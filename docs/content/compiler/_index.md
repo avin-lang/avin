@@ -28,7 +28,8 @@ tuples, type parameters, inference variables, `Any`, `Nothing` and an error type
 
 ## Runtime
 
-`runtime/` is a Sysl package built once per toolchain version, not once per program. It contains:
+`runtime/` is a Sysl package, built into a library archive when its sources change rather than once
+per program, and linked into every executable. It contains:
 
 - program entry, arguments and exit status;
 - the collector interface over `sh.sysl.gc` — heap setup and growth, collect-on-pressure, a
@@ -41,7 +42,8 @@ Its ABI is private between the compiler and the runtime, and not visible to Avin
 
 ## Standard library
 
-`stdlib/` holds Avin source under the module root `avin`. The compiler knows a small, declared set of
+`library/` holds Avin source under the module root `avin`, starting with the prelude every program
+sees. The compiler knows a small, declared set of
 **intrinsics**: arithmetic on built-in types, allocation, field access and the runtime entry points.
 Each is declared in Avin source with `@intrinsic("…")` and has no body. Everything else, including
 `print`, is ordinary library code.
