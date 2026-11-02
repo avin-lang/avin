@@ -48,4 +48,5 @@ before it starts.
 | --- | --- |
 | 0 | Done |
 | 1 | Done |
-| 2–11 | Not started |
+| 2 | In progress: local bindings and assignment; integer arithmetic with trapping, wrapping and saturating operators; bitwise operators and shifts; integer literals of any width; comparison chains; `&&`, `||`, `!`; `if`, `while`, `break`, `continue` and `return`, with `Nothing` for code that never finishes. Still to come: `byte`, `real`, `char`, `match` and patterns with coverage, local functions, generic functions, by-name parameters, and the old corpus |
+| 3–11 | Not started |

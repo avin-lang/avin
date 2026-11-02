@@ -37,8 +37,8 @@ is not a Unicode scalar.
 mathematical result does not fit the width, and so does `/` for the one quotient that cannot fit
 (`MIN / -1`). `%` never overflows: `MIN % -1` is `0`. Division and remainder by zero trap. Code that
 wants other behaviour says so with an operator: `+%`, `-%` and `*%` wrap, and `+|`, `-|` and `*|`
-saturate at the bounds. Shifts never trap; a count at least as large as the width shifts every bit
-out.
+saturate at the bounds. Shifts never trap; a count at least as large as the width, or a negative
+count, shifts every bit out (`>>` keeps the sign, so `-1 >> 40` is `-1`).
 
 Integers are signed; there are no unsigned integer types. Binary data uses `byte`.
 

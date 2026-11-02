@@ -28,8 +28,12 @@ emit_llvm(program: MirProgram) -> string
                             out.push("declare " + c_result(signature) + " @" + symbol + "(" + c_params(signature) + ")\n")
                     _ -> ()
     out.push("\n")
+    var intrinsics: Buf[string] = buf()
     for f in program.functions
-        emit_function(&out, program, f)
+        emit_function(&out, &intrinsics, program, f)
+    for declaration in intrinsics
+        out.push(declaration + "\n")
+    out.push("\n")
     val entry = program.functions.at(program.entry)
     out.push("define i32 @main() {\nentry:\n")
     entry.signature.result match
@@ -86,7 +90,7 @@ private c_params(s: MirSignature) -> string
         out = out + c_type(s.params.at(i))
     out
 
-private emit_function(out: *StrBuilder, program: MirProgram, f: MirFunction)
+private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgram, f: MirFunction)
     out.push("define " + result_type(f.signature) + " @\"" + f.symbol + "\"(")
     for i in 0..<f.signature.params.len()
         if i > 0 then out.push(", ")
@@ -95,18 +99,91 @@ private emit_function(out: *StrBuilder, program: MirProgram, f: MirFunction)
     var temp = 0usize
     for b in 0..<f.blocks.len()
         out.push(s"b$b:\n")
+        if b == 0
+            for s in 0..<f.slots.len()
+                out.push(s"  %s$s = alloca ${llvm_type(f.slots.at(s))}\n")
         val block = f.blocks.at(b)
         for inst in block.insts
-            temp = emit_inst(out, program, f, inst, temp)
+            temp = emit_inst(out, intrinsics, program, f, inst, temp)
         block.term match
             Return(Some(value)) -> out.push("  ret " + typed_operand(program, f, value) + "\n")
             Return(None) -> out.push("  ret void\n")
+            Jump(target) -> out.push(s"  br label %b$target\n")
+            Branch(condition, yes, no) -> out.push("  br i1 " + operand(program, f, condition) + s", label %b$yes, label %b$no\n")
+            Trap ->
+                need(intrinsics, "declare void @llvm.trap()")
+                out.push("  call void @llvm.trap()\n  unreachable\n")
             Unreachable -> out.push("  unreachable\n")
     out.push("}\n\n")
 
-private emit_inst(out: *StrBuilder, program: MirProgram, f: MirFunction, inst: Inst, temp: usize) -> usize
+private need(intrinsics: *Buf[string], declaration: string)
+    if !contains(*intrinsics, declaration) then intrinsics.push(declaration)
+
+private op_name(op: MirOp) -> string = op match
+    OpAdd -> "add"
+    OpSub -> "sub"
+    OpMul -> "mul"
+    OpDiv -> "sdiv"
+    OpRem -> "srem"
+    OpAnd -> "and"
+    OpOr -> "or"
+    OpXor -> "xor"
+    OpShl -> "shl"
+    OpAShr -> "ashr"
+    _ -> ""
+
+// Saturating operations are LLVM intrinsics; multiplication saturates as a fixed-point product
+// with no fractional bits.
+private saturating_name(op: MirOp) -> string = op match
+    OpAddSat -> "sadd.sat"
+    OpSubSat -> "ssub.sat"
+    OpMulSat -> "smul.fix.sat"
+    _ -> ""
+
+private checked_name(op: MirChecked) -> string = op match
+    CheckedAdd -> "sadd"
+    CheckedSub -> "ssub"
+    CheckedMul -> "smul"
+
+private cmp_name(op: MirCmp) -> string = op match
+    CmpEq -> "eq"
+    CmpNe -> "ne"
+    CmpLt -> "slt"
+    CmpLe -> "sle"
+    CmpGt -> "sgt"
+    CmpGe -> "sge"
+    CmpUge -> "uge"
+
+private emit_inst(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgram, f: MirFunction, inst: Inst, temp: usize) -> usize
     var next = temp
     inst match
+        Binary(dest, op, left, right) ->
+            val t = llvm_type(operand_type(program, f, left))
+            val a = operand(program, f, left)
+            val b = operand(program, f, right)
+            val sat = saturating_name(op)
+            if sat == ""
+                out.push(s"  %v$dest = ${op_name(op)} $t $a, $b\n")
+            else
+                val scale = if op is OpMulSat then ", i32 0" else ""
+                need(intrinsics, s"declare $t @llvm.$sat.$t($t, $t${if scale == "" then "" else ", i32"})")
+                out.push(s"  %v$dest = call $t @llvm.$sat.$t($t $a, $t $b$scale)\n")
+        Checked(dest, overflow, op, left, right) ->
+            val t = llvm_type(operand_type(program, f, left))
+            val name = s"llvm.${checked_name(op)}.with.overflow.$t"
+            need(intrinsics, s"declare { $t, i1 } @$name($t, $t)")
+            out.push(s"  %t$next = call { $t, i1 } @$name($t ${operand(program, f, left)}, $t ${operand(program, f, right)})\n")
+            out.push(s"  %v$dest = extractvalue { $t, i1 } %t$next, 0\n")
+            out.push(s"  %v$overflow = extractvalue { $t, i1 } %t$next, 1\n")
+            next += 1
+        Compare(dest, op, left, right) ->
+            out.push(s"  %v$dest = icmp ${cmp_name(op)} " + typed_operand(program, f, left) + ", " + operand(program, f, right) + "\n")
+        Select(dest, condition, yes, no) ->
+            out.push(s"  %v$dest = select i1 " + operand(program, f, condition) + ", " + typed_operand(program, f, yes) + ", " + typed_operand(program, f, no) + "\n")
+        Load(dest, slot) ->
+            out.push(s"  %v$dest = load ${llvm_type(f.slots.at(slot))}, ptr %s$slot\n")
+        Store(slot, value) ->
+            out.push("  store " + typed_operand(program, f, value) + s", ptr %s$slot\n")
         Call(dest, Direct(index), args) ->
             val callee = program.functions.at(index)
             out.push("  ")

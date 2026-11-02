@@ -22,14 +22,37 @@ struct FunctionSymbol
     result: Option[&Type]
     intrinsic: Option[string]
 
+/** A `break` the checker has seen, kept until its loop's type is known. */
+struct BreakSite
+    label: usize
+    span: Span
+    ty: &Type
+
+/** What the checker knows inside one function body. Checking a call to a function whose result is
+ * inferred checks that function's body first, so this is saved and restored around it. */
+struct BodyState
+    locals: Buf[TLocal]
+    /** The locals in scope, innermost last. */
+    visible: Buf[usize]
+    /** The loops enclosing the current expression, innermost last. */
+    loops: Buf[usize]
+    breaks: Buf[BreakSite]
+    labels: usize
+    /** Where the innermost block's locals start in `visible`. */
+    block_start: usize
+
+fresh_body() -> BodyState = BodyState(buf(), buf(), buf(), buf(), 0, 0)
+
 struct Checker
     units: Buf[SourceUnit]
     symbols: Buf[FunctionSymbol]
     /** 0: not yet checked, 1: being checked, 2: checked. */
     states: Buf[u8]
     bodies: Buf[Option[&TExpr]]
+    locals: Buf[Buf[TLocal]]
     scope: Map[string, usize]
     current: usize
+    body: BodyState
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -55,7 +78,7 @@ end Checked
 /** Checks a program. The last unit is the program's own file, which must declare `main`; the units
  * before it (the prelude) are visible to it, and its own declarations shadow theirs. */
 check_program(units: Buf[SourceUnit]) -> Checked
-    var c = Checker(units, buf(), buf(), buf(), map(), 0)
+    var c = Checker(units, buf(), buf(), buf(), buf(), map(), 0, fresh_body())
     for u in 0..<c.units.len()
         declare_unit(&c, u)
     for id in 0..<c.symbols.len()
@@ -82,7 +105,7 @@ check_program(units: Buf[SourceUnit]) -> Checked
     val id = entry.unwrap()
     var functions: Buf[TFunction] = buf()
     for i in 0..<c.symbols.len()
-        functions.push(TFunction(i, c.bodies.at(i)))
+        functions.push(TFunction(i, c.bodies.at(i), c.locals.at(i)))
     Checked(c.units, Some(TProgram(c.symbols, functions, id)))
 
 private declare_unit(c: *Checker, unit: usize)
@@ -99,6 +122,7 @@ private declare_unit(c: *Checker, unit: usize)
                 c.symbols.push(signature(c, unit, file.module_name, f))
                 c.states.push(0)
                 c.bodies.push(None)
+                c.locals.push(buf())
                 c.scope.put(f.name, id)
             DataItem(d) -> c.note(unit, d.span, "data declarations are not implemented")
 
@@ -184,9 +208,13 @@ private check_function(c: *Checker, id: usize)
     symbol.decl.body match
         Some(body) ->
             val previous = c.current
+            val outer = c.body
             c.current = id
+            c.body = fresh_body()
             val typed = check_expr(c, body, symbol.result)
+            c.locals.set(id, c.body.locals)
             c.current = previous
+            c.body = outer
             symbol.result match
                 Some(declared) ->
                     if !conforms(typed.ty, declared) && !(*declared is Unit)
@@ -198,45 +226,349 @@ private check_function(c: *Checker, id: usize)
 
 private unit_of(c: *Checker) -> usize = c.symbols.at(c.current).unit
 
-check_expr(c: *Checker, e: &Expr, expected: Option[&Type]) -> &TExpr
-    val unit = unit_of(c)
-    e.kind match
-        IntLit(spelling) -> integer_literal(c, e.span, spelling, false, expected)
-        Unary(Negate, operand) ->
-            operand.kind match
-                IntLit(spelling) -> integer_literal(c, e.span, spelling, true, expected)
-                _ -> unsupported(c, e, "arithmetic")
-        BoolLit(value) -> TExpr(e.span, Bool, BoolConst(value))
-        StringLit(value) -> TExpr(e.span, Str, StrConst(value))
-        UnitLit -> TExpr(e.span, Unit, UnitConst)
-        Name(name) -> name_expr(c, e.span, name)
-        Call(callee, args) -> call_expr(c, e.span, callee, args)
-        Block(items, discard) ->
-            var typed: Buf[&TExpr] = buf()
-            for i in 0..<items.len()
-                val last = i + 1 == items.len()
-                val item = items.at(i)
-                if item.kind is LocalFunction(_)
-                    typed.push(unsupported(c, item, "local functions"))
-                    continue
-                typed.push(check_expr(c, item, if last && !discard then expected else None))
-            val ty: &Type = if discard || typed.len() == 0 then Unit else typed.at(typed.len() - 1).ty
-            TExpr(e.span, ty, Block(typed))
-        Invalid -> TExpr(e.span, ErrorType, UnitConst)
-        _ -> unsupported(c, e, "this expression")
+/** Checks an expression whose value is used. */
+check_expr(c: *Checker, e: &Expr, expected: Option[&Type]) -> &TExpr = check_value(c, e, expected, true)
+
+/** Checks an expression whose value is discarded, so the branches of an `if` need not agree. */
+private check_statement(c: *Checker, e: &Expr) -> &TExpr = check_value(c, e, None, false)
+
+private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -> &TExpr = e.kind match
+    IntLit(spelling) -> integer_literal(c, e.span, spelling, false, expected)
+    Unary(op, operand) -> unary_expr(c, e, op, operand, expected)
+    BoolLit(value) -> TExpr(e.span, Bool, BoolConst(value))
+    StringLit(value) -> TExpr(e.span, Str, StrConst(value))
+    UnitLit -> TExpr(e.span, Unit, UnitConst)
+    Name(name) -> name_expr(c, e.span, name)
+    Call(callee, args) -> call_expr(c, e.span, callee, args)
+    Block(items, discard) -> block_expr(c, e, items, discard, expected, used)
+    Binding(name, declared, value, mutable) -> binding_expr(c, e, name, declared, value, mutable)
+    Assign(target, op, value, yields) -> assign_expr(c, e, target, op, value, yields)
+    Update(target, increment, postfix) -> update_expr(c, e, target, increment, postfix)
+    Binary(op, left, right) -> binary_expr(c, e, op, left, right, expected)
+    Compare(operands, ops) -> compare_expr(c, e, operands, ops)
+    If(condition, yes, no) -> if_expr(c, e, condition, yes, no, expected, used)
+    While(condition, body, otherwise) -> while_expr(c, e, condition, body, otherwise, expected, used)
+    Break(value) -> break_expr(c, e, value)
+    Continue -> continue_expr(c, e)
+    Return(value) -> return_expr(c, e, value)
+    LocalFunction(_) -> unsupported(c, e, "local functions")
+    Invalid -> TExpr(e.span, ErrorType, UnitConst)
+    _ -> unsupported(c, e, "this expression")
 
 private unsupported(c: *Checker, e: &Expr, what: string) -> &TExpr
     c.note(unit_of(c), e.span, s"$what is not implemented")
     TExpr(e.span, ErrorType, UnitConst)
 
-private name_expr(c: *Checker, at: Span, name: string) -> &TExpr
+private lookup_local(c: *Checker, name: string) -> Option[usize]
+    var i = c.body.visible.len()
+    while i > 0
+        i -= 1
+        val index = c.body.visible.at(i)
+        if c.body.locals.at(index).name == name then return Some(index)
+    None
+
+private param_index(c: *Checker, name: string) -> Option[usize]
     val symbol = c.symbols.at(c.current)
     for i in 0..<symbol.param_names.len()
-        if symbol.param_names.at(i) == name then return TExpr(at, symbol.params.at(i), Param(i))
+        if symbol.param_names.at(i) == name then return Some(i)
+    None
+
+private name_expr(c: *Checker, at: Span, name: string) -> &TExpr
+    if lookup_local(c, name) is Some(index) then return TExpr(at, c.body.locals.at(index).ty, Local(index))
+    val symbol = c.symbols.at(c.current)
+    if param_index(c, name) is Some(i) then return TExpr(at, symbol.params.at(i), Param(i))
     if c.scope.get(name) is Some(_)
         c.note(symbol.unit, at, s"`$name` is a function; function values are not implemented")
     else c.note(symbol.unit, at, s"`$name` is not defined")
     TExpr(at, ErrorType, UnitConst)
+
+// A block's locals go out of scope at its end. A block that contains an expression which never
+// finishes (a `return`, a `break`) never yields, so its type is `Nothing`.
+private block_expr(c: *Checker, e: &Expr, items: Buf[&Expr], discard: bool, expected: Option[&Type], used: bool) -> &TExpr
+    val mark = c.body.visible.len()
+    val outer_start = c.body.block_start
+    c.body.block_start = mark
+    var typed: Buf[&TExpr] = buf()
+    var finishes = true
+    for i in 0..<items.len()
+        val item = items.at(i)
+        val t = if i + 1 == items.len() && !discard then check_value(c, item, expected, used) else check_statement(c, item)
+        if *t.ty is Nothing then finishes = false
+        typed.push(t)
+    c.body.visible.truncate(mark)
+    c.body.block_start = outer_start
+    var ty: &Type = Unit
+    if !finishes then ty = Nothing
+    elif !discard && typed.len() > 0 then ty = typed.at(typed.len() - 1).ty
+    TExpr(e.span, ty, Block(typed))
+
+// Checks a branch of `if` or `while`, whose bindings are not visible after it.
+private branch(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -> &TExpr
+    val mark = c.body.visible.len()
+    val t = check_value(c, e, expected, used)
+    c.body.visible.truncate(mark)
+    t
+
+private binding_expr(c: *Checker, e: &Expr, name: string, declared: Option[&TypeExpr], value: &Expr, mutable: bool) -> &TExpr
+    val unit = unit_of(c)
+    var want: Option[&Type] = None
+    if declared is Some(d) then want = Some(resolve_type(c, unit, d))
+    val typed = check_expr(c, value, want)
+    var ty = typed.ty
+    if want is Some(w)
+        if !conforms(typed.ty, w) then c.note(unit, value.span, s"expected ${type_name(w)}, found ${type_name(typed.ty)}")
+        ty = w
+    for i in c.body.block_start..<c.body.visible.len()
+        if c.body.locals.at(c.body.visible.at(i)).name == name
+            c.note(unit, e.span, s"`$name` is already defined in this block")
+    val index = c.body.locals.len()
+    c.body.locals.push(TLocal(name, ty, mutable))
+    c.body.visible.push(index)
+    // A binding whose value never finishes does not finish either.
+    TExpr(e.span, if *typed.ty is Nothing then Nothing else Unit, Let(index, typed))
+
+// The mutable local an assignment or update writes, after reporting why anything else cannot be
+// written.
+private assignable(c: *Checker, target: &Expr) -> Option[usize]
+    val unit = unit_of(c)
+    val name = target.kind match
+        Name(n) -> n
+        _ ->
+            c.note(unit, target.span, "only a local `var` can be assigned")
+            return None
+    lookup_local(c, name) match
+        Some(index) ->
+            if c.body.locals.at(index).mutable then return Some(index)
+            c.note(unit, target.span, s"`$name` is a `val`; only a `var` can be assigned")
+        None ->
+            if param_index(c, name) is Some(_) then c.note(unit, target.span, s"`$name` is a parameter, which cannot be assigned")
+            elif c.scope.get(name) is Some(_) then c.note(unit, target.span, s"`$name` is a function, which cannot be assigned")
+            else c.note(unit, target.span, s"`$name` is not defined")
+    None
+
+private assign_expr(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp], value: &Expr, yields: bool) -> &TExpr
+    val unit = unit_of(c)
+    val index = assignable(c, target) match
+        Some(i) -> i
+        None ->
+            check_statement(c, value)
+            return TExpr(e.span, ErrorType, UnitConst)
+    val local = c.body.locals.at(index)
+    val current = TExpr(target.span, local.ty, Local(index))
+    val stored = op match
+        Some(o) -> operate(c, e.span, o, binary_spelling(o) + (if yields then ":=" else "="), current, check_expr(c, value, Some(local.ty)))
+        None ->
+            val typed = check_expr(c, value, Some(local.ty))
+            if !conforms(typed.ty, local.ty)
+                c.note(unit, value.span, s"expected ${type_name(local.ty)}, found ${type_name(typed.ty)}")
+            typed
+    val ty: &Type = if *stored.ty is Nothing then Nothing elif yields then local.ty else Unit
+    TExpr(e.span, ty, Store(index, stored, yields))
+
+private update_expr(c: *Checker, e: &Expr, target: &Expr, increment: bool, postfix: bool) -> &TExpr
+    val index = assignable(c, target) match
+        Some(i) -> i
+        None -> return TExpr(e.span, ErrorType, UnitConst)
+    val ty = c.body.locals.at(index).ty
+    if !(*ty is Int(_) || *ty is ErrorType)
+        c.note(unit_of(c), e.span, s"`${if increment then "++" else "--"}` needs an integer, not ${type_name(ty)}")
+        return TExpr(e.span, ErrorType, UnitConst)
+    TExpr(e.span, ty, Step(index, increment, postfix))
+
+// An integer literal, possibly negated, takes its type from context rather than giving one.
+private is_literal(e: &Expr) -> bool = e.kind match
+    IntLit(_) -> true
+    Unary(Negate, operand) -> operand.kind is IntLit(_)
+    _ -> false
+
+private settled(t: &Type) -> bool = !(*t is ErrorType || *t is Nothing)
+
+private expect_bool(c: *Checker, t: &TExpr)
+    if !conforms(t.ty, Bool) then c.note(unit_of(c), t.span, s"expected bool, found ${type_name(t.ty)}")
+
+private unary_expr(c: *Checker, e: &Expr, op: UnaryOp, operand: &Expr, expected: Option[&Type]) -> &TExpr
+    if op is Not
+        val x = check_expr(c, operand, Some(Bool))
+        expect_bool(c, x)
+        return TExpr(e.span, if *x.ty is Nothing then Nothing else Bool, Not(x))
+    if op is Negate && operand.kind is IntLit(spelling)
+        return integer_literal(c, e.span, spelling, true, expected)
+    val x = check_expr(c, operand, expected)
+    if settled(x.ty) && !(*x.ty is Int(_))
+        c.note(unit_of(c), e.span, s"`${unary_spelling(op)}` needs an integer, not ${type_name(x.ty)}")
+        return TExpr(e.span, ErrorType, UnitConst)
+    op match
+        Negate -> TExpr(e.span, x.ty, Negate(x))
+        Complement -> TExpr(e.span, x.ty, Complement(x))
+        _ -> x
+
+// The operand that is not a bare literal is checked first, so a literal on either side takes the
+// other operand's type: in `1 + x` with `x: i8`, the `1` is an `i8`.
+private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Expr, expected: Option[&Type]) -> &TExpr
+    if op is And || op is Or
+        val l = check_expr(c, left, Some(Bool))
+        val r = check_expr(c, right, Some(Bool))
+        expect_bool(c, l)
+        expect_bool(c, r)
+        // The right operand may not run, so only the left one decides that the operation never finishes.
+        return TExpr(e.span, if *l.ty is Nothing then Nothing else Bool, Logic(op is And, l, r))
+    if is_literal(left) && !is_literal(right)
+        val r = check_expr(c, right, expected)
+        return operate(c, e.span, op, binary_spelling(op), check_expr(c, left, Some(r.ty)), r)
+    val l = check_expr(c, left, expected)
+    operate(c, e.span, op, binary_spelling(op), l, check_expr(c, right, Some(l.ty)))
+
+// Arithmetic, bitwise and shift operators take two integers of one type and yield that type.
+private operate(c: *Checker, at: Span, op: BinaryOp, spelling: string, l: &TExpr, r: &TExpr) -> &TExpr
+    if !settled(l.ty) || !settled(r.ty)
+        // An operand that never finishes means the operation never finishes.
+        val ty: &Type = if *l.ty is ErrorType || *r.ty is ErrorType then ErrorType else Nothing
+        return TExpr(at, ty, Arith(op, l, r))
+    if !(*l.ty is Int(_)) || !same_type(l.ty, r.ty)
+        c.note(unit_of(c), at, s"`$spelling` needs two integers of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}")
+        return TExpr(at, ErrorType, UnitConst)
+    TExpr(at, l.ty, Arith(op, l, r))
+
+private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[CompareOp]) -> &TExpr
+    var early: Buf[Option[&TExpr]] = buf()
+    var anchor: Option[&Type] = None
+    for o in operands
+        if is_literal(o) then early.push(None)
+        else
+            val t = check_expr(c, o, None)
+            if anchor is None && settled(t.ty) then anchor = Some(t.ty)
+            early.push(Some(t))
+    var typed: Buf[&TExpr] = buf()
+    for i in 0..<operands.len()
+        early.at(i) match
+            Some(t) -> typed.push(t)
+            None -> typed.push(check_expr(c, operands.at(i), anchor))
+    for i in 0..<ops.len()
+        compare_link(c, ops.at(i), typed.at(i), typed.at(i + 1))
+    var ty: &Type = Bool
+    for t in typed
+        if *t.ty is Nothing then ty = Nothing
+    TExpr(e.span, ty, Compare(typed, ops))
+
+private compare_link(c: *Checker, op: CompareOp, a: &TExpr, b: &TExpr)
+    if !settled(a.ty) || !settled(b.ty) then return
+    val at = a.span.to(b.span)
+    val spelling = compare_spelling(op)
+    if op is Same || op is NotSame
+        c.note(unit_of(c), at, s"`$spelling` compares identities, and ${type_name(a.ty)} values have none")
+        return
+    if !same_type(a.ty, b.ty)
+        c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} with ${type_name(b.ty)}")
+        return
+    val equality = op is Equal || op is NotEqual
+    if *a.ty is Int(_) then return
+    if equality && *a.ty is Bool then return
+    if *a.ty is Str
+        c.note(unit_of(c), at, "comparing strings is not implemented")
+        return
+    c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} values")
+
+// The type two branches agree on, where one that never finishes agrees with anything.
+private join(a: &Type, b: &Type) -> Option[&Type]
+    if *a is Nothing || *a is ErrorType then return Some(b)
+    if *b is Nothing || *b is ErrorType then return Some(a)
+    if same_type(a, b) then Some(a) else None
+
+private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[&Expr], expected: Option[&Type], used: bool) -> &TExpr
+    val cond = check_expr(c, condition, Some(Bool))
+    expect_bool(c, cond)
+    val other = no match
+        Some(n) -> n
+        None ->
+            // Without `else` the branch's value is discarded and the `if` yields unit.
+            return TExpr(e.span, Unit, If(cond, branch(c, yes, None, false), None))
+    val y = branch(c, yes, expected, used)
+    val n = branch(c, other, expected, used)
+    var ty: &Type = Unit
+    if *y.ty is Nothing && *n.ty is Nothing then ty = Nothing
+    elif used
+        join(y.ty, n.ty) match
+            Some(t) -> ty = t
+            None ->
+                c.note(unit_of(c), e.span, s"the branches of this `if` yield ${type_name(y.ty)} and ${type_name(n.ty)}")
+                ty = ErrorType
+    TExpr(e.span, ty, If(cond, y, Some(n)))
+
+// A loop yields unit, or with an `else`, the value its `else` and every `break` agree on. A
+// `while true` that no `break` leaves never finishes.
+private while_expr(c: *Checker, e: &Expr, condition: &Expr, body: &Expr, otherwise: Option[&Expr], expected: Option[&Type], used: bool) -> &TExpr
+    val unit = unit_of(c)
+    val cond = check_expr(c, condition, Some(Bool))
+    expect_bool(c, cond)
+    val label = c.body.labels
+    c.body.labels += 1
+    c.body.loops.push(label)
+    val b = branch(c, body, None, false)
+    c.body.loops.truncate(c.body.loops.len() - 1)
+    var other: Option[&TExpr] = None
+    var ty: &Type = Unit
+    if otherwise is Some(o)
+        val t = branch(c, o, expected, used)
+        other = Some(t)
+        ty = t.ty
+    var broken = false
+    for site in c.body.breaks
+        if site.label != label then continue
+        broken = true
+        if other is None
+            if !(*site.ty is Unit || *site.ty is ErrorType)
+                c.note(unit, site.span, "a `break` with a value needs its loop to have an `else`")
+        elif used
+            join(ty, site.ty) match
+                Some(t) -> ty = t
+                None -> c.note(unit, site.span, s"this `break` yields ${type_name(site.ty)}, but the loop yields ${type_name(ty)}")
+    if !used then ty = Unit
+    if !broken && cond.kind is BoolConst(true) then ty = Nothing
+    TExpr(e.span, ty, While(label, cond, b, other))
+
+private innermost_loop(c: *Checker, e: &Expr, word: string) -> Option[usize]
+    if c.body.loops.len() == 0
+        c.note(unit_of(c), e.span, s"`$word` is outside a loop")
+        return None
+    Some(c.body.loops.at(c.body.loops.len() - 1))
+
+private break_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
+    val target = innermost_loop(c, e, "break")
+    var typed: Option[&TExpr] = None
+    var ty: &Type = Unit
+    if value is Some(v)
+        val t = check_expr(c, v, None)
+        typed = Some(t)
+        ty = t.ty
+    target match
+        Some(label) ->
+            c.body.breaks.push(BreakSite(label, e.span, ty))
+            TExpr(e.span, Nothing, Break(label, typed))
+        None -> TExpr(e.span, ErrorType, UnitConst)
+
+private continue_expr(c: *Checker, e: &Expr) -> &TExpr = innermost_loop(c, e, "continue") match
+    Some(label) -> TExpr(e.span, Nothing, Continue(label))
+    None -> TExpr(e.span, ErrorType, UnitConst)
+
+private return_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
+    val unit = unit_of(c)
+    val symbol = c.symbols.at(c.current)
+    var typed: Option[&TExpr] = None
+    symbol.result match
+        Some(r) ->
+            value match
+                Some(v) ->
+                    val t = check_expr(c, v, Some(r))
+                    if !conforms(t.ty, r) && !(*r is Unit)
+                        c.note(unit, v.span, s"`${symbol.name}` yields ${type_name(r)}, not ${type_name(t.ty)}")
+                    typed = Some(t)
+                None ->
+                    if !(*r is Unit || *r is ErrorType)
+                        c.note(unit, e.span, s"`return` needs a value, because `${symbol.name}` yields ${type_name(r)}")
+        None ->
+            c.note(unit, e.span, s"`${symbol.name}` uses `return`, so it needs a declared result type")
+            if value is Some(v) then typed = Some(check_expr(c, v, None))
+    TExpr(e.span, Nothing, Return(typed))
 
 private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument]) -> &TExpr
     val unit = unit_of(c)
@@ -263,7 +595,9 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument]) -> 
         typed.push(value)
     if args.len() != target.params.len()
         c.note(unit, at, s"`$name` takes ${target.params.len()} arguments, not ${args.len()}")
-    val result = result_of(c, id, at)
+    var result = result_of(c, id, at)
+    for t in typed
+        if *t.ty is Nothing then result = Nothing
     TExpr(at, result, Call(id, typed))
 
 // A function without a declared result type has the type of its body, so its body is checked
@@ -283,17 +617,66 @@ private integer_literal(c: *Checker, at: Span, spelling: string, negative: bool,
     if expected is Some(t)
         if *t is Int(b) then bits = b
     val ty: &Type = Int(bits)
-    var s = scanner_of(spelling)
-    val magnitude = read_number(&s) match
-        Ok(Int(v)) -> v
-        _ ->
-            val message = if bits > 64 then "integer literals wider than 64 bits are not implemented" else s"integer literal does not fit in ${type_name(ty)}"
-            c.note(unit_of(c), at, message)
+    val digits = literal_magnitude(spelling) match
+        Some(d) -> d
+        None ->
+            c.note(unit_of(c), at, "malformed integer literal")
             return TExpr(at, ErrorType, UnitConst)
-    if bits <= 64
-        val limit = ulong(1) << ulong(bits - 1)
-        if magnitude > limit || (!negative && magnitude == limit)
-            c.note(unit_of(c), at, s"integer literal does not fit in ${type_name(ty)}")
-            return TExpr(at, ErrorType, UnitConst)
-    val digits = magnitude.to_string()
-    TExpr(at, ty, IntConst(if negative && magnitude != 0 then "-" + digits else digits))
+    if !fits(digits, bits, negative)
+        c.note(unit_of(c), at, s"integer literal does not fit in ${type_name(ty)}")
+        return TExpr(at, ErrorType, UnitConst)
+    TExpr(at, ty, IntConst(if negative && digits != "0" then "-" + digits else digits))
+
+/** The magnitude an integer literal spells, in decimal, whatever its base and size. */
+literal_magnitude(spelling: string) -> Option[string]
+    val text = spelling.bytes
+    var base = 10u32
+    var start = 0usize
+    if text.len > 2 && text[0] == u8('0')
+        val radix = text[1] | 0x20
+        if radix == u8('x') then base = 16
+        elif radix == u8('o') then base = 8
+        elif radix == u8('b') then base = 2
+        if base != 10 then start = 2
+    // Decimal digits, least significant first, multiplied by the base and added to per digit.
+    var digits: Buf[u32] = buf()
+    digits.push(0)
+    for i in start..<text.len
+        val ch = text[i]
+        if ch == u8('_') then continue
+        val lower = ch | 0x20
+        var d = 99u32
+        if ch >= u8('0') && ch <= u8('9') then d = u32(ch - u8('0'))
+        elif lower >= u8('a') && lower <= u8('f') then d = u32(lower - u8('a')) + 10
+        if d >= base then return None
+        var carry = d
+        for k in 0..<digits.len()
+            val v = digits.at(k) * base + carry
+            digits.set(k, v % 10)
+            carry = v / 10
+        while carry > 0
+            digits.push(carry % 10)
+            carry = carry / 10
+    var end = digits.len()
+    while end > 1 && digits.at(end - 1) == 0 do end -= 1
+    var out = ""
+    var k = end
+    while k > 0
+        k -= 1
+        out = out + char(u8('0') + u8(digits.at(k))).to_string()
+    Some(out)
+
+/** Whether a decimal magnitude, with its sign, fits a signed integer of `bits` bits. */
+fits(digits: string, bits: u32, negative: bool) -> bool
+    // Fewer than one decimal digit per 3.33 bits always fits, so huge widths cost nothing.
+    if ulong(digits.bytes.len) * 4 < ulong(bits) then return true
+    val limit = min_digits(bits)[1..]
+    val order = compare_decimal(digits, limit)
+    order < 0 || (negative && order == 0)
+
+// Compares two decimal numbers without leading zeros: negative, zero or positive.
+private compare_decimal(a: string, b: string) -> int
+    if a.bytes.len != b.bytes.len then return if a.bytes.len < b.bytes.len then -1 else 1
+    for i in 0..<a.bytes.len
+        if a.bytes[i] != b.bytes[i] then return if a.bytes[i] < b.bytes[i] then -1 else 1
+    0

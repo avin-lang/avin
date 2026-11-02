@@ -26,7 +26,7 @@ Avin has Sysl's operator set and precedence. Operators are trait methods (`+` is
 | Propagation | postfix `?` |
 | Assignment | `=` and compound forms (`+=`, `<<=`, `+%=`, …) |
 | Yielding assignment | `:=` and compound forms, which return the stored value |
-| Update | prefix and postfix `++` `--` |
+| Update | prefix and postfix `++` `--`; prefix yields the new value, postfix the old |
 
 Bitwise operators bind more tightly than comparisons: `x & mask == 0` tests the masked value.
 Within the bitwise family, `&` binds tightest, then `^`, then `|`. Shifts bind at the multiplicative
@@ -83,6 +83,7 @@ else -1
 The condition is tested before each iteration, and `continue` returns to that test. `break` exits the
 nearest loop and may carry a value, in which case every `break` value and the loop's `else` must
 agree. The `else` runs on normal completion. Without an `else`, normal completion yields `unit`.
+A `while true` loop that no `break` leaves never finishes, so its type is `Nothing`.
 
 ## match
 

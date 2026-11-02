@@ -11,17 +11,33 @@ mir_type(t: &Type) -> Option[MirType] = *t match
     Int(bits) -> Some(MInt(bits))
     _ -> None
 
+/** Where `break` and `continue` go for one loop, and the slot its value is stored in. */
+private struct LoopTarget
+    label: usize
+    head: usize
+    exit: usize
+    slot: Option[usize]
+
 private struct Lowering
     program: TProgram
     strings: Buf[string]
     /** For each function, the value id of each semantic parameter, or `None` for a unit one. */
     param_values: Buf[Option[usize]]
+    /** The slot of each local, or `None` for one with no runtime value. */
+    local_slots: Buf[Option[usize]]
     values: Buf[MirType]
+    slots: Buf[MirType]
     blocks: Buf[MirBlock]
+    /** The block instructions are being added to, and those instructions. */
+    current: usize
     insts: Buf[Inst]
+    loops: Buf[LoopTarget]
+    /** The function's one trap block, made when first needed. */
+    trap: Option[usize]
+    returns_value: bool
 
 lower_program(program: TProgram) -> MirProgram
-    var l = Lowering(program, buf(), buf(), buf(), buf(), buf())
+    var l = Lowering(program, buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), None, false)
     var functions: Buf[MirFunction] = buf()
     for f in program.functions
         functions.push(lower_function(&l, f))
@@ -42,8 +58,12 @@ private lower_function(l: *Lowering, f: TFunction) -> MirFunction
     val symbol = l.program.symbols.at(f.symbol)
     val signature = signature_of(symbol)
     l.values = buf()
+    l.slots = buf()
     l.blocks = buf()
     l.insts = buf()
+    l.loops = buf()
+    l.trap = None
+    l.returns_value = signature.result is Some(_)
     l.param_values = buf()
     for p in symbol.params
         mir_type(p) match
@@ -51,13 +71,28 @@ private lower_function(l: *Lowering, f: TFunction) -> MirFunction
                 l.param_values.push(Some(l.values.len()))
                 l.values.push(t)
             None -> l.param_values.push(None)
+    l.local_slots = buf()
+    for local in f.locals
+        mir_type(local.ty) match
+            Some(t) ->
+                l.local_slots.push(Some(l.slots.len()))
+                l.slots.push(t)
+            None -> l.local_slots.push(None)
+    l.current = new_block(l)
     f.body match
         Some(body) ->
             val result = lower_expr(l, body)
-            val returned: Option[Operand] = if signature.result is Some(_) then result else None
-            finish_block(l, Return(returned))
+            finish(l, returning(l, result))
         None -> intrinsic_body(l, symbol)
-    MirFunction(function_symbol(symbol), signature, l.values, l.blocks)
+    MirFunction(function_symbol(symbol), signature, l.values, l.slots, l.blocks)
+
+// The terminator that returns a body's value. A function that yields a value but whose body has
+// none at this point is in code that cannot be reached.
+private returning(l: *Lowering, value: Option[Operand]) -> Terminator
+    if !l.returns_value then return Return(None)
+    value match
+        Some(v) -> Return(Some(v))
+        None -> Unreachable
 
 // An intrinsic is a function like any other in the object file; its body is the operation the
 // intrinsic names, so it can be called directly and, later, passed as a value.
@@ -69,20 +104,91 @@ private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
         var params: Buf[MirType] = buf()
         params.push(MStr)
         l.insts.push(Call(None, Runtime("avin_rt_print_line", MirSignature(params, None)), args))
-        finish_block(l, Return(None))
+        finish(l, Return(None))
         return
-    finish_block(l, Unreachable)
+    finish(l, Unreachable)
 
-private finish_block(l: *Lowering, term: Terminator)
-    l.blocks.push(MirBlock(l.insts, term))
+private new_block(l: *Lowering) -> usize
+    val id = l.blocks.len()
+    l.blocks.push(MirBlock(buf(), Unreachable))
+    id
+
+/** Ends the current block with `term`. */
+private finish(l: *Lowering, term: Terminator)
+    l.blocks[l.current].insts = l.insts
+    l.blocks[l.current].term = term
     l.insts = buf()
+
+/** Ends the current block and continues in `block`. */
+private finish_into(l: *Lowering, term: Terminator, block: usize)
+    finish(l, term)
+    l.current = block
+
+/** Ends the current block with control that never falls through, and continues in a fresh block
+ * no path reaches, for any code the program writes after it. */
+private leave(l: *Lowering, term: Terminator)
+    finish_into(l, term, new_block(l))
 
 private fresh(l: *Lowering, t: MirType) -> usize
     val id = l.values.len()
     l.values.push(t)
     id
 
-/** Lowers an expression for its value; `None` for an expression with no runtime value. */
+private new_slot(l: *Lowering, t: &Type) -> Option[usize] = mir_type(t) match
+    Some(m) ->
+        val id = l.slots.len()
+        l.slots.push(m)
+        Some(id)
+    None -> None
+
+private store(l: *Lowering, slot: Option[usize], value: Option[Operand])
+    if slot is Some(s)
+        if value is Some(v) then l.insts.push(Store(s, v))
+
+private load(l: *Lowering, slot: Option[usize]) -> Option[Operand] = slot match
+    Some(s) ->
+        val dest = fresh(l, l.slots.at(s))
+        l.insts.push(Load(dest, s))
+        Some(Value(dest))
+    None -> None
+
+/** Continues only when `flag` is false; otherwise the program traps. */
+private trap_if(l: *Lowering, flag: Operand)
+    val trap = l.trap match
+        Some(t) -> t
+        None ->
+            val t = new_block(l)
+            l.blocks[t].term = Trap
+            l.trap = Some(t)
+            t
+    val next = new_block(l)
+    finish_into(l, Branch(flag, trap, next), next)
+
+private binary(l: *Lowering, t: MirType, op: MirOp, a: Operand, b: Operand) -> Operand
+    val dest = fresh(l, t)
+    l.insts.push(Binary(dest, op, a, b))
+    Value(dest)
+
+private compare(l: *Lowering, op: MirCmp, a: Operand, b: Operand) -> Operand
+    val dest = fresh(l, MBool)
+    l.insts.push(Compare(dest, op, a, b))
+    Value(dest)
+
+private select(l: *Lowering, t: MirType, condition: Operand, yes: Operand, no: Operand) -> Operand
+    val dest = fresh(l, t)
+    l.insts.push(Select(dest, condition, yes, no))
+    Value(dest)
+
+/** An addition, subtraction or multiplication that traps when it overflows. */
+private checked(l: *Lowering, bits: u32, op: MirChecked, a: Operand, b: Operand) -> Operand
+    val dest = fresh(l, MInt(bits))
+    val overflow = fresh(l, MBool)
+    l.insts.push(Checked(dest, overflow, op, a, b))
+    trap_if(l, Value(overflow))
+    Value(dest)
+
+/** Lowers an expression for its value; `None` for an expression with no runtime value, or one in
+ * code no path reaches. */
 private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
     IntConst(digits) -> *e.ty match
         Int(bits) -> Some(ConstInt(bits, digits))
@@ -96,10 +202,15 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
     Param(index) -> l.param_values.at(index) match
         Some(id) -> Some(Value(id))
         None -> None
+    Local(index) -> load(l, l.local_slots.at(index))
     Call(function, args) ->
         var operands: Buf[Operand] = buf()
         for a in args
-            if lower_expr(l, a) is Some(op) then operands.push(op)
+            val op = lower_expr(l, a)
+            if mir_type(a.ty) is Some(_)
+                op match
+                    Some(v) -> operands.push(v)
+                    None -> return None
         val dest = mir_type(e.ty) match
             Some(t) -> Some(fresh(l, t))
             None -> None
@@ -112,3 +223,195 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         for item in items
             last = lower_expr(l, item)
         if mir_type(e.ty) is Some(_) then last else None
+    Let(local, value) ->
+        store(l, l.local_slots.at(local), lower_expr(l, value))
+        None
+    Store(local, value, yields) ->
+        val v = lower_expr(l, value)
+        store(l, l.local_slots.at(local), v)
+        if yields then v else None
+    Step(local, increment, postfix) -> step(l, e, local, increment, postfix)
+    Negate(operand) ->
+        val x = lower_expr(l, operand)?
+        val bits = int_bits(e.ty)
+        Some(checked(l, bits, CheckedSub, ConstInt(bits, "0"), x))
+    Not(operand) ->
+        val x = lower_expr(l, operand)?
+        Some(binary(l, MBool, OpXor, x, ConstBool(true)))
+    Complement(operand) ->
+        val x = lower_expr(l, operand)?
+        val bits = int_bits(e.ty)
+        Some(binary(l, MInt(bits), OpXor, x, ConstInt(bits, "-1")))
+    Arith(op, left, right) ->
+        val a = lower_expr(l, left)?
+        val b = lower_expr(l, right)?
+        Some(arith(l, int_bits(e.ty), op, a, b))
+    Logic(and, left, right) -> logic(l, and, left, right)
+    Compare(operands, ops) -> compare_chain(l, operands, ops)
+    If(condition, yes, no) -> lower_if(l, e, condition, yes, no)
+    While(label, condition, body, otherwise) -> lower_while(l, e, label, condition, body, otherwise)
+    Break(label, value) ->
+        val target = loop_target(l, label)
+        var v: Option[Operand] = None
+        if value is Some(x) then v = lower_expr(l, x)
+        store(l, target.slot, v)
+        leave(l, Jump(target.exit))
+        None
+    Continue(label) ->
+        leave(l, Jump(loop_target(l, label).head))
+        None
+    Return(value) ->
+        var v: Option[Operand] = None
+        var dead = false
+        if value is Some(x)
+            v = lower_expr(l, x)
+            dead = *x.ty is Nothing
+        leave(l, if dead then Unreachable else returning(l, v))
+        None
+
+private int_bits(t: &Type) -> u32 = *t match
+    Int(bits) -> bits
+    _ -> IntBits
+
+private loop_target(l: *Lowering, label: usize) -> LoopTarget
+    for t in l.loops
+        if t.label == label then return t
+    LoopTarget(label, 0, 0, None)
+
+private step(l: *Lowering, e: &TExpr, local: usize, increment: bool, postfix: bool) -> Option[Operand]
+    val slot = l.local_slots.at(local)
+    val old = load(l, slot)?
+    val bits = int_bits(e.ty)
+    val updated = checked(l, bits, if increment then CheckedAdd else CheckedSub, old, ConstInt(bits, "1"))
+    store(l, slot, Some(updated))
+    Some(if postfix then old else updated)
+
+// Avin's integer operators on machine operations. `+`, `-` and `*` trap on overflow; `/` traps on
+// a zero divisor and on the one quotient that does not fit; `%` traps on a zero divisor and is 0
+// for a divisor of -1; a shift count at least the width, or negative, shifts every bit out.
+private arith(l: *Lowering, bits: u32, op: BinaryOp, a: Operand, b: Operand) -> Operand
+    val t = MInt(bits)
+    op match
+        Add -> checked(l, bits, CheckedAdd, a, b)
+        Subtract -> checked(l, bits, CheckedSub, a, b)
+        Multiply -> checked(l, bits, CheckedMul, a, b)
+        AddWrapping -> binary(l, t, OpAdd, a, b)
+        SubtractWrapping -> binary(l, t, OpSub, a, b)
+        MultiplyWrapping -> binary(l, t, OpMul, a, b)
+        AddSaturating -> binary(l, t, OpAddSat, a, b)
+        SubtractSaturating -> binary(l, t, OpSubSat, a, b)
+        MultiplySaturating -> binary(l, t, OpMulSat, a, b)
+        BitAnd -> binary(l, t, OpAnd, a, b)
+        BitOr -> binary(l, t, OpOr, a, b)
+        BitXor -> binary(l, t, OpXor, a, b)
+        Divide ->
+            trap_if(l, compare(l, CmpEq, b, ConstInt(bits, "0")))
+            val minimum = compare(l, CmpEq, a, ConstInt(bits, min_digits(bits)))
+            val minus_one = compare(l, CmpEq, b, ConstInt(bits, "-1"))
+            trap_if(l, binary(l, MBool, OpAnd, minimum, minus_one))
+            binary(l, t, OpDiv, a, b)
+        Remainder ->
+            trap_if(l, compare(l, CmpEq, b, ConstInt(bits, "0")))
+            val minus_one = compare(l, CmpEq, b, ConstInt(bits, "-1"))
+            binary(l, t, OpRem, a, select(l, t, minus_one, ConstInt(bits, "1"), b))
+        ShiftLeft ->
+            val out = compare(l, CmpUge, b, ConstInt(bits, bits.to_string()))
+            select(l, t, out, ConstInt(bits, "0"), binary(l, t, OpShl, a, b))
+        ShiftRight ->
+            val out = compare(l, CmpUge, b, ConstInt(bits, bits.to_string()))
+            binary(l, t, OpAShr, a, select(l, t, out, ConstInt(bits, (bits - 1).to_string()), b))
+        _ -> a
+
+/** The most negative value of a width, in decimal. */
+min_digits(bits: u32) -> string
+    // Doubles a little-endian list of decimal digits, from 1, `bits - 1` times.
+    var digits: Buf[u8] = buf()
+    digits.push(1)
+    for _ in 1..<bits
+        var carry = 0u8
+        for i in 0..<digits.len()
+            val d = digits.at(i) * 2 + carry
+            digits.set(i, d % 10)
+            carry = d / 10
+        if carry > 0 then digits.push(carry)
+    var out = "-"
+    var i = digits.len()
+    while i > 0
+        i -= 1
+        out = out + char(u8('0') + digits.at(i)).to_string()
+    out
+
+private logic(l: *Lowering, and: bool, left: &TExpr, right: &TExpr) -> Option[Operand]
+    val a = lower_expr(l, left)?
+    val slot = new_slot(l, Bool)
+    store(l, slot, Some(a))
+    val rest = new_block(l)
+    val done = new_block(l)
+    finish_into(l, if and then Branch(a, rest, done) else Branch(a, done, rest), rest)
+    store(l, slot, lower_expr(l, right))
+    finish_into(l, Jump(done), done)
+    load(l, slot)
+
+private compare_op(op: CompareOp) -> MirCmp = op match
+    Equal -> CmpEq
+    NotEqual -> CmpNe
+    Less -> CmpLt
+    LessEqual -> CmpLe
+    Greater -> CmpGt
+    GreaterEqual -> CmpGe
+    _ -> CmpEq
+
+// A chain evaluates each operand when its link is reached, and the first false link decides.
+private compare_chain(l: *Lowering, operands: Buf[&TExpr], ops: Buf[CompareOp]) -> Option[Operand]
+    var previous = lower_expr(l, operands.at(0))?
+    if ops.len() == 1
+        val next = lower_expr(l, operands.at(1))?
+        return Some(compare(l, compare_op(ops.at(0)), previous, next))
+    val slot = new_slot(l, Bool)
+    val done = new_block(l)
+    for i in 0..<ops.len()
+        val next = lower_expr(l, operands.at(i + 1))?
+        val result = compare(l, compare_op(ops.at(i)), previous, next)
+        store(l, slot, Some(result))
+        if i + 1 < ops.len()
+            val more = new_block(l)
+            finish_into(l, Branch(result, more, done), more)
+        previous = next
+    finish_into(l, Jump(done), done)
+    load(l, slot)
+
+private lower_if(l: *Lowering, e: &TExpr, condition: &TExpr, yes: &TExpr, no: Option[&TExpr]) -> Option[Operand]
+    val c = lower_expr(l, condition)?
+    val slot = new_slot(l, e.ty)
+    val then_block = new_block(l)
+    val join = new_block(l)
+    val else_block = if no is Some(_) then new_block(l) else join
+    finish_into(l, Branch(c, then_block, else_block), then_block)
+    store(l, slot, lower_expr(l, yes))
+    finish(l, Jump(join))
+    if no is Some(n)
+        l.current = else_block
+        store(l, slot, lower_expr(l, n))
+        finish(l, Jump(join))
+    l.current = join
+    load(l, slot)
+
+private lower_while(l: *Lowering, e: &TExpr, label: usize, condition: &TExpr, body: &TExpr, otherwise: Option[&TExpr]) -> Option[Operand]
+    val slot = new_slot(l, e.ty)
+    val head = new_block(l)
+    val exit = new_block(l)
+    finish_into(l, Jump(head), head)
+    val c = lower_expr(l, condition)?
+    val body_block = new_block(l)
+    val else_block = if otherwise is Some(_) then new_block(l) else exit
+    finish_into(l, Branch(c, body_block, else_block), body_block)
+    l.loops.push(LoopTarget(label, head, exit, slot))
+    lower_expr(l, body)
+    l.loops.truncate(l.loops.len() - 1)
+    finish(l, Jump(head))
+    if otherwise is Some(o)
+        l.current = else_block
+        store(l, slot, lower_expr(l, o))
+        finish(l, Jump(exit))
+    l.current = exit
+    load(l, slot)
