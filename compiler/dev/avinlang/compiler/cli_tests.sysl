@@ -1,0 +1,119 @@
+module dev.avinlang.compiler
+@tests
+
+import sysl.fs.{exists, is_link, make_temp_dir, read_text, remove_dir_all, symlink, write_bytes, write_text}
+import sysl.process.{Exited, capture}
+
+private struct Run
+    status: int
+    said: string
+    noted: string
+
+private avin(args: []const string) -> Run
+    var said = ""
+    var noted = ""
+    val status = run_cli(args, Some(repository_toolchain()), s -> said = said + s + "\n", s -> noted = noted + s + "\n")
+    Run(status, said, noted)
+
+@test("help and version go to the output channel and succeed")
+help_and_version()
+    val help = avin(["avin", "--help"])
+    assert_eq(help.status, 0)
+    assert(help.said.starts_with("usage: avin "))
+    assert_eq(help.noted, "")
+    val version = avin(["avin", "--version"])
+    assert_eq(version.status, 0)
+    assert_eq(version.said, "avin " + Version + "\n")
+
+@test("an incorrect invocation prints the usage to the error channel and exits 2")
+usage_errors()
+    refused(["avin"])
+    refused(["avin", "unknown", "x.avin"])
+    refused(["avin", "parse"])
+    refused(["avin", "emit-llvm", "x.avin"])
+    refused(["avin", "build", "x.avin", "-o"])
+    refused(["avin", "build", "x.avin", "--bad", "out"])
+    refused(["avin", "check", "x.avin", "-o", "out"])
+
+private refused(args: []const string)
+    val run = avin(args)
+    assert_eq(run.status, 2)
+    assert_eq(run.said, "")
+    assert(run.noted.starts_with("usage: avin "))
+
+@test("parse and check report success, and source errors exit 1 with diagnostics")
+front_end_commands()
+    val dir = make_temp_dir("avin-cli").unwrap()
+    defer _ = remove_dir_all(dir)
+    val good = dir + "/good.avin"
+    write_text(good, "main() = 42\n").unwrap()
+    assert_eq(avin(["avin", "parse", good]).said, "parsed 1 declarations\n")
+    assert_eq(avin(["avin", "check", good]).said, "checked " + good + "\n")
+    val bad = dir + "/bad.avin"
+    write_text(bad, "main() = missing\n").unwrap()
+    val failed = avin(["avin", "check", bad])
+    assert_eq(failed.status, 1)
+    assert_eq(failed.said, "")
+    assert(failed.noted.contains("`missing` is not defined"))
+    val absent = avin(["avin", "check", dir + "/absent.avin"])
+    assert_eq(absent.status, 1)
+    assert(absent.noted.contains("absent.avin"))
+    val invalid = dir + "/invalid.avin"
+    write_bytes(invalid, [u8(0xff)]).unwrap()
+    assert_eq(avin(["avin", "check", invalid]).status, 1)
+
+@test("without a toolchain, commands that compile say how to provide one")
+missing_toolchain()
+    val dir = make_temp_dir("avin-cli").unwrap()
+    defer _ = remove_dir_all(dir)
+    val good = dir + "/good.avin"
+    write_text(good, "main() = 42\n").unwrap()
+    var noted = ""
+    val status = run_cli(["avin", "check", good], None, s -> (), s -> noted = noted + s)
+    assert_eq(status, 1)
+    assert(noted.contains("AVIN_ROOT"))
+    assert_eq(run_cli(["avin", "parse", good], None, s -> (), s -> ()), 0)
+
+@test("build writes a runnable executable to a path with spaces and shell characters")
+build_and_run()
+    val dir = make_temp_dir("avin-cli").unwrap()
+    defer _ = remove_dir_all(dir)
+    val source = dir + "/source with spaces; $x.avin"
+    write_text(source, "main() -> int\n    print(\"built\")\n    42\n").unwrap()
+    val binary = dir + "/out put; $y"
+    val built = avin(["avin", "build", source, "-o", binary])
+    assert_eq(built.noted, "")
+    assert_eq(built.status, 0)
+    val run = capture(binary, stderr = true, timeout = 10000).unwrap()
+    assert(run.status == Exited(42))
+    assert_eq(run.text, "built\n")
+    val ir = dir + "/program.ll"
+    assert_eq(avin(["avin", "emit-llvm", source, "-o", ir]).status, 0)
+    assert(read_text(ir).unwrap().contains("define i32 @main()"))
+
+@test("a failed build leaves existing output untouched and never overwrites the source")
+output_protection()
+    val dir = make_temp_dir("avin-cli").unwrap()
+    defer _ = remove_dir_all(dir)
+    val artifact = dir + "/previous"
+    write_text(artifact, "previous output").unwrap()
+    val bad = dir + "/bad.avin"
+    write_text(bad, "main() = missing\n").unwrap()
+    assert_eq(avin(["avin", "build", bad, "-o", artifact]).status, 1)
+    assert_eq(avin(["avin", "emit-llvm", bad, "-o", artifact]).status, 1)
+    assert_eq(read_text(artifact).unwrap(), "previous output")
+    val good = dir + "/good.avin"
+    write_text(good, "main() = 42\n").unwrap()
+    val alias = dir + "/alias.avin"
+    symlink(good, alias).unwrap()
+    for command in ["build", "emit-llvm"]
+        assert_eq(avin(["avin", command, good, "-o", good]).status, 2)
+        assert_eq(avin(["avin", command, good, "-o", alias]).status, 2)
+        assert(is_link(alias))
+        assert_eq(read_text(good).unwrap(), "main() = 42\n")
+    assert_eq(avin(["avin", "build", good, "-o", dir]).status, 1)
+
+@test("the default output is the source's name without its extension, in the working directory")
+default_output_name()
+    assert_eq(default_output("examples/hello.avin"), "hello")
+    assert_eq(default_output("/tmp/a/hello.world.avin"), "hello.world")

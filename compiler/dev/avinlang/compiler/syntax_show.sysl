@@ -1,0 +1,206 @@
+module dev.avinlang.compiler
+
+import sysl.buf.Buf
+
+// A compact, fully parenthesized rendering of syntax trees, for tests and for looking at what the
+// parser built: `1 + 2 * 3` shows as `(+ 1 (* 2 3))`.
+
+unary_spelling(op: UnaryOp) -> string = op match
+    Negate -> "-"
+    Plus -> "+"
+    Not -> "!"
+    Complement -> "~"
+
+binary_spelling(op: BinaryOp) -> string = op match
+    Add -> "+"
+    Subtract -> "-"
+    Multiply -> "*"
+    Divide -> "/"
+    Remainder -> "%"
+    ShiftLeft -> "<<"
+    ShiftRight -> ">>"
+    AddWrapping -> "+%"
+    SubtractWrapping -> "-%"
+    MultiplyWrapping -> "*%"
+    AddSaturating -> "+|"
+    SubtractSaturating -> "-|"
+    MultiplySaturating -> "*|"
+    BitAnd -> "&"
+    BitOr -> "|"
+    BitXor -> "^"
+    And -> "&&"
+    Or -> "||"
+
+compare_spelling(op: CompareOp) -> string = op match
+    Equal -> "=="
+    NotEqual -> "!="
+    Same -> "==="
+    NotSame -> "!=="
+    Less -> "<"
+    LessEqual -> "<="
+    Greater -> ">"
+    GreaterEqual -> ">="
+
+private joined(items: Buf[&Expr]) -> string
+    var out = ""
+    for i in 0..<items.len()
+        if i > 0 then out = out + " "
+        out = out + show_expr(items.at(i))
+    out
+
+private optional(e: Option[&Expr]) -> string = e match
+    Some(v) -> " " + show_expr(v)
+    None -> ""
+
+show_expr(e: &Expr) -> string = e.kind match
+    Invalid -> "<invalid>"
+    UnitLit -> "()"
+    IntLit(spelling) -> spelling
+    RealLit(value) -> value.to_string()
+    CharLit(value) -> f"$value%?"
+    StringLit(value) -> f"$value%?"
+    BoolLit(value) -> if value then "true" else "false"
+    Name(name) -> name
+    Tuple(items) -> "(tuple " + joined(items) + ")"
+    ListLit(items) -> "[" + joined(items) + "]"
+    SetLit(items) -> "{" + joined(items) + "}"
+    MapLit(keys, values) ->
+        var out = "{"
+        for i in 0..<keys.len()
+            if i > 0 then out = out + " "
+            out = out + show_expr(keys.at(i)) + ": " + show_expr(values.at(i))
+        out + "}"
+    Block(items, discard) -> (if discard then "(block! " else "(block ") + joined(items) + ")"
+    Binding(name, declared, value, mutable) ->
+        val ty = declared match
+            Some(t) -> ": " + show_type(t)
+            None -> ""
+        (if mutable then "(var " else "(val ") + name + ty + " " + show_expr(value) + ")"
+    LocalFunction(f) -> show_function(f)
+    Lambda(params, body) ->
+        var out = "(fn ("
+        for i in 0..<params.len()
+            if i > 0 then out = out + " "
+            val p = params.at(i)
+            out = out + p.name
+            if p.declared is Some(t) then out = out + ": " + show_type(t)
+        out + ") " + show_expr(body) + ")"
+    Assign(target, op, value, yields) ->
+        val spelling = (op match
+            Some(o) -> binary_spelling(o)
+            None -> "") + (if yields then ":=" else "=")
+        "(" + spelling + " " + show_expr(target) + " " + show_expr(value) + ")"
+    Update(target, increment, postfix) ->
+        val op = if increment then "++" else "--"
+        "(" + (if postfix then "post" else "pre") + op + " " + show_expr(target) + ")"
+    If(condition, yes, no) -> "(if " + show_expr(condition) + " " + show_expr(yes) + optional(no) + ")"
+    While(condition, body, otherwise) -> "(while " + show_expr(condition) + " " + show_expr(body) + optional(otherwise) + ")"
+    Break(value) -> "(break" + optional(value) + ")"
+    Continue -> "(continue)"
+    Return(value) -> "(return" + optional(value) + ")"
+    Match(subject, arms) ->
+        var out = "(match " + show_expr(subject)
+        for arm in arms
+            out = out + " (" + show_pattern(arm.pattern)
+            if arm.guard is Some(g) then out = out + " if " + show_expr(g)
+            out = out + " -> " + show_expr(arm.body) + ")"
+        out + ")"
+    Unary(op, operand) -> "(" + unary_spelling(op) + " " + show_expr(operand) + ")"
+    Binary(op, left, right) -> "(" + binary_spelling(op) + " " + show_expr(left) + " " + show_expr(right) + ")"
+    Compare(operands, ops) ->
+        var out = "(" + show_expr(operands.at(0))
+        for i in 0..<ops.len()
+            out = out + " " + compare_spelling(ops.at(i)) + " " + show_expr(operands.at(i + 1))
+        out + ")"
+    Range(lower, upper, inclusive) -> "(" + (if inclusive then ".." else "..<") + " " + show_expr(lower) + " " + show_expr(upper) + ")"
+    Is(value, pattern, negated) -> "(" + (if negated then "is-not " else "is ") + show_expr(value) + " " + show_pattern(pattern) + ")"
+    Propagate(value) -> "(? " + show_expr(value) + ")"
+    Call(callee, args) ->
+        var out = "(call " + show_expr(callee)
+        for a in args
+            out = out + " "
+            if a.name is Some(n) then out = out + n + "="
+            out = out + show_expr(a.value)
+        out + ")"
+    Member(target, name) -> "(. " + show_expr(target) + " " + name + ")"
+    TupleIndex(target, index) -> s"(.$index " + show_expr(target) + ")"
+    TypeApply(target, args) ->
+        var out = "(apply " + show_expr(target)
+        for a in args
+            out = out + " " + show_type(a)
+        out + ")"
+end show_expr
+
+show_type(t: &TypeExpr) -> string = t.kind match
+    InvalidType -> "<invalid>"
+    Named(path, args) ->
+        if args.len() == 0 then return path
+        var out = path + "["
+        for i in 0..<args.len()
+            if i > 0 then out = out + ", "
+            out = out + show_type(args.at(i))
+        out + "]"
+    Tuple(items) ->
+        var out = "("
+        for i in 0..<items.len()
+            if i > 0 then out = out + ", "
+            out = out + show_type(items.at(i))
+        out + ")"
+    Function(params, result) ->
+        var out = "("
+        for i in 0..<params.len()
+            if i > 0 then out = out + ", "
+            if params.at(i).by_name then out = out + "-> "
+            out = out + show_type(params.at(i).ty)
+        out + ") -> " + show_type(result)
+
+show_pattern(p: &Pattern) -> string = p.kind match
+    InvalidPattern -> "<invalid>"
+    Wildcard -> "_"
+    Name(name) -> name
+    Literal(value) -> show_expr(value)
+    Constructor(path, args) ->
+        var out = path + "("
+        for i in 0..<args.len()
+            if i > 0 then out = out + ", "
+            out = out + show_pattern(args.at(i))
+        out + ")"
+    Tuple(items) ->
+        var out = "(tuple"
+        for item in items
+            out = out + " " + show_pattern(item)
+        out + ")"
+    Alternatives(options) ->
+        var out = "(|"
+        for option in options
+            out = out + " " + show_pattern(option)
+        out + ")"
+    Named(name, pattern) -> name + " @ " + show_pattern(pattern)
+    Range(lower, upper, inclusive) -> "(" + (if inclusive then ".." else "..<") + " " + show_expr(lower) + " " + show_expr(upper) + ")"
+
+show_function(f: &Function) -> string
+    var out = "(def "
+    for a in f.annotations
+        out = out + "@" + a.name + " "
+    out = out + f.name
+    if f.type_params.len() > 0
+        out = out + "["
+        for i in 0..<f.type_params.len()
+            if i > 0 then out = out + ", "
+            val tp = f.type_params.at(i)
+            out = out + tp.name
+            for j in 0..<tp.bounds.len()
+                out = out + (if j == 0 then ": " else " + ") + show_type(tp.bounds.at(j))
+        out = out + "]"
+    out = out + "("
+    for i in 0..<f.params.len()
+        if i > 0 then out = out + ", "
+        val p = f.params.at(i)
+        out = out + show_pattern(p.pattern) + ": " + (if p.by_name then "-> " else "") + show_type(p.ty) + (if p.variadic then "*" else "")
+        if p.default is Some(d) then out = out + " = " + show_expr(d)
+    out = out + ")"
+    if f.result is Some(r) then out = out + " -> " + show_type(r)
+    if f.guard is Some(g) then out = out + " | " + show_expr(g)
+    f.body match
+        Some(b) -> out + " " + show_expr(b) + ")"
+        None -> out + ")"

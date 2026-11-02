@@ -1,0 +1,115 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{current_dir, entries, exists, make_temp_dir, read_text, remove_dir_all}
+import sysl.process.{Exited, Signalled, capture}
+
+// The execution corpus: Avin programs under `tests/` with their expected behaviour.
+//
+// `tests/run/*.avin` must compile and, at -O0 and -O2, exit and print exactly as expected. A
+// program's leading comment says how it ends: `// expect: exit N`, or `// expect: trap` for a
+// program a trap stops; with neither, it exits 0. Its standard output and error are in `NAME.out`
+// and `NAME.err` beside it, when it writes any.
+//
+// `tests/reject/*.avin` must fail to compile, and each `// error: TEXT` line in it names text the
+// diagnostics must contain.
+//
+// The tests find the corpus from the working directory, which `sysl test` leaves as it found it:
+// they run from the repository root or from `compiler/`.
+
+repository_toolchain() -> Toolchain
+    val here = current_dir().unwrap_or(".")
+    for root in [here, here + "/.."]
+        if toolchain_at(root) is Some(tc) then return tc
+    panic("run the tests from the repository root or from compiler/: no library/ and runtime/ at " + here)
+
+private struct Expectation
+    exit: int
+    trap: bool
+    errors: Buf[string]
+
+private expectation(text: string) -> Expectation
+    var e = Expectation(0, false, buf())
+    for line in text.split("\n")
+        if line.starts_with("// expect: exit ") then e.exit = parse_int(line["// expect: exit ".bytes.len..])
+        elif line == "// expect: trap" then e.trap = true
+        elif line.starts_with("// error: ") then e.errors.push(line["// error: ".bytes.len..])
+    e
+
+private parse_int(text: string) -> int
+    var n = 0
+    for b in text.bytes
+        if b >= u8('0') && b <= u8('9') then n = n * 10 + int(b - u8('0'))
+    n
+
+private sidecar(path: string, suffix: string) -> string
+    val other = path[0..<path.bytes.len - ".avin".bytes.len] + suffix
+    if exists(other) then read_text(other).unwrap_or("") else ""
+
+private cases(tc: Toolchain, dir: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    for name in entries(tc.root + "/tests/" + dir).unwrap_or(buf())
+        if name.ends_with(".avin") then out.push(tc.root + "/tests/" + dir + "/" + name)
+    out
+
+/** Runs one program at both optimization levels; a failure description, or "" when it passed. */
+private run_case(tc: Toolchain, path: string, scratch: string) -> string
+    val text = read_text(path).unwrap_or("")
+    val want = expectation(text)
+    val compiled = compile(tc, source_of(path, text))
+    if compiled.diagnostics != "" then return path + ": did not compile:\n" + compiled.diagnostics
+    val llvm = compiled.llvm.unwrap_or("")
+    val stdout = sidecar(path, ".out")
+    val stderr = sidecar(path, ".err")
+    var failures = ""
+    for level in ["-O0", "-O2"]
+        val binary = scratch + "/program" + level
+        link(tc, llvm, binary, level) match
+            Err(message) ->
+                failures = failures + s"$path $level: did not link: $message\n"
+                continue
+            Ok(_) -> ()
+        val run = capture(binary, stderr = true, timeout = 10000) match
+            Ok(r) -> r
+            Err(e) ->
+                failures = failures + s"$path $level: did not run: ${e.to_string()}\n"
+                continue
+        val ended = run.status match
+            Exited(code) -> !want.trap && code == want.exit
+            Signalled(_) -> want.trap
+            _ -> false
+        if !ended then failures = failures + s"$path $level: ended ${run.status.to_string()}\n"
+        if run.text != stdout then failures = failures + s"$path $level: standard output was:\n${run.text}\n"
+        if run.err.unwrap_or("") != stderr then failures = failures + s"$path $level: standard error was:\n${run.err.unwrap_or("")}\n"
+    failures
+
+@test("every program in tests/run builds, exits and prints as expected at -O0 and -O2")
+corpus_runs()
+    val tc = repository_toolchain()
+    val scratch = make_temp_dir("avin-corpus").unwrap()
+    defer _ = remove_dir_all(scratch)
+    var failures = ""
+    val all = cases(tc, "run")
+    assert(all.len() > 0)
+    for path in all
+        failures = failures + run_case(tc, path, scratch)
+    if failures != "" then panic(failures)
+
+@test("every program in tests/reject fails to compile with the expected diagnostics")
+corpus_rejects()
+    val tc = repository_toolchain()
+    var failures = ""
+    val all = cases(tc, "reject")
+    assert(all.len() > 0)
+    for path in all
+        val text = read_text(path).unwrap_or("")
+        val want = expectation(text)
+        if want.errors.len() == 0 then failures = failures + s"$path: names no expected error\n"
+        val compiled = compile(tc, source_of(path, text))
+        if compiled.diagnostics == "" then failures = failures + s"$path: compiled\n"
+        for message in want.errors
+            if !compiled.diagnostics.contains(message)
+                failures = failures + s"$path: no `$message` in:\n${compiled.diagnostics}\n"
+    if failures != "" then panic(failures)

@@ -1,0 +1,299 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+/** A source file in a program, with the report its diagnostics go to. */
+struct SourceUnit
+    src: Source
+    file: SourceFile
+    report: Report
+
+/** A function's signature and where it was declared. */
+struct FunctionSymbol
+    unit: usize
+    module_name: string
+    name: string
+    decl: &Function
+    params: Buf[&Type]
+    param_names: Buf[string]
+    /** The declared result type, or the one inferred from the body once it has been checked. */
+    result: Option[&Type]
+    intrinsic: Option[string]
+
+struct Checker
+    units: Buf[SourceUnit]
+    symbols: Buf[FunctionSymbol]
+    /** 0: not yet checked, 1: being checked, 2: checked. */
+    states: Buf[u8]
+    bodies: Buf[Option[&TExpr]]
+    scope: Map[string, usize]
+    current: usize
+
+    note(*self, unit: usize, at: Span, message: string)
+        self.units[unit].report.add(error(at, message))
+end Checker
+
+struct Checked
+    units: Buf[SourceUnit]
+    program: Option[TProgram]
+
+    has_errors(self) -> bool
+        for u in self.units
+            if u.report.has_errors() then return true
+        false
+
+    /** Every diagnostic, rendered against its own source. */
+    render(self) -> string
+        var out = ""
+        for u in self.units
+            if u.report.has_errors() then out = out + u.report.render(u.src)
+        out
+end Checked
+
+/** Checks a program. The last unit is the program's own file, which must declare `main`; the units
+ * before it (the prelude) are visible to it, and its own declarations shadow theirs. */
+check_program(units: Buf[SourceUnit]) -> Checked
+    var c = Checker(units, buf(), buf(), buf(), map(), 0)
+    for u in 0..<c.units.len()
+        declare_unit(&c, u)
+    for id in 0..<c.symbols.len()
+        check_function(&c, id)
+    val main_unit = c.units.len() - 1
+    var entry: Option[usize] = None
+    c.scope.get("main") match
+        Some(id) -> if c.symbols.at(id).unit == main_unit then entry = Some(id)
+        None -> ()
+    entry match
+        Some(id) ->
+            // The entry function takes nothing and yields unit or an integer, which becomes the
+            // exit status.
+            val main = c.symbols.at(id)
+            if main.params.len() > 0 then c.note(main_unit, main.decl.name_span, "`main` takes no parameters")
+            val result = main.result.unwrap_or(ErrorType)
+            if !(*result is Unit || *result is Int(_) || *result is ErrorType)
+                c.note(main_unit, main.decl.name_span, s"`main` yields unit or an integer, not ${type_name(result)}")
+        None -> c.note(main_unit, Span(0, 0), "a program needs a `main` function")
+    var failed = false
+    for u in c.units
+        if u.report.has_errors() then failed = true
+    if failed then return Checked(c.units, None)
+    val id = entry.unwrap()
+    var functions: Buf[TFunction] = buf()
+    for i in 0..<c.symbols.len()
+        functions.push(TFunction(i, c.bodies.at(i)))
+    Checked(c.units, Some(TProgram(c.symbols, functions, id)))
+
+private declare_unit(c: *Checker, unit: usize)
+    val file = c.units.at(unit).file
+    var seen: Map[string, Span] = map()
+    for item in file.items
+        item match
+            FunctionItem(f) ->
+                if seen.get(f.name) is Some(_)
+                    c.note(unit, f.name_span, s"`${f.name}` is declared more than once; functions with several clauses are not implemented")
+                    continue
+                seen.put(f.name, f.name_span)
+                val id = c.symbols.len()
+                c.symbols.push(signature(c, unit, file.module_name, f))
+                c.states.push(0)
+                c.bodies.push(None)
+                c.scope.put(f.name, id)
+            DataItem(d) -> c.note(unit, d.span, "data declarations are not implemented")
+
+private signature(c: *Checker, unit: usize, module_name: string, f: &Function) -> FunctionSymbol
+    var params: Buf[&Type] = buf()
+    var names: Buf[string] = buf()
+    if f.type_params.len() > 0 then c.note(unit, f.span, "generic functions are not implemented")
+    if f.guard is Some(g) then c.note(unit, g.span, "function guards are not implemented")
+    for p in f.params
+        p.pattern.kind match
+            Name(n) -> names.push(n)
+            _ ->
+                c.note(unit, p.pattern.span, "parameter patterns are not implemented")
+                names.push("_")
+        if p.by_name || p.variadic || p.default is Some(_)
+            c.note(unit, p.span, "by-name, repeated and default parameters are not implemented")
+        params.push(resolve_type(c, unit, p.ty))
+    var result: Option[&Type] = None
+    if f.result is Some(r) then result = Some(resolve_type(c, unit, r))
+    elif f.body is None then result = Some(Unit)
+    elif f.body is Some(b)
+        if b.kind is Block(_, true) then result = Some(Unit)
+    val intrinsic = intrinsic_of(c, unit, f)
+    if intrinsic is Some(name)
+        intrinsic_signature(name) match
+            Some(expected) ->
+                val declared: &Type = Function(params, result.unwrap_or(Unit))
+                if !same_type(declared, expected)
+                    c.note(unit, f.name_span, s"intrinsic `$name` has type ${type_name(expected)}, not ${type_name(declared)}")
+            None -> c.note(unit, f.name_span, s"`$name` is not an intrinsic")
+    elif f.body is None
+        c.note(unit, f.name_span, s"`${f.name}` needs a body")
+    FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic)
+
+// `@intrinsic("name")` is the only annotation this compiler gives meaning to; it is valid only on a
+// function without a body.
+private intrinsic_of(c: *Checker, unit: usize, f: &Function) -> Option[string]
+    var out: Option[string] = None
+    for a in f.annotations
+        if a.name != "intrinsic"
+            c.note(unit, a.span, s"unknown annotation `@${a.name}`")
+            continue
+        if a.args.len() != 1 || a.args.at(0).name is Some(_)
+            c.note(unit, a.span, "`@intrinsic` takes one string, the intrinsic's name")
+            continue
+        a.args.at(0).value.kind match
+            StringLit(name) -> out = Some(name)
+            _ -> c.note(unit, a.span, "`@intrinsic` takes one string, the intrinsic's name")
+        if f.body is Some(_) then c.note(unit, a.span, "an intrinsic function has no body")
+    out
+
+/** The intrinsics the compiler implements, with the type each must be declared with. */
+intrinsic_signature(name: string) -> Option[&Type]
+    if name == "print_line"
+        var params: Buf[&Type] = buf()
+        params.push(Str)
+        return Some(Function(params, Unit))
+    None
+
+resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
+    InvalidType -> ErrorType
+    Named(path, args) ->
+        builtin_type(path) match
+            Some(ty) ->
+                if args.len() > 0
+                    c.note(unit, t.span, s"`$path` takes no type arguments")
+                    return ErrorType
+                ty
+            None ->
+                c.note(unit, t.span, s"unknown type `$path`")
+                ErrorType
+    Tuple(_) ->
+        c.note(unit, t.span, "tuple types are not implemented")
+        ErrorType
+    Function(_, _) ->
+        c.note(unit, t.span, "function types are not implemented")
+        ErrorType
+
+private check_function(c: *Checker, id: usize)
+    if c.states.at(id) != 0 then return
+    c.states.set(id, 1)
+    val symbol = c.symbols.at(id)
+    symbol.decl.body match
+        Some(body) ->
+            val previous = c.current
+            c.current = id
+            val typed = check_expr(c, body, symbol.result)
+            c.current = previous
+            symbol.result match
+                Some(declared) ->
+                    if !conforms(typed.ty, declared) && !(*declared is Unit)
+                        c.note(symbol.unit, body.span, s"`${symbol.name}` yields ${type_name(typed.ty)}, not ${type_name(declared)}")
+                None -> c.symbols[id].result = Some(typed.ty)
+            c.bodies.set(id, Some(typed))
+        None -> ()
+    c.states.set(id, 2)
+
+private unit_of(c: *Checker) -> usize = c.symbols.at(c.current).unit
+
+check_expr(c: *Checker, e: &Expr, expected: Option[&Type]) -> &TExpr
+    val unit = unit_of(c)
+    e.kind match
+        IntLit(spelling) -> integer_literal(c, e.span, spelling, false, expected)
+        Unary(Negate, operand) ->
+            operand.kind match
+                IntLit(spelling) -> integer_literal(c, e.span, spelling, true, expected)
+                _ -> unsupported(c, e, "arithmetic")
+        BoolLit(value) -> TExpr(e.span, Bool, BoolConst(value))
+        StringLit(value) -> TExpr(e.span, Str, StrConst(value))
+        UnitLit -> TExpr(e.span, Unit, UnitConst)
+        Name(name) -> name_expr(c, e.span, name)
+        Call(callee, args) -> call_expr(c, e.span, callee, args)
+        Block(items, discard) ->
+            var typed: Buf[&TExpr] = buf()
+            for i in 0..<items.len()
+                val last = i + 1 == items.len()
+                val item = items.at(i)
+                if item.kind is LocalFunction(_)
+                    typed.push(unsupported(c, item, "local functions"))
+                    continue
+                typed.push(check_expr(c, item, if last && !discard then expected else None))
+            val ty: &Type = if discard || typed.len() == 0 then Unit else typed.at(typed.len() - 1).ty
+            TExpr(e.span, ty, Block(typed))
+        Invalid -> TExpr(e.span, ErrorType, UnitConst)
+        _ -> unsupported(c, e, "this expression")
+
+private unsupported(c: *Checker, e: &Expr, what: string) -> &TExpr
+    c.note(unit_of(c), e.span, s"$what is not implemented")
+    TExpr(e.span, ErrorType, UnitConst)
+
+private name_expr(c: *Checker, at: Span, name: string) -> &TExpr
+    val symbol = c.symbols.at(c.current)
+    for i in 0..<symbol.param_names.len()
+        if symbol.param_names.at(i) == name then return TExpr(at, symbol.params.at(i), Param(i))
+    if c.scope.get(name) is Some(_)
+        c.note(symbol.unit, at, s"`$name` is a function; function values are not implemented")
+    else c.note(symbol.unit, at, s"`$name` is not defined")
+    TExpr(at, ErrorType, UnitConst)
+
+private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument]) -> &TExpr
+    val unit = unit_of(c)
+    val name = callee.kind match
+        Name(n) -> n
+        _ ->
+            c.note(unit, callee.span, "only a named function can be called")
+            return TExpr(at, ErrorType, UnitConst)
+    val id = c.scope.get(name) match
+        Some(i) -> i
+        None ->
+            c.note(unit, callee.span, s"`$name` is not defined")
+            return TExpr(at, ErrorType, UnitConst)
+    val target = c.symbols.at(id)
+    var typed: Buf[&TExpr] = buf()
+    for i in 0..<args.len()
+        val arg = args.at(i)
+        if arg.name is Some(_) then c.note(unit, arg.span, "named arguments are not implemented")
+        val wanted: Option[&Type] = if i < target.params.len() then Some(target.params.at(i)) else None
+        val value = check_expr(c, arg.value, wanted)
+        if wanted is Some(w)
+            if !conforms(value.ty, w)
+                c.note(unit, arg.value.span, s"expected ${type_name(w)}, found ${type_name(value.ty)}")
+        typed.push(value)
+    if args.len() != target.params.len()
+        c.note(unit, at, s"`$name` takes ${target.params.len()} arguments, not ${args.len()}")
+    val result = result_of(c, id, at)
+    TExpr(at, result, Call(id, typed))
+
+// A function without a declared result type has the type of its body, so its body is checked
+// first; a cycle of such functions is reported rather than guessed at.
+private result_of(c: *Checker, id: usize, at: Span) -> &Type
+    if c.symbols.at(id).result is Some(r) then return r
+    if c.states.at(id) == 1
+        c.note(unit_of(c), at, s"`${c.symbols.at(id).name}` is recursive, so it needs a declared result type")
+        return ErrorType
+    check_function(c, id)
+    c.symbols.at(id).result.unwrap_or(ErrorType)
+
+// An integer literal takes its width from the expected type, or is an `int`. `-` applied directly
+// to a literal is part of it, so the most negative value of each width can be written.
+private integer_literal(c: *Checker, at: Span, spelling: string, negative: bool, expected: Option[&Type]) -> &TExpr
+    var bits = IntBits
+    if expected is Some(t)
+        if *t is Int(b) then bits = b
+    val ty: &Type = Int(bits)
+    var s = scanner_of(spelling)
+    val magnitude = read_number(&s) match
+        Ok(Int(v)) -> v
+        _ ->
+            val message = if bits > 64 then "integer literals wider than 64 bits are not implemented" else s"integer literal does not fit in ${type_name(ty)}"
+            c.note(unit_of(c), at, message)
+            return TExpr(at, ErrorType, UnitConst)
+    if bits <= 64
+        val limit = ulong(1) << ulong(bits - 1)
+        if magnitude > limit || (!negative && magnitude == limit)
+            c.note(unit_of(c), at, s"integer literal does not fit in ${type_name(ty)}")
+            return TExpr(at, ErrorType, UnitConst)
+    val digits = magnitude.to_string()
+    TExpr(at, ty, IntConst(if negative && magnitude != 0 then "-" + digits else digits))

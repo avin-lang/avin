@@ -1,0 +1,157 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+
+private tree(text: string) -> string
+    val parsed = parse_expression(source_of("test.avin", text))
+    if parsed.report.has_errors() then panic(parsed.report.render(source_of("test.avin", text)))
+    show_expr(parsed.tree)
+
+private diagnostics(text: string) -> string
+    val src = source_of("test.avin", text)
+    val parsed = parse(src)
+    parsed.report.render(src)
+
+private declarations(text: string) -> string
+    val src = source_of("test.avin", text)
+    val parsed = parse(src)
+    if parsed.report.has_errors() then panic(parsed.report.render(src))
+    var out = ""
+    for item in parsed.file.items
+        val shown = item match
+            FunctionItem(f) -> show_function(f)
+            DataItem(d) -> "(data " + d.name + ")"
+        out = out + shown + "\n"
+    out
+
+@test("binary operators follow the precedence table and associate left")
+precedence()
+    assert_eq(tree("1 + 2 * 3"), "(+ 1 (* 2 3))")
+    assert_eq(tree("a - b - c"), "(- (- a b) c)")
+    assert_eq(tree("1 + 2 << 3"), "(+ 1 (<< 2 3))")
+    assert_eq(tree("x & mask == 0"), "((& x mask) == 0)")
+    assert_eq(tree("a | b ^ c & d"), "(| a (^ b (& c d)))")
+    assert_eq(tree("a || b && c"), "(|| a (&& b c))")
+    assert_eq(tree("-a.b"), "(- (. a b))")
+    assert_eq(tree("!f(x)"), "(! (call f x))")
+    assert_eq(tree("a +% b *| c"), "(+% a (*| b c))")
+
+@test("comparisons chain into one expression and parentheses end a chain")
+comparison_chains()
+    assert_eq(tree("a < b <= c"), "(a < b <= c)")
+    assert_eq(tree("(a < b) == flag"), "((a < b) == flag)")
+    assert_eq(tree("x === y"), "(x === y)")
+
+@test("collection literals distinguish lists, sets and maps, and bare map keys are strings")
+collections()
+    assert_eq(tree("[1, 2]"), "[1 2]")
+    assert_eq(tree("[]"), "[]")
+    assert_eq(tree("{1, 2}"), "{1 2}")
+    assert_eq(tree("{}"), "{}")
+    assert_eq(tree("{a: 1, \"b c\": 2}"), "{\"a\": 1 \"b c\": 2}")
+    assert_eq(tree("{(a): 1}"), "{a: 1}")
+    assert_eq(tree("[1,\n 2,\n]"), "[1 2]")
+    assert(parse_expression(source_of("t.avin", "{1, a: 2}")).report.has_errors())
+
+@test("parentheses group, make tuples and unit, and tuple elements are read by index")
+tuples()
+    assert_eq(tree("()"), "()")
+    assert_eq(tree("(1)"), "1")
+    assert_eq(tree("(1, \"one\")"), "(tuple 1 \"one\")")
+    assert_eq(tree("t.0"), "(.0 t)")
+    assert_eq(tree("t.0.1"), "(.1 (.0 t))")
+    assert_eq(tree("t.1.name"), "(. (.1 t) name)")
+
+@test("lambdas take one bare parameter or a parenthesized list")
+lambdas()
+    assert_eq(tree("x -> x + 1"), "(fn (x) (+ x 1))")
+    assert_eq(tree("(a, b) -> a"), "(fn (a b) a)")
+    assert_eq(tree("(n: int) -> n"), "(fn (n: int) n)")
+    assert_eq(tree("() -> 1"), "(fn () 1)")
+    assert_eq(tree("f((x) -> x)"), "(call f (fn (x) x))")
+
+@test("calls take positional and named arguments, and type arguments")
+calls()
+    assert_eq(tree("open(path, create = true)"), "(call open path create=true)")
+    assert_eq(tree("f()"), "(call f)")
+    assert_eq(tree("parse[int](text)"), "(call (apply parse int) text)")
+    assert_eq(tree("Map.empty[string, int]"), "(apply (. Map empty) string int)")
+    assert_eq(tree("f(x == y)"), "(call f (x == y))")
+
+@test("assignment forms record their operator and whether they yield")
+assignments()
+    assert_eq(tree("x = 1"), "(= x 1)")
+    assert_eq(tree("x += 1"), "(+= x 1)")
+    assert_eq(tree("x := 2"), "(:= x 2)")
+    assert_eq(tree("x +%:= 1"), "(+%:= x 1)")
+    assert_eq(tree("x <<= 2"), "(<<= x 2)")
+    assert_eq(tree("a = b = c"), "(= a (= b c))")
+    assert_eq(tree("x++"), "(post++ x)")
+    assert_eq(tree("--x"), "(pre-- x)")
+
+@test("pattern tests, propagation and ranges are expressions")
+tests_and_ranges()
+    assert_eq(tree("v is Some(x)"), "(is v Some(x))")
+    assert_eq(tree("v is not None"), "(is-not v None)")
+    assert_eq(tree("a && v is Some(_)"), "(&& a (is v Some(_)))")
+    assert_eq(tree("read()?"), "(? (call read))")
+    assert_eq(tree("1..<n + 1"), "(..< 1 (+ n 1))")
+    assert_eq(tree("a..b"), "(.. a b)")
+    assert(parse_expression(source_of("t.avin", "a..b..c")).report.has_errors())
+
+@test("match arms take every pattern form, guards, and a fallback")
+patterns()
+    val text = "n match\n    0 -> 1\n    -1 -> 2\n    1..<5 -> 3\n    Some(x) | None -> 4\n    all @ (a, b) -> 5\n    _ -> 6\n    true -> 7\n    \"s\" | 'c' -> 8\n    () -> 9\n    k if k > 0 -> 10\n    Color.Red -> 11\n    else 12\n"
+    assert_eq(tree(text), "(match n (0 -> 1) ((- 1) -> 2) ((..< 1 5) -> 3) ((| Some(x) None) -> 4) (all @ (tuple a b) -> 5) (_ -> 6) (true -> 7) ((| \"s\" 'c') -> 8) (() -> 9) (k if (k > 0) -> 10) (Color.Red() -> 11) (_ -> 12))")
+
+@test("a match guard's arrow is not read as a lambda")
+guard_arrows()
+    assert_eq(tree("n match\n    k if ok(k) -> k\n    else 0\n"), "(match n (k if (call ok k) -> k) (_ -> 0))")
+    assert_eq(tree("n match\n    k if any(x -> x) -> k\n    else 0\n"), "(match n (k if (call any (fn (x) x)) -> k) (_ -> 0))")
+
+@test("blocks, bindings and control forms parse with their optional end markers")
+control()
+    assert_eq(tree("if a then 1 else 2"), "(if a 1 2)")
+    assert_eq(tree("if a then 1 elif b then 2 else 3"), "(if a 1 (if b 2 3))")
+    assert_eq(tree("if a\n    f()\n    1\nelse\n    2\nend if\n"), "(if a (block (call f) 1) (block 2))")
+    assert_eq(tree("while go() do step()"), "(while (call go) (call step))")
+    assert_eq(tree("while n < 10\n    n += 1\n    if n == 5 then break n\nelse -1\n"), "(while (n < 10) (block! (+= n 1) (if (n == 5) (break n))) (- 1))")
+    assert_eq(tree("val x: int = 1"), "(val x: int 1)")
+    assert_eq(tree("var total =\n    1\n"), "(var total (block 1))")
+    assert_eq(tree("return"), "(return)")
+
+@test("declarations: module, imports, annotations, generics, parameters and data")
+declarations_parse()
+    val text = "module demo.app\nimport a.b.{c, d as e}\nimport f.g as h\n@test(\"name\", timeout: 30)\ncheck() = 1\n@intrinsic(\"print_line\")\nprint(text: string)\npick[T: Ord + Hash, U](f: (T, -> U) -> U, n: int = 1, xs: T*) -> U\n    f(xs)\nunless(c: bool, body: -> unit)\n    body\ndata Shape derives Eq\n    Circle(r: real)\n    Empty\n"
+    val src = source_of("test.avin", text)
+    val parsed = parse(src)
+    if parsed.report.has_errors() then panic(parsed.report.render(src))
+    assert_eq(parsed.file.module_name, "demo.app")
+    assert_eq(parsed.file.imports.len(), 3usize)
+    assert_eq(parsed.file.imports.at(1).path, "a.b.d")
+    assert_eq(parsed.file.imports.at(1).binding, "e")
+    assert_eq(parsed.file.imports.at(2).binding, "h")
+    assert_eq(declarations(text), "(def @test check() 1)\n(def @intrinsic print(text: string))\n(def pick[T: Ord + Hash, U](f: (T, -> U) -> U, n: int = 1, xs: T*) -> U (block (call f xs)))\n(def unless(c: bool, body: -> unit) (block! body))\n(data Shape)\n")
+
+@test("local functions in a block are declarations, and calls stay calls")
+local_functions()
+    assert_eq(declarations("f() =\n    helper(n: int) = n\n    helper(1)\n"), "(def f() (block (def helper(n: int) n) (call helper 1)))\n")
+    assert_eq(tree("x =\n    1\n"), "(= x (block 1))")
+    assert_eq(declarations("outer() -> int\n    inner(x: int) -> int\n        x\n    inner(2)\n"), "(def outer() -> int (block (def inner(x: int) -> int (block x)) (call inner 2)))\n")
+
+@test("malformed parameters, end markers and layout are diagnosed once each")
+syntax_errors()
+    assert(diagnostics("f(xs: int*, n: int) = 1").contains("a repeated parameter must be last"))
+    assert(diagnostics("data D\n    V(f: -> int)\n").contains("a data field cannot be by-name"))
+    assert(diagnostics("f(n: int)\n    n\nend g\n").contains("`end g` cannot close `f`"))
+    assert(diagnostics("f() =\n    1\n  2\n").contains("indentation does not match an enclosing block"))
+    assert(diagnostics("f() = (1, 2]").contains("mismatched closing delimiter"))
+    assert(diagnostics("f() = x => x").contains("function arrows are written `->`"))
+    val repeated = diagnostics("f() = 1 2 3 4 5\ng() = 1\n")
+    assert(repeated.contains("expected a new line after a declaration"))
+    assert(!repeated.contains("expected a name"))
+
+@test("comments and blank lines do not open blocks, and brackets suspend layout")
+layout_rules()
+    assert_eq(declarations("// comment\nf() = 1 // trailing\n\n    // indented comment\ng() = [1,\n        2]\n"), "(def f() 1)\n(def g() [1 2])\n")

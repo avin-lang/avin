@@ -1,0 +1,173 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.*
+import sysl.text.from_utf8_unchecked
+import sysl.buf.{Buf, buf}
+
+// Tokens carry their operator family, which is what the expression parser's binding powers are
+// keyed on. Layout is decided here: an indented line opens a block (Indent), a line at the same
+// depth separates items (Newline), and a shallower line closes blocks (Dedent). Line breaks inside
+// brackets are not significant.
+enum Token
+    Word
+    Number
+    RealNumber
+    Quoted
+    CharQuoted
+    Symbol
+    AddOp
+    MultiplyOp
+    CompareOp
+    RangeOp
+    BitOrOp
+    BitXorOp
+    BitAndOp
+    AssignOp
+    AndOp
+    OrOp
+    Postfix
+    IsKeyword
+    MatchKeyword
+    Newline
+    Indent
+    Dedent
+end Token
+
+struct Lexed
+    items: Tokens[Token]
+    report: Report
+
+lex(src: Source) -> Lexed
+    var s = scan(src)
+    var lay = layout()
+    var out: Tokens[Token] = tokens()
+    var rep = report()
+    var brackets: Buf[u8] = buf()
+    var head = true
+    var started = false
+    loop
+        if head
+            val ind = measure_indent(&s, 8)
+            if s.at_end() then break
+            if s.at_line_end() || s.starts_with("//".bytes)
+                s.skip_line()
+                continue
+            if ind.is_mixed() then rep.add(error(s.here(), "mixed tabs and spaces in indentation"))
+            val at = s.here()
+            lay.line(ind.columns) match
+                Same ->
+                    if started then out.push(Newline, at)
+                Deeper -> out.push(Indent, at)
+                Shallower(n) ->
+                    for i in 0..<n do out.push(Dedent, at)
+                Ragged(n) ->
+                    for i in 0..<n do out.push(Dedent, at)
+                    rep.add(error(at, "indentation does not match an enclosing block"))
+            started = true
+            head = false
+        s.skip_blanks()
+        if s.starts_with("//".bytes) then s.skip_to_line_end()
+        if s.at_end() then break
+        if s.at_line_end()
+            s.accept_newline()
+            head = lay.significant()
+            continue
+        val start = s.mark()
+        val c = s.peek().unwrap()
+        if is_ident_start(c)
+            s.read_ident(is_ident_start, is_ident_cont)
+            val word = from_utf8_unchecked(src.text(s.span_from(start)))
+            if word == "match"
+                out.push(MatchKeyword, s.span_from(start))
+                lay.opens_block()
+            elif word == "is" then out.push(IsKeyword, s.span_from(start))
+            else out.push(Word, s.span_from(start))
+        elif is_digit(c)
+            scan_numeric(&s) match
+                Ok(floating) -> out.push(if floating then RealNumber else Number, s.span_from(start))
+                Err(e) -> rep.add(error(where(e), e.to_string()))
+        elif c == u8('\'')
+            read_char_literal(&s, c) match
+                Ok(_) -> out.push(CharQuoted, s.span_from(start))
+                Err(e) -> rep.add(error(where(e), e.to_string()))
+        elif c == u8('"')
+            read_quoted(&s, c) match
+                Ok(_) -> out.push(Quoted, s.span_from(start))
+                Err(e) -> rep.add(error(where(e), e.to_string()))
+        else
+            read_operator(&s)
+            if c == u8('(') || c == u8('[') || c == u8('{')
+                brackets.push(c)
+                lay.open_bracket()
+            if c == u8(')') || c == u8(']') || c == u8('}')
+                val want = if c == u8(')') then u8('(') elif c == u8(']') then u8('[') else u8('{')
+                if brackets.len() == 0
+                    rep.add(error(s.span_from(start), "unmatched closing delimiter"))
+                else
+                    val opener = brackets.pop().unwrap()
+                    if opener != want then rep.add(error(s.span_from(start), "mismatched closing delimiter"))
+                val closed = lay.close_bracket()
+                for i in 0..<closed do out.push(Dedent, s.span_from(start))
+            val span = s.span_from(start)
+            val word = from_utf8_unchecked(src.text(span))
+            if word == "->" then lay.opens_block()
+            if word == "=>" then rep.add(error(span, "function arrows are written `->`"))
+            out.push(operator_token(word), span)
+    val at = s.here()
+    if brackets.len() > 0 then rep.add(error(at, "unclosed delimiter"))
+    val closed = lay.finish()
+    for i in 0..<closed do out.push(Dedent, at)
+    Lexed(out, rep)
+end lex
+
+// Scans a numeric literal and reports whether it is a real. Integer digits are scanned without a
+// width limit, since a literal's width comes from its context and may exceed 64 bits; only a
+// literal with a fraction or exponent goes through the real-number reader.
+private scan_numeric(s: *Scanner) -> Result[bool, LitError]
+    val start = s.offset
+    scan_integer(s)?
+    if s.offset > start + 1 && s.src[start] == u8('0')
+        val radix = s.src[start + 1]
+        if radix == u8('x') || radix == u8('X') || radix == u8('o') || radix == u8('O') || radix == u8('b') || radix == u8('B') then return Ok(false)
+    var real = false
+    if s.peek() == Some(u8('.'))
+        if s.peek_at(1) is Some(d) then real = d >= u8('0') && d <= u8('9')
+    if s.peek() == Some(u8('e')) || s.peek() == Some(u8('E')) then real = true
+    if !real then return Ok(false)
+    s.reset(start)
+    read_number(s) match
+        Ok(Real(value)) -> if value.is_infinite() then Err(BadReal(Span(start, s.offset))) else Ok(true)
+        Ok(Int(_)) -> Ok(false)
+        Err(e) -> Err(e)
+
+private scan_integer(s: *Scanner) -> Result[unit, LitError]
+    var base = 10
+    if s.peek() == Some(u8('0'))
+        val next = s.peek_at(1)
+        if next == Some(u8('x')) || next == Some(u8('X')) then base = 16
+        elif next == Some(u8('o')) || next == Some(u8('O')) then base = 8
+        elif next == Some(u8('b')) || next == Some(u8('B')) then base = 2
+        if base != 10 then s.skip(2)
+    skip_digits(s, base)
+
+private operator_token(word: string) -> Token
+    if word == "+" || word == "-" || word == "+%" || word == "-%" || word == "+|" || word == "-|" then AddOp
+    elif word == "*" || word == "/" || word == "%" || word == "<<" || word == ">>" || word == "*%" || word == "*|" then MultiplyOp
+    elif word == "==" || word == "!=" || word == "===" || word == "!==" || word == "<" || word == ">" || word == "<=" || word == ">=" then CompareOp
+    elif word == ".." || word == "..<" then RangeOp
+    elif word == "|" then BitOrOp
+    elif word == "^" then BitXorOp
+    elif word == "&" then BitAndOp
+    elif word == "&&" then AndOp
+    elif word == "||" then OrOp
+    elif word == "=" || word.ends_with("=") && word != "==" && word != "!=" && word != "<=" && word != ">=" then AssignOp
+    elif word == "(" || word == "." || word == "[" || word == "++" || word == "--" || word == "?" then Postfix
+    else Symbol
+
+// Longest spelling first, so that no operator is split into shorter valid ones.
+private read_operator(s: *Scanner)
+    for candidate in ["+%:=", "-%:=", "*%:=", "+|:=", "-|:=", "*|:=", "<<:=", ">>:=", "+%=", "-%=", "*%=", "+|=", "-|=", "*|=", "<<=", ">>=", "===", "!==", "..<", "+:=", "-:=", "*:=", "/:=", "%:=", "&:=", "|:=", "^:=", "++", "--", "+%", "-%", "*%", "+|", "-|", "*|", "<<", ">>", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", ":=", "..", "->", "=>"]
+        if s.starts_with(candidate.bytes)
+            for i in 0..<candidate.bytes.len do s.bump()
+            return
+    s.bump()

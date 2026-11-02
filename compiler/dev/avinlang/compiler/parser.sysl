@@ -1,0 +1,409 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+
+struct Parser
+    src: Source
+    toks: Tokens[Token]
+    report: Report
+    /** The token position of the `->` that ends a match guard, so the guard does not read it as a
+     * lambda arrow. */
+    lambda_boundary: Option[usize]
+
+    spelling(self, t: Spanned[Token]) -> string = from_utf8_unchecked(self.src.text(t.span))
+
+    at(self, word: string) -> bool = self.toks.peek() match
+        Some(t) -> self.spelling(t) == word
+        None -> false
+
+    at_kind(self, kind: Token) -> bool = self.toks.peek() match
+        Some(t) -> t.value == kind
+        None -> false
+
+    accept(*self, word: string) -> bool
+        if !self.at(word) then return false
+        self.toks.advance()
+        true
+
+    expect(*self, word: string)
+        if !self.accept(word)
+            self.report.add(expected(self.toks.here(), s"`$word`", found_at(self.src, self.toks.here())))
+
+    accept_kind(*self, kind: Token) -> bool
+        if !self.at_kind(kind) then return false
+        self.toks.advance()
+        true
+
+    expect_kind(*self, kind: Token, message: string)
+        if !self.accept_kind(kind) then self.report.add(error(self.toks.here(), message))
+
+    /** The spelling of the token `offset` places ahead, or "" past the end. */
+    ahead(self, offset: usize) -> string = self.toks.peek_at(offset) match
+        Some(t) -> self.spelling(t)
+        None -> ""
+
+    /** Whether the parser is at the end of a line or of the enclosing form. */
+    at_line_end(self) -> bool =
+        self.toks.at_end() || self.at_kind(Newline) || self.at_kind(Dedent) || self.at(")") ||
+            self.at("]") || self.at("}") || self.at(",") || self.at("else") || self.at("elif")
+end Parser
+
+impl TokenStream for Parser
+    type Token = Spanned[Token]
+    look(self) -> Option[Spanned[Token]]
+        // A dedent closes an expression's indented body. The next line may begin with `-` or `(`,
+        // which must not attach to the closed expression as an infix or postfix operator.
+        if self.toks.position > 0 && self.toks.items.at(self.toks.position - 1).value == Dedent then return None
+        self.toks.peek()
+    take(*self) -> Option[Spanned[Token]] = self.toks.advance()
+
+parser_for(src: Source) -> Parser
+    val lexed = lex(src)
+    Parser(src, lexed.items, lexed.report, None)
+
+struct ParsedExpr
+    tree: &Expr
+    report: Report
+
+/** Parses one expression; used by tests and tools. */
+parse_expression(src: Source) -> ParsedExpr
+    var p = parser_for(src)
+    val tree = expression(&p, 0)
+    if !p.toks.at_end() then p.report.add(error(p.toks.here(), "unexpected input after expression"))
+    ParsedExpr(tree, p.report)
+
+expression(p: *Parser, minimum: u16) -> &Expr
+    pratt(p, minimum, prefix, infix, binding) match
+        Some(e) -> e
+        None ->
+            val at = p.toks.here()
+            p.report.add(expected(at, "an expression", found_at(p.src, at)))
+            Expr(at, Invalid)
+
+// Binding powers, loosest first. Bitwise operators bind more tightly than comparisons, and shifts
+// bind with multiplication.
+private binding(t: Spanned[Token]) -> u16
+    t.value match
+        AssignOp -> 2
+        MatchKeyword -> 5
+        OrOp -> 10
+        AndOp -> 20
+        CompareOp -> 30
+        IsKeyword -> 30
+        RangeOp -> 34
+        BitOrOp -> 36
+        BitXorOp -> 37
+        BitAndOp -> 38
+        AddOp -> 40
+        MultiplyOp -> 50
+        Postfix -> 80
+        _ -> 0
+
+private const PrefixBinding: u16 = 60
+
+private prefix(t: Spanned[Token], p: *Parser) -> &Expr
+    val text = p.spelling(t)
+    t.value match
+        Number -> Expr(t.span, IntLit(text))
+        RealNumber ->
+            var s = scanner_of(text)
+            read_number(&s) match
+                Ok(Real(v)) -> Expr(t.span, RealLit(v))
+                Ok(Int(_)) -> Expr(t.span, IntLit(text))
+                Err(e) ->
+                    p.report.add(error(t.span, e.to_string()))
+                    Expr(t.span, Invalid)
+        CharQuoted ->
+            var s = scanner_of(text)
+            read_char_literal(&s, u8('\'')) match
+                Ok(v) -> Expr(t.span, CharLit(v))
+                Err(_) -> Expr(t.span, Invalid)
+        Quoted ->
+            var s = scanner_of(text)
+            read_quoted(&s, u8('"')) match
+                Ok(v) -> Expr(t.span, StringLit(v))
+                Err(_) -> Expr(t.span, Invalid)
+        Word -> word_prefix(t, text, p)
+        _ ->
+            if text == "++" || text == "--"
+                val target = expression(p, PrefixBinding)
+                return Expr(t.span.to(target.span), Update(target, text == "++", false))
+            unary_op(text) match
+                Some(op) ->
+                    val operand = expression(p, PrefixBinding)
+                    return Expr(t.span.to(operand.span), Unary(op, operand))
+                None -> ()
+            if text == "[" then return collection(p, t.span, false)
+            if text == "{" then return collection(p, t.span, true)
+            if text == "(" then return parenthesized(p, t.span)
+            p.report.add(expected(t.span, "an expression", found_at(p.src, t.span)))
+            Expr(t.span, Invalid)
+
+private word_prefix(t: Spanned[Token], text: string, p: *Parser) -> &Expr
+    if p.lambda_boundary != Some(p.toks.position) && p.accept("->")
+        var params: Buf[LambdaParam] = buf()
+        params.push(LambdaParam(t.span, text, None))
+        val body = parse_body(p, false)
+        return Expr(t.span.to(body.span), Lambda(params, body))
+    if text == "true" then return Expr(t.span, BoolLit(true))
+    if text == "false" then return Expr(t.span, BoolLit(false))
+    if text == "if" then return parse_if(p, t.span)
+    if text == "while" then return parse_while(p, t.span)
+    if text == "val" || text == "var" then return parse_binding(p, t.span, text == "var")
+    if text == "break" || text == "return"
+        var value: Option[&Expr] = None
+        if !p.at_line_end() then value = Some(expression(p, 0))
+        val kind: ExprKind = if text == "return" then Return(value) else Break(value)
+        return Expr(t.span.to(p.toks.here()), kind)
+    if text == "continue" then return Expr(t.span, Continue)
+    Expr(t.span, Name(text))
+
+// `()` is unit, `(e)` groups, `(a, b)` is a tuple, and `(x, y) -> body` is a lambda.
+private parenthesized(p: *Parser, start: Span) -> &Expr
+    if lambda_params_ahead(p) then return parse_lambda(p, start)
+    if p.accept(")") then return Expr(start.to(p.toks.here()), UnitLit)
+    val first = expression(p, 0)
+    if !p.at(",")
+        p.expect(")")
+        return first
+    var items: Buf[&Expr] = buf()
+    items.push(first)
+    while p.accept(",")
+        if p.at(")") then break
+        items.push(expression(p, 0))
+    val end = p.toks.here()
+    p.expect(")")
+    Expr(start.to(end), Tuple(items))
+
+private infix(left: &Expr, t: Spanned[Token], p: *Parser) -> &Expr
+    val op = p.spelling(t)
+    t.value match
+        AssignOp ->
+            val value = if p.at_kind(Indent) then parse_body(p, false) else expression(p, 1)
+            val (compound, yields) = assign_op(op)
+            Expr(left.span.to(value.span), Assign(left, compound, value, yields))
+        RangeOp ->
+            if left.kind is Range(_, _, _)
+                p.report.add(error(t.span, "range operators do not chain; parenthesize the intended range"))
+            val upper = expression(p, 34)
+            Expr(left.span.to(upper.span), Range(left, upper, op == ".."))
+        CompareOp ->
+            var operands: Buf[&Expr] = buf()
+            var ops: Buf[CompareOp] = buf()
+            operands.push(left)
+            ops.push(compare_op(op))
+            operands.push(expression(p, 30))
+            while p.at_kind(CompareOp)
+                val next = p.toks.advance().unwrap()
+                ops.push(compare_op(p.spelling(next)))
+                operands.push(expression(p, 30))
+            Expr(left.span.to(operands.at(operands.len() - 1).span), Compare(operands, ops))
+        IsKeyword ->
+            val negated = p.accept("not")
+            val pattern = parse_pattern(p)
+            Expr(left.span.to(pattern.span), Is(left, pattern, negated))
+        MatchKeyword -> match_expression(p, left)
+        Postfix -> postfix(left, t, op, p)
+        _ ->
+            val right = expression(p, binding(t))
+            Expr(left.span.to(right.span), Binary(binary_op(op), left, right))
+
+private postfix(left: &Expr, t: Spanned[Token], op: string, p: *Parser) -> &Expr
+    if op == "++" || op == "--" then return Expr(left.span.to(t.span), Update(left, op == "++", true))
+    if op == "?" then return Expr(left.span.to(t.span), Propagate(left))
+    if op == "[" then return type_application(left, p)
+    if op == "(" then return call(left, p)
+    member(left, t, p)
+
+private type_application(left: &Expr, p: *Parser) -> &Expr
+    var args: Buf[&TypeExpr] = buf()
+    if p.at("]") then p.report.add(error(p.toks.here(), "expected at least one type argument"))
+    else
+        loop
+            args.push(parse_type(p))
+            if !p.accept(",") || p.at("]") then break
+    val end = p.toks.here()
+    p.expect("]")
+    Expr(left.span.to(end), TypeApply(left, args))
+
+private call(left: &Expr, p: *Parser) -> &Expr
+    var args: Buf[Argument] = buf()
+    if !p.at(")")
+        loop
+            val start = p.toks.here()
+            var name: Option[string] = None
+            if p.at_kind(Word) && p.ahead(1) == "="
+                name = Some(p.spelling(p.toks.advance().unwrap()))
+                p.toks.advance()
+            val value = expression(p, 0)
+            args.push(Argument(start.to(value.span), name, value))
+            if !p.accept(",") || p.at(")") then break
+    val end = p.toks.here()
+    p.expect(")")
+    Expr(left.span.to(end), Call(left, args))
+
+// `t.name` is a member; `t.0` is a tuple element. The lexer reads `t.0.1` as `t` `.` `0.1`, so a
+// real-number spelling after a dot is split back into two element indices.
+private member(left: &Expr, t: Spanned[Token], p: *Parser) -> &Expr
+    val next = p.toks.advance() match
+        Some(n) -> n
+        None ->
+            p.report.add(expected(p.toks.here(), "a member name", "the end of input"))
+            return Expr(left.span.to(t.span), Invalid)
+    val text = p.spelling(next)
+    next.value match
+        Word -> Expr(left.span.to(next.span), Member(left, text))
+        Number -> Expr(left.span.to(next.span), TupleIndex(left, element_index(p, next.span, text)))
+        RealNumber ->
+            var target = left
+            var start = 0usize
+            for i in 0..text.bytes.len
+                if i == text.bytes.len || text.bytes[i] == u8('.')
+                    target = Expr(left.span.to(next.span), TupleIndex(target, element_index(p, next.span, text[start..<i])))
+                    start = i + 1
+            target
+        _ ->
+            p.report.add(expected(next.span, "a member name", found_at(p.src, next.span)))
+            Expr(left.span.to(next.span), Invalid)
+
+private element_index(p: *Parser, at: Span, digits: string) -> usize
+    var value = 0usize
+    if digits.bytes.len == 0 then p.report.add(error(at, "expected a tuple element index"))
+    for b in digits.bytes
+        if b < u8('0') || b > u8('9')
+            p.report.add(error(at, "a tuple element index is a decimal number"))
+            return 0
+        value = value * 10 + usize(b - u8('0'))
+    value
+
+// Only an unparenthesized name directly followed by `:` is a map-key shorthand: `{a: 1}` means
+// `{"a": 1}`.
+private collection_key(p: *Parser, braces: bool) -> &Expr
+    if braces && p.at_kind(Word) && p.ahead(1) == ":"
+        val key = p.toks.advance().unwrap()
+        return Expr(key.span, StringLit(p.spelling(key)))
+    expression(p, 0)
+
+private collection(p: *Parser, start: Span, braces: bool) -> &Expr
+    val close = if braces then "}" else "]"
+    var keys: Buf[&Expr] = buf()
+    var values: Buf[&Expr] = buf()
+    var map = false
+    if !p.at(close)
+        loop
+            val before = p.toks.position
+            val key = collection_key(p, braces)
+            val entry = braces && p.accept(":")
+            if keys.len() == 0 then map = entry
+            elif map != entry then p.report.add(error(key.span, "a collection literal cannot mix set elements and map entries"))
+            keys.push(key)
+            if entry then values.push(expression(p, 0))
+            if p.toks.position == before then break
+            if !p.accept(",") || p.at(close) then break
+    val end = p.toks.here()
+    p.expect(close)
+    val span = start.to(end)
+    if !braces then Expr(span, ListLit(keys))
+    elif map then Expr(span, MapLit(keys, values))
+    else Expr(span, SetLit(keys))
+end collection
+
+// The opening parenthesis has been consumed. Only a matching `)` followed by `->` makes a
+// parameter list; grouped expressions and tuples stay expressions.
+private lambda_params_ahead(p: *Parser) -> bool
+    var depth = 1
+    var i = 0usize
+    loop
+        val token = p.toks.peek_at(i) match
+            Some(t) -> t
+            None -> return false
+        val word = p.spelling(token)
+        if word == "(" then depth += 1
+        elif word == ")"
+            depth -= 1
+            if depth == 0
+                if p.lambda_boundary == Some(p.toks.position + i + 1) then return false
+                return p.ahead(i + 1) == "->"
+        if token.value == Dedent || token.value == Newline then return false
+        i += 1
+    false
+
+private parse_lambda(p: *Parser, at: Span) -> &Expr
+    var params: Buf[LambdaParam] = buf()
+    if !p.accept(")")
+        loop
+            val start = p.toks.here()
+            val name = required_name(p)
+            var declared: Option[&TypeExpr] = None
+            if p.accept(":") then declared = Some(parse_type(p))
+            params.push(LambdaParam(start.to(p.toks.here()), name, declared))
+            if !p.accept(",") || p.at(")") then break
+        p.expect(")")
+    p.expect("->")
+    val body = parse_body(p, false)
+    Expr(at.to(body.span), Lambda(params, body))
+
+// The top-level arrow ends a match guard; arrows inside brackets or nested blocks can still
+// introduce lambdas.
+match_guard_boundary(p: *Parser) -> Option[usize]
+    var depth = 0
+    var i = 0usize
+    loop
+        val token = p.toks.peek_at(i) match
+            Some(t) -> t
+            None -> return None
+        val word = p.spelling(token)
+        if depth == 0
+            if word == "->" then return Some(p.toks.position + i)
+            if token.value == Newline || token.value == Dedent then return None
+        if word == "(" || word == "[" || word == "{" || token.value == Indent then depth += 1
+        elif word == ")" || word == "]" || word == "}" || token.value == Dedent
+            if depth == 0 then return None
+            depth -= 1
+        i += 1
+    None
+
+private unary_op(text: string) -> Option[UnaryOp]
+    if text == "-" then Some(Negate)
+    elif text == "+" then Some(Plus)
+    elif text == "!" then Some(Not)
+    elif text == "~" then Some(Complement)
+    else None
+
+private binary_op(text: string) -> BinaryOp
+    if text == "+" then Add
+    elif text == "-" then Subtract
+    elif text == "*" then Multiply
+    elif text == "/" then Divide
+    elif text == "%" then Remainder
+    elif text == "<<" then ShiftLeft
+    elif text == ">>" then ShiftRight
+    elif text == "+%" then AddWrapping
+    elif text == "-%" then SubtractWrapping
+    elif text == "*%" then MultiplyWrapping
+    elif text == "+|" then AddSaturating
+    elif text == "-|" then SubtractSaturating
+    elif text == "*|" then MultiplySaturating
+    elif text == "&" then BitAnd
+    elif text == "|" then BitOr
+    elif text == "^" then BitXor
+    elif text == "&&" then And
+    else Or
+
+private compare_op(text: string) -> CompareOp
+    if text == "==" then Equal
+    elif text == "!=" then NotEqual
+    elif text == "===" then Same
+    elif text == "!==" then NotSame
+    elif text == "<" then Less
+    elif text == "<=" then LessEqual
+    elif text == ">" then Greater
+    else GreaterEqual
+
+// `=` and `:=` assign plainly; any other spelling is an operator followed by `=` or `:=`.
+private assign_op(text: string) -> (Option[BinaryOp], bool)
+    val yields = text.ends_with(":=")
+    val operator = if yields then text[0..<text.bytes.len - 2] else text[0..<text.bytes.len - 1]
+    if operator == "" then (None, yields) else (Some(binary_op(operator)), yields)

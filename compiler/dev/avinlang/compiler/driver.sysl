@@ -1,0 +1,95 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.{Source, source_of, report}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, is_dir, make_dir_all, make_temp_dir, metadata, pending_name, publish_file, read_text, remove_dir_all, remove_file, walk, write_text}
+import sysl.process.capture
+
+/** Where the compiler finds what it compiles against: the standard library's Avin source and the
+ * runtime's Sysl package. */
+struct Toolchain
+    root: string
+
+    prelude_path(self) -> string = self.root + "/library/avin/prelude.avin"
+    runtime_dir(self) -> string = self.root + "/runtime"
+    runtime_archive(self) -> string = self.root + "/runtime/.sysl/libavinrt.a"
+end Toolchain
+
+/** A toolchain rooted at `root`, if `root` holds the library and the runtime. */
+toolchain_at(root: string) -> Option[Toolchain]
+    val tc = Toolchain(root)
+    if exists(tc.prelude_path()) && is_dir(tc.runtime_dir()) then Some(tc) else None
+
+struct Compilation
+    /** Every diagnostic, rendered; empty when compilation succeeded. */
+    diagnostics: string
+    llvm: Option[string]
+
+/** Compiles a program to LLVM IR against the toolchain's prelude. */
+compile(tc: Toolchain, src: Source) -> Compilation
+    val prelude_text = read_text(tc.prelude_path()) match
+        Ok(text) -> text
+        Err(e) -> return Compilation(s"avin: ${tc.prelude_path()}: ${e.to_string()}\n", None)
+    var units: Buf[SourceUnit] = buf()
+    var syntax = ""
+    for source in [source_of(tc.prelude_path(), prelude_text), src]
+        val parsed = parse(source)
+        if parsed.report.has_errors() then syntax = syntax + parsed.report.render(source)
+        units.push(SourceUnit(source, parsed.file, parsed.report))
+    // A file with syntax errors is not checked: its tree is a recovery, and checking it would
+    // report the recovery rather than the program.
+    if syntax != "" then return Compilation(syntax, None)
+    val checked = check_program(units)
+    if checked.has_errors() then return Compilation(checked.render(), None)
+    checked.program match
+        Some(program) -> Compilation("", Some(emit_llvm(lower_program(program))))
+        None -> Compilation("avin: checking produced no program\n", None)
+
+/** The runtime library archive, built from the runtime's Sysl package when it is missing or older
+ * than any of its sources. It is built under a temporary name and published by rename, so builds
+ * running at the same time never see a partial archive. */
+ensure_runtime(tc: Toolchain) -> Result[string, string]
+    val archive = tc.runtime_archive()
+    if exists(archive) && !runtime_stale(tc, archive) then return Ok(archive)
+    make_dir_all(tc.root + "/runtime/.sysl").map_err(e -> e.to_string())?
+    val pending = pending_name(archive)
+    defer _ = remove_file(pending)
+    defer _ = remove_file(pending + ".h")
+    val result = capture("sysl", ["build-c", tc.runtime_dir(), "-o", pending], stderr = true, timeout = 120000).map_err(e -> "could not run sysl: " + e.to_string())?
+    if !result.status.ok()
+        return Err("runtime build failed: " + result.status.to_string() + "\n" + result.err.unwrap_or("") + result.text)
+    publish_file(pending, archive).map_err(e -> e.to_string())?
+    Ok(archive)
+
+private runtime_stale(tc: Toolchain, archive: string) -> bool
+    val built = metadata(archive) match
+        Ok(m) -> m.modified
+        Err(_) -> return true
+    var entries = walk(tc.runtime_dir())
+    loop
+        val entry = entries.next() match
+            Some(Ok(e)) -> e
+            Some(Err(_)) -> return true
+            None -> return false
+        if entry.is_dir() && entry.path.ends_with("/.sysl")
+            entries.skip_dir()
+            continue
+        if entry.path.ends_with(".sysl") || entry.path.ends_with(".hocon")
+            if entry.meta.modified > built then return true
+
+/** Links LLVM IR with the runtime into an executable at `output`. The executable is written under a
+ * temporary name and published by rename, so a failed link leaves any previous output in place. */
+link(tc: Toolchain, llvm: string, output: string, optimization: string) -> Result[unit, string]
+    val archive = ensure_runtime(tc)?
+    val dir = make_temp_dir("avin-link").map_err(e -> e.to_string())?
+    defer _ = remove_dir_all(dir)
+    val ir = dir + "/program.ll"
+    write_text(ir, llvm).map_err(e -> e.to_string())?
+    val pending = pending_name(output)
+    defer _ = remove_file(pending)
+    val args = ["-x", "ir", optimization, "-Wno-override-module", ir, "-x", "none", archive, "-lm", "-o", pending]
+    val result = capture("clang", args, stderr = true, timeout = 120000).map_err(e -> "could not run clang: " + e.to_string())?
+    if !result.status.ok()
+        return Err("clang failed: " + result.status.to_string() + "\n" + result.err.unwrap_or("") + result.text)
+    publish_file(pending, output).map_err(e -> e.to_string())?
+    Ok(())

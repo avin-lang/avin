@@ -1,0 +1,164 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{StrBuilder, str_builder}
+
+// Spells a MIR program as LLVM IR. Every decision about types, layout and control flow has already
+// been made; this file only writes it down.
+
+/** The program's LLVM module. Its `main` runs the program's entry function and returns its result
+ * as the exit status, or zero for an entry function that returns nothing. */
+emit_llvm(program: MirProgram) -> string
+    var out = str_builder()
+    out.push("; Avin program\n\n")
+    for i in 0..<program.strings.len()
+        val text = program.strings.at(i)
+        out.push(s"@str.$i = private unnamed_addr constant [${text.bytes.len} x i8] c\"")
+        push_bytes(&out, text)
+        out.push("\"\n")
+    out.push("\n")
+    var declared: Buf[string] = buf()
+    for f in program.functions
+        for block in f.blocks
+            for inst in block.insts
+                inst match
+                    Call(_, Runtime(symbol, signature), _) ->
+                        if !contains(declared, symbol)
+                            declared.push(symbol)
+                            out.push("declare " + c_result(signature) + " @" + symbol + "(" + c_params(signature) + ")\n")
+                    _ -> ()
+    out.push("\n")
+    for f in program.functions
+        emit_function(&out, program, f)
+    val entry = program.functions.at(program.entry)
+    out.push("define i32 @main() {\nentry:\n")
+    entry.signature.result match
+        Some(MInt(bits)) ->
+            out.push(s"  %result = call i$bits @\"${entry.symbol}\"()\n")
+            if bits < 32 then out.push(s"  %status = sext i$bits %result to i32\n  ret i32 %status\n")
+            elif bits > 32 then out.push(s"  %status = trunc i$bits %result to i32\n  ret i32 %status\n")
+            else out.push("  ret i32 %result\n")
+        _ ->
+            out.push(s"  call ${result_type(entry.signature)} @\"${entry.symbol}\"()\n")
+            out.push("  ret i32 0\n")
+    out.push("}\n")
+    out.finish()
+
+private contains(items: Buf[string], value: string) -> bool
+    for item in items
+        if item == value then return true
+    false
+
+// LLVM string constants escape everything outside printable ASCII, and `"` and `\`, as `\XX`.
+private push_bytes(out: *StrBuilder, text: string)
+    val hex = "0123456789ABCDEF"
+    for b in text.bytes
+        if b >= 32 && b < 127 && b != u8('"') && b != u8('\\') then out.push_char(char(b))
+        else
+            out.push_char('\\')
+            out.push_char(char(hex.bytes[usize(b >> 4)]))
+            out.push_char(char(hex.bytes[usize(b & 15)]))
+
+private llvm_type(t: MirType) -> string = t match
+    MInt(bits) -> s"i$bits"
+    MBool -> "i1"
+    MStr -> "{ ptr, i64 }"
+
+private result_type(s: MirSignature) -> string = s.result match
+    Some(t) -> llvm_type(t)
+    None -> "void"
+
+// The runtime is called with the C convention, so a string is passed as its two scalar parts and a
+// bool as a byte.
+private c_type(t: MirType) -> string = t match
+    MInt(bits) -> s"i$bits"
+    MBool -> "i8"
+    MStr -> "ptr, i64"
+
+private c_result(s: MirSignature) -> string = s.result match
+    Some(t) -> c_type(t)
+    None -> "void"
+
+private c_params(s: MirSignature) -> string
+    var out = ""
+    for i in 0..<s.params.len()
+        if i > 0 then out = out + ", "
+        out = out + c_type(s.params.at(i))
+    out
+
+private emit_function(out: *StrBuilder, program: MirProgram, f: MirFunction)
+    out.push("define " + result_type(f.signature) + " @\"" + f.symbol + "\"(")
+    for i in 0..<f.signature.params.len()
+        if i > 0 then out.push(", ")
+        out.push(llvm_type(f.signature.params.at(i)) + s" %v$i")
+    out.push(") {\n")
+    var temp = 0usize
+    for b in 0..<f.blocks.len()
+        out.push(s"b$b:\n")
+        val block = f.blocks.at(b)
+        for inst in block.insts
+            temp = emit_inst(out, program, f, inst, temp)
+        block.term match
+            Return(Some(value)) -> out.push("  ret " + typed_operand(program, f, value) + "\n")
+            Return(None) -> out.push("  ret void\n")
+            Unreachable -> out.push("  unreachable\n")
+    out.push("}\n\n")
+
+private emit_inst(out: *StrBuilder, program: MirProgram, f: MirFunction, inst: Inst, temp: usize) -> usize
+    var next = temp
+    inst match
+        Call(dest, Direct(index), args) ->
+            val callee = program.functions.at(index)
+            out.push("  ")
+            if dest is Some(d) then out.push(s"%v$d = ")
+            out.push("call " + result_type(callee.signature) + " @\"" + callee.symbol + "\"(")
+            for i in 0..<args.len()
+                if i > 0 then out.push(", ")
+                out.push(typed_operand(program, f, args.at(i)))
+            out.push(")\n")
+        Call(dest, Runtime(symbol, signature), args) ->
+            var parts: Buf[string] = buf()
+            for a in args
+                operand_type(program, f, a) match
+                    MStr ->
+                        val (pointer, length, used) = string_parts(out, program, f, a, next)
+                        next = used
+                        parts.push("ptr " + pointer)
+                        parts.push("i64 " + length)
+                    MBool ->
+                        out.push(s"  %t$next = zext i1 " + operand(program, f, a) + " to i8\n")
+                        parts.push(s"i8 %t$next")
+                        next += 1
+                    MInt(bits) -> parts.push(s"i$bits " + operand(program, f, a))
+            out.push("  ")
+            if dest is Some(d) then out.push(s"%v$d = ")
+            out.push("call " + c_result(signature) + " @" + symbol + "(")
+            for i in 0..<parts.len()
+                if i > 0 then out.push(", ")
+                out.push(parts.at(i))
+            out.push(")\n")
+    next
+
+// A string operand's pointer and length, extracting them from a value when it is not a constant.
+private string_parts(out: *StrBuilder, program: MirProgram, f: MirFunction, a: Operand, temp: usize) -> (string, string, usize) = a match
+    ConstStr(index) -> (s"@str.$index", program.strings.at(index).bytes.len.to_string(), temp)
+    Value(id) ->
+        out.push(s"  %t$temp = extractvalue { ptr, i64 } %v$id, 0\n")
+        out.push(s"  %t${temp + 1} = extractvalue { ptr, i64 } %v$id, 1\n")
+        (s"%t$temp", s"%t${temp + 1}", temp + 2)
+    _ -> ("null", "0", temp)
+
+private operand_type(program: MirProgram, f: MirFunction, a: Operand) -> MirType = a match
+    Value(id) -> f.value_types.at(id)
+    ConstInt(bits, _) -> MInt(bits)
+    ConstBool(_) -> MBool
+    ConstStr(_) -> MStr
+
+private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a match
+    Value(id) -> s"%v$id"
+    ConstInt(_, digits) -> digits
+    ConstBool(value) -> if value then "true" else "false"
+    ConstStr(index) -> s"{ ptr @str.$index, i64 ${program.strings.at(index).bytes.len} }"
+
+private typed_operand(program: MirProgram, f: MirFunction, a: Operand) -> string =
+    llvm_type(operand_type(program, f, a)) + " " + operand(program, f, a)

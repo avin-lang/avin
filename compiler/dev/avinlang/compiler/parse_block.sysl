@@ -1,0 +1,110 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+/** A body is either one expression on the same line or an indented block. In a block, a line that
+ * starts a local function declaration declares one. */
+parse_body(p: *Parser, discard: bool) -> &Expr
+    if !p.accept_kind(Indent) then return expression(p, 0)
+    val start = p.toks.here()
+    var items: Buf[&Expr] = buf()
+    loop
+        if p.toks.at_end() || p.accept_kind(Dedent) then break
+        if p.accept_kind(Newline) then continue
+        val position = p.toks.position
+        if local_function_ahead(p)
+            val declaration = parse_function(p, buf())
+            items.push(Expr(declaration.span, LocalFunction(declaration)))
+        else items.push(expression(p, 0))
+        if p.toks.position == position then p.toks.advance()
+        if !p.toks.at_end() && !p.at_kind(Newline) && !p.at_kind(Dedent)
+            if p.toks.items.at(p.toks.position - 1).value != Dedent
+                p.report.add(error(p.toks.here(), "expected a new line between block items"))
+    if items.len() == 0 then p.report.add(error(start, "expected a nonempty block"))
+    Expr(start.to(p.toks.here()), Block(items, discard))
+
+// `else`, `elif` and `end` may continue a form on the line after its indented body.
+private following(p: *Parser, word: string) -> bool
+    if p.at(word) then return true
+    if !p.at_kind(Newline) || p.ahead(1) != word then return false
+    if word == "end"
+        val label = p.toks.peek_at(2) match
+            Some(value) -> value
+            None -> return false
+        if label.value != Word then return false
+    p.toks.advance()
+    true
+
+/** An optional `end name` closing an indented form. `end` is contextual: it closes a form only
+ * when a name follows it. */
+optional_end(p: *Parser, name: string, indented: bool)
+    if !following(p, "end") then return
+    if !(p.toks.peek_at(1) is Some(_)) then return
+    val at = p.toks.here()
+    p.toks.advance()
+    val actual = required_name(p)
+    if !indented then p.report.add(error(at, s"`end $actual` cannot close a one-line form"))
+    if actual != name then p.report.add(error(at, s"`end $actual` cannot close `$name`; expected `end $name`"))
+
+parse_binding(p: *Parser, at: Span, mutable: bool) -> &Expr
+    val name = required_name(p)
+    var declared: Option[&TypeExpr] = None
+    if p.accept(":") then declared = Some(parse_type(p))
+    p.expect("=")
+    val indented = p.at_kind(Indent)
+    val value = parse_body(p, false)
+    optional_end(p, if mutable then "var" else "val", indented)
+    Expr(at.to(value.span), Binding(name, declared, value, mutable))
+
+parse_if(p: *Parser, at: Span) -> &Expr
+    val condition = expression(p, 0)
+    val then_word = p.accept("then")
+    var indented = p.at_kind(Indent)
+    if !then_word && !indented then p.report.add(error(p.toks.here(), "a one-line `if` needs `then`"))
+    val yes = parse_body(p, false)
+    var no: Option[&Expr] = None
+    if following(p, "elif") && p.accept("elif")
+        no = Some(parse_if(p, p.toks.here()))
+    elif following(p, "else") && p.accept("else")
+        indented = p.at_kind(Indent)
+        no = Some(parse_body(p, false))
+    optional_end(p, "if", indented)
+    Expr(at.to(p.toks.here()), If(condition, yes, no))
+
+parse_while(p: *Parser, at: Span) -> &Expr
+    val condition = expression(p, 0)
+    val do_word = p.accept("do")
+    var indented = p.at_kind(Indent)
+    if !do_word && !indented then p.report.add(error(p.toks.here(), "a one-line `while` needs `do`"))
+    val body = parse_body(p, true)
+    var otherwise: Option[&Expr] = None
+    if following(p, "else") && p.accept("else")
+        indented = p.at_kind(Indent)
+        otherwise = Some(parse_body(p, false))
+    optional_end(p, "while", indented)
+    Expr(at.to(p.toks.here()), While(condition, body, otherwise))
+
+match_expression(p: *Parser, subject: &Expr) -> &Expr
+    p.expect_kind(Indent, "expected indented match arms")
+    var arms: Buf[Arm] = buf()
+    loop
+        if p.toks.at_end() || p.accept_kind(Dedent) then break
+        if p.accept_kind(Newline) then continue
+        val before = p.toks.position
+        val fallback = p.accept("else")
+        if !fallback && p.accept("|") && p.at("else")
+            p.report.add(error(p.toks.here(), "a leading `|` needs a pattern, not `else`"))
+        val pattern: &Pattern = if fallback then Pattern(p.toks.here(), Wildcard) else parse_pattern(p)
+        var guard: Option[&Expr] = None
+        if p.accept("if")
+            val previous = p.lambda_boundary
+            p.lambda_boundary = match_guard_boundary(p)
+            guard = Some(expression(p, 0))
+            p.lambda_boundary = previous
+        if !fallback then p.expect("->")
+        val body = parse_body(p, false)
+        arms.push(Arm(pattern, guard, body))
+        if p.toks.position == before then break
+    optional_end(p, "match", true)
+    Expr(subject.span.to(p.toks.here()), Match(subject, arms))

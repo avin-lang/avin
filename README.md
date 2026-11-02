@@ -21,3 +21,4 @@ values. The compiler is written in Sysl; the standard library is written in Avin
 
 Avin is early. The [specification](docs/content/spec/) is the design, and the
 [roadmap](docs/content/compiler/roadmap.md) tracks the compiler being built to it.
+[Getting started](docs/content/getting-started/_index.md) shows how to build and test it.

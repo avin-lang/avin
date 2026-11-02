@@ -47,4 +47,5 @@ by stages 2 and 5, and are to be confirmed before those stages start.
 | Stage | State |
 | --- | --- |
 | 0 | Done |
-| 1–11 | Not started |
+| 1 | Done |
+| 2–11 | Not started |

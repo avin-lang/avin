@@ -48,9 +48,15 @@ Each is declared in Avin source with `@intrinsic("…")` and has no body. Everyt
 
 ## Tests
 
-- **Compiler unit tests** use Sysl's runner (`sysl test compiler`), one file per stage or feature.
-- **Execution tests** are Avin programs with expected output, compiled and run at `-O0` and `-O2` by
-  a Sysl-written test driver inside `sysl test`, so one command runs every test.
+`sysl test compiler`, run from the repository root, runs every test.
+
+- **Compiler unit tests** use Sysl's runner, one file per stage or feature. Parser tests compare a
+  compact rendering of the tree: `1 + 2 * 3` shows as `(+ 1 (* 2 3))`.
+- **Execution tests** are Avin programs in `tests/run/`, compiled and run at `-O0` and `-O2`. A
+  program's leading `// expect: exit N` or `// expect: trap` says how it ends (exit 0 when it says
+  neither), and `NAME.out` and `NAME.err` beside it hold the output it must write.
+- **Rejection tests** are Avin programs in `tests/reject/` that must fail to compile; each
+  `// error: TEXT` line names text the diagnostics must contain.
 - **Library tests** are Avin `@test` functions run by `avin test`, once that runner exists.
 - **Semantic references**: where Avin defines arithmetic as Sysl does, a test compares against an
   independently compiled Sysl program.

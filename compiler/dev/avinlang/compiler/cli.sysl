@@ -1,0 +1,84 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.{Source, source_of}
+import sysl.fs.{canonicalize, read_text, write_text_atomic}
+import sysl.path.stem
+
+const Version: string = "0.1.0"
+const Usage: string = "usage: avin parse <source.avin>\n       avin check <source.avin>\n       avin emit-llvm <source.avin> -o <module.ll>\n       avin build <source.avin> [-o <executable>]\n       avin --help\n       avin --version"
+
+// Output channels, the exit status and the toolchain location stay outside command dispatch, so
+// every command can be run and tested in memory. 0 is success, 1 a source, I/O or build failure,
+// 2 incorrect invocation.
+run_cli(args: []const string, tc: Option[Toolchain], say: string -> unit, note: string -> unit) -> int
+    if args.len == 2 && args[1] == "--help"
+        say(Usage)
+        return 0
+    if args.len == 2 && args[1] == "--version"
+        say("avin " + Version)
+        return 0
+    if args.len < 3
+        note(Usage)
+        return 2
+    val command = args[1]
+    val path = args[2]
+    var output: Option[string] = None
+    if args.len == 5 && args[3] == "-o" then output = Some(args[4])
+    elif args.len != 3
+        note(Usage)
+        return 2
+    val valid = (command == "parse" || command == "check") && output is None ||
+        command == "emit-llvm" && output is Some(_) || command == "build"
+    if !valid
+        note(Usage)
+        return 2
+    if output is Some(out)
+        if canonicalize(path) is Ok(a)
+            if canonicalize(out) is Ok(b)
+                if a == b
+                    note("avin: the output would overwrite the source file")
+                    return 2
+    val text = read_text(path) match
+        Ok(t) -> t
+        Err(e) ->
+            note(s"avin: $path: ${e.to_string()}")
+            return 1
+    val src = source_of(path, text)
+    if command == "parse" then return run_parse(src, say, note)
+    val toolchain = tc match
+        Some(t) -> t
+        None ->
+            note("avin: cannot find the Avin library and runtime; set AVIN_ROOT to the directory that holds them")
+            return 1
+    val compiled = compile(toolchain, src)
+    if compiled.diagnostics != ""
+        note(compiled.diagnostics)
+        return 1
+    val llvm = compiled.llvm.unwrap_or("")
+    if command == "check"
+        say("checked " + path)
+        return 0
+    if command == "emit-llvm"
+        write_text_atomic(output.unwrap_or(""), llvm) match
+            Ok(_) -> return 0
+            Err(e) ->
+                note("avin: " + e.to_string())
+                return 1
+    link(toolchain, llvm, output.unwrap_or(default_output(path)), "-O2") match
+        Ok(_) -> 0
+        Err(message) ->
+            note("avin: " + message)
+            1
+end run_cli
+
+/** Where `avin build` writes when no `-o` is given: the source's name without `.avin`, in the
+ * working directory. */
+default_output(path: string) -> string = stem(path).unwrap_or("a.out")
+
+run_parse(src: Source, say: string -> unit, note: string -> unit) -> int
+    val parsed = parse(src)
+    if parsed.report.has_errors()
+        note(parsed.report.render(src))
+        return 1
+    say(s"parsed ${parsed.file.items.len()} declarations")
+    0

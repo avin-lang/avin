@@ -1,0 +1,114 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+
+/** The machine type of a semantic type, or `None` for a type with no runtime representation. */
+mir_type(t: &Type) -> Option[MirType] = *t match
+    Unit -> None
+    Nothing -> None
+    Bool -> Some(MBool)
+    Str -> Some(MStr)
+    Int(bits) -> Some(MInt(bits))
+    _ -> None
+
+private struct Lowering
+    program: TProgram
+    strings: Buf[string]
+    /** For each function, the value id of each semantic parameter, or `None` for a unit one. */
+    param_values: Buf[Option[usize]]
+    values: Buf[MirType]
+    blocks: Buf[MirBlock]
+    insts: Buf[Inst]
+
+lower_program(program: TProgram) -> MirProgram
+    var l = Lowering(program, buf(), buf(), buf(), buf(), buf())
+    var functions: Buf[MirFunction] = buf()
+    for f in program.functions
+        functions.push(lower_function(&l, f))
+    MirProgram(functions, l.strings, program.entry)
+
+private signature_of(symbol: FunctionSymbol) -> MirSignature
+    var params: Buf[MirType] = buf()
+    for p in symbol.params
+        if mir_type(p) is Some(t) then params.push(t)
+    MirSignature(params, mir_type(symbol.result.unwrap_or(Unit)))
+
+/** The symbol a function has in the object file: its module path and name. A file with no module
+ * header is in `<program>`, which no module path can spell. Quoted in LLVM, so any text is valid. */
+function_symbol(symbol: FunctionSymbol) -> string =
+    (if symbol.module_name == "" then "<program>" else symbol.module_name) + "." + symbol.name
+
+private lower_function(l: *Lowering, f: TFunction) -> MirFunction
+    val symbol = l.program.symbols.at(f.symbol)
+    val signature = signature_of(symbol)
+    l.values = buf()
+    l.blocks = buf()
+    l.insts = buf()
+    l.param_values = buf()
+    for p in symbol.params
+        mir_type(p) match
+            Some(t) ->
+                l.param_values.push(Some(l.values.len()))
+                l.values.push(t)
+            None -> l.param_values.push(None)
+    f.body match
+        Some(body) ->
+            val result = lower_expr(l, body)
+            val returned: Option[Operand] = if signature.result is Some(_) then result else None
+            finish_block(l, Return(returned))
+        None -> intrinsic_body(l, symbol)
+    MirFunction(function_symbol(symbol), signature, l.values, l.blocks)
+
+// An intrinsic is a function like any other in the object file; its body is the operation the
+// intrinsic names, so it can be called directly and, later, passed as a value.
+private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
+    val name = symbol.intrinsic.unwrap_or("")
+    if name == "print_line"
+        var args: Buf[Operand] = buf()
+        args.push(Value(0))
+        var params: Buf[MirType] = buf()
+        params.push(MStr)
+        l.insts.push(Call(None, Runtime("avin_rt_print_line", MirSignature(params, None)), args))
+        finish_block(l, Return(None))
+        return
+    finish_block(l, Unreachable)
+
+private finish_block(l: *Lowering, term: Terminator)
+    l.blocks.push(MirBlock(l.insts, term))
+    l.insts = buf()
+
+private fresh(l: *Lowering, t: MirType) -> usize
+    val id = l.values.len()
+    l.values.push(t)
+    id
+
+/** Lowers an expression for its value; `None` for an expression with no runtime value. */
+private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
+    IntConst(digits) -> *e.ty match
+        Int(bits) -> Some(ConstInt(bits, digits))
+        _ -> None
+    BoolConst(value) -> Some(ConstBool(value))
+    StrConst(value) ->
+        val index = l.strings.len()
+        l.strings.push(value)
+        Some(ConstStr(index))
+    UnitConst -> None
+    Param(index) -> l.param_values.at(index) match
+        Some(id) -> Some(Value(id))
+        None -> None
+    Call(function, args) ->
+        var operands: Buf[Operand] = buf()
+        for a in args
+            if lower_expr(l, a) is Some(op) then operands.push(op)
+        val dest = mir_type(e.ty) match
+            Some(t) -> Some(fresh(l, t))
+            None -> None
+        l.insts.push(Call(dest, Direct(function), operands))
+        dest match
+            Some(id) -> Some(Value(id))
+            None -> None
+    Block(items) ->
+        var last: Option[Operand] = None
+        for item in items
+            last = lower_expr(l, item)
+        if mir_type(e.ty) is Some(_) then last else None
