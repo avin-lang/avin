@@ -14,20 +14,27 @@ mir_type(t: &Type) -> Option[MirType] = *t match
     Real -> Some(MReal)
     _ -> None
 
-/** Where `break` and `continue` go for one loop, and the slot its value is stored in. */
+/** Where a value is kept: the address of a slot, and the type stored there. */
+private struct Place
+    address: Operand
+    ty: MirType
+
+/** Where `break` and `continue` go for one loop, and the place its value is stored in. */
 private struct LoopTarget
     label: usize
     head: usize
     exit: usize
-    slot: Option[usize]
+    slot: Option[Place]
 
 private struct Lowering
     program: TProgram
     strings: Buf[string]
-    /** For each function, the value id of each semantic parameter, or `None` for a unit one. */
+    /** The value holding each parameter of the top-level function, or `None` for a unit one or, in
+     * a local function, one it does not capture. */
     param_values: Buf[Option[usize]]
-    /** The slot of each local, or `None` for one with no runtime value. */
-    local_slots: Buf[Option[usize]]
+    /** Where each local is kept: in this function's own slot, or behind a captured address; `None`
+     * for one with no runtime value or that this function does not reach. */
+    local_slots: Buf[Option[Place]]
     values: Buf[MirType]
     slots: Buf[MirType]
     blocks: Buf[MirBlock]
@@ -46,20 +53,34 @@ lower_program(program: TProgram) -> MirProgram
         functions.push(lower_function(&l, f))
     MirProgram(functions, l.strings, program.entry)
 
-private signature_of(symbol: FunctionSymbol) -> MirSignature
+// A local function takes its declared parameters, then the address of each local it captures,
+// then the value of each top-level parameter it captures.
+private signature_of(program: TProgram, f: TFunction) -> MirSignature
+    val symbol = program.symbols.at(f.symbol)
     var params: Buf[MirType] = buf()
     for p in symbol.params
         if mir_type(p) is Some(t) then params.push(t)
+    for x in symbol.captured_locals
+        if mir_type(f.locals.at(x).ty) is Some(_) then params.push(MPtr)
+    if symbol.root is Some(root)
+        for x in symbol.captured_params
+            if mir_type(program.symbols.at(root).params.at(x)) is Some(t) then params.push(t)
     MirSignature(params, mir_type(symbol.result.unwrap_or(Unit)))
 
 /** The symbol a function has in the object file: its module path and name. A file with no module
- * header is in `<program>`, which no module path can spell. Quoted in LLVM, so any text is valid. */
-function_symbol(symbol: FunctionSymbol) -> string =
-    (if symbol.module_name == "" then "<program>" else symbol.module_name) + "." + symbol.name
+ * header is in `<program>`, which no module path can spell; a local function is named within its
+ * top-level function and numbered, since two blocks may each declare one with the same name.
+ * Quoted in LLVM, so any text is valid. */
+function_symbol(program: TProgram, id: usize) -> string
+    val symbol = program.symbols.at(id)
+    val prefix = if symbol.module_name == "" then "<program>" else symbol.module_name
+    symbol.root match
+        Some(root) -> s"$prefix.${program.symbols.at(root).name}.${symbol.name}#$id"
+        None -> prefix + "." + symbol.name
 
 private lower_function(l: *Lowering, f: TFunction) -> MirFunction
     val symbol = l.program.symbols.at(f.symbol)
-    val signature = signature_of(symbol)
+    val signature = signature_of(l.program, f)
     l.values = buf()
     l.slots = buf()
     l.blocks = buf()
@@ -67,27 +88,33 @@ private lower_function(l: *Lowering, f: TFunction) -> MirFunction
     l.loops = buf()
     l.trap = None
     l.returns_value = signature.result is Some(_)
-    l.param_values = buf()
-    for p in symbol.params
-        mir_type(p) match
-            Some(t) ->
-                l.param_values.push(Some(l.values.len()))
-                l.values.push(t)
-            None -> l.param_values.push(None)
+    l.current = new_block(l)
+    // The function's own locals get slots; a local function's parameters are among them.
     l.local_slots = buf()
     for local in f.locals
-        mir_type(local.ty) match
-            Some(t) ->
-                l.local_slots.push(Some(l.slots.len()))
-                l.slots.push(t)
-            None -> l.local_slots.push(None)
-    l.current = new_block(l)
+        if local.owner == f.symbol then l.local_slots.push(new_slot(l, local.ty)) else l.local_slots.push(None)
+    l.param_values = buf()
+    symbol.root match
+        None ->
+            for p in symbol.params
+                l.param_values.push(if mir_type(p) is Some(t) then Some(fresh(l, t)) else None)
+        Some(root) ->
+            for i in 0..<symbol.params.len()
+                val value = if mir_type(symbol.params.at(i)) is Some(t) then Some(Value(fresh(l, t))) else None
+                store(l, l.local_slots.at(symbol.param_locals.at(i)), value)
+            for x in symbol.captured_locals
+                if mir_type(f.locals.at(x).ty) is Some(t)
+                    l.local_slots.set(x, Some(Place(Value(fresh(l, MPtr)), t)))
+            for _ in l.program.symbols.at(root).params
+                l.param_values.push(None)
+            for x in symbol.captured_params
+                if mir_type(l.program.symbols.at(root).params.at(x)) is Some(t) then l.param_values.set(x, Some(fresh(l, t)))
     f.body match
         Some(body) ->
             val result = lower_expr(l, body)
             finish(l, returning(l, result))
         None -> intrinsic_body(l, symbol)
-    MirFunction(function_symbol(symbol), signature, l.values, l.slots, l.blocks)
+    MirFunction(function_symbol(l.program, f.symbol), signature, l.values, l.slots, l.blocks)
 
 // The terminator that returns a body's value. A function that yields a value but whose body has
 // none at this point is in code that cannot be reached.
@@ -137,21 +164,21 @@ private fresh(l: *Lowering, t: MirType) -> usize
     l.values.push(t)
     id
 
-private new_slot(l: *Lowering, t: &Type) -> Option[usize] = mir_type(t) match
+private new_slot(l: *Lowering, t: &Type) -> Option[Place] = mir_type(t) match
     Some(m) ->
         val id = l.slots.len()
         l.slots.push(m)
-        Some(id)
+        Some(Place(SlotAddress(id), m))
     None -> None
 
-private store(l: *Lowering, slot: Option[usize], value: Option[Operand])
-    if slot is Some(s)
-        if value is Some(v) then l.insts.push(Store(s, v))
+private store(l: *Lowering, place: Option[Place], value: Option[Operand])
+    if place is Some(p)
+        if value is Some(v) then l.insts.push(Store(p.address, v))
 
-private load(l: *Lowering, slot: Option[usize]) -> Option[Operand] = slot match
-    Some(s) ->
-        val dest = fresh(l, l.slots.at(s))
-        l.insts.push(Load(dest, s))
+private load(l: *Lowering, place: Option[Place]) -> Option[Operand] = place match
+    Some(p) ->
+        val dest = fresh(l, p.ty)
+        l.insts.push(Load(dest, p.address))
         Some(Value(dest))
     None -> None
 
@@ -214,6 +241,12 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
                 op match
                     Some(v) -> operands.push(v)
                     None -> return None
+        // A local function also receives what it captures, from where the caller keeps it.
+        val callee = l.program.symbols.at(function)
+        for x in callee.captured_locals
+            if l.local_slots.at(x) is Some(p) then operands.push(p.address)
+        for x in callee.captured_params
+            if l.param_values.at(x) is Some(v) then operands.push(Value(v))
         val dest = mir_type(e.ty) match
             Some(t) -> Some(fresh(l, t))
             None -> None

@@ -31,6 +31,25 @@ fib(n: int) -> int | n > 1 = fib(n - 1) + fib(n - 2)
 
 The exact clause and guard spelling is provisional.
 
+A function declared inside a block is a **local function**. It can be called from anywhere in its
+block, including before its declaration, and it sees the locals declared before it, the enclosing
+function's parameters, and the enclosing local functions. It reads and assigns those locals
+themselves, not copies, so a `var` it changes is changed for the code around it:
+
+```text
+counter() -> int
+    var count = 0
+    bump(by: int)
+        count += by
+    bump(2)
+    bump(3)
+    count                // 5
+```
+
+A call made before the local function's declaration must not reach a local that is not yet
+initialized there, directly or through the local functions it calls, and the function needs a
+declared result type for such a call, as it does for recursion.
+
 ## data
 
 `data` declares an algebraic data type: an immutable value with one or more variants.

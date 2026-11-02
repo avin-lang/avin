@@ -21,6 +21,14 @@ struct FunctionSymbol
     /** The declared result type, or the one inferred from the body once it has been checked. */
     result: Option[&Type]
     intrinsic: Option[string]
+    /** For a local function, the top-level function it is declared in. */
+    root: Option[usize]
+    /** For a local function, the locals its parameters are stored in. */
+    param_locals: Buf[usize]
+    /** For a local function, the enclosing locals and top-level parameters it uses, directly or
+     * through the local functions it calls. */
+    captured_locals: Buf[usize]
+    captured_params: Buf[usize]
 
 /** A `break` the checker has seen, kept until its loop's type is known. */
 struct BreakSite
@@ -30,7 +38,25 @@ struct BreakSite
 
 /** What the checker knows inside one function body. Checking a call to a function whose result is
  * inferred checks that function's body first, so this is saved and restored around it. */
+/** A use of an enclosing local (`param` false) or top-level parameter by a local function. */
+struct CaptureUse
+    function: usize
+    index: usize
+    param: bool
+
+struct LocalCall
+    caller: usize
+    callee: usize
+
+/** A call to a local function made before its declaration, with the locals initialized there. */
+struct EarlyCall
+    callee: usize
+    span: Span
+    initialized: Buf[usize]
+
 struct BodyState
+    /** The top-level function being checked. */
+    root: usize
     locals: Buf[TLocal]
     /** The locals in scope, innermost last. */
     visible: Buf[usize]
@@ -40,8 +66,13 @@ struct BodyState
     labels: usize
     /** Where the innermost block's locals start in `visible`. */
     block_start: usize
+    /** The local functions in scope, innermost last. */
+    functions: Buf[usize]
+    uses: Buf[CaptureUse]
+    calls: Buf[LocalCall]
+    early: Buf[EarlyCall]
 
-fresh_body() -> BodyState = BodyState(buf(), buf(), buf(), buf(), 0, 0)
+fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, 0, buf(), buf(), buf(), buf())
 
 struct Checker
     units: Buf[SourceUnit]
@@ -78,7 +109,7 @@ end Checked
 /** Checks a program. The last unit is the program's own file, which must declare `main`; the units
  * before it (the prelude) are visible to it, and its own declarations shadow theirs. */
 check_program(units: Buf[SourceUnit]) -> Checked
-    var c = Checker(units, buf(), buf(), buf(), buf(), map(), 0, fresh_body())
+    var c = Checker(units, buf(), buf(), buf(), buf(), map(), 0, fresh_body(0))
     for u in 0..<c.units.len()
         declare_unit(&c, u)
     for id in 0..<c.symbols.len()
@@ -155,7 +186,7 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function) -
             None -> c.note(unit, f.name_span, s"`$name` is not an intrinsic")
     elif f.body is None
         c.note(unit, f.name_span, s"`${f.name}` needs a body")
-    FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic)
+    FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf())
 
 // `@intrinsic("name")` is the only annotation this compiler gives meaning to; it is valid only on a
 // function without a body.
@@ -210,19 +241,136 @@ private check_function(c: *Checker, id: usize)
             val previous = c.current
             val outer = c.body
             c.current = id
-            c.body = fresh_body()
-            val typed = check_expr(c, body, symbol.result)
+            c.body = fresh_body(id)
+            check_body(c, id, body)
+            finish_captures(c)
             c.locals.set(id, c.body.locals)
+            for f in local_functions_of(c, id)
+                c.locals.set(f, c.body.locals)
             c.current = previous
             c.body = outer
-            symbol.result match
-                Some(declared) ->
-                    if !conforms(typed.ty, declared) && !(*declared is Unit)
-                        c.note(symbol.unit, body.span, s"`${symbol.name}` yields ${type_name(typed.ty)}, not ${type_name(declared)}")
-                None -> c.symbols[id].result = Some(typed.ty)
-            c.bodies.set(id, Some(typed))
         None -> ()
     c.states.set(id, 2)
+
+// Checks a function's body against its declared result, or infers the result from it.
+private check_body(c: *Checker, id: usize, body: &Expr)
+    val symbol = c.symbols.at(id)
+    val typed = check_expr(c, body, symbol.result)
+    symbol.result match
+        Some(declared) ->
+            if !conforms(typed.ty, declared) && !(*declared is Unit)
+                c.note(symbol.unit, body.span, s"`${symbol.name}` yields ${type_name(typed.ty)}, not ${type_name(declared)}")
+        None -> c.symbols[id].result = Some(typed.ty)
+    c.bodies.set(id, Some(typed))
+
+private local_functions_of(c: *Checker, root: usize) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    for i in 0..<c.symbols.len()
+        if c.symbols.at(i).root == Some(root) then out.push(i)
+    out
+
+// Gives each local function of the top-level function just checked the locals and parameters it
+// captures: those it uses itself, and those used by the local functions it calls that it does not
+// own. Then checks each call made before its callee's declaration: everything the callee captures
+// must already be initialized there.
+private finish_captures(c: *Checker)
+    for u in c.body.uses
+        var captured = if u.param then c.symbols.at(u.function).captured_params else c.symbols.at(u.function).captured_locals
+        if !contains_index(captured, u.index)
+            captured.push(u.index)
+            if u.param then c.symbols[u.function].captured_params = captured else c.symbols[u.function].captured_locals = captured
+    var changed = true
+    while changed
+        changed = false
+        for call in c.body.calls
+            if call.caller == c.body.root then continue
+            var locals = c.symbols.at(call.caller).captured_locals
+            for x in c.symbols.at(call.callee).captured_locals
+                if c.body.locals.at(x).owner != call.caller && !contains_index(locals, x)
+                    locals.push(x)
+                    changed = true
+            c.symbols[call.caller].captured_locals = locals
+            var params = c.symbols.at(call.caller).captured_params
+            for x in c.symbols.at(call.callee).captured_params
+                if !contains_index(params, x)
+                    params.push(x)
+                    changed = true
+            c.symbols[call.caller].captured_params = params
+    for call in c.body.early
+        val callee = c.symbols.at(call.callee)
+        for x in callee.captured_locals
+            if !contains_index(call.initialized, x)
+                c.note(callee.unit, call.span, s"`${callee.name}` uses `${c.body.locals.at(x).name}`, which is not initialized where `${callee.name}` is called here")
+                break
+
+private contains_index(items: Buf[usize], x: usize) -> bool
+    for i in items
+        if i == x then return true
+    false
+
+// Declares the local functions of a block before its items are checked, so they may call one
+// another in any order.
+private declare_local_functions(c: *Checker, items: Buf[&Expr])
+    val start = c.body.functions.len()
+    for item in items
+        if item.kind is LocalFunction(decl)
+            var duplicate = false
+            for i in start..<c.body.functions.len()
+                if c.symbols.at(c.body.functions.at(i)).name == decl.name then duplicate = true
+            if duplicate
+                c.note(unit_of(c), decl.name_span, s"`${decl.name}` is declared more than once in this block")
+                continue
+            val enclosing = c.symbols.at(c.current)
+            var symbol = signature(c, enclosing.unit, enclosing.module_name, decl)
+            symbol.root = Some(c.body.root)
+            val id = c.symbols.len()
+            c.symbols.push(symbol)
+            c.states.push(0)
+            c.bodies.push(None)
+            c.locals.push(buf())
+            c.body.functions.push(id)
+
+private lookup_function(c: *Checker, name: string) -> Option[usize]
+    var i = c.body.functions.len()
+    while i > 0
+        i -= 1
+        if c.symbols.at(c.body.functions.at(i)).name == name then return Some(c.body.functions.at(i))
+    c.scope.get(name)
+
+// A local function is checked where it is declared, seeing the locals declared before it. Its
+// parameters become locals of its own, and loops outside it are not its loops.
+private check_local_function(c: *Checker, decl: &Function) -> usize
+    // The block's own local functions were declared last, so the innermost one with this name is it;
+    // a duplicate was never declared and is not checked.
+    var id = 0usize
+    var found = false
+    var i = c.body.functions.len()
+    while i > 0 && !found
+        i -= 1
+        if c.symbols.at(c.body.functions.at(i)).name == decl.name
+            id = c.body.functions.at(i)
+            found = true
+    if !found || c.states.at(id) != 0 then return id
+    c.states.set(id, 1)
+    val symbol = c.symbols.at(id)
+    val previous = c.current
+    val loops = c.body.loops
+    val outer_start = c.body.block_start
+    val mark = c.body.visible.len()
+    c.current = id
+    c.body.loops = buf()
+    c.body.block_start = mark
+    var param_locals: Buf[usize] = buf()
+    for i in 0..<symbol.params.len()
+        param_locals.push(declare_local(c, decl.span, symbol.param_names.at(i), symbol.params.at(i), false))
+    c.symbols[id].param_locals = param_locals
+    if decl.body is Some(body) then check_body(c, id, body)
+    c.body.visible.truncate(mark)
+    c.body.block_start = outer_start
+    c.body.loops = loops
+    c.current = previous
+    c.states.set(id, 2)
+    id
 
 private unit_of(c: *Checker) -> usize = c.symbols.at(c.current).unit
 
@@ -255,7 +403,9 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
     Return(value) -> return_expr(c, e, value)
     Match(subject, arms) -> match_expr(c, e, subject, arms, expected, used)
     Is(value, pattern, negated) -> is_expr(c, e, value, pattern, negated)
-    LocalFunction(_) -> unsupported(c, e, "local functions")
+    LocalFunction(decl) ->
+        check_local_function(c, decl)
+        TExpr(e.span, Unit, UnitConst)
     Invalid -> TExpr(e.span, ErrorType, UnitConst)
     _ -> unsupported(c, e, "this expression")
 
@@ -271,17 +421,22 @@ private lookup_local(c: *Checker, name: string) -> Option[usize]
         if c.body.locals.at(index).name == name then return Some(index)
     None
 
+// Parameters of the top-level function; a local function's own parameters are locals.
 private param_index(c: *Checker, name: string) -> Option[usize]
-    val symbol = c.symbols.at(c.current)
+    val symbol = c.symbols.at(c.body.root)
     for i in 0..<symbol.param_names.len()
         if symbol.param_names.at(i) == name then return Some(i)
     None
 
 private name_expr(c: *Checker, at: Span, name: string) -> &TExpr
-    if lookup_local(c, name) is Some(index) then return TExpr(at, c.body.locals.at(index).ty, Local(index))
+    if lookup_local(c, name) is Some(index)
+        if c.body.locals.at(index).owner != c.current then c.body.uses.push(CaptureUse(c.current, index, false))
+        return TExpr(at, c.body.locals.at(index).ty, Local(index))
     val symbol = c.symbols.at(c.current)
-    if param_index(c, name) is Some(i) then return TExpr(at, symbol.params.at(i), Param(i))
-    if c.scope.get(name) is Some(_)
+    if param_index(c, name) is Some(i)
+        if c.current != c.body.root then c.body.uses.push(CaptureUse(c.current, i, true))
+        return TExpr(at, c.symbols.at(c.body.root).params.at(i), Param(i))
+    if lookup_function(c, name) is Some(_)
         c.note(symbol.unit, at, s"`$name` is a function; function values are not implemented")
     else c.note(symbol.unit, at, s"`$name` is not defined")
     TExpr(at, ErrorType, UnitConst)
@@ -290,8 +445,10 @@ private name_expr(c: *Checker, at: Span, name: string) -> &TExpr
 // finishes (a `return`, a `break`) never yields, so its type is `Nothing`.
 private block_expr(c: *Checker, e: &Expr, items: Buf[&Expr], discard: bool, expected: Option[&Type], used: bool) -> &TExpr
     val mark = c.body.visible.len()
+    val function_mark = c.body.functions.len()
     val outer_start = c.body.block_start
     c.body.block_start = mark
+    declare_local_functions(c, items)
     var typed: Buf[&TExpr] = buf()
     var finishes = true
     for i in 0..<items.len()
@@ -300,6 +457,7 @@ private block_expr(c: *Checker, e: &Expr, items: Buf[&Expr], discard: bool, expe
         if *t.ty is Nothing then finishes = false
         typed.push(t)
     c.body.visible.truncate(mark)
+    c.body.functions.truncate(function_mark)
     c.body.block_start = outer_start
     var ty: &Type = Unit
     if !finishes then ty = Nothing
@@ -332,7 +490,7 @@ private declare_local(c: *Checker, at: Span, name: string, ty: &Type, mutable: b
         if c.body.locals.at(c.body.visible.at(i)).name == name
             c.note(unit_of(c), at, s"`$name` is already defined in this block")
     val index = c.body.locals.len()
-    c.body.locals.push(TLocal(name, ty, mutable))
+    c.body.locals.push(TLocal(name, ty, mutable, c.current))
     c.body.visible.push(index)
     index
 
@@ -347,11 +505,13 @@ private assignable(c: *Checker, target: &Expr) -> Option[usize]
             return None
     lookup_local(c, name) match
         Some(index) ->
-            if c.body.locals.at(index).mutable then return Some(index)
+            if c.body.locals.at(index).mutable
+                if c.body.locals.at(index).owner != c.current then c.body.uses.push(CaptureUse(c.current, index, false))
+                return Some(index)
             c.note(unit, target.span, s"`$name` is a `val`; only a `var` can be assigned")
         None ->
             if param_index(c, name) is Some(_) then c.note(unit, target.span, s"`$name` is a parameter, which cannot be assigned")
-            elif c.scope.get(name) is Some(_) then c.note(unit, target.span, s"`$name` is a function, which cannot be assigned")
+            elif lookup_function(c, name) is Some(_) then c.note(unit, target.span, s"`$name` is a function, which cannot be assigned")
             else c.note(unit, target.span, s"`$name` is not defined")
     None
 
@@ -603,9 +763,9 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument]) -> 
         _ ->
             c.note(unit, callee.span, "only a named function can be called")
             return TExpr(at, ErrorType, UnitConst)
-    if c.scope.get(name) is None
+    if lookup_function(c, name) is None
         if builtin_type(name) is Some(target) then return conversion(c, at, target, args)
-    val id = c.scope.get(name) match
+    val id = lookup_function(c, name) match
         Some(i) -> i
         None ->
             c.note(unit, callee.span, s"`$name` is not defined")
@@ -623,6 +783,13 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument]) -> 
         typed.push(value)
     if args.len() != target.params.len()
         c.note(unit, at, s"`$name` takes ${target.params.len()} arguments, not ${args.len()}")
+    if target.root is Some(_)
+        c.body.calls.push(LocalCall(c.current, id))
+        if c.states.at(id) == 0
+            var initialized: Buf[usize] = buf()
+            for v in c.body.visible
+                initialized.push(v)
+            c.body.early.push(EarlyCall(id, at, initialized))
     var result = result_of(c, id, at)
     for t in typed
         if *t.ty is Nothing then result = Nothing
@@ -665,6 +832,9 @@ convertible(from: &Type, to: &Type) -> bool = *from match
 // first; a cycle of such functions is reported rather than guessed at.
 private result_of(c: *Checker, id: usize, at: Span) -> &Type
     if c.symbols.at(id).result is Some(r) then return r
+    if c.symbols.at(id).root is Some(_) && c.states.at(id) == 0
+        c.note(unit_of(c), at, s"`${c.symbols.at(id).name}` is called before its declaration, so it needs a declared result type")
+        return ErrorType
     if c.states.at(id) == 1
         c.note(unit_of(c), at, s"`${c.symbols.at(id).name}` is recursive, so it needs a declared result type")
         return ErrorType
