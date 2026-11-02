@@ -1,12 +1,13 @@
 ---
 title: Avin
 heroTitle: Expressive, typed, compiled natively
-heroHighlight: with Sysl underneath
-summary: A garbage-collected, natively compiled language with a small, expressive type system and Sysl's syntax.
+heroHighlight: in clean, indented code
+summary: A natively compiled, garbage-collected language with a small, expressive type system and a light, indentation-based syntax.
 ---
 
 Avin is for writing applications: algebraic data, pattern matching, closures, classes and traits
-with subtyping, immutable collections and type inference, compiled to native code. Its generics are
+with subtyping, immutable collections and type inference, compiled to native code. Its syntax is
+light: blocks are marked by indentation, not braces, and most declarations fit on one line. Its generics are
 reified and unboxed, absence is an explicit `Option`, equality is typed, `string` is a built-in
 UTF-8 type, and failures are values.
 

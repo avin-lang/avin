@@ -1,6 +1,7 @@
 # Avin
 
-A natively compiled, garbage-collected application language with Sysl's syntax.
+A natively compiled, garbage-collected application language with a light, indentation-based
+syntax.
 
 ```text
 data Shape

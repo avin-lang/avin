@@ -1,13 +1,14 @@
 ---
 title: Language specification
-summary: What Avin is — a natively compiled, garbage-collected application language with Sysl's syntax.
+summary: What Avin is — a natively compiled, garbage-collected application language with a small type system and a light, indentation-based syntax.
 weight: 10
 ---
 
 Avin is a compiled, garbage-collected application language: expression-oriented code, algebraic
 data, pattern matching, first-class functions, rich immutable collections, classes and traits with
-real subtyping, and type inference, with a deliberately small type system and Sysl's
-indentation-based syntax.
+real subtyping, and type inference, with a deliberately small type system. Its syntax is light and
+quiet: indentation marks blocks, functions are often a single `name(params) = expression` line, and
+`match` reads top to bottom as a list of cases.
 
 Avin owns its whole runtime, so its generics are reified, values stay unboxed in containers,
 absence is an explicit `Option`, equality is typed, `string` is a built-in type, and failures are
