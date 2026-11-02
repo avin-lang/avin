@@ -16,7 +16,24 @@ greet(name: string)
 Every parameter has a declared type. The result type may be inferred, except for recursive functions.
 An indented body with no `=` and no result type returns `unit`; with `=` or a result type it yields
 its last expression. Default arguments (`size: int = 16`) and named arguments (`open(path, create = true)`)
-are supported. There is **no overloading**: a name denotes one function in a scope.
+are supported.
+
+Functions and methods may be **overloaded**: several functions in one scope may share a name when
+their parameter types differ. A call chooses among them by its arguments:
+
+- The candidates are the overloads that accept the call's arguments: their number, their names and
+  their types. Inference runs for each candidate separately, so a literal argument fits any overload
+  whose parameter it can become.
+- When more than one candidate remains, the most specific wins: the one whose every parameter type
+  conforms to the corresponding parameter type of each other. A call with no candidate, or with no
+  single most specific one, is an error that lists the overloads.
+- Overloads must differ in their parameter types; differing only in result type or parameter names
+  is an error. A default argument that makes two overloads accept the same call makes that call
+  ambiguous.
+- A function used as a value takes its overload from the expected function type.
+
+Same-named declarations with the **same** parameter types are not overloads but the clauses of one
+function, described next.
 
 Variadic parameters are final and written `values: T*`. A call passes zero or more `T`s, or splices
 an existing sequence with `f(xs*)`.

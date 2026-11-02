@@ -20,7 +20,7 @@ are designed together. These are the choices that shape it, each with what it me
 | **Integers keep their width, and overflow traps** | Fixed-width integers keep their width through arithmetic (`i8 + i8` is `i8`), and a result that does not fit stops the program. Wrapping and saturating arithmetic are written with their own operators. |
 | **Binary data is `byte`** | Integers are signed and are for counting; `byte` is the octet that files, sockets and encodings are made of. |
 | **Failures are values; bugs are traps** | A failure a correct caller can meet is a `Result` or `Option`, propagated with `?`. A bug stops the program with a trap. |
-| **One name, one function** | A scope holds one function per name. Default and named arguments give a function its variations, and inference always knows which function a call means. |
+| **Overloading is resolved statically** | Functions and methods may share a name when their parameter types differ. The compiler chooses the most specific overload from the arguments at compile time, and an ambiguous call is an error rather than a guess. |
 | **`object` holds module-wide state** | An `object` is an ordinary value, and the one place for state and functions that belong to a type rather than an instance. |
 | **Initialization is checked** | A constructor assigns every field before `self` is used. Traits carry behaviour, not state. Module-level values and `object`s initialize before `main`, in dependency order, and the compiler rejects a cycle. |
 | **Objects are just data** | An object's header holds its type and what the collector needs, nothing more. Concurrency, when it arrives, is a library and language design of its own. |

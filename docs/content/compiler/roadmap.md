@@ -26,8 +26,8 @@ with `--ff-only`.
 | 1 | **Skeleton and test harness** | The `compiler/`, `runtime/` and `library/` packages; the lexer and parser carried over; `avin parse`, `check` and `build`; a thin end-to-end pipeline (`main() = 42` and `print` of a literal) through resolve, check, MIR and the LLVM emitter, linked with a minimal runtime; the Sysl-written execution-test driver in `sysl test` (`.avin` cases with expected output, run at `-O0` and `-O2`) |
 | 2 | **Type core and scalar programs** | The `Type` enum over symbols; scopes and symbol tables; local bidirectional inference with subtype constraints and `Nothing`; integers with trapping overflow, `byte`, `real`, `char`, `bool`, `unit`; functions, local functions, `if`/`match`/loops, guards, scalar patterns and coverage; unbounded generic functions; by-name parameters. The old execution corpus, revised to the specification, joins the suite here |
 | 3 | **Modules and packages** | `avin.hocon` loading, multi-file modules, imports and visibility, the prelude as an Avin file, `@intrinsic` declarations |
-| 4 | **Runtime and heap values** | The collector over `sh.sysl.gc` with shadow-stack roots; type descriptors; traps with messages and locations; `string` as a runtime value; `data` layouts, tuples, lambdas and closures with environments |
-| 5 | **Object model** | `class`, `trait`, `object`, `impl`, methods, `override`, `open`/`abstract`, constructors with checked initialization, companions, member access, type patterns |
+| 4 | **Runtime and heap values** | The collector over `sh.sysl.gc` with shadow-stack roots; type descriptors; traps with messages and locations; `string` as a runtime value; `data` layouts, tuples, lambdas and closures with environments; by-name parameters |
+| 5 | **Object model** | `class`, `trait`, `object`, `impl`, methods, `override`, `open`/`abstract`, constructors with checked initialization, companions, member access, type patterns; overloading, function clauses, default and named arguments |
 | 6 | **Monomorphization and dispatch** | Bounded generics, closed-world instantiation, dispatch for generic trait methods, reified headers, variance checking, devirtualization |
 | 7 | **Sysl bindings** | `@sysl` declarations, shim generation, the cached shim build, boundary conversions, opaque handles, diagnostics mapped back to bindings |
 | 8 | **Core library in Avin** | `Eq`, `Hash`, `Ord`, `Display`, `Debug`, `Writer`, `Option`, `Result`, `?`, string methods, `print`, `debug`, `StringContext` and interpolators, interpolation and formatting |
@@ -38,15 +38,11 @@ with `--ff-only`.
 Until stage 8, `print` in stage 1 is an `@intrinsic` over a runtime entry point, declared in Avin
 source like every other intrinsic; stage 8 replaces it with the library's `print` over `Display`.
 
-The proposed decisions on the [decisions page](/spec/decisions/#proposed) (final classes, no
-overloading, `:` inheritance, an implicit receiver) are needed by stage 5, and are to be confirmed
-before it starts.
-
 ## Status
 
 | Stage | State |
 | --- | --- |
 | 0 | Done |
 | 1 | Done |
-| 2 | In progress: local bindings and assignment; integer arithmetic with trapping, wrapping and saturating operators; bitwise operators and shifts; integer literals of any width; `byte`, `real` and `char` with their operators, comparisons and conversions; comparison chains; `&&`, `||`, `!`; `if`, `while`, `break`, `continue` and `return`, with `Nothing` for code that never finishes; `match` and `is` with scalar patterns (literals, ranges, alternatives, bindings, `@`, guards) and exhaustiveness over a pattern matrix; local functions that capture enclosing locals by reference; unbounded generic functions, monomorphized, with type arguments written (or a leading prefix of them) or inferred from the arguments and the expected type, each call's unknowns settled within that call. Still to come: by-name parameters, settling an unknown by a later use in the body, and the old corpus |
+| 2 | In progress: local bindings and assignment; integer arithmetic with trapping, wrapping and saturating operators; bitwise operators and shifts; integer literals of any width; `byte`, `real` and `char` with their operators, comparisons and conversions; comparison chains; `&&`, `||`, `!`; `if`, `while`, `break`, `continue` and `return`, with `Nothing` for code that never finishes; `match` and `is` with scalar patterns (literals, ranges, alternatives, bindings, `@`, guards) and exhaustiveness over a pattern matrix; local functions that capture enclosing locals by reference; unbounded generic functions, monomorphized, with type arguments written (or a leading prefix of them) or inferred from the arguments and the expected type, each call's unknowns settled within that call. By-name parameters moved to stage 4, with closures; overloading, function clauses and default and named arguments to stage 5, with methods. Still to come: settling an unknown by a later use in the body, needed by `None` and `[]`, and the old corpus's programs, ported as their features land |
 | 3–11 | Not started |

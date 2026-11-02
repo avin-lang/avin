@@ -1,6 +1,6 @@
 ---
 title: Settled decisions
-summary: Every language and project decision made so far, in one terse list — settled, proposed, and open.
+summary: Every language and project decision made so far, in one terse list — settled and open.
 weight: 30
 ---
 
@@ -34,6 +34,13 @@ a decision changes, this page and the chapter change together.
 - Functions and function types use `->`, never `=>`.
 - `match` is postfix, with indented `pattern -> body` arms.
 - `data` declares algebraic data types.
+- Classes are final unless declared `open` or `abstract`; overriding requires `override`.
+- Inheritance is written with `:`: `class C(…): Base(…), Trait`, one superclass with its
+  constructor arguments and then traits, as in `trait A: B`.
+- The receiver is implicit: members are in scope by their bare names, and `self` names the instance.
+- Functions and methods may be overloaded by parameter types. A call takes the most specific
+  overload that accepts its arguments, chosen at compile time; an ambiguous call is an error.
+  Same-named declarations with the same parameter types are clauses of one function.
 - A class's parameter list is its one constructor. Class parameters are private immutable fields
   (`val` makes one public and read-only, `var` public and mutable), and the statements in the class
   body are the constructor's code, run top to bottom when an instance is created.
@@ -96,17 +103,6 @@ a decision changes, this page and the chapter change together.
 - Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
 - Async, await and concurrency.
 - Partial-function literal syntax, which the user has explicitly left undecided.
-
-## Proposed
-
-These are the specification's defaults until the user confirms or rejects them:
-
-1. **Classes are final by default**, with `open` and `abstract` to allow subclassing.
-2. **No method overloading.** Default and named arguments cover its uses.
-3. **Inheritance is written with `:`**: `class C(…): Base(…), Trait`. This matches Sysl's
-   `trait A: B`.
-4. **The receiver is implicit**, with `self` available. Sysl's `self`/`&self`/`*self` exist to
-   express memory modes, which Avin does not have.
 
 ## Open
 
