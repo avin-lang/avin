@@ -74,6 +74,10 @@ struct BodyState
 
 fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, 0, buf(), buf(), buf(), buf())
 
+struct GenericScope
+    owner: usize
+    params: Buf[TypeParam]
+
 struct Checker
     units: Buf[SourceUnit]
     symbols: Buf[FunctionSymbol]
@@ -84,6 +88,10 @@ struct Checker
     scope: Map[string, usize]
     current: usize
     body: BodyState
+    /** The bindings of inference variables: `None` while a variable is unsolved. */
+    vars: Buf[Option[&Type]]
+    /** The type parameters in scope, and the generic function they belong to. */
+    generic: Option[GenericScope]
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -109,7 +117,7 @@ end Checked
 /** Checks a program. The last unit is the program's own file, which must declare `main`; the units
  * before it (the prelude) are visible to it, and its own declarations shadow theirs. */
 check_program(units: Buf[SourceUnit]) -> Checked
-    var c = Checker(units, buf(), buf(), buf(), buf(), map(), 0, fresh_body(0))
+    var c = Checker(units, buf(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None)
     for u in 0..<c.units.len()
         declare_unit(&c, u)
     for id in 0..<c.symbols.len()
@@ -125,6 +133,7 @@ check_program(units: Buf[SourceUnit]) -> Checked
             // exit status.
             val main = c.symbols.at(id)
             if main.params.len() > 0 then c.note(main_unit, main.decl.name_span, "`main` takes no parameters")
+            if main.decl.type_params.len() > 0 then c.note(main_unit, main.decl.name_span, "`main` cannot be generic")
             val result = main.result.unwrap_or(ErrorType)
             if !(*result is Unit || *result is Int(_) || *result is ErrorType)
                 c.note(main_unit, main.decl.name_span, s"`main` yields unit or an integer, not ${type_name(result)}")
@@ -160,7 +169,11 @@ private declare_unit(c: *Checker, unit: usize)
 private signature(c: *Checker, unit: usize, module_name: string, f: &Function) -> FunctionSymbol
     var params: Buf[&Type] = buf()
     var names: Buf[string] = buf()
-    if f.type_params.len() > 0 then c.note(unit, f.span, "generic functions are not implemented")
+    // A generic function's own type parameters are in scope in its signature.
+    val outer_generic = c.generic
+    if f.type_params.len() > 0 then c.generic = Some(GenericScope(c.symbols.len(), f.type_params))
+    for tp in f.type_params
+        if tp.bounds.len() > 0 then c.note(unit, tp.span, "bounds on type parameters are not implemented")
     if f.guard is Some(g) then c.note(unit, g.span, "function guards are not implemented")
     for p in f.params
         p.pattern.kind match
@@ -186,6 +199,7 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function) -
             None -> c.note(unit, f.name_span, s"`$name` is not an intrinsic")
     elif f.body is None
         c.note(unit, f.name_span, s"`${f.name}` needs a body")
+    c.generic = outer_generic
     FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf())
 
 // `@intrinsic("name")` is the only annotation this compiler gives meaning to; it is valid only on a
@@ -216,6 +230,11 @@ intrinsic_signature(name: string) -> Option[&Type]
 resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
     InvalidType -> ErrorType
     Named(path, args) ->
+        if c.generic is Some(scope)
+            for i in 0..<scope.params.len()
+                if scope.params.at(i).name == path
+                    if args.len() > 0 then c.note(unit, t.span, s"`$path` takes no type arguments")
+                    return TypeVar(scope.owner, i, path)
         builtin_type(path) match
             Some(ty) ->
                 if args.len() > 0
@@ -242,7 +261,10 @@ private check_function(c: *Checker, id: usize)
             val outer = c.body
             c.current = id
             c.body = fresh_body(id)
+            val outer_generic = c.generic
+            c.generic = if symbol.decl.type_params.len() > 0 then Some(GenericScope(id, symbol.decl.type_params)) else None
             check_body(c, id, body)
+            c.generic = outer_generic
             finish_captures(c)
             c.locals.set(id, c.body.locals)
             for f in local_functions_of(c, id)
@@ -321,6 +343,9 @@ private declare_local_functions(c: *Checker, items: Buf[&Expr])
                 c.note(unit_of(c), decl.name_span, s"`${decl.name}` is declared more than once in this block")
                 continue
             val enclosing = c.symbols.at(c.current)
+            if decl.type_params.len() > 0
+                c.note(unit_of(c), decl.name_span, "generic local functions are not implemented")
+                continue
             var symbol = signature(c, enclosing.unit, enclosing.module_name, decl)
             symbol.root = Some(c.body.root)
             val id = c.symbols.len()
@@ -389,7 +414,7 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
     StringLit(value) -> TExpr(e.span, Str, StrConst(value))
     UnitLit -> TExpr(e.span, Unit, UnitConst)
     Name(name) -> name_expr(c, e.span, name)
-    Call(callee, args) -> call_expr(c, e.span, callee, args)
+    Call(callee, args) -> call_expr(c, e.span, callee, args, expected)
     Block(items, discard) -> block_expr(c, e, items, discard, expected, used)
     Binding(name, declared, value, mutable) -> binding_expr(c, e, name, declared, value, mutable)
     Assign(target, op, value, yields) -> assign_expr(c, e, target, op, value, yields)
@@ -756,33 +781,42 @@ private return_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
             if value is Some(v) then typed = Some(check_expr(c, v, None))
     TExpr(e.span, Nothing, Return(typed))
 
-private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument]) -> &TExpr
+// A call to a generic function solves for its type arguments: they may be written (`f[int](x)`),
+// and otherwise each starts as an unknown that the expected result type and the arguments decide.
+// Arguments that are not bare literals are checked first, so a literal takes the type the others
+// settle. Every type argument must be decided by the end of the call.
+private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
-    val name = callee.kind match
+    var explicit: Option[Buf[&TypeExpr]] = None
+    var named = callee
+    if callee.kind is TypeApply(inner, types)
+        explicit = Some(types)
+        named = inner
+    val name = named.kind match
         Name(n) -> n
         _ ->
             c.note(unit, callee.span, "only a named function can be called")
             return TExpr(at, ErrorType, UnitConst)
-    if lookup_function(c, name) is None
+    if lookup_function(c, name) is None && explicit is None
         if builtin_type(name) is Some(target) then return conversion(c, at, target, args)
     val id = lookup_function(c, name) match
         Some(i) -> i
         None ->
-            c.note(unit, callee.span, s"`$name` is not defined")
+            c.note(unit, named.span, s"`$name` is not defined")
             return TExpr(at, ErrorType, UnitConst)
     val target = c.symbols.at(id)
-    var typed: Buf[&TExpr] = buf()
-    for i in 0..<args.len()
-        val arg = args.at(i)
-        if arg.name is Some(_) then c.note(unit, arg.span, "named arguments are not implemented")
-        val wanted: Option[&Type] = if i < target.params.len() then Some(target.params.at(i)) else None
-        val value = check_expr(c, arg.value, wanted)
-        if wanted is Some(w)
-            if !conforms(value.ty, w)
-                c.note(unit, arg.value.span, s"expected ${type_name(w)}, found ${type_name(value.ty)}")
-        typed.push(value)
-    if args.len() != target.params.len()
-        c.note(unit, at, s"`$name` takes ${target.params.len()} arguments, not ${args.len()}")
+    val type_params = target.decl.type_params
+    var type_args: Buf[&Type] = buf()
+    for _ in type_params
+        type_args.push(fresh_var(c))
+    // Written type arguments may be a leading prefix, with the rest inferred.
+    if explicit is Some(types)
+        if types.len() > type_params.len()
+            c.note(unit, callee.span, s"`$name` takes ${type_params.len()} type arguments, not ${types.len()}")
+        else
+            for i in 0..<types.len()
+                unify(c, type_args.at(i), resolve_type(c, unit, types.at(i)))
+    val params = substitute_all(target.params, id, type_args)
     if target.root is Some(_)
         c.body.calls.push(LocalCall(c.current, id))
         if c.states.at(id) == 0
@@ -790,10 +824,48 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument]) -> 
             for v in c.body.visible
                 initialized.push(v)
             c.body.early.push(EarlyCall(id, at, initialized))
-    var result = result_of(c, id, at)
+    val declared = substitute(result_of(c, id, at), id, type_args)
+    if expected is Some(want) then unify(c, declared, want)
+    var early: Buf[Option[&TExpr]] = buf()
+    for _ in args
+        early.push(None)
+    for pass in 0..<2
+        for i in 0..<args.len()
+            // The first pass checks the arguments that are not bare literals, the second the rest.
+            if (pass == 0) == is_literal(args.at(i).value) then continue
+            early.set(i, Some(call_argument(c, args.at(i), if i < params.len() then Some(params.at(i)) else None)))
+    var typed: Buf[&TExpr] = buf()
+    for t in early
+        typed.push(t.unwrap())
+    if args.len() != target.params.len()
+        c.note(unit, at, s"`$name` takes ${target.params.len()} arguments, not ${args.len()}")
+    var solved: Buf[&Type] = buf()
+    for i in 0..<type_args.len()
+        val t = zonk(c, type_args.at(i))
+        if *t is Var(v)
+            c.note(unit, callee.span, s"cannot infer `${type_params.at(i).name}` for this call to `$name`; write it, as in `$name[int](…)`")
+            c.vars.set(v, Some(ErrorType))
+            solved.push(ErrorType)
+        else solved.push(t)
+    var result = zonk(c, declared)
     for t in typed
         if *t.ty is Nothing then result = Nothing
-    TExpr(at, result, Call(id, typed))
+    TExpr(at, result, Call(id, typed, solved))
+
+// Checks one argument against its parameter type, which may still contain unknowns; the argument's
+// type decides them.
+private call_argument(c: *Checker, arg: Argument, param: Option[&Type]) -> &TExpr
+    val unit = unit_of(c)
+    if arg.name is Some(_) then c.note(unit, arg.span, "named arguments are not implemented")
+    var wanted: Option[&Type] = None
+    if param is Some(p)
+        val known = zonk(c, p)
+        if !(*known is Var(_)) then wanted = Some(known)
+    val value = check_expr(c, arg.value, wanted)
+    if param is Some(p)
+        if !(*value.ty is Nothing) && !unify(c, p, value.ty)
+            c.note(unit, arg.value.span, s"expected ${type_name(zonk(c, p))}, found ${type_name(value.ty)}")
+    value
 
 // A built-in type called with one value converts it. Integers convert among themselves (widening
 // sign-extends, narrowing keeps the low bits), to and from `real`, and to `byte` and `char`, which
@@ -1028,3 +1100,53 @@ private pattern_constant(c: *Checker, value: &Expr, ty: &Type) -> &TExpr
         c.note(unit, value.span, "matching strings is not implemented")
         return TExpr(t.span, ErrorType, UnitConst)
     t
+
+/** A fresh inference variable. */
+private fresh_var(c: *Checker) -> &Type
+    val id = c.vars.len()
+    c.vars.push(None)
+    Var(id)
+
+/** `t` with every solved variable replaced by its solution. */
+private zonk(c: *Checker, t: &Type) -> &Type = *t match
+    Var(id) -> c.vars.at(id) match
+        Some(bound) -> zonk(c, bound)
+        None -> t
+    Tuple(items) ->
+        var out: Buf[&Type] = buf()
+        for item in items
+            out.push(zonk(c, item))
+        Tuple(out)
+    Function(params, result) ->
+        var out: Buf[&Type] = buf()
+        for p in params
+            out.push(zonk(c, p))
+        Function(out, zonk(c, result))
+    _ -> t
+
+// Makes two types equal by solving variables, and reports whether they can be. A value that never
+// finishes, or one whose type already failed, fits anything without deciding a variable.
+private unify(c: *Checker, a: &Type, b: &Type) -> bool
+    val x = zonk(c, a)
+    val y = zonk(c, b)
+    if *x is ErrorType || *y is ErrorType then return true
+    if *x is Var(i)
+        if !same_type(x, y) then c.vars.set(i, Some(y))
+        return true
+    if *y is Var(j)
+        c.vars.set(j, Some(x))
+        return true
+    *x match
+        Tuple(xs) -> *y match
+            Tuple(ys) -> unify_all(c, xs, ys)
+            _ -> false
+        Function(xs, r) -> *y match
+            Function(ys, q) -> unify_all(c, xs, ys) && unify(c, r, q)
+            _ -> false
+        _ -> same_type(x, y)
+
+private unify_all(c: *Checker, xs: Buf[&Type], ys: Buf[&Type]) -> bool
+    if xs.len() != ys.len() then return false
+    for i in 0..<xs.len()
+        if !unify(c, xs.at(i), ys.at(i)) then return false
+    true

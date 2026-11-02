@@ -1,6 +1,7 @@
 module dev.avinlang.compiler
 
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
 
 /** The machine type of a semantic type, or `None` for a type with no runtime representation. */
 mir_type(t: &Type) -> Option[MirType] = *t match
@@ -26,9 +27,21 @@ private struct LoopTarget
     exit: usize
     slot: Option[Place]
 
+/** One compiled copy of a function: a generic function has one per list of type arguments it is
+ * called with, and a local function of a generic function one per copy of that function. */
+private struct Instance
+    function: usize
+    type_args: Buf[&Type]
+
 private struct Lowering
     program: TProgram
     strings: Buf[string]
+    instances: Buf[Instance]
+    /** Each instance's index, by its function and type arguments. */
+    instance_index: Map[string, usize]
+    /** The type arguments of the instance being lowered, and the function they belong to. */
+    subst: Buf[&Type]
+    subst_owner: usize
     /** The value holding each parameter of the top-level function, or `None` for a unit one or, in
      * a local function, one it does not capture. */
     param_values: Buf[Option[usize]]
@@ -46,41 +59,82 @@ private struct Lowering
     trap: Option[usize]
     returns_value: bool
 
+// Every function that is not generic is compiled once; each generic function is compiled for each
+// list of type arguments a compiled call gives it, as those calls are found.
 lower_program(program: TProgram) -> MirProgram
-    var l = Lowering(program, buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), None, false)
+    var l = Lowering(program, buf(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), None, false)
+    for i in 0..<program.symbols.len()
+        if !is_generic(program, i) then instance(&l, i, buf())
+    val entry = instance(&l, program.entry, buf())
     var functions: Buf[MirFunction] = buf()
-    for f in program.functions
-        functions.push(lower_function(&l, f))
-    MirProgram(functions, l.strings, program.entry)
+    var k = 0usize
+    while k < l.instances.len()
+        functions.push(lower_function(&l, k))
+        k += 1
+    MirProgram(functions, l.strings, entry)
+
+// A generic function, or a local function of one, whose types depend on type arguments.
+private is_generic(program: TProgram, id: usize) -> bool
+    val symbol = program.symbols.at(id)
+    val owner = symbol.root.unwrap_or(id)
+    program.symbols.at(owner).decl.type_params.len() > 0
+
+/** The index of the instance of `function` for `type_args`, made when first asked for. */
+private instance(l: *Lowering, function: usize, type_args: Buf[&Type]) -> usize
+    var key = function.to_string()
+    for t in type_args
+        key = key + "|" + type_name(t)
+    if l.instance_index.get(key) is Some(index) then return index
+    val index = l.instances.len()
+    l.instances.push(Instance(function, type_args))
+    l.instance_index.put(key, index)
+    index
+
+/** A type of the code being lowered, with the instance's type arguments substituted. */
+private concrete(l: *Lowering, t: &Type) -> &Type = substitute(t, l.subst_owner, l.subst)
+
+private machine(l: *Lowering, t: &Type) -> Option[MirType] = mir_type(concrete(l, t))
 
 // A local function takes its declared parameters, then the address of each local it captures,
 // then the value of each top-level parameter it captures.
-private signature_of(program: TProgram, f: TFunction) -> MirSignature
+private signature_of(l: *Lowering, f: TFunction) -> MirSignature
+    val program = l.program
     val symbol = program.symbols.at(f.symbol)
     var params: Buf[MirType] = buf()
     for p in symbol.params
-        if mir_type(p) is Some(t) then params.push(t)
+        if machine(l, p) is Some(t) then params.push(t)
     for x in symbol.captured_locals
-        if mir_type(f.locals.at(x).ty) is Some(_) then params.push(MPtr)
+        if machine(l, f.locals.at(x).ty) is Some(_) then params.push(MPtr)
     if symbol.root is Some(root)
         for x in symbol.captured_params
-            if mir_type(program.symbols.at(root).params.at(x)) is Some(t) then params.push(t)
-    MirSignature(params, mir_type(symbol.result.unwrap_or(Unit)))
+            if machine(l, program.symbols.at(root).params.at(x)) is Some(t) then params.push(t)
+    MirSignature(params, machine(l, symbol.result.unwrap_or(Unit)))
 
 /** The symbol a function has in the object file: its module path and name. A file with no module
  * header is in `<program>`, which no module path can spell; a local function is named within its
  * top-level function and numbered, since two blocks may each declare one with the same name.
  * Quoted in LLVM, so any text is valid. */
-function_symbol(program: TProgram, id: usize) -> string
+function_symbol(program: TProgram, id: usize, type_args: Buf[&Type]) -> string
     val symbol = program.symbols.at(id)
     val prefix = if symbol.module_name == "" then "<program>" else symbol.module_name
+    var arguments = ""
+    if type_args.len() > 0
+        arguments = "["
+        for i in 0..<type_args.len()
+            if i > 0 then arguments = arguments + ", "
+            arguments = arguments + type_name(type_args.at(i))
+        arguments = arguments + "]"
     symbol.root match
-        Some(root) -> s"$prefix.${program.symbols.at(root).name}.${symbol.name}#$id"
-        None -> prefix + "." + symbol.name
+        Some(root) -> s"$prefix.${program.symbols.at(root).name}$arguments.${symbol.name}#$id"
+        None -> prefix + "." + symbol.name + arguments
 
-private lower_function(l: *Lowering, f: TFunction) -> MirFunction
+private lower_function(l: *Lowering, k: usize) -> MirFunction
+    val inst = l.instances.at(k)
+    val f = l.program.functions.at(inst.function)
     val symbol = l.program.symbols.at(f.symbol)
-    val signature = signature_of(l.program, f)
+    l.subst = inst.type_args
+    l.subst_owner = symbol.root.unwrap_or(inst.function)
+    val signature = signature_of(l, f)
     l.values = buf()
     l.slots = buf()
     l.blocks = buf()
@@ -97,24 +151,24 @@ private lower_function(l: *Lowering, f: TFunction) -> MirFunction
     symbol.root match
         None ->
             for p in symbol.params
-                l.param_values.push(if mir_type(p) is Some(t) then Some(fresh(l, t)) else None)
+                l.param_values.push(if machine(l, p) is Some(t) then Some(fresh(l, t)) else None)
         Some(root) ->
             for i in 0..<symbol.params.len()
-                val value = if mir_type(symbol.params.at(i)) is Some(t) then Some(Value(fresh(l, t))) else None
+                val value = if machine(l, symbol.params.at(i)) is Some(t) then Some(Value(fresh(l, t))) else None
                 store(l, l.local_slots.at(symbol.param_locals.at(i)), value)
             for x in symbol.captured_locals
-                if mir_type(f.locals.at(x).ty) is Some(t)
+                if machine(l, f.locals.at(x).ty) is Some(t)
                     l.local_slots.set(x, Some(Place(Value(fresh(l, MPtr)), t)))
             for _ in l.program.symbols.at(root).params
                 l.param_values.push(None)
             for x in symbol.captured_params
-                if mir_type(l.program.symbols.at(root).params.at(x)) is Some(t) then l.param_values.set(x, Some(fresh(l, t)))
+                if machine(l, l.program.symbols.at(root).params.at(x)) is Some(t) then l.param_values.set(x, Some(fresh(l, t)))
     f.body match
         Some(body) ->
             val result = lower_expr(l, body)
             finish(l, returning(l, result))
         None -> intrinsic_body(l, symbol)
-    MirFunction(function_symbol(l.program, f.symbol), signature, l.values, l.slots, l.blocks)
+    MirFunction(function_symbol(l.program, f.symbol, inst.type_args), signature, l.values, l.slots, l.blocks)
 
 // The terminator that returns a body's value. A function that yields a value but whose body has
 // none at this point is in code that cannot be reached.
@@ -164,7 +218,7 @@ private fresh(l: *Lowering, t: MirType) -> usize
     l.values.push(t)
     id
 
-private new_slot(l: *Lowering, t: &Type) -> Option[Place] = mir_type(t) match
+private new_slot(l: *Lowering, t: &Type) -> Option[Place] = machine(l, t) match
     Some(m) ->
         val id = l.slots.len()
         l.slots.push(m)
@@ -233,11 +287,11 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         Some(id) -> Some(Value(id))
         None -> None
     Local(index) -> load(l, l.local_slots.at(index))
-    Call(function, args) ->
+    Call(function, args, type_args) ->
         var operands: Buf[Operand] = buf()
         for a in args
             val op = lower_expr(l, a)
-            if mir_type(a.ty) is Some(_)
+            if machine(l, a.ty) is Some(_)
                 op match
                     Some(v) -> operands.push(v)
                     None -> return None
@@ -247,10 +301,18 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
             if l.local_slots.at(x) is Some(p) then operands.push(p.address)
         for x in callee.captured_params
             if l.param_values.at(x) is Some(v) then operands.push(Value(v))
-        val dest = mir_type(e.ty) match
+        // A local function shares its top-level function's type arguments; a generic function is
+        // instantiated with the call's, made concrete for the instance being lowered.
+        var concrete_args: Buf[&Type] = buf()
+        if callee.root is Some(_) then concrete_args = l.subst
+        else
+            for t in type_args
+                concrete_args.push(concrete(l, t))
+        val index = instance(l, function, concrete_args)
+        val dest = machine(l, e.ty) match
             Some(t) -> Some(fresh(l, t))
             None -> None
-        l.insts.push(Call(dest, Direct(function), operands))
+        l.insts.push(Call(dest, Direct(index), operands))
         dest match
             Some(id) -> Some(Value(id))
             None -> None
@@ -258,7 +320,7 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         var last: Option[Operand] = None
         for item in items
             last = lower_expr(l, item)
-        if mir_type(e.ty) is Some(_) then last else None
+        if machine(l, e.ty) is Some(_) then last else None
     Let(local, value) ->
         store(l, l.local_slots.at(local), lower_expr(l, value))
         None
@@ -562,7 +624,7 @@ private continue_if(l: *Lowering, condition: Operand, fail: usize)
 // continuing.
 private lower_match(l: *Lowering, e: &TExpr, subject: &TExpr, arms: Buf[TArm]) -> Option[Operand]
     val s = lower_expr(l, subject)
-    if s is None && mir_type(subject.ty) is Some(_) then return None
+    if s is None && machine(l, subject.ty) is Some(_) then return None
     val slot = new_slot(l, e.ty)
     val join = new_block(l)
     for arm in arms
@@ -577,7 +639,7 @@ private lower_match(l: *Lowering, e: &TExpr, subject: &TExpr, arms: Buf[TArm]) -
 
 private lower_is(l: *Lowering, value: &TExpr, pattern: &TPattern, negated: bool) -> Option[Operand]
     val v = lower_expr(l, value)
-    if v is None && mir_type(value.ty) is Some(_) then return None
+    if v is None && machine(l, value.ty) is Some(_) then return None
     val slot = new_slot(l, Bool)
     val fail = new_block(l)
     val join = new_block(l)
