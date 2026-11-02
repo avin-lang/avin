@@ -16,7 +16,7 @@ Iterable[+A]                 iterator(), and the operation families below
 ├── Iterator[+A]             single-pass; iterator() returns itself
 ├── Seq[+A]                  ordered, (Int) -> A
 │   ├── List[+A]             immutable linked list
-│   ├── Vector[+A]           immutable indexed
+│   ├── Vector[+A]           immutable indexed; the default sequence
 │   ├── Range[A]             immutable arithmetic progression
 │   ├── Array[A]             mutable, fixed length, contiguous
 │   └── Buffer[A]            mutable, growable, contiguous
@@ -62,16 +62,35 @@ by contents, displays its contents, and has identity.
 
 ## Literals
 
-| Literal | Value |
+| Literal | Value with no other expected type |
 | --- | --- |
-| `[1, 2, 3]`, `[]` | Sequence literal. **Open:** immutable `List`, or a growable `Buffer` (see [decisions](/spec/decisions/#open)) |
+| `[1, 2, 3]`, `[]` | Immutable `Vector` |
 | `{1, 2, 3}`, `{}` | Immutable `Set` |
 | `{"a": 1, "b": 2}` | Immutable `Map` |
 | `{a: 1, b: 2}` | The same map; a bare identifier directly before `:` is a string key |
 | `Map.empty` | Empty `Map` |
 
-A literal's element types are inferred from its elements and from context. Literals always build the
-canonical library types, even when a user type named `List` is in scope.
+**A literal builds the collection its expected type asks for.** With no expected collection type,
+or one the default satisfies (`Seq[int]`, `Iterable[int]`), a sequence literal is a `Vector`, a set
+literal a `Set` and a map literal a `Map`. When the expected type is another collection — from an
+annotation, a parameter or a field — the literal builds that one instead:
+
+```text
+val xs = [1, 2, 3]                  // Vector[int]
+val queue: Buffer[int] = [1, 2, 3]  // growable and mutable
+val header: Array[byte] = [0x89, 0x50, 0x4e, 0x47]
+val stack: List[string] = []
+val seen: mutable.Set[int] = {}
+```
+
+`List`, `Vector`, `Array` and `Buffer` are built from sequence literals, the set types from set
+literals and the map types from map literals; a library or user collection joins them by
+implementing the library's literal-building trait. The elements take their types from the expected
+element type when there is one (`Array[byte]` makes each literal a `byte`), and otherwise from the
+elements themselves. An empty literal with nothing to say what it holds is an error asking for an
+annotation.
+
+Literals always build the library's types, even when a user type named `Vector` is in scope.
 
 ## Ranges
 

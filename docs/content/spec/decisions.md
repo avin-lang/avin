@@ -54,8 +54,9 @@ a decision changes, this page and the chapter change together.
 - Integer overflow traps. `+%`, `-%`, `*%` wrap and `+|`, `-|`, `*|` saturate, explicitly.
 - A sequence is indexed by calling it: `xs(i)`, and `xs(i) = v` to assign. Sequences implement
   function types, and any library type can implement a function type through `apply`.
-- `{1, 2}` is a Set, `{"a": 1}` is a Map, and `{a: 1}` means `{"a": 1}`. `{}` is the empty Set and
-  `Map.empty` the empty Map.
+- `[1, 2]` is an immutable `Vector`, `{1, 2}` a `Set` and `{"a": 1}` a `Map`, unless the expected
+  type asks for another collection (`val b: Buffer[int] = [1, 2]`), which the literal then builds.
+  `{a: 1}` means `{"a": 1}`. `{}` is the empty Set and `Map.empty` the empty Map.
 - `..` and `..<` expressions construct iterable `Range` values.
 - `for` is comprehension sugar over `map`, `flatMap`, filtering and `foreach`.
 - The collection hierarchy is rooted at `Iterable`, and `Iterator` is itself `Iterable`.
@@ -99,7 +100,5 @@ These are the specification's defaults until the user confirms or rejects them:
 
 ## Open
 
-- `[1, 2]`: an immutable `List` (the current definition) or a growable `Buffer`, as the user has
-  suggested. The names and the mutability policy need agreement.
 - Resource cleanup: a `defer` construct or a library `use`.
 - The exact spelling of function clauses, guards and parameter patterns.
