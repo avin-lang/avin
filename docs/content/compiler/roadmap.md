@@ -30,7 +30,7 @@ with `--ff-only`.
 | 5 | **Object model** | `class`, `trait`, `object`, `impl`, methods, `override`, `open`/`abstract`, constructors with checked initialization, companions, member access, type patterns |
 | 6 | **Monomorphization and dispatch** | Bounded generics, closed-world instantiation, dispatch for generic trait methods, reified headers, variance checking, devirtualization |
 | 7 | **Sysl bindings** | `@sysl` declarations, shim generation, the cached shim build, boundary conversions, opaque handles, diagnostics mapped back to bindings |
-| 8 | **Core library in Avin** | `Eq`, `Hash`, `Ord`, `Display`, `Debug`, `Writer`, `Option`, `Result`, `?`, string methods, `print`, `debug`, interpolation and formatting |
+| 8 | **Core library in Avin** | `Eq`, `Hash`, `Ord`, `Display`, `Debug`, `Writer`, `Option`, `Result`, `?`, string methods, `print`, `debug`, `StringContext` and interpolators, interpolation and formatting |
 | 9 | **Collections in Avin** | `Iterable`/`Iterator` (Iterator is Iterable), `Seq`, `List`, `Vector`, `Array`, `Buffer`, `Deque`, `Set`, `Map`, `Range`, builders, views, literals built through them, `::`, list and sequence patterns, `for` comprehensions |
 | 10 | **Test runner and tooling** | `avin test`, `avin run`, project and package commands |
 | 11 | **System library** | `avin.io`, `avin.fs`, `avin.process`, `avin.time` and the rest over Sysl bindings |

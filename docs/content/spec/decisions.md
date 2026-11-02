@@ -70,6 +70,9 @@ a decision changes, this page and the chapter change together.
 - `print` is an ordinary library function. It renders with `Display`, separates its arguments with
   `, ` and ends with a newline. `print(debug(x))` selects `Debug`.
 - Avin has Sysl's full string interpolation and formatting.
+- An interpolated string is a method call on `StringContext`: `p"a $x b"` is
+  `StringContext(["a ", " b"]).p(x)`. `s`, `f` and `raw` are library methods, and a program defines
+  its own interpolator by implementing a trait for `StringContext`.
 - Nested helper functions see their enclosing scope. Closures are full closures, and `return` inside a
   lambda is local to the lambda.
 - `match` is a value-producing expression with full destructuring.
