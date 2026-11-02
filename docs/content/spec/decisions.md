@@ -57,6 +57,8 @@ a decision changes, this page and the chapter change together.
 - `[1, 2]` is an immutable `Vector`, `{1, 2}` a `Set` and `{"a": 1}` a `Map`, unless the expected
   type asks for another collection (`val b: Buffer[int] = [1, 2]`), which the literal then builds.
   `{a: 1}` means `{"a": 1}`. `{}` is the empty Set and `Map.empty` the empty Map.
+- `x :: xs` prepends to an immutable `List`, and `head :: tail` and `[]` are list patterns, for
+  recursive list code. `::` is right-associative.
 - `..` and `..<` expressions construct iterable `Range` values.
 - `for` is comprehension sugar over `map`, `flatMap`, filtering and `foreach`.
 - The collection hierarchy is rooted at `Iterable`, and `Iterator` is itself `Iterable`.

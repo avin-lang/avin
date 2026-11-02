@@ -60,6 +60,26 @@ fixed-length, mutable buffer whose value elements are stored unboxed, so `Array[
 `Array[Point]` holds `Point`s inline. It can be created in generic code (`Array.fill(n, x)`), compares
 by contents, displays its contents, and has identity.
 
+## List and cons
+
+`List[A]` is an immutable singly linked list, the collection for recursive code. `x :: xs` makes a
+new list with `x` in front of `xs`, sharing `xs`, in constant time. The same spelling takes a list
+apart in a pattern, and `[]` is the empty list:
+
+```text
+sum(xs: List[int]) -> int = xs match
+    [] -> 0
+    head :: tail -> head + sum(tail)
+
+pairs[A](xs: List[A]) -> List[(A, A)] = xs match
+    a :: b :: rest -> (a, b) :: pairs(rest)
+    _ -> []
+```
+
+`::` needs a `List` on its right, so a literal there is built as one: in `1 :: 2 :: []`, the `[]` is
+the empty `List[int]`. `xs(i)` on a list takes time proportional to `i`; code that indexes wants a
+`Vector`.
+
 ## Literals
 
 | Literal | Value with no other expected type |

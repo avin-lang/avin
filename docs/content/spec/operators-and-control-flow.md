@@ -21,6 +21,7 @@ Avin has Sysl's operator set and precedence. Operators are trait methods (`+` is
 | Comparison | `==` `!=` `<` `<=` `>` `>=`, chained |
 | Identity | `===` `!==` (reference types only) |
 | Range | `..` `..<` |
+| Cons | `::`, prepending to a `List` (right-associative) |
 | Pattern test | `is`, `is not` |
 | Propagation | postfix `?` |
 | Assignment | `=` and compound forms (`+=`, `<<=`, `+%=`, …) |
@@ -31,6 +32,10 @@ Bitwise operators bind more tightly than comparisons: `x & mask == 0` tests the 
 Within the bitwise family, `&` binds tightest, then `^`, then `|`. Shifts bind at the multiplicative
 level, so `1 + 2 << 3` is `17`. A shift count at least as large as the width shifts everything out.
 It is not masked.
+
+`::` binds more loosely than every arithmetic and bitwise operator and more tightly than ranges and
+comparisons, and it groups to the right: `n + 1 :: rest` is `(n + 1) :: rest`, and `1 :: 2 :: []` is
+`1 :: (2 :: [])`.
 
 Sysl's pointer operators (prefix `*` and `&`) and `await` are not part of Avin.
 
@@ -87,6 +92,8 @@ expression, checked for exhaustiveness. Patterns include:
 - literals, including negative numbers;
 - inclusive and exclusive literal ranges (`'a'..'z'`, `0..<10`);
 - constructors with nested patterns, tuples and `()`;
+- list patterns: `head :: tail` matches a non-empty `List`, grouping to the right
+  (`first :: second :: rest`), and `[]` matches the empty one;
 - type patterns (`d: Dog`);
 - alternatives (`1 | 2 | 3`), which bind no names and may continue across lines with a leading or
   trailing `|`;

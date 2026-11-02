@@ -31,7 +31,7 @@ with `--ff-only`.
 | 6 | **Monomorphization and dispatch** | Bounded generics, closed-world instantiation, dispatch for generic trait methods, reified headers, variance checking, devirtualization |
 | 7 | **Sysl bindings** | `@sysl` declarations, shim generation, the cached shim build, boundary conversions, opaque handles, diagnostics mapped back to bindings |
 | 8 | **Core library in Avin** | `Eq`, `Hash`, `Ord`, `Display`, `Debug`, `Writer`, `Option`, `Result`, `?`, string methods, `print`, `debug`, interpolation and formatting |
-| 9 | **Collections in Avin** | `Iterable`/`Iterator` (Iterator is Iterable), `Seq`, `List`, `Vector`, `Array`, `Buffer`, `Set`, `Map`, `Range`, views, literals bound to them, `for` comprehensions |
+| 9 | **Collections in Avin** | `Iterable`/`Iterator` (Iterator is Iterable), `Seq`, `List`, `Vector`, `Array`, `Buffer`, `Set`, `Map`, `Range`, views, literals bound to them, `::` and list patterns, `for` comprehensions |
 | 10 | **Test runner and tooling** | `avin test`, `avin run`, project and package commands |
 | 11 | **System library** | `avin.io`, `avin.fs`, `avin.process`, `avin.time` and the rest over Sysl bindings |
 
