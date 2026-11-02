@@ -101,6 +101,25 @@ pairs[A](xs: List[A]) -> List[(A, A)] = xs match
 the empty `List[int]`. `xs(i)` on a list takes time proportional to `i`; code that indexes wants a
 `Vector`.
 
+## Sequence patterns
+
+A sequence is taken apart with the same brackets that build it. `[]` matches an empty sequence, and
+`[a, b, c]` matches a sequence of exactly three elements, binding or testing each one; this works on
+any `Seq` — `List`, `Vector`, `Array`, `Buffer`. On a `List`, `[a, b]` means `a :: b :: []`, and the
+two forms mix: `a :: [b, c]` matches a list of exactly three elements. `::` patterns themselves are
+for lists only, since splitting off a head is what a list does in constant time.
+
+```text
+describe(xs: Vector[string]) -> string = xs match
+    [] -> "nobody"
+    [one] -> one
+    [first, second] -> s"$first and $second"
+    _ -> s"${xs(0)} and ${xs.length() - 1} others"
+```
+
+For exhaustiveness, `[]` together with `head :: tail` covers every `List`; fixed-length patterns
+cover only their lengths, so a match that uses only them needs a catch-all.
+
 ## Literals
 
 | Literal | Value with no other expected type |

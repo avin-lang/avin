@@ -93,7 +93,9 @@ expression, checked for exhaustiveness. Patterns include:
 - inclusive and exclusive literal ranges (`'a'..'z'`, `0..<10`);
 - constructors with nested patterns, tuples and `()`;
 - list patterns: `head :: tail` matches a non-empty `List`, grouping to the right
-  (`first :: second :: rest`), and `[]` matches the empty one;
+  (`first :: second :: rest`);
+- [sequence patterns](/spec/collections/#sequence-patterns): `[]` matches an empty sequence and
+  `[a, b]` a sequence of exactly two elements;
 - type patterns (`d: Dog`);
 - alternatives (`1 | 2 | 3`), which bind no names and may continue across lines with a leading or
   trailing `|`;
