@@ -17,7 +17,8 @@ are designed together. These are the choices that shape it, each with what it me
 | **`string` is built in** | `string` is a type of the language: UTF-8, immutable, and named simply `string`. Its methods live in Avin's own core library. |
 | **`char` is a Unicode scalar value** | One `char` is one character of text, whatever its code point. |
 | **`Array[T]` is an ordinary collection** | Invariant, contiguous, fixed length and mutable; elements are stored unboxed; `==` compares contents, and printing shows them. |
-| **Integers keep their width** | Fixed-width integers keep their width through arithmetic (`i8 + i8` is `i8`). Unsigned widths are a [proposed decision](/spec/decisions/#proposed). |
+| **Integers keep their width, and overflow traps** | Fixed-width integers keep their width through arithmetic (`i8 + i8` is `i8`), and a result that does not fit stops the program. Wrapping and saturating arithmetic are written with their own operators. |
+| **Binary data is `byte`** | Integers are signed and are for counting; `byte` is the octet that files, sockets and encodings are made of. |
 | **Failures are values; bugs are traps** | A failure a correct caller can meet is a `Result` or `Option`, propagated with `?`. A bug stops the program with a trap. |
 | **One name, one function** | A scope holds one function per name. Default and named arguments give a function its variations, and inference always knows which function a call means. |
 | **`object` holds module-wide state** | An `object` is an ordinary value, and the one place for state and functions that belong to a type rather than an instance. |

@@ -24,7 +24,7 @@ with `--ff-only`.
 | --- | --- | --- |
 | 0 | **Specification** | This specification, the architecture, this roadmap, the project reset |
 | 1 | **Skeleton and test harness** | The `compiler/`, `runtime/` and `library/` packages; the lexer and parser carried over; `avin parse`, `check` and `build`; a thin end-to-end pipeline (`main() = 42` and `print` of a literal) through resolve, check, MIR and the LLVM emitter, linked with a minimal runtime; the Sysl-written execution-test driver in `sysl test` (`.avin` cases with expected output, run at `-O0` and `-O2`) |
-| 2 | **Type core and scalar programs** | The `Type` enum over symbols; scopes and symbol tables; local bidirectional inference with subtype constraints and `Nothing`; integers, `real`, `char`, `bool`, `unit`; functions, local functions, `if`/`match`/loops, guards, scalar patterns and coverage; unbounded generic functions; by-name parameters. The old execution corpus, revised to the specification, joins the suite here |
+| 2 | **Type core and scalar programs** | The `Type` enum over symbols; scopes and symbol tables; local bidirectional inference with subtype constraints and `Nothing`; integers with trapping overflow, `byte`, `real`, `char`, `bool`, `unit`; functions, local functions, `if`/`match`/loops, guards, scalar patterns and coverage; unbounded generic functions; by-name parameters. The old execution corpus, revised to the specification, joins the suite here |
 | 3 | **Modules and packages** | `avin.hocon` loading, multi-file modules, imports and visibility, the prelude as an Avin file, `@intrinsic` declarations |
 | 4 | **Runtime and heap values** | The collector over `sh.sysl.gc` with shadow-stack roots; type descriptors; traps with messages and locations; `string` as a runtime value; `data` layouts, tuples, lambdas and closures with environments |
 | 5 | **Object model** | `class`, `trait`, `object`, `impl`, methods, `override`, `open`/`abstract`, constructors with checked initialization, companions, member access, type patterns |
@@ -38,9 +38,9 @@ with `--ff-only`.
 Until stage 8, `print` in stage 1 is an `@intrinsic` over a runtime entry point, declared in Avin
 source like every other intrinsic; stage 8 replaces it with the library's `print` over `Display`.
 
-The proposed decisions on the [decisions page](/spec/decisions/#proposed) (unsigned integers,
-overflow traps, final classes, no overloading, `:` inheritance, an implicit receiver) are needed
-by stages 2 and 5, and are to be confirmed before those stages start.
+The proposed decisions on the [decisions page](/spec/decisions/#proposed) (final classes, no
+overloading, `:` inheritance, an implicit receiver) are needed by stage 5, and are to be confirmed
+before it starts.
 
 ## Status
 

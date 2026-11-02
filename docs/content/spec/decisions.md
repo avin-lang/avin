@@ -41,10 +41,14 @@ a decision changes, this page and the chapter change together.
   memoization.
 - Blocks yield their last expression. `if`, `while` and loop values follow Sysl.
 - All of Sysl's operators are supported, including comparison chains.
-- Built-in types are lowercase (`int`, `bool`, `string`, `unit`, `char`, `real`, `iN`); other types
-  are PascalCase; functions and methods are lowerCamelCase. These are conventions, not syntax rules.
-- `int` is `i32`. Signed integers of any fixed width are available. `real` is binary64, and there is
-  no single-precision type. `char` is a Unicode scalar.
+- Built-in types are lowercase (`int`, `bool`, `string`, `unit`, `char`, `real`, `iN`, `byte`);
+  other types are PascalCase; functions and methods are lowerCamelCase. These are conventions, not
+  syntax rules.
+- `int` is `i32`, and it is the only integer alias. Signed integers of any fixed width are available.
+  There are no unsigned integer types. `real` is binary64, and there is no single-precision type.
+  `char` is a Unicode scalar.
+- `byte` is an octet (0–255) for binary data, with bitwise operations and no arithmetic.
+- Integer overflow traps. `+%`, `-%`, `*%` wrap and `+|`, `-|`, `*|` saturate, explicitly.
 - A sequence is indexed by calling it: `xs(i)`, and `xs(i) = v` to assign. Sequences implement
   function types, and any library type can implement a function type through `apply`.
 - `{1, 2}` is a Set, `{"a": 1}` is a Map, and `{a: 1}` means `{"a": 1}`. `{}` is the empty Set and
@@ -83,14 +87,11 @@ a decision changes, this page and the chapter change together.
 
 These are the specification's defaults until the user confirms or rejects them:
 
-1. **Unsigned integers** `uN`, alongside `iN`. Byte-oriented APIs need `u8`.
-2. **Overflow traps** by default, with explicit `+%` and `+|` for wrapping and saturating
-   arithmetic.
-3. **Classes are final by default**, with `open` and `abstract` to allow subclassing.
-4. **No method overloading.** Default and named arguments cover its uses.
-5. **Inheritance is written with `:`**: `class C(…): Base(…), Trait`. This matches Sysl's
+1. **Classes are final by default**, with `open` and `abstract` to allow subclassing.
+2. **No method overloading.** Default and named arguments cover its uses.
+3. **Inheritance is written with `:`**: `class C(…): Base(…), Trait`. This matches Sysl's
    `trait A: B`.
-6. **The receiver is implicit**, with `self` available. Sysl's `self`/`&self`/`*self` exist to
+4. **The receiver is implicit**, with `self` available. Sysl's `self`/`&self`/`*self` exist to
    express memory modes, which Avin does not have.
 
 ## Open

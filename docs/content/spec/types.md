@@ -12,8 +12,9 @@ ordinary `impl` blocks.
 
 | Type | Meaning |
 | --- | --- |
-| `int` | Alias of `i32` |
+| `int` | Alias of `i32`, and the only integer alias |
 | `iN` | Signed integer of exactly N bits, 1 ≤ N ≤ LLVM's limit (`i8`, `i64`, `i128`, `i257`, …) |
+| `byte` | An octet, 0–255: the unit of binary data |
 | `real` | IEEE-754 binary64. There is no single-precision type |
 | `char` | A Unicode scalar value (U+0000–U+10FFFF, excluding surrogates) |
 | `bool` | `true` or `false` |
@@ -32,9 +33,22 @@ Conversions: widening sign-extends; narrowing keeps the low bits (`i8(300)` is `
 truncates toward zero, saturates at the bounds and maps NaN to zero; `char(n)` traps on a value that
 is not a Unicode scalar.
 
-Division by zero traps. Overflow behaviour is a [proposed decision](/spec/decisions/#proposed):
-trap by default, with Sysl's explicit wrapping and saturating operators for the cases that want
-them.
+**Arithmetic that overflows traps.** `+`, `-`, `*`, unary `-`, `++` and `--` trap when the
+mathematical result does not fit the width, and so does `/` for the one quotient that cannot fit
+(`MIN / -1`). `%` never overflows: `MIN % -1` is `0`. Division and remainder by zero trap. Code that
+wants other behaviour says so with an operator: `+%`, `-%` and `*%` wrap, and `+|`, `-|` and `*|`
+saturate at the bounds. Shifts never trap; a count at least as large as the width shifts every bit
+out.
+
+Integers are signed; there are no unsigned integer types. Binary data uses `byte`.
+
+## byte
+
+`byte` is an octet with a value from 0 to 255. It is the element of binary data — file contents,
+network buffers, encoded text — rather than a small number, so it has equality, ordering, the
+bitwise operators `&`, `|`, `^` and `~`, and shifts, but no arithmetic. `int(b)` gives its value
+(0–255), and `byte(n)` makes one from an integer, trapping when `n` is outside 0–255. An integer
+literal in a `byte` context must be in 0–255: `val mask: byte = 0xf0`.
 
 ## real and char
 

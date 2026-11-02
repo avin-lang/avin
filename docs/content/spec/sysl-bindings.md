@@ -45,7 +45,7 @@ Data crosses the boundary in a fixed set of shapes:
 | --- | --- |
 | `iN`, `real`, `char`, `bool`, `unit` | By value |
 | `string` | Copied into a Sysl `string` in each direction |
-| `Array[u8]` / byte sequences | Copied |
+| `Array[byte]` | Copied |
 | `Option[T]`, `Result[T, E]` of boundary types | Converted variant by variant by the generated shim |
 | `data` declared with `@sysl("…")` mirroring a Sysl struct or enum of boundary types | Converted field by field |
 | `class` declared with `@sysl("…")` | An **opaque handle**: an Avin object owning one counted Sysl reference, released by `close()` or, as a safety net, a finalizer. Its methods are bindings too. |
