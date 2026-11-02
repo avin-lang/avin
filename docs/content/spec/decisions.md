@@ -59,6 +59,9 @@ a decision changes, this page and the chapter change together.
   `{a: 1}` means `{"a": 1}`. `{}` is the empty Set and `Map.empty` the empty Map.
 - `x :: xs` prepends to an immutable `List`, and `head :: tail` and `[]` are list patterns, for
   recursive list code. `::` is right-associative.
+- `Buffer` is the only growable mutable sequence, and `Deque` the mutable sequence for both ends.
+  There is no mutable list type: every collection has a builder, through one library trait, and
+  `List`'s builder appends in constant time and yields an immutable `List`.
 - `..` and `..<` expressions construct iterable `Range` values.
 - `for` is comprehension sugar over `map`, `flatMap`, filtering and `foreach`.
 - The collection hierarchy is rooted at `Iterable`, and `Iterator` is itself `Iterable`.

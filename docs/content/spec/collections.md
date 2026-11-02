@@ -19,12 +19,14 @@ Iterable[+A]                 iterator(), and the operation families below
 │   ├── Vector[+A]           immutable indexed; the default sequence
 │   ├── Range[A]             immutable arithmetic progression
 │   ├── Array[A]             mutable, fixed length, contiguous
-│   └── Buffer[A]            mutable, growable, contiguous
+│   ├── Buffer[A]            mutable, growable at the end, contiguous
+│   └── Deque[A]             mutable, growable at both ends
 ├── Set[A]                   immutable; HashSet, TreeSet
 └── Map[K, +V]               immutable; HashMap, TreeMap
 ```
 
-The mutable `Set` and `Map` variants live in `avin.collections.mutable`.
+The mutable `Set` and `Map` variants live in `avin.collections.mutable`. `Buffer` is the one
+growable mutable sequence; code that adds and removes at both ends uses a `Deque`.
 
 **Iterator is Iterable.** Asking an iterator for its iterator returns the same iterator, at its
 current position, and traversing it consumes it. Every other collection returns a fresh iterator each
@@ -45,6 +47,25 @@ is no separate traverse-once supertype.
   `Iterable` whose run-time type is still the concrete collection.
 - `xs.view()` returns a lazy `Iterator`, for pipelines that should not build intermediate
   collections.
+
+## Builders
+
+Every collection type has a **builder**, through one library trait: `List.builder[int]()`,
+`Vector.builder[string]()`, `Set.builder[A]()`. A builder takes elements with `add(x)` and
+`addAll(xs)`, and `result()` hands over the finished collection; the builder is then spent, and using
+it again traps. Transformations, conversions such as `toList()` and collection literals all build
+through builders, and code that assembles a collection element by element uses one too.
+
+A builder is how an immutable collection is built efficiently without being mutable itself. `List`'s
+builder appends in constant time and hands back an ordinary immutable `List`, so building a list in
+order needs neither a second mutable list type nor a `reverse()` at the end:
+
+```text
+squares(n: int) -> List[int]
+    val b = List.builder[int]()
+    for i in 1..n do b.add(i * i)
+    b.result()
+```
 
 ## Indexing and callable sequences
 
@@ -103,9 +124,9 @@ val stack: List[string] = []
 val seen: mutable.Set[int] = {}
 ```
 
-`List`, `Vector`, `Array` and `Buffer` are built from sequence literals, the set types from set
-literals and the map types from map literals; a library or user collection joins them by
-implementing the library's literal-building trait. The elements take their types from the expected
+A literal is built with its collection's [builder](#builders): sequence types (`List`, `Vector`,
+`Array`, `Buffer`, `Deque`) from sequence literals, set types from set literals and map types from
+map literals. A library or user collection with a builder can be written as a literal the same way. The elements take their types from the expected
 element type when there is one (`Array[byte]` makes each literal a `byte`), and otherwise from the
 elements themselves. An empty literal with nothing to say what it holds is an error asking for an
 annotation.
