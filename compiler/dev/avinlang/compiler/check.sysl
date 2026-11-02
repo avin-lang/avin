@@ -253,6 +253,8 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
     Break(value) -> break_expr(c, e, value)
     Continue -> continue_expr(c, e)
     Return(value) -> return_expr(c, e, value)
+    Match(subject, arms) -> match_expr(c, e, subject, arms, expected, used)
+    Is(value, pattern, negated) -> is_expr(c, e, value, pattern, negated)
     LocalFunction(_) -> unsupported(c, e, "local functions")
     Invalid -> TExpr(e.span, ErrorType, UnitConst)
     _ -> unsupported(c, e, "this expression")
@@ -320,14 +322,19 @@ private binding_expr(c: *Checker, e: &Expr, name: string, declared: Option[&Type
     if want is Some(w)
         if !conforms(typed.ty, w) then c.note(unit, value.span, s"expected ${type_name(w)}, found ${type_name(typed.ty)}")
         ty = w
+    val index = declare_local(c, e.span, name, ty, mutable)
+    // A binding whose value never finishes does not finish either.
+    TExpr(e.span, if *typed.ty is Nothing then Nothing else Unit, Let(index, typed))
+
+/** Brings a new local into scope; a name may be declared once per block. */
+private declare_local(c: *Checker, at: Span, name: string, ty: &Type, mutable: bool) -> usize
     for i in c.body.block_start..<c.body.visible.len()
         if c.body.locals.at(c.body.visible.at(i)).name == name
-            c.note(unit, e.span, s"`$name` is already defined in this block")
+            c.note(unit_of(c), at, s"`$name` is already defined in this block")
     val index = c.body.locals.len()
     c.body.locals.push(TLocal(name, ty, mutable))
     c.body.visible.push(index)
-    // A binding whose value never finishes does not finish either.
-    TExpr(e.span, if *typed.ty is Nothing then Nothing else Unit, Let(index, typed))
+    index
 
 // The mutable local an assignment or update writes, after reporting why anything else cannot be
 // written.
@@ -754,3 +761,100 @@ private compare_decimal(a: string, b: string) -> int
     for i in 0..<a.bytes.len
         if a.bytes[i] != b.bytes[i] then return if a.bytes[i] < b.bytes[i] then -1 else 1
     0
+
+// Each arm's pattern names are scoped to that arm, and may shadow names outside it. The arms'
+// values must agree when the match's value is used, and together the unguarded arms must cover
+// every value of the subject's type.
+private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expected: Option[&Type], used: bool) -> &TExpr
+    val unit = unit_of(c)
+    val s = check_expr(c, subject, None)
+    var typed: Buf[TArm] = buf()
+    var ty: &Type = Nothing
+    var agreed = true
+    var never = true
+    for arm in arms
+        val mark = c.body.visible.len()
+        val outer_start = c.body.block_start
+        c.body.block_start = mark
+        val pattern = check_pattern(c, arm.pattern, s.ty, "")
+        var guard: Option[&TExpr] = None
+        if arm.guard is Some(g)
+            val t = check_expr(c, g, Some(Bool))
+            expect_bool(c, t)
+            guard = Some(t)
+        val body = check_value(c, arm.body, expected, used)
+        c.body.visible.truncate(mark)
+        c.body.block_start = outer_start
+        if !(*body.ty is Nothing) then never = false
+        if used && agreed
+            join(ty, body.ty) match
+                Some(t) -> ty = t
+                None ->
+                    c.note(unit, arm.body.span, s"this arm yields ${type_name(body.ty)}, but the arms before it yield ${type_name(ty)}")
+                    agreed = false
+        typed.push(TArm(pattern, guard, body))
+    if !agreed then ty = ErrorType
+    elif !used then ty = if never then Nothing else Unit
+    if settled(s.ty) && !match_covers(typed, s.ty)
+        c.note(unit, e.span, s"this `match` does not cover every ${type_name(s.ty)} value; add an arm for the rest, such as `_`")
+    TExpr(e.span, ty, Match(s, typed))
+
+private is_expr(c: *Checker, e: &Expr, value: &Expr, pattern: &Pattern, negated: bool) -> &TExpr
+    val v = check_expr(c, value, None)
+    val p = check_pattern(c, pattern, v.ty, "bindings in `is` patterns are not implemented")
+    TExpr(e.span, if *v.ty is Nothing then Nothing else Bool, Is(v, p, negated))
+
+// Checks a pattern against the type of the value it matches. `no_bind` is empty where the pattern
+// may bind names, and otherwise says why it may not.
+private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &TPattern
+    val unit = unit_of(c)
+    p.kind match
+        Wildcard -> TPattern(p.span, ty, PWildcard)
+        InvalidPattern -> TPattern(p.span, ErrorType, PWildcard)
+        Name(name) ->
+            if no_bind != ""
+                c.note(unit, p.span, no_bind)
+                return TPattern(p.span, ErrorType, PWildcard)
+            TPattern(p.span, ty, PBind(declare_local(c, p.span, name, ty, false)))
+        Named(name, inner) ->
+            if no_bind != ""
+                c.note(unit, p.span, no_bind)
+                return TPattern(p.span, ErrorType, PWildcard)
+            val nested = check_pattern(c, inner, ty, no_bind)
+            TPattern(p.span, ty, PNamed(declare_local(c, p.span, name, ty, false), nested))
+        Literal(value) ->
+            val t = pattern_constant(c, value, ty)
+            if !settled(t.ty) then return TPattern(p.span, ErrorType, PWildcard)
+            TPattern(p.span, ty, PLiteral(t))
+        Range(lower, upper, inclusive) ->
+            val low = pattern_constant(c, lower, ty)
+            val high = pattern_constant(c, upper, ty)
+            if !settled(low.ty) || !settled(high.ty) then return TPattern(p.span, ErrorType, PWildcard)
+            if !(*ty is Int(_) || *ty is Byte || *ty is Char)
+                c.note(unit, p.span, s"range patterns match integers, bytes and chars, not ${type_name(ty)}")
+                return TPattern(p.span, ErrorType, PWildcard)
+            TPattern(p.span, ty, PRange(low, high, inclusive))
+        Alternatives(options) ->
+            var typed: Buf[&TPattern] = buf()
+            for o in options
+                typed.push(check_pattern(c, o, ty, if no_bind == "" then "alternatives bind no names; write `_` for a value that is not used" else no_bind))
+            TPattern(p.span, ty, PAlternatives(typed))
+        Constructor(_, _) ->
+            c.note(unit, p.span, "constructor patterns are not implemented")
+            TPattern(p.span, ErrorType, PWildcard)
+        Tuple(_) ->
+            c.note(unit, p.span, "tuple patterns are not implemented")
+            TPattern(p.span, ErrorType, PWildcard)
+
+// A literal in a pattern takes the matched value's type, as it would beside it in `==`.
+private pattern_constant(c: *Checker, value: &Expr, ty: &Type) -> &TExpr
+    val unit = unit_of(c)
+    val t = check_expr(c, value, Some(ty))
+    if !settled(t.ty) || !settled(ty) then return TExpr(t.span, ErrorType, UnitConst)
+    if !same_type(t.ty, ty)
+        c.note(unit, value.span, s"this pattern is ${type_name(t.ty)}, but the value it matches is ${type_name(ty)}")
+        return TExpr(t.span, ErrorType, UnitConst)
+    if *ty is Str
+        c.note(unit, value.span, "matching strings is not implemented")
+        return TExpr(t.span, ErrorType, UnitConst)
+    t

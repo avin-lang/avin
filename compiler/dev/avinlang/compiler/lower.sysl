@@ -270,6 +270,8 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
     Continue(label) ->
         leave(l, Jump(loop_target(l, label).head))
         None
+    Match(subject, arms) -> lower_match(l, e, subject, arms)
+    Is(value, pattern, negated) -> lower_is(l, value, pattern, negated)
     Return(value) ->
         var v: Option[Operand] = None
         var dead = false
@@ -516,3 +518,65 @@ private lower_while(l: *Lowering, e: &TExpr, label: usize, condition: &TExpr, bo
         finish(l, Jump(exit))
     l.current = exit
     load(l, slot)
+
+/** Continues only when `condition` holds; otherwise control goes to `fail`. */
+private continue_if(l: *Lowering, condition: Operand, fail: usize)
+    val next = new_block(l)
+    finish_into(l, Branch(condition, next, fail), next)
+
+// Each arm tests its pattern and then its guard, going on to the next arm when either fails. The
+// checker has proved the arms cover every value, so falling past the last arm traps rather than
+// continuing.
+private lower_match(l: *Lowering, e: &TExpr, subject: &TExpr, arms: Buf[TArm]) -> Option[Operand]
+    val s = lower_expr(l, subject)
+    if s is None && mir_type(subject.ty) is Some(_) then return None
+    val slot = new_slot(l, e.ty)
+    val join = new_block(l)
+    for arm in arms
+        val fail = new_block(l)
+        test_pattern(l, arm.pattern, s, fail)
+        if arm.guard is Some(g)
+            if lower_expr(l, g) is Some(ok) then continue_if(l, ok, fail)
+        store(l, slot, lower_expr(l, arm.body))
+        finish_into(l, Jump(join), fail)
+    finish_into(l, Trap, join)
+    load(l, slot)
+
+private lower_is(l: *Lowering, value: &TExpr, pattern: &TPattern, negated: bool) -> Option[Operand]
+    val v = lower_expr(l, value)
+    if v is None && mir_type(value.ty) is Some(_) then return None
+    val slot = new_slot(l, Bool)
+    val fail = new_block(l)
+    val join = new_block(l)
+    test_pattern(l, pattern, v, fail)
+    store(l, slot, Some(ConstBool(!negated)))
+    finish_into(l, Jump(join), fail)
+    store(l, slot, Some(ConstBool(negated)))
+    finish_into(l, Jump(join), join)
+    load(l, slot)
+
+// Tests `value` against a pattern, binding its names, and continues where it matched; a failed
+// test goes to `fail`. A unit value has no runtime value, and every unit pattern matches it.
+private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: usize)
+    p.kind match
+        PWildcard -> ()
+        PBind(local) -> store(l, l.local_slots.at(local), value)
+        PNamed(local, inner) ->
+            test_pattern(l, inner, value, fail)
+            store(l, l.local_slots.at(local), value)
+        PLiteral(constant) ->
+            if value is Some(v)
+                if lower_expr(l, constant) is Some(k) then continue_if(l, compare(l, compare_op(Equal, p.ty), v, k), fail)
+        PRange(lower, upper, inclusive) ->
+            if value is Some(v)
+                if lower_expr(l, lower) is Some(low) then continue_if(l, compare(l, compare_op(GreaterEqual, p.ty), v, low), fail)
+                if lower_expr(l, upper) is Some(high) then continue_if(l, compare(l, compare_op(if inclusive then LessEqual else Less, p.ty), v, high), fail)
+        PAlternatives(options) ->
+            val matched = new_block(l)
+            for i in 0..<options.len()
+                val last = i + 1 == options.len()
+                val next = if last then fail else new_block(l)
+                test_pattern(l, options.at(i), value, next)
+                finish(l, Jump(matched))
+                l.current = next
+            l.current = matched

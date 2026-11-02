@@ -1,0 +1,98 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+
+// Exhaustiveness. The patterns of a match form a matrix: one row per unguarded arm, one column per
+// value being matched. The matrix covers its columns when every combination of values matches some
+// row. A column is decided by splitting it on the cases its type enumerates (`true` and `false` for
+// `bool`); a type with too many values to enumerate (integers, chars) is covered only by rows that
+// match anything there. Rows with a guard are left out, since a guard may always fail.
+
+private struct Row
+    items: Buf[&TPattern]
+
+/** Whether the unguarded arms of a match on a value of type `ty` cover every value. */
+match_covers(arms: Buf[TArm], ty: &Type) -> bool
+    var rows: Buf[Row] = buf()
+    for arm in arms
+        if arm.guard is Some(_) then continue
+        var items: Buf[&TPattern] = buf()
+        items.push(arm.pattern)
+        rows.push(Row(items))
+    var types: Buf[&Type] = buf()
+    types.push(ty)
+    covers(rows, types)
+
+/** The cases a type enumerates for coverage, or none for a type with too many values. */
+private enum Case
+    BoolCase(value: bool)
+
+private cases_of(t: &Type) -> Buf[Case]
+    var out: Buf[Case] = buf()
+    if *t is Bool
+        out.push(BoolCase(true))
+        out.push(BoolCase(false))
+    out
+
+// A pattern that matches every value of its type: a wildcard, a binding, `()` for unit, and any
+// pattern that already failed to check, so that one error is not reported again as a gap.
+private unconstrained(p: &TPattern) -> bool = p.kind match
+    PWildcard -> true
+    PBind(_) -> true
+    PLiteral(_) -> *p.ty is Unit || *p.ty is ErrorType
+    _ -> *p.ty is ErrorType
+
+private matches_case(p: &TPattern, case: Case) -> bool = case match
+    BoolCase(value) -> p.kind match
+        PLiteral(constant) -> constant.kind match
+            BoolConst(b) -> b == value
+            _ -> false
+        _ -> false
+
+private with_head(row: Row, head: &TPattern) -> Row
+    var items: Buf[&TPattern] = buf()
+    items.push(head)
+    for i in 1..<row.items.len()
+        items.push(row.items.at(i))
+    Row(items)
+
+private tail_of(row: Row) -> Row
+    var items: Buf[&TPattern] = buf()
+    for i in 1..<row.items.len()
+        items.push(row.items.at(i))
+    Row(items)
+
+private covers(rows: Buf[Row], types: Buf[&Type]) -> bool
+    if rows.len() == 0 then return false
+    if types.len() == 0 then return true
+    // Alternatives become one row per option, and a named pattern is its inner pattern; both only in
+    // the first column, so a row keeps its other columns' patterns together.
+    var expanded: Buf[Row] = buf()
+    var changed = false
+    for row in rows
+        val head = row.items.at(0)
+        head.kind match
+            PNamed(_, inner) ->
+                changed = true
+                expanded.push(with_head(row, inner))
+            PAlternatives(options) ->
+                changed = true
+                for o in options
+                    expanded.push(with_head(row, o))
+            _ -> expanded.push(row)
+    if changed then return covers(expanded, types)
+    var rest: Buf[&Type] = buf()
+    for i in 1..<types.len()
+        rest.push(types.at(i))
+    var defaults: Buf[Row] = buf()
+    for row in rows
+        if unconstrained(row.items.at(0)) then defaults.push(tail_of(row))
+    val cases = cases_of(types.at(0))
+    if defaults.len() == rows.len() || cases.len() == 0 then return covers(defaults, rest)
+    for case in cases
+        var specialized: Buf[Row] = buf()
+        for row in rows
+            val head = row.items.at(0)
+            if unconstrained(head) || matches_case(head, case) then specialized.push(tail_of(row))
+        if !covers(specialized, rest) then return false
+    true
