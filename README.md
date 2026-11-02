@@ -20,5 +20,6 @@ inference, with reified, unboxed generics, typed equality, explicit `Option`s, a
 values. The compiler is written in Sysl; the standard library is written in Avin.
 
 Avin is early. The [specification](docs/content/spec/) is the design, and the
-[roadmap](docs/content/compiler/roadmap.md) tracks the compiler being built to it.
+[roadmap](docs/content/compiler/roadmap.md) tracks the compiler being built to it. The
+[examples](examples/) are programs the compiler builds today, and the test suite runs each one.
 [Getting started](docs/content/getting-started/_index.md) shows how to build and test it.
