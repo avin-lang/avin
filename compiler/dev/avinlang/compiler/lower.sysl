@@ -9,6 +9,9 @@ mir_type(t: &Type) -> Option[MirType] = *t match
     Bool -> Some(MBool)
     Str -> Some(MStr)
     Int(bits) -> Some(MInt(bits))
+    Byte -> Some(MInt(8))
+    Char -> Some(MInt(32))
+    Real -> Some(MReal)
     _ -> None
 
 /** Where `break` and `continue` go for one loop, and the slot its value is stored in. */
@@ -190,10 +193,10 @@ private checked(l: *Lowering, bits: u32, op: MirChecked, a: Operand, b: Operand)
 /** Lowers an expression for its value; `None` for an expression with no runtime value, or one in
  * code no path reaches. */
 private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
-    IntConst(digits) -> *e.ty match
-        Int(bits) -> Some(ConstInt(bits, digits))
-        _ -> None
+    IntConst(digits) -> Some(ConstInt(int_bits(e.ty), digits))
     BoolConst(value) -> Some(ConstBool(value))
+    CharConst(code) -> Some(ConstInt(32, code.to_string()))
+    RealConst(value) -> Some(ConstReal(value))
     StrConst(value) ->
         val index = l.strings.len()
         l.strings.push(value)
@@ -233,6 +236,7 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
     Step(local, increment, postfix) -> step(l, e, local, increment, postfix)
     Negate(operand) ->
         val x = lower_expr(l, operand)?
+        if *e.ty is Real then return Some(binary(l, MReal, OpFSub, ConstReal(-0.0), x))
         val bits = int_bits(e.ty)
         Some(checked(l, bits, CheckedSub, ConstInt(bits, "0"), x))
     Not(operand) ->
@@ -245,7 +249,13 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
     Arith(op, left, right) ->
         val a = lower_expr(l, left)?
         val b = lower_expr(l, right)?
-        Some(arith(l, int_bits(e.ty), op, a, b))
+        Some(*e.ty match
+            Real -> real_arith(l, op, a, b)
+            Byte -> byte_arith(l, op, a, b)
+            _ -> arith(l, int_bits(e.ty), op, a, b))
+    Convert(operand) ->
+        val x = lower_expr(l, operand)?
+        Some(convert(l, operand.ty, e.ty, x))
     Logic(and, left, right) -> logic(l, and, left, right)
     Compare(operands, ops) -> compare_chain(l, operands, ops)
     If(condition, yes, no) -> lower_if(l, e, condition, yes, no)
@@ -271,6 +281,8 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
 
 private int_bits(t: &Type) -> u32 = *t match
     Int(bits) -> bits
+    Byte -> 8
+    Char -> 32
     _ -> IntBits
 
 private loop_target(l: *Lowering, label: usize) -> LoopTarget
@@ -322,6 +334,78 @@ private arith(l: *Lowering, bits: u32, op: BinaryOp, a: Operand, b: Operand) -> 
             binary(l, t, OpAShr, a, select(l, t, out, ConstInt(bits, (bits - 1).to_string()), b))
         _ -> a
 
+private real_arith(l: *Lowering, op: BinaryOp, a: Operand, b: Operand) -> Operand
+    val machine = op match
+        Add -> OpFAdd
+        Subtract -> OpFSub
+        Multiply -> OpFMul
+        Divide -> OpFDiv
+        _ -> OpFRem
+    binary(l, MReal, machine, a, b)
+
+// A byte's bits are unsigned, so `>>` shifts zeros in.
+private byte_arith(l: *Lowering, op: BinaryOp, a: Operand, b: Operand) -> Operand
+    val t = MInt(8)
+    op match
+        BitAnd -> binary(l, t, OpAnd, a, b)
+        BitOr -> binary(l, t, OpOr, a, b)
+        BitXor -> binary(l, t, OpXor, a, b)
+        ShiftLeft ->
+            val out = compare(l, CmpUge, b, ConstInt(8, "8"))
+            select(l, t, out, ConstInt(8, "0"), binary(l, t, OpShl, a, b))
+        _ ->
+            val out = compare(l, CmpUge, b, ConstInt(8, "8"))
+            select(l, t, out, ConstInt(8, "0"), binary(l, t, OpLShr, a, b))
+
+private convert_op(l: *Lowering, conv: MirConv, t: MirType, x: Operand) -> Operand
+    val dest = fresh(l, t)
+    l.insts.push(Convert(dest, conv, x))
+    Value(dest)
+
+// Changes an integer's width: `signed` says whether its bits are signed, as an `iN`'s are and a
+// byte's and a char's are not.
+private resize(l: *Lowering, x: Operand, from: u32, to: u32, signed: bool) -> Operand
+    if from == to then return x
+    if from > to then return convert_op(l, Truncate, MInt(to), x)
+    convert_op(l, if signed then SignExtend else ZeroExtend, MInt(to), x)
+
+private convert(l: *Lowering, from: &Type, to: &Type, x: Operand) -> Operand = *to match
+    Real -> *from match
+        Real -> x
+        Byte -> convert_op(l, UnsignedToReal, MReal, x)
+        _ -> convert_op(l, SignedToReal, MReal, x)
+    Int(bits) -> *from match
+        Real -> convert_op(l, RealToInt, MInt(bits), x)
+        Int(width) -> resize(l, x, width, bits, true)
+        _ -> resize(l, x, int_bits(from), bits, false)
+    Byte -> *from match
+        Int(width) -> to_byte(l, x, width)
+        _ -> x
+    Char -> *from match
+        Int(width) -> to_char(l, x, width)
+        Byte -> resize(l, x, 8, 32, false)
+        _ -> x
+    _ -> x
+
+// An integer becomes a byte only when it is 0 to 255; anything else traps.
+private to_byte(l: *Lowering, x: Operand, width: u32) -> Operand
+    if width <= 8
+        trap_if(l, compare(l, CmpLt, x, ConstInt(width, "0")))
+        return resize(l, x, width, 8, false)
+    trap_if(l, compare(l, CmpUgt, x, ConstInt(width, "255")))
+    resize(l, x, width, 8, false)
+
+// An integer becomes a char only when it is a Unicode scalar value: 0 to 0x10FFFF, outside the
+// surrogates 0xD800 to 0xDFFF. A negative value compares as huge, so one unsigned test covers both
+// ends.
+private to_char(l: *Lowering, x: Operand, width: u32) -> Operand
+    val w = if width < 32 then 32u32 else width
+    val wide = resize(l, x, width, w, true)
+    trap_if(l, compare(l, CmpUgt, wide, ConstInt(w, "1114111")))
+    val offset = binary(l, MInt(w), OpSub, wide, ConstInt(w, "55296"))
+    trap_if(l, compare(l, CmpUlt, offset, ConstInt(w, "2048")))
+    resize(l, wide, w, 32, false)
+
 /** The most negative value of a width, in decimal. */
 min_digits(bits: u32) -> string
     // Doubles a little-endian list of decimal digits, from 1, `bits - 1` times.
@@ -352,26 +436,43 @@ private logic(l: *Lowering, and: bool, left: &TExpr, right: &TExpr) -> Option[Op
     finish_into(l, Jump(done), done)
     load(l, slot)
 
-private compare_op(op: CompareOp) -> MirCmp = op match
-    Equal -> CmpEq
-    NotEqual -> CmpNe
-    Less -> CmpLt
-    LessEqual -> CmpLe
-    Greater -> CmpGt
-    GreaterEqual -> CmpGe
-    _ -> CmpEq
+// Reals compare as IEEE 754 says, bytes as unsigned, and every other scalar as signed.
+private compare_op(op: CompareOp, t: &Type) -> MirCmp
+    if *t is Real
+        return op match
+            Equal -> FEq
+            NotEqual -> FNe
+            Less -> FLt
+            LessEqual -> FLe
+            Greater -> FGt
+            _ -> FGe
+    if *t is Byte
+        return op match
+            Equal -> CmpEq
+            NotEqual -> CmpNe
+            Less -> CmpUlt
+            LessEqual -> CmpUle
+            Greater -> CmpUgt
+            _ -> CmpUge
+    op match
+        Equal -> CmpEq
+        NotEqual -> CmpNe
+        Less -> CmpLt
+        LessEqual -> CmpLe
+        Greater -> CmpGt
+        _ -> CmpGe
 
 // A chain evaluates each operand when its link is reached, and the first false link decides.
 private compare_chain(l: *Lowering, operands: Buf[&TExpr], ops: Buf[CompareOp]) -> Option[Operand]
     var previous = lower_expr(l, operands.at(0))?
     if ops.len() == 1
         val next = lower_expr(l, operands.at(1))?
-        return Some(compare(l, compare_op(ops.at(0)), previous, next))
+        return Some(compare(l, compare_op(ops.at(0), operands.at(0).ty), previous, next))
     val slot = new_slot(l, Bool)
     val done = new_block(l)
     for i in 0..<ops.len()
         val next = lower_expr(l, operands.at(i + 1))?
-        val result = compare(l, compare_op(ops.at(i)), previous, next)
+        val result = compare(l, compare_op(ops.at(i), operands.at(i).ty), previous, next)
         store(l, slot, Some(result))
         if i + 1 < ops.len()
             val more = new_block(l)

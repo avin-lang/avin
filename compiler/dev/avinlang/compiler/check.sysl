@@ -236,6 +236,8 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
     IntLit(spelling) -> integer_literal(c, e.span, spelling, false, expected)
     Unary(op, operand) -> unary_expr(c, e, op, operand, expected)
     BoolLit(value) -> TExpr(e.span, Bool, BoolConst(value))
+    CharLit(value) -> TExpr(e.span, Char, CharConst(u32(value)))
+    RealLit(value) -> TExpr(e.span, Real, RealConst(value))
     StringLit(value) -> TExpr(e.span, Str, StrConst(value))
     UnitLit -> TExpr(e.span, Unit, UnitConst)
     Name(name) -> name_expr(c, e.span, name)
@@ -394,8 +396,15 @@ private unary_expr(c: *Checker, e: &Expr, op: UnaryOp, operand: &Expr, expected:
     if op is Negate && operand.kind is IntLit(spelling)
         return integer_literal(c, e.span, spelling, true, expected)
     val x = check_expr(c, operand, expected)
-    if settled(x.ty) && !(*x.ty is Int(_))
-        c.note(unit_of(c), e.span, s"`${unary_spelling(op)}` needs an integer, not ${type_name(x.ty)}")
+    // `-` and `+` apply to integers and reals, `~` to integers and bytes.
+    val fits_op = *x.ty match
+        Int(_) -> true
+        Real -> !(op is Complement)
+        Byte -> op is Complement
+        _ -> !settled(x.ty)
+    if !fits_op
+        val wanted = if op is Complement then "an integer or a byte" else "a number"
+        c.note(unit_of(c), e.span, s"`${unary_spelling(op)}` needs $wanted, not ${type_name(x.ty)}")
         return TExpr(e.span, ErrorType, UnitConst)
     op match
         Negate -> TExpr(e.span, x.ty, Negate(x))
@@ -418,14 +427,24 @@ private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Ex
     val l = check_expr(c, left, expected)
     operate(c, e.span, op, binary_spelling(op), l, check_expr(c, right, Some(l.ty)))
 
-// Arithmetic, bitwise and shift operators take two integers of one type and yield that type.
+// Arithmetic, bitwise and shift operators take two operands of one type and yield that type.
+// Integers have them all; reals have arithmetic; bytes have bitwise operators and shifts.
 private operate(c: *Checker, at: Span, op: BinaryOp, spelling: string, l: &TExpr, r: &TExpr) -> &TExpr
     if !settled(l.ty) || !settled(r.ty)
         // An operand that never finishes means the operation never finishes.
         val ty: &Type = if *l.ty is ErrorType || *r.ty is ErrorType then ErrorType else Nothing
         return TExpr(at, ty, Arith(op, l, r))
-    if !(*l.ty is Int(_)) || !same_type(l.ty, r.ty)
-        c.note(unit_of(c), at, s"`$spelling` needs two integers of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}")
+    val numeric = *l.ty is Int(_) || *l.ty is Real || *l.ty is Byte
+    if !numeric || !same_type(l.ty, r.ty)
+        c.note(unit_of(c), at, s"`$spelling` needs two numbers of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}")
+        return TExpr(at, ErrorType, UnitConst)
+    val bitwise = op is BitAnd || op is BitOr || op is BitXor || op is ShiftLeft || op is ShiftRight
+    val arithmetic = op is Add || op is Subtract || op is Multiply || op is Divide || op is Remainder
+    if *l.ty is Byte && !bitwise
+        c.note(unit_of(c), at, s"`$spelling` is not defined on byte, which has bitwise operators and no arithmetic")
+        return TExpr(at, ErrorType, UnitConst)
+    if *l.ty is Real && !arithmetic
+        c.note(unit_of(c), at, s"`$spelling` is not defined on real")
         return TExpr(at, ErrorType, UnitConst)
     TExpr(at, l.ty, Arith(op, l, r))
 
@@ -461,7 +480,7 @@ private compare_link(c: *Checker, op: CompareOp, a: &TExpr, b: &TExpr)
         c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} with ${type_name(b.ty)}")
         return
     val equality = op is Equal || op is NotEqual
-    if *a.ty is Int(_) then return
+    if *a.ty is Int(_) || *a.ty is Byte || *a.ty is Char || *a.ty is Real then return
     if equality && *a.ty is Bool then return
     if *a.ty is Str
         c.note(unit_of(c), at, "comparing strings is not implemented")
@@ -577,6 +596,8 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument]) -> 
         _ ->
             c.note(unit, callee.span, "only a named function can be called")
             return TExpr(at, ErrorType, UnitConst)
+    if c.scope.get(name) is None
+        if builtin_type(name) is Some(target) then return conversion(c, at, target, args)
     val id = c.scope.get(name) match
         Some(i) -> i
         None ->
@@ -600,6 +621,39 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument]) -> 
         if *t.ty is Nothing then result = Nothing
     TExpr(at, result, Call(id, typed))
 
+// A built-in type called with one value converts it. Integers convert among themselves (widening
+// sign-extends, narrowing keeps the low bits), to and from `real`, and to `byte` and `char`, which
+// trap on a value they cannot hold; `byte` and `char` convert to integers.
+private conversion(c: *Checker, at: Span, target: &Type, args: Buf[Argument]) -> &TExpr
+    val unit = unit_of(c)
+    if args.len() != 1 || args.at(0).name is Some(_)
+        c.note(unit, at, s"`${type_name(target)}(…)` converts exactly one value")
+        for a in args
+            check_statement(c, a.value)
+        return TExpr(at, ErrorType, UnitConst)
+    val arg = args.at(0).value
+    // A literal is read at its own width, which is at least `int`'s, so that `i8(300)` narrows 300.
+    var want: Option[&Type] = None
+    if is_literal(arg)
+        want = *target match
+            Int(bits) -> Some(if bits > IntBits then target else int_type())
+            Real -> Some(Real)
+            _ -> Some(int_type())
+    val x = check_expr(c, arg, want)
+    if !settled(x.ty)
+        return TExpr(at, if *x.ty is Nothing then Nothing else ErrorType, Convert(x))
+    if !convertible(x.ty, target)
+        c.note(unit, at, s"cannot convert ${type_name(x.ty)} to ${type_name(target)}")
+        return TExpr(at, ErrorType, UnitConst)
+    TExpr(at, target, Convert(x))
+
+convertible(from: &Type, to: &Type) -> bool = *from match
+    Int(_) -> *to is Int(_) || *to is Real || *to is Byte || *to is Char
+    Byte -> *to is Int(_) || *to is Byte || *to is Char || *to is Real
+    Char -> *to is Int(_) || *to is Char
+    Real -> *to is Int(_) || *to is Real
+    _ -> false
+
 // A function without a declared result type has the type of its body, so its body is checked
 // first; a cycle of such functions is reported rather than guessed at.
 private result_of(c: *Checker, id: usize, at: Span) -> &Type
@@ -614,14 +668,34 @@ private result_of(c: *Checker, id: usize, at: Span) -> &Type
 // to a literal is part of it, so the most negative value of each width can be written.
 private integer_literal(c: *Checker, at: Span, spelling: string, negative: bool, expected: Option[&Type]) -> &TExpr
     var bits = IntBits
+    var as_byte = false
+    var as_real = false
     if expected is Some(t)
-        if *t is Int(b) then bits = b
-    val ty: &Type = Int(bits)
+        *t match
+            Int(b) -> bits = b
+            Byte -> as_byte = true
+            Real -> as_real = true
+            _ -> ()
     val digits = literal_magnitude(spelling) match
         Some(d) -> d
         None ->
             c.note(unit_of(c), at, "malformed integer literal")
             return TExpr(at, ErrorType, UnitConst)
+    if as_byte
+        if negative && digits != "0" || compare_decimal(digits, "255") > 0
+            c.note(unit_of(c), at, "integer literal does not fit in byte, which holds 0 to 255")
+            return TExpr(at, ErrorType, UnitConst)
+        return TExpr(at, Byte, IntConst(digits))
+    if as_real
+        // Where a real is expected, an integer literal is that real, provided it is exact.
+        if compare_decimal(digits, "9007199254740992") > 0
+            c.note(unit_of(c), at, "integer literal is not exact as a real; write it with a fraction or exponent")
+            return TExpr(at, ErrorType, UnitConst)
+        var value = 0.0
+        for b in digits.bytes
+            value = value * 10.0 + real(b - u8('0'))
+        return TExpr(at, Real, RealConst(if negative then -value else value))
+    val ty: &Type = Int(bits)
     if !fits(digits, bits, negative)
         c.note(unit_of(c), at, s"integer literal does not fit in ${type_name(ty)}")
         return TExpr(at, ErrorType, UnitConst)
