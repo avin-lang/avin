@@ -56,6 +56,10 @@ added in an `impl` block.
 
 ```text
 open class Account(owner: string, var balance: int)
+    if balance < 0 then panic("an account cannot open overdrawn")
+    val opened = clock.now()
+    print(s"opened an account for $owner")
+
     deposit(amount: int)
         balance += amount
 
@@ -66,9 +70,15 @@ class Savings(owner: string, balance: int, rate: real): Account(owner, balance),
     display(out: Writer, spec: FormatSpec) = out.write(describe())
 ```
 
-- The parameter list after the name is the **primary constructor**, and its parameters are fields
-  (`var` makes one mutable; `private` hides one). There are no secondary constructors; a factory
-  belongs in the companion `object`.
+- **The class is its constructor.** The parameter list after the name is the constructor's
+  parameter list, and there is no other constructor; a factory belongs in the companion `object`.
+- **Class parameters are fields.** A plain parameter (`owner`) is a private, immutable field: every
+  method of the class can read it, and nothing outside can. `val` makes it a public read-only field
+  and `var` a public mutable one (`balance` above); `private var` keeps a mutable one private.
+- **The class body is the constructor's body.** Everything in it that is not a member declaration —
+  expressions, `if`, loops, calls — runs when an instance is created, top to bottom, together with
+  the initializers of the `val` and `var` fields declared in the body (`opened`). Methods are
+  declarations and do not run.
 - The receiver is implicit. Members are in scope by their bare names, and `self` names the instance.
 - After `:` comes at most one superclass, with its constructor arguments, followed by any number of
   traits.
@@ -137,9 +147,10 @@ is reserved for the standard library.
 
 ## Initialization
 
-- A constructor runs the superclass constructor first, then assigns its own fields. Until every field
-  is assigned, `self` may not be passed, stored, captured, or used to call a method. This is checked
-  at compile time, so no field is ever observed uninitialized.
+- Creating an instance runs the superclass's constructor first, then stores the class parameters,
+  then runs the class body top to bottom. Until every field is assigned, `self` may not be passed,
+  stored, captured, or used to call a method, and a body statement may not read a field declared
+  below it. This is checked at compile time, so no field is ever observed uninitialized.
 - Module-level `val`s and `object`s initialize before `main`, in the order their initializers depend
   on one another. A dependency cycle is a compile error, not a runtime surprise.
 - Local helper functions may call one another in any order, but a call that would read a captured

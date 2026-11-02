@@ -34,6 +34,9 @@ a decision changes, this page and the chapter change together.
 - Functions and function types use `->`, never `=>`.
 - `match` is postfix, with indented `pattern -> body` arms.
 - `data` declares algebraic data types.
+- A class's parameter list is its one constructor. Class parameters are private immutable fields
+  (`val` makes one public and read-only, `var` public and mutable), and the statements in the class
+  body are the constructor's code, run top to bottom when an instance is created.
 - Every function declaration parameter has an explicit type.
 - Parameter patterns, multiple clauses selected by pattern, and clause guards are supported.
   Their exact spelling is provisional.
