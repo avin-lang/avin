@@ -43,13 +43,21 @@ Its ABI is private between the compiler and the runtime, and not visible to Avin
 The heap is one block reserved when the program starts: 8 GiB, or `AVIN_HEAP_LIMIT` bytes. The
 operating system commits its pages as they are first used, so the heap grows within the reservation
 and costs nothing until then. A program whose live data outgrows the limit stops with a message
-naming it. Every object's first word is its descriptor; constant objects (a variant with no fields)
-live outside the heap, and the collector leaves them alone. `AVIN_GC_STRESS=1` makes every
+naming it.
+
+The collector owns each object's header, which sits just before the object: the word 16 bytes
+before an object's address holds its **kind**, the collector's record of how to trace it, and the
+word after that is the collector's own. An object's address is its first field. Every descriptor
+begins with that kind — the runtime's tracer, and no finalizer or weak hooks — followed by the
+variant's tag, its size, and the offsets of its fields that hold references, so the kind an object
+was allocated with is its descriptor, one load away. Constant objects (string literals, variants
+with no fields, closures that capture nothing) live outside the heap as constant data with the same
+16 bytes ahead of them, their descriptor and a word left zero; the collector ignores any reference
+outside its heap, so it leaves them alone. `AVIN_GC_STRESS=1` makes every
 allocation collect first, and the execution tests run that way, so a reference the compiler failed
 to root is found at the first allocation that could lose it.
 
-An object of a class is laid out as a one-variant `data` value is: the descriptor word, then one
-8-byte slot per field (wider integers take more), the class parameters first and then the fields
+An object of a class is laid out as a one-variant `data` value is: one 8-byte slot per field (wider integers take more), the class parameters first and then the fields
 the body declares, in order. A class with no fields still allocates, since every object has its own
 identity. The constructor is an ordinary function named after the class: it allocates the object,
 stores its parameters into their fields, runs the body, initializing each body field where it is
@@ -71,11 +79,10 @@ abstract methods are never compiled.
 Each class has a method table with one slot per method a subclass may override: its superclass's
 slots in the same positions, each holding the class's override where it has one, then one for each
 overridable method the class adds. The table is constant data placed directly before the class's
-descriptor, in one global, so slot `s` is the word `8(s + 1)` bytes before the address an object's
-descriptor word holds; the descriptor itself keeps its layout and the runtime never reads the
-table. Each instance of a generic class has its own descriptor and table, filled with the method
+descriptor, in one global, so slot `s` is the word `8(s + 1)` bytes before the object's
+descriptor; the descriptor itself keeps its layout and the runtime never reads the table. Each instance of a generic class has its own descriptor and table, filled with the method
 instances for its type arguments. A call through a receiver whose static type is an `open` or
-`abstract` class loads the descriptor word, loads the slot, and calls it indirectly with the
+`abstract` class loads the descriptor from the object's header, loads the slot, and calls it indirectly with the
 overridden method's machine signature, which every override shares; `super.m()` is a direct call.
 
 An `object` is an instance of a class of its own, kept apart from its companion class's: its

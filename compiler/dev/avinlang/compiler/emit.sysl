@@ -16,23 +16,28 @@ import sysl.text.{StrBuilder, str_builder}
 emit_llvm(program: MirProgram) -> string
     var out = str_builder()
     out.push("; Avin program\n\n")
-    // A string literal is a constant object laid out as the runtime lays out a string: a descriptor
-    // holding no references, the length in bytes, then the bytes.
+    // Every descriptor begins with the collector's kind, whose tracer is the runtime's.
+    out.push("declare void @avin_rt_trace(ptr, ptr)\n\n")
+    // A string literal is a constant object laid out as the runtime lays out a string: a header
+    // naming a descriptor that holds no references, the length in bytes, then the bytes.
     if program.strings.len() > 0
-        out.push("@avin.desc.string = private constant { i64, i64, i64 } { i64 0, i64 16, i64 0 }\n")
+        out.push(s"@avin.desc.string = private constant { $KindType, i64, i64, i64 } { $KindValue, i64 0, i64 8, i64 0 }\n")
     for i in 0..<program.strings.len()
         val text = program.strings[i]
         val n = text.bytes.len
-        out.push(s"@avin.str.$i = private constant { ptr, i64, [$n x i8] } { ptr @avin.desc.string, i64 $n, [$n x i8] c\"")
+        out.push(s"@avin.str.$i.const = private constant { ptr, i64, i64, [$n x i8] } { ptr @avin.desc.string, i64 0, i64 $n, [$n x i8] c\"")
         push_bytes(&out, text)
-        out.push("\" }, align 8\n")
+        out.push("\" }, align 16\n")
+        constant_payload(&out, s"@avin.str.$i")
     out.push("\n")
     for i in 0..<program.descriptors.len()
         emit_descriptor(&out, program, i)
-    // A closure that captures nothing is constant: its descriptor, then its entry's address.
+    // A closure that captures nothing is constant: a header naming its descriptor, then its entry's
+    // address.
     for i in 0..<program.closures.len()
         val k = program.closures[i]
-        out.push(s"@avin.fn.$i = private constant { ptr, ptr } { ptr @avin.desc.${k.descriptor}, ptr @\"${program.functions[k.function].symbol}\" }, align 16\n")
+        out.push(s"@avin.fn.$i.const = private constant { ptr, i64, ptr } { ptr @avin.desc.${k.descriptor}, i64 0, ptr @\"${program.functions[k.function].symbol}\" }, align 16\n")
+        constant_payload(&out, s"@avin.fn.$i")
     // A trap site is what the runtime reports when the program stops there: the reason and the file
     // as constant strings, then the line and column.
     for i in 0..<program.traps.len()
@@ -196,17 +201,18 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
             Unreachable -> out.push("  unreachable\n")
     out.push("}\n\n")
 
-// A descriptor is the header the runtime reads (tag, size, reference count) followed by the
-// reference offsets; a constant object is one word, its descriptor. A class's method table sits
-// directly before its descriptor, in the same constant, so slot `s` is the word 8(s + 1) bytes
-// before the address an object's descriptor word holds; `@avin.desc.N` names that address. An
-// abstract method's slot is null: no object of its class exists.
+// A descriptor is the collector's kind, then the header the runtime reads (tag, size, reference
+// count), then the reference offsets. An object's descriptor is the kind the collector keeps in its
+// header, `KindBack` bytes before the object. A class's method table sits directly before its
+// descriptor, in the same constant, so slot `s` is the word 8(s + 1) bytes before the descriptor;
+// `@avin.desc.N` names the descriptor's address. An abstract method's slot is null: no object of its
+// class exists. A variant with no field data is one constant object, which is only its header.
 private emit_descriptor(out: *StrBuilder, program: MirProgram, i: usize)
     val d = program.descriptors[i]
     val n = d.refs.len()
-    val header = s"{ i64, i64, i64, [$n x i64] }"
+    val header = s"{ $KindType, i64, i64, i64, [$n x i64] }"
     var body = str_builder()
-    body.push(s"{ i64 ${d.tag}, i64 ${d.size}, i64 $n, [$n x i64] ")
+    body.push(s"{ $KindValue, i64 ${d.tag}, i64 ${d.size}, i64 $n, [$n x i64] ")
     if n == 0 then body.push("zeroinitializer")
     else
         body.push("[")
@@ -228,7 +234,24 @@ private emit_descriptor(out: *StrBuilder, program: MirProgram, i: usize)
                 None -> out.push("ptr null")
         out.push(s"], $header $value }, align 8\n")
         out.push(s"@avin.desc.$i = private alias $header, ptr getelementptr inbounds ($whole, ptr @avin.methods.$i, i32 0, i32 1)\n")
-    if d.constant then out.push(s"@avin.obj.$i = private constant ptr @avin.desc.$i, align 16\n")
+    if d.constant
+        out.push(s"@avin.obj.$i.const = private constant { ptr, i64 } { ptr @avin.desc.$i, i64 0 }, align 16\n")
+        constant_payload(out, s"@avin.obj.$i")
+
+/** The collector's `Kind` as a descriptor begins with it: the runtime's tracer, and no finalizer,
+ * weak hook or ephemeron hook. */
+private const KindType: string = "{ ptr, ptr, ptr, ptr }"
+private const KindValue: string = "{ ptr, ptr, ptr, ptr } { ptr @avin_rt_trace, ptr null, ptr null, ptr null }"
+
+/** How far before an object its descriptor is: the collector's `KIND_BACK`, two words. A constant
+ * object outside the heap is laid out with those two words ahead of it, its descriptor and a word
+ * left zero, which the collector never reads for an object it does not own. */
+private const KindBack: usize = 16
+
+// Names the payload of the constant object `name.const`, which follows its two header words, as
+// `name`: every reference to the object is to its payload.
+private constant_payload(out: *StrBuilder, name: string)
+    out.push(s"$name = private alias i8, ptr getelementptr inbounds (i8, ptr $name.const, i64 $KindBack)\n")
 
 /** The byte offset from a descriptor to the method in slot `slot` of the table before it. */
 private method_slot_offset(slot: usize) -> string = "-" + ((slot + 1) * 8).to_string()
@@ -245,6 +268,7 @@ private inst_dest(inst: Inst) -> Option[usize] = inst match
     Store(_, _) -> None
     Alloc(dest, _) -> Some(dest)
     Offset(dest, _, _) -> Some(dest)
+    DescriptorOf(dest, _) -> Some(dest)
     MethodSlot(dest, _, _) -> Some(dest)
 
 private need(intrinsics: *Buf[string], declaration: string)
@@ -360,11 +384,16 @@ private emit_inst(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgra
             out.push(s"  %v$dest = call ptr @avin_rt_alloc(ptr %ctx, ptr @avin.desc.$descriptor)\n")
         Offset(dest, base, bytes) ->
             out.push(s"  %v$dest = getelementptr inbounds i8, ptr " + operand(program, f, base) + s", i64 $bytes\n")
+        DescriptorOf(dest, object) ->
+            out.push(s"  %t$next = getelementptr i8, ptr " + operand(program, f, object) + s", i64 -$KindBack\n")
+            out.push(s"  %v$dest = load ptr, ptr %t$next, align 8\n")
+            next += 1
         MethodSlot(dest, object, slot) ->
-            out.push(s"  %t$next = load ptr, ptr " + operand(program, f, object) + ", align 8\n")
-            out.push(s"  %t${next + 1} = getelementptr inbounds i8, ptr %t$next, i64 ${method_slot_offset(slot)}\n")
-            out.push(s"  %v$dest = load ptr, ptr %t${next + 1}, align 8\n")
-            next += 2
+            out.push(s"  %t$next = getelementptr i8, ptr " + operand(program, f, object) + s", i64 -$KindBack\n")
+            out.push(s"  %t${next + 1} = load ptr, ptr %t$next, align 8\n")
+            out.push(s"  %t${next + 2} = getelementptr inbounds i8, ptr %t${next + 1}, i64 ${method_slot_offset(slot)}\n")
+            out.push(s"  %v$dest = load ptr, ptr %t${next + 2}, align 8\n")
+            next += 3
         Call(dest, Direct(index), args) ->
             val callee = program.functions[index]
             out.push("  ")

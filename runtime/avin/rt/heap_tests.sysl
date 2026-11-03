@@ -2,6 +2,7 @@ module avin.rt
 @tests
 
 import sh.sysl.gc
+import sysl.raw.ptr_cast
 
 // A frame holding one reference, laid out as compiled code lays out its frames: the header, then the
 // slots. The contexts and frames are module-level, as a thread's are for as long as it is attached.
@@ -9,7 +10,7 @@ private struct OneRoot
     frame: Frame
     slot: *u8
 
-private var small: Descriptor = Descriptor(1, 16, 0)
+private var small: Descriptor = descriptor(1, 16, 0)
 private var first: Context = Context(null, null)
 private var second: Context = Context(null, null)
 private var third: Context = Context(null, null)
@@ -102,4 +103,63 @@ every_frame_of_a_context_is_walked()
     assert_eq(live_objects(), 1)
     detach(&first)
     assert_eq(live_objects(), 0)
+    reset()
+
+@test("an object's descriptor is the kind in its header, and its payload starts at the reference")
+descriptor_is_the_header_kind()
+    attach(&first)
+    hold(&first, &a)
+    assert(descriptor_of(a.slot) == &small)
+    assert(gc.kind_of(a.slot) == &small.kind)
+    val words: *usize = ptr_cast(a.slot)
+    assert_eq(words[0], 0usize)
+    assert_eq(words[1], 0usize)
+    reset()
+
+// A descriptor whose one reference is the first word of the payload, laid out as the compiler emits
+// one: the header, then the offsets.
+private struct OneRef
+    header: Descriptor
+    offset: usize
+
+private var pair: OneRef = OneRef(descriptor(0, 16, 1), 0)
+
+@test("a reference held in a field keeps its object alive")
+fields_are_traced()
+    attach(&first)
+    hold(&first, &a)
+    val p = allocate(&first, &pair.header)
+    a.slot = p
+    val field: **u8 = ptr_cast(p)
+    field[0] = allocate(&first, &small)
+    assert_eq(live_objects(), 2)
+    field[0] = null
+    assert_eq(live_objects(), 1)
+    reset()
+
+// A constant object outside the heap, laid out as the compiler emits one: its descriptor's kind and
+// a word left zero before its payload.
+private struct Constant
+    kind: *gc.Kind
+    word: usize
+    value: usize
+
+private var constant: Constant = Constant(&small.kind, 0, 7)
+
+@test("a constant outside the heap, held by a root and by a field, is found by its kind and never collected")
+constants_outside_the_heap()
+    val k: *u8 = ptr_cast(&constant.value)
+    assert(descriptor_of(k) == &small)
+    attach(&first)
+    hold(&first, &a)
+    a.slot = k
+    assert_eq(live_objects(), 0)
+    val p = allocate(&first, &pair.header)
+    val field: **u8 = ptr_cast(p)
+    field[0] = k
+    a.slot = p
+    assert_eq(live_objects(), 1)
+    assert(gc.is_live(&space, k))
+    assert_eq(constant.word, 0usize)
+    assert_eq(constant.value, 7usize)
     reset()
