@@ -94,6 +94,9 @@ a decision changes, this page and the chapter change together.
   block's line. Bindings take tuples apart (`val q, r = divmod(n, d)`), and `a, b = b, a` is a
   multiple assignment: a statement that makes the whole right side before storing anything, with
   compound forms that read every place first.
+- Actors are built into the language: `actor` declares one.
+- State machines are built into the language: `machine` declares one, and `state` declares each of
+  its states.
 - Slate's `dal` is not part of Avin.
 
 **Project and tooling**
@@ -112,9 +115,16 @@ a decision changes, this page and the chapter change together.
 
 - Public C interoperability. Until then, C is reached through Sysl.
 - Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async, await and concurrency.
+- Async, await, and concurrency other than actors.
 - Partial-function literal syntax, which the user has explicitly left undecided.
 
 ## Open
 
 - Resource cleanup: a `defer` construct or a library `use`.
+- How actors work: how messages are declared and sent, mailboxes and replies, scheduling and
+  threads, what an actor may share with others on the heap, and failure and supervision.
+- How state machines work: events and transitions, data held by the machine and by each state,
+  entry and exit actions, checking that every event is handled, and whether an actor's behaviour
+  can be a machine.
+- Whether `actor`, `machine` and `state` are reserved everywhere or only where a declaration
+  starts; `state` is a common name for a variable or field.
