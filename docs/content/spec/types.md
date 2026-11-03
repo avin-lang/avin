@@ -93,6 +93,10 @@ most the largest `int` bytes.
 | `trim()`, `trimStart()`, `trimEnd()` | Without the Unicode `White_Space` characters at both ends, the start, the end |
 | `repeat(n)` | `n` copies joined; empty for zero; traps when `n` is negative |
 | `replace(old, new)` | Every occurrence of `old`, left to right and not overlapping, replaced by `new`; an empty `old` occurs nowhere |
+| `indexOf(p)`, `indexOf(p, from)` | `Some` of the byte offset of the first `p`, at or after `from` (default 0; below 0 counts as 0); `None` when there is none or `from` is past the end. The empty string is found at `from` |
+| `lastIndexOf(p)` | `Some` of the byte offset of the last `p`; `None` when there is none. The empty string is found at `byteLength()` |
+| `toInt()`, `toLong()` | `Some` of the number written in decimal: an optional `-` or `+`, then one or more ASCII digits and nothing else; `None` otherwise, or when it does not fit the type |
+| `toReal()` | `Some` of the number written as a decimal fraction, correctly rounded: an optional sign, digits with an optional point, an optional exponent (`3.25`, `-.5`, `1e10`); `None` for anything else, including white space, `nan`, `inf`, hexadecimal, and a number too large to be finite |
 
 ```text
 val word = "café"
