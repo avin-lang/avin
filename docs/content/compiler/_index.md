@@ -40,6 +40,14 @@ per program, and linked into every executable. It contains:
 
 Its ABI is private between the compiler and the runtime, and not visible to Avin code.
 
+The heap is one block reserved when the program starts: 8 GiB, or `AVIN_HEAP_LIMIT` bytes. The
+operating system commits its pages as they are first used, so the heap grows within the reservation
+and costs nothing until then. A program whose live data outgrows the limit stops with a message
+naming it. Every object's first word is its descriptor; constant objects (a variant with no fields)
+live outside the heap, and the collector leaves them alone. `AVIN_GC_STRESS=1` makes every
+allocation collect first, and the execution tests run that way, so a reference the compiler failed
+to root is found at the first allocation that could lose it.
+
 ## Standard library
 
 `library/` holds Avin source under the module root `avin`, starting with the prelude every program

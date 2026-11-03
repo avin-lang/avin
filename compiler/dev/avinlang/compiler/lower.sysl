@@ -13,6 +13,7 @@ mir_type(t: &Type) -> Option[MirType] = *t match
     Byte -> Some(MInt(8))
     Char -> Some(MInt(32))
     Real -> Some(MReal)
+    Data(_, _, _) -> Some(MRef)
     _ -> None
 
 /** Where a value is kept: the address of a slot, and the type stored there. */
@@ -27,6 +28,20 @@ private struct LoopTarget
     exit: usize
     slot: Option[Place]
 
+/** Where each field of one variant is kept in its object: a byte offset and machine type, or
+ * `None` for a field with no runtime value. */
+private struct VariantLayout
+    descriptor: usize
+    fields: Buf[Option[FieldSlot]]
+
+private struct FieldSlot
+    offset: usize
+    ty: MirType
+
+/** The layout of a data type at particular type arguments: one entry per variant. */
+private struct DataLayout
+    variants: Buf[VariantLayout]
+
 /** One compiled copy of a function: a generic function has one per list of type arguments it is
  * called with, and a local function of a generic function one per copy of that function. */
 private struct Instance
@@ -39,6 +54,10 @@ private struct Lowering
     instances: Buf[Instance]
     /** Each instance's index, by its function and type arguments. */
     instance_index: Map[string, usize]
+    descriptors: Buf[Descriptor]
+    layouts: Buf[DataLayout]
+    /** Each layout's index, by the data type it lays out. */
+    layout_index: Map[string, usize]
     /** The type arguments of the instance being lowered, and the function they belong to. */
     subst: Buf[&Type]
     subst_owner: usize
@@ -62,7 +81,7 @@ private struct Lowering
 // Every function that is not generic is compiled once; each generic function is compiled for each
 // list of type arguments a compiled call gives it, as those calls are found.
 lower_program(program: TProgram) -> MirProgram
-    var l = Lowering(program, buf(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), None, false)
+    var l = Lowering(program, buf(), buf(), map(), buf(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), None, false)
     for i in 0..<program.symbols.len()
         if !is_generic(program, i) then instance(&l, i, buf())
     val entry = instance(&l, program.entry, buf())
@@ -71,7 +90,69 @@ lower_program(program: TProgram) -> MirProgram
     while k < l.instances.len()
         functions.push(lower_function(&l, k))
         k += 1
-    MirProgram(functions, l.strings, entry)
+    MirProgram(functions, l.strings, l.descriptors, entry)
+
+// An object is a descriptor word followed by its fields in order, each at a multiple of 8 bytes.
+private field_size(t: MirType) -> usize = t match
+    MInt(bits) -> usize((bits + 63) / 64) * 8
+    MStr -> 16
+    _ -> 8
+
+/** The layout of a data type, which must be concrete; made when first asked for. */
+private layout(l: *Lowering, t: &Type) -> DataLayout
+    val key = type_name(t)
+    if l.layout_index.get(key) is Some(index) then return l.layouts.at(index)
+    val (id, args) = *t match
+        Data(i, _, a) -> (i, a)
+        _ -> panic("a layout of a type that is not data: " + key)
+    val d = l.program.data.at(id)
+    var variants: Buf[VariantLayout] = buf()
+    for v in 0..<d.variants.len()
+        var fields: Buf[Option[FieldSlot]] = buf()
+        var refs: Buf[usize] = buf()
+        var size = 8usize
+        for field in variant_fields(d, id, v, args)
+            mir_type(field) match
+                Some(m) ->
+                    if m is MRef then refs.push(size)
+                    fields.push(Some(FieldSlot(size, m)))
+                    size += field_size(m)
+                None -> fields.push(None)
+        variants.push(VariantLayout(l.descriptors.len(), fields))
+        l.descriptors.push(Descriptor(key + "." + d.variants.at(v).name, v, size, refs, size == 8))
+    val result = DataLayout(variants)
+    l.layout_index.put(key, l.layouts.len())
+    l.layouts.push(result)
+    result
+
+private field_address(l: *Lowering, object: Operand, field: FieldSlot) -> Operand
+    val dest = fresh(l, MPtr)
+    l.insts.push(Offset(dest, object, field.offset))
+    Value(dest)
+
+// The fields are evaluated in order before the object is allocated, so a collection while
+// allocating sees every one of them as a root.
+private construct(l: *Lowering, e: &TExpr, variant: usize, args: Buf[&TExpr]) -> Option[Operand]
+    var values: Buf[Option[Operand]] = buf()
+    for a in args
+        val v = lower_expr(l, a)
+        if v is None && machine(l, a.ty) is Some(_) then return None
+        values.push(v)
+    val shape = layout(l, concrete(l, e.ty)).variants.at(variant)
+    if l.descriptors.at(shape.descriptor).constant then return Some(ConstObject(shape.descriptor))
+    val object = fresh(l, MRef)
+    l.insts.push(Alloc(object, shape.descriptor))
+    for i in 0..<values.len()
+        if shape.fields.at(i) is Some(field)
+            if values.at(i) is Some(v) then l.insts.push(Store(field_address(l, Value(object), field), v))
+    Some(Value(object))
+
+/** Reads a field of an object. */
+private load_field(l: *Lowering, object: Operand, field: FieldSlot) -> Operand
+    val address = field_address(l, object, field)
+    val dest = fresh(l, field.ty)
+    l.insts.push(Load(dest, address))
+    Value(dest)
 
 // A generic function, or a local function of one, whose types depend on type arguments.
 private is_generic(program: TProgram, id: usize) -> bool
@@ -91,7 +172,7 @@ private instance(l: *Lowering, function: usize, type_args: Buf[&Type]) -> usize
     index
 
 /** A type of the code being lowered, with the instance's type arguments substituted. */
-private concrete(l: *Lowering, t: &Type) -> &Type = substitute(t, l.subst_owner, l.subst)
+private concrete(l: *Lowering, t: &Type) -> &Type = substitute(solve(l.program.vars, t), l.subst_owner, l.subst)
 
 private machine(l: *Lowering, t: &Type) -> Option[MirType] = mir_type(concrete(l, t))
 
@@ -315,6 +396,12 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         l.insts.push(Call(dest, Direct(index), operands))
         dest match
             Some(id) -> Some(Value(id))
+            None -> None
+    Construct(variant, args) -> construct(l, e, variant, args)
+    Field(value, index) ->
+        val object = lower_expr(l, value)?
+        layout(l, concrete(l, value.ty)).variants.at(0).fields.at(index) match
+            Some(field) -> Some(load_field(l, object, field))
             None -> None
     Block(items) ->
         var last: Option[Operand] = None
@@ -675,3 +762,19 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
                 finish(l, Jump(matched))
                 l.current = next
             l.current = matched
+        PVariant(variant, fields) ->
+            if value is Some(v)
+                val shape = layout(l, concrete(l, p.ty))
+                // A type with one variant needs no test; otherwise the tag is in the descriptor.
+                if shape.variants.len() > 1
+                    val descriptor = fresh(l, MPtr)
+                    l.insts.push(Load(descriptor, v))
+                    val tag = fresh(l, MInt(64))
+                    l.insts.push(Load(tag, Value(descriptor)))
+                    continue_if(l, compare(l, CmpEq, Value(tag), ConstInt(64, variant.to_string())), fail)
+                val places = shape.variants.at(variant).fields
+                for i in 0..<fields.len()
+                    val sub = fields.at(i)
+                    if sub.kind is PWildcard then continue
+                    val field = if places.at(i) is Some(place) then Some(load_field(l, v, place)) else None
+                    test_pattern(l, sub, field, fail)

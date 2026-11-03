@@ -4,7 +4,7 @@ module dev.avinlang.compiler
 import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
 import sysl.fs.{current_dir, entries, exists, make_temp_dir, read_text, remove_dir_all}
-import sysl.process.{Exited, Signalled, capture}
+import sysl.process.{Exited, Signalled, Var, capture}
 
 // The execution corpus: Avin programs under `tests/` with their expected behaviour.
 //
@@ -12,6 +12,10 @@ import sysl.process.{Exited, Signalled, capture}
 // program's leading comment says how it ends: `// expect: exit N`, or `// expect: trap` for a
 // program a trap stops; with neither, it exits 0. Its standard output and error are in `NAME.out`
 // and `NAME.err` beside it, when it writes any.
+//
+// Every program runs with `AVIN_GC_STRESS=1`, so the collector runs at every allocation and a
+// reference the compiler failed to root is found at once. A `// env: NAME=VALUE` line sets a variable
+// for the program's run, and may turn stress off for a program that allocates heavily.
 //
 // `examples/*.avin` are held to the same standard as `tests/run`, so every example shown to a
 // reader builds and does what its header says.
@@ -32,13 +36,20 @@ private struct Expectation
     exit: int
     trap: bool
     errors: Buf[string]
+    env: Buf[Var]
 
 private expectation(text: string) -> Expectation
-    var e = Expectation(0, false, buf())
+    var e = Expectation(0, false, buf(), buf())
     for line in text.split("\n")
         if line.starts_with("// expect: exit ") then e.exit = parse_int(line["// expect: exit ".bytes.len..])
         elif line == "// expect: trap" then e.trap = true
         elif line.starts_with("// error: ") then e.errors.push(line["// error: ".bytes.len..])
+        elif line.starts_with("// env: ")
+            val setting = line["// env: ".bytes.len..]
+            for i in 0..<setting.bytes.len
+                if setting.bytes[i] == u8('=')
+                    e.env.push(Var(setting[0..<i], setting[i + 1..]))
+                    break
     e
 
 private parse_int(text: string) -> int
@@ -86,7 +97,13 @@ private run_case(tc: Toolchain, path: string, scratch: string) -> string
                 failures = failures + s"$path $level: did not link: $message\n"
                 continue
             Ok(_) -> ()
-        val run = capture(binary, stderr = true, timeout = 10000) match
+        var env: Buf[Var] = buf()
+        var stress = true
+        for v in want.env
+            env.push(v)
+            if v.name == "AVIN_GC_STRESS" then stress = false
+        if stress then env.push(Var("AVIN_GC_STRESS", "1"))
+        val run = capture(binary, env = env.view(), stderr = true, timeout = 10000) match
             Ok(r) -> r
             Err(e) ->
                 failures = failures + s"$path $level: did not run: ${e.to_string()}\n"

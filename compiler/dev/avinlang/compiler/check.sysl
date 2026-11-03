@@ -30,6 +30,39 @@ struct FunctionSymbol
     captured_locals: Buf[usize]
     captured_params: Buf[usize]
 
+/** A `data` type and its variants. Field types name the type's own parameters as
+ * `TypeVar(data_owner(id), i)`, so a field of a particular value's type is its declared type with the
+ * value's type arguments substituted. */
+struct DataSymbol
+    unit: usize
+    module_name: string
+    name: string
+    decl: &DataDecl
+    variants: Buf[VariantSymbol]
+
+/** One constructor of a data type. */
+struct VariantSymbol
+    name: string
+    span: Span
+    field_names: Buf[string]
+    fields: Buf[&Type]
+
+/** A variant, by its data type's index and its own position among the type's variants. */
+struct VariantRef
+    data: usize
+    index: usize
+
+/** The type of a data value, with the type's own parameters as its arguments. */
+own_type(d: DataSymbol, id: usize) -> &Type
+    var args: Buf[&Type] = buf()
+    for i in 0..<d.decl.type_params.len()
+        args.push(TypeVar(data_owner(id), i, d.decl.type_params.at(i).name))
+    Data(id, d.name, args)
+
+/** The field types of a variant for a value of type `Data(id, _, args)`. */
+variant_fields(d: DataSymbol, id: usize, variant: usize, args: Buf[&Type]) -> Buf[&Type] =
+    substitute_all(d.variants.at(variant).fields, data_owner(id), args)
+
 /** A `break` the checker has seen, kept until its loop's type is known. */
 struct BreakSite
     label: usize
@@ -81,6 +114,10 @@ struct GenericScope
 struct Checker
     units: Buf[SourceUnit]
     symbols: Buf[FunctionSymbol]
+    data: Buf[DataSymbol]
+    /** The data types and variants in scope, by name. */
+    types: Map[string, usize]
+    variants: Map[string, VariantRef]
     /** 0: not yet checked, 1: being checked, 2: checked. */
     states: Buf[u8]
     bodies: Buf[Option[&TExpr]]
@@ -117,7 +154,13 @@ end Checked
 /** Checks a program. The last unit is the program's own file, which must declare `main`; the units
  * before it (the prelude) are visible to it, and its own declarations shadow theirs. */
 check_program(units: Buf[SourceUnit]) -> Checked
-    var c = Checker(units, buf(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None)
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None)
+    // Every type is named before any is used, so a data type may refer to itself or to one
+    // declared after it, and functions are declared once every type is known.
+    for u in 0..<c.units.len()
+        declare_types(&c, u)
+    for u in 0..<c.units.len()
+        declare_variants(&c, u)
     for u in 0..<c.units.len()
         declare_unit(&c, u)
     for id in 0..<c.symbols.len()
@@ -146,7 +189,7 @@ check_program(units: Buf[SourceUnit]) -> Checked
     var functions: Buf[TFunction] = buf()
     for i in 0..<c.symbols.len()
         functions.push(TFunction(i, c.bodies.at(i), c.locals.at(i)))
-    Checked(c.units, Some(TProgram(c.symbols, functions, id)))
+    Checked(c.units, Some(TProgram(c.symbols, c.data, functions, c.vars, id)))
 
 private declare_unit(c: *Checker, unit: usize)
     val file = c.units.at(unit).file
@@ -158,13 +201,74 @@ private declare_unit(c: *Checker, unit: usize)
                     c.note(unit, f.name_span, s"`${f.name}` is declared more than once; functions with several clauses are not implemented")
                     continue
                 seen.put(f.name, f.name_span)
+                if c.variants.get(f.name) is Some(v)
+                    if c.data.at(v.data).unit == unit
+                        c.note(unit, f.name_span, s"`${f.name}` is already a variant of `${c.data.at(v.data).name}`")
                 val id = c.symbols.len()
                 c.symbols.push(signature(c, unit, file.module_name, f))
                 c.states.push(0)
                 c.bodies.push(None)
                 c.locals.push(buf())
                 c.scope.put(f.name, id)
-            DataItem(d) -> c.note(unit, d.span, "data declarations are not implemented")
+            DataItem(_) -> ()
+
+private declare_types(c: *Checker, unit: usize)
+    val file = c.units.at(unit).file
+    var seen: Map[string, Span] = map()
+    for item in file.items
+        if item is DataItem(d)
+            if seen.get(d.name) is Some(_) || builtin_type(d.name) is Some(_)
+                c.note(unit, d.span, s"the type `${d.name}` is declared more than once")
+                continue
+            seen.put(d.name, d.span)
+            for a in d.annotations
+                c.note(unit, a.span, s"unknown annotation `@${a.name}`")
+            for t in d.derives
+                c.note(unit, t.span, "`derives` is not implemented")
+            for tp in d.type_params
+                if tp.bounds.len() > 0 then c.note(unit, tp.span, "bounds on type parameters are not implemented")
+            c.types.put(d.name, c.data.len())
+            c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf()))
+
+// A variant's fields are resolved with its type's parameters in scope. Variant names share one
+// space within a file, since a variant is named on its own (`Some(1)`, `None`) wherever it is used.
+private declare_variants(c: *Checker, unit: usize)
+    var seen: Map[string, Span] = map()
+    for id in 0..<c.data.len()
+        val d = c.data.at(id)
+        if d.unit != unit then continue
+        val outer_generic = c.generic
+        c.generic = Some(GenericScope(data_owner(id), d.decl.type_params))
+        var variants: Buf[VariantSymbol] = buf()
+        for v in d.decl.variants
+            if seen.get(v.name) is Some(_)
+                c.note(unit, v.span, s"the variant `${v.name}` is declared more than once")
+                continue
+            seen.put(v.name, v.span)
+            var names: Buf[string] = buf()
+            var fields: Buf[&Type] = buf()
+            for f in v.fields
+                f.pattern.kind match
+                    Name(n) ->
+                        if contains_name(names, n) then c.note(unit, f.pattern.span, s"the field `$n` is declared more than once")
+                        names.push(n)
+                    _ ->
+                        c.note(unit, f.pattern.span, "a field is a name and a type")
+                        names.push("_")
+                if f.default is Some(e) then c.note(unit, e.span, "default field values are not implemented")
+                fields.push(resolve_type(c, unit, f.ty))
+            c.variants.put(v.name, VariantRef(id, variants.len()))
+            variants.push(VariantSymbol(v.name, v.span, names, fields))
+        c.data[id].variants = variants
+        c.generic = outer_generic
+
+/** `n` and a noun, plural unless `n` is one: "1 field", "2 fields". */
+private count(n: usize, noun: string) -> string = if n == 1 then s"1 $noun" else s"$n ${noun}s"
+
+private contains_name(names: Buf[string], name: string) -> bool
+    for n in names
+        if n == name then return true
+    false
 
 private signature(c: *Checker, unit: usize, module_name: string, f: &Function) -> FunctionSymbol
     var params: Buf[&Type] = buf()
@@ -174,6 +278,7 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function) -
     if f.type_params.len() > 0 then c.generic = Some(GenericScope(c.symbols.len(), f.type_params))
     for tp in f.type_params
         if tp.bounds.len() > 0 then c.note(unit, tp.span, "bounds on type parameters are not implemented")
+        if !(tp.variance is Invariant) then c.note(unit, tp.span, "variance is written on the parameters of a type, not of a function")
     if f.guard is Some(g) then c.note(unit, g.span, "function guards are not implemented")
     for p in f.params
         p.pattern.kind match
@@ -235,6 +340,15 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                 if scope.params.at(i).name == path
                     if args.len() > 0 then c.note(unit, t.span, s"`$path` takes no type arguments")
                     return TypeVar(scope.owner, i, path)
+        if c.types.get(path) is Some(id)
+            val d = c.data.at(id)
+            var resolved: Buf[&Type] = buf()
+            for a in args
+                resolved.push(resolve_type(c, unit, a))
+            if resolved.len() != d.decl.type_params.len()
+                c.note(unit, t.span, s"`$path` takes ${count(d.decl.type_params.len(), "type argument")}, not ${resolved.len()}")
+                return ErrorType
+            return Data(id, d.name, resolved)
         builtin_type(path) match
             Some(ty) ->
                 if args.len() > 0
@@ -413,7 +527,9 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
     RealLit(value) -> TExpr(e.span, Real, RealConst(value))
     StringLit(value) -> TExpr(e.span, Str, StrConst(value))
     UnitLit -> TExpr(e.span, Unit, UnitConst)
-    Name(name) -> name_expr(c, e.span, name)
+    Name(name) -> name_expr(c, e.span, name, expected)
+    TypeApply(target, types) -> type_apply(c, e, target, types, expected)
+    Member(target, name) -> member_expr(c, e, target, name)
     Call(callee, args) -> call_expr(c, e.span, callee, args, expected)
     Block(items, discard) -> block_expr(c, e, items, discard, expected, used)
     Binding(name, declared, value, mutable) -> binding_expr(c, e, name, declared, value, mutable)
@@ -453,7 +569,7 @@ private param_index(c: *Checker, name: string) -> Option[usize]
         if symbol.param_names.at(i) == name then return Some(i)
     None
 
-private name_expr(c: *Checker, at: Span, name: string) -> &TExpr
+private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) -> &TExpr
     if lookup_local(c, name) is Some(index)
         if c.body.locals.at(index).owner != c.current then c.body.uses.push(CaptureUse(c.current, index, false))
         return TExpr(at, c.body.locals.at(index).ty, Local(index))
@@ -463,8 +579,42 @@ private name_expr(c: *Checker, at: Span, name: string) -> &TExpr
         return TExpr(at, c.symbols.at(c.body.root).params.at(i), Param(i))
     if lookup_function(c, name) is Some(_)
         c.note(symbol.unit, at, s"`$name` is a function; function values are not implemented")
+    elif c.variants.get(name) is Some(v)
+        if c.data.at(v.data).variants.at(v.index).fields.len() == 0 then return construct(c, at, at, v, buf(), None, expected)
+        c.note(symbol.unit, at, s"`$name` has fields; call it, as in `$name(…)`")
     else c.note(symbol.unit, at, s"`$name` is not defined")
     TExpr(at, ErrorType, UnitConst)
+
+// Type arguments written on a name that is not called: a variant with no fields, as in `None[int]`.
+private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], expected: Option[&Type]) -> &TExpr
+    if target.kind is Name(name)
+        if lookup_function(c, name) is None
+            if c.variants.get(name) is Some(v)
+                if c.data.at(v.data).variants.at(v.index).fields.len() == 0
+                    return construct(c, e.span, target.span, v, buf(), Some(types), expected)
+    unsupported(c, e, "a value with type arguments that is not called")
+
+// A field is read by name from a value of a data type with one variant; a type with several is
+// taken apart by `match`, since which fields a value has depends on its variant.
+private member_expr(c: *Checker, e: &Expr, target: &Expr, name: string) -> &TExpr
+    val unit = unit_of(c)
+    val value = check_expr(c, target, None)
+    val ty = value.ty
+    *ty match
+        Data(id, _, args) ->
+            val d = c.data.at(id)
+            if d.variants.len() > 1
+                c.note(unit, e.span, s"`${type_name(ty)}` has several variants, so its fields are reached by `match`")
+                return TExpr(e.span, ErrorType, UnitConst)
+            if d.variants.len() == 1
+                val names = d.variants.at(0).field_names
+                for i in 0..<names.len()
+                    if names.at(i) == name then return TExpr(e.span, variant_fields(d, id, 0, args).at(i), Field(value, i))
+            c.note(unit, e.span, s"`${type_name(ty)}` has no field `$name`")
+        ErrorType -> ()
+        Nothing -> return value
+        _ -> c.note(unit, e.span, s"${type_name(ty)} has no field `$name`")
+    TExpr(e.span, ErrorType, UnitConst)
 
 // A block's locals go out of scope at its end. A block that contains an expression which never
 // finishes (a `return`, a `break`) never yields, so its type is `Nothing`.
@@ -784,7 +934,8 @@ private return_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
 // A call to a generic function solves for its type arguments: they may be written (`f[int](x)`),
 // and otherwise each starts as an unknown that the expected result type and the arguments decide.
 // Arguments that are not bare literals are checked first, so a literal takes the type the others
-// settle. Every type argument must be decided by the end of the call.
+// settle. Every type argument must be decided by the end of the call. A variant of a data type is
+// called the same way, with the type's parameters as its type parameters.
 private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
     var explicit: Option[Buf[&TypeExpr]] = None
@@ -797,26 +948,22 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
         _ ->
             c.note(unit, callee.span, "only a named function can be called")
             return TExpr(at, ErrorType, UnitConst)
-    if lookup_function(c, name) is None && explicit is None
-        if builtin_type(name) is Some(target) then return conversion(c, at, target, args)
+    if lookup_function(c, name) is None
+        if c.variants.get(name) is Some(v)
+            if c.data.at(v.data).variants.at(v.index).fields.len() == 0
+                c.note(unit, at, s"`$name` has no fields; write it without parentheses")
+                for a in args
+                    check_statement(c, a.value)
+                return TExpr(at, ErrorType, UnitConst)
+            return construct(c, at, named.span, v, args, explicit, expected)
+        if explicit is None
+            if builtin_type(name) is Some(target) then return conversion(c, at, target, args)
     val id = lookup_function(c, name) match
         Some(i) -> i
         None ->
             c.note(unit, named.span, s"`$name` is not defined")
             return TExpr(at, ErrorType, UnitConst)
     val target = c.symbols.at(id)
-    val type_params = target.decl.type_params
-    var type_args: Buf[&Type] = buf()
-    for _ in type_params
-        type_args.push(fresh_var(c))
-    // Written type arguments may be a leading prefix, with the rest inferred.
-    if explicit is Some(types)
-        if types.len() > type_params.len()
-            c.note(unit, callee.span, s"`$name` takes ${type_params.len()} type arguments, not ${types.len()}")
-        else
-            for i in 0..<types.len()
-                unify(c, type_args.at(i), resolve_type(c, unit, types.at(i)))
-    val params = substitute_all(target.params, id, type_args)
     if target.root is Some(_)
         c.body.calls.push(LocalCall(c.current, id))
         if c.states.at(id) == 0
@@ -824,7 +971,43 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
             for v in c.body.visible
                 initialized.push(v)
             c.body.early.push(EarlyCall(id, at, initialized))
-    val declared = substitute(result_of(c, id, at), id, type_args)
+    val declared = result_of(c, id, at)
+    val applied = apply(c, at, named.span, name, true, target.decl.type_params, id, target.params, declared, args, explicit, expected)
+    TExpr(at, applied.result, Call(id, applied.args, applied.type_args))
+
+/** A value made by a variant: a call of the variant with its fields, or the variant's bare name
+ * when it has none. */
+private construct(c: *Checker, at: Span, name_span: Span, v: VariantRef, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+    val d = c.data.at(v.data)
+    val variant = d.variants.at(v.index)
+    val called = variant.fields.len() > 0
+    val applied = apply(c, at, name_span, variant.name, called, d.decl.type_params, data_owner(v.data), variant.fields, own_type(d, v.data), args, explicit, expected)
+    TExpr(at, applied.result, Construct(v.index, applied.args))
+
+/** A call's checked arguments, its solved type arguments, and its result type. */
+private struct Applied
+    args: Buf[&TExpr]
+    type_args: Buf[&Type]
+    result: &Type
+
+// Checks a call of something with parameters `params` and result `result`, both written in terms of
+// the type parameters `type_params` that belong to `owner`. `called` is false for a variant with no
+// fields, which is written without parentheses.
+private apply(c: *Checker, at: Span, name_span: Span, name: string, called: bool, type_params: Buf[TypeParam], owner: usize, params: Buf[&Type], result: &Type, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> Applied
+    val unit = unit_of(c)
+    val first = c.vars.len()
+    var type_args: Buf[&Type] = buf()
+    for _ in type_params
+        type_args.push(fresh_var(c))
+    // Written type arguments may be a leading prefix, with the rest inferred.
+    if explicit is Some(types)
+        if types.len() > type_params.len()
+            c.note(unit, name_span, s"`$name` takes ${count(type_params.len(), "type argument")}, not ${types.len()}")
+        else
+            for i in 0..<types.len()
+                unify(c, type_args.at(i), resolve_type(c, unit, types.at(i)))
+    val wanted = substitute_all(params, owner, type_args)
+    val declared = substitute(result, owner, type_args)
     if expected is Some(want) then unify(c, declared, want)
     var early: Buf[Option[&TExpr]] = buf()
     for _ in args
@@ -833,24 +1016,30 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
         for i in 0..<args.len()
             // The first pass checks the arguments that are not bare literals, the second the rest.
             if (pass == 0) == is_literal(args.at(i).value) then continue
-            early.set(i, Some(call_argument(c, args.at(i), if i < params.len() then Some(params.at(i)) else None)))
+            early.set(i, Some(call_argument(c, args.at(i), if i < wanted.len() then Some(wanted.at(i)) else None)))
     var typed: Buf[&TExpr] = buf()
     for t in early
         typed.push(t.unwrap())
-    if args.len() != target.params.len()
-        c.note(unit, at, s"`$name` takes ${target.params.len()} arguments, not ${args.len()}")
+    if args.len() != params.len()
+        c.note(unit, at, s"`$name` takes ${count(params.len(), "argument")}, not ${args.len()}")
     var solved: Buf[&Type] = buf()
     for i in 0..<type_args.len()
         val t = zonk(c, type_args.at(i))
-        if *t is Var(v)
-            c.note(unit, callee.span, s"cannot infer `${type_params.at(i).name}` for this call to `$name`; write it, as in `$name[int](…)`")
+        // An unknown that belongs to an enclosing call, as in `f(None, 'z')`, is that call's to
+        // settle, and code generation reads its final solution.
+        var mine = false
+        if *t is Var(v) then mine = v >= first
+        if mine && *t is Var(v)
+            val subject = if called then s"this call to `$name`" else s"this `$name`"
+            val example = if called then s"`$name[int](…)`" else s"`$name[int]`"
+            c.note(unit, name_span, s"cannot infer `${type_params.at(i).name}` for $subject; write it, as in $example")
             c.vars.set(v, Some(ErrorType))
             solved.push(ErrorType)
         else solved.push(t)
-    var result = zonk(c, declared)
+    var ty = zonk(c, declared)
     for t in typed
-        if *t.ty is Nothing then result = Nothing
-    TExpr(at, result, Call(id, typed, solved))
+        if *t.ty is Nothing then ty = Nothing
+    Applied(typed, solved, ty)
 
 // Checks one argument against its parameter type, which may still contain unknowns; the argument's
 // type decides them.
@@ -1037,7 +1226,7 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
         typed.push(TArm(pattern, guard, body))
     if !agreed then ty = ErrorType
     elif !used then ty = if never then Nothing else Unit
-    if settled(s.ty) && !match_covers(typed, s.ty)
+    if settled(s.ty) && !match_covers(typed, s.ty, c.data)
         c.note(unit, e.span, s"this `match` does not cover every ${type_name(s.ty)} value; add an arm for the rest, such as `_`")
     TExpr(e.span, ty, Match(s, typed))
 
@@ -1054,6 +1243,12 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
         Wildcard -> TPattern(p.span, ty, PWildcard)
         InvalidPattern -> TPattern(p.span, ErrorType, PWildcard)
         Name(name) ->
+            // A bare name is a variant with no fields when one is in scope, and otherwise binds.
+            if c.variants.get(name) is Some(v)
+                if c.data.at(v.data).variants.at(v.index).fields.len() > 0
+                    c.note(unit, p.span, s"`$name` has fields; match them, as in `$name(…)`")
+                    return TPattern(p.span, ErrorType, PWildcard)
+                return variant_pattern(c, p, v, buf(), ty, no_bind)
             if no_bind != ""
                 c.note(unit, p.span, no_bind)
                 return TPattern(p.span, ErrorType, PWildcard)
@@ -1081,12 +1276,41 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
             for o in options
                 typed.push(check_pattern(c, o, ty, if no_bind == "" then "alternatives bind no names; write `_` for a value that is not used" else no_bind))
             TPattern(p.span, ty, PAlternatives(typed))
-        Constructor(_, _) ->
-            c.note(unit, p.span, "constructor patterns are not implemented")
-            TPattern(p.span, ErrorType, PWildcard)
+        Constructor(path, args) -> c.variants.get(path) match
+            Some(v) -> variant_pattern(c, p, v, args, ty, no_bind)
+            None ->
+                c.note(unit, p.span, s"`$path` is not a variant")
+                for a in args
+                    check_pattern(c, a, ErrorType, no_bind)
+                TPattern(p.span, ErrorType, PWildcard)
         Tuple(_) ->
             c.note(unit, p.span, "tuple patterns are not implemented")
             TPattern(p.span, ErrorType, PWildcard)
+
+// A variant pattern matches a value of the variant's own type, and each field pattern the field's
+// type in the matched value's type.
+private variant_pattern(c: *Checker, p: &Pattern, v: VariantRef, args: Buf[&Pattern], ty: &Type, no_bind: string) -> &TPattern
+    val unit = unit_of(c)
+    val d = c.data.at(v.data)
+    val variant = d.variants.at(v.index)
+    var fields: Buf[&Type] = buf()
+    var ok = true
+    *ty match
+        Data(id, _, type_args) ->
+            if id == v.data then fields = variant_fields(d, id, v.index, type_args)
+            else ok = false
+        ErrorType -> ()
+        _ -> ok = false
+    if !ok then c.note(unit, p.span, s"`${variant.name}` is a variant of `${d.name}`, but the value it matches is ${type_name(ty)}")
+    if args.len() != variant.fields.len()
+        c.note(unit, p.span, s"`${variant.name}` has ${count(variant.fields.len(), "field")}, not ${args.len()}")
+        ok = false
+    var typed: Buf[&TPattern] = buf()
+    for i in 0..<args.len()
+        val field: &Type = if ok && i < fields.len() then fields.at(i) else ErrorType
+        typed.push(check_pattern(c, args.at(i), field, no_bind))
+    if !ok || *ty is ErrorType then return TPattern(p.span, ErrorType, PWildcard)
+    TPattern(p.span, ty, PVariant(v.index, typed))
 
 // A literal in a pattern takes the matched value's type, as it would beside it in `==`.
 private pattern_constant(c: *Checker, value: &Expr, ty: &Type) -> &TExpr
@@ -1108,28 +1332,19 @@ private fresh_var(c: *Checker) -> &Type
     Var(id)
 
 /** `t` with every solved variable replaced by its solution. */
-private zonk(c: *Checker, t: &Type) -> &Type = *t match
-    Var(id) -> c.vars.at(id) match
-        Some(bound) -> zonk(c, bound)
-        None -> t
-    Tuple(items) ->
-        var out: Buf[&Type] = buf()
-        for item in items
-            out.push(zonk(c, item))
-        Tuple(out)
-    Function(params, result) ->
-        var out: Buf[&Type] = buf()
-        for p in params
-            out.push(zonk(c, p))
-        Function(out, zonk(c, result))
-    _ -> t
+private zonk(c: *Checker, t: &Type) -> &Type = solve(c.vars, t)
 
 // Makes two types equal by solving variables, and reports whether they can be. A value that never
 // finishes, or one whose type already failed, fits anything without deciding a variable.
 private unify(c: *Checker, a: &Type, b: &Type) -> bool
     val x = zonk(c, a)
     val y = zonk(c, b)
-    if *x is ErrorType || *y is ErrorType then return true
+    // An unknown meeting a type that already failed takes that type, so it is not reported again as
+    // one that could not be inferred.
+    if *x is ErrorType || *y is ErrorType
+        poison(c, x)
+        poison(c, y)
+        return true
     if *x is Var(i)
         if !same_type(x, y) then c.vars.set(i, Some(y))
         return true
@@ -1143,7 +1358,26 @@ private unify(c: *Checker, a: &Type, b: &Type) -> bool
         Function(xs, r) -> *y match
             Function(ys, q) -> unify_all(c, xs, ys) && unify(c, r, q)
             _ -> false
+        Data(i, _, xs) -> *y match
+            Data(j, _, ys) -> i == j && unify_all(c, xs, ys)
+            _ -> false
         _ -> same_type(x, y)
+
+/** Settles every unknown in `t` as the error type. */
+private poison(c: *Checker, t: &Type)
+    *zonk(c, t) match
+        Var(i) -> c.vars.set(i, Some(ErrorType))
+        Tuple(items) ->
+            for item in items
+                poison(c, item)
+        Function(params, result) ->
+            for p in params
+                poison(c, p)
+            poison(c, result)
+        Data(_, _, args) ->
+            for a in args
+                poison(c, a)
+        _ -> ()
 
 private unify_all(c: *Checker, xs: Buf[&Type], ys: Buf[&Type]) -> bool
     if xs.len() != ys.len() then return false

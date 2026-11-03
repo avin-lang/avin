@@ -17,6 +17,22 @@ emit_llvm(program: MirProgram) -> string
         push_bytes(&out, text)
         out.push("\"\n")
     out.push("\n")
+    // Each descriptor is the header the runtime reads (tag, size, reference count) followed by the
+    // reference offsets; a constant object is one word, its descriptor.
+    for i in 0..<program.descriptors.len()
+        val d = program.descriptors.at(i)
+        val n = d.refs.len()
+        out.push(s"; ${d.name}\n@avin.desc.$i = private constant { i64, i64, i64, [$n x i64] } { i64 ${d.tag}, i64 ${d.size}, i64 $n, [$n x i64] ")
+        if n == 0 then out.push("zeroinitializer")
+        else
+            out.push("[")
+            for j in 0..<n
+                if j > 0 then out.push(", ")
+                out.push(s"i64 ${d.refs.at(j)}")
+            out.push("]")
+        out.push(" }\n")
+        if d.constant then out.push(s"@avin.obj.$i = private constant ptr @avin.desc.$i, align 16\n")
+    out.push("\n")
     var declared: Buf[string] = buf()
     for f in program.functions
         for block in f.blocks
@@ -69,6 +85,7 @@ private llvm_type(t: MirType) -> string = t match
     MReal -> "double"
     MStr -> "{ ptr, i64 }"
     MPtr -> "ptr"
+    MRef -> "ptr"
 
 private result_type(s: MirSignature) -> string = s.result match
     Some(t) -> llvm_type(t)
@@ -82,6 +99,7 @@ private c_type(t: MirType) -> string = t match
     MReal -> "double"
     MStr -> "ptr, i64"
     MPtr -> "ptr"
+    MRef -> "ptr"
 
 private c_result(s: MirSignature) -> string = s.result match
     Some(t) -> c_type(t)
@@ -100,15 +118,49 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
         if i > 0 then out.push(", ")
         out.push(llvm_type(f.signature.params.at(i)) + s" %v$i")
     out.push(") {\n")
+    // Every reference the function holds is a root: each slot of reference type lives in the
+    // function's frame on the shadow stack, and each reference value is stored to a frame slot of
+    // its own as soon as it exists, so a collection at any call finds all of them.
+    var value_roots: Buf[Option[usize]] = buf()
+    var roots = 0usize
+    for s in f.slots
+        if s is MRef then roots += 1
+    for t in f.value_types
+        if t is MRef
+            value_roots.push(Some(roots))
+            roots += 1
+        else value_roots.push(None)
+    val frame = s"{ ptr, i64, [$roots x ptr] }"
     var temp = 0usize
     for b in 0..<f.blocks.len()
         out.push(s"b$b:\n")
         if b == 0
+            if roots > 0
+                need(intrinsics, "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)")
+                need(intrinsics, "declare void @avin_rt_enter(ptr)")
+                need(intrinsics, "declare void @avin_rt_leave(ptr)")
+                out.push(s"  %frame = alloca $frame\n")
+                out.push(s"  call void @llvm.memset.p0.i64(ptr %frame, i8 0, i64 ${16 + 8 * roots}, i1 false)\n")
+                out.push(s"  %frame.count = getelementptr inbounds $frame, ptr %frame, i32 0, i32 1\n")
+                out.push(s"  store i64 $roots, ptr %frame.count\n")
+                for k in 0..<roots
+                    out.push(s"  %root$k = getelementptr inbounds $frame, ptr %frame, i32 0, i32 2, i64 $k\n")
+                out.push("  call void @avin_rt_enter(ptr %frame)\n")
+            var next_root = 0usize
             for s in 0..<f.slots.len()
-                out.push(s"  %s$s = alloca ${llvm_type(f.slots.at(s))}\n")
+                if f.slots.at(s) is MRef
+                    out.push(s"  %s$s = getelementptr inbounds $frame, ptr %frame, i32 0, i32 2, i64 $next_root\n")
+                    next_root += 1
+                else out.push(s"  %s$s = alloca ${llvm_type(f.slots.at(s))}\n")
+            for i in 0..<f.signature.params.len()
+                if value_roots.at(i) is Some(k) then out.push(s"  store ptr %v$i, ptr %root$k\n")
         val block = f.blocks.at(b)
         for inst in block.insts
             temp = emit_inst(out, intrinsics, program, f, inst, temp)
+            if inst_dest(inst) is Some(d)
+                if value_roots.at(d) is Some(k) then out.push(s"  store ptr %v$d, ptr %root$k\n")
+        if block.term is Return(_)
+            if roots > 0 then out.push("  call void @avin_rt_leave(ptr %frame)\n")
         block.term match
             Return(Some(value)) -> out.push("  ret " + typed_operand(program, f, value) + "\n")
             Return(None) -> out.push("  ret void\n")
@@ -120,6 +172,19 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
                 out.push("  call void @avin_rt_trap()\n  unreachable\n")
             Unreachable -> out.push("  unreachable\n")
     out.push("}\n\n")
+
+/** The value an instruction defines, if any. */
+private inst_dest(inst: Inst) -> Option[usize] = inst match
+    Call(dest, _, _) -> dest
+    Binary(dest, _, _, _) -> Some(dest)
+    Checked(dest, _, _, _, _) -> Some(dest)
+    Compare(dest, _, _, _) -> Some(dest)
+    Select(dest, _, _, _) -> Some(dest)
+    Convert(dest, _, _) -> Some(dest)
+    Load(dest, _) -> Some(dest)
+    Store(_, _) -> None
+    Alloc(dest, _) -> Some(dest)
+    Offset(dest, _, _) -> Some(dest)
 
 private need(intrinsics: *Buf[string], declaration: string)
     if !contains(*intrinsics, declaration) then intrinsics.push(declaration)
@@ -225,9 +290,15 @@ private emit_inst(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgra
         Select(dest, condition, yes, no) ->
             out.push(s"  %v$dest = select i1 " + operand(program, f, condition) + ", " + typed_operand(program, f, yes) + ", " + typed_operand(program, f, no) + "\n")
         Load(dest, address) ->
-            out.push(s"  %v$dest = load ${llvm_type(f.value_types.at(dest))}, ptr " + operand(program, f, address) + "\n")
+            val t = f.value_types.at(dest)
+            out.push(s"  %v$dest = load ${llvm_type(t)}, ptr " + operand(program, f, address) + alignment(t) + "\n")
         Store(address, value) ->
-            out.push("  store " + typed_operand(program, f, value) + ", ptr " + operand(program, f, address) + "\n")
+            out.push("  store " + typed_operand(program, f, value) + ", ptr " + operand(program, f, address) + alignment(operand_type(program, f, value)) + "\n")
+        Alloc(dest, descriptor) ->
+            need(intrinsics, "declare ptr @avin_rt_alloc(ptr)")
+            out.push(s"  %v$dest = call ptr @avin_rt_alloc(ptr @avin.desc.$descriptor)\n")
+        Offset(dest, base, bytes) ->
+            out.push(s"  %v$dest = getelementptr inbounds i8, ptr " + operand(program, f, base) + s", i64 $bytes\n")
         Call(dest, Direct(index), args) ->
             val callee = program.functions.at(index)
             out.push("  ")
@@ -253,6 +324,7 @@ private emit_inst(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgra
                     MInt(bits) -> parts.push(s"i$bits " + operand(program, f, a))
                     MReal -> parts.push("double " + operand(program, f, a))
                     MPtr -> parts.push("ptr " + operand(program, f, a))
+                    MRef -> parts.push("ptr " + operand(program, f, a))
             out.push("  ")
             if dest is Some(d) then out.push(s"%v$d = ")
             out.push("call " + c_result(signature) + " @" + symbol + "(")
@@ -278,6 +350,7 @@ private operand_type(program: MirProgram, f: MirFunction, a: Operand) -> MirType
     ConstReal(_) -> MReal
     SlotAddress(_) -> MPtr
     ConstStr(_) -> MStr
+    ConstObject(_) -> MRef
 
 private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a match
     Value(id) -> s"%v$id"
@@ -285,10 +358,17 @@ private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a m
     ConstBool(value) -> if value then "true" else "false"
     ConstReal(value) -> real_constant(value)
     SlotAddress(slot) -> s"%s$slot"
+    ConstObject(descriptor) -> s"@avin.obj.$descriptor"
     ConstStr(index) -> s"{ ptr @str.$index, i64 ${program.strings.at(index).bytes.len} }"
 
 private typed_operand(program: MirProgram, f: MirFunction, a: Operand) -> string =
     llvm_type(operand_type(program, f, a)) + " " + operand(program, f, a)
+
+// Fields sit at multiples of 8 bytes, so an integer wider than 64 bits is accessed at that alignment
+// rather than its natural one; every other type's natural alignment is at most 8.
+private alignment(t: MirType) -> string = t match
+    MInt(bits) -> if bits > 64 then ", align 8" else ""
+    _ -> ""
 
 // LLVM spells a double exactly as the hexadecimal digits of its encoding.
 private real_constant(value: real) -> string

@@ -1,18 +1,19 @@
 module dev.avinlang.compiler
 
+import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 
 // Exhaustiveness. The patterns of a match form a matrix: one row per unguarded arm, one column per
 // value being matched. The matrix covers its columns when every combination of values matches some
 // row. A column is decided by splitting it on the cases its type enumerates (`true` and `false` for
-// `bool`); a type with too many values to enumerate (integers, chars) is covered only by rows that
+// `bool`, the variants of a data type, whose fields become columns of their own); a type with too many values to enumerate (integers, chars) is covered only by rows that
 // match anything there. Rows with a guard are left out, since a guard may always fail.
 
 private struct Row
     items: Buf[&TPattern]
 
 /** Whether the unguarded arms of a match on a value of type `ty` cover every value. */
-match_covers(arms: Buf[TArm], ty: &Type) -> bool
+match_covers(arms: Buf[TArm], ty: &Type, data: Buf[DataSymbol]) -> bool
     var rows: Buf[Row] = buf()
     for arm in arms
         if arm.guard is Some(_) then continue
@@ -21,17 +22,25 @@ match_covers(arms: Buf[TArm], ty: &Type) -> bool
         rows.push(Row(items))
     var types: Buf[&Type] = buf()
     types.push(ty)
-    covers(rows, types)
+    covers(rows, types, data)
 
 /** The cases a type enumerates for coverage, or none for a type with too many values. */
 private enum Case
     BoolCase(value: bool)
+    /** A variant, with the types of its fields in the matched type. */
+    VariantCase(index: usize, fields: Buf[&Type])
 
-private cases_of(t: &Type) -> Buf[Case]
+private cases_of(t: &Type, data: Buf[DataSymbol]) -> Buf[Case]
     var out: Buf[Case] = buf()
-    if *t is Bool
-        out.push(BoolCase(true))
-        out.push(BoolCase(false))
+    *t match
+        Bool ->
+            out.push(BoolCase(true))
+            out.push(BoolCase(false))
+        Data(id, _, args) ->
+            val d = data.at(id)
+            for i in 0..<d.variants.len()
+                out.push(VariantCase(i, variant_fields(d, id, i, args)))
+        _ -> ()
     out
 
 // A pattern that matches every value of its type: a wildcard, a binding, `()` for unit, and any
@@ -48,6 +57,27 @@ private matches_case(p: &TPattern, case: Case) -> bool = case match
             BoolConst(b) -> b == value
             _ -> false
         _ -> false
+    VariantCase(index, _) -> p.kind match
+        PVariant(i, _) -> i == index
+        _ -> false
+
+// A row specialized to a case: its first pattern is replaced by the patterns of the case's fields,
+// which are wildcards when the first pattern matched anything.
+private specialize(row: Row, case: Case) -> Row
+    var items: Buf[&TPattern] = buf()
+    val head = row.items.at(0)
+    case match
+        VariantCase(_, fields) -> head.kind match
+            PVariant(_, inner) ->
+                for p in inner
+                    items.push(p)
+            _ ->
+                for t in fields
+                    items.push(TPattern(Span(0, 0), t, PWildcard))
+        BoolCase(_) -> ()
+    for i in 1..<row.items.len()
+        items.push(row.items.at(i))
+    Row(items)
 
 private with_head(row: Row, head: &TPattern) -> Row
     var items: Buf[&TPattern] = buf()
@@ -62,7 +92,7 @@ private tail_of(row: Row) -> Row
         items.push(row.items.at(i))
     Row(items)
 
-private covers(rows: Buf[Row], types: Buf[&Type]) -> bool
+private covers(rows: Buf[Row], types: Buf[&Type], data: Buf[DataSymbol]) -> bool
     if rows.len() == 0 then return false
     if types.len() == 0 then return true
     // Alternatives become one row per option, and a named pattern is its inner pattern; both only in
@@ -80,19 +110,25 @@ private covers(rows: Buf[Row], types: Buf[&Type]) -> bool
                 for o in options
                     expanded.push(with_head(row, o))
             _ -> expanded.push(row)
-    if changed then return covers(expanded, types)
+    if changed then return covers(expanded, types, data)
     var rest: Buf[&Type] = buf()
     for i in 1..<types.len()
         rest.push(types.at(i))
     var defaults: Buf[Row] = buf()
     for row in rows
         if unconstrained(row.items.at(0)) then defaults.push(tail_of(row))
-    val cases = cases_of(types.at(0))
-    if defaults.len() == rows.len() || cases.len() == 0 then return covers(defaults, rest)
+    val cases = cases_of(types.at(0), data)
+    if defaults.len() == rows.len() || cases.len() == 0 then return covers(defaults, rest, data)
     for case in cases
         var specialized: Buf[Row] = buf()
         for row in rows
             val head = row.items.at(0)
-            if unconstrained(head) || matches_case(head, case) then specialized.push(tail_of(row))
-        if !covers(specialized, rest) then return false
+            if unconstrained(head) || matches_case(head, case) then specialized.push(specialize(row, case))
+        var columns: Buf[&Type] = buf()
+        if case is VariantCase(_, fields)
+            for t in fields
+                columns.push(t)
+        for t in rest
+            columns.push(t)
+        if !covers(specialized, columns, data) then return false
     true

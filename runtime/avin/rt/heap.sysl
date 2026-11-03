@@ -1,0 +1,113 @@
+module avin.rt
+
+import sh.sysl.gc
+import sysl.env
+import sysl.raw.ptr_cast
+
+// The collected heap. Objects are allocated by compiled code through `avin_rt_alloc` and found by
+// the collector through the shadow stack: every function that holds references links a frame of
+// them into `top` while it runs, so the roots are exact and nothing is ever scanned.
+//
+// The heap is one block reserved at startup, `AVIN_HEAP_LIMIT` bytes or 8 GiB. The operating system
+// commits its pages only as they are first touched, so the reservation costs nothing until it is
+// used, and the heap grows within it.
+
+/** One frame of the shadow stack. `count` reference slots follow this header in the frame, which
+ * compiled code keeps on its own stack. */
+struct Frame
+    prev: *Frame
+    count: usize
+
+/** A variant's layout, emitted by the compiler as constant data. `refs` byte offsets of the fields
+ * that hold references follow this header. Every object's first word is its descriptor. */
+struct Descriptor
+    tag: usize
+    size: usize
+    refs: usize
+
+private const DefaultLimit: usize = 8589934592
+
+/** The least the heap may allocate between collections, so a small heap does not collect at every
+ * step. */
+private const Floor: usize = 8388608
+
+private heap_limit() -> usize
+    val text = env.get("AVIN_HEAP_LIMIT") match
+        Some(t) -> t
+        None -> return DefaultLimit
+    var n = 0usize
+    for b in text.bytes
+        if b < u8('0') || b > u8('9') then return DefaultLimit
+        n = n * 10 + usize(b - u8('0'))
+    if n < 4096 then 4096 else n
+
+var top: *Frame = null
+var block: []u8 = [0u8; heap_limit()]
+var space: gc.Heap = gc.heap(&block[0], block.len)
+var low: usize = usize(&block[0])
+var high: usize = usize(&block[0]) + block.len
+
+/** With `AVIN_GC_STRESS=1` every allocation collects first, which finds a missing root at the
+ * first allocation it matters to. */
+var stress: bool = env.get("AVIN_GC_STRESS") == Some("1")
+var budget: usize = Floor
+var since: usize = 0
+
+// A reference may be to a constant object outside the heap, which the collector does not own.
+private mark_ref(h: *gc.Heap, p: *u8)
+    val a = usize(p)
+    if a >= low && a < high then gc.mark(h, p)
+
+private trace(p: *u8, h: *gc.Heap)
+    val word: **Descriptor = ptr_cast(p)
+    val d = word[0]
+    val offsets: *usize = ptr_cast(usize(d) + sizeof(Descriptor))
+    for i in 0..<d.refs
+        val field: **u8 = ptr_cast(usize(p) + offsets[i])
+        mark_ref(h, field[0])
+
+var kind: gc.Kind = gc.Kind(&trace, null, null, null)
+
+private roots(h: *gc.Heap)
+    var f = top
+    while f != null
+        val slots: **u8 = ptr_cast(usize(f) + sizeof(Frame))
+        for i in 0..<f.count
+            mark_ref(h, slots[i])
+        f = f.prev
+
+// After a collection the next one waits until as much has been allocated as survived, so the heap
+// stays within about twice what is live and collecting costs in proportion to what is allocated.
+private collect_now()
+    gc.collect(&space, &roots)
+    since = 0
+    val live = gc.live_size(&space)
+    budget = if live > Floor then live else Floor
+
+/** Links a function's frame onto the shadow stack. */
+@export("avin_rt_enter")
+enter(f: *Frame)
+    f.prev = top
+    top = f
+
+/** Unlinks a function's frame as it returns. */
+@export("avin_rt_leave")
+leave(f: *Frame)
+    top = f.prev
+
+/** A new object laid out by `d`: its first word is `d`, the rest zero. */
+@export("avin_rt_alloc")
+allocate(d: *Descriptor) -> *u8
+    if stress || since >= budget then collect_now()
+    var p = gc.alloc(&space, d.size, &kind)
+    if p == null
+        collect_now()
+        p = gc.alloc(&space, d.size, &kind)
+        if p == null
+            flush()
+            eprints("avin: out of memory: the heap limit is " + block.len.to_string() + " bytes; set AVIN_HEAP_LIMIT to raise it\n")
+            trap()
+    since += d.size
+    val word: **Descriptor = ptr_cast(p)
+    word[0] = d
+    p

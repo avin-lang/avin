@@ -20,14 +20,22 @@ enum Type
     Int(bits: u32)
     Tuple(items: Buf[&Type])
     Function(params: Buf[&Type], result: &Type)
-    /** A type parameter of a generic function, inside that function: opaque, since it may be any
-     * type. `owner` is the function's symbol and `index` its position in the type parameters. */
+    /** A `data` type, by its index in the program's data table, with its name for diagnostics and
+     * its type arguments. */
+    Data(id: usize, name: string, args: Buf[&Type])
+    /** A type parameter, inside the declaration it belongs to: opaque, since it may be any type.
+     * `owner` is a generic function's symbol, or `data_owner` of a data type's index; `index` is
+     * its position in the type parameters. */
     TypeVar(owner: usize, index: usize, name: string)
     /** An unknown the checker is solving for, by its index in the checker's table. */
     Var(id: usize)
 end Type
 
 const IntBits: u32 = 32
+
+/** The owner of a data type's type parameters. Data types are numbered apart from functions, so
+ * their owners start far above any function's symbol. */
+data_owner(id: usize) -> usize = id + (1usize << 48)
 
 int_type() -> &Type = Int(IntBits)
 
@@ -48,6 +56,9 @@ same_type(a: &Type, b: &Type) -> bool = *a match
         _ -> false
     Function(xs, r) -> *b match
         Function(ys, s) -> same_types(xs, ys) && same_type(r, s)
+        _ -> false
+    Data(x, _, xs) -> *b match
+        Data(y, _, ys) -> x == y && same_types(xs, ys)
         _ -> false
     TypeVar(owner, index, _) -> *b match
         TypeVar(o, i, _) -> owner == o && index == i
@@ -80,6 +91,7 @@ type_name(t: &Type) -> string = *t match
     Int(bits) -> if bits == IntBits then "int" else s"i$bits"
     Tuple(items) -> "(" + type_list(items) + ")"
     Function(params, result) -> "(" + type_list(params) + ") -> " + type_name(result)
+    Data(_, name, args) -> if args.len() == 0 then name else name + "[" + type_list(args) + "]"
     TypeVar(_, _, name) -> name
     Var(_) -> "_"
 
@@ -114,10 +126,27 @@ substitute(t: &Type, owner: usize, args: Buf[&Type]) -> &Type = *t match
     TypeVar(o, index, _) -> if o == owner && index < args.len() then args.at(index) else t
     Tuple(items) -> Tuple(substitute_all(items, owner, args))
     Function(params, result) -> Function(substitute_all(params, owner, args), substitute(result, owner, args))
+    Data(id, name, items) -> Data(id, name, substitute_all(items, owner, args))
     _ -> t
 
 substitute_all(items: Buf[&Type], owner: usize, args: Buf[&Type]) -> Buf[&Type]
     var out: Buf[&Type] = buf()
     for item in items
         out.push(substitute(item, owner, args))
+    out
+
+/** `t` with every solved inference variable replaced by its solution in `vars`. */
+solve(vars: Buf[Option[&Type]], t: &Type) -> &Type = *t match
+    Var(id) -> vars.at(id) match
+        Some(bound) -> solve(vars, bound)
+        None -> t
+    Tuple(items) -> Tuple(solve_all(vars, items))
+    Function(params, result) -> Function(solve_all(vars, params), solve(vars, result))
+    Data(id, name, args) -> Data(id, name, solve_all(vars, args))
+    _ -> t
+
+private solve_all(vars: Buf[Option[&Type]], items: Buf[&Type]) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    for item in items
+        out.push(solve(vars, item))
     out
