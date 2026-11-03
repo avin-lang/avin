@@ -38,7 +38,8 @@ struct FunctionSymbol
     /** Whether the function is used as a value somewhere, so a closure of it is made. */
     value: bool
     /** For each parameter with a default, the function that computes it: it takes the parameters
-     * before that one and yields the default, evaluated in this function's declaration scope. */
+     * before that one, a method's receiver first, and yields the default, evaluated in this
+     * function's declaration scope. An override shares the defaults of the method it overrides. */
     defaults: Buf[Option[usize]]
     /** For a function that computes a default, the parameter it is the default of. */
     default_param: Option[string]
@@ -765,7 +766,6 @@ private declare_fields(c: *Checker, unit: usize)
             val name = cp.param.pattern.kind match
                 Name(n) -> n
                 _ -> "_"
-            if cp.param.default is Some(e) then c.note(unit, e.span, "default parameter values are not implemented")
             if field_named(fields, name) is Some(_) then c.note(unit, cp.param.pattern.span, s"the field `$name` is declared more than once")
             fields.push(FieldSymbol(name, cp.param.pattern.span, Some(resolve_type(c, unit, cp.param.ty)), cp.mutable, cp.public, true, id))
         for m in d.members
@@ -1013,6 +1013,7 @@ private declare_methods(c: *Checker, unit: usize)
         c.states.push(0)
         c.bodies.push(None)
         c.locals.push(buf())
+        declare_defaults(c, constructor)
         if !d.object
             var constructors: Buf[usize] = buf()
             constructors.push(constructor)
@@ -1064,8 +1065,7 @@ private declare_methods(c: *Checker, unit: usize)
             val overrides = entry.overrides
             val file_unit = entry.unit
             if f.annotations.len() > 0 then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
-            for p in f.params
-                if p.default is Some(e) then c.note(file_unit, e.span, "default arguments of methods are not implemented")
+            if overrides then refuse_override_defaults(c, file_unit, f)
             if is_trait(c, id)
                 if !public
                     c.note(file_unit, f.name_span, s"`${f.name}` is declared in a trait, so it cannot be private")
@@ -1117,12 +1117,15 @@ private declare_methods(c: *Checker, unit: usize)
                 if entry.from_impl then c.note(file_unit, f.name_span, s"`${f.name}` is already a method of `${d.name}` with the same parameter types; a method's overloads differ in their parameter types")
                 else c.note(file_unit, f.name_span, s"`${f.name}` is declared more than once in `${d.name}` with the same parameter types; a method's overloads differ in their parameter types")
                 continue
-            methods.push(c.symbols.len())
+            val method = c.symbols.len()
+            methods.push(method)
             overriding.push(overrides)
             c.symbols.push(symbol)
             c.states.push(0)
             c.bodies.push(None)
             c.locals.push(buf())
+            // An override takes the defaults of the method it overrides once the class is linked.
+            if !overrides then declare_defaults(c, method)
         c.classes[id].methods = methods
         c.classes[id].overriding = overriding
         // The methods of one name are told apart in the object file by their parameter types.
@@ -1153,8 +1156,7 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
             _ -> None
         None -> None
     if f.annotations.len() > 0 then c.note(unit, f.name_span, "annotations on methods are not implemented")
-    for p in f.params
-        if p.default is Some(e) then c.note(unit, e.span, "default arguments of methods are not implemented")
+    if trait_id is Some(_) || overrides then refuse_override_defaults(c, unit, f)
     if trait_id is Some(t)
         if !trait_declares(c, t, f.name, 0)
             c.note(unit, f.name_span, s"`${f.name}` is not a method of `${c.classes[t].name}`; an impl of a trait implements the trait's methods, and `impl $type_name_of` adds others")
@@ -1215,6 +1217,7 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
     c.states.push(0)
     c.bodies.push(None)
     c.locals.push(buf())
+    if trait_id is None && !overrides then declare_defaults(c, id)
     same_name.push(id)
     if same_name.len() > 1 then mark_overloads(c, same_name)
     *target match
@@ -1275,6 +1278,39 @@ private visible_methods(c: *Checker, ms: Buf[usize]) -> Buf[usize]
     for m in ms
         if method_visible(c, m) then out.push(m)
     out
+
+// Defaults belong to the method that introduces a parameter: one that overrides another method, or
+// implements a trait's, takes that method's defaults and declares none of its own.
+private refuse_override_defaults(c: *Checker, unit: usize, f: &Function)
+    for p in f.params
+        if p.default is Some(e) then c.note(unit, e.span, s"`${f.name}` overrides a method, so it takes that method's default for `${param_name(p)}`; an override cannot declare a default")
+
+private param_name(p: Param) -> string = p.pattern.kind match
+    Name(n) -> n
+    _ -> "_"
+
+// Method `m`, which overrides or implements `base`, takes `base`'s defaults. Overriding two methods
+// that bring different defaults leaves the arguments it may omit unclear, so it is an error.
+private inherit_defaults(c: *Checker, m: usize, base: usize)
+    val from = c.symbols[base].defaults
+    val own = c.symbols[m].defaults
+    if from.len() != own.len() then return
+    var brings = false
+    for d in from
+        if d is Some(_) then brings = true
+    if !brings then return
+    var has = false
+    var same = true
+    for i in 0..<own.len()
+        if own[i] is Some(_) then has = true
+        if own[i] != from[i] then same = false
+    if has
+        if !same then c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`${c.symbols[m].name}` overrides methods with different defaults, `${c.symbols[base].name}` among them; it can take the defaults of only one")
+        return
+    var copied: Buf[Option[usize]] = buf()
+    for d in from
+        copied.push(d)
+    c.symbols[m].defaults = copied
 
 /** Whether a function is a method, whose first parameter is its receiver, `self`. */
 private is_method(symbol: FunctionSymbol) -> bool = (symbol.owner_class is Some(_) && !symbol.constructor) || symbol.receiver is Some(_)
@@ -1639,17 +1675,19 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
             if generic
                 c.note(unit, symbol.decl.name_span, s"`$name` has type parameters of its own, so it cannot override an inherited method")
                 continue
-            for tm in implemented
-                overrides_matches(c, id, m, tm)
             if inherited is Some(target)
                 // An inherited method that implements a trait's method has that trait's position
                 // rather than a slot of its own.
                 slot_matching(c, sid.unwrap(), self_type, m) match
                     Some(slot) ->
-                        if overrides_matches(c, id, m, target) then slots.set(slot, m)
+                        if overrides_matches(c, id, m, target)
+                            slots.set(slot, m)
+                            inherit_defaults(c, m, target)
                     None ->
                         if implemented.len() == 0 then c.note(unit, symbol.decl.name_span, s"`${c.symbols[target].name}` has type parameters of its own, so it cannot be overridden")
-                        else overrides_matches(c, id, m, target)
+                        elif overrides_matches(c, id, m, target) then inherit_defaults(c, m, target)
+            for tm in implemented
+                if overrides_matches(c, id, m, tm) then inherit_defaults(c, m, tm)
         elif inherited is Some(t)
             c.note(unit, symbol.decl.name_span, s"`$name` overrides `${c.symbols[t].name}`; mark it `override`")
         elif implemented.len() > 0
@@ -1734,7 +1772,9 @@ private build_data_table(c: *Checker, id: usize, conformed: Buf[usize])
                         reported.push(key)
                         val m = mine[k]
                         c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`$name` implements `${c.symbols[methods[j]].name}`, so it belongs in an impl of `${c.classes[t].name}` for `$name_of`")
-            if own is Some(m) then chosen = m
+            if own is Some(m)
+                chosen = m
+                inherit_defaults(c, m, methods[j])
             else
                 var bodies: Buf[usize] = buf()
                 for other in conformed
@@ -2058,11 +2098,20 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
 // the default. It is checked in the declaring function's scope, never the caller's, and a call that
 // omits the argument calls it. A generic function's defaults are generic over the same parameters.
 // The default of a by-name parameter is its delayed expression: the function yields it unevaluated.
+//
+// A method's default takes the receiver first, then the parameters before its own, and is checked as
+// the method's body is: `self` and the members of the receiver's type are in scope. A constructor's
+// default takes the parameters before its own; no object exists yet, so it has no `self`. The
+// defaults of both share their type parameters with the class, or the impl, they belong to.
 private declare_defaults(c: *Checker, id: usize)
     val f = c.symbols[id]
+    val first = if is_method(f) then 1usize else 0usize
+    val shared = f.owner_class is Some(_) || f.receiver is Some(_)
     var defaults: Buf[Option[usize]] = buf()
-    for i in 0..<f.decl.params.len()
-        val p = f.decl.params[i]
+    for _ in 0..<first
+        defaults.push(None)
+    for i in first..<f.params.len()
+        val p = f.decl.params[i - first]
         if p.default is None || p.variadic
             defaults.push(None)
             continue
@@ -2075,13 +2124,16 @@ private declare_defaults(c: *Checker, id: usize)
         var names: Buf[string] = buf()
         var decls: Buf[Param] = buf()
         for k in 0..<i
-            params.push(substitute(f.params[k], id, own))
+            params.push(if shared then f.params[k] else substitute(f.params[k], id, own))
             names.push(f.param_names[k])
-            decls.push(f.decl.params[k])
-        val result = substitute(f.params[i], id, own)
+            if k >= first then decls.push(f.decl.params[k - first])
+        val result = if shared then f.params[i] else substitute(f.params[i], id, own)
         val name = s"${f.name}/${f.param_names[i]}"
         val decl = Function(buf(), value.span, p.span, name, f.decl.type_params, decls, None, Some(value), buf())
-        c.symbols.push(FunctionSymbol(f.unit, f.module_name, name, decl, params, names, Some(result), None, f.root, buf(), buf(), buf(), false, false, false, buf(), Some(f.param_names[i]), did, f.decl.type_params, None, false, true, "", None))
+        val type_owner = if shared then f.type_owner else did
+        val type_params = if shared then f.type_params else f.decl.type_params
+        val owner_class = if f.constructor then None else f.owner_class
+        c.symbols.push(FunctionSymbol(f.unit, f.module_name, name, decl, params, names, Some(result), None, f.root, buf(), buf(), buf(), false, false, false, buf(), Some(f.param_names[i]), type_owner, type_params, owner_class, false, true, "", f.receiver))
         c.states.push(0)
         c.bodies.push(None)
         c.locals.push(buf())
@@ -2424,7 +2476,7 @@ private super_initialization(c: *Checker, receiver: &TExpr, sup: &Type, parent: 
         name_span = callee.span
     val s = c.classes[sid]
     val constructor = c.symbols[s.constructor]
-    val signature = Signature(s.name, true, constructor.type_params, class_owner(sid), constructor.params, constructor.param_names, constructor.defaults, Unit, sargs)
+    val signature = Signature(s.name, true, constructor.type_params, class_owner(sid), constructor.params, constructor.param_names, constructor.defaults, Unit, sargs, None)
     val outer = c.super_args
     c.super_args = true
     val applied = apply(c, parent.span, name_span, signature, args, None, None, buf())
@@ -3107,10 +3159,6 @@ private declare_local(c: *Checker, at: Span, name: string, ty: &Type, mutable: b
 // written.
 private assignable(c: *Checker, target: &Expr) -> Option[usize]
     val unit = unit_of(c)
-    // Single assignments and updates write fields themselves; only a multiple assignment gets here.
-    if targets_field(c, target)
-        c.note(unit, target.span, "assigning a field in a multiple assignment is not implemented")
-        return None
     val name = target.kind match
         Name(n) -> n
         _ ->
@@ -3495,6 +3543,10 @@ private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option
     val unit = unit_of(c)
     var locals: Buf[Option[usize]] = buf()
     var types: Buf[Option[&Type]] = buf()
+    // A field is stored through a hidden local the multiple store writes, then copied into the field;
+    // the object it belongs to is held first, before anything is read.
+    var fields: Buf[Option[FieldPlace]] = buf()
+    var block: Buf[&TExpr] = buf()
     var ok = true
     for t in targets
         if t.kind is Name("_")
@@ -3503,7 +3555,22 @@ private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option
                 ok = false
             locals.push(None)
             types.push(None)
+            fields.push(None)
             continue
+        if targets_field(c, t)
+            field_place(c, t) match
+                Some(place) ->
+                    if place.setup is Some(s) then block.push(s)
+                    locals.push(Some(hidden_local(c, place.ty)))
+                    types.push(Some(place.ty))
+                    fields.push(Some(place))
+                None ->
+                    ok = false
+                    locals.push(None)
+                    types.push(None)
+                    fields.push(None)
+            continue
+        fields.push(None)
         assignable(c, t) match
             Some(i) ->
                 locals.push(Some(i))
@@ -3513,7 +3580,6 @@ private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option
                 locals.push(None)
                 types.push(None)
     // Each place's current value, read before anything on the right is evaluated.
-    var block: Buf[&TExpr] = buf()
     var olds: Buf[Option[usize]] = buf()
     if op is Some(_)
         for i in 0..<locals.len()
@@ -3521,7 +3587,10 @@ private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option
                 Some(local) ->
                     val ty = c.body.locals[local].ty
                     val old = hidden_local(c, ty)
-                    block.push(TExpr(e.span, Unit, Let(old, TExpr(targets[i].span, ty, Local(local)))))
+                    val current = fields[i] match
+                        Some(place) -> TExpr(targets[i].span, ty, Field(place.object, place.index))
+                        None -> TExpr(targets[i].span, ty, Local(local))
+                    block.push(TExpr(e.span, Unit, Let(old, current)))
                     olds.push(Some(old))
                 None -> olds.push(None)
     // The parts of the value: checked one by one against their places when it is written as a tuple,
@@ -3579,6 +3648,10 @@ private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option
         stored.push(result)
         stored_types.push(result.ty)
     block.push(TExpr(e.span, Unit, MultiStore(locals, TExpr(value.span, Tuple(stored_types), Construct(0, stored)))))
+    for i in 0..<fields.len()
+        if fields[i] is Some(place)
+            val held = TExpr(targets[i].span, place.ty, Local(locals[i].unwrap()))
+            block.push(TExpr(targets[i].span, Unit, StoreField(place.object, place.index, held, false)))
     TExpr(e.span, Unit, Block(block))
 
 /** A local the compiler introduces to hold a value for a moment; no name reaches it. */
@@ -4015,7 +4088,7 @@ private call_function(c: *Checker, at: Span, name_span: Span, id: usize, args: B
 
 private function_signature(c: *Checker, id: usize, result: &Type) -> Signature
     val f = c.symbols[id]
-    Signature(f.name, true, f.type_params, f.type_owner, f.params, f.param_names, f.defaults, result, buf())
+    Signature(f.name, true, f.type_params, f.type_owner, f.params, f.param_names, f.defaults, result, buf(), None)
 
 /** The overload a call chooses, if it chooses one, and its arguments as checked while choosing: one
  * entry per written argument, `None` for one left to be checked against the chosen parameter. */
@@ -4376,7 +4449,7 @@ private call_method(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, na
 // A method's signature as a call on `receiver` sees it: its parameters past the receiver, and the
 // type arguments of its class, or of the data type its impl adds it to, known from the receiver's
 // type. An inherited method's types name its own class's parameters, so the receiver is seen as an
-// instance of that class.
+// instance of that class. Its defaults are computed from the receiver, which is passed to each.
 private method_signature(c: *Checker, receiver: &TExpr, m: usize, result: &Type) -> Signature
     val target = c.symbols[m]
     val known = receiver_type_args(c, receiver.ty, m)
@@ -4386,8 +4459,8 @@ private method_signature(c: *Checker, receiver: &TExpr, m: usize, result: &Type)
     for i in 1..<target.params.len()
         params.push(target.params[i])
         names.push(target.param_names[i])
-        defaults.push(None)
-    Signature(target.decl.name, true, target.type_params, target.type_owner, params, names, defaults, result, known)
+        defaults.push(if i < target.defaults.len() then target.defaults[i] else None)
+    Signature(target.decl.name, true, target.type_params, target.type_owner, params, names, defaults, result, known, Some(receiver))
 
 // A method call passes the receiver first. The class's type arguments come from the receiver's
 // type, and the method's own, which follow them, are written or inferred as for a function.
@@ -4404,7 +4477,7 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
         val held = hidden_local(c, receiver.ty)
         setup = Some(TExpr(receiver.span, Unit, Let(held, receiver)))
         object = TExpr(receiver.span, receiver.ty, Local(held))
-    val applied = apply(c, at, name_span, method_signature(c, receiver, m, result_of(c, m, at)), args, explicit, expected, checked)
+    val applied = apply(c, at, name_span, method_signature(c, object, m, result_of(c, m, at)), args, explicit, expected, checked)
     var typed: Buf[&TExpr] = buf()
     typed.push(object)
     for a in applied.args
@@ -4453,7 +4526,7 @@ private construct(c: *Checker, at: Span, name_span: Span, v: VariantRef, args: B
     var defaults: Buf[Option[usize]] = buf()
     for _ in variant.fields
         defaults.push(None)
-    val signature = Signature(variant.name, called, d.decl.type_params, data_owner(v.data), variant.fields, variant.field_names, defaults, own_type(d, v.data), buf())
+    val signature = Signature(variant.name, called, d.decl.type_params, data_owner(v.data), variant.fields, variant.field_names, defaults, own_type(d, v.data), buf(), None)
     val applied = apply(c, at, name_span, signature, args, explicit, expected, buf())
     applied.wrap(at, Construct(v.index, applied.args))
 
@@ -4473,6 +4546,8 @@ private struct Signature
     /** Leading type arguments already decided, a method's class's from its receiver; written type
      * arguments follow them. */
     known: Buf[&Type]
+    /** A method's receiver, as the call holds it: its defaults take it before the parameters. */
+    receiver: Option[&TExpr]
 
 /** A call's arguments, one per parameter in parameter order, its solved type arguments, and its
  * result type. `prelude` evaluates what the call needs first: the written arguments in the order
@@ -4651,13 +4726,23 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
                 val default = s.defaults[i].unwrap()
                 local_use(c, default, at)
                 var before: Buf[&TExpr] = buf()
+                if s.receiver is Some(r) then before.push(r)
                 for k in 0..<i
                     before.push(passed[k])
                 val wanted_ty = zonk(c, wanted[i])
                 val local = hidden_local(c, wanted_ty)
-                prelude.push(TExpr(at, Unit, Let(local, TExpr(at, wanted_ty, Call(default, before, solved)))))
+                prelude.push(TExpr(at, Unit, Let(local, TExpr(at, wanted_ty, Call(default, before, default_type_args(c, s, default, solved))))))
                 passed.push(TExpr(at, wanted_ty, Local(local)))
     Applied(passed, solved, ty, prelude, false)
+
+// The type arguments of a call of `default`, a default of the function `s` describes, made by a call
+// that solved `solved`. A method that overrides another takes that one's defaults, which belong to the
+// overridden method's class or trait, so they take the type arguments the receiver has as an instance
+// of that class.
+private default_type_args(c: *Checker, s: Signature, default: usize, solved: Buf[&Type]) -> Buf[&Type]
+    if s.receiver is Some(r)
+        if c.symbols[default].type_owner != s.owner then return receiver_type_args(c, r.ty, default)
+    solved
 
 // Checks a call's arguments against their parameters' types, in an order that lets each argument use
 // what the others decide: first the arguments that are neither bare literals nor lambdas, then the
