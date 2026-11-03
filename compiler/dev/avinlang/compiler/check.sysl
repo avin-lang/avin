@@ -261,6 +261,14 @@ struct ImplSymbol
     owner: usize
     trait_type: Option[&Type]
 
+/** An unknown type argument of a call, open until a later use settles it: where it was made, and
+ * what to report if nothing does. */
+struct Unknown
+    var_id: usize
+    unit: usize
+    at: Span
+    message: string
+
 struct Checker
     units: Buf[SourceUnit]
     symbols: Buf[FunctionSymbol]
@@ -285,6 +293,8 @@ struct Checker
     body: BodyState
     /** The bindings of inference variables: `None` while a variable is unsolved. */
     vars: Buf[Option[&Type]]
+    /** The unknowns a call left open, for a later use in the body to settle. */
+    unknowns: Buf[Unknown]
     /** The type parameters in scope, and the generic function they belong to. */
     generic: Option[GenericScope]
     /** Whether the names a pattern binds are assignable: set while a `var` binding's pattern is
@@ -455,7 +465,7 @@ private check_imports(c: *Checker, unit: usize)
  * unit is one of its files. Every file sees its own module's declarations, the names it imports and
  * the core library's public declarations, in that order: an inner name hides an outer one. */
 check_program(units: Buf[SourceUnit], root_module: string) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module)
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module)
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
     // Every type is named before any is used, so a data type may refer to itself or to one
@@ -511,6 +521,7 @@ check_program(units: Buf[SourceUnit], root_module: string) -> Checked
         settle_inherited_fields(&c, id)
         check_override_results(&c, id)
         check_class_variance(&c, id)
+    settle_unknowns(&c, 0)
     check_initialization(&c)
     for id in 0..<c.data.len()
         check_data_implementations(&c, id)
@@ -3058,8 +3069,11 @@ private check_function(c: *Checker, id: usize)
         var subjects: Buf[&TExpr] = buf()
         for i in 0..<symbol.params.len()
             subjects.push(TExpr(symbol.decl.name_span, symbol.params[i], Param(i)))
+        val mark = c.unknowns.len()
         if symbol.constructor then check_constructor(c, id, None)
         else check_definition(c, id, subjects)
+        // The body is over, so what its uses did not settle cannot be inferred.
+        settle_unknowns(c, mark)
         c.generic = outer_generic
         c.self_trait = outer_trait
         finish_captures(c)
@@ -3256,7 +3270,10 @@ private construct(c: *Checker, k: usize, upto: Option[usize])
             FieldMember(f) ->
                 val index = made.index
                 val declared = c.classes[k].fields[index].ty
+                val mark = c.unknowns.len()
                 val typed = check_expr(c, f.value, declared)
+                // A field's type is known where it is declared, since any function may read it.
+                if declared is None then settle_unknowns(c, mark)
                 declared match
                     Some(want) ->
                         if !fits(c,typed.ty, want) then c.note(unit, f.value.span, s"expected ${type_name(want)}, found ${type_name(typed.ty)}")
@@ -3887,7 +3904,8 @@ private abstract_constructor(c: *Checker, id: usize, at: Span) -> bool
 private binding_ref(c: *Checker, at: Span, name: string) -> Option[&TExpr]
     if lookup_local(c, name) is Some(index)
         if c.body.locals[index].owner != c.current then c.body.uses.push(CaptureUse(c.current, index, false))
-        return Some(TExpr(at, c.body.locals[index].ty, Local(index)))
+        // A local's type may have been settled by a use since it was declared.
+        return Some(TExpr(at, zonk(c, c.body.locals[index].ty), Local(index)))
     if param_index(c, name) is Some(i)
         if c.current != c.body.root then c.body.uses.push(CaptureUse(c.current, i, true))
         return Some(TExpr(at, c.symbols[c.body.root].params[i], Param(i)))
@@ -4638,7 +4656,9 @@ private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Ex
 // Arithmetic, bitwise and shift operators take two operands of one type and yield that type.
 // Integers have them all; reals have arithmetic; bytes have bitwise operators and shifts. `at` is
 // the whole operation, which diagnostics point at; `op_at` is its operator, where a trap is reported.
-private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: string, l: &TExpr, r: &TExpr) -> &TExpr
+private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: string, left: &TExpr, right: &TExpr) -> &TExpr
+    val l = settle_operand(c, left, right)
+    val r = settle_operand(c, right, l)
     if !settled(l.ty) || !settled(r.ty)
         // An operand that never finishes means the operation never finishes.
         val ty: &Type = if *l.ty is ErrorType || *r.ty is ErrorType then ErrorType else Nothing
@@ -4690,7 +4710,20 @@ private is_trait_type(c: *Checker, t: &Type) -> bool = *t match
     Class(id, _, _) -> is_trait(c, id)
     _ -> false
 
-private compare_link(c: *Checker, op: CompareOp, a: &TExpr, b: &TExpr)
+/** `operand` with its type as known now. An operand whose type is still unknown, such as the value
+ * a `Some(n)` pattern binds from a `var best = None`, takes the other operand's type: an operator
+ * is a use that settles it. */
+private settle_operand(c: *Checker, operand: &TExpr, other: &TExpr) -> &TExpr
+    val t = zonk(c, operand.ty)
+    if !(*t is Var(_)) then return if same_type(t, operand.ty) then operand else TExpr(operand.span, t, operand.kind)
+    val o = zonk(c, other.ty)
+    if *o is Var(_) || !settled(o) then return operand
+    unify(c, t, o)
+    TExpr(operand.span, o, operand.kind)
+
+private compare_link(c: *Checker, op: CompareOp, left: &TExpr, right: &TExpr)
+    val a = settle_operand(c, left, right)
+    val b = settle_operand(c, right, a)
     if !settled(a.ty) || !settled(b.ty) then return
     val at = a.span.to(b.span)
     val spelling = compare_spelling(op)
@@ -4781,6 +4814,9 @@ private join(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
     if *b is Nothing || *b is ErrorType then return Some(a)
     if same_type(a, b) then return Some(a)
     var current = zonk(c, a)
+    // An unknown branch, such as a `None` whose type argument is still open, takes the other's type.
+    if *current is Var(_) || *zonk(c, b) is Var(_)
+        return if unify(c, current, b) then Some(zonk(c, current)) else None
     if *current is Data(_, _, _) then return join_args(c, current, zonk(c, b))
     loop
         val k = *current match
@@ -4808,6 +4844,12 @@ private join_args(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
     for i in 0..<xs.len()
         if same_type(xs[i], ys[i])
             args.push(xs[i])
+            continue
+        // An argument still unknown on one side is settled as the other side's: the branches of
+        // `if c then Some(dog) else None` agree on `Option[Dog]`.
+        if *zonk(c, xs[i]) is Var(_) || *zonk(c, ys[i]) is Var(_)
+            if !unify(c, xs[i], ys[i]) then return None
+            args.push(zonk(c, xs[i]))
             continue
         if !(params[i].variance is Covariant) || !is_reference(xs[i]) || !is_reference(ys[i]) then return None
         args.push(join(c, xs[i], ys[i])?)
@@ -4838,7 +4880,12 @@ private upcast(c: *Checker, from: &Type, to: &Type) -> &Type
 /** Whether a value of type `from` may be used where `to` is expected: an instance of a subclass is an
  * instance of its superclass, and an instance of a generic type one of another instance as its
  * parameters' variance allows, also inside a tuple or a function type. */
-private fits(c: *Checker, from: &Type, to: &Type) -> bool = conforms(upcast(c, from, to), to)
+private fits(c: *Checker, from: &Type, to: &Type) -> bool
+    val up = upcast(c, from, to)
+    if conforms(up, zonk(c, to)) then return true
+    // A use settles what is still unknown: an `Option[_]` stored where an `Option[int]` is
+    // expected is one.
+    if has_unknowns(zonk(c, up)) || has_unknowns(zonk(c, to)) then unify(c, up, to) else false
 
 private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[&Expr], expected: Option[&Type], used: bool) -> &TExpr
     val cond = check_expr(c, condition, Some(Bool))
@@ -5798,15 +5845,22 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     for i in 0..<type_args.len()
         val t = zonk(c, type_args[i])
         // An unknown that belongs to an enclosing call, as in `f(None, 'z')`, is that call's to
-        // settle, and code generation reads its final solution.
+        // settle, and code generation reads its final solution. One of this call's own is left
+        // open for a later use in the body to settle, as `best = Some(3)` settles `var best = None`,
+        // unless its parameter has bounds, which the type argument is held to here.
         var mine = false
         if *t is Var(v) then mine = v >= first
         if mine && *t is Var(v)
             val subject = if called then s"this call to `$name`" else s"this `$name`"
             val example = if called then s"`$name[int](…)`" else s"`$name[int]`"
-            c.note(unit, name_span, s"cannot infer `${type_params[i].name}` for $subject; write it, as in $example")
-            c.vars.set(v, Some(ErrorType))
-            solved.push(ErrorType)
+            val message = s"cannot infer `${type_params[i].name}` for $subject; write it, as in $example"
+            if bounds_at(c, owner, type_params, i).len() == 0
+                c.unknowns.push(Unknown(v, unit, name_span, message))
+                solved.push(t)
+            else
+                c.note(unit, name_span, message)
+                c.vars.set(v, Some(ErrorType))
+                solved.push(ErrorType)
         else solved.push(t)
     // The type arguments written or inferred conform to their parameters' bounds; those the receiver
     // gives were held to them where its type was made.
@@ -6511,7 +6565,9 @@ private pattern_constant(c: *Checker, value: &Expr, ty: &Type) -> &TExpr
         return TExpr(value.span, ErrorType, UnitConst)
     val t = check_expr(c, value, Some(ty))
     if !settled(t.ty) || !settled(ty) then return TExpr(t.span, ErrorType, UnitConst)
-    if !same_type(t.ty, ty)
+    // Matching a value whose type is still unknown against a literal settles it as the literal's.
+    if *zonk(c, ty) is Var(_) then unify(c, ty, t.ty)
+    if !same_type(t.ty, zonk(c, ty))
         c.note(unit, value.span, s"this pattern is ${type_name(t.ty)}, but the value it matches is ${type_name(ty)}")
         return TExpr(t.span, ErrorType, UnitConst)
     t
@@ -6559,6 +6615,16 @@ private unify(c: *Checker, a: &Type, b: &Type) -> bool
             Class(j, _, ys) -> i == j && unify_all(c, xs, ys)
             _ -> false
         _ -> same_type(x, y)
+
+/** Reports each unknown left open since `mark` that no use has settled, at the call that made it,
+ * and settles it as the error type so nothing reports it again. */
+private settle_unknowns(c: *Checker, mark: usize)
+    for i in mark..<c.unknowns.len()
+        val u = c.unknowns[i]
+        if *zonk(c, Var(u.var_id)) is Var(v)
+            c.note(u.unit, u.at, u.message)
+            c.vars.set(v, Some(ErrorType))
+    c.unknowns.truncate(mark)
 
 /** Settles every unknown in `t` as the error type. */
 private poison(c: *Checker, t: &Type)
