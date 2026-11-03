@@ -106,7 +106,6 @@ a decision changes, this page and the chapter change together.
   two closures, so `===` tells them apart.
 - Settled 2026-11-03: `loop` is a statement that repeats its indented body (or `loop do body` on one
   line) until a `break` or `return` leaves it. `loop` is a keyword.
-
 - Settled 2026-11-03: `do … while` tests at the end, so its body runs at least once. The body is an
   indented block closed by a line starting `while test`, or one statement written `do stmt while
   test`; an optional `else` runs when the test fails. `break` carries the loop's value as in
