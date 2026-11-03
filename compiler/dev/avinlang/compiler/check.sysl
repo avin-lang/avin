@@ -31,6 +31,9 @@ struct FunctionSymbol
     captured_params: Buf[usize]
     /** Whether this is a lambda, which has no name of its own. */
     lambda: bool
+    /** Whether this lambda is an argument to a by-name parameter, an expression evaluated at each
+     * read, which `return`, `break` and `continue` cannot leave. */
+    delayed: bool
     /** Whether the function is used as a value somewhere, so a closure of it is made. */
     value: bool
 
@@ -295,9 +298,12 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function) -
             _ ->
                 c.note(unit, p.pattern.span, "parameter patterns are not implemented")
                 names.push("_")
-        if p.by_name || p.variadic || p.default is Some(_)
-            c.note(unit, p.span, "by-name, repeated and default parameters are not implemented")
-        params.push(resolve_type(c, unit, p.ty))
+        if p.variadic || p.default is Some(_)
+            c.note(unit, p.span, "repeated and default parameters are not implemented")
+        if p.by_name && f.clauses.len() > 0
+            c.note(unit, p.pattern.span, s"`${f.name}` is defined by clauses, which match its arguments, so its parameters cannot be by-name")
+        val ty = resolve_type(c, unit, p.ty)
+        if p.by_name && f.clauses.len() == 0 then params.push(ByName(ty)) else params.push(ty)
     var result: Option[&Type] = None
     if f.result is Some(r) then result = Some(resolve_type(c, unit, r))
     elif f.body is None && f.clauses.len() == 0 then result = Some(Unit)
@@ -314,7 +320,7 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function) -
     elif f.body is None && f.clauses.len() == 0
         c.note(unit, f.name_span, s"`${f.name}` needs a body, or clauses on the lines after it")
     c.generic = outer_generic
-    FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf(), false, false)
+    FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf(), false, false, false)
 
 // `@intrinsic("name")` is the only annotation this compiler gives meaning to; it is valid only on a
 // function without a body.
@@ -375,8 +381,8 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
     Function(params, result) ->
         var types: Buf[&Type] = buf()
         for p in params
-            if p.by_name then c.note(unit, p.ty.span, "by-name parameters are not implemented")
-            types.push(resolve_type(c, unit, p.ty))
+            val ty = resolve_type(c, unit, p.ty)
+            if p.by_name then types.push(ByName(ty)) else types.push(ty)
         Function(types, resolve_type(c, unit, result))
 
 private check_function(c: *Checker, id: usize)
@@ -594,7 +600,7 @@ private check_local_function(c: *Checker, decl: &Function) -> usize
 private unit_of(c: *Checker) -> usize = c.symbols[c.current].unit
 
 /** A function as diagnostics name it. */
-private described(symbol: FunctionSymbol) -> string = if symbol.lambda then "this lambda" else s"`${symbol.name}`"
+private described(symbol: FunctionSymbol) -> string = if symbol.delayed then "this delayed argument" elif symbol.lambda then "this lambda" else s"`${symbol.name}`"
 
 /** Checks an expression whose value is used. */
 check_expr(c: *Checker, e: &Expr, expected: Option[&Type]) -> &TExpr = check_value(c, e, expected, true)
@@ -632,7 +638,7 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
     Return(value) -> return_expr(c, e, value)
     Match(subject, arms) -> match_expr(c, e, subject, arms, expected, used)
     Is(value, pattern, negated) -> is_expr(c, e, value, pattern, negated)
-    Lambda(params, body) -> lambda_expr(c, e, params, body, expected)
+    Lambda(params, body) -> lambda_expr(c, e, params, body, expected, false)
     LocalFunction(decl) ->
         check_local_function(c, decl)
         TExpr(e.span, Unit, UnitConst)
@@ -659,19 +665,31 @@ private param_index(c: *Checker, name: string) -> Option[usize]
     None
 
 private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) -> &TExpr
-    if lookup_local(c, name) is Some(index)
-        if c.body.locals[index].owner != c.current then c.body.uses.push(CaptureUse(c.current, index, false))
-        return TExpr(at, c.body.locals[index].ty, Local(index))
+    if binding_ref(c, at, name) is Some(t) then return evaluated(t)
     val symbol = c.symbols[c.current]
-    if param_index(c, name) is Some(i)
-        if c.current != c.body.root then c.body.uses.push(CaptureUse(c.current, i, true))
-        return TExpr(at, c.symbols[c.body.root].params[i], Param(i))
     if lookup_function(c, name) is Some(id) then return function_value(c, at, id, None, expected)
     if c.variants.get(name) is Some(v)
         if c.data[v.data].variants[v.index].fields.len() == 0 then return construct(c, at, at, v, buf(), None, expected)
         c.note(symbol.unit, at, s"`$name` has fields; call it, as in `$name(…)`")
     else c.note(symbol.unit, at, s"`$name` is not defined")
     TExpr(at, ErrorType, UnitConst)
+
+// A local or a parameter by name, as it is stored: a by-name parameter is its delayed expression,
+// not yet evaluated.
+private binding_ref(c: *Checker, at: Span, name: string) -> Option[&TExpr]
+    if lookup_local(c, name) is Some(index)
+        if c.body.locals[index].owner != c.current then c.body.uses.push(CaptureUse(c.current, index, false))
+        return Some(TExpr(at, c.body.locals[index].ty, Local(index)))
+    if param_index(c, name) is Some(i)
+        if c.current != c.body.root then c.body.uses.push(CaptureUse(c.current, i, true))
+        return Some(TExpr(at, c.symbols[c.body.root].params[i], Param(i)))
+    None
+
+// A read of a by-name parameter evaluates its delayed expression, a closure with no parameters,
+// every time.
+private evaluated(t: &TExpr) -> &TExpr = *t.ty match
+    ByName(inner) -> TExpr(t.span, inner, CallValue(t, buf()))
+    _ -> t
 
 // Type arguments written on a name that is not called: a variant with no fields, as in `None[int]`.
 private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], expected: Option[&Type]) -> &TExpr
@@ -1174,7 +1192,9 @@ private while_expr(c: *Checker, e: &Expr, condition: &Expr, body: &Expr, otherwi
 
 private innermost_loop(c: *Checker, e: &Expr, word: string) -> Option[usize]
     if c.body.loops.len() == 0
-        c.note(unit_of(c), e.span, s"`$word` is outside a loop")
+        if c.symbols[c.current].delayed
+            c.note(unit_of(c), e.span, s"`$word` cannot leave a delayed argument, which is evaluated where its parameter is read")
+        else c.note(unit_of(c), e.span, s"`$word` is outside a loop")
         return None
     Some(c.body.loops[c.body.loops.len() - 1])
 
@@ -1199,6 +1219,10 @@ private continue_expr(c: *Checker, e: &Expr) -> &TExpr = innermost_loop(c, e, "c
 private return_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
     val unit = unit_of(c)
     val symbol = c.symbols[c.current]
+    if symbol.delayed
+        c.note(unit, e.span, "`return` cannot leave a delayed argument, which is evaluated where its parameter is read")
+        if value is Some(v) then check_statement(c, v)
+        return TExpr(e.span, Nothing, UnitConst)
     var typed: Option[&TExpr] = None
     symbol.result match
         Some(r) ->
@@ -1400,7 +1424,7 @@ private value_call(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument]) ->
 // A lambda is an anonymous local function, checked where it is written. Its parameter types are
 // written or come from the function type expected there, and its result type comes from that type
 // or from its body.
-private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr, expected: Option[&Type]) -> &TExpr
+private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr, expected: Option[&Type], delayed: bool) -> &TExpr
     val unit = unit_of(c)
     var wanted: Buf[&Type] = buf()
     var wanted_result: Option[&Type] = None
@@ -1439,7 +1463,7 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     val enclosing = c.symbols[c.current]
     val decl = Function(buf(), e.span, e.span, "lambda", buf(), buf(), None, Some(body), buf())
     val id = c.symbols.len()
-    c.symbols.push(FunctionSymbol(enclosing.unit, enclosing.module_name, "lambda", decl, types, names, result, None, Some(c.body.root), buf(), buf(), buf(), true, true))
+    c.symbols.push(FunctionSymbol(enclosing.unit, enclosing.module_name, "lambda", decl, types, names, result, None, Some(c.body.root), buf(), buf(), buf(), true, delayed, true))
     c.states.push(1)
     c.bodies.push(None)
     c.locals.push(buf())
@@ -1479,11 +1503,31 @@ private call_argument(c: *Checker, arg: Argument, param: Option[&Type]) -> &TExp
     if param is Some(p)
         val known = zonk(c, p)
         if !(*known is Var(_)) then wanted = Some(known)
+    if param is Some(p)
+        if *zonk(c, p) is ByName(inner) then return delayed_argument(c, arg, p, inner)
     val value = check_expr(c, arg.value, wanted)
     if param is Some(p)
         if !(*value.ty is Nothing) && !unify(c, p, value.ty)
             c.note(unit, arg.value.span, s"expected ${type_name(zonk(c, p))}, found ${type_name(value.ty)}")
     value
+
+// An argument to a by-name parameter is not evaluated at the call. It is checked as a lambda with
+// no parameters, which the callee evaluates at each read. A by-name parameter passed on to another
+// is forwarded as it is, still unevaluated.
+private delayed_argument(c: *Checker, arg: Argument, param: &Type, inner: &Type) -> &TExpr
+    val unit = unit_of(c)
+    if arg.value.kind is Name(n)
+        if binding_ref(c, arg.value.span, n) is Some(t)
+            if *t.ty is ByName(_)
+                if !unify(c, param, t.ty)
+                    c.note(unit, arg.value.span, s"expected ${type_name(zonk(c, param))}, found ${type_name(t.ty)}")
+                return t
+    val expected: &Type = Function(buf(), inner)
+    val delayed = lambda_expr(c, arg.value, buf(), arg.value, Some(expected), true)
+    val yields: &Type = *delayed.ty match
+        Function(_, r) -> r
+        _ -> ErrorType
+    TExpr(arg.value.span, ByName(yields), delayed.kind)
 
 // A built-in type called with one value converts it. Integers convert among themselves (widening
 // sign-extends, narrowing keeps the low bits), to and from `real`, and to `byte` and `char`, which
@@ -1844,6 +1888,9 @@ private unify(c: *Checker, a: &Type, b: &Type) -> bool
         Function(xs, r) -> *y match
             Function(ys, q) -> unify_all(c, xs, ys) && unify(c, r, q)
             _ -> false
+        ByName(r) -> *y match
+            ByName(q) -> unify(c, r, q)
+            _ -> false
         Data(i, _, xs) -> *y match
             Data(j, _, ys) -> i == j && unify_all(c, xs, ys)
             _ -> false
@@ -1860,6 +1907,7 @@ private poison(c: *Checker, t: &Type)
             for p in params
                 poison(c, p)
             poison(c, result)
+        ByName(inner) -> poison(c, inner)
         Data(_, _, args) ->
             for a in args
                 poison(c, a)

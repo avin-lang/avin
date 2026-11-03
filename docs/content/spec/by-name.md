@@ -28,7 +28,8 @@ the delayed expression, then calls the result.
 
 ## Restrictions
 
-`data` fields cannot be by-name, and neither can repeated (`T*`) parameters. Inside a delayed
+`data` fields cannot be by-name, and neither can repeated (`T*`) parameters, nor the parameters
+of a function defined by clauses, whose patterns match the arguments' values. Inside a delayed
 expression, a `return`, `break` or `continue` that would leave the expression is a compile error.
 
 ## Representation
