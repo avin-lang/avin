@@ -25,6 +25,43 @@ both. A bound declared on a type applies everywhere that type's parameters appea
 may be stored, passed and returned; using an operator, a method or a field on it needs the bound that
 provides it. Errors are reported at the generic definition, not at an instantiation.
 
+```text
+trait Ordered
+    less(other: Self) -> bool
+    greater(other: Self) -> bool = other.less(self)
+
+max[T: Ordered](a: T, b: T) -> T = if a.less(b) then b else a
+
+class SortedPair[T: Ordered](first: T, second: T)
+    high() -> T = max(first, second)
+```
+
+- **A value of a bounded `T` has the members of its bounds**: their methods, those of the traits
+  they require, a trait's `val`s and a class bound's visible fields. A call on it is checked against
+  the bound's signature with the bound's `Self` as `T`, and takes every form a method call takes:
+  overloads, default and named arguments, infix calls, the method's own type arguments, and the
+  method as a value. A member no bound has is an error naming the bounds.
+- **A value of `T` is a value of each of its bounds' types**, where that type is a type: it passes
+  where a `Shape` is expected when `T: Shape`.
+- **Each type argument conforms to its parameter's bounds**, whether written or inferred, and on
+  types written in declarations as at calls: a class or object through its header, its superclass
+  and impls, a `data` type through its impls, a trait type to itself and the traits it requires, and
+  a type parameter through its own bounds. The error names the argument, the bound and the
+  parameter. A bound's type arguments are inferred from the argument, as `A` in
+  `drain[S: Source[A], A](s: S)` is from the source passed.
+- **A bound is a trait or a class**, and may name the declaration's other parameters. A trait whose
+  methods mention `Self` is named only here, and in an impl's header.
+- **An impl's parameters are its type's**, and have the bounds the type declares; an impl writes
+  none of its own, since `impl[T: Show] Show for Box[T]` would make `Box[T]` conform for some type
+  arguments only.
+- **A call through a bound is direct**: each instance calls the implementation of its own type
+  argument. Where the argument is a trait type or an open class, any conforming object may arrive,
+  and the call goes through the object's method table as a call on that type does.
+- The bounds of a method's own type parameters are contravariant positions for its class's
+  parameters, as its parameter types are.
+- Operators on a bounded `T` come with the core library's `Add`, `Ord` and `Eq`; until then a
+  bound gives `T` methods only.
+
 ## Reification
 
 Generics are monomorphized: each distinct set of type arguments produces its own code and layout.

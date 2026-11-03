@@ -233,6 +233,22 @@ never reaches a parameter or a mutable field, so neither code can store a `Cat` 
 instance's field expects a `Dog`, and never reaches an invariant argument, so neither code can hand
 out an invariant `Cell[T]` that would let one be stored later.
 
+A type parameter's bounds are resolved where it is declared and kept by owner, position and source
+place, since the own parameters of two methods of one class share an owner and positions; a class's
+or data type's parameters are looked up at the type's declaration wherever they are named. Type
+arguments written in declarations are held to their bounds once every conformance is known (after
+the method tables are placed), and those of calls as each call is checked, after the arguments,
+whose types also settle the bounds' own type arguments. A trait's `Self` is a type parameter owned
+by `self_owner` of the trait, bounded by the trait: a call substitutes the receiver's type for it,
+and comparing an implementation with a trait's method substitutes the implementing type. A call on
+a value of a type parameter is a `BoundCall` carrying the method's position in every table that
+holds it (a trait's position, or an open class's). Lowering knows the receiver's type in each
+instance: for a final class or a `data` type it takes the implementation at that position in the
+type's table and calls it directly, at the type's arguments followed by the call's own; for a trait
+type or an open class it dispatches as a call on that type does. A trait's default bodies are one
+function for every conforming type, so `Self` stays in them, lowered as a reference, and their
+calls on `Self` values dispatch.
+
 An `object` is an instance of a class of its own, kept apart from its companion class's: its
 constructor and methods are separate functions, and its layout and descriptor are its own. Each
 module-level `val`, `var` and object is a **global** of the program, and its initializer is
@@ -283,12 +299,19 @@ reference it still needs and it touches none until it is running again. The coll
 holding the lock, raises the flag `avin_rt_requested`, waits until every other attached context is
 safe, collects, lowers the flag and wakes the others. A thread becomes safe in three ways:
 
-- **At a poll.** The emitter places a poll at the entry of every function that calls another,
-  after its frame is linked and its arguments stored, and before every terminator with a back edge,
-  found by a depth-first walk of the function's blocks, so every loop polls once per iteration and
-  every recursion once per call. A poll is a relaxed atomic load of the flag and a branch to a call
-  of `avin_rt_safepoint`, which is declared cold; the thread parks there until the collection is
-  over. A function with neither calls nor loops never polls.
+- **At a poll.** The emitter places a poll before every terminator with a back edge, found by a
+  depth-first walk of the function's blocks, so every loop polls once per iteration, and before
+  every call that may recur. Which calls may recur comes from the strongly connected components of
+  the whole program's call graph, in which a call through a function value may reach every
+  function whose address is taken (every closure entry and every method-table entry): a call
+  recurs when its callee is in the caller's component. Such a call needs a poll only where no poll
+  has run yet in this call of the function on every path to it, so every recursion polls once per
+  level, on the paths that recurse: `fib` polls before its first recursive call and its leaves never
+  poll. A function that no recursion passes through runs for a bounded time between its callers',
+  its callees' and its own loops' polls, and never polls at all for its calls. A poll is a relaxed
+  atomic load of the flag and a branch, weighted as almost never taken, to a call of
+  `avin_rt_safepoint`, which is declared cold and laid out of line; the thread parks there until the
+  collection is over. Every reference is already in a frame wherever a poll is placed.
 - **Waiting for the lock.** Allocation takes the lock with one compare-and-swap when it is free; a
   thread that has to wait for it waits safe, since the holder may be collecting. Allocation is
   therefore a safepoint.
