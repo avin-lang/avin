@@ -91,6 +91,16 @@ a decision changes, this page and the chapter change together.
 - A `data` type conforming to a trait gives every variant's descriptor the same method table, at the
   trait positions classes use, so a trait-typed call costs the same whatever the value is.
 - A generic impl writes the type's parameters, in order, as its own: `impl[T] Show for Box[T]`.
+- Settled 2026-11-03: [bounds](/spec/generics/#bounds) are traits or classes, written `[T: A + B]`.
+  A value of a bounded `T` has its bounds' methods, `val`s and visible fields, and is a value of
+  each bound's type; type arguments are held to their bounds where written and where inferred, and
+  a bound's own type arguments are inferred from the argument. A call through a bound is direct in
+  each instance, and goes through the method table only where the type argument is a trait type or
+  an open class. An impl's type parameters take its type's bounds and write none of their own.
+- Settled 2026-11-03: `Self` is written only in a trait's methods and names the implementing type;
+  a trait mentioning it, itself or through a trait it requires, is only a bound. In its default
+  bodies `self` is a `Self`. A trait type is a type argument for its own bound when it does not
+  mention `Self`.
 - [Variance](/spec/generics/#variance) applies only where both type arguments are reference types,
   so it never converts: `List[string]` is a `List[Any]`, `List[int]` is not. Tuple parts and
   function results are covariant and function parameters contravariant on the same terms.

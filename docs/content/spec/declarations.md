@@ -350,7 +350,17 @@ with a field. **A trait holds no state.** A trait may require others: `trait Ite
 A trait is both a type and a bound. Used as a type, a value of it is a reference and calls dispatch
 dynamically. Used as a bound (`[T: Shape]`), calls are direct, because the code is monomorphized.
 A trait whose methods mention `Self` other than as the receiver (`Add`, `Ord`, `Eq`) can only be used
-as a bound, as in Sysl.
+as a bound.
+
+- **`Self` in a trait's methods is the type implementing the trait.** A method `less(other: Self)`
+  is implemented by `Money` as `less(other: Money)`; a call substitutes the receiver's type, so
+  through `[T: Ordered]` it takes a `T`. `Self` is written only in a trait's methods.
+- A trait mentions `Self` when its methods or `val`s do, or a trait it requires does. Naming it as a
+  type (a parameter, a field, a type pattern) is an error; it is named as a bound, after a class's
+  `:` and in an impl's header.
+- Inside such a trait's default bodies `self` is a `Self`, so it passes where a parameter takes one:
+  `greater(other: Self) -> bool = other.less(self)`. The body is shared by every conforming type,
+  and its calls on `Self` values go through their method tables.
 
 When a class inherits two implementations of one member, from its superclass or from traits, it must
 override that member. There is no trait linearization.

@@ -233,6 +233,22 @@ never reaches a parameter or a mutable field, so neither code can store a `Cat` 
 instance's field expects a `Dog`, and never reaches an invariant argument, so neither code can hand
 out an invariant `Cell[T]` that would let one be stored later.
 
+A type parameter's bounds are resolved where it is declared and kept by owner, position and source
+place, since the own parameters of two methods of one class share an owner and positions; a class's
+or data type's parameters are looked up at the type's declaration wherever they are named. Type
+arguments written in declarations are held to their bounds once every conformance is known (after
+the method tables are placed), and those of calls as each call is checked, after the arguments,
+whose types also settle the bounds' own type arguments. A trait's `Self` is a type parameter owned
+by `self_owner` of the trait, bounded by the trait: a call substitutes the receiver's type for it,
+and comparing an implementation with a trait's method substitutes the implementing type. A call on
+a value of a type parameter is a `BoundCall` carrying the method's position in every table that
+holds it (a trait's position, or an open class's). Lowering knows the receiver's type in each
+instance: for a final class or a `data` type it takes the implementation at that position in the
+type's table and calls it directly, at the type's arguments followed by the call's own; for a trait
+type or an open class it dispatches as a call on that type does. A trait's default bodies are one
+function for every conforming type, so `Self` stays in them, lowered as a reference, and their
+calls on `Self` values dispatch.
+
 An `object` is an instance of a class of its own, kept apart from its companion class's: its
 constructor and methods are separate functions, and its layout and descriptor are its own. Each
 module-level `val`, `var` and object is a **global** of the program, and its initializer is
