@@ -131,6 +131,10 @@ a decision changes, this page and the chapter change together.
   block's line. Bindings take tuples apart (`val q, r = divmod(n, d)`), and `a, b = b, a` is a
   multiple assignment: a statement that makes the whole right side before storing anything, with
   compound forms that read every place first.
+- Inside brackets whose commas separate items (call arguments, tuple and collection literals), a
+  `return` or `break` value stops at the comma, so `f(a = return 1, b = 2)` has two arguments; a
+  parenthesised `return 1, 2` is two tuple items, and `return (1, 2)` returns a tuple. An indented
+  block inside the brackets starts a line again, and a one-line lambda body never takes a comma list.
 - Actors are built into the language: `actor` declares one.
 - State machines are built into the language: `machine` declares one, and `state` declares each of
   its states.

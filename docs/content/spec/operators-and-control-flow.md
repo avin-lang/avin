@@ -157,6 +157,10 @@ Guards do not count, since a guard may fail.
 
 ## return and end markers
 
-`return expr` exits the enclosing function. Inside a lambda it exits the lambda. Optional end markers
+`return expr` exits the enclosing function. Inside a lambda it exits the lambda. Where a `return` or
+`break` value fills a line, a comma list is a tuple without parentheses (`return a, b`); inside
+brackets whose commas separate items (call arguments, tuple and collection literals) the value stops
+at the comma, so `f(a = return 1, b = 2)` has two arguments and a tuple is written `return (1, 2)`.
+An indented block inside the brackets starts a line again. Optional end markers
 (`end if`, `end while`, `end match`, `end val`, `end name`) are checked against the construct they
 close.
