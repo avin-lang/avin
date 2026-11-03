@@ -61,7 +61,7 @@ a decision changes, this page and the chapter change together.
 - Built-in types are lowercase (`int`, `bool`, `string`, `unit`, `char`, `real`, `iN`, `byte`);
   other types are PascalCase; functions and methods are lowerCamelCase. These are conventions, not
   syntax rules.
-- `int` is `i32`, and it is the only integer alias. Signed integers of any fixed width are available.
+- `int` is `i32` and `long` is `i64`; they are the only integer aliases. Signed integers of any fixed width are available.
   There are no unsigned integer types. `real` is binary64, and there is no single-precision type.
   `char` is a Unicode scalar.
 - `byte` is an octet (0–255) for binary data, with bitwise operations and no arithmetic.

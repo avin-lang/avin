@@ -28,6 +28,6 @@ are designed together. These are the choices that shape it, each with what it me
 | **`unit` is an ordinary type** | It has one value, `()`, and works as a type argument at no cost. |
 | **One top type, `Any`** | Every type conforms to `Any`; value types reach it by boxing at that one site. |
 | **`data` is pure value** | A `data` value has no identity, so the compiler chooses to store it inline or on the heap, and the program sees the same behaviour either way. |
-| **Conversions are written** | `+` on strings joins two strings; numeric conversions are explicit (`i64(x)`); interpolation formats any value. |
+| **Conversions are written** | `+` on strings joins two strings; numeric conversions are explicit (`long(x)`); interpolation formats any value. |
 | **Generic programming at compile time** | Derivation (`derives`) and reified type tests give generic code what it needs, checked by the compiler. |
 | **Whole-program compilation** | The program, its libraries and the standard library are compiled together. That is what makes reification, monomorphized generic methods and devirtualization possible. |

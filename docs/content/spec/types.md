@@ -12,7 +12,8 @@ ordinary `impl` blocks.
 
 | Type | Meaning |
 | --- | --- |
-| `int` | Alias of `i32`, and the only integer alias |
+| `int` | Alias of `i32` |
+| `long` | Alias of `i64`; `int` and `long` are the only integer aliases |
 | `iN` | Signed integer of exactly N bits, 1 ≤ N ≤ LLVM's limit (`i8`, `i64`, `i128`, `i257`, …) |
 | `byte` | An octet, 0–255: the unit of binary data |
 | `real` | IEEE-754 binary64. There is no single-precision type |
@@ -26,7 +27,7 @@ All other types — user types, library types, collections — are PascalCase by
 ## Integers
 
 Arithmetic keeps the operand width: `i8 + i8` is `i8`. Mixed widths need an explicit conversion
-(`i64(x)`); there is no implicit widening. A literal takes its width from context (an annotation,
+(`long(x)`); there is no implicit widening. Diagnostics name `i32` and `i64` by their aliases. A literal takes its width from context (an annotation,
 a parameter, the other operand) and defaults to `int`; a literal that does not fit is a compile error.
 Where a `real` is expected, an integer literal is that real (`x * 2`), provided it is exact: its
 magnitude is at most 2^53.
