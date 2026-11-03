@@ -278,13 +278,20 @@ a decision changes, this page and the chapter change together.
   fields and to call other safe methods, so it cannot reach a subclass's field before the subclass
   sets it. The settled rule read literally forbids every method call in such a body, since the
   subclass's fields are not yet set; this allows the calls that provably observe nothing unset.
+- The thread model ([threads](/spec/threads/)): `avin.threads.spawn(body)` starts a closure on a
+  new thread with an 8 MiB stack and `join()` gives back its result; a structured `scope` joins
+  every thread started in it; a trap in any thread stops the program, and the program ends when
+  `main` returns. The heap, module-level values and captured `var`s are shared. The library offers
+  `Mutex[T]` owning its value, `Condition`, sequentially consistent `Atomic[T]`, `Channel[T]` and
+  `Once`, and every wait marks its thread safe for the collector. A data race is not undefined
+  behaviour: heap fields and module-level variables are accessed with LLVM's `unordered` ordering,
+  so a racing read sees some value written to that word, and a constructor ends with a release
+  fence, so no thread sees an object without its header and constructor-set fields. Actors are
+  scheduled onto a pool of these threads.
 
 ## Open
 
 - Resource cleanup: a `defer` construct or a library `use`.
-- The thread model: how threads are started and joined, what a program may assume about mutable
-  state other threads write (module-level `var`s and `object`s included), the synchronization the
-  library provides, and how the collector coordinates the threads.
 - How actors work: how messages are declared and sent, mailboxes and replies, how actors are
   scheduled onto threads, what an actor may share with others on the heap, and failure and
   supervision.

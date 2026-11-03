@@ -1,7 +1,7 @@
 ---
 title: Strings and formatting
 summary: String literals, interpolation as a method call on StringContext, user-defined interpolators, and formatting through Display and Debug.
-weight: 21
+weight: 22
 ---
 
 Avin has Sysl's string literal, interpolation and formatting surface. The normative reference for

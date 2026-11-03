@@ -1,7 +1,7 @@
 ---
 title: Sysl bindings
 summary: Avin calls Sysl through bindings written in Avin; the compiler generates the Sysl side and lets Sysl check it.
-weight: 18
+weight: 19
 ---
 
 Avin's standard library is written in Avin. Where Sysl already provides something — files, processes,

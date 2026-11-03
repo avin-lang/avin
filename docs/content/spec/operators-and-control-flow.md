@@ -1,7 +1,7 @@
 ---
 title: Operators and control flow
 summary: Sysl's operator set and precedence, comparison chains, blocks that yield values, if, while, match and return.
-weight: 19
+weight: 20
 ---
 
 ## Operators
