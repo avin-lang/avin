@@ -299,12 +299,19 @@ reference it still needs and it touches none until it is running again. The coll
 holding the lock, raises the flag `avin_rt_requested`, waits until every other attached context is
 safe, collects, lowers the flag and wakes the others. A thread becomes safe in three ways:
 
-- **At a poll.** The emitter places a poll at the entry of every function that calls another,
-  after its frame is linked and its arguments stored, and before every terminator with a back edge,
-  found by a depth-first walk of the function's blocks, so every loop polls once per iteration and
-  every recursion once per call. A poll is a relaxed atomic load of the flag and a branch to a call
-  of `avin_rt_safepoint`, which is declared cold; the thread parks there until the collection is
-  over. A function with neither calls nor loops never polls.
+- **At a poll.** The emitter places a poll before every terminator with a back edge, found by a
+  depth-first walk of the function's blocks, so every loop polls once per iteration, and before
+  every call that may recur. Which calls may recur comes from the strongly connected components of
+  the whole program's call graph, in which a call through a function value may reach every
+  function whose address is taken (every closure entry and every method-table entry): a call
+  recurs when its callee is in the caller's component. Such a call needs a poll only where no poll
+  has run yet in this call of the function on every path to it, so every recursion polls once per
+  level, on the paths that recurse: `fib` polls before its first recursive call and its leaves never
+  poll. A function that no recursion passes through runs for a bounded time between its callers',
+  its callees' and its own loops' polls, and never polls at all for its calls. A poll is a relaxed
+  atomic load of the flag and a branch, weighted as almost never taken, to a call of
+  `avin_rt_safepoint`, which is declared cold and laid out of line; the thread parks there until the
+  collection is over. Every reference is already in a frame wherever a poll is placed.
 - **Waiting for the lock.** Allocation takes the lock with one compare-and-swap when it is free; a
   thread that has to wait for it waits safe, since the holder may be collecting. Allocation is
   therefore a safepoint.

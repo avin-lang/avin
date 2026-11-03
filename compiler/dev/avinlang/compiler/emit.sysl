@@ -82,8 +82,9 @@ emit_llvm(program: MirProgram) -> string
                     _ -> ()
     out.push("\n")
     var intrinsics: Buf[string] = buf()
-    for f in program.functions
-        emit_function(&out, &intrinsics, program, f)
+    val graph = call_graph(program)
+    for i in 0..<program.functions.len()
+        emit_function(&out, &intrinsics, program, graph, i)
     for declaration in intrinsics
         out.push(declaration + "\n")
     out.push("\n")
@@ -153,7 +154,8 @@ private c_params(s: MirSignature) -> string
         out = out + ", " + c_type(t)
     out
 
-private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgram, f: MirFunction)
+private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgram, graph: CallGraph, index: usize)
+    val f = program.functions[index]
     out.push("define " + result_type(f.signature) + " @\"" + f.symbol + "\"(ptr %ctx")
     for i in 0..<f.signature.params.len()
         out.push(", " + llvm_type(f.signature.params[i]) + s" %v$i")
@@ -176,6 +178,7 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
     var temp = 0usize
     var polls = 0usize
     val back = back_edges(f)
+    val polled_on_entry = polled_before(graph, index, f)
     for b in 0..<f.blocks.len()
         out.push(s"b$b:\n")
         if b == 0
@@ -198,9 +201,12 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
                 else out.push(s"  %s$s = alloca ${llvm_type(f.slots[s])}\n")
             for i in 0..<f.signature.params.len()
                 if value_roots[i] is Some(k) then out.push(s"  store ptr %v$i, ptr %root$k\n")
-            if makes_calls(f) then polls = emit_poll(out, intrinsics, polls)
         val block = f.blocks[b]
+        var polled = polled_on_entry[b]
         for inst in block.insts
+            if !polled && closes_cycle(graph, index, inst)
+                polls = emit_poll(out, intrinsics, polls)
+                polled = true
             temp = emit_inst(out, intrinsics, program, f, inst, temp)
             if inst_dest(inst) is Some(d)
                 if value_roots[d] is Some(k) then out.push(s"  store ptr %v$d, ptr %root$k\n")
@@ -222,16 +228,20 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
 // A safepoint poll: when a collection has asked the other threads to stop, the runtime parks this one
 // until the collection is over. Every reference the function holds is already in its frame, so the
 // stack is consistent wherever a poll is placed. The flag is read with a relaxed atomic load and the
-// slow path is a call to a cold function, so the common case is one load and a branch predicted not
-// taken. Polls are placed at the entry of every function that calls another, which bounds the time a
-// recursion runs without one, and before every terminator with a back edge, which every cycle of the
-// control flow has. `n` numbers the poll within its function; the next number is answered.
+// slow path is a call to a cold function behind a branch weighted as almost never taken, so the
+// common case is one load and a branch that falls through, and the slow path is laid out of line.
+// Polls are placed before every terminator with a back edge, which every cycle of the control flow
+// has, and before a call that may close a cycle of the call graph, which every recursion makes once
+// per level (see `polled_before`). A call that cannot recurse needs none: its callee runs for a
+// bounded time between its own polls. `n` numbers the poll within its function; the next number is
+// answered.
 private emit_poll(out: *StrBuilder, intrinsics: *Buf[string], n: usize) -> usize
     need(intrinsics, "@avin_rt_requested = external global i32")
     need(intrinsics, "declare void @avin_rt_safepoint(ptr) cold")
+    need(intrinsics, Unlikely)
     out.push(s"  %poll$n = load atomic i32, ptr @avin_rt_requested monotonic, align 4\n")
     out.push(s"  %stop$n = icmp ne i32 %poll$n, 0\n")
-    out.push(s"  br i1 %stop$n, label %park$n, label %run$n\n")
+    out.push(s"  br i1 %stop$n, label %park$n, label %run$n, !prof !0\n")
     out.push(s"park$n:\n  call void @avin_rt_safepoint(ptr %ctx)\n  br label %run$n\n")
     out.push(s"run$n:\n")
     n + 1
@@ -281,16 +291,187 @@ private back_edges(f: MirFunction) -> Buf[bool]
             _ = next.pop()
     back
 
-// Whether `f` calls a function of the program, directly or through a function value, and so may
-// recurse.
-private makes_calls(f: MirFunction) -> bool
-    for block in f.blocks
-        for inst in block.insts
-            inst match
-                Call(_, Direct(_), _) -> return true
-                Call(_, Indirect(_, _), _) -> return true
-                _ -> ()
-    false
+/** The branch weights of a poll: taken once in about a million. A poll's branch is the module's only
+ * metadata, so it is number 0. */
+private const Unlikely: string = "!0 = !{!\"branch_weights\", i32 1, i32 1048575}"
+
+/** Which calls of the program can recur. Functions are grouped into the strongly connected
+ * components of the call graph, where a function calls each function it calls directly and, if it
+ * calls through a function value, every function whose address is taken: every closure entry and
+ * every method-table entry. A call can be part of a recursion exactly when its callee is in the
+ * caller's component. Runtime entry points and the shims of Sysl bindings never call compiled code,
+ * so they add no edges; a binding that takes an Avin function would add one to every function whose
+ * address is taken. */
+private struct CallGraph
+    /** The component of each function. */
+    component: Buf[usize]
+    /** For each component, whether one of its functions has its address taken, so that a call
+     * through a function value from that component may come back to it. */
+    reentered: Buf[bool]
+
+private call_graph(program: MirProgram) -> CallGraph
+    val n = program.functions.len()
+    var taken: Buf[bool] = buf()
+    for _ in 0..<n do taken.push(false)
+    for k in program.closures do taken[k.function] = true
+    for d in program.descriptors
+        for m in d.methods
+            if m is Some(g) then taken[g] = true
+    for f in program.functions
+        for block in f.blocks
+            for inst in block.insts
+                for o in inst_operands(inst) do take(&taken, o)
+            if block.term is Return(Some(o)) then take(&taken, o)
+            if block.term is Branch(o, _, _) then take(&taken, o)
+    var targets: Buf[usize] = buf()
+    for g in 0..<n
+        if taken[g] then targets.push(g)
+    // The edges of function `v` are `edges[starts[v]..<starts[v + 1]]`.
+    var starts: Buf[usize] = buf()
+    var edges: Buf[usize] = buf()
+    for f in program.functions
+        starts.push(edges.len())
+        var indirect = false
+        for block in f.blocks
+            for inst in block.insts
+                inst match
+                    Call(_, Direct(g), _) -> edges.push(g)
+                    Call(_, Indirect(_, _), _) -> indirect = true
+                    _ -> ()
+        if indirect
+            for g in targets do edges.push(g)
+    starts.push(edges.len())
+    val component = components(n, starts, edges)
+    var reentered: Buf[bool] = buf()
+    for _ in 0..<n do reentered.push(false)
+    for g in targets do reentered[component[g]] = true
+    CallGraph(component, reentered)
+
+private take(taken: *Buf[bool], o: Operand)
+    if o is FunctionAddress(g) then (*taken)[g] = true
+
+private inst_operands(inst: Inst) -> Buf[Operand]
+    var out: Buf[Operand] = buf()
+    inst match
+        Call(_, callee, args) ->
+            if callee is Indirect(target, _) then out.push(target)
+            for a in args do out.push(a)
+        Binary(_, _, left, right) ->
+            out.push(left)
+            out.push(right)
+        Checked(_, _, _, left, right) ->
+            out.push(left)
+            out.push(right)
+        Compare(_, _, left, right) ->
+            out.push(left)
+            out.push(right)
+        Select(_, condition, yes, no) ->
+            out.push(condition)
+            out.push(yes)
+            out.push(no)
+        Convert(_, _, value) -> out.push(value)
+        Load(_, address) -> out.push(address)
+        Store(address, value) ->
+            out.push(address)
+            out.push(value)
+        Alloc(_, _) -> ()
+        Offset(_, base, _) -> out.push(base)
+        DescriptorOf(_, object) -> out.push(object)
+        MethodSlot(_, object, _) -> out.push(object)
+    out
+
+// The strongly connected components of a graph of `n` vertices, numbered from 0, by Tarjan's
+// algorithm with an explicit stack of the vertices being visited.
+private components(n: usize, starts: Buf[usize], edges: Buf[usize]) -> Buf[usize]
+    // The visit order of each vertex, from 1; 0 is not visited yet.
+    var order: Buf[usize] = buf()
+    var low: Buf[usize] = buf()
+    var on_stack: Buf[bool] = buf()
+    var component: Buf[usize] = buf()
+    for _ in 0..<n
+        order.push(0)
+        low.push(0)
+        on_stack.push(false)
+        component.push(0)
+    var stack: Buf[usize] = buf()
+    // The vertices being visited, and for each the position of its next edge.
+    var path: Buf[usize] = buf()
+    var next: Buf[usize] = buf()
+    var visited = 0usize
+    var found = 0usize
+    for root in 0..<n
+        if order[root] == 0
+            visited += 1
+            order[root] = visited
+            low[root] = visited
+            stack.push(root)
+            on_stack[root] = true
+            path.push(root)
+            next.push(starts[root])
+            while path.len() > 0
+                val top = path.len() - 1
+                val v = path[top]
+                if next[top] < starts[v + 1]
+                    val w = edges[next[top]]
+                    next[top] += 1
+                    if order[w] == 0
+                        visited += 1
+                        order[w] = visited
+                        low[w] = visited
+                        stack.push(w)
+                        on_stack[w] = true
+                        path.push(w)
+                        next.push(starts[w])
+                    elif on_stack[w] && order[w] < low[v] then low[v] = order[w]
+                else
+                    _ = path.pop()
+                    _ = next.pop()
+                    if low[v] == order[v]
+                        var done = false
+                        while !done
+                            val w = stack.pop().unwrap()
+                            on_stack[w] = false
+                            component[w] = found
+                            done = w == v
+                        found += 1
+                    if path.len() > 0
+                        val u = path[path.len() - 1]
+                        if low[v] < low[u] then low[u] = low[v]
+    component
+
+// Whether `inst`, in function `caller`, is a call that may close a cycle of the call graph.
+private closes_cycle(graph: CallGraph, caller: usize, inst: Inst) -> bool = inst match
+    Call(_, Direct(g), _) -> graph.component[g] == graph.component[caller]
+    Call(_, Indirect(_, _), _) -> graph.reentered[graph.component[caller]]
+    _ -> false
+
+// For each block of function `index`, whether a poll has run in this call of it on every path from
+// the entry to the block. A call that may close a cycle needs a poll before it only where none has:
+// every level of a recursion then still polls once on the way to the next, since every path to the
+// call passes a poll, and the time between that poll and the call is bounded by the code between them,
+// the calls they make, which poll for themselves, and loops, which poll on their back edges. A
+// function that recurses on only some paths polls only on those, and its leaf calls never poll.
+private polled_before(graph: CallGraph, index: usize, f: MirFunction) -> Buf[bool]
+    val n = f.blocks.len()
+    var polled: Buf[bool] = buf()
+    var polls: Buf[bool] = buf()
+    for b in 0..<n
+        polled.push(b != 0)
+        var any = false
+        for inst in f.blocks[b].insts
+            if closes_cycle(graph, index, inst) then any = true
+        polls.push(any)
+    // A block's value only ever falls from true to false, so the walk reaches a fixed point.
+    var changed = true
+    while changed
+        changed = false
+        for b in 0..<n
+            if !polled[b] && !polls[b]
+                for s in successors(f.blocks[b].term)
+                    if polled[s]
+                        polled[s] = false
+                        changed = true
+    polled
 
 // A descriptor is the collector's kind, then the header the runtime reads (tag, size, reference
 // count, type record), then the reference offsets. An object's descriptor is the kind the collector keeps in its
