@@ -26,6 +26,22 @@ Each stage has its own data structures and its own tests. No stage reaches back 
 input. **Types are an enum over symbols, never strings**: built-in types, nominal types, functions,
 tuples, type parameters, inference variables, `Any`, `Nothing` and an error type.
 
+**Loading a program.** `avin build <dir>` takes a directory as the program's root: every `.avin` file
+under it is read in path order, passing over directories whose names begin with `.`, and each is
+given the module its directory's path names, the root directory's files last as the root module.
+A file whose header disagrees with its directory, or that has none outside the root, is reported
+before anything is checked. `avin build <file>` is a program of that one file, in the module its
+header names. The standard library is loaded the same way, from `library/` under the toolchain's
+root, where every module is `avin` or under it; `library/avin/prelude.avin` is one ordinary file of
+module `avin`. A package manifest will name the roots the loader walks; the files and their modules
+are what the later stages see.
+
+Names are resolved by module. Every top-level declaration is held under its qualified name, `a.b.X`
+(a root module's under `X`), and a bare name in a file resolves to the first of its own module's
+declaration, its file's import, and the `avin` module's public declaration that exists. Imports are
+checked once every declaration of the program is known, and a wrong one is dropped. Object-file
+symbols carry the module path, so two modules may each declare `helper`.
+
 ## Runtime
 
 `runtime/` is a Sysl package, built into a library archive when its sources change rather than once
@@ -152,8 +168,9 @@ at offset 56: the number of the type's ancestors and their records' addresses. A
 are its superclasses and every trait it and they conform to, with their type arguments as it sees
 them; a tuple's are the tuple types its parts' ancestors make, one combination at a time. A type
 pattern loads the object's descriptor and its record: for a type nothing else can be (a built-in, a
-final class, a `data` type, a tuple of such), one comparison with the target's record; for an open
-class, a trait or a tuple with a part of one, a call of the runtime's `avin_rt_conforms`, which
+final class, a `data` type, a tuple of such, each with only invariant parameters), one comparison
+with the target's record; for an open class, a trait, an instance of a type with a covariant or
+contravariant parameter, or a tuple with a part of one, a call of the runtime's `avin_rt_conforms`, which
 scans the record's ancestors, so the test costs the number of ancestors. A generic instance is its
 own type with its own record, so `Box[int]` and `Box[string]` differ by address. Strings are made by
 the runtime as well as written as literals, so a string's descriptor names no record, and a null
@@ -161,6 +178,44 @@ record is the mark of a string. Closures and the boxes of captured variables sha
 type pattern names. A type pattern on a value whose static type already conforms to the target tests
 nothing, and on a value of another value type (possible only in a copy of generic code) never
 matches.
+
+The supertypes an instance has through **variance** are open-ended (`List[Dog]` is a `List[Animal]`
+and a `List[Any]`), so a record does not list them all. Lowering notes each record a type pattern
+tests through `avin_rt_conforms`; once every function is lowered, each record gains those tested
+records whose types its own conforms to by variance, by the checker's rule (`view_as`). A test
+still costs one scan of one record.
+
+A covariant view needs no conversion, and stays sound under monomorphization, because variance
+applies only between reference type arguments. Every field and every part of a field whose type
+mentions a type argument is then a reference (the argument itself, or a tuple, function, `data`
+value or object built from it), so `Box[Dog]` and `Box[Animal]` have the same layout and the same
+method-table shape, and code of either instance reads the other's objects correctly. A call through
+a method table runs the code of the object's own instance: a `Box[Dog]` seen as a `Box[Animal]`
+runs `Box[Dog]`'s method, whose results are `Dog`s and so `Animal`s, and whose parameters, a
+covariant parameter never being one, take what the view passes. A direct call (a final class's
+method, an `impl`'s method of a `data` type) runs the code of the static instance, `Box[Animal]`'s,
+on the `Box[Dog]` object: the layouts agree, and that code treats every value as the wider type the
+view promises, so anything reified it does (a type pattern on `T`, a new `Box[T]`) is done at the
+view's types, which the caller expects. The declaration check is what keeps both paths sound: a `+T`
+never reaches a parameter or a mutable field, so neither code can store a `Cat` where a `Dog`
+instance's field expects a `Dog`, and never reaches an invariant argument, so neither code can hand
+out an invariant `Cell[T]` that would let one be stored later.
+
+A type parameter's bounds are resolved where it is declared and kept by owner, position and source
+place, since the own parameters of two methods of one class share an owner and positions; a class's
+or data type's parameters are looked up at the type's declaration wherever they are named. Type
+arguments written in declarations are held to their bounds once every conformance is known (after
+the method tables are placed), and those of calls as each call is checked, after the arguments,
+whose types also settle the bounds' own type arguments. A trait's `Self` is a type parameter owned
+by `self_owner` of the trait, bounded by the trait: a call substitutes the receiver's type for it,
+and comparing an implementation with a trait's method substitutes the implementing type. A call on
+a value of a type parameter is a `BoundCall` carrying the method's position in every table that
+holds it (a trait's position, or an open class's). Lowering knows the receiver's type in each
+instance: for a final class or a `data` type it takes the implementation at that position in the
+type's table and calls it directly, at the type's arguments followed by the call's own; for a trait
+type or an open class it dispatches as a call on that type does. A trait's default bodies are one
+function for every conforming type, so `Self` stays in them, lowered as a reference, and their
+calls on `Self` values dispatch.
 
 An `object` is an instance of a class of its own, kept apart from its companion class's: its
 constructor and methods are separate functions, and its layout and descriptor are its own. Each
@@ -201,7 +256,34 @@ Programs are multi-threaded, so the runtime keeps no per-thread state in globals
 thread's context as a hidden first argument. A function that holds references links its frame of
 roots onto its thread's shadow stack by writing the context's first word directly, on entry and on
 every return, without calling the runtime. A collection walks the frames of every attached
-context; the main thread's is attached before the program's entry function runs.
+context; the main thread's is attached before the program's entry function runs. Another thread
+gets a context of its own from `avin_rt_thread_attach` before it runs compiled code and gives it
+back with `avin_rt_thread_detach` when it has finished, with no frame left on it.
+
+Threads share the heap, and one lock serializes allocation, collection and changes to the list of
+contexts; the collector itself runs single-threaded. **A collection stops the world.** Each context
+is either *running*, when its thread may touch references, or *safe*, when its frames hold every
+reference it still needs and it touches none until it is running again. The collecting thread,
+holding the lock, raises the flag `avin_rt_requested`, waits until every other attached context is
+safe, collects, lowers the flag and wakes the others. A thread becomes safe in three ways:
+
+- **At a poll.** The emitter places a poll at the entry of every function that calls another,
+  after its frame is linked and its arguments stored, and before every terminator with a back edge,
+  found by a depth-first walk of the function's blocks, so every loop polls once per iteration and
+  every recursion once per call. A poll is a relaxed atomic load of the flag and a branch to a call
+  of `avin_rt_safepoint`, which is declared cold; the thread parks there until the collection is
+  over. A function with neither calls nor loops never polls.
+- **Waiting for the lock.** Allocation takes the lock with one compare-and-swap when it is free; a
+  thread that has to wait for it waits safe, since the holder may be collecting. Allocation is
+  therefore a safepoint.
+- **Around a blocking call.** `avin_rt_enter_safe` and `avin_rt_leave_safe` bracket an operation
+  that may wait (a lock, a channel, a join, reading input), so a blocked thread never holds up a
+  collection; leaving waits for a collection in progress to finish.
+
+The handshake is a pair of sequentially consistent stores and loads, the flag by the collector and
+a context's state by its thread, so either the thread sees the flag and wakes the collector, or the
+collector sees the thread safe. With one context attached the flag is never raised, so a program
+with one thread takes no poll's slow path and makes no system call for a collection.
 
 ## Standard library
 

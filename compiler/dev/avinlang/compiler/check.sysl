@@ -265,20 +265,21 @@ struct Checker
     units: Buf[SourceUnit]
     symbols: Buf[FunctionSymbol]
     data: Buf[DataSymbol]
-    /** The data types and variants in scope, by name. */
+    /** The data types and variants, by qualified name: `a.b.Shape`, or `Shape` in the root module. */
     types: Map[string, usize]
     variants: Map[string, VariantRef]
     classes: Buf[ClassSymbol]
-    /** The classes in scope, by name, and the standalone objects, whose types are named after them. */
+    /** The classes, by qualified name, and the standalone objects, whose types are named after them. */
     class_types: Map[string, usize]
     globals: Buf[GlobalSymbol]
-    /** The module-level values and objects in scope, by name. */
+    /** The module-level values and objects, by qualified name. */
     global_names: Map[string, usize]
     /** 0: not yet checked, 1: being checked, 2: checked. */
     states: Buf[u8]
     bodies: Buf[Option[&TExpr]]
     locals: Buf[Buf[TLocal]]
-    /** The top-level functions in scope, by name: several when the name is overloaded. */
+    /** The top-level functions and class constructors, by qualified name: several when the name is
+     * overloaded. */
     scope: Map[string, Buf[usize]]
     current: usize
     body: BodyState
@@ -318,6 +319,12 @@ struct Checker
      * where it is written; before then, each check waits in `pending`. */
     conformances_known: bool
     pending: Buf[PendingBound]
+    /** For each unit, its module and the names its imports bring in. */
+    files: Buf[FileScope]
+    /** The declarations marked `private`, by qualified name: seen only inside their modules. */
+    private_names: Map[string, bool]
+    /** The program's root module, which declares `main`. */
+    root_module: string
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -340,14 +347,124 @@ struct Checked
         out
 end Checked
 
-/** Checks a program. The last unit is the program's own file, which must declare `main`; the units
- * before it (the prelude) are visible to it, and its own declarations shadow theirs. */
-check_program(units: Buf[SourceUnit]) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf())
+/** The core library's module. Its public declarations are seen by every file without an import, and
+ * the built-in types belong to it. */
+const CoreModule: string = "avin"
+
+/** What a file sees besides its own module's declarations and the core library's: each name its
+ * imports bring in, bound to the qualified name of the declaration it imports. */
+struct FileScope
+    module_name: string
+    imports: Map[string, string]
+
+/** The name a declaration `name` of module `module_name` has in the symbol tables: `a.b.name`, or
+ * `name` alone in the root module. A declaration's name holds no dot, so two declarations of
+ * different modules never share one. */
+qualified(module_name: string, name: string) -> string = if module_name == "" then name else module_name + "." + name
+
+/** Whether a declaration has the qualified name `key`, whatever kind it is. */
+private declared(c: *Checker, key: string) -> bool =
+    c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_) || c.variants.get(key) is Some(_) ||
+        c.global_names.get(key) is Some(_) || c.scope.get(key) is Some(_)
+
+/** Whether the declaration named `key` may be seen from another module: it is not `private`. A
+ * function's name is while any of its overloads is public. */
+private exported(c: *Checker, key: string) -> bool
+    if c.private_names.get(key) is Some(_) then return false
+    if c.scope.get(key) is Some(ids)
+        for id in ids
+            if c.symbols[id].public then return true
+        return false
+    true
+
+/** The qualified name a bare `name` denotes in a unit: its own module's declaration of that name,
+ * else the one the file imports under it, else the core library's public one. The nearer hides the
+ * farther whatever kind each is, so a module's function hides a core library type of its name. When
+ * none exists, the module's own, which no table holds, so the use is reported as unknown. */
+private resolve_name(c: *Checker, unit: usize, name: string) -> string
+    val scope = c.files[unit]
+    val own = qualified(scope.module_name, name)
+    if declared(c, own) then return own
+    if scope.imports.get(name) is Some(key) then return key
+    val core = qualified(CoreModule, name)
+    if declared(c, core) && exported(c, core) then return core
+    own
+
+private file_scope(c: *Checker, unit: usize) -> FileScope
+    val file = c.units[unit].file
+    var imports: Map[string, string] = map()
+    for i in file.imports
+        if imports.get(i.binding) is None then imports.put(i.binding, i.path)
+    FileScope(file.module_name, imports)
+
+private module_exists(c: *Checker, name: string) -> bool
+    for f in c.files
+        if f.module_name == name then return true
+    false
+
+// Each import of a unit names a public declaration of another module, under a name the file does not
+// already use. An import found wrong is reported and dropped, so its uses are reported as unknown
+// names rather than resolved to something the import did not mean.
+private check_imports(c: *Checker, unit: usize)
+    val file = c.units[unit].file
+    val own = file.module_name
+    var kept: Map[string, string] = map()
+    for i in file.imports
+        var dot: Option[usize] = None
+        for k in 0..<i.path.bytes.len
+            if i.path.bytes[k] == u8('.') then dot = Some(k)
+        val at = dot match
+            Some(k) -> k
+            None ->
+                if module_exists(c, i.path) then c.note(unit, i.span, s"`${i.path}` is a module; an import names its declarations, as in `import ${i.path}.{Name}`")
+                else c.note(unit, i.span, s"`${i.path}` is not a declaration of a module; an import names one, as in `import a.b.{Name}`")
+                continue
+        val module_name = i.path[0..<at]
+        val name = i.path[at + 1..]
+        if module_name == own
+            c.note(unit, i.span, s"`$name` is declared in this module, which sees it without an import")
+            continue
+        if !module_exists(c, module_name)
+            if module_exists(c, i.path) then c.note(unit, i.span, s"`${i.path}` is a module; an import names its declarations, as in `import ${i.path}.{Name}`")
+            else c.note(unit, i.span, s"unknown module `$module_name`")
+            continue
+        if !declared(c, i.path)
+            c.note(unit, i.span, s"module `$module_name` declares no `$name`")
+            continue
+        if !exported(c, i.path)
+            c.note(unit, i.span, s"`$name` is private to module `$module_name`")
+            continue
+        val local = qualified(own, i.binding)
+        if declared(c, local)
+            var companion = false
+            if c.class_types.get(local) is Some(k)
+                if c.classes[k].decl.object
+                    if c.class_types.get(i.path) is Some(j)
+                        if !c.classes[j].decl.object then companion = true
+            if companion then c.note(unit, i.span, s"`${i.binding}` is a class of module `$module_name`; its companion object is declared in the class's own module")
+            else c.note(unit, i.span, s"`${i.binding}` is imported and also declared in this module")
+            continue
+        if kept.get(i.binding) is Some(earlier)
+            c.note(unit, i.span, s"`${i.binding}` is already imported, from `$earlier`")
+            continue
+        kept.put(i.binding, i.path)
+    c.files[unit].imports = kept
+
+/** Checks a program: the core library's units, then the program's own, each heading its module's
+ * name in `file.module_name`. `root_module` is the module that must declare `main`, and the last
+ * unit is one of its files. Every file sees its own module's declarations, the names it imports and
+ * the core library's public declarations, in that order: an inner name hides an outer one. */
+check_program(units: Buf[SourceUnit], root_module: string) -> Checked
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module)
+    for u in 0..<c.units.len()
+        c.files.push(file_scope(&c, u))
     // Every type is named before any is used, so a data type may refer to itself or to one
-    // declared after it, and functions are declared once every type is known.
+    // declared after it, and functions are declared once every type is known. A class is named
+    // before any object, so an object finds its companion in any file of the module.
     for u in 0..<c.units.len()
         declare_types(&c, u)
+    for u in 0..<c.units.len()
+        declare_objects(&c, u)
     for u in 0..<c.units.len()
         declare_impls(&c, u)
     for u in 0..<c.units.len()
@@ -378,6 +495,8 @@ check_program(units: Buf[SourceUnit]) -> Checked
     c.pending = buf()
     for u in 0..<c.units.len()
         declare_globals(&c, u)
+    for u in 0..<c.units.len()
+        check_imports(&c, u)
     for _ in c.classes
         c.building.push(0)
         c.constructions.push(None)
@@ -391,18 +510,21 @@ check_program(units: Buf[SourceUnit]) -> Checked
     for id in 0..<c.classes.len()
         settle_inherited_fields(&c, id)
         check_override_results(&c, id)
+        check_class_variance(&c, id)
     check_initialization(&c)
     for id in 0..<c.data.len()
         check_data_implementations(&c, id)
+        check_data_variance(&c, id)
     for g in 0..<c.globals.len()
         settle_global(&c, g)
     val init = initializer(&c, initialization_order(&c))
-    val main_unit = c.units.len() - 1
+    var main_unit = c.units.len() - 1
     var entry: Option[usize] = None
-    c.scope.get("main") match
+    c.scope.get(qualified(root_module, "main")) match
         Some(ids) ->
-            if c.symbols[ids[0]].unit == main_unit then entry = Some(ids[0])
-            if ids.len() > 1 then c.note(main_unit, c.symbols[ids[1]].decl.name_span, "`main` cannot be overloaded")
+            entry = Some(ids[0])
+            main_unit = c.symbols[ids[0]].unit
+            if ids.len() > 1 then c.note(c.symbols[ids[1]].unit, c.symbols[ids[1]].decl.name_span, "`main` cannot be overloaded")
         None -> ()
     entry match
         Some(id) ->
@@ -430,34 +552,34 @@ check_program(units: Buf[SourceUnit]) -> Checked
 
 private declare_unit(c: *Checker, unit: usize)
     val file = c.units[unit].file
-    for item in file.items
-        item match
+    for i in 0..<file.items.len()
+        file.items[i] match
             FunctionItem(f) ->
-                // A unit's functions of a name hide an earlier unit's, so the program's own
-                // declarations shadow the prelude's; within one unit they overload one another.
+                // A module's functions of a name overload one another, in whichever of its files
+                // each is declared, and hide the core library's.
+                val key = qualified(file.module_name, f.name)
                 var set: Buf[usize] = buf()
-                if c.scope.get(f.name) is Some(ids)
+                if c.scope.get(key) is Some(ids)
                     for other in ids
-                        if c.symbols[other].unit == unit && !c.symbols[other].constructor then set.push(other)
+                        if !c.symbols[other].constructor then set.push(other)
                 val id = c.symbols.len()
-                val symbol = signature(c, unit, file.module_name, f, id, f.type_params, false)
+                var symbol = signature(c, unit, file.module_name, f, id, f.type_params, false)
+                symbol.public = !file.private_items[i]
                 if same_as_overload(c, symbol, set)
                     c.note(unit, f.name_span, s"`${f.name}` is declared more than once with the same parameter types; overloads differ in their parameter types, and a function that chooses by its arguments' values is written with clauses")
                     continue
-                if set.len() == 0 && c.variants.get(f.name) is Some(v)
-                    if c.data[v.data].unit == unit
-                        c.note(unit, f.name_span, s"`${f.name}` is already a variant of `${c.data[v.data].name}`")
-                if set.len() == 0 && c.class_types.get(f.name) is Some(k)
-                    if c.classes[k].unit == unit
-                        if c.classes[k].decl.object then c.note(unit, f.name_span, s"`${f.name}` is already an object")
-                        else c.note(unit, f.name_span, s"`${f.name}` is already a class, which is called to make one")
+                if set.len() == 0 && c.variants.get(key) is Some(v)
+                    c.note(unit, f.name_span, s"`${f.name}` is already a variant of `${c.data[v.data].name}`")
+                if set.len() == 0 && c.class_types.get(key) is Some(k)
+                    if c.classes[k].decl.object then c.note(unit, f.name_span, s"`${f.name}` is already an object")
+                    else c.note(unit, f.name_span, s"`${f.name}` is already a class, which is called to make one")
                 c.symbols.push(symbol)
                 c.states.push(0)
                 c.bodies.push(None)
                 c.locals.push(buf())
                 declare_defaults(c, id)
                 set.push(id)
-                c.scope.put(f.name, set)
+                c.scope.put(key, set)
                 if set.len() > 1 then mark_overloads(c, set)
             DataItem(_) -> ()
             ClassItem(_) -> ()
@@ -528,60 +650,63 @@ private restore_vars(c: *Checker, saved: Buf[Option[&Type]])
 
 private declare_types(c: *Checker, unit: usize)
     val file = c.units[unit].file
-    var seen: Map[string, Span] = map()
-    for item in file.items
-        if item is DataItem(d)
+    for i in 0..<file.items.len()
+        if file.items[i] is DataItem(d)
+            val key = qualified(file.module_name, d.name)
             if builtin_type(d.name) is Some(_)
                 c.note(unit, d.span, s"`${d.name}` is a built-in type, so it cannot be declared")
                 continue
-            if seen.get(d.name) is Some(_)
+            if c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_)
                 c.note(unit, d.span, s"the type `${d.name}` is declared more than once")
                 continue
-            seen.put(d.name, d.span)
+            if file.private_items[i] then c.private_names.put(key, true)
             for a in d.annotations
                 c.note(unit, a.span, s"unknown annotation `@${a.name}`")
             for t in d.derives
                 c.note(unit, t.span, "`derives` is not implemented")
-            c.types.put(d.name, c.data.len())
+            c.types.put(key, c.data.len())
             c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf(), buf(), buf(), buf(), buf()))
-    for item in file.items
-        if item is ClassItem(d)
+    for i in 0..<file.items.len()
+        if file.items[i] is ClassItem(d)
             if d.object then continue
+            val key = qualified(file.module_name, d.name)
             if builtin_type(d.name) is Some(_)
                 c.note(unit, d.name_span, s"`${d.name}` is a built-in type, so it cannot be declared")
                 continue
-            if seen.get(d.name) is Some(_)
+            if c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_)
                 c.note(unit, d.name_span, s"the type `${d.name}` is declared more than once")
                 continue
-            seen.put(d.name, d.span)
-            c.class_types.put(d.name, c.classes.len())
+            if file.private_items[i] then c.private_names.put(key, true)
+            c.class_types.put(key, c.classes.len())
             c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, None, None, buf(), buf(), 0))
-    // An object is a class with one instance. Named after a class of its module, it is that class's
-    // companion and its type has no name of its own; otherwise its name is also its type's.
-    var objects: Map[string, Span] = map()
-    for item in file.items
-        if item is ClassItem(d)
+
+// An object is a class with one instance. Named after a class of its module, in any of the module's
+// files, it is that class's companion and its type has no name of its own; otherwise its name is
+// also its type's. A class and its companion are one name, so a companion is private where its class
+// is.
+private declare_objects(c: *Checker, unit: usize)
+    val file = c.units[unit].file
+    for i in 0..<file.items.len()
+        if file.items[i] is ClassItem(d)
             if !d.object then continue
+            val key = qualified(file.module_name, d.name)
             if builtin_type(d.name) is Some(_)
                 c.note(unit, d.name_span, s"`${d.name}` is a built-in type, so it cannot be declared")
                 continue
-            if objects.get(d.name) is Some(_)
-                c.note(unit, d.name_span, s"the object `${d.name}` is declared more than once")
-                continue
-            objects.put(d.name, d.span)
             val id = c.classes.len()
             var companion: Option[usize] = None
-            if seen.get(d.name) is Some(_)
-                c.class_types.get(d.name) match
-                    Some(k) ->
-                        if c.classes[k].unit == unit && !c.classes[k].decl.object
-                            companion = Some(k)
-                            c.classes[k].companion = Some(id)
-                    None -> ()
-                if companion is None
-                    c.note(unit, d.name_span, s"`${d.name}` is already a data type; an object may share its name only with a class")
+            if c.class_types.get(key) is Some(k)
+                if c.classes[k].decl.object || c.classes[k].companion is Some(_)
+                    c.note(unit, d.name_span, s"the object `${d.name}` is declared more than once")
                     continue
-            else c.class_types.put(d.name, id)
+                companion = Some(k)
+                c.classes[k].companion = Some(id)
+            elif c.types.get(key) is Some(_)
+                c.note(unit, d.name_span, s"`${d.name}` is already a data type; an object may share its name only with a class")
+                continue
+            else
+                c.class_types.put(key, id)
+                if file.private_items[i] then c.private_names.put(key, true)
             c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, companion, None, buf(), buf(), 0))
 
 // Each impl's type and trait, resolved with the impl's type parameters in scope. They are the type's
@@ -618,16 +743,17 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
         _ -> buf()
     var owner = 0usize
     var home = ""
-    if c.types.get(path) is Some(id)
+    val key = resolve_name(c, unit, path)
+    if c.types.get(key) is Some(id)
         owner = data_owner(id)
         home = c.data[id].module_name
-    elif c.class_types.get(path) is Some(id)
+    elif c.class_types.get(key) is Some(id)
         if is_trait(c, id)
             c.note(unit, d.target.span, s"`$path` is a trait; an impl adds to a data type, a class, an object or a built-in type")
             return invalid
         owner = class_owner(id)
         home = c.classes[id].module_name
-    elif builtin_type(path) is Some(_) then home = c.units[0].file.module_name
+    elif builtin_type(path) is Some(_) then home = CoreModule
     else
         c.note(unit, d.target.span, s"unknown type `$path`")
         return invalid
@@ -733,7 +859,10 @@ private declare_variants(c: *Checker, unit: usize)
                         names.push("_")
                 if f.default is Some(e) then c.note(unit, e.span, "default field values are not implemented")
                 fields.push(resolve_type(c, unit, f.ty))
-            c.variants.put(v.name, VariantRef(id, variants.len()))
+            // A variant is a name of its type's module, private where its type is.
+            val key = qualified(c.data[id].module_name, v.name)
+            c.variants.put(key, VariantRef(id, variants.len()))
+            if c.private_names.get(qualified(c.data[id].module_name, c.data[id].name)) is Some(_) then c.private_names.put(key, true)
             variants.push(VariantSymbol(v.name, v.span, names, fields))
         c.data[id].variants = variants
         c.generic = outer_generic
@@ -758,8 +887,6 @@ private declare_fields(c: *Checker, unit: usize)
         for t in d.derives
             c.note(unit, t.span, "`derives` is not implemented")
         val declares_trait = is_trait(c, id)
-        for tp in d.type_params
-            if !(tp.variance is Invariant) && !declares_trait then c.note(unit, tp.span, "variance on a class's type parameters is not implemented")
         if declares_trait
             for m in d.members
                 m match
@@ -779,7 +906,7 @@ private declare_fields(c: *Checker, unit: usize)
         var traits: Buf[&Type] = buf()
         for i in 0..<d.parents.len()
             val parent = d.parents[i]
-            if parent_trait(c, parent) is Some(t)
+            if parent_trait(c, unit, parent) is Some(t)
                 if trait_type(c, unit, t, parent) is Some(ty)
                     var repeated = false
                     for other in traits
@@ -791,7 +918,7 @@ private declare_fields(c: *Checker, unit: usize)
             else
                 var is_class = false
                 if parent_name(parent) is Some(n)
-                    if c.class_types.get(n) is Some(_) then is_class = true
+                    if c.class_types.get(resolve_name(c, unit, n)) is Some(_) then is_class = true
                 if !is_class then c.note(unit, parent.span, s"`${parent_name(parent).unwrap_or("this")}` is not a trait")
                 elif declares_trait then c.note(unit, parent.span, "a trait may require only traits, not a class")
                 else c.note(unit, parent.span, "the superclass comes first after `:`, before the traits")
@@ -835,8 +962,8 @@ private is_trait(c: *Checker, k: usize) -> bool = c.classes[k].decl.modifier == 
 
 /** The trait a parent after `:` names, if it names one: `Shape`, `Source[int]`, or a mistaken
  * `Shape(…)`, which `trait_type` reports. */
-private parent_trait(c: *Checker, parent: &Expr) -> Option[usize]
-    val k = c.class_types.get(parent_name(parent)?)?
+private parent_trait(c: *Checker, unit: usize, parent: &Expr) -> Option[usize]
+    val k = c.class_types.get(resolve_name(c, unit, parent_name(parent)?))?
     if is_trait(c, k) then Some(k) else None
 
 /** The name a parent after `:` is written with, without its type or constructor arguments. */
@@ -884,10 +1011,11 @@ private superclass_of(c: *Checker, unit: usize, id: usize, parent: &Expr) -> Opt
         _ ->
             c.note(unit, parent.span, "expected a superclass, as in `Base(arguments)`")
             return None
-    val sid = c.class_types.get(name) match
+    val key = resolve_name(c, unit, name)
+    val sid = c.class_types.get(key) match
         Some(s) -> s
         None ->
-            if c.types.get(name) is Some(_) || builtin_type(name) is Some(_)
+            if c.types.get(key) is Some(_) || builtin_type(name) is Some(_)
                 c.note(unit, named.span, s"`$name` is not a class, so it cannot be extended")
             else c.note(unit, named.span, s"`$name` is neither a class nor a trait")
             return None
@@ -977,6 +1105,77 @@ ancestor_type(classes: Buf[ClassSymbol], data: Buf[DataSymbol], t: &Type, target
         if ancestor_type(classes, data, substitute(required, class_owner(k), args), target) is Some(found) then return Some(found)
     ancestor_type(classes, data, substitute(classes[k].superclass?, class_owner(k), args), target)
 
+// `x`, the type of a value, seen as the type `to`: what the value already is as an instance of
+// `to`'s class, trait, data type, tuple or function type, with no conversion. An instance of a
+// subclass is one of its superclass; an instance of a generic type is another instance of it where
+// each type argument follows the parameter's declared variance; a tuple's parts are covariant; a
+// function's parameters are contravariant and its result covariant. Where `x` is not such a view of
+// `to`, the result is `x` itself or a type that differs from `to`. Both types are solved.
+view_as(classes: Buf[ClassSymbol], data: Buf[DataSymbol], x: &Type, to: &Type) -> &Type = *to match
+    Class(k, name, ys) -> ancestor_type(classes, data, x, k) match
+        Some(up) -> *up match
+            Class(_, _, xs) -> Class(k, name, vary_args(classes, data, classes[k].decl.type_params, xs, ys))
+            _ -> up
+        None -> x
+    Data(d, name, ys) -> *x match
+        Data(e, _, xs) ->
+            if e != d then return x
+            Data(d, name, vary_args(classes, data, data[d].decl.type_params, xs, ys))
+        _ -> x
+    Tuple(ys) -> *x match
+        Tuple(xs) ->
+            if xs.len() != ys.len() then return x
+            var items: Buf[&Type] = buf()
+            for i in 0..<xs.len()
+                items.push(view_part(classes, data, xs[i], ys[i]))
+            Tuple(items)
+        _ -> x
+    Function(ys, s) -> *x match
+        Function(xs, r) ->
+            if xs.len() != ys.len() then return x
+            var params: Buf[&Type] = buf()
+            for i in 0..<xs.len()
+                params.push(view_contra(classes, data, xs[i], ys[i]))
+            Function(params, view_part(classes, data, r, s))
+        _ -> x
+    _ -> x
+
+// The type arguments `xs` seen as `ys`, one parameter's variance at a time.
+private vary_args(classes: Buf[ClassSymbol], data: Buf[DataSymbol], params: Buf[TypeParam], xs: Buf[&Type], ys: Buf[&Type]) -> Buf[&Type]
+    if xs.len() != ys.len() || xs.len() != params.len() then return xs
+    var out: Buf[&Type] = buf()
+    for i in 0..<xs.len()
+        val v = params[i].variance
+        if v is Covariant then out.push(view_part(classes, data, xs[i], ys[i]))
+        elif v is Contravariant then out.push(view_contra(classes, data, xs[i], ys[i]))
+        else out.push(xs[i])
+    out
+
+// A part in a covariant position: `x` seen as `to` where both are references, so the object `x`
+// describes is already the one `to` describes. A value of a value type differs in representation
+// from an `Any` or a trait, so it stays itself.
+private view_part(classes: Buf[ClassSymbol], data: Buf[DataSymbol], x: &Type, to: &Type) -> &Type
+    if conforms(x, to) && !(*x is Nothing) then return x
+    if !is_reference(x) then return x
+    if *to is AnyType then return AnyType
+    view_as(classes, data, x, to)
+
+// A part in a contravariant position: `to` where it may be seen as `x`, otherwise `x`.
+private view_contra(classes: Buf[ClassSymbol], data: Buf[DataSymbol], x: &Type, to: &Type) -> &Type
+    if conforms(x, to) && !(*x is Nothing) then return x
+    if conforms(view_part(classes, data, to, x), x) then to else x
+
+/** Whether a value of type `t` is a reference to an object, which every type it may be seen as
+ * shares: `Any`, a string, a tuple, a function, a data type, a class or a trait. */
+is_reference(t: &Type) -> bool = *t match
+    AnyType -> true
+    Str -> true
+    Tuple(_) -> true
+    Function(_, _) -> true
+    Data(_, _, _) -> true
+    Class(_, _, _) -> true
+    _ -> false
+
 /** Whether a field may be used from the code being checked: a public one, or a private one from
  * code of the class that declares it or of its companion. */
 private field_visible(c: *Checker, f: FieldSymbol) -> bool = f.public || inside_class(c, f.owner)
@@ -1043,8 +1242,8 @@ private declare_methods(c: *Checker, unit: usize)
         if k.unit != unit then continue
         val d = k.decl
         // A function of the same name was reported when it was declared.
-        if c.variants.get(d.name) is Some(v)
-            if c.data[v.data].unit == unit then c.note(unit, d.name_span, s"`${d.name}` is already a variant of `${c.data[v.data].name}`")
+        val key = qualified(module_name, d.name)
+        if c.variants.get(key) is Some(v) then c.note(unit, d.name_span, s"`${d.name}` is already a variant of `${c.data[v.data].name}`")
         val self_type = own_class_type(k, id)
         var params: Buf[Param] = buf()
         var types: Buf[&Type] = buf()
@@ -1067,7 +1266,7 @@ private declare_methods(c: *Checker, unit: usize)
         if !d.object
             var constructors: Buf[usize] = buf()
             constructors.push(constructor)
-            c.scope.put(d.name, constructors)
+            c.scope.put(key, constructors)
         c.classes[id].constructor = constructor
         c.classes[id].initializer = constructor
         if is_open(c, id)
@@ -1376,6 +1575,26 @@ private inherit_defaults(c: *Checker, m: usize, base: usize)
         copied.push(d)
     c.symbols[m].defaults = copied
 
+// A method a type inherits, from its superclass or as a trait's default body, that also implements
+// another trait's method keeps its own defaults, so a call omits the same arguments whichever type
+// it is made through only when the trait's method declares none or has the very same ones. The
+// reason it does not, when it does not; `remedy` says how the type replaces the method, which takes
+// the trait method's defaults where the inherited one has none.
+private defaults_conflict(c: *Checker, m: usize, base: usize, remedy: string) -> Option[string]
+    val from = c.symbols[base].defaults
+    val own = c.symbols[m].defaults
+    if from.len() != own.len() then return None
+    var brings = false
+    var same = true
+    var has = false
+    for i in 0..<from.len()
+        if from[i] is Some(_) then brings = true
+        if own[i] is Some(_) then has = true
+        if own[i] != from[i] then same = false
+    if !brings || same then return None
+    if !has then return Some(s"which has defaults `${c.symbols[m].name}` lacks; $remedy to take them")
+    Some("and their defaults differ; a method can take the defaults of only one")
+
 /** Whether a function is a method, whose first parameter is its receiver, `self`. */
 private is_method(symbol: FunctionSymbol) -> bool = (symbol.owner_class is Some(_) && !symbol.constructor) || symbol.receiver is Some(_)
 
@@ -1388,8 +1607,9 @@ is_abstract_method(symbol: FunctionSymbol) -> bool =
 // no parameters whose result is the value; an object's is its class's constructor.
 private declare_globals(c: *Checker, unit: usize)
     val file = c.units[unit].file
-    for item in file.items
-        item match
+    for i in 0..<file.items.len()
+        val key = qualified(file.module_name, item_name(file.items[i]))
+        file.items[i] match
             ValueItem(v) ->
                 if v.name == "_" || global_name_taken(c, unit, v.name, v.span, false) then continue
                 val f = Function(buf(), v.span, v.span, v.name, buf(), buf(), v.declared, Some(v.value), buf())
@@ -1398,7 +1618,8 @@ private declare_globals(c: *Checker, unit: usize)
                 c.states.push(0)
                 c.bodies.push(None)
                 c.locals.push(buf())
-                c.global_names.put(v.name, c.globals.len())
+                if file.private_items[i] then c.private_names.put(key, true)
+                c.global_names.put(key, c.globals.len())
                 c.globals.push(GlobalSymbol(unit, file.module_name, v.name, v.span, v.mutable, init, None))
             ClassItem(d) ->
                 if !d.object then continue
@@ -1408,32 +1629,39 @@ private declare_globals(c: *Checker, unit: usize)
                     if cls.unit == unit && cls.decl.object && cls.name == d.name && cls.global is None
                         if global_name_taken(c, unit, d.name, d.name_span, true) then break
                         c.classes[k].global = Some(c.globals.len())
-                        c.global_names.put(d.name, c.globals.len())
+                        c.global_names.put(key, c.globals.len())
                         c.globals.push(GlobalSymbol(unit, file.module_name, d.name, d.name_span, false, cls.constructor, Some(k)))
             _ -> ()
 
-// Whether a module-level value's name is already declared in its file, reporting it if so. An
+/** The name a top-level declaration introduces: "" for an impl, which introduces none. */
+private item_name(item: Item) -> string = item match
+    FunctionItem(f) -> f.name
+    DataItem(d) -> d.name
+    ClassItem(d) -> d.name
+    ImplItem(_) -> ""
+    ValueItem(v) -> v.name
+
+// Whether a module-level value's name is already declared in its module, reporting it if so. An
 // object's clashes with a class, a function or a variant were reported with its class, so only its
 // clash with a module value is reported here.
 private global_name_taken(c: *Checker, unit: usize, name: string, at: Span, object: bool) -> bool
-    if c.global_names.get(name) is Some(g)
-        if c.globals[g].unit == unit
-            c.note(unit, at, s"`$name` is declared more than once")
-            return true
+    val key = qualified(c.units[unit].file.module_name, name)
+    if c.global_names.get(key) is Some(_)
+        c.note(unit, at, s"`$name` is declared more than once")
+        return true
     if object then return false
-    if c.class_types.get(name) is Some(k)
-        if c.classes[k].unit == unit && !c.classes[k].decl.object && c.classes[k].companion is None
+    if c.class_types.get(key) is Some(k)
+        if !c.classes[k].decl.object && c.classes[k].companion is None
             c.note(unit, at, s"`$name` is already a class")
             return true
-    if c.scope.get(name) is Some(ids)
+    if c.scope.get(key) is Some(ids)
         for f in ids
-            if c.symbols[f].unit == unit && !c.symbols[f].constructor
+            if !c.symbols[f].constructor
                 c.note(unit, at, s"`$name` is already a function")
                 return true
-    if c.variants.get(name) is Some(v)
-        if c.data[v.data].unit == unit
-            c.note(unit, at, s"`$name` is already a variant of `${c.data[v.data].name}`")
-            return true
+    if c.variants.get(key) is Some(v)
+        c.note(unit, at, s"`$name` is already a variant of `${c.data[v.data].name}`")
+        return true
     false
 
 /** The method of class `id` declared as `name`, its own. */
@@ -1916,6 +2144,10 @@ private build_data_table(c: *Checker, id: usize, conformed: Buf[usize])
                 if bodies.len() > 1 && !contains_name(reported, key)
                     reported.push(key)
                     report_conformance(c, id, t, s"`$name_of` inherits two implementations of `$name`, `${c.symbols[bodies[0]].name}` and `${c.symbols[bodies[1]].name}`; implement it in an impl")
+                elif bodies.len() == 1 && chosen != methods[j] && !contains_name(reported, key)
+                    if defaults_conflict(c, chosen, methods[j], s"implement `$name` in an impl") is Some(text)
+                        reported.push(key)
+                        report_conformance(c, id, t, s"`${c.symbols[chosen].name}` implements `${c.symbols[methods[j]].name}` for `$name_of`, $text")
             table.set(c.classes[t].base + j, Some(chosen))
     c.data[id].table = table
     for entry in table
@@ -2120,6 +2352,98 @@ private overrides_matches(c: *Checker, id: usize, m: usize, target: usize) -> bo
 // A trait's method may also be implemented by a method the class inherits, from its superclass or
 // as another trait's default; that one takes the trait method's parameters and yields its result
 // as the class sees them both.
+// A class's or trait's `+T` appears only where a value of `T` is read out: a method's result, an
+// immutable field, a parent's covariant argument. A `-T` appears only where one is passed in: a
+// method's parameter. A mutable field is read and written, so neither may appear in it. Private
+// members are checked like public ones, since a method of the instance seen at a wider type reads
+// and writes them too. The receiver is the instance itself and is not checked.
+private check_class_variance(c: *Checker, id: usize)
+    val k = c.classes[id]
+    val params = k.decl.type_params
+    var variant = false
+    for tp in params
+        if !(tp.variance is Invariant) then variant = true
+    if !variant then return
+    val owner = class_owner(id)
+    val at = k.decl.name_span
+    if k.superclass is Some(sup) then variance_in(c, k.unit, params, owner, sup, 1, at, s"the superclass ${type_name(sup)}")
+    for t in k.traits
+        variance_in(c, k.unit, params, owner, t, 1, at, s"the trait ${type_name(t)}")
+    for i in k.inherited..<k.fields.len()
+        val f = k.fields[i]
+        val ty = f.ty.unwrap_or(ErrorType)
+        if f.mutable then variance_in(c, k.unit, params, owner, ty, 0, f.span, s"the mutable field `${f.name}`")
+        else variance_in(c, k.unit, params, owner, ty, 1, f.span, s"the field `${f.name}`")
+    for m in k.methods
+        val symbol = c.symbols[m]
+        val name = symbol.decl.name
+        for j in 1..<symbol.params.len()
+            val span = if j - 1 < symbol.decl.params.len() then symbol.decl.params[j - 1].span else symbol.decl.name_span
+            val pname = if j < symbol.param_names.len() then symbol.param_names[j] else "_"
+            variance_in(c, k.unit, params, owner, symbol.params[j], -1, span, s"the parameter `$pname` of `$name`")
+        val result_span = symbol.decl.result match
+            Some(r) -> r.span
+            None -> symbol.decl.name_span
+        variance_in(c, k.unit, params, owner, symbol.result.unwrap_or(ErrorType), 1, result_span, s"the result of `$name`")
+        // A bound on a method's own type parameter limits what a caller passes in, as a parameter
+        // type does.
+        for j in params.len()..<symbol.type_params.len()
+            val tp = symbol.type_params[j]
+            for b in bounds_at(c, owner, symbol.type_params, j)
+                variance_in(c, k.unit, params, owner, b, -1, tp.span, s"the bound of `${tp.name}` in `$name`")
+
+// A data type's fields are immutable, so a `+T` may appear in them and a `-T` may not; the traits
+// its impls make it conform to are parents, whose arguments follow their own variance.
+private check_data_variance(c: *Checker, id: usize)
+    val d = c.data[id]
+    val params = d.decl.type_params
+    var variant = false
+    for tp in params
+        if !(tp.variance is Invariant) then variant = true
+    if !variant then return
+    val owner = data_owner(id)
+    for v in d.variants
+        for i in 0..<v.fields.len()
+            val name = if i < v.field_names.len() then v.field_names[i] else "_"
+            variance_in(c, d.unit, params, owner, v.fields[i], 1, v.span, s"the field `$name` of `${v.name}`")
+    for t in d.traits
+        variance_in(c, d.unit, params, owner, t, 1, d.decl.span, s"the trait ${type_name(t)}")
+
+// Reports the first type parameter of `owner` that `t` names in a position its variance forbids.
+// `polarity` is 1 where a value is read out, -1 where one is passed in, 0 where both happen; it flips
+// through a function type's parameters and follows each generic type's declared variance.
+private variance_in(c: *Checker, unit: usize, params: Buf[TypeParam], owner: usize, t: &Type, polarity: i32, at: Span, place: string) -> bool
+    *t match
+        TypeVar(o, i, name) ->
+            if o != owner || i >= params.len() then return true
+            val v = params[i].variance
+            val ok = if v is Covariant then polarity == 1 elif v is Contravariant then polarity == -1 else true
+            if ok then return true
+            val kind = if v is Covariant then "covariant" else "contravariant"
+            val sign = if v is Covariant then "+" else "-"
+            val position = if polarity == 1 then "a covariant" elif polarity == -1 then "a contravariant" else "an invariant"
+            c.note(unit, at, s"the $kind type parameter `$sign$name` appears in $position position, $place")
+            false
+        Tuple(items) ->
+            for item in items
+                if !variance_in(c, unit, params, owner, item, polarity, at, place) then return false
+            true
+        Function(ps, r) ->
+            for p in ps
+                if !variance_in(c, unit, params, owner, p, -polarity, at, place) then return false
+            variance_in(c, unit, params, owner, r, polarity, at, place)
+        ByName(inner) -> variance_in(c, unit, params, owner, inner, polarity, at, place)
+        Data(d, _, args) -> variance_args(c, unit, params, owner, c.data[d].decl.type_params, args, polarity, at, place)
+        Class(k, _, args) -> variance_args(c, unit, params, owner, c.classes[k].decl.type_params, args, polarity, at, place)
+        _ -> true
+
+private variance_args(c: *Checker, unit: usize, params: Buf[TypeParam], owner: usize, declared: Buf[TypeParam], args: Buf[&Type], polarity: i32, at: Span, place: string) -> bool
+    for i in 0..<args.len()
+        val v = if i < declared.len() then declared[i].variance else Invariant
+        val p = if v is Covariant then polarity elif v is Contravariant then -polarity else 0
+        if !variance_in(c, unit, params, owner, args[i], p, at, place) then return false
+    true
+
 private check_override_results(c: *Checker, id: usize)
     val k = c.classes[id]
     if is_trait(c, id)
@@ -2156,6 +2480,7 @@ private check_override_results(c: *Checker, id: usize)
                 if param_mismatch(c, own_class_type(c.classes[id], id), m, base) is Some(text)
                     c.note(k.unit, at, s"$described for `${k.name}`, $text")
                     continue
+                if defaults_conflict(c, m, base, s"override `${c.symbols[m].decl.name}`") is Some(text) then c.note(k.unit, at, s"$described for `${k.name}`, $text")
             if result_mismatch(c, own_class_type(c.classes[id], id), m, base) is Some(text)
                 c.note(k.unit, at, s"$described, $text")
 
@@ -2531,7 +2856,7 @@ private mentions_self(c: *Checker, k: usize, depth: usize) -> bool
             AbstractFieldMember(f) -> if names_self(f.declared) then return true
             _ -> ()
     for parent in c.classes[k].decl.parents
-        if parent_trait(c, parent) is Some(t)
+        if parent_trait(c, c.classes[k].unit, parent) is Some(t)
             if mentions_self(c, t, depth + 1) then return true
     false
 
@@ -2568,7 +2893,8 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
             if c.self_trait is Some(k) then return TypeVar(self_owner(k), 0, "Self")
             c.note(unit, t.span, "`Self` is the type implementing a trait, so it is written only in a trait's methods")
             return ErrorType
-        if c.types.get(path) is Some(id)
+        val key = resolve_name(c, unit, path)
+        if c.types.get(key) is Some(id)
             val d = c.data[id]
             var resolved: Buf[&Type] = buf()
             for a in args
@@ -2578,7 +2904,7 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                 return ErrorType
             check_type_args(c, unit, t.span, s"`$path`", data_owner(id), d.decl.type_params, resolved)
             return Data(id, d.name, resolved)
-        if c.class_types.get(path) is Some(id)
+        if c.class_types.get(key) is Some(id)
             val k = c.classes[id]
             var resolved: Buf[&Type] = buf()
             for a in args
@@ -2598,7 +2924,7 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                     return ErrorType
                 ty
             None ->
-                c.variants.get(path) match
+                c.variants.get(key) match
                     Some(v) -> c.note(unit, t.span, s"`$path` is a variant of `${c.data[v.data].name}`, not a type")
                     None -> c.note(unit, t.span, s"unknown type `$path`")
                 ErrorType
@@ -2979,7 +3305,20 @@ private lookup_functions(c: *Checker, name: string) -> Buf[usize]
             for k in c.body.function_starts[i]..<i + 1
                 if c.symbols[c.body.functions[k]].name == name then found.push(c.body.functions[k])
             return found
-    c.scope.get(name).unwrap_or(found)
+    top_level_functions(c, unit_of(c), name)
+
+// The top-level functions a bare name refers to in a file: those of the module it resolves to, and
+// of another module only the public ones.
+private top_level_functions(c: *Checker, unit: usize, name: string) -> Buf[usize]
+    var found: Buf[usize] = buf()
+    val key = resolve_name(c, unit, name)
+    val ids = c.scope.get(key) match
+        Some(ids) -> ids
+        None -> return found
+    if key == qualified(c.files[unit].module_name, name) then return ids
+    for id in ids
+        if c.symbols[id].public then found.push(id)
+    found
 
 /** The innermost function a name refers to, when it refers to any. */
 private lookup_function(c: *Checker, name: string) -> Option[usize]
@@ -3231,7 +3570,7 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
     if lookup_function(c, name) is Some(id)
         if abstract_constructor(c, id, at) then return TExpr(at, ErrorType, UnitConst)
         return named_function_value(c, at, name, None, expected)
-    if c.variants.get(name) is Some(v)
+    if variant_named(c, name) is Some(v)
         if c.data[v.data].variants[v.index].fields.len() == 0 then return construct(c, at, at, v, buf(), None, expected)
         c.note(symbol.unit, at, s"`$name` has fields; call it, as in `$name(…)`")
     else c.note(symbol.unit, at, s"`$name` is not defined")
@@ -3470,7 +3809,7 @@ private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], 
             if abstract_constructor(c, id, target.span) then return TExpr(e.span, ErrorType, UnitConst)
             return named_function_value(c, e.span, name, Some(types), expected)
         if lookup_local(c, name) is None && param_index(c, name) is None
-            if c.variants.get(name) is Some(v)
+            if variant_named(c, name) is Some(v)
                 if c.data[v.data].variants[v.index].fields.len() == 0
                     return construct(c, e.span, target.span, v, buf(), Some(types), expected)
     // A method named without a call, with its own type arguments, as in `box.convert[int]`.
@@ -3771,14 +4110,13 @@ private update_field(c: *Checker, e: &Expr, target: &Expr, increment: bool, post
     place.wrap(e.span, TExpr(e.span, ty, Block(items)))
 
 // A module-level value or object named by a bare name, unless a local function of that name hides
-// it or a function of a later file, the program's own over the prelude, shadows it.
+// it or a declaration of a nearer module, the file's own over the core library's, shadows it.
 private global_named(c: *Checker, name: string) -> Option[usize]
     if local_function(c, name) is Some(_) then return None
-    val g = c.global_names.get(name)?
-    if c.scope.get(name) is Some(ids)
-        for f in ids
-            if c.symbols[f].unit > c.globals[g].unit then return None
-    Some(g)
+    c.global_names.get(resolve_name(c, unit_of(c), name))
+
+/** The variant a bare name refers to in the code being checked, if it refers to one. */
+private variant_named(c: *Checker, name: string) -> Option[VariantRef] = c.variants.get(resolve_name(c, unit_of(c), name))
 
 // A module-level value's type is its initializer's result: declared, or inferred by checking the
 // initializer first, which is not possible while that initializer is itself being checked.
@@ -4335,56 +4673,70 @@ private join_expected(c: *Checker, a: &Type, b: &Type, expected: Option[&Type]) 
     if fits(c, a, want) && fits(c, b, want) then Some(want) else None
 
 // The type two branches agree on, where one that never finishes agrees with anything.
-// Two instances of classes agree on their nearest common ancestor.
+// Two instances of classes agree on their nearest common ancestor, and two instances of one generic
+// type on the instance whose covariant arguments are their arguments' agreement.
 private join(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
     if *a is Nothing || *a is ErrorType then return Some(b)
     if *b is Nothing || *b is ErrorType then return Some(a)
     if same_type(a, b) then return Some(a)
     var current = zonk(c, a)
+    if *current is Data(_, _, _) then return join_args(c, current, zonk(c, b))
     loop
         val k = *current match
             Class(k, _, args) -> k
             _ -> return None
         if ancestor_type(c.classes, c.data, zonk(c, b), k) is Some(up)
             if same_type(up, current) then return Some(current)
+            if join_args(c, current, up) is Some(t) then return Some(t)
         current = ancestor_parent(c, current)?
     None
+
+// The instance of one generic type that two of its instances agree on: equal invariant arguments,
+// and covariant arguments that are references agreeing on a type.
+private join_args(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
+    val (params, xs, ys) = *a match
+        Data(d, _, xs) -> *b match
+            Data(e, _, ys) -> if d == e then (c.data[d].decl.type_params, xs, ys) else return None
+            _ -> return None
+        Class(k, _, xs) -> *b match
+            Class(j, _, ys) -> if k == j then (c.classes[k].decl.type_params, xs, ys) else return None
+            _ -> return None
+        _ -> return None
+    if xs.len() != ys.len() || xs.len() != params.len() then return None
+    var args: Buf[&Type] = buf()
+    for i in 0..<xs.len()
+        if same_type(xs[i], ys[i])
+            args.push(xs[i])
+            continue
+        if !(params[i].variance is Covariant) || !is_reference(xs[i]) || !is_reference(ys[i]) then return None
+        args.push(join(c, xs[i], ys[i])?)
+    *a match
+        Data(d, name, _) -> Some(Data(d, name, args))
+        Class(k, name, _) -> Some(Class(k, name, args))
+        _ -> None
 
 /** The superclass of an instance's class, as the instance's type, if it has one. */
 private ancestor_parent(c: *Checker, t: &Type) -> Option[&Type] = *t match
     Class(k, _, args) -> Some(substitute(c.classes[k].superclass?, class_owner(k), args))
     _ -> None
 
-/** `from` as an instance of the class `to` names, when `from` is an instance of one of that class's
- * subclasses; otherwise `from` itself. */
+/** `from` as the type `to` asks for, where a value of `from` is one of `to` (see `view_as`);
+ * otherwise `from` itself, or a type that differs from `to`. */
 private upcast(c: *Checker, from: &Type, to: &Type) -> &Type
     val x = zonk(c, from)
-    // Every value converts to `Any`, by boxing where it is written; never inside a tuple, whose
-    // parts are already laid out.
+    // Every value converts to `Any`, by boxing where it is written; never inside a tuple or as a
+    // type argument, whose parts are already laid out.
     if *zonk(c, to) is AnyType && !(*x is Var(_) || *x is ByName(_)) then return AnyType
-    upcast_part(c, x, to)
-
-private upcast_part(c: *Checker, x: &Type, to: &Type) -> &Type
-    *zonk(c, to) match
-        Class(k, _, _) ->
-            // A value of a type parameter is an instance of its bounds.
-            if *x is TypeVar(_, _, _)
-                for b in bounds_of(c, x)
-                    if ancestor_type(c.classes, c.data, b, k) is Some(up) then return up
-                return x
-            ancestor_type(c.classes, c.data, x, k).unwrap_or(x)
-        Tuple(ys) -> *x match
-            Tuple(xs) ->
-                if xs.len() != ys.len() then return x
-                var items: Buf[&Type] = buf()
-                for i in 0..<xs.len()
-                    items.push(upcast_part(c, zonk(c, xs[i]), ys[i]))
-                Tuple(items)
-            _ -> x
-        _ -> x
+    // A value of a type parameter is an instance of its bounds.
+    if *x is TypeVar(_, _, _)
+        if *zonk(c, to) is Class(k, _, _)
+            for b in bounds_of(c, x)
+                if ancestor_type(c.classes, c.data, b, k) is Some(_) then return view_as(c.classes, c.data, b, zonk(c, to))
+    view_as(c.classes, c.data, x, zonk(c, to))
 
 /** Whether a value of type `from` may be used where `to` is expected: an instance of a subclass is an
- * instance of its superclass, also inside a tuple. */
+ * instance of its superclass, and an instance of a generic type one of another instance as its
+ * parameters' variance allows, also inside a tuple or a function type. */
 private fits(c: *Checker, from: &Type, to: &Type) -> bool = conforms(upcast(c, from, to), to)
 
 private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[&Expr], expected: Option[&Type], used: bool) -> &TExpr
@@ -4576,7 +4928,7 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
             return TExpr(at, ErrorType, UnitConst)
         return value_call(c, at, callee, args)
     if ids.len() == 0
-        if c.variants.get(name) is Some(v)
+        if variant_named(c, name) is Some(v)
             if c.data[v.data].variants[v.index].fields.len() == 0
                 c.note(unit, at, s"`$name` has no fields; write it without parentheses")
                 for a in args
@@ -5750,7 +6102,7 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
         InvalidPattern -> TPattern(p.span, ErrorType, PWildcard)
         Name(name) ->
             // A bare name is a variant with no fields when one is in scope, and otherwise binds.
-            if c.variants.get(name) is Some(v)
+            if variant_named(c, name) is Some(v)
                 if c.data[v.data].variants[v.index].fields.len() > 0
                     c.note(unit, p.span, s"`$name` has fields; match them, as in `$name(…)`")
                     return TPattern(p.span, ErrorType, PWildcard)
@@ -5812,7 +6164,7 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
             for o in options
                 typed.push(check_pattern(c, o, ty, if no_bind == "" then "alternatives bind no names; write `_` for a value that is not used" else no_bind))
             TPattern(p.span, ty, PAlternatives(typed))
-        Constructor(path, args) -> c.variants.get(path) match
+        Constructor(path, args) -> variant_named(c, path) match
             Some(v) -> variant_pattern(c, p, v, args, ty, no_bind)
             None ->
                 c.note(unit, p.span, s"`$path` is not a variant")
@@ -5884,6 +6236,10 @@ private may_match(c: *Checker, from: &Type, to: &Type) -> bool
     val x = zonk(c, from)
     val y = zonk(c, to)
     if fits(c, x, y) || *x is AnyType || *x is TypeVar(_, _, _) || *y is TypeVar(_, _, _) then return true
+    // A value of a generic type may be an instance whose arguments are subtypes of the static ones,
+    // or, for a contravariant parameter, supertypes.
+    if !(*y is AnyType) && fits(c, y, x) then return true
+    if variant_instances(c, x, y) then return true
     *x match
         Class(k, _, _) -> *y match
             Class(j, _, _) ->
@@ -5900,11 +6256,29 @@ private may_match(c: *Checker, from: &Type, to: &Type) -> bool
             _ -> false
         _ -> false
 
+// Whether two instances of one generic type may describe one value: their invariant arguments are
+// equal, and their other arguments are references that may describe one value.
+private variant_instances(c: *Checker, x: &Type, y: &Type) -> bool
+    val (params, xs, ys) = *x match
+        Data(d, _, xs) -> *y match
+            Data(e, _, ys) -> if d == e then (c.data[d].decl.type_params, xs, ys) else return false
+            _ -> return false
+        Class(k, _, xs) -> *y match
+            Class(j, _, ys) -> if k == j then (c.classes[k].decl.type_params, xs, ys) else return false
+            _ -> return false
+        _ -> return false
+    if xs.len() != ys.len() || xs.len() != params.len() then return false
+    for i in 0..<xs.len()
+        if same_type(xs[i], ys[i]) then continue
+        if params[i].variance is Invariant || !is_reference(xs[i]) || !is_reference(ys[i]) then return false
+        if !may_match(c, xs[i], ys[i]) && !may_match(c, ys[i], xs[i]) then return false
+    true
+
 // The local a comparison or `n + k` pattern binds: none for `_`. A name that is a variant is not a
 // binder there.
 private binder_local(c: *Checker, binder: &Pattern, ty: &Type, no_bind: string) -> Option[usize] = binder.kind match
     Name(name) ->
-        if c.variants.get(name) is Some(_)
+        if variant_named(c, name) is Some(_)
             c.note(unit_of(c), binder.span, s"`$name` is a variant; a comparison binds a name or `_`")
             return None
         if no_bind != ""

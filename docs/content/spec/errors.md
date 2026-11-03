@@ -1,7 +1,7 @@
 ---
 title: Errors
 summary: Recoverable failure is a value; a bug is a trap. No exceptions, no null.
-weight: 16
+weight: 17
 ---
 
 Avin uses Sysl's model. There are no exceptions.

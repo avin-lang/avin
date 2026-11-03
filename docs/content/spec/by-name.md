@@ -1,7 +1,7 @@
 ---
 title: Call-by-name
 summary: Parameters written value -> T are evaluated on each use, never at the call and never cached.
-weight: 20
+weight: 21
 ---
 
 A parameter declared `value: -> T` takes an expression that is **not** evaluated at the call. Each

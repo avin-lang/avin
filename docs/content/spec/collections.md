@@ -1,7 +1,7 @@
 ---
 title: Collections
 summary: A rich collection library without higher-kinded types, where Iterator is Iterable and arrays are ordinary collections.
-weight: 17
+weight: 18
 ---
 
 The standard library's collections are a rich, immutable-by-default family with shared operation
