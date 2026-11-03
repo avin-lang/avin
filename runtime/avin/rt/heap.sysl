@@ -5,8 +5,10 @@ import sysl.env
 import sysl.raw.ptr_cast
 
 // The collected heap. Objects are allocated by compiled code through `avin_rt_alloc` and found by
-// the collector through the shadow stack: every function that holds references links a frame of
-// them into `top` while it runs, so the roots are exact and nothing is ever scanned.
+// the collector through the shadow stacks: every thread has a context, which compiled code receives
+// as a hidden first argument, and every function that holds references links a frame of them into
+// its thread's context while it runs, so the roots are exact and nothing is ever scanned. A
+// collection walks the frames of every attached context.
 //
 // The heap is one block reserved at startup, `AVIN_HEAP_LIMIT` bytes or 8 GiB. The operating system
 // commits its pages only as they are first touched, so the reservation costs nothing until it is
@@ -17,6 +19,14 @@ import sysl.raw.ptr_cast
 struct Frame
     prev: *Frame
     count: usize
+
+/** One thread's state. Compiled code passes it to every function and every runtime entry point, and
+ * reads and writes `top`, its first word, directly: a function sets `top` to its own frame on entry
+ * and back to its caller's on return. */
+struct Context
+    top: *Frame
+    /** The next attached context. */
+    next: *Context
 
 /** A variant's layout, emitted by the compiler as constant data. `refs` byte offsets of the fields
  * that hold references follow this header. Every object's first word is its descriptor. */
@@ -41,7 +51,9 @@ private heap_limit() -> usize
         n = n * 10 + usize(b - u8('0'))
     if n < 4096 then 4096 else n
 
-var top: *Frame = null
+var main_context: Context = Context(null, null)
+/** Every attached context, whose frames are the roots of a collection. */
+var contexts: *Context = null
 var block: []u8 = [0u8; heap_limit()]
 var space: gc.Heap = gc.heap(&block[0], block.len)
 var low: usize = usize(&block[0])
@@ -69,40 +81,57 @@ private trace(p: *u8, h: *gc.Heap)
 var kind: gc.Kind = gc.Kind(&trace, null, null, null)
 
 private roots(h: *gc.Heap)
-    var f = top
-    while f != null
-        val slots: **u8 = ptr_cast(usize(f) + sizeof(Frame))
-        for i in 0..<f.count
-            mark_ref(h, slots[i])
-        f = f.prev
+    var c = contexts
+    while c != null
+        var f = c.top
+        while f != null
+            val slots: **u8 = ptr_cast(usize(f) + sizeof(Frame))
+            for i in 0..<f.count
+                mark_ref(h, slots[i])
+            f = f.prev
+        c = c.next
+
+/** Makes `c`'s frames roots of every collection from now on. A thread attaches its context before it
+ * runs compiled code. */
+attach(c: *Context)
+    c.next = contexts
+    contexts = c
+
+/** Stops treating `c`'s frames as roots. A thread detaches its context when it has finished running
+ * compiled code, with no frame left on it. */
+detach(c: *Context)
+    if contexts == c
+        contexts = c.next
+        return
+    var p = contexts
+    while p != null
+        if p.next == c
+            p.next = c.next
+            return
+        p = p.next
 
 // After a collection the next one waits until as much has been allocated as survived, so the heap
 // stays within about twice what is live and collecting costs in proportion to what is allocated.
-private collect_now()
+collect_now()
     gc.collect(&space, &roots)
     since = 0
     val live = gc.live_size(&space)
     budget = if live > Floor then live else Floor
 
-/** Links a function's frame onto the shadow stack. */
-@export("avin_rt_enter")
-enter(f: *Frame)
-    f.prev = top
-    top = f
-
-/** Unlinks a function's frame as it returns. */
-@export("avin_rt_leave")
-leave(f: *Frame)
-    top = f.prev
+/** The main thread's context, attached, for the program's entry function. */
+@export("avin_rt_start")
+start() -> *Context
+    attach(&main_context)
+    &main_context
 
 /** A new object laid out by `d`: its first word is `d`, the rest zero. */
 @export("avin_rt_alloc")
-allocate(d: *Descriptor) -> *u8 = allocate_sized(d, d.size)
+allocate(ctx: *Context, d: *Descriptor) -> *u8 = allocate_sized(ctx, d, d.size)
 
 /** A new object of `size` bytes whose first word is `d` and the rest zero, for an object whose size
  * is not its descriptor's, such as a string, whose bytes follow its header. Allocating may collect,
- * so every reference the caller still needs must be a root. */
-allocate_sized(d: *Descriptor, size: usize) -> *u8
+ * so every reference the caller still needs must be a root. `ctx` is the allocating thread's. */
+allocate_sized(ctx: *Context, d: *Descriptor, size: usize) -> *u8
     if stress || since >= budget then collect_now()
     var p = gc.alloc(&space, size, &kind)
     if p == null

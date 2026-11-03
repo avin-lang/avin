@@ -48,6 +48,13 @@ live outside the heap, and the collector leaves them alone. `AVIN_GC_STRESS=1` m
 allocation collect first, and the execution tests run that way, so a reference the compiler failed
 to root is found at the first allocation that could lose it.
 
+Programs are multi-threaded, so the runtime keeps no per-thread state in globals. Each thread has a
+**context**, and every compiled function, closure entry and runtime entry point takes the running
+thread's context as a hidden first argument. A function that holds references links its frame of
+roots onto its thread's shadow stack by writing the context's first word directly, on entry and on
+every return, without calling the runtime. A collection walks the frames of every attached
+context; the main thread's is attached before the program's entry function runs.
+
 ## Standard library
 
 `library/` holds Avin source under the module root `avin`, starting with the prelude every program
@@ -62,6 +69,7 @@ Each is declared in Avin source with `@intrinsic("…")` and has no body. Everyt
 
 - **Compiler unit tests** use Sysl's runner, one file per stage or feature. Parser tests compare a
   compact rendering of the tree: `1 + 2 * 3` shows as `(+ 1 (* 2 3))`.
+- **Runtime tests** are the runtime package's own Sysl tests, which the compiler's tests run.
 - **Execution tests** are Avin programs in `tests/run/`, compiled and run at `-O0` and `-O2`. A
   program's leading `// expect: exit N` or `// expect: trap` says how it ends (exit 0 when it says
   neither), and `NAME.out` and `NAME.err` beside it hold the output it must write.
