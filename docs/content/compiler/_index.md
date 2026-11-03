@@ -107,6 +107,25 @@ field, with a generated method that loads the field, so a read through the trait
 and a read through the class is the field load. A trait-typed value is a plain
 reference to the object, so an upcast from a class to a trait, and from a trait to one it requires,
 is free; a call through a final class's type, even of a method it inherits from a trait, is direct.
+A trait's method declared `override` replaces the default of a required trait's method: it takes no
+position of its own (`trait_slot` of it is the overridden method's), and among the bodies a class
+or data type inherits under one name, one that another of them overrides, through a chain of trait
+overrides, is dropped before two remaining bodies are reported as a conflict.
+
+A method with type parameters of its own, a trait's or an overridable class method, holds a
+position in the checker's tables like any other, but no one function fills it: each list of its own
+type arguments is a different function. Lowering leaves its position empty and gives the method a
+slot past `generic_base`, the length of the longest table any type has, for each list of own type
+arguments a call through a table uses, keyed by the checker position, the name and those
+arguments. A slot is made when lowering first meets such a call, and filled in the descriptor of
+every type whose table holds a method of that name and arity at that position, with the type's
+implementation instantiated at the type's arguments followed by the call's; a descriptor made later
+is filled in every slot already made. The descriptors are emitted only after the worklist is
+empty, so every slot the program uses is in every table that needs it. Two unrelated methods
+sharing a position and arguments share a slot, which is safe, since no type holds both. Comparing
+two such methods' signatures renames each one's own type parameters by position to
+`method_params_owner()`, so an override with a type parameter of another name still matches.
+
 A trait has a constructor symbol, so instantiating one is reported as for an abstract class, and it
 is never compiled.
 
