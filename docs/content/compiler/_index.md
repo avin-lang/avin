@@ -61,6 +61,19 @@ arguments as generic functions are, and a field's type at a particular instance 
 type with the receiver's type arguments substituted. A call of a method of a final class is a
 direct call.
 
+An `object` is an instance of a class of its own, kept apart from its companion class's: its
+constructor and methods are separate functions, and its layout and descriptor are its own. Each
+module-level `val`, `var` and object is a **global** of the program, and its initializer is
+checked as a function with no parameters whose result is the value; an object's initializer is its
+constructor. The checker records what each initializer reads, following every function it calls and
+every lambda it makes, orders the globals so that each comes after what it reads, keeping
+declaration order where nothing decides, and reports a cycle by its chain. The order becomes one
+function, `<init>`, that stores each initializer's result into its global; `main` in the emitted
+program calls it before the program's entry function. A global that holds a reference is a slot of
+one frame, `@avin.roots`, laid out as a function's shadow-stack frame is, which `main` hands to the
+runtime before anything is stored in it; every collection walks it beside the threads' frames. A
+global of any other type is an LLVM global of its own. All start zero.
+
 A trap stops the program with one line on standard error naming what failed and where:
 
 ```text

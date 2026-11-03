@@ -111,20 +111,28 @@ private struct Lowering
      * of one operation share a block and different operations never do. */
     trap_blocks: Map[usize, usize]
     returns_value: bool
+    /** The machine type of each module-level value, or `None` for one with no runtime value. */
+    global_types: Buf[Option[MirType]]
 
 // Every function that is not generic is compiled once; each generic function is compiled for each
 // list of type arguments a compiled call gives it, as those calls are found.
 lower_program(program: TProgram) -> MirProgram
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false)
+    var global_types: Buf[Option[MirType]] = buf()
+    for g in program.globals
+        global_types.push(mir_type(solve(program.vars, program.symbols[g.init].result.unwrap_or(Unit))))
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types)
     for i in 0..<program.symbols.len()
         if !is_generic(program, i) then instance(&l, i, buf())
     val entry = instance(&l, program.entry, buf())
+    val init: Option[usize] = program.init match
+        Some(id) -> Some(instance(&l, id, buf()))
+        None -> None
     var functions: Buf[MirFunction] = buf()
     var k = 0usize
     while k < l.instances.len()
         functions.push(lower_function(&l, k))
         k += 1
-    MirProgram(functions, l.strings, l.descriptors, l.closures, l.traps, entry)
+    MirProgram(functions, l.strings, l.descriptors, l.closures, l.traps, global_types, entry, init)
 
 // An object is a descriptor word followed by its fields in order, each at a multiple of 8 bytes.
 private field_size(t: MirType) -> usize = t match
@@ -136,7 +144,8 @@ private field_size(t: MirType) -> usize = t match
  * whose fields are the class's: its parameters, then the fields its body declares. */
 private layout(l: *Lowering, t: &Type) -> DataLayout
     val key = type_name(t)
-    if l.layout_index.get(key) is Some(index) then return l.layouts[index]
+    val identity = type_key(t)
+    if l.layout_index.get(identity) is Some(index) then return l.layouts[index]
     var variants: Buf[VariantLayout] = buf()
     *t match
         Data(id, _, args) ->
@@ -151,7 +160,7 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
             variants.push(variant_layout(l, key, 0, fields, false))
         _ -> panic("a layout of a type that is not data, a tuple or a class: " + key)
     val result = DataLayout(variants)
-    l.layout_index.put(key, l.layouts.len())
+    l.layout_index.put(identity, l.layouts.len())
     l.layouts.push(result)
     result
 
@@ -258,7 +267,7 @@ private instance_of(l: *Lowering, function: usize, type_args: Buf[&Type], entry:
 private instance_key(function: usize, type_args: Buf[&Type], entry: bool) -> string
     var key = if entry then s"entry $function" else function.to_string()
     for t in type_args
-        key = key + "|" + type_name(t)
+        key = key + "|" + type_key(t)
     key
 
 // Which locals of a top-level function live in boxes: each `var` captured by a function of it that
@@ -435,11 +444,15 @@ function_symbol(program: TProgram, id: usize, type_args: Buf[&Type]) -> string
         arguments = "["
         for i in 0..<type_args.len()
             if i > 0 then arguments = arguments + ", "
-            arguments = arguments + type_name(type_args[i])
+            arguments = arguments + type_key(type_args[i])
         arguments = arguments + "]"
+    // An object's constructor and methods are kept apart from its companion class's.
+    var name = symbol.name
+    if symbol.owner_class is Some(k)
+        if program.classes[k].decl.object then name = "object " + name
     symbol.root match
-        Some(root) -> s"$prefix.${program.symbols[root].name}${program.symbols[root].overload}$arguments.${symbol.name}#$id"
-        None -> prefix + "." + symbol.name + symbol.overload + arguments
+        Some(root) -> s"$prefix.${program.symbols[root].name}${program.symbols[root].overload}$arguments.$name#$id"
+        None -> prefix + "." + name + symbol.overload + arguments
 
 private lower_function(l: *Lowering, k: usize) -> MirFunction
     val inst = l.instances[k]
@@ -586,6 +599,11 @@ private machine_slot(l: *Lowering, m: MirType) -> Option[Place]
     l.slots.push(m)
     Some(Place(SlotAddress(id), m))
 
+/** Where a module-level value is kept, or `None` for one with no runtime value. */
+private global_place(l: *Lowering, g: usize) -> Option[Place] = l.global_types[g] match
+    Some(t) -> Some(Place(GlobalAddress(g), t))
+    None -> None
+
 private store(l: *Lowering, place: Option[Place], value: Option[Operand])
     if place is Some(p)
         if value is Some(v) then l.insts.push(Store(p.address, v))
@@ -704,6 +722,12 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         val object = fresh(l, MRef)
         l.insts.push(Alloc(object, layout(l, concrete(l, e.ty)).variants[0].descriptor))
         Some(Value(object))
+    Global(index) -> load(l, global_place(l, index))
+    StoreGlobal(index, value, yields) ->
+        val v = lower_expr(l, value)
+        if v is None && machine(l, value.ty) is Some(_) then return None
+        store(l, global_place(l, index), v)
+        if yields then v else None
     StoreField(object, index, value, yields) ->
         val target = lower_expr(l, object)?
         val v = lower_expr(l, value)

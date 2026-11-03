@@ -75,6 +75,12 @@ a decision changes, this page and the chapter change together.
 - A private member is private to its class, not to one instance: the class's constructor and
   methods, with the lambdas and local functions in them, may use it on any instance of the class.
 - A class body cannot `return`. A field declared in the body without a type has its initializer's.
+- An [object](/spec/declarations/#object) is made once, before `main`; its name is a value of its own
+  type and cannot be called. It shares its name only with its companion class, whose constructor
+  the name is in call position, while the bare name and `Name.member` are the companion.
+- Module-level `val`s, `var`s and `object`s initialize before `main`, each after the values its
+  initializer reads directly or through the functions it calls, the rest in declaration order; a
+  cycle is a compile error naming the chain.
 - Every function declaration parameter has an explicit type.
 - A [default argument](/spec/declarations/#default-and-named-arguments) is evaluated at each call
   that omits it, in the declaring function's scope, and may use the parameters before it. Named
@@ -158,6 +164,13 @@ a decision changes, this page and the chapter change together.
 - Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
 - Async and await.
 - Partial-function literal syntax, which the user has explicitly left undecided.
+
+## Proposed
+
+- A class and its companion object use each other's private members, in both directions; the
+  specification promised only the companion's access to the class's.
+- An initializer's dependencies count every lambda it makes as if it were called, and every function
+  it calls in full, whatever branch is taken, so a cycle that no run could follow is still rejected.
 
 ## Open
 
