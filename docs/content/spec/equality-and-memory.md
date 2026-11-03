@@ -6,22 +6,29 @@ weight: 15
 
 ## Equality
 
-`a == b` requires `a` and `b` to have a common type that implements `Eq`. Comparing an `int` with a
-`string` is a compile error, not `false`. `!=` is the negation.
+Every value can be compared with `==` and hashed, so any value can be a key in a `Map` or an
+element of a `Set`. `!=` is the negation.
 
-- Built-in types, tuples and `data` types are `Eq` when their components are, structurally.
-- Collections are `Eq` when their elements are, by contents. This includes `Array` and `Buffer`.
-- Classes are `Eq` only if they implement or derive it. There is no inherited default.
+- Built-in types, strings, tuples and `data` types compare and hash by value, structurally.
+- Collections compare by contents when their elements do. This includes `Array` and `Buffer`.
+- Class instances, `object`s and closures compare and hash by identity, which always agree, unless
+  the class implements or derives `Eq`. `class Point(x: int, y: int) derives Eq, Hash` compares and
+  hashes by its fields.
 
-`Hash` must agree with `Eq`. Deriving gives both together, and a hand-written `Hash` requires an
-`Eq` implementation. `Ord` is never derived implicitly; `derives Ord` orders lexicographically by
-field, and by variant declaration order.
+`a == b` requires `a` and `b` to have a common type: comparing an `int` with a `string` is a compile
+error, not `false`. Where the common type is `Any` or a trait, the comparison is decided at run time
+by the values' own types, and values of different types are unequal.
+
+Equal values must have equal hashes. `derives Eq, Hash` gives both from the same fields, so they
+agree. A class that implements one of `==` and the hash by hand must implement the other, and keeping
+the two consistent is then its author's responsibility. `Ord` is never derived implicitly;
+`derives Ord` orders lexicographically by field, and by variant declaration order.
 
 ## Identity
 
 `a === b` is reference identity. It is defined only on reference types: class instances, `object`s,
 arrays, buffers and closures. It is a compile error on a value type, because a value type has no
-identity to compare.
+identity to compare, and on `Any`, which may hold one.
 
 ## Display and Debug
 

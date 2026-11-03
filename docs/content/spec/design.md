@@ -12,7 +12,7 @@ are designed together. These are the choices that shape it, each with what it me
 | **Types are real at run time** | Every generic is monomorphized, and every heap object's header names its exact type, type arguments included. A type pattern on a generic type is checked and sound, and generic code creates an `Array[T]` as easily as any other value. |
 | **Values stay unboxed** | `List[int]` stores `int`s directly. A value is boxed only where it becomes a trait or `Any` value, at that one site. |
 | **Absence is explicit** | A value that may be missing has type `Option[T]`. Every reference refers to an object, and every field is initialized before the object can be observed. |
-| **Equality is typed** | `==` compares two values of one type with an `Eq` implementation. `data` types derive structural `Eq` and `Hash`; classes declare the equality they mean. Identity is the separate `===`, for types that have identity. |
+| **Equality is typed** | `==` compares two values of one type; comparing unrelated types is a compile error. Every value has `==` and a hash, so any value can be a map key: `data` types, tuples and built-ins by value, class instances by identity unless the class implements or derives `Eq`. Identity is also the separate `===`, for types that have identity. |
 | **Printing is a trait** | A type is printable because it implements `Display` and `Debug`; `data` derives both. Output always shows the value. |
 | **`string` is built in** | `string` is a type of the language: UTF-8, immutable, and named simply `string`. Its methods live in Avin's own core library. |
 | **`char` is a Unicode scalar value** | One `char` is one character of text, whatever its code point. |

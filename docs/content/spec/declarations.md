@@ -231,9 +231,10 @@ class Savings(owner: string, balance: int, rate: real): Account(owner, balance),
   traits.
 - Classes are **final unless declared `open` or `abstract`**. Overriding requires `override`.
   An `abstract class` may leave members without bodies and cannot be instantiated.
-- Instances are heap objects with identity. Equality, hashing and display exist only if the class
-  implements or derives them (`class Point(x: int, y: int) derives Eq, Hash, Display`). `===`
-  compares identities, and `==` on a class that defines no equality is a compile error.
+- Instances are heap objects with identity. Unless the class implements or derives `Eq`, `==` and
+  the hash are by identity, like `===`; `class Point(x: int, y: int) derives Eq, Hash, Display`
+  compares and hashes by its fields. Display exists only if the class implements or derives it. See
+  [equality](/spec/equality-and-memory/#equality).
 - A class is created by calling it, `Account("ada", 10)`, as a function is called; a generic class's
   type arguments are inferred from the arguments and the expected type, or written,
   `Box[string]("x")`. The class's name is also its constructor as a function value.

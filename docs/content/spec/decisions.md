@@ -186,6 +186,14 @@ a decision changes, this page and the chapter change together.
   conforming to it, with type arguments compared exactly. One that can never match is an error; one
   covers only where the matched value's type already conforms to `T`. In a clause a type pattern
   naming the parameter's own type is an error.
+- Every type has `==` and a hash. Built-in types, strings, tuples and `data` compare and hash by
+  value; class instances, `object`s and closures by identity, which always agree, until the class
+  implements or derives `Eq`. `derives Eq, Hash` gives both from the same fields; implementing one
+  of `==` and the hash without the other is an error. Keeping a hand-written pair consistent is the
+  programmer's responsibility.
+- `==` between two values whose static types share no common type is a compile error. On `Any` and
+  on trait-typed values `==` is decided at run time through the type's entries: values of different
+  run-time types are unequal. `===` stays defined only on reference types, and not on `Any`.
 
 **Project and tooling**
 
@@ -215,9 +223,6 @@ a decision changes, this page and the chapter change together.
 
 ## Proposed
 
-- `==`, `!=`, `===` and `!==` are not defined on `Any`, though `Any` is a reference type: an `Any`
-  may hold a string or a number, which have no identity, and boxes would give equal numbers
-  different identities. A type pattern recovers a type that has the comparison.
 - A literal pattern does not match an `Any` (`5 -> …` on an `Any` is an error); `n: int if n == 5`
   says it.
 - A tuple's type at run time is the type it was made with: `(animal, 1)` with `animal: Animal` is an
