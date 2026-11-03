@@ -21,6 +21,9 @@ mir_type(t: &Type) -> Option[MirType] = *t match
     Tuple(_) -> Some(MRef)
     Function(_, _) -> Some(MRef)
     ByName(_) -> Some(MRef)
+    // A trait's `Self` is left in the code of the trait's default bodies, which every conforming
+    // type shares: each such type is an object, reached by reference.
+    TypeVar(owner, _, _) -> if is_self_owner(owner) then Some(MRef) else None
     _ -> None
 
 /** Where a value is kept: the address of a slot, and the type stored there. */
@@ -709,6 +712,61 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
         Some(id) -> Some(Value(id))
         None -> None
 
+// A direct call of `function`, the receiver first for a method.
+private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr], type_args: Buf[&Type]) -> Option[Operand]
+    var operands: Buf[Operand] = buf()
+    for a in args
+        val op = lower_expr(l, a)
+        if machine(l, a.ty) is Some(_)
+            op match
+                Some(v) -> operands.push(v)
+                None -> return None
+    // A local function also receives what it captures, from where the caller keeps it.
+    val callee = l.program.symbols[function]
+    for x in callee.captured_locals
+        if l.local_slots[x] is Some(p) then operands.push(p.address)
+    for x in callee.captured_params
+        if l.param_values[x] is Some(v) then operands.push(Value(v))
+    // A local function shares its top-level function's type arguments; a generic function is
+    // instantiated with the call's, made concrete for the instance being lowered.
+    var concrete_args: Buf[&Type] = buf()
+    if callee.root is Some(_) then concrete_args = l.subst
+    else
+        for t in type_args
+            concrete_args.push(concrete(l, t))
+    val index = instance(l, function, concrete_args)
+    val dest = machine(l, e.ty) match
+        Some(t) -> Some(fresh(l, t))
+        None -> None
+    l.insts.push(Call(dest, Direct(index), operands))
+    dest match
+        Some(id) -> Some(Value(id))
+        None -> None
+
+// A call through a bound, in an instance that knows the receiver's type. A trait or an open class
+// may hold an object of any class conforming to it, so the call goes through the object's method
+// table; any other type's implementation is the method at the call's position in its table, called
+// directly. In a trait's default body the receiver is the trait's `Self`, any conforming object.
+private bound_call(l: *Lowering, e: &TExpr, function: usize, slot: Option[usize], args: Buf[&TExpr], type_args: Buf[&Type]) -> Option[Operand]
+    val position = slot match
+        Some(s) -> s
+        None -> return direct_call(l, e, function, args, type_args)
+    val receiver = concrete(l, args[0].ty)
+    if *receiver is Class(k, _, _)
+        if l.program.classes[k].decl.modifier != "" then return dispatch(l, function, position, args, type_args)
+    val entries = checker_table(l, receiver)
+    if position >= entries.len() then return dispatch(l, function, position, args, type_args)
+    val m = entries[position] match
+        Some(m) -> m
+        None -> return dispatch(l, function, position, args, type_args)
+    var concrete_args: Buf[&Type] = buf()
+    for a in implementation_args(l, receiver, m)
+        concrete_args.push(a)
+    val own = l.program.symbols[function].decl.type_params.len()
+    for i in type_args.len() - own..<type_args.len()
+        concrete_args.push(concrete(l, type_args[i]))
+    direct_call(l, e, m, args, concrete_args)
+
 // Calls a function value: its entry is at offset 0, and takes the closure before the arguments.
 private call_value(l: *Lowering, callee: &TExpr, args: Buf[&TExpr]) -> Option[Operand]
     val target = lower_expr(l, callee)?
@@ -1029,36 +1087,9 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         Some(id) -> Some(Value(id))
         None -> None
     Local(index) -> load(l, local_place(l, index))
-    Call(function, args, type_args) ->
-        var operands: Buf[Operand] = buf()
-        for a in args
-            val op = lower_expr(l, a)
-            if machine(l, a.ty) is Some(_)
-                op match
-                    Some(v) -> operands.push(v)
-                    None -> return None
-        // A local function also receives what it captures, from where the caller keeps it.
-        val callee = l.program.symbols[function]
-        for x in callee.captured_locals
-            if l.local_slots[x] is Some(p) then operands.push(p.address)
-        for x in callee.captured_params
-            if l.param_values[x] is Some(v) then operands.push(Value(v))
-        // A local function shares its top-level function's type arguments; a generic function is
-        // instantiated with the call's, made concrete for the instance being lowered.
-        var concrete_args: Buf[&Type] = buf()
-        if callee.root is Some(_) then concrete_args = l.subst
-        else
-            for t in type_args
-                concrete_args.push(concrete(l, t))
-        val index = instance(l, function, concrete_args)
-        val dest = machine(l, e.ty) match
-            Some(t) -> Some(fresh(l, t))
-            None -> None
-        l.insts.push(Call(dest, Direct(index), operands))
-        dest match
-            Some(id) -> Some(Value(id))
-            None -> None
+    Call(function, args, type_args) -> direct_call(l, e, function, args, type_args)
     Dispatch(function, slot, args, type_args) -> dispatch(l, function, slot, args, type_args)
+    BoundCall(function, slot, args, type_args) -> bound_call(l, e, function, slot, args, type_args)
     Construct(variant, args) -> construct(l, e, variant, args)
     FunctionValue(function, type_args) -> Some(function_value(l, function, type_args))
     CallValue(callee, args) -> call_value(l, callee, args)
