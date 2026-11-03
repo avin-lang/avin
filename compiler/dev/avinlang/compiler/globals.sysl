@@ -1,0 +1,111 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+
+// What a function's checked code needs of the rest of the program, which orders the initialization
+// of module-level values: each value is computed after every value its initializer reaches.
+
+/** What one function's code uses directly: the module-level values it reads or writes, and the
+ * functions it calls or makes closures of. Each is listed once, in the order first used. */
+struct Uses
+    globals: Buf[usize]
+    functions: Buf[usize]
+
+uses_of(body: &TExpr) -> Uses
+    var u = Uses(buf(), buf())
+    collect(&u, body)
+    u
+
+/** The module-level values `start` uses, directly or through every function it reaches, in the
+ * order they are first found. */
+globals_reached(direct: Buf[Option[Uses]], start: usize) -> Buf[usize]
+    var seen: Buf[bool] = buf()
+    for _ in direct
+        seen.push(false)
+    var pending: Buf[usize] = buf()
+    pending.push(start)
+    seen.set(start, true)
+    var out: Buf[usize] = buf()
+    var next = 0usize
+    while next < pending.len()
+        val f = pending[next]
+        next += 1
+        if direct[f] is Some(u)
+            for g in u.globals
+                add(&out, g)
+            for callee in u.functions
+                if !seen[callee]
+                    seen.set(callee, true)
+                    pending.push(callee)
+    out
+
+private add(items: *Buf[usize], x: usize)
+    for item in *items
+        if item == x then return
+    items.push(x)
+
+private collect_all(u: *Uses, items: Buf[&TExpr])
+    for item in items
+        collect(u, item)
+
+private collect_option(u: *Uses, e: Option[&TExpr])
+    if e is Some(x) then collect(u, x)
+
+private collect(u: *Uses, e: &TExpr)
+    e.kind match
+        Global(g) -> add(&u.globals, g)
+        StoreGlobal(g, value, _) ->
+            add(&u.globals, g)
+            collect(u, value)
+        Call(f, args, _) ->
+            add(&u.functions, f)
+            collect_all(u, args)
+        FunctionValue(f, _) -> add(&u.functions, f)
+        CallValue(callee, args) ->
+            collect(u, callee)
+            collect_all(u, args)
+        Construct(_, args) -> collect_all(u, args)
+        Field(value, _) -> collect(u, value)
+        StoreField(object, _, value, _) ->
+            collect(u, object)
+            collect(u, value)
+        Block(items) -> collect_all(u, items)
+        Let(_, value) -> collect(u, value)
+        LetPattern(_, value) -> collect(u, value)
+        Store(_, value, _) -> collect(u, value)
+        MultiStore(_, value) -> collect(u, value)
+        Negate(x) -> collect(u, x)
+        Not(x) -> collect(u, x)
+        Complement(x) -> collect(u, x)
+        Convert(x) -> collect(u, x)
+        Render(x) -> collect(u, x)
+        Arith(_, a, b, _) ->
+            collect(u, a)
+            collect(u, b)
+        Logic(_, a, b) ->
+            collect(u, a)
+            collect(u, b)
+        Compare(operands, _) -> collect_all(u, operands)
+        If(condition, yes, no) ->
+            collect(u, condition)
+            collect(u, yes)
+            collect_option(u, no)
+        While(_, condition, body, otherwise) ->
+            collect(u, condition)
+            collect(u, body)
+            collect_option(u, otherwise)
+        Break(_, value) -> collect_option(u, value)
+        Return(value) -> collect_option(u, value)
+        Match(subject, arms) ->
+            collect(u, subject)
+            for arm in arms
+                collect_option(u, arm.guard)
+                collect(u, arm.body)
+        Is(value, _, _) -> collect(u, value)
+        Clauses(subjects, clauses) ->
+            collect_all(u, subjects)
+            for clause in clauses
+                for b in clause.bodies
+                    collect_option(u, b.guard)
+                    collect(u, b.body)
+        _ -> ()

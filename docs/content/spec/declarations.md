@@ -302,6 +302,32 @@ object Config
 An `object` is a singleton value. An `object` with the same name as a class in the same module is its
 companion and may access its private members. `object`s may extend a class and traits.
 
+An object's body is written like a class body with no parameters: its fields and statements run
+once, before `main`, to make the one instance, and its methods have the same implicit receiver and
+`self`. The object's name is a value of the object's own type, so it can be stored and passed like
+any other; it cannot be called, since there is no second instance to make.
+
+An object shares its name only with its companion class. Where both exist, the name in call
+position, `Account(…)`, is the class's constructor, and the bare name `Account` or a member
+`Account.open(…)` is the companion. The class and its companion each use the other's private
+members.
+
+```text
+class Account(owner: string, private var balance: int)
+    private val id = Account.issue()
+
+object Account
+    private var next = 0
+    open(owner: string) -> Account = Account(owner, 0)
+    balanceOf(a: Account) -> int = a.balance
+    private issue() -> int
+        next++
+        next
+```
+
+A file may also declare `val`s and `var`s at module level, beside its functions. Each is a value of
+the program, read and (for a `var`) assigned from any function by its name.
+
 ## Visibility and modules
 
 Declarations are public unless marked `private` (visible in the module). A directory is a module;
@@ -315,7 +341,16 @@ is reserved for the standard library.
   then runs the class body top to bottom. Until every field is assigned, `self` may not be passed,
   stored, captured, or used to call a method, and a body statement may not read a field declared
   below it. This is checked at compile time, so no field is ever observed uninitialized.
-- Module-level `val`s and `object`s initialize before `main`, in the order their initializers depend
-  on one another. A dependency cycle is a compile error, not a runtime surprise.
+- Module-level `val`s, `var`s and `object`s initialize before `main`, in the order their
+  initializers depend on one another. An initializer depends on every module value and object it
+  reads, directly or through the functions it calls and the lambdas it makes; values that need
+  nothing of one another initialize in declaration order. A dependency cycle is a compile error that
+  names the chain, not a runtime surprise:
+
+  ```text
+  val a = b + 1
+  val b = readA() * 2      // error: module-level values need one another to initialize: `a` → `b` → `a`
+  readA() -> int = a
+  ```
 - Local helper functions may call one another in any order, but a call that would read a captured
   local before its initialization is rejected.

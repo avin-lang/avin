@@ -51,6 +51,18 @@ emit_llvm(program: MirProgram) -> string
     for i in 0..<program.traps.len()
         val t = program.traps[i]
         out.push(s"@avin.trap.$i = private constant { ptr, ptr, i64, i64 } { ptr @avin.str.${t.reason}, ptr @avin.str.${t.file}, i64 ${t.line}, i64 ${t.col} }, align 8\n")
+    // The module-level values that hold references are the slots of one frame, laid out as a
+    // function's shadow-stack frame is, which `main` gives the runtime as a root of every
+    // collection. Each other value is a global of its own. All start zero, before `main` initializes
+    // them.
+    val roots = root_count(program)
+    if roots > 0
+        out.push(s"@avin.roots = private global { ptr, i64, [$roots x ptr] } { ptr null, i64 $roots, [$roots x ptr] zeroinitializer }, align 8\n")
+    for i in 0..<program.globals.len()
+        program.globals[i] match
+            Some(MRef) -> ()
+            Some(t) -> out.push(s"@avin.global.$i = private global ${llvm_type(t)} zeroinitializer, align 8\n")
+            None -> ()
     out.push("\n")
     var declared: Buf[string] = buf()
     for f in program.functions
@@ -70,9 +82,14 @@ emit_llvm(program: MirProgram) -> string
         out.push(declaration + "\n")
     out.push("\n")
     val entry = program.functions[program.entry]
-    out.push("declare ptr @avin_rt_start()\n\n")
-    out.push("define i32 @main() {\nentry:\n")
+    out.push("declare ptr @avin_rt_start()\n")
+    if roots > 0 then out.push("declare void @avin_rt_globals(ptr)\n")
+    out.push("\ndefine i32 @main() {\nentry:\n")
     out.push("  %ctx = call ptr @avin_rt_start()\n")
+    // The module-level values are roots before the first of them is stored, and are all
+    // initialized before the entry runs.
+    if roots > 0 then out.push("  call void @avin_rt_globals(ptr @avin.roots)\n")
+    if program.init is Some(init) then out.push(s"  call void @\"${program.functions[init].symbol}\"(ptr %ctx)\n")
     entry.signature.result match
         Some(MInt(bits)) ->
             out.push(s"  %result = call i$bits @\"${entry.symbol}\"(ptr %ctx)\n")
@@ -365,6 +382,7 @@ private operand_type(program: MirProgram, f: MirFunction, a: Operand) -> MirType
     ConstObject(_) -> MRef
     ConstClosure(_) -> MRef
     FunctionAddress(_) -> MPtr
+    GlobalAddress(_) -> MPtr
 
 private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a match
     Value(id) -> s"%v$id"
@@ -376,6 +394,23 @@ private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a m
     ConstStr(index) -> s"@avin.str.$index"
     ConstClosure(index) -> s"@avin.fn.$index"
     FunctionAddress(function) -> "@\"" + program.functions[function].symbol + "\""
+    GlobalAddress(index) -> global_address(program, index)
+
+// A module-level value that holds a reference is a slot of the roots frame; any other is a global
+// of its own.
+private global_address(program: MirProgram, index: usize) -> string
+    if !(program.globals[index] is Some(MRef)) then return s"@avin.global.$index"
+    var slot = 0usize
+    for i in 0..<index
+        if program.globals[i] is Some(MRef) then slot += 1
+    val n = root_count(program)
+    s"getelementptr inbounds ({ ptr, i64, [$n x ptr] }, ptr @avin.roots, i64 0, i32 2, i64 $slot)"
+
+private root_count(program: MirProgram) -> usize
+    var n = 0usize
+    for t in program.globals
+        if t is Some(MRef) then n += 1
+    n
 
 private typed_operand(program: MirProgram, f: MirFunction, a: Operand) -> string =
     llvm_type(operand_type(program, f, a)) + " " + operand(program, f, a)

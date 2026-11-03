@@ -70,6 +70,25 @@ struct ClassSymbol
     constructor: usize
     /** While the constructor is checked, how many fields its code has initialized so far. */
     ready: usize
+    /** For an object, the class of the same name in its module; for a class, that object. Each may
+     * use the other's private members. */
+    companion: Option[usize]
+    /** For an object, the module-level value that holds its one instance. */
+    global: Option[usize]
+
+/** A module-level value: a `val` or `var` declared at the top level of a file, or an object's one
+ * instance. Each is computed once, before `main` runs, by its `init` function: a value's initializer,
+ * checked as a function with no parameters, or an object's constructor. Its type is that function's
+ * result. */
+struct GlobalSymbol
+    unit: usize
+    module_name: string
+    name: string
+    span: Span
+    mutable: bool
+    init: usize
+    /** For an object, its class. */
+    object: Option[usize]
 
 /** A field of a class; `ty` is `None` until the constructor's check infers it from the field's
  * initializer, when the declaration has no type. */
@@ -172,8 +191,11 @@ struct Checker
     types: Map[string, usize]
     variants: Map[string, VariantRef]
     classes: Buf[ClassSymbol]
-    /** The classes in scope, by name. */
+    /** The classes in scope, by name, and the standalone objects, whose types are named after them. */
     class_types: Map[string, usize]
+    globals: Buf[GlobalSymbol]
+    /** The module-level values and objects in scope, by name. */
+    global_names: Map[string, usize]
     /** 0: not yet checked, 1: being checked, 2: checked. */
     states: Buf[u8]
     bodies: Buf[Option[&TExpr]]
@@ -214,7 +236,7 @@ end Checked
 /** Checks a program. The last unit is the program's own file, which must declare `main`; the units
  * before it (the prelude) are visible to it, and its own declarations shadow theirs. */
 check_program(units: Buf[SourceUnit]) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false)
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false)
     // Every type is named before any is used, so a data type may refer to itself or to one
     // declared after it, and functions are declared once every type is known.
     for u in 0..<c.units.len()
@@ -225,8 +247,13 @@ check_program(units: Buf[SourceUnit]) -> Checked
     for u in 0..<c.units.len()
         declare_unit(&c, u)
         declare_methods(&c, u)
+    for u in 0..<c.units.len()
+        declare_globals(&c, u)
     for id in 0..<c.symbols.len()
         check_function(&c, id)
+    for g in 0..<c.globals.len()
+        settle_global(&c, g)
+    val init = initializer(&c, initialization_order(&c))
     val main_unit = c.units.len() - 1
     var entry: Option[usize] = None
     c.scope.get("main") match
@@ -256,7 +283,7 @@ check_program(units: Buf[SourceUnit]) -> Checked
     var sources: Buf[Source] = buf()
     for u in c.units
         sources.push(u.src)
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, functions, c.vars, id)))
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, id, init)))
 
 private declare_unit(c: *Checker, unit: usize)
     val file = c.units[unit].file
@@ -279,7 +306,8 @@ private declare_unit(c: *Checker, unit: usize)
                         c.note(unit, f.name_span, s"`${f.name}` is already a variant of `${c.data[v.data].name}`")
                 if set.len() == 0 && c.class_types.get(f.name) is Some(k)
                     if c.classes[k].unit == unit
-                        c.note(unit, f.name_span, s"`${f.name}` is already a class, which is called to make one")
+                        if c.classes[k].decl.object then c.note(unit, f.name_span, s"`${f.name}` is already an object")
+                        else c.note(unit, f.name_span, s"`${f.name}` is already a class, which is called to make one")
                 c.symbols.push(symbol)
                 c.states.push(0)
                 c.bodies.push(None)
@@ -290,6 +318,7 @@ private declare_unit(c: *Checker, unit: usize)
                 if set.len() > 1 then mark_overloads(c, set)
             DataItem(_) -> ()
             ClassItem(_) -> ()
+            ValueItem(_) -> ()
 
 // Whether a function declared with `symbol` has the same parameter types as one of `others`, so that
 // no call could choose between them. Two overloads are the same when each accepts the other's
@@ -373,6 +402,7 @@ private declare_types(c: *Checker, unit: usize)
             c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf()))
     for item in file.items
         if item is ClassItem(d)
+            if d.object then continue
             if builtin_type(d.name) is Some(_)
                 c.note(unit, d.name_span, s"`${d.name}` is a built-in type, so it cannot be declared")
                 continue
@@ -381,7 +411,34 @@ private declare_types(c: *Checker, unit: usize)
                 continue
             seen.put(d.name, d.span)
             c.class_types.put(d.name, c.classes.len())
-            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0))
+            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, None))
+    // An object is a class with one instance. Named after a class of its module, it is that class's
+    // companion and its type has no name of its own; otherwise its name is also its type's.
+    var objects: Map[string, Span] = map()
+    for item in file.items
+        if item is ClassItem(d)
+            if !d.object then continue
+            if builtin_type(d.name) is Some(_)
+                c.note(unit, d.name_span, s"`${d.name}` is a built-in type, so it cannot be declared")
+                continue
+            if objects.get(d.name) is Some(_)
+                c.note(unit, d.name_span, s"the object `${d.name}` is declared more than once")
+                continue
+            objects.put(d.name, d.span)
+            val id = c.classes.len()
+            var companion: Option[usize] = None
+            if seen.get(d.name) is Some(_)
+                c.class_types.get(d.name) match
+                    Some(k) ->
+                        if c.classes[k].unit == unit && !c.classes[k].decl.object
+                            companion = Some(k)
+                            c.classes[k].companion = Some(id)
+                    None -> ()
+                if companion is None
+                    c.note(unit, d.name_span, s"`${d.name}` is already a data type; an object may share its name only with a class")
+                    continue
+            else c.class_types.put(d.name, id)
+            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, companion, None))
 
 // A variant's fields are resolved with its type's parameters in scope. Variant names share one
 // space within a file, since a variant is named on its own (`Some(1)`, `None`) wherever it is used.
@@ -434,7 +491,7 @@ private declare_fields(c: *Checker, unit: usize)
             c.note(unit, a.span, s"unknown annotation `@${a.name}`")
         if d.modifier != "" then c.note(unit, d.modifier_span, s"`${d.modifier}` classes are not implemented; every class is final")
         for p in d.parents
-            c.note(unit, p.span, "inheritance is not implemented")
+            c.note(unit, p.span, if d.object then "an object extending a class or traits is not implemented" else "inheritance is not implemented")
         for t in d.derives
             c.note(unit, t.span, "`derives` is not implemented")
         for tp in d.type_params
@@ -488,13 +545,15 @@ private declare_methods(c: *Checker, unit: usize)
         var no_defaults: Buf[Option[usize]] = buf()
         for _ in d.params
             no_defaults.push(None)
-        c.symbols.push(FunctionSymbol(unit, module_name, d.name, decl, types, names, Some(self_type), None, None, buf(), buf(), buf(), false, false, false, no_defaults, None, class_owner(id), d.type_params, Some(id), true, true, ""))
+        // An object's constructor makes its one instance before `main` and cannot be called.
+        c.symbols.push(FunctionSymbol(unit, module_name, d.name, decl, types, names, Some(self_type), None, None, buf(), buf(), buf(), false, false, false, no_defaults, None, class_owner(id), d.type_params, Some(id), true, !d.object, ""))
         c.states.push(0)
         c.bodies.push(None)
         c.locals.push(buf())
-        var constructors: Buf[usize] = buf()
-        constructors.push(constructor)
-        c.scope.put(d.name, constructors)
+        if !d.object
+            var constructors: Buf[usize] = buf()
+            constructors.push(constructor)
+            c.scope.put(d.name, constructors)
         c.classes[id].constructor = constructor
         var methods: Buf[usize] = buf()
         for m in d.members
@@ -542,6 +601,59 @@ private declare_methods(c: *Checker, unit: usize)
                 c.bodies.push(None)
                 c.locals.push(buf())
         c.classes[id].methods = methods
+
+// Each module-level value and object of a file, in declaration order, which is the order they
+// initialize in where none depends on another. A value's initializer is checked as a function with
+// no parameters whose result is the value; an object's is its class's constructor.
+private declare_globals(c: *Checker, unit: usize)
+    val file = c.units[unit].file
+    for item in file.items
+        item match
+            ValueItem(v) ->
+                if v.name == "_" || global_name_taken(c, unit, v.name, v.span, false) then continue
+                val f = Function(buf(), v.span, v.span, v.name, buf(), buf(), v.declared, Some(v.value), buf())
+                val init = c.symbols.len()
+                c.symbols.push(signature(c, unit, file.module_name, f, init, buf()))
+                c.states.push(0)
+                c.bodies.push(None)
+                c.locals.push(buf())
+                c.global_names.put(v.name, c.globals.len())
+                c.globals.push(GlobalSymbol(unit, file.module_name, v.name, v.span, v.mutable, init, None))
+            ClassItem(d) ->
+                if !d.object then continue
+                // A second object of one name has no class, and was reported.
+                for k in 0..<c.classes.len()
+                    val cls = c.classes[k]
+                    if cls.unit == unit && cls.decl.object && cls.name == d.name && cls.global is None
+                        if global_name_taken(c, unit, d.name, d.name_span, true) then break
+                        c.classes[k].global = Some(c.globals.len())
+                        c.global_names.put(d.name, c.globals.len())
+                        c.globals.push(GlobalSymbol(unit, file.module_name, d.name, d.name_span, false, cls.constructor, Some(k)))
+            _ -> ()
+
+// Whether a module-level value's name is already declared in its file, reporting it if so. An
+// object's clashes with a class, a function or a variant were reported with its class, so only its
+// clash with a module value is reported here.
+private global_name_taken(c: *Checker, unit: usize, name: string, at: Span, object: bool) -> bool
+    if c.global_names.get(name) is Some(g)
+        if c.globals[g].unit == unit
+            c.note(unit, at, s"`$name` is declared more than once")
+            return true
+    if object then return false
+    if c.class_types.get(name) is Some(k)
+        if c.classes[k].unit == unit && !c.classes[k].decl.object && c.classes[k].companion is None
+            c.note(unit, at, s"`$name` is already a class")
+            return true
+    if c.scope.get(name) is Some(ids)
+        for f in ids
+            if c.symbols[f].unit == unit && !c.symbols[f].constructor
+                c.note(unit, at, s"`$name` is already a function")
+                return true
+    if c.variants.get(name) is Some(v)
+        if c.data[v.data].unit == unit
+            c.note(unit, at, s"`$name` is already a variant of `${c.data[v.data].name}`")
+            return true
+    false
 
 /** The method of class `id` declared as `name`. */
 private method_named(c: *Checker, id: usize, name: string) -> Option[usize]
@@ -1112,6 +1224,7 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
         Some(FieldOf(i)) -> return field_read(c, at, at, self_ref(c, at), enclosing_class(c).unwrap(), i, true)
         Some(MethodOf(m)) -> return method_value(c, at, m)
         None -> ()
+    if global_named(c, name) is Some(g) then return global_read(c, at, g)
     if lookup_function(c, name) is Some(_) then return named_function_value(c, at, name, None, expected)
     if c.variants.get(name) is Some(v)
         if c.data[v.data].variants[v.index].fields.len() == 0 then return construct(c, at, at, v, buf(), None, expected)
@@ -1148,8 +1261,13 @@ private method_value(c: *Checker, at: Span, m: usize) -> &TExpr
     c.note(unit_of(c), at, s"a method used as a value is not implemented; call `${c.symbols[m].decl.name}`, or wrap the call in a lambda")
     TExpr(at, ErrorType, UnitConst)
 
-// Whether code in the class `k` is being checked, which may use its private members.
-private inside_class(c: *Checker, k: usize) -> bool = enclosing_class(c) == Some(k)
+// Whether code that may use the private members of class `k` is being checked: code of the class
+// itself, or of its companion.
+private inside_class(c: *Checker, k: usize) -> bool
+    val here = enclosing_class(c) match
+        Some(h) -> h
+        None -> return false
+    here == k || c.classes[k].companion == Some(here)
 
 // A local or a parameter by name, as it is stored: a by-name parameter is its delayed expression,
 // not yet evaluated.
@@ -1295,6 +1413,7 @@ private assignable(c: *Checker, target: &Expr) -> Option[usize]
             c.note(unit, target.span, s"`$name` is a `val`; only a `var` can be assigned")
         None ->
             if param_index(c, name) is Some(_) then c.note(unit, target.span, s"`$name` is a parameter, which cannot be assigned")
+            elif global_named(c, name) is Some(_) then c.note(unit, target.span, "assigning a module-level value in a multiple assignment is not implemented")
             elif lookup_function(c, name) is Some(_) then c.note(unit, target.span, s"`$name` is a function, which cannot be assigned")
             else c.note(unit, target.span, s"`$name` is not defined")
     None
@@ -1418,8 +1537,162 @@ private update_field(c: *Checker, e: &Expr, target: &Expr, increment: bool, post
     items.push(previous)
     place.wrap(e.span, TExpr(e.span, ty, Block(items)))
 
+// A module-level value or object named by a bare name, unless a local function of that name hides
+// it or a function of a later file, the program's own over the prelude, shadows it.
+private global_named(c: *Checker, name: string) -> Option[usize]
+    if local_function(c, name) is Some(_) then return None
+    val g = c.global_names.get(name)?
+    if c.scope.get(name) is Some(ids)
+        for f in ids
+            if c.symbols[f].unit > c.globals[g].unit then return None
+    Some(g)
+
+// A module-level value's type is its initializer's result: declared, or inferred by checking the
+// initializer first, which is not possible while that initializer is itself being checked.
+private global_type(c: *Checker, g: usize, at: Span) -> &Type
+    val init = c.globals[g].init
+    if c.symbols[init].result is Some(t) then return t
+    if c.states[init] == 0
+        check_function(c, init)
+        return c.symbols[init].result.unwrap_or(ErrorType)
+    val name = c.globals[g].name
+    c.note(unit_of(c), at, s"the type of `$name` is needed while its initializer is checked; declare it, as in `val $name: int = …`")
+    ErrorType
+
+private global_read(c: *Checker, at: Span, g: usize) -> &TExpr = TExpr(at, global_type(c, g, at), Global(g))
+
+// A value declared without a type takes its initializer's, which must be fully known.
+private settle_global(c: *Checker, g: usize)
+    val global = c.globals[g]
+    if global.object is Some(_) then return
+    val t = zonk(c, c.symbols[global.init].result.unwrap_or(ErrorType))
+    if has_unknowns(t)
+        c.note(global.unit, global.span, s"cannot infer the type of `${global.name}`; declare it, as in `val ${global.name}: int = …`")
+        c.symbols[global.init].result = Some(ErrorType)
+    else c.symbols[global.init].result = Some(t)
+
+// Whether an assignment's target is a module-level value: a bare name that no local, parameter or
+// member of the enclosing class hides.
+private targets_global(c: *Checker, target: &Expr) -> Option[usize] = target.kind match
+    Name(n) -> if lookup_local(c, n) is None && param_index(c, n) is None && class_member(c, n) is None then global_named(c, n) else None
+    _ -> None
+
+// Only a module-level `var` can be assigned.
+private writable_global(c: *Checker, at: Span, g: usize) -> bool
+    val global = c.globals[g]
+    if global.object is Some(_) then c.note(unit_of(c), at, s"`${global.name}` is an object, which cannot be assigned")
+    elif !global.mutable then c.note(unit_of(c), at, s"`${global.name}` is a module-level `val`; only a `var` can be assigned")
+    else return true
+    false
+
+private assign_global(c: *Checker, e: &Expr, target: &Expr, g: usize, op: Option[BinaryOp], value: &Expr, yields: bool, op_span: Span) -> &TExpr
+    if !writable_global(c, target.span, g)
+        check_statement(c, value)
+        return TExpr(e.span, ErrorType, UnitConst)
+    val ty = global_type(c, g, target.span)
+    val current = TExpr(target.span, ty, Global(g))
+    val stored = op match
+        Some(o) -> operate(c, e.span, op_span, o, binary_spelling(o) + (if yields then ":=" else "="), current, check_expr(c, value, Some(ty)))
+        None ->
+            val typed = check_expr(c, value, Some(ty))
+            if !conforms(typed.ty, ty)
+                c.note(unit_of(c), value.span, s"expected ${type_name(ty)}, found ${type_name(typed.ty)}")
+            typed
+    val result: &Type = if *stored.ty is Nothing then Nothing elif yields then ty else Unit
+    TExpr(e.span, result, StoreGlobal(g, stored, yields))
+
+// `++` and `--` on a module-level `var`: read, stepped with the usual overflow check, and stored.
+private update_global(c: *Checker, e: &Expr, target: &Expr, g: usize, increment: bool, postfix: bool, op_span: Span) -> &TExpr
+    if !writable_global(c, target.span, g) then return TExpr(e.span, ErrorType, UnitConst)
+    val ty = global_type(c, g, target.span)
+    if !(*ty is Int(_) || *ty is ErrorType)
+        c.note(unit_of(c), e.span, s"`${if increment then "++" else "--"}` needs an integer, not ${type_name(ty)}")
+        return TExpr(e.span, ErrorType, UnitConst)
+    val op = if increment then Add else Subtract
+    val one = TExpr(op_span, ty, IntConst("1"))
+    val current = TExpr(target.span, ty, Global(g))
+    if !postfix then return TExpr(e.span, ty, StoreGlobal(g, TExpr(e.span, ty, Arith(op, current, one, op_span)), true))
+    val old = hidden_local(c, ty)
+    val previous = TExpr(target.span, ty, Local(old))
+    var items: Buf[&TExpr] = buf()
+    items.push(TExpr(e.span, Unit, Let(old, current)))
+    items.push(TExpr(e.span, Unit, StoreGlobal(g, TExpr(e.span, ty, Arith(op, previous, one, op_span)), false)))
+    items.push(previous)
+    TExpr(e.span, ty, Block(items))
+
+/** One step of ordering the module-level values: what each value's initializer needs, and the
+ * search's progress. `state` is 0 for a value not yet reached, 1 while the values it needs are being
+ * ordered, and 2 once it has its place. */
+private struct InitOrder
+    needs: Buf[Buf[usize]]
+    state: Buf[u8]
+    path: Buf[usize]
+    order: Buf[usize]
+
+// Module-level values initialize before `main`, each after every value its initializer uses:
+// directly, or in the functions it calls and the closures it makes, however deeply. Otherwise they
+// keep their declaration order. A value that needs itself is a cycle, reported with the values it
+// passes through.
+private initialization_order(c: *Checker) -> Buf[usize]
+    var direct: Buf[Option[Uses]] = buf()
+    for b in c.bodies
+        direct.push(b match
+            Some(body) -> Some(uses_of(body))
+            None -> None)
+    var o = InitOrder(buf(), buf(), buf(), buf())
+    for g in c.globals
+        o.needs.push(globals_reached(direct, g.init))
+        o.state.push(0)
+    for g in 0..<c.globals.len()
+        if o.state[g] == 0 then order_global(c, &o, g)
+    o.order
+
+private order_global(c: *Checker, o: *InitOrder, g: usize)
+    o.state.set(g, 1)
+    o.path.push(g)
+    for need in o.needs[g]
+        if o.state[need] == 1 then report_cycle(c, o, need)
+        elif o.state[need] == 0 then order_global(c, o, need)
+    o.path.truncate(o.path.len() - 1)
+    o.state.set(g, 2)
+    o.order.push(g)
+
+// The cycle runs from `start`, where it is on the path being ordered, to the path's end and back.
+private report_cycle(c: *Checker, o: *InitOrder, start: usize)
+    val first = c.globals[start]
+    if o.path[o.path.len() - 1] == start
+        c.note(first.unit, first.span, s"`${first.name}` is needed by its own initializer, directly or through the functions it calls")
+        return
+    var cycle = ""
+    var on = false
+    for g in o.path
+        if g == start then on = true
+        if on then cycle = cycle + s"`${c.globals[g].name}` → "
+    c.note(first.unit, first.span, s"module-level values need one another to initialize: $cycle`${first.name}`")
+
+// One function initializes every module-level value in order, storing each initializer's result.
+// The program's `main` runs it before the entry.
+private initializer(c: *Checker, order: Buf[usize]) -> Option[usize]
+    if c.globals.len() == 0 then return None
+    val unit = c.units.len() - 1
+    val module_name = c.units[unit].file.module_name
+    val at = Span(0, 0)
+    val id = c.symbols.len()
+    val decl = Function(buf(), at, at, "<init>", buf(), buf(), None, None, buf())
+    c.symbols.push(FunctionSymbol(unit, module_name, "<init>", decl, buf(), buf(), Some(Unit), None, None, buf(), buf(), buf(), false, false, false, buf(), None, id, buf(), None, false, true, ""))
+    var items: Buf[&TExpr] = buf()
+    for g in order
+        val init = c.globals[g].init
+        val value = TExpr(at, c.symbols[init].result.unwrap_or(ErrorType), Call(init, buf(), buf()))
+        items.push(TExpr(at, Unit, StoreGlobal(g, value, false)))
+    c.states.push(2)
+    c.bodies.push(Some(TExpr(at, Unit, Block(items))))
+    c.locals.push(buf())
+    Some(id)
+
 private assign_expr(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp], value: &Expr, yields: bool, op_span: Span) -> &TExpr
     if targets_field(c, target) then return assign_field(c, e, target, op, value, yields, op_span)
+    if targets_global(c, target) is Some(g) then return assign_global(c, e, target, g, op, value, yields, op_span)
     val unit = unit_of(c)
     val index = assignable(c, target) match
         Some(i) -> i
@@ -1592,6 +1865,7 @@ private hidden_local(c: *Checker, ty: &Type) -> usize
 
 private update_expr(c: *Checker, e: &Expr, target: &Expr, increment: bool, postfix: bool, op_span: Span) -> &TExpr
     if targets_field(c, target) then return update_field(c, e, target, increment, postfix, op_span)
+    if targets_global(c, target) is Some(g) then return update_global(c, e, target, g, increment, postfix, op_span)
     val index = assignable(c, target) match
         Some(i) -> i
         None -> return TExpr(e.span, ErrorType, UnitConst)
@@ -1899,7 +2173,16 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
         Some(MethodOf(m)) -> return method_call(c, at, named.span, self_ref(c, named.span), m, args, explicit, expected)
         Some(FieldOf(_)) -> if explicit is None then return value_call(c, at, callee, args)
         None -> ()
+    // A module-level value is called as a value; a class's name in call position is its
+    // constructor, even where its companion object shares the name.
     val ids = lookup_functions(c, name)
+    if explicit is None && ids.len() == 0 && global_named(c, name) is Some(g)
+        if c.globals[g].object is Some(_)
+            c.note(unit, named.span, s"`$name` is an object, made once before `main`; it cannot be called")
+            for a in args
+                check_statement(c, a.value)
+            return TExpr(at, ErrorType, UnitConst)
+        return value_call(c, at, callee, args)
     if ids.len() == 0
         if c.variants.get(name) is Some(v)
             if c.data[v.data].variants[v.index].fields.len() == 0
