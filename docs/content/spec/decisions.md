@@ -47,7 +47,19 @@ a decision changes, this page and the chapter change together.
   and a program's own top-level functions hide the prelude's of the same name.
 - Choosing an overload tries integer literals and lambdas against each candidate's parameter; every
   other argument is checked once on its own, and only its type is tried. A literal fits any
-  parameter that can hold it, so `f(1)` with `f(int)` and `f(long)` is ambiguous.
+  parameter that can hold it.
+- An integer literal prefers its own type, `int` (or `long` for a literal too large for `int`), when
+  that is all that separates the overloads: `f(1)` with `f(int)` and `f(long)`, or with `f(int)` and
+  `f(real)`, calls `f(int)`. This applies only where no overload is the most specific, and only to an
+  overload that is also the most specific by the arguments that are not literals; `f(1)` with
+  `f(long)` and `f(real)` stays ambiguous, and a generic `f[T](x: T)` loses to `f(x: long)` by
+  specificity before any literal rule applies.
+- A method named without a call, `account.deposit`, is a function value bound to its receiver: a
+  closure holding `account`, of the method's type without the receiver. Inside the class, a bare
+  method name is the same closure over `self`.
+- `string` is a built-in type, not a class: it is final, has its own representation, gets its
+  methods from the library through `impl string`, conforms to traits through `impl`, and is matched
+  by the type pattern `s: string` like any other type.
 - A generic overload is compared by the same rule as any other: `f(x: int)` is more specific than
   `f[T](x: T)`, which accepts an `int` while `f(int)` does not accept a `T`.
 - Whether a parameter is by-name does not distinguish overloads. An argument some candidate takes by
@@ -142,15 +154,6 @@ a decision changes, this page and the chapter change together.
 - Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
 - Async and await.
 - Partial-function literal syntax, which the user has explicitly left undecided.
-
-## Proposed
-
-- An integer literal prefers its own type when overloads differ only in the types a literal could
-  take: `f(1)` with `f(int)` and `f(long)`, or with `f(int)` and `f(real)`, would call `f(int)`
-  rather than be ambiguous. As settled, such a call is ambiguous.
-- A method named without a call, `account.deposit`, is a function value bound to its receiver: a
-  closure holding `account`, of the method's type without the receiver. Inside the class, a bare
-  method name is the same closure over `self`.
 
 ## Open
 

@@ -67,6 +67,11 @@ arithmetic; `int(c)` and `char(n)` convert.
 `string` is a built-in value type with no identity: two equal strings are interchangeable, and
 `===` is not defined on them. It is immutable UTF-8.
 
+`string` is a built-in type, not a class. It is final; its representation is its own, a length and its
+bytes inline in one object; it gets its methods from the library through `impl string`; and it
+conforms to traits through `impl` (`Eq`, `Hash`, `Ord`, `Display`). A type pattern `s: string` on an
+`Any` matches it like any other type.
+
 - `s.byteLength()` is O(1). Iteration is by `char` (`s.chars()`) or by byte (`s.bytes()`).
 - There is no `s(i)` returning a char by index, because that would be O(n) behind O(1) syntax.
   Slicing takes byte offsets and traps on an offset that is not a character boundary.

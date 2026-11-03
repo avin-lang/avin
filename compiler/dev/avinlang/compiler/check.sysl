@@ -1991,8 +1991,58 @@ private choose_overload(c: *Checker, at: Span, name_span: Span, name: string, id
     most_specific(c, fitting, compared) match
         Some(id) -> Choice(Some(id), typed)
         None ->
-            c.note(unit, name_span, s"this call to `$name` is ambiguous: ${overload_list(c, fitting)} each accept it, and none is more specific than the others")
-            Choice(None, typed)
+            literal_preferred(c, fitting, compared, args) match
+                Some(id) -> Choice(Some(id), typed)
+                None ->
+                    c.note(unit, name_span, s"this call to `$name` is ambiguous: ${overload_list(c, fitting)} each accept it, and none is more specific than the others")
+                    Choice(None, typed)
+
+// Where no overload is the most specific, the one that takes each integer literal argument as the
+// literal's own type: `int`, or `long` for a literal too large for `int`. It must also be the most
+// specific one by the arguments that are not literals alone, so the literals break only the ties
+// they cause. None when there is no such overload, or more than one.
+private literal_preferred(c: *Checker, ids: Buf[usize], compared: Buf[Buf[&Type]], args: Buf[Argument]) -> Option[usize]
+    var own: Buf[Option[&Type]] = buf()
+    var any_literal = false
+    for a in args
+        if is_literal(a.value)
+            own.push(Some(literal_own_type(a.value)))
+            any_literal = true
+        else
+            own.push(None)
+    if !any_literal then return None
+    var rest: Buf[Buf[&Type]] = buf()
+    var preferred: Buf[usize] = buf()
+    for k in 0..<ids.len()
+        var others: Buf[&Type] = buf()
+        var takes_own = true
+        for j in 0..<args.len()
+            if own[j] is Some(t)
+                if !same_type(strict(compared[k][j]), t) then takes_own = false
+            else others.push(compared[k][j])
+        rest.push(others)
+        if takes_own then preferred.push(k)
+    if preferred.len() != 1 then return None
+    val a = preferred[0]
+    for b in 0..<ids.len()
+        if a != b
+            if !accepts(c, rest[b], c.symbols[ids[b]].type_owner, c.symbols[ids[b]].type_params.len(), rest[a]) then return None
+    Some(ids[a])
+
+// The type an integer literal, possibly negated, has where nothing else decides it.
+private literal_own_type(e: &Expr) -> &Type
+    var negative = false
+    var spelling = ""
+    e.kind match
+        IntLit(s) -> spelling = s
+        Unary(_, operand) ->
+            negative = true
+            if operand.kind is IntLit(s) then spelling = s
+        _ -> ()
+    val digits = literal_magnitude(spelling) match
+        Some(d) -> d
+        None -> return int_type()
+    if fits(digits, IntBits, negative) then int_type() else Int(64)
 
 // An argument that some candidate takes by name, checked before the overload is chosen: delayed, as
 // that candidate needs it, with the type `inner` when every candidate agrees on it. A candidate that

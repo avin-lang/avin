@@ -60,7 +60,8 @@ their parameter types differ. A call chooses among them by its arguments:
   whose parameter it can become.
 - When more than one candidate remains, the most specific wins: the one whose every parameter type
   conforms to the corresponding parameter type of each other. A call with no candidate, or with no
-  single most specific one, is an error that lists the overloads.
+  single most specific one, is an error that lists the overloads, except that an integer literal
+  breaks a tie in favour of its own type (below).
 - Overloads must differ in their parameter types; differing only in result type or parameter names
   is an error. A default argument that makes two overloads accept the same call makes that call
   ambiguous.
@@ -85,9 +86,12 @@ Choosing an overload works as follows:
   can hold its value (`int`, `long`, the other widths, `byte`, `real`), and the lambda a parameter
   that is a function of as many parameters. Every other argument is checked once, on its own, and
   only its type is tried against each candidate; when every candidate gives it the same parameter
-  type it is checked against that type. So `measure(1)` is ambiguous between `measure(n: int)` and
-  `measure(r: real)`, and so is `wide(1)` between `int` and `long`, since neither type conforms to
-  the other.
+  type it is checked against that type. Neither `int` and `long` nor `int` and `real` conforms to the
+  other, so where no overload is the most specific an integer literal prefers its own type, `int`,
+  or `long` for a literal too large for `int`: `measure(1)` calls `measure(n: int)` beside
+  `measure(r: real)`, and `wide(1)` calls `wide(n: int)` beside `wide(n: long)`. The overload must
+  also be the most specific by the arguments that are not literals. With `wide(n: long)` and
+  `wide(r: real)`, `wide(1)` is ambiguous, since neither takes the literal's own type.
 - **Generic overloads.** A generic overload is compared by the same rule: `which(x: int)` is more
   specific than `which[T](x: T)`, because `which[T]` accepts an `int` and `which(int)` does not
   accept a `T`. Of `f[T](x: T)` and `f[T](x: Maybe[T])`, the second is the more specific. Written
