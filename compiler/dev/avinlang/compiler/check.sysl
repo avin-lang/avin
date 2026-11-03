@@ -422,8 +422,10 @@ private mark_overloads(c: *Checker, set: Buf[usize])
     for id in set
         var text = "("
         val params = c.symbols[id].params
-        for i in 0..<params.len()
-            if i > 0 then text = text + ", "
+        // A method's receiver is the same in all its overloads.
+        val first = if is_method(c.symbols[id]) then 1usize else 0usize
+        for i in first..<params.len()
+            if i > first then text = text + ", "
             text = text + type_name(params[i])
         text = text + ")"
         c.symbols[id].overload = text
@@ -1059,13 +1061,9 @@ private declare_methods(c: *Checker, unit: usize)
             if bodyless && !is_abstract_class(c, id)
                 c.note(file_unit, f.name_span, s"`${f.name}` has no body; only an abstract class may leave a method without one")
             if bodyless && !public then c.note(file_unit, f.name_span, s"`${f.name}` is abstract, so it cannot be private: a subclass implements it")
-            var duplicate = false
+            var same_name: Buf[usize] = buf()
             for other in methods
-                if c.symbols[other].decl.name == f.name then duplicate = true
-            if duplicate
-                if entry.from_impl then c.note(file_unit, f.name_span, s"`${f.name}` is already a method of `${d.name}`; overloading methods is not implemented")
-                else c.note(file_unit, f.name_span, s"`${f.name}` is declared more than once in `${d.name}`; overloading methods is not implemented")
-                continue
+                if c.symbols[other].decl.name == f.name then same_name.push(other)
             var type_params: Buf[TypeParam] = buf()
             for tp in entry.type_params
                 type_params.push(tp)
@@ -1090,6 +1088,10 @@ private declare_methods(c: *Checker, unit: usize)
             for _ in receiver_types
                 method_defaults.push(None)
             symbol.defaults = method_defaults
+            if same_as_overload(c, symbol, same_name)
+                if entry.from_impl then c.note(file_unit, f.name_span, s"`${f.name}` is already a method of `${d.name}` with the same parameter types; a method's overloads differ in their parameter types")
+                else c.note(file_unit, f.name_span, s"`${f.name}` is declared more than once in `${d.name}` with the same parameter types; a method's overloads differ in their parameter types")
+                continue
             methods.push(c.symbols.len())
             overriding.push(overrides)
             c.symbols.push(symbol)
@@ -1098,6 +1100,12 @@ private declare_methods(c: *Checker, unit: usize)
             c.locals.push(buf())
         c.classes[id].methods = methods
         c.classes[id].overriding = overriding
+        // The methods of one name are told apart in the object file by their parameter types.
+        for m in methods
+            var group: Buf[usize] = buf()
+            for other in methods
+                if c.symbols[other].decl.name == c.symbols[m].decl.name then group.push(other)
+            if group.len() > 1 && group[0] == m then mark_overloads(c, group)
 
 // The methods an impl adds to a data type or a built-in type: each a function whose first parameter
 // is the value, `self`. A class's impls were declared with the class's own methods.
@@ -1138,9 +1146,15 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
         if field
             c.note(unit, f.name_span, s"`${f.name}` is already a field of `$type_name_of`")
             return
-    if receiver_method(c, target, f.name) is Some(_)
-        c.note(unit, f.name_span, s"`${f.name}` is already a method of `$type_name_of`; overloading methods is not implemented")
-        return
+    // The methods of this name the type's impls have added so far, which this one overloads.
+    var same_name: Buf[usize] = buf()
+    *target match
+        Data(d, _, _) ->
+            for m in c.data[d].methods
+                if c.symbols[m].decl.name == f.name then same_name.push(m)
+        _ ->
+            for m in c.builtin_methods
+                if same_type(c.symbols[m].receiver.unwrap(), target) && c.symbols[m].decl.name == f.name then same_name.push(m)
     val id = c.symbols.len()
     // A data type's methods share its type parameters, then have their own; a built-in type has
     // none, so its methods' type parameters are their own.
@@ -1169,10 +1183,15 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
     for _ in receiver_types
         method_defaults.push(None)
     symbol.defaults = method_defaults
+    if same_as_overload(c, symbol, same_name)
+        c.note(unit, f.name_span, s"`${f.name}` is already a method of `$type_name_of` with the same parameter types; a method's overloads differ in their parameter types")
+        return
     c.symbols.push(symbol)
     c.states.push(0)
     c.bodies.push(None)
     c.locals.push(buf())
+    same_name.push(id)
+    if same_name.len() > 1 then mark_overloads(c, same_name)
     *target match
         Data(d, _, _) ->
             var methods = c.data[d].methods
@@ -1202,6 +1221,38 @@ private receiver_method(c: *Checker, t: &Type, name: string) -> Option[usize]
             for m in c.builtin_methods
                 if same_type(c.symbols[m].receiver.unwrap(), t) && c.symbols[m].decl.name == name then return Some(m)
             None
+
+/** Every method named `name` that a value of data or built-in type `t` has, one for each list of
+ * parameter types: those its impls add, then for a data type what its method table holds under the
+ * name through the traits it conforms to. */
+private receiver_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    *t match
+        Data(id, _, _) ->
+            val self_type = own_type(c.data[id], id)
+            for m in c.data[id].methods
+                if c.symbols[m].decl.name == name then add_method(c, self_type, &out, m)
+            for entry in c.data[id].table
+                if entry is Some(m)
+                    if c.symbols[m].decl.name == name then add_method(c, self_type, &out, m)
+        Class(_, _, _) -> ()
+        Var(_) -> ()
+        TypeVar(_, _, _) -> ()
+        ErrorType -> ()
+        _ ->
+            for m in c.builtin_methods
+                if same_type(c.symbols[m].receiver.unwrap(), t) && c.symbols[m].decl.name == name then out.push(m)
+    out
+
+/** The methods of `ms` the code being checked may call. */
+private visible_methods(c: *Checker, ms: Buf[usize]) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    for m in ms
+        if method_visible(c, m) then out.push(m)
+    out
+
+/** Whether a function is a method, whose first parameter is its receiver, `self`. */
+private is_method(symbol: FunctionSymbol) -> bool = (symbol.owner_class is Some(_) && !symbol.constructor) || symbol.receiver is Some(_)
 
 /** Whether a method is abstract: declared in a class without a body. */
 is_abstract_method(symbol: FunctionSymbol) -> bool =
@@ -1266,6 +1317,78 @@ private own_method(c: *Checker, id: usize, name: string) -> Option[usize]
         if c.symbols[m].decl.name == name then return Some(m)
     None
 
+/** Whether methods `a` and `b` are one method as a value of `self_type` sees them: the same name and
+ * the same parameter types past the receiver. Such methods override and implement one another and
+ * share a position in a method table; methods of one name with other parameter types overload it. */
+private same_method(c: *Checker, self_type: &Type, a: usize, b: usize) -> bool =
+    c.symbols[a].decl.name == c.symbols[b].decl.name && param_mismatch(c, self_type, a, b) is None
+
+/** The method of class or trait `k` that is the same method as `m`, as `self_type` sees both. */
+private own_matching(c: *Checker, k: usize, self_type: &Type, m: usize) -> Option[usize]
+    for own in c.classes[k].methods
+        if same_method(c, self_type, own, m) then return Some(own)
+    None
+
+/** Adds method `m` to `out` unless `out` already holds the same method as `self_type` sees it. */
+private add_method(c: *Checker, self_type: &Type, out: *Buf[usize], m: usize)
+    for i in 0..<out.len()
+        if same_method(c, self_type, out[i], m) then return
+    out.push(m)
+
+/** The methods of `name` a value of class or trait `id` has that the code being checked may call: one
+ * for each list of parameter types, found in the order `method_named` searches, so each is the
+ * implementation the value's static type knows. */
+private methods_named(c: *Checker, id: usize, name: string) -> Buf[usize]
+    val self_type = own_class_type(c.classes[id], id)
+    var out: Buf[usize] = buf()
+    for m in c.classes[id].methods
+        if c.symbols[m].decl.name == name && method_visible(c, m) then add_method(c, self_type, &out, m)
+    for entry in c.classes[id].table
+        if entry is Some(m)
+            if c.symbols[m].decl.name == name then add_method(c, self_type, &out, m)
+    var k = id
+    loop
+        for m in c.classes[k].methods
+            if c.symbols[m].decl.name == name && method_visible(c, m) then add_method(c, self_type, &out, m)
+        val sup = c.classes[k].superclass match
+            Some(t) -> t
+            None -> break
+        k = *sup match
+            Class(s, _, _) -> s
+            _ -> break
+    trait_methods_named(c, id, self_type, name, &out, 0)
+    out
+
+/** Adds to `out` the methods of `name` of the traits class or trait `id` conforms to or requires. */
+private trait_methods_named(c: *Checker, id: usize, self_type: &Type, name: string, out: *Buf[usize], depth: usize)
+    if depth > c.classes.len() then return
+    for required in c.classes[id].traits
+        if *required is Class(t, _, _)
+            for m in c.classes[t].methods
+                if c.symbols[m].decl.name == name then add_method(c, self_type, out, m)
+            trait_methods_named(c, t, self_type, name, out, depth + 1)
+    if c.classes[id].superclass is Some(sup)
+        if *sup is Class(s, _, _) then trait_methods_named(c, s, self_type, name, out, depth + 1)
+
+/** The method of a trait that trait `id` requires, directly or not, that is the same method as `m`. */
+private required_matching(c: *Checker, id: usize, self_type: &Type, m: usize, depth: usize) -> Option[usize]
+    if depth > c.classes.len() then return None
+    for required in c.classes[id].traits
+        if *required is Class(t, _, _)
+            if own_matching(c, t, self_type, m) is Some(found) then return Some(found)
+            if required_matching(c, t, self_type, m, depth + 1) is Some(found) then return Some(found)
+    None
+
+/** The text of a method's parameter types past the receiver, as `self_type` sees them, after its
+ * name: `add(int, string)`. It tells apart the overloads of one name in a diagnostic. */
+private method_key(c: *Checker, self_type: &Type, m: usize) -> string
+    val params = c.symbols[m].params
+    var text = c.symbols[m].decl.name + "("
+    for i in 1..<params.len()
+        if i > 1 then text = text + ", "
+        text = text + type_name(seen_from(c, self_type, m, params[i]))
+    text + ")"
+
 // The method a name reaches on an instance of class `id`: the class's own, then the nearest
 // ancestor's, passing over the private methods of ancestors that the code being checked cannot see.
 // When none is visible, the nearest of that name, so its privacy can be reported.
@@ -1312,12 +1435,13 @@ private trait_slot(c: *Checker, m: usize) -> usize
         if methods[j] == m then return c.classes[t].base + j
     0
 
-/** The first position of class `k`'s method table holding a method named `name`. */
-private table_position(c: *Checker, k: usize, name: string) -> Option[usize]
+/** The first position of class `k`'s method table holding the same method as `target`. */
+private table_position(c: *Checker, k: usize, target: usize) -> Option[usize]
+    val self_type = own_class_type(c.classes[k], k)
     val table = c.classes[k].table
     for i in 0..<table.len()
         if table[i] is Some(m)
-            if c.symbols[m].decl.name == name then return Some(i)
+            if same_method(c, self_type, m, target) then return Some(i)
     None
 
 /** The traits an instance of `t` conforms to: those its class names and those they require, then
@@ -1388,11 +1512,43 @@ private break_trait_cycles(c: *Checker)
             c.classes[id].traits = buf()
 
 /** The slot of class `k`'s method table that holds the method named `name`, if it has one. */
-private slot_named(c: *Checker, k: usize, name: string) -> Option[usize]
+/** The slot of class `k`'s method table that holds the same method as `m`, as `self_type` sees both. */
+private slot_matching(c: *Checker, k: usize, self_type: &Type, m: usize) -> Option[usize]
     val slots = c.classes[k].slots
     for i in 0..<slots.len()
-        if c.symbols[slots[i]].decl.name == name then return Some(i)
+        if same_method(c, self_type, slots[i], m) then return Some(i)
     None
+
+// An `override` that matches no inherited method by name and parameter types. With no method of
+// that name to override it overrides nothing; with one, how its parameters differ from that one's;
+// with several, it overrides none of those overloads.
+private unmatched_override(c: *Checker, id: usize, sid: Option[usize], conformed: Buf[&Type], m: usize)
+    val k = c.classes[id]
+    val symbol = c.symbols[m]
+    val name = symbol.decl.name
+    val self_type = own_class_type(k, id)
+    var named: Buf[usize] = buf()
+    if sid is Some(s)
+        var a = s
+        loop
+            for other in c.classes[a].methods
+                if c.symbols[other].decl.name == name && c.symbols[other].public then add_method(c, self_type, &named, other)
+            val sup = c.classes[a].superclass match
+                Some(t) -> t
+                None -> break
+            a = *sup match
+                Class(next, _, _) -> next
+                _ -> break
+    for t in conformed
+        if *t is Class(tid, _, _)
+            for other in c.classes[tid].methods
+                if c.symbols[other].decl.name == name then add_method(c, self_type, &named, other)
+    if named.len() == 0
+        c.note(k.unit, symbol.decl.name_span, s"`$name` overrides nothing; no superclass or trait of `${k.name}` has a method `$name`")
+    elif symbol.decl.type_params.len() > 0
+        c.note(k.unit, symbol.decl.name_span, s"`$name` has type parameters of its own, so it cannot override an inherited method")
+    elif named.len() == 1 then overrides_matches(c, id, m, named[0])
+    else c.note(k.unit, symbol.decl.name_span, s"`${method_key(c, self_type, m)}` overrides nothing; the inherited overloads are ${overload_list(c, named)}, and none takes these parameter types")
 
 // A class's method table, built after its superclass's: the superclass's slots, then a slot for each
 // method a subclass may override. A method marked `override` takes the slot of the inherited method
@@ -1407,9 +1563,10 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
     if is_trait(c, id)
         // A trait's methods take positions of their own in its conforming classes' tables; one may
         // not redeclare a method of a trait it requires.
+        val trait_type = own_class_type(k, id)
         for m in k.methods
             val name = c.symbols[m].decl.name
-            if trait_method(c, id, name) is Some(other)
+            if required_matching(c, id, trait_type, m, 0) is Some(other)
                 c.note(unit, c.symbols[m].decl.name_span, s"`$name` is already a method of `${c.classes[c.symbols[other].owner_class.unwrap()].name}`, which `${k.name}` requires; a trait cannot redeclare it")
         return
     var slots: Buf[usize] = buf()
@@ -1433,22 +1590,23 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
         if f.owner == id && f.public
             if trait_method(c, id, f.name) is Some(m)
                 c.note(unit, f.span, s"`${f.name}` is already a method of `${c.classes[c.symbols[m].owner_class.unwrap()].name}`")
+    val self_type = own_class_type(k, id)
     for i in 0..<k.methods.len()
         val m = k.methods[i]
         val symbol = c.symbols[m]
         val name = symbol.decl.name
         val generic = symbol.decl.type_params.len() > 0
         var inherited: Option[usize] = None
-        if sid is Some(s) then inherited = inherited_method(c, s, name)
+        if sid is Some(s) then inherited = inherited_matching(c, s, self_type, m)
         // Every method of the traits the class conforms to that the method implements.
         var implemented: Buf[usize] = buf()
         for t in conformed
             if *t is Class(tid, _, _)
-                if own_method(c, tid, name) is Some(tm)
+                if own_matching(c, tid, self_type, m) is Some(tm)
                     if !contains_id(implemented, tm) then implemented.push(tm)
         if k.overriding[i]
             if inherited is None && implemented.len() == 0
-                c.note(unit, symbol.decl.name_span, s"`$name` overrides nothing; no superclass or trait of `${k.name}` has a method `$name`")
+                unmatched_override(c, id, sid, conformed, m)
                 continue
             if !symbol.public
                 c.note(unit, symbol.decl.name_span, s"`$name` overrides a public method, so it cannot be private")
@@ -1461,7 +1619,7 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
             if inherited is Some(target)
                 // An inherited method that implements a trait's method has that trait's position
                 // rather than a slot of its own.
-                slot_named(c, sid.unwrap(), name) match
+                slot_matching(c, sid.unwrap(), self_type, m) match
                     Some(slot) ->
                         if overrides_matches(c, id, m, target) then slots.set(slot, m)
                     None ->
@@ -1535,37 +1693,40 @@ private build_data_table(c: *Checker, id: usize, conformed: Buf[usize])
     for _ in 0..<size
         table.push(None)
     var reported: Buf[string] = buf()
+    val self_type = own_type(c.data[id], id)
     for t in conformed
         val methods = c.classes[t].methods
         for j in 0..<methods.len()
             val name = c.symbols[methods[j]].decl.name
+            val key = method_key(c, self_type, methods[j])
             var chosen = methods[j]
             var own: Option[usize] = None
             val mine = c.data[id].methods
             for k in 0..<mine.len()
-                if c.symbols[mine[k]].decl.name == name
+                if same_method(c, self_type, mine[k], methods[j])
                     own = Some(mine[k])
-                    if !c.data[id].implementing[k] && !contains_name(reported, name)
-                        reported.push(name)
+                    if !c.data[id].implementing[k] && !contains_name(reported, key)
+                        reported.push(key)
                         val m = mine[k]
                         c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`$name` implements `${c.symbols[methods[j]].name}`, so it belongs in an impl of `${c.classes[t].name}` for `$name_of`")
             if own is Some(m) then chosen = m
             else
                 var bodies: Buf[usize] = buf()
                 for other in conformed
-                    if own_method(c, other, name) is Some(m)
+                    if own_matching(c, other, self_type, methods[j]) is Some(m)
                         if !is_abstract_method(c.symbols[m]) && !contains_id(bodies, m) then bodies.push(m)
                 if bodies.len() > 0 then chosen = bodies[0]
-                if bodies.len() > 1 && !contains_name(reported, name)
-                    reported.push(name)
+                if bodies.len() > 1 && !contains_name(reported, key)
+                    reported.push(key)
                     report_conformance(c, id, t, s"`$name_of` inherits two implementations of `$name`, `${c.symbols[bodies[0]].name}` and `${c.symbols[bodies[1]].name}`; implement it in an impl")
             table.set(c.classes[t].base + j, Some(chosen))
     c.data[id].table = table
     for entry in table
         if entry is Some(m)
             val name = c.symbols[m].decl.name
-            if is_abstract_method(c.symbols[m]) && !contains_name(reported, name)
-                reported.push(name)
+            val key = method_key(c, self_type, m)
+            if is_abstract_method(c.symbols[m]) && !contains_name(reported, key)
+                reported.push(key)
                 val t = c.symbols[m].owner_class.unwrap()
                 report_conformance(c, id, t, s"`$name_of` does not implement `$name` from `${c.classes[t].name}`; implement it in an impl of `${c.classes[t].name}`")
 
@@ -1608,24 +1769,28 @@ private build_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
             ensure_table(c, sid, conformed)
             sup_table = c.classes[sid].table
     var reported: Buf[string] = buf()
+    val self_type = own_class_type(k, id)
     for i in 0..<size
-        val name = table[i] match
-            Some(m) -> c.symbols[m].decl.name
+        val held = table[i] match
+            Some(m) -> m
             None -> continue
-        // Every method the class inherits under this name; its own override, if it has one.
+        val name = c.symbols[held].decl.name
+        val key = method_key(c, self_type, held)
+        // Every method the class inherits that is this one; its own override, if it has one.
         var candidates: Buf[usize] = buf()
         var own: Option[usize] = None
-        if own_method(c, id, name) is Some(m)
-            if c.symbols[m].public && c.symbols[m].decl.type_params.len() == 0 then own = Some(m)
+        for m in k.methods
+            if own is None && same_method(c, self_type, m, held)
+                if c.symbols[m].public && c.symbols[m].decl.type_params.len() == 0 then own = Some(m)
         for entry in table
             if entry is Some(m)
-                if c.symbols[m].decl.name == name && !is_trait(c, c.symbols[m].owner_class.unwrap()) && !contains_id(candidates, m) then candidates.push(m)
+                if same_method(c, self_type, m, held) && !is_trait(c, c.symbols[m].owner_class.unwrap()) && !contains_id(candidates, m) then candidates.push(m)
         for entry in sup_table
             if entry is Some(m)
-                if c.symbols[m].decl.name == name && !contains_id(candidates, m) then candidates.push(m)
+                if same_method(c, self_type, m, held) && !contains_id(candidates, m) then candidates.push(m)
         for t in conformed[id]
             if contains_id(inherited_traits, t) then continue
-            if own_method(c, t, name) is Some(m)
+            if own_matching(c, t, self_type, held) is Some(m)
                 if !is_abstract_method(c.symbols[m]) && !contains_id(candidates, m) then candidates.push(m)
         var chosen: Option[usize] = own
         if own is None
@@ -1633,8 +1798,8 @@ private build_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
             for m in candidates
                 if !is_abstract_method(c.symbols[m]) then bodies.push(m)
             if bodies.len() > 0 then chosen = Some(bodies[0])
-            if bodies.len() > 1 && !contains_name(reported, name)
-                reported.push(name)
+            if bodies.len() > 1 && !contains_name(reported, key)
+                reported.push(key)
                 c.note(k.unit, k.decl.name_span, s"`${k.name}` inherits two implementations of `$name`, `${c.symbols[bodies[0]].name}` and `${c.symbols[bodies[1]].name}`; override it")
         if chosen is Some(m) then table.set(i, Some(m))
     c.classes[id].table = table
@@ -1643,8 +1808,9 @@ private build_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
         for entry in table
             if entry is Some(m)
                 val name = c.symbols[m].decl.name
-                if is_abstract_method(c.symbols[m]) && !contains_name(missing, name)
-                    missing.push(name)
+                val key = method_key(c, self_type, m)
+                if is_abstract_method(c.symbols[m]) && !contains_name(missing, key)
+                    missing.push(key)
                     c.note(k.unit, k.decl.name_span, s"`${k.name}` does not implement `$name` from `${c.classes[c.symbols[m].owner_class.unwrap()].name}`; implement it, or declare `${k.name}` abstract")
 
 /** Class `id`'s method table, built first if it is not yet. */
@@ -1778,6 +1944,21 @@ private inherited_method(c: *Checker, id: usize, name: string) -> Option[usize]
     loop
         if own_method(c, k, name) is Some(m)
             if c.symbols[m].public then return Some(m)
+        val sup = c.classes[k].superclass match
+            Some(t) -> t
+            None -> return None
+        k = *sup match
+            Class(s, _, _) -> s
+            _ -> return None
+    None
+
+/** The nearest public method of class `id` or its ancestors that is the same method as `m`, as
+ * `self_type` sees both: the one `m` overrides. */
+private inherited_matching(c: *Checker, id: usize, self_type: &Type, m: usize) -> Option[usize]
+    var k = id
+    loop
+        if own_matching(c, k, self_type, m) is Some(found)
+            if c.symbols[found].public then return Some(found)
         val sup = c.classes[k].superclass match
             Some(t) -> t
             None -> return None
@@ -2302,6 +2483,14 @@ private impl_member(c: *Checker, name: string) -> Option[MemberRef]
     if receiver_method(c, t, name) is Some(m)
         if method_visible(c, m) then return Some(MethodOf(m))
     None
+
+/** The methods of `name` a bare name reaches inside a class or an impl's method, one for each list of
+ * parameter types, which a call of the name chooses among. */
+private bare_methods(c: *Checker, name: string) -> Buf[usize]
+    if enclosing_class(c) is Some(k) then return methods_named(c, k, name)
+    c.symbols[c.body.root].receiver match
+        Some(t) -> visible_methods(c, receiver_methods(c, t, name))
+        None -> buf()
 
 /** `self`, the instance the enclosing constructor or method works on. */
 private self_ref(c: *Checker, at: Span) -> &TExpr = binding_ref(c, at, "self").unwrap()
@@ -3502,7 +3691,10 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
                 for a in args
                     check_statement(c, a.value)
                 return TExpr(at, ErrorType, UnitConst)
-            return method_call(c, at, named.span, self_ref(c, named.span), m, args, explicit, expected, false)
+            val receiver = self_ref(c, named.span)
+            var ms = bare_methods(c, name)
+            if ms.len() == 0 then ms.push(m)
+            return call_method(c, at, named.span, receiver, name, ms, args, explicit, expected, false)
         Some(FieldOf(_)) -> if explicit is None then return value_call(c, at, callee, args)
         Some(DataFieldOf(_)) -> if explicit is None then return value_call(c, at, callee, args)
         None -> ()
@@ -3567,18 +3759,32 @@ private struct Choice
 // parameters. Of the candidates that fit, the one more specific than each other is chosen: the one
 // whose parameter types, for the parameters the arguments are given to, the other accepts.
 private choose_overload(c: *Checker, at: Span, name_span: Span, name: string, ids: Buf[usize], args: Buf[Argument], explicit: Option[Buf[&TypeExpr]]) -> Choice
+    var signatures: Buf[Signature] = buf()
+    for id in ids
+        signatures.push(function_signature(c, id, ErrorType))
+    choose(c, at, name_span, name, ids, signatures, args, explicit)
+
+// Chooses among the functions `ids`, called through `signatures`: a function's own, or a method's
+// past its receiver, with the type arguments its receiver decides already known.
+private choose(c: *Checker, at: Span, name_span: Span, name: string, ids: Buf[usize], signatures: Buf[Signature], args: Buf[Argument], explicit: Option[Buf[&TypeExpr]]) -> Choice
     val unit = unit_of(c)
     var written: Buf[&Type] = buf()
     if explicit is Some(types)
         for t in types
             written.push(resolve_type(c, unit, t))
     var bound: Buf[usize] = buf()
+    var bound_signatures: Buf[Signature] = buf()
+    // Each bound candidate's parameter types with the known type arguments in place.
+    var views: Buf[Buf[&Type]] = buf()
     var bindings: Buf[Binding] = buf()
-    for id in ids
-        if c.symbols[id].type_params.len() < written.len() then continue
-        val binding = bind_arguments(c, at, function_signature(c, id, ErrorType), args, false)
+    for i in 0..<ids.len()
+        val s = signatures[i]
+        if s.type_params.len() - s.known.len() < written.len() then continue
+        val binding = bind_arguments(c, at, s, args, false)
         if binding.fits
-            bound.push(id)
+            bound.push(ids[i])
+            bound_signatures.push(s)
+            views.push(substitute_all(s.params, s.owner, s.known))
             bindings.push(binding)
     var typed: Buf[Option[&TExpr]] = buf()
     if bound.len() == 0
@@ -3588,22 +3794,22 @@ private choose_overload(c: *Checker, at: Span, name_span: Span, name: string, id
         val value = args[j].value
         var delayed = false
         var agree = true
-        val shared = c.symbols[bound[0]].params[bindings[0].targets[j].unwrap()]
+        val shared = views[0][bindings[0].targets[j].unwrap()]
         for k in 0..<bound.len()
-            val p = c.symbols[bound[k]].params[bindings[k].targets[j].unwrap()]
+            val p = views[k][bindings[k].targets[j].unwrap()]
             if *p is ByName(_) then delayed = true
-            if c.symbols[bound[k]].type_params.len() > 0 || !same_type(p, shared) then agree = false
+            if bound_signatures[k].type_params.len() > bound_signatures[k].known.len() || !same_type(p, shared) then agree = false
         if value.kind is Lambda(_, _) || is_literal(value) then typed.push(None)
         elif delayed then typed.push(Some(delayed_unchosen(c, args[j], if agree then Some(strict(shared)) else None)))
         else typed.push(Some(check_expr(c, value, if agree then Some(shared) else None)))
     var fitting: Buf[usize] = buf()
     var compared: Buf[Buf[&Type]] = buf()
     for k in 0..<bound.len()
-        if !fits_call(c, bound[k], bindings[k], args, typed, written) then continue
+        if !fits_call(c, bound_signatures[k], bindings[k], args, typed, written) then continue
         fitting.push(bound[k])
         var params: Buf[&Type] = buf()
         for t in bindings[k].targets
-            params.push(c.symbols[bound[k]].params[t.unwrap()])
+            params.push(views[k][t.unwrap()])
         compared.push(params)
     if fitting.len() == 0
         c.note(unit, name_span, s"no overload of `$name` accepts these arguments; the overloads are ${overload_list(c, ids)}")
@@ -3692,22 +3898,21 @@ private most_specific(c: *Checker, ids: Buf[usize], compared: Buf[Buf[&Type]]) -
 
 // Whether one candidate of an overloaded call accepts its arguments: those already typed, then the
 // literals and lambdas, by what their parameter types allow.
-private fits_call(c: *Checker, id: usize, binding: Binding, args: Buf[Argument], typed: Buf[Option[&TExpr]], written: Buf[&Type]) -> bool
-    val f = c.symbols[id]
+private fits_call(c: *Checker, s: Signature, binding: Binding, args: Buf[Argument], typed: Buf[Option[&TExpr]], written: Buf[&Type]) -> bool
     val saved = save_vars(c)
     var type_args: Buf[&Type] = buf()
-    for _ in f.type_params
-        type_args.push(fresh_var(c))
+    for i in 0..<s.type_params.len()
+        type_args.push(if i < s.known.len() then s.known[i] else fresh_var(c))
     for i in 0..<written.len()
-        unify(c, type_args[i], written[i])
+        unify(c, type_args[s.known.len() + i], written[i])
     var ok = true
     for j in 0..<args.len()
         if typed[j] is Some(t)
-            val p = strict(substitute(f.params[binding.targets[j].unwrap()], f.type_owner, type_args))
+            val p = strict(substitute(s.params[binding.targets[j].unwrap()], s.owner, type_args))
             if ok && !(*t.ty is Nothing) && !unify(c, p, strict(t.ty)) then ok = false
     for j in 0..<args.len()
         if ok && typed[j] is None
-            val p = zonk(c, strict(substitute(f.params[binding.targets[j].unwrap()], f.type_owner, type_args)))
+            val p = zonk(c, strict(substitute(s.params[binding.targets[j].unwrap()], s.owner, type_args)))
             if !open_argument_fits(args[j].value, p) then ok = false
     restore_vars(c, saved)
     ok
@@ -3757,8 +3962,10 @@ private overload_list(c: *Checker, ids: Buf[usize]) -> string
                 text = text + f.type_params[i].name
             text = text + "]"
         text = text + "("
-        for i in 0..<f.params.len()
-            if i > 0 then text = text + ", "
+        // A method's receiver is not written among its parameters.
+        val first = if is_method(f) then 1usize else 0usize
+        for i in first..<f.params.len()
+            if i > first then text = text + ", "
             text = text + f.param_names[i] + ": " + type_name(f.params[i])
         out = out + "`" + text + ")`"
     out
@@ -3772,20 +3979,22 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
             return super_call(c, at, name_span, target.span, name, args, explicit, expected)
     val object = check_expr(c, target, None)
     if *zonk(c, object.ty) is Class(k, _, _)
+        val ms = methods_named(c, k, name)
+        if ms.len() > 0 then return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
         if method_named(c, k, name) is Some(m)
-            if !method_visible(c, m)
-                c.note(unit, name_span, s"`$name` is private to `${c.classes[c.symbols[m].owner_class.unwrap()].name}`")
-                for a in args
-                    check_statement(c, a.value)
-                return TExpr(at, ErrorType, UnitConst)
-            return method_call(c, at, name_span, object, m, args, explicit, expected, false)
-    if receiver_method(c, zonk(c, object.ty), name) is Some(m)
-        if !method_visible(c, m)
-            c.note(unit, name_span, s"`$name` is private to the impls of `${type_name(c.symbols[m].receiver.unwrap())}`")
+            c.note(unit, name_span, s"`$name` is private to `${c.classes[c.symbols[m].owner_class.unwrap()].name}`")
             for a in args
                 check_statement(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
-        return method_call(c, at, name_span, object, m, args, explicit, expected, false)
+    val all = receiver_methods(c, zonk(c, object.ty), name)
+    if all.len() > 0
+        val ms = visible_methods(c, all)
+        if ms.len() == 0
+            c.note(unit, name_span, s"`$name` is private to the impls of `${type_name(c.symbols[all[0]].receiver.unwrap())}`")
+            for a in args
+                check_statement(c, a.value)
+            return TExpr(at, ErrorType, UnitConst)
+        return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
     if explicit is Some(_)
         for a in args
             check_statement(c, a.value)
@@ -3797,37 +4006,56 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
 private super_call(c: *Checker, at: Span, name_span: Span, super_span: Span, name: string, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
     val k = enclosing_class(c).unwrap()
-    var found: Option[usize] = None
+    var ms: Buf[usize] = buf()
     var sup: &Type = ErrorType
     if c.classes[k].superclass is Some(t)
         sup = t
         if *t is Class(s, _, _)
-            if method_named(c, s, name) is Some(m)
-                if method_visible(c, m) then found = Some(m)
-            if found is None then c.note(unit, name_span, s"`${c.classes[s].name}` has no method `$name` for `super` to call")
+            ms = methods_named(c, s, name)
+            if ms.len() == 0 then c.note(unit, name_span, s"`${c.classes[s].name}` has no method `$name` for `super` to call")
     else c.note(unit, super_span, s"`${c.classes[k].name}` has no superclass for `super` to name")
     if c.super_args
         c.note(unit, super_span, "a superclass's arguments cannot call a method: they run before the object is initialized")
-        found = None
-    if found is Some(m)
-        if is_abstract_method(c.symbols[m])
-            c.note(unit, name_span, s"`${c.symbols[m].name}` is abstract, so `super` cannot call it")
-            found = None
-    val m = found match
+        ms = buf()
+    if ms.len() == 0
+        for a in args
+            check_statement(c, a.value)
+        return TExpr(at, ErrorType, UnitConst)
+    val self_value = self_ref(c, super_span)
+    val receiver = TExpr(super_span, sup, self_value.kind)
+    val choice = pick_method(c, at, name_span, receiver, name, ms, args, explicit)
+    val m = choice.id match
         Some(m) -> m
-        None ->
-            for a in args
-                check_statement(c, a.value)
-            return TExpr(at, ErrorType, UnitConst)
-    val receiver = self_ref(c, super_span)
-    method_call(c, at, name_span, TExpr(super_span, sup, receiver.kind), m, args, explicit, expected, true)
+        None -> return TExpr(at, ErrorType, UnitConst)
+    if is_abstract_method(c.symbols[m])
+        c.note(unit, name_span, s"`${c.symbols[m].name}` is abstract, so `super` cannot call it")
+        for i in 0..<args.len()
+            if i >= choice.typed.len() || choice.typed[i] is None then check_statement(c, args[i].value)
+        return TExpr(at, ErrorType, UnitConst)
+    method_call(c, at, name_span, receiver, m, args, explicit, expected, true, choice.typed)
 
-// A method call passes the receiver first. The class's type arguments come from the receiver's
-// type, and the method's own, which follow them, are written or inferred as for a function.
-private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m: usize, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], direct: bool) -> &TExpr
+// The method of `ms`, the methods of `name` the receiver's type has, that a call chooses, and its
+// arguments as checked while choosing. One method is chosen without looking at the arguments.
+private pick_method(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, name: string, ms: Buf[usize], args: Buf[Argument], explicit: Option[Buf[&TypeExpr]]) -> Choice
+    if ms.len() == 1 || *receiver.ty is Nothing then return Choice(Some(ms[0]), buf())
+    var signatures: Buf[Signature] = buf()
+    for m in ms
+        signatures.push(method_signature(c, receiver, m, ErrorType))
+    choose(c, at, name_span, name, ms, signatures, args, explicit)
+
+// A call of a method of `name` on `receiver`, chosen among the overloads `ms` its type has.
+private call_method(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, name: string, ms: Buf[usize], args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], direct: bool) -> &TExpr
+    val choice = pick_method(c, at, name_span, receiver, name, ms, args, explicit)
+    choice.id match
+        Some(m) -> method_call(c, at, name_span, receiver, m, args, explicit, expected, direct, choice.typed)
+        None -> TExpr(at, ErrorType, UnitConst)
+
+// A method's signature as a call on `receiver` sees it: its parameters past the receiver, and the
+// type arguments of its class, or of the data type its impl adds it to, known from the receiver's
+// type. An inherited method's types name its own class's parameters, so the receiver is seen as an
+// instance of that class.
+private method_signature(c: *Checker, receiver: &TExpr, m: usize, result: &Type) -> Signature
     val target = c.symbols[m]
-    // An inherited method's types name its own class's parameters, so the receiver is seen as an
-    // instance of that class. A method an impl adds to a data type takes the value's type arguments.
     val receiver_type = zonk(c, receiver.ty)
     val known = target.owner_class match
         Some(k) -> *ancestor_type(c.classes, c.data, receiver_type, k).unwrap_or(receiver_type) match
@@ -3843,9 +4071,15 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
         params.push(target.params[i])
         names.push(target.param_names[i])
         defaults.push(None)
+    Signature(target.decl.name, true, target.type_params, target.type_owner, params, names, defaults, result, known)
+
+// A method call passes the receiver first. The class's type arguments come from the receiver's
+// type, and the method's own, which follow them, are written or inferred as for a function.
+private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m: usize, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], direct: bool, checked: Buf[Option[&TExpr]]) -> &TExpr
+    val target = c.symbols[m]
     if *receiver.ty is Nothing
-        for a in args
-            check_statement(c, a.value)
+        for i in 0..<args.len()
+            if i >= checked.len() || checked[i] is None then check_statement(c, args[i].value)
         return receiver
     // The receiver is evaluated before the arguments, so one that is computed is held while they are.
     var setup: Option[&TExpr] = None
@@ -3854,9 +4088,7 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
         val held = hidden_local(c, receiver.ty)
         setup = Some(TExpr(receiver.span, Unit, Let(held, receiver)))
         object = TExpr(receiver.span, receiver.ty, Local(held))
-    val declared = result_of(c, m, at)
-    val signature = Signature(target.decl.name, true, target.type_params, target.type_owner, params, names, defaults, declared, known)
-    val applied = apply(c, at, name_span, signature, args, explicit, expected, buf())
+    val applied = apply(c, at, name_span, method_signature(c, receiver, m, result_of(c, m, at)), args, explicit, expected, checked)
     var typed: Buf[&TExpr] = buf()
     typed.push(object)
     for a in applied.args
@@ -3868,7 +4100,7 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
     if !direct
         if *zonk(c, receiver.ty) is Class(r, _, _)
             if is_trait(c, r) then slot = Some(trait_slot(c, m))
-            elif is_open(c, r) then slot = table_position(c, r, target.decl.name)
+            elif is_open(c, r) then slot = table_position(c, r, m)
     val call = slot match
         Some(s) -> applied.wrap(at, Dispatch(m, s, typed, applied.type_args))
         None -> applied.wrap(at, Call(m, typed, applied.type_args))
