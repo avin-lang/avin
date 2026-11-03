@@ -458,7 +458,31 @@ is reserved for the standard library.
 - Creating an instance runs the superclass's constructor first, then stores the class parameters,
   then runs the class body top to bottom. Until every field is assigned, `self` may not be passed,
   stored, captured, or used to call a method, and a body statement may not read a field declared
-  below it. This is checked at compile time, so no field is ever observed uninitialized.
+  below it. This is checked at compile time, so no field is ever observed uninitialized:
+
+  ```text
+  class Counter(start: int)
+      var count = start
+      print(describe())            // error: `describe` is called before `label` is initialized
+      register(self)               // error: `self` is passed, stored or returned before `label` is initialized
+      val reader = () -> count     // error: a lambda that captures `self` is made before `label` is initialized
+      val label = s"counter $start"
+      register(self)               // every field is set: the body may use `self` freely
+      describe() -> string = s"$label: $count"
+  ```
+
+  Up to and including the initializer of its last field, a body uses `self` only to read a field
+  already set and to assign a field. Calling a method is an error however it is spelled — a bare
+  name, `self.describe()`, `super.describe()` — and so are passing, storing or returning `self` and
+  making a lambda, a by-name argument or a local function that uses a field or `self`, or a method
+  value of `self` (`describe` named without a call), since each can read a field before it is set.
+  An object's body follows the same rule.
+- An `open` or `abstract` class's body runs before any subclass's fields are set, so the object is
+  never complete while it runs: the limits above hold for the whole of it. After its own last field
+  it may call only a method that cannot be overridden (a private one) and that is itself safe: one
+  that uses `self` only to read and assign fields and to call other safe methods. A call that could
+  reach an override, directly or through such a method, is an error, as is passing, storing or
+  capturing `self`, a method value of `self` included.
 - Module-level `val`s, `var`s and `object`s initialize before `main`, in the order their
   initializers depend on one another. An initializer depends on every module value and object it
   reads, directly or through the functions it calls and the lambdas it makes; values that need

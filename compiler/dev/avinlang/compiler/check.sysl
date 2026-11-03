@@ -329,6 +329,7 @@ check_program(units: Buf[SourceUnit]) -> Checked
     for id in 0..<c.classes.len()
         settle_inherited_fields(&c, id)
         check_override_results(&c, id)
+    check_initialization(&c)
     for id in 0..<c.data.len()
         check_data_implementations(&c, id)
     for g in 0..<c.globals.len()
@@ -5224,3 +5225,231 @@ private unify_all(c: *Checker, xs: Buf[&Type], ys: Buf[&Type]) -> bool
     for i in 0..<xs.len()
         if !unify(c, xs[i], ys[i]) then return false
     true
+
+// Initialization: no field of an object is observed before the class body sets it. Until a class
+// body has initialized its last field, `self` may only read a field already initialized and assign
+// a field: it may not call a method, by any spelling, nor be passed, stored, returned or captured.
+// An open or abstract class's body runs before a subclass's fields are initialized, so all of it
+// keeps those limits, except that it may call a method that cannot be overridden and that is
+// itself safe: one whose body uses `self` only to read and assign fields and to call other safe
+// methods. Every function is checked first, so the bodies and the closures' captures are known.
+
+/** How one body's uses of `self` are judged. `self` is the local `self_local`, or the first
+ * parameter where that is absent. `last` names the class body's last field while it is not yet
+ * initialized, and is empty after it. `kind` is `open` or `abstract` for the body of such a class.
+ * With `report` false, nothing is reported: the scan only answers whether the body is safe. */
+struct InitScan
+    unit: usize
+    self_local: Option[usize]
+    last: string
+    kind: string
+    report: bool
+
+/** Checks every class body's uses of `self`. */
+private check_initialization(c: *Checker)
+    var unsafe = unsafe_methods(c)
+    for k in 0..<c.classes.len()
+        check_class_initialization(c, k, &unsafe)
+
+private check_class_initialization(c: *Checker, k: usize, unsafe: *Buf[bool])
+    val cls = c.classes[k]
+    if is_trait(c, k) then return
+    val body = c.bodies[cls.initializer] match
+        Some(b) -> b
+        None -> return
+    val items = body.kind match
+        Block(xs) -> xs
+        _ -> return
+    val self_local = items[0].kind match
+        Let(l, _) -> l
+        _ -> return
+    // The body's statements and field initializers are its items after the object is made, the
+    // superclass initialized and the parameters stored, and before the result.
+    var count = 0usize
+    var last = 0usize
+    var last_name = ""
+    for m in cls.decl.members
+        m match
+            FieldMember(f) ->
+                count += 1
+                last = count
+                last_name = f.name
+            StatementMember(_) -> count += 1
+            MethodMember(_, _, _) -> ()
+    if items.len() < count + 1 then return
+    val start = items.len() - 1 - count
+    val kind = if is_open(c, k) then cls.decl.modifier else ""
+    for i in 0..<count
+        val early = i < last
+        if !early && kind == "" then return
+        val scan = InitScan(cls.unit, Some(self_local), if early then last_name else "", kind, true)
+        val item = items[start + i]
+        // A field's initializer is checked as it is stored.
+        val e = item.kind match
+            StoreField(_, _, value, _) -> value
+            _ -> item
+        scan_init(c, scan, e, unsafe)
+
+/** The methods that cannot be called from an open or abstract class's body, which runs before a
+ * subclass's fields are initialized: those that use `self` for more than reading and assigning its
+ * fields and calling methods that can be. Every method is taken as safe until its body shows
+ * otherwise, and a method that calls an unsafe one is unsafe, so calls among methods settle. */
+private unsafe_methods(c: *Checker) -> Buf[bool]
+    var unsafe: Buf[bool] = buf()
+    for _ in c.symbols
+        unsafe.push(false)
+    var changed = true
+    while changed
+        changed = false
+        for m in 0..<c.symbols.len()
+            if !unsafe[m] && is_class_method(c, m)
+                val safe = c.bodies[m] match
+                    Some(b) -> scan_init(c, InitScan(c.symbols[m].unit, None, "", "", false), b, &unsafe)
+                    None -> false
+                if !safe
+                    unsafe.set(m, true)
+                    changed = true
+    unsafe
+
+private is_class_method(c: *Checker, f: usize) -> bool
+    val symbol = c.symbols[f]
+    symbol.owner_class is Some(_) && !symbol.constructor && symbol.root is None && !symbol.lambda
+
+private is_init_self(s: InitScan, e: &TExpr) -> bool = s.self_local match
+    Some(l) -> e.kind match
+        Local(x) -> x == l
+        _ -> false
+    None -> e.kind match
+        Param(i) -> i == 0
+        _ -> false
+
+private captures_init_self(c: *Checker, s: InitScan, f: usize) -> bool = s.self_local match
+    Some(l) -> contains_index(c.symbols[f].captured_locals, l)
+    None -> contains_index(c.symbols[f].captured_params, 0)
+
+/** Reports a use of `self` the body may not make: `early` describes it before the last field is
+ * initialized, `open` in an open or abstract class's body. Yields false, the scan's verdict. */
+private init_violation(c: *Checker, s: InitScan, at: Span, early: string, open: string) -> bool
+    if s.report
+        if s.last != "" then c.note(s.unit, at, s"$early before `${s.last}` is initialized; a class body uses `self` for more than reading and assigning its fields only once every field is")
+        else c.note(s.unit, at, s"$open in the body of an ${s.kind} class, which runs before a subclass's fields are initialized")
+    false
+
+/** Scans `e` for the uses of `self` that `s` forbids; yields whether there are none. */
+private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bool
+    if is_init_self(s, e) then return init_violation(c, s, e.span, "`self` is passed, stored or returned", "`self` cannot be passed, stored or returned")
+    e.kind match
+        Call(f, args, _) ->
+            var ok = true
+            var from = 0usize
+            val name = c.symbols[f].decl.name
+            if args.len() > 0 && is_class_method(c, f) && is_init_self(s, args[0])
+                from = 1
+                if s.last != "" then ok = init_violation(c, s, e.span, s"`$name` is called", "")
+                elif (*unsafe)[f] then ok = init_violation(c, s, e.span, "", s"`$name` uses `self` for more than its fields, so it cannot be called")
+            elif c.symbols[f].root is Some(_) && captures_init_self(c, s, f)
+                ok = init_violation(c, s, e.span, s"`$name`, which uses `self`, is called", s"`$name` uses `self`, so it cannot be called")
+            for i in from..<args.len()
+                if !scan_init(c, s, args[i], unsafe) then ok = false
+            ok
+        Dispatch(f, _, args, _) ->
+            var ok = true
+            var from = 0usize
+            val name = c.symbols[f].decl.name
+            if args.len() > 0 && is_init_self(s, args[0])
+                from = 1
+                ok = init_violation(c, s, e.span, s"`$name` is called", s"`$name` may be overridden, so it cannot be called")
+            for i in from..<args.len()
+                if !scan_init(c, s, args[i], unsafe) then ok = false
+            ok
+        FunctionValue(f, _) ->
+            if !captures_init_self(c, s, f) then return true
+            val symbol = c.symbols[f]
+            if symbol.delayed then init_violation(c, s, e.span, "an argument passed by name uses `self`", "an argument passed by name cannot use `self`")
+            elif symbol.lambda then init_violation(c, s, e.span, "a lambda that captures `self` is made", "a lambda cannot capture `self`")
+            else init_violation(c, s, e.span, s"`${symbol.decl.name}`, which uses `self`, is used as a value", s"`${symbol.decl.name}` uses `self`, so it cannot be used as a value")
+        Field(value, _) -> is_init_self(s, value) || scan_init(c, s, value, unsafe)
+        StoreField(object, _, value, _) ->
+            val target = is_init_self(s, object) || scan_init(c, s, object, unsafe)
+            scan_init(c, s, value, unsafe) && target
+        StoreGlobal(_, value, _) -> scan_init(c, s, value, unsafe)
+        CallValue(callee, args) ->
+            val ok = scan_init(c, s, callee, unsafe)
+            scan_init_all(c, s, args, unsafe) && ok
+        Construct(_, args) -> scan_init_all(c, s, args, unsafe)
+        Block(items) ->
+            if method_value_of_self(c, s, items) is Some(name) then return init_violation(c, s, e.span, s"`$name` is used as a value", s"`$name` cannot be used as a value")
+            scan_init_all(c, s, items, unsafe)
+        Let(_, value) -> scan_init(c, s, value, unsafe)
+        LetPattern(_, value) -> scan_init(c, s, value, unsafe)
+        Store(_, value, _) -> scan_init(c, s, value, unsafe)
+        MultiStore(_, value) -> scan_init(c, s, value, unsafe)
+        Negate(x) -> scan_init(c, s, x, unsafe)
+        Not(x) -> scan_init(c, s, x, unsafe)
+        Complement(x) -> scan_init(c, s, x, unsafe)
+        Convert(x) -> scan_init(c, s, x, unsafe)
+        Render(x) -> scan_init(c, s, x, unsafe)
+        Box(x) -> scan_init(c, s, x, unsafe)
+        Arith(_, a, b, _) ->
+            val ok = scan_init(c, s, a, unsafe)
+            scan_init(c, s, b, unsafe) && ok
+        Logic(_, a, b) ->
+            val ok = scan_init(c, s, a, unsafe)
+            scan_init(c, s, b, unsafe) && ok
+        Compare(operands, _) -> scan_init_all(c, s, operands, unsafe)
+        If(condition, yes, no) ->
+            var ok = scan_init(c, s, condition, unsafe)
+            if !scan_init(c, s, yes, unsafe) then ok = false
+            if no is Some(x) && !scan_init(c, s, x, unsafe) then ok = false
+            ok
+        While(_, condition, body, otherwise) ->
+            var ok = scan_init(c, s, condition, unsafe)
+            if !scan_init(c, s, body, unsafe) then ok = false
+            if otherwise is Some(x) && !scan_init(c, s, x, unsafe) then ok = false
+            ok
+        Break(_, value) -> value match
+            Some(x) -> scan_init(c, s, x, unsafe)
+            None -> true
+        Return(value) -> value match
+            Some(x) -> scan_init(c, s, x, unsafe)
+            None -> true
+        Match(subject, arms) ->
+            var ok = scan_init(c, s, subject, unsafe)
+            for arm in arms
+                if arm.guard is Some(g) && !scan_init(c, s, g, unsafe) then ok = false
+                if !scan_init(c, s, arm.body, unsafe) then ok = false
+            ok
+        Is(value, _, _) -> scan_init(c, s, value, unsafe)
+        Clauses(subjects, clauses) ->
+            var ok = scan_init_all(c, s, subjects, unsafe)
+            for clause in clauses
+                for b in clause.bodies
+                    if b.guard is Some(g) && !scan_init(c, s, g, unsafe) then ok = false
+                    if !scan_init(c, s, b.body, unsafe) then ok = false
+            ok
+        _ -> true
+
+/** The method's name when `items` make a method of `self` a value: the receiver held in a local,
+ * then a closure over that local that calls the method. */
+private method_value_of_self(c: *Checker, s: InitScan, items: Buf[&TExpr]) -> Option[string]
+    if items.len() != 2 then return None
+    val held = items[0].kind match
+        Let(l, value) -> if is_init_self(s, value) then l else return None
+        _ -> return None
+    val f = items[1].kind match
+        FunctionValue(f, _) -> f
+        _ -> return None
+    if !contains_index(c.symbols[f].captured_locals, held) then return None
+    val body = c.bodies[f] match
+        Some(b) -> b
+        None -> return None
+    body.kind match
+        Call(m, _, _) -> Some(c.symbols[m].decl.name)
+        Dispatch(m, _, _, _) -> Some(c.symbols[m].decl.name)
+        _ -> None
+
+private scan_init_all(c: *Checker, s: InitScan, items: Buf[&TExpr], unsafe: *Buf[bool]) -> bool
+    var ok = true
+    for item in items
+        if !scan_init(c, s, item, unsafe) then ok = false
+    ok
