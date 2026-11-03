@@ -42,6 +42,18 @@ a decision changes, this page and the chapter change together.
 - Functions and methods may be overloaded by parameter types. A call takes the most specific
   overload that accepts its arguments, chosen at compile time; an ambiguous call is an error.
   Same-named declarations with the same parameter types are an error.
+- [Overloads](/spec/declarations/#functions) are the functions of one name in one scope. A block's
+  local functions of a name hide every outer function of that name, whatever their parameter types,
+  and a program's own top-level functions hide the prelude's of the same name.
+- Choosing an overload tries integer literals and lambdas against each candidate's parameter; every
+  other argument is checked once on its own, and only its type is tried. A literal fits any
+  parameter that can hold it, so `f(1)` with `f(int)` and `f(long)` is ambiguous.
+- A generic overload is compared by the same rule as any other: `f(x: int)` is more specific than
+  `f[T](x: T)`, which accepts an `int` while `f(int)` does not accept a `T`.
+- Whether a parameter is by-name does not distinguish overloads. An argument some candidate takes by
+  name is delayed; an overload that takes it strictly evaluates it once, at the call.
+- An overloaded function used as a value needs an expected function type, which chooses the
+  overload. `main` cannot be overloaded.
 - A class's parameter list is its one constructor. Class parameters are private immutable fields
   (`val` makes one public and read-only, `var` public and mutable), and the statements in the class
   body are the constructor's code, run top to bottom when an instance is created.
@@ -124,6 +136,12 @@ a decision changes, this page and the chapter change together.
 - Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
 - Async and await.
 - Partial-function literal syntax, which the user has explicitly left undecided.
+
+## Proposed
+
+- An integer literal prefers its own type when overloads differ only in the types a literal could
+  take: `f(1)` with `f(int)` and `f(long)`, or with `f(int)` and `f(real)`, would call `f(int)`
+  rather than be ambiguous. As settled, such a call is ambiguous.
 
 ## Open
 

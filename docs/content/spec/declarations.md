@@ -66,6 +66,48 @@ their parameter types differ. A call chooses among them by its arguments:
   ambiguous.
 - A function used as a value takes its overload from the expected function type.
 
+```text
+describe(n: int) -> string = s"int $n"
+describe(s: string) -> string = s"string $s"
+which[T](x: T) -> string = "any"
+which(x: int) -> string = "int"
+
+describe(1)                             // int 1
+which(1)                                // int: the generic one accepts an int, but not the reverse
+which("x")                              // any
+val f: (string) -> string = describe    // the string overload
+```
+
+Choosing an overload works as follows:
+
+- **Which arguments decide.** An integer literal and a lambda take their types from their
+  parameter, so each candidate tries them against its own: the literal fits a parameter whose type
+  can hold its value (`int`, `long`, the other widths, `byte`, `real`), and the lambda a parameter
+  that is a function of as many parameters. Every other argument is checked once, on its own, and
+  only its type is tried against each candidate; when every candidate gives it the same parameter
+  type it is checked against that type. So `measure(1)` is ambiguous between `measure(n: int)` and
+  `measure(r: real)`, and so is `wide(1)` between `int` and `long`, since neither type conforms to
+  the other.
+- **Generic overloads.** A generic overload is compared by the same rule: `which(x: int)` is more
+  specific than `which[T](x: T)`, because `which[T]` accepts an `int` and `which(int)` does not
+  accept a `T`. Of `f[T](x: T)` and `f[T](x: Maybe[T])`, the second is the more specific. Written
+  type arguments, as in `which[int](1)`, leave only the overloads with at least that many type
+  parameters.
+- **Defaults.** The most specific is compared over the parameters the call's arguments are given
+  to, so `sized(n: int)` and `sized(n: int, scale: int = 2)` both accept `sized(1)` and neither is
+  more specific: the call is ambiguous. `sized(1, 3)` is not.
+- **By-name parameters.** Whether a parameter is by-name does not tell two overloads apart:
+  `f(x: -> int)` and `f(x: int)` are the same parameter types. An argument that some candidate takes
+  by name is delayed, as that candidate needs it; when the chosen overload takes it strictly, it is
+  evaluated once, at the call.
+- **Scopes.** Overloads are the functions of one name in one scope: the top-level functions of one
+  file, or the local functions of one block. A block's local functions of a name hide every outer
+  function of that name, whatever their parameter types, and a program's own top-level functions of
+  a name hide the prelude's.
+- **Function values.** An overloaded name used as a value with no expected function type is an
+  error, as is one whose expected type no overload's parameters accept. `main` cannot be
+  overloaded, and a variant's name is not overloaded by a function of the same name.
+
 Two declarations with the same name and the **same** parameter types are an error: a function that
 chooses by its arguments' values is written with clauses, described next.
 
