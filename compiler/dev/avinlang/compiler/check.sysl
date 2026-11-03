@@ -279,7 +279,6 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function) -
     for tp in f.type_params
         if tp.bounds.len() > 0 then c.note(unit, tp.span, "bounds on type parameters are not implemented")
         if !(tp.variance is Invariant) then c.note(unit, tp.span, "variance is written on the parameters of a type, not of a function")
-    if f.guard is Some(g) then c.note(unit, g.span, "function guards are not implemented")
     for p in f.params
         p.pattern.kind match
             Name(n) -> names.push(n)
@@ -291,7 +290,7 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function) -
         params.push(resolve_type(c, unit, p.ty))
     var result: Option[&Type] = None
     if f.result is Some(r) then result = Some(resolve_type(c, unit, r))
-    elif f.body is None then result = Some(Unit)
+    elif f.body is None && f.clauses.len() == 0 then result = Some(Unit)
     elif f.body is Some(b)
         if b.kind is Block(_, true) then result = Some(Unit)
     val intrinsic = intrinsic_of(c, unit, f)
@@ -302,8 +301,8 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function) -
                 if !same_type(declared, expected)
                     c.note(unit, f.name_span, s"intrinsic `$name` has type ${type_name(expected)}, not ${type_name(declared)}")
             None -> c.note(unit, f.name_span, s"`$name` is not an intrinsic")
-    elif f.body is None
-        c.note(unit, f.name_span, s"`${f.name}` needs a body")
+    elif f.body is None && f.clauses.len() == 0
+        c.note(unit, f.name_span, s"`${f.name}` needs a body, or clauses on the lines after it")
     c.generic = outer_generic
     FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf())
 
@@ -369,24 +368,87 @@ private check_function(c: *Checker, id: usize)
     if c.states.at(id) != 0 then return
     c.states.set(id, 1)
     val symbol = c.symbols.at(id)
-    symbol.decl.body match
-        Some(body) ->
-            val previous = c.current
-            val outer = c.body
-            c.current = id
-            c.body = fresh_body(id)
-            val outer_generic = c.generic
-            c.generic = if symbol.decl.type_params.len() > 0 then Some(GenericScope(id, symbol.decl.type_params)) else None
-            check_body(c, id, body)
-            c.generic = outer_generic
-            finish_captures(c)
-            c.locals.set(id, c.body.locals)
-            for f in local_functions_of(c, id)
-                c.locals.set(f, c.body.locals)
-            c.current = previous
-            c.body = outer
-        None -> ()
+    if symbol.decl.body is Some(_) || symbol.decl.clauses.len() > 0
+        val previous = c.current
+        val outer = c.body
+        c.current = id
+        c.body = fresh_body(id)
+        val outer_generic = c.generic
+        c.generic = if symbol.decl.type_params.len() > 0 then Some(GenericScope(id, symbol.decl.type_params)) else None
+        var subjects: Buf[&TExpr] = buf()
+        for i in 0..<symbol.params.len()
+            subjects.push(TExpr(symbol.decl.name_span, symbol.params.at(i), Param(i)))
+        check_definition(c, id, subjects)
+        c.generic = outer_generic
+        finish_captures(c)
+        c.locals.set(id, c.body.locals)
+        for f in local_functions_of(c, id)
+            c.locals.set(f, c.body.locals)
+        c.current = previous
+        c.body = outer
     c.states.set(id, 2)
+
+// Checks a function's body or clauses; `subjects` are its parameters' values, which its clauses
+// match.
+private check_definition(c: *Checker, id: usize, subjects: Buf[&TExpr])
+    val decl = c.symbols.at(id).decl
+    if decl.body is Some(body) then check_body(c, id, body)
+    elif decl.clauses.len() > 0 then check_clauses(c, id, subjects)
+
+// Each clause is checked like a match arm over all the parameters at once: its pattern names are
+// scoped to the clause, its bodies must agree with the result, and the clauses that can always be
+// taken once their patterns match must together cover every combination of arguments.
+private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
+    val symbol = c.symbols.at(id)
+    val decl = symbol.decl
+    val unit = symbol.unit
+    var typed: Buf[TClause] = buf()
+    var ty: &Type = Nothing
+    var agreed = true
+    for clause in decl.clauses
+        if clause.patterns.len() != symbol.params.len()
+            c.note(unit, clause.span, s"`${symbol.name}` takes ${count(symbol.params.len(), "argument")}, but this clause matches ${clause.patterns.len()}")
+            continue
+        val mark = c.body.visible.len()
+        val outer_start = c.body.block_start
+        c.body.block_start = mark
+        var patterns: Buf[&TPattern] = buf()
+        for i in 0..<clause.patterns.len()
+            patterns.push(check_pattern(c, clause.patterns.at(i), symbol.params.at(i), ""))
+        var bodies: Buf[TGuarded] = buf()
+        for b in clause.bodies
+            var guard: Option[&TExpr] = None
+            if b.guard is Some(g)
+                val t = check_expr(c, g, Some(Bool))
+                expect_bool(c, t)
+                guard = Some(t)
+            val body = check_expr(c, b.body, symbol.result)
+            symbol.result match
+                Some(declared) ->
+                    if !conforms(body.ty, declared) && !(*declared is Unit)
+                        c.note(unit, b.body.span, s"`${symbol.name}` yields ${type_name(body.ty)}, not ${type_name(declared)}")
+                None ->
+                    if agreed
+                        join(ty, body.ty) match
+                            Some(t) -> ty = t
+                            None ->
+                                c.note(unit, b.body.span, s"this clause yields ${type_name(body.ty)}, but the clauses before it yield ${type_name(ty)}")
+                                agreed = false
+            bodies.push(TGuarded(guard, body))
+        c.body.visible.truncate(mark)
+        c.body.block_start = outer_start
+        typed.push(TClause(patterns, bodies))
+    if symbol.result is None then c.symbols[id].result = Some(if agreed then ty else ErrorType)
+    var settled_params = true
+    for t in symbol.params
+        if !settled(t) then settled_params = false
+    if settled_params && typed.len() == decl.clauses.len() && !clauses_cover(typed, symbol.params, c.data)
+        var blanks = ""
+        for i in 0..<symbol.params.len()
+            blanks = blanks + (if i == 0 then "_" else ", _")
+        c.note(unit, decl.name_span, s"the clauses of `${symbol.name}` do not cover every argument; add a clause for the rest, such as `${symbol.name}($blanks)`")
+    val result = c.symbols.at(id).result.unwrap_or(ErrorType)
+    c.bodies.set(id, Some(TExpr(decl.span, result, Clauses(subjects, typed))))
 
 // Checks a function's body against its declared result, or infers the result from it.
 private check_body(c: *Checker, id: usize, body: &Expr)
@@ -503,7 +565,10 @@ private check_local_function(c: *Checker, decl: &Function) -> usize
     for i in 0..<symbol.params.len()
         param_locals.push(declare_local(c, decl.span, symbol.param_names.at(i), symbol.params.at(i), false))
     c.symbols[id].param_locals = param_locals
-    if decl.body is Some(body) then check_body(c, id, body)
+    var subjects: Buf[&TExpr] = buf()
+    for i in 0..<param_locals.len()
+        subjects.push(TExpr(decl.name_span, symbol.params.at(i), Local(param_locals.at(i))))
+    check_definition(c, id, subjects)
     c.body.visible.truncate(mark)
     c.body.block_start = outer_start
     c.body.loops = loops
@@ -1270,7 +1335,37 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
             if !(*ty is Int(_) || *ty is Byte || *ty is Char)
                 c.note(unit, p.span, s"range patterns match integers, bytes and chars, not ${type_name(ty)}")
                 return TPattern(p.span, ErrorType, PWildcard)
-            TPattern(p.span, ty, PRange(low, high, inclusive))
+            TPattern(p.span, ty, PBounds(None, Some(TBound(low, true)), Some(TBound(high, inclusive))))
+        Bounded(binder, lower, upper) ->
+            if settled(ty) && !(*ty is Int(_) || *ty is Byte || *ty is Char)
+                c.note(unit, p.span, s"comparison patterns match integers, bytes and chars, not ${type_name(ty)}")
+                return TPattern(p.span, ErrorType, PWildcard)
+            var ok = settled(ty)
+            var low: Option[TBound] = None
+            if lower is Some(b)
+                val t = pattern_constant(c, b.value, ty)
+                if settled(t.ty) then low = Some(TBound(t, b.inclusive)) else ok = false
+            var high: Option[TBound] = None
+            if upper is Some(b)
+                val t = pattern_constant(c, b.value, ty)
+                if settled(t.ty) then high = Some(TBound(t, b.inclusive)) else ok = false
+            val local = binder_local(c, binder, ty, no_bind)
+            if !ok then return TPattern(p.span, ErrorType, PWildcard)
+            TPattern(p.span, ty, PBounds(local, low, high))
+        Successor(binder, amount) ->
+            if settled(ty) && !(*ty is Int(_))
+                c.note(unit, p.span, s"`n + k` patterns match integers, not ${type_name(ty)}")
+                return TPattern(p.span, ErrorType, PWildcard)
+            val k = pattern_constant(c, amount, ty)
+            val local = binder_local(c, binder, ty, no_bind)
+            if !settled(k.ty) then return TPattern(p.span, ErrorType, PWildcard)
+            val positive = k.kind match
+                IntConst(digits) -> !digits.starts_with("-") && digits != "0"
+                _ -> false
+            if !positive
+                c.note(unit, amount.span, "the amount in `n + k` is a positive integer literal")
+                return TPattern(p.span, ErrorType, PWildcard)
+            TPattern(p.span, ty, PSuccessor(local, k))
         Alternatives(options) ->
             var typed: Buf[&TPattern] = buf()
             for o in options
@@ -1286,6 +1381,19 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
         Tuple(_) ->
             c.note(unit, p.span, "tuple patterns are not implemented")
             TPattern(p.span, ErrorType, PWildcard)
+
+// The local a comparison or `n + k` pattern binds: none for `_`. A name that is a variant is not a
+// binder there.
+private binder_local(c: *Checker, binder: &Pattern, ty: &Type, no_bind: string) -> Option[usize] = binder.kind match
+    Name(name) ->
+        if c.variants.get(name) is Some(_)
+            c.note(unit_of(c), binder.span, s"`$name` is a variant; a comparison binds a name or `_`")
+            return None
+        if no_bind != ""
+            c.note(unit_of(c), binder.span, no_bind)
+            return None
+        Some(declare_local(c, binder.span, name, ty, false))
+    _ -> None
 
 // A variant pattern matches a value of the variant's own type, and each field pattern the field's
 // type in the matched value's type.

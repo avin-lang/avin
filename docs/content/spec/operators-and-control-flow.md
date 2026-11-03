@@ -92,6 +92,11 @@ expression, checked for exhaustiveness. Patterns include:
 
 - literals, including negative numbers;
 - inclusive and exclusive literal ranges (`'a'..'z'`, `0..<10`);
+- comparison patterns, which bind the value to a name or `_` beside one literal bound or between
+  two: `n < 0`, `n >= 100`, `0 <= n < 10`, `'a' <= c <= 'z'`. Between two bounds the comparisons
+  are `<` or `<=`;
+- `n + k`, where `k` is a positive integer literal: it matches an integer of at least `k` and binds
+  `n` to the value minus `k`, which never overflows;
 - constructors with nested patterns, tuples and `()`;
 - list patterns: `head :: tail` matches a non-empty `List`, grouping to the right
   (`first :: second :: rest`);
@@ -103,8 +108,22 @@ expression, checked for exhaustiveness. Patterns include:
 - named patterns (`whole @ Some(x)`);
 - `_`.
 
-A guard (`n if n > 0 ->`) is evaluated at most once per arm. Range patterns do not count toward
-exhaustiveness, so a scalar match that uses them needs a catch-all.
+Ranges and comparison patterns match integers, bytes and chars; `n + k` matches integers. Every
+pattern form may appear wherever a pattern does, nested inside a constructor (`Some(n > 0)`) or in a
+function's [clauses](/spec/declarations/#clauses).
+
+A guard (`n if n > 0 ->`) is evaluated at most once per arm. Literals, ranges, comparison patterns
+and `n + k` count toward exhaustiveness by the values they leave out, so arms that together reach
+every integer need no catch-all:
+
+```text
+bucket(n: int) -> string = n match
+    n < 0 -> "negative"
+    0 <= n < 10 -> "digit"
+    n >= 10 -> "large"
+```
+
+Guards do not count, since a guard may fail.
 
 ## return and end markers
 

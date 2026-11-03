@@ -5,12 +5,26 @@ import sysl.buf.{Buf, buf}
 
 // Exhaustiveness. The patterns of a match form a matrix: one row per unguarded arm, one column per
 // value being matched. The matrix covers its columns when every combination of values matches some
-// row. A column is decided by splitting it on the cases its type enumerates (`true` and `false` for
-// `bool`, the variants of a data type, whose fields become columns of their own); a type with too many values to enumerate (integers, chars) is covered only by rows that
-// match anything there. Rows with a guard are left out, since a guard may always fail.
+// row. A column is decided by splitting it on the cases its type enumerates: `true` and `false` for
+// `bool`, and the variants of a data type, whose fields become columns of their own. An integer,
+// byte or char column is split into the stretches of values that no pattern's bounds divide, so
+// literals, ranges, comparisons and `n + k` together cover it when every stretch is matched. Rows
+// with a guard are left out, since a guard may always fail.
 
 private struct Row
     items: Buf[&TPattern]
+
+/** Whether the clauses of a function cover every combination of arguments of the parameter
+ * types; a clause counts when one of its bodies has no guard. */
+clauses_cover(clauses: Buf[TClause], params: Buf[&Type], data: Buf[DataSymbol]) -> bool
+    var rows: Buf[Row] = buf()
+    for clause in clauses
+        var always = false
+        for b in clause.bodies
+            if b.guard is None then always = true
+        if always then rows.push(Row(clause.patterns))
+    if params.len() == 0 then return rows.len() > 0
+    covers(rows, params, data)
 
 /** Whether the unguarded arms of a match on a value of type `ty` cover every value. */
 match_covers(arms: Buf[TArm], ty: &Type, data: Buf[DataSymbol]) -> bool
@@ -79,6 +93,158 @@ private specialize(row: Row, case: Case) -> Row
         items.push(row.items.at(i))
     Row(items)
 
+// Integer, byte and char values are written as signed decimal strings, so integers of any width
+// compare exactly.
+
+/** An inclusive stretch of values. */
+private struct Interval
+    low: string
+    high: string
+
+// The values of an ordered scalar type, as stretches in increasing order; empty for any other type.
+// A char is a Unicode scalar, so the surrogates are not among its values.
+private domain_of(t: &Type) -> Buf[Interval]
+    var out: Buf[Interval] = buf()
+    *t match
+        Int(bits) ->
+            val minimum = min_digits(bits)
+            out.push(Interval(minimum, decrement(minimum[1..])))
+        Byte -> out.push(Interval("0", "255"))
+        Char ->
+            out.push(Interval("0", "55295"))
+            out.push(Interval("57344", "1114111"))
+        _ -> ()
+    out
+
+private constant_value(e: &TExpr) -> string = e.kind match
+    IntConst(digits) -> digits
+    CharConst(code) -> code.to_string()
+    _ -> "0"
+
+// The values a pattern matches in an ordered column, given the type's least and greatest values;
+// none for a pattern that does not constrain the column by order.
+private interval_of(p: &TPattern, least: string, greatest: string) -> Option[Interval] = p.kind match
+    PLiteral(value) ->
+        val v = constant_value(value)
+        Some(Interval(v, v))
+    PBounds(_, lower, upper) ->
+        var low = least
+        var high = greatest
+        if lower is Some(b) then low = if b.inclusive then constant_value(b.value) else successor(constant_value(b.value))
+        if upper is Some(b) then high = if b.inclusive then constant_value(b.value) else predecessor(constant_value(b.value))
+        Some(Interval(low, high))
+    PSuccessor(_, amount) -> Some(Interval(constant_value(amount), greatest))
+    _ -> None
+
+// Every boundary of every row's stretch and of the domain cuts the values into pieces that each row
+// either matches entirely or not at all; each piece inside the domain must be covered by the rows
+// that match it, on the remaining columns.
+private covers_ordered(rows: Buf[Row], domain: Buf[Interval], rest: Buf[&Type], data: Buf[DataSymbol]) -> bool
+    val least = domain.at(0).low
+    val greatest = domain.at(domain.len() - 1).high
+    var cuts: Buf[string] = buf()
+    for d in domain
+        add_cut(cuts, d.low)
+        add_cut(cuts, successor(d.high))
+    for row in rows
+        if interval_of(row.items.at(0), least, greatest) is Some(i)
+            if compare_signed(i.low, i.high) <= 0
+                add_cut(cuts, i.low)
+                add_cut(cuts, successor(i.high))
+    for k in 0..<cuts.len() - 1
+        val start = cuts.at(k)
+        var inside = false
+        for d in domain
+            if compare_signed(d.low, start) <= 0 && compare_signed(start, d.high) <= 0 then inside = true
+        if !inside then continue
+        var specialized: Buf[Row] = buf()
+        for row in rows
+            val head = row.items.at(0)
+            var matched = unconstrained(head)
+            if interval_of(head, least, greatest) is Some(i)
+                matched = compare_signed(i.low, start) <= 0 && compare_signed(start, i.high) <= 0
+            if matched then specialized.push(tail_of(row))
+        if !covers(specialized, rest, data) then return false
+    true
+
+// Inserts a value into a sorted list of distinct values.
+private add_cut(cuts: Buf[string], value: string)
+    var at = 0usize
+    while at < cuts.len()
+        val order = compare_signed(cuts.at(at), value)
+        if order == 0 then return
+        if order > 0 then break
+        at += 1
+    cuts.push(value)
+    var i = cuts.len() - 1
+    while i > at
+        cuts.set(i, cuts.at(i - 1))
+        i -= 1
+    cuts.set(at, value)
+
+/** Compares two signed decimal integers: negative, zero or positive. */
+compare_signed(a: string, b: string) -> int
+    val a_negative = a.starts_with("-")
+    val b_negative = b.starts_with("-")
+    if a_negative != b_negative then return if a_negative then -1 else 1
+    if a_negative then return compare_magnitude(b[1..], a[1..])
+    compare_magnitude(a, b)
+
+private compare_magnitude(a: string, b: string) -> int
+    if a.bytes.len != b.bytes.len then return if a.bytes.len < b.bytes.len then -1 else 1
+    for i in 0..<a.bytes.len
+        if a.bytes[i] != b.bytes[i] then return if a.bytes[i] < b.bytes[i] then -1 else 1
+    0
+
+/** The signed decimal integer one greater. */
+successor(a: string) -> string
+    if a.starts_with("-")
+        val m = decrement(a[1..])
+        return if m == "0" then "0" else "-" + m
+    increment(a)
+
+/** The signed decimal integer one less. */
+predecessor(a: string) -> string
+    if a == "0" then return "-1"
+    if a.starts_with("-") then return "-" + increment(a[1..])
+    decrement(a)
+
+// One more than a decimal magnitude.
+private increment(m: string) -> string
+    var digits: Buf[u8] = buf()
+    for b in m.bytes
+        digits.push(b)
+    var i = digits.len()
+    loop
+        if i == 0 then return "1" + digits_text(digits)
+        i -= 1
+        if digits.at(i) == u8('9') then digits.set(i, u8('0'))
+        else
+            digits.set(i, digits.at(i) + 1)
+            return digits_text(digits)
+
+// One less than a positive decimal magnitude, without a leading zero.
+private decrement(m: string) -> string
+    var digits: Buf[u8] = buf()
+    for b in m.bytes
+        digits.push(b)
+    var i = digits.len()
+    while i > 0
+        i -= 1
+        if digits.at(i) == u8('0') then digits.set(i, u8('9'))
+        else
+            digits.set(i, digits.at(i) - 1)
+            break
+    val text = digits_text(digits)
+    if text.bytes.len > 1 && text.bytes[0] == u8('0') then return text[1..]
+    text
+
+private digits_text(digits: Buf[u8]) -> string
+    var out = ""
+    for d in digits
+        out = out + char(d).to_string()
+    out
+
 private with_head(row: Row, head: &TPattern) -> Row
     var items: Buf[&TPattern] = buf()
     items.push(head)
@@ -117,6 +283,9 @@ private covers(rows: Buf[Row], types: Buf[&Type], data: Buf[DataSymbol]) -> bool
     var defaults: Buf[Row] = buf()
     for row in rows
         if unconstrained(row.items.at(0)) then defaults.push(tail_of(row))
+    if defaults.len() < rows.len()
+        val domain = domain_of(types.at(0))
+        if domain.len() > 0 then return covers_ordered(rows, domain, rest, data)
     val cases = cases_of(types.at(0), data)
     if defaults.len() == rows.len() || cases.len() == 0 then return covers(defaults, rest, data)
     for case in cases

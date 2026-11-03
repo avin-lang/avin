@@ -40,13 +40,20 @@ a decision changes, this page and the chapter change together.
 - The receiver is implicit: members are in scope by their bare names, and `self` names the instance.
 - Functions and methods may be overloaded by parameter types. A call takes the most specific
   overload that accepts its arguments, chosen at compile time; an ambiguous call is an error.
-  Same-named declarations with the same parameter types are clauses of one function.
+  Same-named declarations with the same parameter types are an error.
 - A class's parameter list is its one constructor. Class parameters are private immutable fields
   (`val` makes one public and read-only, `var` public and mutable), and the statements in the class
   body are the constructor's code, run top to bottom when an instance is created.
 - Every function declaration parameter has an explicit type.
-- Parameter patterns, multiple clauses selected by pattern, and clause guards are supported.
-  Their exact spelling is provisional.
+- A function may be defined by [clauses](/spec/declarations/#clauses): its signature with no body,
+  then lines `f(patterns) = body`, tried in order. A clause is guarded inline,
+  `f(n) | n > 0 = body`, or by an indented block of `| condition = body` lines in which `| _` always
+  holds; when every guard fails, the next clause is tried. Clauses must cover every argument, and a
+  clause counts toward that only through an unguarded body.
+- Comparison patterns bind a name or `_` beside one literal bound or between two (`n < 0`,
+  `0 <= n < 10`), and `n + k` matches an integer of at least the positive literal `k`, binding the
+  value minus `k`. Both go wherever a pattern does, on integers (comparisons also on bytes and
+  chars), and they count toward exhaustiveness, as literals and ranges do.
 - Variadic parameters are written `values: T*`; by-name parameters are written `value: -> T`, with no
   memoization.
 - Blocks yield their last expression. `if`, `while` and loop values follow Sysl.
@@ -107,4 +114,3 @@ a decision changes, this page and the chapter change together.
 ## Open
 
 - Resource cleanup: a `defer` construct or a library `use`.
-- The exact spelling of function clauses, guards and parameter patterns.

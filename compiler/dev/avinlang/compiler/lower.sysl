@@ -454,6 +454,7 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         None
     Match(subject, arms) -> lower_match(l, e, subject, arms)
     Is(value, pattern, negated) -> lower_is(l, value, pattern, negated)
+    Clauses(subjects, clauses) -> lower_clauses(l, e, subjects, clauses)
     Return(value) ->
         var v: Option[Operand] = None
         var dead = false
@@ -724,6 +725,29 @@ private lower_match(l: *Lowering, e: &TExpr, subject: &TExpr, arms: Buf[TArm]) -
     finish_into(l, Trap, join)
     load(l, slot)
 
+// Each clause tests its patterns against the arguments, then tries its bodies' guards in order; when
+// the patterns fail, or every guard does, the next clause is tried. The checker has proved the
+// clauses cover every argument, so falling past the last one traps.
+private lower_clauses(l: *Lowering, e: &TExpr, subjects: Buf[&TExpr], clauses: Buf[TClause]) -> Option[Operand]
+    var values: Buf[Option[Operand]] = buf()
+    for s in subjects
+        values.push(lower_expr(l, s))
+    val slot = new_slot(l, e.ty)
+    val join = new_block(l)
+    for clause in clauses
+        val fail = new_block(l)
+        for i in 0..<clause.patterns.len()
+            test_pattern(l, clause.patterns.at(i), values.at(i), fail)
+        for b in clause.bodies
+            val next = new_block(l)
+            if b.guard is Some(g)
+                if lower_expr(l, g) is Some(ok) then continue_if(l, ok, next)
+            store(l, slot, lower_expr(l, b.body))
+            finish_into(l, Jump(join), next)
+        finish_into(l, Jump(fail), fail)
+    finish_into(l, Trap, join)
+    load(l, slot)
+
 private lower_is(l: *Lowering, value: &TExpr, pattern: &TPattern, negated: bool) -> Option[Operand]
     val v = lower_expr(l, value)
     if v is None && machine(l, value.ty) is Some(_) then return None
@@ -749,10 +773,19 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
         PLiteral(constant) ->
             if value is Some(v)
                 if lower_expr(l, constant) is Some(k) then continue_if(l, compare(l, compare_op(Equal, p.ty), v, k), fail)
-        PRange(lower, upper, inclusive) ->
+        PBounds(local, lower, upper) ->
             if value is Some(v)
-                if lower_expr(l, lower) is Some(low) then continue_if(l, compare(l, compare_op(GreaterEqual, p.ty), v, low), fail)
-                if lower_expr(l, upper) is Some(high) then continue_if(l, compare(l, compare_op(if inclusive then LessEqual else Less, p.ty), v, high), fail)
+                if lower is Some(b)
+                    if lower_expr(l, b.value) is Some(low) then continue_if(l, compare(l, compare_op(if b.inclusive then GreaterEqual else Greater, p.ty), v, low), fail)
+                if upper is Some(b)
+                    if lower_expr(l, b.value) is Some(high) then continue_if(l, compare(l, compare_op(if b.inclusive then LessEqual else Less, p.ty), v, high), fail)
+            if local is Some(index) then store(l, l.local_slots.at(index), value)
+        PSuccessor(local, amount) ->
+            if value is Some(v)
+                if lower_expr(l, amount) is Some(k)
+                    continue_if(l, compare(l, compare_op(GreaterEqual, p.ty), v, k), fail)
+                    // The value is at least the positive amount, so the difference cannot overflow.
+                    if local is Some(index) then store(l, l.local_slots.at(index), Some(binary(l, MInt(int_bits(p.ty)), OpSub, v, k)))
         PAlternatives(options) ->
             val matched = new_block(l)
             for i in 0..<options.len()

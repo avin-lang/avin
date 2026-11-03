@@ -32,21 +32,52 @@ their parameter types differ. A call chooses among them by its arguments:
   ambiguous.
 - A function used as a value takes its overload from the expected function type.
 
-Same-named declarations with the **same** parameter types are not overloads but the clauses of one
-function, described next.
+Two declarations with the same name and the **same** parameter types are an error: a function that
+chooses by its arguments' values is written with clauses, described next.
 
 Variadic parameters are final and written `values: T*`. A call passes zero or more `T`s, or splices
 an existing sequence with `f(xs*)`.
 
-Multiple clauses with patterns and guards select by argument:
+### Clauses
+
+A function may be defined by **clauses**: its signature on one line with no body, then one clause
+per line, each the function's name applied to a pattern per parameter:
 
 ```text
-fib(0: int) -> int = 0
-fib(1: int) -> int = 1
-fib(n: int) -> int | n > 1 = fib(n - 1) + fib(n - 2)
+classify(n: int) -> string
+classify(0) = "zero"
+classify(n)
+    | n < 0 = "negative"
+    | n < 10 = "small"
+    | _ = "large"
+
+fib(n: int) -> int
+fib(n < 2) = n
+fib(n) = fib(n - 1) + fib(n - 2)
+
+area(s: Shape) -> real
+area(Circle(r)) = 3.14159 * r * r
+area(Rect(w, h)) = w * h
 ```
 
-The exact clause and guard spelling is provisional.
+The signature carries the types, the result type and any type parameters; a clause's patterns carry
+none. A call tries the clauses in order and runs the first whose patterns match the arguments. The
+names a clause's patterns bind are its own.
+
+A clause may be guarded:
+
+- `f(patterns) | condition = body` is taken only when the condition holds.
+- `f(patterns)` followed by an indented block of `| condition = body` lines tries each guard in
+  order; `| _ = body` always holds and ends the block.
+- When the patterns match but every guard fails, the next clause is tried.
+
+A body after `=` is one expression on the same line or an indented block. Without a declared result
+type, the result is inferred from the clauses' bodies, which must agree; a recursive function
+declares it.
+
+The clauses must cover every combination of arguments, as the arms of a `match` must. A guarded
+clause counts toward that only when one of its bodies has no guard, or `| _`, so the clauses above
+end with one that matches anything. A local function may be defined by clauses too.
 
 A function declared inside a block is a **local function**. It can be called from anywhere in its
 block, including before its declaration, and it sees the locals declared before it, the enclosing

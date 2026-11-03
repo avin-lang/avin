@@ -126,7 +126,7 @@ private pattern_separator(p: *Parser) -> bool
     true
 
 private parse_named_pattern(p: *Parser) -> &Pattern
-    val inner = parse_range_pattern(p)
+    val inner = parse_comparison_pattern(p)
     if !p.at("@") then return inner
     val at = p.toks.here()
     p.toks.advance()
@@ -147,11 +147,54 @@ private parse_range_pattern(p: *Parser) -> &Pattern
     val high = literal_of(p, upper)
     Pattern(lower.span.to(upper.span), Range(low, high, inclusive))
 
-private literal_of(p: *Parser, pattern: &Pattern) -> &Expr = pattern.kind match
+private literal_of(p: *Parser, pattern: &Pattern) -> &Expr = bound_of(p, pattern, "a range pattern's bounds are literals")
+
+private bound_of(p: *Parser, pattern: &Pattern, message: string) -> &Expr = pattern.kind match
     Literal(value) -> value
     _ ->
-        p.report.add(error(pattern.span, "a range pattern's bounds are literals"))
+        p.report.add(error(pattern.span, message))
         Expr(pattern.span, Invalid)
+
+private binder(pattern: &Pattern) -> bool = pattern.kind is Name(_) || pattern.kind is Wildcard
+
+// `n + k` and the comparison patterns: `n < k`, `n <= k`, `n > k`, `n >= k`, and a bound before
+// the name, `lo <= n` or `lo <= n < hi`, with `<` or `<=` on either side. The name may be `_`.
+private parse_comparison_pattern(p: *Parser) -> &Pattern
+    val first = parse_range_pattern(p)
+    if p.at("+") && binder(first)
+        p.toks.advance()
+        val amount = parse_pattern_atom(p)
+        val k = bound_of(p, amount, "the amount in `n + k` is a positive integer literal")
+        return Pattern(first.span.to(amount.span), Successor(first, k))
+    if !at_comparison(p) then return first
+    val at = p.toks.here()
+    val op = p.ahead(0)
+    p.toks.advance()
+    if binder(first)
+        val limit = parse_pattern_atom(p)
+        val value = bound_of(p, limit, "a comparison pattern compares with a literal")
+        val bound = PatternBound(value, op == "<=" || op == ">=")
+        val span = first.span.to(limit.span)
+        if at_comparison(p)
+            p.report.add(error(p.toks.here(), "a comparison pattern with two bounds puts the name between them, as in `0 <= n < 10`"))
+            p.toks.advance()
+            parse_pattern_atom(p)
+        if op == "<" || op == "<=" then return Pattern(span, Bounded(first, None, Some(bound)))
+        return Pattern(span, Bounded(first, Some(bound), None))
+    val low = bound_of(p, first, "a comparison pattern compares a name with a literal")
+    if op != "<" && op != "<="
+        p.report.add(error(at, "a comparison pattern that starts with its bound uses `<` or `<=`, as in `0 <= n < 10`"))
+    val name = parse_pattern_atom(p)
+    if !binder(name) then p.report.add(error(name.span, "a comparison pattern binds a name or `_` between its bounds"))
+    val lower = Some(PatternBound(low, op == "<="))
+    if !p.at("<") && !p.at("<=") then return Pattern(first.span.to(name.span), Bounded(name, lower, None))
+    val upper_op = p.ahead(0)
+    p.toks.advance()
+    val limit = parse_pattern_atom(p)
+    val high = bound_of(p, limit, "a comparison pattern compares with a literal")
+    Pattern(first.span.to(limit.span), Bounded(name, lower, Some(PatternBound(high, upper_op == "<="))))
+
+private at_comparison(p: *Parser) -> bool = p.at("<") || p.at("<=") || p.at(">") || p.at(">=")
 
 private parse_pattern_atom(p: *Parser) -> &Pattern
     val start = p.toks.here()
@@ -251,8 +294,9 @@ parse_type_params(p: *Parser) -> Buf[TypeParam]
     p.expect("]")
     params
 
-/** A function clause: `name[T](params) -> Result | guard = body`, an indented body, or no body at
- * all (a declaration completed by an annotation such as `@intrinsic`). */
+/** A function: `name[T](params) -> Result = body`, an indented body, the clauses on the lines after
+ * a signature with no body, or neither (a declaration completed by an annotation such as
+ * `@intrinsic`). */
 parse_function(p: *Parser, annotations: Buf[Annotation]) -> &Function
     val start = p.toks.here()
     val name = required_name(p)
@@ -261,29 +305,100 @@ parse_function(p: *Parser, annotations: Buf[Annotation]) -> &Function
     val params = parse_params(p, true)
     var result: Option[&TypeExpr] = None
     if p.accept("->") then result = Some(parse_type(p))
-    var guard: Option[&Expr] = None
-    if p.accept("|") then guard = Some(expression(p, 3))
+    if p.at("|")
+        p.report.add(error(p.toks.here(), "a guard belongs to a clause; write the clauses on the lines after the signature"))
+        p.toks.advance()
+        expression(p, 3)
     val equals = p.accept("=")
     var body: Option[&Expr] = None
     val indented = p.at_kind(Indent)
+    var clauses: Buf[Clause] = buf()
+    var end = p.toks.here()
     if equals || indented
         // An indented body after a header with neither `=` nor a result type is a procedure body:
         // its last value is discarded and the function yields unit.
-        body = Some(parse_body(p, !equals && result is None))
+        val b = parse_body(p, !equals && result is None)
+        body = Some(b)
+        end = b.span
         optional_end(p, name, indented)
-    val end = body match
-        Some(b) -> b.span
-        None -> p.toks.here()
-    Function(annotations, start.to(end), name_span, name, type_params, params, result, guard, body)
+    elif annotations.len() == 0
+        // A clause is a line that starts with the function's name and an argument list. After a
+        // clause with an indented body, the next line follows the end of that block directly.
+        loop
+            if p.at_kind(Newline) && p.ahead(1) == name && p.ahead(2) == "(" then p.toks.advance()
+            elif !(after_block(p) && p.at(name) && p.ahead(1) == "(") then break
+            val clause = parse_clause(p)
+            end = clause.span
+            clauses.push(clause)
+    Function(annotations, start.to(end), name_span, name, type_params, params, result, body, clauses)
 
-// A local declaration has a parameter list followed by `=`, `->`, `|` or an indented body. A bare
-// call or a type application stays an expression.
+// `name(patterns) = body`, `name(patterns) | guard = body`, or `name(patterns)` followed by an
+// indented block of `| guard = body` lines, tried in order, where `| _ = body` always holds.
+private parse_clause(p: *Parser) -> Clause
+    val start = p.toks.here()
+    p.toks.advance()
+    p.expect("(")
+    var patterns: Buf[&Pattern] = buf()
+    if !p.at(")")
+        loop
+            patterns.push(parse_pattern(p))
+            if p.at(":")
+                p.report.add(error(p.toks.here(), "a clause's arguments are patterns; their types are in the signature"))
+                p.toks.advance()
+                parse_type(p)
+            if !p.accept(",") || p.at(")") then break
+    p.expect(")")
+    var bodies: Buf[GuardedBody] = buf()
+    if p.accept("|")
+        val guard = expression(p, 3)
+        p.expect("=")
+        bodies.push(GuardedBody(Some(guard), parse_body(p, false)))
+    elif p.accept("=") then bodies.push(GuardedBody(None, parse_body(p, false)))
+    elif p.accept_kind(Indent)
+        loop
+            if p.toks.at_end() || p.accept_kind(Dedent) then break
+            if p.accept_kind(Newline) then continue
+            val before = p.toks.position
+            if !p.at("|")
+                p.report.add(error(p.toks.here(), "expected a guard, as in `| n > 0 = value`, or `| _ = value` for the rest"))
+                skip_line(p)
+                continue
+            p.toks.advance()
+            var guard: Option[&Expr] = None
+            if p.at("_") && p.ahead(1) == "=" then p.toks.advance()
+            else guard = Some(expression(p, 3))
+            p.expect("=")
+            bodies.push(GuardedBody(guard, parse_body(p, false)))
+            if p.toks.position == before then p.toks.advance()
+    else p.report.add(error(p.toks.here(), "expected `=`, a guard, or indented guards after a clause's arguments"))
+    val end = if bodies.len() > 0 then bodies.at(bodies.len() - 1).body.span else start
+    Clause(start.to(end), patterns, bodies)
+
+private after_block(p: *Parser) -> bool = p.toks.position > 0 && p.toks.items.at(p.toks.position - 1).value == Dedent
+
+// Skips the rest of a line in a block, with any block nested in it, stopping before the new line
+// or the end of the enclosing block.
+private skip_line(p: *Parser)
+    var depth = 0
+    loop
+        val t = p.toks.peek() match
+            Some(t) -> t
+            None -> return
+        if depth == 0 && (t.value == Newline || t.value == Dedent) then return
+        if t.value == Indent then depth += 1
+        if t.value == Dedent then depth -= 1
+        p.toks.advance()
+
+// A local declaration has a parameter list followed by `=`, `->`, `|` or an indented body, or is a
+// signature with typed parameters followed by its clauses. A bare call or a type application stays
+// an expression.
 local_function_ahead(p: *Parser) -> bool
     if !p.at_kind(Word) then return false
     val next = p.ahead(1)
     if next != "(" && next != "[" then return false
     var depth = 0
     var params = false
+    var typed = false
     var i = 1usize
     loop
         val token = p.toks.peek_at(i) match
@@ -294,6 +409,7 @@ local_function_ahead(p: *Parser) -> bool
         if text == "("
             depth += 1
             params = true
+        elif text == ":" && params && depth == 1 then typed = true
         elif text == ")"
             depth -= 1
             if params && depth == 0
@@ -301,6 +417,8 @@ local_function_ahead(p: *Parser) -> bool
                     Some(t) -> t
                     None -> return false
                 val word = p.spelling(after)
+                // A signature with no result type is followed by its clauses.
+                if after.value == Newline then return typed && p.ahead(i + 2) == p.ahead(0) && p.ahead(i + 3) == "("
                 return word == "=" || word == "->" || word == "|" || after.value == Indent
         elif !params && text != "[" && token.value != Word && text != "]" && text != "," && text != ":" && text != "+" then return false
         i += 1
