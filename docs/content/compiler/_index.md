@@ -325,6 +325,26 @@ sees. The compiler knows a small, declared set of
 Each is declared in Avin source with `@intrinsic("…")` and has no body. Everything else, including
 `print`, is ordinary library code.
 
+An intrinsic is lowered to a function whose body calls one runtime entry point, named in the
+checker's `intrinsic_entry` table with its parameters and result. The formatting library
+(`format.avin`) reaches the runtime this way: `write_out` and `write_int` write to standard output,
+an integer's digits rendered on the stack; `render_int`, `render_real` and `render_char` make a
+value's text; `quote_text` and `quote_char` its quoted, escaped literal; `text_size` and
+`text_width` count a string's bytes and characters; `text_append` and `text_take` keep a
+`StringWriter`'s text in a string object of its own whose length is its capacity, filled in place
+and doubled when full, and copy the written part out.
+
+**Built-in types conforming to traits.** An `impl Trait for int` records a conformance, and the
+checker builds a method table for each built-in type, as for a data type, but holding only the
+impl's methods: a built-in value is no object, so it can neither carry a table nor take a trait's
+default bodies, which are compiled once for objects. A bounded call in an instance whose type
+argument is a built-in type finds its method in that table and calls it directly.
+
+**Rendering an interpolation.** `s"…"` is checked into a join of its pieces with `+`. A hole of a
+built-in type becomes a `Render` node, lowered to the runtime's rendering of the value (a constant
+for `bool` and `unit`); a hole of any other type, a type parameter's included, becomes a call of its
+`toString()`, which needs the type to implement `Display`.
+
 ## Tests
 
 `sysl test compiler`, run from the repository root, runs every test.

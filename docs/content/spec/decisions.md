@@ -232,6 +232,13 @@ a decision changes, this page and the chapter change together.
 - The collection hierarchy is rooted at `Iterable`, and `Iterator` is itself `Iterable`.
 - `print` is an ordinary library function. It renders with `Display`, separates its arguments with
   `, ` and ends with a newline. `print(debug(x))` selects `Debug`.
+- `debug(x)` yields `x`'s `Debug` form as a string. `Writer` writes strings (with `writeChar`,
+  `writeInt`, `writeField` and `writeSpaces` beside `write`); `FormatSpec` is `width`, `precision`
+  and `left`, as in Sysl; `toString()` is a default body of `Display`.
+- A built-in type conforms to a trait through an impl and implements every method of the trait,
+  since a trait's default bodies are shared by objects and a built-in value is not one.
+- A variant's fields take defaults, each a function of the fields before it, as a constructor's
+  parameters do.
 - Avin has Sysl's full string interpolation and formatting.
 - An interpolated string is a method call on `StringContext`: `p"a $x b"` is
   `StringContext(["a ", " b"]).p(x)`. `s`, `f` and `raw` are library methods, and a program defines
