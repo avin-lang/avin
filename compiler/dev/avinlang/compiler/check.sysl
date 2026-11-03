@@ -3359,6 +3359,10 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
         if *t.ty is Nothing then ty = Nothing
     TExpr(e.span, ty, Compare(typed, ops))
 
+private is_trait_type(c: *Checker, t: &Type) -> bool = *t match
+    Class(id, _, _) -> is_trait(c, id)
+    _ -> false
+
 private compare_link(c: *Checker, op: CompareOp, a: &TExpr, b: &TExpr)
     if !settled(a.ty) || !settled(b.ty) then return
     val at = a.span.to(b.span)
@@ -3366,25 +3370,31 @@ private compare_link(c: *Checker, op: CompareOp, a: &TExpr, b: &TExpr)
     // An `Any` may hold a value with no identity and no equality; a type pattern recovers its type,
     // and with it the comparisons that type has.
     if *a.ty is AnyType || *b.ty is AnyType
-        c.note(unit_of(c), at, s"`$spelling` is not defined on Any; match the value by its type first, as in `s: string`")
+        c.note(unit_of(c), at, s"`$spelling` on Any is not implemented; match the value by its type first, as in `s: string`")
         return
-    if op is Same || op is NotSame
-        // A function value is a closure and an object of a class is a heap object: both are
-        // references, so they have an identity.
+    val identity = op is Same || op is NotSame
+    // A function value is a closure and an object of a class is a heap object: both are
+    // references. `===` always compares them by identity; `==` does too, until a class defines its
+    // own equality (`Eq`), which `==` would then use in its place.
+    if identity || *a.ty is Function(_, _) || *a.ty is Class(_, _, _)
+        if !identity && (is_trait_type(c, a.ty) || is_trait_type(c, b.ty))
+            // A trait-typed value may hold a data value, which compares by value, or an object,
+            // which compares by identity: telling them apart needs runtime equality entries.
+            c.note(unit_of(c), at, s"`$spelling` on the trait type ${type_name(if is_trait_type(c, a.ty) then a.ty else b.ty)} is not implemented; match the value by its type first, or compare with `===`")
+            return
         if (*a.ty is Function(_, _) || *a.ty is Class(_, _, _)) && same_type(a.ty, b.ty) then return
         // An instance of a subclass may be the very object a superclass-typed value holds.
         if *a.ty is Class(_, _, _) && *b.ty is Class(_, _, _)
             if same_type(upcast(c, a.ty, b.ty), b.ty) || same_type(upcast(c, b.ty, a.ty), a.ty) then return
-        if *a.ty is Class(_, _, _) && *b.ty is Class(_, _, _)
+            c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} with ${type_name(b.ty)}")
+            return
+        if !identity
             c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} with ${type_name(b.ty)}")
             return
         c.note(unit_of(c), at, s"`$spelling` compares identities, and ${type_name(a.ty)} values have none")
         return
     if !same_type(a.ty, b.ty)
         c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} with ${type_name(b.ty)}")
-        return
-    if *a.ty is Class(_, _, _)
-        c.note(unit_of(c), at, s"`$spelling` compares values, and the class ${type_name(a.ty)} defines no equality; `===` compares identities")
         return
     val equality = op is Equal || op is NotEqual
     if *a.ty is Int(_) || *a.ty is Byte || *a.ty is Char || *a.ty is Real || *a.ty is Str then return
