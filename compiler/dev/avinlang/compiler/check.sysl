@@ -222,6 +222,16 @@ struct BodyState
 
 fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, 0, buf(), buf(), buf(), buf(), buf())
 
+/** A class body checked part way: its initializer's body so far, the code checked so far, the next
+ * member to check and the next field it declares. */
+struct Construction
+    body: BodyState
+    items: Buf[&TExpr]
+    receiver: &TExpr
+    member: usize
+    index: usize
+    finishes: bool
+
 struct GenericScope
     owner: usize
     params: Buf[TypeParam]
@@ -272,6 +282,11 @@ struct Checker
     impls: Buf[ImplSymbol]
     /** The methods impls add to built-in types, each with its `receiver`. */
     builtin_methods: Buf[usize]
+    /** For each class, how far its body is checked: 0 not begun, 1 being checked, 2 stopped after
+     * the fields another function needed, 3 checked. */
+    building: Buf[u8]
+    /** For each class whose body is stopped part way, where to resume it. */
+    constructions: Buf[Option[Construction]]
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -297,7 +312,7 @@ end Checked
 /** Checks a program. The last unit is the program's own file, which must declare `main`; the units
  * before it (the prelude) are visible to it, and its own declarations shadow theirs. */
 check_program(units: Buf[SourceUnit]) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false, false, buf(), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false, false, buf(), buf(), buf(), buf())
     // Every type is named before any is used, so a data type may refer to itself or to one
     // declared after it, and functions are declared once every type is known.
     for u in 0..<c.units.len()
@@ -324,6 +339,14 @@ check_program(units: Buf[SourceUnit]) -> Checked
     place_traits(&c)
     for u in 0..<c.units.len()
         declare_globals(&c, u)
+    for _ in c.classes
+        c.building.push(0)
+        c.constructions.push(None)
+    // Class bodies first: a function a body calls then finds each field the body declared before
+    // the call already typed, and a field whose type needs itself is reported by name.
+    for k in 0..<c.classes.len()
+        val init = c.classes[k].initializer
+        if c.symbols[init].owner_class is Some(owner) && owner == k then check_function(&c, init)
     for id in 0..<c.symbols.len()
         check_function(&c, id)
     for id in 0..<c.classes.len()
@@ -1958,7 +1981,7 @@ private check_function(c: *Checker, id: usize)
         var subjects: Buf[&TExpr] = buf()
         for i in 0..<symbol.params.len()
             subjects.push(TExpr(symbol.decl.name_span, symbol.params[i], Param(i)))
-        if symbol.constructor then check_constructor(c, id)
+        if symbol.constructor then check_constructor(c, id, None)
         else check_definition(c, id, subjects)
         c.generic = outer_generic
         finish_captures(c)
@@ -1968,6 +1991,30 @@ private check_function(c: *Checker, id: usize)
         c.current = previous
         c.body = outer
     c.states.set(id, 2)
+
+// Checks class `k`'s body as far as its field `index`, in the middle of checking some other
+// function: the body is its initializer's, with that function's state set aside meanwhile.
+private check_class_body_upto(c: *Checker, k: usize, index: usize)
+    val id = c.classes[k].initializer
+    val symbol = c.symbols[id]
+    val previous = c.current
+    val outer = c.body
+    val outer_generic = c.generic
+    val outer_binds = c.binds_var
+    val outer_super = c.super_args
+    c.current = id
+    c.body = fresh_body(id)
+    c.generic = if symbol.type_params.len() > 0 then Some(GenericScope(symbol.type_owner, symbol.type_params)) else None
+    c.binds_var = false
+    c.super_args = false
+    c.states.set(id, 1)
+    check_constructor(c, id, Some(index))
+    c.states.set(id, 0)
+    c.current = previous
+    c.body = outer
+    c.generic = outer_generic
+    c.binds_var = outer_binds
+    c.super_args = outer_super
 
 // Checks a function's body or clauses; `subjects` are its parameters' values, which its clauses
 // match.
@@ -2066,12 +2113,18 @@ private check_body(c: *Checker, id: usize, body: &Expr)
 // object, so code in the body that captures it captures it as it would any local. An open or
 // abstract class does all but the allocation in its initializer, which is given the object, and its
 // constructor allocates the object and calls the initializer.
-private check_constructor(c: *Checker, id: usize)
+//
+// With `upto`, the class body is checked only until that field's type is known, and kept to be
+// resumed: a function that reads an inferred field needs the code before the field, never the code
+// after it, which may call that very function.
+private check_constructor(c: *Checker, id: usize, upto: Option[usize])
     val symbol = c.symbols[id]
     val k = symbol.owner_class.unwrap()
     val cls = c.classes[k]
+    if cls.initializer == id && c.building[k] == 2
+        construct(c, k, upto)
+        return
     val decl = cls.decl
-    val unit = symbol.unit
     val self_type = own_class_type(cls, k)
     val self_local = c.body.locals.len()
     c.body.locals.push(TLocal("self", self_type, false, id))
@@ -2105,10 +2158,25 @@ private check_constructor(c: *Checker, id: usize)
     for i in 0..<count_params
         items.push(TExpr(decl.span, Unit, StoreField(receiver, cls.inherited + i, TExpr(decl.name_span, symbol.params[first + i], Param(first + i)), false)))
     c.classes[k].ready = cls.inherited + count_params
-    var index = cls.inherited + count_params
-    for m in decl.members
+    c.constructions.set(k, Some(Construction(c.body, items, receiver, 0, cls.inherited + count_params, finishes)))
+    construct(c, k, upto)
+
+// Checks class `k`'s body from where it stopped: to its end, or with `upto` until that field's type
+// is known, keeping the rest for later.
+private construct(c: *Checker, k: usize, upto: Option[usize])
+    var made = c.constructions[k].unwrap()
+    c.constructions.set(k, None)
+    c.body = made.body
+    c.building.set(k, 1)
+    val decl = c.classes[k].decl
+    val unit = c.classes[k].unit
+    while made.member < decl.members.len()
+        if upto is Some(field) && made.index > field then break
+        val m = decl.members[made.member]
+        made.member += 1
         m match
             FieldMember(f) ->
+                val index = made.index
                 val declared = c.classes[k].fields[index].ty
                 val typed = check_expr(c, f.value, declared)
                 declared match
@@ -2120,21 +2188,29 @@ private check_constructor(c: *Checker, id: usize)
                             c.note(unit, f.span, s"cannot infer the type of the field `${f.name}`; declare it, as in `val ${f.name}: int = …`")
                             c.classes[k].fields[index].ty = Some(ErrorType)
                         else c.classes[k].fields[index].ty = Some(if *inferred is Nothing then ErrorType else inferred)
-                if *typed.ty is Nothing then finishes = false
-                items.push(TExpr(f.span, Unit, StoreField(receiver, index, typed, false)))
-                index += 1
-                c.classes[k].ready = index
+                if *typed.ty is Nothing then made.finishes = false
+                made.items.push(TExpr(f.span, Unit, StoreField(made.receiver, index, typed, false)))
+                made.index = index + 1
+                c.classes[k].ready = made.index
             StatementMember(s) ->
                 val t = check_statement(c, s)
-                if *t.ty is Nothing then finishes = false
-                items.push(t)
+                if *t.ty is Nothing then made.finishes = false
+                made.items.push(t)
             MethodMember(_, _, _) -> ()
-    if first == 0
-        items.push(receiver)
-        c.bodies.set(id, Some(TExpr(decl.span, if finishes then self_type else Nothing, Block(items))))
+    if upto is Some(_)
+        made.body = c.body
+        c.constructions.set(k, Some(made))
+        c.building.set(k, 2)
+        return
+    c.building.set(k, 3)
+    val id = c.classes[k].initializer
+    var items = made.items
+    if c.classes[k].constructor == id
+        items.push(made.receiver)
+        c.bodies.set(id, Some(TExpr(decl.span, if made.finishes then made.receiver.ty else Nothing, Block(items))))
     else
         items.push(TExpr(decl.span, Unit, UnitConst))
-        c.bodies.set(id, Some(TExpr(decl.span, if finishes then Unit else Nothing, Block(items))))
+        c.bodies.set(id, Some(TExpr(decl.span, if made.finishes then Unit else Nothing, Block(items))))
 
 // The call of the superclass's initializer on the object, with the arguments written after the
 // superclass's name. They are checked before the class stores its parameters, so a parameter's name
@@ -2498,16 +2574,15 @@ private data_field_read(c: *Checker, at: Span, object: &TExpr, index: usize) -> 
     Data(id, _, args) -> TExpr(at, variant_fields(c.data[id], id, 0, args)[index], Field(object, index))
     _ -> TExpr(at, ErrorType, UnitConst)
 
-// A field declared without a type has its initializer's, so the class body is checked first. An
-// inherited field's type is its declaring class's.
+// A field declared without a type has its initializer's, so the class body is checked first, as far
+// as the field. An inherited field's type is its declaring class's.
 private field_type(c: *Checker, k: usize, index: usize, at: Span) -> &Type
     if index < c.classes[k].inherited
         if c.classes[k].superclass is Some(sup)
             if *sup is Class(sid, _, args) then return substitute(field_type(c, sid, index, at), class_owner(sid), args)
     if c.classes[k].fields[index].ty is Some(t) then return t
-    val constructor = c.classes[k].initializer
-    if c.states[constructor] == 0
-        check_function(c, constructor)
+    if c.building[k] != 1 && c.states[c.classes[k].initializer] == 0
+        check_class_body_upto(c, k, index)
         return c.classes[k].fields[index].ty.unwrap_or(ErrorType)
     val name = c.classes[k].fields[index].name
     c.note(unit_of(c), at, s"the type of the field `$name` is needed before its initializer is checked; declare it, as in `val $name: int = …`")
