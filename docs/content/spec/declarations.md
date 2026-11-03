@@ -140,8 +140,10 @@ area(Circle(r)) = 3.14159 * r * r
 area(Rect(w, h)) = w * h
 ```
 
-The signature carries the types, the result type and any type parameters; a clause's patterns carry
-none. A call tries the clauses in order and runs the first whose patterns match the arguments. The
+A clause's arguments are followed by `=`, a guard or an indented block of guards; a line of the same
+name followed by `->` or by nothing is another declaration, as two abstract overloads of a method
+are. The signature carries the types, the result type and any type parameters; a clause's patterns
+carry none. A call tries the clauses in order and runs the first whose patterns match the arguments. The
 names a clause's patterns bind are its own.
 
 A clause may be guarded:
