@@ -52,6 +52,12 @@ a decision changes, this page and the chapter change together.
   methods, with the lambdas and local functions in them, may use it on any instance of the class.
 - A class body cannot `return`. A field declared in the body without a type has its initializer's.
 - Every function declaration parameter has an explicit type.
+- A [default argument](/spec/declarations/#default-and-named-arguments) is evaluated at each call
+  that omits it, in the declaring function's scope, and may use the parameters before it. Named
+  arguments follow the positional ones, in any order; the arguments written at a call are evaluated
+  in the order written, then the omitted ones' defaults in parameter order. Names and defaults belong
+  to a declaration: a function value is called by position. A variant takes its fields by name too.
+  The default of a by-name parameter is delayed like any argument to it.
 - A function may be defined by [clauses](/spec/declarations/#clauses): its signature with no body,
   then lines `f(patterns) = body`, tried in order. A clause is guarded inline,
   `f(n) | n > 0 = body`, or by an indented block of `| condition = body` lines in which `| _` always

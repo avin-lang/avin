@@ -16,7 +16,41 @@ greet(name: string)
 Every parameter has a declared type. The result type may be inferred, except for recursive functions.
 An indented body with no `=` and no result type returns `unit`; with `=` or a result type it yields
 its last expression. Default arguments (`size: int = 16`) and named arguments (`open(path, create = true)`)
-are supported.
+are supported, as described next.
+
+### Default and named arguments
+
+```text
+area(width: int, height: int = width, scale: int = 1) -> int = width * height * scale
+
+area(2)                                 // 4
+area(2, scale = 10)                     // 40
+area(height = 3, width = 2)             // 6
+```
+
+A parameter's **default** is evaluated at each call that omits its argument, never once for all
+calls. It is evaluated where the function is declared, not where it is called: it sees what is in
+scope at the declaration, including what a local function captures, and the parameters before its
+own, but not the ones after it. A default does not decide a type argument of a generic function:
+`f[T](x: T = 1)` is an error, because `1` is not a `T`.
+
+A call writes its **positional** arguments first, then any **named** ones, `name = value`, in any
+order; a positional argument after a named one is an error. Each parameter is given at most once,
+by position or by name, and one given nothing must have a default. A name that is no parameter's is
+an error. A named argument is checked against its parameter's type exactly as a positional one is,
+so it takes part in inferring a generic call's type arguments, and a lambda written as one takes its
+parameter types from the parameter.
+
+The arguments written at a call are **evaluated in the order written**, whatever parameters they
+are given to; then the defaults of the omitted parameters are evaluated in parameter order, each
+from the values before it. An argument that never finishes, such as a `return`, ends the call there.
+
+Names and defaults belong to a function's declaration, not to its type. A function value, such as a
+lambda or a function passed as an argument, is called with positional arguments only, all of them.
+A variant is called the same way as a function, so its fields may be given by name:
+`Point(y = 2, x = 1)`. A function defined by [clauses](#clauses) writes its defaults on its
+signature line, and its clauses match every parameter, defaulted or not. The default of a
+[by-name](/spec/by-name/) parameter is delayed like any argument to it.
 
 Functions and methods may be **overloaded**: several functions in one scope may share a name when
 their parameter types differ. A call chooses among them by its arguments:
