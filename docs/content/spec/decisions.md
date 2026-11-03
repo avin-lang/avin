@@ -104,6 +104,10 @@ a decision changes, this page and the chapter change together.
   is an error. A method value takes every parameter, by-name ones still by name, and private
   methods are values only where they could be called. Two values of one method on one object are
   two closures, so `===` tells them apart.
+- Settled 2026-11-03: `do … while` tests at the end, so its body runs at least once. The body is an
+  indented block closed by a line starting `while test`, or one statement written `do stmt while
+  test`; an optional `else` runs when the test fails. `break` carries the loop's value as in
+  `while`, `continue` runs the test, and the test cannot read names the body declared.
 - `string` is a built-in type, not a class: it is final, has its own representation, gets its
   methods from the library through `impl string`, conforms to traits through `impl`, and is matched
   by the type pattern `s: string` like any other type.
