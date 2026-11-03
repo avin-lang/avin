@@ -249,6 +249,12 @@ class Savings(owner: string, balance: int, rate: real): Account(owner, balance),
 - Methods take the forms top-level functions take: a body after `=`, an indented body, or clauses,
   which match the arguments and not the receiver. A method may have type parameters of its own,
   after its class's.
+- A method named without a call is a function value bound to its receiver: `val f = acct.deposit`
+  is an `(int) -> unit` that deposits into `acct`, which is evaluated once, where the value is made.
+  Inside the class a bare method name is the same over `self`. Through a superclass's or a trait's
+  type the value calls the implementation the object's class has. A method's own type parameters
+  are written, `box.pair[bool]`, or come from the expected function type. The same holds for the
+  methods an `impl` adds to any type, `"hey".shout` included.
 - A field declared in the body without a type has its initializer's type. The body cannot
   `return`: it runs to its end to make the object.
 
@@ -455,14 +461,15 @@ is reserved for the standard library.
   Up to and including the initializer of its last field, a body uses `self` only to read a field
   already set and to assign a field. Calling a method is an error however it is spelled — a bare
   name, `self.describe()`, `super.describe()` — and so are passing, storing or returning `self` and
-  making a lambda, a by-name argument or a local function that uses a field or `self`, since each
-  can read a field before it is set. An object's body follows the same rule.
+  making a lambda, a by-name argument or a local function that uses a field or `self`, or a method
+  value of `self` (`describe` named without a call), since each can read a field before it is set.
+  An object's body follows the same rule.
 - An `open` or `abstract` class's body runs before any subclass's fields are set, so the object is
   never complete while it runs: the limits above hold for the whole of it. After its own last field
   it may call only a method that cannot be overridden (a private one) and that is itself safe: one
   that uses `self` only to read and assign fields and to call other safe methods. A call that could
   reach an override, directly or through such a method, is an error, as is passing, storing or
-  capturing `self`.
+  capturing `self`, a method value of `self` included.
 - Module-level `val`s, `var`s and `object`s initialize before `main`, in the order their
   initializers depend on one another. An initializer depends on every module value and object it
   reads, directly or through the functions it calls and the lambdas it makes; values that need

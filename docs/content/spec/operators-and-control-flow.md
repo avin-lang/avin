@@ -39,6 +39,18 @@ comparisons, and it groups to the right: `n + 1 :: rest` is `(n + 1) :: rest`, a
 
 Sysl's pointer operators (prefix `*` and `&`) and `await` are not part of Avin.
 
+### Infix method calls
+
+Any method that takes one argument can be called as an infix operator, without the dot and the
+parentheses: `a max b` is `a.max(b)`, and `xs zip ys` is `xs.zip(ys)`. The caller chooses the form;
+the method's author does not mark it. `a m (b, c)` passes the tuple `(b, c)` as the one argument.
+
+An infix call groups to the left and binds more loosely than the arithmetic, bitwise, shift, cons and
+range operators, and more tightly than comparisons, `is`, `&&` and `||`: `a max b + 1` is
+`a max (b + 1)`, and `xs contains x && ok` is `(xs contains x) && ok`. It stays on one line unless
+the line ends with the method's name. There is no postfix form: `xs size` is an error, written
+`xs.size()`.
+
 ## Comparison chains
 
 `a < b <= c` is one expression. Operands are evaluated left to right, each middle operand exactly
