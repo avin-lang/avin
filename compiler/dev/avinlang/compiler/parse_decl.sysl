@@ -75,6 +75,26 @@ required_name(p: *Parser) -> string
             p.report.add(error(p.toks.here(), "expected a name"))
             ""
 
+/** Whether a word may not be declared as a name. `end` is contextual (it closes a form only when a
+ * name follows), `open` is a modifier only before `class`, and `self` is rejected by the checker
+ * with a message of its own. */
+private reserved(word: string) -> bool = is_keyword(word) && word != "end" && word != "self" && word != "open"
+
+/** Reports a keyword used to declare `what`: `loop` is a keyword and cannot name a value. */
+reject_keyword(p: *Parser, span: Span, word: string, what: string)
+    if reserved(word) then p.report.add(error(span, s"`$word` is a keyword and cannot name $what"))
+
+/** A name that a declaration introduces, which may not be a keyword. */
+declared_name(p: *Parser, what: string) -> string
+    val at = p.toks.here()
+    val word = p.ahead(0)
+    if reserved(word)
+        // Some keywords are tokens of their own kind, which `required_name` would also report.
+        p.toks.advance()
+        reject_keyword(p, at, word, what)
+        return word
+    required_name(p)
+
 private qualified_name(p: *Parser) -> string
     var name = required_name(p)
     while p.accept(".")
@@ -266,6 +286,11 @@ private parse_pattern_atom(p: *Parser) -> &Pattern
         if negative && !(value.kind is Unary(Negate, _))
             p.report.add(error(value.span, "a negative pattern needs a numeric literal"))
         return Pattern(value.span, Literal(value))
+    if token.value != Word && reserved(p.spelling(token))
+        // A keyword that is a token of its own kind still reads as a name being bound.
+        p.toks.advance()
+        reject_keyword(p, start, p.spelling(token), "a value")
+        return Pattern(start, InvalidPattern)
     if token.value != Word
         p.report.add(expected(start, "a pattern", found_at(p.src, start)))
         p.toks.advance()
@@ -277,6 +302,7 @@ private parse_pattern_atom(p: *Parser) -> &Pattern
     if word == "_"
         p.toks.advance()
         return Pattern(token.span, Wildcard)
+    reject_keyword(p, start, word, "a value")
     val path = qualified_name(p)
     if !p.accept("(")
         if path.contains(".") then return Pattern(start.to(p.toks.here()), Constructor(path, buf()))
@@ -331,7 +357,7 @@ parse_type_params(p: *Parser) -> Buf[TypeParam]
             var variance = Invariant
             if p.accept("+") then variance = Covariant
             elif p.accept("-") then variance = Contravariant
-            val name = required_name(p)
+            val name = declared_name(p, "a type parameter")
             var bounds: Buf[&TypeExpr] = buf()
             if p.accept(":")
                 loop
@@ -347,7 +373,10 @@ parse_type_params(p: *Parser) -> Buf[TypeParam]
  * `@intrinsic`). */
 parse_function(p: *Parser, annotations: Buf[Annotation]) -> &Function
     val start = p.toks.here()
-    val name = required_name(p)
+    // `object`, `trait` and `impl` begin a declaration only when no parenthesis follows, so
+    // `object(x: int) = x` declares a function.
+    val declaring = p.at("object") || p.at("trait") || p.at("impl")
+    val name = if declaring then required_name(p) else declared_name(p, "a function")
     val name_span = start.to(p.toks.here())
     val type_params = parse_type_params(p)
     val params = parse_params(p, true)
@@ -496,7 +525,7 @@ local_function_ahead(p: *Parser) -> bool
     false
 
 private parse_data(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &DataDecl
-    val name = required_name(p)
+    val name = declared_name(p, "a type")
     val type_params = parse_type_params(p)
     var variants: Buf[Variant] = buf()
     // The one-line form declares a type with one variant, named after the type.
@@ -516,7 +545,7 @@ private parse_data(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &Da
         if p.accept_kind(Newline) then continue
         val before = p.toks.position
         val at = p.toks.here()
-        val variant = required_name(p)
+        val variant = declared_name(p, "a variant")
         var fields: Buf[Param] = buf()
         if p.at("(") then fields = parse_params(p, false)
         variants.push(Variant(at.to(p.toks.here()), variant, fields))
@@ -533,7 +562,7 @@ private parse_class(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &C
         modifier = required_name(p)
     p.expect("class")
     val name_start = p.toks.here()
-    val name = required_name(p)
+    val name = declared_name(p, "a type")
     val name_span = name_start.to(p.toks.here())
     val type_params = parse_type_params(p)
     var params: Buf[ClassParam] = buf()
@@ -556,7 +585,7 @@ private parse_class(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &C
 private parse_object(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &ClassDecl
     p.expect("object")
     val name_start = p.toks.here()
-    val name = required_name(p)
+    val name = declared_name(p, "an object")
     val name_span = name_start.to(p.toks.here())
     if p.at("[")
         p.report.add(error(p.toks.here(), "an object has one instance, so it cannot be generic"))
@@ -579,7 +608,7 @@ private parse_trait(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &C
     val modifier_span = p.toks.here()
     p.expect("trait")
     val name_start = p.toks.here()
-    val name = required_name(p)
+    val name = declared_name(p, "a type")
     val name_span = name_start.to(p.toks.here())
     val type_params = parse_type_params(p)
     if p.at("(")
@@ -657,7 +686,7 @@ private parse_class_params(p: *Parser) -> Buf[ClassParam]
             elif p.accept("val") then marked = true
             if hidden && !marked then p.report.add(error(start, "a plain class parameter is already private; `private` goes before `val` or `var`"))
             val name_at = p.toks.here()
-            val name = required_name(p)
+            val name = declared_name(p, "a field")
             val pattern = Pattern(name_at.to(p.toks.here()), Name(name))
             p.expect(":")
             if p.at("->")
@@ -679,8 +708,17 @@ private parse_class_member(p: *Parser) -> ClassMember
     if p.at("val") || p.at("var")
         val mutable = p.at("var")
         p.toks.advance()
-        val binding = parse_binding(p, start, mutable)
         if overrides then p.report.add(error(start, "only a method can be marked `override`"))
+        // `val name: T` at the end of its line declares the field without a value, as a trait does.
+        var binding: &Expr = Expr(start, Invalid)
+        if !p.at("(") && p.ahead(1) == ":"
+            val name_span = p.toks.here()
+            val name = required_name(p)
+            p.expect(":")
+            val declared = parse_type(p)
+            if p.at_line_end() then return AbstractFieldMember(AbstractField(start.to(declared.span), name_span, name, declared, mutable, !hidden))
+            binding = binding_value(p, start, mutable, None, name, Some(declared))
+        else binding = parse_binding(p, start, mutable)
         binding.kind match
             Binding(name, declared, value, _) -> return FieldMember(FieldDecl(binding.span, name, declared, value, mutable, !hidden))
             _ ->
@@ -697,13 +735,17 @@ private parse_import(p: *Parser, at: Span, imports: Buf[Import])
         if p.accept("{")
             loop
                 val name = required_name(p)
-                val binding = if p.accept("as") then required_name(p) else name
+                val aliased = p.accept("as")
+                val binding = if aliased then declared_name(p, "an import") else name
+                if !aliased then reject_keyword(p, at, name, "an import")
                 imports.push(Import(at.to(p.toks.here()), path + "." + name, binding))
                 if !p.accept(",") || p.at("}") then break
             p.expect("}")
             return
         path = path + "." + required_name(p)
-    val binding = if p.accept("as") then required_name(p) else last_segment(path)
+    val aliased = p.accept("as")
+    val binding = if aliased then declared_name(p, "an import") else last_segment(path)
+    if !aliased then reject_keyword(p, at, binding, "an import")
     imports.push(Import(at.to(p.toks.here()), path, binding))
 
 private last_segment(path: string) -> string

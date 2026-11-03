@@ -73,7 +73,9 @@ Defaults belong to the method that introduces a parameter. An `override`, and a 
 implements a trait's method, takes that method's defaults and cannot declare its own, so a call
 omits the same arguments and gets the same values whichever class's method then runs. A trait's
 method declares its defaults in the trait, and they apply through the trait's type and on every
-type implementing it. A method of one required parameter whose others have defaults can be
+type implementing it. A method a type inherits, from its superclass or as a trait's default body,
+keeps its own defaults, so where it also implements another trait's method, that method must
+declare no defaults or the very same ones; otherwise the type is an error. A method of one required parameter whose others have defaults can be
 [called infix](/spec/operators-and-control-flow/#infix-method-calls).
 
 Functions and methods may be **overloaded**: several functions in one scope may share a name when
@@ -308,10 +310,11 @@ class Square(label: string, side: int): Rect(label, side, side)
 - **A subclass has every field of its superclass**, first and in the superclass's order, then its
   own. A field cannot be overridden: a public field may not share the name of an inherited public
   field or method. A private member stays private to the class that declares it.
-- **A method a subclass may override** is a public method of an `open` or `abstract` class without
-  type parameters of its own. An override is marked `override`, takes the same parameter types (with
-  the superclass's type arguments substituted) and yields the same result type or, for a class, a
-  subclass of it. A method sharing an inherited method's name and parameter types without
+- **A method a subclass may override** is a public method of an `open` or `abstract` class. An
+  override is marked `override`, takes the same parameter types (with the superclass's type
+  arguments substituted) and yields the same result type or, for a class, a subclass of it. A method
+  with type parameters of its own is overridden by one declaring as many, matched by position:
+  `override tag[V](item: V)` overrides `tag[U](item: U)`. A method sharing an inherited method's name and parameter types without
   `override`, and `override` on a method that overrides nothing, are errors. An override cannot be
   private.
 - **Methods overload as functions do.** A class, object, trait or impl may declare several methods
@@ -375,8 +378,19 @@ val n: Named = t
   a trait's method of the same name without being repeated.
 - A trait's default body is inherited like a superclass's method. A class that is not abstract
   implements every abstract method of its traits; an abstract class may leave them to a subclass.
-- A trait's body declares only methods, all public. A trait's method overrides nothing, and a trait
-  cannot redeclare a method of a trait it requires. A trait cannot be instantiated.
+- A trait's body declares only methods, all public. A trait cannot be instantiated.
+- **A trait may override a method of a trait it requires**, marked `override` and with a body:
+  `trait Square: Shape` with `override describe() -> string = …`. In every class and data type
+  conforming to the trait, its body replaces the required trait's default, or gives an abstract
+  method one, so a call through either trait's type reaches it. Like a class's override, it takes
+  the defaults of the method it overrides. Declaring a required trait's method
+  again without `override` is an error. Two traits overriding one default differently are two
+  implementations, which a class conforming to both overrides.
+- **A trait's method may have type parameters of its own**, as `map[B](f: (A) -> B) -> Iterable[B]`.
+  Its implementations declare as many, matched by position. A call through the trait's type
+  reaches the implementation of the object's class at the call's type arguments: the whole program
+  is compiled at once, so every type argument list a call through the trait uses is known, and each
+  has its own method table slot.
 - A class conforms to a trait once: `Source[int]` and `Source[string]` on one class, written or
   reached through other traits, is an error.
 - **A conforming instance is an instance of the trait**: it passes wherever the trait, or a trait
@@ -385,6 +399,33 @@ val n: Named = t
   expected type when both conform to it.
 - Inside a default body, `self` has the trait's type, so its calls dispatch as any trait-typed
   call does.
+
+```text
+trait Named
+    val name: string
+    greet() -> string = s"hello, $name"
+
+class Person(val name: string, age: int): Named
+class Counter(var name: string): Named
+data Book(name: string, pages: int)
+impl Named for Book
+```
+
+- **An abstract `val`** is written `val name: T` with no value, and only a trait declares one. A
+  trait's `val` is public, is never `var`, and shares its name with no other member of the trait.
+- **A conforming type supplies it with a public field of that name**: a class parameter marked `val`
+  or `var`, a `val` or `var` of the class body, a field inherited from the superclass, or, through an
+  impl, a field of a `data` type with one variant. The field's type is the `val`'s or, where that is a
+  class or a trait, one conforming to it. A `var` field supplies a `val`: the class assigns it, and a
+  read through the trait sees the current value. A method does not supply a `val`, and neither does a
+  private field. A class that is not abstract supplies every `val` of its traits; an abstract class
+  may leave one to a subclass.
+- **It is read with field syntax**, `x.name`, and by bare name inside the trait's default bodies.
+  Read through a class type it is the field itself; read through the trait it reaches the field of
+  the value's own type through its method table. It is never assigned through the trait, and
+  `x.name()` calls the value it holds, which only a function-typed `val` can be.
+- An abstract class's body cannot read a trait's `val` it leaves to a subclass: it runs before the
+  subclass's fields are set.
 
 ## impl
 
@@ -443,6 +484,19 @@ object Config
 
 An `object` is a singleton value. An `object` with the same name as a class in the same module is its
 companion and may access its private members. `object`s may extend a class and traits.
+
+```text
+object Default: Account("none", 0), Display
+    override describe() -> string = "default " + super.describe()
+    override display(out: Writer, spec: FormatSpec) = out.write(describe())
+```
+
+An object extending a class is made as a subclass's instance is: the superclass's constructor runs
+first with the arguments written after `:`, then the object's own body. The object overrides methods
+with `override`, implements every abstract method it inherits (it cannot be left abstract), and
+passes wherever the superclass is expected. The superclass is `open` or `abstract`, as for any
+subclass. What the superclass's arguments and constructor read counts toward the order in which
+module values and objects are made.
 
 An object's body is written like a class body with no parameters: its fields and statements run
 once, before `main`, to make the one instance, and its methods have the same implicit receiver and
