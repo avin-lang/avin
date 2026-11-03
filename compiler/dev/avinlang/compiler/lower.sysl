@@ -1,7 +1,9 @@
 module dev.avinlang.compiler
 
+import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
+import sysl.path.file_name
 
 /** The machine type of a semantic type, or `None` for a type with no runtime representation. */
 mir_type(t: &Type) -> Option[MirType] = *t match
@@ -70,6 +72,9 @@ private struct Lowering
     instance_index: Map[string, usize]
     descriptors: Buf[Descriptor]
     closures: Buf[ClosureConstant]
+    /** The program's trap sites, each once, and each one's index by its unit, offset and reason. */
+    traps: Buf[TrapSite]
+    trap_index: Map[string, usize]
     /** Each closure layout, and each constant closure's index, by function instance. */
     shapes: Map[string, ClosureShape]
     closure_index: Map[string, usize]
@@ -99,14 +104,17 @@ private struct Lowering
     current: usize
     insts: Buf[Inst]
     loops: Buf[LoopTarget]
-    /** The function's one trap block, made when first needed. */
-    trap: Option[usize]
+    /** The unit the function being lowered was declared in, which its spans are offsets into. */
+    unit: usize
+    /** The function's block for each trap site it reaches, made when first needed, so the checks
+     * of one operation share a block and different operations never do. */
+    trap_blocks: Map[usize, usize]
     returns_value: bool
 
 // Every function that is not generic is compiled once; each generic function is compiled for each
 // list of type arguments a compiled call gives it, as those calls are found.
 lower_program(program: TProgram) -> MirProgram
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), None, false)
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false)
     for i in 0..<program.symbols.len()
         if !is_generic(program, i) then instance(&l, i, buf())
     val entry = instance(&l, program.entry, buf())
@@ -115,7 +123,7 @@ lower_program(program: TProgram) -> MirProgram
     while k < l.instances.len()
         functions.push(lower_function(&l, k))
         k += 1
-    MirProgram(functions, l.strings, l.descriptors, l.closures, entry)
+    MirProgram(functions, l.strings, l.descriptors, l.closures, l.traps, entry)
 
 // An object is a descriptor word followed by its fields in order, each at a multiple of 8 bytes.
 private field_size(t: MirType) -> usize = t match
@@ -436,7 +444,8 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     l.blocks = buf()
     l.insts = buf()
     l.loops = buf()
-    l.trap = None
+    l.unit = symbol.unit
+    l.trap_blocks = map()
     l.locals = f.locals
     l.boxed = boxed_locals(l, symbol.root.unwrap_or(inst.function), f.locals)
     if inst.entry then return lower_entry(l, inst)
@@ -580,17 +589,35 @@ private load(l: *Lowering, place: Option[Place]) -> Option[Operand] = place matc
         Some(Value(dest))
     None -> None
 
-/** Continues only when `flag` is false; otherwise the program traps. */
-private trap_if(l: *Lowering, flag: Operand)
-    val trap = l.trap match
-        Some(t) -> t
+/** The trap site for `reason` at the start of `at`, in the function being lowered; made when first
+ * asked for, so every instance of a generic function shares its sites. A site names its file
+ * without the directories it was compiled from, so a report reads the same wherever it was built. */
+private trap_site(l: *Lowering, reason: string, at: Span) -> usize
+    val key = s"${l.unit}:${at.start}:$reason"
+    if l.trap_index.get(key) is Some(index) then return index
+    val src = l.program.sources[l.unit]
+    val position = src.locate(at.start)
+    val file = file_name(src.name).unwrap_or(src.name)
+    l.traps.push(TrapSite(intern(l, reason), intern(l, file), position.line, position.col))
+    l.trap_index.put(key, l.traps.len() - 1)
+    l.traps.len() - 1
+
+/** A terminator that stops the program for `reason` at `at`. */
+private trap_at(l: *Lowering, reason: string, at: Span) -> Terminator = Trap(trap_site(l, reason, at))
+
+/** Continues only when `flag` is false; otherwise the program traps for `reason` at `at`. The
+ * checks of one operation for one reason branch to one block, which is cold and ends the program. */
+private trap_if(l: *Lowering, flag: Operand, reason: string, at: Span)
+    val site = trap_site(l, reason, at)
+    val block = l.trap_blocks.get(site) match
+        Some(b) -> b
         None ->
-            val t = new_block(l)
-            l.blocks[t].term = Trap
-            l.trap = Some(t)
-            t
+            val b = new_block(l)
+            l.blocks[b].term = Trap(site)
+            l.trap_blocks.put(site, b)
+            b
     val next = new_block(l)
-    finish_into(l, Branch(flag, trap, next), next)
+    finish_into(l, Branch(flag, block, next), next)
 
 private binary(l: *Lowering, t: MirType, op: MirOp, a: Operand, b: Operand) -> Operand
     val dest = fresh(l, t)
@@ -607,12 +634,12 @@ private select(l: *Lowering, t: MirType, condition: Operand, yes: Operand, no: O
     l.insts.push(Select(dest, condition, yes, no))
     Value(dest)
 
-/** An addition, subtraction or multiplication that traps when it overflows. */
-private checked(l: *Lowering, bits: u32, op: MirChecked, a: Operand, b: Operand) -> Operand
+/** An addition, subtraction or multiplication that traps at `at` when it overflows. */
+private checked(l: *Lowering, bits: u32, op: MirChecked, a: Operand, b: Operand, at: Span) -> Operand
     val dest = fresh(l, MInt(bits))
     val overflow = fresh(l, MBool)
     l.insts.push(Checked(dest, overflow, op, a, b))
-    trap_if(l, Value(overflow))
+    trap_if(l, Value(overflow), "integer overflow", at)
     Value(dest)
 
 /** Lowers an expression for its value; `None` for an expression with no runtime value, or one in
@@ -679,7 +706,7 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         val join = new_block(l)
         test_parts(l, pattern, value, fail)
         finish_into(l, Jump(join), fail)
-        finish_into(l, Trap, join)
+        finish_into(l, trap_at(l, "no value matched the binding's pattern", pattern.span), join)
         None
     Store(local, value, yields) ->
         val v = lower_expr(l, value)
@@ -690,12 +717,12 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         for i in 0..<locals.len()
             if locals[i] is Some(local) then store(l, local_place(l, local), parts[i])
         None
-    Step(local, increment, postfix) -> step(l, e, local, increment, postfix)
+    Step(local, increment, postfix, op_span) -> step(l, e, local, increment, postfix, op_span)
     Negate(operand) ->
         val x = lower_expr(l, operand)?
         if *e.ty is Real then return Some(binary(l, MReal, OpFSub, ConstReal(-0.0), x))
         val bits = int_bits(e.ty)
-        Some(checked(l, bits, CheckedSub, ConstInt(bits, "0"), x))
+        Some(checked(l, bits, CheckedSub, ConstInt(bits, "0"), x, e.span))
     Not(operand) ->
         val x = lower_expr(l, operand)?
         Some(binary(l, MBool, OpXor, x, ConstBool(true)))
@@ -703,17 +730,17 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         val x = lower_expr(l, operand)?
         val bits = int_bits(e.ty)
         Some(binary(l, MInt(bits), OpXor, x, ConstInt(bits, "-1")))
-    Arith(op, left, right) ->
+    Arith(op, left, right, op_span) ->
         val a = lower_expr(l, left)?
         val b = lower_expr(l, right)?
         Some(*e.ty match
             Real -> real_arith(l, op, a, b)
             Byte -> byte_arith(l, op, a, b)
             Str -> runtime_call(l, "avin_rt_string_concat", [MRef, MRef], MRef, [a, b])
-            _ -> arith(l, int_bits(e.ty), op, a, b))
+            _ -> arith(l, int_bits(e.ty), op, a, b, op_span))
     Convert(operand) ->
         val x = lower_expr(l, operand)?
-        Some(convert(l, operand.ty, e.ty, x))
+        Some(convert(l, operand.ty, e.ty, x, e.span))
     Render(value) -> render(l, value)
     Logic(and, left, right) -> logic(l, and, left, right)
     Compare(operands, ops) -> compare_chain(l, operands, ops)
@@ -752,23 +779,23 @@ private loop_target(l: *Lowering, label: usize) -> LoopTarget
         if t.label == label then return t
     LoopTarget(label, 0, 0, None)
 
-private step(l: *Lowering, e: &TExpr, local: usize, increment: bool, postfix: bool) -> Option[Operand]
+private step(l: *Lowering, e: &TExpr, local: usize, increment: bool, postfix: bool, op_span: Span) -> Option[Operand]
     val slot = local_place(l, local)
     val old = load(l, slot)?
     val bits = int_bits(e.ty)
-    val updated = checked(l, bits, if increment then CheckedAdd else CheckedSub, old, ConstInt(bits, "1"))
+    val updated = checked(l, bits, if increment then CheckedAdd else CheckedSub, old, ConstInt(bits, "1"), op_span)
     store(l, slot, Some(updated))
     Some(if postfix then old else updated)
 
 // Avin's integer operators on machine operations. `+`, `-` and `*` trap on overflow; `/` traps on
 // a zero divisor and on the one quotient that does not fit; `%` traps on a zero divisor and is 0
 // for a divisor of -1; a shift count at least the width, or negative, shifts every bit out.
-private arith(l: *Lowering, bits: u32, op: BinaryOp, a: Operand, b: Operand) -> Operand
+private arith(l: *Lowering, bits: u32, op: BinaryOp, a: Operand, b: Operand, at: Span) -> Operand
     val t = MInt(bits)
     op match
-        Add -> checked(l, bits, CheckedAdd, a, b)
-        Subtract -> checked(l, bits, CheckedSub, a, b)
-        Multiply -> checked(l, bits, CheckedMul, a, b)
+        Add -> checked(l, bits, CheckedAdd, a, b, at)
+        Subtract -> checked(l, bits, CheckedSub, a, b, at)
+        Multiply -> checked(l, bits, CheckedMul, a, b, at)
         AddWrapping -> binary(l, t, OpAdd, a, b)
         SubtractWrapping -> binary(l, t, OpSub, a, b)
         MultiplyWrapping -> binary(l, t, OpMul, a, b)
@@ -779,13 +806,13 @@ private arith(l: *Lowering, bits: u32, op: BinaryOp, a: Operand, b: Operand) -> 
         BitOr -> binary(l, t, OpOr, a, b)
         BitXor -> binary(l, t, OpXor, a, b)
         Divide ->
-            trap_if(l, compare(l, CmpEq, b, ConstInt(bits, "0")))
+            trap_if(l, compare(l, CmpEq, b, ConstInt(bits, "0")), "division by zero", at)
             val minimum = compare(l, CmpEq, a, ConstInt(bits, min_digits(bits)))
             val minus_one = compare(l, CmpEq, b, ConstInt(bits, "-1"))
-            trap_if(l, binary(l, MBool, OpAnd, minimum, minus_one))
+            trap_if(l, binary(l, MBool, OpAnd, minimum, minus_one), "integer overflow", at)
             binary(l, t, OpDiv, a, b)
         Remainder ->
-            trap_if(l, compare(l, CmpEq, b, ConstInt(bits, "0")))
+            trap_if(l, compare(l, CmpEq, b, ConstInt(bits, "0")), "remainder by zero", at)
             val minus_one = compare(l, CmpEq, b, ConstInt(bits, "-1"))
             binary(l, t, OpRem, a, select(l, t, minus_one, ConstInt(bits, "1"), b))
         ShiftLeft ->
@@ -831,7 +858,7 @@ private resize(l: *Lowering, x: Operand, from: u32, to: u32, signed: bool) -> Op
     if from > to then return convert_op(l, Truncate, MInt(to), x)
     convert_op(l, if signed then SignExtend else ZeroExtend, MInt(to), x)
 
-private convert(l: *Lowering, from: &Type, to: &Type, x: Operand) -> Operand = *to match
+private convert(l: *Lowering, from: &Type, to: &Type, x: Operand, at: Span) -> Operand = *to match
     Real -> *from match
         Real -> x
         Byte -> convert_op(l, UnsignedToReal, MReal, x)
@@ -841,31 +868,31 @@ private convert(l: *Lowering, from: &Type, to: &Type, x: Operand) -> Operand = *
         Int(width) -> resize(l, x, width, bits, true)
         _ -> resize(l, x, int_bits(from), bits, false)
     Byte -> *from match
-        Int(width) -> to_byte(l, x, width)
+        Int(width) -> to_byte(l, x, width, at)
         _ -> x
     Char -> *from match
-        Int(width) -> to_char(l, x, width)
+        Int(width) -> to_char(l, x, width, at)
         Byte -> resize(l, x, 8, 32, false)
         _ -> x
     _ -> x
 
 // An integer becomes a byte only when it is 0 to 255; anything else traps.
-private to_byte(l: *Lowering, x: Operand, width: u32) -> Operand
+private to_byte(l: *Lowering, x: Operand, width: u32, at: Span) -> Operand
     if width <= 8
-        trap_if(l, compare(l, CmpLt, x, ConstInt(width, "0")))
+        trap_if(l, compare(l, CmpLt, x, ConstInt(width, "0")), "value out of range for byte", at)
         return resize(l, x, width, 8, false)
-    trap_if(l, compare(l, CmpUgt, x, ConstInt(width, "255")))
+    trap_if(l, compare(l, CmpUgt, x, ConstInt(width, "255")), "value out of range for byte", at)
     resize(l, x, width, 8, false)
 
 // An integer becomes a char only when it is a Unicode scalar value: 0 to 0x10FFFF, outside the
 // surrogates 0xD800 to 0xDFFF. A negative value compares as huge, so one unsigned test covers both
 // ends.
-private to_char(l: *Lowering, x: Operand, width: u32) -> Operand
+private to_char(l: *Lowering, x: Operand, width: u32, at: Span) -> Operand
     val w = if width < 32 then 32u32 else width
     val wide = resize(l, x, width, w, true)
-    trap_if(l, compare(l, CmpUgt, wide, ConstInt(w, "1114111")))
+    trap_if(l, compare(l, CmpUgt, wide, ConstInt(w, "1114111")), "value out of range for char", at)
     val offset = binary(l, MInt(w), OpSub, wide, ConstInt(w, "55296"))
-    trap_if(l, compare(l, CmpUlt, offset, ConstInt(w, "2048")))
+    trap_if(l, compare(l, CmpUlt, offset, ConstInt(w, "2048")), "surrogate code point is not a char", at)
     resize(l, wide, w, 32, false)
 
 /** The most negative value of a width, in decimal. */
@@ -927,11 +954,14 @@ private compare_op(op: CompareOp, t: &Type) -> MirCmp
         _ -> CmpGe
 
 /** The interned constant string `text`. */
-private string_constant(l: *Lowering, text: string) -> Operand
-    if l.string_index.get(text) is Some(index) then return ConstStr(index)
+private string_constant(l: *Lowering, text: string) -> Operand = ConstStr(intern(l, text))
+
+/** The index of the constant string `text`, made when first asked for. */
+private intern(l: *Lowering, text: string) -> usize
+    if l.string_index.get(text) is Some(index) then return index
     l.string_index.put(text, l.strings.len())
     l.strings.push(text)
-    ConstStr(l.strings.len() - 1)
+    l.strings.len() - 1
 
 // A value as text. Integers up to 64 bits widen to 64 and wider ones are passed to the runtime as
 // their 64-bit words in memory, least significant first; bools and unit are constant strings.
@@ -1048,7 +1078,7 @@ private lower_match(l: *Lowering, e: &TExpr, subject: &TExpr, arms: Buf[TArm]) -
             if lower_expr(l, g) is Some(ok) then continue_if(l, ok, fail)
         store(l, slot, lower_expr(l, arm.body))
         finish_into(l, Jump(join), fail)
-    finish_into(l, Trap, join)
+    finish_into(l, trap_at(l, "no arm of the match took the value", e.span), join)
     load(l, slot)
 
 // Each clause tests its patterns against the arguments, then tries its bodies' guards in order; when
@@ -1071,7 +1101,7 @@ private lower_clauses(l: *Lowering, e: &TExpr, subjects: Buf[&TExpr], clauses: B
             store(l, slot, lower_expr(l, b.body))
             finish_into(l, Jump(join), next)
         finish_into(l, Jump(fail), fail)
-    finish_into(l, Trap, join)
+    finish_into(l, trap_at(l, "no clause took the arguments", e.span), join)
     load(l, slot)
 
 private lower_is(l: *Lowering, value: &TExpr, pattern: &TPattern, negated: bool) -> Option[Operand]

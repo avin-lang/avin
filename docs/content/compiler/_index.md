@@ -48,6 +48,27 @@ live outside the heap, and the collector leaves them alone. `AVIN_GC_STRESS=1` m
 allocation collect first, and the execution tests run that way, so a reference the compiler failed
 to root is found at the first allocation that could lose it.
 
+A trap stops the program with one line on standard error naming what failed and where:
+
+```text
+avin: trap: integer overflow at gcd.avin:12:9
+```
+
+The place is the operation's: the operator of an arithmetic operation, compound assignment or
+`++`, the start of a conversion such as `byte(n)`, a negation's `-`. The line and column count from
+1, and the column counts characters. The file is named without its directories, so the message
+reads the same wherever the program was built. The reasons are `integer overflow` (which includes
+the most negative value divided by -1), `division by zero`, `remainder by zero`, `value out of range
+for byte`, `value out of range for char` and `surrogate code point is not a char`; a `match` or a
+function's clauses that no value falls through still name their place, as a check on the compiler.
+
+Lowering records each place a program can trap as a **trap site**: the reason and the file as
+constant strings, then the line and column. Every check made at a site branches to one cold block of
+its function that calls the runtime with the site's constant address, so the checks of one operation
+share a block and two operations never do; the instances of a generic function share its sites. The
+runtime flushes what the program has written to standard output first, so no output is lost, then
+writes the message and stops.
+
 Programs are multi-threaded, so the runtime keeps no per-thread state in globals. Each thread has a
 **context**, and every compiled function, closure entry and runtime entry point takes the running
 thread's context as a hidden first argument. A function that holds references links its frame of

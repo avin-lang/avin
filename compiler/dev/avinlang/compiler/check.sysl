@@ -199,7 +199,10 @@ check_program(units: Buf[SourceUnit]) -> Checked
     var functions: Buf[TFunction] = buf()
     for i in 0..<c.symbols.len()
         functions.push(TFunction(i, c.bodies[i], c.locals[i]))
-    Checked(c.units, Some(TProgram(c.symbols, c.data, functions, c.vars, id)))
+    var sources: Buf[Source] = buf()
+    for u in c.units
+        sources.push(u.src)
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, functions, c.vars, id)))
 
 private declare_unit(c: *Checker, unit: usize)
     val file = c.units[unit].file
@@ -624,12 +627,12 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
     Block(items, discard) -> block_expr(c, e, items, discard, expected, used)
     Binding(name, declared, value, mutable) -> binding_expr(c, e, name, declared, value, mutable)
     Destructure(pattern, declared, value, mutable) -> destructure_expr(c, e, pattern, declared, value, mutable)
-    Assign(target, op, value, yields) -> assign_expr(c, e, target, op, value, yields)
-    MultiAssign(targets, op, value) -> multi_assign_expr(c, e, targets, op, value)
+    Assign(target, op, value, yields, op_span) -> assign_expr(c, e, target, op, value, yields, op_span)
+    MultiAssign(targets, op, value, op_span) -> multi_assign_expr(c, e, targets, op, value, op_span)
     Tuple(items) -> tuple_expr(c, e, items, expected)
     TupleIndex(target, index) -> tuple_index(c, e, target, index)
-    Update(target, increment, postfix) -> update_expr(c, e, target, increment, postfix)
-    Binary(op, left, right) -> binary_expr(c, e, op, left, right, expected)
+    Update(target, increment, postfix, op_span) -> update_expr(c, e, target, increment, postfix, op_span)
+    Binary(op, left, right, op_span) -> binary_expr(c, e, op, left, right, op_span, expected)
     Compare(operands, ops) -> compare_expr(c, e, operands, ops)
     If(condition, yes, no) -> if_expr(c, e, condition, yes, no, expected, used)
     While(condition, body, otherwise) -> while_expr(c, e, condition, body, otherwise, expected, used)
@@ -797,7 +800,7 @@ private assignable(c: *Checker, target: &Expr) -> Option[usize]
             else c.note(unit, target.span, s"`$name` is not defined")
     None
 
-private assign_expr(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp], value: &Expr, yields: bool) -> &TExpr
+private assign_expr(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp], value: &Expr, yields: bool, op_span: Span) -> &TExpr
     val unit = unit_of(c)
     val index = assignable(c, target) match
         Some(i) -> i
@@ -807,7 +810,7 @@ private assign_expr(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp], 
     val local = c.body.locals[index]
     val current = TExpr(target.span, local.ty, Local(index))
     val stored = op match
-        Some(o) -> operate(c, e.span, o, binary_spelling(o) + (if yields then ":=" else "="), current, check_expr(c, value, Some(local.ty)))
+        Some(o) -> operate(c, e.span, op_span, o, binary_spelling(o) + (if yields then ":=" else "="), current, check_expr(c, value, Some(local.ty)))
         None ->
             val typed = check_expr(c, value, Some(local.ty))
             if !conforms(typed.ty, local.ty)
@@ -872,7 +875,7 @@ private destructure_expr(c: *Checker, e: &Expr, pattern: &Pattern, declared: Opt
 
 // `a, b = x, y` and its compound forms. Every place is read, then the whole value is made, and only
 // then is anything stored, so `a, b = b, a` swaps. A target `_` discards its part.
-private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option[BinaryOp], value: &Expr) -> &TExpr
+private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option[BinaryOp], value: &Expr, op_span: Span) -> &TExpr
     val unit = unit_of(c)
     var locals: Buf[Option[usize]] = buf()
     var types: Buf[Option[&Type]] = buf()
@@ -953,7 +956,7 @@ private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option
                 op match
                     Some(o) ->
                         val old = TExpr(targets[i].span, ty, Local(olds[i].unwrap()))
-                        result = operate(c, targets[i].span, o, binary_spelling(o) + "=", old, part)
+                        result = operate(c, targets[i].span, op_span, o, binary_spelling(o) + "=", old, part)
                     None ->
                         if !conforms(part.ty, ty) then c.note(unit, part.span, s"expected ${type_name(ty)}, found ${type_name(part.ty)}")
             None -> ()
@@ -968,7 +971,7 @@ private hidden_local(c: *Checker, ty: &Type) -> usize
     c.body.locals.push(TLocal("", ty, false, c.current))
     index
 
-private update_expr(c: *Checker, e: &Expr, target: &Expr, increment: bool, postfix: bool) -> &TExpr
+private update_expr(c: *Checker, e: &Expr, target: &Expr, increment: bool, postfix: bool, op_span: Span) -> &TExpr
     val index = assignable(c, target) match
         Some(i) -> i
         None -> return TExpr(e.span, ErrorType, UnitConst)
@@ -976,7 +979,7 @@ private update_expr(c: *Checker, e: &Expr, target: &Expr, increment: bool, postf
     if !(*ty is Int(_) || *ty is ErrorType)
         c.note(unit_of(c), e.span, s"`${if increment then "++" else "--"}` needs an integer, not ${type_name(ty)}")
         return TExpr(e.span, ErrorType, UnitConst)
-    TExpr(e.span, ty, Step(index, increment, postfix))
+    TExpr(e.span, ty, Step(index, increment, postfix, op_span))
 
 // An integer literal, possibly negated, takes its type from context rather than giving one.
 private is_literal(e: &Expr) -> bool = e.kind match
@@ -1014,7 +1017,7 @@ private unary_expr(c: *Checker, e: &Expr, op: UnaryOp, operand: &Expr, expected:
 
 // The operand that is not a bare literal is checked first, so a literal on either side takes the
 // other operand's type: in `1 + x` with `x: i8`, the `1` is an `i8`.
-private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Expr, expected: Option[&Type]) -> &TExpr
+private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Expr, op_span: Span, expected: Option[&Type]) -> &TExpr
     if op is And || op is Or
         val l = check_expr(c, left, Some(Bool))
         val r = check_expr(c, right, Some(Bool))
@@ -1024,19 +1027,20 @@ private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Ex
         return TExpr(e.span, if *l.ty is Nothing then Nothing else Bool, Logic(op is And, l, r))
     if is_literal(left) && !is_literal(right)
         val r = check_expr(c, right, expected)
-        return operate(c, e.span, op, binary_spelling(op), check_expr(c, left, Some(r.ty)), r)
+        return operate(c, e.span, op_span, op, binary_spelling(op), check_expr(c, left, Some(r.ty)), r)
     val l = check_expr(c, left, expected)
-    operate(c, e.span, op, binary_spelling(op), l, check_expr(c, right, Some(l.ty)))
+    operate(c, e.span, op_span, op, binary_spelling(op), l, check_expr(c, right, Some(l.ty)))
 
 // Arithmetic, bitwise and shift operators take two operands of one type and yield that type.
-// Integers have them all; reals have arithmetic; bytes have bitwise operators and shifts.
-private operate(c: *Checker, at: Span, op: BinaryOp, spelling: string, l: &TExpr, r: &TExpr) -> &TExpr
+// Integers have them all; reals have arithmetic; bytes have bitwise operators and shifts. `at` is
+// the whole operation, which diagnostics point at; `op_at` is its operator, where a trap is reported.
+private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: string, l: &TExpr, r: &TExpr) -> &TExpr
     if !settled(l.ty) || !settled(r.ty)
         // An operand that never finishes means the operation never finishes.
         val ty: &Type = if *l.ty is ErrorType || *r.ty is ErrorType then ErrorType else Nothing
-        return TExpr(at, ty, Arith(op, l, r))
+        return TExpr(at, ty, Arith(op, l, r, op_at))
     if *l.ty is Str && *r.ty is Str
-        if op is Add then return TExpr(at, Str, Arith(op, l, r))
+        if op is Add then return TExpr(at, Str, Arith(op, l, r, op_at))
         c.note(unit_of(c), at, s"`$spelling` is not defined on strings; `+` joins two strings")
         return TExpr(at, ErrorType, UnitConst)
     if *l.ty is Str && op is Add || *r.ty is Str && op is Add
@@ -1055,7 +1059,7 @@ private operate(c: *Checker, at: Span, op: BinaryOp, spelling: string, l: &TExpr
     if *l.ty is Real && !arithmetic
         c.note(unit_of(c), at, s"`$spelling` is not defined on real")
         return TExpr(at, ErrorType, UnitConst)
-    TExpr(at, l.ty, Arith(op, l, r))
+    TExpr(at, l.ty, Arith(op, l, r, op_at))
 
 private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[CompareOp]) -> &TExpr
     var early: Buf[Option[&TExpr]] = buf()
@@ -1129,7 +1133,7 @@ private interpolate_expr(c: *Checker, e: &Expr, prefix: string, chunks: Buf[stri
     if pieces.len() == 0 then return TExpr(e.span, Str, StrConst(""))
     var out = pieces[0]
     for k in 1..<pieces.len()
-        out = TExpr(e.span, ty, Arith(Add, out, pieces[k]))
+        out = TExpr(e.span, ty, Arith(Add, out, pieces[k], e.span))
     if *ty is Nothing then TExpr(e.span, Nothing, out.kind) else out
 
 // The type two branches agree on, where one that never finishes agrees with anything.
