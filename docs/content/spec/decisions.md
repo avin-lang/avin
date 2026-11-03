@@ -108,6 +108,12 @@ a decision changes, this page and the chapter change together.
 - A private member is private to its class, not to one instance: the class's constructor and
   methods, with the lambdas and local functions in them, may use it on any instance of the class.
 - A class body cannot `return`. A field declared in the body without a type has its initializer's.
+- [Initialization](/spec/declarations/#initialization) is checked at compile time. Through the last
+  field's initializer, a class or object body uses `self` only to read a field already set and to
+  assign a field: a method call in any spelling (bare name, `self.m()`, `super.m()`), passing,
+  storing or returning `self`, and a lambda or local function using a field or `self` are errors.
+  An `open` or `abstract` class's body runs before its subclasses' fields are set, so the limits
+  hold for the whole of it, and it never calls a method a subclass may override.
 - An [object](/spec/declarations/#object) is made once, before `main`; its name is a value of its own
   type and cannot be called. It shares its name only with its companion class, whose constructor
   the name is in call position, while the bare name and `Name.member` are the companion.
@@ -228,6 +234,11 @@ a decision changes, this page and the chapter change together.
 - A tuple's type at run time is the type it was made with: `(animal, 1)` with `animal: Animal` is an
   `(Animal, int)` whatever its class, and a type pattern `(Dog, int)` does not match it. A tuple made
   as `(Dog, int)` matches `(Animal, int)` too.
+- After its own last field, an `open` or `abstract` class's body may call a method that cannot be
+  overridden (a private one) when that method is safe: it uses `self` only to read and assign
+  fields and to call other safe methods, so it cannot reach a subclass's field before the subclass
+  sets it. The settled rule read literally forbids every method call in such a body, since the
+  subclass's fields are not yet set; this allows the calls that provably observe nothing unset.
 
 ## Open
 
