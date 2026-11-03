@@ -17,6 +17,7 @@ a decision changes, this page and the chapter change together.
 - Syntax stays very close to Sysl. Where Sysl has no form, this specification defines one in the
   same style.
 - Execution speed is a primary goal.
+- Programs are multi-threaded: threads run in parallel and share one garbage-collected heap.
 - Typing is nominal. Classes instantiate objects; there are no duck-typed objects.
 - Inference is a useful approximation of Hindley–Milner, not full HM: see
   [inference](/spec/generics/#inference).
@@ -115,14 +116,18 @@ a decision changes, this page and the chapter change together.
 
 - Public C interoperability. Until then, C is reached through Sysl.
 - Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async, await, and concurrency other than actors.
+- Async and await.
 - Partial-function literal syntax, which the user has explicitly left undecided.
 
 ## Open
 
 - Resource cleanup: a `defer` construct or a library `use`.
-- How actors work: how messages are declared and sent, mailboxes and replies, scheduling and
-  threads, what an actor may share with others on the heap, and failure and supervision.
+- The thread model: how threads are started and joined, what a program may assume about mutable
+  state other threads write (module-level `var`s and `object`s included), the synchronization the
+  library provides, and how the collector coordinates the threads.
+- How actors work: how messages are declared and sent, mailboxes and replies, how actors are
+  scheduled onto threads, what an actor may share with others on the heap, and failure and
+  supervision.
 - How state machines work: events and transitions, data held by the machine and by each state,
   entry and exit actions, checking that every event is handled, and whether an actor's behaviour
   can be a machine.

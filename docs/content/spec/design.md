@@ -23,7 +23,7 @@ are designed together. These are the choices that shape it, each with what it me
 | **Overloading is resolved statically** | Functions and methods may share a name when their parameter types differ. The compiler chooses the most specific overload from the arguments at compile time, and an ambiguous call is an error rather than a guess. |
 | **`object` holds module-wide state** | An `object` is an ordinary value, and the one place for state and functions that belong to a type rather than an instance. |
 | **Initialization is checked** | A constructor assigns every field before `self` is used. Traits carry behaviour, not state. Module-level values and `object`s initialize before `main`, in dependency order, and the compiler rejects a cycle. |
-| **Objects are just data** | An object's header holds its type and what the collector needs, nothing more. Concurrency comes through actors, which are a language design of their own. |
+| **Objects are just data** | An object's header holds its type and what the collector needs, nothing more: there is no lock in every object. Threads share the heap; synchronization is library code, and actors are built into the language. |
 | **Tuples and functions of any arity** | A tuple or function type may have as many elements or parameters as the program needs. |
 | **`unit` is an ordinary type** | It has one value, `()`, and works as a type argument at no cost. |
 | **One top type, `Any`** | Every type conforms to `Any`; value types reach it by boxing at that one site. |
