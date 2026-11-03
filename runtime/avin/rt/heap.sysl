@@ -29,12 +29,24 @@ struct Context
     /** The next attached context. */
     next: *Context
 
-/** A variant's layout, emitted by the compiler as constant data. `refs` byte offsets of the fields
- * that hold references follow this header. Every object's first word is its descriptor. */
+/** A variant's layout, emitted by the compiler as constant data. It begins with the collector's
+ * `Kind`, whose `trace` is `avin_rt_trace` and whose other hooks are null, so the kind the collector
+ * keeps in an object's header, `gc.kind_of(p)`, is the object's descriptor. `refs` byte offsets of the
+ * fields that hold references follow this header, counted from the start of the payload. */
 struct Descriptor
+    kind: gc.Kind
     tag: usize
     size: usize
     refs: usize
+
+@assert(offsetof(Descriptor, kind) == 0, "a descriptor begins with its kind")
+
+/** A descriptor's header for objects whose variant is `tag`, of `size` bytes, holding `refs`
+ * references. */
+descriptor(tag: usize, size: usize, refs: usize) -> Descriptor = Descriptor(gc.Kind(&trace, null, null, null), tag, size, refs)
+
+/** The descriptor of the object at `p`, which may be on the heap or a constant outside it. */
+descriptor_of(p: *u8) -> *Descriptor = ptr_cast(gc.kind_of(p))
 
 private const DefaultLimit: usize = 8589934592
 
@@ -56,9 +68,7 @@ var main_context: Context = Context(null, null)
 /** Every attached context, whose frames are the roots of a collection. */
 var contexts: *Context = null
 var block: []u8 = [0u8; heap_limit()]
-var space: gc.Heap = gc.heap(&block[0], block.len)
-var low: usize = usize(&block[0])
-var high: usize = usize(&block[0]) + block.len
+var space: gc.Heap = gc.heap(&block[0], block.len, null)
 
 /** With `AVIN_GC_STRESS=1` every allocation collects first, which finds a missing root at the
  * first allocation it matters to. */
@@ -66,27 +76,22 @@ var stress: bool = env.get("AVIN_GC_STRESS") == Some("1")
 var budget: usize = Floor
 var since: usize = 0
 
-// A reference may be to a constant object outside the heap, which the collector does not own.
-private mark_ref(h: *gc.Heap, p: *u8)
-    val a = usize(p)
-    if a >= low && a < high then gc.mark(h, p)
-
-private trace(p: *u8, h: *gc.Heap)
-    val word: **Descriptor = ptr_cast(p)
-    val d = word[0]
+// The tracer of every object. A reference may be null or to a constant object outside the heap;
+// the collector ignores both.
+@export("avin_rt_trace")
+trace(p: *u8, h: *gc.Heap)
+    val d = descriptor_of(p)
     val offsets: *usize = ptr_cast(usize(d) + sizeof(Descriptor))
     for i in 0..<d.refs
         val field: **u8 = ptr_cast(usize(p) + offsets[i])
-        mark_ref(h, field[0])
-
-var kind: gc.Kind = gc.Kind(&trace, null, null, null)
+        gc.mark(h, field[0])
 
 private mark_frames(h: *gc.Heap, top: *Frame)
     var f = top
     while f != null
         val slots: **u8 = ptr_cast(usize(f) + sizeof(Frame))
         for i in 0..<f.count
-            mark_ref(h, slots[i])
+            gc.mark(h, slots[i])
         f = f.prev
 
 private roots(h: *gc.Heap)
@@ -141,24 +146,22 @@ start() -> *Context
     attach(&main_context)
     &main_context
 
-/** A new object laid out by `d`: its first word is `d`, the rest zero. */
+/** A new object laid out by `d`, all zero; its header holds `d`. */
 @export("avin_rt_alloc")
 allocate(ctx: *Context, d: *Descriptor) -> *u8 = allocate_sized(ctx, d, d.size)
 
-/** A new object of `size` bytes whose first word is `d` and the rest zero, for an object whose size
- * is not its descriptor's, such as a string, whose bytes follow its header. Allocating may collect,
- * so every reference the caller still needs must be a root. `ctx` is the allocating thread's. */
+/** A new object of `size` bytes, all zero, whose header holds `d`, for an object whose size is not
+ * its descriptor's, such as a string, whose bytes follow its length. Allocating may collect, so
+ * every reference the caller still needs must be a root. `ctx` is the allocating thread's. */
 allocate_sized(ctx: *Context, d: *Descriptor, size: usize) -> *u8
     if stress || since >= budget then collect_now()
-    var p = gc.alloc(&space, size, &kind)
+    var p = gc.alloc(&space, size, &d.kind)
     if p == null
         collect_now()
-        p = gc.alloc(&space, size, &kind)
+        p = gc.alloc(&space, size, &d.kind)
         if p == null
             flush()
             eprints("avin: out of memory: the heap limit is " + block.len.to_string() + " bytes; set AVIN_HEAP_LIMIT to raise it\n")
             trap()
     since += size
-    val word: **Descriptor = ptr_cast(p)
-    word[0] = d
     p

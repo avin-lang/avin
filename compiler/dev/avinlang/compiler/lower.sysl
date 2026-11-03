@@ -58,7 +58,7 @@ private struct Instance
 
 /** The layout of a closure of one function: its descriptor, and where each captured value is kept,
  * the captured locals first, then the captured top-level parameters. The entry's address is at
- * offset 8. A closure that captures nothing is constant. */
+ * offset 0. A closure that captures nothing is constant. */
 private struct ClosureShape
     descriptor: usize
     fields: Buf[FieldSlot]
@@ -143,7 +143,11 @@ private never_compiled(program: TProgram, id: usize) -> bool
         Some(k) -> symbol.constructor && program.classes[k].constructor == id && (program.classes[k].decl.modifier == "abstract" || program.classes[k].decl.modifier == "trait")
         None -> false
 
-// An object is a descriptor word followed by its fields in order, each at a multiple of 8 bytes.
+// An object is its fields in order, each at a multiple of 8 bytes; its descriptor is in the header
+// the collector keeps before it.
+/** Where a descriptor's tag is: after the collector's kind, four words. */
+private const DescriptorTag: usize = 32
+
 private field_size(t: MirType) -> usize = t match
     MInt(bits) -> usize((bits + 63) / 64) * 8
     _ -> 8
@@ -178,7 +182,7 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
 private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[&Type], shared: bool, methods: Buf[Option[usize]]) -> VariantLayout
     var fields: Buf[Option[FieldSlot]] = buf()
     var refs: Buf[usize] = buf()
-    var size = 8usize
+    var size = 0usize
     for field in field_types
         mir_type(field) match
             Some(m) ->
@@ -187,7 +191,7 @@ private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[
                 size += field_size(m)
             None -> fields.push(None)
     val shape = VariantLayout(l.descriptors.len(), fields)
-    l.descriptors.push(Descriptor(name, tag, size, refs, shared && size == 8, methods))
+    l.descriptors.push(Descriptor(name, tag, size, refs, shared && size == 0, methods))
     shape
 
 // The method table of a class instance: for each slot, the instance of the method that fills it,
@@ -324,9 +328,9 @@ private box_descriptor(l: *Lowering, t: MirType) -> usize
     val key = machine_name(t)
     if l.boxes.get(key) is Some(d) then return d
     var refs: Buf[usize] = buf()
-    if t is MRef then refs.push(8)
+    if t is MRef then refs.push(0)
     val d = l.descriptors.len()
-    l.descriptors.push(Descriptor("box of " + key, 0, 8 + field_size(t), refs, false, buf()))
+    l.descriptors.push(Descriptor("box of " + key, 0, field_size(t), refs, false, buf()))
     l.boxes.put(key, d)
     d
 
@@ -337,7 +341,7 @@ private machine_name(t: MirType) -> string = t match
     MPtr -> "address"
     MRef -> "reference"
 
-// A closure is its descriptor, its entry's address, and then the value of each local and top-level
+// A closure is its entry's address and then the value of each local and top-level
 // parameter the function captures; a boxed local is captured as its box, so it stays shared.
 private closure_shape(l: *Lowering, function: usize, type_args: Buf[&Type]) -> ClosureShape
     val key = instance_key(function, type_args, false)
@@ -345,7 +349,7 @@ private closure_shape(l: *Lowering, function: usize, type_args: Buf[&Type]) -> C
     val symbol = l.program.symbols[function]
     var fields: Buf[FieldSlot] = buf()
     var refs: Buf[usize] = buf()
-    var size = 16usize
+    var size = 8usize
     symbol.root match
         Some(root) ->
             for x in symbol.captured_locals
@@ -393,7 +397,7 @@ private function_value(l: *Lowering, function: usize, type_args: Buf[&Type]) -> 
         if l.param_values[x] is Some(v) then values.push(Value(v))
     val object = fresh(l, MRef)
     l.insts.push(Alloc(object, shape.descriptor))
-    l.insts.push(Store(field_address(l, Value(object), FieldSlot(8, MPtr)), FunctionAddress(entry)))
+    l.insts.push(Store(field_address(l, Value(object), FieldSlot(0, MPtr)), FunctionAddress(entry)))
     for i in 0..<values.len()
         l.insts.push(Store(field_address(l, Value(object), shape.fields[i]), values[i]))
     Value(object)
@@ -427,7 +431,7 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
         Some(id) -> Some(Value(id))
         None -> None
 
-// Calls a function value: its entry is at offset 8, and takes the closure before the arguments.
+// Calls a function value: its entry is at offset 0, and takes the closure before the arguments.
 private call_value(l: *Lowering, callee: &TExpr, args: Buf[&TExpr]) -> Option[Operand]
     val target = lower_expr(l, callee)?
     var operands: Buf[Operand] = buf()
@@ -448,7 +452,7 @@ private call_value(l: *Lowering, callee: &TExpr, args: Buf[&TExpr]) -> Option[Op
             result = machine(l, r)
         ByName(r) -> result = machine(l, r)
         _ -> panic("a call of a value that is not a function")
-    val code = load_field(l, target, FieldSlot(8, MPtr))
+    val code = load_field(l, target, FieldSlot(0, MPtr))
     val dest = result match
         Some(t) -> Some(fresh(l, t))
         None -> None
@@ -463,7 +467,7 @@ private local_place(l: *Lowering, x: usize) -> Option[Place]
     if !l.boxed[x] then return Some(place)
     val t = machine(l, l.locals[x].ty).unwrap()
     val box = load(l, Some(place)).unwrap()
-    Some(Place(field_address(l, box, FieldSlot(8, t)), t))
+    Some(Place(field_address(l, box, FieldSlot(0, t)), t))
 
 /** Gives a local its first value; a boxed local gets a new box holding it. */
 private bind_local(l: *Lowering, x: usize, value: Option[Operand])
@@ -474,7 +478,7 @@ private bind_local(l: *Lowering, x: usize, value: Option[Operand])
     val t = machine(l, l.locals[x].ty).unwrap()
     val box = fresh(l, MRef)
     l.insts.push(Alloc(box, box_descriptor(l, t)))
-    l.insts.push(Store(field_address(l, Value(box), FieldSlot(8, t)), v))
+    l.insts.push(Store(field_address(l, Value(box), FieldSlot(0, t)), v))
     store(l, l.local_slots[x], Some(Value(box)))
 
 /** A type of the code being lowered, with the instance's type arguments substituted. */
@@ -1268,9 +1272,11 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
                 // A type with one variant needs no test; otherwise the tag is in the descriptor.
                 if shape.variants.len() > 1
                     val descriptor = fresh(l, MPtr)
-                    l.insts.push(Load(descriptor, v))
+                    l.insts.push(DescriptorOf(descriptor, v))
+                    val tag_address = fresh(l, MPtr)
+                    l.insts.push(Offset(tag_address, Value(descriptor), DescriptorTag))
                     val tag = fresh(l, MInt(64))
-                    l.insts.push(Load(tag, Value(descriptor)))
+                    l.insts.push(Load(tag, Value(tag_address)))
                     continue_if(l, compare(l, CmpEq, Value(tag), ConstInt(64, variant.to_string())), fail)
                 val places = shape.variants[variant].fields
                 for i in 0..<fields.len()
