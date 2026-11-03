@@ -52,6 +52,30 @@ A variant is called the same way as a function, so its fields may be given by na
 signature line, and its clauses match every parameter, defaulted or not. The default of a
 [by-name](/spec/by-name/) parameter is delayed like any argument to it.
 
+Methods and class constructors take defaults and named arguments the same way:
+
+```text
+class Account(owner: string, var balance: int = 0)
+    deposit(amount: int, note: string = s"$owner +$amount") -> string
+        balance += amount
+        note
+
+Account("ann").deposit(5)               // "ann +5"
+Account(balance = 3, owner = "bo")
+```
+
+A method's default is evaluated as the method's body is, so it sees `self` and the receiver's
+members as well as the parameters before it; the receiver is the one the call is made on. A
+constructor's default sees the parameters before it, but no `self`: the object does not exist yet.
+A subclass passing its superclass's constructor arguments may omit those with defaults.
+
+Defaults belong to the method that introduces a parameter. An `override`, and a method that
+implements a trait's method, takes that method's defaults and cannot declare its own, so a call
+omits the same arguments and gets the same values whichever class's method then runs. A trait's
+method declares its defaults in the trait, and they apply through the trait's type and on every
+type implementing it. A method of one required parameter whose others have defaults can be
+[called infix](/spec/operators-and-control-flow/#infix-method-calls).
+
 Functions and methods may be **overloaded**: several functions in one scope may share a name when
 their parameter types differ. A call chooses among them by its arguments:
 
