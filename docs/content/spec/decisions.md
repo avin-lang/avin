@@ -49,9 +49,10 @@ a decision changes, this page and the chapter change together.
   object, then stores its own parameters and runs its own body. The superclass's arguments cannot
   call a method or use `self`; a parameter's name in them reads the argument.
 - A subclass's fields are its superclass's, in order, then its own. Fields are never overridden.
-- Only public methods without type parameters of their own can be overridden. An override takes the
-  same parameter types and yields the same result or, for a class result, a subclass of it
-  (covariant results). An override cannot be private.
+- Only public methods can be overridden. An override takes the same parameter types and yields the
+  same result or, for a class result, a subclass of it (covariant results). An override cannot be
+  private. A method with type parameters of its own is overridden by one declaring as many, matched
+  by position (bounds, once they exist, must match too).
 - An abstract method is a method without a body, allowed only in an `abstract` class; an abstract
   class cannot be instantiated, and every concrete subclass implements each abstract method.
 - A call through a receiver whose static type is an `open` or `abstract` class reaches the override
@@ -60,13 +61,27 @@ a decision changes, this page and the chapter change together.
   where they have none, to the expected type when both conform to it, such as a trait.
 - A class implementing a trait's method marks it `override`, whether the trait's method is abstract
   or has a default body, as an override of a superclass's method is marked. A trait's methods are
-  public and override nothing; a trait cannot redeclare a method of a trait it requires.
+  public. A trait may override a default of a trait it requires, marked `override` and with a body;
+  in every type conforming to it, its body replaces the default. Redeclaring a required trait's
+  method without `override` is an error.
 - A class conforms to a trait once: two different type argument lists for one trait, reached by any
   paths, are an error. A trait's own default bodies count as inherited implementations, so a
   superclass's method and a trait's default of one name, or two traits' defaults, must be overridden.
 - A trait-typed call reaches the implementation through the class's method table, at a position the
   trait has in every conforming class's table (the whole program is known), so it costs one virtual
   call.
+- A trait's abstract `val name: T` is supplied by a public field of that name of each conforming
+  type: a class's `val` or `var` field, own or inherited, or a one-variant `data` type's field through
+  an impl. A `var` field satisfies a `val`; a method or a private field does not. Read through the
+  trait it is a method table entry the compiler fills with a method that loads the field; read
+  through a class type it is the field. It is never assigned through the trait.
+- An `object` may extend an `open` or `abstract` class, constructed from the top down as a subclass
+  is, overriding its methods and conforming to it; it implements every abstract member it inherits.
+- A trait's method, or an overridable class method, may have type parameters of its own and be
+  called dynamically. The whole program is known, so each list of its own type arguments that a call
+  through a table uses gets a slot of its own in the table of every type implementing the method,
+  filled with that type's implementation instantiated at those arguments; such a call also costs one
+  virtual call.
 - An `impl` adds methods and conformances, never state. Its methods are a class's or an object's own
   methods; for a `data` or built-in type they are called directly. Inside them the receiver is
   implicit, as in a class, with a one-variant `data` type's fields in scope by bare name.
@@ -288,6 +303,9 @@ a decision changes, this page and the chapter change together.
   so a racing read sees some value written to that word, and a constructor ends with a release
   fence, so no thread sees an object without its header and constructor-set fields. Actors are
   scheduled onto a pool of these threads.
+- A trait's `override` may also give an abstract method of a trait it requires a body, not only
+  replace a default: `trait Square: Shape` with `override area() -> int = side() * side()` makes
+  `area` concrete for every class conforming to `Square`.
 
 ## Open
 

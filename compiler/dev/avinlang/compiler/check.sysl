@@ -289,6 +289,11 @@ struct Checker
     building: Buf[u8]
     /** For each class whose body is stopped part way, where to resume it. */
     constructions: Buf[Option[Construction]]
+    /** The traits' `val` members: each an abstract method of no parameters that a read with field
+     * syntax calls. */
+    trait_fields: Buf[usize]
+    /** The methods made to read a field where it supplies a trait's `val`: each yields its field. */
+    field_getters: Buf[usize]
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -314,7 +319,7 @@ end Checked
 /** Checks a program. The last unit is the program's own file, which must declare `main`; the units
  * before it (the prelude) are visible to it, and its own declarations shadow theirs. */
 check_program(units: Buf[SourceUnit]) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false, false, buf(), buf(), buf(), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf())
     // Every type is named before any is used, so a data type may refer to itself or to one
     // declared after it, and functions are declared once every type is known.
     for u in 0..<c.units.len()
@@ -568,6 +573,7 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
     for m in d.members
         m match
             FieldMember(f) -> c.note(unit, f.span, s"an impl adds methods, not state, so it cannot declare the field `${f.name}`")
+            AbstractFieldMember(f) -> c.note(unit, f.span, s"an impl adds methods, not state, so it cannot declare the field `${f.name}`")
             StatementMember(s) -> c.note(unit, s.span, "an impl's body declares only methods")
             MethodMember(_, _, _) -> ()
     val path = d.target.kind match
@@ -658,8 +664,10 @@ private written_trait_span(d: &ImplDecl) -> Span = d.trait_name match
 private trait_declares(c: *Checker, t: usize, name: string, depth: usize) -> bool
     if depth > c.classes.len() then return false
     for m in c.classes[t].decl.members
-        if m is MethodMember(f, _, _)
-            if f.name == name then return true
+        m match
+            MethodMember(f, _, _) -> if f.name == name then return true
+            AbstractFieldMember(f) -> if f.name == name then return true
+            _ -> ()
     for required in c.classes[t].traits
         if *required is Class(r, _, _)
             if trait_declares(c, r, name, depth + 1) then return true
@@ -724,8 +732,15 @@ private declare_fields(c: *Checker, unit: usize)
             for m in d.members
                 m match
                     FieldMember(f) -> c.note(unit, f.span, s"a trait holds no state, so it cannot declare the field `${f.name}`")
+                    AbstractFieldMember(f) ->
+                        if f.mutable then c.note(unit, f.span, s"a trait declares `val` members, which are read and never assigned through it; write `val ${f.name}`")
+                        elif !f.public then c.note(unit, f.span, s"`${f.name}` is declared in a trait, so it cannot be private")
                     StatementMember(s) -> c.note(unit, s.span, "a trait has no constructor, so its body declares only methods")
                     _ -> ()
+        else
+            for m in d.members
+                if m is AbstractFieldMember(f)
+                    c.note(unit, f.span, s"`${f.name}` has no value; only a trait declares a `val` without one, and a class gives each of its fields a value where it declares it")
         val outer_generic = c.generic
         c.generic = Some(GenericScope(class_owner(id), d.type_params))
         var traits: Buf[&Type] = buf()
@@ -739,13 +754,12 @@ private declare_fields(c: *Checker, unit: usize)
                             if o == t then repeated = true
                     if repeated then c.note(unit, parent.span, s"`${c.classes[t].name}` is named more than once after `:`")
                     else traits.push(ty)
-            elif i == 0 && !declares_trait && !d.object then c.classes[id].superclass = superclass_of(c, unit, id, parent)
+            elif i == 0 && !declares_trait then c.classes[id].superclass = superclass_of(c, unit, id, parent)
             else
                 var is_class = false
                 if parent_name(parent) is Some(n)
                     if c.class_types.get(n) is Some(_) then is_class = true
                 if !is_class then c.note(unit, parent.span, s"`${parent_name(parent).unwrap_or("this")}` is not a trait")
-                elif d.object then c.note(unit, parent.span, "an object extending a class is not implemented")
                 elif declares_trait then c.note(unit, parent.span, "a trait may require only traits, not a class")
                 else c.note(unit, parent.span, "the superclass comes first after `:`, before the traits")
         // An impl of a trait for the class is the same conformance as one its header states.
@@ -983,6 +997,8 @@ private struct MethodDecl
     module_name: string
     type_params: Buf[TypeParam]
     from_impl: bool
+    /** Whether this is a trait's `val`, read as a field and supplied by a field. */
+    field: bool
 
 // Each class's constructor, a function named after the class that takes its parameters and yields
 // a new instance, and its methods, each a function whose first parameter is the instance.
@@ -1043,7 +1059,14 @@ private declare_methods(c: *Checker, unit: usize)
         // implements the trait's method without being marked.
         var declared: Buf[MethodDecl] = buf()
         for m in d.members
-            if m is MethodMember(f, public, overrides) then declared.push(MethodDecl(f, public, overrides, unit, module_name, d.type_params, false))
+            m match
+                MethodMember(f, public, overrides) -> declared.push(MethodDecl(f, public, overrides, unit, module_name, d.type_params, false, false))
+                // A trait's `val` is an abstract method of no parameters, read with field syntax.
+                AbstractFieldMember(f) ->
+                    if is_trait(c, id) && !f.mutable && f.public
+                        val getter = Function(buf(), f.span, f.name_span, f.name, buf(), buf(), Some(f.declared), None, buf())
+                        declared.push(MethodDecl(getter, true, false, unit, module_name, d.type_params, false, true))
+                _ -> ()
         for block in c.impls
             if *block.target is Class(target, _, _)
                 if target != id then continue
@@ -1058,7 +1081,7 @@ private declare_methods(c: *Checker, unit: usize)
                             if !trait_declares(c, t, f.name, 0)
                                 c.note(block.unit, f.name_span, s"`${f.name}` is not a method of `${c.classes[t].name}`; an impl of a trait implements the trait's methods, and `impl ${d.name}` adds others")
                                 continue
-                        declared.push(MethodDecl(f, public, overrides || trait_id is Some(_), block.unit, block.module_name, block.decl.type_params, true))
+                        declared.push(MethodDecl(f, public, overrides || trait_id is Some(_), block.unit, block.module_name, block.decl.type_params, true, false))
         for entry in declared
             val f = entry.f
             val public = entry.public
@@ -1070,11 +1093,8 @@ private declare_methods(c: *Checker, unit: usize)
                 if !public
                     c.note(file_unit, f.name_span, s"`${f.name}` is declared in a trait, so it cannot be private")
                     continue
-                if f.type_params.len() > 0
-                    c.note(file_unit, f.name_span, s"`${f.name}` has type parameters of its own; a trait's method with type parameters is not implemented")
-                    continue
-                if overrides
-                    c.note(file_unit, f.name_span, s"`${f.name}` is declared in a trait, which overrides nothing; a trait's method is implemented by a class")
+                if overrides && f.body is None && f.clauses.len() == 0
+                    c.note(file_unit, f.name_span, s"`${f.name}` overrides a method in a trait, so it needs a body, which replaces the default of the trait it requires")
                     continue
             var clash: Option[usize] = None
             for i in 0..<k.fields.len()
@@ -1113,11 +1133,18 @@ private declare_methods(c: *Checker, unit: usize)
             for _ in receiver_types
                 method_defaults.push(None)
             symbol.defaults = method_defaults
+            var shared = entry.field && same_name.len() > 0
+            for other in same_name
+                if is_trait_field(c, other) then shared = true
+            if shared
+                c.note(file_unit, f.name_span, s"`${f.name}` is declared more than once in `${d.name}`; a trait's `val` shares its name with no other member")
+                continue
             if same_as_overload(c, symbol, same_name)
                 if entry.from_impl then c.note(file_unit, f.name_span, s"`${f.name}` is already a method of `${d.name}` with the same parameter types; a method's overloads differ in their parameter types")
                 else c.note(file_unit, f.name_span, s"`${f.name}` is declared more than once in `${d.name}` with the same parameter types; a method's overloads differ in their parameter types")
                 continue
             val method = c.symbols.len()
+            if entry.field then c.trait_fields.push(method)
             methods.push(method)
             overriding.push(overrides)
             c.symbols.push(symbol)
@@ -1160,9 +1187,6 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
     if trait_id is Some(t)
         if !trait_declares(c, t, f.name, 0)
             c.note(unit, f.name_span, s"`${f.name}` is not a method of `${c.classes[t].name}`; an impl of a trait implements the trait's methods, and `impl $type_name_of` adds others")
-            return
-        if f.type_params.len() > 0
-            c.note(unit, f.name_span, s"`${f.name}` has type parameters of its own, so it cannot implement a trait's method")
             return
     elif overrides
         c.note(unit, f.name_span, s"`${f.name}` overrides nothing; `$type_name_of` has no superclass")
@@ -1312,6 +1336,26 @@ private inherit_defaults(c: *Checker, m: usize, base: usize)
         copied.push(d)
     c.symbols[m].defaults = copied
 
+// A method a type inherits, from its superclass or as a trait's default body, that also implements
+// another trait's method keeps its own defaults, so a call omits the same arguments whichever type
+// it is made through only when the trait's method declares none or has the very same ones. The
+// reason it does not, when it does not; `remedy` says how the type replaces the method, which takes
+// the trait method's defaults where the inherited one has none.
+private defaults_conflict(c: *Checker, m: usize, base: usize, remedy: string) -> Option[string]
+    val from = c.symbols[base].defaults
+    val own = c.symbols[m].defaults
+    if from.len() != own.len() then return None
+    var brings = false
+    var same = true
+    var has = false
+    for i in 0..<from.len()
+        if from[i] is Some(_) then brings = true
+        if own[i] is Some(_) then has = true
+        if own[i] != from[i] then same = false
+    if !brings || same then return None
+    if !has then return Some(s"which has defaults `${c.symbols[m].name}` lacks; $remedy to take them")
+    Some("and their defaults differ; a method can take the defaults of only one")
+
 /** Whether a function is a method, whose first parameter is its receiver, `self`. */
 private is_method(symbol: FunctionSymbol) -> bool = (symbol.owner_class is Some(_) && !symbol.constructor) || symbol.receiver is Some(_)
 
@@ -1418,7 +1462,11 @@ private methods_named(c: *Checker, id: usize, name: string) -> Buf[usize]
             Class(s, _, _) -> s
             _ -> break
     trait_methods_named(c, id, self_type, name, &out, 0)
-    out
+    // A trait's `val`, and the method a field supplies it with, are read as a field, not called.
+    var callable: Buf[usize] = buf()
+    for m in out
+        if !reads_field(c, m) then callable.push(m)
+    callable
 
 /** Adds to `out` the methods of `name` of the traits class or trait `id` conforms to or requires. */
 private trait_methods_named(c: *Checker, id: usize, self_type: &Type, name: string, out: *Buf[usize], depth: usize)
@@ -1457,6 +1505,11 @@ private method_key(c: *Checker, self_type: &Type, m: usize) -> string
 // an instance has, wherever it comes from; a method no table holds is the nearest ancestor's, and
 // then a trait's. A trait's methods are its own, then those of the traits it requires.
 private method_named(c: *Checker, id: usize, name: string) -> Option[usize]
+    val m = any_method_named(c, id, name)?
+    if reads_field(c, m) then None else Some(m)
+
+/** The method `method_named` finds, a trait's `val` and the method that supplies it included. */
+private any_method_named(c: *Checker, id: usize, name: string) -> Option[usize]
     if own_method(c, id, name) is Some(m)
         if method_visible(c, m) then return Some(m)
     for entry in c.classes[id].table
@@ -1491,10 +1544,48 @@ private trait_method(c: *Checker, id: usize, name: string) -> Option[usize]
 /** The position of a trait's method in the method table of every class conforming to the trait. */
 private trait_slot(c: *Checker, m: usize) -> usize
     val t = c.symbols[m].owner_class.unwrap()
+    if trait_overridden(c, m) is Some(o) then return trait_slot(c, o)
     val methods = c.classes[t].methods
     for j in 0..<methods.len()
         if methods[j] == m then return c.classes[t].base + j
     0
+
+/** For a trait's method declared `override`, the method of a trait it requires whose default it
+ * replaces, at whose position it is called. */
+private trait_overridden(c: *Checker, m: usize) -> Option[usize]
+    val t = c.symbols[m].owner_class?
+    if !is_trait(c, t) then return None
+    val methods = c.classes[t].methods
+    for j in 0..<methods.len()
+        if methods[j] == m && c.classes[t].overriding[j]
+            return required_matching(c, t, own_class_type(c.classes[t], t), m, 0)
+    None
+
+/** Whether trait method `n` overrides `m`, directly or through the overrides between them. */
+private replaces(c: *Checker, n: usize, m: usize) -> bool
+    var x = n
+    var steps = 0usize
+    while steps <= c.classes.len()
+        x = trait_overridden(c, x) match
+            Some(o) -> o
+            None -> return false
+        if x == m then return true
+        steps += 1
+    false
+
+/** The method bodies a type may inherit under one name, without those another of them overrides: a
+ * trait's override replaces the default of the trait it requires. */
+private unreplaced(c: *Checker, bodies: Buf[usize]) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    for m in bodies
+        var replaced = false
+        for n in bodies
+            if n != m && replaces(c, n, m) then replaced = true
+        if !replaced then out.push(m)
+    out
+
+/** Whether a trait's method `m` is an override, which has no position of its own. */
+private is_trait_override(c: *Checker, m: usize) -> bool = trait_overridden(c, m) is Some(_)
 
 /** The first position of class `k`'s method table holding the same method as `target`. */
 private table_position(c: *Checker, k: usize, target: usize) -> Option[usize]
@@ -1606,8 +1697,6 @@ private unmatched_override(c: *Checker, id: usize, sid: Option[usize], conformed
                 if c.symbols[other].decl.name == name then add_method(c, self_type, &named, other)
     if named.len() == 0
         c.note(k.unit, symbol.decl.name_span, s"`$name` overrides nothing; no superclass or trait of `${k.name}` has a method `$name`")
-    elif symbol.decl.type_params.len() > 0
-        c.note(k.unit, symbol.decl.name_span, s"`$name` has type parameters of its own, so it cannot override an inherited method")
     elif named.len() == 1 then overrides_matches(c, id, m, named[0])
     else c.note(k.unit, symbol.decl.name_span, s"`${method_key(c, self_type, m)}` overrides nothing; the inherited overloads are ${overload_list(c, named)}, and none takes these parameter types")
 
@@ -1622,13 +1711,26 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
     val k = c.classes[id]
     val unit = k.unit
     if is_trait(c, id)
-        // A trait's methods take positions of their own in its conforming classes' tables; one may
-        // not redeclare a method of a trait it requires.
+        // A trait's methods take positions of their own in its conforming classes' tables, except an
+        // override, which replaces the default of a method of a trait it requires at that method's
+        // position. Redeclaring a required trait's method without `override` is an error.
+        // An override takes the defaults of the method it overrides, so the required traits, whose
+        // own overrides may bring theirs, are linked first.
+        for required in k.traits
+            if *required is Class(r, _, _) then link_methods(c, r, linked)
         val trait_type = own_class_type(k, id)
-        for m in k.methods
+        for i in 0..<k.methods.len()
+            val m = k.methods[i]
             val name = c.symbols[m].decl.name
-            if required_matching(c, id, trait_type, m, 0) is Some(other)
-                c.note(unit, c.symbols[m].decl.name_span, s"`$name` is already a method of `${c.classes[c.symbols[other].owner_class.unwrap()].name}`, which `${k.name}` requires; a trait cannot redeclare it")
+            val target = required_matching(c, id, trait_type, m, 0)
+            if k.overriding[i]
+                if target is Some(other)
+                    if overrides_matches(c, id, m, other) then inherit_defaults(c, m, other)
+                elif trait_method(c, id, name) is Some(other)
+                    overrides_matches(c, id, m, other)
+                else c.note(unit, c.symbols[m].decl.name_span, s"`$name` overrides nothing; no trait `${k.name}` requires has a method `$name`")
+            elif target is Some(other)
+                c.note(unit, c.symbols[m].decl.name_span, s"`$name` is already a method of `${c.classes[c.symbols[other].owner_class.unwrap()].name}`, which `${k.name}` requires; mark it `override` to replace its default")
         return
     var slots: Buf[usize] = buf()
     var sid: Option[usize] = None
@@ -1643,6 +1745,9 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
                     c.note(unit, k.fields[i].span, s"`${k.fields[i].name}` is already a method of `${c.classes[c.symbols[m].owner_class.unwrap()].name}`")
     var conformed: Buf[&Type] = buf()
     collect_traits(c, own_class_type(k, id), &conformed)
+    // A trait's overrides take their defaults when it is linked, before a class's methods take them.
+    for t in conformed
+        if *t is Class(tid, _, _) then link_methods(c, tid, linked)
     for i in 0..<conformed.len()
         for j in 0..<i
             if *conformed[i] is Class(a, _, _) && *conformed[j] is Class(b, _, _)
@@ -1650,13 +1755,12 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
     for f in k.fields
         if f.owner == id && f.public
             if trait_method(c, id, f.name) is Some(m)
-                c.note(unit, f.span, s"`${f.name}` is already a method of `${c.classes[c.symbols[m].owner_class.unwrap()].name}`")
+                if !is_trait_field(c, m) then c.note(unit, f.span, s"`${f.name}` is already a method of `${c.classes[c.symbols[m].owner_class.unwrap()].name}`")
     val self_type = own_class_type(k, id)
     for i in 0..<k.methods.len()
         val m = k.methods[i]
         val symbol = c.symbols[m]
         val name = symbol.decl.name
-        val generic = symbol.decl.type_params.len() > 0
         var inherited: Option[usize] = None
         if sid is Some(s) then inherited = inherited_matching(c, s, self_type, m)
         // Every method of the traits the class conforms to that the method implements.
@@ -1665,15 +1769,18 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
             if *t is Class(tid, _, _)
                 if own_matching(c, tid, self_type, m) is Some(tm)
                     if !contains_id(implemented, tm) then implemented.push(tm)
+        var supplies_field = false
+        for tm in implemented
+            if is_trait_field(c, tm) && !supplies_field
+                supplies_field = true
+                c.note(unit, symbol.decl.name_span, s"`$name` is a `val` of `${c.classes[c.symbols[tm].owner_class.unwrap()].name}`, which `${k.name}` supplies with a field, not a method: declare `val $name: ${type_name(seen_from(c, self_type, tm, c.symbols[tm].result.unwrap_or(ErrorType)))}`")
+        if supplies_field then continue
         if k.overriding[i]
             if inherited is None && implemented.len() == 0
                 unmatched_override(c, id, sid, conformed, m)
                 continue
             if !symbol.public
                 c.note(unit, symbol.decl.name_span, s"`$name` overrides a public method, so it cannot be private")
-                continue
-            if generic
-                c.note(unit, symbol.decl.name_span, s"`$name` has type parameters of its own, so it cannot override an inherited method")
                 continue
             if inherited is Some(target)
                 // An inherited method that implements a trait's method has that trait's position
@@ -1684,15 +1791,14 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
                             slots.set(slot, m)
                             inherit_defaults(c, m, target)
                     None ->
-                        if implemented.len() == 0 then c.note(unit, symbol.decl.name_span, s"`${c.symbols[target].name}` has type parameters of its own, so it cannot be overridden")
-                        elif overrides_matches(c, id, m, target) then inherit_defaults(c, m, target)
+                        if overrides_matches(c, id, m, target) then inherit_defaults(c, m, target)
             for tm in implemented
                 if overrides_matches(c, id, m, tm) then inherit_defaults(c, m, tm)
         elif inherited is Some(t)
             c.note(unit, symbol.decl.name_span, s"`$name` overrides `${c.symbols[t].name}`; mark it `override`")
         elif implemented.len() > 0
             c.note(unit, symbol.decl.name_span, s"`$name` implements `${c.symbols[implemented[0]].name}`; mark it `override`")
-        elif is_open(c, id) && symbol.public && !generic then slots.push(m)
+        elif is_open(c, id) && symbol.public then slots.push(m)
     c.classes[id].slots = slots
 
 // Each trait's position in the method tables of the classes and data types conforming to it. The
@@ -1760,11 +1866,16 @@ private build_data_table(c: *Checker, id: usize, conformed: Buf[usize])
     for t in conformed
         val methods = c.classes[t].methods
         for j in 0..<methods.len()
+            // An override fills the position of the method it overrides.
+            if is_trait_override(c, methods[j]) then continue
             val name = c.symbols[methods[j]].decl.name
             val key = method_key(c, self_type, methods[j])
             var chosen = methods[j]
             var own: Option[usize] = None
             val mine = c.data[id].methods
+            if is_trait_field(c, methods[j])
+                table.set(c.classes[t].base + j, Some(data_supplied_field(c, id, methods[j])))
+                continue
             for k in 0..<mine.len()
                 if same_method(c, self_type, mine[k], methods[j])
                     own = Some(mine[k])
@@ -1776,14 +1887,19 @@ private build_data_table(c: *Checker, id: usize, conformed: Buf[usize])
                 chosen = m
                 inherit_defaults(c, m, methods[j])
             else
-                var bodies: Buf[usize] = buf()
+                var found: Buf[usize] = buf()
                 for other in conformed
                     if own_matching(c, other, self_type, methods[j]) is Some(m)
-                        if !is_abstract_method(c.symbols[m]) && !contains_id(bodies, m) then bodies.push(m)
+                        if !is_abstract_method(c.symbols[m]) && !contains_id(found, m) then found.push(m)
+                val bodies = unreplaced(c, found)
                 if bodies.len() > 0 then chosen = bodies[0]
                 if bodies.len() > 1 && !contains_name(reported, key)
                     reported.push(key)
                     report_conformance(c, id, t, s"`$name_of` inherits two implementations of `$name`, `${c.symbols[bodies[0]].name}` and `${c.symbols[bodies[1]].name}`; implement it in an impl")
+                elif bodies.len() == 1 && chosen != methods[j] && !contains_name(reported, key)
+                    if defaults_conflict(c, chosen, methods[j], s"implement `$name` in an impl") is Some(text)
+                        reported.push(key)
+                        report_conformance(c, id, t, s"`${c.symbols[chosen].name}` implements `${c.symbols[methods[j]].name}` for `$name_of`, $text")
             table.set(c.classes[t].base + j, Some(chosen))
     c.data[id].table = table
     for entry in table
@@ -1793,6 +1909,11 @@ private build_data_table(c: *Checker, id: usize, conformed: Buf[usize])
             if is_abstract_method(c.symbols[m]) && !contains_name(reported, key)
                 reported.push(key)
                 val t = c.symbols[m].owner_class.unwrap()
+                if is_trait_field(c, m)
+                    val ty = seen_from(c, self_type, m, c.symbols[m].result.unwrap_or(ErrorType))
+                    val how = if c.data[id].variants.len() == 1 then s"declare a field `$name: ${type_name(ty)}` in it" else "it has several variants, so it has no field every value shares"
+                    report_conformance(c, id, t, s"`$name_of` does not supply `${c.classes[t].name}`'s `val $name`, which a data type supplies with a field of its one variant; $how")
+                    continue
                 // A method of an impl of the trait with this name and other parameter types was meant
                 // to implement it where the trait has no other method of the name.
                 var meant: Option[usize] = None
@@ -1807,6 +1928,23 @@ private build_data_table(c: *Checker, id: usize, conformed: Buf[usize])
                         c.note(c.symbols[own].unit, c.symbols[own].decl.name_span, s"`${c.symbols[own].name}` implements `${c.symbols[m].name}`, $text")
                         continue
                 report_conformance(c, id, t, s"`$name_of` does not implement `$name` from `${c.classes[t].name}`; implement it in an impl of `${c.classes[t].name}`")
+
+// What fills the position of a trait's `val` `tm` in data type `id`'s table: a method that reads the
+// field of that name of the type's one variant, or else `tm` itself, which leaves it abstract. A
+// method an impl declares under the name is reported, since a field supplies a `val`.
+private data_supplied_field(c: *Checker, id: usize, tm: usize) -> usize
+    val d = c.data[id]
+    val name = c.symbols[tm].decl.name
+    val self_type = own_type(d, id)
+    for m in d.methods
+        if same_method(c, self_type, m, tm)
+            val ty = seen_from(c, self_type, tm, c.symbols[tm].result.unwrap_or(ErrorType))
+            c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`$name` is a `val` of `${c.classes[c.symbols[tm].owner_class.unwrap()].name}`, which `${d.name}` supplies with a field, not a method: declare the field `$name: ${type_name(ty)}`")
+            return m
+    if d.variants.len() == 1
+        if contains_name(d.variants[0].field_names, name)
+            return field_getter(c, d.unit, d.module_name, d.name, d.decl.span, name, self_type, data_owner(id), d.decl.type_params, None)
+    tm
 
 // A problem with data type `id`'s conformance to trait `t` is reported at the impl that brings the
 // trait in: the impl of `t` itself, or of a trait requiring it.
@@ -1838,7 +1976,7 @@ private build_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
     for t in conformed[id]
         val methods = c.classes[t].methods
         for j in 0..<methods.len()
-            table.set(c.classes[t].base + j, Some(methods[j]))
+            if !is_trait_override(c, methods[j]) then table.set(c.classes[t].base + j, Some(methods[j]))
     var inherited_traits: Buf[usize] = buf()
     var sup_table: Buf[Option[usize]] = buf()
     if k.superclass is Some(s)
@@ -1854,12 +1992,15 @@ private build_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
             None -> continue
         val name = c.symbols[held].decl.name
         val key = method_key(c, self_type, held)
+        if is_trait_field(c, held)
+            table.set(i, Some(supplied_field(c, id, held, sup_table, i)))
+            continue
         // Every method the class inherits that is this one; its own override, if it has one.
         var candidates: Buf[usize] = buf()
         var own: Option[usize] = None
         for m in k.methods
             if own is None && same_method(c, self_type, m, held)
-                if c.symbols[m].public && c.symbols[m].decl.type_params.len() == 0 then own = Some(m)
+                if c.symbols[m].public then own = Some(m)
         for entry in table
             if entry is Some(m)
                 if same_method(c, self_type, m, held) && !is_trait(c, c.symbols[m].owner_class.unwrap()) && !contains_id(candidates, m) then candidates.push(m)
@@ -1872,9 +2013,10 @@ private build_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
                 if !is_abstract_method(c.symbols[m]) && !contains_id(candidates, m) then candidates.push(m)
         var chosen: Option[usize] = own
         if own is None
-            var bodies: Buf[usize] = buf()
+            var found: Buf[usize] = buf()
             for m in candidates
-                if !is_abstract_method(c.symbols[m]) then bodies.push(m)
+                if !is_abstract_method(c.symbols[m]) then found.push(m)
+            val bodies = unreplaced(c, found)
             if bodies.len() > 0 then chosen = Some(bodies[0])
             if bodies.len() > 1 && !contains_name(reported, key)
                 reported.push(key)
@@ -1889,33 +2031,72 @@ private build_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
                 val key = method_key(c, self_type, m)
                 if is_abstract_method(c.symbols[m]) && !contains_name(missing, key)
                     missing.push(key)
-                    c.note(k.unit, k.decl.name_span, s"`${k.name}` does not implement `$name` from `${c.classes[c.symbols[m].owner_class.unwrap()].name}`; implement it, or declare `${k.name}` abstract")
+                    val owner = c.symbols[m].owner_class.unwrap()
+                    // An object is its one instance, so it cannot be left abstract.
+                    val otherwise = if k.decl.object then "" else s", or declare `${k.name}` abstract"
+                    if is_trait_field(c, m)
+                        val ty = seen_from(c, self_type, m, c.symbols[m].result.unwrap_or(ErrorType))
+                        c.note(k.unit, k.decl.name_span, s"`${k.name}` does not supply `${c.classes[owner].name}`'s `val $name`; declare a public field `val $name: ${type_name(ty)}`$otherwise")
+                        continue
+                    c.note(k.unit, k.decl.name_span, s"`${k.name}` does not implement `$name` from `${c.classes[owner].name}`; implement it$otherwise")
+
+// What fills the position of a trait's `val` `tm`, at `position` of class `id`'s table: the method
+// that reads the class's public field of that name, the superclass's where it already supplies the
+// trait, or else `tm` itself, which leaves it abstract. A method or a private field of that name is
+// reported where it is declared.
+private supplied_field(c: *Checker, id: usize, tm: usize, sup_table: Buf[Option[usize]], position: usize) -> usize
+    if position < sup_table.len()
+        if sup_table[position] is Some(m)
+            if contains_id(c.field_getters, m) then return m
+    val k = c.classes[id]
+    val name = c.symbols[tm].decl.name
+    for m in k.methods
+        if same_method(c, own_class_type(k, id), m, tm) then return m
+    var hidden: Option[usize] = None
+    for i in 0..<k.fields.len()
+        if k.fields[i].name != name then continue
+        if k.fields[i].public then return field_getter(c, k.unit, k.module_name, k.name, k.fields[i].span, name, own_class_type(k, id), class_owner(id), k.decl.type_params, Some(id))
+        hidden = Some(i)
+    if hidden is Some(i)
+        val f = k.fields[i]
+        val keyword = if f.mutable then "var" else "val"
+        c.note(k.unit, f.span, s"`$name` is private to `${c.classes[f.owner].name}`, so it cannot supply `${c.classes[c.symbols[tm].owner_class.unwrap()].name}`'s `val $name`; declare it a public field, `$keyword $name`")
+        return field_getter(c, k.unit, k.module_name, k.name, f.span, name, own_class_type(k, id), class_owner(id), k.decl.type_params, Some(id))
+    tm
+
+// A method that yields field `name` of its receiver, `self.name`, which supplies a trait's `val` of
+// that name: a class's method when `owner_class` is its class, otherwise one an impl adds to the
+// data type `self_type`.
+private field_getter(c: *Checker, unit: usize, module_name: string, type_name_of: string, at: Span, name: string, self_type: &Type, type_owner: usize, type_params: Buf[TypeParam], owner_class: Option[usize]) -> usize
+    val read = Expr(at, Member(Expr(at, Name("self")), name))
+    val decl = Function(buf(), at, at, name, buf(), buf(), None, Some(read), buf())
+    var params: Buf[&Type] = buf()
+    params.push(self_type)
+    var names: Buf[string] = buf()
+    names.push("self")
+    var defaults: Buf[Option[usize]] = buf()
+    defaults.push(None)
+    val receiver = if owner_class is None then Some(self_type) else None
+    val id = c.symbols.len()
+    c.symbols.push(FunctionSymbol(unit, module_name, type_name_of + "." + name, decl, params, names, None, None, None, buf(), buf(), buf(), false, false, false, defaults, None, type_owner, type_params, owner_class, false, true, "", receiver))
+    c.states.push(0)
+    c.bodies.push(None)
+    c.locals.push(buf())
+    c.field_getters.push(id)
+    id
 
 /** Class `id`'s method table, built first if it is not yet. */
 private ensure_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
     if c.classes[id].table.len() == 0 then build_table(c, id, conformed)
 
-// An override takes the parameters of the method it overrides, with the superclass's type arguments
-// substituted, and yields its result or, for a class, a subclass of it.
+// An override declares as many type parameters of its own as the method it overrides, takes its
+// parameters, with the superclass's type arguments substituted and the type parameters matched by
+// position, and yields its result or, for a class, a subclass of it.
 private overrides_matches(c: *Checker, id: usize, m: usize, target: usize) -> bool
-    val unit = c.classes[id].unit
     val symbol = c.symbols[m]
-    val base = c.symbols[target]
-    val owner = base.owner_class.unwrap()
-    val args = ancestor_type(c.classes, c.data, own_class_type(c.classes[id], id), owner) match
-        Some(t) -> *t match
-            Class(_, _, a) -> a
-            _ -> buf()
-        None -> buf()
-    val described = s"`${symbol.decl.name}` overrides `${base.name}`"
-    if symbol.params.len() != base.params.len()
-        c.note(unit, symbol.decl.name_span, s"$described, which takes ${count(base.params.len() - 1, "parameter")}, not ${symbol.params.len() - 1}")
+    if param_mismatch(c, own_class_type(c.classes[id], id), m, target) is Some(text)
+        c.note(c.classes[id].unit, symbol.decl.name_span, s"`${symbol.decl.name}` overrides `${c.symbols[target].name}`, $text")
         return false
-    for i in 1..<base.params.len()
-        val want = substitute(base.params[i], class_owner(owner), args)
-        if !same_type(symbol.params[i], want)
-            c.note(unit, symbol.decl.name_span, s"$described, whose parameter `${base.param_names[i]}` is ${type_name(want)}, not ${type_name(symbol.params[i])}")
-            return false
     true
 
 // The results of overrides, compared once every body is checked, since a result may be inferred: an
@@ -1925,7 +2106,12 @@ private overrides_matches(c: *Checker, id: usize, m: usize, target: usize) -> bo
 // as the class sees them both.
 private check_override_results(c: *Checker, id: usize)
     val k = c.classes[id]
-    if is_trait(c, id) then return
+    if is_trait(c, id)
+        for m in k.methods
+            if trait_overridden(c, m) is Some(base)
+                if result_mismatch(c, own_class_type(k, id), m, base) is Some(text)
+                    c.note(k.unit, c.symbols[m].decl.name_span, s"`${c.symbols[m].decl.name}` overrides `${c.symbols[base].name}`, $text")
+        return
     if k.superclass is Some(sup)
         if *sup is Class(sid, _, _)
             val base_slots = c.classes[sid].slots
@@ -1944,6 +2130,9 @@ private check_override_results(c: *Checker, id: usize)
                 None -> continue
             val base = methods[j]
             if m == base then continue
+            if contains_id(c.field_getters, m)
+                if field_mismatch(c, own_class_type(c.classes[id], id), m, base) is Some(text) then c.note(k.unit, c.symbols[m].decl.name_span, text)
+                continue
             val described = s"`${c.symbols[m].name}` implements `${c.symbols[base].name}`"
             val own = c.symbols[m].owner_class == Some(id)
             val at = if own then c.symbols[m].decl.name_span else k.decl.name_span
@@ -1951,27 +2140,46 @@ private check_override_results(c: *Checker, id: usize)
                 if param_mismatch(c, own_class_type(c.classes[id], id), m, base) is Some(text)
                     c.note(k.unit, at, s"$described for `${k.name}`, $text")
                     continue
+                if defaults_conflict(c, m, base, s"override `${c.symbols[m].decl.name}`") is Some(text) then c.note(k.unit, at, s"$described for `${k.name}`, $text")
             if result_mismatch(c, own_class_type(c.classes[id], id), m, base) is Some(text)
                 c.note(k.unit, at, s"$described, $text")
 
 /** A type in method `m`'s signature as a value of `self_type`, a class's or a data type's own type,
- * sees it. */
+ * sees it. The method's own type parameters are renamed by position to `method_params_owner()`, so
+ * the signatures of two methods with type parameters of their own compare. */
 private seen_from(c: *Checker, self_type: &Type, m: usize, t: &Type) -> &Type
+    val symbol = c.symbols[m]
+    val own = symbol.decl.type_params.len()
+    val outer = symbol.type_params.len() - own
+    var renamed = t
+    if own > 0
+        var names: Buf[&Type] = buf()
+        for i in 0..<outer
+            names.push(TypeVar(symbol.type_owner, i, symbol.type_params[i].name))
+        for j in 0..<own
+            names.push(TypeVar(method_params_owner(), j, symbol.type_params[outer + j].name))
+        renamed = substitute(t, symbol.type_owner, names)
     // A method an impl adds to a data type already names the type's own parameters.
-    val owner = c.symbols[m].owner_class match
+    val owner = symbol.owner_class match
         Some(k) -> k
-        None -> return t
+        None -> return renamed
     val args = ancestor_type(c.classes, c.data, self_type, owner) match
         Some(a) -> *a match
             Class(_, _, xs) -> xs
             _ -> buf()
         None -> buf()
-    substitute(t, class_owner(owner), args)
+    substitute(renamed, class_owner(owner), args)
 
-/** How method `m`'s parameters differ from those of `base`, which it implements for `self_type`. */
+/** How many type parameters of its own method `m` declares. */
+private own_type_params(c: *Checker, m: usize) -> usize = c.symbols[m].decl.type_params.len()
+
+/** How method `m`'s parameters differ from those of `base`, which it implements for `self_type`.
+ * The two declare the same number of type parameters of their own. */
 private param_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) -> Option[string]
     val have = c.symbols[m].params
     val want = c.symbols[base].params
+    val own = own_type_params(c, base)
+    if own_type_params(c, m) != own then return Some(s"which has ${count(own, "type parameter")} of its own, not ${own_type_params(c, m)}")
     if have.len() != want.len() then return Some(s"which takes ${count(want.len() - 1, "parameter")}, not ${have.len() - 1}")
     for i in 1..<want.len()
         val w = seen_from(c, self_type, base, want[i])
@@ -2006,6 +2214,9 @@ private check_data_implementations(c: *Checker, id: usize)
                 None -> continue
             val base = methods[j]
             if m == base then continue
+            if contains_id(c.field_getters, m)
+                if field_mismatch(c, self_type, m, base) is Some(text) then report_conformance(c, id, t, text)
+                continue
             val described = s"`${c.symbols[m].name}` implements `${c.symbols[base].name}`"
             if c.symbols[m].receiver is Some(_)
                 val at = c.symbols[m].decl.name_span
@@ -2013,6 +2224,22 @@ private check_data_implementations(c: *Checker, id: usize)
                 elif result_mismatch(c, self_type, m, base) is Some(text) then c.note(c.symbols[m].unit, at, s"$described, $text")
             elif param_mismatch(c, self_type, m, base) is Some(text) then report_conformance(c, id, t, s"$described for `${c.data[id].name}`, $text")
             elif result_mismatch(c, self_type, m, base) is Some(text) then report_conformance(c, id, t, s"$described, $text")
+
+/** How the field that `getter` reads differs from the trait's `val` `base` it supplies for
+ * `self_type`: its type is the `val`'s or, where that is a class or a trait, one conforming to it. */
+private field_mismatch(c: *Checker, self_type: &Type, getter: usize, base: usize) -> Option[string]
+    if result_mismatch(c, self_type, getter, base) is None then return None
+    val want = seen_from(c, self_type, base, c.symbols[base].result.unwrap_or(ErrorType))
+    val have = seen_from(c, self_type, getter, c.symbols[getter].result.unwrap_or(ErrorType))
+    val name = c.symbols[base].decl.name
+    Some(s"the field `$name` is ${type_name(have)}, but `${c.classes[c.symbols[base].owner_class.unwrap()].name}`'s `val $name`, which it supplies, is ${type_name(want)}")
+
+/** Whether method `m` is read with field syntax: a trait's `val`, or the method a field supplies it
+ * with. */
+private reads_field(c: *Checker, m: usize) -> bool = is_trait_field(c, m) || contains_id(c.field_getters, m)
+
+/** Whether method `m` is a trait's `val`. */
+private is_trait_field(c: *Checker, m: usize) -> bool = contains_id(c.trait_fields, m)
 
 private alike_or_error(a: &Type, b: &Type) -> bool = *a is ErrorType || *b is ErrorType || same_type(a, b)
 
@@ -2443,6 +2670,7 @@ private construct(c: *Checker, k: usize, upto: Option[usize])
                 val t = check_statement(c, s)
                 if *t.ty is Nothing then made.finishes = false
                 made.items.push(t)
+            AbstractFieldMember(_) -> ()
             MethodMember(_, _, _) -> ()
     if upto is Some(_)
         made.body = c.body
@@ -2596,6 +2824,9 @@ private enum MemberRef
     /** A field of the one variant of the data type an impl's method works on. */
     DataFieldOf(index: usize)
     MethodOf(id: usize)
+    /** A `val` of a trait the enclosing trait or class conforms to, which no field of its own
+     * supplies here: it is read through the method table. */
+    TraitFieldOf(id: usize)
 
 // Inside a class, its fields and methods are in scope by bare name, behind the locals, parameters
 // and local functions, and ahead of top-level declarations.
@@ -2609,7 +2840,17 @@ private class_member(c: *Checker, name: string) -> Option[MemberRef]
         if field_visible(c, c.classes[k].fields[i]) then return Some(FieldOf(i))
     if method_named(c, k, name) is Some(m)
         if method_visible(c, m) then return Some(MethodOf(m))
+    if trait_field_named(c, k, name) is Some(m) then return Some(TraitFieldOf(m))
     None
+
+/** The `val` named `name` of a trait that class or trait `k` conforms to or requires. */
+private trait_field_named(c: *Checker, k: usize, name: string) -> Option[usize]
+    val m = any_method_named(c, k, name)?
+    if is_trait_field(c, m) then Some(m) else None
+
+// A read of a trait's `val` `m` on `object`, which calls what the object's method table holds for it:
+// for a class or a data type with the field, a method that yields the field.
+private trait_field_read(c: *Checker, at: Span, object: &TExpr, m: usize, expected: Option[&Type]) -> &TExpr = method_call(c, at, at, object, m, buf(), None, expected, false, buf())
 
 // Inside a method an impl adds to a data type or a built-in type, the type's methods are in scope by
 // bare name, as in a class, and so are the fields of a data type with one variant: whatever
@@ -2806,6 +3047,7 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
             var ms = bare_methods(c, name)
             if ms.len() == 0 then ms.push(m)
             return overloaded_method_value(c, at, self_ref(c, at), name, ms, None, expected)
+        Some(TraitFieldOf(m)) -> return trait_field_read(c, at, self_ref(c, at), m, expected)
         None -> ()
     if global_named(c, name) is Some(g) then return global_read(c, at, g)
     if lookup_function(c, name) is Some(id)
@@ -3083,6 +3325,7 @@ private class_member_value(c: *Checker, at: Span, object: &TExpr, k: usize, name
             c.note(unit_of(c), at, s"`$name` is private to `${c.classes[cls.fields[i].owner].name}`")
             return TExpr(at, ErrorType, UnitConst)
         return field_read(c, at, at, object, k, i, is_self(c, object))
+    if trait_field_named(c, k, name) is Some(m) then return trait_field_read(c, at, object, m, expected)
     val ms = methods_named(c, k, name)
     if ms.len() > 1 then return overloaded_method_value(c, at, object, name, ms, None, expected)
     if method_named(c, k, name) is Some(m) then return member_method_value(c, at, object, m, None, expected)
@@ -3238,7 +3481,8 @@ private field_place(c: *Checker, target: &Expr) -> Option[FieldPlace]
     val index = class_field(c, k, name) match
         Some(i) -> i
         None ->
-            if method_named(c, k, name) is Some(_) then c.note(unit, target.span, s"`$name` is a method of `${cls.name}`, which cannot be assigned")
+            if trait_field_named(c, k, name) is Some(m) then c.note(unit, target.span, s"`$name` is a `val` of `${c.classes[c.symbols[m].owner_class.unwrap()].name}`, which is read through `${cls.name}` and never assigned")
+            elif method_named(c, k, name) is Some(_) then c.note(unit, target.span, s"`$name` is a method of `${cls.name}`, which cannot be assigned")
             else c.note(unit, target.span, s"`${cls.name}` has no member `$name`")
             return None
     val field = cls.fields[index]
@@ -4086,6 +4330,7 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
             return call_method(c, at, named.span, receiver, name, ms, args, explicit, expected, false)
         Some(FieldOf(_)) -> if explicit is None then return value_call(c, at, callee, args)
         Some(DataFieldOf(_)) -> if explicit is None then return value_call(c, at, callee, args)
+        Some(TraitFieldOf(_)) -> if explicit is None then return value_call(c, at, callee, args)
         None -> ()
     // A module-level value is called as a value; a class's name in call position is its
     // constructor, even where its companion object shares the name.
@@ -5537,6 +5782,7 @@ private check_class_initialization(c: *Checker, k: usize, unsafe: *Buf[bool])
                 last = count
                 last_name = f.name
             StatementMember(_) -> count += 1
+            AbstractFieldMember(_) -> ()
             MethodMember(_, _, _) -> ()
     if items.len() < count + 1 then return
     val start = items.len() - 1 - count
@@ -5620,7 +5866,9 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
             val name = c.symbols[f].decl.name
             if args.len() > 0 && is_init_self(s, args[0])
                 from = 1
-                ok = init_violation(c, s, e.span, s"`$name` is called", s"`$name` may be overridden, so it cannot be called")
+                // A trait's `val` is read through the method table, from a field a subclass may set.
+                if is_trait_field(c, f) then ok = init_violation(c, s, e.span, s"`$name` is read", s"`$name` is a trait's `val`, which a subclass may supply, so it cannot be read")
+                else ok = init_violation(c, s, e.span, s"`$name` is called", s"`$name` may be overridden, so it cannot be called")
             for i in from..<args.len()
                 if !scan_init(c, s, args[i], unsafe) then ok = false
             ok

@@ -117,6 +117,29 @@ private struct Lowering
     returns_value: bool
     /** The machine type of each module-level value, or `None` for one with no runtime value. */
     global_types: Buf[Option[MirType]]
+    /** Where the slots of methods with type parameters of their own begin in a method table: past
+     * every position the checker gave any type's table. */
+    generic_base: usize
+    /** Each slot of a method with type parameters of their own, at `generic_base` plus its index,
+     * and each one's index by its key. */
+    generic_slots: Buf[GenericSlot]
+    generic_index: Map[string, usize]
+    /** The descriptors whose method tables hold a method with type parameters of its own, each with
+     * the type it describes, so a slot found later is filled in them too. */
+    generic_holders: Buf[GenericHolder]
+
+/** One slot for a method with type parameters of its own, at one list of its own type arguments: a
+ * call through a method table to `name` at checker position `position` with `type_args` reaches it.
+ * Each type holding that method at that position fills the slot with its implementation instantiated
+ * at those arguments. */
+private struct GenericSlot
+    position: usize
+    name: string
+    type_args: Buf[&Type]
+
+private struct GenericHolder
+    descriptor: usize
+    ty: &Type
 
 // Every function that is not generic is compiled once; each generic function is compiled for each
 // list of type arguments a compiled call gives it, as those calls are found. An abstract method has
@@ -125,7 +148,12 @@ lower_program(program: TProgram) -> MirProgram
     var global_types: Buf[Option[MirType]] = buf()
     for g in program.globals
         global_types.push(mir_type(solve(program.vars, program.symbols[g.init].result.unwrap_or(Unit))))
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types)
+    var generic_base = 0usize
+    for k in program.classes
+        if k.table.len() > generic_base then generic_base = k.table.len()
+    for d in program.data
+        if d.table.len() > generic_base then generic_base = d.table.len()
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf())
     // Record 0 is for the objects no type pattern names: closures, and the boxes of captured
     // variables.
     l.records.push(TypeRecord("a closure or a captured variable", buf()))
@@ -181,6 +209,9 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
                 fields.push(substitute(f.ty.unwrap_or(ErrorType), class_owner(id), args))
             variants.push(variant_layout(l, key, 0, fields, false, method_table(l, t), record))
         _ -> panic("a layout of a type that is not data, a tuple or a class: " + key)
+    if holds_generic_methods(l, t)
+        for v in variants
+            hold_generic_slots(l, v.descriptor, t)
     val result = DataLayout(variants)
     l.layout_index.put(identity, l.layouts.len())
     l.layouts.push(result)
@@ -207,13 +238,12 @@ private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[
 // that fills it, with the type arguments of the class or trait that declares the method as the
 // instance sees them, or for a method an impl adds to a data type, the value's own. Each instance of
 // a generic type has its own table, which every variant of a data type shares. An abstract method's
-// slot is empty, as is a position no trait of the type uses.
+// slot is empty, as is a position no trait of the type uses. A method with type parameters of its own
+// is no one function, so its position is empty too: each list of its own type arguments that a call
+// through a table uses has a slot past `generic_base` instead.
 private method_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
     var table: Buf[Option[usize]] = buf()
-    val entries = *t match
-        Class(k, _, _) -> l.program.classes[k].table
-        Data(d, _, _) -> l.program.data[d].table
-        _ -> return table
+    val entries = checker_table(l, t)
     for entry in entries
         val m = entry match
             Some(m) -> m
@@ -221,24 +251,89 @@ private method_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
                 table.push(None)
                 continue
         val symbol = l.program.symbols[m]
-        if is_abstract_method(symbol)
+        if is_abstract_method(symbol) || symbol.decl.type_params.len() > 0
             table.push(None)
             continue
-        val owner = symbol.owner_class match
-            Some(k) -> k
-            None ->
-                val own = *t match
-                    Data(_, _, xs) -> xs
-                    _ -> buf()
-                table.push(Some(instance(l, m, own)))
-                continue
-        val args = ancestor_type(l.program.classes, l.program.data, t, owner) match
-            Some(a) -> *a match
-                Class(_, _, xs) -> xs
-                _ -> buf()
-            None -> buf()
-        table.push(Some(instance(l, m, args)))
+        table.push(Some(instance(l, m, implementation_args(l, t, m))))
     table
+
+/** The checker's method table of class or data type `t`: the method at each position. */
+private checker_table(l: *Lowering, t: &Type) -> Buf[Option[usize]] = *t match
+    Class(k, _, _) -> l.program.classes[k].table
+    Data(d, _, _) -> l.program.data[d].table
+    _ -> buf()
+
+/** The type arguments of the class or trait declaring method `m` as a value of `t` sees them, or for
+ * a method an impl adds to a data type, the value's own: the leading type arguments of the instance
+ * of `m` that `t`'s table holds. */
+private implementation_args(l: *Lowering, t: &Type, m: usize) -> Buf[&Type]
+    if l.program.symbols[m].owner_class is None
+        if *t is Data(_, _, xs) then return xs
+        return buf()
+    val owner = l.program.symbols[m].owner_class.unwrap()
+    ancestor_type(l.program.classes, l.program.data, t, owner) match
+        Some(a) -> *a match
+            Class(_, _, xs) -> xs
+            _ -> buf()
+        None -> buf()
+
+/** Whether `t`'s method table holds a method with type parameters of its own. */
+private holds_generic_methods(l: *Lowering, t: &Type) -> bool
+    for entry in checker_table(l, t)
+        if entry is Some(m)
+            if l.program.symbols[m].decl.type_params.len() > 0 then return true
+    false
+
+// A descriptor whose type's table holds a method with type parameters of its own is filled in every
+// slot already made for such a method, and in each one made later.
+private hold_generic_slots(l: *Lowering, descriptor: usize, t: &Type)
+    l.generic_holders.push(GenericHolder(descriptor, t))
+    for s in 0..<l.generic_slots.len()
+        fill_generic_slot(l, descriptor, t, s)
+
+/** The table slot of a call through a method table to the method at checker position `position`,
+ * named `name`, with its own type arguments `type_args`: made when first asked for, and filled in
+ * every descriptor holding such a method there. */
+private generic_slot(l: *Lowering, position: usize, name: string, type_args: Buf[&Type]) -> usize
+    var key = s"$position $name"
+    for t in type_args
+        key = key + "|" + type_key(t)
+    if l.generic_index.get(key) is Some(index) then return l.generic_base + index
+    val index = l.generic_slots.len()
+    l.generic_slots.push(GenericSlot(position, name, type_args))
+    l.generic_index.put(key, index)
+    for h in l.generic_holders
+        fill_generic_slot(l, h.descriptor, h.ty, index)
+    l.generic_base + index
+
+// Fills generic slot `s` of a descriptor of type `t` with `t`'s implementation of the method, at the
+// slot's own type arguments after those of the type that declares the implementation. A type holding
+// another method at that position, or none, or an abstract one, leaves the slot empty: no call reaching
+// the slot is made on it.
+private fill_generic_slot(l: *Lowering, descriptor: usize, t: &Type, s: usize)
+    val slot = l.generic_slots[s]
+    val entries = checker_table(l, t)
+    if slot.position >= entries.len() then return
+    val m = entries[slot.position] match
+        Some(m) -> m
+        None -> return
+    val symbol = l.program.symbols[m]
+    if symbol.decl.name != slot.name || symbol.decl.type_params.len() != slot.type_args.len() || is_abstract_method(symbol) then return
+    var args: Buf[&Type] = buf()
+    for a in implementation_args(l, t, m)
+        args.push(a)
+    for a in slot.type_args
+        args.push(a)
+    val code = instance(l, m, args)
+    val index = l.generic_base + s
+    val old = l.descriptors[descriptor].methods
+    var methods: Buf[Option[usize]] = buf()
+    for i in 0..<old.len()
+        methods.push(old[i])
+    while methods.len() <= index
+        methods.push(None)
+    methods.set(index, Some(code))
+    l.descriptors[descriptor].methods = methods
 
 private field_address(l: *Lowering, object: Operand, field: FieldSlot) -> Operand
     val dest = fresh(l, MPtr)
@@ -596,8 +691,16 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
     for p in symbol.params
         if machine(l, substitute(p, symbol.type_owner, concrete_args)) is Some(t) then params.push(t)
     val result = machine(l, substitute(symbol.result.unwrap_or(Unit), symbol.type_owner, concrete_args))
+    // A method with type parameters of its own has a slot for each list of its own type arguments.
+    var position = slot
+    val own = symbol.decl.type_params.len()
+    if own > 0
+        var own_args: Buf[&Type] = buf()
+        for i in concrete_args.len() - own..<concrete_args.len()
+            own_args.push(concrete_args[i])
+        position = generic_slot(l, slot, symbol.decl.name, own_args)
     val code = fresh(l, MPtr)
-    l.insts.push(MethodSlot(code, operands[0], slot))
+    l.insts.push(MethodSlot(code, operands[0], position))
     val dest = result match
         Some(t) -> Some(fresh(l, t))
         None -> None
