@@ -3,7 +3,7 @@ module dev.avinlang.compiler
 
 import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
-import sysl.fs.{current_dir, entries, exists, make_temp_dir, read_text, remove_dir_all}
+import sysl.fs.{current_dir, entries, exists, is_dir, make_temp_dir, read_text, remove_dir_all}
 import sysl.process.{Exited, Signalled, Var, capture}
 
 // The execution corpus: Avin programs under `tests/` with their expected behaviour.
@@ -22,6 +22,10 @@ import sysl.process.{Exited, Signalled, Var, capture}
 //
 // `tests/reject/*.avin` must fail to compile, and each `// error: TEXT` line in it names text the
 // diagnostics must contain.
+//
+// `tests/programs/run/NAME/` and `tests/programs/reject/NAME/` are programs of many files, each
+// directory the root of one program, held to the same standards. Their expectation lines may be in
+// any of their files, and their output is in `NAME.out` and `NAME.err` beside the directory.
 //
 // The tests find the corpus from the working directory, which `sysl test` leaves as it found it:
 // they run from the repository root or from `compiler/`.
@@ -58,9 +62,12 @@ private parse_int(text: string) -> int
         if b >= u8('0') && b <= u8('9') then n = n * 10 + int(b - u8('0'))
     n
 
-private sidecar(path: string, suffix: string) -> string
-    val other = path[0..<path.bytes.len - ".avin".bytes.len] + suffix
+// The text of the sidecar `base` + `suffix`, or "" when there is none.
+private sidecar(base: string, suffix: string) -> string
+    val other = base + suffix
     if exists(other) then read_text(other).unwrap_or("") else ""
+
+private without_extension(path: string) -> string = path[0..<path.bytes.len - ".avin".bytes.len]
 
 /** The programs in a directory of the repository. */
 private cases(tc: Toolchain, dir: string) -> Buf[string]
@@ -69,12 +76,36 @@ private cases(tc: Toolchain, dir: string) -> Buf[string]
         if name.ends_with(".avin") then out.push(tc.root + "/" + dir + "/" + name)
     out
 
+/** The program directories in a directory of the repository. */
+private program_cases(tc: Toolchain, dir: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    for name in entries(tc.root + "/" + dir).unwrap_or(buf())
+        if is_dir(tc.root + "/" + dir + "/" + name) then out.push(tc.root + "/" + dir + "/" + name)
+    out
+
+/** A program to run or reject: its files, and the text of them all, which holds its expectations. */
+private struct Case
+    files: Buf[ProgramFile]
+    text: string
+
+private case_at(path: string) -> Case
+    if is_dir(path)
+        val files = program_files(path).unwrap()
+        var text = ""
+        for f in files
+            text = text + read_text(f.src.name).unwrap_or("") + "\n"
+        return Case(files, text)
+    val text = read_text(path).unwrap_or("")
+    Case(single_file(source_of(path, text)), text)
+
+// A program's sidecars: `NAME.out` beside `NAME.avin`, or beside the directory `NAME`.
+private sidecar_base(path: string) -> string = if is_dir(path) then path else without_extension(path)
+
 // Runs every program in a directory; the failures, or "" when all passed.
-private run_all(tc: Toolchain, dir: string) -> string
+private run_all(tc: Toolchain, all: Buf[string]) -> string
     val scratch = make_temp_dir("avin-corpus").unwrap()
     defer _ = remove_dir_all(scratch)
     var failures = ""
-    val all = cases(tc, dir)
     assert(all.len() > 0)
     for path in all
         failures = failures + run_case(tc, path, scratch)
@@ -82,13 +113,13 @@ private run_all(tc: Toolchain, dir: string) -> string
 
 /** Runs one program at both optimization levels; a failure description, or "" when it passed. */
 private run_case(tc: Toolchain, path: string, scratch: string) -> string
-    val text = read_text(path).unwrap_or("")
-    val want = expectation(text)
-    val compiled = compile(tc, source_of(path, text))
+    val program = case_at(path)
+    val want = expectation(program.text)
+    val compiled = compile_files(tc, program.files)
     if compiled.diagnostics != "" then return path + ": did not compile:\n" + compiled.diagnostics
     val llvm = compiled.llvm.unwrap_or("")
-    val stdout = sidecar(path, ".out")
-    val stderr = sidecar(path, ".err")
+    val stdout = sidecar(sidecar_base(path), ".out")
+    val stderr = sidecar(sidecar_base(path), ".err")
     var failures = ""
     for level in ["-O0", "-O2"]
         val binary = scratch + "/program" + level
@@ -119,27 +150,44 @@ private run_case(tc: Toolchain, path: string, scratch: string) -> string
 
 @test("every program in tests/run builds, exits and prints as expected at -O0 and -O2")
 corpus_runs()
-    val failures = run_all(repository_toolchain(), "tests/run")
+    val tc = repository_toolchain()
+    val failures = run_all(tc, cases(tc, "tests/run"))
+    if failures != "" then panic(failures)
+
+@test("every program of many modules in tests/programs/run builds, exits and prints as expected at -O0 and -O2")
+programs_run()
+    val tc = repository_toolchain()
+    val failures = run_all(tc, program_cases(tc, "tests/programs/run"))
     if failures != "" then panic(failures)
 
 @test("every example builds, exits and prints as its header says at -O0 and -O2")
 examples_run()
-    val failures = run_all(repository_toolchain(), "examples")
+    val tc = repository_toolchain()
+    val failures = run_all(tc, cases(tc, "examples"))
     if failures != "" then panic(failures)
 
 @test("every program in tests/reject fails to compile with the expected diagnostics")
 corpus_rejects()
     val tc = repository_toolchain()
+    val failures = reject_all(tc, cases(tc, "tests/reject"))
+    if failures != "" then panic(failures)
+
+@test("every program of many modules in tests/programs/reject fails to compile with the expected diagnostics")
+programs_reject()
+    val tc = repository_toolchain()
+    val failures = reject_all(tc, program_cases(tc, "tests/programs/reject"))
+    if failures != "" then panic(failures)
+
+private reject_all(tc: Toolchain, all: Buf[string]) -> string
     var failures = ""
-    val all = cases(tc, "tests/reject")
     assert(all.len() > 0)
     for path in all
-        val text = read_text(path).unwrap_or("")
-        val want = expectation(text)
+        val program = case_at(path)
+        val want = expectation(program.text)
         if want.errors.len() == 0 then failures = failures + s"$path: names no expected error\n"
-        val compiled = compile(tc, source_of(path, text))
+        val compiled = compile_files(tc, program.files)
         if compiled.diagnostics == "" then failures = failures + s"$path: compiled\n"
         for message in want.errors
             if !compiled.diagnostics.contains(message)
                 failures = failures + s"$path: no `$message` in:\n${compiled.diagnostics}\n"
-    if failures != "" then panic(failures)
+    failures
