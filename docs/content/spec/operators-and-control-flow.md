@@ -132,7 +132,7 @@ expression, checked for exhaustiveness. Patterns include:
   (`first :: second :: rest`);
 - [sequence patterns](/spec/collections/#sequence-patterns): `[]` matches an empty sequence and
   `[a, b]` a sequence of exactly two elements;
-- type patterns (`d: Dog`);
+- type patterns (`d: Dog`, `_: Dog`);
 - alternatives (`1 | 2 | 3`), which bind no names and may continue across lines with a leading or
   trailing `|`;
 - named patterns (`whole @ Some(x)`);
@@ -154,6 +154,28 @@ bucket(n: int) -> string = n match
 ```
 
 Guards do not count, since a guard may fail.
+
+A **type pattern**, `x: T`, matches a value whose type at run time is `T` and binds it to `x` as a
+`T`; `_: T` tests without binding. For a class or a trait it matches an instance of any subclass or
+conforming class, and for a generic type it compares the type arguments exactly (`Box[int]` is not a
+`Box[string]`). The value matched may be an `Any`, or of a trait's or an open class's type, to be
+taken down to a class; a tuple, part by part. A downcast is written this way, never as a cast:
+
+```text
+legs(a: Animal) -> int = a match
+    d: Dog -> d.legs
+    b: Bird -> b.legs
+    _ -> 0
+```
+
+A type pattern that can never match, such as `s: string` on an `int`, is an error. A type pattern
+covers every value only when its type is one the matched value already has, so a `match` on an `Any`
+needs a `_` arm. A literal does not match an `Any`; match its type first (`n: int if n == 5`). In a
+function's clauses a type pattern takes an argument apart like any other (`size(s: string) = …`),
+but one naming the parameter's own type is an error, since the signature already says it. In a
+destructuring binding, whose `:` begins the binding's type, a type pattern is in parentheses. A
+function type in a type pattern is written in parentheses, because an arm's `->` follows it:
+`f: ((int) -> int) -> …`.
 
 ## return and end markers
 

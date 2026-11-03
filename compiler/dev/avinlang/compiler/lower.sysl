@@ -9,6 +9,7 @@ import sysl.path.file_name
 mir_type(t: &Type) -> Option[MirType] = *t match
     Unit -> None
     Nothing -> None
+    AnyType -> Some(MRef)
     Bool -> Some(MBool)
     Str -> Some(MRef)
     Int(bits) -> Some(MInt(bits))
@@ -72,6 +73,9 @@ private struct Lowering
     /** Each instance's index, by its function and type arguments. */
     instance_index: Map[string, usize]
     descriptors: Buf[Descriptor]
+    /** The type records, and each one's index by the type it describes. */
+    records: Buf[TypeRecord]
+    record_index: Map[string, usize]
     closures: Buf[ClosureConstant]
     /** The program's trap sites, each once, and each one's index by its unit, offset and reason. */
     traps: Buf[TrapSite]
@@ -121,7 +125,10 @@ lower_program(program: TProgram) -> MirProgram
     var global_types: Buf[Option[MirType]] = buf()
     for g in program.globals
         global_types.push(mir_type(solve(program.vars, program.symbols[g.init].result.unwrap_or(Unit))))
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types)
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types)
+    // Record 0 is for the objects no type pattern names: closures, and the boxes of captured
+    // variables.
+    l.records.push(TypeRecord("a closure or a captured variable", buf()))
     for i in 0..<program.symbols.len()
         if !is_generic(program, i) && !never_compiled(program, i) then instance(&l, i, buf())
     val entry = instance(&l, program.entry, buf())
@@ -133,7 +140,7 @@ lower_program(program: TProgram) -> MirProgram
     while k < l.instances.len()
         functions.push(lower_function(&l, k))
         k += 1
-    MirProgram(functions, l.strings, l.descriptors, l.closures, l.traps, global_types, entry, init)
+    MirProgram(functions, l.strings, l.descriptors, l.records, l.closures, l.traps, global_types, entry, init)
 
 /** Whether a function has no code: an abstract method, or an abstract class's or a trait's constructor. */
 private never_compiled(program: TProgram, id: usize) -> bool
@@ -160,18 +167,19 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
     val identity = type_key(t)
     if l.layout_index.get(identity) is Some(index) then return l.layouts[index]
     var variants: Buf[VariantLayout] = buf()
+    val record = record_of(l, t)
     *t match
         Data(id, _, args) ->
             val d = l.program.data[id]
             val methods = method_table(l, t)
             for v in 0..<d.variants.len()
-                variants.push(variant_layout(l, key + "." + d.variants[v].name, v, variant_fields(d, id, v, args), true, methods))
-        Tuple(items) -> variants.push(variant_layout(l, key, 0, items, true, buf()))
+                variants.push(variant_layout(l, key + "." + d.variants[v].name, v, variant_fields(d, id, v, args), true, methods, record))
+        Tuple(items) -> variants.push(variant_layout(l, key, 0, items, true, buf(), record))
         Class(id, _, args) ->
             var fields: Buf[&Type] = buf()
             for f in l.program.classes[id].fields
                 fields.push(substitute(f.ty.unwrap_or(ErrorType), class_owner(id), args))
-            variants.push(variant_layout(l, key, 0, fields, false, method_table(l, t)))
+            variants.push(variant_layout(l, key, 0, fields, false, method_table(l, t), record))
         _ -> panic("a layout of a type that is not data, a tuple or a class: " + key)
     val result = DataLayout(variants)
     l.layout_index.put(identity, l.layouts.len())
@@ -180,7 +188,7 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
 
 // One variant's fields at their offsets, and its descriptor; a variant with no field data is one
 // constant object, unless `shared` is false: every object of a class is its own, for its identity.
-private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[&Type], shared: bool, methods: Buf[Option[usize]]) -> VariantLayout
+private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[&Type], shared: bool, methods: Buf[Option[usize]], record: usize) -> VariantLayout
     var fields: Buf[Option[FieldSlot]] = buf()
     var refs: Buf[usize] = buf()
     var size = 0usize
@@ -192,7 +200,7 @@ private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[
                 size += field_size(m)
             None -> fields.push(None)
     val shape = VariantLayout(l.descriptors.len(), fields)
-    l.descriptors.push(Descriptor(name, tag, size, refs, shared && size == 0, methods))
+    l.descriptors.push(Descriptor(name, tag, size, refs, shared && size == 0, methods, record))
     shape
 
 // The method table of a class instance or a data value: for each slot, the instance of the method
@@ -340,9 +348,166 @@ private box_descriptor(l: *Lowering, t: MirType) -> usize
     var refs: Buf[usize] = buf()
     if t is MRef then refs.push(0)
     val d = l.descriptors.len()
-    l.descriptors.push(Descriptor("box of " + key, 0, field_size(t), refs, false, buf()))
+    l.descriptors.push(Descriptor("box of " + key, 0, field_size(t), refs, false, buf(), 0))
     l.boxes.put(key, d)
     d
+
+// A type's record lists its ancestors: for a class or trait, its superclasses and the traits it and
+// they conform to, for a data type the traits its impls make it conform to, with their type arguments as it sees them; for a tuple, each tuple type its parts
+// may be seen as, one part's ancestor at a time. Every other type is its own and nothing else.
+private record_of(l: *Lowering, t: &Type) -> usize
+    val key = type_key(t)
+    if l.record_index.get(key) is Some(r) then return r
+    val index = l.records.len()
+    l.records.push(TypeRecord(type_name(t), buf()))
+    l.record_index.put(key, index)
+    var ancestors: Buf[usize] = buf()
+    for up in supertypes(l, t)
+        ancestors.push(record_of(l, up))
+    l.records.set(index, TypeRecord(type_name(t), ancestors))
+    index
+
+/** The types `t` conforms to besides itself and `Any`, each once. */
+private supertypes(l: *Lowering, t: &Type) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    *t match
+        Class(_, _, _) -> class_ancestors(l, t, &out)
+        Data(_, _, _) -> class_ancestors(l, t, &out)
+        Tuple(items) ->
+            // Each part's own type and its ancestors; every combination but the tuple itself.
+            var choices: Buf[Buf[&Type]] = buf()
+            for item in items
+                var options: Buf[&Type] = buf()
+                options.push(item)
+                if *item is Class(_, _, _) || *item is Data(_, _, _) then class_ancestors(l, item, &options)
+                choices.push(options)
+            var combos: Buf[Buf[&Type]] = buf()
+            combos.push(buf())
+            for options in choices
+                var next: Buf[Buf[&Type]] = buf()
+                for combo in combos
+                    for option in options
+                        var longer: Buf[&Type] = buf()
+                        for x in combo do longer.push(x)
+                        longer.push(option)
+                        next.push(longer)
+                combos = next
+            for combo in combos
+                val up: &Type = Tuple(combo)
+                if !same_type(up, t) then out.push(up)
+        _ -> ()
+    out
+
+// Adds the superclasses of the class `t` and the traits it and they conform to, each once.
+private class_ancestors(l: *Lowering, t: &Type, out: *Buf[&Type])
+    // A data type's ancestors are the traits its impls name, and what those require.
+    if *t is Data(d, _, xs)
+        for required in l.program.data[d].traits
+            val parent = substitute(required, data_owner(d), xs)
+            var seen = false
+            for i in 0..<out.len()
+                if same_type(out[i], parent) then seen = true
+            if seen then continue
+            out.push(parent)
+            class_ancestors(l, parent, out)
+        return
+    val k = *t match
+        Class(k, _, _) -> k
+        _ -> return
+    val args = *t match
+        Class(_, _, a) -> a
+        _ -> buf()
+    val symbol = l.program.classes[k]
+    var parents: Buf[&Type] = buf()
+    for required in symbol.traits
+        parents.push(substitute(required, class_owner(k), args))
+    if symbol.superclass is Some(sup) then parents.push(substitute(sup, class_owner(k), args))
+    for parent in parents
+        var seen = false
+        for i in 0..<out.len()
+            if same_type(out[i], parent) then seen = true
+        if seen then continue
+        out.push(parent)
+        class_ancestors(l, parent, out)
+
+/** The descriptor of a box holding a value of the built-in type `t` as an `Any`; unit's is one
+ * constant object. */
+private value_box(l: *Lowering, t: &Type) -> usize
+    val key = "value box " + type_key(t)
+    if l.boxes.get(key) is Some(d) then return d
+    val size = machine(l, t) match
+        Some(m) -> field_size(m)
+        None -> 0
+    val d = l.descriptors.len()
+    l.descriptors.push(Descriptor("box of " + type_name(t), 0, size, buf(), size == 0, buf(), record_of(l, t)))
+    l.boxes.put(key, d)
+    d
+
+// A value as an `Any`. One the program already keeps as a reference to an object is that object;
+// a built-in value is put in a new box, and unit is its one constant box.
+private box_value(l: *Lowering, t: &Type, value: Option[Operand]) -> Option[Operand]
+    if *t is Unit then return Some(ConstObject(value_box(l, t)))
+    val v = value?
+    val m = machine(l, t)?
+    if m is MRef then return Some(v)
+    val object = fresh(l, MRef)
+    l.insts.push(Alloc(object, value_box(l, t)))
+    l.insts.push(Store(field_address(l, Value(object), FieldSlot(0, m)), v))
+    Some(Value(object))
+
+/** Where a descriptor's type record is: after the collector's kind and three words. */
+private const DescriptorRecord: usize = 56
+
+// Whether the object `object` has type `t` at run time. A string's descriptor names no record; a
+// type nothing else can be is tested by its record alone, and an open class, a trait, or a tuple
+// with such a part also by the record's ancestors.
+private type_test(l: *Lowering, object: Operand, t: &Type) -> Operand
+    val descriptor = fresh(l, MPtr)
+    l.insts.push(DescriptorOf(descriptor, object))
+    val address = fresh(l, MPtr)
+    l.insts.push(Offset(address, Value(descriptor), DescriptorRecord))
+    val record = fresh(l, MPtr)
+    l.insts.push(Load(record, Value(address)))
+    if *t is Str then return compare(l, CmpEq, Value(record), NullAddress)
+    val target = RecordAddress(record_of(l, t))
+    if exact(l, t) then return compare(l, CmpEq, Value(record), target)
+    val found = runtime_call(l, "avin_rt_conforms", [MPtr, MPtr], MInt(32), [Value(record), target])
+    compare(l, CmpNe, found, ConstInt(32, "0"))
+
+/** Whether only a value of exactly type `t` has type `t`: true of every type but an open or
+ * abstract class, a trait, and a tuple with a part of one. */
+private exact(l: *Lowering, t: &Type) -> bool = *t match
+    Class(k, _, _) -> l.program.classes[k].decl.modifier == ""
+    Tuple(items) ->
+        for item in items
+            if !exact(l, item) then return false
+        true
+    _ -> true
+
+/** The value of type `t` an object that has that type holds: a built-in value is in its box. */
+private unbox(l: *Lowering, t: &Type, object: Operand) -> Option[Operand] = machine(l, t) match
+    Some(MRef) -> Some(object)
+    Some(m) -> Some(load_field(l, object, FieldSlot(0, m)))
+    None -> None
+
+// Whether a value of static type `from` always has type `to`: `to` is `Any`, or `from` itself, or
+// for a class or a trait, one of its ancestors; for a tuple, part by part.
+private always_is(l: *Lowering, from: &Type, to: &Type) -> bool
+    if *to is AnyType || same_type(from, to) then return true
+    *from match
+        Class(_, _, _) -> *to match
+            Class(k, _, _) -> ancestor_type(l.program.classes, l.program.data, from, k) match
+                Some(up) -> same_type(up, to)
+                None -> false
+            _ -> false
+        Tuple(xs) -> *to match
+            Tuple(ys) ->
+                if xs.len() != ys.len() then return false
+                for i in 0..<xs.len()
+                    if !always_is(l, xs[i], ys[i]) then return false
+                true
+            _ -> false
+        _ -> false
 
 private machine_name(t: MirType) -> string = t match
     MInt(bits) -> s"i$bits"
@@ -375,7 +540,7 @@ private closure_shape(l: *Lowering, function: usize, type_args: Buf[&Type]) -> C
                     size += field_size(m)
         None -> ()
     val shape = ClosureShape(l.descriptors.len(), fields)
-    l.descriptors.push(Descriptor("closure of " + function_symbol(l.program, function, type_args), 0, size, refs, false, buf()))
+    l.descriptors.push(Descriptor("closure of " + function_symbol(l.program, function, type_args), 0, size, refs, false, buf(), 0))
     l.shapes.put(key, shape)
     shape
 
@@ -867,6 +1032,10 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         val x = lower_expr(l, operand)?
         Some(convert(l, operand.ty, e.ty, x, e.span))
     Render(value) -> render(l, value)
+    Box(value) ->
+        val v = lower_expr(l, value)
+        if v is None && machine(l, value.ty) is Some(_) then return None
+        box_value(l, concrete(l, value.ty), v)
     Logic(and, left, right) -> logic(l, and, left, right)
     Compare(operands, ops) -> compare_chain(l, operands, ops)
     If(condition, yes, no) -> lower_if(l, e, condition, yes, no)
@@ -1276,6 +1445,23 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
                 finish(l, Jump(matched))
                 l.current = next
             l.current = matched
+        PType(target, local, _) ->
+            val from = concrete(l, p.ty)
+            val to = concrete(l, target)
+            var bound = value
+            if always_is(l, from, to)
+                if *to is AnyType && !(*from is AnyType) then bound = box_value(l, from, value)
+            elif *from is AnyType || *from is Class(_, _, _) || *from is Tuple(_)
+                // An object whose type is a subtype of its static type: its descriptor's record says.
+                if value is Some(v)
+                    continue_if(l, type_test(l, v, to), fail)
+                    bound = unbox(l, to, v)
+            else
+                // A value that is neither `Any` nor an object of a class has exactly its static
+                // type, which a copy of generic code may find is not `to`.
+                continue_if(l, ConstBool(false), fail)
+                bound = None
+            if local is Some(x) then bind_local(l, x, bound)
         PVariant(variant, fields) ->
             if value is Some(v)
                 val shape = layout(l, concrete(l, p.ty))

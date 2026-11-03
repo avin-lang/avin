@@ -101,14 +101,7 @@ parse_type(p: *Parser) -> &TypeExpr
         p.report.add(expected(start, "a type", found_at(p.src, start)))
         p.toks.advance()
         return TypeExpr(start, InvalidType)
-    val path = qualified_name(p)
-    var args: Buf[&TypeExpr] = buf()
-    if p.accept("[")
-        loop
-            args.push(parse_type(p))
-            if !p.accept(",") || p.at("]") then break
-        p.expect("]")
-    val named = TypeExpr(start.to(p.toks.here()), Named(path, args))
+    val named = named_type(p, start)
     if !p.accept("->") then return named
     var params: Buf[FunctionTypeParam] = buf()
     params.push(FunctionTypeParam(named, false))
@@ -116,13 +109,47 @@ parse_type(p: *Parser) -> &TypeExpr
     TypeExpr(start.to(result.span), Function(params, result))
 end parse_type
 
-parse_pattern(p: *Parser) -> &Pattern
-    val first = parse_named_pattern(p)
+/** A type's name and its type arguments, `Map[K, V]`. */
+private named_type(p: *Parser, start: Span) -> &TypeExpr
+    val path = qualified_name(p)
+    var args: Buf[&TypeExpr] = buf()
+    if p.accept("[")
+        loop
+            args.push(parse_type(p))
+            if !p.accept(",") || p.at("]") then break
+        p.expect("]")
+    TypeExpr(start.to(p.toks.here()), Named(path, args))
+
+// The type of a type pattern, which a match arm's `->` may follow, so a function type there is
+// written in parentheses: `f: ((int) -> int)`.
+private parse_pattern_type(p: *Parser) -> &TypeExpr
+    val start = p.toks.here()
+    if !p.accept("(")
+        if p.at_kind(Word) then return named_type(p, start)
+        p.report.add(expected(start, "a type", found_at(p.src, start)))
+        return TypeExpr(start, InvalidType)
+    var items: Buf[&TypeExpr] = buf()
+    if !p.at(")")
+        loop
+            items.push(parse_type(p))
+            if !p.accept(",") || p.at(")") then break
+    p.expect(")")
+    if items.len() == 1 then return items[0]
+    TypeExpr(start.to(p.toks.here()), Tuple(items))
+
+parse_pattern(p: *Parser) -> &Pattern = pattern_of(p, true)
+
+/** A pattern where a `:` after it begins its type, as a parameter's and a binding's do: a type
+ * pattern there is written in parentheses. */
+parse_untyped_pattern(p: *Parser) -> &Pattern = pattern_of(p, false)
+
+private pattern_of(p: *Parser, typed: bool) -> &Pattern
+    val first = parse_named_pattern(p, typed)
     if !pattern_separator(p) then return first
     var options: Buf[&Pattern] = buf()
     options.push(first)
     loop
-        options.push(parse_named_pattern(p))
+        options.push(parse_named_pattern(p, typed))
         if !pattern_separator(p) then break
     Pattern(first.span.to(p.toks.here()), Alternatives(options))
 
@@ -135,12 +162,17 @@ private pattern_separator(p: *Parser) -> bool
     p.accept_kind(Newline)
     true
 
-private parse_named_pattern(p: *Parser) -> &Pattern
+// A name or `_` followed by `:` and a type is a type pattern, where `typed` allows one.
+private parse_named_pattern(p: *Parser, typed: bool) -> &Pattern
     val inner = parse_comparison_pattern(p)
+    if typed && p.at(":") && binder(inner)
+        p.toks.advance()
+        val ty = parse_pattern_type(p)
+        return Pattern(inner.span.to(ty.span), Typed(inner, ty))
     if !p.at("@") then return inner
     val at = p.toks.here()
     p.toks.advance()
-    val nested = parse_named_pattern(p)
+    val nested = parse_named_pattern(p, typed)
     inner.kind match
         Name(name) -> Pattern(inner.span.to(nested.span), Named(name, nested))
         _ ->
@@ -260,7 +292,7 @@ parse_params(p: *Parser, function: bool) -> Buf[Param]
     if !p.at(")")
         loop
             val start = p.toks.here()
-            val pattern = parse_pattern(p)
+            val pattern = parse_untyped_pattern(p)
             val named = pattern.kind is Name(_)
             p.expect(":")
             val by_name = p.accept("->")
@@ -352,10 +384,6 @@ private parse_clause(p: *Parser) -> Clause
     if !p.at(")")
         loop
             patterns.push(parse_pattern(p))
-            if p.at(":")
-                p.report.add(error(p.toks.here(), "a clause's arguments are patterns; their types are in the signature"))
-                p.toks.advance()
-                parse_type(p)
             if !p.accept(",") || p.at(")") then break
     p.expect(")")
     var bodies: Buf[GuardedBody] = buf()

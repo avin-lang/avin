@@ -124,6 +124,29 @@ There is no arity limit.
 `data`) converts to `Any` by boxing at the point of conversion; the box records the exact type, so a
 `match` on an `Any` recovers the value.
 
+```text
+describe(x: Any) -> string = x match
+    s: string -> s"text $s"
+    n: int -> s"number $n"
+    _ -> "something else"
+
+describe(42)        // the int is boxed where it becomes an Any
+```
+
+A value converts to `Any` wherever one is expected of it, at a single site: an argument, a binding,
+an assignment, a field, a result, a part of a tuple written out, or each branch of an `if` or
+`match` expected to yield an `Any`. A tuple already made does not convert part by part:
+`(string, int)` is not a `(Any, int)`, since boxing never happens inside a container.
+
+How a value is boxed is the compiler's choice, and invisible except in cost. A string, a tuple and a
+`data` value are already objects whose header names their exact type, so they need no box; a
+number, a `char`, a `bool` and `unit` get one. A tuple's type at run time is the type it was made
+with: `(animal, 1)` with `animal: Animal` is an `(Animal, int)`, whatever class the animal is.
+
+An `Any` has no equality and no identity: `==`, `!=`, `===` and `!==` are not defined on it, since
+it may hold a value with neither. A type pattern recovers the value's type, and with it the
+comparisons that type has.
+
 `Nothing` is the bottom type: the type of `return`, `break`, `continue` and a call to a function that
 never returns. It is a subtype of every type, and an expression of type `Nothing` never produces a
 value. An empty collection literal or `None` does **not** have a `Nothing` type argument; its type
