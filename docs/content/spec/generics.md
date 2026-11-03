@@ -149,6 +149,21 @@ infer is.
 - Local `val`/`var` types, lambda parameter and result types, and type arguments at calls and
   constructors are inferred from arguments **and** from the expected type. Within one function body,
   an inference variable may be settled by a later use.
+- A type argument of a call that neither its arguments nor its expected type decide stays unknown
+  until the end of the enclosing function body (a lambda's body is part of it), and the first use
+  that needs it settles it:
+  - a branch it joins: `if c then Some(x) else None` is an `Option[int]`, as is a `match` whose
+    other arms are, and a lambda's `None` takes the type of its other return paths;
+  - a store: `var best = None` then `best = Some(3)` makes `best` an `Option[int]`, from the body
+    or from a local function or lambda that assigns it;
+  - a use as a value of a known type: an argument, a value stored where its type is declared, an
+    operand of an arithmetic or comparison operator, or a value matched against a literal pattern.
+    `best match Some(b) if b >= i -> …` settles `b`, and with it `best`, as `i`'s type.
+
+  A later use that disagrees with an earlier one is an error at the later use. An unknown still open
+  at the end of the body is an error at the call that made it, asking for the type to be written. A
+  field declared without a type has its initializer's type at once, since any function may read it.
+  A type argument held to a bound is decided at its call.
 - Constraints are subtype constraints. A type variable collects lower and upper bounds and is solved
   to the least type that satisfies them, so `if c then dog else cat` is an `Animal`, and the branches
   of a `match` agree on their least upper bound.

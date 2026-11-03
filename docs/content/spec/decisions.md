@@ -21,6 +21,9 @@ a decision changes, this page and the chapter change together.
 - Typing is nominal. Classes instantiate objects; there are no duck-typed objects.
 - Inference is a useful approximation of Hindley–Milner, not full HM: see
   [inference](/spec/generics/#inference).
+- A call's type argument that nothing at the call decides stays open until the end of the
+  enclosing function body, settled by the first later use that needs it (a branch it joins, a
+  store, a use as a value of a known type), and is an error at the call if nothing settles it.
 - The compiler is written in Sysl. Self-hosting is optional.
 - **The standard library is written in Avin.** Sysl is reached through
   [bindings written in Avin](/spec/sysl-bindings/), which the compiler turns into shims that Sysl
