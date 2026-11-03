@@ -359,9 +359,11 @@ check_program(units: Buf[SourceUnit]) -> Checked
     for id in 0..<c.classes.len()
         settle_inherited_fields(&c, id)
         check_override_results(&c, id)
+        check_class_variance(&c, id)
     check_initialization(&c)
     for id in 0..<c.data.len()
         check_data_implementations(&c, id)
+        check_data_variance(&c, id)
     for g in 0..<c.globals.len()
         settle_global(&c, g)
     val init = initializer(&c, initialization_order(&c))
@@ -727,7 +729,6 @@ private declare_fields(c: *Checker, unit: usize)
         val declares_trait = is_trait(c, id)
         for tp in d.type_params
             if tp.bounds.len() > 0 then c.note(unit, tp.span, "bounds on type parameters are not implemented")
-            if !(tp.variance is Invariant) && !declares_trait then c.note(unit, tp.span, "variance on a class's type parameters is not implemented")
         if declares_trait
             for m in d.members
                 m match
@@ -942,6 +943,77 @@ ancestor_type(classes: Buf[ClassSymbol], data: Buf[DataSymbol], t: &Type, target
     for required in classes[k].traits
         if ancestor_type(classes, data, substitute(required, class_owner(k), args), target) is Some(found) then return Some(found)
     ancestor_type(classes, data, substitute(classes[k].superclass?, class_owner(k), args), target)
+
+// `x`, the type of a value, seen as the type `to`: what the value already is as an instance of
+// `to`'s class, trait, data type, tuple or function type, with no conversion. An instance of a
+// subclass is one of its superclass; an instance of a generic type is another instance of it where
+// each type argument follows the parameter's declared variance; a tuple's parts are covariant; a
+// function's parameters are contravariant and its result covariant. Where `x` is not such a view of
+// `to`, the result is `x` itself or a type that differs from `to`. Both types are solved.
+view_as(classes: Buf[ClassSymbol], data: Buf[DataSymbol], x: &Type, to: &Type) -> &Type = *to match
+    Class(k, name, ys) -> ancestor_type(classes, data, x, k) match
+        Some(up) -> *up match
+            Class(_, _, xs) -> Class(k, name, vary_args(classes, data, classes[k].decl.type_params, xs, ys))
+            _ -> up
+        None -> x
+    Data(d, name, ys) -> *x match
+        Data(e, _, xs) ->
+            if e != d then return x
+            Data(d, name, vary_args(classes, data, data[d].decl.type_params, xs, ys))
+        _ -> x
+    Tuple(ys) -> *x match
+        Tuple(xs) ->
+            if xs.len() != ys.len() then return x
+            var items: Buf[&Type] = buf()
+            for i in 0..<xs.len()
+                items.push(view_part(classes, data, xs[i], ys[i]))
+            Tuple(items)
+        _ -> x
+    Function(ys, s) -> *x match
+        Function(xs, r) ->
+            if xs.len() != ys.len() then return x
+            var params: Buf[&Type] = buf()
+            for i in 0..<xs.len()
+                params.push(view_contra(classes, data, xs[i], ys[i]))
+            Function(params, view_part(classes, data, r, s))
+        _ -> x
+    _ -> x
+
+// The type arguments `xs` seen as `ys`, one parameter's variance at a time.
+private vary_args(classes: Buf[ClassSymbol], data: Buf[DataSymbol], params: Buf[TypeParam], xs: Buf[&Type], ys: Buf[&Type]) -> Buf[&Type]
+    if xs.len() != ys.len() || xs.len() != params.len() then return xs
+    var out: Buf[&Type] = buf()
+    for i in 0..<xs.len()
+        val v = params[i].variance
+        if v is Covariant then out.push(view_part(classes, data, xs[i], ys[i]))
+        elif v is Contravariant then out.push(view_contra(classes, data, xs[i], ys[i]))
+        else out.push(xs[i])
+    out
+
+// A part in a covariant position: `x` seen as `to` where both are references, so the object `x`
+// describes is already the one `to` describes. A value of a value type differs in representation
+// from an `Any` or a trait, so it stays itself.
+private view_part(classes: Buf[ClassSymbol], data: Buf[DataSymbol], x: &Type, to: &Type) -> &Type
+    if conforms(x, to) && !(*x is Nothing) then return x
+    if !is_reference(x) then return x
+    if *to is AnyType then return AnyType
+    view_as(classes, data, x, to)
+
+// A part in a contravariant position: `to` where it may be seen as `x`, otherwise `x`.
+private view_contra(classes: Buf[ClassSymbol], data: Buf[DataSymbol], x: &Type, to: &Type) -> &Type
+    if conforms(x, to) && !(*x is Nothing) then return x
+    if conforms(view_part(classes, data, to, x), x) then to else x
+
+/** Whether a value of type `t` is a reference to an object, which every type it may be seen as
+ * shares: `Any`, a string, a tuple, a function, a data type, a class or a trait. */
+is_reference(t: &Type) -> bool = *t match
+    AnyType -> true
+    Str -> true
+    Tuple(_) -> true
+    Function(_, _) -> true
+    Data(_, _, _) -> true
+    Class(_, _, _) -> true
+    _ -> false
 
 /** Whether a field may be used from the code being checked: a public one, or a private one from
  * code of the class that declares it or of its companion. */
@@ -2080,6 +2152,92 @@ private overrides_matches(c: *Checker, id: usize, m: usize, target: usize) -> bo
 // A trait's method may also be implemented by a method the class inherits, from its superclass or
 // as another trait's default; that one takes the trait method's parameters and yields its result
 // as the class sees them both.
+// A class's or trait's `+T` appears only where a value of `T` is read out: a method's result, an
+// immutable field, a parent's covariant argument. A `-T` appears only where one is passed in: a
+// method's parameter. A mutable field is read and written, so neither may appear in it. Private
+// members are checked like public ones, since a method of the instance seen at a wider type reads
+// and writes them too. The receiver is the instance itself and is not checked.
+private check_class_variance(c: *Checker, id: usize)
+    val k = c.classes[id]
+    val params = k.decl.type_params
+    var variant = false
+    for tp in params
+        if !(tp.variance is Invariant) then variant = true
+    if !variant then return
+    val owner = class_owner(id)
+    val at = k.decl.name_span
+    if k.superclass is Some(sup) then variance_in(c, k.unit, params, owner, sup, 1, at, s"the superclass ${type_name(sup)}")
+    for t in k.traits
+        variance_in(c, k.unit, params, owner, t, 1, at, s"the trait ${type_name(t)}")
+    for i in k.inherited..<k.fields.len()
+        val f = k.fields[i]
+        val ty = f.ty.unwrap_or(ErrorType)
+        if f.mutable then variance_in(c, k.unit, params, owner, ty, 0, f.span, s"the mutable field `${f.name}`")
+        else variance_in(c, k.unit, params, owner, ty, 1, f.span, s"the field `${f.name}`")
+    for m in k.methods
+        val symbol = c.symbols[m]
+        val name = symbol.decl.name
+        for j in 1..<symbol.params.len()
+            val span = if j - 1 < symbol.decl.params.len() then symbol.decl.params[j - 1].span else symbol.decl.name_span
+            val pname = if j < symbol.param_names.len() then symbol.param_names[j] else "_"
+            variance_in(c, k.unit, params, owner, symbol.params[j], -1, span, s"the parameter `$pname` of `$name`")
+        val result_span = symbol.decl.result match
+            Some(r) -> r.span
+            None -> symbol.decl.name_span
+        variance_in(c, k.unit, params, owner, symbol.result.unwrap_or(ErrorType), 1, result_span, s"the result of `$name`")
+
+// A data type's fields are immutable, so a `+T` may appear in them and a `-T` may not; the traits
+// its impls make it conform to are parents, whose arguments follow their own variance.
+private check_data_variance(c: *Checker, id: usize)
+    val d = c.data[id]
+    val params = d.decl.type_params
+    var variant = false
+    for tp in params
+        if !(tp.variance is Invariant) then variant = true
+    if !variant then return
+    val owner = data_owner(id)
+    for v in d.variants
+        for i in 0..<v.fields.len()
+            val name = if i < v.field_names.len() then v.field_names[i] else "_"
+            variance_in(c, d.unit, params, owner, v.fields[i], 1, v.span, s"the field `$name` of `${v.name}`")
+    for t in d.traits
+        variance_in(c, d.unit, params, owner, t, 1, d.decl.span, s"the trait ${type_name(t)}")
+
+// Reports the first type parameter of `owner` that `t` names in a position its variance forbids.
+// `polarity` is 1 where a value is read out, -1 where one is passed in, 0 where both happen; it flips
+// through a function type's parameters and follows each generic type's declared variance.
+private variance_in(c: *Checker, unit: usize, params: Buf[TypeParam], owner: usize, t: &Type, polarity: i32, at: Span, place: string) -> bool
+    *t match
+        TypeVar(o, i, name) ->
+            if o != owner || i >= params.len() then return true
+            val v = params[i].variance
+            val ok = if v is Covariant then polarity == 1 elif v is Contravariant then polarity == -1 else true
+            if ok then return true
+            val kind = if v is Covariant then "covariant" else "contravariant"
+            val sign = if v is Covariant then "+" else "-"
+            val position = if polarity == 1 then "a covariant" elif polarity == -1 then "a contravariant" else "an invariant"
+            c.note(unit, at, s"the $kind type parameter `$sign$name` appears in $position position, $place")
+            false
+        Tuple(items) ->
+            for item in items
+                if !variance_in(c, unit, params, owner, item, polarity, at, place) then return false
+            true
+        Function(ps, r) ->
+            for p in ps
+                if !variance_in(c, unit, params, owner, p, -polarity, at, place) then return false
+            variance_in(c, unit, params, owner, r, polarity, at, place)
+        ByName(inner) -> variance_in(c, unit, params, owner, inner, polarity, at, place)
+        Data(d, _, args) -> variance_args(c, unit, params, owner, c.data[d].decl.type_params, args, polarity, at, place)
+        Class(k, _, args) -> variance_args(c, unit, params, owner, c.classes[k].decl.type_params, args, polarity, at, place)
+        _ -> true
+
+private variance_args(c: *Checker, unit: usize, params: Buf[TypeParam], owner: usize, declared: Buf[TypeParam], args: Buf[&Type], polarity: i32, at: Span, place: string) -> bool
+    for i in 0..<args.len()
+        val v = if i < declared.len() then declared[i].variance else Invariant
+        val p = if v is Covariant then polarity elif v is Contravariant then -polarity else 0
+        if !variance_in(c, unit, params, owner, args[i], p, at, place) then return false
+    true
+
 private check_override_results(c: *Checker, id: usize)
     val k = c.classes[id]
     if is_trait(c, id)
@@ -4083,50 +4241,65 @@ private join_expected(c: *Checker, a: &Type, b: &Type, expected: Option[&Type]) 
     if fits(c, a, want) && fits(c, b, want) then Some(want) else None
 
 // The type two branches agree on, where one that never finishes agrees with anything.
-// Two instances of classes agree on their nearest common ancestor.
+// Two instances of classes agree on their nearest common ancestor, and two instances of one generic
+// type on the instance whose covariant arguments are their arguments' agreement.
 private join(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
     if *a is Nothing || *a is ErrorType then return Some(b)
     if *b is Nothing || *b is ErrorType then return Some(a)
     if same_type(a, b) then return Some(a)
     var current = zonk(c, a)
+    if *current is Data(_, _, _) then return join_args(c, current, zonk(c, b))
     loop
         val k = *current match
             Class(k, _, args) -> k
             _ -> return None
         if ancestor_type(c.classes, c.data, zonk(c, b), k) is Some(up)
             if same_type(up, current) then return Some(current)
+            if join_args(c, current, up) is Some(t) then return Some(t)
         current = ancestor_parent(c, current)?
     None
+
+// The instance of one generic type that two of its instances agree on: equal invariant arguments,
+// and covariant arguments that are references agreeing on a type.
+private join_args(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
+    val (params, xs, ys) = *a match
+        Data(d, _, xs) -> *b match
+            Data(e, _, ys) -> if d == e then (c.data[d].decl.type_params, xs, ys) else return None
+            _ -> return None
+        Class(k, _, xs) -> *b match
+            Class(j, _, ys) -> if k == j then (c.classes[k].decl.type_params, xs, ys) else return None
+            _ -> return None
+        _ -> return None
+    if xs.len() != ys.len() || xs.len() != params.len() then return None
+    var args: Buf[&Type] = buf()
+    for i in 0..<xs.len()
+        if same_type(xs[i], ys[i])
+            args.push(xs[i])
+            continue
+        if !(params[i].variance is Covariant) || !is_reference(xs[i]) || !is_reference(ys[i]) then return None
+        args.push(join(c, xs[i], ys[i])?)
+    *a match
+        Data(d, name, _) -> Some(Data(d, name, args))
+        Class(k, name, _) -> Some(Class(k, name, args))
+        _ -> None
 
 /** The superclass of an instance's class, as the instance's type, if it has one. */
 private ancestor_parent(c: *Checker, t: &Type) -> Option[&Type] = *t match
     Class(k, _, args) -> Some(substitute(c.classes[k].superclass?, class_owner(k), args))
     _ -> None
 
-/** `from` as an instance of the class `to` names, when `from` is an instance of one of that class's
- * subclasses; otherwise `from` itself. */
+/** `from` as the type `to` asks for, where a value of `from` is one of `to` (see `view_as`);
+ * otherwise `from` itself, or a type that differs from `to`. */
 private upcast(c: *Checker, from: &Type, to: &Type) -> &Type
     val x = zonk(c, from)
-    // Every value converts to `Any`, by boxing where it is written; never inside a tuple, whose
-    // parts are already laid out.
+    // Every value converts to `Any`, by boxing where it is written; never inside a tuple or as a
+    // type argument, whose parts are already laid out.
     if *zonk(c, to) is AnyType && !(*x is Var(_) || *x is ByName(_)) then return AnyType
-    upcast_part(c, x, to)
-
-private upcast_part(c: *Checker, x: &Type, to: &Type) -> &Type
-    *zonk(c, to) match
-        Class(k, _, _) -> ancestor_type(c.classes, c.data, x, k).unwrap_or(x)
-        Tuple(ys) -> *x match
-            Tuple(xs) ->
-                if xs.len() != ys.len() then return x
-                var items: Buf[&Type] = buf()
-                for i in 0..<xs.len()
-                    items.push(upcast_part(c, zonk(c, xs[i]), ys[i]))
-                Tuple(items)
-            _ -> x
-        _ -> x
+    view_as(c.classes, c.data, x, zonk(c, to))
 
 /** Whether a value of type `from` may be used where `to` is expected: an instance of a subclass is an
- * instance of its superclass, also inside a tuple. */
+ * instance of its superclass, and an instance of a generic type one of another instance as its
+ * parameters' variance allows, also inside a tuple or a function type. */
 private fits(c: *Checker, from: &Type, to: &Type) -> bool = conforms(upcast(c, from, to), to)
 
 private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[&Expr], expected: Option[&Type], used: bool) -> &TExpr
@@ -5570,6 +5743,10 @@ private may_match(c: *Checker, from: &Type, to: &Type) -> bool
     val x = zonk(c, from)
     val y = zonk(c, to)
     if fits(c, x, y) || *x is AnyType || *x is TypeVar(_, _, _) || *y is TypeVar(_, _, _) then return true
+    // A value of a generic type may be an instance whose arguments are subtypes of the static ones,
+    // or, for a contravariant parameter, supertypes.
+    if !(*y is AnyType) && fits(c, y, x) then return true
+    if variant_instances(c, x, y) then return true
     *x match
         Class(k, _, _) -> *y match
             Class(j, _, _) ->
@@ -5585,6 +5762,24 @@ private may_match(c: *Checker, from: &Type, to: &Type) -> bool
                 true
             _ -> false
         _ -> false
+
+// Whether two instances of one generic type may describe one value: their invariant arguments are
+// equal, and their other arguments are references that may describe one value.
+private variant_instances(c: *Checker, x: &Type, y: &Type) -> bool
+    val (params, xs, ys) = *x match
+        Data(d, _, xs) -> *y match
+            Data(e, _, ys) -> if d == e then (c.data[d].decl.type_params, xs, ys) else return false
+            _ -> return false
+        Class(k, _, xs) -> *y match
+            Class(j, _, ys) -> if k == j then (c.classes[k].decl.type_params, xs, ys) else return false
+            _ -> return false
+        _ -> return false
+    if xs.len() != ys.len() || xs.len() != params.len() then return false
+    for i in 0..<xs.len()
+        if same_type(xs[i], ys[i]) then continue
+        if params[i].variance is Invariant || !is_reference(xs[i]) || !is_reference(ys[i]) then return false
+        if !may_match(c, xs[i], ys[i]) && !may_match(c, ys[i], xs[i]) then return false
+    true
 
 // The local a comparison or `n + k` pattern binds: none for `_`. A name that is a variant is not a
 // binder there.

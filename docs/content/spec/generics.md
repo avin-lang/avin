@@ -31,7 +31,10 @@ Generics are monomorphized: each distinct set of type arguments produces its own
 `List[int]` stores unboxed `int`s. Every heap object's header names its exact type, including type
 arguments, so:
 
-- a type pattern such as `xs: List[string] -> …` is checked exactly;
+- a type pattern such as `xs: List[string] -> …` is checked against the object's exact type: it
+  matches when that type is the pattern's or a subtype of it, through [variance](#variance) too, so
+  a `List[Dog]` held as an `Any` matches `xs: List[Animal]` and a `List[int]` does not match
+  `xs: List[Any]`;
 - generic code can create an `Array[T]` without any evidence parameter;
 - there are no unchecked casts. A downcast is a `match` with a type pattern.
 
@@ -56,15 +59,43 @@ happens inside a container: `List[int]` is not a `List[Display]`.
 
 ## Variance
 
-Type parameters declare variance: `+T` covariant, `-T` contravariant, plain `T` invariant. The
-checker verifies each parameter's positions (a `+T` may not appear as a method parameter, and so on).
+Type parameters of `data` types, classes and traits declare variance: `+T` covariant, `-T`
+contravariant, plain `T` invariant. A function's or an `impl`'s type parameters take none.
 
 - Immutable collections are covariant: `List[+A]`, `Map[K, +V]`, `Option[+T]`.
 - Mutable collections are invariant: `Array[T]`, `Buffer[T]`. A covariant mutable collection would
   accept a store that is only checkable at run time.
-- Variance applies where the arguments are reference types. Because reference types share one
-  representation (a pointer to an object whose header carries its type), `List[Dog]` is a
-  `List[Animal]` with no conversion at all.
+- Variance applies where the arguments are reference types: `Any`, strings, tuples, functions,
+  `data` types, classes and traits. Because reference types share one representation (a pointer to
+  an object whose header carries its type), `List[Dog]` is a `List[Animal]` with no conversion at
+  all, and `List[string]` is a `List[Any]`. A value of a value type becomes an `Any` or a trait only
+  by boxing, which never happens inside a container, so `List[int]` is not a `List[Any]`.
+- Tuple parts are covariant and function types take contravariant parameters and covariant
+  results, on the same terms: `(Animal) -> int` is a `(Dog) -> int`, and `() -> string` is a
+  `() -> Any`, but `() -> int` is not.
+- Where two branches yield instances of one generic type, they agree on the instance whose
+  covariant arguments are their arguments' agreement: `if c then Some(dog) else Some(cat)` is an
+  `Option[Animal]`.
+
+The checker verifies each declared parameter's positions:
+
+- A `+T` may appear where a value is read out: a method's result, an immutable field (every field
+  of a `data` type, a `val` or plain parameter of a class), the covariant arguments of a superclass
+  or trait the type conforms to.
+- A `-T` may appear where a value is passed in: a method's parameter.
+- A mutable field is both, so neither may appear in a `var`.
+- A function type's parameters flip the position and its result keeps it; an argument of another
+  generic type takes the position as that type's parameter's variance turns it, and an invariant
+  parameter's argument is a position where neither may appear. So a `+T` may appear in a method
+  parameter `f: (T) -> int`, and a `-T` in a result `() -> (T) -> unit`.
+- Private members are checked like public ones: an instance seen through a wider type still runs
+  them.
+- The traits a `data` type's `impl`s make it conform to are parents, like a class's. The methods an
+  `impl` adds to a `data` type are not positions: they receive the value as whichever instance of
+  the type it is seen as, and data is immutable.
+
+An error names the parameter, its variance and the position: a `+T` in the parameter `x` of `put`
+is reported as a covariant type parameter appearing in a contravariant position.
 
 Use-site variance (wildcards, existentials) is not part of Avin.
 

@@ -152,8 +152,9 @@ at offset 56: the number of the type's ancestors and their records' addresses. A
 are its superclasses and every trait it and they conform to, with their type arguments as it sees
 them; a tuple's are the tuple types its parts' ancestors make, one combination at a time. A type
 pattern loads the object's descriptor and its record: for a type nothing else can be (a built-in, a
-final class, a `data` type, a tuple of such), one comparison with the target's record; for an open
-class, a trait or a tuple with a part of one, a call of the runtime's `avin_rt_conforms`, which
+final class, a `data` type, a tuple of such, each with only invariant parameters), one comparison
+with the target's record; for an open class, a trait, an instance of a type with a covariant or
+contravariant parameter, or a tuple with a part of one, a call of the runtime's `avin_rt_conforms`, which
 scans the record's ancestors, so the test costs the number of ancestors. A generic instance is its
 own type with its own record, so `Box[int]` and `Box[string]` differ by address. Strings are made by
 the runtime as well as written as literals, so a string's descriptor names no record, and a null
@@ -161,6 +162,28 @@ record is the mark of a string. Closures and the boxes of captured variables sha
 type pattern names. A type pattern on a value whose static type already conforms to the target tests
 nothing, and on a value of another value type (possible only in a copy of generic code) never
 matches.
+
+The supertypes an instance has through **variance** are open-ended (`List[Dog]` is a `List[Animal]`
+and a `List[Any]`), so a record does not list them all. Lowering notes each record a type pattern
+tests through `avin_rt_conforms`; once every function is lowered, each record gains those tested
+records whose types its own conforms to by variance, by the checker's rule (`view_as`). A test
+still costs one scan of one record.
+
+A covariant view needs no conversion, and stays sound under monomorphization, because variance
+applies only between reference type arguments. Every field and every part of a field whose type
+mentions a type argument is then a reference (the argument itself, or a tuple, function, `data`
+value or object built from it), so `Box[Dog]` and `Box[Animal]` have the same layout and the same
+method-table shape, and code of either instance reads the other's objects correctly. A call through
+a method table runs the code of the object's own instance: a `Box[Dog]` seen as a `Box[Animal]`
+runs `Box[Dog]`'s method, whose results are `Dog`s and so `Animal`s, and whose parameters, a
+covariant parameter never being one, take what the view passes. A direct call (a final class's
+method, an `impl`'s method of a `data` type) runs the code of the static instance, `Box[Animal]`'s,
+on the `Box[Dog]` object: the layouts agree, and that code treats every value as the wider type the
+view promises, so anything reified it does (a type pattern on `T`, a new `Box[T]`) is done at the
+view's types, which the caller expects. The declaration check is what keeps both paths sound: a `+T`
+never reaches a parameter or a mutable field, so neither code can store a `Cat` where a `Dog`
+instance's field expects a `Dog`, and never reaches an invariant argument, so neither code can hand
+out an invariant `Cell[T]` that would let one be stored later.
 
 An `object` is an instance of a class of its own, kept apart from its companion class's: its
 constructor and methods are separate functions, and its layout and descriptor are its own. Each
