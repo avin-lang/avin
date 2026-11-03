@@ -3582,6 +3582,7 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Break(value) -> break_expr(c, e, value)
     Continue -> continue_expr(c, e)
     Return(value) -> return_expr(c, e, value)
+    Propagate(value) -> propagate_expr(c, e, value)
     Match(subject, arms) -> match_expr(c, e, subject, arms, expected, used)
     Is(value, pattern, negated) -> is_expr(c, e, value, pattern, negated)
     Lambda(params, body) -> lambda_expr(c, e, params, body, expected, false)
@@ -4954,6 +4955,95 @@ private return_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
             else c.note(unit, e.span, s"`${symbol.name}` uses `return`, so it needs a declared result type")
             if value is Some(v) then typed = Some(check_expr(c, v, None))
     TExpr(e.span, Nothing, Return(typed))
+
+/** The core library's data type `name`, by its index, unless a program has none. */
+private core_data(c: *Checker, name: string) -> Option[usize]
+    for i in 0..<c.data.len()
+        if c.data[i].module_name == "avin" && c.data[i].name == name then return Some(i)
+    None
+
+/** The position of the variant `name` among the variants of the data type `d`. */
+private variant_index(c: *Checker, d: usize, name: string) -> usize
+    for i in 0..<c.data[d].variants.len()
+        if c.data[d].variants[i].name == name then return i
+    0
+
+// `value?` takes an `Option` or a `Result` apart: a `Some` or an `Ok` yields its value, and a `None`
+// or an `Err` returns from the enclosing function, which must yield an `Option` or a `Result` with an
+// error type the failure's conforms to. It checks as the `match` it means, whose failure arm makes a
+// fresh `None` or an `Err` of the function's own result type, so the error is passed on unchanged.
+private propagate_expr(c: *Checker, e: &Expr, value: &Expr) -> &TExpr
+    val unit = unit_of(c)
+    val s = check_expr(c, value, None)
+    val ty = zonk(c, s.ty)
+    if *ty is ErrorType then return TExpr(e.span, ErrorType, UnitConst)
+    val option = core_data(c, "Option")
+    val result = core_data(c, "Result")
+    var is_option = false
+    var args: Buf[&Type] = buf()
+    var d = 0usize
+    *ty match
+        Data(id, _, xs) ->
+            val is_result = result match
+                Some(r) -> id == r
+                None -> false
+            if option is Some(o) && id == o then is_option = true
+            elif !is_result
+                c.note(unit, value.span, s"`?` takes apart an Option or a Result, not ${type_name(ty)}")
+                return TExpr(e.span, ErrorType, UnitConst)
+            d = id
+            args = xs
+        _ ->
+            c.note(unit, value.span, s"`?` takes apart an Option or a Result, not ${type_name(ty)}")
+            return TExpr(e.span, ErrorType, UnitConst)
+    val symbol = c.symbols[c.current]
+    if symbol.delayed
+        c.note(unit, e.span, "`?` cannot return from a delayed argument, which is evaluated where its parameter is read")
+        return TExpr(e.span, ErrorType, UnitConst)
+    if symbol.constructor
+        c.note(unit, e.span, "`?` cannot return from a class body, which runs to its end to make the object")
+        return TExpr(e.span, ErrorType, UnitConst)
+    val declared = symbol.result match
+        Some(r) -> zonk(c, r)
+        None ->
+            if symbol.lambda then c.note(unit, e.span, "this lambda uses `?`, so its result type must be known where it is written, as in `val f: (string) -> Option[int] = …`")
+            else c.note(unit, e.span, s"`${symbol.name}` uses `?`, so it needs a declared result type")
+            return TExpr(e.span, ErrorType, UnitConst)
+    if *declared is ErrorType then return TExpr(e.span, ErrorType, UnitConst)
+    val wanted = if is_option then "an Option" else "a Result"
+    var failure: Buf[&Type] = buf()
+    *declared match
+        Data(id, _, xs) if id == d -> failure = xs
+        _ ->
+            c.note(unit, e.span, s"`?` on ${type_name(ty)} returns ${if is_option then "`None`" else "the `Err`"} from ${described(symbol)}, which yields ${type_name(declared)}, not $wanted")
+            return TExpr(e.span, ErrorType, UnitConst)
+    // The value's own local and the failure's are hidden from the program's names.
+    val held = c.body.locals.len()
+    c.body.locals.push(TLocal("?value", args[0], false, c.current))
+    var success: Buf[&TPattern] = buf()
+    success.push(TPattern(e.span, args[0], PBind(held)))
+    var arms: Buf[TArm] = buf()
+    if is_option
+        arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "Some"), success)), None, TExpr(e.span, args[0], Local(held))))
+        val none = TExpr(e.span, declared, Construct(variant_index(c, d, "None"), buf()))
+        arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "None"), buf())), None, TExpr(e.span, Nothing, Return(Some(none)))))
+        return TExpr(e.span, args[0], Match(s, arms))
+    val error = zonk(c, args[1])
+    val passed = zonk(c, failure[1])
+    if !fits(c, error, passed)
+        c.note(unit, e.span, s"`?` passes on an error of ${type_name(error)}, but ${described(symbol)} yields errors of ${type_name(passed)}; convert it first with `mapErr`")
+        return TExpr(e.span, ErrorType, UnitConst)
+    val caught = c.body.locals.len()
+    c.body.locals.push(TLocal("?error", error, false, c.current))
+    var failed: Buf[&TPattern] = buf()
+    failed.push(TPattern(e.span, error, PBind(caught)))
+    var fields: Buf[&TExpr] = buf()
+    val read = TExpr(e.span, error, Local(caught))
+    fields.push(if *passed is AnyType then to_any(c, read) else read)
+    val err = TExpr(e.span, declared, Construct(variant_index(c, d, "Err"), fields))
+    arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "Ok"), success)), None, TExpr(e.span, args[0], Local(held))))
+    arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "Err"), failed)), None, TExpr(e.span, Nothing, Return(Some(err)))))
+    TExpr(e.span, args[0], Match(s, arms))
 
 // A call to a generic function solves for its type arguments: they may be written (`f[int](x)`),
 // and otherwise each starts as an unknown that the expected result type and the arguments decide.
