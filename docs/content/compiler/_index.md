@@ -101,7 +101,10 @@ not use is a null word. A call through a trait-typed receiver loads the descript
 the trait method's fixed position, so it costs what a virtual call costs: no search, no hashing, no
 second table. The price is table size, since positions are global, and tables are small constant
 data. At each trait position the class's table holds its own override, else what its superclass's
-table holds under that name, else the trait's default body. A trait-typed value is a plain
+table holds under that name, else the trait's default body. A trait's `val` takes a position like a
+method of no parameters; the checker fills it, in each class or data type that supplies it with a
+field, with a generated method that loads the field, so a read through the trait is a virtual call
+and a read through the class is the field load. A trait-typed value is a plain
 reference to the object, so an upcast from a class to a trait, and from a trait to one it requires,
 is free; a call through a final class's type, even of a method it inherits from a trait, is direct.
 A trait has a constructor symbol, so instantiating one is reported as for an abstract class, and it

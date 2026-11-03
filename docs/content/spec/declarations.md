@@ -362,6 +362,33 @@ val n: Named = t
 - Inside a default body, `self` has the trait's type, so its calls dispatch as any trait-typed
   call does.
 
+```text
+trait Named
+    val name: string
+    greet() -> string = s"hello, $name"
+
+class Person(val name: string, age: int): Named
+class Counter(var name: string): Named
+data Book(name: string, pages: int)
+impl Named for Book
+```
+
+- **An abstract `val`** is written `val name: T` with no value, and only a trait declares one. A
+  trait's `val` is public, is never `var`, and shares its name with no other member of the trait.
+- **A conforming type supplies it with a public field of that name**: a class parameter marked `val`
+  or `var`, a `val` or `var` of the class body, a field inherited from the superclass, or, through an
+  impl, a field of a `data` type with one variant. The field's type is the `val`'s or, where that is a
+  class or a trait, one conforming to it. A `var` field supplies a `val`: the class assigns it, and a
+  read through the trait sees the current value. A method does not supply a `val`, and neither does a
+  private field. A class that is not abstract supplies every `val` of its traits; an abstract class
+  may leave one to a subclass.
+- **It is read with field syntax**, `x.name`, and by bare name inside the trait's default bodies.
+  Read through a class type it is the field itself; read through the trait it reaches the field of
+  the value's own type through its method table. It is never assigned through the trait, and
+  `x.name()` calls the value it holds, which only a function-typed `val` can be.
+- An abstract class's body cannot read a trait's `val` it leaves to a subclass: it runs before the
+  subclass's fields are set.
+
 ## impl
 
 `impl Trait for Type` makes an existing type conform to a trait after the fact, including the
@@ -419,6 +446,19 @@ object Config
 
 An `object` is a singleton value. An `object` with the same name as a class in the same module is its
 companion and may access its private members. `object`s may extend a class and traits.
+
+```text
+object Default: Account("none", 0), Display
+    override describe() -> string = "default " + super.describe()
+    override display(out: Writer, spec: FormatSpec) = out.write(describe())
+```
+
+An object extending a class is made as a subclass's instance is: the superclass's constructor runs
+first with the arguments written after `:`, then the object's own body. The object overrides methods
+with `override`, implements every abstract method it inherits (it cannot be left abstract), and
+passes wherever the superclass is expected. The superclass is `open` or `abstract`, as for any
+subclass. What the superclass's arguments and constructor read counts toward the order in which
+module values and objects are made.
 
 An object's body is written like a class body with no parameters: its fields and statements run
 once, before `main`, to make the one instance, and its methods have the same implicit receiver and

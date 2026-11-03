@@ -67,6 +67,13 @@ a decision changes, this page and the chapter change together.
 - A trait-typed call reaches the implementation through the class's method table, at a position the
   trait has in every conforming class's table (the whole program is known), so it costs one virtual
   call.
+- A trait's abstract `val name: T` is supplied by a public field of that name of each conforming
+  type: a class's `val` or `var` field, own or inherited, or a one-variant `data` type's field through
+  an impl. A `var` field satisfies a `val`; a method or a private field does not. Read through the
+  trait it is a method table entry the compiler fills with a method that loads the field; read
+  through a class type it is the field. It is never assigned through the trait.
+- An `object` may extend an `open` or `abstract` class, constructed from the top down as a subclass
+  is, overriding its methods and conforming to it; it implements every abstract member it inherits.
 - An `impl` adds methods and conformances, never state. Its methods are a class's or an object's own
   methods; for a `data` or built-in type they are called directly. Inside them the receiver is
   implicit, as in a class, with a one-variant `data` type's fields in scope by bare name.
