@@ -109,6 +109,13 @@ a decision changes, this page and the chapter change together.
   name is delayed; an overload that takes it strictly evaluates it once, at the call.
 - An overloaded function used as a value needs an expected function type, which chooses the
   overload. `main` cannot be overloaded.
+- Methods overload by the same rules, among the methods of a name the receiver's static type has,
+  inherited ones included. A method is identified by its name and parameter types: an override, a
+  trait implementation and a method table position each match by both, so a subclass overrides one
+  overload and inherits the others. `override` matching no inherited parameter types is an error.
+- A clause is a line of the function's name and arguments followed by `=`, a guard or indented
+  guards; a line of the same name followed by `->` or nothing is another declaration, so two
+  abstract overloads may follow each other.
 - A class's parameter list is its one constructor. Class parameters are private immutable fields
   (`val` makes one public and read-only, `var` public and mutable), and the statements in the class
   body are the constructor's code, run top to bottom when an instance is created.

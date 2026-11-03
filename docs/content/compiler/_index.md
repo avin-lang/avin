@@ -81,7 +81,10 @@ abstract methods are never compiled.
 
 Each class has a method table with one slot per method a subclass may override: its superclass's
 slots in the same positions, each holding the class's override where it has one, then one for each
-overridable method the class adds. The table is constant data placed directly before the class's
+overridable method the class adds. A method is identified by its name and parameter types, so
+each overload of a name has a slot of its own, and an override takes the slot of the inherited
+method with its parameter types; each overload is also a symbol of its own, named by its parameter
+types. The table is constant data placed directly before the class's
 descriptor, in one global, so slot `s` is the word `8(s + 1)` bytes before the object's
 descriptor; the descriptor itself keeps its layout and the runtime never reads the table. Each instance of a generic class has its own descriptor and table, filled with the method
 instances for its type arguments. A call through a receiver whose static type is an `open` or
