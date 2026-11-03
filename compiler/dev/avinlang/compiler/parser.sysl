@@ -60,7 +60,12 @@ impl TokenStream for Parser
         // A dedent closes an expression's indented body. The next line may begin with `-` or `(`,
         // which must not attach to the closed expression as an infix or postfix operator.
         if self.toks.position > 0 && self.toks.items[self.toks.position - 1].value == Dedent then return None
-        self.toks.peek()
+        // A name right after a complete operand is an infix method call. Inside brackets, where a
+        // line break makes no token, the name may be on a later line; `infix_call` rejects that.
+        val next = self.toks.peek()
+        if next is Some(t)
+            if t.value == Word && self.toks.position > 0 && !is_keyword(self.spelling(t)) then return Some(Spanned(InfixName, t.span))
+        next
     take(*self) -> Option[Spanned[Token]] = self.toks.advance()
 
 parser_for(src: Source) -> Parser
@@ -96,6 +101,7 @@ private binding(t: Spanned[Token]) -> u16
         AndOp -> 20
         CompareOp -> 30
         IsKeyword -> 30
+        InfixName -> InfixBinding
         RangeOp -> 34
         BitOrOp -> 36
         BitXorOp -> 37
@@ -106,6 +112,16 @@ private binding(t: Spanned[Token]) -> u16
         _ -> 0
 
 private const PrefixBinding: u16 = 60
+
+// An infix method call binds more loosely than ranges and every arithmetic operator, and more
+// tightly than comparisons.
+private const InfixBinding: u16 = 32
+
+// Words that keep their meaning after an operand, and so never name a method called infix.
+is_keyword(word: string) -> bool
+    for k in ["abstract", "as", "break", "class", "continue", "data", "derives", "do", "elif", "else", "end", "false", "for", "if", "impl", "import", "is", "match", "module", "not", "object", "open", "override", "private", "return", "self", "super", "then", "trait", "true", "val", "var", "while"]
+        if word == k then return true
+    false
 
 // An interpolated string's holes are expressions in the file, each parsed on its own from the
 // source with everything outside the hole blanked, so its spans point into the file.
@@ -279,10 +295,34 @@ private infix(left: &Expr, t: Spanned[Token], p: *Parser) -> &Expr
             val pattern = parse_pattern(p)
             Expr(left.span.to(pattern.span), Is(left, pattern, negated))
         MatchKeyword -> match_expression(p, left)
+        InfixName -> infix_call(left, t, op, p)
         Postfix -> postfix(left, t, op, p)
         _ ->
             val right = expression(p, binding(t))
             Expr(left.span.to(right.span), Binary(binary_op(op), left, right, t.span))
+
+// `a max b` calls `max` on `a` with `b`. The argument follows on the same line, or, when the line
+// ends with the method's name, as an indented block on the next. There is no postfix form, so a name
+// with nothing that can start an argument after it is an error.
+private infix_call(left: &Expr, t: Spanned[Token], name: string, p: *Parser) -> &Expr
+    for b in p.src.text(Span(left.span.end, t.span.start))
+        if b == u8('\n')
+            p.report.add(error(t.span, s"an infix call starts on its receiver's line: end that line with `$name` to put the argument on the next"))
+            break
+    if !p.at_kind(Indent) && (p.at_line_end() || argument_cannot_start(p))
+        val receiver = from_utf8_unchecked(p.src.text(left.span))
+        p.report.add(error(t.span, s"`$name` has no argument: an infix call takes one, and there is no postfix form; a method without arguments is called `$receiver.$name()`"))
+        return Expr(left.span.to(t.span), Invalid)
+    val arg = if p.at_kind(Indent) then parse_body(p, false) else expression(p, InfixBinding)
+    Expr(left.span.to(arg.span), InfixCall(left, name, t.span, arg))
+
+// Whether the next token only continues an expression, as `==` or `then` does, and cannot begin one.
+private argument_cannot_start(p: *Parser) -> bool
+    p.toks.peek() match
+        Some(next) -> next.value match
+            CompareOp | MultiplyOp | AssignOp | AndOp | OrOp | BitOrOp | BitXorOp | BitAndOp | RangeOp | IsKeyword | MatchKeyword -> true
+            _ -> p.at("then") || p.at("do")
+        None -> true
 
 private postfix(left: &Expr, t: Spanned[Token], op: string, p: *Parser) -> &Expr
     if op == "++" || op == "--" then return Expr(left.span.to(t.span), Update(left, op == "++", true, t.span))

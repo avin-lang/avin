@@ -3,6 +3,7 @@ module dev.avinlang.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
+import sysl.text.from_utf8_unchecked
 
 /** A source file in a program, with the report its diagnostics go to. */
 struct SourceUnit
@@ -2680,6 +2681,7 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     TypeApply(target, types) -> type_apply(c, e, target, types, expected)
     Member(target, name) -> member_expr(c, e, target, name, expected)
     Call(callee, args) -> call_expr(c, e.span, callee, args, expected)
+    InfixCall(target, name, name_span, arg) -> infix_call(c, e.span, target, name, name_span, arg, expected)
     Block(items, discard) -> block_expr(c, e, items, discard, expected, used)
     Binding(name, declared, value, mutable) -> binding_expr(c, e, name, declared, value, mutable)
     Destructure(pattern, declared, value, mutable) -> destructure_expr(c, e, pattern, declared, value, mutable)
@@ -3951,7 +3953,7 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
     if callee.kind is TypeApply(inner, types)
         explicit = Some(types)
         named = inner
-    if named.kind is Member(target, member) then return member_call(c, at, callee, named.span, target, member, args, explicit, expected)
+    if named.kind is Member(target, member) then return member_call(c, at, callee, named.span, target, member, args, explicit, expected, false)
     val name = named.kind match
         Name(n) -> n
         _ -> return value_call(c, at, callee, args)
@@ -4246,7 +4248,7 @@ private overload_list(c: *Checker, ids: Buf[usize]) -> string
 
 // `object.name(args)`: a method of the object's class, or a field holding a function, which is
 // called as a value.
-private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, target: &Expr, name: string, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, target: &Expr, name: string, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], infix: bool) -> &TExpr
     val unit = unit_of(c)
     if target.kind is Name("super")
         if lookup_local(c, "super") is None && enclosing_class(c) is Some(_)
@@ -4254,7 +4256,9 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
     val object = check_expr(c, target, None)
     if *zonk(c, object.ty) is Class(k, _, _)
         val ms = methods_named(c, k, name)
-        if ms.len() > 0 then return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
+        if ms.len() > 0
+            if infix && !takes_one_argument(c, ms) then return infix_arity_error(c, at, name_span, target, name, ms, args)
+            return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
         if method_named(c, k, name) is Some(m)
             c.note(unit, name_span, s"`$name` is private to `${c.classes[c.symbols[m].owner_class.unwrap()].name}`")
             for a in args
@@ -4268,12 +4272,57 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
             for a in args
                 check_statement(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
+        if infix && !takes_one_argument(c, ms) then return infix_arity_error(c, at, name_span, target, name, ms, args)
         return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
+    if infix
+        if !(*zonk(c, object.ty) is ErrorType)
+            c.note(unit, name_span, s"`${type_name(zonk(c, object.ty))}` has no method `$name` to call infix")
+        for a in args
+            check_statement(c, a.value)
+        return TExpr(at, ErrorType, UnitConst)
     if explicit is Some(_)
         for a in args
             check_statement(c, a.value)
         return unsupported(c, callee, "type arguments on a call of a field")
     call_checked(c, at, name_span, member_of(c, callee, object, name, None), args)
+
+// `a m b` is the call `a.m(b)`. It names a method of `a`'s type: a field holding a function and a
+// function `m` of two parameters are not called infix.
+private infix_call(c: *Checker, at: Span, target: &Expr, name: string, name_span: Span, arg: &Expr, expected: Option[&Type]) -> &TExpr
+    var args: Buf[Argument] = buf()
+    args.push(Argument(arg.span, None, arg))
+    val callee = Expr(target.span.to(name_span), Member(target, name))
+    member_call(c, at, callee, name_span, target, name, args, None, expected, true)
+
+// Whether one of the methods `ms` can be called with exactly one argument.
+private takes_one_argument(c: *Checker, ms: Buf[usize]) -> bool
+    for m in ms
+        val s = c.symbols[m]
+        var required = 0usize
+        for i in 1..<s.params.len()
+            if i >= s.defaults.len() || s.defaults[i] is None then required += 1
+        if required <= 1 && s.params.len() >= 2 then return true
+    false
+
+// An infix call of a method that takes some other number of arguments. A tuple written as the
+// argument is spelled back as the arguments of a dotted call.
+private infix_arity_error(c: *Checker, at: Span, name_span: Span, target: &Expr, name: string, ms: Buf[usize], args: Buf[Argument]) -> &TExpr
+    val unit = unit_of(c)
+    val count = c.symbols[ms[0]].params.len() - 1
+    val src = c.units[unit].src
+    val receiver = from_utf8_unchecked(src.text(target.span))
+    var inner = "…"
+    if args[0].value.kind is Tuple(items)
+        inner = ""
+        for i in 0..<items.len()
+            if i > 0 then inner = inner + ", "
+            inner = inner + from_utf8_unchecked(src.text(items[i].span))
+    elif count == 0 then inner = ""
+    val counted = if count == 1 then "1 argument" else s"$count arguments"
+    c.note(unit, name_span, s"`$name` takes $counted, and only a method of one argument is called infix; write `$receiver.$name($inner)`")
+    for a in args
+        check_statement(c, a.value)
+    TExpr(at, ErrorType, UnitConst)
 
 // `super.name(args)` calls the superclass's implementation of a method on `self`, directly, even where
 // the class overrides it.

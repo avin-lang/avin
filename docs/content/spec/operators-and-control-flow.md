@@ -47,9 +47,30 @@ the method's author does not mark it. `a m (b, c)` passes the tuple `(b, c)` as 
 
 An infix call groups to the left and binds more loosely than the arithmetic, bitwise, shift, cons and
 range operators, and more tightly than comparisons, `is`, `&&` and `||`: `a max b + 1` is
-`a max (b + 1)`, and `xs contains x && ok` is `(xs contains x) && ok`. It stays on one line unless
-the line ends with the method's name. There is no postfix form: `xs size` is an error, written
-`xs.size()`.
+`a max (b + 1)`, `a max b max c` is `(a max b) max c`, and `xs contains x && ok` is
+`(xs contains x) && ok`. There is no postfix form: `xs size` is an error, written `xs.size()`.
+
+An infix call stays on one line. A line that ends with the method's name continues it: the argument
+is the indented block on the lines that follow.
+
+```text
+val widest = current max
+    measure(header) + padding
+```
+
+A name that starts a line never continues the line above, inside brackets too: end the line with the
+name instead.
+
+The call is resolved exactly as `a.m(b)` is: overloads are chosen by the argument's type, a trait or
+`open` method dispatches on the receiver's class, an `impl` adds methods that can be called this way,
+and a generic method's type arguments are inferred. The name must be a method of the receiver's type
+that can take one argument. A field holding a function is not called infix, and neither is a
+function `m(a, b)` declared outside the type: `a m b` never means `m(a, b)`. A method of two
+parameters is not called infix even with a tuple after its name: `a put (1, 2)` against
+`put(i: int, j: int)` is an error that says to write `a.put(1, 2)`.
+
+A word that keeps its meaning after an operand, such as `then`, `do`, `else`, `if`, `is` or
+`match`, is never read as a method's name, so `if a max b then c` and `n is int` read as before.
 
 ## Comparison chains
 

@@ -41,6 +41,10 @@ a decision changes, this page and the chapter change together.
 - The receiver is implicit: members are in scope by their bare names, and `self` names the instance.
 - Any method taking one argument can be called infix, `a max b` for `a.max(b)`, at the caller's
   choice: there is no annotation that permits or forbids it. There is no postfix form.
+- An infix call names a method of its receiver's type, resolved as the dotted call is; it never
+  falls back to a function `m(a, b)`, and a method of two parameters is not called infix with a
+  tuple. It stays on one line unless the line ends with the method's name, and then the argument is
+  the indented block below. Keywords such as `then`, `do`, `is` and `match` never name the method.
 - A subclass's constructor evaluates the superclass's arguments, runs the superclass's body on the
   object, then stores its own parameters and runs its own body. The superclass's arguments cannot
   call a method or use `self`; a parameter's name in them reads the argument.
