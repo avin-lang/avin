@@ -3,6 +3,8 @@ module avin.rt
 import sh.sysl.gc
 import sysl.env
 import sysl.raw.ptr_cast
+import sysl.sync.*
+import sysl.threads.{Condvar, Mutex, SleepLock}
 
 // The collected heap. Objects are allocated by compiled code through `avin_rt_alloc` and found by
 // the collector through the shadow stacks: every thread has a context, which compiled code receives
@@ -10,6 +12,14 @@ import sysl.raw.ptr_cast
 // its thread's context while it runs, so the roots are exact and nothing is ever scanned. A
 // collection walks the frames of every attached context, and the frames of module-level values,
 // which belong to no thread.
+//
+// Threads share the heap. One lock, `heap_lock`, serializes allocation, collection and changes to
+// the list of contexts. A collection stops the world: the collecting thread raises `requested`,
+// waits until every other attached context is safe, collects, lowers the flag and wakes the others.
+// A context is safe when its thread is parked at a safepoint or inside a region that touches no
+// reference, such as a wait for the heap lock or a blocking call. Compiled code polls `requested` at
+// the entry of every function that calls and on every back edge of its control flow, and calls
+// `avin_rt_safepoint` only when it is raised; it is never raised while one context is attached.
 //
 // The heap is one block reserved at startup, `AVIN_HEAP_LIMIT` bytes or 8 GiB. The operating system
 // commits its pages only as they are first touched, so the reservation costs nothing until it is
@@ -28,6 +38,26 @@ struct Context
     top: *Frame
     /** The next attached context. */
     next: *Context
+    /** `Running` while the thread may read or write references; `Safe` while its frames hold every
+     * reference it still needs and it touches none until it is running again. */
+    state: Atomic[u32]
+
+/** A context's state while its thread may touch references. */
+const Running: u32 = 0
+/** A context's state while its thread is stopped for a collection or in a region that touches no
+ * reference. */
+const Safe: u32 = 1
+
+/** A context no thread is running yet: safe, with an empty stack. */
+new_context() -> Context = Context(null, null, Atomic(Safe))
+
+// The storage of a context the runtime made for a thread, which keeps itself alive until the thread
+// detaches.
+private struct ThreadContext
+    context: Context
+    me: Option[&ThreadContext]
+
+@assert(offsetof(ThreadContext, context) == 0, "a thread's context is the start of its storage")
 
 /** A variant's layout, emitted by the compiler as constant data. It begins with the collector's
  * `Kind`, whose `trace` is `avin_rt_trace` and whose other hooks are null, so the kind the collector
@@ -67,7 +97,7 @@ private heap_limit() -> usize
         n = n * 10 + usize(b - u8('0'))
     if n < 4096 then 4096 else n
 
-var main_context: Context = Context(null, null)
+var main_context: Context = new_context()
 /** Every attached context, whose frames are the roots of a collection. */
 var contexts: *Context = null
 var block: []u8 = [0u8; heap_limit()]
@@ -116,15 +146,112 @@ register_globals(f: *Frame)
     f.prev = globals
     globals = f
 
-/** Makes `c`'s frames roots of every collection from now on. A thread attaches its context before it
- * runs compiled code. */
+/** Raised while a collection waits for the other threads to stop. Compiled code reads it at every
+ * safepoint poll and calls `avin_rt_safepoint` when it is not zero. */
+@export("avin_rt_requested")
+var requested: Atomic[u32] = Atomic(0)
+
+/** Held by the thread that allocates, collects, attaches or detaches: the collector's heap, the list
+ * of contexts and the collection budget are touched only under it. A collecting thread holds it for
+ * the whole stop. */
+var heap_lock: SleepLock = SleepLock.new()
+
+// The handshake of a stop. The collector sleeps on `parked` until every other context is safe;
+// stopped threads sleep on `resumed` until `requested` is lowered. Both are notified under `world`,
+// so no wake is lost between a check and a wait.
+private var world: Mutex[u32] = Mutex.new(0)
+private var parked: Condvar = Condvar.new()
+private var resumed: Condvar = Condvar.new()
+
+/** How many collections have stopped other threads, which a collection with one context attached
+ * never does. */
+var stops: usize = 0
+
+/** Marks `c` safe: its frames hold every reference its thread still needs, and the thread touches no
+ * reference until it calls `leave_safe`. A blocking call is made between the two, so a thread that
+ * waits does not hold up a collection. */
+@export("avin_rt_enter_safe")
+enter_safe(c: *Context)
+    c.state.store(Safe)
+    // The store and the load are both sequentially consistent, as the collector's raising of the
+    // flag and its reading of the states are: either this thread sees the flag and wakes the
+    // collector, or the collector sees this context safe.
+    if requested.load() != 0
+        world.lock_raw()
+        parked.notify_all()
+        world.unlock_raw()
+
+/** Marks `c` running again, first waiting until any collection in progress has finished. */
+@export("avin_rt_leave_safe")
+leave_safe(c: *Context)
+    loop
+        c.state.store(Running)
+        if requested.load() == 0 then return
+        // A collection started while this thread was safe: step back, and wait for it.
+        c.state.store(Safe)
+        world.lock_raw()
+        parked.notify_all()
+        while requested.load() != 0
+            resumed.wait(&world)
+        world.unlock_raw()
+
+/** Parks the calling thread until the collection that raised `requested` has finished. Compiled code
+ * calls it from a poll, with its frames consistent. */
+@export("avin_rt_safepoint")
+safepoint(c: *Context)
+    enter_safe(c)
+    leave_safe(c)
+
+// Takes the heap lock for `c`'s thread, safe while it waits, since the holder may be collecting.
+// Once it holds the lock no collection is in progress, so `leave_safe` returns at once.
+private lock_heap(c: *Context)
+    if heap_lock.try_lock() then return
+    enter_safe(c)
+    heap_lock.lock()
+    leave_safe(c)
+
+private others_safe(c: *Context) -> bool
+    var o = contexts
+    while o != null
+        if o != c && o.state.load() != Safe then return false
+        o = o.next
+    true
+
+/** Stops every attached thread but `c`'s, under the heap lock, and answers whether there was any.
+ * `resume_others` lets them run again. */
+stop_others(c: *Context) -> bool
+    if contexts == null || contexts == c && c.next == null then return false
+    requested.store(1)
+    world.lock_raw()
+    while !others_safe(c)
+        parked.wait(&world)
+    world.unlock_raw()
+    stops += 1
+    true
+
+resume_others()
+    world.lock_raw()
+    requested.store(0)
+    resumed.notify_all()
+    world.unlock_raw()
+
+/** Makes `c`'s frames roots of every collection from now on. A context is attached in the state it
+ * has; a thread's own is marked running after it is attached. */
 attach(c: *Context)
+    heap_lock.lock()
     c.next = contexts
     contexts = c
+    heap_lock.unlock()
 
 /** Stops treating `c`'s frames as roots. A thread detaches its context when it has finished running
- * compiled code, with no frame left on it. */
+ * compiled code, with no frame left on it; the context is safe from then on. */
 detach(c: *Context)
+    enter_safe(c)
+    heap_lock.lock()
+    unlink(c)
+    heap_lock.unlock()
+
+private unlink(c: *Context)
     if contexts == c
         contexts = c.next
         return
@@ -135,18 +262,54 @@ detach(c: *Context)
             return
         p = p.next
 
+/** A context for the calling thread, attached and running, which it passes to the compiled code it
+ * runs. The thread gives it back with `avin_rt_thread_detach` before it finishes. */
+@export("avin_rt_thread_attach")
+thread_attach() -> *Context
+    val t: &ThreadContext = ThreadContext(new_context(), None)
+    t.me = Some(t)
+    val c: *Context = ptr_cast(&*t)
+    // Attached safe, then running once no collection is in progress.
+    attach(c)
+    leave_safe(c)
+    c
+
+/** Detaches `c`, a context `avin_rt_thread_attach` made, and gives back its storage. The thread
+ * calls it last, with no frame left on its stack. */
+@export("avin_rt_thread_detach")
+thread_detach(c: *Context)
+    detach(c)
+    val t: *ThreadContext = ptr_cast(c)
+    t.me = None
+
 // After a collection the next one waits until as much has been allocated as survived, so the heap
 // stays within about twice what is live and collecting costs in proportion to what is allocated.
+// The caller holds the heap lock and every other thread is stopped.
 collect_now()
     gc.collect(&space, &roots)
     since = 0
     val live = gc.live_size(&space)
     budget = if live > Floor then live else Floor
 
-/** The main thread's context, attached, for the program's entry function. */
+// A collection by `c`'s thread, which holds the heap lock: the others are stopped around it.
+private collect_stopped(c: *Context)
+    val stopped = stop_others(c)
+    collect_now()
+    if stopped then resume_others()
+
+/** Collects now, stopping every other attached thread for the collection. `c` is the calling
+ * thread's context, with its frames consistent. */
+@export("avin_rt_collect")
+collect(c: *Context)
+    lock_heap(c)
+    collect_stopped(c)
+    heap_lock.unlock()
+
+/** The main thread's context, attached and running, for the program's entry function. */
 @export("avin_rt_start")
 start() -> *Context
     attach(&main_context)
+    leave_safe(&main_context)
     &main_context
 
 /** A new object laid out by `d`, all zero; its header holds `d`. */
@@ -155,16 +318,19 @@ allocate(ctx: *Context, d: *Descriptor) -> *u8 = allocate_sized(ctx, d, d.size)
 
 /** A new object of `size` bytes, all zero, whose header holds `d`, for an object whose size is not
  * its descriptor's, such as a string, whose bytes follow its length. Allocating may collect, so
- * every reference the caller still needs must be a root. `ctx` is the allocating thread's. */
+ * every reference the caller still needs must be a root; it is also a safepoint, since a thread
+ * waiting for the heap lock is safe. `ctx` is the allocating thread's. */
 allocate_sized(ctx: *Context, d: *Descriptor, size: usize) -> *u8
-    if stress || since >= budget then collect_now()
+    lock_heap(ctx)
+    if stress || since >= budget then collect_stopped(ctx)
     var p = gc.alloc(&space, size, &d.kind)
     if p == null
-        collect_now()
+        collect_stopped(ctx)
         p = gc.alloc(&space, size, &d.kind)
         if p == null
             flush()
             eprints("avin: out of memory: the heap limit is " + block.len.to_string() + " bytes; set AVIN_HEAP_LIMIT to raise it\n")
             trap()
     since += size
+    heap_lock.unlock()
     p
