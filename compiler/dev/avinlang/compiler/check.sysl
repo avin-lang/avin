@@ -56,6 +56,10 @@ struct FunctionSymbol
      * compute its defaults, its parameter types as written, as in `(int, string)`, which tell the
      * overloads apart in the object file; empty otherwise. */
     overload: string
+    /** For a method an `impl` adds to a data type or a built-in type, the type of its receiver,
+     * `self`, with the impl's type parameters as its arguments. Such a method is called directly:
+     * the type has no subclasses. A class's methods, its impls' included, have `owner_class`. */
+    receiver: Option[&Type]
 
 /** A class. Its fields are its parameters, in order, then the fields its body declares; their types
  * name the class's own type parameters as `TypeVar(class_owner(id), i)`. */
@@ -138,6 +142,16 @@ struct DataSymbol
     name: string
     decl: &DataDecl
     variants: Buf[VariantSymbol]
+    /** The methods its impls add, in declaration order; each takes the value as `self`. */
+    methods: Buf[usize]
+    /** For each of `methods`, whether an impl of a trait declares it. */
+    implementing: Buf[bool]
+    /** The traits its impls make it conform to, their type arguments in the type's own parameters. */
+    traits: Buf[&Type]
+    /** Its method table, which every variant's descriptor carries: at each conformed trait's `base`,
+     * the implementation of each of the trait's methods, the type's own method of that name or the
+     * trait's default body. Empty when the type conforms to no trait. */
+    table: Buf[Option[usize]]
 
 /** One constructor of a data type. */
 struct VariantSymbol
@@ -212,6 +226,18 @@ struct GenericScope
     owner: usize
     params: Buf[TypeParam]
 
+/** An `impl` block, resolved. `target` is the type it adds to, with the impl's type parameters as its
+ * arguments, which are the type's own: `owner` owns them, `data_owner` or `class_owner` of the type.
+ * `trait` is the trait it makes the type conform to. An impl found invalid has the error type as its
+ * target, and its methods are not declared. */
+struct ImplSymbol
+    unit: usize
+    module_name: string
+    decl: &ImplDecl
+    target: &Type
+    owner: usize
+    trait_type: Option[&Type]
+
 struct Checker
     units: Buf[SourceUnit]
     symbols: Buf[FunctionSymbol]
@@ -243,6 +269,9 @@ struct Checker
     /** Whether a superclass's constructor arguments are being checked: they run before the class
      * stores its parameters, so a parameter's name reads the argument itself, not its field. */
     super_args: bool
+    impls: Buf[ImplSymbol]
+    /** The methods impls add to built-in types, each with its `receiver`. */
+    builtin_methods: Buf[usize]
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -268,11 +297,13 @@ end Checked
 /** Checks a program. The last unit is the program's own file, which must declare `main`; the units
  * before it (the prelude) are visible to it, and its own declarations shadow theirs. */
 check_program(units: Buf[SourceUnit]) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false, false)
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false, false, buf(), buf())
     // Every type is named before any is used, so a data type may refer to itself or to one
     // declared after it, and functions are declared once every type is known.
     for u in 0..<c.units.len()
         declare_types(&c, u)
+    for u in 0..<c.units.len()
+        declare_impls(&c, u)
     for u in 0..<c.units.len()
         declare_variants(&c, u)
         declare_fields(&c, u)
@@ -282,6 +313,8 @@ check_program(units: Buf[SourceUnit]) -> Checked
     for u in 0..<c.units.len()
         declare_unit(&c, u)
         declare_methods(&c, u)
+    for i in 0..<c.impls.len()
+        declare_impl_methods(&c, i)
     var linked: Buf[bool] = buf()
     for _ in c.classes
         linked.push(false)
@@ -296,6 +329,8 @@ check_program(units: Buf[SourceUnit]) -> Checked
     for id in 0..<c.classes.len()
         settle_inherited_fields(&c, id)
         check_override_results(&c, id)
+    for id in 0..<c.data.len()
+        check_data_implementations(&c, id)
     for g in 0..<c.globals.len()
         settle_global(&c, g)
     val init = initializer(&c, initialization_order(&c))
@@ -363,6 +398,7 @@ private declare_unit(c: *Checker, unit: usize)
                 if set.len() > 1 then mark_overloads(c, set)
             DataItem(_) -> ()
             ClassItem(_) -> ()
+            ImplItem(_) -> ()
             ValueItem(_) -> ()
 
 // Whether a function declared with `symbol` has the same parameter types as one of `others`, so that
@@ -444,7 +480,7 @@ private declare_types(c: *Checker, unit: usize)
             for tp in d.type_params
                 if tp.bounds.len() > 0 then c.note(unit, tp.span, "bounds on type parameters are not implemented")
             c.types.put(d.name, c.data.len())
-            c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf()))
+            c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf(), buf(), buf(), buf(), buf()))
     for item in file.items
         if item is ClassItem(d)
             if d.object then continue
@@ -484,6 +520,122 @@ private declare_types(c: *Checker, unit: usize)
                     continue
             else c.class_types.put(d.name, id)
             c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, companion, None, buf(), buf(), 0))
+
+// Each impl's type and trait, resolved with the impl's type parameters in scope. They are the type's
+// own parameters under the names the impl gives them, so `impl[T] Box[T]` lists them in order. What
+// an impl may hold, and where it may be written, is reported here once: an impl lives in the module
+// of its type or of its trait, and the built-in types belong to the core library's module, the
+// prelude's. A data type's conformances are recorded here; a class's join those its header states
+// when its fields are declared.
+private declare_impls(c: *Checker, unit: usize)
+    val file = c.units[unit].file
+    for item in file.items
+        if item is ImplItem(d) then c.impls.push(resolve_impl(c, unit, file.module_name, d))
+
+private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl) -> ImplSymbol
+    val invalid = ImplSymbol(unit, module_name, d, ErrorType, 0, None)
+    for tp in d.type_params
+        if tp.bounds.len() > 0 then c.note(unit, tp.span, "bounds on type parameters are not implemented")
+        if !(tp.variance is Invariant) then c.note(unit, tp.span, "variance is written on the parameters of a type, not of an impl")
+    for m in d.members
+        m match
+            FieldMember(f) -> c.note(unit, f.span, s"an impl adds methods, not state, so it cannot declare the field `${f.name}`")
+            StatementMember(s) -> c.note(unit, s.span, "an impl's body declares only methods")
+            MethodMember(_, _, _) -> ()
+    val path = d.target.kind match
+        Named(p, _) -> p
+        _ ->
+            c.note(unit, d.target.span, "an impl adds to a data type, a class, an object or a built-in type")
+            return invalid
+    val written = d.target.kind match
+        Named(_, args) -> args
+        _ -> buf()
+    var owner = 0usize
+    var home = ""
+    if c.types.get(path) is Some(id)
+        owner = data_owner(id)
+        home = c.data[id].module_name
+    elif c.class_types.get(path) is Some(id)
+        if is_trait(c, id)
+            c.note(unit, d.target.span, s"`$path` is a trait; an impl adds to a data type, a class, an object or a built-in type")
+            return invalid
+        owner = class_owner(id)
+        home = c.classes[id].module_name
+    elif builtin_type(path) is Some(_) then home = c.units[0].file.module_name
+    else
+        c.note(unit, d.target.span, s"unknown type `$path`")
+        return invalid
+    // The arguments written on the type are the impl's parameters, in order.
+    var in_order = written.len() == d.type_params.len()
+    if in_order
+        for i in 0..<written.len()
+            written[i].kind match
+                Named(n, inner) -> if n != d.type_params[i].name || inner.len() > 0 then in_order = false
+                _ -> in_order = false
+    if !in_order
+        c.note(unit, d.target.span, "the type an impl adds to takes the impl's type parameters, in order, as in `impl[T] Box[T]`")
+        return invalid
+    val outer_generic = c.generic
+    c.generic = Some(GenericScope(owner, d.type_params))
+    val target = resolve_type(c, unit, d.target)
+    var trait_type: Option[&Type] = None
+    var trait_home = ""
+    if d.trait_name is Some(written_trait)
+        val t = resolve_type(c, unit, written_trait)
+        *t match
+            Class(k, _, _) ->
+                if is_trait(c, k)
+                    trait_type = Some(t)
+                    trait_home = c.classes[k].module_name
+                else c.note(unit, written_trait.span, s"`${c.classes[k].name}` is not a trait; an impl names a trait before `for`")
+            ErrorType -> ()
+            _ -> c.note(unit, written_trait.span, s"${type_name(t)} is not a trait; an impl names a trait before `for`")
+    c.generic = outer_generic
+    if *target is ErrorType then return invalid
+    if d.trait_name is Some(_) && trait_type is None then return invalid
+    if module_name != home && (trait_type is None || module_name != trait_home)
+        if trait_type is None then c.note(unit, d.target.span, s"`$path` is declared in another module; an impl adding methods to it belongs in that module")
+        else c.note(unit, d.target.span, s"neither `$path` nor `${type_name(trait_type.unwrap())}` is declared in this module; an impl belongs in the module of its type or of its trait")
+        return invalid
+    if trait_type is Some(t)
+        *target match
+            Data(id, _, _) ->
+                if conforms_directly(c.data[id].traits, t)
+                    c.note(unit, written_trait_span(d), s"`$path` already conforms to `${type_name(t)}`; a conformance is stated once")
+                    return invalid
+                var traits = c.data[id].traits
+                traits.push(t)
+                c.data[id].traits = traits
+            Class(_, _, _) -> ()
+            _ ->
+                c.note(unit, d.target.span, "conforming a built-in type to a trait is not implemented")
+                return invalid
+    ImplSymbol(unit, module_name, d, target, owner, trait_type)
+
+/** Whether `traits` already holds the trait `t` names, with any type arguments. */
+private conforms_directly(traits: Buf[&Type], t: &Type) -> bool
+    val id = *t match
+        Class(k, _, _) -> k
+        _ -> return false
+    for other in traits
+        if *other is Class(o, _, _)
+            if o == id then return true
+    false
+
+private written_trait_span(d: &ImplDecl) -> Span = d.trait_name match
+    Some(t) -> t.span
+    None -> d.target.span
+
+/** Whether the trait `t` declares a method named `name`, or one of the traits it requires does. */
+private trait_declares(c: *Checker, t: usize, name: string, depth: usize) -> bool
+    if depth > c.classes.len() then return false
+    for m in c.classes[t].decl.members
+        if m is MethodMember(f, _, _)
+            if f.name == name then return true
+    for required in c.classes[t].traits
+        if *required is Class(r, _, _)
+            if trait_declares(c, r, name, depth + 1) then return true
+    false
 
 // A variant's fields are resolved with its type's parameters in scope. Variant names share one
 // space within a file, since a variant is named on its own (`Some(1)`, `None`) wherever it is used.
@@ -568,6 +720,18 @@ private declare_fields(c: *Checker, unit: usize)
                 elif d.object then c.note(unit, parent.span, "an object extending a class is not implemented")
                 elif declares_trait then c.note(unit, parent.span, "a trait may require only traits, not a class")
                 else c.note(unit, parent.span, "the superclass comes first after `:`, before the traits")
+        // An impl of a trait for the class is the same conformance as one its header states.
+        for i in 0..<c.impls.len()
+            val block = c.impls[i]
+            val t = block.trait_type match
+                Some(t) -> t
+                None -> continue
+            if *block.target is Class(target, _, _)
+                if target != id then continue
+                if conforms_directly(traits, t)
+                    c.note(block.unit, written_trait_span(block.decl), s"`${d.name}` already conforms to `${type_name(t)}`; a conformance is stated once")
+                    c.impls[i].target = ErrorType
+                else traits.push(t)
         c.classes[id].traits = traits
         var fields: Buf[FieldSymbol] = buf()
         for cp in d.params
@@ -721,7 +885,12 @@ private settle_inherited_fields(c: *Checker, id: usize)
 /** The type `t`, an instance of a class or a trait, as an instance of the class or trait `target`,
  * or `None` when `target` is not among its ancestors: its superclasses and the traits they and it
  * conform to, and the traits those require. */
-ancestor_type(classes: Buf[ClassSymbol], t: &Type, target: usize) -> Option[&Type]
+ancestor_type(classes: Buf[ClassSymbol], data: Buf[DataSymbol], t: &Type, target: usize) -> Option[&Type]
+    // A data type conforms to the traits its impls name, and to those they require.
+    if *t is Data(d, _, xs)
+        for required in data[d].traits
+            if ancestor_type(classes, data, substitute(required, data_owner(d), xs), target) is Some(found) then return Some(found)
+        return None
     val k = *t match
         Class(k, _, _) -> k
         _ -> return None
@@ -730,8 +899,8 @@ ancestor_type(classes: Buf[ClassSymbol], t: &Type, target: usize) -> Option[&Typ
         Class(_, _, a) -> a
         _ -> buf()
     for required in classes[k].traits
-        if ancestor_type(classes, substitute(required, class_owner(k), args), target) is Some(found) then return Some(found)
-    ancestor_type(classes, substitute(classes[k].superclass?, class_owner(k), args), target)
+        if ancestor_type(classes, data, substitute(required, class_owner(k), args), target) is Some(found) then return Some(found)
+    ancestor_type(classes, data, substitute(classes[k].superclass?, class_owner(k), args), target)
 
 /** Whether a field may be used from the code being checked: a public one, or a private one from
  * code of the class that declares it or of its companion. */
@@ -742,7 +911,21 @@ private method_visible(c: *Checker, m: usize) -> bool
     if c.symbols[m].public then return true
     c.symbols[m].owner_class match
         Some(k) -> inside_class(c, k)
-        None -> false
+        None -> c.symbols[m].receiver match
+            Some(t) -> inside_impl(c, t)
+            None -> false
+
+/** Whether the code being checked is a method an impl adds to the data or built-in type of `t`, so it
+ * may call that type's private methods. */
+private inside_impl(c: *Checker, t: &Type) -> bool
+    val here = c.symbols[c.body.root].receiver match
+        Some(r) -> r
+        None -> return false
+    *here match
+        Data(a, _, _) -> *t match
+            Data(b, _, _) -> a == b
+            _ -> false
+        _ -> same_type(here, t)
 
 // The field of class `k` a name reaches from the code being checked: the class's own field first,
 // then the nearest ancestor's, passing over the private fields the code cannot see. When none is
@@ -762,6 +945,17 @@ private field_named(fields: Buf[FieldSymbol], name: string) -> Option[usize]
     for i in 0..<fields.len()
         if fields[i].name == name then return Some(i)
     None
+
+/** A method of a class as it is declared: in the class's body, or in an impl in file `unit` that
+ * names the class's type parameters `type_params`. */
+private struct MethodDecl
+    f: &Function
+    public: bool
+    overrides: bool
+    unit: usize
+    module_name: string
+    type_params: Buf[TypeParam]
+    from_impl: bool
 
 // Each class's constructor, a function named after the class that takes its parameters and yields
 // a new instance, and its methods, each a function whose first parameter is the instance.
@@ -788,7 +982,7 @@ private declare_methods(c: *Checker, unit: usize)
         for _ in d.params
             no_defaults.push(None)
         // An object's constructor makes its one instance before `main` and cannot be called.
-        c.symbols.push(FunctionSymbol(unit, module_name, d.name, decl, types, names, Some(self_type), None, None, buf(), buf(), buf(), false, false, false, no_defaults, None, class_owner(id), d.type_params, Some(id), true, !d.object, ""))
+        c.symbols.push(FunctionSymbol(unit, module_name, d.name, decl, types, names, Some(self_type), None, None, buf(), buf(), buf(), false, false, false, no_defaults, None, class_owner(id), d.type_params, Some(id), true, !d.object, "", None))
         c.states.push(0)
         c.bodies.push(None)
         c.locals.push(buf())
@@ -811,75 +1005,203 @@ private declare_methods(c: *Checker, unit: usize)
                 init_names.push(names[i])
                 init_defaults.push(None)
             c.classes[id].initializer = c.symbols.len()
-            c.symbols.push(FunctionSymbol(unit, module_name, d.name + ".<init>", decl, init_types, init_names, Some(Unit), None, None, buf(), buf(), buf(), false, false, false, init_defaults, None, class_owner(id), d.type_params, Some(id), true, true, ""))
+            c.symbols.push(FunctionSymbol(unit, module_name, d.name + ".<init>", decl, init_types, init_names, Some(Unit), None, None, buf(), buf(), buf(), false, false, false, init_defaults, None, class_owner(id), d.type_params, Some(id), true, true, "", None))
             c.states.push(0)
             c.bodies.push(None)
             c.locals.push(buf())
         var methods: Buf[usize] = buf()
         var overriding: Buf[bool] = buf()
+        // The class's own methods, then those its impls add; a method of an impl of a trait
+        // implements the trait's method without being marked.
+        var declared: Buf[MethodDecl] = buf()
         for m in d.members
-            if m is MethodMember(f, public, overrides)
-                if f.annotations.len() > 0 then c.note(unit, f.name_span, "annotations on methods are not implemented")
-                for p in f.params
-                    if p.default is Some(e) then c.note(unit, e.span, "default arguments of methods are not implemented")
-                if is_trait(c, id)
-                    if !public
-                        c.note(unit, f.name_span, s"`${f.name}` is declared in a trait, so it cannot be private")
-                        continue
-                    if f.type_params.len() > 0
-                        c.note(unit, f.name_span, s"`${f.name}` has type parameters of its own; a trait's method with type parameters is not implemented")
-                        continue
-                    if overrides
-                        c.note(unit, f.name_span, s"`${f.name}` is declared in a trait, which overrides nothing; a trait's method is implemented by a class")
-                        continue
-                var clash: Option[usize] = None
-                for i in 0..<k.fields.len()
-                    if k.fields[i].name == f.name && (i >= k.inherited || k.fields[i].public) then clash = Some(i)
-                if clash is Some(i)
-                    c.note(unit, f.name_span, s"`${f.name}` is already a field of `${c.classes[k.fields[i].owner].name}`")
+            if m is MethodMember(f, public, overrides) then declared.push(MethodDecl(f, public, overrides, unit, module_name, d.type_params, false))
+        for block in c.impls
+            if *block.target is Class(target, _, _)
+                if target != id then continue
+                val trait_id = block.trait_type match
+                    Some(t) -> *t match
+                        Class(t, _, _) -> Some(t)
+                        _ -> None
+                    None -> None
+                for m in block.decl.members
+                    if m is MethodMember(f, public, overrides)
+                        if trait_id is Some(t)
+                            if !trait_declares(c, t, f.name, 0)
+                                c.note(block.unit, f.name_span, s"`${f.name}` is not a method of `${c.classes[t].name}`; an impl of a trait implements the trait's methods, and `impl ${d.name}` adds others")
+                                continue
+                        declared.push(MethodDecl(f, public, overrides || trait_id is Some(_), block.unit, block.module_name, block.decl.type_params, true))
+        for entry in declared
+            val f = entry.f
+            val public = entry.public
+            val overrides = entry.overrides
+            val file_unit = entry.unit
+            if f.annotations.len() > 0 then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
+            for p in f.params
+                if p.default is Some(e) then c.note(file_unit, e.span, "default arguments of methods are not implemented")
+            if is_trait(c, id)
+                if !public
+                    c.note(file_unit, f.name_span, s"`${f.name}` is declared in a trait, so it cannot be private")
                     continue
-                val bodyless = f.body is None && f.clauses.len() == 0
-                if bodyless && !is_abstract_class(c, id)
-                    c.note(unit, f.name_span, s"`${f.name}` has no body; only an abstract class may leave a method without one")
-                if bodyless && !public then c.note(unit, f.name_span, s"`${f.name}` is abstract, so it cannot be private: a subclass implements it")
-                var duplicate = false
-                for other in methods
-                    if c.symbols[other].decl.name == f.name then duplicate = true
-                if duplicate
-                    c.note(unit, f.name_span, s"`${f.name}` is declared more than once in `${d.name}`; overloading methods is not implemented")
+                if f.type_params.len() > 0
+                    c.note(file_unit, f.name_span, s"`${f.name}` has type parameters of its own; a trait's method with type parameters is not implemented")
                     continue
-                var type_params: Buf[TypeParam] = buf()
-                for tp in d.type_params
-                    type_params.push(tp)
-                for tp in f.type_params
-                    type_params.push(tp)
-                var symbol = signature(c, unit, module_name, f, class_owner(id), type_params, true)
-                // The receiver comes first, named `self`.
-                var receiver_types: Buf[&Type] = buf()
-                var receiver_names: Buf[string] = buf()
-                receiver_types.push(self_type)
-                receiver_names.push("self")
-                for t in symbol.params
-                    receiver_types.push(t)
-                for n in symbol.param_names
-                    receiver_names.push(n)
-                symbol.params = receiver_types
-                symbol.param_names = receiver_names
-                symbol.name = d.name + "." + f.name
-                symbol.owner_class = Some(id)
-                symbol.public = public
-                var method_defaults: Buf[Option[usize]] = buf()
-                for _ in receiver_types
-                    method_defaults.push(None)
-                symbol.defaults = method_defaults
-                methods.push(c.symbols.len())
-                overriding.push(overrides)
-                c.symbols.push(symbol)
-                c.states.push(0)
-                c.bodies.push(None)
-                c.locals.push(buf())
+                if overrides
+                    c.note(file_unit, f.name_span, s"`${f.name}` is declared in a trait, which overrides nothing; a trait's method is implemented by a class")
+                    continue
+            var clash: Option[usize] = None
+            for i in 0..<k.fields.len()
+                if k.fields[i].name == f.name && (i >= k.inherited || k.fields[i].public) then clash = Some(i)
+            if clash is Some(i)
+                c.note(file_unit, f.name_span, s"`${f.name}` is already a field of `${c.classes[k.fields[i].owner].name}`")
+                continue
+            val bodyless = f.body is None && f.clauses.len() == 0
+            if bodyless && !is_abstract_class(c, id)
+                c.note(file_unit, f.name_span, s"`${f.name}` has no body; only an abstract class may leave a method without one")
+            if bodyless && !public then c.note(file_unit, f.name_span, s"`${f.name}` is abstract, so it cannot be private: a subclass implements it")
+            var duplicate = false
+            for other in methods
+                if c.symbols[other].decl.name == f.name then duplicate = true
+            if duplicate
+                if entry.from_impl then c.note(file_unit, f.name_span, s"`${f.name}` is already a method of `${d.name}`; overloading methods is not implemented")
+                else c.note(file_unit, f.name_span, s"`${f.name}` is declared more than once in `${d.name}`; overloading methods is not implemented")
+                continue
+            var type_params: Buf[TypeParam] = buf()
+            for tp in entry.type_params
+                type_params.push(tp)
+            for tp in f.type_params
+                type_params.push(tp)
+            var symbol = signature(c, file_unit, entry.module_name, f, class_owner(id), type_params, true)
+            // The receiver comes first, named `self`.
+            var receiver_types: Buf[&Type] = buf()
+            var receiver_names: Buf[string] = buf()
+            receiver_types.push(self_type)
+            receiver_names.push("self")
+            for t in symbol.params
+                receiver_types.push(t)
+            for n in symbol.param_names
+                receiver_names.push(n)
+            symbol.params = receiver_types
+            symbol.param_names = receiver_names
+            symbol.name = d.name + "." + f.name
+            symbol.owner_class = Some(id)
+            symbol.public = public
+            var method_defaults: Buf[Option[usize]] = buf()
+            for _ in receiver_types
+                method_defaults.push(None)
+            symbol.defaults = method_defaults
+            methods.push(c.symbols.len())
+            overriding.push(overrides)
+            c.symbols.push(symbol)
+            c.states.push(0)
+            c.bodies.push(None)
+            c.locals.push(buf())
         c.classes[id].methods = methods
         c.classes[id].overriding = overriding
+
+// The methods an impl adds to a data type or a built-in type: each a function whose first parameter
+// is the value, `self`. A class's impls were declared with the class's own methods.
+private declare_impl_methods(c: *Checker, i: usize)
+    val target = c.impls[i].target
+    if *target is ErrorType || *target is Class(_, _, _) then return
+    for m in c.impls[i].decl.members
+        if m is MethodMember(f, public, overrides) then declare_impl_method(c, i, f, public, overrides)
+
+private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, overrides: bool)
+    val block = c.impls[i]
+    val unit = block.unit
+    val target = block.target
+    val type_name_of = *target match
+        Data(id, _, _) -> c.data[id].name
+        _ -> type_name(target)
+    val trait_id = block.trait_type match
+        Some(t) -> *t match
+            Class(t, _, _) -> Some(t)
+            _ -> None
+        None -> None
+    if f.annotations.len() > 0 then c.note(unit, f.name_span, "annotations on methods are not implemented")
+    for p in f.params
+        if p.default is Some(e) then c.note(unit, e.span, "default arguments of methods are not implemented")
+    if trait_id is Some(t)
+        if !trait_declares(c, t, f.name, 0)
+            c.note(unit, f.name_span, s"`${f.name}` is not a method of `${c.classes[t].name}`; an impl of a trait implements the trait's methods, and `impl $type_name_of` adds others")
+            return
+        if f.type_params.len() > 0
+            c.note(unit, f.name_span, s"`${f.name}` has type parameters of its own, so it cannot implement a trait's method")
+            return
+    elif overrides
+        c.note(unit, f.name_span, s"`${f.name}` overrides nothing; `$type_name_of` has no superclass")
+    if *target is Data(id, _, _)
+        var field = false
+        for v in c.data[id].variants
+            if contains_name(v.field_names, f.name) then field = true
+        if field
+            c.note(unit, f.name_span, s"`${f.name}` is already a field of `$type_name_of`")
+            return
+    if receiver_method(c, target, f.name) is Some(_)
+        c.note(unit, f.name_span, s"`${f.name}` is already a method of `$type_name_of`; overloading methods is not implemented")
+        return
+    val id = c.symbols.len()
+    // A data type's methods share its type parameters, then have their own; a built-in type has
+    // none, so its methods' type parameters are their own.
+    val owner = if *target is Data(_, _, _) then block.owner else id
+    var type_params: Buf[TypeParam] = buf()
+    for tp in block.decl.type_params
+        type_params.push(tp)
+    for tp in f.type_params
+        type_params.push(tp)
+    var symbol = signature(c, unit, block.module_name, f, owner, type_params, false)
+    // The receiver comes first, named `self`.
+    var receiver_types: Buf[&Type] = buf()
+    var receiver_names: Buf[string] = buf()
+    receiver_types.push(target)
+    receiver_names.push("self")
+    for t in symbol.params
+        receiver_types.push(t)
+    for n in symbol.param_names
+        receiver_names.push(n)
+    symbol.params = receiver_types
+    symbol.param_names = receiver_names
+    symbol.name = type_name_of + "." + f.name
+    symbol.public = public
+    symbol.receiver = Some(target)
+    var method_defaults: Buf[Option[usize]] = buf()
+    for _ in receiver_types
+        method_defaults.push(None)
+    symbol.defaults = method_defaults
+    c.symbols.push(symbol)
+    c.states.push(0)
+    c.bodies.push(None)
+    c.locals.push(buf())
+    *target match
+        Data(d, _, _) ->
+            var methods = c.data[d].methods
+            methods.push(id)
+            c.data[d].methods = methods
+            var implementing = c.data[d].implementing
+            implementing.push(trait_id is Some(_))
+            c.data[d].implementing = implementing
+        _ -> c.builtin_methods.push(id)
+
+/** The method named `name` that a value of data or built-in type `t` has: one its impls add, or for a
+ * data type, what its method table holds under the name through a trait it conforms to. */
+private receiver_method(c: *Checker, t: &Type, name: string) -> Option[usize]
+    *t match
+        Data(id, _, _) ->
+            for m in c.data[id].methods
+                if c.symbols[m].decl.name == name then return Some(m)
+            for entry in c.data[id].table
+                if entry is Some(m)
+                    if c.symbols[m].decl.name == name then return Some(m)
+            None
+        Class(_, _, _) -> None
+        Var(_) -> None
+        TypeVar(_, _, _) -> None
+        ErrorType -> None
+        _ ->
+            for m in c.builtin_methods
+                if same_type(c.symbols[m].receiver.unwrap(), t) && c.symbols[m].decl.name == name then return Some(m)
+            None
 
 /** Whether a method is abstract: declared in a class without a body. */
 is_abstract_method(symbol: FunctionSymbol) -> bool =
@@ -1002,6 +1324,16 @@ private table_position(c: *Checker, k: usize, name: string) -> Option[usize]
  * its superclass's, each as an instance of `t` sees it. A trait conformed to with two different type
  * argument lists appears twice. */
 private collect_traits(c: *Checker, t: &Type, out: *Buf[&Type])
+    if *t is Data(d, _, xs)
+        for required in c.data[d].traits
+            val r = substitute(required, data_owner(d), xs)
+            var seen = false
+            for i in 0..<out.len()
+                if same_type(out[i], r) then seen = true
+            if !seen
+                out.push(r)
+                collect_traits(c, r, out)
+        return
     val k = *t match
         Class(k, _, _) -> k
         _ -> return
@@ -1019,9 +1351,14 @@ private collect_traits(c: *Checker, t: &Type, out: *Buf[&Type])
     if c.classes[k].superclass is Some(sup) then collect_traits(c, substitute(sup, class_owner(k), args), out)
 
 /** The ids of the traits class `k` conforms to, each once. */
-private conformed_traits(c: *Checker, k: usize) -> Buf[usize]
+private conformed_traits(c: *Checker, k: usize) -> Buf[usize] = trait_ids(c, own_class_type(c.classes[k], k))
+
+/** The ids of the traits data type `d` conforms to through its impls, each once. */
+private data_traits(c: *Checker, d: usize) -> Buf[usize] = trait_ids(c, own_type(c.data[d], d))
+
+private trait_ids(c: *Checker, t: &Type) -> Buf[usize]
     var types: Buf[&Type] = buf()
-    collect_traits(c, own_class_type(c.classes[k], k), &types)
+    collect_traits(c, t, &types)
     var ids: Buf[usize] = buf()
     for t in types
         if *t is Class(id, _, _)
@@ -1137,14 +1474,26 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
         elif is_open(c, id) && symbol.public && !generic then slots.push(m)
     c.classes[id].slots = slots
 
-// Each trait's position in the method tables of the classes conforming to it. The whole program is
-// known, so the positions are chosen once for all of them: each trait takes the lowest position at
-// which its methods fit, in every class conforming to it, past that class's own slots and the
-// positions of the other traits it conforms to that are already placed.
+// Each trait's position in the method tables of the classes and data types conforming to it. The
+// whole program is known, so the positions are chosen once for all of them: each trait takes the
+// lowest position at which its methods fit, in every type conforming to it, past a class's own slots
+// and the positions of the other traits the type conforms to that are already placed.
 private place_traits(c: *Checker)
     var conformed: Buf[Buf[usize]] = buf()
     for k in 0..<c.classes.len()
         if is_trait(c, k) then conformed.push(buf()) else conformed.push(conformed_traits(c, k))
+    // Every conforming type's traits and slot count: the classes, then the data types.
+    var holders: Buf[Buf[usize]] = buf()
+    var slot_counts: Buf[usize] = buf()
+    for k in 0..<c.classes.len()
+        holders.push(conformed[k])
+        slot_counts.push(c.classes[k].slots.len())
+    var data_conformed: Buf[Buf[usize]] = buf()
+    for d in 0..<c.data.len()
+        val ids = data_traits(c, d)
+        data_conformed.push(ids)
+        holders.push(ids)
+        slot_counts.push(0)
     var placed: Buf[bool] = buf()
     for _ in c.classes
         placed.push(false)
@@ -1155,10 +1504,10 @@ private place_traits(c: *Checker)
         loop
             if n == 0 then break
             var free = true
-            for k in 0..<c.classes.len()
-                if !contains_id(conformed[k], t) then continue
-                if base < c.classes[k].slots.len() then free = false
-                for other in conformed[k]
+            for k in 0..<holders.len()
+                if !contains_id(holders[k], t) then continue
+                if base < slot_counts[k] then free = false
+                for other in holders[k]
                     if placed[other]
                         val start = c.classes[other].base
                         val end = start + c.classes[other].methods.len()
@@ -1169,6 +1518,69 @@ private place_traits(c: *Checker)
         placed.set(t, true)
     for k in 0..<c.classes.len()
         if !is_trait(c, k) then ensure_table(c, k, conformed)
+    for d in 0..<c.data.len()
+        build_data_table(c, d, data_conformed[d])
+
+// A data type's method table: at each position of a trait it conforms to, the type's own method of
+// that name, which an impl of a trait declares, or else the trait's default body. Two different
+// default bodies under one name must be replaced by the type's own; every abstract method must be.
+private build_data_table(c: *Checker, id: usize, conformed: Buf[usize])
+    if conformed.len() == 0 then return
+    val name_of = c.data[id].name
+    var size = 0usize
+    for t in conformed
+        val end = c.classes[t].base + c.classes[t].methods.len()
+        if end > size then size = end
+    var table: Buf[Option[usize]] = buf()
+    for _ in 0..<size
+        table.push(None)
+    var reported: Buf[string] = buf()
+    for t in conformed
+        val methods = c.classes[t].methods
+        for j in 0..<methods.len()
+            val name = c.symbols[methods[j]].decl.name
+            var chosen = methods[j]
+            var own: Option[usize] = None
+            val mine = c.data[id].methods
+            for k in 0..<mine.len()
+                if c.symbols[mine[k]].decl.name == name
+                    own = Some(mine[k])
+                    if !c.data[id].implementing[k] && !contains_name(reported, name)
+                        reported.push(name)
+                        val m = mine[k]
+                        c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`$name` implements `${c.symbols[methods[j]].name}`, so it belongs in an impl of `${c.classes[t].name}` for `$name_of`")
+            if own is Some(m) then chosen = m
+            else
+                var bodies: Buf[usize] = buf()
+                for other in conformed
+                    if own_method(c, other, name) is Some(m)
+                        if !is_abstract_method(c.symbols[m]) && !contains_id(bodies, m) then bodies.push(m)
+                if bodies.len() > 0 then chosen = bodies[0]
+                if bodies.len() > 1 && !contains_name(reported, name)
+                    reported.push(name)
+                    report_conformance(c, id, t, s"`$name_of` inherits two implementations of `$name`, `${c.symbols[bodies[0]].name}` and `${c.symbols[bodies[1]].name}`; implement it in an impl")
+            table.set(c.classes[t].base + j, Some(chosen))
+    c.data[id].table = table
+    for entry in table
+        if entry is Some(m)
+            val name = c.symbols[m].decl.name
+            if is_abstract_method(c.symbols[m]) && !contains_name(reported, name)
+                reported.push(name)
+                val t = c.symbols[m].owner_class.unwrap()
+                report_conformance(c, id, t, s"`$name_of` does not implement `$name` from `${c.classes[t].name}`; implement it in an impl of `${c.classes[t].name}`")
+
+// A problem with data type `id`'s conformance to trait `t` is reported at the impl that brings the
+// trait in: the impl of `t` itself, or of a trait requiring it.
+private report_conformance(c: *Checker, id: usize, t: usize, message: string)
+    for block in c.impls
+        if *block.target is Data(d, _, _)
+            if d != id then continue
+            if block.trait_type is Some(tt)
+                if *tt is Class(k, _, _)
+                    if k == t || requires_trait(c, t, k, 0)
+                        c.note(block.unit, block.decl.target.span, message)
+                        return
+    c.note(c.data[id].unit, c.data[id].decl.span, message)
 
 // A class's method table: its slots, then at each trait's position the implementation of each of
 // the trait's methods. Under each name the class's own override wins; otherwise the class inherits
@@ -1246,7 +1658,7 @@ private overrides_matches(c: *Checker, id: usize, m: usize, target: usize) -> bo
     val symbol = c.symbols[m]
     val base = c.symbols[target]
     val owner = base.owner_class.unwrap()
-    val args = ancestor_type(c.classes, own_class_type(c.classes[id], id), owner) match
+    val args = ancestor_type(c.classes, c.data, own_class_type(c.classes[id], id), owner) match
         Some(t) -> *t match
             Class(_, _, a) -> a
             _ -> buf()
@@ -1276,7 +1688,7 @@ private check_override_results(c: *Checker, id: usize)
             for i in 0..<base_slots.len()
                 val m = k.slots[i]
                 if m == base_slots[i] || c.symbols[m].owner_class != Some(id) then continue
-                if result_mismatch(c, id, m, base_slots[i]) is Some(text)
+                if result_mismatch(c, own_class_type(c.classes[id], id), m, base_slots[i]) is Some(text)
                     c.note(k.unit, c.symbols[m].decl.name_span, s"`${c.symbols[m].decl.name}` overrides `${c.symbols[base_slots[i]].name}`, $text")
     for t in conformed_traits(c, id)
         val methods = c.classes[t].methods
@@ -1292,42 +1704,71 @@ private check_override_results(c: *Checker, id: usize)
             val own = c.symbols[m].owner_class == Some(id)
             val at = if own then c.symbols[m].decl.name_span else k.decl.name_span
             if !own
-                if param_mismatch(c, id, m, base) is Some(text)
+                if param_mismatch(c, own_class_type(c.classes[id], id), m, base) is Some(text)
                     c.note(k.unit, at, s"$described for `${k.name}`, $text")
                     continue
-            if result_mismatch(c, id, m, base) is Some(text)
+            if result_mismatch(c, own_class_type(c.classes[id], id), m, base) is Some(text)
                 c.note(k.unit, at, s"$described, $text")
 
-/** A type in method `m`'s signature as an instance of class `id` sees it. */
-private seen_from(c: *Checker, id: usize, m: usize, t: &Type) -> &Type
-    val owner = c.symbols[m].owner_class.unwrap()
-    val args = ancestor_type(c.classes, own_class_type(c.classes[id], id), owner) match
+/** A type in method `m`'s signature as a value of `self_type`, a class's or a data type's own type,
+ * sees it. */
+private seen_from(c: *Checker, self_type: &Type, m: usize, t: &Type) -> &Type
+    // A method an impl adds to a data type already names the type's own parameters.
+    val owner = c.symbols[m].owner_class match
+        Some(k) -> k
+        None -> return t
+    val args = ancestor_type(c.classes, c.data, self_type, owner) match
         Some(a) -> *a match
             Class(_, _, xs) -> xs
             _ -> buf()
         None -> buf()
     substitute(t, class_owner(owner), args)
 
-/** How method `m`'s parameters differ from those of `base`, which it implements in class `id`. */
-private param_mismatch(c: *Checker, id: usize, m: usize, base: usize) -> Option[string]
+/** How method `m`'s parameters differ from those of `base`, which it implements for `self_type`. */
+private param_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) -> Option[string]
     val have = c.symbols[m].params
     val want = c.symbols[base].params
     if have.len() != want.len() then return Some(s"which takes ${count(want.len() - 1, "parameter")}, not ${have.len() - 1}")
     for i in 1..<want.len()
-        val w = seen_from(c, id, base, want[i])
-        val h = seen_from(c, id, m, have[i])
+        val w = seen_from(c, self_type, base, want[i])
+        val h = seen_from(c, self_type, m, have[i])
         if !same_type(h, w) then return Some(s"whose parameter `${c.symbols[base].param_names[i]}` is ${type_name(w)}, not ${type_name(h)}")
     None
 
-/** How method `m`'s result differs from that of `base`, which it overrides or implements in class
- * `id`: it yields that result or, where that is a class or a trait, a type conforming to it. */
-private result_mismatch(c: *Checker, id: usize, m: usize, base: usize) -> Option[string]
-    val want = seen_from(c, id, base, c.symbols[base].result.unwrap_or(ErrorType))
-    val own = seen_from(c, id, m, c.symbols[m].result.unwrap_or(ErrorType))
+/** How method `m`'s result differs from that of `base`, which it overrides or implements for
+ * `self_type`: it yields that result or, where that is a class or a trait, a type conforming to it. */
+private result_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) -> Option[string]
+    val want = seen_from(c, self_type, base, c.symbols[base].result.unwrap_or(ErrorType))
+    val own = seen_from(c, self_type, m, c.symbols[m].result.unwrap_or(ErrorType))
     var fits = alike_or_error(own, want)
     if *want is Class(b, _, _)
-        if ancestor_type(c.classes, own, b) is Some(up) then fits = alike_or_error(up, want)
+        if ancestor_type(c.classes, c.data, own, b) is Some(up) then fits = alike_or_error(up, want)
     if fits then None else Some(s"which yields ${type_name(want)}, not ${type_name(own)}")
+
+// The methods in a data type's table implement its traits' methods with their parameters and yield
+// their results, or types conforming to them, as the data type sees both; compared once every body
+// is checked, since a result may be inferred.
+private check_data_implementations(c: *Checker, id: usize)
+    val table = c.data[id].table
+    if table.len() == 0 then return
+    val self_type = own_type(c.data[id], id)
+    for t in data_traits(c, id)
+        val methods = c.classes[t].methods
+        for j in 0..<methods.len()
+            val position = c.classes[t].base + j
+            if position >= table.len() then continue
+            val m = table[position] match
+                Some(m) -> m
+                None -> continue
+            val base = methods[j]
+            if m == base then continue
+            val described = s"`${c.symbols[m].name}` implements `${c.symbols[base].name}`"
+            if c.symbols[m].receiver is Some(_)
+                val at = c.symbols[m].decl.name_span
+                if param_mismatch(c, self_type, m, base) is Some(text) then c.note(c.symbols[m].unit, at, s"$described, $text")
+                elif result_mismatch(c, self_type, m, base) is Some(text) then c.note(c.symbols[m].unit, at, s"$described, $text")
+            elif param_mismatch(c, self_type, m, base) is Some(text) then report_conformance(c, id, t, s"$described for `${c.data[id].name}`, $text")
+            elif result_mismatch(c, self_type, m, base) is Some(text) then report_conformance(c, id, t, s"$described, $text")
 
 private alike_or_error(a: &Type, b: &Type) -> bool = *a is ErrorType || *b is ErrorType || same_type(a, b)
 
@@ -1391,7 +1832,7 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
     elif f.body is None && f.clauses.len() == 0 && !bodyless
         c.note(unit, f.name_span, s"`${f.name}` needs a body, or clauses on the lines after it")
     c.generic = outer_generic
-    FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf(), false, false, false, buf(), None, owner, type_params, None, false, true, "")
+    FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf(), false, false, false, buf(), None, owner, type_params, None, false, true, "", None)
 
 // Each default argument becomes a function of its own, declared beside the function whose parameter
 // it belongs to: it takes the parameters before that one, so the default may use them, and yields
@@ -1421,7 +1862,7 @@ private declare_defaults(c: *Checker, id: usize)
         val result = substitute(f.params[i], id, own)
         val name = s"${f.name}/${f.param_names[i]}"
         val decl = Function(buf(), value.span, p.span, name, f.decl.type_params, decls, None, Some(value), buf())
-        c.symbols.push(FunctionSymbol(f.unit, f.module_name, name, decl, params, names, Some(result), None, f.root, buf(), buf(), buf(), false, false, false, buf(), Some(f.param_names[i]), did, f.decl.type_params, None, false, true, ""))
+        c.symbols.push(FunctionSymbol(f.unit, f.module_name, name, decl, params, names, Some(result), None, f.root, buf(), buf(), buf(), false, false, false, buf(), Some(f.param_names[i]), did, f.decl.type_params, None, false, true, "", None))
         c.states.push(0)
         c.bodies.push(None)
         c.locals.push(buf())
@@ -1822,6 +2263,8 @@ private enclosing_class(c: *Checker) -> Option[usize] = c.symbols[c.body.root].o
 /** A member of the enclosing class named by its bare name: a field or a method. */
 private enum MemberRef
     FieldOf(index: usize)
+    /** A field of the one variant of the data type an impl's method works on. */
+    DataFieldOf(index: usize)
     MethodOf(id: usize)
 
 // Inside a class, its fields and methods are in scope by bare name, behind the locals, parameters
@@ -1829,12 +2272,28 @@ private enum MemberRef
 private class_member(c: *Checker, name: string) -> Option[MemberRef]
     val k = enclosing_class(c) match
         Some(k) -> k
-        None -> return None
+        None -> return impl_member(c, name)
     if local_function(c, name) is Some(_) then return None
     // An ancestor's private member is not the subclass's to name.
     if class_field(c, k, name) is Some(i)
         if field_visible(c, c.classes[k].fields[i]) then return Some(FieldOf(i))
     if method_named(c, k, name) is Some(m)
+        if method_visible(c, m) then return Some(MethodOf(m))
+    None
+
+// Inside a method an impl adds to a data type or a built-in type, the type's methods are in scope by
+// bare name, as in a class, and so are the fields of a data type with one variant: whatever
+// `self.name` reaches.
+private impl_member(c: *Checker, name: string) -> Option[MemberRef]
+    val t = c.symbols[c.body.root].receiver?
+    if local_function(c, name) is Some(_) then return None
+    if *t is Data(id, _, _)
+        val d = c.data[id]
+        if d.variants.len() == 1
+            val names = d.variants[0].field_names
+            for i in 0..<names.len()
+                if names[i] == name then return Some(DataFieldOf(i))
+    if receiver_method(c, t, name) is Some(m)
         if method_visible(c, m) then return Some(MethodOf(m))
     None
 
@@ -1979,6 +2438,7 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
         return TExpr(at, ErrorType, UnitConst)
     class_member(c, name) match
         Some(FieldOf(i)) -> return field_read(c, at, at, self_ref(c, at), enclosing_class(c).unwrap(), i, true)
+        Some(DataFieldOf(i)) -> return data_field_read(c, at, self_ref(c, at), i)
         Some(MethodOf(m)) -> return method_value(c, at, m)
         None -> ()
     if global_named(c, name) is Some(g) then return global_read(c, at, g)
@@ -2004,6 +2464,11 @@ private field_read(c: *Checker, at: Span, name_span: Span, object: &TExpr, k: us
         Class(_, _, a) -> a
         _ -> buf()
     TExpr(at, substitute(ty, class_owner(k), args), Field(object, index))
+
+/** Field `index` of the one variant of `object`'s data type. */
+private data_field_read(c: *Checker, at: Span, object: &TExpr, index: usize) -> &TExpr = *zonk(c, object.ty) match
+    Data(id, _, args) -> TExpr(at, variant_fields(c.data[id], id, 0, args)[index], Field(object, index))
+    _ -> TExpr(at, ErrorType, UnitConst)
 
 // A field declared without a type has its initializer's, so the class body is checked first. An
 // inherited field's type is its declaring class's.
@@ -2456,7 +2921,7 @@ private initializer(c: *Checker, order: Buf[usize]) -> Option[usize]
     val at = Span(0, 0)
     val id = c.symbols.len()
     val decl = Function(buf(), at, at, "<init>", buf(), buf(), None, None, buf())
-    c.symbols.push(FunctionSymbol(unit, module_name, "<init>", decl, buf(), buf(), Some(Unit), None, None, buf(), buf(), buf(), false, false, false, buf(), None, id, buf(), None, false, true, ""))
+    c.symbols.push(FunctionSymbol(unit, module_name, "<init>", decl, buf(), buf(), Some(Unit), None, None, buf(), buf(), buf(), false, false, false, buf(), None, id, buf(), None, false, true, "", None))
     var items: Buf[&TExpr] = buf()
     for g in order
         val init = c.globals[g].init
@@ -2836,7 +3301,7 @@ private join(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
         val k = *current match
             Class(k, _, args) -> k
             _ -> return None
-        if ancestor_type(c.classes, zonk(c, b), k) is Some(up)
+        if ancestor_type(c.classes, c.data, zonk(c, b), k) is Some(up)
             if same_type(up, current) then return Some(current)
         current = ancestor_parent(c, current)?
     None
@@ -2851,7 +3316,7 @@ private ancestor_parent(c: *Checker, t: &Type) -> Option[&Type] = *t match
 private upcast(c: *Checker, from: &Type, to: &Type) -> &Type
     val x = zonk(c, from)
     *zonk(c, to) match
-        Class(k, _, _) -> ancestor_type(c.classes, x, k).unwrap_or(x)
+        Class(k, _, _) -> ancestor_type(c.classes, c.data, x, k).unwrap_or(x)
         Tuple(ys) -> *x match
             Tuple(xs) ->
                 if xs.len() != ys.len() then return x
@@ -3001,6 +3466,7 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
                 return TExpr(at, ErrorType, UnitConst)
             return method_call(c, at, named.span, self_ref(c, named.span), m, args, explicit, expected, false)
         Some(FieldOf(_)) -> if explicit is None then return value_call(c, at, callee, args)
+        Some(DataFieldOf(_)) -> if explicit is None then return value_call(c, at, callee, args)
         None -> ()
     // A module-level value is called as a value; a class's name in call position is its
     // constructor, even where its companion object shares the name.
@@ -3275,6 +3741,13 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
                     check_statement(c, a.value)
                 return TExpr(at, ErrorType, UnitConst)
             return method_call(c, at, name_span, object, m, args, explicit, expected, false)
+    if receiver_method(c, zonk(c, object.ty), name) is Some(m)
+        if !method_visible(c, m)
+            c.note(unit, name_span, s"`$name` is private to the impls of `${type_name(c.symbols[m].receiver.unwrap())}`")
+            for a in args
+                check_statement(c, a.value)
+            return TExpr(at, ErrorType, UnitConst)
+        return method_call(c, at, name_span, object, m, args, explicit, expected, false)
     if explicit is Some(_)
         for a in args
             check_statement(c, a.value)
@@ -3315,13 +3788,16 @@ private super_call(c: *Checker, at: Span, name_span: Span, super_span: Span, nam
 // type, and the method's own, which follow them, are written or inferred as for a function.
 private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m: usize, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], direct: bool) -> &TExpr
     val target = c.symbols[m]
-    val k = target.owner_class.unwrap()
     // An inherited method's types name its own class's parameters, so the receiver is seen as an
-    // instance of that class.
+    // instance of that class. A method an impl adds to a data type takes the value's type arguments.
     val receiver_type = zonk(c, receiver.ty)
-    val known = *ancestor_type(c.classes, receiver_type, k).unwrap_or(receiver_type) match
-        Class(_, _, a) -> a
-        _ -> buf()
+    val known = target.owner_class match
+        Some(k) -> *ancestor_type(c.classes, c.data, receiver_type, k).unwrap_or(receiver_type) match
+            Class(_, _, a) -> a
+            _ -> buf()
+        None -> *receiver_type match
+            Data(_, _, a) -> a
+            _ -> buf()
     var params: Buf[&Type] = buf()
     var names: Buf[string] = buf()
     var defaults: Buf[Option[usize]] = buf()
@@ -3341,7 +3817,7 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
         setup = Some(TExpr(receiver.span, Unit, Let(held, receiver)))
         object = TExpr(receiver.span, receiver.ty, Local(held))
     val declared = result_of(c, m, at)
-    val signature = Signature(target.decl.name, true, target.type_params, class_owner(k), params, names, defaults, declared, known)
+    val signature = Signature(target.decl.name, true, target.type_params, target.type_owner, params, names, defaults, declared, known)
     val applied = apply(c, at, name_span, signature, args, explicit, expected, buf())
     var typed: Buf[&TExpr] = buf()
     typed.push(object)
@@ -3760,7 +4236,7 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     val enclosing = c.symbols[c.current]
     val decl = Function(buf(), e.span, e.span, "lambda", buf(), buf(), None, Some(body), buf())
     val id = c.symbols.len()
-    c.symbols.push(FunctionSymbol(enclosing.unit, enclosing.module_name, "lambda", decl, types, names, result, None, Some(c.body.root), buf(), buf(), buf(), true, delayed, true, buf(), None, id, buf(), None, false, true, ""))
+    c.symbols.push(FunctionSymbol(enclosing.unit, enclosing.module_name, "lambda", decl, types, names, result, None, Some(c.body.root), buf(), buf(), buf(), true, delayed, true, buf(), None, id, buf(), None, false, true, "", None))
     c.states.push(1)
     c.bodies.push(None)
     c.locals.push(buf())

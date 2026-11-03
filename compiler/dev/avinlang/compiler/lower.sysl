@@ -163,8 +163,9 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
     *t match
         Data(id, _, args) ->
             val d = l.program.data[id]
+            val methods = method_table(l, t)
             for v in 0..<d.variants.len()
-                variants.push(variant_layout(l, key + "." + d.variants[v].name, v, variant_fields(d, id, v, args), true, buf()))
+                variants.push(variant_layout(l, key + "." + d.variants[v].name, v, variant_fields(d, id, v, args), true, methods))
         Tuple(items) -> variants.push(variant_layout(l, key, 0, items, true, buf()))
         Class(id, _, args) ->
             var fields: Buf[&Type] = buf()
@@ -194,16 +195,18 @@ private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[
     l.descriptors.push(Descriptor(name, tag, size, refs, shared && size == 0, methods))
     shape
 
-// The method table of a class instance: for each slot, the instance of the method that fills it,
-// with the type arguments of the class or trait that declares the method as the instance sees them.
-// Each instance of a generic class has its own table. An abstract method's slot is empty, as is a
-// position no trait of the class uses.
+// The method table of a class instance or a data value: for each slot, the instance of the method
+// that fills it, with the type arguments of the class or trait that declares the method as the
+// instance sees them, or for a method an impl adds to a data type, the value's own. Each instance of
+// a generic type has its own table, which every variant of a data type shares. An abstract method's
+// slot is empty, as is a position no trait of the type uses.
 private method_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
     var table: Buf[Option[usize]] = buf()
-    val id = *t match
-        Class(k, _, _) -> k
+    val entries = *t match
+        Class(k, _, _) -> l.program.classes[k].table
+        Data(d, _, _) -> l.program.data[d].table
         _ -> return table
-    for entry in l.program.classes[id].table
+    for entry in entries
         val m = entry match
             Some(m) -> m
             None ->
@@ -213,8 +216,15 @@ private method_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
         if is_abstract_method(symbol)
             table.push(None)
             continue
-        val owner = symbol.owner_class.unwrap()
-        val args = ancestor_type(l.program.classes, t, owner) match
+        val owner = symbol.owner_class match
+            Some(k) -> k
+            None ->
+                val own = *t match
+                    Data(_, _, xs) -> xs
+                    _ -> buf()
+                table.push(Some(instance(l, m, own)))
+                continue
+        val args = ancestor_type(l.program.classes, l.program.data, t, owner) match
             Some(a) -> *a match
                 Class(_, _, xs) -> xs
                 _ -> buf()
