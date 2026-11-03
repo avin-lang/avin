@@ -39,6 +39,8 @@ a decision changes, this page and the chapter change together.
 - Inheritance is written with `:`: `class C(…): Base(…), Trait`, one superclass with its
   constructor arguments and then traits, as in `trait A: B`.
 - The receiver is implicit: members are in scope by their bare names, and `self` names the instance.
+- Any method taking one argument can be called infix, `a max b` for `a.max(b)`, at the caller's
+  choice: there is no annotation that permits or forbids it. There is no postfix form.
 - A subclass's constructor evaluates the superclass's arguments, runs the superclass's body on the
   object, then stores its own parameters and runs its own body. The superclass's arguments cannot
   call a method or use `self`; a parameter's name in them reads the argument.
@@ -90,6 +92,14 @@ a decision changes, this page and the chapter change together.
 - A method named without a call, `account.deposit`, is a function value bound to its receiver: a
   closure holding `account`, of the method's type without the receiver. Inside the class, a bare
   method name is the same closure over `self`.
+- Settled 2026-11-03: a method value evaluates its receiver once, where the value is made. Through a
+  trait-typed or open-class receiver it calls the implementation the object's class has, through
+  the object's method table at each call; the object is fixed, so this is the implementation it had
+  when the value was made. The class's type arguments come from the receiver's type; a method's own
+  are written (`box.pair[bool]`) or decided by the expected function type, and one left undecided
+  is an error. A method value takes every parameter, by-name ones still by name, and private
+  methods are values only where they could be called. Two values of one method on one object are
+  two closures, so `===` tells them apart.
 - `string` is a built-in type, not a class: it is final, has its own representation, gets its
   methods from the library through `impl string`, conforms to traits through `impl`, and is matched
   by the type pattern `s: string` like any other type.
@@ -99,6 +109,13 @@ a decision changes, this page and the chapter change together.
   name is delayed; an overload that takes it strictly evaluates it once, at the call.
 - An overloaded function used as a value needs an expected function type, which chooses the
   overload. `main` cannot be overloaded.
+- Methods overload by the same rules, among the methods of a name the receiver's static type has,
+  inherited ones included. A method is identified by its name and parameter types: an override, a
+  trait implementation and a method table position each match by both, so a subclass overrides one
+  overload and inherits the others. `override` matching no inherited parameter types is an error.
+- A clause is a line of the function's name and arguments followed by `=`, a guard or indented
+  guards; a line of the same name followed by `->` or nothing is another declaration, so two
+  abstract overloads may follow each other.
 - A class's parameter list is its one constructor. Class parameters are private immutable fields
   (`val` makes one public and read-only, `var` public and mutable), and the statements in the class
   body are the constructor's code, run top to bottom when an instance is created.
@@ -222,6 +239,10 @@ a decision changes, this page and the chapter change together.
 - Partial-function literal syntax, which the user has explicitly left undecided.
 
 ## Proposed
+
+- An infix method call binds more loosely than arithmetic, bitwise, shift, cons and range operators
+  and more tightly than comparisons, `is`, `&&` and `||`, and groups to the left, so
+  `xs contains x && ok` is `(xs contains x) && ok`.
 
 - A literal pattern does not match an `Any` (`5 -> …` on an `Any` is an error); `n: int if n == 5`
   says it.

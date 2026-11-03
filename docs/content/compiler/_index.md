@@ -68,7 +68,9 @@ the receiver. The constructor and the methods share the class's type parameters,
 following them, so a generic class's constructor and methods are instantiated per list of type
 arguments as generic functions are, and a field's type at a particular instance is its declared
 type with the receiver's type arguments substituted. A call of a method of a final class is a
-direct call.
+direct call. A method named without a call is checked into a lambda of the method's type without
+the receiver: the receiver is evaluated into a hidden local the lambda captures, and the lambda's
+body calls the method on it, directly or through the method table as a call written there would.
 
 A subclass's object starts with its superclass's fields, in the superclass's order, so the
 superclass's code finds each field at the offset it expects in any subclass's object. An `open` or
@@ -79,7 +81,10 @@ abstract methods are never compiled.
 
 Each class has a method table with one slot per method a subclass may override: its superclass's
 slots in the same positions, each holding the class's override where it has one, then one for each
-overridable method the class adds. The table is constant data placed directly before the class's
+overridable method the class adds. A method is identified by its name and parameter types, so
+each overload of a name has a slot of its own, and an override takes the slot of the inherited
+method with its parameter types; each overload is also a symbol of its own, named by its parameter
+types. The table is constant data placed directly before the class's
 descriptor, in one global, so slot `s` is the word `8(s + 1)` bytes before the object's
 descriptor; the descriptor itself keeps its layout and the runtime never reads the table. Each instance of a generic class has its own descriptor and table, filled with the method
 instances for its type arguments. A call through a receiver whose static type is an `open` or

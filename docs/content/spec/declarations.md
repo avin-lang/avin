@@ -249,6 +249,12 @@ class Savings(owner: string, balance: int, rate: real): Account(owner, balance),
 - Methods take the forms top-level functions take: a body after `=`, an indented body, or clauses,
   which match the arguments and not the receiver. A method may have type parameters of its own,
   after its class's.
+- A method named without a call is a function value bound to its receiver: `val f = acct.deposit`
+  is an `(int) -> unit` that deposits into `acct`, which is evaluated once, where the value is made.
+  Inside the class a bare method name is the same over `self`. Through a superclass's or a trait's
+  type the value calls the implementation the object's class has. A method's own type parameters
+  are written, `box.pair[bool]`, or come from the expected function type. The same holds for the
+  methods an `impl` adds to any type, `"hey".shout` included.
 - A field declared in the body without a type has its initializer's type. The body cannot
   `return`: it runs to its end to make the object.
 
@@ -279,8 +285,18 @@ class Square(label: string, side: int): Rect(label, side, side)
 - **A method a subclass may override** is a public method of an `open` or `abstract` class without
   type parameters of its own. An override is marked `override`, takes the same parameter types (with
   the superclass's type arguments substituted) and yields the same result type or, for a class, a
-  subclass of it. A method sharing an inherited method's name without `override`, and `override` on
-  a method that overrides nothing, are errors. An override cannot be private.
+  subclass of it. A method sharing an inherited method's name and parameter types without
+  `override`, and `override` on a method that overrides nothing, are errors. An override cannot be
+  private.
+- **Methods overload as functions do.** A class, object, trait or impl may declare several methods
+  of one name with different parameter types, and a call chooses among the methods of that name its
+  receiver's static type has, its own and inherited ones together, by the rules for functions above.
+  Each overload is a method of its own: a subclass overrides one by its parameter types and inherits
+  the others, and may add an overload of an inherited name without `override`. A call through an
+  `open` class or a trait reaches the override of the overload it chose. `override` that matches no
+  inherited method's parameter types is an error naming the inherited overloads of that name, or,
+  where there is one, how its parameters differ. An overloaded method used as a value takes its
+  overload from the expected function type, and without one it is ambiguous.
 - **An abstract method** is one without a body, allowed only in an `abstract` class. A class that is
   not abstract implements every abstract method it inherits. An abstract class cannot be
   instantiated, but its constructor runs as part of each subclass's.
@@ -368,16 +384,17 @@ do not own. Resolution is coherent: one implementation per trait and type, found
 - **An impl adds methods, never state.** Its body declares methods only: no fields and no
   statements. A method an impl adds to a class or an object is one of its methods, as if the class's
   body declared it: it sees the private fields, is inherited by a subclass, and a subclass may
-  override it. A method of a name the type already has is an error, since methods are not
-  overloaded.
+  override it. A method with the name and parameter types of one the type already has is an error;
+  one with other parameter types overloads it.
 - **Inside an impl's methods the receiver is implicit**, as in a class: `self` is the value, the
   type's methods are in scope by bare name, and so are the fields of a `data` type with one variant,
   the fields `self.name` reaches. A type with several variants takes `self` apart with `match`.
   A `private` method of an impl is callable only from the methods of that type.
 - **The methods of `impl Trait for Type` implement the trait's methods**, so they are not marked
   `override`, and each must be a method of the trait or of a trait it requires. A default body the
-  impl leaves alone stays, and every abstract method must be implemented. One method of a name
-  implements every trait method of that name the type conforms to, as a class's does; a `data`
+  impl leaves alone stays, and every abstract method must be implemented. One method of a name and
+  parameter types implements every trait method of that name and parameter types the type conforms
+  to, as a class's does; a `data`
   type's method implementing a trait's method is declared in an impl of that trait. An impl of a
   trait with no body states a conformance the type's methods already satisfy.
 - **A `data` value of a type that conforms to a trait is a value of the trait's type.** Its calls
