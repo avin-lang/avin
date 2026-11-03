@@ -91,11 +91,21 @@ build_and_run()
     assert_eq(avin(["avin", "emit-llvm", source, "-o", ir]).status, 0)
     assert(read_text(ir).unwrap().contains("define i32 @main()"))
 
-// The text of the function `name` in `ir`, from its `define` to its closing brace.
+// The text of the function `name` in `ir`, from its `define` to its closing brace. A call of the
+// function names it the same way, so the definition is the mention whose line opens a body.
 private function_text(ir: string, name: string) -> string
-    val start = ir.index_of("@\"<program>." + name + "\"(") match
-        Some(i) -> i
-        None -> return ""
+    val key = "@\"<program>." + name + "\"("
+    var from = 0usize
+    var start = 0usize
+    var found = false
+    while !found
+        start = ir.index_of_from(key, from) match
+            Some(i) -> i
+            None -> return ""
+        ir.index_of_from("\n", start) match
+            Some(e) -> found = ir.bytes[e - 1] == u8('{')
+            None -> return ""
+        from = start + 1
     val end = ir.index_of_from("\n}\n", start) match
         Some(e) -> e
         None -> ir.bytes.len
@@ -103,12 +113,12 @@ private function_text(ir: string, name: string) -> string
 
 private polls_in(text: string) -> usize = text.count_of("call void @avin_rt_safepoint(ptr %ctx)")
 
-@test("safepoint polls sit at the entry of functions that call and on every back edge, and nowhere else")
+@test("safepoint polls sit on every back edge and before the calls that may recur, and nowhere else")
 safepoint_polls()
     val dir = make_temp_dir("avin-cli").unwrap()
     defer _ = remove_dir_all(dir)
     val source = dir + "/polls.avin"
-    write_text(source, "count(n: int) -> int\n    var i = 0\n    var s = 0\n    while i < n\n        s = s + i\n        i = i + 1\n    s\n\nnested(n: int) -> int\n    var t = 0\n    var i = 0\n    while i < n\n        var j = 0\n        do\n            t = t + j\n            j = j + 1\n        while j < i\n        i = i + 1\n    t\n\nleaf(x: int) -> int = if x > 0 then x + 1 else x - 1\n\nmain() -> int = count(leaf(3)) + nested(4)\n").unwrap()
+    write_text(source, "count(n: int) -> int\n    var i = 0\n    var s = 0\n    while i < n\n        s = s + i\n        i = i + 1\n    s\n\nnested(n: int) -> int\n    var t = 0\n    var i = 0\n    while i < n\n        var j = 0\n        do\n            t = t + j\n            j = j + 1\n        while j < i\n        i = i + 1\n    t\n\nleaf(x: int) -> int = if x > 0 then x + 1 else x - 1\n\nfib(n: int) -> int = if n < 2 then n else fib(n - 1) + fib(n - 2)\n\nisEven(n: int) -> bool = if n == 0 then true else isOdd(n - 1)\n\nisOdd(n: int) -> bool = if n == 0 then false else isEven(n - 1)\n\napply(f: (int) -> int, x: int) -> int = f(x)\n\ndown(n: int) -> int = if n <= 0 then 0 else apply(down, n - 1) + 1\n\ninc(x: int) -> int = x + 1\n\ntwice(g: (int) -> int) -> int = g(g(1))\n\nmain() -> int = count(leaf(3)) + nested(4) + fib(10) - 55 + (if isEven(6) then 0 else 1) + apply(down, 5) - 5 + twice(inc) - 3\n").unwrap()
     val out = dir + "/polls.ll"
     val emitted = avin(["avin", "emit-llvm", source, "-o", out])
     assert_eq(emitted.noted, "")
@@ -116,12 +126,27 @@ safepoint_polls()
     assert(ir.contains("@avin_rt_requested = external global i32"))
     assert(ir.contains("declare void @avin_rt_safepoint(ptr) cold"))
     assert(ir.contains("load atomic i32, ptr @avin_rt_requested monotonic"))
+    // The slow path is weighted as almost never taken, so the poll falls through.
+    assert(ir.contains(", !prof !0\n"))
+    assert(ir.contains("!0 = !{!\"branch_weights\", i32 1, i32 1048575}"))
     // A loop with no call polls on its back edge only; two nested loops poll on each back edge.
     assert_eq(polls_in(function_text(ir, "count")), 1usize)
     assert_eq(polls_in(function_text(ir, "nested")), 2usize)
-    // A function that calls polls at its entry; one with neither calls nor loops never polls.
-    assert_eq(polls_in(function_text(ir, "main")), 1usize)
+    // A caller that cannot be called back never polls, nor does a function with neither calls nor
+    // loops.
+    assert_eq(polls_in(function_text(ir, "main")), 0usize)
     assert_eq(polls_in(function_text(ir, "leaf")), 0usize)
+    // A recursion polls once per level: before the first recursive call, which every path to the
+    // second passes, and in each function of a mutual recursion.
+    assert_eq(polls_in(function_text(ir, "fib")), 1usize)
+    assert_eq(polls_in(function_text(ir, "isEven")), 1usize)
+    assert_eq(polls_in(function_text(ir, "isOdd")), 1usize)
+    // A function reached only as a value, which recurses through a call of that value: both the
+    // call through the value and the call that passes it may recur.
+    assert_eq(polls_in(function_text(ir, "down")), 1usize)
+    assert_eq(polls_in(function_text(ir, "apply")), 1usize)
+    // A call through a value polls only when some function that is a value can call back.
+    assert_eq(polls_in(function_text(ir, "twice")), 0usize)
     val binary = dir + "/polls"
     assert_eq(avin(["avin", "build", source, "-o", binary]).status, 0)
     assert(capture(binary, stderr = true, timeout = 10000).unwrap().status == Exited(10))
