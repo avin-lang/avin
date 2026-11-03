@@ -380,7 +380,8 @@ val n: Named = t
 - **A trait may override a method of a trait it requires**, marked `override` and with a body:
   `trait Square: Shape` with `override describe() -> string = …`. In every class and data type
   conforming to the trait, its body replaces the required trait's default, or gives an abstract
-  method one, so a call through either trait's type reaches it. Declaring a required trait's method
+  method one, so a call through either trait's type reaches it. Like a class's override, it takes
+  the defaults of the method it overrides. Declaring a required trait's method
   again without `override` is an error. Two traits overriding one default differently are two
   implementations, which a class conforming to both overrides.
 - **A trait's method may have type parameters of its own**, as `map[B](f: (A) -> B) -> Iterable[B]`.
