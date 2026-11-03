@@ -254,20 +254,21 @@ struct Checker
     units: Buf[SourceUnit]
     symbols: Buf[FunctionSymbol]
     data: Buf[DataSymbol]
-    /** The data types and variants in scope, by name. */
+    /** The data types and variants, by qualified name: `a.b.Shape`, or `Shape` in the root module. */
     types: Map[string, usize]
     variants: Map[string, VariantRef]
     classes: Buf[ClassSymbol]
-    /** The classes in scope, by name, and the standalone objects, whose types are named after them. */
+    /** The classes, by qualified name, and the standalone objects, whose types are named after them. */
     class_types: Map[string, usize]
     globals: Buf[GlobalSymbol]
-    /** The module-level values and objects in scope, by name. */
+    /** The module-level values and objects, by qualified name. */
     global_names: Map[string, usize]
     /** 0: not yet checked, 1: being checked, 2: checked. */
     states: Buf[u8]
     bodies: Buf[Option[&TExpr]]
     locals: Buf[Buf[TLocal]]
-    /** The top-level functions in scope, by name: several when the name is overloaded. */
+    /** The top-level functions and class constructors, by qualified name: several when the name is
+     * overloaded. */
     scope: Map[string, Buf[usize]]
     current: usize
     body: BodyState
@@ -289,6 +290,12 @@ struct Checker
     building: Buf[u8]
     /** For each class whose body is stopped part way, where to resume it. */
     constructions: Buf[Option[Construction]]
+    /** For each unit, its module and the names its imports bring in. */
+    files: Buf[FileScope]
+    /** The declarations marked `private`, by qualified name: seen only inside their modules. */
+    private_names: Map[string, bool]
+    /** The program's root module, which declares `main`. */
+    root_module: string
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -311,14 +318,124 @@ struct Checked
         out
 end Checked
 
-/** Checks a program. The last unit is the program's own file, which must declare `main`; the units
- * before it (the prelude) are visible to it, and its own declarations shadow theirs. */
-check_program(units: Buf[SourceUnit]) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false, false, buf(), buf(), buf(), buf())
+/** The core library's module. Its public declarations are seen by every file without an import, and
+ * the built-in types belong to it. */
+const CoreModule: string = "avin"
+
+/** What a file sees besides its own module's declarations and the core library's: each name its
+ * imports bring in, bound to the qualified name of the declaration it imports. */
+struct FileScope
+    module_name: string
+    imports: Map[string, string]
+
+/** The name a declaration `name` of module `module_name` has in the symbol tables: `a.b.name`, or
+ * `name` alone in the root module. A declaration's name holds no dot, so two declarations of
+ * different modules never share one. */
+qualified(module_name: string, name: string) -> string = if module_name == "" then name else module_name + "." + name
+
+/** Whether a declaration has the qualified name `key`, whatever kind it is. */
+private declared(c: *Checker, key: string) -> bool =
+    c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_) || c.variants.get(key) is Some(_) ||
+        c.global_names.get(key) is Some(_) || c.scope.get(key) is Some(_)
+
+/** Whether the declaration named `key` may be seen from another module: it is not `private`. A
+ * function's name is while any of its overloads is public. */
+private exported(c: *Checker, key: string) -> bool
+    if c.private_names.get(key) is Some(_) then return false
+    if c.scope.get(key) is Some(ids)
+        for id in ids
+            if c.symbols[id].public then return true
+        return false
+    true
+
+/** The qualified name a bare `name` denotes in a unit: its own module's declaration of that name,
+ * else the one the file imports under it, else the core library's public one. The nearer hides the
+ * farther whatever kind each is, so a module's function hides a core library type of its name. When
+ * none exists, the module's own, which no table holds, so the use is reported as unknown. */
+private resolve_name(c: *Checker, unit: usize, name: string) -> string
+    val scope = c.files[unit]
+    val own = qualified(scope.module_name, name)
+    if declared(c, own) then return own
+    if scope.imports.get(name) is Some(key) then return key
+    val core = qualified(CoreModule, name)
+    if declared(c, core) && exported(c, core) then return core
+    own
+
+private file_scope(c: *Checker, unit: usize) -> FileScope
+    val file = c.units[unit].file
+    var imports: Map[string, string] = map()
+    for i in file.imports
+        if imports.get(i.binding) is None then imports.put(i.binding, i.path)
+    FileScope(file.module_name, imports)
+
+private module_exists(c: *Checker, name: string) -> bool
+    for f in c.files
+        if f.module_name == name then return true
+    false
+
+// Each import of a unit names a public declaration of another module, under a name the file does not
+// already use. An import found wrong is reported and dropped, so its uses are reported as unknown
+// names rather than resolved to something the import did not mean.
+private check_imports(c: *Checker, unit: usize)
+    val file = c.units[unit].file
+    val own = file.module_name
+    var kept: Map[string, string] = map()
+    for i in file.imports
+        var dot: Option[usize] = None
+        for k in 0..<i.path.bytes.len
+            if i.path.bytes[k] == u8('.') then dot = Some(k)
+        val at = dot match
+            Some(k) -> k
+            None ->
+                if module_exists(c, i.path) then c.note(unit, i.span, s"`${i.path}` is a module; an import names its declarations, as in `import ${i.path}.{Name}`")
+                else c.note(unit, i.span, s"`${i.path}` is not a declaration of a module; an import names one, as in `import a.b.{Name}`")
+                continue
+        val module_name = i.path[0..<at]
+        val name = i.path[at + 1..]
+        if module_name == own
+            c.note(unit, i.span, s"`$name` is declared in this module, which sees it without an import")
+            continue
+        if !module_exists(c, module_name)
+            if module_exists(c, i.path) then c.note(unit, i.span, s"`${i.path}` is a module; an import names its declarations, as in `import ${i.path}.{Name}`")
+            else c.note(unit, i.span, s"unknown module `$module_name`")
+            continue
+        if !declared(c, i.path)
+            c.note(unit, i.span, s"module `$module_name` declares no `$name`")
+            continue
+        if !exported(c, i.path)
+            c.note(unit, i.span, s"`$name` is private to module `$module_name`")
+            continue
+        val local = qualified(own, i.binding)
+        if declared(c, local)
+            var companion = false
+            if c.class_types.get(local) is Some(k)
+                if c.classes[k].decl.object
+                    if c.class_types.get(i.path) is Some(j)
+                        if !c.classes[j].decl.object then companion = true
+            if companion then c.note(unit, i.span, s"`${i.binding}` is a class of module `$module_name`; its companion object is declared in the class's own module")
+            else c.note(unit, i.span, s"`${i.binding}` is imported and also declared in this module")
+            continue
+        if kept.get(i.binding) is Some(earlier)
+            c.note(unit, i.span, s"`${i.binding}` is already imported, from `$earlier`")
+            continue
+        kept.put(i.binding, i.path)
+    c.files[unit].imports = kept
+
+/** Checks a program: the core library's units, then the program's own, each heading its module's
+ * name in `file.module_name`. `root_module` is the module that must declare `main`, and the last
+ * unit is one of its files. Every file sees its own module's declarations, the names it imports and
+ * the core library's public declarations, in that order: an inner name hides an outer one. */
+check_program(units: Buf[SourceUnit], root_module: string) -> Checked
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), map(), root_module)
+    for u in 0..<c.units.len()
+        c.files.push(file_scope(&c, u))
     // Every type is named before any is used, so a data type may refer to itself or to one
-    // declared after it, and functions are declared once every type is known.
+    // declared after it, and functions are declared once every type is known. A class is named
+    // before any object, so an object finds its companion in any file of the module.
     for u in 0..<c.units.len()
         declare_types(&c, u)
+    for u in 0..<c.units.len()
+        declare_objects(&c, u)
     for u in 0..<c.units.len()
         declare_impls(&c, u)
     for u in 0..<c.units.len()
@@ -341,6 +458,8 @@ check_program(units: Buf[SourceUnit]) -> Checked
     place_traits(&c)
     for u in 0..<c.units.len()
         declare_globals(&c, u)
+    for u in 0..<c.units.len()
+        check_imports(&c, u)
     for _ in c.classes
         c.building.push(0)
         c.constructions.push(None)
@@ -360,12 +479,13 @@ check_program(units: Buf[SourceUnit]) -> Checked
     for g in 0..<c.globals.len()
         settle_global(&c, g)
     val init = initializer(&c, initialization_order(&c))
-    val main_unit = c.units.len() - 1
+    var main_unit = c.units.len() - 1
     var entry: Option[usize] = None
-    c.scope.get("main") match
+    c.scope.get(qualified(root_module, "main")) match
         Some(ids) ->
-            if c.symbols[ids[0]].unit == main_unit then entry = Some(ids[0])
-            if ids.len() > 1 then c.note(main_unit, c.symbols[ids[1]].decl.name_span, "`main` cannot be overloaded")
+            entry = Some(ids[0])
+            main_unit = c.symbols[ids[0]].unit
+            if ids.len() > 1 then c.note(c.symbols[ids[1]].unit, c.symbols[ids[1]].decl.name_span, "`main` cannot be overloaded")
         None -> ()
     entry match
         Some(id) ->
@@ -393,34 +513,34 @@ check_program(units: Buf[SourceUnit]) -> Checked
 
 private declare_unit(c: *Checker, unit: usize)
     val file = c.units[unit].file
-    for item in file.items
-        item match
+    for i in 0..<file.items.len()
+        file.items[i] match
             FunctionItem(f) ->
-                // A unit's functions of a name hide an earlier unit's, so the program's own
-                // declarations shadow the prelude's; within one unit they overload one another.
+                // A module's functions of a name overload one another, in whichever of its files
+                // each is declared, and hide the core library's.
+                val key = qualified(file.module_name, f.name)
                 var set: Buf[usize] = buf()
-                if c.scope.get(f.name) is Some(ids)
+                if c.scope.get(key) is Some(ids)
                     for other in ids
-                        if c.symbols[other].unit == unit && !c.symbols[other].constructor then set.push(other)
+                        if !c.symbols[other].constructor then set.push(other)
                 val id = c.symbols.len()
-                val symbol = signature(c, unit, file.module_name, f, id, f.type_params, false)
+                var symbol = signature(c, unit, file.module_name, f, id, f.type_params, false)
+                symbol.public = !file.private_items[i]
                 if same_as_overload(c, symbol, set)
                     c.note(unit, f.name_span, s"`${f.name}` is declared more than once with the same parameter types; overloads differ in their parameter types, and a function that chooses by its arguments' values is written with clauses")
                     continue
-                if set.len() == 0 && c.variants.get(f.name) is Some(v)
-                    if c.data[v.data].unit == unit
-                        c.note(unit, f.name_span, s"`${f.name}` is already a variant of `${c.data[v.data].name}`")
-                if set.len() == 0 && c.class_types.get(f.name) is Some(k)
-                    if c.classes[k].unit == unit
-                        if c.classes[k].decl.object then c.note(unit, f.name_span, s"`${f.name}` is already an object")
-                        else c.note(unit, f.name_span, s"`${f.name}` is already a class, which is called to make one")
+                if set.len() == 0 && c.variants.get(key) is Some(v)
+                    c.note(unit, f.name_span, s"`${f.name}` is already a variant of `${c.data[v.data].name}`")
+                if set.len() == 0 && c.class_types.get(key) is Some(k)
+                    if c.classes[k].decl.object then c.note(unit, f.name_span, s"`${f.name}` is already an object")
+                    else c.note(unit, f.name_span, s"`${f.name}` is already a class, which is called to make one")
                 c.symbols.push(symbol)
                 c.states.push(0)
                 c.bodies.push(None)
                 c.locals.push(buf())
                 declare_defaults(c, id)
                 set.push(id)
-                c.scope.put(f.name, set)
+                c.scope.put(key, set)
                 if set.len() > 1 then mark_overloads(c, set)
             DataItem(_) -> ()
             ClassItem(_) -> ()
@@ -491,62 +611,65 @@ private restore_vars(c: *Checker, saved: Buf[Option[&Type]])
 
 private declare_types(c: *Checker, unit: usize)
     val file = c.units[unit].file
-    var seen: Map[string, Span] = map()
-    for item in file.items
-        if item is DataItem(d)
+    for i in 0..<file.items.len()
+        if file.items[i] is DataItem(d)
+            val key = qualified(file.module_name, d.name)
             if builtin_type(d.name) is Some(_)
                 c.note(unit, d.span, s"`${d.name}` is a built-in type, so it cannot be declared")
                 continue
-            if seen.get(d.name) is Some(_)
+            if c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_)
                 c.note(unit, d.span, s"the type `${d.name}` is declared more than once")
                 continue
-            seen.put(d.name, d.span)
+            if file.private_items[i] then c.private_names.put(key, true)
             for a in d.annotations
                 c.note(unit, a.span, s"unknown annotation `@${a.name}`")
             for t in d.derives
                 c.note(unit, t.span, "`derives` is not implemented")
             for tp in d.type_params
                 if tp.bounds.len() > 0 then c.note(unit, tp.span, "bounds on type parameters are not implemented")
-            c.types.put(d.name, c.data.len())
+            c.types.put(key, c.data.len())
             c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf(), buf(), buf(), buf(), buf()))
-    for item in file.items
-        if item is ClassItem(d)
+    for i in 0..<file.items.len()
+        if file.items[i] is ClassItem(d)
             if d.object then continue
+            val key = qualified(file.module_name, d.name)
             if builtin_type(d.name) is Some(_)
                 c.note(unit, d.name_span, s"`${d.name}` is a built-in type, so it cannot be declared")
                 continue
-            if seen.get(d.name) is Some(_)
+            if c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_)
                 c.note(unit, d.name_span, s"the type `${d.name}` is declared more than once")
                 continue
-            seen.put(d.name, d.span)
-            c.class_types.put(d.name, c.classes.len())
+            if file.private_items[i] then c.private_names.put(key, true)
+            c.class_types.put(key, c.classes.len())
             c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, None, None, buf(), buf(), 0))
-    // An object is a class with one instance. Named after a class of its module, it is that class's
-    // companion and its type has no name of its own; otherwise its name is also its type's.
-    var objects: Map[string, Span] = map()
-    for item in file.items
-        if item is ClassItem(d)
+
+// An object is a class with one instance. Named after a class of its module, in any of the module's
+// files, it is that class's companion and its type has no name of its own; otherwise its name is
+// also its type's. A class and its companion are one name, so a companion is private where its class
+// is.
+private declare_objects(c: *Checker, unit: usize)
+    val file = c.units[unit].file
+    for i in 0..<file.items.len()
+        if file.items[i] is ClassItem(d)
             if !d.object then continue
+            val key = qualified(file.module_name, d.name)
             if builtin_type(d.name) is Some(_)
                 c.note(unit, d.name_span, s"`${d.name}` is a built-in type, so it cannot be declared")
                 continue
-            if objects.get(d.name) is Some(_)
-                c.note(unit, d.name_span, s"the object `${d.name}` is declared more than once")
-                continue
-            objects.put(d.name, d.span)
             val id = c.classes.len()
             var companion: Option[usize] = None
-            if seen.get(d.name) is Some(_)
-                c.class_types.get(d.name) match
-                    Some(k) ->
-                        if c.classes[k].unit == unit && !c.classes[k].decl.object
-                            companion = Some(k)
-                            c.classes[k].companion = Some(id)
-                    None -> ()
-                if companion is None
-                    c.note(unit, d.name_span, s"`${d.name}` is already a data type; an object may share its name only with a class")
+            if c.class_types.get(key) is Some(k)
+                if c.classes[k].decl.object || c.classes[k].companion is Some(_)
+                    c.note(unit, d.name_span, s"the object `${d.name}` is declared more than once")
                     continue
-            else c.class_types.put(d.name, id)
+                companion = Some(k)
+                c.classes[k].companion = Some(id)
+            elif c.types.get(key) is Some(_)
+                c.note(unit, d.name_span, s"`${d.name}` is already a data type; an object may share its name only with a class")
+                continue
+            else
+                c.class_types.put(key, id)
+                if file.private_items[i] then c.private_names.put(key, true)
             c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, companion, None, buf(), buf(), 0))
 
 // Each impl's type and trait, resolved with the impl's type parameters in scope. They are the type's
@@ -580,16 +703,17 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
         _ -> buf()
     var owner = 0usize
     var home = ""
-    if c.types.get(path) is Some(id)
+    val key = resolve_name(c, unit, path)
+    if c.types.get(key) is Some(id)
         owner = data_owner(id)
         home = c.data[id].module_name
-    elif c.class_types.get(path) is Some(id)
+    elif c.class_types.get(key) is Some(id)
         if is_trait(c, id)
             c.note(unit, d.target.span, s"`$path` is a trait; an impl adds to a data type, a class, an object or a built-in type")
             return invalid
         owner = class_owner(id)
         home = c.classes[id].module_name
-    elif builtin_type(path) is Some(_) then home = c.units[0].file.module_name
+    elif builtin_type(path) is Some(_) then home = CoreModule
     else
         c.note(unit, d.target.span, s"unknown type `$path`")
         return invalid
@@ -692,7 +816,10 @@ private declare_variants(c: *Checker, unit: usize)
                         names.push("_")
                 if f.default is Some(e) then c.note(unit, e.span, "default field values are not implemented")
                 fields.push(resolve_type(c, unit, f.ty))
-            c.variants.put(v.name, VariantRef(id, variants.len()))
+            // A variant is a name of its type's module, private where its type is.
+            val key = qualified(c.data[id].module_name, v.name)
+            c.variants.put(key, VariantRef(id, variants.len()))
+            if c.private_names.get(qualified(c.data[id].module_name, c.data[id].name)) is Some(_) then c.private_names.put(key, true)
             variants.push(VariantSymbol(v.name, v.span, names, fields))
         c.data[id].variants = variants
         c.generic = outer_generic
@@ -731,7 +858,7 @@ private declare_fields(c: *Checker, unit: usize)
         var traits: Buf[&Type] = buf()
         for i in 0..<d.parents.len()
             val parent = d.parents[i]
-            if parent_trait(c, parent) is Some(t)
+            if parent_trait(c, unit, parent) is Some(t)
                 if trait_type(c, unit, t, parent) is Some(ty)
                     var repeated = false
                     for other in traits
@@ -743,7 +870,7 @@ private declare_fields(c: *Checker, unit: usize)
             else
                 var is_class = false
                 if parent_name(parent) is Some(n)
-                    if c.class_types.get(n) is Some(_) then is_class = true
+                    if c.class_types.get(resolve_name(c, unit, n)) is Some(_) then is_class = true
                 if !is_class then c.note(unit, parent.span, s"`${parent_name(parent).unwrap_or("this")}` is not a trait")
                 elif d.object then c.note(unit, parent.span, "an object extending a class is not implemented")
                 elif declares_trait then c.note(unit, parent.span, "a trait may require only traits, not a class")
@@ -788,8 +915,8 @@ private is_trait(c: *Checker, k: usize) -> bool = c.classes[k].decl.modifier == 
 
 /** The trait a parent after `:` names, if it names one: `Shape`, `Source[int]`, or a mistaken
  * `Shape(…)`, which `trait_type` reports. */
-private parent_trait(c: *Checker, parent: &Expr) -> Option[usize]
-    val k = c.class_types.get(parent_name(parent)?)?
+private parent_trait(c: *Checker, unit: usize, parent: &Expr) -> Option[usize]
+    val k = c.class_types.get(resolve_name(c, unit, parent_name(parent)?))?
     if is_trait(c, k) then Some(k) else None
 
 /** The name a parent after `:` is written with, without its type or constructor arguments. */
@@ -836,10 +963,11 @@ private superclass_of(c: *Checker, unit: usize, id: usize, parent: &Expr) -> Opt
         _ ->
             c.note(unit, parent.span, "expected a superclass, as in `Base(arguments)`")
             return None
-    val sid = c.class_types.get(name) match
+    val key = resolve_name(c, unit, name)
+    val sid = c.class_types.get(key) match
         Some(s) -> s
         None ->
-            if c.types.get(name) is Some(_) || builtin_type(name) is Some(_)
+            if c.types.get(key) is Some(_) || builtin_type(name) is Some(_)
                 c.note(unit, named.span, s"`$name` is not a class, so it cannot be extended")
             else c.note(unit, named.span, s"`$name` is neither a class nor a trait")
             return None
@@ -993,8 +1121,8 @@ private declare_methods(c: *Checker, unit: usize)
         if k.unit != unit then continue
         val d = k.decl
         // A function of the same name was reported when it was declared.
-        if c.variants.get(d.name) is Some(v)
-            if c.data[v.data].unit == unit then c.note(unit, d.name_span, s"`${d.name}` is already a variant of `${c.data[v.data].name}`")
+        val key = qualified(module_name, d.name)
+        if c.variants.get(key) is Some(v) then c.note(unit, d.name_span, s"`${d.name}` is already a variant of `${c.data[v.data].name}`")
         val self_type = own_class_type(k, id)
         var params: Buf[Param] = buf()
         var types: Buf[&Type] = buf()
@@ -1017,7 +1145,7 @@ private declare_methods(c: *Checker, unit: usize)
         if !d.object
             var constructors: Buf[usize] = buf()
             constructors.push(constructor)
-            c.scope.put(d.name, constructors)
+            c.scope.put(key, constructors)
         c.classes[id].constructor = constructor
         c.classes[id].initializer = constructor
         if is_open(c, id)
@@ -1324,8 +1452,9 @@ is_abstract_method(symbol: FunctionSymbol) -> bool =
 // no parameters whose result is the value; an object's is its class's constructor.
 private declare_globals(c: *Checker, unit: usize)
     val file = c.units[unit].file
-    for item in file.items
-        item match
+    for i in 0..<file.items.len()
+        val key = qualified(file.module_name, item_name(file.items[i]))
+        file.items[i] match
             ValueItem(v) ->
                 if v.name == "_" || global_name_taken(c, unit, v.name, v.span, false) then continue
                 val f = Function(buf(), v.span, v.span, v.name, buf(), buf(), v.declared, Some(v.value), buf())
@@ -1334,7 +1463,8 @@ private declare_globals(c: *Checker, unit: usize)
                 c.states.push(0)
                 c.bodies.push(None)
                 c.locals.push(buf())
-                c.global_names.put(v.name, c.globals.len())
+                if file.private_items[i] then c.private_names.put(key, true)
+                c.global_names.put(key, c.globals.len())
                 c.globals.push(GlobalSymbol(unit, file.module_name, v.name, v.span, v.mutable, init, None))
             ClassItem(d) ->
                 if !d.object then continue
@@ -1344,32 +1474,39 @@ private declare_globals(c: *Checker, unit: usize)
                     if cls.unit == unit && cls.decl.object && cls.name == d.name && cls.global is None
                         if global_name_taken(c, unit, d.name, d.name_span, true) then break
                         c.classes[k].global = Some(c.globals.len())
-                        c.global_names.put(d.name, c.globals.len())
+                        c.global_names.put(key, c.globals.len())
                         c.globals.push(GlobalSymbol(unit, file.module_name, d.name, d.name_span, false, cls.constructor, Some(k)))
             _ -> ()
 
-// Whether a module-level value's name is already declared in its file, reporting it if so. An
+/** The name a top-level declaration introduces: "" for an impl, which introduces none. */
+private item_name(item: Item) -> string = item match
+    FunctionItem(f) -> f.name
+    DataItem(d) -> d.name
+    ClassItem(d) -> d.name
+    ImplItem(_) -> ""
+    ValueItem(v) -> v.name
+
+// Whether a module-level value's name is already declared in its module, reporting it if so. An
 // object's clashes with a class, a function or a variant were reported with its class, so only its
 // clash with a module value is reported here.
 private global_name_taken(c: *Checker, unit: usize, name: string, at: Span, object: bool) -> bool
-    if c.global_names.get(name) is Some(g)
-        if c.globals[g].unit == unit
-            c.note(unit, at, s"`$name` is declared more than once")
-            return true
+    val key = qualified(c.units[unit].file.module_name, name)
+    if c.global_names.get(key) is Some(_)
+        c.note(unit, at, s"`$name` is declared more than once")
+        return true
     if object then return false
-    if c.class_types.get(name) is Some(k)
-        if c.classes[k].unit == unit && !c.classes[k].decl.object && c.classes[k].companion is None
+    if c.class_types.get(key) is Some(k)
+        if !c.classes[k].decl.object && c.classes[k].companion is None
             c.note(unit, at, s"`$name` is already a class")
             return true
-    if c.scope.get(name) is Some(ids)
+    if c.scope.get(key) is Some(ids)
         for f in ids
-            if c.symbols[f].unit == unit && !c.symbols[f].constructor
+            if !c.symbols[f].constructor
                 c.note(unit, at, s"`$name` is already a function")
                 return true
-    if c.variants.get(name) is Some(v)
-        if c.data[v.data].unit == unit
-            c.note(unit, at, s"`$name` is already a variant of `${c.data[v.data].name}`")
-            return true
+    if c.variants.get(key) is Some(v)
+        c.note(unit, at, s"`$name` is already a variant of `${c.data[v.data].name}`")
+        return true
     false
 
 /** The method of class `id` declared as `name`, its own. */
@@ -2173,7 +2310,8 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                 if scope.params[i].name == path
                     if args.len() > 0 then c.note(unit, t.span, s"`$path` takes no type arguments")
                     return TypeVar(scope.owner, i, path)
-        if c.types.get(path) is Some(id)
+        val key = resolve_name(c, unit, path)
+        if c.types.get(key) is Some(id)
             val d = c.data[id]
             var resolved: Buf[&Type] = buf()
             for a in args
@@ -2182,7 +2320,7 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                 c.note(unit, t.span, s"`$path` takes ${count(d.decl.type_params.len(), "type argument")}, not ${resolved.len()}")
                 return ErrorType
             return Data(id, d.name, resolved)
-        if c.class_types.get(path) is Some(id)
+        if c.class_types.get(key) is Some(id)
             val k = c.classes[id]
             var resolved: Buf[&Type] = buf()
             for a in args
@@ -2198,7 +2336,7 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                     return ErrorType
                 ty
             None ->
-                c.variants.get(path) match
+                c.variants.get(key) match
                     Some(v) -> c.note(unit, t.span, s"`$path` is a variant of `${c.data[v.data].name}`, not a type")
                     None -> c.note(unit, t.span, s"unknown type `$path`")
                 ErrorType
@@ -2573,7 +2711,20 @@ private lookup_functions(c: *Checker, name: string) -> Buf[usize]
             for k in c.body.function_starts[i]..<i + 1
                 if c.symbols[c.body.functions[k]].name == name then found.push(c.body.functions[k])
             return found
-    c.scope.get(name).unwrap_or(found)
+    top_level_functions(c, unit_of(c), name)
+
+// The top-level functions a bare name refers to in a file: those of the module it resolves to, and
+// of another module only the public ones.
+private top_level_functions(c: *Checker, unit: usize, name: string) -> Buf[usize]
+    var found: Buf[usize] = buf()
+    val key = resolve_name(c, unit, name)
+    val ids = c.scope.get(key) match
+        Some(ids) -> ids
+        None -> return found
+    if key == qualified(c.files[unit].module_name, name) then return ids
+    for id in ids
+        if c.symbols[id].public then found.push(id)
+    found
 
 /** The innermost function a name refers to, when it refers to any. */
 private lookup_function(c: *Checker, name: string) -> Option[usize]
@@ -2811,7 +2962,7 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
     if lookup_function(c, name) is Some(id)
         if abstract_constructor(c, id, at) then return TExpr(at, ErrorType, UnitConst)
         return named_function_value(c, at, name, None, expected)
-    if c.variants.get(name) is Some(v)
+    if variant_named(c, name) is Some(v)
         if c.data[v.data].variants[v.index].fields.len() == 0 then return construct(c, at, at, v, buf(), None, expected)
         c.note(symbol.unit, at, s"`$name` has fields; call it, as in `$name(…)`")
     else c.note(symbol.unit, at, s"`$name` is not defined")
@@ -3034,7 +3185,7 @@ private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], 
             if abstract_constructor(c, id, target.span) then return TExpr(e.span, ErrorType, UnitConst)
             return named_function_value(c, e.span, name, Some(types), expected)
         if lookup_local(c, name) is None && param_index(c, name) is None
-            if c.variants.get(name) is Some(v)
+            if variant_named(c, name) is Some(v)
                 if c.data[v.data].variants[v.index].fields.len() == 0
                     return construct(c, e.span, target.span, v, buf(), Some(types), expected)
     // A method named without a call, with its own type arguments, as in `box.convert[int]`.
@@ -3300,14 +3451,13 @@ private update_field(c: *Checker, e: &Expr, target: &Expr, increment: bool, post
     place.wrap(e.span, TExpr(e.span, ty, Block(items)))
 
 // A module-level value or object named by a bare name, unless a local function of that name hides
-// it or a function of a later file, the program's own over the prelude, shadows it.
+// it or a declaration of a nearer module, the file's own over the core library's, shadows it.
 private global_named(c: *Checker, name: string) -> Option[usize]
     if local_function(c, name) is Some(_) then return None
-    val g = c.global_names.get(name)?
-    if c.scope.get(name) is Some(ids)
-        for f in ids
-            if c.symbols[f].unit > c.globals[g].unit then return None
-    Some(g)
+    c.global_names.get(resolve_name(c, unit_of(c), name))
+
+/** The variant a bare name refers to in the code being checked, if it refers to one. */
+private variant_named(c: *Checker, name: string) -> Option[VariantRef] = c.variants.get(resolve_name(c, unit_of(c), name))
 
 // A module-level value's type is its initializer's result: declared, or inferred by checking the
 // initializer first, which is not possible while that initializer is itself being checked.
@@ -4098,7 +4248,7 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
             return TExpr(at, ErrorType, UnitConst)
         return value_call(c, at, callee, args)
     if ids.len() == 0
-        if c.variants.get(name) is Some(v)
+        if variant_named(c, name) is Some(v)
             if c.data[v.data].variants[v.index].fields.len() == 0
                 c.note(unit, at, s"`$name` has no fields; write it without parentheses")
                 for a in args
@@ -5216,7 +5366,7 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
         InvalidPattern -> TPattern(p.span, ErrorType, PWildcard)
         Name(name) ->
             // A bare name is a variant with no fields when one is in scope, and otherwise binds.
-            if c.variants.get(name) is Some(v)
+            if variant_named(c, name) is Some(v)
                 if c.data[v.data].variants[v.index].fields.len() > 0
                     c.note(unit, p.span, s"`$name` has fields; match them, as in `$name(…)`")
                     return TPattern(p.span, ErrorType, PWildcard)
@@ -5278,7 +5428,7 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
             for o in options
                 typed.push(check_pattern(c, o, ty, if no_bind == "" then "alternatives bind no names; write `_` for a value that is not used" else no_bind))
             TPattern(p.span, ty, PAlternatives(typed))
-        Constructor(path, args) -> c.variants.get(path) match
+        Constructor(path, args) -> variant_named(c, path) match
             Some(v) -> variant_pattern(c, p, v, args, ty, no_bind)
             None ->
                 c.note(unit, p.span, s"`$path` is not a variant")
@@ -5370,7 +5520,7 @@ private may_match(c: *Checker, from: &Type, to: &Type) -> bool
 // binder there.
 private binder_local(c: *Checker, binder: &Pattern, ty: &Type, no_bind: string) -> Option[usize] = binder.kind match
     Name(name) ->
-        if c.variants.get(name) is Some(_)
+        if variant_named(c, name) is Some(_)
             c.note(unit_of(c), binder.span, s"`$name` is a variant; a comparison binds a name or `_`")
             return None
         if no_bind != ""

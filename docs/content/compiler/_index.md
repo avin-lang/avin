@@ -26,6 +26,22 @@ Each stage has its own data structures and its own tests. No stage reaches back 
 input. **Types are an enum over symbols, never strings**: built-in types, nominal types, functions,
 tuples, type parameters, inference variables, `Any`, `Nothing` and an error type.
 
+**Loading a program.** `avin build <dir>` takes a directory as the program's root: every `.avin` file
+under it is read in path order, passing over directories whose names begin with `.`, and each is
+given the module its directory's path names, the root directory's files last as the root module.
+A file whose header disagrees with its directory, or that has none outside the root, is reported
+before anything is checked. `avin build <file>` is a program of that one file, in the module its
+header names. The standard library is loaded the same way, from `library/` under the toolchain's
+root, where every module is `avin` or under it; `library/avin/prelude.avin` is one ordinary file of
+module `avin`. A package manifest will name the roots the loader walks; the files and their modules
+are what the later stages see.
+
+Names are resolved by module. Every top-level declaration is held under its qualified name, `a.b.X`
+(a root module's under `X`), and a bare name in a file resolves to the first of its own module's
+declaration, its file's import, and the `avin` module's public declaration that exists. Imports are
+checked once every declaration of the program is known, and a wrong one is dropped. Object-file
+symbols carry the module path, so two modules may each declare `helper`.
+
 ## Runtime
 
 `runtime/` is a Sysl package, built into a library archive when its sources change rather than once

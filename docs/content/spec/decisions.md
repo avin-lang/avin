@@ -239,6 +239,23 @@ a decision changes, this page and the chapter change together.
 **Project and tooling**
 
 - A project lists packages; a package has an `avin.hocon` manifest; a module is a directory.
+- A program's root is a directory, and each directory under it is a module named by its path from
+  the root (`a/b` is `a.b`). The root directory's own files are the root module, which has no name
+  and holds `main`; they take no header. Every other file begins with `module a.b`, naming the module
+  its directory makes it part of. A program of one file is compiled alone, and its header, if any,
+  names its module.
+- A module's files share one namespace: what one declares, every other sees by its bare name, its
+  `private` declarations included. Another module's declarations are reached only by importing them,
+  per file: `import a.b.X`, `import a.b.{X, y as z}`. There is no wildcard import. An unknown
+  import, an import of a private
+  declaration and an import of a name the file's module declares or another import already binds are
+  errors; an unused import is not.
+- A file sees its own module's declarations, then its imports, then the standard library's public
+  declarations in module `avin`, which need no import; the nearer hides the farther. Program modules
+  may not be `avin` or under it.
+- Modules may import one another in a cycle; module-level values initialize in the order their uses
+  need across the whole program.
+- A class and its companion object are in one module, in any of its files.
 - One `avin` command does everything: build, run, test, deps and config.
 - Testing follows Sysl's model: `@test`, `@tests`, setup and teardown, and the built-in runner.
   Every feature ships with tests.
@@ -263,6 +280,10 @@ a decision changes, this page and the chapter change together.
 - Partial-function literal syntax, which the user has explicitly left undecided.
 
 ## Proposed
+
+- A module is not named in code: `import a.b` is an error, and `b.X` does not reach `a.b`'s `X`.
+  Every use of another module's declaration goes through an import of that declaration. The
+  alternative is qualified access through an imported module name, `import a.b` then `b.X`.
 
 - An infix method call binds more loosely than arithmetic, bitwise, shift, cons and range operators
   and more tightly than comparisons, `is`, `&&` and `||`, and groups to the left, so
