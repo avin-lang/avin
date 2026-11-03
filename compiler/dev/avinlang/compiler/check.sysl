@@ -29,6 +29,10 @@ struct FunctionSymbol
      * through the local functions it calls. */
     captured_locals: Buf[usize]
     captured_params: Buf[usize]
+    /** Whether this is a lambda, which has no name of its own. */
+    lambda: bool
+    /** Whether the function is used as a value somewhere, so a closure of it is made. */
+    value: bool
 
 /** A `data` type and its variants. Field types name the type's own parameters as
  * `TypeVar(data_owner(id), i)`, so a field of a particular value's type is its declared type with the
@@ -310,7 +314,7 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function) -
     elif f.body is None && f.clauses.len() == 0
         c.note(unit, f.name_span, s"`${f.name}` needs a body, or clauses on the lines after it")
     c.generic = outer_generic
-    FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf())
+    FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf(), false, false)
 
 // `@intrinsic("name")` is the only annotation this compiler gives meaning to; it is valid only on a
 // function without a body.
@@ -368,9 +372,12 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
         for item in items
             types.push(resolve_type(c, unit, item))
         Tuple(types)
-    Function(_, _) ->
-        c.note(unit, t.span, "function types are not implemented")
-        ErrorType
+    Function(params, result) ->
+        var types: Buf[&Type] = buf()
+        for p in params
+            if p.by_name then c.note(unit, p.ty.span, "by-name parameters are not implemented")
+            types.push(resolve_type(c, unit, p.ty))
+        Function(types, resolve_type(c, unit, result))
 
 private check_function(c: *Checker, id: usize)
     if c.states[id] != 0 then return
@@ -434,7 +441,7 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
             symbol.result match
                 Some(declared) ->
                     if !conforms(body.ty, declared) && !(*declared is Unit)
-                        c.note(unit, b.body.span, s"`${symbol.name}` yields ${type_name(body.ty)}, not ${type_name(declared)}")
+                        c.note(unit, b.body.span, s"${described(symbol)} yields ${type_name(body.ty)}, not ${type_name(declared)}")
                 None ->
                     if agreed
                         join(ty, body.ty) match
@@ -465,7 +472,7 @@ private check_body(c: *Checker, id: usize, body: &Expr)
     symbol.result match
         Some(declared) ->
             if !conforms(typed.ty, declared) && !(*declared is Unit)
-                c.note(symbol.unit, body.span, s"`${symbol.name}` yields ${type_name(typed.ty)}, not ${type_name(declared)}")
+                c.note(symbol.unit, body.span, s"${described(symbol)} yields ${type_name(typed.ty)}, not ${type_name(declared)}")
         None -> c.symbols[id].result = Some(typed.ty)
     c.bodies.set(id, Some(typed))
 
@@ -506,7 +513,7 @@ private finish_captures(c: *Checker)
         val callee = c.symbols[call.callee]
         for x in callee.captured_locals
             if !contains_index(call.initialized, x)
-                c.note(callee.unit, call.span, s"`${callee.name}` uses `${c.body.locals[x].name}`, which is not initialized where `${callee.name}` is called here")
+                c.note(callee.unit, call.span, s"`${callee.name}` uses `${c.body.locals[x].name}`, which is not initialized where `${callee.name}` is used here")
                 break
 
 private contains_index(items: Buf[usize], x: usize) -> bool
@@ -586,6 +593,9 @@ private check_local_function(c: *Checker, decl: &Function) -> usize
 
 private unit_of(c: *Checker) -> usize = c.symbols[c.current].unit
 
+/** A function as diagnostics name it. */
+private described(symbol: FunctionSymbol) -> string = if symbol.lambda then "this lambda" else s"`${symbol.name}`"
+
 /** Checks an expression whose value is used. */
 check_expr(c: *Checker, e: &Expr, expected: Option[&Type]) -> &TExpr = check_value(c, e, expected, true)
 
@@ -622,6 +632,7 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
     Return(value) -> return_expr(c, e, value)
     Match(subject, arms) -> match_expr(c, e, subject, arms, expected, used)
     Is(value, pattern, negated) -> is_expr(c, e, value, pattern, negated)
+    Lambda(params, body) -> lambda_expr(c, e, params, body, expected)
     LocalFunction(decl) ->
         check_local_function(c, decl)
         TExpr(e.span, Unit, UnitConst)
@@ -655,9 +666,8 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
     if param_index(c, name) is Some(i)
         if c.current != c.body.root then c.body.uses.push(CaptureUse(c.current, i, true))
         return TExpr(at, c.symbols[c.body.root].params[i], Param(i))
-    if lookup_function(c, name) is Some(_)
-        c.note(symbol.unit, at, s"`$name` is a function; function values are not implemented")
-    elif c.variants.get(name) is Some(v)
+    if lookup_function(c, name) is Some(id) then return function_value(c, at, id, None, expected)
+    if c.variants.get(name) is Some(v)
         if c.data[v.data].variants[v.index].fields.len() == 0 then return construct(c, at, at, v, buf(), None, expected)
         c.note(symbol.unit, at, s"`$name` has fields; call it, as in `$name(…)`")
     else c.note(symbol.unit, at, s"`$name` is not defined")
@@ -666,7 +676,8 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
 // Type arguments written on a name that is not called: a variant with no fields, as in `None[int]`.
 private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], expected: Option[&Type]) -> &TExpr
     if target.kind is Name(name)
-        if lookup_function(c, name) is None
+        if lookup_function(c, name) is Some(id) then return function_value(c, e.span, id, Some(types), expected)
+        if lookup_local(c, name) is None && param_index(c, name) is None
             if c.variants.get(name) is Some(v)
                 if c.data[v.data].variants[v.index].fields.len() == 0
                     return construct(c, e.span, target.span, v, buf(), Some(types), expected)
@@ -1054,6 +1065,8 @@ private compare_link(c: *Checker, op: CompareOp, a: &TExpr, b: &TExpr)
     val at = a.span.to(b.span)
     val spelling = compare_spelling(op)
     if op is Same || op is NotSame
+        // A function value is a closure, a reference type, so it has an identity.
+        if *a.ty is Function(_, _) && same_type(a.ty, b.ty) then return
         c.note(unit_of(c), at, s"`$spelling` compares identities, and ${type_name(a.ty)} values have none")
         return
     if !same_type(a.ty, b.ty)
@@ -1193,13 +1206,14 @@ private return_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
                 Some(v) ->
                     val t = check_expr(c, v, Some(r))
                     if !conforms(t.ty, r) && !(*r is Unit)
-                        c.note(unit, v.span, s"`${symbol.name}` yields ${type_name(r)}, not ${type_name(t.ty)}")
+                        c.note(unit, v.span, s"${described(symbol)} yields ${type_name(r)}, not ${type_name(t.ty)}")
                     typed = Some(t)
                 None ->
                     if !(*r is Unit || *r is ErrorType)
-                        c.note(unit, e.span, s"`return` needs a value, because `${symbol.name}` yields ${type_name(r)}")
+                        c.note(unit, e.span, s"`return` needs a value, because ${described(symbol)} yields ${type_name(r)}")
         None ->
-            c.note(unit, e.span, s"`${symbol.name}` uses `return`, so it needs a declared result type")
+            if symbol.lambda then c.note(unit, e.span, "this lambda uses `return`, so its result type must be known where it is written, as in `val f: (int) -> int = …`")
+            else c.note(unit, e.span, s"`${symbol.name}` uses `return`, so it needs a declared result type")
             if value is Some(v) then typed = Some(check_expr(c, v, None))
     TExpr(e.span, Nothing, Return(typed))
 
@@ -1217,9 +1231,10 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
         named = inner
     val name = named.kind match
         Name(n) -> n
-        _ ->
-            c.note(unit, callee.span, "only a named function can be called")
-            return TExpr(at, ErrorType, UnitConst)
+        _ -> return value_call(c, at, callee, args)
+    // A local or a parameter hides a function of the same name, as it does where it is not called.
+    if explicit is None && (lookup_local(c, name) is Some(_) || param_index(c, name) is Some(_))
+        return value_call(c, at, callee, args)
     if lookup_function(c, name) is None
         if c.variants.get(name) is Some(v)
             if c.data[v.data].variants[v.index].fields.len() == 0
@@ -1236,13 +1251,7 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
             c.note(unit, named.span, s"`$name` is not defined")
             return TExpr(at, ErrorType, UnitConst)
     val target = c.symbols[id]
-    if target.root is Some(_)
-        c.body.calls.push(LocalCall(c.current, id))
-        if c.states[id] == 0
-            var initialized: Buf[usize] = buf()
-            for v in c.body.visible
-                initialized.push(v)
-            c.body.early.push(EarlyCall(id, at, initialized))
+    local_use(c, id, at)
     val declared = result_of(c, id, at)
     val applied = apply(c, at, named.span, name, true, target.decl.type_params, id, target.params, declared, args, explicit, expected)
     TExpr(at, applied.result, Call(id, applied.args, applied.type_args))
@@ -1281,17 +1290,7 @@ private apply(c: *Checker, at: Span, name_span: Span, name: string, called: bool
     val wanted = substitute_all(params, owner, type_args)
     val declared = substitute(result, owner, type_args)
     if expected is Some(want) then unify(c, declared, want)
-    var early: Buf[Option[&TExpr]] = buf()
-    for _ in args
-        early.push(None)
-    for pass in 0..<2
-        for i in 0..<args.len()
-            // The first pass checks the arguments that are not bare literals, the second the rest.
-            if (pass == 0) == is_literal(args[i].value) then continue
-            early.set(i, Some(call_argument(c, args[i], if i < wanted.len() then Some(wanted[i]) else None)))
-    var typed: Buf[&TExpr] = buf()
-    for t in early
-        typed.push(t.unwrap())
+    val typed = check_arguments(c, args, wanted)
     if args.len() != params.len()
         c.note(unit, at, s"`$name` takes ${count(params.len(), "argument")}, not ${args.len()}")
     var solved: Buf[&Type] = buf()
@@ -1312,6 +1311,164 @@ private apply(c: *Checker, at: Span, name_span: Span, name: string, called: bool
     for t in typed
         if *t.ty is Nothing then ty = Nothing
     Applied(typed, solved, ty)
+
+// Checks a call's arguments against its parameter types, in an order that lets each argument use
+// what the others decide: first the arguments that are neither bare literals nor lambdas, then the
+// literals, which take the types the others settle, and last the lambdas, whose parameter types
+// come from all of them.
+private check_arguments(c: *Checker, args: Buf[Argument], wanted: Buf[&Type]) -> Buf[&TExpr]
+    var early: Buf[Option[&TExpr]] = buf()
+    for _ in args
+        early.push(None)
+    for pass in 0..<3
+        for i in 0..<args.len()
+            val value = args[i].value
+            val rank = if value.kind is Lambda(_, _) then 2 elif is_literal(value) then 1 else 0
+            if rank != pass then continue
+            early.set(i, Some(call_argument(c, args[i], if i < wanted.len() then Some(wanted[i]) else None)))
+    var typed: Buf[&TExpr] = buf()
+    for t in early
+        typed.push(t.unwrap())
+    typed
+
+// A use of a local function, by a call or as a value, needs what the function captures where it is
+// used; a use before the function's declaration needs those captures initialized already.
+private local_use(c: *Checker, id: usize, at: Span)
+    if c.symbols[id].root is None then return
+    c.body.calls.push(LocalCall(c.current, id))
+    if c.states[id] == 0
+        var initialized: Buf[usize] = buf()
+        for v in c.body.visible
+            initialized.push(v)
+        c.body.early.push(EarlyCall(id, at, initialized))
+
+// A named function used as a value. A generic one is instantiated as a call would be, with its type
+// arguments written or decided by the expected function type.
+private function_value(c: *Checker, at: Span, id: usize, explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+    val unit = unit_of(c)
+    val target = c.symbols[id]
+    local_use(c, id, at)
+    val result = result_of(c, id, at)
+    val type_params = target.decl.type_params
+    val first = c.vars.len()
+    var type_args: Buf[&Type] = buf()
+    for _ in type_params
+        type_args.push(fresh_var(c))
+    if explicit is Some(types)
+        if types.len() > type_params.len()
+            c.note(unit, at, s"`${target.name}` takes ${count(type_params.len(), "type argument")}, not ${types.len()}")
+            for t in type_args
+                unify(c, t, ErrorType)
+        else
+            for i in 0..<types.len()
+                unify(c, type_args[i], resolve_type(c, unit, types[i]))
+    val declared: &Type = Function(target.params, result)
+    val ty = substitute(declared, id, type_args)
+    if expected is Some(want) then unify(c, ty, want)
+    var solved: Buf[&Type] = buf()
+    for i in 0..<type_args.len()
+        val t = zonk(c, type_args[i])
+        if *t is Var(v)
+            if v >= first
+                c.note(unit, at, s"cannot infer `${type_params[i].name}` for `${target.name}` used as a value; write it, as in `${target.name}[int]`")
+                c.vars.set(v, Some(ErrorType))
+        solved.push(zonk(c, t))
+    c.symbols[id].value = true
+    TExpr(at, zonk(c, ty), FunctionValue(id, solved))
+
+// A call of a value of a function type: a local, a parameter, or any expression that yields a
+// function.
+private value_call(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument]) -> &TExpr
+    val unit = unit_of(c)
+    val f = check_expr(c, callee, None)
+    val ty = zonk(c, f.ty)
+    *ty match
+        Function(params, result) ->
+            val typed = check_arguments(c, args, params)
+            if args.len() != params.len()
+                c.note(unit, at, s"this function takes ${count(params.len(), "argument")}, not ${args.len()}")
+            var r = zonk(c, result)
+            for t in typed
+                if *t.ty is Nothing then r = Nothing
+            TExpr(at, r, CallValue(f, typed))
+        _ ->
+            if settled(ty) then c.note(unit, callee.span, s"a value of type ${type_name(ty)} cannot be called; only a function can")
+            for a in args
+                check_statement(c, a.value)
+            TExpr(at, if *ty is Nothing then Nothing else ErrorType, UnitConst)
+
+// A lambda is an anonymous local function, checked where it is written. Its parameter types are
+// written or come from the function type expected there, and its result type comes from that type
+// or from its body.
+private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr, expected: Option[&Type]) -> &TExpr
+    val unit = unit_of(c)
+    var wanted: Buf[&Type] = buf()
+    var wanted_result: Option[&Type] = None
+    var mismatched = false
+    if expected is Some(want)
+        val known = zonk(c, want)
+        if *known is Function(ps, r)
+            if ps.len() == params.len()
+                wanted = ps
+                wanted_result = Some(r)
+            else
+                c.note(unit, e.span, s"expected a function of ${count(ps.len(), "parameter")}, but this lambda takes ${params.len()}")
+                mismatched = true
+    var types: Buf[&Type] = buf()
+    var names: Buf[string] = buf()
+    for i in 0..<params.len()
+        val p = params[i]
+        names.push(p.name)
+        var ty: &Type = ErrorType
+        p.declared match
+            Some(d) ->
+                ty = resolve_type(c, unit, d)
+                if i < wanted.len()
+                    if !unify(c, wanted[i], ty)
+                        c.note(unit, p.span, s"`${p.name}` is declared ${type_name(ty)}, but this lambda is expected to take ${type_name(zonk(c, wanted[i]))}")
+                        ty = ErrorType
+            None ->
+                val known: &Type = if i < wanted.len() then zonk(c, wanted[i]) else Var(0)
+                if i < wanted.len() && !has_unknowns(known) then ty = known
+                elif !mismatched then c.note(unit, p.span, s"cannot infer the type of `${p.name}`; write it, as in `(${p.name}: int) -> …`")
+        types.push(ty)
+    var result: Option[&Type] = None
+    if wanted_result is Some(r)
+        val known = zonk(c, r)
+        if !has_unknowns(known) then result = Some(known)
+    val enclosing = c.symbols[c.current]
+    val decl = Function(buf(), e.span, e.span, "lambda", buf(), buf(), None, Some(body), buf())
+    val id = c.symbols.len()
+    c.symbols.push(FunctionSymbol(enclosing.unit, enclosing.module_name, "lambda", decl, types, names, result, None, Some(c.body.root), buf(), buf(), buf(), true, true))
+    c.states.push(1)
+    c.bodies.push(None)
+    c.locals.push(buf())
+    // Checked as a local function is: its parameters are locals of its own, and loops outside it are
+    // not its loops.
+    val previous = c.current
+    val loops = c.body.loops
+    val outer_start = c.body.block_start
+    val mark = c.body.visible.len()
+    c.current = id
+    c.body.loops = buf()
+    c.body.block_start = mark
+    var param_locals: Buf[usize] = buf()
+    for i in 0..<params.len()
+        param_locals.push(declare_local(c, params[i].span, names[i], types[i], false))
+    c.symbols[id].param_locals = param_locals
+    check_body(c, id, body)
+    c.body.visible.truncate(mark)
+    c.body.block_start = outer_start
+    c.body.loops = loops
+    c.current = previous
+    c.states.set(id, 2)
+    // Making the closure needs everything the lambda captures where it is written.
+    c.body.calls.push(LocalCall(previous, id))
+    val yields = c.symbols[id].result.unwrap_or(ErrorType)
+    if result is None
+        if wanted_result is Some(r) then unify(c, r, yields)
+    val ty: &Type = if mismatched then ErrorType else Function(types, yields)
+    TExpr(e.span, ty, FunctionValue(id, buf()))
 
 // Checks one argument against its parameter type, which may still contain unknowns; the argument's
 // type decides them.

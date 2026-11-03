@@ -15,6 +15,7 @@ mir_type(t: &Type) -> Option[MirType] = *t match
     Real -> Some(MReal)
     Data(_, _, _) -> Some(MRef)
     Tuple(_) -> Some(MRef)
+    Function(_, _) -> Some(MRef)
     _ -> None
 
 /** Where a value is kept: the address of a slot, and the type stored there. */
@@ -48,6 +49,15 @@ private struct DataLayout
 private struct Instance
     function: usize
     type_args: Buf[&Type]
+    /** Whether this is the function's closure entry rather than the function itself. */
+    entry: bool
+
+/** The layout of a closure of one function: its descriptor, and where each captured value is kept,
+ * the captured locals first, then the captured top-level parameters. The entry's address is at
+ * offset 8. A closure that captures nothing is constant. */
+private struct ClosureShape
+    descriptor: usize
+    fields: Buf[FieldSlot]
 
 private struct Lowering
     program: TProgram
@@ -58,6 +68,12 @@ private struct Lowering
     /** Each instance's index, by its function and type arguments. */
     instance_index: Map[string, usize]
     descriptors: Buf[Descriptor]
+    closures: Buf[ClosureConstant]
+    /** Each closure layout, and each constant closure's index, by function instance. */
+    shapes: Map[string, ClosureShape]
+    closure_index: Map[string, usize]
+    /** The descriptor of a box for each machine type, by the type's name. */
+    boxes: Map[string, usize]
     layouts: Buf[DataLayout]
     /** Each layout's index, by the data type it lays out. */
     layout_index: Map[string, usize]
@@ -67,6 +83,11 @@ private struct Lowering
     /** The value holding each parameter of the top-level function, or `None` for a unit one or, in
      * a local function, one it does not capture. */
     param_values: Buf[Option[usize]]
+    /** The locals of the top-level function the code being lowered belongs to, and whether each is
+     * kept in a box: a `var` that a closure captures lives on the heap, so the closure and the code
+     * around it share it. The local's own place then holds the box. */
+    locals: Buf[TLocal]
+    boxed: Buf[bool]
     /** Where each local is kept: in this function's own slot, or behind a captured address; `None`
      * for one with no runtime value or that this function does not reach. */
     local_slots: Buf[Option[Place]]
@@ -84,7 +105,7 @@ private struct Lowering
 // Every function that is not generic is compiled once; each generic function is compiled for each
 // list of type arguments a compiled call gives it, as those calls are found.
 lower_program(program: TProgram) -> MirProgram
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), None, false)
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), None, false)
     for i in 0..<program.symbols.len()
         if !is_generic(program, i) then instance(&l, i, buf())
     val entry = instance(&l, program.entry, buf())
@@ -93,7 +114,7 @@ lower_program(program: TProgram) -> MirProgram
     while k < l.instances.len()
         functions.push(lower_function(&l, k))
         k += 1
-    MirProgram(functions, l.strings, l.descriptors, entry)
+    MirProgram(functions, l.strings, l.descriptors, l.closures, entry)
 
 // An object is a descriptor word followed by its fields in order, each at a multiple of 8 bytes.
 private field_size(t: MirType) -> usize = t match
@@ -202,15 +223,167 @@ private is_generic(program: TProgram, id: usize) -> bool
     program.symbols[owner].decl.type_params.len() > 0
 
 /** The index of the instance of `function` for `type_args`, made when first asked for. */
-private instance(l: *Lowering, function: usize, type_args: Buf[&Type]) -> usize
-    var key = function.to_string()
-    for t in type_args
-        key = key + "|" + type_name(t)
+private instance(l: *Lowering, function: usize, type_args: Buf[&Type]) -> usize =
+    instance_of(l, function, type_args, false)
+
+/** The closure entry of `function` for `type_args`: it takes the closure, then the function's
+ * parameters, and calls the function with what the closure holds. */
+private entry_instance(l: *Lowering, function: usize, type_args: Buf[&Type]) -> usize =
+    instance_of(l, function, type_args, true)
+
+private instance_of(l: *Lowering, function: usize, type_args: Buf[&Type], entry: bool) -> usize
+    val key = instance_key(function, type_args, entry)
     if l.instance_index.get(key) is Some(index) then return index
     val index = l.instances.len()
-    l.instances.push(Instance(function, type_args))
+    l.instances.push(Instance(function, type_args, entry))
     l.instance_index.put(key, index)
     index
+
+private instance_key(function: usize, type_args: Buf[&Type], entry: bool) -> string
+    var key = if entry then s"entry $function" else function.to_string()
+    for t in type_args
+        key = key + "|" + type_name(t)
+    key
+
+// Which locals of a top-level function live in boxes: each `var` captured by a function of it that
+// is made into a closure. Locals with no runtime value need no box.
+private boxed_locals(l: *Lowering, root: usize, locals: Buf[TLocal]) -> Buf[bool]
+    var boxed: Buf[bool] = buf()
+    for _ in locals
+        boxed.push(false)
+    for symbol in l.program.symbols
+        if symbol.root != Some(root) || !symbol.value then continue
+        for x in symbol.captured_locals
+            if locals[x].mutable && machine(l, locals[x].ty) is Some(_) then boxed[x] = true
+    boxed
+
+/** The descriptor of a box holding one value of machine type `t`. */
+private box_descriptor(l: *Lowering, t: MirType) -> usize
+    val key = machine_name(t)
+    if l.boxes.get(key) is Some(d) then return d
+    var refs: Buf[usize] = buf()
+    if t is MRef then refs.push(8)
+    val d = l.descriptors.len()
+    l.descriptors.push(Descriptor("box of " + key, 0, 8 + field_size(t), refs, false))
+    l.boxes.put(key, d)
+    d
+
+private machine_name(t: MirType) -> string = t match
+    MInt(bits) -> s"i$bits"
+    MBool -> "bool"
+    MReal -> "real"
+    MPtr -> "address"
+    MRef -> "reference"
+
+// A closure is its descriptor, its entry's address, and then the value of each local and top-level
+// parameter the function captures; a boxed local is captured as its box, so it stays shared.
+private closure_shape(l: *Lowering, function: usize, type_args: Buf[&Type]) -> ClosureShape
+    val key = instance_key(function, type_args, false)
+    if l.shapes.get(key) is Some(shape) then return shape
+    val symbol = l.program.symbols[function]
+    var fields: Buf[FieldSlot] = buf()
+    var refs: Buf[usize] = buf()
+    var size = 16usize
+    symbol.root match
+        Some(root) ->
+            for x in symbol.captured_locals
+                if machine(l, l.locals[x].ty) is Some(t)
+                    val m = if l.boxed[x] then MRef else t
+                    if m is MRef then refs.push(size)
+                    fields.push(FieldSlot(size, m))
+                    size += field_size(m)
+            for x in symbol.captured_params
+                if machine(l, l.program.symbols[root].params[x]) is Some(m)
+                    if m is MRef then refs.push(size)
+                    fields.push(FieldSlot(size, m))
+                    size += field_size(m)
+        None -> ()
+    val shape = ClosureShape(l.descriptors.len(), fields)
+    l.descriptors.push(Descriptor("closure of " + function_symbol(l.program, function, type_args), 0, size, refs, false))
+    l.shapes.put(key, shape)
+    shape
+
+// A function as a value. One that captures nothing is a constant closure; otherwise the captured
+// values are read first and the closure is allocated after, so a collection while allocating sees
+// each of them as a root.
+private function_value(l: *Lowering, function: usize, type_args: Buf[&Type]) -> Operand
+    val symbol = l.program.symbols[function]
+    var concrete_args: Buf[&Type] = buf()
+    if symbol.root is Some(_) then concrete_args = l.subst
+    else
+        for t in type_args
+            concrete_args.push(concrete(l, t))
+    val entry = entry_instance(l, function, concrete_args)
+    val shape = closure_shape(l, function, concrete_args)
+    if shape.fields.len() == 0
+        val key = instance_key(function, concrete_args, false)
+        if l.closure_index.get(key) is Some(index) then return ConstClosure(index)
+        val index = l.closures.len()
+        l.closures.push(ClosureConstant(shape.descriptor, entry))
+        l.closure_index.put(key, index)
+        return ConstClosure(index)
+    var values: Buf[Operand] = buf()
+    for x in symbol.captured_locals
+        if machine(l, l.locals[x].ty) is Some(_)
+            val place = if l.boxed[x] then l.local_slots[x] else local_place(l, x)
+            values.push(load(l, place).unwrap())
+    for x in symbol.captured_params
+        if l.param_values[x] is Some(v) then values.push(Value(v))
+    val object = fresh(l, MRef)
+    l.insts.push(Alloc(object, shape.descriptor))
+    l.insts.push(Store(field_address(l, Value(object), FieldSlot(8, MPtr)), FunctionAddress(entry)))
+    for i in 0..<values.len()
+        l.insts.push(Store(field_address(l, Value(object), shape.fields[i]), values[i]))
+    Value(object)
+
+// Calls a function value: its entry is at offset 8, and takes the closure before the arguments.
+private call_value(l: *Lowering, callee: &TExpr, args: Buf[&TExpr]) -> Option[Operand]
+    val target = lower_expr(l, callee)?
+    var operands: Buf[Operand] = buf()
+    operands.push(target)
+    for a in args
+        val op = lower_expr(l, a)
+        if machine(l, a.ty) is Some(_)
+            op match
+                Some(v) -> operands.push(v)
+                None -> return None
+    var params: Buf[MirType] = buf()
+    params.push(MRef)
+    var result: Option[MirType] = None
+    *concrete(l, callee.ty) match
+        Function(ps, r) ->
+            for p in ps
+                if machine(l, p) is Some(t) then params.push(t)
+            result = machine(l, r)
+        _ -> panic("a call of a value that is not a function")
+    val code = load_field(l, target, FieldSlot(8, MPtr))
+    val dest = result match
+        Some(t) -> Some(fresh(l, t))
+        None -> None
+    l.insts.push(Call(dest, Indirect(code, MirSignature(params, result)), operands))
+    dest match
+        Some(id) -> Some(Value(id))
+        None -> None
+
+/** Where a local's value is: its place, or for a boxed local, the box's field. */
+private local_place(l: *Lowering, x: usize) -> Option[Place]
+    val place = l.local_slots[x]?
+    if !l.boxed[x] then return Some(place)
+    val t = machine(l, l.locals[x].ty).unwrap()
+    val box = load(l, Some(place)).unwrap()
+    Some(Place(field_address(l, box, FieldSlot(8, t)), t))
+
+/** Gives a local its first value; a boxed local gets a new box holding it. */
+private bind_local(l: *Lowering, x: usize, value: Option[Operand])
+    if !l.boxed[x] then return store(l, l.local_slots[x], value)
+    val v = value match
+        Some(v) -> v
+        None -> return
+    val t = machine(l, l.locals[x].ty).unwrap()
+    val box = fresh(l, MRef)
+    l.insts.push(Alloc(box, box_descriptor(l, t)))
+    l.insts.push(Store(field_address(l, Value(box), FieldSlot(8, t)), v))
+    store(l, l.local_slots[x], Some(Value(box)))
 
 /** A type of the code being lowered, with the instance's type arguments substituted. */
 private concrete(l: *Lowering, t: &Type) -> &Type = substitute(solve(l.program.vars, t), l.subst_owner, l.subst)
@@ -256,19 +429,25 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     val symbol = l.program.symbols[f.symbol]
     l.subst = inst.type_args
     l.subst_owner = symbol.root.unwrap_or(inst.function)
-    val signature = signature_of(l, f)
     l.values = buf()
     l.slots = buf()
     l.blocks = buf()
     l.insts = buf()
     l.loops = buf()
     l.trap = None
+    l.locals = f.locals
+    l.boxed = boxed_locals(l, symbol.root.unwrap_or(inst.function), f.locals)
+    if inst.entry then return lower_entry(l, inst)
+    val signature = signature_of(l, f)
     l.returns_value = signature.result is Some(_)
     l.current = new_block(l)
     // The function's own locals get slots; a local function's parameters are among them.
     l.local_slots = buf()
-    for local in f.locals
-        if local.owner == f.symbol then l.local_slots.push(new_slot(l, local.ty)) else l.local_slots.push(None)
+    for x in 0..<f.locals.len()
+        val local = f.locals[x]
+        if local.owner != f.symbol then l.local_slots.push(None)
+        elif l.boxed[x] then l.local_slots.push(machine_slot(l, MRef))
+        else l.local_slots.push(new_slot(l, local.ty))
     l.param_values = buf()
     symbol.root match
         None ->
@@ -277,10 +456,10 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
         Some(root) ->
             for i in 0..<symbol.params.len()
                 val value = if machine(l, symbol.params[i]) is Some(t) then Some(Value(fresh(l, t))) else None
-                store(l, l.local_slots[symbol.param_locals[i]], value)
+                bind_local(l, symbol.param_locals[i], value)
             for x in symbol.captured_locals
                 if machine(l, f.locals[x].ty) is Some(t)
-                    l.local_slots.set(x, Some(Place(Value(fresh(l, MPtr)), t)))
+                    l.local_slots.set(x, Some(Place(Value(fresh(l, MPtr)), if l.boxed[x] then MRef else t)))
             for _ in l.program.symbols[root].params
                 l.param_values.push(None)
             for x in symbol.captured_params
@@ -291,6 +470,45 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
             finish(l, returning(l, result))
         None -> intrinsic_body(l, symbol)
     MirFunction(function_symbol(l.program, f.symbol, inst.type_args), signature, l.values, l.slots, l.blocks)
+
+// A closure entry takes the closure and the function's parameters. It keeps each captured local
+// the closure holds in a slot of its own and calls the function with the slot's address, as a
+// direct caller passes the address of its own; captured parameters are passed as values.
+private lower_entry(l: *Lowering, inst: Instance) -> MirFunction
+    val f = l.program.functions[inst.function]
+    val direct = signature_of(l, f)
+    var params: Buf[MirType] = buf()
+    params.push(MRef)
+    val closure = Value(fresh(l, MRef))
+    var args: Buf[Operand] = buf()
+    for p in l.program.symbols[inst.function].params
+        if machine(l, p) is Some(t)
+            params.push(t)
+            args.push(Value(fresh(l, t)))
+    l.returns_value = direct.result is Some(_)
+    l.current = new_block(l)
+    val symbol = l.program.symbols[inst.function]
+    val shape = closure_shape(l, inst.function, inst.type_args)
+    var i = 0usize
+    for x in symbol.captured_locals
+        if machine(l, l.locals[x].ty) is Some(_)
+            val field = shape.fields[i]
+            val slot = machine_slot(l, field.ty).unwrap()
+            l.insts.push(Store(slot.address, load_field(l, closure, field)))
+            args.push(slot.address)
+            i += 1
+    while i < shape.fields.len()
+        args.push(load_field(l, closure, shape.fields[i]))
+        i += 1
+    val dest = direct.result match
+        Some(t) -> Some(fresh(l, t))
+        None -> None
+    l.insts.push(Call(dest, Direct(instance(l, inst.function, inst.type_args)), args))
+    finish(l, Return(dest match
+        Some(d) -> Some(Value(d))
+        None -> None))
+    val name = function_symbol(l.program, inst.function, inst.type_args) + "#closure"
+    MirFunction(name, MirSignature(params, direct.result), l.values, l.slots, l.blocks)
 
 // The terminator that returns a body's value. A function that yields a value but whose body has
 // none at this point is in code that cannot be reached.
@@ -341,11 +559,13 @@ private fresh(l: *Lowering, t: MirType) -> usize
     id
 
 private new_slot(l: *Lowering, t: &Type) -> Option[Place] = machine(l, t) match
-    Some(m) ->
-        val id = l.slots.len()
-        l.slots.push(m)
-        Some(Place(SlotAddress(id), m))
+    Some(m) -> machine_slot(l, m)
     None -> None
+
+private machine_slot(l: *Lowering, m: MirType) -> Option[Place]
+    val id = l.slots.len()
+    l.slots.push(m)
+    Some(Place(SlotAddress(id), m))
 
 private store(l: *Lowering, place: Option[Place], value: Option[Operand])
     if place is Some(p)
@@ -405,7 +625,7 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
     Param(index) -> l.param_values[index] match
         Some(id) -> Some(Value(id))
         None -> None
-    Local(index) -> load(l, l.local_slots[index])
+    Local(index) -> load(l, local_place(l, index))
     Call(function, args, type_args) ->
         var operands: Buf[Operand] = buf()
         for a in args
@@ -436,6 +656,8 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
             Some(id) -> Some(Value(id))
             None -> None
     Construct(variant, args) -> construct(l, e, variant, args)
+    FunctionValue(function, type_args) -> Some(function_value(l, function, type_args))
+    CallValue(callee, args) -> call_value(l, callee, args)
     Field(value, index) ->
         val object = lower_expr(l, value)?
         layout(l, concrete(l, value.ty)).variants[0].fields[index] match
@@ -447,7 +669,7 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
             last = lower_expr(l, item)
         if machine(l, e.ty) is Some(_) then last else None
     Let(local, value) ->
-        store(l, l.local_slots[local], lower_expr(l, value))
+        bind_local(l, local, lower_expr(l, value))
         None
     LetPattern(pattern, value) ->
         // The pattern cannot fail, so its failure block is never reached.
@@ -459,12 +681,12 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         None
     Store(local, value, yields) ->
         val v = lower_expr(l, value)
-        store(l, l.local_slots[local], v)
+        store(l, local_place(l, local), v)
         if yields then v else None
     MultiStore(locals, value) ->
         val parts = tuple_parts(l, value)?
         for i in 0..<locals.len()
-            if locals[i] is Some(local) then store(l, l.local_slots[local], parts[i])
+            if locals[i] is Some(local) then store(l, local_place(l, local), parts[i])
         None
     Step(local, increment, postfix) -> step(l, e, local, increment, postfix)
     Negate(operand) ->
@@ -529,7 +751,7 @@ private loop_target(l: *Lowering, label: usize) -> LoopTarget
     LoopTarget(label, 0, 0, None)
 
 private step(l: *Lowering, e: &TExpr, local: usize, increment: bool, postfix: bool) -> Option[Operand]
-    val slot = l.local_slots[local]
+    val slot = local_place(l, local)
     val old = load(l, slot)?
     val bits = int_bits(e.ty)
     val updated = checked(l, bits, if increment then CheckedAdd else CheckedSub, old, ConstInt(bits, "1"))
@@ -695,6 +917,8 @@ private compare_op(op: CompareOp, t: &Type) -> MirCmp
     op match
         Equal -> CmpEq
         NotEqual -> CmpNe
+        Same -> CmpEq
+        NotSame -> CmpNe
         Less -> CmpLt
         LessEqual -> CmpLe
         Greater -> CmpGt
@@ -866,10 +1090,10 @@ private lower_is(l: *Lowering, value: &TExpr, pattern: &TPattern, negated: bool)
 private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: usize)
     p.kind match
         PWildcard -> ()
-        PBind(local) -> store(l, l.local_slots[local], value)
+        PBind(local) -> bind_local(l, local, value)
         PNamed(local, inner) ->
             test_pattern(l, inner, value, fail)
-            store(l, l.local_slots[local], value)
+            bind_local(l, local, value)
         PLiteral(constant) ->
             if value is Some(v)
                 if lower_expr(l, constant) is Some(k) then continue_if(l, compare_values(l, Equal, p.ty, v, k), fail)
@@ -879,13 +1103,13 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
                     if lower_expr(l, b.value) is Some(low) then continue_if(l, compare_values(l, if b.inclusive then GreaterEqual else Greater, p.ty, v, low), fail)
                 if upper is Some(b)
                     if lower_expr(l, b.value) is Some(high) then continue_if(l, compare_values(l, if b.inclusive then LessEqual else Less, p.ty, v, high), fail)
-            if local is Some(index) then store(l, l.local_slots[index], value)
+            if local is Some(index) then bind_local(l, index, value)
         PSuccessor(local, amount) ->
             if value is Some(v)
                 if lower_expr(l, amount) is Some(k)
                     continue_if(l, compare(l, compare_op(GreaterEqual, p.ty), v, k), fail)
                     // The value is at least the positive amount, so the difference cannot overflow.
-                    if local is Some(index) then store(l, l.local_slots[index], Some(binary(l, MInt(int_bits(p.ty)), OpSub, v, k)))
+                    if local is Some(index) then bind_local(l, index, Some(binary(l, MInt(int_bits(p.ty)), OpSub, v, k)))
         PAlternatives(options) ->
             val matched = new_block(l)
             for i in 0..<options.len()
