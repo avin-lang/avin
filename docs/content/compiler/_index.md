@@ -102,6 +102,20 @@ is free; a call through a final class's type, even of a method it inherits from 
 A trait has a constructor symbol, so instantiating one is reported as for an abstract class, and it
 is never compiled.
 
+An `impl` is resolved before any type's fields: its target and trait are named with the impl's type
+parameters standing for the type's own (`data_owner` or `class_owner` of the type), so its methods'
+types are the type's as any other method's are. An impl of a class or an object joins it: its trait
+is added to the class's `traits` beside those its header states, and its methods to the class's
+methods, marked as overriding when the impl is of a trait, so the method table, inheritance and
+dispatch are the class's own machinery. An impl of a `data` or built-in type gives each method a
+`receiver`, the type of its `self`; such a method is called directly, and inside it the checker
+finds the type's methods, and a one-variant type's fields, by bare name. A `data` type conforming
+to a trait has a method table like a class's, with no slots of its own: trait positions are placed
+over classes and data types together, and the table holds at each position the type's method of
+that name or the trait's default. Every variant's descriptor carries that table before it, the
+constant objects of fieldless variants included, so a trait-typed call on a data value is the same
+two loads. The type record lists the traits too, so a `t: Trait` pattern on an `Any` matches.
+
 `Any` is a reference to an object. The checker inserts a **box** node wherever a value converts to
 `Any`; lowering makes it nothing for a value already kept as a reference to an object with a
 descriptor (a string, a tuple, a `data` value, an object, a closure), and for a number, `char` or

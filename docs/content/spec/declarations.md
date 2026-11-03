@@ -356,12 +356,37 @@ impl Shape
     perimeter() -> real = …
 ```
 
-`impl Type` without a trait adds methods to a type declared in the same module. Sysl's orphan rule
-applies: an `impl` lives in the module of the trait or of the type. Declaring a trait in a class's
-header and writing a separate `impl` for it are the same conformance; it may be stated once.
+`impl Type` without a trait adds methods to a type declared in the same module. An `impl` lives in
+the module of the trait or of the type; the built-in types belong to the core library's module,
+`avin`, which is where `impl string` is written. Declaring a trait in a class's header and writing a
+separate `impl` for it are the same conformance; it may be stated once.
 
 `impl` is how Avin expresses type classes (`Ord`, `Hash`, `Display`) and adds methods to types you
 do not own. Resolution is coherent: one implementation per trait and type, found without search.
+
+- **An impl adds methods, never state.** Its body declares methods only: no fields and no
+  statements. A method an impl adds to a class or an object is one of its methods, as if the class's
+  body declared it: it sees the private fields, is inherited by a subclass, and a subclass may
+  override it. A method of a name the type already has is an error, since methods are not
+  overloaded.
+- **Inside an impl's methods the receiver is implicit**, as in a class: `self` is the value, the
+  type's methods are in scope by bare name, and so are the fields of a `data` type with one variant,
+  the fields `self.name` reaches. A type with several variants takes `self` apart with `match`.
+  A `private` method of an impl is callable only from the methods of that type.
+- **The methods of `impl Trait for Type` implement the trait's methods**, so they are not marked
+  `override`, and each must be a method of the trait or of a trait it requires. A default body the
+  impl leaves alone stays, and every abstract method must be implemented. One method of a name
+  implements every trait method of that name the type conforms to, as a class's does; a `data`
+  type's method implementing a trait's method is declared in an impl of that trait. An impl of a
+  trait with no body states a conformance the type's methods already satisfy.
+- **A `data` value of a type that conforms to a trait is a value of the trait's type.** Its calls
+  through the trait dispatch as a class instance's do, a variant without fields included; a call on
+  the data type itself is direct.
+- **A generic impl names the type's parameters**, in order: `impl[T] Show for Box[T]`,
+  `impl[K, V] Map[K, V]`. The names are the impl's own and need not be the declaration's. An impl
+  for particular type arguments (`impl Show for Box[int]`) is not part of the language.
+- A method added to a built-in type (`impl string`, `impl int`) is called on a value of that type,
+  `"hi".shout()`, `7.squared()`.
 
 ## object
 

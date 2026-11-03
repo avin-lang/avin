@@ -61,6 +61,17 @@ a decision changes, this page and the chapter change together.
 - A trait-typed call reaches the implementation through the class's method table, at a position the
   trait has in every conforming class's table (the whole program is known), so it costs one virtual
   call.
+- An `impl` adds methods and conformances, never state. Its methods are a class's or an object's own
+  methods; for a `data` or built-in type they are called directly. Inside them the receiver is
+  implicit, as in a class, with a one-variant `data` type's fields in scope by bare name.
+- The methods of `impl Trait for Type` implement the trait's methods without `override`, and each is
+  a method of the trait or of one it requires. A `data` type's method implementing a trait method is
+  declared in an impl of that trait.
+- A `data` type conforming to a trait gives every variant's descriptor the same method table, at the
+  trait positions classes use, so a trait-typed call costs the same whatever the value is.
+- A generic impl writes the type's parameters, in order, as its own: `impl[T] Show for Box[T]`.
+- The built-in types belong to the core library's module, `avin`; an impl adding methods to one is
+  written there.
 - Functions and methods may be overloaded by parameter types. A call takes the most specific
   overload that accepts its arguments, chosen at compile time; an ambiguous call is an error.
   Same-named declarations with the same parameter types are an error.
@@ -190,6 +201,9 @@ a decision changes, this page and the chapter change together.
 - A class and its companion object use each other's private members, in both directions.
 - An initializer's dependencies count every lambda it makes as if it were called, and every function
   it calls in full, whatever branch is taken, so a cycle that no run could follow is still rejected.
+- An impl for particular type arguments of a generic type (`impl Show for Box[int]`) is not allowed:
+  an impl covers every instance of its type. Allowing one needs a rule for its overlap with a generic
+  impl of the same trait.
 - The singleton declaration keeps the keyword `object`.
 
 **Deferred**
