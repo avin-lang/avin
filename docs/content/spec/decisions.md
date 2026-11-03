@@ -304,6 +304,12 @@ a decision changes, this page and the chapter change together.
   an impl covers every instance of its type. Allowing one needs a rule for its overlap with a generic
   impl of the same trait.
 - The singleton declaration keeps the keyword `object`.
+- A program's binding shims are one Sysl package that depends on the runtime's, built into one
+  archive the program links in place of the runtime's, so all of a program's Sysl code shares one
+  copy of Sysl's library. The archive is cached by a hash of the shims, the Sysl version and the
+  runtime's source.
+- A binding is a top-level function. Across the boundary a `bool` is a byte and a `char` its code
+  point; `string` is copied each way.
 
 **Deferred**
 

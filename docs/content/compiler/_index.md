@@ -16,7 +16,7 @@ the standard library — in one run.
 | Load | `avin.hocon` → module graph | Packages, modules and files; the reserved `avin` root; the prelude, which is an Avin file. |
 | Resolve | AST → resolved AST | Scopes and symbol tables. Every name is bound to a declaration symbol, and imports, visibility and shadowing are decided here, once. |
 | Check | resolved AST → typed HIR | A `Type` algebra over declaration symbols; local bidirectional inference with subtype constraints; bounds, variance and `impl` coherence; initialization; pattern exhaustiveness. |
-| Bindings | `@sysl` declarations → shim | Generates the Sysl shim source and its boundary signatures. |
+| Bindings | `@sysl` declarations → shim archive | Generates the Sysl shim source and its boundary signatures, and has Sysl check and build it. |
 | Monomorphize | typed HIR → mono HIR | Instantiates functions, types and generic trait methods for every use, and computes the dispatch for trait-typed calls over the closed world. |
 | Lower | mono HIR → MIR | Explicit control flow, object layouts and headers, type descriptors, vtables, closures and environments, allocation, GC root slots, traps. |
 | Emit | MIR → LLVM IR | Spelling only: no typing, layout or semantic decisions. |
@@ -41,6 +41,38 @@ Names are resolved by module. Every top-level declaration is held under its qual
 declaration, its file's import, and the `avin` module's public declaration that exists. Imports are
 checked once every declaration of the program is known, and a wrong one is dropped. Object-file
 symbols carry the module path, so two modules may each declare `helper`.
+
+## Sysl bindings and the shim cache
+
+A [binding](/spec/sysl-bindings/) is checked as a top-level function without a body: its
+`@sysl("module.name")` must name a Sysl function by module path and name, and its parameters and
+result must be boundary types — integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`,
+`unit` and `string`. Lowering gives it a body that passes its parameters, after the context, to a
+shim symbol, `avin_shim_` followed by the binding's own symbol with every character other than a
+letter or digit written as `_` and two hex digits, and returns what the shim returns. Since it is an
+ordinary function, a binding can be passed as a value. The MIR program lists every binding of the
+functions it compiles.
+
+For a program with bindings, the driver generates one Sysl module, `avin.shims`, in a package whose
+manifest depends on the runtime's package. Each binding gets an import of its Sysl function under a
+private name, and an exported shim that converts each argument (a `bool` arrives as a byte, a `char`
+as its code point, a `string` is copied into a Sysl `string`), calls the function with the result
+declared at the binding's type, and converts the result back (a `string` is copied into a new Avin
+string through the runtime's `avin_rt_new_text`). `sysl build-c` checks and builds the package into
+one archive holding the runtime, the shims and the part of Sysl's library they reach, which the
+program links instead of the runtime's own archive. One archive means one copy of Sysl's library, so
+Sysl and Avin share standard output and keep their writes in order.
+
+A Sysl diagnostic is placed by its line in the shim: the driver records the line of each binding's
+import and the lines of its function, and reports the message at the binding's name as `the Sysl
+binding \`name\` does not match \`module.name\`: …`. A diagnostic that falls elsewhere is reported
+with Sysl's whole output.
+
+The archive is cached under `.avin/shims/` in the toolchain's root, named by a SHA-256 of the
+manifest, the shim source, the `sysl --version` output and the runtime's source files. A build with
+the same bindings finds it there and runs no Sysl build; it is built under a temporary name and
+published by rename, so concurrent builds never see a partial archive. The `check` command builds
+the shims too, since only Sysl can say whether a binding is right.
 
 ## Runtime
 

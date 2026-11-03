@@ -15,6 +15,8 @@ struct Toolchain
     prelude_path(self) -> string = self.root + "/library/avin/prelude.avin"
     runtime_dir(self) -> string = self.root + "/runtime"
     runtime_archive(self) -> string = self.root + "/runtime/.sysl/libavinrt.a"
+    /** Where the archives of the runtime with a program's binding shims are kept, by key. */
+    shim_cache(self) -> string = self.root + "/.avin/shims"
 end Toolchain
 
 /** A toolchain rooted at `root`, if `root` holds the library and the runtime. */
@@ -26,6 +28,9 @@ struct Compilation
     /** Every diagnostic, rendered; empty when compilation succeeded. */
     diagnostics: string
     llvm: Option[string]
+    /** For a program with Sysl bindings, the archive it links in place of the runtime's: the runtime
+     * with the bindings' shims, which Sysl has checked. */
+    archive: Option[string]
 
 /** A source file of a program, with the module its place under the program's root directory gives
  * it. A program of one file has no root directory: its `module_name` is `None`, and its header, if it has
@@ -72,18 +77,35 @@ private collect_files(root: string, rel: string, module_name: string, modules: *
 /** Compiles a program of one file to LLVM IR against the toolchain's library. */
 compile(tc: Toolchain, src: Source) -> Compilation = compile_files(tc, single_file(src))
 
-/** Compiles a program to LLVM IR against the toolchain's library. */
-compile_files(tc: Toolchain, files: Buf[ProgramFile]) -> Compilation = lower_files(tc, files) match
-    Ok(program) -> Compilation("", Some(emit_llvm(program)))
-    Err(diagnostics) -> Compilation(diagnostics, None)
+/** Compiles a program to LLVM IR against the toolchain's library, and builds the shims of its Sysl
+ * bindings, so a binding Sysl rejects is reported as the program's error. */
+compile_files(tc: Toolchain, files: Buf[ProgramFile]) -> Compilation
+    val lowered = lower_units(tc, files) match
+        Ok(l) -> l
+        Err(diagnostics) -> return Compilation(diagnostics, None, None)
+    var archive: Option[string] = None
+    if lowered.program.bindings.len() > 0
+        ensure_shims(tc, lowered.program.bindings, lowered.units) match
+            Ok(a) -> archive = Some(a)
+            Err(diagnostics) -> return Compilation(diagnostics, None, None)
+    Compilation("", Some(emit_llvm(lowered.program)), archive)
 
 /** Compiles a program of one file as far as MIR, or renders its diagnostics. */
 lower_source(tc: Toolchain, src: Source) -> Result[MirProgram, string] = lower_files(tc, single_file(src))
 
-/** Compiles a program as far as MIR against the toolchain's library, or renders its diagnostics.
- * The library's directory is loaded as a program tree is, and every module in it is the core
- * library's, `avin` or under it; the program's own modules may not be. */
-lower_files(tc: Toolchain, files: Buf[ProgramFile]) -> Result[MirProgram, string]
+/** Compiles a program as far as MIR against the toolchain's library, or renders its diagnostics. */
+lower_files(tc: Toolchain, files: Buf[ProgramFile]) -> Result[MirProgram, string] = lower_units(tc, files) match
+    Ok(lowered) -> Ok(lowered.program)
+    Err(diagnostics) -> Err(diagnostics)
+
+/** A program as MIR, with the units it was compiled from, which place its diagnostics. */
+private struct Lowered
+    program: MirProgram
+    units: Buf[SourceUnit]
+
+// The library's directory is loaded as a program tree is, and every module in it is the core
+// library's, `avin` or under it; the program's own modules may not be.
+private lower_units(tc: Toolchain, files: Buf[ProgramFile]) -> Result[Lowered, string]
     val library = program_files(tc.library_dir()).map_err(message -> s"avin: $message\n")?
     var units: Buf[SourceUnit] = buf()
     var diagnostics = ""
@@ -104,7 +126,7 @@ lower_files(tc: Toolchain, files: Buf[ProgramFile]) -> Result[MirProgram, string
     val checked = check_program(units, root_module)
     if checked.has_errors() then return Err(checked.render())
     checked.program match
-        Some(program) -> Ok(lower_program(program))
+        Some(program) -> Ok(Lowered(lower_program(program), checked.units))
         None -> Err("avin: checking produced no program\n")
 
 // A file of a program tree belongs to the module its directory names, and its header, which every
@@ -174,10 +196,14 @@ private runtime_stale(tc: Toolchain, archive: string) -> bool
         if entry.path.ends_with(".sysl") || entry.path.ends_with(".hocon")
             if entry.meta.modified > built then return true
 
-/** Links LLVM IR with the runtime into an executable at `output`. The executable is written under a
- * temporary name and published by rename, so a failed link leaves any previous output in place. */
-link(tc: Toolchain, llvm: string, output: string, optimization: string) -> Result[unit, string]
-    val archive = ensure_runtime(tc)?
+/** Links LLVM IR with the runtime into an executable at `output`: with `shims`, the runtime with a
+ * program's binding shims, when there is one, and otherwise the runtime's own archive. The
+ * executable is written under a temporary name and published by rename, so a failed link leaves any
+ * previous output in place. */
+link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimization: string) -> Result[unit, string]
+    val archive = shims match
+        Some(a) -> a
+        None -> ensure_runtime(tc)?
     val dir = make_temp_dir("avin-link").map_err(e -> e.to_string())?
     defer _ = remove_dir_all(dir)
     val ir = dir + "/program.ll"

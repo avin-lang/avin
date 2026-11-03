@@ -2656,6 +2656,8 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
     elif f.body is Some(b)
         if b.kind is Block(_, true) then result = Some(Unit)
     val intrinsic = intrinsic_of(c, unit, f)
+    val binding = has_annotation(f, "sysl")
+    if binding then check_binding(c, unit, f, params, result, intrinsic is Some(_))
     if intrinsic is Some(name)
         intrinsic_signature(name) match
             Some(expected) ->
@@ -2663,7 +2665,7 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
                 if !same_type(declared, expected)
                     c.note(unit, f.name_span, s"intrinsic `$name` has type ${type_name(expected)}, not ${type_name(declared)}")
             None -> c.note(unit, f.name_span, s"`$name` is not an intrinsic")
-    elif f.body is None && f.clauses.len() == 0 && !bodyless
+    elif f.body is None && f.clauses.len() == 0 && !bodyless && !binding
         c.note(unit, f.name_span, s"`${f.name}` needs a body, or clauses on the lines after it")
     c.generic = outer_generic
     FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf(), false, false, false, buf(), None, owner, type_params, None, false, true, "", None)
@@ -2715,11 +2717,12 @@ private declare_defaults(c: *Checker, id: usize)
         defaults.push(Some(did))
     c.symbols[id].defaults = defaults
 
-// `@intrinsic("name")` is the only annotation this compiler gives meaning to; it is valid only on a
-// function without a body.
+// `@intrinsic("name")` and `@sysl("path")` are the annotations this compiler gives meaning to; each
+// is valid only on a function without a body. This reads the first; `sysl_binding_of` the second.
 private intrinsic_of(c: *Checker, unit: usize, f: &Function) -> Option[string]
     var out: Option[string] = None
     for a in f.annotations
+        if a.name == "sysl" then continue
         if a.name != "intrinsic"
             c.note(unit, a.span, s"unknown annotation `@${a.name}`")
             continue
@@ -2874,6 +2877,75 @@ private names_self(t: &TypeExpr) -> bool
                 if names_self(p.ty) then return true
             return names_self(result)
         InvalidType -> ()
+    false
+
+/** The Sysl function a binding names: the string of its `@sysl` annotation, when it has one. */
+binding_target(f: &Function) -> Option[string]
+    for a in f.annotations
+        if a.name == "sysl" && a.args.len() == 1
+            if a.args[0].value.kind is StringLit(path) then return Some(path)
+    None
+
+// A binding is a top-level function without a body whose `@sysl("module.path.name")` names a Sysl
+// function. Its parameters and result are boundary types, which the generated shim converts; a
+// binding with a wrong type is caught when Sysl checks the shim.
+private check_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Type], result: Option[&Type], intrinsic: bool)
+    for a in f.annotations
+        if a.name != "sysl" then continue
+        var path: Option[string] = None
+        if a.args.len() == 1 && a.args[0].name is None
+            if a.args[0].value.kind is StringLit(p) then path = Some(p)
+        path match
+            Some(p) ->
+                if !is_sysl_path(p) then c.note(unit, a.span, s"`@sysl` names a Sysl function by its module and name, as in `sysl.text.to_upper`; `$p` is not one")
+            None -> c.note(unit, a.span, "`@sysl` takes one string, the module and name of the Sysl function, as in `@sysl(\"sysl.text.to_upper\")`")
+        if intrinsic then c.note(unit, a.span, "a function is an intrinsic or a Sysl binding, not both")
+        if f.body is Some(_) || f.clauses.len() > 0 then c.note(unit, a.span, "a Sysl binding has no body: the Sysl function it names is its body")
+        if f.type_params.len() > 0
+            c.note(unit, f.name_span, "generic Sysl bindings are not implemented")
+            continue
+        for i in 0..<f.params.len()
+            val p = f.params[i]
+            if p.by_name then c.note(unit, p.pattern.span, "a by-name parameter cannot cross to Sysl")
+            elif !crosses_to_sysl(params[i]) then c.note(unit, p.ty.span, s"`${type_name(params[i])}` cannot cross to Sysl; ${BoundaryTypes}")
+        if result is Some(r)
+            if !crosses_to_sysl(r)
+                val at = if f.result is Some(t) then t.span else f.name_span
+                c.note(unit, at, s"`${type_name(r)}` cannot cross to Sysl; ${BoundaryTypes}")
+
+const BoundaryTypes: string = "a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit` and `string`"
+
+/** Whether a value of type `t` crosses between Avin and Sysl, converted by a binding's shim. */
+crosses_to_sysl(t: &Type) -> bool = *t match
+    ErrorType -> true
+    Unit -> true
+    Bool -> true
+    Char -> true
+    Real -> true
+    Str -> true
+    Byte -> true
+    Int(bits) -> bits == 8 || bits == 16 || bits == 32 || bits == 64
+    _ -> false
+
+// A module path and a name: two or more identifiers joined by dots.
+private is_sysl_path(p: string) -> bool
+    var parts = 0
+    var start = true
+    for b in p.bytes
+        if b == u8('.')
+            if start then return false
+            start = true
+            continue
+        val letter = b >= u8('a') && b <= u8('z') || b >= u8('A') && b <= u8('Z') || b == u8('_')
+        val digit = b >= u8('0') && b <= u8('9')
+        if !letter && !(digit && !start) then return false
+        if start then parts += 1
+        start = false
+    !start && parts >= 2
+
+private has_annotation(f: &Function, name: string) -> bool
+    for a in f.annotations
+        if a.name == name then return true
     false
 
 resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match

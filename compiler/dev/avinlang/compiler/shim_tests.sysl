@@ -1,0 +1,63 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.metadata
+
+// The shims of Sysl bindings: where each binding's part of the generated source is, and the cache of
+// built archives.
+
+private compiled(text: string) -> Compilation = compile(repository_toolchain(), source_of("/probe/bindings.avin", text))
+
+private lines(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    for line in text.split("\n")
+        out.push(line)
+    out
+
+@test("each binding's import and function are at the lines the shim source records")
+shim_lines()
+    val program = lower_source(repository_toolchain(), source_of("/probe/bindings.avin", "@sysl(\"sysl.text.to_upper\")\nupper(s: string) -> string\n\n@sysl(\"sysl.prints\")\nwrite(s: string)\n\n@sysl(\"sysl.path.is_absolute\")\nabsolute(p: string) -> bool\n\nmain() = 0\n")).unwrap()
+    assert_eq(program.bindings.len(), 3usize)
+    val shim = shim_source(program.bindings)
+    val text = lines(shim.text)
+    for i in 0..<program.bindings.len()
+        val b = program.bindings[i]
+        assert(text[shim.imports[i] - 1].starts_with(s"import ${b.target} as bound_$i"))
+        assert_eq(text[shim.first[i] - 1], s"// ${b.name}")
+        assert(text[shim.first[i] + 1].starts_with(s"shim_$i("))
+        // The function's last line is followed by a blank line or the end of the source.
+        assert(text[shim.last[i] - 1].starts_with("    "))
+        assert(shim.last[i] == text.len() - 1 || text[shim.last[i]] == "")
+    // A unit result has no conversion back, so its function is a line shorter.
+    assert_eq(shim.last[1] - shim.first[1], 3usize)
+    assert_eq(shim.last[2] - shim.first[2], 4usize)
+
+@test("a binding's shim is built once and found in the cache after that")
+shim_cache()
+    val text = "@sysl(\"sysl.text.to_lower\")\nlower(s: string) -> string\n\nmain() = 0\n"
+    val first = compiled(text)
+    assert_eq(first.diagnostics, "")
+    val archive = first.archive.unwrap()
+    val built = metadata(archive).unwrap().modified
+    // The same bindings in another program are the same shims, which are not built again.
+    val second = compiled("// another program with the same binding\n" + text)
+    assert_eq(second.archive.unwrap(), archive)
+    assert(metadata(archive).unwrap().modified == built)
+    // Another binding is another archive.
+    val other = compiled("@sysl(\"sysl.text.to_upper\")\nlower(s: string) -> string\n\nmain() = 0\n")
+    assert(other.archive.unwrap() != archive)
+
+@test("a program without bindings links the runtime's own archive")
+no_shims()
+    val c = compiled("main() = 0\n")
+    assert_eq(c.diagnostics, "")
+    assert(c.archive is None)
+
+@test("Sysl's diagnostic of a shim is reported at the binding's name")
+shim_diagnostic_place()
+    val c = compiled("main() = 0\n\n@sysl(\"sysl.text.to_upper\")\nshout(s: char) -> string\n")
+    assert(c.diagnostics.contains("/probe/bindings.avin:4:1"))
+    assert(c.diagnostics.contains("the Sysl binding `shout` does not match `sysl.text.to_upper`: 's' of 'sysl.text.to_upper' is string, but char was given"))
+    assert(c.llvm is None)
