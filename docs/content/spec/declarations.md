@@ -249,6 +249,12 @@ class Savings(owner: string, balance: int, rate: real): Account(owner, balance),
 - Methods take the forms top-level functions take: a body after `=`, an indented body, or clauses,
   which match the arguments and not the receiver. A method may have type parameters of its own,
   after its class's.
+- A method named without a call is a function value bound to its receiver: `val f = acct.deposit`
+  is an `(int) -> unit` that deposits into `acct`, which is evaluated once, where the value is made.
+  Inside the class a bare method name is the same over `self`. Through a superclass's or a trait's
+  type the value calls the implementation the object's class has. A method's own type parameters
+  are written, `box.pair[bool]`, or come from the expected function type. The same holds for the
+  methods an `impl` adds to any type, `"hey".shout` included.
 - A field declared in the body without a type has its initializer's type. The body cannot
   `return`: it runs to its end to make the object.
 

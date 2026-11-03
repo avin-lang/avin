@@ -2399,7 +2399,7 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     UnitLit -> TExpr(e.span, Unit, UnitConst)
     Name(name) -> name_expr(c, e.span, name, expected)
     TypeApply(target, types) -> type_apply(c, e, target, types, expected)
-    Member(target, name) -> member_expr(c, e, target, name)
+    Member(target, name) -> member_expr(c, e, target, name, expected)
     Call(callee, args) -> call_expr(c, e.span, callee, args, expected)
     Block(items, discard) -> block_expr(c, e, items, discard, expected, used)
     Binding(name, declared, value, mutable) -> binding_expr(c, e, name, declared, value, mutable)
@@ -2466,7 +2466,7 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
     class_member(c, name) match
         Some(FieldOf(i)) -> return field_read(c, at, at, self_ref(c, at), enclosing_class(c).unwrap(), i, true)
         Some(DataFieldOf(i)) -> return data_field_read(c, at, self_ref(c, at), i)
-        Some(MethodOf(m)) -> return method_value(c, at, m)
+        Some(MethodOf(m)) -> return method_value(c, at, self_ref(c, at), m, None, expected)
         None -> ()
     if global_named(c, name) is Some(g) then return global_read(c, at, g)
     if lookup_function(c, name) is Some(id)
@@ -2512,10 +2512,103 @@ private field_type(c: *Checker, k: usize, index: usize, at: Span) -> &Type
     c.note(unit_of(c), at, s"the type of the field `$name` is needed before its initializer is checked; declare it, as in `val $name: int = …`")
     ErrorType
 
-// A method named without a call. Binding one to its receiver as a function value is not built yet.
-private method_value(c: *Checker, at: Span, m: usize) -> &TExpr
-    c.note(unit_of(c), at, s"a method used as a value is not implemented; call `${c.symbols[m].decl.name}`, or wrap the call in a lambda")
-    TExpr(at, ErrorType, UnitConst)
+// The method `name` that a value of type `t` has: its class's, or one an impl adds to its data or
+// built-in type.
+private method_of(c: *Checker, t: &Type, name: string) -> Option[usize]
+    val known = zonk(c, t)
+    if *known is Class(k, _, _) then return method_named(c, k, name)
+    receiver_method(c, known, name)
+
+// `object.name` for a method `m` of the object's type, named without a call: outside the class, or
+// the impls, that declare it, a private method cannot be.
+private member_method_value(c: *Checker, at: Span, object: &TExpr, m: usize, explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+    if !method_visible(c, m)
+        val name = c.symbols[m].decl.name
+        c.symbols[m].owner_class match
+            Some(k) -> c.note(unit_of(c), at, s"`$name` is private to `${c.classes[k].name}`")
+            None -> c.note(unit_of(c), at, s"`$name` is private to the impls of `${type_name(c.symbols[m].receiver.unwrap())}`")
+        return TExpr(at, ErrorType, UnitConst)
+    method_value(c, at, object, m, explicit, expected)
+
+// A method named without a call is a function value bound to its receiver: a closure, of the
+// method's type without the receiver, that holds the receiver and calls the method on it with its
+// arguments. The receiver is evaluated once, where the value is made. Through a trait or an open
+// class the closure calls through the object's method table, as a call there would; the object is
+// fixed, so that is the implementation its class had when the value was made. The class's type
+// arguments come from the receiver's type, and the method's own are written or decided by the
+// expected function type.
+private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+    val unit = unit_of(c)
+    if *receiver.ty is Nothing then return receiver
+    val target = c.symbols[m]
+    val name = target.decl.name
+    val known = receiver_type_args(c, receiver.ty, m)
+    val result = result_of(c, m, at)
+    val type_params = target.type_params
+    val first = c.vars.len()
+    var type_args: Buf[&Type] = buf()
+    for i in 0..<type_params.len()
+        type_args.push(if i < known.len() then known[i] else fresh_var(c))
+    var failed = false
+    if explicit is Some(types)
+        val own = type_params.len() - known.len()
+        if types.len() > own
+            c.note(unit, at, s"`$name` takes ${count(own, "type argument")}, not ${types.len()}")
+            failed = true
+        else
+            for i in 0..<types.len()
+                unify(c, type_args[known.len() + i], resolve_type(c, unit, types[i]))
+    var params: Buf[&Type] = buf()
+    var names: Buf[string] = buf()
+    for i in 1..<target.params.len()
+        params.push(target.params[i])
+        names.push(target.param_names[i])
+    val declared: &Type = Function(substitute_all(params, target.type_owner, type_args), substitute(result, target.type_owner, type_args))
+    if expected is Some(want) then unify(c, declared, want)
+    var solved: Buf[&Type] = buf()
+    for i in 0..<type_args.len()
+        val t = zonk(c, type_args[i])
+        if *t is Var(v)
+            if v >= first
+                if !failed then c.note(unit, at, s"cannot infer `${type_params[i].name}` for `$name` used as a value; write it, as in `$name[int]`")
+                c.vars.set(v, Some(ErrorType))
+                failed = true
+        solved.push(zonk(c, t))
+    if failed then return TExpr(at, ErrorType, UnitConst)
+    val ty = zonk(c, declared)
+    var lambda_params: Buf[&Type] = buf()
+    var lambda_result: &Type = ErrorType
+    if *ty is Function(ps, r)
+        lambda_params = ps
+        lambda_result = r
+    // The receiver is held in a local of the code making the value, which the closure captures.
+    val held = hidden_local(c, receiver.ty)
+    val enclosing = c.symbols[c.current]
+    val decl = Function(buf(), at, at, "lambda", buf(), buf(), None, None, buf())
+    val id = c.symbols.len()
+    c.symbols.push(FunctionSymbol(enclosing.unit, enclosing.module_name, "lambda", decl, lambda_params, names, Some(lambda_result), None, Some(c.body.root), buf(), buf(), buf(), true, false, true, buf(), None, id, buf(), None, false, true, "", None))
+    c.states.push(2)
+    c.bodies.push(None)
+    c.locals.push(buf())
+    var args: Buf[&TExpr] = buf()
+    args.push(TExpr(at, receiver.ty, Local(held)))
+    var param_locals: Buf[usize] = buf()
+    for i in 0..<lambda_params.len()
+        val index = c.body.locals.len()
+        c.body.locals.push(TLocal(names[i], lambda_params[i], false, id))
+        param_locals.push(index)
+        args.push(TExpr(at, lambda_params[i], Local(index)))
+    c.symbols[id].param_locals = param_locals
+    c.body.uses.push(CaptureUse(id, held, false))
+    c.body.calls.push(LocalCall(c.current, id))
+    val call = dispatch_slot(c, receiver.ty, m) match
+        Some(s) -> Dispatch(m, s, args, solved)
+        None -> Call(m, args, solved)
+    c.bodies.set(id, Some(TExpr(at, lambda_result, call)))
+    var items: Buf[&TExpr] = buf()
+    items.push(TExpr(receiver.span, Unit, Let(held, receiver)))
+    items.push(TExpr(at, ty, FunctionValue(id, buf())))
+    TExpr(at, ty, Block(items))
 
 // Whether code that may use the private members of class `k` is being checked: code of the class
 // itself, or of its companion.
@@ -2553,9 +2646,13 @@ private evaluated(t: &TExpr) -> &TExpr = *t.ty match
     ByName(inner) -> TExpr(t.span, inner, CallValue(t, buf()))
     _ -> t
 
-// Type arguments written on a name that is not called: a variant with no fields, as in `None[int]`.
+// Type arguments written on a name that is not called: a function or a method used as a value, or a
+// variant with no fields, as in `None[int]`.
 private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], expected: Option[&Type]) -> &TExpr
     if target.kind is Name(name)
+        // A method of the enclosing class by bare name, bound to `self`, as in `convert[int]`.
+        if lookup_local(c, name) is None && param_index(c, name) is None
+            if class_member(c, name) is Some(MethodOf(m)) then return method_value(c, e.span, self_ref(c, target.span), m, Some(types), expected)
         if lookup_function(c, name) is Some(id)
             if abstract_constructor(c, id, target.span) then return TExpr(e.span, ErrorType, UnitConst)
             return named_function_value(c, e.span, name, Some(types), expected)
@@ -2563,15 +2660,23 @@ private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], 
             if c.variants.get(name) is Some(v)
                 if c.data[v.data].variants[v.index].fields.len() == 0
                     return construct(c, e.span, target.span, v, buf(), Some(types), expected)
+    // A method named without a call, with its own type arguments, as in `box.convert[int]`.
+    if target.kind is Member(inner, name)
+        val object = check_expr(c, inner, None)
+        if method_of(c, object.ty, name) is Some(m) then return member_method_value(c, e.span, object, m, Some(types), expected)
     unsupported(c, e, "a value with type arguments that is not called")
 
 // A field is read by name from a value of a data type with one variant; a type with several is
 // taken apart by `match`, since which fields a value has depends on its variant.
-private member_expr(c: *Checker, e: &Expr, target: &Expr, name: string) -> &TExpr = member_of(c, e, check_expr(c, target, None), name)
+// A method named without a call is a function value bound to the value; see `method_value`.
+private member_expr(c: *Checker, e: &Expr, target: &Expr, name: string, expected: Option[&Type]) -> &TExpr = member_of(c, e, check_expr(c, target, None), name, expected)
 
-private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string) -> &TExpr
+private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
     val ty = zonk(c, value.ty)
+    // A field of a data type with one variant comes before a method of the same name.
+    if !(*ty is Class(_, _, _)) && !one_variant_field(c, ty, name)
+        if receiver_method(c, ty, name) is Some(m) then return member_method_value(c, e.span, value, m, None, expected)
     *ty match
         Data(id, _, args) ->
             val d = c.data[id]
@@ -2583,23 +2688,32 @@ private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string) -> &TExpr
                 for i in 0..<names.len()
                     if names[i] == name then return TExpr(e.span, variant_fields(d, id, 0, args)[i], Field(value, i))
             c.note(unit, e.span, s"`${type_name(ty)}` has no field `$name`")
-        Class(k, _, _) -> return class_member_value(c, e.span, value, k, name)
+        Class(k, _, _) -> return class_member_value(c, e.span, value, k, name, expected)
         ErrorType -> ()
         Nothing -> return value
         _ -> c.note(unit, e.span, s"${type_name(ty)} has no field `$name`")
     TExpr(e.span, ErrorType, UnitConst)
 
 // `object.name` on an object of class `k`: a field, which outside the class must be public.
-private class_member_value(c: *Checker, at: Span, object: &TExpr, k: usize, name: string) -> &TExpr
+private class_member_value(c: *Checker, at: Span, object: &TExpr, k: usize, name: string, expected: Option[&Type]) -> &TExpr
     val cls = c.classes[k]
     if class_field(c, k, name) is Some(i)
         if !field_visible(c, cls.fields[i])
             c.note(unit_of(c), at, s"`$name` is private to `${c.classes[cls.fields[i].owner].name}`")
             return TExpr(at, ErrorType, UnitConst)
         return field_read(c, at, at, object, k, i, is_self(c, object))
-    if method_named(c, k, name) is Some(m) then return method_value(c, at, m)
+    if method_named(c, k, name) is Some(m) then return member_method_value(c, at, object, m, None, expected)
     c.note(unit_of(c), at, s"`${cls.name}` has no member `$name`")
     TExpr(at, ErrorType, UnitConst)
+
+/** Whether `t` is a data type with one variant that has a field `name`. */
+private one_variant_field(c: *Checker, t: &Type, name: string) -> bool
+    if *t is Data(id, _, _)
+        val d = c.data[id]
+        if d.variants.len() == 1
+            for n in d.variants[0].field_names
+                if n == name then return true
+    false
 
 /** Whether an expression is `self` in a constructor, the object it is still initializing. */
 private is_self(c: *Checker, t: &TExpr) -> bool = t.kind match
@@ -3790,7 +3904,7 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
         for a in args
             check_statement(c, a.value)
         return unsupported(c, callee, "type arguments on a call of a field")
-    call_checked(c, at, name_span, member_of(c, callee, object, name), args)
+    call_checked(c, at, name_span, member_of(c, callee, object, name, None), args)
 
 // `super.name(args)` calls the superclass's implementation of a method on `self`, directly, even where
 // the class overrides it.
@@ -3826,16 +3940,7 @@ private super_call(c: *Checker, at: Span, name_span: Span, super_span: Span, nam
 // type, and the method's own, which follow them, are written or inferred as for a function.
 private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m: usize, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], direct: bool) -> &TExpr
     val target = c.symbols[m]
-    // An inherited method's types name its own class's parameters, so the receiver is seen as an
-    // instance of that class. A method an impl adds to a data type takes the value's type arguments.
-    val receiver_type = zonk(c, receiver.ty)
-    val known = target.owner_class match
-        Some(k) -> *ancestor_type(c.classes, c.data, receiver_type, k).unwrap_or(receiver_type) match
-            Class(_, _, a) -> a
-            _ -> buf()
-        None -> *receiver_type match
-            Data(_, _, a) -> a
-            _ -> buf()
+    val known = receiver_type_args(c, receiver.ty, m)
     var params: Buf[&Type] = buf()
     var names: Buf[string] = buf()
     var defaults: Buf[Option[usize]] = buf()
@@ -3861,14 +3966,8 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
     typed.push(object)
     for a in applied.args
         typed.push(a)
-    // A method a subclass may override is called through the object's method table, unless the
-    // receiver's class is final, so the method is known, or the call is `super`'s. Through a trait,
-    // the method is at the trait's position in the table of whatever class the object has.
-    var slot: Option[usize] = None
-    if !direct
-        if *zonk(c, receiver.ty) is Class(r, _, _)
-            if is_trait(c, r) then slot = Some(trait_slot(c, m))
-            elif is_open(c, r) then slot = table_position(c, r, target.decl.name)
+    // A `super` call names its method directly, even where the class overrides it.
+    val slot = if direct then None else dispatch_slot(c, receiver.ty, m)
     val call = slot match
         Some(s) -> applied.wrap(at, Dispatch(m, s, typed, applied.type_args))
         None -> applied.wrap(at, Call(m, typed, applied.type_args))
@@ -3879,6 +3978,28 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
             items.push(call)
             TExpr(at, call.ty, Block(items))
         None -> call
+
+// The type arguments of method `m`'s class, or of the data type an impl adds it to, as a receiver of
+// type `receiver_type` has them. An inherited method's types name its own class's parameters, so the
+// receiver is seen as an instance of that class.
+private receiver_type_args(c: *Checker, receiver_type: &Type, m: usize) -> Buf[&Type]
+    val t = zonk(c, receiver_type)
+    c.symbols[m].owner_class match
+        Some(k) -> *ancestor_type(c.classes, c.data, t, k).unwrap_or(t) match
+            Class(_, _, a) -> a
+            _ -> buf()
+        None -> *t match
+            Data(_, _, a) -> a
+            _ -> buf()
+
+// A method a subclass may override is called through the object's method table, unless the
+// receiver's class is final, so the method is known. Through a trait, the method is at the trait's
+// position in the table of whatever class the object has.
+private dispatch_slot(c: *Checker, receiver_type: &Type, m: usize) -> Option[usize]
+    if *zonk(c, receiver_type) is Class(r, _, _)
+        if is_trait(c, r) then return Some(trait_slot(c, m))
+        if is_open(c, r) then return table_position(c, r, c.symbols[m].decl.name)
+    None
 
 /** A value made by a variant: a call of the variant with its fields, or the variant's bare name
  * when it has none. */

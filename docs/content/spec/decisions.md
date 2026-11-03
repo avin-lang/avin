@@ -90,6 +90,14 @@ a decision changes, this page and the chapter change together.
 - A method named without a call, `account.deposit`, is a function value bound to its receiver: a
   closure holding `account`, of the method's type without the receiver. Inside the class, a bare
   method name is the same closure over `self`.
+- Settled 2026-11-03: a method value evaluates its receiver once, where the value is made. Through a
+  trait-typed or open-class receiver it calls the implementation the object's class has, through
+  the object's method table at each call; the object is fixed, so this is the implementation it had
+  when the value was made. The class's type arguments come from the receiver's type; a method's own
+  are written (`box.pair[bool]`) or decided by the expected function type, and one left undecided
+  is an error. A method value takes every parameter, by-name ones still by name, and private
+  methods are values only where they could be called. Two values of one method on one object are
+  two closures, so `===` tells them apart.
 - `string` is a built-in type, not a class: it is final, has its own representation, gets its
   methods from the library through `impl string`, conforms to traits through `impl`, and is matched
   by the type pattern `s: string` like any other type.

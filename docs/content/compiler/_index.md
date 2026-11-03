@@ -68,7 +68,9 @@ the receiver. The constructor and the methods share the class's type parameters,
 following them, so a generic class's constructor and methods are instantiated per list of type
 arguments as generic functions are, and a field's type at a particular instance is its declared
 type with the receiver's type arguments substituted. A call of a method of a final class is a
-direct call.
+direct call. A method named without a call is checked into a lambda of the method's type without
+the receiver: the receiver is evaluated into a hidden local the lambda captures, and the lambda's
+body calls the method on it, directly or through the method table as a call written there would.
 
 A subclass's object starts with its superclass's fields, in the superclass's order, so the
 superclass's code finds each field at the offset it expects in any subclass's object. An `open` or
