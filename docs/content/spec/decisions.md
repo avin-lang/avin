@@ -111,6 +111,12 @@ a decision changes, this page and the chapter change together.
   is an error. A method value takes every parameter, by-name ones still by name, and private
   methods are values only where they could be called. Two values of one method on one object are
   two closures, so `===` tells them apart.
+- Settled 2026-11-03: `loop` is a statement that repeats its indented body (or `loop do body` on one
+  line) until a `break` or `return` leaves it. `loop` is a keyword.
+- Settled 2026-11-03: `do … while` tests at the end, so its body runs at least once. The body is an
+  indented block closed by a line starting `while test`, or one statement written `do stmt while
+  test`; an optional `else` runs when the test fails. `break` carries the loop's value as in
+  `while`, `continue` runs the test, and the test cannot read names the body declared.
 - `string` is a built-in type, not a class: it is final, has its own representation, gets its
   methods from the library through `impl string`, conforms to traits through `impl`, and is matched
   by the type pattern `s: string` like any other type.
@@ -156,6 +162,12 @@ a decision changes, this page and the chapter change together.
   in the order written, then the omitted ones' defaults in parameter order. Names and defaults belong
   to a declaration: a function value is called by position. A variant takes its fields by name too.
   The default of a by-name parameter is delayed like any argument to it.
+- Settled 2026-11-03: methods and class constructors take defaults as functions do. A method's
+  default sees `self`, the receiver's members and the parameters before it; a constructor's sees the
+  parameters before it and no `self`. Defaults belong to the method that introduces the parameter:
+  an override, and a method implementing a trait's, takes them and may not declare its own, so a
+  call's defaults are the same whichever class's method runs. A trait method's defaults apply through
+  the trait's type. A method of one required parameter and defaults may be called infix.
 - A function may be defined by [clauses](/spec/declarations/#clauses): its signature with no body,
   then lines `f(patterns) = body`, tried in order. A clause is guarded inline,
   `f(n) | n > 0 = body`, or by an indented block of `| condition = body` lines in which `| _` always
@@ -204,7 +216,8 @@ a decision changes, this page and the chapter change together.
 - A tuple needs no parentheses where it fills the rest of a line: `= a, b`, `return a, b`, a
   block's line. Bindings take tuples apart (`val q, r = divmod(n, d)`), and `a, b = b, a` is a
   multiple assignment: a statement that makes the whole right side before storing anything, with
-  compound forms that read every place first.
+  compound forms that read every place first. Its places are `var` locals and `var` fields, each
+  field's object evaluated before anything else.
 - Inside brackets whose commas separate items (call arguments, tuple and collection literals), a
   `return` or `break` value stops at the comma, so `f(a = return 1, b = 2)` has two arguments; a
   parenthesised `return 1, 2` is two tuple items, and `return (1, 2)` returns a tuple. An indented

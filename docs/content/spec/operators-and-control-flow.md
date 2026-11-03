@@ -103,6 +103,11 @@ so this swaps `a` and `b` with no temporary. The right side is a tuple, written 
 (`q, r = divmod(n, 10)`), with one part per place; a place `_` discards its part. The places may be
 parenthesized: `(a, b) = (b, a)`.
 
+A place is a `var` local or a `var` field, written `obj.field`, `self.field`, or by its bare name
+inside its class: `self.lo, self.hi = hi, lo`. The object a field belongs to is evaluated first, left
+to right across the places, before anything else; then the right side is made, then every place is
+stored.
+
 The compound forms read every place first, then make the right side, then combine and store:
 `a, b += b, a` adds each to the other using the values the statement started with.
 
@@ -147,6 +152,48 @@ The condition is tested before each iteration, and `continue` returns to that te
 nearest loop and may carry a value, in which case every `break` value and the loop's `else` must
 agree. The `else` runs on normal completion. Without an `else`, normal completion yields `unit`.
 A `while true` loop that no `break` leaves never finishes, so its type is `Nothing`.
+
+## loop
+
+```text
+var k = 0
+val found = loop
+    k += 5
+    if k > 12 then break k * 2
+```
+
+`loop` repeats its body until a `break` or `return` leaves it; `continue` starts the body again. A
+one-line loop is written `loop do step()`. Only a `break` ends a `loop`, so there is no `else`: with
+`break value`, every `break` value must agree and is the value of the loop, and a `break` without
+one makes the loop `unit`. A `loop` that no `break` leaves never finishes, so its type is
+`Nothing`, and a function may end in one. `loop` is a keyword and cannot be used as a name.
+
+## do … while
+
+```text
+digits(n: int) -> string
+    var rest = n
+    var s = ""
+
+    do
+        s = s"${rest % 10}" + s
+        rest /= 10
+    while rest > 0
+
+    s
+
+var i = 0
+do i += 1 while i < 4
+```
+
+The test comes at the end, so the body runs at least once. The body is an indented block with
+`while test` on the line that closes it, or a single statement on one line. The value rules are
+`while`'s: a `break` carries the loop's value, and an `else` after the test runs when the test fails,
+so every `break` value and the `else` must agree.
+
+`continue` runs the test, not the body again. The test cannot read names the body declared, since the
+body's scope has ended. A `do` that starts a line always opens this form; the `do` of a one-line
+`while` body follows its header, so the two never meet.
 
 ## match
 
