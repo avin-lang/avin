@@ -4,6 +4,7 @@ import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
 import sysl.path.file_name
+import sysl.text.from_utf8_unchecked
 
 /** The machine type of a semantic type, or `None` for a type with no runtime representation. */
 mir_type(t: &Type) -> Option[MirType] = *t match
@@ -168,7 +169,17 @@ lower_program(program: TProgram) -> MirProgram
     while k < l.instances.len()
         functions.push(lower_function(&l, k))
         k += 1
-    MirProgram(functions, l.strings, l.descriptors, l.records, l.closures, l.traps, global_types, entry, init)
+    var bindings: Buf[MirBinding] = buf()
+    for inst in l.instances
+        val symbol = program.symbols[inst.function]
+        if binding_target(symbol.decl) is Some(target)
+            val shim = shim_symbol(function_symbol(program, inst.function, inst.type_args))
+            // A function used as a value is an instance twice, its body and its closure's entry.
+            var seen = false
+            for b in bindings
+                if b.shim == shim then seen = true
+            if !seen then bindings.push(MirBinding(shim, target, symbol.name, symbol.params, symbol.result.unwrap_or(Unit), symbol.unit, symbol.decl.name_span))
+    MirProgram(functions, l.strings, l.descriptors, l.records, l.closures, l.traps, global_types, entry, init, bindings)
 
 /** Whether a function has no code: an abstract method, or an abstract class's or a trait's constructor. */
 private never_compiled(program: TProgram, id: usize) -> bool
@@ -848,7 +859,9 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
         Some(body) ->
             val result = lower_expr(l, body)
             finish(l, returning(l, result))
-        None -> intrinsic_body(l, symbol)
+        None ->
+            if binding_target(symbol.decl) is Some(_) then binding_body(l, symbol, shim_symbol(function_symbol(l.program, f.symbol, inst.type_args)))
+            else intrinsic_body(l, symbol)
     MirFunction(function_symbol(l.program, f.symbol, inst.type_args), signature, l.values, l.slots, l.blocks)
 
 // A closure entry takes the closure and the function's parameters. It keeps each captured local
@@ -897,6 +910,41 @@ private returning(l: *Lowering, value: Option[Operand]) -> Terminator
     value match
         Some(v) -> Return(Some(v))
         None -> Unreachable
+
+// A Sysl binding is a function like any other in the object file; its body passes its parameters to
+// the binding's shim, with the context first, and returns what the shim returns. The shim is
+// generated Sysl, called with the C convention, which converts each value at the boundary.
+private binding_body(l: *Lowering, symbol: FunctionSymbol, shim: string)
+    var args: Buf[Operand] = buf()
+    var params: Buf[MirType] = buf()
+    for i in 0..<symbol.params.len()
+        if l.param_values[i] is Some(v)
+            args.push(Value(v))
+            params.push(l.values[v])
+    val result = machine(l, symbol.result.unwrap_or(Unit))
+    val dest = result match
+        Some(t) -> Some(fresh(l, t))
+        None -> None
+    l.insts.push(Call(dest, Runtime(shim, MirSignature(params, result)), args))
+    finish(l, Return(dest match
+        Some(d) -> Some(Value(d))
+        None -> None))
+
+/** The symbol of the shim a binding's body calls: `avin_shim_` and the binding's own symbol, with
+ * each character other than a letter or a digit written as `_` and its two hex digits. */
+shim_symbol(function: string) -> string
+    val hex = "0123456789abcdef"
+    var out: Buf[u8] = buf()
+    for b in "avin_shim_".bytes
+        out.push(b)
+    for b in function.bytes
+        if b >= u8('a') && b <= u8('z') || b >= u8('A') && b <= u8('Z') || b >= u8('0') && b <= u8('9')
+            out.push(b)
+        else
+            out.push(u8('_'))
+            out.push(hex.bytes[usize(b >> 4)])
+            out.push(hex.bytes[usize(b & 15)])
+    from_utf8_unchecked(out.view())
 
 // An intrinsic is a function like any other in the object file; its body is the operation the
 // intrinsic names, so it can be called directly and, later, passed as a value.

@@ -1,0 +1,216 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.{Span, error, report}
+import sysl.buf.{Buf, buf}
+import sysl.crypto.sha256
+import sysl.fs.{exists, make_dir_all, make_temp_dir, pending_name, publish_file, read_text, remove_dir_all, remove_file, walk, write_text}
+import sysl.process.capture
+import sysl.text.{StrBuilder, str_builder}
+
+// Sysl bindings. Each binding's body calls a shim: a Sysl function, generated here, exported with the
+// C convention under the symbol the binding's body names. The shim converts each argument from its
+// Avin representation, calls the Sysl function the binding names, and converts the result back. Sysl
+// checks every shim against the real declaration, so a binding with a wrong type fails the build with
+// Sysl's diagnostic, reported at the binding.
+//
+// The shims are one Sysl package that depends on the runtime's, built by `sysl build-c` into one
+// archive that holds the runtime, the shims and the part of Sysl's library they reach. A program with
+// bindings links that archive in place of the runtime's own, so its Sysl code shares one copy of
+// Sysl's library: one standard output, one allocator.
+
+/** The generated shim package's source, and where each binding's part of it is: the line of its
+ * import and the lines of its function, counted from one. */
+struct ShimSource
+    text: string
+    imports: Buf[usize]
+    first: Buf[usize]
+    last: Buf[usize]
+
+/** The manifest of the shim package, depending on the runtime package at `runtime_dir`. */
+shim_manifest(runtime_dir: string) -> string =
+    "package { name = \"avin-shims\", version = \"0.1.0\", sysl = \"0.8.0\" }\n" +
+    "dependencies {\n  avin-runtime { path = \"" + runtime_dir + "\" }\n}\n" +
+    "requires { heap = true, posix = true }\n"
+
+/** The shim module for a program's bindings. */
+shim_source(bindings: Buf[MirBinding]) -> ShimSource
+    var out = str_builder()
+    var line = 1usize
+    var imports: Buf[usize] = buf()
+    var first: Buf[usize] = buf()
+    var last: Buf[usize] = buf()
+    val head = "module avin.shims\n\nimport avin.rt.{Context, text_bytes, text_length, text_of}\nimport sysl.raw.str_cast\n"
+    out.push(head)
+    line += 4
+    for i in 0..<bindings.len()
+        out.push(s"import ${bindings[i].target} as bound_$i\n")
+        imports.push(line)
+        line += 1
+    out.push("\n// An Avin string's bytes, copied into a Sysl string.\nprivate text_in(p: *u8) -> string = str_cast(text_bytes(p)[0..<text_length(p)])\n")
+    line += 3
+    for i in 0..<bindings.len()
+        val b = bindings[i]
+        out.push("\n")
+        line += 1
+        first.push(line)
+        out.push(s"// ${b.name}\n@export(\"${b.shim}\")\nshim_$i(ctx: *Context")
+        var args: Buf[string] = buf()
+        for k in 0..<b.params.len()
+            val p = b.params[k]
+            if *p is Unit
+                args.push("()")
+                continue
+            out.push(s", a$k: ${c_side(p)}")
+            args.push(into_sysl(p, s"a$k"))
+        out.push(")")
+        if !(*b.result is Unit) then out.push(" -> " + c_side(b.result))
+        out.push(s"\n    val r: ${sysl_side(b.result)} = bound_$i(")
+        for k in 0..<args.len()
+            if k > 0 then out.push(", ")
+            out.push(args[k])
+        out.push(")\n")
+        line += 4
+        if !(*b.result is Unit)
+            out.push("    " + out_of_sysl(b.result, "r") + "\n")
+            line += 1
+        last.push(line - 1)
+    ShimSource(out.finish(), imports, first, last)
+
+// How a boundary type is passed with the C convention: as Avin's compiled code passes it.
+private c_side(t: &Type) -> string = *t match
+    Bool -> "u8"
+    Char -> "u32"
+    Str -> "*u8"
+    _ -> sysl_side(t)
+
+// The Sysl type a boundary type is converted to.
+private sysl_side(t: &Type) -> string = *t match
+    Unit -> "unit"
+    Bool -> "bool"
+    Char -> "char"
+    Real -> "real"
+    Str -> "string"
+    Byte -> "u8"
+    Int(bits) -> if bits == 32 then "int" elif bits == 64 then "long" else s"i$bits"
+    _ -> "unit"
+
+private into_sysl(t: &Type, a: string) -> string = *t match
+    Bool -> s"$a != 0"
+    Char -> s"char($a)"
+    Str -> s"text_in($a)"
+    _ -> a
+
+private out_of_sysl(t: &Type, r: string) -> string = *t match
+    Bool -> s"if $r then u8(1) else u8(0)"
+    Char -> s"u32($r)"
+    Str -> s"text_of(ctx, $r)"
+    _ -> r
+
+/** The archive a program with bindings links in place of the runtime's: the runtime with the
+ * program's shims, built once for each shim source, Sysl version and runtime source, and kept in the
+ * toolchain's cache. An error is the diagnostics of a shim Sysl rejected, reported at the bindings,
+ * or why the shims could not be built. */
+ensure_shims(tc: Toolchain, bindings: Buf[MirBinding], units: Buf[SourceUnit]) -> Result[string, string]
+    val shim = shim_source(bindings)
+    val manifest = shim_manifest(tc.runtime_dir())
+    val version = capture("sysl", ["--version"], timeout = 60000) match
+        Ok(r) -> r.text
+        Err(e) -> return Err("could not run sysl: " + e.to_string())
+    val archive = tc.shim_cache() + "/" + shim_key(manifest + shim.text + version + runtime_fingerprint(tc)) + ".a"
+    if exists(archive) then return Ok(archive)
+    make_dir_all(tc.shim_cache()).map_err(e -> e.to_string())?
+    val dir = make_temp_dir("avin-shims").map_err(e -> e.to_string())?
+    defer _ = remove_dir_all(dir)
+    make_dir_all(dir + "/avin/shims").map_err(e -> e.to_string())?
+    write_text(dir + "/sysl.hocon", manifest).map_err(e -> e.to_string())?
+    write_text(dir + "/avin/shims/shims.sysl", shim.text).map_err(e -> e.to_string())?
+    // Built under a temporary name and published by rename, so builds running at the same time never
+    // see a partial archive.
+    val pending = pending_name(archive)
+    defer _ = remove_file(pending)
+    defer _ = remove_file(pending + ".h")
+    val result = capture("sysl", ["build-c", dir, "-o", pending], stderr = true, timeout = 300000).map_err(e -> "could not run sysl: " + e.to_string())?
+    if !result.status.ok()
+        val output = result.err.unwrap_or("") + result.text
+        return Err(shim_diagnostics(output, shim, bindings, units))
+    publish_file(pending, archive).map_err(e -> e.to_string())?
+    Ok(archive)
+
+/** Sysl's diagnostics of a shim, each reported at the binding whose part of the shim it is in, or
+ * the whole output when one of them is elsewhere. */
+shim_diagnostics(output: string, shim: ShimSource, bindings: Buf[MirBinding], units: Buf[SourceUnit]) -> string
+    var rendered = ""
+    var message = ""
+    var unplaced = false
+    for text in output.split("\n")
+        if text.starts_with("error: ")
+            message = text["error: ".bytes.len..]
+            continue
+        var at = 0usize
+        while at < text.bytes.len && text.bytes[at] == u8(' ')
+            at += 1
+        if message == "" || !text[at..].starts_with("--> ") then continue
+        val place = text[at + 4..]
+        val k = if place.contains("/avin/shims/shims.sysl:") then owner_of(shim, line_of(place)) else None
+        k match
+            Some(i) ->
+                val b = bindings[i]
+                var r = report()
+                r.add(error(b.span, s"the Sysl binding `${b.name}` does not match `${b.target}`: $message"))
+                rendered = rendered + r.render(units[b.unit].src)
+            None -> unplaced = true
+        message = ""
+    if unplaced || rendered == "" then return "avin: Sysl could not build the bindings' shims:\n" + output
+    rendered
+
+// The line of a `path:line:col` place.
+private line_of(place: string) -> usize
+    var parts: Buf[string] = buf()
+    for p in place.split(":")
+        parts.push(p)
+    if parts.len() < 3 then return 0
+    var n = 0usize
+    for b in parts[parts.len() - 2].bytes
+        if b >= u8('0') && b <= u8('9') then n = n * 10 + usize(b - u8('0'))
+    n
+
+// The binding whose import or function holds a line of the shim.
+private owner_of(shim: ShimSource, line: usize) -> Option[usize]
+    for i in 0..<shim.first.len()
+        if shim.imports[i] == line || line >= shim.first[i] && line <= shim.last[i] then return Some(i)
+    None
+
+// The cache key: the first half of a SHA-256 of everything the archive is built from, in hex.
+private shim_key(text: string) -> string
+    val digest = sha256(text.bytes)
+    val hex = "0123456789abcdef"
+    var out = str_builder()
+    for i in 0..<16
+        out.push_char(char(hex.bytes[usize(digest[i] >> 4)]))
+        out.push_char(char(hex.bytes[usize(digest[i] & 15)]))
+    out.finish()
+
+// The runtime's sources, each file's path and text in the order of their paths, which the archive is
+// built from as much as from the shims.
+private runtime_fingerprint(tc: Toolchain) -> string
+    var files: Buf[string] = buf()
+    var entries = walk(tc.runtime_dir())
+    loop
+        val entry = entries.next() match
+            Some(Ok(e)) -> e
+            Some(Err(_)) -> continue
+            None -> break
+        if entry.is_dir() && entry.path.ends_with("/.sysl")
+            entries.skip_dir()
+            continue
+        if entry.path.ends_with(".sysl") || entry.path.ends_with(".hocon") || entry.path.ends_with(".sum")
+            var at = files.len()
+            files.push(entry.path)
+            while at > 0 && files[at - 1] > entry.path
+                files[at] = files[at - 1]
+                at -= 1
+            files[at] = entry.path
+    var out = str_builder()
+    for f in files
+        out.push(f + "\n" + read_text(f).unwrap_or("") + "\n")
+    out.finish()

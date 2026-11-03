@@ -13,6 +13,8 @@ struct Toolchain
     prelude_path(self) -> string = self.root + "/library/avin/prelude.avin"
     runtime_dir(self) -> string = self.root + "/runtime"
     runtime_archive(self) -> string = self.root + "/runtime/.sysl/libavinrt.a"
+    /** Where the archives of the runtime with a program's binding shims are kept, by key. */
+    shim_cache(self) -> string = self.root + "/.avin/shims"
 end Toolchain
 
 /** A toolchain rooted at `root`, if `root` holds the library and the runtime. */
@@ -24,14 +26,34 @@ struct Compilation
     /** Every diagnostic, rendered; empty when compilation succeeded. */
     diagnostics: string
     llvm: Option[string]
+    /** For a program with Sysl bindings, the archive it links in place of the runtime's: the runtime
+     * with the bindings' shims, which Sysl has checked. */
+    archive: Option[string]
 
-/** Compiles a program to LLVM IR against the toolchain's prelude. */
-compile(tc: Toolchain, src: Source) -> Compilation = lower_source(tc, src) match
-    Ok(program) -> Compilation("", Some(emit_llvm(program)))
-    Err(diagnostics) -> Compilation(diagnostics, None)
+/** Compiles a program to LLVM IR against the toolchain's prelude, and builds the shims of its Sysl
+ * bindings, so a binding Sysl rejects is reported as the program's error. */
+compile(tc: Toolchain, src: Source) -> Compilation
+    val lowered = lower_units(tc, src) match
+        Ok(l) -> l
+        Err(diagnostics) -> return Compilation(diagnostics, None, None)
+    var archive: Option[string] = None
+    if lowered.program.bindings.len() > 0
+        ensure_shims(tc, lowered.program.bindings, lowered.units) match
+            Ok(a) -> archive = Some(a)
+            Err(diagnostics) -> return Compilation(diagnostics, None, None)
+    Compilation("", Some(emit_llvm(lowered.program)), archive)
 
 /** Compiles a program as far as MIR against the toolchain's prelude, or renders its diagnostics. */
-lower_source(tc: Toolchain, src: Source) -> Result[MirProgram, string]
+lower_source(tc: Toolchain, src: Source) -> Result[MirProgram, string] = lower_units(tc, src) match
+    Ok(lowered) -> Ok(lowered.program)
+    Err(diagnostics) -> Err(diagnostics)
+
+/** A program as MIR, with the units it was compiled from, which place its diagnostics. */
+private struct Lowered
+    program: MirProgram
+    units: Buf[SourceUnit]
+
+private lower_units(tc: Toolchain, src: Source) -> Result[Lowered, string]
     val prelude_text = read_text(tc.prelude_path()) match
         Ok(text) -> text
         Err(e) -> return Err(s"avin: ${tc.prelude_path()}: ${e.to_string()}\n")
@@ -47,7 +69,7 @@ lower_source(tc: Toolchain, src: Source) -> Result[MirProgram, string]
     val checked = check_program(units)
     if checked.has_errors() then return Err(checked.render())
     checked.program match
-        Some(program) -> Ok(lower_program(program))
+        Some(program) -> Ok(Lowered(lower_program(program), checked.units))
         None -> Err("avin: checking produced no program\n")
 
 /** The runtime library archive, built from the runtime's Sysl package when it is missing or older
@@ -82,10 +104,14 @@ private runtime_stale(tc: Toolchain, archive: string) -> bool
         if entry.path.ends_with(".sysl") || entry.path.ends_with(".hocon")
             if entry.meta.modified > built then return true
 
-/** Links LLVM IR with the runtime into an executable at `output`. The executable is written under a
- * temporary name and published by rename, so a failed link leaves any previous output in place. */
-link(tc: Toolchain, llvm: string, output: string, optimization: string) -> Result[unit, string]
-    val archive = ensure_runtime(tc)?
+/** Links LLVM IR with the runtime into an executable at `output`: with `shims`, the runtime with a
+ * program's binding shims, when there is one, and otherwise the runtime's own archive. The
+ * executable is written under a temporary name and published by rename, so a failed link leaves any
+ * previous output in place. */
+link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimization: string) -> Result[unit, string]
+    val archive = shims match
+        Some(a) -> a
+        None -> ensure_runtime(tc)?
     val dir = make_temp_dir("avin-link").map_err(e -> e.to_string())?
     defer _ = remove_dir_all(dir)
     val ir = dir + "/program.ll"
