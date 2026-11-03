@@ -16,6 +16,7 @@ mir_type(t: &Type) -> Option[MirType] = *t match
     Char -> Some(MInt(32))
     Real -> Some(MReal)
     Data(_, _, _) -> Some(MRef)
+    Class(_, _, _) -> Some(MRef)
     Tuple(_) -> Some(MRef)
     Function(_, _) -> Some(MRef)
     ByName(_) -> Some(MRef)
@@ -130,8 +131,9 @@ private field_size(t: MirType) -> usize = t match
     MInt(bits) -> usize((bits + 63) / 64) * 8
     _ -> 8
 
-/** The layout of a data or tuple type, which must be concrete; made when first asked for. A tuple
- * is laid out as a data type with one variant whose fields are its parts. */
+/** The layout of a data, tuple or class type, which must be concrete; made when first asked for. A
+ * tuple is laid out as a data type with one variant whose fields are its parts, and a class as one
+ * whose fields are the class's: its parameters, then the fields its body declares. */
 private layout(l: *Lowering, t: &Type) -> DataLayout
     val key = type_name(t)
     if l.layout_index.get(key) is Some(index) then return l.layouts[index]
@@ -140,17 +142,22 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
         Data(id, _, args) ->
             val d = l.program.data[id]
             for v in 0..<d.variants.len()
-                variants.push(variant_layout(l, key + "." + d.variants[v].name, v, variant_fields(d, id, v, args)))
-        Tuple(items) -> variants.push(variant_layout(l, key, 0, items))
-        _ -> panic("a layout of a type that is neither data nor a tuple: " + key)
+                variants.push(variant_layout(l, key + "." + d.variants[v].name, v, variant_fields(d, id, v, args), true))
+        Tuple(items) -> variants.push(variant_layout(l, key, 0, items, true))
+        Class(id, _, args) ->
+            var fields: Buf[&Type] = buf()
+            for f in l.program.classes[id].fields
+                fields.push(substitute(f.ty.unwrap_or(ErrorType), class_owner(id), args))
+            variants.push(variant_layout(l, key, 0, fields, false))
+        _ -> panic("a layout of a type that is not data, a tuple or a class: " + key)
     val result = DataLayout(variants)
     l.layout_index.put(key, l.layouts.len())
     l.layouts.push(result)
     result
 
 // One variant's fields at their offsets, and its descriptor; a variant with no field data is one
-// constant object.
-private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[&Type]) -> VariantLayout
+// constant object, unless `shared` is false: every object of a class is its own, for its identity.
+private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[&Type], shared: bool) -> VariantLayout
     var fields: Buf[Option[FieldSlot]] = buf()
     var refs: Buf[usize] = buf()
     var size = 8usize
@@ -162,7 +169,7 @@ private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[
                 size += field_size(m)
             None -> fields.push(None)
     val shape = VariantLayout(l.descriptors.len(), fields)
-    l.descriptors.push(Descriptor(name, tag, size, refs, size == 8))
+    l.descriptors.push(Descriptor(name, tag, size, refs, shared && size == 8))
     shape
 
 private field_address(l: *Lowering, object: Operand, field: FieldSlot) -> Operand
@@ -229,7 +236,7 @@ private load_field(l: *Lowering, object: Operand, field: FieldSlot) -> Operand
 private is_generic(program: TProgram, id: usize) -> bool
     val symbol = program.symbols[id]
     val owner = symbol.root.unwrap_or(id)
-    program.symbols[owner].decl.type_params.len() > 0
+    program.symbols[owner].type_params.len() > 0
 
 /** The index of the instance of `function` for `type_args`, made when first asked for. */
 private instance(l: *Lowering, function: usize, type_args: Buf[&Type]) -> usize =
@@ -439,7 +446,7 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     val f = l.program.functions[inst.function]
     val symbol = l.program.symbols[f.symbol]
     l.subst = inst.type_args
-    l.subst_owner = symbol.root.unwrap_or(inst.function)
+    l.subst_owner = l.program.symbols[symbol.root.unwrap_or(inst.function)].type_owner
     l.values = buf()
     l.slots = buf()
     l.blocks = buf()
@@ -693,6 +700,18 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         layout(l, concrete(l, value.ty)).variants[0].fields[index] match
             Some(field) -> Some(load_field(l, object, field))
             None -> None
+    New ->
+        val object = fresh(l, MRef)
+        l.insts.push(Alloc(object, layout(l, concrete(l, e.ty)).variants[0].descriptor))
+        Some(Value(object))
+    StoreField(object, index, value, yields) ->
+        val target = lower_expr(l, object)?
+        val v = lower_expr(l, value)
+        if v is None && machine(l, value.ty) is Some(_) then return None
+        layout(l, concrete(l, object.ty)).variants[0].fields[index] match
+            Some(field) -> if v is Some(x) then l.insts.push(Store(field_address(l, target, field), x))
+            None -> ()
+        if yields then v else None
     Block(items) ->
         var last: Option[Operand] = None
         for item in items

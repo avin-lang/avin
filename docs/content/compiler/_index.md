@@ -48,6 +48,19 @@ live outside the heap, and the collector leaves them alone. `AVIN_GC_STRESS=1` m
 allocation collect first, and the execution tests run that way, so a reference the compiler failed
 to root is found at the first allocation that could lose it.
 
+An object of a class is laid out as a one-variant `data` value is: the descriptor word, then one
+8-byte slot per field (wider integers take more), the class parameters first and then the fields
+the body declares, in order. A class with no fields still allocates, since every object has its own
+identity. The constructor is an ordinary function named after the class: it allocates the object,
+stores its parameters into their fields, runs the body, initializing each body field where it is
+declared, and returns the object, which it holds in a local named `self` so closures made in the
+body capture it as they would any local. A method is an ordinary function whose first parameter is
+the receiver. The constructor and the methods share the class's type parameters, a method's own
+following them, so a generic class's constructor and methods are instantiated per list of type
+arguments as generic functions are, and a field's type at a particular instance is its declared
+type with the receiver's type arguments substituted. A call of a method of a final class is a
+direct call.
+
 A trap stops the program with one line on standard error naming what failed and where:
 
 ```text

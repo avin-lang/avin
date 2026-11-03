@@ -228,7 +228,24 @@ class Savings(owner: string, balance: int, rate: real): Account(owner, balance),
 - Classes are **final unless declared `open` or `abstract`**. Overriding requires `override`.
   An `abstract class` may leave members without bodies and cannot be instantiated.
 - Instances are heap objects with identity. Equality, hashing and display exist only if the class
-  implements or derives them (`class Point(x: int, y: int) derives Eq, Hash, Display`).
+  implements or derives them (`class Point(x: int, y: int) derives Eq, Hash, Display`). `===`
+  compares identities, and `==` on a class that defines no equality is a compile error.
+- A class is created by calling it, `Account("ada", 10)`, as a function is called; a generic class's
+  type arguments are inferred from the arguments and the expected type, or written,
+  `Box[string]("x")`. The class's name is also its constructor as a function value.
+- Outside the class, `obj.field` reads a public field, `obj.field = value` assigns a public `var`
+  one, and `obj.method(args)` calls a method. A method or a field declared `private` in the body,
+  and a plain class parameter, are private to the class: its constructor and methods, and the
+  lambdas and local functions in them, may use them on any instance of the class.
+- Inside the class, names resolve innermost first: a local, a parameter or a local function hides
+  a member of the same name, and a member hides a top-level declaration. `self.balance` always
+  reaches the field, so a method's parameter may share a field's name. In the class body, a class
+  parameter's name is its field, so it reads what an assignment to a `var` stored.
+- Methods take the forms top-level functions take: a body after `=`, an indented body, or clauses,
+  which match the arguments and not the receiver. A method may have type parameters of its own,
+  after its class's.
+- A field declared in the body without a type has its initializer's type. The body cannot
+  `return`: it runs to its end to make the object.
 
 ## trait
 

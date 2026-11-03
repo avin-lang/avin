@@ -57,6 +57,12 @@ a decision changes, this page and the chapter change together.
 - A class's parameter list is its one constructor. Class parameters are private immutable fields
   (`val` makes one public and read-only, `var` public and mutable), and the statements in the class
   body are the constructor's code, run top to bottom when an instance is created.
+- Inside a class, a local, a parameter or a local function hides a member of the same name, and a
+  member hides a top-level declaration; `self.name` always reaches the member. In the class body,
+  a class parameter's name is its field, so it reads what an assignment to a `var` stored.
+- A private member is private to its class, not to one instance: the class's constructor and
+  methods, with the lambdas and local functions in them, may use it on any instance of the class.
+- A class body cannot `return`. A field declared in the body without a type has its initializer's.
 - Every function declaration parameter has an explicit type.
 - A [default argument](/spec/declarations/#default-and-named-arguments) is evaluated at each call
   that omits it, in the declaring function's scope, and may use the parameters before it. Named
@@ -142,6 +148,9 @@ a decision changes, this page and the chapter change together.
 - An integer literal prefers its own type when overloads differ only in the types a literal could
   take: `f(1)` with `f(int)` and `f(long)`, or with `f(int)` and `f(real)`, would call `f(int)`
   rather than be ambiguous. As settled, such a call is ambiguous.
+- A method named without a call, `account.deposit`, is a function value bound to its receiver: a
+  closure holding `account`, of the method's type without the receiver. Inside the class, a bare
+  method name is the same closure over `self`.
 
 ## Open
 
