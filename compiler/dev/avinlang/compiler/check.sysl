@@ -238,6 +238,17 @@ struct GenericScope
     owner: usize
     params: Buf[TypeParam]
 
+/** Type arguments written before every conformance is known, for the parameters `params` of `owner`,
+ * held to their bounds once they are, in the generic scope they were written in. */
+struct PendingBound
+    unit: usize
+    at: Span
+    what: string
+    owner: usize
+    params: Buf[TypeParam]
+    args: Buf[&Type]
+    scope: Option[GenericScope]
+
 /** An `impl` block, resolved. `target` is the type it adds to, with the impl's type parameters as its
  * arguments, which are the type's own: `owner` owns them, `data_owner` or `class_owner` of the type.
  * `trait` is the trait it makes the type conform to. An impl found invalid has the error type as its
@@ -254,20 +265,21 @@ struct Checker
     units: Buf[SourceUnit]
     symbols: Buf[FunctionSymbol]
     data: Buf[DataSymbol]
-    /** The data types and variants in scope, by name. */
+    /** The data types and variants, by qualified name: `a.b.Shape`, or `Shape` in the root module. */
     types: Map[string, usize]
     variants: Map[string, VariantRef]
     classes: Buf[ClassSymbol]
-    /** The classes in scope, by name, and the standalone objects, whose types are named after them. */
+    /** The classes, by qualified name, and the standalone objects, whose types are named after them. */
     class_types: Map[string, usize]
     globals: Buf[GlobalSymbol]
-    /** The module-level values and objects in scope, by name. */
+    /** The module-level values and objects, by qualified name. */
     global_names: Map[string, usize]
     /** 0: not yet checked, 1: being checked, 2: checked. */
     states: Buf[u8]
     bodies: Buf[Option[&TExpr]]
     locals: Buf[Buf[TLocal]]
-    /** The top-level functions in scope, by name: several when the name is overloaded. */
+    /** The top-level functions and class constructors, by qualified name: several when the name is
+     * overloaded. */
     scope: Map[string, Buf[usize]]
     current: usize
     body: BodyState
@@ -294,6 +306,25 @@ struct Checker
     trait_fields: Buf[usize]
     /** The methods made to read a field where it supplies a trait's `val`: each yields its field. */
     field_getters: Buf[usize]
+    /** The bounds of each type parameter that has any, resolved where it is declared, by
+     * `bound_key`. */
+    bounds: Map[string, Buf[&Type]]
+    /** The trait whose methods are being declared or checked, which `Self` names the implementer
+     * of. */
+    self_trait: Option[usize]
+    /** Whether the type being resolved is a bound or the trait of an impl, where a trait that
+     * mentions `Self` may be named. */
+    bound_context: bool
+    /** Whether every type's conformances are known, so a type argument can be held to its bounds
+     * where it is written; before then, each check waits in `pending`. */
+    conformances_known: bool
+    pending: Buf[PendingBound]
+    /** For each unit, its module and the names its imports bring in. */
+    files: Buf[FileScope]
+    /** The declarations marked `private`, by qualified name: seen only inside their modules. */
+    private_names: Map[string, bool]
+    /** The program's root module, which declares `main`. */
+    root_module: string
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -316,14 +347,124 @@ struct Checked
         out
 end Checked
 
-/** Checks a program. The last unit is the program's own file, which must declare `main`; the units
- * before it (the prelude) are visible to it, and its own declarations shadow theirs. */
-check_program(units: Buf[SourceUnit]) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf())
+/** The core library's module. Its public declarations are seen by every file without an import, and
+ * the built-in types belong to it. */
+const CoreModule: string = "avin"
+
+/** What a file sees besides its own module's declarations and the core library's: each name its
+ * imports bring in, bound to the qualified name of the declaration it imports. */
+struct FileScope
+    module_name: string
+    imports: Map[string, string]
+
+/** The name a declaration `name` of module `module_name` has in the symbol tables: `a.b.name`, or
+ * `name` alone in the root module. A declaration's name holds no dot, so two declarations of
+ * different modules never share one. */
+qualified(module_name: string, name: string) -> string = if module_name == "" then name else module_name + "." + name
+
+/** Whether a declaration has the qualified name `key`, whatever kind it is. */
+private declared(c: *Checker, key: string) -> bool =
+    c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_) || c.variants.get(key) is Some(_) ||
+        c.global_names.get(key) is Some(_) || c.scope.get(key) is Some(_)
+
+/** Whether the declaration named `key` may be seen from another module: it is not `private`. A
+ * function's name is while any of its overloads is public. */
+private exported(c: *Checker, key: string) -> bool
+    if c.private_names.get(key) is Some(_) then return false
+    if c.scope.get(key) is Some(ids)
+        for id in ids
+            if c.symbols[id].public then return true
+        return false
+    true
+
+/** The qualified name a bare `name` denotes in a unit: its own module's declaration of that name,
+ * else the one the file imports under it, else the core library's public one. The nearer hides the
+ * farther whatever kind each is, so a module's function hides a core library type of its name. When
+ * none exists, the module's own, which no table holds, so the use is reported as unknown. */
+private resolve_name(c: *Checker, unit: usize, name: string) -> string
+    val scope = c.files[unit]
+    val own = qualified(scope.module_name, name)
+    if declared(c, own) then return own
+    if scope.imports.get(name) is Some(key) then return key
+    val core = qualified(CoreModule, name)
+    if declared(c, core) && exported(c, core) then return core
+    own
+
+private file_scope(c: *Checker, unit: usize) -> FileScope
+    val file = c.units[unit].file
+    var imports: Map[string, string] = map()
+    for i in file.imports
+        if imports.get(i.binding) is None then imports.put(i.binding, i.path)
+    FileScope(file.module_name, imports)
+
+private module_exists(c: *Checker, name: string) -> bool
+    for f in c.files
+        if f.module_name == name then return true
+    false
+
+// Each import of a unit names a public declaration of another module, under a name the file does not
+// already use. An import found wrong is reported and dropped, so its uses are reported as unknown
+// names rather than resolved to something the import did not mean.
+private check_imports(c: *Checker, unit: usize)
+    val file = c.units[unit].file
+    val own = file.module_name
+    var kept: Map[string, string] = map()
+    for i in file.imports
+        var dot: Option[usize] = None
+        for k in 0..<i.path.bytes.len
+            if i.path.bytes[k] == u8('.') then dot = Some(k)
+        val at = dot match
+            Some(k) -> k
+            None ->
+                if module_exists(c, i.path) then c.note(unit, i.span, s"`${i.path}` is a module; an import names its declarations, as in `import ${i.path}.{Name}`")
+                else c.note(unit, i.span, s"`${i.path}` is not a declaration of a module; an import names one, as in `import a.b.{Name}`")
+                continue
+        val module_name = i.path[0..<at]
+        val name = i.path[at + 1..]
+        if module_name == own
+            c.note(unit, i.span, s"`$name` is declared in this module, which sees it without an import")
+            continue
+        if !module_exists(c, module_name)
+            if module_exists(c, i.path) then c.note(unit, i.span, s"`${i.path}` is a module; an import names its declarations, as in `import ${i.path}.{Name}`")
+            else c.note(unit, i.span, s"unknown module `$module_name`")
+            continue
+        if !declared(c, i.path)
+            c.note(unit, i.span, s"module `$module_name` declares no `$name`")
+            continue
+        if !exported(c, i.path)
+            c.note(unit, i.span, s"`$name` is private to module `$module_name`")
+            continue
+        val local = qualified(own, i.binding)
+        if declared(c, local)
+            var companion = false
+            if c.class_types.get(local) is Some(k)
+                if c.classes[k].decl.object
+                    if c.class_types.get(i.path) is Some(j)
+                        if !c.classes[j].decl.object then companion = true
+            if companion then c.note(unit, i.span, s"`${i.binding}` is a class of module `$module_name`; its companion object is declared in the class's own module")
+            else c.note(unit, i.span, s"`${i.binding}` is imported and also declared in this module")
+            continue
+        if kept.get(i.binding) is Some(earlier)
+            c.note(unit, i.span, s"`${i.binding}` is already imported, from `$earlier`")
+            continue
+        kept.put(i.binding, i.path)
+    c.files[unit].imports = kept
+
+/** Checks a program: the core library's units, then the program's own, each heading its module's
+ * name in `file.module_name`. `root_module` is the module that must declare `main`, and the last
+ * unit is one of its files. Every file sees its own module's declarations, the names it imports and
+ * the core library's public declarations, in that order: an inner name hides an outer one. */
+check_program(units: Buf[SourceUnit], root_module: string) -> Checked
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module)
+    for u in 0..<c.units.len()
+        c.files.push(file_scope(&c, u))
     // Every type is named before any is used, so a data type may refer to itself or to one
-    // declared after it, and functions are declared once every type is known.
+    // declared after it, and functions are declared once every type is known. A class is named
+    // before any object, so an object finds its companion in any file of the module.
     for u in 0..<c.units.len()
         declare_types(&c, u)
+    for u in 0..<c.units.len()
+        declare_objects(&c, u)
     for u in 0..<c.units.len()
         declare_impls(&c, u)
     for u in 0..<c.units.len()
@@ -344,8 +485,18 @@ check_program(units: Buf[SourceUnit]) -> Checked
     for id in 0..<c.classes.len()
         link_methods(&c, id, &linked)
     place_traits(&c)
+    // Type arguments written in declarations are held to their bounds once every conformance is known.
+    c.conformances_known = true
+    for p in c.pending
+        val outer_generic = c.generic
+        c.generic = p.scope
+        hold_to_bounds(&c, p.unit, p.at, p.what, p.owner, p.params, p.args, 0)
+        c.generic = outer_generic
+    c.pending = buf()
     for u in 0..<c.units.len()
         declare_globals(&c, u)
+    for u in 0..<c.units.len()
+        check_imports(&c, u)
     for _ in c.classes
         c.building.push(0)
         c.constructions.push(None)
@@ -359,18 +510,21 @@ check_program(units: Buf[SourceUnit]) -> Checked
     for id in 0..<c.classes.len()
         settle_inherited_fields(&c, id)
         check_override_results(&c, id)
+        check_class_variance(&c, id)
     check_initialization(&c)
     for id in 0..<c.data.len()
         check_data_implementations(&c, id)
+        check_data_variance(&c, id)
     for g in 0..<c.globals.len()
         settle_global(&c, g)
     val init = initializer(&c, initialization_order(&c))
-    val main_unit = c.units.len() - 1
+    var main_unit = c.units.len() - 1
     var entry: Option[usize] = None
-    c.scope.get("main") match
+    c.scope.get(qualified(root_module, "main")) match
         Some(ids) ->
-            if c.symbols[ids[0]].unit == main_unit then entry = Some(ids[0])
-            if ids.len() > 1 then c.note(main_unit, c.symbols[ids[1]].decl.name_span, "`main` cannot be overloaded")
+            entry = Some(ids[0])
+            main_unit = c.symbols[ids[0]].unit
+            if ids.len() > 1 then c.note(c.symbols[ids[1]].unit, c.symbols[ids[1]].decl.name_span, "`main` cannot be overloaded")
         None -> ()
     entry match
         Some(id) ->
@@ -398,34 +552,34 @@ check_program(units: Buf[SourceUnit]) -> Checked
 
 private declare_unit(c: *Checker, unit: usize)
     val file = c.units[unit].file
-    for item in file.items
-        item match
+    for i in 0..<file.items.len()
+        file.items[i] match
             FunctionItem(f) ->
-                // A unit's functions of a name hide an earlier unit's, so the program's own
-                // declarations shadow the prelude's; within one unit they overload one another.
+                // A module's functions of a name overload one another, in whichever of its files
+                // each is declared, and hide the core library's.
+                val key = qualified(file.module_name, f.name)
                 var set: Buf[usize] = buf()
-                if c.scope.get(f.name) is Some(ids)
+                if c.scope.get(key) is Some(ids)
                     for other in ids
-                        if c.symbols[other].unit == unit && !c.symbols[other].constructor then set.push(other)
+                        if !c.symbols[other].constructor then set.push(other)
                 val id = c.symbols.len()
-                val symbol = signature(c, unit, file.module_name, f, id, f.type_params, false)
+                var symbol = signature(c, unit, file.module_name, f, id, f.type_params, false)
+                symbol.public = !file.private_items[i]
                 if same_as_overload(c, symbol, set)
                     c.note(unit, f.name_span, s"`${f.name}` is declared more than once with the same parameter types; overloads differ in their parameter types, and a function that chooses by its arguments' values is written with clauses")
                     continue
-                if set.len() == 0 && c.variants.get(f.name) is Some(v)
-                    if c.data[v.data].unit == unit
-                        c.note(unit, f.name_span, s"`${f.name}` is already a variant of `${c.data[v.data].name}`")
-                if set.len() == 0 && c.class_types.get(f.name) is Some(k)
-                    if c.classes[k].unit == unit
-                        if c.classes[k].decl.object then c.note(unit, f.name_span, s"`${f.name}` is already an object")
-                        else c.note(unit, f.name_span, s"`${f.name}` is already a class, which is called to make one")
+                if set.len() == 0 && c.variants.get(key) is Some(v)
+                    c.note(unit, f.name_span, s"`${f.name}` is already a variant of `${c.data[v.data].name}`")
+                if set.len() == 0 && c.class_types.get(key) is Some(k)
+                    if c.classes[k].decl.object then c.note(unit, f.name_span, s"`${f.name}` is already an object")
+                    else c.note(unit, f.name_span, s"`${f.name}` is already a class, which is called to make one")
                 c.symbols.push(symbol)
                 c.states.push(0)
                 c.bodies.push(None)
                 c.locals.push(buf())
                 declare_defaults(c, id)
                 set.push(id)
-                c.scope.put(f.name, set)
+                c.scope.put(key, set)
                 if set.len() > 1 then mark_overloads(c, set)
             DataItem(_) -> ()
             ClassItem(_) -> ()
@@ -496,62 +650,63 @@ private restore_vars(c: *Checker, saved: Buf[Option[&Type]])
 
 private declare_types(c: *Checker, unit: usize)
     val file = c.units[unit].file
-    var seen: Map[string, Span] = map()
-    for item in file.items
-        if item is DataItem(d)
+    for i in 0..<file.items.len()
+        if file.items[i] is DataItem(d)
+            val key = qualified(file.module_name, d.name)
             if builtin_type(d.name) is Some(_)
                 c.note(unit, d.span, s"`${d.name}` is a built-in type, so it cannot be declared")
                 continue
-            if seen.get(d.name) is Some(_)
+            if c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_)
                 c.note(unit, d.span, s"the type `${d.name}` is declared more than once")
                 continue
-            seen.put(d.name, d.span)
+            if file.private_items[i] then c.private_names.put(key, true)
             for a in d.annotations
                 c.note(unit, a.span, s"unknown annotation `@${a.name}`")
             for t in d.derives
                 c.note(unit, t.span, "`derives` is not implemented")
-            for tp in d.type_params
-                if tp.bounds.len() > 0 then c.note(unit, tp.span, "bounds on type parameters are not implemented")
-            c.types.put(d.name, c.data.len())
+            c.types.put(key, c.data.len())
             c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf(), buf(), buf(), buf(), buf()))
-    for item in file.items
-        if item is ClassItem(d)
+    for i in 0..<file.items.len()
+        if file.items[i] is ClassItem(d)
             if d.object then continue
+            val key = qualified(file.module_name, d.name)
             if builtin_type(d.name) is Some(_)
                 c.note(unit, d.name_span, s"`${d.name}` is a built-in type, so it cannot be declared")
                 continue
-            if seen.get(d.name) is Some(_)
+            if c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_)
                 c.note(unit, d.name_span, s"the type `${d.name}` is declared more than once")
                 continue
-            seen.put(d.name, d.span)
-            c.class_types.put(d.name, c.classes.len())
+            if file.private_items[i] then c.private_names.put(key, true)
+            c.class_types.put(key, c.classes.len())
             c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, None, None, buf(), buf(), 0))
-    // An object is a class with one instance. Named after a class of its module, it is that class's
-    // companion and its type has no name of its own; otherwise its name is also its type's.
-    var objects: Map[string, Span] = map()
-    for item in file.items
-        if item is ClassItem(d)
+
+// An object is a class with one instance. Named after a class of its module, in any of the module's
+// files, it is that class's companion and its type has no name of its own; otherwise its name is
+// also its type's. A class and its companion are one name, so a companion is private where its class
+// is.
+private declare_objects(c: *Checker, unit: usize)
+    val file = c.units[unit].file
+    for i in 0..<file.items.len()
+        if file.items[i] is ClassItem(d)
             if !d.object then continue
+            val key = qualified(file.module_name, d.name)
             if builtin_type(d.name) is Some(_)
                 c.note(unit, d.name_span, s"`${d.name}` is a built-in type, so it cannot be declared")
                 continue
-            if objects.get(d.name) is Some(_)
-                c.note(unit, d.name_span, s"the object `${d.name}` is declared more than once")
-                continue
-            objects.put(d.name, d.span)
             val id = c.classes.len()
             var companion: Option[usize] = None
-            if seen.get(d.name) is Some(_)
-                c.class_types.get(d.name) match
-                    Some(k) ->
-                        if c.classes[k].unit == unit && !c.classes[k].decl.object
-                            companion = Some(k)
-                            c.classes[k].companion = Some(id)
-                    None -> ()
-                if companion is None
-                    c.note(unit, d.name_span, s"`${d.name}` is already a data type; an object may share its name only with a class")
+            if c.class_types.get(key) is Some(k)
+                if c.classes[k].decl.object || c.classes[k].companion is Some(_)
+                    c.note(unit, d.name_span, s"the object `${d.name}` is declared more than once")
                     continue
-            else c.class_types.put(d.name, id)
+                companion = Some(k)
+                c.classes[k].companion = Some(id)
+            elif c.types.get(key) is Some(_)
+                c.note(unit, d.name_span, s"`${d.name}` is already a data type; an object may share its name only with a class")
+                continue
+            else
+                c.class_types.put(key, id)
+                if file.private_items[i] then c.private_names.put(key, true)
             c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, companion, None, buf(), buf(), 0))
 
 // Each impl's type and trait, resolved with the impl's type parameters in scope. They are the type's
@@ -567,8 +722,10 @@ private declare_impls(c: *Checker, unit: usize)
 
 private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl) -> ImplSymbol
     val invalid = ImplSymbol(unit, module_name, d, ErrorType, 0, None)
+    // An impl's parameters are its type's, bounded where the type declares them; a bound of the
+    // impl's own would make the conformance hold for some type arguments only.
     for tp in d.type_params
-        if tp.bounds.len() > 0 then c.note(unit, tp.span, "bounds on type parameters are not implemented")
+        if tp.bounds.len() > 0 then c.note(unit, tp.span, s"an impl's type parameters take the bounds of its type's, so `${tp.name}` cannot have one of its own; an impl for some type arguments only is not implemented")
         if !(tp.variance is Invariant) then c.note(unit, tp.span, "variance is written on the parameters of a type, not of an impl")
     for m in d.members
         m match
@@ -586,16 +743,17 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
         _ -> buf()
     var owner = 0usize
     var home = ""
-    if c.types.get(path) is Some(id)
+    val key = resolve_name(c, unit, path)
+    if c.types.get(key) is Some(id)
         owner = data_owner(id)
         home = c.data[id].module_name
-    elif c.class_types.get(path) is Some(id)
+    elif c.class_types.get(key) is Some(id)
         if is_trait(c, id)
             c.note(unit, d.target.span, s"`$path` is a trait; an impl adds to a data type, a class, an object or a built-in type")
             return invalid
         owner = class_owner(id)
         home = c.classes[id].module_name
-    elif builtin_type(path) is Some(_) then home = c.units[0].file.module_name
+    elif builtin_type(path) is Some(_) then home = CoreModule
     else
         c.note(unit, d.target.span, s"unknown type `$path`")
         return invalid
@@ -615,7 +773,7 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
     var trait_type: Option[&Type] = None
     var trait_home = ""
     if d.trait_name is Some(written_trait)
-        val t = resolve_type(c, unit, written_trait)
+        val t = resolve_bound(c, unit, written_trait)
         *t match
             Class(k, _, _) ->
                 if is_trait(c, k)
@@ -682,6 +840,7 @@ private declare_variants(c: *Checker, unit: usize)
         if d.unit != unit then continue
         val outer_generic = c.generic
         c.generic = Some(GenericScope(data_owner(id), d.decl.type_params))
+        declare_bounds(c, unit, data_owner(id), d.decl.type_params, 0)
         var variants: Buf[VariantSymbol] = buf()
         for v in d.decl.variants
             if seen.get(v.name) is Some(_)
@@ -700,7 +859,10 @@ private declare_variants(c: *Checker, unit: usize)
                         names.push("_")
                 if f.default is Some(e) then c.note(unit, e.span, "default field values are not implemented")
                 fields.push(resolve_type(c, unit, f.ty))
-            c.variants.put(v.name, VariantRef(id, variants.len()))
+            // A variant is a name of its type's module, private where its type is.
+            val key = qualified(c.data[id].module_name, v.name)
+            c.variants.put(key, VariantRef(id, variants.len()))
+            if c.private_names.get(qualified(c.data[id].module_name, c.data[id].name)) is Some(_) then c.private_names.put(key, true)
             variants.push(VariantSymbol(v.name, v.span, names, fields))
         c.data[id].variants = variants
         c.generic = outer_generic
@@ -725,9 +887,6 @@ private declare_fields(c: *Checker, unit: usize)
         for t in d.derives
             c.note(unit, t.span, "`derives` is not implemented")
         val declares_trait = is_trait(c, id)
-        for tp in d.type_params
-            if tp.bounds.len() > 0 then c.note(unit, tp.span, "bounds on type parameters are not implemented")
-            if !(tp.variance is Invariant) && !declares_trait then c.note(unit, tp.span, "variance on a class's type parameters is not implemented")
         if declares_trait
             for m in d.members
                 m match
@@ -743,10 +902,11 @@ private declare_fields(c: *Checker, unit: usize)
                     c.note(unit, f.span, s"`${f.name}` has no value; only a trait declares a `val` without one, and a class gives each of its fields a value where it declares it")
         val outer_generic = c.generic
         c.generic = Some(GenericScope(class_owner(id), d.type_params))
+        declare_bounds(c, unit, class_owner(id), d.type_params, 0)
         var traits: Buf[&Type] = buf()
         for i in 0..<d.parents.len()
             val parent = d.parents[i]
-            if parent_trait(c, parent) is Some(t)
+            if parent_trait(c, unit, parent) is Some(t)
                 if trait_type(c, unit, t, parent) is Some(ty)
                     var repeated = false
                     for other in traits
@@ -758,7 +918,7 @@ private declare_fields(c: *Checker, unit: usize)
             else
                 var is_class = false
                 if parent_name(parent) is Some(n)
-                    if c.class_types.get(n) is Some(_) then is_class = true
+                    if c.class_types.get(resolve_name(c, unit, n)) is Some(_) then is_class = true
                 if !is_class then c.note(unit, parent.span, s"`${parent_name(parent).unwrap_or("this")}` is not a trait")
                 elif declares_trait then c.note(unit, parent.span, "a trait may require only traits, not a class")
                 else c.note(unit, parent.span, "the superclass comes first after `:`, before the traits")
@@ -802,8 +962,8 @@ private is_trait(c: *Checker, k: usize) -> bool = c.classes[k].decl.modifier == 
 
 /** The trait a parent after `:` names, if it names one: `Shape`, `Source[int]`, or a mistaken
  * `Shape(…)`, which `trait_type` reports. */
-private parent_trait(c: *Checker, parent: &Expr) -> Option[usize]
-    val k = c.class_types.get(parent_name(parent)?)?
+private parent_trait(c: *Checker, unit: usize, parent: &Expr) -> Option[usize]
+    val k = c.class_types.get(resolve_name(c, unit, parent_name(parent)?))?
     if is_trait(c, k) then Some(k) else None
 
 /** The name a parent after `:` is written with, without its type or constructor arguments. */
@@ -832,6 +992,7 @@ private trait_type(c: *Checker, unit: usize, t: usize, parent: &Expr) -> Option[
         if args.len() == 0 then c.note(unit, parent.span, s"`$name` is generic; write its type arguments, as in `$name[int]`")
         else c.note(unit, parent.span, s"`$name` takes ${count(wanted, "type argument")}, not ${args.len()}")
         return None
+    check_type_args(c, unit, parent.span, s"`$name`", class_owner(t), c.classes[t].decl.type_params, args)
     Some(Class(t, name, args))
 
 // The superclass after `:`: a class, called with its constructor arguments or named alone when it
@@ -850,10 +1011,11 @@ private superclass_of(c: *Checker, unit: usize, id: usize, parent: &Expr) -> Opt
         _ ->
             c.note(unit, parent.span, "expected a superclass, as in `Base(arguments)`")
             return None
-    val sid = c.class_types.get(name) match
+    val key = resolve_name(c, unit, name)
+    val sid = c.class_types.get(key) match
         Some(s) -> s
         None ->
-            if c.types.get(name) is Some(_) || builtin_type(name) is Some(_)
+            if c.types.get(key) is Some(_) || builtin_type(name) is Some(_)
                 c.note(unit, named.span, s"`$name` is not a class, so it cannot be extended")
             else c.note(unit, named.span, s"`$name` is neither a class nor a trait")
             return None
@@ -943,6 +1105,77 @@ ancestor_type(classes: Buf[ClassSymbol], data: Buf[DataSymbol], t: &Type, target
         if ancestor_type(classes, data, substitute(required, class_owner(k), args), target) is Some(found) then return Some(found)
     ancestor_type(classes, data, substitute(classes[k].superclass?, class_owner(k), args), target)
 
+// `x`, the type of a value, seen as the type `to`: what the value already is as an instance of
+// `to`'s class, trait, data type, tuple or function type, with no conversion. An instance of a
+// subclass is one of its superclass; an instance of a generic type is another instance of it where
+// each type argument follows the parameter's declared variance; a tuple's parts are covariant; a
+// function's parameters are contravariant and its result covariant. Where `x` is not such a view of
+// `to`, the result is `x` itself or a type that differs from `to`. Both types are solved.
+view_as(classes: Buf[ClassSymbol], data: Buf[DataSymbol], x: &Type, to: &Type) -> &Type = *to match
+    Class(k, name, ys) -> ancestor_type(classes, data, x, k) match
+        Some(up) -> *up match
+            Class(_, _, xs) -> Class(k, name, vary_args(classes, data, classes[k].decl.type_params, xs, ys))
+            _ -> up
+        None -> x
+    Data(d, name, ys) -> *x match
+        Data(e, _, xs) ->
+            if e != d then return x
+            Data(d, name, vary_args(classes, data, data[d].decl.type_params, xs, ys))
+        _ -> x
+    Tuple(ys) -> *x match
+        Tuple(xs) ->
+            if xs.len() != ys.len() then return x
+            var items: Buf[&Type] = buf()
+            for i in 0..<xs.len()
+                items.push(view_part(classes, data, xs[i], ys[i]))
+            Tuple(items)
+        _ -> x
+    Function(ys, s) -> *x match
+        Function(xs, r) ->
+            if xs.len() != ys.len() then return x
+            var params: Buf[&Type] = buf()
+            for i in 0..<xs.len()
+                params.push(view_contra(classes, data, xs[i], ys[i]))
+            Function(params, view_part(classes, data, r, s))
+        _ -> x
+    _ -> x
+
+// The type arguments `xs` seen as `ys`, one parameter's variance at a time.
+private vary_args(classes: Buf[ClassSymbol], data: Buf[DataSymbol], params: Buf[TypeParam], xs: Buf[&Type], ys: Buf[&Type]) -> Buf[&Type]
+    if xs.len() != ys.len() || xs.len() != params.len() then return xs
+    var out: Buf[&Type] = buf()
+    for i in 0..<xs.len()
+        val v = params[i].variance
+        if v is Covariant then out.push(view_part(classes, data, xs[i], ys[i]))
+        elif v is Contravariant then out.push(view_contra(classes, data, xs[i], ys[i]))
+        else out.push(xs[i])
+    out
+
+// A part in a covariant position: `x` seen as `to` where both are references, so the object `x`
+// describes is already the one `to` describes. A value of a value type differs in representation
+// from an `Any` or a trait, so it stays itself.
+private view_part(classes: Buf[ClassSymbol], data: Buf[DataSymbol], x: &Type, to: &Type) -> &Type
+    if conforms(x, to) && !(*x is Nothing) then return x
+    if !is_reference(x) then return x
+    if *to is AnyType then return AnyType
+    view_as(classes, data, x, to)
+
+// A part in a contravariant position: `to` where it may be seen as `x`, otherwise `x`.
+private view_contra(classes: Buf[ClassSymbol], data: Buf[DataSymbol], x: &Type, to: &Type) -> &Type
+    if conforms(x, to) && !(*x is Nothing) then return x
+    if conforms(view_part(classes, data, to, x), x) then to else x
+
+/** Whether a value of type `t` is a reference to an object, which every type it may be seen as
+ * shares: `Any`, a string, a tuple, a function, a data type, a class or a trait. */
+is_reference(t: &Type) -> bool = *t match
+    AnyType -> true
+    Str -> true
+    Tuple(_) -> true
+    Function(_, _) -> true
+    Data(_, _, _) -> true
+    Class(_, _, _) -> true
+    _ -> false
+
 /** Whether a field may be used from the code being checked: a public one, or a private one from
  * code of the class that declares it or of its companion. */
 private field_visible(c: *Checker, f: FieldSymbol) -> bool = f.public || inside_class(c, f.owner)
@@ -1009,8 +1242,8 @@ private declare_methods(c: *Checker, unit: usize)
         if k.unit != unit then continue
         val d = k.decl
         // A function of the same name was reported when it was declared.
-        if c.variants.get(d.name) is Some(v)
-            if c.data[v.data].unit == unit then c.note(unit, d.name_span, s"`${d.name}` is already a variant of `${c.data[v.data].name}`")
+        val key = qualified(module_name, d.name)
+        if c.variants.get(key) is Some(v) then c.note(unit, d.name_span, s"`${d.name}` is already a variant of `${c.data[v.data].name}`")
         val self_type = own_class_type(k, id)
         var params: Buf[Param] = buf()
         var types: Buf[&Type] = buf()
@@ -1033,7 +1266,7 @@ private declare_methods(c: *Checker, unit: usize)
         if !d.object
             var constructors: Buf[usize] = buf()
             constructors.push(constructor)
-            c.scope.put(d.name, constructors)
+            c.scope.put(key, constructors)
         c.classes[id].constructor = constructor
         c.classes[id].initializer = constructor
         if is_open(c, id)
@@ -1114,11 +1347,17 @@ private declare_methods(c: *Checker, unit: usize)
                 type_params.push(tp)
             for tp in f.type_params
                 type_params.push(tp)
+            // In a trait, `Self` names the type implementing it.
+            val outer_trait = c.self_trait
+            if is_trait(c, id) then c.self_trait = Some(id)
             var symbol = signature(c, file_unit, entry.module_name, f, class_owner(id), type_params, true)
-            // The receiver comes first, named `self`.
+            c.self_trait = outer_trait
+            // The receiver comes first, named `self`. In a trait that mentions `Self`, it is a `Self`,
+            // so the trait's methods can pass it where their parameters take one.
             var receiver_types: Buf[&Type] = buf()
             var receiver_names: Buf[string] = buf()
-            receiver_types.push(self_type)
+            if is_trait(c, id) && mentions_self(c, id, 0) then receiver_types.push(TypeVar(self_owner(id), 0, "Self"))
+            else receiver_types.push(self_type)
             receiver_names.push("self")
             for t in symbol.params
                 receiver_types.push(t)
@@ -1368,8 +1607,9 @@ is_abstract_method(symbol: FunctionSymbol) -> bool =
 // no parameters whose result is the value; an object's is its class's constructor.
 private declare_globals(c: *Checker, unit: usize)
     val file = c.units[unit].file
-    for item in file.items
-        item match
+    for i in 0..<file.items.len()
+        val key = qualified(file.module_name, item_name(file.items[i]))
+        file.items[i] match
             ValueItem(v) ->
                 if v.name == "_" || global_name_taken(c, unit, v.name, v.span, false) then continue
                 val f = Function(buf(), v.span, v.span, v.name, buf(), buf(), v.declared, Some(v.value), buf())
@@ -1378,7 +1618,8 @@ private declare_globals(c: *Checker, unit: usize)
                 c.states.push(0)
                 c.bodies.push(None)
                 c.locals.push(buf())
-                c.global_names.put(v.name, c.globals.len())
+                if file.private_items[i] then c.private_names.put(key, true)
+                c.global_names.put(key, c.globals.len())
                 c.globals.push(GlobalSymbol(unit, file.module_name, v.name, v.span, v.mutable, init, None))
             ClassItem(d) ->
                 if !d.object then continue
@@ -1388,32 +1629,39 @@ private declare_globals(c: *Checker, unit: usize)
                     if cls.unit == unit && cls.decl.object && cls.name == d.name && cls.global is None
                         if global_name_taken(c, unit, d.name, d.name_span, true) then break
                         c.classes[k].global = Some(c.globals.len())
-                        c.global_names.put(d.name, c.globals.len())
+                        c.global_names.put(key, c.globals.len())
                         c.globals.push(GlobalSymbol(unit, file.module_name, d.name, d.name_span, false, cls.constructor, Some(k)))
             _ -> ()
 
-// Whether a module-level value's name is already declared in its file, reporting it if so. An
+/** The name a top-level declaration introduces: "" for an impl, which introduces none. */
+private item_name(item: Item) -> string = item match
+    FunctionItem(f) -> f.name
+    DataItem(d) -> d.name
+    ClassItem(d) -> d.name
+    ImplItem(_) -> ""
+    ValueItem(v) -> v.name
+
+// Whether a module-level value's name is already declared in its module, reporting it if so. An
 // object's clashes with a class, a function or a variant were reported with its class, so only its
 // clash with a module value is reported here.
 private global_name_taken(c: *Checker, unit: usize, name: string, at: Span, object: bool) -> bool
-    if c.global_names.get(name) is Some(g)
-        if c.globals[g].unit == unit
-            c.note(unit, at, s"`$name` is declared more than once")
-            return true
+    val key = qualified(c.units[unit].file.module_name, name)
+    if c.global_names.get(key) is Some(_)
+        c.note(unit, at, s"`$name` is declared more than once")
+        return true
     if object then return false
-    if c.class_types.get(name) is Some(k)
-        if c.classes[k].unit == unit && !c.classes[k].decl.object && c.classes[k].companion is None
+    if c.class_types.get(key) is Some(k)
+        if !c.classes[k].decl.object && c.classes[k].companion is None
             c.note(unit, at, s"`$name` is already a class")
             return true
-    if c.scope.get(name) is Some(ids)
+    if c.scope.get(key) is Some(ids)
         for f in ids
-            if c.symbols[f].unit == unit && !c.symbols[f].constructor
+            if !c.symbols[f].constructor
                 c.note(unit, at, s"`$name` is already a function")
                 return true
-    if c.variants.get(name) is Some(v)
-        if c.data[v.data].unit == unit
-            c.note(unit, at, s"`$name` is already a variant of `${c.data[v.data].name}`")
-            return true
+    if c.variants.get(key) is Some(v)
+        c.note(unit, at, s"`$name` is already a variant of `${c.data[v.data].name}`")
+        return true
     false
 
 /** The method of class `id` declared as `name`, its own. */
@@ -2104,6 +2352,98 @@ private overrides_matches(c: *Checker, id: usize, m: usize, target: usize) -> bo
 // A trait's method may also be implemented by a method the class inherits, from its superclass or
 // as another trait's default; that one takes the trait method's parameters and yields its result
 // as the class sees them both.
+// A class's or trait's `+T` appears only where a value of `T` is read out: a method's result, an
+// immutable field, a parent's covariant argument. A `-T` appears only where one is passed in: a
+// method's parameter. A mutable field is read and written, so neither may appear in it. Private
+// members are checked like public ones, since a method of the instance seen at a wider type reads
+// and writes them too. The receiver is the instance itself and is not checked.
+private check_class_variance(c: *Checker, id: usize)
+    val k = c.classes[id]
+    val params = k.decl.type_params
+    var variant = false
+    for tp in params
+        if !(tp.variance is Invariant) then variant = true
+    if !variant then return
+    val owner = class_owner(id)
+    val at = k.decl.name_span
+    if k.superclass is Some(sup) then variance_in(c, k.unit, params, owner, sup, 1, at, s"the superclass ${type_name(sup)}")
+    for t in k.traits
+        variance_in(c, k.unit, params, owner, t, 1, at, s"the trait ${type_name(t)}")
+    for i in k.inherited..<k.fields.len()
+        val f = k.fields[i]
+        val ty = f.ty.unwrap_or(ErrorType)
+        if f.mutable then variance_in(c, k.unit, params, owner, ty, 0, f.span, s"the mutable field `${f.name}`")
+        else variance_in(c, k.unit, params, owner, ty, 1, f.span, s"the field `${f.name}`")
+    for m in k.methods
+        val symbol = c.symbols[m]
+        val name = symbol.decl.name
+        for j in 1..<symbol.params.len()
+            val span = if j - 1 < symbol.decl.params.len() then symbol.decl.params[j - 1].span else symbol.decl.name_span
+            val pname = if j < symbol.param_names.len() then symbol.param_names[j] else "_"
+            variance_in(c, k.unit, params, owner, symbol.params[j], -1, span, s"the parameter `$pname` of `$name`")
+        val result_span = symbol.decl.result match
+            Some(r) -> r.span
+            None -> symbol.decl.name_span
+        variance_in(c, k.unit, params, owner, symbol.result.unwrap_or(ErrorType), 1, result_span, s"the result of `$name`")
+        // A bound on a method's own type parameter limits what a caller passes in, as a parameter
+        // type does.
+        for j in params.len()..<symbol.type_params.len()
+            val tp = symbol.type_params[j]
+            for b in bounds_at(c, owner, symbol.type_params, j)
+                variance_in(c, k.unit, params, owner, b, -1, tp.span, s"the bound of `${tp.name}` in `$name`")
+
+// A data type's fields are immutable, so a `+T` may appear in them and a `-T` may not; the traits
+// its impls make it conform to are parents, whose arguments follow their own variance.
+private check_data_variance(c: *Checker, id: usize)
+    val d = c.data[id]
+    val params = d.decl.type_params
+    var variant = false
+    for tp in params
+        if !(tp.variance is Invariant) then variant = true
+    if !variant then return
+    val owner = data_owner(id)
+    for v in d.variants
+        for i in 0..<v.fields.len()
+            val name = if i < v.field_names.len() then v.field_names[i] else "_"
+            variance_in(c, d.unit, params, owner, v.fields[i], 1, v.span, s"the field `$name` of `${v.name}`")
+    for t in d.traits
+        variance_in(c, d.unit, params, owner, t, 1, d.decl.span, s"the trait ${type_name(t)}")
+
+// Reports the first type parameter of `owner` that `t` names in a position its variance forbids.
+// `polarity` is 1 where a value is read out, -1 where one is passed in, 0 where both happen; it flips
+// through a function type's parameters and follows each generic type's declared variance.
+private variance_in(c: *Checker, unit: usize, params: Buf[TypeParam], owner: usize, t: &Type, polarity: i32, at: Span, place: string) -> bool
+    *t match
+        TypeVar(o, i, name) ->
+            if o != owner || i >= params.len() then return true
+            val v = params[i].variance
+            val ok = if v is Covariant then polarity == 1 elif v is Contravariant then polarity == -1 else true
+            if ok then return true
+            val kind = if v is Covariant then "covariant" else "contravariant"
+            val sign = if v is Covariant then "+" else "-"
+            val position = if polarity == 1 then "a covariant" elif polarity == -1 then "a contravariant" else "an invariant"
+            c.note(unit, at, s"the $kind type parameter `$sign$name` appears in $position position, $place")
+            false
+        Tuple(items) ->
+            for item in items
+                if !variance_in(c, unit, params, owner, item, polarity, at, place) then return false
+            true
+        Function(ps, r) ->
+            for p in ps
+                if !variance_in(c, unit, params, owner, p, -polarity, at, place) then return false
+            variance_in(c, unit, params, owner, r, polarity, at, place)
+        ByName(inner) -> variance_in(c, unit, params, owner, inner, polarity, at, place)
+        Data(d, _, args) -> variance_args(c, unit, params, owner, c.data[d].decl.type_params, args, polarity, at, place)
+        Class(k, _, args) -> variance_args(c, unit, params, owner, c.classes[k].decl.type_params, args, polarity, at, place)
+        _ -> true
+
+private variance_args(c: *Checker, unit: usize, params: Buf[TypeParam], owner: usize, declared: Buf[TypeParam], args: Buf[&Type], polarity: i32, at: Span, place: string) -> bool
+    for i in 0..<args.len()
+        val v = if i < declared.len() then declared[i].variance else Invariant
+        val p = if v is Covariant then polarity elif v is Contravariant then -polarity else 0
+        if !variance_in(c, unit, params, owner, args[i], p, at, place) then return false
+    true
+
 private check_override_results(c: *Checker, id: usize)
     val k = c.classes[id]
     if is_trait(c, id)
@@ -2168,7 +2508,13 @@ private seen_from(c: *Checker, self_type: &Type, m: usize, t: &Type) -> &Type
             Class(_, _, xs) -> xs
             _ -> buf()
         None -> buf()
-    substitute(renamed, class_owner(owner), args)
+    // A trait's `Self` is the type the method is seen from.
+    var selfless = renamed
+    if is_trait(c, owner)
+        var implementer: Buf[&Type] = buf()
+        implementer.push(self_type)
+        selfless = substitute(renamed, self_owner(owner), implementer)
+    substitute(selfless, class_owner(owner), args)
 
 /** How many type parameters of its own method `m` declares. */
 private own_type_params(c: *Checker, m: usize) -> usize = c.symbols[m].decl.type_params.len()
@@ -2288,8 +2634,10 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
     // A generic function's own type parameters are in scope in its signature.
     val outer_generic = c.generic
     if type_params.len() > 0 then c.generic = Some(GenericScope(owner, type_params))
+    // The function's own type parameters follow those of its class or impl, if it has any.
+    if type_params.len() >= f.type_params.len()
+        declare_bounds(c, unit, owner, type_params, type_params.len() - f.type_params.len())
     for tp in f.type_params
-        if tp.bounds.len() > 0 then c.note(unit, tp.span, "bounds on type parameters are not implemented")
         if !(tp.variance is Invariant) then c.note(unit, tp.span, "variance is written on the parameters of a type, not of a function")
     for p in f.params
         p.pattern.kind match
@@ -2308,6 +2656,8 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
     elif f.body is Some(b)
         if b.kind is Block(_, true) then result = Some(Unit)
     val intrinsic = intrinsic_of(c, unit, f)
+    val binding = has_annotation(f, "sysl")
+    if binding then check_binding(c, unit, f, params, result, intrinsic is Some(_))
     if intrinsic is Some(name)
         intrinsic_signature(name) match
             Some(expected) ->
@@ -2315,7 +2665,7 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
                 if !same_type(declared, expected)
                     c.note(unit, f.name_span, s"intrinsic `$name` has type ${type_name(expected)}, not ${type_name(declared)}")
             None -> c.note(unit, f.name_span, s"`$name` is not an intrinsic")
-    elif f.body is None && f.clauses.len() == 0 && !bodyless
+    elif f.body is None && f.clauses.len() == 0 && !bodyless && !binding
         c.note(unit, f.name_span, s"`${f.name}` needs a body, or clauses on the lines after it")
     c.generic = outer_generic
     FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf(), false, false, false, buf(), None, owner, type_params, None, false, true, "", None)
@@ -2367,11 +2717,12 @@ private declare_defaults(c: *Checker, id: usize)
         defaults.push(Some(did))
     c.symbols[id].defaults = defaults
 
-// `@intrinsic("name")` is the only annotation this compiler gives meaning to; it is valid only on a
-// function without a body.
+// `@intrinsic("name")` and `@sysl("path")` are the annotations this compiler gives meaning to; each
+// is valid only on a function without a body. This reads the first; `sysl_binding_of` the second.
 private intrinsic_of(c: *Checker, unit: usize, f: &Function) -> Option[string]
     var out: Option[string] = None
     for a in f.annotations
+        if a.name == "sysl" then continue
         if a.name != "intrinsic"
             c.note(unit, a.span, s"unknown annotation `@${a.name}`")
             continue
@@ -2392,15 +2743,230 @@ intrinsic_signature(name: string) -> Option[&Type]
         return Some(Function(params, Unit))
     None
 
+// The bounds of the type parameter at `index` of `owner` are recorded under this key: the
+// parameter's place in the source tells apart the methods of one class, whose own type parameters
+// share an owner and positions.
+private bound_key(owner: usize, index: usize, tp: TypeParam) -> string = s"$owner/$index/${tp.span.start}/${tp.name}"
+
+// Resolves the bounds of `params` from position `from` on, in the scope that declares them, and
+// records them. A bound is a trait or a class. It may name the parameters, and a trait that
+// mentions `Self`, which is a bound and never a type.
+private declare_bounds(c: *Checker, unit: usize, owner: usize, params: Buf[TypeParam], from: usize)
+    for i in from..<params.len()
+        val tp = params[i]
+        if tp.bounds.len() == 0 then continue
+        var bounds: Buf[&Type] = buf()
+        for b in tp.bounds
+            val t = resolve_bound(c, unit, b)
+            *t match
+                Class(k, _, _) ->
+                    if c.classes[k].decl.object then c.note(unit, b.span, s"`${type_name(t)}` is an object, which has one value; a bound is a trait or a class")
+                    else bounds.push(t)
+                ErrorType -> ()
+                _ -> c.note(unit, b.span, s"a bound is a trait or a class, not ${type_name(t)}")
+        c.bounds.put(bound_key(owner, i, tp), bounds)
+
+/** A type written as a bound, or as the trait of an impl: a trait that mentions `Self` may be named. */
+private resolve_bound(c: *Checker, unit: usize, t: &TypeExpr) -> &Type
+    val saved = c.bound_context
+    c.bound_context = true
+    val resolved = resolve_type(c, unit, t)
+    c.bound_context = saved
+    resolved
+
+// The bounds of type parameter `index` of `owner`, where `params` are the parameters in scope. A
+// class's or data type's own parameters are bounded where the type declares them, so they have those
+// bounds wherever they are named, its methods and impls included. A trait's `Self` is bounded by the
+// trait.
+private bounds_at(c: *Checker, owner: usize, params: Buf[TypeParam], index: usize) -> Buf[&Type]
+    if is_self_owner(owner)
+        val k = owner - self_owner(0)
+        var own: Buf[&Type] = buf()
+        own.push(own_class_type(c.classes[k], k))
+        return own
+    if owner >= method_params_owner() then return buf()
+    var declared = params
+    if owner >= class_owner(0)
+        val k = owner - class_owner(0)
+        if k < c.classes.len() && index < c.classes[k].decl.type_params.len() then declared = c.classes[k].decl.type_params
+    elif owner >= data_owner(0)
+        val d = owner - data_owner(0)
+        if d < c.data.len() && index < c.data[d].decl.type_params.len() then declared = c.data[d].decl.type_params
+    if index >= declared.len() then return buf()
+    c.bounds.get(bound_key(owner, index, declared[index])) match
+        Some(bounds) -> bounds
+        None -> buf()
+
+/** The bounds of type parameter `t` as the code being checked names it. */
+private bounds_of(c: *Checker, t: &Type) -> Buf[&Type]
+    var params: Buf[TypeParam] = buf()
+    *t match
+        TypeVar(owner, index, _) ->
+            if c.generic is Some(scope)
+                if scope.owner == owner then params = scope.params
+            bounds_at(c, owner, params, index)
+        _ -> buf()
+
+/** Whether a value of type `t` conforms to `bound`, a trait or a class: a type parameter does through
+ * its own bounds. */
+private conforms_to_bound(c: *Checker, t: &Type, bound: &Type) -> bool
+    val x = zonk(c, t)
+    val k = *bound match
+        Class(k, _, _) -> k
+        _ -> return true
+    *x match
+        ErrorType -> true
+        Nothing -> true
+        Var(_) -> true
+        TypeVar(_, _, _) ->
+            for b in bounds_of(c, x)
+                if ancestor_type(c.classes, c.data, b, k) is Some(up)
+                    if conforms(zonk(c, up), zonk(c, bound)) then return true
+            false
+        _ -> ancestor_type(c.classes, c.data, x, k) match
+            Some(up) -> conforms(zonk(c, up), zonk(c, bound))
+            None -> false
+
+// Holds type arguments written on a type to the bounds of its parameters: at once when every
+// conformance is known, and otherwise once it is.
+private check_type_args(c: *Checker, unit: usize, at: Span, what: string, owner: usize, params: Buf[TypeParam], args: Buf[&Type])
+    if !c.conformances_known
+        c.pending.push(PendingBound(unit, at, what, owner, params, args, c.generic))
+        return
+    hold_to_bounds(c, unit, at, what, owner, params, args, 0)
+
+// Reports each of `args`, from position `from` on, that does not conform to a bound of its
+// parameter, the bound seen with these type arguments.
+private hold_to_bounds(c: *Checker, unit: usize, at: Span, what: string, owner: usize, params: Buf[TypeParam], args: Buf[&Type], from: usize)
+    for i in from..<params.len()
+        if i >= args.len() then break
+        for b in bounds_at(c, owner, params, i)
+            val bound = substitute(b, owner, args)
+            if !conforms_to_bound(c, args[i], bound)
+                c.note(unit, at, s"`${type_name(zonk(c, args[i]))}` does not conform to `${type_name(bound)}`, the bound of `${params[i].name}` in $what")
+
+/** Whether trait `k`'s methods, or those of a trait it requires, mention `Self` other than as the
+ * receiver: such a trait is only a bound. */
+private mentions_self(c: *Checker, k: usize, depth: usize) -> bool
+    if depth > c.classes.len() then return false
+    for m in c.classes[k].decl.members
+        m match
+            MethodMember(f, _, _) ->
+                for p in f.params
+                    if names_self(p.ty) then return true
+                if f.result is Some(r)
+                    if names_self(r) then return true
+            AbstractFieldMember(f) -> if names_self(f.declared) then return true
+            _ -> ()
+    for parent in c.classes[k].decl.parents
+        if parent_trait(c, c.classes[k].unit, parent) is Some(t)
+            if mentions_self(c, t, depth + 1) then return true
+    false
+
+private names_self(t: &TypeExpr) -> bool
+    t.kind match
+        Named(path, args) ->
+            if path == "Self" then return true
+            for a in args
+                if names_self(a) then return true
+        Tuple(items) ->
+            for item in items
+                if names_self(item) then return true
+        Function(params, result) ->
+            for p in params
+                if names_self(p.ty) then return true
+            return names_self(result)
+        InvalidType -> ()
+    false
+
+/** The Sysl function a binding names: the string of its `@sysl` annotation, when it has one. */
+binding_target(f: &Function) -> Option[string]
+    for a in f.annotations
+        if a.name == "sysl" && a.args.len() == 1
+            if a.args[0].value.kind is StringLit(path) then return Some(path)
+    None
+
+// A binding is a top-level function without a body whose `@sysl("module.path.name")` names a Sysl
+// function. Its parameters and result are boundary types, which the generated shim converts; a
+// binding with a wrong type is caught when Sysl checks the shim.
+private check_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Type], result: Option[&Type], intrinsic: bool)
+    for a in f.annotations
+        if a.name != "sysl" then continue
+        var path: Option[string] = None
+        if a.args.len() == 1 && a.args[0].name is None
+            if a.args[0].value.kind is StringLit(p) then path = Some(p)
+        path match
+            Some(p) ->
+                if !is_sysl_path(p) then c.note(unit, a.span, s"`@sysl` names a Sysl function by its module and name, as in `sysl.text.to_upper`; `$p` is not one")
+            None -> c.note(unit, a.span, "`@sysl` takes one string, the module and name of the Sysl function, as in `@sysl(\"sysl.text.to_upper\")`")
+        if intrinsic then c.note(unit, a.span, "a function is an intrinsic or a Sysl binding, not both")
+        if f.body is Some(_) || f.clauses.len() > 0 then c.note(unit, a.span, "a Sysl binding has no body: the Sysl function it names is its body")
+        if f.type_params.len() > 0
+            c.note(unit, f.name_span, "generic Sysl bindings are not implemented")
+            continue
+        for i in 0..<f.params.len()
+            val p = f.params[i]
+            if p.by_name then c.note(unit, p.pattern.span, "a by-name parameter cannot cross to Sysl")
+            elif !crosses_to_sysl(params[i]) then c.note(unit, p.ty.span, s"`${type_name(params[i])}` cannot cross to Sysl; ${BoundaryTypes}")
+        if result is Some(r)
+            if !crosses_to_sysl(r)
+                val at = if f.result is Some(t) then t.span else f.name_span
+                c.note(unit, at, s"`${type_name(r)}` cannot cross to Sysl; ${BoundaryTypes}")
+
+const BoundaryTypes: string = "a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit` and `string`"
+
+/** Whether a value of type `t` crosses between Avin and Sysl, converted by a binding's shim. */
+crosses_to_sysl(t: &Type) -> bool = *t match
+    ErrorType -> true
+    Unit -> true
+    Bool -> true
+    Char -> true
+    Real -> true
+    Str -> true
+    Byte -> true
+    Int(bits) -> bits == 8 || bits == 16 || bits == 32 || bits == 64
+    _ -> false
+
+// A module path and a name: two or more identifiers joined by dots.
+private is_sysl_path(p: string) -> bool
+    var parts = 0
+    var start = true
+    for b in p.bytes
+        if b == u8('.')
+            if start then return false
+            start = true
+            continue
+        val letter = b >= u8('a') && b <= u8('z') || b >= u8('A') && b <= u8('Z') || b == u8('_')
+        val digit = b >= u8('0') && b <= u8('9')
+        if !letter && !(digit && !start) then return false
+        if start then parts += 1
+        start = false
+    !start && parts >= 2
+
+private has_annotation(f: &Function, name: string) -> bool
+    for a in f.annotations
+        if a.name == name then return true
+    false
+
 resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
     InvalidType -> ErrorType
     Named(path, args) ->
+        // The type arguments of a bound are types, so only the outermost name may be a trait that
+        // mentions `Self`.
+        val as_bound = c.bound_context
+        c.bound_context = false
         if c.generic is Some(scope)
             for i in 0..<scope.params.len()
                 if scope.params[i].name == path
                     if args.len() > 0 then c.note(unit, t.span, s"`$path` takes no type arguments")
                     return TypeVar(scope.owner, i, path)
-        if c.types.get(path) is Some(id)
+        if path == "Self"
+            if args.len() > 0 then c.note(unit, t.span, "`Self` takes no type arguments")
+            if c.self_trait is Some(k) then return TypeVar(self_owner(k), 0, "Self")
+            c.note(unit, t.span, "`Self` is the type implementing a trait, so it is written only in a trait's methods")
+            return ErrorType
+        val key = resolve_name(c, unit, path)
+        if c.types.get(key) is Some(id)
             val d = c.data[id]
             var resolved: Buf[&Type] = buf()
             for a in args
@@ -2408,8 +2974,9 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
             if resolved.len() != d.decl.type_params.len()
                 c.note(unit, t.span, s"`$path` takes ${count(d.decl.type_params.len(), "type argument")}, not ${resolved.len()}")
                 return ErrorType
+            check_type_args(c, unit, t.span, s"`$path`", data_owner(id), d.decl.type_params, resolved)
             return Data(id, d.name, resolved)
-        if c.class_types.get(path) is Some(id)
+        if c.class_types.get(key) is Some(id)
             val k = c.classes[id]
             var resolved: Buf[&Type] = buf()
             for a in args
@@ -2417,6 +2984,10 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
             if resolved.len() != k.decl.type_params.len()
                 c.note(unit, t.span, s"`$path` takes ${count(k.decl.type_params.len(), "type argument")}, not ${resolved.len()}")
                 return ErrorType
+            if !as_bound && is_trait(c, id) && mentions_self(c, id, 0)
+                c.note(unit, t.span, s"`$path` mentions `Self`, so it is a bound, as in `[T: $path]`, and not a type")
+                return ErrorType
+            check_type_args(c, unit, t.span, s"`$path`", class_owner(id), k.decl.type_params, resolved)
             return Class(id, k.name, resolved)
         builtin_type(path) match
             Some(ty) ->
@@ -2425,7 +2996,7 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                     return ErrorType
                 ty
             None ->
-                c.variants.get(path) match
+                c.variants.get(key) match
                     Some(v) -> c.note(unit, t.span, s"`$path` is a variant of `${c.data[v.data].name}`, not a type")
                     None -> c.note(unit, t.span, s"unknown type `$path`")
                 ErrorType
@@ -2452,12 +3023,17 @@ private check_function(c: *Checker, id: usize)
         c.body = fresh_body(id)
         val outer_generic = c.generic
         c.generic = if symbol.type_params.len() > 0 then Some(GenericScope(symbol.type_owner, symbol.type_params)) else None
+        val outer_trait = c.self_trait
+        c.self_trait = None
+        if symbol.owner_class is Some(k)
+            if is_trait(c, k) then c.self_trait = Some(k)
         var subjects: Buf[&TExpr] = buf()
         for i in 0..<symbol.params.len()
             subjects.push(TExpr(symbol.decl.name_span, symbol.params[i], Param(i)))
         if symbol.constructor then check_constructor(c, id, None)
         else check_definition(c, id, subjects)
         c.generic = outer_generic
+        c.self_trait = outer_trait
         finish_captures(c)
         c.locals.set(id, c.body.locals)
         for f in local_functions_of(c, id)
@@ -2801,7 +3377,20 @@ private lookup_functions(c: *Checker, name: string) -> Buf[usize]
             for k in c.body.function_starts[i]..<i + 1
                 if c.symbols[c.body.functions[k]].name == name then found.push(c.body.functions[k])
             return found
-    c.scope.get(name).unwrap_or(found)
+    top_level_functions(c, unit_of(c), name)
+
+// The top-level functions a bare name refers to in a file: those of the module it resolves to, and
+// of another module only the public ones.
+private top_level_functions(c: *Checker, unit: usize, name: string) -> Buf[usize]
+    var found: Buf[usize] = buf()
+    val key = resolve_name(c, unit, name)
+    val ids = c.scope.get(key) match
+        Some(ids) -> ids
+        None -> return found
+    if key == qualified(c.files[unit].module_name, name) then return ids
+    for id in ids
+        if c.symbols[id].public then found.push(id)
+    found
 
 /** The innermost function a name refers to, when it refers to any. */
 private lookup_function(c: *Checker, name: string) -> Option[usize]
@@ -3053,7 +3642,7 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
     if lookup_function(c, name) is Some(id)
         if abstract_constructor(c, id, at) then return TExpr(at, ErrorType, UnitConst)
         return named_function_value(c, at, name, None, expected)
-    if c.variants.get(name) is Some(v)
+    if variant_named(c, name) is Some(v)
         if c.data[v.data].variants[v.index].fields.len() == 0 then return construct(c, at, at, v, buf(), None, expected)
         c.note(symbol.unit, at, s"`$name` has fields; call it, as in `$name(…)`")
     else c.note(symbol.unit, at, s"`$name` is not defined")
@@ -3136,7 +3725,25 @@ private overloaded_method_value(c: *Checker, at: Span, receiver: &TExpr, name: s
 private methods_of(c: *Checker, t: &Type, name: string) -> Buf[usize]
     val known = zonk(c, t)
     if *known is Class(k, _, _) then return methods_named(c, k, name)
+    if *known is TypeVar(_, _, _) then return bound_methods(c, known, name)
     visible_methods(c, receiver_methods(c, known, name))
+
+/** The methods of `name` a value of type parameter `t` has: those of its bounds, each once. */
+private bound_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    for b in bounds_of(c, t)
+        if *b is Class(k, _, _)
+            for m in methods_named(c, k, name)
+                if !contains_id(out, m) then out.push(m)
+    out
+
+// The bounds of type parameter `t`, as a diagnostic names them.
+private bound_names(c: *Checker, t: &Type) -> string
+    var text = ""
+    for b in bounds_of(c, t)
+        if text != "" then text = text + " + "
+        text = text + type_name(b)
+    text
 
 // `object.name` for a method `m` of the object's type, named without a call: outside the class, or
 // the impls, that declare it, a private method cannot be.
@@ -3180,9 +3787,9 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
     var params: Buf[&Type] = buf()
     var names: Buf[string] = buf()
     for i in 1..<target.params.len()
-        params.push(target.params[i])
+        params.push(with_self(c, m, receiver.ty, target.params[i]))
         names.push(target.param_names[i])
-    val declared: &Type = Function(substitute_all(params, target.type_owner, type_args), substitute(result, target.type_owner, type_args))
+    val declared: &Type = Function(substitute_all(params, target.type_owner, type_args), substitute(with_self(c, m, receiver.ty, result), target.type_owner, type_args))
     if expected is Some(want) then unify(c, declared, want)
     var solved: Buf[&Type] = buf()
     for i in 0..<type_args.len()
@@ -3220,9 +3827,7 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
     c.symbols[id].param_locals = param_locals
     c.body.uses.push(CaptureUse(id, held, false))
     c.body.calls.push(LocalCall(c.current, id))
-    val call = dispatch_slot(c, receiver.ty, m) match
-        Some(s) -> Dispatch(m, s, args, solved)
-        None -> Call(m, args, solved)
+    val call = method_call_kind(c, receiver.ty, m, args, solved, false)
     c.bodies.set(id, Some(TExpr(at, lambda_result, call)))
     var items: Buf[&TExpr] = buf()
     items.push(TExpr(receiver.span, Unit, Let(held, receiver)))
@@ -3276,7 +3881,7 @@ private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], 
             if abstract_constructor(c, id, target.span) then return TExpr(e.span, ErrorType, UnitConst)
             return named_function_value(c, e.span, name, Some(types), expected)
         if lookup_local(c, name) is None && param_index(c, name) is None
-            if c.variants.get(name) is Some(v)
+            if variant_named(c, name) is Some(v)
                 if c.data[v.data].variants[v.index].fields.len() == 0
                     return construct(c, e.span, target.span, v, buf(), Some(types), expected)
     // A method named without a call, with its own type arguments, as in `box.convert[int]`.
@@ -3312,10 +3917,43 @@ private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: 
                     if names[i] == name then return TExpr(e.span, variant_fields(d, id, 0, args)[i], Field(value, i))
             c.note(unit, e.span, s"`${type_name(ty)}` has no field `$name`")
         Class(k, _, _) -> return class_member_value(c, e.span, value, k, name, expected)
+        TypeVar(_, _, _) -> return bound_member_value(c, e.span, value, ty, name, expected)
         ErrorType -> ()
         Nothing -> return value
         _ -> c.note(unit, e.span, s"${type_name(ty)} has no field `$name`")
     TExpr(e.span, ErrorType, UnitConst)
+
+// `value.name` on a value of type parameter `ty`: a `val` of a trait bounding it, or a method of its
+// bounds named without a call.
+private bound_member_value(c: *Checker, at: Span, value: &TExpr, ty: &Type, name: string, expected: Option[&Type]) -> &TExpr
+    if bound_field(c, ty, name) is Some(m) then return trait_field_read(c, at, value, m, expected)
+    // A field of a class bounding it is read as from an instance of that class.
+    if bound_class_field(c, ty, name) is Some(b)
+        if *b is Class(k, _, _) then return class_member_value(c, at, TExpr(value.span, b, value.kind), k, name, expected)
+    val ms = bound_methods(c, ty, name)
+    if ms.len() > 0 then return member_method_value(c, at, value, ms[0], None, expected)
+    no_bound_member(c, at, ty, name)
+    TExpr(at, ErrorType, UnitConst)
+
+/** The `val` named `name` of a trait bounding type parameter `ty`, read with field syntax. */
+private bound_field(c: *Checker, ty: &Type, name: string) -> Option[usize]
+    for b in bounds_of(c, ty)
+        if *b is Class(k, _, _)
+            if trait_field_named(c, k, name) is Some(m) then return Some(m)
+    None
+
+/** The class bounding type parameter `ty` that has a field named `name`. */
+private bound_class_field(c: *Checker, ty: &Type, name: string) -> Option[&Type]
+    for b in bounds_of(c, ty)
+        if *b is Class(k, _, _)
+            if !is_trait(c, k) && class_field(c, k, name) is Some(_) then return Some(b)
+    None
+
+// Reports that type parameter `ty` has no member `name`: only its bounds give it any.
+private no_bound_member(c: *Checker, at: Span, ty: &Type, name: string)
+    val t = type_name(ty)
+    if bounds_of(c, ty).len() == 0 then c.note(unit_of(c), at, s"`$t` has no bound, so it has no member `$name`; a bound, as in `[$t: Trait]`, gives it the methods of the trait")
+    else c.note(unit_of(c), at, s"`$name` is not a member of `${bound_names(c, ty)}`, the bound of `$t`")
 
 // `object.name` on an object of class `k`: a field, which outside the class must be public.
 private class_member_value(c: *Checker, at: Span, object: &TExpr, k: usize, name: string, expected: Option[&Type]) -> &TExpr
@@ -3544,14 +4182,13 @@ private update_field(c: *Checker, e: &Expr, target: &Expr, increment: bool, post
     place.wrap(e.span, TExpr(e.span, ty, Block(items)))
 
 // A module-level value or object named by a bare name, unless a local function of that name hides
-// it or a function of a later file, the program's own over the prelude, shadows it.
+// it or a declaration of a nearer module, the file's own over the core library's, shadows it.
 private global_named(c: *Checker, name: string) -> Option[usize]
     if local_function(c, name) is Some(_) then return None
-    val g = c.global_names.get(name)?
-    if c.scope.get(name) is Some(ids)
-        for f in ids
-            if c.symbols[f].unit > c.globals[g].unit then return None
-    Some(g)
+    c.global_names.get(resolve_name(c, unit_of(c), name))
+
+/** The variant a bare name refers to in the code being checked, if it refers to one. */
+private variant_named(c: *Checker, name: string) -> Option[VariantRef] = c.variants.get(resolve_name(c, unit_of(c), name))
 
 // A module-level value's type is its initializer's result: declared, or inferred by checking the
 // initializer first, which is not possible while that initializer is itself being checked.
@@ -4108,50 +4745,70 @@ private join_expected(c: *Checker, a: &Type, b: &Type, expected: Option[&Type]) 
     if fits(c, a, want) && fits(c, b, want) then Some(want) else None
 
 // The type two branches agree on, where one that never finishes agrees with anything.
-// Two instances of classes agree on their nearest common ancestor.
+// Two instances of classes agree on their nearest common ancestor, and two instances of one generic
+// type on the instance whose covariant arguments are their arguments' agreement.
 private join(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
     if *a is Nothing || *a is ErrorType then return Some(b)
     if *b is Nothing || *b is ErrorType then return Some(a)
     if same_type(a, b) then return Some(a)
     var current = zonk(c, a)
+    if *current is Data(_, _, _) then return join_args(c, current, zonk(c, b))
     loop
         val k = *current match
             Class(k, _, args) -> k
             _ -> return None
         if ancestor_type(c.classes, c.data, zonk(c, b), k) is Some(up)
             if same_type(up, current) then return Some(current)
+            if join_args(c, current, up) is Some(t) then return Some(t)
         current = ancestor_parent(c, current)?
     None
+
+// The instance of one generic type that two of its instances agree on: equal invariant arguments,
+// and covariant arguments that are references agreeing on a type.
+private join_args(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
+    val (params, xs, ys) = *a match
+        Data(d, _, xs) -> *b match
+            Data(e, _, ys) -> if d == e then (c.data[d].decl.type_params, xs, ys) else return None
+            _ -> return None
+        Class(k, _, xs) -> *b match
+            Class(j, _, ys) -> if k == j then (c.classes[k].decl.type_params, xs, ys) else return None
+            _ -> return None
+        _ -> return None
+    if xs.len() != ys.len() || xs.len() != params.len() then return None
+    var args: Buf[&Type] = buf()
+    for i in 0..<xs.len()
+        if same_type(xs[i], ys[i])
+            args.push(xs[i])
+            continue
+        if !(params[i].variance is Covariant) || !is_reference(xs[i]) || !is_reference(ys[i]) then return None
+        args.push(join(c, xs[i], ys[i])?)
+    *a match
+        Data(d, name, _) -> Some(Data(d, name, args))
+        Class(k, name, _) -> Some(Class(k, name, args))
+        _ -> None
 
 /** The superclass of an instance's class, as the instance's type, if it has one. */
 private ancestor_parent(c: *Checker, t: &Type) -> Option[&Type] = *t match
     Class(k, _, args) -> Some(substitute(c.classes[k].superclass?, class_owner(k), args))
     _ -> None
 
-/** `from` as an instance of the class `to` names, when `from` is an instance of one of that class's
- * subclasses; otherwise `from` itself. */
+/** `from` as the type `to` asks for, where a value of `from` is one of `to` (see `view_as`);
+ * otherwise `from` itself, or a type that differs from `to`. */
 private upcast(c: *Checker, from: &Type, to: &Type) -> &Type
     val x = zonk(c, from)
-    // Every value converts to `Any`, by boxing where it is written; never inside a tuple, whose
-    // parts are already laid out.
+    // Every value converts to `Any`, by boxing where it is written; never inside a tuple or as a
+    // type argument, whose parts are already laid out.
     if *zonk(c, to) is AnyType && !(*x is Var(_) || *x is ByName(_)) then return AnyType
-    upcast_part(c, x, to)
-
-private upcast_part(c: *Checker, x: &Type, to: &Type) -> &Type
-    *zonk(c, to) match
-        Class(k, _, _) -> ancestor_type(c.classes, c.data, x, k).unwrap_or(x)
-        Tuple(ys) -> *x match
-            Tuple(xs) ->
-                if xs.len() != ys.len() then return x
-                var items: Buf[&Type] = buf()
-                for i in 0..<xs.len()
-                    items.push(upcast_part(c, zonk(c, xs[i]), ys[i]))
-                Tuple(items)
-            _ -> x
-        _ -> x
+    // A value of a type parameter is an instance of its bounds.
+    if *x is TypeVar(_, _, _)
+        if *zonk(c, to) is Class(k, _, _)
+            for b in bounds_of(c, x)
+                if ancestor_type(c.classes, c.data, b, k) is Some(_) then return view_as(c.classes, c.data, b, zonk(c, to))
+    view_as(c.classes, c.data, x, zonk(c, to))
 
 /** Whether a value of type `from` may be used where `to` is expected: an instance of a subclass is an
- * instance of its superclass, also inside a tuple. */
+ * instance of its superclass, and an instance of a generic type one of another instance as its
+ * parameters' variance allows, also inside a tuple or a function type. */
 private fits(c: *Checker, from: &Type, to: &Type) -> bool = conforms(upcast(c, from, to), to)
 
 private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[&Expr], expected: Option[&Type], used: bool) -> &TExpr
@@ -4343,7 +5000,7 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
             return TExpr(at, ErrorType, UnitConst)
         return value_call(c, at, callee, args)
     if ids.len() == 0
-        if c.variants.get(name) is Some(v)
+        if variant_named(c, name) is Some(v)
             if c.data[v.data].variants[v.index].fields.len() == 0
                 c.note(unit, at, s"`$name` has no fields; write it without parentheses")
                 for a in args
@@ -4622,6 +5279,18 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
             for a in args
                 check_statement(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
+    // A value of a type parameter has the methods of its bounds, and no others.
+    if *zonk(c, object.ty) is TypeVar(_, _, _)
+        val ty = zonk(c, object.ty)
+        val ms = bound_methods(c, ty, name)
+        if ms.len() > 0
+            if infix && !takes_one_argument(c, ms) then return infix_arity_error(c, at, name_span, target, name, ms, args)
+            return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
+        if bound_field(c, ty, name) is None && bound_class_field(c, ty, name) is None
+            no_bound_member(c, name_span, ty, name)
+            for a in args
+                check_statement(c, a.value)
+            return TExpr(at, ErrorType, UnitConst)
     val all = receiver_methods(c, zonk(c, object.ty), name)
     if all.len() > 0
         val ms = visible_methods(c, all)
@@ -4742,10 +5411,20 @@ private method_signature(c: *Checker, receiver: &TExpr, m: usize, result: &Type)
     var names: Buf[string] = buf()
     var defaults: Buf[Option[usize]] = buf()
     for i in 1..<target.params.len()
-        params.push(target.params[i])
+        params.push(with_self(c, m, receiver.ty, target.params[i]))
         names.push(target.param_names[i])
         defaults.push(if i < target.defaults.len() then target.defaults[i] else None)
-    Signature(target.decl.name, true, target.type_params, target.type_owner, params, names, defaults, result, known, Some(receiver))
+    Signature(target.decl.name, true, target.type_params, target.type_owner, params, names, defaults, with_self(c, m, receiver.ty, result), known, Some(receiver))
+
+/** Type `t` of method `m` with the `Self` of a trait declaring `m` as the receiver's type. */
+private with_self(c: *Checker, m: usize, receiver_type: &Type, t: &Type) -> &Type
+    val k = c.symbols[m].owner_class match
+        Some(k) -> k
+        None -> return t
+    if !is_trait(c, k) then return t
+    var implementer: Buf[&Type] = buf()
+    implementer.push(zonk(c, receiver_type))
+    substitute(t, self_owner(k), implementer)
 
 // A method call passes the receiver first. The class's type arguments come from the receiver's
 // type, and the method's own, which follow them, are written or inferred as for a function.
@@ -4767,11 +5446,7 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
     typed.push(object)
     for a in applied.args
         typed.push(a)
-    // A `super` call names its method directly, even where the class overrides it.
-    val slot = if direct then None else dispatch_slot(c, receiver.ty, m)
-    val call = slot match
-        Some(s) -> applied.wrap(at, Dispatch(m, s, typed, applied.type_args))
-        None -> applied.wrap(at, Call(m, typed, applied.type_args))
+    val call = applied.wrap(at, method_call_kind(c, receiver.ty, m, typed, applied.type_args, direct))
     setup match
         Some(s) ->
             var items: Buf[&TExpr] = buf()
@@ -4785,6 +5460,13 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
 // receiver is seen as an instance of that class.
 private receiver_type_args(c: *Checker, receiver_type: &Type, m: usize) -> Buf[&Type]
     val t = zonk(c, receiver_type)
+    // A type parameter has the methods of its bounds, as an instance of them.
+    if *t is TypeVar(_, _, _)
+        if c.symbols[m].owner_class is Some(k)
+            for b in bounds_of(c, t)
+                if ancestor_type(c.classes, c.data, b, k) is Some(up)
+                    if *up is Class(_, _, a) then return a
+        return buf()
     c.symbols[m].owner_class match
         Some(k) -> *ancestor_type(c.classes, c.data, t, k).unwrap_or(t) match
             Class(_, _, a) -> a
@@ -4800,6 +5482,25 @@ private dispatch_slot(c: *Checker, receiver_type: &Type, m: usize) -> Option[usi
     if *zonk(c, receiver_type) is Class(r, _, _)
         if is_trait(c, r) then return Some(trait_slot(c, m))
         if is_open(c, r) then return table_position(c, r, m)
+    None
+
+// How a call of method `m` on a receiver of type `receiver_type` is made, with `args` the receiver
+// and the arguments. A `super` call names its method directly, even where the class overrides it.
+// On a type parameter the call goes to the method of whatever type each instance has: it is placed
+// at the position the method has in every table that holds it.
+private method_call_kind(c: *Checker, receiver_type: &Type, m: usize, args: Buf[&TExpr], type_args: Buf[&Type], direct: bool) -> TExprKind
+    if direct then return Call(m, args, type_args)
+    if *zonk(c, receiver_type) is TypeVar(_, _, _) then return BoundCall(m, bound_slot(c, m), args, type_args)
+    dispatch_slot(c, receiver_type, m) match
+        Some(s) -> Dispatch(m, s, args, type_args)
+        None -> Call(m, args, type_args)
+
+// The table position of a method reached through a bound: a trait's, or an open class's when the
+// method may be overridden. A final class's method is the one called.
+private bound_slot(c: *Checker, m: usize) -> Option[usize]
+    val k = c.symbols[m].owner_class?
+    if is_trait(c, k) then return Some(trait_slot(c, m))
+    if is_open(c, k) then return table_position(c, k, m)
     None
 
 /** A value made by a variant: a call of the variant with its fields, or the variant's bare name
@@ -4966,6 +5667,15 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     for t in binding.targets
         targets.push(if t is Some(i) then Some(wanted[i]) else None)
     val typed = check_arguments(c, args, targets, checked)
+    // A type argument the arguments settled settles those its bounds name: `[S: Source[A], A]`
+    // takes `A` from the source `S` is.
+    for i in known.len()..<type_params.len()
+        val arg = zonk(c, type_args[i])
+        if *arg is Var(_) then continue
+        for b in bounds_at(c, owner, type_params, i)
+            val bound = substitute(b, owner, type_args)
+            if *bound is Class(bk, _, _)
+                if ancestor_type(c.classes, c.data, arg, bk) is Some(up) then unify(c, up, bound)
     var solved: Buf[&Type] = buf()
     for i in 0..<type_args.len()
         val t = zonk(c, type_args[i])
@@ -4980,6 +5690,9 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
             c.vars.set(v, Some(ErrorType))
             solved.push(ErrorType)
         else solved.push(t)
+    // The type arguments written or inferred conform to their parameters' bounds; those the receiver
+    // gives were held to them where its type was made.
+    hold_to_bounds(c, unit, name_span, s"`$name`", owner, type_params, solved, known.len())
     var ty = zonk(c, declared)
     for t in typed
         if *t.ty is Nothing then ty = Nothing
@@ -5461,7 +6174,7 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
         InvalidPattern -> TPattern(p.span, ErrorType, PWildcard)
         Name(name) ->
             // A bare name is a variant with no fields when one is in scope, and otherwise binds.
-            if c.variants.get(name) is Some(v)
+            if variant_named(c, name) is Some(v)
                 if c.data[v.data].variants[v.index].fields.len() > 0
                     c.note(unit, p.span, s"`$name` has fields; match them, as in `$name(…)`")
                     return TPattern(p.span, ErrorType, PWildcard)
@@ -5523,7 +6236,7 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
             for o in options
                 typed.push(check_pattern(c, o, ty, if no_bind == "" then "alternatives bind no names; write `_` for a value that is not used" else no_bind))
             TPattern(p.span, ty, PAlternatives(typed))
-        Constructor(path, args) -> c.variants.get(path) match
+        Constructor(path, args) -> variant_named(c, path) match
             Some(v) -> variant_pattern(c, p, v, args, ty, no_bind)
             None ->
                 c.note(unit, p.span, s"`$path` is not a variant")
@@ -5595,6 +6308,10 @@ private may_match(c: *Checker, from: &Type, to: &Type) -> bool
     val x = zonk(c, from)
     val y = zonk(c, to)
     if fits(c, x, y) || *x is AnyType || *x is TypeVar(_, _, _) || *y is TypeVar(_, _, _) then return true
+    // A value of a generic type may be an instance whose arguments are subtypes of the static ones,
+    // or, for a contravariant parameter, supertypes.
+    if !(*y is AnyType) && fits(c, y, x) then return true
+    if variant_instances(c, x, y) then return true
     *x match
         Class(k, _, _) -> *y match
             Class(j, _, _) ->
@@ -5611,11 +6328,29 @@ private may_match(c: *Checker, from: &Type, to: &Type) -> bool
             _ -> false
         _ -> false
 
+// Whether two instances of one generic type may describe one value: their invariant arguments are
+// equal, and their other arguments are references that may describe one value.
+private variant_instances(c: *Checker, x: &Type, y: &Type) -> bool
+    val (params, xs, ys) = *x match
+        Data(d, _, xs) -> *y match
+            Data(e, _, ys) -> if d == e then (c.data[d].decl.type_params, xs, ys) else return false
+            _ -> return false
+        Class(k, _, xs) -> *y match
+            Class(j, _, ys) -> if k == j then (c.classes[k].decl.type_params, xs, ys) else return false
+            _ -> return false
+        _ -> return false
+    if xs.len() != ys.len() || xs.len() != params.len() then return false
+    for i in 0..<xs.len()
+        if same_type(xs[i], ys[i]) then continue
+        if params[i].variance is Invariant || !is_reference(xs[i]) || !is_reference(ys[i]) then return false
+        if !may_match(c, xs[i], ys[i]) && !may_match(c, ys[i], xs[i]) then return false
+    true
+
 // The local a comparison or `n + k` pattern binds: none for `_`. A name that is a variant is not a
 // binder there.
 private binder_local(c: *Checker, binder: &Pattern, ty: &Type, no_bind: string) -> Option[usize] = binder.kind match
     Name(name) ->
-        if c.variants.get(name) is Some(_)
+        if variant_named(c, name) is Some(_)
             c.note(unit_of(c), binder.span, s"`$name` is a variant; a comparison binds a name or `_`")
             return None
         if no_bind != ""
@@ -5872,6 +6607,8 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
             for i in from..<args.len()
                 if !scan_init(c, s, args[i], unsafe) then ok = false
             ok
+        // The receiver's type is a type parameter, so it is never the object being initialized.
+        BoundCall(_, _, args, _) -> scan_init_all(c, s, args, unsafe)
         FunctionValue(f, _) ->
             if !captures_init_self(c, s, f) then return true
             val symbol = c.symbols[f]

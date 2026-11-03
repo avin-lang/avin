@@ -91,6 +91,24 @@ a decision changes, this page and the chapter change together.
 - A `data` type conforming to a trait gives every variant's descriptor the same method table, at the
   trait positions classes use, so a trait-typed call costs the same whatever the value is.
 - A generic impl writes the type's parameters, in order, as its own: `impl[T] Show for Box[T]`.
+- Settled 2026-11-03: [bounds](/spec/generics/#bounds) are traits or classes, written `[T: A + B]`.
+  A value of a bounded `T` has its bounds' methods, `val`s and visible fields, and is a value of
+  each bound's type; type arguments are held to their bounds where written and where inferred, and
+  a bound's own type arguments are inferred from the argument. A call through a bound is direct in
+  each instance, and goes through the method table only where the type argument is a trait type or
+  an open class. An impl's type parameters take its type's bounds and write none of their own.
+- Settled 2026-11-03: `Self` is written only in a trait's methods and names the implementing type;
+  a trait mentioning it, itself or through a trait it requires, is only a bound. In its default
+  bodies `self` is a `Self`. A trait type is a type argument for its own bound when it does not
+  mention `Self`.
+- [Variance](/spec/generics/#variance) applies only where both type arguments are reference types,
+  so it never converts: `List[string]` is a `List[Any]`, `List[int]` is not. Tuple parts and
+  function results are covariant and function parameters contravariant on the same terms.
+- A variance error is reported in private members as in public ones; there is no escape for a
+  private `var`. The methods an impl adds to a `data` type are not variance positions; the traits
+  its impls name are.
+- A type pattern matches an object whose type conforms to the pattern's type through variance, as
+  the checker's subtyping does: a `List[Dog]` held as an `Any` matches `List[Animal]`.
 - The built-in types belong to the core library's module, `avin`; an impl adding methods to one is
   written there.
 - Functions and methods may be overloaded by parameter types. A call takes the most specific
@@ -254,6 +272,23 @@ a decision changes, this page and the chapter change together.
 **Project and tooling**
 
 - A project lists packages; a package has an `avin.hocon` manifest; a module is a directory.
+- A program's root is a directory, and each directory under it is a module named by its path from
+  the root (`a/b` is `a.b`). The root directory's own files are the root module, which has no name
+  and holds `main`; they take no header. Every other file begins with `module a.b`, naming the module
+  its directory makes it part of. A program of one file is compiled alone, and its header, if any,
+  names its module.
+- A module's files share one namespace: what one declares, every other sees by its bare name, its
+  `private` declarations included. Another module's declarations are reached only by importing them,
+  per file: `import a.b.X`, `import a.b.{X, y as z}`. There is no wildcard import. An unknown
+  import, an import of a private
+  declaration and an import of a name the file's module declares or another import already binds are
+  errors; an unused import is not.
+- A file sees its own module's declarations, then its imports, then the standard library's public
+  declarations in module `avin`, which need no import; the nearer hides the farther. Program modules
+  may not be `avin` or under it.
+- Modules may import one another in a cycle; module-level values initialize in the order their uses
+  need across the whole program.
+- A class and its companion object are in one module, in any of its files.
 - One `avin` command does everything: build, run, test, deps and config.
 - Testing follows Sysl's model: `@test`, `@tests`, setup and teardown, and the built-in runner.
   Every feature ships with tests.
@@ -269,6 +304,12 @@ a decision changes, this page and the chapter change together.
   an impl covers every instance of its type. Allowing one needs a rule for its overlap with a generic
   impl of the same trait.
 - The singleton declaration keeps the keyword `object`.
+- A program's binding shims are one Sysl package that depends on the runtime's, built into one
+  archive the program links in place of the runtime's, so all of a program's Sysl code shares one
+  copy of Sysl's library. The archive is cached by a hash of the shims, the Sysl version and the
+  runtime's source.
+- A binding is a top-level function. Across the boundary a `bool` is a byte and a `char` its code
+  point; `string` is copied each way.
 
 **Deferred**
 
@@ -278,6 +319,10 @@ a decision changes, this page and the chapter change together.
 - Partial-function literal syntax, which the user has explicitly left undecided.
 
 ## Proposed
+
+- A module is not named in code: `import a.b` is an error, and `b.X` does not reach `a.b`'s `X`.
+  Every use of another module's declaration goes through an import of that declaration. The
+  alternative is qualified access through an imported module name, `import a.b` then `b.X`.
 
 - An infix method call binds more loosely than arithmetic, bitwise, shift, cons and range operators
   and more tightly than comparisons, `is`, `&&` and `||`, and groups to the left, so

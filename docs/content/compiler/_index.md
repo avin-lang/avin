@@ -16,7 +16,7 @@ the standard library — in one run.
 | Load | `avin.hocon` → module graph | Packages, modules and files; the reserved `avin` root; the prelude, which is an Avin file. |
 | Resolve | AST → resolved AST | Scopes and symbol tables. Every name is bound to a declaration symbol, and imports, visibility and shadowing are decided here, once. |
 | Check | resolved AST → typed HIR | A `Type` algebra over declaration symbols; local bidirectional inference with subtype constraints; bounds, variance and `impl` coherence; initialization; pattern exhaustiveness. |
-| Bindings | `@sysl` declarations → shim | Generates the Sysl shim source and its boundary signatures. |
+| Bindings | `@sysl` declarations → shim archive | Generates the Sysl shim source and its boundary signatures, and has Sysl check and build it. |
 | Monomorphize | typed HIR → mono HIR | Instantiates functions, types and generic trait methods for every use, and computes the dispatch for trait-typed calls over the closed world. |
 | Lower | mono HIR → MIR | Explicit control flow, object layouts and headers, type descriptors, vtables, closures and environments, allocation, GC root slots, traps. |
 | Emit | MIR → LLVM IR | Spelling only: no typing, layout or semantic decisions. |
@@ -25,6 +25,54 @@ the standard library — in one run.
 Each stage has its own data structures and its own tests. No stage reaches back into an earlier stage's
 input. **Types are an enum over symbols, never strings**: built-in types, nominal types, functions,
 tuples, type parameters, inference variables, `Any`, `Nothing` and an error type.
+
+**Loading a program.** `avin build <dir>` takes a directory as the program's root: every `.avin` file
+under it is read in path order, passing over directories whose names begin with `.`, and each is
+given the module its directory's path names, the root directory's files last as the root module.
+A file whose header disagrees with its directory, or that has none outside the root, is reported
+before anything is checked. `avin build <file>` is a program of that one file, in the module its
+header names. The standard library is loaded the same way, from `library/` under the toolchain's
+root, where every module is `avin` or under it; `library/avin/prelude.avin` is one ordinary file of
+module `avin`. A package manifest will name the roots the loader walks; the files and their modules
+are what the later stages see.
+
+Names are resolved by module. Every top-level declaration is held under its qualified name, `a.b.X`
+(a root module's under `X`), and a bare name in a file resolves to the first of its own module's
+declaration, its file's import, and the `avin` module's public declaration that exists. Imports are
+checked once every declaration of the program is known, and a wrong one is dropped. Object-file
+symbols carry the module path, so two modules may each declare `helper`.
+
+## Sysl bindings and the shim cache
+
+A [binding](/spec/sysl-bindings/) is checked as a top-level function without a body: its
+`@sysl("module.name")` must name a Sysl function by module path and name, and its parameters and
+result must be boundary types — integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`,
+`unit` and `string`. Lowering gives it a body that passes its parameters, after the context, to a
+shim symbol, `avin_shim_` followed by the binding's own symbol with every character other than a
+letter or digit written as `_` and two hex digits, and returns what the shim returns. Since it is an
+ordinary function, a binding can be passed as a value. The MIR program lists every binding of the
+functions it compiles.
+
+For a program with bindings, the driver generates one Sysl module, `avin.shims`, in a package whose
+manifest depends on the runtime's package. Each binding gets an import of its Sysl function under a
+private name, and an exported shim that converts each argument (a `bool` arrives as a byte, a `char`
+as its code point, a `string` is copied into a Sysl `string`), calls the function with the result
+declared at the binding's type, and converts the result back (a `string` is copied into a new Avin
+string through the runtime's `avin_rt_new_text`). `sysl build-c` checks and builds the package into
+one archive holding the runtime, the shims and the part of Sysl's library they reach, which the
+program links instead of the runtime's own archive. One archive means one copy of Sysl's library, so
+Sysl and Avin share standard output and keep their writes in order.
+
+A Sysl diagnostic is placed by its line in the shim: the driver records the line of each binding's
+import and the lines of its function, and reports the message at the binding's name as `the Sysl
+binding \`name\` does not match \`module.name\`: …`. A diagnostic that falls elsewhere is reported
+with Sysl's whole output.
+
+The archive is cached under `.avin/shims/` in the toolchain's root, named by a SHA-256 of the
+manifest, the shim source, the `sysl --version` output and the runtime's source files. A build with
+the same bindings finds it there and runs no Sysl build; it is built under a temporary name and
+published by rename, so concurrent builds never see a partial archive. The `check` command builds
+the shims too, since only Sysl can say whether a binding is right.
 
 ## Runtime
 
@@ -152,8 +200,9 @@ at offset 56: the number of the type's ancestors and their records' addresses. A
 are its superclasses and every trait it and they conform to, with their type arguments as it sees
 them; a tuple's are the tuple types its parts' ancestors make, one combination at a time. A type
 pattern loads the object's descriptor and its record: for a type nothing else can be (a built-in, a
-final class, a `data` type, a tuple of such), one comparison with the target's record; for an open
-class, a trait or a tuple with a part of one, a call of the runtime's `avin_rt_conforms`, which
+final class, a `data` type, a tuple of such, each with only invariant parameters), one comparison
+with the target's record; for an open class, a trait, an instance of a type with a covariant or
+contravariant parameter, or a tuple with a part of one, a call of the runtime's `avin_rt_conforms`, which
 scans the record's ancestors, so the test costs the number of ancestors. A generic instance is its
 own type with its own record, so `Box[int]` and `Box[string]` differ by address. Strings are made by
 the runtime as well as written as literals, so a string's descriptor names no record, and a null
@@ -161,6 +210,44 @@ record is the mark of a string. Closures and the boxes of captured variables sha
 type pattern names. A type pattern on a value whose static type already conforms to the target tests
 nothing, and on a value of another value type (possible only in a copy of generic code) never
 matches.
+
+The supertypes an instance has through **variance** are open-ended (`List[Dog]` is a `List[Animal]`
+and a `List[Any]`), so a record does not list them all. Lowering notes each record a type pattern
+tests through `avin_rt_conforms`; once every function is lowered, each record gains those tested
+records whose types its own conforms to by variance, by the checker's rule (`view_as`). A test
+still costs one scan of one record.
+
+A covariant view needs no conversion, and stays sound under monomorphization, because variance
+applies only between reference type arguments. Every field and every part of a field whose type
+mentions a type argument is then a reference (the argument itself, or a tuple, function, `data`
+value or object built from it), so `Box[Dog]` and `Box[Animal]` have the same layout and the same
+method-table shape, and code of either instance reads the other's objects correctly. A call through
+a method table runs the code of the object's own instance: a `Box[Dog]` seen as a `Box[Animal]`
+runs `Box[Dog]`'s method, whose results are `Dog`s and so `Animal`s, and whose parameters, a
+covariant parameter never being one, take what the view passes. A direct call (a final class's
+method, an `impl`'s method of a `data` type) runs the code of the static instance, `Box[Animal]`'s,
+on the `Box[Dog]` object: the layouts agree, and that code treats every value as the wider type the
+view promises, so anything reified it does (a type pattern on `T`, a new `Box[T]`) is done at the
+view's types, which the caller expects. The declaration check is what keeps both paths sound: a `+T`
+never reaches a parameter or a mutable field, so neither code can store a `Cat` where a `Dog`
+instance's field expects a `Dog`, and never reaches an invariant argument, so neither code can hand
+out an invariant `Cell[T]` that would let one be stored later.
+
+A type parameter's bounds are resolved where it is declared and kept by owner, position and source
+place, since the own parameters of two methods of one class share an owner and positions; a class's
+or data type's parameters are looked up at the type's declaration wherever they are named. Type
+arguments written in declarations are held to their bounds once every conformance is known (after
+the method tables are placed), and those of calls as each call is checked, after the arguments,
+whose types also settle the bounds' own type arguments. A trait's `Self` is a type parameter owned
+by `self_owner` of the trait, bounded by the trait: a call substitutes the receiver's type for it,
+and comparing an implementation with a trait's method substitutes the implementing type. A call on
+a value of a type parameter is a `BoundCall` carrying the method's position in every table that
+holds it (a trait's position, or an open class's). Lowering knows the receiver's type in each
+instance: for a final class or a `data` type it takes the implementation at that position in the
+type's table and calls it directly, at the type's arguments followed by the call's own; for a trait
+type or an open class it dispatches as a call on that type does. A trait's default bodies are one
+function for every conforming type, so `Self` stays in them, lowered as a reference, and their
+calls on `Self` values dispatch.
 
 An `object` is an instance of a class of its own, kept apart from its companion class's: its
 constructor and methods are separate functions, and its layout and descriptor are its own. Each

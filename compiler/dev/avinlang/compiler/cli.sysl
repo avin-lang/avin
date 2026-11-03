@@ -1,11 +1,12 @@
 module dev.avinlang.compiler
 
-import sh.sysl.parsing.{Source, source_of}
-import sysl.fs.{canonicalize, read_text, write_text_atomic}
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{canonicalize, is_dir, read_text, write_text_atomic}
 import sysl.path.stem
 
 const Version: string = "0.1.0"
-const Usage: string = "usage: avin parse <source.avin>\n       avin check <source.avin>\n       avin emit-llvm <source.avin> -o <module.ll>\n       avin build <source.avin> [-o <executable>]\n       avin --help\n       avin --version"
+const Usage: string = "usage: avin parse <program>\n       avin check <program>\n       avin emit-llvm <program> -o <module.ll>\n       avin build <program> [-o <executable>]\n       avin --help\n       avin --version\n<program> is a source file, or a directory holding a program's modules"
 
 // Output channels, the exit status and the toolchain location stay outside command dispatch, so
 // every command can be run and tested in memory. 0 is success, 1 a source, I/O or build failure,
@@ -38,19 +39,31 @@ run_cli(args: []const string, tc: Option[Toolchain], say: string -> unit, note: 
                 if a == b
                     note("avin: the output would overwrite the source file")
                     return 2
-    val text = read_text(path) match
-        Ok(t) -> t
-        Err(e) ->
-            note(s"avin: $path: ${e.to_string()}")
+    // A directory is the root of a program of many files; a file is a program by itself.
+    var files: Buf[ProgramFile] = buf()
+    if is_dir(path)
+        files = program_files(path) match
+            Ok(f) -> f
+            Err(message) ->
+                note("avin: " + message)
+                return 1
+        if files.len() == 0
+            note(s"avin: $path: no `.avin` files in the program")
             return 1
-    val src = source_of(path, text)
-    if command == "parse" then return run_parse(src, say, note)
+    else
+        val text = read_text(path) match
+            Ok(t) -> t
+            Err(e) ->
+                note(s"avin: $path: ${e.to_string()}")
+                return 1
+        files = single_file(source_of(path, text))
+    if command == "parse" then return run_parse(files, say, note)
     val toolchain = tc match
         Some(t) -> t
         None ->
             note("avin: cannot find the Avin library and runtime; set AVIN_ROOT to the directory that holds them")
             return 1
-    val compiled = compile(toolchain, src)
+    val compiled = compile_files(toolchain, files)
     if compiled.diagnostics != ""
         note(compiled.diagnostics)
         return 1
@@ -64,21 +77,30 @@ run_cli(args: []const string, tc: Option[Toolchain], say: string -> unit, note: 
             Err(e) ->
                 note("avin: " + e.to_string())
                 return 1
-    link(toolchain, llvm, output.unwrap_or(default_output(path)), "-O2") match
+    val executable = output.unwrap_or(default_output(path))
+    if is_dir(executable)
+        note(s"avin: `$executable` is a directory; name the executable with -o")
+        return 1
+    link(toolchain, llvm, compiled.archive, executable, "-O2") match
         Ok(_) -> 0
         Err(message) ->
             note("avin: " + message)
             1
 end run_cli
 
-/** Where `avin build` writes when no `-o` is given: the source's name without `.avin`, in the
- * working directory. */
+/** Where `avin build` writes when no `-o` is given: the source's name without `.avin`, or the
+ * program directory's name, in the working directory. */
 default_output(path: string) -> string = stem(path).unwrap_or("a.out")
 
-run_parse(src: Source, say: string -> unit, note: string -> unit) -> int
-    val parsed = parse(src)
-    if parsed.report.has_errors()
-        note(parsed.report.render(src))
-        return 1
-    say(s"parsed ${parsed.file.items.len()} declarations")
+run_parse(files: Buf[ProgramFile], say: string -> unit, note: string -> unit) -> int
+    var declarations = 0usize
+    var failed = false
+    for f in files
+        val parsed = parse(f.src)
+        if parsed.report.has_errors()
+            note(parsed.report.render(f.src))
+            failed = true
+        declarations += parsed.file.items.len()
+    if failed then return 1
+    say(s"parsed $declarations declarations")
     0

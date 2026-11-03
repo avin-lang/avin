@@ -4,6 +4,7 @@ import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
 import sysl.path.file_name
+import sysl.text.from_utf8_unchecked
 
 /** The machine type of a semantic type, or `None` for a type with no runtime representation. */
 mir_type(t: &Type) -> Option[MirType] = *t match
@@ -21,6 +22,9 @@ mir_type(t: &Type) -> Option[MirType] = *t match
     Tuple(_) -> Some(MRef)
     Function(_, _) -> Some(MRef)
     ByName(_) -> Some(MRef)
+    // A trait's `Self` is left in the code of the trait's default bodies, which every conforming
+    // type shares: each such type is an object, reached by reference.
+    TypeVar(owner, _, _) -> if is_self_owner(owner) then Some(MRef) else None
     _ -> None
 
 /** Where a value is kept: the address of a slot, and the type stored there. */
@@ -127,6 +131,10 @@ private struct Lowering
     /** The descriptors whose method tables hold a method with type parameters of its own, each with
      * the type it describes, so a slot found later is filled in them too. */
     generic_holders: Buf[GenericHolder]
+    /** The type each record describes, by the record's index. */
+    record_types: Buf[&Type]
+    /** The records a type pattern tests against, each once. */
+    tested: Buf[usize]
 
 /** One slot for a method with type parameters of its own, at one list of its own type arguments: a
  * call through a method table to `name` at checker position `position` with `type_args` reaches it.
@@ -153,10 +161,11 @@ lower_program(program: TProgram) -> MirProgram
         if k.table.len() > generic_base then generic_base = k.table.len()
     for d in program.data
         if d.table.len() > generic_base then generic_base = d.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf())
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf())
     // Record 0 is for the objects no type pattern names: closures, and the boxes of captured
     // variables.
     l.records.push(TypeRecord("a closure or a captured variable", buf()))
+    l.record_types.push(Unit)
     for i in 0..<program.symbols.len()
         if !is_generic(program, i) && !never_compiled(program, i) then instance(&l, i, buf())
     val entry = instance(&l, program.entry, buf())
@@ -168,7 +177,18 @@ lower_program(program: TProgram) -> MirProgram
     while k < l.instances.len()
         functions.push(lower_function(&l, k))
         k += 1
-    MirProgram(functions, l.strings, l.descriptors, l.records, l.closures, l.traps, global_types, entry, init)
+    add_variant_ancestors(&l)
+    var bindings: Buf[MirBinding] = buf()
+    for inst in l.instances
+        val symbol = program.symbols[inst.function]
+        if binding_target(symbol.decl) is Some(target)
+            val shim = shim_symbol(function_symbol(program, inst.function, inst.type_args))
+            // A function used as a value is an instance twice, its body and its closure's entry.
+            var seen = false
+            for b in bindings
+                if b.shim == shim then seen = true
+            if !seen then bindings.push(MirBinding(shim, target, symbol.name, symbol.params, symbol.result.unwrap_or(Unit), symbol.unit, symbol.decl.name_span))
+    MirProgram(functions, l.strings, l.descriptors, l.records, l.closures, l.traps, global_types, entry, init, bindings)
 
 /** Whether a function has no code: an abstract method, or an abstract class's or a trait's constructor. */
 private never_compiled(program: TProgram, id: usize) -> bool
@@ -455,6 +475,7 @@ private record_of(l: *Lowering, t: &Type) -> usize
     if l.record_index.get(key) is Some(r) then return r
     val index = l.records.len()
     l.records.push(TypeRecord(type_name(t), buf()))
+    l.record_types.push(t)
     l.record_index.put(key, index)
     var ancestors: Buf[usize] = buf()
     for up in supertypes(l, t)
@@ -564,20 +585,53 @@ private type_test(l: *Lowering, object: Operand, t: &Type) -> Operand
     val record = fresh(l, MPtr)
     l.insts.push(Load(record, Value(address)))
     if *t is Str then return compare(l, CmpEq, Value(record), NullAddress)
-    val target = RecordAddress(record_of(l, t))
+    val index = record_of(l, t)
+    val target = RecordAddress(index)
     if exact(l, t) then return compare(l, CmpEq, Value(record), target)
+    var seen = false
+    for r in l.tested
+        if r == index then seen = true
+    if !seen then l.tested.push(index)
     val found = runtime_call(l, "avin_rt_conforms", [MPtr, MPtr], MInt(32), [Value(record), target])
     compare(l, CmpNe, found, ConstInt(32, "0"))
 
 /** Whether only a value of exactly type `t` has type `t`: true of every type but an open or
- * abstract class, a trait, and a tuple with a part of one. */
+ * abstract class, a trait, an instance of a type with a parameter that is not invariant, and a tuple
+ * with a part of one. */
 private exact(l: *Lowering, t: &Type) -> bool = *t match
-    Class(k, _, _) -> l.program.classes[k].decl.modifier == ""
+    Class(k, _, _) -> l.program.classes[k].decl.modifier == "" && all_invariant(l.program.classes[k].decl.type_params)
+    Data(d, _, _) -> all_invariant(l.program.data[d].decl.type_params)
     Tuple(items) ->
         for item in items
             if !exact(l, item) then return false
         true
     _ -> true
+
+private all_invariant(params: Buf[TypeParam]) -> bool
+    for p in params
+        if !(p.variance is Invariant) then return false
+    true
+
+// A type pattern on an instance of a generic type matches an object whose type conforms to it
+// through its parameters' variance, as the checker's subtyping does. Those supertypes are open-ended,
+// so a record does not list them all: once every function is lowered, each record gains those among
+// the types that type patterns test against.
+private add_variant_ancestors(l: *Lowering)
+    for r in 1..<l.records.len()
+        val from = l.record_types[r]
+        var ancestors = l.records[r].ancestors
+        var grew = false
+        for target in l.tested
+            if target == r then continue
+            var listed = false
+            for a in ancestors
+                if a == target then listed = true
+            if listed then continue
+            val to = l.record_types[target]
+            if same_type(view_as(l.program.classes, l.program.data, from, to), to)
+                ancestors.push(target)
+                grew = true
+        if grew then l.records.set(r, TypeRecord(l.records[r].name, ancestors))
 
 /** The value of type `t` an object that has that type holds: a built-in value is in its box. */
 private unbox(l: *Lowering, t: &Type, object: Operand) -> Option[Operand] = machine(l, t) match
@@ -586,23 +640,12 @@ private unbox(l: *Lowering, t: &Type, object: Operand) -> Option[Operand] = mach
     None -> None
 
 // Whether a value of static type `from` always has type `to`: `to` is `Any`, or `from` itself, or
-// for a class or a trait, one of its ancestors; for a tuple, part by part.
+// a type a value of `from` is with no conversion: an ancestor, an instance of the same generic type
+// as variance allows, a tuple part by part.
 private always_is(l: *Lowering, from: &Type, to: &Type) -> bool
     if *to is AnyType || same_type(from, to) then return true
-    *from match
-        Class(_, _, _) -> *to match
-            Class(k, _, _) -> ancestor_type(l.program.classes, l.program.data, from, k) match
-                Some(up) -> same_type(up, to)
-                None -> false
-            _ -> false
-        Tuple(xs) -> *to match
-            Tuple(ys) ->
-                if xs.len() != ys.len() then return false
-                for i in 0..<xs.len()
-                    if !always_is(l, xs[i], ys[i]) then return false
-                true
-            _ -> false
-        _ -> false
+    if !is_reference(from) then return false
+    same_type(view_as(l.program.classes, l.program.data, from, to), to)
 
 private machine_name(t: MirType) -> string = t match
     MInt(bits) -> s"i$bits"
@@ -708,6 +751,61 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
     dest match
         Some(id) -> Some(Value(id))
         None -> None
+
+// A direct call of `function`, the receiver first for a method.
+private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr], type_args: Buf[&Type]) -> Option[Operand]
+    var operands: Buf[Operand] = buf()
+    for a in args
+        val op = lower_expr(l, a)
+        if machine(l, a.ty) is Some(_)
+            op match
+                Some(v) -> operands.push(v)
+                None -> return None
+    // A local function also receives what it captures, from where the caller keeps it.
+    val callee = l.program.symbols[function]
+    for x in callee.captured_locals
+        if l.local_slots[x] is Some(p) then operands.push(p.address)
+    for x in callee.captured_params
+        if l.param_values[x] is Some(v) then operands.push(Value(v))
+    // A local function shares its top-level function's type arguments; a generic function is
+    // instantiated with the call's, made concrete for the instance being lowered.
+    var concrete_args: Buf[&Type] = buf()
+    if callee.root is Some(_) then concrete_args = l.subst
+    else
+        for t in type_args
+            concrete_args.push(concrete(l, t))
+    val index = instance(l, function, concrete_args)
+    val dest = machine(l, e.ty) match
+        Some(t) -> Some(fresh(l, t))
+        None -> None
+    l.insts.push(Call(dest, Direct(index), operands))
+    dest match
+        Some(id) -> Some(Value(id))
+        None -> None
+
+// A call through a bound, in an instance that knows the receiver's type. A trait or an open class
+// may hold an object of any class conforming to it, so the call goes through the object's method
+// table; any other type's implementation is the method at the call's position in its table, called
+// directly. In a trait's default body the receiver is the trait's `Self`, any conforming object.
+private bound_call(l: *Lowering, e: &TExpr, function: usize, slot: Option[usize], args: Buf[&TExpr], type_args: Buf[&Type]) -> Option[Operand]
+    val position = slot match
+        Some(s) -> s
+        None -> return direct_call(l, e, function, args, type_args)
+    val receiver = concrete(l, args[0].ty)
+    if *receiver is Class(k, _, _)
+        if l.program.classes[k].decl.modifier != "" then return dispatch(l, function, position, args, type_args)
+    val entries = checker_table(l, receiver)
+    if position >= entries.len() then return dispatch(l, function, position, args, type_args)
+    val m = entries[position] match
+        Some(m) -> m
+        None -> return dispatch(l, function, position, args, type_args)
+    var concrete_args: Buf[&Type] = buf()
+    for a in implementation_args(l, receiver, m)
+        concrete_args.push(a)
+    val own = l.program.symbols[function].decl.type_params.len()
+    for i in type_args.len() - own..<type_args.len()
+        concrete_args.push(concrete(l, type_args[i]))
+    direct_call(l, e, m, args, concrete_args)
 
 // Calls a function value: its entry is at offset 0, and takes the closure before the arguments.
 private call_value(l: *Lowering, callee: &TExpr, args: Buf[&TExpr]) -> Option[Operand]
@@ -848,7 +946,9 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
         Some(body) ->
             val result = lower_expr(l, body)
             finish(l, returning(l, result))
-        None -> intrinsic_body(l, symbol)
+        None ->
+            if binding_target(symbol.decl) is Some(_) then binding_body(l, symbol, shim_symbol(function_symbol(l.program, f.symbol, inst.type_args)))
+            else intrinsic_body(l, symbol)
     MirFunction(function_symbol(l.program, f.symbol, inst.type_args), signature, l.values, l.slots, l.blocks)
 
 // A closure entry takes the closure and the function's parameters. It keeps each captured local
@@ -897,6 +997,41 @@ private returning(l: *Lowering, value: Option[Operand]) -> Terminator
     value match
         Some(v) -> Return(Some(v))
         None -> Unreachable
+
+// A Sysl binding is a function like any other in the object file; its body passes its parameters to
+// the binding's shim, with the context first, and returns what the shim returns. The shim is
+// generated Sysl, called with the C convention, which converts each value at the boundary.
+private binding_body(l: *Lowering, symbol: FunctionSymbol, shim: string)
+    var args: Buf[Operand] = buf()
+    var params: Buf[MirType] = buf()
+    for i in 0..<symbol.params.len()
+        if l.param_values[i] is Some(v)
+            args.push(Value(v))
+            params.push(l.values[v])
+    val result = machine(l, symbol.result.unwrap_or(Unit))
+    val dest = result match
+        Some(t) -> Some(fresh(l, t))
+        None -> None
+    l.insts.push(Call(dest, Runtime(shim, MirSignature(params, result)), args))
+    finish(l, Return(dest match
+        Some(d) -> Some(Value(d))
+        None -> None))
+
+/** The symbol of the shim a binding's body calls: `avin_shim_` and the binding's own symbol, with
+ * each character other than a letter or a digit written as `_` and its two hex digits. */
+shim_symbol(function: string) -> string
+    val hex = "0123456789abcdef"
+    var out: Buf[u8] = buf()
+    for b in "avin_shim_".bytes
+        out.push(b)
+    for b in function.bytes
+        if b >= u8('a') && b <= u8('z') || b >= u8('A') && b <= u8('Z') || b >= u8('0') && b <= u8('9')
+            out.push(b)
+        else
+            out.push(u8('_'))
+            out.push(hex.bytes[usize(b >> 4)])
+            out.push(hex.bytes[usize(b & 15)])
+    from_utf8_unchecked(out.view())
 
 // An intrinsic is a function like any other in the object file; its body is the operation the
 // intrinsic names, so it can be called directly and, later, passed as a value.
@@ -1029,36 +1164,9 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         Some(id) -> Some(Value(id))
         None -> None
     Local(index) -> load(l, local_place(l, index))
-    Call(function, args, type_args) ->
-        var operands: Buf[Operand] = buf()
-        for a in args
-            val op = lower_expr(l, a)
-            if machine(l, a.ty) is Some(_)
-                op match
-                    Some(v) -> operands.push(v)
-                    None -> return None
-        // A local function also receives what it captures, from where the caller keeps it.
-        val callee = l.program.symbols[function]
-        for x in callee.captured_locals
-            if l.local_slots[x] is Some(p) then operands.push(p.address)
-        for x in callee.captured_params
-            if l.param_values[x] is Some(v) then operands.push(Value(v))
-        // A local function shares its top-level function's type arguments; a generic function is
-        // instantiated with the call's, made concrete for the instance being lowered.
-        var concrete_args: Buf[&Type] = buf()
-        if callee.root is Some(_) then concrete_args = l.subst
-        else
-            for t in type_args
-                concrete_args.push(concrete(l, t))
-        val index = instance(l, function, concrete_args)
-        val dest = machine(l, e.ty) match
-            Some(t) -> Some(fresh(l, t))
-            None -> None
-        l.insts.push(Call(dest, Direct(index), operands))
-        dest match
-            Some(id) -> Some(Value(id))
-            None -> None
+    Call(function, args, type_args) -> direct_call(l, e, function, args, type_args)
     Dispatch(function, slot, args, type_args) -> dispatch(l, function, slot, args, type_args)
+    BoundCall(function, slot, args, type_args) -> bound_call(l, e, function, slot, args, type_args)
     Construct(variant, args) -> construct(l, e, variant, args)
     FunctionValue(function, type_args) -> Some(function_value(l, function, type_args))
     CallValue(callee, args) -> call_value(l, callee, args)
@@ -1554,7 +1662,7 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
             var bound = value
             if always_is(l, from, to)
                 if *to is AnyType && !(*from is AnyType) then bound = box_value(l, from, value)
-            elif *from is AnyType || *from is Class(_, _, _) || *from is Tuple(_)
+            elif *from is AnyType || *from is Class(_, _, _) || *from is Tuple(_) || *from is Data(_, _, _)
                 // An object whose type is a subtype of its static type: its descriptor's record says.
                 if value is Some(v)
                     continue_if(l, type_test(l, v, to), fail)
