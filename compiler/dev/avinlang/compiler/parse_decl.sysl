@@ -28,6 +28,8 @@ parse(src: Source) -> Parsed
             file.tests_only = true
             continue
         if p.accept("data") then file.items.push(DataItem(parse_data(&p, start, annotations)))
+        elif p.at("class") || (p.ahead(1) == "class" && (p.at("open") || p.at("abstract")))
+            file.items.push(ClassItem(parse_class(&p, start, annotations)))
         else file.items.push(FunctionItem(parse_function(&p, annotations)))
         val closed_block = p.toks.position > 0 && p.toks.items[p.toks.position - 1].value == Dedent
         if !p.toks.at_end() && !p.at_kind(Newline) && !closed_block
@@ -454,6 +456,94 @@ private parse_data(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &Da
         variants.push(Variant(at.to(p.toks.here()), variant, fields))
         if p.toks.position == before then p.toks.advance()
     DataDecl(annotations, start.to(p.toks.here()), name, type_params, variants, derives)
+
+// `class Name[T](params): Parent(args), Trait derives Eq` and an optional indented body of fields,
+// methods and statements, each possibly `private`; `open` or `abstract` may come first.
+private parse_class(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &ClassDecl
+    var modifier = ""
+    var modifier_span = start
+    if !p.at("class")
+        modifier_span = p.toks.here()
+        modifier = required_name(p)
+    p.expect("class")
+    val name_start = p.toks.here()
+    val name = required_name(p)
+    val name_span = name_start.to(p.toks.here())
+    val type_params = parse_type_params(p)
+    var params: Buf[ClassParam] = buf()
+    if p.at("(") then params = parse_class_params(p)
+    var parents: Buf[&Expr] = buf()
+    if p.accept(":")
+        loop
+            parents.push(expression(p, 0))
+            if !p.accept(",") then break
+    var derives: Buf[&TypeExpr] = buf()
+    if p.accept("derives")
+        loop
+            derives.push(parse_type(p))
+            if !p.accept(",") then break
+    var members: Buf[ClassMember] = buf()
+    val indented = p.accept_kind(Indent)
+    if indented
+        loop
+            if p.toks.at_end() || p.accept_kind(Dedent) then break
+            if p.accept_kind(Newline) then continue
+            val before = p.toks.position
+            members.push(parse_class_member(p))
+            if p.toks.position == before then p.toks.advance()
+            if !p.toks.at_end() && !p.at_kind(Newline) && !p.at_kind(Dedent) && !after_block(p)
+                p.report.add(error(p.toks.here(), "expected a new line between class members"))
+                skip_line(p)
+        optional_end(p, name, true)
+    ClassDecl(annotations, start.to(p.toks.here()), name_span, name, modifier, modifier_span, type_params, params, parents, derives, members)
+
+// `owner: string`, `val name: string`, `var balance: int`, `private var count: int`
+private parse_class_params(p: *Parser) -> Buf[ClassParam]
+    var params: Buf[ClassParam] = buf()
+    p.expect("(")
+    if !p.at(")")
+        loop
+            val start = p.toks.here()
+            val hidden = p.accept("private")
+            var mutable = false
+            var marked = false
+            if p.accept("var")
+                mutable = true
+                marked = true
+            elif p.accept("val") then marked = true
+            if hidden && !marked then p.report.add(error(start, "a plain class parameter is already private; `private` goes before `val` or `var`"))
+            val name_at = p.toks.here()
+            val name = required_name(p)
+            val pattern = Pattern(name_at.to(p.toks.here()), Name(name))
+            p.expect(":")
+            if p.at("->")
+                p.report.add(error(p.toks.here(), "a class parameter is a field, so it cannot be by-name"))
+                p.toks.advance()
+            val ty = parse_type(p)
+            var default: Option[&Expr] = None
+            if p.accept("=") then default = Some(expression(p, 0))
+            params.push(ClassParam(Param(start.to(p.toks.here()), pattern, ty, default, false, false), mutable, marked && !hidden))
+            if !p.accept(",") || p.at(")") then break
+    p.expect(")")
+    params
+
+// A field (`val`/`var`), a method (a function declaration), or a statement the constructor runs.
+private parse_class_member(p: *Parser) -> ClassMember
+    val start = p.toks.here()
+    val hidden = p.accept("private")
+    val overrides = p.accept("override")
+    if p.at("val") || p.at("var")
+        val mutable = p.at("var")
+        p.toks.advance()
+        val binding = parse_binding(p, start, mutable)
+        if overrides then p.report.add(error(start, "only a method can be marked `override`"))
+        binding.kind match
+            Binding(name, declared, value, _) -> return FieldMember(FieldDecl(binding.span, name, declared, value, mutable, !hidden))
+            _ ->
+                p.report.add(error(binding.span, "a field declaration names one field"))
+                return StatementMember(Expr(binding.span, Invalid))
+    if hidden || overrides || local_function_ahead(p) then return MethodMember(parse_function(p, buf()), !hidden, overrides)
+    StatementMember(line_statement(p))
 
 // `import a.b.c`, `import a.b.c as d`, `import a.b.{c, d as e}`
 private parse_import(p: *Parser, at: Span, imports: Buf[Import])
