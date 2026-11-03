@@ -36,6 +36,11 @@ struct FunctionSymbol
     delayed: bool
     /** Whether the function is used as a value somewhere, so a closure of it is made. */
     value: bool
+    /** For each parameter with a default, the function that computes it: it takes the parameters
+     * before that one and yields the default, evaluated in this function's declaration scope. */
+    defaults: Buf[Option[usize]]
+    /** For a function that computes a default, the parameter it is the default of. */
+    default_param: Option[string]
 
 /** A `data` type and its variants. Field types name the type's own parameters as
  * `TypeVar(data_owner(id), i)`, so a field of a particular value's type is its declared type with the
@@ -223,6 +228,7 @@ private declare_unit(c: *Checker, unit: usize)
                 c.bodies.push(None)
                 c.locals.push(buf())
                 c.scope.put(f.name, id)
+                declare_defaults(c, id)
             DataItem(_) -> ()
 
 private declare_types(c: *Checker, unit: usize)
@@ -301,8 +307,7 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function) -
             _ ->
                 c.note(unit, p.pattern.span, "parameter patterns are not implemented")
                 names.push("_")
-        if p.variadic || p.default is Some(_)
-            c.note(unit, p.span, "repeated and default parameters are not implemented")
+        if p.variadic then c.note(unit, p.span, "repeated parameters are not implemented")
         if p.by_name && f.clauses.len() > 0
             c.note(unit, p.pattern.span, s"`${f.name}` is defined by clauses, which match its arguments, so its parameters cannot be by-name")
         val ty = resolve_type(c, unit, p.ty)
@@ -323,7 +328,42 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function) -
     elif f.body is None && f.clauses.len() == 0
         c.note(unit, f.name_span, s"`${f.name}` needs a body, or clauses on the lines after it")
     c.generic = outer_generic
-    FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf(), false, false, false)
+    FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf(), false, false, false, buf(), None)
+
+// Each default argument becomes a function of its own, declared beside the function whose parameter
+// it belongs to: it takes the parameters before that one, so the default may use them, and yields
+// the default. It is checked in the declaring function's scope, never the caller's, and a call that
+// omits the argument calls it. A generic function's defaults are generic over the same parameters.
+// The default of a by-name parameter is its delayed expression: the function yields it unevaluated.
+private declare_defaults(c: *Checker, id: usize)
+    val f = c.symbols[id]
+    var defaults: Buf[Option[usize]] = buf()
+    for i in 0..<f.decl.params.len()
+        val p = f.decl.params[i]
+        if p.default is None || p.variadic
+            defaults.push(None)
+            continue
+        val value = p.default.unwrap()
+        val did = c.symbols.len()
+        var own: Buf[&Type] = buf()
+        for k in 0..<f.decl.type_params.len()
+            own.push(TypeVar(did, k, f.decl.type_params[k].name))
+        var params: Buf[&Type] = buf()
+        var names: Buf[string] = buf()
+        var decls: Buf[Param] = buf()
+        for k in 0..<i
+            params.push(substitute(f.params[k], id, own))
+            names.push(f.param_names[k])
+            decls.push(f.decl.params[k])
+        val result = substitute(f.params[i], id, own)
+        val name = s"${f.name}/${f.param_names[i]}"
+        val decl = Function(buf(), value.span, p.span, name, f.decl.type_params, decls, None, Some(value), buf())
+        c.symbols.push(FunctionSymbol(f.unit, f.module_name, name, decl, params, names, Some(result), None, f.root, buf(), buf(), buf(), false, false, false, buf(), Some(f.param_names[i])))
+        c.states.push(0)
+        c.bodies.push(None)
+        c.locals.push(buf())
+        defaults.push(Some(did))
+    c.symbols[id].defaults = defaults
 
 // `@intrinsic("name")` is the only annotation this compiler gives meaning to; it is valid only on a
 // function without a body.
@@ -477,6 +517,13 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
 // Checks a function's body against its declared result, or infers the result from it.
 private check_body(c: *Checker, id: usize, body: &Expr)
     val symbol = c.symbols[id]
+    // The default of a by-name parameter is checked as an argument to it is: a delayed expression.
+    if symbol.default_param is Some(_) && symbol.result is Some(r)
+        if *r is ByName(inner)
+            val expected: &Type = Function(buf(), inner)
+            val delayed = lambda_expr(c, body, buf(), body, Some(expected), true)
+            c.bodies.set(id, Some(TExpr(body.span, r, delayed.kind)))
+            return
     val typed = check_expr(c, body, symbol.result)
     symbol.result match
         Some(declared) ->
@@ -554,6 +601,7 @@ private declare_local_functions(c: *Checker, items: Buf[&Expr])
             c.bodies.push(None)
             c.locals.push(buf())
             c.body.functions.push(id)
+            declare_defaults(c, id)
 
 private lookup_function(c: *Checker, name: string) -> Option[usize]
     var i = c.body.functions.len()
@@ -576,8 +624,16 @@ private check_local_function(c: *Checker, decl: &Function) -> usize
             id = c.body.functions[i]
             found = true
     if !found || c.states[id] != 0 then return id
+    check_local_symbol(c, id)
+    // Its defaults are checked where it is declared too, seeing what it sees.
+    for d in c.symbols[id].defaults
+        if d is Some(default) then check_local_symbol(c, default)
+    id
+
+private check_local_symbol(c: *Checker, id: usize)
     c.states.set(id, 1)
     val symbol = c.symbols[id]
+    val decl = symbol.decl
     val previous = c.current
     val loops = c.body.loops
     val outer_start = c.body.block_start
@@ -598,12 +654,15 @@ private check_local_function(c: *Checker, decl: &Function) -> usize
     c.body.loops = loops
     c.current = previous
     c.states.set(id, 2)
-    id
 
 private unit_of(c: *Checker) -> usize = c.symbols[c.current].unit
 
 /** A function as diagnostics name it. */
-private described(symbol: FunctionSymbol) -> string = if symbol.delayed then "this delayed argument" elif symbol.lambda then "this lambda" else s"`${symbol.name}`"
+private described(symbol: FunctionSymbol) -> string
+    if symbol.delayed then return "this delayed argument"
+    if symbol.lambda then return "this lambda"
+    if symbol.default_param is Some(p) then return s"the default of `$p`"
+    s"`${symbol.name}`"
 
 /** Checks an expression whose value is used. */
 check_expr(c: *Checker, e: &Expr, expected: Option[&Type]) -> &TExpr = check_value(c, e, expected, true)
@@ -1281,8 +1340,9 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
     val target = c.symbols[id]
     local_use(c, id, at)
     val declared = result_of(c, id, at)
-    val applied = apply(c, at, named.span, name, true, target.decl.type_params, id, target.params, declared, args, explicit, expected)
-    TExpr(at, applied.result, Call(id, applied.args, applied.type_args))
+    val signature = Signature(name, true, target.decl.type_params, id, target.params, target.param_names, target.defaults, declared)
+    val applied = apply(c, at, named.span, signature, args, explicit, expected)
+    applied.wrap(at, Call(id, applied.args, applied.type_args))
 
 /** A value made by a variant: a call of the variant with its fields, or the variant's bare name
  * when it has none. */
@@ -1290,20 +1350,136 @@ private construct(c: *Checker, at: Span, name_span: Span, v: VariantRef, args: B
     val d = c.data[v.data]
     val variant = d.variants[v.index]
     val called = variant.fields.len() > 0
-    val applied = apply(c, at, name_span, variant.name, called, d.decl.type_params, data_owner(v.data), variant.fields, own_type(d, v.data), args, explicit, expected)
-    TExpr(at, applied.result, Construct(v.index, applied.args))
+    var defaults: Buf[Option[usize]] = buf()
+    for _ in variant.fields
+        defaults.push(None)
+    val signature = Signature(variant.name, called, d.decl.type_params, data_owner(v.data), variant.fields, variant.field_names, defaults, own_type(d, v.data))
+    val applied = apply(c, at, name_span, signature, args, explicit, expected)
+    applied.wrap(at, Construct(v.index, applied.args))
 
-/** A call's checked arguments, its solved type arguments, and its result type. */
+/** What a call is checked against: a function's or a variant's parameters and result, written in
+ * terms of the type parameters `type_params` that belong to `owner`. `called` is false for a variant
+ * with no fields, which is written without parentheses. `defaults` names, for each parameter with a
+ * default, the function that computes it. */
+private struct Signature
+    name: string
+    called: bool
+    type_params: Buf[TypeParam]
+    owner: usize
+    params: Buf[&Type]
+    names: Buf[string]
+    defaults: Buf[Option[usize]]
+    result: &Type
+
+/** A call's arguments, one per parameter in parameter order, its solved type arguments, and its
+ * result type. `prelude` evaluates what the call needs first: the written arguments in the order
+ * written, then the omitted ones' defaults; when an argument never finishes, the prelude ends with it
+ * and there is no call. */
 private struct Applied
     args: Buf[&TExpr]
     type_args: Buf[&Type]
     result: &Type
+    prelude: Buf[&TExpr]
+    cut: bool
 
-// Checks a call of something with parameters `params` and result `result`, both written in terms of
-// the type parameters `type_params` that belong to `owner`. `called` is false for a variant with no
-// fields, which is written without parentheses.
-private apply(c: *Checker, at: Span, name_span: Span, name: string, called: bool, type_params: Buf[TypeParam], owner: usize, params: Buf[&Type], result: &Type, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> Applied
+    /** The call made by `kind`, after the prelude. */
+    wrap(self, at: Span, kind: TExprKind) -> &TExpr
+        if self.cut then return TExpr(at, Nothing, Block(self.prelude))
+        val call = TExpr(at, self.result, kind)
+        if self.prelude.len() == 0 then return call
+        var items: Buf[&TExpr] = buf()
+        for p in self.prelude
+            items.push(p)
+        items.push(call)
+        TExpr(at, self.result, Block(items))
+end Applied
+
+/** Which written argument each parameter takes. `slots` has one entry per parameter: the index of
+ * its argument, or `None` when it is left to its default. `targets` has one per written argument:
+ * the parameter it is given to, or `None` when it fits none. `fits` is false when the call cannot be
+ * made, already reported. */
+private struct Binding
+    slots: Buf[Option[usize]]
+    targets: Buf[Option[usize]]
+    fits: bool
+
+// Matches a call's arguments to a signature's parameters: positional arguments first, in order, then
+// named ones, each naming a parameter not already given; a parameter given nothing must have a
+// default. This is the step that decides whether a call fits a signature.
+private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument]) -> Binding
     val unit = unit_of(c)
+    val noun = if s.owner >= data_owner(0) then "field" else "parameter"
+    var slots: Buf[Option[usize]] = buf()
+    for _ in s.params
+        slots.push(None)
+    var targets: Buf[Option[usize]] = buf()
+    var fits = true
+    var named = false
+    var positional = 0usize
+    for j in 0..<args.len()
+        val a = args[j]
+        a.name match
+            None ->
+                if named
+                    c.note(unit, a.span, "a positional argument cannot follow a named one")
+                    fits = false
+                    targets.push(None)
+                    continue
+                positional += 1
+                if j < s.params.len()
+                    slots.set(j, Some(j))
+                    targets.push(Some(j))
+                else targets.push(None)
+            Some(n) ->
+                named = true
+                var k: Option[usize] = None
+                for i in 0..<s.names.len()
+                    if s.names[i] == n && n != "_" then k = Some(i)
+                k match
+                    None ->
+                        c.note(unit, a.span, s"`${s.name}` has no $noun `$n`")
+                        fits = false
+                        targets.push(None)
+                    Some(i) ->
+                        if slots[i] is Some(_)
+                            c.note(unit, a.span, s"`$n` is given more than once")
+                            fits = false
+                            targets.push(None)
+                        else
+                            slots.set(i, Some(j))
+                            targets.push(Some(i))
+    var has_defaults = false
+    for d in s.defaults
+        if d is Some(_) then has_defaults = true
+    if positional > s.params.len()
+        c.note(unit, at, s"`${s.name}` takes ${count(s.params.len(), "argument")}, not $positional")
+        return Binding(slots, targets, false)
+    // A call already reported for a misplaced or misnamed argument is not also reported for the
+    // parameter that argument was probably meant for.
+    if !fits then return Binding(slots, targets, false)
+    var missing: Buf[string] = buf()
+    for i in 0..<s.params.len()
+        if slots[i] is None && s.defaults[i] is None then missing.push(s.names[i])
+    if missing.len() > 0
+        fits = false
+        if !named && !has_defaults
+            c.note(unit, at, s"`${s.name}` takes ${count(s.params.len(), "argument")}, not ${args.len()}")
+        else
+            for m in missing
+                c.note(unit, at, s"`${s.name}` needs an argument for `$m`, which has no default")
+    Binding(slots, targets, fits)
+
+// Checks a call against a signature: binds its arguments to the parameters, solves the type
+// arguments, and checks each argument against its parameter's type.
+private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> Applied
+    val unit = unit_of(c)
+    val name = s.name
+    val called = s.called
+    val type_params = s.type_params
+    val owner = s.owner
+    val params = s.params
+    val result = s.result
+    val binding = bind_arguments(c, at, s, args)
     val first = c.vars.len()
     var type_args: Buf[&Type] = buf()
     for _ in type_params
@@ -1318,9 +1494,10 @@ private apply(c: *Checker, at: Span, name_span: Span, name: string, called: bool
     val wanted = substitute_all(params, owner, type_args)
     val declared = substitute(result, owner, type_args)
     if expected is Some(want) then unify(c, declared, want)
-    val typed = check_arguments(c, args, wanted)
-    if args.len() != params.len()
-        c.note(unit, at, s"`$name` takes ${count(params.len(), "argument")}, not ${args.len()}")
+    var targets: Buf[Option[&Type]] = buf()
+    for t in binding.targets
+        targets.push(if t is Some(i) then Some(wanted[i]) else None)
+    val typed = check_arguments(c, args, targets)
     var solved: Buf[&Type] = buf()
     for i in 0..<type_args.len()
         val t = zonk(c, type_args[i])
@@ -1338,13 +1515,47 @@ private apply(c: *Checker, at: Span, name_span: Span, name: string, called: bool
     var ty = zonk(c, declared)
     for t in typed
         if *t.ty is Nothing then ty = Nothing
-    Applied(typed, solved, ty)
+    // Arguments written in parameter order with none omitted are passed as they are; otherwise each
+    // written argument is held in a local, in the order written, and the omitted ones' defaults are
+    // computed after them, in parameter order, each from the parameters before it.
+    var direct = binding.fits
+    for i in 0..<binding.slots.len()
+        binding.slots[i] match
+            Some(j) -> if j != i then direct = false
+            None -> direct = false
+    if direct || !binding.fits then return Applied(typed, solved, ty, buf(), false)
+    var prelude: Buf[&TExpr] = buf()
+    var held: Buf[Option[&TExpr]] = buf()
+    for _ in params
+        held.push(None)
+    for j in 0..<typed.len()
+        val t = typed[j]
+        prelude.push(t)
+        if *t.ty is Nothing then return Applied(buf(), solved, Nothing, prelude, true)
+        val local = hidden_local(c, t.ty)
+        prelude.set(prelude.len() - 1, TExpr(t.span, Unit, Let(local, t)))
+        held.set(binding.targets[j].unwrap(), Some(TExpr(t.span, t.ty, Local(local))))
+    var passed: Buf[&TExpr] = buf()
+    for i in 0..<params.len()
+        held[i] match
+            Some(value) -> passed.push(value)
+            None ->
+                val default = s.defaults[i].unwrap()
+                local_use(c, default, at)
+                var before: Buf[&TExpr] = buf()
+                for k in 0..<i
+                    before.push(passed[k])
+                val wanted_ty = zonk(c, wanted[i])
+                val local = hidden_local(c, wanted_ty)
+                prelude.push(TExpr(at, Unit, Let(local, TExpr(at, wanted_ty, Call(default, before, solved)))))
+                passed.push(TExpr(at, wanted_ty, Local(local)))
+    Applied(passed, solved, ty, prelude, false)
 
-// Checks a call's arguments against its parameter types, in an order that lets each argument use
+// Checks a call's arguments against their parameters' types, in an order that lets each argument use
 // what the others decide: first the arguments that are neither bare literals nor lambdas, then the
 // literals, which take the types the others settle, and last the lambdas, whose parameter types
-// come from all of them.
-private check_arguments(c: *Checker, args: Buf[Argument], wanted: Buf[&Type]) -> Buf[&TExpr]
+// come from all of them. `wanted` has an entry per argument, `None` for one that fits no parameter.
+private check_arguments(c: *Checker, args: Buf[Argument], wanted: Buf[Option[&Type]]) -> Buf[&TExpr]
     var early: Buf[Option[&TExpr]] = buf()
     for _ in args
         early.push(None)
@@ -1353,7 +1564,7 @@ private check_arguments(c: *Checker, args: Buf[Argument], wanted: Buf[&Type]) ->
             val value = args[i].value
             val rank = if value.kind is Lambda(_, _) then 2 elif is_literal(value) then 1 else 0
             if rank != pass then continue
-            early.set(i, Some(call_argument(c, args[i], if i < wanted.len() then Some(wanted[i]) else None)))
+            early.set(i, Some(call_argument(c, args[i], if i < wanted.len() then wanted[i] else None)))
     var typed: Buf[&TExpr] = buf()
     for t in early
         typed.push(t.unwrap())
@@ -1410,9 +1621,16 @@ private value_call(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument]) ->
     val unit = unit_of(c)
     val f = check_expr(c, callee, None)
     val ty = zonk(c, f.ty)
+    // Only a declaration's parameters have names and defaults; a function value is called with its
+    // arguments by position.
+    for a in args
+        if a.name is Some(n) then c.note(unit, a.span, s"a function value takes its arguments by position, so `$n` cannot be named")
     *ty match
         Function(params, result) ->
-            val typed = check_arguments(c, args, params)
+            var wanted: Buf[Option[&Type]] = buf()
+            for p in params
+                wanted.push(Some(p))
+            val typed = check_arguments(c, args, wanted)
             if args.len() != params.len()
                 c.note(unit, at, s"this function takes ${count(params.len(), "argument")}, not ${args.len()}")
             var r = zonk(c, result)
@@ -1467,7 +1685,7 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     val enclosing = c.symbols[c.current]
     val decl = Function(buf(), e.span, e.span, "lambda", buf(), buf(), None, Some(body), buf())
     val id = c.symbols.len()
-    c.symbols.push(FunctionSymbol(enclosing.unit, enclosing.module_name, "lambda", decl, types, names, result, None, Some(c.body.root), buf(), buf(), buf(), true, delayed, true))
+    c.symbols.push(FunctionSymbol(enclosing.unit, enclosing.module_name, "lambda", decl, types, names, result, None, Some(c.body.root), buf(), buf(), buf(), true, delayed, true, buf(), None))
     c.states.push(1)
     c.bodies.push(None)
     c.locals.push(buf())
@@ -1502,7 +1720,6 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
 // type decides them.
 private call_argument(c: *Checker, arg: Argument, param: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
-    if arg.name is Some(_) then c.note(unit, arg.span, "named arguments are not implemented")
     var wanted: Option[&Type] = None
     if param is Some(p)
         val known = zonk(c, p)

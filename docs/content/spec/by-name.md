@@ -26,6 +26,21 @@ Passing a by-name parameter on to another by-name parameter forwards the delayed
 evaluating it. `f: -> (int) -> int` delays the production of a function, and `f(1)` first evaluates
 the delayed expression, then calls the result.
 
+## Defaults
+
+A by-name parameter may have a [default](/spec/declarations/#default-and-named-arguments), which is
+a delayed expression like any argument to it: a call that omits the argument passes the default
+unevaluated, each read of the parameter evaluates it again, and a parameter that is never read never
+evaluates it. A default that reads an earlier by-name parameter evaluates that parameter's argument
+at each of its own evaluations.
+
+```text
+orElse(value: int, fallback: -> int = expensive()) = if value >= 0 then value else fallback
+```
+
+A named argument to a by-name parameter is delayed too, though the arguments written around it are
+evaluated at the call.
+
 ## Restrictions
 
 `data` fields cannot be by-name, and neither can repeated (`T*`) parameters, nor the parameters
