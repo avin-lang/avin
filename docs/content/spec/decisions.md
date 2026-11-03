@@ -187,6 +187,10 @@ a decision changes, this page and the chapter change together.
 - The collector is Sysl's `sh.sysl.gc`, shared with Slate. Its API may change if Slate changes with
   it.
 - The compiler's untyped AST, typed HIR, lowered IR and LLVM output are kept as distinct stages.
+- A class and its companion object use each other's private members, in both directions.
+- An initializer's dependencies count every lambda it makes as if it were called, and every function
+  it calls in full, whatever branch is taken, so a cycle that no run could follow is still rejected.
+- The singleton declaration keeps the keyword `object`.
 
 **Deferred**
 
@@ -205,10 +209,6 @@ a decision changes, this page and the chapter change together.
 - A tuple's type at run time is the type it was made with: `(animal, 1)` with `animal: Animal` is an
   `(Animal, int)` whatever its class, and a type pattern `(Dog, int)` does not match it. A tuple made
   as `(Dog, int)` matches `(Animal, int)` too.
-- A class and its companion object use each other's private members, in both directions; the
-  specification promised only the companion's access to the class's.
-- An initializer's dependencies count every lambda it makes as if it were called, and every function
-  it calls in full, whatever branch is taken, so a cycle that no run could follow is still rejected.
 
 ## Open
 
