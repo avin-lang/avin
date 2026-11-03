@@ -39,6 +39,8 @@ a decision changes, this page and the chapter change together.
 - Inheritance is written with `:`: `class C(…): Base(…), Trait`, one superclass with its
   constructor arguments and then traits, as in `trait A: B`.
 - The receiver is implicit: members are in scope by their bare names, and `self` names the instance.
+- Any method taking one argument can be called infix, `a max b` for `a.max(b)`, at the caller's
+  choice: there is no annotation that permits or forbids it. There is no postfix form.
 - A subclass's constructor evaluates the superclass's arguments, runs the superclass's body on the
   object, then stores its own parameters and runs its own body. The superclass's arguments cannot
   call a method or use `self`; a parameter's name in them reads the argument.
@@ -230,6 +232,10 @@ a decision changes, this page and the chapter change together.
 - Partial-function literal syntax, which the user has explicitly left undecided.
 
 ## Proposed
+
+- An infix method call binds more loosely than arithmetic, bitwise, shift, cons and range operators
+  and more tightly than comparisons, `is`, `&&` and `||`, and groups to the left, so
+  `xs contains x && ok` is `(xs contains x) && ok`.
 
 - A literal pattern does not match an `Any` (`5 -> …` on an `Any` is an error); `n: int if n == 5`
   says it.
