@@ -321,6 +321,13 @@ a decision changes, this page and the chapter change together.
   runtime's source.
 - A binding is a top-level function. Across the boundary a `bool` is a byte and a `char` its code
   point; `string` is copied each way.
+- `Option[+T]` and `Result[+T, +E]` are `data` types of the core library, written in Avin, with
+  their methods in an `impl`. Those methods are not variance positions, so `getOrElse(default: -> T)`
+  takes `T` in a parameter and needs no lower bound: on an `Option[Dog]` seen as an `Option[Animal]`,
+  the default is an `Animal`. See [errors](/spec/errors/#option-and-result).
+- `?` returns from the function or lambda it is written in, so that one's result type must be
+  declared or, for a lambda, known where it is written. It cannot leave a delayed argument or a class
+  body.
 
 **Deferred**
 

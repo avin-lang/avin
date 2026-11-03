@@ -36,6 +36,42 @@ loadConfig(path: string) -> Result[Config, ConfigError]
 An `Option` `?` cannot exit a function returning `Result`, and the enclosing function's result type
 must be able to carry the failure.
 
+`?` returns from the function it is written in; inside a lambda, from the lambda. That function's
+result type must be declared, or for a lambda known where it is written, as in
+`val f: (string) -> Option[int] = s -> Some(parse(s)? + 1)`. A delayed argument and a class body
+cannot be left by `?`, as they cannot by `return`.
+
+## Option and Result
+
+Both are `data` types of the core library, written in Avin:
+
+```text
+data Option[+T]
+    Some(value: T)
+    None
+
+data Result[+T, +E]
+    Ok(value: T)
+    Err(error: E)
+```
+
+Their methods:
+
+| `Option[T]` | `Result[T, E]` |
+|---|---|
+| `isSome()`, `isNone()` | `isOk()`, `isErr()` |
+| `getOrElse(default: -> T) -> T` | `getOrElse(default: -> T) -> T` |
+| `orElse(other: -> Option[T]) -> Option[T]` | `ok() -> Option[T]`, `err() -> Option[E]` |
+| `map[U](f: (T) -> U) -> Option[U]` | `map[U](f: (T) -> U) -> Result[U, E]` |
+| `flatMap[U](f: (T) -> Option[U]) -> Option[U]` | `mapErr[F](f: (E) -> F) -> Result[T, F]` |
+| `filter(p: (T) -> bool) -> Option[T]` | `flatMap[U](f: (T) -> Result[U, E]) -> Result[U, E]` |
+| `fold[U](ifNone: -> U, f: (T) -> U) -> U` | `fold[U](onErr: (E) -> U, onOk: (T) -> U) -> U` |
+| `foreach(f: (T) -> unit)` | `foreach(f: (T) -> unit)` |
+
+A default or an alternative is passed by name, so it is evaluated only when it is used. The methods
+an `impl` adds are not [variance](/spec/generics/#variance) positions, so `T` may appear in a
+parameter: on an `Option[Dog]` seen as an `Option[Animal]`, `getOrElse` takes an `Animal`.
+
 ## Not in Avin
 
 `throw`, `try`/`catch`/`finally`, `Try`, checked or unchecked exceptions, and `null`. Releasing a
