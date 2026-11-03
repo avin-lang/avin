@@ -79,6 +79,28 @@ conforms to traits through `impl` (`Eq`, `Hash`, `Ord`, `Display`). A type patte
   (`s"${x}"`) or `x.toString()`, both of which use `Display`.
 - Ordering is by code point, which for UTF-8 is byte order.
 
+The library's methods on `string`. Offsets and lengths count bytes and are `int`; a string holds at
+most the largest `int` bytes.
+
+| Method | Result |
+| --- | --- |
+| `byteLength()` | The number of bytes, O(1) |
+| `charCount()` | The number of characters, O(n) |
+| `isEmpty()`, `nonEmpty()` | Whether it has no bytes, or some |
+| `startsWith(p)`, `endsWith(p)`, `contains(p)` | Whether `p` occurs at the start, the end, anywhere; the empty string occurs in every string |
+| `slice(from, until)` | The bytes from `from` up to `until`; traps unless `0 <= from <= until <= byteLength()` and both offsets are character boundaries |
+| `toUpper()`, `toLower()` | Each character's simple case mapping, one character for one: `"straße".toUpper()` is `STRAßE` |
+| `trim()`, `trimStart()`, `trimEnd()` | Without the Unicode `White_Space` characters at both ends, the start, the end |
+| `repeat(n)` | `n` copies joined; empty for zero; traps when `n` is negative |
+| `replace(old, new)` | Every occurrence of `old`, left to right and not overlapping, replaced by `new`; an empty `old` occurs nowhere |
+
+```text
+val word = "café"
+print(s"${word.byteLength()} ${word.charCount()}")   // 5 4
+print(word.slice(3, 5))                               // é
+print(word.slice(0, 4))                               // traps: offset 4 is inside `é`
+```
+
 ## unit
 
 `unit` has the single value `()`. It is an ordinary type: it can be a type argument, a field, a

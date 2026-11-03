@@ -2,6 +2,7 @@ module avin.rt
 
 import sysl.buf.{Buf, buf}
 import sysl.raw.ptr_cast
+import sysl.slices.copy
 
 // Avin's strings. A string is a reference to an object holding its length in bytes and then its
 // UTF-8 bytes; its descriptor is in the header the collector keeps before it. A literal is a constant object the compiler emits; a string the program
@@ -24,10 +25,18 @@ text_length(p: *u8) -> usize
 /** The first byte of the string at `p`. */
 text_bytes(p: *u8) -> *u8 = ptr_cast(usize(p) + sizeof(Text))
 
+/** The most bytes a string holds: the largest `int`, so every byte offset into one is an `int`. */
+const max_text_length: usize = 2147483647
+
 /** A new string of `length` bytes, all zero, for the caller to fill before anything else sees it.
- * The shims of Sysl bindings make the strings they return through it. */
+ * The shims of Sysl bindings make the strings they return through it. A string longer than
+ * `max_text_length` stops the program, as running out of memory does. */
 @export("avin_rt_new_text")
 new_text(ctx: *Context, length: usize) -> *u8
+    if length > max_text_length
+        flush()
+        eprints("avin: out of memory: a string of " + length.to_string() + " bytes is longer than the most a string holds, " + max_text_length.to_string() + "\n")
+        trap()
     val p = allocate_sized(ctx, &text_descriptor, sizeof(Text) + length)
     val t: *Text = ptr_cast(p)
     t.length = length
@@ -65,11 +74,63 @@ compare(ctx: *Context, a: *u8, b: *u8) -> int
         if x[i] != y[i] then return if x[i] < y[i] then -1 else 1
     if m < n then -1 elif m > n then 1 else 0
 
+/** Whether byte offset `i` of the string at `p` starts a character or ends the string: it is not
+ * inside a character's encoding. */
+private at_boundary(p: *u8, i: usize) -> bool = i == text_length(p) || (text_bytes(p)[i] & 192) != 128
+
+/** The bytes of `s` from offset `from` up to `until`, which the caller has checked lie in order
+ * within it; null when either offset falls inside a character. The whole string is `s` itself. */
+@export("avin_rt_string_slice")
+slice(ctx: *Context, s: *u8, from: int, until: int) -> *u8
+    val lo = usize(from)
+    val hi = usize(until)
+    if !at_boundary(s, lo) || !at_boundary(s, hi) then return null
+    if lo == 0 && hi == text_length(s) then return s
+    // Allocating may collect; `s` stays alive because the caller holds it as a root.
+    val p = new_text(ctx, hi - lo)
+    val to = text_bytes(p)
+    val x = text_bytes(s)
+    for i in lo..<hi do to[i - lo] = x[i]
+    p
+
+/** The byte offset of the first place at or after `from` where `needle` occurs in `s`, or -1. An
+ * empty needle occurs at `from` itself; a `from` past the end finds nothing. */
+@export("avin_rt_string_find")
+find(ctx: *Context, s: *u8, needle: *u8, from: int) -> int
+    val m = text_length(s)
+    val n = text_length(needle)
+    val start = if from < 0 then 0usize else usize(from)
+    if start > m || n > m - start then return -1
+    val x = text_bytes(s)
+    val y = text_bytes(needle)
+    if n == 0 then return int(start)
+    val first = y[0]
+    for i in start..<(m - n + 1)
+        if x[i] != first then continue
+        var j = 1usize
+        while j < n && x[i + j] == y[j]
+            j += 1
+        if j == n then return int(i)
+    -1
+
+/** `s` written `count` times over; `count` is not negative. Once is `s` itself. */
+@export("avin_rt_string_repeat")
+repeat(ctx: *Context, s: *u8, count: int) -> *u8
+    if count == 1 then return s
+    val m = text_length(s)
+    val k = usize(count)
+    val p = new_text(ctx, m * k)
+    val to = text_bytes(p)
+    val x = text_bytes(s)
+    for r in 0..<k
+        for i in 0..<m do to[r * m + i] = x[i]
+    p
+
 /** A new string holding the bytes of `s`. */
 text_of(ctx: *Context, s: string) -> *u8
     val p = new_text(ctx, s.bytes.len)
     val to = text_bytes(p)
-    for i in 0..<s.bytes.len do to[i] = s.bytes[i]
+    copy(to[0..<s.bytes.len], s.bytes)
     p
 
 // Rendering a value as text, for interpolation. Each renders as Sysl's `to_string` does.
