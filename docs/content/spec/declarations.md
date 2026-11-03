@@ -73,7 +73,9 @@ Defaults belong to the method that introduces a parameter. An `override`, and a 
 implements a trait's method, takes that method's defaults and cannot declare its own, so a call
 omits the same arguments and gets the same values whichever class's method then runs. A trait's
 method declares its defaults in the trait, and they apply through the trait's type and on every
-type implementing it. A method of one required parameter whose others have defaults can be
+type implementing it. A method a type inherits, from its superclass or as a trait's default body,
+keeps its own defaults, so where it also implements another trait's method, that method must
+declare no defaults or the very same ones; otherwise the type is an error. A method of one required parameter whose others have defaults can be
 [called infix](/spec/operators-and-control-flow/#infix-method-calls).
 
 Functions and methods may be **overloaded**: several functions in one scope may share a name when
@@ -528,6 +530,48 @@ Declarations are public unless marked `private` (visible in the module). A direc
 `module a.b` heads each file. A **package** is a build unit with an `avin.hocon` manifest; a
 **project** lists packages. `import a.b.{X, y as z}` brings names into a file. The root module `avin`
 is reserved for the standard library.
+
+```text
+// shapes/circle.avin
+module shapes
+
+import geometry.Point
+
+class Circle(val r: int)
+    center() -> Point = Point(r, 0)
+
+area(c: Circle) -> int = scale() * c.r * c.r
+
+private scale() -> int = 3          // seen by every file of `shapes`, and nowhere else
+
+// main.avin, in the program's root directory
+import shapes.{Circle, area as circleArea}
+
+main() = print(s"${circleArea(Circle(2))}")
+```
+
+- **A program is a directory tree.** Each directory under the program's root is a module named by
+  its path from the root, `geometry/shapes` being `geometry.shapes`, so a directory is named as a
+  declaration is: letters, digits and `_`. Every file of a module begins with `module` and the
+  module's name, which must agree with its directory. The root directory's own files are the **root
+  module**, which has no name, holds `main` and takes no header. A program of a single file is
+  compiled alone; its header, if any, names its module.
+- **A module's files are one namespace.** Each sees every declaration of every other file of its
+  module by its bare name, private ones included, and they may not declare one name twice, except
+  as overloads of a function. A class's companion object may be in another file of the class's
+  module, never in another module.
+- **Another module's declarations are imported, per file.** `import a.b.X` brings `X` into the file;
+  `import a.b.{X, y as z}` brings several, and `as` names one differently. There is no wildcard
+  import. Importing a name the module does not declare, a private declaration, a name the file's own
+  module declares or one another import already brings in is an error; an import the file does not
+  use is not.
+- **What a name means** is decided in that order: the file's module, then its imports, then the
+  public declarations of the standard library's module `avin`, which every file sees without an
+  import. The nearer hides the farther, whatever kind each declaration is. A program's own modules
+  may not be `avin` or under it.
+- **Modules may import one another**, in a cycle if need be: the program is compiled whole. Its
+  module-level values initialize before `main`, each after the values its initializer needs, across
+  modules as within one.
 
 ## Initialization
 

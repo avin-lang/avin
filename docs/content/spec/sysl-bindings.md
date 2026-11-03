@@ -1,7 +1,7 @@
 ---
 title: Sysl bindings
 summary: Avin calls Sysl through bindings written in Avin; the compiler generates the Sysl side and lets Sysl check it.
-weight: 18
+weight: 19
 ---
 
 Avin's standard library is written in Avin. Where Sysl already provides something — files, processes,
@@ -18,8 +18,25 @@ readText(path: string) -> Result[string, IoError] =
     readTextRaw(path).mapErr(IoError.fromSysl)
 ```
 
-A binding is a function declaration with no body. Bindings are usually private, with a public
-function giving the Avin-shaped API: camelCase names, Avin error types, Avin collections.
+A binding is a top-level function declaration with no body. `@sysl` takes one string: the Sysl
+function's module path and name. Bindings are usually private, with a public function giving the
+Avin-shaped API: camelCase names, Avin error types, Avin collections. A binding is otherwise an
+ordinary function: it is called, overloaded, given defaults and passed as a value like any other.
+
+```text
+@sysl("sysl.text.to_upper")
+upper(s: string) -> string
+
+@sysl("sysl.prints")
+write(s: string)
+```
+
+A binding whose types do not fit the Sysl function is rejected with Sysl's own message, at the
+binding:
+
+```text
+error: the Sysl binding `upper` does not match `sysl.text.to_upper`: 's' of 'sysl.text.to_upper' is string, but long was given
+```
 
 ## How a binding is compiled
 
@@ -32,7 +49,8 @@ function giving the Avin-shaped API: camelCase names, Avin error types, Avin col
    diagnostic that the Avin compiler maps back to the binding. Avin never guesses a mangled name or a
    Sysl memory layout.
 4. The shim library is cached by a hash of its source and the Sysl version, and rebuilt only when a
-   binding changes.
+   binding changes. It is built together with the runtime, so the program holds one copy of Sysl's
+   library, and what Sysl and Avin each write to standard output stays in order.
 
 The Avin compiler does not need Sysl's compiler as a library. It needs only the `sysl` command at
 build time; the produced executable does not.
@@ -43,7 +61,7 @@ Data crosses the boundary in a fixed set of shapes:
 
 | Avin type | Crossing |
 | --- | --- |
-| `iN`, `real`, `char`, `bool`, `unit` | By value |
+| `i8`, `i16`, `int`, `long`, `byte`, `real`, `char`, `bool`, `unit` | By value; Sysl's `u8` is `byte` |
 | `string` | Copied into a Sysl `string` in each direction |
 | `Array[byte]` | Copied |
 | `Option[T]`, `Result[T, E]` of boundary types | Converted variant by variant by the generated shim |

@@ -128,6 +128,10 @@ private struct Lowering
     /** The descriptors whose method tables hold a method with type parameters of its own, each with
      * the type it describes, so a slot found later is filled in them too. */
     generic_holders: Buf[GenericHolder]
+    /** The type each record describes, by the record's index. */
+    record_types: Buf[&Type]
+    /** The records a type pattern tests against, each once. */
+    tested: Buf[usize]
 
 /** One slot for a method with type parameters of its own, at one list of its own type arguments: a
  * call through a method table to `name` at checker position `position` with `type_args` reaches it.
@@ -154,10 +158,11 @@ lower_program(program: TProgram) -> MirProgram
         if k.table.len() > generic_base then generic_base = k.table.len()
     for d in program.data
         if d.table.len() > generic_base then generic_base = d.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf())
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf())
     // Record 0 is for the objects no type pattern names: closures, and the boxes of captured
     // variables.
     l.records.push(TypeRecord("a closure or a captured variable", buf()))
+    l.record_types.push(Unit)
     for i in 0..<program.symbols.len()
         if !is_generic(program, i) && !never_compiled(program, i) then instance(&l, i, buf())
     val entry = instance(&l, program.entry, buf())
@@ -169,6 +174,7 @@ lower_program(program: TProgram) -> MirProgram
     while k < l.instances.len()
         functions.push(lower_function(&l, k))
         k += 1
+    add_variant_ancestors(&l)
     var bindings: Buf[MirBinding] = buf()
     for inst in l.instances
         val symbol = program.symbols[inst.function]
@@ -466,6 +472,7 @@ private record_of(l: *Lowering, t: &Type) -> usize
     if l.record_index.get(key) is Some(r) then return r
     val index = l.records.len()
     l.records.push(TypeRecord(type_name(t), buf()))
+    l.record_types.push(t)
     l.record_index.put(key, index)
     var ancestors: Buf[usize] = buf()
     for up in supertypes(l, t)
@@ -575,20 +582,53 @@ private type_test(l: *Lowering, object: Operand, t: &Type) -> Operand
     val record = fresh(l, MPtr)
     l.insts.push(Load(record, Value(address)))
     if *t is Str then return compare(l, CmpEq, Value(record), NullAddress)
-    val target = RecordAddress(record_of(l, t))
+    val index = record_of(l, t)
+    val target = RecordAddress(index)
     if exact(l, t) then return compare(l, CmpEq, Value(record), target)
+    var seen = false
+    for r in l.tested
+        if r == index then seen = true
+    if !seen then l.tested.push(index)
     val found = runtime_call(l, "avin_rt_conforms", [MPtr, MPtr], MInt(32), [Value(record), target])
     compare(l, CmpNe, found, ConstInt(32, "0"))
 
 /** Whether only a value of exactly type `t` has type `t`: true of every type but an open or
- * abstract class, a trait, and a tuple with a part of one. */
+ * abstract class, a trait, an instance of a type with a parameter that is not invariant, and a tuple
+ * with a part of one. */
 private exact(l: *Lowering, t: &Type) -> bool = *t match
-    Class(k, _, _) -> l.program.classes[k].decl.modifier == ""
+    Class(k, _, _) -> l.program.classes[k].decl.modifier == "" && all_invariant(l.program.classes[k].decl.type_params)
+    Data(d, _, _) -> all_invariant(l.program.data[d].decl.type_params)
     Tuple(items) ->
         for item in items
             if !exact(l, item) then return false
         true
     _ -> true
+
+private all_invariant(params: Buf[TypeParam]) -> bool
+    for p in params
+        if !(p.variance is Invariant) then return false
+    true
+
+// A type pattern on an instance of a generic type matches an object whose type conforms to it
+// through its parameters' variance, as the checker's subtyping does. Those supertypes are open-ended,
+// so a record does not list them all: once every function is lowered, each record gains those among
+// the types that type patterns test against.
+private add_variant_ancestors(l: *Lowering)
+    for r in 1..<l.records.len()
+        val from = l.record_types[r]
+        var ancestors = l.records[r].ancestors
+        var grew = false
+        for target in l.tested
+            if target == r then continue
+            var listed = false
+            for a in ancestors
+                if a == target then listed = true
+            if listed then continue
+            val to = l.record_types[target]
+            if same_type(view_as(l.program.classes, l.program.data, from, to), to)
+                ancestors.push(target)
+                grew = true
+        if grew then l.records.set(r, TypeRecord(l.records[r].name, ancestors))
 
 /** The value of type `t` an object that has that type holds: a built-in value is in its box. */
 private unbox(l: *Lowering, t: &Type, object: Operand) -> Option[Operand] = machine(l, t) match
@@ -597,23 +637,12 @@ private unbox(l: *Lowering, t: &Type, object: Operand) -> Option[Operand] = mach
     None -> None
 
 // Whether a value of static type `from` always has type `to`: `to` is `Any`, or `from` itself, or
-// for a class or a trait, one of its ancestors; for a tuple, part by part.
+// a type a value of `from` is with no conversion: an ancestor, an instance of the same generic type
+// as variance allows, a tuple part by part.
 private always_is(l: *Lowering, from: &Type, to: &Type) -> bool
     if *to is AnyType || same_type(from, to) then return true
-    *from match
-        Class(_, _, _) -> *to match
-            Class(k, _, _) -> ancestor_type(l.program.classes, l.program.data, from, k) match
-                Some(up) -> same_type(up, to)
-                None -> false
-            _ -> false
-        Tuple(xs) -> *to match
-            Tuple(ys) ->
-                if xs.len() != ys.len() then return false
-                for i in 0..<xs.len()
-                    if !always_is(l, xs[i], ys[i]) then return false
-                true
-            _ -> false
-        _ -> false
+    if !is_reference(from) then return false
+    same_type(view_as(l.program.classes, l.program.data, from, to), to)
 
 private machine_name(t: MirType) -> string = t match
     MInt(bits) -> s"i$bits"
@@ -1602,7 +1631,7 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
             var bound = value
             if always_is(l, from, to)
                 if *to is AnyType && !(*from is AnyType) then bound = box_value(l, from, value)
-            elif *from is AnyType || *from is Class(_, _, _) || *from is Tuple(_)
+            elif *from is AnyType || *from is Class(_, _, _) || *from is Tuple(_) || *from is Data(_, _, _)
                 // An object whose type is a subtype of its static type: its descriptor's record says.
                 if value is Some(v)
                     continue_if(l, type_test(l, v, to), fail)

@@ -1,15 +1,17 @@
 module dev.avinlang.compiler
 
-import sh.sysl.parsing.{Source, source_of, report}
+import sh.sysl.parsing.{Source, Span, error, source_of, report}
 import sysl.buf.{Buf, buf}
-import sysl.fs.{exists, is_dir, make_dir_all, make_temp_dir, metadata, pending_name, publish_file, read_text, remove_dir_all, remove_file, walk, write_text}
+import sysl.fs.{entries, exists, is_dir, make_dir_all, make_temp_dir, metadata, pending_name, publish_file, read_text, remove_dir_all, remove_file, walk, write_text}
 import sysl.process.capture
+import sysl.slices.sort
 
 /** Where the compiler finds what it compiles against: the standard library's Avin source and the
  * runtime's Sysl package. */
 struct Toolchain
     root: string
 
+    library_dir(self) -> string = self.root + "/library"
     prelude_path(self) -> string = self.root + "/library/avin/prelude.avin"
     runtime_dir(self) -> string = self.root + "/runtime"
     runtime_archive(self) -> string = self.root + "/runtime/.sysl/libavinrt.a"
@@ -30,10 +32,55 @@ struct Compilation
      * with the bindings' shims, which Sysl has checked. */
     archive: Option[string]
 
-/** Compiles a program to LLVM IR against the toolchain's prelude, and builds the shims of its Sysl
+/** A source file of a program, with the module its place under the program's root directory gives
+ * it. A program of one file has no root directory: its `module_name` is `None`, and its header, if it has
+ * one, names its module. */
+struct ProgramFile
+    src: Source
+    module_name: Option[string]
+
+/** A program of one file. */
+single_file(src: Source) -> Buf[ProgramFile]
+    var files: Buf[ProgramFile] = buf()
+    files.push(ProgramFile(src, None))
+    files
+
+/** The files of the program rooted at the directory `root`: every `.avin` file under it, in order of
+ * path, each in the module its directory's path from the root names, `a/b` being `a.b`. The files of
+ * the root directory itself are the root module, which has no name, and come last. Directories whose
+ * names begin with `.` are passed over. */
+program_files(root: string) -> Result[Buf[ProgramFile], string]
+    var modules: Buf[ProgramFile] = buf()
+    var root_files: Buf[ProgramFile] = buf()
+    collect_files(root, "", "", &modules, &root_files)?
+    for f in root_files
+        modules.push(f)
+    Ok(modules)
+
+private collect_files(root: string, rel: string, module_name: string, modules: *Buf[ProgramFile], root_files: *Buf[ProgramFile]) -> Result[unit, string]
+    val dir = if rel == "" then root else root + "/" + rel
+    val names = entries(dir).map_err(e -> s"$dir: ${e.to_string()}")?
+    val sorted = names.view()
+    sort(sorted)
+    for name in sorted
+        if name.starts_with(".") then continue
+        val child = if rel == "" then name else rel + "/" + name
+        val full = root + "/" + child
+        if is_dir(full)
+            collect_files(root, child, qualified(module_name, name), modules, root_files)?
+        elif name.ends_with(".avin")
+            val text = read_text(full).map_err(e -> s"$full: ${e.to_string()}")?
+            val file = ProgramFile(source_of(full, text), Some(module_name))
+            if rel == "" then root_files.push(file) else modules.push(file)
+    Ok(())
+
+/** Compiles a program of one file to LLVM IR against the toolchain's library. */
+compile(tc: Toolchain, src: Source) -> Compilation = compile_files(tc, single_file(src))
+
+/** Compiles a program to LLVM IR against the toolchain's library, and builds the shims of its Sysl
  * bindings, so a binding Sysl rejects is reported as the program's error. */
-compile(tc: Toolchain, src: Source) -> Compilation
-    val lowered = lower_units(tc, src) match
+compile_files(tc: Toolchain, files: Buf[ProgramFile]) -> Compilation
+    val lowered = lower_units(tc, files) match
         Ok(l) -> l
         Err(diagnostics) -> return Compilation(diagnostics, None, None)
     var archive: Option[string] = None
@@ -43,8 +90,11 @@ compile(tc: Toolchain, src: Source) -> Compilation
             Err(diagnostics) -> return Compilation(diagnostics, None, None)
     Compilation("", Some(emit_llvm(lowered.program)), archive)
 
-/** Compiles a program as far as MIR against the toolchain's prelude, or renders its diagnostics. */
-lower_source(tc: Toolchain, src: Source) -> Result[MirProgram, string] = lower_units(tc, src) match
+/** Compiles a program of one file as far as MIR, or renders its diagnostics. */
+lower_source(tc: Toolchain, src: Source) -> Result[MirProgram, string] = lower_files(tc, single_file(src))
+
+/** Compiles a program as far as MIR against the toolchain's library, or renders its diagnostics. */
+lower_files(tc: Toolchain, files: Buf[ProgramFile]) -> Result[MirProgram, string] = lower_units(tc, files) match
     Ok(lowered) -> Ok(lowered.program)
     Err(diagnostics) -> Err(diagnostics)
 
@@ -53,24 +103,66 @@ private struct Lowered
     program: MirProgram
     units: Buf[SourceUnit]
 
-private lower_units(tc: Toolchain, src: Source) -> Result[Lowered, string]
-    val prelude_text = read_text(tc.prelude_path()) match
-        Ok(text) -> text
-        Err(e) -> return Err(s"avin: ${tc.prelude_path()}: ${e.to_string()}\n")
+// The library's directory is loaded as a program tree is, and every module in it is the core
+// library's, `avin` or under it; the program's own modules may not be.
+private lower_units(tc: Toolchain, files: Buf[ProgramFile]) -> Result[Lowered, string]
+    val library = program_files(tc.library_dir()).map_err(message -> s"avin: $message\n")?
     var units: Buf[SourceUnit] = buf()
-    var syntax = ""
-    for source in [source_of(tc.prelude_path(), prelude_text), src]
-        val parsed = parse(source)
-        if parsed.report.has_errors() then syntax = syntax + parsed.report.render(source)
-        units.push(SourceUnit(source, parsed.file, parsed.report))
+    var diagnostics = ""
+    var root_module = ""
+    for i in 0..<library.len() + files.len()
+        val in_library = i < library.len()
+        val file = if in_library then library[i] else files[i - library.len()]
+        var parsed = parse(file.src)
+        file.module_name match
+            Some(m) -> place_file(&parsed, m, in_library)
+            None -> root_module = parsed.file.module_name
+        if parsed.report.has_errors() then diagnostics = diagnostics + parsed.report.render(file.src)
+        units.push(SourceUnit(file.src, parsed.file, parsed.report))
     // A file with syntax errors is not checked: its tree is a recovery, and checking it would
-    // report the recovery rather than the program.
-    if syntax != "" then return Err(syntax)
-    val checked = check_program(units)
+    // report the recovery rather than the program. A file in the wrong module is not checked either,
+    // since every name it declares would be reported in a module it does not mean.
+    if diagnostics != "" then return Err(diagnostics)
+    val checked = check_program(units, root_module)
     if checked.has_errors() then return Err(checked.render())
     checked.program match
         Some(program) -> Ok(Lowered(lower_program(program), checked.units))
         None -> Err("avin: checking produced no program\n")
+
+// A file of a program tree belongs to the module its directory names, and its header, which every
+// file outside the root directory has, says so. The root directory's files are the root module,
+// which has no name, so they have none.
+private place_file(parsed: *Parsed, module_name: string, in_library: bool)
+    val header = parsed.file.module_name
+    val at = parsed.file.module_span
+    val core = module_name == CoreModule || module_name.starts_with(CoreModule + ".")
+    if !valid_module_name(module_name)
+        parsed.report.add(error(Span(0, 0), s"`$module_name` is not a module name: each directory of a program is named with letters, digits and `_`, not starting with a digit"))
+    elif in_library && !core
+        parsed.report.add(error(Span(0, 0), s"the standard library's modules are `avin` and the modules under it, not `$module_name`"))
+    elif !in_library && core
+        parsed.report.add(error(if header == "" then Span(0, 0) else at, s"the module `$module_name` is reserved for the standard library"))
+    elif module_name == "" && header != ""
+        parsed.report.add(error(at, s"this file is in the program's root directory, whose module has no name, so it has no `module` header"))
+    elif module_name != "" && header == ""
+        parsed.report.add(error(Span(0, 0), s"this file is in module `$module_name`, so it begins with `module $module_name`"))
+    elif header != module_name
+        parsed.report.add(error(at, s"the header names module `$header`, but the file is in module `$module_name`"))
+    parsed.file.module_name = module_name
+
+private valid_module_name(name: string) -> bool
+    if name == "" then return true
+    var start = true
+    for b in name.bytes
+        if b == u8('.')
+            if start then return false
+            start = true
+            continue
+        val letter = b >= u8('a') && b <= u8('z') || b >= u8('A') && b <= u8('Z') || b == u8('_')
+        val digit = b >= u8('0') && b <= u8('9')
+        if !letter && !(digit && !start) then return false
+        start = false
+    !start
 
 /** The runtime library archive, built from the runtime's Sysl package when it is missing or older
  * than any of its sources. It is built under a temporary name and published by rename, so builds
