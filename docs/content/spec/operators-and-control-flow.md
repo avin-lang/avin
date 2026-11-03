@@ -103,6 +103,11 @@ so this swaps `a` and `b` with no temporary. The right side is a tuple, written 
 (`q, r = divmod(n, 10)`), with one part per place; a place `_` discards its part. The places may be
 parenthesized: `(a, b) = (b, a)`.
 
+A place is a `var` local or a `var` field, written `obj.field`, `self.field`, or by its bare name
+inside its class: `self.lo, self.hi = hi, lo`. The object a field belongs to is evaluated first, left
+to right across the places, before anything else; then the right side is made, then every place is
+stored.
+
 The compound forms read every place first, then make the right side, then combine and store:
 `a, b += b, a` adds each to the other using the values the statement started with.
 

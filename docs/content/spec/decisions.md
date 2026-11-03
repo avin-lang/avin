@@ -163,6 +163,12 @@ a decision changes, this page and the chapter change together.
   in the order written, then the omitted ones' defaults in parameter order. Names and defaults belong
   to a declaration: a function value is called by position. A variant takes its fields by name too.
   The default of a by-name parameter is delayed like any argument to it.
+- Settled 2026-11-03: methods and class constructors take defaults as functions do. A method's
+  default sees `self`, the receiver's members and the parameters before it; a constructor's sees the
+  parameters before it and no `self`. Defaults belong to the method that introduces the parameter:
+  an override, and a method implementing a trait's, takes them and may not declare its own, so a
+  call's defaults are the same whichever class's method runs. A trait method's defaults apply through
+  the trait's type. A method of one required parameter and defaults may be called infix.
 - A function may be defined by [clauses](/spec/declarations/#clauses): its signature with no body,
   then lines `f(patterns) = body`, tried in order. A clause is guarded inline,
   `f(n) | n > 0 = body`, or by an indented block of `| condition = body` lines in which `| _` always
@@ -211,7 +217,8 @@ a decision changes, this page and the chapter change together.
 - A tuple needs no parentheses where it fills the rest of a line: `= a, b`, `return a, b`, a
   block's line. Bindings take tuples apart (`val q, r = divmod(n, d)`), and `a, b = b, a` is a
   multiple assignment: a statement that makes the whole right side before storing anything, with
-  compound forms that read every place first.
+  compound forms that read every place first. Its places are `var` locals and `var` fields, each
+  field's object evaluated before anything else.
 - Inside brackets whose commas separate items (call arguments, tuple and collection literals), a
   `return` or `break` value stops at the comma, so `f(a = return 1, b = 2)` has two arguments; a
   parenthesised `return 1, 2` is two tuple items, and `return (1, 2)` returns a tuple. An indented
