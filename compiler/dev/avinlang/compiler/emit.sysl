@@ -11,11 +11,16 @@ import sysl.text.{StrBuilder, str_builder}
 emit_llvm(program: MirProgram) -> string
     var out = str_builder()
     out.push("; Avin program\n\n")
+    // A string literal is a constant object laid out as the runtime lays out a string: a descriptor
+    // holding no references, the length in bytes, then the bytes.
+    if program.strings.len() > 0
+        out.push("@avin.desc.string = private constant { i64, i64, i64 } { i64 0, i64 16, i64 0 }\n")
     for i in 0..<program.strings.len()
         val text = program.strings[i]
-        out.push(s"@str.$i = private unnamed_addr constant [${text.bytes.len} x i8] c\"")
+        val n = text.bytes.len
+        out.push(s"@avin.str.$i = private constant { ptr, i64, [$n x i8] } { ptr @avin.desc.string, i64 $n, [$n x i8] c\"")
         push_bytes(&out, text)
-        out.push("\"\n")
+        out.push("\" }, align 8\n")
     out.push("\n")
     // Each descriptor is the header the runtime reads (tag, size, reference count) followed by the
     // reference offsets; a constant object is one word, its descriptor.
@@ -83,7 +88,6 @@ private llvm_type(t: MirType) -> string = t match
     MInt(bits) -> s"i$bits"
     MBool -> "i1"
     MReal -> "double"
-    MStr -> "{ ptr, i64 }"
     MPtr -> "ptr"
     MRef -> "ptr"
 
@@ -91,13 +95,11 @@ private result_type(s: MirSignature) -> string = s.result match
     Some(t) -> llvm_type(t)
     None -> "void"
 
-// The runtime is called with the C convention, so a string is passed as its two scalar parts and a
-// bool as a byte.
+// The runtime is called with the C convention, so a bool is passed as a byte.
 private c_type(t: MirType) -> string = t match
     MInt(bits) -> s"i$bits"
     MBool -> "i8"
     MReal -> "double"
-    MStr -> "ptr, i64"
     MPtr -> "ptr"
     MRef -> "ptr"
 
@@ -312,11 +314,6 @@ private emit_inst(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgra
             var parts: Buf[string] = buf()
             for a in args
                 operand_type(program, f, a) match
-                    MStr ->
-                        val (pointer, length, used) = string_parts(out, program, f, a, next)
-                        next = used
-                        parts.push("ptr " + pointer)
-                        parts.push("i64 " + length)
                     MBool ->
                         out.push(s"  %t$next = zext i1 " + operand(program, f, a) + " to i8\n")
                         parts.push(s"i8 %t$next")
@@ -334,22 +331,13 @@ private emit_inst(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgra
             out.push(")\n")
     next
 
-// A string operand's pointer and length, extracting them from a value when it is not a constant.
-private string_parts(out: *StrBuilder, program: MirProgram, f: MirFunction, a: Operand, temp: usize) -> (string, string, usize) = a match
-    ConstStr(index) -> (s"@str.$index", program.strings[index].bytes.len.to_string(), temp)
-    Value(id) ->
-        out.push(s"  %t$temp = extractvalue { ptr, i64 } %v$id, 0\n")
-        out.push(s"  %t${temp + 1} = extractvalue { ptr, i64 } %v$id, 1\n")
-        (s"%t$temp", s"%t${temp + 1}", temp + 2)
-    _ -> ("null", "0", temp)
-
 private operand_type(program: MirProgram, f: MirFunction, a: Operand) -> MirType = a match
     Value(id) -> f.value_types[id]
     ConstInt(bits, _) -> MInt(bits)
     ConstBool(_) -> MBool
     ConstReal(_) -> MReal
     SlotAddress(_) -> MPtr
-    ConstStr(_) -> MStr
+    ConstStr(_) -> MRef
     ConstObject(_) -> MRef
 
 private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a match
@@ -359,7 +347,7 @@ private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a m
     ConstReal(value) -> real_constant(value)
     SlotAddress(slot) -> s"%s$slot"
     ConstObject(descriptor) -> s"@avin.obj.$descriptor"
-    ConstStr(index) -> s"{ ptr @str.$index, i64 ${program.strings[index].bytes.len} }"
+    ConstStr(index) -> s"@avin.str.$index"
 
 private typed_operand(program: MirProgram, f: MirFunction, a: Operand) -> string =
     llvm_type(operand_type(program, f, a)) + " " + operand(program, f, a)

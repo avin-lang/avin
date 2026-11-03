@@ -8,7 +8,7 @@ mir_type(t: &Type) -> Option[MirType] = *t match
     Unit -> None
     Nothing -> None
     Bool -> Some(MBool)
-    Str -> Some(MStr)
+    Str -> Some(MRef)
     Int(bits) -> Some(MInt(bits))
     Byte -> Some(MInt(8))
     Char -> Some(MInt(32))
@@ -51,7 +51,9 @@ private struct Instance
 
 private struct Lowering
     program: TProgram
+    /** The program's string literals, each once, and each one's index. */
     strings: Buf[string]
+    string_index: Map[string, usize]
     instances: Buf[Instance]
     /** Each instance's index, by its function and type arguments. */
     instance_index: Map[string, usize]
@@ -82,7 +84,7 @@ private struct Lowering
 // Every function that is not generic is compiled once; each generic function is compiled for each
 // list of type arguments a compiled call gives it, as those calls are found.
 lower_program(program: TProgram) -> MirProgram
-    var l = Lowering(program, buf(), buf(), map(), buf(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), None, false)
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), None, false)
     for i in 0..<program.symbols.len()
         if !is_generic(program, i) then instance(&l, i, buf())
     val entry = instance(&l, program.entry, buf())
@@ -96,7 +98,6 @@ lower_program(program: TProgram) -> MirProgram
 // An object is a descriptor word followed by its fields in order, each at a multiple of 8 bytes.
 private field_size(t: MirType) -> usize = t match
     MInt(bits) -> usize((bits + 63) / 64) * 8
-    MStr -> 16
     _ -> 8
 
 /** The layout of a data or tuple type, which must be concrete; made when first asked for. A tuple
@@ -307,7 +308,7 @@ private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
         var args: Buf[Operand] = buf()
         args.push(Value(0))
         var params: Buf[MirType] = buf()
-        params.push(MStr)
+        params.push(MRef)
         l.insts.push(Call(None, Runtime("avin_rt_print_line", MirSignature(params, None)), args))
         finish(l, Return(None))
         return
@@ -399,10 +400,7 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
     BoolConst(value) -> Some(ConstBool(value))
     CharConst(code) -> Some(ConstInt(32, code.to_string()))
     RealConst(value) -> Some(ConstReal(value))
-    StrConst(value) ->
-        val index = l.strings.len()
-        l.strings.push(value)
-        Some(ConstStr(index))
+    StrConst(value) -> Some(string_constant(l, value))
     UnitConst -> None
     Param(index) -> l.param_values[index] match
         Some(id) -> Some(Value(id))
@@ -487,10 +485,12 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         Some(*e.ty match
             Real -> real_arith(l, op, a, b)
             Byte -> byte_arith(l, op, a, b)
+            Str -> runtime_call(l, "avin_rt_string_concat", [MRef, MRef], MRef, [a, b])
             _ -> arith(l, int_bits(e.ty), op, a, b))
     Convert(operand) ->
         val x = lower_expr(l, operand)?
         Some(convert(l, operand.ty, e.ty, x))
+    Render(value) -> render(l, value)
     Logic(and, left, right) -> logic(l, and, left, right)
     Compare(operands, ops) -> compare_chain(l, operands, ops)
     If(condition, yes, no) -> lower_if(l, e, condition, yes, no)
@@ -700,17 +700,64 @@ private compare_op(op: CompareOp, t: &Type) -> MirCmp
         Greater -> CmpGt
         _ -> CmpGe
 
+/** The interned constant string `text`. */
+private string_constant(l: *Lowering, text: string) -> Operand
+    if l.string_index.get(text) is Some(index) then return ConstStr(index)
+    l.string_index.put(text, l.strings.len())
+    l.strings.push(text)
+    ConstStr(l.strings.len() - 1)
+
+// A value as text. Integers up to 64 bits widen to 64 and wider ones are passed to the runtime as
+// their 64-bit words in memory, least significant first; bools and unit are constant strings.
+private render(l: *Lowering, value: &TExpr) -> Option[Operand]
+    if *value.ty is Unit
+        lower_expr(l, value)
+        return Some(string_constant(l, "()"))
+    val x = lower_expr(l, value)?
+    Some(*value.ty match
+        Bool -> select(l, MRef, x, string_constant(l, "true"), string_constant(l, "false"))
+        Char -> runtime_call(l, "avin_rt_render_char", [MInt(32)], MRef, [x])
+        Real -> runtime_call(l, "avin_rt_render_real", [MReal], MRef, [x])
+        Byte -> runtime_call(l, "avin_rt_render_int", [MInt(64)], MRef, [resize(l, x, 8, 64, false)])
+        Int(bits) ->
+            if bits <= 64 then runtime_call(l, "avin_rt_render_int", [MInt(64)], MRef, [resize(l, x, bits, 64, true)])
+            else
+                val width = (bits + 63) / 64 * 64
+                val words = new_slot(l, Int(width))
+                store(l, words, Some(resize(l, x, bits, width, true)))
+                val address = words.unwrap().address
+                runtime_call(l, "avin_rt_render_wide", [MPtr, MInt(64)], MRef, [address, ConstInt(64, (width / 64).to_string())])
+        _ -> x)
+
+// Strings compare by the sign of the runtime's three-way comparison; every other type by one
+// machine comparison.
+private compare_values(l: *Lowering, op: CompareOp, t: &Type, a: Operand, b: Operand) -> Operand
+    if *t is Str
+        val order = runtime_call(l, "avin_rt_string_compare", [MRef, MRef], MInt(32), [a, b])
+        return compare(l, compare_op(op, Int(32)), order, ConstInt(32, "0"))
+    compare(l, compare_op(op, t), a, b)
+
+/** A call of a runtime entry point that returns a value. */
+private runtime_call(l: *Lowering, symbol: string, params: []MirType, result: MirType, args: []Operand) -> Operand
+    var types: Buf[MirType] = buf()
+    for p in params do types.push(p)
+    var operands: Buf[Operand] = buf()
+    for a in args do operands.push(a)
+    val dest = fresh(l, result)
+    l.insts.push(Call(Some(dest), Runtime(symbol, MirSignature(types, Some(result))), operands))
+    Value(dest)
+
 // A chain evaluates each operand when its link is reached, and the first false link decides.
 private compare_chain(l: *Lowering, operands: Buf[&TExpr], ops: Buf[CompareOp]) -> Option[Operand]
     var previous = lower_expr(l, operands[0])?
     if ops.len() == 1
         val next = lower_expr(l, operands[1])?
-        return Some(compare(l, compare_op(ops[0], operands[0].ty), previous, next))
+        return Some(compare_values(l, ops[0], operands[0].ty, previous, next))
     val slot = new_slot(l, Bool)
     val done = new_block(l)
     for i in 0..<ops.len()
         val next = lower_expr(l, operands[i + 1])?
-        val result = compare(l, compare_op(ops[i], operands[i].ty), previous, next)
+        val result = compare_values(l, ops[i], operands[i].ty, previous, next)
         store(l, slot, Some(result))
         if i + 1 < ops.len()
             val more = new_block(l)
@@ -825,13 +872,13 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
             store(l, l.local_slots[local], value)
         PLiteral(constant) ->
             if value is Some(v)
-                if lower_expr(l, constant) is Some(k) then continue_if(l, compare(l, compare_op(Equal, p.ty), v, k), fail)
+                if lower_expr(l, constant) is Some(k) then continue_if(l, compare_values(l, Equal, p.ty, v, k), fail)
         PBounds(local, lower, upper) ->
             if value is Some(v)
                 if lower is Some(b)
-                    if lower_expr(l, b.value) is Some(low) then continue_if(l, compare(l, compare_op(if b.inclusive then GreaterEqual else Greater, p.ty), v, low), fail)
+                    if lower_expr(l, b.value) is Some(low) then continue_if(l, compare_values(l, if b.inclusive then GreaterEqual else Greater, p.ty, v, low), fail)
                 if upper is Some(b)
-                    if lower_expr(l, b.value) is Some(high) then continue_if(l, compare(l, compare_op(if b.inclusive then LessEqual else Less, p.ty), v, high), fail)
+                    if lower_expr(l, b.value) is Some(high) then continue_if(l, compare_values(l, if b.inclusive then LessEqual else Less, p.ty, v, high), fail)
             if local is Some(index) then store(l, l.local_slots[index], value)
         PSuccessor(local, amount) ->
             if value is Some(v)

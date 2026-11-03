@@ -103,6 +103,34 @@ private binding(t: Spanned[Token]) -> u16
 
 private const PrefixBinding: u16 = 60
 
+// An interpolated string's holes are expressions in the file, each parsed on its own from the
+// source with everything outside the hole blanked, so its spans point into the file.
+private interpolation(p: *Parser, t: Spanned[Token]) -> &Expr
+    val text = p.spelling(t)
+    var quote = 0usize
+    while text.bytes[quote] != u8('"') do quote += 1
+    val prefix = from_utf8_unchecked(text.bytes[0..<quote])
+    var s = scan(p.src)
+    s.reset(t.span.start + quote)
+    val parts = read_interpolated_named(&s, u8('"'), "${".bytes, u8('}'), is_ident_start, is_ident_cont) match
+        Ok(v) -> v
+        Err(_) -> return Expr(t.span, Invalid)
+    var holes: Buf[&Expr] = buf()
+    for span in parts.holes
+        holes.push(hole(p, span))
+    Expr(t.span, Interpolate(prefix, parts.chunks, holes))
+
+private hole(p: *Parser, span: Span) -> &Expr
+    if span.start == span.end
+        p.report.add(error(span, "an interpolation hole needs an expression"))
+        return Expr(span, Invalid)
+    val lexed = lex_hole(p.src, span)
+    var inner = Parser(p.src, lexed.items, lexed.report, None)
+    val e = expression(&inner, 0)
+    if !inner.toks.at_end() then inner.report.add(error(inner.toks.here(), "unexpected input after the expression in this hole"))
+    p.report.absorb(inner.report)
+    e
+
 private prefix(t: Spanned[Token], p: *Parser) -> &Expr
     val text = p.spelling(t)
     t.value match
@@ -125,6 +153,7 @@ private prefix(t: Spanned[Token], p: *Parser) -> &Expr
             read_quoted(&s, u8('"')) match
                 Ok(v) -> Expr(t.span, StringLit(v))
                 Err(_) -> Expr(t.span, Invalid)
+        Interpolated -> interpolation(p, t)
         Word -> word_prefix(t, text, p)
         _ ->
             if text == "++" || text == "--"

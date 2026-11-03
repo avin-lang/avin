@@ -61,7 +61,11 @@ pasted into its text.
 
 ## Rendering
 
-A hole is rendered by its type's `Display` implementation, or by `Debug` for `%?`. A value whose type
+A hole is rendered by its type's `Display` implementation, or by `Debug` for `%?`. The built-in
+types display as Sysl renders them: an integer of any width as its decimal digits with a sign when
+negative, a `byte` as its number, a `char` as itself, a `real` as the fewest digits that read back
+as the same value, written out without an exponent (`2.5`, `1`, `0.1`), a `bool` as `true` or
+`false`, `()` as `()`, and a string as itself. A value whose type
 implements neither is a compile error. There is no fallback that prints an address. The specifier
 applies to the whole rendered value.
 

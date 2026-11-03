@@ -13,6 +13,8 @@ enum Token
     Number
     RealNumber
     Quoted
+    /** A name and a quoted literal with nothing between them: `s"total: $n"`. */
+    Interpolated
     CharQuoted
     Symbol
     AddOp
@@ -37,13 +39,20 @@ struct Lexed
     items: Tokens[Token]
     report: Report
 
-lex(src: Source) -> Lexed
-    var s = scan(src)
+lex(src: Source) -> Lexed = lex_range(src.bytes, Span(0, src.bytes.len), true)
+
+/** The tokens of the expression in an interpolation hole: the bytes `span` covers, with offsets into
+ * the whole file, and no layout, since a hole lies inside one line. */
+lex_hole(src: Source, span: Span) -> Lexed = lex_range(src.bytes, span, false)
+
+private lex_range(text: []const u8, range: Span, lines: bool) -> Lexed
+    var s = scanner(text[0..<range.end])
+    s.reset(range.start)
     var lay = layout()
     var out: Tokens[Token] = tokens()
     var rep = report()
     var brackets: Buf[u8] = buf()
-    var head = true
+    var head = lines
     var started = false
     loop
         if head
@@ -70,14 +79,18 @@ lex(src: Source) -> Lexed
         if s.at_end() then break
         if s.at_line_end()
             s.accept_newline()
-            head = lay.significant()
+            head = lines && lay.significant()
             continue
         val start = s.mark()
         val c = s.peek().unwrap()
         if is_ident_start(c)
             s.read_ident(is_ident_start, is_ident_cont)
-            val word = from_utf8_unchecked(src.text(s.span_from(start)))
-            if word == "match"
+            val word = from_utf8_unchecked(text[start..<s.mark()])
+            if s.peek() == Some(u8('"'))
+                read_interpolated_named(&s, u8('"'), "${".bytes, u8('}'), is_ident_start, is_ident_cont) match
+                    Ok(_) -> out.push(Interpolated, s.span_from(start))
+                    Err(e) -> rep.add(error(where(e), e.to_string()))
+            elif word == "match"
                 out.push(MatchKeyword, s.span_from(start))
                 lay.opens_block()
             elif word == "is" then out.push(IsKeyword, s.span_from(start))
@@ -109,7 +122,7 @@ lex(src: Source) -> Lexed
                 val closed = lay.close_bracket()
                 for i in 0..<closed do out.push(Dedent, s.span_from(start))
             val span = s.span_from(start)
-            val word = from_utf8_unchecked(src.text(span))
+            val word = from_utf8_unchecked(text[span.start..<span.end])
             if word == "->" then lay.opens_block()
             if word == "=>" then rep.add(error(span, "function arrows are written `->`"))
             out.push(operator_token(word), span)
@@ -118,7 +131,7 @@ lex(src: Source) -> Lexed
     val closed = lay.finish()
     for i in 0..<closed do out.push(Dedent, at)
     Lexed(out, rep)
-end lex
+end lex_range
 
 // Scans a numeric literal and reports whether it is a real. Integer digits are scanned without a
 // width limit, since a literal's width comes from its context and may exceed 64 bits; only a

@@ -1,0 +1,130 @@
+module avin.rt
+
+import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
+
+// Avin's strings. A string is a reference to an object holding its descriptor, its length in bytes,
+// and then its UTF-8 bytes. A literal is a constant object the compiler emits; a string the program
+// makes is allocated here, on the collected heap. A string holds no references, so the collector
+// marks it and never looks inside.
+
+/** The header of a string object. `length` bytes follow it. */
+struct Text
+    descriptor: *Descriptor
+    length: usize
+
+/** The descriptor of every string this runtime allocates: it holds no references. */
+var text_descriptor: Descriptor = Descriptor(0, sizeof(Text), 0)
+
+/** The length in bytes of the string at `p`. */
+text_length(p: *u8) -> usize
+    val t: *Text = ptr_cast(p)
+    t.length
+
+/** The first byte of the string at `p`. */
+text_bytes(p: *u8) -> *u8 = ptr_cast(usize(p) + sizeof(Text))
+
+/** A new string of `length` bytes, all zero, for the caller to fill before anything else sees it. */
+new_text(length: usize) -> *u8
+    val p = allocate_sized(&text_descriptor, sizeof(Text) + length)
+    val t: *Text = ptr_cast(p)
+    t.length = length
+    p
+
+/** `a` followed by `b`. Joining with an empty string gives back the other string itself. */
+@export("avin_rt_string_concat")
+concat(a: *u8, b: *u8) -> *u8
+    val m = text_length(a)
+    val n = text_length(b)
+    if n == 0 then return a
+    if m == 0 then return b
+    // Allocating may collect; `a` and `b` stay alive because the caller holds them as roots, and the
+    // collector never moves an object.
+    val p = new_text(m + n)
+    val to = text_bytes(p)
+    val x = text_bytes(a)
+    val y = text_bytes(b)
+    for i in 0..<m do to[i] = x[i]
+    for i in 0..<n do to[m + i] = y[i]
+    p
+
+/** Negative, zero or positive as `a` orders before, the same as, or after `b`. Strings order by
+ * their bytes, which for UTF-8 is the order of their code points, and a string orders after every
+ * string it begins with. */
+@export("avin_rt_string_compare")
+compare(a: *u8, b: *u8) -> int
+    if a == b then return 0
+    val m = text_length(a)
+    val n = text_length(b)
+    val x = text_bytes(a)
+    val y = text_bytes(b)
+    val shorter = if m < n then m else n
+    for i in 0..<shorter
+        if x[i] != y[i] then return if x[i] < y[i] then -1 else 1
+    if m < n then -1 elif m > n then 1 else 0
+
+/** A new string holding the bytes of `s`. */
+text_of(s: string) -> *u8
+    val p = new_text(s.bytes.len)
+    val to = text_bytes(p)
+    for i in 0..<s.bytes.len do to[i] = s.bytes[i]
+    p
+
+// Rendering a value as text, for interpolation. Each renders as Sysl's `to_string` does.
+
+/** The decimal digits of an integer of at most 64 bits, with a sign when it is negative. */
+@export("avin_rt_render_int")
+render_int(value: long) -> *u8 = text_of(value.to_string())
+
+/** The decimal digits of a wider integer: `count` 64-bit words at `words`, least significant first,
+ * in two's complement. */
+@export("avin_rt_render_wide")
+render_wide(words: *ulong, count: usize) -> *u8
+    // Taken apart into 32-bit limbs, so each step of dividing by ten fits in 64 bits.
+    var limbs: Buf[ulong] = buf()
+    for i in 0..<count
+        limbs.push(words[i] & 4294967295)
+        limbs.push(words[i] >> 32)
+    val negative = (words[count - 1] >> 63) == 1
+    if negative
+        // Two's complement negation: invert every limb and add one.
+        var carry = ulong(1)
+        for i in 0..<limbs.len()
+            val v = (limbs[i] ^ 4294967295) + carry
+            limbs[i] = v & 4294967295
+            carry = v >> 32
+    var digits: Buf[u8] = buf()
+    loop
+        var remainder = ulong(0)
+        var zero = true
+        var i = limbs.len()
+        while i > 0
+            i -= 1
+            val v = (remainder << 32) | limbs[i]
+            limbs[i] = v / 10
+            remainder = v % 10
+            if limbs[i] != 0 then zero = false
+        digits.push(u8('0') + u8(remainder))
+        if zero then break
+    var length = digits.len()
+    if negative then length += 1
+    val p = new_text(length)
+    val to = text_bytes(p)
+    var at = 0usize
+    if negative
+        to[0] = u8('-')
+        at = 1
+    var k = digits.len()
+    while k > 0
+        k -= 1
+        to[at] = digits[k]
+        at += 1
+    p
+
+/** The shortest decimal form that reads back as the same real. */
+@export("avin_rt_render_real")
+render_real(value: real) -> *u8 = text_of(value.to_string())
+
+/** The character itself. */
+@export("avin_rt_render_char")
+render_char(value: char) -> *u8 = text_of(value.to_string())

@@ -599,6 +599,7 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
     CharLit(value) -> TExpr(e.span, Char, CharConst(u32(value)))
     RealLit(value) -> TExpr(e.span, Real, RealConst(value))
     StringLit(value) -> TExpr(e.span, Str, StrConst(value))
+    Interpolate(prefix, chunks, holes) -> interpolate_expr(c, e, prefix, chunks, holes)
     UnitLit -> TExpr(e.span, Unit, UnitConst)
     Name(name) -> name_expr(c, e.span, name, expected)
     TypeApply(target, types) -> type_apply(c, e, target, types, expected)
@@ -1005,6 +1006,14 @@ private operate(c: *Checker, at: Span, op: BinaryOp, spelling: string, l: &TExpr
         // An operand that never finishes means the operation never finishes.
         val ty: &Type = if *l.ty is ErrorType || *r.ty is ErrorType then ErrorType else Nothing
         return TExpr(at, ty, Arith(op, l, r))
+    if *l.ty is Str && *r.ty is Str
+        if op is Add then return TExpr(at, Str, Arith(op, l, r))
+        c.note(unit_of(c), at, s"`$spelling` is not defined on strings; `+` joins two strings")
+        return TExpr(at, ErrorType, UnitConst)
+    if *l.ty is Str && op is Add || *r.ty is Str && op is Add
+        val other = if *l.ty is Str then r.ty else l.ty
+        c.note(unit_of(c), at, s"`+` joins two strings, not a string and ${type_name(other)}")
+        return TExpr(at, ErrorType, UnitConst)
     val numeric = *l.ty is Int(_) || *l.ty is Real || *l.ty is Byte
     if !numeric || !same_type(l.ty, r.ty)
         c.note(unit_of(c), at, s"`$spelling` needs two numbers of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}")
@@ -1051,12 +1060,46 @@ private compare_link(c: *Checker, op: CompareOp, a: &TExpr, b: &TExpr)
         c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} with ${type_name(b.ty)}")
         return
     val equality = op is Equal || op is NotEqual
-    if *a.ty is Int(_) || *a.ty is Byte || *a.ty is Char || *a.ty is Real then return
+    if *a.ty is Int(_) || *a.ty is Byte || *a.ty is Char || *a.ty is Real || *a.ty is Str then return
     if equality && *a.ty is Bool then return
-    if *a.ty is Str
-        c.note(unit_of(c), at, "comparing strings is not implemented")
-        return
     c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} values")
+
+// `s"a${x}b"` is the text pieces and the rendered holes joined in order, as
+// `"a" + x.toString() + "b"`; an empty piece is left out. Each hole is evaluated once, left to
+// right.
+private interpolate_expr(c: *Checker, e: &Expr, prefix: string, chunks: Buf[string], holes: Buf[&Expr]) -> &TExpr
+    val unit = unit_of(c)
+    var ok = true
+    if prefix != "s"
+        c.note(unit, e.span, s"`$prefix\"…\"` interpolation is not implemented; `s\"…\"` is")
+        ok = false
+    var pieces: Buf[&TExpr] = buf()
+    var ty: &Type = Str
+    for i in 0..<chunks.len()
+        if chunks[i] != "" then pieces.push(TExpr(e.span, Str, StrConst(chunks[i])))
+        if i < holes.len()
+            val h = check_expr(c, holes[i], None)
+            *h.ty match
+                Str -> pieces.push(h)
+                Int(_) -> pieces.push(TExpr(h.span, Str, Render(h)))
+                Byte -> pieces.push(TExpr(h.span, Str, Render(h)))
+                Char -> pieces.push(TExpr(h.span, Str, Render(h)))
+                Real -> pieces.push(TExpr(h.span, Str, Render(h)))
+                Bool -> pieces.push(TExpr(h.span, Str, Render(h)))
+                Unit -> pieces.push(TExpr(h.span, Str, Render(h)))
+                Nothing ->
+                    ty = Nothing
+                    pieces.push(h)
+                ErrorType -> ok = false
+                _ ->
+                    c.note(unit, h.span, s"rendering a ${type_name(h.ty)} value is not implemented")
+                    ok = false
+    if !ok then return TExpr(e.span, ErrorType, UnitConst)
+    if pieces.len() == 0 then return TExpr(e.span, Str, StrConst(""))
+    var out = pieces[0]
+    for k in 1..<pieces.len()
+        out = TExpr(e.span, ty, Arith(Add, out, pieces[k]))
+    if *ty is Nothing then TExpr(e.span, Nothing, out.kind) else out
 
 // The type two branches agree on, where one that never finishes agrees with anything.
 private join(a: &Type, b: &Type) -> Option[&Type]
@@ -1608,9 +1651,6 @@ private pattern_constant(c: *Checker, value: &Expr, ty: &Type) -> &TExpr
     if !settled(t.ty) || !settled(ty) then return TExpr(t.span, ErrorType, UnitConst)
     if !same_type(t.ty, ty)
         c.note(unit, value.span, s"this pattern is ${type_name(t.ty)}, but the value it matches is ${type_name(ty)}")
-        return TExpr(t.span, ErrorType, UnitConst)
-    if *ty is Str
-        c.note(unit, value.span, "matching strings is not implemented")
         return TExpr(t.span, ErrorType, UnitConst)
     t
 
