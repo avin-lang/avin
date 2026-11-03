@@ -91,6 +91,14 @@ a decision changes, this page and the chapter change together.
 - A `data` type conforming to a trait gives every variant's descriptor the same method table, at the
   trait positions classes use, so a trait-typed call costs the same whatever the value is.
 - A generic impl writes the type's parameters, in order, as its own: `impl[T] Show for Box[T]`.
+- [Variance](/spec/generics/#variance) applies only where both type arguments are reference types,
+  so it never converts: `List[string]` is a `List[Any]`, `List[int]` is not. Tuple parts and
+  function results are covariant and function parameters contravariant on the same terms.
+- A variance error is reported in private members as in public ones; there is no escape for a
+  private `var`. The methods an impl adds to a `data` type are not variance positions; the traits
+  its impls name are.
+- A type pattern matches an object whose type conforms to the pattern's type through variance, as
+  the checker's subtyping does: a `List[Dog]` held as an `Any` matches `List[Animal]`.
 - The built-in types belong to the core library's module, `avin`; an impl adding methods to one is
   written there.
 - Functions and methods may be overloaded by parameter types. A call takes the most specific
