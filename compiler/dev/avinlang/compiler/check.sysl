@@ -2707,7 +2707,7 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
         Some(w) -> w
         None -> return check_form(c, e, None, used)
     if !(*zonk(c, want) is AnyType) then return check_form(c, e, expected, used)
-    val passes = e.kind is Block(_, _) || e.kind is If(_, _, _) || e.kind is Match(_, _) || e.kind is While(_, _, _)
+    val passes = e.kind is Block(_, _) || e.kind is If(_, _, _) || e.kind is Match(_, _) || e.kind is While(_, _, _) || e.kind is Loop(_) || e.kind is DoWhile(_, _, _)
     to_any(c, check_form(c, e, if passes then expected else None, used))
 
 /** `typed` as an `Any`: put in a box where its type needs one. An unknown type is decided as
@@ -2746,6 +2746,9 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Compare(operands, ops) -> compare_expr(c, e, operands, ops)
     If(condition, yes, no) -> if_expr(c, e, condition, yes, no, expected, used)
     While(condition, body, otherwise) -> while_expr(c, e, condition, body, otherwise, expected, used)
+    Loop(body) -> loop_expr(c, e, body)
+
+    DoWhile(body, condition, otherwise) -> check_form(c, do_while_form(e, body, condition, otherwise), expected, used)
     Break(value) -> break_expr(c, e, value)
     Continue -> continue_expr(c, e)
     Return(value) -> return_expr(c, e, value)
@@ -3958,6 +3961,43 @@ private while_expr(c: *Checker, e: &Expr, condition: &Expr, body: &Expr, otherwi
     if !used then ty = Unit
     if !broken && cond.kind is BoolConst(true) then ty = Nothing
     TExpr(e.span, ty, While(label, cond, b, other))
+
+// A `loop` is left only by a `break`, so it yields what its `break`s agree on, and never finishes
+// when none exists. It is lowered as a `while` whose condition always holds.
+private loop_expr(c: *Checker, e: &Expr, body: &Expr) -> &TExpr
+    val label = c.body.labels
+    c.body.labels += 1
+    c.body.loops.push(label)
+    val b = branch(c, body, None, false)
+    c.body.loops.truncate(c.body.loops.len() - 1)
+    var ty: &Type = Nothing
+    var broken = false
+    for site in c.body.breaks
+        if site.label != label then continue
+        if !broken
+            ty = site.ty
+            broken = true
+        else
+            join(c, ty, site.ty) match
+                Some(t) -> ty = t
+                None -> c.note(unit_of(c), site.span, s"this `break` yields ${type_name(site.ty)}, but the loop yields ${type_name(ty)}")
+    TExpr(e.span, ty, While(label, TExpr(e.span, Bool, BoolConst(true)), b, None))
+
+// `do body while test else other` is a `while` whose first test passes without being evaluated, so
+// the body runs once before the test and a `continue` in it reaches the test. A flag declared just
+// outside the loop, named so that no source name can equal it, is cleared by that first test.
+private do_while_form(e: &Expr, body: &Expr, condition: &Expr, otherwise: Option[&Expr]) -> &Expr
+    val flag = s"do first ${e.span.start}"
+    val here = condition.span
+    val clear = Expr(here, Assign(Expr(here, Name(flag)), None, Expr(here, BoolLit(false)), false, here))
+    var first: Buf[&Expr] = buf()
+    first.push(clear)
+    first.push(Expr(here, BoolLit(true)))
+    val test = Expr(here, If(Expr(here, Name(flag)), Expr(here, Block(first, false)), Some(condition)))
+    var items: Buf[&Expr] = buf()
+    items.push(Expr(here, Binding(flag, None, Expr(here, BoolLit(true)), true)))
+    items.push(Expr(e.span, While(test, body, otherwise)))
+    Expr(e.span, Block(items, false))
 
 private innermost_loop(c: *Checker, e: &Expr, word: string) -> Option[usize]
     if c.body.loops.len() == 0
