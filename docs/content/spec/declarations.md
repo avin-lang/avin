@@ -284,10 +284,11 @@ class Square(label: string, side: int): Rect(label, side, side)
 - **A subclass has every field of its superclass**, first and in the superclass's order, then its
   own. A field cannot be overridden: a public field may not share the name of an inherited public
   field or method. A private member stays private to the class that declares it.
-- **A method a subclass may override** is a public method of an `open` or `abstract` class without
-  type parameters of its own. An override is marked `override`, takes the same parameter types (with
-  the superclass's type arguments substituted) and yields the same result type or, for a class, a
-  subclass of it. A method sharing an inherited method's name and parameter types without
+- **A method a subclass may override** is a public method of an `open` or `abstract` class. An
+  override is marked `override`, takes the same parameter types (with the superclass's type
+  arguments substituted) and yields the same result type or, for a class, a subclass of it. A method
+  with type parameters of its own is overridden by one declaring as many, matched by position:
+  `override tag[V](item: V)` overrides `tag[U](item: U)`. A method sharing an inherited method's name and parameter types without
   `override`, and `override` on a method that overrides nothing, are errors. An override cannot be
   private.
 - **Methods overload as functions do.** A class, object, trait or impl may declare several methods
@@ -351,8 +352,18 @@ val n: Named = t
   a trait's method of the same name without being repeated.
 - A trait's default body is inherited like a superclass's method. A class that is not abstract
   implements every abstract method of its traits; an abstract class may leave them to a subclass.
-- A trait's body declares only methods, all public. A trait's method overrides nothing, and a trait
-  cannot redeclare a method of a trait it requires. A trait cannot be instantiated.
+- A trait's body declares only methods, all public. A trait cannot be instantiated.
+- **A trait may override a method of a trait it requires**, marked `override` and with a body:
+  `trait Square: Shape` with `override describe() -> string = …`. In every class and data type
+  conforming to the trait, its body replaces the required trait's default, or gives an abstract
+  method one, so a call through either trait's type reaches it. Declaring a required trait's method
+  again without `override` is an error. Two traits overriding one default differently are two
+  implementations, which a class conforming to both overrides.
+- **A trait's method may have type parameters of its own**, as `map[B](f: (A) -> B) -> Iterable[B]`.
+  Its implementations declare as many, matched by position. A call through the trait's type
+  reaches the implementation of the object's class at the call's type arguments: the whole program
+  is compiled at once, so every type argument list a call through the trait uses is known, and each
+  has its own method table slot.
 - A class conforms to a trait once: `Source[int]` and `Source[string]` on one class, written or
   reached through other traits, is an error.
 - **A conforming instance is an instance of the trait**: it passes wherever the trait, or a trait
