@@ -167,6 +167,14 @@ a decision changes, this page and the chapter change together.
 - State machines are built into the language: `machine` declares one, and `state` declares each of
   its states.
 - Slate's `dal` is not part of Avin.
+- `Any` holds a value of any type. A value converts to it at a single site (an argument, a binding,
+  an assignment, a field, a result, a tuple part written out, a branch expected to yield one), never
+  inside a container. A string, a tuple and a `data` value need no box, being objects whose header
+  names their type; numbers, `char`, `bool` and `unit` are boxed.
+- A type pattern `x: T` matches a value whose run-time type is `T`, a subclass of it or a class
+  conforming to it, with type arguments compared exactly. One that can never match is an error; one
+  covers only where the matched value's type already conforms to `T`. In a clause a type pattern
+  naming the parameter's own type is an error.
 
 **Project and tooling**
 
@@ -189,6 +197,14 @@ a decision changes, this page and the chapter change together.
 
 ## Proposed
 
+- `==`, `!=`, `===` and `!==` are not defined on `Any`, though `Any` is a reference type: an `Any`
+  may hold a string or a number, which have no identity, and boxes would give equal numbers
+  different identities. A type pattern recovers a type that has the comparison.
+- A literal pattern does not match an `Any` (`5 -> …` on an `Any` is an error); `n: int if n == 5`
+  says it.
+- A tuple's type at run time is the type it was made with: `(animal, 1)` with `animal: Animal` is an
+  `(Animal, int)` whatever its class, and a type pattern `(Dog, int)` does not match it. A tuple made
+  as `(Dog, int)` matches `(Animal, int)` too.
 - A class and its companion object use each other's private members, in both directions; the
   specification promised only the companion's access to the class's.
 - An initializer's dependencies count every lambda it makes as if it were called, and every function

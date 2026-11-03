@@ -19,9 +19,10 @@ emit_llvm(program: MirProgram) -> string
     // Every descriptor begins with the collector's kind, whose tracer is the runtime's.
     out.push("declare void @avin_rt_trace(ptr, ptr)\n\n")
     // A string literal is a constant object laid out as the runtime lays out a string: a header
-    // naming a descriptor that holds no references, the length in bytes, then the bytes.
+    // naming a descriptor that holds no references and no type record, the length in bytes, then the
+    // bytes.
     if program.strings.len() > 0
-        out.push(s"@avin.desc.string = private constant { $KindType, i64, i64, i64 } { $KindValue, i64 0, i64 8, i64 0 }\n")
+        out.push(s"@avin.desc.string = private constant { $KindType, i64, i64, i64, ptr } { $KindValue, i64 0, i64 8, i64 0, ptr null }\n")
     for i in 0..<program.strings.len()
         val text = program.strings[i]
         val n = text.bytes.len
@@ -32,6 +33,19 @@ emit_llvm(program: MirProgram) -> string
     out.push("\n")
     for i in 0..<program.descriptors.len()
         emit_descriptor(&out, program, i)
+    // A type record is the number of the type's ancestors and their records' addresses.
+    for i in 0..<program.records.len()
+        val r = program.records[i]
+        val n = r.ancestors.len()
+        out.push(s"; type ${r.name}\n@avin.type.$i = private constant { i64, [$n x ptr] } { i64 $n, [$n x ptr] ")
+        if n == 0 then out.push("zeroinitializer")
+        else
+            out.push("[")
+            for j in 0..<n
+                if j > 0 then out.push(", ")
+                out.push(s"ptr @avin.type.${r.ancestors[j]}")
+            out.push("]")
+        out.push(" }, align 8\n")
     // A closure that captures nothing is constant: a header naming its descriptor, then its entry's
     // address.
     for i in 0..<program.closures.len()
@@ -202,7 +216,7 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
     out.push("}\n\n")
 
 // A descriptor is the collector's kind, then the header the runtime reads (tag, size, reference
-// count), then the reference offsets. An object's descriptor is the kind the collector keeps in its
+// count, type record), then the reference offsets. An object's descriptor is the kind the collector keeps in its
 // header, `KindBack` bytes before the object. A class's method table sits directly before its
 // descriptor, in the same constant, so slot `s` is the word 8(s + 1) bytes before the descriptor;
 // `@avin.desc.N` names the descriptor's address. An abstract method's slot is null: no object of its
@@ -210,9 +224,9 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
 private emit_descriptor(out: *StrBuilder, program: MirProgram, i: usize)
     val d = program.descriptors[i]
     val n = d.refs.len()
-    val header = s"{ $KindType, i64, i64, i64, [$n x i64] }"
+    val header = s"{ $KindType, i64, i64, i64, ptr, [$n x i64] }"
     var body = str_builder()
-    body.push(s"{ $KindValue, i64 ${d.tag}, i64 ${d.size}, i64 $n, [$n x i64] ")
+    body.push(s"{ $KindValue, i64 ${d.tag}, i64 ${d.size}, i64 $n, ptr @avin.type.${d.record}, [$n x i64] ")
     if n == 0 then body.push("zeroinitializer")
     else
         body.push("[")
@@ -442,6 +456,8 @@ private operand_type(program: MirProgram, f: MirFunction, a: Operand) -> MirType
     ConstClosure(_) -> MRef
     FunctionAddress(_) -> MPtr
     GlobalAddress(_) -> MPtr
+    RecordAddress(_) -> MPtr
+    NullAddress -> MPtr
 
 private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a match
     Value(id) -> s"%v$id"
@@ -454,6 +470,8 @@ private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a m
     ConstClosure(index) -> s"@avin.fn.$index"
     FunctionAddress(function) -> "@\"" + program.functions[function].symbol + "\""
     GlobalAddress(index) -> global_address(program, index)
+    RecordAddress(index) -> s"@avin.type.$index"
+    NullAddress -> "null"
 
 // A module-level value that holds a reference is a slot of the roots frame; any other is a global
 // of its own.

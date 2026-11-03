@@ -1486,7 +1486,9 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                     return ErrorType
                 ty
             None ->
-                c.note(unit, t.span, s"unknown type `$path`")
+                c.variants.get(path) match
+                    Some(v) -> c.note(unit, t.span, s"`$path` is a variant of `${c.data[v.data].name}`, not a type")
+                    None -> c.note(unit, t.span, s"unknown type `$path`")
                 ErrorType
     Tuple(items) ->
         var types: Buf[&Type] = buf()
@@ -1558,7 +1560,11 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
         c.body.block_start = mark
         var patterns: Buf[&TPattern] = buf()
         for i in 0..<clause.patterns.len()
-            patterns.push(check_pattern(c, clause.patterns[i], params[i], ""))
+            val pattern = check_pattern(c, clause.patterns[i], params[i], "")
+            // A type pattern naming the parameter's own type tests nothing: it is the signature's.
+            if pattern.kind is PType(target, _, _)
+                if same_type(target, params[i]) then c.note(unit, pattern.span, "a clause's arguments are patterns; their types are in the signature")
+            patterns.push(pattern)
         var bodies: Buf[TGuarded] = buf()
         for b in clause.bodies
             var guard: Option[&TExpr] = None
@@ -1902,7 +1908,28 @@ check_expr(c: *Checker, e: &Expr, expected: Option[&Type]) -> &TExpr = check_val
 /** Checks an expression whose value is discarded, so the branches of an `if` need not agree. */
 private check_statement(c: *Checker, e: &Expr) -> &TExpr = check_value(c, e, None, false)
 
-private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -> &TExpr = e.kind match
+// A value expected as `Any` converts to it where it is written. Only the forms that yield one of
+// their parts (a block, `if`, `match`, a loop) pass `Any` on to those parts, so each converts its
+// own; for any other the expected `Any` says nothing about how to check it.
+private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -> &TExpr
+    val want = expected match
+        Some(w) -> w
+        None -> return check_form(c, e, None, used)
+    if !(*zonk(c, want) is AnyType) then return check_form(c, e, expected, used)
+    val passes = e.kind is Block(_, _) || e.kind is If(_, _, _) || e.kind is Match(_, _) || e.kind is While(_, _, _)
+    to_any(c, check_form(c, e, if passes then expected else None, used))
+
+/** `typed` as an `Any`: put in a box where its type needs one. An unknown type is decided as
+ * `Any`. */
+private to_any(c: *Checker, typed: &TExpr) -> &TExpr
+    val t = zonk(c, typed.ty)
+    if *t is Var(_)
+        unify(c, t, AnyType)
+        return typed
+    if *t is AnyType || *t is Nothing || *t is ErrorType || *t is ByName(_) then return typed
+    TExpr(typed.span, AnyType, Box(typed))
+
+private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -> &TExpr = e.kind match
     IntLit(spelling) -> integer_literal(c, e.span, spelling, false, expected)
     Unary(op, operand) -> unary_expr(c, e, op, operand, expected)
     BoolLit(value) -> TExpr(e.span, Bool, BoolConst(value))
@@ -2757,6 +2784,11 @@ private compare_link(c: *Checker, op: CompareOp, a: &TExpr, b: &TExpr)
     if !settled(a.ty) || !settled(b.ty) then return
     val at = a.span.to(b.span)
     val spelling = compare_spelling(op)
+    // An `Any` may hold a value with no identity and no equality; a type pattern recovers its type,
+    // and with it the comparisons that type has.
+    if *a.ty is AnyType || *b.ty is AnyType
+        c.note(unit_of(c), at, s"`$spelling` is not defined on Any; match the value by its type first, as in `s: string`")
+        return
     if op is Same || op is NotSame
         // A function value is a closure and an object of a class is a heap object: both are
         // references, so they have an identity.
@@ -2850,6 +2882,12 @@ private ancestor_parent(c: *Checker, t: &Type) -> Option[&Type] = *t match
  * subclasses; otherwise `from` itself. */
 private upcast(c: *Checker, from: &Type, to: &Type) -> &Type
     val x = zonk(c, from)
+    // Every value converts to `Any`, by boxing where it is written; never inside a tuple, whose
+    // parts are already laid out.
+    if *zonk(c, to) is AnyType && !(*x is Var(_) || *x is ByName(_)) then return AnyType
+    upcast_part(c, x, to)
+
+private upcast_part(c: *Checker, x: &Type, to: &Type) -> &Type
     *zonk(c, to) match
         Class(k, _, _) -> ancestor_type(c.classes, x, k).unwrap_or(x)
         Tuple(ys) -> *x match
@@ -2857,7 +2895,7 @@ private upcast(c: *Checker, from: &Type, to: &Type) -> &Type
                 if xs.len() != ys.len() then return x
                 var items: Buf[&Type] = buf()
                 for i in 0..<xs.len()
-                    items.push(upcast(c, xs[i], ys[i]))
+                    items.push(upcast_part(c, zonk(c, xs[i]), ys[i]))
                 Tuple(items)
             _ -> x
         _ -> x
@@ -4102,6 +4140,66 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
                 typed.push(check_pattern(c, items[i], if ok then parts[i] else ErrorType, no_bind))
             if !ok then return TPattern(p.span, ErrorType, PWildcard)
             TPattern(p.span, ty, PVariant(0, typed))
+        Typed(binder, written) ->
+            val target = resolve_type(c, unit, written)
+            val local = binder_local(c, binder, target, no_bind)
+            if *target is ErrorType || !settled(zonk(c, ty)) then return TPattern(p.span, ErrorType, PWildcard)
+            if names_function(target)
+                c.note(unit, written.span, "a type pattern on a function type is not implemented")
+                return TPattern(p.span, ErrorType, PWildcard)
+            if !may_match(c, ty, target)
+                c.note(unit, p.span, s"a value of type ${type_name(zonk(c, ty))} is never ${type_article(target)}, so this type pattern never matches")
+                return TPattern(p.span, ErrorType, PWildcard)
+            TPattern(p.span, ty, PType(target, local, !fits(c, ty, target)))
+
+/** Whether a function type is `t` or a part of it. */
+private names_function(t: &Type) -> bool = *t match
+    Function(_, _) -> true
+    Tuple(items) ->
+        for item in items
+            if names_function(item) then return true
+        false
+    Data(_, _, args) ->
+        for a in args
+            if names_function(a) then return true
+        false
+    Class(_, _, args) ->
+        for a in args
+            if names_function(a) then return true
+        false
+    _ -> false
+
+/** A type's name with an article, for a sentence: `an int`, `a Dog`. */
+private type_article(t: &Type) -> string
+    val name = type_name(t)
+    val first = name.bytes[0]
+    val vowel = first == u8('a') || first == u8('e') || first == u8('i') || first == u8('o') || first == u8('u') || first == u8('A') || first == u8('E') || first == u8('I') || first == u8('O') || first == u8('U')
+    (if vowel then "an " else "a ") + name
+
+// Whether a value of static type `from` may have type `to` at run time. It does where `from` fits
+// `to`, where `from` is `Any`, and where `to` is a subclass of the class `from` or conforms to the
+// trait `from`; a class and a trait unrelated to it may meet in a subclass, where the class is open.
+// A tuple may, part by part, since its parts may be instances of subclasses. Any other value has
+// exactly its static type. A type parameter may be any type, so its copies decide.
+private may_match(c: *Checker, from: &Type, to: &Type) -> bool
+    val x = zonk(c, from)
+    val y = zonk(c, to)
+    if fits(c, x, y) || *x is AnyType || *x is TypeVar(_, _, _) || *y is TypeVar(_, _, _) then return true
+    *x match
+        Class(k, _, _) -> *y match
+            Class(j, _, _) ->
+                if ancestor_type(c.classes, y, k) is Some(up)
+                    if same_type(up, x) then return true
+                (is_trait(c, j) && is_open(c, k)) || (is_trait(c, k) && is_open(c, j))
+            _ -> false
+        Tuple(xs) -> *y match
+            Tuple(ys) ->
+                if xs.len() != ys.len() then return false
+                for i in 0..<xs.len()
+                    if !may_match(c, xs[i], ys[i]) then return false
+                true
+            _ -> false
+        _ -> false
 
 // The local a comparison or `n + k` pattern binds: none for `_`. A name that is a variant is not a
 // binder there.
@@ -4144,6 +4242,10 @@ private variant_pattern(c: *Checker, p: &Pattern, v: VariantRef, args: Buf[&Patt
 // A literal in a pattern takes the matched value's type, as it would beside it in `==`.
 private pattern_constant(c: *Checker, value: &Expr, ty: &Type) -> &TExpr
     val unit = unit_of(c)
+    if *zonk(c, ty) is AnyType
+        c.note(unit, value.span, "a literal does not match an Any; match the value by its type first, as in `n: int`")
+        check_expr(c, value, None)
+        return TExpr(value.span, ErrorType, UnitConst)
     val t = check_expr(c, value, Some(ty))
     if !settled(t.ty) || !settled(ty) then return TExpr(t.span, ErrorType, UnitConst)
     if !same_type(t.ty, ty)

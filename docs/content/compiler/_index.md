@@ -49,7 +49,8 @@ The collector owns each object's header, which sits just before the object: the 
 before an object's address holds its **kind**, the collector's record of how to trace it, and the
 word after that is the collector's own. An object's address is its first field. Every descriptor
 begins with that kind — the runtime's tracer, and no finalizer or weak hooks — followed by the
-variant's tag, its size, and the offsets of its fields that hold references, so the kind an object
+variant's tag, its size, the number of its references, its type record, and the offsets of its
+fields that hold references, so the kind an object
 was allocated with is its descriptor, one load away. Constant objects (string literals, variants
 with no fields, closures that capture nothing) live outside the heap as constant data with the same
 16 bytes ahead of them, their descriptor and a word left zero; the collector ignores any reference
@@ -100,6 +101,25 @@ reference to the object, so an upcast from a class to a trait, and from a trait 
 is free; a call through a final class's type, even of a method it inherits from a trait, is direct.
 A trait has a constructor symbol, so instantiating one is reported as for an abstract class, and it
 is never compiled.
+
+`Any` is a reference to an object. The checker inserts a **box** node wherever a value converts to
+`Any`; lowering makes it nothing for a value already kept as a reference to an object with a
+descriptor (a string, a tuple, a `data` value, an object, a closure), and for a number, `char` or
+`bool` a new one-field object whose descriptor is that type's box descriptor; `unit` has one
+constant box. A **type record** per type is constant data that every descriptor of the type names,
+at offset 56: the number of the type's ancestors and their records' addresses. A class's ancestors
+are its superclasses and every trait it and they conform to, with their type arguments as it sees
+them; a tuple's are the tuple types its parts' ancestors make, one combination at a time. A type
+pattern loads the object's descriptor and its record: for a type nothing else can be (a built-in, a
+final class, a `data` type, a tuple of such), one comparison with the target's record; for an open
+class, a trait or a tuple with a part of one, a call of the runtime's `avin_rt_conforms`, which
+scans the record's ancestors, so the test costs the number of ancestors. A generic instance is its
+own type with its own record, so `Box[int]` and `Box[string]` differ by address. Strings are made by
+the runtime as well as written as literals, so a string's descriptor names no record, and a null
+record is the mark of a string. Closures and the boxes of captured variables share one record no
+type pattern names. A type pattern on a value whose static type already conforms to the target tests
+nothing, and on a value of another value type (possible only in a copy of generic code) never
+matches.
 
 An `object` is an instance of a class of its own, kept apart from its companion class's: its
 constructor and methods are separate functions, and its layout and descriptor are its own. Each
