@@ -2655,7 +2655,7 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
         Some(w) -> w
         None -> return check_form(c, e, None, used)
     if !(*zonk(c, want) is AnyType) then return check_form(c, e, expected, used)
-    val passes = e.kind is Block(_, _) || e.kind is If(_, _, _) || e.kind is Match(_, _) || e.kind is While(_, _, _)
+    val passes = e.kind is Block(_, _) || e.kind is If(_, _, _) || e.kind is Match(_, _) || e.kind is While(_, _, _) || e.kind is Loop(_)
     to_any(c, check_form(c, e, if passes then expected else None, used))
 
 /** `typed` as an `Any`: put in a box where its type needs one. An unknown type is decided as
@@ -2694,6 +2694,7 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Compare(operands, ops) -> compare_expr(c, e, operands, ops)
     If(condition, yes, no) -> if_expr(c, e, condition, yes, no, expected, used)
     While(condition, body, otherwise) -> while_expr(c, e, condition, body, otherwise, expected, used)
+    Loop(body) -> loop_expr(c, e, body)
     Break(value) -> break_expr(c, e, value)
     Continue -> continue_expr(c, e)
     Return(value) -> return_expr(c, e, value)
@@ -3885,6 +3886,27 @@ private while_expr(c: *Checker, e: &Expr, condition: &Expr, body: &Expr, otherwi
     if !used then ty = Unit
     if !broken && cond.kind is BoolConst(true) then ty = Nothing
     TExpr(e.span, ty, While(label, cond, b, other))
+
+// A `loop` is left only by a `break`, so it yields what its `break`s agree on, and never finishes
+// when none exists. It is lowered as a `while` whose condition always holds.
+private loop_expr(c: *Checker, e: &Expr, body: &Expr) -> &TExpr
+    val label = c.body.labels
+    c.body.labels += 1
+    c.body.loops.push(label)
+    val b = branch(c, body, None, false)
+    c.body.loops.truncate(c.body.loops.len() - 1)
+    var ty: &Type = Nothing
+    var broken = false
+    for site in c.body.breaks
+        if site.label != label then continue
+        if !broken
+            ty = site.ty
+            broken = true
+        else
+            join(c, ty, site.ty) match
+                Some(t) -> ty = t
+                None -> c.note(unit_of(c), site.span, s"this `break` yields ${type_name(site.ty)}, but the loop yields ${type_name(ty)}")
+    TExpr(e.span, ty, While(label, TExpr(e.span, Bool, BoolConst(true)), b, None))
 
 private innermost_loop(c: *Checker, e: &Expr, word: string) -> Option[usize]
     if c.body.loops.len() == 0

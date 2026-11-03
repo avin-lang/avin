@@ -148,6 +148,21 @@ nearest loop and may carry a value, in which case every `break` value and the lo
 agree. The `else` runs on normal completion. Without an `else`, normal completion yields `unit`.
 A `while true` loop that no `break` leaves never finishes, so its type is `Nothing`.
 
+## loop
+
+```text
+var k = 0
+val found = loop
+    k += 5
+    if k > 12 then break k * 2
+```
+
+`loop` repeats its body until a `break` or `return` leaves it; `continue` starts the body again. A
+one-line loop is written `loop do step()`. Only a `break` ends a `loop`, so there is no `else`: with
+`break value`, every `break` value must agree and is the value of the loop, and a `break` without
+one makes the loop `unit`. A `loop` that no `break` leaves never finishes, so its type is
+`Nothing`, and a function may end in one. `loop` is a keyword and cannot be used as a name.
+
 ## match
 
 `subject match` is followed by indented `pattern -> body` arms and an optional `else`. It is an

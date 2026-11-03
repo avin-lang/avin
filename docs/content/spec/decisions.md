@@ -104,6 +104,8 @@ a decision changes, this page and the chapter change together.
   is an error. A method value takes every parameter, by-name ones still by name, and private
   methods are values only where they could be called. Two values of one method on one object are
   two closures, so `===` tells them apart.
+- Settled 2026-11-03: `loop` is a statement that repeats its indented body (or `loop do body` on one
+  line) until a `break` or `return` leaves it. `loop` is a keyword.
 - `string` is a built-in type, not a class: it is final, has its own representation, gets its
   methods from the library through `impl string`, conforms to traits through `impl`, and is matched
   by the type pattern `s: string` like any other type.
