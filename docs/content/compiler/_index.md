@@ -309,6 +309,18 @@ sees. The compiler knows a small, declared set of
 Each is declared in Avin source with `@intrinsic("…")` and has no body. Everything else, including
 `print`, is ordinary library code.
 
+A built-in type's impl may declare a method as an intrinsic; its declared type takes the receiver
+first. `impl string` in `library/avin/string.avin` does so for the string operations that read the
+object itself: `byteLength` (the length word, loaded and narrowed to `int`), a private `byteAt` (a
+checked byte load), `slice`, `repeat` and a private `find`, the last three over the runtime's
+`avin_rt_string_slice`, `avin_rt_string_repeat` and `avin_rt_string_find`. A direct call of one is
+lowered where it is made, so its checks (an offset out of range, an offset inside a character, a
+negative count) trap at the caller's line; the intrinsic's function body, used when the method is
+passed as a value, reports them at its declaration. The runtime's `avin_rt_new_text` refuses a
+string longer than the largest `int`, so every byte offset is an `int`. The other string methods are
+Avin over these, and casing, replacing and the white-space test are Sysl bindings
+(`sysl.text.to_upper`, `to_lower`, `replace_all`, `sysl.unicode.is_space`).
+
 ## Tests
 
 `sysl test compiler`, run from the repository root, runs every test.

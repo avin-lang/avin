@@ -531,7 +531,7 @@ private declare_unit(c: *Checker, unit: usize)
                     for other in ids
                         if !c.symbols[other].constructor then set.push(other)
                 val id = c.symbols.len()
-                var symbol = signature(c, unit, file.module_name, f, id, f.type_params, false)
+                var symbol = signature(c, unit, file.module_name, f, id, f.type_params, false, None)
                 symbol.public = !file.private_items[i]
                 if same_as_overload(c, symbol, set)
                     c.note(unit, f.name_span, s"`${f.name}` is declared more than once with the same parameter types; overloads differ in their parameter types, and a function that chooses by its arguments' values is written with clauses")
@@ -1314,7 +1314,7 @@ private declare_methods(c: *Checker, unit: usize)
                 type_params.push(tp)
             for tp in f.type_params
                 type_params.push(tp)
-            var symbol = signature(c, file_unit, entry.module_name, f, class_owner(id), type_params, true)
+            var symbol = signature(c, file_unit, entry.module_name, f, class_owner(id), type_params, true, None)
             // The receiver comes first, named `self`.
             var receiver_types: Buf[&Type] = buf()
             var receiver_names: Buf[string] = buf()
@@ -1382,7 +1382,13 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
             Class(t, _, _) -> Some(t)
             _ -> None
         None -> None
-    if f.annotations.len() > 0 then c.note(unit, f.name_span, "annotations on methods are not implemented")
+    // A built-in type's operations are intrinsics, so its impls may declare them; no other method
+    // takes an annotation.
+    val builtin = !(*target is Data(_, _, _))
+    for a in f.annotations
+        if a.name != "intrinsic" || !builtin || trait_id is Some(_)
+            c.note(unit, f.name_span, "annotations on methods are not implemented")
+            break
     if trait_id is Some(_) || overrides then refuse_override_defaults(c, unit, f)
     if trait_id is Some(t)
         if !trait_declares(c, t, f.name, 0)
@@ -1415,7 +1421,7 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
         type_params.push(tp)
     for tp in f.type_params
         type_params.push(tp)
-    var symbol = signature(c, unit, block.module_name, f, owner, type_params, false)
+    var symbol = signature(c, unit, block.module_name, f, owner, type_params, false, Some(target))
     // The receiver comes first, named `self`.
     var receiver_types: Buf[&Type] = buf()
     var receiver_names: Buf[string] = buf()
@@ -1575,7 +1581,7 @@ private declare_globals(c: *Checker, unit: usize)
                 if v.name == "_" || global_name_taken(c, unit, v.name, v.span, false) then continue
                 val f = Function(buf(), v.span, v.span, v.name, buf(), buf(), v.declared, Some(v.value), buf())
                 val init = c.symbols.len()
-                c.symbols.push(signature(c, unit, file.module_name, f, init, buf(), false))
+                c.symbols.push(signature(c, unit, file.module_name, f, init, buf(), false, None))
                 c.states.push(0)
                 c.bodies.push(None)
                 c.locals.push(buf())
@@ -2576,8 +2582,9 @@ private contains_name(names: Buf[string], name: string) -> bool
     false
 
 // `owner` and `type_params` are the type parameters in scope in the signature: a function's own, or
-// for a method its class's and its own.
-private signature(c: *Checker, unit: usize, module_name: string, f: &Function, owner: usize, type_params: Buf[TypeParam], bodyless: bool) -> FunctionSymbol
+// for a method its class's and its own. `receiver` is the type an impl adds the method to, which an
+// intrinsic's declared type takes as its first parameter.
+private signature(c: *Checker, unit: usize, module_name: string, f: &Function, owner: usize, type_params: Buf[TypeParam], bodyless: bool, receiver: Option[&Type]) -> FunctionSymbol
     var params: Buf[&Type] = buf()
     var names: Buf[string] = buf()
     // A generic function's own type parameters are in scope in its signature.
@@ -2608,7 +2615,11 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
     if intrinsic is Some(name)
         intrinsic_signature(name) match
             Some(expected) ->
-                val declared: &Type = Function(params, result.unwrap_or(Unit))
+                var with_receiver: Buf[&Type] = buf()
+                if receiver is Some(r) then with_receiver.push(r)
+                for p in params
+                    with_receiver.push(p)
+                val declared: &Type = Function(with_receiver, result.unwrap_or(Unit))
                 if !same_type(declared, expected)
                     c.note(unit, f.name_span, s"intrinsic `$name` has type ${type_name(expected)}, not ${type_name(declared)}")
             None -> c.note(unit, f.name_span, s"`$name` is not an intrinsic")
@@ -2682,12 +2693,28 @@ private intrinsic_of(c: *Checker, unit: usize, f: &Function) -> Option[string]
         if f.body is Some(_) then c.note(unit, a.span, "an intrinsic function has no body")
     out
 
-/** The intrinsics the compiler implements, with the type each must be declared with. */
+/** The intrinsics the compiler implements, with the type each must be declared with. A method's
+ * type takes its receiver first. */
 intrinsic_signature(name: string) -> Option[&Type]
-    if name == "print_line"
-        var params: Buf[&Type] = buf()
+    // Each takes a string first, then these.
+    var params: Buf[&Type] = buf()
+    params.push(Str)
+    if name == "print_line" then return Some(Function(params, Unit))
+    if name == "string_byte_length" then return Some(Function(params, Int(32)))
+    if name == "string_byte_at"
+        params.push(Int(32))
+        return Some(Function(params, Byte))
+    if name == "string_slice"
+        params.push(Int(32))
+        params.push(Int(32))
+        return Some(Function(params, Str))
+    if name == "string_find"
         params.push(Str)
-        return Some(Function(params, Unit))
+        params.push(Int(32))
+        return Some(Function(params, Int(32)))
+    if name == "string_repeat"
+        params.push(Int(32))
+        return Some(Function(params, Str))
     None
 
 /** The Sysl function a binding names: the string of its `@sysl` annotation, when it has one. */
@@ -3142,7 +3169,7 @@ private declare_local_functions(c: *Checker, items: Buf[&Expr])
             for i in start..<c.body.functions.len()
                 if c.symbols[c.body.functions[i]].name == decl.name then set.push(c.body.functions[i])
             val id = c.symbols.len()
-            var symbol = signature(c, enclosing.unit, enclosing.module_name, decl, id, decl.type_params, false)
+            var symbol = signature(c, enclosing.unit, enclosing.module_name, decl, id, decl.type_params, false, None)
             symbol.root = Some(c.body.root)
             if same_as_overload(c, symbol, set)
                 c.note(unit_of(c), decl.name_span, s"`${decl.name}` is declared more than once in this block with the same parameter types")
