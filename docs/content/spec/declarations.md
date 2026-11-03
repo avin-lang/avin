@@ -214,7 +214,7 @@ open class Account(owner: string, var balance: int)
 
 class Savings(owner: string, balance: int, rate: real): Account(owner, balance), Display
     override describe() -> string = "savings " + super.describe()
-    display(out: Writer, spec: FormatSpec) = out.write(describe())
+    override display(out: Writer, spec: FormatSpec) = out.write(describe())
 ```
 
 - **The class is its constructor.** The parameter list after the name is the constructor's
@@ -289,7 +289,6 @@ class Square(label: string, side: int): Rect(label, side, side)
 - **A subclass instance conforms to its superclasses.** It passes wherever a superclass is expected,
   and the branches of an `if` or `match` that yield different subclasses join to their nearest
   common superclass. `===` compares an instance of a class with one of its sub- or superclasses.
-  Inheritance from traits is not implemented yet.
 
 ## trait
 
@@ -309,6 +308,40 @@ as a bound, as in Sysl.
 
 When a class inherits two implementations of one member, from its superclass or from traits, it must
 override that member. There is no trait linearization.
+
+```text
+trait Named
+    label() -> string
+
+trait Tagged: Named
+    tag() -> string = s"<${label()}>"
+
+class Item(text: string): Tagged
+    override label() -> string = text
+
+val t: Tagged = Item("x")
+val n: Named = t
+```
+
+- A class conforms to the traits after its superclass in the `:` list, and to every trait those
+  require; a subclass conforms to its superclass's traits. A trait is named there with its type
+  arguments and without constructor arguments.
+- **Implementing a trait's method is overriding it**: the class's method is marked `override`,
+  whether the trait's method is abstract or has a default body, and takes its parameter types and
+  its result or a type conforming to it. A method the class inherits from its superclass implements
+  a trait's method of the same name without being repeated.
+- A trait's default body is inherited like a superclass's method. A class that is not abstract
+  implements every abstract method of its traits; an abstract class may leave them to a subclass.
+- A trait's body declares only methods, all public. A trait's method overrides nothing, and a trait
+  cannot redeclare a method of a trait it requires. A trait cannot be instantiated.
+- A class conforms to a trait once: `Source[int]` and `Source[string]` on one class, written or
+  reached through other traits, is an error.
+- **A conforming instance is an instance of the trait**: it passes wherever the trait, or a trait
+  the trait requires, is expected, with no conversion, and `===` compares it with values of those
+  types. Branches of an `if` or `match` yielding two classes with no common superclass agree on the
+  expected type when both conform to it.
+- Inside a default body, `self` has the trait's type, so its calls dispatch as any trait-typed
+  call does.
 
 ## impl
 

@@ -50,7 +50,17 @@ a decision changes, this page and the chapter change together.
   class cannot be instantiated, and every concrete subclass implements each abstract method.
 - A call through a receiver whose static type is an `open` or `abstract` class reaches the override
   of the object's class; a call through a final class's type, and `super.m()`, are direct.
-- `if` and `match` branches yielding different classes join to their nearest common superclass.
+- `if` and `match` branches yielding different classes join to their nearest common superclass;
+  where they have none, to the expected type when both conform to it, such as a trait.
+- A class implementing a trait's method marks it `override`, whether the trait's method is abstract
+  or has a default body, as an override of a superclass's method is marked. A trait's methods are
+  public and override nothing; a trait cannot redeclare a method of a trait it requires.
+- A class conforms to a trait once: two different type argument lists for one trait, reached by any
+  paths, are an error. A trait's own default bodies count as inherited implementations, so a
+  superclass's method and a trait's default of one name, or two traits' defaults, must be overridden.
+- A trait-typed call reaches the implementation through the class's method table, at a position the
+  trait has in every conforming class's table (the whole program is known), so it costs one virtual
+  call.
 - Functions and methods may be overloaded by parameter types. A call takes the most specific
   overload that accepts its arguments, chosen at compile time; an ambiguous call is an error.
   Same-named declarations with the same parameter types are an error.

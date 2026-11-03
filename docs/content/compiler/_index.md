@@ -78,6 +78,22 @@ instances for its type arguments. A call through a receiver whose static type is
 `abstract` class loads the descriptor word, loads the slot, and calls it indirectly with the
 overridden method's machine signature, which every override shares; `super.m()` is a direct call.
 
+A trait's methods are found through the same table, with the same two loads. The whole program is
+compiled together, so every class conforming to a trait is known: each trait is given one position,
+its `base`, and its methods take the positions `base`, `base + 1`, … in the table of **every** class
+conforming to it, directly or through a superclass or a trait it requires. Positions are chosen
+first-fit, trait by trait: the lowest `base` at which the trait's methods lie past every conforming
+class's own slots and clear of the traits already placed in each. A position a class's traits do
+not use is a null word. A call through a trait-typed receiver loads the descriptor and the word at
+the trait method's fixed position, so it costs what a virtual call costs: no search, no hashing, no
+second table. The price is table size, since positions are global, and tables are small constant
+data. At each trait position the class's table holds its own override, else what its superclass's
+table holds under that name, else the trait's default body. A trait-typed value is a plain
+reference to the object, so an upcast from a class to a trait, and from a trait to one it requires,
+is free; a call through a final class's type, even of a method it inherits from a trait, is direct.
+A trait has a constructor symbol, so instantiating one is reported as for an abstract class, and it
+is never compiled.
+
 An `object` is an instance of a class of its own, kept apart from its companion class's: its
 constructor and methods are separate functions, and its layout and descriptor are its own. Each
 module-level `val`, `var` and object is a **global** of the program, and its initializer is
