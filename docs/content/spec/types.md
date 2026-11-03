@@ -86,6 +86,23 @@ returns `unit`.
 `(n, name) -> …`. Elements are read with `t.0`, `t.1`. Tuples are values with no identity and derive
 `Eq`, `Hash`, `Ord`, `Display` and `Debug` when their elements do.
 
+Where a value fills the rest of a line, a tuple needs no parentheses: after `=` in a function, clause
+or binding, after `return`, after `->` in a `match` arm, and as a line of a block, including its
+last. Inside brackets and in the body of a one-line `if` or `while`, a comma separates other things,
+so a tuple there is parenthesized.
+
+```text
+divmod(a: int, b: int) -> (int, int) = a / b, a % b
+
+bounds(a: int, b: int) -> (int, int)
+    if a > b then return b, a
+    a, b
+```
+
+A tuple is taken apart by a binding (`val q, r = divmod(17, 5)`, `val (a, (b, c)) = t`), by a
+[multiple assignment](/spec/operators-and-control-flow/#multiple-assignment), and by tuple
+patterns in `match` and in clauses.
+
 ## Function types
 
 `(A, B) -> C` is the type of a function taking `A` and `B` and returning `C`; `() -> C` takes nothing.

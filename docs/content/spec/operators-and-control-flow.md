@@ -59,6 +59,36 @@ answer() -> int
     result
 ```
 
+A binding may take a value apart by a pattern that cannot fail: `val q, r = divmod(17, 5)`, or
+`var (lo, hi) = 0, 10`, in which every name is a `var`. A pattern that could fail, such as a literal
+or a variant of a type with several, belongs in a `match`.
+
+## Multiple assignment
+
+`a, b = b, a` assigns several places at once. The whole right side is made before any place changes,
+so this swaps `a` and `b` with no temporary. The right side is a tuple, written out or computed
+(`q, r = divmod(n, 10)`), with one part per place; a place `_` discards its part. The places may be
+parenthesized: `(a, b) = (b, a)`.
+
+The compound forms read every place first, then make the right side, then combine and store:
+`a, b += b, a` adds each to the other using the values the statement started with.
+
+A multiple assignment is a statement, not an expression: it has no `:=` form, and it fills a whole
+line, so it is not the body of a one-line `if` or `while`.
+
+```text
+extendedGcd(a: int, b: int) -> (int, int, int)
+    var r0, r1 = a, b
+    var s0, s1 = 1, 0
+    var t0, t1 = 0, 1
+    while r1 != 0
+        val q = r0 / r1
+        r0, r1 = r1, r0 - q * r1
+        s0, s1 = s1, s0 - q * s1
+        t0, t1 = t1, t0 - q * t1
+    r0, s0, t0
+```
+
 ## if
 
 ```text

@@ -14,6 +14,7 @@ mir_type(t: &Type) -> Option[MirType] = *t match
     Char -> Some(MInt(32))
     Real -> Some(MReal)
     Data(_, _, _) -> Some(MRef)
+    Tuple(_) -> Some(MRef)
     _ -> None
 
 /** Where a value is kept: the address of a slot, and the type stored there. */
@@ -98,32 +99,40 @@ private field_size(t: MirType) -> usize = t match
     MStr -> 16
     _ -> 8
 
-/** The layout of a data type, which must be concrete; made when first asked for. */
+/** The layout of a data or tuple type, which must be concrete; made when first asked for. A tuple
+ * is laid out as a data type with one variant whose fields are its parts. */
 private layout(l: *Lowering, t: &Type) -> DataLayout
     val key = type_name(t)
     if l.layout_index.get(key) is Some(index) then return l.layouts[index]
-    val (id, args) = *t match
-        Data(i, _, a) -> (i, a)
-        _ -> panic("a layout of a type that is not data: " + key)
-    val d = l.program.data[id]
     var variants: Buf[VariantLayout] = buf()
-    for v in 0..<d.variants.len()
-        var fields: Buf[Option[FieldSlot]] = buf()
-        var refs: Buf[usize] = buf()
-        var size = 8usize
-        for field in variant_fields(d, id, v, args)
-            mir_type(field) match
-                Some(m) ->
-                    if m is MRef then refs.push(size)
-                    fields.push(Some(FieldSlot(size, m)))
-                    size += field_size(m)
-                None -> fields.push(None)
-        variants.push(VariantLayout(l.descriptors.len(), fields))
-        l.descriptors.push(Descriptor(key + "." + d.variants[v].name, v, size, refs, size == 8))
+    *t match
+        Data(id, _, args) ->
+            val d = l.program.data[id]
+            for v in 0..<d.variants.len()
+                variants.push(variant_layout(l, key + "." + d.variants[v].name, v, variant_fields(d, id, v, args)))
+        Tuple(items) -> variants.push(variant_layout(l, key, 0, items))
+        _ -> panic("a layout of a type that is neither data nor a tuple: " + key)
     val result = DataLayout(variants)
     l.layout_index.put(key, l.layouts.len())
     l.layouts.push(result)
     result
+
+// One variant's fields at their offsets, and its descriptor; a variant with no field data is one
+// constant object.
+private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[&Type]) -> VariantLayout
+    var fields: Buf[Option[FieldSlot]] = buf()
+    var refs: Buf[usize] = buf()
+    var size = 8usize
+    for field in field_types
+        mir_type(field) match
+            Some(m) ->
+                if m is MRef then refs.push(size)
+                fields.push(Some(FieldSlot(size, m)))
+                size += field_size(m)
+            None -> fields.push(None)
+    val shape = VariantLayout(l.descriptors.len(), fields)
+    l.descriptors.push(Descriptor(name, tag, size, refs, size == 8))
+    shape
 
 private field_address(l: *Lowering, object: Operand, field: FieldSlot) -> Operand
     val dest = fresh(l, MPtr)
@@ -146,6 +155,37 @@ private construct(l: *Lowering, e: &TExpr, variant: usize, args: Buf[&TExpr]) ->
         if shape.fields[i] is Some(field)
             if values[i] is Some(v) then l.insts.push(Store(field_address(l, Value(object), field), v))
     Some(Value(object))
+
+// The parts of a tuple-typed expression, in order. A tuple written out is never made: its parts are
+// evaluated directly. None when the expression never finishes.
+private tuple_parts(l: *Lowering, e: &TExpr) -> Option[Buf[Option[Operand]]]
+    var parts: Buf[Option[Operand]] = buf()
+    if e.kind is Construct(_, args)
+        for a in args
+            val v = lower_expr(l, a)
+            if v is None && machine(l, a.ty) is Some(_) then return None
+            parts.push(v)
+        return Some(parts)
+    val object = lower_expr(l, e)?
+    for field in layout(l, concrete(l, e.ty)).variants[0].fields
+        parts.push(field match
+            Some(f) -> Some(load_field(l, object, f))
+            None -> None)
+    Some(parts)
+
+// Tests a value against a pattern, as `test_pattern` does; a tuple pattern over a tuple written out
+// tests each part where it is computed, without making the tuple.
+private test_parts(l: *Lowering, pattern: &TPattern, value: &TExpr, fail: usize)
+    if pattern.kind is PVariant(_, fields) && *concrete(l, value.ty) is Tuple(_)
+        val parts = tuple_parts(l, value) match
+            Some(p) -> p
+            None -> return
+        for i in 0..<fields.len()
+            test_pattern(l, fields[i], parts[i], fail)
+        return
+    val v = lower_expr(l, value)
+    if v is None && machine(l, value.ty) is Some(_) then return
+    test_pattern(l, pattern, v, fail)
 
 /** Reads a field of an object. */
 private load_field(l: *Lowering, object: Operand, field: FieldSlot) -> Operand
@@ -411,10 +451,23 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
     Let(local, value) ->
         store(l, l.local_slots[local], lower_expr(l, value))
         None
+    LetPattern(pattern, value) ->
+        // The pattern cannot fail, so its failure block is never reached.
+        val fail = new_block(l)
+        val join = new_block(l)
+        test_parts(l, pattern, value, fail)
+        finish_into(l, Jump(join), fail)
+        finish_into(l, Trap, join)
+        None
     Store(local, value, yields) ->
         val v = lower_expr(l, value)
         store(l, l.local_slots[local], v)
         if yields then v else None
+    MultiStore(locals, value) ->
+        val parts = tuple_parts(l, value)?
+        for i in 0..<locals.len()
+            if locals[i] is Some(local) then store(l, l.local_slots[local], parts[i])
+        None
     Step(local, increment, postfix) -> step(l, e, local, increment, postfix)
     Negate(operand) ->
         val x = lower_expr(l, operand)?

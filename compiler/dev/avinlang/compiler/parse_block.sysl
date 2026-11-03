@@ -16,13 +16,18 @@ parse_body(p: *Parser, discard: bool) -> &Expr
         if local_function_ahead(p)
             val declaration = parse_function(p, buf())
             items.push(Expr(declaration.span, LocalFunction(declaration)))
-        else items.push(expression(p, 0))
+        else items.push(line_statement(p))
         if p.toks.position == position then p.toks.advance()
         if !p.toks.at_end() && !p.at_kind(Newline) && !p.at_kind(Dedent)
             if p.toks.items[p.toks.position - 1].value != Dedent
                 p.report.add(error(p.toks.here(), "expected a new line between block items"))
     if items.len() == 0 then p.report.add(error(start, "expected a nonempty block"))
     Expr(start.to(p.toks.here()), Block(items, discard))
+
+/** A body that fills the rest of a line, where a tuple needs no parentheses (`= a, b`), or an
+ * indented block. */
+parse_line_body(p: *Parser, discard: bool) -> &Expr
+    if p.at_kind(Indent) then parse_body(p, discard) else line_value(p)
 
 // `else`, `elif` and `end` may continue a form on the line after its indented body.
 private following(p: *Parser, word: string) -> bool
@@ -47,15 +52,29 @@ optional_end(p: *Parser, name: string, indented: bool)
     if !indented then p.report.add(error(at, s"`end $actual` cannot close a one-line form"))
     if actual != name then p.report.add(error(at, s"`end $actual` cannot close `$name`; expected `end $name`"))
 
+// `val x = value`, or a binding that takes a value apart: `val q, r = value`, `val (a, b) = value`.
 parse_binding(p: *Parser, at: Span, mutable: bool) -> &Expr
-    val name = required_name(p)
+    var pattern: Option[&Pattern] = None
+    var name = ""
+    if p.at("(") || p.ahead(1) == ","
+        val first = parse_pattern(p)
+        if p.at(",")
+            var items: Buf[&Pattern] = buf()
+            items.push(first)
+            while p.accept(",")
+                items.push(parse_pattern(p))
+            pattern = Some(Pattern(first.span.to(items[items.len() - 1].span), Tuple(items)))
+        else pattern = Some(first)
+    else name = required_name(p)
     var declared: Option[&TypeExpr] = None
     if p.accept(":") then declared = Some(parse_type(p))
     p.expect("=")
     val indented = p.at_kind(Indent)
-    val value = parse_body(p, false)
+    val value = parse_line_body(p, false)
     optional_end(p, if mutable then "var" else "val", indented)
-    Expr(at.to(value.span), Binding(name, declared, value, mutable))
+    pattern match
+        Some(shape) -> Expr(at.to(value.span), Destructure(shape, declared, value, mutable))
+        None -> Expr(at.to(value.span), Binding(name, declared, value, mutable))
 
 parse_if(p: *Parser, at: Span) -> &Expr
     val condition = expression(p, 0)
@@ -103,7 +122,7 @@ match_expression(p: *Parser, subject: &Expr) -> &Expr
             guard = Some(expression(p, 0))
             p.lambda_boundary = previous
         if !fallback then p.expect("->")
-        val body = parse_body(p, false)
+        val body = parse_line_body(p, false)
         arms.push(Arm(pattern, guard, body))
         if p.toks.position == before then break
     optional_end(p, "match", true)

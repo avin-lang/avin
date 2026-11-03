@@ -129,6 +129,9 @@ struct Checker
     vars: Buf[Option[&Type]]
     /** The type parameters in scope, and the generic function they belong to. */
     generic: Option[GenericScope]
+    /** Whether the names a pattern binds are assignable: set while a `var` binding's pattern is
+     * checked. */
+    binds_var: bool
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -154,7 +157,7 @@ end Checked
 /** Checks a program. The last unit is the program's own file, which must declare `main`; the units
  * before it (the prelude) are visible to it, and its own declarations shadow theirs. */
 check_program(units: Buf[SourceUnit]) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None)
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false)
     // Every type is named before any is used, so a data type may refer to itself or to one
     // declared after it, and functions are declared once every type is known.
     for u in 0..<c.units.len()
@@ -360,9 +363,11 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
             None ->
                 c.note(unit, t.span, s"unknown type `$path`")
                 ErrorType
-    Tuple(_) ->
-        c.note(unit, t.span, "tuple types are not implemented")
-        ErrorType
+    Tuple(items) ->
+        var types: Buf[&Type] = buf()
+        for item in items
+            types.push(resolve_type(c, unit, item))
+        Tuple(types)
     Function(_, _) ->
         c.note(unit, t.span, "function types are not implemented")
         ErrorType
@@ -601,7 +606,11 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
     Call(callee, args) -> call_expr(c, e.span, callee, args, expected)
     Block(items, discard) -> block_expr(c, e, items, discard, expected, used)
     Binding(name, declared, value, mutable) -> binding_expr(c, e, name, declared, value, mutable)
+    Destructure(pattern, declared, value, mutable) -> destructure_expr(c, e, pattern, declared, value, mutable)
     Assign(target, op, value, yields) -> assign_expr(c, e, target, op, value, yields)
+    MultiAssign(targets, op, value) -> multi_assign_expr(c, e, targets, op, value)
+    Tuple(items) -> tuple_expr(c, e, items, expected)
+    TupleIndex(target, index) -> tuple_index(c, e, target, index)
     Update(target, increment, postfix) -> update_expr(c, e, target, increment, postfix)
     Binary(op, left, right) -> binary_expr(c, e, op, left, right, expected)
     Compare(operands, ops) -> compare_expr(c, e, operands, ops)
@@ -776,6 +785,158 @@ private assign_expr(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp], 
             typed
     val ty: &Type = if *stored.ty is Nothing then Nothing elif yields then local.ty else Unit
     TExpr(e.span, ty, Store(index, stored, yields))
+
+// A tuple's parts take their expected types from an expected tuple of the same size. A part that
+// never finishes means the tuple is never made.
+private tuple_expr(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Option[&Type]) -> &TExpr
+    var wants: Buf[&Type] = buf()
+    if expected is Some(t)
+        if *zonk(c, t) is Tuple(types)
+            if types.len() == items.len() then wants = types
+    var typed: Buf[&TExpr] = buf()
+    var types: Buf[&Type] = buf()
+    var never = false
+    var failed = false
+    for i in 0..<items.len()
+        val t = check_expr(c, items[i], if wants.len() > 0 then Some(wants[i]) else None)
+        if *t.ty is Nothing then never = true
+        if *t.ty is ErrorType then failed = true
+        typed.push(t)
+        types.push(t.ty)
+    val ty: &Type = if failed then ErrorType elif never then Nothing else Tuple(types)
+    TExpr(e.span, ty, Construct(0, typed))
+
+// `t.0` reads a part of a tuple by its position.
+private tuple_index(c: *Checker, e: &Expr, target: &Expr, index: usize) -> &TExpr
+    val t = check_expr(c, target, None)
+    *zonk(c, t.ty) match
+        Tuple(types) ->
+            if index < types.len() then return TExpr(e.span, types[index], Field(t, index))
+            c.note(unit_of(c), e.span, s"${type_name(t.ty)} has ${count(types.len(), "part")}, numbered from 0, so it has no part $index")
+        ErrorType -> ()
+        Nothing -> return t
+        _ -> c.note(unit_of(c), e.span, s"`.$index` reads a part of a tuple, and ${type_name(t.ty)} is not one")
+    TExpr(e.span, ErrorType, UnitConst)
+
+// `val a, b = value`: the pattern must match every value of the value's type, since a binding has
+// no other way to go. A `var` makes every name it binds assignable.
+private destructure_expr(c: *Checker, e: &Expr, pattern: &Pattern, declared: Option[&TypeExpr], value: &Expr, mutable: bool) -> &TExpr
+    val unit = unit_of(c)
+    var want: Option[&Type] = None
+    if declared is Some(d) then want = Some(resolve_type(c, unit, d))
+    val typed = check_expr(c, value, want)
+    var ty = typed.ty
+    if want is Some(w)
+        if !conforms(typed.ty, w) then c.note(unit, value.span, s"expected ${type_name(w)}, found ${type_name(typed.ty)}")
+        ty = w
+    val outer = c.binds_var
+    c.binds_var = mutable
+    val shape = check_pattern(c, pattern, ty, "")
+    c.binds_var = outer
+    if settled(ty) && settled(shape.ty)
+        var arms: Buf[TArm] = buf()
+        arms.push(TArm(shape, None, TExpr(e.span, Unit, UnitConst)))
+        if !match_covers(arms, ty, c.data)
+            c.note(unit, pattern.span, s"a binding's pattern must match every ${type_name(ty)} value; take the value apart with `match`")
+    TExpr(e.span, if *typed.ty is Nothing then Nothing else Unit, LetPattern(shape, typed))
+
+// `a, b = x, y` and its compound forms. Every place is read, then the whole value is made, and only
+// then is anything stored, so `a, b = b, a` swaps. A target `_` discards its part.
+private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option[BinaryOp], value: &Expr) -> &TExpr
+    val unit = unit_of(c)
+    var locals: Buf[Option[usize]] = buf()
+    var types: Buf[Option[&Type]] = buf()
+    var ok = true
+    for t in targets
+        if t.kind is Name("_")
+            if op is Some(o)
+                c.note(unit, t.span, s"`${binary_spelling(o)}=` reads every place before writing it, and `_` has nothing to read")
+                ok = false
+            locals.push(None)
+            types.push(None)
+            continue
+        assignable(c, t) match
+            Some(i) ->
+                locals.push(Some(i))
+                types.push(Some(c.body.locals[i].ty))
+            None ->
+                ok = false
+                locals.push(None)
+                types.push(None)
+    // Each place's current value, read before anything on the right is evaluated.
+    var block: Buf[&TExpr] = buf()
+    var olds: Buf[Option[usize]] = buf()
+    if op is Some(_)
+        for i in 0..<locals.len()
+            locals[i] match
+                Some(local) ->
+                    val ty = c.body.locals[local].ty
+                    val old = hidden_local(c, ty)
+                    block.push(TExpr(e.span, Unit, Let(old, TExpr(targets[i].span, ty, Local(local)))))
+                    olds.push(Some(old))
+                None -> olds.push(None)
+    // The parts of the value: checked one by one against their places when it is written as a tuple,
+    // and otherwise read from the tuple it makes.
+    var parts: Buf[&TExpr] = buf()
+    var never = false
+    if value.kind is Tuple(items)
+        if items.len() != targets.len()
+            c.note(unit, value.span, s"this assigns ${count(targets.len(), "place")} from ${count(items.len(), "value")}")
+            ok = false
+        for i in 0..<items.len()
+            val want = if i < types.len() then types[i] else None
+            val t = check_expr(c, items[i], want)
+            if *t.ty is Nothing then never = true
+            if op is Some(_)
+                val part = hidden_local(c, t.ty)
+                block.push(TExpr(t.span, Unit, Let(part, t)))
+                parts.push(TExpr(t.span, t.ty, Local(part)))
+            else parts.push(t)
+    else
+        val whole = check_expr(c, value, None)
+        if *whole.ty is Nothing then never = true
+        *zonk(c, whole.ty) match
+            Tuple(item_types) ->
+                if item_types.len() != targets.len()
+                    c.note(unit, value.span, s"this assigns ${count(targets.len(), "place")} from a tuple of ${item_types.len()}")
+                    ok = false
+                else
+                    val held = hidden_local(c, whole.ty)
+                    block.push(TExpr(value.span, Unit, Let(held, whole)))
+                    for i in 0..<item_types.len()
+                        parts.push(TExpr(value.span, item_types[i], Field(TExpr(value.span, whole.ty, Local(held)), i)))
+            ErrorType -> ok = false
+            Nothing -> ()
+            _ ->
+                c.note(unit, value.span, s"a multiple assignment takes its values from a tuple, not ${type_name(whole.ty)}")
+                ok = false
+    if !ok then return TExpr(e.span, ErrorType, UnitConst)
+    if never then return TExpr(e.span, Nothing, Block(block))
+    // Each stored value: the part itself, or the place's old value combined with it.
+    var stored: Buf[&TExpr] = buf()
+    var stored_types: Buf[&Type] = buf()
+    for i in 0..<parts.len()
+        val part = parts[i]
+        var result = part
+        types[i] match
+            Some(ty) ->
+                op match
+                    Some(o) ->
+                        val old = TExpr(targets[i].span, ty, Local(olds[i].unwrap()))
+                        result = operate(c, targets[i].span, o, binary_spelling(o) + "=", old, part)
+                    None ->
+                        if !conforms(part.ty, ty) then c.note(unit, part.span, s"expected ${type_name(ty)}, found ${type_name(part.ty)}")
+            None -> ()
+        stored.push(result)
+        stored_types.push(result.ty)
+    block.push(TExpr(e.span, Unit, MultiStore(locals, TExpr(value.span, Tuple(stored_types), Construct(0, stored)))))
+    TExpr(e.span, Unit, Block(block))
+
+/** A local the compiler introduces to hold a value for a moment; no name reaches it. */
+private hidden_local(c: *Checker, ty: &Type) -> usize
+    val index = c.body.locals.len()
+    c.body.locals.push(TLocal("", ty, false, c.current))
+    index
 
 private update_expr(c: *Checker, e: &Expr, target: &Expr, increment: bool, postfix: bool) -> &TExpr
     val index = assignable(c, target) match
@@ -1320,13 +1481,13 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
             if no_bind != ""
                 c.note(unit, p.span, no_bind)
                 return TPattern(p.span, ErrorType, PWildcard)
-            TPattern(p.span, ty, PBind(declare_local(c, p.span, name, ty, false)))
+            TPattern(p.span, ty, PBind(declare_local(c, p.span, name, ty, c.binds_var)))
         Named(name, inner) ->
             if no_bind != ""
                 c.note(unit, p.span, no_bind)
                 return TPattern(p.span, ErrorType, PWildcard)
             val nested = check_pattern(c, inner, ty, no_bind)
-            TPattern(p.span, ty, PNamed(declare_local(c, p.span, name, ty, false), nested))
+            TPattern(p.span, ty, PNamed(declare_local(c, p.span, name, ty, c.binds_var), nested))
         Literal(value) ->
             val t = pattern_constant(c, value, ty)
             if !settled(t.ty) then return TPattern(p.span, ErrorType, PWildcard)
@@ -1381,9 +1542,26 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
                 for a in args
                     check_pattern(c, a, ErrorType, no_bind)
                 TPattern(p.span, ErrorType, PWildcard)
-        Tuple(_) ->
-            c.note(unit, p.span, "tuple patterns are not implemented")
-            TPattern(p.span, ErrorType, PWildcard)
+        Tuple(items) ->
+            // A tuple pattern takes apart a tuple of the same size; a tuple is matched as a value
+            // with one variant whose fields are its parts.
+            var parts: Buf[&Type] = buf()
+            var ok = true
+            *zonk(c, ty) match
+                Tuple(types) ->
+                    if types.len() == items.len() then parts = types
+                    else
+                        c.note(unit, p.span, s"this pattern has ${items.len()} parts, but the tuple it matches, ${type_name(ty)}, has ${types.len()}")
+                        ok = false
+                ErrorType -> ok = false
+                _ ->
+                    c.note(unit, p.span, s"a tuple pattern matches a tuple, not ${type_name(ty)}")
+                    ok = false
+            var typed: Buf[&TPattern] = buf()
+            for i in 0..<items.len()
+                typed.push(check_pattern(c, items[i], if ok then parts[i] else ErrorType, no_bind))
+            if !ok then return TPattern(p.span, ErrorType, PWildcard)
+            TPattern(p.span, ty, PVariant(0, typed))
 
 // The local a comparison or `n + k` pattern binds: none for `_`. A name that is a variant is not a
 // binder there.
@@ -1395,7 +1573,7 @@ private binder_local(c: *Checker, binder: &Pattern, ty: &Type, no_bind: string) 
         if no_bind != ""
             c.note(unit_of(c), binder.span, no_bind)
             return None
-        Some(declare_local(c, binder.span, name, ty, false))
+        Some(declare_local(c, binder.span, name, ty, c.binds_var))
     _ -> None
 
 // A variant pattern matches a value of the variant's own type, and each field pattern the field's

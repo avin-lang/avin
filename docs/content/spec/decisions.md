@@ -90,6 +90,10 @@ a decision changes, this page and the chapter change together.
 - Nested helper functions see their enclosing scope. Closures are full closures, and `return` inside a
   lambda is local to the lambda.
 - `match` is a value-producing expression with full destructuring.
+- A tuple needs no parentheses where it fills the rest of a line: `= a, b`, `return a, b`, a
+  block's line. Bindings take tuples apart (`val q, r = divmod(n, d)`), and `a, b = b, a` is a
+  multiple assignment: a statement that makes the whole right side before storing anything, with
+  compound forms that read every place first.
 - Slate's `dal` is not part of Avin.
 
 **Project and tooling**

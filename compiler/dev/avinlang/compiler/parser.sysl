@@ -154,11 +154,48 @@ private word_prefix(t: Spanned[Token], text: string, p: *Parser) -> &Expr
     if text == "val" || text == "var" then return parse_binding(p, t.span, text == "var")
     if text == "break" || text == "return"
         var value: Option[&Expr] = None
-        if !p.at_line_end() then value = Some(expression(p, 0))
+        if !p.at_line_end() then value = Some(line_value(p))
         val kind: ExprKind = if text == "return" then Return(value) else Break(value)
         return Expr(t.span.to(p.toks.here()), kind)
     if text == "continue" then return Expr(t.span, Continue)
     Expr(t.span, Name(text))
+
+/** A value that fills the rest of a line: an expression, or several separated by commas, which
+ * make a tuple without parentheses. */
+line_value(p: *Parser) -> &Expr
+    val first = expression(p, 0)
+    if !p.at(",") then return first
+    var items: Buf[&Expr] = buf()
+    items.push(first)
+    while p.accept(",")
+        items.push(expression(p, 0))
+    Expr(first.span.to(items[items.len() - 1].span), Tuple(items))
+
+/** A statement that fills a line: a value or a tuple, an assignment whose value may be a tuple, or a
+ * multiple assignment, `a, b = b, a`, which is a statement and not an expression. */
+line_statement(p: *Parser) -> &Expr
+    val first = expression(p, 3)
+    var items: Buf[&Expr] = buf()
+    items.push(first)
+    while p.accept(",")
+        items.push(expression(p, 3))
+    val last = items[items.len() - 1]
+    if !p.at_kind(AssignOp)
+        if items.len() == 1 then return first
+        return Expr(first.span.to(last.span), Tuple(items))
+    val at = p.toks.here()
+    val (compound, yields) = assign_op(p.spelling(p.toks.advance().unwrap()))
+    val value = if p.at_kind(Indent) then parse_body(p, false) else line_statement(p)
+    // The places may be written in parentheses: `(a, b) = (b, a)`.
+    if items.len() == 1
+        if first.kind is Tuple(places)
+            items = places
+        else return Expr(first.span.to(value.span), Assign(first, compound, value, yields))
+    if yields then p.report.add(error(at, "a multiple assignment has no `:=` form, since it is a statement and yields nothing"))
+    // `while c do a, b = …` would assign to the loop: a list fills a whole line.
+    if items[0].kind is While(_, _, _) || items[0].kind is If(_, _, _)
+        p.report.add(error(items[0].span, "a multiple assignment fills a whole line, so it cannot be the body of a one-line `if` or `while`; indent it on the next line"))
+    Expr(first.span.to(value.span), MultiAssign(items, compound, value))
 
 // `()` is unit, `(e)` groups, `(a, b)` is a tuple, and `(x, y) -> body` is a lambda.
 private parenthesized(p: *Parser, start: Span) -> &Expr
