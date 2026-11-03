@@ -73,7 +73,9 @@ Defaults belong to the method that introduces a parameter. An `override`, and a 
 implements a trait's method, takes that method's defaults and cannot declare its own, so a call
 omits the same arguments and gets the same values whichever class's method then runs. A trait's
 method declares its defaults in the trait, and they apply through the trait's type and on every
-type implementing it. A method of one required parameter whose others have defaults can be
+type implementing it. A method a type inherits, from its superclass or as a trait's default body,
+keeps its own defaults, so where it also implements another trait's method, that method must
+declare no defaults or the very same ones; otherwise the type is an error. A method of one required parameter whose others have defaults can be
 [called infix](/spec/operators-and-control-flow/#infix-method-calls).
 
 Functions and methods may be **overloaded**: several functions in one scope may share a name when

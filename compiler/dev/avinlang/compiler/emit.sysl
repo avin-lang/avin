@@ -174,6 +174,8 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
         else value_roots.push(None)
     val frame = s"{ ptr, i64, [$roots x ptr] }"
     var temp = 0usize
+    var polls = 0usize
+    val back = back_edges(f)
     for b in 0..<f.blocks.len()
         out.push(s"b$b:\n")
         if b == 0
@@ -196,11 +198,13 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
                 else out.push(s"  %s$s = alloca ${llvm_type(f.slots[s])}\n")
             for i in 0..<f.signature.params.len()
                 if value_roots[i] is Some(k) then out.push(s"  store ptr %v$i, ptr %root$k\n")
+            if makes_calls(f) then polls = emit_poll(out, intrinsics, polls)
         val block = f.blocks[b]
         for inst in block.insts
             temp = emit_inst(out, intrinsics, program, f, inst, temp)
             if inst_dest(inst) is Some(d)
                 if value_roots[d] is Some(k) then out.push(s"  store ptr %v$d, ptr %root$k\n")
+        if back[b] then polls = emit_poll(out, intrinsics, polls)
         if block.term is Return(_)
             if roots > 0 then out.push("  store ptr %caller, ptr %ctx\n")
         block.term match
@@ -214,6 +218,79 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
                 out.push(s"  call void @avin_rt_trap(ptr %ctx, ptr @avin.trap.$site)\n  unreachable\n")
             Unreachable -> out.push("  unreachable\n")
     out.push("}\n\n")
+
+// A safepoint poll: when a collection has asked the other threads to stop, the runtime parks this one
+// until the collection is over. Every reference the function holds is already in its frame, so the
+// stack is consistent wherever a poll is placed. The flag is read with a relaxed atomic load and the
+// slow path is a call to a cold function, so the common case is one load and a branch predicted not
+// taken. Polls are placed at the entry of every function that calls another, which bounds the time a
+// recursion runs without one, and before every terminator with a back edge, which every cycle of the
+// control flow has. `n` numbers the poll within its function; the next number is answered.
+private emit_poll(out: *StrBuilder, intrinsics: *Buf[string], n: usize) -> usize
+    need(intrinsics, "@avin_rt_requested = external global i32")
+    need(intrinsics, "declare void @avin_rt_safepoint(ptr) cold")
+    out.push(s"  %poll$n = load atomic i32, ptr @avin_rt_requested monotonic, align 4\n")
+    out.push(s"  %stop$n = icmp ne i32 %poll$n, 0\n")
+    out.push(s"  br i1 %stop$n, label %park$n, label %run$n\n")
+    out.push(s"park$n:\n  call void @avin_rt_safepoint(ptr %ctx)\n  br label %run$n\n")
+    out.push(s"run$n:\n")
+    n + 1
+
+private successors(term: Terminator) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    term match
+        Jump(target) -> out.push(target)
+        Branch(_, yes, no) ->
+            out.push(yes)
+            out.push(no)
+        _ -> ()
+    out
+
+// For each block of `f`, whether its terminator has a back edge: an edge to a block on the
+// depth-first path from the entry to it. Every cycle of the control flow contains one, whatever order
+// the blocks are numbered in, and an `if`'s join is never reached by one.
+private back_edges(f: MirFunction) -> Buf[bool]
+    // 0: not reached yet; 1: on the current path; 2: finished.
+    var state: Buf[u8] = buf()
+    var back: Buf[bool] = buf()
+    for _ in 0..<f.blocks.len()
+        state.push(0)
+        back.push(false)
+    if f.blocks.len() == 0 then return back
+    // The path, and for each block on it the index of the successor to follow next.
+    var path: Buf[usize] = buf()
+    var next: Buf[usize] = buf()
+    path.push(0)
+    next.push(0)
+    state[0] = 1
+    while path.len() > 0
+        val top = path.len() - 1
+        val b = path[top]
+        val succ = successors(f.blocks[b].term)
+        if next[top] < succ.len()
+            val s = succ[next[top]]
+            next[top] += 1
+            if state[s] == 1 then back[b] = true
+            else if state[s] == 0
+                state[s] = 1
+                path.push(s)
+                next.push(0)
+        else
+            state[b] = 2
+            _ = path.pop()
+            _ = next.pop()
+    back
+
+// Whether `f` calls a function of the program, directly or through a function value, and so may
+// recurse.
+private makes_calls(f: MirFunction) -> bool
+    for block in f.blocks
+        for inst in block.insts
+            inst match
+                Call(_, Direct(_), _) -> return true
+                Call(_, Indirect(_, _), _) -> return true
+                _ -> ()
+    false
 
 // A descriptor is the collector's kind, then the header the runtime reads (tag, size, reference
 // count, type record), then the reference offsets. An object's descriptor is the kind the collector keeps in its

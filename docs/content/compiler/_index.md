@@ -224,7 +224,34 @@ Programs are multi-threaded, so the runtime keeps no per-thread state in globals
 thread's context as a hidden first argument. A function that holds references links its frame of
 roots onto its thread's shadow stack by writing the context's first word directly, on entry and on
 every return, without calling the runtime. A collection walks the frames of every attached
-context; the main thread's is attached before the program's entry function runs.
+context; the main thread's is attached before the program's entry function runs. Another thread
+gets a context of its own from `avin_rt_thread_attach` before it runs compiled code and gives it
+back with `avin_rt_thread_detach` when it has finished, with no frame left on it.
+
+Threads share the heap, and one lock serializes allocation, collection and changes to the list of
+contexts; the collector itself runs single-threaded. **A collection stops the world.** Each context
+is either *running*, when its thread may touch references, or *safe*, when its frames hold every
+reference it still needs and it touches none until it is running again. The collecting thread,
+holding the lock, raises the flag `avin_rt_requested`, waits until every other attached context is
+safe, collects, lowers the flag and wakes the others. A thread becomes safe in three ways:
+
+- **At a poll.** The emitter places a poll at the entry of every function that calls another,
+  after its frame is linked and its arguments stored, and before every terminator with a back edge,
+  found by a depth-first walk of the function's blocks, so every loop polls once per iteration and
+  every recursion once per call. A poll is a relaxed atomic load of the flag and a branch to a call
+  of `avin_rt_safepoint`, which is declared cold; the thread parks there until the collection is
+  over. A function with neither calls nor loops never polls.
+- **Waiting for the lock.** Allocation takes the lock with one compare-and-swap when it is free; a
+  thread that has to wait for it waits safe, since the holder may be collecting. Allocation is
+  therefore a safepoint.
+- **Around a blocking call.** `avin_rt_enter_safe` and `avin_rt_leave_safe` bracket an operation
+  that may wait (a lock, a channel, a join, reading input), so a blocked thread never holds up a
+  collection; leaving waits for a collection in progress to finish.
+
+The handshake is a pair of sequentially consistent stores and loads, the flag by the collector and
+a context's state by its thread, so either the thread sees the flag and wakes the collector, or the
+collector sees the thread safe. With one context attached the flag is never raised, so a program
+with one thread takes no poll's slow path and makes no system call for a collection.
 
 ## Standard library
 

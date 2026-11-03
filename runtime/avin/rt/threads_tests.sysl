@@ -1,0 +1,247 @@
+module avin.rt
+@tests
+
+import sh.sysl.gc
+import sysl.raw.ptr_cast
+import sysl.sync.*
+import sysl.threads.{Thread, spawn, yield_now}
+
+// Real threads sharing the heap, each running as compiled code does: a context attached for the
+// thread, a frame of roots linked onto it, allocation through the runtime and polls of `requested`.
+
+// A list cell, laid out as the compiler lays out a variant with one reference: the next cell at
+// offset 0, then a number.
+private struct CellLayout
+    header: Descriptor
+    offset: usize
+
+private var cell: CellLayout = CellLayout(descriptor(2, 16, 1), 0)
+
+// One frame holding one reference, as compiled code lays out its frames.
+private struct Root
+    frame: Frame
+    slot: *u8
+
+// The state one worker thread is handed. A worker builds a list of `count` cells rooted in its own
+// frame, polling between allocations, and checks the whole list once it is built.
+private struct Job
+    root: Root
+    count: usize
+    ok: bool
+
+private const Workers: usize = 4
+
+private var jobs: [4]Job = [Job(Root(Frame(null, 1), null), 0, false); 4]
+
+private link(ctx: *Context, r: *Root)
+    r.slot = null
+    r.frame.prev = ctx.top
+    ctx.top = &r.frame
+
+private unlink_root(ctx: *Context, r: *Root)
+    ctx.top = r.frame.prev
+    r.slot = null
+
+// Whether the list at `head` holds `count` cells numbered `count - 1` down to 0.
+private intact(head: *u8, count: usize) -> bool
+    var p = head
+    var n = count
+    while p != null
+        if n == 0 then return false
+        n -= 1
+        val words: *usize = ptr_cast(p)
+        if words[1] != n then return false
+        val next: **u8 = ptr_cast(p)
+        p = next[0]
+    n == 0
+
+// How many workers have attached. Each waits, polling, until all have, so their allocations overlap.
+private var attached: Atomic[u32] = Atomic(0)
+
+private build(j: *Job) -> unit
+    val ctx = thread_attach()
+    link(ctx, &j.root)
+    _ = attached.add(1)
+    while attached.load() < u32(Workers)
+        if requested.load(Relaxed) != 0 then safepoint(ctx)
+    for i in 0..<j.count
+        val p = allocate(ctx, &cell.header)
+        val next: **u8 = ptr_cast(p)
+        next[0] = j.root.slot
+        val words: *usize = ptr_cast(p)
+        words[1] = i
+        j.root.slot = p
+        // A poll, as compiled code makes on a loop's back edge.
+        if requested.load(Relaxed) != 0 then safepoint(ctx)
+    collect(ctx)
+    j.ok = intact(j.root.slot, j.count)
+    unlink_root(ctx, &j.root)
+    thread_detach(ctx)
+
+// A thread that collects over and over until `halt` is raised, as another thread's allocation would.
+private struct Collector
+    halt: Atomic[u32]
+    rounds: usize
+
+private var collector: Collector = Collector(Atomic(0), 0)
+
+private collect_repeatedly(k: *Collector) -> unit
+    val ctx = thread_attach()
+    loop
+        collect(ctx)
+        k.rounds += 1
+        if k.halt.load() != 0 then break
+    thread_detach(ctx)
+
+private run_workers(count: usize)
+    var threads: [4]Option[Thread] = [None; 4]
+    attached.store(0)
+    for i in 0..<Workers
+        jobs[i] = Job(Root(Frame(null, 1), null), count, false)
+        threads[i] = spawn(&build, &jobs[i])
+    for i in 0..<Workers
+        threads[i] match
+            Some(t) -> assert(t.join())
+            None -> assert(false, "a thread did not start")
+    for i in 0..<Workers
+        assert(jobs[i].ok, "a worker's list lost cells")
+
+@test("threads allocating while every allocation collects keep every cell their frames hold")
+allocation_under_stress()
+    val before = stops
+    stress = true
+    run_workers(1500)
+    stress = false
+    assert(stops > before)
+    collect_now()
+    assert_eq(gc.live(&space), 0usize)
+
+@test("threads allocating while another thread collects over and over keep every cell")
+allocation_beside_a_collector()
+    collector.halt.store(0)
+    collector.rounds = 0
+    val k = spawn(&collect_repeatedly, &collector).unwrap()
+    run_workers(4000)
+    collector.halt.store(1)
+    assert(k.join())
+    assert(collector.rounds > 0)
+    collect_now()
+    assert_eq(gc.live(&space), 0usize)
+
+// A thread that roots one object and then spins on polls until `halt` is raised, as a compiled loop
+// with no allocation in it does.
+private struct Spinner
+    root: Root
+    ready: Atomic[u32]
+    halt: Atomic[u32]
+    parks: usize
+
+private var spinner: Spinner = Spinner(Root(Frame(null, 1), null), Atomic(0), Atomic(0), 0)
+
+private spin(s: *Spinner) -> unit
+    val ctx = thread_attach()
+    link(ctx, &s.root)
+    s.root.slot = allocate(ctx, &cell.header)
+    s.ready.store(1)
+    while s.halt.load() == 0
+        if requested.load(Relaxed) != 0
+            safepoint(ctx)
+            s.parks += 1
+    unlink_root(ctx, &s.root)
+    thread_detach(ctx)
+
+@test("a collection waits for a thread to park at a poll, and scans the parked thread's frames")
+parked_frames_are_scanned()
+    spinner.ready.store(0)
+    spinner.halt.store(0)
+    spinner.parks = 0
+    val t = spawn(&spin, &spinner).unwrap()
+    while spinner.ready.load() == 0
+        _ = yield_now()
+    val me = thread_attach()
+    for _ in 0..<20
+        collect(me)
+        assert_eq(gc.live(&space), 1usize)
+    spinner.halt.store(1)
+    assert(t.join())
+    // A thread parked once may stay parked through several collections in a row.
+    assert(spinner.parks >= 1)
+    collect(me)
+    assert_eq(gc.live(&space), 0usize)
+    thread_detach(me)
+
+// A thread that marks itself safe, as it does around a blocking call, waits for `go`, and then marks
+// itself running.
+private struct Sleeper
+    root: Root
+    safe: Atomic[u32]
+    go: Atomic[u32]
+    running: Atomic[u32]
+
+private var sleeper: Sleeper = Sleeper(Root(Frame(null, 1), null), Atomic(0), Atomic(0), Atomic(0))
+
+private sleep_safely(s: *Sleeper) -> unit
+    val ctx = thread_attach()
+    link(ctx, &s.root)
+    s.root.slot = allocate(ctx, &cell.header)
+    enter_safe(ctx)
+    s.safe.store(1)
+    while s.go.load() == 0
+        _ = yield_now()
+    leave_safe(ctx)
+    s.running.store(1)
+    unlink_root(ctx, &s.root)
+    thread_detach(ctx)
+
+@test("a thread in a safe region does not hold up a collection, and does not run again until it ends")
+safe_regions()
+    sleeper.safe.store(0)
+    sleeper.go.store(0)
+    sleeper.running.store(0)
+    val t = spawn(&sleep_safely, &sleeper).unwrap()
+    while sleeper.safe.load() == 0
+        _ = yield_now()
+    val me = thread_attach()
+    // The sleeper never polls, so this finishes only because its context is safe.
+    collect(me)
+    assert_eq(gc.live(&space), 1usize)
+    // Hold the world stopped, let the sleeper leave its region, and see that it waits.
+    heap_lock.lock()
+    assert(stop_others(me))
+    sleeper.go.store(1)
+    for _ in 0..<20000
+        _ = yield_now()
+    assert_eq(sleeper.running.load(), 0u32)
+    resume_others()
+    heap_lock.unlock()
+    assert(t.join())
+    assert_eq(sleeper.running.load(), 1u32)
+    thread_detach(me)
+    collect_now()
+    assert_eq(gc.live(&space), 0usize)
+
+@test("with one thread attached a collection stops nobody and the poll flag stays down")
+one_thread_never_stops()
+    val me = thread_attach()
+    val before = stops
+    stress = true
+    for _ in 0..<100
+        _ = allocate(me, &cell.header)
+        assert_eq(requested.load(), 0u32)
+    collect(me)
+    stress = false
+    assert_eq(stops, before)
+    thread_detach(me)
+    collect_now()
+    assert_eq(gc.live(&space), 0usize)
+
+@test("a thread's context is attached running and detached safe, and the list keeps the others")
+thread_contexts()
+    val a = thread_attach()
+    val b = thread_attach()
+    assert_eq(a.state.load(), Running)
+    assert(contexts == b && b.next == a)
+    thread_detach(b)
+    assert(contexts == a)
+    thread_detach(a)
+    assert(contexts == null)
