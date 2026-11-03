@@ -27,21 +27,8 @@ emit_llvm(program: MirProgram) -> string
         push_bytes(&out, text)
         out.push("\" }, align 8\n")
     out.push("\n")
-    // Each descriptor is the header the runtime reads (tag, size, reference count) followed by the
-    // reference offsets; a constant object is one word, its descriptor.
     for i in 0..<program.descriptors.len()
-        val d = program.descriptors[i]
-        val n = d.refs.len()
-        out.push(s"; ${d.name}\n@avin.desc.$i = private constant { i64, i64, i64, [$n x i64] } { i64 ${d.tag}, i64 ${d.size}, i64 $n, [$n x i64] ")
-        if n == 0 then out.push("zeroinitializer")
-        else
-            out.push("[")
-            for j in 0..<n
-                if j > 0 then out.push(", ")
-                out.push(s"i64 ${d.refs[j]}")
-            out.push("]")
-        out.push(" }\n")
-        if d.constant then out.push(s"@avin.obj.$i = private constant ptr @avin.desc.$i, align 16\n")
+        emit_descriptor(&out, program, i)
     // A closure that captures nothing is constant: its descriptor, then its entry's address.
     for i in 0..<program.closures.len()
         val k = program.closures[i]
@@ -209,6 +196,43 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
             Unreachable -> out.push("  unreachable\n")
     out.push("}\n\n")
 
+// A descriptor is the header the runtime reads (tag, size, reference count) followed by the
+// reference offsets; a constant object is one word, its descriptor. A class's method table sits
+// directly before its descriptor, in the same constant, so slot `s` is the word 8(s + 1) bytes
+// before the address an object's descriptor word holds; `@avin.desc.N` names that address. An
+// abstract method's slot is null: no object of its class exists.
+private emit_descriptor(out: *StrBuilder, program: MirProgram, i: usize)
+    val d = program.descriptors[i]
+    val n = d.refs.len()
+    val header = s"{ i64, i64, i64, [$n x i64] }"
+    var body = str_builder()
+    body.push(s"{ i64 ${d.tag}, i64 ${d.size}, i64 $n, [$n x i64] ")
+    if n == 0 then body.push("zeroinitializer")
+    else
+        body.push("[")
+        for j in 0..<n
+            if j > 0 then body.push(", ")
+            body.push(s"i64 ${d.refs[j]}")
+        body.push("]")
+    body.push(" }")
+    val value = body.finish()
+    val m = d.methods.len()
+    if m == 0 then out.push(s"; ${d.name}\n@avin.desc.$i = private constant $header $value\n")
+    else
+        val whole = s"{ [$m x ptr], $header }"
+        out.push(s"; ${d.name}\n@avin.methods.$i = private constant $whole { [$m x ptr] [")
+        for j in 0..<m
+            if j > 0 then out.push(", ")
+            d.methods[m - 1 - j] match
+                Some(f) -> out.push("ptr @\"" + program.functions[f].symbol + "\"")
+                None -> out.push("ptr null")
+        out.push(s"], $header $value }, align 8\n")
+        out.push(s"@avin.desc.$i = private alias $header, ptr getelementptr inbounds ($whole, ptr @avin.methods.$i, i32 0, i32 1)\n")
+    if d.constant then out.push(s"@avin.obj.$i = private constant ptr @avin.desc.$i, align 16\n")
+
+/** The byte offset from a descriptor to the method in slot `slot` of the table before it. */
+private method_slot_offset(slot: usize) -> string = "-" + ((slot + 1) * 8).to_string()
+
 /** The value an instruction defines, if any. */
 private inst_dest(inst: Inst) -> Option[usize] = inst match
     Call(dest, _, _) -> dest
@@ -221,6 +245,7 @@ private inst_dest(inst: Inst) -> Option[usize] = inst match
     Store(_, _) -> None
     Alloc(dest, _) -> Some(dest)
     Offset(dest, _, _) -> Some(dest)
+    MethodSlot(dest, _, _) -> Some(dest)
 
 private need(intrinsics: *Buf[string], declaration: string)
     if !contains(*intrinsics, declaration) then intrinsics.push(declaration)
@@ -335,6 +360,11 @@ private emit_inst(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgra
             out.push(s"  %v$dest = call ptr @avin_rt_alloc(ptr %ctx, ptr @avin.desc.$descriptor)\n")
         Offset(dest, base, bytes) ->
             out.push(s"  %v$dest = getelementptr inbounds i8, ptr " + operand(program, f, base) + s", i64 $bytes\n")
+        MethodSlot(dest, object, slot) ->
+            out.push(s"  %t$next = load ptr, ptr " + operand(program, f, object) + ", align 8\n")
+            out.push(s"  %t${next + 1} = getelementptr inbounds i8, ptr %t$next, i64 ${method_slot_offset(slot)}\n")
+            out.push(s"  %v$dest = load ptr, ptr %t${next + 1}, align 8\n")
+            next += 2
         Call(dest, Direct(index), args) ->
             val callee = program.functions[index]
             out.push("  ")

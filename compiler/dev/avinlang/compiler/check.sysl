@@ -68,8 +68,25 @@ struct ClassSymbol
     /** The symbols of its methods, in declaration order. */
     methods: Buf[usize]
     constructor: usize
-    /** While the constructor is checked, how many fields its code has initialized so far. */
+    /** While the class body is checked, how many fields its code has initialized so far. */
     ready: usize
+    /** The superclass, its type arguments written in this class's own type parameters. */
+    superclass: Option[&Type]
+    /** How many of `fields` the class inherits: the superclass's fields lead, in the superclass's
+     * order, so the superclass's code finds each at the offset it expects. */
+    inherited: usize
+    /** The function the class body is checked as. For a final class it is the constructor. For an
+     * open or abstract class it takes the object as its first parameter, so a subclass's constructor
+     * runs it on the subclass's object; the class's own constructor allocates and then calls it. */
+    initializer: usize
+    /** The method in each slot of the class's method table: the superclass's slots first, in the
+     * same positions, each holding this class's override where it has one, then a slot for each
+     * method the class adds that a subclass may override. */
+    slots: Buf[usize]
+    /** For each of `methods`, whether it is declared `override`. */
+    overriding: Buf[bool]
+    /** 0 before the class's superclass is linked, 1 while it is, 2 after. */
+    linked: u8
     /** For an object, the class of the same name in its module; for a class, that object. Each may
      * use the other's private members. */
     companion: Option[usize]
@@ -99,6 +116,8 @@ struct FieldSymbol
     mutable: bool
     public: bool
     param: bool
+    /** The class that declares the field: a subclass inherits its superclass's fields. */
+    owner: usize
 
 /** A `data` type and its variants. Field types name the type's own parameters as
  * `TypeVar(data_owner(id), i)`, so a field of a particular value's type is its declared type with the
@@ -211,6 +230,9 @@ struct Checker
     /** Whether the names a pattern binds are assignable: set while a `var` binding's pattern is
      * checked. */
     binds_var: bool
+    /** Whether a superclass's constructor arguments are being checked: they run before the class
+     * stores its parameters, so a parameter's name reads the argument itself, not its field. */
+    super_args: bool
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -236,7 +258,7 @@ end Checked
 /** Checks a program. The last unit is the program's own file, which must declare `main`; the units
  * before it (the prelude) are visible to it, and its own declarations shadow theirs. */
 check_program(units: Buf[SourceUnit]) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false)
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false, false)
     // Every type is named before any is used, so a data type may refer to itself or to one
     // declared after it, and functions are declared once every type is known.
     for u in 0..<c.units.len()
@@ -244,13 +266,24 @@ check_program(units: Buf[SourceUnit]) -> Checked
     for u in 0..<c.units.len()
         declare_variants(&c, u)
         declare_fields(&c, u)
+    // A subclass's fields and methods follow its superclass's, wherever either is declared.
+    for id in 0..<c.classes.len()
+        inherit_fields(&c, id)
     for u in 0..<c.units.len()
         declare_unit(&c, u)
         declare_methods(&c, u)
+    var linked: Buf[bool] = buf()
+    for _ in c.classes
+        linked.push(false)
+    for id in 0..<c.classes.len()
+        link_methods(&c, id, &linked)
     for u in 0..<c.units.len()
         declare_globals(&c, u)
     for id in 0..<c.symbols.len()
         check_function(&c, id)
+    for id in 0..<c.classes.len()
+        settle_inherited_fields(&c, id)
+        check_override_results(&c, id)
     for g in 0..<c.globals.len()
         settle_global(&c, g)
     val init = initializer(&c, initialization_order(&c))
@@ -297,7 +330,7 @@ private declare_unit(c: *Checker, unit: usize)
                     for other in ids
                         if c.symbols[other].unit == unit && !c.symbols[other].constructor then set.push(other)
                 val id = c.symbols.len()
-                val symbol = signature(c, unit, file.module_name, f, id, f.type_params)
+                val symbol = signature(c, unit, file.module_name, f, id, f.type_params, false)
                 if same_as_overload(c, symbol, set)
                     c.note(unit, f.name_span, s"`${f.name}` is declared more than once with the same parameter types; overloads differ in their parameter types, and a function that chooses by its arguments' values is written with clauses")
                     continue
@@ -411,7 +444,7 @@ private declare_types(c: *Checker, unit: usize)
                 continue
             seen.put(d.name, d.span)
             c.class_types.put(d.name, c.classes.len())
-            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, None))
+            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, None, None))
     // An object is a class with one instance. Named after a class of its module, it is that class's
     // companion and its type has no name of its own; otherwise its name is also its type's.
     var objects: Map[string, Span] = map()
@@ -438,7 +471,7 @@ private declare_types(c: *Checker, unit: usize)
                     c.note(unit, d.name_span, s"`${d.name}` is already a data type; an object may share its name only with a class")
                     continue
             else c.class_types.put(d.name, id)
-            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, companion, None))
+            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, companion, None))
 
 // A variant's fields are resolved with its type's parameters in scope. Variant names share one
 // space within a file, since a variant is named on its own (`Some(1)`, `None`) wherever it is used.
@@ -489,9 +522,9 @@ private declare_fields(c: *Checker, unit: usize)
         val d = k.decl
         for a in d.annotations
             c.note(unit, a.span, s"unknown annotation `@${a.name}`")
-        if d.modifier != "" then c.note(unit, d.modifier_span, s"`${d.modifier}` classes are not implemented; every class is final")
-        for p in d.parents
-            c.note(unit, p.span, if d.object then "an object extending a class or traits is not implemented" else "inheritance is not implemented")
+        if d.object
+            for p in d.parents
+                c.note(unit, p.span, "an object extending a class or traits is not implemented")
         for t in d.derives
             c.note(unit, t.span, "`derives` is not implemented")
         for tp in d.type_params
@@ -499,6 +532,10 @@ private declare_fields(c: *Checker, unit: usize)
             if !(tp.variance is Invariant) then c.note(unit, tp.span, "variance on a class's type parameters is not implemented")
         val outer_generic = c.generic
         c.generic = Some(GenericScope(class_owner(id), d.type_params))
+        for i in 0..<d.parents.len()
+            if d.object then break
+            if i == 0 then c.classes[id].superclass = superclass_of(c, unit, id, d.parents[i])
+            else c.note(unit, d.parents[i].span, "inheriting from traits is not implemented")
         var fields: Buf[FieldSymbol] = buf()
         for cp in d.params
             val name = cp.param.pattern.kind match
@@ -506,15 +543,147 @@ private declare_fields(c: *Checker, unit: usize)
                 _ -> "_"
             if cp.param.default is Some(e) then c.note(unit, e.span, "default parameter values are not implemented")
             if field_named(fields, name) is Some(_) then c.note(unit, cp.param.pattern.span, s"the field `$name` is declared more than once")
-            fields.push(FieldSymbol(name, cp.param.pattern.span, Some(resolve_type(c, unit, cp.param.ty)), cp.mutable, cp.public, true))
+            fields.push(FieldSymbol(name, cp.param.pattern.span, Some(resolve_type(c, unit, cp.param.ty)), cp.mutable, cp.public, true, id))
         for m in d.members
             if m is FieldMember(f)
                 if field_named(fields, f.name) is Some(_) then c.note(unit, f.span, s"the field `${f.name}` is declared more than once")
                 var ty: Option[&Type] = None
                 if f.declared is Some(t) then ty = Some(resolve_type(c, unit, t))
-                fields.push(FieldSymbol(f.name, f.span, ty, f.mutable, f.public, false))
+                fields.push(FieldSymbol(f.name, f.span, ty, f.mutable, f.public, false, id))
         c.classes[id].fields = fields
         c.generic = outer_generic
+
+/** Whether a class may be extended: one declared `open` or `abstract`. */
+private is_open(c: *Checker, k: usize) -> bool = c.classes[k].decl.modifier != ""
+
+/** Whether a class is abstract, so it cannot be instantiated. */
+private is_abstract_class(c: *Checker, k: usize) -> bool = c.classes[k].decl.modifier == "abstract"
+
+// The superclass after `:`: a class, called with its constructor arguments or named alone when it
+// takes none, its type arguments written when it is generic. Its arguments are checked with the
+// constructor.
+private superclass_of(c: *Checker, unit: usize, id: usize, parent: &Expr) -> Option[&Type]
+    var callee = parent
+    if parent.kind is Call(target, _) then callee = target
+    var written: Buf[&TypeExpr] = buf()
+    var named = callee
+    if callee.kind is TypeApply(inner, types)
+        written = types
+        named = inner
+    val name = named.kind match
+        Name(n) -> n
+        _ ->
+            c.note(unit, parent.span, "expected a superclass, as in `Base(arguments)`")
+            return None
+    val sid = c.class_types.get(name) match
+        Some(s) -> s
+        None ->
+            if c.types.get(name) is Some(_) || builtin_type(name) is Some(_)
+                c.note(unit, named.span, s"`$name` is not a class, so it cannot be extended")
+            else c.note(unit, named.span, s"`$name` is not a class; inheriting from traits is not implemented")
+            return None
+    val s = c.classes[sid]
+    if !is_open(c, sid)
+        c.note(unit, named.span, s"`$name` is final; declare it `open` or `abstract` to extend it")
+        return None
+    var args: Buf[&Type] = buf()
+    for t in written
+        args.push(resolve_type(c, unit, t))
+    if args.len() != s.decl.type_params.len()
+        if args.len() == 0 then c.note(unit, named.span, s"`$name` is generic; write its type arguments, as in `$name[int](…)`")
+        else c.note(unit, named.span, s"`$name` takes ${count(s.decl.type_params.len(), "type argument")}, not ${args.len()}")
+        return None
+    Some(Class(sid, name, args))
+
+// A subclass's fields are its superclass's, at the same positions and with the superclass's type
+// arguments substituted, followed by its own. A field of its own may share the name of an inherited
+// one only when one of the two is private: a public field is never overridden.
+private inherit_fields(c: *Checker, id: usize)
+    if c.classes[id].linked == 2 then return
+    val k = c.classes[id]
+    if k.linked == 1
+        c.note(k.unit, k.decl.name_span, s"`${k.name}` inherits from itself")
+        c.classes[id].superclass = None
+        return
+    var sid = 0usize
+    var args: Buf[&Type] = buf()
+    if k.superclass is Some(t)
+        if *t is Class(s, _, a)
+            sid = s
+            args = a
+    if k.superclass is None
+        c.classes[id].linked = 2
+        return
+    c.classes[id].linked = 1
+    inherit_fields(c, sid)
+    if c.classes[id].superclass is None
+        c.classes[id].linked = 2
+        return
+    var fields: Buf[FieldSymbol] = buf()
+    for f in c.classes[sid].fields
+        var copy = f
+        if f.ty is Some(t) then copy.ty = Some(substitute(t, class_owner(sid), args))
+        fields.push(copy)
+    val inherited = fields.len()
+    for f in k.fields
+        for i in 0..<inherited
+            if fields[i].name == f.name && fields[i].public && f.public
+                c.note(k.unit, f.span, s"`${f.name}` is already a field of `${c.classes[fields[i].owner].name}`; a field cannot be overridden")
+        fields.push(f)
+    c.classes[id].fields = fields
+    c.classes[id].inherited = inherited
+    c.classes[id].linked = 2
+
+// An inherited field declared without a type has its type once its own class's body is checked.
+private settle_inherited_fields(c: *Checker, id: usize)
+    val k = c.classes[id]
+    if k.inherited == 0 then return
+    var sid = 0usize
+    var args: Buf[&Type] = buf()
+    if k.superclass is Some(t)
+        if *t is Class(s, _, a)
+            sid = s
+            args = a
+    settle_inherited_fields(c, sid)
+    for i in 0..<k.inherited
+        c.classes[id].fields[i].ty = Some(substitute(c.classes[sid].fields[i].ty.unwrap_or(ErrorType), class_owner(sid), args))
+
+/** The type `t`, an instance of a class or of one of its subclasses, as an instance of the class
+ * `target`, or `None` when `target` is not among its class's ancestors. */
+ancestor_type(classes: Buf[ClassSymbol], t: &Type, target: usize) -> Option[&Type]
+    var current = t
+    loop
+        *current match
+            Class(k, _, args) ->
+                if k == target then return Some(current)
+                current = substitute(classes[k].superclass?, class_owner(k), args)
+            _ -> return None
+    None
+
+/** Whether a field may be used from the code being checked: a public one, or a private one from
+ * code of the class that declares it or of its companion. */
+private field_visible(c: *Checker, f: FieldSymbol) -> bool = f.public || inside_class(c, f.owner)
+
+/** Whether a method may be called from the code being checked. */
+private method_visible(c: *Checker, m: usize) -> bool
+    if c.symbols[m].public then return true
+    c.symbols[m].owner_class match
+        Some(k) -> inside_class(c, k)
+        None -> false
+
+// The field of class `k` a name reaches from the code being checked: the class's own field first,
+// then the nearest ancestor's, passing over the private fields the code cannot see. When none is
+// visible, the nearest field of that name, so its privacy can be reported.
+private class_field(c: *Checker, k: usize, name: string) -> Option[usize]
+    val fields = c.classes[k].fields
+    var hidden: Option[usize] = None
+    var i = fields.len()
+    while i > 0
+        i -= 1
+        if fields[i].name != name then continue
+        if field_visible(c, fields[i]) then return Some(i)
+        if hidden is None then hidden = Some(i)
+    hidden
 
 private field_named(fields: Buf[FieldSymbol], name: string) -> Option[usize]
     for i in 0..<fields.len()
@@ -538,8 +707,8 @@ private declare_methods(c: *Checker, unit: usize)
         var names: Buf[string] = buf()
         for i in 0..<d.params.len()
             params.push(d.params[i].param)
-            types.push(k.fields[i].ty.unwrap_or(ErrorType))
-            names.push(k.fields[i].name)
+            types.push(k.fields[k.inherited + i].ty.unwrap_or(ErrorType))
+            names.push(k.fields[k.inherited + i].name)
         val decl = Function(buf(), d.span, d.name_span, d.name, d.type_params, params, None, None, buf())
         val constructor = c.symbols.len()
         var no_defaults: Buf[Option[usize]] = buf()
@@ -555,16 +724,41 @@ private declare_methods(c: *Checker, unit: usize)
             constructors.push(constructor)
             c.scope.put(d.name, constructors)
         c.classes[id].constructor = constructor
+        c.classes[id].initializer = constructor
+        if is_open(c, id)
+            // The initializer takes the object, then the constructor's parameters.
+            var init_types: Buf[&Type] = buf()
+            var init_names: Buf[string] = buf()
+            var init_defaults: Buf[Option[usize]] = buf()
+            init_types.push(self_type)
+            init_names.push("self")
+            init_defaults.push(None)
+            for i in 0..<types.len()
+                init_types.push(types[i])
+                init_names.push(names[i])
+                init_defaults.push(None)
+            c.classes[id].initializer = c.symbols.len()
+            c.symbols.push(FunctionSymbol(unit, module_name, d.name + ".<init>", decl, init_types, init_names, Some(Unit), None, None, buf(), buf(), buf(), false, false, false, init_defaults, None, class_owner(id), d.type_params, Some(id), true, true, ""))
+            c.states.push(0)
+            c.bodies.push(None)
+            c.locals.push(buf())
         var methods: Buf[usize] = buf()
+        var overriding: Buf[bool] = buf()
         for m in d.members
             if m is MethodMember(f, public, overrides)
-                if overrides then c.note(unit, f.name_span, "overriding is not implemented; every class is final")
                 if f.annotations.len() > 0 then c.note(unit, f.name_span, "annotations on methods are not implemented")
                 for p in f.params
                     if p.default is Some(e) then c.note(unit, e.span, "default arguments of methods are not implemented")
-                if field_named(k.fields, f.name) is Some(_)
-                    c.note(unit, f.name_span, s"`${f.name}` is already a field of `${d.name}`")
+                var clash: Option[usize] = None
+                for i in 0..<k.fields.len()
+                    if k.fields[i].name == f.name && (i >= k.inherited || k.fields[i].public) then clash = Some(i)
+                if clash is Some(i)
+                    c.note(unit, f.name_span, s"`${f.name}` is already a field of `${c.classes[k.fields[i].owner].name}`")
                     continue
+                val bodyless = f.body is None && f.clauses.len() == 0
+                if bodyless && !is_abstract_class(c, id)
+                    c.note(unit, f.name_span, s"`${f.name}` has no body; only an abstract class may leave a method without one")
+                if bodyless && !public then c.note(unit, f.name_span, s"`${f.name}` is abstract, so it cannot be private: a subclass implements it")
                 var duplicate = false
                 for other in methods
                     if c.symbols[other].decl.name == f.name then duplicate = true
@@ -576,7 +770,7 @@ private declare_methods(c: *Checker, unit: usize)
                     type_params.push(tp)
                 for tp in f.type_params
                     type_params.push(tp)
-                var symbol = signature(c, unit, module_name, f, class_owner(id), type_params)
+                var symbol = signature(c, unit, module_name, f, class_owner(id), type_params, true)
                 // The receiver comes first, named `self`.
                 var receiver_types: Buf[&Type] = buf()
                 var receiver_names: Buf[string] = buf()
@@ -596,11 +790,17 @@ private declare_methods(c: *Checker, unit: usize)
                     method_defaults.push(None)
                 symbol.defaults = method_defaults
                 methods.push(c.symbols.len())
+                overriding.push(overrides)
                 c.symbols.push(symbol)
                 c.states.push(0)
                 c.bodies.push(None)
                 c.locals.push(buf())
         c.classes[id].methods = methods
+        c.classes[id].overriding = overriding
+
+/** Whether a method is abstract: declared in a class without a body. */
+is_abstract_method(symbol: FunctionSymbol) -> bool =
+    symbol.owner_class is Some(_) && !symbol.constructor && symbol.intrinsic is None && symbol.decl.body is None && symbol.decl.clauses.len() == 0
 
 // Each module-level value and object of a file, in declaration order, which is the order they
 // initialize in where none depends on another. A value's initializer is checked as a function with
@@ -613,7 +813,7 @@ private declare_globals(c: *Checker, unit: usize)
                 if v.name == "_" || global_name_taken(c, unit, v.name, v.span, false) then continue
                 val f = Function(buf(), v.span, v.span, v.name, buf(), buf(), v.declared, Some(v.value), buf())
                 val init = c.symbols.len()
-                c.symbols.push(signature(c, unit, file.module_name, f, init, buf()))
+                c.symbols.push(signature(c, unit, file.module_name, f, init, buf(), false))
                 c.states.push(0)
                 c.bodies.push(None)
                 c.locals.push(buf())
@@ -655,10 +855,162 @@ private global_name_taken(c: *Checker, unit: usize, name: string, at: Span, obje
             return true
     false
 
-/** The method of class `id` declared as `name`. */
-private method_named(c: *Checker, id: usize, name: string) -> Option[usize]
+/** The method of class `id` declared as `name`, its own. */
+private own_method(c: *Checker, id: usize, name: string) -> Option[usize]
     for m in c.classes[id].methods
         if c.symbols[m].decl.name == name then return Some(m)
+    None
+
+// The method a name reaches on an instance of class `id`: the class's own, then the nearest
+// ancestor's, passing over the private methods of ancestors that the code being checked cannot see.
+// When none is visible, the nearest of that name, so its privacy can be reported.
+private method_named(c: *Checker, id: usize, name: string) -> Option[usize]
+    var hidden: Option[usize] = None
+    var k = id
+    loop
+        if own_method(c, k, name) is Some(m)
+            if method_visible(c, m) then return Some(m)
+            if hidden is None then hidden = Some(m)
+        val sup = c.classes[k].superclass match
+            Some(t) -> t
+            None -> return hidden
+        k = *sup match
+            Class(s, _, _) -> s
+            _ -> return hidden
+    hidden
+
+/** The slot of class `k`'s method table that holds the method named `name`, if it has one. */
+private slot_named(c: *Checker, k: usize, name: string) -> Option[usize]
+    val slots = c.classes[k].slots
+    for i in 0..<slots.len()
+        if c.symbols[slots[i]].decl.name == name then return Some(i)
+    None
+
+// A class's method table, built after its superclass's: the superclass's slots, then a slot for each
+// method a subclass may override. A method marked `override` takes the slot of the inherited method
+// it replaces, which must have the same parameter types and a result it conforms to; a method that
+// shares an inherited method's name without `override` is an error. A class that is not abstract
+// implements every abstract method it inherits.
+private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
+    if linked[id] then return
+    linked.set(id, true)
+    val k = c.classes[id]
+    val unit = k.unit
+    var slots: Buf[usize] = buf()
+    var sid: Option[usize] = None
+    var sargs: Buf[&Type] = buf()
+    if k.superclass is Some(t)
+        if *t is Class(s, _, a)
+            link_methods(c, s, linked)
+            sid = Some(s)
+            sargs = a
+            for m in c.classes[s].slots
+                slots.push(m)
+            for i in k.inherited..<k.fields.len()
+                if inherited_method(c, s, k.fields[i].name) is Some(m)
+                    c.note(unit, k.fields[i].span, s"`${k.fields[i].name}` is already a method of `${c.classes[c.symbols[m].owner_class.unwrap()].name}`")
+    for i in 0..<k.methods.len()
+        val m = k.methods[i]
+        val symbol = c.symbols[m]
+        val name = symbol.decl.name
+        val generic = symbol.decl.type_params.len() > 0
+        var inherited: Option[usize] = None
+        if sid is Some(s) then inherited = inherited_method(c, s, name)
+        if k.overriding[i]
+            val target = inherited match
+                Some(t) -> t
+                None ->
+                    c.note(unit, symbol.decl.name_span, s"`$name` overrides nothing; no superclass of `${k.name}` has a method `$name`")
+                    continue
+            if !symbol.public
+                c.note(unit, symbol.decl.name_span, s"`$name` overrides a public method, so it cannot be private")
+                continue
+            val slot = slot_named(c, sid.unwrap(), name) match
+                Some(s) -> s
+                None ->
+                    c.note(unit, symbol.decl.name_span, s"`${c.symbols[target].name}` has type parameters of its own, so it cannot be overridden")
+                    continue
+            if generic
+                c.note(unit, symbol.decl.name_span, s"`$name` has type parameters of its own, so it cannot override `${c.symbols[target].name}`")
+                continue
+            if overrides_matches(c, id, m, target)
+                slots.set(slot, m)
+        elif inherited is Some(t)
+            c.note(unit, symbol.decl.name_span, s"`$name` overrides `${c.symbols[t].name}`; mark it `override`")
+        elif is_open(c, id) && symbol.public && !generic then slots.push(m)
+    c.classes[id].slots = slots
+    if !is_abstract_class(c, id)
+        for m in slots
+            if is_abstract_method(c.symbols[m])
+                c.note(unit, k.decl.name_span, s"`${k.name}` does not implement `${c.symbols[m].decl.name}` from `${c.classes[c.symbols[m].owner_class.unwrap()].name}`; implement it, or declare `${k.name}` abstract")
+
+// An override takes the parameters of the method it overrides, with the superclass's type arguments
+// substituted, and yields its result or, for a class, a subclass of it.
+private overrides_matches(c: *Checker, id: usize, m: usize, target: usize) -> bool
+    val unit = c.classes[id].unit
+    val symbol = c.symbols[m]
+    val base = c.symbols[target]
+    val owner = base.owner_class.unwrap()
+    val args = ancestor_type(c.classes, own_class_type(c.classes[id], id), owner) match
+        Some(t) -> *t match
+            Class(_, _, a) -> a
+            _ -> buf()
+        None -> buf()
+    val described = s"`${symbol.decl.name}` overrides `${base.name}`"
+    if symbol.params.len() != base.params.len()
+        c.note(unit, symbol.decl.name_span, s"$described, which takes ${count(base.params.len() - 1, "parameter")}, not ${symbol.params.len() - 1}")
+        return false
+    for i in 1..<base.params.len()
+        val want = substitute(base.params[i], class_owner(owner), args)
+        if !same_type(symbol.params[i], want)
+            c.note(unit, symbol.decl.name_span, s"$described, whose parameter `${base.param_names[i]}` is ${type_name(want)}, not ${type_name(symbol.params[i])}")
+            return false
+    true
+
+// The results of overrides, compared once every body is checked, since a result may be inferred: an
+// override yields the overridden method's result or, where that is a class, a subclass of it.
+private check_override_results(c: *Checker, id: usize)
+    val k = c.classes[id]
+    val sup = k.superclass match
+        Some(t) -> t
+        None -> return
+    val sid = *sup match
+        Class(s, _, _) -> s
+        _ -> return
+    val base_slots = c.classes[sid].slots
+    for i in 0..<base_slots.len()
+        val m = k.slots[i]
+        if m == base_slots[i] || c.symbols[m].owner_class != Some(id) then continue
+        val symbol = c.symbols[m]
+        val base = c.symbols[base_slots[i]]
+        val owner = base.owner_class.unwrap()
+        val args = ancestor_type(c.classes, own_class_type(k, id), owner) match
+            Some(t) -> *t match
+                Class(_, _, a) -> a
+                _ -> buf()
+            None -> buf()
+        val want = substitute(base.result.unwrap_or(ErrorType), class_owner(owner), args)
+        val own = symbol.result.unwrap_or(ErrorType)
+        var fits = alike_or_error(own, want)
+        if *want is Class(b, _, _)
+            if ancestor_type(c.classes, own, b) is Some(up) then fits = alike_or_error(up, want)
+        if !fits
+            c.note(k.unit, symbol.decl.name_span, s"`${symbol.decl.name}` overrides `${base.name}`, which yields ${type_name(want)}, not ${type_name(own)}")
+
+private alike_or_error(a: &Type, b: &Type) -> bool = *a is ErrorType || *b is ErrorType || same_type(a, b)
+
+/** The nearest public method named `name` of class `id` or its ancestors: what a subclass inherits. */
+private inherited_method(c: *Checker, id: usize, name: string) -> Option[usize]
+    var k = id
+    loop
+        if own_method(c, k, name) is Some(m)
+            if c.symbols[m].public then return Some(m)
+        val sup = c.classes[k].superclass match
+            Some(t) -> t
+            None -> return None
+        k = *sup match
+            Class(s, _, _) -> s
+            _ -> return None
     None
 
 /** `n` and a noun, plural unless `n` is one: "1 field", "2 fields". */
@@ -671,7 +1023,7 @@ private contains_name(names: Buf[string], name: string) -> bool
 
 // `owner` and `type_params` are the type parameters in scope in the signature: a function's own, or
 // for a method its class's and its own.
-private signature(c: *Checker, unit: usize, module_name: string, f: &Function, owner: usize, type_params: Buf[TypeParam]) -> FunctionSymbol
+private signature(c: *Checker, unit: usize, module_name: string, f: &Function, owner: usize, type_params: Buf[TypeParam], bodyless: bool) -> FunctionSymbol
     var params: Buf[&Type] = buf()
     var names: Buf[string] = buf()
     // A generic function's own type parameters are in scope in its signature.
@@ -704,7 +1056,7 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
                 if !same_type(declared, expected)
                     c.note(unit, f.name_span, s"intrinsic `$name` has type ${type_name(expected)}, not ${type_name(declared)}")
             None -> c.note(unit, f.name_span, s"`$name` is not an intrinsic")
-    elif f.body is None && f.clauses.len() == 0
+    elif f.body is None && f.clauses.len() == 0 && !bodyless
         c.note(unit, f.name_span, s"`${f.name}` needs a body, or clauses on the lines after it")
     c.generic = outer_generic
     FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf(), false, false, false, buf(), None, owner, type_params, None, false, true, "")
@@ -885,11 +1237,11 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
             val body = check_expr(c, b.body, symbol.result)
             symbol.result match
                 Some(declared) ->
-                    if !conforms(body.ty, declared) && !(*declared is Unit)
+                    if !fits(c,body.ty, declared) && !(*declared is Unit)
                         c.note(unit, b.body.span, s"${described(symbol)} yields ${type_name(body.ty)}, not ${type_name(declared)}")
                 None ->
                     if agreed
-                        join(ty, body.ty) match
+                        join(c, ty, body.ty) match
                             Some(t) -> ty = t
                             None ->
                                 c.note(unit, b.body.span, s"this clause yields ${type_name(body.ty)}, but the clauses before it yield ${type_name(ty)}")
@@ -923,32 +1275,57 @@ private check_body(c: *Checker, id: usize, body: &Expr)
     val typed = check_expr(c, body, symbol.result)
     symbol.result match
         Some(declared) ->
-            if !conforms(typed.ty, declared) && !(*declared is Unit)
+            if !fits(c,typed.ty, declared) && !(*declared is Unit)
                 c.note(symbol.unit, body.span, s"${described(symbol)} yields ${type_name(typed.ty)}, not ${type_name(declared)}")
         None -> c.symbols[id].result = Some(typed.ty)
     c.bodies.set(id, Some(typed))
 
-// A constructor makes the object, stores its parameters into their fields, then runs the class body
-// top to bottom: each statement, and each field's initializer where the field is declared. It
-// yields the object. `self` is a local holding the object, so code in the body that captures it
-// captures it as it would any local.
+// A constructor makes the object, runs the superclass's initializer on it, stores its parameters
+// into their fields, then runs the class body top to bottom: each statement, and each field's
+// initializer where the field is declared. It yields the object. `self` is a local holding the
+// object, so code in the body that captures it captures it as it would any local. An open or
+// abstract class does all but the allocation in its initializer, which is given the object, and its
+// constructor allocates the object and calls the initializer.
 private check_constructor(c: *Checker, id: usize)
     val symbol = c.symbols[id]
     val k = symbol.owner_class.unwrap()
-    val decl = c.classes[k].decl
+    val cls = c.classes[k]
+    val decl = cls.decl
     val unit = symbol.unit
-    val self_type = symbol.result.unwrap()
+    val self_type = own_class_type(cls, k)
     val self_local = c.body.locals.len()
     c.body.locals.push(TLocal("self", self_type, false, id))
     c.body.visible.push(self_local)
     val receiver = TExpr(decl.name_span, self_type, Local(self_local))
     var items: Buf[&TExpr] = buf()
-    items.push(TExpr(decl.span, Unit, Let(self_local, TExpr(decl.name_span, self_type, New))))
-    for i in 0..<symbol.params.len()
-        items.push(TExpr(decl.span, Unit, StoreField(receiver, i, TExpr(decl.name_span, symbol.params[i], Param(i)), false)))
-    c.classes[k].ready = symbol.params.len()
+    val made = TExpr(decl.name_span, self_type, New)
+    if cls.initializer != id
+        items.push(TExpr(decl.span, Unit, Let(self_local, made)))
+        var args: Buf[&TExpr] = buf()
+        args.push(receiver)
+        for i in 0..<symbol.params.len()
+            args.push(TExpr(decl.name_span, symbol.params[i], Param(i)))
+        var type_args: Buf[&Type] = buf()
+        if *self_type is Class(_, _, a) then type_args = a
+        items.push(TExpr(decl.span, Unit, Call(cls.initializer, args, type_args)))
+        items.push(receiver)
+        c.bodies.set(id, Some(TExpr(decl.span, self_type, Block(items))))
+        return
+    // An initializer's object is its first parameter, and the class's parameters follow it.
+    val first = if cls.constructor == id then 0usize else 1usize
+    items.push(TExpr(decl.span, Unit, Let(self_local, if first == 0 then made else TExpr(decl.name_span, self_type, Param(0)))))
+    c.classes[k].ready = 0
     var finishes = true
-    var index = symbol.params.len()
+    if cls.superclass is Some(sup)
+        val parent = decl.parents[0]
+        val call = super_initialization(c, receiver, sup, parent)
+        if *call.ty is Nothing then finishes = false
+        items.push(call)
+    val count_params = symbol.params.len() - first
+    for i in 0..<count_params
+        items.push(TExpr(decl.span, Unit, StoreField(receiver, cls.inherited + i, TExpr(decl.name_span, symbol.params[first + i], Param(first + i)), false)))
+    c.classes[k].ready = cls.inherited + count_params
+    var index = cls.inherited + count_params
     for m in decl.members
         m match
             FieldMember(f) ->
@@ -956,7 +1333,7 @@ private check_constructor(c: *Checker, id: usize)
                 val typed = check_expr(c, f.value, declared)
                 declared match
                     Some(want) ->
-                        if !conforms(typed.ty, want) then c.note(unit, f.value.span, s"expected ${type_name(want)}, found ${type_name(typed.ty)}")
+                        if !fits(c,typed.ty, want) then c.note(unit, f.value.span, s"expected ${type_name(want)}, found ${type_name(typed.ty)}")
                     None ->
                         val inferred = zonk(c, typed.ty)
                         if has_unknowns(inferred)
@@ -972,8 +1349,40 @@ private check_constructor(c: *Checker, id: usize)
                 if *t.ty is Nothing then finishes = false
                 items.push(t)
             MethodMember(_, _, _) -> ()
-    items.push(receiver)
-    c.bodies.set(id, Some(TExpr(decl.span, if finishes then self_type else Nothing, Block(items))))
+    if first == 0
+        items.push(receiver)
+        c.bodies.set(id, Some(TExpr(decl.span, if finishes then self_type else Nothing, Block(items))))
+    else
+        items.push(TExpr(decl.span, Unit, UnitConst))
+        c.bodies.set(id, Some(TExpr(decl.span, if finishes then Unit else Nothing, Block(items))))
+
+// The call of the superclass's initializer on the object, with the arguments written after the
+// superclass's name. They are checked before the class stores its parameters, so a parameter's name
+// reads the argument passed for it, and no field of the object is ready yet.
+private super_initialization(c: *Checker, receiver: &TExpr, sup: &Type, parent: &Expr) -> &TExpr
+    val sid = *sup match
+        Class(s, _, _) -> s
+        _ -> 0usize
+    val sargs = *sup match
+        Class(_, _, a) -> a
+        _ -> buf()
+    var args: Buf[Argument] = buf()
+    var name_span = parent.span
+    if parent.kind is Call(callee, a)
+        args = a
+        name_span = callee.span
+    val s = c.classes[sid]
+    val constructor = c.symbols[s.constructor]
+    val signature = Signature(s.name, true, constructor.type_params, class_owner(sid), constructor.params, constructor.param_names, constructor.defaults, Unit, sargs)
+    val outer = c.super_args
+    c.super_args = true
+    val applied = apply(c, parent.span, name_span, signature, args, None, None, buf())
+    c.super_args = outer
+    var call_args: Buf[&TExpr] = buf()
+    call_args.push(receiver)
+    for a in applied.args
+        call_args.push(a)
+    applied.wrap(parent.span, Call(s.initializer, call_args, applied.type_args))
 
 private local_functions_of(c: *Checker, root: usize) -> Buf[usize]
     var out: Buf[usize] = buf()
@@ -1034,7 +1443,7 @@ private declare_local_functions(c: *Checker, items: Buf[&Expr])
             for i in start..<c.body.functions.len()
                 if c.symbols[c.body.functions[i]].name == decl.name then set.push(c.body.functions[i])
             val id = c.symbols.len()
-            var symbol = signature(c, enclosing.unit, enclosing.module_name, decl, id, decl.type_params)
+            var symbol = signature(c, enclosing.unit, enclosing.module_name, decl, id, decl.type_params, false)
             symbol.root = Some(c.body.root)
             if same_as_overload(c, symbol, set)
                 c.note(unit_of(c), decl.name_span, s"`${decl.name}` is declared more than once in this block with the same parameter types")
@@ -1090,8 +1499,11 @@ private class_member(c: *Checker, name: string) -> Option[MemberRef]
         Some(k) -> k
         None -> return None
     if local_function(c, name) is Some(_) then return None
-    if field_named(c.classes[k].fields, name) is Some(i) then return Some(FieldOf(i))
-    if method_named(c, k, name) is Some(m) then return Some(MethodOf(m))
+    // An ancestor's private member is not the subclass's to name.
+    if class_field(c, k, name) is Some(i)
+        if field_visible(c, c.classes[k].fields[i]) then return Some(FieldOf(i))
+    if method_named(c, k, name) is Some(m)
+        if method_visible(c, m) then return Some(MethodOf(m))
     None
 
 /** `self`, the instance the enclosing constructor or method works on. */
@@ -1212,20 +1624,35 @@ private lookup_local(c: *Checker, name: string) -> Option[usize]
 // through its field, which a `var` field's assignments change.
 private param_index(c: *Checker, name: string) -> Option[usize]
     val symbol = c.symbols[c.body.root]
-    if symbol.constructor then return None
+    if symbol.constructor
+        // A superclass's arguments read the parameters themselves; an initializer's object is not
+        // one of them.
+        if !c.super_args then return None
+        val first = if c.classes[symbol.owner_class.unwrap()].constructor == c.body.root then 0usize else 1usize
+        for i in first..<symbol.param_names.len()
+            if symbol.param_names[i] == name then return Some(i)
+        return None
     for i in 0..<symbol.param_names.len()
         if symbol.param_names[i] == name then return Some(i)
     None
 
 private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) -> &TExpr
+    if c.super_args && name == "self"
+        c.note(unit_of(c), at, "`self` cannot be used in a superclass's arguments, which run before the object is initialized")
+        return TExpr(at, ErrorType, UnitConst)
     if binding_ref(c, at, name) is Some(t) then return evaluated(t)
     val symbol = c.symbols[c.current]
+    if name == "super" && enclosing_class(c) is Some(_)
+        c.note(symbol.unit, at, "`super` calls a superclass's method, as in `super.describe()`")
+        return TExpr(at, ErrorType, UnitConst)
     class_member(c, name) match
         Some(FieldOf(i)) -> return field_read(c, at, at, self_ref(c, at), enclosing_class(c).unwrap(), i, true)
         Some(MethodOf(m)) -> return method_value(c, at, m)
         None -> ()
     if global_named(c, name) is Some(g) then return global_read(c, at, g)
-    if lookup_function(c, name) is Some(_) then return named_function_value(c, at, name, None, expected)
+    if lookup_function(c, name) is Some(id)
+        if abstract_constructor(c, id, at) then return TExpr(at, ErrorType, UnitConst)
+        return named_function_value(c, at, name, None, expected)
     if c.variants.get(name) is Some(v)
         if c.data[v.data].variants[v.index].fields.len() == 0 then return construct(c, at, at, v, buf(), None, expected)
         c.note(symbol.unit, at, s"`$name` has fields; call it, as in `$name(…)`")
@@ -1236,8 +1663,9 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
 // field must already be initialized: a parameter, or a body field declared above the read.
 private field_read(c: *Checker, at: Span, name_span: Span, object: &TExpr, k: usize, index: usize, own: bool) -> &TExpr
     val field = c.classes[k].fields[index]
-    if own && c.current == c.classes[k].constructor && index >= c.classes[k].ready
-        c.note(unit_of(c), name_span, s"`${field.name}` is read before its declaration in the class body initializes it")
+    if own && c.current == c.classes[k].initializer && index >= c.classes[k].ready
+        if c.super_args then c.note(unit_of(c), name_span, s"`${field.name}` is read in a superclass's arguments, which run before the object is initialized")
+        else c.note(unit_of(c), name_span, s"`${field.name}` is read before its declaration in the class body initializes it")
         return TExpr(at, ErrorType, UnitConst)
     val ty = field_type(c, k, index, name_span)
     val args = *zonk(c, object.ty) match
@@ -1245,10 +1673,14 @@ private field_read(c: *Checker, at: Span, name_span: Span, object: &TExpr, k: us
         _ -> buf()
     TExpr(at, substitute(ty, class_owner(k), args), Field(object, index))
 
-// A field declared without a type has its initializer's, so the constructor is checked first.
+// A field declared without a type has its initializer's, so the class body is checked first. An
+// inherited field's type is its declaring class's.
 private field_type(c: *Checker, k: usize, index: usize, at: Span) -> &Type
+    if index < c.classes[k].inherited
+        if c.classes[k].superclass is Some(sup)
+            if *sup is Class(sid, _, args) then return substitute(field_type(c, sid, index, at), class_owner(sid), args)
     if c.classes[k].fields[index].ty is Some(t) then return t
-    val constructor = c.classes[k].constructor
+    val constructor = c.classes[k].initializer
     if c.states[constructor] == 0
         check_function(c, constructor)
         return c.classes[k].fields[index].ty.unwrap_or(ErrorType)
@@ -1268,6 +1700,16 @@ private inside_class(c: *Checker, k: usize) -> bool
         Some(h) -> h
         None -> return false
     here == k || c.classes[k].companion == Some(here)
+
+// An abstract class has a constructor its subclasses' constructors run, but cannot be called to make
+// an object of its own; reports whether `id` is one.
+private abstract_constructor(c: *Checker, id: usize, at: Span) -> bool
+    val symbol = c.symbols[id]
+    if !symbol.constructor then return false
+    val k = symbol.owner_class.unwrap()
+    if !is_abstract_class(c, k) then return false
+    c.note(unit_of(c), at, s"`${c.classes[k].name}` is abstract, so it cannot be instantiated; instantiate a subclass")
+    true
 
 // A local or a parameter by name, as it is stored: a by-name parameter is its delayed expression,
 // not yet evaluated.
@@ -1289,7 +1731,9 @@ private evaluated(t: &TExpr) -> &TExpr = *t.ty match
 // Type arguments written on a name that is not called: a variant with no fields, as in `None[int]`.
 private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], expected: Option[&Type]) -> &TExpr
     if target.kind is Name(name)
-        if lookup_function(c, name) is Some(_) then return named_function_value(c, e.span, name, Some(types), expected)
+        if lookup_function(c, name) is Some(id)
+            if abstract_constructor(c, id, target.span) then return TExpr(e.span, ErrorType, UnitConst)
+            return named_function_value(c, e.span, name, Some(types), expected)
         if lookup_local(c, name) is None && param_index(c, name) is None
             if c.variants.get(name) is Some(v)
                 if c.data[v.data].variants[v.index].fields.len() == 0
@@ -1323,9 +1767,9 @@ private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string) -> &TExpr
 // `object.name` on an object of class `k`: a field, which outside the class must be public.
 private class_member_value(c: *Checker, at: Span, object: &TExpr, k: usize, name: string) -> &TExpr
     val cls = c.classes[k]
-    if field_named(cls.fields, name) is Some(i)
-        if !cls.fields[i].public && !inside_class(c, k)
-            c.note(unit_of(c), at, s"`$name` is private to `${cls.name}`")
+    if class_field(c, k, name) is Some(i)
+        if !field_visible(c, cls.fields[i])
+            c.note(unit_of(c), at, s"`$name` is private to `${c.classes[cls.fields[i].owner].name}`")
             return TExpr(at, ErrorType, UnitConst)
         return field_read(c, at, at, object, k, i, is_self(c, object))
     if method_named(c, k, name) is Some(m) then return method_value(c, at, m)
@@ -1375,7 +1819,7 @@ private binding_expr(c: *Checker, e: &Expr, name: string, declared: Option[&Type
     val typed = check_expr(c, value, want)
     var ty = typed.ty
     if want is Some(w)
-        if !conforms(typed.ty, w) then c.note(unit, value.span, s"expected ${type_name(w)}, found ${type_name(typed.ty)}")
+        if !fits(c,typed.ty, w) then c.note(unit, value.span, s"expected ${type_name(w)}, found ${type_name(typed.ty)}")
         ty = w
     val index = declare_local(c, e.span, name, ty, mutable)
     // A binding whose value never finishes does not finish either.
@@ -1473,21 +1917,21 @@ private field_place(c: *Checker, target: &Expr) -> Option[FieldPlace]
                     return None
         _ -> return None
     val cls = c.classes[k]
-    val index = field_named(cls.fields, name) match
+    val index = class_field(c, k, name) match
         Some(i) -> i
         None ->
             if method_named(c, k, name) is Some(_) then c.note(unit, target.span, s"`$name` is a method of `${cls.name}`, which cannot be assigned")
             else c.note(unit, target.span, s"`${cls.name}` has no member `$name`")
             return None
     val field = cls.fields[index]
-    if !field.public && !inside_class(c, k)
-        c.note(unit, target.span, s"`$name` is private to `${cls.name}`")
+    if !field_visible(c, field)
+        c.note(unit, target.span, s"`$name` is private to `${c.classes[field.owner].name}`")
         return None
     if !field.mutable
         if field.param then c.note(unit, target.span, s"`$name` is a class parameter, which cannot be assigned; declare it `var` to make it a mutable field")
         else c.note(unit, target.span, s"`$name` is a `val` field; only a `var` field can be assigned")
         return None
-    if is_self(c, object) && c.current == cls.constructor && index >= cls.ready
+    if is_self(c, object) && c.current == cls.initializer && index >= cls.ready
         c.note(unit, target.span, s"`$name` is assigned before its declaration in the class body initializes it")
         return None
     val args = *zonk(c, object.ty) match
@@ -1509,7 +1953,7 @@ private assign_field(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp],
         Some(o) -> operate(c, e.span, op_span, o, binary_spelling(o) + (if yields then ":=" else "="), current, check_expr(c, value, Some(place.ty)))
         None ->
             val typed = check_expr(c, value, Some(place.ty))
-            if !conforms(typed.ty, place.ty)
+            if !fits(c,typed.ty, place.ty)
                 c.note(unit_of(c), value.span, s"expected ${type_name(place.ty)}, found ${type_name(typed.ty)}")
             typed
     val ty: &Type = if *stored.ty is Nothing then Nothing elif yields then place.ty else Unit
@@ -1705,7 +2149,7 @@ private assign_expr(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp], 
         Some(o) -> operate(c, e.span, op_span, o, binary_spelling(o) + (if yields then ":=" else "="), current, check_expr(c, value, Some(local.ty)))
         None ->
             val typed = check_expr(c, value, Some(local.ty))
-            if !conforms(typed.ty, local.ty)
+            if !fits(c,typed.ty, local.ty)
                 c.note(unit, value.span, s"expected ${type_name(local.ty)}, found ${type_name(typed.ty)}")
             typed
     val ty: &Type = if *stored.ty is Nothing then Nothing elif yields then local.ty else Unit
@@ -1752,7 +2196,7 @@ private destructure_expr(c: *Checker, e: &Expr, pattern: &Pattern, declared: Opt
     val typed = check_expr(c, value, want)
     var ty = typed.ty
     if want is Some(w)
-        if !conforms(typed.ty, w) then c.note(unit, value.span, s"expected ${type_name(w)}, found ${type_name(typed.ty)}")
+        if !fits(c,typed.ty, w) then c.note(unit, value.span, s"expected ${type_name(w)}, found ${type_name(typed.ty)}")
         ty = w
     val outer = c.binds_var
     c.binds_var = mutable
@@ -1850,7 +2294,7 @@ private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option
                         val old = TExpr(targets[i].span, ty, Local(olds[i].unwrap()))
                         result = operate(c, targets[i].span, op_span, o, binary_spelling(o) + "=", old, part)
                     None ->
-                        if !conforms(part.ty, ty) then c.note(unit, part.span, s"expected ${type_name(ty)}, found ${type_name(part.ty)}")
+                        if !fits(c,part.ty, ty) then c.note(unit, part.span, s"expected ${type_name(ty)}, found ${type_name(part.ty)}")
             None -> ()
         stored.push(result)
         stored_types.push(result.ty)
@@ -1884,7 +2328,7 @@ private is_literal(e: &Expr) -> bool = e.kind match
 private settled(t: &Type) -> bool = !(*t is ErrorType || *t is Nothing)
 
 private expect_bool(c: *Checker, t: &TExpr)
-    if !conforms(t.ty, Bool) then c.note(unit_of(c), t.span, s"expected bool, found ${type_name(t.ty)}")
+    if !fits(c,t.ty, Bool) then c.note(unit_of(c), t.span, s"expected bool, found ${type_name(t.ty)}")
 
 private unary_expr(c: *Checker, e: &Expr, op: UnaryOp, operand: &Expr, expected: Option[&Type]) -> &TExpr
     if op is Not
@@ -1984,6 +2428,9 @@ private compare_link(c: *Checker, op: CompareOp, a: &TExpr, b: &TExpr)
         // A function value is a closure and an object of a class is a heap object: both are
         // references, so they have an identity.
         if (*a.ty is Function(_, _) || *a.ty is Class(_, _, _)) && same_type(a.ty, b.ty) then return
+        // An instance of a subclass may be the very object a superclass-typed value holds.
+        if *a.ty is Class(_, _, _) && *b.ty is Class(_, _, _)
+            if same_type(upcast(c, a.ty, b.ty), b.ty) || same_type(upcast(c, b.ty, a.ty), a.ty) then return
         if *a.ty is Class(_, _, _) && *b.ty is Class(_, _, _)
             c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} with ${type_name(b.ty)}")
             return
@@ -2038,10 +2485,45 @@ private interpolate_expr(c: *Checker, e: &Expr, prefix: string, chunks: Buf[stri
     if *ty is Nothing then TExpr(e.span, Nothing, out.kind) else out
 
 // The type two branches agree on, where one that never finishes agrees with anything.
-private join(a: &Type, b: &Type) -> Option[&Type]
+// Two instances of classes agree on their nearest common ancestor.
+private join(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
     if *a is Nothing || *a is ErrorType then return Some(b)
     if *b is Nothing || *b is ErrorType then return Some(a)
-    if same_type(a, b) then Some(a) else None
+    if same_type(a, b) then return Some(a)
+    var current = zonk(c, a)
+    loop
+        val k = *current match
+            Class(k, _, args) -> k
+            _ -> return None
+        if ancestor_type(c.classes, zonk(c, b), k) is Some(up)
+            if same_type(up, current) then return Some(current)
+        current = ancestor_parent(c, current)?
+    None
+
+/** The superclass of an instance's class, as the instance's type, if it has one. */
+private ancestor_parent(c: *Checker, t: &Type) -> Option[&Type] = *t match
+    Class(k, _, args) -> Some(substitute(c.classes[k].superclass?, class_owner(k), args))
+    _ -> None
+
+/** `from` as an instance of the class `to` names, when `from` is an instance of one of that class's
+ * subclasses; otherwise `from` itself. */
+private upcast(c: *Checker, from: &Type, to: &Type) -> &Type
+    val x = zonk(c, from)
+    *zonk(c, to) match
+        Class(k, _, _) -> ancestor_type(c.classes, x, k).unwrap_or(x)
+        Tuple(ys) -> *x match
+            Tuple(xs) ->
+                if xs.len() != ys.len() then return x
+                var items: Buf[&Type] = buf()
+                for i in 0..<xs.len()
+                    items.push(upcast(c, xs[i], ys[i]))
+                Tuple(items)
+            _ -> x
+        _ -> x
+
+/** Whether a value of type `from` may be used where `to` is expected: an instance of a subclass is an
+ * instance of its superclass, also inside a tuple. */
+private fits(c: *Checker, from: &Type, to: &Type) -> bool = conforms(upcast(c, from, to), to)
 
 private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[&Expr], expected: Option[&Type], used: bool) -> &TExpr
     val cond = check_expr(c, condition, Some(Bool))
@@ -2056,7 +2538,7 @@ private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[
     var ty: &Type = Unit
     if *y.ty is Nothing && *n.ty is Nothing then ty = Nothing
     elif used
-        join(y.ty, n.ty) match
+        join(c, y.ty, n.ty) match
             Some(t) -> ty = t
             None ->
                 c.note(unit_of(c), e.span, s"the branches of this `if` yield ${type_name(y.ty)} and ${type_name(n.ty)}")
@@ -2088,7 +2570,7 @@ private while_expr(c: *Checker, e: &Expr, condition: &Expr, body: &Expr, otherwi
             if !(*site.ty is Unit || *site.ty is ErrorType)
                 c.note(unit, site.span, "a `break` with a value needs its loop to have an `else`")
         elif used
-            join(ty, site.ty) match
+            join(c, ty, site.ty) match
                 Some(t) -> ty = t
                 None -> c.note(unit, site.span, s"this `break` yields ${type_name(site.ty)}, but the loop yields ${type_name(ty)}")
     if !used then ty = Unit
@@ -2138,7 +2620,7 @@ private return_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
             value match
                 Some(v) ->
                     val t = check_expr(c, v, Some(r))
-                    if !conforms(t.ty, r) && !(*r is Unit)
+                    if !fits(c, t.ty, r) && !(*r is Unit)
                         c.note(unit, v.span, s"${described(symbol)} yields ${type_name(r)}, not ${type_name(t.ty)}")
                     typed = Some(t)
                 None ->
@@ -2170,7 +2652,13 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
     if explicit is None && (lookup_local(c, name) is Some(_) || param_index(c, name) is Some(_))
         return value_call(c, at, callee, args)
     class_member(c, name) match
-        Some(MethodOf(m)) -> return method_call(c, at, named.span, self_ref(c, named.span), m, args, explicit, expected)
+        Some(MethodOf(m)) ->
+            if c.super_args
+                c.note(unit, named.span, s"`$name` is a method, which a superclass's arguments cannot call: they run before the object is initialized")
+                for a in args
+                    check_statement(c, a.value)
+                return TExpr(at, ErrorType, UnitConst)
+            return method_call(c, at, named.span, self_ref(c, named.span), m, args, explicit, expected, false)
         Some(FieldOf(_)) -> if explicit is None then return value_call(c, at, callee, args)
         None -> ()
     // A module-level value is called as a value; a class's name in call position is its
@@ -2203,6 +2691,10 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
 
 // A call of one function, with `typed` holding the arguments already checked, if any.
 private call_function(c: *Checker, at: Span, name_span: Span, id: usize, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], typed: Buf[Option[&TExpr]]) -> &TExpr
+    if abstract_constructor(c, id, name_span)
+        for i in 0..<args.len()
+            if i >= typed.len() || typed[i] is None then check_statement(c, args[i].value)
+        return TExpr(at, ErrorType, UnitConst)
     local_use(c, id, at)
     val declared = result_of(c, id, at)
     val applied = apply(c, at, name_span, function_signature(c, id, declared), args, explicit, expected, typed)
@@ -2430,27 +2922,63 @@ private overload_list(c: *Checker, ids: Buf[usize]) -> string
 // called as a value.
 private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, target: &Expr, name: string, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
+    if target.kind is Name("super")
+        if lookup_local(c, "super") is None && enclosing_class(c) is Some(_)
+            return super_call(c, at, name_span, target.span, name, args, explicit, expected)
     val object = check_expr(c, target, None)
     if *zonk(c, object.ty) is Class(k, _, _)
         if method_named(c, k, name) is Some(m)
-            if !c.symbols[m].public && !inside_class(c, k)
-                c.note(unit, name_span, s"`$name` is private to `${c.classes[k].name}`")
+            if !method_visible(c, m)
+                c.note(unit, name_span, s"`$name` is private to `${c.classes[c.symbols[m].owner_class.unwrap()].name}`")
                 for a in args
                     check_statement(c, a.value)
                 return TExpr(at, ErrorType, UnitConst)
-            return method_call(c, at, name_span, object, m, args, explicit, expected)
+            return method_call(c, at, name_span, object, m, args, explicit, expected, false)
     if explicit is Some(_)
         for a in args
             check_statement(c, a.value)
         return unsupported(c, callee, "type arguments on a call of a field")
     call_checked(c, at, name_span, member_of(c, callee, object, name), args)
 
+// `super.name(args)` calls the superclass's implementation of a method on `self`, directly, even where
+// the class overrides it.
+private super_call(c: *Checker, at: Span, name_span: Span, super_span: Span, name: string, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+    val unit = unit_of(c)
+    val k = enclosing_class(c).unwrap()
+    var found: Option[usize] = None
+    var sup: &Type = ErrorType
+    if c.classes[k].superclass is Some(t)
+        sup = t
+        if *t is Class(s, _, _)
+            if method_named(c, s, name) is Some(m)
+                if method_visible(c, m) then found = Some(m)
+            if found is None then c.note(unit, name_span, s"`${c.classes[s].name}` has no method `$name` for `super` to call")
+    else c.note(unit, super_span, s"`${c.classes[k].name}` has no superclass for `super` to name")
+    if c.super_args
+        c.note(unit, super_span, "a superclass's arguments cannot call a method: they run before the object is initialized")
+        found = None
+    if found is Some(m)
+        if is_abstract_method(c.symbols[m])
+            c.note(unit, name_span, s"`${c.symbols[m].name}` is abstract, so `super` cannot call it")
+            found = None
+    val m = found match
+        Some(m) -> m
+        None ->
+            for a in args
+                check_statement(c, a.value)
+            return TExpr(at, ErrorType, UnitConst)
+    val receiver = self_ref(c, super_span)
+    method_call(c, at, name_span, TExpr(super_span, sup, receiver.kind), m, args, explicit, expected, true)
+
 // A method call passes the receiver first. The class's type arguments come from the receiver's
 // type, and the method's own, which follow them, are written or inferred as for a function.
-private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m: usize, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m: usize, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], direct: bool) -> &TExpr
     val target = c.symbols[m]
     val k = target.owner_class.unwrap()
-    val known = *zonk(c, receiver.ty) match
+    // An inherited method's types name its own class's parameters, so the receiver is seen as an
+    // instance of that class.
+    val receiver_type = zonk(c, receiver.ty)
+    val known = *ancestor_type(c.classes, receiver_type, k).unwrap_or(receiver_type) match
         Class(_, _, a) -> a
         _ -> buf()
     var params: Buf[&Type] = buf()
@@ -2478,7 +3006,15 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
     typed.push(object)
     for a in applied.args
         typed.push(a)
-    val call = applied.wrap(at, Call(m, typed, applied.type_args))
+    // A method a subclass may override is called through the object's method table, unless the
+    // receiver's class is final, so the method is known, or the call is `super`'s.
+    var slot: Option[usize] = None
+    if !direct
+        if *zonk(c, receiver.ty) is Class(r, _, _)
+            if is_open(c, r) then slot = slot_named(c, r, target.decl.name)
+    val call = slot match
+        Some(s) -> applied.wrap(at, Dispatch(m, s, typed, applied.type_args))
+        None -> applied.wrap(at, Call(m, typed, applied.type_args))
     setup match
         Some(s) ->
             var items: Buf[&TExpr] = buf()
@@ -2924,7 +3460,7 @@ private call_argument(c: *Checker, arg: Argument, param: Option[&Type]) -> &TExp
         if *zonk(c, p) is ByName(inner) then return delayed_argument(c, arg, p, inner)
     val value = check_expr(c, arg.value, wanted)
     if param is Some(p)
-        if !(*value.ty is Nothing) && !unify(c, p, value.ty)
+        if !(*value.ty is Nothing) && !unify(c, p, upcast(c, value.ty, p))
             c.note(unit, arg.value.span, s"expected ${type_name(zonk(c, p))}, found ${type_name(value.ty)}")
     value
 
@@ -3108,7 +3644,7 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
         c.body.block_start = outer_start
         if !(*body.ty is Nothing) then never = false
         if used && agreed
-            join(ty, body.ty) match
+            join(c, ty, body.ty) match
                 Some(t) -> ty = t
                 None ->
                     c.note(unit, arm.body.span, s"this arm yields ${type_name(body.ty)}, but the arms before it yield ${type_name(ty)}")

@@ -251,6 +251,46 @@ class Savings(owner: string, balance: int, rate: real): Account(owner, balance),
 - A field declared in the body without a type has its initializer's type. The body cannot
   `return`: it runs to its end to make the object.
 
+### Inheritance
+
+```text
+abstract class Shape(val label: string)
+    area() -> int
+    describe() -> string = s"$label: ${area()}"
+
+open class Rect(label: string, val w: int, val h: int): Shape(label)
+    override area() -> int = w * h
+
+class Square(label: string, side: int): Rect(label, side, side)
+    override describe() -> string = "square " + super.describe()
+```
+
+- **Only an `open` or `abstract` class can be extended**; extending a final class is an error. A
+  generic superclass is written with its type arguments, `class IntBox(x: int): Box[int](x)`.
+- **Construction runs from the top down.** A subclass's constructor first evaluates the arguments
+  written after the superclass and runs the superclass's constructor body on the new object, then
+  stores its own parameters and runs its own body. Those arguments run before the object is ready:
+  a parameter's name in them reads the argument itself, and they cannot call a method or use
+  `self`.
+- **A subclass has every field of its superclass**, first and in the superclass's order, then its
+  own. A field cannot be overridden: a public field may not share the name of an inherited public
+  field or method. A private member stays private to the class that declares it.
+- **A method a subclass may override** is a public method of an `open` or `abstract` class without
+  type parameters of its own. An override is marked `override`, takes the same parameter types (with
+  the superclass's type arguments substituted) and yields the same result type or, for a class, a
+  subclass of it. A method sharing an inherited method's name without `override`, and `override` on
+  a method that overrides nothing, are errors. An override cannot be private.
+- **An abstract method** is one without a body, allowed only in an `abstract` class. A class that is
+  not abstract implements every abstract method it inherits. An abstract class cannot be
+  instantiated, but its constructor runs as part of each subclass's.
+- **A call reaches the override of the object's own class**, whatever the receiver's static type,
+  when that type is an `open` or `abstract` class. `super.name(args)` calls the superclass's
+  implementation directly; it cannot name an abstract method.
+- **A subclass instance conforms to its superclasses.** It passes wherever a superclass is expected,
+  and the branches of an `if` or `match` that yield different subclasses join to their nearest
+  common superclass. `===` compares an instance of a class with one of its sub- or superclasses.
+  Inheritance from traits is not implemented yet.
+
 ## trait
 
 ```text

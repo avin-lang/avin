@@ -115,14 +115,15 @@ private struct Lowering
     global_types: Buf[Option[MirType]]
 
 // Every function that is not generic is compiled once; each generic function is compiled for each
-// list of type arguments a compiled call gives it, as those calls are found.
+// list of type arguments a compiled call gives it, as those calls are found. An abstract method has
+// no code, and an abstract class's constructor is never called: its subclasses run its initializer.
 lower_program(program: TProgram) -> MirProgram
     var global_types: Buf[Option[MirType]] = buf()
     for g in program.globals
         global_types.push(mir_type(solve(program.vars, program.symbols[g.init].result.unwrap_or(Unit))))
     var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types)
     for i in 0..<program.symbols.len()
-        if !is_generic(program, i) then instance(&l, i, buf())
+        if !is_generic(program, i) && !never_compiled(program, i) then instance(&l, i, buf())
     val entry = instance(&l, program.entry, buf())
     val init: Option[usize] = program.init match
         Some(id) -> Some(instance(&l, id, buf()))
@@ -133,6 +134,14 @@ lower_program(program: TProgram) -> MirProgram
         functions.push(lower_function(&l, k))
         k += 1
     MirProgram(functions, l.strings, l.descriptors, l.closures, l.traps, global_types, entry, init)
+
+/** Whether a function has no code: an abstract method, or an abstract class's constructor. */
+private never_compiled(program: TProgram, id: usize) -> bool
+    val symbol = program.symbols[id]
+    if is_abstract_method(symbol) then return true
+    symbol.owner_class match
+        Some(k) -> symbol.constructor && program.classes[k].constructor == id && program.classes[k].decl.modifier == "abstract"
+        None -> false
 
 // An object is a descriptor word followed by its fields in order, each at a multiple of 8 bytes.
 private field_size(t: MirType) -> usize = t match
@@ -151,13 +160,13 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
         Data(id, _, args) ->
             val d = l.program.data[id]
             for v in 0..<d.variants.len()
-                variants.push(variant_layout(l, key + "." + d.variants[v].name, v, variant_fields(d, id, v, args), true))
-        Tuple(items) -> variants.push(variant_layout(l, key, 0, items, true))
+                variants.push(variant_layout(l, key + "." + d.variants[v].name, v, variant_fields(d, id, v, args), true, buf()))
+        Tuple(items) -> variants.push(variant_layout(l, key, 0, items, true, buf()))
         Class(id, _, args) ->
             var fields: Buf[&Type] = buf()
             for f in l.program.classes[id].fields
                 fields.push(substitute(f.ty.unwrap_or(ErrorType), class_owner(id), args))
-            variants.push(variant_layout(l, key, 0, fields, false))
+            variants.push(variant_layout(l, key, 0, fields, false, method_table(l, t)))
         _ -> panic("a layout of a type that is not data, a tuple or a class: " + key)
     val result = DataLayout(variants)
     l.layout_index.put(identity, l.layouts.len())
@@ -166,7 +175,7 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
 
 // One variant's fields at their offsets, and its descriptor; a variant with no field data is one
 // constant object, unless `shared` is false: every object of a class is its own, for its identity.
-private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[&Type], shared: bool) -> VariantLayout
+private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[&Type], shared: bool, methods: Buf[Option[usize]]) -> VariantLayout
     var fields: Buf[Option[FieldSlot]] = buf()
     var refs: Buf[usize] = buf()
     var size = 8usize
@@ -178,8 +187,30 @@ private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[
                 size += field_size(m)
             None -> fields.push(None)
     val shape = VariantLayout(l.descriptors.len(), fields)
-    l.descriptors.push(Descriptor(name, tag, size, refs, shared && size == 8))
+    l.descriptors.push(Descriptor(name, tag, size, refs, shared && size == 8, methods))
     shape
+
+// The method table of a class instance: for each slot, the instance of the method that fills it,
+// with the type arguments of the ancestor that declares the method as the instance sees them. Each
+// instance of a generic class has its own table. An abstract method's slot is empty.
+private method_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
+    var table: Buf[Option[usize]] = buf()
+    val id = *t match
+        Class(k, _, _) -> k
+        _ -> return table
+    for m in l.program.classes[id].slots
+        val symbol = l.program.symbols[m]
+        if is_abstract_method(symbol)
+            table.push(None)
+            continue
+        val owner = symbol.owner_class.unwrap()
+        val args = ancestor_type(l.program.classes, t, owner) match
+            Some(a) -> *a match
+                Class(_, _, xs) -> xs
+                _ -> buf()
+            None -> buf()
+        table.push(Some(instance(l, m, args)))
+    table
 
 private field_address(l: *Lowering, object: Operand, field: FieldSlot) -> Operand
     val dest = fresh(l, MPtr)
@@ -289,7 +320,7 @@ private box_descriptor(l: *Lowering, t: MirType) -> usize
     var refs: Buf[usize] = buf()
     if t is MRef then refs.push(8)
     val d = l.descriptors.len()
-    l.descriptors.push(Descriptor("box of " + key, 0, 8 + field_size(t), refs, false))
+    l.descriptors.push(Descriptor("box of " + key, 0, 8 + field_size(t), refs, false, buf()))
     l.boxes.put(key, d)
     d
 
@@ -324,7 +355,7 @@ private closure_shape(l: *Lowering, function: usize, type_args: Buf[&Type]) -> C
                     size += field_size(m)
         None -> ()
     val shape = ClosureShape(l.descriptors.len(), fields)
-    l.descriptors.push(Descriptor("closure of " + function_symbol(l.program, function, type_args), 0, size, refs, false))
+    l.descriptors.push(Descriptor("closure of " + function_symbol(l.program, function, type_args), 0, size, refs, false, buf()))
     l.shapes.put(key, shape)
     shape
 
@@ -360,6 +391,35 @@ private function_value(l: *Lowering, function: usize, type_args: Buf[&Type]) -> 
     for i in 0..<values.len()
         l.insts.push(Store(field_address(l, Value(object), shape.fields[i]), values[i]))
     Value(object)
+
+// Calls a method through the method table of the receiver, `args[0]`: whichever override fills the
+// slot in the object's class, it takes the parameters `function` takes and yields its result, as
+// machine types, so the call is spelled from `function`'s signature.
+private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], type_args: Buf[&Type]) -> Option[Operand]
+    var operands: Buf[Operand] = buf()
+    for a in args
+        val op = lower_expr(l, a)
+        if machine(l, a.ty) is Some(_)
+            op match
+                Some(v) -> operands.push(v)
+                None -> return None
+    val symbol = l.program.symbols[function]
+    var concrete_args: Buf[&Type] = buf()
+    for t in type_args
+        concrete_args.push(concrete(l, t))
+    var params: Buf[MirType] = buf()
+    for p in symbol.params
+        if machine(l, substitute(p, symbol.type_owner, concrete_args)) is Some(t) then params.push(t)
+    val result = machine(l, substitute(symbol.result.unwrap_or(Unit), symbol.type_owner, concrete_args))
+    val code = fresh(l, MPtr)
+    l.insts.push(MethodSlot(code, operands[0], slot))
+    val dest = result match
+        Some(t) -> Some(fresh(l, t))
+        None -> None
+    l.insts.push(Call(dest, Indirect(Value(code), MirSignature(params, result)), operands))
+    dest match
+        Some(id) -> Some(Value(id))
+        None -> None
 
 // Calls a function value: its entry is at offset 8, and takes the closure before the arguments.
 private call_value(l: *Lowering, callee: &TExpr, args: Buf[&TExpr]) -> Option[Operand]
@@ -710,6 +770,7 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         dest match
             Some(id) -> Some(Value(id))
             None -> None
+    Dispatch(function, slot, args, type_args) -> dispatch(l, function, slot, args, type_args)
     Construct(variant, args) -> construct(l, e, variant, args)
     FunctionValue(function, type_args) -> Some(function_value(l, function, type_args))
     CallValue(callee, args) -> call_value(l, callee, args)

@@ -61,6 +61,23 @@ arguments as generic functions are, and a field's type at a particular instance 
 type with the receiver's type arguments substituted. A call of a method of a final class is a
 direct call.
 
+A subclass's object starts with its superclass's fields, in the superclass's order, so the
+superclass's code finds each field at the offset it expects in any subclass's object. An `open` or
+`abstract` class's body is compiled as its *initializer*, `<Class>.<init>`, a function that takes
+the object and the constructor's parameters; the class's constructor allocates and calls it, and a
+subclass's initializer calls its superclass's first. An abstract class's constructor and its
+abstract methods are never compiled.
+
+Each class has a method table with one slot per method a subclass may override: its superclass's
+slots in the same positions, each holding the class's override where it has one, then one for each
+overridable method the class adds. The table is constant data placed directly before the class's
+descriptor, in one global, so slot `s` is the word `8(s + 1)` bytes before the address an object's
+descriptor word holds; the descriptor itself keeps its layout and the runtime never reads the
+table. Each instance of a generic class has its own descriptor and table, filled with the method
+instances for its type arguments. A call through a receiver whose static type is an `open` or
+`abstract` class loads the descriptor word, loads the slot, and calls it indirectly with the
+overridden method's machine signature, which every override shares; `super.m()` is a direct call.
+
 An `object` is an instance of a class of its own, kept apart from its companion class's: its
 constructor and methods are separate functions, and its layout and descriptor are its own. Each
 module-level `val`, `var` and object is a **global** of the program, and its initializer is

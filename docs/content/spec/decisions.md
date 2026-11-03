@@ -39,6 +39,18 @@ a decision changes, this page and the chapter change together.
 - Inheritance is written with `:`: `class C(…): Base(…), Trait`, one superclass with its
   constructor arguments and then traits, as in `trait A: B`.
 - The receiver is implicit: members are in scope by their bare names, and `self` names the instance.
+- A subclass's constructor evaluates the superclass's arguments, runs the superclass's body on the
+  object, then stores its own parameters and runs its own body. The superclass's arguments cannot
+  call a method or use `self`; a parameter's name in them reads the argument.
+- A subclass's fields are its superclass's, in order, then its own. Fields are never overridden.
+- Only public methods without type parameters of their own can be overridden. An override takes the
+  same parameter types and yields the same result or, for a class result, a subclass of it
+  (covariant results). An override cannot be private.
+- An abstract method is a method without a body, allowed only in an `abstract` class; an abstract
+  class cannot be instantiated, and every concrete subclass implements each abstract method.
+- A call through a receiver whose static type is an `open` or `abstract` class reaches the override
+  of the object's class; a call through a final class's type, and `super.m()`, are direct.
+- `if` and `match` branches yielding different classes join to their nearest common superclass.
 - Functions and methods may be overloaded by parameter types. A call takes the most specific
   overload that accepts its arguments, chosen at compile time; an ambiguous call is an error.
   Same-named declarations with the same parameter types are an error.
