@@ -150,7 +150,8 @@ a decision changes, this page and the chapter change together.
   covariant type takes its parameter in. A value of the bound is one of the parameter with no
   conversion, so a type argument is the bound or a reference type it is seen as. A call infers the
   join of the bound and the arguments, `Any` where they are references with no nearer common type;
-  a written or expected type argument is held to the bound. An override writes its method's lower
+  a written or expected type argument is held to the bound (the expected type's part is refined,
+  proposed below). An override writes its method's lower
   bound or none. A type's and an impl's parameters take none.
 - The built-in types belong to the core library's module, `avin`; a conformance of one is written
   there or in the trait's module. An impl that only adds methods may be written in any module
@@ -225,6 +226,19 @@ a decision changes, this page and the chapter change together.
   differs from `trim`'s `White_Space`; `isSpaceChar` is the categories `Zs`, `Zl` and `Zp`.
   `asDigit` is the digit's value in radix 36 (Unicode decimal digits give their value, ASCII and
   fullwidth letters give 10 to 35) and is -1 for any other character, never a trap.
+- Settled by the user 2026-11-04 ([collections](/spec/collections/#maps-and-sets)): `Map[K, +V]` and
+  `Set[A]` are traits, as in the reference library. The hash-based collections are `HashMap` and
+  `HashSet`; `TreeMap` and `TreeSet` conform to `SortedMap[K, +V]` and `SortedSet[A]`, which require
+  `Map` and `Set` and re-declare the updating methods with the sorted result. Map and set literals,
+  `Map(…)`, `Set(…)`, `Map.empty`, `Set.empty` and the two builders make the hash-based ones, typed as
+  the traits; `SortedMap` and `SortedSet` companions, and a literal where one is expected, make tree
+  ones. A method putting a value in takes `[W >: V]`. An update through a trait answers the same
+  kind; `map`, `collect` and `flatMap` through the trait answer a hash-based collection. Maps and sets
+  of different kinds with equal contents are equal, through the traits and `Any`, and hash alike. A
+  map has no `mkString` of its own: it joins its entries as pairs, `(a, 1)`, through `Iterable`'s.
+  The ordered operations keep their names, `first`, `last`, `floor`, `ceiling`, `from`, `until`,
+  `range` (from inclusive, until exclusive) and `reverseIterator`; the tree is balanced by weight,
+  each side at most three times the other.
 - A generic overload is compared by the same rule as any other: `f(x: int)` is more specific than
   `f[T](x: T)`, which accepts an `int` while `f(int)` does not accept a `T`.
 - Whether a parameter is by-name does not distinguish overloads. An argument some candidate takes by
@@ -1013,6 +1027,14 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
+- Lower bounds and the expected type ([generics](/spec/generics/#lower-bounds)): the expected type
+  decides a lower-bounded type argument only where it admits the bound; otherwise the argument is
+  inferred from the bound and the arguments, and the result is passed as any value is. So
+  `println(m.getOrElse(k, "none"), n)` on a `Map[string, string]`, where each argument expects a
+  `Display`, takes `W` as `string` rather than reporting `Display` as no supertype of `string`. A
+  delayed (by-name) argument widens an open lower-bounded type argument as any other argument does:
+  `cats.getOrElse(k, dog)` is an `Animal`. Both keep programs working that called the methods before
+  they took `[W >: V]`. Awaiting the user.
 - Nested data types ([generics](/spec/generics/#polymorphic-recursion)): a data type naming itself
   at a larger instance in its fields (`Deeper(inner: Tree[Nest[T]])` in `Tree[T]`) is rejected at
   the type as polymorphic recursion, even where no code compares, hashes or shows it, since every
@@ -1044,16 +1066,6 @@ Settled by the user on 2026-11-04:
   literal whose elements its builder takes, a map literal only by a builder of pairs. A map literal's
   keys agree on one type and its values on another, each as `if` branches do. The mutable `Set` and
   `Map` gain companions with `empty` and `builder`.
-- Sorted collections ([collections](/spec/collections/#sorted-maps-and-sets)): `TreeMap[K: Ord, +V]`
-  and `TreeSet[A: Ord]` are data types of their own beside `Map` and `Set`, not variants of them, and
-  `Map` and `Set` stay the hash-based collections rather than becoming traits over a `HashMap` and a
-  `HashSet`. A tree collection has the same traits as its hash-based counterpart (`Iterable`, the
-  function type, `Eq`, `Hash`, `Display`, `Debug`) and the same methods, so code over those traits
-  takes either; a method that makes a collection of another key (`map`, `collect`, `flatMap`) bounds
-  it by `Ord` and answers a tree collection. A tree collection hashes to what the hash-based one with
-  the same contents does. The ordered operations are `first`, `last`, `floor`, `ceiling`, `from`,
-  `until`, `range` (from inclusive, until exclusive) and `reverseIterator`. The tree is balanced by
-  weight, each side at most three times the other.
 - Packages ([packages](/spec/packages/)), modelled on Sysl's package system:
   - **The manifest**: `package { name, version, description }`, `dependencies { … }` and `workspace
     = [ … ]`, and no other key; an unknown key is an error, not a warning. A name is a lowercase
@@ -1378,16 +1390,16 @@ Settled by the user on 2026-11-04:
     `setSeed`; the companion's methods use one shared, locked generator. PCG32, written in Avin with
     the wrapping operators, so a seed gives the same sequence everywhere. Binding: one runtime
     function for the platform's seed over `sysl.posix.rand.seed_from_os`, since its `u64` does not
-    fit a `long` at the boundary. `nextGaussian` needs a square root and a logarithm on `real`, which
-    Avin does not have yet. Not blocked on opaque handles.
+    fit a `long` at the boundary. `nextGaussian` uses `avin.math`'s `sqrt` and `log`. Not blocked on
+    opaque handles.
   - **[`avin.net`](/spec/system-library/#avin-net)**: `TcpStream` and `TcpListener`; `Url`, parsed
     and percent-encoded, written in Avin; an HTTP/1.1 client (`get`, `post`, `send` with a `Request`)
     written in Avin over the TCP stream, a status never an error. `IoError` gains
     `ConnectionRefused`, `ConnectionReset` and `TimedOut`. Bindings: `sysl.net.resolve`, `socket`
-    and the `Socket` methods. **TCP is blocked on stage-7 opaque handles** (a `Socket`, and the
-    `Address` it connects to, are not boundary types); `Url` is not blocked. **`https` is blocked on
-    bindings to Sysl packages other than the standard library**, since TLS lives in a package of its
-    own.
+    and the `Socket` methods, held as an opaque handle (a `Socket`, and the `Address` it connects
+    to, are not boundary types). `Url` needs neither. `https` takes a Sysl TLS package, named in
+    the library's `sysl-dependencies` and bound as any package is; opaque handles and bindings to
+    Sysl packages beyond the standard library are both in the compiler.
   - **[Concurrency](/spec/system-library/#concurrency)** stays in `avin.threads`; there is no
     separate concurrency module. The reference's futures map onto what is there (`successful`, `all`
     for `sequence`, `first` for `firstCompletedOf`, `await` for waiting with a time limit); added are
@@ -1419,6 +1431,17 @@ Settled by the user on 2026-11-04:
   call with "`Name` is closed"; a handle never closed is given back by a finalizer when the
   collector frees it. A handle crosses back into Sysl only as the receiver of its own methods,
   compares by identity, and has no `Display`.
+- **The elementary functions are a module, `avin.math`** ([system library](/spec/system-library/#avin-math)),
+  with the reference library's names, called as `math.sqrt(x)` after `import avin.math` or imported
+  by name: `Pi` and `E`; `sqrt`, `cbrt`, `exp`, `expm1`, `log` (natural), `log10`, `log1p`, `pow`,
+  `hypot`; `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2(y, x)`, `sinh`, `cosh`, `tanh`;
+  `floor`, `ceil`, `rint` (ties to even), `abs`, `max`, `min` (NaN when either is, `-0.0` below
+  `0.0`), `signum`, `toRadians` and `toDegrees`. All take and give `real`, follow IEEE 754 and
+  never trap: `sqrt(-1.0)` is NaN, `log(0.0)` negative infinity. Not methods on `real`, and no
+  integer overloads of `abs`, `max` and `min` yet; the reference's `round`, which answers a `long`,
+  is left out until real-to-integer rounding is decided with the conversions. Bindings: one
+  runtime function per function, over the methods of Sysl's `Float` on `real`, since a binding names
+  a function and these are methods.
 
 ## Open
 

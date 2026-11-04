@@ -142,7 +142,11 @@ impl[A] Chain[A]
   stays a `Chain[Cat]`, and a literal takes the bound's type (`longs.prepended(3)` is a
   `Chain[long]`). Where the bound and the arguments are references with no nearer common type, the
   join is `Any`, the top: `cats.prepended("hello")` is a `Chain[Any]`. Two value types still have no
-  join. A written type argument, or one the expected type decides, is held to the bound.
+  join. A delayed (by-name) argument widens it as any other argument does, so on a map of cats
+  `getOrElse(key, dog)` is an `Animal`. A written type argument is held to the bound. The expected
+  type decides a type argument only where it admits the bound; otherwise the argument is inferred as
+  if nothing were expected and the result then passed as any value is, so `m.getOrElse(k, "none")`
+  on a map of strings, passed where a `Display` is expected, takes `W` as `string`.
 - **An override writes the overridden method's lower bound, or none**: it may assume no more of its
   type arguments than the method it overrides does. Calls through a trait dispatch as any generic
   trait method's do.
