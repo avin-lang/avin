@@ -348,6 +348,8 @@ struct Checker
     /** The derived traits whose methods read the fields through the trait: each field's type must
      * implement it. */
     derivations: Buf[Derivation]
+    /** The conformances that hold only at type arguments meeting an impl's own bounds. */
+    conditional: Buf[ConditionalConformance]
     /** The methods impls add to classes, which are not variance positions in a class whose fields
      * are all immutable. */
     impl_methods: Buf[usize]
@@ -484,7 +486,7 @@ private check_imports(c: *Checker, unit: usize)
  * unit is one of its files. Every file sees its own module's declarations, the names it imports and
  * the core library's public declarations, in that order: an inner name hides an outer one. */
 check_program(units: Buf[SourceUnit], root_module: string) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf())
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
     // `derives` is written out as the methods and impls it stands for before anything is declared.
@@ -585,7 +587,7 @@ check_program(units: Buf[SourceUnit], root_module: string) -> Checked
     var sources: Buf[Source] = buf()
     for u in c.units
         sources.push(u.src)
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, id, init, c.builtins, c.core)))
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, id, init, c.builtins, c.conditional, c.core)))
 
 private declare_unit(c: *Checker, unit: usize)
     val file = c.units[unit].file
@@ -848,6 +850,8 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
                     c.note(unit, written_trait_span(d), s"`$path` already conforms to `${type_name(t)}`; a conformance is stated once")
                     return invalid
                 c.builtins.push(BuiltinConformance(target, t, unit, d.target.span, buf()))
+        if conditional
+            if *t is Class(k, _, _) then c.conditional.push(ConditionalConformance(owner, k, conditions, unit, d.type_params))
     ImplSymbol(unit, module_name, d, target, owner, trait_type, conditions)
 
 /** Whether class `k` is the one with qualified name `key`. */
@@ -860,10 +864,10 @@ private buf1u(x: usize) -> Buf[usize]
     out.push(x)
     out
 
-// An impl with bounds of its own makes a data type conform to a trait that is only a bound, as `Eq`,
-// `Ord` or `Add` are, for the type arguments that meet them. Such a conformance is decided where a
-// bound is checked; a trait that is also a type would need it decided at conversions and type
-// patterns too, which is not implemented, and neither is a class's.
+// An impl with bounds of its own makes a data type or a class conform to a trait for the type
+// arguments that meet them. The conformance is decided wherever one is: where a bound is checked,
+// where a value converts to the trait, where a type pattern tests it, and where one of the impl's
+// methods is called.
 private conditional_impl_refused(c: *Checker, unit: usize, d: &ImplDecl, target: &Type, trait_type: Option[&Type]) -> bool
     val at = d.type_params[0].span
     val t = trait_type match
@@ -871,8 +875,8 @@ private conditional_impl_refused(c: *Checker, unit: usize, d: &ImplDecl, target:
         None ->
             c.note(unit, at, "an impl that adds methods for some type arguments only is not implemented; bound the type's own parameters")
             return true
-    if !(*target is Data(_, _, _))
-        c.note(unit, at, "an impl with bounds of its own is implemented for data types only")
+    if !(*target is Data(_, _, _) || *target is Class(_, _, _))
+        c.note(unit, at, "an impl with bounds of its own is implemented for data types and classes only")
         return true
     if *t is Class(k, _, _)
         // Every type compares and hashes, so an impl of `Eq` or `Hash` holds at every type argument,
@@ -887,9 +891,6 @@ private conditional_impl_refused(c: *Checker, unit: usize, d: &ImplDecl, target:
                         c.note(unit, b.span, s"every type compares and hashes, so an impl of `${type_name(t)}` holds for every type argument; its bounds may be `Eq` and `Hash` only")
                         return true
             return false
-        if !mentions_self(c, k, 0)
-            c.note(unit, at, s"an impl with bounds of its own is implemented for traits that are only bounds, which mention `Self`; `${type_name(t)}` is also a type")
-            return true
     false
 
 /** The traits built-in type `t` conforms to through its impls. */
@@ -1230,24 +1231,25 @@ ancestor_type(classes: Buf[ClassSymbol], data: Buf[DataSymbol], t: &Type, target
 // subclass is one of its superclass; an instance of a generic type is another instance of it where
 // each type argument follows the parameter's declared variance; a tuple's parts are covariant; a
 // function's parameters are contravariant and its result covariant. Where `x` is not such a view of
-// `to`, the result is `x` itself or a type that differs from `to`. Both types are solved.
-view_as(classes: Buf[ClassSymbol], data: Buf[DataSymbol], x: &Type, to: &Type) -> &Type = *to match
-    Class(k, name, ys) -> ancestor_type(classes, data, x, k) match
+// `to`, the result is `x` itself or a type that differs from `to`. Both types are solved. A
+// conformance an impl with bounds of its own states is a view only where `x`'s arguments meet them.
+view_as(f: Conformances, x: &Type, to: &Type) -> &Type = *to match
+    Class(k, name, ys) -> holding_ancestor(f, x, k) match
         Some(up) -> *up match
-            Class(_, _, xs) -> Class(k, name, vary_args(classes, data, classes[k].decl.type_params, xs, ys))
+            Class(_, _, xs) -> Class(k, name, vary_args(f, f.classes[k].decl.type_params, xs, ys))
             _ -> up
         None -> x
     Data(d, name, ys) -> *x match
         Data(e, _, xs) ->
             if e != d then return x
-            Data(d, name, vary_args(classes, data, data[d].decl.type_params, xs, ys))
+            Data(d, name, vary_args(f, f.data[d].decl.type_params, xs, ys))
         _ -> x
     Tuple(ys) -> *x match
         Tuple(xs) ->
             if xs.len() != ys.len() then return x
             var items: Buf[&Type] = buf()
             for i in 0..<xs.len()
-                items.push(view_part(classes, data, xs[i], ys[i]))
+                items.push(view_part(f, xs[i], ys[i]))
             Tuple(items)
         _ -> x
     Function(ys, s) -> *x match
@@ -1255,35 +1257,35 @@ view_as(classes: Buf[ClassSymbol], data: Buf[DataSymbol], x: &Type, to: &Type) -
             if xs.len() != ys.len() then return x
             var params: Buf[&Type] = buf()
             for i in 0..<xs.len()
-                params.push(view_contra(classes, data, xs[i], ys[i]))
-            Function(params, view_part(classes, data, r, s))
+                params.push(view_contra(f, xs[i], ys[i]))
+            Function(params, view_part(f, r, s))
         _ -> x
     _ -> x
 
 // The type arguments `xs` seen as `ys`, one parameter's variance at a time.
-private vary_args(classes: Buf[ClassSymbol], data: Buf[DataSymbol], params: Buf[TypeParam], xs: Buf[&Type], ys: Buf[&Type]) -> Buf[&Type]
+private vary_args(f: Conformances, params: Buf[TypeParam], xs: Buf[&Type], ys: Buf[&Type]) -> Buf[&Type]
     if xs.len() != ys.len() || xs.len() != params.len() then return xs
     var out: Buf[&Type] = buf()
     for i in 0..<xs.len()
         val v = params[i].variance
-        if v is Covariant then out.push(view_part(classes, data, xs[i], ys[i]))
-        elif v is Contravariant then out.push(view_contra(classes, data, xs[i], ys[i]))
+        if v is Covariant then out.push(view_part(f, xs[i], ys[i]))
+        elif v is Contravariant then out.push(view_contra(f, xs[i], ys[i]))
         else out.push(xs[i])
     out
 
 // A part in a covariant position: `x` seen as `to` where both are references, so the object `x`
 // describes is already the one `to` describes. A value of a value type differs in representation
 // from an `Any` or a trait, so it stays itself.
-private view_part(classes: Buf[ClassSymbol], data: Buf[DataSymbol], x: &Type, to: &Type) -> &Type
+private view_part(f: Conformances, x: &Type, to: &Type) -> &Type
     if conforms(x, to) && !(*x is Nothing) then return x
     if !is_reference(x) then return x
     if *to is AnyType then return AnyType
-    view_as(classes, data, x, to)
+    view_as(f, x, to)
 
 // A part in a contravariant position: `to` where it may be seen as `x`, otherwise `x`.
-private view_contra(classes: Buf[ClassSymbol], data: Buf[DataSymbol], x: &Type, to: &Type) -> &Type
+private view_contra(f: Conformances, x: &Type, to: &Type) -> &Type
     if conforms(x, to) && !(*x is Nothing) then return x
-    if conforms(view_part(classes, data, to, x), x) then to else x
+    if conforms(view_part(f, to, x), x) then to else x
 
 /** Whether a value of type `t` is a reference to an object, which every type it may be seen as
  * shares: `Any`, a string, a tuple, a function, a data type, a class or a trait. */
@@ -3132,46 +3134,69 @@ private resolve_bound(c: *Checker, unit: usize, t: &TypeExpr) -> &Type
 // class's or data type's own parameters are bounded where the type declares them, so they have those
 // bounds wherever they are named, its methods and impls included. A trait's `Self` is bounded by the
 // trait.
-private bounds_at(c: *Checker, owner: usize, params: Buf[TypeParam], index: usize) -> Buf[&Type]
+private bounds_at(c: *Checker, owner: usize, params: Buf[TypeParam], index: usize) -> Buf[&Type] = scope_bounds(conformances(c), owner, params, index)
+
+private scope_bounds(f: Conformances, owner: usize, params: Buf[TypeParam], index: usize) -> Buf[&Type]
     if is_self_owner(owner)
         val k = owner - self_owner(0)
         var own: Buf[&Type] = buf()
-        own.push(own_class_type(c.classes[k], k))
+        own.push(own_class_type(f.classes[k], k))
         return own
     if owner >= method_params_owner() then return buf()
     var declared = params
     if owner >= class_owner(0)
         val k = owner - class_owner(0)
-        if k < c.classes.len() && index < c.classes[k].decl.type_params.len() then declared = c.classes[k].decl.type_params
+        if k < f.classes.len() && index < f.classes[k].decl.type_params.len() then declared = f.classes[k].decl.type_params
     elif owner >= data_owner(0)
         val d = owner - data_owner(0)
-        if d < c.data.len() && index < c.data[d].decl.type_params.len() then declared = c.data[d].decl.type_params
+        if d < f.data.len() && index < f.data[d].decl.type_params.len() then declared = f.data[d].decl.type_params
     if index >= declared.len() then return buf()
     var out: Buf[&Type] = buf()
-    if c.bounds.get(bound_key(owner, index, declared[index])) is Some(own)
+    if f.bounds.get(bound_key(owner, index, declared[index])) is Some(own)
         for b in own
             out.push(b)
     // Inside an impl with bounds of its own, its parameters have those bounds too.
     if index < params.len() && params[index].span.start != declared[index].span.start
-        if c.bounds.get(bound_key(owner, index, params[index])) is Some(extra)
+        if f.bounds.get(bound_key(owner, index, params[index])) is Some(extra)
             for b in extra
                 out.push(b)
     out
 
 /** The bounds of type parameter `t` as the code being checked names it. */
-private bounds_of(c: *Checker, t: &Type) -> Buf[&Type]
+private bounds_of(c: *Checker, t: &Type) -> Buf[&Type] = type_var_bounds(conformances(c), t)
+
+private type_var_bounds(f: Conformances, t: &Type) -> Buf[&Type]
     var params: Buf[TypeParam] = buf()
     *t match
         TypeVar(owner, index, _) ->
-            if c.generic is Some(scope)
+            if f.generic is Some(scope)
                 if scope.owner == owner then params = scope.params
-            bounds_at(c, owner, params, index)
+            scope_bounds(f, owner, params, index)
         _ -> buf()
+
+/** What deciding a conformance reads: the types, the conformances their impls state, and the bounds
+ * of the type parameters in scope where the question is asked. Lowering asks only of concrete types,
+ * so it gives no scope. */
+struct Conformances
+    classes: Buf[ClassSymbol]
+    data: Buf[DataSymbol]
+    builtins: Buf[BuiltinConformance]
+    conditional: Buf[ConditionalConformance]
+    core: CoreTraits
+    bounds: Map[string, Buf[&Type]]
+    generic: Option[GenericScope]
+
+/** The conformances as the code being checked sees them. */
+private conformances(c: *Checker) -> Conformances = Conformances(c.classes, c.data, c.builtins, c.conditional, c.core, c.bounds, c.generic)
 
 /** Whether a value of type `t` conforms to `bound`, a trait or a class: a type parameter does through
  * its own bounds. */
-private conforms_to_bound(c: *Checker, t: &Type, bound: &Type) -> bool
-    val x = zonk(c, t)
+private conforms_to_bound(c: *Checker, t: &Type, bound: &Type) -> bool = meets_bound(conformances(c), zonk(c, t), zonk(c, bound))
+
+/** Whether a value of type `x` conforms to `bound`, a trait or a class, where both are solved: a
+ * type parameter through its bounds, a built-in type through its impls, and a class or data type
+ * through the conformances that hold at its type arguments. Every type compares and hashes. */
+meets_bound(f: Conformances, x: &Type, bound: &Type) -> bool
     val k = *bound match
         Class(k, _, _) -> k
         _ -> return true
@@ -3180,22 +3205,65 @@ private conforms_to_bound(c: *Checker, t: &Type, bound: &Type) -> bool
         Nothing -> true
         Var(_) -> true
         TypeVar(_, _, _) ->
-            for b in bounds_of(c, x)
-                if ancestor_type(c.classes, c.data, b, k) is Some(up)
-                    if conforms(zonk(c, up), zonk(c, bound)) then return true
+            for b in type_var_bounds(f, x)
+                if holding_ancestor(f, b, k) is Some(up)
+                    if conforms(up, bound) then return true
             false
         _ ->
-            // Every type compares and hashes, by value or by identity.
-            if is_core_trait(c, k, "Eq") || is_core_trait(c, k, "Hash") then return true
+            if names_core_trait(f.core, k, "Eq") || names_core_trait(f.core, k, "Hash") then return true
             if is_builtin(x)
-                var traits: Buf[&Type] = buf()
-                collect_traits(c, x, &traits)
-                for t in traits
-                    if conforms(t, zonk(c, bound)) then return true
+                for b in f.builtins
+                    if same_type(b.ty, x)
+                        if ancestor_type(f.classes, f.data, b.trait_type, k) is Some(up)
+                            if conforms(up, bound) then return true
                 return false
-            ancestor_type(c.classes, c.data, x, k) match
-                Some(up) -> conforms(zonk(c, up), zonk(c, bound)) && conditions_hold(c, x, k)
+            holding_ancestor(f, x, k) match
+                Some(up) -> conforms(up, bound)
                 None -> false
+
+private names_core_trait(core: CoreTraits, k: usize, name: string) -> bool = core.trait_named(name) match
+    Some(t) -> t == k
+    None -> false
+
+/** `t` as an instance of the class or trait `target`, as `ancestor_type` finds it, through only the
+ * conformances that hold at `t`'s type arguments: one an impl with bounds of its own states holds
+ * where the arguments meet them. */
+holding_ancestor(f: Conformances, t: &Type, target: usize) -> Option[&Type]
+    if *t is Data(d, _, xs)
+        for required in f.data[d].traits
+            if !conformance_holds(f, data_owner(d), required, xs) then continue
+            if holding_ancestor(f, substitute(required, data_owner(d), xs), target) is Some(found) then return Some(found)
+        return None
+    val k = *t match
+        Class(k, _, _) -> k
+        _ -> return None
+    if k == target then return Some(t)
+    val args = *t match
+        Class(_, _, a) -> a
+        _ -> buf()
+    for required in f.classes[k].traits
+        if !conformance_holds(f, class_owner(k), required, args) then continue
+        if holding_ancestor(f, substitute(required, class_owner(k), args), target) is Some(found) then return Some(found)
+    holding_ancestor(f, substitute(f.classes[k].superclass?, class_owner(k), args), target)
+
+/** Whether the type whose parameters `owner` owns, at type arguments `args`, has the conformance to
+ * `required` its declaration or an impl states: at once, unless an impl with bounds of its own
+ * states it and `args` miss them. */
+conformance_holds(f: Conformances, owner: usize, required: &Type, args: Buf[&Type]) -> bool
+    val id = *required match
+        Class(id, _, _) -> id
+        _ -> return true
+    for x in f.conditional
+        if x.owner == owner && x.trait_id == id then return conditions_met(f, x, args)
+    true
+
+/** Whether type arguments `args` meet the bounds of conditional conformance `x`. */
+conditions_met(f: Conformances, x: ConditionalConformance, args: Buf[&Type]) -> bool
+    for i in 0..<x.conditions.len()
+        if i >= args.len() then break
+        for b in x.conditions[i]
+            if !meets_bound(f, args[i], substitute(b, x.owner, args)) then return false
+    true
 
 /** The core library's operator and equality traits and their methods, by name. */
 private find_core_traits(c: *Checker)
@@ -3222,33 +3290,6 @@ private is_universal(c: *Checker, m: usize) -> bool = c.core.is(m, "equals") || 
 private core_trait_type(c: *Checker, name: string) -> Option[&Type]
     val k = c.core.trait_named(name)?
     Some(own_class_type(c.classes[k], k))
-
-// Whether a data type's conformance to trait `k` holds at its type arguments: an impl with bounds of
-// its own makes it conform only where they are met. Some impl reaching `k` must hold.
-private conditions_hold(c: *Checker, t: &Type, k: usize) -> bool
-    val d = *t match
-        Data(d, _, _) -> d
-        _ -> return true
-    val args = *t match
-        Data(_, _, args) -> args
-        _ -> buf()
-    var reached = false
-    for block in c.impls
-        val tt = block.trait_type match
-            Some(tt) -> tt
-            None -> continue
-        val same = *block.target match
-            Data(e, _, _) -> e == d
-            _ -> false
-        if !same || ancestor_type(c.classes, c.data, tt, k) is None then continue
-        reached = true
-        var holds = true
-        for i in 0..<block.conditions.len()
-            if i >= args.len() then break
-            for b in block.conditions[i]
-                if !conforms_to_bound(c, args[i], substitute(b, block.owner, args)) then holds = false
-        if holds then return true
-    !reached
 
 // Holds each field of a type deriving a trait to the trait, which the derived method calls on it: a
 // class's constructor parameters, a data type's variants' fields, seen with the bounds the type's
@@ -3281,6 +3322,10 @@ private check_derivation(c: *Checker, dv: Derivation)
             Some(id) -> id
             None -> return
         scope = Some(GenericScope(class_owner(id), c.classes[id].decl.type_params))
+        // A generic class's derived impl bounds its parameters by the trait.
+        for block in c.impls
+            if block.unit == dv.unit && block.decl.span.start == dv.span.start && block.decl.span.end == dv.span.end
+                scope = Some(GenericScope(class_owner(id), block.decl.type_params))
         for f in c.classes[id].fields
             if f.param && f.owner == id && f.ty is Some(t)
                 names.push(f.name)
@@ -4252,6 +4297,7 @@ private member_method_value(c: *Checker, at: Span, object: &TExpr, m: usize, exp
 private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
     if *receiver.ty is Nothing then return receiver
+    if refuse_unmet_conformance(c, at, receiver.ty, m) then return TExpr(at, ErrorType, UnitConst)
     val target = c.symbols[m]
     val name = target.decl.name
     val known = receiver_type_args(c, receiver.ty, m)
@@ -5400,11 +5446,6 @@ private compare_link(c: *Checker, op: CompareOp, left: &TExpr, right: &TExpr)
 // the values' own types. A value of a type parameter compares through a bound that is `Eq` or
 // requires it.
 private equality_link(c: *Checker, at: Span, spelling: string, x: &Type, y: &Type)
-    // Arrays are equal when their contents are, which needs an `Eq` implementation that holds only
-    // when the elements' type has one: an impl with bounds of its own, which classes do not have yet.
-    if is_array_type(c, x) || is_array_type(c, y)
-        c.note(unit_of(c), at, s"`$spelling` on arrays compares their contents, which is not implemented yet; compare identities with `===`")
-        return
     if *x is AnyType && *y is AnyType then return
     if *x is TypeVar(_, _, _) || *y is TypeVar(_, _, _)
         if !same_type(x, y)
@@ -5587,8 +5628,8 @@ private upcast(c: *Checker, from: &Type, to: &Type) -> &Type
     if *x is TypeVar(_, _, _)
         if *zonk(c, to) is Class(k, _, _)
             for b in bounds_of(c, x)
-                if ancestor_type(c.classes, c.data, b, k) is Some(_) then return view_as(c.classes, c.data, b, zonk(c, to))
-    view_as(c.classes, c.data, x, zonk(c, to))
+                if holding_ancestor(conformances(c), b, k) is Some(_) then return view_as(conformances(c), b, zonk(c, to))
+    view_as(conformances(c), x, zonk(c, to))
 
 /** Whether a value of type `from` may be used where `to` is expected: an instance of a subclass is an
  * instance of its superclass, and an instance of a generic type one of another instance as its
@@ -6580,14 +6621,44 @@ private with_self(c: *Checker, m: usize, receiver_type: &Type, t: &Type) -> &Typ
     implementer.push(zonk(c, receiver_type))
     substitute(t, self_owner(k), implementer)
 
+// Reports a call of method `m` on a receiver of type `receiver_type` that has the method only through
+// a conformance that does not hold at its type arguments: a method of an impl with bounds of its own
+// the arguments miss, or a trait's method the type reaches only through such an impl.
+private refuse_unmet_conformance(c: *Checker, at: Span, receiver_type: &Type, m: usize) -> bool
+    val t = zonk(c, receiver_type)
+    val owner = *t match
+        Class(k, _, _) -> class_owner(k)
+        Data(d, _, _) -> data_owner(d)
+        _ -> return false
+    val args = *t match
+        Class(_, _, a) -> a
+        Data(_, _, a) -> a
+        _ -> buf()
+    val f = conformances(c)
+    val symbol = c.symbols[m]
+    var missing: Option[usize] = None
+    for x in c.conditional
+        if x.owner != owner || x.params.len() == 0 || symbol.unit != x.unit then continue
+        if symbol.type_params.len() < x.params.len() || symbol.type_params[0].span.start != x.params[0].span.start then continue
+        if !conditions_met(f, x, args) then missing = Some(x.trait_id)
+    if missing is None
+        if symbol.owner_class is Some(k)
+            if is_trait(c, k) && ancestor_type(c.classes, c.data, t, k) is Some(_) && holding_ancestor(f, t, k) is None then missing = Some(k)
+    val k = missing match
+        Some(k) -> k
+        None -> return false
+    c.note(unit_of(c), at, s"`${symbol.decl.name}` is a method of `${c.classes[k].name}`, which ${type_name(t)} does not implement")
+    true
+
 // A method call passes the receiver first. The class's type arguments come from the receiver's
 // type, and the method's own, which follow them, are written or inferred as for a function.
 private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m: usize, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], direct: bool, checked: Buf[Option[&TExpr]]) -> &TExpr
     val target = c.symbols[m]
-    if *receiver.ty is Nothing
+    val unmet = refuse_unmet_conformance(c, name_span, receiver.ty, m)
+    if *receiver.ty is Nothing || unmet
         for i in 0..<args.len()
             if i >= checked.len() || checked[i] is None then check_statement(c, args[i].value)
-        return receiver
+        return if unmet then TExpr(at, ErrorType, UnitConst) else receiver
     // The receiver is evaluated before the arguments, so one that is computed is held while they are.
     var setup: Option[&TExpr] = None
     var object = receiver

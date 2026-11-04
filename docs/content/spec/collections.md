@@ -203,7 +203,8 @@ that is read before one is written, so a buffer needs no value to fill it with.
 `Vector[+T]` is the default sequence: immutable, covariant and indexed in constant time. Its
 elements are in one array that nothing writes to after the vector is made, so an operation that
 makes a changed vector (`appended`, `prepended`, `concat`, `updated`) copies them. Both compare and
-hash by their elements in order.
+hash by their elements in order, and display as an array does, `[1, 2, 3]`, where their elements
+display.
 
 ## Ranges
 

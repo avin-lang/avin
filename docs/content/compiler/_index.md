@@ -230,12 +230,22 @@ bytes, and otherwise calls the record's entry; the hash reads the entry the same
 made for every record an object can have, once a program makes such a comparison at all; making them
 can lay out more types, so lowering repeats until no record lacks them.
 
-**Conditional conformance.** An impl with bounds of its own records them per type parameter. A
-data type's conformance to a trait through such an impl holds at a type argument list when the
-arguments meet them, which is checked where a bound is checked; the impl's methods see the bounds as
-their parameters' own. The trait is one that is only a bound, so no value is ever converted to it and
-no type pattern tests it; the type's method table at an instance whose arguments miss the bounds
-still holds the impl's methods, compiled but never reached.
+**Conditional conformance.** An impl with bounds of its own is recorded as a
+`ConditionalConformance`: the type's owner, the trait, and the bounds per type parameter, in the
+type's own parameters. The trait joins the type's `traits` as any other, so trait positions and
+method tables are laid out over every instance alike, and the impl's methods see the bounds as their
+parameters' own. Whether an instance has the conformance is decided by `holding_ancestor`, which
+walks the type's conformances as `ancestor_type` does but passes a recorded one only where the type
+arguments meet its bounds (`meets_bound`: a type parameter through its bounds in scope, a built-in
+through its impls, a class or data type recursively). It reads a `Conformances` value: the types,
+the built-in and conditional conformances, the core traits, and the bounds of the type parameters in
+scope, which lowering, asking only of concrete types, leaves empty. Every place a conformance is
+decided goes through it: a bound held to a type argument, a conversion (`view_as`, so a covariant
+type argument too), the type record's ancestors, the static decision that a type pattern always
+matches, and a call of a method the type has only through the conformance, a method of the impl or
+the trait's, which the checker reports on an instance missing the bounds. Such an instance's table
+leaves the trait's positions empty, so the impl's methods are never compiled at its arguments; the
+`equals` and `hash` entries of `Eq` and `Hash`, which every type meets, are unaffected.
 
 **Derived traits.** `derives` is written out on the syntax tree (`derive.sysl`) before the checker
 declares anything, so a derived method is declared, checked and compiled as one written by hand, and
@@ -246,9 +256,9 @@ has by value), its method matching `(self, other)` or `self` against each varian
 comparing variant positions when the variants differ. `Eq` joins `equals` calls with `&&`, `Hash`
 folds the fields' `hash` with wrapping `*% 31 +%`, `Ord` returns the first nonzero `compare`, and
 `Display` and `Debug` write the name and each field through the trait's own method, rendering into a
-`StringWriter` first when the spec has a width. A generic data type's `Ord` impl bounds every
-parameter by `Ord`, a conditional conformance; `Display` and `Debug` cannot be conditional, being
-types too. The rules a list breaks on its own (an unknown trait, a repeat, a trait the type also
+`StringWriter` first when the spec has a width. A generic type's `Ord`, `Display` and `Debug` are
+conditional conformances: an impl bounding every parameter by the trait, for a data type as always
+and for a generic class in place of the parent and the method. The rules a list breaks on its own (an unknown trait, a repeat, a trait the type also
 implements, `Eq` without `Hash` on a class) are reported while writing it out. The rest needs types:
 once every conformance is known, the checker holds each field to the trait derived from it, with the
 bounds the parameters have in the derived impl, names a field that falls short, and leaves that
