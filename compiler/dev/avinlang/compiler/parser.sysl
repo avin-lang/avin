@@ -15,6 +15,9 @@ struct Parser
      * collection literals): a `return` or `break` value stops at the comma there, instead of making a
      * tuple. An indented block starts a new line context and clears it. */
     in_list: bool
+    /** The spans of the expressions written in parentheses of their own, which the rule against
+     * mixing left- and right-grouping infix calls lets through. */
+    grouped: Buf[Span]
 
     spelling(self, t: Spanned[Token]) -> string = from_utf8_unchecked(self.src.text(t.span))
 
@@ -65,12 +68,36 @@ impl TokenStream for Parser
         val next = self.toks.peek()
         if next is Some(t)
             if t.value == Word && self.toks.position > 0 && !is_keyword(self.spelling(t)) then return Some(Spanned(InfixName, t.span))
+            // `++` and `--` with an operand after them on the line call a method of that name:
+            // `xs ++ ys`. Otherwise they update the operand before them: `i++`.
+            if t.value == Postfix && self.toks.position > 0 && operand_follows(self, t) then return Some(Spanned(SymbolOp, t.span))
         next
     take(*self) -> Option[Spanned[Token]] = self.toks.advance()
 
 parser_for(src: Source) -> Parser
     val lexed = lex(src)
-    Parser(src, lexed.items, lexed.report, None, false)
+    Parser(src, lexed.items, lexed.report, None, false, buf())
+
+// Whether the `++` or `--` token `t` is followed, on its own line, by something that begins an
+// operand and is not itself an operator: a name, a literal or an opening bracket, or an indented
+// block on the next line.
+private operand_follows(p: Parser, t: Spanned[Token]) -> bool
+    val word = p.spelling(t)
+    if word != "++" && word != "--" then return false
+    val next = p.toks.peek_at(1) match
+        Some(n) -> n
+        None -> return false
+    if next.value == Indent then return true
+    for b in p.src.text(Span(t.span.end, next.span.start))
+        if b == u8('\n') then return false
+    next.value match
+        Word ->
+            val w = p.spelling(next)
+            !is_keyword(w) || w == "self" || w == "true" || w == "false"
+        Number | RealNumber | Quoted | Interpolated | CharQuoted -> true
+        _ ->
+            val w = p.spelling(next)
+            w == "(" || w == "[" || w == "{"
 
 struct ParsedExpr
     tree: &Expr
@@ -102,6 +129,7 @@ private binding(t: Spanned[Token]) -> u16
         CompareOp -> 30
         IsKeyword -> 30
         InfixName -> InfixBinding
+        SymbolOp -> InfixBinding
         RangeOp -> 34
         ConsOp -> 35
         BitOrOp -> 36
@@ -146,7 +174,7 @@ private hole(p: *Parser, span: Span) -> &Expr
         p.report.add(error(span, "an interpolation hole needs an expression"))
         return Expr(span, Invalid)
     val lexed = lex_hole(p.src, span)
-    var inner = Parser(p.src, lexed.items, lexed.report, None, false)
+    var inner = Parser(p.src, lexed.items, lexed.report, None, false, buf())
     val e = expression(&inner, 0)
     if !inner.toks.at_end() then inner.report.add(error(inner.toks.here(), "unexpected input after the expression in this hole"))
     p.report.absorb(inner.report)
@@ -176,6 +204,10 @@ private prefix(t: Spanned[Token], p: *Parser) -> &Expr
                 Err(_) -> Expr(t.span, Invalid)
         Interpolated -> interpolation(p, t)
         Word -> word_prefix(t, text, p)
+        SymbolOp ->
+            p.report.add(error(t.span, s"`$text` is a method's name, called between its two operands; a symbol method has no prefix form, and a prefix operator written right before another needs a space between them"))
+            val operand = expression(p, PrefixBinding)
+            Expr(t.span.to(operand.span), Invalid)
         _ ->
             if text == "++" || text == "--"
                 val target = expression(p, PrefixBinding)
@@ -238,8 +270,13 @@ line_statement(p: *Parser) -> &Expr
         if items.len() == 1 then return first
         return Expr(first.span.to(last.span), Tuple(items))
     val at = p.toks.here()
-    val (compound, yields) = assign_op(p.spelling(p.toks.advance().unwrap()))
+    val spelling = p.spelling(p.toks.advance().unwrap())
     val value = if p.at_kind(Indent) then parse_body(p, false) else line_statement(p)
+    if !language_assignment(spelling)
+        if items.len() == 1 && !(first.kind is Tuple(_)) then return Expr(first.span.to(value.span), SymbolAssign(first, spelling, value, at))
+        p.report.add(error(at, s"`$spelling` calls a method of one target, so a multiple assignment cannot use it"))
+        return Expr(first.span.to(value.span), Invalid)
+    val (compound, yields) = assign_op(spelling)
     // The places may be written in parentheses: `(a, b) = (b, a)`.
     if items.len() == 1
         if first.kind is Tuple(places)
@@ -261,6 +298,7 @@ private parenthesized(p: *Parser, start: Span) -> &Expr
     if !p.at(",")
         p.in_list = outer
         p.expect(")")
+        p.grouped.push(first.span)
         return first
     var items: Buf[&Expr] = buf()
     items.push(first)
@@ -277,6 +315,7 @@ private infix(left: &Expr, t: Spanned[Token], p: *Parser) -> &Expr
     t.value match
         AssignOp ->
             val value = if p.at_kind(Indent) then parse_body(p, false) else expression(p, 1)
+            if !language_assignment(op) then return Expr(left.span.to(value.span), SymbolAssign(left, op, value, t.span))
             val (compound, yields) = assign_op(op)
             Expr(left.span.to(value.span), Assign(left, compound, value, yields, t.span))
         RangeOp ->
@@ -305,6 +344,7 @@ private infix(left: &Expr, t: Spanned[Token], p: *Parser) -> &Expr
             Expr(left.span.to(pattern.span), Is(left, pattern, negated))
         MatchKeyword -> match_expression(p, left)
         InfixName -> infix_call(left, t, op, p)
+        SymbolOp -> symbol_call(left, t, op, p)
         Postfix -> postfix(left, t, op, p)
         _ ->
             val right = expression(p, binding(t))
@@ -325,11 +365,43 @@ private infix_call(left: &Expr, t: Spanned[Token], name: string, p: *Parser) -> 
     val arg = if p.at_kind(Indent) then parse_body(p, false) else expression(p, InfixBinding)
     Expr(left.span.to(arg.span), InfixCall(left, name, t.span, arg))
 
+// `xs ++ ys` calls the method `++` of `xs` with `ys`, at the level and with the rules of `a max b`. A
+// name ending in `:` groups to the right and takes its receiver on the right: `x +: xs` is
+// `xs.+:(x)`, and `a +: b +: xs` is `a +: (b +: xs)`. Left- and right-grouping calls do not mix
+// without parentheses.
+private symbol_call(left: &Expr, t: Spanned[Token], name: string, p: *Parser) -> &Expr
+    for b in p.src.text(Span(left.span.end, t.span.start))
+        if b == u8('\n')
+            p.report.add(error(t.span, s"an infix call starts on its receiver's line: end that line with `$name` to put the operand on the next"))
+            break
+    if !p.at_kind(Indent) && (p.at_line_end() || argument_cannot_start(p))
+        p.report.add(error(t.span, s"`$name` has no right operand: a method named by a symbol is called between two operands, and has no postfix form"))
+        return Expr(left.span.to(t.span), Invalid)
+    val right = groups_right(name)
+    mixed_grouping(p, left, right, t.span)
+    val arg = if p.at_kind(Indent) then parse_body(p, false) else expression(p, if right then InfixBinding - 1 else InfixBinding)
+    if !right then return Expr(left.span.to(arg.span), InfixCall(left, name, t.span, arg))
+    mixed_grouping(p, arg, right, t.span)
+    Expr(left.span.to(arg.span), InfixCall(arg, name, t.span, left))
+
+/** Whether an infix method of this name groups to the right: a symbol ending in `:`. */
+groups_right(name: string) -> bool = name.ends_with(":") && is_operator_spelling(name)
+
+// Reports an operand that is an infix call grouping the other way, written without parentheses:
+// `a ++ b +: c` could mean either grouping.
+private mixed_grouping(p: *Parser, operand: &Expr, right: bool, at: Span)
+    if operand.kind is InfixCall(_, other, _, _)
+        if groups_right(other) == right then return
+        for g in p.grouped
+            if g.start == operand.span.start && g.end == operand.span.end then return
+        val (l, r) = if right then (other, p.spelling(Spanned(SymbolOp, at))) else (p.spelling(Spanned(SymbolOp, at)), other)
+        p.report.add(error(at, s"`$l` groups to the left and `$r` to the right, so they cannot be mixed at one level: add parentheses"))
+
 // Whether the next token only continues an expression, as `==` or `then` does, and cannot begin one.
 private argument_cannot_start(p: *Parser) -> bool
     p.toks.peek() match
         Some(next) -> next.value match
-            CompareOp | MultiplyOp | AssignOp | AndOp | OrOp | BitOrOp | BitXorOp | BitAndOp | RangeOp | ConsOp | IsKeyword | MatchKeyword -> true
+            CompareOp | MultiplyOp | AssignOp | AndOp | OrOp | BitOrOp | BitXorOp | BitAndOp | RangeOp | ConsOp | SymbolOp | IsKeyword | MatchKeyword -> true
             _ -> p.at("then") || p.at("do")
         None -> true
 
@@ -392,6 +464,8 @@ private member(left: &Expr, t: Spanned[Token], p: *Parser) -> &Expr
                     start = i + 1
             target
         _ ->
+            // A method named by a symbol is reached as any other: `xs.++(ys)`.
+            if is_operator_spelling(text) then return Expr(left.span.to(next.span), Member(left, text))
             p.report.add(expected(next.span, "a member name", found_at(p.src, next.span)))
             Expr(left.span.to(next.span), Invalid)
 
@@ -531,6 +605,19 @@ private compare_op(text: string) -> CompareOp
     elif text == "<=" then LessEqual
     elif text == ">" then Greater
     else GreaterEqual
+
+/** The operators of the language that have compound assignment forms, `+=` and `+:=`. */
+compound_operator(text: string) -> bool
+    for op in ["+", "-", "*", "/", "%", "<<", ">>", "+%", "-%", "*%", "+|", "-|", "*|", "&", "|", "^"]
+        if text == op then return true
+    false
+
+// Whether an assignment's spelling is the language's own: `=`, `:=`, or one of them after an
+// operator that has compound forms. Any other spelling is a method's name (`++=`).
+private language_assignment(text: string) -> bool
+    if text == "=" || text == ":=" then return true
+    if text.ends_with(":=") && compound_operator(text[0..<text.bytes.len - 2]) then return true
+    compound_operator(text[0..<text.bytes.len - 1])
 
 // `=` and `:=` assign plainly; any other spelling is an operator followed by `=` or `:=`.
 private assign_op(text: string) -> (Option[BinaryOp], bool)

@@ -441,8 +441,18 @@ Settled by the user on 2026-11-03:
   `iN`), lets the core library implement a trait once for every width (`impl[T: Integer] Display for
   T`). Such an impl over a bare type parameter is allowed only for closed core traits, in the core
   library.
-- Until methods can be named by symbols, a vector's `:+`, `+:` and `++` are `appended`,
-  `prepended` and `concat`, and a buffer's `+=` is `add`.
+- Settled by the user 2026-11-03: any run of the operator characters `+ - * / % < > = ! & | ^ ~ : ?`
+  that is not one of the language's operators names a method, declared like any method and called
+  infix (`xs ++ ys`) or dotted (`xs.++(ys)`). The language's operators, including the yielding
+  compound forms, are not method names: a type has them through their traits, and a method named
+  `+` is an error saying to implement `Add`. A symbol call binds at the infix-call level and groups
+  left, except that a name ending in `:` groups right with its receiver on the right (`x +: xs` is
+  `xs.+:(x)`, `x` evaluated first); left- and right-grouping calls do not mix without parentheses.
+  There are no prefix or postfix symbol methods; `++` and `--` update when no operand follows on the
+  line. `x op= y` calls the method `op=` where `x`'s type has one, and otherwise is the language's
+  compound assignment or, for a symbol method `op`, `x = x op y`. The library uses symbols:
+  `Vector`'s `++`, `:+` and `+:`, `List`'s and `Map`'s `++`, and a buffer's `+=` and `++=` beside
+  `add` and `addAll`.
 - A module may be named in code through an import of the module itself: `import a.b`, then `b.X`
   reaches `a.b`'s public `X`, alongside imports of single declarations.
 - An infix method call binds more loosely than arithmetic, bitwise, shift, cons and range operators
