@@ -867,6 +867,122 @@ main() = print(s"${circleArea(Circle(2))}")
   module-level values initialize before `main`, each after the values its initializer needs, across
   modules as within one.
 
+## Literate source
+
+**A file named `.lavin` is a Markdown document, and the part of it indented four columns is the
+program.** Everything else is prose and is not compiled. The file's **name** alone decides which
+kind of file it is: an `.avin` file is never read this way, whatever its indentation, and a `.lavin`
+file with no prose in it is an `.avin` file indented four spaces. There is no other marker: no name
+on a block, no directive that opens one, and no way to say that a block ends.
+
+````text
+# Halving
+
+This program explains itself. Everything at the margin is prose, and the compiler never
+sees it.
+
+    half(n: int) -> int = n / 2
+
+    main()
+        val h = half(9)
+
+A paragraph between two indented blocks ends nothing, so a body can be explained a step
+at a time and picked up again where it left off.
+
+        print(h)
+
+What a reader should *not* run gets a fence instead of an indent:
+
+~~~
+half(n) = n / 2      // the wrong version, with no types
+~~~
+````
+
+The program that file holds is the indented lines, and it is an ordinary Avin program:
+
+```text
+half(n: int) -> int = n / 2
+
+main()
+    val h = half(9)
+    print(h)
+```
+
+The code appears in the order it runs and nothing reorders it, so the file reads correctly as it
+is: to a person, to a Markdown renderer, and to `grep`. What it adds over comments is room for a
+full explanation between two functions, or between two lines of one.
+
+A `.lavin` file is accepted wherever an `.avin` file is: as a program of one file, as a file of a
+module in a directory program (a module may mix the two), in the standard library's directory, and
+by `avin test`, which finds its `@test` functions as it finds an ordinary file's. The language
+server reads it the same way.
+
+### The rules
+
+- **Four columns is the threshold**, which is Markdown's own, so what a renderer shows as a code
+  block is exactly what the compiler reads.
+- **The program's indentation starts after the four columns.** A declaration is written four
+  columns in, its body eight, and so on; the program's blocks open and close by its own
+  indentation, measured from there.
+- **Consecutive indented blocks are one program, and prose between them is blank lines.** A
+  paragraph between two blocks ends nothing: the next block's lines carry on at whatever depth the
+  program had reached, so a function body may be explained a step at a time, its later lines
+  indented as deep as its earlier ones. A program line less deep than the block it is in closes
+  that block, as it would in an `.avin` file.
+- **A fenced block is an illustration.** Both ` ``` ` and `~~~` mark code that is to be read rather
+  than run (a wrong version beside the right one, a shell transcript, a fragment of another
+  language) and none of it is compiled, however it is indented. Code that runs is indented; code
+  that is only shown is fenced. A fence closes at a line of the same character, at least as long,
+  and nothing else.
+- **What is under a list item is prose.** An indented block inside a list item belongs to that
+  item, so a list may hold examples without any of them entering the program. An executable block
+  therefore never sits directly under a list; a line of prose at the margin separates the two.
+
+### Positions are the document's
+
+Every line of program text stays where it was written, so every position the compiler reports, in
+a diagnostic, a trap's report, a failed test or the language server, is the line and column of the
+document the reader has open, the four columns included:
+
+```text
+error: `nope` is not defined
+ --> doubling.lavin:8:16
+  |
+8 |         double(nope)
+  |                ^^^^
+```
+
+### Two forms Markdown accepts are refused
+
+Both would silently drop part of the program, and neither could be diagnosed later, because what
+reaches the compiler is simply a smaller program than the author wrote.
+
+**A tab in the indentation.** A tab is as wide as whatever displays it, so a tab-indented line could
+be program text in one editor and prose in another. It is refused *before* the four-column test,
+because failing that test would silently turn the line into prose and drop a statement from a
+function.
+
+```text
+error: a tab in the indentation of a literate file — what makes a line program text is four columns of indent, and a tab is as wide as whatever happens to be displaying it, so this line is code in one editor and prose in another
+```
+
+**A fence that is never closed.** Markdown runs an unclosed fence to the end of the document. In a
+literate file that would turn every declaration below it into an illustration, and the resulting
+diagnostic would point somewhere far below the cause. The fence is refused at the line that opened
+it.
+
+```text
+error: this fence is never closed, so everything below it is an illustration and none of it is compiled — close it, or indent the lines that are meant to run
+```
+
+### `tangle` and `weave`
+
+The two halves of a literate system are named for what they do to the source. Every build of a
+`.lavin` file tangles it; `avin tangle` prints the program with the prose stripped, line for line
+with the document, and `avin weave` renders the document as HTML with its program coloured. Both
+read the file as a build does, so a file the compiler refuses is refused with the same diagnostic.
+[Getting started](/getting-started/#literate-programs) shows them.
+
 ## Initialization
 
 - Creating an instance runs the superclass's constructor first, then stores the class parameters,

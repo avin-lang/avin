@@ -1,0 +1,250 @@
+module dev.avinlang.compiler
+
+import sh.sysl.markdown.{Region, gfm, gfm_html, heading_ids, parse_with_regions, to_html_with}
+import sh.sysl.parsing.{Source, Span, source_of}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_dir, read_text, write_text_atomic}
+import sysl.path.{file_name}
+import sysl.text.{StrBuilder, from_utf8_unchecked, str_builder}
+
+// The two halves of a literate system, as commands. `avin tangle` prints the program a `.lavin`
+// file holds, its prose stripped and its four columns taken off, line for line with the document;
+// `avin weave` renders the document as one HTML page.
+//
+// **The compiler says which lines are code, and the Markdown is read around them.** Each run of
+// program lines becomes a region of the `sysl-lang/markdown` package's `parse_with_regions`, which
+// closes every Markdown block open where the region begins and sets it as a code block of the
+// document marked `avin`. Consecutive runs with only blank lines between them are one region. The
+// rest is read as one CommonMark document with GitHub's extensions and heading ids. Every block
+// marked `avin`, a region or a fenced illustration, is coloured by Avin's own lexer.
+
+/** The info string a woven program block carries. */
+const WeaveLanguage: string = "avin"
+
+tangle_usage() -> string = "usage: avin tangle <file.lavin> [-o <path>]"
+weave_usage() -> string = "usage: avin weave <file.lavin> [-o <file.html>]"
+
+/** `avin tangle` and `avin weave`: the program, or the document, a literate file holds, written to
+ * `-o` or said. A file the compiler refuses is refused here with the same diagnostic. */
+literate_command(args: []const string, say: string -> unit, note: string -> unit) -> int
+    val command = args[1]
+    val usage = if command == "tangle" then tangle_usage() else weave_usage()
+    var input: Option[string] = None
+    var output: Option[string] = None
+    var i = 2usize
+    while i < args.len
+        if args[i] == "-o" && i + 1 < args.len && output is None
+            output = Some(args[i + 1])
+            i += 2
+            continue
+        if args[i].starts_with("-") || input is Some(_)
+            note(usage)
+            return 2
+        input = Some(args[i])
+        i += 1
+    val file = input match
+        Some(f) -> f
+        None ->
+            note(usage)
+            return 2
+    if is_dir(file) || !is_literate(file)
+        note(s"avin: $file is not a literate source: `$command` reads one `${LiterateExtension}` file")
+        return 2
+    val text = read_text(file) match
+        Ok(t) -> t
+        Err(e) ->
+            note(s"avin: $file: ${e.to_string()}")
+            return 1
+    val src = source_of(file, text)
+    val rendered = if command == "tangle" then tangle_text(src) else weave_render(src)
+    val out = rendered match
+        Ok(o) -> o
+        Err(why) ->
+            note(why)
+            return 1
+    output match
+        None ->
+            say(if out.ends_with("\n") then out[0..<out.bytes.len - 1] else out)
+            0
+        Some(to) ->
+            write_text_atomic(to, out) match
+                Ok(_) -> 0
+                Err(e) ->
+                    note(s"avin: $to: ${e.to_string()}")
+                    1
+
+// The program a literate file holds, or its refusal rendered against the document.
+private tangle_text(src: Source) -> Result[string, string] = tangled_program(src) match
+    Ok(program) -> Ok(program)
+    Err(d) -> Err(d.render(src))
+
+/** The document a literate file holds as an HTML page, or its refusal rendered against the
+ * document: a file the compiler will not read is not woven. */
+weave_render(src: Source) -> Result[string, string]
+    val program = literate_program(src) match
+        Ok(p) -> p
+        Err(d) -> return Err(d.render(src))
+    val opts = gfm()
+    opts.exts.add(heading_ids())
+    val doc = parse_with_regions(from_utf8_unchecked(src.bytes), opts, weave_regions(src, program)) match
+        Ok(d) -> d
+        Err(e) -> return Err(s"${src.name}: ${e.to_string()}")
+    val code: &Fn(string, string) -> Option[string] = (info, text) ->
+        if weave_language(info) == WeaveLanguage then Some(weave_code_block(text)) else None
+    val title = file_name(src.name).unwrap_or(src.name)
+    Ok(weave_page(title, to_html_with(doc, gfm_html() with { highlight = Some(code) })))
+
+// The runs of program text, each a region holding its code with the four columns taken off. A run
+// goes on through blank lines as far as more program text follows, and stops before them otherwise.
+// `program` is the document with its prose blanked, so a line holds program text exactly when it
+// is not blank there.
+private weave_regions(src: Source, program: Source) -> Buf[Region]
+    var out: Buf[Region] = buf()
+    val n = src.line_count()
+    var line: usize = 1
+    while line <= n
+        if !weave_code(program, line)
+            line += 1
+            continue
+        var code = str_builder()
+        var through = line
+        var next = line
+        loop
+            if next > n then break
+            if weave_code(program, next)
+                val text = from_utf8_unchecked(src.line_text(next))
+                code.push(text[LiterateMargin..<text.bytes.len])
+                code.push("\n")
+                through = next
+                next += 1
+                continue
+            var ahead = next
+            while ahead <= n && !weave_code(program, ahead) && weave_blank(src, ahead)
+                ahead += 1
+            if ahead > n || !weave_code(program, ahead) then break
+            while next < ahead
+                code.push("\n")
+                next += 1
+        out.push(Region(Span(src.line_span(line).start, src.line_span(through).end), WeaveLanguage, code.finish()))
+        line = next
+    out
+
+private weave_code(program: Source, line: usize) -> bool = !weave_blank(program, line)
+
+private weave_blank(src: Source, line: usize) -> bool = from_utf8_unchecked(src.line_text(line)).trim().is_empty()
+
+// An info string's language: its first word, as CommonMark reads one.
+private weave_language(info: string) -> string
+    for k in 0..<info.bytes.len
+        if info.bytes[k] == u8(' ') then return info[0..<k]
+    info
+
+/** A block of Avin, coloured by the language's own lexer: each token set in a `span` whose class
+ * names what it is, and everything between tokens -- blanks and comments -- set as it was written. */
+weave_code_block(text: string) -> string =
+    s"<pre><code class=\"language-$WeaveLanguage\">${highlight_avin(text)}</code></pre>\n"
+
+/** Avin source as HTML, each token in a `span` of class `hl-keyword`, `hl-type`, `hl-number`,
+ * `hl-string`, `hl-operator` or `hl-name`, and each comment in one of class `hl-comment`. */
+highlight_avin(text: string) -> string
+    val src = source_of("block.avin", text)
+    val lexed = lex(src)
+    var out = str_builder()
+    var at = 0usize
+    for t in lexed.items.items
+        if t.span.is_empty() || t.span.start < at then continue
+        highlight_gap(&out, text[at..<t.span.start])
+        val word = text[t.span.start..<t.span.end]
+        val class = t.value match
+            Word ->
+                if is_keyword(word) || word == "lazy" || word == "in" then "hl-keyword"
+                elif word.bytes[0] >= u8('A') && word.bytes[0] <= u8('Z') || builtin_type(word) is Some(_) then "hl-type"
+                else "hl-name"
+            MatchKeyword | IsKeyword -> "hl-keyword"
+            Number | RealNumber -> "hl-number"
+            Quoted | Interpolated | CharQuoted -> "hl-string"
+            _ -> "hl-operator"
+        out.push(s"<span class=\"$class\">")
+        escape_html(&out, word)
+        out.push("</span>")
+        at = t.span.end
+    highlight_gap(&out, text[at..<text.bytes.len])
+    out.finish()
+
+// What lies between two tokens: blanks, line breaks and comments, a comment set in its own span.
+private highlight_gap(out: *StrBuilder, gap: string)
+    var at = 0usize
+    val bs = gap.bytes
+    var k = 0usize
+    while k + 1 < bs.len
+        if bs[k] == u8('/') && bs[k + 1] == u8('/')
+            escape_html(out, gap[at..<k])
+            var end = k
+            while end < bs.len && bs[end] != u8('\n') && bs[end] != u8('\r') do end += 1
+            out.push("<span class=\"hl-comment\">")
+            escape_html(out, gap[k..<end])
+            out.push("</span>")
+            at = end
+            k = end
+        else
+            k += 1
+    escape_html(out, gap[at..<bs.len])
+
+private escape_html(out: *StrBuilder, text: string)
+    var from = 0usize
+    for k in 0..<text.bytes.len
+        val b = text.bytes[k]
+        val entity = if b == u8('<') then "&lt;" elif b == u8('>') then "&gt;" elif b == u8('&') then "&amp;" elif b == u8('"') then "&quot;" else ""
+        if entity != ""
+            out.push(text[from..<k])
+            out.push(entity)
+            from = k + 1
+    out.push(text[from..<text.bytes.len])
+
+private weave_page(title: string, body: string) -> string
+    var out = str_builder()
+    out.push("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n")
+    out.push("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>")
+    escape_html(&out, title)
+    out.push("</title>\n<style>\n")
+    out.push(weave_style())
+    out.push("</style>\n</head>\n<body>\n<main>\n")
+    out.push(body)
+    out.push("</main>\n</body>\n</html>\n")
+    out.finish()
+
+// The page's stylesheet: a colour is named once, as a custom property, and the dark palette answers
+// the same names. The prose is set to a measure; the code may run past it.
+private weave_style() -> string = raw"""
+    :root {
+      --bg: #fdfdfc; --fg: #1a1a18; --muted: #6b6b66; --rule: #e2e2dd; --code-bg: #f6f6f4;
+      --accent: #4a5f8a; --hl-keyword: #8a3d6b; --hl-string: #3f6b40; --hl-comment: #86867e;
+      --hl-number: #9a5b23; --hl-type: #3d6478; --hl-operator: #6b6b66;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #16161a; --fg: #e6e6e2; --muted: #9a9a94; --rule: #2c2c33; --code-bg: #1e1e24;
+        --accent: #9db2dd; --hl-keyword: #d69ac4; --hl-string: #9ccb9d; --hl-comment: #7e7e88;
+        --hl-number: #e0a86a; --hl-type: #8fc0d6; --hl-operator: #9a9a94;
+      }
+    }
+    body { margin: 0; background: var(--bg); color: var(--fg);
+      font: 17px/1.6 Georgia, "Iowan Old Style", serif; }
+    main { max-width: 42em; margin: 0 auto; padding: 2.5em 1em 4em; }
+    h1, h2, h3, h4 { font-family: system-ui, sans-serif; line-height: 1.25; margin: 1.6em 0 0.5em; }
+    a { color: var(--accent); }
+    code { font: 0.86em/1.5 ui-monospace, Menlo, Consolas, monospace; background: var(--code-bg);
+      padding: 0.1em 0.3em; border-radius: 3px; }
+    pre { background: var(--code-bg); border: 1px solid var(--rule); border-radius: 4px;
+      padding: 0.8em 1em; overflow-x: auto; }
+    pre code { padding: 0; background: none; }
+    blockquote { margin: 0 0 1em; padding-left: 1em; border-left: 3px solid var(--rule); color: var(--muted); }
+    table { border-collapse: collapse; }
+    th, td { border: 1px solid var(--rule); padding: 0.3em 0.6em; }
+    .hl-keyword { color: var(--hl-keyword); }
+    .hl-type { color: var(--hl-type); }
+    .hl-number { color: var(--hl-number); }
+    .hl-string { color: var(--hl-string); }
+    .hl-comment { color: var(--hl-comment); font-style: italic; }
+    .hl-operator { color: var(--hl-operator); }
+    """

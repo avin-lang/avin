@@ -26,6 +26,13 @@ without them, or a message whose framing cannot be read, ends it with status 1.
 Unsaved text is analyzed as it stands in the editor: the server reads an open document's text in
 place of the file on disk, for every file of the program, and writes nothing anywhere.
 
+A [literate](/spec/declarations/#literate-source) `.lavin` document is answered like an `.avin`
+file: its program is the lines indented four columns, and every position the server reports or
+reads, a diagnostic's range, a hover's, a definition's place and the outline's, is the document's
+own line and column. The VS Code extension in `editors/vscode` registers `.lavin` files as
+*Literate Avin*, highlights their program blocks as Avin and their prose as Markdown, and starts the
+same server for them.
+
 ## Which program a file belongs to
 
 Every change is answered by checking the whole program the file belongs to, together with the
