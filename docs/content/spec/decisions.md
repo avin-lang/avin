@@ -286,9 +286,9 @@ a decision changes, this page and the chapter change together.
 - An interpolated string is a method call on `StringContext`: `p"a $x b"` is
   `StringContext(["a ", " b"]).p(x)`. `s`, `f` and `raw` are library methods, and a program defines
   its own interpolator by implementing a trait for `StringContext`.
-- Interpolated literals follow Scala's lexing (settled 2026-11-04). A backslash directly before a
-  `"` does not end any interpolated literal, so `raw"a\"b"` holds `a\"b` and `raw"a\"` is
-  unterminated; `$"` is a double quote and `$$` a dollar sign in every interpolator. The lexer reads
+- Interpolated literals follow Scala's lexing (settled 2026-11-04). A backslash and a `"` or
+  `\` after it are skipped as a pair, so `raw"a\"b"` holds `a\"b`, `raw"a\"` is unterminated and
+  `raw"a\\"` ends, holding two backslashes; `$"` is a double quote and `$$` a dollar sign in every interpolator. The lexer reads
   no escape: a part reaches `StringContext` as written, and only `s` and `f` process escapes, so
   `p"\d"` is fine and `s"\d"` is an error. A backslash is otherwise an ordinary character
   (`raw"C:\dir"`, `\$name` still interpolates).
