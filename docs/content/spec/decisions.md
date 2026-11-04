@@ -451,6 +451,20 @@ a decision changes, this page and the chapter change together.
   iterator is then not a `for` source.
 - `Array.fill(n, value)` evaluates `value` once and shares it between the elements; per-element
   values come from `Array.tabulate`. The alternative is a by-name `value`, evaluated per element.
+- A one-variant `data` type may have a companion `object`, as a class may: the name in call position
+  is the constructor and `Name.member` the companion. The immutable `Map[K, +V]` and `Set[A]` are
+  `data` types, since the methods an impl adds to a `data` type are not variance positions
+  (`updated(key: K, value: V)` needs no lower bound) and impls with bounds of their own (`Eq` when
+  the values have it) exist for `data` types; `Map.empty` and `Map.builder` then need a companion.
+  Until this is settled the empty map is `Map[K, V]()`, through a default field, and the builders
+  are named `MapBuilder` and `SetBuilder`. The alternatives are to exempt the methods of a class's
+  impls from variance as a `data` type's are, or to add lower bounds (`[W >: V]`).
+- The hash-based maps and sets iterate in an order the program cannot rely on: the immutable ones in
+  an order fixed by the keys' hashes alone, so equal maps iterate alike, and the mutable ones in
+  table order. The alternative is insertion order, which costs an index array beside the table.
+- Maps and sets display in the shape of their literals: `{a: 1, b: 2}` with each key and value in its
+  own `Display`, `{1, 2, 3}` for a set, and `{"a": 1}` with each part's `Debug`. Mutable maps and
+  sets compare and hash by contents, as arrays do.
 
 ## Open
 
