@@ -241,6 +241,11 @@ a decision changes, this page and the chapter change together.
   `{a: 1}` means `{"a": 1}`. `{}` is the empty Set and `Map.empty` the empty Map.
 - `x :: xs` prepends to an immutable `List`, and `head :: tail` is a list pattern, for recursive
   list code. `::` is right-associative.
+- Settled 2026-11-03: `List[+T]` is the core library's `data` type with variants `Cons(first, rest)`
+  and `Nil`. `::` and list patterns always mean the core library's `List`, whatever `List`, `Cons`
+  or `Nil` name where they are written. Every `List` method loops rather than recursing, so no
+  length deepens the stack, and lists compare and hash by contents and order lexicographically when
+  their elements are ordered.
 - Sequences are matched with the brackets that build them: `[]` matches any empty sequence and
   `[a, b]` any sequence of exactly two elements.
 - `Buffer` is the only growable mutable sequence, and `Deque` the mutable sequence for both ends.

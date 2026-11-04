@@ -3986,6 +3986,8 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     DoWhile(body, condition, otherwise) -> check_form(c, do_while_form(e, body, condition, otherwise), expected, used)
     For(pattern, source, body) -> for_expr(c, e, pattern, source, body)
     Range(lower, upper, inclusive) -> range_expr(c, e, lower, upper, inclusive)
+    Cons(head, tail, op_span) -> cons_expr(c, e, head, tail, op_span, expected)
+    ListLit(items) -> sequence_literal(c, e, items, expected)
     Break(value) -> break_expr(c, e, value)
     Continue -> continue_expr(c, e)
     Return(value) -> return_expr(c, e, value)
@@ -5614,6 +5616,48 @@ private is_range_type(c: *Checker, t: &Type) -> bool = *t match
     Class(k, _, _) -> c.classes[k].module_name == CoreModule && c.classes[k].name == "Range" && !c.classes[k].decl.object
     _ -> false
 
+/** The core library's `List` variant `name`: `Cons`, a head and a tail, or `Nil`, the empty list. */
+private list_variant(c: *Checker, name: string) -> Option[VariantRef]
+    val d = core_data(c, "List")?
+    Some(VariantRef(d, variant_index(c, d, name)))
+
+/** Whether `t` is an instance of the core library's `List`. */
+private is_list_type(c: *Checker, t: &Type) -> bool = *t match
+    Data(d, _, _) -> c.data[d].module_name == CoreModule && c.data[d].name == "List"
+    _ -> false
+
+// `head :: tail` is the core library's `Cons(head, tail)`, whatever `Cons` names where it is written,
+// so the element type is inferred as a call of the variant infers it: from the expected type and from
+// both operands, a `List` of their common type.
+private cons_expr(c: *Checker, e: &Expr, head: &Expr, tail: &Expr, op_span: Span, expected: Option[&Type]) -> &TExpr
+    val v = list_variant(c, "Cons") match
+        Some(v) -> v
+        None -> return unsupported(c, e, "`::`")
+    var args: Buf[Argument] = buf()
+    args.push(Argument(head.span, None, head))
+    args.push(Argument(tail.span, None, tail))
+    construct(c, e.span, op_span, v, args, None, expected)
+
+// A sequence literal where a `List` is expected builds that list, element by element from the front:
+// `[a, b]` is `a :: b :: []`, and `[]` is the empty list. A literal with any other expected type, or
+// none, is not built here.
+private sequence_literal(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Option[&Type]) -> &TExpr
+    val wanted = expected match
+        Some(t) -> zonk(c, t)
+        None -> return unsupported(c, e, "this expression")
+    if !is_list_type(c, wanted) then return unsupported(c, e, "this expression")
+    if items.len() == 0
+        val nil = list_variant(c, "Nil").unwrap()
+        return construct(c, e.span, e.span, nil, buf(), None, expected)
+    var rest: Buf[&Expr] = buf()
+    for i in 1..<items.len()
+        rest.push(items[i])
+    val tail = Expr(Span(if rest.len() > 0 then rest[0].span.start else e.span.end, e.span.end), ListLit(rest))
+    var args: Buf[Argument] = buf()
+    args.push(Argument(items[0].span, None, items[0]))
+    args.push(Argument(tail.span, None, tail))
+    construct(c, e.span, items[0].span, list_variant(c, "Cons").unwrap(), args, None, expected)
+
 /** The `iterator` methods a value of type `t` has: those of its class, of its bounds for a type
  * parameter, or of its impls. */
 private iterator_methods(c: *Checker, t: &Type) -> Buf[usize] = *t match
@@ -7197,6 +7241,21 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
                 for a in args
                     check_pattern(c, a, ErrorType, no_bind)
                 TPattern(p.span, ErrorType, PWildcard)
+        Cons(head, tail) ->
+            var parts: Buf[&Pattern] = buf()
+            parts.push(head)
+            parts.push(tail)
+            list_pattern(c, p, "Cons", parts, ty, no_bind, "`::` patterns match a `List`")
+        Sequence(items) ->
+            if items.len() == 0 then return list_pattern(c, p, "Nil", buf(), ty, no_bind, "sequence patterns match a `List`")
+            // `[a, b, c]` on a list is `a :: [b, c]`.
+            var rest: Buf[&Pattern] = buf()
+            for i in 1..<items.len()
+                rest.push(items[i])
+            var parts: Buf[&Pattern] = buf()
+            parts.push(items[0])
+            parts.push(Pattern(Span(if rest.len() > 0 then rest[0].span.start else p.span.end, p.span.end), Sequence(rest)))
+            list_pattern(c, p, "Cons", parts, ty, no_bind, "sequence patterns match a `List`")
         Tuple(items) ->
             // A tuple pattern takes apart a tuple of the same size; a tuple is matched as a value
             // with one variant whose fields are its parts.
@@ -7337,6 +7396,21 @@ private variant_pattern(c: *Checker, p: &Pattern, v: VariantRef, args: Buf[&Patt
         typed.push(check_pattern(c, args[i], field, no_bind))
     if !ok || *ty is ErrorType then return TPattern(p.span, ErrorType, PWildcard)
     TPattern(p.span, ty, PVariant(v.index, typed))
+
+// A list pattern is the core library's `List` variant `name` with the patterns `parts` for its
+// fields, whatever `Cons` and `Nil` name where it is written. On any other type it is reported with
+// `what`.
+private list_pattern(c: *Checker, p: &Pattern, name: string, parts: Buf[&Pattern], ty: &Type, no_bind: string, what: string) -> &TPattern
+    val t = zonk(c, ty)
+    val v = list_variant(c, name)
+    if v is Some(found)
+        if is_list_type(c, t) then return variant_pattern(c, p, found, parts, t, no_bind)
+    if !(*t is ErrorType)
+        if is_array_type(c, t) then c.note(unit_of(c), p.span, "sequence patterns on arrays are not implemented")
+        else c.note(unit_of(c), p.span, s"$what, not ${type_name(t)}")
+    for part in parts
+        check_pattern(c, part, ErrorType, no_bind)
+    TPattern(p.span, ErrorType, PWildcard)
 
 // A literal in a pattern takes the matched value's type, as it would beside it in `==`.
 private pattern_constant(c: *Checker, value: &Expr, ty: &Type) -> &TExpr
