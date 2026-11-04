@@ -1291,19 +1291,26 @@ private returning(l: *Lowering, value: Option[Operand]) -> Terminator
 // A Sysl binding is a function like any other in the object file; its body passes its parameters to
 // the binding's shim, with the context first, and returns what the shim returns. The shim is
 // generated Sysl, called with the C convention, which converts each value at the boundary. A result
-// the shim makes objects for comes with the descriptors and constant objects it makes them by.
+// the shim makes objects for comes with the descriptors and constant objects it makes them by, and a
+// parameter the shim reads through the core library, a vector, with the functions it reads it by:
+// each parameter's layouts after the parameters, then the result's.
 private binding_body(l: *Lowering, symbol: FunctionSymbol, shim: string)
     var args: Buf[Operand] = buf()
     var params: Buf[MirType] = buf()
     var crossings: Buf[&Crossing] = buf()
-    var unused: Buf[Operand] = buf()
+    var layouts: Buf[Operand] = buf()
     for i in 0..<symbol.params.len()
-        crossings.push(crossing(l, concrete(l, symbol.params[i]), &unused))
+        var own: Buf[Operand] = buf()
+        val c = crossing(l, concrete(l, symbol.params[i]), &own)
+        crossings.push(c)
+        // An array of bytes is copied into Sysl as it is, with no layout.
+        if !(c.form is Bytes)
+            for operand in own
+                layouts.push(operand)
         if l.param_values[i] is Some(v)
             args.push(Value(v))
             params.push(l.values[v])
     val result_type = concrete(l, symbol.result.unwrap_or(Unit))
-    var layouts: Buf[Operand] = buf()
     val result_crossing = crossing(l, result_type, &layouts)
     for operand in layouts
         params.push(if operand is ConstObject(_) then MRef else MPtr)
@@ -1331,19 +1338,19 @@ private crossing(l: *Lowering, t: &Type, layouts: *Buf[Operand]) -> &Crossing
             if array && *args[0] is Byte
                 layouts.push(DescriptorAddress(layout(l, t).variants[0].descriptor))
                 return Crossing(t, Bytes, buf(), 1)
-            // A vector's elements are an array made as an `Array` of its element type is, which the
-            // vector holds in its one field.
+            // A vector out of Sysl is made from an array made as an `Array` of its element type is;
+            // into Sysl, its elements are read a leaf at a time. The core library's functions that do
+            // both follow the array's descriptor.
             val start = layouts.len()
-            var vector: Option[usize] = None
             if array
                 layouts.push(DescriptorAddress(layout(l, t).variants[0].descriptor))
             else
                 layouts.push(DescriptorAddress(layout(l, array_type(l, args[0])).variants[0].descriptor))
-                val shape = layout(l, t)
-                layouts.push(DescriptorAddress(shape.variants[0].descriptor))
-                vector = Some(shape.variants[0].fields[0].unwrap().offset)
+                layouts.push(vector_function(l, "vectorOfArray", args[0]))
+                layouts.push(vector_function(l, "vectorLength", args[0]))
+                layouts.push(vector_function(l, "vectorLeaf", args[0]))
             val element = crossing(l, args[0], layouts)
-            return Crossing(t, Elements(element, vector), buf(), layouts.len() - start)
+            return Crossing(t, Elements(element, !array), buf(), layouts.len() - start)
         Data(id, _, args) ->
             val d = l.program.data[id]
             val shape = layout(l, t)
@@ -1366,6 +1373,17 @@ private crossing(l: *Lowering, t: &Type, layouts: *Buf[Operand]) -> &Crossing
                 None -> if d.name == "Option" then OptionForm else ResultForm
             return Crossing(t, form, variants, layouts.len() - start)
         _ -> return Crossing(t, Plain, buf(), 0)
+
+// The address of the core library's function `name` for vectors of `element`, which a shim calls to
+// make or to read a vector.
+private vector_function(l: *Lowering, name: string, element: &Type) -> Operand
+    for id in 0..<l.program.symbols.len()
+        val s = l.program.symbols[id]
+        if s.module_name == "avin" && s.name == name && s.owner_class is None && s.receiver is None
+            var args: Buf[&Type] = buf()
+            args.push(element)
+            return FunctionAddress(instance(l, id, args))
+    panic("the core library declares no " + name)
 
 // The core library's `Array` of `element`.
 private array_type(l: *Lowering, element: &Type) -> &Type
@@ -1502,6 +1520,11 @@ private array_operation(l: *Lowering, name: string, array: &Type, args: Buf[Oper
     val a = args[0]
     // A frozen array is the array itself, seen through a type that only reads it.
     if name == "array_freeze" then return Some(a)
+    // The end of filling an array the library made: every element store before it is visible to
+    // another thread no later than any store that hands the array over.
+    if name == "array_publish"
+        l.insts.push(Publish)
+        return None
     if name == "array_length" then return Some(byte_length(l, a))
     if name == "array_clear"
         trap_if(l, compare(l, CmpUgt, args[2], byte_length(l, a)), "slice out of range", at)

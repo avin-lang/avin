@@ -107,11 +107,23 @@ shim_source(bindings: Buf[MirBinding]) -> ShimSource
                 args.push("()")
                 continue
             put(&w, s", a$k: ${crossing_c_side(p)}")
-            args.push(into_expr(&w, p, s"a$k"))
+            args.push(into_expr(&w, p, s"a$k", s"ep$k", 0))
+        // Each parameter's layouts, then the result's.
+        for k in 0..<b.params.len()
+            for j in 0..<passed_layouts(b.params[k])
+                put(&w, s", e${k}_$j: *u8")
         for k in 0..<b.result.layouts
             put(&w, s", d$k: *u8")
         put(&w, ")")
         if !(*b.result.ty is Unit) then put(&w, " -> " + crossing_c_side(b.result))
+        for k in 0..<b.params.len()
+            val n = passed_layouts(b.params[k])
+            if n == 0 then continue
+            put(&w, s"\n    var es$k: [$n]*u8 = [")
+            for j in 0..<n
+                if j > 0 then put(&w, ", ")
+                put(&w, s"e${k}_$j")
+            put(&w, s"]\n    val ep$k: **u8 = ptr_cast(&es$k)")
         // A result that holds a collection may be spelled with a slice or a `Buf`, so it takes the
         // Sysl function's own type, and the overloads of its conversion choose by it.
         val spellings = sysl_types(&w, b.result)
@@ -256,11 +268,18 @@ private payload(c: &Crossing, name: string) -> &Crossing
 // How a value of `c`'s type is passed with the C convention.
 private crossing_c_side(c: &Crossing) -> string = if c.form is Plain then c_side(c.ty) else "*u8"
 
-// A value of `c`'s type as Avin passes or stores it, `value`, converted into Sysl.
-private into_expr(w: *ShimWriter, c: &Crossing, value: string) -> string = c.form match
+// How many layouts a parameter of `c`'s type is passed with: none for a scalar, a string or an array
+// of bytes, which are converted by their types alone.
+private passed_layouts(c: &Crossing) -> usize = if c.form is Plain || c.form is Bytes then 0 else c.layouts
+
+// A value of `c`'s type as Avin passes or stores it, `value`, converted into Sysl, with its layouts
+// from `base` among the ones `ds` points at.
+private into_expr(w: *ShimWriter, c: &Crossing, value: string, ds: string, base: usize) -> string = c.form match
     Plain -> into_sysl(c.ty, value)
     Bytes -> s"bytes_in($value)"
-    _ -> s"in_${function_of(w, c, false).unwrap()}($value)"
+    _ ->
+        val at = if base == 0 then ds else s"ptr_cast(usize($ds) + ${base * 8}usize)"
+        s"in_${function_of(w, c, false).unwrap()}(ctx, $value, $at)"
 
 // The Sysl value `value` of `c`'s type converted out of Sysl, with its layouts from `base` among the
 // ones `ds` points at. A field of a mirror of an integer type takes any Sysl integer, converted.
@@ -287,8 +306,8 @@ private construction(w: *ShimWriter, c: &Crossing, v: CrossVariant, args: Buf[st
         _ -> if args.len() == 0 then v.name else s"${v.name}($joined)"
 
 // The conversion into Sysl of a value of the `k`th data type that crosses that way: its variant is
-// its descriptor's tag, and each field is read at its offset. A mirror's integer field becomes the
-// integer type the Sysl variant or struct declares.
+// its descriptor's tag, and each field is read at its offset, with its layouts among the ones `ds`
+// points at. A mirror's integer field becomes the integer type the Sysl variant or struct declares.
 private in_function(w: *ShimWriter, k: usize)
     val c = w.ins[k]
     if c.form is Elements(element, vector)
@@ -297,7 +316,7 @@ private in_function(w: *ShimWriter, k: usize)
     val mirrored = c.form is Mirror(_, _, _, _, _)
     put(w, "\n")
     val start = w.line
-    put(w, s"// ${type_name(c.ty)} into Sysl.\nprivate in_$k(p: *u8) -> ${sysl_type(w, c)}\n")
+    put(w, s"// ${type_name(c.ty)} into Sysl.\nprivate in_$k(ctx: *Context, p: *u8, ds: **u8) -> ${sysl_type(w, c)}\n")
     if c.variants.len() > 1 then put(w, "    val tag = descriptor_of(p).tag\n")
     for t in 0..<c.variants.len()
         val v = c.variants[t]
@@ -311,7 +330,7 @@ private in_function(w: *ShimWriter, k: usize)
                 Some(offset) ->
                     put(w, indent + s"val q$i: *${crossing_c_side(f.crossing)} = ptr_cast(usize(p) + ${offset}usize)\n")
                     if mirrored && *f.crossing.ty is Int(_) then args.push(s"integer_in(long(q$i[0]))")
-                    else args.push(into_expr(w, f.crossing, s"q$i[0]"))
+                    else args.push(into_expr(w, f.crossing, s"q$i[0]", "ds", f.base))
                 None -> args.push("()")
         put(w, indent + (if lastly then "" else "return ") + construction(w, c, v, args) + "\n")
     mirror_lines(w, c, start)
@@ -371,27 +390,37 @@ private out_overload(w: *ShimWriter, k: usize, c: &Crossing, spelling: string)
 
 // The conversion into Sysl of the `k`th collection that crosses that way: each element of its array,
 // read at its place and converted, pushed onto a `Buf` whose elements are the slice the Sysl function
-// is passed. A vector's array is its field at offset `vector`.
-private in_elements(w: *ShimWriter, k: usize, c: &Crossing, element: &Crossing, vector: Option[usize])
-    put(w, s"\n// ${type_name(c.ty)} into Sysl.\nprivate in_$k(p: *u8) -> ${sysl_type(w, c)}\n")
-    vector match
-        Some(offset) ->
-            put(w, s"    val field: **u8 = ptr_cast(usize(p) + ${offset}usize)\n    val a = field[0]\n")
-        None -> put(w, "    val a = p\n")
+// is passed. A vector's elements are read a leaf at a time, each leaf an array given by the core
+// library's function among the layouts, which neither allocates nor collects.
+private in_elements(w: *ShimWriter, k: usize, c: &Crossing, element: &Crossing, vector: bool)
+    val own = if vector then 4usize else 1usize
+    put(w, s"\n// ${type_name(c.ty)} into Sysl.\nprivate in_$k(ctx: *Context, p: *u8, ds: **u8) -> ${sysl_type(w, c)}\n")
     put(w, s"    var b: Buf[${sysl_type(w, element)}] = buf()\n")
-    if *element.ty is Unit
-        put(w, "    for _ in 0..<array_length(a) do b.push(())\n")
+    var indent = "    "
+    if vector
+        put(w, "    val length_of: *extern(*Context, *u8) -> i32 = ptr_cast(ds[2])\n")
+        put(w, "    val leaf_of: *extern(*Context, *u8, i32) -> *u8 = ptr_cast(ds[3])\n")
+        put(w, "    val n = usize(length_of(ctx, p))\n")
+        put(w, "    var at = 0usize\n")
+        put(w, "    while at < n\n")
+        put(w, "        val a = leaf_of(ctx, p, i32(at))\n")
+        put(w, "        at += array_length(a)\n")
+        indent = "        "
     else
-        put(w, s"    val e: *${crossing_c_side(element)} = ptr_cast(array_elements(a))\n")
-        put(w, "    for i in 0..<array_length(a) do b.push(" + into_expr(w, element, "e[i]") + ")\n")
+        put(w, "    val a = p\n")
+    if *element.ty is Unit
+        put(w, indent + "for _ in 0..<array_length(a) do b.push(())\n")
+    else
+        put(w, indent + s"val e: *${crossing_c_side(element)} = ptr_cast(array_elements(a))\n")
+        put(w, indent + "for i in 0..<array_length(a) do b.push(" + into_expr(w, element, "e[i]", "ds", own) + ")\n")
     put(w, "    b.view()\n")
 
 // The conversion out of Sysl of the `k`th collection that crosses that way: a new array laid out by
 // the first of the layouts `ds` points at, kept as a frame while each element is converted and stored
-// at its place, and for a vector, a new vector, laid out by the second, that holds it. The elements'
-// layouts follow. A `Buf` is converted as the slice of its elements.
-private out_elements(w: *ShimWriter, k: usize, c: &Crossing, element: &Crossing, vector: Option[usize])
-    val own = if vector is Some(_) then 2usize else 1usize
+// at its place, and for a vector, the vector the core library's function, the second layout, makes
+// of it. The elements' layouts follow. A `Buf` is converted as the slice of its elements.
+private out_elements(w: *ShimWriter, k: usize, c: &Crossing, element: &Crossing, vector: bool)
+    val own = if vector then 4usize else 1usize
     val side = crossing_c_side(element)
     put(w, s"\n// ${type_name(c.ty)} out of Sysl.\n")
     for t in sysl_types(w, element)
@@ -404,16 +433,14 @@ private out_elements(w: *ShimWriter, k: usize, c: &Crossing, element: &Crossing,
             put(w, s"        val x: $side = " + out_expr(w, element, "v[i]", "ds", own, false) + "\n")
             put(w, s"        val e: *$side = ptr_cast(array_elements(root.object))\n")
             put(w, "        e[i] = x\n")
-        vector match
-            Some(offset) ->
-                put(w, "    val made = allocate(ctx, ptr_cast(ds[1]))\n")
-                put(w, s"    val field: **u8 = ptr_cast(usize(made) + ${offset}usize)\n")
-                put(w, "    field[0] = root.object\n")
-                put(w, "    ctx.top = root.frame.prev\n")
-                put(w, "    made\n")
-            None ->
-                put(w, "    ctx.top = root.frame.prev\n")
-                put(w, "    root.object\n")
+        if vector
+            put(w, "    val of_array: *extern(*Context, *u8) -> *u8 = ptr_cast(ds[1])\n")
+            put(w, "    val made = of_array(ctx, root.object)\n")
+            put(w, "    ctx.top = root.frame.prev\n")
+            put(w, "    made\n")
+        else
+            put(w, "    ctx.top = root.frame.prev\n")
+            put(w, "    root.object\n")
         put(w, s"private out_$k(ctx: *Context, v: Buf[$t], ds: **u8) -> *u8 = out_$k(ctx, v.view(), ds)\n")
 
 // Makes the lines of a conversion from `start` to the last written its mirror's, when its type is
