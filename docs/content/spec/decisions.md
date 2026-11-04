@@ -979,6 +979,17 @@ Settled by the user on 2026-11-04:
   - **Depth.** Nesting is recursion: about 3,000 levels of parentheses on the main thread
     unoptimized, more on a thread given a larger stack. An exhausted stack ends the program with a
     segmentation fault and no message.
+- Derivation through shapes ([derivation](/spec/derivation/)): `derives` takes any trait whose module
+  declares a `derive X for T` template, written once like an impl. The compiler gives every data type
+  and class (its constructor parameters) a constant shape: variants, fields, names, positions,
+  defaults and annotations. Inside a template, `T.walk(value, visitor)` and `T.walkPair(a, b,
+  visitor)` call the visitor's `field[F: Bound]` hook once per field at that field's type, and
+  `T.build(builder)` makes a value from fields supplied in any order, using defaults and the
+  builder's `missing` for absent ones. The template is checked once; that each field meets the hook's
+  bound is checked per deriving type and reported at the `derives` entry naming the field. Generic
+  types derive with each parameter bounded by the trait. Annotations are constant values of types
+  implementing `Annotation`, written `@JsonKey("full_name")` on a type, variant or field. No macros,
+  no reflection: at `-O2` a derived encoder is the hand-written one.
 
 ## Open
 

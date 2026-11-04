@@ -50,6 +50,7 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
 | [System library](/spec/system-library/) | Proposed: `avin.process` — arguments, environment, exit; `avin.io` — `IoError`, standard input; `avin.fs` — files and directories |
 | [Packages](/spec/packages/) | Proposed: `avin.hocon`, dependencies, version selection, `avin.sum`, workspaces, `avin new` and `avin tidy` |
 | [Parsing](/spec/parsing/) | Proposed: `avin.parsing` — parser combinators, leaf parsers for numbers, names and strings, errors with positions |
+| [Derivation](/spec/derivation/) | Proposed: library-defined `derives` — compile-time shapes of data types and classes, `derive` templates, annotations, a JSON library written with them |
 | [Settled decisions](/spec/decisions/) | Every decision made so far, in one list |
 
 The syntax is light and regular: blocks by indentation, functions as `name(params) -> T`, `match`
