@@ -4222,9 +4222,19 @@ private unit_of(c: *Checker) -> usize = c.symbols[c.current].unit
 /** A function as diagnostics name it. */
 private described(symbol: FunctionSymbol) -> string
     if symbol.delayed then return "this delayed argument"
+    if symbol.lambda && symbol.param_names.len() == 1 && symbol.param_names[0].starts_with("yield guard ") then return "this guard"
+    if comprehension_part(symbol) then return "this `for` with `yield`"
     if symbol.lambda then return "this lambda"
     if symbol.default_param is Some(p) then return s"the default of `$p`"
     s"`${symbol.name}`"
+
+/** Whether `symbol` is a function a `for` with `yield` makes of a guard or of what follows a
+ * generator, which `return`, `break`, `continue` and `?` cannot leave. */
+private comprehension_part(symbol: FunctionSymbol) -> bool =
+    symbol.lambda && symbol.param_names.len() == 1 && (symbol.param_names[0].starts_with("yield guard ") || symbol.param_names[0].starts_with("yield item "))
+
+private comprehension_exit(word: string) -> string =
+    s"`$word` cannot leave a `for` with `yield`, whose guards and yielded value are functions passed to its sources' methods"
 
 /** Checks an expression whose value is used. */
 check_expr(c: *Checker, e: &Expr, expected: Option[&Type]) -> &TExpr = check_value(c, e, expected, true)
@@ -4285,6 +4295,7 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
 
     DoWhile(body, condition, otherwise) -> check_form(c, do_while_form(e, body, condition, otherwise), expected, used)
     For(pattern, source, body) -> for_expr(c, e, pattern, source, body)
+    ForYield(generators, body) -> for_yield_expr(c, e, generators, body, expected)
     Range(lower, upper, inclusive) -> range_expr(c, e, lower, upper, inclusive)
     Cons(head, tail, op_span) -> cons_expr(c, e, head, tail, op_span, expected)
     ListLit(items) -> sequence_literal(c, e, items, expected)
@@ -6059,6 +6070,60 @@ private for_expr(c: *Checker, e: &Expr, pattern: &Pattern, source: &Expr, body: 
     all.push(looped)
     TExpr(at, if finishes then Unit else Nothing, Block(all))
 
+// A `for` with `yield` is calls on its sources, checked as they would be if written out. The first
+// generator's source is evaluated first; each of its guards becomes `withFilter`, which tests an
+// element only when the call after it reaches that element; then the last generator's elements are
+// passed to `map` with the yielded value, and every earlier generator's to `flatMap` with the rest
+// of the comprehension, whose sources are evaluated anew for each element. The pattern binds each
+// element in every function made of it, a guard's as well as the one after it.
+private for_yield_expr(c: *Checker, e: &Expr, generators: Buf[Generator], body: &Expr, expected: Option[&Type]) -> &TExpr
+    val g = generators[0]
+    val item = s"yield item ${g.span.start}"
+    var rest = body
+    if generators.len() > 1
+        var later: Buf[Generator] = buf()
+        for i in 1 ..< generators.len() do later.push(generators[i])
+        rest = Expr(later[0].span.to(e.span), ForYield(later, body))
+    var source = check_expr(c, g.source, None)
+    // A guard's function is named apart, so a diagnostic about its result names the guard.
+    for guard in g.guards
+        source = comprehension_call(c, g.span, g.source.span, source, "withFilter", element_function(g.pattern, s"yield guard ${g.span.start}", guard), None)
+    val name = if generators.len() > 1 then "flatMap" else "map"
+    comprehension_call(c, e.span, g.source.span, source, name, element_function(g.pattern, item, rest), expected)
+
+/** The function of one element that binds it by `pattern` and yields `body`. */
+private element_function(pattern: &Pattern, item: string, body: &Expr) -> &Expr
+    var params: Buf[LambdaParam] = buf()
+    params.push(LambdaParam(pattern.span, item, None))
+    var items: Buf[&Expr] = buf()
+    items.push(element_binding(pattern, name_at(pattern.span, item)))
+    items.push(body)
+    Expr(body.span, Lambda(params, Expr(body.span, Block(items, false))))
+
+/** The call `receiver.name(f)` a comprehension makes, reported at the generator's source when the
+ * receiver's type has no method of that name. */
+private comprehension_call(c: *Checker, at: Span, source_span: Span, receiver: &TExpr, name: string, f: &Expr, expected: Option[&Type]) -> &TExpr
+    val ty = zonk(c, receiver.ty)
+    if !settled(ty) then return receiver
+    var args: Buf[Argument] = buf()
+    args.push(Argument(f.span, None, f))
+    val ms = comprehension_methods(c, ty, name)
+    if ms.len() == 0
+        val role = if name == "withFilter" then "a guard of a `for` with `yield`" else "a `for` with `yield`"
+        c.note(unit_of(c), source_span, s"`${type_name(ty)}` has no method `$name`, which $role calls on its source")
+        return TExpr(at, ErrorType, UnitConst)
+    call_method(c, at, source_span, receiver, name, ms, args, None, expected, false)
+
+/** The methods of `name` a call on a value of type `t` chooses among, as a call written out sees them. */
+private comprehension_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
+    if *t is Class(k, _, _)
+        val ms = methods_named(c, k, name)
+        if ms.len() > 0 then return ms
+    if *t is TypeVar(_, _, _)
+        val ms = bound_methods(c, t, name)
+        if ms.len() > 0 then return ms
+    visible_methods(c, receiver_methods(c, t, name))
+
 /** Evaluates `value` into a new hidden local `name` of type `ty`, adding the binding to `lets`. */
 private hold(c: *Checker, at: Span, name: string, ty: &Type, value: &TExpr, lets: *Buf[&TExpr])
     val index = declare_local(c, at, name, ty, false)
@@ -6216,6 +6281,7 @@ private innermost_loop(c: *Checker, e: &Expr, word: string) -> Option[usize]
     if c.body.loops.len() == 0
         if c.symbols[c.current].delayed
             c.note(unit_of(c), e.span, s"`$word` cannot leave a delayed argument, which is evaluated where its parameter is read")
+        elif comprehension_part(c.symbols[c.current]) then c.note(unit_of(c), e.span, comprehension_exit(word))
         else c.note(unit_of(c), e.span, s"`$word` is outside a loop")
         return None
     Some(c.body.loops[c.body.loops.len() - 1])
@@ -6243,6 +6309,10 @@ private return_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
     val symbol = c.symbols[c.current]
     if symbol.delayed
         c.note(unit, e.span, "`return` cannot leave a delayed argument, which is evaluated where its parameter is read")
+        if value is Some(v) then check_statement(c, v)
+        return TExpr(e.span, Nothing, UnitConst)
+    if comprehension_part(symbol)
+        c.note(unit, e.span, comprehension_exit("return"))
         if value is Some(v) then check_statement(c, v)
         return TExpr(e.span, Nothing, UnitConst)
     if symbol.constructor
@@ -6329,6 +6399,9 @@ private propagate_expr(c: *Checker, e: &Expr, value: &Expr) -> &TExpr
     val symbol = c.symbols[c.current]
     if symbol.delayed
         c.note(unit, e.span, "`?` cannot return from a delayed argument, which is evaluated where its parameter is read")
+        return TExpr(e.span, ErrorType, UnitConst)
+    if comprehension_part(symbol)
+        c.note(unit, e.span, comprehension_exit("?"))
         return TExpr(e.span, ErrorType, UnitConst)
     if symbol.constructor
         c.note(unit, e.span, "`?` cannot return from a class body, which runs to its end to make the object")

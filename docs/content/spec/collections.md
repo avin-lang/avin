@@ -292,3 +292,57 @@ for (name, age) in people
     if age < 18 then continue
     print(name)
 ```
+
+### Generators, guards and `yield`
+
+A comprehension is `for`, one or more generators separated by commas, and `yield` with the value
+to collect, on the rest of the line or in an indented block. A generator is `pattern in source`,
+and any number of guards, `if condition`, may follow it. When the generators do not fit on one line
+they go one to a line in an indented block after `for`, a line starting with `if` adding a guard to
+the generator above it, and `yield` starts the line after the block. `yield` is a keyword.
+
+```text
+val pairs = for x in xs, y in ys if x < y yield (x, y)
+
+val grid = for
+    row in 0 ..< height
+    if row % 2 == 0
+    col in 0 ..< width
+yield
+    val cell = row * width + col
+    cell * cell
+```
+
+The last generator's source is called with `map` and the yielded value, every earlier one with
+`flatMap` and the rest of the comprehension, and each guard becomes `withFilter` on the source it
+follows:
+
+```text
+for x in xs if p(x), y in ys yield f(x, y)
+xs.withFilter(x -> p(x)).flatMap(x -> ys.map(y -> f(x, y)))
+```
+
+The calls are checked as if written out, so the first source decides the result's type: `map` and
+`flatMap` on a `List` give a `List`, on a `Vector`, an `Array` or a `Buffer` that collection, on a
+`Set` a `Set`, on an `Option` an `Option`, and on a `Range`, which holds only a progression, a
+`Vector`. A `Map`'s elements are its entries as `(key, value)` pairs, and a comprehension over one
+yields pairs and makes a `Map`. `flatMap` on the library's collections takes any `Iterable` from its
+function, so a later generator may draw from another kind of collection than the first; an
+`Option`'s `flatMap` takes an `Option`. A type of the program's own works in a comprehension by
+having the methods it calls: `map` for one generator, `flatMap` for more, and `withFilter` for a
+guard. A source without the method it is asked for is an error at that source.
+
+`withFilter` is lazy. It returns a view of the collection that tests each element just before
+`map`, `flatMap` or `foreach` uses it, and another `withFilter` on the view combines the tests. So
+the order of evaluation follows the source element by element: the first source is evaluated once,
+then for each of its elements its guards run and, for an element that passes them, the next
+generator's source is evaluated anew and its elements taken in turn, down to the yielded value. A
+guard that prints shows its output interleaved with the yielded values', not all before them.
+`Option`'s `withFilter` is its `filter`, since with one value at most the two are the same.
+
+Each generator binds by its pattern, as a `for` loop does: a name, `_`, a tuple or a variant pattern
+that every element matches; a pattern some elements would not match is an error, not a filter. The
+bindings are visible to the generator's guards and to everything after it, and each element is a
+new binding. A guard is a `bool`. The guards and the yielded value are functions passed to the
+sources' methods, so `return`, `break`, `continue` and `?` cannot leave them, though a loop inside
+the yielded block may be left as usual. A `for` without `yield` has one generator and no guards.

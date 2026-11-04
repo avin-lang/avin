@@ -474,6 +474,21 @@ Settled by the user on 2026-11-03:
 
 ## Proposed
 
+- The form of a `for` with `yield` ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
+  generators `pattern in source` separated by commas, each followed by any number of `if` guards,
+  then `yield` and the value on the rest of the line or in an indented block; or the generators one
+  to a line in a block after `for`, a line starting with `if` guarding the generator above, with
+  `yield` on the line after the block. `yield` is a keyword. A `for` without `yield` keeps one
+  generator and no guards.
+- A guard is `withFilter`, a lazy view each collection provides (`Option`'s is its `filter`); a type
+  of the program's own needs `withFilter` for a guard, with no fallback to `filter`. `flatMap` on
+  the library's collections takes any `Iterable` from its function; a `Range` maps to a `Vector`;
+  a `Map`'s entries reach a comprehension as pairs, through `map` and `flatMap` overloads taking
+  a function of one pair, and yield a `Map`.
+- A generator's pattern must match every element, as in a `for` loop, rather than filtering out the
+  elements it does not match. `return`, `break`, `continue` and `?` cannot leave a comprehension's
+  guards or yielded value.
+
 - The thread model ([threads](/spec/threads/)): `avin.threads.spawn(body)` starts a closure on a
   new thread with an 8 MiB stack and `join()` gives back its result; a structured `scope` joins
   every thread started in it; a trap in any thread stops the program, and the program ends when
@@ -486,6 +501,9 @@ Settled by the user on 2026-11-03:
   scheduled onto a pool of these threads.
 
 ## Open
+
+- Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
+  over a `Map` yields when its values are not pairs (it needs `Iterable`'s own transformations).
 
 - Resource cleanup: a `defer` construct or a library `use`.
 - How actors work: how messages are declared and sent, mailboxes and replies, how actors are
