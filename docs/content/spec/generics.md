@@ -174,6 +174,21 @@ infer is.
 - Constraints are subtype constraints. A type variable collects lower and upper bounds and is solved
   to the least type that satisfies them, so `if c then dog else cat` is an `Animal`, and the branches
   of a `match` agree on their least upper bound.
+- A type argument of a call given several arguments takes their join, as branches do; the first
+  argument does not decide it alone. Each argument whose type mentions it where a value is read out
+  (the whole parameter, a covariant argument of a generic type, a tuple part, a function's result)
+  is a lower bound, so with nothing expected `cat :: dogs` is a `List[Animal]`, `pair(cat, dog)`
+  for `pair[T](a: T, b: T)` takes `Animal`, and `firstOf(Some(cat), Some(dog))` takes it too. An
+  expected type decides the type argument before the arguments do. An invariant or contravariant
+  use (an argument of `Box[T]` for an invariant `T`, a lambda's parameter) decides it for good, as
+  the type the lower bounds so far fit, and a later argument must be an instance of that. A number
+  literal takes the type the other arguments decide. Two value types have no join, so
+  `pair(1, "one")` is an error naming both, unless `Any` is expected.
+- Two classes join to their nearest common superclass. Where they have none, they join to the trait
+  they both conform to that every other trait they share is a parent of: a `Parrot` and a
+  `Goldfish` that are both `Pet: Named` join to `Pet`. Where they share several unrelated traits,
+  no one of them is chosen: the join is an error that names them, and the type is written, or
+  given by the expected type.
 - `None`, `[]`, `{}` and `Map.empty` take their type arguments from context. Where nothing determines
   a type, the result is an error asking for an annotation, never a silent default to `Any` or
   `Nothing`.

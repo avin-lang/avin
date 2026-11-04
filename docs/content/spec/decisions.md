@@ -329,6 +329,13 @@ a decision changes, this page and the chapter change together.
   on a generic type, and `Ord` on a generic class, needs the parameters bounded by the trait where
   the type declares them.
 - `x.equals(y)` and `x.hash()` may be called on a value of any type parameter, bounded or not.
+- Settled 2026-11-03: a type argument a call's arguments decide is the
+  [join](/spec/generics/#inference) of the types they give it where a value is read out, as two
+  branches' types are joined; the first argument does not decide it alone, so `cat :: dogs` is a
+  `List[Animal]` with nothing expected. An expected type decides it first; an invariant or
+  contravariant use decides it for good. Two classes with no common superclass join to the one trait
+  they share that every other trait they share is a parent of; sharing several unrelated traits is
+  no join, an error naming them, rather than a choice among them. The same holds for branches.
 
 **Project and tooling**
 

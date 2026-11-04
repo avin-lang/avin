@@ -5396,17 +5396,19 @@ private displayed(c: *Checker, h: &TExpr) -> Option[&TExpr]
         return None
     Some(call_method(c, h.span, h.span, h, "toString", ms, buf(), None, None, false))
 
-// The type two branches agree on; where they have no nearest common superclass, the type expected
-// of them, when both conform to it: two classes conforming to one trait agree on the trait only
-// where it is asked for, since they may share several.
+// The type two branches agree on; where they have none (see `join`), the type expected of them,
+// when both conform to it: two classes sharing several unrelated traits agree on one of them only
+// where it is asked for.
 private join_expected(c: *Checker, a: &Type, b: &Type, expected: Option[&Type]) -> Option[&Type]
     if join(c, a, b) is Some(t) then return Some(t)
     val want = expected?
     if fits(c, a, want) && fits(c, b, want) then Some(want) else None
 
-// The type two branches agree on, where one that never finishes agrees with anything.
-// Two instances of classes agree on their nearest common ancestor, and two instances of one generic
-// type on the instance whose covariant arguments are their arguments' agreement.
+// The type two branches, or two arguments given one type parameter, agree on, where one that never
+// finishes agrees with anything. Two instances of classes agree on their nearest common ancestor
+// class; where they have none, on the one trait they share that is more specific than every other
+// they share (see `shared_traits`). Two instances of one generic type agree on the instance whose
+// covariant arguments are their arguments' agreement.
 private join(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
     if *a is Nothing || *a is ErrorType then return Some(b)
     if *b is Nothing || *b is ErrorType then return Some(a)
@@ -5416,15 +5418,46 @@ private join(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
     if *current is Var(_) || *zonk(c, b) is Var(_)
         return if unify(c, current, b) then Some(zonk(c, current)) else None
     if *current is Data(_, _, _) then return join_args(c, current, zonk(c, b))
-    loop
+    val start = current
+    var climbing = true
+    while climbing
         val k = *current match
             Class(k, _, args) -> k
             _ -> return None
         if ancestor_type(c.classes, c.data, zonk(c, b), k) is Some(up)
             if same_type(up, current) then return Some(current)
             if join_args(c, current, up) is Some(t) then return Some(t)
-        current = ancestor_parent(c, current)?
-    None
+        ancestor_parent(c, current) match
+            Some(up) -> current = up
+            None -> climbing = false
+    val traits = shared_traits(c, start, zonk(c, b))
+    if traits.len() == 1 then Some(traits[0]) else None
+
+// The traits two instances of classes both conform to, each as the instance they agree on, less
+// those another of them conforms to: of `Named` and `Pet: Named`, only `Pet`. Two classes with no
+// common superclass join to the trait when exactly one remains; where several unrelated ones
+// remain, no single one is the answer, and the type has to be written.
+private shared_traits(c: *Checker, a: &Type, b: &Type) -> Buf[&Type]
+    var shared: Buf[&Type] = buf()
+    if !(*a is Class(_, _, _)) || !(*b is Class(_, _, _)) then return shared
+    var mine: Buf[&Type] = buf()
+    if *a is Class(k, _, _)
+        if is_trait(c, k) then mine.push(a)
+    collect_traits(c, a, &mine)
+    for r in mine
+        if *r is Class(k, _, _)
+            if ancestor_type(c.classes, c.data, b, k) is Some(up)
+                if same_type(up, r) then shared.push(r)
+                elif join_args(c, r, up) is Some(t) then shared.push(t)
+    var nearest: Buf[&Type] = buf()
+    for i in 0..<shared.len()
+        var wider = false
+        if *shared[i] is Class(k, _, _)
+            for j in 0..<shared.len()
+                if j != i
+                    if ancestor_type(c.classes, c.data, shared[j], k) is Some(_) then wider = true
+        if !wider then nearest.push(shared[i])
+    nearest
 
 // The instance of one generic type that two of its instances agree on: equal invariant arguments,
 // and covariant arguments that are references agreeing on a type.
@@ -6219,11 +6252,14 @@ private fits_call(c: *Checker, s: Signature, binding: Binding, args: Buf[Argumen
         type_args.push(if i < s.known.len() then s.known[i] else fresh_var(c))
     for i in 0..<written.len()
         unify(c, type_args[s.known.len() + i], written[i])
+    var open = open_type_args(c, type_args, s.known.len())
     var ok = true
     for j in 0..<args.len()
         if typed[j] is Some(t)
             val p = strict(substitute(s.params[binding.targets[j].unwrap()], s.owner, type_args))
-            if ok && !(*t.ty is Nothing) && !unify(c, p, strict(t.ty)) then ok = false
+            if ok && !(*t.ty is Nothing)
+                val agrees = if mentions_open(p, &open) then constrain(c, p, strict(t.ty), &open, true) else unify(c, p, strict(t.ty))
+                if !agrees then ok = false
     for j in 0..<args.len()
         if ok && typed[j] is None
             val p = zonk(c, strict(substitute(s.params[binding.targets[j].unwrap()], s.owner, type_args)))
@@ -6699,7 +6735,8 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     var targets: Buf[Option[&Type]] = buf()
     for t in binding.targets
         targets.push(if t is Some(i) then Some(wanted[i]) else None)
-    val typed = check_arguments(c, args, targets, checked)
+    var open = open_type_args(c, type_args, known.len())
+    val typed = check_arguments(c, args, targets, checked, &open)
     // A type argument the arguments settled settles those its bounds name: `[S: Source[A], A]`
     // takes `A` from the source `S` is.
     for i in known.len()..<type_params.len()
@@ -6789,12 +6826,21 @@ private default_type_args(c: *Checker, s: Signature, default: usize, solved: Buf
         if c.symbols[default].type_owner != s.owner then return receiver_type_args(c, r.ty, default)
     solved
 
+/** The inference variables among `type_args`, from `from` on, that nothing has decided yet: those
+ * the arguments of a call decide by their join. */
+private open_type_args(c: *Checker, type_args: Buf[&Type], from: usize) -> Buf[usize]
+    var open: Buf[usize] = buf()
+    for i in from..<type_args.len()
+        if *type_args[i] is Var(v)
+            if *zonk(c, type_args[i]) is Var(_) then open.push(v)
+    open
+
 // Checks a call's arguments against their parameters' types, in an order that lets each argument use
 // what the others decide: first the arguments that are neither bare literals nor lambdas, then the
 // literals, which take the types the others settle, and last the lambdas, whose parameter types
 // come from all of them. `wanted` has an entry per argument, `None` for one that fits no parameter.
 // An argument with an entry in `checked` was checked already, and only its type is matched here.
-private check_arguments(c: *Checker, args: Buf[Argument], wanted: Buf[Option[&Type]], checked: Buf[Option[&TExpr]]) -> Buf[&TExpr]
+private check_arguments(c: *Checker, args: Buf[Argument], wanted: Buf[Option[&Type]], checked: Buf[Option[&TExpr]], open: *Buf[usize]) -> Buf[&TExpr]
     var early: Buf[Option[&TExpr]] = buf()
     for _ in args
         early.push(None)
@@ -6810,13 +6856,14 @@ private check_arguments(c: *Checker, args: Buf[Argument], wanted: Buf[Option[&Ty
                         // once, at the call, by one that takes it strictly.
                         if param is Some(p)
                             if *given.ty is ByName(_) && !(*zonk(c, p) is ByName(_)) then t = evaluated(given)
-                            if !(*t.ty is Nothing) && !unify(c, p, t.ty)
-                                c.note(unit_of(c), value.span, s"expected ${type_name(zonk(c, p))}, found ${type_name(t.ty)}")
+                            val agrees = *t.ty is Nothing || (if mentions_open(p, open) then constrain(c, p, t.ty, open, true) else unify(c, p, t.ty))
+                            if !agrees
+                                c.note(unit_of(c), value.span, mismatch(c, zonk(c, p), t.ty))
                         early.set(i, Some(t))
                     continue
             val rank = if value.kind is Lambda(_, _) then 2 elif is_literal(value) then 1 else 0
             if rank != pass then continue
-            early.set(i, Some(call_argument(c, args[i], param)))
+            early.set(i, Some(call_argument(c, args[i], param, open)))
     var typed: Buf[&TExpr] = buf()
     for t in early
         typed.push(t.unwrap())
@@ -6920,7 +6967,8 @@ private call_checked(c: *Checker, at: Span, callee_span: Span, f: &TExpr, args: 
             var wanted: Buf[Option[&Type]] = buf()
             for p in params
                 wanted.push(Some(p))
-            val typed = check_arguments(c, args, wanted, buf())
+            var none: Buf[usize] = buf()
+            val typed = check_arguments(c, args, wanted, buf(), &none)
             if args.len() != params.len()
                 c.note(unit, at, s"this function takes ${count(params.len(), "argument")}, not ${args.len()}")
             var r = zonk(c, result)
@@ -7010,20 +7058,162 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     TExpr(e.span, ty, FunctionValue(id, buf()))
 
 // Checks one argument against its parameter type, which may still contain unknowns; the argument's
-// type decides them.
-private call_argument(c: *Checker, arg: Argument, param: Option[&Type]) -> &TExpr
+// type decides them. `open` holds the call's own type arguments that only arguments have decided so
+// far (see `constrain`): an argument is checked expecting what the others have decided of them only
+// where it is decided for good, so `Some(dog)` after a `cat` is an `Option[Dog]`, which widens the
+// type argument, rather than an `Option[Cat]` it cannot be.
+private call_argument(c: *Checker, arg: Argument, param: Option[&Type], open: *Buf[usize]) -> &TExpr
     val unit = unit_of(c)
     var wanted: Option[&Type] = None
     if param is Some(p)
-        val known = zonk(c, p)
+        val known = loosen(c, p, open, true)
         if !(*known is Var(_)) then wanted = Some(known)
     if param is Some(p)
         if *zonk(c, p) is ByName(inner) then return delayed_argument(c, arg, p, inner)
     val value = check_expr(c, arg.value, wanted)
     if param is Some(p)
-        if !(*value.ty is Nothing) && !unify(c, p, upcast(c, value.ty, p))
-            c.note(unit, arg.value.span, s"expected ${type_name(zonk(c, p))}, found ${type_name(value.ty)}")
+        if !(*value.ty is Nothing) && !constrain(c, p, value.ty, open, true)
+            c.note(unit, arg.value.span, mismatch(c, zonk(c, p), value.ty))
     value
+
+/** "expected T, found U", and why two classes that share several traits do not join to one. */
+private mismatch(c: *Checker, wanted: &Type, found: &Type) -> string
+    val text = s"expected ${type_name(wanted)}, found ${type_name(found)}"
+    val traits = shared_traits(c, wanted, zonk(c, found))
+    if traits.len() < 2 then return text
+    var names = ""
+    for i in 0..<traits.len()
+        if i > 0 then names = names + (if i + 1 == traits.len() then " and " else ", ")
+        names = names + type_name(traits[i])
+    s"$text; they have no common superclass and share the unrelated traits $names, so write the type wanted"
+
+/** The expected type of an argument whose parameter has the type `t`: `t` solved, except that a type
+ * argument still open in `open` is left unknown where a value is read out, when what decided it is a
+ * reference type that a later argument may widen. A value type is kept, so a literal takes it. */
+private loosen(c: *Checker, t: &Type, open: *Buf[usize], covariant: bool) -> &Type = *t match
+    Var(i) ->
+        val now = zonk(c, t)
+        if covariant && open_index(open, i) is Some(_) && is_reference(now) then fresh_var(c) else now
+    Tuple(items) ->
+        var parts: Buf[&Type] = buf()
+        for item in items
+            parts.push(loosen(c, item, open, covariant))
+        Tuple(parts)
+    Function(params, result) ->
+        var solved: Buf[&Type] = buf()
+        for param in params
+            solved.push(zonk(c, param))
+        Function(solved, loosen(c, result, open, covariant))
+    Data(d, name, args) -> Data(d, name, loosen_args(c, c.data[d].decl.type_params, args, open, covariant))
+    Class(k, name, args) -> Class(k, name, loosen_args(c, c.classes[k].decl.type_params, args, open, covariant))
+    _ -> zonk(c, t)
+
+private loosen_args(c: *Checker, params: Buf[TypeParam], args: Buf[&Type], open: *Buf[usize], covariant: bool) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    for i in 0..<args.len()
+        val reads = covariant && i < params.len() && params[i].variance is Covariant
+        out.push(loosen(c, args[i], open, reads))
+    out
+
+/** Where the inference variable `v` is in `open`. */
+private open_index(open: *Buf[usize], v: usize) -> Option[usize]
+    for i in 0..<open.len()
+        if open[i] == v then return Some(i)
+    None
+
+/** Whether `t`, a parameter's type as the call instantiates it, names a type argument in `open`. */
+private mentions_open(t: &Type, open: *Buf[usize]) -> bool = *t match
+    Var(i) -> open_index(open, i) is Some(_)
+    Tuple(items) -> any_open(items, open)
+    Function(params, result) -> any_open(params, open) || mentions_open(result, open)
+    ByName(inner) -> mentions_open(inner, open)
+    Data(_, _, args) -> any_open(args, open)
+    Class(_, _, args) -> any_open(args, open)
+    _ -> false
+
+private any_open(types: Buf[&Type], open: *Buf[usize]) -> bool
+    for t in types
+        if mentions_open(t, open) then return true
+    false
+
+// Holds `actual`, an argument's type, to `p`, its parameter's type as the call instantiates it. A
+// type argument in `open` that `p` names where a value is read out (the whole parameter, a covariant
+// argument of a generic type, a tuple part, a function's result) takes each argument's type there as
+// a lower bound and is the join of its lower bounds: `pair(cat, dog)` and `Cons(cat, dogs)` take
+// `Animal`. Named anywhere else (an invariant or contravariant argument, a function's parameter) it
+// is decided for good and leaves `open`, and every later argument must be an instance of it.
+private constrain(c: *Checker, p: &Type, actual: &Type, open: *Buf[usize], covariant: bool) -> bool
+    if !mentions_open(p, open) then return unify(c, p, upcast(c, actual, p))
+    val v = zonk(c, actual)
+    *p match
+        Var(i) -> return lower_bound(c, i, v, open, covariant)
+        Tuple(xs) -> *v match
+            Tuple(ys) ->
+                if xs.len() != ys.len() then return false
+                for k in 0..<xs.len()
+                    if !constrain(c, xs[k], ys[k], open, covariant) then return false
+                return true
+            _ -> ()
+        Function(xs, r) -> *v match
+            Function(ys, q) ->
+                if xs.len() != ys.len() then return false
+                for k in 0..<xs.len()
+                    if !constrain(c, xs[k], ys[k], open, false) then return false
+                return constrain(c, r, q, open, covariant)
+            _ -> ()
+        Data(d, _, xs) -> *v match
+            Data(e, _, ys) -> if d == e then return constrain_args(c, c.data[d].decl.type_params, xs, ys, open, covariant)
+            _ -> ()
+        Class(k, _, xs) ->
+            if ancestor_type(c.classes, c.data, v, k) is Some(up)
+                if *up is Class(_, _, ys) then return constrain_args(c, c.classes[k].decl.type_params, xs, ys, open, covariant)
+        _ -> ()
+    unify(c, p, upcast(c, actual, p))
+
+private constrain_args(c: *Checker, params: Buf[TypeParam], xs: Buf[&Type], ys: Buf[&Type], open: *Buf[usize], covariant: bool) -> bool
+    if xs.len() != ys.len() || xs.len() != params.len() then return false
+    for i in 0..<xs.len()
+        // Variance holds where the arguments are references; `List[int]` is no `List[long]`.
+        val reads = covariant && params[i].variance is Covariant && is_reference(zonk(c, ys[i]))
+        if !constrain(c, xs[i], ys[i], open, reads) then return false
+    true
+
+// One argument's type `v` given to the type argument `i`. Where `i` is open and a value is read out,
+// `v` widens it to their join; elsewhere `i` is decided as `v`, or as what it already is when `v` is
+// an instance of that, and an open `i` whose lower bounds are all instances of `v` is decided as `v`.
+private lower_bound(c: *Checker, i: usize, v: &Type, open: *Buf[usize], covariant: bool) -> bool
+    val p: &Type = Var(i)
+    val at = open_index(open, i) match
+        Some(n) -> n
+        None -> return unify(c, p, upcast(c, v, p))
+    val now = zonk(c, p)
+    if !covariant
+        open.set(at, open[open.len() - 1])
+        open.truncate(open.len() - 1)
+        if !(*now is Var(_)) && !has_unknowns(now) && !has_unknowns(v) && !same_type(now, v)
+            if conforms(upcast(c, now, v), v)
+                settle(c, i, v)
+                return true
+        return unify(c, p, v)
+    if *now is Var(_) then return unify(c, p, v)
+    if !has_unknowns(now) && conforms(upcast(c, v, now), now) then return true
+    join(c, now, v) match
+        Some(t) ->
+            settle(c, i, zonk(c, t))
+            true
+        None -> false
+
+/** Re-solves the inference variable `i`, at the end of the chain of variables it is solved as. */
+private settle(c: *Checker, i: usize, t: &Type)
+    var k = i
+    var following = true
+    while following
+        following = false
+        if c.vars[k] is Some(s)
+            if *s is Var(j)
+                k = j
+                following = true
+    if !same_type(t, Var(k)) then c.vars.set(k, Some(t))
 
 // An argument to a by-name parameter is not evaluated at the call. It is checked as a lambda with
 // no parameters, which the callee evaluates at each read. A by-name parameter passed on to another
