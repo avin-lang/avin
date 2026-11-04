@@ -87,8 +87,9 @@ emit_llvm(program: MirProgram) -> string
     out.push("\n")
     var intrinsics: Buf[string] = buf()
     val graph = call_graph(program)
+    val collects = collecting_functions(program, graph)
     for i in 0..<program.functions.len()
-        emit_function(&out, &intrinsics, program, graph, i)
+        emit_function(&out, &intrinsics, program, graph, plan_roots(program, graph, collects, i), i)
     for declaration in intrinsics
         out.push(declaration + "\n")
     out.push("\n")
@@ -197,26 +198,20 @@ private c_params(s: MirSignature) -> string
         out = out + ", " + c_type(t)
     out
 
-private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgram, graph: CallGraph, index: usize)
+private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgram, graph: CallGraph, plan: RootPlan, index: usize)
     val f = program.functions[index]
     out.push("define " + result_type(f.signature) + " @\"" + f.symbol + "\"(ptr %ctx")
     for i in 0..<f.signature.params.len()
         out.push(", " + llvm_type(f.signature.params[i]) + s" %v$i")
     out.push(") {\n")
-    // Every reference the function holds is a root: each slot of reference type lives in the
-    // function's frame on the shadow stack, and each reference value is stored to a frame slot of
-    // its own as soon as it exists, so a collection at any call finds all of them. The frame's first
+    // The references live across a collection point are the function's roots, kept in its frame on
+    // the shadow stack (see `plan_roots`): each such value is stored to its frame slot where it is
+    // made, and a local slot of reference type that needs one is that frame slot. The frame's first
     // word links it to the caller's frame; the context's first word is the top frame, which the
-    // function sets to its own on entry and gives back to the caller's on every return.
-    var value_roots: Buf[Option[usize]] = buf()
-    var roots = 0usize
-    for s in f.slots
-        if s is MRef then roots += 1
-    for t in f.value_types
-        if t is MRef
-            value_roots.push(Some(roots))
-            roots += 1
-        else value_roots.push(None)
+    // function sets to its own on entry and gives back to the caller's on every return. A function
+    // with no roots has no frame.
+    val value_roots = plan.value_cells
+    val roots = plan.cells
     val frame = s"{ ptr, i64, [$roots x ptr] }"
     var temp = 0usize
     var polls = 0usize
@@ -229,22 +224,22 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
             // keep; offset 24 in the runtime's context.
             if uses_caller_site(f) then out.push("  %caller.site = getelementptr inbounds i8, ptr %ctx, i64 24\n")
             if roots > 0
-                need(intrinsics, "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)")
+                // Only the slots the collector might read before the function stores to them start
+                // null; every other slot is written before any collection can see it.
                 out.push(s"  %frame = alloca $frame\n")
-                out.push(s"  call void @llvm.memset.p0.i64(ptr %frame, i8 0, i64 ${16 + 8 * roots}, i1 false)\n")
                 out.push(s"  %frame.count = getelementptr inbounds $frame, ptr %frame, i32 0, i32 1\n")
                 out.push(s"  store i64 $roots, ptr %frame.count\n")
                 for k in 0..<roots
                     out.push(s"  %root$k = getelementptr inbounds $frame, ptr %frame, i32 0, i32 2, i64 $k\n")
+                    if plan.zeroed[k] then out.push(s"  store ptr null, ptr %root$k\n")
                 out.push("  %caller = load ptr, ptr %ctx\n")
                 out.push("  store ptr %caller, ptr %frame\n")
                 out.push("  store ptr %frame, ptr %ctx\n")
-            var next_root = 0usize
             for s in 0..<f.slots.len()
-                if f.slots[s] is MRef
-                    out.push(s"  %s$s = getelementptr inbounds $frame, ptr %frame, i32 0, i32 2, i64 $next_root\n")
-                    next_root += 1
-                else out.push(s"  %s$s = alloca ${llvm_type(f.slots[s])}\n")
+                if plan.slot_cells[s] is Some(k) then out.push(s"  %s$s = getelementptr inbounds $frame, ptr %frame, i32 0, i32 2, i64 $k\n")
+                else
+                    out.push(s"  %s$s = alloca ${llvm_type(f.slots[s])}\n")
+                    if plan.slot_zeroed[s] then out.push(s"  store ptr null, ptr %s$s\n")
             for i in 0..<f.signature.params.len()
                 if value_roots[i] is Some(k) then out.push(s"  store ptr %v$i, ptr %root$k\n")
         val block = f.blocks[b]
@@ -287,8 +282,8 @@ private uses_caller_site(f: MirFunction) -> bool
     false
 
 // A safepoint poll: when a collection has asked the other threads to stop, the runtime parks this one
-// until the collection is over. Every reference the function holds is already in its frame, so the
-// stack is consistent wherever a poll is placed. The flag is read with a relaxed atomic load and the
+// until the collection is over. Every reference the function still needs after the poll is already
+// in its frame, so the stack is consistent wherever a poll is placed. The flag is read with a relaxed atomic load and the
 // slow path is a call to a cold function behind a branch weighted as almost never taken, so the
 // common case is one load and a branch that falls through, and the slow path is laid out of line.
 // Polls are placed before every terminator with a back edge, which every cycle of the control flow
@@ -307,7 +302,7 @@ private emit_poll(out: *StrBuilder, intrinsics: *Buf[string], n: usize) -> usize
     out.push(s"run$n:\n")
     n + 1
 
-private successors(term: Terminator) -> Buf[usize]
+successors(term: Terminator) -> Buf[usize]
     var out: Buf[usize] = buf()
     term match
         Jump(target) -> out.push(target)
@@ -320,7 +315,7 @@ private successors(term: Terminator) -> Buf[usize]
 // For each block of `f`, whether its terminator has a back edge: an edge to a block on the
 // depth-first path from the entry to it. Every cycle of the control flow contains one, whatever order
 // the blocks are numbered in, and an `if`'s join is never reached by one.
-private back_edges(f: MirFunction) -> Buf[bool]
+back_edges(f: MirFunction) -> Buf[bool]
     // 0: not reached yet; 1: on the current path; 2: finished.
     var state: Buf[u8] = buf()
     var back: Buf[bool] = buf()
@@ -363,14 +358,14 @@ private const Unlikely: string = "!0 = !{!\"branch_weights\", i32 1, i32 1048575
  * caller's component. Runtime entry points and the shims of Sysl bindings never call compiled code,
  * so they add no edges; a binding that takes an Avin function would add one to every function whose
  * address is taken. */
-private struct CallGraph
+struct CallGraph
     /** The component of each function. */
     component: Buf[usize]
     /** For each component, whether one of its functions has its address taken, so that a call
      * through a function value from that component may come back to it. */
     reentered: Buf[bool]
 
-private call_graph(program: MirProgram) -> CallGraph
+call_graph(program: MirProgram) -> CallGraph
     val n = program.functions.len()
     var taken: Buf[bool] = buf()
     for _ in 0..<n do taken.push(false)
@@ -412,7 +407,7 @@ private call_graph(program: MirProgram) -> CallGraph
 private take(taken: *Buf[bool], o: Operand)
     if o is FunctionAddress(g) then (*taken)[g] = true
 
-private inst_operands(inst: Inst) -> Buf[Operand]
+inst_operands(inst: Inst) -> Buf[Operand]
     var out: Buf[Operand] = buf()
     inst match
         Call(_, callee, args) ->
@@ -506,7 +501,7 @@ private components(n: usize, starts: Buf[usize], edges: Buf[usize]) -> Buf[usize
     component
 
 // Whether `inst`, in function `caller`, is a call that may close a cycle of the call graph.
-private closes_cycle(graph: CallGraph, caller: usize, inst: Inst) -> bool = inst match
+closes_cycle(graph: CallGraph, caller: usize, inst: Inst) -> bool = inst match
     Call(_, Direct(g), _) -> graph.component[g] == graph.component[caller]
     Call(_, Indirect(_, _), _) -> graph.reentered[graph.component[caller]]
     _ -> false
@@ -517,7 +512,7 @@ private closes_cycle(graph: CallGraph, caller: usize, inst: Inst) -> bool = inst
 // call passes a poll, and the time between that poll and the call is bounded by the code between them,
 // the calls they make, which poll for themselves, and loops, which poll on their back edges. A
 // function that recurses on only some paths polls only on those, and its leaf calls never poll.
-private polled_before(graph: CallGraph, index: usize, f: MirFunction) -> Buf[bool]
+polled_before(graph: CallGraph, index: usize, f: MirFunction) -> Buf[bool]
     val n = f.blocks.len()
     var polled: Buf[bool] = buf()
     var polls: Buf[bool] = buf()
@@ -601,7 +596,7 @@ private constant_payload(out: *StrBuilder, name: string)
 private method_slot_offset(slot: usize) -> string = "-" + ((slot + 2) * 8).to_string()
 
 /** The value an instruction defines, if any. */
-private inst_dest(inst: Inst) -> Option[usize] = inst match
+inst_dest(inst: Inst) -> Option[usize] = inst match
     Call(dest, _, _) -> dest
     Binary(dest, _, _, _) -> Some(dest)
     Checked(dest, _, _, _, _) -> Some(dest)
