@@ -619,6 +619,21 @@ Settled by the user on 2026-11-04:
   `impl` cannot name a nested type, and a method on the unnested type has no way to ask `T` to be
   an option.
 
+- The methods every `Iterable` has ([collections](/spec/collections/#methods-every-iterable-has)):
+  folds, `reduce` (trapping when empty) and `reduceOption`, searches, `count`, `minBy`/`maxBy` and
+  `min`/`max` (answering `Option`), `mkString`, `partition`, `groupBy`, `groupMap`,
+  `groupMapReduce`, the conversions and `zipWithIndex` are written once on `Iterable` and replace
+  the copies `Seq` and `Set` had. A collection they make is a `Vector`, whatever the receiver:
+  `partition` answers `(Vector[T], Vector[T])`, `groupBy` a `Map[K, Vector[T]]`, `zipWithIndex` a
+  `Vector[(T, int)]`, so a set's or a map's partition keeps every element, equal results included,
+  and a list's comes back indexed. A type's own method of the same signature still answers where the
+  type is known (`List.toList()` is the list itself). `Iterator` has lazy `map`, `filter`, `take`,
+  `drop`, `takeWhile`, `dropWhile`, `zip` and `zipWithIndex` answering iterators; its
+  `zipWithIndex` is the trait's own method and so is found before `Iterable`'s. To compile these, a
+  method table holds a method at a position only for the types a call through that position can
+  reach, by the receiver's static type, so a trait method that makes an instance at a larger type
+  argument (`zipWithIndex` on an `Iterator[(T, int)]`) is not compiled for every type it makes.
+
 - Sorting ([collections](/spec/collections/#sorting)): every `Seq` has `sorted()` (elements `Ord`),
   `sortedBy[K: Ord](key)` and `sortedWith(compare: (T, T) -> int)`, answering a `Vector`; `List`
   has its own three answering a `List`. `Array`, `Buffer` and `Deque` sort in place with `sort()`,

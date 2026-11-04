@@ -9,22 +9,218 @@ trait Iterable[+A]
 
 // A single pass over a sequence of elements. `hasNext()` says whether another element remains, and
 // `next()` yields it and moves past it; `next()` on an iterator with no element left traps.
+//
+// The iterators made from an iterator here are lazy: each reads its source only as far as its own
+// `hasNext()` and `next()` ask, so `it.map(f).take(2)` calls `f` twice however long `it` is. They
+// share the source, which then must not be read on its own.
 trait Iterator[+A]: Iterable[A]
     hasNext() -> bool
     next() -> A
     override iterator() -> Iterator[A] = self
 
-// Every collection and iterator. Traversing an iterator consumes it.
-impl[A] Iterable[A]
+    // The elements with `f` applied to each, `f` being called as each is read.
+    map[B](f: (A) -> B) -> Iterator[B] = MappedIterator(self, f)
+
+    // The elements that satisfy `p`; `p` is called as the source is read past each one.
+    filter(p: (A) -> bool) -> Iterator[A] = FilteredIterator(self, p, None)
+
+    // The first `n` elements, or all of them when there are fewer; none when `n` is not positive.
+    take(n: int) -> Iterator[A] = TakenIterator(self, n)
+
+    // The elements after the first `n`, which are skipped when the first element is asked for.
+    drop(n: int) -> Iterator[A] = DroppedIterator(self, n)
+
+    // The elements up to, and not including, the first that does not satisfy `p`.
+    takeWhile(p: (A) -> bool) -> Iterator[A] = TakenWhileIterator(self, p, None, false)
+
+    // The elements from the first that does not satisfy `p` on.
+    dropWhile(p: (A) -> bool) -> Iterator[A] = DroppedWhileIterator(self, p, None, false)
+
+    // Pairs of this iterator's elements and `other`'s, in step, ending when either does.
+    zip[B](other: Iterator[B]) -> Iterator[(A, B)] = ZippedIterator(self, other)
+
+    // Each element paired with its position, counted from 0.
+    zipWithIndex() -> Iterator[(A, int)] = IndexedIterator(self, 0)
+
+// Every collection and iterator has these, written once here over `iterator()`. Each traverses the
+// elements in iteration order and, on an iterator, consumes it. A type with a faster way to answer
+// one keeps its own method of the same name and parameter types, which is found first.
+impl[T] Iterable[T]
+    // Whether there are no elements.
+    isEmpty() -> bool = !iterator().hasNext()
+
+    // Whether there is at least one element.
+    nonEmpty() -> bool = iterator().hasNext()
+
+    // `f` applied to `initial` and the first element, then to that result and the second, and so on
+    // to the last: `f(f(initial, x0), x1)`; `initial` when there are no elements.
+    foldLeft[B](initial: B, f: (B, T) -> B) -> B
+        var acc = initial
+        val it = iterator()
+        while it.hasNext() do acc = f(acc, it.next())
+        acc
+
+    // `f` applied to the first two elements, then to that result and the third, and so on; traps
+    // when there are no elements.
+    reduce(f: (T, T) -> T) -> T = reduceOption(f) match
+        Some(x) -> x
+        None -> fail("reduce of an empty collection")
+
+    // `f` applied as `reduce` applies it, or `None` when there are no elements.
+    reduceOption(f: (T, T) -> T) -> Option[T]
+        val it = iterator()
+        if !it.hasNext() then return None
+        var acc = it.next()
+        while it.hasNext() do acc = f(acc, it.next())
+        Some(acc)
+
+    // Calls `f` with each element, in order.
+    foreach(f: (T) -> unit)
+        val it = iterator()
+        while it.hasNext() do f(it.next())
+
+    // Whether `p` holds for some element; the elements after the first that satisfies it are not
+    // reached.
+    exists(p: (T) -> bool) -> bool
+        val it = iterator()
+        while it.hasNext()
+            if p(it.next()) then return true
+        false
+
+    // Whether `p` holds for every element; true when there are none.
+    forall(p: (T) -> bool) -> bool
+        val it = iterator()
+        while it.hasNext()
+            if !p(it.next()) then return false
+        true
+
+    // The first element that satisfies `p`, or `None`.
+    find(p: (T) -> bool) -> Option[T]
+        val it = iterator()
+        while it.hasNext()
+            val x = it.next()
+            if p(x) then return Some(x)
+        None
+
+    // How many elements satisfy `p`.
+    count(p: (T) -> bool) -> int
+        var n = 0
+        val it = iterator()
+        while it.hasNext()
+            if p(it.next()) then n += 1
+        n
+
+    // The element whose key is least, the first of equal ones, or `None` when there are none. `key`
+    // is computed once for each element.
+    minBy[K: Ord](key: (T) -> K) -> Option[T] = extremeBy(iterator(), key, false)
+
+    // The element whose key is greatest, the first of equal ones, or `None` when there are none.
+    maxBy[K: Ord](key: (T) -> K) -> Option[T] = extremeBy(iterator(), key, true)
+
+    // The elements that satisfy `p` and those that do not, each in order.
+    partition(p: (T) -> bool) -> (Vector[T], Vector[T])
+        val yes = Vector.builder[T]()
+        val no = Vector.builder[T]()
+        for x in iterator()
+            if p(x) then yes.add(x) else no.add(x)
+        (yes.result(), no.result())
+
+    // The elements grouped by their keys: each key maps to the elements that have it, in order.
+    groupBy[K: Eq + Hash](key: (T) -> K) -> Map[K, Vector[T]] = groupMap(key, x -> x)
+
+    // `f` of the elements, grouped by the elements' keys: each key maps to `f` of the elements that
+    // have it, in order.
+    groupMap[K: Eq + Hash, V](key: (T) -> K, f: (T) -> V) -> Map[K, Vector[V]]
+        var groups = Map.empty[K, Buffer[V]]()
+        for x in iterator()
+            val k = key(x)
+            groups.get(k) match
+                Some(group) -> group.add(f(x))
+                None ->
+                    val group = Buffer[V]()
+                    group.add(f(x))
+                    groups = groups.updated(k, group)
+        groups.map((k, group) -> (k, group.toVector()))
+
+    // `f` of the elements, grouped by the elements' keys and each group combined: a key with one
+    // element maps to `f` of it, and `combine` joins the values of a key's elements in order.
+    groupMapReduce[K: Eq + Hash, V](key: (T) -> K, f: (T) -> V, combine: (V, V) -> V) -> Map[K, V]
+        var groups = Map.empty[K, V]()
+        for x in iterator()
+            val k = key(x)
+            val v = f(x)
+            val joined = groups.get(k) match
+                Some(before) -> combine(before, v)
+                None -> v
+            groups = groups.updated(k, joined)
+        groups
+
+    // A list of the elements, in order.
+    toList() -> List[T]
+        val b = List.builder[T]()
+        for x in iterator() do b.add(x)
+        b.result()
+
+    // A vector of the elements, in order.
+    toVector() -> Vector[T]
+        val b = Vector.builder[T]()
+        for x in iterator() do b.add(x)
+        b.result()
+
+    // A new array of the elements, in order.
+    toArray() -> Array[T]
+        val b = Array.builder[T]()
+        for x in iterator() do b.add(x)
+        b.result()
+
+    // A new buffer of the elements, in order.
+    toBuffer() -> Buffer[T]
+        val b = Buffer[T]()
+        for x in iterator() do b.add(x)
+        b
+
+    // Each element paired with its position in iteration order, counted from 0.
+    zipWithIndex() -> Vector[(T, int)]
+        val b = Vector.builder[(T, int)]()
+        var i = 0
+        for x in iterator()
+            b.add((x, i))
+            i += 1
+        b.result()
+
     // `pf` of the first element it is defined at, or `None` when it is defined at none; the elements
     // after that one are not reached.
-    collectFirst[B](pf: PartialFunction[A, B]) -> Option[B]
+    collectFirst[B](pf: PartialFunction[T, B]) -> Option[B]
         val f = pf.lift()
         val it = iterator()
         while it.hasNext()
             val found = f(it.next())
             if found.isSome() then return found
         None
+
+// Elements that hash and compare make a set.
+impl[T: Eq + Hash] Iterable[T]
+    // A set of the elements, each equal one once.
+    toSet() -> Set[T]
+        val b = Set.builder[T]()
+        for x in iterator() do b.add(x)
+        b.result()
+
+// Ordered elements have a greatest and a least.
+impl[T: Ord] Iterable[T]
+    // The greatest element, the first of equal ones, or `None` when there are none.
+    max() -> Option[T] = extreme(iterator(), true)
+
+    // The least element, the first of equal ones, or `None` when there are none.
+    min() -> Option[T] = extreme(iterator(), false)
+
+// Displayable elements join into a string.
+impl[T: Display] Iterable[T]
+    // The elements in their own `Display`, separated by `sep`: `[1, 2, 3].mkString()` is `1, 2, 3`.
+    mkString(sep: string = ", ") -> string = joined(iterator(), "", sep, "")
+
+    // The elements between `start` and `end`, separated by `sep`.
+    mkString(start: string, sep: string, end: string) -> string = joined(iterator(), start, sep, end)
 
 // Every collection of elements that add has the total of them, an empty one `T.zero()`. Overflow traps
 // as `+` does; a string collection concatenates. Traversing an iterator consumes it.
@@ -43,3 +239,119 @@ impl[T: Mul] Iterable[T]
         while it.hasNext() do total = total * it.next()
         total
 
+// The element of `items` whose key is greatest, or least, the first of equal ones.
+private extremeBy[T, K: Ord](items: Iterator[T], key: (T) -> K, greatest: bool) -> Option[T]
+    if !items.hasNext() then return None
+    var best = items.next()
+    var bestKey = key(best)
+    while items.hasNext()
+        val x = items.next()
+        val k = key(x)
+        if (if greatest then k > bestKey else k < bestKey)
+            best = x
+            bestKey = k
+    Some(best)
+
+private class MappedIterator[A, B](source: Iterator[A], f: (A) -> B): Iterator[B]
+    override hasNext() -> bool = source.hasNext()
+
+    override next() -> B = f(source.next())
+
+// Holds the next element that satisfies `p` once `hasNext()` has found it.
+private class FilteredIterator[A](source: Iterator[A], p: (A) -> bool, private var found: Option[A]): Iterator[A]
+    override hasNext() -> bool
+        while found.isNone() && source.hasNext()
+            val x = source.next()
+            if p(x) then found = Some(x)
+        found.isSome()
+
+    override next() -> A
+        hasNext()
+        found match
+            Some(x) ->
+                found = None
+                x
+            None -> fail("next on an exhausted iterator")
+
+private class TakenIterator[A](source: Iterator[A], private var remaining: int): Iterator[A]
+    override hasNext() -> bool = remaining > 0 && source.hasNext()
+
+    override next() -> A
+        if remaining <= 0 then fail("next on an exhausted iterator")
+        remaining -= 1
+        source.next()
+
+private class DroppedIterator[A](source: Iterator[A], private var skip: int): Iterator[A]
+    private skipped()
+        while skip > 0 && source.hasNext()
+            source.next()
+            skip -= 1
+        skip = 0
+
+    override hasNext() -> bool
+        skipped()
+        source.hasNext()
+
+    override next() -> A
+        skipped()
+        source.next()
+
+// Holds the next element once `hasNext()` has read it, and stops at the first that fails `p`.
+private class TakenWhileIterator[A](source: Iterator[A], p: (A) -> bool, private var found: Option[A], private var done: bool): Iterator[A]
+    override hasNext() -> bool
+        if done then return false
+        if found.isSome() then return true
+        if !source.hasNext()
+            done = true
+            return false
+        val x = source.next()
+        if p(x) then found = Some(x) else done = true
+        !done
+
+    override next() -> A
+        hasNext()
+        found match
+            Some(x) ->
+                found = None
+                x
+            None -> fail("next on an exhausted iterator")
+
+// Holds the first element that fails `p` once the elements before it are skipped.
+private class DroppedWhileIterator[A](source: Iterator[A], p: (A) -> bool, private var found: Option[A], private var started: bool): Iterator[A]
+    private start()
+        if started then return
+        started = true
+        while source.hasNext()
+            val x = source.next()
+            if !p(x)
+                found = Some(x)
+                return
+
+    override hasNext() -> bool
+        start()
+        found.isSome() || source.hasNext()
+
+    override next() -> A
+        start()
+        found match
+            Some(x) ->
+                found = None
+                x
+            None -> source.next()
+
+private class ZippedIterator[A, B](left: Iterator[A], right: Iterator[B]): Iterator[(A, B)]
+    override hasNext() -> bool = left.hasNext() && right.hasNext()
+
+    override next() -> (A, B)
+        if !hasNext() then fail("next on an exhausted iterator")
+        val x = left.next()
+        (x, right.next())
+
+private class IndexedIterator[A](source: Iterator[A], private var index: int): Iterator[(A, int)]
+    override hasNext() -> bool = source.hasNext()
+
+    override next() -> (A, int)
+        val x = source.next()
+        val i = index
+        index += 1
+        (x, i)

@@ -148,10 +148,13 @@ private struct Lowering
     library: bool
     /** The span of the innermost expression being lowered, where a call made for it is placed. */
     here: Span
-    /** For each position of a method table, whether a call goes through it. A table holds a method
-     * only at a position some call uses, so a method reached only through tables is compiled only
-     * when called: a data type's `Display` costs nothing in a program that never shows it. */
-    used_slots: Buf[bool]
+    /** For each position of a method table, the calls through it: the method's name, and the static
+     * type of the receiver, `Any` where that is not known. A table holds a method only at a position
+     * some call reaching its type uses, so a method reached only through tables is compiled only when
+     * called: a data type's `Display` costs nothing in a program that never shows it. And a method
+     * that makes an instance of a larger type, as an iterator's `zipWithIndex` does, does not fill
+     * the tables of every type it makes in turn. */
+    slot_calls: Buf[Buf[SlotCall]]
     /** Whether a position has come into use since the tables were last filled. */
     new_slots: bool
     /** The Sysl bindings whose bodies have been compiled, in that order. */
@@ -161,13 +164,20 @@ private struct Lowering
     calls_values: bool
 
 /** One slot for a method with type parameters of its own, at one list of its own type arguments: a
- * call through a method table to `name` at checker position `position` with `type_args` reaches it.
- * Each type holding that method at that position fills the slot with its implementation instantiated
- * at those arguments. */
+ * call through a method table to `name` at checker position `position` with `type_args`, on a
+ * receiver of static type `receiver`, reaches it. Each type of that receiver holding that method at
+ * that position fills the slot with its implementation instantiated at those arguments. */
 private struct GenericSlot
     position: usize
     name: string
     type_args: Buf[&Type]
+    receiver: &Type
+
+/** A call through a method table position: of the method `name`, on a receiver of static type
+ * `receiver`. */
+private struct SlotCall
+    name: string
+    receiver: &Type
 
 private struct GenericHolder
     descriptor: usize
@@ -338,7 +348,7 @@ private method_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
                 table.push(None)
                 continue
         val symbol = l.program.symbols[m]
-        if is_abstract_method(symbol) || symbol.decl.type_params.len() > 0 || missing[p] || !slot_used(l, p)
+        if is_abstract_method(symbol) || symbol.decl.type_params.len() > 0 || missing[p] || !slot_used(l, p, symbol.decl.name, t)
             table.push(None)
             continue
         table.push(Some(instance(l, m, implementation_args(l, t, m))))
@@ -354,14 +364,42 @@ private call_entry(l: *Lowering, t: &Type) -> Option[usize]
         _ -> return None
     Some(instance(l, m, implementation_args(l, t, m)))
 
-private slot_used(l: *Lowering, position: usize) -> bool = position < l.used_slots.len() && l.used_slots[position]
+/** Whether `t` names a type parameter or an unsolved type anywhere in it. */
+private names_type_parameter(t: &Type) -> bool = *t match
+    TypeVar(_, _, _) -> true
+    Var(_) -> true
+    Tuple(items) -> any_names_type_parameter(items)
+    Function(params, result) -> any_names_type_parameter(params) || names_type_parameter(result)
+    ByName(inner) -> names_type_parameter(inner)
+    Data(_, _, args) -> any_names_type_parameter(args)
+    Class(_, _, args) -> any_names_type_parameter(args)
+    _ -> false
 
-/** Records a call through `position` of a method table. */
-private use_slot(l: *Lowering, position: usize)
-    while l.used_slots.len() <= position
-        l.used_slots.push(false)
-    if l.used_slots[position] then return
-    l.used_slots.set(position, true)
+private any_names_type_parameter(items: Buf[&Type]) -> bool
+    for item in items
+        if names_type_parameter(item) then return true
+    false
+
+/** Whether a call through `position` of a method table reaches the method `name` on an object of type
+ * `t`: one of that method whose receiver's static type `t` has. Different traits' methods may share
+ * a position in different types' tables, so the name tells them apart. */
+private slot_used(l: *Lowering, position: usize, name: string, t: &Type) -> bool
+    if position >= l.slot_calls.len() then return false
+    for call in l.slot_calls[position]
+        if call.name == name && always_is(l, t, call.receiver) then return true
+    false
+
+/** Records a call through `position` of a method table, of the method `name`, on a receiver of static
+ * type `receiver`, `Any` where any object may be the receiver. */
+private use_slot(l: *Lowering, position: usize, name: string, receiver: &Type)
+    while l.slot_calls.len() <= position
+        l.slot_calls.push(buf())
+    var known: Buf[SlotCall] = buf()
+    for k in l.slot_calls[position]
+        if k.name == name && same_type(k.receiver, receiver) then return
+        known.push(k)
+    known.push(SlotCall(name, receiver))
+    l.slot_calls.set(position, known)
     l.new_slots = true
 
 // Fills the positions that came into use since the last time in the method tables already made, each
@@ -469,13 +507,13 @@ private hold_generic_slots(l: *Lowering, descriptor: usize, t: &Type)
 /** The table slot of a call through a method table to the method at checker position `position`,
  * named `name`, with its own type arguments `type_args`: made when first asked for, and filled in
  * every descriptor holding such a method there. */
-private generic_slot(l: *Lowering, position: usize, name: string, type_args: Buf[&Type]) -> usize
-    var key = s"$position $name"
+private generic_slot(l: *Lowering, position: usize, name: string, type_args: Buf[&Type], receiver: &Type) -> usize
+    var key = s"$position $name ${type_key(receiver)}"
     for t in type_args
         key = key + "|" + type_key(t)
     if l.generic_index.get(key) is Some(index) then return l.generic_base + index
     val index = l.generic_slots.len()
-    l.generic_slots.push(GenericSlot(position, name, type_args))
+    l.generic_slots.push(GenericSlot(position, name, type_args, receiver))
     l.generic_index.put(key, index)
     for h in l.generic_holders
         fill_generic_slot(l, h.descriptor, h.ty, index)
@@ -484,9 +522,10 @@ private generic_slot(l: *Lowering, position: usize, name: string, type_args: Buf
 // Fills generic slot `s` of a descriptor of type `t` with `t`'s implementation of the method, at the
 // slot's own type arguments after those of the type that declares the implementation. A type holding
 // another method at that position, or none, or an abstract one, leaves the slot empty: no call reaching
-// the slot is made on it.
+// the slot is made on it. So does a type a value of the slot's receiver type never has.
 private fill_generic_slot(l: *Lowering, descriptor: usize, t: &Type, s: usize)
     val slot = l.generic_slots[s]
+    if !always_is(l, t, slot.receiver) then return
     val entries = checker_table(l, t)
     if slot.position >= entries.len() then return
     val m = entries[slot.position] match
@@ -916,14 +955,18 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
     val result = machine(l, substitute(symbol.result.unwrap_or(Unit), symbol.type_owner, concrete_args))
     // A method with type parameters of its own has a slot for each list of its own type arguments.
     var position = slot
+    // A receiver whose type still names a type parameter, as `Self` does in a trait's default body
+    // compiled once for every type, may be an object of any type.
+    val seen = concrete(l, args[0].ty)
+    val receiver: &Type = if names_type_parameter(seen) then AnyType else seen
     val own = symbol.decl.type_params.len()
     if own > 0
         var own_args: Buf[&Type] = buf()
         for i in concrete_args.len() - own..<concrete_args.len()
             own_args.push(concrete_args[i])
-        position = generic_slot(l, slot, symbol.decl.name, own_args)
+        position = generic_slot(l, slot, symbol.decl.name, own_args, receiver)
     else
-        use_slot(l, position)
+        use_slot(l, position, symbol.decl.name, receiver)
     val code = fresh(l, MPtr)
     l.insts.push(MethodSlot(code, operands[0], position))
     val dest = result match
@@ -2312,7 +2355,7 @@ private operator_call(l: *Lowering, t: &Type, name: string, args: []Operand, res
 
 private operator_values(l: *Lowering, t: &Type, name: string, values: Buf[Operand], result: Option[MirType]) -> Option[Operand]
     val m = l.program.core.method_named(name).unwrap()
-    if decided_at_run_time(l, t) then return dispatch_operands(l, core_position(l, m), values, result)
+    if decided_at_run_time(l, t) then return dispatch_operands(l, core_position(l, m), name, values, result)
     explicit_implementation(l, t, m) match
         Some(index) -> call_instance(l, index, values, result)
         None ->
@@ -2342,12 +2385,13 @@ private call_instance(l: *Lowering, index: usize, operands: Buf[Operand], result
         Some(id) -> Some(Value(id))
         None -> None
 
-/** A call of the method at `position` of the method table of `operands[0]`'s object. */
-private dispatch_operands(l: *Lowering, position: usize, operands: Buf[Operand], result: Option[MirType]) -> Option[Operand]
+/** A call of the method `name` at `position` of the method table of `operands[0]`'s object, which
+ * may be of any type. */
+private dispatch_operands(l: *Lowering, position: usize, name: string, operands: Buf[Operand], result: Option[MirType]) -> Option[Operand]
     var params: Buf[MirType] = buf()
     for o in operands
         params.push(operand_type(l, o))
-    use_slot(l, position)
+    use_slot(l, position, name, AnyType)
     val code = fresh(l, MPtr)
     l.insts.push(MethodSlot(code, operands[0], position))
     val dest = result match

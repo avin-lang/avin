@@ -348,10 +348,15 @@ its table positions and the method go, the method recorded as withdrawn so lower
 it), and a bound or interpolation that then fails names the field in its diagnostic.
 
 Lowering compiles a data type's trait implementations only when called, and fills a method table
-position only once some call goes through it (`used_slots`): each new position is filled in every
-table made so far, which may make instances to compile, until no position is new. So a program that
-never shows a value carries no `Display` or `Debug` code, and one calling `toString()` through
-`Display` carries it only for the types it makes.
+position only once some call goes through it: each new position is filled in every table made so
+far, which may make instances to compile, until no position is new. So a program that never shows a
+value carries no `Display` or `Debug` code, and one calling `toString()` through `Display` carries it
+only for the types it makes. A call records its receiver's static type at the position
+(`slot_receivers`; a generic method's slot carries it too), and a table is filled there only where
+its type always is one of those types; a call lowering makes with no static receiver, an equality
+decided at run time, fills the position in every table (`used_slots`). Without that, a trait method
+making an instance at a larger type argument, as `Iterator.zipWithIndex` makes an
+`Iterator[(T, int)]`, would fill that instance's table, make the next larger one, and never end.
 
 The supertypes an instance has through **variance** are open-ended (`List[Dog]` is a `List[Animal]`
 and a `List[Any]`), so a record does not list them all. Lowering notes each record a type pattern
