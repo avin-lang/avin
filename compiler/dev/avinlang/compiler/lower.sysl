@@ -2372,9 +2372,9 @@ private lower_kind(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
             val name = binary_operator_method(op).unwrap().method
             return operator_call(l, t, name, [a, b], machine(l, t))
         Some(scalar_arith(l, t, op, a, b, op_span))
-    Convert(operand) ->
+    Convert(operand, wrap) ->
         val x = lower_expr(l, operand)?
-        Some(convert(l, concrete(l, operand.ty), concrete(l, e.ty), x, e.span))
+        Some(convert(l, concrete(l, operand.ty), concrete(l, e.ty), x, e.span, wrap))
     Box(value) ->
         val v = lower_expr(l, value)
         if v is None && machine(l, value.ty) is Some(_) then return None
@@ -2509,15 +2509,15 @@ private resize(l: *Lowering, x: Operand, from: u32, to: u32, signed: bool) -> Op
     if from > to then return convert_op(l, Truncate, MInt(to), x)
     convert_op(l, if signed then SignExtend else ZeroExtend, MInt(to), x)
 
-private convert(l: *Lowering, from: &Type, to: &Type, x: Operand, at: Span) -> Operand = *to match
+private convert(l: *Lowering, from: &Type, to: &Type, x: Operand, at: Span, wrap: bool) -> Operand = *to match
     Real -> *from match
         Real -> x
         Byte -> convert_op(l, UnsignedToReal, MReal, x)
         _ -> convert_op(l, SignedToReal, MReal, x)
     Int(bits) -> *from match
         Real -> convert_op(l, RealToInt, MInt(bits), x)
-        Int(width) -> resize(l, x, width, bits, true)
-        _ -> resize(l, x, int_bits(from), bits, false)
+        Int(width) -> if wrap then resize(l, x, width, bits, true) else narrow_signed(l, x, width, bits, to, at)
+        _ -> if wrap then resize(l, x, int_bits(from), bits, false) else narrow_unsigned(l, x, int_bits(from), bits, to, at)
     Byte -> *from match
         Int(width) -> to_byte(l, x, width, at)
         _ -> x
@@ -2526,6 +2526,22 @@ private convert(l: *Lowering, from: &Type, to: &Type, x: Operand, at: Span) -> O
         Byte -> resize(l, x, 8, 32, false)
         _ -> x
     _ -> x
+
+// A signed integer becomes one of another width: widening sign-extends, and narrowing traps when the
+// value does not survive the trip back to the wider width.
+private narrow_signed(l: *Lowering, x: Operand, from: u32, to: u32, target: &Type, at: Span) -> Operand
+    if from <= to then return resize(l, x, from, to, true)
+    val narrow = resize(l, x, from, to, true)
+    val back = resize(l, narrow, to, from, true)
+    trap_if(l, compare(l, CmpNe, back, x), s"value out of range for ${type_name(target)}", at)
+    narrow
+
+// A byte or a char, whose bits are unsigned, becomes a signed integer: it traps when the value is
+// above the greatest the width holds.
+private narrow_unsigned(l: *Lowering, x: Operand, from: u32, to: u32, target: &Type, at: Span) -> Operand
+    if from < to then return resize(l, x, from, to, false)
+    trap_if(l, compare(l, CmpUgt, x, ConstInt(from, max_digits(to))), s"value out of range for ${type_name(target)}", at)
+    resize(l, x, from, to, false)
 
 // An integer becomes a byte only when it is 0 to 255; anything else traps.
 private to_byte(l: *Lowering, x: Operand, width: u32, at: Span) -> Operand
@@ -2564,6 +2580,15 @@ min_digits(bits: u32) -> string
         i -= 1
         out = out + char(u8('0') + digits[i]).to_string()
     out
+
+/** The greatest value of a width, in decimal. */
+max_digits(bits: u32) -> string
+    // The magnitude of the least value is a power of two, which ends in 2, 4, 6 or 8, or is 1 for a
+    // width of one bit, so taking one from its last digit never borrows.
+    val least = min_digits(bits)
+    val head = least[1..<least.len - 1]
+    val last = least.bytes[least.len - 1] - 1
+    head + char(last).to_string()
 
 private logic(l: *Lowering, and: bool, left: &TExpr, right: &TExpr) -> Option[Operand]
     val a = lower_expr(l, left)?

@@ -853,6 +853,13 @@ Settled by the user on 2026-11-04:
     allowed.
   - Every type parameter of a generic deriving type is bounded by the derived trait.
 
+- **Integer limits and narrowing** (user, 2026-11-04). `MinValue` and `MaxValue` on every integer type
+  (`int.MaxValue`, `long.MinValue`, `i8.MaxValue`, any `iN`), on `byte` and on `char`, and on `real`
+  `MaxValue`, `MinValue`, `MinPositiveValue`, `PositiveInfinity`, `NegativeInfinity` and `NaN`, all
+  compile-time constants. Narrowing integer conversions (`i8(x)`, `int(l)`, `T(n)`, and a byte or char to
+  a narrower integer) trap when the value does not fit; real-to-integer still saturates. The wrapping
+  form, `i8.wrap(x)` (spelling proposed below), keeps the low bits. Not yet: the limits of a type parameter bounded by `Integer` (`T.MaxValue`).
+
 **Deferred**
 
 - Public C interoperability. Until then, C is reached through Sysl.
@@ -860,6 +867,11 @@ Settled by the user on 2026-11-04:
 - Async and await.
 
 ## Proposed
+
+- The wrapping conversion is spelled `i8.wrap(x)`, as the wrapping operators are spelled `+%`: the
+  integer type's name, `.wrap`, one operand, any integer target (a bounded type parameter included,
+  `T.wrap(n)`). The core library needs it to test whether a value fits a narrower width (the formatter
+  converts a generic integer to `long` and back). Awaiting the user.
 
 - Literal shapes ([collections](/spec/collections/#literals)): each of the library's collections is
   built only by the literal of its own shape: every `Seq` by `[a, b]`, `Set`, `TreeSet` and the
@@ -1021,7 +1033,7 @@ Settled by the user on 2026-11-04:
 - Ranges of other integer types as values (`Range[long]`, `Range[i16]`) are not decided. The
   endpoint type would be an `[T: Integer]` parameter, but the count of a range of `long`s or of
   `i8`s needs a type wider than `T`, a `Seq[T]`'s `length()` is an `int` that a `long` range can
-  exceed (trapping, as `int.min .. int.max` does), and a bare `Range` written in signatures means
+  exceed (trapping, as `int.MinValue .. int.MaxValue` does), and a bare `Range` written in signatures means
   the `int` range today. `for` over a range written in place already counts any integer type.
   Awaiting the user's choice of how `Range` is spelled and what type its `by` step has.
 - Value definitions in a `for` with `yield` ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
