@@ -19,7 +19,10 @@ element of a `Set`. `!=` is the negation.
 
 `a == b` requires `a` and `b` to have a common type: comparing an `int` with a `string` is a compile
 error, not `false`. Where the common type is `Any` or a trait, the comparison is decided at run time
-by the values' own types, and values of different types are unequal.
+by the values' own types, and values of different types are unequal, except that sequences are
+equal when their elements are equal in order whatever their classes (`Any` holding `[1, 2]` equals a
+`List(1, 2)`), with hashes that agree. An array compares as a sequence, by its contents, as
+elsewhere in Avin.
 
 `==` is `Eq`'s `equals(other: Self) -> bool` and the hash is `Hash`'s `hash() -> long`. Every type
 conforms to both without declaring it, so `[K: Eq + Hash]` admits any key type, and `x.equals(y)`
