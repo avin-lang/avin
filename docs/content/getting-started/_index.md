@@ -38,7 +38,7 @@ A missing tool is reported by name, with what installs it.
 
 Working on the compiler, the library or the runtime needs:
 
-- Sysl 0.8.13, with a checkout of `parsing` at `../sysl-lang/` relative to the repository
+- Sysl 0.8.17, with a checkout of Sysl's `parsing` package at `../sysl-lang/` relative to the repository
 - clang on `PATH`
 
 From the repository root:

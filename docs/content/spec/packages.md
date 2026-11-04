@@ -170,7 +170,9 @@ given to the nearest `avin.hocon` with a `package` block: `avin run shapes/main.
 without one, as before.
 
 - `avin build`, `run`, `test`, `check`, `emit-llvm` and `parse` compile the whole package with its
-  dependencies. `avin build` names the executable after the package.
+  dependencies. `avin build` names the executable after the package. A package without `main` is a
+  library: `avin check` checks it, its tests included, and `avin run` and `avin build`, having no
+  `main` to start from, refuse it.
 - `avin new <dir>` writes a program package named by the directory's last segment: its manifest, a
   module of that name (with `-` written `_`) holding one function, `main.avin` using it, a test of it in
   `tests/`, and a `.gitignore` naming `.avin/`. `avin new <dir> --lib` writes a library, the same
