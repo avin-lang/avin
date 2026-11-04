@@ -1,7 +1,7 @@
 module dev.avinlang.compiler
 
 import sh.sysl.parsing.*
-import sysl.text.from_utf8_unchecked
+import sysl.text.{from_utf8_unchecked, str_builder}
 import sysl.buf.{Buf, buf}
 
 // Tokens carry their operator family, which is what the expression parser's binding powers are
@@ -76,6 +76,99 @@ lex(src: Source) -> Lexed = lex_range(src.bytes, Span(0, src.bytes.len), true, l
  * the whole file, and no layout, since a hole lies inside one line. */
 lex_hole(src: Source, span: Span) -> Lexed = lex_range(src.bytes, span, false, 0)
 
+/** An interpolated literal written after the name `prefix`, with the cursor on its opening quote.
+ * A backslash directly before a quote does not end the literal, and no interpolator but `s` and `f`
+ * reads escapes: the chunks of every other literal are the text as written. `$$` stands for a
+ * dollar sign and `$"` for a double quote in all of them; holes are `${…}` and `$name`. */
+read_interpolated_literal(s: *Scanner, prefix: string) -> Result[Interpolation, LitError]
+    val decode = prefix == "s" || prefix == "f"
+    val start = s.offset
+    if !s.accept(u8('"')) then return Err(NoQuote(Span(start, start + 1)))
+    var chunks: Buf[string] = buf()
+    var holes: Buf[Span] = buf()
+    var b = str_builder()
+    var failure: Option[LitError] = None
+    loop
+        s.peek() match
+            None -> return Err(Unterminated(s.span_from(start)))
+            Some(c) ->
+                if c == u8('"')
+                    s.bump()
+                    break
+                elif c == u8('\\') && decode
+                    // A bad escape is reported once the literal has been read to its end, so the
+                    // text after it is not mistaken for code.
+                    val at = s.offset
+                    read_escape(s) match
+                        Err(e) ->
+                            if failure.is_none() then failure = Some(e)
+                            if s.offset == at then s.bump()
+                        Ok(ch) -> b.push_char(ch)
+                elif c == u8('\\')
+                    // A backslash and a quote or backslash after it are taken as a pair, so the quote
+                    // does not end the literal and `\\"` does.
+                    s.bump()
+                    b.push_char(char(u32(c)))
+                    val next = s.peek()
+                    if next == Some(u8('"')) || next == Some(u8('\\'))
+                        s.bump()
+                        b.push_char(char(u32(next.unwrap())))
+                elif c == u8('$') && (s.peek_at(1) == Some(u8('$')) || s.peek_at(1) == Some(u8('"')))
+                    s.bump()
+                    b.push_char(char(u32(s.peek().unwrap())))
+                    s.bump()
+                elif c == u8('$') && s.peek_at(1) == Some(u8('{'))
+                    s.bump()
+                    s.bump()
+                    val from = s.offset
+                    skip_raw_hole(s, start)?
+                    holes.push(Span(from, s.offset - 1))
+                    chunks.push(b.finish())
+                    b = str_builder()
+                elif c == u8('$') && opens_name(s)
+                    s.bump()
+                    s.read_ident(is_ident_start, is_ident_cont) match
+                        Some(at) -> holes.push(at)
+                        None -> return Err(Unterminated(s.span_from(start)))
+                    chunks.push(b.finish())
+                    b = str_builder()
+                else
+                    s.next_char() match
+                        Some(ch) -> b.push_char(ch)
+                        None -> return Err(Unterminated(s.span_from(start)))
+    failure match
+        Some(e) -> return Err(e)
+        None -> ()
+    chunks.push(b.finish())
+    Ok(Interpolation(chunks, holes))
+
+private opens_name(s: *Scanner) -> bool =
+    s.peek_at(1) match
+        Some(n) -> is_ident_start(n)
+        None -> false
+
+// Step over the expression of a `${…}` hole, leaving the cursor just past its `}`. A bracket inside
+// a string or character literal in the hole is not counted.
+private skip_raw_hole(s: *Scanner, start: usize) -> Result[unit, LitError]
+    var depth = 1usize
+    loop
+        s.peek() match
+            None -> return Err(Unterminated(s.span_from(start)))
+            Some(c) ->
+                s.bump()
+                if c == u8('{') then depth += 1
+                elif c == u8('}')
+                    depth -= 1
+                    if depth == 0 then return Ok(())
+                elif c == u8('"') || c == u8('\'')
+                    loop
+                        s.peek() match
+                            None -> return Err(Unterminated(s.span_from(start)))
+                            Some(q) ->
+                                s.bump()
+                                if q == u8('\\') then s.bump()
+                                elif q == c then break
+
 private lex_range(text: []const u8, range: Span, lines: bool, margin: usize) -> Lexed
     var s = scanner(text[0..<range.end])
     s.reset(range.start)
@@ -118,7 +211,7 @@ private lex_range(text: []const u8, range: Span, lines: bool, margin: usize) -> 
             s.read_ident(is_ident_start, is_ident_cont)
             val word = from_utf8_unchecked(text[start..<s.mark()])
             if s.peek() == Some(u8('"'))
-                read_interpolated_named(&s, u8('"'), "${".bytes, u8('}'), is_ident_start, is_ident_cont) match
+                read_interpolated_literal(&s, word) match
                     Ok(_) -> out.push(Interpolated, s.span_from(start))
                     Err(e) -> rep.add(error(where(e), e.to_string()))
             elif word == "match"

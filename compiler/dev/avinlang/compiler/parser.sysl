@@ -167,6 +167,7 @@ private operand_ended(p: *Parser) -> bool
     last.value match
         Word ->
             val w = p.spelling(last)
+            if w == "not" && p.toks.position >= 2 && p.toks.items[p.toks.position - 2].value == IsKeyword then return false
             !is_keyword(w) || w == "self" || w == "true" || w == "false"
         Number | RealNumber | Quoted | Interpolated | CharQuoted | Postfix -> true
         Dedent -> p.open_lines > 0
@@ -296,9 +297,10 @@ symbol_token(name: string) -> Token
 private call_level(name: string) -> u16 =
     if is_operator_spelling(name) then binding(Spanned(symbol_token(name), Span(0, 0))) else InfixBinding
 
-// Words that keep their meaning after an operand, and so never name a method called infix.
+// Words that keep their meaning after an operand, and so never name a method called infix. `not` is
+// not among them: it is a keyword only directly after `is`, and an ordinary name everywhere else.
 is_keyword(word: string) -> bool
-    for k in ["abstract", "as", "break", "class", "continue", "data", "derives", "do", "elif", "else", "end", "false", "for", "if", "impl", "import", "is", "loop", "match", "module", "not", "object", "open", "override", "private", "return", "self", "static", "super", "then", "trait", "true", "val", "var", "while", "yield"]
+    for k in ["abstract", "as", "break", "class", "continue", "data", "derives", "do", "elif", "else", "end", "false", "for", "if", "impl", "import", "is", "loop", "match", "module", "object", "open", "override", "private", "return", "self", "static", "super", "then", "trait", "true", "val", "var", "while", "yield"]
         if word == k then return true
     false
 
@@ -311,7 +313,7 @@ private interpolation(p: *Parser, t: Spanned[Token]) -> &Expr
     val prefix = from_utf8_unchecked(text.bytes[0..<quote])
     var s = scan(p.src)
     s.reset(t.span.start + quote)
-    val parts = read_interpolated_named(&s, u8('"'), "${".bytes, u8('}'), is_ident_start, is_ident_cont) match
+    val parts = read_interpolated_literal(&s, prefix) match
         Ok(v) -> v
         Err(_) -> return Expr(t.span, Invalid)
     var holes: Buf[&Expr] = buf()
@@ -321,8 +323,8 @@ private interpolation(p: *Parser, t: Spanned[Token]) -> &Expr
     Expr(t.span, Interpolate(prefix, parts.chunks, written, holes))
 
 // The literal text between an interpolation's holes as written, from `start` (just past the
-// opening quote) to `end` (the closing quote): escapes are left as they are and only `$$`, which is
-// how a dollar sign is written where a hole could begin, becomes `$`. A braced hole's span is its
+// opening quote) to `end` (the closing quote): escapes are left as they are and only `$$` and `$"`, which
+// are how a dollar sign and a double quote are written, become `$` and `"`. A braced hole's span is its
 // expression, between `${` and `}`; a bare one's is its name, after `$`.
 private written_parts(src: Source, start: usize, end: usize, holes: Buf[Span]) -> Buf[string]
     var out: Buf[string] = buf()
@@ -338,10 +340,7 @@ private undoubled(src: Source, from: usize, until: usize) -> string
     var b = str_builder()
     var i = from
     while i < until
-        if src.bytes[i] == u8('$') && i + 1 < until && src.bytes[i + 1] == u8('$')
-            i += 1
-        elif src.bytes[i] == u8('\\') && i + 1 < until
-            b.bytes.push(src.bytes[i])
+        if src.bytes[i] == u8('$') && i + 1 < until && (src.bytes[i + 1] == u8('$') || src.bytes[i + 1] == u8('"'))
             i += 1
         b.bytes.push(src.bytes[i])
         i += 1
@@ -539,6 +538,7 @@ private infix(left: &Expr, t: Spanned[Token], p: *Parser) -> &Expr
                 operands.push(expression(p, 30))
             Expr(left.span.to(operands[operands.len() - 1].span), Compare(operands, ops))
         IsKeyword ->
+            // Directly after `is`, `not` is always the keyword: `x is not(y)` negates the pattern `(y)`.
             val negated = p.accept("not")
             val pattern = parse_pattern(p)
             Expr(left.span.to(pattern.span), Is(left, pattern, negated))
@@ -902,9 +902,16 @@ private compare_op(text: string) -> CompareOp
     elif text == ">" then Greater
     else GreaterEqual
 
-/** Whether `name` is one of the integers' bitwise operators that a method of another type may be
- * named: `&`, `^`, `|`, and `~` between two operands. */
-bitwise_method_name(name: string) -> bool = name == "&" || name == "^" || name == "|" || name == "~"
+/** Whether `name` is one of the integers' bitwise or shift operators that a method of another type
+ * may be named: `&`, `^`, `|`, `~` between two operands, `<<` and `>>`. */
+bitwise_method_name(name: string) -> bool = name == "&" || name == "^" || name == "|" || name == "~" || name == "<<" || name == ">>"
+
+/** Whether `name` is one of the arithmetic or ordering operators that a method of a data type, a
+ * class or a trait may be named: `+`, `-`, `*`, `/`, `%`, `<`, `<=`, `>` and `>=`. */
+arithmetic_method_name(name: string) -> bool
+    for op in ["+", "-", "*", "/", "%", "<", "<=", ">", ">="]
+        if name == op then return true
+    false
 
 /** The operators of the language that have compound assignment forms, `+=` and `+:=`. */
 compound_operator(text: string) -> bool

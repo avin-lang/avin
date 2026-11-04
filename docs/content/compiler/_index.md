@@ -15,7 +15,7 @@ the standard library — in one run.
 | Lex and parse | source → AST | Indentation layout and grammar, on `sh.sysl.parsing`. Keeps spans; does no name lookup. A name in operator position, after a complete operand, is an infix method call: the parser sees it as an operator token, so keywords are the only words it has to tell apart. An operator is the longest run of operator characters; a run that is not one of the language's operators is a method's name called infix, and `++` or `--` is one only when an operand follows it on the line. |
 | Load | `avin.hocon` → module graph | Packages, modules and files; the reserved `avin` root; the prelude, which is an Avin file. |
 | Resolve | AST → resolved AST | Scopes and symbol tables. Every name is bound to a declaration symbol, and imports, visibility and shadowing are decided here, once. |
-| Check | resolved AST → typed HIR | A `Type` algebra over declaration symbols; local bidirectional inference with subtype constraints; bounds, variance and `impl` coherence; initialization; pattern exhaustiveness. |
+| Check | resolved AST → typed HIR | A `Type` algebra over declaration symbols; local bidirectional inference with subtype constraints; bounds, variance and `impl` coherence; initialization; pattern exhaustiveness; a finite set of instances, rejecting generic cycles whose type arguments grow. |
 | Bindings | `@sysl` declarations → shim archive | Generates the Sysl shim source and its boundary signatures, and has Sysl check and build it. |
 | Monomorphize | typed HIR → mono HIR | Instantiates functions, types and generic trait methods for every use, and computes the dispatch for trait-typed calls over the closed world. |
 | Lower | mono HIR → MIR | Explicit control flow, object layouts and headers, type descriptors, vtables, closures and environments, allocation, GC root slots, traps. |
@@ -103,7 +103,10 @@ its array and of the vector, in an order the binding's `Crossing` records. Since
 program lists every binding of the functions it compiles, with how each value crosses.
 
 For a program with bindings, the driver generates one Sysl module, `avin.shims`, in a package whose
-manifest depends on the runtime's package. Each binding gets an import of its Sysl function under a
+manifest depends on the runtime's package and on every Sysl package that the `sysl-dependencies` of
+the program's packages name: loading a package gathers them over its whole dependency graph, a
+directory made absolute and two releases of one name reduced to the higher, and the program carries
+them to the build. Each binding gets an import of its Sysl function under a
 private name, and an exported shim that converts each argument (a `bool` arrives as a byte, a `char`
 as its code point, a `string` is copied into a Sysl `string`), calls the function with the result
 declared at the binding's type, and converts the result back (a `string` is copied into a new Avin
@@ -132,9 +135,11 @@ own lines, reported at its declaration as `the Sysl mirror \`Name\` does not mat
 
 The archive is cached under `shims/` in the user's cache for this compiler version
 (`~/Library/Caches/avin/<version>` on macOS, `AVIN_CACHE` when it is set), never in the toolchain's
-root, which an installed compiler only reads. It is named by a SHA-256 of the manifest, the shim
-source, the `sysl --version` output and the runtime's source files, each named by its path in the
-runtime. A build with
+root, which an installed compiler only reads. It is named by a SHA-256 of the manifest, which names each Sysl package
+at its release or commit, the shim source, the `sysl --version` output, the runtime's source files,
+each named by its path in the runtime, and the source files of each Sysl package named by directory;
+a package's source files are its Sysl, manifest, sum and C files, outside its `.sysl` working
+directory. The executables `avin run` and `avin test` cache are keyed by the same Sysl packages. A build with
 the same bindings finds it there and runs no Sysl build; it is built under a temporary name and
 published by rename, so concurrent builds never see a partial archive. The `check` command builds
 the shims too, since only Sysl can say whether a binding is right.
@@ -440,7 +445,10 @@ final class, a `data` type, a tuple of such, each with only invariant parameters
 with the target's record; for an open class, a trait, an instance of a type with a covariant or
 contravariant parameter, or a tuple with a part of one, a call of the runtime's `avin_rt_conforms`, which
 scans the record's ancestors, so the test costs the number of ancestors. A generic instance is its
-own type with its own record, so `Box[int]` and `Box[string]` differ by address. Strings are made by
+own type with its own record, so `Box[int]` and `Box[string]` differ by address. A closure's
+descriptor names the record of its function's own type in the copy it was made from, and a function
+type, whose parameters and result vary and which a class may extend, is always tested through
+`avin_rt_conforms`. Strings are made by
 the runtime as well as written as literals, so the program emits one descriptor for every string
 (`string_descriptor`), naming the record of `string` and holding its method table; its literals
 name it, and `main` hands it to the runtime (`avin_rt_string_descriptor`) before anything else, so
@@ -467,6 +475,17 @@ function that loads both records, answers false when they differ, compares strin
 `string`) by bytes, and otherwise calls the record's entry; the hash reads the entry the same way. The entries are
 made for every record an object can have, once a program makes such a comparison at all; making them
 can lay out more types, so lowering repeats until no record lacks them.
+
+Two **rendering entries** follow (offsets 24 and 32): `display` and `debug` on an object of the type,
+a writer and a spec, through the type's own implementation where it conforms, or writing the type's
+name in the spec's field where it does not. A call of `display`, `debug` or `toString()` through a
+table on a receiver of `Any`, or of a trait that does not require the method's trait, does not use
+the table, which may have no such position for the object's type: `display` and `debug` call a
+generated function that loads the object's record and calls its entry, and `toString()` calls the
+core library's `displayString` at `Any`, which does the same through `display`. A receiver of
+`Display`, `Debug` or a trait requiring them keeps the table, since every object it holds conforms.
+The `display` entries are made like the equality entries, once a program shows such a value at all,
+and the `debug` entries once it debugs one.
 
 **Conditional conformance.** An impl with bounds of its own is recorded as a
 `ConditionalConformance`: the type's owner, the trait, and the bounds per type parameter, in the
@@ -815,7 +834,7 @@ the process with every other thread in it.
 sees. The compiler knows a small, declared set of
 **intrinsics**: arithmetic on built-in types, allocation, field access and the runtime entry points.
 Each is declared in Avin source with `@intrinsic("…")` and has no body. Everything else, including
-`print`, is ordinary library code.
+`println`, is ordinary library code.
 
 An intrinsic that is not a string operation is lowered to a function whose body calls one runtime entry point, named in the
 checker's `intrinsic_entry` table with its parameters and result. The formatting library

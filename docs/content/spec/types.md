@@ -32,12 +32,22 @@ a parameter, the other operand) and defaults to `int`; a literal that does not f
 Where a `real` is expected, an integer literal is that real (`x * 2`), provided it is exact: its
 magnitude is at most 2^53.
 
-Conversions: widening sign-extends; narrowing keeps the low bits (`i8(300)` is `44`); real-to-integer
+Conversions: widening sign-extends; narrowing traps when the value does not fit the narrower width
+(`i8(300)` traps, `i8(127)` is `127`), and `i8.wrap(300)` is the explicit wrapping form, which keeps the low
+bits (`44`); real-to-integer
 truncates toward zero, saturates at the bounds and maps NaN to zero; `char(n)` traps on a value that
 is not a Unicode scalar. Conversions are written as a call of the target type, and these exist: between
 any two integer types; integers and `real` in both directions; an integer or `byte` to `byte` and
 `char`; `byte` and `char` to any integer type; `byte` to `real`. A conversion to the same type is
 allowed and does nothing.
+
+**Limits.** Every integer type has its least and greatest value as constants, `MinValue` and `MaxValue`:
+`int.MaxValue`, `long.MinValue`, `i8.MaxValue`, `i1.MinValue`, `i257.MaxValue`, and `byte.MaxValue` (255)
+and `byte.MinValue` (0). `char.MaxValue` is U+10FFFF and `char.MinValue` U+0000. `real` has `MaxValue`
+(the greatest finite value), `MinValue` (the least, its negation), `MinPositiveValue` (the least positive
+value, subnormal), `PositiveInfinity`, `NegativeInfinity` and `NaN`. They are written on the type, are
+folded at compile time, and have the type they are written on. Any other name written on one of these
+types is an error.
 
 **Arithmetic that overflows traps.** `+`, `-`, `*`, unary `-`, `++` and `--` trap when the
 mathematical result does not fit the width, and so does `/` for the one quotient that cannot fit
@@ -69,6 +79,20 @@ literal in a `byte` context must be in 0–255: `val mask: byte = 0xf0`.
 `real` arithmetic follows IEEE 754, including NaN and signed zero; comparisons with NaN are false
 except `!=`. There is no implicit fused multiply-add. `char` supports ordering and equality but no
 arithmetic; `int(c)` and `char(n)` convert.
+
+A `char` has these methods, classifying by the Unicode Character Database:
+
+| Method | Meaning |
+|---|---|
+| `isDigit()` | A decimal digit of any script (category `Nd`) |
+| `isLetter()` | A letter of any script (categories `Lu`, `Ll`, `Lt`, `Lm`, `Lo`) |
+| `isLetterOrDigit()` | `isLetter()` or `isDigit()` |
+| `isWhitespace()` | A space separator other than the non-breaking ones (U+00A0, U+2007, U+202F), or U+0009 to U+000D, or U+001C to U+001F; this is not `trim`'s test, which is the `White_Space` property and so counts U+00A0 |
+| `isSpaceChar()` | A character of category `Zs`, `Zl` or `Zp` |
+| `isUpper()`, `isLower()` | Cased and upper, cased and lower |
+| `isControl()` | U+0000 to U+001F and U+007F to U+009F |
+| `toUpper()`, `toLower()` | The simple case mapping, one character for one: `'ß'.toUpper()` is `'ß'` |
+| `asDigit()` | The digit's value in radix 36: a decimal digit of any script gives its value, an ASCII or fullwidth letter, either case, gives 10 to 35; any other character gives -1 |
 
 ## string
 
@@ -121,9 +145,9 @@ most the largest `int` bytes.
 
 ```text
 val word = "café"
-print(s"${word.byteLength()} ${word.charCount()}")   // 5 4
-print(word.slice(3, 5))                               // é
-print(word.slice(0, 4))                               // traps: offset 4 is inside `é`
+println(s"${word.byteLength()} ${word.charCount()}")   // 5 4
+println(word.slice(3, 5))                               // é
+println(word.slice(0, 4))                               // traps: offset 4 is inside `é`
 ```
 
 ## unit

@@ -8,7 +8,9 @@ weight: 20
 
 Avin has Sysl's operator set and precedence. Operators are trait methods (`+` is `Add`, `<` is `Ord`,
 `==` is `Eq`), so a generic needs the bound that supplies one, and a user type gains one through an
-`impl`.
+`impl`. A data type or a class may also define the arithmetic and ordering operators as
+[ordinary methods](#operator-methods), with any operand and result types: `start + delay` with an
+`Instant` and a `Duration`.
 
 | Operator | Trait | Method |
 | --- | --- | --- |
@@ -21,7 +23,7 @@ Each method takes and yields the implementing type: `add(other: Self) -> Self`. 
 a type implements its `compare(other: Self) -> int`, negative, zero or positive, and inherits the
 four comparisons from it, implementing any of them as well where it can answer more directly. The
 built-in types implement the traits their operators have, so `int` is an `Add` and an `Ord`, and
-`string` is an `Add` (joining) and an `Ord`. Both operands of an operator on a data type or a class
+`string` is an `Add` (joining) and an `Ord`. Both operands of an operator reached through its trait
 are of one type. The wrapping, saturating and shift operators belong to the built-in types alone;
 `&`, `^` and `|` are the integers' and bytes' bitwise operators, and on any other type the
 [methods](#methods-named-by-symbols) of those names.
@@ -133,18 +135,18 @@ class Bag(val items: Vector[int])
 ```
 
 `a ++ b` is `a.++(b)`, and `a.++(b)` may be written as such. A function outside a type cannot be
-named by a symbol. Most of the language's own operators are not method names, because a type has
-them through their traits: declaring a method named `+` is an error that says to implement `Add`.
-The reserved spellings are `+` `-` `*` `/` `%`, the wrapping and saturating `+%` `-%` `*%` `+|` `-|`
-`*|`, `<<` `>>`, `!` `&&` `||`, `==` `!=` `<` `<=` `>` `>=` `===` `!==`, `::`, `=` `:=` `:` `?`
-`->` `=>`, and each yielding compound form such as `+:=`. Every other run is free, `++`, `--` and the
-plain compound spellings `+=` and `-=` among them.
+named by a symbol. Some of the language's own operators are not method names: declaring a method
+named `==` is an error that says to implement `Eq`. The reserved spellings are the wrapping and
+saturating `+%` `-%` `*%` `+|` `-|` `*|`, `!` `&&` `||`, `==` `!=` `===` `!==`, `::`, `=` `:=`
+`:` `?` `->` `=>`, and each yielding compound form such as `+:=` and `<<:=`. Every other run is
+free, `++`, `--`, `>>>` and the plain compound spellings `+=` and `-=` among them.
 
-`&`, `^`, `|`, and `~` between two operands, are free too, on every type but the integers and bytes,
-whose bitwise operators are the machine's: a method of one of these names on `int` or `byte`, in an
-extension too, is an error. On any other type, `a | b` calls `a`'s method `|`, so a parser
-combinator, a set of flags or a query builder can be written with them. Prefix `~` stays the
-integers' and bytes' complement, and `~a` on another type is an error.
+`&`, `^`, `|`, `~` between two operands, and the shifts `<<` and `>>`, are free too, on every type
+but the integers and bytes, whose bitwise and shift operators are the machine's: a method of one of
+these names on `int` or `byte`, in an extension too, is an error. On any other type, `a | b` calls
+`a`'s method `|` and `a >> b` its method `>>`, each at its operator's own level, so a parser
+combinator (`p >> f`), a set of flags, a stream or a query builder can be written with them. Prefix
+`~` stays the integers' and bytes' complement, and `~a` on another type is an error.
 
 ```text
 data Flags(bits: int)
@@ -155,6 +157,46 @@ impl Flags
 
 val rw = Flags(1) | Flags(2)
 ```
+
+#### Operator methods
+
+The arithmetic operators `+` `-` `*` `/` `%` and the orderings `<` `<=` `>` `>=` are free method
+names on a data type, a class or a trait, with any operand and result types, and overloaded by the
+operand's type like any method. `a + b` calls `a`'s method `+` where `a`'s type, or a type
+parameter's bound, has one taking one argument, at the built-in `+`'s own precedence, so
+`a + b * k` is `a + (b * k)` whichever of them are methods:
+
+```text
+data Instant(micros: long)
+
+impl Instant
+    +(d: Duration) -> Instant = Instant(micros + d.micros)
+    -(d: Duration) -> Instant = Instant(micros - d.micros)
+    -(earlier: Instant) -> Duration = Duration(micros - earlier.micros)
+
+class Vec(val x: real, val y: real)
+    *(k: real) -> Vec = Vec(x * k, y * k)
+    *(other: Vec) -> real = x * other.x + y * other.y
+    -() -> Vec = Vec(-x, -y)
+
+val deadline = start + timeout
+val waited = now - start
+val scaled = v * 2.0
+val flipped = -v
+```
+
+A prefix `-a` calls a method `-` taking no argument. Where a type has no method of an operator's
+name, the operator is its core trait's, `Add`'s `add` for `+`, as it always is in generic code: a
+type with both a method `+` and an `impl Add` has its method called by `a + b` and `add` called
+by a function bounded by `Add`. `a < b` alone calls the method `<`, whatever it yields, so a query
+builder's `age < 30` can build a condition; a comparison by a method does not chain, and
+`lo <= x < hi` through one is an error that says to join the comparisons with `&&`. `x += y` and
+the other compound forms assign through the method: `deadline += grace` is
+`deadline = deadline + grace`.
+
+The built-in types keep their operators: a method of one of these names on `int`, `real`, `byte`,
+`char`, `string`, `bool` or a tuple, in an extension or a trait implementation, is an error, so `+`
+on two `int`s is always the machine's addition. `==` and `!=` stay `Eq`'s.
 
 A symbol method's call binds at the level of the language's operator its name's first character
 belongs to, so a name reads with the operator it resembles. One character overrides the first: a
@@ -192,7 +234,8 @@ opposite directions, whether symbol methods or the language's own, do not mix wi
 `a ++ b +: c`, `a + b +: c` and `1 :: xs :+ 2` are errors, and `(a ++ b) :+ c` and `1 :: (xs :+ 2)`
 are not. Operators of different levels need none: `1 +: xs :+ 2` is `(1 +: xs) :+ 2`.
 
-There are no prefix or postfix symbol methods. `++` and `--` keep their update meaning when no
+There are no prefix or postfix symbol methods, beyond the [method `-`](#operator-methods) taking no
+argument that a prefix `-` calls. `++` and `--` keep their update meaning when no
 operand follows them on the line: `i++` and `++i` update `i`, and `xs ++ ys` calls `++`. An operand
 here is a name, a literal or an opening bracket on the same line, or an indented block on the next;
 so `a ++ -b`, with a prefix operator after `++`, is `(a++) - b`, written `a ++ (-b)` to join.
@@ -200,8 +243,9 @@ so `a ++ -b`, with a prefix operator after `++`, is `(a++) - b`, written `a ++ (
 `x op= y` calls `x`'s method named `op=` when the type of `x` has one: `buffer += 3` appends, and
 the buffer need not be a `var`. Otherwise `op=` assigns. Where `op` is one of the language's
 arithmetic, wrapping, saturating, shift or bitwise operators, it is the compound assignment it has
-always been; where `op` is a symbol method, or `&`, `^` or `|` on a type that has a method of that
-name, `x op= y` is `x = x op y`, so `flags |= Flags(4)` combines flags into a `var`, and `xs ++= ys` joins onto a
+always been; where `op` is a symbol method, or `&`, `^`, `|`, `<<`, `>>` or an
+[operator method](#operator-methods) on a type that has a method of that name, `x op= y` is
+`x = x op y`, so `flags |= Flags(4)` combines flags into a `var`, and `xs ++= ys` joins onto a
 `var` vector and `xs :+= 4` appends to it. The target is a `var` local, a `var` field, a module
 value or an element `xs(i)`, and its object and indices are evaluated once. A right-grouping name
 has no compound form, and the yielding forms (`+:=`) belong to the language's operators alone. A
@@ -293,7 +337,7 @@ scope s ->
         part(1)
 
 xs.foreach x ->
-    print(x)
+    println(x)
 ```
 
 A lambda of several parameters needs the call's parentheses before it, `run() (x, y) ->`: the
@@ -547,7 +591,10 @@ this way tests its patterns and guards once each time it is called, lifted or gi
 ## is
 
 `x is P` tests a value against any pattern a `match` arm takes and yields a `bool`; `x is not P` is
-its negation. The names `P` binds are in scope only where the test is known to have matched:
+its negation. `not` is a keyword only there, directly after `is`, where it always negates: `x is
+not(y)` tests the pattern `(y)`. Everywhere else `not` is an ordinary name, so a function, method,
+parameter or local may be called `not` and `not(p)` calls it. The names `P` binds are in scope only
+where the test is known to have matched:
 
 ```text
 area(shape: Option[Shape]) -> int

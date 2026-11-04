@@ -11,9 +11,9 @@ here.
 | Form | Meaning |
 | --- | --- |
 | `"…"` | Ordinary string with escapes |
-| `raw"…"` | Raw string, with no escape processing |
+| `raw"…"` | Raw string, with no escape processing: a backslash is an ordinary character (`raw"C:\dir"`), though `\"` does not end the literal |
 | Text blocks | Multi-line literals with Sysl's indentation and line-joining rules |
-| `s"…"` | Interpolation: `$name`, `${expression}`, `$$` |
+| `s"…"` | Interpolation: `$name`, `${expression}`, `$$` for a dollar sign, `$"` for a double quote |
 | `f"…"` | Formatted interpolation: a specifier after a hole (`${x}%08.3f`) |
 | `name"…"` | Any interpolator: a call of the method `name` on a `StringContext` |
 
@@ -24,7 +24,7 @@ the value is laid out:
 
 ```text
 val n = 7
-print(f"${n}%03d|${2.5}%08.2f|${"hi"}%-5s|")     // 007|00002.50|hi   |
+println(f"${n}%03d|${2.5}%08.2f|${"hi"}%-5s|")     // 007|00002.50|hi   |
 ```
 
 A specifier is `%`, then any flags, then a width, then `.` and a precision, then one conversion
@@ -71,11 +71,11 @@ is an integer.
 
 ```text
 val n = 7
-print(f"${n}%s")       // format `%s` expects a string or another value that is not a number, but the value has type `int`
-print(f"${n}%#d")      // the flag `#` has no effect under `%d`
-print(f"${n}%u")       // `%u` is not a format conversion: integers are signed, so `%d` writes every one
-print(f"${n}%")        // this format specifier has no conversion: …
-print(f"${2.5}%.${2.5}f")  // a width or precision written as a hole is a count, so it has to be an integer, …
+println(f"${n}%s")       // format `%s` expects a string or another value that is not a number, but the value has type `int`
+println(f"${n}%#d")      // the flag `#` has no effect under `%d`
+println(f"${n}%u")       // `%u` is not a format conversion: integers are signed, so `%d` writes every one
+println(f"${n}%")        // this format specifier has no conversion: …
+println(f"${2.5}%.${2.5}f")  // a width or precision written as a hole is a count, so it has to be an integer, …
 ```
 
 A value of a type that renders itself is handed what the specifier says in its `FormatSpec`: the
@@ -109,7 +109,11 @@ StringContext(["text ", " and ", ""]).p(a, b + 1)
   own form.
 
 A program adds its own interpolator by giving `StringContext` a method through a trait it declares
-and an `impl` of that trait. The interpolator is available wherever the trait is imported:
+and an `impl` of that trait. The interpolator is available wherever it is imported: in the module that
+declares it, in a file that imports that module (`import sql`), and in a file that imports one of its
+declarations by name (`import sql.{Query}`). Importing a module that itself imports `sql` does not
+bring `sql"…"` into scope, and `s`, `f` and `raw` need no import. Using an interpolator that is not
+in scope is an error that names the module to import:
 
 ```text
 trait SqlInterpolation
@@ -133,6 +137,32 @@ as the same value, written out without an exponent (`2.5`, `1`, `0.1`), a `bool`
 `false`, `()` as `()`, and a string as itself. A value whose type
 implements neither is a compile error. There is no fallback that prints an address. The specifier
 applies to the whole rendered value.
+
+A value whose static type is `Any` or a trait is shown by the type it has when the program runs.
+`Any` and every trait meet `Display` and `Debug`, as every type meets `Eq`: such a value meets a
+`Display` or `Debug` bound, has `display`, `debug` and `toString()`, and may be interpolated, whatever
+the trait itself declares. It does not convert to `Display` or `Debug` as a value: a value of either
+trait holds only objects whose types implement it. It renders through its own type's implementation, so a `Seq[int]` holding
+a vector prints `[1, 2, 3]`, as the vector would, and a `Vector[Seq[int]]` prints
+`[[1, 2, 3], [4]]`. A type with no `Display` (or no `Debug`) of its own renders as its name, `Cat` or
+`Box[int]`, and a function value as `<function>`, in the field the spec describes. The rule is for
+values whose type is decided at run time only: a value whose static type is a class or a data type
+still needs that type's own `Display`, and a type parameter its bound's. No impl gives a trait a
+`Display` of its own; its values are always shown by their own types.
+
+```avin
+trait Pet
+    name() -> string
+
+class Cat(): Pet
+    override name() -> string = "cat"
+
+main()
+    val xs: Seq[int] = [1, 2, 3]
+    val pet: Pet = Cat()
+    val anything: Any = (1, "two")
+    println(s"$xs $pet $anything")    // [1, 2, 3] Cat (1, two)
+```
 
 The core library declares the traits:
 
@@ -169,11 +199,12 @@ trait Debug
 - `toString()` renders into a `StringWriter`, a writer building a string, and returns its `text()`.
   `StandardOutput` is the writer for standard output; it writes an integer's digits without making
   a string of them. `StandardError` is the writer for standard error, which keeps no buffer.
-- `print(x)` writes `x`'s `Display` form and a new line to standard output; `eprint(x)` writes the
-  same to standard error, as one write, so a line is never split by another writer's. Given several
-  values, of any types that implement `Display`, each writes them separated by `, `:
-  `print("total", 3, (1, 2))` writes `total, 3, (1, 2)`. `debug(x)` is `x`'s
-  `Debug` form as a string, so `print(debug(x))` prints it. Inside an implementation of `Debug`, the
+- `print(x)` writes `x`'s `Display` form to standard output with no new line; `println(x)` writes it
+  and a new line. `print()` writes nothing and `println()` writes just a new line. `eprint` and
+  `eprintln` are the same for standard error, each a single write, so a line is never split by another
+  writer's. Given several values, of any types that implement `Display`, each writes them separated
+  by `, ` (they are not a tuple): `println("total", 3, (1, 2))` writes `total, 3, (1, 2)`. `debug(x)` is `x`'s
+  `Debug` form as a string, so `println(debug(x))` prints it. Inside an implementation of `Debug`, the
   bare name `debug` is the method, and a part is written with `part.debug(out, spec)`.
 - The built-in types' `Debug` forms are their `Display` forms, except that a string and a `char`
   are written as the literals that make them: quoted, with the quote, the backslash and control

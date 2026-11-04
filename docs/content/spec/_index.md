@@ -25,7 +25,7 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
    names happen to match.
 4. **Two failure channels.** A failure a correct caller can meet is a value (`Result`, `Option`); a
    bug is a trap. There is no `null` and there are no exceptions.
-5. **Library, not compiler.** `print`, collections, formatting and the rest are ordinary Avin code in
+5. **Library, not compiler.** `println`, collections, formatting and the rest are ordinary Avin code in
    the standard library. The compiler knows only the built-in types and a declared set of intrinsics.
 6. **Sysl is the system layer.** Avin reaches Sysl — and through Sysl, C — with
    [bindings written in Avin](/spec/sysl-bindings/). The standard library is written in Avin.
@@ -47,8 +47,9 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
 | [Operators and control flow](/spec/operators-and-control-flow/) | Operators, blocks, `if`, `while`, `match` |
 | [Call-by-name](/spec/by-name/) | `value: -> T` parameters |
 | [Strings and formatting](/spec/strings-and-formatting/) | Interpolation and format specifiers |
-| [System library](/spec/system-library/) | Proposed: `avin.process` — arguments, environment, exit; `avin.io` — `IoError`, standard input; `avin.fs` — files and directories |
-| [Packages](/spec/packages/) | Proposed: `avin.hocon`, dependencies, version selection, `avin.sum`, workspaces, `avin new` and `avin tidy` |
+| [System library](/spec/system-library/) | Proposed: `avin.process` — arguments, environment, exit; `avin.io` — `IoError`, standard input; `avin.fs` — files and directories; `avin.time`; the environment, commands and pipelines, `Source`, `avin.random`, `avin.net` (TCP, URLs, HTTP) and futures' additions |
+| [Regular expressions](/spec/regex/) | Proposed: `avin.regex` — the pattern language, leftmost-first backtracking, `Regex`, `Match` and `MatchIterator` |
+| [Packages](/spec/packages/) | Proposed: `avin.hocon`, dependencies, version selection, `avin.sum`, workspaces, `avin new` and `avin tidy`; settled: features, members of a repository, vendoring and the standard library's modules |
 | [Derivation](/spec/derivation/) | Library-defined `derives`: shapes of data types and classes, `derive` templates, annotations, a JSON library written with them |
 | [Settled decisions](/spec/decisions/) | Every decision made so far, in one list |
 

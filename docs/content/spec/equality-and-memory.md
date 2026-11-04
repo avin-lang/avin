@@ -19,7 +19,10 @@ element of a `Set`. `!=` is the negation.
 
 `a == b` requires `a` and `b` to have a common type: comparing an `int` with a `string` is a compile
 error, not `false`. Where the common type is `Any` or a trait, the comparison is decided at run time
-by the values' own types, and values of different types are unequal.
+by the values' own types, and values of different types are unequal, except that sequences are
+equal when their elements are equal in order whatever their classes (`Any` holding `[1, 2]` equals a
+`List(1, 2)`), with hashes that agree. An array compares as a sequence, by its contents, as
+elsewhere in Avin.
 
 `==` is `Eq`'s `equals(other: Self) -> bool` and the hash is `Hash`'s `hash() -> long`. Every type
 conforms to both without declaring it, so `[K: Eq + Hash]` admits any key type, and `x.equals(y)`
@@ -55,13 +58,13 @@ identity to compare, and on `Any`, which may hold one.
 
 ## Display and Debug
 
-Text rendering comes from two traits. `Display` is the human form, used by `print`,
+Text rendering comes from two traits. `Display` is the human form, used by `println`,
 interpolation and `toString()`. `Debug` is the diagnostic form, used by `debug(x)`, where strings are
 quoted and escaped. Both render into a `Writer` with a `FormatSpec`, so formatting a value needs no
 intermediate string. `data` types and tuples derive both; classes declare them. Nothing has a default
 that prints an address.
 
-A `data` type has both without asking, wherever its fields have them: `print(Some(3))` writes
+A `data` type has both without asking, wherever its fields have them: `println(Some(3))` writes
 `Some(3)`, and `assertEq(Some(3), Some(3))` needs nothing written. `derives Display, Debug` on a data
 type is allowed and means the same. An impl of the type's own replaces the automatic one: `impl
 Display for Money` gives `Money` its own `Display` while its `Debug` stays the derived one, and `List`,

@@ -1,0 +1,224 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.{Source, source_of}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, is_dir, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.Stdio
+
+// The formatter: the spaces between tokens, indentation, blank lines and comments, lines broken at
+// the width limit, literate files, the refusals, `avin fmt` and every source file of the
+// repository formatted without a change of meaning.
+
+// The text formatted, which must be formatted already when formatted again.
+private formatted(text: string) -> string = formatted_as("probe.avin", text)
+
+private formatted_as(name: string, text: string) -> string
+    val once = format_text(name, text) match
+        Ok(t) -> t
+        Err(why) -> panic(s"not formatted: $why")
+    assert_eq(format_text(name, once).unwrap(), once)
+    once
+
+// ---- spaces ----
+
+@test("fmt: spaces around binary operators, `=` and `->`, after `,` and `:`, none inside brackets")
+fmt_spaces_between_tokens()
+    assert_eq(formatted("f( a:int,b :int )->int=a+b*2\n"), "f(a: int, b: int) -> int = a + b * 2\n")
+    assert_eq(formatted("val xs = [ 1,2 ]\nval m = { \"a\":1 }\n"), "val xs = [1, 2]\nval m = {\"a\": 1}\n")
+    assert_eq(formatted("val r = 0..<n\nval s = 1..10\n"), "val r = 0 ..< n\nval s = 1 .. 10\n")
+    assert_eq(formatted("val ok = a&& !b||c==d\n"), "val ok = a && !b || c == d\n")
+    assert_eq(formatted("val ys = xs ++ ys :+ 3\n"), "val ys = xs ++ ys :+ 3\n")
+
+@test("fmt: a prefix operator stays against its operand, and two signs keep apart")
+fmt_prefix_operators()
+    assert_eq(formatted("val a = - x\nval b = f(-1, ! ok)\nval c = a- -b\n"), "val a = -x\nval b = f(-1, !ok)\nval c = a - -b\n")
+    assert_eq(formatted("f() -> int\n    return -1\n"), "f() -> int\n  return -1\n")
+    assert_eq(formatted("main()\n    for x in 10..0 by -4 do println(x)\n"), "main()\n  for x in 10 .. 0 by -4 do println(x)\n")
+
+@test("fmt: members, calls, type arguments, `?`, splices and annotations keep their tokens together")
+fmt_tight_tokens()
+    assert_eq(formatted("val n = xs . size()\n"), "val n = xs.size()\n")
+    assert_eq(formatted("f(xs: int*) -> int = g(xs*)?\n"), "f(xs: int*) -> int = g(xs*)?\n")
+    assert_eq(formatted("val m: Map[string, int] = Map()\n"), "val m: Map[string, int] = Map()\n")
+    assert_eq(formatted("@test( \"x\" )\nt() = ()\n"), "@test(\"x\")\nt() = ()\n")
+    assert_eq(formatted("val s = s\"a ${ x+1 } b\"\n"), "val s = s\"a ${ x+1 } b\"\n")
+    assert_eq(formatted("f(x: int) -> int = x match\n    small@1..5 -> small\n    _ -> 0\n"), "f(x: int) -> int = x match\n  small @ 1 .. 5 -> small\n  _ -> 0\n")
+
+@test("fmt: a dot after a number keeps its space, since `1 .5` is not `1.5`")
+fmt_number_dot()
+    assert_eq(formatted("val a = 1.toString()\n"), "val a = 1.toString()\n")
+
+// ---- indentation ----
+
+@test("fmt: every block level is two columns, whatever the source used")
+fmt_indentation()
+    val src = "main()\n    if a\n        b()\n    else\n            c()\n    d()\n"
+    assert_eq(formatted(src), "main()\n  if a\n    b()\n  else\n    c()\n  d()\n")
+    assert_eq(formatted("f(x: int) -> int = x match\n   0 -> 1\n   _ -> 2\n"), "f(x: int) -> int = x match\n  0 -> 1\n  _ -> 2\n")
+
+@test("fmt: continuation lines stay continuation lines, two columns in")
+fmt_continuation_lines()
+    val src = "main()\n    val total = a\n          + b * c\n          - d\n    println(total)\n"
+    assert_eq(formatted(src), "main()\n  val total = a\n    + b * c\n    - d\n  println(total)\n")
+
+@test("fmt: a block opened inside brackets is indented from the line that opens it")
+fmt_block_in_brackets()
+    val src = "main()\n    foo(xs, x ->\n            val y = x\n            y)\n"
+    assert_eq(formatted(src), "main()\n  foo(xs, x ->\n    val y = x\n    y)\n")
+
+@test("fmt: a trailing block and a lambda's block keep their places")
+fmt_trailing_blocks()
+    val src = "main()\n    retry(3)\n        fetch()\n    xs.foreach x ->\n        println(x)\n"
+    assert_eq(formatted(src), "main()\n  retry(3)\n    fetch()\n  xs.foreach x ->\n    println(x)\n")
+
+// ---- comments and blank lines ----
+
+@test("fmt: comments are kept exactly, a trailing one a space after the code, a lone one at its block")
+fmt_comments()
+    val src = "// head  comment\nmain()\n        //   inside\n    a()   // after a\n    if b\n        c()\n            // deeper than c\n    d()\n"
+    assert_eq(formatted(src), "// head  comment\nmain()\n  //   inside\n  a() // after a\n  if b\n    c()\n    // deeper than c\n  d()\n")
+
+@test("fmt: at most one blank line, none at the ends of the file")
+fmt_blank_lines()
+    val src = "\n\nmain()\n    a()\n\n\n\n    b()\n\n\n"
+    assert_eq(formatted(src), "main()\n  a()\n\n  b()\n")
+
+@test("fmt: a blank line between top-level declarations, except between one-line ones")
+fmt_blank_between_declarations()
+    val src = "import a.b\nimport a.c\nval x: int = 1\nf() -> int\n    1\ng() = 2\nh() = 3\n"
+    assert_eq(formatted(src), "import a.b\nimport a.c\nval x: int = 1\n\nf() -> int\n  1\n\ng() = 2\nh() = 3\n")
+
+@test("fmt: the blank line goes before a declaration's comments and annotations, never inside them")
+fmt_blank_before_comments()
+    val src = "f() -> int\n    1\n// about g\n@test(\"g\")\ng()\n    assert(true)\n"
+    assert_eq(formatted(src), "f() -> int\n  1\n\n// about g\n@test(\"g\")\ng()\n  assert(true)\n")
+    assert_eq(formatted("f() -> int\n    1\n\n// about g\ng() = 2\n"), "f() -> int\n  1\n\n// about g\ng() = 2\n")
+
+// ---- the width limit ----
+
+@test("fmt: a call too long for the line takes one argument per line, two columns in")
+fmt_breaks_a_long_call()
+    val short = "longArgumentName"
+    val other = "anotherQuiteLongArgumentTooLong"
+    val src = s"main()\n    println(compute(${short}1, ${short}2, ${short}3, ${short}4), $other)\n"
+    assert_eq(formatted(src), s"main()\n  println(\n    compute(${short}1, ${short}2, ${short}3, ${short}4),\n    $other\n  )\n")
+    val arg = "aVeryLongArgumentNameNumber"
+    val deeper = s"main()\n    println(compute(${arg}1, ${arg}2, ${arg}3, ${arg}4, ${arg}5))\n"
+    assert_eq(formatted(deeper), s"main()\n  println(\n    compute(\n      ${arg}1,\n      ${arg}2,\n      ${arg}3,\n      ${arg}4,\n      ${arg}5\n    )\n  )\n")
+
+@test("fmt: a parameter list too long for the line takes one parameter per line, four columns in")
+fmt_breaks_a_long_parameter_list()
+    val src = "combine(firstParameter: int, secondParameter: string, thirdParameter: Vector[int], fourth: bool, fifth: Option[string]) -> int\n    1\n"
+    assert_eq(formatted(src), "combine(\n    firstParameter: int,\n    secondParameter: string,\n    thirdParameter: Vector[int],\n    fourth: bool,\n    fifth: Option[string]\n) -> int\n  1\n")
+
+@test("fmt: a list written one item per line stays so, and one broken any other way is joined")
+fmt_keeps_one_item_per_line()
+    assert_eq(formatted("val xs = [\n    1,\n        2\n]\n"), "val xs = [\n  1,\n  2\n]\n")
+    assert_eq(formatted("val xs = [1,\n          2]\n"), "val xs = [1, 2]\n")
+    assert_eq(formatted("main()\n    f(a,\n      b)\n"), "main()\n  f(a, b)\n")
+
+@test("fmt: a binding's value too long for the line, holding no list, breaks before its loosest operators")
+fmt_breaks_a_long_value()
+    val name = "someRatherLongOperandName"
+    val src = s"main()\n    val total = ${name}1 * 2 + ${name}2 * 3 + ${name}3 * 4 + ${name}4 * 5 + ${name}5\n    println(total)\n"
+    assert_eq(formatted(src), s"main()\n  val total = ${name}1 * 2\n    + ${name}2 * 3\n    + ${name}3 * 4\n    + ${name}4 * 5\n    + ${name}5\n  println(total)\n")
+
+@test("fmt: a line with nothing that may be broken stays long")
+fmt_leaves_an_unbreakable_line()
+    val long = "x" + "y".repeat(130)
+    assert_eq(formatted(s"val $long = 1\n"), s"val $long = 1\n")
+
+@test("fmt: a comment inside brackets keeps the lines it is on")
+fmt_comment_in_brackets()
+    val src = "val xs = [1, // one\n           2]\n"
+    assert_eq(formatted(src), "val xs = [1, // one\n  2]\n")
+
+// ---- literate files and refusals ----
+
+@test("fmt: in a literate file only the program is formatted, four columns in and two a level")
+fmt_literate()
+    val src = "# Title\n\nSome  prose,   kept.\n\n    main()\n            println(1+2)\n\nMore prose.\n\n    f() = 1\n"
+    assert_eq(formatted_as("doc.lavin", src), "# Title\n\nSome  prose,   kept.\n\n    main()\n      println(1 + 2)\n\nMore prose.\n\n    f() = 1\n")
+
+@test("fmt: a file that does not parse is refused with its diagnostics")
+fmt_refuses_a_broken_file()
+    val why = format_text("broken.avin", "main(\n") match
+        Ok(_) -> panic("formatted a broken file")
+        Err(w) -> w
+    assert(why.contains("broken.avin"))
+
+// ---- `avin fmt` ----
+
+private struct FmtRun
+    status: int
+    said: string
+    noted: string
+
+private fmt_avin(dir: string, args: []const string) -> FmtRun
+    var said = ""
+    var noted = ""
+    val status = run_cli_with(args, Some(repository_toolchain()), s -> said = said + s + "\n", s -> noted = noted + s + "\n", Stdio.ToPath(dir + "/run.out"), Stdio.ToPath(dir + "/run.err"))
+    FmtRun(status, said, noted)
+
+@test("fmt: `avin fmt --check` lists the files not formatted and fails; `avin fmt` rewrites them")
+fmt_command_checks_and_rewrites()
+    val dir = make_temp_dir("avin-fmt").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/a.avin", "main()\n    println(1+2)\n").unwrap()
+    write_text(dir + "/b.avin", "f() = 1\n").unwrap()
+    write_text(dir + "/.hidden.avin", "f( ) = 1\n").unwrap()
+    val checked = fmt_avin(dir, ["avin", "fmt", "--check", dir])
+    assert_eq(checked.status, 1)
+    assert_eq(checked.said, dir + "/a.avin\n")
+    assert(checked.noted.contains("1 file is not formatted"))
+    val rewritten = fmt_avin(dir, ["avin", "fmt", dir])
+    assert_eq(rewritten.status, 0)
+    assert_eq(read_text(dir + "/a.avin").unwrap(), "main()\n  println(1 + 2)\n")
+    assert_eq(read_text(dir + "/.hidden.avin").unwrap(), "f( ) = 1\n")
+    assert_eq(fmt_avin(dir, ["avin", "fmt", "--check", dir + "/a.avin", dir + "/b.avin"]).status, 0)
+
+@test("fmt: `avin fmt` fails on a file that does not parse and on a path that does not exist")
+fmt_command_failures()
+    val dir = make_temp_dir("avin-fmt").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/bad.avin", "main(\n").unwrap()
+    val bad = fmt_avin(dir, ["avin", "fmt", dir + "/bad.avin"])
+    assert_eq(bad.status, 1)
+    assert(bad.noted.contains("bad.avin"))
+    assert_eq(read_text(dir + "/bad.avin").unwrap(), "main(\n")
+    assert_eq(fmt_avin(dir, ["avin", "fmt", dir + "/missing.avin"]).status, 1)
+    assert_eq(fmt_avin(dir, ["avin", "fmt", "--wrong"]).status, 2)
+
+// ---- the repository ----
+
+private fmt_sources(dir: string, out: *Buf[string])
+    for name in entries(dir).unwrap_or(buf())
+        if name.starts_with(".") then continue
+        val full = dir + "/" + name
+        if is_dir(full) then fmt_sources(full, out)
+        elif is_source_name(name) then out.push(full)
+
+@test("fmt: every source file of the tests and the library that parses formats to the same program, once and for all")
+fmt_repository_sources()
+    val tc = repository_toolchain()
+    var files: Buf[string] = buf()
+    fmt_sources(tc.root + "/tests", &files)
+    fmt_sources(tc.root + "/library", &files)
+    var parsed = 0
+    var already = 0
+    for file in files
+        val text = read_text(file).unwrap()
+        val doc = source_of(file, text)
+        if parse(doc).report.has_errors() then continue
+        parsed += 1
+        // Re-breaking lines must keep the meaning by itself, without falling back to the source's
+        // line breaks.
+        val once = format_reflowed(doc) match
+            Ok(t) -> t
+            Err(why) -> panic(why)
+        if once == text then already += 1
+        val twice = format_text(file, once).unwrap()
+        if twice != once then panic(s"$file: formatting is not stable")
+    print(s"fmt: $parsed of ${files.len()} source files parse; $already are formatted already")
+    assert(parsed > 700)

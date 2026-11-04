@@ -81,6 +81,18 @@ a decision changes, this page and the chapter change together.
   an impl. A `var` field satisfies a `val`; a method or a private field does not. Read through the
   trait it is a method table entry the compiler fills with a method that loads the field; read
   through a class type it is the field. It is never assigned through the trait.
+- Traits may hold state (settled, user, 2026-11-04). A trait declares a field with a value,
+  `val name: T = expr` or `var name: T = expr`, and every class and object conforming to it stores
+  one of its own. Through the class's type it is the class's field; through the trait, or a type
+  parameter the trait bounds, it is read and assigned through method table entries the compiler
+  fills with a method that loads or stores the class's field. Construction runs the superclass
+  first, then stores the class's parameters, then computes the fields of the traits the superclass
+  does not already conform to, a trait's required traits before it and each trait once, in the order
+  of the `:` list, then runs the class body. A trait's field's value may read the fields initialized
+  before it and uses `self` for nothing else. Only a class or an object conforms to a trait holding
+  state, or requiring one that does: an impl of it for a `data` type, a built-in type or a tuple is an
+  error. A class declaring a field of a trait field's name, or conforming to two traits that declare
+  fields of one name, is an error.
 - An `object` may extend an `open` or `abstract` class, constructed from the top down as a subclass
   is, overriding its methods and conforming to it; it implements every abstract member it inherits.
 - A trait's method, or an overridable class method, may have type parameters of its own and be
@@ -110,6 +122,11 @@ a decision changes, this page and the chapter change together.
   a trait mentioning it, itself or through a trait it requires, is only a bound. In its default
   bodies `self` is a `Self`. A trait type is a type argument for its own bound when it does not
   mention `Self`.
+- Settled 2026-11-04 (user): [polymorphic recursion](/spec/generics/#polymorphic-recursion), a
+  cycle of generic code whose type arguments grow on every round, is a compile-time error naming
+  the cycle, through functions, methods, local functions, lambdas and calls through traits and
+  bounds alike; recursion whose type arguments do not grow is legal. Checking never runs without
+  end on it.
 - [Variance](/spec/generics/#variance) applies only where both type arguments are reference types,
   so it never converts: `List[string]` is a `List[Any]`, `List[int]` is not. Tuple parts and
   function results are covariant and function parameters contravariant on the same terms.
@@ -118,6 +135,15 @@ a decision changes, this page and the chapter change together.
   its impls name are.
 - A type pattern matches an object whose type conforms to the pattern's type through variance, as
   the checker's subtyping does: a `List[Dog]` held as an `Any` matches `List[Animal]`.
+- Settled by the user 2026-11-04: [lower bounds](/spec/generics/#lower-bounds) on a function's or a
+  method's own type parameters, written first: `[W >: T]`, `[W >: T: Display]`. A lower bound is a
+  covariant position, so a covariant trait declares `put[W >: V](key: K, value: W) -> Bag[K, W]` as
+  a virtual method; impl methods that are not variance positions are no longer the only way a
+  covariant type takes its parameter in. A value of the bound is one of the parameter with no
+  conversion, so a type argument is the bound or a reference type it is seen as. A call infers the
+  join of the bound and the arguments, `Any` where they are references with no nearer common type;
+  a written or expected type argument is held to the bound. An override writes its method's lower
+  bound or none. A type's and an impl's parameters take none.
 - The built-in types belong to the core library's module, `avin`; a conformance of one is written
   there or in the trait's module. An impl that only adds methods may be written in any module
   (settled 2026-11-04, below).
@@ -127,6 +153,15 @@ a decision changes, this page and the chapter change together.
 - [Overloads](/spec/declarations/#functions) are the functions of one name in one scope. A block's
   local functions of a name hide every outer function of that name, whatever their parameter types,
   and a program's own top-level functions hide the prelude's of the same name.
+- A local value (`val`, `var` or a pattern binding) and a local function of the same block may not
+  share a name, whichever is written first (settled, user, 2026-11-04). In a nested block, a lambda
+  or as a parameter of the enclosing function, a local may hide an outer local function like any
+  outer name (settled, user, 2026-11-04).
+- Generic local functions ([declarations](/spec/declarations/#functions)): a local function's type
+  parameters follow the enclosing ones it shares, which its calls never write, so `pair[int](1)`
+  writes only `pair`'s own. A local function's type parameter may not take the name of one already
+  in scope rather than hiding it. Written type arguments and those an expected type gives a generic
+  function used as a value are held to its bounds, as a call's are (settled, user, 2026-11-04).
 - Choosing an overload tries integer literals and lambdas against each candidate's parameter; every
   other argument is checked once on its own, and only its type is tried. A literal fits any
   parameter that can hold it.
@@ -172,6 +207,16 @@ a decision changes, this page and the chapter change together.
   `"-0"` is 0, and refuse white space, separators and overflow (`"-9223372036854775808"` is a
   `long`); `toReal` is correctly rounded, takes decimal only, and refuses white space, `nan`, `inf`,
   hexadecimal and a value too large to be finite. A refusal is `None`, never a trap.
+- Settled 2026-11-04: the core library follows the reference language's library in names and
+  behaviour unless it genuinely improves on it. `Option` has `isDefined`, `isEmpty` and `nonEmpty`
+  (not `isSome`/`isNone`), `get` (trapping on `None`) and `filterNot`; there is no `orNull`, since
+  there is no null. `char` has `isDigit`, `isLetter`, `isLetterOrDigit`, `isWhitespace`,
+  `isSpaceChar`, `isUpper`, `isLower`, `isControl`, `toUpper`, `toLower` and `asDigit`, classifying
+  by the Unicode Character Database. `isWhitespace` is true for the space separators except the
+  non-breaking ones (U+00A0, U+2007, U+202F) and for U+0009 to U+000D and U+001C to U+001F, so it
+  differs from `trim`'s `White_Space`; `isSpaceChar` is the categories `Zs`, `Zl` and `Zp`.
+  `asDigit` is the digit's value in radix 36 (Unicode decimal digits give their value, ASCII and
+  fullwidth letters give 10 to 35) and is -1 for any other character, never a trap.
 - A generic overload is compared by the same rule as any other: `f(x: int)` is more specific than
   `f[T](x: T)`, which accepts an `int` while `f(int)` does not accept a `T`.
 - Whether a parameter is by-name does not distinguish overloads. An argument some candidate takes by
@@ -269,11 +314,22 @@ a decision changes, this page and the chapter change together.
 - A `for` with `yield` is comprehension sugar over `map`, `flatMap` and filtering; a `for` without
   `yield` loops over the source's iterator.
 - The collection hierarchy is rooted at `Iterable`, and `Iterator` is itself `Iterable`.
-- `print` is an ordinary library function. It renders with `Display`, separates its arguments with
-  `, ` and ends with a newline. `print(debug(x))` selects `Debug`.
+- `print` and `println` are ordinary library functions (settled 2026-11-04). Both render with `Display` and
+  separate several arguments with `, `, which is not a tuple; `println` ends with a newline and `print`
+  does not. `print()` writes nothing and `println()` writes a bare newline; `eprint` and `eprintln` are
+  the same for standard error. `println(debug(x))` selects `Debug`.
 - `debug(x)` yields `x`'s `Debug` form as a string. `Writer` writes strings (with `writeChar`,
   `writeInt`, `writeField` and `writeSpaces` beside `write`); `FormatSpec` is `width`, `precision`
   and `left`; `toString()` is a default body of `Display`.
+- Settled 2026-11-04 (user): a value of `Any` or of any trait is shown by the type it has at run time.
+  `Any` and every trait meet `Display` and `Debug` whatever they declare, as every type meets `Eq`:
+  such a value meets those bounds, has `display`, `debug` and `toString()` and is interpolated, and
+  renders through its own type's implementation, found through its type record, so `Seq[int]` prints
+  as the vector it holds. It does not convert to `Display` or `Debug` as a value, so a value of either
+  trait holds only objects that implement it, and is still shown through its method table. A type with no implementation of its own renders as its name (`Cat`,
+  `Box[int]`; a function value `<function>`), never an address. Static types keep their rule: a
+  class or data type needs its own `Display`, a type parameter its bound's. A trait takes no impl of
+  `Display` or `Debug`: its values are shown by their own types, which keeps one rule.
 - A built-in type conforms to a trait through an impl and implements every method of the trait,
   since a trait's default bodies are shared by objects and a built-in value is not one.
 - A variant's fields take defaults, each a function of the fields before it, as a constructor's
@@ -282,6 +338,17 @@ a decision changes, this page and the chapter change together.
 - An interpolated string is a method call on `StringContext`: `p"a $x b"` is
   `StringContext(["a ", " b"]).p(x)`. `s`, `f` and `raw` are library methods, and a program defines
   its own interpolator by implementing a trait for `StringContext`.
+- A user-defined interpolator is visible where it is imported (settled by the user, 2026-11-04): in
+  the module that declares it, in a file importing that module whole, and in a file importing one of
+  its declarations by name. `s`, `f` and `raw` need no import. A module that merely imports another
+  does not pass its interpolators on, and using one that is not in scope is an error naming the
+  module to import.
+- Interpolated literals follow Scala's lexing (settled 2026-11-04). A backslash and a `"` or
+  `\` after it are skipped as a pair, so `raw"a\"b"` holds `a\"b`, `raw"a\"` is unterminated and
+  `raw"a\\"` ends, holding two backslashes; `$"` is a double quote and `$$` a dollar sign in every interpolator. The lexer reads
+  no escape: a part reaches `StringContext` as written, and only `s` and `f` process escapes, so
+  `p"\d"` is fine and `s"\d"` is an error. A backslash is otherwise an ordinary character
+  (`raw"C:\dir"`, `\$name` still interpolates).
 - Nested helper functions see their enclosing scope. Closures are full closures, and `return` inside a
   lambda is local to the lambda.
 - `match` is a value-producing expression with full destructuring.
@@ -558,6 +625,31 @@ Settled by the user on 2026-11-03:
 
 Settled by the user on 2026-11-04:
 
+- **`From[E]` is one generic trait, implemented once per source error type** by the type the
+  errors convert to: `impl From[IoError] for ConfigError` beside `impl From[ParseError] for
+  ConfigError`. A type may implement one generic trait at several type arguments where the trait's
+  members are all static and it requires no other trait, as `From`'s one member,
+  `static from(value: E) -> Self`, is; any other trait is implemented once. `?` on a `Result[U, E]`
+  in a function yielding `Result[T, F]` passes the error on unchanged where `E` is an `F`, and
+  otherwise through `F.from`: at `From[E]`, or else at the one conformance `From[X]` with `E` an `X`
+  that is more specific than every other such. Neither is an error naming `From[E]`; several equally
+  specific ones are an error naming them. On a type parameter the conformances are its bounds',
+  `F: From[IoError] + From[ParseError]`. See [errors](/spec/errors/) and
+  [declarations](/spec/declarations/#impl).
+- **One formatting style, applied by `avin fmt [--check] [<path>...]` and the language server's
+  `textDocument/formatting`.** Each block level is indented two spaces; a literate file keeps its
+  four-column code-block margin and indents two a level inside it, and only its program is
+  formatted. Spaces go around binary operators (ranges included, `0 ..< n`), `=` and `->`, after
+  `,` and `:`, and nowhere inside brackets; a prefix operator stays against its operand. At most
+  one blank line in a row, none at either end of the file, and one between two top-level
+  declarations unless both are one line; a declaration's comments and annotations stay with it.
+  Comments are kept exactly, a trailing one a space after the code. A line longer than 120
+  characters has a list broken one item per line, a call's or a literal's items two columns in and
+  a parameter list's four, the closing bracket on its own line; a list the source wrote one item
+  per line stays so; a binding's value with no list to break is broken before its loosest operators
+  as continuation lines. No trailing commas are added. The formatter keeps every token and
+  refuses a file that does not parse; its result parses to the same syntax tree.
+
 - **`compareAndSet` on a value without identity** — a data value, tuple, string, `Option` or `Any` —
   **compares with `==`; on scalars and references it compares the word.** A class instance (even of
   a class that derives `Eq`) and a function value keep identity. See
@@ -758,6 +850,39 @@ Settled by the user on 2026-11-04:
   call binds at the level of `a max b`. See [methods named by
   symbols](/spec/operators-and-control-flow/#methods-named-by-symbols).
 
+- **The shifts `<<` and `>>` are free method names on the same terms as `&`, `^` and `|`** (user,
+  2026-11-04), so a parser combinator library can spell sequencing-then-map `p >> f`. On every type
+  but the integers and bytes, `a << b` and `a >> b` call the methods of those names, at the shifts'
+  own level, that of multiplication (`a ++ b >> f` is `a ++ (b >> f)`, `a >> f | b` is
+  `(a >> f) | b`); `x <<= y` calls `<<=` where the type has one and is otherwise `x = x << y`. The
+  integers' and bytes' shifts stay the machine's and cannot be redefined, by an extension either,
+  and the yielding forms `<<:=` and `>>:=` stay reserved. Avin has no `>>>` operator, so `>>>` was
+  already a free name. This amends the rule above. See [methods named by
+  symbols](/spec/operators-and-control-flow/#methods-named-by-symbols).
+
+- **The arithmetic operators `+ - * / %` and the orderings `< <= > >=` are free method names on
+  data types, classes and traits, with any operand and result types** (user, 2026-11-04), beside
+  the operator traits, which stay for generic code: `Instant + Duration -> Instant`,
+  `Instant - Instant -> Duration`, `Vec * real`. Such methods overload by the operand's type like
+  any other. `a + b` calls `a`'s method `+` where `a`'s type (a data type, a class, or a type
+  parameter through its bounds) has one taking one argument, at the built-in operator's own
+  precedence; where it has none, the operator is the core trait's (`Add`'s `add`), as before. The
+  method is just a method: on a type with both, the operator calls the method and code bounded by
+  `Add` calls `add`. Prefix `-a` calls a method `-` taking no argument (`-() -> Vec`), and otherwise
+  is `Neg`'s `negate`. `a < b` alone calls the method `<`, whatever it yields; a comparison by a
+  method does not chain, and `a < b < c` through one is an error saying to join the comparisons with
+  `&&`. `x += y` calls `+=` where the type has one and is otherwise `x = x + y`, the method `+`
+  included. The built-in types keep their operators: a method of one of these names on `int`,
+  `real`, `byte`, `char`, `string`, `bool` or a tuple, by an extension or a trait implementation, is
+  an error. `==` and `!=` stay `Eq`'s, and the wrapping, saturating and yielding forms stay
+  reserved. `avin.time` spells its reading arithmetic with them. This amends the two rules above.
+  See [methods named by symbols](/spec/operators-and-control-flow/#methods-named-by-symbols).
+
+- **`not` is a soft keyword: a keyword only directly after `is`** (user, 2026-11-04), so the parsing
+  library can name its negative lookahead `not(p)`. After `is` it is always the keyword, so `x is
+  not(y)` negates the pattern `(y)`; everywhere else it is an ordinary name, and a function, method,
+  parameter or local may be called `not`. See [is](/spec/operators-and-control-flow/#is).
+
 - **A method named by a symbol with `~` anywhere in its name binds at the tightest symbol level**,
   whatever its first character: `~`, `~>`, `<~`, `~!`, `<~>` and `^~` bind together there and group
   left, so `num | symbol("(") ~> expr <~ symbol(")")` is `num | ((symbol("(") ~> expr) <~
@@ -811,6 +936,46 @@ Settled by the user on 2026-11-04:
     allowed.
   - Every type parameter of a generic deriving type is bounded by the derived trait.
 
+- Packages beyond the manifest, settled by the user (2026-11-04) as proposed:
+  - **Features** ([features](/spec/packages/#features)), Sysl's model with the module as the unit
+    gated: a feature block has `doc`, `default`, `modules`, `enables` and `requires`, and
+    `name = [x]` is its short form; optional dependencies, `"dep:x"`, `"dep/feature"`, users'
+    `features`, `default_features = false` and `-x`, unification by union and the
+    `--features`/`--no-default-features`/`--all-features` flags are Sysl's. Where Sysl gates lines
+    with `#if feature_x`, Avin has no conditional compilation: a feature lists whole **modules**
+    (with those under them), read only while it is on, and an import of a gated module or of an
+    optional dependency's module is allowed only from a module whose own gate implies it, checked
+    against the manifest whatever is selected, so features are additive by construction. `avin test`,
+    `avin check`, the language server and `avin tidy` turn every feature on. Not carried over: Sysl's
+    `choices`, a feature's `if` and `targets`, and options, which are about machines and C
+    configuration Avin's manifest does not describe.
+  - **Members of a repository** ([members](/spec/packages/#members-of-a-repository)), Sysl's:
+    `{ git, member = "dir", version | rev }`, the member a package named `<coordinate>//<dir>` for
+    selection and `avin.sum`, every member at one version one clone whose hash each member's line
+    carries, a fetched member's `workspace = true` and in-repository `path` siblings read as their
+    own coordinates at the member's version, and `avin add <coordinate>//<dir>@<version>`. Its modules
+    keep their own names, as every dependency's do, so Avin needs no `package.repository` key.
+  - **Vendoring** ([vendoring](/spec/packages/#vendoring)), Sysl's: `avin vendor` copies the
+    resolution with every feature on into `vendor/` at the project (workspace) root in the cache's
+    layout, each copy hashed against its `avin.sum` line first, `.git` and path dependencies left out;
+    a `vendor/` present is the cache, and the root's `vendor/` is never a module. Two choices of
+    Avin's own: a package missing from `vendor/` is **refused** rather than fetched into it, so a
+    vendored build never touches the network; and `avin vendor` **removes** packages the resolution
+    no longer reads, as `avin tidy` does for lines.
+  - **The standard library's modules** ([standard library](/spec/packages/#the-standard-library-s-modules)):
+    the `avin` tree shipped with the compiler (`share/avin/library`, or `AVIN_ROOT/library`),
+    versioned with it, never a dependency and never in `avin.sum`; `avin` is the prelude, seen
+    without an import, and every module under it is imported by name like any module. A
+    compilation reads the prelude and then only the library modules something imports,
+    transitively, so the library can grow without every program parsing all of it. Domain libraries
+    are packages (as settled for `dev.avinlang`). The standard library has no features.
+- **Integer limits and narrowing** (user, 2026-11-04). `MinValue` and `MaxValue` on every integer type
+  (`int.MaxValue`, `long.MinValue`, `i8.MaxValue`, any `iN`), on `byte` and on `char`, and on `real`
+  `MaxValue`, `MinValue`, `MinPositiveValue`, `PositiveInfinity`, `NegativeInfinity` and `NaN`, all
+  compile-time constants. Narrowing integer conversions (`i8(x)`, `int(l)`, `T(n)`, and a byte or char to
+  a narrower integer) trap when the value does not fit; real-to-integer still saturates. The wrapping
+  form, `i8.wrap(x)` (spelling proposed below), keeps the low bits. Not yet: the limits of a type parameter bounded by `Integer` (`T.MaxValue`).
+
 **Deferred**
 
 - Public C interoperability. Until then, C is reached through Sysl.
@@ -818,6 +983,29 @@ Settled by the user on 2026-11-04:
 - Async and await.
 
 ## Proposed
+
+- Nested data types ([generics](/spec/generics/#polymorphic-recursion)): a data type naming itself
+  at a larger instance in its fields (`Deeper(inner: Tree[Nest[T]])` in `Tree[T]`) is rejected at
+  the type as polymorphic recursion, even where no code compares, hashes or shows it, since every
+  data type's structural equality, hash and `Display` would need a copy for every depth. A class
+  naming itself so in a field is not rejected for that alone; only code that grows with it is.
+- Which growth counts ([generics](/spec/generics/#polymorphic-recursion)): growth is measured as
+  nesting depth, and a cycle is rejected when a round of it nests its type arguments deeper in
+  total. A call through a bound on a value of a type parameter takes that type's arguments apart
+  (a `Box[U]` reaching `Box`'s method at `U` is one level less); an implementation reached through
+  a method table whose static type names every type parameter of the receiver's class (an
+  `Iterator[(A, int)]` for an `IndexedIterator[A]`) takes them apart from the receiver's, while one
+  reached through a trait that leaves some unnamed (a trait with no type parameters) continues the
+  cycle from wherever the class's larger instance was made.
+- Trait fields ([declarations](/spec/declarations/#trait)): a trait's field declares its type, since
+  each conforming class's layout and the trait's `val` are known before any body is checked; it is
+  public, as every member of a trait is, and is never `lazy`. A class never overrides a trait's
+  field, `val` or `var`: declaring a field of its name is an error rather than an override. A trait
+  never redeclares, with a value, a `val` of a trait it requires.
+- The wrapping conversion is spelled `i8.wrap(x)`, as the wrapping operators are spelled `+%`: the
+  integer type's name, `.wrap`, one operand, any integer target (a bounded type parameter included,
+  `T.wrap(n)`). The core library needs it to test whether a value fits a narrower width (the formatter
+  converts a generic integer to `long` and back). Awaiting the user.
 
 - Literal shapes ([collections](/spec/collections/#literals)): each of the library's collections is
   built only by the literal of its own shape: every `Seq` by `[a, b]`, `Set`, `TreeSet` and the
@@ -844,9 +1032,33 @@ Settled by the user on 2026-11-04:
     leading zeros. A manifest is optional: a directory or file with none above it is a program as
     before.
   - **Dependencies**: `{ git = "host/owner/name", version = "x.y.z" }` read at the tag `vx.y.z`
-    and cloned from `https://`; `{ path = "../dir" }`, relative to the manifest naming it and refused
-    in a fetched package; `{ workspace = true }`. A coordinate with `https://` or `.git` is refused.
-    No `rev` pins, features or members of a repository yet.
+    and cloned from `https://`; `{ path = "../dir" }`, relative to the manifest naming it, and in a
+    fetched package naming another package of its repository at its version (refused when it leaves
+    the repository); `{ workspace = true }`. A coordinate with `https://` or `.git` is refused.
+    Features and members of a repository are settled above.
+  - **Members, as built**: a fetched package's in-repository `path` and `workspace = true`
+    dependencies are read as the repository's own packages at its version whether the package is a
+    member or the repository's root package, since the root of a workspace with a `package` block is
+    its first member. A member's directory may hold no `.`, `..` or `*`. The clone is filed once per
+    repository and version; a repository whose root has no manifest is still filed when a member of
+    it is what was asked for.
+  - **Vendoring, as built**: `avin tidy` and `avin add` read the machine's cache, fetching into it,
+    whether or not the project has a `vendor/`, so a dependency is added to a vendored project and
+    then copied in by `avin vendor`. `avin vendor` checks every cache copy before writing anything, so
+    a refusal leaves `vendor/` as it was (and a project with none still has none); a vendored copy is
+    left alone only when its recorded hash and its files both match its line, so an edited copy is
+    replaced; directories left empty by a removal are removed; and it ends `vendored N packages into
+    vendor/`, the packages being `avin.sum`'s lines (a member and its repository's root package at
+    one version are two packages and one copy). The cache's `.hash` beside a vendored entry is trusted
+    by a build, as the cache's is: a build does not re-hash `vendor/`.
+  - **`rev` pins**: `{ git = "…", rev = "<hex>" }`, seven to forty lowercase hexadecimal digits,
+    refused with a `version` or without `git`. The repository is cloned whole and the commit
+    resolved to its full id, fetched by that id when no branch or tag reaches it (only a full id
+    can); the cache entry is `@r<full id>` and the `avin.sum` line `<coordinate> r<full id>
+    sha256:…`, so an abbreviation and the full id are one package. A cached commit an abbreviation
+    begins is found without the network. A package pinned at two commits, or at a commit and a
+    release, anywhere in the graph is refused naming both: a commit is not chosen among, since
+    none is higher. `avin add <coordinate>@<rev>` writes the full id.
   - **What a dependency brings in**: its modules, under their own names; not its root directory's
     files (its `main`) nor its `tests` directory, so a program can be depended on and `avin test`
     runs only the package's own tests. One module in two packages is refused. A directory holding its
@@ -965,15 +1177,24 @@ Settled by the user on 2026-11-04:
   all. `==` between two sequence types needs the same element type on both sides (a `Vector[int]`
   and a `List[string]` are a compile-time error, as any two types with no common type are); a
   value typed as `Seq[T]` compares with any sequence. A class that implements `Eq` itself keeps its
-  own equality between two of its instances. Through `Any` the values' own types still decide, so
-  a vector and a list held as `Any` are unequal. The mutable `Array`, `Buffer` and `Deque` compare
+  own equality between two of its instances. Settled (user, 2026-11-04): through `Any` and
+  trait-typed values sequences of equal elements in order are equal whatever their class, with
+  hashes that agree (`val a: Any = [1, 2]; a == List(1, 2)` is `true`); the elements are compared
+  as `Any` values are, so `[1] == ["a"]` held as `Any` is `false`. An `Array` is a `Seq` here and
+  compares by contents, as it already did. The mutable `Array`, `Buffer` and `Deque` compare
   as they are when the comparison runs, so a hash held across a change is stale, as it was before.
-- Ranges of other integer types as values (`Range[long]`, `Range[i16]`) are not decided. The
-  endpoint type would be an `[T: Integer]` parameter, but the count of a range of `long`s or of
-  `i8`s needs a type wider than `T`, a `Seq[T]`'s `length()` is an `int` that a `long` range can
-  exceed (trapping, as `int.min .. int.max` does), and a bare `Range` written in signatures means
-  the `int` range today. `for` over a range written in place already counts any integer type.
-  Awaiting the user's choice of how `Range` is spelled and what type its `by` step has.
+- **Ranges of other integer types are `NumericRange[T: Integer]`** (settled, user, 2026-11-04).
+  `Range` stays the `int` range, and a bare `Range` in a signature means it. `a..b` and `a..<b`
+  written as values make a `NumericRange[T]` where the bounds are integers of any type other than
+  `int` (`long`, `i8`, `i16`, …); an integer literal bound takes its type from the other bound, and
+  bounds of two types are an error. `by` takes a step of the same type, `T`. It is a `Seq[T]`
+  with the `Range` rules: a zero step traps, a range is empty when its start lies past its limit in
+  the step's direction, and iteration stops without stepping past the limit, so it never passes
+  either end of `T`. `get`, `apply`, `head`, `contains` and `isEmpty` are answered from the bounds
+  and never wrap, at any width; `length()` traps beyond `int`, and `last()` and the other
+  questions that count the values trap for a range whose ends are more than the largest `long`
+  apart (the smallest `long` to the largest), which only a range of `long`s can be. `for` over a range
+  written in place already counted any integer type, and still does.
 - Value definitions in a `for` with `yield` ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
   `pattern = value` after a generator, each with its own `if` guards, written with no `val`, and
   never first. It is evaluated once per element that reaches it and binds in what follows. Where no
@@ -1010,7 +1231,7 @@ Settled by the user on 2026-11-04:
   `readAll() -> string`, sharing one runtime-held buffer. A line ends at `\n` with a `\r` before it
   trimmed; the last line needs no terminator. Ill-formed UTF-8 becomes U+FFFD and a failed read ends
   the input, so reading standard input answers no `IoError`, where `fs.readText` answers
-  `InvalidUtf8`. `eprint(x)` mirrors `print` on standard error and is in the prelude with
+  `InvalidUtf8`. `eprintln(x)` mirrors `println` on standard error and is in the prelude with
   `StandardError`, an unbuffered `Writer`; every write to standard error flushes standard output
   first. A test run by `avin test` reads empty input.
 - Running and testing (stage 10): `avin run <program> [-O0 | -O2] [-- args]` builds into
@@ -1077,18 +1298,107 @@ Settled by the user on 2026-11-04:
 - A collection added to itself ([collections](/spec/collections/#buffer)): `b.addAll(b)` and
   `b ++= b` on a `Buffer` or a `Deque` append the elements it held when the call began, once, and
   `s --= s` on a mutable `Set` empties it.
-- [`avin.time`](/spec/system-library/#avintime): `Duration`, `Instant` (monotonic) and `WallTime`
+- [`avin.time`](/spec/system-library/#avin-time): `Duration`, `Instant` (monotonic) and `WallTime`
   (wall clock, a `Duration` since the 1970 epoch) are data types counting whole microseconds in a
   `long`, overflow trapping; the two clocks are distinct types so their readings never mix. A
-  duration implements `Add`, `Sub`, `Neg`; an instant combines with a duration through `plus`,
-  `minus` and `since`, because an operator trait takes and yields the implementing type alone. The
+  duration implements `Add`, `Sub`, `Neg`, and scales by a `long` with its methods `*` and `/`; a
+  reading combines with a duration through its methods `+` and `-`, and two readings of one clock
+  through `-` (or `since`), which yields their `Duration`. The
   text forms are a duration's largest-unit form (`1.5ms`) and an ISO 8601 UTC timestamp. Sleeping
   and calendar fields beyond the timestamp text are not part of it yet.
+- Bindings to Sysl packages ([packages](/spec/packages/#sysl-dependencies),
+  [bindings](/spec/sysl-bindings/#sysl-packages)): a manifest names the Sysl packages its bindings
+  reach in a block of its own, `sysl-dependencies`, beside `dependencies`, each entry written as an
+  Avin dependency is (`git` with `version` or `rev`, or `path`; never `workspace`). The block is
+  separate because Sysl, not Avin, resolves, fetches and verifies those packages: they are not
+  Avin packages, so they take no part in Avin's version selection, `avin.sum`, `avin add` or
+  `avin tidy`. The shim package's manifest lists every Sysl dependency of every package in the
+  program, so a library's bindings build in any program that uses it; one name at two releases of
+  one coordinate takes the higher, and one name with any other two origins is refused naming both.
+  A fetched package may not name a Sysl directory. The shim archive and the cached executable are
+  keyed by these entries and by the sources of each Sysl package named by directory. Sysl's other
+  dependency keys (`mount`, `features`, `options`) are not offered yet.
+- The rest of the system library ([system library](/spec/system-library/)), each module following
+  the reference standard library's names and shapes where Avin's rules allow:
+  - **[The environment and the platform](/spec/system-library/#the-environment-and-the-platform)**
+    are functions of `avin.process`, beside `env`, not a module of their own: `environment()` as a
+    `Map`, `currentDir`, `homeDir`, `executable`, `processors`, `pid` and `os()`. There is no
+    property store and nothing sets a variable; a child's variables are set on its command. Bindings:
+    `sysl.fs.current_dir` and `home_dir`, `sysl.env.current_exe`, `sysl.process.pid` (a `u32`, which
+    fits a `long`), `sysl.os` through a mirror of `sysl.Os`, and the runtime's processor count.
+    `environment()` needs `sysl.env.vars`, which answers a `Buf` of pairs: it waits for tuples as a
+    boundary type, a stage-7 addition.
+  - **[Commands](/spec/system-library/#commands)** in `avin.process`: a `Command` value, combined
+    with `|` (a pipeline), `andThen`, `orElse` and `followedBy`, redirected with `toFile`,
+    `appendTo`, `fromFile` and `withInput`, and run by `run()` (the exit status), `output()` (the
+    text, any status but success an `Err`), `lines()` (an iterator as output arrives) and `start()`
+    (a `Child`). Importing the module adds `run()` and `output()` to `string`. **Operators Avin cannot
+    define**: postfix `!` and `!!` (no method is called postfix, and `!` is the language's), and
+    anything spelled with `#` (not an operator character), so `#|` is `|`, and `#&&`, `#||`, `###`,
+    `#>`, `#>>` and `#<` are words; `run()` is the status, where the reference's `run()` starts the
+    process, which here is `start()`. Bindings: `sysl.process.run`, `capture`, `start`, `spawn` and
+    `pipe`, with mirrors of `Status`, `Output` and `Var`. **Blocked on stage-7 opaque handles**:
+    `Stdio` carries a `sysl.fs.File`, and `Child` and `Spawned` are live processes.
+  - **[`Source`](/spec/system-library/#source)** in `avin.io`: `fromFile` (read whole, every failure
+    up front), `fromString`, `stdin()`, and `lines()`, `chars()` and `readAll()`, each consuming. The
+    reference's `getLines` and `mkString` are `lines` and `readAll`, the names `avin.io` already uses.
+    No new binding: it is written over `fs.readText` and standard input's buffer. Not blocked.
+  - **[`avin.random`](/spec/system-library/#avin-random)**: a `Random` class (`Random(seed)`
+    reproducible, `Random()` seeded by the platform) with `nextInt`, `nextLong`, bounded forms,
+    `between`, `nextReal`, `nextBoolean`, `nextGaussian`, `nextBytes`, `alphanumeric`, `shuffle` and
+    `setSeed`; the companion's methods use one shared, locked generator. PCG32, written in Avin with
+    the wrapping operators, so a seed gives the same sequence everywhere. Binding: one runtime
+    function for the platform's seed over `sysl.posix.rand.seed_from_os`, since its `u64` does not
+    fit a `long` at the boundary. `nextGaussian` needs a square root and a logarithm on `real`, which
+    Avin does not have yet. Not blocked on opaque handles.
+  - **[`avin.net`](/spec/system-library/#avin-net)**: `TcpStream` and `TcpListener`; `Url`, parsed
+    and percent-encoded, written in Avin; an HTTP/1.1 client (`get`, `post`, `send` with a `Request`)
+    written in Avin over the TCP stream, a status never an error. `IoError` gains
+    `ConnectionRefused`, `ConnectionReset` and `TimedOut`. Bindings: `sysl.net.resolve`, `socket`
+    and the `Socket` methods. **TCP is blocked on stage-7 opaque handles** (a `Socket`, and the
+    `Address` it connects to, are not boundary types); `Url` is not blocked. **`https` is blocked on
+    bindings to Sysl packages other than the standard library**, since TLS lives in a package of its
+    own.
+  - **[Concurrency](/spec/system-library/#concurrency)** stays in `avin.threads`; there is no
+    separate concurrency module. The reference's futures map onto what is there (`successful`, `all`
+    for `sequence`, `first` for `firstCompletedOf`, `await` for waiting with a time limit); added are
+    `Future.traverse`, `mapErr` and `orElse` on a future of a `Result` (its `recover` and
+    `fallbackTo`), an `Executor` for pools of one's own (its execution context, chosen explicitly),
+    `threads.blocking(body)` and `threads.sleep(d)`. There is no `failed` or `filter`, since a future
+    carries no failure. Bindings: none beyond a runtime timed wait for `sleep`. Not blocked.
+  - **JSON** is a package of its own, not part of the system library.
+- [`avin.regex`](/spec/regex/): the pattern language and its matching follow the established
+  backtracking dialect exactly: leftmost-first alternation, greedy, reluctant and possessive
+  repetition, atomic groups, bounded lookbehind (a repetition without an upper bound in one is an
+  error), and the same rules for what a repeated group captures; `\d`, `\s`, `\w`, `\b` and the
+  POSIX classes are ASCII, and `i` folds only ASCII without `u`. Matching walks characters (scalar
+  values); every offset in the API is a byte offset, and a `PatternError`'s index counts the
+  pattern's characters. There is no null: `group(i)`, `group(name)`, `before(i)`, `after(i)` answer
+  `Option[string]`, `subgroups()` a `List[Option[string]]`, and `start(i)`/`end(i)` -1 for a group
+  that took no part. Members without arguments are methods (`"a+".r()`, `m.start()`). `Regex(p)`
+  traps on an invalid pattern with the error's message and `Regex.compile(p)` answers a
+  `Result[Regex, PatternError]`; a group number or name the match does not have traps. Properties
+  needing Unicode data beyond the general category (scripts, blocks, `Alphabetic`, `Uppercase`,
+  `Lowercase`, `Ideographic`, `Word`, emoji), the flags `U` and `c`, `\X`, `\b{g}` and `\N{…}` are
+  refused with an `Unsupported` error until the runtime holds that data.
 
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
   over a `Map` yields when its values are not pairs (it needs `Iterable`'s own transformations).
+
+- Packages, where Sysl's choice does not transfer ([packages](/spec/packages/)):
+  - Whether a feature needs anything finer than a module: a compile-time `feature("x")` constant a
+    function could test (folded away when false), or nothing, the module being the only gate.
+  - Whether a module may be listed by more than one feature (on while any is on), or by one only, as
+    proposed.
+  - Whether a build should re-hash `vendor/` on every run, catching a hand edit to a committed
+    vendored package, or trust the hash recorded beside each package as it trusts the cache's.
+  - Whether a manifest names the oldest compiler it builds with (`package.avin = "0.x.y"`), since
+    the standard library's modules arrive with the compiler and a package using a new one fails on an
+    older compiler with "no module" rather than a version message.
+  - Whether manifests gain machine conditions (Sysl's `if`, `choices`, `targets`) once Avin builds
+    for more than one target.
 
 - Resource cleanup: a `defer` construct or a library `use`.
 - How actors work: how messages are declared and sent, mailboxes and replies, how actors are

@@ -51,15 +51,34 @@ type differs:
 ```text
 data ConfigError
     Unreadable(cause: IoError)
+    Malformed(cause: ParseError)
     Invalid(key: string)
 
 impl From[IoError] for ConfigError
-    from(e: IoError) -> ConfigError = Unreadable(e)
+    static from(value: IoError) -> ConfigError = Unreadable(value)
+
+impl From[ParseError] for ConfigError
+    static from(value: ParseError) -> ConfigError = Malformed(value)
 
 loadConfig(path: string) -> Result[Config, ConfigError]
     val text = readText(path)?
-    parseConfig(text)
+    val doc = parseDocument(text)?
+    configOf(doc)
 ```
+
+`From[E]` is a core trait with one static member, `static from(value: E) -> Self`, so an error type
+implements it once for each error it wraps. On `Err(e)`, with `e` of type `E` and the enclosing
+function yielding errors of `F`:
+
+- **Where `E` is an `F`**, `e` is passed on unchanged.
+- **Otherwise `F.from(e)`** makes the error passed on, through `F`'s conformance to `From[E]`. Where
+  `F` has none, a conformance `From[X]` with `E` an `X` serves, if exactly one is more specific
+  than every other: an error of a subclass converts through its superclass's.
+- **No conformance is an error** naming the one missing, `From[E]`; several equally specific are an
+  error naming them.
+- **A type parameter converts through its bounds**: in
+  `load[F: From[IoError] + From[ParseError]](path: string) -> Result[Doc, F]`, both errors convert,
+  and each instance calls its type argument's `from`.
 
 An `Option` `?` cannot exit a function returning `Result`, and the enclosing function's result type
 must be able to carry the failure.
@@ -87,7 +106,7 @@ Their methods:
 
 | `Option[T]` | `Result[T, E]` |
 |---|---|
-| `isSome()`, `isNone()` | `isOk()`, `isErr()` |
+| `isDefined()`, `isEmpty()` | `isOk()`, `isErr()` |
 | `getOrElse(default: -> T) -> T` | `getOrElse(default: -> T) -> T` |
 | `orElse(other: -> Option[T]) -> Option[T]` | `ok() -> Option[T]`, `err() -> Option[E]` |
 | `map[U](f: (T) -> U) -> Option[U]` | `map[U](f: (T) -> U) -> Result[U, E]` |
@@ -100,6 +119,11 @@ Their methods:
 | `contains(x: T) -> bool` | `orElse[F](f: (E) -> Result[T, F]) -> Result[T, F]` |
 | `toList() -> List[T]`, `toVector() -> Vector[T]` | `toList() -> List[T]` |
 | `zip[U](other: Option[U]) -> Option[(T, U)]` | |
+| `get() -> T`, trapping on `None` | |
+| `filterNot(p: (T) -> bool) -> Option[T]` | |
+
+An `Option[Option[T]]` also has `flatten()`, and an `Option` has `nonEmpty()` beside `isDefined()` and
+`isEmpty()`. There is no `orNull`, since Avin has no null.
 
 `exists` is false and `forall` true for `None` and for `Err`, which hold no value. `toList` and
 `toVector` give one element or none.

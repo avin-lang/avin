@@ -20,10 +20,10 @@ import avin.process
 main()
     val files = process.args()
     if files.isEmpty()
-        print(s"usage: ${process.programName()} FILE...")
+        println(s"usage: ${process.programName()} FILE...")
         process.exit(2)
     val home = process.env("HOME").getOrElse("/")
-    for f in files do print(s"$home: $f")
+    for f in files do println(s"$home: $f")
 ```
 
 | Function | Meaning |
@@ -40,7 +40,7 @@ remain available everywhere.
 
 ```text
 main(args: Vector[string]) -> int
-    for f in args do print(f)
+    for f in args do println(f)
     0
 ```
 
@@ -62,10 +62,98 @@ by an argument of its own, which the test does not see: in a test, `args()` is e
 `avin run <program> -- ARGS` passes everything after `--` to the program unchanged, flags and a
 second `--` included.
 
+### The environment and the platform
+
+**Proposed.** What a program asks about where it runs is a function of `avin.process`, beside `env`;
+there is no module for the environment alone and no store of properties. Each fact the platform
+knows is asked for by name, and a program's own settings are its own values.
+
+| Function | Meaning |
+| --- | --- |
+| `environment() -> Map[string, string]` | Every environment variable and its value, read when called. A variable set to nothing is there with `""`. |
+| `currentDir() -> Result[string, IoError]` | The directory relative paths are read from. |
+| `homeDir() -> Option[string]` | The user's home directory, `None` where the platform names none. |
+| `executable() -> Option[string]` | The absolute path of the running program's file, where the platform can tell. |
+| `processors() -> int` | How many processors the program may run on: the number the futures' pool grows to. |
+| `pid() -> long` | The process's identifier. |
+| `os() -> Os` | The operating system the program was compiled for: `MacOS`, `Linux`, `Windows`, `Android`, `Wasi` or `Freestanding`. |
+
+**Nothing sets a variable.** The environment is the program's to read; a program that runs another
+gives it the variables it needs through its [command](#commands), which changes nothing in its own.
+Text ends lines with `\n` on every platform, so there is no line separator to ask for.
+
+### Commands
+
+**Proposed.** A `Command` is another program to run: a program and its arguments, the directory and
+variables it runs with and where its streams go, made first and run when asked. Commands combine into
+pipelines and sequences, and what combines is again a command.
+
+```text
+import avin.process.{Command, CommandError}
+
+sources(dir: string) -> Result[Vector[string], CommandError]
+    val listing = Command("ls", dir) | Command("grep", "\\.avin$")
+    Ok(listing.output()?.lines())
+
+main() -> int
+    "make test".run() match
+        Ok(status) if status.isSuccess() -> 0
+        _ -> 1
+```
+
+| Making | Meaning |
+| --- | --- |
+| `Command(program: string, args: string*)` | One program and its arguments, each passed as it is: no shell reads them. A program without a `/` is looked for on `PATH`. |
+| `Command.parse(line: string)` | The line split at runs of white space, the first word the program; no quoting and no shell. A line with no word traps. |
+| `c.inDir(dir: string)` | The same command, run in `dir`. |
+| `c.withEnv(name: string, value: string)` | The same command, with the variable set for it; the rest of the program's environment is passed on. |
+| `c.withTimeout(d: Duration)` | The same command, stopped when it has run for `d`; its status is then `TimedOut`. |
+| `c.toFile(file: string)`, `c.appendTo(file: string)` | The same command, its standard output written to the file, emptied first or added to. |
+| `c.fromFile(file: string)`, `c.withInput(text: string)` | The same command, reading the file, or the text, as its standard input. |
+| `a andThen b` | `a`, then `b` only where `a` succeeded; the status is the last one run. |
+| `a orElse b` | `a`, then `b` only where `a` did not succeed. |
+| `a followedBy b` | `a`, then `b` whatever `a`'s status. |
+
+**`a | b` is a pipeline**: `a`'s standard output is `b`'s standard input, the two running at once,
+and its status is `b`'s.
+
+| Running | Meaning |
+| --- | --- |
+| `c.run() -> Result[ExitStatus, IoError]` | Runs the command with the program's own streams, waits, and answers how it ended. A status other than success is a value, not a failure. |
+| `c.output() -> Result[string, CommandError]` | Runs it with its standard output captured as text and standard error the program's own; any status but success is `Failed(status)`. |
+| `c.lines() -> Result[Iterator[string], IoError]` | Starts it and answers its standard output's lines as they arrive, by the rule [standard input](#standard-input) reads lines by. Its status is not checked. |
+| `c.start() -> Result[Child, IoError]` | Starts it and answers at once. A `Child` has `waitFor() -> Result[ExitStatus, IoError]`, `isAlive()` and `kill()`. |
+
+```text
+data ExitStatus
+    Exited(code: int)
+    Signalled(signal: int)
+    TimedOut
+
+data CommandError
+    Io(error: IoError)
+    Failed(status: ExitStatus)
+```
+
+`isSuccess()` is `true` of `Exited(0)` alone. A program that is not there fails to start: `run`
+answers `Err(NotFound)` and `output` `Err(Io(NotFound))`.
+
+**A string runs as a command.** Importing `avin.process` adds `run()` and `output()` to `string`, as
+an [extension](/spec/declarations/#extensions): `"ls -l".run()` is `Command.parse("ls -l").run()`.
+
+**Combining is spelled with words where an operator cannot be.** `|` is free on any type but the
+integers and bytes, so a pipeline is `a | b`. Running is a method rather than a postfix `!` or `!!`,
+because no method is called postfix and `!` is the language's own; `#` is no operator character,
+and `&&` and `||` are the language's, so sequencing is `andThen`, `orElse` and `followedBy`, and
+redirection `toFile`, `appendTo` and `fromFile`.
+
+**Waiting is safe for the collector.** A thread waiting in `run`, `output` or `waitFor` holds
+nothing the collector waits on, as `await` does not.
+
 ## `avin.io`
 
 Standard input, read as text, and the error every module that reads or writes shares. Standard
-output and standard error need no import: `print` and `eprint` are in the prelude, beside the
+output and standard error need no import: `print`, `println`, `eprint` and `eprintln` are in the prelude, beside the
 writers `StandardOutput` and `StandardError`.
 
 ### `IoError`
@@ -112,8 +200,8 @@ main()
     for line in io.lines()
         line.trim().toInt() match
             Some(n) -> total += n
-            None -> eprint(s"not a number: $line")
-    print(total)
+            None -> eprintln(s"not a number: $line")
+    println(total)
 ```
 
 | Function | Meaning |
@@ -140,11 +228,42 @@ stream a program consumes as it arrives, where a file is read whole: `fs.readTex
 **Writing to standard error flushes standard output first.** Standard output is buffered, and
 flushed when the program ends, exits or traps; standard error is not buffered. Each write to
 standard error first flushes what the program has written to standard output, so when both go to one
-terminal or one file they arrive in the order the program wrote them. `eprint(x)` renders `x` and its
+terminal or one file they arrive in the order the program wrote them. `eprintln(x)` renders `x` and its
 new line first and writes them in one write, so a line is never split.
 
 **Tests see no input.** `avin test` gives each test an empty standard input, so a test never waits on
 the terminal it was started from. `avin run` hands the program its own standard input.
+
+### `Source`
+
+**Proposed.** A `Source` is text to be read from somewhere, so one function can read a file, a string
+or standard input alike.
+
+```text
+import avin.io.{IoError, Source}
+
+count(src: Source) -> int = src.lines().count(l -> !l.isEmpty())
+
+main() -> int
+    Source.fromFile("notes.txt") match
+        Ok(src) -> println(count(src))
+        Err(e) -> eprintln(e.message())
+    0
+```
+
+| Function | Meaning |
+| --- | --- |
+| `Source.fromFile(file: string) -> Result[Source, IoError]` | The file's text, read whole when the source is made, as `fs.readText` reads it: every failure, `InvalidUtf8` among them, is the `Err`. |
+| `Source.fromString(text: string) -> Source` | The text itself. |
+| `Source.stdin() -> Source` | Standard input, read as it is consumed and sharing `readLine`'s buffer. |
+| `s.lines() -> Iterator[string]` | The lines left, by the rule standard input's lines follow. |
+| `s.chars() -> Iterator[char]` | The characters left. |
+| `s.readAll() -> string` | Everything left. |
+
+**A source is read once.** Each of the three takes up where the last stopped, as standard input's
+functions do; a second `lines()` over a source already read to its end has nothing. A source holds
+nothing open, so there is nothing to close: a file's is its text, and standard input stays the
+program's.
 
 ## `avin.fs`
 
@@ -199,7 +318,7 @@ listing `InvalidUtf8` rather than leaving that name out.
 
 ```text
 for name in fs.listDir(dir)?
-    if name.endsWith(".txt") then print(name)
+    if name.endsWith(".txt") then println(name)
 ```
 
 ## `avin.time`
@@ -220,24 +339,151 @@ import avin.time
 
 val start = time.now()
 work()
-print(s"took ${start.elapsed()}")
+println(s"took ${start.elapsed()}")
 ```
 
 **Making durations.** `microseconds`, `milliseconds`, `seconds`, `minutes` and `hours` each take a
 `long` count; `zero()` is the empty duration. `inMilliseconds`, `inSeconds` and `inMinutes` answer
 whole units, a fraction dropped toward zero, and `inSecondsReal` the seconds with their fraction.
 Durations add, subtract and negate with `+`, `-` and unary `-` (they implement `Add`, `Sub` and
-`Neg`), and `times(n)` and `dividedBy(n)` scale one by a `long`; `abs()` drops the sign and
-`isNegative()` asks it.
+`Neg`), and `d * n` and `d / n` scale one by a `long`, a remainder dropped toward zero; `abs()`
+drops the sign and `isNegative()` asks it.
 
 **Readings.** `now()` reads the monotonic clock and `wallClock()` the wall clock; `fromEpoch(d)`
 makes the wall-clock time `d` after the start of 1970. On an `Instant`, `elapsed()` is the time from
-it to now, `since(earlier)` the time from another reading, and `plus(d)` and `minus(d)` move it by a
-duration; a `WallTime` has `since`, `plus`, `minus` and the `sinceEpoch` duration. The arithmetic
-operators work on one type only, which is why an instant and a duration combine through methods.
+it to now, `later - earlier` (or `later.since(earlier)`) the time from another reading, and
+`start + d` and `start - d` move it by a duration; a `WallTime` has the same `+`, `-` and `since`, and
+the `sinceEpoch` duration. These are [operator methods](/spec/operators-and-control-flow/#methods-named-by-symbols)
+of the reading types, so a reading of one clock less a reading of the other does not compile.
 
 **Order, equality and text.** All three types compare by value and are ordered, so `<`, `==` and
 `max` work on them. A duration displays in the largest unit it fills, with its fraction and no
 trailing zeros: `3us`, `1.5ms`, `90.5s`, `-500ms`; its `Debug` form wraps that as `Duration(1.5ms)`.
 A `WallTime` displays as an ISO 8601 UTC timestamp with microseconds, `2026-11-04T12:34:56.000045Z`,
 in the proleptic Gregorian calendar.
+
+## `avin.random`
+
+**Proposed.** Pseudo-random numbers: a generator a program seeds to replay a run, or lets the platform
+seed.
+
+```text
+import avin.random.Random
+
+main()
+    val dice = Random(42)
+    println(dice.between(1, 7))
+    println(Random.nextInt(100))
+    println(Random.shuffle([1, 2, 3, 4]))
+```
+
+`Random(seed: long)` is a generator whose numbers are fixed by its seed, the same on every platform
+and in every release; `Random()` is seeded by the platform, differently each time.
+
+| Method | Meaning |
+| --- | --- |
+| `nextInt() -> int`, `nextLong() -> long` | Any value of the type, each equally likely. |
+| `nextInt(bound: int) -> int`, `nextLong(bound: long) -> long` | From `0` up to `bound`, not including it; a bound that is not positive traps. |
+| `between(min, max)` | From `min` up to `max`, not including it, for `int`, `long` and `real`; `min >= max` traps. |
+| `nextReal() -> real` | From `0.0` up to `1.0`, not including it, every multiple of 2^-53 equally likely. |
+| `nextBoolean() -> bool` | `true` or `false`, equally likely. |
+| `nextGaussian() -> real` | Normally distributed, mean `0.0` and standard deviation `1.0`. |
+| `nextBytes(n: int) -> Array[byte]` | A new array of `n` bytes. |
+| `alphanumeric() -> Iterator[char]` | An endless run of characters from `A`–`Z`, `a`–`z` and `0`–`9`, equally likely. |
+| `shuffle[T](xs: Iterable[T]) -> Vector[T]` | The elements in a new order, every order equally likely. |
+| `setSeed(seed: long)` | Starts the generator again as `Random(seed)` would. |
+
+**The companion is a generator too.** `Random.nextInt(100)` and every other method called on
+`Random` itself use one generator the program shares, seeded by the platform on first use and safe to
+call from any thread. A `Random` a program makes is its own: it takes no lock, so threads that share
+one share it through a `Mutex`.
+
+**The generator is named.** It is PCG32 (PCG-XSH-RR, 64 bits of state, 32 of output), so a seeded run
+can be checked against the published algorithm. A bound is reached without bias, by rejection rather
+than a remainder. **None of this is fit for secrets**: anyone who sees a few outputs can compute the
+rest, so a key, a token or a password is never taken from it.
+
+## `avin.net`
+
+**Proposed.** TCP connections, URLs, and a small HTTP client. Every operation that can fail answers a
+`Result[T, IoError]`, and a connection that is reading or writing waits safe for the collector.
+
+```text
+import avin.net.http
+
+main() -> int
+    http.get("http://example.com/") match
+        Ok(r) if r.status == 200 -> println(r.text())
+        Ok(r) -> eprintln(s"status ${r.status}")
+        Err(e) -> eprintln(e.message())
+    0
+```
+
+### TCP
+
+| Function | Meaning |
+| --- | --- |
+| `TcpStream.connect(host: string, port: int) -> Result[TcpStream, IoError]` | A connection to the first of the host's addresses that answers. |
+| `s.read(max: int) -> Result[Array[byte], IoError]` | Up to `max` bytes, waiting for at least one; empty when the other end has finished sending. |
+| `s.readLine() -> Result[Option[string], IoError]` | The next line, as standard input reads one, `None` at the end. |
+| `s.write(bytes: Array[byte])`, `s.writeText(text: string)` | Sends all of it. |
+| `s.setTimeout(d: Duration)` | A read or write that waits longer fails with `TimedOut`. |
+| `s.shutdownOutput()` | Tells the other end nothing more will be sent. |
+| `s.close()` | Ends the connection; closing again does nothing. |
+| `TcpListener.bind(host: string, port: int) -> Result[TcpListener, IoError]` | Listens for connections; port `0` lets the platform choose. |
+| `l.port() -> int` | The port it listens on. |
+| `l.accept() -> Result[TcpStream, IoError]` | Waits for the next connection. |
+
+A connection and a listener are closed by `close()`; one the program forgets is closed when the
+collector finds it unreachable, so a lost one leaks nothing for long, but only `close()` says when.
+`IoError` gains the variants a connection meets: `ConnectionRefused`, `ConnectionReset` and
+`TimedOut`.
+
+### `Url`
+
+`Url.parse(text) -> Result[Url, UrlError]` reads an absolute URL into its `scheme`, `host`, `port`
+(an `Option[int]`), `path`, `query` (an `Option[string]`) and `fragment`; `u.portOrDefault()` gives
+80 for `http` and 443 for `https` where none is written, and `u.queryParams() -> Vector[(string,
+string)]` the decoded pairs. `Url.encode(text)` and `Url.decode(text)` percent-encode and decode a
+component. A `Url` displays as the text it was parsed from, normalized: the scheme and host in lower
+case, a default port left out.
+
+### `http`
+
+| Function | Meaning |
+| --- | --- |
+| `http.get(url: string) -> Result[Response, HttpError]` | Fetches the URL. |
+| `http.post(url: string, body: string, contentType: string) -> Result[Response, HttpError]` | Sends `body` and answers the response. |
+| `http.send(request: Request) -> Result[Response, HttpError]` | Any method, headers, body and timeout, built from `Request(method, url)` with `withHeader`, `withBody` and `withTimeout`. |
+
+A `Response` has its `status`, its `headers` as a vector of name and value pairs, `header(name)`
+looking a name up without regard to case, its `body` as an `Array[byte]` and `text()` reading that as
+UTF-8. **A status is an answer, not a failure**: `404` is an `Ok`. `HttpError` is `Io(IoError)`,
+`BadUrl(UrlError)`, `Malformed(text)` for a reply that is not HTTP, and `Unsupported(text)`. The
+client speaks HTTP/1.1, one request to a connection, reads bodies by `Content-Length`, chunked or to
+the connection's end, and follows up to five redirects of a `GET` or `HEAD`. `https` is
+`Unsupported` until the library has TLS.
+
+## Concurrency
+
+**Proposed.** Futures and promises stay in [`avin.threads`](/spec/threads/#futures), beside the
+threads and locks they are built on; there is no separate module for them. What a program writing
+with futures reaches for is there, under these names:
+
+| To | Write |
+| --- | --- |
+| Run a computation on the pool | `Future(body)` |
+| A future already complete | `Future.successful(x)`; a failure is `Future.successful(Err(e))`, since a future carries none of its own |
+| Wait for the value | `f.await()`, or `f.await(timeoutMillis)` for an `Option` |
+| Every value of several | `Future.all(fs)` |
+| The first value of several | `Future.first(fs)` |
+| A future for each element, then all of them | `Future.traverse(xs, f)`, which is `Future.all(xs.map(f))` started in order |
+| Go on from a failure | on a `Future[Result[T, E]]`: `mapErr(f)`, and `orElse(other)`, which runs the by-name `other` where the first ended in `Err` |
+| Run on threads of one's own | `Executor.fixed(n)`, a pool of `n` workers, and `ex.future(body)`; `Executor.shared()` is the pool `Future(body)` uses. A future's `map`, `flatMap` and `onComplete` run on the executor it was made on. `ex.shutdown()` lets its workers end once the queued work is done. |
+| Say a body will wait on something other than a future | `threads.blocking(body)`: the pool starts a worker in its place while it waits, as it does for `await` |
+| Pause a thread | `threads.sleep(d: Duration)`, safe for the collector while it sleeps |
+
+## JSON
+
+JSON is not part of the system library: reading and writing it is a package of its own, which a
+program adds as a dependency.

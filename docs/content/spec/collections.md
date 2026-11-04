@@ -263,7 +263,7 @@ alike, whatever order they were built in.
 ```text
 var counts = Map.empty[string, int]()
 for w in words do counts = counts.updated(w, counts.getOrElse(w, 0) + 1)
-for (word, n) in counts do print(s"$word $n")
+for (word, n) in counts do println(s"$word $n")
 ```
 
 `m(k)` reads a value and traps when the key is absent; `m.get(k)` returns an `Option`, and
@@ -342,11 +342,11 @@ The three slices are collections of the same kind, sharing their structure with 
 
 ```text
 val scores = TreeMap(("cy", 7), ("al", 9), ("bo", 4))
-print(scores)                     // {al: 9, bo: 4, cy: 7}
-print(scores.range("b", "c"))     // {bo: 4}
-print(scores.floor("bz"))         // Some((bo, 4))
+println(scores)                     // {al: 9, bo: 4, cy: 7}
+println(scores.range("b", "c"))     // {bo: 4}
+println(scores.floor("bz"))         // Some((bo, 4))
 val small: TreeSet[int] = {5, 1, 3}
-print(small.until(4))             // {1, 3}
+println(small.until(4))             // {1, 3}
 ```
 
 `TreeMap.empty`, `TreeMap.builder` and `TreeMap((k, v), …)`, and the same for `TreeSet`, make them as
@@ -590,7 +590,10 @@ list each of them takes time proportional to its length.
 and hash alike, whichever kinds they are, so `[1, 2, 3] == List(1, 2, 3)` and `[1, 2, 3] == (1..3)`
 are `true`, and a `Seq[int]` key finds an entry stored under a vector, a list or a range of the same
 elements. The two sides need the same element type. A class of the program's own that implements
-`Seq` is compared the same way unless it implements `Eq` itself.
+`Seq` is compared the same way unless it implements `Eq` itself. The same holds through `Any` and
+trait-typed values: an `Any` holding a vector equals a list of the same elements, compared element
+by element as `Any` values are, and the hashes agree, so a set or map keyed by `Any` finds a
+sequence under any class of the same elements.
 
 ```text
 total(xs: Seq[int]) -> int = xs.foldLeft(0, (acc, x) -> acc + x)
@@ -687,7 +690,7 @@ value of the type: `for i in 2147483640..2147483647 by 5` yields 2147483640 and 
 
 A `Range` of `int`s is a `Seq[int]`, and answers its own sequence questions from its bounds in
 constant time: `length()` (trapping for a range of more values than the largest `int`, such as
-`int.min .. int.max`), `r(i)`, which is `start + i * step` and traps outside `0 ..< length()`, and
+`int.MinValue .. int.MaxValue`), `r(i)`, which is `start + i * step` and traps outside `0 ..< length()`, and
 `contains(x)`, which is whether `x` lies between the first and last values a whole number of steps
 from the first, so `(1 ..< 10 by 3).contains(7)` is true and `.contains(8)` false. `get(i)`, `head()`,
 `last()` and their `Option` forms are answered from the bounds too, so they work on a range too long
@@ -695,6 +698,26 @@ for `length()`. Everything else
 it has as [every sequence](#methods-every-seq-has) does, and what those make of it, `map` and
 `filter` as much as `take` and `reverse`, is a `Vector`: `(1 .. 5).map(x -> x * x)` is
 `[1, 4, 9, 16, 25]`.
+
+### Ranges of other integer types
+
+Where the endpoints are integers of a type other than `int`, `a..b` and `a..<b` make a
+`NumericRange[T]` of that type, a `Seq[T]` that behaves as `Range` does: an integer literal endpoint
+takes its type from the other, `by` takes a step of type `T`, a zero step traps, and iteration never
+passes the largest or smallest value of `T`. `get`, `r(i)`, `head()`, `contains(x)` and `isEmpty()`
+are answered from the bounds without wrapping, so a range from the smallest `long` to the largest contains 0, and an
+`i8` range from 100 to 127 by 20 has the values 100 and 120. `length()` traps for more values than an `int`
+holds, as it does for `Range`; a range of `long`s past that still answers `head()`, `last()` and
+`get(i)`. A range whose ends lie more than the largest `long` apart cannot be counted, so
+`last()` and `length()` on it trap, while iterating it, `get` and `contains` work.
+
+```text
+val big: long = 5000000000
+val r = 0 .. big by 1000000000
+r.length()      // 6
+r.last()        // 5000000000
+r.contains(3000000000)   // true
+```
 
 ## for comprehensions
 
@@ -715,7 +738,7 @@ lets `break`, `continue` and `return` leave the body directly. A source with no 
 for i in 0..<n do total += i
 for (name, age) in people
     if age < 18 then continue
-    print(name)
+    println(name)
 ```
 
 ### Generators, guards and `yield`

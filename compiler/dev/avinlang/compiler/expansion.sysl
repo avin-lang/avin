@@ -1,0 +1,857 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+// Polymorphic recursion: a generic function, method or type whose instances need instances at ever
+// larger type arguments, as `depth[T]` calling `depth(Nest(x), n - 1)` needs `depth[Nest[T]]`, then
+// `depth[Nest[Nest[T]]]`, and so on. Generics are compiled once per list of type arguments, so such
+// code has no finite set of copies, and it is rejected where it is checked.
+//
+// The check follows how type arguments flow. Every type parameter of a generic function, method,
+// data type or class is a node. An edge from `P` to `Q` says that an instance with some type `X` for
+// `P` needs an instance whose type for `Q` holds `X`, and its weight is how much deeper: `Nest[T]`
+// for `Q` from `T` is 1, `T` itself 0. An edge of negative weight takes `X` apart instead: a type
+// argument `Box[U]` reaching a method of `Box` at `U` is -1. Edges come from:
+//
+// - each call, function value, call through a bound and call through a method table in generic
+//   code: from the caller's parameters to the callee's, through the type arguments the call gives,
+//   which are the type arguments of the callee's class or trait as the receiver's static type has
+//   them;
+// - each type the code names: from the code's parameters to the type's, since an instance of the
+//   type has a type record and its structural equality and hash;
+// - each data type's fields: from the type's parameters to those of the types they name, since a
+//   data value is compared, hashed and shown field by field;
+// - each type's parameters to the methods its instances compile with the type's own type arguments
+//   rather than the caller's: its operator and equality methods, and each implementation a call
+//   through a method table reaches where the method called is another one (a trait's, which the
+//   type implements) and the receiver's static type does not decide the implementation's type
+//   arguments, as a trait with fewer parameters than the class does not;
+// - each call through a bound on a value of a type parameter: from that parameter to the
+//   implementation at the call's position in the method table of each data type or class some
+//   generic code passes as that parameter, taking the type argument apart.
+//
+// A local function or lambda with no type parameters of its own is copied with the code it is
+// declared in, so its types are that code's.
+//
+// The instances are infinite exactly when a cycle's weights add up to more than zero: each round of
+// it nests the type arguments deeper. Each strongly connected set of nodes holding such a cycle is
+// reported once, naming the cycle, at its growing edge.
+
+private struct FlowEdge
+    from: usize
+    to: usize
+    weight: i64
+    unit: usize
+    span: Span
+    arg: &Type
+
+/** The flow graph: each node by its key (see `function_base`), the edges and each node's outgoing
+ * ones, and what the program's calls through method tables and bounds use. */
+private struct Flow
+    keys: Buf[usize]
+    nodes: Map[usize, usize]
+    edges: Buf[FlowEdge]
+    /** Each edge's index, by its two nodes: two edges between the same nodes keep the heavier. */
+    edge_index: Map[usize, usize]
+    out: Buf[Buf[usize]]
+    /** The methods called through each method table position. */
+    sites: Map[usize, Buf[usize]]
+    /** The methods with type parameters of their own called through a table, which are at no
+     * position: each reaches the methods of its name. */
+    generic_sites: Buf[usize]
+    /** Each call through a bound on a value of a type parameter: the parameter's node key and the
+     * method table position. */
+    bound_keys: Buf[usize]
+    bound_slots: Buf[usize]
+    /** For each node, the data types and classes (by `data_base` or `class_base`) some code passes
+     * to it as the outermost type of its type argument, directly or through other parameters. */
+    heads: Map[usize, Buf[usize]]
+    /** The methods of types, by `name/n`, with `n` type parameters of their own. */
+    methods_by_name: Map[string, Buf[usize]]
+    /** The generic local functions of each top-level function. */
+    generic_locals: Map[usize, Buf[usize]]
+
+/** Where code is: the key of its first type parameter's node, the owner its types name those
+ * parameters by, its unit, and whether it has type parameters at all. */
+private struct Site
+    base: usize
+    owner: usize
+    unit: usize
+    generic: bool
+
+// Node keys: a function's type parameter `i` is `function * 256 + i`; a data type's and a class's
+// are tagged above every function's.
+private function_base(id: usize) -> usize = id * 256
+
+private data_base(id: usize) -> usize = (1usize << 62) + id * 256
+
+private class_base(id: usize) -> usize = (1usize << 61) + id * 256
+
+/** Rejects every generic call cycle of the program whose type arguments grow. */
+check_expansion(c: *Checker)
+    var f = Flow(buf(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), map(), map())
+    index_symbols(c, &f)
+    for id in 0..<c.symbols.len()
+        c.bodies[id] match
+            Some(body) -> walk(c, &f, code_site(c, &f, id), body)
+            None -> ()
+    for d in 0..<c.data.len()
+        val data = c.data[d]
+        val site = Site(data_base(d), data_owner(d), data.unit, data.decl.type_params.len() > 0)
+        for v in data.variants
+            for t in v.fields
+                mention(c, &f, site, v.span, t)
+    connect_methods(c, &f)
+    connect_bounds(c, &f)
+    report_cycles(c, &f)
+
+// The methods by name and the generic local functions by top-level function, read once.
+private index_symbols(c: *Checker, f: *Flow)
+    for id in 0..<c.symbols.len()
+        val symbol = c.symbols[id]
+        if symbol.root is Some(root)
+            if symbol.decl.type_params.len() > 0
+                var locals = f.generic_locals.get(root).unwrap_or(buf())
+                locals.push(id)
+                f.generic_locals.put(root, locals)
+        elif (symbol.owner_class is Some(_) && !symbol.constructor) || symbol.receiver is Some(_)
+            val key = s"${symbol.decl.name}/${symbol.decl.type_params.len()}"
+            var same = f.methods_by_name.get(key).unwrap_or(buf())
+            same.push(id)
+            f.methods_by_name.put(key, same)
+
+/** The code whose type parameters a function's types name: its own, or for a local function or
+ * lambda with none of its own, the innermost generic local function it is declared in, else its
+ * top-level function. */
+private code_owner(c: *Checker, f: *Flow, id: usize) -> usize
+    val symbol = c.symbols[id]
+    val root = symbol.root match
+        Some(r) -> r
+        None -> return id
+    if symbol.decl.type_params.len() > 0 then return id
+    var best = root
+    var best_count = c.symbols[root].type_params.len()
+    if f.generic_locals.get(root) is Some(locals)
+        for g in locals
+            val s = c.symbols[g]
+            if s.unit == symbol.unit && s.decl.span.start <= symbol.decl.span.start && symbol.decl.span.end <= s.decl.span.end && s.type_params.len() > best_count
+                best = g
+                best_count = s.type_params.len()
+    best
+
+private code_site(c: *Checker, f: *Flow, id: usize) -> Site
+    val code = code_owner(c, f, id)
+    val symbol = c.symbols[id]
+    val owner = c.symbols[symbol.root.unwrap_or(id)].type_owner
+    Site(function_base(code), owner, symbol.unit, c.symbols[code].type_params.len() > 0)
+
+private node(f: *Flow, key: usize) -> usize
+    if f.nodes.get(key) is Some(n) then return n
+    val n = f.keys.len()
+    f.keys.push(key)
+    f.out.push(buf())
+    f.nodes.put(key, n)
+    n
+
+private connect(f: *Flow, from_key: usize, to_key: usize, weight: i64, unit: usize, span: Span, arg: &Type)
+    val from = node(f, from_key)
+    val to = node(f, to_key)
+    if from == to && weight <= 0 then return
+    val key = (from << 32) + to
+    if f.edge_index.get(key) is Some(index)
+        if weight > f.edges[index].weight then f.edges.set(index, FlowEdge(from, to, weight, unit, span, arg))
+        return
+    val index = f.edges.len()
+    f.edges.push(FlowEdge(from, to, weight, unit, span, arg))
+    f.edge_index.put(key, index)
+    var list = f.out[from]
+    list.push(index)
+    f.out.set(from, list)
+
+private resolved(c: *Checker, t: &Type) -> &Type = *t match
+    Var(id) -> c.vars[id] match
+        Some(bound) -> resolved(c, bound)
+        None -> t
+    _ -> t
+
+/** The indices of the type parameters of `owner` that `t` names. */
+private params_in(c: *Checker, t: &Type, owner: usize, out: *Buf[usize])
+    *resolved(c, t) match
+        TypeVar(o, i, _) ->
+            if o != owner then return
+            for x in *out
+                if x == i then return
+            out.push(i)
+        Tuple(items) ->
+            for x in items
+                params_in(c, x, owner, out)
+        Function(params, result) ->
+            for x in params
+                params_in(c, x, owner, out)
+            params_in(c, result, owner, out)
+        ByName(inner) -> params_in(c, inner, owner, out)
+        Data(_, _, args) ->
+            for x in args
+                params_in(c, x, owner, out)
+        Class(_, _, args) ->
+            for x in args
+                params_in(c, x, owner, out)
+        _ -> ()
+
+/** How deep in `t` its deepest mention of type parameter `i` of `owner` is: 0 for the parameter
+ * itself, one more for each type around it; -1 where `t` does not name it. */
+private depth_of(c: *Checker, t: &Type, owner: usize, i: usize) -> i64
+    val parts: Buf[&Type] = *resolved(c, t) match
+        TypeVar(o, j, _) -> return if o == owner && j == i then 0 else -1
+        Tuple(items) -> items
+        Function(params, result) ->
+            var all: Buf[&Type] = buf()
+            for p in params
+                all.push(p)
+            all.push(result)
+            all
+        ByName(inner) ->
+            var one: Buf[&Type] = buf()
+            one.push(inner)
+            one
+        Data(_, _, args) -> args
+        Class(_, _, args) -> args
+        _ -> return -1
+    var deepest: i64 = -1
+    for x in parts
+        val d = depth_of(c, x, owner, i)
+        if d >= 0 && d + 1 > deepest then deepest = d + 1
+    deepest
+
+/** The deepest mention in `t` of any type parameter of `owner`, or -1. */
+private deepest_param(c: *Checker, t: &Type, owner: usize) -> i64
+    var params: Buf[usize] = buf()
+    params_in(c, t, owner, &params)
+    var deepest: i64 = -1
+    for i in params
+        val d = depth_of(c, t, owner, i)
+        if d > deepest then deepest = d
+    deepest
+
+/** Edges from the code at `site` to the type parameters from `offset` on of the code or type whose
+ * parameter 0 has key `target`, given `args`; and the edges of the types `args` name. */
+private flow_into(c: *Checker, f: *Flow, site: Site, span: Span, args: Buf[&Type], target: usize, offset: usize)
+    if !site.generic then return
+    for j in 0..<args.len()
+        if offset + j >= 256 then break
+        var params: Buf[usize] = buf()
+        params_in(c, args[j], site.owner, &params)
+        for i in params
+            if i < 256 then connect(f, site.base + i, target + offset + j, depth_of(c, args[j], site.owner, i), site.unit, span, args[j])
+        if params.len() > 0
+            *resolved(c, args[j]) match
+                Data(id, _, _) -> add_head(f, target + offset + j, data_base(id))
+                Class(id, _, _) -> add_head(f, target + offset + j, class_base(id))
+                _ -> ()
+        mention(c, f, site, span, args[j])
+
+private add_head(f: *Flow, key: usize, head: usize) -> bool
+    var heads = f.heads.get(key).unwrap_or(buf())
+    for h in heads
+        if h == head then return false
+    heads.push(head)
+    f.heads.put(key, heads)
+    true
+
+/** The edges of the data types and classes `t` names, from the code at `site`. */
+private mention(c: *Checker, f: *Flow, site: Site, span: Span, t: &Type)
+    if !site.generic then return
+    *resolved(c, t) match
+        Data(id, _, args) -> flow_into(c, f, site, span, args, data_base(id), 0)
+        Class(id, _, args) -> flow_into(c, f, site, span, args, class_base(id), 0)
+        Tuple(items) ->
+            for x in items
+                mention(c, f, site, span, x)
+        Function(params, result) ->
+            for x in params
+                mention(c, f, site, span, x)
+            mention(c, f, site, span, result)
+        ByName(inner) -> mention(c, f, site, span, inner)
+        _ -> ()
+
+/** A direct call or function value of `id`. A local function or lambda with no type parameters of
+ * its own is part of the code it is declared in, so calling it adds nothing. */
+private call_edges(c: *Checker, f: *Flow, site: Site, span: Span, id: usize, type_args: Buf[&Type])
+    val symbol = c.symbols[id]
+    if symbol.root is Some(_) && symbol.decl.type_params.len() == 0 then return
+    flow_into(c, f, site, span, type_args, function_base(id), 0)
+
+/** A call through a method table: the method called, as a direct call would, and the position,
+ * whose implementations `connect_methods` reaches. */
+private dispatch_edges(c: *Checker, f: *Flow, site: Site, span: Span, id: usize, slot: usize, type_args: Buf[&Type])
+    flow_into(c, f, site, span, type_args, function_base(id), 0)
+    var called = f.sites.get(slot).unwrap_or(buf())
+    var seen = false
+    for g in called
+        if g == id then seen = true
+    if !seen
+        called.push(id)
+        f.sites.put(slot, called)
+    if own_generic_edges(c, f, site, span, id, type_args)
+        var known = false
+        for g in f.generic_sites
+            if g == id then known = true
+        if !known then f.generic_sites.push(id)
+
+/** A call through a bound: the method called, as a direct call would, and, where the receiver is
+ * a value of one of the code's type parameters, the implementation at the position in the method
+ * table of whichever type that parameter is, its type arguments taken apart from the parameter's. */
+private bound_edges(c: *Checker, f: *Flow, site: Site, span: Span, id: usize, slot: usize, args: Buf[&TExpr], type_args: Buf[&Type])
+    flow_into(c, f, site, span, type_args, function_base(id), 0)
+    own_generic_edges(c, f, site, span, id, type_args)
+    if !site.generic || args.len() == 0 then return
+    *resolved(c, args[0].ty) match
+        TypeVar(o, i, _) ->
+            if o == site.owner && i < 256
+                f.bound_keys.push(site.base + i)
+                f.bound_slots.push(slot)
+        _ -> ()
+
+// The type arguments a call gives a method's own type parameters reach every method of its name
+// that may implement it. Whether the method has any is the result.
+private own_generic_edges(c: *Checker, f: *Flow, site: Site, span: Span, id: usize, type_args: Buf[&Type]) -> bool
+    val symbol = c.symbols[id]
+    val own = symbol.decl.type_params.len()
+    if own == 0 || type_args.len() < own then return false
+    var own_args: Buf[&Type] = buf()
+    for i in type_args.len() - own..<type_args.len()
+        own_args.push(type_args[i])
+    if f.methods_by_name.get(s"${symbol.decl.name}/$own") is Some(methods)
+        for m in methods
+            if m != id then flow_into(c, f, site, span, own_args, function_base(m), c.symbols[m].type_params.len() - own)
+    true
+
+private walk_all(c: *Checker, f: *Flow, site: Site, items: Buf[&TExpr])
+    for e in items
+        walk(c, f, site, e)
+
+private walk_option(c: *Checker, f: *Flow, site: Site, e: Option[&TExpr])
+    if e is Some(x) then walk(c, f, site, x)
+
+private walk(c: *Checker, f: *Flow, site: Site, e: &TExpr)
+    mention(c, f, site, e.span, e.ty)
+    e.kind match
+        Call(id, args, type_args) ->
+            call_edges(c, f, site, e.span, id, type_args)
+            walk_all(c, f, site, args)
+        Dispatch(id, slot, args, type_args) ->
+            dispatch_edges(c, f, site, e.span, id, slot, type_args)
+            walk_all(c, f, site, args)
+        BoundCall(id, slot, args, type_args) ->
+            if slot is Some(p) then bound_edges(c, f, site, e.span, id, p, args, type_args)
+            else call_edges(c, f, site, e.span, id, type_args)
+            walk_all(c, f, site, args)
+        FunctionValue(id, type_args) -> call_edges(c, f, site, e.span, id, type_args)
+        Construct(_, args) -> walk_all(c, f, site, args)
+        Collection(elements, built) ->
+            walk_all(c, f, site, elements)
+            walk(c, f, site, built)
+        CallValue(callee, args) ->
+            walk(c, f, site, callee)
+            walk_all(c, f, site, args)
+        Field(value, _) -> walk(c, f, site, value)
+        StoreField(object, _, value, _) ->
+            walk(c, f, site, object)
+            walk(c, f, site, value)
+        LazyGlobal(_, initialize, _) -> walk(c, f, site, initialize)
+        LazyField(object, _, initialize, _) ->
+            walk(c, f, site, object)
+            walk(c, f, site, initialize)
+        StoreGlobal(_, value, _) -> walk(c, f, site, value)
+        Block(items) -> walk_all(c, f, site, items)
+        Let(_, value) -> walk(c, f, site, value)
+        LetPattern(pattern, value) ->
+            walk_pattern(c, f, site, pattern)
+            walk(c, f, site, value)
+        Store(_, value, _) -> walk(c, f, site, value)
+        MultiStore(_, value) -> walk(c, f, site, value)
+        Negate(x) -> walk(c, f, site, x)
+        Not(x) -> walk(c, f, site, x)
+        Complement(x) -> walk(c, f, site, x)
+        Convert(x, _) -> walk(c, f, site, x)
+        Box(x) -> walk(c, f, site, x)
+        Arith(_, a, b, _) ->
+            walk(c, f, site, a)
+            walk(c, f, site, b)
+        Logic(_, a, b) ->
+            walk(c, f, site, a)
+            walk(c, f, site, b)
+        Compare(operands, _) -> walk_all(c, f, site, operands)
+        If(condition, yes, no) ->
+            walk(c, f, site, condition)
+            walk(c, f, site, yes)
+            walk_option(c, f, site, no)
+        While(_, condition, body, otherwise) ->
+            walk(c, f, site, condition)
+            walk(c, f, site, body)
+            walk_option(c, f, site, otherwise)
+        Break(_, value) -> walk_option(c, f, site, value)
+        Return(value) -> walk_option(c, f, site, value)
+        Match(subject, arms) ->
+            walk(c, f, site, subject)
+            for arm in arms
+                walk_pattern(c, f, site, arm.pattern)
+                walk_option(c, f, site, arm.guard)
+                walk(c, f, site, arm.body)
+        Is(value, pattern, _) ->
+            walk(c, f, site, value)
+            walk_pattern(c, f, site, pattern)
+        Clauses(subjects, clauses) ->
+            walk_all(c, f, site, subjects)
+            for clause in clauses
+                for p in clause.patterns
+                    walk_pattern(c, f, site, p)
+                for b in clause.bodies
+                    walk_option(c, f, site, b.guard)
+                    walk(c, f, site, b.body)
+        _ -> ()
+
+private walk_pattern(c: *Checker, f: *Flow, site: Site, p: &TPattern)
+    mention(c, f, site, p.span, p.ty)
+    p.kind match
+        PLiteral(value) -> walk(c, f, site, value)
+        PBounds(_, lower, upper) ->
+            if lower is Some(b) then walk(c, f, site, b.value)
+            if upper is Some(b) then walk(c, f, site, b.value)
+        PSuccessor(_, amount) -> walk(c, f, site, amount)
+        PAlternatives(options) ->
+            for x in options
+                walk_pattern(c, f, site, x)
+        PNamed(_, inner) -> walk_pattern(c, f, site, inner)
+        PVariant(_, fields) ->
+            for x in fields
+                walk_pattern(c, f, site, x)
+        PType(target, _, _) -> mention(c, f, site, p.span, target)
+        PSequence(_, test, elements, items) ->
+            walk(c, f, site, test)
+            walk_all(c, f, site, elements)
+            for x in items
+                walk_pattern(c, f, site, x)
+        _ -> ()
+
+
+/** Whether a method is called on the type's instances without a call naming it: the operator and
+ * equality methods. */
+private implicit_method(name: string) -> bool =
+    name == "equals" || name == "hash" || name == "compare" || name == "add" || name == "subtract" || name == "multiply" ||
+        name == "divide" || name == "remainder" || name == "negate" || name == "less" || name == "lessOrEqual" ||
+        name == "greater" || name == "greaterOrEqual"
+
+/** Edges from each type's parameters to the methods its instances compile with its own type
+ * arguments, once every call through a bound or a table is known. */
+private connect_methods(c: *Checker, f: *Flow)
+    for k in 0..<c.classes.len()
+        val class = c.classes[k]
+        if class.decl.type_params.len() == 0 then continue
+        val self_type = class_type_of(c, k)
+        val site = Site(class_base(k), class_owner(k), class.unit, true)
+        connect_table(c, f, self_type, site, class.decl.name_span, class.table)
+        for m in class.methods
+            if implicit_method(c.symbols[m].decl.name) || reached_by_name(c, f, self_type, site.owner, m) then view_edges(c, f, self_type, site, class.decl.name_span, m)
+    for d in 0..<c.data.len()
+        val data = c.data[d]
+        if data.decl.type_params.len() == 0 then continue
+        val self_type = data_type_of(c, d)
+        val site = Site(data_base(d), data_owner(d), data.unit, true)
+        connect_table(c, f, self_type, site, data.decl.span, data.table)
+        for m in data.methods
+            if implicit_method(c.symbols[m].decl.name) || reached_by_name(c, f, self_type, site.owner, m) then view_edges(c, f, self_type, site, data.decl.span, m)
+
+private class_type_of(c: *Checker, k: usize) -> &Type
+    var args: Buf[&Type] = buf()
+    val params = c.classes[k].decl.type_params
+    for i in 0..<params.len()
+        args.push(TypeVar(class_owner(k), i, params[i].name))
+    Class(k, c.classes[k].name, args)
+
+private data_type_of(c: *Checker, d: usize) -> &Type
+    var args: Buf[&Type] = buf()
+    val params = c.data[d].decl.type_params
+    for i in 0..<params.len()
+        args.push(TypeVar(data_owner(d), i, params[i].name))
+    Data(d, c.data[d].name, args)
+
+// The implementations in a type's method table that a call through their position reaches with the
+// type's own type arguments.
+private connect_table(c: *Checker, f: *Flow, self_type: &Type, site: Site, span: Span, table: Buf[Option[usize]])
+    for p in 0..<table.len()
+        val m = table[p] match
+            Some(m) -> m
+            None -> continue
+        val called = f.sites.get(p) match
+            Some(x) -> x
+            None -> continue
+        for g in called
+            if g != m && undecided(c, self_type, site.owner, g)
+                view_edges(c, f, self_type, site, span, m)
+                break
+
+/** Whether some call through a bound or a table of a method with type parameters of its own reaches
+ * method `m`, of the same name, of a value of type `self_type` with that type's own type arguments. */
+private reached_by_name(c: *Checker, f: *Flow, self_type: &Type, owner: usize, m: usize) -> bool
+    val symbol = c.symbols[m]
+    val own = symbol.decl.type_params.len()
+    if own == 0 then return false
+    for g in f.generic_sites
+        val called = c.symbols[g]
+        if g != m && called.decl.name == symbol.decl.name && called.decl.type_params.len() == own && undecided(c, self_type, owner, g) then return true
+    false
+
+// Whether a call of `g` through a bound or a table may reach a value of type `self_type` without
+// deciding its type arguments: the type is an instance of the class or trait `g` belongs to, and as
+// that instance it leaves some of its own type parameters unnamed, as an instance of a trait with
+// none does. Where it names them all, the receiver's type arguments decide them, and the
+// implementation's are taken apart from those.
+private undecided(c: *Checker, self_type: &Type, owner: usize, g: usize) -> bool
+    val k = c.symbols[g].owner_class match
+        Some(k) -> k
+        None -> return false
+    val view = ancestor_type(c.classes, c.data, self_type, k) match
+        Some(v) -> v
+        None -> return false
+    val count = *self_type match
+        Data(_, _, a) -> a.len()
+        Class(_, _, a) -> a.len()
+        _ -> 0
+    var named: Buf[usize] = buf()
+    params_in(c, view, owner, &named)
+    named.len() < count
+
+// Edges from the type `self_type`'s parameters to method `m`'s, through the type `m` belongs to as
+// `self_type` has it: the type itself, a superclass, or a trait it implements. A method an impl adds
+// names the impl's own type parameters in its receiver's type, each standing for the type's
+// parameter at its position.
+private view_edges(c: *Checker, f: *Flow, self_type: &Type, site: Site, span: Span, m: usize)
+    val symbol = c.symbols[m]
+    if symbol.owner_class is None
+        val receiver_args = symbol.receiver match
+            Some(r) -> *r match
+                Data(_, _, args) -> args
+                Class(_, _, args) -> args
+                _ -> return
+            None -> return
+        for j in 0..<receiver_args.len()
+            if j >= 256 then break
+            var params: Buf[usize] = buf()
+            params_in(c, receiver_args[j], symbol.type_owner, &params)
+            for i in params
+                if i < 256 then connect(f, site.base + j, function_base(m) + i, 0 - depth_of(c, receiver_args[j], symbol.type_owner, i), site.unit, span, receiver_args[j])
+        return
+    val k = symbol.owner_class.unwrap()
+    val view = ancestor_type(c.classes, c.data, self_type, k) match
+        Some(v) -> v
+        None -> return
+    val args = *view match
+        Class(_, _, a) -> a
+        _ -> return
+    flow_into(c, f, site, span, args, function_base(m), 0)
+
+// The calls through bounds: each type parameter's outermost types reach the parameters it is passed
+// on to unchanged, and each call on a value of it reaches each such type's implementation.
+private connect_bounds(c: *Checker, f: *Flow)
+    var changed = true
+    while changed
+        changed = false
+        for e in f.edges
+            if e.weight != 0 then continue
+            if !(*resolved(c, e.arg) is TypeVar(_, _, _)) then continue
+            if f.heads.get(f.keys[e.from]) is Some(heads)
+                for h in heads
+                    if add_head(f, f.keys[e.to], h) then changed = true
+    for x in 0..<f.bound_keys.len()
+        val key = f.bound_keys[x]
+        val slot = f.bound_slots[x]
+        val heads = f.heads.get(key) match
+            Some(h) -> h
+            None -> continue
+        for h in heads
+            if h >= (1usize << 62)
+                val d = (h - (1usize << 62)) / 256
+                bound_target(c, f, key, data_type_of(c, d), data_owner(d), c.data[d].table, slot)
+            else
+                val k = (h - (1usize << 61)) / 256
+                bound_target(c, f, key, class_type_of(c, k), class_owner(k), c.classes[k].table, slot)
+
+private bound_target(c: *Checker, f: *Flow, from: usize, self_type: &Type, owner: usize, table: Buf[Option[usize]], slot: usize)
+    if slot < table.len()
+        if table[slot] is Some(m) then bound_target_edges(c, f, from, self_type, owner, m)
+
+// Edges from the type parameter with node key `from`, holding an instance of `self_type`, to method
+// `m`, that type's implementation: each of `m`'s type parameters is a part of the type argument, or
+// holds parts of it as deep as the view of `self_type` it belongs to puts them, so the weight is that
+// depth less the one the type adds.
+private bound_target_edges(c: *Checker, f: *Flow, from: usize, self_type: &Type, owner: usize, m: usize)
+    val symbol = c.symbols[m]
+    if symbol.owner_class is None
+        val receiver_args = symbol.receiver match
+            Some(r) -> *r match
+                Data(_, _, args) -> args
+                Class(_, _, args) -> args
+                _ -> return
+            None -> return
+        for j in 0..<receiver_args.len()
+            var params: Buf[usize] = buf()
+            params_in(c, receiver_args[j], symbol.type_owner, &params)
+            for i in params
+                if i < 256 then connect(f, from, function_base(m) + i, -1 - depth_of(c, receiver_args[j], symbol.type_owner, i), symbol.unit, symbol.decl.name_span, receiver_args[j])
+        return
+    val k = symbol.owner_class.unwrap()
+    val view = ancestor_type(c.classes, c.data, self_type, k) match
+        Some(v) -> v
+        None -> return
+    val args = *view match
+        Class(_, _, a) -> a
+        _ -> return
+    for i in 0..<args.len()
+        if i >= 256 then break
+        val d = deepest_param(c, args[i], owner)
+        if d >= 0 then connect(f, from, function_base(m) + i, d - 1, symbol.unit, symbol.decl.name_span, args[i])
+
+/** Reports each strongly connected set of nodes that holds a cycle of positive weight, naming the
+ * cycle. */
+private report_cycles(c: *Checker, f: *Flow)
+    val component = components(f)
+    // The edges within each component that holds a growing one.
+    var inner: Map[usize, Buf[usize]] = map()
+    for x in 0..<f.edges.len()
+        val e = f.edges[x]
+        if e.weight > 0 && component[e.from] == component[e.to] then inner.put(component[e.from], buf())
+    var order: Buf[usize] = buf()
+    for x in 0..<f.edges.len()
+        val e = f.edges[x]
+        if component[e.from] != component[e.to] then continue
+        if inner.get(component[e.from]) is Some(list)
+            if list.len() == 0 then order.push(component[e.from])
+            var more = list
+            more.push(x)
+            inner.put(component[e.from], more)
+    var cycles: Buf[Buf[usize]] = buf()
+    for k in order
+        val cycle = positive_cycle(f, inner.get(k).unwrap())
+        if cycle.len() > 0 then cycles.push(cycle)
+    // A nested data type is reported at the type, and not again through the code written for it,
+    // its derived and structural methods.
+    var nested: Map[usize, bool] = map()
+    for cycle in cycles
+        if !only_data(f, cycle) then continue
+        for x in cycle
+            nested.put((f.keys[f.edges[x].from] - (1usize << 62)) / 256, true)
+        report_cycle(c, f, cycle)
+    for cycle in cycles
+        if only_data(f, cycle) then continue
+        var through_nested = false
+        for x in cycle
+            if names_data(c, f.edges[x].arg, &nested) then through_nested = true
+        if !through_nested then report_cycle(c, f, cycle)
+
+private only_data(f: *Flow, cycle: Buf[usize]) -> bool
+    for x in cycle
+        if f.keys[f.edges[x].from] < (1usize << 62) then return false
+    true
+
+private names_data(c: *Checker, t: &Type, ids: *Map[usize, bool]) -> bool = *resolved(c, t) match
+    Data(id, _, args) -> ids.get(id) is Some(_) || any_names_data(c, args, ids)
+    Class(_, _, args) -> any_names_data(c, args, ids)
+    Tuple(items) -> any_names_data(c, items, ids)
+    Function(params, result) -> any_names_data(c, params, ids) || names_data(c, result, ids)
+    ByName(inner) -> names_data(c, inner, ids)
+    _ -> false
+
+private any_names_data(c: *Checker, items: Buf[&Type], ids: *Map[usize, bool]) -> bool
+    for x in items
+        if names_data(c, x, ids) then return true
+    false
+
+/** Reports a cycle at its heaviest edge in the program's own code, else in the library's. */
+private report_cycle(c: *Checker, f: *Flow, cycle: Buf[usize])
+    var best = 0usize
+    for i in 1..<cycle.len()
+        val a = f.edges[cycle[best]]
+        val b = f.edges[cycle[i]]
+        val better_place = in_library(c, a.unit) && !in_library(c, b.unit)
+        val same_place = in_library(c, a.unit) == in_library(c, b.unit)
+        if better_place || (same_place && b.weight > a.weight) then best = i
+    val e = f.edges[cycle[best]]
+    var path: Buf[usize] = buf()
+    for i in 0..<cycle.len()
+        path.push(f.edges[cycle[(best + i) % cycle.len()]].from)
+    path.push(e.from)
+    val shown = type_name(solve(c.vars, e.arg))
+    c.note(e.unit, e.span, s"polymorphic recursion: each round of the cycle ${cycle_text(c, f, path)} passes `$shown` for `${param_name(c, f, e.to)}`, so its type arguments grow without end and the code has no finite set of copies")
+
+private in_library(c: *Checker, unit: usize) -> bool
+    val m = c.units[unit].file.module_name
+    m == "avin" || m.starts_with("avin.")
+
+/** A cycle of positive total weight among `edges`, as its edges in order, or none: the longest
+ * paths are relaxed once per node, and an edge still relaxing after that lies on such a cycle's
+ * way. */
+private positive_cycle(f: *Flow, edges: Buf[usize]) -> Buf[usize]
+    var dist: Map[usize, i64] = map()
+    var pred: Map[usize, usize] = map()
+    for x in edges
+        dist.put(f.edges[x].from, 0)
+        dist.put(f.edges[x].to, 0)
+    var rounds = 0usize
+    var changed = true
+    var last = 0usize
+    // Every node of the component is an end of one of its edges.
+    val count = node_count(f, edges)
+    while changed && rounds <= count
+        changed = false
+        rounds += 1
+        for x in edges
+            val e = f.edges[x]
+            val through = dist.get(e.from).unwrap() + e.weight
+            if through > dist.get(e.to).unwrap()
+                dist.put(e.to, through)
+                pred.put(e.to, x)
+                changed = true
+                last = e.to
+    var out: Buf[usize] = buf()
+    if !changed then return out
+    // Walking back as many steps as there are nodes ends inside the cycle.
+    var v = last
+    for _ in 0..<count
+        v = f.edges[pred.get(v).unwrap()].from
+    val start = v
+    var reversed: Buf[usize] = buf()
+    var done = false
+    while !done
+        val x = pred.get(v).unwrap()
+        reversed.push(x)
+        v = f.edges[x].from
+        done = v == start
+    var i = reversed.len()
+    while i > 0
+        i -= 1
+        out.push(reversed[i])
+    out
+
+private node_count(f: *Flow, edges: Buf[usize]) -> usize
+    var seen: Map[usize, bool] = map()
+    var count = 0usize
+    for x in edges
+        val e = f.edges[x]
+        if seen.get(e.from) is None
+            seen.put(e.from, true)
+            count += 1
+        if seen.get(e.to) is None
+            seen.put(e.to, true)
+            count += 1
+    count
+
+/** Each node's strongly connected component, by Tarjan's algorithm without recursion. */
+private components(f: *Flow) -> Buf[usize]
+    val n = f.keys.len()
+    var index: Buf[usize] = buf()
+    var low: Buf[usize] = buf()
+    var on_stack: Buf[bool] = buf()
+    var component: Buf[usize] = buf()
+    for _ in 0..<n
+        index.push(n)
+        low.push(n)
+        on_stack.push(false)
+        component.push(n)
+    var stack: Buf[usize] = buf()
+    var counter = 0usize
+    var count = 0usize
+    for root in 0..<n
+        if index[root] != n then continue
+        var frames: Buf[usize] = buf()
+        var positions: Buf[usize] = buf()
+        index.set(root, counter)
+        low.set(root, counter)
+        counter += 1
+        stack.push(root)
+        on_stack.set(root, true)
+        frames.push(root)
+        positions.push(0)
+        while frames.len() > 0
+            val top = frames.len() - 1
+            val v = frames[top]
+            val p = positions[top]
+            if p < f.out[v].len()
+                positions.set(top, p + 1)
+                val w = f.edges[f.out[v][p]].to
+                if index[w] == n
+                    index.set(w, counter)
+                    low.set(w, counter)
+                    counter += 1
+                    stack.push(w)
+                    on_stack.set(w, true)
+                    frames.push(w)
+                    positions.push(0)
+                elif on_stack[w] && index[w] < low[v]
+                    low.set(v, index[w])
+            else
+                frames.truncate(top)
+                positions.truncate(top)
+                if top > 0
+                    val u = frames[top - 1]
+                    if low[v] < low[u] then low.set(u, low[v])
+                if low[v] == index[v]
+                    var done = false
+                    while !done
+                        val w = stack[stack.len() - 1]
+                        stack.truncate(stack.len() - 1)
+                        on_stack.set(w, false)
+                        component.set(w, count)
+                        done = w == v
+                    count += 1
+    component
+
+
+/** The code or type each node of `path` belongs to, in order, each named once per stretch. */
+private cycle_text(c: *Checker, f: *Flow, path: Buf[usize]) -> string
+    var out = ""
+    var last = ""
+    var count = 0
+    for n in path
+        val label = node_label(c, f, n)
+        if label == "" || label == last then continue
+        if out != "" then out = out + " -> "
+        out = out + s"`$label`"
+        last = label
+        count += 1
+    // A cycle within one function or type still names it at both ends.
+    if count == 1 then out = out + s" -> `$last`"
+    out
+
+private node_label(c: *Checker, f: *Flow, n: usize) -> string
+    val key = f.keys[n]
+    if key >= (1usize << 62) then return c.data[(key - (1usize << 62)) / 256].name
+    if key >= (1usize << 61) then return c.classes[(key - (1usize << 61)) / 256].name
+    val symbol = c.symbols[key / 256]
+    if symbol.owner_class is Some(k)
+        if symbol.constructor then return c.classes[k].name
+        return s"${c.classes[k].name}.${symbol.decl.name}"
+    if symbol.receiver is Some(r)
+        return *r match
+            Data(_, name, _) -> s"$name.${symbol.decl.name}"
+            Class(_, name, _) -> s"$name.${symbol.decl.name}"
+            _ -> s"${type_name(r)}.${symbol.decl.name}"
+    symbol.decl.name
+
+private param_name(c: *Checker, f: *Flow, n: usize) -> string
+    val key = f.keys[n]
+    if key >= (1usize << 62)
+        val d = (key - (1usize << 62)) / 256
+        val i = (key - (1usize << 62)) % 256
+        val params = c.data[d].decl.type_params
+        return if i < params.len() then params[i].name else "_"
+    if key >= (1usize << 61)
+        val k = (key - (1usize << 61)) / 256
+        val i = (key - (1usize << 61)) % 256
+        val params = c.classes[k].decl.type_params
+        return if i < params.len() then params[i].name else "_"
+    val params = c.symbols[key / 256].type_params
+    val i = key % 256
+    if i < params.len() then params[i].name else "_"

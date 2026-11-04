@@ -10,7 +10,7 @@ weight: 13
 area(width: int, height: int) -> int = width * height
 
 greet(name: string)
-    print(s"hello, $name")
+    println(s"hello, $name")
 ```
 
 Every parameter has a declared type. The result type may be inferred, except for recursive functions.
@@ -265,6 +265,28 @@ A call made before the local function's declaration must not reach a local that 
 initialized there, directly or through the local functions it calls, and the function needs a
 declared result type for such a call, as it does for recursion.
 
+A local function's name is its block's: a `val`, a `var` or a pattern binding of the same name in
+the same block is an error, whether it is written before or after the function, because the
+function is visible across the whole block. A block nested inside, a lambda's body and the enclosing
+function's parameters are other scopes, and a local there may hide the function as any local hides
+an outer name; likewise a local function declared in a nested block or a lambda's body hides an
+enclosing value, parameter or local function of its name there, so the innermost declaration wins
+whichever kind each is. The block's own local functions of one name are overloads of each other.
+
+A local function may declare type parameters of its own, with bounds, exactly as a top-level
+function does. Its calls write its type arguments or leave them to be inferred, and used as a value
+it takes them from the expected function type. Inside a generic function it also sees the enclosing
+type parameters, which every call shares and none writes. A type parameter of a local function may
+not reuse the name of one already in scope:
+
+```text
+pairs[T: Display](first: T) -> string
+    pair[U](x: U) -> (T, U) = (first, x)
+    s"${pair(1)} ${pair("a")} ${pair[real](2.5)}"
+
+pairs("p")               // "(p, 1) (p, a) (p, 2.5)"
+```
+
 ## data
 
 `data` declares an algebraic data type: an immutable value with one or more variants.
@@ -293,7 +315,7 @@ derived one ([Display and Debug](/spec/equality-and-memory/#display-and-debug)).
 open class Account(owner: string, var balance: int)
     if balance < 0 then panic("an account cannot open overdrawn")
     val opened = clock.now()
-    print(s"opened an account for $owner")
+    println(s"opened an account for $owner")
 
     deposit(amount: int)
         balance += amount
@@ -406,8 +428,9 @@ trait Shape
     describe() -> string = s"area ${area()}"
 ```
 
-A trait declares methods, which may have default bodies, and abstract `val` members a class supplies
-with a field. **A trait holds no state.** A trait may require others: `trait Iterator[+A]: Iterable[A]`.
+A trait declares methods, which may have default bodies, abstract `val` members a class supplies
+with a field, and fields with values, which every class conforming to it stores (below). A trait may
+require others: `trait Iterator[+A]: Iterable[A]`.
 
 A trait is both a type and a bound. Used as a type, a value of it is a reference and calls dispatch
 dynamically. Used as a bound (`[T: Shape]`), calls are direct, because the code is monomorphized.
@@ -450,7 +473,8 @@ val n: Named = t
   a trait's method of the same name without being repeated.
 - A trait's default body is inherited like a superclass's method. A class that is not abstract
   implements every abstract method of its traits; an abstract class may leave them to a subclass.
-- A trait's body declares only methods, all public. A trait cannot be instantiated.
+- A trait's body declares methods and fields, all public, and no statements: it has no constructor.
+  A trait cannot be instantiated.
 - **A trait may override a method of a trait it requires**, marked `override` and with a body:
   `trait Square: Shape` with `override describe() -> string = …`. In every class and data type
   conforming to the trait, its body replaces the required trait's default, or gives an abstract
@@ -498,6 +522,50 @@ impl Named for Book
   `x.name()` calls the value it holds, which only a function-typed `val` can be.
 - An abstract class's body cannot read a trait's `val` it leaves to a subclass: it runs before the
   subclass's fields are set.
+
+### Fields
+
+```text
+data Position(line: int, column: int)
+
+trait Positional
+    var pos: Option[Position] = None
+    at(line: int, column: int) = pos = Some(Position(line, column))
+
+class Token(val text: string): Positional
+
+val t = Token("x")
+t.at(3, 4)
+val p: Positional = t
+p.pos = None
+```
+
+- **A trait may declare fields with values**, `val name: T = expr` and `var name: T = expr`. Each
+  declares its type, and is public. A field without a value is the abstract `val` above, and is
+  never `var`.
+- **Every class and object conforming to the trait stores the trait's fields**, each of its own. A
+  subclass of a class that conforms stores them once, in the superclass; a generic trait's fields
+  take the type arguments the class names it with, `class Ints: Box[int]`.
+- **They are read and assigned as fields**: by bare name and through `self` in the trait's methods,
+  and as `x.name` outside. Through a class type, `x.name` is the class's field; through the trait,
+  or a type parameter the trait bounds, it reaches the field of the object's own class through its
+  method table, for reading and, for a `var`, for assigning. A trait's field supplies the abstract
+  `val` of its name of any other trait the class conforms to.
+- **Construction runs from the top down**: the superclass's constructor, then the class's
+  parameters are stored, then the fields of the traits the superclass does not already conform to
+  are computed, then the class body runs. The traits come in the order of the `:` list, each after
+  the traits it requires and each once, and each trait's fields in the order it declares them.
+- **A field's value is computed with `self` as the trait's receiver**, in the trait's module. It may
+  read the fields initialized before it: those of a superclass, the class's parameters (as the
+  trait's `val`s they supply), and the trait fields computed earlier. It uses `self` for nothing
+  else: it calls no method of the object and does not pass it, as a class body before its last field
+  does not.
+- **Only a class or an object conforms to a trait with fields**, or to one requiring such a trait: an
+  impl of it for a `data` type, a built-in type or a tuple is an error. A trait's field is never
+  overridden: a class declaring a field or a method of its name is an error, and so is a class
+  conforming to two traits that declare fields of one name.
+- A `var` field makes it an invariant position: a covariant trait's type parameter cannot appear in
+  its type, as in a class's.
 
 ### Static members
 
@@ -558,6 +626,15 @@ separate `impl` for it are the same conformance; it may be stated once.
 
 `impl` is how Avin expresses type classes (`Ord`, `Hash`, `Display`) and adds methods to types you
 do not own. Resolution is coherent: one implementation per trait and type, found without search.
+
+**A generic trait whose members are all static, and which requires no other trait, may be
+implemented by one type at several type arguments**, once at each: `impl From[IoError] for
+AppError` beside `impl From[ParseError] for AppError`, or `class Note : Make[int], Make[string]`.
+No value of such a trait exists, so each call names a type, and the member called is the one taking
+the arguments' types: `AppError.from(e)` as any overloaded method, and on a type parameter bounded
+by several instances, `T: Make[int] + Make[string]`, the instance whose member the arguments fit.
+Each conformance gives every member of the trait at its own type arguments. Any other trait is
+implemented once, at one list of type arguments.
 
 A built-in type conforms to a trait only through an impl, and meets the trait as a bound: each
 instance of generic code calls the impl's method directly. A built-in value is not an object, so a
@@ -656,7 +733,7 @@ impl[T: Ord] Seq[T]
 // main.avin
 import words
 
-main() = print("hey".shout())       // hey!
+main() = println("hey".shout())       // hey!
 ```
 
 - **An extension's methods are seen by its own module and by every file that imports the module**:
@@ -720,8 +797,8 @@ object Twice
     apply(s: string) -> string = s + s
 
 main()
-    print(Twice(21))       // 42
-    print(Twice("ab"))     // abab
+    println(Twice(21))       // 42
+    println(Twice("ab"))     // abab
 ```
 
 An object shares its name only with its companion class or `data` type. Where both exist, the name in
@@ -831,7 +908,7 @@ private scale() -> int = 3          // seen by every file of `shapes`, and nowhe
 // main.avin, in the program's root directory
 import shapes.{Circle, area as circleArea}
 
-main() = print(s"${circleArea(Circle(2))}")
+main() = println(s"${circleArea(Circle(2))}")
 ```
 
 - **A program is a directory tree.** Each directory under the program's root is a module named by
@@ -889,7 +966,7 @@ sees it.
 A paragraph between two indented blocks ends nothing, so a body can be explained a step
 at a time and picked up again where it left off.
 
-        print(h)
+        println(h)
 
 What a reader should *not* run gets a fence instead of an indent:
 
@@ -905,7 +982,7 @@ half(n: int) -> int = n / 2
 
 main()
     val h = half(9)
-    print(h)
+    println(h)
 ```
 
 The code appears in the order it runs and nothing reorders it, so the file reads correctly as it
@@ -1087,7 +1164,7 @@ test the core library or a dependency declares.
   ```text
   class Counter(start: int)
       var count = start
-      print(describe())            // error: `describe` is called before `label` is initialized
+      println(describe())            // error: `describe` is called before `label` is initialized
       register(self)               // error: `self` is passed, stored or returned before `label` is initialized
       val reader = () -> count     // error: a lambda that captures `self` is made before `label` is initialized
       val label = s"counter $start"
