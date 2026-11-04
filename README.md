@@ -12,7 +12,7 @@ area(shape: Shape) -> real = shape match
     Circle(r) -> 3.14159 * r * r
     Rect(w, h) -> w * h
 
-main() = print([Circle(1.0), Rect(2.0, 3.0)].map(area).sum())
+main() = println([Circle(1.0), Rect(2.0, 3.0)].map(area).sum())
 ```
 
 Algebraic data, pattern matching, closures, classes and traits, immutable collections and type

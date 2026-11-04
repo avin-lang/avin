@@ -225,7 +225,7 @@ stage_prefix() {
     # The runtime's archive, built by the staged compiler from the staged runtime into a cache of its
     # own: the one archive that build makes is the one an installed compiler looks for.
     mkdir -p $out/prime || return 1
-    print -r -- 'main() = print("primed")' > $out/prime/prime.avin
+    print -r -- 'main() = println("primed")' > $out/prime/prime.avin
     (cd $out/prime && env -u AVIN_ROOT AVIN_CACHE=$cache $stage/bin/avin build prime.avin -o prime) || return 1
     [[ $($out/prime/prime) == primed ]] || { print "the priming program did not run"; return 1 }
     local built=($cache/runtime/libavinrt-*.a(N))
@@ -282,8 +282,8 @@ version_check() {
 hello() {
     mkdir -p $work/hello || return 1
     print -r -- 'main()
-    print("Hello, Avin!")
-    print(6 * 7)' > $work/hello/hello.avin
+    println("Hello, Avin!")
+    println(6 * 7)' > $work/hello/hello.avin
 
     (cd $work/hello && installed build hello.avin -o hello) || return 1
     local said
@@ -303,7 +303,7 @@ hello() {
 
 bindings() {
     mkdir -p $work/bindings || return 1
-    print -r -- 'main() = print("avin".toUpper())' > $work/bindings/upper.avin
+    print -r -- 'main() = println("avin".toUpper())' > $work/bindings/upper.avin
     local said
     said=$(cd $work/bindings && installed run upper.avin) || return 1
     print -r -- $said

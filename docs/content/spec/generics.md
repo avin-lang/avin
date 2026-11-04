@@ -238,7 +238,7 @@ infer is.
 - An argument of type `Nothing` (a `break`, a `return`, `fail(…)`) decides no type argument, since
   the call is never made: the other arguments and the expected type decide them as they would
   alone, and one that only such an argument names is `Nothing`. So `identity(break 42)` and
-  `print(fail("unreachable"))` are well typed, while a `Nothing` argument beside `1` and `"one"`
+  `println(fail("unreachable"))` are well typed, while a `Nothing` argument beside `1` and `"one"`
   reconciles neither with the other, nor answers for a bound they break.
   Likewise a tuple or a collection literal with a part of type `Nothing` is never made, and has
   type `Nothing`.

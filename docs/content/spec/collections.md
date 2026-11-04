@@ -263,7 +263,7 @@ alike, whatever order they were built in.
 ```text
 var counts = Map.empty[string, int]()
 for w in words do counts = counts.updated(w, counts.getOrElse(w, 0) + 1)
-for (word, n) in counts do print(s"$word $n")
+for (word, n) in counts do println(s"$word $n")
 ```
 
 `m(k)` reads a value and traps when the key is absent; `m.get(k)` returns an `Option`, and
@@ -342,11 +342,11 @@ The three slices are collections of the same kind, sharing their structure with 
 
 ```text
 val scores = TreeMap(("cy", 7), ("al", 9), ("bo", 4))
-print(scores)                     // {al: 9, bo: 4, cy: 7}
-print(scores.range("b", "c"))     // {bo: 4}
-print(scores.floor("bz"))         // Some((bo, 4))
+println(scores)                     // {al: 9, bo: 4, cy: 7}
+println(scores.range("b", "c"))     // {bo: 4}
+println(scores.floor("bz"))         // Some((bo, 4))
 val small: TreeSet[int] = {5, 1, 3}
-print(small.until(4))             // {1, 3}
+println(small.until(4))             // {1, 3}
 ```
 
 `TreeMap.empty`, `TreeMap.builder` and `TreeMap((k, v), …)`, and the same for `TreeSet`, make them as
@@ -715,7 +715,7 @@ lets `break`, `continue` and `return` leave the body directly. A source with no 
 for i in 0..<n do total += i
 for (name, age) in people
     if age < 18 then continue
-    print(name)
+    println(name)
 ```
 
 ### Generators, guards and `yield`

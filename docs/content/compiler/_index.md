@@ -815,7 +815,7 @@ the process with every other thread in it.
 sees. The compiler knows a small, declared set of
 **intrinsics**: arithmetic on built-in types, allocation, field access and the runtime entry points.
 Each is declared in Avin source with `@intrinsic("…")` and has no body. Everything else, including
-`print`, is ordinary library code.
+`println`, is ordinary library code.
 
 An intrinsic that is not a string operation is lowered to a function whose body calls one runtime entry point, named in the
 checker's `intrinsic_entry` table with its parameters and result. The formatting library

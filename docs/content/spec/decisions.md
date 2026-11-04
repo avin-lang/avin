@@ -288,8 +288,10 @@ a decision changes, this page and the chapter change together.
 - A `for` with `yield` is comprehension sugar over `map`, `flatMap` and filtering; a `for` without
   `yield` loops over the source's iterator.
 - The collection hierarchy is rooted at `Iterable`, and `Iterator` is itself `Iterable`.
-- `print` is an ordinary library function. It renders with `Display`, separates its arguments with
-  `, ` and ends with a newline. `print(debug(x))` selects `Debug`.
+- `print` and `println` are ordinary library functions (settled 2026-11-04). Both render with `Display` and
+  separate several arguments with `, `, which is not a tuple; `println` ends with a newline and `print`
+  does not. `print()` writes nothing and `println()` writes a bare newline; `eprint` and `eprintln` are
+  the same for standard error. `println(debug(x))` selects `Debug`.
 - `debug(x)` yields `x`'s `Debug` form as a string. `Writer` writes strings (with `writeChar`,
   `writeInt`, `writeField` and `writeSpaces` beside `write`); `FormatSpec` is `width`, `precision`
   and `left`; `toString()` is a default body of `Display`.
@@ -1058,7 +1060,7 @@ Settled by the user on 2026-11-04:
   `readAll() -> string`, sharing one runtime-held buffer. A line ends at `\n` with a `\r` before it
   trimmed; the last line needs no terminator. Ill-formed UTF-8 becomes U+FFFD and a failed read ends
   the input, so reading standard input answers no `IoError`, where `fs.readText` answers
-  `InvalidUtf8`. `eprint(x)` mirrors `print` on standard error and is in the prelude with
+  `InvalidUtf8`. `eprintln(x)` mirrors `println` on standard error and is in the prelude with
   `StandardError`, an unbuffered `Writer`; every write to standard error flushes standard output
   first. A test run by `avin test` reads empty input.
 - Running and testing (stage 10): `avin run <program> [-O0 | -O2] [-- args]` builds into

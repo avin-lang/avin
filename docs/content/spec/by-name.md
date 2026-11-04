@@ -55,7 +55,7 @@ times(n: int, action: -> unit)
         i += 1
 
 times(3)
-    print("tick")
+    println("tick")
 ```
 
 The block is the delayed expression, with every rule above: it runs at each read of `action`, never

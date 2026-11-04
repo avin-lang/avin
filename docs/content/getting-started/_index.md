@@ -130,7 +130,7 @@ below()
 
 @test
 leavesInRange()
-    print("clamping 4")
+    println("clamping 4")
     assert(clamp(4, 1, 3) == 4, "four is left as it is")
 ```
 

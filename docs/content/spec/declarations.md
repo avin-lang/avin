@@ -10,7 +10,7 @@ weight: 13
 area(width: int, height: int) -> int = width * height
 
 greet(name: string)
-    print(s"hello, $name")
+    println(s"hello, $name")
 ```
 
 Every parameter has a declared type. The result type may be inferred, except for recursive functions.
@@ -313,7 +313,7 @@ derived one ([Display and Debug](/spec/equality-and-memory/#display-and-debug)).
 open class Account(owner: string, var balance: int)
     if balance < 0 then panic("an account cannot open overdrawn")
     val opened = clock.now()
-    print(s"opened an account for $owner")
+    println(s"opened an account for $owner")
 
     deposit(amount: int)
         balance += amount
@@ -676,7 +676,7 @@ impl[T: Ord] Seq[T]
 // main.avin
 import words
 
-main() = print("hey".shout())       // hey!
+main() = println("hey".shout())       // hey!
 ```
 
 - **An extension's methods are seen by its own module and by every file that imports the module**:
@@ -740,8 +740,8 @@ object Twice
     apply(s: string) -> string = s + s
 
 main()
-    print(Twice(21))       // 42
-    print(Twice("ab"))     // abab
+    println(Twice(21))       // 42
+    println(Twice("ab"))     // abab
 ```
 
 An object shares its name only with its companion class or `data` type. Where both exist, the name in
@@ -851,7 +851,7 @@ private scale() -> int = 3          // seen by every file of `shapes`, and nowhe
 // main.avin, in the program's root directory
 import shapes.{Circle, area as circleArea}
 
-main() = print(s"${circleArea(Circle(2))}")
+main() = println(s"${circleArea(Circle(2))}")
 ```
 
 - **A program is a directory tree.** Each directory under the program's root is a module named by
@@ -909,7 +909,7 @@ sees it.
 A paragraph between two indented blocks ends nothing, so a body can be explained a step
 at a time and picked up again where it left off.
 
-        print(h)
+        println(h)
 
 What a reader should *not* run gets a fence instead of an indent:
 
@@ -925,7 +925,7 @@ half(n: int) -> int = n / 2
 
 main()
     val h = half(9)
-    print(h)
+    println(h)
 ```
 
 The code appears in the order it runs and nothing reorders it, so the file reads correctly as it
@@ -1107,7 +1107,7 @@ test the core library or a dependency declares.
   ```text
   class Counter(start: int)
       var count = start
-      print(describe())            // error: `describe` is called before `label` is initialized
+      println(describe())            // error: `describe` is called before `label` is initialized
       register(self)               // error: `self` is passed, stored or returned before `label` is initialized
       val reader = () -> count     // error: a lambda that captures `self` is made before `label` is initialized
       val label = s"counter $start"

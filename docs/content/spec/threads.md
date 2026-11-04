@@ -142,7 +142,7 @@ main() -> int
         val words = load(path).split(" ")
         words.length()
     val both = for p in page, n in counted yield s"${p.charCount()} characters, $n words"
-    print(both.await())
+    println(both.await())
     0
 ```
 
