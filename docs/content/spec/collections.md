@@ -16,7 +16,8 @@ Iterable[+A]                 iterator(), and the operation families below
 ├── Iterator[+A]             single-pass; iterator() returns itself
 ├── Seq[+A]                  ordered, (Int) -> A
 │   ├── List[+A]             immutable linked list
-│   ├── Vector[+A]           immutable indexed; the default sequence
+│   ├── Vector[+A]           immutable, persistent tree; the default sequence
+│   ├── ArraySeq[+A]         immutable, one array; built once, then read
 │   ├── Range[A]             immutable arithmetic progression
 │   ├── Array[A]             mutable, fixed length, contiguous
 │   ├── Buffer[A]            mutable, growable at the end, contiguous
@@ -362,7 +363,7 @@ one.
 
 Literals always build the library's types, even when a user type named `Vector` is in scope.
 
-## Buffer and Vector
+## Buffer
 
 `Buffer[T]` is invariant, growable and mutable. `Buffer[int]()` is an empty buffer; `add(x)`, or
 `b += x`, appends in amortized constant time, `addAll(xs)`, or `b ++= xs`, appends each in turn, `insert(i, x)` and `remove(i)` work at any index, and `clear()` empties
@@ -370,11 +371,64 @@ it. `b(i)` and `b(i) = v` read and replace an element, and an index outside `0 .
 at the caller's line. Its elements live in an array with spare capacity, which never holds a value
 that is read before one is written, so a buffer needs no value to fill it with.
 
-`Vector[+T]` is the default sequence: immutable, covariant and indexed in constant time. Its
-elements are in one array that nothing writes to after the vector is made, so an operation that
-makes a changed vector (`xs :+ x`, `x +: xs`, `xs ++ ys`, `updated`) copies them. Both compare and
-hash by their elements in order, and display as an array does, `[1, 2, 3]`, where their elements
-display.
+## Vector
+
+`Vector[+T]` is the default sequence: immutable, covariant and persistent. A changed vector shares
+almost everything with the one it came from, so keeping both costs little, and either may be
+changed again.
+
+Its elements are in a tree of arrays of 32. The tree has a balanced middle and, at every level, a
+prefix and a suffix beside it: the arrays at the two ends, which is where a vector grows. Reading
+an element takes one array per level, and a vector of up to 2^31 elements has at most six. Adding
+an element at either end makes a new array at that end of the bottom level, and only when that
+array is full does the next level gain one; so `:+` and `+:` take amortized constant time.
+`updated` copies the arrays on one path from the top of the tree to the element. Slicing cuts the
+arrays at its two edges and shares the rest, so it takes time in the depth of the tree, not in the
+length of the slice.
+
+Every array in a vector's tree is exactly the size it holds and is never written once it is in the
+tree. The library ends the filling of each with a release fence, before the array is stored in
+another, and the vector's constructor ends with the fence [threads](/spec/threads/) describe, so a
+vector made by one thread is whole to any other thread that reads it.
+
+| Operation | Cost |
+|---|---|
+| `xs(i)`, `head()`, `last()` | O(log₃₂ n), at most six arrays |
+| `xs :+ x`, `x +: xs` | amortized O(1) |
+| `updated(i, x)` | O(log₃₂ n), one path copied |
+| `slice`, `take`, `drop`, `takeRight`, `dropRight`, `splitAt`, `tail`, `init` | O(log₃₂ n) |
+| `xs ++ ys` | O(min(length of xs, length of ys)) |
+| `length()`, `isEmpty()` | O(1) |
+| `iterator()`, `reverseIterator()`, `for`, `foldLeft`, `map`, `filter` | O(n), a leaf at a time |
+| `Vector.builder()`, `toVector()` | O(n), each array made once |
+
+A vector's iterators read one leaf after another, finding the next leaf only when one is used up.
+A builder fills leaves of 32 as elements come and makes the tree above them once, at `result()`.
+
+## ArraySeq
+
+`ArraySeq[+T]` is the immutable sequence whose elements are in one array that nothing writes to
+after it is made. There is no level between an index and its element, so `xs(i)` reads one array
+however long the sequence is, but every operation that makes a changed sequence (`xs :+ x`,
+`x +: xs`, `xs ++ ys`, `updated`) copies all of them: it is for elements built once and then read.
+`slice` copies the elements it keeps. `ArraySeq.empty[T]()` and `ArraySeq.builder[T]()` make one, as
+does `toArraySeq()` on any collection, or a literal whose expected type is an `ArraySeq`:
+
+```avin
+val xs: ArraySeq[int] = [1, 2, 3]
+val ys = xs :+ 4                    // [1, 2, 3, 4], a copy; xs is unchanged
+val v = ys.toVector()               // a Vector of the same elements
+```
+
+| Operation | Cost |
+|---|---|
+| `xs(i)`, `length()` | O(1) |
+| `xs :+ x`, `x +: xs`, `updated(i, x)`, `slice` | O(n), a copy |
+| `xs ++ ys` | O(length of xs + length of ys) |
+| `map`, `filter`, `collect`, `flatMap`, iteration | O(n) |
+
+Both `Vector` and `ArraySeq` compare and hash by their elements in order, and display as an array
+does, `[1, 2, 3]`, where their elements display.
 
 ## Seq
 

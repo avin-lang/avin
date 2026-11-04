@@ -1,114 +1,214 @@
 module avin
 
 // An immutable indexed sequence, and the default one: `[1, 2, 3]` is a `Vector[int]`. Its elements
-// are in one array that nothing writes to after the vector is made, so `v(i)` takes constant time,
-// and an operation that makes a changed vector, such as `:+` or `updated`, copies them.
-class Vector[+T](private val elements: FrozenArray[T]): Seq[T]
-    override length() -> int = elements.length()
+// are in a tree of arrays of 32, with a prefix and a suffix at each level beside a balanced middle
+// (the shapes are in vector_tree.avin). Reading an element takes one array per level, and a vector
+// of up to 2^31 elements has at most 6. Adding at either end writes into the array at that end, so
+// `:+` and `+:` take amortized constant time; `updated` copies one path from the top to a leaf; and
+// slicing makes new arrays only at the edges, sharing the rest, so it takes time proportional to the
+// depth. Versions of a vector share every array they have in common.
+abstract class Vector[+T]: Seq[T]
+    override toVector() -> Vector[T] = self
 
-    // The element at `index`, which traps when there is none.
-    override apply(index: int) -> T = elements(index)
+// The methods an `impl` adds to a class whose fields are all immutable are not variance positions,
+// so `T` may appear in a parameter: on a `Vector[Dog]` seen as a `Vector[Animal]`, `T` is `Animal`.
+impl[T] Vector[T]
+    // Steps through the elements a leaf at a time.
+    override iterator() -> VectorIterator[T]
+        val n = length()
+        if n == 0 then return VectorIterator(self, emptyArray(), 0)
+        VectorIterator(self, vectorLeaf(self, 0), n)
+
+    // Steps through the elements from the last to the first, a leaf at a time.
+    override reverseIterator() -> VectorReverseIterator[T]
+        val n = length()
+        if n == 0 then return VectorReverseIterator(self, emptyArray(), -1)
+        val leaf = vectorLeaf(self, n - 1)
+        VectorReverseIterator(self, leaf, n - leaf.length())
 
     // The elements from `from` up to `until`, which traps when the indices are not in order within
     // the vector.
-    slice(from: int, until: int) -> Vector[T] = Vector(elements.slice(from, until))
+    slice(from: int, until: int) -> Vector[T]
+        if from < 0 || until > length() || from > until then fail("slice out of range")
+        sliced(self, from, until)
+
+    // The first `n` elements, or all of them when there are fewer.
+    take(n: int) -> Vector[T] = sliced(self, 0, clamped(n, length()))
+
+    // The elements after the first `n`; empty when there are no more.
+    drop(n: int) -> Vector[T] = sliced(self, clamped(n, length()), length())
+
+    // The last `n` elements, or all of them when there are fewer.
+    takeRight(n: int) -> Vector[T] = sliced(self, length() - clamped(n, length()), length())
+
+    // The elements before the last `n`; empty when there are no more.
+    dropRight(n: int) -> Vector[T] = sliced(self, 0, length() - clamped(n, length()))
+
+    // The first `n` elements and the rest: `(take(n), drop(n))`.
+    splitAt(n: int) -> (Vector[T], Vector[T])
+        val k = clamped(n, length())
+        (sliced(self, 0, k), sliced(self, k, length()))
+
+    // Every element after the first, which traps on the empty vector.
+    tail() -> Vector[T]
+        if length() == 0 then fail("tail of an empty vector")
+        sliced(self, 1, length())
+
+    // Every element before the last, which traps on the empty vector.
+    init() -> Vector[T]
+        if length() == 0 then fail("init of an empty vector")
+        sliced(self, 0, length() - 1)
 
     // `f` of each element, in order.
     map[U](f: (T) -> U) -> Vector[U]
-        val b = Vector.builder[U]()
-        for i in 0 ..< elements.length() do b.add(f(elements(i)))
+        val b = VectorAssembler[U]()
+        for x in self do b.add(f(x))
         b.result()
 
     // The elements that satisfy `p`, in order.
     filter(p: (T) -> bool) -> Vector[T]
-        val b = Vector.builder[T]()
-        for i in 0 ..< elements.length()
-            val x = elements(i)
+        val b = VectorAssembler[T]()
+        for x in self
             if p(x) then b.add(x)
         b.result()
 
     // `pf` of each element it is defined at, in order: `xs.collect(match Some(n) -> n)`.
     collect[U](pf: PartialFunction[T, U]) -> Vector[U]
         val f = pf.lift()
-        val b = Vector.builder[U]()
-        for i in 0 ..< elements.length()
-            if f(elements(i)) is Some(u) then b.add(u)
+        val b = VectorAssembler[U]()
+        for x in self
+            if f(x) is Some(u) then b.add(u)
         b.result()
 
-    override toVector() -> Vector[T] = self
-
-    override iterator() -> Iterator[T] = VectorIterator(elements, 0)
-
-// The methods an `impl` adds to a class whose fields are all immutable are not variance positions,
-// so `T` may appear in a parameter: on a `Vector[Dog]` seen as a `Vector[Animal]`, `T` is `Animal`.
-impl[T] Vector[T]
     // The elements of the collections `f` makes of each element, joined in order.
     flatMap[U](f: (T) -> Iterable[U]) -> Vector[U]
-        val b = Vector.builder[U]()
-        for i in 0 ..< elements.length() do b.addAll(f(elements(i)))
+        val b = VectorAssembler[U]()
+        for x in self
+            for y in f(x) do b.add(y)
         b.result()
 
     // The elements that satisfy `p`, tested only as `map`, `flatMap` or `foreach` reaches each one.
     withFilter(p: (T) -> bool) -> FilteredVector[T] = FilteredVector(self, p)
 
     // This vector with `element` after its elements: `xs :+ x`.
-    :+(element: T) -> Vector[T]
-        val n = elements.length()
-        val a = newArray[T](n + 1)
-        for i in 0 ..< n do a(i) = elements(i)
-        a(n) = element
-        Vector(freeze(a))
+    :+(element: T) -> Vector[T] = self match
+        v: Vector2[T] -> v.appended(element)
+        v: Vector3[T] -> v.appended(element)
+        v: Vector1[T] -> v.appended(element)
+        v: Vector4[T] -> v.appended(element)
+        v: Vector5[T] -> v.appended(element)
+        v: Vector6[T] -> v.appended(element)
+        _ -> Vector1(single(element))
 
     // This vector with `element` before its elements: `x +: xs`.
-    +:(element: T) -> Vector[T]
-        val n = elements.length()
-        val a = newArray[T](n + 1)
-        a(0) = element
-        for i in 0 ..< n do a(i + 1) = elements(i)
-        Vector(freeze(a))
+    +:(element: T) -> Vector[T] = self match
+        v: Vector2[T] -> v.prepended(element)
+        v: Vector3[T] -> v.prepended(element)
+        v: Vector1[T] -> v.prepended(element)
+        v: Vector4[T] -> v.prepended(element)
+        v: Vector5[T] -> v.prepended(element)
+        v: Vector6[T] -> v.prepended(element)
+        _ -> Vector1(single(element))
 
-    // The elements of this vector followed by those of `other`: `xs ++ ys`.
+    // The elements of this vector followed by those of `other`: `xs ++ ys`. The shorter operand's
+    // elements are added one at a time to the longer one's end, so the time is proportional to the
+    // shorter's length; two operands of comparable length are copied into a new vector in one pass.
     ++(other: Vector[T]) -> Vector[T]
-        val n = elements.length()
+        val n = length()
         val m = other.length()
-        val a = newArray[T](n + m)
-        for i in 0 ..< n do a(i) = elements(i)
-        for i in 0 ..< m do a(n + i) = other(i)
-        Vector(freeze(a))
+        if m == 0 then return self
+        if n == 0 then return other
+        if m > 64 && n > 64 && m <= 8 * n && n <= 8 * m
+            val b = VectorAssembler[T]()
+            b.addVector(self)
+            b.addVector(other)
+            return b.result()
+        if m <= n
+            var out = self
+            for x in other do out = out :+ x
+            return out
+        var out = other
+        val it = reverseIterator()
+        while it.hasNext() do out = it.next() +: out
+        out
 
     // This vector with the element at `index` replaced by `element`; traps when there is none.
     updated(index: int, element: T) -> Vector[T]
-        if index < 0 || index >= elements.length() then fail("index out of range")
-        val a = newArray[T](elements.length())
-        for i in 0 ..< elements.length() do a(i) = elements(i)
-        a(index) = element
-        Vector(freeze(a))
+        if index < 0 || index >= length() then fail("index out of range")
+        self match
+            v: Vector2[T] -> v.updatedAt(index, element)
+            v: Vector3[T] -> v.updatedAt(index, element)
+            v: Vector1[T] -> v.updatedAt(index, element)
+            v: Vector4[T] -> v.updatedAt(index, element)
+            v: Vector5[T] -> v.updatedAt(index, element)
+            v: Vector6[T] -> v.updatedAt(index, element)
+            _ -> fail("index out of range")
+
+    // Calls `f` with each element, in order.
+    foreach(f: (T) -> unit)
+        for x in self do f(x)
+
+    // `f` applied to `initial` and the first element, then to that result and the second, and so on.
+    foldLeft[B](initial: B, f: (B, T) -> B) -> B
+        var acc = initial
+        for x in self do acc = f(acc, x)
+        acc
+
+    // Whether `p` holds for some element.
+    exists(p: (T) -> bool) -> bool
+        for x in self
+            if p(x) then return true
+        false
+
+    // Whether `p` holds for every element; true when there are none.
+    forall(p: (T) -> bool) -> bool
+        for x in self
+            if !p(x) then return false
+        true
+
+    // How many elements satisfy `p`.
+    count(p: (T) -> bool) -> int
+        var n = 0
+        for x in self
+            if p(x) then n += 1
+        n
 
     // A new array of the elements.
     toArray() -> Array[T]
-        val a = newArray[T](elements.length())
-        for i in 0 ..< elements.length() do a(i) = elements(i)
+        val n = length()
+        val a = newArray[T](n)
+        var at = 0
+        while at < n
+            val leaf = vectorLeaf(self, at)
+            for j in 0 ..< leaf.length() do a(at + j) = leaf(j)
+            at += leaf.length()
+        publish(a)
         a
 
     // A new buffer of the elements.
     toBuffer() -> Buffer[T]
         val b = Buffer[T]()
-        for i in 0 ..< elements.length() do b.add(elements(i))
+        for x in self do b.add(x)
         b
 
+    // The elements in one array, read in constant time without a tree.
+    override toArraySeq() -> ArraySeq[T] = ArraySeq(freeze(toArray()))
 
-// Two vectors are equal when they have equal elements in the same order.
+
+// Two vectors are equal when they have equal elements in the same order, however each was built.
 impl[T] Eq for Vector[T]
     equals(other: Vector[T]) -> bool
-        if elements.length() != other.length() then return false
-        for i in 0 ..< elements.length()
-            if !elements(i).equals(other(i)) then return false
+        if length() != other.length() then return false
+        val a = iterator()
+        val b = other.iterator()
+        while a.hasNext()
+            if !a.next().equals(b.next()) then return false
         true
 
 impl[T] Hash for Vector[T]
     hash() -> long
         var h = long(1)
-        for i in 0 ..< elements.length() do h = h *% 31 +% elements(i).hash()
+        for x in self do h = h *% 31 +% x.hash()
         h
 
 // A vector of displayable elements displays as `[1, 2, 3]`, as an array does. A field width pads the
@@ -121,9 +221,11 @@ impl[T: Display] Display for Vector[T]
             out.writeField(text.text(), spec)
             return
         out.write("[")
-        for i in 0 ..< elements.length()
-            if i > 0 then out.write(", ")
-            elements(i).display(out, FormatSpec())
+        var first = true
+        for x in self
+            if !first then out.write(", ")
+            first = false
+            x.display(out, FormatSpec())
         out.write("]")
 
 // A vector's diagnostic form is its elements' diagnostic forms in brackets: `["a", "b"]`.
@@ -135,28 +237,31 @@ impl[T: Debug] Debug for Vector[T]
             out.writeField(text.text(), spec)
             return
         out.write("[")
-        for i in 0 ..< elements.length()
-            if i > 0 then out.write(", ")
-            elements(i).debug(out, FormatSpec())
+        var first = true
+        for x in self
+            if !first then out.write(", ")
+            first = false
+            x.debug(out, FormatSpec())
         out.write("]")
 
 object Vector
     // A vector with no elements.
-    empty[T]() -> Vector[T] = Vector(freeze(newArray[T](0)))
+    empty[T]() -> Vector[T] = Vector0()
 
     // A builder of a vector: the elements it is given, in order.
-    builder[T]() -> VectorBuilder[T] = VectorBuilder(Buffer[T](), false)
+    builder[T]() -> VectorBuilder[T] = VectorBuilder(VectorAssembler[T](), false)
 
-// Builds a vector from the elements given to it, which it keeps in a buffer until `result()`.
-class VectorBuilder[T](private val buffer: Buffer[T], private var spent: bool): Builder[T, Vector[T]]
+// Builds a vector from the elements given to it, filling leaves of 32 as they come and making the
+// tree above them once, at `result()`.
+class VectorBuilder[T](private val assembler: VectorAssembler[T], private var spent: bool): Builder[T, Vector[T]]
     override add(element: T)
         if spent then fail("add to a builder whose result was taken")
-        buffer.add(element)
+        assembler.add(element)
 
     override result() -> Vector[T]
         if spent then fail("result of a builder whose result was taken")
         spent = true
-        buffer.toVector()
+        assembler.result()
 
 // A vector seen through a test, which a guard of a `for` with `yield` makes: each element is tested
 // just before the call after it would use it, so a guard runs in turn with the rest of the
@@ -184,12 +289,64 @@ class FilteredVector[T](private val vector: Vector[T], private val p: (T) -> boo
         for x in vector
             if p(x) then f(x)
 
-// Steps through a vector's elements.
-private class VectorIterator[T](items: FrozenArray[T], private var index: int): Iterator[T]
-    override hasNext() -> bool = index < items.length()
+// Steps through a vector's elements, reading each leaf's elements in turn and finding the next leaf
+// only when one is used up. `start` is the index of the leaf's first element.
+class VectorIterator[T](private val vector: Vector[T], private var leaf: FrozenArray[T], private val total: int): Iterator[T]
+    private var pos = 0
+    private var start = 0
+
+    override hasNext() -> bool = start + pos < total
 
     override next() -> T
-        if index >= items.length() then fail("next on an exhausted iterator")
-        val value = items(index)
-        index += 1
+        if pos >= leaf.length()
+            start += leaf.length()
+            if start >= total then fail("next on an exhausted iterator")
+            leaf = vectorLeaf(vector, start)
+            pos = 0
+        val value = leaf(pos)
+        pos += 1
         value
+
+// Steps through a vector's elements from the last, a leaf at a time. `start` is the index of the
+// leaf's first element, and `pos` the position in the leaf of the next element.
+class VectorReverseIterator[T](private val vector: Vector[T], private var leaf: FrozenArray[T], private var start: int): Iterator[T]
+    private var pos = leaf.length() - 1
+
+    override hasNext() -> bool = start + pos >= 0
+
+    override next() -> T
+        if pos < 0
+            if start <= 0 then fail("next on an exhausted iterator")
+            leaf = vectorLeaf(vector, start - 1)
+            start -= leaf.length()
+            pos = leaf.length() - 1
+        val value = leaf(pos)
+        pos -= 1
+        value
+
+// The elements of `v` from `lo` up to `hi`, which lie in order within it.
+private sliced[T](v: Vector[T], lo: int, hi: int) -> Vector[T]
+    if lo == 0 && hi == v.length() then return v
+    if lo >= hi then return Vector0()
+    v match
+        x: Vector1[T] -> Vector1(x.data1.slice(lo, hi))
+        _ ->
+            val s = newSlicer[T]()
+            v match
+                x: Vector2[T] -> x.feed(s, lo, hi)
+                x: Vector3[T] -> x.feed(s, lo, hi)
+                x: Vector4[T] -> x.feed(s, lo, hi)
+                x: Vector5[T] -> x.feed(s, lo, hi)
+                x: Vector6[T] -> x.feed(s, lo, hi)
+                _ -> ()
+            s.result()
+
+// `n` held within `0` and `limit`.
+private clamped(n: int, limit: int) -> int = if n < 0 then 0 elif n > limit then limit else n
+
+// The number of elements of `v`, and the leaf that holds its element at `index`: how a conversion to
+// Sysl reads a vector's elements, a leaf at a time.
+private vectorLength[T](v: Vector[T]) -> int = v.length()
+
+// The vector of the elements of an array a conversion from Sysl has made and nothing else holds.
+private vectorOfArray[T](elements: Array[T]) -> Vector[T] = vectorOf(freeze(elements))
