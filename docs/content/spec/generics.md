@@ -158,6 +158,11 @@ contravariant, plain `T` invariant. A function's or an `impl`'s type parameters 
 - Where two branches yield instances of one generic type, they agree on the instance whose
   covariant arguments are their arguments' agreement: `if c then Some(dog) else Some(cat)` is an
   `Option[Animal]`.
+- Branches that agree on no type of their own agree on the type expected of them when both are
+  instances of it, also while its type arguments are still being inferred: in
+  `v.flatMap(n -> if n == 2 then List.empty[int]() else v)` the lambda is expected to yield an
+  `Iterable[U]`, so its branches agree on `Iterable[int]`, and `U` is `int`. The same holds for
+  the arms of a `match` and for a loop's `else` and its `break`s.
 
 The checker verifies each declared parameter's positions:
 

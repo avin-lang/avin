@@ -5433,7 +5433,7 @@ private check_class_body_upto(c: *Checker, k: usize, index: usize)
 // match.
 private check_definition(c: *Checker, id: usize, subjects: Buf[&TExpr])
     val decl = c.symbols[id].decl
-    if decl.body is Some(body) then check_body(c, id, body)
+    if decl.body is Some(body) then check_body(c, id, body, None)
     elif decl.clauses.len() > 0 then check_clauses(c, id, subjects)
 
 // Each clause is checked like a match arm over all the parameters at once: its pattern names are
@@ -5503,7 +5503,10 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
     c.bodies.set(id, Some(TExpr(decl.span, result, Clauses(matched, typed))))
 
 // Checks a function's body against its declared result, or infers the result from it.
-private check_body(c: *Checker, id: usize, body: &Expr)
+// `hint` is the shape a body whose result is inferred is expected to have, such as the `Iterable[U]`
+// a lambda passed to `flatMap` yields while `U` is still unknown: branches that agree on no type of
+// their own are taken as that shape where both fit it.
+private check_body(c: *Checker, id: usize, body: &Expr, hint: Option[&Type])
     val symbol = c.symbols[id]
     // The default of a by-name parameter is checked as an argument to it is: a delayed expression.
     if symbol.default_param is Some(_) && symbol.result is Some(r)
@@ -5512,7 +5515,7 @@ private check_body(c: *Checker, id: usize, body: &Expr)
             val delayed = lambda_expr(c, body, buf(), body, Some(expected), true)
             c.bodies.set(id, Some(TExpr(body.span, r, delayed.kind)))
             return
-    val typed = check_expr(c, body, symbol.result)
+    val typed = check_expr(c, body, if symbol.result is Some(_) then symbol.result else hint)
     symbol.result match
         Some(declared) ->
             if !fits(c,typed.ty, declared) && !(*declared is Unit)
@@ -8255,7 +8258,7 @@ private while_expr(c: *Checker, e: &Expr, condition: &Expr, body: &Expr, otherwi
             if !(*site.ty is Unit || *site.ty is ErrorType)
                 c.note(unit, site.span, "a `break` with a value needs its loop to have an `else`")
         elif used
-            join(c, ty, site.ty) match
+            join_expected(c, ty, site.ty, expected) match
                 Some(t) -> ty = t
                 None -> c.note(unit, site.span, s"this `break` yields ${type_name(site.ty)}, but the loop yields ${type_name(ty)}")
     if !used then ty = Unit
@@ -10456,9 +10459,13 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
                 elif !mismatched then c.note(unit, p.span, s"cannot infer the type of `${p.name}`; write it, as in `(${p.name}: int) -> …`")
         types.push(ty)
     var result: Option[&Type] = None
+    // A result still partly unknown is inferred from the body, which is checked against its known
+    // shape; one wholly unknown says nothing.
+    var hint: Option[&Type] = None
     if wanted_result is Some(r)
         val known = zonk(c, r)
         if !has_unknowns(known) then result = Some(known)
+        elif !(*known is Var(_)) then hint = Some(known)
     val enclosing = c.symbols[c.current]
     val decl = Function(buf(), e.span, e.span, "lambda", buf(), buf(), None, Some(body), buf())
     val id = c.symbols.len()
@@ -10479,7 +10486,7 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     for i in 0..<params.len()
         param_locals.push(declare_local(c, params[i].span, names[i], types[i], false))
     c.symbols[id].param_locals = param_locals
-    check_body(c, id, body)
+    check_body(c, id, body, hint)
     c.body.visible.truncate(mark)
     c.body.block_start = outer_start
     c.body.loops = loops
