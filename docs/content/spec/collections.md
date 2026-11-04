@@ -58,6 +58,11 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
   sequence has it, through an impl adding it to `Seq`, and so do sets, and maps, whose entries join
   as `key: value`, the form a displayed map shows. `max()` and `min()` on every sequence of `Ord`
   elements answer `Some` of the greatest or least, the first of equal ones, and `None` when empty.
+  `sum()` and `product()` are added to `Iterable` the same way, so every collection has them, ranges
+  and sets included, where its elements have `Add` or `Mul`: they answer the total or the product,
+  and the identity (`T.zero()`, `T.one()`) when empty, so `[1, 2, 3].sum()` is `6`, `(1..5).product()`
+  is `120`, and the `sum` of no `real`s is `0.0` and of no strings is `""`. Overflow traps as `+` does,
+  and strings concatenate in `sum` but have no `product`.
 
 ## Builders
 
