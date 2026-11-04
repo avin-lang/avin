@@ -629,97 +629,41 @@ lsp_document_symbols(server: LspServer, params: Json) -> Json
     var out: Buf[Json] = buf()
     for item in file.items
         item match
-            FunctionItem(f) -> out.push(lsp_symbol(src, f.name, SymbolFunction, lsp_extent(src, f.span), name_in(src, f.name_span, f.name), buf()))
+            FunctionItem(f) -> out.push(lsp_symbol(src, f.name, SymbolFunction, f.span, name_in(src, f.name_span, f.name), buf()))
             DataItem(data) ->
                 var variants: Buf[Json] = buf()
                 for v in data.variants
-                    variants.push(lsp_symbol(src, v.name, SymbolEnumMember, lsp_extent(src, v.span), name_in(src, v.span, v.name), buf()))
-                out.push(lsp_symbol(src, data.name, SymbolEnum, lsp_extent(src, data.span), name_in(src, data.span, data.name), variants))
+                    variants.push(lsp_symbol(src, v.name, SymbolEnumMember, v.span, name_in(src, v.span, v.name), buf()))
+                out.push(lsp_symbol(src, data.name, SymbolEnum, data.span, name_in(src, data.span, data.name), variants))
             ClassItem(decl) ->
                 var members: Buf[Json] = buf()
                 for cp in decl.params
                     val name = lsp_pattern_name(cp.param.pattern)
-                    members.push(lsp_symbol(src, name, SymbolField, lsp_extent(src, cp.param.span), name_in(src, cp.param.span, name), buf()))
+                    members.push(lsp_symbol(src, name, SymbolField, cp.param.span, name_in(src, cp.param.span, name), buf()))
                 lsp_members(src, decl.members, &members)
                 val kind = if decl.object then SymbolObject elif decl.modifier == "trait" then SymbolInterface else SymbolClass
-                out.push(lsp_symbol(src, decl.name, kind, lsp_extent(src, decl.span), name_in(src, decl.name_span, decl.name), members))
+                out.push(lsp_symbol(src, decl.name, kind, decl.span, name_in(src, decl.name_span, decl.name), members))
             ImplItem(decl) ->
                 var members: Buf[Json] = buf()
                 lsp_members(src, decl.members, &members)
                 val name = decl.trait_name match
                     Some(t) -> s"impl ${show_type(t)} for ${show_type(decl.target)}"
                     None -> s"impl ${show_type(decl.target)}"
-                out.push(lsp_symbol(src, name, SymbolNamespace, lsp_extent(src, decl.span), lsp_extent(src, decl.target.span), members))
-            ValueItem(v) -> out.push(lsp_symbol(src, v.name, if v.mutable then SymbolVariable else SymbolConstant, lsp_extent(src, v.span), name_in(src, v.span, v.name), buf()))
+                out.push(lsp_symbol(src, name, SymbolNamespace, decl.span, decl.target.span, members))
+            ValueItem(v) -> out.push(lsp_symbol(src, v.name, if v.mutable then SymbolVariable else SymbolConstant, v.span,name_in(src, v.span, v.name), buf()))
     Json.Arr(out)
 
 private lsp_members(src: Source, members: Buf[ClassMember], out: *Buf[Json])
     for m in members
         m match
-            FieldMember(f) -> out.push(lsp_symbol(src, f.name, SymbolField, lsp_extent(src, f.span), name_in(src, f.span, f.name), buf()))
-            AbstractFieldMember(f) -> out.push(lsp_symbol(src, f.name, SymbolField, lsp_extent(src, f.span), name_in(src, f.name_span, f.name), buf()))
-            MethodMember(method, _, _, _) -> out.push(lsp_symbol(src, method.name, SymbolMethod, lsp_extent(src, method.span), name_in(src, method.name_span, method.name), buf()))
+            FieldMember(f) -> out.push(lsp_symbol(src, f.name, SymbolField, f.span, name_in(src, f.span, f.name), buf()))
+            AbstractFieldMember(f) -> out.push(lsp_symbol(src, f.name, SymbolField, f.span, name_in(src, f.name_span, f.name), buf()))
+            MethodMember(method, _, _, _) -> out.push(lsp_symbol(src, method.name, SymbolMethod, method.span,name_in(src, method.name_span, method.name), buf()))
             StatementMember(_) -> ()
 
 private lsp_pattern_name(p: &Pattern) -> string = p.kind match
     Name(n) -> n
     _ -> show_pattern(p)
-
-// A declaration's extent, for the outline. The span the parser gives many declarations runs on to the
-// token after them -- the next declaration's first word, or the `,` or `)` after a parameter -- so
-// it is cut where the layout ends the declaration: a declaration that begins a line goes on over the
-// lines indented further than it, and one written after something else on its line, a class's
-// parameter, ends before the `,` or the unopened `)` that follows it.
-private lsp_extent(src: Source, span: Span) -> Span
-    val b = src.bytes
-    var end = if span.end > b.len then b.len else span.end
-    if end <= span.start then return Span(span.start, span.start)
-    var line_start = span.start
-    while line_start > 0 && b[line_start - 1] != u8('\n')
-        line_start -= 1
-    var leads = true
-    for i in line_start..<span.start
-        if !lsp_blank(b[i]) then leads = false
-    if leads
-        val laid = lsp_layout_end(b, span.start, span.start - line_start)
-        if laid < end then end = laid
-    else
-        val last = b[end - 1]
-        if last == u8(',') || (last == u8(')') || last == u8(']')) && !lsp_balanced(b, span.start, end) then end -= 1
-    while end > span.start && lsp_blank(b[end - 1])
-        end -= 1
-    Span(span.start, end)
-
-// Where a declaration beginning at `start`, indented by `indent`, ends: the end of its own line or of
-// the last line after it indented further, blank lines between them aside.
-private lsp_layout_end(b: []const u8, start: usize, indent: usize) -> usize
-    var at = start
-    while at < b.len && b[at] != u8('\n')
-        at += 1
-    var end = at
-    while at < b.len
-        val line = at + 1
-        var first = line
-        while first < b.len && (b[first] == u8(' ') || b[first] == u8('\t'))
-            first += 1
-        var next = first
-        while next < b.len && b[next] != u8('\n')
-            next += 1
-        if first < next && b[first] != u8('\r')
-            if first - line <= indent then return end
-            end = next
-        at = next
-    end
-
-private lsp_blank(c: u8) -> bool = c == u8(' ') || c == u8('\t') || c == u8('\r') || c == u8('\n')
-
-// Whether the brackets between `from` and `to` close every one they open.
-private lsp_balanced(b: []const u8, from: usize, to: usize) -> bool
-    var depth = 0
-    for i in from..<to
-        if b[i] == u8('(') || b[i] == u8('[') then depth += 1
-        elif b[i] == u8(')') || b[i] == u8(']') then depth -= 1
-    depth == 0
 
 // One `DocumentSymbol`. The protocol asks that the name's range lie inside the declaration's, so a
 // name found outside it is taken as the declaration's start.
