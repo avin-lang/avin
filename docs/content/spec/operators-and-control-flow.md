@@ -136,15 +136,16 @@ class Bag(val items: Vector[int])
 named by a symbol. Most of the language's own operators are not method names, because a type has
 them through their traits: declaring a method named `+` is an error that says to implement `Add`.
 The reserved spellings are `+` `-` `*` `/` `%`, the wrapping and saturating `+%` `-%` `*%` `+|` `-|`
-`*|`, `<<` `>>`, `!` `&&` `||`, `==` `!=` `<` `<=` `>` `>=` `===` `!==`, `::`, `=` `:=` `:` `?`
-`->` `=>`, and each yielding compound form such as `+:=`. Every other run is free, `++`, `--` and the
-plain compound spellings `+=` and `-=` among them.
+`*|`, `!` `&&` `||`, `==` `!=` `<` `<=` `>` `>=` `===` `!==`, `::`, `=` `:=` `:` `?` `->` `=>`,
+and each yielding compound form such as `+:=` and `<<:=`. Every other run is free, `++`, `--`,
+`>>>` and the plain compound spellings `+=` and `-=` among them.
 
-`&`, `^`, `|`, and `~` between two operands, are free too, on every type but the integers and bytes,
-whose bitwise operators are the machine's: a method of one of these names on `int` or `byte`, in an
-extension too, is an error. On any other type, `a | b` calls `a`'s method `|`, so a parser
-combinator, a set of flags or a query builder can be written with them. Prefix `~` stays the
-integers' and bytes' complement, and `~a` on another type is an error.
+`&`, `^`, `|`, `~` between two operands, and the shifts `<<` and `>>`, are free too, on every type
+but the integers and bytes, whose bitwise and shift operators are the machine's: a method of one of
+these names on `int` or `byte`, in an extension too, is an error. On any other type, `a | b` calls
+`a`'s method `|` and `a >> b` its method `>>`, each at its operator's own level, so a parser
+combinator (`p >> f`), a set of flags, a stream or a query builder can be written with them. Prefix
+`~` stays the integers' and bytes' complement, and `~a` on another type is an error.
 
 ```text
 data Flags(bits: int)
@@ -200,8 +201,8 @@ so `a ++ -b`, with a prefix operator after `++`, is `(a++) - b`, written `a ++ (
 `x op= y` calls `x`'s method named `op=` when the type of `x` has one: `buffer += 3` appends, and
 the buffer need not be a `var`. Otherwise `op=` assigns. Where `op` is one of the language's
 arithmetic, wrapping, saturating, shift or bitwise operators, it is the compound assignment it has
-always been; where `op` is a symbol method, or `&`, `^` or `|` on a type that has a method of that
-name, `x op= y` is `x = x op y`, so `flags |= Flags(4)` combines flags into a `var`, and `xs ++= ys` joins onto a
+always been; where `op` is a symbol method, or `&`, `^`, `|`, `<<` or `>>` on a type that has a
+method of that name, `x op= y` is `x = x op y`, so `flags |= Flags(4)` combines flags into a `var`, and `xs ++= ys` joins onto a
 `var` vector and `xs :+= 4` appends to it. The target is a `var` local, a `var` field, a module
 value or an element `xs(i)`, and its object and indices are evaluated once. A right-grouping name
 has no compound form, and the yielding forms (`+:=`) belong to the language's operators alone. A
@@ -547,7 +548,10 @@ this way tests its patterns and guards once each time it is called, lifted or gi
 ## is
 
 `x is P` tests a value against any pattern a `match` arm takes and yields a `bool`; `x is not P` is
-its negation. The names `P` binds are in scope only where the test is known to have matched:
+its negation. `not` is a keyword only there, directly after `is`, where it always negates: `x is
+not(y)` tests the pattern `(y)`. Everywhere else `not` is an ordinary name, so a function, method,
+parameter or local may be called `not` and `not(p)` calls it. The names `P` binds are in scope only
+where the test is known to have matched:
 
 ```text
 area(shape: Option[Shape]) -> int

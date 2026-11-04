@@ -775,6 +775,21 @@ Settled by the user on 2026-11-04:
   call binds at the level of `a max b`. See [methods named by
   symbols](/spec/operators-and-control-flow/#methods-named-by-symbols).
 
+- **The shifts `<<` and `>>` are free method names on the same terms as `&`, `^` and `|`** (user,
+  2026-11-04), so a parser combinator library can spell sequencing-then-map `p >> f`. On every type
+  but the integers and bytes, `a << b` and `a >> b` call the methods of those names, at the shifts'
+  own level, that of multiplication (`a ++ b >> f` is `a ++ (b >> f)`, `a >> f | b` is
+  `(a >> f) | b`); `x <<= y` calls `<<=` where the type has one and is otherwise `x = x << y`. The
+  integers' and bytes' shifts stay the machine's and cannot be redefined, by an extension either,
+  and the yielding forms `<<:=` and `>>:=` stay reserved. Avin has no `>>>` operator, so `>>>` was
+  already a free name. This amends the rule above. See [methods named by
+  symbols](/spec/operators-and-control-flow/#methods-named-by-symbols).
+
+- **`not` is a soft keyword: a keyword only directly after `is`** (user, 2026-11-04), so the parsing
+  library can name its negative lookahead `not(p)`. After `is` it is always the keyword, so `x is
+  not(y)` negates the pattern `(y)`; everywhere else it is an ordinary name, and a function, method,
+  parameter or local may be called `not`. See [is](/spec/operators-and-control-flow/#is).
+
 - **A method named by a symbol with `~` anywhere in its name binds at the tightest symbol level**,
   whatever its first character: `~`, `~>`, `<~`, `~!`, `<~>` and `^~` bind together there and group
   left, so `num | symbol("(") ~> expr <~ symbol(")")` is `num | ((symbol("(") ~> expr) <~
