@@ -34,6 +34,7 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
 
 | Chapter | Contents |
 | --- | --- |
+| [The AVIN philosophy](/spec/philosophy/) | Abstraction, Versatility, Intuition and Naturalness: the principles behind the design |
 | [Design choices](/spec/design/) | The choices that shape the type system, runtime and library |
 | [Types](/spec/types/) | Built-in types, numbers, strings, tuples, functions, `Any`/`Nothing` |
 | [Declarations](/spec/declarations/) | `data`, `class`, `trait`, `object`, `impl`, members, modules, initialization |
