@@ -164,6 +164,7 @@ copyNotes(from: string, to: string) -> Result[unit, IoError]
 | `createDir(dir) -> Result[unit, IoError]` | Makes one directory, whose parent must exist; `AlreadyExists` if something is there. |
 | `createDirAll(dir) -> Result[unit, IoError]` | Makes the directory and every missing one above it; a directory already there is success, a file in the way an error. |
 | `createTempDir(prefix) -> Result[string, IoError]` | Makes a new, empty directory in the platform's place for temporary files, its name starting with `prefix`, and answers its path. |
+| `listDir(dir) -> Result[Vector[string], IoError]` | The names of the directory's entries, files and directories alike; `NotFound` or `NotADirectory` when there is no directory to list. |
 
 **Paths are strings**, and the questions follow symbolic links: `isDir` of a link to a directory is
 `true`. `removeDirAll` is the exception that matters: a link inside the tree is removed, never
@@ -176,5 +177,13 @@ inventing a name, so no other program can take it in between, and nothing remove
 **Bytes are copied.** The array `readBytes` answers is new, and changing it changes nothing on disk;
 the array given to `writeBytes` is read once and left as it was.
 
-Listing a directory's entries is not yet offered: it needs a list of names to come back from the
-platform, which a binding cannot yet carry.
+**A listing is names, in no promised order.** `listDir` answers each entry's name alone, without
+the directory before it, and leaves out `.` and `..`; what is inside a subdirectory is not listed.
+The order is the one the file system keeps, which is not sorted and may differ between two listings
+of one directory, so a program that wants an order applies one. A name that is not UTF-8 makes the
+whole listing `InvalidUtf8` rather than leaving that name out.
+
+```text
+for name in fs.listDir(dir)?
+    if name.endsWith(".txt") then print(name)
+```

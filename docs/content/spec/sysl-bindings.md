@@ -64,21 +64,58 @@ Data crosses the boundary in a fixed set of shapes:
 | `i8`, `i16`, `int`, `long`, `byte`, `real`, `char`, `bool`, `unit` | By value; Sysl's `u8` is `byte` |
 | `string` | Copied into a Sysl `string` in each direction |
 | `Array[byte]` | Copied into a Sysl `[]u8` in each direction |
+| `Array[T]`, `Vector[T]` of any other boundary type | **Copied**, element by element: into a Sysl slice `[]T`, and out of a Sysl `[]T` or `Buf[T]` into a new array or vector |
 | `Option[T]`, `Result[T, E]` of boundary types | Converted variant by variant by the generated shim |
 | `data` declared with `@sysl("…")` mirroring a Sysl struct or enum of boundary types | Converted field by field |
 | `class` declared with `@sysl("…")` | An **opaque handle**: an Avin object owning one counted Sysl reference, released by `close()` or, as a safety net, a finalizer. Its methods are bindings too. |
 
-These shapes nest: a `Result[Option[string], IoError]` crosses, and so does a mirror whose fields
-are `Option`s or other mirrors. No other collection crosses: an `Array` of anything but `byte`, a
-`Vector` or a `Map` is converted by the Avin function that wraps the binding.
+These shapes nest: a `Result[Option[string], IoError]` crosses, and so do a
+`Result[Vector[string], IoError]`, a `Vector[Vector[string]]`, a `Vector[Array[byte]]` and a mirror
+whose fields are `Option`s, collections or other mirrors.
+
+### Collections are copies
+
+A collection crosses the boundary **as a copy**, so neither side ever holds the other's memory:
+
+- **Into Sysl**, an `Array[T]` or a `Vector[T]` parameter becomes a fresh Sysl slice `[]T` of its
+  elements, each converted; the Sysl function may take it as a `[]T` or a `[]const T`. Changing the
+  slice does not change the Avin array.
+- **Out of Sysl**, a slice or a `Buf` of a boundary type becomes a fresh Avin collection. A binding
+  usually declares a **`Vector[T]`**, the immutable sequence the standard library's functions answer
+  with; it may declare an **`Array[T]`** instead, a new array no one else holds. Which of `[]T` and
+  `Buf[T]` the Sysl function returns does not matter: the shim takes either.
 
 ```text
-error: `Vector[string]` cannot cross to Sysl; a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, `Array[byte]`, `Option` and `Result` of these, and data types declared with `@sysl` to mirror a Sysl enum or struct
+@sysl("sysl.fs.entries")
+private entries(dir: string) -> Result[Vector[string], SyslIoError]
+
+@sysl("sysl.path.join_all")
+private joinAll(parts: Vector[string]) -> string
+```
+
+A copy costs time in the length of the collection, which is the right trade for a boundary between
+two memory models: a vector a binding answers is an ordinary Avin vector, collected like any other,
+and the Sysl buffer it came from is released when the shim returns.
+
+A Sysl function, or a mirrored struct's field, that takes a `Buf[T]` rather than a slice is not
+reached through a collection: Sysl's own functions take slices. A collection whose elements do not
+fit the Sysl function is reported at the binding, in each direction:
+
+```text
+error: the Sysl binding `splitInts` does not match `sysl.text.split`: `Vector[int]` is made from a Sysl `[]int` or `Buf[int]`, and the value is none of these
+```
+
+No other collection crosses: a `List`, a `Buffer`, a `Map` or a `Set` is converted by the Avin
+function that wraps the binding, and an `Array` or a `Vector` crosses only when its elements do.
+
+```text
+error: `Vector[(int, int)]` cannot cross to Sysl; a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, data types declared with `@sysl` to mirror a Sysl enum or struct, and `Array`, `Vector`, `Option` and `Result` of these
 ```
 
 **Avin heap references never enter Sysl memory.** A Sysl container cannot hold an Avin object,
 because Sysl's reference counting cannot keep an Avin object alive and the collector cannot see Sysl
-memory. Avin's own collections are written in Avin, so the standard library has no need for Sysl
+memory. That is why a collection crosses as a copy of its elements, never as the Avin array itself.
+Avin's own collections are written in Avin, so the standard library has no need for Sysl
 containers of Avin values.
 
 ## Mirrors
@@ -113,9 +150,10 @@ readText(file: string) -> Result[string, IoError]
   struct's fields of the same names: `data LocalDate` with the one variant `LocalDate(day: int)`
   mirrors `sysl.time.LocalDate`.
 - **A field is a boundary type.** An integer field takes any Sysl integer, converted with a check in
-  each direction: Avin has no unsigned integers, so Sysl's `usize` offset above is a `long`.
+  each direction: Avin has no unsigned integers, so Sysl's `usize` offset above is a `long`. A
+  collection field is copied as a binding's collection is.
 - A mirror has no type parameters, and none of its fields holds the mirror itself, directly or
-  through an `Option`, a `Result` or another mirror.
+  through an `Option`, a `Result`, a collection or another mirror.
 
 Sysl checks a mirror against the type it names when it checks a shim that converts one, so a missing
 variant, a field of the wrong type or a name Sysl does not declare is reported at the mirror, in

@@ -403,8 +403,13 @@ a decision changes, this page and the chapter change together.
   enum's variants are matched by name and their fields by position; a struct is mirrored by one
   variant named as the type, whose fields are matched by name. A mirror has no type parameters and
   never holds itself. An integer field takes any Sysl integer, converted with a check in each
-  direction, so a Sysl `usize` is mirrored by a `long`. Of the collections only `Array[byte]`
-  crosses.
+  direction, so a Sysl `usize` is mirrored by a `long`.
+- Settled by the user 2026-11-03: **Sysl collections cross the binding boundary as copies.** A Sysl
+  slice or `Buf` of a boundary type in a result becomes a fresh Avin `Vector[T]` (or a fresh
+  `Array[T]`, where the binding declares one); an Avin `Array[T]` or `Vector[T]` parameter of a
+  boundary type is copied into a Sysl slice. Collections nest, inside one another, `Option`,
+  `Result` and mirrors' fields. `Array[byte]` stays a bulk copy to and from `[]u8`. No other Avin
+  collection crosses.
 - `Option[+T]` and `Result[+T, +E]` are `data` types of the core library, written in Avin, with
   their methods in an `impl`. Those methods are not variance positions, so `getOrElse(default: -> T)`
   takes `T` in a parameter and needs no lower bound: on an `Option[Dog]` seen as an `Option[Animal]`,
@@ -568,8 +573,9 @@ Settled by the user on 2026-11-03:
   `appendText`, `writeBytes`, `appendBytes`), asks `exists`, `isDir` and `isFile`, and makes and
   removes (`createDir`, `createDirAll`, `createTempDir`, `remove`, `removeDir`, `removeDirAll`),
   each failure an `IoError` in a `Result`. Writing replaces a file and appending creates one;
-  `createDirAll` accepts a directory already there and `removeDirAll` a path already gone. Listing a
-  directory waits for a binding that can carry a list of strings.
+  `createDirAll` accepts a directory already there and `removeDirAll` a path already gone.
+  `listDir(dir) -> Result[Vector[string], IoError]` answers the entries' names, without the
+  directory and without `.` and `..`, in the file system's order, which is unspecified.
 - Standard input and error, in `avin.io` beside `IoError` ([system library](/spec/system-library/)):
   standard input as text through `readLine() -> Option[string]`, `lines() -> Iterator[string]` and
   `readAll() -> string`, sharing one runtime-held buffer. A line ends at `\n` with a `\r` before it

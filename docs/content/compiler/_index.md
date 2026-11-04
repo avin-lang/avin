@@ -79,15 +79,15 @@ called it.
 A [binding](/spec/sysl-bindings/) is checked as a top-level function without a body: its
 `@sysl("module.name")` must name a Sysl function by module path and name, and its parameters and
 result must be boundary types — integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`,
-`unit`, `string`, `Array[byte]`, `Option` and `Result` of boundary types, and data types declared
-with `@sysl("module.Name")`, which mirror a Sysl enum or struct. A mirror's fields are held to the
+`unit`, `string`, data types declared with `@sysl("module.Name")`, which mirror a Sysl enum or
+struct, and `Array`, `Vector`, `Option` and `Result` of boundary types. A mirror's fields are held to the
 boundary types once every variant is declared, and a mirror that holds itself is rejected. Lowering
 gives a binding a body that passes its parameters, after the context, to a shim symbol, `avin_shim_`
 followed by the binding's own symbol with every character other than a letter or digit written as
 `_` and two hex digits, and returns what the shim returns. A result the shim makes objects for
 follows the parameters with its **layouts**: the descriptor of each variant of each data type in it,
-or the variant's one constant object, and an array's descriptor, in an order the binding's
-`Crossing` records. Since it is an ordinary function, a binding can be passed as a value. The MIR
+or the variant's one constant object, an array's descriptor, and for a vector the descriptors of
+its array and of the vector, in an order the binding's `Crossing` records. Since it is an ordinary function, a binding can be passed as a value. The MIR
 program lists every binding of the functions it compiles, with how each value crosses.
 
 For a program with bindings, the driver generates one Sysl module, `avin.shims`, in a package whose
@@ -100,7 +100,14 @@ conversion function per type and direction, shared by every binding: into Sysl i
 from the object's descriptor and each field at its offset; out of Sysl it matches the Sysl value,
 allocates the variant by its layout and stores each converted field, keeping the object in a frame
 of the thread's stack while its fields' objects are made. A mirror's integer field converts to and
-from whatever integer type Sysl declares. `sysl build-c` checks and builds the package into
+from whatever integer type Sysl declares. An `Array` or a `Vector` of any element type but `byte`
+is copied element by element: into Sysl each element is converted onto a `Buf` whose elements are
+the slice the function is passed; out of Sysl a new array is allocated by its layout and kept in a
+frame while each element is converted and stored, then a vector's object is allocated around it.
+Since the Sysl function may answer a slice or a `Buf`, the conversion out of Sysl of a type that holds
+a collection is one overload per spelling of its Sysl type, the `Buf` one taking the slice of its
+elements, and the result is declared without a type so the function's own chooses the overload; a
+call no overload takes is reported at the binding as the Sysl types the Avin type is made from. `sysl build-c` checks and builds the package into
 one archive holding the runtime, the shims and the part of Sysl's library they reach, which the
 program links instead of the runtime's own archive. One archive means one copy of Sysl's library, so
 Sysl and Avin share standard output and keep their writes in order.
