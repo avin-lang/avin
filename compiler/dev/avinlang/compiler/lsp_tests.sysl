@@ -127,7 +127,7 @@ lsp_initialize()
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-16\"," +
         "\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":true},\"hoverProvider\":true," +
         "\"definitionProvider\":true,\"documentSymbolProvider\":true,\"referencesProvider\":true," +
-        "\"documentHighlightProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\"," +
+        "\"documentHighlightProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\"," +
         "\"class\",\"struct\",\"enum\",\"interface\",\"typeParameter\",\"enumMember\",\"function\",\"method\"," +
         "\"property\",\"parameter\",\"variable\"],\"tokenModifiers\":[\"declaration\",\"readonly\",\"static\"," +
         "\"defaultLibrary\"]},\"full\":true},\"completionProvider\":{\"triggerCharacters\":[\".\"]}}," +
@@ -876,3 +876,156 @@ lsp_completion_time()
     print(s"lsp: completion in vector_tree.avin: ${items.len()} items in $took ms")
     assert(lsp_offers(items, "length"))
     assert(took < 2000)
+
+// ---- rename ----
+
+// Two modules: a trait, a class overriding its method, a record, and a function with parameters a
+// call names.
+private lsp_rename_text() -> string =
+    "import geo\n" +
+    "\n" +
+    "trait Shape\n" +
+    "    size() -> int\n" +
+    "class Box(val item: int): Shape\n" +
+    "    override size() -> int = item\n" +
+    "data Pair(a: int, b: int)\n" +
+    "scale(width: int, height: int) -> int = width * height\n" +
+    "main()\n" +
+    "    val k = geo.area(2, 3)\n" +
+    "    val p = Pair(a = 1, b = 2)\n" +
+    "    print(scale(height = k, width = p.a))\n" +
+    "    print(Box(item = 4).size())\n"
+
+private lsp_renaming() -> Kinds
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    make_dir_all(dir + "/geo").unwrap()
+    write_text(dir + "/geo/shapes.avin", "module geo\n\narea(w: int, h: int) -> int = w * h\n").unwrap()
+    write_text(dir + "/main.avin", lsp_rename_text()).unwrap()
+    val uri = lsp_file_uri(dir + "/main.avin")
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(uri, lsp_rename_text())), lsp_publish_of(uri, ""))
+    Kinds(dir, uri, lsp_file_uri(dir + "/geo/shapes.avin"), server)
+
+private lsp_rename_at(o: *Kinds, id: int, line: int, character: int, name: string) -> string =
+    lsp_one(&o.server, lsp_request(id, "textDocument/rename", s"{\"textDocument\":{\"uri\":\"${o.uri}\"},\"position\":{\"line\":$line,\"character\":$character},\"newName\":\"$name\"}"))
+
+private lsp_edit(l0: int, c0: int, l1: int, c1: int, name: string) -> string =
+    s"{\"range\":${lsp_test_range(l0, c0, l1, c1)},\"newText\":\"$name\"}"
+
+private lsp_changes(id: int, uri: string, edits: string) -> string = lsp_reply(id, s"{\"changes\":{\"$uri\":[$edits]}}")
+
+private lsp_refused(answer: string, message: string)
+    assert(answer.contains("\"code\":-32803"), answer)
+    assert(answer.contains(message), answer)
+
+@test("lsp: rename changes a local and a parameter, with the names a call writes for the parameter")
+lsp_rename_values()
+    var o = lsp_renaming()
+    assert_eq(lsp_rename_at(&o, 2, 9, 8, "total"),
+        lsp_changes(2, o.uri, s"${lsp_edit(9, 8, 9, 9, "total")},${lsp_edit(11, 25, 11, 26, "total")}"))
+    // From the declaration or from a use, a parameter is renamed where its call names it.
+    val width = s"${lsp_edit(7, 6, 7, 11, "w")},${lsp_edit(7, 40, 7, 45, "w")},${lsp_edit(11, 28, 11, 33, "w")}"
+    assert_eq(lsp_rename_at(&o, 3, 7, 7, "w"), lsp_changes(3, o.uri, width))
+    assert_eq(lsp_rename_at(&o, 4, 11, 30, "w"), lsp_changes(4, o.uri, width))
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: rename changes a record's field with its named arguments and reads, and a type with its uses")
+lsp_rename_data()
+    var o = lsp_renaming()
+    assert_eq(lsp_rename_at(&o, 2, 6, 10, "first"),
+        lsp_changes(2, o.uri, s"${lsp_edit(6, 10, 6, 11, "first")},${lsp_edit(10, 17, 10, 18, "first")},${lsp_edit(11, 38, 11, 39, "first")}"))
+    assert_eq(lsp_rename_at(&o, 3, 10, 13, "Duo"),
+        lsp_changes(3, o.uri, s"${lsp_edit(6, 5, 6, 9, "Duo")},${lsp_edit(10, 12, 10, 16, "Duo")}"))
+    // A class's constructor parameter is its field, and a call names it.
+    assert_eq(lsp_rename_at(&o, 4, 4, 14, "value"),
+        lsp_changes(4, o.uri, s"${lsp_edit(4, 14, 4, 18, "value")},${lsp_edit(5, 29, 5, 33, "value")},${lsp_edit(12, 14, 12, 18, "value")}"))
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: rename of a method renames what it overrides and what overrides it, from either")
+lsp_rename_methods()
+    var o = lsp_renaming()
+    val edits = s"${lsp_edit(3, 4, 3, 8, "area")},${lsp_edit(5, 13, 5, 17, "area")},${lsp_edit(12, 24, 12, 28, "area")}"
+    assert_eq(lsp_rename_at(&o, 2, 5, 14, "area"), lsp_changes(2, o.uri, edits))
+    assert_eq(lsp_rename_at(&o, 3, 3, 5, "area"), lsp_changes(3, o.uri, edits))
+    assert_eq(lsp_rename_at(&o, 4, 12, 26, "area"), lsp_changes(4, o.uri, edits))
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: rename of a function in another module changes both files")
+lsp_rename_across_modules()
+    var o = lsp_renaming()
+    val answer = lsp_rename_at(&o, 2, 9, 17, "surface")
+    assert(answer.contains(s"\"${o.uri}\":[${lsp_edit(9, 16, 9, 20, "surface")}]"), answer)
+    assert(answer.contains(s"\"${o.geo_uri}\":[${lsp_edit(2, 0, 2, 4, "surface")}]"), answer)
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: rename answers the program as the editor holds it, not as the disk does")
+lsp_rename_unsaved()
+    var o = lsp_renaming()
+    val text = "main()\n    val a = 1\n    print(a)\n"
+    lsp_one(&o.server, lsp_change(o.uri, text))
+    assert_eq(lsp_rename_at(&o, 2, 1, 8, "b"), lsp_changes(2, o.uri, s"${lsp_edit(1, 8, 1, 9, "b")},${lsp_edit(2, 10, 2, 11, "b")}"))
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: rename is refused for a keyword, a bad name, the library, a module and nothing")
+lsp_rename_refusals()
+    var o = lsp_renaming()
+    lsp_refused(lsp_rename_at(&o, 2, 9, 8, "val"), "reserved word")
+    lsp_refused(lsp_rename_at(&o, 3, 9, 8, "1x"), "not a name")
+    lsp_refused(lsp_rename_at(&o, 4, 9, 8, ""), "not a name")
+    lsp_refused(lsp_rename_at(&o, 5, 9, 8, "a b"), "not a name")
+    lsp_refused(lsp_rename_at(&o, 6, 9, 8, "_"), "not a name")
+    // `print` is the library's, and `int` a type of the language.
+    lsp_refused(lsp_rename_at(&o, 7, 11, 5, "show"), "core library")
+    lsp_refused(lsp_rename_at(&o, 8, 0, 8, "place"), "module cannot be renamed")
+    lsp_refused(lsp_rename_at(&o, 9, 1, 0, "x"), "no name here")
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: rename is refused where the new name would clash with one in scope")
+lsp_rename_clashes()
+    var o = lsp_renaming()
+    // `height` is read where `width` is: the use would name the other parameter.
+    lsp_refused(lsp_rename_at(&o, 2, 7, 7, "height"), "clash")
+    // A parameter renamed to a module-level function's name, which the body calls.
+    val text = "val x = 1\nf(y: int) -> int = y + x\nmain()\n    print(f(2))\n"
+    lsp_one(&o.server, lsp_change(o.uri, text))
+    lsp_refused(lsp_rename_at(&o, 3, 0, 4, "y"), "clash")
+    // Two locals of one block.
+    lsp_one(&o.server, lsp_change(o.uri, "main()\n    val a = 1\n    val b = 2\n    print(a + b)\n"))
+    lsp_refused(lsp_rename_at(&o, 4, 1, 8, "b"), "clash")
+    // The same name is no change, and a free name is no clash.
+    assert_eq(lsp_rename_at(&o, 5, 1, 8, "a"), lsp_reply(5, "{\"changes\":{}}"))
+    assert(lsp_rename_at(&o, 6, 1, 8, "c").contains("\"newText\":\"c\""))
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: rename is refused while the program has a syntax error")
+lsp_rename_syntax_error()
+    var o = lsp_renaming()
+    lsp_one(&o.server, lsp_change(o.uri, "main()\n    val a = 1\n    print(a)\n"))
+    lsp_one(&o.server, lsp_change(o.uri, "main()\n    val a = 1\n    print(a)\n    val c = (\n"))
+    lsp_refused(lsp_rename_at(&o, 2, 1, 8, "b"), "syntax error")
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: prepareRename answers the name and its place, or why it cannot be renamed")
+lsp_prepare_rename_answers()
+    var o = lsp_renaming()
+    assert_eq(lsp_one(&o.server, lsp_request(2, "textDocument/prepareRename", lsp_test_at(o.uri, 11, 25))),
+        lsp_reply(2, s"{\"range\":${lsp_test_range(11, 25, 11, 26)},\"placeholder\":\"k\"}"))
+    // A name written with its module is replaced from the last dot.
+    assert_eq(lsp_one(&o.server, lsp_request(3, "textDocument/prepareRename", lsp_test_at(o.uri, 9, 17))),
+        lsp_reply(3, s"{\"range\":${lsp_test_range(9, 16, 9, 20)},\"placeholder\":\"area\"}"))
+    lsp_refused(lsp_one(&o.server, lsp_request(4, "textDocument/prepareRename", lsp_test_at(o.uri, 11, 5))), "core library")
+    lsp_refused(lsp_one(&o.server, lsp_request(5, "textDocument/prepareRename", lsp_test_at(o.uri, 0, 8))), "module cannot be renamed")
+    assert_eq(lsp_one(&o.server, lsp_request(6, "textDocument/prepareRename", lsp_test_at(o.uri, 1, 0))),
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"error\":{\"code\":-32803,\"message\":\"there is no name here to rename\"}}")
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: rename of an impl's method follows the trait it implements, and stops at a library trait")
+lsp_rename_impls()
+    var o = lsp_renaming()
+    val text = "trait Greet\n    hello() -> string\ndata Pair(a: int, b: int)\nimpl Greet for Pair\n    hello() -> string = \"hi\"\nimpl Add for Pair\n    add(other: Pair) -> Pair = Pair(a + other.a, b + other.b)\n    static zero() -> Pair = Pair(0, 0)\nmain()\n    print(Pair(1, 2).hello())\n    print(Pair(1, 2).add(Pair(3, 4)).a)\n"
+    assert_eq(lsp_one(&o.server, lsp_change(o.uri, text)), lsp_publish_of(o.uri, ""))
+    assert_eq(lsp_rename_at(&o, 2, 4, 4, "greet"),
+        lsp_changes(2, o.uri, s"${lsp_edit(1, 4, 1, 9, "greet")},${lsp_edit(4, 4, 4, 9, "greet")},${lsp_edit(9, 21, 9, 26, "greet")}"))
+    lsp_refused(lsp_rename_at(&o, 3, 6, 4, "plus"), "core library")
+    lsp_refused(lsp_rename_at(&o, 4, 10, 22, "plus"), "core library")
+    remove_dir_all(o.dir).unwrap_or(())

@@ -33,6 +33,8 @@ val LspParseError: int = -32700
 val LspInvalidRequest: int = -32600
 val LspMethodNotFound: int = -32601
 val LspServerNotInitialized: int = -32002
+/** A request the server understood and will not carry out, with the reason as its message. */
+val LspRequestFailed: int = -32803
 
 /** One document the editor has open: where it is, what it says, and what the last analysis of its
  * program found in it. */
@@ -49,6 +51,7 @@ struct LspDocument
 struct LspIndexed
     root: string
     references: Buf[Reference]
+    overrides: Buf[Override]
 
 /** What the server remembers between messages. */
 struct LspServer
@@ -203,6 +206,8 @@ lsp_answer(server: *LspServer, body: string) -> Buf[string]
         "textDocument/documentSymbol" -> lsp_result(asked, lsp_document_symbols(*server, params))
         "textDocument/references" -> lsp_result(asked, lsp_references(*server, params))
         "textDocument/documentHighlight" -> lsp_result(asked, lsp_highlights(*server, params))
+        "textDocument/prepareRename" -> lsp_refusable(asked, lsp_prepare_rename(*server, params))
+        "textDocument/rename" -> lsp_refusable(asked, lsp_rename(*server, params))
         "textDocument/semanticTokens/full" -> lsp_result(asked, lsp_semantic_tokens(*server, params))
         "textDocument/completion" -> lsp_result(asked, lsp_completion(*server, params))
         _ -> lsp_error(asked, LspMethodNotFound, s"'$method' is not a method avin lsp answers"))
@@ -249,6 +254,9 @@ private lsp_capabilities() -> Json
     lsp_put(&caps, "documentSymbolProvider", Json.Bool(true))
     lsp_put(&caps, "referencesProvider", Json.Bool(true))
     lsp_put(&caps, "documentHighlightProvider", Json.Bool(true))
+    var rename: Buf[JsonMember] = buf()
+    lsp_put(&rename, "prepareProvider", Json.Bool(true))
+    lsp_put(&caps, "renameProvider", Json.Obj(rename))
     lsp_put(&caps, "semanticTokensProvider", lsp_token_legend())
     var completion: Buf[JsonMember] = buf()
     var triggers: Buf[Json] = buf()
@@ -383,6 +391,7 @@ struct LspAnalysis
     program: LspProgram
     found: Buf[LspFound]
     references: Buf[Reference]
+    overrides: Buf[Override]
     files: Buf[string]
     whole: bool
     completions: Completions
@@ -402,14 +411,14 @@ lsp_analyze(server: LspServer, file: string, text: string, completing: string = 
         Ok(f) -> f
         Err(message) ->
             found[0].diagnostics.push(lsp_diagnostic(source_of(file, text), Span(0, 0), Error, s"avin: $message"))
-            return LspAnalysis(program, found, buf(), names, false, no_completions())
+            return LspAnalysis(program, found, buf(), buf(), names, false, no_completions())
     var files: Buf[ProgramFile] = buf()
     if program.directory && !program.library
         files = program_tree_files(program.root) match
             Ok(f) -> f
             Err(message) ->
                 found[0].diagnostics.push(lsp_diagnostic(source_of(file, text), Span(0, 0), Error, s"avin: $message"))
-                return LspAnalysis(program, found, buf(), names, false, no_completions())
+                return LspAnalysis(program, found, buf(), buf(), names, false, no_completions())
     elif !program.library
         files = single_file(source_of(file, text))
     var units: Buf[SourceUnit] = buf()
@@ -431,11 +440,11 @@ lsp_analyze(server: LspServer, file: string, text: string, completing: string = 
     if broken
         for u in units
             if u.report.has_errors() then lsp_found(&found, u, true)
-        return LspAnalysis(program, found, buf(), names, false, no_completions())
+        return LspAnalysis(program, found, buf(), buf(), names, false, no_completions())
     val checked = check_program(units, root_module, program.library || program.package, completing == "", completing)
     for u in checked.units
         if u.report.len() > 0 then lsp_found(&found, u, false)
-    LspAnalysis(program, found, checked.references, names, true, checked.completions)
+    LspAnalysis(program, found, checked.references, checked.overrides, names, true, checked.completions)
 
 // A file's source as the editor holds it, where it holds it: `text` for the file being analyzed.
 private lsp_held(server: LspServer, src: Source, file: string, text: string) -> Source
@@ -498,7 +507,7 @@ private lsp_changed(server: *LspServer, uri: string, text: string, out: *Buf[str
         var programs: Buf[LspIndexed] = buf()
         for p in server.programs
             if p.root != root then programs.push(p)
-        programs.push(LspIndexed(root, a.references))
+        programs.push(LspIndexed(root, a.references, a.overrides))
         server.programs = programs
     var now: Buf[LspPublished] = buf()
     for f in a.found
@@ -804,6 +813,232 @@ lsp_highlights(server: LspServer, params: Json) -> Json
         lsp_put(&h, "kind", Json.Int(if r.declares() then 3 else 2))
         out.push(Json.Obj(h))
     Json.Arr(out)
+
+// ---- rename ----
+
+// A request that may be refused: its answer, or an error carrying the reason.
+private lsp_refusable(id: Json, answer: Result[Json, string]) -> string = answer match
+    Ok(j) -> lsp_result(id, j)
+    Err(why) -> lsp_error(id, LspRequestFailed, why)
+
+/** One name to be replaced: the bytes `start` to `end` of `file`. */
+struct LspEdit
+    file: string
+    start: usize
+    end: usize
+
+private lsp_edit_earlier(a: LspEdit, b: LspEdit) -> bool =
+    if a.file != b.file then a.file < b.file else a.start < b.start
+
+// The bytes of `text` from `start` to `end`, as text.
+private lsp_slice(text: string, start: usize, end: usize) -> string =
+    if end > text.bytes.len || start > end then "" else from_utf8_lossy(text.bytes[start..<end])
+
+// Whether `name` can be written as a name: a letter or `_` and then letters, digits and `_`, which is
+// not a word the language reserves, nor the `_` that stands for no name.
+private lsp_valid_name(name: string) -> bool
+    if name.bytes.len == 0 || name == "_" || is_keyword(name) then return false
+    for i in 0..<name.bytes.len
+        val b = name.bytes[i]
+        val letter = b == u8('_') || (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z')) || b >= 0x80
+        if !(letter || (i > 0 && b >= u8('0') && b <= u8('9'))) then return false
+    true
+
+// Where the name `old` is written in the place `r` names: the whole of it, or the end of a path
+// (`geo.area`) that names it. An import's alias spells another name, and has no such place.
+private lsp_name_place(text: string, r: Reference, old: string) -> Option[(usize, usize)]
+    val n = old.bytes.len
+    val at = lsp_slice(text, r.at_span.start, r.at_span.end)
+    if at == old then return Some((r.at_span.start, r.at_span.end))
+    if at.bytes.len > n && at.ends_with(old) && at.bytes[at.bytes.len - n - 1] == u8('.')
+        return Some((r.at_span.end - n, r.at_span.end))
+    None
+
+// Whether `file` is one the program owns, and so one a rename may change.
+private lsp_owned(server: LspServer, root: string, file: string) -> bool
+    if file.starts_with(lsp_normal(server.toolchain.library_dir()) + "/") then return false
+    file == root || file.starts_with(root + "/")
+
+// What the name under the cursor is, when it may be renamed: the place under the cursor, the name
+// as the declaration spells it, and the reason it may not be where it may not.
+private lsp_renameable(server: LspServer, d: LspDocument, offset: usize) -> Result[(Reference, string), string]
+    // A document the last analysis could not read through, for a syntax error, has no names.
+    if d.root == "" then return Err("the program has a syntax error; fix it before renaming")
+    val at = lsp_reference_at(d, offset) match
+        Some(r) -> r
+        None -> return Err("there is no name here to rename")
+    if at.kind is ModuleName then return Err("a module cannot be renamed")
+    if at.library || !lsp_owned(server, d.root, at.declared_file) then return Err("this name is declared in the core library or a dependency, which a rename does not change")
+    val old = lsp_slice(lsp_file_text(server, at.declared_file), at.declared_span.start, at.declared_span.end)
+    if !lsp_valid_name(old) then return Err("only a name can be renamed, not an operator")
+    if lsp_name_place(lsp_file_text(server, at.at_file), at, old) is None then return Err("this is an import's alias, a name of its own; rename the declaration instead")
+    Ok((at, old))
+
+/** `textDocument/prepareRename`: the name under the cursor and what it is now, or why it is not
+ * renamed. */
+lsp_prepare_rename(server: LspServer, params: Json) -> Result[Json, string]
+    val (d, offset) = lsp_point(server, params) match
+        Some(p) -> p
+        None -> return Ok(Json.Null)
+    val (at, old) = lsp_renameable(server, d, offset)?
+    val (start, end) = lsp_name_place(d.text, at, old).unwrap()
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "range", lsp_range(source_of(d.file, d.text), Span(start, end)))
+    lsp_put(&out, "placeholder", Json.Str(old))
+    Ok(Json.Obj(out))
+
+// Whether declaration `file`, `span` is in `set`.
+private lsp_declared_in(set: Buf[(string, Span)], file: string, span: Span) -> bool
+    for s in set
+        if s.0 == file && s.1.start == span.start && s.1.end == span.end then return true
+    false
+
+/** The declarations that are renamed together with `first`: a method and the methods that override
+ * or implement it, and those they override or implement in turn. */
+private lsp_family(first: Reference, overrides: Buf[Override]) -> Buf[(string, Span)]
+    var set: Buf[(string, Span)] = buf()
+    set.push((first.declared_file, first.declared_span))
+    var grown = true
+    while grown
+        grown = false
+        for o in overrides
+            val low = lsp_declared_in(set, o.file, o.span)
+            val high = lsp_declared_in(set, o.base_file, o.base_span)
+            if low && !high
+                set.push((o.base_file, o.base_span))
+                grown = true
+            elif high && !low
+                set.push((o.file, o.span))
+                grown = true
+    set
+
+// `text` with each of `edits` (in order, within `file`) replaced by `name`.
+private lsp_apply(text: string, file: string, edits: Buf[LspEdit], name: string) -> string
+    var out: Buf[u8] = buf()
+    var at = 0usize
+    for e in edits
+        if e.file != file then continue
+        while at < e.start
+            out.push(text.bytes[at])
+            at += 1
+        for b in name.bytes
+            out.push(b)
+        at = e.end
+    while at < text.bytes.len
+        out.push(text.bytes[at])
+        at += 1
+    from_utf8_lossy(out.view())
+
+// How many references name a declaration of `set`, and how many diagnostics there are.
+private lsp_count_family(refs: Buf[Reference], set: Buf[(string, Span)]) -> usize
+    var n = 0usize
+    for r in refs
+        if lsp_declared_in(set, r.declared_file, r.declared_span) then n += 1
+    n
+
+private lsp_count_diagnostics(a: LspAnalysis) -> usize
+    var n = 0usize
+    for f in a.found
+        n += f.diagnostics.len()
+    n
+
+/** `textDocument/rename`: the edit that gives the declaration under the cursor, and every place the
+ * last analysis found the program naming it, the new name, across every file of the program. A
+ * method is renamed with the methods that override or implement it, and those it overrides.
+ *
+ * What would change the program's meaning is refused: a keyword or a name that is not a name, a
+ * declaration of the core library or a dependency, and a name that would clash with one in scope at
+ * a place the renamed name is used. The last is decided by analyzing the program as the edit would
+ * leave it: every name must still mean what it meant, and no new diagnostic may appear. */
+lsp_rename(server: LspServer, params: Json) -> Result[Json, string]
+    val (d, offset) = lsp_point(server, params) match
+        Some(p) -> p
+        None -> return Ok(Json.Null)
+    val name = lsp_text_at(params, ["newName"]).unwrap_or("")
+    if !lsp_valid_name(name)
+        val why = if is_keyword(name) then "a reserved word" else "not a name"
+        return Err(s"`$name` is $why, so nothing can be renamed to it")
+    val (at, old) = lsp_renameable(server, d, offset)?
+    var refs = d.references
+    var overrides: Buf[Override] = buf()
+    for p in server.programs
+        if p.root == d.root
+            refs = p.references
+            overrides = p.overrides
+    val family = lsp_family(at, overrides)
+    for member in family
+        if !lsp_owned(server, d.root, member.0) then return Err(s"`$old` also names a member of the core library or a dependency, which it implements or overrides; a rename does not change that")
+    var edits: Buf[LspEdit] = buf()
+    var seen: Buf[(string, usize)] = buf()
+    for r in refs
+        if !lsp_declared_in(family, r.declared_file, r.declared_span) then continue
+        val place = lsp_name_place(lsp_file_text(server, r.at_file), r, old) match
+            Some(p) -> p
+            None -> continue
+        if !lsp_owned(server, d.root, r.at_file) then return Err("a use of this name is in the core library or a dependency, which a rename does not change")
+        var again = false
+        for s in seen
+            if s.0 == r.at_file && s.1 == place.0 then again = true
+        if again then continue
+        seen.push((r.at_file, place.0))
+        edits.push(LspEdit(r.at_file, place.0, place.1))
+    sort_by(edits.view(), lsp_edit_earlier)
+    var changes: Buf[JsonMember] = buf()
+    if name == old then return Ok(lsp_workspace_edit(changes))
+    // The program as the edit leaves it, to be analyzed: every file the edit changes, held as the
+    // editor holds it.
+    var held: Buf[LspDocument] = buf()
+    var files: Buf[string] = buf()
+    for e in edits
+        var known = false
+        for f in files
+            if f == e.file then known = true
+        if !known then files.push(e.file)
+    for doc in server.documents
+        var changed = false
+        for f in files
+            if f == doc.file then changed = true
+        held.push(if changed then LspDocument(doc.uri, doc.file, lsp_apply(doc.text, doc.file, edits, name), doc.references, doc.root) else doc)
+    for f in files
+        var open = false
+        for doc in server.documents
+            if doc.file == f then open = true
+        if !open then held.push(LspDocument(lsp_file_uri(f), f, lsp_apply(lsp_file_text(server, f), f, edits, name), buf(), ""))
+    val before = lsp_analyze(server, d.file, d.text)
+    if !before.whole then return Err("the program has a syntax error; fix it before renaming")
+    var moved = server
+    moved.documents = held
+    var new_text = d.text
+    for doc in held
+        if doc.file == d.file then new_text = doc.text
+    val after = lsp_analyze(moved, d.file, new_text)
+    val clash = s"renaming `$old` to `$name` would clash with a name already in scope where it is used"
+    if !after.whole || lsp_count_diagnostics(after) > lsp_count_diagnostics(before) then return Err(clash)
+    // Each declaration of the family, where the edit leaves it, is named by as many places as before.
+    var moved_family: Buf[(string, Span)] = buf()
+    for member in family
+        var start = member.1.start
+        for e in edits
+            if e.file == member.0 && e.start < member.1.start then start = start + name.bytes.len - (e.end - e.start)
+        moved_family.push((member.0, Span(start, start + name.bytes.len)))
+    if lsp_count_family(after.references, moved_family) != lsp_count_family(refs, family) then return Err(clash)
+    // The edit, file by file.
+    for f in files
+        var list: Buf[Json] = buf()
+        val src = source_of(f, lsp_file_text(server, f))
+        for e in edits
+            if e.file != f then continue
+            var change: Buf[JsonMember] = buf()
+            lsp_put(&change, "range", lsp_range(src, Span(e.start, e.end)))
+            lsp_put(&change, "newText", Json.Str(name))
+            list.push(Json.Obj(change))
+        lsp_put(&changes, lsp_uri_of(server, f), Json.Arr(list))
+    Ok(lsp_workspace_edit(changes))
+
+private lsp_workspace_edit(changes: Buf[JsonMember]) -> Json
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "changes", Json.Obj(changes))
+    Json.Obj(out)
 
 // ---- semantic tokens ----
 

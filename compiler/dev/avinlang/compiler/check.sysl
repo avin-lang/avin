@@ -489,6 +489,8 @@ struct Checked
     program: Option[TProgram]
     /** What each name resolved to, when the check was asked to record it; empty otherwise. */
     references: Buf[Reference]
+    /** The methods that override or implement another, when the check was asked to record names. */
+    overrides: Buf[Override]
     /** What may be written where the check was asked to complete, and what kind of place that is
      * (`completion.sysl`). */
     completions: Completions
@@ -791,10 +793,11 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     val tests = check_tests(&c)
     val completions = finish_completion(&c)
     val references = finish_index(&c)
+    val overrides = finish_ties(&c)
     var failed = false
     for u in c.units
         if u.report.has_errors() then failed = true
-    if failed then return Checked(c.units, None, references, completions)
+    if failed then return Checked(c.units, None, references, overrides, completions)
     var functions: Buf[TFunction] = buf()
     for i in 0..<c.symbols.len()
         functions.push(TFunction(i, c.bodies[i], c.locals[i]))
@@ -803,7 +806,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
         sources.push(u.src)
     val views = solved_views(c.vars, c.views)
     val type_tests = solved_views(c.vars, c.type_tests)
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, init, c.builtins, c.conditional, c.core, tests, testing, views, type_tests)), references, completions)
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, init, c.builtins, c.conditional, c.core, tests, testing, views, type_tests)), references, overrides, completions)
 
 /** Each view with its unknowns solved, each distinct one once. */
 private solved_views(vars: Buf[Option[&Type]], views: Buf[TypeView]) -> Buf[TypeView]
@@ -3786,6 +3789,7 @@ private build_data_table(c: *Checker, id: usize, conformed: Buf[usize])
                         c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`$name` implements `${c.symbols[methods[j]].name}`, so it belongs in an impl of `${c.classes[t].name}` for `$name_of`")
             if own is Some(m)
                 chosen = m
+                index_tie(c, m, methods[j])
                 inherit_defaults(c, m, methods[j])
             else
                 var found: Buf[usize] = buf()
@@ -4011,6 +4015,7 @@ private overrides_matches(c: *Checker, id: usize, m: usize, target: usize) -> bo
     if param_mismatch(c, own_class_type(c.classes[id], id), m, target) is Some(text)
         c.note(c.classes[id].unit, symbol.decl.name_span, s"`${symbol.decl.name}` overrides `${c.symbols[target].name}`, $text")
         return false
+    index_tie(c, m, target)
     true
 
 // The results of overrides, compared once every body is checked, since a result may be inferred: an
@@ -5675,7 +5680,7 @@ private super_initialization(c: *Checker, receiver: &TExpr, sup: &Type, parent: 
         name_span = callee.span
     val s = c.classes[sid]
     val constructor = c.symbols[s.constructor]
-    val signature = Signature(s.name, true, constructor.type_params, class_owner(sid), constructor.params, constructor.param_names, constructor.defaults, Unit, sargs, None, declares_variadic(constructor.decl))
+    val signature = Signature(s.name, true, constructor.type_params, class_owner(sid), constructor.params, constructor.param_names, constructor.defaults, Unit, sargs, None, declares_variadic(constructor.decl), function_sites(c, s.constructor, 0))
     val outer = c.super_args
     c.super_args = true
     val applied = apply(c, parent.span, name_span, signature, args, None, None, buf())
@@ -8901,7 +8906,7 @@ private apply_value(c: *Checker, at: Span, name: string, o: usize, ids: Buf[usiz
 
 private function_signature(c: *Checker, id: usize, result: &Type) -> Signature
     val f = c.symbols[id]
-    Signature(f.name, true, f.type_params, f.type_owner, f.params, f.param_names, f.defaults, result, buf(), None, declares_variadic(f.decl))
+    Signature(f.name, true, f.type_params, f.type_owner, f.params, f.param_names, f.defaults, result, buf(), None, declares_variadic(f.decl), function_sites(c, id, 0))
 
 /** The overload a call chooses, if it chooses one, and its arguments as checked while choosing: one
  * entry per written argument, `None` for one left to be checked against the chosen parameter. */
@@ -9477,7 +9482,7 @@ private method_signature(c: *Checker, receiver: &TExpr, m: usize, result: &Type)
         params.push(with_self(c, m, receiver.ty, target.params[i]))
         names.push(target.param_names[i])
         defaults.push(if i < target.defaults.len() then target.defaults[i] else None)
-    Signature(target.decl.name, true, target.type_params, target.type_owner, params, names, defaults, with_self(c, m, receiver.ty, result), known, Some(receiver), declares_variadic(target.decl))
+    Signature(target.decl.name, true, target.type_params, target.type_owner, params, names, defaults, with_self(c, m, receiver.ty, result), known, Some(receiver), declares_variadic(target.decl), function_sites(c, m, 1))
 
 /** Type `t` of method `m` with the `Self` of a trait declaring `m` as the receiver's type. */
 private with_self(c: *Checker, m: usize, receiver_type: &Type, t: &Type) -> &Type
@@ -9684,7 +9689,7 @@ private variant_signature(c: *Checker, v: VariantRef) -> Signature
     val d = c.data[v.data]
     val variant = d.variants[v.index]
     val called = variant.fields.len() > 0
-    Signature(variant.name, called, d.decl.type_params, data_owner(v.data), variant.fields, variant.field_names, variant.defaults, own_type(d, v.data), buf(), None, false)
+    Signature(variant.name, called, d.decl.type_params, data_owner(v.data), variant.fields, variant.field_names, variant.defaults, own_type(d, v.data), buf(), None, false, variant_sites(c, v))
 
 /** What a call is checked against: a function's or a variant's parameters and result, written in
  * terms of the type parameters `type_params` that belong to `owner`. `called` is false for a variant
@@ -9707,6 +9712,9 @@ private struct Signature
     /** Whether the last parameter is repeated: its type is `Vector[T]`, and the call gives it any
      * number of `T`s, or one sequence spliced with `xs*`. */
     variadic: bool
+    /** Where each parameter is declared, for an argument written with its name; empty unless the
+     * check is recording references. */
+    sites: Buf[Option[ParamSite]]
 
 /** A call's arguments, one per parameter in parameter order, its solved type arguments, and its
  * result type. `prelude` evaluates what the call needs first: the written arguments in the order
@@ -9866,6 +9874,21 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
                 c.note(unit, at, s"`${s.name}` needs an argument for `$m`, which has no default")
     Binding(slots, targets, fits)
 
+// Records each name written in an argument (`width = 3`) as a reference to the parameter it names.
+private index_argument_names(c: *Checker, unit: usize, s: Signature, args: Buf[Argument], binding: Binding)
+    if c.index is None then return
+    for j in 0..<args.len()
+        if j >= binding.targets.len() then break
+        val n = args[j].name match
+            Some(n) -> n
+            None -> continue
+        val i = binding.targets[j] match
+            Some(i) -> i
+            None -> continue
+        if i >= s.sites.len() || i >= s.params.len() then continue
+        if s.sites[i] is Some(site)
+            index_argument_name(c, unit, Span(args[j].span.start, args[j].span.start + n.bytes.len), site, s.params[i])
+
 // Checks a call against a signature: binds its arguments to the parameters, solves the type
 // arguments, and checks each argument against its parameter's type. `checked` holds, for an
 // overloaded call, the arguments checked while its overload was chosen; it is empty otherwise.
@@ -9879,6 +9902,7 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     val result = s.result
     val known = s.known
     var binding = bind_arguments(c, at, s, args, true)
+    index_argument_names(c, unit, s, args, binding)
     val first = c.vars.len()
     var type_args: Buf[&Type] = buf()
     for i in 0..<type_params.len()
