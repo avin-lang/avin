@@ -101,11 +101,31 @@ struct LocalPlace
     unit: usize
     span: Span
 
+/** A method that overrides or implements another: where each one's name is declared. Renaming
+ * either renames both, since a call through the base is a call of the override. */
+struct Override
+    file: string
+    span: Span
+    base_file: string
+    base_span: Span
+
+/** Where a parameter or a field a call can name is declared, so that a name written in an argument
+ * (`f(width = 3)`) is a reference to it. */
+struct ParamSite
+    unit: usize
+    at: Span
+    starts: usize
+    keyword: string
+    name: string
+    role: ValueRole
+
 /** The references one analysis made, each place kept once. A body can be checked more than once
  * (an argument against each overload it might match), so the last recording of a place is the one
  * kept: it is the one checking settled on. */
 struct DefinitionIndex
     noted: Buf[Noted]
+    /** The methods that override or implement another, by symbol: the override, then the base. */
+    ties: Buf[(usize, usize)]
     places: Map[string, usize]
     /** Where each local was declared, by its function and its index there. */
     locals: Map[string, LocalPlace]
@@ -126,7 +146,64 @@ struct DefinitionIndex
 
 /** An index with nothing in it, for an analysis an editor is asking for: completing at the stand-in
  * name `completing` where it is not empty. */
-definition_index(completing: string = "") -> &DefinitionIndex = DefinitionIndex(buf(), map(), map(), false, completing, completion_probe())
+definition_index(completing: string = "") -> &DefinitionIndex = DefinitionIndex(buf(), buf(), map(), map(), false, completing, completion_probe())
+
+/** Records that method `m` overrides or implements `base`. */
+index_tie(c: *Checker, m: usize, base: usize)
+    if c.index is Some(ix) then ix.ties.push((m, base))
+
+/** The overrides the check recorded, as the places their names are declared. */
+finish_ties(c: *Checker) -> Buf[Override]
+    var out: Buf[Override] = buf()
+    val ix = c.index match
+        Some(i) -> i
+        None -> return out
+    for t in ix.ties
+        val (m, base) = t
+        val a = c.symbols[m]
+        val b = c.symbols[base]
+        if a.decl.name_span.end <= a.decl.name_span.start || b.decl.name_span.end <= b.decl.name_span.start then continue
+        out.push(Override(c.units[a.unit].src.name, function_name(c, m), c.units[b.unit].src.name, function_name(c, base)))
+    out
+
+/** Where the parameters of function `id` are declared, from the parameter at `first` on, for a call
+ * to name them; a constructor's are the fields of its class. Empty when nothing is being indexed. */
+function_sites(c: *Checker, id: usize, first: usize) -> Buf[Option[ParamSite]]
+    var out: Buf[Option[ParamSite]] = buf()
+    if c.index is None then return out
+    val s = c.symbols[id]
+    if s.lambda || s.default_param is Some(_) || s.root is Some(_) then return out
+    for j in first..<s.param_names.len()
+        out.push(param_site(c, s, s.param_names[j]))
+    out
+
+private param_site(c: *Checker, s: FunctionSymbol, name: string) -> Option[ParamSite]
+    if s.constructor
+        if s.owner_class is Some(k)
+            val home = c.classes[k].unit
+            for f in c.classes[k].fields
+                if f.owner == k && f.name == name
+                    return Some(ParamSite(home, name_in(c.units[home].src, f.span, f.name), f.span.start, if f.mutable then "var " else "val ", name, FieldRole))
+        return None
+    for p in s.decl.params
+        if pattern_name(p.pattern) == name
+            return Some(ParamSite(s.unit, name_in(c.units[s.unit].src, p.span, name), p.span.start, "", name, ParamRole))
+    None
+
+/** Where the fields of variant `v` are declared, when its type is a record. */
+variant_sites(c: *Checker, v: VariantRef) -> Buf[Option[ParamSite]]
+    var out: Buf[Option[ParamSite]] = buf()
+    if c.index is None then return out
+    val d = c.data[v.data]
+    if d.decl.variants.len() != 1 || v.index != 0 then return out
+    for p in d.decl.variants[0].fields
+        val name = pattern_name(p.pattern)
+        out.push(Some(ParamSite(d.unit, name_in(c.units[d.unit].src, p.span, name), p.span.start, "val ", name, FieldRole)))
+    out
+
+/** A parameter or field named in an argument, written at `at`, of type `ty`. */
+index_argument_name(c: *Checker, unit: usize, at: Span, site: ParamSite, ty: &Type)
+    index_note(c, unit, at, site.unit, site.at, site.starts, ValueTarget(site.keyword, site.name, ty, site.role))
 
 private current_unit(c: *Checker) -> usize = c.symbols[c.current].unit
 

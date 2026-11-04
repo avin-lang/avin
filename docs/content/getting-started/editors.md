@@ -60,6 +60,8 @@ The server announces exactly these capabilities in its answer to `initialize`:
 | `textDocument/documentSymbol` | The document's outline: classes, traits and objects with their fields and methods, data types with their variants, impls with their methods, functions and module values. It is read from the parse, so it is there while the program has mistakes in it |
 | `textDocument/references` | Every place the program names what the name under the cursor names, in every file of the program and the library, in the order of their files; the declaration's own name with them when the request's `includeDeclaration` asks for it |
 | `textDocument/documentHighlight` | The places in the document that name the same thing, the declaration marked as a write and each use as a read |
+| `textDocument/prepareRename` | The name under the cursor and where it is written, or the reason it cannot be renamed. [Rename](#rename) below says which names may be |
+| `textDocument/rename` | The edit that gives the name under the cursor a new name everywhere the program names it, in every file of the program |
 | `textDocument/semanticTokens/full` | Every name the checker resolved in the document, classified by what it names; the legend is below |
 | `textDocument/completion` | What may be written at the cursor, as the checker sees the scope there; triggered by `.` as well as by typing a name. [Completion](#completion) below says what each place offers |
 
@@ -68,6 +70,28 @@ an overloaded function to the overload the checker chose. References follow the 
 references of a trait's method are the calls made through the trait, and those of a class's
 override are the calls on that class, so asking from `Shape.area` does not list a call the checker
 resolved to `Circle.area`.
+
+### Rename
+
+Rename is built on the same references. It renames locals, parameters, fields, methods, types, a
+module's functions and values, pattern bindings and type parameters, with the names a call writes
+for a parameter or a record's field (`scale(width = 3)`), in `.avin` and `.lavin` files alike. A
+method is renamed together with the methods it overrides or implements and those that override or
+implement it, so renaming `Shape.area` renames `Circle.area` too, from either end. A name written
+with its module (`geo.area`) is replaced after the last dot, and an import's alias, which is a name
+of its own, is left alone.
+
+A rename is refused, with the reason as the error's message, when it would change what the program
+means:
+
+- the name is declared in the core library or a dependency, or a method of the family implements or
+  overrides one that is (an `impl Add for Point`'s `add`);
+- the name is a module or an operator;
+- the new name is a reserved word, or is not a name (a letter or `_`, then letters, digits and `_`);
+- the new name would clash with one in scope where the old one is used. The server checks the
+  program as the edit would leave it: every name must still mean what it meant, and no new
+  diagnostic may appear;
+- the program has a syntax error, since the places of its names are not known.
 
 ### Completion
 
