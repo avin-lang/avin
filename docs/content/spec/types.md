@@ -48,6 +48,14 @@ count, shifts every bit out (`>>` keeps the sign, so `-1 >> 40` is `-1`).
 
 Integers are signed; there are no unsigned integer types. Binary data uses `byte`.
 
+The integer types are one family, `iN` for every width from `i1` to `i8388608`, and the closed core
+trait `Integer` has exactly them as members (`byte` is not one). The core library implements its
+traits once for the whole family, so every width compares, orders, prints in decimal and debugs
+alike, and meets a bound such as `Ord` or `Display` as `int` does; a parameter bounded by `Integer`
+has every integer operation and conversion ([Bounds](generics.md#bounds)). A value that fits in a
+`long` renders through it, at no cost for widths up to 64 bits; a wider one renders in chunks of
+eighteen digits.
+
 ## byte
 
 `byte` is an octet with a value from 0 to 255. It is the element of binary data — file contents,

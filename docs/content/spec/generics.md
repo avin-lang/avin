@@ -72,6 +72,29 @@ class SortedPair[T: Ordered](first: T, second: T)
   requires it, `a < b` one that is `Ord`, and `a == b` one that is `Eq` (`Ord` requires `Eq`). Every
   type meets `Eq` and `Hash`, so any type argument passes those bounds. In an instance at a built-in
   type the operator is the machine's operation, as written outside generic code.
+- **`Integer` is a closed bound**: its members are the integer types, every width, which the
+  compiler decides; no type implements it and no declaration names it after `:`. It requires `Add`,
+  `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Ord`, `Display` and `Debug`, so `[T: Integer]` has every
+  operator and both text forms. A value of such a `T` converts to the other integer types and to
+  `real`, `byte` and `char` as an integer does (`long(x)`), and a call of `T` converts to it
+  (`T(n)`, narrowing to the low bits as integers do); each instance converts at its width.
+
+```text
+digits[T: Integer](x: T) -> int
+    var n = 1
+    var rest = x / T(10)
+    while rest != T(0)
+        rest = rest / T(10)
+        n += 1
+    n
+```
+
+- **The core library implements a trait for every integer width at once** with an impl over a
+  type parameter bounded by `Integer` alone: `impl[T: Integer] Display for T`. Only the core library
+  writes such an impl, and only with `Integer`; a trait it implements this way has no other impl for
+  any width, and a program implements none of the core library's traits for an integer type, since
+  neither is declared in its module. A program's own trait may be implemented for one width
+  (`impl Sized for i5`), and that width then has both.
 
 ## Reification
 

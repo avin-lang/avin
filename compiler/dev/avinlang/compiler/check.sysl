@@ -784,6 +784,8 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
     var owner = 0usize
     var home = ""
     val key = resolve_name(c, unit, path)
+    if written.len() == 0 && names_type_param(d.type_params, path)
+        return resolve_family_impl(c, unit, module_name, d)
     if c.types.get(key) is Some(id)
         owner = data_owner(id)
         home = c.data[id].module_name
@@ -833,6 +835,8 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
     c.generic = outer_generic
     if *target is ErrorType then return invalid
     if d.trait_name is Some(_) && trait_type is None then return invalid
+    if trait_type is Some(t)
+        if refuse_closed_trait(c, unit, written_trait_span(d), t) then return invalid
     if module_name != home && (trait_type is None || module_name != trait_home)
         if trait_type is None then c.note(unit, d.target.span, s"`$path` is declared in another module; an impl adding methods to it belongs in that module")
         else c.note(unit, d.target.span, s"neither `$path` nor `${type_name(trait_type.unwrap())}` is declared in this module; an impl belongs in the module of its type or of its trait")
@@ -855,6 +859,70 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
         if conditional
             if *t is Class(k, _, _) then c.conditional.push(ConditionalConformance(owner, k, conditions, unit, d.type_params))
     ImplSymbol(unit, module_name, d, target, owner, trait_type, conditions)
+
+/** Whether `name` is one of `params`. */
+private names_type_param(params: Buf[TypeParam], name: string) -> bool
+    for tp in params
+        if tp.name == name then return true
+    false
+
+// An impl for every integer width, `impl[T: Integer] Display for T`, adds to the integer family: its
+// one type parameter, bounded by `Integer` alone, stands for the width of each instance. Only the
+// core library declares one, and a trait it implements has no other impl for any width, since a
+// conformance is stated once.
+private resolve_family_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl) -> ImplSymbol
+    val invalid = ImplSymbol(unit, module_name, d, ErrorType, 0, None, buf())
+    if module_name != CoreModule
+        c.note(unit, d.target.span, "an impl for every type meeting a bound, as in `impl[T: Integer] Display for T`, is declared only in the core library")
+        return invalid
+    val outer_generic = c.generic
+    c.generic = Some(GenericScope(integer_owner(), d.type_params))
+    var bounded = d.type_params.len() == 1 && d.type_params[0].bounds.len() == 1
+    if bounded
+        bounded = *resolve_bound(c, unit, d.type_params[0].bounds[0]) match
+            Class(k, _, _) -> is_class_named(c, k, qualified(CoreModule, "Integer"))
+            _ -> false
+    var trait_type: Option[&Type] = None
+    if bounded && d.trait_name is Some(written_trait)
+        val t = resolve_bound(c, unit, written_trait)
+        *t match
+            Class(k, _, _) ->
+                if is_trait(c, k) then trait_type = Some(t)
+                else c.note(unit, written_trait.span, s"`${c.classes[k].name}` is not a trait; an impl names a trait before `for`")
+            ErrorType -> ()
+            _ -> c.note(unit, written_trait.span, s"${type_name(t)} is not a trait; an impl names a trait before `for`")
+    c.generic = outer_generic
+    if !bounded
+        c.note(unit, d.target.span, "an impl adds to a type parameter only where it is the impl's one parameter, bounded by `Integer` alone: the integer family")
+        return invalid
+    if d.trait_name is Some(_) && trait_type is None then return invalid
+    val target = integer_family()
+    if trait_type is Some(t)
+        if refuse_closed_trait(c, unit, written_trait_span(d), t) then return invalid
+        for b in c.builtins
+            if (is_integer_family(b.ty) || *b.ty is Int(_)) && same_trait(b.trait_type, t)
+                val which = if is_integer_family(b.ty) then "every integer width" else s"`${type_name(b.ty)}`"
+                c.note(unit, written_trait_span(d), s"$which already conforms to `${type_name(t)}`; a conformance is stated once")
+                return invalid
+        c.builtins.push(BuiltinConformance(target, t, unit, d.target.span, buf()))
+    ImplSymbol(unit, module_name, d, target, integer_owner(), trait_type, buf())
+
+/** Whether `a` and `b` name one trait, with any type arguments. */
+private same_trait(a: &Type, b: &Type) -> bool = *a match
+    Class(x, _, _) -> *b match
+        Class(y, _, _) -> x == y
+        _ -> false
+    _ -> false
+
+// `Integer` is closed: its members are the integer types, every width, which the compiler decides.
+// Nothing implements it, and no type names it as a trait it conforms to.
+private refuse_closed_trait(c: *Checker, unit: usize, at: Span, t: &Type) -> bool
+    val k = *t match
+        Class(k, _, _) -> k
+        _ -> return false
+    if !is_class_named(c, k, qualified(CoreModule, "Integer")) then return false
+    c.note(unit, at, "`Integer` is closed: its members are the integer types, and nothing else implements it")
+    true
 
 /** Whether class `k` is the one with qualified name `key`. */
 private is_class_named(c: *Checker, k: usize, key: string) -> bool = c.class_types.get(key) match
@@ -899,7 +967,7 @@ private conditional_impl_refused(c: *Checker, unit: usize, d: &ImplDecl, target:
 private builtin_traits(c: *Checker, t: &Type) -> Buf[&Type]
     var out: Buf[&Type] = buf()
     for b in c.builtins
-        if same_type(b.ty, t) then out.push(b.trait_type)
+        if builtin_covers(b.ty, t) then out.push(b.trait_type)
     out
 
 /** Whether `traits` already holds the trait `t` names, with any type arguments. */
@@ -1116,7 +1184,9 @@ private trait_type(c: *Checker, unit: usize, t: usize, parent: &Expr) -> Option[
         else c.note(unit, parent.span, s"`$name` takes ${count(wanted, "type argument")}, not ${args.len()}")
         return None
     check_type_args(c, unit, parent.span, s"`$name`", class_owner(t), c.classes[t].decl.type_params, args)
-    Some(Class(t, name, args))
+    val resolved: &Type = Class(t, name, args)
+    if refuse_closed_trait(c, unit, parent.span, resolved) then return None
+    Some(resolved)
 
 // The superclass after `:`: a class, called with its constructor arguments or named alone when it
 // takes none, its type arguments written when it is generic. Its arguments are checked with the
@@ -1541,9 +1611,10 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
     val block = c.impls[i]
     val unit = block.unit
     val target = block.target
+    val family = is_integer_family(target)
     val type_name_of = *target match
         Data(id, _, _) -> c.data[id].name
-        _ -> type_name(target)
+        _ -> if family then "Integer" else type_name(target)
     val trait_id = block.trait_type match
         Some(t) -> *t match
             Class(t, _, _) -> Some(t)
@@ -1551,7 +1622,7 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
         None -> None
     // A built-in type's operations are intrinsics, so its impls may declare them; no other method
     // takes an annotation but the core library's `@trapsAtCaller`.
-    val builtin = !(*target is Data(_, _, _))
+    val builtin = !(*target is Data(_, _, _)) && !family
     for a in f.annotations
         if a.name == TrapsAtCaller then continue
         if a.name != "intrinsic" || !builtin || trait_id is Some(_)
@@ -1581,9 +1652,9 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
             for m in c.builtin_methods
                 if same_type(c.symbols[m].receiver.unwrap(), target) && c.symbols[m].decl.name == f.name then same_name.push(m)
     val id = c.symbols.len()
-    // A data type's methods share its type parameters, then have their own; a built-in type has
-    // none, so its methods' type parameters are their own.
-    val owner = if *target is Data(_, _, _) then block.owner else id
+    // A data type's methods share its type parameters, then have their own, and so do the integer
+    // family's; a built-in type has none, so its methods' type parameters are their own.
+    val owner = if *target is Data(_, _, _) || family then block.owner else id
     var type_params: Buf[TypeParam] = buf()
     for tp in block.decl.type_params
         type_params.push(tp)
@@ -1641,11 +1712,16 @@ private receiver_method(c: *Checker, t: &Type, name: string) -> Option[usize]
             None
         Class(_, _, _) -> None
         Var(_) -> None
-        TypeVar(_, _, _) -> None
+        TypeVar(_, _, _) ->
+            // Inside an impl for every integer width, its own type has the methods its impls add.
+            if !is_integer_family(t) then return None
+            for m in c.builtin_methods
+                if same_type(c.symbols[m].receiver.unwrap(), t) && c.symbols[m].decl.name == name then return Some(m)
+            None
         ErrorType -> None
         _ ->
             for m in c.builtin_methods
-                if same_type(c.symbols[m].receiver.unwrap(), t) && c.symbols[m].decl.name == name then return Some(m)
+                if builtin_covers(c.symbols[m].receiver.unwrap(), t) && c.symbols[m].decl.name == name then return Some(m)
             None
 
 /** Every method named `name` that a value of data or built-in type `t` has, one for each list of
@@ -1663,11 +1739,14 @@ private receiver_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
                     if c.symbols[m].decl.name == name then add_method(c, self_type, &out, m)
         Class(_, _, _) -> ()
         Var(_) -> ()
-        TypeVar(_, _, _) -> ()
+        TypeVar(_, _, _) ->
+            if is_integer_family(t)
+                for m in c.builtin_methods
+                    if same_type(c.symbols[m].receiver.unwrap(), t) && c.symbols[m].decl.name == name then out.push(m)
         ErrorType -> ()
         _ ->
             for m in c.builtin_methods
-                if same_type(c.symbols[m].receiver.unwrap(), t) && c.symbols[m].decl.name == name then out.push(m)
+                if builtin_covers(c.symbols[m].receiver.unwrap(), t) && c.symbols[m].decl.name == name then out.push(m)
     out
 
 /** The methods of `ms` the code being checked may call. */
@@ -1983,7 +2062,7 @@ private table_position(c: *Checker, k: usize, target: usize) -> Option[usize]
  * its superclass's, each as an instance of `t` sees it. A trait conformed to with two different type
  * argument lists appears twice. */
 private collect_traits(c: *Checker, t: &Type, out: *Buf[&Type])
-    if is_builtin(t)
+    if is_builtin(t) || is_integer_family(t)
         for r in builtin_traits(c, t)
             var seen = false
             for i in 0..<out.len()
@@ -2275,8 +2354,10 @@ private build_builtin_table(c: *Checker, b: usize, conformed: Buf[usize])
             if is_universal(c, methods[j]) then continue
             val name = c.symbols[methods[j]].decl.name
             var own: Option[usize] = None
+            // A width's impls for every integer width implement the trait as the family sees it.
             for m in c.builtin_methods
-                if own is None && same_type(c.symbols[m].receiver.unwrap(), ty) && same_method(c, ty, m, methods[j]) then own = Some(m)
+                val receiver = c.symbols[m].receiver.unwrap()
+                if own is None && builtin_covers(receiver, ty) && same_method(c, receiver, m, methods[j]) then own = Some(m)
             own match
                 Some(m) ->
                     inherit_defaults(c, m, methods[j])
@@ -3145,6 +3226,11 @@ private scope_bounds(f: Conformances, owner: usize, params: Buf[TypeParam], inde
         var own: Buf[&Type] = buf()
         own.push(own_class_type(f.classes[k], k))
         return own
+    // The integer family's parameter is bounded by `Integer`, wherever it is named.
+    if owner == integer_owner() && index == 0
+        var family: Buf[&Type] = buf()
+        if f.core.trait_named("Integer") is Some(k) then family.push(own_class_type(f.classes[k], k))
+        return family
     if owner >= method_params_owner() then return buf()
     var declared = params
     if owner >= class_owner(0)
@@ -3215,8 +3301,13 @@ meets_bound(f: Conformances, x: &Type, bound: &Type) -> bool
         _ ->
             if names_core_trait(f.core, k, "Eq") || names_core_trait(f.core, k, "Hash") then return true
             if is_builtin(x)
+                // Every integer is a member of `Integer`, and has what it requires.
+                if *x is Int(_)
+                    if f.core.trait_named("Integer") is Some(integer)
+                        if ancestor_type(f.classes, f.data, own_class_type(f.classes[integer], integer), k) is Some(up)
+                            if conforms(up, bound) then return true
                 for b in f.builtins
-                    if same_type(b.ty, x)
+                    if builtin_covers(b.ty, x)
                         if ancestor_type(f.classes, f.data, b.trait_type, k) is Some(up)
                             if conforms(up, bound) then return true
                 return false
@@ -3272,7 +3363,7 @@ conditions_met(f: Conformances, x: ConditionalConformance, args: Buf[&Type]) -> 
 private find_core_traits(c: *Checker)
     var traits: Map[string, usize] = map()
     var methods: Map[string, usize] = map()
-    for name in ["Eq", "Hash", "Ord", "Add", "Sub", "Mul", "Div", "Rem", "Neg"]
+    for name in ["Eq", "Hash", "Ord", "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Integer"]
         if c.class_types.get(qualified(CoreModule, name)) is Some(k)
             if is_trait(c, k)
                 traits.put(name, k)
@@ -6239,6 +6330,13 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
             return construct(c, at, named.span, v, args, explicit, expected)
         if explicit is None
             if builtin_type(name) is Some(target) then return conversion(c, at, target, args)
+            if integer_param_named(c, name) is Some(target) then return conversion(c, at, target, args)
+            if c.generic is Some(scope)
+                if names_type_param(scope.params, name)
+                    c.note(unit, named.span, s"`$name` is a type parameter, which a call converts to only where it is bounded by `Integer`")
+                    for a in args
+                        check_statement(c, a.value)
+                    return TExpr(at, ErrorType, UnitConst)
         c.note(unit, named.span, s"`$name` is not defined")
         return TExpr(at, ErrorType, UnitConst)
     if ids.len() == 1 then return call_function(c, at, named.span, ids[0], args, explicit, expected, buf())
@@ -6733,6 +6831,11 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
 // receiver is seen as an instance of that class.
 private receiver_type_args(c: *Checker, receiver_type: &Type, m: usize) -> Buf[&Type]
     val t = zonk(c, receiver_type)
+    // A method of an impl for every integer width takes the receiver's width as its parameter.
+    if c.symbols[m].type_owner == integer_owner()
+        var width: Buf[&Type] = buf()
+        width.push(t)
+        return width
     // A type parameter has the methods of its bounds, as an instance of them.
     if *t is TypeVar(_, _, _)
         if c.symbols[m].owner_class is Some(k)
@@ -7449,19 +7552,42 @@ private conversion(c: *Checker, at: Span, target: &Type, args: Buf[Argument]) ->
         return TExpr(at, ErrorType, UnitConst)
     val arg = args[0].value
     // A literal is read at its own width, which is at least `int`'s, so that `i8(300)` narrows 300.
+    // Converted to a type parameter bounded by `Integer`, whose width each instance decides, it is
+    // read as a `long`.
     var want: Option[&Type] = None
     if is_literal(arg)
         want = *target match
             Int(bits) -> Some(if bits > IntBits then target else int_type())
             Real -> Some(Real)
+            TypeVar(_, _, _) -> Some(Int(64))
             _ -> Some(int_type())
     val x = check_expr(c, arg, want)
     if !settled(x.ty)
         return TExpr(at, if *x.ty is Nothing then Nothing else ErrorType, Convert(x))
-    if !convertible(x.ty, target)
+    if !convertible(as_integer(c, x.ty), as_integer(c, target))
         c.note(unit, at, s"cannot convert ${type_name(x.ty)} to ${type_name(target)}")
         return TExpr(at, ErrorType, UnitConst)
     TExpr(at, target, Convert(x))
+
+/** The type parameter in scope named `name` when it is bounded by `Integer`, so that calling it
+ * converts to the width each instance has. */
+private integer_param_named(c: *Checker, name: string) -> Option[&Type]
+    val scope = c.generic?
+    for i in 0..<scope.params.len()
+        if scope.params[i].name == name
+            val t: &Type = TypeVar(scope.owner, i, name)
+            return if is_integer_param(c, t) then Some(t) else None
+    None
+
+/** Whether `t` is a type parameter bounded by `Integer`, so every instance has an integer for it. */
+private is_integer_param(c: *Checker, t: &Type) -> bool
+    if !(*t is TypeVar(_, _, _)) then return false
+    core_trait_type(c, "Integer") match
+        Some(integer) -> conforms_to_bound(c, t, integer)
+        None -> false
+
+/** `t` as a conversion sees it: a type parameter bounded by `Integer` converts as an integer does. */
+private as_integer(c: *Checker, t: &Type) -> &Type = if is_integer_param(c, t) then Int(64) else t
 
 convertible(from: &Type, to: &Type) -> bool = *from match
     Int(_) -> *to is Int(_) || *to is Real || *to is Byte || *to is Char

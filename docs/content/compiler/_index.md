@@ -400,6 +400,24 @@ impl's methods: a built-in value is no object, so it can neither carry a table n
 default bodies, which are compiled once for objects. A bounded call in an instance whose type
 argument is a built-in type finds its method in that table and calls it directly.
 
+**The integer family.** `Integer` is a core trait the compiler gives its members: every `Int(bits)`
+meets it in `meets_bound`, and `refuse_closed_trait` rejects any impl of it and any `:` naming it. An
+impl in module `avin` whose target is its own one parameter, bounded by `Integer` alone
+(`impl[T: Integer] Display for T`), is resolved by `resolve_family_impl` onto the **integer family**:
+the type parameter `TypeVar(integer_owner(), 0, "T")`, which the impl and all its methods share as a
+data type's methods share its owner, and which `scope_bounds` bounds by `Integer` wherever it is
+named. Its conformance is a `BuiltinConformance` whose type is the family, and `builtin_covers`
+lets such a conformance, and a method whose receiver is the family, stand for every integer type:
+in `builtin_traits`, `meets_bound`, method lookup on an integer receiver and the built-in tables. A
+trait so implemented has no other impl for any width. The family's conformances get a table of
+their own; a width with impls of its own (a program's trait for `i5`) has a table holding both, the
+family's methods matched against the trait as the family sees them. A call of a family method takes
+the receiver's width as its first type argument (`receiver_type_args`), and lowering does the same
+when it finds the method in a table (`implementation_args`), so each width is an instance whose
+operators are the machine's and whose conversions (`long(x)`, `T(n)`, checked by
+`integer_param_named` and `as_integer`) resize to the instance's width. A width with no impl of its
+own takes the family's table in `builtin_table`.
+
 **Rendering an interpolation.** `s"…"` is checked into a join of its pieces with `+`. A hole of a
 built-in type becomes a `Render` node, lowered to the runtime's rendering of the value (a constant
 for `bool` and `unit`); a hole of any other type, a type parameter's included, becomes a call of its
