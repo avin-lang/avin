@@ -585,6 +585,18 @@ Settled by the user on 2026-11-03:
 
 Settled by the user on 2026-11-04:
 
+- **`From[E]` is one generic trait, implemented once per source error type** by the type the
+  errors convert to: `impl From[IoError] for ConfigError` beside `impl From[ParseError] for
+  ConfigError`. A type may implement one generic trait at several type arguments where the trait's
+  members are all static and it requires no other trait, as `From`'s one member,
+  `static from(value: E) -> Self`, is; any other trait is implemented once. `?` on a `Result[U, E]`
+  in a function yielding `Result[T, F]` passes the error on unchanged where `E` is an `F`, and
+  otherwise through `F.from`: at `From[E]`, or else at the one conformance `From[X]` with `E` an `X`
+  that is more specific than every other such. Neither is an error naming `From[E]`; several equally
+  specific ones are an error naming them. On a type parameter the conformances are its bounds',
+  `F: From[IoError] + From[ParseError]`. See [errors](/spec/errors/) and
+  [declarations](/spec/declarations/#impl).
+
 - **`compareAndSet` on a value without identity** — a data value, tuple, string, `Option` or `Any` —
   **compares with `==`; on scalars and references it compares the word.** A class instance (even of
   a class that derives `Eq`) and a function value keep identity. See

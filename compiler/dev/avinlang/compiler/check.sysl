@@ -463,6 +463,9 @@ struct Checker
     type_slots: Buf[&Type]
     /** Whether a template's own parameter is being declared, the one place `Shaped` is a bound. */
     declaring_template: bool
+    /** The instance of a trait a type implements at several type arguments that a member of the trait
+     * is being seen as, while one of those conformances is checked. */
+    seen_instance: Option[&Type]
 
     note(*self, unit: usize, at: Span, message: string)
         // What goes wrong in an impl made from a template is the template's, already reported where
@@ -701,7 +704,7 @@ private check_imports(c: *Checker, unit: usize)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false)
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, None)
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -784,6 +787,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     check_template_implementations(&c)
     check_function_types(&c)
     check_equality_pairs(&c)
+    check_several_conformances(&c)
     for g in 0..<c.globals.len()
         settle_global(&c, g)
     check_tests_impls(&c)
@@ -1480,16 +1484,16 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
     if trait_type is Some(t)
         *target match
             Data(id, _, _) ->
-                if conforms_directly(c.data[id].traits, t)
-                    c.note(unit, written_trait_span(d), s"`$path` already conforms to `${type_name(t)}`; a conformance is stated once")
+                if conforms_already(c, c.data[id].traits, t)
+                    c.note(unit, written_trait_span(d), restated(c, path, t))
                     return invalid
                 var traits = c.data[id].traits
                 traits.push(t)
                 c.data[id].traits = traits
             Class(_, _, _) -> ()
             _ ->
-                if conforms_directly(builtin_traits(c, target), t)
-                    c.note(unit, written_trait_span(d), s"`$path` already conforms to `${type_name(t)}`; a conformance is stated once")
+                if conforms_already(c, builtin_traits(c, target), t)
+                    c.note(unit, written_trait_span(d), restated(c, path, t))
                     return invalid
                 c.builtins.push(BuiltinConformance(target, t, unit, d.target.span, buf(), 0, buf()))
         if conditional
@@ -1972,6 +1976,42 @@ private conforms_directly(traits: Buf[&Type], t: &Type) -> bool
             if o == id then return true
     false
 
+/** The error for a conformance of type `who` to `t` stated again. */
+private restated(c: *Checker, who: string, t: &Type) -> string
+    if *t is Class(k, _, _)
+        if is_trait(c, k) && c.classes[k].decl.type_params.len() > 0 && !implemented_several_times(c, k)
+            return s"`$who` already conforms to `${c.classes[k].name}`; a type implements a trait at several type arguments only where the trait's members are all static"
+    s"`$who` already conforms to `${type_name(t)}`; a conformance is stated once"
+
+/** Whether `traits` already holds the conformance `t` states: the trait with any type arguments, or
+ * for a trait a type may implement several times, with the same ones. */
+private conforms_already(c: *Checker, traits: Buf[&Type], t: &Type) -> bool
+    val id = *t match
+        Class(k, _, _) -> k
+        _ -> return false
+    if !implemented_several_times(c, id) then return conforms_directly(traits, t)
+    for other in traits
+        if same_trait(other, t) && same_type(other, t) then return true
+    false
+
+// A generic trait whose members are all static may be implemented by one type at several type
+// arguments, `From[IoError]` and `From[ParseError]`: no value of it exists, so no method table holds
+// its members, and each call names the type and finds the member by its parameter types.
+private implemented_several_times(c: *Checker, k: usize) -> bool = is_trait(c, k) && several_conformances(c.classes[k].decl)
+
+/** Whether trait `d` may be implemented by one type at several type arguments: it is generic,
+ * requires no other trait, and its members are all static. */
+several_conformances(d: &ClassDecl) -> bool
+    if d.type_params.len() == 0 || d.parents.len() > 0 then return false
+    var any = false
+    for m in d.members
+        m match
+            MethodMember(_, _, _, static_member) ->
+                if !static_member then return false
+                any = true
+            _ -> return false
+    any
+
 private written_trait_span(d: &ImplDecl) -> Span = d.trait_name match
     Some(t) -> t.span
     None -> d.target.span
@@ -2143,11 +2183,7 @@ private declare_fields(c: *Checker, unit: usize)
                 elif !(*f is ErrorType) then c.note(unit, parent.span, s"${type_name(f)} is neither a class nor a trait")
             elif parent_trait(c, unit, parent) is Some(t)
                 if trait_type(c, unit, t, parent) is Some(ty)
-                    var repeated = false
-                    for other in traits
-                        if *other is Class(o, _, _)
-                            if o == t then repeated = true
-                    if repeated then c.note(unit, parent.span, s"`${c.classes[t].name}` is named more than once after `:`")
+                    if conforms_already(c, traits, ty) then c.note(unit, parent.span, s"`${c.classes[t].name}` is named more than once after `:`")
                     else traits.push(ty)
             elif i == 0 && !declares_trait then c.classes[id].superclass = superclass_of(c, unit, id, parent)
             else
@@ -2165,8 +2201,8 @@ private declare_fields(c: *Checker, unit: usize)
                 None -> continue
             if *block.target is Class(target, _, _)
                 if target != id then continue
-                if conforms_directly(traits, t)
-                    val message = s"`${d.name}` already conforms to `${type_name(t)}`; a conformance is stated once"
+                if conforms_already(c, traits, t)
+                    val message = restated(c, d.name, t)
                     derived_of_impl(c, i) match
                         Some(x) -> derived_note(c, x, message)
                         None -> c.note(block.unit, written_trait_span(block.decl), message)
@@ -3627,7 +3663,7 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
     for i in 0..<conformed.len()
         for j in 0..<i
             if *conformed[i] is Class(a, _, _) && *conformed[j] is Class(b, _, _)
-                if a == b then c.note(unit, k.decl.name_span, s"`${k.name}` conforms to `${c.classes[a].name}` twice, as ${type_name(conformed[j])} and ${type_name(conformed[i])}")
+                if a == b && !(implemented_several_times(c, a) && !same_type(conformed[i], conformed[j])) then c.note(unit, k.decl.name_span, s"`${k.name}` conforms to `${c.classes[a].name}` twice, as ${type_name(conformed[j])} and ${type_name(conformed[i])}")
     for f in k.fields
         if f.owner == id && f.public
             if trait_method(c, id, f.name) is Some(m)
@@ -3652,6 +3688,9 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
                 mismatched = true
                 report_static_mismatch(c, symbol.unit, symbol.decl.name_span, name, c.classes[c.symbols[tm].owner_class.unwrap()].name, c.symbols[tm].static_member)
         if mismatched then continue
+        // A static member implementing a trait the class conforms to at several type arguments is
+        // matched to its conformance once every class is linked.
+        if symbol.static_member && implemented.len() == 0 && implements_several(c, conformed, self_type, m) then continue
         if symbol.static_member && implemented.len() == 0
             c.note(symbol.unit, symbol.decl.name_span, s"`$name` is static, which only a trait's member and its implementations are; `${k.name}` conforms to no trait with a static `$name`")
             continue
@@ -3770,9 +3809,13 @@ private build_builtin_table(c: *Checker, b: usize, conformed: Buf[usize])
             val name = c.symbols[methods[j]].decl.name
             var own: Option[usize] = None
             // A width's impls for every integer width implement the trait as the family sees it.
+            // A trait implemented at several type arguments has its members matched to each of its
+            // conformances once all are known; the table holds any one of them.
+            val several = implemented_several_times(c, t)
             for m in c.builtin_methods
                 val receiver = c.symbols[m].receiver.unwrap()
-                if own is None && builtin_covers(receiver, ty) && same_method(c, receiver, m, methods[j]) then own = Some(m)
+                if own is None && builtin_covers(receiver, ty) && (if several then c.symbols[m].decl.name == name && c.symbols[m].static_member else same_method(c, receiver, m, methods[j])) then own = Some(m)
+            if several && own is None then continue
             own match
                 Some(m) ->
                     inherit_defaults(c, m, methods[j])
@@ -4229,7 +4272,11 @@ private seen_from(c: *Checker, self_type: &Type, m: usize, t: &Type) -> &Type
     val owner = symbol.owner_class match
         Some(k) -> k
         None -> return renamed
-    val args = ancestor_type(c.classes, c.data, self_type, owner) match
+    var instance = ancestor_type(c.classes, c.data, self_type, owner)
+    if c.seen_instance is Some(i)
+        if *i is Class(k, _, _)
+            if k == owner then instance = Some(i)
+    val args = instance match
         Some(a) -> *a match
             Class(_, _, xs) -> xs
             _ -> buf()
@@ -4381,6 +4428,62 @@ private check_equality_pairs(c: *Checker)
                                 at = written_trait_span(block.decl)
                                 unit = block.unit
             c.note(unit, at, unpaired_equality(c.data[d].name, own_eq))
+
+// A type implementing a trait at several type arguments gives each of the trait's static members once
+// for each: `From[IoError]` and `From[ParseError]` need a `from` taking each. The method tables hold
+// one implementation per member, so each conformance is checked here against the members it names.
+private check_several_conformances(c: *Checker)
+    for k in 0..<c.classes.len()
+        if is_trait(c, k) then continue
+        val self_type = own_class_type(c.classes[k], k)
+        for t in c.classes[k].traits
+            check_conformance_members(c, self_type, t, c.classes[k].unit, c.classes[k].decl.name_span)
+    for block in c.impls
+        if *block.target is Class(_, _, _) || *block.target is ErrorType then continue
+        val t = block.trait_type match
+            Some(t) -> t
+            None -> continue
+        check_conformance_members(c, block.target, t, block.unit, written_trait_span(block.decl))
+
+/** Whether static member `m` of `self_type` implements a member of one of the conformances in
+ * `conformed` to a trait implemented at several type arguments. */
+private implements_several(c: *Checker, conformed: Buf[&Type], self_type: &Type, m: usize) -> bool
+    for t in conformed
+        if *t is Class(tid, _, _)
+            if implemented_several_times(c, tid)
+                c.seen_instance = Some(t)
+                var matched = false
+                for tm in c.classes[tid].methods
+                    if same_method(c, self_type, tm, m) then matched = true
+                c.seen_instance = None
+                if matched then return true
+    false
+
+private check_conformance_members(c: *Checker, self_type: &Type, t: &Type, unit: usize, at: Span)
+    val tid = *t match
+        Class(k, _, _) -> k
+        _ -> return
+    if !implemented_several_times(c, tid) then return
+    c.seen_instance = Some(t)
+    for tm in c.classes[tid].methods
+        val name = c.symbols[tm].decl.name
+        val candidates = *self_type match
+            Class(k, _, _) -> methods_named(c, k, name)
+            _ -> receiver_methods(c, self_type, name)
+        var found: Option[usize] = None
+        for m in candidates
+            if found is None && m != tm && c.symbols[m].static_member && param_mismatch(c, self_type, m, tm) is None then found = Some(m)
+        found match
+            Some(m) ->
+                if result_mismatch(c, self_type, m, tm) is Some(text) then c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`$name` implements `$name` of ${type_name(t)}, $text")
+            None ->
+                var shown = ""
+                val want = c.symbols[tm].params
+                for i in 1..<want.len()
+                    if i > 1 then shown = shown + ", "
+                    shown = shown + s"${c.symbols[tm].param_names[i]}: ${type_name(seen_from(c, self_type, tm, want[i]))}"
+                c.note(unit, at, s"`${type_name(self_type)}` implements `${type_name(t)}` without `static $name($shown)`")
+    c.seen_instance = None
 
 private unpaired_equality(name: string, has_eq: bool) -> string =
     if has_eq then s"`$name` implements `equals` from `Eq` without `hash` from `Hash`; equal values must have equal hashes, so a type implementing one implements both"
@@ -4884,9 +4987,9 @@ meets_bound(f: Conformances, x: &Type, bound: &Type) -> bool
                         if ancestor_type(f.classes, f.data, b.trait_type, k) is Some(up)
                             if conforms(up, bound) then return true
                 return false
-            holding_ancestor(f, x, k) match
-                Some(up) -> conforms(up, bound)
-                None -> false
+            for up in holding_ancestors(f, x, k)
+                if conforms(up, bound) then return true
+            false
 
 private names_core_trait(core: CoreTraits, k: usize, name: string) -> bool = core.trait_named(name) match
     Some(t) -> t == k
@@ -4912,6 +5015,34 @@ holding_ancestor(f: Conformances, t: &Type, target: usize) -> Option[&Type]
         if !conformance_holds(f, class_owner(k), required, args) then continue
         if holding_ancestor(f, substitute(required, class_owner(k), args), target) is Some(found) then return Some(found)
     holding_ancestor(f, substitute(f.classes[k].superclass?, class_owner(k), args), target)
+
+/** Every instance of the class or trait `target` that `t` is through the conformances holding at its
+ * type arguments: one at most, except for a trait a type implements at several type arguments. */
+holding_ancestors(f: Conformances, t: &Type, target: usize) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    collect_ancestors(f, t, target, &out, 0)
+    out
+
+private collect_ancestors(f: Conformances, t: &Type, target: usize, out: *Buf[&Type], depth: usize)
+    if depth > f.classes.len() then return
+    if *t is Data(d, _, xs)
+        for required in f.data[d].traits
+            if conformance_holds(f, data_owner(d), required, xs) then collect_ancestors(f, substitute(required, data_owner(d), xs), target, out, depth + 1)
+        return
+    val k = *t match
+        Class(k, _, _) -> k
+        _ -> return
+    if k == target
+        for i in 0..<out.len()
+            if same_type(out[i], t) then return
+        out.push(t)
+        return
+    val args = *t match
+        Class(_, _, a) -> a
+        _ -> buf()
+    for required in f.classes[k].traits
+        if conformance_holds(f, class_owner(k), required, args) then collect_ancestors(f, substitute(required, class_owner(k), args), target, out, depth + 1)
+    if f.classes[k].superclass is Some(sup) then collect_ancestors(f, substitute(sup, class_owner(k), args), target, out, depth + 1)
 
 /** Whether the type whose parameters `owner` owns, at type arguments `args`, has the conformance to
  * `required` its declaration or an impl states: at once, unless an impl with bounds of its own
@@ -8919,20 +9050,119 @@ private propagate_expr(c: *Checker, e: &Expr, value: &Expr) -> &TExpr
         return TExpr(e.span, args[0], Match(s, arms))
     val error = zonk(c, args[1])
     val passed = zonk(c, failure[1])
-    if !fits(c, error, passed)
-        c.note(unit, e.span, s"`?` passes on an error of ${type_name(error)}, but ${described(symbol)} yields errors of ${type_name(passed)}; convert it first with `mapErr`")
-        return TExpr(e.span, ErrorType, UnitConst)
     val caught = c.body.locals.len()
     c.body.locals.push(TLocal("?error", error, false, c.current))
     var failed: Buf[&TPattern] = buf()
     failed.push(TPattern(e.span, error, PBind(caught)))
     var fields: Buf[&TExpr] = buf()
     val read = TExpr(e.span, error, Local(caught))
-    fields.push(if *passed is AnyType then to_any(c, read) else read)
+    if fits(c, error, passed) then fields.push(if *passed is AnyType then to_any(c, read) else read)
+    else
+        val converted = converted_error(c, e, value, read, passed, symbol)
+        if *converted.ty is ErrorType then return TExpr(e.span, ErrorType, UnitConst)
+        fields.push(converted)
     val err = TExpr(e.span, declared, Construct(variant_index(c, d, "Err"), fields))
     arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "Ok"), success)), None, TExpr(e.span, args[0], Local(held))))
     arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "Err"), failed)), None, TExpr(e.span, Nothing, Return(Some(err)))))
     TExpr(e.span, args[0], Match(s, arms))
+
+// An error `?` passes on to a function yielding errors of another type, `passed`, is converted by
+// that type's `from`, through its conformance to `From` at the error's type. Where it has none, the
+// conformance at a type the error is a value of serves, if one is more specific than every other.
+// On a type parameter the conformances are its bounds', and each instance calls its type
+// argument's `from`.
+private converted_error(c: *Checker, e: &Expr, value: &Expr, read: &TExpr, passed: &Type, symbol: FunctionSymbol) -> &TExpr
+    val unit = unit_of(c)
+    val error = read.ty
+    val failed = TExpr(e.span, ErrorType, UnitConst)
+    val from = c.class_types.get(qualified(CoreModule, "From")) match
+        Some(k) -> k
+        None ->
+            c.note(unit, e.span, s"`?` passes on an error of ${type_name(error)}, but ${described(symbol)} yields errors of ${type_name(passed)}; convert it first with `mapErr`")
+            return failed
+    val sources = from_sources(c, passed, from)
+    var exact: Option[&Type] = None
+    var candidates: Buf[&Type] = buf()
+    for s in sources
+        val source = conformance_arg(s)
+        if same_type(source, error) then exact = Some(s)
+        elif fits(c, error, source) then candidates.push(s)
+    val chosen = exact match
+        Some(s) -> s
+        None ->
+            if candidates.len() == 0
+                c.note(unit, e.span, s"`?` passes on an error of ${type_name(error)}, but ${described(symbol)} yields errors of ${type_name(passed)}, which does not implement From[${type_name(error)}]; implement it, or convert the error first with `mapErr`")
+                return failed
+            var best: Buf[&Type] = buf()
+            for x in candidates
+                var below_all = true
+                for y in candidates
+                    if !fits(c, conformance_arg(x), conformance_arg(y)) then below_all = false
+                if below_all then best.push(x)
+            if best.len() != 1
+                var shown = ""
+                for i in 0..<candidates.len()
+                    if i > 0 then shown = shown + if i + 1 == candidates.len() then " and " else ", "
+                    shown = shown + type_name(candidates[i])
+                c.note(unit, e.span, s"`?` cannot choose how to convert an error of ${type_name(error)} to ${type_name(passed)}: it implements $shown, and none is more specific than the others")
+                return failed
+            best[0]
+    val source = conformance_arg(chosen)
+    val receiver = TExpr(e.span, passed, TypeReceiver)
+    var argument = to_trait(c, read, source)
+    if *source is AnyType then argument = to_any(c, read)
+    var members: Buf[usize] = buf()
+    for m in c.classes[from].methods
+        if c.symbols[m].decl.name == "from" then members.push(m)
+    if members.len() != 1
+        c.note(unit, e.span, "the core library's `From` declares one member, `from`")
+        return failed
+    val member = members[0]
+    var call_args: Buf[&TExpr] = buf()
+    call_args.push(receiver)
+    call_args.push(argument)
+    // Each instance calls its type argument's `from` for the source the bound names.
+    if *passed is TypeVar(_, _, _)
+        var type_args: Buf[&Type] = buf()
+        type_args.push(source)
+        return TExpr(e.span, passed, BoundCall(member, bound_slot(c, member), call_args, type_args))
+    // A known type's own `from` taking the source.
+    val statics = *passed match
+        Class(k, _, _) -> methods_named(c, k, "from")
+        _ -> receiver_methods(c, passed, "from")
+    for m in statics
+        if !c.symbols[m].static_member then continue
+        val s = method_signature(c, receiver, m, c.symbols[m].result.unwrap_or(ErrorType))
+        if s.params.len() == 1 && same_type(zonk(c, substitute(s.params[0], s.owner, s.known)), source)
+            var written: Buf[Argument] = buf()
+            written.push(Argument(e.span, None, value, false))
+            var checked: Buf[Option[&TExpr]] = buf()
+            checked.push(Some(argument))
+            return method_call(c, e.span, e.span, receiver, m, written, None, Some(passed), false, checked)
+    c.note(unit, e.span, s"`${type_name(passed)}` implements ${type_name(chosen)} but has no static `from` taking ${type_name(source)}")
+    failed
+
+/** The type argument of an instance of `From`. */
+private conformance_arg(t: &Type) -> &Type = *t match
+    Class(_, _, xs) -> if xs.len() == 1 then xs[0] else ErrorType
+    _ -> ErrorType
+
+/** The instances of trait `k` type `t` implements: a type parameter's through its bounds, a built-in
+ * type's through its impls, and any other's through the conformances holding at its arguments. */
+private from_sources(c: *Checker, t: &Type, k: usize) -> Buf[&Type]
+    val f = conformances(c)
+    var out: Buf[&Type] = buf()
+    if *t is TypeVar(_, _, _)
+        for b in bounds_of(c, t)
+            for up in holding_ancestors(f, b, k)
+                out.push(up)
+        return out
+    if is_builtin(t) || *t is Tuple(_)
+        for b in c.builtins
+            if builtin_covers(b.ty, t) && tuple_parts_hold(f, b.owner, b.params, t)
+                if ancestor_type(c.classes, c.data, b.trait_type, k) is Some(up) then out.push(up)
+        return out
+    holding_ancestors(f, t, k)
 
 // A call to a generic function solves for its type arguments: they may be written (`f[int](x)`),
 // and otherwise each starts as an unknown that the expected result type and the arguments decide.
@@ -9528,7 +9758,59 @@ private static_call(c: *Checker, at: Span, name_span: Span, target: &Expr, ty: &
     if *t is Int(1) && name == "one" && args.len() == 0
         c.note(unit, name_span, "`i1` has no `1`, so `i1.one()` does not exist")
         return TExpr(at, ErrorType, UnitConst)
+    if *t is TypeVar(_, _, _) && statics.len() == 1 && explicit is None
+        if c.symbols[statics[0]].owner_class is Some(k)
+            if implemented_several_times(c, k) && c.symbols[statics[0]].decl.type_params.len() == 0
+                val instances = from_sources(c, t, k)
+                if instances.len() > 1 then return several_bound_call(c, at, name_span, TExpr(target.span, t, TypeReceiver), statics[0], instances, args)
     call_method(c, at, name_span, TExpr(target.span, t, TypeReceiver), name, statics, args, explicit, expected, false)
+
+// A static member of a trait a type parameter is bounded by at several type arguments,
+// `T: Make[int] + Make[string]`: the arguments decide which instance's member is called, the one
+// whose parameter types they fit. Each instance of the code calls its type argument's member for it.
+private several_bound_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m: usize, instances: Buf[&Type], args: Buf[Argument]) -> &TExpr
+    val unit = unit_of(c)
+    val symbol = c.symbols[m]
+    var typed: Buf[&TExpr] = buf()
+    for a in args
+        typed.push(check_expr(c, a.value, None))
+    for a in args
+        if a.name is Some(_)
+            c.note(unit, a.span, s"`${symbol.decl.name}` is called on a type parameter bounded by several instances of its trait, so its arguments are passed by position")
+            return TExpr(at, ErrorType, UnitConst)
+    var chosen: Buf[&Type] = buf()
+    for instance in instances
+        if typed.len() + 1 != symbol.params.len() then break
+        val instance_args = *instance match
+            Class(_, _, xs) -> xs
+            _ -> buf()
+        var accepts = true
+        for i in 0..<typed.len()
+            val wanted = substitute(with_self(c, m, receiver.ty, symbol.params[i + 1]), symbol.type_owner, instance_args)
+            if !fits(c, typed[i].ty, wanted) && !boxes_to(c, typed[i].ty, wanted) then accepts = false
+        if accepts then chosen.push(instance)
+    if chosen.len() != 1
+        var shown = ""
+        for i in 0..<instances.len()
+            if i > 0 then shown = shown + if i + 1 == instances.len() then " and " else ", "
+            shown = shown + type_name(instances[i])
+        var given = ""
+        for i in 0..<typed.len()
+            if i > 0 then given = given + ", "
+            given = given + type_name(zonk(c, typed[i].ty))
+        val problem = if chosen.len() == 0 then "none of them takes" else "more than one takes"
+        c.note(unit, name_span, s"`${type_name(receiver.ty)}` is bounded by $shown, and $problem `${symbol.decl.name}($given)`")
+        return TExpr(at, ErrorType, UnitConst)
+    val instance_args = *chosen[0] match
+        Class(_, _, xs) -> xs
+        _ -> buf()
+    var call_args: Buf[&TExpr] = buf()
+    call_args.push(receiver)
+    for i in 0..<typed.len()
+        val wanted = substitute(with_self(c, m, receiver.ty, symbol.params[i + 1]), symbol.type_owner, instance_args)
+        call_args.push(to_trait(c, typed[i], zonk(c, wanted)))
+    val result = substitute(with_self(c, m, receiver.ty, symbol.result.unwrap_or(ErrorType)), symbol.type_owner, instance_args)
+    TExpr(at, result, BoundCall(m, bound_slot(c, m), call_args, instance_args))
 
 // A static member belongs to its type, so it is called on the type and never on a value.
 private refuse_static_on_value(c: *Checker, at: Span, receiver: &TExpr, m: usize) -> bool
