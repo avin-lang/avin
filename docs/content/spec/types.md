@@ -216,6 +216,7 @@ expected, makes one:
 val half: PartialFunction[int, int] = match n if n % 2 == 0 -> n / 2
 half.isDefinedAt(3)           // false
 half.applyOrElse(3, n -> n)   // 3
+[2, 4].map(half)              // [1, 2]: a partial function passes where `int -> int` is expected
 ```
 
 ## Vector types

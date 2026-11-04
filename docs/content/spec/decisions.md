@@ -589,7 +589,8 @@ Settled by the user on 2026-11-04:
   call that traps at the program's call site outside its domain, `lift`, `orElse` and
   `applyOrElse`; a literal tests its patterns and guards once per call, `lift` or `applyOrElse`.
   Every collection with `map` has `collect`, every `Iterable` has `collectFirst`, and `Option` has
-  `collect`.
+  `collect`. A `PartialFunction[A, B]` is a subtype of `A -> B`, through its `apply`, so it passes
+  wherever one is expected and traps there outside its domain.
 - `[]T` in a type position means exactly `Vector[T]`: `xs: []int`, `[][]int`, `Option[[]string]`,
   `main(args: []string)`. Its element is a name or a parenthesized type, so `[]int -> int` is a
   function from a vector and `[](int -> int)` a vector of functions. A type pattern takes it
