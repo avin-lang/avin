@@ -1,0 +1,676 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8_unchecked, str_builder}
+
+// `avin fmt` and the language server's formatting: a file rewritten in the one house style.
+//
+// **The formatter works on the lexer's tokens, not on the syntax tree.** The tree keeps no comments
+// and no blank lines, and a formatter has to keep both exactly; the tokens, with the text between
+// them, keep everything. What the formatter decides is only the white space: the spaces between
+// two tokens on a line, each line's indentation, the blank lines, and where a line too long for
+// `FormatWidth` columns is broken. The tokens themselves come out in the order and spelling they
+// went in.
+//
+// **Indentation follows the lexer's own layout.** The formatter runs the same `Layout` the lexer
+// does over the file's columns, so it knows which lines open a block, which continue one and which
+// sit inside brackets, and it gives every block level `FormatIndent` columns. A deeper line stays
+// deeper and a line at a block's margin stays at it, so the lexer reads the new file's blocks
+// exactly as it read the old one's.
+//
+// **A line is re-broken only where a line break means nothing.** Inside brackets a line break is
+// not significant, so a list too long for one line is broken one item per line there, the items
+// `FormatCallIndent` columns in (a parameter list `FormatDefinitionIndent`), the closing bracket on
+// a line of its own. A list the source already wrote one item per line, with a line break after
+// its opening bracket and before its closing one, is kept that way. A binding's value too long
+// for a line and holding no list is broken before its loosest operators, as continuation lines. A
+// line holding a comment inside its brackets, or a block opened inside them, keeps its line breaks
+// and is only re-indented.
+//
+// **The result is checked before it is given back.** The new text is parsed, and its syntax tree,
+// without positions, and its tokens must be the old one's; where re-breaking lines would change
+// either, the file is formatted again keeping every line break, and where even that would, the file
+// is refused. A file that does not parse is refused with its diagnostics.
+
+/** The widest a formatted line is, in characters, before the formatter breaks it. */
+const FormatWidth: usize = 120
+
+/** The columns one block level is indented by. */
+const FormatIndent: usize = 2
+
+/** The columns the items of a broken call's or literal's brackets are indented by, and each level of
+ * brackets open at the start of a line. */
+const FormatCallIndent: usize = 2
+
+/** The columns the items of a broken parameter list are indented by. */
+const FormatDefinitionIndent: usize = 4
+
+// One token, with what the formatter needs of its place in the source.
+private struct FmtToken
+    kind: Token
+    text: string
+    line: usize
+    start: usize
+    end: usize
+    /** Whether blanks separate it from the token before it on the same line. */
+    spaced: bool
+
+// One line of the source.
+private struct FmtLine
+    /** The index of its first token, and how many it holds. */
+    first: usize
+    count: usize
+    /** Its comment, from `//` to the end of the line without trailing blanks, or "". */
+    comment: string
+    /** A line of a literate file's prose. */
+    prose: bool
+    /** Its indentation in the source, after a literate file's margin. */
+    column: usize
+    /** Whether the lexer measures its indentation: a line outside brackets, or in a block opened
+     * inside them. */
+    head: bool
+    /** How many blocks are open on it. */
+    level: usize
+    /** Its new indentation, after the margin. */
+    indent: usize
+    /** How many brackets are open where it starts. */
+    brackets: usize
+    /** How many closing brackets it starts with. */
+    closers: usize
+    /** For a head line: the index of the first token of the next head line (or the end), and that
+     * line's level. */
+    end: usize
+    next_level: usize
+
+// The file as the formatter reads it.
+private struct Fmt
+    toks: Buf[FmtToken]
+    /** Indexed by line number; the entry at 0 is unused. */
+    lines: Buf[FmtLine]
+    /** For an opening bracket, the index of its closing one. */
+    partner: Buf[usize]
+    /** For each token, whether a space goes before it when it shares a line with the one before. */
+    space: Buf[bool]
+    margin: usize
+
+/** A source file formatted, or why it is not: its diagnostics where it does not parse. */
+format_source(doc: Source) -> Result[string, string] = fmt_checked(doc, true)
+
+/** The text of the file `name` formatted. */
+format_text(name: string, text: string) -> Result[string, string] = format_source(source_of(name, text))
+
+/** The file formatted with its lines re-broken, refused rather than formatted again keeping its line
+ * breaks where re-breaking would change its meaning. */
+format_reflowed(doc: Source) -> Result[string, string] = fmt_checked(doc, false)
+
+private fmt_checked(doc: Source, keep_breaks: bool) -> Result[string, string]
+    val parsed = parse(doc)
+    if parsed.report.has_errors() then return Err(parsed.report.render(parsed.source).trim_end())
+    val before = fmt_shape(parsed.file, parsed.source)
+    val text = fmt_layout(doc, parsed.source, true)?
+    if fmt_same_program(doc.name, text, before) then return Ok(text)
+    if keep_breaks
+        val kept = fmt_layout(doc, parsed.source, false)?
+        if fmt_same_program(doc.name, kept, before) then return Ok(kept)
+    Err(s"${doc.name}: the formatter would change what the file means, so it is left as it is")
+
+// What a file says, without where: its syntax tree shown without positions, and its tokens.
+private fmt_shape(file: SourceFile, program: Source) -> string
+    var out = str_builder()
+    out.push(show_file(file))
+    for t in lex(program).items.items
+        if t.value == Newline || t.value == Indent || t.value == Dedent then continue
+        out.push("\n")
+        out.push(from_utf8_unchecked(program.text(t.span)))
+    out.finish()
+
+private fmt_same_program(name: string, text: string, before: string) -> bool
+    val parsed = parse(source_of(name, text))
+    if parsed.report.has_errors() then return false
+    fmt_shape(parsed.file, parsed.source) == before
+
+// ---- reading the file ----
+
+private is_closer(text: string) -> bool = text == ")" || text == "]" || text == "}"
+private is_opener(text: string) -> bool = text == "(" || text == "[" || text == "{"
+
+private blank_byte(b: u8) -> bool = b == u8(' ') || b == u8('\t') || b == u8('\r')
+
+private all_blank(bytes: []const u8) -> bool
+    for b in bytes
+        if !blank_byte(b) then return false
+    true
+
+// The lines a source has: a newline at the end starts no line of its own.
+private fmt_line_count(src: Source) -> usize
+    val n = src.line_count()
+    if n > 1 && src.line_span(n).is_empty() then n - 1 else n
+
+private fmt_scan(doc: Source, program: Source, margin: usize) -> Result[Fmt, string]
+    val lexed = lex(program)
+    if lexed.report.has_errors() then return Err(lexed.report.render(program).trim_end())
+    val n = fmt_line_count(program)
+    var lines: Buf[FmtLine] = buf()
+    for i in 0..n
+        lines.push(FmtLine(0, 0, "", false, 0, false, 0, 0, 0, 0, 0, 0))
+    var toks: Buf[FmtToken] = buf()
+    var line = 1usize
+    for t in lexed.items.items
+        if t.value == Newline || t.value == Indent || t.value == Dedent then continue
+        while line < n && program.line_span(line + 1).start <= t.span.start
+            line += 1
+        if t.span.end > program.line_span(line).end
+            return Err(s"${doc.name}:$line: a literal runs past the end of its line, so the file is left as it is")
+        var spaced = false
+        if toks.len() > 0 && toks[toks.len() - 1].line == line then spaced = t.span.start > toks[toks.len() - 1].end
+        toks.push(FmtToken(t.value, from_utf8_unchecked(program.text(t.span)), line, t.span.start, t.span.end, spaced))
+        if lines[line].count == 0 then lines[line].first = toks.len() - 1
+        lines[line].count += 1
+    for l in 1..n
+        val span = program.line_span(l)
+        val bytes = program.text(span)
+        var col = 0usize
+        var i = 0usize
+        while i < bytes.len && (bytes[i] == u8(' ') || bytes[i] == u8('\t'))
+            col = if bytes[i] == u8('\t') then (col / 8 + 1) * 8 else col + 1
+            i += 1
+        lines[l].column = if col > margin then col - margin else 0
+        var from = if lines[l].count > 0 then toks[lines[l].first + lines[l].count - 1].end - span.start else i
+        while from < bytes.len && blank_byte(bytes[from])
+            from += 1
+        if from + 1 < bytes.len && bytes[from] == u8('/') && bytes[from + 1] == u8('/')
+            var to = bytes.len
+            while to > from && blank_byte(bytes[to - 1])
+                to -= 1
+            lines[l].comment = from_utf8_unchecked(bytes[from..<to])
+        if lines[l].count == 0 && lines[l].comment == "" && !all_blank(doc.line_text(l)) then lines[l].prose = true
+        var c = 0usize
+        while c < lines[l].count && is_closer(toks[lines[l].first + c].text)
+            c += 1
+        lines[l].closers = c
+    var partner: Buf[usize] = buf()
+    var open: Buf[usize] = buf()
+    for k in 0..<toks.len()
+        partner.push(k)
+        if is_opener(toks[k].text) then open.push(k)
+        elif is_closer(toks[k].text)
+            if open.pop() is Some(o) then partner[o] = k
+    fmt_measure(&lines, toks, n)?
+    var f = Fmt(toks, lines, partner, buf(), margin)
+    for k in 0..<f.toks.len()
+        f.space.push(k > 0 && fmt_space(f, k))
+    Ok(f)
+end fmt_scan
+
+// Runs the lexer's layout over the lines, as the lexer does, and gives each line its new
+// indentation: a head line its block's, a line inside brackets its head line's and a step for each
+// bracket open since, and a comment line the indentation a line of code at its column would have.
+private fmt_measure(lines: *Buf[FmtLine], toks: Buf[FmtToken], n: usize) -> Result[unit, string]
+    var lay = layout()
+    var stack: Buf[usize] = buf()
+    stack.push(0)
+    var head_next = true
+    var prev_indent = 0usize
+    var owner = 0usize
+    var waiting: Buf[usize] = buf()
+    var heads: Buf[usize] = buf()
+    for l in 1..n
+        if lines[l].count == 0
+            if lines[l].comment != "" then waiting.push(l)
+            continue
+        if head_next
+            for c in waiting
+                lines[c].indent = fmt_comment_indent(lay, stack, lines[c].column, lines[l].column)
+        lines[l].brackets = lay.brackets
+        if head_next
+            lines[l].head = true
+            lay.line(lines[l].column) match
+                Same -> ()
+                Deeper ->
+                    val top = stack[stack.len() - 1]
+                    // A block opened inside brackets starts from the line that opened it.
+                    val base = if lay.brackets > 0 && prev_indent > top then prev_indent else top
+                    stack.push(base + FormatIndent)
+                Shallower(k) ->
+                    for i in 0..<k do stack.pop()
+                Ragged(_) -> return Err(s"line $l: indentation does not match an enclosing block")
+            lines[l].indent = stack[stack.len() - 1]
+            lines[l].level = stack.len() - 1
+            owner = l
+            heads.push(l)
+        else
+            val h = lines[owner]
+            val inner = if lines[l].brackets > lines[l].closers then lines[l].brackets - lines[l].closers else 0
+            val rel = if inner > h.brackets then inner - h.brackets else 0
+            lines[l].indent = h.indent + FormatCallIndent * rel
+            lines[l].level = h.level
+            for c in waiting
+                lines[c].indent = lines[l].indent
+        waiting.clear()
+        prev_indent = lines[l].indent
+        val first = lines[l].first
+        val last = first + lines[l].count - 1
+        for k in first..last
+            val t = toks[k]
+            if is_opener(t.text) then lay.open_bracket()
+            elif is_closer(t.text)
+                val closed = lay.close_bracket()
+                for i in 0..<closed do stack.pop()
+            if (t.kind == MatchKeyword || t.text == "->") && k == last then lay.opens_block()
+        head_next = lay.significant()
+    for c in waiting
+        lines[c].indent = fmt_comment_indent(lay, stack, lines[c].column, 0)
+    for i in 0..<heads.len()
+        val h = heads[i]
+        if i + 1 < heads.len()
+            lines[h].end = lines[heads[i + 1]].first
+            lines[h].next_level = lines[heads[i + 1]].level
+        else
+            lines[h].end = toks.len()
+            lines[h].next_level = 0
+    Ok(())
+end fmt_measure
+
+// The indentation of a comment on a line of its own: that of the block whose margin it sits at or
+// inside, or, deeper than every open block, of the block the next line opens.
+private fmt_comment_indent(lay: Layout, stack: Buf[usize], column: usize, next: usize) -> usize
+    val top = lay.blocks.len() - 1
+    if column > lay.blocks[top].column
+        return if next > lay.blocks[top].column then stack[top] + FormatIndent else stack[top]
+    var i = top
+    while i > 0 && lay.blocks[i].column > column
+        i -= 1
+    stack[i]
+
+// ---- spaces between tokens ----
+
+// Whether the token can end an operand, so that an operator after it stands between two.
+private fmt_operand_end(t: FmtToken) -> bool = t.kind match
+    Word -> !is_keyword(t.text) || t.text == "self" || t.text == "true" || t.text == "false" || t.text == "super"
+    Number | RealNumber | Quoted | Interpolated | CharQuoted -> true
+    Symbol -> is_closer(t.text)
+    Postfix -> t.text == "?" || t.text == "++" || t.text == "--"
+    _ -> false
+
+private fmt_word_like(t: FmtToken) -> bool = t.kind match
+    Word | Number | RealNumber | Quoted | Interpolated | CharQuoted | IsKeyword | MatchKeyword -> true
+    Symbol -> is_closer(t.text)
+    _ -> false
+
+private fmt_operator_kind(t: FmtToken) -> bool = t.kind match
+    AddOp | MultiplyOp | CompareOp | RangeOp | ConsOp | BitOrOp | BitXorOp | BitAndOp | AndOp | OrOp | SymbolOp | AssignOp -> true
+    Symbol -> t.text == "~" || t.text == "!" || t.text == "->" || t.text == "=>" || t.text == "|"
+    _ -> false
+
+// `xs*` passing a sequence, or `string*` a repeated parameter's type: a `*` with nothing after it
+// in its list.
+private fmt_splice(f: Fmt, k: usize) -> bool
+    if f.toks[k].text != "*" then return false
+    if k + 1 >= f.toks.len() || f.toks[k + 1].line != f.toks[k].line then return true
+    val next = f.toks[k + 1].text
+    next == ")" || next == "]" || next == ","
+
+/** Whether token `k` is an operator between two operands. */
+private fmt_binary(f: Fmt, k: usize) -> bool
+    val t = f.toks[k]
+    if t.text == "!" || t.text == "->" || t.text == "=>" || t.kind == AssignOp then return false
+    if !fmt_operator_kind(t) then return false
+    if k == 0 || !fmt_operand_end(f.toks[k - 1]) then return false
+    // `by -4` and `in -1 .. 1`: a sign written against its operand after a word reads as a prefix,
+    // and is kept one.
+    if (t.text == "-" || t.text == "+" || t.text == "~") && t.spaced && k + 1 < f.toks.len()
+        val next = f.toks[k + 1]
+        if next.line == t.line && !next.spaced then return false
+    !fmt_splice(f, k)
+
+private fmt_prefix(f: Fmt, k: usize) -> bool
+    val t = f.toks[k].text
+    (t == "-" || t == "+" || t == "!" || t == "~") && !fmt_binary(f, k)
+
+private fmt_spaced_operator(f: Fmt, k: usize) -> bool
+    val t = f.toks[k]
+    t.kind == AssignOp || t.text == "->" || t.text == "=>" || fmt_binary(f, k)
+
+// Whether the first token of a head line: an operator there starts a continuation line, a guard or
+// a method's name, and keeps the spacing it was written with.
+private fmt_starts_head(f: Fmt, k: usize) -> bool
+    val l = f.lines[f.toks[k].line]
+    l.head && l.first == k
+
+private fmt_space(f: Fmt, k: usize) -> bool
+    val space = fmt_wanted_space(f, k).unwrap_or(f.toks[k].spaced)
+    space || fmt_would_join(f.toks[k - 1].text, f.toks[k].text)
+
+// The space the style asks for between tokens `k - 1` and `k`, or None where it keeps the source's.
+private fmt_wanted_space(f: Fmt, k: usize) -> Option[bool]
+    val a = f.toks[k - 1]
+    val b = f.toks[k]
+    // `1.5` is one number and `1 .5` is not, so a dot after a number keeps the space it has.
+    if (a.kind == Number || a.kind == RealNumber) && b.text == "." then return None
+    if is_closer(b.text) || b.text == "," || b.text == "." || (b.kind == Postfix && b.text == "?") then return Some(false)
+    // `@` after an operand binds a pattern's name (`whole @ _ :: rest`); anywhere else it starts an
+    // annotation.
+    if a.text == "@" then return Some(k >= 2 && f.toks[k - 2].line == a.line && fmt_operand_end(f.toks[k - 2]))
+    if b.text == "@" && fmt_operand_end(a) then return Some(true)
+    if is_opener(a.text) || a.text == "." then return Some(false)
+    if a.text == "," then return Some(true)
+    if b.text == ":" then return Some(false)
+    if a.text == ":" then return Some(true)
+    if fmt_starts_head(f, k - 1) && fmt_operator_kind(a) then return None
+    if fmt_prefix(f, k - 1) || fmt_splice(f, k) then return Some(false)
+    if fmt_spaced_operator(f, k - 1) || fmt_spaced_operator(f, k) then return Some(true)
+    if b.text == "(" || b.text == "[" then return None
+    if a.text == "++" || a.text == "--" || b.text == "++" || b.text == "--" then return None
+    if fmt_word_like(a) && fmt_word_like(b) then return Some(true)
+    None
+
+// Whether two tokens written together would be read as different tokens.
+private fmt_would_join(a: string, b: string) -> bool
+    val x = a.bytes[a.bytes.len - 1]
+    val y = b.bytes[0]
+    if is_operator_char(x) && is_operator_char(y) then return true
+    if is_ident_cont(x) && (is_ident_cont(y) || y == u8('"') || y == u8('\'')) then return true
+    if x == u8('.') && y == u8('.') then return true
+    false
+
+// ---- writing lines ----
+
+private fmt_spaces(n: usize) -> string
+    var out = str_builder()
+    for i in 0..<n
+        out.push(" ")
+    out.finish()
+
+// Tokens `a` to `b` on one line.
+private fmt_flat(f: Fmt, a: usize, b: usize) -> string
+    var out = str_builder()
+    for k in a..<b
+        if k > a && f.space[k] then out.push(" ")
+        out.push(f.toks[k].text)
+    out.finish()
+
+private fmt_width(text: string) -> usize
+    var n = 0usize
+    for b in text.bytes
+        if b < 0x80 || b >= 0xC0 then n += 1
+    n
+
+// A parameter list: brackets whose items are typed, `name: T`.
+private fmt_definition_list(f: Fmt, o: usize, c: usize) -> bool
+    var k = o + 1
+    while k < c
+        if f.toks[k].text == ":" then return true
+        if is_opener(f.toks[k].text) then k = f.partner[k]
+        k += 1
+    false
+
+// The binding power of an operator a line may be broken before; 0 for one it may not.
+private fmt_level(t: FmtToken) -> usize = t.kind match
+    OrOp -> 1
+    AndOp -> 2
+    CompareOp -> 3
+    RangeOp -> 4
+    ConsOp -> 5
+    BitOrOp -> 6
+    BitXorOp -> 7
+    BitAndOp -> 8
+    AddOp -> 9
+    MultiplyOp -> 10
+    SymbolOp -> symbol_token(t.text) match
+        SymbolCompare -> 3
+        SymbolCons -> 5
+        SymbolBitOr -> 6
+        SymbolBitXor -> 7
+        SymbolBitAnd -> 8
+        SymbolAdd -> 9
+        SymbolMultiply -> 10
+        _ -> 11
+    Symbol -> if t.text == "~" then 11 else 0
+    _ -> 0
+
+/** Tokens `a` to `b`, one line or several, at `indent`. `value_from` is where a binding's value
+ * starts when the tokens are a whole `val`, `var` or `return` line that may go on in continuation
+ * lines, and 0 otherwise; inside brackets (`nested`) a line may be broken before any operator. */
+private fmt_render(f: Fmt, a: usize, b: usize, indent: usize, nested: bool, value_from: usize, out: *Buf[string])
+    var forced: Option[usize] = None
+    var longest: Option[usize] = None
+    var widest = 0usize
+    var k = a
+    while k < b
+        if is_opener(f.toks[k].text) && f.partner[k] < b
+            val c = f.partner[k]
+            if c > k + 1
+                val broken = f.toks[k + 1].line > f.toks[k].line && f.toks[c].line > f.toks[c - 1].line
+                if forced is None && broken then forced = Some(k)
+                // A list is broken only where the line up to it fits: breaking one whose opening
+                // bracket is past the limit would leave the long line long and the list split.
+                val inside = fmt_width(fmt_flat(f, k + 1, c))
+                val fits = indent + fmt_width(fmt_flat(f, a, k + 1)) <= FormatWidth
+                if fits && (longest is None || inside > widest)
+                    longest = Some(k)
+                    widest = inside
+            k = c + 1
+        else
+            k += 1
+    val text = fmt_flat(f, a, b)
+    if forced is None && indent + fmt_width(text) <= FormatWidth
+        out.push(fmt_spaces(indent) + text)
+        return
+    val group = if forced is Some(g) then Some(g) else longest
+    if group is Some(o)
+        val c = f.partner[o]
+        out.push(fmt_spaces(indent) + fmt_flat(f, a, o + 1))
+        val step = if fmt_definition_list(f, o, c) then FormatDefinitionIndent else FormatCallIndent
+        var e = o + 1
+        while e < c
+            var to = e
+            while to < c && f.toks[to].text != ","
+                if is_opener(f.toks[to].text) then to = f.partner[to]
+                to += 1
+            if to > e then fmt_render(f, e, to, indent + step, true, 0, out)
+            if to < c
+                out[out.len() - 1] = out[out.len() - 1] + ","
+                to += 1
+            e = to
+        fmt_render(f, c, b, indent, nested, 0, out)
+        return
+    // No list to break: break before the loosest operators instead, where a line may be.
+    val from = if nested then a + 1 else value_from
+    if from == 0 || from >= b
+        out.push(fmt_spaces(indent) + text)
+        return
+    var loosest = 0usize
+    var depth = 0usize
+    for i in from..<b
+        val t = f.toks[i]
+        if is_opener(t.text) then depth += 1
+        elif is_closer(t.text) && depth > 0 then depth -= 1
+        elif depth == 0 && i > from && fmt_binary(f, i)
+            val level = fmt_level(t)
+            if level > 0 && (loosest == 0 || level < loosest) then loosest = level
+    if loosest == 0
+        out.push(fmt_spaces(indent) + text)
+        return
+    var start = a
+    depth = 0
+    for i in from..<b
+        val t = f.toks[i]
+        if is_opener(t.text) then depth += 1
+        elif is_closer(t.text) && depth > 0 then depth -= 1
+        elif depth == 0 && i > from && fmt_binary(f, i) && fmt_level(t) == loosest
+            fmt_render(f, start, i, if start == a then indent else indent + FormatCallIndent, nested, 0, out)
+            start = i
+    fmt_render(f, start, b, indent + FormatCallIndent, nested, 0, out)
+end fmt_render
+
+// Where the value of a `val`, `var` or `return` line starts, when the line may go on in
+// continuation lines: no block follows it.
+private fmt_value_start(f: Fmt, l: usize) -> usize
+    val ln = f.lines[l]
+    if ln.next_level > ln.level then return 0
+    var k = ln.first
+    while k < ln.end && (f.toks[k].text == "private" || f.toks[k].text == "lazy")
+        k += 1
+    if k >= ln.end then return 0
+    if f.toks[k].text == "return" then return k + 1
+    if f.toks[k].text != "val" && f.toks[k].text != "var" then return 0
+    var depth = 0usize
+    while k < ln.end
+        val t = f.toks[k]
+        if is_opener(t.text) then depth += 1
+        elif is_closer(t.text) && depth > 0 then depth -= 1
+        elif depth == 0 && t.text == "=" then return k + 1
+        k += 1
+    0
+
+// The last line of the head line `l`'s statement when it may be laid out afresh: no prose and no
+// comment inside it but at its end, and every bracket closed within it.
+private fmt_reflowable(f: Fmt, l: usize) -> Option[usize]
+    val ln = f.lines[l]
+    val last = f.toks[ln.end - 1].line
+    for i in l..last
+        if f.lines[i].prose then return None
+        if i < last && f.lines[i].comment != "" then return None
+    var depth = 0usize
+    for k in ln.first..<ln.end
+        if is_opener(f.toks[k].text) then depth += 1
+        elif is_closer(f.toks[k].text)
+            if depth == 0 then return None
+            depth -= 1
+    if depth == 0 then Some(last) else None
+
+// Whether tokens `a` to `b` are annotations alone: `@name` or `@name(…)`, any number.
+private fmt_annotations_only(f: Fmt, a: usize, b: usize) -> bool
+    var k = a
+    while k < b
+        if f.toks[k].text != "@" || k + 1 >= b || f.toks[k + 1].kind != Word then return false
+        k += 2
+        if k < b && f.toks[k].text == "(" then k = f.partner[k] + 1
+    k == b && b > a
+
+// ---- the output ----
+
+private struct FmtOut
+    lines: Buf[string]
+    /** 0 code, 1 comment, 2 blank, 3 prose. */
+    kinds: Buf[u8]
+    /** Whether a blank line goes before the line. */
+    gaps: Buf[bool]
+    /** Blank lines read and not yet written. */
+    blanks: usize
+    /** A blank line or prose since the last line of code. */
+    separated: bool
+    /** Where the run of comment lines just written began. */
+    run: usize
+    /** Whether a top-level declaration has begun, how many lines of code it has, whether the one
+     * before it had more than one, and, while it may need one, where the blank line before it goes. */
+    started: bool
+    item_code: usize
+    prev_multi: bool
+    wants_gap: bool
+    gap_at: usize
+
+    private flush(*self, kind: u8)
+        if self.blanks == 0 then return
+        if self.lines.len() > 0
+            val last = self.kinds[self.kinds.len() - 1]
+            // Blank lines beside prose are the document's and stay as they are; between code, at
+            // most one.
+            val n = if kind == 3 || last == 3 then self.blanks else 1
+            for i in 0..<n
+                self.push("", 2)
+            self.separated = true
+        self.blanks = 0
+
+    private push(*self, text: string, kind: u8)
+        self.lines.push(text)
+        self.kinds.push(kind)
+        self.gaps.push(false)
+
+    blank(*self)
+        self.blanks += 1
+
+    prose(*self, text: string)
+        self.flush(3)
+        self.push(text, 3)
+        self.separated = true
+
+    comment(*self, text: string)
+        self.flush(1)
+        if self.kinds.len() == 0 || self.kinds[self.kinds.len() - 1] != 1 then self.run = self.lines.len()
+        self.push(text, 1)
+
+    /** A line of code; `item` is 1 for the first line of a top-level declaration, 2 for a top-level
+     * line that belongs to the declaration before it, 0 for any other. */
+    code(*self, text: string, item: u8)
+        self.flush(0)
+        if item == 1
+            self.close_item()
+            val here = self.lines.len()
+            val lead = if here > 0 && self.kinds[here - 1] == 1 then self.run else here
+            self.wants_gap = self.started && !self.separated
+            self.gap_at = lead
+            self.started = true
+            self.item_code = 0
+        self.push(text, 0)
+        self.item_code += 1
+        self.separated = false
+
+    private close_item(*self)
+        if !self.started then return
+        val multi = self.item_code > 1
+        if self.wants_gap && (self.prev_multi || multi) then self.gaps[self.gap_at] = true
+        self.prev_multi = multi
+        self.wants_gap = false
+
+    finish(*self) -> string
+        self.close_item()
+        var out = str_builder()
+        for i in 0..<self.lines.len()
+            if self.gaps[i] then out.push("\n")
+            out.push(self.lines[i])
+            out.push("\n")
+        out.finish()
+end FmtOut
+
+private fmt_out() -> FmtOut = FmtOut(buf(), buf(), buf(), 0, false, 0, false, 0, false, false, 0)
+
+private fmt_with_comment(text: string, comment: string) -> string =
+    if comment == "" then text elif text.trim_end() == "" then text + comment else text + " " + comment
+
+private fmt_layout(doc: Source, program: Source, reflow: bool) -> Result[string, string]
+    val margin = literate_margin(doc)
+    val f = fmt_scan(doc, program, margin)?
+    val n = f.lines.len() - 1
+    val pad = fmt_spaces(margin)
+    var out = fmt_out()
+    var after_annotation = false
+    var l = 1usize
+    while l <= n
+        val ln = f.lines[l]
+        if ln.prose
+            out.prose(from_utf8_unchecked(doc.line_text(l)))
+            l += 1
+            continue
+        if ln.count == 0
+            if ln.comment == "" then out.blank() else out.comment(pad + fmt_spaces(ln.indent) + ln.comment)
+            l += 1
+            continue
+        var item = 0u8
+        if ln.head && ln.level == 0
+            val word = f.toks[ln.first].text
+            item = if after_annotation || word == "else" || word == "elif" || word == "end" then 2u8 else 1u8
+            after_annotation = fmt_annotations_only(f, ln.first, ln.end)
+        if ln.head && reflow && fmt_reflowable(f, l) is Some(last)
+            var rendered: Buf[string] = buf()
+            fmt_render(f, ln.first, ln.end, ln.indent, false, fmt_value_start(f, l), &rendered)
+            for i in 0..<rendered.len()
+                val text = if i + 1 == rendered.len() then fmt_with_comment(pad + rendered[i], f.lines[last].comment) else pad + rendered[i]
+                out.code(text, if i == 0 then item else 0u8)
+            l = last + 1
+            continue
+        out.code(fmt_with_comment(pad + fmt_spaces(ln.indent) + fmt_flat(f, ln.first, ln.first + ln.count), ln.comment), item)
+        l += 1
+    Ok(out.finish())
+end fmt_layout

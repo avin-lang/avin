@@ -5,7 +5,7 @@ import sh.sysl.parsing.{Diagnostic, Source, Span, error, source_of}
 import sysl.buf.{Buf, buf}
 import sysl.crypto.sha256
 import sysl.encoding.hex_string
-import sysl.fs.{cache_dir, canonicalize, current_dir, entries, exists, is_dir, make_dir_all, pending_name, publish_dir, read_bytes, read_text, remove_dir_all, remove_file, walk, write_text, write_text_atomic}
+import sysl.fs.{cache_dir, canonicalize, copy_file, current_dir, entries, exists, is_dir, make_dir_all, pending_name, publish_dir, read_bytes, read_text, remove_dir_all, remove_file, walk, write_text, write_text_atomic}
 import sysl.path.{is_absolute, normalize, parent}
 import sysl.process.capture
 import sysl.slices.sort
@@ -34,10 +34,12 @@ const DigestPrefix: string = "sha256:"
 
 /** Where a dependency's source comes from. */
 enum Origin
-    /** A git repository, by its coordinate (`github.com/owner/name`), at the tag of `version`. */
+    /** A git repository, by its package's coordinate, at the tag of `version`. The coordinate is the
+     * repository's (`github.com/owner/name`) for the package at its root, and the repository's, `//`
+     * and a directory (`github.com/owner/name//solid`) for a member of it. */
     Git(coordinate: string, version: string)
-    /** A git repository, by its coordinate, at the commit `rev` names: a full or abbreviated
-     * lowercase hexadecimal id. */
+    /** A git repository, by its package's coordinate, at the commit `rev` names: a full or
+     * abbreviated lowercase hexadecimal id. */
     Rev(coordinate: string, rev: string)
     /** A directory, as the manifest wrote it, for a package developed beside the one using it. */
     Local(dir: string)
@@ -142,7 +144,8 @@ private read_dependencies(f: Field, sysl: bool, into: *Buf[Dependency]) -> Resul
         var version: Option[string] = None
         var rev: Option[string] = None
         var local: Option[string] = None
-        var member = false
+        var in_workspace = false
+        var member: Option[string] = None
         for g in d.value.fields()
             if g.key == "git"
                 val c = text_of(g)?
@@ -164,21 +167,31 @@ private read_dependencies(f: Field, sysl: bool, into: *Buf[Dependency]) -> Resul
                 return Err(error(g.key_span, s"`workspace` is not a key of a Sysl dependency, which holds `git` with `version` or `rev`, or `path`: a workspace's members are Avin packages"))
             elif g.key == "workspace"
                 g.value.as_bool() match
-                    Some(true) -> member = true
+                    Some(true) -> in_workspace = true
                     _ -> return Err(error(g.value.span, "a dependency's `workspace` is `true`: the dependency is the member of the workspace with its name"))
             elif sysl
                 return Err(error(g.key_span, s"`${g.key}` is not a key of a Sysl dependency, which holds `git` with `version` or `rev`, or `path`"))
+            elif g.key == "member"
+                val dir = text_of(g)?
+                if !valid_member(dir) then return Err(error(g.value.span, s"`$dir` is not a member's directory: ${MemberRule}"))
+                member = Some(dir)
             else
-                return Err(error(g.key_span, s"`${g.key}` is not a key of a dependency, which holds `git` with `version` or `rev`, `path`, or `workspace`"))
+                return Err(error(g.key_span, s"`${g.key}` is not a key of a dependency, which holds `git` with `version` or `rev` and optionally `member`, `path`, or `workspace`"))
         var sources = 0
         if git is Some(_) then sources += 1
         if local is Some(_) then sources += 1
-        if member then sources += 1
+        if in_workspace then sources += 1
         if sources != 1 && sysl
             return Err(error(d.key_span, s"the Sysl dependency `${d.key}` says once where it comes from: `git` with a `version` or a `rev`, or `path`"))
         if sources != 1
             return Err(error(d.key_span, s"the dependency `${d.key}` says once where it comes from: `git` with a `version` or a `rev`, `path`, or `workspace = true`"))
-        if git is Some(c)
+        if member is Some(_) && git is None
+            return Err(error(d.key_span, s"the dependency `${d.key}` has a `member`, which belongs with `git`: a member is a package in a directory of a fetched repository"))
+        if git is Some(repository)
+            // A member is a package of its own, named by the repository's coordinate, `//` and its directory.
+            val c = member match
+                Some(dir) -> repository + "//" + dir
+                None -> repository
             if version is Some(_) && rev is Some(_)
                 return Err(error(d.key_span, s"the dependency `${d.key}` has a `version` and a `rev`: a git dependency is read at a release or at a commit, not both"))
             if rev is Some(x)
@@ -274,6 +287,37 @@ valid_coordinate(c: string) -> bool
             val ok = b >= u8('a') && b <= u8('z') || b >= u8('A') && b <= u8('Z') || b >= u8('0') && b <= u8('9') || b == u8('.') || b == u8('_') || b == u8('-')
             if !ok then return false
     true
+
+private const MemberRule: string = "a member is a directory of the repository relative to its root, with no `.`, `..` or `*`, such as `solid` or `tools/probe`"
+
+/** Whether `dir` names a member of a repository: a relative directory with no empty, `.` or `..`
+ * segment and no `*`. */
+valid_member(dir: string) -> bool
+    if dir == "" || is_absolute(dir) || dir.contains("*") then return false
+    for segment in dir.split("/")
+        if segment == "" || segment == "." || segment == ".." then return false
+    true
+
+/** The repository a package's coordinate names: all of it for the package at the repository's root,
+ * and what comes before `//` for a member. */
+repository_of(coordinate: string) -> string = coordinate.split("//")[0]
+
+/** The directory of the member a package's coordinate names, relative to its repository's root; empty
+ * for the package at the root. */
+member_of(coordinate: string) -> string
+    val parts = coordinate.split("//")
+    if parts.len == 2 then parts[1] else ""
+
+/** The coordinate of the package in the directory `dir` of `repository`: the repository's own for its
+ * root, empty `dir`. */
+member_coordinate(repository: string, dir: string) -> string = if dir == "" then repository else repository + "//" + dir
+
+/** Whether `c` is a package's coordinate: a git coordinate, optionally followed by `//` and a member's
+ * directory. */
+valid_package_coordinate(c: string) -> bool
+    val parts = c.split("//")
+    if parts.len == 1 then return valid_coordinate(c)
+    parts.len == 2 && valid_coordinate(parts[0]) && valid_member(parts[1])
 
 // Workspaces.
 
@@ -493,6 +537,9 @@ struct Resolution
     sum_file: string
     sums: Buf[SumLine]
     read: Buf[SumLine]
+    /** Each repository cloned into the cache while resolving, as its coordinate and its version or `r`
+     * and commit, `github.com/owner/json v1.4.0`. */
+    cloned: Buf[string]
 
 private struct Selected
     coordinate: string
@@ -507,6 +554,25 @@ private struct Resolver
     /** The commit, by full id, each coordinate asked for at a `rev` is pinned to. */
     pinned: Buf[Selected]
     changed: bool
+    /** Whether the packages are read from the project's `vendor/` rather than the machine's cache. */
+    vendored: bool
+    cloned: Buf[string]
+
+/** The directory, beside a project's manifest or at its workspace's root, holding the packages it
+ * resolves to, in the cache's layout. */
+const VendorName: string = "vendor"
+
+/** The repository a fetched package was read from: its coordinate, the version or `r` and commit it
+ * was read at, and the directory its clone is kept in. */
+private struct Clone
+    repository: string
+    key: string
+    root: string
+
+/** Where a dependency led: its package's directory, and for a fetched one the clone it is in. */
+private struct Reached
+    dir: string
+    clone: Option[Clone]
 
 /** Resolves the package at `dir` and everything it depends on, fetching what the cache has not got
  * and checking each fetched package against the sum file. With `whole`, and `dir` a workspace's root,
@@ -514,8 +580,13 @@ private struct Resolver
  *
  * The version of a git dependency is the highest any manifest in the graph asks for: a version that
  * some manifest names, never a newer one nobody named. In a workspace the versions are chosen over
- * every member's dependencies, so no two members are built against two versions of one package. */
-resolve(dir: string, fetching: Fetching, whole: bool) -> Result[Resolution, string]
+ * every member's dependencies, so no two members are built against two versions of one package.
+ *
+ * A project with a `vendor/` directory resolves from it in place of the cache, and fetches nothing. */
+resolve(dir: string, fetching: Fetching, whole: bool) -> Result[Resolution, string] = resolve_from(dir, fetching, whole, true)
+
+// Resolves as `resolve` does; without `vendored`, from the cache even where the project has a `vendor/`.
+private resolve_from(dir: string, fetching: Fetching, whole: bool, vendored: bool) -> Result[Resolution, string]
     val home = canonicalize(dir).map_err(e -> s"avin: $dir: ${e.to_string()}")?
     val m = read_manifest(home)?
     val ws = workspace_containing(m)?
@@ -529,7 +600,10 @@ resolve(dir: string, fetching: Fetching, whole: bool) -> Result[Resolution, stri
         None -> roots.push(home)
     val sum_file = sum_dir + "/" + SumName
     val sums = read_sums(sum_file)?
-    var r = Resolver(fetching, ws, sums, buf(), buf(), buf(), false)
+    val vendor = sum_dir + "/" + VendorName
+    val from_vendor = vendored && is_dir(vendor)
+    val source = if from_vendor then Fetching(vendor, "", false) else fetching
+    var r = Resolver(source, ws, sums, buf(), buf(), buf(), false, from_vendor, buf())
     // A version raised can name dependencies of its own, which can raise another: walk again until a
     // walk raises nothing.
     loop
@@ -537,30 +611,39 @@ resolve(dir: string, fetching: Fetching, whole: bool) -> Result[Resolution, stri
         var seen: Buf[string] = buf()
         var reached: Buf[ResolvedPackage] = buf()
         for root in roots
-            visit(&r, root, false, &seen, &reached)?
+            visit(&r, root, None, &seen, &reached)?
         if !r.changed then break
     var seen: Buf[string] = buf()
     var packages: Buf[ResolvedPackage] = buf()
     if whole && (m.has_workspace || !m.has_package)
         for root in roots
-            visit(&r, root, false, &seen, &packages)?
+            visit(&r, root, None, &seen, &packages)?
     else
-        visit(&r, home, false, &seen, &packages)?
-    Ok(Resolution(packages, sum_file, r.sums, r.read))
+        visit(&r, home, None, &seen, &packages)?
+    Ok(Resolution(packages, sum_file, r.sums, r.read, r.cloned))
 
-private visit(r: *Resolver, dir: string, fetched: bool, seen: *Buf[string], out: *Buf[ResolvedPackage]) -> Result[unit, string]
+// Visits the package at `dir`, which was fetched from `from` when that is given, and every package it
+// depends on.
+private visit(r: *Resolver, dir: string, from: Option[Clone], seen: *Buf[string], out: *Buf[ResolvedPackage]) -> Result[unit, string]
     if contains(*seen, dir) then return Ok(())
     seen.push(dir)
     val m = read_manifest(dir)?
     if !m.has_package then return Err(s"avin: $dir is a workspace's root with no `package` block, which no package can depend on")
-    out.push(ResolvedPackage(m.name, dir, m, fetched))
+    out.push(ResolvedPackage(m.name, dir, m, from is Some(_)))
     for d in m.dependencies
-        val target = d.origin match
+        // A fetched package's path and workspace dependencies are other packages of its repository,
+        // read at the version it was read at.
+        val origin = from match
+            Some(c) -> sibling_origin(c, dir, d, m)?
+            None -> d.origin
+        val reached = origin match
             Git(coordinate, version) ->
                 if pinned_sha(*r, coordinate) != ""
                     return Err(error(d.span, s"`${d.label}` asks for $coordinate at the release v$version, and another dependency pins it to the commit ${pinned_sha(*r, coordinate)}: a package is read at one release or at one commit, so make them agree").render(m.src))
                 select(r, coordinate, version)
-                fetch_package(r, coordinate, selected_version(*r, coordinate))?
+                val chosen = selected_version(*r, coordinate)
+                val got = fetch_package(r, coordinate, chosen)?
+                Reached(got, Some(Clone(repository_of(coordinate), chosen, normalize(cached_package_dir(r.fetching.cache, repository_of(coordinate), chosen)))))
             Rev(coordinate, rev) ->
                 if selected_version(*r, coordinate) != ""
                     return Err(error(d.span, s"`${d.label}` pins $coordinate to the commit $rev, and another dependency asks for it at the release v${selected_version(*r, coordinate)}: a package is read at one release or at one commit, so make them agree").render(m.src))
@@ -569,27 +652,52 @@ private visit(r: *Resolver, dir: string, fetched: bool, seen: *Buf[string], out:
                     r.pinned.push(Selected(coordinate, got.sha))
                 elif pinned_sha(*r, coordinate) != got.sha
                     return Err(error(d.span, s"`${d.label}` pins $coordinate to the commit ${got.sha}, and another dependency pins it to ${pinned_sha(*r, coordinate)}: a package is read at one commit, so make them agree").render(m.src))
-                got.dir
+                Reached(got.dir, Some(Clone(repository_of(coordinate), rev_key(got.sha), normalize(cached_revision_dir(r.fetching.cache, repository_of(coordinate), got.sha)))))
             Local(p) ->
-                if fetched then return Err(error(d.span, s"`${d.label}` is a path dependency of a fetched package: a directory is only where it is on the machine that published it").render(m.src))
                 val full = if is_absolute(p) then p else dir + "/" + p
                 val c = canonicalize(full) match
                     Ok(c) -> c
                     Err(_) -> return Err(error(d.span, s"`${d.label}` is a path dependency, and `$p` is not a directory").render(m.src))
                 if !is_dir(c) then return Err(error(d.span, s"`${d.label}` is a path dependency, and `$p` is not a directory").render(m.src))
                 if !exists(c + "/" + ManifestName) then return Err(error(d.span, s"`${d.label}` is a path dependency, and `$p` holds no $ManifestName, so it is not a package").render(m.src))
-                c
+                Reached(c, None)
             Member ->
-                if fetched then return Err(error(d.span, s"`${d.label}` is a workspace dependency of a fetched package, which is in no workspace").render(m.src))
                 r.workspace match
                     Some(w) ->
                         index_of(w.names, d.label) match
-                            Some(i) -> w.members[i]
+                            Some(i) -> Reached(w.members[i], None)
                             None -> return Err(error(d.span, s"`${d.label}` is a workspace dependency, and no member of the workspace at ${w.root} is named `${d.label}`").render(m.src))
                     None -> return Err(error(d.span, s"`${d.label}` is a workspace dependency, and this package is in no workspace: a workspace's root lists its members, `workspace = [\"app\", \"${d.label}\"]`").render(m.src))
-        val into_fetched = fetched || d.origin is Git(_, _) || d.origin is Rev(_, _)
-        visit(r, target, into_fetched, seen, out)?
+        visit(r, reached.dir, reached.clone, seen, out)?
     Ok(())
+
+// The origin of the dependency `d` of the fetched package at `dir`, read from the clone `c`: a path or
+// workspace dependency is the package of the same repository it names, at the version or commit the
+// clone was read at; a git dependency is itself.
+private sibling_origin(c: Clone, dir: string, d: Dependency, m: Manifest) -> Result[Origin, string]
+    var sibling = ""
+    d.origin match
+        Local(p) ->
+            val target = normalize(if is_absolute(p) then p else dir + "/" + p)
+            if target != c.root && !target.starts_with(c.root + "/")
+                return Err(error(d.span, s"`${d.label}` is a path dependency of a fetched package that leaves its repository, ${c.repository}: a directory outside it is only where it is on the machine that published it").render(m.src))
+            sibling = if target == c.root then "" else target[c.root.bytes.len + 1..]
+            if !exists(target + "/" + ManifestName)
+                return Err(error(d.span, s"`${d.label}` is a path dependency, and `$p` holds no $ManifestName in ${c.repository} ${sum_label(c.key)}, so it is not a package").render(m.src))
+        Member ->
+            var in_workspace = false
+            if exists(c.root + "/" + ManifestName) then in_workspace = read_manifest(c.root)?.has_workspace
+            if !in_workspace
+                return Err(error(d.span, s"`${d.label}` is a workspace dependency of a fetched package, which is in no workspace").render(m.src))
+            val ws = workspace_of(read_manifest(c.root)?)?
+            val i = index_of(ws.names, d.label) match
+                Some(i) -> i
+                None -> return Err(error(d.span, s"`${d.label}` is a workspace dependency, and no member of the workspace of ${c.repository} ${sum_label(c.key)} is named `${d.label}`").render(m.src))
+            val at = ws.members[i]
+            sibling = if at == c.root then "" else at[c.root.bytes.len + 1..]
+        _ -> return Ok(d.origin)
+    val coordinate = member_coordinate(c.repository, sibling)
+    Ok(if c.key.starts_with("r") then Rev(coordinate, c.key[1..]) else Git(coordinate, c.key))
 
 private select(r: *Resolver, coordinate: string, version: string)
     for i in 0..<r.selected.len()
@@ -610,22 +718,46 @@ private selected_version(r: Resolver, coordinate: string) -> string
 cached_package_dir(cache: string, coordinate: string, version: string) -> string = s"$cache/$coordinate/@v$version"
 
 // The fetched package's directory: from the cache, checked by the hash recorded when it was
-// fetched, or cloned at its tag and hashed. Either way the hash is held to the sum file's line.
+// fetched, or cloned at its tag and hashed. Either way the hash is held to the sum file's line. A
+// member's directory is in the clone of its repository, which every member at the version shares,
+// and its line carries the clone's hash.
 private fetch_package(r: *Resolver, coordinate: string, version: string) -> Result[string, string]
     if r.fetching.cache == "" then return Err(s"avin: cannot fetch $coordinate v$version: this machine has no cache directory to keep packages in; set XDG_CACHE_HOME")
-    val dir = cached_package_dir(r.fetching.cache, coordinate, version)
+    val repository = repository_of(coordinate)
+    val member = member_of(coordinate)
+    val dir = cached_package_dir(r.fetching.cache, repository, version)
     val hash_file = dir + ".hash"
     var hash = ""
     if is_dir(dir)
         hash = read_text(hash_file) match
             Ok(t) -> t.trim()
-            Err(_) -> return Err(s"avin: $dir holds $coordinate v$version and no record of what it hashed to, so $SumName cannot be checked against it; remove that directory and build again")
+            Err(_) -> return Err(s"avin: $dir holds $repository v$version and no record of what it hashed to, so $SumName cannot be checked against it; remove that directory and build again")
     elif !r.fetching.online
-        return Err(s"avin: $coordinate v$version is not fetched yet; `avin build` fetches it")
+        return Err(not_fetched(*r, s"$coordinate v$version"))
     else
-        hash = clone_package(r.fetching, coordinate, version, dir)?
+        hash = clone_package(r.fetching, repository, version, dir, member == "")?
+        r.cloned.push(s"$repository v$version")
+    val at = package_in(dir, coordinate, s"v$version")?
     check_sum(r, coordinate, version, hash)?
-    Ok(dir)
+    Ok(at)
+
+// Why a package missing from where packages are read is not fetched.
+private not_fetched(r: Resolver, what: string) -> string
+    if r.vendored then return s"avin: $what is not in ${VendorName}/, and a project with a ${VendorName}/ fetches nothing; `avin vendor` adds it"
+    s"avin: $what is not fetched yet; `avin build` fetches it"
+
+// The directory of the package `coordinate` names in the clone at `dir`, read at `shown`: the clone
+// itself for the package at the repository's root, or its member's directory, which must hold a
+// manifest.
+private package_in(dir: string, coordinate: string, shown: string) -> Result[string, string]
+    val member = member_of(coordinate)
+    if member == ""
+        if !exists(dir + "/" + ManifestName) then return Err(s"avin: $coordinate $shown holds no $ManifestName, so it is not an Avin package")
+        return Ok(dir)
+    val at = dir + "/" + member
+    if !is_dir(at) then return Err(s"avin: $coordinate $shown: the repository has no directory `$member` at that version, so it has no such member")
+    if !exists(at + "/" + ManifestName) then return Err(s"avin: $coordinate $shown: `$member` holds no $ManifestName, so it is not a package")
+    Ok(at)
 
 // Holds a fetched package's hash to the sum file's line for it, and notes that resolution read it.
 // `key` is the version, or `r` and the commit.
@@ -661,28 +793,32 @@ private cached_commits(cache: string, coordinate: string, rev: string) -> Buf[st
 // full id, so two spellings of one commit are one package.
 private fetch_revision(r: *Resolver, coordinate: string, rev: string) -> Result[FetchedRevision, string]
     if r.fetching.cache == "" then return Err(s"avin: cannot fetch $coordinate at $rev: this machine has no cache directory to keep packages in; set XDG_CACHE_HOME")
+    val repository = repository_of(coordinate)
     var sha = ""
-    val have = cached_commits(r.fetching.cache, coordinate, rev)
-    if have.len() > 1 then return Err(s"avin: `$rev` is the start of more than one commit of $coordinate the cache holds: write more of it")
+    val have = cached_commits(r.fetching.cache, repository, rev)
+    if have.len() > 1 then return Err(s"avin: `$rev` is the start of more than one commit of $repository the cache holds: write more of it")
     if have.len() == 1 then sha = have[0]
-    if sha == "" && !r.fetching.online then return Err(s"avin: $coordinate at $rev is not fetched yet; `avin build` fetches it")
+    if sha == "" && !r.fetching.online then return Err(not_fetched(*r, s"$coordinate at $rev"))
     var hash = ""
     if sha != ""
-        val dir = cached_revision_dir(r.fetching.cache, coordinate, sha)
+        val dir = cached_revision_dir(r.fetching.cache, repository, sha)
         hash = read_text(dir + ".hash") match
             Ok(t) -> t.trim()
-            Err(_) -> return Err(s"avin: $dir holds $coordinate at $sha and no record of what it hashed to, so $SumName cannot be checked against it; remove that directory and build again")
+            Err(_) -> return Err(s"avin: $dir holds $repository at $sha and no record of what it hashed to, so $SumName cannot be checked against it; remove that directory and build again")
     else
-        val cloned = clone_revision(r.fetching, coordinate, rev)?
+        val cloned = clone_revision(r.fetching, repository, rev, member_of(coordinate) == "")?
         sha = cloned.sha
-        hash = read_text(cached_revision_dir(r.fetching.cache, coordinate, sha) + ".hash").map_err(e -> s"avin: ${e.to_string()}")?.trim()
+        r.cloned.push(s"$repository ${rev_key(sha)}")
+        hash = read_text(cached_revision_dir(r.fetching.cache, repository, sha) + ".hash").map_err(e -> s"avin: ${e.to_string()}")?.trim()
+    val at = package_in(cached_revision_dir(r.fetching.cache, repository, sha), coordinate, s"at $sha")?
     check_sum(r, coordinate, rev_key(sha), hash)?
-    Ok(FetchedRevision(cached_revision_dir(r.fetching.cache, coordinate, sha), sha))
+    Ok(FetchedRevision(at, sha))
 
 // Clones the repository, finds the commit `rev` names (fetching it by its full id when no branch or
 // tag reaches it), checks it out, and files the tree in the cache under the commit's full id with its
-// hash beside it. A commit already filed by another build is the same tree.
-private clone_revision(fetching: Fetching, coordinate: string, rev: string) -> Result[FetchedRevision, string]
+// hash beside it. A commit already filed by another build is the same tree. With `root_package`, a
+// repository with no manifest at its root is refused before it is filed.
+private clone_revision(fetching: Fetching, coordinate: string, rev: string, root_package: bool) -> Result[FetchedRevision, string]
     val above = fetching.cache + "/" + coordinate
     make_dir_all(above).map_err(e -> s"avin: $above: ${e.to_string()}")?
     val partial = pending_name(above + "/@r" + rev)
@@ -704,7 +840,7 @@ private clone_revision(fetching: Fetching, coordinate: string, rev: string) -> R
     if !checkout.status.ok()
         return Err(s"avin: cannot check out $coordinate at $sha:\n${checkout.err.unwrap_or("")}${checkout.text}")
     remove_dir_all(partial + "/.git").map_err(e -> s"avin: $partial/.git: ${e.to_string()}")?
-    if !exists(partial + "/" + ManifestName) then return Err(s"avin: $coordinate at $sha holds no $ManifestName, so it is not an Avin package")
+    if root_package && !exists(partial + "/" + ManifestName) then return Err(s"avin: $coordinate at $sha holds no $ManifestName, so it is not an Avin package")
     val hash = tree_hash(partial)?
     val dir = cached_revision_dir(fetching.cache, coordinate, sha)
     write_text_atomic(dir + ".hash", hash + "\n").map_err(e -> s"avin: $dir.hash: ${e.to_string()}")?
@@ -713,8 +849,9 @@ private clone_revision(fetching: Fetching, coordinate: string, rev: string) -> R
     Ok(FetchedRevision(dir, sha))
 
 // Clones the tag into a directory of this fetch's own beside the cache entry, hashes it, records the
-// hash and then moves it into place, so nothing ever reads a package half fetched.
-private clone_package(fetching: Fetching, coordinate: string, version: string, dir: string) -> Result[string, string]
+// hash and then moves it into place, so nothing ever reads a package half fetched. With
+// `root_package`, a repository with no manifest at its root is refused before it is filed.
+private clone_package(fetching: Fetching, coordinate: string, version: string, dir: string, root_package: bool) -> Result[string, string]
     val above = parent(dir).unwrap_or(".")
     make_dir_all(above).map_err(e -> s"avin: $above: ${e.to_string()}")?
     val partial = pending_name(dir)
@@ -725,7 +862,7 @@ private clone_package(fetching: Fetching, coordinate: string, version: string, d
     if !result.status.ok()
         return Err(s"avin: cannot fetch $coordinate $tag from $url:\n${result.err.unwrap_or("")}${result.text}")
     remove_dir_all(partial + "/.git").map_err(e -> s"avin: $partial/.git: ${e.to_string()}")?
-    if !exists(partial + "/" + ManifestName) then return Err(s"avin: $coordinate $tag holds no $ManifestName, so it is not an Avin package")
+    if root_package && !exists(partial + "/" + ManifestName) then return Err(s"avin: $coordinate $tag holds no $ManifestName, so it is not an Avin package")
     val hash = tree_hash(partial)?
     write_text_atomic(dir + ".hash", hash + "\n").map_err(e -> s"avin: $dir.hash: ${e.to_string()}")?
     if publish_dir(partial, dir) is Err(e)
@@ -748,9 +885,10 @@ record_sums(res: Resolution) -> Result[unit, string]
 /** Rewrites the sum file of the package or workspace at `dir` to exactly the fetched packages its
  * whole resolution reads, keeping each line that stays where it was, and says through `say` what it
  * removed and added. With `check`, it writes nothing and fails when the file is not already that.
- * Answers whether the file was tidy. */
+ * Answers whether the file was tidy. The resolution is read from the cache, whatever the project's
+ * `vendor/` holds. */
 tidy(dir: string, fetching: Fetching, check: bool, say: string -> unit) -> Result[bool, string]
-    val res = resolve(dir, fetching, true)?
+    val res = resolve_from(dir, fetching, true, false)?
     var lines: Buf[SumLine] = buf()
     var changed = false
     for l in res.sums
@@ -770,6 +908,120 @@ tidy(dir: string, fetching: Fetching, check: bool, say: string -> unit) -> Resul
     else
         write_text_atomic(res.sum_file, render_sums(lines)).map_err(e -> s"avin: ${res.sum_file}: ${e.to_string()}")?
     Ok(false)
+
+// Vendoring.
+
+// A cache entry to copy into `vendor/`: its path from the cache, `<coordinate>/@v<version>`, and the
+// hash it was checked to.
+private struct VendorCopy
+    entry: string
+    hash: string
+
+/** Copies every fetched package the whole resolution of the package or workspace at `dir` reads into
+ * `vendor/` beside its sum file, in the cache's layout: one directory per repository and version or
+ * commit, with its hash beside it. Each package is fetched into the cache first if it is not there and
+ * gets a line in the sum file if it has none, and the cache's copy is hashed and held to that line
+ * before it is copied, `.git` and the root's `.avin` left out. A copy already in place and hashing as
+ * recorded is left alone; one the resolution no longer reads is removed. Says through `say` what it
+ * fetched and removed, and how many packages it vendored. */
+vendor(dir: string, fetching: Fetching, say: string -> unit) -> Result[unit, string]
+    val res = resolve_from(dir, fetching, true, false)?
+    record_sums(res)?
+    for c in res.cloned
+        say(s"fetching $c")
+    val into = parent(res.sum_file).unwrap_or(".") + "/" + VendorName
+    // Every copy is checked before anything is written, so a refusal leaves `vendor/` as it was.
+    var kept: Buf[string] = buf()
+    var copies: Buf[VendorCopy] = buf()
+    for l in res.read
+        val entry = repository_of(l.coordinate) + "/" + entry_name(l.version)
+        if contains(kept, entry) then continue
+        kept.push(entry)
+        val target = into + "/" + entry
+        if is_dir(target) && read_text(target + ".hash").unwrap_or("").trim() == l.hash && tree_hash(target)? == l.hash then continue
+        val from = fetching.cache + "/" + entry
+        val actual = tree_hash(from)?
+        if actual != l.hash
+            return Err(s"avin: the cache's copy of ${repository_of(l.coordinate)} ${sum_label(l.version)}, $from, hashes to $actual, and $SumName records ${l.hash}: it was changed after it was fetched. Remove that directory and run `avin vendor` again")
+        copies.push(VendorCopy(entry, l.hash))
+    make_dir_all(into).map_err(e -> s"avin: $into: ${e.to_string()}")?
+    for c in copies
+        copy_package(fetching.cache + "/" + c.entry, into + "/" + c.entry, c.hash)?
+    for entry in vendored_entries(into)?
+        if contains(kept, entry) then continue
+        remove_dir_all(into + "/" + entry).map_err(e -> s"avin: $into/$entry: ${e.to_string()}")?
+        if exists(into + "/" + entry + ".hash")
+            remove_file(into + "/" + entry + ".hash").map_err(e -> s"avin: $into/$entry.hash: ${e.to_string()}")?
+        remove_empty_parents(into, parent(into + "/" + entry).unwrap_or(into))
+        say(s"removed ${entry_label(entry)}")
+    val n = res.read.len()
+    say(s"vendored $n ${if n == 1 then "package" else "packages"} into ${VendorName}/")
+    Ok(())
+
+// The name of a repository's directory in the cache at a sum key: `@v` and the version, or `@r` and
+// the commit.
+private entry_name(key: string) -> string = if key.starts_with("r") then "@" + key else "@v" + key
+
+// A vendored entry, `<coordinate>/@v<version>`, as the command names it: `<coordinate> v<version>`.
+private entry_label(entry: string) -> string
+    val parts = entry.split("/@")
+    if parts.len != 2 then return entry
+    parts[0] + " " + parts[1]
+
+// The entries of the vendor directory `into`, each as its path from it: every directory whose name
+// begins with `@v` or `@r`.
+private vendored_entries(into: string) -> Result[Buf[string], string]
+    var out: Buf[string] = buf()
+    var walker = walk(into)
+    loop
+        val entry = walker.next() match
+            Some(Ok(e)) -> e
+            Some(Err(e)) -> return Err(s"avin: $into: ${e.to_string()}")
+            None -> break
+        if entry.path.bytes.len <= into.bytes.len || !entry.is_dir() then continue
+        val rel = entry.path[into.bytes.len + 1..]
+        val segments = rel.split("/")
+        val name = segments[segments.len - 1]
+        if name.starts_with("@v") || name.starts_with("@r")
+            out.push(rel)
+            walker.skip_dir()
+    Ok(out)
+
+// Removes each empty directory from `dir` up to, and not including, `top`.
+private remove_empty_parents(top: string, dir: string)
+    var at = dir
+    while at != top && at.starts_with(top + "/")
+        if entries(at).unwrap_or(buf()).len() > 0 then return
+        if remove_dir_all(at) is Err(_) then return
+        at = parent(at).unwrap_or(top)
+
+// Copies the package tree at `from` to `to`, `.git` anywhere and the root's `.avin` left out, with
+// `hash` recorded beside it: into a directory of this copy's own, then moved into place.
+private copy_package(from: string, to: string, hash: string) -> Result[unit, string]
+    val above = parent(to).unwrap_or(".")
+    make_dir_all(above).map_err(e -> s"avin: $above: ${e.to_string()}")?
+    if is_dir(to) then remove_dir_all(to).map_err(e -> s"avin: $to: ${e.to_string()}")?
+    val partial = pending_name(to)
+    defer _ = remove_dir_all(partial)
+    make_dir_all(partial).map_err(e -> s"avin: $partial: ${e.to_string()}")?
+    var walker = walk(from)
+    loop
+        val entry = walker.next() match
+            Some(Ok(e)) -> e
+            Some(Err(e)) -> return Err(s"avin: $from: ${e.to_string()}")
+            None -> break
+        if entry.path.bytes.len <= from.bytes.len then continue
+        val rel = entry.path[from.bytes.len + 1..]
+        if entry.is_dir()
+            if rel == ".avin" || rel == ".git" || rel.ends_with("/.git")
+                walker.skip_dir()
+                continue
+            make_dir_all(partial + "/" + rel).map_err(e -> s"avin: $partial/$rel: ${e.to_string()}")?
+            continue
+        if entry.is_link() then continue
+        copy_file(entry.path, partial + "/" + rel).map_err(e -> s"avin: $to/$rel: ${e.to_string()}")?
+    write_text_atomic(to + ".hash", hash + "\n").map_err(e -> s"avin: $to.hash: ${e.to_string()}")?
+    publish_dir(partial, to).map_err(e -> s"avin: $to: ${e.to_string()}")
 
 // Adding a dependency.
 
@@ -793,7 +1045,9 @@ latest_version(fetching: Fetching, coordinate: string) -> Result[string, string]
 
 /** Records the dependency `source`, a coordinate with an optional `@version` (the highest release
  * when none is given), in the manifest of the package at `dir`, fetches it, and adds what it and its
- * own dependencies hashed to to the sum file. A dependency already listed, under its coordinate or
+ * own dependencies hashed to to the sum file. A coordinate followed by `//` and a directory names the
+ * member of the repository in that directory, and is written with `member`. The resolution is read
+ * from the cache, whatever the project's `vendor/` holds. A dependency already listed, under its coordinate or
  * under the name the added package gives itself, has its version changed in place. Everything else
  * in the manifest, its comments and layout included, is left as written; where the dependency cannot
  * be fetched or is not a package, the manifest is as it was. Says through `say` what it did. */
@@ -804,8 +1058,12 @@ add_dependency(dir: string, source: string, fetching: Fetching, say: string -> u
     val parts = source.split("@")
     if parts.len > 2 then return Err(s"avin: `$source` is not a source: a coordinate and optionally a version, `github.com/owner/name@1.0.0`")
     val coordinate = parts[0]
-    if !valid_coordinate(coordinate)
-        return Err(s"avin: `$coordinate` is not a git coordinate: a coordinate names a repository as `host/owner/name`, such as `github.com/owner/json`, with no `https://` and no `.git`")
+    if !valid_coordinate(repository_of(coordinate))
+        return Err(s"avin: `${repository_of(coordinate)}` is not a git coordinate: a coordinate names a repository as `host/owner/name`, such as `github.com/owner/json`, with no `https://` and no `.git`")
+    if !valid_package_coordinate(coordinate)
+        return Err(s"avin: `$coordinate` does not name a member of ${repository_of(coordinate)}: after `//`, ${MemberRule}")
+    val repository = repository_of(coordinate)
+    val member = member_of(coordinate)
     var version = ""
     var rev = ""
     if parts.len == 2
@@ -813,20 +1071,21 @@ add_dependency(dir: string, source: string, fetching: Fetching, say: string -> u
         elif valid_rev(parts[1]) then rev = parts[1]
         else return Err(s"avin: `${parts[1]}` is neither a version nor a revision: " + bad_version(parts[1]))
     else
-        version = latest_version(fetching, coordinate)?
+        version = latest_version(fetching, repository)?
     // Fetch it alone first: the name it gives itself is what the manifest lists it under.
-    var fetcher = Resolver(fetching, None, buf(), buf(), buf(), buf(), false)
+    var fetcher = Resolver(fetching, None, buf(), buf(), buf(), buf(), false, false, buf())
     var fetched = ""
     var shown = s"v$version"
+    val within = if member == "" then "" else s", member = \"$member\""
     var entry = ""
     if rev != ""
         val got = fetch_revision(&fetcher, coordinate, rev)?
         fetched = got.dir
         shown = rev_key(got.sha)
-        entry = s"{ git = \"$coordinate\", rev = \"${got.sha}\" }"
+        entry = s"{ git = \"$repository\"$within, rev = \"${got.sha}\" }"
     else
         fetched = fetch_package(&fetcher, coordinate, version)?
-        entry = s"{ git = \"$coordinate\", version = \"$version\" }"
+        entry = s"{ git = \"$repository\"$within, version = \"$version\" }"
     val added = read_manifest(fetched)?
     if !added.has_package then return Err(s"avin: $coordinate $shown is a workspace's root with no `package` block, which no package can depend on")
     var label = added.name
@@ -867,7 +1126,7 @@ add_dependency(dir: string, source: string, fetching: Fetching, say: string -> u
         out.push(s"\ndependencies {\n  $label $entry\n}\n")
         edited = out.finish()
     write_text_atomic(file, edited).map_err(e -> s"avin: $file: ${e.to_string()}")?
-    val outcome = resolve(m.dir, fetching, false)
+    val outcome = resolve_from(m.dir, fetching, false, false)
     if outcome is Err(message)
         write_text_atomic(file, text).map_err(e -> s"avin: $file: ${e.to_string()}")?
         return Err(message)

@@ -108,6 +108,45 @@ digits[T: Integer](x: T) -> int
   neither is declared in its module. A program's own trait may be implemented for one width
   (`impl Sized for i5`), and that width then has both.
 
+## Lower bounds
+
+`[W >: T]` requires every type argument for `W` to be a supertype of `T`. It is how a covariant type
+takes a value of its own parameter in: a `Map[K, +V]` cannot have `updated(key: K, value: V)`, since
+`V` would sit where a value is passed in, but it can have
+
+```text
+trait Bag[K, +V]
+    put[W >: V](key: K, value: W) -> Bag[K, W]
+
+data Chain[+A]
+    Link(head: A, tail: Chain[A])
+    End
+
+impl[A] Chain[A]
+    prepended[W >: A](x: W) -> Chain[W] = Link(x, self)
+```
+
+- **Only a function's or a method's own type parameters have a lower bound**: those of a function,
+  of a trait's, class's or impl's method, and of an extension's method. A type's parameters and an
+  impl's take none. A lower bound is any type, and may name the declaration's other parameters; a
+  chain of lower bounds may not lead back to the parameter it starts from.
+- **It is written first, then any bounds**: `[W >: T: Display]` is a supertype of `T` that conforms
+  to `Display`. A value of `W` has the bounds' members, as any bounded parameter's does.
+- **A value of the lower bound is a value of the parameter, with no conversion**: inside
+  `prepended`, `self` is a `Chain[A]` and so a `Chain[W]`, and an `A` is a `W`. Each type argument
+  is held to it at the call: the bound must be the argument, or be seen as it as a covariant part is
+  (both references, as [variance](#variance) requires). So a `long` bound admits `long` and no
+  `Any`, and `longs.prepended[Any](3)` is an error naming the bound.
+- **Inference starts from the bound**: the type argument is the join of the lower bound and the
+  arguments a value is read from, so `cats.prepended(dog)` is a `Chain[Animal]`, `cats.prepended(cat)`
+  stays a `Chain[Cat]`, and a literal takes the bound's type (`longs.prepended(3)` is a
+  `Chain[long]`). Where the bound and the arguments are references with no nearer common type, the
+  join is `Any`, the top: `cats.prepended("hello")` is a `Chain[Any]`. Two value types still have no
+  join. A written type argument, or one the expected type decides, is held to the bound.
+- **An override writes the overridden method's lower bound, or none**: it may assume no more of its
+  type arguments than the method it overrides does. Calls through a trait dispatch as any generic
+  trait method's do.
+
 ## Reification
 
 Generics are monomorphized: each distinct set of type arguments produces its own code and layout.
@@ -130,6 +169,40 @@ that implements the trait and every `B` the program uses, and generates the disp
 
 Trait-typed values give one shared copy of code where monomorphizing would be wasteful.
 
+### Polymorphic recursion
+
+Because every list of type arguments gets its own copy, a program must need only finitely many of
+them. **Polymorphic recursion**, a cycle of generic code whose type arguments grow on every round,
+needs infinitely many, and is a compile-time error naming the cycle:
+
+```avin
+data Nest[T](x: T)
+
+depth[T](x: T, n: int) -> int = if n == 0 then 0 else depth(Nest(x), n - 1)
+// error: polymorphic recursion: each round of the cycle `depth` -> `depth` passes `Nest[T]`
+// for `T`, so its type arguments grow without end and the code has no finite set of copies
+```
+
+The cycle may run through any generic code: functions, methods, generic local functions, lambdas,
+and calls through a trait or a bound, where a class's implementation is reached with a larger
+instance of the class. A type argument grows when it is built from the cycle's own type parameter,
+as `Nest[T]`, `(T, T)`, `Vector[T]` or `(T) -> int` are from `T`.
+
+Recursion whose type arguments do not grow is ordinary: `f[T]` calling `f[T]`, `f[A, B]` calling
+`f[B, A]`, a call at a fixed type such as `f[int]`, and a type that grows once outside any cycle all
+have finitely many copies.
+
+A data type naming itself at a larger instance in its fields, a **nested data type** such as
+
+```avin
+data Tree[T]
+    Leaf(value: T)
+    Deeper(inner: Tree[Nest[T]])
+```
+
+is rejected the same way, at the type: every data type compares, hashes and shows its values field
+by field, and each of those needs a copy for every depth.
+
 ## Subtyping
 
 `S <: T` holds when:
@@ -137,7 +210,9 @@ Trait-typed values give one shared copy of code where monomorphizing would be wa
 - `S` is a class whose superclass chain or declared traits include `T`, or an `impl T for S` exists;
 - `T` is `Any`, or `S` is `Nothing`;
 - both are function types, with parameters contravariant and results covariant;
-- both are instances of one generic type and each argument follows its declared variance (below).
+- both are instances of one generic type and each argument follows its declared variance (below);
+- `T` is a type parameter with a [lower bound](#lower-bounds) that `S` is, or is a subtype of as a
+  covariant part is.
 
 A value type is never a subtype of a trait or of `Any` without conversion. A value converts to a trait
 type or `Any` by **boxing at a single site**, such as an argument or an assignment. Boxing never
@@ -174,6 +249,10 @@ The checker verifies each declared parameter's positions:
   of a `data` type, a `val` or plain parameter of a class), the covariant arguments of a superclass
   or trait the type conforms to.
 - A `-T` may appear where a value is passed in: a method's parameter.
+- The bounds of a method's own type parameter are positions where a value is passed in; its
+  [lower bound](#lower-bounds) is one where a value is read out, so a `+T` may be the lower bound
+  of a method's parameter, `put[W >: V](key: K, value: W)`, and a `-T` may not. A `+V` in the
+  parameter itself, `put(key: K, value: V)`, is still an error.
 - A mutable field is both, so neither may appear in a `var`.
 - A function type's parameters flip the position and its result keeps it; an argument of another
   generic type takes the position as that type's parameter's variance turns it, and an invariant

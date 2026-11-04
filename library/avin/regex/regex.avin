@@ -1,0 +1,241 @@
+module avin.regex
+
+// Regular expressions: `Regex` compiles a pattern once and searches text with it, `Match` is one
+// match found, with its groups, and `MatchIterator` walks every match in a text. Offsets into text
+// count bytes, as every string offset does; matching itself goes character by character, so `.`
+// matches one character, however many bytes encode it.
+
+// A compiled pattern, as a `Regex` holds it.
+class Pattern(private val text: string, private val groups: int)
+    // The pattern as it was written.
+    pattern() -> string = text
+
+    // The number of capturing groups, not counting the whole match.
+    groupCount() -> int = groups
+
+impl Display for Pattern
+    display(out: Writer, spec: FormatSpec) = out.writeField(text, spec)
+
+// A regular expression. `Regex(pattern)` compiles the pattern and traps when it is not a valid one,
+// with the message `PatternError` gives; `Regex.compile` answers with the error instead. The group
+// names given after the pattern name its groups in order for `Match.group(name)`, in place of the
+// names the pattern gives them.
+class Regex(private val text: string, private val program: Program, private val patternNames: Vector[(string, int)], private val names: Vector[string], private val unanchoredMatch: bool)
+    // The compiled pattern.
+    pattern() -> Pattern = Pattern(text, program.groupCount - 1)
+
+    // The pattern as it was written.
+    regex() -> string = text
+
+    // Whether the whole of `source` matches; for a regex made by `unanchored()`, whether any part of
+    // it does.
+    matches(source: string) -> bool
+        val e = searching(source)
+        if unanchoredMatch then e.engine.search(0) else e.engine.matchAt(0, true)
+
+    // The first match in `source`, as text.
+    findFirstIn(source: string) -> Option[string]
+        val e = searching(source)
+        if e.engine.search(0) then Some(e.matched()) else None
+
+    // The first match in `source`.
+    findFirstMatchIn(source: string) -> Option[Match]
+        val e = searching(source)
+        if e.engine.search(0) then Some(e.snapshot()) else None
+
+    // A match at the start of `source`, as text.
+    findPrefixOf(source: string) -> Option[string]
+        val e = searching(source)
+        if e.engine.matchAt(0, false) then Some(e.matched()) else None
+
+    // A match at the start of `source`.
+    findPrefixMatchOf(source: string) -> Option[Match]
+        val e = searching(source)
+        if e.engine.matchAt(0, false) then Some(e.snapshot()) else None
+
+    // Every match in `source`, left to right and not overlapping, as text. After an empty match the
+    // next search starts one character further on.
+    findAllIn(source: string) -> MatchIterator = MatchIterator(searching(source))
+
+    // Every match in `source`, as `findAllIn` finds them.
+    findAllMatchIn(source: string) -> Iterator[Match] = findAllIn(source).matchData()
+
+    // The same pattern, where `matches` asks whether any part of the text matches.
+    unanchored() -> Regex = Regex(text, program, patternNames, names, true)
+
+    // The same pattern, where `matches` asks whether the whole text matches.
+    anchored() -> Regex = Regex(text, program, patternNames, names, false)
+
+    private searching(source: string) -> Searched = Searched(source, program, patternNames, names)
+
+impl Display for Regex
+    display(out: Writer, spec: FormatSpec) = out.writeField(regex(), spec)
+
+object Regex
+    // The pattern compiled; a pattern that is not valid traps with its error's message.
+    apply(regex: string, groupNames: string*) -> Regex = compile(regex, groupNames*) match
+        Ok(r) -> r
+        Err(e) -> fail(e.message())
+
+    // The pattern compiled, or what is wrong with it.
+    compile(regex: string, groupNames: string*) -> Result[Regex, PatternError]
+        val parsed = parsePattern(regex)?
+        Ok(Regex(regex, compileProgram(parsed), parsed.names, groupNames, false))
+
+impl string
+    // The string compiled as a pattern, as `Regex(self, groupNames*)`.
+    r(groupNames: string*) -> Regex = Regex(self, groupNames*)
+
+// A text being searched: its characters as code points, the byte offset each starts at with the
+// text's length after the last, and the matcher running over them.
+private class Searched(val source: string, program: Program, private val patternNames: Vector[(string, int)], private val names: Vector[string])
+    private val offsets = Buffer[int]()
+    val engine: Engine = Engine(program, decode(source, offsets))
+
+    // The text of the current match.
+    matched() -> string = source.slice(offsets(engine.groups(0)), offsets(engine.groups(1)))
+
+    // Searches on from the current match: from its end, or one character past it when it was empty.
+    findNext() -> bool
+        var from = engine.last
+        if from == engine.first then from += 1
+        if from > engine.text.length()
+            for k in 0..<engine.groups.length() do engine.groups(k) = -1
+            return false
+        engine.search(from)
+
+    // The current match, with its groups as byte offsets.
+    snapshot() -> Match
+        val count = engine.program.groupCount
+        val starts = Array.fill(count, -1)
+        val ends = Array.fill(count, -1)
+        for g in 0..<count
+            val s = engine.groups(g * 2)
+            if s >= 0
+                starts(g) = offsets(s)
+                ends(g) = offsets(engine.groups(g * 2 + 1))
+        Match(source, starts, ends, patternNames, names)
+
+// The code points of `s`, with the byte offset of each and of the end added to `offsets`.
+private decode(s: string, offsets: Buffer[int]) -> Array[int]
+    val codes = Buffer[int]()
+    val n = s.byteLength()
+    var i = 0
+    while i < n
+        offsets.add(i)
+        val c = s.charAt(i)
+        codes.add(int(c))
+        val code = int(c)
+        i += if code < 0x80 then 1 elif code < 0x800 then 2 elif code < 0x10000 then 3 else 4
+    offsets.add(n)
+    codes.toArray()
+
+// One match: the text it was found in, and where the whole match and each group start and end, as
+// byte offsets. A group that took no part in the match starts and ends at -1 and has no text.
+class Match(val source: string, private val starts: Array[int], private val ends: Array[int], private val patternNames: Vector[(string, int)], private val names: Vector[string])
+    // The number of capturing groups, not counting the whole match.
+    groupCount() -> int = starts.length() - 1
+
+    // Where the match starts and ends.
+    start() -> int = starts(0)
+    end() -> int = ends(0)
+
+    // Where group `i` starts and ends, -1 when it took no part; group 0 is the whole match, and a
+    // group the pattern does not have traps.
+    start(i: int) -> int = starts(checked(i))
+    end(i: int) -> int = ends(checked(i))
+
+    // The text matched.
+    matched() -> string = source.slice(starts(0), ends(0))
+
+    // The text group `i` matched, or None when it took no part in the match.
+    group(i: int) -> Option[string]
+        val g = checked(i)
+        if starts(g) < 0 then None else Some(source.slice(starts(g), ends(g)))
+
+    // The text of the group named `name`: by the names given to the `Regex` where there are any, the
+    // first naming group 1, and otherwise by the names the pattern gives its groups. A name that
+    // names no group traps.
+    group(name: string) -> Option[string]
+        if names.nonEmpty()
+            if name == "" then return group(0)
+            var k = 0
+            while k < names.length()
+                if names(k) == name then return group(k + 1)
+                k += 1
+            fail("group name " + name + " not defined")
+        for (known, index) in patternNames
+            if known == name then return group(index)
+        fail("No group with name <" + name + ">")
+
+    // The text of every group in order, None for each that took no part.
+    subgroups() -> List[Option[string]]
+        val b = List.builder[Option[string]]()
+        for i in 1..groupCount() do b.add(group(i))
+        b.result()
+
+    // The text before the match, and after it.
+    before() -> string = source.slice(0, starts(0))
+    after() -> string = source.slice(ends(0), source.byteLength())
+
+    // The text before group `i`, and after it, or None when it took no part.
+    before(i: int) -> Option[string]
+        val g = checked(i)
+        if starts(g) < 0 then None else Some(source.slice(0, starts(g)))
+
+    after(i: int) -> Option[string]
+        val g = checked(i)
+        if starts(g) < 0 then None else Some(source.slice(ends(g), source.byteLength()))
+
+    // The names given to the `Regex` for its groups.
+    groupNames() -> Vector[string] = names
+
+    private checked(i: int) -> int
+        if i < 0 || i >= starts.length() then fail("No group " + i.toString())
+        i
+
+impl Display for Match
+    display(out: Writer, spec: FormatSpec) = out.writeField(matched(), spec)
+
+// The matches of a regex in a text, as text, left to right. Between a call of `next()` and the next
+// call of `hasNext()` it also answers for the match `next()` gave: where it starts and ends, and its
+// groups.
+class MatchIterator(private val searched: Searched): Iterator[string]
+    // Whether the current match has been found, given out by `next()`, or the search is over.
+    private var state = 0
+
+    override hasNext() -> bool
+        if state == 0 then state = if searched.findNext() then 1 else 3
+        elif state == 2
+            state = 0
+            return hasNext()
+        state == 1
+
+    override next() -> string
+        if !hasNext() then fail("next on an exhausted match iterator")
+        state = 2
+        searched.matched()
+
+    // The current match; asking before any match is found, or after the last, traps.
+    private current() -> Match
+        if state == 0 && !hasNext() then fail("no current match")
+        if state == 3 then fail("no current match")
+        searched.snapshot()
+
+    start() -> int = current().start()
+    end() -> int = current().end()
+    start(i: int) -> int = current().start(i)
+    end(i: int) -> int = current().end(i)
+    group(i: int) -> Option[string] = current().group(i)
+    groupCount() -> int = current().groupCount()
+    matched() -> string = current().matched()
+
+    // The same matches, each as a `Match`.
+    matchData() -> Iterator[Match] = MatchDataIterator(self, searched)
+
+private class MatchDataIterator(source: MatchIterator, searched: Searched): Iterator[Match]
+    override hasNext() -> bool = source.hasNext()
+
+    override next() -> Match
+        source.next()
+        searched.snapshot()

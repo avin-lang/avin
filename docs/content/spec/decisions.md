@@ -122,6 +122,11 @@ a decision changes, this page and the chapter change together.
   a trait mentioning it, itself or through a trait it requires, is only a bound. In its default
   bodies `self` is a `Self`. A trait type is a type argument for its own bound when it does not
   mention `Self`.
+- Settled 2026-11-04 (user): [polymorphic recursion](/spec/generics/#polymorphic-recursion), a
+  cycle of generic code whose type arguments grow on every round, is a compile-time error naming
+  the cycle, through functions, methods, local functions, lambdas and calls through traits and
+  bounds alike; recursion whose type arguments do not grow is legal. Checking never runs without
+  end on it.
 - [Variance](/spec/generics/#variance) applies only where both type arguments are reference types,
   so it never converts: `List[string]` is a `List[Any]`, `List[int]` is not. Tuple parts and
   function results are covariant and function parameters contravariant on the same terms.
@@ -130,6 +135,15 @@ a decision changes, this page and the chapter change together.
   its impls name are.
 - A type pattern matches an object whose type conforms to the pattern's type through variance, as
   the checker's subtyping does: a `List[Dog]` held as an `Any` matches `List[Animal]`.
+- Settled by the user 2026-11-04: [lower bounds](/spec/generics/#lower-bounds) on a function's or a
+  method's own type parameters, written first: `[W >: T]`, `[W >: T: Display]`. A lower bound is a
+  covariant position, so a covariant trait declares `put[W >: V](key: K, value: W) -> Bag[K, W]` as
+  a virtual method; impl methods that are not variance positions are no longer the only way a
+  covariant type takes its parameter in. A value of the bound is one of the parameter with no
+  conversion, so a type argument is the bound or a reference type it is seen as. A call infers the
+  join of the bound and the arguments, `Any` where they are references with no nearer common type;
+  a written or expected type argument is held to the bound. An override writes its method's lower
+  bound or none. A type's and an impl's parameters take none.
 - The built-in types belong to the core library's module, `avin`; a conformance of one is written
   there or in the trait's module. An impl that only adds methods may be written in any module
   (settled 2026-11-04, below).
@@ -622,6 +636,19 @@ Settled by the user on 2026-11-04:
   specific ones are an error naming them. On a type parameter the conformances are its bounds',
   `F: From[IoError] + From[ParseError]`. See [errors](/spec/errors/) and
   [declarations](/spec/declarations/#impl).
+- **One formatting style, applied by `avin fmt [--check] [<path>...]` and the language server's
+  `textDocument/formatting`.** Each block level is indented two spaces; a literate file keeps its
+  four-column code-block margin and indents two a level inside it, and only its program is
+  formatted. Spaces go around binary operators (ranges included, `0 ..< n`), `=` and `->`, after
+  `,` and `:`, and nowhere inside brackets; a prefix operator stays against its operand. At most
+  one blank line in a row, none at either end of the file, and one between two top-level
+  declarations unless both are one line; a declaration's comments and annotations stay with it.
+  Comments are kept exactly, a trailing one a space after the code. A line longer than 120
+  characters has a list broken one item per line, a call's or a literal's items two columns in and
+  a parameter list's four, the closing bracket on its own line; a list the source wrote one item
+  per line stays so; a binding's value with no list to break is broken before its loosest operators
+  as continuation lines. No trailing commas are added. The formatter keeps every token and
+  refuses a file that does not parse; its result parses to the same syntax tree.
 
 - **`compareAndSet` on a value without identity** — a data value, tuple, string, `Option` or `Any` —
   **compares with `==`; on scalars and references it compares the word.** A class instance (even of
@@ -957,6 +984,19 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
+- Nested data types ([generics](/spec/generics/#polymorphic-recursion)): a data type naming itself
+  at a larger instance in its fields (`Deeper(inner: Tree[Nest[T]])` in `Tree[T]`) is rejected at
+  the type as polymorphic recursion, even where no code compares, hashes or shows it, since every
+  data type's structural equality, hash and `Display` would need a copy for every depth. A class
+  naming itself so in a field is not rejected for that alone; only code that grows with it is.
+- Which growth counts ([generics](/spec/generics/#polymorphic-recursion)): growth is measured as
+  nesting depth, and a cycle is rejected when a round of it nests its type arguments deeper in
+  total. A call through a bound on a value of a type parameter takes that type's arguments apart
+  (a `Box[U]` reaching `Box`'s method at `U` is one level less); an implementation reached through
+  a method table whose static type names every type parameter of the receiver's class (an
+  `Iterator[(A, int)]` for an `IndexedIterator[A]`) takes them apart from the receiver's, while one
+  reached through a trait that leaves some unnamed (a trait with no type parameters) continues the
+  cycle from wherever the class's larger instance was made.
 - Trait fields ([declarations](/spec/declarations/#trait)): a trait's field declares its type, since
   each conforming class's layout and the trait's `val` are known before any body is checked; it is
   public, as every member of a trait is, and is never `lazy`. A class never overrides a trait's
@@ -992,9 +1032,25 @@ Settled by the user on 2026-11-04:
     leading zeros. A manifest is optional: a directory or file with none above it is a program as
     before.
   - **Dependencies**: `{ git = "host/owner/name", version = "x.y.z" }` read at the tag `vx.y.z`
-    and cloned from `https://`; `{ path = "../dir" }`, relative to the manifest naming it and refused
-    in a fetched package; `{ workspace = true }`. A coordinate with `https://` or `.git` is refused.
+    and cloned from `https://`; `{ path = "../dir" }`, relative to the manifest naming it, and in a
+    fetched package naming another package of its repository at its version (refused when it leaves
+    the repository); `{ workspace = true }`. A coordinate with `https://` or `.git` is refused.
     Features and members of a repository are settled above.
+  - **Members, as built**: a fetched package's in-repository `path` and `workspace = true`
+    dependencies are read as the repository's own packages at its version whether the package is a
+    member or the repository's root package, since the root of a workspace with a `package` block is
+    its first member. A member's directory may hold no `.`, `..` or `*`. The clone is filed once per
+    repository and version; a repository whose root has no manifest is still filed when a member of
+    it is what was asked for.
+  - **Vendoring, as built**: `avin tidy` and `avin add` read the machine's cache, fetching into it,
+    whether or not the project has a `vendor/`, so a dependency is added to a vendored project and
+    then copied in by `avin vendor`. `avin vendor` checks every cache copy before writing anything, so
+    a refusal leaves `vendor/` as it was (and a project with none still has none); a vendored copy is
+    left alone only when its recorded hash and its files both match its line, so an edited copy is
+    replaced; directories left empty by a removal are removed; and it ends `vendored N packages into
+    vendor/`, the packages being `avin.sum`'s lines (a member and its repository's root package at
+    one version are two packages and one copy). The cache's `.hash` beside a vendored entry is trusted
+    by a build, as the cache's is: a build does not re-hash `vendor/`.
   - **`rev` pins**: `{ git = "…", rev = "<hex>" }`, seven to forty lowercase hexadecimal digits,
     refused with a `version` or without `git`. The repository is cloned whole and the commit
     resolved to its full id, fetched by that id when no branch or tag reaches it (only a full id
@@ -1311,6 +1367,20 @@ Settled by the user on 2026-11-04:
     `threads.blocking(body)` and `threads.sleep(d)`. There is no `failed` or `filter`, since a future
     carries no failure. Bindings: none beyond a runtime timed wait for `sleep`. Not blocked.
   - **JSON** is a package of its own, not part of the system library.
+- [`avin.regex`](/spec/regex/): the pattern language and its matching follow the established
+  backtracking dialect exactly: leftmost-first alternation, greedy, reluctant and possessive
+  repetition, atomic groups, bounded lookbehind (a repetition without an upper bound in one is an
+  error), and the same rules for what a repeated group captures; `\d`, `\s`, `\w`, `\b` and the
+  POSIX classes are ASCII, and `i` folds only ASCII without `u`. Matching walks characters (scalar
+  values); every offset in the API is a byte offset, and a `PatternError`'s index counts the
+  pattern's characters. There is no null: `group(i)`, `group(name)`, `before(i)`, `after(i)` answer
+  `Option[string]`, `subgroups()` a `List[Option[string]]`, and `start(i)`/`end(i)` -1 for a group
+  that took no part. Members without arguments are methods (`"a+".r()`, `m.start()`). `Regex(p)`
+  traps on an invalid pattern with the error's message and `Regex.compile(p)` answers a
+  `Result[Regex, PatternError]`; a group number or name the match does not have traps. Properties
+  needing Unicode data beyond the general category (scripts, blocks, `Alphabetic`, `Uppercase`,
+  `Lowercase`, `Ideographic`, `Word`, emoji), the flags `U` and `c`, `\X`, `\b{g}` and `\N{…}` are
+  refused with an `Unsupported` error until the runtime holds that data.
 
 ## Open
 
