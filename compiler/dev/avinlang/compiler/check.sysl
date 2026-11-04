@@ -575,9 +575,40 @@ resolve_name(c: *Checker, unit: usize, name: string) -> string
 private file_scope(c: *Checker, unit: usize) -> FileScope
     val file = c.units[unit].file
     var imports: Map[string, string] = map()
+    // A module imported whole is bound from the start, so a type written through it, `m.X`, resolves
+    // in the signatures and fields declared before the imports are checked. `check_imports` replaces
+    // these bindings with the ones it keeps.
+    var modules: Map[string, string] = map()
     for i in file.imports
         if imports.get(i.binding) is None then imports.put(i.binding, i.path)
-    FileScope(file.module_name, imports, map())
+        if i.path != file.module_name && module_has_unit(c, i.path) && !names_declaration(c, i.path) && modules.get(i.binding) is None
+            modules.put(i.binding, i.path)
+    FileScope(file.module_name, imports, modules)
+
+private module_has_unit(c: *Checker, name: string) -> bool
+    for u in c.units
+        if u.file.module_name == name then return true
+    false
+
+// Whether `path`, `a.b`, names a top-level declaration or variant `b` of a module `a`, read from the
+// source before anything is declared.
+private names_declaration(c: *Checker, path: string) -> bool
+    var dot: Option[usize] = None
+    for k in 0..<path.bytes.len
+        if path.bytes[k] == u8('.') then dot = Some(k)
+    val at = dot match
+        Some(k) -> k
+        None -> return false
+    val module_name = path[0..<at]
+    val name = path[at + 1..]
+    for u in c.units
+        if u.file.module_name != module_name then continue
+        for item in u.file.items
+            if item_name(item) == name then return true
+            if item is DataItem(d)
+                for v in d.variants
+                    if v.name == name then return true
+    false
 
 // What an earlier import bound a name to, a declaration or a module, or "" when none did.
 private imported_from(kept: Map[string, string], mods: Map[string, string], binding: string) -> string
@@ -5351,7 +5382,7 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                 if path == "Nothing" && args.len() == 0 then return Nothing
                 c.variants.get(key) match
                     Some(v) -> c.note(unit, t.span, s"`$path` is a variant of `${c.data[v.data].name}`, not a type")
-                    None -> c.note(unit, t.span, s"unknown type `$path`")
+                    None -> c.note(unit, t.span, unknown_type_message(c, unit, path))
                 ErrorType
     Tuple(items) ->
         var types: Buf[&Type] = buf()
@@ -5365,6 +5396,20 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
             if p.by_name then types.push(ByName(ty)) else types.push(ty)
         Function(types, resolve_type(c, unit, result))
     ResolvedType(slot) -> c.type_slots[slot]
+
+// What is said of a type name that names no type. Written through a module the file imports whole,
+// `m.X`, it names what the module lacks: a declaration `X`, or a public one.
+private unknown_type_message(c: *Checker, unit: usize, path: string) -> string
+    var dot: Option[usize] = None
+    for k in 0..<path.bytes.len
+        if dot is None && path.bytes[k] == u8('.') then dot = Some(k)
+    if dot is Some(k)
+        if c.files[unit].modules.get(path[0..<k]) is Some(module_path)
+            val name = path[k + 1..]
+            val key = qualified(module_path, name)
+            if !declared(c, key) then return s"module `$module_path` declares no type `$name`"
+            if !exported(c, key) then return s"`$name` is private to module `$module_path`"
+    s"unknown type `$path`"
 
 private check_function(c: *Checker, id: usize)
     if c.states[id] != 0 then return
