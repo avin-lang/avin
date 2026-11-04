@@ -268,6 +268,60 @@ Every function of the program is emitted with internal linkage, since nothing ou
 one by name; that lets LLVM inline a method into each caller and drop the copy, which is what makes the
 direct calls pay.
 
+**Escape analysis and scalar replacement.** After devirtualization a pass over the MIR
+(`scalar.sysl`) keeps objects that never leave the function that makes them as their fields. It has
+three steps:
+
+- **Inlining.** Lowering makes a data value, a tuple or a class's object with `Alloc`, so an object
+  is made in its constructor, an iterator in a sequence's `iterator()`, and it is used in the
+  methods it is passed to; nothing can be learned of it until those calls are in the function. A
+  direct call is inlined where it makes such an object or is handed one, when the callee has at
+  most 80 MIR instructions and cannot recur through direct calls. Two summaries of each function,
+  solved for the whole program from "no" upward until nothing changes, decide which calls those
+  are: whether everything it returns is an object it makes (or one an inlined call of its own
+  makes), and, for each parameter, whether the function lets the object go anywhere but into its
+  fields, its descriptor, a null test, its own return and the parameters of functions with the same
+  property. Inlining runs in rounds, each exposing the calls the next inlines, up to 8 rounds and
+  2000 added instructions per function. An inlined body's parameters are the call's arguments, its
+  values, slots and blocks are numbered after the caller's, and each return stores the result to a
+  slot of its own and jumps to a block that loads it and goes on with the rest of the caller's block.
+- **Replacement.** The references of a function are grouped: a value, the local slots it is stored
+  to (slots whose address is only loaded and stored), the values loaded back from them, and both
+  operands of a `select`. A group is kept as its fields when every reference in it comes from an
+  `Alloc` in the function and every use reaches a field (an `Offset` used only as the address of a
+  load or store, or the object's own address for its first field), reads the descriptor, or
+  compares with null. Anything else lets the object escape: a store into an object, an array or a
+  module-level value, a call (inlining has already taken the calls that could be followed), a
+  return, a capture (a store into a closure), boxing as `Any`, a call through a table or a function
+  value, a comparison by identity, and so any hand-over to another thread. A group's objects must
+  also never be in use two at a time: a forward pass over the blocks takes every reference of the
+  group as current from where it is made until the next `Alloc` of the group, and current again
+  where it is stored to or loaded from a current one; a use that may not be current on some path
+  (an older object kept beside a newer one made by the same `Alloc` in a loop) keeps the whole group
+  as objects. A kept group gets one local slot per field offset, of the field's machine type (a
+  field holding references is a slot of reference type), and one for the descriptor where its
+  objects are made with more than one descriptor and the descriptor is read. Each `Alloc` becomes
+  stores of zero to the group's fields (and of its descriptor), each field access a plain load or
+  store of the slot, a read of the descriptor the constant descriptor, and a null test a constant.
+  The fields that hold references are local slots of reference type, so the frame plan roots them
+  wherever they are live across a collection point, as it does any local variable, and a sequence
+  only an iterator holds stays alive; the object itself has no header, no root and no atomic
+  access, since no other thread can reach it.
+- **Fences.** A `fence release` is needed only where a store another thread could see has been
+  made since the last fence. A forward pass over each function's blocks drops every fence before
+  which, since the function started or the last fence, there has been no store other than to a
+  local slot or the context's caller site, no allocation, no atomic operation, no call through a
+  table or a function value, no runtime entry point other than the quiet ones that store nothing,
+  and no call of a function that may return with such a store unfenced (found for the whole program
+  at once). So the fence that ended the making of an object kept as its fields goes, and a fence
+  after a heap store that may be part of another object's making stays.
+
+So `for x in xs` over a `Vector`, a `List`, an `ArraySeq` or a `Range` value keeps its iterator in
+slots, `val (q, r) = divmod(a, b)` makes no tuple once `divmod` is inlined, and a derived method's
+visitor costs nothing. A tuple returned by a function too large to inline, or a recursive one, is
+still an object: results are not returned as several machine values. A `for` over an `Iterable`
+whose `iterator()` call stays guarded keeps its iterator on the heap.
+
 A method with type parameters of its own, a trait's or an overridable class method, holds a
 position in the checker's tables like any other, but no one function fills it: each list of its own
 type arguments is a different function. Lowering leaves its position empty and gives the method a
@@ -662,7 +716,8 @@ store is the same instruction a plain one is.
 **Making an object ends with `fence release`**, once its last field is stored and before the
 reference can reach anything else: a data value or tuple after its fields, a closure after its
 captures, a box after its value, a value boxed as `Any` after the value, and a class's object at the
-end of its constructor, after the class body has run. A constant object needs none. On arm64 the
+end of its constructor, after the class body has run. A constant object needs none, nor does an
+object kept as its fields (above, under escape analysis and scalar replacement). On arm64 the
 fence is one `dmb ish`; on x86-64 it is no instruction at all, only an order the compiler keeps.
 Arrays and strings are made by the runtime, which makes the fence for them through `published`: a
 string after its bytes are written, `avin_rt_new_array` after the array's length and zero bytes, and

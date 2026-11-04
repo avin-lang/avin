@@ -245,15 +245,15 @@ walk is `FieldWriter(…).variant(PERSON_0).field[string](NAME, name).field[int]
 
 **What holds now.** Every call is direct: the visitor's type is known and each hook is compiled for
 one field type, so there is no call through a method table, no lookup by name and no boxing. A shape
-is read with a load of a module value. The one cost beyond the hand-written encoder is the visitor:
-`FieldWriter` is data, and data is on the heap, so each `encode` allocates it once. The compiler's
-tests hold a derived encoder to exactly this, against a hand-written one.
+is read with a load of a module value. The visitor costs nothing: `FieldWriter` is data that never
+leaves `encode`, so the walk and the hooks are inlined into it and the visitor is kept as its
+fields, with no allocation. The compiler's tests hold a derived encoder to exactly this: it
+allocates no more than a hand-written one, and calls each field's own method directly.
 
-**What two later compiler features add.** Small data that does not escape a call is to live in
-registers, so the visitor costs nothing. Constant data is to be emitted once in read-only data, so
+**What a later compiler feature adds.** Constant data is to be emitted once in read-only data, so
 the shapes become constants and code reading them folds: `shape.variantCount > 1` is `false`,
-`f.has(JsonOmit)` is `false` and the key is `"name"`, all known to the compiler. With both, and the
-hooks inlined at `-O2`, what remains is exactly the hand-written encoder:
+`f.has(JsonOmit)` is `false` and the key is `"name"`, all known to the compiler. With that, what
+remains is exactly the hand-written encoder:
 
 ```text
 encode(out: JsonWriter) =
@@ -265,7 +265,8 @@ encode(out: JsonWriter) =
     out.endObject()
 ```
 
-At `-O0` the hook calls stay calls: there are no lookups by name and no boxing either way. A program
+The hooks are inlined at `-O0` too, since the compiler inlines them to keep the visitor as its
+fields; there are no lookups by name and no boxing either way. A program
 that never encodes a `Person` compiles none of the encoder, though it still makes `Person`'s shape
 before `main`.
 

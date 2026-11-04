@@ -1,0 +1,109 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// Which objects are kept as their fields: one made and used only in the function that makes it,
+// once the calls that make it or are handed it are inlined. One stored, returned, captured by a
+// closure, held as `Any`, passed to a function value or compared by identity stays an object.
+
+private lowered(text: string) -> MirProgram = lower_source(repository_toolchain(), source_of("probe.avin", text)) match
+    Ok(p) -> p
+    Err(d) -> panic(d)
+
+private function_of(program: MirProgram, name: string) -> MirFunction
+    for f in program.functions
+        if f.symbol == "<program>." + name then return f
+    panic("no function " + name)
+
+/** What the function `name` of `text` does that costs an object: its allocations, its fences and
+ * the program's functions it calls directly, each as `;`-ended symbol. */
+private struct Made
+    allocations: int
+    fences: int
+    calls: string
+
+private made(text: string, name: string) -> Made
+    val program = lowered(text)
+    var allocations = 0
+    var fences = 0
+    var calls = ""
+    for block in function_of(program, name).blocks
+        for inst in block.insts
+            inst match
+                Alloc(_, _) -> allocations = allocations + 1
+                Publish -> fences = fences + 1
+                Call(_, Direct(g), _) -> calls = calls + program.functions[g].symbol + ";"
+                _ -> ()
+    Made(allocations, fences, calls)
+
+private const Point: string = "data Pt(x: int, y: int)\n\nclass Cell(var value: int)\n\nclass Holder(var p: Pt)\n\nvar sink: Any = 0\n\n"
+
+@test("a tuple a function returns is taken apart where it is made, once the function is inlined")
+returned_tuple_is_fields()
+    val text = "divmod(a: int, b: int) -> (int, int) = a / b, a % b\n\npairs(n: int) -> int\n    var t = 0\n    for i in 0..<n\n        val (q, r) = divmod(i, 7)\n        t += q + r\n    t\n\nmain()\n    print(pairs(10))\n"
+    val m = made(text, "pairs")
+    assert_eq(m.allocations, 0)
+    assert_eq(m.fences, 0)
+    assert_eq(m.calls, "")
+
+@test("a data value matched where it is made, on either of two paths, is its fields")
+matched_value_is_fields()
+    val text = "data Shape\n    Circle(radius: int)\n    Rect(w: int, h: int)\n\narea(round: bool, k: int) -> int\n    val s = if round then Circle(k) else Rect(k, k + 1)\n    s match\n        Circle(r) -> 3 * r * r\n        Rect(w, h) -> w * h\n\nmain()\n    print(area(true, 2))\n"
+    val m = made(text, "area")
+    assert_eq(m.allocations, 0)
+    assert_eq(m.fences, 0)
+
+@test("the iterator of a `for` over a vector is its fields, and its methods are inlined")
+vector_iterator_is_fields()
+    val text = "sum(xs: Vector[int]) -> int\n    var total = 0\n    for x in xs do total += x\n    total\n\nmain()\n    val v: Vector[int] = [1, 2, 3]\n    print(sum(v))\n"
+    val m = made(text, "sum")
+    assert_eq(m.allocations, 0)
+    assert(!m.calls.contains("VectorIterator"), m.calls)
+
+@test("the iterators of a list, an array sequence and a range are their fields")
+other_iterators_are_fields()
+    val text = "list(xs: List[int]) -> int\n    var total = 0\n    for x in xs do total += x\n    total\n\nseq(xs: ArraySeq[int]) -> int\n    var total = 0\n    for x in xs do total += x\n    total\n\nrange(n: int) -> int\n    val r = 0..<n\n    var total = 0\n    for x in r do total += x\n    total\n\nmain()\n    print(list([1, 2]) + seq([1, 2].toArraySeq()) + range(3))\n"
+    for name in ["list", "seq", "range"]
+        val m = made(text, name)
+        assert_eq(m.allocations, 0)
+        assert(!m.calls.contains("Iterator"), m.calls)
+
+@test("a value made in a loop and used before the next is made is its fields")
+loop_value_is_fields()
+    val m = made(Point + "walk(n: int) -> int\n    var total = 0\n    for i in 0..<n\n        val p = Pt(i, i)\n        total += p.x + p.y\n    total\n\nmain()\n    print(walk(3))\n", "walk")
+    assert_eq(m.allocations, 0)
+    assert_eq(m.fences, 0)
+
+@test("a value still in use when the next is made at the same place stays an object")
+older_value_stays_an_object()
+    val m = made(Point + "previous(n: int) -> int\n    var last = Pt(0, 0)\n    var total = 0\n    for i in 1..n\n        val p = Pt(i, i)\n        total += last.x\n        last = p\n    total\n\nmain()\n    print(previous(3))\n", "previous")
+    assert_eq(m.allocations, 2)
+
+@test("a value stored into a field, returned, captured, held as Any or passed to a function value stays an object")
+escaping_values_stay_objects()
+    val text = Point + "store(h: Holder, k: int) = h.p = Pt(k, k)\n\nmake(k: int) -> Pt = Pt(k, k)\n\ncapture(k: int) -> (int) -> int\n    val p = Pt(k, k)\n    x -> x + p.x\n\nhold(k: int)\n    val a: Any = Pt(k, k)\n    sink = a\n\nthrough(f: (Pt) -> int, k: int) -> int = f(Pt(k, k))\n\nmain()\n    val h = Holder(Pt(0, 0))\n    store(h, 1)\n    hold(2)\n    print(s\"${make(1).x} ${capture(1)(2)} ${through(p -> p.y, 3)}\")\n"
+    for name in ["store", "make", "hold", "through"]
+        val m = made(text, name)
+        assert_eq(m.allocations, 1)
+        assert_eq(m.fences, 1)
+    // The closure and the value it captures.
+    assert_eq(made(text, "capture").allocations, 2)
+
+@test("objects compared by identity stay objects")
+identity_keeps_objects()
+    val m = made(Point + "same(k: int) -> bool\n    val c = Cell(k)\n    val d = Cell(k)\n    c === d\n\nmain()\n    print(same(1))\n", "same")
+    assert_eq(m.calls, "<program>.Cell;<program>.Cell;")
+
+@test("an object passed to a function that keeps it stays an object")
+kept_argument_stays_an_object()
+    val m = made(Point + "keep(p: Pt) = sink = p\n\nuse(k: int) -> int\n    val p = Pt(k, k)\n    keep(p)\n    p.x\n\nmain()\n    print(use(1))\n", "use")
+    assert_eq(m.allocations, 1)
+    assert(m.calls.contains("keep"), m.calls)
+
+@test("an object passed to a function that only reads it is its fields once the function is inlined")
+read_argument_is_fields()
+    val m = made(Point + "norm(p: Pt) -> int = p.x * p.x + p.y * p.y\n\nuse(k: int) -> int\n    val p = Pt(k, k + 1)\n    norm(p) + p.x\n\nmain()\n    print(use(1))\n", "use")
+    assert_eq(m.allocations, 0)
+    assert_eq(m.calls, "")
