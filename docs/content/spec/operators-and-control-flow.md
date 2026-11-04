@@ -106,7 +106,9 @@ name instead.
 The call is resolved exactly as `a.m(b)` is: overloads are chosen by the argument's type, a trait or
 `open` method dispatches on the receiver's class, an `impl` adds methods that can be called this way,
 and a generic method's type arguments are inferred. The name must be a method of the receiver's type
-that can take one argument. A field holding a function is not called infix, and neither is a
+that can take one argument, which a method with a [repeated](/spec/declarations/#repeated-parameters)
+last parameter can: `w surround "!"` gives `surround(marks: string*)` one mark. A field holding a
+function is not called infix, and neither is a
 function `m(a, b)` declared outside the type: `a m b` never means `m(a, b)`. A method of two
 parameters is not called infix even with a tuple after its name: `a put (1, 2)` against
 `put(i: int, j: int)` is an error that says to write `a.put(1, 2)`.

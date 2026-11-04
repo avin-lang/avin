@@ -61,7 +61,9 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
   collection and iterator has it, through an impl adding it to `Iterable`, and a map keeps its own,
   whose entries join as `key: value`, the form a displayed map shows. `max()` and `min()` on every
   collection of `Ord` elements answer `Some` of the greatest or least, the first of equal ones, and
-  `None` when empty.
+  `None` when empty. The free functions `max(first, rest*)` and `min(first, rest*)` take one value or more, with a
+  [repeated](/spec/declarations/#repeated-parameters) parameter, and answer the greatest or least
+  itself: `max(3, 9, 4)` is `9`, `min(x, ys*)` the least of `x` and the elements of `ys`.
   `sum()` and `product()` are added to `Iterable` the same way, so every collection has them, ranges
   and sets included, where its elements have `Add` or `Mul`: they answer the total or the product,
   and the identity (`T.zero()`, `T.one()`) when empty, so `[1, 2, 3].sum()` is `6`, `(1..5).product()`
@@ -100,11 +102,12 @@ Collections they make are vectors, maps and sets; n is the number of elements.
 | `sum()` (`T: Add`), `product()` (`T: Mul`) | `T`; the identity when empty | O(n) |
 | `mkString(sep)`, `mkString(start, sep, end)` (`T: Display`) | `string` | O(n) |
 | `partition(p)` | `(Vector[T], Vector[T])`: those that satisfy `p`, those that do not | O(n) |
-| `groupBy(key)` (`K: Eq + Hash`) | `Map[K, Vector[T]]` | O(n) |
+| `groupBy(key)` | `Map[K, Vector[T]]` | O(n) |
 | `groupMap(key, f)` | `Map[K, Vector[V]]` | O(n) |
 | `groupMapReduce(key, f, combine)` | `Map[K, V]` | O(n) |
 | `toList()`, `toVector()`, `toArray()`, `toBuffer()` | the collection, in order | O(n) |
-| `toSet()` (`T: Eq + Hash`) | `Set[T]` | O(n) |
+| `toSet()` | `Set[T]` | O(n) |
+| `toMap()`, on pairs | `Map[K, V]`, a later key's value replacing | O(n) |
 | `zipWithIndex()` | `Vector[(T, int)]`, positions from 0 | O(n) |
 | `collectFirst(pf)` | `Option[B]` | O(n) |
 

@@ -70,6 +70,10 @@ class SortedPair[T: Ordered](first: T, second: T)
   impl its parameters have the bounds' members. Its methods overload the type's other methods by
   parameter types, as any method does, so two of the same parameter types are an error even where
   their bounds could never both hold.
+- **An impl without a trait may add to a type built from its parameters**, as
+  `impl[T] Option[Option[T]]` or `impl[A: Ord, B] Seq[(A, B)]`. Its parameters are not the type's
+  but its own, learned at each call by matching the receiver's static type against the type it
+  names, then held to their bounds; [declarations](declarations.md#impl) has the matching rule.
 - **A call through a bound is direct**: each instance calls the implementation of its own type
   argument. Where the argument is a trait type or an open class, any conforming object may arrive,
   and the call goes through the object's method table as a call on that type does.

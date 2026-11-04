@@ -85,15 +85,18 @@ a decision changes, this page and the chapter change together.
   through a table uses gets a slot of its own in the table of every type implementing the method,
   filled with that type's implementation instantiated at those arguments; such a call also costs one
   virtual call.
-- An `impl` adds methods and conformances, never state. Its methods are a class's or an object's own
-  methods; for a `data` or built-in type they are called directly. Inside them the receiver is
+- An `impl` adds methods and conformances, never state. Written in a class's or an object's module,
+  its methods are the class's own; for a `data` or built-in type, or written elsewhere, they are
+  called directly. Inside them the receiver is
   implicit, as in a class, with a one-variant `data` type's fields in scope by bare name.
 - The methods of `impl Trait for Type` implement the trait's methods without `override`, and each is
   a method of the trait or of one it requires. A `data` type's method implementing a trait method is
   declared in an impl of that trait.
 - A `data` type conforming to a trait gives every variant's descriptor the same method table, at the
   trait positions classes use, so a trait-typed call costs the same whatever the value is.
-- A generic impl writes the type's parameters, in order, as its own: `impl[T] Show for Box[T]`.
+- A generic impl of a trait writes the type's parameters, in order, as its own:
+  `impl[T] Show for Box[T]`. An impl without `for` may also name a type built from its parameters
+  (settled 2026-11-04, below).
 - Settled 2026-11-03: [bounds](/spec/generics/#bounds) are traits or classes, written `[T: A + B]`.
   A value of a bounded `T` has its bounds' methods, `val`s and visible fields, and is a value of
   each bound's type; type arguments are held to their bounds where written and where inferred, and
@@ -112,8 +115,9 @@ a decision changes, this page and the chapter change together.
   its impls name are.
 - A type pattern matches an object whose type conforms to the pattern's type through variance, as
   the checker's subtyping does: a `List[Dog]` held as an `Any` matches `List[Animal]`.
-- The built-in types belong to the core library's module, `avin`; an impl adding methods to one is
-  written there.
+- The built-in types belong to the core library's module, `avin`; a conformance of one is written
+  there or in the trait's module. An impl that only adds methods may be written in any module
+  (settled 2026-11-04, below).
 - Functions and methods may be overloaded by parameter types. A call takes the most specific
   overload that accepts its arguments, chosen at compile time; an ambiguous call is an error.
   Same-named declarations with the same parameter types are an error.
@@ -553,6 +557,22 @@ Settled by the user on 2026-11-03:
 
 Settled by the user on 2026-11-04:
 
+- **An impl that only adds methods may be written in any module** (a relaxed impl); in another module
+  than its type's or trait's it is an [extension](/spec/declarations/#extensions): `impl string`,
+  `impl[T: Ord] Seq[T]`, `impl[T] Option[Option[T]]`, `impl Box` for another module's class. Its
+  methods are seen in its own module and in every file importing that module, whole or any
+  declaration of it, with no further step; a file importing neither does not see them, and the
+  core library's are seen everywhere. A type's own methods are found first: an extension method a
+  type's own or inherited method of the same name and parameter types always hides is an error at
+  its declaration, and one added to a trait is passed over for a type that has such a method. Two
+  seen extensions of different modules adding one name and parameter types to a receiver make the
+  call an error naming both modules. An extension's `private` methods are private to its module. Its
+  methods reach no private member of another module's type, are in no method table and are not
+  overridden; `self` is the receiver and the type's public fields and methods are in scope by bare
+  name. Infix calls, method values and calls through a bound see extensions as dotted calls do,
+  a bound's where the generic function is written. Conformances, `impl Trait for Type`, stay in the
+  module of the type or of the trait.
+
 - **Sequences, sets and maps are functions, by subtyping.** `Seq[+T]` is a subtype of `(int) -> T`,
   through its `apply(index)`; `Set[A]`, immutable and mutable, of `(A) -> bool`; `Map[K, V]`,
   immutable and mutable, of `(K) -> V`, whose `apply` traps on a missing key as `m(k)` does. A
@@ -596,6 +616,28 @@ Settled by the user on 2026-11-04:
   function from a vector and `[](int -> int)` a vector of functions. A type pattern takes it
   without parentheses, `v: []int -> body`. There is no fixed-length `[N]T` (an error); error
   messages print `Vector[int]`.
+- [Repeated parameters](/spec/declarations/#repeated-parameters): `values: T*` is the last
+  parameter, at most one, named, with no default and not by-name; inside the function it is a
+  `Vector[T]`. A call gives it every positional argument from its position on, each checked
+  against `T` (so generic `T` is inferred from them), or splices one `Iterable[T]` with `xs*` as
+  its only argument, written last: a `Vector[T]` is passed as it is, any other sequence copied.
+  `f(1, xs*)` into the one parameter, `xs*` anywhere else, and naming the repeated parameter are
+  errors. A function with one, used as a value, has the type `(…, Vector[T]) -> R`. A method
+  overriding or implementing another repeats the same parameter or neither does; `main` takes
+  none; `data` fields cannot be repeated. A method whose only required parameter precedes a
+  repeated one is called infix with one argument.
+- An impl without `for` adds methods to any type built from its parameters
+  ([declarations](/spec/declarations/#impl)): `impl[T] Option[Option[T]]`,
+  `impl[A, B] Pair[A, List[B]]`, `impl[T] Seq[Seq[T]]`, `impl[K, V] Iterable[(K, V)]`. Every
+  parameter must appear in the type. A call matches the receiver's static type against it,
+  seeing a reference through its traits and superclasses only at covariant parts, and holds the
+  learned parameters to the impl's bounds; a receiver that does not match is an error saying what
+  it would need to be. Two impls that both match a receiver and add a method of one name and
+  parameter types make the call an error, as does such a method clashing with the type's own. An
+  impl of a trait still names its type's parameters in order, so conformances never overlap. The
+  core library adds `flatten` to `Option[Option[T]]`, `Result[Result[T, E], E]` and `Seq[Seq[T]]`
+  (a `Vector[T]`), `toMap()` to `Iterable[(K, V)]` (keys bounded as a map's) and `unzip()` to
+  `Seq[(A, B)]`.
 
 **Deferred**
 
@@ -605,6 +647,14 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
+- Repeated parameters beside overloads and constructors
+  ([declarations](/spec/declarations/#repeated-parameters)): an overload with a repeated parameter
+  is a candidate only where no overload without one accepts the call, so `pick(x: long)` takes
+  `pick(1)` beside `pick(xs: int*)`; among those with one, the arguments are compared by the
+  element type. A class's constructor may end with a repeated parameter, whose field is a
+  `Vector[T]` (`class Path(val parts: string*)`), and a subclass passes it on with `: Path(parts*)`.
+  The core library gains `max(first, rest*)` and `min(first, rest*)` on `T: Ord`, answering the
+  greatest or least of one value or more, the first of equal ones.
 - Option, Result and string methods ([errors](/spec/errors/), [types](/spec/types/#string)):
   `Option` gains `exists`, `forall`, `contains` (on `T: Eq`, which every type meets), `toList`,
   `toVector` and `zip`; `Result` gains `exists`, `forall`, `toList` and `orElse(f)`, where `f`
@@ -615,9 +665,7 @@ Settled by the user on 2026-11-04:
   empty separator (no piece boundary is defined there). `lines` ends a line at `\n` or `\r\n`; a
   terminator at the end starts no further line, the empty string has no lines, and a lone `\r`
   stays in its line. `take`, `drop`, `takeRight`, `dropRight` and the padding widths clamp rather
-  than trap. `flatten` on `Option[Option[T]]` and `Result[Result[T, E], E]` is not offered: an
-  `impl` cannot name a nested type, and a method on the unnested type has no way to ask `T` to be
-  an option.
+  than trap.
 
 - The methods every `Iterable` has ([collections](/spec/collections/#methods-every-iterable-has)):
   folds, `reduce` (trapping when empty) and `reduceOption`, searches, `count`, `minBy`/`maxBy` and

@@ -301,22 +301,38 @@ struct ConditionalImpl
     params: Buf[TypeParam]
 
 /** An impl that adds methods to a trait, `impl[T] Seq[T]`: every value whose type conforms to the
- * trait has them. */
+ * trait has them. Or an impl adding methods to a type built from its parameters, `impl[T]
+ * Seq[Seq[T]]` or `impl[T] Option[Option[T]]`: the values whose type matches it have them. `on_trait`
+ * tells which the type the impl adds to is; `trait_id` is that trait's. `extension` tells whether
+ * the impl is written outside the module of the type or trait it adds to. */
 struct TraitImpl
     unit: usize
     module_name: string
     decl: &ImplDecl
     trait_id: usize
+    on_trait: bool
+    extension: bool
 
 /** A method an impl adds to trait `trait_id`. It is a generic function whose type parameters are the
  * impl's (`impl_params` of them), then `Self`, the receiver's type, bounded by the trait at the impl's
  * parameters, then its own. A call gives the receiver's static type as `Self`, so each instance calls
  * the trait's methods of that type directly, or through the method table where the receiver is seen
- * only as the trait. */
+ * only as the trait.
+ *
+ * Where the impl adds to a data type, a class or a built-in type built from its parameters
+ * (`on_trait` false), there is no `Self`: the receiver is of the type the impl names. Either way
+ * `target` is that type, naming the impl's parameters as this function's, and a call learns them
+ * by matching the receiver's static type against it.
+ *
+ * An `extension`, added by an impl outside the module of the type or trait it adds to, is seen only
+ * by code of that module and by files importing the module or a declaration of it. */
 struct TraitMethod
     function: usize
     trait_id: usize
     impl_params: usize
+    on_trait: bool
+    target: &Type
+    extension: bool
 
 /** An unknown type argument of a call, open until a later use settles it: where it was made, and
  * what to report if nothing does. */
@@ -690,6 +706,8 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool) -> Che
                     _ -> false
             if main.params.len() > 1 || (main.params.len() == 1 && !takes_arguments && !(*main.params[0] is ErrorType))
                 c.note(main_unit, main.decl.name_span, "`main` is `main()` or `main(args: Vector[string])`")
+            elif takes_arguments && declares_variadic(main.decl)
+                c.note(main_unit, main.decl.name_span, "`main`'s `args` is not a repeated parameter; `main` is `main()` or `main(args: Vector[string])`")
             if takes_arguments && main.defaults.len() > 0 && main.defaults[0] is Some(_)
                 c.note(main_unit, main.decl.name_span, "`main`'s `args` has no default; `main` is `main()` or `main(args: Vector[string])`")
             if main.decl.type_params.len() > 0 then c.note(main_unit, main.decl.name_span, "`main` cannot be generic")
@@ -920,9 +938,10 @@ private declare_objects(c: *Checker, unit: usize)
 
 // Each impl's type and trait, resolved with the impl's type parameters in scope. They are the type's
 // own parameters under the names the impl gives them, so `impl[T] Box[T]` lists them in order. What
-// an impl may hold, and where it may be written, is reported here once: an impl lives in the module
-// of its type or of its trait, and the built-in types belong to the core library's module, the
-// prelude's. A data type's conformances are recorded here; a class's join those its header states
+// an impl may hold, and where it may be written, is reported here once: a conformance lives in the
+// module of its type or of its trait, and the built-in types belong to the core library's module,
+// the prelude's; an impl that only adds methods may be written in any module. A data type's
+// conformances are recorded here; a class's join those its header states
 // when its fields are declared.
 private declare_impls(c: *Checker, unit: usize)
     val file = c.units[unit].file
@@ -977,8 +996,15 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
             written[i].kind match
                 Named(n, inner) -> if n != d.type_params[i].name || inner.len() > 0 then in_order = false
                 _ -> in_order = false
-    if !in_order
-        c.note(unit, d.target.span, "the type an impl adds to takes the impl's type parameters, in order, as in `impl[T] Box[T]`")
+    // Any other type built from the parameters is matched against each receiver's type, so its
+    // methods are a call's to find; a conformance is a type's, at every instance of it. An impl
+    // adding methods to a type of another module is matched the same way: its methods are not the
+    // type's, so they reach no private member and no method table.
+    if !in_order && d.trait_name is Some(_)
+        c.note(unit, d.target.span, "the type an impl of a trait is for takes the impl's type parameters, in order, as in `impl[T] Display for Box[T]`")
+        return invalid
+    if !in_order || (d.trait_name is None && module_name != home)
+        c.trait_impls.push(TraitImpl(unit, module_name, d, 0, false, module_name != home))
         return invalid
     val outer_generic = c.generic
     c.generic = Some(GenericScope(owner, d.type_params))
@@ -1033,9 +1059,9 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
     if d.trait_name is Some(_) && trait_type is None then return invalid
     if trait_type is Some(t)
         if refuse_closed_trait(c, unit, written_trait_span(d), t) then return invalid
-    if module_name != home && (trait_type is None || module_name != trait_home)
-        if trait_type is None then c.note(unit, d.target.span, s"`$path` is declared in another module; an impl adding methods to it belongs in that module")
-        else c.note(unit, d.target.span, s"neither `$path` nor `${type_name(trait_type.unwrap())}` is declared in this module; an impl belongs in the module of its type or of its trait")
+    // A conformance is one answer everywhere, so it is stated where the type or the trait is.
+    if trait_type is Some(t) && module_name != home && module_name != trait_home
+        c.note(unit, d.target.span, s"neither `$path` nor `${type_name(t)}` is declared in this module; an impl belongs in the module of its type or of its trait")
         return invalid
     if trait_type is Some(t)
         *target match
@@ -1057,43 +1083,61 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
     elif conditional then c.conditional_methods.push(ConditionalImpl(owner, conditions, unit, d.type_params))
     ImplSymbol(unit, module_name, d, target, owner, trait_type, conditions)
 
-// An impl without `for` whose type is a trait adds methods to the trait: it names the trait's
-// parameters in order, as an impl of a type does, and lives in the trait's module. Its methods are
-// declared once every trait's own methods are.
+// An impl without `for` whose type is a trait adds methods to the trait, at any arguments built from
+// the impl's parameters: `impl[T] Seq[T]` to every sequence, `impl[T] Seq[Seq[T]]` to a sequence of
+// sequences. Written in another module than the trait's, it is an extension. Its methods are declared
+// once every trait's own methods are.
 private resolve_trait_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl, id: usize)
-    val k = c.classes[id]
-    val written = d.target.kind match
-        Named(_, args) -> args
-        _ -> buf()
-    var in_order = written.len() == d.type_params.len() && written.len() == k.decl.type_params.len()
-    if in_order
-        for i in 0..<written.len()
-            written[i].kind match
-                Named(n, inner) -> if n != d.type_params[i].name || inner.len() > 0 then in_order = false
-                _ -> in_order = false
-    if !in_order
-        c.note(unit, d.target.span, s"the trait an impl adds to takes the impl's type parameters, in order, as in `impl[T] ${k.name}[T]`")
-        return
-    if module_name != k.module_name
-        c.note(unit, d.target.span, s"`${k.name}` is declared in another module; an impl adding methods to it belongs in that module")
-        return
-    c.trait_impls.push(TraitImpl(unit, module_name, d, id))
+    c.trait_impls.push(TraitImpl(unit, module_name, d, id, true, module_name != c.classes[id].module_name))
 
 // Each method an impl adds to a trait is a generic function over the impl's parameters, then `Self`,
 // the type of the value it is called on, bounded by the trait, then its own. Its receiver, `self`, is
 // a `Self`, so its body reaches the value only through the trait's methods, and a call compiles it
 // for the receiver's static type.
+// The type the impl adds to is resolved once, with its parameters as those of a placeholder owner, to
+// hold it to naming each of them: a call learns the impl's parameters only from its receiver's type.
 private declare_trait_methods(c: *Checker, i: usize)
-    for m in c.trait_impls[i].decl.members
-        if m is MethodMember(f, public, overrides, static_member) then declare_trait_method(c, i, f, public, overrides, static_member)
+    val block = c.trait_impls[i]
+    val placeholder = c.symbols.len()
+    val outer_generic = c.generic
+    c.generic = Some(GenericScope(placeholder, block.decl.type_params))
+    // A trait is resolved as the bound it is of `Self`, so one whose methods mention `Self` is too.
+    val target = if block.on_trait then resolve_bound(c, block.unit, block.decl.target) else resolve_type(c, block.unit, block.decl.target)
+    c.generic = outer_generic
+    if *target is ErrorType then return
+    var complete = true
+    for j in 0..<block.decl.type_params.len()
+        if !names_param(target, placeholder, j)
+            val tp = block.decl.type_params[j]
+            c.note(block.unit, tp.span, s"`${tp.name}` is not part of `${show_type(block.decl.target)}`; each of an impl's type parameters is, so a call learns it from the receiver's type")
+            complete = false
+    if !complete then return
+    for m in block.decl.members
+        if m is MethodMember(f, public, overrides, static_member) then declare_trait_method(c, i, f, public, overrides, static_member, target, placeholder)
 
-private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, overrides: bool, static_member: bool)
+/** Whether type `t` names the `index`th type parameter of `owner`. */
+private names_param(t: &Type, owner: usize, index: usize) -> bool = *t match
+    TypeVar(o, i, _) -> o == owner && i == index
+    Tuple(items) -> any_names_param(items, owner, index)
+    Function(params, result) -> any_names_param(params, owner, index) || names_param(result, owner, index)
+    ByName(inner) -> names_param(inner, owner, index)
+    Data(_, _, args) -> any_names_param(args, owner, index)
+    Class(_, _, args) -> any_names_param(args, owner, index)
+    _ -> false
+
+private any_names_param(items: Buf[&Type], owner: usize, index: usize) -> bool
+    for t in items
+        if names_param(t, owner, index) then return true
+    false
+
+private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, overrides: bool, static_member: bool, written_target: &Type, placeholder: usize)
     val block = c.trait_impls[i]
     val unit = block.unit
     val k = block.trait_id
-    val trait_name = c.classes[k].name
+    val trait_name = if block.on_trait then c.classes[k].name else head_name(written_target)
     if static_member
-        c.note(unit, f.name_span, s"`${f.name}` is static, which only a trait's member and its implementations are; an impl adding to `$trait_name` adds methods of values")
+        val adds = if block.on_trait then "a trait's member and its implementations are" else "a type's own member is"
+        c.note(unit, f.name_span, s"`${f.name}` is static, which only $adds; an impl adding to `$trait_name` adds methods of values")
         return
     if f.annotations.len() > 0
         c.note(unit, f.name_span, "annotations on methods are not implemented")
@@ -1101,17 +1145,22 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
     if overrides
         c.note(unit, f.name_span, s"`${f.name}` overrides nothing; the methods an impl adds to `$trait_name` are not the trait's, so no type implements or overrides them")
         return
-    if trait_declares(c, k, f.name, 0)
+    if block.on_trait && trait_declares(c, k, f.name, 0)
         c.note(unit, f.name_span, s"`${f.name}` is already a method of `$trait_name`; an impl adds to a trait only methods the trait does not declare")
         return
     val id = c.symbols.len()
     val impl_params = block.decl.type_params.len()
+    var renamed: Buf[&Type] = buf()
+    for j in 0..<impl_params
+        renamed.push(TypeVar(id, j, block.decl.type_params[j].name))
+    val target = substitute(written_target, placeholder, renamed)
     var type_params: Buf[TypeParam] = buf()
     for tp in block.decl.type_params
         type_params.push(tp)
-    var bound: Buf[&TypeExpr] = buf()
-    bound.push(block.decl.target)
-    type_params.push(TypeParam(block.decl.target.span, "Self", Invariant, bound, s"${c.units[unit].src.name}:${block.decl.span.start}:Self"))
+    if block.on_trait
+        var bound: Buf[&TypeExpr] = buf()
+        bound.push(block.decl.target)
+        type_params.push(TypeParam(block.decl.target.span, "Self", Invariant, bound, s"${c.units[unit].src.name}:${block.decl.span.start}:Self"))
     for tp in f.type_params
         type_params.push(tp)
     // The impl's parameters and `Self` are bounded here, in this function's scope; `signature`
@@ -1120,7 +1169,7 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
     c.generic = Some(GenericScope(id, type_params))
     declare_bounds(c, unit, id, type_params, 0)
     c.generic = outer_generic
-    val receiver: &Type = TypeVar(id, impl_params, "Self")
+    val receiver: &Type = if block.on_trait then TypeVar(id, impl_params, "Self") else target
     var symbol = signature(c, unit, block.module_name, f, id, type_params, false, Some(receiver))
     var receiver_types: Buf[&Type] = buf()
     var receiver_names: Buf[string] = buf()
@@ -1132,32 +1181,83 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
         receiver_names.push(n)
     symbol.params = receiver_types
     symbol.param_names = receiver_names
-    symbol.name = trait_name + "." + f.name
+    // A method added to a type built from the impl's parameters is named with that type, which tells
+    // it from a method of the same name another such impl adds.
+    val nested = !block.on_trait || !in_order_target(target, id, impl_params)
+    symbol.name = if nested then type_name(target) + "." + f.name else trait_name + "." + f.name
     symbol.public = public
     symbol.receiver = Some(receiver)
     var method_defaults: Buf[Option[usize]] = buf()
     for _ in receiver_types
         method_defaults.push(None)
     symbol.defaults = method_defaults
-    // The methods impls have added to this trait under the name so far, which this one overloads.
+    // The methods impls of this module have added to this type under the name so far, which this
+    // one overloads. Impls adding to different types built from one, as `Option[Option[T]]` and
+    // `Option[List[T]]`, are told apart by the receiver at a call; extensions of two modules, by
+    // which of the modules a file imports.
     var same_name: Buf[usize] = buf()
     for tm in c.trait_methods
-        if tm.trait_id == k && c.symbols[tm.function].decl.name == f.name then same_name.push(tm.function)
+        val other = c.symbols[tm.function]
+        if other.decl.name == f.name && other.module_name == block.module_name && same_added_target(c, tm, block.on_trait, k, target, id, impl_params) then same_name.push(tm.function)
     if same_as_overload(c, symbol, same_name)
-        c.note(unit, f.name_span, s"`${f.name}` is already added to `$trait_name` with the same parameter types; a method's overloads differ in their parameter types")
+        c.note(unit, f.name_span, s"`${f.name}` is already added to `${if nested then type_name(target) else trait_name}` with the same parameter types; a method's overloads differ in their parameter types")
         return
     c.symbols.push(symbol)
     c.states.push(0)
     c.bodies.push(None)
     c.locals.push(buf())
     declare_defaults(c, id)
-    c.trait_methods.push(TraitMethod(id, k, impl_params))
+    c.trait_methods.push(TraitMethod(id, k, impl_params, block.on_trait, target, block.extension))
     same_name.push(id)
     if same_name.len() > 1 then mark_overloads(c, same_name)
+    // The type's own methods are found first, so an extension one of them always hides could never
+    // be called.
+    if block.extension && !block.on_trait
+        val own = *target match
+            Class(t, _, _) -> methods_named(c, t, f.name)
+            _ -> receiver_methods(c, target, f.name)
+        for o in own
+            if c.symbols[o].public && same_params_seen(c, target, o, id)
+                c.note(unit, f.name_span, s"`${f.name}` is already a method of `${head_name(target)}` with the same parameter types, which a call always finds first; an extension adds methods the type does not have")
+                return
+
+/** The name of the type `t` is an instance of, as a diagnostic names it: `Option` for
+ * `Option[Option[T]]`. */
+private head_name(t: &Type) -> string = *t match
+    Data(_, name, _) -> name
+    Class(_, name, _) -> name
+    _ -> type_name(t)
+
+/** Whether `target`, the type an impl adds to, is its type at the impl's `count` parameters of
+ * `owner`, in order, as `Seq[T]` is. */
+private in_order_target(target: &Type, owner: usize, count: usize) -> bool
+    val args = *target match
+        Data(_, _, a) -> a
+        Class(_, _, a) -> a
+        _ -> return count == 0
+    if args.len() != count then return false
+    for j in 0..<count
+        val named = *args[j] match
+            TypeVar(o, i, _) -> o == owner && i == j
+            _ -> false
+        if !named then return false
+    true
+
+/** Whether method `tm` is added to the same type as an impl adding to `target`, whose parameters
+ * are owner `owner`'s: to the same trait, or the same type built from parameters, the parameters
+ * renamed alike. */
+private same_added_target(c: *Checker, tm: TraitMethod, on_trait: bool, k: usize, target: &Type, owner: usize, count: usize) -> bool
+    if tm.on_trait != on_trait then return false
+    if on_trait && tm.trait_id != k then return false
+    if tm.impl_params != count then return false
+    var names: Buf[&Type] = buf()
+    for j in 0..<count
+        names.push(TypeVar(method_params_owner(), j, "T"))
+    same_type(substitute(tm.target, tm.function, names), substitute(target, owner, names))
 
 /** What the impls adding method `m` add to, as a diagnostic names it: a trait, or a type. */
 private impls_owner(c: *Checker, m: usize) -> string = trait_method_of(c, m) match
-    Some(tm) -> c.classes[tm.trait_id].name
+    Some(tm) -> if tm.on_trait then c.classes[tm.trait_id].name else head_name(tm.target)
     None -> type_name(c.symbols[m].receiver.unwrap())
 
 /** The impl's record of method `m` where an impl adds it to a trait. */
@@ -1165,6 +1265,113 @@ private trait_method_of(c: *Checker, m: usize) -> Option[TraitMethod]
     for tm in c.trait_methods
         if tm.function == m then return Some(tm)
     None
+
+/** Whether a value of type `t` is an instance of the type method `tm` is added to, at whatever
+ * arguments: it conforms to the trait, or is of the data type, of the class or a subclass, or of the
+ * built-in type. Whether its arguments match is `added_args`'s to say. */
+private added_applies(c: *Checker, t: &Type, tm: TraitMethod) -> bool
+    if tm.on_trait then return trait_view(c, t, tm.trait_id) is Some(_)
+    val x = zonk(c, t)
+    *tm.target match
+        Data(d, _, _) -> *x match
+            Data(e, _, _) -> d == e
+            _ -> false
+        Class(k, _, _) -> trait_view(c, x, k) is Some(_)
+        _ -> added_args(c, x, tm) is Some(_)
+
+/** The impl's type arguments a call of method `tm` takes on a value of type `t`: what the
+ * receiver's static type gives each parameter in the type the impl adds to, or `None` where the
+ * receiver's type does not match it. */
+private added_args(c: *Checker, t: &Type, tm: TraitMethod) -> Option[Buf[&Type]]
+    var binds: Buf[Option[&Type]] = buf()
+    for _ in 0..<tm.impl_params
+        binds.push(None)
+    if !match_target(c, tm.target, t, tm.function, &binds, true) then return None
+    var out: Buf[&Type] = buf()
+    for b in binds
+        out.push(b.unwrap_or(ErrorType))
+    Some(out)
+
+// Matches `pattern`, a type built from the impl parameters `owner` owns, against `t`, a receiver's
+// static type or a part of it, binding each parameter in `binds`. Where `covariant`, at the top and
+// inside a covariant parameter, a reference is seen as the pattern's trait or class through its
+// conformances and superclasses, as it is passed where one is expected: a `Vector[Vector[int]]` is a
+// `Seq[Seq[int]]`. Elsewhere each part is the pattern's own type, and a parameter named twice takes
+// one type.
+private match_target(c: *Checker, pattern: &Type, t: &Type, owner: usize, binds: *Buf[Option[&Type]], covariant: bool) -> bool
+    val x = zonk(c, t)
+    if *x is ErrorType then return true
+    *pattern match
+        TypeVar(o, i, _) ->
+            if o != owner then return same_type(pattern, x)
+            binds[i] match
+                Some(b) -> same_type(zonk(c, b), x)
+                None ->
+                    binds.set(i, Some(x))
+                    true
+        Data(d, _, ps) -> *x match
+            Data(e, _, xs) -> d == e && match_args(c, c.data[d].decl.type_params, ps, xs, owner, binds, covariant)
+            _ -> false
+        Class(k, _, ps) ->
+            var seen: Option[&Type] = None
+            val same_class = *x match
+                Class(j, _, _) -> j == k
+                _ -> false
+            if same_class then seen = Some(x)
+            elif covariant then seen = trait_view(c, x, k)
+            seen match
+                Some(up) -> *up match
+                    Class(_, _, xs) -> match_args(c, c.classes[k].decl.type_params, ps, xs, owner, binds, covariant)
+                    _ -> false
+                None -> false
+        Tuple(ps) -> *x match
+            Tuple(xs) -> ps.len() == xs.len() && match_parts(c, ps, xs, owner, binds, covariant)
+            _ -> false
+        Function(ps, r) -> *x match
+            Function(xs, s) -> ps.len() == xs.len() && match_parts(c, ps, xs, owner, binds, false) && match_target(c, r, s, owner, binds, false)
+            _ -> false
+        _ -> same_type(pattern, x)
+
+// The type arguments `ps` of a pattern matched against `xs`, each in a covariant position where the
+// parameter it is for is covariant and the whole is.
+private match_args(c: *Checker, params: Buf[TypeParam], ps: Buf[&Type], xs: Buf[&Type], owner: usize, binds: *Buf[Option[&Type]], covariant: bool) -> bool
+    if ps.len() != xs.len() then return false
+    for i in 0..<ps.len()
+        val co = covariant && i < params.len() && params[i].variance is Covariant
+        if !match_target(c, ps[i], xs[i], owner, binds, co) then return false
+    true
+
+private match_parts(c: *Checker, ps: Buf[&Type], xs: Buf[&Type], owner: usize, binds: *Buf[Option[&Type]], covariant: bool) -> bool
+    for i in 0..<ps.len()
+        if !match_target(c, ps[i], xs[i], owner, binds, covariant) then return false
+    true
+
+/** What a receiver must be for method `tm`, as a diagnostic says it: `an `Option` of an `Option``
+ * for `Option[Option[T]]`, `a `Seq` of pairs` for `Seq[(A, B)]`; the type written out where it has
+ * more than one part built from the parameters. */
+private added_target_phrase(tm: TraitMethod) -> string = target_phrase(tm.target)
+
+private target_phrase(t: &Type) -> string
+    val inner = *t match
+        Tuple(items) -> return if items.len() == 2 then "a pair" else s"a tuple of ${items.len()}"
+        Data(_, _, args) -> args
+        Class(_, _, args) -> args
+        _ -> return s"`${type_name(t)}`"
+    val name = head_name(t)
+    var built: Option[&Type] = None
+    for a in inner
+        if !(*a is TypeVar(_, _, _))
+            if built is Some(_) then return s"`${type_name(t)}`"
+            built = Some(a)
+    val article = if starts_with_vowel(name) then "an" else "a"
+    built match
+        Some(a) -> s"$article `$name` of ${target_phrase(a)}"
+        None -> s"$article `$name`"
+
+private starts_with_vowel(name: string) -> bool
+    for v in ["A", "E", "I", "O", "U", "a", "e", "i", "o", "u"]
+        if name.starts_with(v) then return true
+    false
 
 /** Whether `name` is one of `params`. */
 private names_type_param(params: Buf[TypeParam], name: string) -> bool
@@ -1486,7 +1693,9 @@ private declare_fields(c: *Checker, unit: usize)
                 Name(n) -> n
                 _ -> "_"
             if field_named(fields, name) is Some(_) then c.note(unit, cp.param.pattern.span, s"the field `$name` is declared more than once")
-            fields.push(FieldSymbol(name, cp.param.pattern.span, Some(resolve_type(c, unit, cp.param.ty)), cp.mutable, cp.public, true, id))
+            val written = resolve_type(c, unit, cp.param.ty)
+            val field_type = if cp.param.variadic then vector_of(c, written) else written
+            fields.push(FieldSymbol(name, cp.param.pattern.span, Some(field_type), cp.mutable, cp.public, true, id))
         for m in d.members
             if m is FieldMember(f)
                 if field_named(fields, f.name) is Some(_) then c.note(unit, f.span, s"the field `${f.name}` is declared more than once")
@@ -1772,10 +1981,14 @@ private field_visible(c: *Checker, f: FieldSymbol) -> bool = f.public || inside_
 private method_visible(c: *Checker, m: usize) -> bool
     if c.symbols[m].public then return true
     // A private method an impl adds to a trait is called from the methods impls add to that trait.
+    // One an impl adds to a type built from its parameters is private to the type's own impls.
+    // A private method of an extension is private to the extension's module.
     if trait_method_of(c, m) is Some(tm)
-        return trait_method_of(c, c.body.root) match
-            Some(here) -> here.trait_id == tm.trait_id
-            None -> false
+        if tm.extension then return c.files[unit_of(c)].module_name == c.symbols[m].module_name
+        if tm.on_trait
+            return trait_method_of(c, c.body.root) match
+                Some(here) -> here.on_trait && here.trait_id == tm.trait_id
+                None -> false
     c.symbols[m].owner_class match
         Some(k) -> inside_class(c, k)
         None -> c.symbols[m].receiver match
@@ -1785,6 +1998,7 @@ private method_visible(c: *Checker, m: usize) -> bool
 /** Whether the code being checked is a method an impl adds to the data or built-in type of `t`, or
  * code of a data type's companion object, so it may call that type's private methods. */
 private inside_impl(c: *Checker, t: &Type) -> bool
+    if in_extension(c) then return false
     if *t is Data(b, _, _)
         if c.data[b].companion is Some(o)
             if enclosing_class(c) == Some(o) then return true
@@ -1796,6 +2010,12 @@ private inside_impl(c: *Checker, t: &Type) -> bool
             Data(b, _, _) -> a == b
             _ -> false
         _ -> same_type(here, t)
+
+/** Whether the code being checked is a method of an extension: an impl written outside the module
+ * of the type or trait it adds to, whose methods reach no private member of the type. */
+private in_extension(c: *Checker) -> bool = trait_method_of(c, c.body.root) match
+    Some(tm) -> tm.extension
+    None -> false
 
 // The field of class `k` a name reaches from the code being checked: the class's own field first,
 // then the nearest ancestor's, passing over the private fields the code cannot see. When none is
@@ -2184,20 +2404,57 @@ private trait_view(c: *Checker, t: &Type, k: usize) -> Option[&Type]
 // The methods of `name` a value of type `t` has: `own`, those of its type, then each that an impl
 // adds to a trait `t` conforms to. The type's own method takes precedence over an added one with the
 // same parameter types, which is left out.
+//
+// An impl adding to a type built from its parameters, as `impl[T] Option[Option[T]]`, adds to the
+// values whose type matches it. Where some added method's type matches, only those are offered;
+// where none does, those whose type the receiver is an instance of are, so the call reports what the
+// receiver would need to be. Such a method is not hidden by the type's own of the same parameter
+// types: both are the type's, so the call is ambiguous, as `refuse_trait_clash` reports.
 private with_trait_methods(c: *Checker, t: &Type, name: string, own: Buf[usize]) -> Buf[usize]
     if c.trait_methods.len() == 0 then return own
     var out: Buf[usize] = buf()
     for m in own
         out.push(m)
+    var matching: Buf[usize] = buf()
+    var unmatched: Buf[usize] = buf()
     for tm in c.trait_methods
         val m = tm.function
-        if c.symbols[m].decl.name != name || !method_visible(c, m) then continue
-        if trait_view(c, t, tm.trait_id) is None then continue
+        if c.symbols[m].decl.name != name || !method_visible(c, m) || !extension_seen(c, tm) then continue
+        if !added_applies(c, t, tm) then continue
+        val matches = added_args(c, t, tm) is Some(_)
         var hidden = false
         for o in own
             if same_params_seen(c, t, o, m) then hidden = true
-        if !hidden then out.push(m)
+        if hidden && (tm.on_trait || tm.extension || !matches) then continue
+        if matches then matching.push(m) else unmatched.push(m)
+    val offered = if matching.len() > 0 || own.len() > 0 then matching else unmatched
+    for m in offered
+        out.push(m)
     out
+
+/** Whether the code being checked sees the methods impl method `tm` is added with: those of an impl
+ * in the module of the type or trait it adds to are seen wherever the type is; an extension's, by
+ * code of its own module and of a file importing that module or any declaration of it. The core
+ * library's are seen everywhere. */
+private extension_seen(c: *Checker, tm: TraitMethod) -> bool
+    if !tm.extension then return true
+    val home = c.symbols[tm.function].module_name
+    if home == CoreModule then return true
+    sees_module(c, unit_of(c), home)
+
+/** Whether file `unit` is of module `module_name` or imports it: the module itself, `import a.b`,
+ * or one of its declarations, `import a.b.X`. */
+private sees_module(c: *Checker, unit: usize, module_name: string) -> bool
+    val scope = c.files[unit]
+    if scope.module_name == module_name then return true
+    for (_, imported) in scope.modules
+        if imported == module_name then return true
+    for (_, key) in scope.imports
+        var dot = 0usize
+        for k in 0..<key.bytes.len
+            if key.bytes[k] == u8('.') then dot = k
+        if dot > 0 && key[0..<dot] == module_name then return true
+    false
 
 /** The parameter types of method `m` past the receiver, as a call on a value of type `t` sees them,
  * with the method's own type parameters renamed alike, so two methods' lists compare. */
@@ -2227,31 +2484,62 @@ private same_params_seen(c: *Checker, t: &Type, a: usize, b: usize) -> bool
     true
 
 // Reports a use of `name` on a value of type `t` where the only method of that name is a private one
-// an impl adds to a trait `t` conforms to, which the code being checked may not call.
+// an impl adds to a trait `t` conforms to, which the code being checked may not call, or one an
+// extension adds in a module the file does not import.
 private refuse_private_trait_method(c: *Checker, at: Span, t: &Type, name: string) -> bool
     for tm in c.trait_methods
         val m = tm.function
-        if c.symbols[m].decl.name != name || method_visible(c, m) then continue
-        if trait_view(c, t, tm.trait_id) is None then continue
-        c.note(unit_of(c), at, s"`$name` is private to the impls of `${c.classes[tm.trait_id].name}`")
+        if c.symbols[m].decl.name != name || !added_applies(c, t, tm) then continue
+        val home = module_label(c.symbols[m].module_name)
+        if !extension_seen(c, tm)
+            c.note(unit_of(c), at, s"`$name` is added to `${impls_owner(c, m)}` by $home, which this file does not import")
+            return true
+        if method_visible(c, m) then continue
+        if tm.extension then c.note(unit_of(c), at, s"`$name` is private to $home, whose impl adds it to `${impls_owner(c, m)}`")
+        else c.note(unit_of(c), at, s"`$name` is private to the impls of `${impls_owner(c, m)}`")
         return true
     false
 
 // Reports a call of `name` on a value of type `t` that reaches, among `ms`, two methods impls add to
 // two traits `t` conforms to, with the same parameter types: neither trait's is the one meant.
+//
+// An impl adding to a type built from its parameters clashes the same way with another such impl, or
+// with the type's own method, where the receiver matches both.
 private refuse_trait_clash(c: *Checker, at: Span, t: &Type, name: string, ms: Buf[usize]) -> bool
     for i in 0..<ms.len()
         val a = trait_method_of(c, ms[i]) match
             Some(x) -> x
             None -> continue
+        if !a.on_trait && !a.extension && added_args(c, t, a) is Some(_)
+            for o in ms
+                if trait_method_of(c, o) is Some(_) then continue
+                if same_params_seen(c, t, o, ms[i])
+                    c.note(unit_of(c), at, s"`$name` is ambiguous on ${type_name(zonk(c, t))}: `${head_name(a.target)}` has it, and an impl adding to `${type_name(a.target)}` adds it with the same parameter types")
+                    return true
         for j in i + 1..<ms.len()
             val b = trait_method_of(c, ms[j]) match
                 Some(x) -> x
                 None -> continue
-            if a.trait_id != b.trait_id && same_params_seen(c, t, ms[i], ms[j])
-                c.note(unit_of(c), at, s"`$name` is ambiguous on ${type_name(zonk(c, t))}: impls of `${c.classes[a.trait_id].name}` and of `${c.classes[b.trait_id].name}` each add it with the same parameter types")
+            val module_a = c.symbols[a.function].module_name
+            val module_b = c.symbols[b.function].module_name
+            if module_a == module_b && same_added_target(c, a, b.on_trait, b.trait_id, b.target, b.function, b.impl_params) then continue
+            if added_args(c, t, a) is None || added_args(c, t, b) is None then continue
+            if same_params_seen(c, t, ms[i], ms[j])
+                if module_a != module_b
+                    c.note(unit_of(c), at, s"`$name` is ambiguous on ${type_name(zonk(c, t))}: ${module_label(module_a)} and ${module_label(module_b)} each add it with the same parameter types, and this file sees both")
+                    return true
+                c.note(unit_of(c), at, s"`$name` is ambiguous on ${type_name(zonk(c, t))}: impls of `${added_label(c, a)}` and of `${added_label(c, b)}` each add it with the same parameter types")
                 return true
     false
+
+/** A module as a diagnostic names it; the root module has no name of its own. */
+private module_label(module_name: string) -> string = if module_name == "" then "the root module" else s"module `$module_name`"
+
+/** The type an impl adding method `tm` adds to, as a diagnostic names it: the trait, for an impl of
+ * it at its parameters in order, or the type built from them. */
+private added_label(c: *Checker, tm: TraitMethod) -> string
+    if tm.on_trait && in_order_target(tm.target, tm.function, tm.impl_params) then return c.classes[tm.trait_id].name
+    type_name(tm.target)
 
 /** The methods of `ms` the code being checked may call. */
 private visible_methods(c: *Checker, ms: Buf[usize]) -> Buf[usize]
@@ -3351,6 +3639,12 @@ private param_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) -> 
         val w = seen_from(c, self_type, base, want[i])
         val h = seen_from(c, self_type, m, have[i])
         if !same_type(h, w) then return Some(s"whose parameter `${c.symbols[base].param_names[i]}` is ${type_name(w)}, not ${type_name(h)}")
+    // A call through either method passes the same arguments, so both repeat their last parameter or
+    // neither does.
+    val repeats = declares_variadic(c.symbols[base].decl)
+    if repeats != declares_variadic(c.symbols[m].decl)
+        val last = c.symbols[base].param_names[want.len() - 1]
+        return Some(if repeats then s"whose parameter `$last` is repeated" else s"whose parameter `$last` is not repeated")
     None
 
 /** How method `m`'s result differs from that of `base`, which it overrides or implements for
@@ -3556,10 +3850,10 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
             _ ->
                 c.note(unit, p.pattern.span, "parameter patterns are not implemented")
                 names.push("_")
-        if p.variadic then c.note(unit, p.span, "repeated parameters are not implemented")
         if p.by_name && f.clauses.len() > 0
             c.note(unit, p.pattern.span, s"`${f.name}` is defined by clauses, which match its arguments, so its parameters cannot be by-name")
-        val ty = resolve_type(c, unit, p.ty)
+        val written = resolve_type(c, unit, p.ty)
+        val ty = if p.variadic then vector_of(c, written) else written
         if p.by_name && f.clauses.len() == 0 then params.push(ByName(ty)) else params.push(ty)
     var result: Option[&Type] = None
     if f.result is Some(r) then result = Some(resolve_type(c, unit, r))
@@ -3877,6 +4171,8 @@ meets_bound(f: Conformances, x: &Type, bound: &Type) -> bool
     val k = *bound match
         Class(k, _, _) -> k
         _ -> return true
+    // Every type compares and hashes, a type parameter without a bound too.
+    if names_core_trait(f.core, k, "Eq") || names_core_trait(f.core, k, "Hash") then return true
     *x match
         ErrorType -> true
         Nothing -> true
@@ -4675,7 +4971,7 @@ private super_initialization(c: *Checker, receiver: &TExpr, sup: &Type, parent: 
         name_span = callee.span
     val s = c.classes[sid]
     val constructor = c.symbols[s.constructor]
-    val signature = Signature(s.name, true, constructor.type_params, class_owner(sid), constructor.params, constructor.param_names, constructor.defaults, Unit, sargs, None)
+    val signature = Signature(s.name, true, constructor.type_params, class_owner(sid), constructor.params, constructor.param_names, constructor.defaults, Unit, sargs, None, declares_variadic(constructor.decl))
     val outer = c.super_args
     c.super_args = true
     val applied = apply(c, parent.span, name_span, signature, args, None, None, buf())
@@ -4821,6 +5117,15 @@ private local_function(c: *Checker, name: string) -> Option[usize]
 /** The class whose constructor or method the code being checked belongs to. */
 private enclosing_class(c: *Checker) -> Option[usize] = c.symbols[c.body.root].owner_class
 
+/** The class whose fields a bare name reaches: the enclosing class, or the class of the receiver of
+ * a method an impl adds to a type built from a class's parameters or to another module's class. */
+private fields_class(c: *Checker) -> Option[usize]
+    if enclosing_class(c) is Some(k) then return Some(k)
+    val t = c.symbols[c.body.root].receiver?
+    *t match
+        Class(k, _, _) -> if is_trait(c, k) then None else Some(k)
+        _ -> None
+
 /** A member of the enclosing class named by its bare name: a field or a method. */
 private enum MemberRef
     FieldOf(index: usize)
@@ -4869,6 +5174,13 @@ private impl_member(c: *Checker, name: string) -> Option[MemberRef]
             val names = d.variants[0].field_names
             for i in 0..<names.len()
                 if names[i] == name then return Some(DataFieldOf(i))
+    // Adding to a class built from its parameters, or to another module's class, the class's
+    // visible fields and methods are in scope as in its own body.
+    if fields_class(c) is Some(k)
+        if class_field(c, k, name) is Some(i)
+            if field_visible(c, c.classes[k].fields[i]) then return Some(FieldOf(i))
+        val own = methods_named(c, k, name)
+        if own.len() > 0 then return Some(MethodOf(own[0]))
     if receiver_method(c, t, name) is Some(m)
         if method_visible(c, m) then return Some(MethodOf(m))
     // Inside a method an impl adds to a trait, the receiver is a `Self`: the trait's `val`s and
@@ -4885,7 +5197,8 @@ private bare_methods(c: *Checker, name: string) -> Buf[usize]
     if enclosing_class(c) is Some(k) then return with_trait_methods(c, own_class_type(c.classes[k], k), name, methods_named(c, k, name))
     c.symbols[c.body.root].receiver match
         Some(t) ->
-            val own = if is_trait_self(t) then bound_methods(c, t, name) else visible_methods(c, receiver_methods(c, t, name))
+            var own = if is_trait_self(t) then bound_methods(c, t, name) else visible_methods(c, receiver_methods(c, t, name))
+            if fields_class(c) is Some(k) then own = methods_named(c, k, name)
             with_trait_methods(c, t, name, own)
         None -> buf()
 
@@ -5044,6 +5357,10 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Continue -> continue_expr(c, e)
     Return(value) -> return_expr(c, e, value)
     Propagate(value) -> propagate_expr(c, e, value)
+    Splice(value) ->
+        c.note(unit_of(c), e.span, "`*` after an argument passes a sequence as a repeated parameter's arguments; it is written only as the last argument of a call to a function with one")
+        check_statement(c, value)
+        TExpr(e.span, ErrorType, UnitConst)
     Match(subject, arms) -> match_expr(c, e, subject, arms, expected, used)
     Is(_, _, _) -> check_condition(c, e).expr
     Lambda(params, body) -> lambda_expr(c, e, params, body, expected, false)
@@ -5098,7 +5415,7 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
         c.note(symbol.unit, at, "`super` calls a superclass's method, as in `super.describe()`")
         return TExpr(at, ErrorType, UnitConst)
     class_member(c, name) match
-        Some(FieldOf(i)) -> return field_read(c, at, at, self_ref(c, at), enclosing_class(c).unwrap(), i, true)
+        Some(FieldOf(i)) -> return field_read(c, at, at, self_ref(c, at), fields_class(c).unwrap(), i, true)
         Some(DataFieldOf(i)) -> return data_field_read(c, at, self_ref(c, at), i)
         Some(MethodOf(m)) ->
             var ms = bare_methods(c, name)
@@ -5309,7 +5626,7 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
 // Whether code that may use the private members of class `k` is being checked: code of the class
 // itself, or of its companion; for a data type's companion object, a method an impl adds to the type.
 private inside_class(c: *Checker, k: usize) -> bool
-    if c.classes[k].companion_data is Some(d)
+    if c.classes[k].companion_data is Some(d) && !in_extension(c)
         if c.symbols[c.body.root].receiver is Some(r)
             if *r is Data(a, _, _)
                 if a == d then return true
@@ -5585,7 +5902,7 @@ private field_place(c: *Checker, target: &Expr) -> Option[FieldPlace]
     target.kind match
         Name(n) ->
             name = n
-            k = enclosing_class(c).unwrap()
+            k = fields_class(c).unwrap()
             object = self_ref(c, target.span)
         Member(t, n) ->
             name = n
@@ -7149,6 +7466,27 @@ is_array_class(k: ClassSymbol) -> bool = k.module_name == CoreModule && k.name =
 /** Whether a class is the core library's `Vector`, whose one field is the array of its elements. */
 is_vector_class(k: ClassSymbol) -> bool = k.module_name == CoreModule && k.name == "Vector" && !k.decl.object
 
+/** Whether a function's last parameter is repeated, `values: T*`. */
+declares_variadic(f: &Function) -> bool = f.params.len() > 0 && f.params[f.params.len() - 1].variadic
+
+/** `Vector[t]`: inside its function, a repeated parameter of element type `t` is a vector. */
+private vector_of(c: *Checker, t: &Type) -> &Type = core_class_of(c, "Vector", t)
+
+/** The core library's generic class or trait `name`, of the one type argument `t`. */
+private core_class_of(c: *Checker, name: string, t: &Type) -> &Type
+    c.class_types.get(qualified(CoreModule, name)) match
+        Some(k) ->
+            var args: Buf[&Type] = buf()
+            args.push(t)
+            Class(k, name, args)
+        None -> ErrorType
+
+/** The element type of a repeated parameter, from its type `Vector[T]` with the call's type
+ * arguments in place. */
+private repeated_element(t: &Type) -> &Type = *t match
+    Class(_, _, args) -> if args.len() == 1 then args[0] else ErrorType
+    _ -> ErrorType
+
 /** Whether `k` is one of the core library's classes whose objects are arrays: `Array`, or the
  * read-only `FrozenArray` a vector keeps its elements in. Their methods may be array intrinsics. */
 private is_array_storage(k: ClassSymbol) -> bool =
@@ -7347,7 +7685,7 @@ private call_function(c: *Checker, at: Span, name_span: Span, id: usize, args: B
 
 private function_signature(c: *Checker, id: usize, result: &Type) -> Signature
     val f = c.symbols[id]
-    Signature(f.name, true, f.type_params, f.type_owner, f.params, f.param_names, f.defaults, result, buf(), None)
+    Signature(f.name, true, f.type_params, f.type_owner, f.params, f.param_names, f.defaults, result, buf(), None, declares_variadic(f.decl))
 
 /** The overload a call chooses, if it chooses one, and its arguments as checked while choosing: one
  * entry per written argument, `None` for one left to be checked against the chosen parameter. */
@@ -7399,12 +7737,12 @@ private choose(c: *Checker, at: Span, name_span: Span, name: string, ids: Buf[us
         c.note(unit, name_span, s"no overload of `$name` accepts these arguments; the overloads are ${overload_list(c, ids)}")
         return Choice(None, typed)
     for j in 0..<args.len()
-        val value = args[j].value
+        val value = argument_value(args[j])
         var delayed = false
         var agree = true
-        val shared = views[0][bindings[0].targets[j].unwrap()]
+        val shared = argument_type(c, bound_signatures[0], views[0], bindings[0], args, j).unwrap()
         for k in 0..<bound.len()
-            val p = views[k][bindings[k].targets[j].unwrap()]
+            val p = argument_type(c, bound_signatures[k], views[k], bindings[k], args, j).unwrap()
             if *p is ByName(_) then delayed = true
             if bound_signatures[k].type_params.len() > bound_signatures[k].known.len() || !same_type(p, shared) then agree = false
         if takes_parameter_type(value) || is_literal(value) then typed.push(None)
@@ -7412,12 +7750,17 @@ private choose(c: *Checker, at: Span, name_span: Span, name: string, ids: Buf[us
         else typed.push(Some(check_expr(c, value, if agree then Some(shared) else None)))
     var fitting: Buf[usize] = buf()
     var compared: Buf[Buf[&Type]] = buf()
+    // A candidate with a repeated parameter is chosen only where no candidate without one fits.
+    var fixed_fits = false
     for k in 0..<bound.len()
+        if !bound_signatures[k].variadic && fits_call(c, bound_signatures[k], bindings[k], args, typed, written) then fixed_fits = true
+    for k in 0..<bound.len()
+        if fixed_fits && bound_signatures[k].variadic then continue
         if !fits_call(c, bound_signatures[k], bindings[k], args, typed, written) then continue
         fitting.push(bound[k])
         var params: Buf[&Type] = buf()
-        for t in bindings[k].targets
-            params.push(views[k][t.unwrap()])
+        for j in 0..<args.len()
+            params.push(argument_type(c, bound_signatures[k], views[k], bindings[k], args, j).unwrap())
         compared.push(params)
     if fitting.len() == 0
         c.note(unit, name_span, s"no overload of `$name` accepts these arguments; the overloads are ${overload_list(c, ids)}")
@@ -7515,16 +7858,19 @@ private fits_call(c: *Checker, s: Signature, binding: Binding, args: Buf[Argumen
         unify(c, type_args[s.known.len() + i], written[i])
     var open = open_type_args(c, type_args, s.known.len())
     var ok = true
+    val params = substitute_all(s.params, s.owner, type_args)
     for j in 0..<args.len()
         if typed[j] is Some(t)
-            val p = strict(substitute(s.params[binding.targets[j].unwrap()], s.owner, type_args))
+            val p = strict(argument_type(c, s, params, binding, args, j).unwrap())
+            // A sequence spliced into a repeated parameter is any `Iterable` of its elements.
+            val spliced = args[j].value.kind is Splice(_)
             if ok && !(*t.ty is Nothing)
-                val agrees = if mentions_open(p, &open) then constrain(c, p, strict(t.ty), &open, true) else unify(c, p, strict(t.ty))
+                val agrees = if mentions_open(p, &open) || spliced then constrain(c, p, strict(t.ty), &open, true) else unify(c, p, strict(t.ty))
                 if !agrees then ok = false
     for j in 0..<args.len()
         if ok && typed[j] is None
-            val p = zonk(c, strict(substitute(s.params[binding.targets[j].unwrap()], s.owner, type_args)))
-            if !open_argument_fits(args[j].value, p) then ok = false
+            val p = zonk(c, strict(argument_type(c, s, params, binding, args, j).unwrap()))
+            if !open_argument_fits(argument_value(args[j]), p) then ok = false
     restore_vars(c, saved)
     ok
 
@@ -7763,7 +8109,10 @@ private takes_one_argument(c: *Checker, ms: Buf[usize]) -> bool
     for m in ms
         val s = c.symbols[m]
         var required = 0usize
+        // A repeated parameter takes zero arguments or more, so it is never required.
+        val repeated = declares_variadic(s.decl)
         for i in 1..<s.params.len()
+            if repeated && i + 1 == s.params.len() then continue
             if i >= s.defaults.len() || s.defaults[i] is None then required += 1
         if required <= 1 && s.params.len() >= 2 then return true
     false
@@ -7855,7 +8204,7 @@ private method_signature(c: *Checker, receiver: &TExpr, m: usize, result: &Type)
         params.push(with_self(c, m, receiver.ty, target.params[i]))
         names.push(target.param_names[i])
         defaults.push(if i < target.defaults.len() then target.defaults[i] else None)
-    Signature(target.decl.name, true, target.type_params, target.type_owner, params, names, defaults, with_self(c, m, receiver.ty, result), known, Some(receiver))
+    Signature(target.decl.name, true, target.type_params, target.type_owner, params, names, defaults, with_self(c, m, receiver.ty, result), known, Some(receiver), declares_variadic(target.decl))
 
 /** Type `t` of method `m` with the `Self` of a trait declaring `m` as the receiver's type. */
 private with_self(c: *Checker, m: usize, receiver_type: &Type, t: &Type) -> &Type
@@ -7877,6 +8226,10 @@ private refuse_unmet_conformance(c: *Checker, at: Span, receiver_type: &Type, m:
     // A method an impl with bounds of its own adds to a trait needs the trait's arguments, as the
     // receiver has them, to meet those bounds.
     if trait_method_of(c, m) is Some(tm)
+        // One an impl adds to a type built from its parameters needs the receiver to match it.
+        if added_args(c, t, tm) is None
+            c.note(unit_of(c), at, s"`${symbol.decl.name}` is for ${added_target_phrase(tm)}; this is `${type_name(t)}`")
+            return true
         val known = receiver_type_args(c, t, m)
         val f = conformances(c)
         for i in 0..<tm.impl_params
@@ -7972,17 +8325,17 @@ private operand_first(c: *Checker, name_span: Span) -> bool
 // receiver is seen as an instance of that class.
 private receiver_type_args(c: *Checker, receiver_type: &Type, m: usize) -> Buf[&Type]
     val t = zonk(c, receiver_type)
-    // A method an impl adds to a trait takes the trait's arguments as the receiver sees it, then the
-    // receiver's own type as `Self`.
+    // A method an impl adds to a trait takes the impl's arguments as the receiver's type gives them
+    // in the type the impl adds to, then the receiver's own type as `Self`; one an impl adds to a
+    // data type, a class or a built-in type built from its parameters has no `Self`.
     if trait_method_of(c, m) is Some(tm)
         var args: Buf[&Type] = buf()
-        if trait_view(c, t, tm.trait_id) is Some(up)
-            if *up is Class(_, _, a)
-                for x in a
-                    args.push(x)
+        if added_args(c, t, tm) is Some(found)
+            for x in found
+                args.push(x)
         while args.len() < tm.impl_params
             args.push(ErrorType)
-        args.push(t)
+        if tm.on_trait then args.push(t)
         return args
     // A method of an impl for every integer width takes the receiver's width as its parameter.
     if c.symbols[m].type_owner == integer_owner()
@@ -8046,7 +8399,7 @@ private construct(c: *Checker, at: Span, name_span: Span, v: VariantRef, args: B
     val d = c.data[v.data]
     val variant = d.variants[v.index]
     val called = variant.fields.len() > 0
-    val signature = Signature(variant.name, called, d.decl.type_params, data_owner(v.data), variant.fields, variant.field_names, variant.defaults, own_type(d, v.data), buf(), None)
+    val signature = Signature(variant.name, called, d.decl.type_params, data_owner(v.data), variant.fields, variant.field_names, variant.defaults, own_type(d, v.data), buf(), None, false)
     val applied = apply(c, at, name_span, signature, args, explicit, expected, buf())
     applied.wrap(at, Construct(v.index, applied.args))
 
@@ -8068,6 +8421,9 @@ private struct Signature
     known: Buf[&Type]
     /** A method's receiver, as the call holds it: its defaults take it before the parameters. */
     receiver: Option[&TExpr]
+    /** Whether the last parameter is repeated: its type is `Vector[T]`, and the call gives it any
+     * number of `T`s, or one sequence spliced with `xs*`. */
+    variadic: bool
 
 /** A call's arguments, one per parameter in parameter order, its solved type arguments, and its
  * result type. `prelude` evaluates what the call needs first: the written arguments in the order
@@ -8115,8 +8471,12 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
     var fits = true
     var named = false
     var positional = 0usize
+    // A repeated parameter takes every positional argument from its position on, or one sequence
+    // spliced with `xs*` as the only one.
+    val repeated: Option[usize] = if s.variadic then Some(s.params.len() - 1) else None
     for j in 0..<args.len()
         val a = args[j]
+        val spliced = a.value.kind is Splice(_)
         a.name match
             None ->
                 if named
@@ -8125,6 +8485,23 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
                     targets.push(None)
                     continue
                 positional += 1
+                if repeated is Some(r)
+                    if j >= r
+                        if spliced && (j != r || j + 1 < args.len())
+                            if report then c.note(unit, a.span, s"a spliced sequence is the only argument of the repeated parameter `${s.names[r]}`; write the other elements into the sequence")
+                            fits = false
+                        elif !spliced && j > r && args[r].value.kind is Splice(_)
+                            fits = false
+                        if slots[r] is None then slots.set(r, Some(j))
+                        targets.push(Some(r))
+                        continue
+                if spliced
+                    if report
+                        val given = if j < s.params.len() then s"`${s.names[j]}`, which is not repeated" else "no parameter"
+                        c.note(unit, a.span, s"`*` passes a sequence to a repeated parameter, but this argument of `${s.name}` is given to $given")
+                    fits = false
+                    targets.push(None)
+                    continue
                 if j < s.params.len()
                     slots.set(j, Some(j))
                     targets.push(Some(j))
@@ -8134,6 +8511,14 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
                 var k: Option[usize] = None
                 for i in 0..<s.names.len()
                     if s.names[i] == n && n != "_" then k = Some(i)
+                if k is Some(i) && repeated == Some(i)
+                    if report then c.note(unit, a.span, s"`$n` is a repeated parameter, given its arguments by position: `${s.name}(…, a, b)` or `${s.name}(…, xs*)`")
+                    fits = false
+                    targets.push(None)
+                    continue
+                if spliced
+                    if report then c.note(unit, a.span, "`*` passes a sequence to a repeated parameter, by position, not to a named argument")
+                    fits = false
                 k match
                     None ->
                         if report then c.note(unit, a.span, s"`${s.name}` has no $noun `$n`")
@@ -8150,7 +8535,7 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
     var has_defaults = false
     for d in s.defaults
         if d is Some(_) then has_defaults = true
-    if positional > s.params.len()
+    if positional > s.params.len() && !s.variadic
         if report then c.note(unit, at, s"`${s.name}` takes ${count(s.params.len(), "argument")}, not $positional")
         return Binding(slots, targets, false)
     // A call already reported for a misplaced or misnamed argument is not also reported for the
@@ -8158,11 +8543,13 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
     if !fits then return Binding(slots, targets, false)
     var missing: Buf[string] = buf()
     for i in 0..<s.params.len()
-        if slots[i] is None && s.defaults[i] is None then missing.push(s.names[i])
+        if slots[i] is None && s.defaults[i] is None && repeated != Some(i) then missing.push(s.names[i])
     if missing.len() > 0
         fits = false
         if !report then return Binding(slots, targets, false)
-        if !named && !has_defaults
+        if !named && !has_defaults && s.variadic
+            c.note(unit, at, s"`${s.name}` takes at least ${count(s.params.len() - 1, "argument")}, not ${args.len()}")
+        elif !named && !has_defaults
             c.note(unit, at, s"`${s.name}` takes ${count(s.params.len(), "argument")}, not ${args.len()}")
         else
             for m in missing
@@ -8181,7 +8568,7 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     val params = s.params
     val result = s.result
     val known = s.known
-    val binding = bind_arguments(c, at, s, args, true)
+    var binding = bind_arguments(c, at, s, args, true)
     val first = c.vars.len()
     var type_args: Buf[&Type] = buf()
     for i in 0..<type_params.len()
@@ -8198,10 +8585,14 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     val declared = substitute(result, owner, type_args)
     if expected is Some(want) then unify(c, declared, want)
     var targets: Buf[Option[&Type]] = buf()
-    for t in binding.targets
-        targets.push(if t is Some(i) then Some(wanted[i]) else None)
+    for j in 0..<binding.targets.len()
+        targets.push(argument_type(c, s, wanted, binding, args, j))
     var open = open_type_args(c, type_args, known.len())
-    val typed = check_arguments(c, args, targets, checked, &open)
+    // Binding has placed, or reported, each spliced sequence, which is checked as the sequence it is.
+    var passed_args: Buf[Argument] = buf()
+    for a in args
+        passed_args.push(Argument(a.span, a.name, argument_value(a)))
+    var typed = check_arguments(c, passed_args, targets, checked, &open)
     // A type argument the arguments settled settles those its bounds name: `[S: Source[A], A]`
     // takes `A` from the source `S` is.
     for i in known.len()..<type_params.len()
@@ -8245,6 +8636,12 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     var ty = zonk(c, declared)
     for t in typed
         if *t.ty is Nothing then ty = Nothing
+    // The arguments of a repeated parameter become one vector, made where the first of them is
+    // written, or after the others when there are none.
+    if s.variadic && binding.fits
+        val packed = pack_repeated(c, at, wanted, binding, args, typed)
+        typed = packed.typed
+        binding = packed.binding
     // Arguments written in parameter order with none omitted are passed as they are; otherwise each
     // written argument is held in a local, in the order written, and the omitted ones' defaults are
     // computed after them, in parameter order, each from the parameters before it.
@@ -8281,6 +8678,104 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
                 prelude.push(TExpr(at, Unit, Let(local, TExpr(at, wanted_ty, Call(default, before, default_type_args(c, s, default, solved))))))
                 passed.push(TExpr(at, wanted_ty, Local(local)))
     Applied(passed, solved, ty, prelude, false)
+
+/** The type written argument `j` is checked against, of the parameter types `params` (with the
+ * call's type arguments in place): its parameter's, or for an argument of a repeated parameter of
+ * type `Vector[T]`, the element type `T`; a sequence spliced into it is any `Iterable[T]`. None for
+ * an argument that fits no parameter. */
+private argument_type(c: *Checker, s: Signature, params: Buf[&Type], binding: Binding, args: Buf[Argument], j: usize) -> Option[&Type]
+    val i = binding.targets[j] match
+        Some(i) -> i
+        None -> return None
+    if !s.variadic || i + 1 != params.len() then return Some(params[i])
+    val element = repeated_element(params[i])
+    if args[j].value.kind is Splice(_) then Some(core_class_of(c, "Iterable", element)) else Some(element)
+
+/** The expression an argument passes: the sequence itself for one spliced with `xs*`. */
+private argument_value(a: Argument) -> &Expr = a.value.kind match
+    Splice(inner) -> inner
+    _ -> a.value
+
+/** A call's checked arguments and their binding after a repeated parameter's are made one vector. */
+private struct Packed
+    typed: Buf[&TExpr]
+    binding: Binding
+
+// Replaces the arguments of the repeated parameter, the last of `params`, with the vector they make,
+// at the place of the first of them; with none, an empty vector follows the other arguments.
+private pack_repeated(c: *Checker, at: Span, params: Buf[&Type], binding: Binding, args: Buf[Argument], typed: Buf[&TExpr]) -> Packed
+    val r = params.len() - 1
+    val element = zonk(c, repeated_element(params[r]))
+    var out: Buf[&TExpr] = buf()
+    var targets: Buf[Option[usize]] = buf()
+    var items: Buf[&TExpr] = buf()
+    var spliced: Option[&TExpr] = None
+    var place: Option[usize] = None
+    for j in 0..<typed.len()
+        if binding.targets[j] == Some(r)
+            if place is None
+                place = Some(out.len())
+                out.push(typed[j])
+                targets.push(Some(r))
+            if args[j].value.kind is Splice(_) then spliced = Some(typed[j]) else items.push(typed[j])
+        else
+            out.push(typed[j])
+            targets.push(binding.targets[j])
+    val vector = repeated_vector(c, at, element, items, spliced)
+    place match
+        Some(k) -> out.set(k, vector)
+        None ->
+            out.push(vector)
+            targets.push(Some(r))
+    var slots: Buf[Option[usize]] = buf()
+    for _ in params
+        slots.push(None)
+    for k in 0..<targets.len()
+        if targets[k] is Some(i) then slots.set(i, Some(k))
+    Packed(out, Binding(slots, targets, true))
+
+// The vector a repeated parameter of element type `element` receives: `items` in order, through the
+// core library's vector builder, or the sequence `spliced` as a vector. A spliced vector of that very
+// type is passed as it is; any other sequence is copied.
+private repeated_vector(c: *Checker, at: Span, element: &Type, items: Buf[&TExpr], spliced: Option[&TExpr]) -> &TExpr
+    val unit = unit_of(c)
+    val vector = vector_of(c, element)
+    if spliced is Some(xs)
+        if same_type(zonk(c, xs.ty), vector) || *xs.ty is Nothing || *xs.ty is ErrorType then return xs
+    val o = c.class_types.get(qualified(CoreModule, "Vector")) match
+        Some(k) -> c.classes[k].companion
+        None -> None
+    val companion = o match
+        Some(o) -> o
+        None ->
+            c.note(unit, at, "a repeated parameter needs the core library's `Vector`")
+            return TExpr(at, ErrorType, UnitConst)
+    val builder = call_method(c, at, at, global_read(c, at, c.classes[companion].global.unwrap()), "builder", methods_named(c, companion, "builder"), buf(), None, None, false)
+    *zonk(c, builder.ty) match
+        Class(_, _, a) -> if a.len() == 1 then unify(c, a[0], element)
+        _ -> return TExpr(at, ErrorType, UnitConst)
+    val held = hidden_local(c, builder.ty)
+    val receiver = TExpr(at, builder.ty, Local(held))
+    var steps: Buf[&TExpr] = buf()
+    steps.push(TExpr(at, Unit, Let(held, builder)))
+    val adding = if spliced is Some(_) then "addAll" else "add"
+    val ms = methods_of(c, builder.ty, adding)
+    if ms.len() != 1
+        c.note(unit, at, s"${type_name(builder.ty)} has no one `$adding` method to take a repeated parameter's arguments")
+        return TExpr(at, ErrorType, UnitConst)
+    val type_args = receiver_type_args(c, builder.ty, ms[0])
+    var given = items
+    if spliced is Some(xs)
+        given = buf()
+        given.push(xs)
+    for item in given
+        var call_args: Buf[&TExpr] = buf()
+        call_args.push(receiver)
+        call_args.push(item)
+        steps.push(TExpr(item.span, Unit, method_call_kind(c, builder.ty, ms[0], call_args, type_args, false)))
+    val result = call_method(c, at, at, receiver, "result", methods_of(c, builder.ty, "result"), buf(), None, None, false)
+    steps.push(result)
+    TExpr(at, zonk(c, result.ty), Block(steps))
 
 // The type arguments of a call of `default`, a default of the function `s` describes, made by a call
 // that solved `solved`. A method that overrides another takes that one's defaults, which belong to the
@@ -8321,7 +8816,7 @@ private check_arguments(c: *Checker, args: Buf[Argument], wanted: Buf[Option[&Ty
                         // once, at the call, by one that takes it strictly.
                         if param is Some(p)
                             if *given.ty is ByName(_) && !(*zonk(c, p) is ByName(_)) then t = evaluated(given)
-                            val agrees = *t.ty is Nothing || (if mentions_open(p, open) then constrain(c, p, t.ty, open, true) else unify(c, p, t.ty))
+                            val agrees = *t.ty is Nothing || constrain(c, p, t.ty, open, true)
                             if !agrees
                                 c.note(unit_of(c), value.span, mismatch(c, zonk(c, p), t.ty))
                         early.set(i, Some(t))
