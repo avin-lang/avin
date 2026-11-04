@@ -216,6 +216,40 @@ position of its own (`trait_slot` of it is the overridden method's), and among t
 or data type inherits under one name, one that another of them overrides, through a chain of trait
 overrides, is dropped before two remaining bodies are reported as a conflict.
 
+**Devirtualization.** Once lowering has compiled every function and filled every method table, a pass
+over the finished MIR (`devirt.sysl`) rewrites calls through tables wherever the whole program shows
+which method runs. Each rewrite runs exactly the method the table would have given, so overrides,
+open classes, impl-added methods and trait defaults keep their meaning:
+
+- **Known receiver.** A call whose receiver's descriptor is known is a direct call of what that
+  descriptor's table holds. A value's descriptor is known when it was allocated in the function, read
+  back from a local slot whose every store is an object of that one descriptor (a slot whose address
+  is passed on is never followed), or returned by a function whose every `return` yields an object of
+  one descriptor. Function results are solved together, from "undetermined" down through "one
+  descriptor" to "unknown", until nothing changes. So `val s: Shape = Rect(2, 3); s.area()` is direct,
+  and so are `hasNext` and `next` on the iterator a sequence's `iterator()` makes: `for` keeps its
+  settled meaning, a traversal through `iterator()`, and its calls become direct and inlinable.
+- **One implementation.** A call is direct when every descriptor in the program of a type conforming
+  to the receiver's class or trait, at any type arguments, holds one and the same method at the call's
+  position. A trait with one implementing class, or an open class no subclass overrides, needs no
+  table load. A boxed value's descriptor belongs to no class or data type, so it always counts as a
+  method of its own.
+- **Guarded.** Otherwise, when the descriptors of the types the receiver's exact static type admits
+  hold at most 8 different methods (16 descriptors), each of at most 40 MIR instructions, the call
+  reads the receiver's descriptor and compares it with each of theirs in turn; a match calls that
+  method directly, and an object of any other descriptor takes the method from its table as before.
+  The result meets in a slot of its own. Measured at `-O2`, a guard pays only when the methods are
+  small enough for LLVM to inline: before a call that stays a call, the compares cost what the table
+  load they replace saved. So a `Vector`'s `apply`, whose depth classes each walk their part of the
+  tree, keeps its table call.
+
+Calls through more methods, through larger ones, and on receivers of type `Any` stay as they were,
+as does a call whose method returns nothing where the method it overrides returns a value (an
+override yielding `Nothing`): its machine signature is not the call's.
+Every function of the program is emitted with internal linkage, since nothing outside the module calls
+one by name; that lets LLVM inline a method into each caller and drop the copy, which is what makes the
+direct calls pay.
+
 A method with type parameters of its own, a trait's or an overridable class method, holds a
 position in the checker's tables like any other, but no one function fills it: each list of its own
 type arguments is a different function. Lowering leaves its position empty and gives the method a

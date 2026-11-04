@@ -27,6 +27,7 @@ main()
     print(shapes.map(area).sum())
 ```
 
+- [The AVIN philosophy](/spec/philosophy/): Abstraction, Versatility, Intuition and Naturalness
 - [The specification](/spec/), starting with its [design choices](/spec/design/)
 - [The compiler architecture](/compiler/) and [roadmap](/compiler/roadmap/)
 - [Getting started](/getting-started/)

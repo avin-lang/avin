@@ -1,0 +1,152 @@
+module dev.avinlang.grammar
+@tests
+
+import sh.sysl.highlighter.{Highlighter, from_json}
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8, from_utf8_unchecked, join, split}
+
+// The editor grammar, editors/vscode/syntaxes/avin.tmLanguage.json, run on the tokenizer an editor
+// uses, against annotated samples in samples/.
+//
+// A sample is Avin source with annotation lines under the lines they describe:
+//
+//     val total = count + 1
+//     // <--- keyword.declaration.avin
+//     //  ^^^^^ variable.other.definition.avin
+//     //                ^ keyword.operator.avin -comment
+//
+// The carets mark columns of the nearest line above that is not an annotation, and `<-` with k
+// dashes marks the first k columns, which no caret can reach. Every token overlapping the marked
+// columns must carry each named scope exactly, and must carry no scope starting with a name written
+// after `-`. An annotation is itself a line comment, so a sample stays a valid Avin file.
+
+private avin() -> Highlighter =
+    from_json(from_utf8(embed("../../../../vscode/syntaxes/avin.tmLanguage.json")).expect("the grammar is UTF-8")).expect("the grammar loads")
+
+/** The columns an annotation marks, as `[from, to)`, and the text after the marks; None when the line
+ * is not an annotation. */
+private struct Marks
+    from: usize
+    to: usize
+    scopes: string
+
+private marks(line: string) -> Option[Marks]
+    val b = line.bytes
+    var i: usize = 0
+    while i < b.len && b[i] == u8(' ') do i += 1
+    if i + 1 >= b.len || b[i] != u8('/') || b[i + 1] != u8('/') then return None
+    i += 2
+    while i < b.len && b[i] == u8(' ') do i += 1
+    if i >= b.len then return None
+    var from: usize = 0
+    var to: usize = 0
+    if b[i] == u8('^')
+        from = i
+        while i < b.len && b[i] == u8('^') do i += 1
+        to = i
+    elif b[i] == u8('<') && i + 1 < b.len && b[i + 1] == u8('-')
+        i += 1
+        while i < b.len && b[i] == u8('-')
+            i += 1
+            to += 1
+    else
+        return None
+    if i >= b.len || b[i] != u8(' ') then return None
+    Some(Marks(from, to, from_utf8_unchecked(b[i + 1..<b.len])))
+
+/** Whether `name` is one scope of `scopes`, or, with `prefix`, whether one starts with it. */
+private carries(scopes: Buf[string], name: string, prefix: bool) -> bool
+    for s in scopes.view()
+        if s == name || prefix && s.starts_with(name) then return true
+    false
+
+/** Checks every annotation of `sample`. */
+private check(sample_name: string, sample: string)
+    val failures = failures_of(sample_name, sample)
+    assert(failures.len() == 0, join(failures.view(), "\n"))
+
+/** Every claim of `sample`'s annotations that the grammar does not meet; a sample with no claims is
+ * one failure. */
+private failures_of(sample_name: string, sample: string) -> Buf[string]
+    val h = avin()
+    val lines = split(sample, "\n")
+    val tokens = h.tokens(sample)
+    var failures: Buf[string] = buf()
+    var claims: usize = 0
+    var target: usize = 0
+    var seen = false
+    for n in 0..<lines.len
+        marks(lines[n]) match
+            None ->
+                target = n
+                seen = true
+            Some(m) ->
+                assert(seen, s"${sample_name}:${n + 1}: an annotation with no line above it")
+                for want in split(m.scopes, " ")
+                    if want.len == 0 then continue
+                    claims += 1
+                    val negated = want.starts_with("-")
+                    val name = if negated then from_utf8_unchecked(want.bytes[1..<want.len]) else want
+                    var at: usize = 0
+                    var covered = false
+                    for t in tokens[target].view()
+                        val stop = at + t.text.len
+                        if stop > m.from && at < m.to
+                            covered = true
+                            if carries(t.scopes, name, negated) == negated
+                                failures.push(s"${sample_name}:${n + 1}: '${t.text}' ${if negated then "carries" else "lacks"} ${name}: ${join(t.scopes.view(), " ")}")
+                        at = stop
+                    if !covered then failures.push(s"${sample_name}:${n + 1}: the marked columns are past the end of line ${target + 1}")
+    if claims == 0 then failures.push(s"${sample_name} makes no claims")
+    failures
+end failures_of
+
+@test("avin grammar: loads with every pattern compiled")
+loads_clean()
+    val h = avin()
+    assert(h.load_warnings().len() == 0, join(h.load_warnings().view(), "; "))
+
+@test("avin grammar: an annotation names its columns")
+reads_marks()
+    val caret = marks("//   ^^^ a.b -c").unwrap()
+    assert(caret.from == 5 && caret.to == 8 && caret.scopes == "a.b -c")
+    val start = marks("// <--- x").unwrap()
+    assert(start.from == 0 && start.to == 3 && start.scopes == "x")
+    assert(marks("// an ordinary comment") is None)
+    assert(marks("val x = 1") is None)
+
+@test("avin grammar: a claim the grammar does not meet is a failure")
+reports_failures()
+    assert(failures_of("t", "val x = 1\n// <--- keyword.declaration.avin\n").len() == 0)
+    assert(failures_of("t", "val x = 1\n// <--- comment.line.double-slash.avin\n").len() == 1)
+    assert(failures_of("t", "val x = 1\n// <--- -keyword\n").len() == 1)
+    assert(failures_of("t", "val x = 1\n// <--- keyword.declaration\n").len() == 1)
+    assert(failures_of("t", "val x = 1\n//           ^ keyword.declaration.avin\n").len() == 1)
+    assert(failures_of("t", "val x = 1\n// nothing claimed\n").len() == 1)
+
+@test("avin grammar: comments")
+comments() = check("comments.avin", from_utf8(embed("../../../samples/comments.avin")).unwrap())
+
+@test("avin grammar: keywords and modifiers")
+keywords() = check("keywords.avin", from_utf8(embed("../../../samples/keywords.avin")).unwrap())
+
+@test("avin grammar: declarations")
+declarations() = check("declarations.avin", from_utf8(embed("../../../samples/declarations.avin")).unwrap())
+
+@test("avin grammar: types")
+types() = check("types.avin", from_utf8(embed("../../../samples/types.avin")).unwrap())
+
+@test("avin grammar: numbers")
+numbers() = check("numbers.avin", from_utf8(embed("../../../samples/numbers.avin")).unwrap())
+
+@test("avin grammar: strings and characters")
+strings() = check("strings.avin", from_utf8(embed("../../../samples/strings.avin")).unwrap())
+
+@test("avin grammar: interpolation")
+interpolation() = check("interpolation.avin", from_utf8(embed("../../../samples/interpolation.avin")).unwrap())
+
+@test("avin grammar: operators")
+operators() = check("operators.avin", from_utf8(embed("../../../samples/operators.avin")).unwrap())
+
+@test("avin grammar: annotations")
+annotations() = check("annotations.avin", from_utf8(embed("../../../samples/annotations.avin")).unwrap())
