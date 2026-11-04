@@ -64,7 +64,7 @@ second `--` included.
 
 ### The environment and the platform
 
-**Proposed.** What a program asks about where it runs is a function of `avin.process`, beside `env`;
+What a program asks about where it runs is a function of `avin.process`, beside `env`;
 there is no module for the environment alone and no store of properties. Each fact the platform
 knows is asked for by name, and a program's own settings are its own values.
 
@@ -84,7 +84,7 @@ Text ends lines with `\n` on every platform, so there is no line separator to as
 
 ### Commands
 
-**Proposed.** A `Command` is another program to run: a program and its arguments, the directory and
+A `Command` is another program to run: a program and its arguments, the directory and
 variables it runs with and where its streams go, made first and run when asked. Commands combine into
 pipelines and sequences, and what combines is again a command.
 
@@ -237,7 +237,7 @@ the terminal it was started from. `avin run` hands the program its own standard 
 
 ### `Source`
 
-**Proposed.** A `Source` is text to be read from somewhere, so one function can read a file, a string
+A `Source` is text to be read from somewhere, so one function can read a file, a string
 or standard input alike.
 
 ```text
@@ -365,7 +365,7 @@ in the proleptic Gregorian calendar.
 
 ## `avin.math`
 
-**Proposed.** The elementary functions on `real`, and the constants `Pi` and `E`. They are functions
+The elementary functions on `real`, and the constants `Pi` and `E`. They are functions
 of the module rather than methods, called through it or imported by name:
 
 ```text
@@ -401,7 +401,7 @@ of `real` itself, its infinities and NaN, are on the type: `real.PositiveInfinit
 
 ## `avin.random`
 
-**Proposed.** Pseudo-random numbers: a generator a program seeds to replay a run, or lets the platform
+Pseudo-random numbers: a generator a program seeds to replay a run, or lets the platform
 seed.
 
 ```text
@@ -442,7 +442,7 @@ rest, so a key, a token or a password is never taken from it.
 
 ## `avin.net`
 
-**Proposed.** TCP connections, URLs, and a small HTTP client. Every operation that can fail answers a
+TCP connections, URLs, and a small HTTP client. Every operation that can fail answers a
 `Result[T, IoError]`, and a connection that is reading or writing waits safe for the collector.
 
 ```text
@@ -505,7 +505,7 @@ reaches one.
 
 ## Concurrency
 
-**Proposed.** Futures and promises stay in [`avin.threads`](/spec/threads/#futures), beside the
+Futures and promises stay in [`avin.threads`](/spec/threads/#futures), beside the
 threads and locks they are built on; there is no separate module for them. What a program writing
 with futures reaches for is there, under these names:
 
