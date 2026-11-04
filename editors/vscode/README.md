@@ -5,6 +5,13 @@ comment toggling, bracket and quote pairing, indentation after a line that opens
 indentation, and, through `avin lsp`, whatever the language server offers: diagnostics as you type,
 hover, go to definition, document symbols.
 
+Literate files, ending in `.lavin`, are the language *Literate Avin*: a Markdown document whose
+lines indented four columns are the program. The program blocks are highlighted as Avin, fenced
+blocks as illustrations (as Avin when the fence is marked `avin`), headings, lists and the inline
+Markdown of the prose as Markdown, and the language server answers in them as it does in `.avin`
+files, at the document's own positions. `syntaxes/lavin.tmLanguage.json` is the grammar; its tests
+are `samples/literate.lavin` in the grammar tests.
+
 *An independent Avin extension for Visual Studio Code. It is not affiliated with or endorsed by
 Microsoft or the Visual Studio Code project.*
 

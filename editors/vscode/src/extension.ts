@@ -30,7 +30,10 @@ async function start(): Promise<void> {
         options: { env: server.env, cwd: server.cwd },
     }
     const clientOptions: LanguageClientOptions = {
-        documentSelector: [{ scheme: "file", language: "avin" }],
+        documentSelector: [
+            { scheme: "file", language: "avin" },
+            { scheme: "file", language: "avin-literate" },
+        ],
         outputChannelName: "Avin",
     }
 

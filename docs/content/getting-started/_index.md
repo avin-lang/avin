@@ -40,8 +40,33 @@ in the program's directory, and the next run of an unchanged program starts it w
 again. Any change to the program's sources, the standard library, the runtime or the compiler
 builds it afresh.
 
-A program is a source file or a directory: `avin run my-program` builds every `.avin` file under
-`my-program/`. `build`, `run` and `test` all take `-O0` or `-O2`, and build at `-O2` by default.
+A program is a source file or a directory: `avin run my-program` builds every `.avin` and `.lavin`
+file under `my-program/`. `build`, `run` and `test` all take `-O0` or `-O2`, and build at `-O2` by
+default.
+
+## Literate programs
+
+A `.lavin` file is a Markdown document whose lines indented four columns are the program
+([Literate source](/spec/declarations/#literate-source) has the rules). Every command that takes a
+source file takes one, and a directory program may mix `.avin` and `.lavin` files freely.
+`examples/digits.lavin` is one. Two commands run each half of a literate system on its own:
+
+```sh
+./compiler/avin tangle examples/digits.lavin
+./compiler/avin tangle examples/digits.lavin -o digits.avin
+./compiler/avin weave examples/digits.lavin -o digits.html
+```
+
+- **`avin tangle`** prints the program with the prose stripped and the four columns taken off, line
+  for line with the document, so line 30 of what it prints is line 30 of the file. It shows exactly
+  what the compiler reads, which is the first thing to check when a literate file misbehaves: a
+  block indented that should not have been, or a fence that swallowed a function.
+- **`avin weave`** renders the document as one HTML page, with its stylesheet inside it: the prose
+  as Markdown with GitHub's extensions, and every program block, and every fenced block marked
+  `avin`, coloured by the compiler's own lexer. Without `-o` the page goes to standard output.
+
+Both read the file as a build does, so a file the compiler refuses (a tab in an indentation, a fence
+never closed) is refused with the same diagnostic, and neither needs the library or the runtime.
 
 ## Testing a program
 

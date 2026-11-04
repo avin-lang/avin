@@ -772,6 +772,19 @@ Settled by the user on 2026-11-04:
   is a continuation, not the call's trailing block. See [continuation
   lines](/spec/operators-and-control-flow/#continuation-lines).
 
+- **A `.lavin` file is literate source: a Markdown document whose lines indented four columns are
+  the program**, and the name alone decides it (an `.avin` file never reads this way). It is
+  accepted wherever an `.avin` file is: a program of one file, a file of any module of a directory
+  program or of the library, `avin test`, and the language server. The program's own indentation
+  starts after the four columns; prose between two blocks ends nothing and reads as blank lines; a
+  fenced block (` ``` ` or `~~~`) is an illustration and is not compiled; an indented block under a
+  list item is prose. Prose is blanked, not removed, so every position reported is the document's
+  own line and column. A tab in a line's indentation and a fence that is never closed are refused
+  where they are. `avin tangle` prints the program with the prose stripped, line for line; `avin
+  weave` renders the document as one HTML page, the prose as GitHub-flavoured Markdown and the
+  program coloured by the compiler's own lexer. See [literate
+  source](/spec/declarations/#literate-source).
+
 **Deferred**
 
 - Public C interoperability. Until then, C is reached through Sysl.
