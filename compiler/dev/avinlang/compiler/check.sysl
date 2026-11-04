@@ -345,6 +345,9 @@ struct Checker
     builtins: Buf[BuiltinConformance]
     /** The core library's operator and equality traits, found once every method is declared. */
     core: CoreTraits
+    /** The methods impls add to classes, which are not variance positions in a class whose fields
+     * are all immutable. */
+    impl_methods: Buf[usize]
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -370,6 +373,9 @@ end Checked
 /** The core library's module. Its public declarations are seen by every file without an import, and
  * the built-in types belong to it. */
 const CoreModule: string = "avin"
+
+/** The annotation of a core-library function whose traps report the place it is called from. */
+const TrapsAtCaller: string = "trapsAtCaller"
 
 /** What a file sees besides its own module's declarations and the core library's: each name its
  * imports bring in, bound to the qualified name of the declaration it imports. */
@@ -475,7 +481,7 @@ private check_imports(c: *Checker, unit: usize)
  * unit is one of its files. Every file sees its own module's declarations, the names it imports and
  * the core library's public declarations, in that order: an inner name hides an outer one. */
 check_program(units: Buf[SourceUnit], root_module: string) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()))
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf())
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
     // Every type is named before any is used, so a data type may refer to itself or to one
@@ -851,12 +857,15 @@ private buf1u(x: usize) -> Buf[usize]
 // An impl with bounds of its own makes a data type conform to a trait that is only a bound, as `Eq`,
 // `Ord` or `Add` are, for the type arguments that meet them. Such a conformance is decided where a
 // bound is checked; a trait that is also a type would need it decided at conversions and type
-// patterns too, which is not implemented, and neither is a class's.
+// patterns too, which is not implemented, and neither is a class's. An impl that only adds methods,
+// with bounds every type meets (`Eq`, `Hash`), holds for every type argument, so its methods may
+// compare and hash the type's elements.
 private conditional_impl_refused(c: *Checker, unit: usize, d: &ImplDecl, target: &Type, trait_type: Option[&Type]) -> bool
     val at = d.type_params[0].span
     val t = trait_type match
         Some(t) -> t
         None ->
+            if only_universal_bounds(d) then return false
             c.note(unit, at, "an impl that adds methods for some type arguments only is not implemented; bound the type's own parameters")
             return true
     if !(*target is Data(_, _, _))
@@ -879,6 +888,16 @@ private conditional_impl_refused(c: *Checker, unit: usize, d: &ImplDecl, target:
             c.note(unit, at, s"an impl with bounds of its own is implemented for traits that are only bounds, which mention `Self`; `${type_name(t)}` is also a type")
             return true
     false
+
+/** Whether every bound of the impl's type parameters is `Eq` or `Hash`, which every type meets. */
+private only_universal_bounds(d: &ImplDecl) -> bool
+    for tp in d.type_params
+        for b in tp.bounds
+            val name = b.kind match
+                Named(path, _) -> path
+                _ -> ""
+            if name != "Eq" && name != "Hash" then return false
+    true
 
 /** The traits built-in type `t` conforms to through its impls. */
 private builtin_traits(c: *Checker, t: &Type) -> Buf[&Type]
@@ -1430,9 +1449,10 @@ private declare_methods(c: *Checker, unit: usize)
             val public = entry.public
             val overrides = entry.overrides
             val file_unit = entry.unit
-            // The core library's array class declares its element operations as intrinsics.
-            val intrinsic_method = is_array_class(c.classes[id]) && f.annotations.len() > 0
-            if f.annotations.len() > 0 && !intrinsic_method then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
+            // The core library's array classes declare their element operations as intrinsics, and
+            // its methods may trap at their callers.
+            val intrinsic_method = is_array_storage(c.classes[id]) && f.annotations.len() > 0
+            if f.annotations.len() > 0 && !intrinsic_method && !only_traps_at_caller(f) then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
             if overrides then refuse_override_defaults(c, file_unit, f)
             if is_trait(c, id)
                 if !public
@@ -1496,6 +1516,7 @@ private declare_methods(c: *Checker, unit: usize)
                 continue
             val method = c.symbols.len()
             if entry.field then c.trait_fields.push(method)
+            if entry.from_impl then c.impl_methods.push(method)
             methods.push(method)
             overriding.push(overrides)
             c.symbols.push(symbol)
@@ -1534,9 +1555,10 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
             _ -> None
         None -> None
     // A built-in type's operations are intrinsics, so its impls may declare them; no other method
-    // takes an annotation.
+    // takes an annotation but the core library's `@trapsAtCaller`.
     val builtin = !(*target is Data(_, _, _))
     for a in f.annotations
+        if a.name == TrapsAtCaller then continue
         if a.name != "intrinsic" || !builtin || trait_id is Some(_)
             c.note(unit, f.name_span, "annotations on methods are not implemented")
             break
@@ -2558,7 +2580,13 @@ private check_class_variance(c: *Checker, id: usize)
         val ty = f.ty.unwrap_or(ErrorType)
         if f.mutable then variance_in(c, k.unit, params, owner, ty, 0, f.span, s"the mutable field `${f.name}`")
         else variance_in(c, k.unit, params, owner, ty, 1, f.span, s"the field `${f.name}`")
+    // An instance whose fields are all immutable holds nothing a method could store a value into,
+    // so the methods its impls add are not positions, as a `data` type's are not.
+    var immutable = true
+    for f in k.fields
+        if f.mutable then immutable = false
     for m in k.methods
+        if immutable && contains_id(c.impl_methods, m) then continue
         val symbol = c.symbols[m]
         val name = symbol.decl.name
         for j in 1..<symbol.params.len()
@@ -2964,10 +2992,16 @@ private declare_defaults(c: *Checker, id: usize)
 
 // `@intrinsic("name")` and `@sysl("path")` are the annotations this compiler gives meaning to; each
 // is valid only on a function without a body. This reads the first; `sysl_binding_of` the second.
+// The core library's `@trapsAtCaller` marks a function whose traps report the place it is called
+// from, as an operation of the language does.
 private intrinsic_of(c: *Checker, unit: usize, f: &Function) -> Option[string]
     var out: Option[string] = None
     for a in f.annotations
         if a.name == "sysl" then continue
+        if a.name == TrapsAtCaller
+            if c.units[unit].file.module_name != CoreModule then c.note(unit, a.span, s"`@$TrapsAtCaller` is for the core library's operations")
+            elif a.args.len() != 0 then c.note(unit, a.span, s"`@$TrapsAtCaller` takes no arguments")
+            continue
         if a.name != "intrinsic"
             c.note(unit, a.span, s"unknown annotation `@${a.name}`")
             continue
@@ -3975,6 +4009,7 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Assign(target, op, value, yields, op_span) -> assign_expr(c, e, target, op, value, yields, op_span)
     MultiAssign(targets, op, value, op_span) -> multi_assign_expr(c, e, targets, op, value, op_span)
     Tuple(items) -> tuple_expr(c, e, items, expected)
+    ListLit(items) -> sequence_literal(c, e, items, expected)
     TupleIndex(target, index) -> tuple_index(c, e, target, index)
     Update(target, increment, postfix, op_span) -> update_expr(c, e, target, increment, postfix, op_span)
     Binary(op, left, right, op_span) -> binary_expr(c, e, op, left, right, op_span, expected)
@@ -4862,6 +4897,90 @@ private held_element(e: &Expr, callee: &Expr, args: Buf[Argument], items: *Buf[&
         items.push(Expr(args[i].span, Binding(name, None, args[i].value, false)))
         held.push(Argument(args[i].span, args[i].name, Expr(args[i].span, Name(name))))
     HeldElement(Expr(callee.span, Name(seq)), held)
+
+// A sequence literal `[a, b, c]` is built with a builder: the collection the expected type names
+// supplies one when its companion object has a `builder` method, and otherwise the literal is the
+// core library's `Vector`, whatever a `Vector` of the program's own is called. The builder is held in
+// a hidden local, given each element in order with `add`, and its `result()` is the literal's value.
+// The result is matched with the expected type first, directly or as the instance of it the
+// collection is, so `val b: Buffer[byte] = [1, 2]` gives each element the expected type `byte`;
+// without one, the elements are checked on their own and agree on a type as an `if`'s branches do.
+private sequence_literal(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Option[&Type]) -> &TExpr
+    val unit = unit_of(c)
+    val at = e.span
+    var want: Option[&Type] = None
+    if expected is Some(t) then want = Some(zonk(c, t))
+    var collection: Option[usize] = None
+    if want is Some(t)
+        if *t is Class(k, _, _)
+            if c.classes[k].companion is Some(o)
+                if methods_named(c, o, "builder").len() > 0 then collection = Some(o)
+    if collection is None
+        if c.class_types.get(qualified(CoreModule, "Vector")) is Some(k) then collection = c.classes[k].companion
+    val o = collection match
+        Some(o) -> o
+        None ->
+            for item in items
+                check_statement(c, item)
+            c.note(unit, at, "a collection literal needs the core library's `Vector`")
+            return TExpr(at, ErrorType, UnitConst)
+    val companion = global_read(c, at, c.classes[o].global.unwrap())
+    // The builder's element type is open until the expected type or the elements settle it; an
+    // empty literal with neither is reported as one.
+    val first_unknown = c.unknowns.len()
+    val builder = call_method(c, at, at, companion, "builder", methods_named(c, o, "builder"), buf(), None, None, false)
+    for i in first_unknown..<c.unknowns.len()
+        c.unknowns[i].message = "cannot infer the element type of an empty collection literal; give it a type, as in `val xs: Vector[int] = []`"
+    if *builder.ty is ErrorType
+        for item in items
+            check_statement(c, item)
+        return builder
+    val held = hidden_local(c, builder.ty)
+    val receiver = TExpr(at, builder.ty, Local(held))
+    var steps: Buf[&TExpr] = buf()
+    steps.push(TExpr(at, Unit, Let(held, builder)))
+    val result = call_method(c, at, at, receiver, "result", methods_of(c, builder.ty, "result"), buf(), None, None, false)
+    if want is Some(w)
+        if !unify(c, result.ty, w)
+            if *w is Class(k, _, _)
+                if ancestor_type(c.classes, c.data, zonk(c, result.ty), k) is Some(up) then unify(c, up, w)
+    val adds = methods_of(c, builder.ty, "add")
+    if adds.len() == 0
+        c.note(unit, at, s"${type_name(builder.ty)} has no `add` method to take the literal's elements")
+        return TExpr(at, ErrorType, UnitConst)
+    val element = zonk(c, method_signature(c, receiver, adds[0], ErrorType).params[0])
+    if *element is Var(_)
+        // No element type is expected, so the elements decide it.
+        var typed: Buf[&TExpr] = buf()
+        var agreed: Option[&Type] = None
+        for item in items
+            val t = check_expr(c, item, None)
+            typed.push(t)
+            agreed = agreed match
+                None -> Some(t.ty)
+                Some(so_far) -> join(c, so_far, t.ty) match
+                    Some(j) -> Some(j)
+                    None ->
+                        c.note(unit, item.span, s"the elements of a collection literal need a common type; ${type_name(zonk(c, so_far))} and ${type_name(zonk(c, t.ty))} have none")
+                        Some(ErrorType)
+        if agreed is Some(t) then unify(c, element, t)
+        for i in 0..<items.len()
+            var args: Buf[Argument] = buf()
+            args.push(Argument(items[i].span, None, items[i]))
+            var given: Buf[Option[&TExpr]] = buf()
+            // An element of a narrower reference type is the agreed type as it is.
+            val t = typed[i]
+            val agreed_type = zonk(c, element)
+            val same = same_type(zonk(c, t.ty), agreed_type) || *t.ty is Nothing || *t.ty is ErrorType
+            given.push(Some(if same then t else TExpr(t.span, agreed_type, t.kind)))
+            steps.push(method_call(c, items[i].span, items[i].span, receiver, adds[0], args, None, None, false, given))
+    else
+        for item in items
+            var args: Buf[Argument] = buf()
+            args.push(Argument(item.span, None, item))
+            steps.push(call_method(c, item.span, item.span, receiver, "add", adds, args, None, None, false))
+    steps.push(result)
+    TExpr(at, zonk(c, result.ty), Block(steps))
 
 // A tuple's parts take their expected types from an expected tuple of the same size. A part that
 // never finishes means the tuple is never made.
@@ -5779,6 +5898,17 @@ private return_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
 /** Whether a class is the core library's `Array`: its objects hold their length and then their
  * elements, not fields, and only the library's intrinsics make them. */
 is_array_class(k: ClassSymbol) -> bool = k.module_name == CoreModule && k.name == "Array" && !k.decl.object
+
+/** Whether `k` is one of the core library's classes whose objects are arrays: `Array`, or the
+ * read-only `FrozenArray` a vector keeps its elements in. Their methods may be array intrinsics. */
+private is_array_storage(k: ClassSymbol) -> bool =
+    k.module_name == CoreModule && (k.name == "Array" || k.name == "FrozenArray") && !k.decl.object
+
+/** Whether every annotation of `f` is `@trapsAtCaller`. */
+private only_traps_at_caller(f: &Function) -> bool
+    for a in f.annotations
+        if a.name != TrapsAtCaller then return false
+    true
 
 private is_array_type(c: *Checker, t: &Type) -> bool = *t match
     Class(k, _, _) -> is_array_class(c.classes[k])
