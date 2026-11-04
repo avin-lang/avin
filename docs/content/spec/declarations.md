@@ -265,6 +265,12 @@ A call made before the local function's declaration must not reach a local that 
 initialized there, directly or through the local functions it calls, and the function needs a
 declared result type for such a call, as it does for recursion.
 
+A local function's name is its block's: a `val`, a `var` or a pattern binding of the same name in
+the same block is an error, whether it is written before or after the function, because the
+function is visible across the whole block. A block nested inside, a lambda's body and the enclosing
+function's parameters are other scopes, and a local there may hide the function as any local hides
+an outer name. The block's own local functions of one name are overloads of each other.
+
 ## data
 
 `data` declares an algebraic data type: an immutable value with one or more variants.
