@@ -70,7 +70,9 @@ from the new thread too.
 - **`Condition`**, made by a mutex's `condition()` and waited for inside that mutex's `with`.
   `wait()` lets the mutex go while it sleeps and holds it again before it returns; `notify()` wakes
   one waiting thread and `notifyAll()` every one. A wait may end with nothing having changed, so the
-  state is checked again in a loop. Waiting from a thread that does not hold the mutex traps.
+  state is checked again in a loop. `waitFor(timeoutMillis: long) -> bool` waits at most that many
+  milliseconds and answers `false` where the time ran out first; a time that is not positive
+  answers `false` at once. Waiting from a thread that does not hold the mutex traps.
 - **`Atomic[T](value)`**, with `load`, `store`, `swap`, `compareAndSet(expected, desired) -> bool`
   and `update(f)`, and for the integers `add(n)` and `sub(n)`, each giving back the new value and
   trapping on overflow, as `+` and `-` do, before anything is stored. Every operation is
@@ -117,11 +119,60 @@ blocked on a lock, a condition, a channel, a join or input never holds up a coll
 binding declared as blocking does the same. **A deadlock is not detected**, apart from a thread
 taking a lock it already holds: threads that each wait for another sleep for ever.
 
+## Futures
+
+A `Future[T]` is a value some thread is computing. `Future(body)` runs `body` on a shared pool of
+worker threads and gives back the future of its result at once; the body is a by-name argument, so
+it is written in place or as a trailing block:
+
+```avin
+import avin.threads.Future
+
+main() -> int
+    val page = Future(fetch(url))
+    val counted = Future
+        val words = load(path).split(" ")
+        words.length()
+    val both = for p in page, n in counted yield s"${p.charCount()} characters, $n words"
+    print(both.await())
+    0
+```
+
+- **`await() -> T`** waits for the value and gives it back, the same value at every call, safe for
+  the collector while it waits. **`await(timeoutMillis: long) -> Option[T]`** waits at most that many
+  milliseconds and gives `None` where the time ran out first; a time that is not positive asks
+  without waiting. `isCompleted()` asks and `value()` gives `Some` of a value already there; neither
+  waits. Times are milliseconds as a `long`, the unit every timed wait in the library takes.
+- **The combinators never wait.** `map(f)` and `flatMap(f)` give the future of `f` of the value,
+  `f` running on a pool thread once the value is there, so a `for … yield` over futures is a future
+  too; `zip(other)` pairs two values, and `onComplete(f)` runs `f` with the value on a pool thread,
+  at once where it is already there. `Future.successful(x)` is complete from the start.
+  `Future.all(fs)` is the future of every value of an `Iterable` of futures, as a `Vector` in the
+  order given, and `Future.first(fs)` of the value of whichever completes first; the first of no
+  futures traps.
+- **A future carries no failure.** A computation that can fail returns `Future[Result[T, E]]`, and
+  such a future also has `mapOk(f)` and `flatMapOk(f)`, which go on from an `Ok` and pass an `Err`
+  through unchanged. A trap inside a body stops the program, as it does in any thread.
+- **A `Promise[T]()`** is completed by another thread: its `future` field is the future it completes,
+  `complete(x)` completes it and traps where it is already complete, and `tryComplete(x) -> bool`
+  completes it only where nothing has yet, answering whether it did, for threads that race to give
+  the value. Every thread waiting on the future wakes with the value.
+
+**The pool** is started on first use, one worker at a time as work arrives with no idle worker, up
+to one for each processor the machine offers. Its workers are never joined, so the program ends when
+`main` returns, whatever futures are pending. **A body may wait for another future.** A worker that
+waits in `await` for a value not yet there counts as not working, and where work is queued with no
+worker free, the pool starts another in its place; that one stays afterwards and is idle while there
+is nothing to do. So waits nested in bodies never leave the pool without a thread to run the future
+they wait for, however deep they go, and the pool grows only by as many workers as wait at once.
+
 ## The memory model
 
 Starting a thread happens before its body; its end happens before `join` returns; releasing a
 `Mutex` happens before the next thread takes it; a `send` happens before the `receive` that gets the
-value; and an `Atomic` store happens before every load that reads it. A program whose shared
+value; an `Atomic` store happens before every load that reads it; and completing a future happens
+before every `await` that gives its value and before every combinator's function runs with it. A
+program whose shared
 mutable state is reached only under those edges sees sequentially consistent behaviour.
 
 **A data race on a plain field or `var` is not undefined behaviour.** A racing read returns some
