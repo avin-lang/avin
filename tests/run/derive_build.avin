@@ -1,0 +1,104 @@
+// expect: exit 0
+// A template that builds values: `T.build(builder)` asks the builder for the variant, then for fields
+// in any order, each read at its own type through the builder's `field` hook. A field supplied twice
+// is the builder's `duplicate`; one never supplied takes its default, which sees the fields before
+// it, or else the builder's `missing` decides, so an absent `Option` can be `None`. Built for a
+// one-variant data type, a type of several variants, a generic type and a class.
+
+trait FromText
+    static fromText(text: string) -> Option[Self]
+    static whenMissing() -> Option[Self]
+
+impl FromText for int
+    static fromText(text: string) -> Option[int] = text.toInt()
+    static whenMissing() -> Option[int] = None
+
+impl FromText for string
+    static fromText(text: string) -> Option[string] = Some(text)
+    static whenMissing() -> Option[string] = None
+
+impl[A: FromText] FromText for Option[A]
+    static fromText(text: string) -> Option[Option[A]] = A.fromText(text).map(a -> Some(a))
+    static whenMissing() -> Option[Option[A]] = Some(None)
+
+// A decoder from name and text pairs, derived for any type.
+trait FromPairs
+    static fromPairs(pairs: Vector[(string, string)]) -> Result[Self, string]
+
+derive FromPairs for T
+    static fromPairs(pairs: Vector[(string, string)]) -> Result[T, string] = T.build(PairReader(pairs))
+
+class PairReader(pairs: Vector[(string, string)])
+    var at = 0
+    var current = ""
+
+impl ShapeBuilder[string] for PairReader
+    variant(t: TypeShape) -> Result[int, string] =
+        if t.variantCount == 1 then return Ok(0)
+        if pairs.length() == 0 then return Err("no variant")
+        val (key, name) = pairs(0)
+        if key != "kind" then return Err("expected kind first")
+        at = 1
+        t.variants.find(v -> v.name == name) match
+            Some(v) -> Ok(v.index)
+            None -> Err(s"unknown variant $name")
+    next(v: VariantShape) -> Result[Option[int], string] =
+        while at < pairs.length()
+            val (key, text) = pairs(at)
+            at += 1
+            v.fields.find(f -> f.name == key) match
+                Some(f) ->
+                    current = text
+                    return Ok(Some(f.index))
+                None -> ()
+        Ok(None)
+    duplicate(f: FieldShape) -> string = s"duplicate field ${f.name}"
+
+impl PairReader
+    field[F: FromText](f: FieldShape) -> Result[F, string] = F.fromText(current) match
+        Some(v) -> Ok(v)
+        None -> Err(s"bad ${f.name}: $current")
+    missing[F: FromText](f: FieldShape) -> Result[F, string] = F.whenMissing() match
+        Some(v) -> Ok(v)
+        None -> Err(s"missing field ${f.name}")
+
+data Person(name: string, age: int, nick: Option[string], visits: int = age * 2) derives FromPairs
+
+data Shape derives FromPairs
+    Circle(radius: int)
+    Rect(width: int, height: int)
+    Empty
+
+// A generic type's parameter is bounded by the derived trait, and here by what the hooks need too.
+data Labelled[A: FromText](label: string, value: A) derives FromPairs
+
+impl[A: FromText] FromPairs for Option[A]
+    static fromPairs(pairs: Vector[(string, string)]) -> Result[Option[A], string] = Err("not a record")
+
+impl FromPairs for int
+    static fromPairs(pairs: Vector[(string, string)]) -> Result[int, string] = Err("not a record")
+
+class Account(val owner: string, val balance: int = 7) derives FromPairs
+
+show(r: Result[Person, string]) = r match
+    Ok(p) -> print(s"${p.name} ${p.age} ${p.nick} ${p.visits}")
+    Err(e) -> print(s"error: $e")
+
+main()
+    show(Person.fromPairs([("age", "36"), ("name", "Ada")]))
+    show(Person.fromPairs([("name", "Ada"), ("other", "skipped"), ("age", "36"), ("nick", "ad"), ("visits", "1")]))
+    show(Person.fromPairs([("name", "Ada")]))
+    show(Person.fromPairs([("name", "Ada"), ("name", "Bea"), ("age", "3")]))
+    show(Person.fromPairs([("name", "Ada"), ("age", "x")]))
+    print(Shape.fromPairs([("kind", "Rect"), ("height", "3"), ("width", "2")]))
+    print(Shape.fromPairs([("kind", "Empty")]))
+    print(Shape.fromPairs([("kind", "Oval")]))
+    print(Shape.fromPairs([("kind", "Circle")]))
+    print(Labelled[int].fromPairs([("value", "5"), ("label", "five")]))
+    print(Labelled[Option[int]].fromPairs([("label", "none")]))
+    Account.fromPairs([("owner", "ed")]) match
+        Ok(a) -> print(s"${a.owner} ${a.balance}")
+        Err(e) -> print(e)
+    Account.fromPairs([("balance", "3"), ("owner", "bo")]) match
+        Ok(a) -> print(s"${a.owner} ${a.balance}")
+        Err(e) -> print(e)

@@ -1,15 +1,15 @@
 ---
-title: Derivation through shapes (proposed)
-summary: Proposed — library-defined derivation, where the compiler describes each data type and class as a shape, and a trait's own module says once how to derive it, checked at compile time and compiled per type.
+title: Derivation through shapes
+summary: Library-defined derivation, where the compiler describes each data type and class as a shape, and a trait's own module says once how to derive it, checked at compile time and compiled per type.
 weight: 25
 ---
 
-**Proposed.** Today `derives` takes only the core library's `Eq`, `Hash`, `Ord`, `Display` and
-`Debug`, whose code the compiler writes itself. This chapter lets any trait be derived. The trait's
-module writes a **derive template** once, against the **shape** the compiler gives every data type
-and class: its variants, their fields, each field's name, position, default and annotations. A type
-that says `derives JsonEncoder` gets an ordinary impl, checked like a hand-written one, compiled for
-that type alone, and reading nothing about the type at run time.
+Any trait can be derived. Besides the core library's `Eq`, `Hash`, `Ord`, `Display` and `Debug`, a
+trait's module writes a **derive template** once, against the **shape** the compiler gives every
+data type and class: its variants, their fields, each field's name, position, default and
+annotations. A type that says `derives JsonEncoder` gets an ordinary impl, compiled for that type
+alone, whose calls on the type's fields are written for each field's own type and look nothing up
+at run time.
 
 The aim is that a library such as a JSON codec is as complete written this way as written by hand:
 encoder and decoder traits, derivation for data types and classes, renamed and omitted fields,
@@ -30,9 +30,9 @@ those calls.
 | The template loops over the fields, the loop unrolled per type | A name for "this field's type" inside the loop (a path-dependent type) and a body checked anew at every expansion: a macro by another name | Rejected |
 | Descriptions read at run time | Lookups by name and boxing on every call | Rejected: cost the call site does not show |
 
-In the chosen design the template is checked once, generically, like any generic code. The only
-thing checked per type is that each field's type meets the bound the hook declares, and a failure
-there is reported at the `derives` entry, naming the field.
+The template is checked once, generically, like any generic code. What is checked for each deriving
+type is the hook: it is found on the visitor type the template names, and each field's type must
+meet the bound it declares, a failure reported at the `derives` entry, naming the field.
 
 ## Shapes
 
@@ -55,10 +55,13 @@ impl FieldShape                                 // and the same on TypeShape and
 - **A data type's shape** has one variant per variant, in declaration order, each with its fields.
   The single-line form has one variant, of the type's name.
 - **A class's shape** has one variant, of the class's name, whose fields are its constructor
-  parameters, plain, `val` and `var` alike, in order: what `derives` reads today. Fields its body
-  declares take no part. A repeated parameter is a field of type `Vector[T]`.
-- **A shape is a constant.** The compiler emits each one once, in read-only data; reading it costs a
-  load, and code that reads one where it is known [folds](#cost).
+  parameters, plain, `val` and `var` alike, in order: what the built-in derivations read. Fields
+  its body declares take no part. A repeated parameter is a field of type `Vector[T]`.
+- **A shape is made once.** The shapes of a type, its variants and its fields are module values
+  private to the type's module, made before `main` like any other; reading one costs a load. A type
+  has them where it derives a trait through a template or carries annotations, and no other does.
+- The core library declares `TypeShape`, `VariantShape`, `FieldShape`, `Annotation`, `Shaped`, and
+  the visitor and builder traits below, in the prelude's module.
 
 ## Derive templates
 
@@ -73,15 +76,22 @@ derive JsonEncoder for T
 ```
 
 - **One template per trait, in the trait's module**, as a conformance lives in the trait's or the
-  type's module. A trait without one cannot be derived: `derives X` is then an error saying that X
-  has no derivation.
+  type's module. A second template for a trait, or one in another module, is an error. A trait
+  without one cannot be derived: `derives X` is then an error saying that X has no derivation. A
+  `derives` entry finds the template in its own module, in a module its file imports from, or in
+  the core library.
 - **The body is an impl's body**: every abstract method and static member of the trait, defaults left
-  alone or replaced. `T` stands where an impl names its type, and `self` is a `T`.
+  alone or replaced, each checked against the trait's as an impl's is. `T` stands where an impl names
+  its type, and `self` is a `T`. `T` is any name the header gives.
 - **`T` conforms to the trait and to the core's `Shaped`**, and to nothing else. `Shaped` gives the
-  template the static members below. `Shaped` is named nowhere else: it is not a bound a
-  program writes.
+  template the static members below. `Shaped` is named nowhere else: written as a bound anywhere but
+  a template, it is an error.
 - **The template is checked once**, where it is declared, like any generic code; errors in it are
-  the template author's and are reported there.
+  the template author's and are reported there, and nowhere else: a type deriving a trait whose
+  template has errors reports nothing more.
+- **Each deriving type gets the template's body as its impl**, with `T` the type. Its names resolve
+  as the template's do, in the trait's module, and each call of a member of `Shaped` on `T` is
+  replaced by code written for the type's own variants and fields, which follows.
 
 ```text
 trait Shaped
@@ -109,12 +119,17 @@ value match
 
 **The field hook is not in the trait**, because its bound is the deriving library's own: a visitor
 type declares one method `field` with exactly one type parameter of its own, `field[F: Bound](f:
-FieldShape, value: F) -> Self`. The visitor's type is named where the template calls `walk`, so the
-hook is found and checked there. That each field's type meets `Bound` is checked per deriving type.
+FieldShape, value: F) -> Self`. The hook is resolved for each deriving type, on the visitor type the
+template passes to `walk`: the code written there calls it once per field, at the field's type. A
+visitor type without such a method, and a field whose type misses any of `Bound`'s traits, are
+errors at the `derives` entry, the second naming the field (`Variant.field` in a type of several
+variants). A class's fields are read from the object, plain private parameters included.
 
 `T.walkPair(a, b, v)` is the same over two values, for equality and ordering: it calls
 `v.variants(T.variantOf(a), T.variantOf(b))`, and, where the two are the same variant, `v.field(f, x,
-y)` per field with both values' fields.
+y)` per field with both values' fields; where they differ, the visitor `variants` returned is the
+result. `T.variantOf(x)` is the shape of the variant `x` is, a class's one variant for a class, and
+`T.shape()` the type's.
 
 ```text
 trait ShapePairVisitor
@@ -151,19 +166,28 @@ val x1 = …
 Ok(Variant(x0, x1))
 ```
 
+- The builder's `field` and `missing` are its hooks, found and held to the fields as a visitor's
+  `field` is; `E` is what the builder's type gives `ShapeBuilder`.
+- `variant` is asked even of a type with one variant, so a builder can read what opens a value
+  there.
 - A field never supplied takes its **default** where its declaration has one, evaluated as the
   constructor would, seeing the fields before it; otherwise the builder's `missing` decides, so a
   library can let an absent `Option` be `None`.
-- An index out of range from `variant` or `next` is a bug in the builder, and traps.
-- A class is built through its constructor. An abstract class cannot be built, nor an open one, whose
-  value could be any subclass: a template that calls `build` cannot derive for either, an error at
-  the `derives` entry naming the reason.
+- An index out of range from `variant` or `next` is a bug in the builder, and traps with a message
+  naming the type or the variant.
+- A class is built through its constructor, a repeated parameter passed as its vector. An abstract
+  class cannot be built, nor an open one, whose value could be any subclass: a template that calls
+  `build` cannot derive for either, an error at the `derives` entry naming the reason. `walk`,
+  `walkPair` and `variantOf` are allowed on both, and a subclass inherits the conformance, so it
+  walks as its superclass.
 
 ## Annotations
 
-An annotation is a **constant value of a type implementing `Annotation`**: a data value or an
-`object`, written with `@` before a type, a variant or a field. Its arguments are constants: literals,
-other constants, and data built from them, evaluated by the compiler and stored in the shape.
+An annotation is a **value of a type implementing `Annotation`**: a data value or an `object`,
+written with `@` before a type or a class (on the line before it), or a variant, a field or a class
+parameter (on the same line). Its arguments are those of a call of its name, evaluated once, before
+`main`, when the shape is made, and stored there. Traits, objects and functions take no annotations
+of this kind, nor do a function's parameters.
 
 ```text
 data JsonKey(name: string)
@@ -181,8 +205,10 @@ data Person(@JsonKey("full_name") name: string, age: int, @JsonOmit score: int =
 
 A template reads them from the shape: `f.annotation[JsonKey]()` is the field's `JsonKey`, if any;
 `f.has(JsonOmit)` whether it carries the object. An annotation no template reads is allowed; one
-whose name resolves to no type or object implementing `Annotation` is an error. The compiler's own
-annotations, `@test`, `@tests` and `@intrinsic`, stay its own and are not in shapes.
+whose name resolves to no type or object, or to one not implementing `Annotation`, is an error. A
+misused annotation, such as `@JsonOmit` on a field with no default, is not rejected while compiling:
+it fails when a value is decoded. The compiler's own annotations, `@test`, `@tests`, `@intrinsic`
+and `@sysl`, stay its own and are not in shapes.
 
 ## `derives` with a library trait
 
@@ -193,14 +219,16 @@ whose `walk` and `build` are written for `Order`'s shape.
 - **Errors name the field.** Where a field's type misses the hook's bound, the error is at the
   `derives` entry: *`Order` cannot derive `JsonEncoder`: field `lines` has type `List[Line]`, which
   does not implement `JsonEncoder`* (here because `Line` does not). Deriving a trait the type also
-  implements is an error, as today.
+  implements is an error, a conformance stated twice.
 - **Recursion needs nothing.** The derived impl is a conformance, declared before any body is
   checked, so `data Tree(label: string, children: List[Tree]) derives JsonEncoder` holds through
   `List`'s bounded impl and its own; the calls recurse at run time as hand-written ones would.
-- **Generic types derive conditionally**, as today's derived `Ord`, `Display` and `Debug` do: `data
+- **Generic types derive conditionally**, as the derived `Ord`, `Display` and `Debug` do: `data
   Box[A](item: A) derives JsonEncoder` is `impl[A: JsonEncoder] JsonEncoder for Box[A]`, each
   parameter bounded by the trait, so a `Box[int]` encodes and a `Box` of a type without an encoder
-  does not.
+  does not. Where the hook's bound is another trait, the type bounds its parameter by it itself,
+  `data Labelled[A: FromText](value: A) derives FromPairs`, and the error at the `derives` entry says
+  so.
 - **Static members are derived too.** A template's `static decode` becomes `Order.decode`, called
   through a bound as `A.decode(r)`.
 
@@ -211,11 +239,19 @@ data Person(name: string, age: int) derives JsonEncoder
 ```
 
 The derived `encode` is `Person.walk(self, FieldWriter(out, PERSON))` then `out.endObject()`, and the
-walk is `FieldWriter(…).variant(PERSON_0).field[string](NAME, name).field[int](AGE, age)`. Every call
-is direct: the visitor's type is known and each hook is compiled for one field type.
-`FieldWriter` is data, so it lives in registers, not on the heap. The shapes are constants, so
-`shape.variantCount > 1` is `false`, `f.has(JsonOmit)` is `false` and the key is `"name"`, all known
-to the compiler. At `-O2`, with the hooks inlined, what remains is exactly the hand-written encoder:
+walk is `FieldWriter(…).variant(PERSON_0).field[string](NAME, name).field[int](AGE, age)`.
+
+**What holds now.** Every call is direct: the visitor's type is known and each hook is compiled for
+one field type, so there is no call through a method table, no lookup by name and no boxing. A shape
+is read with a load of a module value. The one cost beyond the hand-written encoder is the visitor:
+`FieldWriter` is data, and data is on the heap, so each `encode` allocates it once. The compiler's
+tests hold a derived encoder to exactly this, against a hand-written one.
+
+**What two later compiler features add.** Small data that does not escape a call is to live in
+registers, so the visitor costs nothing. Constant data is to be emitted once in read-only data, so
+the shapes become constants and code reading them folds: `shape.variantCount > 1` is `false`,
+`f.has(JsonOmit)` is `false` and the key is `"name"`, all known to the compiler. With both, and the
+hooks inlined at `-O2`, what remains is exactly the hand-written encoder:
 
 ```text
 encode(out: JsonWriter) =
@@ -227,12 +263,13 @@ encode(out: JsonWriter) =
     out.endObject()
 ```
 
-At `-O0` the hook calls stay calls, with constant arguments: there are no lookups by name, no boxing
-and no allocation either way. A program that never encodes a `Person` compiles none of this.
+At `-O0` the hook calls stay calls: there are no lookups by name and no boxing either way. A program
+that never encodes a `Person` compiles none of the encoder, though it still makes `Person`'s shape
+before `main`.
 
 ## A JSON library
 
-The core of `json`, as it would be written once this exists. `JsonWriter` writes text and places the
+The core of a `json` library written with templates. `JsonWriter` writes text and places the
 commas; `JsonReader` reads tokens from a byte stream, one at a time.
 
 ```text
@@ -382,7 +419,8 @@ into a tree first and decodes from the tree, with nothing new from the language.
 
 ## The built-in derivations, re-expressed
 
-The five traits `derives` takes today fit the same mould, each a short template in the core library:
+The five traits the compiler derives itself are to be re-expressed in the same mould, each a short
+template in the core library:
 
 ```text
 derive Hash for T
@@ -407,7 +445,7 @@ impl OrdWalk
 
 `Eq` is `Ord`'s shape with `equals`; `Display` and `Debug` write `v.name`, then the fields between
 parentheses through `display` or `debug`, closing where `T.variantOf(self).fieldCount > 0`. The
-rules `derives` has today stay: a class derives `Eq` and `Hash` together; a data type's `==` and hash
+rules of the built-in derivations stay: a class derives `Eq` and `Hash` together; a data type's `==` and hash
 stay the language's own, by value, as they are for tuples; the automatic `Display` and `Debug` of
 every data type are these templates applied without asking, where a field missing the hook's bound
 leaves the type without the trait instead of being an error.

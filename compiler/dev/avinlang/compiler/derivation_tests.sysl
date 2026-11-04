@@ -1,0 +1,82 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// What a method derived through a template costs: the code written for the type's fields calls the
+// visitor's hooks directly, each compiled for one field type, with no call through a method table,
+// no lookup and no boxing. The visitor, a data value, is allocated once per call until data can live
+// in registers; a hand-written encoder allocates nothing.
+
+private lowered(text: string) -> MirProgram = lower_source(repository_toolchain(), source_of("probe.avin", text)) match
+    Ok(p) -> p
+    Err(d) -> panic(d)
+
+private function_of(program: MirProgram, name: string) -> MirFunction
+    for f in program.functions
+        if f.symbol == "<program>." + name then return f
+    panic("no function " + name)
+
+/** How a function's calls are made and what it allocates. */
+private struct Cost
+    through_tables: int
+    entries: int
+    compared: int
+    allocations: int
+    direct: Buf[string]
+
+private cost_of(program: MirProgram, name: string) -> Cost
+    var tables = 0
+    var entries = 0
+    var compared = 0
+    var allocations = 0
+    var direct: Buf[string] = buf()
+    for block in function_of(program, name).blocks
+        for inst in block.insts
+            inst match
+                MethodSlot(_, _, _) -> tables = tables + 1
+                CallEntry(_, _) -> entries = entries + 1
+                Compare(_, CmpEq, _, DescriptorAddress(_)) -> compared = compared + 1
+                Alloc(_, _) -> allocations = allocations + 1
+                Call(_, Direct(g), _) -> direct.push(program.functions[g].symbol)
+                Call(_, Runtime(entry, _), _) -> if entry == "avin_rt_alloc" then allocations = allocations + 1
+                _ -> ()
+    Cost(tables, entries, compared, allocations, direct)
+
+private calls(c: Cost, symbol: string) -> bool
+    for d in c.direct
+        if d == "<program>." + symbol then return true
+    false
+
+private const Encoder: string = "class Out\n    var text = \"\"\n    key(k: string) = text = text + k + \":\"\n    value(v: string) = text = text + v + \";\"\n\ntrait Encode\n    encode(out: Out)\n\nimpl Encode for int\n    encode(out: Out) = out.value(s\"$self\")\n\nimpl Encode for string\n    encode(out: Out) = out.value(self)\n\nderive Encode for T\n    encode(out: Out)\n        T.walk(self, FieldWriter(out))\n        ()\n\ndata FieldWriter(out: Out)\n\nimpl ShapeVisitor for FieldWriter\n    variant(v: VariantShape) -> FieldWriter = self\n\nimpl FieldWriter\n    field[F: Encode](f: FieldShape, value: F) -> FieldWriter =\n        out.key(f.name)\n        value.encode(out)\n        self\n\ndata Person(name: string, age: int) derives Encode\n\ndata Hand(name: string, age: int)\n\nimpl Hand\n    encode(out: Out) =\n        out.key(\"name\")\n        name.encode(out)\n        out.key(\"age\")\n        age.encode(out)\n\nmain()\n    val out = Out()\n    Person(\"Ada\", 36).encode(out)\n    Hand(\"Ada\", 36).encode(out)\n    print(out.text)\n"
+
+@test("a derived method calls the visitor's hooks directly, one for each field's type")
+derived_calls_are_direct()
+    val c = cost_of(lowered(Encoder), "Person.encode")
+    assert_eq(c.through_tables, 0)
+    assert_eq(c.entries, 0)
+    assert_eq(c.compared, 0)
+    assert(calls(c, "FieldWriter.variant"))
+    assert(calls(c, "FieldWriter.field[string]"))
+    assert(calls(c, "FieldWriter.field[int]"))
+
+@test("a derived method allocates only its visitor, beyond what the hand-written one does")
+derived_allocates_only_the_visitor()
+    val program = lowered(Encoder)
+    val derived = cost_of(program, "Person.encode")
+    val hand = cost_of(program, "Hand.encode")
+    assert_eq(hand.allocations, 0)
+    assert_eq(derived.allocations, hand.allocations + 1)
+
+@test("each hook is compiled for one field type and calls its field's own method directly")
+hooks_are_direct()
+    val program = lowered(Encoder)
+    val text = cost_of(program, "FieldWriter.field[string]")
+    assert_eq(text.through_tables, 0)
+    assert_eq(text.allocations, 0)
+    assert(calls(text, "string.encode"))
+    val number = cost_of(program, "FieldWriter.field[int]")
+    assert_eq(number.through_tables, 0)
+    assert_eq(number.allocations, 0)
+    assert(calls(number, "int.encode"))
