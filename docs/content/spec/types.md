@@ -145,6 +145,24 @@ patterns in `match` and in clauses.
 ## Function types
 
 `(A, B) -> C` is the type of a function taking `A` and `B` and returning `C`; `() -> C` takes nothing.
+A function taking one parameter may drop the parentheses: `int -> string`, `Option[T] -> bool`.
+`(A) -> B` and `A -> B` are the same type. `->` groups to the right, so `int -> int -> int` is
+`int -> (int -> int)`, a function returning a function; a function taking a function writes the
+parameter in parentheses, `(int -> int) -> int`. A tuple parameter takes a second pair of
+parentheses, `((A, B)) -> C`, since `(A, B) -> C` takes two parameters.
+
+```text
+twice(f: int -> int, x: int) -> int = f(f(x))
+adder(n: int) -> int -> int = x -> x + n      // the result is a function type
+val fs: List[int -> int] = [adder(1), adder(2)]
+val add: int -> int -> int = a -> b -> a + b
+```
+
+The form works wherever a type does: parameters, fields, results, type arguments, tuple parts,
+`val` annotations and supertypes. A result of function form needs no parentheses, since the
+declaration's `=` ends it. A type pattern in a `match` arm is the exception: the arm's `->` follows
+the type, so a function type there is written in parentheses, `f: (int -> int) -> body`.
+Compiler messages print every function type with a parameter list, `(int) -> int`.
 A by-name parameter type is written `-> T` inside a parameter list; see
 [call-by-name](/spec/by-name/). Function types are traits: a class may list a function type among its
 supertypes and implement `apply`, and its instances are then callable as `value(args)` and usable

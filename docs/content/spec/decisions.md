@@ -554,6 +554,17 @@ Settled by the user on 2026-11-03:
   elements it does not match. `return`, `break`, `continue` and `?` cannot leave a comprehension's
   guards or yielded value.
 
+Settled by the user on 2026-11-04:
+
+- A function type with one parameter is written without parentheses: `int -> string`,
+  `Option[T] -> bool`. `->` in a type groups to the right, so `int -> int -> int` is
+  `int -> (int -> int)`; `(A) -> B` is the same type as `A -> B`, `(A, B) -> C` takes two
+  parameters, a function taking one tuple is `((A, B)) -> C`, and a function taking a function is
+  `(int -> int) -> int`. A function type needs no parentheses in a parameter, field, result,
+  type argument, tuple part or `val` annotation, nor as a supertype; a type pattern in a `match`
+  arm still writes it in parentheses, since the arm's own `->` follows it. Error messages print
+  every function type with a parameter list, `(int) -> int`.
+
 **Deferred**
 
 - Public C interoperability. Until then, C is reached through Sysl.
