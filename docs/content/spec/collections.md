@@ -55,7 +55,7 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
   a collection has them only where its elements do. `mkString` joins elements that have `Display`
   into a string: `mkString(sep = ", ")` separates them, `mkString(start, sep, end)` also brackets
   them, so `[1, 2, 3].mkString()` is `1, 2, 3` and `.mkString("<", "|", ">")` is `<1|2|3>`. Lists,
-  vectors, arrays, buffers and sets have it, and maps, whose entries join as `key: value`, the form
+  vectors, arrays, buffers, deques and sets have it, and maps, whose entries join as `key: value`, the form
   a displayed map shows. `max()` and `min()` on lists, vectors and arrays of `Ord` elements answer
   `Some` of the greatest or least, the first of equal ones, and `None` when empty.
 
@@ -258,6 +258,44 @@ elements are in one array that nothing writes to after the vector is made, so an
 makes a changed vector (`appended`, `prepended`, `concat`, `updated`) copies them. Both compare and
 hash by their elements in order, and display as an array does, `[1, 2, 3]`, where their elements
 display.
+
+## Seq
+
+`Seq[+T]` is what every indexed sequence shares, so a function over `Seq[T]` takes a list, a vector,
+an array, a buffer or a deque. A sequence supplies `length()` and `apply(index)`, and has the rest
+from them: `get`, `isEmpty`, `nonEmpty`, `head` and `last` (trapping when empty) with `headOption` and
+`lastOption`, `foldLeft`, `foldRight`, `foreach`, `exists`, `forall`, `find`, `indexWhere`, `count`,
+`toVector`, `toList`, an iterator, and `reverseIterator`, which walks from the last element to the
+first. A sequence that reaches its elements another way overrides the ones that would be slow: a list
+walks from its front, so on a list each of them takes time proportional to its length.
+
+```text
+total(xs: Seq[int]) -> int = xs.foldLeft(0, (acc, x) -> acc + x)
+
+total([1, 2, 3])                   // a Vector
+total(Array.fill(4, 1))            // an Array
+```
+
+`contains` and `indexOf` compare with an element of the sequence's own type, so each sequence type
+declares them for itself; on a `Seq[T]` known only as one, `exists` and `indexWhere` do the same work.
+
+## Deque
+
+`Deque[T]` is invariant, growable and mutable at both ends. `Deque[int]()` is an empty deque;
+`addFirst(x)` and `addLast(x)` put an element at the front or the back in amortized constant time, and
+`removeFirst()` and `removeLast()` take one off and return it, trapping on an empty deque. So a deque
+is a queue, `addLast` with `removeFirst`, and a stack, `addLast` with `removeLast`. `d(i)` and
+`d(i) = v` read and replace the element `i` places from the front, an index outside
+`0 ..< length()` trapping, and `clear()` empties it. Its elements live in an array as a ring that wraps
+around from the array's end to its start, doubling as a buffer's does when full. A deque compares and
+hashes by its elements in order, displays as `[1, 2, 3]`, has `mkString` where its elements display,
+and is built by `Deque.builder` and by a sequence literal where one is expected.
+
+```text
+val pending: Deque[string] = ["build", "test"]
+pending.addFirst("fetch")
+while pending.nonEmpty() do run(pending.removeFirst())
+```
 
 ## Ranges
 

@@ -4277,9 +4277,41 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
     val want = expected match
         Some(w) -> w
         None -> return check_form(c, e, None, used)
+    if is_index_function(zonk(c, want)) then return as_index_function(c, check_form(c, e, expected, used))
     if !(*zonk(c, want) is AnyType) then return check_form(c, e, expected, used)
     val passes = e.kind is Block(_, _) || e.kind is If(_, _, _) || e.kind is Match(_, _) || e.kind is While(_, _, _) || e.kind is Loop(_) || e.kind is DoWhile(_, _, _)
     to_any(c, check_form(c, e, if passes then expected else None, used))
+
+/** Whether `t` is a function from one `int`, which a sequence is wherever one is expected. */
+private is_index_function(t: &Type) -> bool = *t match
+    Function(params, _) -> params.len() == 1 && *params[0] is Int(IntBits)
+    _ -> false
+
+/** `typed`, where a function from an index is expected: a sequence becomes the function from an
+ * index to its element, through the core library's `elementAt`, and any other value stays as it is,
+ * for the caller to hold to the function type. */
+private as_index_function(c: *Checker, typed: &TExpr) -> &TExpr
+    val t = zonk(c, typed.ty)
+    if !(*t is Class(_, _, _) || *t is Data(_, _, _)) then return typed
+    val seq = c.class_types.get(qualified(CoreModule, "Seq")) match
+        Some(k) -> k
+        None -> return typed
+    val element = holding_ancestor(conformances(c), t, seq) match
+        Some(up) -> *up match
+            Class(_, _, args) -> if args.len() == 1 then args[0] else return typed
+            _ -> return typed
+        None -> return typed
+    val ids = c.scope.get(qualified(CoreModule, "elementAt")) match
+        Some(ids) -> ids
+        None -> return typed
+    if ids.len() != 1 then return typed
+    var params: Buf[&Type] = buf()
+    params.push(Int(IntBits))
+    var args: Buf[&TExpr] = buf()
+    args.push(typed)
+    var type_args: Buf[&Type] = buf()
+    type_args.push(element)
+    TExpr(typed.span, Function(params, element), Call(ids[0], args, type_args))
 
 /** `typed` as an `Any`: put in a box where its type needs one. An unknown type is decided as
  * `Any`. */
@@ -8049,7 +8081,10 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
             parts.push(tail)
             list_pattern(c, p, "Cons", parts, ty, no_bind, "`::` patterns match a `List`")
         Sequence(items) ->
-            if items.len() == 0 then return list_pattern(c, p, "Nil", buf(), ty, no_bind, "sequence patterns match a `List`")
+            val t = zonk(c, ty)
+            if !is_list_type(c, t)
+                if seq_element(c, t) is Some(element) then return sequence_pattern(c, p, items, t, element, no_bind)
+            if items.len() == 0 then return list_pattern(c, p, "Nil", buf(), ty, no_bind, "sequence patterns match a `Seq`")
             // `[a, b, c]` on a list is `a :: [b, c]`.
             var rest: Buf[&Pattern] = buf()
             for i in 1..<items.len()
@@ -8057,7 +8092,7 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
             var parts: Buf[&Pattern] = buf()
             parts.push(items[0])
             parts.push(Pattern(Span(if rest.len() > 0 then rest[0].span.start else p.span.end, p.span.end), Sequence(rest)))
-            list_pattern(c, p, "Cons", parts, ty, no_bind, "sequence patterns match a `List`")
+            list_pattern(c, p, "Cons", parts, ty, no_bind, "sequence patterns match a `Seq`")
         Tuple(items) ->
             // A tuple pattern takes apart a tuple of the same size; a tuple is matched as a value
             // with one variant whose fields are its parts.
@@ -8199,6 +8234,33 @@ private variant_pattern(c: *Checker, p: &Pattern, v: VariantRef, args: Buf[&Patt
     if !ok || *ty is ErrorType then return TPattern(p.span, ErrorType, PWildcard)
     TPattern(p.span, ty, PVariant(v.index, typed))
 
+/** The element type of `t` as a `Seq`, when it is one. */
+private seq_element(c: *Checker, t: &Type) -> Option[&Type]
+    if !(*t is Class(_, _, _) || *t is Data(_, _, _)) then return None
+    val seq = c.class_types.get(qualified(CoreModule, "Seq"))?
+    val up = holding_ancestor(conformances(c), t, seq)?
+    *up match
+        Class(_, _, args) -> if args.len() == 1 then Some(args[0]) else None
+        _ -> None
+
+// A sequence pattern on a sequence other than a list, `[a, b, c]`, matches one of exactly that many
+// elements. The matched sequence is held in a local of its own, through which the pattern asks its
+// `length()` once and then reads each element it tests with `apply`, in order, stopping at the first
+// that fails; an element matched by `_` is not read.
+private sequence_pattern(c: *Checker, p: &Pattern, items: Buf[&Pattern], ty: &Type, element: &Type, no_bind: string) -> &TPattern
+    val at = p.span
+    val name = s"sequence pattern ${at.start}"
+    val local = declare_local(c, at, name, ty, false)
+    val length = check_expr(c, compare_at(at, Equal, call_at(at, name_at(at, name), "length"), Expr(at, IntLit(items.len().to_string()))), None)
+    var elements: Buf[&TExpr] = buf()
+    var typed: Buf[&TPattern] = buf()
+    for i in 0..<items.len()
+        var args: Buf[Argument] = buf()
+        args.push(Argument(at, None, Expr(at, IntLit(i.to_string()))))
+        elements.push(check_expr(c, Expr(at, Call(name_at(at, name), args)), None))
+        typed.push(check_pattern(c, items[i], element, no_bind))
+    TPattern(p.span, ty, PSequence(local, length, elements, typed))
+
 // A list pattern is the core library's `List` variant `name` with the patterns `parts` for its
 // fields, whatever `Cons` and `Nil` name where it is written. On any other type it is reported with
 // `what`.
@@ -8207,9 +8269,7 @@ private list_pattern(c: *Checker, p: &Pattern, name: string, parts: Buf[&Pattern
     val v = list_variant(c, name)
     if v is Some(found)
         if is_list_type(c, t) then return variant_pattern(c, p, found, parts, t, no_bind)
-    if !(*t is ErrorType)
-        if is_array_type(c, t) then c.note(unit_of(c), p.span, "sequence patterns on arrays are not implemented")
-        else c.note(unit_of(c), p.span, s"$what, not ${type_name(t)}")
+    if !(*t is ErrorType) then c.note(unit_of(c), p.span, s"$what, not ${type_name(t)}")
     for part in parts
         check_pattern(c, part, ErrorType, no_bind)
     TPattern(p.span, ErrorType, PWildcard)
