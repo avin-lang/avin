@@ -108,6 +108,9 @@ struct ClassSymbol
     /** For a trait, the position of its first method in the table of every class conforming to it;
      * its methods follow in declaration order. */
     base: usize
+    /** For an object named after a data type of its module, that type: the object is its companion,
+     * and each uses the other's private members. */
+    companion_data: Option[usize]
 
 /** A module-level value: a `val` or `var` declared at the top level of a file, or an object's one
  * instance. Each is computed once, before `main` runs, by its `init` function: a value's initializer,
@@ -154,6 +157,9 @@ struct DataSymbol
      * the implementation of each of the trait's methods, the type's own method of that name or the
      * trait's default body. Empty when the type conforms to no trait. */
     table: Buf[Option[usize]]
+    /** The object of the same name in its module, its companion: the bare name and `Name.member`
+     * are the object, while a variant of the type's name is still called to make a value. */
+    companion: Option[usize]
 
 /** One constructor of a data type. */
 struct VariantSymbol
@@ -470,11 +476,14 @@ private check_imports(c: *Checker, unit: usize)
         val local = qualified(own, i.binding)
         if declared(c, local)
             var companion = false
+            var data_companion = false
             if c.class_types.get(local) is Some(k)
                 if c.classes[k].decl.object
                     if c.class_types.get(i.path) is Some(j)
                         if !c.classes[j].decl.object then companion = true
+                    if c.types.get(i.path) is Some(_) then data_companion = true
             if companion then c.note(unit, i.span, s"`${i.binding}` is a class of module `$module_name`; its companion object is declared in the class's own module")
+            elif data_companion then c.note(unit, i.span, s"`${i.binding}` is a data type of module `$module_name`; its companion object is declared in the type's own module")
             else c.note(unit, i.span, s"`${i.binding}` is imported and also declared in this module")
             continue
         if kept.get(i.binding) is Some(earlier)
@@ -704,7 +713,7 @@ private declare_types(c: *Checker, unit: usize)
             for a in d.annotations
                 c.note(unit, a.span, s"unknown annotation `@${a.name}`")
             c.types.put(key, c.data.len())
-            c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf(), buf(), buf(), buf(), buf()))
+            c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf(), buf(), buf(), buf(), buf(), None))
     for i in 0..<file.items.len()
         if file.items[i] is ClassItem(d)
             if d.object then continue
@@ -717,12 +726,12 @@ private declare_types(c: *Checker, unit: usize)
                 continue
             if file.private_items[i] then c.private_names.put(key, true)
             c.class_types.put(key, c.classes.len())
-            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, None, None, buf(), buf(), 0))
+            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, None, None, buf(), buf(), 0, None))
 
-// An object is a class with one instance. Named after a class of its module, in any of the module's
-// files, it is that class's companion and its type has no name of its own; otherwise its name is
-// also its type's. A class and its companion are one name, so a companion is private where its class
-// is.
+// An object is a class with one instance. Named after a class or a data type of its module, in any of
+// the module's files, it is that type's companion and its type has no name of its own; otherwise its
+// name is also its type's. A type and its companion are one name, so a companion is private where its
+// type is.
 private declare_objects(c: *Checker, unit: usize)
     val file = c.units[unit].file
     for i in 0..<file.items.len()
@@ -734,19 +743,23 @@ private declare_objects(c: *Checker, unit: usize)
                 continue
             val id = c.classes.len()
             var companion: Option[usize] = None
+            var companion_data: Option[usize] = None
             if c.class_types.get(key) is Some(k)
                 if c.classes[k].decl.object || c.classes[k].companion is Some(_)
                     c.note(unit, d.name_span, s"the object `${d.name}` is declared more than once")
                     continue
                 companion = Some(k)
                 c.classes[k].companion = Some(id)
-            elif c.types.get(key) is Some(_)
-                c.note(unit, d.name_span, s"`${d.name}` is already a data type; an object may share its name only with a class")
-                continue
+            elif c.types.get(key) is Some(t)
+                if c.data[t].companion is Some(_)
+                    c.note(unit, d.name_span, s"the object `${d.name}` is declared more than once")
+                    continue
+                companion_data = Some(t)
+                c.data[t].companion = Some(id)
             else
                 c.class_types.put(key, id)
                 if file.private_items[i] then c.private_names.put(key, true)
-            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, companion, None, buf(), buf(), 0))
+            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, companion, None, buf(), buf(), 0, companion_data))
 
 // Each impl's type and trait, resolved with the impl's type parameters in scope. They are the type's
 // own parameters under the names the impl gives them, so `impl[T] Box[T]` lists them in order. What
@@ -1313,9 +1326,12 @@ private method_visible(c: *Checker, m: usize) -> bool
             Some(t) -> inside_impl(c, t)
             None -> false
 
-/** Whether the code being checked is a method an impl adds to the data or built-in type of `t`, so it
- * may call that type's private methods. */
+/** Whether the code being checked is a method an impl adds to the data or built-in type of `t`, or
+ * code of a data type's companion object, so it may call that type's private methods. */
 private inside_impl(c: *Checker, t: &Type) -> bool
+    if *t is Data(b, _, _)
+        if c.data[b].companion is Some(o)
+            if enclosing_class(c) == Some(o) then return true
     val here = c.symbols[c.body.root].receiver match
         Some(r) -> r
         None -> return false
@@ -1365,9 +1381,20 @@ private declare_methods(c: *Checker, unit: usize)
         val k = c.classes[id]
         if k.unit != unit then continue
         val d = k.decl
-        // A function of the same name was reported when it was declared.
+        // A function of the same name was reported when it was declared, unless the object is a data
+        // type's companion. A data type's own variant of its name stays its constructor in call
+        // position, as a class's does; a variant with no fields is a value by its bare name, which
+        // the companion would take.
         val key = qualified(module_name, d.name)
-        if c.variants.get(key) is Some(v) then c.note(unit, d.name_span, s"`${d.name}` is already a variant of `${c.data[v.data].name}`")
+        if c.variants.get(key) is Some(v)
+            if k.companion_data != Some(v.data) then c.note(unit, d.name_span, s"`${d.name}` is already a variant of `${c.data[v.data].name}`")
+            elif c.data[v.data].variants[v.index].fields.len() == 0 then c.note(unit, d.name_span, s"`${d.name}` is a variant of `${d.name}` with no fields, a value by its bare name; a companion object cannot share it")
+        if k.companion_data is Some(_) && c.variants.get(key) is None
+            if c.scope.get(key) is Some(ids)
+                for f in ids
+                    if !c.symbols[f].constructor
+                        c.note(unit, d.name_span, s"`${d.name}` is already a function")
+                        break
         val self_type = own_class_type(k, id)
         var params: Buf[Param] = buf()
         var types: Buf[&Type] = buf()
@@ -4375,8 +4402,12 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
     TExpr(at, ty, Block(items))
 
 // Whether code that may use the private members of class `k` is being checked: code of the class
-// itself, or of its companion.
+// itself, or of its companion; for a data type's companion object, a method an impl adds to the type.
 private inside_class(c: *Checker, k: usize) -> bool
+    if c.classes[k].companion_data is Some(d)
+        if c.symbols[c.body.root].receiver is Some(r)
+            if *r is Data(a, _, _)
+                if a == d then return true
     val here = enclosing_class(c) match
         Some(h) -> h
         None -> return false
@@ -5018,9 +5049,13 @@ private sequence_literal(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Opt
         if is_list_type(c, t) then return list_literal(c, e, items, expected)
     var collection: Option[usize] = None
     if want is Some(t)
-        if *t is Class(k, _, _)
-            if c.classes[k].companion is Some(o)
-                if methods_named(c, o, "builder").len() > 0 then collection = Some(o)
+        val companion = *t match
+            Class(k, _, _) -> c.classes[k].companion
+            Data(d, _, _) -> c.data[d].companion
+            _ -> None
+        if companion is Some(o)
+            if methods_named(c, o, "builder").len() > 0 then collection = Some(o)
+    val from_expected = collection is Some(_)
     if collection is None
         if c.class_types.get(qualified(CoreModule, "Vector")) is Some(k) then collection = c.classes[k].companion
     val o = collection match
@@ -5031,10 +5066,21 @@ private sequence_literal(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Opt
             c.note(unit, at, "a collection literal needs the core library's `Vector`")
             return TExpr(at, ErrorType, UnitConst)
     val companion = global_read(c, at, c.classes[o].global.unwrap())
+    // A `builder` declared to return a `Builder` of the expected collection takes its type
+    // arguments from it at the call, where bounds on them are checked: `Set.builder[A: Eq + Hash]`
+    // learns `A` from the `Set[int]` expected.
+    var wanted_builder: Option[&Type] = None
+    if want is Some(w)
+        if from_expected
+            if c.class_types.get(qualified(CoreModule, "Builder")) is Some(b)
+                var args: Buf[&Type] = buf()
+                args.push(fresh_var(c))
+                args.push(w)
+                wanted_builder = Some(Class(b, "Builder", args))
     // The builder's element type is open until the expected type or the elements settle it; an
     // empty literal with neither is reported as one.
     val first_unknown = c.unknowns.len()
-    val builder = call_method(c, at, at, companion, "builder", methods_named(c, o, "builder"), buf(), None, None, false)
+    val builder = call_method(c, at, at, companion, "builder", methods_named(c, o, "builder"), buf(), None, wanted_builder, false)
     for i in first_unknown..<c.unknowns.len()
         c.unknowns[i].message = "cannot infer the element type of an empty collection literal; give it a type, as in `val xs: Vector[int] = []`"
     if *builder.ty is ErrorType
@@ -6220,9 +6266,15 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
         Some(TraitFieldOf(_)) -> if explicit is None then return value_call(c, at, callee, args)
         None -> ()
     // A module-level value is called as a value; a class's name in call position is its
-    // constructor, even where its companion object shares the name.
+    // constructor, and a data type's variant of its own name, even where a companion object shares
+    // the name.
     val ids = lookup_functions(c, name)
-    if explicit is None && ids.len() == 0 && global_named(c, name) is Some(g)
+    var global = if explicit is None && ids.len() == 0 then global_named(c, name) else None
+    if global is Some(g)
+        if c.globals[g].object is Some(k)
+            if variant_named(c, name) is Some(v)
+                if c.classes[k].companion_data == Some(v.data) then global = None
+    if global is Some(g)
         if c.globals[g].object is Some(_)
             c.note(unit, named.span, s"`$name` is an object, made once before `main`; it cannot be called")
             for a in args
