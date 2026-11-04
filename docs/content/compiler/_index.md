@@ -445,7 +445,10 @@ final class, a `data` type, a tuple of such, each with only invariant parameters
 with the target's record; for an open class, a trait, an instance of a type with a covariant or
 contravariant parameter, or a tuple with a part of one, a call of the runtime's `avin_rt_conforms`, which
 scans the record's ancestors, so the test costs the number of ancestors. A generic instance is its
-own type with its own record, so `Box[int]` and `Box[string]` differ by address. Strings are made by
+own type with its own record, so `Box[int]` and `Box[string]` differ by address. A closure's
+descriptor names the record of its function's own type in the copy it was made from, and a function
+type, whose parameters and result vary and which a class may extend, is always tested through
+`avin_rt_conforms`. Strings are made by
 the runtime as well as written as literals, so the program emits one descriptor for every string
 (`string_descriptor`), naming the record of `string` and holding its method table; its literals
 name it, and `main` hands it to the runtime (`avin_rt_string_descriptor`) before anything else, so

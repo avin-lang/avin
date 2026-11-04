@@ -117,6 +117,9 @@ arguments, so:
   matches when that type is the pattern's or a subtype of it, through [variance](#variance) too, so
   a `List[Dog]` held as an `Any` matches `xs: List[Animal]` and a `List[int]` does not match
   `xs: List[Any]`;
+- a function value's header names its function type, so `f: ((Dog) -> Animal) -> …` matches a
+  `(Animal) -> Dog` held as an `Any`, and a value of a class extending a function type, a `Vector[int]`
+  among them, matches that function type;
 - generic code can create an `Array[T]` without any evidence parameter;
 - there are no unchecked casts. A downcast is a `match` with a type pattern.
 
