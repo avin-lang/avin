@@ -1,0 +1,140 @@
+module avin
+
+// The hash-based immutable map: keys are found by their hash and compared with `==`, so any type can
+// be a key. It is the map a map literal `{"a": 1}`, `Map(...)` and `Map.empty` build. An update
+// answers a new hash map that shares all but the changed path with the old one, which is left as it
+// was. Iteration visits the entries in an order fixed by the keys' hashes, not by the order they were
+// added. `HashMap.empty[K, V]()` is the empty map, and `HashMap.builder[K, V]()` builds one from
+// pairs.
+data HashMap[K: Eq + Hash, +V](root: HashTrie[K, V] = Empty)
+
+impl[K, V] Map[K, V] for HashMap[K, V]
+    size() -> int = trieSize(root)
+
+    isEmpty() -> bool = root is Empty
+
+    nonEmpty() -> bool = !isEmpty()
+
+    get(key: K) -> Option[V] = trieFind(root, spreadHash(key.hash()), key)
+
+    updated[W >: V](key: K, value: W) -> HashMap[K, W] =
+        HashMap(trieInsert[K, W](root, spreadHash(key.hash()), key, value))
+
+    removed(key: K) -> HashMap[K, V]
+        val h = spreadHash(key.hash())
+        if trieFind(root, h, key) is None then self else HashMap(trieRemove(root, h, key))
+
+    ++[W >: V](other: Iterable[(K, W)]) -> HashMap[K, W]
+        var t: HashTrie[K, W] = root
+        for (k, v) in other do t = trieInsert(t, spreadHash(k.hash()), k, v)
+        HashMap(t)
+
+    --(keys: Iterable[K]) -> HashMap[K, V]
+        var t = root
+        for k in keys
+            val h = spreadHash(k.hash())
+            if trieFind(t, h, k) is Some(_) then t = trieRemove(t, h, k)
+        HashMap(t)
+
+    updatedWith[W >: V](key: K, f: (Option[V]) -> Option[W]) -> HashMap[K, W] = f(get(key)) match
+        Some(v) -> updated(key, v)
+        None -> removed(key)
+
+    keysIterator() -> Iterator[K] = MapKeys(HashTrieIterator(root))
+
+    valuesIterator() -> Iterator[V] = MapValues(HashTrieIterator(root))
+
+    keySet() -> HashSet[K]
+        var t: HashTrie[K, unit] = Empty
+        for k in MapKeys(HashTrieIterator(root)) do t = trieInsert(t, spreadHash(k.hash()), k, ())
+        HashSet(t)
+
+    filterKeys(p: (K) -> bool) -> HashMap[K, V]
+        var t = root
+        for k in MapKeys(HashTrieIterator(root))
+            if !p(k) then t = trieRemove(t, spreadHash(k.hash()), k)
+        HashMap(t)
+
+    filter(p: (K, V) -> bool) -> HashMap[K, V]
+        var t = root
+        for (k, v) in iterator()
+            if !p(k, v) then t = trieRemove(t, spreadHash(k.hash()), k)
+        HashMap(t)
+
+    transform[W](f: (K, V) -> W) -> HashMap[K, W]
+        var t: HashTrie[K, W] = Empty
+        for (k, v) in iterator() do t = trieInsert(t, spreadHash(k.hash()), k, f(k, v))
+        HashMap(t)
+
+    mapValues[W](f: (V) -> W) -> HashMap[K, W]
+        var t: HashTrie[K, W] = Empty
+        for (k, v) in iterator() do t = trieInsert(t, spreadHash(k.hash()), k, f(v))
+        HashMap(t)
+
+    iterator() -> Iterator[(K, V)] = HashTrieIterator(root)
+
+impl[K, V: Eq] Eq for HashMap[K, V]
+    equals(other: HashMap[K, V]) -> bool
+        if size() != other.size() then return false
+        for (k, v) in iterator()
+            other.get(k) match
+                Some(w) -> if w != v then return false
+                None -> return false
+        true
+
+// A sum over the entries, so that the hash does not depend on the order they are visited in; a tree
+// map of the same entries hashes alike.
+impl[K, V: Hash] Hash for HashMap[K, V]
+    hash() -> long
+        var h: long = 0
+        for (k, v) in iterator() do h = h +% spreadHash(k.hash() *% 31 +% v.hash())
+        h
+
+// A map of displayable keys and values displays as `{a: 1, b: 2}`, the shape of a map literal, each
+// key and value in its own `Display`. A field width pads the whole.
+impl[K: Display, V: Display] Display for HashMap[K, V]
+    display(out: Writer, spec: FormatSpec)
+        writeEntry(w: Writer, entry: (K, V))
+            entry.0.display(w, FormatSpec())
+            w.write(": ")
+            entry.1.display(w, FormatSpec())
+        writeBraced(out, spec, iterator(), writeEntry)
+
+// A map's diagnostic form is its keys' and values' diagnostic forms in braces: `{"a": 1}`.
+impl[K: Debug, V: Debug] Debug for HashMap[K, V]
+    debug(out: Writer, spec: FormatSpec)
+        writeEntry(w: Writer, entry: (K, V))
+            entry.0.debug(w, FormatSpec())
+            w.write(": ")
+            entry.1.debug(w, FormatSpec())
+        writeBraced(out, spec, iterator(), writeEntry)
+
+object HashMap
+    // A hash map with no entries.
+    empty[K, V]() -> HashMap[K, V] = HashMap(Empty)
+
+    // A hash map of the pairs given, a later pair's value replacing an earlier one's for the same
+    // key: `HashMap((1, "one"), (2, "two"))`.
+    apply[K: Eq + Hash, V](pairs: (K, V)*) -> HashMap[K, V]
+        var t: HashTrie[K, V] = Empty
+        for (k, v) in pairs do t = trieInsert(t, spreadHash(k.hash()), k, v)
+        HashMap(t)
+
+    // A builder of a hash map: the pairs it is given, a later pair's value replacing an earlier one's
+    // for the same key.
+    builder[K, V]() -> Builder[(K, V), HashMap[K, V]] = HashMapBuilder[K, V]()
+
+// Builds a hash map from `(key, value)` pairs.
+class HashMapBuilder[K: Eq + Hash, V]: Builder[(K, V), HashMap[K, V]]
+    private var trie: HashTrie[K, V] = Empty
+    private var spent = false
+
+    override add(element: (K, V))
+        if spent then fail("add to a builder whose result was taken")
+        val (k, v) = element
+        trie = trieInsert(trie, spreadHash(k.hash()), k, v)
+
+    override result() -> HashMap[K, V]
+        if spent then fail("result of a builder whose result was taken")
+        spent = true
+        HashMap(trie)
