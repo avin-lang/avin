@@ -1,0 +1,94 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A tuple is `Display`, `Debug` and `Ord` where each of its parts is. Code cannot be generic over a
+// tuple's arity, so the core library's impls for tuples are written here, one of each trait for
+// every arity from two up to the widest tuple the program writes, as a type, a value or a pattern.
+// No tuple wider than that can arise: a tuple type is written somewhere before a value of it exists.
+//
+// The impls are Avin, checked and lowered as the core library's own are. The parameters of each
+// arity's impls are its tuple family, `(A0, A1, …)`, and a tuple of that many parts meets an impl
+// where its parts meet the impl's bounds.
+
+/** The file of the core library holding the impls for tuples, or `None` where the program writes no
+ * tuple or is checked without the core library. */
+tuple_impls_unit(units: Buf[SourceUnit]) -> Option[SourceUnit]
+    var widest = 0usize
+    var core = false
+    for u in units
+        if u.file.widest_tuple > widest then widest = u.file.widest_tuple
+        if u.file.module_name == CoreModule then core = true
+    if !core || widest < 2 then return None
+    val parsed = parse(source_of("tuples.avin", tuple_impls(widest)))
+    Some(SourceUnit(parsed.source, parsed.file, parsed.report))
+
+/** The source of the impls for tuples of two to `widest` parts. */
+tuple_impls(widest: usize) -> string
+    var text = "module avin\n"
+    for n in 2..<widest + 1
+        text = text + display_impl(n) + debug_impl(n) + ord_impl(n)
+    text
+
+/** `A0: bound, A1: bound, …` for `n` parts. */
+private bounded_params(n: usize, bound: string) -> string
+    var text = ""
+    for i in 0..<n
+        if i > 0 then text = text + ", "
+        text = text + s"A$i: $bound"
+    text
+
+/** `(A0, A1, …)` for `n` parts. */
+private family(n: usize) -> string
+    var text = "("
+    for i in 0..<n
+        if i > 0 then text = text + ", "
+        text = text + s"A$i"
+    text + ")"
+
+// `(a, b)`: the parts in their own form, separated by `, ` between parentheses. A field width pads
+// the whole, rendered into a string first, as it does a data value.
+private parts_written(n: usize, method: string) -> string
+    var text = "            out.write(\"(\")\n"
+    for i in 0..<n
+        if i > 0 then text = text + "            out.write(\", \")\n"
+        text = text + s"            self.${i}.${method}(out, FormatSpec())\n"
+    text + "            out.write(\")\")\n"
+
+private display_impl(n: usize) -> string
+    var text = s"\nimpl[${bounded_params(n, "Display")}] Display for ${family(n)}\n"
+    text = text + "    display(out: Writer, spec: FormatSpec)\n"
+    text = text + "        if spec.width > 0\n"
+    text = text + "            out.writeField(self.toString(), spec)\n"
+    text = text + "        else\n"
+    text = text + parts_written(n, "display")
+    text = text + "    toString() -> string\n"
+    text = text + "        val text = StringWriter()\n"
+    text = text + "        self.display(text, FormatSpec())\n"
+    text + "        text.text()\n"
+
+private debug_impl(n: usize) -> string
+    var text = s"\nimpl[${bounded_params(n, "Debug")}] Debug for ${family(n)}\n"
+    text = text + "    debug(out: Writer, spec: FormatSpec)\n"
+    text = text + "        if spec.width > 0\n"
+    text = text + "            val text = StringWriter()\n"
+    text = text + "            self.debug(text, FormatSpec())\n"
+    text = text + "            out.writeField(text.text(), spec)\n"
+    text = text + "        else\n"
+    text + parts_written(n, "debug")
+
+// Lexicographically: the first part whose `compare` is not zero decides.
+private ord_impl(n: usize) -> string
+    val t = family(n)
+    var text = s"\nimpl[${bounded_params(n, "Ord")}] Ord for $t\n"
+    text = text + s"    compare(other: $t) -> int\n"
+    for i in 0..<n - 1
+        text = text + s"        val c$i = self.${i}.compare(other.${i})\n"
+        text = text + s"        if c$i != 0 then return c$i\n"
+    text = text + s"        self.${n - 1}.compare(other.${n - 1})\n"
+    val names = ["less", "lessOrEqual", "greater", "greaterOrEqual"]
+    val ops = ["<", "<=", ">", ">="]
+    for i in 0..<4
+        text = text + s"    ${names[i]}(other: $t) -> bool = self.compare(other) ${ops[i]} 0\n"
+    text

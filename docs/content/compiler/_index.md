@@ -843,6 +843,23 @@ operators are the machine's and whose conversions (`long(x)`, `T(n)`, checked by
 `integer_param_named` and `as_integer`) resize to the instance's width. A width with no impl of its
 own takes the family's table in `builtin_table`.
 
+**Tuple families.** Code cannot be generic over a tuple's arity, so the core library's `Display`,
+`Debug` and `Ord` for tuples are written by the compiler for each arity. The parser records the
+widest tuple each file writes, as a type, a value or a pattern (`SourceFile.widest_tuple`), and
+`tuple_impls_unit` (`tuples.sysl`) adds a file of module `avin` holding the three impls for every
+arity from two up to the widest: `impl[A0: Ord, A1: Ord] Ord for (A0, A1)`, comparing part by part.
+No wider tuple can arise, since a tuple type is written before a value of it exists.
+`resolve_tuple_impl` resolves such an impl, allowed only in the core library, onto the **tuple
+family** of its arity: the tuple of the parameters `TypeVar(tuple_owner(n), i, "Ai")`, one owner
+per arity, so the three impls share one type and one table as the integer family's do, while each
+parameter's bounds are the impl's own (`bound_key` tells them apart by declaration site). Its
+`BuiltinConformance` carries the owner and the parameters, and `builtin_covers` lets it stand for
+every tuple of that many parts; `tuple_parts_hold` adds the condition that each part meets the
+parameter's bounds, in `meets_bound`, `builtin_traits` and method lookup (`method_holds`). A call of
+a family method takes the tuple's parts as its type arguments, in `receiver_type_args` and in
+lowering's `implementation_args`, so each tuple type is an instance calling its parts' methods
+directly.
+
 **Rendering an interpolation.** `s"…"` is checked into a join of its pieces with `+`. A hole of a
 built-in type becomes a `Render` node, lowered to the runtime's rendering of the value (a constant
 for `bool` and `unit`); a hole of any other type, a type parameter's included, becomes a call of its

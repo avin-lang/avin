@@ -667,6 +667,10 @@ private check_imports(c: *Checker, unit: usize)
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
     var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false)
+    // The core library's impls for tuples are a file made for the program, after the program's own:
+    // see `tuples.sysl`.
+    val given = c.units.len()
+    if tuple_impls_unit(c.units) is Some(u) then c.units.push(u)
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
     // `derives` is written out as the methods and impls it stands for before anything is declared.
@@ -748,7 +752,8 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     for g in 0..<c.globals.len()
         settle_global(&c, g)
     val init = initializer(&c, initialization_order(&c))
-    var main_unit = c.units.len() - 1
+    // A program without `main` is told so in its last file.
+    var main_unit = given - 1
     var entry: Option[usize] = None
     c.scope.get(qualified(root_module, "main")) match
         Some(ids) ->
@@ -1127,6 +1132,7 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
             AbstractFieldMember(f) -> c.note(unit, f.span, s"an impl adds methods, not state, so it cannot declare the field `${f.name}`")
             StatementMember(s) -> c.note(unit, s.span, "an impl's body declares only methods")
             MethodMember(_, _, _, _) -> ()
+    if d.target.kind is Tuple(_) then return resolve_tuple_impl(c, unit, module_name, d)
     val path = d.target.kind match
         Named(p, _) -> p
         _ ->
@@ -1247,7 +1253,7 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
                 if conforms_directly(builtin_traits(c, target), t)
                     c.note(unit, written_trait_span(d), s"`$path` already conforms to `${type_name(t)}`; a conformance is stated once")
                     return invalid
-                c.builtins.push(BuiltinConformance(target, t, unit, d.target.span, buf()))
+                c.builtins.push(BuiltinConformance(target, t, unit, d.target.span, buf(), 0, buf()))
         if conditional
             if *t is Class(k, _, _) then c.conditional.push(ConditionalConformance(owner, k, conditions, unit, d.type_params))
     elif conditional then c.conditional_methods.push(ConditionalImpl(owner, conditions, unit, d.type_params))
@@ -1591,8 +1597,70 @@ private resolve_family_impl(c: *Checker, unit: usize, module_name: string, d: &I
                 val which = if is_integer_family(b.ty) then "every integer width" else s"`${type_name(b.ty)}`"
                 c.note(unit, written_trait_span(d), s"$which already conforms to `${type_name(t)}`; a conformance is stated once")
                 return invalid
-        c.builtins.push(BuiltinConformance(target, t, unit, d.target.span, buf()))
+        c.builtins.push(BuiltinConformance(target, t, unit, d.target.span, buf(), 0, buf()))
     ImplSymbol(unit, module_name, d, target, integer_owner(), trait_type, buf())
+
+// An impl for every tuple of some arity, `impl[A0: Display, A1: Display] Display for (A0, A1)`, adds
+// to that arity's tuple family: its parameters, in order, are the tuple's parts, and a tuple of that
+// many parts meets it where each part meets the parameter's bounds. Only the core library declares
+// one, and it does so for every arity a program writes (`tuples.sysl`).
+private resolve_tuple_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl) -> ImplSymbol
+    val invalid = ImplSymbol(unit, module_name, d, ErrorType, 0, None, buf())
+    val parts = d.target.kind match
+        Tuple(items) -> items
+        _ -> return invalid
+    if module_name != CoreModule
+        c.note(unit, d.target.span, "an impl for every tuple of an arity, as in `impl[A: Display, B: Display] Display for (A, B)`, is declared only in the core library")
+        return invalid
+    var in_order = parts.len() == d.type_params.len()
+    if in_order
+        for i in 0..<parts.len()
+            parts[i].kind match
+                Named(n, inner) -> if n != d.type_params[i].name || inner.len() > 0 then in_order = false
+                _ -> in_order = false
+    if !in_order
+        c.note(unit, d.target.span, "the tuple an impl is for has the impl's type parameters as its parts, in order, as in `impl[A, B] Display for (A, B)`")
+        return invalid
+    val owner = tuple_owner(parts.len())
+    val outer_generic = c.generic
+    c.generic = Some(GenericScope(owner, d.type_params))
+    declare_bounds(c, unit, owner, d.type_params, 0)
+    var trait_type: Option[&Type] = None
+    if d.trait_name is Some(written_trait)
+        val t = resolve_bound(c, unit, written_trait)
+        *t match
+            Class(k, _, _) ->
+                if is_trait(c, k) then trait_type = Some(t)
+                else c.note(unit, written_trait.span, s"`${c.classes[k].name}` is not a trait; an impl names a trait before `for`")
+            ErrorType -> ()
+            _ -> c.note(unit, written_trait.span, s"${type_name(t)} is not a trait; an impl names a trait before `for`")
+    c.generic = outer_generic
+    val t = trait_type match
+        Some(t) -> t
+        None ->
+            if d.trait_name is None then c.note(unit, d.target.span, "an impl for every tuple of an arity implements a trait")
+            return invalid
+    val target = tuple_family(parts.len())
+    for b in c.builtins
+        if same_type(b.ty, target) && same_trait(b.trait_type, t)
+            c.note(unit, written_trait_span(d), s"`${type_name(target)}` already conforms to `${type_name(t)}`; a conformance is stated once")
+            return invalid
+    c.builtins.push(BuiltinConformance(target, t, unit, d.target.span, buf(), owner, d.type_params))
+    ImplSymbol(unit, module_name, d, target, owner, trait_type, buf())
+
+/** Whether the parts of tuple `t` meet the bounds of the parameters `params` of the tuple family
+ * `owner` belongs to: where an impl for that family holds for `t`. Any other type holds at once. */
+tuple_parts_hold(f: Conformances, owner: usize, params: Buf[TypeParam], t: &Type) -> bool
+    if !is_tuple_owner(owner) then return true
+    val parts = *t match
+        Tuple(parts) -> parts
+        _ -> return true
+    for i in 0..<parts.len()
+        if i >= params.len() then return false
+        if f.bounds.get(bound_key(owner, i, params[i])) is Some(bounds)
+            for b in bounds
+                if !meets_bound(f, parts[i], b) then return false
+    true
 
 /** Whether `a` and `b` name one trait, with any type arguments. */
 private same_trait(a: &Type, b: &Type) -> bool = *a match
@@ -1652,7 +1720,7 @@ private conditional_impl_refused(c: *Checker, unit: usize, d: &ImplDecl, target:
 private builtin_traits(c: *Checker, t: &Type) -> Buf[&Type]
     var out: Buf[&Type] = buf()
     for b in c.builtins
-        if builtin_covers(b.ty, t) then out.push(b.trait_type)
+        if builtin_covers(b.ty, t) && (is_tuple_family(t) || tuple_parts_hold(conformances(c), b.owner, b.params, t)) then out.push(b.trait_type)
     out
 
 /** Whether `traits` already holds the trait `t` names, with any type arguments. */
@@ -2531,8 +2599,9 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
                 if same_type(c.symbols[m].receiver.unwrap(), target) && c.symbols[m].decl.name == f.name then same_name.push(m)
     val id = c.symbols.len()
     // A data type's methods share its type parameters, then have their own, and so do the integer
-    // family's; a built-in type has none, so its methods' type parameters are their own.
-    val owner = if *target is Data(_, _, _) || family || is_template_type(target) then block.owner else id
+    // family's and a tuple family's; a built-in type has none, so its methods' type parameters are
+    // their own.
+    val owner = if *target is Data(_, _, _) || family || is_tuple_family(target) || is_template_type(target) then block.owner else id
     var type_params: Buf[TypeParam] = buf()
     for tp in block.decl.type_params
         type_params.push(tp)
@@ -2600,8 +2669,13 @@ private receiver_method(c: *Checker, t: &Type, name: string) -> Option[usize]
         ErrorType -> None
         _ ->
             for m in c.builtin_methods
-                if builtin_covers(c.symbols[m].receiver.unwrap(), t) && c.symbols[m].decl.name == name then return Some(m)
+                if builtin_covers(c.symbols[m].receiver.unwrap(), t) && c.symbols[m].decl.name == name && method_holds(c, m, t) then return Some(m)
             None
+
+/** Whether built-in method `m` is one a value of type `t` has: for a method of an impl for a tuple
+ * family, where `t`'s parts meet the impl's bounds. */
+private method_holds(c: *Checker, m: usize, t: &Type) -> bool =
+    is_tuple_family(t) || tuple_parts_hold(conformances(c), c.symbols[m].type_owner, c.symbols[m].type_params, t)
 
 /** Every method named `name` that a value of data or built-in type `t` has, one for each list of
  * parameter types: those its impls add, then for a data type what its method table holds under the
@@ -2625,7 +2699,7 @@ receiver_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
         ErrorType -> ()
         _ ->
             for m in c.builtin_methods
-                if builtin_covers(c.symbols[m].receiver.unwrap(), t) && c.symbols[m].decl.name == name then out.push(m)
+                if builtin_covers(c.symbols[m].receiver.unwrap(), t) && c.symbols[m].decl.name == name && method_holds(c, m, t) then out.push(m)
     out
 
 /** `t` as an instance of trait `k`, where it conforms to it at its type arguments; a type parameter
@@ -3154,7 +3228,7 @@ private table_position(c: *Checker, k: usize, target: usize) -> Option[usize]
  * its superclass's, each as an instance of `t` sees it. A trait conformed to with two different type
  * argument lists appears twice. */
 private collect_traits(c: *Checker, t: &Type, out: *Buf[&Type])
-    if is_builtin(t) || is_integer_family(t)
+    if is_builtin(t) || is_integer_family(t) || *t is Tuple(_)
         for r in builtin_traits(c, t)
             var seen = false
             for i in 0..<out.len()
@@ -4545,14 +4619,14 @@ meets_bound(f: Conformances, x: &Type, bound: &Type) -> bool
             false
         _ ->
             if names_core_trait(f.core, k, "Eq") || names_core_trait(f.core, k, "Hash") then return true
-            if is_builtin(x)
+            if is_builtin(x) || *x is Tuple(_)
                 // Every integer is a member of `Integer`, and has what it requires.
                 if *x is Int(_)
                     if f.core.trait_named("Integer") is Some(integer)
                         if ancestor_type(f.classes, f.data, own_class_type(f.classes[integer], integer), k) is Some(up)
                             if conforms(up, bound) then return true
                 for b in f.builtins
-                    if builtin_covers(b.ty, x)
+                    if builtin_covers(b.ty, x) && tuple_parts_hold(f, b.owner, b.params, x)
                         if ancestor_type(f.classes, f.data, b.trait_type, k) is Some(up)
                             if conforms(up, bound) then return true
                 return false
@@ -7306,6 +7380,7 @@ private ordering_link(c: *Checker, at: Span, spelling: string, x: &Type, y: &Typ
         TypeVar(_, _, _) -> operator_conforms(c, at, spelling, x, "Ord")
         Data(_, _, _) -> operator_conforms(c, at, spelling, x, "Ord")
         Class(_, _, _) -> operator_conforms(c, at, spelling, x, "Ord")
+        Tuple(_) -> operator_conforms(c, at, spelling, x, "Ord")
         _ -> c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(x)} values")
 
 // Whether a value of type `t` has an operator through the core trait `trait_name`: its type conforms
@@ -7367,9 +7442,6 @@ private interpolate_expr(c: *Checker, e: &Expr, prefix: string, chunks: Buf[stri
 private displayed(c: *Checker, h: &TExpr) -> Option[&TExpr]
     val unit = unit_of(c)
     val t = zonk(c, h.ty)
-    if *t is Tuple(_)
-        c.note(unit, h.span, s"rendering a tuple is not implemented; interpolate its parts")
-        return None
     val display = c.class_types.get(qualified(CoreModule, "Display")) match
         Some(k) -> k
         None ->
@@ -9025,6 +9097,9 @@ private receiver_type_args(c: *Checker, receiver_type: &Type, m: usize) -> Buf[&
         var width: Buf[&Type] = buf()
         width.push(t)
         return width
+    // One of an impl for every tuple of an arity takes the receiver's parts as its parameters.
+    if is_tuple_owner(c.symbols[m].type_owner)
+        if *t is Tuple(parts) then return parts
     // A type parameter has the methods of its bounds, as an instance of them.
     if *t is TypeVar(_, _, _)
         if c.symbols[m].owner_class is Some(k)
