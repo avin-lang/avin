@@ -1,0 +1,192 @@
+module avin
+
+// An immutable indexed sequence whose elements are in one array that nothing writes to after the
+// sequence is made, so `xs(i)` takes constant time, with no level of a tree between the index and
+// the element, and an operation that makes a changed sequence, such as `:+` or `updated`, copies
+// them. It is for a sequence built once and then read.
+class ArraySeq[+T](private val elements: FrozenArray[T]): Seq[T]
+    override length() -> int = elements.length()
+
+    // The element at `index`, which traps when there is none.
+    override apply(index: int) -> T = elements(index)
+
+    // The elements from `from` up to `until`, which traps when the indices are not in order within
+    // the sequence.
+    slice(from: int, until: int) -> ArraySeq[T] = ArraySeq(elements.slice(from, until))
+
+    // `f` of each element, in order.
+    map[U](f: (T) -> U) -> ArraySeq[U]
+        val b = ArraySeq.builder[U]()
+        for i in 0 ..< elements.length() do b.add(f(elements(i)))
+        b.result()
+
+    // The elements that satisfy `p`, in order.
+    filter(p: (T) -> bool) -> ArraySeq[T]
+        val b = ArraySeq.builder[T]()
+        for i in 0 ..< elements.length()
+            val x = elements(i)
+            if p(x) then b.add(x)
+        b.result()
+
+    override toVector() -> Vector[T] = vectorOf(elements)
+
+    override iterator() -> Iterator[T] = ArraySeqIterator(elements, 0)
+
+// The methods an `impl` adds to a class whose fields are all immutable are not variance positions,
+// so `T` may appear in a parameter: on an `ArraySeq[Dog]` seen as an `ArraySeq[Animal]`, `T` is
+// `Animal`.
+impl[T] ArraySeq[T]
+    // The elements of the collections `f` makes of each element, joined in order.
+    flatMap[U](f: (T) -> Iterable[U]) -> ArraySeq[U]
+        val b = ArraySeq.builder[U]()
+        for i in 0 ..< elements.length() do b.addAll(f(elements(i)))
+        b.result()
+
+    // The elements that satisfy `p`, tested only as `map`, `flatMap` or `foreach` reaches each one.
+    withFilter(p: (T) -> bool) -> FilteredArraySeq[T] = FilteredArraySeq(self, p)
+
+    // This sequence with `element` after its elements: `xs :+ x`.
+    :+(element: T) -> ArraySeq[T]
+        val n = elements.length()
+        val a = newArray[T](n + 1)
+        for i in 0 ..< n do a(i) = elements(i)
+        a(n) = element
+        ArraySeq(freeze(a))
+
+    // This sequence with `element` before its elements: `x +: xs`.
+    +:(element: T) -> ArraySeq[T]
+        val n = elements.length()
+        val a = newArray[T](n + 1)
+        a(0) = element
+        for i in 0 ..< n do a(i + 1) = elements(i)
+        ArraySeq(freeze(a))
+
+    // The elements of this sequence followed by those of `other`: `xs ++ ys`.
+    ++(other: ArraySeq[T]) -> ArraySeq[T]
+        val n = elements.length()
+        val m = other.length()
+        val a = newArray[T](n + m)
+        for i in 0 ..< n do a(i) = elements(i)
+        for i in 0 ..< m do a(n + i) = other(i)
+        ArraySeq(freeze(a))
+
+    // This sequence with the element at `index` replaced by `element`; traps when there is none.
+    updated(index: int, element: T) -> ArraySeq[T]
+        if index < 0 || index >= elements.length() then fail("index out of range")
+        val a = newArray[T](elements.length())
+        for i in 0 ..< elements.length() do a(i) = elements(i)
+        a(index) = element
+        ArraySeq(freeze(a))
+
+    // A new array of the elements.
+    toArray() -> Array[T]
+        val a = newArray[T](elements.length())
+        for i in 0 ..< elements.length() do a(i) = elements(i)
+        a
+
+    // A new buffer of the elements.
+    toBuffer() -> Buffer[T]
+        val b = Buffer[T]()
+        for i in 0 ..< elements.length() do b.add(elements(i))
+        b
+
+    // This sequence itself: it is already one.
+    override toArraySeq() -> ArraySeq[T] = self
+
+
+// Two sequences of this kind are equal when they have equal elements in the same order.
+impl[T] Eq for ArraySeq[T]
+    equals(other: ArraySeq[T]) -> bool
+        if elements.length() != other.length() then return false
+        for i in 0 ..< elements.length()
+            if !elements(i).equals(other(i)) then return false
+        true
+
+impl[T] Hash for ArraySeq[T]
+    hash() -> long
+        var h = long(1)
+        for i in 0 ..< elements.length() do h = h *% 31 +% elements(i).hash()
+        h
+
+// A sequence of displayable elements displays as `[1, 2, 3]`, as an array does. A field width pads
+// the whole.
+impl[T: Display] Display for ArraySeq[T]
+    display(out: Writer, spec: FormatSpec)
+        if spec.width > 0
+            val text = StringWriter()
+            display(text, FormatSpec())
+            out.writeField(text.text(), spec)
+            return
+        out.write("[")
+        for i in 0 ..< elements.length()
+            if i > 0 then out.write(", ")
+            elements(i).display(out, FormatSpec())
+        out.write("]")
+
+// The diagnostic form is the elements' diagnostic forms in brackets: `["a", "b"]`.
+impl[T: Debug] Debug for ArraySeq[T]
+    debug(out: Writer, spec: FormatSpec)
+        if spec.width > 0
+            val text = StringWriter()
+            debug(text, FormatSpec())
+            out.writeField(text.text(), spec)
+            return
+        out.write("[")
+        for i in 0 ..< elements.length()
+            if i > 0 then out.write(", ")
+            elements(i).debug(out, FormatSpec())
+        out.write("]")
+
+object ArraySeq
+    // A sequence with no elements.
+    empty[T]() -> ArraySeq[T] = ArraySeq(freeze(newArray[T](0)))
+
+    // A builder of a sequence: the elements it is given, in order.
+    builder[T]() -> ArraySeqBuilder[T] = ArraySeqBuilder(Buffer[T](), false)
+
+// Builds an `ArraySeq` from the elements given to it, which it keeps in a buffer until `result()`.
+class ArraySeqBuilder[T](private val buffer: Buffer[T], private var spent: bool): Builder[T, ArraySeq[T]]
+    override add(element: T)
+        if spent then fail("add to a builder whose result was taken")
+        buffer.add(element)
+
+    override result() -> ArraySeq[T]
+        if spent then fail("result of a builder whose result was taken")
+        spent = true
+        buffer.toArraySeq()
+
+// An `ArraySeq` seen through a test, which a guard of a `for` with `yield` makes: each element is
+// tested just before the call after it would use it, so a guard runs in turn with the rest of the
+// comprehension, element by element.
+class FilteredArraySeq[T](private val seq: ArraySeq[T], private val p: (T) -> bool)
+    // The sequence of `f` of each element that passes the test, in order.
+    map[U](f: (T) -> U) -> ArraySeq[U]
+        val b = ArraySeq.builder[U]()
+        for x in seq
+            if p(x) then b.add(f(x))
+        b.result()
+
+    // The elements of the collections `f` makes of each element that passes the test, in order.
+    flatMap[U](f: (T) -> Iterable[U]) -> ArraySeq[U]
+        val b = ArraySeq.builder[U]()
+        for x in seq
+            if p(x) then b.addAll(f(x))
+        b.result()
+
+    // The elements that pass this test and then `q`.
+    withFilter(q: (T) -> bool) -> FilteredArraySeq[T] = FilteredArraySeq(seq, x -> p(x) && q(x))
+
+    // Calls `f` with each element that passes the test, in order.
+    foreach(f: (T) -> unit)
+        for x in seq
+            if p(x) then f(x)
+
+// Steps through an `ArraySeq`'s elements.
+private class ArraySeqIterator[T](items: FrozenArray[T], private var index: int): Iterator[T]
+    override hasNext() -> bool = index < items.length()
+
+    override next() -> T
+        if index >= items.length() then fail("next on an exhausted iterator")
+        val value = items(index)
+        index += 1
+        value
