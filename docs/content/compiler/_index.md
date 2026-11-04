@@ -26,8 +26,8 @@ Each stage has its own data structures and its own tests. No stage reaches back 
 input. **Types are an enum over symbols, never strings**: built-in types, nominal types, functions,
 tuples, type parameters, inference variables, `Any`, `Nothing` and an error type.
 
-**Loading a program.** `avin build <dir>` takes a directory as the program's root: every `.avin` file
-under it is read in path order, passing over directories whose names begin with `.`, and each is
+**Loading a program.** `avin build <dir>` takes a directory as the program's root: every `.avin` and
+`.lavin` file under it is read in path order, passing over directories whose names begin with `.`, and each is
 given the module its directory's path names, the root directory's files last as the root module.
 A file whose header disagrees with its directory, or that has none outside the root, is reported
 before anything is checked. `avin build <file>` is a program of that one file, in the module its
@@ -40,6 +40,13 @@ against `avin.sum`), and the loader walks each dependency's tree without its roo
 then the package's own; a directory holding its own manifest is passed over. The files and their
 modules are what the later stages see; a dependency's `@test` functions are dropped from the program
 after checking, so `avin test` runs only the package's own.
+
+A [literate](/spec/declarations/#literate-source) `.lavin` file is read by the parser as its program
+laid over the document (`literate.sysl`): the parsing package's `tangle_literate` decides which lines
+are program text and refuses a tab in an indentation or an unclosed fence, and every other byte
+becomes a space, so the program has the document's bytes at the document's offsets. The lexer
+measures indentation past the four-column margin. Every later stage reads that program as its
+unit's source, and every span, line and column is the document's with no mapping.
 
 Names are resolved by module. Every top-level declaration is held under its qualified name, `a.b.X`
 (a root module's under `X`), and a bare name in a file resolves to the first of its own module's
