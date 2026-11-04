@@ -453,6 +453,17 @@ Settled by the user on 2026-11-03:
   table order.
 - Maps and sets display in the shape of their literals: `{a: 1, b: 2}`, `{1, 2, 3}`, and `{"a": 1}`
   with each part's `Debug`. Mutable maps and sets compare and hash by contents, as arrays do.
+- Every `data` type may have a companion, not only one-variant ones: an `object` named after a data
+  type of its module is its companion. A variant of the type's own name stays the constructor in call
+  position; a type with no such variant (`List`) has nothing of its name to call. An object cannot
+  share its name with a variant of another type, nor with a fieldless variant of its own type's name.
+  A `builder` returning a `Builder` of its collection takes its type arguments from the type a
+  literal expects, so their bounds are checked at the call.
+- A sequence literal builds whatever collection is expected through its companion's `builder`,
+  `Set` and `Map` included (`val s: Set[int] = [3, 1, 2]`), until set and map literals have syntax of
+  their own.
+- The arithmetic traits carry their identities: `Add` has `zero` and `Mul` has `one`, so `sum` and
+  `product` of an empty collection are those values rather than an `Option`.
 
 **Deferred**
 
@@ -473,14 +484,6 @@ Settled by the user on 2026-11-03:
   so a racing read sees some value written to that word, and a constructor ends with a release
   fence, so no thread sees an object without its header and constructor-set fields. Actors are
   scheduled onto a pool of these threads.
-- Companions for every `data` type, not only one-variant ones, as `List.builder` needs: an `object`
-  named after a data type of its module is its companion. A variant of the type's own name stays
-  the constructor in call position; a type with no such variant (`List`, whose variants are `Cons`
-  and `Nil`) has nothing of its name to call, and calling its companion is the error calling any
-  object is. An object cannot share its name with a variant of another type, nor with a fieldless
-  variant of its own type's name, whose bare name is already that value. A `builder` declared to
-  return a `Builder` of its collection (`Set.builder[A: Eq + Hash]() -> Builder[A, Set[A]]`) takes
-  its type arguments from the type a literal expects, so their bounds are checked at the call.
 
 ## Open
 
