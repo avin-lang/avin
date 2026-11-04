@@ -46,11 +46,34 @@ struct MirrorLines
     first: usize
     last: usize
 
-/** The manifest of the shim package, depending on the runtime package at `runtime_dir`. */
-shim_manifest(runtime_dir: string) -> string =
-    "package { name = \"avin-shims\", version = \"0.1.0\", sysl = \"0.8.0\" }\n" +
-    "dependencies {\n  avin-runtime { path = \"" + runtime_dir + "\" }\n}\n" +
-    "requires { heap = true, posix = true }\n"
+/** The manifest of the shim package, depending on the runtime package at `runtime_dir` and on each of
+ * the Sysl packages `sysl` the program's manifests name. */
+shim_manifest(runtime_dir: string, sysl: Buf[SyslPackage]) -> string
+    var out = str_builder()
+    out.push("package { name = \"avin-shims\", version = \"0.1.0\", sysl = \"0.8.0\" }\n")
+    out.push("dependencies {\n  avin-runtime { path = " + hocon_text(runtime_dir) + " }\n")
+    for p in sysl
+        val entry = p.origin match
+            Git(c, v) -> "git = " + hocon_text(c) + ", version = " + hocon_text(v)
+            Rev(c, r) -> "git = " + hocon_text(c) + ", rev = " + hocon_text(r)
+            Local(d) -> "path = " + hocon_text(d)
+            Member -> ""
+        out.push("  " + p.label + " { " + entry + " }\n")
+    out.push("}\nrequires { heap = true, posix = true }\n")
+    out.finish()
+
+// A HOCON string holding `text`.
+private hocon_text(text: string) -> string = "\"" + text.replace_all("\\", "\\\\").replace_all("\"", "\\\"") + "\""
+
+/** What a build that links the shims depends on in the Sysl packages `sysl` beyond their manifest
+ * entries: the sources of each one in a directory, which change with no new version. A fetched
+ * package is named by its version or commit, which the manifest holds. */
+sysl_fingerprint(sysl: Buf[SyslPackage]) -> string
+    var out = str_builder()
+    for p in sysl
+        if p.origin is Local(d)
+            out.push(p.label + "\n" + tree_fingerprint(d))
+    out.finish()
 
 // The shim source as it is written, the line the next text starts on, and the conversions of data
 // types it holds: one function for each type in each direction, named by its position here, with
@@ -500,13 +523,13 @@ private out_of_sysl(t: &Type, r: string) -> string = *t match
  * program's shims, built once for each shim source, Sysl version and runtime source, and kept in the
  * toolchain's cache. An error is the diagnostics of a shim Sysl rejected, reported at the bindings,
  * or why the shims could not be built. */
-ensure_shims(tc: Toolchain, bindings: Buf[MirBinding], units: Buf[SourceUnit]) -> Result[string, string]
+ensure_shims(tc: Toolchain, bindings: Buf[MirBinding], units: Buf[SourceUnit], sysl: Buf[SyslPackage]) -> Result[string, string]
     val shim = shim_source(bindings)
-    val manifest = shim_manifest(tc.runtime_dir())
+    val manifest = shim_manifest(tc.runtime_dir(), sysl)
     val version = capture(tc.sysl, ["--version"], timeout = 60000) match
         Ok(r) -> r.text
         Err(e) -> return Err("avin: " + missing_tool(tc.sysl, e.to_string()))
-    val archive = tc.shim_cache() + "/" + content_key(manifest + shim.text + version + runtime_fingerprint(tc)) + ".a"
+    val archive = tc.shim_cache() + "/" + shim_key(manifest, shim.text, version, runtime_fingerprint(tc), sysl) + ".a"
     if exists(archive) then return Ok(archive)
     make_dir_all(tc.shim_cache()).map_err(e -> e.to_string())?
     val dir = make_temp_dir("avin-shims").map_err(e -> e.to_string())?
@@ -554,6 +577,13 @@ shim_diagnostics(output: string, shim: ShimSource, bindings: Buf[MirBinding], un
             k match
                 Some(i) ->
                     val b = bindings[i]
+                    // A binding whose import failed is also undefined where its shim calls it, which
+                    // says nothing more.
+                    if message.starts_with("undefined function 'bound_")
+                        message = ""
+                        continue
+                    if message.starts_with("no module is called ")
+                        message = message + ": a binding reaches Sysl's standard library and the Sysl packages the manifest names in `sysl-dependencies`"
                     var r = report()
                     r.add(error(b.span, s"the Sysl binding `${b.name}` does not match `${b.target}`: $message"))
                     rendered = rendered + r.render(units[b.unit].src)
@@ -598,6 +628,12 @@ private owner_of(shim: ShimSource, line: usize) -> Option[usize]
         if shim.imports[i] == line || line >= shim.first[i] && line <= shim.last[i] then return Some(i)
     None
 
+/** The name a shim archive is cached under: a key over the shim package's manifest, which names each
+ * Sysl package at its version, the shim source, the Sysl version, the runtime's sources, and the
+ * sources of each Sysl package in a directory. */
+shim_key(manifest: string, shim: string, sysl_version: string, runtime: string, sysl: Buf[SyslPackage]) -> string =
+    content_key(manifest + shim + sysl_version + runtime + sysl_fingerprint(sysl))
+
 /** A cache key: the first half of a SHA-256 of everything a cached file is built from, in hex. */
 content_key(text: string) -> string
     val digest = sha256(text.bytes)
@@ -611,9 +647,13 @@ content_key(text: string) -> string
 /** The runtime's sources, each file's path in the runtime and its text, in the order of their paths,
  * which a shim archive is built from as much as from the shims, and every executable is linked with.
  * The paths are the runtime's own, so the same sources installed anywhere read the same. */
-runtime_fingerprint(tc: Toolchain) -> string
+runtime_fingerprint(tc: Toolchain) -> string = tree_fingerprint(tc.runtime_dir())
+
+/** The sources of the Sysl package at `dir`, as `runtime_fingerprint` lists the runtime's: its Sysl
+ * files, manifests, sum files and any C it carries, leaving out its `.sysl` working directory. */
+tree_fingerprint(dir: string) -> string
     var files: Buf[string] = buf()
-    var entries = walk(tc.runtime_dir())
+    var entries = walk(dir)
     loop
         val entry = entries.next() match
             Some(Ok(e)) -> e
@@ -622,11 +662,12 @@ runtime_fingerprint(tc: Toolchain) -> string
         if entry.is_dir() && entry.path.ends_with("/.sysl")
             entries.skip_dir()
             continue
-        if entry.path.ends_with(".sysl") || entry.path.ends_with(".hocon") || entry.path.ends_with(".sum")
-            files.push(entry.path)
+        val p = entry.path
+        if p.ends_with(".sysl") || p.ends_with(".hocon") || p.ends_with(".sum") || p.ends_with(".c") || p.ends_with(".h")
+            files.push(p)
     val sorted = files.view()
     sort(sorted)
-    val prefix = tc.runtime_dir().bytes.len
+    val prefix = dir.bytes.len
     var out = str_builder()
     for f in sorted
         out.push(f[prefix..] + "\n" + read_text(f).unwrap_or("") + "\n")

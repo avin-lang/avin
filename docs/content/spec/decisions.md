@@ -81,6 +81,18 @@ a decision changes, this page and the chapter change together.
   an impl. A `var` field satisfies a `val`; a method or a private field does not. Read through the
   trait it is a method table entry the compiler fills with a method that loads the field; read
   through a class type it is the field. It is never assigned through the trait.
+- Traits may hold state (settled, user, 2026-11-04). A trait declares a field with a value,
+  `val name: T = expr` or `var name: T = expr`, and every class and object conforming to it stores
+  one of its own. Through the class's type it is the class's field; through the trait, or a type
+  parameter the trait bounds, it is read and assigned through method table entries the compiler
+  fills with a method that loads or stores the class's field. Construction runs the superclass
+  first, then stores the class's parameters, then computes the fields of the traits the superclass
+  does not already conform to, a trait's required traits before it and each trait once, in the order
+  of the `:` list, then runs the class body. A trait's field's value may read the fields initialized
+  before it and uses `self` for nothing else. Only a class or an object conforms to a trait holding
+  state, or requiring one that does: an impl of it for a `data` type, a built-in type or a tuple is an
+  error. A class declaring a field of a trait field's name, or conforming to two traits that declare
+  fields of one name, is an error.
 - An `object` may extend an `open` or `abstract` class, constructed from the top down as a subclass
   is, overriding its methods and conforming to it; it implements every abstract member it inherits.
 - A trait's method, or an overridable class method, may have type parameters of its own and be
@@ -312,6 +324,11 @@ a decision changes, this page and the chapter change together.
 - An interpolated string is a method call on `StringContext`: `p"a $x b"` is
   `StringContext(["a ", " b"]).p(x)`. `s`, `f` and `raw` are library methods, and a program defines
   its own interpolator by implementing a trait for `StringContext`.
+- A user-defined interpolator is visible where it is imported (settled by the user, 2026-11-04): in
+  the module that declares it, in a file importing that module whole, and in a file importing one of
+  its declarations by name. `s`, `f` and `raw` need no import. A module that merely imports another
+  does not pass its interpolators on, and using one that is not in scope is an error naming the
+  module to import.
 - Interpolated literals follow Scala's lexing (settled 2026-11-04). A backslash and a `"` or
   `\` after it are skipped as a pair, so `raw"a\"b"` holds `a\"b`, `raw"a\"` is unterminated and
   `raw"a\\"` ends, holding two backslashes; `$"` is a double quote and `$$` a dollar sign in every interpolator. The lexer reads
@@ -594,6 +611,18 @@ Settled by the user on 2026-11-03:
 
 Settled by the user on 2026-11-04:
 
+- **`From[E]` is one generic trait, implemented once per source error type** by the type the
+  errors convert to: `impl From[IoError] for ConfigError` beside `impl From[ParseError] for
+  ConfigError`. A type may implement one generic trait at several type arguments where the trait's
+  members are all static and it requires no other trait, as `From`'s one member,
+  `static from(value: E) -> Self`, is; any other trait is implemented once. `?` on a `Result[U, E]`
+  in a function yielding `Result[T, F]` passes the error on unchanged where `E` is an `F`, and
+  otherwise through `F.from`: at `From[E]`, or else at the one conformance `From[X]` with `E` an `X`
+  that is more specific than every other such. Neither is an error naming `From[E]`; several equally
+  specific ones are an error naming them. On a type parameter the conformances are its bounds',
+  `F: From[IoError] + From[ParseError]`. See [errors](/spec/errors/) and
+  [declarations](/spec/declarations/#impl).
+
 - **`compareAndSet` on a value without identity** — a data value, tuple, string, `Option` or `Any` —
   **compares with `==`; on scalars and references it compares the word.** A class instance (even of
   a class that derives `Eq`) and a function value keep identity. See
@@ -804,6 +833,24 @@ Settled by the user on 2026-11-04:
   already a free name. This amends the rule above. See [methods named by
   symbols](/spec/operators-and-control-flow/#methods-named-by-symbols).
 
+- **The arithmetic operators `+ - * / %` and the orderings `< <= > >=` are free method names on
+  data types, classes and traits, with any operand and result types** (user, 2026-11-04), beside
+  the operator traits, which stay for generic code: `Instant + Duration -> Instant`,
+  `Instant - Instant -> Duration`, `Vec * real`. Such methods overload by the operand's type like
+  any other. `a + b` calls `a`'s method `+` where `a`'s type (a data type, a class, or a type
+  parameter through its bounds) has one taking one argument, at the built-in operator's own
+  precedence; where it has none, the operator is the core trait's (`Add`'s `add`), as before. The
+  method is just a method: on a type with both, the operator calls the method and code bounded by
+  `Add` calls `add`. Prefix `-a` calls a method `-` taking no argument (`-() -> Vec`), and otherwise
+  is `Neg`'s `negate`. `a < b` alone calls the method `<`, whatever it yields; a comparison by a
+  method does not chain, and `a < b < c` through one is an error saying to join the comparisons with
+  `&&`. `x += y` calls `+=` where the type has one and is otherwise `x = x + y`, the method `+`
+  included. The built-in types keep their operators: a method of one of these names on `int`,
+  `real`, `byte`, `char`, `string`, `bool` or a tuple, by an extension or a trait implementation, is
+  an error. `==` and `!=` stay `Eq`'s, and the wrapping, saturating and yielding forms stay
+  reserved. `avin.time` spells its reading arithmetic with them. This amends the two rules above.
+  See [methods named by symbols](/spec/operators-and-control-flow/#methods-named-by-symbols).
+
 - **`not` is a soft keyword: a keyword only directly after `is`** (user, 2026-11-04), so the parsing
   library can name its negative lookahead `not(p)`. After `is` it is always the keyword, so `x is
   not(y)` negates the pattern `(y)`; everywhere else it is an ordinary name, and a function, method,
@@ -895,6 +942,12 @@ Settled by the user on 2026-11-04:
     compilation reads the prelude and then only the library modules something imports,
     transitively, so the library can grow without every program parsing all of it. Domain libraries
     are packages (as settled for `dev.avinlang`). The standard library has no features.
+- **Integer limits and narrowing** (user, 2026-11-04). `MinValue` and `MaxValue` on every integer type
+  (`int.MaxValue`, `long.MinValue`, `i8.MaxValue`, any `iN`), on `byte` and on `char`, and on `real`
+  `MaxValue`, `MinValue`, `MinPositiveValue`, `PositiveInfinity`, `NegativeInfinity` and `NaN`, all
+  compile-time constants. Narrowing integer conversions (`i8(x)`, `int(l)`, `T(n)`, and a byte or char to
+  a narrower integer) trap when the value does not fit; real-to-integer still saturates. The wrapping
+  form, `i8.wrap(x)` (spelling proposed below), keeps the low bits. Not yet: the limits of a type parameter bounded by `Integer` (`T.MaxValue`).
 
 **Deferred**
 
@@ -903,6 +956,16 @@ Settled by the user on 2026-11-04:
 - Async and await.
 
 ## Proposed
+
+- Trait fields ([declarations](/spec/declarations/#trait)): a trait's field declares its type, since
+  each conforming class's layout and the trait's `val` are known before any body is checked; it is
+  public, as every member of a trait is, and is never `lazy`. A class never overrides a trait's
+  field, `val` or `var`: declaring a field of its name is an error rather than an override. A trait
+  never redeclares, with a value, a `val` of a trait it requires.
+- The wrapping conversion is spelled `i8.wrap(x)`, as the wrapping operators are spelled `+%`: the
+  integer type's name, `.wrap`, one operand, any integer target (a bounded type parameter included,
+  `T.wrap(n)`). The core library needs it to test whether a value fits a narrower width (the formatter
+  converts a generic integer to `long` and back). Awaiting the user.
 
 - Literal shapes ([collections](/spec/collections/#literals)): each of the library's collections is
   built only by the literal of its own shape: every `Seq` by `[a, b]`, `Set`, `TreeSet` and the
@@ -1058,15 +1121,24 @@ Settled by the user on 2026-11-04:
   all. `==` between two sequence types needs the same element type on both sides (a `Vector[int]`
   and a `List[string]` are a compile-time error, as any two types with no common type are); a
   value typed as `Seq[T]` compares with any sequence. A class that implements `Eq` itself keeps its
-  own equality between two of its instances. Through `Any` the values' own types still decide, so
-  a vector and a list held as `Any` are unequal. The mutable `Array`, `Buffer` and `Deque` compare
+  own equality between two of its instances. Settled (user, 2026-11-04): through `Any` and
+  trait-typed values sequences of equal elements in order are equal whatever their class, with
+  hashes that agree (`val a: Any = [1, 2]; a == List(1, 2)` is `true`); the elements are compared
+  as `Any` values are, so `[1] == ["a"]` held as `Any` is `false`. An `Array` is a `Seq` here and
+  compares by contents, as it already did. The mutable `Array`, `Buffer` and `Deque` compare
   as they are when the comparison runs, so a hash held across a change is stale, as it was before.
-- Ranges of other integer types as values (`Range[long]`, `Range[i16]`) are not decided. The
-  endpoint type would be an `[T: Integer]` parameter, but the count of a range of `long`s or of
-  `i8`s needs a type wider than `T`, a `Seq[T]`'s `length()` is an `int` that a `long` range can
-  exceed (trapping, as `int.min .. int.max` does), and a bare `Range` written in signatures means
-  the `int` range today. `for` over a range written in place already counts any integer type.
-  Awaiting the user's choice of how `Range` is spelled and what type its `by` step has.
+- **Ranges of other integer types are `NumericRange[T: Integer]`** (settled, user, 2026-11-04).
+  `Range` stays the `int` range, and a bare `Range` in a signature means it. `a..b` and `a..<b`
+  written as values make a `NumericRange[T]` where the bounds are integers of any type other than
+  `int` (`long`, `i8`, `i16`, …); an integer literal bound takes its type from the other bound, and
+  bounds of two types are an error. `by` takes a step of the same type, `T`. It is a `Seq[T]`
+  with the `Range` rules: a zero step traps, a range is empty when its start lies past its limit in
+  the step's direction, and iteration stops without stepping past the limit, so it never passes
+  either end of `T`. `get`, `apply`, `head`, `contains` and `isEmpty` are answered from the bounds
+  and never wrap, at any width; `length()` traps beyond `int`, and `last()` and the other
+  questions that count the values trap for a range whose ends are more than the largest `long`
+  apart (the smallest `long` to the largest), which only a range of `long`s can be. `for` over a range
+  written in place already counted any integer type, and still does.
 - Value definitions in a `for` with `yield` ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
   `pattern = value` after a generator, each with its own `if` guards, written with no `val`, and
   never first. It is evaluated once per element that reaches it and binds in what follows. Where no
@@ -1173,10 +1245,23 @@ Settled by the user on 2026-11-04:
 - [`avin.time`](/spec/system-library/#avin-time): `Duration`, `Instant` (monotonic) and `WallTime`
   (wall clock, a `Duration` since the 1970 epoch) are data types counting whole microseconds in a
   `long`, overflow trapping; the two clocks are distinct types so their readings never mix. A
-  duration implements `Add`, `Sub`, `Neg`; an instant combines with a duration through `plus`,
-  `minus` and `since`, because an operator trait takes and yields the implementing type alone. The
+  duration implements `Add`, `Sub`, `Neg`, and scales by a `long` with its methods `*` and `/`; a
+  reading combines with a duration through its methods `+` and `-`, and two readings of one clock
+  through `-` (or `since`), which yields their `Duration`. The
   text forms are a duration's largest-unit form (`1.5ms`) and an ISO 8601 UTC timestamp. Sleeping
   and calendar fields beyond the timestamp text are not part of it yet.
+- Bindings to Sysl packages ([packages](/spec/packages/#sysl-dependencies),
+  [bindings](/spec/sysl-bindings/#sysl-packages)): a manifest names the Sysl packages its bindings
+  reach in a block of its own, `sysl-dependencies`, beside `dependencies`, each entry written as an
+  Avin dependency is (`git` with `version` or `rev`, or `path`; never `workspace`). The block is
+  separate because Sysl, not Avin, resolves, fetches and verifies those packages: they are not
+  Avin packages, so they take no part in Avin's version selection, `avin.sum`, `avin add` or
+  `avin tidy`. The shim package's manifest lists every Sysl dependency of every package in the
+  program, so a library's bindings build in any program that uses it; one name at two releases of
+  one coordinate takes the higher, and one name with any other two origins is refused naming both.
+  A fetched package may not name a Sysl directory. The shim archive and the cached executable are
+  keyed by these entries and by the sources of each Sysl package named by directory. Sysl's other
+  dependency keys (`mount`, `features`, `options`) are not offered yet.
 - The rest of the system library ([system library](/spec/system-library/)), each module following
   the reference standard library's names and shapes where Avin's rules allow:
   - **[The environment and the platform](/spec/system-library/#the-environment-and-the-platform)**
