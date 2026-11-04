@@ -116,6 +116,24 @@ given any two other origins is refused at the manifest line, naming both:
 error: the Sysl dependency `digits` is github.com/o/digits v0.1.0 here and the directory /work/digits in `app`: one name is one Sysl package, so make them agree
 ```
 
+**The C libraries a Sysl package needs are linked into the program.** A Sysl package that binds a
+library the machine supplies says so in its own files, and Avin links what it says, as Sysl links
+its own programs: each library a module names with `@link` is passed as `-l<name>`, and each module
+its manifest requires under `requires { pkg_config { … } }` is linked with the flags `pkg-config
+--libs` answers on the machine at that link. A program binding the `sqlite3` package therefore needs
+nothing more in its own manifest than the package:
+
+```hocon
+sysl-dependencies {
+  sqlite3 { git = "github.com/sysl-lang/sqlite3", version = "0.7.1" }
+}
+```
+
+The libraries are kept beside the shims' cached archive, so a cached build links them too; the
+`pkg-config` question is asked again at every link, so a library that moved is still found. A
+`pkg_config` module the machine does not know stops the link with the command that failed. The C a
+package carries in its own tree is compiled into the shims' archive and needs nothing at the link.
+
 ### What a dependency brings in
 
 **A dependency's modules come in under their own names.** A package `geometry` whose directory holds

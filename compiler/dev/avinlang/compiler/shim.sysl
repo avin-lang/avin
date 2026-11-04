@@ -616,7 +616,9 @@ ensure_shims(tc: Toolchain, bindings: Buf[MirBinding], handles: Buf[MirHandle], 
         Ok(r) -> r.text
         Err(e) -> return Err("avin: " + missing_tool(tc.sysl, e.to_string()))
     val archive = tc.shim_cache() + "/" + shim_key(manifest, shim.text, version, runtime_fingerprint(tc), sysl) + ".a"
-    if exists(archive) then return Ok(archive)
+    // An archive is whole with the libraries it needs beside it; one without them was cached before
+    // they were kept, and is built again.
+    if exists(archive) && exists(link_needs_file(archive)) then return Ok(archive)
     make_dir_all(tc.shim_cache()).map_err(e -> e.to_string())?
     val dir = make_temp_dir("avin-shims").map_err(e -> e.to_string())?
     defer _ = remove_dir_all(dir)
@@ -632,8 +634,63 @@ ensure_shims(tc: Toolchain, bindings: Buf[MirBinding], handles: Buf[MirHandle], 
     if !result.status.ok()
         val output = result.err.unwrap_or("") + result.text
         return Err(shim_diagnostics(output, shim, bindings, units))
+    // The libraries are published first, so an archive is never seen without them.
+    val needs = link_needs_file(archive)
+    val pending_needs = pending_name(needs)
+    defer _ = remove_file(pending_needs)
+    write_text(pending_needs, link_needs(result.err.unwrap_or("") + "\n" + result.text)).map_err(e -> e.to_string())?
+    publish_file(pending_needs, needs).map_err(e -> e.to_string())?
     publish_file(pending, archive).map_err(e -> e.to_string())?
     Ok(archive)
+
+/** The file beside a shim archive that lists the C libraries the archive's Sysl packages need at
+ * the link, one to a line: `lib <name>` for a library a package names with `@link`, and
+ * `pkg <name>` for a `pkg_config` module a package requires, whose flags are asked for at each link,
+ * so a library that moves on the machine is still found. */
+link_needs_file(archive: string) -> string = archive + ".link"
+
+// What `sysl build-c` says the archive's link line still needs: what `@link` named, and the
+// `pkg_config` modules the packages require.
+private const LinkLibraries: string = "sysl: link this against: "
+private const LinkModules: string = "sysl: and against what the packages require, which pkg-config answers for: pkg-config --libs "
+
+/** The libraries `sysl build-c`'s report says an archive needs, in the form of `link_needs_file`. */
+link_needs(output: string) -> string
+    var out = str_builder()
+    for text in output.split("\n")
+        if text.starts_with(LinkLibraries)
+            for name in text[LinkLibraries.bytes.len..].split(",")
+                val n = name.trim()
+                if n != "" then out.push("lib " + n + "\n")
+        elif text.starts_with(LinkModules)
+            for name in text[LinkModules.bytes.len..].split(" ")
+                val n = name.trim()
+                if n != "" then out.push("pkg " + n + "\n")
+    out.finish()
+
+/** The linker flags for the libraries a `link_needs_file` lists: `-l` for each library the C
+ * runtime does not already carry, then what `pkg-config --libs` answers for the modules. */
+link_flags(needs: string) -> Result[Buf[string], string]
+    var flags: Buf[string] = buf()
+    var modules: Buf[string] = buf()
+    modules.push("--libs")
+    for text in needs.split("\n")
+        if text.starts_with("lib ")
+            val name = text["lib ".bytes.len..]
+            // Every program is linked with the C runtime and `-lm` already.
+            if name != "c" && name != "m" then flags.push("-l" + name)
+        elif text.starts_with("pkg ")
+            modules.push(text["pkg ".bytes.len..])
+    if modules.len() == 1 then return Ok(flags)
+    var asked = "pkg-config"
+    for m in modules
+        asked = asked + " " + m
+    val result = capture("pkg-config", modules.view(), stderr = true, timeout = 60000).map_err(e -> s"the Sysl packages need the flags `$asked` answers, and it could not run: ${e.to_string()}")?
+    if !result.status.ok()
+        return Err(s"the Sysl packages need the flags `$asked` answers, and it failed: ${result.status.to_string()}\n${result.err.unwrap_or("")}${result.text}")
+    for word in result.text.replace_all("\n", " ").replace_all("\t", " ").split(" ")
+        if word != "" then flags.push(word)
+    Ok(flags)
 
 /** Sysl's diagnostics of a shim, each reported at the binding whose part of the shim it is in, or
  * the whole output when one of them is elsewhere. */
