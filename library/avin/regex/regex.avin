@@ -6,12 +6,37 @@ module avin.regex
 // matches one character, however many bytes encode it.
 
 // A compiled pattern, as a `Regex` holds it.
-class Pattern(private val text: string, private val groups: int)
+class Pattern(private val text: string, private val program: Program, private val patternNames: Vector[(string, int)])
     // The pattern as it was written.
     pattern() -> string = text
 
     // The number of capturing groups, not counting the whole match.
-    groupCount() -> int = groups
+    groupCount() -> int = program.groupCount - 1
+
+    // The pieces of `input` between the matches of the pattern, left to right. An empty match at
+    // the very start makes no empty first piece; a text the pattern does not match is one piece.
+    // With a `limit` above 0 there are at most `limit` pieces, the last holding the rest of the
+    // text; with 0 the empty pieces at the end are dropped; below 0 every piece is kept.
+    split(input: string, limit: int = 0) -> Array[string]
+        val e = Searched(input, program, patternNames, Vector.empty[string]())
+        val pieces = Buffer[string]()
+        var index = 0
+        val limited = limit > 0
+        while e.findNext()
+            val m = e.snapshot()
+            if !limited || pieces.length() < limit - 1
+                if !(index == 0 && m.start() == 0 && m.end() == 0)
+                    pieces.add(input.slice(index, m.start()))
+                    index = m.end()
+            elif pieces.length() == limit - 1
+                pieces.add(input.slice(index, input.byteLength()))
+                index = m.end()
+        if index == 0 then return Array.fill(1, input)
+        if !limited || pieces.length() < limit then pieces.add(input.slice(index, input.byteLength()))
+        var kept = pieces.length()
+        if limit == 0
+            while kept > 0 && pieces(kept - 1).isEmpty() do kept -= 1
+        pieces.toArray().slice(0, kept)
 
 impl Display for Pattern
     display(out: Writer, spec: FormatSpec) = out.writeField(text, spec)
@@ -22,7 +47,7 @@ impl Display for Pattern
 // names the pattern gives them.
 class Regex(private val text: string, private val program: Program, private val patternNames: Vector[(string, int)], private val names: Vector[string], private val unanchoredMatch: bool)
     // The compiled pattern.
-    pattern() -> Pattern = Pattern(text, program.groupCount - 1)
+    pattern() -> Pattern = Pattern(text, program, patternNames)
 
     // The pattern as it was written.
     regex() -> string = text
@@ -60,6 +85,26 @@ class Regex(private val text: string, private val program: Program, private val 
     // Every match in `source`, as `findAllIn` finds them.
     findAllMatchIn(source: string) -> Iterator[Match] = findAllIn(source).matchData()
 
+    // `target` with every match replaced by `replacement`, in which `$n` and `${name}` stand for
+    // what a group matched (nothing where it took no part) and a backslash makes the character after
+    // it literal. A reference to a group the pattern does not have traps, as does a `$` or `\` with
+    // nothing after it.
+    replaceAllIn(target: string, replacement: string) -> string = replacing(target, m -> Some(replacement), false)
+
+    // `target` with every match `m` replaced by `replacer(m)`, read as a replacement is.
+    replaceAllIn(target: string, replacer: (Match) -> string) -> string = replacing(target, m -> Some(replacer(m)), false)
+
+    // `target` with its first match replaced by `replacement`.
+    replaceFirstIn(target: string, replacement: string) -> string = replacing(target, m -> Some(replacement), true)
+
+    // `target` with each match `m` for which `replacer(m)` gives a replacement replaced by it; the
+    // others are kept as they are.
+    replaceSomeIn(target: string, replacer: (Match) -> Option[string]) -> string = replacing(target, replacer, false)
+
+    // The pieces of `toSplit` between the matches, as `pattern().split(toSplit)`: the empty pieces
+    // at the end are dropped.
+    split(toSplit: string) -> Array[string] = pattern().split(toSplit)
+
     // The same pattern, where `matches` asks whether any part of the text matches.
     unanchored() -> Regex = Regex(text, program, patternNames, names, true)
 
@@ -67,6 +112,25 @@ class Regex(private val text: string, private val program: Program, private val 
     anchored() -> Regex = Regex(text, program, patternNames, names, false)
 
     private searching(source: string) -> Searched = Searched(source, program, patternNames, names)
+
+    // `target` with the matches `replacer` gives a replacement for replaced, the first only when
+    // `once`.
+    private replacing(target: string, replacer: (Match) -> Option[string], once: bool) -> string
+        val e = searching(target)
+        val out = StringWriter()
+        var copied = 0
+        var going = e.findNext()
+        while going
+            val m = e.snapshot()
+            replacer(m) match
+                Some(replacement) ->
+                    out.write(target.slice(copied, m.start()))
+                    expandReplacement(out, replacement, m, patternNames)
+                    copied = m.end()
+                None -> ()
+            going = !once && e.findNext()
+        out.write(target.slice(copied, target.byteLength()))
+        out.text()
 
 impl Display for Regex
     display(out: Writer, spec: FormatSpec) = out.writeField(regex(), spec)
@@ -81,6 +145,92 @@ object Regex
     compile(regex: string, groupNames: string*) -> Result[Regex, PatternError]
         val parsed = parsePattern(regex)?
         Ok(Regex(regex, compileProgram(parsed), parsed.names, groupNames, false))
+
+    // A pattern that matches `text` literally: the text between `\Q` and `\E`, with each `\E` in it
+    // written so that it does not end the quotation.
+    quote(text: string) -> string
+        val out = StringWriter()
+        out.write("\\Q")
+        var current = 0
+        var found = text.indexOf("\\E", current)
+        while found.nonEmpty()
+            val at = found.get()
+            out.write(text.slice(current, at))
+            out.write("\\E\\\\E\\Q")
+            current = at + 2
+            found = text.indexOf("\\E", current)
+        out.write(text.slice(current, text.byteLength()))
+        out.write("\\E")
+        out.text()
+
+    // A replacement that writes `text` literally: each `\` and `$` in it with a backslash before it.
+    quoteReplacement(text: string) -> string
+        if !text.contains("\\") && !text.contains("$") then return text
+        val out = StringWriter()
+        for c in text.chars()
+            if c == '\\' || c == '$' then out.write("\\")
+            out.write(c.toString())
+        out.text()
+
+// Writes `replacement` to `out` with its group references filled in from `m`: `$` and the longest
+// run of digits naming a group the pattern has (the first digit always counts), `${name}` for a
+// group the pattern names, and a backslash making the character after it literal.
+private expandReplacement(out: StringWriter, replacement: string, m: Match, patternNames: Vector[(string, int)])
+    val n = replacement.byteLength()
+    var plain = 0
+    var i = 0
+    while i < n
+        val c = replacement.charAt(i)
+        if c == '\\'
+            out.write(replacement.slice(plain, i))
+            i += 1
+            if i == n then fail("character to be escaped is missing")
+            val width = charWidth(int(replacement.charAt(i)))
+            out.write(replacement.slice(i, i + width))
+            i += width
+            plain = i
+        elif c == '$'
+            out.write(replacement.slice(plain, i))
+            i += 1
+            if i == n then fail("Illegal group reference: group index is missing")
+            var group = -1
+            if replacement.charAt(i) == '{'
+                i += 1
+                val nameStart = i
+                while i < n && isAsciiAlnum(replacement.charAt(i)) do i += 1
+                if i == nameStart then fail("named capturing group has 0 length name")
+                if i == n || replacement.charAt(i) != '}' then fail("named capturing group is missing trailing '}'")
+                val name = replacement.slice(nameStart, i)
+                if digitOf(name.charAt(0)) >= 0 then fail("capturing group name {" + name + "} starts with digit character")
+                for (known, index) in patternNames
+                    if group < 0 && known == name then group = index
+                if group < 0 then fail("No group with name {" + name + "}")
+                i += 1
+            else
+                group = digitOf(replacement.charAt(i))
+                if group < 0 then fail("Illegal group reference")
+                i += 1
+                var more = true
+                while more && i < n
+                    val d = digitOf(replacement.charAt(i))
+                    if d < 0 || group * 10 + d > m.groupCount()
+                        more = false
+                    else
+                        group = group * 10 + d
+                        i += 1
+            if m.start(group) >= 0 then out.write(m.source.slice(m.start(group), m.end(group)))
+            plain = i
+        else
+            i += charWidth(int(c))
+    out.write(replacement.slice(plain, n))
+
+// The value of an ASCII digit, -1 for any other character.
+private digitOf(c: char) -> int = if c >= '0' && c <= '9' then int(c) - int('0') else -1
+
+private isAsciiAlnum(c: char) -> bool = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+
+// The number of bytes that encode the character `code`.
+private charWidth(code: int) -> int = if code < 0x80 then 1 elif code < 0x800 then 2 elif code < 0x10000 then 3 else 4
 
 impl string
     // The string compiled as a pattern, as `Regex(self, groupNames*)`.
@@ -125,8 +275,7 @@ private decode(s: string, offsets: Buffer[int]) -> Array[int]
         offsets.add(i)
         val c = s.charAt(i)
         codes.add(int(c))
-        val code = int(c)
-        i += if code < 0x80 then 1 elif code < 0x800 then 2 elif code < 0x10000 then 3 else 4
+        i += charWidth(int(c))
     offsets.add(n)
     codes.toArray()
 
