@@ -8417,18 +8417,49 @@ private do_while_form(e: &Expr, body: &Expr, condition: &Expr, otherwise: Option
     items.push(Expr(e.span, While(test, body, otherwise)))
     Expr(e.span, Block(items, false))
 
-// `a..b` and `a..<b` written as values make the core library's `Range` of `int`s, by its
-// constructor, with a step of one.
+// `a..b` and `a..<b` written as values make the core library's `Range` where the bounds are `int`s
+// and its `NumericRange` where they are any other integer type, by the constructor, with a step of
+// one. Each bound is evaluated once, left to right, and an integer literal takes its type from the
+// other bound.
 private range_expr(c: *Checker, e: &Expr, lower: &Expr, upper: &Expr, inclusive: bool) -> &TExpr
-    val k = core_class(c, "Range") match
+    val unit = unit_of(c)
+    val at = e.span
+    val tag = s"${at.start}"
+    val mark = c.body.visible.len()
+    val literal_first = is_literal(lower) && !is_literal(upper)
+    var lo: &TExpr = TExpr(at, ErrorType, UnitConst)
+    var hi: &TExpr = TExpr(at, ErrorType, UnitConst)
+    if literal_first
+        hi = check_expr(c, upper, None)
+        lo = check_expr(c, lower, Some(zonk(c, hi.ty)))
+    else
+        lo = check_expr(c, lower, None)
+        hi = check_expr(c, upper, Some(zonk(c, lo.ty)))
+    val ty = zonk(c, lo.ty)
+    if !(*ty is Int(_))
+        if settled(ty) then c.note(unit, e.span, s"a range counts integers, not ${type_name(ty)}")
+        return TExpr(at, ErrorType, UnitConst)
+    if !fits(c, hi.ty, ty)
+        c.note(unit, e.span, s"a range's bounds have one integer type, not ${type_name(ty)} and ${type_name(zonk(c, hi.ty))}")
+        return TExpr(at, ErrorType, UnitConst)
+    val wide = *ty match
+        Int(bits) -> bits != IntBits
+        _ -> false
+    val k = core_class(c, if wide then "NumericRange" else "Range") match
         Some(k) -> k
         None -> return unsupported(c, e, "a range")
+    var lets: Buf[&TExpr] = buf()
+    hold(c, at, s"range lo $tag", ty, lo, &lets)
+    hold(c, at, s"range hi $tag", ty, hi, &lets)
     var args: Buf[Argument] = buf()
-    args.push(Argument(lower.span, None, lower, false))
-    args.push(Argument(upper.span, None, upper, false))
+    args.push(Argument(lower.span, None, name_at(lower.span, s"range lo $tag"), false))
+    args.push(Argument(upper.span, None, name_at(upper.span, s"range hi $tag"), false))
     args.push(Argument(e.span, None, Expr(e.span, IntLit("1")), false))
     args.push(Argument(e.span, None, Expr(e.span, BoolLit(inclusive)), false))
-    call_function(c, e.span, e.span, c.classes[k].constructor, args, None, None, buf())
+    val made = call_function(c, e.span, e.span, c.classes[k].constructor, args, None, None, buf())
+    c.body.visible.truncate(mark)
+    lets.push(made)
+    TExpr(at, made.ty, Block(lets))
 
 // `for pattern in source body` runs the body once for each element of `source`, bound by `pattern`,
 // as a `while` loop whose `break` and `continue` are the `for`'s. Each kind of source has its own
