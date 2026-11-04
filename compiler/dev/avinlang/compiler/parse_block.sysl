@@ -236,6 +236,23 @@ parse_do(p: *Parser, at: Span) -> &Expr
 
 match_expression(p: *Parser, subject: &Expr) -> &Expr
     p.expect_kind(Indent, "expected indented match arms")
+    val arms = match_arms(p)
+    Expr(subject.span.to(p.toks.here()), Match(subject, arms))
+
+// `match` with nothing before it is a function of the value its arms match. The arms are an
+// indented block, as after `x match`, or one arm on the `match` line: `xs.collect(match Some(n) -> n)`.
+match_function(p: *Parser, at: Span) -> &Expr
+    if p.accept_kind(Indent) then return Expr(at.to(p.toks.here()), MatchFunction(match_arms(p)))
+    var arms: Buf[Arm] = buf()
+    if p.at_line_end()
+        p.report.add(error(p.toks.here(), "expected match arms after `match`: one on the same line, or an indented block"))
+        return Expr(at, Invalid)
+    arms.push(match_arm(p, false, true))
+    Expr(at.to(p.toks.here()), MatchFunction(arms))
+
+// The arms of an indented block, whose Indent is consumed; reads through its Dedent and an optional
+// `end match`.
+private match_arms(p: *Parser) -> Buf[Arm]
     var arms: Buf[Arm] = buf()
     loop
         if p.toks.at_end() || p.accept_kind(Dedent) then break
@@ -244,16 +261,23 @@ match_expression(p: *Parser, subject: &Expr) -> &Expr
         val fallback = p.accept("else")
         if !fallback && p.accept("|") && p.at("else")
             p.report.add(error(p.toks.here(), "a leading `|` needs a pattern, not `else`"))
-        val pattern: &Pattern = if fallback then Pattern(p.toks.here(), Wildcard) else parse_pattern(p)
-        var guard: Option[&Expr] = None
-        if p.accept("if")
-            val previous = p.lambda_boundary
-            p.lambda_boundary = match_guard_boundary(p)
-            guard = Some(expression(p, 0))
-            p.lambda_boundary = previous
-        if !fallback then p.expect("->")
-        val body = parse_line_body(p, false)
-        arms.push(Arm(pattern, guard, body))
+        arms.push(match_arm(p, fallback, false))
         if p.toks.position == before then break
     optional_end(p, "match", true)
-    Expr(subject.span.to(p.toks.here()), Match(subject, arms))
+    arms
+
+// One arm: a pattern, an optional `if` guard, `->` and the body. An `else` arm, already consumed when
+// `fallback` is set, has no pattern and no arrow. `alone` marks the one arm on a `match` function's
+// own line.
+private match_arm(p: *Parser, fallback: bool, alone: bool) -> Arm
+    val pattern: &Pattern = if fallback then Pattern(p.toks.here(), Wildcard) else parse_pattern(p)
+    var guard: Option[&Expr] = None
+    if p.accept("if")
+        val previous = p.lambda_boundary
+        p.lambda_boundary = match_guard_boundary(p)
+        guard = Some(expression(p, 0))
+        p.lambda_boundary = previous
+    if !fallback then p.expect("->")
+    // In an argument list a comma ends a one-line arm's body, as it ends the argument.
+    val body = if alone && p.in_list && !p.at_kind(Indent) then expression(p, 0) else parse_line_body(p, false)
+    Arm(pattern, guard, body)

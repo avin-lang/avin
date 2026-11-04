@@ -143,7 +143,7 @@ private interval_of(p: &TPattern, least: string, greatest: string) -> Option[Int
 // Every boundary of every row's stretch and of the domain cuts the values into pieces that each row
 // either matches entirely or not at all; each piece inside the domain must be covered by the rows
 // that match it, on the remaining columns.
-private covers_ordered(rows: Buf[Row], domain: Buf[Interval], rest: Buf[&Type], data: Buf[DataSymbol]) -> bool
+private witness_ordered(rows: Buf[Row], domain: Buf[Interval], t: &Type, rest: Buf[&Type], data: Buf[DataSymbol]) -> Option[Buf[string]]
     val least = domain[0].low
     val greatest = domain[domain.len() - 1].high
     var cuts: Buf[string] = buf()
@@ -168,8 +168,44 @@ private covers_ordered(rows: Buf[Row], domain: Buf[Interval], rest: Buf[&Type], 
             if interval_of(head, least, greatest) is Some(i)
                 matched = compare_signed(i.low, start) <= 0 && compare_signed(start, i.high) <= 0
             if matched then specialized.push(tail_of(row))
-        if !covers(specialized, rest, data) then return false
-    true
+        if witness(specialized, rest, data) is Some(parts)
+            val example = if *t is Char then printable_in(start, predecessor(cuts[k + 1])) else example_in(start, predecessor(cuts[k + 1]))
+            return in_front(spell_value(t, example), Some(parts))
+    None
+
+// The value of a stretch of integers to name as an example: zero, or the one nearest it.
+private example_in(low: string, high: string) -> string
+    if compare_signed(low, "0") <= 0 && compare_signed("0", high) <= 0 then return "0"
+    if compare_signed(high, "0") < 0 then return high
+    low
+
+// The char of a stretch to name as an example: `a` when it is there, else the first printable one.
+private printable_in(low: string, high: string) -> string
+    if compare_signed(low, "97") <= 0 && compare_signed("97", high) <= 0 then return "97"
+    if compare_signed(low, "126") <= 0 && compare_signed("32", high) <= 0
+        return if compare_signed(low, "32") < 0 then "32" else low
+    low
+
+// A value of an ordered scalar type written as a literal pattern.
+private spell_value(t: &Type, value: string) -> string
+    if !(*t is Char) then return value
+    var code = 0u32
+    for b in value.bytes
+        code = code * 10 + u32(b - u8('0'))
+    if code == 39 then return "'\\''"
+    if code == 92 then return "'\\\\'"
+    if code >= 32 && code < 127 then return "'" + char(u8(code)).to_string() + "'"
+    s"'\\u{${hex(code)}}'"
+
+private hex(n: u32) -> string
+    if n == 0 then return "0"
+    val digits = "0123456789abcdef"
+    var out = ""
+    var m = n
+    while m > 0
+        out = char(digits.bytes[usize(m % 16)]).to_string() + out
+        m = m / 16
+    out
 
 // Inserts a value into a sorted list of distinct values.
 private add_cut(cuts: Buf[string], value: string)
@@ -262,9 +298,33 @@ private tail_of(row: Row) -> Row
         items.push(row.items[i])
     Row(items)
 
-private covers(rows: Buf[Row], types: Buf[&Type], data: Buf[DataSymbol]) -> bool
-    if rows.len() == 0 then return false
-    if types.len() == 0 then return true
+private covers(rows: Buf[Row], types: Buf[&Type], data: Buf[DataSymbol]) -> bool = witness(rows, types, data) is None
+
+/** A value the unguarded arms of a match on a value of type `ty` leave out, written as a pattern,
+ * such as `Rect(_, _)` or `-1`; `None` when they cover every value. */
+missing_case(arms: Buf[TArm], ty: &Type, data: Buf[DataSymbol]) -> Option[string]
+    var rows: Buf[Row] = buf()
+    for arm in arms
+        if arm.guard is Some(_) then continue
+        var items: Buf[&TPattern] = buf()
+        items.push(arm.pattern)
+        rows.push(Row(items))
+    var types: Buf[&Type] = buf()
+    types.push(ty)
+    witness(rows, types, data) match
+        Some(parts) -> if parts.len() > 0 then Some(parts[0]) else None
+        None -> None
+
+// The columns of one combination of values that no row matches, each written as a pattern, or `None`
+// when the rows cover every combination. It decides as `covers` describes: split the first column on
+// its cases, or on the stretches of its ordered values, and look for a gap in each.
+private witness(rows: Buf[Row], types: Buf[&Type], data: Buf[DataSymbol]) -> Option[Buf[string]]
+    if rows.len() == 0
+        var all: Buf[string] = buf()
+        for t in types
+            all.push("_")
+        return Some(all)
+    if types.len() == 0 then return None
     // Alternatives become one row per option, and a named pattern is its inner pattern; both only in
     // the first column, so a row keeps its other columns' patterns together.
     var expanded: Buf[Row] = buf()
@@ -280,7 +340,7 @@ private covers(rows: Buf[Row], types: Buf[&Type], data: Buf[DataSymbol]) -> bool
                 for o in options
                     expanded.push(with_head(row, o))
             _ -> expanded.push(row)
-    if changed then return covers(expanded, types, data)
+    if changed then return witness(expanded, types, data)
     var rest: Buf[&Type] = buf()
     for i in 1..<types.len()
         rest.push(types[i])
@@ -289,9 +349,9 @@ private covers(rows: Buf[Row], types: Buf[&Type], data: Buf[DataSymbol]) -> bool
         if unconstrained(row.items[0]) then defaults.push(tail_of(row))
     if defaults.len() < rows.len()
         val domain = domain_of(types[0])
-        if domain.len() > 0 then return covers_ordered(rows, domain, rest, data)
+        if domain.len() > 0 then return witness_ordered(rows, domain, types[0], rest, data)
     val cases = cases_of(types[0], data)
-    if defaults.len() == rows.len() || cases.len() == 0 then return covers(defaults, rest, data)
+    if defaults.len() == rows.len() || cases.len() == 0 then return in_front("_", witness(defaults, rest, data))
     for case in cases
         var specialized: Buf[Row] = buf()
         for row in rows
@@ -303,5 +363,42 @@ private covers(rows: Buf[Row], types: Buf[&Type], data: Buf[DataSymbol]) -> bool
                 columns.push(t)
         for t in rest
             columns.push(t)
-        if !covers(specialized, columns, data) then return false
-    true
+        if witness(specialized, columns, data) is Some(parts) then return Some(spell_case(types[0], case, parts, data))
+    None
+
+private in_front(head: string, found: Option[Buf[string]]) -> Option[Buf[string]] = found match
+    Some(parts) ->
+        var out: Buf[string] = buf()
+        out.push(head)
+        for p in parts
+            out.push(p)
+        Some(out)
+    None -> None
+
+// Columns that start with a case's fields, as one column holding the case written as a pattern:
+// `Rect(_, _)`, `(1, _)`, `true`, and a list's cases as `[]` and `_ :: _`.
+private spell_case(t: &Type, case: Case, parts: Buf[string], data: Buf[DataSymbol]) -> Buf[string]
+    var k = 0usize
+    if case is VariantCase(_, fields) then k = fields.len()
+    var inner = ""
+    for i in 0..<k
+        if i > 0 then inner = inner + ", "
+        inner = inner + parts[i]
+    val head = case match
+        BoolCase(value) -> if value then "true" else "false"
+        VariantCase(index, _) -> *t match
+            Data(id, _, _) ->
+                val d = data[id]
+                val name = d.variants[index].name
+                if d.module_name == "avin" && d.name == "List" && name == "Nil" then "[]"
+                elif d.module_name == "avin" && d.name == "List" && name == "Cons" && k == 2
+                    val first = if parts[0].contains(" :: ") then "(" + parts[0] + ")" else parts[0]
+                    first + " :: " + parts[1]
+                elif k == 0 then name
+                else name + "(" + inner + ")"
+            _ -> "(" + inner + ")"
+    var out: Buf[string] = buf()
+    out.push(head)
+    for i in k..<parts.len()
+        out.push(parts[i])
+    out

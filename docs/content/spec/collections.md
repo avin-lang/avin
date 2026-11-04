@@ -63,6 +63,12 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
   and the identity (`T.zero()`, `T.one()`) when empty, so `[1, 2, 3].sum()` is `6`, `(1..5).product()`
   is `120`, and the `sum` of no `real`s is `0.0` and of no strings is `""`. Overflow traps as `+` does,
   and strings concatenate in `sum` but have no `product`.
+- `collect(pf)` takes a [`PartialFunction`](/spec/types/#partial-functions) and keeps `pf` of each
+  element it is defined at, in order, in the collection `map` would make: `shapes.collect(match
+  Circle(r) -> r)` is the radii of the circles. Every collection with `map` has it, and so does
+  `Option`. `collectFirst(pf)`, on every `Iterable`, is `Some` of `pf` of the first element it is
+  defined at, or `None`, and reaches no element after that one. A `Map` collects its entries as
+  pairs into a `Map`.
 
 ## Builders
 

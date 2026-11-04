@@ -4945,6 +4945,7 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Match(subject, arms) -> match_expr(c, e, subject, arms, expected, used)
     Is(_, _, _) -> check_condition(c, e).expr
     Lambda(params, body) -> lambda_expr(c, e, params, body, expected, false)
+    MatchFunction(arms) -> match_function_expr(c, e, arms, expected)
     LocalFunction(decl) ->
         check_local_function(c, decl)
         TExpr(e.span, Unit, UnitConst)
@@ -7301,7 +7302,7 @@ private choose(c: *Checker, at: Span, name_span: Span, name: string, ids: Buf[us
             val p = views[k][bindings[k].targets[j].unwrap()]
             if *p is ByName(_) then delayed = true
             if bound_signatures[k].type_params.len() > bound_signatures[k].known.len() || !same_type(p, shared) then agree = false
-        if value.kind is Lambda(_, _) || is_literal(value) then typed.push(None)
+        if takes_parameter_type(value) || is_literal(value) then typed.push(None)
         elif delayed then typed.push(Some(delayed_unchosen(c, args[j], if agree then Some(strict(shared)) else None)))
         else typed.push(Some(check_expr(c, value, if agree then Some(shared) else None)))
     var fitting: Buf[usize] = buf()
@@ -7431,7 +7432,15 @@ private open_argument_fits(value: &Expr, p: &Type) -> bool
         Lambda(params, _) -> *p match
             Function(ps, _) -> ps.len() == params.len()
             _ -> false
+        MatchFunction(_) -> *p match
+            Function(ps, _) -> ps.len() == 1
+            Class(_, name, _) -> name == "PartialFunction"
+            _ -> false
         _ -> true
+
+/** Whether an argument takes its type from its parameter, and so is checked after the others: a
+ * lambda, or a `match` with nothing before it. */
+private takes_parameter_type(value: &Expr) -> bool = value.kind is Lambda(_, _) || value.kind is MatchFunction(_)
 
 // Whether an integer literal, possibly negated, can be a value of type `t`, as `integer_literal`
 // would make it.
@@ -8212,7 +8221,7 @@ private check_arguments(c: *Checker, args: Buf[Argument], wanted: Buf[Option[&Ty
                                 c.note(unit_of(c), value.span, mismatch(c, zonk(c, p), t.ty))
                         early.set(i, Some(t))
                     continue
-            val rank = if value.kind is Lambda(_, _) then 2 elif is_literal(value) then 1 else 0
+            val rank = if takes_parameter_type(value) then 2 elif is_literal(value) then 1 else 0
             if rank != pass then continue
             early.set(i, Some(call_argument(c, args[i], param, open)))
     var typed: Buf[&TExpr] = buf()
@@ -8407,6 +8416,90 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
         if wanted_result is Some(r) then unify(c, r, yields)
     val ty: &Type = if mismatched then ErrorType else Function(types, yields)
     TExpr(e.span, ty, FunctionValue(id, buf()))
+
+/** The parameter of the lambda a `match` function is checked as: a keyword, so no name written in
+ * an arm can refer to it. */
+const MatchParam: string = "match"
+
+// A `match` with nothing before it is a function of one value, which its arms match; the value's type
+// comes from the expected type. Where a function `(A) -> B` is expected it is the lambda
+// `x -> x match …`, so its arms cover every `A`, as any `match`'s do. Where a `PartialFunction[A, B]`
+// is expected they need not: it is the core library's `MatchPartialFunction` of two lambdas over the
+// same arms, one telling whether an arm matches and one yielding `Some` of the matching arm's value,
+// or `None`. A call, `lift` and `applyOrElse` run only the second, so each tests the patterns and
+// guards once.
+private match_function_expr(c: *Checker, e: &Expr, arms: Buf[Arm], expected: Option[&Type]) -> &TExpr
+    val unit = unit_of(c)
+    if expected is Some(w)
+        val t = zonk(c, w)
+        *t match
+            Function(ps, _) ->
+                if ps.len() != 1
+                    c.note(unit, e.span, s"a `match` function takes one value, but a function of ${count(ps.len(), "parameter")} is expected here")
+                    return TExpr(e.span, ErrorType, UnitConst)
+                if !matched_type_known(c, e, ps[0]) then return TExpr(e.span, ErrorType, UnitConst)
+                return lambda_expr(c, e, match_params(e.span), match_body(e.span, arms), expected, false)
+            Class(k, _, args) ->
+                if core_class(c, "PartialFunction") == Some(k) && args.len() == 2
+                    return partial_match(c, e, arms, args[0], args[1])
+            _ -> ()
+    c.note(unit, e.span, "a `match` with nothing before it is a function, whose type comes from where it is used: write it where a function such as `(int) -> string` or a `PartialFunction[int, string]` is expected, or declare that type")
+    TExpr(e.span, ErrorType, UnitConst)
+
+// Whether the type of the value a `match` function matches is known; reports it when not.
+private matched_type_known(c: *Checker, e: &Expr, t: &Type) -> bool
+    if !has_unknowns(zonk(c, t)) then return true
+    c.note(unit_of(c), e.span, "cannot infer the type of the value this `match` matches; declare the function's type, as in `(int) -> string` or `PartialFunction[int, string]`")
+    false
+
+private match_params(at: Span) -> Buf[LambdaParam]
+    var params: Buf[LambdaParam] = buf()
+    params.push(LambdaParam(at, MatchParam, None))
+    params
+
+private match_body(at: Span, arms: Buf[Arm]) -> &Expr = Expr(at, Match(Expr(at, Name(MatchParam)), arms))
+
+// A `match` function where `PartialFunction[from, to]` is expected. Its arms are checked twice, once
+// in each lambda; the second check is skipped when the first found errors, so each is reported once.
+private partial_match(c: *Checker, e: &Expr, arms: Buf[Arm], from: &Type, to: &Type) -> &TExpr
+    val unit = unit_of(c)
+    if !matched_type_known(c, e, from) then return TExpr(e.span, ErrorType, UnitConst)
+    val ids = c.scope.get(qualified(CoreModule, "MatchPartialFunction")) match
+        Some(ids) -> ids
+        None ->
+            c.note(unit, e.span, "the core library has no `MatchPartialFunction` to make a partial function of")
+            return TExpr(e.span, ErrorType, UnitConst)
+    val at = e.span
+    var tests: Buf[Arm] = buf()
+    var attempts: Buf[Arm] = buf()
+    for arm in arms
+        val b = arm.body.span
+        var held: Buf[Argument] = buf()
+        held.push(Argument(b, None, arm.body))
+        attempts.push(Arm(arm.pattern, arm.guard, Expr(b, Call(Expr(b, Name(core_path("Some"))), held))))
+        tests.push(Arm(arm.pattern, arm.guard, Expr(b, BoolLit(true))))
+    attempts.push(Arm(Pattern(at, Wildcard), None, Expr(at, Name(core_path("None")))))
+    tests.push(Arm(Pattern(at, Wildcard), None, Expr(at, BoolLit(false))))
+    val attempt_body = match_body(at, attempts)
+    val test_body = match_body(at, tests)
+    var option_args: Buf[&Type] = buf()
+    option_args.push(to)
+    val option = core_data(c, "Option") match
+        Some(d) -> Data(d, "Option", option_args)
+        None -> return TExpr(e.span, ErrorType, UnitConst)
+    var params: Buf[&Type] = buf()
+    params.push(from)
+    val before = c.units[unit].report.len()
+    val attempt = lambda_expr(c, Expr(at, Lambda(match_params(at), attempt_body)), match_params(at), attempt_body, Some(Function(params, option)), false)
+    if c.units[unit].report.len() > before then return TExpr(e.span, ErrorType, UnitConst)
+    val test = lambda_expr(c, Expr(at, Lambda(match_params(at), test_body)), match_params(at), test_body, Some(Function(params, Bool)), false)
+    var args: Buf[Argument] = buf()
+    args.push(Argument(at, None, test_body))
+    args.push(Argument(at, None, attempt_body))
+    var typed: Buf[Option[&TExpr]] = buf()
+    typed.push(Some(test))
+    typed.push(Some(attempt))
+    call_function(c, at, at, ids[0], args, None, None, typed)
 
 // Checks one argument against its parameter type, which may still contain unknowns; the argument's
 // type decides them. `open` holds the call's own type arguments that only arguments have decided so
@@ -8777,8 +8870,14 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
         typed.push(TArm(pattern, guard, body))
     if !agreed then ty = ErrorType
     elif !used then ty = if never then Nothing else Unit
-    if settled(s.ty) && !match_covers(typed, s.ty, c.data)
-        c.note(unit, e.span, s"this `match` does not cover every ${type_name(s.ty)} value; add an arm for the rest, such as `_`")
+    if settled(s.ty)
+        missing_case(typed, s.ty, c.data) match
+            Some(case) ->
+                // A value no arm matches is named when there is more to say of it than `_`.
+                val subject = s"this `match` does not cover every ${type_name(s.ty)} value"
+                if case == "_" then c.note(unit, e.span, s"$subject; add an arm for the rest, such as `_`")
+                else c.note(unit, e.span, s"$subject, such as `$case`; add an arm for it, or `_` for the rest")
+            None -> ()
     TExpr(e.span, ty, Match(s, typed))
 
 /** A condition checked, and the locals its `is` tests bound: `yes` where it is known to hold, `no`

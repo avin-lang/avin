@@ -341,6 +341,36 @@ destructuring binding, whose `:` begins the binding's type, a type pattern is in
 function type in a type pattern is written in parentheses, because an arm's `->` follows it:
 `f: ((int) -> int) -> …`.
 
+A `match` that does not cover every value names one it leaves out, written as a pattern:
+`` this `match` does not cover every Shape value, such as `Rect(_, _)` ``.
+
+### Match functions
+
+A `match` with nothing before it is a function of one value, which its arms match. The arms are
+exactly those of a `match`: patterns, `if` guards, `->` and block bodies. One arm may stand on the
+`match` line; several go in an indented block, which may open inside parentheses or after an infix
+method's name at the end of a line:
+
+```text
+val radii = shapes.collect(match Circle(r) -> r)
+val sizes = shapes.map(match
+    Circle(r) -> r * r * 3.14
+    Rect(w, h) -> w * h)
+val firstBig = shapes collectFirst match
+    Circle(r) if r > 10.0 -> r
+```
+
+The type of the value it matches comes from the type expected where it is written, as a lambda's
+parameter type does; a `match` function with no expected type is an error asking for one. Where a
+function type `A -> B` is expected, the function is `x -> x match …` and its arms must cover every
+`A`, as any `match`'s do: `pairs.map(match (k, v) -> s"$k=$v")`. A function of two or more
+parameters is not a `match` function's type.
+
+Where a [`PartialFunction[A, B]`](/spec/types/#partial-functions) is expected, the arms need not
+cover every `A`: the function is defined at the values some arm matches. A partial function made
+this way tests its patterns and guards once each time it is called, lifted or given to
+`applyOrElse`; `isDefinedAt` tests them without running an arm's body.
+
 ## is
 
 `x is P` tests a value against any pattern a `match` arm takes and yields a `bool`; `x is not P` is

@@ -561,13 +561,22 @@ Settled by the user on 2026-11-04:
   is the same type; `Seq[string]` and `Array[string]` are errors), it has no default, and any other
   parameter list is an error naming the two forms. The result rules are unchanged. A program built
   for its tests does not run `main`, so tests see no arguments.
+- A `match` with nothing before it is a [function literal](/spec/operators-and-control-flow/#match-functions)
+  of one value, whose arms are ordinary `match` arms: `xs.collect(match Some(n) -> n)`, one arm on
+  the `match` line, or an indented block of them, inside parentheses or after an infix method's
+  name. Its parameter type comes from the expected type, as a lambda's does, and with none it is an
+  error. Where `A -> B` is expected its arms must cover every `A`; where `PartialFunction[A, B]` is
+  expected they need not. `PartialFunction[-A, +B]` is a core-library trait with `isDefinedAt`, a
+  call that traps at the program's call site outside its domain, `lift`, `orElse` and
+  `applyOrElse`; a literal tests its patterns and guards once per call, `lift` or `applyOrElse`.
+  Every collection with `map` has `collect`, every `Iterable` has `collectFirst`, and `Option` has
+  `collect`.
 
 **Deferred**
 
 - Public C interoperability. Until then, C is reached through Sysl.
 - Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
 - Async and await.
-- Partial-function literal syntax, which the user has explicitly left undecided.
 
 ## Proposed
 
