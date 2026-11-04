@@ -108,7 +108,7 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
             gather(&w, p, false)
         gather(&w, b.result, true)
     val converts = w.ins.len() + w.outs.len() > 0 || uses_bytes(bindings)
-    put(&w, "module avin.shims\n\nimport avin.rt.{Context, text_bytes, text_length, text_of}\nimport sysl.raw.str_cast\n")
+    put(&w, "module avin.shims\n\nimport avin.rt.{Context, stop_in_binding, text_bytes, text_length, text_of}\nimport sysl.raw.str_cast\n")
     if converts then put(&w, "import avin.rt.{Frame, allocate, array_elements, array_length, descriptor_of, new_array}\nimport sysl.raw.ptr_cast\nimport sysl.slices.copy\n")
     elif handles.len() > 0 then put(&w, "import sysl.raw.ptr_cast\n")
     var collects = false
@@ -128,6 +128,7 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
         w.mirror_lines.push(MirrorLines(m, w.line, w.line))
         put(&w, s"import ${w.mirrors[m].target} as mirror_$m\n")
     put(&w, "\n// An Avin string's bytes, copied into a Sysl string.\nprivate text_in(p: *u8) -> string = str_cast(text_bytes(p)[0..<text_length(p)])\n")
+    put(&w, IntegerHelper)
     if converts then put(&w, ConversionHelpers)
     for m in 0..<w.mirrors.len()
         if w.mirrors[m].finalizer != "" then handle_lines(&w, m)
@@ -188,7 +189,12 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
         // hold across a call that may free the value, as the conversion's allocation may: the
         // conversion takes the answer where the call gives it.
         val direct = receiver is Some(_) && !(b.result.form is Plain)
-        if !direct
+        // An integer result takes any Sysl integer, converted with a check as a mirror's field is.
+        val integral = *b.result.ty is Int(_)
+        if integral
+            val side = sysl_side(b.result.ty)
+            put(&w, s"\n    val r: $side = integer_to(ctx, $call, \"$side\")\n")
+        elif !direct
             if spellings.len() == 1 then put(&w, s"\n    val r: ${spellings[0]} = $call\n")
             else put(&w, s"\n    val r = $call\n")
         else put(&w, "\n")
@@ -246,9 +252,19 @@ private const ConversionHelpers: string =
     "// its references, while the conversion makes the objects of its fields.\n" +
     "private struct Root\n" +
     "    frame: Frame\n" +
-    "    object: *u8\n" +
-    "\n// An integer converted to the Sysl integer type its place asks for, as a mirror's field.\n" +
-    "private integer_in[T: Integer](x: long) -> T = T(x)\n"
+    "    object: *u8\n"
+
+// The conversion of an integer crossing the boundary in either direction: a binding's integer result
+// and a mirror's integer field take any integer the other side gives, and stop the program, at the
+// call of the binding, where the value does not fit. A conversion that loses a value keeps the low
+// bits in the build the shims are made by, so the value is checked by converting it back.
+private const IntegerHelper: string =
+    "\n// `x` converted to the integer type its place asks for, which must hold it; `name` names that\n" +
+    "// type where the program stops.\n" +
+    "private integer_to[T: Integer, S: Integer](ctx: *Context, x: S, name: string) -> T\n" +
+    "    val y = T.wrap(x)\n" +
+    "    if S.wrap(y) != x || (y < T.wrap(0)) != (x < S.wrap(0)) then stop_in_binding(ctx, \"value out of range for \" + name)\n" +
+    "    y\n"
 
 // Whether a binding passes or returns an array of bytes, which no data type's conversion holds.
 private uses_bytes(bindings: Buf[MirBinding]) -> bool
@@ -389,7 +405,7 @@ private into_expr(w: *ShimWriter, c: &Crossing, value: string, ds: string, base:
 // ones `ds` points at. A field of a mirror of an integer type takes any Sysl integer, converted.
 private out_expr(w: *ShimWriter, c: &Crossing, value: string, ds: string, base: usize, mirrored: bool) -> string = c.form match
     Plain ->
-        if mirrored && *c.ty is Int(_) then out_of_sysl(c.ty, s"${sysl_side(c.ty)}($value)") else out_of_sysl(c.ty, value)
+        if mirrored && *c.ty is Int(_) then s"integer_to(ctx, $value, \"${sysl_side(c.ty)}\")" else out_of_sysl(c.ty, value)
     Bytes -> s"bytes_of(ctx, $value, $ds[$base])"
     _ ->
         val at = if base == 0 then ds else s"ptr_cast(usize($ds) + ${base * 8}usize)"
@@ -440,7 +456,7 @@ private in_function(w: *ShimWriter, k: usize)
             f.offset match
                 Some(offset) ->
                     put(w, indent + s"val q$i: *${crossing_c_side(f.crossing)} = ptr_cast(usize(p) + ${offset}usize)\n")
-                    if mirrored && *f.crossing.ty is Int(_) then args.push(s"integer_in(long(q$i[0]))")
+                    if mirrored && *f.crossing.ty is Int(_) then args.push(s"integer_to(ctx, q$i[0], \"the Sysl field `${f.name}`\")")
                     else args.push(into_expr(w, f.crossing, s"q$i[0]", "ds", f.base))
                 None -> args.push("()")
         put(w, indent + (if lastly then "" else "return ") + construction(w, c, v, args) + "\n")
@@ -737,8 +753,16 @@ shim_diagnostics(output: string, shim: ShimSource, bindings: Buf[MirBinding], un
     rendered
 
 // Sysl's diagnostic `message`, or when it says that no overload of a conversion out of Sysl takes the
-// value it is called with, what that conversion makes and from what.
+// value it is called with, what that conversion makes and from what; when it says an integer's
+// conversion was given a value of another type, which type.
 private unconverted_message(shim: ShimSource, message: string) -> string
+    // An integer result or a mirror's integer field is converted from any Sysl integer, and only one.
+    val integral = "'avin.shims.integer_to' requires its type parameter 'S' to implement 'Integer', but "
+    val refusal = " does not"
+    val trimmed = message.trim()
+    if trimmed.starts_with(integral) && trimmed.ends_with(refusal)
+        val given = trimmed[integral.bytes.len..<trimmed.bytes.len - refusal.bytes.len]
+        return s"an integer is made from a Sysl integer, but the value is $given"
     val prefix = "no 'avin.shims.out_"
     if !message.starts_with(prefix) then return message
     var k = 0usize
