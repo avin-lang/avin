@@ -286,6 +286,12 @@ a decision changes, this page and the chapter change together.
 - An interpolated string is a method call on `StringContext`: `p"a $x b"` is
   `StringContext(["a ", " b"]).p(x)`. `s`, `f` and `raw` are library methods, and a program defines
   its own interpolator by implementing a trait for `StringContext`.
+- Interpolated literals follow Scala's lexing (settled 2026-11-04). A backslash directly before a
+  `"` does not end any interpolated literal, so `raw"a\"b"` holds `a\"b` and `raw"a\"` is
+  unterminated; `$"` is a double quote and `$$` a dollar sign in every interpolator. The lexer reads
+  no escape: a part reaches `StringContext` as written, and only `s` and `f` process escapes, so
+  `p"\d"` is fine and `s"\d"` is an error. A backslash is otherwise an ordinary character
+  (`raw"C:\dir"`, `\$name` still interpolates).
 - Nested helper functions see their enclosing scope. Closures are full closures, and `return` inside a
   lambda is local to the lambda.
 - `match` is a value-producing expression with full destructuring.
@@ -1096,10 +1102,6 @@ Settled by the user on 2026-11-04:
   `minus` and `since`, because an operator trait takes and yields the implementing type alone. The
   text forms are a duration's largest-unit form (`1.5ms`) and an ISO 8601 UTC timestamp. Sleeping
   and calendar fields beyond the timestamp text are not part of it yet.
-- Raw strings ([strings and formatting](/spec/strings-and-formatting/)): `raw"…"` reads no escape,
-  so a backslash is an ordinary character (`raw"C:\dir"`, `raw"a\"` is `a\`) and the literal ends at
-  the first `"` outside a hole. A `"` cannot be written inside the text of a raw string; a hole can
-  supply one (`raw"${"\""}"`). Holes (`${…}`, `$name`) and `$$` work as in every interpolator.
 
 ## Open
 
