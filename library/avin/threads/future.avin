@@ -1,0 +1,277 @@
+module avin.threads
+
+// Futures: a value some thread will compute, and the promise of one, which another thread keeps.
+// `Future(body)` runs `body` on a shared pool of worker threads and gives back at once the future of
+// what it returns; `await` waits for it, and `map`, `flatMap`, `zip`, `onComplete`, `Future.all` and
+// `Future.first` go on from it without waiting. A future carries no failure of its own: a computation
+// that can fail yields a `Result`, and a trap inside a body stops the program, as it does in any
+// thread.
+
+// The processors the machine offers the program, and at least one.
+@sysl("avin.rt.processors")
+private processors() -> long
+
+// The threads every future's body runs on. None is started until there is work for one: a task given
+// when no worker is idle starts another, up to one for each processor. A worker that waits in `await`
+// for a future not yet complete counts as not working, so the pool starts another in its place where
+// work is waiting; that one stays afterwards, idle when there is nothing to do. A body that waits for
+// another future therefore never leaves the pool without a thread to run that future, however deep
+// the waits nest. The workers are never joined: the program ends when `main` returns, whatever they
+// are doing.
+private class Pool()
+    private val lock = Lock()
+    private val work = Condition(lock)
+    private val tasks = Deque[() -> unit]()
+    private val target = int(processors())
+    // The identities of the workers running, which only grows.
+    private val workers = Buffer[long]()
+    // Workers started that have not yet put their identity in `workers`.
+    private var starting = 0
+    private var idle = 0
+    private var blocked = 0
+
+    // Runs `task` on a worker, soon.
+    submit(task: () -> unit)
+        lock.acquire()
+        tasks.addLast(task)
+        if idle > 0 then work.notify()
+        if tasks.length() > idle + starting && workers.length() + starting - blocked < target then start()
+        lock.release()
+
+    // Counts the calling thread as waiting where it is a worker, starting another where work is left
+    // with no thread free to run it; answers whether it was counted, so `resumed` undoes it.
+    blocking() -> bool
+        val me = current()
+        lock.acquire()
+        val mine = workers.contains(me)
+        if mine
+            blocked += 1
+            if tasks.length() > idle + starting then start()
+        lock.release()
+        mine
+
+    // Counts a worker that `blocking` counted as working again.
+    resumed()
+        lock.acquire()
+        blocked -= 1
+        lock.release()
+
+    // Starts one more worker, counted at once; under the lock.
+    private start()
+        starting += 1
+        spawn(() ->
+            lock.acquire()
+            starting -= 1
+            workers.add(current())
+            serve())
+
+    // A worker's life, from holding the lock: take the oldest task, run it without the lock, and wait
+    // while there is none.
+    private serve()
+        loop
+            while tasks.isEmpty()
+                idle += 1
+                work.wait()
+                idle -= 1
+            val task = tasks.removeFirst()
+            lock.release()
+            task()
+            lock.acquire()
+
+private val pool = Pool()
+
+// Where a future's value is left, once, and what is to run with it.
+private class Cell[T]()
+    private val lock = Lock()
+    private val done = Condition(lock)
+    private var value: Option[T] = None
+    // What runs with the value once it is there, newest first, each on the thread that completes the
+    // cell.
+    private var waiting: List[(T) -> unit] = []
+
+    // Leaves `v` where there is no value yet, waking every thread waiting and running what waits;
+    // answers whether it did.
+    complete(v: T) -> bool
+        lock.acquire()
+        if value.isSome()
+            lock.release()
+            return false
+        value = Some(v)
+        val run = waiting
+        waiting = []
+        done.notifyAll()
+        lock.release()
+        for f in run.reverse() do f(v)
+        true
+
+    // The value, where there is one now.
+    peek() -> Option[T]
+        lock.acquire()
+        val v = value
+        lock.release()
+        v
+
+    // Runs `f` with the value on the thread that completes the cell, or now where it is complete.
+    whenDone(f: (T) -> unit)
+        lock.acquire()
+        value match
+            Some(v) ->
+                lock.release()
+                f(v)
+            None ->
+                waiting = f :: waiting
+                lock.release()
+
+    // Waits until there is a value, or for at most `timeoutMillis` milliseconds where it is given.
+    waitFor(timeoutMillis: Option[long]) -> Option[T]
+        if peek() is Some(v) then return Some(v)
+        val counted = pool.blocking()
+        lock.acquire()
+        timeoutMillis match
+            None -> while value.isNone() do done.wait()
+            Some(limit) ->
+                val deadline = monotonicMillis() + limit
+                var left = limit
+                while value.isNone() && left > 0
+                    done.waitFor(left)
+                    left = deadline - monotonicMillis()
+        val v = value
+        lock.release()
+        if counted then pool.resumed()
+        v
+
+// A value that is being computed, or has been. It is completed once, by its body on the pool or by
+// its promise; every `await` then gives that value, and the combinators make new futures from it
+// without waiting.
+//
+//     val page = Future(fetch(url))
+//     val words = page.map(p -> p.split(" ").length())
+//     print(words.await())
+class Future[T](private val cell: Cell[T])
+    // Waits for the value, safe for the collector while it waits, and gives it back. A body on the pool
+    // that waits leaves its place to another worker, so waits nested in bodies never stall the pool.
+    await() -> T = cell.waitFor(None) match
+        Some(v) -> v
+        None -> fail("a future waited for without a time limit has no value")
+
+    // Waits at most `timeoutMillis` milliseconds for the value: `Some` of it, or `None` where the time
+    // ran out first. A time that is not positive asks without waiting.
+    await(timeoutMillis: long) -> Option[T] = cell.waitFor(Some(timeoutMillis))
+
+    // Whether the value is there.
+    isCompleted() -> bool = cell.peek().isSome()
+
+    // The value, where it is there now; never waits.
+    value() -> Option[T] = cell.peek()
+
+    // Runs `f` with the value on a pool thread once it is there.
+    onComplete(f: (T) -> unit) = cell.whenDone(v -> pool.submit(() -> f(v)))
+
+    // The future of `f` of the value, which runs on a pool thread once the value is there.
+    map[U](f: (T) -> U) -> Future[U]
+        val next = Cell[U]()
+        cell.whenDone(v -> pool.submit(() ->
+            next.complete(f(v))
+            ()))
+        Future(next)
+
+    // The future of the value of the future `f` gives for the value; `f` runs on a pool thread once the
+    // value is there.
+    flatMap[U](f: (T) -> Future[U]) -> Future[U]
+        val next = Cell[U]()
+        cell.whenDone(v -> pool.submit(() ->
+            f(v).cell.whenDone(u ->
+                next.complete(u)
+                ())))
+        Future(next)
+
+    // The future of both values, once both are there.
+    zip[U](other: Future[U]) -> Future[(T, U)]
+        val next = Cell[(T, U)]()
+        cell.whenDone(t -> other.cell.whenDone(u ->
+            next.complete((t, u))
+            ()))
+        Future(next)
+
+// A future of a computation that can fail is composed through its `Ok` values: an `Err` passes
+// through every step unchanged.
+impl[T, E] Future[Result[T, E]]
+    // The future of `f` of the `Ok` value, or of the `Err` as it was.
+    mapOk[U](f: (T) -> U) -> Future[Result[U, E]] = map(r -> r.map(f))
+
+    // The future `f` gives for the `Ok` value, or the `Err` as it was.
+    flatMapOk[U](f: (T) -> Future[Result[U, E]]) -> Future[Result[U, E]] = flatMap(r -> r match
+        Ok(v) -> f(v)
+        Err(e) -> Future.successful(Err(e)))
+
+object Future
+    // Runs `body` on the pool and gives back the future of what it returns.
+    apply[T](body: -> T) -> Future[T]
+        val cell = Cell[T]()
+        pool.submit(() ->
+            cell.complete(body)
+            ())
+        Future(cell)
+
+    // A future already complete with `x`.
+    successful[T](x: T) -> Future[T]
+        val cell = Cell[T]()
+        cell.complete(x)
+        Future(cell)
+
+    // The future of every future's value, in the order the futures were given, once all are there.
+    all[T](fs: Iterable[Future[T]]) -> Future[Vector[T]]
+        val futures = fs.toVector()
+        val n = futures.length()
+        val cell = Cell[Vector[T]]()
+        if n == 0
+            cell.complete([])
+            return Future(cell)
+        val slots = Array.fill[Option[T]](n, None)
+        val left = Atomic(n)
+        for (f, i) in futures.zipWithIndex()
+            f.cell.whenDone(v ->
+                slots(i) = Some(v)
+                if left.sub(1) == 0
+                    val b = Vector.builder[T]()
+                    for s in slots
+                        s match
+                            Some(x) -> b.add(x)
+                            None -> fail("a future of all has a value missing")
+                    cell.complete(b.result())
+                    ())
+        Future(cell)
+
+    // The future of the value of whichever of `fs` is complete first; traps where `fs` is empty.
+    first[T](fs: Iterable[Future[T]]) -> Future[T]
+        val cell = Cell[T]()
+        var any = false
+        for f in fs
+            any = true
+            f.cell.whenDone(v ->
+                cell.complete(v)
+                ())
+        if !any then fail("the first of no futures")
+        Future(cell)
+
+// The promise of a value some thread will give: its `future` is completed by the first `complete` or
+// `tryComplete`, from any thread.
+//
+//     val reply = Promise[string]()
+//     spawn(() -> reply.complete(answer()))
+//     print(reply.future.await())
+class Promise[T]()
+    private val cell = Cell[T]()
+
+    // The future this promise completes.
+    val future: Future[T] = Future(cell)
+
+    // Completes the future with `x`; traps where it is already complete.
+    complete(x: T)
+        if !cell.complete(x) then fail("a promise is completed twice")
+
+    // Completes the future with `x` where it is not complete yet, and answers whether it did.
+    tryComplete(x: T) -> bool = cell.complete(x)
+
+    // Whether the future is complete.
+    isCompleted() -> bool = cell.peek().isSome()

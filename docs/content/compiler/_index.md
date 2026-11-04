@@ -564,11 +564,14 @@ which take and give back one spin lock every such operation shares. `add`, `sub`
 library code, a loop of `load` and `compareAndSet`, so an integer that would overflow traps before
 anything is stored.
 
-**Locks and conditions.** The synchronization library reaches seven intrinsics, each a runtime
+**Locks and conditions.** The synchronization library reaches eight intrinsics, each a runtime
 entry: `lock_new`, `lock_acquire`, `lock_release`, `condition_new`, `condition_wait`,
-`condition_notify` and `condition_notify_all`. A lock is an object on the collected heap holding a
-Sysl `SleepLock`, the three-state futex lock, and a condition one holding a `Condvar`; neither holds
-a reference, and the collector never moves either, so a thread sleeps on a word inside it. Taking a
+`condition_wait_for`, `condition_notify` and `condition_notify_all`. A lock is an object on the
+collected heap holding a Sysl `Mutex[unit]`, the three-state futex lock guarding nothing, and a
+condition one holding a `Condvar`; neither holds a reference, and the collector never moves either,
+so a thread sleeps on a word inside it. `condition_wait_for` takes a time in milliseconds and answers
+whether a notification came before it ran out, through `Condvar.wait_for`, which needs the lock to
+be a `Mutex`. Taking a
 free lock is one compare-and-swap; a thread that has to wait, and every condition wait, links a frame
 holding the objects it waits on onto its stack, waits safe, and unlinks the frame once it is running
 again, so what it sleeps on stays alive whatever the program still holds. A condition wait lets the

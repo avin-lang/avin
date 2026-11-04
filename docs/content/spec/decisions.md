@@ -682,6 +682,19 @@ Settled by the user on 2026-11-04:
   meaning: `name()` or `name(x: T)` before a block declares one. A block whose only line is a name
   and an operand stays the infix-continuation error. A block for a last parameter that is neither
   by-name nor a function, already given, or absent is an error.
+- [Futures](/spec/threads/#futures) in `avin.threads`: `Future(body)`, the companion's
+  `apply[T](body: -> T)`, runs a by-name body on a shared pool and gives back a `Future[T]` at once;
+  `await()` waits safe for the collector, `await(timeoutMillis: long)` gives an `Option`, and times
+  are milliseconds as a `long`, as in a condition's `waitFor(timeoutMillis) -> bool`. `map`,
+  `flatMap`, `zip`, `onComplete`, `Future.all` (a `Vector` in the order given), `Future.first`
+  (trapping on no futures) and `Future.successful` never wait, and every function given to one
+  runs on a pool thread. A future carries no failure: a computation that can fail is a
+  `Future[Result[T, E]]`, which also has `mapOk` and `flatMapOk`, and a trap in a body stops the
+  program. `Promise[T]()` has a `future` field; `complete(x)` a second time traps, and
+  `tryComplete(x) -> bool` completes only where nothing has. The pool starts workers as work comes,
+  up to one per processor (`sysl.platform.cpu_count`), never joins them, and starts one more in the
+  place of each worker waiting in `await` while work is queued, so nested waits never deadlock it;
+  `await` inside a body is allowed.
 
 **Deferred**
 

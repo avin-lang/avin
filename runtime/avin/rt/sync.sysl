@@ -2,16 +2,20 @@ module avin.rt
 
 import sysl.raw.ptr_cast
 import sysl.sync.*
-import sysl.threads.{Condvar, SleepLock}
+import sysl.threads.{Condvar, Mutex}
+import sysl.time.monotonic
 
 // The waiting the synchronization library is built on: a lock that sleeps and a condition variable,
 // each the payload of an object on the collected heap, which the library keeps as an opaque `Any`.
 // The collector never moves an object, so a thread may sleep on a word inside one, and a thread that
 // sleeps keeps what it sleeps on as a root of its own until it wakes. A thread that has to wait is
 // safe for the collector while it waits, so it holds up no collection however long it sleeps.
+//
+// A lock is a `Mutex` guarding nothing, so a condition can wait on it for a bounded time as well as
+// for ever.
 
-/** The descriptor of a lock: a `SleepLock`, holding no reference and naming no type record. */
-var lock_descriptor: Descriptor = descriptor(0, sizeof(SleepLock), 0)
+/** The descriptor of a lock: a `Mutex[unit]`, holding no reference and naming no type record. */
+var lock_descriptor: Descriptor = descriptor(0, sizeof(Mutex[unit]), 0)
 
 /** The descriptor of a condition: a `Condvar`, holding no reference and naming no type record. */
 var condition_descriptor: Descriptor = descriptor(0, sizeof(Condvar), 0)
@@ -29,27 +33,27 @@ private struct Waiting
 @export("avin_rt_lock_new")
 lock_new(ctx: *Context) -> *u8
     val p = allocate(ctx, &lock_descriptor)
-    val l: *SleepLock = ptr_cast(p)
-    *l = SleepLock.new()
+    val l: *Mutex[unit] = ptr_cast(p)
+    *l = Mutex.new(())
     published(p)
 
 /** Takes the lock `p`, safe for the collector while it waits for another thread to let it go. */
 @export("avin_rt_lock_acquire")
 lock_acquire(ctx: *Context, p: *u8)
-    val l: *SleepLock = ptr_cast(p)
-    if l.try_lock() then return
+    val l: *Mutex[unit] = ptr_cast(p)
+    if l.try_lock_raw().is_some() then return
     var w = Waiting(Frame(ctx.top, 1), p, null)
     ctx.top = &w.frame
     enter_safe(ctx)
-    l.lock()
+    l.lock_raw()
     leave_safe(ctx)
     ctx.top = w.frame.prev
 
 /** Lets the lock `p` go, which the calling thread holds. */
 @export("avin_rt_lock_release")
 lock_release(ctx: *Context, p: *u8)
-    val l: *SleepLock = ptr_cast(p)
-    l.unlock()
+    val l: *Mutex[unit] = ptr_cast(p)
+    l.unlock_raw()
 
 /** A new condition, with no thread waiting on it. */
 @export("avin_rt_condition_new")
@@ -66,13 +70,40 @@ condition_new(ctx: *Context) -> *u8
 @export("avin_rt_condition_wait")
 condition_wait(ctx: *Context, p: *u8, lock: *u8)
     val c: *Condvar = ptr_cast(p)
-    val l: *SleepLock = ptr_cast(lock)
+    val l: *Mutex[unit] = ptr_cast(lock)
     var w = Waiting(Frame(ctx.top, 2), p, lock)
     ctx.top = &w.frame
     enter_safe(ctx)
-    c.wait_raw(l)
+    c.wait(l)
     leave_safe(ctx)
     ctx.top = w.frame.prev
+
+/** `condition_wait` for at most `millis` milliseconds: answers `false` where the time ran out before a
+ * notification came. Either way the lock is held again when it answers, and the caller checks what it
+ * waits for again. A time that is not positive answers `false` at once, without letting the lock go. */
+@export("avin_rt_condition_wait_for")
+condition_wait_for(ctx: *Context, p: *u8, lock: *u8, millis: long) -> bool
+    if millis <= 0 then return false
+    val c: *Condvar = ptr_cast(p)
+    val l: *Mutex[unit] = ptr_cast(lock)
+    val ns: i64 = if millis > 9223372036854 then 9223372036854000000 else millis * 1000000
+    var w = Waiting(Frame(ctx.top, 2), p, lock)
+    ctx.top = &w.frame
+    enter_safe(ctx)
+    val notified = c.wait_for(l, ns)
+    leave_safe(ctx)
+    ctx.top = w.frame.prev
+    notified
+
+/** Milliseconds on a clock that only moves forward, from a starting point of no meaning: the
+ * difference between two readings is the time between them, which a bounded wait counts down. */
+monotonic_millis() -> long = monotonic().us / 1000
+
+/** How many processors the machine offers the program, and at least one: the size of the library's
+ * pool of workers. */
+processors() -> long
+    val n = long(cpu_count())
+    if n < 1 then 1 else n
 
 /** Wakes one thread waiting on the condition `p`, if any is. */
 @export("avin_rt_condition_notify")
