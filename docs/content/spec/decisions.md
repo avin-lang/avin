@@ -554,6 +554,14 @@ Settled by the user on 2026-11-03:
   elements it does not match. `return`, `break`, `continue` and `?` cannot leave a comprehension's
   guards or yielded value.
 
+Settled by the user on 2026-11-04:
+
+- `main` is `main()` or `main(args: Vector[string])`, the arguments after the program's name, the
+  same as `avin.process.args()`. The parameter is exactly `Vector[string]` (a name for that type
+  is the same type; `Seq[string]` and `Array[string]` are errors), it has no default, and any other
+  parameter list is an error naming the two forms. The result rules are unchanged. A program built
+  for its tests does not run `main`, so tests see no arguments.
+
 **Deferred**
 
 - Public C interoperability. Until then, C is reached through Sysl.
@@ -574,7 +582,8 @@ Settled by the user on 2026-11-03:
 - `avin.process` ([system library](/spec/system-library/)): `args() -> Vector[string]` holds the
   arguments after the program's name, and `programName()` gives the name separately; `env(name)` is
   an `Option[string]`; `exit(code: int) -> Nothing` flushes standard output first, as a trap does.
-  Arguments are checked as UTF-8 at startup. A test run by `avin test` sees no arguments.
+  Arguments are checked as UTF-8 at startup. A test run by `avin test` sees no arguments. `main`
+  may take the same vector: `main(args: Vector[string])` (settled above).
 - `avin.fs` and `avin.io` ([system library](/spec/system-library/)): `IoError`, shared by every
   module that does input or output, lives in `avin.io` as a plain `data` type with the variants
   `NotFound`, `PermissionDenied`, `AlreadyExists`, `IsADirectory`, `NotADirectory`,
