@@ -888,7 +888,7 @@ Settled by the user on 2026-11-04:
   - **Dependencies**: `{ git = "host/owner/name", version = "x.y.z" }` read at the tag `vx.y.z`
     and cloned from `https://`; `{ path = "../dir" }`, relative to the manifest naming it and refused
     in a fetched package; `{ workspace = true }`. A coordinate with `https://` or `.git` is refused.
-    No features or members of a repository yet.
+    Features and members of a repository are the entries below.
   - **`rev` pins**: `{ git = "…", rev = "<hex>" }`, seven to forty lowercase hexadecimal digits,
     refused with a `version` or without `git`. The repository is cloned whole and the commit
     resolved to its full id, fetched by that id when no branch or tag reaches it (only a full id
@@ -929,6 +929,38 @@ Settled by the user on 2026-11-04:
     version that is no longer chosen keeps its line until `avin tidy`); where fetching or resolving
     fails, the manifest is put back as it was. It adds only git dependencies: a path dependency is
     written by hand.
+  - **Features** ([features](/spec/packages/#features)), Sysl's model with the module as the unit
+    gated: a feature block has `doc`, `default`, `modules`, `enables` and `requires`, and
+    `name = [x]` is its short form; optional dependencies, `"dep:x"`, `"dep/feature"`, users'
+    `features`, `default_features = false` and `-x`, unification by union and the
+    `--features`/`--no-default-features`/`--all-features` flags are Sysl's. Where Sysl gates lines
+    with `#if feature_x`, Avin has no conditional compilation: a feature lists whole **modules**
+    (with those under them), read only while it is on, and an import of a gated module or of an
+    optional dependency's module is allowed only from a module whose own gate implies it, checked
+    against the manifest whatever is selected, so features are additive by construction. `avin test`,
+    `avin check`, the language server and `avin tidy` turn every feature on. Not carried over: Sysl's
+    `choices`, a feature's `if` and `targets`, and options, which are about machines and C
+    configuration Avin's manifest does not describe.
+  - **Members of a repository** ([members](/spec/packages/#members-of-a-repository)), Sysl's:
+    `{ git, member = "dir", version | rev }`, the member a package named `<coordinate>//<dir>` for
+    selection and `avin.sum`, every member at one version one clone whose hash each member's line
+    carries, a fetched member's `workspace = true` and in-repository `path` siblings read as their
+    own coordinates at the member's version, and `avin add <coordinate>//<dir>@<version>`. Its modules
+    keep their own names, as every dependency's do, so Avin needs no `package.repository` key.
+  - **Vendoring** ([vendoring](/spec/packages/#vendoring)), Sysl's: `avin vendor` copies the
+    resolution with every feature on into `vendor/` at the project (workspace) root in the cache's
+    layout, each copy hashed against its `avin.sum` line first, `.git` and path dependencies left out;
+    a `vendor/` present is the cache, and the root's `vendor/` is never a module. Two choices of
+    Avin's own: a package missing from `vendor/` is **refused** rather than fetched into it, so a
+    vendored build never touches the network; and `avin vendor` **removes** packages the resolution
+    no longer reads, as `avin tidy` does for lines.
+  - **The standard library's modules** ([standard library](/spec/packages/#the-standard-library-s-modules)):
+    the `avin` tree shipped with the compiler (`share/avin/library`, or `AVIN_ROOT/library`),
+    versioned with it, never a dependency and never in `avin.sum`; `avin` is the prelude, seen
+    without an import, and every module under it is imported by name like any module. A
+    compilation reads the prelude and then only the library modules something imports,
+    transitively, so the library can grow without every program parsing all of it. Domain libraries
+    are packages (as settled for `dev.avinlang`). The standard library has no features.
 
 - Repeated parameters beside overloads and constructors
   ([declarations](/spec/declarations/#repeated-parameters)): an overload with a repeated parameter
@@ -1188,6 +1220,19 @@ Settled by the user on 2026-11-04:
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
   over a `Map` yields when its values are not pairs (it needs `Iterable`'s own transformations).
+
+- Packages, where Sysl's choice does not transfer ([packages](/spec/packages/)):
+  - Whether a feature needs anything finer than a module: a compile-time `feature("x")` constant a
+    function could test (folded away when false), or nothing, the module being the only gate.
+  - Whether a module may be listed by more than one feature (on while any is on), or by one only, as
+    proposed.
+  - Whether a build should re-hash `vendor/` on every run, catching a hand edit to a committed
+    vendored package, or trust the hash recorded beside each package as it trusts the cache's.
+  - Whether a manifest names the oldest compiler it builds with (`package.avin = "0.x.y"`), since
+    the standard library's modules arrive with the compiler and a package using a new one fails on an
+    older compiler with "no module" rather than a version message.
+  - Whether manifests gain machine conditions (Sysl's `if`, `choices`, `targets`) once Avin builds
+    for more than one target.
 
 - Resource cleanup: a `defer` construct or a library `use`.
 - How actors work: how messages are declared and sent, mailboxes and replies, how actors are
