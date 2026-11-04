@@ -818,6 +818,16 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
+- Sorted collections ([collections](/spec/collections/#sorted-maps-and-sets)): `TreeMap[K: Ord, +V]`
+  and `TreeSet[A: Ord]` are data types of their own beside `Map` and `Set`, not variants of them, and
+  `Map` and `Set` stay the hash-based collections rather than becoming traits over a `HashMap` and a
+  `HashSet`. A tree collection has the same traits as its hash-based counterpart (`Iterable`, the
+  function type, `Eq`, `Hash`, `Display`, `Debug`) and the same methods, so code over those traits
+  takes either; a method that makes a collection of another key (`map`, `collect`, `flatMap`) bounds
+  it by `Ord` and answers a tree collection. A tree collection hashes to what the hash-based one with
+  the same contents does. The ordered operations are `first`, `last`, `floor`, `ceiling`, `from`,
+  `until`, `range` (from inclusive, until exclusive) and `reverseIterator`. The tree is balanced by
+  weight, each side at most three times the other.
 - Packages ([packages](/spec/packages/)), modelled on Sysl's package system:
   - **The manifest**: `package { name, version, description }`, `dependencies { … }` and `workspace
     = [ … ]`, and no other key; an unknown key is an error, not a warning. A name is a lowercase

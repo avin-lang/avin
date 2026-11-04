@@ -1,0 +1,259 @@
+module avin
+
+// The structure under `TreeMap` and `TreeSet`: a binary search tree ordered by the keys' `compare`,
+// kept balanced by weight. Each node records the number of entries below it, and neither subtree of
+// a node holds more than three times the entries of the other (counting an empty subtree as one), so
+// the height stays within a constant factor of the logarithm of the size. Every update copies only
+// the path from the root to the changed entry, plus the rotations that rebalance it, and shares the
+// rest with the tree it came from.
+private data SortedTree[K, +V]
+    Tip
+    Bin(size: int, key: K, value: V, left: SortedTree[K, V], right: SortedTree[K, V])
+
+// How much heavier one side of a node may be than the other, and the bound below which a single
+// rotation restores the balance and above which a double one is needed.
+private val treeDelta = 3
+private val treeRatio = 2
+
+// The number of entries in `t`.
+private treeSize[K, V](t: SortedTree[K, V]) -> int = t match
+    Tip -> 0
+    Bin(n, _, _, _, _) -> n
+
+// A node over two subtrees that are already balanced with each other.
+private treeNode[K, V](k: K, v: V, l: SortedTree[K, V], r: SortedTree[K, V]) -> SortedTree[K, V] =
+    Bin(treeSize(l) + treeSize(r) + 1, k, v, l, r)
+
+// A node over two subtrees that were balanced with each other before one of them gained or lost one
+// entry, rotated back into balance.
+private treeBalance[K, V](k: K, v: V, l: SortedTree[K, V], r: SortedTree[K, V]) -> SortedTree[K, V]
+    val sl = treeSize(l)
+    val sr = treeSize(r)
+    if sl + sr <= 1 then treeNode(k, v, l, r)
+    elif sr > treeDelta * sl then treeRotateLeft(k, v, l, r)
+    elif sl > treeDelta * sr then treeRotateRight(k, v, l, r)
+    else treeNode(k, v, l, r)
+
+// Moves entries from the heavy right side `r` to the left.
+private treeRotateLeft[K, V](k: K, v: V, l: SortedTree[K, V], r: SortedTree[K, V]) -> SortedTree[K, V] =
+    r match
+        Bin(_, rk, rv, rl, rr) ->
+            if treeSize(rl) < treeRatio * treeSize(rr) then treeNode(rk, rv, treeNode(k, v, l, rl), rr)
+            else rl match
+                Bin(_, mk, mv, ml, mr) -> treeNode(mk, mv, treeNode(k, v, l, ml), treeNode(rk, rv, mr, rr))
+                Tip -> fail("a heavy subtree without entries")
+        Tip -> fail("a heavy subtree without entries")
+
+// Moves entries from the heavy left side `l` to the right.
+private treeRotateRight[K, V](k: K, v: V, l: SortedTree[K, V], r: SortedTree[K, V]) -> SortedTree[K, V] =
+    l match
+        Bin(_, lk, lv, ll, lr) ->
+            if treeSize(lr) < treeRatio * treeSize(ll) then treeNode(lk, lv, ll, treeNode(k, v, lr, r))
+            else lr match
+                Bin(_, mk, mv, ml, mr) -> treeNode(mk, mv, treeNode(lk, lv, ll, ml), treeNode(k, v, mr, r))
+                Tip -> fail("a heavy subtree without entries")
+        Tip -> fail("a heavy subtree without entries")
+
+// The value at `key`, found by descending in a loop.
+private treeFind[K: Ord, V](root: SortedTree[K, V], key: K) -> Option[V]
+    var t = root
+    loop
+        t match
+            Bin(_, k, v, l, r) ->
+                val c = key.compare(k)
+                if c == 0 then return Some(v)
+                t = if c < 0 then l else r
+            Tip -> return None
+
+// `t` with `key` bound to `value`, replacing the value and the key it had.
+private treeInsert[K: Ord, V](t: SortedTree[K, V], key: K, value: V) -> SortedTree[K, V] = t match
+    Tip -> Bin(1, key, value, Tip, Tip)
+    Bin(n, k, v, l, r) ->
+        val c = key.compare(k)
+        if c < 0 then treeBalance(k, v, treeInsert(l, key, value), r)
+        elif c > 0 then treeBalance(k, v, l, treeInsert(r, key, value))
+        else Bin(n, key, value, l, r)
+
+// `t` without `key`, which must be present for the result to share the paths it does not touch.
+private treeRemove[K: Ord, V](t: SortedTree[K, V], key: K) -> SortedTree[K, V] = t match
+    Tip -> Tip
+    Bin(_, k, v, l, r) ->
+        val c = key.compare(k)
+        if c < 0 then treeBalance(k, v, treeRemove(l, key), r)
+        elif c > 0 then treeBalance(k, v, l, treeRemove(r, key))
+        else treeGlue(l, r)
+
+// The least entry of `t` and the tree without it; `t` must not be empty.
+private treeRemoveMin[K, V](t: SortedTree[K, V]) -> (K, V, SortedTree[K, V]) = t match
+    Bin(_, k, v, Tip, r) -> (k, v, r)
+    Bin(_, k, v, l, r) ->
+        val (mk, mv, rest) = treeRemoveMin(l)
+        (mk, mv, treeBalance(k, v, rest, r))
+    Tip -> fail("the least entry of an empty tree")
+
+// The greatest entry of `t` and the tree without it; `t` must not be empty.
+private treeRemoveMax[K, V](t: SortedTree[K, V]) -> (K, V, SortedTree[K, V]) = t match
+    Bin(_, k, v, l, Tip) -> (k, v, l)
+    Bin(_, k, v, l, r) ->
+        val (mk, mv, rest) = treeRemoveMax(r)
+        (mk, mv, treeBalance(k, v, l, rest))
+    Tip -> fail("the greatest entry of an empty tree")
+
+// The entries of `l` and then of `r`, two trees balanced with each other whose keys are all less in
+// `l`: the entry that joins them is taken from the heavier side.
+private treeGlue[K, V](l: SortedTree[K, V], r: SortedTree[K, V]) -> SortedTree[K, V]
+    if l is Tip then return r
+    if r is Tip then return l
+    if treeSize(l) > treeSize(r)
+        val (k, v, rest) = treeRemoveMax(l)
+        treeBalance(k, v, rest, r)
+    else
+        val (k, v, rest) = treeRemoveMin(r)
+        treeBalance(k, v, l, rest)
+
+// The entries of `l`, then `k` bound to `v`, then the entries of `r`, where every key of `l` is less
+// than `k` and every key of `r` greater, whatever their sizes: the smaller tree descends the side of
+// the larger until the two are balanced with each other.
+private treeLink[K, V](k: K, v: V, l: SortedTree[K, V], r: SortedTree[K, V]) -> SortedTree[K, V]
+    val sl = treeSize(l)
+    val sr = treeSize(r)
+    if treeDelta * sl < sr
+        r match
+            Bin(_, rk, rv, rl, rr) -> return treeBalance(rk, rv, treeLink(k, v, l, rl), rr)
+            Tip -> ()
+    if treeDelta * sr < sl
+        l match
+            Bin(_, lk, lv, ll, lr) -> return treeBalance(lk, lv, ll, treeLink(k, v, lr, r))
+            Tip -> ()
+    treeNode(k, v, l, r)
+
+// The entries of `l` and then of `r`, where every key of `l` is less than every key of `r`, whatever
+// their sizes.
+private treeMerge[K, V](l: SortedTree[K, V], r: SortedTree[K, V]) -> SortedTree[K, V]
+    if l is Tip then return r
+    if r is Tip then return l
+    val sl = treeSize(l)
+    val sr = treeSize(r)
+    if treeDelta * sl < sr
+        r match
+            Bin(_, rk, rv, rl, rr) -> return treeBalance(rk, rv, treeMerge(l, rl), rr)
+            Tip -> ()
+    if treeDelta * sr < sl
+        l match
+            Bin(_, lk, lv, ll, lr) -> return treeBalance(lk, lv, ll, treeMerge(lr, r))
+            Tip -> ()
+    treeGlue(l, r)
+
+// The entries of `t` whose keys are at least `low`.
+private treeFrom[K: Ord, V](t: SortedTree[K, V], low: K) -> SortedTree[K, V] = t match
+    Tip -> Tip
+    Bin(_, k, v, l, r) ->
+        val c = low.compare(k)
+        if c < 0 then treeLink(k, v, treeFrom(l, low), r)
+        elif c > 0 then treeFrom(r, low)
+        else treeLink(k, v, Tip, r)
+
+// The entries of `t` whose keys are less than `high`.
+private treeUntil[K: Ord, V](t: SortedTree[K, V], high: K) -> SortedTree[K, V] = t match
+    Tip -> Tip
+    Bin(_, k, v, l, r) ->
+        val c = high.compare(k)
+        if c < 0 then treeUntil(l, high)
+        elif c > 0 then treeLink(k, v, l, treeUntil(r, high))
+        else l
+
+// The entries of `t` that satisfy `p`, in a tree built from the kept parts of `t`'s own.
+private treeFilter[K, V](t: SortedTree[K, V], p: (K, V) -> bool) -> SortedTree[K, V] = t match
+    Tip -> Tip
+    Bin(_, k, v, l, r) ->
+        val kl = treeFilter(l, p)
+        val keep = p(k, v)
+        val kr = treeFilter(r, p)
+        if keep then treeLink(k, v, kl, kr) else treeMerge(kl, kr)
+
+// The same keys in the same shape, each bound to `f` of the key and its value, called in key order.
+private treeTransform[K, V, W](t: SortedTree[K, V], f: (K, V) -> W) -> SortedTree[K, W] = t match
+    Tip -> Tip
+    Bin(n, k, v, l, r) ->
+        val tl = treeTransform(l, f)
+        val w = f(k, v)
+        Bin(n, k, w, tl, treeTransform(r, f))
+
+// The least entry of `t`, found in a loop.
+private treeFirst[K, V](root: SortedTree[K, V]) -> Option[(K, V)]
+    var t = root
+    var found: Option[(K, V)] = None
+    loop
+        t match
+            Bin(_, k, v, l, _) ->
+                found = Some((k, v))
+                t = l
+            Tip -> return found
+
+// The greatest entry of `t`, found in a loop.
+private treeLast[K, V](root: SortedTree[K, V]) -> Option[(K, V)]
+    var t = root
+    var found: Option[(K, V)] = None
+    loop
+        t match
+            Bin(_, k, v, _, r) ->
+                found = Some((k, v))
+                t = r
+            Tip -> return found
+
+// The entry with the greatest key at most `key`, found in a loop.
+private treeFloor[K: Ord, V](root: SortedTree[K, V], key: K) -> Option[(K, V)]
+    var t = root
+    var found: Option[(K, V)] = None
+    loop
+        t match
+            Bin(_, k, v, l, r) ->
+                val c = key.compare(k)
+                if c == 0 then return Some((k, v))
+                if c > 0
+                    found = Some((k, v))
+                    t = r
+                else
+                    t = l
+            Tip -> return found
+
+// The entry with the least key at least `key`, found in a loop.
+private treeCeiling[K: Ord, V](root: SortedTree[K, V], key: K) -> Option[(K, V)]
+    var t = root
+    var found: Option[(K, V)] = None
+    loop
+        t match
+            Bin(_, k, v, l, r) ->
+                val c = key.compare(k)
+                if c == 0 then return Some((k, v))
+                if c < 0
+                    found = Some((k, v))
+                    t = l
+                else
+                    t = r
+            Tip -> return found
+
+// Visits the entries of a tree in order of their keys, ascending or descending, holding the path of
+// nodes still to visit.
+private class SortedTreeIterator[K, V](root: SortedTree[K, V], private val descending: bool): Iterator[(K, V)]
+    private var path: List[SortedTree[K, V]] = []
+    descend(root)
+
+    override hasNext() -> bool = path.nonEmpty()
+
+    override next() -> (K, V) = path match
+        Bin(_, k, v, l, r) :: rest ->
+            path = rest
+            descend(if descending then l else r)
+            (k, v)
+        _ -> fail("next on an exhausted iterator")
+
+    // Pushes `t` and its nodes along the side visited first.
+    private descend(t: SortedTree[K, V])
+        var node = t
+        loop
+            node match
+                Bin(_, _, _, l, r) ->
+                    path = node :: path
+                    node = if descending then r else l
+                Tip -> return
