@@ -368,12 +368,15 @@ struct TraitMethod
     extension: bool
 
 /** An unknown type argument of a call, open until a later use settles it: where it was made, and
- * what to report if nothing does. */
+ * what to report if nothing does. One the call's result names only where a value is read out
+ * (`R` in `Left(1)`, an `Either[int, R]`) is `Nothing` if nothing settles it, as `None` alone is an
+ * `Option[Nothing]`; any other is reported. */
 struct Unknown
     var_id: usize
     unit: usize
     at: Span
     message: string
+    covariant: bool
 
 struct Checker
     units: Buf[SourceUnit]
@@ -2666,7 +2669,11 @@ private vary_args(f: Conformances, params: Buf[TypeParam], xs: Buf[&Type], ys: B
     var out: Buf[&Type] = buf()
     for i in 0..<xs.len()
         val v = params[i].variance
-        if v is Covariant then out.push(view_part(f, xs[i], ys[i]))
+        // No value has type `Nothing`, so an instance whose covariant argument is `Nothing` holds
+        // none of it and is an instance with any type there, a value type too: `None` alone, an
+        // `Option[Nothing]`, is an `Option[int]`.
+        if v is Covariant && *xs[i] is Nothing && !(*ys[i] is Var(_)) then out.push(ys[i])
+        elif v is Covariant then out.push(view_part(f, xs[i], ys[i]))
         elif v is Contravariant then out.push(view_contra(f, xs[i], ys[i]))
         else out.push(xs[i])
     out
@@ -8182,6 +8189,11 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
     var steps: Buf[&TExpr] = buf()
     steps.push(TExpr(at, Unit, Let(held, builder)))
     val result = call_method(c, at, at, receiver, "result", methods_of(c, builder.ty, "result"), buf(), None, None, false)
+    // The builder takes elements in, but the literal is only the collection it yields: an element
+    // type that collection holds only where a value is read out is `Nothing` if nothing settles it,
+    // so `[]` alone is a `Vector[Nothing]`, as `Vector.empty()` is, and `{}` alone, a `Set`, is not.
+    for i in first_unknown..<c.unknowns.len()
+        c.unknowns[i].covariant = occurrence(c, result.ty, c.unknowns[i].var_id, true) == 1
     if want is Some(w)
         if !unify(c, result.ty, w)
             if *w is Class(k, _, _)
@@ -8710,8 +8722,10 @@ private compare_link(c: *Checker, op: CompareOp, left: &TExpr, right: &TExpr)
 // requires it.
 private equality_link(c: *Checker, at: Span, spelling: string, x: &Type, y: &Type)
     if *x is AnyType && *y is AnyType then return
+    // A value of a type parameter's lower bound is a value of the parameter, so `v == x` compares an
+    // option's `T` with a `T1 >: T`.
     if *x is TypeVar(_, _, _) || *y is TypeVar(_, _, _)
-        if !same_type(x, y)
+        if !same_type(x, y) && !fits(c, x, y) && !fits(c, y, x)
             c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(x)} with ${type_name(y)}")
             return
         operator_conforms(c, at, spelling, x, "Eq")
@@ -11358,7 +11372,12 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
             val example = if called then s"`$name[${written}int](…)`" else s"`$name[${written}int]`"
             val message = s"cannot infer `${type_params[i].name}` for $subject; write it, as in $example"
             if bounds_at(c, owner, type_params, i).len() == 0
-                c.unknowns.push(Unknown(v, unit, name_span, message))
+                // Named only where a value is read out, by the parameters and the result, it has
+                // no constraint but lower bounds, and with none it is the least type, `Nothing`.
+                val reads = occurrences(c, wanted, v, true)
+                val gives = occurrence(c, declared, v, true)
+                val covariant = reads <= 1 && gives <= 1 && reads + gives > 0
+                c.unknowns.push(Unknown(v, unit, name_span, message, covariant))
                 solved.push(t)
             else
                 c.note(unit, name_span, message)
@@ -12697,15 +12716,50 @@ private unify(c: *Checker, a: &Type, b: &Type) -> bool
             _ -> false
         _ -> same_type(x, y)
 
-/** Reports each unknown left open since `mark` that no use has settled, at the call that made it,
- * and settles it as the error type so nothing reports it again. */
+/** Settles each unknown left open since `mark` that no use has settled: as `Nothing` where the call's
+ * result names it only where a value is read out, and otherwise by reporting it at the call that
+ * made it and settling it as the error type, so nothing reports it again. */
 private settle_unknowns(c: *Checker, mark: usize)
+    // `Nothing` first, so an unknown another call shares, as `show(None)` shares `show`'s `T`, is
+    // settled whichever call recorded it first.
+    for i in mark..<c.unknowns.len()
+        val u = c.unknowns[i]
+        if u.covariant && *zonk(c, Var(u.var_id)) is Var(v) then c.vars.set(v, Some(Nothing))
     for i in mark..<c.unknowns.len()
         val u = c.unknowns[i]
         if *zonk(c, Var(u.var_id)) is Var(v)
             c.note(u.unit, u.at, u.message)
             c.vars.set(v, Some(ErrorType))
     c.unknowns.truncate(mark)
+
+/** Where the unknown `v` occurs in `t`: 0 nowhere, 1 only where a value is read out (the whole
+ * type, a covariant argument, a tuple part, a function's result), 2 somewhere else as well. */
+private occurrence(c: *Checker, t: &Type, v: usize, covariant: bool) -> i32 = *zonk(c, t) match
+    Var(i) -> if i != v then 0 elif covariant then 1 else 2
+    Tuple(items) -> occurrences(c, items, v, covariant)
+    Function(params, result) ->
+        val ps = occurrences(c, params, v, false)
+        val r = occurrence(c, result, v, covariant)
+        if ps > r then ps else r
+    ByName(inner) -> occurrence(c, inner, v, covariant)
+    Data(d, _, args) -> occurrence_args(c, c.data[d].decl.type_params, args, v, covariant)
+    Class(k, _, args) -> occurrence_args(c, c.classes[k].decl.type_params, args, v, covariant)
+    _ -> 0
+
+private occurrences(c: *Checker, types: Buf[&Type], v: usize, covariant: bool) -> i32
+    var most = 0
+    for t in types
+        val o = occurrence(c, t, v, covariant)
+        if o > most then most = o
+    most
+
+private occurrence_args(c: *Checker, params: Buf[TypeParam], args: Buf[&Type], v: usize, covariant: bool) -> i32
+    var most = 0
+    for i in 0..<args.len()
+        val reads = covariant && i < params.len() && params[i].variance is Covariant
+        val o = occurrence(c, args[i], v, reads)
+        if o > most then most = o
+    most
 
 /** Settles every unknown in `t` as the error type. */
 private poison(c: *Checker, t: &Type)
