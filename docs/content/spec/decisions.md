@@ -560,13 +560,24 @@ Settled by the user on 2026-11-03:
   arguments after the program's name, and `programName()` gives the name separately; `env(name)` is
   an `Option[string]`; `exit(code: int) -> Nothing` flushes standard output first, as a trap does.
   Arguments are checked as UTF-8 at startup. A test run by `avin test` sees no arguments.
-- `avin.io` ([system library](/spec/system-library/)): standard input as text through
-  `readLine() -> Option[string]`, `lines() -> Iterator[string]` and `readAll() -> string`, sharing one
-  runtime-held buffer. A line ends at `\n` with a `\r` before it trimmed; the last line needs no
-  terminator. Ill-formed UTF-8 becomes U+FFFD; a failed read ends the input, so reading has no error
-  type. `eprint(x)` mirrors `print` on standard error and is in the prelude with `StandardError`, an
-  unbuffered `Writer`; every write to standard error flushes standard output first. A test run by
-  `avin test` reads empty input.
+- `avin.fs` and `avin.io` ([system library](/spec/system-library/)): `IoError`, shared by every
+  module that does input or output, lives in `avin.io` as a plain `data` type with the variants
+  `NotFound`, `PermissionDenied`, `AlreadyExists`, `IsADirectory`, `NotADirectory`,
+  `DirectoryNotEmpty`, `InvalidUtf8(offset: long)` and `Other(text: string)`, and a `message()`
+  sentence. `avin.fs` reads and writes whole files (`readText`, `readBytes`, `writeText`,
+  `appendText`, `writeBytes`, `appendBytes`), asks `exists`, `isDir` and `isFile`, and makes and
+  removes (`createDir`, `createDirAll`, `createTempDir`, `remove`, `removeDir`, `removeDirAll`),
+  each failure an `IoError` in a `Result`. Writing replaces a file and appending creates one;
+  `createDirAll` accepts a directory already there and `removeDirAll` a path already gone. Listing a
+  directory waits for a binding that can carry a list of strings.
+- Standard input and error, in `avin.io` beside `IoError` ([system library](/spec/system-library/)):
+  standard input as text through `readLine() -> Option[string]`, `lines() -> Iterator[string]` and
+  `readAll() -> string`, sharing one runtime-held buffer. A line ends at `\n` with a `\r` before it
+  trimmed; the last line needs no terminator. Ill-formed UTF-8 becomes U+FFFD and a failed read ends
+  the input, so reading standard input answers no `IoError`, where `fs.readText` answers
+  `InvalidUtf8`. `eprint(x)` mirrors `print` on standard error and is in the prelude with
+  `StandardError`, an unbuffered `Writer`; every write to standard error flushes standard output
+  first. A test run by `avin test` reads empty input.
 - Running and testing (stage 10): `avin run <program> [-O0 | -O2] [-- args]` builds into
   `.avin/build/` in the program's directory, reuses the executable while nothing it was built from
   has changed, and exits with the program's status, or 128 and the signal's number for a trap. Its
