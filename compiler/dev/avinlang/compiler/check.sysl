@@ -5698,7 +5698,12 @@ private hold_to_bounds(c: *Checker, unit: usize, at: Span, what: string, owner: 
         if lower_at(c, owner, params, i) is Some(l)
             val lower = zonk(c, substitute(l, owner, args))
             val arg = zonk(c, args[i])
-            if *arg is ErrorType || *lower is ErrorType || has_unknowns(arg) || has_unknowns(lower) then continue
+            if *arg is ErrorType || *lower is ErrorType then continue
+            // One still open is held to the bound where a later use settles it, and the view is
+            // read once the program is solved.
+            if has_unknowns(arg) || has_unknowns(lower)
+                c.views.push(TypeView(one_part(lower), one_part(arg)))
+                continue
             // The generic code passes a value of the bound as one of the parameter with no
             // conversion, as a part of a tuple is.
             if conforms(lower, arg) || conforms(view_part(conformances(c), lower, arg), arg)
@@ -5713,7 +5718,12 @@ private admits_lowers(c: *Checker, owner: usize, params: Buf[TypeParam], from: u
         if lower_at(c, owner, params, i) is Some(l)
             val lower = zonk(c, substitute(l, owner, args))
             val arg = zonk(c, args[i])
-            if *arg is ErrorType || *lower is ErrorType || has_unknowns(arg) || has_unknowns(lower) then continue
+            if *arg is ErrorType || *lower is ErrorType then continue
+            // One still open is held to the bound where a later use settles it, and the view is
+            // read once the program is solved.
+            if has_unknowns(arg) || has_unknowns(lower)
+                c.views.push(TypeView(one_part(lower), one_part(arg)))
+                continue
             if !conforms(lower, arg) && !conforms(view_part(conformances(c), lower, arg), arg) then return false
     true
 
@@ -9123,8 +9133,8 @@ private join_expected(c: *Checker, a: &Type, b: &Type, expected: Option[&Type]) 
 private join(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
     val t = joined(c, a, b)?
     // Each side is taken as the type they agree on with no conversion, as an upcast is.
-    if !same_type(zonk(c, a), zonk(c, t)) then c.views.push(TypeView(a, t))
-    if !same_type(zonk(c, b), zonk(c, t)) then c.views.push(TypeView(b, t))
+    if !same_type(zonk(c, a), zonk(c, t)) && !through_lowers(c, zonk(c, a), zonk(c, t)) then c.views.push(TypeView(a, t))
+    if !same_type(zonk(c, b), zonk(c, t)) && !through_lowers(c, zonk(c, b), zonk(c, t)) then c.views.push(TypeView(b, t))
     Some(t)
 
 private joined(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
@@ -9231,8 +9241,36 @@ private ancestor_parent(c: *Checker, t: &Type) -> Option[&Type] = *t match
 private upcast(c: *Checker, from: &Type, to: &Type) -> &Type
     val x = zonk(c, from)
     val up = viewed(c, x, to)
-    if !same_type(x, zonk(c, up)) then c.views.push(TypeView(x, up))
+    if !same_type(x, zonk(c, up)) && !through_lowers(c, x, zonk(c, up)) then c.views.push(TypeView(x, up))
     up
+
+// Whether `up` differs from `x` only where a type parameter's lower bound is seen as the parameter,
+// as `self`, an `Option[T]`, is returned as an `Option[B]` for `B >: T`. Each call states that view
+// at the type arguments it gives (see `hold_to_bounds`), so the generic code's own view says nothing
+// more about what values meet.
+private through_lowers(c: *Checker, x: &Type, up: &Type) -> bool
+    if same_type(x, up) then return true
+    if *up is TypeVar(_, _, _)
+        return type_var_lower(conformances(c), up) match
+            Some(l) -> same_type(x, l)
+            None -> false
+    *up match
+        Data(d, _, ys) -> *x match
+            Data(e, _, xs) -> d == e && all_through_lowers(c, xs, ys)
+            _ -> false
+        Class(k, _, ys) -> *x match
+            Class(j, _, xs) -> k == j && all_through_lowers(c, xs, ys)
+            _ -> false
+        Tuple(ys) -> *x match
+            Tuple(xs) -> all_through_lowers(c, xs, ys)
+            _ -> false
+        _ -> false
+
+private all_through_lowers(c: *Checker, xs: Buf[&Type], ys: Buf[&Type]) -> bool
+    if xs.len() != ys.len() then return false
+    for i in 0..<xs.len()
+        if !through_lowers(c, zonk(c, xs[i]), zonk(c, ys[i])) then return false
+    true
 
 private viewed(c: *Checker, x: &Type, to: &Type) -> &Type
     // Every value converts to `Any`, by boxing where it is written; never inside a tuple or as a
