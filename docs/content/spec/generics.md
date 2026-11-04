@@ -140,7 +140,10 @@ The checker verifies each declared parameter's positions:
   them.
 - The traits a `data` type's `impl`s make it conform to are parents, like a class's. The methods an
   `impl` adds to a `data` type are not positions: they receive the value as whichever instance of
-  the type it is seen as, and data is immutable.
+  the type it is seen as, and data is immutable. The same holds for the methods an `impl` adds to a
+  class whose fields are all immutable (proposed; see [decisions](/spec/decisions/#proposed)), so
+  `Vector[+T]` takes `T` in `appended` and `contains`; a class with a `var` field keeps every method
+  a position.
 
 An error names the parameter, its variance and the position: a `+T` in the parameter `x` of `put`
 is reported as a covariant type parameter appearing in a contravariant position.
