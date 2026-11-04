@@ -239,6 +239,13 @@ private in_core_library(program: TProgram, id: usize) -> bool
     val m = program.symbols[id].module_name
     m == "avin" || m.starts_with("avin.")
 
+/** Whether a function is the constructor of a class, which allocates the object it yields. */
+private is_class_constructor(program: TProgram, id: usize) -> bool
+    val symbol = program.symbols[id]
+    symbol.owner_class match
+        Some(k) -> symbol.constructor && program.classes[k].constructor == id
+        None -> false
+
 /** Whether a function has no code: an abstract method, or an abstract class's or a trait's constructor. */
 private never_compiled(program: TProgram, id: usize) -> bool
     val symbol = program.symbols[id]
@@ -530,6 +537,7 @@ private construct(l: *Lowering, e: &TExpr, variant: usize, args: Buf[&TExpr]) ->
     for i in 0..<values.len()
         if shape.fields[i] is Some(field)
             if values[i] is Some(v) then l.insts.push(Store(field_address(l, Value(object), field), v))
+    l.insts.push(Publish)
     Some(Value(object))
 
 // The parts of a tuple-typed expression, in order. A tuple written out is never made: its parts are
@@ -750,6 +758,7 @@ private box_value(l: *Lowering, t: &Type, value: Option[Operand]) -> Option[Oper
     val object = fresh(l, MRef)
     l.insts.push(Alloc(object, value_box(l, t)))
     l.insts.push(Store(field_address(l, Value(object), FieldSlot(0, m)), v))
+    l.insts.push(Publish)
     Some(Value(object))
 
 /** Where a descriptor's type record is: after the collector's kind and three words. */
@@ -893,6 +902,7 @@ private function_value(l: *Lowering, function: usize, type_args: Buf[&Type]) -> 
     l.insts.push(Alloc(object, shape.descriptor))
     for i in 0..<values.len()
         l.insts.push(Store(field_address(l, Value(object), shape.fields[i]), values[i]))
+    l.insts.push(Publish)
     Value(object)
 
 // Calls a method through the method table of the receiver, `args[0]`: whichever override fills the
@@ -1076,6 +1086,7 @@ private bind_local(l: *Lowering, x: usize, value: Option[Operand])
     val box = fresh(l, MRef)
     l.insts.push(Alloc(box, box_descriptor(l, t)))
     l.insts.push(Store(field_address(l, Value(box), FieldSlot(0, t)), v))
+    l.insts.push(Publish)
     store(l, l.local_slots[x], Some(Value(box)))
 
 /** A type of the code being lowered, with the instance's type arguments substituted. */
@@ -1175,6 +1186,8 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     f.body match
         Some(body) ->
             val result = lower_expr(l, body)
+            // A class's object is made by its constructor and complete when the constructor is.
+            if is_class_constructor(l.program, f.symbol) then l.insts.push(Publish)
             finish(l, returning(l, result))
         None ->
             if binding_target(symbol.decl) is Some(_) then binding_body(l, symbol, shim_symbol(function_symbol(l.program, f.symbol, inst.type_args)))

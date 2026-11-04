@@ -610,6 +610,8 @@ Settled by the user on 2026-11-04:
   core library adds `flatten` to `Option[Option[T]]`, `Result[Result[T, E], E]` and `Seq[Seq[T]]`
   (a `Vector[T]`), `toMap()` to `Iterable[(K, V)]` (keys bounded as a map's) and `unzip()` to
   `Seq[(A, B)]`.
+- A heap field or module variable wider than 64 bits is accessed as untorn 64-bit words: a racing
+  read of it may combine words of different writes ([threads](/spec/threads/#the-memory-model)).
 
 **Deferred**
 

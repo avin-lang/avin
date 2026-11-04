@@ -490,6 +490,26 @@ a context's state by its thread, so either the thread sees the flag and wakes th
 collector sees the thread safe. With one context attached the flag is never raised, so a program
 with one thread takes no poll's slow path and makes no system call for a collection.
 
+The emitter gives the [memory model](/spec/threads/#the-memory-model) its two guarantees.
+**Every load and store another thread can reach is an `unordered` atomic one**: a field of an
+object, which covers class and data fields, a closure's captures and the box of a captured `var`;
+an element of an array; a byte of a string; and a module-level value, in `@avin.roots` or a global
+of its own. A function's own slots, and the slots of its callers whose addresses a local function is
+given as parameters, belong to one thread and are accessed plainly, as are the header words and the
+constant descriptors behind them. An atomic access is made at the width the value is laid out at, a
+whole power-of-two number of bytes: a `bool` is a byte and an `i5` a byte, an `i24` four, an `i48`
+eight, truncated after a load and zero-extended before a store. An integer wider than 64 bits is
+accessed as its 64-bit words, lowest first, each an `unordered` access of its own, so no word is torn
+and a racing load may combine words of different stores. On arm64 and x86-64 an `unordered` load or
+store is the same instruction a plain one is.
+
+**Making an object ends with `fence release`**, once its last field is stored and before the
+reference can reach anything else: a data value or tuple after its fields, a closure after its
+captures, a box after its value, a value boxed as `Any` after the value, and a class's object at the
+end of its constructor, after the class body has run. A constant object needs none. On arm64 the
+fence is one `dmb ish`; on x86-64 it is no instruction at all, only an order the compiler keeps.
+Arrays and strings are made by the runtime, so the fence for them is the runtime's to make.
+
 ## Standard library
 
 `library/` holds Avin source under the module root `avin`, starting with the prelude every program
