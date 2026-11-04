@@ -14,6 +14,21 @@ signature, and the caller must deal with it.
 exhausted iterator or a failed assertion stops the program with a message and the source location.
 A trap is not a value and cannot be caught.
 
+**The location is in the program's own code.** A trap reached inside the core library, whether the
+library asked for it, as `m(k)` on a missing key does, or a check failed there, such as an overflow,
+reports the place where the program last called into the library, with the library's reason:
+
+```text
+main()
+    val b = Buffer[int]()
+    b.remove(0)          // avin: trap: index out of range at main.avin:3:5
+```
+
+That holds however deep in the library the trap is, and whether the program called the library
+directly, through a trait or through a function value. When the library calls back into the
+program, as `Array.tabulate` calls the function it is given, a trap the program's code reaches in
+the library again reports that inner call, the nearest one the program wrote.
+
 ## The ? operator
 
 `expr?` unwraps `Ok(v)` or `Some(v)` to `v`. On `Err(e)` or `None` it returns from the enclosing

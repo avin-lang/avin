@@ -407,8 +407,11 @@ a decision changes, this page and the chapter change together.
 - `Vector` keeps its elements in one array that is never written after the vector is made: indexing
   is constant time and a changed vector is a copy. A persistent structure may replace it without
   changing its interface.
-- Core-library functions marked `@trapsAtCaller` report their traps at the program's call, as the
-  language's own operations do; the annotation is the core library's alone.
+- A trap inside the core library, a `fail` or a failed check such as an overflow alike, reports the
+  place where the program last entered the library: the program's own call, however many library
+  calls deep the trap is and whether the program reached the library directly, through a method
+  table or through a function value. No annotation asks for it and no function of the program pays
+  for it. See [errors](/spec/errors/).
 
 Settled by the user on 2026-11-03:
 
