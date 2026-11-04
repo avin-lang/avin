@@ -653,7 +653,7 @@ main() = print(s"${circleArea(Circle(2))}")
   its path from the root, `geometry/shapes` being `geometry.shapes`, so a directory is named as a
   declaration is: letters, digits and `_`. Every file of a module begins with `module` and the
   module's name, which must agree with its directory. The root directory's own files are the **root
-  module**, which has no name, holds `main` and takes no header. A program of a single file is
+  module**, which has no name, holds `main` (`main()` or `main(args: Vector[string])`) and takes no header. A program of a single file is
   compiled alone; its header, if any, names its module.
 - **A module's files are one namespace.** Each sees every declaration of every other file of its
   module by its bare name, private ones included, and they may not declare one name twice, except
