@@ -61,6 +61,9 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
   sequence has it, through an impl adding it to `Seq`, and so do sets, and maps, whose entries join
   as `key: value`, the form a displayed map shows. `max()` and `min()` on every sequence of `Ord`
   elements answer `Some` of the greatest or least, the first of equal ones, and `None` when empty.
+  The free functions `max(first, rest*)` and `min(first, rest*)` take one value or more, with a
+  [repeated](/spec/declarations/#repeated-parameters) parameter, and answer the greatest or least
+  itself: `max(3, 9, 4)` is `9`, `min(x, ys*)` the least of `x` and the elements of `ys`.
   `sum()` and `product()` are added to `Iterable` the same way, so every collection has them, ranges
   and sets included, where its elements have `Add` or `Mul`: they answer the total or the product,
   and the identity (`T.zero()`, `T.one()`) when empty, so `[1, 2, 3].sum()` is `6`, `(1..5).product()`
