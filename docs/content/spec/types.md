@@ -201,6 +201,23 @@ collections are functions this way: a `Seq[T]` is an `(int) -> T`, a `Set[A]` an
 
 There is no arity limit.
 
+### Partial functions
+
+`PartialFunction[-A, +B]` is a core-library trait, and a subtype of `A -> B`: a function defined at
+some values of `A` and not others. `isDefinedAt(a)` says whether it is defined at `a`; calling it,
+`pf(a)`, at a value it is not defined at traps, and the trap names the program's call. `lift()` is
+the total function `A -> Option[B]`, `None` where it is not defined; `applyOrElse(a, default)` is its
+value at `a`, or `default(a)` where it is not defined; `pf.orElse(other)` is `pf` where it is
+defined and `other` elsewhere. A [`match` with nothing before
+it](/spec/operators-and-control-flow/#match-functions), written where a `PartialFunction` is
+expected, makes one:
+
+```text
+val half: PartialFunction[int, int] = match n if n % 2 == 0 -> n / 2
+half.isDefinedAt(3)           // false
+half.applyOrElse(3, n -> n)   // 3
+```
+
 ## Vector types
 
 `[]T` is another way to write `Vector[T]`: the same type, in any position a type may stand.
