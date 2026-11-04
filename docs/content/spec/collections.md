@@ -58,7 +58,9 @@ Every collection type has a **builder**, through one library trait: `List.builde
 `Vector.builder[string]()`, `Set.builder[A]()`. A builder takes elements with `add(x)` and
 `addAll(xs)`, and `result()` hands over the finished collection; the builder is then spent, and using
 it again traps. Transformations, conversions such as `toList()` and collection literals all build
-through builders, and code that assembles a collection element by element uses one too.
+through builders, and code that assembles a collection element by element uses one too. The trait
+is `Builder[-A, +C]`: `add(element: A)`, `addAll(elements: Iterable[A])`, which adds each in turn
+unless a builder does better, and `result() -> C`.
 
 A builder is how an immutable collection is built efficiently without being mutable itself. `List`'s
 builder appends in constant time and hands back an ordinary immutable `List`, so building a list in
@@ -223,12 +225,32 @@ val seen: mutable.Set[int] = {}
 
 A literal is built with its collection's [builder](#builders): sequence types (`List`, `Vector`,
 `Array`, `Buffer`, `Deque`) from sequence literals, set types from set literals and map types from
-map literals. A library or user collection with a builder can be written as a literal the same way. The elements take their types from the expected
-element type when there is one (`Array[byte]` makes each literal a `byte`), and otherwise from the
-elements themselves. An empty literal with nothing to say what it holds is an error asking for an
-annotation.
+map literals. A library or user collection with a builder can be written as a literal the same way:
+a class whose companion object has a `builder()` method, returning a `Builder` of the elements and
+the class, is built by a sequence literal wherever that class is expected. The elements take their
+types from the expected element type when there is one (`Array[byte]` makes each literal a
+`byte`), and otherwise from the elements themselves, which agree on a type as the branches of an
+`if` do: `[dog, cat]` is a `Vector[Animal]`, and `[1, "two"]` is an error. An empty literal with
+nothing to say what it holds takes its type from a later use, as `None` does, and is otherwise an
+error asking for an annotation. A literal compared with `==`, `!=` or an ordering takes the other
+operand's type as its expected type, so `xs == [1, 2]` compares a `List` with a `List` when `xs` is
+one.
 
 Literals always build the library's types, even when a user type named `Vector` is in scope.
+
+## Buffer and Vector
+
+`Buffer[T]` is invariant, growable and mutable. `Buffer[int]()` is an empty buffer; `add(x)` appends
+in amortized constant time, `insert(i, x)` and `remove(i)` work at any index, and `clear()` empties
+it. `b(i)` and `b(i) = v` read and replace an element, and an index outside `0 ..< length()` traps
+at the caller's line. Its elements live in an array with spare capacity, which never holds a value
+that is read before one is written, so a buffer needs no value to fill it with.
+
+`Vector[+T]` is the default sequence: immutable, covariant and indexed in constant time. Its
+elements are in one array that nothing writes to after the vector is made, so an operation that
+makes a changed vector (`appended`, `prepended`, `concat`, `updated`) copies them. Both compare and
+hash by their elements in order, and display as an array does, `[1, 2, 3]`, where their elements
+display.
 
 ## Ranges
 

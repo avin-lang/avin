@@ -64,6 +64,9 @@ private struct Instance
      * the type `type_args[0]`, which no source declares: its structural `==` or hash, its type
      * record's equality entries, or the comparison and hash of values of unknown type. */
     generated: u8
+    /** For a `@trapsAtCaller` function, the call this copy is made for, which its traps report: such
+     * a function has a copy for each place it is called from directly. */
+    caller: Option[CallSite]
 
 /** The layout of a closure of one function: its descriptor, and where each captured value is kept,
  * the captured locals first, then the captured top-level parameters. The entry's address is at
@@ -142,6 +145,13 @@ private struct Lowering
     /** Whether the program compares or hashes a value of unknown type, which reads the equality
      * entries of its type's record: every record then gets them. */
     runtime_equality: bool
+    /** For an instance of a `@trapsAtCaller` function, the call its traps report. */
+    caller: Option[CallSite]
+
+/** A place in the program's source: an offset into a unit. */
+private struct CallSite
+    unit: usize
+    at: Span
 
 /** One slot for a method with type parameters of its own, at one list of its own type arguments: a
  * call through a method table to `name` at checker position `position` with `type_args` reaches it.
@@ -168,7 +178,7 @@ lower_program(program: TProgram) -> MirProgram
         if k.table.len() > generic_base then generic_base = k.table.len()
     for d in program.data
         if d.table.len() > generic_base then generic_base = d.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false)
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, None)
     // Record 0 is for the objects no type pattern names: closures, and the boxes of captured
     // variables.
     l.records.push(TypeRecord("a closure or a captured variable", buf(), None, None))
@@ -506,9 +516,27 @@ private instance_of(l: *Lowering, function: usize, type_args: Buf[&Type], entry:
     val key = instance_key(function, type_args, entry)
     if l.instance_index.get(key) is Some(index) then return index
     val index = l.instances.len()
-    l.instances.push(Instance(function, type_args, entry, Written))
+    l.instances.push(Instance(function, type_args, entry, Written, None))
     l.instance_index.put(key, index)
     index
+
+/** The instance of `function` for `type_args` that a call at `site` makes: a copy of its own for a
+ * `@trapsAtCaller` function, whose traps report that call, and otherwise the function's one copy.
+ * A call made inside such a copy reports the place the copy itself was called from. */
+private called_instance(l: *Lowering, function: usize, type_args: Buf[&Type], site: Span) -> usize
+    if !traps_at_caller(l.program.symbols[function].decl) then return instance(l, function, type_args)
+    val caller = l.caller.unwrap_or(CallSite(l.unit, site))
+    val key = instance_key(function, type_args, false) + s"@${caller.unit}:${caller.at.start}"
+    if l.instance_index.get(key) is Some(index) then return index
+    val index = l.instances.len()
+    l.instances.push(Instance(function, type_args, false, Written, Some(caller)))
+    l.instance_index.put(key, index)
+    index
+
+private traps_at_caller(f: &Function) -> bool
+    for a in f.annotations
+        if a.name == "trapsAtCaller" then return true
+    false
 
 /** The function lowering makes of kind `kind` for type `t`, made when first asked for. */
 private generated(l: *Lowering, kind: u8, t: &Type) -> usize
@@ -517,7 +545,7 @@ private generated(l: *Lowering, kind: u8, t: &Type) -> usize
     val index = l.instances.len()
     var args: Buf[&Type] = buf()
     args.push(t)
-    l.instances.push(Instance(0, args, false, kind))
+    l.instances.push(Instance(0, args, false, kind, None))
     l.instance_index.put(key, index)
     if kind == AnyEquals || kind == AnyHash then l.runtime_equality = true
     index
@@ -874,7 +902,7 @@ private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr],
     else
         for t in type_args
             concrete_args.push(concrete(l, t))
-    val index = instance(l, function, concrete_args)
+    val index = called_instance(l, function, concrete_args, e.span)
     val dest = machine(l, e.ty) match
         Some(t) -> Some(fresh(l, t))
         None -> None
@@ -1015,6 +1043,7 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     l.loops = buf()
     l.unit = symbol.unit
     l.trap_blocks = map()
+    l.caller = inst.caller
     l.locals = f.locals
     l.boxed = boxed_locals(l, symbol.root.unwrap_or(inst.function), f.locals)
     if inst.entry then return lower_entry(l, inst)
@@ -1051,7 +1080,9 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
         None ->
             if binding_target(symbol.decl) is Some(_) then binding_body(l, symbol, shim_symbol(function_symbol(l.program, f.symbol, inst.type_args)))
             else intrinsic_body(l, symbol)
-    MirFunction(function_symbol(l.program, f.symbol, inst.type_args), signature, l.values, l.slots, l.blocks)
+    var name = function_symbol(l.program, f.symbol, inst.type_args)
+    if inst.caller is Some(site) then name = name + s"@${site.unit}.${site.at.start}"
+    MirFunction(name, signature, l.values, l.slots, l.blocks)
 
 // A closure entry takes the closure and the function's parameters. It keeps each captured local
 // the closure holds in a slot of its own and calls the function with the slot's address, as a
@@ -1233,7 +1264,18 @@ private array_operation(l: *Lowering, name: string, array: &Type, args: Buf[Oper
         val length = convert_op(l, SignExtend, MInt(64), args[0])
         return Some(runtime_call(l, "avin_rt_new_array", [MPtr, MInt(64)], MRef, [DescriptorAddress(descriptor), length]))
     val a = args[0]
+    // A frozen array is the array itself, seen through a type that only reads it.
+    if name == "array_freeze" then return Some(a)
     if name == "array_length" then return Some(byte_length(l, a))
+    if name == "array_clear"
+        trap_if(l, compare(l, CmpUgt, args[2], byte_length(l, a)), "slice out of range", at)
+        trap_if(l, compare(l, CmpUgt, args[1], args[2]), "slice out of range", at)
+        var types: Buf[MirType] = buf()
+        types.push(MRef)
+        types.push(MInt(32))
+        types.push(MInt(32))
+        l.insts.push(Call(None, Runtime("avin_rt_array_clear", MirSignature(types, None)), args))
+        return None
     if name == "array_slice"
         trap_if(l, compare(l, CmpUgt, args[2], byte_length(l, a)), "slice out of range", at)
         trap_if(l, compare(l, CmpUgt, args[1], args[2]), "slice out of range", at)
@@ -1313,13 +1355,17 @@ private load(l: *Lowering, place: Option[Place]) -> Option[Operand] = place matc
         Some(Value(dest))
     None -> None
 
-/** The trap site for `reason` at the start of `at`, in the function being lowered; made when first
- * asked for, so every instance of a generic function shares its sites. A site names its file
+/** The trap site for `reason` at the start of `written`, in the function being lowered, or at the
+ * call a `@trapsAtCaller` copy was made for; made when first asked for, so every instance of a
+ * generic function shares its sites. A site names its file
  * without the directories it was compiled from, so a report reads the same wherever it was built. */
-private trap_site(l: *Lowering, reason: string, at: Span) -> usize
-    val key = s"${l.unit}:${at.start}:$reason"
+private trap_site(l: *Lowering, reason: string, written: Span) -> usize
+    // A `@trapsAtCaller` function's traps are reported where it was called.
+    val site = l.caller.unwrap_or(CallSite(l.unit, written))
+    val at = site.at
+    val key = s"${site.unit}:${at.start}:$reason"
     if l.trap_index.get(key) is Some(index) then return index
-    val src = l.program.sources[l.unit]
+    val src = l.program.sources[site.unit]
     val position = src.locate(at.start)
     val file = file_name(src.name).unwrap_or(src.name)
     l.traps.push(TrapSite(intern(l, reason), intern(l, file), position.line, position.col))

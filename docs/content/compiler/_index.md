@@ -441,6 +441,28 @@ descriptor. `xs(i)` on a value whose type has an `apply` method calls it; `xs(i)
 A private intrinsic `fail(reason)`, of type `Nothing`, traps with a literal reason at its call;
 `Range` and the library's iterators use it.
 
+`FrozenArray[+T]`, private to the core library, is an array seen through a type that only reads it
+(`is_array_storage`): its `length`, `apply` and `slice` are the array intrinsics, and
+`freeze(a)` (`array_freeze`) is the array itself, so a `Vector` keeps its elements unboxed with no
+copy and stays covariant. `clearElements` (`array_clear`, `avin_rt_array_clear`) zeroes a range, so
+a buffer's vacated capacity keeps nothing alive. A core-library function marked **`@trapsAtCaller`**
+is lowered once per place it is called from directly: `called_instance` keys the instance by the
+call's unit and offset (passed on from a copy that is itself such a call), `Instance.caller` and
+`Lowering.caller` hold it, and `trap_site` reports every trap of that copy, its inlined array checks
+and `fail` calls included, at the call. A call through a method table or a function value reaches
+the ordinary copy, which reports the library's line.
+
+**Sequence literals** (`sequence_literal` in `check.sysl`) are checked against the expected type. A
+`List` is built as `::` chains (`list_literal`). Otherwise the collection is the expected class
+whose companion object has a `builder` method, or else the core library's `Vector`, looked up by
+qualified name so a program's own `Vector` never takes its place. The literal becomes a block: a
+hidden local holding `Companion.builder()`, one `add` call per element, and `result()`. The result
+type is unified with the expected type, or with the instance of the expected trait the collection
+is (`ancestor_type`), which settles the element type, and the elements are then checked as `add`'s
+arguments. With no element type expected, each element is checked alone and their types are joined
+as `if` branches are, the narrower references passed as the joined type. The builder's open type
+argument is recorded with a message about empty literals, so a later use may settle it.
+
 **`for` loops** are checked as the `while` loops they mean, in the manner of `do … while`: the
 source is evaluated once into a hidden local, and the element is bound by the pattern at the top of
 each iteration, after which the loop steps, so `continue` goes straight to the test. A range written
