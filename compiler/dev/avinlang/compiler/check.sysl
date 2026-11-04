@@ -651,6 +651,8 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool) -> Che
     for id in 0..<c.classes.len()
         link_methods(&c, id, &linked)
     place_traits(&c)
+    for id in 0..<c.classes.len()
+        check_apply_overloads(&c, id)
     // Type arguments written in declarations are held to their bounds once every conformance is known.
     c.conformances_known = true
     for p in c.pending
@@ -2647,6 +2649,68 @@ private declare_globals(c: *Checker, unit: usize)
                         c.global_names.put(key, c.globals.len())
                         c.globals.push(GlobalSymbol(unit, file.module_name, d.name, d.name_span, false, cls.constructor, Some(k), false))
             _ -> ()
+
+// A companion's `apply` overloads the constructor its name has in call position, so it cannot take
+// the same parameter types: no call could choose between them. Two are the same as two overloads of
+// a function are, each accepting the other's parameter types.
+private check_apply_overloads(c: *Checker, o: usize)
+    val k = c.classes[o]
+    if !k.decl.object then return
+    val made = made_by(c, o) match
+        Some(m) -> m
+        None -> return
+    for m in k.methods
+        if c.symbols[m].decl.name == "apply" && clashes(c, made, m)
+            c.note(k.unit, c.symbols[m].decl.name_span, s"`apply` takes the same parameter types as ${made.what}, which `${k.name}(…)` also calls, so no call could choose between them")
+
+/** The constructor an object's name has in call position, which its `apply` methods overload: its
+ * parameter types, in the `count` type parameters of `owner`, and what a diagnostic calls it. */
+private struct MadeBy
+    params: Buf[&Type]
+    owner: usize
+    count: usize
+    what: string
+
+/** For companion `o`, the constructor its name has in call position: its class's, unless that is
+ * abstract or an array, or its data type's variant of its name, where that has fields. */
+private made_by(c: *Checker, o: usize) -> Option[MadeBy]
+    val k = c.classes[o]
+    if k.companion is Some(cls)
+        if is_array_class(c.classes[cls]) || is_abstract_class(c, cls) then return None
+        val ctor = c.symbols[c.classes[cls].constructor]
+        return Some(MadeBy(ctor.params, ctor.type_owner, ctor.type_params.len(), s"`${k.name}`'s constructor"))
+    val d = k.companion_data match
+        Some(d) -> d
+        None -> return None
+    val v = c.variants.get(qualified(k.module_name, k.name)) match
+        Some(v) -> v
+        None -> return None
+    if v.data != d || c.data[d].variants[v.index].fields.len() == 0 then return None
+    Some(MadeBy(c.data[d].variants[v.index].fields, data_owner(d), c.data[d].decl.type_params.len(), s"the variant `${k.name}`"))
+
+/** Whether `apply` method `m` takes the same parameter types as the constructor `made`, so that no
+ * call could choose between them. */
+private clashes(c: *Checker, made: MadeBy, m: usize) -> bool
+    val f = c.symbols[m]
+    if f.params.len() != made.params.len() + 1 then return false
+    for p in made.params
+        if *p is ErrorType then return false
+    var own: Buf[&Type] = buf()
+    for i in 1..<f.params.len()
+        own.push(f.params[i])
+    accepts(c, own, f.type_owner, f.type_params.len(), made.params) && accepts(c, made.params, made.owner, made.count, own)
+
+/** The `apply` methods of object `o` a call by its name may choose: those the code being checked may
+ * call, less any refused for taking its constructor's parameter types. */
+private object_applies(c: *Checker, o: usize) -> Buf[usize]
+    val ms = methods_named(c, o, "apply")
+    val made = made_by(c, o) match
+        Some(m) -> m
+        None -> return ms
+    var out: Buf[usize] = buf()
+    for m in ms
+        if !clashes(c, made, m) then out.push(m)
+    out
 
 /** The name a top-level declaration introduces: "" for an impl, which introduces none. */
 private item_name(item: Item) -> string = item match
@@ -5511,7 +5575,17 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
             return overloaded_method_value(c, at, self_ref(c, at), name, ms, None, expected)
         Some(TraitFieldOf(m)) -> return trait_field_read(c, at, self_ref(c, at), m, expected)
         None -> ()
-    if global_named(c, name) is Some(g) then return global_read(c, at, g)
+    if global_named(c, name) is Some(g)
+        // An object that declares `apply`, where a function is expected, is that function, unless
+        // the object is of a function type and so a function value itself.
+        if expected is Some(t)
+            if *zonk(c, t) is Function(ps, _)
+                val ids = lookup_functions(c, name)
+                if applying_object(c, name, ids) is Some(o)
+                    var found: Buf[&Type] = buf()
+                    function_ancestors(c.classes, c.data, own_class_type(c.classes[o], o), &found, 0)
+                    if found.len() == 0 then return apply_value(c, at, name, o, ids, ps, expected)
+        return global_read(c, at, g)
     if lookup_function(c, name) is Some(id)
         if abstract_constructor(c, id, at) then return TExpr(at, ErrorType, UnitConst)
         return named_function_value(c, at, name, None, expected)
@@ -7753,8 +7827,10 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
         None -> ()
     // A module-level value is called as a value; a class's name in call position is its
     // constructor, and a data type's variant of its own name, even where a companion object shares
-    // the name.
+    // the name. An object that declares `apply` is called through it, and a companion's `apply`
+    // methods overload the constructor its name has in call position.
     val ids = lookup_functions(c, name)
+    if applying_object(c, name, ids) is Some(o) then return apply_call(c, at, named.span, name, o, ids, args, explicit, expected)
     var global = if explicit is None && ids.len() == 0 then global_named(c, name) else None
     if global is Some(g)
         if c.globals[g].object is Some(k)
@@ -7762,7 +7838,7 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
                 if c.classes[k].companion_data == Some(v.data) then global = None
     if global is Some(g)
         if c.globals[g].object is Some(_)
-            c.note(unit, named.span, s"`$name` is an object, made once before `main`; it cannot be called")
+            c.note(unit, named.span, s"`$name` is an object, made once before `main`; it is called only through an `apply` method it declares")
             for a in args
                 check_statement(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
@@ -7803,6 +7879,122 @@ private call_function(c: *Checker, at: Span, name_span: Span, id: usize, args: B
     val applied = apply(c, at, name_span, function_signature(c, id, declared), args, explicit, expected, typed)
     applied.wrap(at, Call(id, applied.args, applied.type_args))
 
+// The object a call by `name` reaches through its `apply` methods: the object of that name, where it
+// declares `apply` and the name is not a function's, only, if anything, its companion class's
+// constructor.
+private applying_object(c: *Checker, name: string, ids: Buf[usize]) -> Option[usize]
+    for id in ids
+        if !c.symbols[id].constructor then return None
+    val g = global_named(c, name) match
+        Some(g) -> g
+        None -> return None
+    val o = c.globals[g].object match
+        Some(o) -> o
+        None -> return None
+    if object_applies(c, o).len() == 0 then return None
+    Some(o)
+
+/** The constructors of `ids` a call can choose: a class that is abstract, a trait or an array is
+ * not made by its name, and leaves the call to the companion's `apply`. */
+private callable_constructors(c: *Checker, ids: Buf[usize]) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    for id in ids
+        val k = c.symbols[id].owner_class.unwrap()
+        if !is_array_class(c.classes[k]) && !is_abstract_class(c, k) then out.push(id)
+    out
+
+/** For a data type's companion `o` named `name`, the type's variant of that name, made by a call. */
+private companion_variant(c: *Checker, o: usize, name: string) -> Option[VariantRef]
+    val d = c.classes[o].companion_data match
+        Some(d) -> d
+        None -> return None
+    val v = variant_named(c, name) match
+        Some(v) -> v
+        None -> return None
+    if v.data != d || c.data[d].variants[v.index].fields.len() == 0 then return None
+    Some(v)
+
+/** The `apply` method `m` of object `o`, for a diagnostic: "`Point.apply(x: int)`". */
+private apply_text(c: *Checker, o: usize, m: usize) -> string
+    val f = c.symbols[m]
+    var names: Buf[string] = buf()
+    var params: Buf[&Type] = buf()
+    for i in 1..<f.params.len()
+        names.push(f.param_names[i])
+        params.push(f.params[i])
+    candidate_text(c.classes[o].name + ".apply", f.type_params, names, params)
+
+// A call by the name of object `o`, which declares `apply`: `Name(…)` chooses among the object's
+// `apply` methods and, for a companion, the constructor its name has in call position, the class's
+// or the data type's variant of the type's name, as any overloaded call chooses. Type arguments
+// written at the call are the chosen candidate's own: the class's or the data type's for a
+// constructor, the method's for an `apply`.
+private apply_call(c: *Checker, at: Span, name_span: Span, name: string, o: usize, ids: Buf[usize], args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+    val receiver = global_read(c, name_span, c.classes[o].global.unwrap())
+    val constructors = callable_constructors(c, ids)
+    val variant = companion_variant(c, o, name)
+    val ms = object_applies(c, o)
+    var signatures: Buf[Signature] = buf()
+    var labels: Buf[string] = buf()
+    for id in constructors
+        signatures.push(function_signature(c, id, ErrorType))
+        labels.push(overload_text(c, id))
+    if variant is Some(v)
+        val s = variant_signature(c, v)
+        signatures.push(s)
+        labels.push(candidate_text(s.name, s.type_params, s.names, s.params))
+    val first_method = signatures.len()
+    for m in ms
+        signatures.push(method_signature(c, receiver, m, ErrorType))
+        labels.push(apply_text(c, o, m))
+    var typed: Buf[Option[&TExpr]] = buf()
+    var chosen = 0usize
+    if signatures.len() > 1
+        val choice = choose_among(c, at, name_span, name, signatures, labels, args, explicit)
+        typed = choice.typed
+        chosen = choice.id match
+            Some(i) -> i
+            None -> return TExpr(at, ErrorType, UnitConst)
+    if chosen < constructors.len() then return call_function(c, at, name_span, constructors[chosen], args, explicit, expected, typed)
+    if chosen < first_method then return construct_checked(c, at, name_span, variant.unwrap(), args, explicit, expected, typed)
+    method_call(c, at, name_span, receiver, ms[chosen - first_method], args, explicit, expected, false, typed)
+
+// The name of object `o`, which declares `apply`, where a function type is expected: of its `apply`
+// methods and its companion class's constructor, the one whose parameters accept the expected
+// type's, as for any overloaded function used as a value.
+private apply_value(c: *Checker, at: Span, name: string, o: usize, ids: Buf[usize], params: Buf[&Type], expected: Option[&Type]) -> &TExpr
+    val unit = unit_of(c)
+    val receiver = global_read(c, at, c.classes[o].global.unwrap())
+    val constructors = callable_constructors(c, ids)
+    val ms = object_applies(c, o)
+    var labels: Buf[string] = buf()
+    var fitting: Buf[usize] = buf()
+    var fitting_labels: Buf[string] = buf()
+    var owners: Buf[usize] = buf()
+    var counts: Buf[usize] = buf()
+    var compared: Buf[Buf[&Type]] = buf()
+    for k in 0..<constructors.len() + ms.len()
+        val s = if k < constructors.len() then function_signature(c, constructors[k], ErrorType) else method_signature(c, receiver, ms[k - constructors.len()], ErrorType)
+        val label = if k < constructors.len() then overload_text(c, constructors[k]) else apply_text(c, o, ms[k - constructors.len()])
+        labels.push(label)
+        val view = substitute_all(s.params, s.owner, s.known)
+        if accepts(c, view, s.owner, s.type_params.len(), params)
+            fitting.push(k)
+            fitting_labels.push(label)
+            owners.push(s.owner)
+            counts.push(s.type_params.len())
+            compared.push(view)
+    if fitting.len() == 0
+        c.note(unit, at, s"no overload of `$name` has the parameter types of ${type_name(zonk(c, expected.unwrap()))}; the overloads are ${joined_labels(labels)}")
+        return TExpr(at, ErrorType, UnitConst)
+    val k = most_specific_of(c, owners, counts, compared) match
+        Some(i) -> fitting[i]
+        None ->
+            c.note(unit, at, s"`$name` used as ${type_name(zonk(c, expected.unwrap()))} is ambiguous: ${joined_labels(fitting_labels)} each accept it")
+            return TExpr(at, ErrorType, UnitConst)
+    if k < constructors.len() then function_value(c, at, constructors[k], None, expected)
+    else method_value(c, at, receiver, ms[k - constructors.len()], None, expected)
+
 private function_signature(c: *Checker, id: usize, result: &Type) -> Signature
     val f = c.symbols[id]
     Signature(f.name, true, f.type_params, f.type_owner, f.params, f.param_names, f.defaults, result, buf(), None, declares_variadic(f.decl))
@@ -7833,6 +8025,17 @@ private choose_overload(c: *Checker, at: Span, name_span: Span, name: string, id
 // Chooses among the functions `ids`, called through `signatures`: a function's own, or a method's
 // past its receiver, with the type arguments its receiver decides already known.
 private choose(c: *Checker, at: Span, name_span: Span, name: string, ids: Buf[usize], signatures: Buf[Signature], args: Buf[Argument], explicit: Option[Buf[&TypeExpr]]) -> Choice
+    var labels: Buf[string] = buf()
+    for id in ids
+        labels.push(overload_text(c, id))
+    val choice = choose_among(c, at, name_span, name, signatures, labels, args, explicit)
+    choice.id match
+        Some(i) -> Choice(Some(ids[i]), choice.typed)
+        None -> choice
+
+// Chooses among the candidates `signatures`, which a diagnostic names as `labels`: the chosen one's
+// position among them, and the arguments as checked while choosing.
+private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signatures: Buf[Signature], labels: Buf[string], args: Buf[Argument], explicit: Option[Buf[&TypeExpr]]) -> Choice
     val unit = unit_of(c)
     var written: Buf[&Type] = buf()
     if explicit is Some(types)
@@ -7843,18 +8046,18 @@ private choose(c: *Checker, at: Span, name_span: Span, name: string, ids: Buf[us
     // Each bound candidate's parameter types with the known type arguments in place.
     var views: Buf[Buf[&Type]] = buf()
     var bindings: Buf[Binding] = buf()
-    for i in 0..<ids.len()
+    for i in 0..<signatures.len()
         val s = signatures[i]
         if s.type_params.len() - s.known.len() < written.len() then continue
         val binding = bind_arguments(c, at, s, args, false)
         if binding.fits
-            bound.push(ids[i])
+            bound.push(i)
             bound_signatures.push(s)
             views.push(substitute_all(s.params, s.owner, s.known))
             bindings.push(binding)
     var typed: Buf[Option[&TExpr]] = buf()
     if bound.len() == 0
-        c.note(unit, name_span, s"no overload of `$name` accepts these arguments; the overloads are ${overload_list(c, ids)}")
+        c.note(unit, name_span, s"no overload of `$name` accepts these arguments; the overloads are ${joined_labels(labels)}")
         return Choice(None, typed)
     for j in 0..<args.len()
         val value = argument_value(args[j])
@@ -7883,22 +8086,29 @@ private choose(c: *Checker, at: Span, name_span: Span, name: string, ids: Buf[us
             params.push(argument_type(c, bound_signatures[k], views[k], bindings[k], args, j).unwrap())
         compared.push(params)
     if fitting.len() == 0
-        c.note(unit, name_span, s"no overload of `$name` accepts these arguments; the overloads are ${overload_list(c, ids)}")
+        c.note(unit, name_span, s"no overload of `$name` accepts these arguments; the overloads are ${joined_labels(labels)}")
         return Choice(None, typed)
-    most_specific(c, fitting, compared) match
-        Some(id) -> Choice(Some(id), typed)
+    var owners: Buf[usize] = buf()
+    var counts: Buf[usize] = buf()
+    var fitting_labels: Buf[string] = buf()
+    for i in fitting
+        owners.push(signatures[i].owner)
+        counts.push(signatures[i].type_params.len())
+        fitting_labels.push(labels[i])
+    most_specific_of(c, owners, counts, compared) match
+        Some(k) -> Choice(Some(fitting[k]), typed)
         None ->
-            literal_preferred(c, fitting, compared, args) match
-                Some(id) -> Choice(Some(id), typed)
+            literal_preferred(c, owners, counts, compared, args) match
+                Some(k) -> Choice(Some(fitting[k]), typed)
                 None ->
-                    c.note(unit, name_span, s"this call to `$name` is ambiguous: ${overload_list(c, fitting)} each accept it, and none is more specific than the others")
+                    c.note(unit, name_span, s"this call to `$name` is ambiguous: ${joined_labels(fitting_labels)} each accept it, and none is more specific than the others")
                     Choice(None, typed)
 
 // Where no overload is the most specific, the one that takes each integer literal argument as the
 // literal's own type: `int`, or `long` for a literal too large for `int`. It must also be the most
 // specific one by the arguments that are not literals alone, so the literals break only the ties
 // they cause. None when there is no such overload, or more than one.
-private literal_preferred(c: *Checker, ids: Buf[usize], compared: Buf[Buf[&Type]], args: Buf[Argument]) -> Option[usize]
+private literal_preferred(c: *Checker, owners: Buf[usize], counts: Buf[usize], compared: Buf[Buf[&Type]], args: Buf[Argument]) -> Option[usize]
     var own: Buf[Option[&Type]] = buf()
     var any_literal = false
     for a in args
@@ -7910,7 +8120,7 @@ private literal_preferred(c: *Checker, ids: Buf[usize], compared: Buf[Buf[&Type]
     if !any_literal then return None
     var rest: Buf[Buf[&Type]] = buf()
     var preferred: Buf[usize] = buf()
-    for k in 0..<ids.len()
+    for k in 0..<compared.len()
         var others: Buf[&Type] = buf()
         var takes_own = true
         for j in 0..<args.len()
@@ -7921,10 +8131,10 @@ private literal_preferred(c: *Checker, ids: Buf[usize], compared: Buf[Buf[&Type]
         if takes_own then preferred.push(k)
     if preferred.len() != 1 then return None
     val a = preferred[0]
-    for b in 0..<ids.len()
+    for b in 0..<compared.len()
         if a != b
-            if !accepts(c, rest[b], c.symbols[ids[b]].type_owner, c.symbols[ids[b]].type_params.len(), rest[a]) then return None
-    Some(ids[a])
+            if !accepts(c, rest[b], owners[b], counts[b], rest[a]) then return None
+    Some(a)
 
 // The type an integer literal, possibly negated, has where nothing else decides it.
 private literal_own_type(e: &Expr) -> &Type
@@ -7958,13 +8168,25 @@ private delayed_unchosen(c: *Checker, arg: Argument, inner: Option[&Type]) -> &T
 // The one of `ids` more specific than each other one: its parameter types `compared[k]` are accepted
 // by every other's. None when no single one is: when none is, or when two accept each other's.
 private most_specific(c: *Checker, ids: Buf[usize], compared: Buf[Buf[&Type]]) -> Option[usize]
+    var owners: Buf[usize] = buf()
+    var counts: Buf[usize] = buf()
+    for id in ids
+        owners.push(c.symbols[id].type_owner)
+        counts.push(c.symbols[id].type_params.len())
+    most_specific_of(c, owners, counts, compared) match
+        Some(k) -> Some(ids[k])
+        None -> None
+
+// The position of the candidate more specific than each other one, where candidate `k` takes the
+// parameter types `compared[k]`, written in the `counts[k]` type parameters of `owners[k]`.
+private most_specific_of(c: *Checker, owners: Buf[usize], counts: Buf[usize], compared: Buf[Buf[&Type]]) -> Option[usize]
     var best: Buf[usize] = buf()
-    for a in 0..<ids.len()
+    for a in 0..<compared.len()
         var wins = true
-        for b in 0..<ids.len()
+        for b in 0..<compared.len()
             if a != b && wins
-                if !accepts(c, compared[b], c.symbols[ids[b]].type_owner, c.symbols[ids[b]].type_params.len(), compared[a]) then wins = false
-        if wins then best.push(ids[a])
+                if !accepts(c, compared[b], owners[b], counts[b], compared[a]) then wins = false
+        if wins then best.push(a)
     if best.len() == 1 then Some(best[0]) else None
 
 // Whether one candidate of an overloaded call accepts its arguments: those already typed, then the
@@ -8035,25 +8257,45 @@ private literal_fits(e: &Expr, t: &Type) -> bool
 
 /** The overloads `ids` as written, for a diagnostic: "`f(x: int)`, `f(s: string)`". */
 private overload_list(c: *Checker, ids: Buf[usize]) -> string
+    var labels: Buf[string] = buf()
+    for id in ids
+        labels.push(overload_text(c, id))
+    joined_labels(labels)
+
+/** Candidates' labels joined for a diagnostic. */
+private joined_labels(labels: Buf[string]) -> string
     var out = ""
-    for k in 0..<ids.len()
+    for k in 0..<labels.len()
         if k > 0 then out = out + ", "
-        val f = c.symbols[ids[k]]
-        var text = f.name
-        if f.type_params.len() > 0
-            text = text + "["
-            for i in 0..<f.type_params.len()
-                if i > 0 then text = text + ", "
-                text = text + f.type_params[i].name
-            text = text + "]"
-        text = text + "("
-        // A method's receiver is not written among its parameters.
-        val first = if is_method(f) then 1usize else 0usize
-        for i in first..<f.params.len()
-            if i > first then text = text + ", "
-            text = text + f.param_names[i] + ": " + type_name(f.params[i])
-        out = out + "`" + text + ")`"
+        out = out + labels[k]
     out
+
+/** One overload `id` as written, for a diagnostic: "`f(x: int)`". */
+private overload_text(c: *Checker, id: usize) -> string
+    val f = c.symbols[id]
+    // A method's receiver is not written among its parameters.
+    val first = if is_method(f) then 1usize else 0usize
+    var names: Buf[string] = buf()
+    var params: Buf[&Type] = buf()
+    for i in first..<f.params.len()
+        names.push(f.param_names[i])
+        params.push(f.params[i])
+    candidate_text(f.name, f.type_params, names, params)
+
+/** A candidate of a call as written, for a diagnostic: "`f[T](x: T)`". */
+private candidate_text(name: string, type_params: Buf[TypeParam], names: Buf[string], params: Buf[&Type]) -> string
+    var text = name
+    if type_params.len() > 0
+        text = text + "["
+        for i in 0..<type_params.len()
+            if i > 0 then text = text + ", "
+            text = text + type_params[i].name
+        text = text + "]"
+    text = text + "("
+    for i in 0..<params.len()
+        if i > 0 then text = text + ", "
+        text = text + names[i] + ": " + type_name(params[i])
+    "`" + text + ")`"
 
 // The type `target` names where it is the receiver of a call, as `int` in `int.zero()`, `T` in
 // `T.zero()` and `Box[int]` in `Box[int].zero()`; `None` where it is a value, a value of the name
@@ -8516,12 +8758,19 @@ private bound_slot(c: *Checker, m: usize) -> Option[usize]
 /** A value made by a variant: a call of the variant with its fields, or the variant's bare name
  * when it has none. */
 private construct(c: *Checker, at: Span, name_span: Span, v: VariantRef, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+    construct_checked(c, at, name_span, v, args, explicit, expected, buf())
+
+// A variant made by a call, with `typed` holding the arguments already checked, if any.
+private construct_checked(c: *Checker, at: Span, name_span: Span, v: VariantRef, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], typed: Buf[Option[&TExpr]]) -> &TExpr
+    val applied = apply(c, at, name_span, variant_signature(c, v), args, explicit, expected, typed)
+    applied.wrap(at, Construct(v.index, applied.args))
+
+/** What a call of variant `v` is checked against: its fields, in the type parameters of its type. */
+private variant_signature(c: *Checker, v: VariantRef) -> Signature
     val d = c.data[v.data]
     val variant = d.variants[v.index]
     val called = variant.fields.len() > 0
-    val signature = Signature(variant.name, called, d.decl.type_params, data_owner(v.data), variant.fields, variant.field_names, variant.defaults, own_type(d, v.data), buf(), None, false)
-    val applied = apply(c, at, name_span, signature, args, explicit, expected, buf())
-    applied.wrap(at, Construct(v.index, applied.args))
+    Signature(variant.name, called, d.decl.type_params, data_owner(v.data), variant.fields, variant.field_names, variant.defaults, own_type(d, v.data), buf(), None, false)
 
 /** What a call is checked against: a function's or a variant's parameters and result, written in
  * terms of the type parameters `type_params` that belong to `owner`. `called` is false for a variant

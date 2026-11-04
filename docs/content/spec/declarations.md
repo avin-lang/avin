@@ -306,7 +306,8 @@ class Savings(owner: string, balance: int, rate: real): Account(owner, balance),
 ```
 
 - **The class is its constructor.** The parameter list after the name is the constructor's
-  parameter list, and there is no other constructor; a factory belongs in the companion `object`.
+  parameter list, and there is no other constructor; a factory belongs in the companion `object`,
+  whose `apply` methods the class's name also calls, as "A companion's `apply`" below describes.
 - **Class parameters are fields.** A plain parameter (`owner`) is a private, immutable field: every
   method of the class can read it, and nothing outside can. `val` makes it a public read-only field
   and `var` a public mutable one (`balance` above); `private var` keeps a mutable one private.
@@ -710,7 +711,18 @@ module values and objects are made.
 An object's body is written like a class body with no parameters: its fields and statements run
 once, before `main`, to make the one instance, and its methods have the same implicit receiver and
 `self`. The object's name is a value of the object's own type, so it can be stored and passed like
-any other; it cannot be called, since there is no second instance to make.
+any other. There is no second instance to make, so calling the object's name, `Name(…)`, calls the
+`apply` methods it declares; an object without one cannot be called.
+
+```text
+object Twice
+    apply(n: int) -> int = n * 2
+    apply(s: string) -> string = s + s
+
+main()
+    print(Twice(21))       // 42
+    print(Twice("ab"))     // abab
+```
 
 An object shares its name only with its companion class or `data` type. Where both exist, the name in
 call position, `Account(…)`, is the class's constructor, and the bare name `Account` or a member
@@ -733,9 +745,10 @@ object Account
 A `data` type has a companion the same way: an object of its name in its module. A variant of the
 type's own name stays its constructor in call position, so `Point(1, 2)` makes a point while
 `Point.origin()` is the companion's; a type with no variant of its name, such as `List`, has
-nothing of that name to call. The methods the type's impls add and the companion's methods each
-use the other's private members. A companion cannot share its name with a variant of another type,
-nor with a variant of its own type's name that has no fields, whose bare name is already a value.
+nothing of that name to call but its companion's `apply`. The methods the type's impls add and the
+companion's methods each use the other's private members. A companion cannot share its name with a
+variant of another type, nor with a variant of its own type's name that has no fields, whose bare
+name is already a value.
 
 ```text
 data Point(x: int, y: int)
@@ -746,6 +759,51 @@ object Point
 object List
     builder[T]() -> ListBuilder[T] = ListBuilder()
 ```
+
+### A companion's `apply`
+
+A companion's `apply` methods overload the constructor its name has in call position: the class's,
+or the data type's variant of the type's name. `Name(…)` chooses among the constructor and every
+`apply` by the rules of any overloaded call: the candidates the arguments fit, by number, name and
+type, and of those the most specific by parameter types, a candidate with a repeated parameter only
+where none without one fits. By-name parameters, defaults, repeated parameters, generic inference and
+a trailing block all work as for any call, so a by-name `apply` takes an indented block after the
+name.
+
+```text
+class Future[T](private val cell: Cell[T])
+
+object Future
+    apply[T](body: -> T) -> Future[T] = Future(Cell(body))
+
+main()
+    val direct = Future(Cell(1))       // the constructor: a `Cell` fits only it
+    val page = Future(fetch(url))      // `apply`: the body runs inside it
+    val sum = Future
+        val a = 20
+        a + 1
+```
+
+Inside the `apply`, `Future(Cell(body))` is the constructor: both candidates accept a `Cell[T]`, and
+the constructor's parameter type is the more specific.
+
+- **Type arguments** written at the call, `Future[int](…)`, are the chosen candidate's own: the
+  class's or the data type's type parameters for the constructor, the method's for an `apply`.
+- **Same parameter types.** An `apply` taking the same parameter types as the constructor, up to the
+  names of type parameters, is refused where it is declared, since no call could choose between
+  them; whether a parameter is by-name does not tell two apart.
+- **No constructor of the name.** Where the name has no constructor in call position (a data type
+  with no variant of its name, such as `List`, or an abstract class), `Name(…)` calls the
+  companion's `apply` alone. The library gives `List`, `Set` and `Map` one taking their elements:
+  `List(1, 2, 3)`, `Set("a", "b")`, `Map((1, "one"), (2, "two"))`. A plain object's `apply` is
+  called by the object's name the same way.
+- **As a function value.** Where a function type is expected, the name of an object that declares
+  `apply` is its companion class's constructor or the `apply` whose parameters accept that type's,
+  chosen as for any overloaded function used as a value: `[1, 2].map(Pair)`. A variant with fields
+  is not a value, so a data type's companion offers its `apply` methods alone. Elsewhere the bare
+  name is the object.
+  An object that is itself of a function type stays that value.
+- `Name.apply(…)` is an ordinary member call, and chooses among the `apply` methods alone.
 
 A file may also declare `val`s and `var`s at module level, beside its functions. Each is a value of
 the program, read and (for a `var`) assigned from any function by its name.
