@@ -291,6 +291,24 @@ struct ConditionalImpl
     unit: usize
     params: Buf[TypeParam]
 
+/** An impl that adds methods to a trait, `impl[T] Seq[T]`: every value whose type conforms to the
+ * trait has them. */
+struct TraitImpl
+    unit: usize
+    module_name: string
+    decl: &ImplDecl
+    trait_id: usize
+
+/** A method an impl adds to trait `trait_id`. It is a generic function whose type parameters are the
+ * impl's (`impl_params` of them), then `Self`, the receiver's type, bounded by the trait at the impl's
+ * parameters, then its own. A call gives the receiver's static type as `Self`, so each instance calls
+ * the trait's methods of that type directly, or through the method table where the receiver is seen
+ * only as the trait. */
+struct TraitMethod
+    function: usize
+    trait_id: usize
+    impl_params: usize
+
 /** An unknown type argument of a call, open until a later use settles it: where it was made, and
  * what to report if nothing does. */
 struct Unknown
@@ -384,6 +402,9 @@ struct Checker
     /** The `Display` and `Debug` a data type would have had without asking, but which a field of it
      * does not implement: the type is left without the trait, and a use needing it names the field. */
     underived: Buf[Underived]
+    /** The impls that add methods to a trait, and the methods they add. */
+    trait_impls: Buf[TraitImpl]
+    trait_methods: Buf[TraitMethod]
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -559,7 +580,7 @@ private check_imports(c: *Checker, unit: usize)
  * unit is one of its files. Every file sees its own module's declarations, the names it imports and
  * the core library's public declarations, in that order: an inner name hides an outer one. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf())
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
     // `derives` is written out as the methods and impls it stands for before anything is declared.
@@ -585,6 +606,8 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool) -> Che
         declare_methods(&c, u)
     for i in 0..<c.impls.len()
         declare_impl_methods(&c, i)
+    for i in 0..<c.trait_impls.len()
+        declare_trait_methods(&c, i)
     find_core_traits(&c)
     var linked: Buf[bool] = buf()
     for _ in c.classes
@@ -904,7 +927,8 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
         home = c.data[id].module_name
     elif c.class_types.get(key) is Some(id)
         if is_trait(c, id)
-            c.note(unit, d.target.span, s"`$path` is a trait; an impl adds to a data type, a class, an object or a built-in type")
+            if d.trait_name is None then resolve_trait_impl(c, unit, module_name, d, id)
+            else c.note(unit, d.target.span, s"`$path` is a trait; an impl of a trait is for a data type, a class, an object or a built-in type")
             return invalid
         owner = class_owner(id)
         home = c.classes[id].module_name
@@ -973,6 +997,115 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
             if *t is Class(k, _, _) then c.conditional.push(ConditionalConformance(owner, k, conditions, unit, d.type_params))
     elif conditional then c.conditional_methods.push(ConditionalImpl(owner, conditions, unit, d.type_params))
     ImplSymbol(unit, module_name, d, target, owner, trait_type, conditions)
+
+// An impl without `for` whose type is a trait adds methods to the trait: it names the trait's
+// parameters in order, as an impl of a type does, and lives in the trait's module. Its methods are
+// declared once every trait's own methods are.
+private resolve_trait_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl, id: usize)
+    val k = c.classes[id]
+    val written = d.target.kind match
+        Named(_, args) -> args
+        _ -> buf()
+    var in_order = written.len() == d.type_params.len() && written.len() == k.decl.type_params.len()
+    if in_order
+        for i in 0..<written.len()
+            written[i].kind match
+                Named(n, inner) -> if n != d.type_params[i].name || inner.len() > 0 then in_order = false
+                _ -> in_order = false
+    if !in_order
+        c.note(unit, d.target.span, s"the trait an impl adds to takes the impl's type parameters, in order, as in `impl[T] ${k.name}[T]`")
+        return
+    if module_name != k.module_name
+        c.note(unit, d.target.span, s"`${k.name}` is declared in another module; an impl adding methods to it belongs in that module")
+        return
+    c.trait_impls.push(TraitImpl(unit, module_name, d, id))
+
+// Each method an impl adds to a trait is a generic function over the impl's parameters, then `Self`,
+// the type of the value it is called on, bounded by the trait, then its own. Its receiver, `self`, is
+// a `Self`, so its body reaches the value only through the trait's methods, and a call compiles it
+// for the receiver's static type.
+private declare_trait_methods(c: *Checker, i: usize)
+    for m in c.trait_impls[i].decl.members
+        if m is MethodMember(f, public, overrides, static_member) then declare_trait_method(c, i, f, public, overrides, static_member)
+
+private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, overrides: bool, static_member: bool)
+    val block = c.trait_impls[i]
+    val unit = block.unit
+    val k = block.trait_id
+    val trait_name = c.classes[k].name
+    if static_member
+        c.note(unit, f.name_span, s"`${f.name}` is static, which only a trait's member and its implementations are; an impl adding to `$trait_name` adds methods of values")
+        return
+    if f.annotations.len() > 0
+        c.note(unit, f.name_span, "annotations on methods are not implemented")
+        return
+    if overrides
+        c.note(unit, f.name_span, s"`${f.name}` overrides nothing; the methods an impl adds to `$trait_name` are not the trait's, so no type implements or overrides them")
+        return
+    if trait_declares(c, k, f.name, 0)
+        c.note(unit, f.name_span, s"`${f.name}` is already a method of `$trait_name`; an impl adds to a trait only methods the trait does not declare")
+        return
+    val id = c.symbols.len()
+    val impl_params = block.decl.type_params.len()
+    var type_params: Buf[TypeParam] = buf()
+    for tp in block.decl.type_params
+        type_params.push(tp)
+    var bound: Buf[&TypeExpr] = buf()
+    bound.push(block.decl.target)
+    type_params.push(TypeParam(block.decl.target.span, "Self", Invariant, bound, s"${c.units[unit].src.name}:${block.decl.span.start}:Self"))
+    for tp in f.type_params
+        type_params.push(tp)
+    // The impl's parameters and `Self` are bounded here, in this function's scope; `signature`
+    // bounds the method's own.
+    val outer_generic = c.generic
+    c.generic = Some(GenericScope(id, type_params))
+    declare_bounds(c, unit, id, type_params, 0)
+    c.generic = outer_generic
+    val receiver: &Type = TypeVar(id, impl_params, "Self")
+    var symbol = signature(c, unit, block.module_name, f, id, type_params, false, Some(receiver))
+    var receiver_types: Buf[&Type] = buf()
+    var receiver_names: Buf[string] = buf()
+    receiver_types.push(receiver)
+    receiver_names.push("self")
+    for t in symbol.params
+        receiver_types.push(t)
+    for n in symbol.param_names
+        receiver_names.push(n)
+    symbol.params = receiver_types
+    symbol.param_names = receiver_names
+    symbol.name = trait_name + "." + f.name
+    symbol.public = public
+    symbol.receiver = Some(receiver)
+    var method_defaults: Buf[Option[usize]] = buf()
+    for _ in receiver_types
+        method_defaults.push(None)
+    symbol.defaults = method_defaults
+    // The methods impls have added to this trait under the name so far, which this one overloads.
+    var same_name: Buf[usize] = buf()
+    for tm in c.trait_methods
+        if tm.trait_id == k && c.symbols[tm.function].decl.name == f.name then same_name.push(tm.function)
+    if same_as_overload(c, symbol, same_name)
+        c.note(unit, f.name_span, s"`${f.name}` is already added to `$trait_name` with the same parameter types; a method's overloads differ in their parameter types")
+        return
+    c.symbols.push(symbol)
+    c.states.push(0)
+    c.bodies.push(None)
+    c.locals.push(buf())
+    declare_defaults(c, id)
+    c.trait_methods.push(TraitMethod(id, k, impl_params))
+    same_name.push(id)
+    if same_name.len() > 1 then mark_overloads(c, same_name)
+
+/** What the impls adding method `m` add to, as a diagnostic names it: a trait, or a type. */
+private impls_owner(c: *Checker, m: usize) -> string = trait_method_of(c, m) match
+    Some(tm) -> c.classes[tm.trait_id].name
+    None -> type_name(c.symbols[m].receiver.unwrap())
+
+/** The impl's record of method `m` where an impl adds it to a trait. */
+private trait_method_of(c: *Checker, m: usize) -> Option[TraitMethod]
+    for tm in c.trait_methods
+        if tm.function == m then return Some(tm)
+    None
 
 /** Whether `name` is one of `params`. */
 private names_type_param(params: Buf[TypeParam], name: string) -> bool
@@ -1533,6 +1666,11 @@ private field_visible(c: *Checker, f: FieldSymbol) -> bool = f.public || inside_
 /** Whether a method may be called from the code being checked. */
 private method_visible(c: *Checker, m: usize) -> bool
     if c.symbols[m].public then return true
+    // A private method an impl adds to a trait is called from the methods impls add to that trait.
+    if trait_method_of(c, m) is Some(tm)
+        return trait_method_of(c, c.body.root) match
+            Some(here) -> here.trait_id == tm.trait_id
+            None -> false
     c.symbols[m].owner_class match
         Some(k) -> inside_class(c, k)
         None -> c.symbols[m].receiver match
@@ -1926,6 +2064,89 @@ private receiver_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
             for m in c.builtin_methods
                 if builtin_covers(c.symbols[m].receiver.unwrap(), t) && c.symbols[m].decl.name == name then out.push(m)
     out
+
+/** `t` as an instance of trait `k`, where it conforms to it at its type arguments; a type parameter
+ * does through its bounds. */
+private trait_view(c: *Checker, t: &Type, k: usize) -> Option[&Type]
+    val known = zonk(c, t)
+    val f = conformances(c)
+    if *known is TypeVar(_, _, _)
+        for b in bounds_of(c, known)
+            if holding_ancestor(f, b, k) is Some(up) then return Some(up)
+        return None
+    holding_ancestor(f, known, k)
+
+// The methods of `name` a value of type `t` has: `own`, those of its type, then each that an impl
+// adds to a trait `t` conforms to. The type's own method takes precedence over an added one with the
+// same parameter types, which is left out.
+private with_trait_methods(c: *Checker, t: &Type, name: string, own: Buf[usize]) -> Buf[usize]
+    if c.trait_methods.len() == 0 then return own
+    var out: Buf[usize] = buf()
+    for m in own
+        out.push(m)
+    for tm in c.trait_methods
+        val m = tm.function
+        if c.symbols[m].decl.name != name || !method_visible(c, m) then continue
+        if trait_view(c, t, tm.trait_id) is None then continue
+        var hidden = false
+        for o in own
+            if same_params_seen(c, t, o, m) then hidden = true
+        if !hidden then out.push(m)
+    out
+
+/** The parameter types of method `m` past the receiver, as a call on a value of type `t` sees them,
+ * with the method's own type parameters renamed alike, so two methods' lists compare. */
+private seen_params(c: *Checker, t: &Type, m: usize) -> Buf[&Type]
+    val symbol = c.symbols[m]
+    val known = receiver_type_args(c, t, m)
+    val own = symbol.decl.type_params.len()
+    val outer = symbol.type_params.len() - own
+    var names: Buf[&Type] = buf()
+    for i in 0..<outer
+        names.push(if i < known.len() then known[i] else TypeVar(symbol.type_owner, i, symbol.type_params[i].name))
+    for j in 0..<own
+        names.push(TypeVar(method_params_owner(), j, symbol.type_params[outer + j].name))
+    var out: Buf[&Type] = buf()
+    for i in 1..<symbol.params.len()
+        out.push(substitute(with_self(c, m, t, symbol.params[i]), symbol.type_owner, names))
+    out
+
+/** Whether methods `a` and `b` take the same parameter types as a call on a value of type `t` sees
+ * them. */
+private same_params_seen(c: *Checker, t: &Type, a: usize, b: usize) -> bool
+    val x = seen_params(c, t, a)
+    val y = seen_params(c, t, b)
+    if x.len() != y.len() then return false
+    for i in 0..<x.len()
+        if !same_type(zonk(c, x[i]), zonk(c, y[i])) then return false
+    true
+
+// Reports a use of `name` on a value of type `t` where the only method of that name is a private one
+// an impl adds to a trait `t` conforms to, which the code being checked may not call.
+private refuse_private_trait_method(c: *Checker, at: Span, t: &Type, name: string) -> bool
+    for tm in c.trait_methods
+        val m = tm.function
+        if c.symbols[m].decl.name != name || method_visible(c, m) then continue
+        if trait_view(c, t, tm.trait_id) is None then continue
+        c.note(unit_of(c), at, s"`$name` is private to the impls of `${c.classes[tm.trait_id].name}`")
+        return true
+    false
+
+// Reports a call of `name` on a value of type `t` that reaches, among `ms`, two methods impls add to
+// two traits `t` conforms to, with the same parameter types: neither trait's is the one meant.
+private refuse_trait_clash(c: *Checker, at: Span, t: &Type, name: string, ms: Buf[usize]) -> bool
+    for i in 0..<ms.len()
+        val a = trait_method_of(c, ms[i]) match
+            Some(x) -> x
+            None -> continue
+        for j in i + 1..<ms.len()
+            val b = trait_method_of(c, ms[j]) match
+                Some(x) -> x
+                None -> continue
+            if a.trait_id != b.trait_id && same_params_seen(c, t, ms[i], ms[j])
+                c.note(unit_of(c), at, s"`$name` is ambiguous on ${type_name(zonk(c, t))}: impls of `${c.classes[a.trait_id].name}` and of `${c.classes[b.trait_id].name}` each add it with the same parameter types")
+                return true
+    false
 
 /** The methods of `ms` the code being checked may call. */
 private visible_methods(c: *Checker, ms: Buf[usize]) -> Buf[usize]
@@ -4362,6 +4583,8 @@ private class_member(c: *Checker, name: string) -> Option[MemberRef]
     if method_named(c, k, name) is Some(m)
         if method_visible(c, m) then return Some(MethodOf(m))
     if trait_field_named(c, k, name) is Some(m) then return Some(TraitFieldOf(m))
+    val added = with_trait_methods(c, own_class_type(c.classes[k], k), name, buf())
+    if added.len() > 0 then return Some(MethodOf(added[0]))
     None
 
 /** The `val` named `name` of a trait that class or trait `k` conforms to or requires. */
@@ -4387,15 +4610,27 @@ private impl_member(c: *Checker, name: string) -> Option[MemberRef]
                 if names[i] == name then return Some(DataFieldOf(i))
     if receiver_method(c, t, name) is Some(m)
         if method_visible(c, m) then return Some(MethodOf(m))
+    // Inside a method an impl adds to a trait, the receiver is a `Self`: the trait's `val`s and
+    // methods are in scope, and those impls add to it.
+    if is_trait_self(t)
+        if bound_field(c, t, name) is Some(m) then return Some(TraitFieldOf(m))
+    val added = bare_methods(c, name)
+    if added.len() > 0 then return Some(MethodOf(added[0]))
     None
 
 /** The methods of `name` a bare name reaches inside a class or an impl's method, one for each list of
  * parameter types, which a call of the name chooses among. */
 private bare_methods(c: *Checker, name: string) -> Buf[usize]
-    if enclosing_class(c) is Some(k) then return methods_named(c, k, name)
+    if enclosing_class(c) is Some(k) then return with_trait_methods(c, own_class_type(c.classes[k], k), name, methods_named(c, k, name))
     c.symbols[c.body.root].receiver match
-        Some(t) -> visible_methods(c, receiver_methods(c, t, name))
+        Some(t) ->
+            val own = if is_trait_self(t) then bound_methods(c, t, name) else visible_methods(c, receiver_methods(c, t, name))
+            with_trait_methods(c, t, name, own)
         None -> buf()
+
+/** Whether receiver type `t` is the `Self` of a method an impl adds to a trait: a type parameter, but
+ * not the integer family's. */
+private is_trait_self(t: &Type) -> bool = *t is TypeVar(_, _, _) && !is_integer_family(t)
 
 /** `self`, the instance the enclosing constructor or method works on. A static member works on no
  * instance, so there the receiver's members are an error. */
@@ -4694,6 +4929,7 @@ private method_of(c: *Checker, t: &Type, name: string) -> Option[usize]
 // most specific.
 private overloaded_method_value(c: *Checker, at: Span, receiver: &TExpr, name: string, ms: Buf[usize], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
     if ms.len() == 1 || *receiver.ty is Nothing then return method_value(c, at, receiver, ms[0], explicit, expected)
+    if refuse_trait_clash(c, at, receiver.ty, name, ms) then return TExpr(at, ErrorType, UnitConst)
     val unit = unit_of(c)
     var wanted: Option[Buf[&Type]] = None
     if expected is Some(t)
@@ -4724,9 +4960,9 @@ private overloaded_method_value(c: *Checker, at: Span, receiver: &TExpr, name: s
  * list of parameter types. */
 private methods_of(c: *Checker, t: &Type, name: string) -> Buf[usize]
     val known = zonk(c, t)
-    if *known is Class(k, _, _) then return methods_named(c, k, name)
-    if *known is TypeVar(_, _, _) then return bound_methods(c, known, name)
-    visible_methods(c, receiver_methods(c, known, name))
+    if *known is Class(k, _, _) then return with_trait_methods(c, known, name, methods_named(c, k, name))
+    if *known is TypeVar(_, _, _) then return with_trait_methods(c, known, name, bound_methods(c, known, name))
+    with_trait_methods(c, known, name, visible_methods(c, receiver_methods(c, known, name)))
 
 /** The methods of `name` a value of type parameter `t` has: those of its bounds, each once. */
 private bound_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
@@ -4752,7 +4988,7 @@ private member_method_value(c: *Checker, at: Span, object: &TExpr, m: usize, exp
         val name = c.symbols[m].decl.name
         c.symbols[m].owner_class match
             Some(k) -> c.note(unit_of(c), at, s"`$name` is private to `${c.classes[k].name}`")
-            None -> c.note(unit_of(c), at, s"`$name` is private to the impls of `${type_name(c.symbols[m].receiver.unwrap())}`")
+            None -> c.note(unit_of(c), at, s"`$name` is private to the impls of `${impls_owner(c, m)}`")
         return TExpr(at, ErrorType, UnitConst)
     method_value(c, at, object, m, explicit, expected)
 
@@ -4901,6 +5137,7 @@ private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], 
         val ms = methods_of(c, object.ty, name)
         if ms.len() > 1 then return overloaded_method_value(c, e.span, object, name, ms, Some(types), expected)
         if method_of(c, object.ty, name) is Some(m) then return member_method_value(c, e.span, object, m, Some(types), expected)
+        if ms.len() == 1 then return member_method_value(c, e.span, object, ms[0], Some(types), expected)
     unsupported(c, e, "a value with type arguments that is not called")
 
 // A field is read by name from a value of a data type with one variant; a type with several is
@@ -4916,6 +5153,7 @@ private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: 
         val ms = methods_of(c, ty, name)
         if ms.len() > 1 then return overloaded_method_value(c, e.span, value, name, ms, None, expected)
         if receiver_method(c, ty, name) is Some(m) then return member_method_value(c, e.span, value, m, None, expected)
+        if ms.len() == 1 && trait_method_of(c, ms[0]) is Some(_) then return member_method_value(c, e.span, value, ms[0], None, expected)
     *ty match
         Data(id, _, args) ->
             val d = c.data[id]
@@ -4941,7 +5179,7 @@ private bound_member_value(c: *Checker, at: Span, value: &TExpr, ty: &Type, name
     // A field of a class bounding it is read as from an instance of that class.
     if bound_class_field(c, ty, name) is Some(b)
         if *b is Class(k, _, _) then return class_member_value(c, at, TExpr(value.span, b, value.kind), k, name, expected)
-    val ms = bound_methods(c, ty, name)
+    val ms = with_trait_methods(c, ty, name, bound_methods(c, ty, name))
     if ms.len() > 0 then return member_method_value(c, at, value, ms[0], None, expected)
     no_bound_member(c, at, ty, name)
     TExpr(at, ErrorType, UnitConst)
@@ -4975,9 +5213,10 @@ private class_member_value(c: *Checker, at: Span, object: &TExpr, k: usize, name
             return TExpr(at, ErrorType, UnitConst)
         return field_read(c, at, at, object, k, i, is_self(c, object))
     if trait_field_named(c, k, name) is Some(m) then return trait_field_read(c, at, object, m, expected)
-    val ms = methods_named(c, k, name)
+    val ms = with_trait_methods(c, object.ty, name, methods_named(c, k, name))
     if ms.len() > 1 then return overloaded_method_value(c, at, object, name, ms, None, expected)
     if method_named(c, k, name) is Some(m) then return member_method_value(c, at, object, m, None, expected)
+    if ms.len() == 1 then return member_method_value(c, at, object, ms[0], None, expected)
     c.note(unit_of(c), at, s"`${cls.name}` has no member `$name`")
     TExpr(at, ErrorType, UnitConst)
 
@@ -7132,7 +7371,7 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
         if static_receiver(c, target, name) is Some(ty) then return static_call(c, at, name_span, target, ty, name, args, explicit, expected)
     val object = check_expr(c, target, None)
     if *zonk(c, object.ty) is Class(k, _, _)
-        val ms = methods_named(c, k, name)
+        val ms = with_trait_methods(c, object.ty, name, methods_named(c, k, name))
         if ms.len() > 0
             if infix && !takes_one_argument(c, ms) then return infix_arity_error(c, at, name_span, target, name, ms, args)
             return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
@@ -7141,11 +7380,15 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
             for a in args
                 check_statement(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
+    if methods_of(c, object.ty, name).len() == 0 && refuse_private_trait_method(c, name_span, object.ty, name)
+        for a in args
+            check_statement(c, a.value)
+        return TExpr(at, ErrorType, UnitConst)
     // A value of a type parameter has the methods of its bounds, and no others but the `equals` and
     // `hash` every value has.
     if *zonk(c, object.ty) is TypeVar(_, _, _)
         val ty = zonk(c, object.ty)
-        val ms = bound_methods(c, ty, name)
+        val ms = with_trait_methods(c, ty, name, bound_methods(c, ty, name))
         if ms.len() > 0
             if infix && !takes_one_argument(c, ms) then return infix_arity_error(c, at, name_span, target, name, ms, args)
             return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
@@ -7158,8 +7401,8 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
                 check_statement(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
     val all = receiver_methods(c, zonk(c, object.ty), name)
-    if all.len() > 0
-        val ms = visible_methods(c, all)
+    val ms = with_trait_methods(c, object.ty, name, visible_methods(c, all))
+    if all.len() > 0 || ms.len() > 0
         if ms.len() == 0
             c.note(unit, name_span, s"`$name` is private to the impls of `${type_name(c.symbols[all[0]].receiver.unwrap())}`")
             for a in args
@@ -7267,6 +7510,10 @@ private pick_method(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, na
 
 // A call of a method of `name` on `receiver`, chosen among the overloads `ms` its type has.
 private call_method(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, name: string, ms: Buf[usize], args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], direct: bool) -> &TExpr
+    if refuse_trait_clash(c, name_span, receiver.ty, name, ms)
+        for a in args
+            check_statement(c, a.value)
+        return TExpr(at, ErrorType, UnitConst)
     val choice = pick_method(c, at, name_span, receiver, name, ms, args, explicit)
     choice.id match
         Some(m) -> method_call(c, at, name_span, receiver, m, args, explicit, expected, direct, choice.typed)
@@ -7305,6 +7552,17 @@ private with_self(c: *Checker, m: usize, receiver_type: &Type, t: &Type) -> &Typ
 private refuse_unmet_conformance(c: *Checker, at: Span, receiver_type: &Type, m: usize) -> bool
     val t = zonk(c, receiver_type)
     val symbol = c.symbols[m]
+    // A method an impl with bounds of its own adds to a trait needs the trait's arguments, as the
+    // receiver has them, to meet those bounds.
+    if trait_method_of(c, m) is Some(tm)
+        val known = receiver_type_args(c, t, m)
+        val f = conformances(c)
+        for i in 0..<tm.impl_params
+            for b in bounds_at(c, symbol.type_owner, symbol.type_params, i)
+                if !meets_bound(f, zonk(c, known[i]), zonk(c, substitute(b, symbol.type_owner, known)))
+                    c.note(unit_of(c), at, s"`${symbol.decl.name}` needs `${symbol.type_params[i].name}: ${type_name(b)}`, which ${type_name(t)} does not meet")
+                    return true
+        return false
     var declaring = t
     if symbol.owner_class is Some(k)
         if !is_trait(c, k) then declaring = ancestor_type(c.classes, c.data, t, k).unwrap_or(t)
@@ -7372,6 +7630,18 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
 // receiver is seen as an instance of that class.
 private receiver_type_args(c: *Checker, receiver_type: &Type, m: usize) -> Buf[&Type]
     val t = zonk(c, receiver_type)
+    // A method an impl adds to a trait takes the trait's arguments as the receiver sees it, then the
+    // receiver's own type as `Self`.
+    if trait_method_of(c, m) is Some(tm)
+        var args: Buf[&Type] = buf()
+        if trait_view(c, t, tm.trait_id) is Some(up)
+            if *up is Class(_, _, a)
+                for x in a
+                    args.push(x)
+        while args.len() < tm.impl_params
+            args.push(ErrorType)
+        args.push(t)
+        return args
     // A method of an impl for every integer width takes the receiver's width as its parameter.
     if c.symbols[m].type_owner == integer_owner()
         var width: Buf[&Type] = buf()
@@ -7406,7 +7676,9 @@ private dispatch_slot(c: *Checker, receiver_type: &Type, m: usize) -> Option[usi
 // On a type parameter the call goes to the method of whatever type each instance has: it is placed
 // at the position the method has in every table that holds it.
 private method_call_kind(c: *Checker, receiver_type: &Type, m: usize, args: Buf[&TExpr], type_args: Buf[&Type], direct: bool) -> TExprKind
-    if direct then return Call(m, args, type_args)
+    // A method an impl adds to a trait is in no method table: its instance for the receiver's type
+    // is called.
+    if direct || trait_method_of(c, m) is Some(_) then return Call(m, args, type_args)
     // A static member called on a type that is known is that type's own; on a type parameter, each
     // instance calls its type argument's.
     if c.symbols[m].static_member && !(*zonk(c, receiver_type) is TypeVar(_, _, _)) then return Call(m, args, type_args)

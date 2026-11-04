@@ -476,8 +476,10 @@ Settled by the user on 2026-11-03:
   the folds, `foreach`, `exists`, `forall`, `find`, `indexWhere`, `count`, `toVector`, `toList`, an
   iterator and `reverseIterator`) are default bodies written once over those two. `List` is a `Seq`
   and overrides every one that would index into it, so none takes more than linear time on a list.
-  `contains` and `indexOf` take an element, which a covariant trait's method cannot, so each
-  sequence type declares its own.
+  `contains` and `indexOf`, which take an element, and `mkString`, `max` and `min`, which need
+  something of the elements, are added to `Seq` by impls (`impl[T] Seq[T]`, `impl[T: Display]
+  Seq[T]`, `impl[T: Ord] Seq[T]`), written once for every sequence; `contains` and `indexOf` are
+  `exists` and `indexWhere`, so on a list they walk it once.
 - A sequence passed or stored where a function from one `int` is expected becomes that function,
   through the core library's `elementAt`; the conversion happens where the value is written, as a
   conversion to `Any` does.
@@ -494,7 +496,13 @@ Settled by the user on 2026-11-03:
   reach the value only through the trait's own methods, which are variance-checked, so, like the
   methods an impl adds to a `data` type, they are not variance positions: `contains(element: T)`,
   `indexOf`, `mkString`, `max` and `min` are written once on `Seq`, and generic code over `Seq[T]`
-  has them.
+  has them. A call is compiled for the receiver's static type, so the trait's methods the added one
+  calls are that type's, called directly, and go through the method table only where the receiver
+  is seen as the trait. Lookup takes the receiver's type's own methods first: an added method with
+  the name and parameter types of one the type has is passed over, so a type keeps a faster version
+  of its own where its static type is known. Two impls of different traits adding a method of one
+  name and parameter types to a type conforming to both make a call of it on that type an error; an
+  impl may not add a method the trait declares.
 - The form of a `for` with `yield` ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
   generators `pattern in source` separated by commas, each followed by any number of `if` guards,
   then `yield` and the value on the rest of the line or in an indented block; or the generators one

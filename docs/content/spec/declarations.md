@@ -531,6 +531,29 @@ built-in type implements every method of the trait, defaults included.
   misses a bound is an error naming the bound. [Generics](generics.md) has the rules.
 - A method added to a built-in type (`impl string`, `impl int`) is called on a value of that type,
   `"hi".shout()`, `7.squared()`.
+- **An impl without `for` whose type is a trait adds methods to the trait** (`impl[T] Seq[T]`,
+  `impl[T: Display] Seq[T]`), in the trait's module. Every value whose type conforms to the trait has
+  them: a class or `data` type implementing it, the trait's own type, a type parameter it bounds.
+  Inside them `self` is the value and `Self` its type; the trait's methods, and those other impls add
+  to it, are in scope by bare name. They reach the value only through the trait's methods, so they
+  are not variance positions: `contains(element: T)` is written on `Seq[+T]`.
+- **A call of an added method is compiled for the receiver's static type.** Where that is a class or
+  a `data` type, the trait's methods the added one calls are that type's, called directly; where it
+  is the trait, they go through the object's method table. An added method is in no method table and
+  nothing overrides it; it may not take the name of a method the trait declares.
+- **A type's own methods are found before those added to its traits.** An added method with the name
+  and parameter types of a method the receiver's type has (its own, an inherited one, or one of a trait
+  it conforms to) is passed over, so a type keeps a faster version of its own wherever its static type
+  is known; code that sees only the trait calls the added one. An added method with other parameter
+  types overloads the type's. Where a type conforms to two traits and impls of both add a method of one
+  name and parameter types, a call of it on that type is an error.
+
+```text
+impl[T] Seq[T]
+    contains(element: T) -> bool = exists(x -> x.equals(element))
+
+present[T](xs: Seq[T], x: T) -> bool = xs.contains(x)
+```
 
 ## object
 
