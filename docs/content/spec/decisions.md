@@ -905,12 +905,14 @@ Settled by the user on 2026-11-04:
   the type as polymorphic recursion, even where no code compares, hashes or shows it, since every
   data type's structural equality, hash and `Display` would need a copy for every depth. A class
   naming itself so in a field is not rejected for that alone; only code that grows with it is.
-- Which growth counts ([generics](/spec/generics/#polymorphic-recursion)): an implementation
-  reached through a trait or a bound whose static type names every type parameter of the
-  receiver's class (an `Iterator[(A, int)]` for an `IndexedIterator[A]`) takes its type arguments
-  apart from the receiver's, so it continues no cycle; one reached through a trait that leaves some
-  unnamed (a trait with no type parameters) continues the cycle from wherever the class's larger
-  instance was made.
+- Which growth counts ([generics](/spec/generics/#polymorphic-recursion)): growth is measured as
+  nesting depth, and a cycle is rejected when a round of it nests its type arguments deeper in
+  total. A call through a bound on a value of a type parameter takes that type's arguments apart
+  (a `Box[U]` reaching `Box`'s method at `U` is one level less); an implementation reached through
+  a method table whose static type names every type parameter of the receiver's class (an
+  `Iterator[(A, int)]` for an `IndexedIterator[A]`) takes them apart from the receiver's, while one
+  reached through a trait that leaves some unnamed (a trait with no type parameters) continues the
+  cycle from wherever the class's larger instance was made.
 
 - Literal shapes ([collections](/spec/collections/#literals)): each of the library's collections is
   built only by the literal of its own shape: every `Seq` by `[a, b]`, `Set`, `TreeSet` and the
