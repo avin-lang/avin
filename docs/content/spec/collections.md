@@ -247,15 +247,15 @@ Literals always build the library's types, even when a user type named `Vector` 
 
 ## Buffer and Vector
 
-`Buffer[T]` is invariant, growable and mutable. `Buffer[int]()` is an empty buffer; `add(x)` appends
-in amortized constant time, `insert(i, x)` and `remove(i)` work at any index, and `clear()` empties
+`Buffer[T]` is invariant, growable and mutable. `Buffer[int]()` is an empty buffer; `add(x)`, or
+`b += x`, appends in amortized constant time, `addAll(xs)`, or `b ++= xs`, appends each in turn, `insert(i, x)` and `remove(i)` work at any index, and `clear()` empties
 it. `b(i)` and `b(i) = v` read and replace an element, and an index outside `0 ..< length()` traps
 at the caller's line. Its elements live in an array with spare capacity, which never holds a value
 that is read before one is written, so a buffer needs no value to fill it with.
 
 `Vector[+T]` is the default sequence: immutable, covariant and indexed in constant time. Its
 elements are in one array that nothing writes to after the vector is made, so an operation that
-makes a changed vector (`appended`, `prepended`, `concat`, `updated`) copies them. Both compare and
+makes a changed vector (`xs :+ x`, `x +: xs`, `xs ++ ys`, `updated`) copies them. Both compare and
 hash by their elements in order, and display as an array does, `[1, 2, 3]`, where their elements
 display.
 

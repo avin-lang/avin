@@ -42,6 +42,12 @@ alone.
 | Assignment | `=` and compound forms (`+=`, `<<=`, `+%=`, …) |
 | Yielding assignment | `:=` and compound forms, which return the stored value |
 | Update | prefix and postfix `++` `--`; prefix yields the new value, postfix the old |
+| Symbol methods | any other run of operator characters names a method, called infix: `xs ++ ys`, `x +: xs` |
+
+An operator is the longest run of the characters `+ - * / % < > = ! & | ^ ~ : ?`, so a prefix
+operator written directly after another operator needs a space: `a = -1`, `x * -y`. A run stops
+before `//`, which begins a comment. The range operators `..` and `..<` are spelled with dots, which
+are not operator characters.
 
 Bitwise operators bind more tightly than comparisons: `x & mask == 0` tests the masked value.
 Within the bitwise family, `&` binds tightest, then `^`, then `|`. Shifts bind at the multiplicative
@@ -86,6 +92,48 @@ parameters is not called infix even with a tuple after its name: `a put (1, 2)` 
 
 A word that keeps its meaning after an operand, such as `then`, `do`, `else`, `if`, `is` or
 `match`, is never read as a method's name, so `if a max b then c` and `n is int` read as before.
+
+### Methods named by symbols
+
+A method may be named by a run of operator characters, declared like any other method in a class,
+trait, object or impl, and called infix or dotted:
+
+```text
+class Bag(val items: Vector[int])
+    ++(other: Bag) -> Bag = Bag(items ++ other.items)
+    +:(x: int) -> Bag = Bag(x +: items)
+```
+
+`a ++ b` is `a.++(b)`, and `a.++(b)` may be written as such. A function outside a type cannot be
+named by a symbol. The language's own operators are not method names, because a type has them
+through their traits: declaring a method named `+` is an error that says to implement `Add`. The
+reserved spellings are `+` `-` `*` `/` `%`, the wrapping and saturating `+%` `-%` `*%` `+|` `-|`
+`*|`, `<<` `>>`, `&` `|` `^` `~` `!` `&&` `||`, `==` `!=` `<` `<=` `>` `>=` `===` `!==`, `::`, `=`
+`:=` `:` `?` `->` `=>`, and each yielding compound form such as `+:=`. Every other run is free,
+`++`, `--` and the plain compound spellings `+=` and `-=` among them.
+
+A symbol method's call binds as `a max b` does: more loosely than arithmetic, bitwise, shift, cons and
+range operators, and more tightly than comparisons, `is`, `&&` and `||`, so `a ++ b + c` is
+`a ++ (b + c)` and `xs ++ ys == zs` compares the joined sequence. It groups to the left, except that a
+name ending in `:` groups to the right and takes its receiver on the right: `x +: xs` is `xs.+:(x)`,
+and `a +: b +: xs` is `a +: (b +: xs)`. The operands are still evaluated in the order written, `x`
+before `xs`. A left-grouping call, whether its name is a symbol or a word, and a right-grouping one do
+not mix at one level without parentheses: `a ++ b +: c` is an error, and `(a ++ b) :+ c` and
+`1 +: (v :+ 2)` are not.
+
+There are no prefix or postfix symbol methods. `++` and `--` keep their update meaning when no
+operand follows them on the line: `i++` and `++i` update `i`, and `xs ++ ys` calls `++`. An operand
+here is a name, a literal or an opening bracket on the same line, or an indented block on the next;
+so `a ++ -b`, with a prefix operator after `++`, is `(a++) - b`, written `a ++ (-b)` to join.
+
+`x op= y` calls `x`'s method named `op=` when the type of `x` has one: `buffer += 3` appends, and
+the buffer need not be a `var`. Otherwise `op=` assigns. Where `op` is one of the language's
+arithmetic, wrapping, saturating, shift or bitwise operators, it is the compound assignment it has
+always been; where `op` is a symbol method, `x op= y` is `x = x op y`, so `xs ++= ys` joins onto a
+`var` vector and `xs :+= 4` appends to it. The target is a `var` local, a `var` field, a module
+value or an element `xs(i)`, and its object and indices are evaluated once. A right-grouping name
+has no compound form, and the yielding forms (`+:=`) belong to the language's operators alone. A
+multiple assignment uses only the language's compound forms.
 
 ## Comparison chains
 

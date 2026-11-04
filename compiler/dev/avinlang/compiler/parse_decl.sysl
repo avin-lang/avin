@@ -43,7 +43,10 @@ parse(src: Source) -> Parsed
             file.items.push(ImplItem(parse_impl(&p, start, annotations)))
         elif (p.at("val") || p.at("var")) && p.ahead(1) != "("
             file.items.push(parse_value(&p, start, annotations))
-        else file.items.push(FunctionItem(parse_function(&p, annotations)))
+        else
+            if is_operator_spelling(p.ahead(0))
+                p.report.add(error(p.toks.here(), s"`${p.ahead(0)}` names a function, but only a method can be named by a symbol: declare it in a class, trait, object or impl"))
+            file.items.push(FunctionItem(parse_function(&p, annotations)))
         file.private_items.push(hidden)
         val closed_block = p.toks.position > 0 && p.toks.items[p.toks.position - 1].value == Dedent
         if !p.toks.at_end() && !p.at_kind(Newline) && !closed_block
@@ -94,6 +97,40 @@ declared_name(p: *Parser, what: string) -> string
         reject_keyword(p, at, word, what)
         return word
     required_name(p)
+
+// A method's name that is a run of operator characters. The language's own operators are not method
+// names: a type has them through their traits.
+private symbol_name(p: *Parser) -> string
+    val t = p.toks.advance().unwrap()
+    val name = p.spelling(t)
+    if language_operator(name)
+        val via = operator_trait(name)
+        if via != "" then p.report.add(error(t.span, s"`$name` is an operator of the language, which a type has by implementing `$via`, not by a method named `$name`"))
+        else p.report.add(error(t.span, s"`$name` is an operator of the language and cannot name a method"))
+    name
+
+/** Whether `name` is one of the language's operators, which no method may be named. */
+language_operator(name: string) -> bool
+    if compound_operator(name) then return true
+    if name.ends_with(":=") && compound_operator(name[0..<name.bytes.len - 2]) then return true
+    for op in ["&&", "||", "!", "~", "==", "!=", "<", "<=", ">", ">=", "===", "!==", "::", "=", ":=", ":", "?", "->", "=>"]
+        if name == op then return true
+    false
+
+// The trait an operator comes from, or "" for one a user type cannot have.
+private operator_trait(name: string) -> string
+    if name == "+" then "Add"
+    elif name == "-" then "Sub"
+    elif name == "*" then "Mul"
+    elif name == "/" then "Div"
+    elif name == "%" then "Rem"
+    elif name == "==" || name == "!=" then "Eq"
+    elif name == "<" || name == "<=" || name == ">" || name == ">=" then "Ord"
+    else ""
+
+/** Whether the member ahead declares a method named by a symbol: the symbol, then its type
+ * parameters or its parameters. */
+private symbol_method_ahead(p: *Parser) -> bool = is_operator_spelling(p.ahead(0)) && (p.ahead(1) == "(" || p.ahead(1) == "[")
 
 private qualified_name(p: *Parser) -> string
     var name = required_name(p)
@@ -393,7 +430,8 @@ parse_function(p: *Parser, annotations: Buf[Annotation]) -> &Function
     // `object`, `trait` and `impl` begin a declaration only when no parenthesis follows, so
     // `object(x: int) = x` declares a function.
     val declaring = p.at("object") || p.at("trait") || p.at("impl")
-    val name = if declaring then required_name(p) else declared_name(p, "a function")
+    val symbol = is_operator_spelling(p.ahead(0))
+    val name = if symbol then symbol_name(p) elif declaring then required_name(p) else declared_name(p, "a function")
     val name_span = start.to(p.toks.here())
     val type_params = parse_type_params(p)
     val params = parse_params(p, true)
@@ -750,7 +788,7 @@ private parse_class_member(p: *Parser) -> ClassMember
             _ ->
                 p.report.add(error(binding.span, "a field declaration names one field"))
                 return StatementMember(Expr(binding.span, Invalid))
-    if hidden || overrides || local_function_ahead(p) || signature_ahead(p) then return MethodMember(parse_function(p, buf()), !hidden, overrides)
+    if hidden || overrides || symbol_method_ahead(p) || local_function_ahead(p) || signature_ahead(p) then return MethodMember(parse_function(p, buf()), !hidden, overrides)
     StatementMember(line_statement(p))
 
 // A member that is a name, type parameters perhaps, and a parameter list with a typed parameter,
