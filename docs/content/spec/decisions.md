@@ -464,6 +464,21 @@ Settled by the user on 2026-11-03:
   their own.
 - The arithmetic traits carry their identities: `Add` has `zero` and `Mul` has `one`, so `sum` and
   `product` of an empty collection are those values rather than an `Option`.
+- `Seq[+T]` is a core trait over `Iterable[T]` with two abstract methods, `length()` and
+  `apply(index)`; its other methods (`get`, `isEmpty`, `head`, `headOption`, `last`, `lastOption`,
+  the folds, `foreach`, `exists`, `forall`, `find`, `indexWhere`, `count`, `toVector`, `toList`, an
+  iterator and `reverseIterator`) are default bodies written once over those two. `List` is a `Seq`
+  and overrides every one that would index into it, so none takes more than linear time on a list.
+  `contains` and `indexOf` take an element, which a covariant trait's method cannot, so each
+  sequence type declares its own.
+- A sequence passed or stored where a function from one `int` is expected becomes that function,
+  through the core library's `elementAt`; the conversion happens where the value is written, as a
+  conversion to `Any` does.
+- A sequence pattern on a sequence other than a list asks `length()` once and then reads, with
+  `apply`, each element whose pattern is not `_`, in order, stopping at the first that fails.
+- `Deque[T]` is a ring over an array, doubling when full as a buffer does, its spare places zero
+  bytes. `removeFirst()` and `removeLast()` return the element and trap on an empty deque, as
+  `Buffer.remove` traps outside the buffer; `isEmpty()` is the test before them.
 
 **Deferred**
 
@@ -484,6 +499,12 @@ Settled by the user on 2026-11-03:
   so a racing read sees some value written to that word, and a constructor ends with a release
   fence, so no thread sees an object without its header and constructor-set fields. Actors are
   scheduled onto a pool of these threads.
+- An `impl` adding methods to a trait (`impl[T] Seq[T]`, `impl[T: Display] Seq[T]`), which an impl
+  cannot do today. Its methods would reach the value only through the trait's own methods, which
+  are variance-checked, so, like the methods an impl adds to a `data` type, they would not be
+  variance positions: `contains(element: T)`, `indexOf`, `mkString` and `max`/`min` could then be
+  written once on `Seq` instead of on each sequence type, and generic code over `Seq[T]` would have
+  them.
 
 ## Open
 
