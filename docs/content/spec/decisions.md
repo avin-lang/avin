@@ -296,10 +296,11 @@ a decision changes, this page and the chapter change together.
   `writeInt`, `writeField` and `writeSpaces` beside `write`); `FormatSpec` is `width`, `precision`
   and `left`; `toString()` is a default body of `Display`.
 - Settled 2026-11-04 (user): a value of `Any` or of any trait is shown by the type it has at run time.
-  `Any` and every trait are `Display` and `Debug` whatever they declare: such a value meets those
-  bounds, converts to either trait, has `display`, `debug` and `toString()` and is interpolated, and
+  `Any` and every trait meet `Display` and `Debug` whatever they declare, as every type meets `Eq`:
+  such a value meets those bounds, has `display`, `debug` and `toString()` and is interpolated, and
   renders through its own type's implementation, found through its type record, so `Seq[int]` prints
-  as the vector it holds. A type with no implementation of its own renders as its name (`Cat`,
+  as the vector it holds. It does not convert to `Display` or `Debug` as a value, so a value of either
+  trait holds only objects that implement it, and is still shown through its method table. A type with no implementation of its own renders as its name (`Cat`,
   `Box[int]`; a function value `<function>`), never an address. Static types keep their rule: a
   class or data type needs its own `Display`, a type parameter its bound's. A trait takes no impl of
   `Display` or `Debug`: its values are shown by their own types, which keeps one rule.

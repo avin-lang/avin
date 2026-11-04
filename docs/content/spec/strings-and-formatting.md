@@ -135,9 +135,10 @@ implements neither is a compile error. There is no fallback that prints an addre
 applies to the whole rendered value.
 
 A value whose static type is `Any` or a trait is shown by the type it has when the program runs.
-`Any` and every trait are `Display` and `Debug`: such a value meets a `Display` or `Debug` bound,
-converts to either trait, has `display`, `debug` and `toString()`, and may be interpolated, whatever
-the trait itself declares. It renders through its own type's implementation, so a `Seq[int]` holding
+`Any` and every trait meet `Display` and `Debug`, as every type meets `Eq`: such a value meets a
+`Display` or `Debug` bound, has `display`, `debug` and `toString()`, and may be interpolated, whatever
+the trait itself declares. It does not convert to `Display` or `Debug` as a value: a value of either
+trait holds only objects whose types implement it. It renders through its own type's implementation, so a `Seq[int]` holding
 a vector prints `[1, 2, 3]`, as the vector would, and a `Vector[Seq[int]]` prints
 `[[1, 2, 3], [4]]`. A type with no `Display` (or no `Debug`) of its own renders as its name, `Cat` or
 `Box[int]`, and a function value as `<function>`, in the field the spec describes. The rule is for
