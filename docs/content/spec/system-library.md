@@ -346,14 +346,15 @@ println(s"took ${start.elapsed()}")
 `long` count; `zero()` is the empty duration. `inMilliseconds`, `inSeconds` and `inMinutes` answer
 whole units, a fraction dropped toward zero, and `inSecondsReal` the seconds with their fraction.
 Durations add, subtract and negate with `+`, `-` and unary `-` (they implement `Add`, `Sub` and
-`Neg`), and `times(n)` and `dividedBy(n)` scale one by a `long`; `abs()` drops the sign and
-`isNegative()` asks it.
+`Neg`), and `d * n` and `d / n` scale one by a `long`, a remainder dropped toward zero; `abs()`
+drops the sign and `isNegative()` asks it.
 
 **Readings.** `now()` reads the monotonic clock and `wallClock()` the wall clock; `fromEpoch(d)`
 makes the wall-clock time `d` after the start of 1970. On an `Instant`, `elapsed()` is the time from
-it to now, `since(earlier)` the time from another reading, and `plus(d)` and `minus(d)` move it by a
-duration; a `WallTime` has `since`, `plus`, `minus` and the `sinceEpoch` duration. The arithmetic
-operators work on one type only, which is why an instant and a duration combine through methods.
+it to now, `later - earlier` (or `later.since(earlier)`) the time from another reading, and
+`start + d` and `start - d` move it by a duration; a `WallTime` has the same `+`, `-` and `since`, and
+the `sinceEpoch` duration. These are [operator methods](/spec/operators-and-control-flow/#methods-named-by-symbols)
+of the reading types, so a reading of one clock less a reading of the other does not compile.
 
 **Order, equality and text.** All three types compare by value and are ordered, so `<`, `==` and
 `max` work on them. A duration displays in the largest unit it fills, with its fraction and no
