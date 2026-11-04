@@ -363,6 +363,42 @@ trailing zeros: `3us`, `1.5ms`, `90.5s`, `-500ms`; its `Debug` form wraps that a
 A `WallTime` displays as an ISO 8601 UTC timestamp with microseconds, `2026-11-04T12:34:56.000045Z`,
 in the proleptic Gregorian calendar.
 
+## `avin.math`
+
+**Proposed.** The elementary functions on `real`, and the constants `Pi` and `E`. They are functions
+of the module rather than methods, called through it or imported by name:
+
+```text
+import avin.math
+import avin.math.{Pi, sqrt}
+
+main()
+    println(sqrt(2.0))
+    println(math.atan2(1.0, -1.0) / Pi)
+    println(math.log(0.0))
+```
+
+| Function | Meaning |
+| --- | --- |
+| `sqrt(x)`, `cbrt(x)` | The square root, NaN for a negative `x`; the cube root, negative for a negative `x`. |
+| `exp(x)`, `expm1(x)` | `E` to the power `x`; `exp(x) - 1.0`, accurate near zero. |
+| `log(x)`, `log10(x)`, `log1p(x)` | The natural logarithm; to base 10; `log(1.0 + x)`, accurate near zero. Negative infinity at zero, NaN below it. |
+| `pow(x, y)` | `x` to the power `y`. `pow(x, 0.0)` is `1.0` for every `x`, NaN included; a negative `x` with a `y` that is not whole is NaN. |
+| `hypot(x, y)` | `sqrt(x * x + y * y)`, without overflow or underflow on the way. |
+| `sin(x)`, `cos(x)`, `tan(x)` | Of an angle in radians. |
+| `asin(x)`, `acos(x)`, `atan(x)` | The angle in radians: `asin` and `atan` from `-Pi / 2` to `Pi / 2`, `acos` from `0.0` to `Pi`; NaN outside `-1.0` to `1.0` for the first two. |
+| `atan2(y, x)` | The angle in radians, from `-Pi` to `Pi`, of the point `(x, y)`; `y` comes first. |
+| `sinh(x)`, `cosh(x)`, `tanh(x)` | The hyperbolic functions. |
+| `floor(x)`, `ceil(x)`, `rint(x)` | The whole number below, above, or nearest, as a `real`; `rint` takes a tie to the even one, so `rint(2.5)` is `2.0`. |
+| `abs(x)`, `signum(x)` | The magnitude, `abs(-0.0)` being `0.0`; `1.0`, `-1.0`, or `x` itself for a zero or NaN. |
+| `max(x, y)`, `min(x, y)` | NaN when either is; `-0.0` is less than `0.0`. |
+| `toRadians(x)`, `toDegrees(x)` | An angle converted. |
+
+**Nothing traps.** Every function follows IEEE 754: an argument outside a function's domain gives
+NaN, a pole gives the infinity its limit approaches, and the infinities go where their limits do
+(`sqrt` of positive infinity is positive infinity, `exp` of negative infinity is `0.0`). The limits
+of `real` itself, its infinities and NaN, are on the type: `real.PositiveInfinity`, `real.NaN`.
+
 ## `avin.random`
 
 **Proposed.** Pseudo-random numbers: a generator a program seeds to replay a run, or lets the platform
