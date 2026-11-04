@@ -64,6 +64,7 @@ The server announces exactly these capabilities in its answer to `initialize`:
 | `textDocument/rename` | The edit that gives the name under the cursor a new name everywhere the program names it, in every file of the program |
 | `textDocument/semanticTokens/full` | Every name the checker resolved in the document, classified by what it names; the legend is below |
 | `textDocument/completion` | What may be written at the cursor, as the checker sees the scope there; triggered by `.` as well as by typing a name. [Completion](#completion) below says what each place offers |
+| `textDocument/formatting` | The document in the style `avin fmt` writes, as one edit over the whole text; no edit when it is in the style already, and none while it does not parse. The request's options are not read: the style has no settings |
 
 A call through a method table goes to the method the receiver's static type declares, and a call of
 an overloaded function to the overload the checker chose. References follow the same choice: the
