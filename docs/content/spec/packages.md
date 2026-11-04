@@ -73,8 +73,9 @@ A dependency is named in `dependencies` and says once where it comes from:
   reaches is found by its full id alone. A dependency has a `version` or a `rev`, never both.
 - **`path`**: a directory holding a package, relative to the manifest that names it, for a package
   developed beside the one using it. A path dependency may name paths of its own, each relative to its
-  own manifest. A fetched package may not name a path, which exists only on the machine that
-  published it.
+  own manifest. A fetched package's path names another package of
+  [its own repository](#members-of-a-repository), read at the same version; a path leaving the
+  repository is refused, since it exists only on the machine that published it.
 - **`workspace = true`**: the member of the package's [workspace](#workspaces) whose package has the
   dependency's name.
 
@@ -374,7 +375,8 @@ they are directories being edited beside the project, as `avin.sum` already trea
 and nothing in it is compiled as one of the project's own modules; its packages are dependencies like
 any fetched one. `avin.sum` is unchanged by vendoring: it is still the record each vendored package is
 checked against, and `avin tidy` still rewrites it to the resolution, independently of what `vendor/`
-holds.
+holds. `avin tidy` and `avin add` read the machine's cache, fetching into it, whether or not there is
+a `vendor/`; after `avin add`, the build refuses the new package until `avin vendor` copies it in.
 
 ## The standard library's modules
 
@@ -430,7 +432,8 @@ without one, as before.
   manifest: the version given, the commit given (written to the manifest as its full id), or the
   highest release the repository has tagged. It fetches the package, lists
   it under the name its own manifest gives it, and adds its hash to `avin.sum`. Adding a dependency
-  already listed changes its version, to a lower one as well as a higher. The rest of the manifest,
+  already listed changes its version, to a lower one as well as a higher. A coordinate followed by
+  `//` and a directory adds that [member](#members-of-a-repository). The rest of the manifest,
   comments and layout included, is left as written, and a dependency that cannot be fetched or is
   not an Avin package changes nothing.
 - `avin tidy [--check] [<package>]` rewrites `avin.sum`, given a package, a path in one, or a

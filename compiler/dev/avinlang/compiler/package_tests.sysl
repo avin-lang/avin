@@ -2,7 +2,7 @@ module dev.avinlang.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{exists, make_dir_all, make_temp_dir, read_text, remove_dir_all, remove_file, write_text}
+import sysl.fs.{entries, exists, is_dir, make_dir_all, make_temp_dir, read_text, remove_dir_all, remove_file, write_text}
 import sysl.path.parent
 import sysl.process.{Stdio, capture}
 
@@ -825,3 +825,383 @@ add_rev()
     assert(add_dependency(app, "example.com/avin/pinned@0123abc", fetching, s -> ()).unwrap_err().contains("has no commit"))
     assert_eq(read_text(app + "/avin.hocon").unwrap(), before)
     assert(add_dependency(app, "example.com/avin/pinned@main", fetching, s -> ()).unwrap_err().contains("neither a version nor a revision"))
+
+// The repository `example.com/avin/geometry` as a host would serve it: a workspace whose root is the
+// package `geometry`, with the members `core`, `solid` (which names `core` by `workspace = true` and
+// the root by `path = ".."`) and `tools/probe` (which names `core` by `path = "../../core"`), tagged
+// v0.1.0 and v0.2.0. `core`'s `unit` and the root's `base` are 1 and 10 at the first tag and 2 and 20
+// at the second. v0.2.0 adds `docs`, a directory with no manifest, `leaky`, whose path leaves the
+// repository, and `lost`, which names a member the workspace lacks. Answers the two tags' commits.
+private geometry(dir: string) -> Buf[string]
+    val work = dir + "/work/geometry"
+    put(work + "/avin.hocon", manifest("geometry", "workspace = [\"core\", \"solid\", \"tools/*\"]\n"))
+    put(work + "/geometry/geometry.avin", "module geometry\n\nbase() -> int = 10\n")
+    put(work + "/core/avin.hocon", manifest("core", ""))
+    put(work + "/core/core/core.avin", "module core\n\nunit() -> int = 1\n")
+    put(work + "/solid/avin.hocon", manifest("solid", "dependencies {\n  core { workspace = true }\n  geometry { path = \"..\" }\n}\n"))
+    put(work + "/solid/solid/solid.avin", "module solid\n\nimport core.unit\nimport geometry.base\n\nvolume() -> int = unit() * base()\n")
+    put(work + "/tools/probe/avin.hocon", manifest("probe", "dependencies {\n  core { path = \"../../core\" }\n}\n"))
+    put(work + "/tools/probe/probe/probe.avin", "module probe\n\nimport core.unit\n\nprobe() -> int = unit() + 100\n")
+    git(work, ["init", "-q"])
+    commit_and_tag(work, "v0.1.0")
+    put(work + "/geometry/geometry.avin", "module geometry\n\nbase() -> int = 20\n")
+    put(work + "/core/core/core.avin", "module core\n\nunit() -> int = 2\n")
+    put(work + "/docs/readme.txt", "no manifest here\n")
+    put(work + "/leaky/avin.hocon", manifest("leaky", "dependencies {\n  outside { path = \"../../outside\" }\n}\n"))
+    put(work + "/lost/avin.hocon", manifest("lost", "dependencies {\n  nobody { workspace = true }\n}\n"))
+    commit_and_tag(work, "v0.2.0")
+    make_dir_all(dir + "/remotes/example.com/avin").unwrap()
+    git(dir, ["clone", "-q", "--bare", work, dir + "/remotes/example.com/avin/geometry.git"])
+    var ids: Buf[string] = buf()
+    ids.push(commit_of(work, "v0.1.0"))
+    ids.push(commit_of(work, "v0.2.0"))
+    ids
+
+// A dependency on the member `dir` of the geometry repository, read at `at`: `version = "0.1.0"` or
+// `rev = "…"`.
+private geometry_dep(label: string, dir: string, at: string) -> string = s"  $label { git = \"example.com/avin/geometry\", member = \"$dir\", $at }\n"
+
+// The package `app` at `dir/app`, with `dependencies` and a main printing `solid`'s volume.
+private geometry_app(dir: string, dependencies: string)
+    put(dir + "/avin.hocon", manifest("app", "dependencies {\n" + dependencies + "}\n"))
+    put(dir + "/main.avin", "import solid.volume\n\nmain() = println(s\"${volume()}\")\n")
+
+private names_of(program: LoadedProgram) -> string
+    var names = ""
+    for f in program.files
+        names = names + f.src.name + "\n"
+    names
+
+@test("member names a directory of a git dependency's repository, and is refused anywhere else")
+member_manifest()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/avin.hocon", manifest("a", "dependencies {\n" + geometry_dep("s", "tools/probe", "version = \"0.1.0\"") + "  r { git = \"example.com/o/r\", member = \"m\", rev = \"3f9a2c1\" }\n}\n")).unwrap()
+    val m = read_manifest(dir).unwrap()
+    assert(m.dependencies[0].origin is Git("example.com/avin/geometry//tools/probe", "0.1.0"))
+    assert(m.dependencies[1].origin is Rev("example.com/o/r//m", "3f9a2c1"))
+    assert_eq(repository_of("example.com/o/r//tools/probe"), "example.com/o/r")
+    assert_eq(member_of("example.com/o/r//tools/probe"), "tools/probe")
+    assert_eq(member_of("example.com/o/r"), "")
+    assert(manifest_error(manifest("a", "dependencies {\n  b { path = \"../b\", member = \"m\" }\n}\n")).contains("has a `member`, which belongs with `git`"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { workspace = true, member = \"m\" }\n}\n")).contains("has a `member`, which belongs with `git`"))
+    for bad in ["../m", "/m", "", "a//b", "./m", "a/..", "m*"]
+        assert(manifest_error(manifest("a", "dependencies {\n  b { git = \"example.com/o/r\", member = \"" + bad + "\", version = \"1.0.0\" }\n}\n")).contains("is not a member's directory"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { git = \"example.com/o/r\", member = \"m\" }\n}\n")).contains("names a repository and no version"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { member = \"m\", version = \"1.0.0\" }\n}\n")).contains("says once where it comes from"))
+
+@test("members of one repository at one version are one clone, each a package of its own whose avin.sum line carries the clone's hash")
+members_fetched()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    geometry(dir)
+    val app = dir + "/app"
+    geometry_app(app, geometry_dep("solid", "solid", "version = \"0.1.0\""))
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    val program = load_package(app, fetching).unwrap()
+    val names = names_of(program)
+    val clone = cached_package_dir(dir + "/cache", "example.com/avin/geometry", "0.1.0")
+    assert(names.contains("/cache/example.com/avin/geometry/@v0.1.0/solid/solid/solid.avin"))
+    // The member's workspace sibling and its path to the root are the repository's own packages.
+    assert(names.contains("/cache/example.com/avin/geometry/@v0.1.0/core/core/core.avin"))
+    assert(names.contains("/cache/example.com/avin/geometry/@v0.1.0/geometry/geometry.avin"))
+    assert_eq(compile_files(repository_toolchain(), program.files).diagnostics, "")
+    // One clone for all three, with no history.
+    var cached = ""
+    for name in entries(dir + "/cache/example.com/avin/geometry").unwrap()
+        cached = cached + name + " "
+    assert(cached == "@v0.1.0 @v0.1.0.hash " || cached == "@v0.1.0.hash @v0.1.0 ")
+    assert(!exists(clone + "/.git"))
+    val hash = tree_hash(clone).unwrap()
+    assert_eq(read_text(app + "/avin.sum").unwrap(), s"example.com/avin/geometry//solid v0.1.0 $hash\nexample.com/avin/geometry//core v0.1.0 $hash\nexample.com/avin/geometry v0.1.0 $hash\n")
+    // Each member's line is checked: a wrong one is refused naming that member.
+    write_text(app + "/avin.sum", s"example.com/avin/geometry//solid v0.1.0 $hash\nexample.com/avin/geometry//core v0.1.0 sha256:0000\nexample.com/avin/geometry v0.1.0 $hash\n").unwrap()
+    assert(load_package(app, fetching).unwrap_err().contains("avin.sum records example.com/avin/geometry//core v0.1.0 as sha256:0000"))
+    remove_file(app + "/avin.sum").unwrap()
+    // A nested member, whose path to its sibling climbs two directories.
+    put(app + "/avin.hocon", manifest("app", "dependencies {\n" + geometry_dep("probe", "tools/probe", "version = \"0.1.0\"") + "}\n"))
+    put(app + "/main.avin", "import probe.probe\n\nmain() = println(s\"${probe()}\")\n")
+    val nested = load_package(app, fetching).unwrap()
+    assert(names_of(nested).contains("/@v0.1.0/tools/probe/probe/probe.avin"))
+    assert(names_of(nested).contains("/@v0.1.0/core/core/core.avin"))
+    assert_eq(compile_files(repository_toolchain(), nested.files).diagnostics, "")
+    assert_eq(sum_versions(app + "/avin.sum"), "example.com/avin/geometry//tools/probe v0.1.0\nexample.com/avin/geometry//core v0.1.0\n")
+
+@test("members are selected separately: a higher version of a sibling asked for elsewhere is chosen, and a member at a release and a commit is refused")
+members_selected()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    val ids = geometry(dir)
+    val app = dir + "/app"
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    // Two members at two versions: `solid` at 0.1.0 reads `core` at 0.2.0, which the app asks for.
+    geometry_app(app, geometry_dep("solid", "solid", "version = \"0.1.0\"") + geometry_dep("core", "core", "version = \"0.2.0\""))
+    val program = load_package(app, fetching).unwrap()
+    val names = names_of(program)
+    assert(names.contains("/@v0.1.0/solid/solid/solid.avin"))
+    assert(names.contains("/@v0.2.0/core/core/core.avin"))
+    assert(!names.contains("/@v0.1.0/core/core/core.avin"))
+    assert(names.contains("/@v0.1.0/geometry/geometry.avin"))
+    assert_eq(compile_files(repository_toolchain(), program.files).diagnostics, "")
+    val first = tree_hash(cached_package_dir(dir + "/cache", "example.com/avin/geometry", "0.1.0")).unwrap()
+    val second = tree_hash(cached_package_dir(dir + "/cache", "example.com/avin/geometry", "0.2.0")).unwrap()
+    assert(first != second)
+    assert_eq(read_text(app + "/avin.sum").unwrap(), s"example.com/avin/geometry//solid v0.1.0 $first\nexample.com/avin/geometry//core v0.1.0 $first\nexample.com/avin/geometry v0.1.0 $first\nexample.com/avin/geometry//core v0.2.0 $second\n")
+    // The root package asked for at a higher version raises the member's path sibling, separately from
+    // the member itself.
+    geometry_app(app, geometry_dep("solid", "solid", "version = \"0.1.0\"") + "  geometry { git = \"example.com/avin/geometry\", version = \"0.2.0\" }\n")
+    val raised = names_of(load_package(app, fetching).unwrap())
+    assert(raised.contains("/@v0.2.0/geometry/geometry.avin"))
+    assert(raised.contains("/@v0.1.0/core/core/core.avin"))
+    // A member is one package at one release or one commit.
+    geometry_app(app, geometry_dep("solid", "solid", "version = \"0.1.0\"") + geometry_dep("core", "core", s"rev = \"${ids[1]}\""))
+    val conflict = load_package(app, fetching).unwrap_err()
+    assert(conflict.contains(s"`core` pins example.com/avin/geometry//core to the commit ${ids[1]}, and another dependency asks for it at the release v0.1.0"))
+    // Run, vendored so the command line fetches nothing: `core` 0.2.0's unit times the root 0.1.0's base.
+    geometry_app(app, geometry_dep("solid", "solid", "version = \"0.1.0\"") + geometry_dep("core", "core", "version = \"0.2.0\""))
+    vendor(app, fetching, s -> ()).unwrap()
+    assert_eq(avin(dir, ["avin", "run", app]).out, "20\n")
+
+@test("a member missing from its repository at a version, or a directory there with no manifest, is refused naming the coordinate and version")
+member_missing()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    geometry(dir)
+    val app = dir + "/app"
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    geometry_app(app, geometry_dep("solid", "docs", "version = \"0.1.0\""))
+    assert(load_package(app, fetching).unwrap_err().contains("example.com/avin/geometry//docs v0.1.0: the repository has no directory `docs` at that version"))
+    geometry_app(app, geometry_dep("solid", "docs", "version = \"0.2.0\""))
+    assert(load_package(app, fetching).unwrap_err().contains("example.com/avin/geometry//docs v0.2.0: `docs` holds no avin.hocon, so it is not a package"))
+    assert(!exists(app + "/avin.sum"))
+    // A fetched member's path out of its repository, and a workspace sibling the workspace lacks.
+    geometry_app(app, geometry_dep("solid", "leaky", "version = \"0.2.0\""))
+    assert(load_package(app, fetching).unwrap_err().contains("`outside` is a path dependency of a fetched package that leaves its repository, example.com/avin/geometry"))
+    geometry_app(app, geometry_dep("solid", "lost", "version = \"0.2.0\""))
+    assert(load_package(app, fetching).unwrap_err().contains("no member of the workspace of example.com/avin/geometry v0.2.0 is named `nobody`"))
+    // A repository whose root is no workspace has no siblings to name.
+    published(dir)
+    put(dir + "/work/extra/avin.hocon", manifest("extra", "dependencies {\n  shapes { workspace = true }\n}\n"))
+    commit_and_tag(dir + "/work/extra", "v0.3.0")
+    git(dir + "/remotes/example.com/avin/extra.git", ["fetch", "-q", dir + "/work/extra", "v0.3.0:refs/tags/v0.3.0"])
+    put(app + "/avin.hocon", manifest("app", "dependencies {\n  extra { git = \"example.com/avin/extra\", version = \"0.3.0\" }\n}\n"))
+    assert(load_package(app, fetching).unwrap_err().contains("`shapes` is a workspace dependency of a fetched package, which is in no workspace"))
+
+@test("a member pinned to a commit reads its siblings at that commit, from one clone")
+member_at_a_commit()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    val ids = geometry(dir)
+    val app = dir + "/app"
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    geometry_app(app, geometry_dep("solid", "solid", s"rev = \"${ids[0][0..<8]}\""))
+    val program = load_package(app, fetching).unwrap()
+    val names = names_of(program)
+    assert(names.contains(s"/@r${ids[0]}/solid/solid/solid.avin"))
+    assert(names.contains(s"/@r${ids[0]}/core/core/core.avin"))
+    assert(names.contains(s"/@r${ids[0]}/geometry/geometry.avin"))
+    val hash = tree_hash(cached_revision_dir(dir + "/cache", "example.com/avin/geometry", ids[0])).unwrap()
+    assert_eq(read_text(app + "/avin.sum").unwrap(), s"example.com/avin/geometry//solid r${ids[0]} $hash\nexample.com/avin/geometry//core r${ids[0]} $hash\nexample.com/avin/geometry r${ids[0]} $hash\n")
+    assert_eq(entries(dir + "/cache/example.com/avin/geometry").unwrap().len(), 2)
+    // Vendored, a commit's clone is kept under its full id.
+    vendor(app, fetching, s -> ()).unwrap()
+    assert(is_dir(app + s"/vendor/example.com/avin/geometry/@r${ids[0]}/solid"))
+    assert_eq(avin(dir, ["avin", "run", app]).out, "10\n")
+
+@test("avin add of a coordinate, //, and a directory records the member with git and member")
+add_member()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    val ids = geometry(dir)
+    val app = dir + "/app"
+    put(app + "/avin.hocon", manifest("app", ""))
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    var said = ""
+    add_dependency(app, "example.com/avin/geometry//solid@0.1.0", fetching, s -> said = said + s + "\n").unwrap()
+    assert_eq(said, "added solid: example.com/avin/geometry//solid v0.1.0\n")
+    assert_eq(read_text(app + "/avin.hocon").unwrap(), manifest("app", "\ndependencies {\n" + geometry_dep("solid", "solid", "version = \"0.1.0\"") + "}\n"))
+    assert_eq(sum_versions(app + "/avin.sum"), "example.com/avin/geometry//solid v0.1.0\nexample.com/avin/geometry//core v0.1.0\nexample.com/avin/geometry v0.1.0\n")
+    assert_eq(tidy(app, fetching, true, s -> ()).unwrap(), true)
+    // Again at a commit, abbreviated: the entry changes in place to the full id.
+    said = ""
+    add_dependency(app, s"example.com/avin/geometry//solid@${ids[1][0..<7]}", fetching, s -> said = said + s + "\n").unwrap()
+    assert_eq(said, s"updated solid to example.com/avin/geometry//solid r${ids[1]}\n")
+    assert_eq(read_text(app + "/avin.hocon").unwrap(), manifest("app", "\ndependencies {\n" + geometry_dep("solid", "solid", s"rev = \"${ids[1]}\"") + "}\n"))
+    // A nested member, with no version: the repository's highest release.
+    put(app + "/avin.hocon", manifest("app", ""))
+    said = ""
+    add_dependency(app, "example.com/avin/geometry//tools/probe", fetching, s -> said = said + s + "\n").unwrap()
+    assert_eq(said, "added probe: example.com/avin/geometry//tools/probe v0.2.0\n")
+    assert(read_text(app + "/avin.hocon").unwrap().contains(geometry_dep("probe", "tools/probe", "version = \"0.2.0\"")))
+    // What is not a member, or not in the repository at that version, changes nothing.
+    val before = read_text(app + "/avin.hocon").unwrap()
+    assert(add_dependency(app, "example.com/avin/geometry//nothere@0.2.0", fetching, s -> ()).unwrap_err().contains("example.com/avin/geometry//nothere v0.2.0: the repository has no directory `nothere`"))
+    assert(add_dependency(app, "example.com/avin/geometry//docs@0.2.0", fetching, s -> ()).unwrap_err().contains("`docs` holds no avin.hocon"))
+    assert(add_dependency(app, "example.com/avin/geometry//../x@0.1.0", fetching, s -> ()).unwrap_err().contains("does not name a member of example.com/avin/geometry"))
+    assert(add_dependency(app, "example.com/avin/geometry//a//b@0.1.0", fetching, s -> ()).unwrap_err().contains("does not name a member"))
+    assert(add_dependency(app, "example.com//solid@0.1.0", fetching, s -> ()).unwrap_err().contains("is not a git coordinate"))
+    assert_eq(read_text(app + "/avin.hocon").unwrap(), before)
+
+@test("avin vendor copies the resolution into vendor/, which a build then reads in place of the cache, fetching nothing")
+vendor_copies()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    geometry(dir)
+    put(dir + "/other/avin.hocon", manifest("other", ""))
+    put(dir + "/other/other/other.avin", "module other\n\nname() -> string = \"other\"\n")
+    val app = dir + "/app"
+    geometry_app(app, geometry_dep("solid", "solid", "version = \"0.1.0\"") + "  other { path = \"../other\" }\n")
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    var said = ""
+    vendor(app, fetching, s -> said = said + s + "\n").unwrap()
+    assert_eq(said, "fetching example.com/avin/geometry v0.1.0\nvendored 3 packages into vendor/\n")
+    val entry = app + "/vendor/example.com/avin/geometry/@v0.1.0"
+    val hash = tree_hash(entry).unwrap()
+    assert_eq(hash, tree_hash(cached_package_dir(dir + "/cache", "example.com/avin/geometry", "0.1.0")).unwrap())
+    assert_eq(read_text(entry + ".hash").unwrap(), hash + "\n")
+    assert_eq(read_text(entry + "/core/core/core.avin").unwrap(), "module core\n\nunit() -> int = 1\n")
+    assert_eq(sum_versions(app + "/avin.sum"), "example.com/avin/geometry//solid v0.1.0\nexample.com/avin/geometry//core v0.1.0\nexample.com/avin/geometry v0.1.0\n")
+    // A path dependency is not vendored.
+    assert_eq(entries(app + "/vendor").unwrap().len(), 1)
+    // With no cache and fetching off, the build reads vendor/.
+    val program = load_package(app, Fetching(dir + "/no-cache", "", false)).unwrap()
+    assert(names_of(program).contains("/app/vendor/example.com/avin/geometry/@v0.1.0/solid/solid/solid.avin"))
+    assert(!names_of(program).contains("/cache/"))
+    assert_eq(compile_files(repository_toolchain(), program.files).diagnostics, "")
+    assert(!exists(dir + "/no-cache"))
+    assert_eq(avin(dir, ["avin", "run", app]).out, "10\n")
+    // Vendoring again fetches and copies nothing.
+    said = ""
+    vendor(app, fetching, s -> said = said + s + "\n").unwrap()
+    assert_eq(said, "vendored 3 packages into vendor/\n")
+
+@test("a vendored project refuses a package vendor/ lacks, and avin vendor adds it, repairs an edited copy and removes what is no longer read")
+vendor_refuses_and_prunes()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    geometry(dir)
+    val app = dir + "/app"
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    geometry_app(app, geometry_dep("solid", "solid", "version = \"0.1.0\""))
+    vendor(app, fetching, s -> ()).unwrap()
+    // A dependency added since is refused, not fetched, even with fetching on.
+    geometry_app(app, geometry_dep("solid", "solid", "version = \"0.1.0\"") + geometry_dep("core", "core", "version = \"0.2.0\""))
+    val refused = load_package(app, fetching).unwrap_err()
+    assert(refused.contains("example.com/avin/geometry//core v0.2.0 is not in vendor/"))
+    assert(refused.contains("`avin vendor` adds it"))
+    assert(!exists(cached_package_dir(dir + "/cache", "example.com/avin/geometry", "0.2.0")))
+    // tidy reads the cache, whatever vendor/ holds.
+    var said = ""
+    tidy(app, fetching, false, s -> said = said + s + "\n").unwrap()
+    assert_eq(said, "added example.com/avin/geometry//core v0.2.0\n")
+    said = ""
+    vendor(app, fetching, s -> said = said + s + "\n").unwrap()
+    assert_eq(said, "vendored 4 packages into vendor/\n")
+    assert(names_of(load_package(app, fetching).unwrap()).contains("/app/vendor/example.com/avin/geometry/@v0.2.0/core/core/core.avin"))
+    // What the resolution no longer reads is removed, its hash with it.
+    geometry_app(app, geometry_dep("solid", "solid", "version = \"0.1.0\""))
+    said = ""
+    vendor(app, fetching, s -> said = said + s + "\n").unwrap()
+    assert_eq(said, "removed example.com/avin/geometry v0.2.0\nvendored 3 packages into vendor/\n")
+    val vendored = app + "/vendor/example.com/avin/geometry"
+    assert(!exists(vendored + "/@v0.2.0"))
+    assert(!exists(vendored + "/@v0.2.0.hash"))
+    assert(is_dir(vendored + "/@v0.1.0"))
+    // A copy hashing as recorded is left alone (its root's `.avin` is no part of it); an edited one is
+    // copied afresh.
+    put(vendored + "/@v0.1.0/.avin/marker", "left\n")
+    vendor(app, fetching, s -> ()).unwrap()
+    assert(exists(vendored + "/@v0.1.0/.avin/marker"))
+    put(vendored + "/@v0.1.0/core/core/core.avin", "module core\n\nunit() -> int = 9\n")
+    vendor(app, fetching, s -> ()).unwrap()
+    assert_eq(read_text(vendored + "/@v0.1.0/core/core/core.avin").unwrap(), "module core\n\nunit() -> int = 1\n")
+    assert(!exists(vendored + "/@v0.1.0/.avin/marker"))
+    // A repository read no more is removed with the directories above it, and vendor/ stays.
+    put(app + "/avin.hocon", manifest("app", ""))
+    put(app + "/main.avin", "main() = println(\"none\")\n")
+    said = ""
+    vendor(app, fetching, s -> said = said + s + "\n").unwrap()
+    assert_eq(said, "removed example.com/avin/geometry v0.1.0\nvendored 0 packages into vendor/\n")
+    assert(!exists(app + "/vendor/example.com"))
+    assert(is_dir(app + "/vendor"))
+
+@test("avin vendor refuses a cache entry changed since it was fetched, and a vendored build holds each copy to avin.sum")
+vendor_hash_mismatch()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    geometry(dir)
+    val app = dir + "/app"
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    geometry_app(app, geometry_dep("solid", "solid", "version = \"0.1.0\""))
+    load_package(app, fetching).unwrap()
+    val cached = cached_package_dir(dir + "/cache", "example.com/avin/geometry", "0.1.0")
+    put(cached + "/core/core/core.avin", "module core\n\nunit() -> int = 9\n")
+    val changed = vendor(app, fetching, s -> ()).unwrap_err()
+    assert(changed.contains("the cache's copy of example.com/avin/geometry v0.1.0"))
+    assert(changed.contains("it was changed after it was fetched"))
+    // Nothing was written, so the project is not vendored.
+    assert(!exists(app + "/vendor"))
+    put(cached + "/core/core/core.avin", "module core\n\nunit() -> int = 1\n")
+    vendor(app, fetching, s -> ()).unwrap()
+    val sums = read_text(app + "/avin.sum").unwrap()
+    write_text(app + "/avin.sum", sums.replace_all("geometry//solid v0.1.0 sha256:", "geometry//solid v0.1.0 sha256:00")).unwrap()
+    assert(load_package(app, fetching).unwrap_err().contains("avin.sum records example.com/avin/geometry//solid v0.1.0 as sha256:00"))
+    write_text(app + "/avin.sum", sums).unwrap()
+    remove_file(app + "/vendor/example.com/avin/geometry/@v0.1.0.hash").unwrap()
+    assert(load_package(app, fetching).unwrap_err().contains("no record of what it hashed to"))
+
+@test("a workspace is vendored at its root, which every member reads")
+vendor_workspace()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    geometry(dir)
+    val ws = dir + "/ws"
+    put(ws + "/avin.hocon", "workspace = [\"app\"]\n")
+    geometry_app(ws + "/app", geometry_dep("solid", "solid", "version = \"0.1.0\""))
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    var said = ""
+    vendor(ws + "/app", fetching, s -> said = said + s + "\n").unwrap()
+    assert(said.ends_with("vendored 3 packages into vendor/\n"))
+    assert(is_dir(ws + "/vendor/example.com/avin/geometry/@v0.1.0"))
+    assert(!exists(ws + "/app/vendor"))
+    assert(exists(ws + "/avin.sum"))
+    val program = load_package(ws + "/app", Fetching(dir + "/no-cache", "", false)).unwrap()
+    assert(names_of(program).contains("/ws/vendor/example.com/avin/geometry/@v0.1.0/solid/"))
+
+@test("a package's own vendor/ is never one of its modules; in a program without a manifest it is an ordinary directory")
+vendor_is_not_a_module()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    put(dir + "/pkg/avin.hocon", manifest("pkg", ""))
+    put(dir + "/pkg/main.avin", "main() = println(\"pkg\")\n")
+    put(dir + "/pkg/vendor/stray/stray.avin", "module vendor.stray\n\nbroken(\n")
+    put(dir + "/pkg/tools/vendor/kept.avin", "module tools.vendor\n\nkept() -> int = 1\n")
+    var names = ""
+    for f in program_files(dir + "/pkg").unwrap()
+        names = names + f.src.name + "\n"
+    assert(!names.contains("/pkg/vendor/"))
+    assert(names.contains("/pkg/tools/vendor/kept.avin"))
+    assert_eq(avin(dir, ["avin", "run", dir + "/pkg"]).out, "pkg\n")
+    put(dir + "/plain/main.avin", "main() = 0\n")
+    put(dir + "/plain/vendor/v.avin", "module vendor\n\nx() -> int = 1\n")
+    var plain = ""
+    for f in program_files(dir + "/plain").unwrap()
+        plain = plain + f.src.name + "\n"
+    assert(plain.contains("/plain/vendor/v.avin"))
+
+@test("avin vendor on the command line: a package, usage, and a path in no package")
+vendor_command_line()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    two_packages(dir)
+    val vendored = avin(dir, ["avin", "vendor", dir + "/app/tests"])
+    assert_eq(vendored.noted, "")
+    assert_eq(vendored.status, 0)
+    assert_eq(vendored.said, "vendored 0 packages into vendor/\n")
+    assert(is_dir(dir + "/app/vendor"))
+    // A path dependency needs nothing vendored, and the vendored package still runs.
+    assert_eq(avin(dir, ["avin", "run", dir + "/app"]).out, "9 8\n")
+    assert_eq(avin(dir, ["avin", "vendor", "--bad"]).status, 2)
+    assert_eq(avin(dir, ["avin", "vendor", "a", "b"]).status, 2)
+    put(dir + "/plain/main.avin", "main() = 0\n")
+    assert(avin(dir, ["avin", "vendor", dir + "/plain"]).noted.contains("`avin vendor` reads a package's avin.hocon"))
