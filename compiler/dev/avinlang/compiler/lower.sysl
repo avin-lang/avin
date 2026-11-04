@@ -183,6 +183,9 @@ private struct Lowering
     /** Whether a module-level value's initializer is being made at compile time, where a vector
      * literal may be too: it runs once, so its one object is the object it would have made. */
     in_global: bool
+    /** Whether the program shows a value of unknown type, which reads the `display` or `debug`
+     * entry of its type's record: every record then gets them. */
+    runtime_rendering: bool
 
 /** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
  * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
@@ -237,10 +240,10 @@ lower_program(program: TProgram) -> MirProgram
         if d.table.len() > generic_base then generic_base = d.table.len()
     for b in program.builtins
         if b.table.len() > generic_base then generic_base = b.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false)
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, false)
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
-    l.records.push(TypeRecord("a captured variable", buf(), None, None))
+    l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None))
     l.record_types.push(Unit)
     // A module-level value made at compile time has no storage: every read of it is the constant.
     for _ in program.globals
@@ -316,8 +319,11 @@ lower_program(program: TProgram) -> MirProgram
         // A call through a position no call used before fills it in every table made so far.
         if fill_used_slots(&l) then continue
         // A comparison of values of unknown type calls the entries of their type's record, so once
-        // the program makes one, every record gets them; making them may lay out more types.
-        if !l.runtime_equality || !add_equality_entries(&l) then break
+        // the program makes one, every record gets them; making them may lay out more types. Showing
+        // such a value does the same with the rendering entries.
+        val compared = l.runtime_equality && add_equality_entries(&l)
+        val shown = l.runtime_rendering && add_rendering_entries(&l)
+        if !compared && !shown then break
     add_variant_ancestors(&l)
     functions = devirtualize(functions, l.descriptors, dispatch_sites(&l))
     functions = scalar_replace(functions, l.descriptors)
@@ -950,6 +956,7 @@ private generated(l: *Lowering, kind: u8, t: &Type) -> usize
     l.instances.push(Instance(0, args, false, kind))
     l.instance_index.put(key, index)
     if kind == AnyEquals || kind == AnyHash then l.runtime_equality = true
+    if kind == AnyDisplay || kind == AnyDebug then l.runtime_rendering = true
     index
 
 private instance_key(function: usize, type_args: Buf[&Type], entry: bool) -> string
@@ -988,13 +995,13 @@ private record_of(l: *Lowering, t: &Type) -> usize
     val key = type_key(t)
     if l.record_index.get(key) is Some(r) then return r
     val index = l.records.len()
-    l.records.push(TypeRecord(type_name(t), buf(), None, None))
+    l.records.push(TypeRecord(type_name(t), buf(), None, None, None, None))
     l.record_types.push(t)
     l.record_index.put(key, index)
     var ancestors: Buf[usize] = buf()
     for up in supertypes(l, t)
         ancestors.push(record_of(l, up))
-    l.records.set(index, TypeRecord(type_name(t), ancestors, None, None))
+    l.records.set(index, TypeRecord(type_name(t), ancestors, None, None, None, None))
     index
 
 /** The types `t` conforms to besides itself and `Any`, each once. */
@@ -1164,7 +1171,7 @@ private add_variant_ancestors(l: *Lowering)
             if always_is(l, from, to) || same_type(view_as(lowering_conformances(l), from, to), to)
                 ancestors.push(target)
                 grew = true
-        if grew then l.records.set(r, TypeRecord(l.records[r].name, ancestors, l.records[r].equals, l.records[r].hash))
+        if grew then l.records.set(r, TypeRecord(l.records[r].name, ancestors, l.records[r].equals, l.records[r].hash, l.records[r].display, l.records[r].debug))
 
 /** The value of type `t` an object that has that type holds: a built-in value is in its box, and an
  * option kept as a pointer is the `Some`'s value or null. */
@@ -1360,6 +1367,7 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
                 None -> return None
     // Only the object an option kept as a pointer stands for has a method table.
     if pointer_option(l, args[0].ty) then operands.set(0, option_object(l, args[0].ty, operands[0]))
+    if rendering_call(l, function, concrete(l, args[0].ty), operands) is Some(shown) then return shown
     val symbol = l.program.symbols[function]
     var concrete_args: Buf[&Type] = buf()
     for t in type_args
@@ -2976,10 +2984,21 @@ private const AnyEquals: u8 = 5
 private const AnyHash: u8 = 6
 /** A method table's entry for an option kept as a pointer: see `table_entry`. */
 private const OptionAdapter: u8 = 7
+/** A type record's `display` entry: an object of the type rendered by its `Display`, or by name. */
+private const RecordDisplay: u8 = 8
+/** A type record's `debug` entry: the same through `Debug`. */
+private const RecordDebug: u8 = 9
+/** `display` on a value of unknown type, through its record. */
+private const AnyDisplay: u8 = 10
+/** `debug` on a value of unknown type, through its record. */
+private const AnyDebug: u8 = 11
 
-/** Where a type record's `equals` and `hash` entries are: after the ancestor count. */
+/** Where a type record's entries are: after the ancestor count, `equals`, `hash`, `display` and
+ * `debug`. */
 private const RecordEqualsEntry: usize = 8
 private const RecordHashEntry: usize = 16
+private const RecordDisplayEntry: usize = 24
+private const RecordDebugEntry: usize = 32
 
 /** Whether `t` is a built-in type whose operators are machine operations. */
 private is_machine_scalar(t: &Type) -> bool = *t match
@@ -3204,10 +3223,111 @@ private add_equality_entries(l: *Lowering) -> bool
         if owned
             val equals = generated(l, RecordEquals, t)
             val hash = generated(l, RecordHash, t)
-            l.records.set(r, TypeRecord(record.name, l.records[r].ancestors, Some(equals), Some(hash)))
+            l.records.set(r, TypeRecord(record.name, l.records[r].ancestors, Some(equals), Some(hash), l.records[r].display, l.records[r].debug))
             added = true
         r += 1
     added
+
+/** Gives every type record that some object has as its own type rendering entries; whether it made
+ * any. */
+private add_rendering_entries(l: *Lowering) -> bool
+    // Each entry is made only where the program reads it: `display` once it shows such a value, and
+    // `debug` once it debugs one.
+    val displays = l.instance_index.get(s"generated $AnyDisplay|${type_key(AnyType)}") is Some(_)
+    val debugs = l.instance_index.get(s"generated $AnyDebug|${type_key(AnyType)}") is Some(_)
+    var added = false
+    var r = 0usize
+    while r < l.records.len()
+        val record = l.records[r]
+        val t: &Type = if r == 0 then Function(buf(), Unit) else l.record_types[r]
+        var owned = true
+        if *t is Class(k, _, _)
+            if l.program.classes[k].decl.modifier == "trait" || l.program.classes[k].decl.modifier == "abstract" then owned = false
+        if owned
+            var display = record.display
+            var debug = record.debug
+            if displays && display is None then display = Some(generated(l, RecordDisplay, t))
+            if debugs && debug is None then debug = Some(generated(l, RecordDebug, t))
+            if !same_entry(display, record.display) || !same_entry(debug, record.debug)
+                l.records.set(r, TypeRecord(record.name, record.ancestors, record.equals, record.hash, display, debug))
+                added = true
+        r += 1
+    added
+
+private same_entry(a: Option[usize], b: Option[usize]) -> bool = a match
+    Some(x) -> b match
+        Some(y) -> x == y
+        None -> false
+    None -> b is None
+
+// `display`, `debug` or `toString` called through a table on a receiver of static type `receiver`.
+// On `Any`, or on a trait that does not require the method's trait, the object's own type may have
+// no `Display` or `Debug`, so the call goes through the rendering entries of its type's record.
+// `None` where the table answers; otherwise the call's result.
+private rendering_call(l: *Lowering, function: usize, receiver: &Type, operands: Buf[Operand]) -> Option[Option[Operand]]
+    val core = l.program.core
+    val shown = core.is(function, "display") || core.is(function, "toString")
+    if !shown && !core.is(function, "debug") then return None
+    if !rendered_at_run_time(l.program.classes, receiver) then return None
+    if *receiver is Class(_, _, _)
+        val k = l.program.symbols[function].owner_class?
+        if holding_ancestor(lowering_conformances(l), receiver, k) is Some(_) then return None
+    if core.is(function, "display") then return Some(call_instance(l, generated(l, AnyDisplay, AnyType), operands, None))
+    if core.is(function, "debug") then return Some(call_instance(l, generated(l, AnyDebug, AnyType), operands, None))
+    Some(call_instance(l, library_instance(l, "displayString", AnyType), one(operands[0]), machine(l, Str)))
+
+/** The machine types of a rendering method's parameters: the object, the writer and the spec. */
+private rendering_params(l: *Lowering, name: string) -> Buf[MirType]
+    var params: Buf[MirType] = buf()
+    params.push(MRef)
+    val symbol = l.program.symbols[l.program.core.method_named(name).unwrap()]
+    for p in 1..<symbol.params.len()
+        if machine(l, symbol.params[p]) is Some(m) then params.push(m)
+    params
+
+// `display` or `debug`, named `name`, on an object of unknown type: its record's entry renders it.
+private any_rendering(l: *Lowering, name: string, entry: usize) -> MirFunction
+    val params = rendering_params(l, name)
+    var operands: Buf[Operand] = buf()
+    for m in params
+        operands.push(Value(fresh(l, m)))
+    val code = record_entry(l, object_record(l, operands[0]), entry)
+    push_call(l, None, Indirect(code, MirSignature(params, None)), operands)
+    finish(l, Return(None))
+    MirFunction(s"avin.any.$name", MirSignature(params, None), l.values, l.slots, l.blocks)
+
+// A record's `display` or `debug` entry for type `t`: the object rendered by the type's own
+// implementation of the trait that declares `name`, or, where the type has none, as the type's name.
+private record_rendering(l: *Lowering, t: &Type, name: string) -> MirFunction
+    val params = rendering_params(l, name)
+    var operands: Buf[Operand] = buf()
+    for m in params
+        operands.push(Value(fresh(l, m)))
+    val m = l.program.core.method_named(name).unwrap()
+    own_rendering(l, t, m) match
+        Some(index) ->
+            var args: Buf[Operand] = buf()
+            if unbox(l, t, operands[0]) is Some(x) then args.push(x)
+            for i in 1..<operands.len()
+                args.push(operands[i])
+            call_instance(l, index, args, None)
+        None ->
+            val shown = if *t is Function(_, _) then "<function>" else type_name(t)
+            var args: Buf[Operand] = buf()
+            args.push(string_constant(l, shown))
+            for i in 1..<operands.len()
+                args.push(operands[i])
+            call_instance(l, library_function(l, "renderTypeName"), args, None)
+    finish(l, Return(None))
+    MirFunction(s"avin.record.$name.${type_key(t)}", MirSignature(params, None), l.values, l.slots, l.blocks)
+
+/** The instance of type `t`'s own implementation of the rendering method `m`, where `t` conforms to
+ * the trait declaring it. */
+private own_rendering(l: *Lowering, t: &Type, m: usize) -> Option[usize]
+    if !(*t is Class(_, _, _) || *t is Data(_, _, _) || *t is Tuple(_) || is_builtin(t)) then return None
+    val k = l.program.symbols[m].owner_class?
+    if !meets_bound(lowering_conformances(l), t, Class(k, l.program.classes[k].decl.name, buf())) then return None
+    explicit_implementation(l, t, m)
 
 // The body of a function lowering makes, which no source declares; see `Instance.generated`.
 private lower_generated(l: *Lowering, inst: Instance) -> MirFunction
@@ -3256,6 +3376,10 @@ private lower_generated(l: *Lowering, inst: Instance) -> MirFunction
         val h = if *t is Class(_, _, _) || *t is Data(_, _, _) || *t is Tuple(_) then own_hash(l, t, x) else hash_value(l, t, x)
         finish(l, Return(Some(h)))
         return MirFunction("avin.record.hash." + key, MirSignature(single(MRef), Some(MInt(64))), l.values, l.slots, l.blocks)
+    if kind == RecordDisplay then return record_rendering(l, t, "display")
+    if kind == RecordDebug then return record_rendering(l, t, "debug")
+    if kind == AnyDisplay then return any_rendering(l, "display", RecordDisplayEntry)
+    if kind == AnyDebug then return any_rendering(l, "debug", RecordDebugEntry)
     if kind == AnyEquals
         val a = Value(fresh(l, MRef))
         val b = Value(fresh(l, MRef))
