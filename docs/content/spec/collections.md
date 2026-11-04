@@ -22,11 +22,18 @@ Iterable[+A]                 iterator(), and the operation families below
 │   ├── Array[A]             mutable, fixed length, contiguous
 │   ├── Buffer[A]            mutable, growable at the end, contiguous
 │   └── Deque[A]             mutable, growable at both ends
-├── Set[A]                   immutable, by hash
-├── TreeSet[A]               immutable, sorted by Ord
-├── Map[K, +V]               immutable, by hash
-└── TreeMap[K, +V]           immutable, sorted by Ord
+├── Set[A]                   immutable sets, (A) -> bool
+│   ├── HashSet[A]           by hash; what {a, b} and Set(...) build
+│   └── SortedSet[A]         in order, with the ordered operations
+│       └── TreeSet[A]       sorted by Ord
+└── Map[K, +V]               immutable maps, (K) -> V
+    ├── HashMap[K, +V]       by hash; what {k: v} and Map(...) build
+    └── SortedMap[K, +V]     in key order, with the ordered operations
+        └── TreeMap[K, +V]   sorted by Ord
 ```
+
+`Set`, `SortedSet`, `Map` and `SortedMap` are traits; the hash-based and tree collections are the
+data types that conform to them.
 
 `[]T` is shorthand for `Vector[T]` in any type position (`xs: []int`, `[][]int`); see
 [types](/spec/types/).
@@ -248,17 +255,35 @@ squares(n: int) -> List[int]
 
 ## Maps and sets
 
-`Map[K, +V]` and `Set[A]` find keys by their hash and compare them with `==`. Every type has both, so
+`Map[K, +V]` and `Set[A]` are traits, the immutable maps and sets: a function over `Map[string, int]`
+takes a `HashMap` or a `TreeMap`. A map literal `{"a": 1}`, `Map((k, v), …)`, `Map.empty` and
+`Map.builder` make a `HashMap`, typed as a `Map`, and `{1, 2}`, `Set(…)`, `Set.empty` and
+`Set.builder` a `HashSet`, typed as a `Set`; `HashMap` and `HashSet` have companions of their own
+for a value typed as the hash-based kind.
+
+`HashMap` and `HashSet` find keys by their hash and compare them with `==`. Every type has both, so
 any type is a key: strings and tuples by value, `data` values field by field, class instances by
 identity unless their class implements `Eq` and `Hash`. Each key's hash is spread over all 64 bits
 before it is used, so sequential integers and strings sharing long prefixes do not cluster.
 
-The immutable map and set are persistent: `m.updated(k, v)`, `m.removed(k)`, `s.added(x)` and
-`s.removed(x)` return a new collection sharing all but the changed path with the old one, which is
-left as it was. They are hash tries, branching on one bit of the spread hash at a time, so an update
-copies a path proportional to the logarithm of the size. Two maps are equal when they hold the same
-keys bound to equal values, and two sets when they hold the same elements; equal collections hash
-alike, whatever order they were built in.
+The immutable maps and sets are persistent: `m.updated(k, v)`, `m.removed(k)`, `s.added(x)` and
+`s.removed(x)` return a new collection of the same kind, sharing all but the changed path with the
+old one, which is left as it was, even when called through the trait: a `TreeMap` held as a `Map`
+answers a `TreeMap`. The same holds for `++`, `--`, `updatedWith`, `filter`, `filterKeys`,
+`transform`, `mapValues` and a set's `union`, `intersect` and `diff`. The methods that make keys or
+elements of another type, `map`, `collect` and `flatMap`, answer a hash-based collection through the
+trait, and the tree collection's own versions answer a tree collection where its type is known. The
+hash-based kinds are hash tries, branching on one bit of the spread hash at a time, so an update
+copies a path proportional to the logarithm of the size.
+
+A map's values are covariant, so a method that puts a value in takes any supertype of `V`, as
+[lower bounds](/spec/generics/#lower-bounds) allow: `updated[W >: V](key, value: W) -> Map[K, W]`,
+`++[W >: V]`, `updatedWith[W >: V]` and `getOrElse[W >: V]`. A `Map[string, Cat]` updated with a
+`Dog` is a `Map[string, Animal]`.
+
+Two maps are equal when they hold the same keys bound to equal values, and two sets when they hold
+the same elements, whatever their kinds: a `HashMap` equals a `TreeMap` of the same entries, through
+the traits or `Any`. Equal collections hash alike, whatever order they were built in.
 
 ```text
 var counts = Map.empty[string, int]()
@@ -309,25 +334,30 @@ mutable ones it is the table's order.
 Mutable maps and sets, like arrays, compare and hash by their contents at the moment they are
 compared; `===` tells two of them apart. Every map and set displays in the shape of its literal,
 `{a: 1, b: 2}` and `{1, 2, 3}`, each part in its own `Display`, and its `Debug` uses the parts'
-`Debug`, `{"a": 1}`, each where the parts have it.
+`Debug`, `{"a": 1}`, each where the parts have it; one held as its trait is shown by its own type. An
+immutable map has no `mkString` of its own: it joins its entries as the pairs they are,
+`{"a": 1}.mkString()` is `(a, 1)`.
 
 ## Sorted maps and sets
 
-`TreeMap[K, +V]` and `TreeSet[A]` keep their keys in the order of `compare`, so a key must be `Ord`:
-`TreeSet(Point(1, 2))` is an error naming the bound when `Point` has no order. They are persistent
-like `Map` and `Set`, an update copying one path, and they are balanced trees, so a lookup, an update
-and each ordered operation below take time in the logarithm of the size. Iteration, `keys()`,
-`values()`, `foreach`, `mkString` and the display all visit the keys in ascending order.
+`SortedMap[K, +V]` and `SortedSet[A]` are traits, a `Map` and a `Set` kept in order, and `TreeMap`
+and `TreeSet` conform to them. These keep their keys in the order of `compare`, so a key must be
+`Ord`: `TreeSet(Point(1, 2))` is an error naming the bound when `Point` has no order. They are
+persistent like the hash-based kinds, an update copying one path, and they are balanced trees, so a
+lookup, an update and each ordered operation below take time in the logarithm of the size.
+Iteration, `keys()`, `values()`, `foreach`, `mkString` and the display all visit the keys in
+ascending order.
 
-A tree map has every method of `Map`, and a tree set every method of `Set`, with the same meaning and
-the same traits: each is `Iterable`, a function (`(K) -> V` and `(A) -> bool`), `Eq`, `Hash`,
-`Display` and `Debug`, so code written over those traits takes either kind. A tree collection equals
-another of its type holding the same entries, and hashes to what the `Map` or `Set` of the same
-entries does. The methods that make a collection keyed by something new — `map`, `collect` and
-`flatMap` — need the new key to be `Ord` and answer a tree collection; where two entries make the same
-key, the later one in key order wins. A tree map's `keySet()` is a `TreeSet`.
+A sorted map is a `Map`, and a sorted set a `Set`, so code over `Map` or `Set` takes either kind. An
+update through `SortedMap` or `SortedSet` answers one, so `sorted.updated(k, v).first()` type-checks:
+the sorted traits re-declare `updated`, `removed`, `++`, `--`, `updatedWith`, `filter`, `filterKeys`,
+`transform`, `mapValues`, a set's `added`, `removed`, `union`, `intersect` and `diff` with the sorted
+result, and a sorted map's `keySet()` is a `SortedSet` (a tree map's a `TreeSet`). A tree
+collection's own `map`, `collect` and `flatMap` need the new key to be `Ord` and answer a tree
+collection; where two entries make the same key, the later one in key order wins.
 
-The ordered operations, on both kinds, answering a map's entries as `(key, value)` pairs:
+The ordered operations, members of `SortedMap` and `SortedSet`, answering a map's entries as
+`(key, value)` pairs:
 
 | Operation | Answers |
 |---|---|
@@ -351,6 +381,8 @@ println(small.until(4))             // {1, 3}
 
 `TreeMap.empty`, `TreeMap.builder` and `TreeMap((k, v), …)`, and the same for `TreeSet`, make them as
 their hash-based counterparts' companions do, and a set or map literal builds one where one is expected.
+`SortedMap` and `SortedSet` have the same companions, making tree collections typed as the sorted
+traits, and a literal where a `SortedMap` or `SortedSet` is expected builds a tree collection.
 
 ## Indexing and callable sequences
 
