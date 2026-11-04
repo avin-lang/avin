@@ -548,9 +548,11 @@ impl Shape
     perimeter() -> real = …
 ```
 
-`impl Type` without a trait adds methods to a type declared in the same module. An `impl` lives in
-the module of the trait or of the type; the built-in types belong to the core library's module,
-`avin`, which is where `impl string` is written. Declaring a trait in a class's header and writing a
+`impl Type` without a trait adds methods to a type, and may be written in any module: in the type's
+own module its methods are the type's, and in another module the impl is an **extension**, whose
+methods are seen where that module is imported (below). A conformance, `impl Trait for Type`, lives in
+the module of the trait or of the type, so a type has one answer to it everywhere; the built-in types
+belong to the core library's module, `avin`. Declaring a trait in a class's header and writing a
 separate `impl` for it are the same conformance; it may be stated once.
 
 `impl` is how Avin expresses type classes (`Ord`, `Hash`, `Display`) and adds methods to types you
@@ -562,10 +564,10 @@ trait's default bodies, which every conforming object shares, do not reach it: a
 built-in type implements every method of the trait, defaults included.
 
 - **An impl adds methods, never state.** Its body declares methods only: no fields and no
-  statements. A method an impl adds to a class or an object is one of its methods, as if the class's
-  body declared it: it sees the private fields, is inherited by a subclass, and a subclass may
-  override it. A method with the name and parameter types of one the type already has is an error;
-  one with other parameter types overloads it.
+  statements. A method an impl in a class's or an object's module adds to it is one of its methods,
+  as if the class's body declared it: it sees the private fields, is inherited by a subclass, and a
+  subclass may override it. A method with the name and parameter types of one the type already has
+  is an error; one with other parameter types overloads it.
 - **Inside an impl's methods the receiver is implicit**, as in a class: `self` is the value, the
   type's methods are in scope by bare name, and so are the fields of a `data` type with one variant,
   the fields `self.name` reaches. A type with several variants takes `self` apart with `match`.
@@ -611,7 +613,7 @@ built-in type implements every method of the trait, defaults included.
 - A method added to a built-in type (`impl string`, `impl int`) is called on a value of that type,
   `"hi".shout()`, `7.squared()`.
 - **An impl without `for` whose type is a trait adds methods to the trait** (`impl[T] Seq[T]`,
-  `impl[T: Display] Seq[T]`), in the trait's module. Every value whose type conforms to the trait has
+  `impl[T: Display] Seq[T]`). Every value whose type conforms to the trait has
   them: a class or `data` type implementing it, the trait's own type, a type parameter it bounds.
   Inside them `self` is the value and `Self` its type; the trait's methods, and those other impls add
   to it, are in scope by bare name. They reach the value only through the trait's methods, so they
@@ -633,6 +635,52 @@ impl[T] Seq[T]
 
 present[T](xs: Seq[T], x: T) -> bool = xs.contains(x)
 ```
+
+### Extensions
+
+An impl without `for` written outside the module of the type or trait it adds to is an
+**extension**. Every form above may be one: `impl string`, `impl[T: Ord] Seq[T]`,
+`impl[T] Option[Option[T]]`, `impl Box` for a class another module declares.
+
+```text
+// words/words.avin
+module words
+
+impl string
+    shout() -> string = s"${self}!"
+
+impl[T: Ord] Seq[T]
+    median() -> T = sorted().apply(length() / 2)
+
+// main.avin
+import words
+
+main() = print("hey".shout())       // hey!
+```
+
+- **An extension's methods are seen by its own module and by every file that imports the module**:
+  whole (`import a.b`, `import a.b as c`), or any declaration of it (`import a.b.X`,
+  `import a.b.{X, y}`). Nothing else is needed, and a file that imports neither does not see them:
+  a call there is an error naming the module that adds the method and saying the file does not
+  import it. The core library's impls are seen everywhere. Importing is per file, as for names.
+- **An extension adds methods, never meaning.** Its methods are not the type's: they reach no private
+  field or method of a type of another module, are in no method table, are not inherited as the
+  type's and are not overridden; a call is compiled for the receiver's static type, as the methods
+  added to a trait are. Inside them `self` is the receiver, and the type's public fields and methods
+  are in scope by bare name.
+- **A type's own methods are found first.** An extension's method with the name and parameter types
+  of a method the type has, its own or an inherited one, could never be called, and is an error where
+  it is declared; one with other parameter types overloads the type's. A method an extension adds to
+  a trait is passed over for a type that has one of its name and parameter types, as other methods
+  added to a trait are, so an extension never changes what an existing call means.
+- **Two extensions a file sees, from different modules**, that add a method of one name and
+  parameter types to types a receiver matches make a call of it on that receiver an error naming both
+  modules. Within one module the second is an error where it is declared.
+- **A `private` method of an extension is private to its module**: the module's other code calls it,
+  and a file importing the module does not.
+- **Infix calls, method values and calls through a bound see extensions as dotted calls do.** In
+  `middle[S: Seq[int]](xs: S) -> int = xs.median()`, `median` is found where `middle` is written,
+  so `middle`'s own file must see the extension; each instance calls it at its type arguments.
 
 ## object
 
@@ -751,6 +799,8 @@ main() = print(s"${circleArea(Circle(2))}")
   import, and a local, parameter or member of the enclosing class named like the module hides it.
   Importing `a.b` makes only `a.b` reachable, not its submodules; each module named in code is
   imported.
+- **Importing a module, or any declaration of it, also brings in the methods its
+  [extensions](#extensions) add**, so `"hey".shout()` works in every file that imports `words`.
 - **What a name means** is decided in that order: the file's module, then its imports, then the
   public declarations of the standard library's module `avin`, which every file sees without an
   import. The nearer hides the farther, whatever kind each declaration is. A program's own modules
