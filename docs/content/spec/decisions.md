@@ -486,16 +486,15 @@ Settled by the user on 2026-11-03:
 - `Deque[T]` is a ring over an array, doubling when full as a buffer does, its spare places zero
   bytes. `removeFirst()` and `removeLast()` return the element and trap on an empty deque, as
   `Buffer.remove` traps outside the buffer; `isEmpty()` is the test before them.
-
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-- Partial-function literal syntax, which the user has explicitly left undecided.
-
-## Proposed
-
+- A trait may declare `static` members, which belong to the implementing type rather than to a
+  value: `static zero() -> Self` in `Add`, `static one() -> Self` in `Mul`. Every impl gives them,
+  and they are called on a type, `int.zero()`, or on a bounded type parameter, `T.zero()`. `sum()`
+  and `product()` on the collections are written with them.
+- An `impl` may add methods to a trait (`impl[T] Seq[T]`, `impl[T: Display] Seq[T]`). Its methods
+  reach the value only through the trait's own methods, which are variance-checked, so, like the
+  methods an impl adds to a `data` type, they are not variance positions: `contains(element: T)`,
+  `indexOf`, `mkString`, `max` and `min` are written once on `Seq`, and generic code over `Seq[T]`
+  has them.
 - The form of a `for` with `yield` ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
   generators `pattern in source` separated by commas, each followed by any number of `if` guards,
   then `yield` and the value on the rest of the line or in an indented block; or the generators one
@@ -510,6 +509,16 @@ Settled by the user on 2026-11-03:
 - A generator's pattern must match every element, as in a `for` loop, rather than filtering out the
   elements it does not match. `return`, `break`, `continue` and `?` cannot leave a comprehension's
   guards or yielded value.
+
+**Deferred**
+
+- Public C interoperability. Until then, C is reached through Sysl.
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+- Partial-function literal syntax, which the user has explicitly left undecided.
+
+## Proposed
+
 - Running and testing (stage 10): `avin run <program> [-O0 | -O2] [-- args]` builds into
   `.avin/build/` in the program's directory, reuses the executable while nothing it was built from
   has changed, and exits with the program's status, or 128 and the signal's number for a trap. Its
@@ -533,12 +542,6 @@ Settled by the user on 2026-11-03:
   so a racing read sees some value written to that word, and a constructor ends with a release
   fence, so no thread sees an object without its header and constructor-set fields. Actors are
   scheduled onto a pool of these threads.
-- An `impl` adding methods to a trait (`impl[T] Seq[T]`, `impl[T: Display] Seq[T]`), which an impl
-  cannot do today. Its methods would reach the value only through the trait's own methods, which
-  are variance-checked, so, like the methods an impl adds to a `data` type, they would not be
-  variance positions: `contains(element: T)`, `indexOf`, `mkString` and `max`/`min` could then be
-  written once on `Seq` instead of on each sequence type, and generic code over `Seq[T]` would have
-  them.
 
 ## Open
 
