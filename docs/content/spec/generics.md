@@ -51,16 +51,23 @@ class SortedPair[T: Ordered](first: T, second: T)
   `drain[S: Source[A], A](s: S)` is from the source passed.
 - **A bound is a trait or a class**, and may name the declaration's other parameters. A trait whose
   methods mention `Self` is named only here, and in an impl's header.
-- **An impl's parameters are its type's**, and have the bounds the type declares; an impl writes
-  none of its own, since `impl[T: Show] Show for Box[T]` would make `Box[T]` conform for some type
-  arguments only.
+- **An impl's parameters are its type's**, and have the bounds the type declares. **An impl of a
+  trait may bound them further**, making the type conform only for the type arguments that meet the
+  bounds: with `impl[T: Ord] Ord for Box[T]`, a `Box[int]` is an `Ord` and a `Box[Plain]` is not. Each
+  type argument written or inferred for a bound is held to them, and the impl's methods have the
+  bounds' members. Such an impl is of a data type and of a trait that is only a bound, one that
+  mentions `Self`, as `Eq`, `Ord` and `Add` do; an impl of `Eq` or `Hash` may be bounded only by them,
+  since every type meets them. An impl adding methods to some type arguments only is not part of the
+  language.
 - **A call through a bound is direct**: each instance calls the implementation of its own type
   argument. Where the argument is a trait type or an open class, any conforming object may arrive,
   and the call goes through the object's method table as a call on that type does.
 - The bounds of a method's own type parameters are contravariant positions for its class's
   parameters, as its parameter types are.
-- Operators on a bounded `T` come with the core library's `Add`, `Ord` and `Eq`; until then a
-  bound gives `T` methods only.
+- **Operators on a bounded `T` come from its bounds**: `a + b` needs a bound that is `Add` or
+  requires it, `a < b` one that is `Ord`, and `a == b` one that is `Eq` (`Ord` requires `Eq`). Every
+  type meets `Eq` and `Hash`, so any type argument passes those bounds. In an instance at a built-in
+  type the operator is the machine's operation, as written outside generic code.
 
 ## Reification
 
@@ -149,6 +156,21 @@ infer is.
 - Local `val`/`var` types, lambda parameter and result types, and type arguments at calls and
   constructors are inferred from arguments **and** from the expected type. Within one function body,
   an inference variable may be settled by a later use.
+- A type argument of a call that neither its arguments nor its expected type decide stays unknown
+  until the end of the enclosing function body (a lambda's body is part of it), and the first use
+  that needs it settles it:
+  - a branch it joins: `if c then Some(x) else None` is an `Option[int]`, as is a `match` whose
+    other arms are, and a lambda's `None` takes the type of its other return paths;
+  - a store: `var best = None` then `best = Some(3)` makes `best` an `Option[int]`, from the body
+    or from a local function or lambda that assigns it;
+  - a use as a value of a known type: an argument, a value stored where its type is declared, an
+    operand of an arithmetic or comparison operator, or a value matched against a literal pattern.
+    `best match Some(b) if b >= i -> …` settles `b`, and with it `best`, as `i`'s type.
+
+  A later use that disagrees with an earlier one is an error at the later use. An unknown still open
+  at the end of the body is an error at the call that made it, asking for the type to be written. A
+  field declared without a type has its initializer's type at once, since any function may read it.
+  A type argument held to a bound is decided at its call.
 - Constraints are subtype constraints. A type variable collects lower and upper bounds and is solved
   to the least type that satisfies them, so `if c then dog else cat` is an `Animal`, and the branches
   of a `match` agree on their least upper bound.

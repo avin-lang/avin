@@ -161,6 +161,8 @@ struct VariantSymbol
     span: Span
     field_names: Buf[string]
     fields: Buf[&Type]
+    /** For each field, the function computing its value where a construction omits it. */
+    defaults: Buf[Option[usize]]
 
 /** A variant, by its data type's index and its own position among the type's variants. */
 struct VariantRef
@@ -264,6 +266,14 @@ struct ImplSymbol
      * holds only for type arguments that meet them. Empty for an impl without any. */
     conditions: Buf[Buf[&Type]]
 
+/** An unknown type argument of a call, open until a later use settles it: where it was made, and
+ * what to report if nothing does. */
+struct Unknown
+    var_id: usize
+    unit: usize
+    at: Span
+    message: string
+
 struct Checker
     units: Buf[SourceUnit]
     symbols: Buf[FunctionSymbol]
@@ -288,6 +298,8 @@ struct Checker
     body: BodyState
     /** The bindings of inference variables: `None` while a variable is unsolved. */
     vars: Buf[Option[&Type]]
+    /** The unknowns a call left open, for a later use in the body to settle. */
+    unknowns: Buf[Unknown]
     /** The type parameters in scope, and the generic function they belong to. */
     generic: Option[GenericScope]
     /** Whether the names a pattern binds are assignable: set while a `var` binding's pattern is
@@ -328,6 +340,9 @@ struct Checker
     private_names: Map[string, bool]
     /** The program's root module, which declares `main`. */
     root_module: string
+    /** The built-in types' conformances to traits, one for each impl of a trait for a built-in
+     * type. */
+    builtins: Buf[BuiltinConformance]
     /** The core library's operator and equality traits, found once every method is declared. */
     core: CoreTraits
 
@@ -460,7 +475,7 @@ private check_imports(c: *Checker, unit: usize)
  * unit is one of its files. Every file sees its own module's declarations, the names it imports and
  * the core library's public declarations, in that order: an inner name hides an outer one. */
 check_program(units: Buf[SourceUnit], root_module: string) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, CoreTraits(map(), map()))
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()))
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
     // Every type is named before any is used, so a data type may refer to itself or to one
@@ -517,11 +532,11 @@ check_program(units: Buf[SourceUnit], root_module: string) -> Checked
         settle_inherited_fields(&c, id)
         check_override_results(&c, id)
         check_class_variance(&c, id)
+    settle_unknowns(&c, 0)
     check_initialization(&c)
     for id in 0..<c.data.len()
         check_data_implementations(&c, id)
         check_data_variance(&c, id)
-    check_builtin_implementations(&c)
     check_equality_pairs(&c)
     for g in 0..<c.globals.len()
         settle_global(&c, g)
@@ -556,7 +571,7 @@ check_program(units: Buf[SourceUnit], root_module: string) -> Checked
     var sources: Buf[Source] = buf()
     for u in c.units
         sources.push(u.src)
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, id, init, c.core)))
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, id, init, c.builtins, c.core)))
 
 private declare_unit(c: *Checker, unit: usize)
     val file = c.units[unit].file
@@ -571,7 +586,7 @@ private declare_unit(c: *Checker, unit: usize)
                     for other in ids
                         if !c.symbols[other].constructor then set.push(other)
                 val id = c.symbols.len()
-                var symbol = signature(c, unit, file.module_name, f, id, f.type_params, false)
+                var symbol = signature(c, unit, file.module_name, f, id, f.type_params, false, None)
                 symbol.public = !file.private_items[i]
                 if same_as_overload(c, symbol, set)
                     c.note(unit, f.name_span, s"`${f.name}` is declared more than once with the same parameter types; overloads differ in their parameter types, and a function that chooses by its arguments' values is written with clauses")
@@ -817,18 +832,11 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
                 c.data[id].traits = traits
             Class(_, _, _) -> ()
             _ ->
-                // A built-in type conforms through its impls alone, each stated once.
-                for other in c.impls
-                    if other.trait_type is Some(o)
-                        if same_type(other.target, target) && conforms_directly(buf1(o), t)
-                            c.note(unit, written_trait_span(d), s"`$path` already conforms to `${type_name(t)}`; a conformance is stated once")
-                            return invalid
+                if conforms_directly(builtin_traits(c, target), t)
+                    c.note(unit, written_trait_span(d), s"`$path` already conforms to `${type_name(t)}`; a conformance is stated once")
+                    return invalid
+                c.builtins.push(BuiltinConformance(target, t, unit, d.target.span, buf()))
     ImplSymbol(unit, module_name, d, target, owner, trait_type, conditions)
-
-private buf1(t: &Type) -> Buf[&Type]
-    var out: Buf[&Type] = buf()
-    out.push(t)
-    out
 
 /** Whether class `k` is the one with qualified name `key`. */
 private is_class_named(c: *Checker, k: usize, key: string) -> bool = c.class_types.get(key) match
@@ -871,6 +879,13 @@ private conditional_impl_refused(c: *Checker, unit: usize, d: &ImplDecl, target:
             c.note(unit, at, s"an impl with bounds of its own is implemented for traits that are only bounds, which mention `Self`; `${type_name(t)}` is also a type")
             return true
     false
+
+/** The traits built-in type `t` conforms to through its impls. */
+private builtin_traits(c: *Checker, t: &Type) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    for b in c.builtins
+        if same_type(b.ty, t) then out.push(b.trait_type)
+    out
 
 /** Whether `traits` already holds the trait `t` names, with any type arguments. */
 private conforms_directly(traits: Buf[&Type], t: &Type) -> bool
@@ -925,15 +940,42 @@ private declare_variants(c: *Checker, unit: usize)
                     _ ->
                         c.note(unit, f.pattern.span, "a field is a name and a type")
                         names.push("_")
-                if f.default is Some(e) then c.note(unit, e.span, "default field values are not implemented")
                 fields.push(resolve_type(c, unit, f.ty))
             // A variant is a name of its type's module, private where its type is.
             val key = qualified(c.data[id].module_name, v.name)
             c.variants.put(key, VariantRef(id, variants.len()))
             if c.private_names.get(qualified(c.data[id].module_name, c.data[id].name)) is Some(_) then c.private_names.put(key, true)
-            variants.push(VariantSymbol(v.name, v.span, names, fields))
+            variants.push(VariantSymbol(v.name, v.span, names, fields, field_defaults(c, unit, id, v, names, fields)))
         c.data[id].variants = variants
         c.generic = outer_generic
+
+// The defaults of a variant's fields, as a constructor's: each a function of the fields before it,
+// sharing the data type's type parameters, called where a construction omits the field.
+private field_defaults(c: *Checker, unit: usize, id: usize, v: Variant, names: Buf[string], fields: Buf[&Type]) -> Buf[Option[usize]]
+    val d = c.data[id]
+    var defaults: Buf[Option[usize]] = buf()
+    for i in 0..<v.fields.len()
+        val value = v.fields[i].default match
+            Some(e) -> e
+            None ->
+                defaults.push(None)
+                continue
+        val did = c.symbols.len()
+        var params: Buf[&Type] = buf()
+        var param_names: Buf[string] = buf()
+        var decls: Buf[Param] = buf()
+        for k in 0..<i
+            params.push(fields[k])
+            param_names.push(names[k])
+            decls.push(v.fields[k])
+        val name = s"${v.name}/${names[i]}"
+        val decl = Function(buf(), value.span, v.fields[i].span, name, d.decl.type_params, decls, None, Some(value), buf())
+        c.symbols.push(FunctionSymbol(unit, d.module_name, name, decl, params, param_names, Some(fields[i]), None, None, buf(), buf(), buf(), false, false, false, buf(), Some(names[i]), data_owner(id), d.decl.type_params, None, false, true, "", None))
+        c.states.push(0)
+        c.bodies.push(None)
+        c.locals.push(buf())
+        defaults.push(Some(did))
+    defaults
 
 /** The type of an instance of a class, with the class's own parameters as its arguments: the type of
  * `self` in its constructor and methods. */
@@ -1418,7 +1460,7 @@ private declare_methods(c: *Checker, unit: usize)
             // In a trait, `Self` names the type implementing it.
             val outer_trait = c.self_trait
             if is_trait(c, id) then c.self_trait = Some(id)
-            var symbol = signature(c, file_unit, entry.module_name, f, class_owner(id), type_params, true)
+            var symbol = signature(c, file_unit, entry.module_name, f, class_owner(id), type_params, true, None)
             c.self_trait = outer_trait
             // The receiver comes first, named `self`. In a trait that mentions `Self`, it is a `Self`,
             // so the trait's methods can pass it where their parameters take one.
@@ -1489,7 +1531,13 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
             Class(t, _, _) -> Some(t)
             _ -> None
         None -> None
-    if f.annotations.len() > 0 then c.note(unit, f.name_span, "annotations on methods are not implemented")
+    // A built-in type's operations are intrinsics, so its impls may declare them; no other method
+    // takes an annotation.
+    val builtin = !(*target is Data(_, _, _))
+    for a in f.annotations
+        if a.name != "intrinsic" || !builtin || trait_id is Some(_)
+            c.note(unit, f.name_span, "annotations on methods are not implemented")
+            break
     if trait_id is Some(_) || overrides then refuse_override_defaults(c, unit, f)
     if trait_id is Some(t)
         if !trait_declares(c, t, f.name, 0)
@@ -1522,7 +1570,7 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
         type_params.push(tp)
     for tp in f.type_params
         type_params.push(tp)
-    var symbol = signature(c, unit, block.module_name, f, owner, type_params, false)
+    var symbol = signature(c, unit, block.module_name, f, owner, type_params, false, Some(target))
     // The receiver comes first, named `self`.
     var receiver_types: Buf[&Type] = buf()
     var receiver_names: Buf[string] = buf()
@@ -1682,7 +1730,7 @@ private declare_globals(c: *Checker, unit: usize)
                 if v.name == "_" || global_name_taken(c, unit, v.name, v.span, false) then continue
                 val f = Function(buf(), v.span, v.span, v.name, buf(), buf(), v.declared, Some(v.value), buf())
                 val init = c.symbols.len()
-                c.symbols.push(signature(c, unit, file.module_name, f, init, buf(), false))
+                c.symbols.push(signature(c, unit, file.module_name, f, init, buf(), false, None))
                 c.states.push(0)
                 c.bodies.push(None)
                 c.locals.push(buf())
@@ -1916,6 +1964,15 @@ private table_position(c: *Checker, k: usize, target: usize) -> Option[usize]
  * its superclass's, each as an instance of `t` sees it. A trait conformed to with two different type
  * argument lists appears twice. */
 private collect_traits(c: *Checker, t: &Type, out: *Buf[&Type])
+    if is_builtin(t)
+        for r in builtin_traits(c, t)
+            var seen = false
+            for i in 0..<out.len()
+                if same_type(out[i], r) then seen = true
+            if !seen
+                out.push(r)
+                collect_traits(c, r, out)
+        return
     if *t is Data(d, _, xs)
         for required in c.data[d].traits
             val r = substitute(required, data_owner(d), xs)
@@ -2137,6 +2194,16 @@ private place_traits(c: *Checker)
         data_conformed.push(ids)
         holders.push(ids)
         slot_counts.push(0)
+    // A built-in type's conformances are gathered under the first impl that names it.
+    var builtin_conformed: Buf[Buf[usize]] = buf()
+    for b in 0..<c.builtins.len()
+        var first = true
+        for e in 0..<b
+            if same_type(c.builtins[e].ty, c.builtins[b].ty) then first = false
+        val ids = if first then trait_ids(c, c.builtins[b].ty) else buf()
+        builtin_conformed.push(ids)
+        holders.push(ids)
+        slot_counts.push(0)
     var placed: Buf[bool] = buf()
     for _ in c.classes
         placed.push(false)
@@ -2163,6 +2230,46 @@ private place_traits(c: *Checker)
         if !is_trait(c, k) then ensure_table(c, k, conformed)
     for d in 0..<c.data.len()
         build_data_table(c, d, data_conformed[d])
+    for b in 0..<c.builtins.len()
+        build_builtin_table(c, b, builtin_conformed[b])
+
+// A built-in type's method table, kept by the first of its conformances: at each position of a
+// trait it conforms to, the method of the type's impl that implements it. A built-in value is no
+// object, so it cannot take a trait's default body, which is shared by objects of every conforming
+// type; its impl implements every method of the trait.
+private build_builtin_table(c: *Checker, b: usize, conformed: Buf[usize])
+    if conformed.len() == 0 then return
+    val ty = c.builtins[b].ty
+    val name_of = type_name(ty)
+    var size = 0usize
+    for t in conformed
+        val end = c.classes[t].base + c.classes[t].methods.len()
+        if end > size then size = end
+    var table: Buf[Option[usize]] = buf()
+    for _ in 0..<size
+        table.push(None)
+    for t in conformed
+        val methods = c.classes[t].methods
+        for j in 0..<methods.len()
+            if is_trait_override(c, methods[j]) then continue
+            // A built-in type has `==` and the hash already.
+            if is_universal(c, methods[j]) then continue
+            val name = c.symbols[methods[j]].decl.name
+            var own: Option[usize] = None
+            for m in c.builtin_methods
+                if own is None && same_type(c.symbols[m].receiver.unwrap(), ty) && same_method(c, ty, m, methods[j]) then own = Some(m)
+            own match
+                Some(m) ->
+                    inherit_defaults(c, m, methods[j])
+                    table.set(c.classes[t].base + j, Some(m))
+                None ->
+                    var at = b
+                    for e in 0..<c.builtins.len()
+                        if same_type(c.builtins[e].ty, ty) && *c.builtins[e].trait_type is Class(k, _, _)
+                            if k == t then at = e
+                    val what = if is_trait_field(c, methods[j]) then s"`val $name`, which a built-in type has no field to supply" else s"`$name`; a built-in type takes no default bodies, so its impl implements every method of the trait"
+                    c.note(c.builtins[at].unit, c.builtins[at].span, s"`$name_of` does not implement ${c.classes[t].name}'s $what")
+    c.builtins[b].table = table
 
 // A data type's method table: at each position of a trait it conforms to, the type's own method of
 // that name, which an impl of a trait declares, or else the trait's default body. Two different
@@ -2654,28 +2761,6 @@ private check_data_implementations(c: *Checker, id: usize)
             elif param_mismatch(c, self_type, m, base) is Some(text) then report_conformance(c, id, t, s"$described for `${c.data[id].name}`, $text")
             elif result_mismatch(c, self_type, m, base) is Some(text) then report_conformance(c, id, t, s"$described, $text")
 
-// A built-in type has no method table, so its impl of a trait implements every method of the trait
-// and of the traits it requires, defaults included; `equals` and `hash` it has already.
-private check_builtin_implementations(c: *Checker)
-    for block in c.impls
-        if *block.target is ErrorType || *block.target is Data(_, _, _) || *block.target is Class(_, _, _) then continue
-        val k = block.trait_type match
-            Some(t) -> *t match
-                Class(k, _, _) -> k
-                _ -> continue
-            None -> continue
-        var traits = trait_ids(c, own_class_type(c.classes[k], k))
-        if !contains_id(traits, k) then traits.push(k)
-        for t in traits
-            for tm in c.classes[t].methods
-                if is_universal(c, tm) || is_trait_override(c, tm) then continue
-                var found = false
-                for m in c.builtin_methods
-                    if same_type(c.symbols[m].receiver.unwrap(), block.target) && c.symbols[m].decl.name == c.symbols[tm].decl.name && c.symbols[m].params.len() == c.symbols[tm].params.len()
-                        found = true
-                if !found
-                    c.note(block.unit, written_trait_span(block.decl), s"`${type_name(block.target)}` does not implement `${c.symbols[tm].decl.name}` from `${c.classes[t].name}`; an impl for a built-in type implements every method of its trait, defaults included")
-
 // A type that implements one of `equals` and `hash` implements the other, so that equal values have
 // equal hashes.
 private check_equality_pairs(c: *Checker)
@@ -2775,8 +2860,9 @@ private contains_name(names: Buf[string], name: string) -> bool
     false
 
 // `owner` and `type_params` are the type parameters in scope in the signature: a function's own, or
-// for a method its class's and its own.
-private signature(c: *Checker, unit: usize, module_name: string, f: &Function, owner: usize, type_params: Buf[TypeParam], bodyless: bool) -> FunctionSymbol
+// for a method its class's and its own. `receiver` is the type an impl adds the method to, which an
+// intrinsic's declared type takes as its first parameter.
+private signature(c: *Checker, unit: usize, module_name: string, f: &Function, owner: usize, type_params: Buf[TypeParam], bodyless: bool, receiver: Option[&Type]) -> FunctionSymbol
     var params: Buf[&Type] = buf()
     var names: Buf[string] = buf()
     // A generic function's own type parameters are in scope in its signature.
@@ -2809,7 +2895,11 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
     if intrinsic is Some(name)
         intrinsic_signature(name) match
             Some(expected) ->
-                val declared: &Type = Function(params, result.unwrap_or(Unit))
+                var with_receiver: Buf[&Type] = buf()
+                if receiver is Some(r) then with_receiver.push(r)
+                for p in params
+                    with_receiver.push(p)
+                val declared: &Type = Function(with_receiver, result.unwrap_or(Unit))
                 if !same_type(declared, expected)
                     c.note(unit, f.name_span, s"intrinsic `$name` has type ${type_name(expected)}, not ${type_name(declared)}")
             None -> c.note(unit, f.name_span, s"`$name` is not an intrinsic")
@@ -2883,12 +2973,91 @@ private intrinsic_of(c: *Checker, unit: usize, f: &Function) -> Option[string]
         if f.body is Some(_) then c.note(unit, a.span, "an intrinsic function has no body")
     out
 
-/** The intrinsics the compiler implements, with the type each must be declared with. */
+/** The intrinsics the compiler implements, with the type each must be declared with. A method's
+ * type takes its receiver first. */
 intrinsic_signature(name: string) -> Option[&Type]
+    if name.starts_with("string_") then return string_intrinsic(name)
+    val found = intrinsic_entry(name)?
+    Some(Function(found.1, found.2))
+
+/** The runtime entry point an intrinsic calls, with its parameters and result. Each intrinsic is a
+ * call of one entry point, which takes the thread's context first and then the intrinsic's own
+ * arguments. */
+intrinsic_entry(name: string) -> Option[(string, Buf[&Type], &Type)]
+    var params: Buf[&Type] = buf()
+    var result: &Type = Unit
+    var entry = ""
     if name == "print_line"
-        var params: Buf[&Type] = buf()
+        entry = "avin_rt_print_line"
         params.push(Str)
-        return Some(Function(params, Unit))
+    elif name == "write_out"
+        entry = "avin_rt_write_out"
+        params.push(Str)
+    elif name == "write_int"
+        entry = "avin_rt_write_int"
+        params.push(Int(64))
+    elif name == "render_int"
+        entry = "avin_rt_render_int"
+        params.push(Int(64))
+        result = Str
+    elif name == "render_real"
+        entry = "avin_rt_render_real"
+        params.push(Real)
+        result = Str
+    elif name == "render_char"
+        entry = "avin_rt_render_char"
+        params.push(Char)
+        result = Str
+    elif name == "text_size"
+        entry = "avin_rt_text_size"
+        params.push(Str)
+        result = Int(64)
+    elif name == "text_width"
+        entry = "avin_rt_text_width"
+        params.push(Str)
+        result = Int(64)
+    elif name == "text_append"
+        entry = "avin_rt_text_append"
+        params.push(Str)
+        params.push(Int(64))
+        params.push(Str)
+        result = Str
+    elif name == "text_take"
+        entry = "avin_rt_text_take"
+        params.push(Str)
+        params.push(Int(64))
+        result = Str
+    elif name == "quote_text"
+        entry = "avin_rt_quote_text"
+        params.push(Str)
+        result = Str
+    elif name == "quote_char"
+        entry = "avin_rt_quote_char"
+        params.push(Char)
+        result = Str
+    else return None
+    Some((entry, params, result))
+
+// The string operations, which lowering expands in place. Each takes a string first, then these.
+private string_intrinsic(name: string) -> Option[&Type]
+    var params: Buf[&Type] = buf()
+    params.push(Str)
+    if name == "string_byte_length" then return Some(Function(params, Int(32)))
+    if name == "string_byte_at"
+        params.push(Int(32))
+        return Some(Function(params, Byte))
+    if name == "string_slice"
+        params.push(Int(32))
+        params.push(Int(32))
+        return Some(Function(params, Str))
+    if name == "string_find"
+        params.push(Str)
+        params.push(Int(32))
+        return Some(Function(params, Int(32)))
+    if name == "string_parse_real" then return Some(Function(params, Real))
+    if name == "string_repeat"
+        params.push(Int(32))
+        return Some(Function(params, Str))
     None
 
 // The bounds of the type parameter at `index` of `owner` are recorded under this key: the
@@ -2981,9 +3150,15 @@ private conforms_to_bound(c: *Checker, t: &Type, bound: &Type) -> bool
         _ ->
             // Every type compares and hashes, by value or by identity.
             if is_core_trait(c, k, "Eq") || is_core_trait(c, k, "Hash") then return true
+            if is_builtin(x)
+                var traits: Buf[&Type] = buf()
+                collect_traits(c, x, &traits)
+                for t in traits
+                    if conforms(t, zonk(c, bound)) then return true
+                return false
             ancestor_type(c.classes, c.data, x, k) match
                 Some(up) -> conforms(zonk(c, up), zonk(c, bound)) && conditions_hold(c, x, k)
-                None -> builtin_conforms(c, x, bound)
+                None -> false
 
 /** The core library's operator and equality traits and their methods, by name. */
 private find_core_traits(c: *Checker)
@@ -3010,18 +3185,6 @@ private is_universal(c: *Checker, m: usize) -> bool = c.core.is(m, "equals") || 
 private core_trait_type(c: *Checker, name: string) -> Option[&Type]
     val k = c.core.trait_named(name)?
     Some(own_class_type(c.classes[k], k))
-
-/** Whether the built-in type `t` conforms to `bound` through an impl, or through a trait one requires. */
-private builtin_conforms(c: *Checker, t: &Type, bound: &Type) -> bool
-    val k = *bound match
-        Class(k, _, _) -> k
-        _ -> return false
-    for block in c.impls
-        if block.trait_type is Some(tt)
-            if same_type(block.target, t)
-                if ancestor_type(c.classes, c.data, tt, k) is Some(up)
-                    if conforms(zonk(c, up), zonk(c, bound)) then return true
-    false
 
 // Whether a data type's conformance to trait `k` holds at its type arguments: an impl with bounds of
 // its own makes it conform only where they are met. Some impl reaching `k` must hold.
@@ -3253,8 +3416,11 @@ private check_function(c: *Checker, id: usize)
         var subjects: Buf[&TExpr] = buf()
         for i in 0..<symbol.params.len()
             subjects.push(TExpr(symbol.decl.name_span, symbol.params[i], Param(i)))
+        val mark = c.unknowns.len()
         if symbol.constructor then check_constructor(c, id, None)
         else check_definition(c, id, subjects)
+        // The body is over, so what its uses did not settle cannot be inferred.
+        settle_unknowns(c, mark)
         c.generic = outer_generic
         c.self_trait = outer_trait
         finish_captures(c)
@@ -3451,7 +3617,10 @@ private construct(c: *Checker, k: usize, upto: Option[usize])
             FieldMember(f) ->
                 val index = made.index
                 val declared = c.classes[k].fields[index].ty
+                val mark = c.unknowns.len()
                 val typed = check_expr(c, f.value, declared)
+                // A field's type is known where it is declared, since any function may read it.
+                if declared is None then settle_unknowns(c, mark)
                 declared match
                     Some(want) ->
                         if !fits(c,typed.ty, want) then c.note(unit, f.value.span, s"expected ${type_name(want)}, found ${type_name(typed.ty)}")
@@ -3573,7 +3742,7 @@ private declare_local_functions(c: *Checker, items: Buf[&Expr])
             for i in start..<c.body.functions.len()
                 if c.symbols[c.body.functions[i]].name == decl.name then set.push(c.body.functions[i])
             val id = c.symbols.len()
-            var symbol = signature(c, enclosing.unit, enclosing.module_name, decl, id, decl.type_params, false)
+            var symbol = signature(c, enclosing.unit, enclosing.module_name, decl, id, decl.type_params, false, None)
             symbol.root = Some(c.body.root)
             if same_as_overload(c, symbol, set)
                 c.note(unit_of(c), decl.name_span, s"`${decl.name}` is declared more than once in this block with the same parameter types")
@@ -3805,6 +3974,7 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Break(value) -> break_expr(c, e, value)
     Continue -> continue_expr(c, e)
     Return(value) -> return_expr(c, e, value)
+    Propagate(value) -> propagate_expr(c, e, value)
     Match(subject, arms) -> match_expr(c, e, subject, arms, expected, used)
     Is(value, pattern, negated) -> is_expr(c, e, value, pattern, negated)
     Lambda(params, body) -> lambda_expr(c, e, params, body, expected, false)
@@ -4081,7 +4251,8 @@ private abstract_constructor(c: *Checker, id: usize, at: Span) -> bool
 private binding_ref(c: *Checker, at: Span, name: string) -> Option[&TExpr]
     if lookup_local(c, name) is Some(index)
         if c.body.locals[index].owner != c.current then c.body.uses.push(CaptureUse(c.current, index, false))
-        return Some(TExpr(at, c.body.locals[index].ty, Local(index)))
+        // A local's type may have been settled by a use since it was declared.
+        return Some(TExpr(at, zonk(c, c.body.locals[index].ty), Local(index)))
     if param_index(c, name) is Some(i)
         if c.current != c.body.root then c.body.uses.push(CaptureUse(c.current, i, true))
         return Some(TExpr(at, c.symbols[c.body.root].params[i], Param(i)))
@@ -4836,7 +5007,9 @@ private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Ex
 // Arithmetic, bitwise and shift operators take two operands of one type and yield that type.
 // Integers have them all; reals have arithmetic; bytes have bitwise operators and shifts. `at` is
 // the whole operation, which diagnostics point at; `op_at` is its operator, where a trap is reported.
-private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: string, l: &TExpr, r: &TExpr) -> &TExpr
+private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: string, left: &TExpr, right: &TExpr) -> &TExpr
+    val l = settle_operand(c, left, right)
+    val r = settle_operand(c, right, l)
     if !settled(l.ty) || !settled(r.ty)
         // An operand that never finishes means the operation never finishes.
         val ty: &Type = if *l.ty is ErrorType || *r.ty is ErrorType then ErrorType else Nothing
@@ -4910,7 +5083,20 @@ private is_trait_type(c: *Checker, t: &Type) -> bool = *t match
     Class(id, _, _) -> is_trait(c, id)
     _ -> false
 
-private compare_link(c: *Checker, op: CompareOp, a: &TExpr, b: &TExpr)
+/** `operand` with its type as known now. An operand whose type is still unknown, such as the value
+ * a `Some(n)` pattern binds from a `var best = None`, takes the other operand's type: an operator
+ * is a use that settles it. */
+private settle_operand(c: *Checker, operand: &TExpr, other: &TExpr) -> &TExpr
+    val t = zonk(c, operand.ty)
+    if !(*t is Var(_)) then return if same_type(t, operand.ty) then operand else TExpr(operand.span, t, operand.kind)
+    val o = zonk(c, other.ty)
+    if *o is Var(_) || !settled(o) then return operand
+    unify(c, t, o)
+    TExpr(operand.span, o, operand.kind)
+
+private compare_link(c: *Checker, op: CompareOp, left: &TExpr, right: &TExpr)
+    val a = settle_operand(c, left, right)
+    val b = settle_operand(c, right, a)
     if !settled(a.ty) || !settled(b.ty) then return
     val at = a.span.to(b.span)
     val spelling = compare_spelling(op)
@@ -5013,15 +5199,37 @@ private interpolate_expr(c: *Checker, e: &Expr, prefix: string, chunks: Buf[stri
                     ty = Nothing
                     pieces.push(h)
                 ErrorType -> ok = false
-                _ ->
-                    c.note(unit, h.span, s"rendering a ${type_name(h.ty)} value is not implemented")
-                    ok = false
+                _ -> displayed(c, h) match
+                    Some(text) -> pieces.push(text)
+                    None -> ok = false
     if !ok then return TExpr(e.span, ErrorType, UnitConst)
     if pieces.len() == 0 then return TExpr(e.span, Str, StrConst(""))
     var out = pieces[0]
     for k in 1..<pieces.len()
         out = TExpr(e.span, ty, Arith(Add, out, pieces[k], e.span))
     if *ty is Nothing then TExpr(e.span, Nothing, out.kind) else out
+
+// A hole of a type other than the built-ins is rendered by its `Display` implementation, as
+// `h.toString()`. A type that does not implement `Display` cannot be interpolated.
+private displayed(c: *Checker, h: &TExpr) -> Option[&TExpr]
+    val unit = unit_of(c)
+    val t = zonk(c, h.ty)
+    if *t is Tuple(_)
+        c.note(unit, h.span, s"rendering a tuple is not implemented; interpolate its parts")
+        return None
+    val display = c.class_types.get(qualified(CoreModule, "Display")) match
+        Some(k) -> k
+        None ->
+            c.note(unit, h.span, "the core library declares no `Display`")
+            return None
+    if !conforms_to_bound(c, t, Class(display, "Display", buf()))
+        c.note(unit, h.span, s"`${type_name(t)}` does not implement `Display`, so it cannot be interpolated")
+        return None
+    val ms = methods_of(c, t, "toString")
+    if ms.len() == 0
+        c.note(unit, h.span, s"`${type_name(t)}` has no `toString`")
+        return None
+    Some(call_method(c, h.span, h.span, h, "toString", ms, buf(), None, None, false))
 
 // The type two branches agree on; where they have no nearest common superclass, the type expected
 // of them, when both conform to it: two classes conforming to one trait agree on the trait only
@@ -5039,6 +5247,9 @@ private join(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
     if *b is Nothing || *b is ErrorType then return Some(a)
     if same_type(a, b) then return Some(a)
     var current = zonk(c, a)
+    // An unknown branch, such as a `None` whose type argument is still open, takes the other's type.
+    if *current is Var(_) || *zonk(c, b) is Var(_)
+        return if unify(c, current, b) then Some(zonk(c, current)) else None
     if *current is Data(_, _, _) then return join_args(c, current, zonk(c, b))
     loop
         val k = *current match
@@ -5066,6 +5277,12 @@ private join_args(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
     for i in 0..<xs.len()
         if same_type(xs[i], ys[i])
             args.push(xs[i])
+            continue
+        // An argument still unknown on one side is settled as the other side's: the branches of
+        // `if c then Some(dog) else None` agree on `Option[Dog]`.
+        if *zonk(c, xs[i]) is Var(_) || *zonk(c, ys[i]) is Var(_)
+            if !unify(c, xs[i], ys[i]) then return None
+            args.push(zonk(c, xs[i]))
             continue
         if !(params[i].variance is Covariant) || !is_reference(xs[i]) || !is_reference(ys[i]) then return None
         args.push(join(c, xs[i], ys[i])?)
@@ -5096,7 +5313,12 @@ private upcast(c: *Checker, from: &Type, to: &Type) -> &Type
 /** Whether a value of type `from` may be used where `to` is expected: an instance of a subclass is an
  * instance of its superclass, and an instance of a generic type one of another instance as its
  * parameters' variance allows, also inside a tuple or a function type. */
-private fits(c: *Checker, from: &Type, to: &Type) -> bool = conforms(upcast(c, from, to), to)
+private fits(c: *Checker, from: &Type, to: &Type) -> bool
+    val up = upcast(c, from, to)
+    if conforms(up, zonk(c, to)) then return true
+    // A use settles what is still unknown: an `Option[_]` stored where an `Option[int]` is
+    // expected is one.
+    if has_unknowns(zonk(c, up)) || has_unknowns(zonk(c, to)) then unify(c, up, to) else false
 
 private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[&Expr], expected: Option[&Type], used: bool) -> &TExpr
     val cond = check_expr(c, condition, Some(Bool))
@@ -5241,6 +5463,95 @@ private return_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
             else c.note(unit, e.span, s"`${symbol.name}` uses `return`, so it needs a declared result type")
             if value is Some(v) then typed = Some(check_expr(c, v, None))
     TExpr(e.span, Nothing, Return(typed))
+
+/** The core library's data type `name`, by its index, unless a program has none. */
+private core_data(c: *Checker, name: string) -> Option[usize]
+    for i in 0..<c.data.len()
+        if c.data[i].module_name == "avin" && c.data[i].name == name then return Some(i)
+    None
+
+/** The position of the variant `name` among the variants of the data type `d`. */
+private variant_index(c: *Checker, d: usize, name: string) -> usize
+    for i in 0..<c.data[d].variants.len()
+        if c.data[d].variants[i].name == name then return i
+    0
+
+// `value?` takes an `Option` or a `Result` apart: a `Some` or an `Ok` yields its value, and a `None`
+// or an `Err` returns from the enclosing function, which must yield an `Option` or a `Result` with an
+// error type the failure's conforms to. It checks as the `match` it means, whose failure arm makes a
+// fresh `None` or an `Err` of the function's own result type, so the error is passed on unchanged.
+private propagate_expr(c: *Checker, e: &Expr, value: &Expr) -> &TExpr
+    val unit = unit_of(c)
+    val s = check_expr(c, value, None)
+    val ty = zonk(c, s.ty)
+    if *ty is ErrorType then return TExpr(e.span, ErrorType, UnitConst)
+    val option = core_data(c, "Option")
+    val result = core_data(c, "Result")
+    var is_option = false
+    var args: Buf[&Type] = buf()
+    var d = 0usize
+    *ty match
+        Data(id, _, xs) ->
+            val is_result = result match
+                Some(r) -> id == r
+                None -> false
+            if option is Some(o) && id == o then is_option = true
+            elif !is_result
+                c.note(unit, value.span, s"`?` takes apart an Option or a Result, not ${type_name(ty)}")
+                return TExpr(e.span, ErrorType, UnitConst)
+            d = id
+            args = xs
+        _ ->
+            c.note(unit, value.span, s"`?` takes apart an Option or a Result, not ${type_name(ty)}")
+            return TExpr(e.span, ErrorType, UnitConst)
+    val symbol = c.symbols[c.current]
+    if symbol.delayed
+        c.note(unit, e.span, "`?` cannot return from a delayed argument, which is evaluated where its parameter is read")
+        return TExpr(e.span, ErrorType, UnitConst)
+    if symbol.constructor
+        c.note(unit, e.span, "`?` cannot return from a class body, which runs to its end to make the object")
+        return TExpr(e.span, ErrorType, UnitConst)
+    val declared = symbol.result match
+        Some(r) -> zonk(c, r)
+        None ->
+            if symbol.lambda then c.note(unit, e.span, "this lambda uses `?`, so its result type must be known where it is written, as in `val f: (string) -> Option[int] = …`")
+            else c.note(unit, e.span, s"`${symbol.name}` uses `?`, so it needs a declared result type")
+            return TExpr(e.span, ErrorType, UnitConst)
+    if *declared is ErrorType then return TExpr(e.span, ErrorType, UnitConst)
+    val wanted = if is_option then "an Option" else "a Result"
+    var failure: Buf[&Type] = buf()
+    *declared match
+        Data(id, _, xs) if id == d -> failure = xs
+        _ ->
+            c.note(unit, e.span, s"`?` on ${type_name(ty)} returns ${if is_option then "`None`" else "the `Err`"} from ${described(symbol)}, which yields ${type_name(declared)}, not $wanted")
+            return TExpr(e.span, ErrorType, UnitConst)
+    // The value's own local and the failure's are hidden from the program's names.
+    val held = c.body.locals.len()
+    c.body.locals.push(TLocal("?value", args[0], false, c.current))
+    var success: Buf[&TPattern] = buf()
+    success.push(TPattern(e.span, args[0], PBind(held)))
+    var arms: Buf[TArm] = buf()
+    if is_option
+        arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "Some"), success)), None, TExpr(e.span, args[0], Local(held))))
+        val none = TExpr(e.span, declared, Construct(variant_index(c, d, "None"), buf()))
+        arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "None"), buf())), None, TExpr(e.span, Nothing, Return(Some(none)))))
+        return TExpr(e.span, args[0], Match(s, arms))
+    val error = zonk(c, args[1])
+    val passed = zonk(c, failure[1])
+    if !fits(c, error, passed)
+        c.note(unit, e.span, s"`?` passes on an error of ${type_name(error)}, but ${described(symbol)} yields errors of ${type_name(passed)}; convert it first with `mapErr`")
+        return TExpr(e.span, ErrorType, UnitConst)
+    val caught = c.body.locals.len()
+    c.body.locals.push(TLocal("?error", error, false, c.current))
+    var failed: Buf[&TPattern] = buf()
+    failed.push(TPattern(e.span, error, PBind(caught)))
+    var fields: Buf[&TExpr] = buf()
+    val read = TExpr(e.span, error, Local(caught))
+    fields.push(if *passed is AnyType then to_any(c, read) else read)
+    val err = TExpr(e.span, declared, Construct(variant_index(c, d, "Err"), fields))
+    arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "Ok"), success)), None, TExpr(e.span, args[0], Local(held))))
+    arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "Err"), failed)), None, TExpr(e.span, Nothing, Return(Some(err)))))
+    TExpr(e.span, args[0], Match(s, arms))
 
 // A call to a generic function solves for its type arguments: they may be written (`f[int](x)`),
 // and otherwise each starts as an unknown that the expected result type and the arguments decide.
@@ -5805,10 +6116,7 @@ private construct(c: *Checker, at: Span, name_span: Span, v: VariantRef, args: B
     val d = c.data[v.data]
     val variant = d.variants[v.index]
     val called = variant.fields.len() > 0
-    var defaults: Buf[Option[usize]] = buf()
-    for _ in variant.fields
-        defaults.push(None)
-    val signature = Signature(variant.name, called, d.decl.type_params, data_owner(v.data), variant.fields, variant.field_names, defaults, own_type(d, v.data), buf(), None)
+    val signature = Signature(variant.name, called, d.decl.type_params, data_owner(v.data), variant.fields, variant.field_names, variant.defaults, own_type(d, v.data), buf(), None)
     val applied = apply(c, at, name_span, signature, args, explicit, expected, buf())
     applied.wrap(at, Construct(v.index, applied.args))
 
@@ -5976,15 +6284,29 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     for i in 0..<type_args.len()
         val t = zonk(c, type_args[i])
         // An unknown that belongs to an enclosing call, as in `f(None, 'z')`, is that call's to
-        // settle, and code generation reads its final solution.
+        // settle, and code generation reads its final solution. One of this call's own is left
+        // open for a later use in the body to settle, as `best = Some(3)` settles `var best = None`,
+        // unless its parameter has bounds, which the type argument is held to here.
         var mine = false
         if *t is Var(v) then mine = v >= first
         if mine && *t is Var(v)
             val subject = if called then s"this call to `$name`" else s"this `$name`"
-            val example = if called then s"`$name[int](…)`" else s"`$name[int]`"
-            c.note(unit, name_span, s"cannot infer `${type_params[i].name}` for $subject; write it, as in $example")
-            c.vars.set(v, Some(ErrorType))
-            solved.push(ErrorType)
+            // Written type arguments fill a leading prefix, so the example spells every one up to
+            // the unsettled parameter: those already settled by their types, the others by name.
+            var written = ""
+            for j in known.len()..<i
+                val before = zonk(c, type_args[j])
+                val text = if *before is Var(_) then type_params[j].name else type_name(before)
+                written = written + text + ", "
+            val example = if called then s"`$name[${written}int](…)`" else s"`$name[${written}int]`"
+            val message = s"cannot infer `${type_params[i].name}` for $subject; write it, as in $example"
+            if bounds_at(c, owner, type_params, i).len() == 0
+                c.unknowns.push(Unknown(v, unit, name_span, message))
+                solved.push(t)
+            else
+                c.note(unit, name_span, message)
+                c.vars.set(v, Some(ErrorType))
+                solved.push(ErrorType)
         else solved.push(t)
     // The type arguments written or inferred conform to their parameters' bounds; those the receiver
     // gives were held to them where its type was made.
@@ -6689,7 +7011,9 @@ private pattern_constant(c: *Checker, value: &Expr, ty: &Type) -> &TExpr
         return TExpr(value.span, ErrorType, UnitConst)
     val t = check_expr(c, value, Some(ty))
     if !settled(t.ty) || !settled(ty) then return TExpr(t.span, ErrorType, UnitConst)
-    if !same_type(t.ty, ty)
+    // Matching a value whose type is still unknown against a literal settles it as the literal's.
+    if *zonk(c, ty) is Var(_) then unify(c, ty, t.ty)
+    if !same_type(t.ty, zonk(c, ty))
         c.note(unit, value.span, s"this pattern is ${type_name(t.ty)}, but the value it matches is ${type_name(ty)}")
         return TExpr(t.span, ErrorType, UnitConst)
     t
@@ -6737,6 +7061,16 @@ private unify(c: *Checker, a: &Type, b: &Type) -> bool
             Class(j, _, ys) -> i == j && unify_all(c, xs, ys)
             _ -> false
         _ -> same_type(x, y)
+
+/** Reports each unknown left open since `mark` that no use has settled, at the call that made it,
+ * and settles it as the error type so nothing reports it again. */
+private settle_unknowns(c: *Checker, mark: usize)
+    for i in mark..<c.unknowns.len()
+        val u = c.unknowns[i]
+        if *zonk(c, Var(u.var_id)) is Var(v)
+            c.note(u.unit, u.at, u.message)
+            c.vars.set(v, Some(ErrorType))
+    c.unknowns.truncate(mark)
 
 /** Settles every unknown in `t` as the error type. */
 private poison(c: *Checker, t: &Type)

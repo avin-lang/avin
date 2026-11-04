@@ -79,6 +79,32 @@ conforms to traits through `impl` (`Eq`, `Hash`, `Ord`, `Display`). A type patte
   (`s"${x}"`) or `x.toString()`, both of which use `Display`.
 - Ordering is by code point, which for UTF-8 is byte order.
 
+The library's methods on `string`. Offsets and lengths count bytes and are `int`; a string holds at
+most the largest `int` bytes.
+
+| Method | Result |
+| --- | --- |
+| `byteLength()` | The number of bytes, O(1) |
+| `charCount()` | The number of characters, O(n) |
+| `isEmpty()`, `nonEmpty()` | Whether it has no bytes, or some |
+| `startsWith(p)`, `endsWith(p)`, `contains(p)` | Whether `p` occurs at the start, the end, anywhere; the empty string occurs in every string |
+| `slice(from, until)` | The bytes from `from` up to `until`; traps unless `0 <= from <= until <= byteLength()` and both offsets are character boundaries |
+| `toUpper()`, `toLower()` | Each character's simple case mapping, one character for one: `"straße".toUpper()` is `STRAßE` |
+| `trim()`, `trimStart()`, `trimEnd()` | Without the Unicode `White_Space` characters at both ends, the start, the end |
+| `repeat(n)` | `n` copies joined; empty for zero; traps when `n` is negative |
+| `replace(old, new)` | Every occurrence of `old`, left to right and not overlapping, replaced by `new`; an empty `old` occurs nowhere |
+| `indexOf(p)`, `indexOf(p, from)` | `Some` of the byte offset of the first `p`, at or after `from` (default 0; below 0 counts as 0); `None` when there is none or `from` is past the end. The empty string is found at `from` |
+| `lastIndexOf(p)` | `Some` of the byte offset of the last `p`; `None` when there is none. The empty string is found at `byteLength()` |
+| `toInt()`, `toLong()` | `Some` of the number written in decimal: an optional `-` or `+`, then one or more ASCII digits and nothing else; `None` otherwise, or when it does not fit the type |
+| `toReal()` | `Some` of the number written as a decimal fraction, correctly rounded: an optional sign, digits with an optional point, an optional exponent (`3.25`, `-.5`, `1e10`); `None` for anything else, including white space, `nan`, `inf`, hexadecimal, and a number too large to be finite |
+
+```text
+val word = "café"
+print(s"${word.byteLength()} ${word.charCount()}")   // 5 4
+print(word.slice(3, 5))                               // é
+print(word.slice(0, 4))                               // traps: offset 4 is inside `é`
+```
+
 ## unit
 
 `unit` has the single value `()`. It is an ordinary type: it can be a type argument, a field, a

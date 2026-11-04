@@ -173,8 +173,10 @@ lower_program(program: TProgram) -> MirProgram
     // variables.
     l.records.push(TypeRecord("a closure or a captured variable", buf(), None, None))
     l.record_types.push(Unit)
+    // The core library's functions are compiled only as the program reaches them, so a program
+    // carries none of the library it does not use, and builds no shim for a binding it never calls.
     for i in 0..<program.symbols.len()
-        if !is_generic(program, i) && !never_compiled(program, i) then instance(&l, i, buf())
+        if !is_generic(program, i) && !never_compiled(program, i) && !in_core_library(program, i) then instance(&l, i, buf())
     val entry = instance(&l, program.entry, buf())
     val init: Option[usize] = program.init match
         Some(id) -> Some(instance(&l, id, buf()))
@@ -201,6 +203,11 @@ lower_program(program: TProgram) -> MirProgram
                 if b.shim == shim then seen = true
             if !seen then bindings.push(MirBinding(shim, target, symbol.name, symbol.params, symbol.result.unwrap_or(Unit), symbol.unit, symbol.decl.name_span))
     MirProgram(functions, l.strings, l.descriptors, l.records, l.closures, l.traps, global_types, entry, init, bindings)
+
+/** Whether a function belongs to the core library's module, `avin`, or one under it. */
+private in_core_library(program: TProgram, id: usize) -> bool
+    val m = program.symbols[id].module_name
+    m == "avin" || m.starts_with("avin.")
 
 /** Whether a function has no code: an abstract method, or an abstract class's or a trait's constructor. */
 private never_compiled(program: TProgram, id: usize) -> bool
@@ -289,11 +296,17 @@ private method_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
         table.push(Some(instance(l, m, implementation_args(l, t, m))))
     table
 
-/** The checker's method table of class or data type `t`: the method at each position. */
+/** The checker's method table of class, data or built-in type `t`: the method at each position. */
 private checker_table(l: *Lowering, t: &Type) -> Buf[Option[usize]] = *t match
     Class(k, _, _) -> l.program.classes[k].table
     Data(d, _, _) -> l.program.data[d].table
-    _ -> buf()
+    _ -> builtin_table(l, t)
+
+/** A built-in type's table, which the first of its conformances keeps. */
+private builtin_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
+    for b in l.program.builtins
+        if same_type(b.ty, t) then return b.table
+    buf()
 
 /** The type arguments of the class or trait declaring method `m` as a value of `t` sees them, or for
  * a method an impl adds to a data type, the value's own: the leading type arguments of the instance
@@ -785,8 +798,11 @@ private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr],
             op match
                 Some(v) -> operands.push(v)
                 None -> return None
-    // A local function also receives what it captures, from where the caller keeps it.
+    // A string operation is lowered where it is called, so its checks report the call's place.
     val callee = l.program.symbols[function]
+    if callee.intrinsic is Some(name)
+        if name.starts_with("string_") then return intrinsic_operation(l, name, operands, e.span)
+    // A local function also receives what it captures, from where the caller keeps it.
     for x in callee.captured_locals
         if l.local_slots[x] is Some(p) then operands.push(p.address)
     for x in callee.captured_params
@@ -817,16 +833,6 @@ private bound_call(l: *Lowering, e: &TExpr, function: usize, slot: Option[usize]
         Some(s) -> s
         None -> return direct_call(l, e, function, args, type_args)
     val receiver = concrete(l, args[0].ty)
-    // A built-in type has no method table: its impl's method is called.
-    if is_builtin(receiver)
-        val m = builtin_implementation(l, receiver, function) match
-            Some(m) -> m
-            None -> return unreachable_call(l, args)
-        var own_args: Buf[&Type] = buf()
-        val own = l.program.symbols[function].decl.type_params.len()
-        for i in type_args.len() - own..<type_args.len()
-            own_args.push(concrete(l, type_args[i]))
-        return direct_call(l, e, m, args, own_args)
     if *receiver is Class(k, _, _)
         if l.program.classes[k].decl.modifier != "" then return dispatch(l, function, position, args, type_args)
     val entries = checker_table(l, receiver)
@@ -1070,18 +1076,77 @@ shim_symbol(function: string) -> string
     from_utf8_unchecked(out.view())
 
 // An intrinsic is a function like any other in the object file; its body is the operation the
-// intrinsic names, so it can be called directly and, later, passed as a value.
+// intrinsic names, so it can be passed as a value. A direct call of a string operation is lowered in
+// place instead, so a value of one reports its checks at the intrinsic's declaration.
 private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
     val name = symbol.intrinsic.unwrap_or("")
-    if name == "print_line"
-        var args: Buf[Operand] = buf()
-        args.push(Value(0))
-        var params: Buf[MirType] = buf()
-        params.push(MRef)
-        l.insts.push(Call(None, Runtime("avin_rt_print_line", MirSignature(params, None)), args))
-        finish(l, Return(None))
+    if name.starts_with("string_")
+        var operands: Buf[Operand] = buf()
+        for i in 0..<symbol.params.len()
+            operands.push(Value(i))
+        val result = intrinsic_operation(l, name, operands, symbol.decl.name_span)
+        finish(l, Return(result))
         return
-    finish(l, Unreachable)
+    // Every other intrinsic calls one runtime entry point.
+    val found = intrinsic_entry(name) match
+        Some(f) -> f
+        None ->
+            finish(l, Unreachable)
+            return
+    var args: Buf[Operand] = buf()
+    var params: Buf[MirType] = buf()
+    for i in 0..<found.1.len()
+        if machine(l, found.1[i]) is Some(t)
+            if l.param_values[i] is Some(v) then args.push(Value(v))
+            params.push(t)
+    val result = machine(l, found.2)
+    val dest = result match
+        Some(t) -> Some(fresh(l, t))
+        None -> None
+    l.insts.push(Call(dest, Runtime(found.0, MirSignature(params, result)), args))
+    finish(l, Return(dest match
+        Some(id) -> Some(Value(id))
+        None -> None))
+
+/** The bytes of a string's header, its length, before its UTF-8 bytes. */
+private const TextHeader: usize = 8
+
+// The string operations. A string's length is a 64-bit word at its start, but no string is longer
+// than the largest `int`, so byte offsets and lengths are `int`. An offset compared unsigned against
+// a length is out of range when negative too.
+private intrinsic_operation(l: *Lowering, name: string, args: Buf[Operand], at: Span) -> Option[Operand]
+    val s = args[0]
+    if name == "string_byte_length" then return Some(byte_length(l, s))
+    if name == "string_byte_at"
+        trap_if(l, compare(l, CmpUge, args[1], byte_length(l, s)), "byte offset out of range", at)
+        val bytes = fresh(l, MPtr)
+        l.insts.push(Offset(bytes, s, TextHeader))
+        val address = fresh(l, MPtr)
+        l.insts.push(Index(address, Value(bytes), args[1]))
+        val b = fresh(l, MInt(8))
+        l.insts.push(Load(b, Value(address)))
+        return Some(Value(b))
+    if name == "string_slice"
+        // The runtime answers no string when an offset falls inside a character.
+        trap_if(l, compare(l, CmpUgt, args[2], byte_length(l, s)), "slice out of range", at)
+        trap_if(l, compare(l, CmpUgt, args[1], args[2]), "slice out of range", at)
+        val part = runtime_call(l, "avin_rt_string_slice", [MRef, MInt(32), MInt(32)], MRef, [s, args[1], args[2]])
+        trap_if(l, compare(l, CmpEq, part, NullAddress), "slice offset is not a character boundary", at)
+        return Some(part)
+    if name == "string_find"
+        return Some(runtime_call(l, "avin_rt_string_find", [MRef, MRef, MInt(32)], MInt(32), [s, args[1], args[2]]))
+    if name == "string_parse_real"
+        return Some(runtime_call(l, "avin_rt_string_parse_real", [MRef], MReal, [s]))
+    if name == "string_repeat"
+        trap_if(l, compare(l, CmpLt, args[1], ConstInt(32, "0")), "negative repeat count", at)
+        return Some(runtime_call(l, "avin_rt_string_repeat", [MRef, MInt(32)], MRef, [s, args[1]]))
+    None
+
+/** The length in bytes of the string `s`, as an `int`. */
+private byte_length(l: *Lowering, s: Operand) -> Operand
+    val word = fresh(l, MInt(64))
+    l.insts.push(Load(word, s))
+    convert_op(l, Truncate, MInt(32), Value(word))
 
 private new_block(l: *Lowering) -> usize
     val id = l.blocks.len()
@@ -1809,9 +1874,6 @@ private is_machine_scalar(t: &Type) -> bool = *t match
     Str -> true
     _ -> false
 
-/** Whether `t` is a built-in type, which has no method table. */
-private is_builtin(t: &Type) -> bool = is_machine_scalar(t) || *t is Unit
-
 /** Whether a value of type `t` may be of any of several types at run time, so its operators and its
  * equality are decided by the object: `Any`, a trait, an open or abstract class, and a trait's `Self`
  * in the trait's shared default bodies. */
@@ -1885,11 +1947,7 @@ private operator_call(l: *Lowering, t: &Type, name: string, args: []Operand, res
 private operator_values(l: *Lowering, t: &Type, name: string, values: Buf[Operand], result: Option[MirType]) -> Option[Operand]
     val m = l.program.core.method_named(name).unwrap()
     if decided_at_run_time(l, t) then return dispatch_operands(l, core_position(l, m), values, result)
-    var target: Option[usize] = None
-    if is_builtin(t)
-        if builtin_implementation(l, t, m) is Some(s) then target = Some(instance(l, s, buf()))
-    else target = explicit_implementation(l, t, m)
-    target match
+    explicit_implementation(l, t, m) match
         Some(index) -> call_instance(l, index, values, result)
         None ->
             // An instance the checker never lets run: a conditional impl's method at type
@@ -1908,24 +1966,6 @@ private explicit_implementation(l: *Lowering, t: &Type, m: usize) -> Option[usiz
     val symbol = l.program.symbols[x]
     if is_abstract_method(symbol) || symbol.decl.name != l.program.symbols[m].decl.name then return None
     Some(instance(l, x, implementation_args(l, t, x)))
-
-/** The method of a built-in type's impl that implements trait method `m`. */
-private builtin_implementation(l: *Lowering, t: &Type, m: usize) -> Option[usize]
-    val name = l.program.symbols[m].decl.name
-    val arity = l.program.symbols[m].params.len()
-    for s in 0..<l.program.symbols.len()
-        val symbol = l.program.symbols[s]
-        if symbol.receiver is Some(r)
-            if same_type(r, t) && symbol.decl.name == name && symbol.params.len() == arity then return Some(s)
-    None
-
-/** A call in an instance the checker never lets run: its arguments are evaluated, and nothing
- * follows. */
-private unreachable_call(l: *Lowering, args: Buf[&TExpr]) -> Option[Operand]
-    for a in args
-        lower_expr(l, a)
-    leave(l, Unreachable)
-    None
 
 private call_instance(l: *Lowering, index: usize, operands: Buf[Operand], result: Option[MirType]) -> Option[Operand]
     val dest = result match
