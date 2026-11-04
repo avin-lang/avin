@@ -303,6 +303,11 @@ a decision changes, this page and the chapter change together.
 - An interpolated string is a method call on `StringContext`: `p"a $x b"` is
   `StringContext(["a ", " b"]).p(x)`. `s`, `f` and `raw` are library methods, and a program defines
   its own interpolator by implementing a trait for `StringContext`.
+- A user-defined interpolator is visible where it is imported (settled by the user, 2026-11-04): in
+  the module that declares it, in a file importing that module whole, and in a file importing one of
+  its declarations by name. `s`, `f` and `raw` need no import. A module that merely imports another
+  does not pass its interpolators on, and using one that is not in scope is an error naming the
+  module to import.
 - Interpolated literals follow Scala's lexing (settled 2026-11-04). A backslash and a `"` or
   `\` after it are skipped as a pair, so `raw"a\"b"` holds `a\"b`, `raw"a\"` is unterminated and
   `raw"a\\"` ends, holding two backslashes; `$"` is a double quote and `$$` a dollar sign in every interpolator. The lexer reads

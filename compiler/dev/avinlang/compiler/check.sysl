@@ -7884,8 +7884,8 @@ private operator_conforms(c: *Checker, at: Span, spelling: string, t: &Type, tra
 private interpolate_expr(c: *Checker, e: &Expr, prefix: string, chunks: Buf[string], parts: Buf[string], holes: Buf[&Expr], expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
     if prefix != "s" && prefix != "f"
-        if !names_interpolator(c, prefix)
-            c.note(unit, e.span, s"`$prefix\"…\"` names no interpolator: `StringContext` has no method `$prefix` here")
+        val found = interpolators_named(c, e.span, prefix)
+        if found.len() == 0
             for h in holes
                 check_statement(c, h)
             return TExpr(e.span, ErrorType, UnitConst)
@@ -8157,14 +8157,31 @@ private count_hole_fits(c: *Checker, hole: Option[&TExpr]) -> bool
     c.note(unit_of(c), h.span, s"a width or precision written as a hole is a count, so it has to be an integer, but this one has type `${type_name(t)}`")
     false
 
-// Whether `StringContext` has a method `name` that this unit can call: one of the core library's,
-// or one an imported trait's impl gives it.
-private names_interpolator(c: *Checker, name: string) -> bool
+// The interpolators `name` this unit may use: the methods of `StringContext` called `name` that are
+// the core library's, or are declared in this file's module or one it imports, whole or by a name. Where
+// there are none, the error is reported here, naming the module to import where one declares it, and
+// the list is empty.
+private interpolators_named(c: *Checker, at: Span, name: string) -> Buf[usize]
+    var seen: Buf[usize] = buf()
     val id = c.types.get(qualified(CoreModule, "StringContext")) match
         Some(k) -> k
-        None -> return false
+        None -> return seen
     val ty = Data(id, "StringContext", buf())
-    with_trait_methods(c, ty, name, visible_methods(c, receiver_methods(c, ty, name))).len() > 0
+    val unit = unit_of(c)
+    var elsewhere: Buf[string] = buf()
+    for m in with_trait_methods(c, ty, name, visible_methods(c, receiver_methods(c, ty, name)))
+        val home = c.symbols[m].module_name
+        if home == CoreModule || sees_module(c, unit, home) then seen.push(m)
+        else
+            var known = false
+            for h in elsewhere
+                if h == home then known = true
+            if !known then elsewhere.push(home)
+    if seen.len() > 0 then return seen
+    if elsewhere.len() > 0
+        c.note(unit, at, s"the interpolator `$name\"…\"` is declared in ${module_label(elsewhere[0])}, which this file does not import; add `import ${elsewhere[0]}`")
+    else c.note(unit, at, s"`$name\"…\"` names no interpolator: `StringContext` has no method `$name` here")
+    seen
 
 // `StringContext([parts…]).prefix(holes…)`, naming the core library's `StringContext` whatever the
 // file calls its own declarations.
