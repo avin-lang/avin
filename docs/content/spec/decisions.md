@@ -243,6 +243,17 @@ a decision changes, this page and the chapter change together.
   (and a map's `keysIteratorFrom` and `valuesIteratorFrom`), and `reverseIterator`, which the
   reference's sorted collections lack and which is kept; the tree is balanced by weight, each side
   at most three times the other.
+- Settled by the user 2026-11-04: the elementary functions are a module, `avin.math` ([system library](/spec/system-library/#avin-math)),
+  with the reference library's names, called as `math.sqrt(x)` after `import avin.math` or imported
+  by name: `Pi` and `E`; `sqrt`, `cbrt`, `exp`, `expm1`, `log` (natural), `log10`, `log1p`, `pow`,
+  `hypot`; `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2(y, x)`, `sinh`, `cosh`, `tanh`;
+  `floor`, `ceil`, `rint` (ties to even), `abs`, `max`, `min` (NaN when either is, `-0.0` below
+  `0.0`), `signum`, `toRadians` and `toDegrees`. All take and give `real`, follow IEEE 754 and
+  never trap: `sqrt(-1.0)` is NaN, `log(0.0)` negative infinity. Not methods on `real`, and no
+  integer overloads of `abs`, `max` and `min` yet; the reference's `round`, which answers a `long`,
+  is left out until real-to-integer rounding is decided with the conversions. Bindings: one
+  runtime function per function, over the methods of Sysl's `Float` on `real`, since a binding names
+  a function and these are methods.
 - A generic overload is compared by the same rule as any other: `f(x: int)` is more specific than
   `f[T](x: T)`, which accepts an `int` while `f(int)` does not accept a `T`.
 - Whether a parameter is by-name does not distinguish overloads. An argument some candidate takes by
@@ -1369,17 +1380,6 @@ Settled by the user on 2026-11-04:
     `threads.blocking(body)` and `threads.sleep(d)`. There is no `failed` or `filter`, since a future
     carries no failure. Bindings: none beyond a runtime timed wait for `sleep`. Not blocked.
   - **JSON** is a package of its own, not part of the system library.
-- Settled by the user 2026-11-04: **The elementary functions are a module, `avin.math`** ([system library](/spec/system-library/#avin-math)),
-  with the reference library's names, called as `math.sqrt(x)` after `import avin.math` or imported
-  by name: `Pi` and `E`; `sqrt`, `cbrt`, `exp`, `expm1`, `log` (natural), `log10`, `log1p`, `pow`,
-  `hypot`; `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2(y, x)`, `sinh`, `cosh`, `tanh`;
-  `floor`, `ceil`, `rint` (ties to even), `abs`, `max`, `min` (NaN when either is, `-0.0` below
-  `0.0`), `signum`, `toRadians` and `toDegrees`. All take and give `real`, follow IEEE 754 and
-  never trap: `sqrt(-1.0)` is NaN, `log(0.0)` negative infinity. Not methods on `real`, and no
-  integer overloads of `abs`, `max` and `min` yet; the reference's `round`, which answers a `long`,
-  is left out until real-to-integer rounding is decided with the conversions. Bindings: one
-  runtime function per function, over the methods of Sysl's `Float` on `real`, since a binding names
-  a function and these are methods.
 
 **Deferred**
 
@@ -1419,7 +1419,12 @@ Settled by the user on 2026-11-04:
   `Result[Regex, PatternError]`; a group number or name the match does not have traps. Properties
   needing Unicode data beyond the general category (scripts, blocks, `Alphabetic`, `Uppercase`,
   `Lowercase`, `Ideographic`, `Word`, emoji), the flags `U` and `c`, `\X`, `\b{g}` and `\N{…}` are
-  refused with an `Unsupported` error until the runtime holds that data.
+  refused with an `Unsupported` error until the runtime holds that data. Replacing and splitting
+  follow the same dialect: `replaceAllIn` (a replacement, or a `(Match) -> string` whose result is
+  read as one), `replaceFirstIn`, `replaceSomeIn`, `split` answering an `Array[string]` with the
+  empty pieces at the end dropped, `Pattern.split(s, limit = 0)`, `Regex.quote` and
+  `Regex.quoteReplacement`; `$n` takes digits while they name a group, `${name}` is the pattern's
+  own name only, and a reference that cannot be resolved traps with the dialect's message.
 - Sysl handles ([Sysl bindings](/spec/sysl-bindings/#handles)): a `class` declared with `@sysl`
   naming a Sysl type has no parameters, fields or constructor and is made only by a binding that
   returns it, directly or as the value of an `Option` or `Result`; a collection of handles does not
