@@ -487,6 +487,10 @@ built-in type implements every method of the trait, defaults included.
 - **A generic impl names the type's parameters**, in order: `impl[T] Show for Box[T]`,
   `impl[K, V] Map[K, V]`. The names are the impl's own and need not be the declaration's. An impl
   for particular type arguments (`impl Show for Box[int]`) is not part of the language.
+- **An impl may bound the type's parameters further** (`impl[T: Display] List[T]`,
+  `impl[T: Ord] Ord for Box[T]`), and then holds only for the type arguments that meet the bounds:
+  the trait's conformance, or the methods it adds. Calling one of those methods on an instance that
+  misses a bound is an error naming the bound. [Generics](generics.md) has the rules.
 - A method added to a built-in type (`impl string`, `impl int`) is called on a value of that type,
   `"hi".shout()`, `7.squared()`.
 
