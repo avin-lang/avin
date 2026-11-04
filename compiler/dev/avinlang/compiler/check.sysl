@@ -274,6 +274,15 @@ struct ImplSymbol
      * holds only for type arguments that meet them. Empty for an impl without any. */
     conditions: Buf[Buf[&Type]]
 
+/** An impl with bounds of its own that adds methods to a data type or class: `impl[T: Display]
+ * List[T]`. Its methods are the ones whose type parameters begin with `params`, and a receiver has
+ * them only where its type arguments meet `conditions`, the bounds of each parameter. */
+struct ConditionalImpl
+    owner: usize
+    conditions: Buf[Buf[&Type]]
+    unit: usize
+    params: Buf[TypeParam]
+
 /** An unknown type argument of a call, open until a later use settles it: where it was made, and
  * what to report if nothing does. */
 struct Unknown
@@ -361,6 +370,9 @@ struct Checker
     /** The methods impls add to classes, which are not variance positions in a class whose fields
      * are all immutable. */
     impl_methods: Buf[usize]
+    /** The impls with bounds of their own that add methods without a trait: their methods exist only
+     * at type arguments meeting the bounds. */
+    conditional_methods: Buf[ConditionalImpl]
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -527,7 +539,7 @@ private check_imports(c: *Checker, unit: usize)
  * unit is one of its files. Every file sees its own module's declarations, the names it imports and
  * the core library's public declarations, in that order: an inner name hides an outer one. */
 check_program(units: Buf[SourceUnit], root_module: string) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf())
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
     // `derives` is written out as the methods and impls it stands for before anything is declared.
@@ -897,6 +909,7 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
                 c.builtins.push(BuiltinConformance(target, t, unit, d.target.span, buf()))
         if conditional
             if *t is Class(k, _, _) then c.conditional.push(ConditionalConformance(owner, k, conditions, unit, d.type_params))
+    elif conditional then c.conditional_methods.push(ConditionalImpl(owner, conditions, unit, d.type_params))
     ImplSymbol(unit, module_name, d, target, owner, trait_type, conditions)
 
 /** Whether class `k` is the one with qualified name `key`. */
@@ -909,20 +922,18 @@ private buf1u(x: usize) -> Buf[usize]
     out.push(x)
     out
 
-// An impl with bounds of its own makes a data type or a class conform to a trait for the type
-// arguments that meet them. The conformance is decided wherever one is: where a bound is checked,
-// where a value converts to the trait, where a type pattern tests it, and where one of the impl's
-// methods is called.
+// An impl with bounds of its own makes a data type or a class conform to a trait, or adds methods to
+// it, for the type arguments that meet them. The conformance is decided wherever one is: where a
+// bound is checked, where a value converts to the trait, where a type pattern tests it, and where one
+// of the impl's methods is called; an added method, where it is called or taken as a value.
 private conditional_impl_refused(c: *Checker, unit: usize, d: &ImplDecl, target: &Type, trait_type: Option[&Type]) -> bool
     val at = d.type_params[0].span
-    val t = trait_type match
-        Some(t) -> t
-        None ->
-            c.note(unit, at, "an impl that adds methods for some type arguments only is not implemented; bound the type's own parameters")
-            return true
     if !(*target is Data(_, _, _) || *target is Class(_, _, _))
         c.note(unit, at, "an impl with bounds of its own is implemented for data types and classes only")
         return true
+    val t = trait_type match
+        Some(t) -> t
+        None -> return false
     if *t is Class(k, _, _)
         // Every type compares and hashes, so an impl of `Eq` or `Hash` holds at every type argument,
         // and its bounds may only be ones every type meets.
@@ -3310,12 +3321,16 @@ conformance_holds(f: Conformances, owner: usize, required: &Type, args: Buf[&Typ
     true
 
 /** Whether type arguments `args` meet the bounds of conditional conformance `x`. */
-conditions_met(f: Conformances, x: ConditionalConformance, args: Buf[&Type]) -> bool
-    for i in 0..<x.conditions.len()
+conditions_met(f: Conformances, x: ConditionalConformance, args: Buf[&Type]) -> bool = unmet_condition(f, x.owner, x.conditions, args) is None
+
+/** The first type parameter, by position, and bound of `conditions` that type arguments `args` of the
+ * type `owner` owns miss; `None` where they meet them all. */
+unmet_condition(f: Conformances, owner: usize, conditions: Buf[Buf[&Type]], args: Buf[&Type]) -> Option[(usize, &Type)]
+    for i in 0..<conditions.len()
         if i >= args.len() then break
-        for b in x.conditions[i]
-            if !meets_bound(f, args[i], substitute(b, x.owner, args)) then return false
-    true
+        for b in conditions[i]
+            if !meets_bound(f, args[i], substitute(b, owner, args)) then return Some((i, b))
+    None
 
 /** The core library's operator and equality traits and their methods, by name. */
 private find_core_traits(c: *Checker)
@@ -6764,19 +6779,29 @@ private with_self(c: *Checker, m: usize, receiver_type: &Type, t: &Type) -> &Typ
 
 // Reports a call of method `m` on a receiver of type `receiver_type` that has the method only through
 // a conformance that does not hold at its type arguments: a method of an impl with bounds of its own
-// the arguments miss, or a trait's method the type reaches only through such an impl.
+// the arguments miss, or a trait's method the type reaches only through such an impl. A method a
+// class's subclass inherits is decided at the type arguments the subclass gives that class.
 private refuse_unmet_conformance(c: *Checker, at: Span, receiver_type: &Type, m: usize) -> bool
     val t = zonk(c, receiver_type)
-    val owner = *t match
+    val symbol = c.symbols[m]
+    var declaring = t
+    if symbol.owner_class is Some(k)
+        if !is_trait(c, k) then declaring = ancestor_type(c.classes, c.data, t, k).unwrap_or(t)
+    val owner = *declaring match
         Class(k, _, _) -> class_owner(k)
         Data(d, _, _) -> data_owner(d)
         _ -> return false
-    val args = *t match
+    val args = *declaring match
         Class(_, _, a) -> a
         Data(_, _, a) -> a
         _ -> buf()
     val f = conformances(c)
-    val symbol = c.symbols[m]
+    for x in c.conditional_methods
+        if x.owner != owner || x.params.len() == 0 || symbol.unit != x.unit then continue
+        if symbol.type_params.len() < x.params.len() || symbol.type_params[0].span.start != x.params[0].span.start then continue
+        if unmet_condition(f, x.owner, x.conditions, args) is Some((i, b))
+            c.note(unit_of(c), at, s"`${symbol.decl.name}` needs `${x.params[i].name}: ${type_name(b)}`, which ${type_name(t)} does not meet")
+            return true
     var missing: Option[usize] = None
     for x in c.conditional
         if x.owner != owner || x.params.len() == 0 || symbol.unit != x.unit then continue

@@ -247,6 +247,15 @@ the trait's, which the checker reports on an instance missing the bounds. Such a
 leaves the trait's positions empty, so the impl's methods are never compiled at its arguments; the
 `equals` and `hash` entries of `Eq` and `Hash`, which every type meets, are unaffected.
 
+An impl with bounds of its own and no trait is recorded as a `ConditionalImpl`, the same owner,
+bounds and parameters without a trait; its methods are declared as any impl's, so they overload the
+type's others and clash with one of the same parameter types. `refuse_unmet_conformance`, at every
+call and method value, finds the impl a method came from by its first type parameter's span and
+reports the first parameter and bound the receiver's type arguments miss (`unmet_condition`). A
+class's method is decided at the arguments the receiver gives the declaring class, through
+`ancestor_type`, so a subclass instance is held to its superclass's impls. The methods are ordinary
+generic methods, compiled for an instance only where a call reaches them.
+
 **Derived traits.** `derives` is written out on the syntax tree (`derive.sysl`) before the checker
 declares anything, so a derived method is declared, checked and compiled as one written by hand, and
 every node made for it carries the span of its `derives` entry. A class gains each derived trait
