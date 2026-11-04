@@ -122,7 +122,10 @@ Their methods:
 | `get() -> T`, trapping on `None` | |
 | `filterNot(p: (T) -> bool) -> Option[T]` | |
 
-An `Option[Option[T]]` also has `flatten()`, and an `Option` has `nonEmpty()` beside `isDefined()` and
+An `Option` also has `toRight[L](left: -> L) -> Either[L, T]` and `toLeft[R](right: -> R) ->
+Either[T, R]`, which put its value on one side of an [`Either`](#either) and the argument, evaluated
+only for `None`, on the other. It also has `iterator()` (one element or none) and `knownSize()` (1 or 0), an
+`Option[(A, B)]` has `unzip()` giving the two options, an `Option[Option[T]]` also has `flatten()`, and an `Option` has `nonEmpty()` beside `isDefined()` and
 `isEmpty()`. There is no `orNull`, since Avin has no null.
 
 `exists` is false and `forall` true for `None` and for `Err`, which hold no value. `toList` and
@@ -131,6 +134,54 @@ An `Option[Option[T]]` also has `flatten()`, and an `Option` has `nonEmpty()` be
 A default or an alternative is passed by name, so it is evaluated only when it is used. The methods
 an `impl` adds are not [variance](/spec/generics/#variance) positions, so `T` may appear in a
 parameter: on an `Option[Dog]` seen as an `Option[Animal]`, `getOrElse` takes an `Animal`.
+
+## Either
+
+`Either` holds a value of one of two types. It is a `data` type of the core library, written in Avin,
+covariant in both sides:
+
+```text
+data Either[+L, +R]
+    Left(value: L)
+    Right(value: R)
+```
+
+`Result` is the type for something that can fail, and it is what `?` takes apart; `Either` is the
+plain choice of two, with no `?` and no `From`. Its methods are right-biased: those that look at a
+value look at a `Right`'s and pass a `Left` through unchanged, so a `Left` is where a reason goes.
+
+| Method | On a `Right(b)` | On a `Left(a)` |
+|---|---|---|
+| `isLeft()`, `isRight()` | false, true | true, false |
+| `fold[C](fa: (L) -> C, fb: (R) -> C) -> C` | `fb(b)` | `fa(a)` |
+| `swap() -> Either[R, L]` | `Left(b)` | `Right(a)` |
+| `map[R2](f: (R) -> R2) -> Either[L, R2]` | `Right(f(b))` | itself |
+| `flatMap[R2](f: (R) -> Either[L, R2]) -> Either[L, R2]` | `f(b)` | itself |
+| `getOrElse(default: -> R) -> R` | `b` | `default` |
+| `orElse(other: -> Either[L, R]) -> Either[L, R]` | itself | `other` |
+| `contains(x: R) -> bool` | `b == x` | false |
+| `exists(p: (R) -> bool) -> bool` | `p(b)` | false |
+| `forall(p: (R) -> bool) -> bool` | `p(b)` | true |
+| `filterOrElse(p: (R) -> bool, zero: -> L) -> Either[L, R]` | itself if `p(b)`, else `Left(zero)` | itself |
+| `toOption() -> Option[R]` | `Some(b)` | `None` |
+| `toList() -> List[R]`, `toVector() -> Vector[R]` | one element | empty |
+| `foreach(f: (R) -> unit)` | calls `f(b)` | nothing |
+| `iterator() -> Iterator[R]` | one element | empty |
+
+Some methods are for an `Either` of a particular shape, added by an `impl` on it as `Option`'s
+`flatten` is:
+
+- `merge()` on an `Either[A, A]` gives the value from whichever side holds it.
+- `joinLeft()` on an `Either[Either[C, R], R]` gives the inner either of a `Left`, and keeps a `Right`.
+- `joinRight()` on an `Either[L, Either[L, C]]` gives the inner either of a `Right`, and keeps a `Left`.
+
+`Either.cond[L, R](test: bool, right: -> R, left: -> L) -> Either[L, R]` is `Right(right)` when
+`test` holds and `Left(left)` otherwise, evaluating only the side it uses. Defaults and alternatives
+are passed by name, and `L` and `R` appear in parameters without lower bounds, as for `Option`.
+
+A `match` covers an `Either` with a `Left` and a `Right` arm that each cover their value. Eithers are
+equal, hash and show by side and value: `Right(4)`, `Left(no)`, and under `debug` `Left("no")`.
+There is no left projection: `swap()` turns the left side into the one the methods work on.
 
 ## Not in Avin
 
