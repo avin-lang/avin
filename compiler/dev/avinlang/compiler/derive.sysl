@@ -127,20 +127,24 @@ private type_text(t: &TypeExpr) -> string = t.kind match
         text + "]"
     _ -> "this type"
 
-// The traits that impls anywhere in the module implement for the type named `type_name`.
+// The core library's traits that impls anywhere in the module implement for the type named
+// `type_name`. An impl of a trait of the module's own, or one a file imports, does not count, however
+// it is named.
 private impl_traits(c: *Checker, unit: usize, type_name: string) -> Buf[string]
     var out: Buf[string] = buf()
     val module_name = c.units[unit].file.module_name
-    for u in c.units
-        if u.file.module_name != module_name then continue
-        for item in u.file.items
+    for u in 0..<c.units.len()
+        if c.units[u].file.module_name != module_name then continue
+        for item in c.units[u].file.items
             if item is ImplItem(d)
                 val target = d.target.kind match
                     Named(path, _) -> path
                     _ -> ""
                 if target != type_name then continue
                 if d.trait_name is Some(t)
-                    if t.kind is Named(path, _) then out.push(path)
+                    if t.kind is Named(path, _)
+                        if path.starts_with(CorePrefix) then out.push(path[CorePrefix.bytes.len..])
+                        elif names_core(c, u, path) then out.push(path)
     out
 
 // A class that derives lists the traits after its parents and gains their methods. `Eq` and `Hash`
@@ -154,7 +158,7 @@ private derive_class(c: *Checker, unit: usize, d: &ClassDecl, impls: *Buf[&ImplD
     var implemented = impl_traits(c, unit, d.name)
     for parent in d.parents
         parent.kind match
-            Name(n) -> implemented.push(n)
+            Name(n) -> if names_core(c, unit, n) then implemented.push(n)
             _ -> ()
     for m in d.members
         if m is MethodMember(f, _, _)
@@ -196,9 +200,9 @@ private derive_class(c: *Checker, unit: usize, d: &ClassDecl, impls: *Buf[&ImplD
         if conditional && d.type_params.len() > 0
             var members_of_impl: Buf[ClassMember] = buf()
             members_of_impl.push(MethodMember(method, true, false))
-            impls.push(ImplDecl(at, bounded_params(at, d.type_params, name), Some(named_type(at, name)), other, members_of_impl))
+            impls.push(ImplDecl(at, bounded_params(c, unit, at, d.type_params, name), Some(named_type(at, core_path(name))), other, members_of_impl))
         else
-            parents.push(Expr(at, Name(name)))
+            parents.push(Expr(at, Name(core_path(name))))
             members.push(MethodMember(method, true, true))
         if conditional then c.derivations.push(Derivation(unit, d.name, false, name, at, false))
     ClassDecl(d.annotations, d.span, d.name_span, d.name, d.modifier, d.modifier_span, d.type_params, d.params, parents, d.derives, members, d.object)
@@ -220,18 +224,12 @@ private derive_data(c: *Checker, unit: usize, d: &DataDecl) -> Buf[&ImplDecl]
     for t in traits
         if t.name == "Eq" || t.name == "Hash" then continue
         out.push(data_impl(c, unit, d, t.name, t.at, false))
-    // Each is declared at the type, at a start of its own: the bounds the impl gives the type's
-    // parameters are known by where the parameters are written.
-    // A type declared twice is reported as such, and has none.
+    // Each is declared at the type. A type declared twice is reported as such, and has none.
     if declarations_named(c, unit, d.name) > 1 then return out
-    var offset = 0usize
     for name in ["Display", "Debug"]
-        offset += 1
         if has_trait(traits, name) || contains_name(implemented, name) then continue
         if contains_name(impl_methods(c, unit, d.name), derived_method(name)) then continue
-        // A module declaring a type of the trait's name means its own by the name.
-        if declares_type(c, unit, name) then continue
-        out.push(data_impl(c, unit, d, name, Span(d.span.start + offset - 1, d.span.end), true))
+        out.push(data_impl(c, unit, d, name, d.span, true))
     out
 
 // The impl of `trait_name` derived for data type `d`, declared at `at`.
@@ -240,21 +238,29 @@ private data_impl(c: *Checker, unit: usize, d: &DataDecl, trait_name: string, at
     var members: Buf[ClassMember] = buf()
     members.push(MethodMember(data_method(at, trait_name, d, target), true, false))
     c.derivations.push(Derivation(unit, d.name, true, trait_name, at, automatic))
-    ImplDecl(at, bounded_params(at, d.type_params, trait_name), Some(named_type(at, trait_name)), target, members)
+    ImplDecl(at, bounded_params(c, unit, at, d.type_params, trait_name), Some(named_type(at, core_path(trait_name))), target, members)
 
-// Whether a class, trait, object or data type of the module, other than the core library, is named
-// `type_name`.
-private declares_type(c: *Checker, unit: usize, type_name: string) -> bool
-    val module_name = c.units[unit].file.module_name
-    if module_name == CoreModule then return false
+// Whether the bare name `name`, written in unit `unit`, denotes the core library's declaration of it:
+// no declaration of the unit's module and no import of its file takes the name first. The core
+// library's own files always mean their own.
+private names_core(c: *Checker, unit: usize, name: string) -> bool
+    val file = c.units[unit].file
+    if file.module_name == CoreModule then return true
+    for i in file.imports
+        if i.binding == name then return false
     for u in c.units
-        if u.file.module_name != module_name then continue
+        if u.file.module_name != file.module_name then continue
         for item in u.file.items
             item match
-                ClassItem(d) -> if d.name == type_name then return true
-                DataItem(d) -> if d.name == type_name then return true
-                _ -> ()
-    false
+                FunctionItem(f) -> if f.name == name then return false
+                ClassItem(d) -> if d.name == name then return false
+                DataItem(d) ->
+                    if d.name == name then return false
+                    for v in d.variants
+                        if v.name == name then return false
+                ValueItem(v) -> if v.name == name then return false
+                ImplItem(_) -> ()
+    true
 
 // How many data types of the module are named `type_name`.
 private declarations_named(c: *Checker, unit: usize, type_name: string) -> usize
@@ -283,14 +289,16 @@ private impl_methods(c: *Checker, unit: usize, type_name: string) -> Buf[string]
                     if m is MethodMember(f, _, _) then out.push(f.name)
     out
 
-// The type parameters of an impl of `trait_name` derived for a type with parameters `params`: each
-// bounded by the trait, so the conformance holds where every type argument implements it.
-private bounded_params(at: Span, params: Buf[TypeParam], trait_name: string) -> Buf[TypeParam]
+// The type parameters of an impl of `trait_name` derived for a type with parameters `params`, in unit
+// `unit`: each bounded by the trait, so the conformance holds where every type argument implements
+// it. Each impl derived for a type is declared at one place, so the trait tells their parameters
+// apart.
+private bounded_params(c: *Checker, unit: usize, at: Span, params: Buf[TypeParam], trait_name: string) -> Buf[TypeParam]
     var out: Buf[TypeParam] = buf()
     for tp in params
         var bounds: Buf[&TypeExpr] = buf()
-        bounds.push(named_type(at, trait_name))
-        out.push(TypeParam(at, tp.name, Invariant, bounds))
+        bounds.push(named_type(at, core_path(trait_name)))
+        out.push(TypeParam(at, tp.name, Invariant, bounds, s"${c.units[unit].src.name}:${at.start}:derives $trait_name"))
     out
 
 // The method implementing `trait_name` for data type `d`, whose type is `target`.
@@ -428,7 +436,7 @@ private render_parts(at: Span, trait_name: string, opening: string, fields: Buf[
     items.push(call1(at, out, "write", Expr(at, StringLit(opening))))
     for i in 0..<fields.len()
         if i > 0 then items.push(call1(at, out, "write", Expr(at, StringLit(", "))))
-        items.push(call2(at, fields[i], method, out, Expr(at, Call(Expr(at, Name("FormatSpec")), buf()))))
+        items.push(call2(at, fields[i], method, out, Expr(at, Call(Expr(at, Name(core_path("FormatSpec"))), buf()))))
     if closing != "" then items.push(call1(at, out, "write", Expr(at, StringLit(closing))))
     Expr(at, Block(items, true))
 
@@ -445,11 +453,11 @@ private render_with_width(at: Span, trait_name: string, plain: &Expr) -> &Functi
     ops.push(Greater)
     val padded = Expr(at, Compare(operands, ops))
     var whole: Buf[&Expr] = buf()
-    whole.push(Expr(at, Binding("text", None, Expr(at, Call(Expr(at, Name("StringWriter")), buf())), false)))
-    whole.push(call2(at, Expr(at, Name("self")), method, Expr(at, Name("text")), Expr(at, Call(Expr(at, Name("FormatSpec")), buf()))))
+    whole.push(Expr(at, Binding("text", None, Expr(at, Call(Expr(at, Name(core_path("StringWriter"))), buf())), false)))
+    whole.push(call2(at, Expr(at, Name("self")), method, Expr(at, Name("text")), Expr(at, Call(Expr(at, Name(core_path("FormatSpec"))), buf()))))
     whole.push(call2(at, out, "writeField", call0(at, Expr(at, Name("text")), "text"), spec))
     val body = Expr(at, If(padded, Expr(at, Block(whole, true)), Some(plain)))
     var params: Buf[Param] = buf()
-    params.push(Param(at, Pattern(at, Name("out")), named_type(at, "Writer"), None, false, false))
-    params.push(Param(at, Pattern(at, Name("spec")), named_type(at, "FormatSpec"), None, false, false))
+    params.push(Param(at, Pattern(at, Name("out")), named_type(at, core_path("Writer")), None, false, false))
+    params.push(Param(at, Pattern(at, Name("spec")), named_type(at, core_path("FormatSpec")), None, false, false))
     Function(buf(), at, at, method, buf(), params, Some(named_type(at, "unit")), Some(body), buf())

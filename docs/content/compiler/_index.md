@@ -282,7 +282,7 @@ leaves the trait's positions empty, so the impl's methods are never compiled at 
 An impl with bounds of its own and no trait is recorded as a `ConditionalImpl`, the same owner,
 bounds and parameters without a trait; its methods are declared as any impl's, so they overload the
 type's others and clash with one of the same parameter types. `refuse_unmet_conformance`, at every
-call and method value, finds the impl a method came from by its first type parameter's span and
+call and method value, finds the impl a method came from by its first type parameter's site and
 reports the first parameter and bound the receiver's type arguments miss (`unmet_condition`). A
 class's method is decided at the arguments the receiver gives the declaring class, through
 `ancestor_type`, so a subclass instance is held to its superclass's impls. The methods are ordinary
@@ -290,7 +290,16 @@ generic methods, compiled for an instance only where a call reaches them.
 
 **Derived traits.** `derives` is written out on the syntax tree (`derive.sysl`) before the checker
 declares anything, so a derived method is declared, checked and compiled as one written by hand, and
-every node made for it carries the span of its `derives` entry. A class gains each derived trait
+every node made for it carries the span of its `derives` entry. What the written-out code names from
+the core library, the traits, `Writer`, `FormatSpec` and `StringWriter`, it names by `core_path`: a
+path no source can spell, which `resolve_name` takes straight to the core library's declaration, so a
+module's own `Display`, an imported one, a variant or function of a core trait's name, or a type
+parameter called `Writer` changes nothing about it. An impl or parent the module writes counts as a
+core trait's only where its bare name reaches the core library from that file (`names_core`).
+Every type parameter carries a `site`, its file and offset, or for a derived impl's the type's
+place and the trait; the bounds a parameter has are recorded by owner, position and site
+(`bound_key`), so two impls of one type, wherever each is declared, keep their bounds apart. A
+class gains each derived trait
 after its parents and an `override` of the trait's method over its constructor parameters, read
 through `self` and `other`; a data type gains an impl per trait (none for `Eq` and `Hash`, which it
 has by value), its method matching `(self, other)` or `self` against each variant, and for `Ord`
@@ -306,8 +315,8 @@ bounds the parameters have in the derived impl, names a field that falls short, 
 derived method unchecked.
 
 Every data type gains a `Display` and a `Debug` impl this way without `derives`, unless an impl of
-its own in the module implements the trait or declares its method; each is declared at the type,
-the two at different offsets so the bounds their parameters carry are kept apart. These
+its own in the module implements the core trait or declares its method; both are declared at the
+type, their parameters told apart by site. These
 **automatic derivations** are held to the fields after the written ones, repeatedly until nothing
 changes, since a type left without `Display` leaves the types holding it without `Display` in turn.
 A field that falls short is not reported: the type is withdrawn from the trait (its conformance,
