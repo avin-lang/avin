@@ -85,8 +85,9 @@ a decision changes, this page and the chapter change together.
   through a table uses gets a slot of its own in the table of every type implementing the method,
   filled with that type's implementation instantiated at those arguments; such a call also costs one
   virtual call.
-- An `impl` adds methods and conformances, never state. Its methods are a class's or an object's own
-  methods; for a `data` or built-in type they are called directly. Inside them the receiver is
+- An `impl` adds methods and conformances, never state. Written in a class's or an object's module,
+  its methods are the class's own; for a `data` or built-in type, or written elsewhere, they are
+  called directly. Inside them the receiver is
   implicit, as in a class, with a one-variant `data` type's fields in scope by bare name.
 - The methods of `impl Trait for Type` implement the trait's methods without `override`, and each is
   a method of the trait or of one it requires. A `data` type's method implementing a trait method is
@@ -114,8 +115,9 @@ a decision changes, this page and the chapter change together.
   its impls name are.
 - A type pattern matches an object whose type conforms to the pattern's type through variance, as
   the checker's subtyping does: a `List[Dog]` held as an `Any` matches `List[Animal]`.
-- The built-in types belong to the core library's module, `avin`; an impl adding methods to one is
-  written there.
+- The built-in types belong to the core library's module, `avin`; a conformance of one is written
+  there or in the trait's module. An impl that only adds methods may be written in any module
+  (settled 2026-11-04, below).
 - Functions and methods may be overloaded by parameter types. A call takes the most specific
   overload that accepts its arguments, chosen at compile time; an ambiguous call is an error.
   Same-named declarations with the same parameter types are an error.
@@ -555,6 +557,22 @@ Settled by the user on 2026-11-03:
 
 Settled by the user on 2026-11-04:
 
+- **An impl that only adds methods may be written in any module** (a relaxed impl); in another module
+  than its type's or trait's it is an [extension](/spec/declarations/#extensions): `impl string`,
+  `impl[T: Ord] Seq[T]`, `impl[T] Option[Option[T]]`, `impl Box` for another module's class. Its
+  methods are seen in its own module and in every file importing that module, whole or any
+  declaration of it, with no further step; a file importing neither does not see them, and the
+  core library's are seen everywhere. A type's own methods are found first: an extension method a
+  type's own or inherited method of the same name and parameter types always hides is an error at
+  its declaration, and one added to a trait is passed over for a type that has such a method. Two
+  seen extensions of different modules adding one name and parameter types to a receiver make the
+  call an error naming both modules. An extension's `private` methods are private to its module. Its
+  methods reach no private member of another module's type, are in no method table and are not
+  overridden; `self` is the receiver and the type's public fields and methods are in scope by bare
+  name. Infix calls, method values and calls through a bound see extensions as dotted calls do,
+  a bound's where the generic function is written. Conformances, `impl Trait for Type`, stay in the
+  module of the type or of the trait.
+
 - **Sequences, sets and maps are functions, by subtyping.** `Seq[+T]` is a subtype of `(int) -> T`,
   through its `apply(index)`; `Set[A]`, immutable and mutable, of `(A) -> bool`; `Map[K, V]`,
   immutable and mutable, of `(K) -> V`, whose `apply` traps on a missing key as `m(k)` does. A
@@ -598,6 +616,24 @@ Settled by the user on 2026-11-04:
   function from a vector and `[](int -> int)` a vector of functions. A type pattern takes it
   without parentheses, `v: []int -> body`. There is no fixed-length `[N]T` (an error); error
   messages print `Vector[int]`.
+- The thread model ([threads](/spec/threads/)): `avin.threads.spawn(body)` starts a closure on a
+  new thread with an 8 MiB stack and `join()` gives back its result; a structured `scope` joins
+  every thread started in it; a trap in any thread stops the program, and the program ends when
+  `main` returns. The heap, module-level values and captured `var`s are shared. The library offers
+  `Mutex[T]` owning its value, `Condition`, sequentially consistent `Atomic[T]`, `Channel[T]` and
+  `Once`, and every wait marks its thread safe for the collector. A data race is not undefined
+  behaviour: heap fields and module-level variables are accessed with LLVM's `unordered` ordering,
+  so a racing read sees some value written to that word, and a constructor ends with a release
+  fence, so no thread sees an object without its header and constructor-set fields. Actors are
+  scheduled onto a pool of these threads.
+- Details of starting and joining: `spawn` gives back a `Thread[T]` whose `join()` any thread may
+  call, any number of times and at once; one waits for the thread and the others for that wait. A
+  thread's handle is collected like any object once nothing reaches it; a thread never joined keeps
+  its stack until the program ends. `s.spawn` is called by the thread running the scope's body
+  while the scope is open, and anything else traps, so the scope sees every thread it has to join;
+  a thread the scope started starts more through a scope of its own. When several threads trap at
+  once, or one traps while another calls `exit`, only the first stops the program: its output is
+  flushed once and its reason is the one reported.
 - [Repeated parameters](/spec/declarations/#repeated-parameters): `values: T*` is the last
   parameter, at most one, named, with no default and not by-name; inside the function it is a
   `Vector[T]`. A call gives it every positional argument from its position on, each checked
@@ -620,6 +656,20 @@ Settled by the user on 2026-11-04:
   core library adds `flatten` to `Option[Option[T]]`, `Result[Result[T, E], E]` and `Seq[Seq[T]]`
   (a `Vector[T]`), `toMap()` to `Iterable[(K, V)]` (keys bounded as a map's) and `unzip()` to
   `Seq[(A, B)]`.
+- A heap field or module variable wider than 64 bits is accessed as untorn 64-bit words: a racing
+  read of it may combine words of different writes ([threads](/spec/threads/#the-memory-model)).
+- [Trailing blocks](/spec/operators-and-control-flow/#trailing-blocks): an indented block on the
+  lines after a call is the call's last argument, given to the callee's last parameter. A by-name
+  parameter takes the block as its delayed expression (`retry(3)` + block); a function parameter
+  takes a lambda whose parameters end the call's line, one name or a parenthesized list after
+  the call's parentheses (`withFile(path) f ->`, `zipWith(a, b) (x, y) ->`). A callee with no
+  other arguments is written without parentheses (`scope s ->`, `s.spawn` + block). It applies
+  wherever an expression ends a line (`val r = retry(3)` + block, a method call, a match arm's
+  body), and never in the test of `if`, `elif`, `while` or `do … while`, a `for` source or guard,
+  or a class's parents, where the block is the form's body. A local function's header keeps its
+  meaning: `name()` or `name(x: T)` before a block declares one. A block whose only line is a name
+  and an operand stays the infix-continuation error. A block for a last parameter that is neither
+  by-name nor a function, already given, or absent is an error.
 
 **Deferred**
 
@@ -695,17 +745,6 @@ Settled by the user on 2026-11-04:
   `Eq` and `Debug` bounds, showing both values' `Debug` forms) trap at the assertion's place. Not yet
   built: `@tests` files, setup and teardown hooks, `should_trap`, `ignore` and `timeout` arguments,
   and tests answering with a `Result`.
-- The thread model ([threads](/spec/threads/)): `avin.threads.spawn(body)` starts a closure on a
-  new thread with an 8 MiB stack and `join()` gives back its result; a structured `scope` joins
-  every thread started in it; a trap in any thread stops the program, and the program ends when
-  `main` returns. The heap, module-level values and captured `var`s are shared. The library offers
-  `Mutex[T]` owning its value, `Condition`, sequentially consistent `Atomic[T]`, `Channel[T]` and
-  `Once`, and every wait marks its thread safe for the collector. A data race is not undefined
-  behaviour: heap fields and module-level variables are accessed with LLVM's `unordered` ordering,
-  so a racing read sees some value written to that word, and a constructor ends with a release
-  fence, so no thread sees an object without its header and constructor-set fields. Actors are
-  scheduled onto a pool of these threads.
-
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

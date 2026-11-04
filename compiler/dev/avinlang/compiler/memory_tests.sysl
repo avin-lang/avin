@@ -1,0 +1,112 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// The memory model's code: every load and store of a heap field, an array element or a module-level
+// value is an unordered atomic access made at the width the value is laid out at, an integer wider
+// than 64 bits a word at a time, and making an object ends with a release fence. The function's own
+// slots stay plain.
+
+private const Probe: string = "class Cell(var n: long, var flag: bool, var wide: i128, var small: i5)\n\ndata Point(x: int, y: int)\n\nvar total: long = 0\n\npoint() -> Point = Point(1, 2)\n\nadder(k: int) -> (int) -> int = (x: int) -> x + k\n\ncounted() -> int\n    var c = 0\n    val g = () -> c += 1\n    g()\n    c\n\nelements() -> int\n    val a = Array.fill(3, 0)\n    a(1) = 4\n    a(1)\n\nmain()\n    val cell = Cell(1, true, 2, 3)\n    cell.n += 1\n    cell.flag = !cell.flag\n    cell.wide += 1\n    cell.small = cell.small +% 1\n    total += cell.n\n    print(s\"${cell.n} ${cell.flag} ${cell.wide} ${cell.small} $total ${point().x} ${adder(1)(2)} ${counted()} ${elements()}\")\n"
+
+/** The module the probe program compiles to. */
+private probe_ir() -> string
+    val program = lower_source(repository_toolchain(), source_of("probe.avin", Probe)) match
+        Ok(p) -> p
+        Err(d) -> panic(d)
+    emit_llvm(program)
+
+/** The body of the function whose symbol is `symbol`, one instruction per line. */
+private body_of(ir: string, symbol: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var inside = false
+    for line in ir.split("\n")
+        if line.starts_with("define ") && line.contains("@\"" + symbol + "\"(") then inside = true
+        elif inside
+            if line == "}" then return out
+            out.push(line)
+    out
+
+/** Whether some line has every one of `parts`. */
+private any_line(lines: Buf[string], parts: []string) -> bool
+    for line in lines
+        var all = true
+        for p in parts
+            if !line.contains(p) then all = false
+        if all then return true
+    false
+
+private shown(lines: Buf[string]) -> string
+    var out = ""
+    for line in lines
+        out = out + line + "\n"
+    out
+
+@test("a field is loaded and stored with unordered atomic accesses")
+field_accesses_are_unordered()
+    val main = body_of(probe_ir(), "<program>.main")
+    assert(any_line(main, ["= load atomic i64, ptr %v", "unordered, align 8"]), shown(main))
+    assert(any_line(main, ["store atomic i64 ", "unordered, align 8"]), shown(main))
+
+@test("a module-level value is loaded and stored with unordered atomic accesses")
+module_values_are_unordered()
+    val main = body_of(probe_ir(), "<program>.main")
+    assert(any_line(main, ["load atomic i64, ptr @avin.global.", "unordered, align 8"]), shown(main))
+    assert(any_line(main, ["store atomic i64 ", ", ptr @avin.global.", "unordered, align 8"]), shown(main))
+
+@test("a bool field is accessed as an unordered byte, and an odd-width integer at its storage width")
+narrow_fields_use_storage_width()
+    val main = body_of(probe_ir(), "<program>.main")
+    assert(any_line(main, ["load atomic i8, ptr", "unordered, align 1"]), shown(main))
+    assert(any_line(main, ["= trunc i8 ", " to i1"]), shown(main))
+    assert(any_line(main, ["= trunc i8 ", " to i5"]), shown(main))
+    assert(any_line(main, ["= zext i1 ", " to i8"]), shown(main))
+    assert(any_line(main, ["= zext i5 ", " to i8"]), shown(main))
+    assert(!any_line(main, ["atomic i1"]) && !any_line(main, ["atomic i5"]), shown(main))
+
+@test("a field wider than 64 bits is loaded and stored as unordered 64-bit words")
+wide_fields_are_words()
+    val main = body_of(probe_ir(), "<program>.main")
+    assert(any_line(main, [".w1 = load atomic i64, ptr ", ".p1 unordered, align 8"]), shown(main))
+    assert(any_line(main, ["store atomic i64 ", ".w1, ptr ", ".p1 unordered, align 8"]), shown(main))
+    assert(!any_line(main, ["atomic i128"]), shown(main))
+
+@test("an array element is accessed with unordered atomic accesses")
+array_elements_are_unordered()
+    val f = body_of(probe_ir(), "<program>.elements")
+    assert(any_line(f, ["store atomic i32 ", "unordered, align 4"]), shown(f))
+    assert(any_line(f, ["load atomic i32, ptr ", "unordered, align 4"]), shown(f))
+
+@test("the function's own slots are accessed plainly")
+slots_are_plain()
+    val main = body_of(probe_ir(), "<program>.main")
+    assert(!any_line(main, ["atomic", "ptr %s"]), shown(main))
+
+/** Whether the last instruction before the function returns is a release fence. */
+private fenced_before_return(lines: Buf[string]) -> bool
+    var last_fence = false
+    for line in lines
+        if line == "  fence release" then last_fence = true
+        elif line.starts_with("  ret ") then return last_fence
+        elif line.contains("store atomic") || line.contains("call ") then last_fence = false
+    false
+
+@test("a class's constructor ends with a release fence after its last field store")
+class_constructor_fenced()
+    val f = body_of(probe_ir(), "<program>.Cell")
+    assert(fenced_before_return(f), shown(f))
+
+@test("making a data value, a closure and a box for a captured var each end with a release fence")
+allocations_fenced()
+    val ir = probe_ir()
+    val p = body_of(ir, "<program>.point")
+    assert(fenced_before_return(p), shown(p))
+    val a = body_of(ir, "<program>.adder")
+    assert(fenced_before_return(a), shown(a))
+    val c = body_of(ir, "<program>.counted")
+    var fences = 0
+    for line in c
+        if line == "  fence release" then fences += 1
+    assert(fences == 2, shown(c))
