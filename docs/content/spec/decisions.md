@@ -670,6 +670,18 @@ Settled by the user on 2026-11-04:
   unbounded at zero and a negative capacity traps; a send to a closed channel traps, closing twice
   does nothing, and a channel is `Iterable`, receiving until it is closed and drained. `Once.run`
   makes every other caller wait for the running body; a body running its own `Once` again traps.
+- [Trailing blocks](/spec/operators-and-control-flow/#trailing-blocks): an indented block on the
+  lines after a call is the call's last argument, given to the callee's last parameter. A by-name
+  parameter takes the block as its delayed expression (`retry(3)` + block); a function parameter
+  takes a lambda whose parameters end the call's line, one name or a parenthesized list after
+  the call's parentheses (`withFile(path) f ->`, `zipWith(a, b) (x, y) ->`). A callee with no
+  other arguments is written without parentheses (`scope s ->`, `s.spawn` + block). It applies
+  wherever an expression ends a line (`val r = retry(3)` + block, a method call, a match arm's
+  body), and never in the test of `if`, `elif`, `while` or `do … while`, a `for` source or guard,
+  or a class's parents, where the block is the form's body. A local function's header keeps its
+  meaning: `name()` or `name(x: T)` before a block declares one. A block whose only line is a name
+  and an operand stays the infix-continuation error. A block for a last parameter that is neither
+  by-name nor a function, already given, or absent is an error.
 
 **Deferred**
 
@@ -698,6 +710,21 @@ Settled by the user on 2026-11-04:
   terminator at the end starts no further line, the empty string has no lines, and a lone `\r`
   stays in its line. `take`, `drop`, `takeRight`, `dropRight` and the padding widths clamp rather
   than trap.
+
+- The methods every `Iterable` has ([collections](/spec/collections/#methods-every-iterable-has)):
+  folds, `reduce` (trapping when empty) and `reduceOption`, searches, `count`, `minBy`/`maxBy` and
+  `min`/`max` (answering `Option`), `mkString`, `partition`, `groupBy`, `groupMap`,
+  `groupMapReduce`, the conversions and `zipWithIndex` are written once on `Iterable` and replace
+  the copies `Seq` and `Set` had. A collection they make is a `Vector`, whatever the receiver:
+  `partition` answers `(Vector[T], Vector[T])`, `groupBy` a `Map[K, Vector[T]]`, `zipWithIndex` a
+  `Vector[(T, int)]`, so a set's or a map's partition keeps every element, equal results included,
+  and a list's comes back indexed. A type's own method of the same signature still answers where the
+  type is known (`List.toList()` is the list itself). `Iterator` has lazy `map`, `filter`, `take`,
+  `drop`, `takeWhile`, `dropWhile`, `zip` and `zipWithIndex` answering iterators; its
+  `zipWithIndex` is the trait's own method and so is found before `Iterable`'s. To compile these, a
+  method table holds a method at a position only for the types a call through that position can
+  reach, by the receiver's static type, so a trait method that makes an instance at a larger type
+  argument (`zipWithIndex` on an `Iterator[(T, int)]`) is not compiled for every type it makes.
 
 - Sorting ([collections](/spec/collections/#sorting)): every `Seq` has `sorted()` (elements `Ord`),
   `sortedBy[K: Ord](key)` and `sortedWith(compare: (T, T) -> int)`, answering a `Vector`; `List`

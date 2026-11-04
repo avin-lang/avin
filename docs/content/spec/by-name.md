@@ -41,6 +41,27 @@ orElse(value: int, fallback: -> int = expensive()) = if value >= 0 then value el
 A named argument to a by-name parameter is delayed too, though the arguments written around it are
 evaluated at the call.
 
+## Trailing blocks
+
+A by-name last parameter takes an indented block written after the call's line as its
+[trailing block](/spec/operators-and-control-flow/#trailing-blocks), which makes a function read like
+a control form of the language:
+
+```text
+times(n: int, action: -> unit)
+    var i = 0
+    while i < n
+        action
+        i += 1
+
+times(3)
+    print("tick")
+```
+
+The block is the delayed expression, with every rule above: it runs at each read of `action`, never
+at the call, it yields its last expression, and a `return`, `break` or `continue` leaving it is an
+error.
+
 ## Restrictions
 
 `data` fields cannot be by-name, and neither can repeated (`T*`) parameters, nor the parameters

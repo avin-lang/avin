@@ -1,0 +1,127 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// Which references a function keeps in its frame: only those live across a point where the
+// collector can run, sharing a frame slot where they are never live at once.
+
+private lowered(text: string) -> MirProgram = lower_source(repository_toolchain(), source_of("probe.avin", text)) match
+    Ok(p) -> p
+    Err(d) -> panic(d)
+
+/** The frame of the program's function `name` in `text`. */
+private plan_of(text: string, name: string) -> RootPlan
+    val program = lowered(text)
+    val graph = call_graph(program)
+    val collects = collecting_functions(program, graph)
+    for i in 0..<program.functions.len()
+        if program.functions[i].symbol == "<program>." + name then return plan_roots(program, graph, collects, i)
+    panic("no function " + name)
+
+/** How many values and local slots of the plan have a frame slot. */
+private rooted(plan: RootPlan) -> int
+    var n = 0
+    for c in plan.value_cells
+        if c is Some(_) then n = n + 1
+    for c in plan.slot_cells
+        if c is Some(_) then n = n + 1
+    n
+
+/** The LLVM text of the program's function `name` in `text`. */
+private function_text(text: string, name: string) -> string
+    val all = emit_llvm(lowered(text))
+    val head = "@\"<program>." + name + "\"("
+    var out = ""
+    var inside = false
+    for line in all.split("\n")
+        if line.starts_with("define ") && line.contains(head) then inside = true
+        if inside
+            out = out + line + "\n"
+            if line == "}" then return out
+    out
+
+const CellText: string = "data Cell(n: int)\n\nuse(c: Cell) -> int = c.n\n\n"
+
+@test("a function that reads fields and never collects has no frame")
+leaf_accessor_has_no_frame()
+    val text = "class Node(val a: Array[Array[int]], val b: Array[Array[int]])\n\nat(n: Node, i: int) -> int = n.a(i >> 5)(i & 31)\n\nmain()\n    val n = Node(Array.fill(1, Array.fill(32, 1)), Array.fill(1, Array.fill(32, 2)))\n    print(at(n, 3).toString())\n"
+    assert_eq(plan_of(text, "at").cells, 0usize)
+    assert(!function_text(text, "at").contains("%frame"))
+
+@test("a function whose branches only read fields and trap has no frame, however many references it reads")
+wide_accessor_has_no_frame()
+    val text = "class Node(val a: Array[Array[int]], val b: Array[Array[int]])\n\nat(n: Node, i: int) -> int\n    if i < 0 then return n.b(0)(0) + n.b(1)(1) + n.a(2)(2) + n.a(3)(3)\n    n.a(i >> 5)(i & 31)\n\nmain()\n    val n = Node(Array.fill(4, Array.fill(32, 1)), Array.fill(4, Array.fill(32, 2)))\n    print(at(n, 3).toString())\n"
+    assert_eq(plan_of(text, "at").cells, 0usize)
+
+@test("a reference held across an allocation is in the frame")
+allocation_while_holding_has_frame()
+    val text = CellText + "keep(c: Cell) -> int\n    val d = Cell(c.n + 1)\n    c.n + d.n\n\nmain()\n    print(keep(Cell(1)).toString())\n"
+    val plan = plan_of(text, "keep")
+    assert_eq(plan.cells, 1usize)
+    assert_eq(plan.value_cells[0], Some(0usize))
+    assert(function_text(text, "keep").contains("%frame = alloca { ptr, i64, [1 x ptr] }"))
+
+@test("two references never live at once share one frame slot")
+disjoint_references_share_a_slot()
+    val text = CellText + "two() -> int\n    val a = Cell(1)\n    val b = Cell(2)\n    val x = use(a) + use(b)\n    val c = Cell(3)\n    val d = Cell(4)\n    x + use(c) + use(d)\n\nmain()\n    print(two().toString())\n"
+    val plan = plan_of(text, "two")
+    assert_eq(plan.cells, 1usize)
+    assert_eq(rooted(plan), 2)
+
+@test("a reference live across a loop's safepoint poll is in the frame")
+reference_across_poll_has_frame()
+    val text = CellText + "spin(c: Cell, n: int) -> int\n    var i = 0\n    var s = 0\n    while i < n\n        s = s + c.n\n        i += 1\n    s\n\nmain()\n    print(spin(Cell(2), 3).toString())\n"
+    val plan = plan_of(text, "spin")
+    assert_eq(plan.cells, 1usize)
+    assert_eq(plan.value_cells[0], Some(0usize))
+
+@test("a reference passed to a runtime entry point that allocates is in the frame, though it is not used after")
+runtime_arguments_are_rooted()
+    val text = "join(a: string, b: string) -> string = a + b\n\nmain()\n    print(join(\"a\", \"b\"))\n"
+    val plan = plan_of(text, "join")
+    assert_eq(plan.cells, 2usize)
+
+@test("a reference passed to a function of the program and not used after is the callee's to keep")
+call_arguments_are_the_callees()
+    val text = CellText + "grow(c: Cell) -> Cell = Cell(c.n + 1)\n\nnext(c: Cell) -> int = use(grow(c))\n\nmain()\n    print(next(Cell(1)).toString())\n"
+    assert_eq(plan_of(text, "next").cells, 0usize)
+    assert_eq(plan_of(text, "grow").cells, 0usize)
+
+@test("an object stays rooted while an address computed from it is in use across an allocation")
+derived_address_keeps_its_object()
+    val text = CellText + "class Holder(var item: Cell)\n\nput(h: Holder, k: int)\n    h.item = Cell(k)\n\nmain()\n    val h = Holder(Cell(0))\n    put(h, 3)\n    print(h.item.n.toString())\n"
+    var program = lowered(text)
+    var index = 0usize
+    for i in 0..<program.functions.len()
+        if program.functions[i].symbol == "<program>.put" then index = i
+    val f = program.functions[index]
+    // The field's address is taken before the new cell is allocated, so only the address is used
+    // after the allocation.
+    var moved: Buf[Inst] = buf()
+    for inst in f.blocks[0].insts
+        if inst is Offset(_, Value(0), _) then moved.push(inst)
+    assert_eq(moved.len(), 1usize)
+    for inst in f.blocks[0].insts
+        if !(inst is Offset(_, Value(0), _)) then moved.push(inst)
+    var blocks: Buf[MirBlock] = buf()
+    blocks.push(MirBlock(moved, f.blocks[0].term))
+    for b in 1..<f.blocks.len() do blocks.push(f.blocks[b])
+    program.functions[index] = MirFunction(f.symbol, f.signature, f.value_types, f.slots, blocks)
+    val graph = call_graph(program)
+    val plan = plan_roots(program, graph, collecting_functions(program, graph), index)
+    assert_eq(plan.cells, 1usize)
+    assert_eq(plan.value_cells[0], Some(0usize))
+
+@test("a frame slot starts null only when the collector can read it before the function writes it")
+slots_start_null_only_when_read_first()
+    val held = CellText + "keep(c: Cell) -> int\n    val d = Cell(c.n + 1)\n    c.n + d.n\n\nmain()\n    print(keep(Cell(1)).toString())\n"
+    assert(!plan_of(held, "keep").zeroed[0])
+    assert(!function_text(held, "keep").contains("store ptr null"))
+    val made = CellText + "two() -> int\n    val a = Cell(1)\n    val b = Cell(2)\n    use(a) + use(b)\n\nmain()\n    print(two().toString())\n"
+    assert(plan_of(made, "two").zeroed[0])
+    val branches = CellText + "choose(flag: bool) -> int\n    if flag\n        val a = Cell(1)\n        val b = Cell(2)\n        return use(a) + use(b)\n    val c = Cell(3)\n    val d = Cell(4)\n    use(c) + use(d)\n\nmain()\n    print(choose(true).toString())\n"
+    val plan = plan_of(branches, "choose")
+    assert_eq(plan.cells, 1usize)
+    assert(plan.zeroed[0])

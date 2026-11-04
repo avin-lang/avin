@@ -348,10 +348,15 @@ its table positions and the method go, the method recorded as withdrawn so lower
 it), and a bound or interpolation that then fails names the field in its diagnostic.
 
 Lowering compiles a data type's trait implementations only when called, and fills a method table
-position only once some call goes through it (`used_slots`): each new position is filled in every
-table made so far, which may make instances to compile, until no position is new. So a program that
-never shows a value carries no `Display` or `Debug` code, and one calling `toString()` through
-`Display` carries it only for the types it makes.
+position only once some call goes through it: each new position is filled in every table made so
+far, which may make instances to compile, until no position is new. So a program that never shows a
+value carries no `Display` or `Debug` code, and one calling `toString()` through `Display` carries it
+only for the types it makes. A call records its receiver's static type at the position
+(`slot_receivers`; a generic method's slot carries it too), and a table is filled there only where
+its type always is one of those types; a call lowering makes with no static receiver, an equality
+decided at run time, fills the position in every table (`used_slots`). Without that, a trait method
+making an instance at a larger type argument, as `Iterator.zipWithIndex` makes an
+`Iterator[(T, int)]`, would fill that instance's table, make the next larger one, and never end.
 
 The supertypes an instance has through **variance** are open-ended (`List[Dog]` is a `List[Animal]`
 and a `List[Any]`), so a record does not list them all. Lowering notes each record a type pattern
@@ -458,6 +463,33 @@ context; the main thread's is attached before the program's entry function runs.
 gets a context of its own from `avin_rt_thread_attach` before it runs compiled code and gives it
 back with `avin_rt_thread_detach` when it has finished, with no frame left on it.
 
+**What a frame holds.** The collector can run only at a *collection point*: an allocation, a poll
+(below), a call of one of the program's functions that may collect, a call through a function value,
+and a call of a runtime entry point that may allocate, poll or block. A function may collect when it
+allocates, polls, calls through a function value or calls a runtime entry point or function that
+may; this is found for the whole program at once, so a call of an accessor that only reads fields is
+no collection point. Only the eight runtime entry points that do none of these (comparing, hashing
+and searching strings, hashing reals and identities, testing conformance, clearing array elements)
+are known to be quiet; every other entry point and every Sysl binding's shim may collect.
+
+A reference, whether a value or a local variable, is a root only where it is **live across** a
+collection point: made before it and used after it. Liveness is computed backward over the
+function's blocks, and an address computed from a reference, a field's or an element's, keeps that
+reference live while the address is in use. References passed to a function of the program are the
+callee's to keep: inside the callee a parameter is a root only if the callee uses it after one of its
+own collection points. A runtime entry point that may collect is the exception, since it reads its
+arguments after allocating, so references passed to it are live across the call.
+
+References that are never live at once share a frame slot: slots are given out in the order the
+references' extents over the function begin, each to a reference whose extent begins after that of
+the slot's last occupant ended. A value is stored to its slot where it is made, and a local variable
+that needs a slot lives in it. The frame is not cleared on entry: only a slot the collector could read
+before the function has stored to it on some path is set to null, and a slot whose reference has died
+still holds a valid reference, since its object has been kept alive by that same slot at every
+collection since. A function with no reference live across a collection point has **no frame** at
+all, so a leaf that only reads fields, or one whose branches only read fields and trap, pushes
+nothing.
+
 Threads share the heap, and one lock serializes allocation, collection and changes to the list of
 contexts; the collector itself runs single-threaded. **A collection stops the world.** Each context
 is either *running*, when its thread may touch references, or *safe*, when its frames hold every
@@ -477,7 +509,8 @@ safe, collects, lowers the flag and wakes the others. A thread becomes safe in t
   its callees' and its own loops' polls, and never polls at all for its calls. A poll is a relaxed
   atomic load of the flag and a branch, weighted as almost never taken, to a call of
   `avin_rt_safepoint`, which is declared cold and laid out of line; the thread parks there until the
-  collection is over. Every reference is already in a frame wherever a poll is placed.
+  collection is over. Every reference live across a poll is already in a frame where the poll is
+  placed.
 - **Waiting for the lock.** Allocation takes the lock with one compare-and-swap when it is free; a
   thread that has to wait for it waits safe, since the holder may be collecting. Allocation is
   therefore a safepoint.

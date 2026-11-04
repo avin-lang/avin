@@ -58,10 +58,10 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
   a collection has them only where its elements do. `mkString` joins elements that have `Display`
   into a string: `mkString(sep = ", ")` separates them, `mkString(start, sep, end)` also brackets
   them, so `[1, 2, 3].mkString()` is `1, 2, 3` and `.mkString("<", "|", ">")` is `<1|2|3>`. Every
-  sequence has it, through an impl adding it to `Seq`, and so do sets, and maps, whose entries join
-  as `key: value`, the form a displayed map shows. `max()` and `min()` on every sequence of `Ord`
-  elements answer `Some` of the greatest or least, the first of equal ones, and `None` when empty.
-  The free functions `max(first, rest*)` and `min(first, rest*)` take one value or more, with a
+  collection and iterator has it, through an impl adding it to `Iterable`, and a map keeps its own,
+  whose entries join as `key: value`, the form a displayed map shows. `max()` and `min()` on every
+  collection of `Ord` elements answer `Some` of the greatest or least, the first of equal ones, and
+  `None` when empty. The free functions `max(first, rest*)` and `min(first, rest*)` take one value or more, with a
   [repeated](/spec/declarations/#repeated-parameters) parameter, and answer the greatest or least
   itself: `max(3, 9, 4)` is `9`, `min(x, ys*)` the least of `x` and the elements of `ys`.
   `sum()` and `product()` are added to `Iterable` the same way, so every collection has them, ranges
@@ -75,6 +75,59 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
   `Option`. `collectFirst(pf)`, on every `Iterable`, is `Some` of `pf` of the first element it is
   defined at, or `None`, and reaches no element after that one. A `Map` collects its entries as
   pairs into a `Map`.
+
+## Methods every Iterable has
+
+Impls add these to `Iterable`, each written once over `iterator()`, so every collection has them:
+lists, vectors, arrays, buffers, deques, ranges, sets, maps (whose elements are their entries, as
+`(key, value)` pairs), the mutable sets and maps, iterators, and a class of the program's own that
+conforms to `Iterable`. They visit the elements in iteration order. On an iterator they consume it.
+A type with a faster way to answer one keeps its own method of the same name and parameter types,
+which is found first wherever the type is known: a list walks itself for `foldLeft`, `find` and the
+rest, a set and a range know at once whether they are empty, a vector is its own `toVector()`.
+Collections they make are vectors, maps and sets; n is the number of elements.
+
+| Method | Result | Cost |
+|---|---|---|
+| `isEmpty()`, `nonEmpty()` | `bool` | O(1) |
+| `foldLeft(initial, f)` | `B` | O(n) |
+| `reduce(f)` | `T`; traps when empty | O(n) |
+| `reduceOption(f)` | `Option[T]`, `None` when empty | O(n) |
+| `foreach(f)` | `unit` | O(n) |
+| `exists(p)`, `forall(p)` | `bool`; stops at the first that decides | O(n) |
+| `find(p)` | `Option[T]`, the first that satisfies `p` | O(n) |
+| `count(p)` | `int` | O(n) |
+| `minBy(key)`, `maxBy(key)` (`K: Ord`) | `Option[T]`, the first of equal keys | O(n), `key` once per element |
+| `min()`, `max()` (`T: Ord`) | `Option[T]`, the first of equal ones | O(n) |
+| `sum()` (`T: Add`), `product()` (`T: Mul`) | `T`; the identity when empty | O(n) |
+| `mkString(sep)`, `mkString(start, sep, end)` (`T: Display`) | `string` | O(n) |
+| `partition(p)` | `(Vector[T], Vector[T])`: those that satisfy `p`, those that do not | O(n) |
+| `groupBy(key)` | `Map[K, Vector[T]]` | O(n) |
+| `groupMap(key, f)` | `Map[K, Vector[V]]` | O(n) |
+| `groupMapReduce(key, f, combine)` | `Map[K, V]` | O(n) |
+| `toList()`, `toVector()`, `toArray()`, `toBuffer()` | the collection, in order | O(n) |
+| `toSet()` | `Set[T]` | O(n) |
+| `toMap()`, on pairs | `Map[K, V]`, a later key's value replacing | O(n) |
+| `zipWithIndex()` | `Vector[(T, int)]`, positions from 0 | O(n) |
+| `collectFirst(pf)` | `Option[B]` | O(n) |
+
+Each group of `groupBy` and `groupMap` keeps its elements' order; `groupMapReduce` combines a key's
+values in that order, so `words.groupMapReduce(w -> w.take(1), w -> 1, (a, b) -> a + b)` counts the
+words by their first letter. The map's own order is its keys' hashes.
+
+```text
+val (small, large) = [5, 12, 3, 40].partition(x -> x < 10)    // [5, 3], [12, 40]
+(1..6).groupBy(x -> x % 3)                                     // {0: [3, 6], 1: [1, 4], 2: [2, 5]}
+["b", "a"].zipWithIndex()                                      // [("b", 0), ("a", 1)]
+```
+
+**An iterator's transformations are lazy.** `Iterator` itself has `map(f)`, `filter(p)`, `take(n)`,
+`drop(n)`, `takeWhile(p)`, `dropWhile(p)`, `zip(other)` with another iterator, and `zipWithIndex()`,
+each answering an iterator that reads its source only as far as its own `hasNext()` and `next()` ask:
+`it.map(f).take(2).toVector()` calls `f` twice however long `it` is. `drop(n)` skips when the first
+element is asked for, `zip` ends with the shorter side, and `zipWithIndex` here is an
+`Iterator[(T, int)]` rather than a vector. The new iterator shares its source, which must not then be
+read on its own.
 
 ## Builders
 
@@ -309,10 +362,11 @@ display.
 `Seq[+T]` is what every indexed sequence shares, so a function over `Seq[T]` takes a list, a vector,
 an array, a buffer or a deque. A sequence supplies `length()` and `apply(index)`, and has the rest
 from them: `get`, `isEmpty`, `nonEmpty`, `head` and `last` (trapping when empty) with `headOption` and
-`lastOption`, `foldLeft`, `foldRight`, `foreach`, `exists`, `forall`, `find`, `indexWhere`, `count`,
-`toVector`, `toList`, an iterator, and `reverseIterator`, which walks from the last element to the
-first. A sequence that reaches its elements another way overrides the ones that would be slow: a list
-walks from its front, so on a list each of them takes time proportional to its length.
+`lastOption`, `foldRight`, `indexWhere`, `toVector`, an iterator, and `reverseIterator`, which walks
+from the last element to the first. The [methods every Iterable has](#methods-every-iterable-has),
+`foldLeft`, `exists`, `count` and the rest, it has as every collection does. A sequence that reaches
+its elements another way overrides the ones that would be slow: a list walks from its front, so on a
+list each of them takes time proportional to its length.
 
 ```text
 total(xs: Seq[int]) -> int = xs.foldLeft(0, (acc, x) -> acc + x)
@@ -324,8 +378,8 @@ total(Array.fill(4, 1))            // an Array
 Impls add more to every sequence ([impl](/spec/declarations/#impl)), written once on `Seq` and
 reached through generic code over `Seq[T]` as on each sequence type: `contains(element)` and
 `indexOf(element)`, which compare with `equals` and are `exists` and `indexWhere`, so a list walks
-itself once; where the elements display, `mkString`; where they are ordered, `max()` and `min()`;
-and the sorts, `sorted()`, `sortedBy` and `sortedWith` ([sorting](#sorting)).
+itself once; and where the elements are ordered, the sorts, `sorted()`, `sortedBy` and `sortedWith`
+([sorting](#sorting)).
 
 ```text
 present[T](xs: Seq[T], x: T) -> bool = xs.contains(x)
