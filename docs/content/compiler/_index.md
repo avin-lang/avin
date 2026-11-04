@@ -127,6 +127,13 @@ one archive holding the runtime, the shims and the part of Sysl's library they r
 program links instead of the runtime's own archive. One archive means one copy of Sysl's library, so
 Sysl and Avin share standard output and keep their writes in order.
 
+The C libraries the archive's Sysl packages need are not in it. `sysl build-c` reports them after a
+build: what an `@link` named, and the `pkg_config` modules the packages require. The driver keeps
+them in a file beside the archive, `<archive>.link`, one to a line (`lib sqlite3`, `pkg sqlite3`),
+written before the archive is published; an archive found without it is built again. The link
+passes each `lib` as `-l<name>`, leaving out `c` and `m`, which every program is linked with, and
+then the words `pkg-config --libs` prints for the `pkg` modules, asked at every link.
+
 A Sysl diagnostic is placed by its line in the shim: the driver records the line of each binding's
 import and the lines of its function, and reports the message at the binding's name as `the Sysl
 binding \`name\` does not match \`module.name\`: …`. A mirror's import and its conversions are its

@@ -537,12 +537,18 @@ ensure_runtime(tc: Toolchain) -> Result[string, string]
 runtime_key(tc: Toolchain) -> string = content_key("avin " + Version + "\n" + runtime_fingerprint(tc))
 
 /** Links LLVM IR with the runtime into an executable at `output`: with `shims`, the runtime with a
- * program's binding shims, when there is one, and otherwise the runtime's own archive. The
- * executable is written under a temporary name and published by rename, so a failed link leaves any
- * previous output in place. */
+ * program's binding shims, when there is one, together with the C libraries its Sysl packages need,
+ * and otherwise the runtime's own archive. The executable is written under a temporary name and
+ * published by rename, so a failed link leaves any previous output in place. */
 link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimization: string) -> Result[unit, string]
+    var libraries: Buf[string] = buf()
     val archive = shims match
-        Some(a) -> a
+        Some(a) ->
+            val needs = link_needs_file(a)
+            if exists(needs)
+                val listed = read_text(needs).map_err(e -> s"$needs: ${e.to_string()}")?
+                libraries = link_flags(listed)?
+            a
         None -> ensure_runtime(tc)?
     val dir = make_temp_dir("avin-link").map_err(e -> e.to_string())?
     defer _ = remove_dir_all(dir)
@@ -550,8 +556,14 @@ link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimiz
     write_text(ir, llvm).map_err(e -> e.to_string())?
     val pending = pending_name(output)
     defer _ = remove_file(pending)
-    val args = ["-x", "ir", optimization, "-Wno-override-module", ir, "-x", "none", archive, "-lm", "-o", pending]
-    val result = capture(tc.clang, args, stderr = true, timeout = 120000).map_err(e -> missing_tool(tc.clang, e.to_string()))?
+    var args: Buf[string] = buf()
+    for a in ["-x", "ir", optimization, "-Wno-override-module", ir, "-x", "none", archive]
+        args.push(a)
+    for flag in libraries
+        args.push(flag)
+    for a in ["-lm", "-o", pending]
+        args.push(a)
+    val result = capture(tc.clang, args.view(), stderr = true, timeout = 120000).map_err(e -> missing_tool(tc.clang, e.to_string()))?
     if !result.status.ok()
         return Err("clang failed: " + result.status.to_string() + "\n" + result.err.unwrap_or("") + result.text)
     publish_file(pending, output).map_err(e -> e.to_string())?
