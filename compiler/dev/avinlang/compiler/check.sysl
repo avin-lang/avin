@@ -6084,7 +6084,9 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     ForYield(generators, body) -> for_yield_expr(c, e, generators, body, expected)
     Range(lower, upper, inclusive) -> range_expr(c, e, lower, upper, inclusive)
     Cons(head, tail, op_span) -> cons_expr(c, e, head, tail, op_span, expected)
-    ListLit(items) -> sequence_literal(c, e, items, expected)
+    ListLit(items) -> collection_literal(c, e, "sequence", items, buf(), expected)
+    SetLit(items) -> collection_literal(c, e, "set", items, buf(), expected)
+    MapLit(keys, values) -> collection_literal(c, e, "map", keys, values, expected)
     Break(value) -> break_expr(c, e, value)
     Continue -> continue_expr(c, e)
     Return(value) -> return_expr(c, e, value)
@@ -7094,22 +7096,85 @@ private held_element(e: &Expr, callee: &Expr, args: Buf[Argument], items: *Buf[&
         held.push(Argument(args[i].span, args[i].name, Expr(args[i].span, Name(name)), args[i].block))
     HeldElement(Expr(callee.span, Name(seq)), held)
 
-// A sequence literal `[a, b, c]` is built with a builder, except where a `List` is expected (see
-// `list_literal`): the collection the expected type names
-// supplies one when its companion object has a `builder` method, and otherwise the literal is the
-// core library's `Vector`, whatever a `Vector` of the program's own is called. The builder is held in
-// a hidden local, given each element in order with `add`, and its `result()` is the literal's value.
-// The result is matched with the expected type first, directly or as the instance of it the
-// collection is, so `val b: Buffer[byte] = [1, 2]` gives each element the expected type `byte`;
-// without one, the elements are checked on their own and agree on a type as an `if`'s branches do.
-private sequence_literal(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Option[&Type]) -> &TExpr
+// The keys or the values of a map literal: each checked against `want`, the part of the pair the
+// builder takes, or, where that is still open, checked on its own, all agreeing on one type as the
+// branches of an `if` do, which then settles `want`.
+private literal_parts(c: *Checker, exprs: Buf[&Expr], want: &Type, what: string) -> Buf[&TExpr]
+    val unit = unit_of(c)
+    var typed: Buf[&TExpr] = buf()
+    val wanted = zonk(c, want)
+    if !(*wanted is Var(_))
+        for x in exprs
+            val t = to_trait(c, check_expr(c, x, Some(wanted)), wanted)
+            if !(*t.ty is Nothing) && !(*t.ty is ErrorType) && !fits(c, t.ty, wanted)
+                c.note(unit, x.span, mismatch(c, wanted, t.ty))
+                typed.push(TExpr(t.span, ErrorType, t.kind))
+            else typed.push(t)
+        return typed
+    var agreed: Option[&Type] = None
+    for x in exprs
+        val t = check_expr(c, x, None)
+        typed.push(t)
+        agreed = agreed match
+            None -> Some(t.ty)
+            Some(so_far) -> join(c, so_far, t.ty) match
+                Some(j) -> Some(j)
+                None ->
+                    c.note(unit, x.span, s"the $what of a map literal need a common type; ${type_name(zonk(c, so_far))} and ${type_name(zonk(c, t.ty))} have none")
+                    Some(ErrorType)
+    if agreed is Some(t) then unify(c, want, t)
+    // A part of a narrower reference type is the agreed type as it is.
+    val agreed_type = zonk(c, want)
+    var out: Buf[&TExpr] = buf()
+    for t in typed
+        val same = same_type(zonk(c, t.ty), agreed_type) || *t.ty is Nothing || *t.ty is ErrorType
+        out.push(if same then t else TExpr(t.span, agreed_type, t.kind))
+    out
+
+private is_collection_literal(e: &Expr) -> bool =e.kind is ListLit(_) || e.kind is SetLit(_) || e.kind is MapLit(_, _)
+
+const MutableModule: string = "avin.collections.mutable"
+
+// Which literal the library's collection `t` is written as: "sequence" for every `Seq`, "set" for
+// the hash-based and sorted sets, immutable and mutable, "map" for the maps, and "" for any other
+// type, a program's own collection included, which any literal its builder takes can build.
+private collection_shape(c: *Checker, t: &Type) -> string
+    if seq_element(c, t) is Some(_) then return "sequence"
+    var module_name = ""
+    var name = ""
+    *t match
+        Class(k, _, _) ->
+            module_name = c.classes[k].module_name
+            name = c.classes[k].name
+        Data(d, _, _) ->
+            module_name = c.data[d].module_name
+            name = c.data[d].name
+        _ -> return ""
+    if module_name != CoreModule && module_name != MutableModule then return ""
+    if name == "Set" || (name == "TreeSet" && module_name == CoreModule) then return "set"
+    if name == "Map" || (name == "TreeMap" && module_name == CoreModule) then return "map"
+    ""
+
+// A collection literal is built with a builder, except where a `List` is expected (see
+// `list_literal`): the collection the expected type names supplies one when its companion object has
+// a `builder` method, and otherwise the literal is the core library's `Vector` for a sequence
+// literal `[a, b]`, its `Set` for a set literal `{a, b}` and its `Map` for a map literal
+// `{k: v}`, whatever a collection of the program's own is called. A library collection is built only
+// by the literal of its own shape, so `[1, 2]` where a `Set` is expected is reported; `{}` is the
+// empty set or the empty map, as expected. The builder is held in a hidden local, given each element
+// in order with `add` (a map literal's entries as `(key, value)` pairs), and its `result()` is the
+// literal's value. The result is matched with the expected type first, directly or as the instance
+// of it the collection is, so `val b: Buffer[byte] = [1, 2]` gives each element the expected type
+// `byte`; without one, the elements are checked on their own and agree on a type as an `if`'s
+// branches do, and a map literal's keys and its values each agree on theirs.
+private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Expr], values: Buf[&Expr], expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
     val at = e.span
     var want: Option[&Type] = None
     if expected is Some(t) then want = Some(zonk(c, t))
     // A `List` is a data type, built from the back with `::`, which needs no builder.
     if want is Some(t)
-        if is_list_type(c, t) then return list_literal(c, e, items, expected)
+        if is_list_type(c, t) && shape == "sequence" then return list_literal(c, e, items, expected)
     var collection: Option[usize] = None
     if want is Some(t)
         val companion = *t match
@@ -7118,15 +7183,30 @@ private sequence_literal(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Opt
             _ -> None
         if companion is Some(o)
             if methods_named(c, o, "builder").len() > 0 then collection = Some(o)
+        val wanted_shape = collection_shape(c, t)
+        // `{}` is a set literal with nothing in it, and as such the empty map too.
+        val fitting = wanted_shape == "" || wanted_shape == shape || (shape == "set" && items.len() == 0 && wanted_shape == "map")
+        if !fitting
+            val written = if wanted_shape == "sequence" then "`[a, b]`" elif wanted_shape == "set" then "`{a, b}`" else "`{k: v}`"
+            c.note(unit, at, s"${type_name(t)} is a $wanted_shape, written as a $wanted_shape literal, $written, not a $shape literal")
+            for item in items
+                check_statement(c, item)
+            for value in values
+                check_statement(c, value)
+            return TExpr(at, ErrorType, UnitConst)
     val from_expected = collection is Some(_)
     if collection is None
-        if c.class_types.get(qualified(CoreModule, "Vector")) is Some(k) then collection = c.classes[k].companion
+        val default_name = if shape == "sequence" then "Vector" elif shape == "set" then "Set" else "Map"
+        if c.class_types.get(qualified(CoreModule, default_name)) is Some(k) then collection = c.classes[k].companion
+        elif c.types.get(qualified(CoreModule, default_name)) is Some(d) then collection = c.data[d].companion
     val o = collection match
         Some(o) -> o
         None ->
             for item in items
                 check_statement(c, item)
-            c.note(unit, at, "a collection literal needs the core library's `Vector`")
+            for value in values
+                check_statement(c, value)
+            c.note(unit, at, s"a $shape literal needs the core library's `${if shape == "sequence" then "Vector" elif shape == "set" then "Set" else "Map"}`")
             return TExpr(at, ErrorType, UnitConst)
     val companion = global_read(c, at, c.classes[o].global.unwrap())
     // A `builder` declared to return a `Builder` of the expected collection takes its type
@@ -7144,11 +7224,14 @@ private sequence_literal(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Opt
     // empty literal with neither is reported as one.
     val first_unknown = c.unknowns.len()
     val builder = call_method(c, at, at, companion, "builder", methods_named(c, o, "builder"), buf(), None, wanted_builder, false)
+    val example = if shape == "sequence" then "`val xs: Vector[int] = []`" elif shape == "set" then "`val s: Set[int] = {}`" else "`val m: Map[string, int] = {}`"
     for i in first_unknown..<c.unknowns.len()
-        c.unknowns[i].message = "cannot infer the element type of an empty collection literal; give it a type, as in `val xs: Vector[int] = []`"
+        c.unknowns[i].message = s"cannot infer the element type of an empty collection literal; give it a type, as in $example"
     if *builder.ty is ErrorType
         for item in items
             check_statement(c, item)
+        for value in values
+            check_statement(c, value)
         return builder
     val held = hidden_local(c, builder.ty)
     val receiver = TExpr(at, builder.ty, Local(held))
@@ -7168,7 +7251,40 @@ private sequence_literal(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Opt
         c.note(unit, at, s"the `add` method of ${type_name(builder.ty)} does not take one element, so it cannot build a literal")
         return TExpr(at, ErrorType, UnitConst)
     val element = zonk(c, substitute(adding.params[0], adding.owner, adding.known))
-    if *element is Var(_)
+    if shape == "map"
+        val parts: Buf[&Type] = *element match
+            Tuple(types) -> types
+            _ -> buf()
+        if parts.len() != 2
+            c.note(unit, at, s"${type_name(builder.ty)} takes elements of type ${type_name(element)}, not `(key, value)` pairs, so a map literal cannot build it")
+            for item in items
+                check_statement(c, item)
+            for value in values
+                check_statement(c, value)
+            return TExpr(at, ErrorType, UnitConst)
+        val typed_keys = literal_parts(c, items, parts[0], "keys")
+        val typed_values = literal_parts(c, values, parts[1], "values")
+        var pair_types: Buf[&Type] = buf()
+        pair_types.push(zonk(c, parts[0]))
+        pair_types.push(zonk(c, parts[1]))
+        val pair: &Type = Tuple(pair_types)
+        for i in 0..<items.len()
+            val span = items[i].span.to(values[i].span)
+            var pair_parts: Buf[&Expr] = buf()
+            pair_parts.push(items[i])
+            pair_parts.push(values[i])
+            var args: Buf[Argument] = buf()
+            args.push(Argument(span, None, Expr(span, Tuple(pair_parts)), false))
+            var typed_parts: Buf[&TExpr] = buf()
+            typed_parts.push(typed_keys[i])
+            typed_parts.push(typed_values[i])
+            val failed = *typed_keys[i].ty is ErrorType || *typed_values[i].ty is ErrorType
+            val never = *typed_keys[i].ty is Nothing || *typed_values[i].ty is Nothing
+            val ty: &Type = if failed then ErrorType elif never then Nothing else pair
+            var given: Buf[Option[&TExpr]] = buf()
+            given.push(Some(TExpr(span, ty, Construct(0, typed_parts))))
+            steps.push(method_call(c, span, span, receiver, adds[0], args, None, None, false, given))
+    elif *element is Var(_)
         // No element type is expected, so the elements decide it.
         var typed: Buf[&TExpr] = buf()
         var agreed: Option[&Type] = None
@@ -7524,7 +7640,7 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
     // A number or collection literal takes its type from another operand: `xs == [1, 2]` builds the
     // collection `xs` is.
     for o in operands
-        if is_literal(o) || o.kind is ListLit(_) then early.push(None)
+        if is_literal(o) || is_collection_literal(o) then early.push(None)
         else
             val t = check_expr(c, o, None)
             if anchor is None && settled(t.ty) then anchor = Some(t.ty)

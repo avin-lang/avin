@@ -345,12 +345,12 @@ val scores = TreeMap(("cy", 7), ("al", 9), ("bo", 4))
 print(scores)                     // {al: 9, bo: 4, cy: 7}
 print(scores.range("b", "c"))     // {bo: 4}
 print(scores.floor("bz"))         // Some((bo, 4))
-val small: TreeSet[int] = [5, 1, 3]
+val small: TreeSet[int] = {5, 1, 3}
 print(small.until(4))             // {1, 3}
 ```
 
 `TreeMap.empty`, `TreeMap.builder` and `TreeMap((k, v), …)`, and the same for `TreeSet`, make them as
-their hash-based counterparts' companions do, and a sequence literal builds one where one is expected.
+their hash-based counterparts' companions do, and a set or map literal builds one where one is expected.
 
 ## Indexing and callable sequences
 
@@ -487,12 +487,20 @@ val seen: mutable.Set[int] = {}
 
 A literal is built with its collection's [builder](#builders): sequence types (`List`, `Vector`,
 `Array`, `Buffer`, `Deque`) from sequence literals, set types from set literals and map types from
-map literals. A library or user collection with a builder can be written as a literal the same way:
+map literals, the mutable `Set` and `Map` of `avin.collections.mutable` and `TreeSet` and `TreeMap`
+included. Each is built only by the literal of its own shape: `[1, 2]` where a `Set` is expected is
+an error, as `{1, 2}` is where a `Vector` is; `{}` is the empty set or the empty map, whichever is
+expected. A library or user collection with a builder can be written as a literal the same way:
 a class or `data` type whose companion object has a `builder()` method, returning a `Builder` of the
-elements and the type, is built by a sequence literal wherever that class is expected. The elements take their
-types from the expected element type when there is one (`Array[byte]` makes each literal a
-`byte`), and otherwise from the elements themselves, which agree on a type as the branches of an
-`if` do: `[dog, cat]` is a `Vector[Animal]`, and `[1, "two"]` is an error. An empty literal with
+elements and the type, is built by a sequence or set literal wherever that class is expected, and by
+a map literal when its builder takes `(key, value)` pairs, each entry given to it as one. The
+elements take their types from the expected element type when there is one (`Array[byte]` makes
+each literal a `byte`), and otherwise from the elements themselves, which agree on a type as the
+branches of an `if` do: `[dog, cat]` is a `Vector[Animal]`, and `[1, "two"]` is an error. A map
+literal's keys agree on one type and its values on another, so `{a: dog, b: cat}` is a
+`Map[string, Animal]`. A literal in braces is all elements or all entries; `{1, b: 2}` is an
+error. Set and map literals nest inside one another and inside sequence literals, and like them may
+spread over lines, a trailing comma allowed. An empty literal with
 nothing to say what it holds takes its type from a later use, as `None` does, and is otherwise an
 error asking for an annotation. A literal compared with `==`, `!=` or an ordering takes the other
 operand's type as its expected type, so `xs == [1, 2]` compares a `List` with a `List` when `xs` is
