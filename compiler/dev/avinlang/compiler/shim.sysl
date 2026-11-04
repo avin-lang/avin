@@ -234,7 +234,7 @@ private mirror_of(w: *ShimWriter, c: &Crossing) -> Option[usize]
 private sysl_type(w: *ShimWriter, c: &Crossing) -> string = c.form match
     Plain -> sysl_side(c.ty)
     Bytes -> "[]u8"
-    OptionForm -> s"Option[${sysl_type(w, payload(c, "Some"))}]"
+    OptionForm(_) -> s"Option[${sysl_type(w, payload(c, "Some"))}]"
     ResultForm -> s"Result[${sysl_type(w, payload(c, "Ok"))}, ${sysl_type(w, payload(c, "Err"))}]"
     Mirror(_, _, _, _, _) -> s"mirror_${mirror_of(w, c).unwrap()}"
     Elements(element, _) -> s"[]${sysl_type(w, element)}"
@@ -244,7 +244,7 @@ private sysl_type(w: *ShimWriter, c: &Crossing) -> string = c.form match
 private sysl_types(w: *ShimWriter, c: &Crossing) -> Buf[string]
     var out: Buf[string] = buf()
     c.form match
-        OptionForm ->
+        OptionForm(_) ->
             for t in sysl_types(w, payload(c, "Some"))
                 out.push(s"Option[$t]")
         ResultForm ->
@@ -264,6 +264,12 @@ private payload(c: &Crossing, name: string) -> &Crossing
     for v in c.variants
         if v.name == name then return v.fields[0].crossing
     c
+
+// The field of an option's `Some`.
+private payload_field(c: &Crossing) -> CrossField
+    for v in c.variants
+        if v.name == "Some" then return v.fields[0]
+    panic("an option's crossing without `Some`")
 
 // How a value of `c`'s type is passed with the C convention.
 private crossing_c_side(c: &Crossing) -> string = if c.form is Plain then c_side(c.ty) else "*u8"
@@ -317,6 +323,13 @@ private in_function(w: *ShimWriter, k: usize)
     put(w, "\n")
     val start = w.line
     put(w, s"// ${type_name(c.ty)} into Sysl.\nprivate in_$k(ctx: *Context, p: *u8, ds: **u8) -> ${sysl_type(w, c)}\n")
+    // An option Avin keeps as a pointer is `None` where it is null, and otherwise its value.
+    if c.form is OptionForm(true)
+        val f = payload_field(c)
+        put(w, "    if p == null then return None\n")
+        put(w, "    Some(" + into_expr(w, f.crossing, "p", "ds", f.base) + ")\n")
+        mirror_lines(w, c, start)
+        return
     if c.variants.len() > 1 then put(w, "    val tag = descriptor_of(p).tag\n")
     for t in 0..<c.variants.len()
         val v = c.variants[t]
@@ -356,6 +369,11 @@ private out_overload(w: *ShimWriter, k: usize, c: &Crossing, spelling: string)
     val mirrored = c.form is Mirror(_, _, _, _, _)
     val structure = c.form is Mirror(_, _, _, _, true)
     put(w, s"private out_$k(ctx: *Context, v: $spelling, ds: **u8) -> *u8\n")
+    if c.form is OptionForm(true)
+        val f = payload_field(c)
+        put(w, "    v match\n        None -> null\n")
+        put(w, "        Some(f0) -> " + out_expr(w, f.crossing, "f0", "ds", f.base, false) + "\n")
+        return
     if !structure then put(w, "    v match\n")
     for t in 0..<c.variants.len()
         val v = c.variants[t]
@@ -485,9 +503,9 @@ private out_of_sysl(t: &Type, r: string) -> string = *t match
 ensure_shims(tc: Toolchain, bindings: Buf[MirBinding], units: Buf[SourceUnit]) -> Result[string, string]
     val shim = shim_source(bindings)
     val manifest = shim_manifest(tc.runtime_dir())
-    val version = capture("sysl", ["--version"], timeout = 60000) match
+    val version = capture(tc.sysl, ["--version"], timeout = 60000) match
         Ok(r) -> r.text
-        Err(e) -> return Err("could not run sysl: " + e.to_string())
+        Err(e) -> return Err("avin: " + missing_tool(tc.sysl, e.to_string()))
     val archive = tc.shim_cache() + "/" + content_key(manifest + shim.text + version + runtime_fingerprint(tc)) + ".a"
     if exists(archive) then return Ok(archive)
     make_dir_all(tc.shim_cache()).map_err(e -> e.to_string())?
@@ -501,7 +519,7 @@ ensure_shims(tc: Toolchain, bindings: Buf[MirBinding], units: Buf[SourceUnit]) -
     val pending = pending_name(archive)
     defer _ = remove_file(pending)
     defer _ = remove_file(pending + ".h")
-    val result = capture("sysl", ["build-c", dir, "-o", pending], stderr = true, timeout = 300000).map_err(e -> "could not run sysl: " + e.to_string())?
+    val result = capture(tc.sysl, ["build-c", dir, "-o", pending], stderr = true, timeout = 300000).map_err(e -> "avin: " + missing_tool(tc.sysl, e.to_string()))?
     if !result.status.ok()
         val output = result.err.unwrap_or("") + result.text
         return Err(shim_diagnostics(output, shim, bindings, units))
@@ -590,8 +608,9 @@ content_key(text: string) -> string
         out.push_char(char(hex.bytes[usize(digest[i] & 15)]))
     out.finish()
 
-/** The runtime's sources, each file's path and text in the order of their paths, which a shim archive
- * is built from as much as from the shims, and every executable is linked with. */
+/** The runtime's sources, each file's path in the runtime and its text, in the order of their paths,
+ * which a shim archive is built from as much as from the shims, and every executable is linked with.
+ * The paths are the runtime's own, so the same sources installed anywhere read the same. */
 runtime_fingerprint(tc: Toolchain) -> string
     var files: Buf[string] = buf()
     var entries = walk(tc.runtime_dir())
@@ -607,7 +626,8 @@ runtime_fingerprint(tc: Toolchain) -> string
             files.push(entry.path)
     val sorted = files.view()
     sort(sorted)
+    val prefix = tc.runtime_dir().bytes.len
     var out = str_builder()
     for f in sorted
-        out.push(f + "\n" + read_text(f).unwrap_or("") + "\n")
+        out.push(f[prefix..] + "\n" + read_text(f).unwrap_or("") + "\n")
     out.finish()

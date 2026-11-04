@@ -1,0 +1,1043 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.encoding.json.{Json, Member as JsonMember, parse as parse_json}
+import sysl.fs.{entries, is_dir, read_text}
+import sysl.io.{Reader, stdin}
+import sysl.path.parent
+import sysl.slices.sort_by
+import sysl.text.{from_utf8, from_utf8_lossy, parse_uint, str_builder, to_lower}
+
+// `avin lsp`: the Language Server Protocol over standard input and output, answered by the compiler
+// itself.
+//
+// **Every answer comes from the analysis `avin check` makes**, not from a second reading of the
+// language: a diagnostic is one the parser or the checker reports, a hover is what the checker knew
+// about the name, a definition is where the checker resolved it to (`definition_index.sysl`), and a
+// completion is what the checker found in scope where the cursor is (`completion.sysl`).
+// What an editor holds and has not saved is read in place of the disk, so nothing is written
+// anywhere for the server to read back.
+//
+// **A change is answered by analyzing again, whole**: the program the document belongs to is parsed
+// and checked with the library, as `avin check` does, and the references that check recorded are
+// kept until the next change: each open document's own, for hover, definition, highlights and
+// semantic tokens, and the whole program's, for the references of a declaration. A program is the directory it is rooted at
+// or the file alone (`lsp_program`); a file of the library is checked as the library.
+//
+// Positions are the protocol's: a line counted from zero and a character counted in UTF-16 code
+// units, converted from the byte offsets the compiler keeps (`lsp_position`, `lsp_offset`).
+
+// The JSON-RPC and protocol error codes the server answers with.
+val LspParseError: int = -32700
+val LspInvalidRequest: int = -32600
+val LspMethodNotFound: int = -32601
+val LspServerNotInitialized: int = -32002
+
+/** One document the editor has open: where it is, what it says, and what the last analysis of its
+ * program found in it. */
+struct LspDocument
+    uri: string
+    file: string
+    text: string
+    references: Buf[Reference]
+    /** The program the last analysis that read the document was of, whose references are the ones
+     * the document's names are looked for among. */
+    root: string
+
+/** Every reference one analysis of a program recorded, in every file it read. */
+struct LspIndexed
+    root: string
+    references: Buf[Reference]
+
+/** What the server remembers between messages. */
+struct LspServer
+    toolchain: Toolchain
+    initialized: bool
+    shut_down: bool
+    /** Set by `exit`: the status the process ends with, zero after a `shutdown` and one without. */
+    exit_code: Option[int]
+    documents: Buf[LspDocument]
+    /** Every file whose last published list was not empty, with the program it was published for:
+     * what has to be cleared when that program's next analysis finds nothing wrong there. */
+    published: Buf[LspPublished]
+    /** The last whole analysis of each program, for what is asked across all of it. */
+    programs: Buf[LspIndexed]
+    /** Whether the editor said at `initialize` that it expands snippets, so a completed call can
+     * leave its arguments to fill in. */
+    snippets: bool
+
+/** A file the server last published diagnostics for, and the program that found them. */
+struct LspPublished
+    root: string
+    uri: string
+
+lsp_server(tc: Toolchain) -> LspServer = LspServer(tc, false, false, None, buf(), buf(), buf(), false)
+
+const LspUsage: string = "usage: avin lsp [--stdio]"
+
+/** `avin lsp [--stdio]`. The flag is what an editor's client library passes to say which transport
+ * it chose; standard input and output is the only one there is. */
+lsp_command(args: []const string, tc: Option[Toolchain], note: string -> unit) -> int
+    for i in 2..<args.len
+        if args[i] != "--stdio"
+            note(LspUsage)
+            return 2
+    val toolchain = tc match
+        Some(t) -> t
+        None ->
+            note(NoToolchain)
+            return 1
+    var input = stdin()
+    lsp_serve(&input, stdout(), toolchain, note)
+
+/** Reads messages from `r` and writes the answers to `w` until `exit`, returning the status to end
+ * with. Input that ends without an `exit`, or a message whose framing cannot be read, ends the
+ * server with status one: past a broken header there is no telling where the next message starts. */
+lsp_serve(r: *Reader, w: *Writer, tc: Toolchain, note: string -> unit) -> int
+    var server = lsp_server(tc)
+    var pending: Buf[u8] = buf()
+    loop
+        val body = lsp_read(r, &pending) match
+            Err(why) ->
+                note(s"avin lsp: $why")
+                return 1
+            Ok(None) -> return 1
+            Ok(Some(text)) -> text
+        for out in lsp_answer(&server, body)
+            w.write(lsp_frame(out).bytes)
+            flush()
+        if server.exit_code is Some(code) then return code
+
+/** One message framed as the protocol frames it: a `Content-Length` header, a blank line, the body. */
+lsp_frame(body: string) -> string = s"Content-Length: ${body.bytes.len}\r\n\r\n$body"
+
+/** The next message's body, read off `r` past whatever `pending` already holds: `None` where the
+ * input ended cleanly between two messages. */
+lsp_read(r: *Reader, pending: *Buf[u8]) -> Result[Option[string], string]
+    var chunk: [4096]u8 = [0; 4096]
+    loop
+        if lsp_header_end(*pending) is Some(head)
+            val length = lsp_content_length(from_utf8_lossy(pending.view()[0..<head]))?
+            val need = head + 4 + length
+            while pending.len() < need
+                val got = r.read(chunk)
+                if got.len == 0 then return Err("the input ended inside a message")
+                for b in got
+                    pending.push(b)
+            val body = from_utf8_lossy(pending.view()[head + 4..<need])
+            var rest: Buf[u8] = buf()
+            for i in need..<pending.len()
+                rest.push(pending[i])
+            *pending = rest
+            return Ok(Some(body))
+        val got = r.read(chunk)
+        if got.len == 0
+            if pending.len() == 0 then return Ok(None)
+            return Err("the input ended inside a message's header")
+        for b in got
+            pending.push(b)
+
+// Where the header block ends: the offset of the `\r\n\r\n` that closes it.
+private lsp_header_end(b: Buf[u8]) -> Option[usize]
+    if b.len() < 4 then return None
+    for i in 0..b.len() - 4
+        if b[i] == u8('\r') && b[i + 1] == u8('\n') && b[i + 2] == u8('\r') && b[i + 3] == u8('\n') then return Some(i)
+    None
+
+// The body's length, from the header block; a header's name is matched without regard to case.
+private lsp_content_length(headers: string) -> Result[usize, string]
+    for line in headers.split("\r\n")
+        val colon = line.index_of(":") match
+            Some(at) -> at
+            None -> continue
+        if to_lower(line[0..<colon]) != "content-length" then continue
+        return parse_uint(line[colon + 1..].trim()) match
+            Ok(n) -> Ok(usize(n))
+            Err(_) -> Err(s"'$line' is not a length")
+    Err("a message with no Content-Length header")
+
+/** What the server says to one message body: the response to a request, and any notification the
+ * message caused, in the order they are to be written. */
+lsp_answer(server: *LspServer, body: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val msg = parse_json(body) match
+        Err(why) ->
+            out.push(lsp_error(Json.Null, LspParseError, s"the message is not JSON: $why"))
+            return out
+        Ok(m) -> m
+    val id = msg.get("id")
+    val method = lsp_text_at(msg, ["method"]) match
+        Some(m) -> m
+        None ->
+            // A response to something the server asked is the one message with no method, and the
+            // server asks nothing.
+            if id is None || (msg.get("result") is None && msg.get("error") is None)
+                out.push(lsp_error(id.unwrap_or(Json.Null), LspInvalidRequest, "a request names a method"))
+            return out
+    // A notification has no id and is never answered, an unknown one included.
+    val asked = id match
+        Some(i) -> i
+        None ->
+            lsp_notified(server, method, msg, &out)
+            return out
+    if method != "initialize" && !server.initialized
+        out.push(lsp_error(asked, LspServerNotInitialized, s"'$method' before 'initialize'"))
+        return out
+    if server.shut_down
+        out.push(lsp_error(asked, LspInvalidRequest, s"'$method' after 'shutdown'"))
+        return out
+    val params = msg.get("params").unwrap_or(Json.Null)
+    out.push(method match
+        "initialize" ->
+            server.initialized = true
+            server.snippets = lsp_at(params, ["capabilities", "textDocument", "completion", "completionItem", "snippetSupport"]) match
+                Some(Json.Bool(b)) -> b
+                _ -> false
+            lsp_result(asked, lsp_capabilities())
+        "shutdown" ->
+            server.shut_down = true
+            lsp_result(asked, Json.Null)
+        "textDocument/hover" -> lsp_result(asked, lsp_hover(*server, params))
+        "textDocument/definition" -> lsp_result(asked, lsp_definition(*server, params))
+        "textDocument/documentSymbol" -> lsp_result(asked, lsp_document_symbols(*server, params))
+        "textDocument/references" -> lsp_result(asked, lsp_references(*server, params))
+        "textDocument/documentHighlight" -> lsp_result(asked, lsp_highlights(*server, params))
+        "textDocument/semanticTokens/full" -> lsp_result(asked, lsp_semantic_tokens(*server, params))
+        "textDocument/completion" -> lsp_result(asked, lsp_completion(*server, params))
+        _ -> lsp_error(asked, LspMethodNotFound, s"'$method' is not a method avin lsp answers"))
+    out
+
+// A notification: what it changes, and the diagnostics a document's change publishes.
+private lsp_notified(server: *LspServer, method: string, msg: Json, out: *Buf[string])
+    if method == "exit"
+        server.exit_code = Some(if server.shut_down then 0 else 1)
+        return
+    if !server.initialized || server.shut_down then return
+    val params = msg.get("params").unwrap_or(Json.Null)
+    val uri = lsp_text_at(params, ["textDocument", "uri"]).unwrap_or("")
+    if uri == "" then return
+    if method == "textDocument/didOpen"
+        if lsp_text_at(params, ["textDocument", "text"]) is Some(text) then lsp_changed(server, uri, text, out)
+    elif method == "textDocument/didChange"
+        // Full synchronization: every change carries the whole text, and the last is what it says now.
+        if params.get("contentChanges") is Some(changes)
+            if changes.len() > 0
+                if changes.at(changes.len() - 1) is Some(last)
+                    if lsp_text_at(last, ["text"]) is Some(text) then lsp_changed(server, uri, text, out)
+    elif method == "textDocument/didSave"
+        // The editor's text is already the one analyzed; a save that carries its text says it again.
+        if lsp_text_at(params, ["text"]) is Some(text) then lsp_changed(server, uri, text, out)
+    elif method == "textDocument/didClose"
+        lsp_forget(server, uri)
+        lsp_unpublish(server, uri)
+        out.push(lsp_publish(uri, buf()))
+
+// The capabilities the server announces: full-text synchronization, hover, definition, the outline,
+// references, highlights, semantic tokens and completion, with positions counted in UTF-16, the
+// protocol's default.
+private lsp_capabilities() -> Json
+    var sync: Buf[JsonMember] = buf()
+    lsp_put(&sync, "openClose", Json.Bool(true))
+    lsp_put(&sync, "change", Json.Int(1))
+    lsp_put(&sync, "save", Json.Bool(true))
+    var caps: Buf[JsonMember] = buf()
+    lsp_put(&caps, "positionEncoding", Json.Str("utf-16"))
+    lsp_put(&caps, "textDocumentSync", Json.Obj(sync))
+    lsp_put(&caps, "hoverProvider", Json.Bool(true))
+    lsp_put(&caps, "definitionProvider", Json.Bool(true))
+    lsp_put(&caps, "documentSymbolProvider", Json.Bool(true))
+    lsp_put(&caps, "referencesProvider", Json.Bool(true))
+    lsp_put(&caps, "documentHighlightProvider", Json.Bool(true))
+    lsp_put(&caps, "semanticTokensProvider", lsp_token_legend())
+    var completion: Buf[JsonMember] = buf()
+    var triggers: Buf[Json] = buf()
+    triggers.push(Json.Str("."))
+    lsp_put(&completion, "triggerCharacters", Json.Arr(triggers))
+    lsp_put(&caps, "completionProvider", Json.Obj(completion))
+    var info: Buf[JsonMember] = buf()
+    lsp_put(&info, "name", Json.Str("avin"))
+    lsp_put(&info, "version", Json.Str(Version))
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "capabilities", Json.Obj(caps))
+    lsp_put(&out, "serverInfo", Json.Obj(info))
+    Json.Obj(out)
+
+private lsp_result(id: Json, result: Json) -> string
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "jsonrpc", Json.Str("2.0"))
+    lsp_put(&out, "id", id)
+    lsp_put(&out, "result", result)
+    Json.Obj(out).to_string()
+
+private lsp_error(id: Json, code: int, message: string) -> string
+    var err: Buf[JsonMember] = buf()
+    lsp_put(&err, "code", Json.Int(long(code)))
+    lsp_put(&err, "message", Json.Str(message))
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "jsonrpc", Json.Str("2.0"))
+    lsp_put(&out, "id", id)
+    lsp_put(&out, "error", Json.Obj(err))
+    Json.Obj(out).to_string()
+
+// `textDocument/publishDiagnostics` for one document.
+private lsp_publish(uri: string, diagnostics: Buf[Json]) -> string
+    var params: Buf[JsonMember] = buf()
+    lsp_put(&params, "uri", Json.Str(uri))
+    lsp_put(&params, "diagnostics", Json.Arr(diagnostics))
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "jsonrpc", Json.Str("2.0"))
+    lsp_put(&out, "method", Json.Str("textDocument/publishDiagnostics"))
+    lsp_put(&out, "params", Json.Obj(params))
+    Json.Obj(out).to_string()
+
+/** One member onto an object being built. */
+lsp_put(members: *Buf[JsonMember], key: string, v: Json) = members.push(JsonMember(key, v))
+
+/** The member under each key in turn: `lsp_at(m, ["params", "textDocument", "uri"])`. */
+lsp_at(j: Json, keys: []const string) -> Option[Json]
+    var here = j
+    for key in keys
+        here = here.get(key) match
+            Some(v) -> v
+            None -> return None
+    Some(here)
+
+/** The string at `keys`, where a string is there. */
+lsp_text_at(j: Json, keys: []const string) -> Option[string] = lsp_at(j, keys) match
+    Some(v) -> v.as_str()
+    None -> None
+
+/** The integer at `keys`, where one is there and fits an `int`. */
+lsp_int_at(j: Json, keys: []const string) -> Option[int]
+    val n = lsp_at(j, keys) match
+        Some(v) -> v.as_int()
+        None -> None
+    n match
+        Some(k) -> if k >= -2147483648 && k <= 2147483647 then Some(int(k)) else None
+        None -> None
+
+// ---- analysis ----
+
+/** What a file is compiled as: the directory a program of many files is rooted at, the file alone,
+ * or the library. */
+struct LspProgram
+    root: string
+    directory: bool
+    library: bool
+
+/** The program `file` belongs to, `header` being the module its first line names. A file of the
+ * library is the library's, and a file in a package is the package's. A file whose header names a module is in a program rooted where the
+ * directories above it spell that module (`a/b/x.avin` for `module a.b`), and a file with no header
+ * is a root file of the program in its directory when that directory has modules below it; any
+ * other file is a program by itself. */
+lsp_program(library: string, file: string, header: string) -> LspProgram
+    if file.starts_with(library + "/") then return LspProgram(library, true, true)
+    if enclosing_package(file) is Ok(Some(package)) then return LspProgram(package, true, false)
+    val dir = parent(file).unwrap_or("")
+    if header != ""
+        var tail = "/"
+        for b in header.bytes
+            tail = tail + (if b == u8('.') then "/" else from_utf8_lossy([b]))
+        if dir.ends_with(tail) && dir.bytes.len > tail.bytes.len then return LspProgram(dir[0..<dir.bytes.len - tail.bytes.len], true, false)
+        return LspProgram(file, false, false)
+    if dir != "" && lsp_holds_modules(dir, 0) then LspProgram(dir, true, false) else LspProgram(file, false, false)
+
+// Whether a directory below `dir`, at most a few levels down, holds an `.avin` or `.lavin` file.
+private lsp_holds_modules(dir: string, depth: usize) -> bool
+    if depth > 3 then return false
+    val names = entries(dir) match
+        Ok(n) -> n
+        Err(_) -> return false
+    for name in names
+        if name.starts_with(".") then continue
+        val full = dir + "/" + name
+        if is_dir(full)
+            if lsp_dir_has_avin(full, depth + 1) then return true
+    false
+
+private lsp_dir_has_avin(dir: string, depth: usize) -> bool
+    if depth > 4 then return false
+    val names = entries(dir) match
+        Ok(n) -> n
+        Err(_) -> return false
+    for name in names
+        if name.starts_with(".") then continue
+        if is_source_name(name) then return true
+        val full = dir + "/" + name
+        if is_dir(full)
+            if lsp_dir_has_avin(full, depth + 1) then return true
+    false
+
+/** What one file is told: its diagnostics. */
+struct LspFound
+    file: string
+    diagnostics: Buf[Json]
+
+/** What one analysis found: the diagnostics file by file, the analyzed document's own first; the
+ * references the check recorded; the files it read; and whether it checked the whole program, which
+ * a syntax error stops short of. */
+struct LspAnalysis
+    program: LspProgram
+    found: Buf[LspFound]
+    references: Buf[Reference]
+    files: Buf[string]
+    whole: bool
+    completions: Completions
+
+/** Analyzes the program `file` belongs to as `avin check` does, `text` in place of the disk for
+ * `file` and the editor's text for every other file it holds. With `completing`, the stand-in name
+ * written in `text` where a completion is asked for, the check also records what could be written
+ * there. */
+lsp_analyze(server: LspServer, file: string, text: string, completing: string = "") -> LspAnalysis
+    val library_dir = lsp_normal(server.toolchain.library_dir())
+    val first = parse(source_of(file, text))
+    val program = lsp_program(library_dir, file, first.file.module_name)
+    var found: Buf[LspFound] = buf()
+    found.push(LspFound(file, buf()))
+    var names: Buf[string] = buf()
+    val library = program_files(library_dir) match
+        Ok(f) -> f
+        Err(message) ->
+            found[0].diagnostics.push(lsp_diagnostic(source_of(file, text), Span(0, 0), Error, s"avin: $message"))
+            return LspAnalysis(program, found, buf(), names, false, no_completions())
+    var files: Buf[ProgramFile] = buf()
+    if program.directory && !program.library
+        files = program_tree_files(program.root) match
+            Ok(f) -> f
+            Err(message) ->
+                found[0].diagnostics.push(lsp_diagnostic(source_of(file, text), Span(0, 0), Error, s"avin: $message"))
+                return LspAnalysis(program, found, buf(), names, false, no_completions())
+    elif !program.library
+        files = single_file(source_of(file, text))
+    var units: Buf[SourceUnit] = buf()
+    var root_module = ""
+    var broken = false
+    for i in 0..<library.len() + files.len()
+        val in_library = i < library.len()
+        val f = if in_library then library[i] else files[i - library.len()]
+        val src = lsp_held(server, f.src, file, text)
+        var parsed = parse(src)
+        f.module_name match
+            Some(m) -> place_file(&parsed, m, in_library)
+            None -> root_module = parsed.file.module_name
+        if parsed.report.has_errors() then broken = true
+        names.push(src.name)
+        units.push(SourceUnit(parsed.source, parsed.file, parsed.report))
+    // A syntax error stops at the parse, as a build does: each file's syntax errors are reported, the
+    // first on each line.
+    if broken
+        for u in units
+            if u.report.has_errors() then lsp_found(&found, u, true)
+        return LspAnalysis(program, found, buf(), names, false, no_completions())
+    val checked = check_program(units, root_module, program.library, completing == "", completing)
+    for u in checked.units
+        if u.report.len() > 0 then lsp_found(&found, u, false)
+    LspAnalysis(program, found, checked.references, names, true, checked.completions)
+
+// A file's source as the editor holds it, where it holds it: `text` for the file being analyzed.
+private lsp_held(server: LspServer, src: Source, file: string, text: string) -> Source
+    val name = lsp_normal(src.name)
+    if name == file then return source_of(name, text)
+    for d in server.documents
+        if d.file == name then return source_of(name, d.text)
+    if name == src.name then src else source(name, src.bytes)
+
+// A unit's diagnostics onto what its file is told.
+private lsp_found(found: *Buf[LspFound], u: SourceUnit, first_per_line: bool)
+    var k = 0usize
+    while k < found.len() && found[k].file != u.src.name
+        k += 1
+    if k == found.len() then found.push(LspFound(u.src.name, buf()))
+    var last_line = 0usize
+    for i in 0..<u.report.len()
+        val d = u.report.at(i)
+        val line = u.src.locate(d.span.start).line
+        if first_per_line && i > 0 && line <= last_line then continue
+        last_line = line
+        var message = d.message
+        if d.label != "" then message = message + "\n" + d.label
+        if d.note != "" then message = message + "\n" + d.note
+        found[k].diagnostics.push(lsp_diagnostic(u.src, d.span, d.severity, message))
+
+private lsp_diagnostic(src: Source, at: Span, severity: Severity, message: string) -> Json
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "range", lsp_range(src, at))
+    lsp_put(&out, "severity", Json.Int(severity match
+        Error -> 1
+        Warning -> 2
+        Note -> 3
+        Help -> 4))
+    lsp_put(&out, "source", Json.Str("avin"))
+    lsp_put(&out, "message", Json.Str(message))
+    Json.Obj(out)
+
+/** A document's new text: held in place of the disk, its program analyzed, what the analysis
+ * recorded given to every open document of the program, and the diagnostics published -- the
+ * document's own first, then every other file the analysis found something wrong in, then an empty
+ * list for each file this program had published for and no longer finds anything wrong in. */
+private lsp_changed(server: *LspServer, uri: string, text: string, out: *Buf[string])
+    val file = lsp_uri_file(uri)
+    lsp_forget(server, uri)
+    server.documents.push(LspDocument(uri, file, text, buf(), ""))
+    val a = lsp_analyze(*server, file, text)
+    val root = a.program.root
+    if a.whole
+        for i in 0..<server.documents.len()
+            var read = false
+            for n in a.files
+                if n == server.documents[i].file then read = true
+            if !read then continue
+            var mine: Buf[Reference] = buf()
+            for r in a.references
+                if r.at_file == server.documents[i].file then mine.push(r)
+            server.documents[i].references = mine
+            server.documents[i].root = root
+        var programs: Buf[LspIndexed] = buf()
+        for p in server.programs
+            if p.root != root then programs.push(p)
+        programs.push(LspIndexed(root, a.references))
+        server.programs = programs
+    var now: Buf[LspPublished] = buf()
+    for f in a.found
+        val there = if f.file == file then uri else lsp_uri_of(*server, f.file)
+        out.push(lsp_publish(there, f.diagnostics))
+        if f.diagnostics.len() > 0 then now.push(LspPublished(root, there))
+    // A file is cleared only by an analysis that read it: a syntax error stops before the rest of
+    // the program is checked, so what was published for the other files stands.
+    var kept: Buf[LspPublished] = buf()
+    for p in server.published
+        var still = p.uri == uri
+        for n in now
+            if n.uri == p.uri then still = true
+        if still then continue
+        if p.root == root && a.whole then out.push(lsp_publish(p.uri, buf()))
+        else kept.push(p)
+    for n in now
+        kept.push(n)
+    server.published = kept
+
+// The URI a file is published under: the one the editor opened it by where it is open, so that a
+// file has one list whichever analysis found its mistakes.
+private lsp_uri_of(server: LspServer, file: string) -> string
+    for d in server.documents
+        if d.file == file then return d.uri
+    lsp_file_uri(file)
+
+private lsp_unpublish(server: *LspServer, uri: string)
+    var kept: Buf[LspPublished] = buf()
+    for p in server.published
+        if p.uri != uri then kept.push(p)
+    server.published = kept
+
+private lsp_forget(server: *LspServer, uri: string)
+    var kept: Buf[LspDocument] = buf()
+    for d in server.documents
+        if d.uri != uri then kept.push(d)
+    server.documents = kept
+
+private lsp_document(server: LspServer, uri: string) -> Option[LspDocument]
+    for d in server.documents
+        if d.uri == uri then return Some(d)
+    None
+
+// ---- positions ----
+
+lsp_range(src: Source, at: Span) -> Json
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "start", lsp_position(src, at.start))
+    lsp_put(&out, "end", lsp_position(src, if at.end > at.start then at.end else at.start))
+    Json.Obj(out)
+
+/** The protocol's position of a byte offset: the line from zero, and the character as the UTF-16
+ * code units before it on its line -- one for each character, two for one outside the Basic
+ * Multilingual Plane, which is the one whose UTF-8 lead byte is `0xF0` or above. */
+lsp_position(src: Source, offset: usize) -> Json
+    val at = if offset > src.bytes.len then src.bytes.len else offset
+    val line = src.locate(at).line
+    var units = 0
+    for i in src.starts[line - 1]..<at
+        val b = src.bytes[i]
+        if (b & 0xC0) != 0x80 then units += if b >= 0xF0 then 2 else 1
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "line", Json.Int(long(line - 1)))
+    lsp_put(&out, "character", Json.Int(long(units)))
+    Json.Obj(out)
+
+/** The byte offset of a protocol position: `lsp_position` turned around. A character past the end
+ * of its line is the line's end, and a line past the end of the file is the file's end. */
+lsp_offset(src: Source, line: int, character: int) -> usize
+    if line < 0 then return 0
+    if usize(line) >= src.line_count() then return src.bytes.len
+    var at = src.starts[usize(line)]
+    var units = 0
+    while at < src.bytes.len && src.bytes[at] != u8('\n') && units < character
+        val b = src.bytes[at]
+        val width: usize = if b < 0x80 then 1 elif b < 0xE0 then 2 elif b < 0xF0 then 3 else 4
+        units += if width == 4 then 2 else 1
+        at += width
+    if at > src.bytes.len then src.bytes.len else at
+
+// ---- hover and definition ----
+
+// The reference written at `offset` in a document: the smallest one covering it, so that a cursor
+// on an argument is on the argument and not the call around it. A cursor just past a name's last
+// character is on that name too, as editors place a cursor after the word it was typed into.
+private lsp_reference_at(d: LspDocument, offset: usize) -> Option[Reference]
+    var best: Option[Reference] = None
+    for pass in 0..<2
+        if pass == 1 && (best is Some(_) || offset == 0) then break
+        val at = if pass == 0 then offset else offset - 1
+        for r in d.references
+            if at < r.at_span.start || at >= r.at_span.end then continue
+            best = best match
+                Some(b) -> if r.at_span.len() < b.at_span.len() then Some(r) else Some(b)
+                None -> Some(r)
+    best
+
+// The document and offset a `textDocument/*` request's `params` point at.
+private lsp_point(server: LspServer, params: Json) -> Option[(LspDocument, usize)]
+    val uri = lsp_text_at(params, ["textDocument", "uri"]).unwrap_or("")
+    val d = lsp_document(server, uri) match
+        Some(d) -> d
+        None -> return None
+    val line = lsp_int_at(params, ["position", "line"]).unwrap_or(0)
+    val character = lsp_int_at(params, ["position", "character"]).unwrap_or(0)
+    Some((d, lsp_offset(source_of(d.file, d.text), line, character)))
+
+/** `textDocument/hover`: what the checker knew about the name under the cursor, as Avin code, and
+ * the declaration's doc comment under it. */
+lsp_hover(server: LspServer, params: Json) -> Json
+    val (d, offset) = lsp_point(server, params) match
+        Some(p) -> p
+        None -> return Json.Null
+    val r = lsp_reference_at(d, offset) match
+        Some(r) -> r
+        None -> return Json.Null
+    var value = s"```avin\n${r.detail}\n```"
+    if r.doc != "" then value = value + "\n\n" + r.doc
+    var contents: Buf[JsonMember] = buf()
+    lsp_put(&contents, "kind", Json.Str("markdown"))
+    lsp_put(&contents, "value", Json.Str(value))
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "contents", Json.Obj(contents))
+    lsp_put(&out, "range", lsp_range(source_of(d.file, d.text), r.at_span))
+    Json.Obj(out)
+
+// ---- completion ----
+
+/** `textDocument/completion`: what the checker finds may be written at the cursor
+ * (`completion.sysl`). The document's word at the cursor is replaced by a stand-in in a copy of its
+ * text, the first copy that parses is analyzed with its program, and what the check recorded at the
+ * stand-in is answered, with the keywords that begin an expression where a name in one is being
+ * written. Nothing the analysis finds is published or kept: the editor's document, its diagnostics
+ * and its references are those of its last change. The editor filters the list by what is typed. */
+lsp_completion(server: LspServer, params: Json) -> Json
+    val (d, offset) = lsp_point(server, params) match
+        Some(p) -> p
+        None -> return Json.Null
+    var items: Buf[Json] = buf()
+    if !completion_in_code(d.file, d.text, offset) then return lsp_completion_list(items)
+    val word = completion_word(d.text, offset)
+    var chosen = ""
+    for t in completion_texts(d.text, word)
+        if !parse(source_of(d.file, t)).report.has_errors()
+            chosen = t
+            break
+    if chosen == "" then return lsp_completion_list(items)
+    val found = lsp_analyze(server, d.file, chosen, CompletionMarker).completions
+    for c in found.items
+        items.push(lsp_completion_item(server, c))
+    if found.site is ValueSite
+        for k in ["val", "var", "if", "match", "for", "while", "loop", "return", "break", "continue", "true", "false"]
+            items.push(lsp_keyword_item(k))
+    lsp_completion_list(items)
+
+private lsp_completion_list(items: Buf[Json]) -> Json
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "isIncomplete", Json.Bool(false))
+    lsp_put(&out, "items", Json.Arr(items))
+    Json.Obj(out)
+
+// One completion: sorted by how near its scope is, then by name; a call written as a snippet with
+// a placeholder for each argument where the editor expands snippets.
+private lsp_completion_item(server: LspServer, c: Completion) -> Json
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "label", Json.Str(c.label))
+    lsp_put(&out, "kind", Json.Int(lsp_completion_kind(c)))
+    lsp_put(&out, "detail", Json.Str(c.detail))
+    if c.doc != ""
+        var doc: Buf[JsonMember] = buf()
+        lsp_put(&doc, "kind", Json.Str("markdown"))
+        lsp_put(&doc, "value", Json.Str(c.doc))
+        lsp_put(&out, "documentation", Json.Obj(doc))
+    lsp_put(&out, "sortText", Json.Str(s"${c.group}_${c.label}"))
+    val callable = !c.property && (c.kind is FunctionName || c.kind is MethodName)
+    if server.snippets && callable && c.params.len() > 0
+        var text = c.label + "("
+        for i in 0..<c.params.len()
+            if i > 0 then text = text + ", "
+            text = text + "${" + s"${i + 1}:${c.params[i]}" + "}"
+        lsp_put(&out, "insertText", Json.Str(text + ")"))
+        lsp_put(&out, "insertTextFormat", Json.Int(2))
+    else
+        lsp_put(&out, "insertText", Json.Str(c.label))
+        lsp_put(&out, "insertTextFormat", Json.Int(1))
+    Json.Obj(out)
+
+private lsp_keyword_item(word: string) -> Json
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "label", Json.Str(word))
+    lsp_put(&out, "kind", Json.Int(14))
+    lsp_put(&out, "sortText", Json.Str("5_" + word))
+    lsp_put(&out, "insertText", Json.Str(word))
+    lsp_put(&out, "insertTextFormat", Json.Int(1))
+    Json.Obj(out)
+
+// The protocol's kind of completion item for what a completion names.
+private lsp_completion_kind(c: Completion) -> long
+    if c.property then return 10
+    if c.builtin then return 22
+    c.kind match
+        ModuleName -> 9
+        ClassName -> 7
+        RecordName -> 22
+        EnumName -> 13
+        TraitName -> 8
+        TypeParamName -> 25
+        VariantName -> 20
+        FunctionName -> 3
+        MethodName -> 2
+        FieldName -> 5
+        ParamName -> 6
+        LocalName -> 6
+        GlobalName -> 6
+
+/** `textDocument/definition`: where the name under the cursor was declared, its range the name the
+ * declaration spells. */
+lsp_definition(server: LspServer, params: Json) -> Json
+    val (d, offset) = lsp_point(server, params) match
+        Some(p) -> p
+        None -> return Json.Null
+    val r = lsp_reference_at(d, offset) match
+        Some(r) -> r
+        None -> return Json.Null
+    val text = lsp_file_text(server, r.declared_file)
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "uri", Json.Str(lsp_uri_of(server, r.declared_file)))
+    lsp_put(&out, "range", lsp_range(source_of(r.declared_file, text), r.declared_span))
+    Json.Obj(out)
+
+// What a file says: an editor's text where it holds one, the disk's otherwise.
+private lsp_file_text(server: LspServer, file: string) -> string
+    for d in server.documents
+        if d.file == file then return d.text
+    read_text(file).unwrap_or("")
+
+// ---- references and highlights ----
+
+// Places in the order of their files' names, then of where they are written.
+private lsp_earlier(a: Reference, b: Reference) -> bool =
+    if a.at_file != b.at_file then a.at_file < b.at_file else a.at_span.start < b.at_span.start
+
+// Whether `r` stands for the declaration `d` stands for.
+private lsp_same_declaration(r: Reference, d: Reference) -> bool =
+    r.declared_file == d.declared_file && r.declared_span.start == d.declared_span.start && r.declared_span.end == d.declared_span.end
+
+/** `textDocument/references`: every place the program names the declaration the name under the
+ * cursor stands for, in every file the last analysis read, the library's included; the declaration's
+ * own name among them where `context.includeDeclaration` asks for it. A method's references are
+ * those of that method: a call the checker resolved to the method it overrides, or to the trait
+ * member it implements, is a reference to that one. */
+lsp_references(server: LspServer, params: Json) -> Json
+    val (d, offset) = lsp_point(server, params) match
+        Some(p) -> p
+        None -> return Json.Null
+    val target = lsp_reference_at(d, offset) match
+        Some(r) -> r
+        None -> return Json.Null
+    val declaration = lsp_at(params, ["context", "includeDeclaration"]) match
+        Some(Json.Bool(b)) -> b
+        _ -> false
+    var all = d.references
+    for p in server.programs
+        if p.root == d.root then all = p.references
+    var found: Buf[Reference] = buf()
+    for r in all
+        if !lsp_same_declaration(r, target) then continue
+        if r.declares() && !declaration then continue
+        found.push(r)
+    sort_by(found.view(), lsp_earlier)
+    var sources: Buf[Source] = buf()
+    var out: Buf[Json] = buf()
+    for r in found
+        var k = 0usize
+        while k < sources.len() && sources[k].name != r.at_file
+            k += 1
+        if k == sources.len() then sources.push(source_of(r.at_file, lsp_file_text(server, r.at_file)))
+        var location: Buf[JsonMember] = buf()
+        lsp_put(&location, "uri", Json.Str(lsp_uri_of(server, r.at_file)))
+        lsp_put(&location, "range", lsp_range(sources[k], r.at_span))
+        out.push(Json.Obj(location))
+    Json.Arr(out)
+
+/** `textDocument/documentHighlight`: the places in the document that name what the name under the
+ * cursor names, the declaration's own name written as a write and every use as a read. */
+lsp_highlights(server: LspServer, params: Json) -> Json
+    val (d, offset) = lsp_point(server, params) match
+        Some(p) -> p
+        None -> return Json.Null
+    val target = lsp_reference_at(d, offset) match
+        Some(r) -> r
+        None -> return Json.Null
+    val src = source_of(d.file, d.text)
+    var found: Buf[Reference] = buf()
+    for r in d.references
+        if lsp_same_declaration(r, target) then found.push(r)
+    sort_by(found.view(), lsp_earlier)
+    var out: Buf[Json] = buf()
+    for r in found
+        var h: Buf[JsonMember] = buf()
+        lsp_put(&h, "range", lsp_range(src, r.at_span))
+        lsp_put(&h, "kind", Json.Int(if r.declares() then 3 else 2))
+        out.push(Json.Obj(h))
+    Json.Arr(out)
+
+// ---- semantic tokens ----
+
+/** The token types the server classifies names by, in the order of the legend it announces. */
+val LspTokenTypes: []const string = ["namespace", "class", "struct", "enum", "interface", "typeParameter", "enumMember", "function", "method", "property", "parameter", "variable"]
+
+/** The token modifiers, each a bit in the order of the legend. */
+val LspTokenModifiers: []const string = ["declaration", "readonly", "static", "defaultLibrary"]
+
+// A name's position in `LspTokenTypes`.
+private lsp_token_type(kind: NameKind) -> long = kind match
+    ModuleName -> 0
+    ClassName -> 1
+    RecordName -> 2
+    EnumName -> 3
+    TraitName -> 4
+    TypeParamName -> 5
+    VariantName -> 6
+    FunctionName -> 7
+    MethodName -> 8
+    FieldName -> 9
+    ParamName -> 10
+    LocalName -> 11
+    GlobalName -> 11
+
+private lsp_token_modifiers(r: Reference) -> long
+    var bits: long = 0
+    if r.declares() then bits = bits | 1
+    if r.readonly then bits = bits | 2
+    if r.static_member then bits = bits | 4
+    if r.library then bits = bits | 8
+    bits
+
+/** `textDocument/semanticTokens/full`: every name the checker resolved in the document, classified
+ * by what it names, as the protocol's runs of five integers -- the line and the start relative to
+ * the token before, the length, the type and the modifiers -- with columns in UTF-16 code units.
+ * Keywords, literals, operators and comments are left to the editor's grammar. A name the checker
+ * reached no declaration for, as in code a syntax error stopped short of, has no token. */
+lsp_semantic_tokens(server: LspServer, params: Json) -> Json
+    val uri = lsp_text_at(params, ["textDocument", "uri"]).unwrap_or("")
+    val d = lsp_document(server, uri) match
+        Some(d) -> d
+        None -> return Json.Null
+    val src = source_of(d.file, d.text)
+    var order: Buf[Reference] = buf()
+    for r in d.references
+        if r.at_span.end > r.at_span.start && r.at_span.end <= src.bytes.len then order.push(r)
+    sort_by(order.view(), lsp_earlier)
+    var data: Buf[Json] = buf()
+    var last_line = 0usize
+    var last_column = 0usize
+    var covered = 0usize
+    var line = 0usize
+    var column = 0usize
+    var scanned = 0usize
+    for r in order
+        // One token per place, none overlapping another, none running past its line.
+        if r.at_span.start < covered then continue
+        // The line and UTF-16 column are counted forward from the token before, so the whole document
+        // is read once.
+        while scanned < r.at_span.start
+            val b = src.bytes[scanned]
+            if b == u8('\n')
+                line += 1
+                column = 0
+            elif (b & 0xC0) != 0x80
+                column += if b >= 0xF0 then 2 else 1
+            scanned += 1
+        var length = 0usize
+        var i = r.at_span.start
+        var crosses = false
+        while i < r.at_span.end
+            val b = src.bytes[i]
+            if b == u8('\n') then crosses = true
+            if (b & 0xC0) != 0x80 then length += if b >= 0xF0 then 2 else 1
+            i += 1
+        if crosses then continue
+        covered = r.at_span.end
+        val delta_column = if line == last_line then column - last_column else column
+        data.push(Json.Int(long(line - last_line)))
+        data.push(Json.Int(long(delta_column)))
+        data.push(Json.Int(long(length)))
+        data.push(Json.Int(lsp_token_type(r.kind)))
+        data.push(Json.Int(lsp_token_modifiers(r)))
+        last_line = line
+        last_column = column
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "data", Json.Arr(data))
+    Json.Obj(out)
+
+// The legend semantic tokens are written in.
+private lsp_token_legend() -> Json
+    var types: Buf[Json] = buf()
+    for t in LspTokenTypes
+        types.push(Json.Str(t))
+    var modifiers: Buf[Json] = buf()
+    for m in LspTokenModifiers
+        modifiers.push(Json.Str(m))
+    var legend: Buf[JsonMember] = buf()
+    lsp_put(&legend, "tokenTypes", Json.Arr(types))
+    lsp_put(&legend, "tokenModifiers", Json.Arr(modifiers))
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "legend", Json.Obj(legend))
+    lsp_put(&out, "full", Json.Bool(true))
+    Json.Obj(out)
+
+// ---- the outline ----
+
+// The protocol's kinds of symbol the outline names.
+const SymbolNamespace: long = 3
+const SymbolClass: long = 5
+const SymbolMethod: long = 6
+const SymbolField: long = 8
+const SymbolEnum: long = 10
+const SymbolInterface: long = 11
+const SymbolFunction: long = 12
+const SymbolVariable: long = 13
+const SymbolConstant: long = 14
+const SymbolObject: long = 19
+const SymbolEnumMember: long = 22
+
+/** `textDocument/documentSymbol`: the document's declarations as a tree, read off its parse, so an
+ * outline is there while the program has mistakes in it. */
+lsp_document_symbols(server: LspServer, params: Json) -> Json
+    val uri = lsp_text_at(params, ["textDocument", "uri"]).unwrap_or("")
+    val d = lsp_document(server, uri) match
+        Some(d) -> d
+        None -> return Json.Null
+    val parsed = parse(source_of(d.file, d.text))
+    val src = parsed.source
+    val file = parsed.file
+    var out: Buf[Json] = buf()
+    for item in file.items
+        item match
+            FunctionItem(f) -> out.push(lsp_symbol(src, f.name, SymbolFunction, f.span, name_in(src, f.name_span, f.name), buf()))
+            DataItem(data) ->
+                var variants: Buf[Json] = buf()
+                for v in data.variants
+                    variants.push(lsp_symbol(src, v.name, SymbolEnumMember, v.span, name_in(src, v.span, v.name), buf()))
+                out.push(lsp_symbol(src, data.name, SymbolEnum, data.span, name_in(src, data.span, data.name), variants))
+            ClassItem(decl) ->
+                var members: Buf[Json] = buf()
+                for cp in decl.params
+                    val name = lsp_pattern_name(cp.param.pattern)
+                    members.push(lsp_symbol(src, name, SymbolField, cp.param.span, name_in(src, cp.param.span, name), buf()))
+                lsp_members(src, decl.members, &members)
+                val kind = if decl.object then SymbolObject elif decl.modifier == "trait" then SymbolInterface else SymbolClass
+                out.push(lsp_symbol(src, decl.name, kind, decl.span, name_in(src, decl.name_span, decl.name), members))
+            ImplItem(decl) ->
+                var members: Buf[Json] = buf()
+                lsp_members(src, decl.members, &members)
+                val name = decl.trait_name match
+                    Some(t) -> s"impl ${show_type(t)} for ${show_type(decl.target)}"
+                    None -> s"impl ${show_type(decl.target)}"
+                out.push(lsp_symbol(src, name, SymbolNamespace, decl.span, decl.target.span, members))
+            ValueItem(v) -> out.push(lsp_symbol(src, v.name, if v.mutable then SymbolVariable else SymbolConstant, v.span,name_in(src, v.span, v.name), buf()))
+    Json.Arr(out)
+
+private lsp_members(src: Source, members: Buf[ClassMember], out: *Buf[Json])
+    for m in members
+        m match
+            FieldMember(f) -> out.push(lsp_symbol(src, f.name, SymbolField, f.span, name_in(src, f.span, f.name), buf()))
+            AbstractFieldMember(f) -> out.push(lsp_symbol(src, f.name, SymbolField, f.span, name_in(src, f.name_span, f.name), buf()))
+            MethodMember(method, _, _, _) -> out.push(lsp_symbol(src, method.name, SymbolMethod, method.span,name_in(src, method.name_span, method.name), buf()))
+            StatementMember(_) -> ()
+
+private lsp_pattern_name(p: &Pattern) -> string = p.kind match
+    Name(n) -> n
+    _ -> show_pattern(p)
+
+// One `DocumentSymbol`. The protocol asks that the name's range lie inside the declaration's, so a
+// name found outside it is taken as the declaration's start.
+private lsp_symbol(src: Source, name: string, kind: long, whole: Span, named: Span, children: Buf[Json]) -> Json
+    val at = if named.start >= whole.start && named.end <= whole.end && named.end >= named.start then named else Span(whole.start, whole.start)
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "name", Json.Str(name))
+    lsp_put(&out, "kind", Json.Int(kind))
+    lsp_put(&out, "range", lsp_range(src, whole))
+    lsp_put(&out, "selectionRange", lsp_range(src, at))
+    if children.len() > 0 then lsp_put(&out, "children", Json.Arr(children))
+    Json.Obj(out)
+
+// ---- files and URIs ----
+
+/** A path with its `.` and empty segments dropped and each `..` taking the segment before it away,
+ * so two spellings of one file compare equal. */
+lsp_normal(p: string) -> string
+    var parts: Buf[string] = buf()
+    for part in p.split("/")
+        if part == "" || part == "." then continue
+        if part == ".." && parts.len() > 0 && parts[parts.len() - 1] != ".."
+            parts.pop()
+            continue
+        parts.push(part)
+    var out = str_builder()
+    if p.starts_with("/") then out.push("/")
+    for i in 0..<parts.len()
+        if i > 0 then out.push("/")
+        out.push(parts[i])
+    out.finish()
+
+/** The file a `file://` URI names, its percent-escapes decoded and its path normalized. Anything
+ * else is taken as a path. */
+lsp_uri_file(uri: string) -> string
+    if !uri.starts_with("file://") then return lsp_normal(uri)
+    var out: Buf[u8] = buf()
+    val b = uri.bytes
+    var i = 7usize
+    while i < b.len
+        if b[i] == u8('%') && i + 2 < b.len && lsp_hex(b[i + 1]) is Some(hi) && lsp_hex(b[i + 2]) is Some(lo)
+            out.push(hi * 16 + lo)
+            i += 3
+        else
+            out.push(b[i])
+            i += 1
+    lsp_normal(from_utf8(out.view()).unwrap_or(uri[7..]))
+
+private lsp_hex(c: u8) -> Option[u8] =
+    if c >= u8('0') && c <= u8('9') then Some(c - u8('0'))
+    elif c >= u8('a') && c <= u8('f') then Some(c - u8('a') + 10)
+    elif c >= u8('A') && c <= u8('F') then Some(c - u8('A') + 10)
+    else None
+
+/** The `file://` URI of an absolute path: every byte but an unreserved one or a `/` percent-escaped. */
+lsp_file_uri(file: string) -> string
+    val hex = "0123456789ABCDEF"
+    var out = str_builder()
+    out.push("file://")
+    for c in file.bytes
+        if lsp_unreserved(c) then out.push(from_utf8_lossy([c]))
+        else
+            val hi = usize(c >> 4)
+            val lo = usize(c & 15)
+            out.push("%" + hex[hi..<hi + 1] + hex[lo..<lo + 1])
+    out.finish()
+
+private lsp_unreserved(c: u8) -> bool =
+    c >= u8('a') && c <= u8('z') || c >= u8('A') && c <= u8('Z') || c >= u8('0') && c <= u8('9') ||
+        c == u8('-') || c == u8('.') || c == u8('_') || c == u8('~') || c == u8('/')

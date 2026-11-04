@@ -34,6 +34,7 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
 
 | Chapter | Contents |
 | --- | --- |
+| [The AVIN philosophy](/spec/philosophy/) | Abstraction, Versatility, Intuition and Naturalness: the principles behind the design |
 | [Design choices](/spec/design/) | The choices that shape the type system, runtime and library |
 | [Types](/spec/types/) | Built-in types, numbers, strings, tuples, functions, `Any`/`Nothing` |
 | [Declarations](/spec/declarations/) | `data`, `class`, `trait`, `object`, `impl`, members, modules, initialization |
@@ -47,8 +48,11 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
 | [Call-by-name](/spec/by-name/) | `value: -> T` parameters |
 | [Strings and formatting](/spec/strings-and-formatting/) | Interpolation and format specifiers |
 | [System library](/spec/system-library/) | Proposed: `avin.process` — arguments, environment, exit; `avin.io` — `IoError`, standard input; `avin.fs` — files and directories |
+| [Packages](/spec/packages/) | Proposed: `avin.hocon`, dependencies, version selection, `avin.sum`, workspaces, `avin new` and `avin tidy` |
+| [Parsing](/spec/parsing/) | Proposed: `avin.parsing` — parser combinators, leaf parsers for numbers, names and strings, errors with positions |
+| [Derivation](/spec/derivation/) | Library-defined `derives`: shapes of data types and classes, `derive` templates, annotations, a JSON library written with them |
 | [Settled decisions](/spec/decisions/) | Every decision made so far, in one list |
 
-Syntax follows Sysl wherever Sysl has a form: indentation blocks, `name(params) -> T` functions,
-postfix `match` with `->` arms, `[T: Bound]` generics, `impl Trait for Type`. Where Avin needs a form
-Sysl lacks (classes, objects, variance), this specification defines it in the same style.
+The syntax is light and regular: blocks by indentation, functions as `name(params) -> T`, `match`
+written after the value with `->` arms, generics as `[T: Bound]`, conformance as `impl Trait for
+Type`, and classes, objects and variance in the same style.

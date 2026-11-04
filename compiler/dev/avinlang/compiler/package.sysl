@@ -1,0 +1,720 @@
+module dev.avinlang.compiler
+
+import sh.sysl.hocon.{Field, Value, parse as parse_hocon}
+import sh.sysl.parsing.{Diagnostic, Source, Span, error, source_of}
+import sysl.buf.{Buf, buf}
+import sysl.crypto.sha256
+import sysl.encoding.hex_string
+import sysl.fs.{cache_dir, canonicalize, current_dir, entries, exists, is_dir, make_dir_all, pending_name, publish_dir, read_bytes, read_text, remove_dir_all, remove_file, walk, write_text, write_text_atomic}
+import sysl.path.{is_absolute, normalize, parent}
+import sysl.process.capture
+import sysl.slices.sort
+import sysl.text.{parse_long, str_builder}
+
+// Packages. A directory holding an `avin.hocon` is a package: the manifest names it, gives its
+// version, and lists the packages it depends on. The directory is the package's program root, so its
+// subdirectories are its modules, exactly as for a program without a manifest. A dependency is a git
+// repository read at a release tag, a directory beside the package, or another member of the
+// workspace the package is in. A dependency's modules come in under their own names; its root
+// directory's files and its `tests` directory are its own and do not.
+//
+// Fetched packages are kept in the machine's cache, one directory per coordinate and version, with
+// the hash of the tree recorded beside it when it was fetched. `avin.sum`, beside the manifest,
+// records that hash for every fetched package the project has read, and a package whose hash differs
+// from its line is refused.
+
+/** The file that makes a directory a package. */
+const ManifestName: string = "avin.hocon"
+
+/** The file, beside a manifest, that records what each fetched package hashed to. */
+const SumName: string = "avin.sum"
+
+/** How a recorded hash begins: the algorithm that made it. */
+const DigestPrefix: string = "sha256:"
+
+/** Where a dependency's source comes from. */
+enum Origin
+    /** A git repository, by its coordinate (`github.com/owner/name`), at the tag of `version`. */
+    Git(coordinate: string, version: string)
+    /** A directory, as the manifest wrote it, for a package developed beside the one using it. */
+    Local(dir: string)
+    /** The member of the package's workspace whose package has the dependency's name. */
+    Member
+
+/** A dependency as a manifest lists it: its name there, where it comes from, and where it was written. */
+struct Dependency
+    label: string
+    origin: Origin
+    span: Span
+
+/** A package's manifest, read and checked. */
+struct Manifest
+    dir: string
+    src: Source
+    /** Whether the manifest has a `package` block; a workspace's root may have none. */
+    has_package: bool
+    name: string
+    version: string
+    description: string
+    dependencies: Buf[Dependency]
+    /** Whether the manifest lists a workspace, and the directories it lists, as written. */
+    has_workspace: bool
+    workspace: Buf[string]
+
+/** The manifest of the package at `dir`, or the first thing wrong with it, rendered with its place. */
+read_manifest(dir: string) -> Result[Manifest, string]
+    val file = dir + "/" + ManifestName
+    val text = read_text(file).map_err(e -> s"avin: $file: ${e.to_string()}")?
+    val src = source_of(file, text)
+    val doc = parse_hocon(src).map_err(d -> d.render(src))?
+    var m = Manifest(dir, src, false, "", "", "", buf(), false, buf())
+    read_fields(&m, doc.root).map_err(d -> d.render(src))?
+    Ok(m)
+
+private read_fields(m: *Manifest, root: Value) -> Result[unit, Diagnostic]
+    var dependencies = Span(0, 0)
+    for f in root.fields()
+        if f.key == "package"
+            m.has_package = true
+            read_package(m, f)?
+        elif f.key == "dependencies"
+            dependencies = f.key_span
+            read_dependencies(m, f)?
+        elif f.key == "workspace"
+            read_workspace(m, f)?
+        else
+            return Err(error(f.key_span, s"`${f.key}` is not a key of $ManifestName, which holds `package`, `dependencies` and `workspace`"))
+    if !m.has_package && !m.has_workspace
+        return Err(error(Span(0, 0), s"$ManifestName has no `package` block: a package is named and versioned, `package { name = \"geom\", version = \"0.1.0\" }`"))
+    if !m.has_package && m.dependencies.len() > 0
+        return Err(error(dependencies, "a workspace with no `package` block compiles nothing of its own, so its dependencies would reach nothing: name each in the member that imports it"))
+    Ok(())
+
+private read_package(m: *Manifest, f: Field) -> Result[unit, Diagnostic]
+    if !f.value.is_obj() then return Err(error(f.value.span, "`package` is a block, `package { name = \"geom\", version = \"0.1.0\" }`"))
+    var named = false
+    var versioned = false
+    for g in f.value.fields()
+        if g.key == "name"
+            m.name = text_of(g)?
+            if !valid_package_name(m.name) then return Err(error(g.value.span, s"`${m.name}` is not a package name: ${PackageNameRule}"))
+            named = true
+        elif g.key == "version"
+            m.version = text_of(g)?
+            if !valid_version(m.version) then return Err(error(g.value.span, bad_version(m.version)))
+            versioned = true
+        elif g.key == "description"
+            m.description = text_of(g)?
+        else
+            return Err(error(g.key_span, s"`${g.key}` is not a key of `package`, which holds `name`, `version` and `description`"))
+    if !named then return Err(error(f.key_span, "the `package` block has no `name`: every package is named, `name = \"geom\"`"))
+    if !versioned then return Err(error(f.key_span, "the `package` block has no `version`: every package has one, `version = \"0.1.0\"`"))
+    Ok(())
+
+private read_dependencies(m: *Manifest, f: Field) -> Result[unit, Diagnostic]
+    if !f.value.is_obj() then return Err(error(f.value.span, "`dependencies` is a block naming each dependency, `json { git = \"github.com/owner/json\", version = \"1.0.0\" }`"))
+    for d in f.value.fields()
+        if !valid_package_name(d.key) then return Err(error(d.key_span, s"`${d.key}` is not a dependency's name: ${PackageNameRule}"))
+        if !d.value.is_obj()
+            return Err(error(d.value.span, s"the dependency `${d.key}` is a block saying where it comes from: `{ git = \"github.com/owner/name\", version = \"1.0.0\" }`, `{ path = \"../name\" }` or `{ workspace = true }`"))
+        var git: Option[string] = None
+        var version: Option[string] = None
+        var local: Option[string] = None
+        var member = false
+        for g in d.value.fields()
+            if g.key == "git"
+                val c = text_of(g)?
+                if !valid_coordinate(c) then return Err(error(g.value.span, s"`$c` is not a git coordinate: a coordinate names a repository as `host/owner/name`, such as `github.com/owner/json`, with no `https://` and no `.git`"))
+                git = Some(c)
+            elif g.key == "version"
+                val v = text_of(g)?
+                if !valid_version(v) then return Err(error(g.value.span, bad_version(v)))
+                version = Some(v)
+            elif g.key == "path"
+                val p = text_of(g)?
+                if p == "" then return Err(error(g.value.span, "a dependency's `path` names a directory"))
+                local = Some(p)
+            elif g.key == "workspace"
+                g.value.as_bool() match
+                    Some(true) -> member = true
+                    _ -> return Err(error(g.value.span, "a dependency's `workspace` is `true`: the dependency is the member of the workspace with its name"))
+            else
+                return Err(error(g.key_span, s"`${g.key}` is not a key of a dependency, which holds `git` and `version`, `path`, or `workspace`"))
+        var sources = 0
+        if git is Some(_) then sources += 1
+        if local is Some(_) then sources += 1
+        if member then sources += 1
+        if sources != 1
+            return Err(error(d.key_span, s"the dependency `${d.key}` says once where it comes from: `git` with a `version`, `path`, or `workspace = true`"))
+        if git is Some(c)
+            version match
+                Some(v) -> m.dependencies.push(Dependency(d.key, Git(c, v), d.key_span))
+                None -> return Err(error(d.key_span, s"the dependency `${d.key}` names a repository and no version: a git dependency is read at a release, `version = \"1.0.0\"` being the tag `v1.0.0`"))
+            continue
+        if version is Some(_) then return Err(error(d.key_span, s"the dependency `${d.key}` has a `version`, which belongs with `git`: a directory is read as it stands"))
+        if local is Some(p) then m.dependencies.push(Dependency(d.key, Local(p), d.key_span))
+        else m.dependencies.push(Dependency(d.key, Member, d.key_span))
+    Ok(())
+
+private read_workspace(m: *Manifest, f: Field) -> Result[unit, Diagnostic]
+    val wrong = error(f.value.span, "`workspace` is a list of the members' directories, each relative to this file, `workspace = [\"app\", \"libs/*\"]`")
+    val dirs = f.value.as_text_list() match
+        Some(d) -> d
+        None -> return Err(wrong)
+    if !f.value.is_arr() then return Err(wrong)
+    for d in dirs
+        if d == "" || is_absolute(d) then return Err(wrong)
+        for segment in d.split("/")
+            if segment == "" || segment == "." || segment == ".." || segment.contains("**")
+                return Err(error(f.value.span, s"`$d` is not a member's directory: an entry is a relative path with no `.` or `..`, and `*` stands for part of one directory's name"))
+        m.workspace.push(d)
+    m.has_workspace = true
+    Ok(())
+
+private text_of(f: Field) -> Result[string, Diagnostic] = f.value.as_text() match
+    Some(s) -> Ok(s)
+    None -> Err(error(f.value.span, s"`${f.key}` is written as a string, in quotes"))
+
+private const PackageNameRule: string = "a name begins with a lowercase letter, and holds lowercase letters, digits, `_` and `-`"
+
+private bad_version(v: string) -> string = s"`$v` is not a version: a version is three numbers, `major.minor.patch`, such as `0.1.0`"
+
+/** Whether `name` names a package: a lowercase letter, then lowercase letters, digits, `_` and `-`. */
+valid_package_name(name: string) -> bool
+    if name.bytes.len == 0 then return false
+    for i in 0..<name.bytes.len
+        val b = name.bytes[i]
+        val lower = b >= u8('a') && b <= u8('z')
+        val other = b >= u8('0') && b <= u8('9') || b == u8('_') || b == u8('-')
+        if !lower && !(other && i > 0) then return false
+    true
+
+/** Whether `v` is a version: three numbers separated by dots, none with a leading zero. */
+valid_version(v: string) -> bool = version_numbers(v) is Some(_)
+
+private version_numbers(v: string) -> Option[Buf[long]]
+    val parts = v.split(".")
+    if parts.len != 3 then return None
+    var out: Buf[long] = buf()
+    for p in parts
+        if p.bytes.len == 0 || p.bytes.len > 9 || p.bytes.len > 1 && p.bytes[0] == u8('0') then return None
+        for b in p.bytes
+            if b < u8('0') || b > u8('9') then return None
+        out.push(parse_long(p).unwrap_or(0))
+    Some(out)
+
+/** Whether version `a` is after version `b`. */
+version_after(a: string, b: string) -> bool
+    val x = version_numbers(a).unwrap_or(buf())
+    val y = version_numbers(b).unwrap_or(buf())
+    if x.len() < 3 || y.len() < 3 then return false
+    for i in 0..<3
+        if x[i] != y[i] then return x[i] > y[i]
+    false
+
+/** Whether `c` is a git coordinate: `host/owner/name` and deeper, each segment of letters, digits,
+ * `.`, `_` and `-`, with no scheme and no `.git`. */
+valid_coordinate(c: string) -> bool
+    if c.contains("://") || c.ends_with(".git") then return false
+    val segments = c.split("/")
+    if segments.len < 3 then return false
+    for s in segments
+        if s.bytes.len == 0 || s == "." || s == ".." then return false
+        for b in s.bytes
+            val ok = b >= u8('a') && b <= u8('z') || b >= u8('A') && b <= u8('Z') || b >= u8('0') && b <= u8('9') || b == u8('.') || b == u8('_') || b == u8('-')
+            if !ok then return false
+    true
+
+// Workspaces.
+
+/** A workspace: its root directory, and its members' directories and package names. */
+struct Workspace
+    root: string
+    members: Buf[string]
+    names: Buf[string]
+
+/** The workspace the manifest `m` declares: its member directories, the root first when the root is a
+ * package too, and each one's package name. A member is a directory holding a manifest; `*` in an
+ * entry stands for part of one directory's name, and an entry with none must name a member. */
+workspace_of(m: Manifest) -> Result[Workspace, string]
+    var ws = Workspace(m.dir, buf(), buf())
+    if m.has_package
+        ws.members.push(m.dir)
+        ws.names.push(m.name)
+    for entry in m.workspace
+        var found: Buf[string] = buf()
+        expand_members(m.dir, entry.split("/"), 0, &found)
+        if found.len() == 0 && !entry.contains("*")
+            return Err(s"avin: ${m.src.name}: the workspace lists `$entry`, and ${m.dir}/$entry holds no $ManifestName")
+        for dir in found
+            if contains(ws.members, dir) then continue
+            val member = read_manifest(dir)?
+            if !member.has_package then return Err(s"avin: $dir: a workspace's member is a package, and its $ManifestName has no `package` block")
+            val i = index_of(ws.names, member.name)
+            if i is Some(k) then return Err(s"avin: ${m.src.name}: two members of the workspace are named `${member.name}`, ${ws.members[k]} and $dir")
+            ws.members.push(dir)
+            ws.names.push(member.name)
+    Ok(ws)
+
+private expand_members(dir: string, segments: []string, i: usize, found: *Buf[string])
+    if i == segments.len
+        if exists(dir + "/" + ManifestName) then found.push(dir)
+        return
+    val segment = segments[i]
+    if !segment.contains("*")
+        val next = dir + "/" + segment
+        if is_dir(next) then expand_members(next, segments, i + 1, found)
+        return
+    val names = entries(dir) match
+        Ok(n) -> n
+        Err(_) -> return
+    val sorted = names.view()
+    sort(sorted)
+    for name in sorted
+        if name.starts_with(".") then continue
+        if glob_matches(segment.bytes, 0, name.bytes, 0) && is_dir(dir + "/" + name)
+            expand_members(dir + "/" + name, segments, i + 1, found)
+
+// Whether `name` from `j` matches `pattern` from `i`, where `*` matches any run of bytes.
+private glob_matches(pattern: []const u8, i: usize, name: []const u8, j: usize) -> bool
+    if i == pattern.len then return j == name.len
+    if pattern[i] == u8('*')
+        for k in j..name.len
+            if glob_matches(pattern, i + 1, name, k) then return true
+        return false
+    j < name.len && pattern[i] == name[j] && glob_matches(pattern, i + 1, name, j + 1)
+
+/** The workspace the package at `dir` is in: its own, when its manifest lists one, or that of the
+ * nearest directory above it whose manifest lists it as a member. */
+workspace_containing(m: Manifest) -> Result[Option[Workspace], string]
+    if m.has_workspace then return Ok(Some(workspace_of(m)?))
+    var at = parent(m.dir)
+    loop
+        val dir = at match
+            Some(d) -> d
+            None -> return Ok(None)
+        if exists(dir + "/" + ManifestName)
+            val above = read_manifest(dir)?
+            if above.has_workspace
+                val ws = workspace_of(above)?
+                if contains(ws.members, m.dir) then return Ok(Some(ws))
+        if dir == "/" || dir == "" then return Ok(None)
+        at = parent(dir)
+
+// Finding a package.
+
+/** The directory of the package `path` is in: the nearest directory at or above it holding a manifest
+ * with a `package` block, or `None` when there is none. A manifest with no `package` block, a
+ * workspace's root, is passed over, unless it is `path` itself, which is refused with the members it
+ * lists. */
+enclosing_package(path: string) -> Result[Option[string], string]
+    val absolute = absolute_path(path)
+    var at = if is_dir(absolute) then absolute else parent(absolute).unwrap_or("/")
+    loop
+        if exists(at + "/" + ManifestName)
+            val m = read_manifest(at)?
+            if m.has_package then return Ok(Some(at))
+            if at == absolute
+                val ws = workspace_of(m)?
+                var listed = ""
+                for d in ws.members
+                    listed = listed + "\n  " + d
+                return Err(s"avin: $path is a workspace, which compiles nothing of its own; name one of its members:$listed")
+        val up = parent(at) match
+            Some(d) -> d
+            None -> return Ok(None)
+        if up == at then return Ok(None)
+        at = up
+
+/** `path` made absolute against the working directory, with `.` and `..` resolved by name. */
+absolute_path(path: string) -> string
+    if is_absolute(path) then return normalize(path)
+    val here = current_dir() match
+        Ok(d) -> d
+        Err(_) -> return normalize(path)
+    normalize(here + "/" + path)
+
+// Fetching.
+
+/** Where fetched packages are kept, and where they are fetched from. */
+struct Fetching
+    /** The directory fetched packages are kept in, one directory per coordinate and version; empty
+     * when this machine has none. */
+    cache: string
+    /** What a coordinate's clone URL begins with: `https://`, or a mirror's own prefix. The URL is
+     * this, the coordinate, and `.git`. */
+    base: string
+    /** Whether a package missing from the cache is fetched, rather than refused. */
+    online: bool
+
+/** Fetching into the machine's cache from each repository's own host. */
+default_fetching() -> Fetching
+    cache_dir() match
+        Some(d) -> Fetching(d + "/avin/pkg", "https://", true)
+        None -> Fetching("", "https://", true)
+
+/** A line of `avin.sum`: a fetched package, its version, and what its tree hashed to. */
+struct SumLine
+    coordinate: string
+    version: string
+    hash: string
+
+/** The lines of the sum file at `file`; none when there is no file. */
+read_sums(file: string) -> Result[Buf[SumLine], string]
+    var out: Buf[SumLine] = buf()
+    if !exists(file) then return Ok(out)
+    val text = read_text(file).map_err(e -> s"avin: $file: ${e.to_string()}")?
+    var n = 0
+    for line in text.lines()
+        n += 1
+        if line == "" then continue
+        val fields = line.split(" ")
+        if fields.len != 3 || !fields[1].starts_with("v") || !valid_version(fields[1][1..]) || !fields[2].starts_with(DigestPrefix)
+            return Err(s"avin: $file:$n: a line is a coordinate, a version and a hash, `github.com/owner/name v1.0.0 sha256:…`")
+        out.push(SumLine(fields[0], fields[1][1..], fields[2]))
+    Ok(out)
+
+private render_sums(lines: Buf[SumLine]) -> string
+    var out = str_builder()
+    for l in lines
+        out.push(s"${l.coordinate} v${l.version} ${l.hash}\n")
+    out.finish()
+
+private find_sum(lines: Buf[SumLine], coordinate: string, version: string) -> Option[SumLine]
+    for l in lines
+        if l.coordinate == coordinate && l.version == version then return Some(l)
+    None
+
+/** The hash of the package tree at `root`: SHA-256 of a listing of its files, one line each, the
+ * file's own SHA-256 in lowercase hexadecimal, two spaces and its path from the root, sorted by
+ * path. A `.git` anywhere and the root's own `.avin` are left out: they are what fetching and building
+ * leave, not the package. */
+tree_hash(root: string) -> Result[string, string]
+    var paths: Buf[string] = buf()
+    var walker = walk(root)
+    loop
+        val entry = walker.next() match
+            Some(Ok(e)) -> e
+            Some(Err(e)) -> return Err(s"avin: $root: ${e.to_string()}")
+            None -> break
+        if entry.path.bytes.len <= root.bytes.len then continue
+        val rel = entry.path[root.bytes.len + 1..]
+        if entry.is_dir()
+            if rel == ".avin" || rel == ".git" || rel.ends_with("/.git") then walker.skip_dir()
+            continue
+        if entry.is_link() then continue
+        paths.push(rel)
+    val sorted = paths.view()
+    sort(sorted)
+    var listing = str_builder()
+    for rel in sorted
+        val bytes = read_bytes(root + "/" + rel).map_err(e -> s"avin: $root/$rel: ${e.to_string()}")?
+        listing.push(digest(bytes) + "  " + rel + "\n")
+    Ok(DigestPrefix + digest(listing.finish().bytes))
+
+private digest(bytes: []const u8) -> string
+    val d = sha256(bytes)
+    hex_string(d[0..<32])
+
+// Resolution.
+
+/** A package a program is made of: its name, its directory and its manifest. */
+struct ResolvedPackage
+    name: string
+    dir: string
+    manifest: Manifest
+
+/** What resolving a package found: the packages, the one resolved first and then every package it
+ * depends on, directly or through another; the sum file; the lines it holds; and a line for every
+ * fetched package and version that resolution read, in the order first read. */
+struct Resolution
+    packages: Buf[ResolvedPackage]
+    sum_file: string
+    sums: Buf[SumLine]
+    read: Buf[SumLine]
+
+private struct Selected
+    coordinate: string
+    version: string
+
+private struct Resolver
+    fetching: Fetching
+    workspace: Option[Workspace]
+    sums: Buf[SumLine]
+    read: Buf[SumLine]
+    selected: Buf[Selected]
+    changed: bool
+
+/** Resolves the package at `dir` and everything it depends on, fetching what the cache has not got
+ * and checking each fetched package against the sum file. With `whole`, and `dir` a workspace's root,
+ * every member is resolved.
+ *
+ * The version of a git dependency is the highest any manifest in the graph asks for: a version that
+ * some manifest names, never a newer one nobody named. In a workspace the versions are chosen over
+ * every member's dependencies, so no two members are built against two versions of one package. */
+resolve(dir: string, fetching: Fetching, whole: bool) -> Result[Resolution, string]
+    val home = canonicalize(dir).map_err(e -> s"avin: $dir: ${e.to_string()}")?
+    val m = read_manifest(home)?
+    val ws = workspace_containing(m)?
+    var roots: Buf[string] = buf()
+    var sum_dir = home
+    ws match
+        Some(w) ->
+            sum_dir = w.root
+            for d in w.members
+                roots.push(d)
+        None -> roots.push(home)
+    val sum_file = sum_dir + "/" + SumName
+    val sums = read_sums(sum_file)?
+    var r = Resolver(fetching, ws, sums, buf(), buf(), false)
+    // A version raised can name dependencies of its own, which can raise another: walk again until a
+    // walk raises nothing.
+    loop
+        r.changed = false
+        var seen: Buf[string] = buf()
+        var reached: Buf[ResolvedPackage] = buf()
+        for root in roots
+            visit(&r, root, false, &seen, &reached)?
+        if !r.changed then break
+    var seen: Buf[string] = buf()
+    var packages: Buf[ResolvedPackage] = buf()
+    if whole && (m.has_workspace || !m.has_package)
+        for root in roots
+            visit(&r, root, false, &seen, &packages)?
+    else
+        visit(&r, home, false, &seen, &packages)?
+    Ok(Resolution(packages, sum_file, r.sums, r.read))
+
+private visit(r: *Resolver, dir: string, fetched: bool, seen: *Buf[string], out: *Buf[ResolvedPackage]) -> Result[unit, string]
+    if contains(*seen, dir) then return Ok(())
+    seen.push(dir)
+    val m = read_manifest(dir)?
+    if !m.has_package then return Err(s"avin: $dir is a workspace's root with no `package` block, which no package can depend on")
+    out.push(ResolvedPackage(m.name, dir, m))
+    for d in m.dependencies
+        val target = d.origin match
+            Git(coordinate, version) ->
+                select(r, coordinate, version)
+                fetch_package(r, coordinate, selected_version(*r, coordinate))?
+            Local(p) ->
+                if fetched then return Err(error(d.span, s"`${d.label}` is a path dependency of a fetched package: a directory is only where it is on the machine that published it").render(m.src))
+                val full = if is_absolute(p) then p else dir + "/" + p
+                val c = canonicalize(full) match
+                    Ok(c) -> c
+                    Err(_) -> return Err(error(d.span, s"`${d.label}` is a path dependency, and `$p` is not a directory").render(m.src))
+                if !is_dir(c) then return Err(error(d.span, s"`${d.label}` is a path dependency, and `$p` is not a directory").render(m.src))
+                if !exists(c + "/" + ManifestName) then return Err(error(d.span, s"`${d.label}` is a path dependency, and `$p` holds no $ManifestName, so it is not a package").render(m.src))
+                c
+            Member ->
+                if fetched then return Err(error(d.span, s"`${d.label}` is a workspace dependency of a fetched package, which is in no workspace").render(m.src))
+                r.workspace match
+                    Some(w) ->
+                        index_of(w.names, d.label) match
+                            Some(i) -> w.members[i]
+                            None -> return Err(error(d.span, s"`${d.label}` is a workspace dependency, and no member of the workspace at ${w.root} is named `${d.label}`").render(m.src))
+                    None -> return Err(error(d.span, s"`${d.label}` is a workspace dependency, and this package is in no workspace: a workspace's root lists its members, `workspace = [\"app\", \"${d.label}\"]`").render(m.src))
+        val into_fetched = fetched || d.origin is Git(_, _)
+        visit(r, target, into_fetched, seen, out)?
+    Ok(())
+
+private select(r: *Resolver, coordinate: string, version: string)
+    for i in 0..<r.selected.len()
+        if r.selected[i].coordinate == coordinate
+            if version_after(version, r.selected[i].version)
+                r.selected[i].version = version
+                r.changed = true
+            return
+    r.selected.push(Selected(coordinate, version))
+    r.changed = true
+
+private selected_version(r: Resolver, coordinate: string) -> string
+    for s in r.selected
+        if s.coordinate == coordinate then return s.version
+    ""
+
+/** Where `coordinate` at `version` is kept in the cache `cache`. */
+cached_package_dir(cache: string, coordinate: string, version: string) -> string = s"$cache/$coordinate/@v$version"
+
+// The fetched package's directory: from the cache, checked by the hash recorded when it was
+// fetched, or cloned at its tag and hashed. Either way the hash is held to the sum file's line.
+private fetch_package(r: *Resolver, coordinate: string, version: string) -> Result[string, string]
+    if r.fetching.cache == "" then return Err(s"avin: cannot fetch $coordinate v$version: this machine has no cache directory to keep packages in; set XDG_CACHE_HOME")
+    val dir = cached_package_dir(r.fetching.cache, coordinate, version)
+    val hash_file = dir + ".hash"
+    var hash = ""
+    if is_dir(dir)
+        hash = read_text(hash_file) match
+            Ok(t) -> t.trim()
+            Err(_) -> return Err(s"avin: $dir holds $coordinate v$version and no record of what it hashed to, so $SumName cannot be checked against it; remove that directory and build again")
+    elif !r.fetching.online
+        return Err(s"avin: $coordinate v$version is not fetched yet; `avin build` fetches it")
+    else
+        hash = clone_package(r.fetching, coordinate, version, dir)?
+    if find_sum(r.sums, coordinate, version) is Some(line)
+        if line.hash != hash
+            return Err(s"avin: $SumName records $coordinate v$version as ${line.hash}, and the package hashes to $hash: the tag may have moved or the repository been rewritten. If the new contents are the ones you want, remove the line and build again")
+    if find_sum(r.read, coordinate, version) is None then r.read.push(SumLine(coordinate, version, hash))
+    Ok(dir)
+
+// Clones the tag into a directory of this fetch's own beside the cache entry, hashes it, records the
+// hash and then moves it into place, so nothing ever reads a package half fetched.
+private clone_package(fetching: Fetching, coordinate: string, version: string, dir: string) -> Result[string, string]
+    val above = parent(dir).unwrap_or(".")
+    make_dir_all(above).map_err(e -> s"avin: $above: ${e.to_string()}")?
+    val partial = pending_name(dir)
+    defer _ = remove_dir_all(partial)
+    val url = fetching.base + coordinate + ".git"
+    val tag = "v" + version
+    val result = capture("git", ["clone", "--quiet", "--depth", "1", "--branch", tag, url, partial], stderr = true, timeout = 600000).map_err(e -> s"avin: cannot fetch $coordinate $tag: could not run git: ${e.to_string()}")?
+    if !result.status.ok()
+        return Err(s"avin: cannot fetch $coordinate $tag from $url:\n${result.err.unwrap_or("")}${result.text}")
+    remove_dir_all(partial + "/.git").map_err(e -> s"avin: $partial/.git: ${e.to_string()}")?
+    if !exists(partial + "/" + ManifestName) then return Err(s"avin: $coordinate $tag holds no $ManifestName, so it is not an Avin package")
+    val hash = tree_hash(partial)?
+    write_text_atomic(dir + ".hash", hash + "\n").map_err(e -> s"avin: $dir.hash: ${e.to_string()}")?
+    if publish_dir(partial, dir) is Err(e)
+        // Another build fetched the same tag first: the same tag is the same tree.
+        if !is_dir(dir) then return Err(s"avin: $dir: ${e.to_string()}")
+    Ok(hash)
+
+/** Adds to the sum file a line for every fetched package resolution read that it has none for. A
+ * build only adds lines; `avin tidy` is what removes them. */
+record_sums(res: Resolution) -> Result[unit, string]
+    var lines = res.sums
+    var added = false
+    for l in res.read
+        if find_sum(lines, l.coordinate, l.version) is None
+            lines.push(l)
+            added = true
+    if !added then return Ok(())
+    write_text_atomic(res.sum_file, render_sums(lines)).map_err(e -> s"avin: ${res.sum_file}: ${e.to_string()}")
+
+/** Rewrites the sum file of the package or workspace at `dir` to exactly the fetched packages its
+ * whole resolution reads, keeping each line that stays where it was, and says through `say` what it
+ * removed and added. With `check`, it writes nothing and fails when the file is not already that.
+ * Answers whether the file was tidy. */
+tidy(dir: string, fetching: Fetching, check: bool, say: string -> unit) -> Result[bool, string]
+    val res = resolve(dir, fetching, true)?
+    var lines: Buf[SumLine] = buf()
+    var changed = false
+    for l in res.sums
+        if find_sum(res.read, l.coordinate, l.version) is Some(_)
+            lines.push(l)
+        else
+            say(s"${if check then "would remove" else "removed"} ${l.coordinate} v${l.version}")
+            changed = true
+    for l in res.read
+        if find_sum(lines, l.coordinate, l.version) is None
+            say(s"${if check then "would add" else "added"} ${l.coordinate} v${l.version}")
+            lines.push(l)
+            changed = true
+    if check || !changed then return Ok(!changed)
+    if lines.len() == 0
+        remove_file(res.sum_file).map_err(e -> s"avin: ${res.sum_file}: ${e.to_string()}")?
+    else
+        write_text_atomic(res.sum_file, render_sums(lines)).map_err(e -> s"avin: ${res.sum_file}: ${e.to_string()}")?
+    Ok(false)
+
+// Loading a program.
+
+/** A program the command line or the editor names, with its files. */
+struct LoadedProgram
+    /** The program's root: the package's directory, the directory of a program without a manifest,
+     * or the file of a program of one file. */
+    root: string
+    files: Buf[ProgramFile]
+    /** The package's name, when the program is a package. */
+    package: Option[string]
+
+/** The program `path` names. A path at or under a package's directory is that package, compiled with
+ * every package it depends on; any other directory is a program of many files, and a file a program
+ * by itself. */
+load_program(path: string, fetching: Fetching) -> Result[LoadedProgram, string]
+    if enclosing_package(path)? is Some(dir)
+        // The package's directory is named as it was given, when it was given.
+        val root = if dir == absolute_path(path) then path else dir
+        return load_package(root, fetching)
+    if is_dir(path)
+        val files = program_files(path).map_err(message -> "avin: " + message)?
+        if files.len() == 0 then return Err(s"avin: $path: no `.avin` or `.lavin` files in the program")
+        return Ok(LoadedProgram(path, files, None))
+    val text = read_text(path).map_err(e -> s"avin: $path: ${e.to_string()}")?
+    Ok(LoadedProgram(path, single_file(source_of(path, text)), None))
+
+/** The package at `root` with every package it depends on: each dependency's modules first, then the
+ * package's own files. The sum file gains a line for any package fetched for the first time. A module
+ * two packages both hold is refused. */
+load_package(root: string, fetching: Fetching) -> Result[LoadedProgram, string]
+    val res = resolve(root, fetching, false)?
+    record_sums(res)?
+    var files: Buf[ProgramFile] = buf()
+    var owners: Buf[string] = buf()
+    for i in 1..<res.packages.len()
+        val p = res.packages[i]
+        for f in package_files(p.dir, true).map_err(message -> "avin: " + message)?
+            files.push(f)
+            owners.push(p.name)
+    val own = package_files(root, false).map_err(message -> "avin: " + message)?
+    for f in own
+        files.push(f)
+        owners.push(res.packages[0].name)
+    if own.len() == 0 then return Err(s"avin: $root: no `.avin` or `.lavin` files in the package")
+    var modules: Buf[string] = buf()
+    var holders: Buf[string] = buf()
+    for i in 0..<files.len()
+        val module_name = files[i].module_name.unwrap_or("")
+        if module_name == "" then continue
+        index_of(modules, module_name) match
+            Some(k) ->
+                if holders[k] != owners[i]
+                    return Err(s"avin: the module `$module_name` is in two packages, `${holders[k]}` and `${owners[i]}`: a module belongs to one package")
+            None ->
+                modules.push(module_name)
+                holders.push(owners[i])
+    Ok(LoadedProgram(root, files, Some(res.packages[0].name)))
+
+/** The files of the program tree at `root` as `program_files` finds them, or, when `root` holds a
+ * manifest, of the package and its dependencies without fetching any: what the language server reads. */
+program_tree_files(root: string) -> Result[Buf[ProgramFile], string]
+    if !exists(root + "/" + ManifestName) then return program_files(root)
+    val fetching = default_fetching()
+    val offline = Fetching(fetching.cache, fetching.base, false)
+    load_package(root, offline) match
+        Ok(p) -> Ok(p.files)
+        Err(message) -> Err(message.trim())
+
+// Scaffolding.
+
+/** Writes a new package at `dir`, named by the directory's last segment: its manifest, a module of
+ * that name with one function, a test of it, a `.gitignore`, and without `library` a `main.avin`
+ * using the module. Answers the package's name. */
+new_package(dir: string, library: bool) -> Result[string, string]
+    val name = absolute_path(dir).split("/")
+    val package_name = if name.len > 0 then name[name.len - 1] else ""
+    if !valid_package_name(package_name) then return Err(s"avin: `$package_name` is not a package name: $PackageNameRule")
+    val module_name = package_name.replace_all("-", "_")
+    if module_name == CoreModule then return Err(s"avin: a package is not named `$package_name`: its module would be `$CoreModule`, which is the standard library's")
+    if module_name == "tests" then return Err("avin: a package is not named `tests`: its module would be its own tests' directory")
+    if exists(dir) then return Err(s"avin: $dir already exists")
+    make_dir_all(dir + "/" + module_name).map_err(e -> s"avin: $dir: ${e.to_string()}")?
+    make_dir_all(dir + "/tests").map_err(e -> s"avin: $dir: ${e.to_string()}")?
+    val files = [
+        (ManifestName, s"package {\n  name = \"$package_name\"\n  version = \"0.1.0\"\n}\n\ndependencies {\n}\n"),
+        (".gitignore", ".avin/\n"),
+        (s"$module_name/$module_name.avin", s"module $module_name\n\n// The greeting for `name`.\ngreeting(name: string) -> string = \"Hello, \" + name + \"!\"\n"),
+        (s"tests/${module_name}_tests.avin", s"module tests\n\nimport $module_name.greeting\n\n@test(\"the greeting names whom it greets\")\ngreetsByName()\n    assertEq(greeting(\"Avin\"), \"Hello, Avin!\")\n"),
+    ]
+    for (file, text) in files
+        write_text(dir + "/" + file, text).map_err(e -> s"avin: $dir/$file: ${e.to_string()}")?
+    if !library
+        write_text(dir + "/main.avin", s"import $module_name.greeting\n\nmain()\n    print(greeting(\"world\"))\n").map_err(e -> s"avin: $dir/main.avin: ${e.to_string()}")?
+    Ok(package_name)
+
+// Small helpers.
+
+private contains(items: Buf[string], item: string) -> bool = index_of(items, item) is Some(_)
+
+private index_of(items: Buf[string], item: string) -> Option[usize]
+    for i in 0..<items.len()
+        if items[i] == item then return Some(i)
+    None

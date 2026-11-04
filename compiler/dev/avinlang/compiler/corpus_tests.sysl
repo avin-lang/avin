@@ -1,7 +1,7 @@
 module dev.avinlang.compiler
 @tests
 
-import sh.sysl.parsing.source_of
+import sh.sysl.parsing.{Source, source_of}
 import sysl.buf.{Buf, buf}
 import sysl.fs.{create, current_dir, entries, exists, is_dir, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
 import sysl.process.{Exited, FromPath, Signalled, Stdio, ToFile, Var, capture, run}
@@ -23,6 +23,9 @@ import sysl.text.from_utf8_unchecked
 //
 // `examples/*.avin` are held to the same standard as `tests/run`, so every example shown to a
 // reader builds and does what its header says.
+//
+// A program in any of these places may be a literate `.lavin` file; its expectation lines are
+// comments of its program, read from the program with the prose stripped.
 //
 // `tests/reject/*.avin` must fail to compile, and each `// error: TEXT` line in it names text the
 // diagnostics must contain.
@@ -99,7 +102,7 @@ private sidecar(base: string, suffix: string) -> string
 private input_of(base: string) -> Stdio =
     if exists(base + ".in") then FromPath(base + ".in") else FromPath("/dev/null")
 
-private without_extension(path: string) -> string = path[0..<path.bytes.len - ".avin".bytes.len]
+private without_extension(path: string) -> string = without_source_extension(path)
 
 /** The programs in a directory of the repository. */
 private cases(tc: Toolchain, dir: string) -> Buf[string] = cases_in(tc.root + "/" + dir)
@@ -108,7 +111,7 @@ private cases_in(dir: string) -> Buf[string]
     var out: Buf[string] = buf()
     for name in entries(dir).unwrap_or(buf())
         if name.starts_with(".") then continue
-        if name.ends_with(".avin") then out.push(dir + "/" + name)
+        if is_source_name(name) then out.push(dir + "/" + name)
     out
 
 /** The program directories in a directory of the repository; a name starting with `.` (a build
@@ -132,10 +135,15 @@ private case_at(path: string) -> Case
         val files = program_files(path).unwrap()
         var text = ""
         for f in files
-            text = text + read_text(f.src.name).unwrap_or("") + "\n"
+            text = text + expectation_text(f.src) + "\n"
         return Case(files, text)
-    val text = read_text(path).unwrap_or("")
-    Case(single_file(source_of(path, text)), text)
+    val src = source_of(path, read_text(path).unwrap_or(""))
+    Case(single_file(src), expectation_text(src))
+
+// The lines a file's expectations are read from: its text, or a literate file's program, where its
+// expectation comments stand at the margin of the program rather than four columns in.
+private expectation_text(src: Source) -> string =
+    if is_literate(src.name) then tangled_program(src).unwrap_or("") else from_utf8_unchecked(src.bytes)
 
 // A program's sidecars: `NAME.out` beside `NAME.avin`, or beside the directory `NAME`.
 private sidecar_base(path: string) -> string = if is_dir(path) then path else without_extension(path)
@@ -173,7 +181,9 @@ private run_case(tc: Toolchain, path: string, scratch: string) -> string
             env.push(v)
             if v.name == "AVIN_GC_STRESS" then stress = false
         if stress then env.push(Var("AVIN_GC_STRESS", "1"))
-        val run = capture(binary, args = want.args.view(), env = env.view(), stderr = true, timeout = 10000, stdin = input_of(sidecar_base(path))) match
+        // A minute catches a program that hangs, and leaves room for a program that collects on
+        // every allocation while the machine is busy with other builds.
+        val run = capture(binary, args = want.args.view(), env = env.view(), stderr = true, timeout = 60000, stdin = input_of(sidecar_base(path))) match
             Ok(r) -> r
             Err(e) ->
                 failures = failures + s"$path $level: did not run: ${e.to_string()}\n"

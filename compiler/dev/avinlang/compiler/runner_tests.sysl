@@ -15,13 +15,121 @@ private struct Session
     out: string
     err: string
 
-private session(dir: string, args: []const string) -> Session
+private session(dir: string, args: []const string) -> Session = session_in(".", dir, args)
+
+// A session whose current directory, the program a command uses when it is given none, is `here`.
+private session_in(here: string, dir: string, args: []const string) -> Session
     var said = ""
     var noted = ""
     val out = dir + "/run.out"
     val err = dir + "/run.err"
-    val status = run_cli_with(args, Some(repository_toolchain()), s -> said = said + s + "\n", s -> noted = noted + s + "\n", Stdio.ToPath(out), Stdio.ToPath(err))
+    val status = run_cli_in(here, args, Some(repository_toolchain()), s -> said = said + s + "\n", s -> noted = noted + s + "\n", Stdio.ToPath(out), Stdio.ToPath(err))
     Session(status, said, noted, read_text(out).unwrap_or(""), read_text(err).unwrap_or(""))
+
+@test("avin alone runs the package, or the directory program, it is in")
+bare_avin_runs_the_current_program()
+    val dir = make_temp_dir("avin-default").unwrap()
+    defer _ = remove_dir_all(dir)
+    new_package(dir + "/demo", false).unwrap()
+    val package = session_in(dir + "/demo", dir, ["avin"])
+    assert_eq(package.noted, "")
+    assert_eq(package.out, "Hello, world!\n")
+    assert_eq(package.status, 0)
+    // From inside the package, the enclosing package is the program.
+    val inside = session_in(dir + "/demo/demo", dir, ["avin", "-O0"])
+    assert_eq(inside.out, "Hello, world!\n")
+    make_dir_all(dir + "/plain").unwrap()
+    write_text(dir + "/plain/main.avin", "main() -> int\n    print(\"plain\")\n    5\n").unwrap()
+    val plain = session_in(dir + "/plain", dir, ["avin"])
+    assert_eq(plain.out, "plain\n")
+    assert_eq(plain.status, 5)
+    make_dir_all(dir + "/empty").unwrap()
+    make_dir_all(dir + "/logs").unwrap()
+    val empty = session_in(dir + "/empty", dir + "/logs", ["avin"])
+    assert_eq(empty.status, 1)
+    assert(empty.noted.contains("no Avin program here"))
+    assert_eq(empty.out, "")
+
+@test("avin with a first argument that is not a command runs that path, and the arguments after -- reach it")
+a_path_first_is_run()
+    val dir = make_temp_dir("avin-default").unwrap()
+    defer _ = remove_dir_all(dir)
+    val source = dir + "/echo.avin"
+    write_text(source, "import avin.process\n\nmain() -> int\n    print(process.args())\n    process.exit(process.args().length())\n").unwrap()
+    val plain = session(dir, ["avin", source])
+    assert_eq(plain.noted, "")
+    assert_eq(plain.out, "[]\n")
+    val given = session(dir, ["avin", source, "-O0", "--", "a", "b"])
+    assert_eq(given.out, "[a, b]\n")
+    assert_eq(given.status, 2)
+    // Options with no path before them are for the current directory's program.
+    make_dir_all(dir + "/here").unwrap()
+    write_text(dir + "/here/echo.avin", "import avin.process\n\nmain() -> int\n    print(process.args())\n    0\n").unwrap()
+    val options = session_in(dir + "/here", dir, ["avin", "--", "x"])
+    assert_eq(options.out, "[x]\n")
+    // A path that exists is a path, a word that does not is refused with the commands.
+    val unknown = session(dir, ["avin", "nosuchthing"])
+    assert_eq(unknown.status, 2)
+    assert(unknown.noted.starts_with("avin: unknown command or file `nosuchthing`\nusage: avin "))
+    refused_usage(dir, ["avin", "--bad"])
+    refused_usage(dir, ["avin", "-o", "x"])
+
+@test("build, check, parse and test take the current directory's program when none is named")
+commands_default_to_the_current_program()
+    val dir = make_temp_dir("avin-default").unwrap()
+    defer _ = remove_dir_all(dir)
+    new_package(dir + "/demo", false).unwrap()
+    val home = dir + "/demo"
+    assert(session_in(home, dir, ["avin", "check"]).said.starts_with("checked "))
+    assert(session_in(home, dir, ["avin", "parse"]).said.starts_with("parsed "))
+    val built = session_in(home, dir, ["avin", "build", "-o", dir + "/demo-binary"])
+    assert_eq(built.noted, "")
+    assert(exists(dir + "/demo-binary"))
+    val tested = session_in(home, dir, ["avin", "test"])
+    assert_eq(tested.status, 0)
+    assert(tested.said.contains("1 passed, 0 failed"))
+    val ir = dir + "/demo.ll"
+    assert_eq(session_in(home, dir, ["avin", "emit-llvm", "-o", ir]).status, 0)
+    assert(exists(ir))
+    make_dir_all(dir + "/empty").unwrap()
+    for command in ["build", "check", "parse", "test", "run"]
+        val r = session_in(dir + "/empty", dir, ["avin", command])
+        assert_eq(r.status, 1)
+        assert(r.noted.contains("no Avin program here"))
+
+@test("avin test reads its first argument as the program when it names an existing path, and as the filter otherwise")
+test_argument_is_a_program_or_a_filter()
+    val dir = make_temp_dir("avin-default").unwrap()
+    defer _ = remove_dir_all(dir)
+    new_package(dir + "/demo", false).unwrap()
+    val home = dir + "/demo"
+    val filtered = session_in(home, dir, ["avin", "test", "greets"])
+    assert_eq(filtered.status, 0)
+    assert(filtered.said.contains("1 passed, 0 failed"))
+    val excluded = session_in(home, dir, ["avin", "test", "nothing-has-this-name"])
+    assert(!excluded.said.contains("1 passed"))
+    val program = session(dir, ["avin", "test", home])
+    assert(program.said.contains("1 passed, 0 failed"))
+    val both = session(dir, ["avin", "test", home, "greets", "-O0"])
+    assert(both.said.contains("1 passed, 0 failed"))
+    // An argument that names an existing path is the program, so a filter spelled like one follows the program.
+    val spelled = session(dir, ["avin", "test", home, "demo"])
+    assert(!spelled.said.contains("0 passed, 1 failed"))
+
+@test("a command name is the command, and a directory named like one is run by its path")
+command_names_win_over_paths()
+    val dir = make_temp_dir("avin-default").unwrap()
+    defer _ = remove_dir_all(dir)
+    make_dir_all(dir + "/test").unwrap()
+    write_text(dir + "/test/main.avin", "main() -> int\n    print(\"directory\")\n    0\n").unwrap()
+    val by_path = session(dir, ["avin", dir + "/test"])
+    assert_eq(by_path.out, "directory\n")
+    make_dir_all(dir + "/logs").unwrap()
+    val by_name = session_in(dir, dir + "/logs", ["avin", "test"])
+    assert_eq(by_name.out, "")
+    // `test` ran as the command on the directory, which holds no tests, so the program never ran.
+    assert(!by_name.noted.contains("unknown command"))
+    assert(!by_name.noted.starts_with("usage:"))
 
 @test("run builds the program, runs it with its arguments, and forwards its output and exit status")
 run_forwards_output_and_status()
@@ -215,7 +323,6 @@ test_single_file()
 usage_of_run_and_test()
     val dir = make_temp_dir("avin-run").unwrap()
     defer _ = remove_dir_all(dir)
-    refused_usage(dir,["avin", "run"])
     refused_usage(dir,["avin", "run", "x.avin", "-o", "y"])
     refused_usage(dir,["avin", "run", "x.avin", "extra"])
     refused_usage(dir,["avin", "test", "x.avin", "a", "b"])

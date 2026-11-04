@@ -14,6 +14,8 @@ parse_body(p: *Parser, discard: bool) -> &Expr
     p.in_list = false
     val header = p.in_header
     p.in_header = false
+    val lines = p.open_lines
+    p.open_lines = 0
     loop
         if p.toks.at_end() || p.accept_kind(Dedent) then break
         if p.accept_kind(Newline) then continue
@@ -29,8 +31,9 @@ parse_body(p: *Parser, discard: bool) -> &Expr
                 p.report.add(error(p.toks.here(), "expected a new line between block items"))
     p.in_list = outer
     p.in_header = header
+    p.open_lines = lines
     if items.len() == 0 then p.report.add(error(start, "expected a nonempty block"))
-    Expr(start.to(p.toks.here()), Block(items, discard))
+    Expr(start.to(p.ended()), Block(items, discard))
 
 // Whether the indented line after a statement starts with a name and then an argument, as an
 // infix call continued from the line above would: `b` then `    add 2`.
@@ -127,7 +130,7 @@ parse_if(p: *Parser, at: Span) -> &Expr
         indented = p.at_kind(Indent)
         no = Some(parse_body(p, false))
     optional_end(p, "if", indented)
-    Expr(at.to(p.toks.here()), If(condition, yes, no))
+    Expr(at.to(p.ended()), If(condition, yes, no))
 
 parse_while(p: *Parser, at: Span) -> &Expr
     val condition = header_expression(p)
@@ -140,7 +143,7 @@ parse_while(p: *Parser, at: Span) -> &Expr
         indented = p.at_kind(Indent)
         otherwise = Some(parse_body(p, false))
     optional_end(p, "while", indented)
-    Expr(at.to(p.toks.here()), While(condition, body, otherwise))
+    Expr(at.to(p.ended()), While(condition, body, otherwise))
 
 // `for pattern in source` and an indented body, or `for pattern in source do body` on one line.
 // With `yield`, a comprehension: generators separated by commas, each followed by its `if` guards,
@@ -173,7 +176,7 @@ parse_for(p: *Parser, at: Span) -> &Expr
             None -> generators.push(generator(p))
         if !following(p, "yield")
             p.report.add(error(p.toks.here(), "generators written in a block after `for` need `yield` on the line after them"))
-            return Expr(at.to(p.toks.here()), Invalid)
+            return Expr(at.to(p.ended()), Invalid)
     else
         generators.push(generator(p))
         while p.accept(",")
@@ -182,7 +185,7 @@ parse_for(p: *Parser, at: Span) -> &Expr
         val indented = p.at_kind(Indent)
         val body = parse_line_body(p, false)
         optional_end(p, "for", indented)
-        return Expr(at.to(p.toks.here()), ForYield(generators, body))
+        return Expr(at.to(p.ended()), ForYield(generators, body))
     val first = generators[0]
     if generators.len() > 1 || first.guards.len() > 0
         p.report.add(error(first.span.to(generators[generators.len() - 1].span), "a `for` without `yield` has one generator and no guards; nest the loops, or test in the body"))
@@ -191,7 +194,7 @@ parse_for(p: *Parser, at: Span) -> &Expr
     if !do_word && !indented then p.report.add(error(p.toks.here(), "a one-line `for` needs `do`"))
     val body = parse_body(p, true)
     optional_end(p, "for", indented)
-    Expr(at.to(p.toks.here()), For(first.pattern, first.source, body))
+    Expr(at.to(p.ended()), For(first.pattern, first.source, body))
 
 // `pattern in source` and the `if` guards after it.
 private generator(p: *Parser) -> Generator
@@ -218,7 +221,7 @@ parse_loop(p: *Parser, at: Span) -> &Expr
     if !do_word && !indented then p.report.add(error(p.toks.here(), "a one-line `loop` needs `do`"))
     val body = parse_body(p, true)
     optional_end(p, "loop", indented)
-    Expr(at.to(p.toks.here()), Loop(body))
+    Expr(at.to(p.ended()), Loop(body))
 
 /** `do`, then the body (an indented block, or one statement on the same line), then `while` and the
  * test, then an optional `else` that runs when the test fails. */
@@ -227,7 +230,7 @@ parse_do(p: *Parser, at: Span) -> &Expr
     val body = parse_body(p, true)
     if !(following(p, "while") && p.accept("while"))
         p.report.add(error(p.toks.here(), "a `do` body needs a `while` test after it"))
-        return Expr(at.to(p.toks.here()), DoWhile(body, Expr(p.toks.here(), BoolLit(false)), None))
+        return Expr(at.to(p.ended()), DoWhile(body, Expr(p.toks.here(), BoolLit(false)), None))
     val condition = header_expression(p)
     var otherwise: Option[&Expr] = None
     var else_indented = false
@@ -235,28 +238,31 @@ parse_do(p: *Parser, at: Span) -> &Expr
         else_indented = p.at_kind(Indent)
         otherwise = Some(parse_body(p, false))
     optional_end(p, "do", indented || else_indented)
-    Expr(at.to(p.toks.here()), DoWhile(body, condition, otherwise))
+    Expr(at.to(p.ended()), DoWhile(body, condition, otherwise))
 
 match_expression(p: *Parser, subject: &Expr) -> &Expr
     p.expect_kind(Indent, "expected indented match arms")
     val arms = match_arms(p)
-    Expr(subject.span.to(p.toks.here()), Match(subject, arms))
+    Expr(subject.span.to(p.ended()), Match(subject, arms))
 
 // `match` with nothing before it is a function of the value its arms match. The arms are an
 // indented block, as after `x match`, or one arm on the `match` line: `xs.collect(match Some(n) -> n)`.
 match_function(p: *Parser, at: Span) -> &Expr
-    if p.accept_kind(Indent) then return Expr(at.to(p.toks.here()), MatchFunction(match_arms(p)))
+    if p.accept_kind(Indent) then return Expr(at.to(p.ended()), MatchFunction(match_arms(p)))
     var arms: Buf[Arm] = buf()
     if p.at_line_end()
         p.report.add(error(p.toks.here(), "expected match arms after `match`: one on the same line, or an indented block"))
         return Expr(at, Invalid)
     arms.push(match_arm(p, false, true))
-    Expr(at.to(p.toks.here()), MatchFunction(arms))
+    Expr(at.to(p.ended()), MatchFunction(arms))
 
 // The arms of an indented block, whose Indent is consumed; reads through its Dedent and an optional
 // `end match`.
 private match_arms(p: *Parser) -> Buf[Arm]
     var arms: Buf[Arm] = buf()
+    // The arms start a new line context, as a block's lines do.
+    val lines = p.open_lines
+    p.open_lines = 0
     loop
         if p.toks.at_end() || p.accept_kind(Dedent) then break
         if p.accept_kind(Newline) then continue
@@ -266,6 +272,7 @@ private match_arms(p: *Parser) -> Buf[Arm]
             p.report.add(error(p.toks.here(), "a leading `|` needs a pattern, not `else`"))
         arms.push(match_arm(p, fallback, false))
         if p.toks.position == before then break
+    p.open_lines = lines
     optional_end(p, "match", true)
     arms
 

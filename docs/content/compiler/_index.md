@@ -26,15 +26,27 @@ Each stage has its own data structures and its own tests. No stage reaches back 
 input. **Types are an enum over symbols, never strings**: built-in types, nominal types, functions,
 tuples, type parameters, inference variables, `Any`, `Nothing` and an error type.
 
-**Loading a program.** `avin build <dir>` takes a directory as the program's root: every `.avin` file
-under it is read in path order, passing over directories whose names begin with `.`, and each is
+**Loading a program.** `avin build <dir>` takes a directory as the program's root: every `.avin` and
+`.lavin` file under it is read in path order, passing over directories whose names begin with `.`, and each is
 given the module its directory's path names, the root directory's files last as the root module.
 A file whose header disagrees with its directory, or that has none outside the root, is reported
 before anything is checked. `avin build <file>` is a program of that one file, in the module its
 header names. The standard library is loaded the same way, from `library/` under the toolchain's
 root, where every module is `avin` or under it; `library/avin/prelude.avin` is one ordinary file of
-module `avin`. A package manifest will name the roots the loader walks; the files and their modules
-are what the later stages see.
+module `avin`. A path in a package, a directory with an `avin.hocon` found by walking up, is the
+package: `package.sysl` reads the manifest with Sysl's HOCON reader, resolves the dependency graph
+(the highest version asked for of each git coordinate, fetched into the machine's cache and checked
+against `avin.sum`), and the loader walks each dependency's tree without its root files and `tests/`,
+then the package's own; a directory holding its own manifest is passed over. The files and their
+modules are what the later stages see; a dependency's `@test` functions are dropped from the program
+after checking, so `avin test` runs only the package's own.
+
+A [literate](/spec/declarations/#literate-source) `.lavin` file is read by the parser as its program
+laid over the document (`literate.sysl`): the parsing package's `tangle_literate` decides which lines
+are program text and refuses a tab in an indentation or an unclosed fence, and every other byte
+becomes a space, so the program has the document's bytes at the document's offsets. The lexer
+measures indentation past the four-column margin. Every later stage reads that program as its
+unit's source, and every span, line and column is the document's with no mapping.
 
 Names are resolved by module. Every top-level declaration is held under its qualified name, `a.b.X`
 (a root module's under `X`), and a bare name in a file resolves to the first of its own module's
@@ -118,8 +130,11 @@ binding \`name\` does not match \`module.name\`: …`. A mirror's import and its
 own lines, reported at its declaration as `the Sysl mirror \`Name\` does not match
 \`module.Name\`: …`. A diagnostic that falls elsewhere is reported with Sysl's whole output.
 
-The archive is cached under `.avin/shims/` in the toolchain's root, named by a SHA-256 of the
-manifest, the shim source, the `sysl --version` output and the runtime's source files. A build with
+The archive is cached under `shims/` in the user's cache for this compiler version
+(`~/Library/Caches/avin/<version>` on macOS, `AVIN_CACHE` when it is set), never in the toolchain's
+root, which an installed compiler only reads. It is named by a SHA-256 of the manifest, the shim
+source, the `sysl --version` output and the runtime's source files, each named by its path in the
+runtime. A build with
 the same bindings finds it there and runs no Sysl build; it is built under a temporary name and
 published by rename, so concurrent builds never see a partial archive. The `check` command builds
 the shims too, since only Sysl can say whether a binding is right.
@@ -127,7 +142,10 @@ the shims too, since only Sysl can say whether a binding is right.
 ## Runtime
 
 `runtime/` is a Sysl package, built into a library archive when its sources change rather than once
-per program, and linked into every executable. It contains:
+per program, and linked into every executable. The archive is named by a key over the compiler's
+version and the runtime's sources: a release ships it prebuilt as `share/avin/lib/libavinrt-<key>.a`,
+and otherwise it is built into `runtime/` in the user's cache, so a program that reaches no Sysl
+binding is built without Sysl. It contains:
 
 - program entry, arguments and exit status;
 - the collector interface over `sh.sysl.gc` — heap setup and growth, collect-on-pressure, a
@@ -281,6 +299,53 @@ that name or the trait's default. Every variant's descriptor carries that table 
 constant objects of fieldless variants included, so a trait-typed call on a data value is the same
 two loads. The type record lists the traits too, so a `t: Trait` pattern on an `Any` matches.
 
+**Options as pointers** (`representation.sysl`). An `Option[T]` whose `T` is always a non-null
+reference to an object with a descriptor is kept as one pointer: `Some(x)` is `x` itself and `None`
+is null, so making either allocates nothing and a match compares with null. `T` is then a class, a
+trait, an object, an `Array` or another class instance, `Any`, a string, a tuple, a function, or a
+`data` type other than `Option`. Every other option stays an object: one of a built-in value type
+(`int`, `real`, `bool`, `char`, `byte`, `unit`), of `Nothing`, and of an option, since
+`Option[Option[C]]` cannot spend null on both of its `None`s. The choice is lowering's (construction,
+variant patterns, structural `==` and hash, which compute exactly what the object form computes),
+and the program cannot tell:
+
+- Where such an option must be an object, lowering makes the object it stands for, laid out as every
+  option of its type is: `None`'s constant object, or a new `Some` holding the pointer. That is a box
+  to `Any`, a type pattern that tests it as an object or finds it as a trait, a call through a method
+  table, and the receiver or a `Self` argument of a trait's default body, which is compiled once for
+  objects (a `Self` result is taken back). Where an object becomes such an option (a type pattern's
+  binding, a record's equality entries), lowering takes the pointer out of it again.
+- Only that object has a method table. Its descriptor's table holds, for each method of the type, an
+  adapter (`avin.adapter.…`) that takes the object where the trait's method takes `Self`, calls the
+  method with the pointer, and gives back an object for a `Self` result; a default body sits there
+  directly.
+- A binding's shim converts it with `OptionForm(pointer)`: null is `None`, any other pointer the
+  `Some`'s value, converted as its type is.
+- A null is no root and no field the collector follows: it ignores every reference outside its heap,
+  null included. Making an option allocates nothing, so it publishes nothing, and the memory model is
+  unchanged.
+
+A **view** takes a value as another type with no conversion, and the pointer must never be read where
+an object is expected. The checker records every view `upcast` and `join` make, and every type
+pattern (`TProgram.views`, `TProgram.type_tests`); before lowering anything, `option_plan` keeps
+every option of the program an object where one of them could:
+
+- an option viewed as anything but another option, except as an `Any` where it is written (a box),
+  including inside a type argument, a tuple or a function type, as `List[Option[Dog]]` seen as
+  `List[Any]`; or an option of a pointer-shaped argument viewed as one of another, as
+  `Option[Option[Dog]]` seen as `Option[Any]`;
+- a type parameter viewed as anything but an `Any` it is boxed to, unless the view is through a bound
+  of a class or trait `Option` does not conform to, or a function type, widening no argument to `Any`
+  or to a trait `Option` conforms to (a bound holds exactly, so an instance's argument has the
+  bound's own arguments);
+- a type pattern whose target's arguments the tested value's static type does not fix, as one on an
+  `Any`, where the target names `Any`, a type parameter or a trait `Option` conforms to inside it,
+  such as `List[Any]`: the object it finds may hold options of any form; a pattern on a value whose
+  static type fixes them is checked as the view the other way;
+- a trait `Option` conforms to declaring a method that takes or returns `Self` inside another type.
+
+Two options whose arguments are both pointer-shaped share the one form, so their views need nothing.
+
 `Any` is a reference to an object. The checker inserts a **box** node wherever a value converts to
 `Any`; lowering makes it nothing for a value already kept as a reference to an object with a
 descriptor (a string, a tuple, a `data` value, an object, a closure), and for a number, `char` or
@@ -399,7 +464,8 @@ records whose types its own conforms to by variance, by the checker's rule (`vie
 still costs one scan of one record.
 
 A covariant view needs no conversion, and stays sound under monomorphization, because variance
-applies only between reference type arguments. Every field and every part of a field whose type
+applies only between reference type arguments (an option kept as a pointer is held to that by
+`option_plan`; see **Options as pointers**). Every field and every part of a field whose type
 mentions a type argument is then a reference (the argument itself, or a tuple, function, `data`
 value or object built from it), so `Box[Dog]` and `Box[Animal]` have the same layout and the same
 method-table shape, and code of either instance reads the other's objects correctly. A call through
@@ -472,6 +538,21 @@ its function that calls the runtime with the site's constant address, so the che
 share a block and two operations never do; the instances of a generic function share its sites. The
 runtime flushes what the program has written to standard output first, so no output is lost, then
 writes the message and stops.
+
+A thread that runs out of stack stops the program the same way, with `avin: trap: stack overflow`
+and no place. The runtime's C handler (`runtime/avin/rt/__posix__/stack_guard.c`) is installed by
+each thread before it runs Avin code, on the main thread when the runtime starts and on a started
+thread before its closure runs, and removed when that closure returns. Installing it records the
+lowest address of the thread's own stack, read from the operating system, and gives the thread an
+alternate signal stack, which is what lets the handler run when the ordinary stack is the thing that
+is full. A fault is reported only if its address lies in the guard region at the bottom of the
+faulting thread's stack; any other fault is a real crash, so the handler restores the default action
+and returns, and the program ends with the segmentation fault it would have had. The place is left
+out because the context's caller site holds where the program last entered the library, which is not
+where its recursion was. The handler writes the message with `write(2)` first, then flushes standard
+output, which is not safe inside a signal handler: an alarm ends the process if the flush never
+returns, and output buffered at the moment of the fault may be lost when the fault came from inside
+the C library's own output routines. The process ends as any trap does.
 
 A trap inside the core library reports the program's own call instead, through the context's
 **caller site**, a word at offset 24 holding the address of a trap site. Code generated for the
@@ -592,7 +673,9 @@ on the field's address at the instance's type, and the emitter makes it one `seq
 the value's storage width: `load atomic`, `store atomic`, `atomicrmw xchg` and `cmpxchg`, whose
 success bit is the result. A `bool` or a narrow integer is widened as a shared field is, a `real` is
 accessed as the 64 bits of its encoding, and a reference as a `ptr`, so a compare-and-set compares
-identity. An integer wider than 64 bits has no single atomic access, so each operation on one is the
+identity. `compareAndSet` of a value without identity (data, tuple, string, `Any`) is library code
+over two intrinsics, `atomic_by_value`, which lowering folds to a constant for the instance's `T`,
+and `atomic_compare_set` on the word: it loops on `==` and a word compare-and-set. An integer wider than 64 bits has no single atomic access, so each operation on one is the
 field's word-at-a-time accesses between `avin_rt_wide_atomic_begin` and `avin_rt_wide_atomic_end`,
 which take and give back one spin lock every such operation shares. `add`, `sub` and `update` are
 library code, a loop of `load` and `compareAndSet`, so an integer that would overflow traps before
@@ -682,8 +765,8 @@ for `bool` and `unit`); a hole of any other type, a type parameter's included, b
 
 A built-in type's impl may declare a method as an intrinsic; its declared type takes the receiver
 first. `impl string` in `library/avin/string.avin` does so for the string operations that read the
-object itself: `byteLength` (the length word, loaded and narrowed to `int`), a private `byteAt` (a
-checked byte load), `slice`, `repeat` and a private `find`, the last three over the runtime's
+object itself: `byteLength` (the length word, loaded and narrowed to `int`), `byteAt` (a checked
+byte load), `slice`, `repeat` and a private `find`, the last three over the runtime's
 `avin_rt_string_slice`, `avin_rt_string_repeat` and `avin_rt_string_find`, and a private
 `parseReal` over `avin_rt_string_parse_real`, which reads the number with Sysl's parser and answers
 not-a-number for a refusal. A direct call of one is

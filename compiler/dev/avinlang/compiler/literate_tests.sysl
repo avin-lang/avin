@@ -1,0 +1,289 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.{Source, source_of}
+import sysl.encoding.json.quoted as json_quote
+import sysl.fs.{exists, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.Stdio
+import sysl.text.from_utf8_unchecked
+
+// Literate source: a `.lavin` file is a Markdown document whose lines indented four columns are the
+// program. The reading, the positions it keeps, its two refusals, the commands that tangle and weave
+// a document, and a literate file in a program, in `avin test` and in the language server.
+
+private struct LitRun
+    status: int
+    said: string
+    noted: string
+    out: string
+
+private lit_avin(dir: string, args: []const string) -> LitRun
+    var said = ""
+    var noted = ""
+    val out = dir + "/run.out"
+    val status = run_cli_with(args, Some(repository_toolchain()), s -> said = said + s + "\n", s -> noted = noted + s + "\n", Stdio.ToPath(out), Stdio.ToPath(dir + "/run.err"))
+    LitRun(status, said, noted, read_text(out).unwrap_or(""))
+
+private program_of(name: string, text: string) -> string =
+    from_utf8_unchecked(literate_program(source_of(name, text)).unwrap().bytes)
+
+private lit_diagnostics(name: string, text: string) -> string
+    val parsed = parse(source_of(name, text))
+    parsed.report.render(parsed.source)
+
+// ---- the reading ----
+
+@test("literate: only the name decides, and the suffix comes off either kind of source")
+literate_names()
+    assert(is_literate("a/b.lavin"))
+    assert(!is_literate("a/b.avin"))
+    assert(is_source_name("x.avin") && is_source_name("x.lavin"))
+    assert(!is_source_name("x.md") && !is_source_name("x.lavinx"))
+    assert_eq(without_source_extension("dir/x.lavin"), "dir/x")
+    assert_eq(without_source_extension("dir/x.avin"), "dir/x")
+    assert_eq(literate_margin(source_of("x.lavin", "")), 4usize)
+    assert_eq(literate_margin(source_of("x.avin", "")), 0usize)
+
+@test("literate: the program keeps every program line's bytes where they were and blanks the prose")
+literate_program_is_laid_over_the_document()
+    val text = "# Title é\n\n    main() = 0\nprose\r\n    // two\n"
+    val program = program_of("t.lavin", text)
+    assert_eq(program.bytes.len, text.bytes.len)
+    assert_eq(program, "          \n\n    main() = 0\n     \r\n    // two\n")
+    // An ordinary file is its own program, however it is indented.
+    assert_eq(program_of("t.avin", text), text)
+
+@test("literate: a fenced block is an illustration, an indented line under a bullet is prose")
+literate_illustrations()
+    val text = "```\n    junk(\n```\n~~~~\n    ~~~\n    more junk\n~~~~\n- item\n\n      also junk\nback\n    main() = 0\n"
+    assert_eq(tangled_program(source_of("t.lavin", text)).unwrap(), "\n\n\n\n\n\n\n\n\n\n\nmain() = 0\n")
+    assert(!parse(source_of("t.lavin", text)).report.has_errors())
+
+@test("literate: an ordinary file is never read as literate, so four columns down its left are an indent")
+literate_only_by_name()
+    assert(!parse(source_of("t.lavin", "    main() = 0\n")).report.has_errors())
+    assert(parse(source_of("t.avin", "    main() = 0\n")).report.has_errors())
+
+@test("literate: prose between the lines of one body ends nothing, at any depth, with blank lines around it")
+literate_layout_across_prose()
+    val text = "    main() -> int\n        var n = 0\n\nProse at the margin.\n\n        while n < 3 do\n            n += 1\n\nMore prose.\n            \n            n += 0\n        n\n"
+    val parsed = parse(source_of("t.lavin", text))
+    assert_eq(parsed.report.render(parsed.source), "")
+    assert_eq(parsed.file.items.len(), 1usize)
+
+@test("literate: a program line less deep than its block is still a dedent, measured past the margin")
+literate_ragged_indentation()
+    val text = "    main()\n        val x = 1\n\nprose\n\n      val y = 2\n"
+    val said = lit_diagnostics("r.lavin", text)
+    assert(said.contains("indentation does not match an enclosing block"))
+    assert(said.contains("--> r.lavin:6:7"))
+
+// ---- positions ----
+
+@test("literate: a diagnostic names the document's line and column and quotes the document's line")
+literate_diagnostic_positions()
+    val text = "# Doubling\n\n    double(n: int) -> int = n * 2\n\nIt is used once.\n\n    main() -> int\n        double(nope)\n"
+    val compiled = compile(repository_toolchain(), source_of("d.lavin", text))
+    assert(compiled.diagnostics.contains("error: `nope` is not defined\n --> d.lavin:8:16\n  |\n8 |         double(nope)\n  |                ^^^^\n"))
+
+@test("literate: a tab in a line's indentation is refused where it is, before the four-column test")
+literate_tab_refused()
+    val message = "a tab in the indentation of a literate file — what makes a line program text is four columns of indent, and a tab is as wide as whatever happens to be displaying it, so this line is code in one editor and prose in another"
+    assert_eq(lit_diagnostics("t.lavin", "    main()\n  \tval x = 1\n"),
+        s"error: $message\n --> t.lavin:2:3\n  |\n2 |   \tval x = 1\n  |   ^\n")
+    // Inside a fence the line is an illustration, and a tab there is the illustration's business.
+    assert(!parse(source_of("t.lavin", "```\n\tx\n```\n    main() = 0\n")).report.has_errors())
+    // A tab after the indentation is the program's own, as in an ordinary file.
+    assert(lit_diagnostics("t.lavin", "\t\n    main() = 0\n") == "")
+
+@test("literate: a fence that is never closed is refused at the line that opened it")
+literate_unclosed_fence_refused()
+    val said = lit_diagnostics("f.lavin", "    main() = 0\n\n~~~\n    lost() = 1\n")
+    assert(said.starts_with("error: this fence is never closed, so everything below it is an illustration and none of it is compiled — close it, or indent the lines that are meant to run\n --> f.lavin:3:1\n"))
+    // A closing fence of the other character, or a shorter one, does not close it.
+    assert(lit_diagnostics("f.lavin", "````\n```\n~~~~\n") != "")
+    assert(lit_diagnostics("f.lavin", "````\n```\n````\n    main() = 0\n") == "")
+
+// ---- tangle and weave ----
+
+private const LitDocument: string = "# Halving\n\nAn explanation with a < b & an *emphasis*.\n\n    // The half, rounded toward zero.\n    half(n: int) -> int = n / 2\n\nThe body is explained between its lines.\n\n    main()\n        val s = \"two\"\n\n        print(half(9))\n\n~~~avin\nwrong(n) = n\n~~~\n\n```\nnot avin\n```\n"
+
+@test("tangle: prints the program with its prose blanked and four columns off, line for line")
+tangle_prints_the_program()
+    val dir = make_temp_dir("avin-lit").unwrap()
+    defer _ = remove_dir_all(dir)
+    val file = dir + "/h.lavin"
+    write_text(file, LitDocument).unwrap()
+    val run = lit_avin(dir, ["avin", "tangle", file])
+    assert_eq(run.status, 0)
+    assert_eq(run.noted, "")
+    assert_eq(run.said, "\n\n\n\n// The half, rounded toward zero.\nhalf(n: int) -> int = n / 2\n\n\n\nmain()\n    val s = \"two\"\n\n    print(half(9))\n\n\n\n\n\n\n\n\n")
+    val out = dir + "/h.avin"
+    assert_eq(lit_avin(dir, ["avin", "tangle", file, "-o", out]).status, 0)
+    assert_eq(read_text(out).unwrap(), run.said)
+    // What tangle prints is an ordinary program that runs as the document does.
+    assert_eq(lit_avin(dir, ["avin", "run", out]).out, "4\n")
+    assert_eq(lit_avin(dir, ["avin", "run", file]).out, "4\n")
+
+@test("tangle and weave: refuse a file the compiler refuses, an ordinary file, and a bad command line")
+tangle_and_weave_refusals()
+    val dir = make_temp_dir("avin-lit").unwrap()
+    defer _ = remove_dir_all(dir)
+    val broken = dir + "/b.lavin"
+    write_text(broken, "    main() = 0\n```\n").unwrap()
+    for command in ["tangle", "weave"]
+        val run = lit_avin(dir, ["avin", command, broken])
+        assert_eq(run.status, 1)
+        assert(run.noted.starts_with("error: this fence is never closed"))
+        assert(run.noted.contains(s"--> $broken:2:1"))
+        val plain = lit_avin(dir, ["avin", command, dir + "/p.avin"])
+        assert_eq(plain.status, 2)
+        assert(plain.noted.contains("is not a literate source"))
+        assert_eq(lit_avin(dir, ["avin", command]).status, 2)
+        assert_eq(lit_avin(dir, ["avin", command, broken, "--bad"]).status, 2)
+        assert_eq(lit_avin(dir, ["avin", command, broken, broken]).status, 2)
+    assert_eq(lit_avin(dir, ["avin", "weave", dir + "/missing.lavin"]).status, 1)
+
+@test("weave: the document as one HTML page, its program blocks coloured by the Avin lexer")
+weave_renders_the_document()
+    val dir = make_temp_dir("avin-lit").unwrap()
+    defer _ = remove_dir_all(dir)
+    val file = dir + "/h.lavin"
+    write_text(file, LitDocument).unwrap()
+    val out = dir + "/h.html"
+    val run = lit_avin(dir, ["avin", "weave", file, "-o", out])
+    assert_eq(run.status, 0)
+    assert_eq(run.noted, "")
+    val html = read_text(out).unwrap()
+    assert(html.starts_with("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"))
+    assert(html.contains("<title>h.lavin</title>"))
+    assert(html.contains(".hl-keyword {"))
+    assert(html.contains("<h1 id=\"halving\">Halving</h1>\n<p>An explanation with a &lt; b &amp; an <em>emphasis</em>.</p>\n"))
+    // One program block, coloured: a comment, a name, a type, an operator and a number.
+    assert(html.contains("<pre><code class=\"language-avin\"><span class=\"hl-comment\">// The half, rounded toward zero.</span>\n<span class=\"hl-name\">half</span><span class=\"hl-operator\">(</span><span class=\"hl-name\">n</span><span class=\"hl-operator\">:</span> <span class=\"hl-type\">int</span><span class=\"hl-operator\">)</span> <span class=\"hl-operator\">-&gt;</span> <span class=\"hl-type\">int</span> <span class=\"hl-operator\">=</span> <span class=\"hl-name\">n</span> <span class=\"hl-operator\">/</span> <span class=\"hl-number\">2</span>\n</code></pre>\n<p>The body is explained between its lines.</p>\n"))
+    // The second block keeps the program's own indentation, and its blank line, past the margin.
+    assert(html.contains("<pre><code class=\"language-avin\"><span class=\"hl-name\">main</span><span class=\"hl-operator\">(</span><span class=\"hl-operator\">)</span>\n    <span class=\"hl-keyword\">val</span> <span class=\"hl-name\">s</span> <span class=\"hl-operator\">=</span> <span class=\"hl-string\">&quot;two&quot;</span>\n\n    <span class=\"hl-name\">print</span>"))
+    // A fence marked `avin` is coloured too; an unmarked one is set as it is.
+    assert(html.contains("<pre><code class=\"language-avin\"><span class=\"hl-name\">wrong</span>"))
+    assert(html.contains("<pre><code>not avin\n</code></pre>"))
+    // Without -o, the page is said.
+    val said = lit_avin(dir, ["avin", "weave", file])
+    assert_eq(said.status, 0)
+    assert_eq(said.said, html)
+
+@test("weave: the colouring of a line the lexer cannot finish still holds all of its text")
+weave_highlights_broken_code()
+    assert_eq(highlight_avin("x = \"open\n"), "<span class=\"hl-name\">x</span> <span class=\"hl-operator\">=</span> &quot;open\n")
+    assert_eq(highlight_avin("a // b < c\n"), "<span class=\"hl-name\">a</span> <span class=\"hl-comment\">// b &lt; c</span>\n")
+    assert_eq(highlight_avin("if x is Some(y) then 1.5 else 'c'"), "<span class=\"hl-keyword\">if</span> <span class=\"hl-name\">x</span> <span class=\"hl-keyword\">is</span> <span class=\"hl-type\">Some</span><span class=\"hl-operator\">(</span><span class=\"hl-name\">y</span><span class=\"hl-operator\">)</span> <span class=\"hl-keyword\">then</span> <span class=\"hl-number\">1.5</span> <span class=\"hl-keyword\">else</span> <span class=\"hl-string\">'c'</span>")
+
+// ---- in a program ----
+
+@test("literate: a directory program finds .lavin files beside .avin ones, in modules and at the root")
+literate_files_in_a_directory_program()
+    val dir = make_temp_dir("avin-lit").unwrap()
+    defer _ = remove_dir_all(dir)
+    make_dir_all(dir + "/p/m").unwrap()
+    write_text(dir + "/p/main.lavin", "The root file.\n\n    import m.twice\n\n    main() -> int = twice(other())\n").unwrap()
+    write_text(dir + "/p/other.avin", "other() -> int = 4\n").unwrap()
+    write_text(dir + "/p/m/m.lavin", "    module m\n\nDoubles.\n\n    twice(n: int) -> int = n * 2\n").unwrap()
+    val files = program_files(dir + "/p").unwrap()
+    assert_eq(files.len(), 3usize)
+    assert_eq(files[0].src.name, dir + "/p/m/m.lavin")
+    val run = lit_avin(dir, ["avin", "run", dir + "/p"])
+    assert_eq(run.noted, "")
+    assert_eq(run.status, 8)
+
+@test("literate: avin test finds a .lavin file's tests and places a failure in the document")
+literate_tests_run()
+    val dir = make_temp_dir("avin-lit").unwrap()
+    defer _ = remove_dir_all(dir)
+    val file = dir + "/t.lavin"
+    write_text(file, "# Tests\n\n    @test\n    holds()\n        assert(1 + 1 == 2)\n\nOne that fails.\n\n    @test\n    breaks()\n        assert(1 + 1 == 3)\n").unwrap()
+    val run = lit_avin(dir, ["avin", "test", file])
+    assert_eq(run.status, 1)
+    assert(run.said.contains("t.lavin\n"))
+    assert(run.said.contains("assertion failed at t.lavin:11:9"))
+    assert(run.said.contains("1 passed, 1 failed"))
+    assert_eq(lit_avin(dir, ["avin", "test", file, "holds"]).status, 0)
+
+// ---- the language server ----
+
+private lit_lsp_request(id: int, method: string, params: string) -> string =
+    s"{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"$method\",\"params\":$params}"
+
+private lit_lsp_notify(method: string, params: string) -> string =
+    s"{\"jsonrpc\":\"2.0\",\"method\":\"$method\",\"params\":$params}"
+
+private lit_lsp_at(uri: string, line: int, character: int) -> string =
+    s"{\"textDocument\":{\"uri\":\"$uri\"},\"position\":{\"line\":$line,\"character\":$character}}"
+
+private lit_lsp_range(l0: int, c0: int, l1: int, c1: int) -> string =
+    s"{\"start\":{\"line\":$l0,\"character\":$c0},\"end\":{\"line\":$l1,\"character\":$c1}}"
+
+private lit_lsp_one(server: *LspServer, body: string) -> string
+    val out = lsp_answer(server, body)
+    assert_eq(out.len(), 1)
+    out[0]
+
+private lit_lsp_publish(uri: string, diagnostics: string) -> string =
+    s"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"$uri\",\"diagnostics\":[$diagnostics]}}"
+
+private lit_lsp_text(last: string) -> string =
+    "# Doubling\n\n    double(n: int) -> int = n * 2\n\nThe program uses it once.\n\n    main() -> int\n        val x = double(4)\n\nand checks it.\n\n        x + " + last + "\n"
+
+@test("lsp: a .lavin document's diagnostics, hover, definition and outline are at its own positions")
+lsp_literate_document()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    defer _ = remove_dir_all(dir)
+    val uri = lsp_file_uri(dir + "/d.lavin")
+    var server = lsp_server(repository_toolchain())
+    lsp_answer(&server, lit_lsp_request(1, "initialize", "{\"capabilities\":{}}"))
+    lsp_answer(&server, lit_lsp_notify("initialized", "{}"))
+    val open = lit_lsp_notify("textDocument/didOpen", s"{\"textDocument\":{\"uri\":\"$uri\",\"languageId\":\"avin-literate\",\"version\":1,\"text\":${json_quote(lit_lsp_text("nope"))}}}")
+    val error = s"{\"range\":${lit_lsp_range(11, 12, 11, 16)},\"severity\":1,\"source\":\"avin\",\"message\":${json_quote("`nope` is not defined")}}"
+    assert_eq(lit_lsp_one(&server, open), lit_lsp_publish(uri, error))
+    val change = lit_lsp_notify("textDocument/didChange", s"{\"textDocument\":{\"uri\":\"$uri\",\"version\":2},\"contentChanges\":[{\"text\":${json_quote(lit_lsp_text("1"))}}]}")
+    assert_eq(lit_lsp_one(&server, change), lit_lsp_publish(uri, ""))
+    val hover = s"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":${json_quote("```avin\ndouble(n: int) -> int\n```")}},\"range\":${lit_lsp_range(7, 16, 7, 22)}}}"
+    assert_eq(lit_lsp_one(&server, lit_lsp_request(2, "textDocument/hover", lit_lsp_at(uri, 7, 17))), hover)
+    val local = s"{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":${json_quote("```avin\nval x: int\n```")}},\"range\":${lit_lsp_range(11, 8, 11, 9)}}}"
+    assert_eq(lit_lsp_one(&server, lit_lsp_request(3, "textDocument/hover", lit_lsp_at(uri, 11, 8))), local)
+    // Prose holds nothing to hover.
+    assert_eq(lit_lsp_one(&server, lit_lsp_request(4, "textDocument/hover", lit_lsp_at(uri, 4, 4))), "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":null}")
+    val definition = s"{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"uri\":\"$uri\",\"range\":${lit_lsp_range(2, 4, 2, 10)}}}"
+    assert_eq(lit_lsp_one(&server, lit_lsp_request(5, "textDocument/definition", lit_lsp_at(uri, 7, 17))), definition)
+    val double = s"{\"name\":\"double\",\"kind\":12,\"range\":${lit_lsp_range(2, 4, 2, 33)},\"selectionRange\":${lit_lsp_range(2, 4, 2, 10)}}"
+    val main = s"{\"name\":\"main\",\"kind\":12,\"range\":${lit_lsp_range(6, 4, 11, 13)},\"selectionRange\":${lit_lsp_range(6, 4, 6, 8)}}"
+    assert_eq(lit_lsp_one(&server, lit_lsp_request(6, "textDocument/documentSymbol", s"{\"textDocument\":{\"uri\":\"$uri\"}}")),
+        s"{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":[$double,$main]}")
+    // Semantic tokens start at the declaration of `double`, four columns in on line 2, then its
+    // parameter `n`, seven columns further.
+    val tokens = lit_lsp_one(&server, lit_lsp_request(7, "textDocument/semanticTokens/full", s"{\"textDocument\":{\"uri\":\"$uri\"}}"))
+    assert(tokens.contains("\"data\":[2,4,6,7,1,0,7,1,10,1,"), tokens)
+    // The references of `double` are its declaration and its one use, both in the document's columns.
+    val references = lit_lsp_one(&server, lit_lsp_request(8, "textDocument/references", s"{\"textDocument\":{\"uri\":\"$uri\"},\"position\":{\"line\":7,\"character\":17},\"context\":{\"includeDeclaration\":true}}"))
+    assert(references.contains(lit_lsp_range(2, 4, 2, 10)), references)
+    assert(references.contains(lit_lsp_range(7, 16, 7, 22)), references)
+
+@test("lsp: a refused .lavin document is told where, and a directory of .lavin modules is a program")
+lsp_literate_refusal_and_program()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    defer _ = remove_dir_all(dir)
+    make_dir_all(dir + "/m").unwrap()
+    write_text(dir + "/m/m.lavin", "    module m\n").unwrap()
+    assert(lsp_program(dir + "/library", dir + "/main.lavin", "").directory)
+    write_text(dir + "/f.lavin", "    main() = 0\n").unwrap()
+    val uri = lsp_file_uri(dir + "/f.lavin")
+    var server = lsp_server(repository_toolchain())
+    lsp_answer(&server, lit_lsp_request(1, "initialize", "{\"capabilities\":{}}"))
+    lsp_answer(&server, lit_lsp_notify("initialized", "{}"))
+    val open = lit_lsp_notify("textDocument/didOpen", s"{\"textDocument\":{\"uri\":\"$uri\",\"languageId\":\"avin-literate\",\"version\":1,\"text\":${json_quote("    main() = 0\n\n```\n")}}}")
+    val answers = lsp_answer(&server, open)
+    var told = false
+    for answer in answers
+        if answer.contains(uri)
+            assert(answer.contains(s"\"range\":${lit_lsp_range(2, 0, 2, 3)}"))
+            assert(answer.contains("this fence is never closed"))
+            told = true
+    assert(told)

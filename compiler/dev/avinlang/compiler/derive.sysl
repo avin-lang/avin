@@ -57,8 +57,9 @@ derive_unit(c: *Checker, unit: usize)
     var derives_any = false
     for item in file.items
         item match
-            ClassItem(d) -> if d.derives.len() > 0 then derives_any = true
+            ClassItem(d) -> if d.derives.len() > 0 || d.annotations.len() > 0 || params_annotated(d.params) then derives_any = true
             DataItem(_) -> derives_any = true
+            ImplItem(d) -> if d.template then derives_any = true
             _ -> ()
     if !derives_any then return
     var items: Buf[Item] = buf()
@@ -69,18 +70,273 @@ derive_unit(c: *Checker, unit: usize)
         private_items.push(file.private_items[i])
         item match
             ClassItem(d) ->
+                var library: Buf[LibraryDerived] = buf()
+                var made_class = d
                 if d.derives.len() > 0
                     var impls: Buf[&ImplDecl] = buf()
-                    items.set(items.len() - 1, ClassItem(derive_class(c, unit, d, &impls)))
+                    made_class = derive_class(c, unit, d, &impls, &library)
                     for made in impls
                         items.push(ImplItem(made))
                         private_items.push(false)
+                if is_shaped_class(made_class)
+                    val shaped = class_shape_parts(d)
+                    if library.len() > 0 || annotated(shaped, d.annotations)
+                        for v in shape_values(c, unit, d.span, d.name, shaped, d.annotations)
+                            items.push(ValueItem(v))
+                            private_items.push(true)
+                    for lib in library
+                        derive_through_template(c, unit, lib, d.name, d.type_params, false)
+                    made_class = ClassDecl(buf(), made_class.span, made_class.name_span, made_class.name, made_class.modifier, made_class.modifier_span, made_class.type_params, made_class.params, made_class.parents, made_class.derives, made_class.members, made_class.object)
+                items.set(items_position(items, item), ClassItem(made_class))
             DataItem(d) ->
-                for made in derive_data(c, unit, d)
+                var library: Buf[LibraryDerived] = buf()
+                for made in derive_data(c, unit, d, &library)
                     items.push(ImplItem(made))
                     private_items.push(false)
+                var own: Buf[Annotation] = buf()
+                var written: Buf[Annotation] = buf()
+                for a in d.annotations
+                    if a.name == "sysl" then own.push(a) else written.push(a)
+                val shaped = data_shape_parts(d)
+                if library.len() > 0 || annotated(shaped, written)
+                    for v in shape_values(c, unit, d.span, d.name, shaped, written)
+                        items.push(ValueItem(v))
+                        private_items.push(true)
+                for lib in library
+                    derive_through_template(c, unit, lib, d.name, d.type_params, true)
+                if written.len() > 0
+                    val position = items_position(items, item)
+                    items.set(position, DataItem(DataDecl(own, d.span, d.name, d.type_params, d.variants, d.derives)))
+            ImplItem(d) ->
+                if d.template then items.set(items_position(items, item), ImplItem(template_bounded(d)))
             _ -> ()
     c.units[unit].file = SourceFile(file.module_name, file.module_span, file.tests_only, file.imports, items, private_items)
+
+/** Adds the impls `derives` entries made from templates to the templates' files, once every unit
+ * is written out: each is declared where its template is, so the template's names resolve there. */
+finish_derivations(c: *Checker)
+    for p in c.template_impls
+        val file = c.units[p.unit].file
+        var items = file.items
+        var private_items = file.private_items
+        items.push(ImplItem(p.decl))
+        private_items.push(false)
+        c.units[p.unit].file = SourceFile(file.module_name, file.module_span, file.tests_only, file.imports, items, private_items)
+    c.template_impls = buf()
+
+/** An impl a `derives` entry made from a template, waiting to join the template's file. */
+struct TemplateImpl
+    unit: usize
+    decl: &ImplDecl
+
+/** A trait a `derives` list names that a template derives: the entry, and the template. */
+private struct LibraryDerived
+    name: string
+    at: Span
+    template_unit: usize
+    template: &ImplDecl
+
+/** The position of the item just pushed for `item`: the last one that is it. */
+private items_position(items: Buf[Item], item: Item) -> usize
+    var at = 0usize
+    for i in 0..<items.len()
+        if same_item(items[i], item) then at = i
+    at
+
+private same_item(a: Item, b: Item) -> bool = a match
+    DataItem(x) -> b match
+        DataItem(y) -> x.span.start == y.span.start && x.name == y.name
+        _ -> false
+    ImplItem(x) -> b match
+        ImplItem(y) -> x.span.start == y.span.start && x.span.end == y.span.end
+        _ -> false
+    ClassItem(x) -> b match
+        ClassItem(y) -> x.span.start == y.span.start && x.name == y.name
+        _ -> false
+    _ -> false
+
+// A template's `T` is bounded by the trait it derives and by `Shaped`, which gives it the shape and
+// the code written for each type's fields.
+private template_bounded(d: &ImplDecl) -> &ImplDecl
+    val written = d.type_params[0]
+    var bounds: Buf[&TypeExpr] = buf()
+    if d.trait_name is Some(t) then bounds.push(t)
+    bounds.push(named_type(written.span, core_path("Shaped")))
+    var params: Buf[TypeParam] = buf()
+    params.push(TypeParam(written.span, written.name, Invariant, bounds, written.site))
+    ImplDecl(d.span, params, d.trait_name, d.target, d.members, true, None)
+
+// The impl a `derives` entry makes from a template for the type named `type_name`, declared in the
+// template's file: the template's body, its `T` standing for the type, each of the type's parameters
+// bounded by the trait.
+private derive_through_template(c: *Checker, unit: usize, lib: LibraryDerived, type_name: string, type_params: Buf[TypeParam], data: bool)
+    val at = lib.at
+    val t = lib.template
+    val trait_expr = t.trait_name.unwrap()
+    var params: Buf[TypeParam] = buf()
+    for tp in type_params
+        var bounds: Buf[&TypeExpr] = buf()
+        bounds.push(trait_expr)
+        params.push(TypeParam(at, tp.name, Invariant, bounds, s"${c.units[unit].src.name}:${at.start}:derives ${lib.name}"))
+    val site = DeriveSite(unit, type_name, at, lib.name, t.type_params[0].name, data, t.span)
+    val decl = ImplDecl(at, params, Some(trait_expr), own_type(at, type_name, type_params), t.members, false, Some(site))
+    c.template_impls.push(TemplateImpl(lib.template_unit, decl))
+
+// The template deriving the trait `t` names, as unit `unit` sees it: one declared in the unit's own
+// module, in a module the unit's file imports from, or in the core library.
+private find_template(c: *Checker, unit: usize, path: string) -> Option[LibraryDerived]
+    val bare = last_segment(path)
+    val module_name = c.units[unit].file.module_name
+    var found: Option[LibraryDerived] = None
+    for u in 0..<c.units.len()
+        val other = c.units[u].file.module_name
+        for item in c.units[u].file.items
+            if item is ImplItem(d)
+                if !d.template then continue
+                val name = d.trait_name.unwrap().kind match
+                    Named(p, _) -> last_segment(p)
+                    _ -> ""
+                if name != bare then continue
+                if !module_sees(c, unit, other, path) then continue
+                val candidate = LibraryDerived(bare, Span(0, 0), u, d)
+                if other == module_name then return Some(candidate)
+                if found is None then found = Some(candidate)
+    found
+
+private module_sees(c: *Checker, unit: usize, other: string, path: string) -> bool
+    val file = c.units[unit].file
+    if other == file.module_name || other == CoreModule then return true
+    if path.starts_with(other + ".") then return true
+    for i in file.imports
+        if i.path == other || i.path.starts_with(other + ".") then return true
+    false
+
+private last_segment(path: string) -> string
+    var start = 0usize
+    for i in 0..<path.bytes.len
+        if path.bytes[i] == u8('.') || path.bytes[i] == u8(':') then start = i + 1
+    path[start..]
+
+/** One variant of a type as its shape describes it: its name, its fields' names and whether each has
+ * a default, and the annotations on it and on each field. */
+private struct ShapedVariant
+    name: string
+    fields: Buf[Param]
+    annotations: Buf[Annotation]
+
+private data_shape_parts(d: &DataDecl) -> Buf[ShapedVariant]
+    var out: Buf[ShapedVariant] = buf()
+    for v in d.variants
+        out.push(ShapedVariant(v.name, v.fields, v.annotations))
+    out
+
+private class_shape_parts(d: &ClassDecl) -> Buf[ShapedVariant]
+    var fields: Buf[Param] = buf()
+    for p in d.params
+        fields.push(p.param)
+    var out: Buf[ShapedVariant] = buf()
+    out.push(ShapedVariant(d.name, fields, buf()))
+    out
+
+/** Whether a class declaration is one a shape describes: a class, not a trait or an object. */
+private is_shaped_class(d: &ClassDecl) -> bool = !d.object && d.modifier != "trait"
+
+private params_annotated(params: Buf[ClassParam]) -> bool
+    for p in params
+        if p.param.annotations.len() > 0 then return true
+    false
+
+private annotated(variants: Buf[ShapedVariant], on_type: Buf[Annotation]) -> bool
+    if on_type.len() > 0 then return true
+    for v in variants
+        if v.annotations.len() > 0 then return true
+        for f in v.fields
+            if f.annotations.len() > 0 then return true
+    false
+
+/** The name of the module value holding a shape: the type's, then a variant's, then a field's. */
+shape_value_name(type_name: string) -> string = s"__shape_$type_name"
+
+variant_shape_name(type_name: string, variant: usize) -> string = s"__shape_${type_name}_$variant"
+
+field_shape_name(type_name: string, variant: usize, field: usize) -> string = s"__shape_${type_name}_${variant}_$field"
+
+// The module values holding a type's shape, private to its module: one per field, one per variant
+// and one for the type, each made once before `main` from the ones before it. An annotation whose
+// name is no type or object the file can name is reported, and left out.
+private shape_values(c: *Checker, unit: usize, at: Span, type_name: string, variants: Buf[ShapedVariant], on_type: Buf[Annotation]) -> Buf[FieldDecl]
+    var out: Buf[FieldDecl] = buf()
+    var variant_names: Buf[&Expr] = buf()
+    for i in 0..<variants.len()
+        val v = variants[i]
+        var field_names: Buf[&Expr] = buf()
+        for j in 0..<v.fields.len()
+            val f = v.fields[j]
+            val name = f.pattern.kind match
+                Name(n) -> n
+                _ -> s"_$j"
+            var args: Buf[&Expr] = buf()
+            args.push(Expr(at, StringLit(name)))
+            args.push(int_lit(at, s"$j"))
+            args.push(Expr(at, BoolLit(f.default is Some(_))))
+            args.push(annotation_values(c, unit, f.annotations))
+            out.push(FieldDecl(at, field_shape_name(type_name, i, j), None, call_core(at, "FieldShape", args), false, false, false))
+            field_names.push(Expr(at, Name(field_shape_name(type_name, i, j))))
+        var args: Buf[&Expr] = buf()
+        args.push(Expr(at, StringLit(v.name)))
+        args.push(int_lit(at, s"$i"))
+        args.push(int_lit(at, s"${v.fields.len()}"))
+        args.push(Expr(at, ListLit(field_names)))
+        args.push(annotation_values(c, unit, v.annotations))
+        out.push(FieldDecl(at, variant_shape_name(type_name, i), None, call_core(at, "VariantShape", args), false, false, false))
+        variant_names.push(Expr(at, Name(variant_shape_name(type_name, i))))
+    var args: Buf[&Expr] = buf()
+    args.push(Expr(at, StringLit(type_name)))
+    args.push(int_lit(at, s"${variants.len()}"))
+    args.push(Expr(at, ListLit(variant_names)))
+    args.push(annotation_values(c, unit, on_type))
+    out.push(FieldDecl(at, shape_value_name(type_name), None, call_core(at, "TypeShape", args), false, false, false))
+    out
+
+private call_core(at: Span, name: string, args: Buf[&Expr]) -> &Expr
+    var written: Buf[Argument] = buf()
+    for a in args
+        written.push(Argument(at, None, a, false))
+    Expr(at, Call(Expr(at, Name(core_path(name))), written))
+
+// The annotations as a vector of values: `@JsonOmit` the object, `@JsonKey("name")` the value its
+// arguments make.
+private annotation_values(c: *Checker, unit: usize, annotations: Buf[Annotation]) -> &Expr
+    var values: Buf[&Expr] = buf()
+    for a in annotations
+        if !names_declaration(c, unit, a.name)
+            c.note(unit, a.span, s"unknown annotation `@${a.name}`; an annotation is a value of a type or an object implementing `Annotation`")
+            continue
+        if a.args.len() == 0 then values.push(Expr(a.span, Name(a.name)))
+        else
+            var written: Buf[Argument] = buf()
+            for arg in a.args
+                written.push(Argument(arg.value.span, arg.name, arg.value, false))
+            values.push(Expr(a.span, Call(Expr(a.span, Name(a.name)), written)))
+    Expr(Span(0, 0), ListLit(values))
+
+// Whether `name`, written in unit `unit`, names a data type, a class or an object: one its module
+// declares, one its file imports, or one of the core library's.
+private names_declaration(c: *Checker, unit: usize, name: string) -> bool
+    val file = c.units[unit].file
+    for i in file.imports
+        if i.binding == name then return true
+    declares_type(c, file.module_name, name) || declares_type(c, CoreModule, name)
+
+private declares_type(c: *Checker, module_name: string, name: string) -> bool
+    for u in c.units
+        if u.file.module_name != module_name then continue
+        for item in u.file.items
+            item match
+                ClassItem(d) -> if d.name == name then return true
+                DataItem(d) -> if d.name == name then return true
+                _ -> ()
+    false
 
 /** One trait a `derives` list names, and the entry naming it. */
 private struct Derived
@@ -89,14 +345,26 @@ private struct Derived
 
 // The traits `derives` names, each once, with what cannot be derived reported. `implemented` names
 // the traits the type also implements by hand.
-private derived_traits(c: *Checker, unit: usize, type_name: string, derives: Buf[&TypeExpr], implemented: Buf[string]) -> Buf[Derived]
+private derived_traits(c: *Checker, unit: usize, type_name: string, derives: Buf[&TypeExpr], implemented: Buf[string], library: *Buf[LibraryDerived]) -> Buf[Derived]
     var out: Buf[Derived] = buf()
     for t in derives
         val name = t.kind match
             Named(path, args) -> if args.len() == 0 then path else ""
             _ -> ""
+        if derived_method(name) == "" && name != ""
+            find_template(c, unit, name) match
+                Some(found) ->
+                    var seen = false
+                    for l in *library
+                        if l.name == found.name then seen = true
+                    if seen
+                        c.note(unit, t.span, s"`$name` is derived twice")
+                        continue
+                    library.push(LibraryDerived(found.name, t.span, found.template_unit, found.template))
+                    continue
+                None -> ()
         if derived_method(name) == ""
-            c.note(unit, t.span, s"`${type_text(t)}` cannot be derived; a type derives `Eq`, `Hash`, `Ord`, `Display` and `Debug`")
+            c.note(unit, t.span, s"`${type_text(t)}` cannot be derived; a type derives `Eq`, `Hash`, `Ord`, `Display`, `Debug`, and a trait whose module declares a template for it, `derive ${type_text(t)} for T`")
             continue
         if has_trait(out, name)
             c.note(unit, t.span, s"`$name` is derived twice")
@@ -151,7 +419,7 @@ private impl_traits(c: *Checker, unit: usize, type_name: string) -> Buf[string]
 // come together, so that equal instances hash alike, and `Ord` comes with an equality by the same
 // fields. A generic class's `Ord`, `Display` and `Debug` are impls in `impls` instead, holding where
 // the type arguments implement the trait.
-private derive_class(c: *Checker, unit: usize, d: &ClassDecl, impls: *Buf[&ImplDecl]) -> &ClassDecl
+private derive_class(c: *Checker, unit: usize, d: &ClassDecl, impls: *Buf[&ImplDecl], library: *Buf[LibraryDerived]) -> &ClassDecl
     if d.modifier == "trait"
         c.note(unit, d.derives[0].span, "a trait derives nothing; the types implementing it do")
         return d
@@ -164,7 +432,7 @@ private derive_class(c: *Checker, unit: usize, d: &ClassDecl, impls: *Buf[&ImplD
         if m is MethodMember(f, _, _, _)
             for trait_name in ["Eq", "Hash", "Ord", "Display", "Debug"]
                 if f.name == derived_method(trait_name) then implemented.push(trait_name)
-    val traits = derived_traits(c, unit, d.name, d.derives, implemented)
+    val traits = derived_traits(c, unit, d.name, d.derives, implemented, library)
     val equality_by_hand = contains_name(implemented, "Eq")
     for t in traits
         if t.name == "Eq" && !has_trait(traits, "Hash")
@@ -200,7 +468,7 @@ private derive_class(c: *Checker, unit: usize, d: &ClassDecl, impls: *Buf[&ImplD
         if conditional && d.type_params.len() > 0
             var members_of_impl: Buf[ClassMember] = buf()
             members_of_impl.push(MethodMember(method, true, false, false))
-            impls.push(ImplDecl(at, bounded_params(c, unit, at, d.type_params, name), Some(named_type(at, core_path(name))), other, members_of_impl))
+            impls.push(ImplDecl(at, bounded_params(c, unit, at, d.type_params, name), Some(named_type(at, core_path(name))), other, members_of_impl, false, None))
         else
             parents.push(Expr(at, Name(core_path(name))))
             members.push(MethodMember(method, true, true, false))
@@ -217,10 +485,10 @@ private class_method(at: Span, trait_name: string, name: string, other_type: &Ty
 
 // A data type that derives gains an impl per trait. `Eq` and `Hash` it has already, by its fields,
 // and `Display` and `Debug` unless its own impls give them.
-private derive_data(c: *Checker, unit: usize, d: &DataDecl) -> Buf[&ImplDecl]
+private derive_data(c: *Checker, unit: usize, d: &DataDecl, library: *Buf[LibraryDerived]) -> Buf[&ImplDecl]
     var out: Buf[&ImplDecl] = buf()
     val implemented = impl_traits(c, unit, d.name)
-    val traits = if d.derives.len() == 0 then buf() else derived_traits(c, unit, d.name, d.derives, implemented)
+    val traits = if d.derives.len() == 0 then buf() else derived_traits(c, unit, d.name, d.derives, implemented, library)
     for t in traits
         if t.name == "Eq" || t.name == "Hash" then continue
         out.push(data_impl(c, unit, d, t.name, t.at, false))
@@ -238,7 +506,7 @@ private data_impl(c: *Checker, unit: usize, d: &DataDecl, trait_name: string, at
     var members: Buf[ClassMember] = buf()
     members.push(MethodMember(data_method(at, trait_name, d, target), true, false, false))
     c.derivations.push(Derivation(unit, d.name, true, trait_name, at, automatic))
-    ImplDecl(at, bounded_params(c, unit, at, d.type_params, trait_name), Some(named_type(at, core_path(trait_name))), target, members)
+    ImplDecl(at, bounded_params(c, unit, at, d.type_params, trait_name), Some(named_type(at, core_path(trait_name))), target, members, false, None)
 
 // Whether the bare name `name`, written in unit `unit`, denotes the core library's declaration of it:
 // no declaration of the unit's module and no import of its file takes the name first. The core
@@ -317,7 +585,7 @@ private named_type(at: Span, name: string) -> &TypeExpr = TypeExpr(at, Named(nam
 
 private one_param(at: Span, name: string, ty: &TypeExpr) -> Buf[Param]
     var out: Buf[Param] = buf()
-    out.push(Param(at, Pattern(at, Name(name)), ty, None, false, false))
+    out.push(Param(at, Pattern(at, Name(name)), ty, None, false, false, buf()))
     out
 
 private method_of(at: Span, name: string, params: Buf[Param], result: &TypeExpr, body: &Expr) -> &Function =
@@ -458,6 +726,6 @@ private render_with_width(at: Span, trait_name: string, plain: &Expr) -> &Functi
     whole.push(call2(at, out, "writeField", call0(at, Expr(at, Name("text")), "text"), spec))
     val body = Expr(at, If(padded, Expr(at, Block(whole, true)), Some(plain)))
     var params: Buf[Param] = buf()
-    params.push(Param(at, Pattern(at, Name("out")), named_type(at, core_path("Writer")), None, false, false))
-    params.push(Param(at, Pattern(at, Name("spec")), named_type(at, core_path("FormatSpec")), None, false, false))
+    params.push(Param(at, Pattern(at, Name("out")), named_type(at, core_path("Writer")), None, false, false, buf()))
+    params.push(Param(at, Pattern(at, Name("spec")), named_type(at, core_path("FormatSpec")), None, false, false, buf()))
     Function(buf(), at, at, method, buf(), params, Some(named_type(at, "unit")), Some(body), buf())

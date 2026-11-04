@@ -22,8 +22,9 @@ a type implements its `compare(other: Self) -> int`, negative, zero or positive,
 four comparisons from it, implementing any of them as well where it can answer more directly. The
 built-in types implement the traits their operators have, so `int` is an `Add` and an `Ord`, and
 `string` is an `Add` (joining) and an `Ord`. Both operands of an operator on a data type or a class
-are of one type. The wrapping, saturating, bitwise and shift operators belong to the built-in types
-alone.
+are of one type. The wrapping, saturating and shift operators belong to the built-in types alone;
+`&`, `^` and `|` are the integers' and bytes' bitwise operators, and on any other type the
+[methods](#methods-named-by-symbols) of those names.
 
 `Add` and `Mul` also name their identities, as [static members](/spec/declarations/#static-members) of
 the implementing type: `static zero() -> Self`, which `add` leaves a value unchanged by, and
@@ -63,7 +64,7 @@ impl Add for Point
 | Assignment | `=` and compound forms (`+=`, `<<=`, `+%=`, …) |
 | Yielding assignment | `:=` and compound forms, which return the stored value |
 | Update | prefix and postfix `++` `--`; prefix yields the new value, postfix the old |
-| Symbol methods | any other run of operator characters names a method, called infix: `xs ++ ys`, `x +: xs` |
+| Symbol methods | any other run of operator characters names a method, called infix at the level of its first character, or tightest when it has a `~` in it: `xs ++ ys`, `x +: xs`, `a <~ b` |
 
 An operator is the longest run of the characters `+ - * / % < > = ! & | ^ ~ : ?`, so a prefix
 operator written directly after another operator needs a space: `a = -1`, `x * -y`. A run stops
@@ -76,7 +77,8 @@ level, so `1 + 2 << 3` is `17`. A shift count at least as large as the width shi
 It is not masked.
 
 `::` binds more loosely than every arithmetic and bitwise operator and more tightly than ranges and
-comparisons, and it groups to the right: `n + 1 :: rest` is `(n + 1) :: rest`, and `1 :: 2 :: []` is
+comparisons (the full table, with the methods named by symbols, is under
+[methods named by symbols](#methods-named-by-symbols)), and it groups to the right: `n + 1 :: rest` is `(n + 1) :: rest`, and `1 :: 2 :: []` is
 `1 :: (2 :: [])`.
 
 Sysl's pointer operators (prefix `*` and `&`) and `await` are not part of Avin.
@@ -87,8 +89,9 @@ Any method that takes one argument can be called as an infix operator, without t
 parentheses: `a max b` is `a.max(b)`, and `xs zip ys` is `xs.zip(ys)`. The caller chooses the form;
 the method's author does not mark it. `a m (b, c)` passes the tuple `(b, c)` as the one argument.
 
-An infix call groups to the left and binds more loosely than the arithmetic, bitwise, shift, cons and
-range operators, and more tightly than comparisons, `is`, `&&` and `||`: `a max b + 1` is
+An infix call by a word groups to the left and binds more loosely than the arithmetic, bitwise,
+shift, cons and range operators, and more tightly than comparisons, `is`, `&&` and `||` (a method
+named by a symbol binds by [its first character](#methods-named-by-symbols)): `a max b + 1` is
 `a max (b + 1)`, `a max b max c` is `(a max b) max c`, and `xs contains x && ok` is
 `(xs contains x) && ok`. There is no postfix form: `xs size` is an error, written `xs.size()`.
 
@@ -101,7 +104,8 @@ val widest = current max
 ```
 
 A name that starts a line never continues the line above, inside brackets too: end the line with the
-name instead. An indented block after a call is the call's [trailing block](#trailing-blocks), except
+name instead. A method named by a symbol is an operator and may start a
+[continuation line](#continuation-lines). An indented block after a call is the call's [trailing block](#trailing-blocks), except
 that one holding only a name and an operand is reported as this mistake.
 
 The call is resolved exactly as `a.m(b)` is: overloads are chosen by the argument's type, a trait or
@@ -129,21 +133,64 @@ class Bag(val items: Vector[int])
 ```
 
 `a ++ b` is `a.++(b)`, and `a.++(b)` may be written as such. A function outside a type cannot be
-named by a symbol. The language's own operators are not method names, because a type has them
-through their traits: declaring a method named `+` is an error that says to implement `Add`. The
-reserved spellings are `+` `-` `*` `/` `%`, the wrapping and saturating `+%` `-%` `*%` `+|` `-|`
-`*|`, `<<` `>>`, `&` `|` `^` `~` `!` `&&` `||`, `==` `!=` `<` `<=` `>` `>=` `===` `!==`, `::`, `=`
-`:=` `:` `?` `->` `=>`, and each yielding compound form such as `+:=`. Every other run is free,
-`++`, `--` and the plain compound spellings `+=` and `-=` among them.
+named by a symbol. Most of the language's own operators are not method names, because a type has
+them through their traits: declaring a method named `+` is an error that says to implement `Add`.
+The reserved spellings are `+` `-` `*` `/` `%`, the wrapping and saturating `+%` `-%` `*%` `+|` `-|`
+`*|`, `<<` `>>`, `!` `&&` `||`, `==` `!=` `<` `<=` `>` `>=` `===` `!==`, `::`, `=` `:=` `:` `?`
+`->` `=>`, and each yielding compound form such as `+:=`. Every other run is free, `++`, `--` and the
+plain compound spellings `+=` and `-=` among them.
 
-A symbol method's call binds as `a max b` does: more loosely than arithmetic, bitwise, shift, cons and
-range operators, and more tightly than comparisons, `is`, `&&` and `||`, so `a ++ b + c` is
-`a ++ (b + c)` and `xs ++ ys == zs` compares the joined sequence. It groups to the left, except that a
-name ending in `:` groups to the right and takes its receiver on the right: `x +: xs` is `xs.+:(x)`,
-and `a +: b +: xs` is `a +: (b +: xs)`. The operands are still evaluated in the order written, `x`
-before `xs`. A left-grouping call, whether its name is a symbol or a word, and a right-grouping one do
-not mix at one level without parentheses: `a ++ b +: c` is an error, and `(a ++ b) :+ c` and
-`1 +: (v :+ 2)` are not.
+`&`, `^`, `|`, and `~` between two operands, are free too, on every type but the integers and bytes,
+whose bitwise operators are the machine's: a method of one of these names on `int` or `byte`, in an
+extension too, is an error. On any other type, `a | b` calls `a`'s method `|`, so a parser
+combinator, a set of flags or a query builder can be written with them. Prefix `~` stays the
+integers' and bytes' complement, and `~a` on another type is an error.
+
+```text
+data Flags(bits: int)
+
+impl Flags
+    |(other: Flags) -> Flags = Flags(bits | other.bits)
+    &(other: Flags) -> Flags = Flags(bits & other.bits)
+
+val rw = Flags(1) | Flags(2)
+```
+
+A symbol method's call binds at the level of the language's operator its name's first character
+belongs to, so a name reads with the operator it resembles. One character overrides the first: a
+name with `~` anywhere in it binds at the tightest symbol level, so `~`, `~>`, `<~`, `<~>`, `~!` and
+`^~` all bind together, the way a grammar's sequencing operators are read. The levels, tightest
+first:
+
+| Level | Operators | Symbol methods whose name starts with |
+| --- | --- | --- |
+| Prefix | unary `-` `+` `!` `~` | |
+| Other symbols | | `~` `?`, and any character no lower level takes: `~>`, `??`; and every name with a `~` in it: `<~`, `^~` |
+| Multiplicative | `*` `/` `%` `<<` `>>` `*%` `*\|` | `*` `/` `%`, `<<` and `>>`: `*:`, `<<<` |
+| Additive | `+` `-` `+%` `-%` `+\|` `-\|` | `+` `-`: `++`, `+:`, `--` |
+| Bitwise and | `&` | `&`: `&&&` |
+| Bitwise exclusive or | `^` | `^`: `^^` |
+| Bitwise or | `\|` | `\|`: `\|>` |
+| Cons | `::` | `:`: `:+`, `:::` |
+| Range | `..` `..<` | |
+| Named calls | `a max b` | |
+| Comparison | `==` `!=` `<` `<=` `>` `>=` `===` `!==`, `is` | `<` `>` `=` `!`: `<=>`, `<>`, `!!` |
+| Logical and | `&&` | |
+| Logical or | `\|\|` | |
+| Assignment | `=` `:=` and compound forms | a name ending in `=` that is not a comparison: `+=`, `++=`, `\|=` |
+
+So `a ++ b + c` is `(a ++ b) + c`, `a ++ b * c` is `a ++ (b * c)`, `xs ++ ys :+ z` is
+`(xs ++ ys) :+ z`, and `xs ++ ys == zs` compares the joined sequence. A grammar written with
+combinators reads as it would on paper: `a ~ b ^^ f | c ~ d` is `((a ~ b) ^^ f) | (c ~ d)`,
+`"[" ~> items <~ "]" ^^ f` is `(("[" ~> items) <~ "]") ^^ f`, and `a <~ b ~ c` is `(a <~ b) ~ c`.
+A `~` name ending in `=` is still a compound assignment: `p ~= q` is `p = p ~ q`.
+
+A symbol call groups to the left, except that a name ending in `:` groups to the right and takes its
+receiver on the right: `x +: xs` is `xs.+:(x)`, and `a +: b +: xs` is `a +: (b +: xs)`. The operands
+are still evaluated in the order written, `x` before `xs`. Operators of one level that group in
+opposite directions, whether symbol methods or the language's own, do not mix without parentheses:
+`a ++ b +: c`, `a + b +: c` and `1 :: xs :+ 2` are errors, and `(a ++ b) :+ c` and `1 :: (xs :+ 2)`
+are not. Operators of different levels need none: `1 +: xs :+ 2` is `(1 +: xs) :+ 2`.
 
 There are no prefix or postfix symbol methods. `++` and `--` keep their update meaning when no
 operand follows them on the line: `i++` and `++i` update `i`, and `xs ++ ys` calls `++`. An operand
@@ -153,11 +200,67 @@ so `a ++ -b`, with a prefix operator after `++`, is `(a++) - b`, written `a ++ (
 `x op= y` calls `x`'s method named `op=` when the type of `x` has one: `buffer += 3` appends, and
 the buffer need not be a `var`. Otherwise `op=` assigns. Where `op` is one of the language's
 arithmetic, wrapping, saturating, shift or bitwise operators, it is the compound assignment it has
-always been; where `op` is a symbol method, `x op= y` is `x = x op y`, so `xs ++= ys` joins onto a
+always been; where `op` is a symbol method, or `&`, `^` or `|` on a type that has a method of that
+name, `x op= y` is `x = x op y`, so `flags |= Flags(4)` combines flags into a `var`, and `xs ++= ys` joins onto a
 `var` vector and `xs :+= 4` appends to it. The target is a `var` local, a `var` field, a module
 value or an element `xs(i)`, and its object and indices are evaluated once. A right-grouping name
 has no compound form, and the yielding forms (`+:=`) belong to the language's operators alone. A
 multiple assignment uses only the language's compound forms.
+
+### Continuation lines
+
+A line that starts with a binary operator, indented deeper than the line above it, continues the
+expression that line left open:
+
+```text
+val atom = number
+    | symbol("(") ~> defer(expr) <~ symbol(")")
+    | ident ^^ Var
+
+val total = a
+    + b * c
+    - d
+```
+
+The line break means nothing to precedence: the operators group exactly as they would on one line,
+so `total` is `(a + (b * c)) - d`, `atom` has three alternatives, and `a + b` with `* c` on the
+next line is `a + (b * c)`. A comparison chain goes on across the lines too.
+
+- **What starts one.** Every operator that stands between two operands: the arithmetic, wrapping,
+  saturating, shift, bitwise, comparison, logical, range and cons operators, a method named by a
+  symbol, `~`, and `++` or `--` with an operand after it. `-` and `+` there are binary, written
+  `- d` or `-d`. A word never starts one (a named infix call ends its line instead, as
+  [above](#infix-method-calls)), and neither do `!`, `.`, `?`, a bracket, `=` and the compound
+  assignments.
+- **Where.** Wherever an expression ends a line and has a complete operand: a binding's value, an
+  assignment, a `return` value, a call's argument, a `match` arm's or a lambda's body, a branch of a
+  one-line `if`, an expression statement.
+- **How far.** Each following line that starts with such an operator and is still deeper than the
+  line the expression began on continues it, at the depth of a continuation line above it or deeper
+  (indentation that matches no line above is an error, as in any block); the depth means nothing
+  beyond that. The expression ends at the first line back at the depth it began
+  on, or shallower. A line inside the continuation that does not start with an operator is an error,
+  except a call's trailing block or an infix call's argument, indented under its own line as usual.
+- **Blank lines and comments** between continuation lines are skipped, as they are everywhere.
+- **Not after a header.** The indented lines after the test of `if`, `elif`, `while` and
+  `do … while`, a `for` source and a class's parents are the form's body. There, and wherever else
+  an indented block follows a word or a symbol that is not a complete operand (`=`, `->`, `else`,
+  `do`, `then`, a declaration's signature), a line that starts with `-x` is a block's line:
+
+```text
+negate(x: int) -> int
+    -x
+
+sign(x: int) -> int
+    if x < 0
+        -1
+    else
+        1
+```
+
+Inside brackets a line break is not significant, so a line in a call's arguments may start with any
+operator at any depth, a method named by a symbol included. A block opened inside the brackets, a
+lambda's body, starts its own lines again.
 
 ### Trailing blocks
 
@@ -218,6 +321,8 @@ already put an indented block after their line keep it:
 - `x match` and the bare `match` function: the block holds the arms.
 - A block whose one line is a name and a single operand, `add 2`, reads as the method and argument
   of an infix call that should have ended the line above, and is reported as that.
+- A block whose first line starts with a binary operator is a
+  [continuation line](#continuation-lines): `f(1)` and `    - x` is `f(1) - x`.
 
 It is an error to write a trailing block for a call whose last parameter is neither by-name nor a
 function (the message names the parameter and its type), whose last parameter is already given, or

@@ -96,6 +96,8 @@ most the largest `int` bytes.
 | `charCount()` | The number of characters, O(n) |
 | `isEmpty()`, `nonEmpty()` | Whether it has no bytes, or some |
 | `startsWith(p)`, `endsWith(p)`, `contains(p)` | Whether `p` occurs at the start, the end, anywhere; the empty string occurs in every string |
+| `startsWith(p, at)` | Whether `p` occurs at byte offset `at`; false when it would reach outside the string |
+| `byteAt(at)`, `charAt(at)` | The byte at offset `at`, and the character whose encoding begins there; each traps when `at` is outside the string |
 | `slice(from, until)` | The bytes from `from` up to `until`; traps unless `0 <= from <= until <= byteLength()` and both offsets are character boundaries |
 | `toUpper()`, `toLower()` | Each character's simple case mapping, one character for one: `"straße".toUpper()` is `STRAßE` |
 | `trim()`, `trimStart()`, `trimEnd()` | Without the Unicode `White_Space` characters at both ends, the start, the end |

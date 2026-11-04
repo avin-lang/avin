@@ -270,7 +270,7 @@ a decision changes, this page and the chapter change together.
   `, ` and ends with a newline. `print(debug(x))` selects `Debug`.
 - `debug(x)` yields `x`'s `Debug` form as a string. `Writer` writes strings (with `writeChar`,
   `writeInt`, `writeField` and `writeSpaces` beside `write`); `FormatSpec` is `width`, `precision`
-  and `left`, as in Sysl; `toString()` is a default body of `Display`.
+  and `left`; `toString()` is a default body of `Display`.
 - A built-in type conforms to a trait through an impl and implements every method of the trait,
   since a trait's default bodies are shared by objects and a built-in value is not one.
 - A variant's fields take defaults, each a function of the fields before it, as a constructor's
@@ -383,7 +383,7 @@ a decision changes, this page and the chapter change together.
   need across the whole program.
 - A class and its companion object are in one module, in any of its files.
 - One `avin` command does everything: build, run, test, deps and config.
-- Testing follows Sysl's model: `@test`, `@tests`, setup and teardown, and the built-in runner.
+- Testing is built in: `@test`, `@tests`, setup and teardown, and the built-in runner.
   Every feature ships with tests.
 - `avin build file.avin` writes `./file` by default; `-o` overrides it. A failed build leaves
   existing output untouched.
@@ -453,9 +453,9 @@ Settled by the user on 2026-11-03:
   that is not one of the language's operators names a method, declared like any method and called
   infix (`xs ++ ys`) or dotted (`xs.++(ys)`). The language's operators, including the yielding
   compound forms, are not method names: a type has them through their traits, and a method named
-  `+` is an error saying to implement `Add`. A symbol call binds at the infix-call level and groups
-  left, except that a name ending in `:` groups right with its receiver on the right (`x +: xs` is
-  `xs.+:(x)`, `x` evaluated first); left- and right-grouping calls do not mix without parentheses.
+  `+` is an error saying to implement `Add`. A symbol call groups left, except that a name ending in
+  `:` groups right with its receiver on the right (`x +: xs` is `xs.+:(x)`, `x` evaluated first).
+  The level it binds at, and the bitwise operators a type may define, are settled on 2026-11-04.
   There are no prefix or postfix symbol methods; `++` and `--` update when no operand follows on the
   line. `x op= y` calls the method `op=` where `x`'s type has one, and otherwise is the language's
   compound assignment or, for a symbol method `op`, `x = x op y`. The library uses symbols:
@@ -553,6 +553,11 @@ Settled by the user on 2026-11-03:
   guards or yielded value.
 
 Settled by the user on 2026-11-04:
+
+- **`compareAndSet` on a value without identity** — a data value, tuple, string, `Option` or `Any` —
+  **compares with `==`; on scalars and references it compares the word.** A class instance (even of
+  a class that derives `Eq`) and a function value keep identity. See
+  [threads](/spec/threads/).
 
 - **`Vector[+T]` is a persistent, radix-balanced tree of arrays of 32**, with a prefix and a suffix
   beside a balanced middle at every level, and stays the default sequence (`[1, 2]`, `[]T`,
@@ -729,6 +734,79 @@ Settled by the user on 2026-11-04:
   name stays the object. This amends the earlier rule that the name in call position is only the
   constructor and that an object cannot be called.
 
+- **A method named by a symbol binds at the level of the language's operator its first character
+  belongs to**, on Avin's own table, tightest first: a name starting with any character that starts
+  no operator below (`~`, `?`) binds above multiplication; `*`, `/`, `%`, `<<` and `>>` names with
+  the multiplicative operators and shifts; `+` and `-` names with the additive operators; `&`, `^`
+  and `|` names with those bitwise operators, `&` tightest; `:` names with `::`; then ranges and
+  methods called by a word (`a max b`); `<`, `>`, `=` and `!` names with the comparisons; and a name
+  ending in `=` that is not a comparison (`+=`, `++=`, `|=`) is an assignment. A name ending in `:`
+  still groups right with its receiver on the right, and left- and right-grouping operators at one
+  level, symbol, word or the language's own, do not mix without parentheses (`1 :: xs :+ 2` is an
+  error; `1 +: xs :+ 2` is `(1 +: xs) :+ 2`). So `xs ++ ys :+ z` is `(xs ++ ys) :+ z`, and the
+  combinators `a ~ b ^^ f | c ~ d` read `((a ~ b) ^^ f) | (c ~ d)`. **`&`, `^`, `|` and `~`
+  between two operands are free method names** for every type but the integers and bytes, whose
+  bitwise operators stay the machine's and cannot be redefined, by an extension either; `a | b` on
+  such a type calls its method `|`, and `x |= y` calls `|=` where the type has one and is otherwise
+  `x = x | y`. Prefix `~` stays the integers' and bytes' complement. `+ - * / %` and the
+  comparisons still come only through their traits, and `&&`, `||`, `!`, `===`, `!==`, `::`, `=`,
+  `:=`, `->`, `?`, `..` and `..<` stay reserved. This replaces the earlier rule that every symbol
+  call binds at the level of `a max b`. See [methods named by
+  symbols](/spec/operators-and-control-flow/#methods-named-by-symbols).
+
+- **A method named by a symbol with `~` anywhere in its name binds at the tightest symbol level**,
+  whatever its first character: `~`, `~>`, `<~`, `~!`, `<~>` and `^~` bind together there and group
+  left, so `num | symbol("(") ~> expr <~ symbol(")")` is `num | ((symbol("(") ~> expr) <~
+  symbol(")"))`, `"[" ~> items <~ "]" ^^ f` is `(("[" ~> items) <~ "]") ^^ f`, and `a <~ b ~ c` is
+  `(a <~ b) ~ c`. Every other name keeps the first-character rule; a `~` name ending in `=` (`~=`)
+  is still a compound assignment, and prefix `~` is unchanged. This amends the rule above, under
+  which `<~` bound with the comparisons.
+
+- **A line that starts with a binary operator, indented deeper than the line where its expression
+  began, continues that expression**, with the operator's own precedence: the line break means
+  nothing. Every binary operator of the language, every method named by a symbol, `~`, and `++` or
+  `--` with an operand after it start one; a word, `!`, `.`, `?`, a bracket and the assignments do
+  not. It applies wherever an expression with a complete operand ends a line (a binding's value, an
+  assignment, a `return` value, an infix call's argument, a `match` arm's or a lambda's body, an
+  expression statement) and ends at the first line back at the depth the expression began on; a
+  line inside it that does not start with an operator is an error. Blank lines and comments between
+  continuation lines are skipped. After an operand `-x` and `+x` there are binary; after the test of
+  `if`, `elif` or `while`, a `for` source, a class's parents, and after anything that is not a
+  complete operand (`=`, `->`, `else`, `do`, a signature), an indented line is a block's line, so
+  `if c` over `-1` is a block yielding `-1`. An indented line starting with an operator after a call
+  is a continuation, not the call's trailing block. See [continuation
+  lines](/spec/operators-and-control-flow/#continuation-lines).
+
+- **A `.lavin` file is literate source: a Markdown document whose lines indented four columns are
+  the program**, and the name alone decides it (an `.avin` file never reads this way). It is
+  accepted wherever an `.avin` file is: a program of one file, a file of any module of a directory
+  program or of the library, `avin test`, and the language server. The program's own indentation
+  starts after the four columns; prose between two blocks ends nothing and reads as blank lines; a
+  fenced block (` ``` ` or `~~~`) is an illustration and is not compiled; an indented block under a
+  list item is prose. Prose is blanked, not removed, so every position reported is the document's
+  own line and column. A tab in a line's indentation and a fence that is never closed are refused
+  where they are. `avin tangle` prints the program with the prose stripped, line for line; `avin
+  weave` renders the document as one HTML page, the prose as GitHub-flavoured Markdown and the
+  program coloured by the compiler's own lexer. See [literate
+  source](/spec/declarations/#literate-source).
+- **Derivation through shapes** ([derivation](/spec/derivation/)): `derives` takes any trait whose
+  module declares a `derive X for T` template, written once like an impl. Every data type and class
+  (its constructor parameters) has a shape, made once before `main`: variants, fields, names,
+  positions, defaults and annotations. Inside a template, `T.walk(value, visitor)` and `T.walkPair(a,
+  b, visitor)` call the visitor's `field[F: Bound]` hook once per field at that field's type, and
+  `T.build(builder)` makes a value from fields supplied in any order, using defaults and the
+  builder's `missing` for absent ones. The template is checked once; the visitor's hook is found for
+  each deriving type, and that each field meets its bound is reported at the `derives` entry naming
+  the field. Annotations are values of types implementing `Annotation`, written `@JsonKey("name")`
+  on a type, variant or field. The user resolved the proposal's open questions:
+  - `Shaped` is a bound only a template's `T` has; a program cannot write it elsewhere.
+  - The built-in `Display`, `Debug`, `Ord` and class `Eq` and `Hash` derivations are to be
+    re-expressed as core-library templates. A data type's own `==` and hash stay the language's.
+  - A misused annotation is not rejected while compiling; it fails when a value is decoded.
+  - `build` is refused for open and abstract classes, an error at the `derives` entry; `walk` is
+    allowed.
+  - Every type parameter of a generic deriving type is bounded by the derived trait.
+
 **Deferred**
 
 - Public C interoperability. Until then, C is reached through Sysl.
@@ -736,6 +814,39 @@ Settled by the user on 2026-11-04:
 - Async and await.
 
 ## Proposed
+
+- Packages ([packages](/spec/packages/)), modelled on Sysl's package system:
+  - **The manifest**: `package { name, version, description }`, `dependencies { … }` and `workspace
+    = [ … ]`, and no other key; an unknown key is an error, not a warning. A name is a lowercase
+    letter then lowercase letters, digits, `_` and `-`; a version is `major.minor.patch` with no
+    leading zeros. A manifest is optional: a directory or file with none above it is a program as
+    before.
+  - **Dependencies**: `{ git = "host/owner/name", version = "x.y.z" }` read at the tag `vx.y.z`
+    and cloned from `https://`; `{ path = "../dir" }`, relative to the manifest naming it and refused
+    in a fetched package; `{ workspace = true }`. A coordinate with `https://` or `.git` is refused.
+    No `rev` pins, features or members of a repository yet.
+  - **What a dependency brings in**: its modules, under their own names; not its root directory's
+    files (its `main`) nor its `tests` directory, so a program can be depended on and `avin test`
+    runs only the package's own tests. One module in two packages is refused. A directory holding its
+    own manifest is another package and never a module of the tree above it.
+  - **Version selection**: the highest version any manifest in the graph asks for, over every member
+    of a workspace.
+  - **The cache** is the machine's, `<cache>/avin/pkg/<coordinate>/@v<version>/`, the clone's
+    `.git` removed and the tree's hash written beside it. Builds fetch; the language server does not.
+  - **`avin.sum`**: `<coordinate> v<version> sha256:<hex>` per fetched package and version read,
+    one file per project (the workspace root's); the hash is Sysl's tree hash (SHA-256 of a sorted
+    listing of each file's SHA-256 and path, `.git` and the root's `.avin/` left out). A mismatch is
+    refused; a build only adds lines; `avin tidy [--check]` rewrites it to what the whole resolution
+    reads.
+  - **Workspaces**: Sysl's: members listed by directory with `*` within a name, a root with a
+    `package` block a member, a root without one taking no dependencies and refused as a program.
+  - **Finding the package**: every command walks up from the path it is given to the nearest
+    manifest with a `package` block, a workspace root without one being passed over. Sysl looks only
+    beside the path; walking up is what lets a file, a test directory or an editor's open file name
+    its package.
+  - **`avin new <dir> [--lib]`** names the package by the directory, writes a module of that name
+    (`-` written `_`), `main.avin` unless `--lib`, a test in `tests/` and a `.gitignore` of `.avin/`;
+    the names `avin` and `tests` are refused. `avin build` names the executable after the package.
 
 - Repeated parameters beside overloads and constructors
   ([declarations](/spec/declarations/#repeated-parameters)): an overload with a repeated parameter
@@ -847,13 +958,55 @@ Settled by the user on 2026-11-04:
   arguments reach the process; reading them is `avin.process`'s, in the system library. A test is a
   top-level `@test` function of the program, in any module, taking nothing and yielding unit, named
   by the function or by `@test("a sentence")`; a program built for its tests need not have `main`.
-  `avin test <program> [filter]` builds one executable and runs each test in a process of its own, so
+  `run` is the default command and the current directory the default program: `avin` is `avin run .`,
+  `avin <path> ...` is `avin run <path> ...` when the first argument is not a command name, and the
+  commands taking a program default it to `.`. A command name is always the command; a path that
+  spells one is reached as `./test`. `avin test`'s first argument is the program when it names an
+  existing path and the filter otherwise.
+  `avin test [<program>] [filter]` builds one executable and runs each test in a process of its own, so
   a trap stops only that test, reporting `ok` or `FAIL` per test grouped by file, the reason and the
   test's output under a failure, and `N passed, M failed`; it exits 1 when any failed. The core
   library's `assert(condition)`, `assert(condition, message)` and `assertEq(actual, expected)` (with
   `Eq` and `Debug` bounds, showing both values' `Debug` forms) trap at the assertion's place. Not yet
   built: `@tests` files, setup and teardown hooks, `should_trap`, `ignore` and `timeout` arguments,
   and tests answering with a `Result`.
+- Parser combinators, `avin.parsing` ([parsing](/spec/parsing/)), in the core library until
+  packages exist. The choices for the user:
+  - **Representation.** `Parser[+T]` is a class holding `run: Input -> Option[T]`; `Input` is
+    mutable (the byte offset, the furthest failure and its expectations, a committed flag), so a
+    success allocates only its `Some` and backtracking restores one offset. A parser of a megabyte of
+    JSON runs in about a tenth of a second unoptimized. The alternative, an immutable input and a
+    result carrying the next input, allocates a result per step.
+  - **Backtracking by default, with commit points.** `p | q` retries from where `p` started however
+    far it read. `p ~! q` and `commit(p)` make a later failure fail the whole parse, for errors that
+    name what the committed rule expected.
+  - **Errors.** The furthest failure wins; its distinct expectations are listed in the order tried
+    (``2:5: expected `,` or `]`, found '4'``). `label(what)` renames a failure that got no further than
+    the rule's first character.
+  - **Names.** `~`, `~>`, `<~`, `~!`, `|`, `^^`, `^^^` and methods `map`, `flatMap`, `filter`,
+    `label`, `opt`, `rep`, `rep1`, `repSep`, `rep1Sep`, `commit`, `positioned`, `parse`,
+    `parsePrefix`, each repetition also as a function (`rep(p)`). `>>` is a shift and cannot name
+    a method, so binding is `flatMap` alone. `not` is a keyword, so the negative look ahead is
+    `notFollowedBy`; the positive one is `guard`. `lit` takes a string or a character, since
+    `char`, `int` and `real` name types: the number parsers are `integer` (`long`) and `decimal`
+    (`real`). `symbol(s)` is `token(lit(s))`. There is one whole-input entry point, `parse`, and no
+    `parseAll`.
+  - **Recursion.** Rules are `lazy val`s and a cycle reads through `defer(p)`, a by-name parameter
+    evaluated on the first run and kept.
+  - **`<~` binds with the comparisons**, below `^^` and `|`, as its first character places it, so
+    `"(" ~> e <~ ")" ^^ f` and `a | "(" ~> e <~ ")"` misgroup, the second without a type error. The
+    library writes such rules in parentheses or as rules of their own. Placing a symbol method that
+    begins with `<` and continues with `~` (or any name containing `~`) at the level of other
+    symbols would remove the trap.
+  - **No regular expressions**: a compiled pattern would cross from Sysl as a handle, and bindings
+    carry none yet.
+  - **The core library's `string` gains** `byteAt(at)`, `charAt(at)` and `startsWith(prefix, at)`,
+    which the parsers read the text with; `charAt` reads the character whose encoding begins at a
+    byte offset.
+  - **Depth.** Nesting is recursion: about 3,000 levels of parentheses on the main thread
+    unoptimized, more on a thread given a larger stack. An exhausted stack ends the program with a
+    segmentation fault and no message.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
