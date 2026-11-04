@@ -260,6 +260,9 @@ struct ImplSymbol
     target: &Type
     owner: usize
     trait_type: Option[&Type]
+    /** For each type parameter, the bounds the impl gives it besides its type's: the conformance
+     * holds only for type arguments that meet them. Empty for an impl without any. */
+    conditions: Buf[Buf[&Type]]
 
 struct Checker
     units: Buf[SourceUnit]
@@ -325,6 +328,8 @@ struct Checker
     private_names: Map[string, bool]
     /** The program's root module, which declares `main`. */
     root_module: string
+    /** The core library's operator and equality traits, found once every method is declared. */
+    core: CoreTraits
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -455,7 +460,7 @@ private check_imports(c: *Checker, unit: usize)
  * unit is one of its files. Every file sees its own module's declarations, the names it imports and
  * the core library's public declarations, in that order: an inner name hides an outer one. */
 check_program(units: Buf[SourceUnit], root_module: string) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module)
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, CoreTraits(map(), map()))
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
     // Every type is named before any is used, so a data type may refer to itself or to one
@@ -478,6 +483,7 @@ check_program(units: Buf[SourceUnit], root_module: string) -> Checked
         declare_methods(&c, u)
     for i in 0..<c.impls.len()
         declare_impl_methods(&c, i)
+    find_core_traits(&c)
     var linked: Buf[bool] = buf()
     for _ in c.classes
         linked.push(false)
@@ -515,6 +521,8 @@ check_program(units: Buf[SourceUnit], root_module: string) -> Checked
     for id in 0..<c.data.len()
         check_data_implementations(&c, id)
         check_data_variance(&c, id)
+    check_builtin_implementations(&c)
+    check_equality_pairs(&c)
     for g in 0..<c.globals.len()
         settle_global(&c, g)
     val init = initializer(&c, initialization_order(&c))
@@ -548,7 +556,7 @@ check_program(units: Buf[SourceUnit], root_module: string) -> Checked
     var sources: Buf[Source] = buf()
     for u in c.units
         sources.push(u.src)
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, id, init)))
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, id, init, c.core)))
 
 private declare_unit(c: *Checker, unit: usize)
     val file = c.units[unit].file
@@ -721,11 +729,12 @@ private declare_impls(c: *Checker, unit: usize)
         if item is ImplItem(d) then c.impls.push(resolve_impl(c, unit, file.module_name, d))
 
 private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl) -> ImplSymbol
-    val invalid = ImplSymbol(unit, module_name, d, ErrorType, 0, None)
-    // An impl's parameters are its type's, bounded where the type declares them; a bound of the
-    // impl's own would make the conformance hold for some type arguments only.
+    val invalid = ImplSymbol(unit, module_name, d, ErrorType, 0, None, buf())
+    // An impl's parameters are its type's, bounded where the type declares them. A bound of the
+    // impl's own makes the conformance hold only for the type arguments that meet it.
+    var conditional = false
     for tp in d.type_params
-        if tp.bounds.len() > 0 then c.note(unit, tp.span, s"an impl's type parameters take the bounds of its type's, so `${tp.name}` cannot have one of its own; an impl for some type arguments only is not implemented")
+        if tp.bounds.len() > 0 then conditional = true
         if !(tp.variance is Invariant) then c.note(unit, tp.span, "variance is written on the parameters of a type, not of an impl")
     for m in d.members
         m match
@@ -782,6 +791,14 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
                 else c.note(unit, written_trait.span, s"`${c.classes[k].name}` is not a trait; an impl names a trait before `for`")
             ErrorType -> ()
             _ -> c.note(unit, written_trait.span, s"${type_name(t)} is not a trait; an impl names a trait before `for`")
+    var conditions: Buf[Buf[&Type]] = buf()
+    if conditional && !(*target is ErrorType)
+        if conditional_impl_refused(c, unit, d, target, trait_type)
+            c.generic = outer_generic
+            return invalid
+        declare_bounds(c, unit, owner, d.type_params, 0)
+        for i in 0..<d.type_params.len()
+            conditions.push(c.bounds.get(bound_key(owner, i, d.type_params[i])).unwrap_or(buf()))
     c.generic = outer_generic
     if *target is ErrorType then return invalid
     if d.trait_name is Some(_) && trait_type is None then return invalid
@@ -800,9 +817,60 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
                 c.data[id].traits = traits
             Class(_, _, _) -> ()
             _ ->
-                c.note(unit, d.target.span, "conforming a built-in type to a trait is not implemented")
-                return invalid
-    ImplSymbol(unit, module_name, d, target, owner, trait_type)
+                // A built-in type conforms through its impls alone, each stated once.
+                for other in c.impls
+                    if other.trait_type is Some(o)
+                        if same_type(other.target, target) && conforms_directly(buf1(o), t)
+                            c.note(unit, written_trait_span(d), s"`$path` already conforms to `${type_name(t)}`; a conformance is stated once")
+                            return invalid
+    ImplSymbol(unit, module_name, d, target, owner, trait_type, conditions)
+
+private buf1(t: &Type) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    out.push(t)
+    out
+
+/** Whether class `k` is the one with qualified name `key`. */
+private is_class_named(c: *Checker, k: usize, key: string) -> bool = c.class_types.get(key) match
+    Some(x) -> x == k
+    None -> false
+
+private buf1u(x: usize) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    out.push(x)
+    out
+
+// An impl with bounds of its own makes a data type conform to a trait that is only a bound, as `Eq`,
+// `Ord` or `Add` are, for the type arguments that meet them. Such a conformance is decided where a
+// bound is checked; a trait that is also a type would need it decided at conversions and type
+// patterns too, which is not implemented, and neither is a class's.
+private conditional_impl_refused(c: *Checker, unit: usize, d: &ImplDecl, target: &Type, trait_type: Option[&Type]) -> bool
+    val at = d.type_params[0].span
+    val t = trait_type match
+        Some(t) -> t
+        None ->
+            c.note(unit, at, "an impl that adds methods for some type arguments only is not implemented; bound the type's own parameters")
+            return true
+    if !(*target is Data(_, _, _))
+        c.note(unit, at, "an impl with bounds of its own is implemented for data types only")
+        return true
+    if *t is Class(k, _, _)
+        // Every type compares and hashes, so an impl of `Eq` or `Hash` holds at every type argument,
+        // and its bounds may only be ones every type meets.
+        if is_class_named(c, k, qualified(CoreModule, "Eq")) || is_class_named(c, k, qualified(CoreModule, "Hash"))
+            for tp in d.type_params
+                for b in tp.bounds
+                    val name = b.kind match
+                        Named(path, _) -> path
+                        _ -> ""
+                    if name != "Eq" && name != "Hash"
+                        c.note(unit, b.span, s"every type compares and hashes, so an impl of `${type_name(t)}` holds for every type argument; its bounds may be `Eq` and `Hash` only")
+                        return true
+            return false
+        if !mentions_self(c, k, 0)
+            c.note(unit, at, s"an impl with bounds of its own is implemented for traits that are only bounds, which mention `Self`; `${type_name(t)}` is also a type")
+            return true
+    false
 
 /** Whether `traits` already holds the trait `t` names, with any type arguments. */
 private conforms_directly(traits: Buf[&Type], t: &Type) -> bool
@@ -2154,7 +2222,7 @@ private build_data_table(c: *Checker, id: usize, conformed: Buf[usize])
         if entry is Some(m)
             val name = c.symbols[m].decl.name
             val key = method_key(c, self_type, m)
-            if is_abstract_method(c.symbols[m]) && !contains_name(reported, key)
+            if is_abstract_method(c.symbols[m]) && !is_universal(c, m) && !contains_name(reported, key)
                 reported.push(key)
                 val t = c.symbols[m].owner_class.unwrap()
                 if is_trait_field(c, m)
@@ -2235,9 +2303,16 @@ private build_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
     var reported: Buf[string] = buf()
     val self_type = own_class_type(k, id)
     for i in 0..<size
-        val held = table[i] match
+        val listed = table[i] match
             Some(m) -> m
             None -> continue
+        // At the position of a trait the superclass already implements, the method is the
+        // superclass's implementation: its `Self` is the superclass, the type that conforms, so an
+        // override matches it rather than the trait's method seen with this class as `Self`.
+        var held = listed
+        if i >= k.slots.len() && i < sup_table.len()
+            if sup_table[i] is Some(sm)
+                if !is_abstract_method(c.symbols[sm]) && c.symbols[sm].decl.name == c.symbols[listed].decl.name then held = sm
         val name = c.symbols[held].decl.name
         val key = method_key(c, self_type, held)
         if is_trait_field(c, held)
@@ -2277,7 +2352,7 @@ private build_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
             if entry is Some(m)
                 val name = c.symbols[m].decl.name
                 val key = method_key(c, self_type, m)
-                if is_abstract_method(c.symbols[m]) && !contains_name(missing, key)
+                if is_abstract_method(c.symbols[m]) && !is_universal(c, m) && !contains_name(missing, key)
                     missing.push(key)
                     val owner = c.symbols[m].owner_class.unwrap()
                     // An object is its one instance, so it cannot be left abstract.
@@ -2460,6 +2535,9 @@ private check_override_results(c: *Checker, id: usize)
                 if m == base_slots[i] || c.symbols[m].owner_class != Some(id) then continue
                 if result_mismatch(c, own_class_type(c.classes[id], id), m, base_slots[i]) is Some(text)
                     c.note(k.unit, c.symbols[m].decl.name_span, s"`${c.symbols[m].decl.name}` overrides `${c.symbols[base_slots[i]].name}`, $text")
+    var sup_table: Buf[Option[usize]] = buf()
+    if k.superclass is Some(sup)
+        if *sup is Class(sid, _, _) then sup_table = c.classes[sid].table
     for t in conformed_traits(c, id)
         val methods = c.classes[t].methods
         for j in 0..<methods.len()
@@ -2468,7 +2546,12 @@ private check_override_results(c: *Checker, id: usize)
             val m = k.table[position] match
                 Some(m) -> m
                 None -> continue
-            val base = methods[j]
+            // Where the superclass implements the trait, the class keeps or overrides its
+            // implementation, which was checked against the trait with the superclass as `Self`.
+            var base = methods[j]
+            if position < sup_table.len()
+                if sup_table[position] is Some(sm)
+                    if !is_abstract_method(c.symbols[sm]) && c.symbols[sm].decl.name == c.symbols[base].decl.name then base = sm
             if m == base then continue
             if contains_id(c.field_getters, m)
                 if field_mismatch(c, own_class_type(c.classes[id], id), m, base) is Some(text) then c.note(k.unit, c.symbols[m].decl.name_span, text)
@@ -2570,6 +2653,71 @@ private check_data_implementations(c: *Checker, id: usize)
                 elif result_mismatch(c, self_type, m, base) is Some(text) then c.note(c.symbols[m].unit, at, s"$described, $text")
             elif param_mismatch(c, self_type, m, base) is Some(text) then report_conformance(c, id, t, s"$described for `${c.data[id].name}`, $text")
             elif result_mismatch(c, self_type, m, base) is Some(text) then report_conformance(c, id, t, s"$described, $text")
+
+// A built-in type has no method table, so its impl of a trait implements every method of the trait
+// and of the traits it requires, defaults included; `equals` and `hash` it has already.
+private check_builtin_implementations(c: *Checker)
+    for block in c.impls
+        if *block.target is ErrorType || *block.target is Data(_, _, _) || *block.target is Class(_, _, _) then continue
+        val k = block.trait_type match
+            Some(t) -> *t match
+                Class(k, _, _) -> k
+                _ -> continue
+            None -> continue
+        var traits = trait_ids(c, own_class_type(c.classes[k], k))
+        if !contains_id(traits, k) then traits.push(k)
+        for t in traits
+            for tm in c.classes[t].methods
+                if is_universal(c, tm) || is_trait_override(c, tm) then continue
+                var found = false
+                for m in c.builtin_methods
+                    if same_type(c.symbols[m].receiver.unwrap(), block.target) && c.symbols[m].decl.name == c.symbols[tm].decl.name && c.symbols[m].params.len() == c.symbols[tm].params.len()
+                        found = true
+                if !found
+                    c.note(block.unit, written_trait_span(block.decl), s"`${type_name(block.target)}` does not implement `${c.symbols[tm].decl.name}` from `${c.classes[t].name}`; an impl for a built-in type implements every method of its trait, defaults included")
+
+// A type that implements one of `equals` and `hash` implements the other, so that equal values have
+// equal hashes.
+private check_equality_pairs(c: *Checker)
+    val eq = c.core.method_named("equals") match
+        Some(m) -> m
+        None -> return
+    val hash = c.core.method_named("hash") match
+        Some(m) -> m
+        None -> return
+    for k in 0..<c.classes.len()
+        if is_trait(c, k) then continue
+        val table = c.classes[k].table
+        val own_eq = implemented_at(c, table, eq)
+        if own_eq != implemented_at(c, table, hash)
+            c.note(c.classes[k].unit, c.classes[k].decl.name_span, unpaired_equality(c.classes[k].name, own_eq))
+    for d in 0..<c.data.len()
+        val table = c.data[d].table
+        val own_eq = implemented_at(c, table, eq)
+        if own_eq != implemented_at(c, table, hash)
+            var at = c.data[d].decl.span
+            var unit = c.data[d].unit
+            for block in c.impls
+                if *block.target is Data(e, _, _)
+                    if e == d && block.trait_type is Some(t)
+                        if *t is Class(tk, _, _)
+                            if is_core_trait(c, tk, "Eq") || is_core_trait(c, tk, "Hash")
+                                at = written_trait_span(block.decl)
+                                unit = block.unit
+            c.note(unit, at, unpaired_equality(c.data[d].name, own_eq))
+
+private unpaired_equality(name: string, has_eq: bool) -> string =
+    if has_eq then s"`$name` implements `equals` from `Eq` without `hash` from `Hash`; equal values must have equal hashes, so a type implementing one implements both"
+    else s"`$name` implements `hash` from `Hash` without `equals` from `Eq`; equal values must have equal hashes, so a type implementing one implements both"
+
+/** Whether `table` holds an implementation of the core trait method `m` at its position, rather than
+ * the trait's own abstract method. */
+private implemented_at(c: *Checker, table: Buf[Option[usize]], m: usize) -> bool
+    val position = trait_slot(c, m)
+    if position >= table.len() then return false
+    table[position] match
+        Some(x) -> x != m && !is_abstract_method(c.symbols[x]) && c.symbols[x].decl.name == c.symbols[m].decl.name
+        None -> false
 
 /** How the field that `getter` reads differs from the trait's `val` `base` it supplies for
  * `self_type`: its type is the `val`'s or, where that is a class or a trait, one conforming to it. */
@@ -2793,9 +2941,16 @@ private bounds_at(c: *Checker, owner: usize, params: Buf[TypeParam], index: usiz
         val d = owner - data_owner(0)
         if d < c.data.len() && index < c.data[d].decl.type_params.len() then declared = c.data[d].decl.type_params
     if index >= declared.len() then return buf()
-    c.bounds.get(bound_key(owner, index, declared[index])) match
-        Some(bounds) -> bounds
-        None -> buf()
+    var out: Buf[&Type] = buf()
+    if c.bounds.get(bound_key(owner, index, declared[index])) is Some(own)
+        for b in own
+            out.push(b)
+    // Inside an impl with bounds of its own, its parameters have those bounds too.
+    if index < params.len() && params[index].span.start != declared[index].span.start
+        if c.bounds.get(bound_key(owner, index, params[index])) is Some(extra)
+            for b in extra
+                out.push(b)
+    out
 
 /** The bounds of type parameter `t` as the code being checked names it. */
 private bounds_of(c: *Checker, t: &Type) -> Buf[&Type]
@@ -2823,9 +2978,77 @@ private conforms_to_bound(c: *Checker, t: &Type, bound: &Type) -> bool
                 if ancestor_type(c.classes, c.data, b, k) is Some(up)
                     if conforms(zonk(c, up), zonk(c, bound)) then return true
             false
-        _ -> ancestor_type(c.classes, c.data, x, k) match
-            Some(up) -> conforms(zonk(c, up), zonk(c, bound))
-            None -> false
+        _ ->
+            // Every type compares and hashes, by value or by identity.
+            if is_core_trait(c, k, "Eq") || is_core_trait(c, k, "Hash") then return true
+            ancestor_type(c.classes, c.data, x, k) match
+                Some(up) -> conforms(zonk(c, up), zonk(c, bound)) && conditions_hold(c, x, k)
+                None -> builtin_conforms(c, x, bound)
+
+/** The core library's operator and equality traits and their methods, by name. */
+private find_core_traits(c: *Checker)
+    var traits: Map[string, usize] = map()
+    var methods: Map[string, usize] = map()
+    for name in ["Eq", "Hash", "Ord", "Add", "Sub", "Mul", "Div", "Rem", "Neg"]
+        if c.class_types.get(qualified(CoreModule, name)) is Some(k)
+            if is_trait(c, k)
+                traits.put(name, k)
+                for m in c.classes[k].methods
+                    methods.put(c.symbols[m].decl.name, m)
+    c.core = CoreTraits(traits, methods)
+
+/** Whether class `k` is the core trait `name`. */
+private is_core_trait(c: *Checker, k: usize, name: string) -> bool = c.core.trait_named(name) match
+    Some(t) -> t == k
+    None -> false
+
+/** Whether `m` is `Eq`'s `equals` or `Hash`'s `hash`, which every type has: its own where it
+ * implements the trait, and otherwise by value or by identity. */
+private is_universal(c: *Checker, m: usize) -> bool = c.core.is(m, "equals") || c.core.is(m, "hash")
+
+/** The type of the core trait `name`, when the core library declares it. */
+private core_trait_type(c: *Checker, name: string) -> Option[&Type]
+    val k = c.core.trait_named(name)?
+    Some(own_class_type(c.classes[k], k))
+
+/** Whether the built-in type `t` conforms to `bound` through an impl, or through a trait one requires. */
+private builtin_conforms(c: *Checker, t: &Type, bound: &Type) -> bool
+    val k = *bound match
+        Class(k, _, _) -> k
+        _ -> return false
+    for block in c.impls
+        if block.trait_type is Some(tt)
+            if same_type(block.target, t)
+                if ancestor_type(c.classes, c.data, tt, k) is Some(up)
+                    if conforms(zonk(c, up), zonk(c, bound)) then return true
+    false
+
+// Whether a data type's conformance to trait `k` holds at its type arguments: an impl with bounds of
+// its own makes it conform only where they are met. Some impl reaching `k` must hold.
+private conditions_hold(c: *Checker, t: &Type, k: usize) -> bool
+    val d = *t match
+        Data(d, _, _) -> d
+        _ -> return true
+    val args = *t match
+        Data(_, _, args) -> args
+        _ -> buf()
+    var reached = false
+    for block in c.impls
+        val tt = block.trait_type match
+            Some(tt) -> tt
+            None -> continue
+        val same = *block.target match
+            Data(e, _, _) -> e == d
+            _ -> false
+        if !same || ancestor_type(c.classes, c.data, tt, k) is None then continue
+        reached = true
+        var holds = true
+        for i in 0..<block.conditions.len()
+            if i >= args.len() then break
+            for b in block.conditions[i]
+                if !conforms_to_bound(c, args[i], substitute(b, block.owner, args)) then holds = false
+        if holds then return true
+    !reached
 
 // Holds type arguments written on a type to the bounds of its parameters: at once when every
 // conformance is known, and otherwise once it is.
@@ -4575,6 +4798,10 @@ private unary_expr(c: *Checker, e: &Expr, op: UnaryOp, operand: &Expr, expected:
     if op is Negate && operand.kind is IntLit(spelling)
         return integer_literal(c, e.span, spelling, true, expected)
     val x = check_expr(c, operand, expected)
+    // On a type parameter, a data type or a class, `-` is `Neg`'s `negate`.
+    if op is Negate && has_operator_traits(zonk(c, x.ty))
+        if !operator_conforms(c, e.span, "-", zonk(c, x.ty), "Neg") then return TExpr(e.span, ErrorType, UnitConst)
+        return TExpr(e.span, zonk(c, x.ty), Negate(x))
     // `-` and `+` apply to integers and reals, `~` to integers and bytes.
     val fits_op = *x.ty match
         Int(_) -> true
@@ -4623,6 +4850,14 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
         c.note(unit_of(c), at, s"`+` joins two strings, not a string and ${type_name(other)}")
         return TExpr(at, ErrorType, UnitConst)
     val numeric = *l.ty is Int(_) || *l.ty is Real || *l.ty is Byte
+    // On a type parameter, a data type or a class, an arithmetic operator is its core trait's method.
+    if !numeric && has_operator_traits(zonk(c, l.ty))
+        if binary_operator_method(op) is Some(om)
+            if !same_type(zonk(c, l.ty), zonk(c, r.ty))
+                c.note(unit_of(c), at, s"`$spelling` needs two values of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}")
+                return TExpr(at, ErrorType, UnitConst)
+            if !operator_conforms(c, at, spelling, zonk(c, l.ty), om.trait_name) then return TExpr(at, ErrorType, UnitConst)
+            return TExpr(at, zonk(c, l.ty), Arith(op, l, r, op_at))
     if !numeric || !same_type(l.ty, r.ty)
         c.note(unit_of(c), at, s"`$spelling` needs two numbers of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}")
         return TExpr(at, ErrorType, UnitConst)
@@ -4635,6 +4870,14 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
         c.note(unit_of(c), at, s"`$spelling` is not defined on real")
         return TExpr(at, ErrorType, UnitConst)
     TExpr(at, l.ty, Arith(op, l, r, op_at))
+
+/** Whether a value of type `t` takes its operators from the core traits rather than the machine: a
+ * type parameter, a data type or a class. */
+private has_operator_traits(t: &Type) -> bool = *t match
+    TypeVar(_, _, _) -> true
+    Data(_, _, _) -> true
+    Class(_, _, _) -> true
+    _ -> false
 
 private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[CompareOp]) -> &TExpr
     var early: Buf[Option[&TExpr]] = buf()
@@ -4650,6 +4893,12 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
         early[i] match
             Some(t) -> typed.push(t)
             None -> typed.push(check_expr(c, operands[i], anchor))
+    // `==` between an `Any` and a value of another type compares the value as an `Any`.
+    if ops.len() == 1 && (ops[0] is Equal || ops[0] is NotEqual)
+        val x = zonk(c, typed[0].ty)
+        val y = zonk(c, typed[1].ty)
+        if *x is AnyType && settled(y) && !(*y is AnyType) then typed.set(1, to_any(c, typed[1]))
+        elif *y is AnyType && settled(x) && !(*x is AnyType) then typed.set(0, to_any(c, typed[0]))
     for i in 0..<ops.len()
         compare_link(c, ops[i], typed[i], typed[i + 1])
     var ty: &Type = Bool
@@ -4665,39 +4914,77 @@ private compare_link(c: *Checker, op: CompareOp, a: &TExpr, b: &TExpr)
     if !settled(a.ty) || !settled(b.ty) then return
     val at = a.span.to(b.span)
     val spelling = compare_spelling(op)
-    // An `Any` may hold a value with no identity and no equality; a type pattern recovers its type,
-    // and with it the comparisons that type has.
+    val identity = op is Same || op is NotSame
+    if op is Equal || op is NotEqual then return equality_link(c, at, spelling, zonk(c, a.ty), zonk(c, b.ty))
+    if !identity then return ordering_link(c, at, spelling, zonk(c, a.ty), zonk(c, b.ty))
+    // An `Any` may hold a value with no identity; a type pattern recovers its type.
     if *a.ty is AnyType || *b.ty is AnyType
         c.note(unit_of(c), at, s"`$spelling` on Any is not implemented; match the value by its type first, as in `s: string`")
         return
-    val identity = op is Same || op is NotSame
     // A function value is a closure and an object of a class is a heap object: both are
-    // references. `===` always compares them by identity; `==` does too, until a class defines its
-    // own equality (`Eq`), which `==` would then use in its place.
-    if identity || *a.ty is Function(_, _) || *a.ty is Class(_, _, _)
-        if !identity && (is_trait_type(c, a.ty) || is_trait_type(c, b.ty))
-            // A trait-typed value may hold a data value, which compares by value, or an object,
-            // which compares by identity: telling them apart needs runtime equality entries.
-            c.note(unit_of(c), at, s"`$spelling` on the trait type ${type_name(if is_trait_type(c, a.ty) then a.ty else b.ty)} is not implemented; match the value by its type first, or compare with `===`")
-            return
-        if (*a.ty is Function(_, _) || *a.ty is Class(_, _, _)) && same_type(a.ty, b.ty) then return
-        // An instance of a subclass may be the very object a superclass-typed value holds.
-        if *a.ty is Class(_, _, _) && *b.ty is Class(_, _, _)
-            if same_type(upcast(c, a.ty, b.ty), b.ty) || same_type(upcast(c, b.ty, a.ty), a.ty) then return
-            c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} with ${type_name(b.ty)}")
-            return
-        if !identity
-            c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} with ${type_name(b.ty)}")
-            return
-        c.note(unit_of(c), at, s"`$spelling` compares identities, and ${type_name(a.ty)} values have none")
-        return
-    if !same_type(a.ty, b.ty)
+    // references, which `===` compares by identity.
+    if (*a.ty is Function(_, _) || *a.ty is Class(_, _, _)) && same_type(a.ty, b.ty) then return
+    // An instance of a subclass may be the very object a superclass-typed value holds.
+    if *a.ty is Class(_, _, _) && *b.ty is Class(_, _, _)
+        if same_type(upcast(c, a.ty, b.ty), b.ty) || same_type(upcast(c, b.ty, a.ty), a.ty) then return
         c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} with ${type_name(b.ty)}")
         return
-    val equality = op is Equal || op is NotEqual
-    if *a.ty is Int(_) || *a.ty is Byte || *a.ty is Char || *a.ty is Real || *a.ty is Str then return
-    if equality && *a.ty is Bool then return
-    c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} values")
+    if *a.ty is Function(_, _) || *a.ty is Class(_, _, _)
+        c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} with ${type_name(b.ty)}")
+        return
+    c.note(unit_of(c), at, s"`$spelling` compares identities, and ${type_name(a.ty)} values have none")
+
+// Every type has `==`, so two values compare when they have a common type: one type, or a class or
+// trait one is an instance of. On `Any` and on trait types the comparison is decided at run time by
+// the values' own types. A value of a type parameter compares through a bound that is `Eq` or
+// requires it.
+private equality_link(c: *Checker, at: Span, spelling: string, x: &Type, y: &Type)
+    if *x is AnyType && *y is AnyType then return
+    if *x is TypeVar(_, _, _) || *y is TypeVar(_, _, _)
+        if !same_type(x, y)
+            c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(x)} with ${type_name(y)}")
+            return
+        operator_conforms(c, at, spelling, x, "Eq")
+        return
+    if *x is AnyType || *y is AnyType
+        c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(x)} with ${type_name(y)} in a chain; compare them on their own")
+        return
+    if same_type(x, y) || fits(c, x, y) || fits(c, y, x) then return
+    c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(x)} with ${type_name(y)}")
+
+// `<`, `<=`, `>` and `>=` are `Ord`'s: the numbers, chars, bytes and strings have them, and a type
+// parameter, a data type or a class through `Ord`.
+private ordering_link(c: *Checker, at: Span, spelling: string, x: &Type, y: &Type)
+    if !same_type(x, y)
+        c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(x)} with ${type_name(y)}")
+        return
+    *x match
+        Int(_) -> ()
+        Byte -> ()
+        Char -> ()
+        Real -> ()
+        Str -> ()
+        TypeVar(_, _, _) -> operator_conforms(c, at, spelling, x, "Ord")
+        Data(_, _, _) -> operator_conforms(c, at, spelling, x, "Ord")
+        Class(_, _, _) -> operator_conforms(c, at, spelling, x, "Ord")
+        _ -> c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(x)} values")
+
+// Whether a value of type `t` has an operator through the core trait `trait_name`: its type conforms
+// to the trait, or for a type parameter, one of its bounds does. Reports it where it does not.
+private operator_conforms(c: *Checker, at: Span, spelling: string, t: &Type, trait_name: string) -> bool
+    val bound = core_trait_type(c, trait_name) match
+        Some(b) -> b
+        None ->
+            c.note(unit_of(c), at, s"`$spelling` on ${type_name(t)} needs the core library's `$trait_name`")
+            return false
+    if conforms_to_bound(c, t, bound) then return true
+    // A trait's `Self` is any type conforming to it, and every type has `==`.
+    if *t is TypeVar(owner, _, _)
+        if is_self_owner(owner) && (trait_name == "Eq" || trait_name == "Hash") then return true
+    if *t is TypeVar(_, _, name)
+        c.note(unit_of(c), at, s"`$spelling` on `$name` needs a bound that is `$trait_name` or requires it, as in `[$name: $trait_name]`")
+    else c.note(unit_of(c), at, s"`$spelling` needs ${type_name(t)} to implement `$trait_name`")
+    false
 
 // `s"a${x}b"` is the text pieces and the rendered holes joined in order, as
 // `"a" + x.toString() + "b"`; an empty piece is left out. Each hole is evaluated once, left to
@@ -5301,6 +5588,12 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
             return TExpr(at, ErrorType, UnitConst)
         if infix && !takes_one_argument(c, ms) then return infix_arity_error(c, at, name_span, target, name, ms, args)
         return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
+    // Every value has `Eq`'s `equals` and `Hash`'s `hash`, its own or by value or identity.
+    if c.core.method_named(name) is Some(m)
+        if is_universal(c, m) && !(*zonk(c, object.ty) is ErrorType) && !(*zonk(c, object.ty) is TypeVar(_, _, _))
+            val ms = buf1u(m)
+            if infix && !takes_one_argument(c, ms) then return infix_arity_error(c, at, name_span, target, name, ms, args)
+            return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
     if infix
         if !(*zonk(c, object.ty) is ErrorType)
             c.note(unit, name_span, s"`${type_name(zonk(c, object.ty))}` has no method `$name` to call infix")
@@ -5490,6 +5783,9 @@ private dispatch_slot(c: *Checker, receiver_type: &Type, m: usize) -> Option[usi
 // at the position the method has in every table that holds it.
 private method_call_kind(c: *Checker, receiver_type: &Type, m: usize, args: Buf[&TExpr], type_args: Buf[&Type], direct: bool) -> TExprKind
     if direct then return Call(m, args, type_args)
+    // `equals` and `hash` are decided by the receiver's type in every instance: its own, or by value
+    // or identity.
+    if is_universal(c, m) then return BoundCall(m, Some(trait_slot(c, m)), args, type_args)
     if *zonk(c, receiver_type) is TypeVar(_, _, _) then return BoundCall(m, bound_slot(c, m), args, type_args)
     dispatch_slot(c, receiver_type, m) match
         Some(s) -> Dispatch(m, s, args, type_args)

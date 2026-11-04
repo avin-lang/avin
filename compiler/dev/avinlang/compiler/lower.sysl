@@ -60,6 +60,10 @@ private struct Instance
     type_args: Buf[&Type]
     /** Whether this is the function's closure entry rather than the function itself. */
     entry: bool
+    /** `Written` for a function of the program; otherwise the kind of function lowering makes for
+     * the type `type_args[0]`, which no source declares: its structural `==` or hash, its type
+     * record's equality entries, or the comparison and hash of values of unknown type. */
+    generated: u8
 
 /** The layout of a closure of one function: its descriptor, and where each captured value is kept,
  * the captured locals first, then the captured top-level parameters. The entry's address is at
@@ -135,6 +139,9 @@ private struct Lowering
     record_types: Buf[&Type]
     /** The records a type pattern tests against, each once. */
     tested: Buf[usize]
+    /** Whether the program compares or hashes a value of unknown type, which reads the equality
+     * entries of its type's record: every record then gets them. */
+    runtime_equality: bool
 
 /** One slot for a method with type parameters of its own, at one list of its own type arguments: a
  * call through a method table to `name` at checker position `position` with `type_args` reaches it.
@@ -161,10 +168,10 @@ lower_program(program: TProgram) -> MirProgram
         if k.table.len() > generic_base then generic_base = k.table.len()
     for d in program.data
         if d.table.len() > generic_base then generic_base = d.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf())
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false)
     // Record 0 is for the objects no type pattern names: closures, and the boxes of captured
     // variables.
-    l.records.push(TypeRecord("a closure or a captured variable", buf()))
+    l.records.push(TypeRecord("a closure or a captured variable", buf(), None, None))
     l.record_types.push(Unit)
     for i in 0..<program.symbols.len()
         if !is_generic(program, i) && !never_compiled(program, i) then instance(&l, i, buf())
@@ -174,12 +181,17 @@ lower_program(program: TProgram) -> MirProgram
         None -> None
     var functions: Buf[MirFunction] = buf()
     var k = 0usize
-    while k < l.instances.len()
-        functions.push(lower_function(&l, k))
-        k += 1
+    while true
+        while k < l.instances.len()
+            functions.push(lower_function(&l, k))
+            k += 1
+        // A comparison of values of unknown type calls the entries of their type's record, so once
+        // the program makes one, every record gets them; making them may lay out more types.
+        if !l.runtime_equality || !add_equality_entries(&l) then break
     add_variant_ancestors(&l)
     var bindings: Buf[MirBinding] = buf()
     for inst in l.instances
+        if inst.generated != Written then continue
         val symbol = program.symbols[inst.function]
         if binding_target(symbol.decl) is Some(target)
             val shim = shim_symbol(function_symbol(program, inst.function, inst.type_args))
@@ -434,8 +446,20 @@ private instance_of(l: *Lowering, function: usize, type_args: Buf[&Type], entry:
     val key = instance_key(function, type_args, entry)
     if l.instance_index.get(key) is Some(index) then return index
     val index = l.instances.len()
-    l.instances.push(Instance(function, type_args, entry))
+    l.instances.push(Instance(function, type_args, entry, Written))
     l.instance_index.put(key, index)
+    index
+
+/** The function lowering makes of kind `kind` for type `t`, made when first asked for. */
+private generated(l: *Lowering, kind: u8, t: &Type) -> usize
+    val key = s"generated $kind|${type_key(t)}"
+    if l.instance_index.get(key) is Some(index) then return index
+    val index = l.instances.len()
+    var args: Buf[&Type] = buf()
+    args.push(t)
+    l.instances.push(Instance(0, args, false, kind))
+    l.instance_index.put(key, index)
+    if kind == AnyEquals || kind == AnyHash then l.runtime_equality = true
     index
 
 private instance_key(function: usize, type_args: Buf[&Type], entry: bool) -> string
@@ -474,13 +498,13 @@ private record_of(l: *Lowering, t: &Type) -> usize
     val key = type_key(t)
     if l.record_index.get(key) is Some(r) then return r
     val index = l.records.len()
-    l.records.push(TypeRecord(type_name(t), buf()))
+    l.records.push(TypeRecord(type_name(t), buf(), None, None))
     l.record_types.push(t)
     l.record_index.put(key, index)
     var ancestors: Buf[usize] = buf()
     for up in supertypes(l, t)
         ancestors.push(record_of(l, up))
-    l.records.set(index, TypeRecord(type_name(t), ancestors))
+    l.records.set(index, TypeRecord(type_name(t), ancestors, None, None))
     index
 
 /** The types `t` conforms to besides itself and `Any`, each once. */
@@ -631,7 +655,7 @@ private add_variant_ancestors(l: *Lowering)
             if same_type(view_as(l.program.classes, l.program.data, from, to), to)
                 ancestors.push(target)
                 grew = true
-        if grew then l.records.set(r, TypeRecord(l.records[r].name, ancestors))
+        if grew then l.records.set(r, TypeRecord(l.records[r].name, ancestors, l.records[r].equals, l.records[r].hash))
 
 /** The value of type `t` an object that has that type holds: a built-in value is in its box. */
 private unbox(l: *Lowering, t: &Type, object: Operand) -> Option[Operand] = machine(l, t) match
@@ -788,10 +812,21 @@ private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr],
 // table; any other type's implementation is the method at the call's position in its table, called
 // directly. In a trait's default body the receiver is the trait's `Self`, any conforming object.
 private bound_call(l: *Lowering, e: &TExpr, function: usize, slot: Option[usize], args: Buf[&TExpr], type_args: Buf[&Type]) -> Option[Operand]
+    if is_operator_method(l, function) then return core_call(l, e, function, args)
     val position = slot match
         Some(s) -> s
         None -> return direct_call(l, e, function, args, type_args)
     val receiver = concrete(l, args[0].ty)
+    // A built-in type has no method table: its impl's method is called.
+    if is_builtin(receiver)
+        val m = builtin_implementation(l, receiver, function) match
+            Some(m) -> m
+            None -> return unreachable_call(l, args)
+        var own_args: Buf[&Type] = buf()
+        val own = l.program.symbols[function].decl.type_params.len()
+        for i in type_args.len() - own..<type_args.len()
+            own_args.push(concrete(l, type_args[i]))
+        return direct_call(l, e, m, args, own_args)
     if *receiver is Class(k, _, _)
         if l.program.classes[k].decl.modifier != "" then return dispatch(l, function, position, args, type_args)
     val entries = checker_table(l, receiver)
@@ -902,6 +937,7 @@ function_symbol(program: TProgram, id: usize, type_args: Buf[&Type]) -> string
 
 private lower_function(l: *Lowering, k: usize) -> MirFunction
     val inst = l.instances[k]
+    if inst.generated != Written then return lower_generated(l, inst)
     val f = l.program.functions[inst.function]
     val symbol = l.program.symbols[f.symbol]
     l.subst = inst.type_args
@@ -1221,9 +1257,9 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
     Step(local, increment, postfix, op_span) -> step(l, e, local, increment, postfix, op_span)
     Negate(operand) ->
         val x = lower_expr(l, operand)?
-        if *e.ty is Real then return Some(binary(l, MReal, OpFSub, ConstReal(-0.0), x))
-        val bits = int_bits(e.ty)
-        Some(checked(l, bits, CheckedSub, ConstInt(bits, "0"), x, e.span))
+        val t = concrete(l, e.ty)
+        if !is_machine_scalar(t) then return operator_call(l, t, "negate", [x], machine(l, t))
+        Some(negate_value(l, t, x, e.span))
     Not(operand) ->
         val x = lower_expr(l, operand)?
         Some(binary(l, MBool, OpXor, x, ConstBool(true)))
@@ -1234,11 +1270,13 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
     Arith(op, left, right, op_span) ->
         val a = lower_expr(l, left)?
         val b = lower_expr(l, right)?
-        Some(*e.ty match
-            Real -> real_arith(l, op, a, b)
-            Byte -> byte_arith(l, op, a, b)
-            Str -> runtime_call(l, "avin_rt_string_concat", [MRef, MRef], MRef, [a, b])
-            _ -> arith(l, int_bits(e.ty), op, a, b, op_span))
+        val t = concrete(l, e.ty)
+        // On a data type or a class the operator is its core trait's method; on a type parameter
+        // whose instance is a built-in type, it is that type's machine operation.
+        if !is_machine_scalar(t)
+            val name = binary_operator_method(op).unwrap().method
+            return operator_call(l, t, name, [a, b], machine(l, t))
+        Some(scalar_arith(l, t, op, a, b, op_span))
     Convert(operand) ->
         val x = lower_expr(l, operand)?
         Some(convert(l, operand.ty, e.ty, x, e.span))
@@ -1327,6 +1365,20 @@ private arith(l: *Lowering, bits: u32, op: BinaryOp, a: Operand, b: Operand, at:
             val out = compare(l, CmpUge, b, ConstInt(bits, bits.to_string()))
             binary(l, t, OpAShr, a, select(l, t, out, ConstInt(bits, (bits - 1).to_string()), b))
         _ -> a
+
+/** An arithmetic, bitwise or shift operation on two values of the built-in type `t`, or `+` joining
+ * two strings. */
+private scalar_arith(l: *Lowering, t: &Type, op: BinaryOp, a: Operand, b: Operand, at: Span) -> Operand = *t match
+    Real -> real_arith(l, op, a, b)
+    Byte -> byte_arith(l, op, a, b)
+    Str -> runtime_call(l, "avin_rt_string_concat", [MRef, MRef], MRef, [a, b])
+    _ -> arith(l, int_bits(t), op, a, b, at)
+
+/** `-x` on an integer, which traps on overflow, or a real. */
+private negate_value(l: *Lowering, t: &Type, x: Operand, at: Span) -> Operand
+    if *t is Real then return binary(l, MReal, OpFSub, ConstReal(-0.0), x)
+    val bits = int_bits(t)
+    checked(l, bits, CheckedSub, ConstInt(bits, "0"), x, at)
 
 private real_arith(l: *Lowering, op: BinaryOp, a: Operand, b: Operand) -> Operand
     val machine = op match
@@ -1498,6 +1550,29 @@ private compare_values(l: *Lowering, op: CompareOp, t: &Type, a: Operand, b: Ope
         return compare(l, compare_op(op, Int(32)), order, ConstInt(32, "0"))
     compare(l, compare_op(op, t), a, b)
 
+/** An operand of a comparison: its value, a placeholder for a unit value, which has none and is equal
+ * to every other, or `None` in code no path reaches. */
+private link_operand(l: *Lowering, e: &TExpr) -> Option[Operand]
+    val v = lower_expr(l, e)
+    if v is None && machine(l, e.ty) is None && !(*e.ty is Nothing) then return Some(ConstBool(false))
+    v
+
+// One link of a comparison chain between values of types `x` and `y`, which may name the instance's
+// type parameters. `==` and `!=` are equality of any type; `<` and the others are the machine's on a
+// built-in type and `Ord`'s methods on any other.
+private compare_link(l: *Lowering, op: CompareOp, x: &Type, y: &Type, a: Operand, b: Operand) -> Operand
+    val s = concrete(l, x)
+    val t = concrete(l, y)
+    if op is Equal || op is NotEqual
+        // A value whose type is decided at run time compares through its record, whichever side
+        // holds it.
+        val common = if decided_at_run_time(l, t) then t else s
+        val same = equals_values(l, common, a, b)
+        return if op is Equal then same else binary(l, MBool, OpXor, same, ConstBool(true))
+    if op is Same || op is NotSame || is_machine_scalar(s) then return compare_values(l, op, s, a, b)
+    val name = compare_operator_method(op).unwrap().method
+    operator_call(l, s, name, [a, b], Some(MBool)).unwrap_or(ConstBool(false))
+
 /** A call of a runtime entry point that returns a value. */
 private runtime_call(l: *Lowering, symbol: string, params: []MirType, result: MirType, args: []Operand) -> Operand
     var types: Buf[MirType] = buf()
@@ -1510,15 +1585,15 @@ private runtime_call(l: *Lowering, symbol: string, params: []MirType, result: Mi
 
 // A chain evaluates each operand when its link is reached, and the first false link decides.
 private compare_chain(l: *Lowering, operands: Buf[&TExpr], ops: Buf[CompareOp]) -> Option[Operand]
-    var previous = lower_expr(l, operands[0])?
+    var previous = link_operand(l, operands[0])?
     if ops.len() == 1
-        val next = lower_expr(l, operands[1])?
-        return Some(compare_values(l, ops[0], operands[0].ty, previous, next))
+        val next = link_operand(l, operands[1])?
+        return Some(compare_link(l, ops[0], operands[0].ty, operands[1].ty, previous, next))
     val slot = new_slot(l, Bool)
     val done = new_block(l)
     for i in 0..<ops.len()
-        val next = lower_expr(l, operands[i + 1])?
-        val result = compare_values(l, ops[i], operands[i].ty, previous, next)
+        val next = link_operand(l, operands[i + 1])?
+        val result = compare_link(l, ops[i], operands[i].ty, operands[i + 1].ty, previous, next)
         store(l, slot, Some(result))
         if i + 1 < ops.len()
             val more = new_block(l)
@@ -1691,3 +1766,467 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
                     if sub.kind is PWildcard then continue
                     val field = if places[i] is Some(place) then Some(load_field(l, v, place)) else None
                     test_pattern(l, sub, field, fail)
+
+// Operators and equality. An operator is a core trait's method (`+` is `Add`'s `add`, `<` is `Ord`'s
+// `less`), and every instance knows its operands' types: on a built-in type the operator is the
+// machine's operation, generic code included, and on a data type or a class it is a direct call of
+// the type's implementation, or a call through the method table where the type is a trait or an
+// open class.
+//
+// `==` and the hash are every type's. A type that implements `Eq` and `Hash` uses its own; otherwise
+// a built-in value compares by value, a string by its bytes, a tuple and a data value field by field
+// through a function made for its type, and an object or a closure by identity. Values of `Any`, of a
+// trait type or of an open class compare by their types at run time: unequal when their type records
+// differ, and otherwise through the record's equality entries, made for every record once a program
+// compares such values.
+
+/** The kinds of `Instance.generated`: a function of the program, or one lowering makes. */
+private const Written: u8 = 0
+/** `==` on two values of a tuple or data type, field by field. */
+private const StructuralEquals: u8 = 1
+/** The hash of a tuple or data value, from its fields'. */
+private const StructuralHash: u8 = 2
+/** A type record's `equals` entry: two objects of the type, compared as that type. */
+private const RecordEquals: u8 = 3
+/** A type record's `hash` entry. */
+private const RecordHash: u8 = 4
+/** `==` on two values of unknown type, through their records. */
+private const AnyEquals: u8 = 5
+/** The hash of a value of unknown type, through its record. */
+private const AnyHash: u8 = 6
+
+/** Where a type record's `equals` and `hash` entries are: after the ancestor count. */
+private const RecordEqualsEntry: usize = 8
+private const RecordHashEntry: usize = 16
+
+/** Whether `t` is a built-in type whose operators are machine operations. */
+private is_machine_scalar(t: &Type) -> bool = *t match
+    Int(_) -> true
+    Byte -> true
+    Char -> true
+    Real -> true
+    Bool -> true
+    Str -> true
+    _ -> false
+
+/** Whether `t` is a built-in type, which has no method table. */
+private is_builtin(t: &Type) -> bool = is_machine_scalar(t) || *t is Unit
+
+/** Whether a value of type `t` may be of any of several types at run time, so its operators and its
+ * equality are decided by the object: `Any`, a trait, an open or abstract class, and a trait's `Self`
+ * in the trait's shared default bodies. */
+private decided_at_run_time(l: *Lowering, t: &Type) -> bool = *t match
+    AnyType -> true
+    TypeVar(owner, _, _) -> is_self_owner(owner)
+    Class(k, _, _) -> l.program.classes[k].decl.modifier != ""
+    _ -> false
+
+/** Whether `m` is a core trait method that an operator or `==` is written with, or the hash. */
+private is_operator_method(l: *Lowering, m: usize) -> bool
+    val name = l.program.symbols[m].decl.name
+    if !l.program.core.is(m, name) then return false
+    name == "equals" || name == "hash" || method_compare_op(name) is Some(_) || method_binary_op(name) is Some(_) || name == "negate"
+
+private method_compare_op(name: string) -> Option[CompareOp]
+    if name == "less" then return Some(Less)
+    if name == "lessOrEqual" then return Some(LessEqual)
+    if name == "greater" then return Some(Greater)
+    if name == "greaterOrEqual" then return Some(GreaterEqual)
+    None
+
+private method_binary_op(name: string) -> Option[BinaryOp]
+    if name == "add" then return Some(Add)
+    if name == "subtract" then return Some(Subtract)
+    if name == "multiply" then return Some(Multiply)
+    if name == "divide" then return Some(Divide)
+    if name == "remainder" then return Some(Remainder)
+    None
+
+/** The position of the core trait method `m` in the method table of every type conforming to its
+ * trait. */
+private core_position(l: *Lowering, m: usize) -> usize
+    val k = l.program.symbols[m].owner_class.unwrap()
+    val methods = l.program.classes[k].methods
+    for j in 0..<methods.len()
+        if methods[j] == m then return l.program.classes[k].base + j
+    0
+
+// A call of a core trait method through a bound, or of `equals` or `hash` on any value: the
+// receiver's type in this instance decides what it is.
+private core_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr]) -> Option[Operand]
+    var ops: Buf[Operand] = buf()
+    var values: Buf[Operand] = buf()
+    for a in args
+        val v = lower_expr(l, a)
+        v match
+            Some(x) ->
+                ops.push(x)
+                values.push(x)
+            None ->
+                if machine(l, a.ty) is Some(_) then return None
+                ops.push(ConstBool(false))
+    val t = concrete(l, args[0].ty)
+    val name = l.program.symbols[function].decl.name
+    if name == "equals" then return Some(equals_values(l, t, ops[0], ops[1]))
+    if name == "hash" then return Some(hash_value(l, t, ops[0]))
+    if is_machine_scalar(t)
+        if name == "negate" then return Some(negate_value(l, t, ops[0], e.span))
+        if method_compare_op(name) is Some(op) then return Some(compare_values(l, op, t, ops[0], ops[1]))
+        if method_binary_op(name) is Some(op) then return Some(scalar_arith(l, t, op, ops[0], ops[1], e.span))
+    operator_values(l, t, name, values, machine(l, e.ty))
+
+/** The core trait method `name` called on `args`, the receiver first, whose type `t` is not a
+ * built-in scalar. */
+private operator_call(l: *Lowering, t: &Type, name: string, args: []Operand, result: Option[MirType]) -> Option[Operand]
+    var values: Buf[Operand] = buf()
+    for a in args do values.push(a)
+    operator_values(l, t, name, values, result)
+
+private operator_values(l: *Lowering, t: &Type, name: string, values: Buf[Operand], result: Option[MirType]) -> Option[Operand]
+    val m = l.program.core.method_named(name).unwrap()
+    if decided_at_run_time(l, t) then return dispatch_operands(l, core_position(l, m), values, result)
+    var target: Option[usize] = None
+    if is_builtin(t)
+        if builtin_implementation(l, t, m) is Some(s) then target = Some(instance(l, s, buf()))
+    else target = explicit_implementation(l, t, m)
+    target match
+        Some(index) -> call_instance(l, index, values, result)
+        None ->
+            // An instance the checker never lets run: a conditional impl's method at type
+            // arguments that do not meet its bounds.
+            leave(l, Unreachable)
+            None
+
+/** The instance implementing core trait method `m` for the data type or class `t`: what its method
+ * table holds at `m`'s position, its own method or a trait's default body; `None` where it leaves
+ * the trait's method abstract. */
+private explicit_implementation(l: *Lowering, t: &Type, m: usize) -> Option[usize]
+    val position = core_position(l, m)
+    val entries = checker_table(l, t)
+    if position >= entries.len() then return None
+    val x = entries[position]?
+    val symbol = l.program.symbols[x]
+    if is_abstract_method(symbol) || symbol.decl.name != l.program.symbols[m].decl.name then return None
+    Some(instance(l, x, implementation_args(l, t, x)))
+
+/** The method of a built-in type's impl that implements trait method `m`. */
+private builtin_implementation(l: *Lowering, t: &Type, m: usize) -> Option[usize]
+    val name = l.program.symbols[m].decl.name
+    val arity = l.program.symbols[m].params.len()
+    for s in 0..<l.program.symbols.len()
+        val symbol = l.program.symbols[s]
+        if symbol.receiver is Some(r)
+            if same_type(r, t) && symbol.decl.name == name && symbol.params.len() == arity then return Some(s)
+    None
+
+/** A call in an instance the checker never lets run: its arguments are evaluated, and nothing
+ * follows. */
+private unreachable_call(l: *Lowering, args: Buf[&TExpr]) -> Option[Operand]
+    for a in args
+        lower_expr(l, a)
+    leave(l, Unreachable)
+    None
+
+private call_instance(l: *Lowering, index: usize, operands: Buf[Operand], result: Option[MirType]) -> Option[Operand]
+    val dest = result match
+        Some(t) -> Some(fresh(l, t))
+        None -> None
+    l.insts.push(Call(dest, Direct(index), operands))
+    dest match
+        Some(id) -> Some(Value(id))
+        None -> None
+
+/** A call of the method at `position` of the method table of `operands[0]`'s object. */
+private dispatch_operands(l: *Lowering, position: usize, operands: Buf[Operand], result: Option[MirType]) -> Option[Operand]
+    var params: Buf[MirType] = buf()
+    for o in operands
+        params.push(operand_type(l, o))
+    val code = fresh(l, MPtr)
+    l.insts.push(MethodSlot(code, operands[0], position))
+    val dest = result match
+        Some(t) -> Some(fresh(l, t))
+        None -> None
+    l.insts.push(Call(dest, Indirect(Value(code), MirSignature(params, result)), operands))
+    dest match
+        Some(id) -> Some(Value(id))
+        None -> None
+
+private operand_type(l: *Lowering, o: Operand) -> MirType = o match
+    Value(id) -> l.values[id]
+    ConstInt(bits, _) -> MInt(bits)
+    ConstBool(_) -> MBool
+    ConstReal(_) -> MReal
+    ConstStr(_) -> MRef
+    ConstObject(_) -> MRef
+    ConstClosure(_) -> MRef
+    _ -> MPtr
+
+private two(a: Operand, b: Operand) -> Buf[Operand]
+    var out: Buf[Operand] = buf()
+    out.push(a)
+    out.push(b)
+    out
+
+private one(a: Operand) -> Buf[Operand]
+    var out: Buf[Operand] = buf()
+    out.push(a)
+    out
+
+/** `a == b` for two values of type `t`. */
+private equals_values(l: *Lowering, t: &Type, a: Operand, b: Operand) -> Operand = *t match
+    Unit -> ConstBool(true)
+    Bool -> compare(l, CmpEq, a, b)
+    Int(_) -> compare(l, CmpEq, a, b)
+    Byte -> compare(l, CmpEq, a, b)
+    Char -> compare(l, CmpEq, a, b)
+    Real -> compare(l, FEq, a, b)
+    Str -> compare_values(l, Equal, t, a, b)
+    Function(_, _) -> compare(l, CmpEq, a, b)
+    ByName(_) -> compare(l, CmpEq, a, b)
+    _ ->
+        if decided_at_run_time(l, t) then call_instance(l, generated(l, AnyEquals, AnyType), two(a, b), Some(MBool)).unwrap()
+        else own_equals(l, t, a, b)
+
+/** `a == b` for two values whose type is exactly `t`, a class, data or tuple type: the type's own
+ * `equals`, or field by field, or by identity. */
+private own_equals(l: *Lowering, t: &Type, a: Operand, b: Operand) -> Operand
+    if *t is Class(_, _, _) || *t is Data(_, _, _)
+        if l.program.core.method_named("equals") is Some(eq)
+            if explicit_implementation(l, t, eq) is Some(i) then return call_instance(l, i, two(a, b), Some(MBool)).unwrap()
+    *t match
+        Data(_, _, _) -> call_instance(l, generated(l, StructuralEquals, t), two(a, b), Some(MBool)).unwrap()
+        Tuple(_) -> call_instance(l, generated(l, StructuralEquals, t), two(a, b), Some(MBool)).unwrap()
+        _ -> compare(l, CmpEq, a, b)
+
+/** The hash of a value of type `t`, a `long`; equal values hash alike. */
+private hash_value(l: *Lowering, t: &Type, a: Operand) -> Operand = *t match
+    Unit -> ConstInt(64, "0")
+    Bool -> select(l, MInt(64), a, ConstInt(64, "1"), ConstInt(64, "0"))
+    Int(bits) -> resize(l, a, bits, 64, true)
+    Byte -> resize(l, a, 8, 64, false)
+    Char -> resize(l, a, 32, 64, false)
+    Real -> runtime_call(l, "avin_rt_real_hash", [MReal], MInt(64), [a])
+    Str -> runtime_call(l, "avin_rt_string_hash", [MRef], MInt(64), [a])
+    Function(_, _) -> runtime_call(l, "avin_rt_identity_hash", [MRef], MInt(64), [a])
+    ByName(_) -> runtime_call(l, "avin_rt_identity_hash", [MRef], MInt(64), [a])
+    _ ->
+        if decided_at_run_time(l, t) then call_instance(l, generated(l, AnyHash, AnyType), one(a), Some(MInt(64))).unwrap()
+        else own_hash(l, t, a)
+
+/** The hash of a value whose type is exactly `t`, a class, data or tuple type. */
+private own_hash(l: *Lowering, t: &Type, a: Operand) -> Operand
+    if *t is Class(_, _, _) || *t is Data(_, _, _)
+        if l.program.core.method_named("hash") is Some(h)
+            if explicit_implementation(l, t, h) is Some(i) then return call_instance(l, i, one(a), Some(MInt(64))).unwrap()
+    *t match
+        Data(_, _, _) -> call_instance(l, generated(l, StructuralHash, t), one(a), Some(MInt(64))).unwrap()
+        Tuple(_) -> call_instance(l, generated(l, StructuralHash, t), one(a), Some(MInt(64))).unwrap()
+        _ -> runtime_call(l, "avin_rt_identity_hash", [MRef], MInt(64), [a])
+
+/** Gives every type record that some object has as its own type equality entries; whether it made
+ * any. A trait's record and an abstract class's belong to no object. Record 0, of closures, compares
+ * by identity. */
+private add_equality_entries(l: *Lowering) -> bool
+    var added = false
+    var r = 0usize
+    while r < l.records.len()
+        val record = l.records[r]
+        val t: &Type = if r == 0 then Function(buf(), Unit) else l.record_types[r]
+        var owned = record.equals is None
+        if *t is Class(k, _, _)
+            if l.program.classes[k].decl.modifier == "trait" || l.program.classes[k].decl.modifier == "abstract" then owned = false
+        if owned
+            val equals = generated(l, RecordEquals, t)
+            val hash = generated(l, RecordHash, t)
+            l.records.set(r, TypeRecord(record.name, l.records[r].ancestors, Some(equals), Some(hash)))
+            added = true
+        r += 1
+    added
+
+// The body of a function lowering makes, which no source declares; see `Instance.generated`.
+private lower_generated(l: *Lowering, inst: Instance) -> MirFunction
+    l.subst = buf()
+    l.subst_owner = 0
+    l.values = buf()
+    l.slots = buf()
+    l.blocks = buf()
+    l.insts = buf()
+    l.loops = buf()
+    l.unit = 0
+    l.trap_blocks = map()
+    l.locals = buf()
+    l.boxed = buf()
+    l.local_slots = buf()
+    l.param_values = buf()
+    l.returns_value = true
+    l.current = new_block(l)
+    val t = inst.type_args[0]
+    val key = type_key(t)
+    val kind = inst.generated
+    if kind == StructuralEquals
+        val m = mir_type(t).unwrap()
+        val a = Value(fresh(l, m))
+        val b = Value(fresh(l, m))
+        structural_equals(l, t, a, b)
+        return MirFunction("avin.equals." + key, MirSignature(pair(m), Some(MBool)), l.values, l.slots, l.blocks)
+    if kind == StructuralHash
+        val m = mir_type(t).unwrap()
+        val a = Value(fresh(l, m))
+        structural_hash(l, t, a)
+        return MirFunction("avin.hash." + key, MirSignature(single(m), Some(MInt(64))), l.values, l.slots, l.blocks)
+    if kind == RecordEquals
+        val a = Value(fresh(l, MRef))
+        val b = Value(fresh(l, MRef))
+        val x = unbox(l, t, a).unwrap_or(ConstBool(false))
+        val y = unbox(l, t, b).unwrap_or(ConstBool(false))
+        val same = if *t is Class(_, _, _) || *t is Data(_, _, _) || *t is Tuple(_) then own_equals(l, t, x, y) else equals_values(l, t, x, y)
+        finish(l, Return(Some(same)))
+        return MirFunction("avin.record.equals." + key, MirSignature(pair(MRef), Some(MBool)), l.values, l.slots, l.blocks)
+    if kind == RecordHash
+        val a = Value(fresh(l, MRef))
+        val x = unbox(l, t, a).unwrap_or(ConstBool(false))
+        val h = if *t is Class(_, _, _) || *t is Data(_, _, _) || *t is Tuple(_) then own_hash(l, t, x) else hash_value(l, t, x)
+        finish(l, Return(Some(h)))
+        return MirFunction("avin.record.hash." + key, MirSignature(single(MRef), Some(MInt(64))), l.values, l.slots, l.blocks)
+    if kind == AnyEquals
+        val a = Value(fresh(l, MRef))
+        val b = Value(fresh(l, MRef))
+        any_equals(l, a, b)
+        return MirFunction("avin.any.equals", MirSignature(pair(MRef), Some(MBool)), l.values, l.slots, l.blocks)
+    val a = Value(fresh(l, MRef))
+    any_hash(l, a)
+    MirFunction("avin.any.hash", MirSignature(single(MRef), Some(MInt(64))), l.values, l.slots, l.blocks)
+
+private pair(m: MirType) -> Buf[MirType]
+    var out: Buf[MirType] = buf()
+    out.push(m)
+    out.push(m)
+    out
+
+private single(m: MirType) -> Buf[MirType]
+    var out: Buf[MirType] = buf()
+    out.push(m)
+    out
+
+/** The field types of variant `v` of a tuple or data type `t`. */
+private field_types(l: *Lowering, t: &Type, v: usize) -> Buf[&Type] = *t match
+    Tuple(items) -> items
+    Data(id, _, args) -> variant_fields(l.program.data[id], id, v, args)
+    _ -> buf()
+
+/** The tag of a data value's variant, from its descriptor. */
+private variant_tag(l: *Lowering, object: Operand) -> Operand
+    val descriptor = fresh(l, MPtr)
+    l.insts.push(DescriptorOf(descriptor, object))
+    val address = fresh(l, MPtr)
+    l.insts.push(Offset(address, Value(descriptor), DescriptorTag))
+    val tag = fresh(l, MInt(64))
+    l.insts.push(Load(tag, Value(address)))
+    Value(tag)
+
+/** Whether a variant has a field with a runtime value. */
+private has_field_data(fields: Buf[Option[FieldSlot]]) -> bool
+    for f in fields
+        if f is Some(_) then return true
+    false
+
+// Two values of one tuple or data type are equal when they are of one variant and each field is
+// equal; the first difference decides.
+private structural_equals(l: *Lowering, t: &Type, a: Operand, b: Operand)
+    val shape = layout(l, t)
+    val unequal = new_block(l)
+    l.blocks[unequal].term = Return(Some(ConstBool(false)))
+    if shape.variants.len() == 1
+        equal_fields(l, field_types(l, t, 0), shape.variants[0].fields, a, b, unequal)
+        finish(l, Return(Some(ConstBool(true))))
+        return
+    val tag = variant_tag(l, a)
+    continue_if(l, compare(l, CmpEq, tag, variant_tag(l, b)), unequal)
+    for v in 0..<shape.variants.len()
+        val fields = shape.variants[v].fields
+        if !has_field_data(fields) then continue
+        val body = new_block(l)
+        val other = new_block(l)
+        finish_into(l, Branch(compare(l, CmpEq, tag, ConstInt(64, v.to_string())), body, other), body)
+        equal_fields(l, field_types(l, t, v), fields, a, b, unequal)
+        finish(l, Return(Some(ConstBool(true))))
+        l.current = other
+    finish(l, Return(Some(ConstBool(true))))
+
+private equal_fields(l: *Lowering, types: Buf[&Type], fields: Buf[Option[FieldSlot]], a: Operand, b: Operand, unequal: usize)
+    for i in 0..<fields.len()
+        if fields[i] is Some(slot)
+            val same = equals_values(l, types[i], load_field(l, a, slot), load_field(l, b, slot))
+            continue_if(l, same, unequal)
+
+// A tuple's or data value's hash combines its variant's tag with its fields' hashes, in order.
+private structural_hash(l: *Lowering, t: &Type, a: Operand)
+    val shape = layout(l, t)
+    if shape.variants.len() == 1
+        finish(l, Return(Some(hash_fields(l, field_types(l, t, 0), shape.variants[0].fields, a, ConstInt(64, "0")))))
+        return
+    val tag = variant_tag(l, a)
+    for v in 0..<shape.variants.len()
+        val fields = shape.variants[v].fields
+        if !has_field_data(fields) then continue
+        val body = new_block(l)
+        val other = new_block(l)
+        finish_into(l, Branch(compare(l, CmpEq, tag, ConstInt(64, v.to_string())), body, other), body)
+        finish(l, Return(Some(hash_fields(l, field_types(l, t, v), fields, a, tag))))
+        l.current = other
+    finish(l, Return(Some(tag)))
+
+private hash_fields(l: *Lowering, types: Buf[&Type], fields: Buf[Option[FieldSlot]], a: Operand, start: Operand) -> Operand
+    var h = start
+    for i in 0..<fields.len()
+        if fields[i] is Some(slot)
+            val part = hash_value(l, types[i], load_field(l, a, slot))
+            h = binary(l, MInt(64), OpAdd, binary(l, MInt(64), OpMul, h, ConstInt(64, "31")), part)
+    h
+
+/** The type record of an object, from its descriptor; null for a string. */
+private object_record(l: *Lowering, object: Operand) -> Operand
+    val descriptor = fresh(l, MPtr)
+    l.insts.push(DescriptorOf(descriptor, object))
+    val address = fresh(l, MPtr)
+    l.insts.push(Offset(address, Value(descriptor), DescriptorRecord))
+    val record = fresh(l, MPtr)
+    l.insts.push(Load(record, Value(address)))
+    Value(record)
+
+/** The record's entry at `offset`, a function's address. */
+private record_entry(l: *Lowering, record: Operand, offset: usize) -> Operand
+    val address = fresh(l, MPtr)
+    l.insts.push(Offset(address, record, offset))
+    val code = fresh(l, MPtr)
+    l.insts.push(Load(code, Value(address)))
+    Value(code)
+
+// Two values of unknown type are equal when they have one type, by that type's own equality: two
+// strings by their bytes, any other type through its record's `equals` entry.
+private any_equals(l: *Lowering, a: Operand, b: Operand)
+    val unequal = new_block(l)
+    l.blocks[unequal].term = Return(Some(ConstBool(false)))
+    val record = object_record(l, a)
+    continue_if(l, compare(l, CmpEq, record, object_record(l, b)), unequal)
+    val strings = new_block(l)
+    val others = new_block(l)
+    finish_into(l, Branch(compare(l, CmpEq, record, NullAddress), strings, others), strings)
+    finish(l, Return(Some(compare_values(l, Equal, Str, a, b))))
+    l.current = others
+    val code = record_entry(l, record, RecordEqualsEntry)
+    val dest = fresh(l, MBool)
+    l.insts.push(Call(Some(dest), Indirect(code, MirSignature(pair(MRef), Some(MBool))), two(a, b)))
+    finish(l, Return(Some(Value(dest))))
+
+private any_hash(l: *Lowering, a: Operand)
+    val record = object_record(l, a)
+    val strings = new_block(l)
+    val others = new_block(l)
+    finish_into(l, Branch(compare(l, CmpEq, record, NullAddress), strings, others), strings)
+    finish(l, Return(Some(runtime_call(l, "avin_rt_string_hash", [MRef], MInt(64), [a]))))
+    l.current = others
+    val code = record_entry(l, record, RecordHashEntry)
+    val dest = fresh(l, MInt(64))
+    l.insts.push(Call(Some(dest), Indirect(code, MirSignature(single(MRef), Some(MInt(64)))), one(a)))
+    finish(l, Return(Some(Value(dest))))
