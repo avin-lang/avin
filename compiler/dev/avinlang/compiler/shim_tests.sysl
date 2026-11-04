@@ -3,7 +3,7 @@ module dev.avinlang.compiler
 
 import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
-import sysl.fs.{make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, write_text}
+import sysl.fs.{exists, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, remove_file, write_text}
 
 // The shims of Sysl bindings: where each binding's part of the generated source is, and the cache of
 // built archives.
@@ -147,6 +147,48 @@ shim_cache()
     // Another binding is another archive.
     val other = compiled("@sysl(\"sysl.text.to_upper\")\nlower(s: string) -> string\n\nmain() = 0\n")
     assert(other.archive.unwrap() != archive)
+
+@test("a shim archive keeps the C libraries it needs beside it, and one cached without them is built again")
+shim_link_needs_kept()
+    val text = "@sysl(\"sysl.text.to_lower\")\nlowerKeepingLibraries(s: string) -> string\n\nmain() = 0\n"
+    val first = compiled(text)
+    assert_eq(first.diagnostics, "")
+    val archive = first.archive.unwrap()
+    val needs = link_needs_file(archive)
+    assert(exists(needs))
+    // The standard library needs the C runtime's mathematics and nothing else.
+    assert_eq(read_text(needs).unwrap(), "lib m\n")
+    remove_file(needs).unwrap()
+    val second = compiled(text)
+    assert_eq(second.archive.unwrap(), archive)
+    assert(exists(needs))
+
+@test("the libraries `sysl build-c` reports an archive needs are kept, `@link` names and pkg-config modules apart")
+link_needs_report()
+    val report = "wrote /x/a.a\nwrote /x/a.a.h\nsysl: link this against: m, sqlite3\nsysl: and against what the packages require, which pkg-config answers for: pkg-config --libs sqlite3 yaml-0.1\nsysl: pass -Wl,-dead_strip when linking, so a library only unreached functions need can be left off\n"
+    assert_eq(link_needs(report), "lib m\nlib sqlite3\npkg sqlite3\npkg yaml-0.1\n")
+    assert_eq(link_needs("wrote /x/a.a\nwrote /x/a.a.h\n"), "")
+    assert_eq(link_needs(""), "")
+
+@test("an archive's libraries are linked with -l, less the C runtime's, and its pkg-config modules with what pkg-config answers")
+link_flags_of_needs()
+    assert_eq(link_flags("").unwrap().len(), 0usize)
+    assert_eq(link_flags("lib m\nlib c\n").unwrap().len(), 0usize)
+    val named = link_flags("lib m\nlib z\nlib c\nlib sqlite3\n").unwrap()
+    assert_eq(named.len(), 2usize)
+    assert_eq(named[0], "-lz")
+    assert_eq(named[1], "-lsqlite3")
+    // The machine is asked for a module's flags, and they follow the libraries named directly.
+    val asked = link_flags("lib z\npkg sqlite3\n").unwrap()
+    assert_eq(asked[0], "-lz")
+    var found = false
+    for flag in asked
+        if flag == "-lsqlite3" then found = true
+    assert(found)
+    // A module the machine does not know stops the link, naming what was asked.
+    link_flags("lib z\npkg avin-no-such-module\n") match
+        Ok(_) -> panic("a module pkg-config does not know was linked")
+        Err(message) -> assert(message.contains("`pkg-config --libs avin-no-such-module`"))
 
 @test("the shim package's manifest names each Sysl package a program's manifests name")
 shim_manifest_sysl_packages()
