@@ -599,6 +599,14 @@ main() = print(s"${circleArea(Circle(2))}")
   import. Importing a name the module does not declare, a private declaration, a name the file's own
   module declares or one another import already brings in is an error; an import the file does not
   use is not.
+- **A module may be imported whole.** `import a.b` binds the module under its last segment and
+  `import a.b as c` under `c`; `b.X` then reaches `a.b`'s public `X`, whatever it is: a type
+  (`b.Point`, in type position too), function, value, object or variant (`b.Some(x)`, in patterns
+  as well). A private `X` or one the module does not declare is an error. The name is the module's
+  alone: a declaration of the file's module or another import under the same name is an error at the
+  import, and a local, parameter or member of the enclosing class named like the module hides it.
+  Importing `a.b` makes only `a.b` reachable, not its submodules; each module named in code is
+  imported.
 - **What a name means** is decided in that order: the file's module, then its imports, then the
   public declarations of the standard library's module `avin`, which every file sees without an
   import. The nearer hides the farther, whatever kind each declaration is. A program's own modules

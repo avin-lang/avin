@@ -387,14 +387,14 @@ end Checked
  * the built-in types belong to it. */
 const CoreModule: string = "avin"
 
-/** The annotation of a core-library function whose traps report the place it is called from. */
-const TrapsAtCaller: string = "trapsAtCaller"
-
 /** What a file sees besides its own module's declarations and the core library's: each name its
  * imports bring in, bound to the qualified name of the declaration it imports. */
 struct FileScope
     module_name: string
     imports: Map[string, string]
+    /** Each module the file imports whole, `import a.b`, bound to the name it is reached by and
+     * holding the module's path. */
+    modules: Map[string, string]
 
 /** The name a declaration `name` of module `module_name` has in the symbol tables: `a.b.name`, or
  * `name` alone in the root module. A declaration's name holds no dot, so two declarations of
@@ -422,6 +422,15 @@ private exported(c: *Checker, key: string) -> bool
  * none exists, the module's own, which no table holds, so the use is reported as unknown. */
 private resolve_name(c: *Checker, unit: usize, name: string) -> string
     val scope = c.files[unit]
+    // `m.X`, with `m` a module the file imports: that module's public `X`, else nothing.
+    var dot: Option[usize] = None
+    for k in 0..<name.bytes.len
+        if dot is None && name.bytes[k] == u8('.') then dot = Some(k)
+    if dot is Some(k)
+        if scope.modules.get(name[0..<k]) is Some(module_path)
+            val key = qualified(module_path, name[k + 1..])
+            if declared(c, key) && exported(c, key) then return key
+        return name
     val own = qualified(scope.module_name, name)
     if declared(c, own) then return own
     if scope.imports.get(name) is Some(key) then return key
@@ -434,7 +443,13 @@ private file_scope(c: *Checker, unit: usize) -> FileScope
     var imports: Map[string, string] = map()
     for i in file.imports
         if imports.get(i.binding) is None then imports.put(i.binding, i.path)
-    FileScope(file.module_name, imports)
+    FileScope(file.module_name, imports, map())
+
+// What an earlier import bound a name to, a declaration or a module, or "" when none did.
+private imported_from(kept: Map[string, string], mods: Map[string, string], binding: string) -> string
+    if kept.get(binding) is Some(earlier) then return earlier
+    if mods.get(binding) is Some(earlier) then return earlier
+    ""
 
 private module_exists(c: *Checker, name: string) -> bool
     for f in c.files
@@ -448,7 +463,21 @@ private check_imports(c: *Checker, unit: usize)
     val file = c.units[unit].file
     val own = file.module_name
     var kept: Map[string, string] = map()
+    var mods: Map[string, string] = map()
     for i in file.imports
+        // A whole module, `import a.b`, is reached by its binding: `b.X`.
+        var dotted = false
+        for k in 0..<i.path.bytes.len
+            if i.path.bytes[k] == u8('.') then dotted = true
+        if module_exists(c, i.path) && !(dotted && declared(c, i.path))
+            if i.path == own
+                c.note(unit, i.span, s"`${i.path}` is this file's own module")
+            elif declared(c, qualified(own, i.binding))
+                c.note(unit, i.span, s"`${i.binding}` is a module and also declared in this module")
+            elif imported_from(kept, mods, i.binding) != ""
+                c.note(unit, i.span, s"`${i.binding}` is already imported, from `${imported_from(kept, mods, i.binding)}`")
+            else mods.put(i.binding, i.path)
+            continue
         var dot: Option[usize] = None
         for k in 0..<i.path.bytes.len
             if i.path.bytes[k] == u8('.') then dot = Some(k)
@@ -486,11 +515,12 @@ private check_imports(c: *Checker, unit: usize)
             elif data_companion then c.note(unit, i.span, s"`${i.binding}` is a data type of module `$module_name`; its companion object is declared in the type's own module")
             else c.note(unit, i.span, s"`${i.binding}` is imported and also declared in this module")
             continue
-        if kept.get(i.binding) is Some(earlier)
-            c.note(unit, i.span, s"`${i.binding}` is already imported, from `$earlier`")
+        if imported_from(kept, mods, i.binding) != ""
+            c.note(unit, i.span, s"`${i.binding}` is already imported, from `${imported_from(kept, mods, i.binding)}`")
             continue
         kept.put(i.binding, i.path)
     c.files[unit].imports = kept
+    c.files[unit].modules = mods
 
 /** Checks a program: the core library's units, then the program's own, each heading its module's
  * name in `file.module_name`. `root_module` is the module that must declare `main`, and the last
@@ -1471,10 +1501,9 @@ private declare_methods(c: *Checker, unit: usize)
             val public = entry.public
             val overrides = entry.overrides
             val file_unit = entry.unit
-            // The core library's array classes declare their element operations as intrinsics, and
-            // its methods may trap at their callers.
+            // The core library's array classes declare their element operations as intrinsics.
             val intrinsic_method = is_array_storage(c.classes[id]) && f.annotations.len() > 0
-            if f.annotations.len() > 0 && !intrinsic_method && !only_traps_at_caller(f) then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
+            if f.annotations.len() > 0 && !intrinsic_method then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
             if overrides then refuse_override_defaults(c, file_unit, f)
             if is_trait(c, id)
                 if !public
@@ -1577,10 +1606,9 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
             _ -> None
         None -> None
     // A built-in type's operations are intrinsics, so its impls may declare them; no other method
-    // takes an annotation but the core library's `@trapsAtCaller`.
+    // takes an annotation.
     val builtin = !(*target is Data(_, _, _))
     for a in f.annotations
-        if a.name == TrapsAtCaller then continue
         if a.name != "intrinsic" || !builtin || trait_id is Some(_)
             c.note(unit, f.name_span, "annotations on methods are not implemented")
             break
@@ -3015,16 +3043,10 @@ private declare_defaults(c: *Checker, id: usize)
 
 // `@intrinsic("name")` and `@sysl("path")` are the annotations this compiler gives meaning to; each
 // is valid only on a function without a body. This reads the first; `sysl_binding_of` the second.
-// The core library's `@trapsAtCaller` marks a function whose traps report the place it is called
-// from, as an operation of the language does.
 private intrinsic_of(c: *Checker, unit: usize, f: &Function) -> Option[string]
     var out: Option[string] = None
     for a in f.annotations
         if a.name == "sysl" then continue
-        if a.name == TrapsAtCaller
-            if c.units[unit].file.module_name != CoreModule then c.note(unit, a.span, s"`@$TrapsAtCaller` is for the core library's operations")
-            elif a.args.len() != 0 then c.note(unit, a.span, s"`@$TrapsAtCaller` takes no arguments")
-            continue
         if a.name != "intrinsic"
             c.note(unit, a.span, s"unknown annotation `@${a.name}`")
             continue
@@ -3953,6 +3975,25 @@ private lookup_function(c: *Checker, name: string) -> Option[usize]
     val ids = lookup_functions(c, name)
     if ids.len() == 0 then None else Some(ids[0])
 
+// `m.X` where `m` is a module the file imports whole and no local, parameter, local function or
+// member of the enclosing class hides it: the declaration `X` of that module, written as the name
+// `m.X`. A module without a public `X` is reported, and the use is left invalid.
+private module_use(c: *Checker, e: &Expr) -> Option[&Expr]
+    val unit = unit_of(c)
+    if e.kind is Member(target, name)
+        if target.kind is Name(m)
+            if lookup_local(c, m) is Some(_) || param_index(c, m) is Some(_) || class_member(c, m) is Some(_) || local_function(c, m) is Some(_) then return None
+            if c.files[unit].modules.get(m) is Some(module_path)
+                val key = qualified(module_path, name)
+                if !declared(c, key)
+                    c.note(unit, e.span, s"module `$module_path` declares no `$name`")
+                    return Some(Expr(e.span, Invalid))
+                if !exported(c, key)
+                    c.note(unit, e.span, s"`$name` is private to module `$module_path`")
+                    return Some(Expr(e.span, Invalid))
+                return Some(Expr(e.span, Name(m + "." + name)))
+    None
+
 private local_function(c: *Checker, name: string) -> Option[usize]
     var i = c.body.functions.len()
     while i > 0
@@ -4117,7 +4158,9 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     UnitLit -> TExpr(e.span, Unit, UnitConst)
     Name(name) -> name_expr(c, e.span, name, expected)
     TypeApply(target, types) -> type_apply(c, e, target, types, expected)
-    Member(target, name) -> member_expr(c, e, target, name, expected)
+    Member(target, name) ->
+        if module_use(c, e) is Some(q) then check_form(c, q, expected, used)
+        else member_expr(c, e, target, name, expected)
     Call(callee, args) -> call_expr(c, e.span, callee, args, expected)
     InfixCall(target, name, name_span, arg) -> infix_call(c, e.span, target, name, name_span, arg, expected)
     Block(items, discard) -> block_expr(c, e, items, discard, expected, used)
@@ -4448,6 +4491,7 @@ private evaluated(t: &TExpr) -> &TExpr = *t.ty match
 // Type arguments written on a name that is not called: a function or a method used as a value, or a
 // variant with no fields, as in `None[int]`.
 private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], expected: Option[&Type]) -> &TExpr
+    if module_use(c, target) is Some(q) then return type_apply(c, e, q, types, expected)
     if target.kind is Name(name)
         // A method of the enclosing class by bare name, bound to `self`, as in `convert[int]`.
         if lookup_local(c, name) is None && param_index(c, name) is None
@@ -6126,12 +6170,6 @@ is_array_class(k: ClassSymbol) -> bool = k.module_name == CoreModule && k.name =
 private is_array_storage(k: ClassSymbol) -> bool =
     k.module_name == CoreModule && (k.name == "Array" || k.name == "FrozenArray") && !k.decl.object
 
-/** Whether every annotation of `f` is `@trapsAtCaller`. */
-private only_traps_at_caller(f: &Function) -> bool
-    for a in f.annotations
-        if a.name != TrapsAtCaller then return false
-    true
-
 private is_array_type(c: *Checker, t: &Type) -> bool = *t match
     Class(k, _, _) -> is_array_class(c.classes[k])
     _ -> false
@@ -6243,6 +6281,9 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
     if callee.kind is TypeApply(inner, types)
         explicit = Some(types)
         named = inner
+    if module_use(c, named) is Some(q)
+        if explicit is Some(types) then return call_expr(c, at, Expr(callee.span, TypeApply(q, types)), args, expected)
+        return call_expr(c, at, q, args, expected)
     if named.kind is Member(target, member) then return member_call(c, at, callee, named.span, target, member, args, explicit, expected, false)
     val name = named.kind match
         Name(n) -> n

@@ -336,6 +336,21 @@ share a block and two operations never do; the instances of a generic function s
 runtime flushes what the program has written to standard output first, so no output is lost, then
 writes the message and stops.
 
+A trap inside the core library reports the program's own call instead, through the context's
+**caller site**, a word at offset 24 holding the address of a trap site. Code generated for the
+program's functions sets it, before each call that may enter the library, to a site with no reason
+at the call's start: a direct call of a library function, or any call through a method table or a
+function value, which may reach the library. A call between two of the program's functions sets
+nothing, and no function takes a parameter for it. The library's functions, and the functions
+lowering makes, never set it; around each call that may run the program's code (a call of a
+function of the program's, through a method table or of a function value) they read it before and
+write it back after, since the program's code may enter the library again and move it. A trap in
+the library's code, a `fail` or a failed check alike, ends in `avin_rt_caller_trap`, which reports
+the reason of the library's own site at the place the caller site holds; before the program has
+entered the library at all, the caller site is null and the library's own place is reported. The
+function that initializes the module-level values counts as the library's: each value is computed
+by a function of its own, which is the program's.
+
 Programs are multi-threaded, so the runtime keeps no per-thread state in globals. Each thread has a
 **context**, and every compiled function, closure entry and runtime entry point takes the running
 thread's context as a hidden first argument. A function that holds references links its frame of
@@ -438,19 +453,15 @@ length; only `Array.fill`, `tabulate` and `empty` call it, and they set every el
 array is seen. `avin_rt_array_slice` copies a range of elements into a new array of the same
 descriptor. `xs(i)` on a value whose type has an `apply` method calls it; `xs(i) = v` is checked as
 `xs.update(i, v)`, and the compound and yielding forms hold `xs` and the indices in hidden locals.
-A private intrinsic `fail(reason)`, of type `Nothing`, traps with a literal reason at its call;
-`Range` and the library's iterators use it.
+A private intrinsic `fail(reason)`, of type `Nothing`, traps with a literal reason; `Range` and the
+library's iterators use it. Being the library's code, it reports the program's call that entered
+the library (the caller site above).
 
 `FrozenArray[+T]`, private to the core library, is an array seen through a type that only reads it
 (`is_array_storage`): its `length`, `apply` and `slice` are the array intrinsics, and
 `freeze(a)` (`array_freeze`) is the array itself, so a `Vector` keeps its elements unboxed with no
 copy and stays covariant. `clearElements` (`array_clear`, `avin_rt_array_clear`) zeroes a range, so
-a buffer's vacated capacity keeps nothing alive. A core-library function marked **`@trapsAtCaller`**
-is lowered once per place it is called from directly: `called_instance` keys the instance by the
-call's unit and offset (passed on from a copy that is itself such a call), `Instance.caller` and
-`Lowering.caller` hold it, and `trap_site` reports every trap of that copy, its inlined array checks
-and `fail` calls included, at the call. A call through a method table or a function value reaches
-the ordinary copy, which reports the library's line.
+a buffer's vacated capacity keeps nothing alive.
 
 **Sequence literals** (`sequence_literal` in `check.sysl`) are checked against the expected type. A
 `List` is built as `::` chains (`list_literal`). Otherwise the collection is the expected class
