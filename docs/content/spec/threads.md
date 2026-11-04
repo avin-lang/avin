@@ -1,18 +1,15 @@
 ---
 title: Threads
-summary: A proposal for starting and joining threads, what they share, how they synchronize, and what a racing read sees.
+summary: Starting and joining threads, what they share, how they synchronize, and what a racing read sees.
 weight: 16
 ---
 
-**This chapter is a proposal, awaiting the user's decision** (see [decisions](/spec/decisions/)).
-The runtime machinery it rests on exists: contexts attached per thread, an allocation lock,
-safepoints and stop-the-world collection ([the runtime](/compiler/#runtime)). No thread API is
-exposed to programs yet.
+Avin programs run threads in parallel over one shared, collected heap.
 
 ## Starting and joining
 
-Threads are library code in `avin.threads`, over two runtime entries that make and retire a thread's
-context. A thread runs a closure and is joined for its result:
+Threads are library code in `avin.threads`, over runtime entries that start a thread with a context
+of its own and wait for it to finish. A thread runs a closure and is joined for its result:
 
 ```avin
 import avin.threads.spawn
@@ -25,12 +22,32 @@ main() -> int
 
 - `spawn[T](body: () -> T, stack: long = 8388608) -> Thread[T]` starts `body` on a new operating
   system thread with a stack of its own (8 MiB unless asked otherwise). `join() -> T` waits for it
-  and gives back the result; joining a second time gives the same result again.
+  and gives back the result; joining a second time gives the same result again. Any thread may
+  join, several at once: one waits for the thread and the others wait for that one. A `Thread` is
+  collected like any other object once nothing reaches it; a thread that is never joined keeps its
+  stack until the program ends.
 - **A trap in any thread stops the program**, as it does in a program with one thread: traps report
-  bugs, and a bug in one thread leaves the state the others share in doubt.
-- **The program ends when `main` returns**, whatever other threads are still running. A library
-  scope makes the joins structural: `scope(s -> …)` returns only once every thread started through
-  `s.spawn` has finished.
+  bugs, and a bug in one thread leaves the state the others share in doubt. Only the first thread to
+  stop the program reports: what was written is flushed once and one reason is printed, and a
+  thread that traps after it, or calls `exit`, waits for the end.
+- **The program ends when `main` returns**, whatever other threads are still running: standard
+  output is flushed and the process exits with `main`'s status, taking the other threads with it.
+- A library scope makes the joins structural: `scope(s -> …)` returns its body's result only once
+  every thread started through `s.spawn` has finished. `s.spawn` takes the same arguments as
+  `spawn` and is called by the thread that runs the scope's body, while the scope is open; a call
+  from another thread, or after the scope has returned, traps. A thread the scope started that
+  starts more uses a scope of its own.
+
+```avin
+import avin.threads.scope
+
+main() -> int
+    val parts = Array.fill(4, 0)
+    scope(s ->
+        for i in 0..<4
+            s.spawn(() -> parts(i) = (i + 1) * 10))
+    parts(0) + parts(1) + parts(2) + parts(3)
+```
 
 ## What is shared
 

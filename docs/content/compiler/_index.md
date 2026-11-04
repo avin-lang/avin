@@ -490,6 +490,29 @@ a context's state by its thread, so either the thread sees the flag and wakes th
 collector sees the thread safe. With one context attached the flag is never raised, so a program
 with one thread takes no poll's slow path and makes no system call for a collection.
 
+**Starting a thread.** `avin.threads` reaches three intrinsics. `thread_start` calls
+`avin_rt_thread_start` with a closure taking nothing and returning nothing, which stores the body's
+result where the `Thread` reads it, and the stack size. The entry makes the new thread's context
+before the thread exists, with a frame of two slots at the bottom of its stack: the closure, and the
+thread's *joint*, the object it is joined by, allocated on the collected heap. That frame is linked
+onto the calling thread's own stack while the joint is allocated and the lock is awaited, then moved
+to the new context, which is attached, safe, before the operating system thread is started with the
+requested stack. So the closure is a root at every moment from the call to the thread's end. The
+new thread marks its context running, calls the closure's entry (the word before its descriptor)
+with its context and the closure, and detaches and frees its context when the closure returns.
+`thread_join` calls `avin_rt_thread_join`, which waits safe for the operating system thread under the
+joint's own lock, so of several joins one waits for the thread and the rest for it, and a later join
+returns at once; the joint, and with it the thread's handle, is collected once nothing reaches the
+`Thread`. `thread_current` answers the calling context's address, which the scope compares with
+its owner's.
+
+**Ending the program.** A trap, a failed allocation and `exit` begin by taking a lock that is never
+given back: the first thread to take it flushes standard output, reports and stops the process, and
+any other waits safe for the end, so a program stops once with one report however many threads fail.
+A trap ends the process with the trap signal from whichever thread raises it. When `main` returns,
+the entry's `main` returns its status to the C library, whose exit flushes standard output and ends
+the process with every other thread in it.
+
 ## Standard library
 
 `library/` holds Avin source under the module root `avin`, starting with the prelude every program
