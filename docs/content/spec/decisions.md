@@ -314,8 +314,8 @@ a decision changes, this page and the chapter change together.
 - A `for` with `yield` is comprehension sugar over `map`, `flatMap` and filtering; a `for` without
   `yield` loops over the source's iterator.
 - The collection hierarchy is rooted at `Iterable`, and `Iterator` is itself `Iterable`.
-- `print` and `println` are ordinary library functions (settled 2026-11-04). Both render with `Display` and
-  separate several arguments with `, `, which is not a tuple; `println` ends with a newline and `print`
+- `print` and `println` are ordinary library functions (settled 2026-11-04). Both take any value, shown as
+  interpolation shows an `Any` (below), and separate several arguments with `, `, which is not a tuple; `println` ends with a newline and `print`
   does not. `print()` writes nothing and `println()` writes a bare newline; `eprint` and `eprintln` are
   the same for standard error. `println(debug(x))` selects `Debug`.
 - `debug(x)` yields `x`'s `Debug` form as a string. `Writer` writes strings (with `writeChar`,
@@ -328,8 +328,15 @@ a decision changes, this page and the chapter change together.
   as the vector it holds. It does not convert to `Display` or `Debug` as a value, so a value of either
   trait holds only objects that implement it, and is still shown through its method table. A type with no implementation of its own renders as its name (`Cat`,
   `Box[int]`; a function value `<function>`), never an address. Static types keep their rule: a
-  class or data type needs its own `Display`, a type parameter its bound's. A trait takes no impl of
-  `Display` or `Debug`: its values are shown by their own types, which keeps one rule.
+  class or data type needs its own `Display` to meet the bound or be interpolated, a type parameter
+  its bound's. A trait takes no impl of `Display` or `Debug`: its values are shown by their own types,
+  which keeps one rule.
+- Settled 2026-11-04 (user): `print`, `println`, `eprint` and `eprintln` take any value, in their
+  one-argument and several-argument forms alike, each parameter an `Any`: `println(1, pet, xs)` with
+  `pet: Pet` and `xs: Seq[int]`, a function value and a class with no `Display` all print, each shown
+  as that `Any` is in an interpolated string (by its type's own `Display`, or its name). A number,
+  `char`, `bool` or `unit` argument is boxed to be passed, as at any `Any` parameter; a string or an
+  object is not.
 - A built-in type conforms to a trait through an impl and implements every method of the trait,
   since a trait's default bodies are shared by objects and a built-in value is not one.
 - A variant's fields take defaults, each a function of the fields before it, as a constructor's

@@ -147,7 +147,8 @@ a vector prints `[1, 2, 3]`, as the vector would, and a `Vector[Seq[int]]` print
 `[[1, 2, 3], [4]]`. A type with no `Display` (or no `Debug`) of its own renders as its name, `Cat` or
 `Box[int]`, and a function value as `<function>`, in the field the spec describes. The rule is for
 values whose type is decided at run time only: a value whose static type is a class or a data type
-still needs that type's own `Display`, and a type parameter its bound's. No impl gives a trait a
+still needs that type's own `Display` to be interpolated, and a type parameter its bound's (`print`
+and `println` take their arguments as `Any`, so they show such a value by its name). No impl gives a trait a
 `Display` of its own; its values are always shown by their own types.
 
 ```avin
@@ -199,11 +200,15 @@ trait Debug
 - `toString()` renders into a `StringWriter`, a writer building a string, and returns its `text()`.
   `StandardOutput` is the writer for standard output; it writes an integer's digits without making
   a string of them. `StandardError` is the writer for standard error, which keeps no buffer.
-- `print(x)` writes `x`'s `Display` form to standard output with no new line; `println(x)` writes it
-  and a new line. `print()` writes nothing and `println()` writes just a new line. `eprint` and
-  `eprintln` are the same for standard error, each a single write, so a line is never split by another
-  writer's. Given several values, of any types that implement `Display`, each writes them separated
-  by `, ` (they are not a tuple): `println("total", 3, (1, 2))` writes `total, 3, (1, 2)`. `debug(x)` is `x`'s
+- `print(x)` writes `x` to standard output with no new line; `println(x)` writes it and a new line.
+  Each takes a value of any type, as an `Any`, and shows it as that `Any` is shown in an interpolated
+  string: by its type's own `Display`, or by the type's name for a type with none, so `println(pet)`
+  with `pet: Pet`, `println(xs)` with `xs: Seq[int]` and `println(Cat())` for a class with no
+  `Display` all print, the last as `Cat`, and a function value as `<function>`. `print()` writes
+  nothing and `println()` writes just a new line. `eprint` and `eprintln` are the same for standard
+  error, each a single write, so a line is never split by another writer's. Given several values, of
+  any types, each writes them separated by `, ` (they are not a tuple): `println("total", 3, (1, 2))`
+  writes `total, 3, (1, 2)`, and `println(1, pet, xs)` writes `1, Cat, [1, 2, 3]`. `debug(x)` is `x`'s
   `Debug` form as a string, so `println(debug(x))` prints it. Inside an implementation of `Debug`, the
   bare name `debug` is the method, and a part is written with `part.debug(out, spec)`.
 - The built-in types' `Debug` forms are their `Display` forms, except that a string and a `char`
