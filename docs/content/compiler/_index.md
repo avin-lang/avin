@@ -605,8 +605,16 @@ collection since. A function with no reference live across a collection point ha
 all, so a leaf that only reads fields, or one whose branches only read fields and trap, pushes
 nothing.
 
-Threads share the heap, and one lock serializes allocation, collection and changes to the list of
-contexts; the collector itself runs single-threaded. **A collection stops the world.** Each context
+Threads share the heap, and one lock serializes claiming memory, collection and changes to the list
+of contexts; the collector itself runs single-threaded. **Each thread allocates from a chunk of its
+own.** A context holds a chunk of the heap (the collector's thread-local allocation chunks, from
+the gc 0.3.1 release), and a small object is carved from it with no lock and no atomic operation.
+A thread takes the lock only to claim a fresh chunk when its own is spent, or for an object too
+large for any chunk. The collection budget counts a chunk whole from the moment it is claimed, a
+thread that detaches retires its chunk, and a collection retires the chunk of every context while
+the world is stopped, so the next allocation of each thread claims a fresh one. Threads that
+allocate therefore scale with their number rather than queueing on the lock. **A collection stops
+the world.** Each context
 is either *running*, when its thread may touch references, or *safe*, when its frames hold every
 reference it still needs and it touches none until it is running again. The collecting thread,
 holding the lock, raises the flag `avin_rt_requested`, waits until every other attached context is
@@ -626,9 +634,9 @@ safe, collects, lowers the flag and wakes the others. A thread becomes safe in t
   `avin_rt_safepoint`, which is declared cold and laid out of line; the thread parks there until the
   collection is over. Every reference live across a poll is already in a frame where the poll is
   placed.
-- **Waiting for the lock.** Allocation takes the lock with one compare-and-swap when it is free; a
-  thread that has to wait for it waits safe, since the holder may be collecting. Allocation is
-  therefore a safepoint.
+- **Waiting for the lock.** Claiming a chunk takes the lock with one compare-and-swap when it is
+  free; a thread that has to wait for it waits safe, since the holder may be collecting. An
+  allocation the thread's chunk cannot serve is therefore a safepoint.
 - **Around a blocking call.** `avin_rt_enter_safe` and `avin_rt_leave_safe` bracket an operation
   that may wait (a lock, a condition, a channel, a join, reading input), so a blocked thread never
   holds up a collection; leaving waits for a collection in progress to finish.
