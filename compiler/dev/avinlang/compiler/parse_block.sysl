@@ -147,49 +147,42 @@ parse_while(p: *Parser, at: Span) -> &Expr
     Expr(at.to(p.ended()), While(condition, body, otherwise))
 
 // `for pattern in source` and an indented body, or `for pattern in source do body` on one line.
-// With `yield`, a comprehension: generators separated by commas, each followed by its `if` guards,
-// or written one to a line in an indented block after `for`, with `yield` on the line after it.
+// With `yield`, a comprehension: generators and value definitions separated by commas, each followed
+// by its `if` guards, or written one to a line in an indented block after `for`, with `yield` on the
+// line after it.
 parse_for(p: *Parser, at: Span) -> &Expr
-    var generators: Buf[Generator] = buf()
+    var clauses: Buf[Clause] = buf()
     if p.accept_kind(Indent)
-        // A line starting with `if` adds guards to the generator above it.
-        var guards: Buf[&Expr] = buf()
-        var start = p.toks.here()
-        var pattern: Option[&Pattern] = None
-        var source: &Expr = Expr(start, Invalid)
+        // A line starting with `if` adds guards to the clause above it.
         loop
             if p.toks.at_end() || p.accept_kind(Dedent) then break
             if p.accept_kind(Newline) then continue
             val before = p.toks.position
-            if p.at("if") && pattern is Some(_)
-                guards_after(p, &guards)
-            else
-                if pattern is Some(shape) then generators.push(generator_of(start, shape, source, guards))
-                guards = buf()
-                start = p.toks.here()
-                pattern = Some(parse_pattern(p))
-                p.expect("in")
-                source = header_expression(p)
-                guards_after(p, &guards)
+            if p.at("if") && clauses.len() > 0 then guards_after(p, &clauses) else clause(p, &clauses)
             if p.toks.position == before then break
-        pattern match
-            Some(shape) -> generators.push(generator_of(start, shape, source, guards))
-            None -> generators.push(generator(p))
+        if clauses.len() == 0 then clause(p, &clauses)
         if !following(p, "yield")
             p.report.add(error(p.toks.here(), "generators written in a block after `for` need `yield` on the line after them"))
             return Expr(at.to(p.ended()), Invalid)
     else
-        generators.push(generator(p))
-        while p.accept(",")
-            generators.push(generator(p))
+        clause(p, &clauses)
+        while p.accept(",") do clause(p, &clauses)
+    val generators = grouped(p, clauses)
     if p.accept("yield")
         val indented = p.at_kind(Indent)
         val body = parse_line_body(p, false)
         optional_end(p, "for", indented)
+        if generators.len() == 0 then return Expr(at.to(p.ended()), Invalid)
         return Expr(at.to(p.ended()), ForYield(generators, body))
+    if generators.len() == 0
+        p.accept("do")
+        parse_body(p, true)
+        return Expr(at.to(p.ended()), Invalid)
     val first = generators[0]
     if generators.len() > 1 || first.guards.len() > 0
         p.report.add(error(first.span.to(generators[generators.len() - 1].span), "a `for` without `yield` has one generator and no guards; nest the loops, or test in the body"))
+    else if first.definitions.len() > 0
+        p.report.add(error(first.definitions[0].span, "a value definition between generators needs `yield`; a `for` without it binds the value in its body"))
     val do_word = p.accept("do")
     val indented = p.at_kind(Indent)
     if !do_word && !indented then p.report.add(error(p.toks.here(), "a one-line `for` needs `do`"))
@@ -197,23 +190,107 @@ parse_for(p: *Parser, at: Span) -> &Expr
     optional_end(p, "for", indented)
     Expr(at.to(p.ended()), For(first.pattern, first.source, body))
 
-// `pattern in source` and the `if` guards after it.
-private generator(p: *Parser) -> Generator
+/** A comprehension's clauses as they are written, before they are grouped into generators. */
+private enum Clause
+    /** `pattern in source`. */
+    GeneratorClause(start: Span, pattern: &Pattern, source: &Expr)
+    /** `pattern = value`. */
+    DefinitionClause(start: Span, pattern: &Pattern, value: &Expr)
+    GuardClause(condition: &Expr)
+
+// `pattern in source` or `pattern = value`, and the `if` guards after it.
+private clause(p: *Parser, clauses: *Buf[Clause])
     val start = p.toks.here()
     val pattern = parse_pattern(p)
-    p.expect("in")
-    val source = header_expression(p)
+    if p.accept("=")
+        clauses.push(DefinitionClause(start, pattern, header_expression(p)))
+    else
+        p.expect("in")
+        clauses.push(GeneratorClause(start, pattern, header_expression(p)))
+    guards_after(p, clauses)
+
+private guards_after(p: *Parser, clauses: *Buf[Clause])
+    while p.accept("if") do clauses.push(GuardClause(header_expression(p)))
+
+// Each generator takes the guards after it and the value definitions after them, each definition
+// the guards after it. A comprehension starts with a generator.
+private grouped(p: *Parser, clauses: Buf[Clause]) -> Buf[Generator]
+    var generators: Buf[Generator] = buf()
+    var i = 0
+    while i < clauses.len()
+        val (start, pattern, source) = clauses[i] match
+            GeneratorClause(s, pat, src) -> (s, pat, src)
+            DefinitionClause(s, pat, _) ->
+                p.report.add(error(s.to(pat.span), "a `for` starts with a generator, `pattern in source`; a value definition follows one"))
+                i += 1
+                continue
+            GuardClause(_) ->
+                i += 1
+                continue
+        i += 1
+        val guards = guards_from(clauses, &i)
+        var definitions: Buf[GeneratorDefinition] = buf()
+        // A definition binds in the generator's scope, as a `val` in a block does, so it binds only
+        // new names; one that rebinds a name is reported and left out.
+        var names: Buf[string] = buf()
+        pattern_names(pattern, &names)
+        while i < clauses.len()
+            val (d_start, d_pattern, value) = clauses[i] match
+                DefinitionClause(s, pat, v) -> (s, pat, v)
+                _ -> break
+            i += 1
+            val d_guards = guards_from(clauses, &i)
+            var bound: Buf[string] = buf()
+            pattern_names(d_pattern, &bound)
+            var fresh = true
+            for name in bound
+                if fresh && holds(names, name)
+                    p.report.add(error(d_pattern.span, s"`$name` is already bound in this `for`, by the generator before it or a definition after that generator; a value definition binds a new name"))
+                    fresh = false
+                names.push(name)
+            if fresh then definitions.push(GeneratorDefinition(start_to_end(d_start, value, d_guards), d_pattern, value, d_guards))
+        generators.push(Generator(start_to_end(start, source, guards), pattern, source, guards, definitions))
+    generators
+
+// The guards from clause `i` on, leaving `i` after them.
+private guards_from(clauses: Buf[Clause], i: *usize) -> Buf[&Expr]
     var guards: Buf[&Expr] = buf()
-    guards_after(p, &guards)
-    generator_of(start, pattern, source, guards)
+    while *i < clauses.len()
+        clauses[*i] match
+            GuardClause(condition) -> guards.push(condition)
+            _ -> break
+        *i += 1
+    guards
 
-// A generator spans from its pattern through its last guard.
-private generator_of(start: Span, pattern: &Pattern, source: &Expr, guards: Buf[&Expr]) -> Generator
-    val end = if guards.len() > 0 then guards[guards.len() - 1].span else source.span
-    Generator(start.to(end), pattern, source, guards)
+private holds(names: Buf[string], name: string) -> bool
+    for n in names
+        if n == name then return true
+    false
 
-private guards_after(p: *Parser, guards: *Buf[&Expr])
-    while p.accept("if") do guards.push(header_expression(p))
+// The names `pattern` binds, in order, `_` left out.
+private pattern_names(pattern: &Pattern, names: *Buf[string])
+    pattern.kind match
+        Name(n) -> if n != "_" then names.push(n)
+        Named(n, inner) ->
+            names.push(n)
+            pattern_names(inner, names)
+        Constructor(_, args) -> for a in args do pattern_names(a, names)
+        Tuple(items) -> for a in items do pattern_names(a, names)
+        Sequence(items) -> for a in items do pattern_names(a, names)
+        Cons(head, tail) ->
+            pattern_names(head, names)
+            pattern_names(tail, names)
+        Successor(binder, _) -> pattern_names(binder, names)
+        Bounded(binder, _, _) -> pattern_names(binder, names)
+        Typed(binder, _) -> pattern_names(binder, names)
+        // Every alternative binds the same names.
+        Alternatives(options) -> if options.len() > 0 then pattern_names(options[0], names)
+        _ -> ()
+
+// A generator or a definition spans from its pattern through its last guard.
+private start_to_end(start: Span, value: &Expr, guards: Buf[&Expr]) -> Span
+    val end = if guards.len() > 0 then guards[guards.len() - 1].span else value.span
+    start.to(end)
 
 // `loop` and an indented body, or `loop do body` on one line; only `break` or `return` leaves it.
 parse_loop(p: *Parser, at: Span) -> &Expr

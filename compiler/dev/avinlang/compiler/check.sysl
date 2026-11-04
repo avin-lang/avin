@@ -5980,7 +5980,7 @@ private comprehension_part(symbol: FunctionSymbol) -> bool =
     symbol.lambda && symbol.param_names.len() == 1 && (symbol.param_names[0].starts_with("yield guard ") || symbol.param_names[0].starts_with("yield item "))
 
 private comprehension_exit(word: string) -> string =
-    s"`$word` cannot leave a `for` with `yield`, whose guards and yielded value are functions passed to its sources' methods"
+    s"`$word` cannot leave a `for` with `yield`, whose guards, value definitions and yielded value are functions passed to its sources' methods"
 
 /** Checks an expression whose value is used. */
 check_expr(c: *Checker, e: &Expr, expected: Option[&Type]) -> &TExpr = check_value(c, e, expected, true)
@@ -8046,6 +8046,11 @@ private for_expr(c: *Checker, e: &Expr, pattern: &Pattern, source: &Expr, body: 
 // passed to `map` with the yielded value, and every earlier generator's to `flatMap` with the rest
 // of the comprehension, whose sources are evaluated anew for each element. The pattern binds each
 // element in every function made of it, a guard's as well as the one after it.
+//
+// A value definition after a generator is evaluated once for each element that reaches it. One that
+// a guard follows, and every one before it, pairs each element with its value through `map`, so the
+// guard and everything after it take the pair apart; the definitions after the last guarded one are
+// bound in the function the elements are passed to, beside the element, as `val`s in one block.
 private for_yield_expr(c: *Checker, e: &Expr, generators: Buf[Generator], body: &Expr, expected: Option[&Type]) -> &TExpr
     val g = generators[0]
     val item = s"yield item ${g.span.start}"
@@ -8055,18 +8060,41 @@ private for_yield_expr(c: *Checker, e: &Expr, generators: Buf[Generator], body: 
         for i in 1 ..< generators.len() do later.push(generators[i])
         rest = Expr(later[0].span.to(e.span), ForYield(later, body))
     var source = check_expr(c, g.source, None)
+    var pattern = g.pattern
     // A guard's function is named apart, so a diagnostic about its result names the guard.
     for guard in g.guards
-        source = comprehension_call(c, g.span, g.source.span, source, "withFilter", element_function(g.pattern, s"yield guard ${g.span.start}", guard), None)
+        source = comprehension_call(c, g.span, g.source.span, source, "withFilter", element_function(pattern, s"yield guard ${g.span.start}", buf(), guard), None)
+    var paired = 0
+    for i in 0 ..< g.definitions.len()
+        if g.definitions[i].guards.len() > 0 then paired = i + 1
+    for i in 0 ..< paired
+        val d = g.definitions[i]
+        val pair = s"yield pair ${d.span.start}"
+        var parts: Buf[&Expr] = buf()
+        parts.push(name_at(d.span, pair))
+        parts.push(d.value)
+        source = comprehension_call(c, d.span, g.source.span, source, "map", element_function(pattern, pair, buf(), Expr(d.value.span, Tuple(parts))), None)
+        var shapes: Buf[&Pattern] = buf()
+        shapes.push(pattern)
+        shapes.push(d.pattern)
+        pattern = Pattern(g.pattern.span.to(d.pattern.span), Tuple(shapes))
+        for guard in d.guards
+            source = comprehension_call(c, d.span, g.source.span, source, "withFilter", element_function(pattern, s"yield guard ${d.span.start}", buf(), guard), None)
+    var definitions: Buf[&Expr] = buf()
+    for i in paired ..< g.definitions.len()
+        val d = g.definitions[i]
+        definitions.push(element_binding(d.pattern, d.value))
     val name = if generators.len() > 1 then "flatMap" else "map"
-    comprehension_call(c, e.span, g.source.span, source, name, element_function(g.pattern, item, rest), expected)
+    comprehension_call(c, e.span, g.source.span, source, name, element_function(pattern, item, definitions, rest), expected)
 
-/** The function of one element that binds it by `pattern` and yields `body`. */
-private element_function(pattern: &Pattern, item: string, body: &Expr) -> &Expr
+/** The function of one element that binds it by `pattern`, then each of `definitions`, and yields
+ * `body`. */
+private element_function(pattern: &Pattern, item: string, definitions: Buf[&Expr], body: &Expr) -> &Expr
     var params: Buf[LambdaParam] = buf()
     params.push(LambdaParam(pattern.span, item, None))
     var items: Buf[&Expr] = buf()
     items.push(element_binding(pattern, name_at(pattern.span, item)))
+    for d in definitions do items.push(d)
     items.push(body)
     Expr(body.span, Lambda(params, Expr(body.span, Block(items, false))))
 

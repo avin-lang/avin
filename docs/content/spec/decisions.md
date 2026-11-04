@@ -955,6 +955,19 @@ Settled by the user on 2026-11-04:
   exceed (trapping, as `int.min .. int.max` does), and a bare `Range` written in signatures means
   the `int` range today. `for` over a range written in place already counts any integer type.
   Awaiting the user's choice of how `Range` is spelled and what type its `by` step has.
+- Value definitions in a `for` with `yield` ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
+  `pattern = value` after a generator, each with its own `if` guards, written with no `val`, and
+  never first. It is evaluated once per element that reaches it and binds in what follows. Where no
+  guard follows, it is a `val` in the function passed to its generator's source; where a guard
+  follows, it and the definitions before it after the same generator pair each element with its
+  value through the source's `map`, so it is evaluated for every element before that guard tests
+  any, and over a set or map the pair has to be hashable. A definition may not rebind a name its
+  generator or an earlier definition after it binds; a later generator may.
+- Comprehensions over the mutable collections ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
+  a mutable `Set` and `Map` have `withFilter`, a lazy view as the immutable ones have, and a
+  mutable `Map` a `map` over its entries as pairs, so the first source's kind decides the result as
+  elsewhere: a new mutable set or map, as an `Array`, a `Buffer` or a `Deque` gives a new one of its
+  own kind, the source unchanged.
 
 - `avin.process` ([system library](/spec/system-library/)): `args() -> Vector[string]` holds the
   arguments after the program's name, and `programName()` gives the name separately; `env(name)` is
