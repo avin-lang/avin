@@ -2930,9 +2930,6 @@ private declare_methods(c: *Checker, unit: usize)
                 if !public
                     c.note(file_unit, f.name_span, s"`${f.name}` is declared in a trait, so it cannot be private")
                     continue
-                if overrides && f.body is None && f.clauses.len() == 0
-                    c.note(file_unit, f.name_span, s"`${f.name}` overrides a method in a trait, so it needs a body, which replaces the default of the trait it requires")
-                    continue
             var clash: Option[usize] = None
             for i in 0..<k.fields.len()
                 if k.fields[i].name == f.name && (i >= k.inherited || k.fields[i].public) then clash = Some(i)
@@ -3736,16 +3733,31 @@ private replaces(c: *Checker, n: usize, m: usize) -> bool
         steps += 1
     false
 
-/** The method bodies a type may inherit under one name, without those another of them overrides: a
- * trait's override replaces the default of the trait it requires. */
-private unreplaced(c: *Checker, bodies: Buf[usize]) -> Buf[usize]
+/** The methods a type may inherit under one name, without those another of them overrides: a
+ * trait's override replaces the method of the trait it requires, and one without a body makes the
+ * method abstract again, so the default it replaces is not inherited. */
+private unreplaced(c: *Checker, methods: Buf[usize]) -> Buf[usize]
     var out: Buf[usize] = buf()
-    for m in bodies
+    for m in methods
         var replaced = false
-        for n in bodies
+        for n in methods
             if n != m && replaces(c, n, m) then replaced = true
         if !replaced then out.push(m)
     out
+
+/** The methods of `methods` that have bodies. */
+private with_bodies(c: *Checker, methods: Buf[usize]) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    for m in methods
+        if !is_abstract_method(c.symbols[m]) then out.push(m)
+    out
+
+/** A trait's override without a body among `methods`: the declaration a type inheriting no body for
+ * the method must implement. */
+private redeclared(c: *Checker, methods: Buf[usize]) -> Option[usize]
+    for m in methods
+        if is_abstract_method(c.symbols[m]) && is_trait_override(c, m) then return Some(m)
+    None
 
 /** Whether a trait's method `m` is an override, which has no position of its own. */
 private is_trait_override(c: *Checker, m: usize) -> bool = trait_overridden(c, m) is Some(_)
@@ -4134,9 +4146,11 @@ private build_data_table(c: *Checker, id: usize, conformed: Buf[usize])
                 var found: Buf[usize] = buf()
                 for other in conformed
                     if own_matching(c, other, self_type, methods[j]) is Some(m)
-                        if !is_abstract_method(c.symbols[m]) && !contains_id(found, m) then found.push(m)
-                val bodies = unreplaced(c, found)
+                        if !contains_id(found, m) then found.push(m)
+                val kept = unreplaced(c, found)
+                val bodies = with_bodies(c, kept)
                 if bodies.len() > 0 then chosen = bodies[0]
+                elif redeclared(c, kept) is Some(m) then chosen = m
                 if bodies.len() > 1 && !contains_name(reported, key)
                     reported.push(key)
                     report_conformance(c, id, t, s"`$name_of` inherits two implementations of `$name`, `${c.symbols[bodies[0]].name}` and `${c.symbols[bodies[1]].name}`; implement it in an impl")
@@ -4264,14 +4278,13 @@ private build_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
         for t in conformed[id]
             if contains_id(inherited_traits, t) then continue
             if own_matching(c, t, self_type, held) is Some(m)
-                if !is_abstract_method(c.symbols[m]) && !contains_id(candidates, m) then candidates.push(m)
+                if !contains_id(candidates, m) then candidates.push(m)
         var chosen: Option[usize] = own
         if own is None
-            var found: Buf[usize] = buf()
-            for m in candidates
-                if !is_abstract_method(c.symbols[m]) then found.push(m)
-            val bodies = unreplaced(c, found)
+            val kept = unreplaced(c, candidates)
+            val bodies = with_bodies(c, kept)
             if bodies.len() > 0 then chosen = Some(bodies[0])
+            elif redeclared(c, kept) is Some(m) then chosen = Some(m)
             if bodies.len() > 1 && !contains_name(reported, key)
                 reported.push(key)
                 c.note(k.unit, k.decl.name_span, s"`${k.name}` inherits two implementations of `$name`, `${c.symbols[bodies[0]].name}` and `${c.symbols[bodies[1]].name}`; override it")
@@ -4543,12 +4556,18 @@ private check_override_results(c: *Checker, id: usize)
                 if result_mismatch(c, own_class_type(c.classes[id], id), m, base_slots[i]) is Some(text)
                     c.note(k.unit, c.symbols[m].decl.name_span, s"`${c.symbols[m].decl.name}` overrides `${c.symbols[base_slots[i]].name}`, $text")
     var sup_table: Buf[Option[usize]] = buf()
+    var sup_traits: Buf[usize] = buf()
     if k.superclass is Some(sup)
-        if *sup is Class(sid, _, _) then sup_table = c.classes[sid].table
+        if *sup is Class(sid, _, _)
+            sup_table = c.classes[sid].table
+            sup_traits = conformed_traits(c, sid)
     for t in conformed_traits(c, id)
         val methods = c.classes[t].methods
         for j in 0..<methods.len()
-            val position = c.classes[t].base + j
+            // A trait's override shares the position of the method it overrides, and what fills it
+            // implements the override too, yielding its narrower result.
+            val redeclaring = is_trait_override(c, methods[j])
+            val position = if redeclaring then trait_slot(c, methods[j]) else c.classes[t].base + j
             if position >= k.table.len() then continue
             val m = k.table[position] match
                 Some(m) -> m
@@ -4556,7 +4575,7 @@ private check_override_results(c: *Checker, id: usize)
             // Where the superclass implements the trait, the class keeps or overrides its
             // implementation, which was checked against the trait with the superclass as `Self`.
             var base = methods[j]
-            if position < sup_table.len()
+            if position < sup_table.len() && (!redeclaring || contains_id(sup_traits, t))
                 if sup_table[position] is Some(sm)
                     if !is_abstract_method(c.symbols[sm]) && c.symbols[sm].decl.name == c.symbols[base].decl.name then base = sm
             if m == base then continue
@@ -4720,7 +4739,8 @@ private check_data_implementations(c: *Checker, id: usize)
     for t in data_traits(c, id)
         val methods = c.classes[t].methods
         for j in 0..<methods.len()
-            val position = c.classes[t].base + j
+            // A trait's override shares the position of the method it overrides.
+            val position = if is_trait_override(c, methods[j]) then trait_slot(c, methods[j]) else c.classes[t].base + j
             if position >= table.len() then continue
             val m = table[position] match
                 Some(m) -> m
