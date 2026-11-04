@@ -585,6 +585,20 @@ Settled by the user on 2026-11-03:
 
 Settled by the user on 2026-11-04:
 
+- **One formatting style, applied by `avin fmt [--check] [<path>...]` and the language server's
+  `textDocument/formatting`.** Each block level is indented two spaces; a literate file keeps its
+  four-column code-block margin and indents two a level inside it, and only its program is
+  formatted. Spaces go around binary operators (ranges included, `0 ..< n`), `=` and `->`, after
+  `,` and `:`, and nowhere inside brackets; a prefix operator stays against its operand. At most
+  one blank line in a row, none at either end of the file, and one between two top-level
+  declarations unless both are one line; a declaration's comments and annotations stay with it.
+  Comments are kept exactly, a trailing one a space after the code. A line longer than 120
+  characters has a list broken one item per line, a call's or a literal's items two columns in and
+  a parameter list's four, the closing bracket on its own line; a list the source wrote one item
+  per line stays so; a binding's value with no list to break is broken before its loosest operators
+  as continuation lines. No trailing commas are added. The formatter keeps every token and
+  refuses a file that does not parse; its result parses to the same syntax tree.
+
 - **`compareAndSet` on a value without identity** — a data value, tuple, string, `Option` or `Any` —
   **compares with `==`; on scalars and references it compares the word.** A class instance (even of
   a class that derives `Eq`) and a function value keep identity. See

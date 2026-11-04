@@ -207,6 +207,23 @@ what each one hashed to; commit it. `avin add github.com/owner/json@1.4.0` write
 into the manifest and fetches it, and without `@1.4.0` takes the highest release. `avin tidy` rewrites it to exactly what the package uses, and
 `avin tidy --check` fails when it is not. The [packages chapter](/spec/packages/) has the rest.
 
+## Formatting
+
+`avin fmt` rewrites every `.avin` and `.lavin` file under the paths it is given (the current
+directory when there are none) in Avin's one style, and `avin fmt --check` lists the files that are
+not in it and fails, for a build or a commit hook:
+
+```sh
+./compiler/avin fmt hello
+./compiler/avin fmt --check hello
+```
+
+Each block level is two spaces in, and a line is broken only past 120 characters, one item of a list
+to a line. Comments and blank lines stay where they are, at most one blank line in a row. In a
+literate file only the program is formatted, inside its four-column margin. A file that does not
+parse is left alone and its errors are reported. The [decisions](/spec/decisions/) list the style
+in full; the language server formats with the same rules.
+
 ## The compiler's tests
 
 ```sh

@@ -1,13 +1,14 @@
 module dev.avinlang.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{canonicalize, exists, is_dir, write_text_atomic}
+import sysl.fs.{canonicalize, entries, exists, is_dir, read_text, write_text_atomic}
 import sysl.path.stem
 import sysl.process.Stdio
+import sysl.slices.sort_by
 
 const Version: string = "0.0.2"
 const NoToolchain: string = "avin: cannot find the Avin library and runtime: they are installed in `share/avin` beside `bin/avin`; for a source checkout, set AVIN_ROOT to the directory that holds `library/` and `runtime/`"
-const Usage: string = "usage: avin [<program>] [-O0 | -O2] [-- <argument>...]\n       avin parse [<program>]\n       avin check [<program>]\n       avin emit-llvm [<program>] -o <module.ll>\n       avin build [<program>] [-o <executable>] [-O0 | -O2]\n       avin run [<program>] [-O0 | -O2] [-- <argument>...]\n       avin test [<program>] [<filter>] [-O0 | -O2]\n       avin new <dir> [--lib]\n       avin add <source>[@<version>] [<package>]\n       avin tidy [--check] [<package>]\n       avin tangle <file.lavin> [-o <path>]\n       avin weave <file.lavin> [-o <file.html>]\n       avin lsp [--stdio]\n       avin --help\n       avin --version\n<program> is a path in a package (a directory holding avin.hocon), a source file (`.avin`, or `.lavin` for a literate one), or a directory holding a program's modules; left out, it is the current directory\n`avin` alone is `avin run`, and `avin <program> ...` is `avin run <program> ...` when the first argument is not a command; reach a file or directory named like a command as `./test`\n`avin test`: an argument that names an existing file or directory is the program, any other is the filter; `avin test . <filter>` filters when a path of that name exists"
+const Usage: string = "usage: avin [<program>] [-O0 | -O2] [-- <argument>...]\n       avin parse [<program>]\n       avin check [<program>]\n       avin emit-llvm [<program>] -o <module.ll>\n       avin build [<program>] [-o <executable>] [-O0 | -O2]\n       avin run [<program>] [-O0 | -O2] [-- <argument>...]\n       avin test [<program>] [<filter>] [-O0 | -O2]\n       avin new <dir> [--lib]\n       avin add <source>[@<version>] [<package>]\n       avin tidy [--check] [<package>]\n       avin fmt [--check] [<path>...]\n       avin tangle <file.lavin> [-o <path>]\n       avin weave <file.lavin> [-o <file.html>]\n       avin lsp [--stdio]\n       avin --help\n       avin --version\n<program> is a path in a package (a directory holding avin.hocon), a source file (`.avin`, or `.lavin` for a literate one), or a directory holding a program's modules; left out, it is the current directory\n`avin` alone is `avin run`, and `avin <program> ...` is `avin run <program> ...` when the first argument is not a command; reach a file or directory named like a command as `./test`\n`avin test`: an argument that names an existing file or directory is the program, any other is the filter; `avin test . <filter>` filters when a path of that name exists"
 
 // Output channels, the exit status and the toolchain location stay outside command dispatch, so
 // every command can be run and tested in memory. 0 is success, 1 a source, I/O or build failure,
@@ -21,7 +22,7 @@ run_cli_with(args: []const string, tc: Option[Toolchain], say: string -> unit, n
 
 /** Every command name; a first argument that is one is that command, never a path. */
 is_command(word: string) -> bool
-    for c in ["parse", "check", "emit-llvm", "build", "run", "test", "new", "add", "tidy", "tangle", "weave", "lsp"]
+    for c in ["parse", "check", "emit-llvm", "build", "run", "test", "new", "add", "tidy", "fmt", "tangle", "weave", "lsp"]
         if c == word then return true
     false
 
@@ -57,6 +58,7 @@ run_command(here: string, args: []const string, tc: Option[Toolchain], say: stri
     if args.len >= 2 && (args[1] == "tangle" || args[1] == "weave") then return literate_command(args, say, note)
     if args.len >= 2 && args[1] == "new" then return new_command(args, say, note)
     if args.len >= 2 && args[1] == "tidy" then return tidy_command(args, say, note)
+    if args.len >= 2 && args[1] == "fmt" then return fmt_command(args, say, note)
     if args.len >= 2 && args[1] == "add" then return add_command(args, say, note)
     val command = args[1]
     // The program is the next argument when it is one: not an option, and for `test`, naming an existing
@@ -246,6 +248,67 @@ tidy_command(args: []const string, say: string -> unit, note: string -> unit) ->
         Err(message) ->
             note(message.trim_end())
             1
+
+/** `avin fmt [--check] [<path>...]`: every `.avin` and `.lavin` file under the paths (the current
+ * directory when none is given) rewritten in the house style, or with `--check` the files that are
+ * not in it listed and a failure. A directory or file whose name starts with `.` is passed over. */
+fmt_command(args: []const string, say: string -> unit, note: string -> unit) -> int
+    var check = false
+    var paths: Buf[string] = buf()
+    for i in 2..<args.len
+        if args[i] == "--check" && !check then check = true
+        elif args[i].starts_with("-")
+            note(Usage)
+            return 2
+        else paths.push(args[i])
+    if paths.len() == 0 then paths.push(".")
+    var failed = false
+    var files: Buf[string] = buf()
+    for p in paths
+        if is_dir(p) then fmt_collect(p, &files)
+        elif exists(p) then files.push(p)
+        else
+            note(s"avin: $p: no such file or directory")
+            failed = true
+    var unformatted = 0
+    for file in files
+        val text = read_text(file) match
+            Ok(t) -> t
+            Err(e) ->
+                note(s"avin: $file: ${e.to_string()}")
+                failed = true
+                continue
+        val formatted = format_text(file, text) match
+            Ok(t) -> t
+            Err(why) ->
+                note(why)
+                failed = true
+                continue
+        if formatted == text then continue
+        unformatted += 1
+        if check
+            say(file)
+        elif write_text_atomic(file, formatted) is Err(e)
+            note(s"avin: $file: ${e.to_string()}")
+            failed = true
+    if failed then return 1
+    if check && unformatted > 0
+        val files_are = if unformatted == 1 then "file is" else "files are"
+        note(s"avin: $unformatted $files_are not formatted; `avin fmt` rewrites them")
+        return 1
+    0
+
+// The source files under a directory, in name order.
+private fmt_collect(dir: string, files: *Buf[string])
+    var names = entries(dir).unwrap_or(buf())
+    sort_by(names.view(), fmt_name_before)
+    for name in names
+        if name.starts_with(".") then continue
+        val full = if dir.ends_with("/") then dir + name else dir + "/" + name
+        if is_dir(full) then fmt_collect(full, files)
+        elif is_source_name(name) then files.push(full)
+
+private fmt_name_before(a: string, b: string) -> bool = a < b
 
 /** Where `avin build` writes when no `-o` is given: the package's name, or the source's name without
  * `.avin` or `.lavin`, or the program directory's name, in the working directory. */
