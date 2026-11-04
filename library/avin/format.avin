@@ -37,8 +37,31 @@ trait Writer
 
 // How a value is laid out: the `width` of the field it fills, where 0 asks for no padding, padded on
 // the left, or on the right when `left`; and a `precision`, -1 for none, which a renderer that takes
-// one reads in its own terms. The built-in types read the width and the side.
-data FormatSpec(width: int = 0, precision: int = -1, left: bool = false)
+// one reads in its own terms. The rest is what an `f"…"` specifier writes: `zeroPad` for the `0`
+// flag, `plus` for `+`, `space` for a space, `alternate` for `#`, and the `conversion` letter, `s`
+// when none is written. A renderer reads the conversions its type takes and renders its own form
+// under any other.
+data FormatSpec(width: int = 0, precision: int = -1, left: bool = false, zeroPad: bool = false, plus: bool = false, space: bool = false, alternate: bool = false, conversion: char = 's')
+
+impl FormatSpec
+    // This spec with the width `n`, counted when the program runs: a negative count asks for a field
+    // of its magnitude, padded on the right, and a count beyond `int` is the largest `int`.
+    withWidth[T: Integer](n: T) -> FormatSpec =
+        val count = clampedCount(n)
+        if count < 0 then FormatSpec(-count, precision, true, zeroPad, plus, space, alternate, conversion)
+        else FormatSpec(count, precision, left, zeroPad, plus, space, alternate, conversion)
+
+    // This spec with the precision `n`, counted when the program runs: a negative count is as though
+    // no precision were written.
+    withPrecision[T: Integer](n: T) -> FormatSpec =
+        val count = clampedCount(n)
+        FormatSpec(width, if count < 0 then -1 else count, left, zeroPad, plus, space, alternate, conversion)
+
+// `n` held to the range an `int` holds with room to negate it.
+private clampedCount[T: Integer](n: T) -> int
+    val wide = long(n)
+    if T(wide) != n then return if n < T(0) then -2147483647 else 2147483647
+    if wide > 2147483647 then 2147483647 elif wide < -2147483647 then -2147483647 else int(wide)
 
 // A value's human form. `display` renders it into `out`, in the field `spec` describes.
 trait Display
@@ -168,7 +191,7 @@ impl Display for byte
     toString() -> string = renderInt(long(int(self)))
 
 impl Display for real
-    display(out: Writer, spec: FormatSpec) = out.writeField(renderReal(self), spec)
+    display(out: Writer, spec: FormatSpec) = writeReal(out, self, spec)
     toString() -> string = renderReal(self)
 
 impl Display for char
@@ -185,7 +208,7 @@ impl Display for unit
     toString() -> string = "()"
 
 impl Display for string
-    display(out: Writer, spec: FormatSpec) = out.writeField(self, spec)
+    display(out: Writer, spec: FormatSpec) = out.writeField(if spec.precision >= 0 then take(spec.precision) else self, spec)
     toString() -> string = self
 
 // The Debug forms of the built-in types are their Display forms, except that a string and a `char`
@@ -200,6 +223,21 @@ impl Debug for byte
 
 impl Debug for real
     debug(out: Writer, spec: FormatSpec) = out.writeField(renderReal(self), spec)
+
+// A real under `f`, `e`, `g`, `E` or `G` is written as those conversions lay it out, its digits the
+// exact value's rounded half to even; under any other it is its shortest form, padded with spaces.
+private writeReal(out: Writer, x: real, spec: FormatSpec)
+    val c = spec.conversion
+    if c != 'f' && c != 'e' && c != 'g' && c != 'E' && c != 'G'
+        out.writeField(renderReal(x), spec)
+        return
+    var flags = 0
+    if spec.left then flags = flags | 1
+    if spec.plus then flags = flags | 2
+    if spec.space then flags = flags | 4
+    if spec.zeroPad then flags = flags | 8
+    if spec.alternate then flags = flags | 16
+    out.write(formatReal(x, c, flags, spec.width, spec.precision))
 
 impl Debug for char
     debug(out: Writer, spec: FormatSpec) = out.writeField(quoteChar(self), spec)
@@ -217,6 +255,9 @@ impl Debug for string
 // or fewer it always does: there the test that it fits folds away when the width's instance is
 // compiled. A value too wide for `long` is cut into chunks of eighteen digits.
 private writeInteger[T: Integer](out: Writer, x: T, spec: FormatSpec)
+    if !plainInteger(spec)
+        out.writeField(integerText(x, spec), spec)
+        return
     val n = long(x)
     if T(n) == x then writeLong(out, n, spec)
     elif spec.width <= 0 then writeWide(out, x)
@@ -255,7 +296,49 @@ private writeChunk(out: Writer, n: long)
 // An integer with no field to fill goes to the writer as a number, which standard output renders
 // with no string in between.
 private writeLong(out: Writer, n: long, spec: FormatSpec)
-    if spec.width <= 0 then out.writeInt(n) else out.writeField(renderInt(n), spec)
+    if !plainInteger(spec) then out.writeField(integerText(n, spec), spec)
+    elif spec.width <= 0 then out.writeInt(n)
+    else out.writeField(renderInt(n), spec)
+
+// Whether `spec` asks for an integer's decimal digits padded with spaces and nothing more.
+private plainInteger(spec: FormatSpec) -> bool =
+    val c = spec.conversion
+    (c == 's' || c == 'd' || c == 'i') && spec.precision < 0 && !spec.zeroPad && !spec.plus && !spec.space
+
+// `x` under an integer conversion, everything but the spaces that pad it: the sign, `-` when
+// negative or else `+` or a space when asked; the base's prefix under `#` (`0x`, `0X` or `0b` before
+// a value other than zero, a leading `0` in octal); then the digits of the magnitude, at least
+// `precision` of them, where a precision of 0 writes zero as no digits; and, under `0` with neither
+// `-` nor a precision, zeros after the sign and prefix to fill the width. Every base writes a
+// negative value as its sign and magnitude.
+private integerText[T: Integer](x: T, spec: FormatSpec) -> string
+    val c = spec.conversion
+    val base: long = if c == 'x' || c == 'X' then 16 elif c == 'o' then 8 elif c == 'b' then 2 else 10
+    val upper = c == 'X'
+    val zero = x == T(0)
+    val n = long(x)
+    val written = StringWriter()
+    if T(n) == x then writeDigits(written, n, base, upper) else writeDigits(written, x, T(base), upper)
+    var digits = written.text()
+    if spec.precision == 0 && zero then digits = ""
+    elif spec.precision > digits.byteLength() then digits = "0".repeat(spec.precision - digits.byteLength()) + digits
+    var lead = if x < T(0) then "-" elif spec.plus then "+" elif spec.space then " " else ""
+    if spec.alternate
+        if base == 16 && !zero then lead = lead + (if upper then "0X" else "0x")
+        elif base == 2 && !zero then lead = lead + "0b"
+        elif base == 8 && !digits.startsWith("0") then digits = "0" + digits
+    if spec.zeroPad && !spec.left && spec.precision < 0
+        val fill = spec.width - lead.byteLength() - digits.byteLength()
+        if fill > 0 then digits = "0".repeat(fill) + digits
+    lead + digits
+
+// Writes the digits of the magnitude of `x` in `base`, most significant first.
+private writeDigits[T: Integer](out: Writer, x: T, base: T, upper: bool)
+    val high = x / base
+    if high != T(0) then writeDigits(out, high, base, upper)
+    val d = long(x % base)
+    val digit = if d < 0 then -d else d
+    out.writeChar(char(int(if digit < 10 then 48 + digit elif upper then 55 + digit else 87 + digit)))
 
 @intrinsic("write_out")
 private writeOut(text: string)
@@ -271,6 +354,9 @@ private renderInt(n: long) -> string
 
 @intrinsic("render_real")
 private renderReal(x: real) -> string
+
+@intrinsic("format_real")
+private formatReal(x: real, conversion: char, flags: int, width: int, precision: int) -> string
 
 @intrinsic("render_char")
 private renderChar(c: char) -> string

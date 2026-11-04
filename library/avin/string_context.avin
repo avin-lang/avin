@@ -3,8 +3,8 @@ module avin
 // An interpolated string is a method call on a `StringContext`. `p"text $a and ${b + 1}"` is
 // `StringContext(["text ", " and ", ""]).p(a, b + 1)`: the literal pieces between the holes become
 // the context's parts, as written, with their escapes not yet decoded, and the holes become the
-// method's arguments. There is always one more part than there are holes. `s` and `raw` are the
-// core library's interpolators; a program adds its own with a trait and an `impl` of it for
+// method's arguments. There is always one more part than there are holes. `s`, `f` and `raw` are
+// the core library's interpolators; a program adds its own with a trait and an `impl` of it for
 // `StringContext`.
 data StringContext(parts: Vector[string])
 
@@ -17,6 +17,78 @@ impl StringContext
     // them.
     raw(args: Display*) -> string = joined(args, false)
 
+    // The parts with their escapes decoded and each argument rendered between them as an `f"…"`
+    // literal renders it, with the specifier at the start of the part after it read as the program
+    // runs. A width or precision written as a hole is an argument of its own, an `int` or a `long`.
+    // An argument renders in its own form under a conversion its type does not take. The compiler
+    // writes an `f"…"` literal out directly, checking its specifiers as it compiles them; here a
+    // specifier that is malformed, a count that is not an `int` or a `long`, and `%?`, which asks for
+    // a `Debug` form a `Display` argument does not have, trap.
+    f(args: Display*) -> string
+        if args.length() != parts.length() - 1 then fail(s"an interpolator was given ${args.length()} arguments for ${parts.length()} parts")
+        val out = StringWriter()
+        writeDecoded(out, parts(0))
+        var k = 0
+        while k < args.length()
+            val value = args(k)
+            k += 1
+            var part = parts(k)
+            if !part.startsWith("%")
+                value.display(out, FormatSpec())
+                writeDecoded(out, part)
+                continue
+            var left = false
+            var plus = false
+            var space = false
+            var zeroPad = false
+            var alternate = false
+            var at = 1
+            while at < part.byteLength() && isFlag(part.charAt(at))
+                val flag = part.charAt(at)
+                if flag == '-' then left = true
+                elif flag == '+' then plus = true
+                elif flag == ' ' then space = true
+                elif flag == '0' then zeroPad = true
+                else alternate = true
+                at += 1
+            var width = 0
+            var widthArgument: Option[Display] = None
+            if at == part.byteLength() && k < args.length()
+                widthArgument = Some(args(k))
+                k += 1
+                part = parts(k)
+                at = 0
+            else
+                while at < part.byteLength() && isDigit(part.charAt(at))
+                    width = countDigit(width, part.charAt(at), "width")
+                    at += 1
+            var precision = -1
+            var precisionArgument: Option[Display] = None
+            if at < part.byteLength() && part.charAt(at) == '.'
+                at += 1
+                precision = 0
+                if at == part.byteLength() && k < args.length()
+                    precisionArgument = Some(args(k))
+                    k += 1
+                    part = parts(k)
+                    at = 0
+                else
+                    while at < part.byteLength() && isDigit(part.charAt(at))
+                        precision = countDigit(precision, part.charAt(at), "precision")
+                        at += 1
+            if at >= part.byteLength() then fail("a format specifier has no conversion: a `%` right after a hole begins one, such as `%d` or `%s`")
+            val conversion = part.charAt(at)
+            if conversion == 'u' then fail("`%u` is not a format conversion: integers are signed, so `%d` writes every one")
+            if conversion == '?' then fail("`%?` asks for a value's `Debug` form, which a `Display` argument does not have")
+            if !"dixXobfeEgGcs".contains(conversion.toString()) then fail(s"`%$conversion` is not a format conversion")
+            at += 1
+            var spec = FormatSpec(width, precision, left, zeroPad, plus, space, alternate, conversion)
+            if widthArgument is Some(n) then spec = spec.withWidth(countOf(n))
+            if precisionArgument is Some(n) then spec = spec.withPrecision(countOf(n))
+            value.display(out, spec)
+            writeDecoded(out, part.slice(at, part.byteLength()))
+        out.text()
+
     // The parts, decoded when `decode`, alternating with the arguments. A context given a number of
     // arguments other than one fewer than its parts traps.
     private joined(args: Vector[Display], decode: bool) -> string
@@ -26,6 +98,22 @@ impl StringContext
             if i > 0 then args(i - 1).display(out, FormatSpec())
             if decode then writeDecoded(out, parts(i)) else out.write(parts(i))
         out.text()
+
+private isDigit(c: char) -> bool = c >= '0' && c <= '9'
+
+private isFlag(c: char) -> bool = c == '-' || c == '+' || c == ' ' || c == '0' || c == '#'
+
+// `count` with the digit `d` written after it, which traps beyond the largest `int`.
+private countDigit(count: int, d: char, what: string) -> int
+    val next = long(count) * 10 + long(int(d) - int('0'))
+    if next > 2147483647 then fail(s"a format $what is at most 2147483647")
+    int(next)
+
+// A width or precision given as an argument, which has to be an `int` or a `long`.
+private countOf(n: Display) -> long =
+    if n is i: int then long(i)
+    elif n is l: long then l
+    else fail("a width or precision given as an argument has to be an `int` or a `long`")
 
 // Writes `part` with its escapes decoded, as a string literal's are: `\n`, `\t`, `\r`, `\0`, `\a`,
 // `\b`, `\f`, `\v`, `\e`, a backslash before `\`, `"`, `'`, `` ` `` or `/` for that character,

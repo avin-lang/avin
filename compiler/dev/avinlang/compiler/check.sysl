@@ -4387,6 +4387,14 @@ intrinsic_entry(name: string) -> Option[(string, Buf[&Type], &Type)]
         entry = "avin_rt_render_real"
         params.push(Real)
         result = Str
+    elif name == "format_real"
+        entry = "avin_rt_format_real"
+        params.push(Real)
+        params.push(Char)
+        params.push(Int(32))
+        params.push(Int(32))
+        params.push(Int(32))
+        result = Str
     elif name == "render_char"
         entry = "avin_rt_render_char"
         params.push(Char)
@@ -7420,47 +7428,283 @@ private operator_conforms(c: *Checker, at: Span, spelling: string, t: &Type, tra
     else c.note(unit_of(c), at, s"`$spelling` needs ${type_name(t)} to implement `$trait_name`")
     false
 
-// `p"a${x}b"` is the method call `StringContext(["a", "b"]).p(x)`, the parts as written. `s"…"` is
-// written out directly instead, to the text that call makes: the decoded pieces and the rendered
-// holes joined in order, as `"a" + x.toString() + "b"`, an empty piece left out. Each hole is
-// evaluated once, left to right.
+// `p"a${x}b"` is the method call `StringContext(["a", "b"]).p(x)`, the parts as written. `s"…"` and
+// `f"…"` are written out directly instead, to the text that call makes (see `formatted_text`).
 private interpolate_expr(c: *Checker, e: &Expr, prefix: string, chunks: Buf[string], parts: Buf[string], holes: Buf[&Expr], expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
-    if prefix != "s"
+    if prefix != "s" && prefix != "f"
         if !names_interpolator(c, prefix)
             c.note(unit, e.span, s"`$prefix\"…\"` names no interpolator: `StringContext` has no method `$prefix` here")
             for h in holes
                 check_statement(c, h)
             return TExpr(e.span, ErrorType, UnitConst)
         return check_expr(c, interpolator_call(e.span, prefix, parts, holes), expected)
+    formatted_text(c, e, prefix == "f", chunks, holes)
+
+/** What an `f"…"` specifier writes after its hole's `%`: the flags, the width and the precision, each
+ * as digits or as a hole of its own, and the conversion, the character after them, empty when the
+ * text ends first. */
+struct Specifier
+    left: bool
+    plus: bool
+    space: bool
+    zero: bool
+    alternate: bool
+    width: string
+    width_hole: Option[&TExpr]
+    precision: string
+    precision_hole: Option[&TExpr]
+    conversion: string
+
+// `s"…"` and `f"…"` are written out to calls on one `StringWriter`, made for the literal: each
+// decoded piece of text is written to it, each hole is rendered into it by its `display` (by its
+// `debug` under `%?`) in the field its specifier describes, and its text is the value. A string hole
+// with no specifier is written as it is. Each hole is evaluated once, left to right, just before it
+// is rendered; a hole that never finishes leaves the literal never finishing. In an `f"…"` literal, a
+// `%` right after a hole begins that hole's specifier, checked here against the hole's type; any
+// other `%` is text.
+private formatted_text(c: *Checker, e: &Expr, specifiers: bool, chunks: Buf[string], holes: Buf[&Expr]) -> &TExpr
+    val at = e.span
+    var typed: Buf[&TExpr] = buf()
+    for h in holes
+        typed.push(check_expr(c, h, None))
+    val writer = check_expr(c, Expr(at, Call(Expr(at, Name(core_path("StringWriter"))), buf())), None)
+    if *writer.ty is ErrorType then return writer
+    val held = hidden_local(c, writer.ty)
+    var items: Buf[&Expr] = buf()
+    items.push(checked_slot(c, TExpr(at, Unit, Let(held, writer))))
     var ok = true
-    var pieces: Buf[&TExpr] = buf()
-    var ty: &Type = Str
-    for i in 0..<chunks.len()
-        if chunks[i] != "" then pieces.push(TExpr(e.span, Str, StrConst(chunks[i])))
-        if i < holes.len()
-            val h = check_expr(c, holes[i], None)
-            *h.ty match
-                Str -> pieces.push(h)
-                Int(_) -> pieces.push(TExpr(h.span, Str, Render(h)))
-                Byte -> pieces.push(TExpr(h.span, Str, Render(h)))
-                Char -> pieces.push(TExpr(h.span, Str, Render(h)))
-                Real -> pieces.push(TExpr(h.span, Str, Render(h)))
-                Bool -> pieces.push(TExpr(h.span, Str, Render(h)))
-                Unit -> pieces.push(TExpr(h.span, Str, Render(h)))
-                Nothing ->
-                    ty = Nothing
-                    pieces.push(h)
-                ErrorType -> ok = false
-                _ -> displayed(c, h) match
-                    Some(text) -> pieces.push(text)
-                    None -> ok = false
-    if !ok then return TExpr(e.span, ErrorType, UnitConst)
-    if pieces.len() == 0 then return TExpr(e.span, Str, StrConst(""))
-    var out = pieces[0]
-    for k in 1..<pieces.len()
-        out = TExpr(e.span, ty, Arith(Add, out, pieces[k], e.span))
-    if *ty is Nothing then TExpr(e.span, Nothing, out.kind) else out
+    var text = chunks[0]
+    var k = 0usize
+    while k < typed.len()
+        val value = typed[k]
+        var rest = chunks[k + 1]
+        k += 1
+        if text != "" then items.push(writer_call(c, at, held, writer.ty, "write", Expr(at, StringLit(text)), None))
+        var spec: Option[Specifier] = None
+        if specifiers && rest.bytes.len > 0 && rest.bytes[0] == u8('%')
+            var p = Specifier(false, false, false, false, false, "", None, "", None, "")
+            var b = rest.bytes
+            var i = 1usize
+            while i < b.len && is_format_flag(b[i])
+                if b[i] == u8('-') then p.left = true
+                if b[i] == u8('+') then p.plus = true
+                if b[i] == u8(' ') then p.space = true
+                if b[i] == u8('0') then p.zero = true
+                if b[i] == u8('#') then p.alternate = true
+                i += 1
+            if i == b.len && k < typed.len()
+                p.width_hole = Some(typed[k])
+                rest = chunks[k + 1]
+                k += 1
+                b = rest.bytes
+                i = 0
+            else
+                val from = i
+                while i < b.len && b[i] >= u8('0') && b[i] <= u8('9') do i += 1
+                p.width = from_utf8_unchecked(b[from..<i])
+            if i < b.len && b[i] == u8('.')
+                i += 1
+                if i == b.len && k < typed.len()
+                    p.precision_hole = Some(typed[k])
+                    rest = chunks[k + 1]
+                    k += 1
+                    b = rest.bytes
+                    i = 0
+                else
+                    val from = i
+                    while i < b.len && b[i] >= u8('0') && b[i] <= u8('9') do i += 1
+                    p.precision = if i == from then "0" else from_utf8_unchecked(b[from..<i])
+            if i < b.len
+                val from = i
+                i += 1
+                while i < b.len && b[i] & u8(0xC0) == u8(0x80) do i += 1
+                p.conversion = from_utf8_unchecked(b[from..<i])
+            rest = from_utf8_unchecked(b[i..<b.len])
+            spec = Some(p)
+        text = rest
+        if *value.ty is ErrorType
+            ok = false
+            continue
+        if *value.ty is Nothing
+            items.push(checked_slot(c, value))
+            continue
+        spec match
+            None ->
+                if *value.ty is Str
+                    items.push(writer_call(c, at, held, writer.ty, "write", checked_slot(c, value), None))
+                elif implements_display(c, value)
+                    items.push(rendered(c, at, held, writer.ty, value, "display", Expr(at, Call(Expr(at, Name(core_path("FormatSpec"))), buf()))))
+                else ok = false
+            Some(p) -> specified(c, value, p) match
+                Some(layout) -> items.push(rendered(c, at, held, writer.ty, value, if p.conversion == "?" then "debug" else "display", layout))
+                None -> ok = false
+    if text != "" then items.push(writer_call(c, at, held, writer.ty, "write", Expr(at, StringLit(text)), None))
+    if !ok then return TExpr(at, ErrorType, UnitConst)
+    items.push(Expr(at, Call(Expr(at, Member(checked_slot(c, TExpr(at, writer.ty, Local(held))), "text")), buf())))
+    check_expr(c, block_of(at, items), None)
+
+private is_format_flag(b: u8) -> bool = b == u8('-') || b == u8('+') || b == u8(' ') || b == u8('0') || b == u8('#')
+
+// Written code that stands for `t`, already checked.
+private checked_slot(c: *Checker, t: &TExpr) -> &Expr
+    val slot = Expr(t.span, Checked(c.checked_slots.len()))
+    c.checked_slots.push(t)
+    slot
+
+// `out.name(arg)` on the literal's writer, held in local `held`.
+private writer_call(c: *Checker, at: Span, held: usize, ty: &Type, name: string, arg: &Expr, second: Option[&Expr]) -> &Expr
+    var args: Buf[Argument] = buf()
+    args.push(Argument(at, None, arg, false))
+    if second is Some(s) then args.push(Argument(at, None, s, false))
+    Expr(at, Call(Expr(at, Member(checked_slot(c, TExpr(at, ty, Local(held))), name)), args))
+
+// `value.method(out, layout)`: the hole rendered into the literal's writer.
+private rendered(c: *Checker, at: Span, held: usize, ty: &Type, value: &TExpr, method: string, layout: &Expr) -> &Expr
+    var args: Buf[Argument] = buf()
+    args.push(Argument(at, None, checked_slot(c, TExpr(at, ty, Local(held))), false))
+    args.push(Argument(at, None, layout, false))
+    Expr(at, Call(Expr(at, Member(checked_slot(c, value), method)), args))
+
+// Whether the hole's type implements `Display`, reporting why not when it does not.
+private implements_display(c: *Checker, h: &TExpr) -> bool
+    val t = zonk(c, h.ty)
+    core_trait(c, "Display") match
+        Some(display) ->
+            if conforms_to_bound(c, t, display) then return true
+            c.note(unit_of(c), h.span, s"`${type_name(t)}` does not implement `Display`, so it cannot be interpolated${underived_reason(c, t, "Display")}")
+            false
+        None ->
+            c.note(unit_of(c), h.span, "the core library declares no `Display`")
+            false
+
+private core_trait(c: *Checker, name: string) -> Option[&Type]
+    val id = c.class_types.get(qualified(CoreModule, name))?
+    Some(Class(id, name, buf()))
+
+// Whether `t` is an integer: one of the integer widths, or a type parameter bounded by `Integer`.
+private integer_type(c: *Checker, t: &Type) -> bool = *t match
+    Int(_) -> true
+    TypeVar(_, _, _) -> core_trait(c, "Integer") match
+        Some(integer) -> conforms_to_bound(c, t, integer)
+        None -> false
+    _ -> false
+
+// The `FormatSpec` an `f"…"` specifier describes, after checking it against the hole it follows: the
+// conversion is one the hole's type takes, each flag has an effect under it, and a width or precision
+// written as a hole is an integer. `None` when it has been reported.
+private specified(c: *Checker, value: &TExpr, p: Specifier) -> Option[&Expr]
+    val unit = unit_of(c)
+    val at = value.span
+    val t = zonk(c, value.ty)
+    val letter = p.conversion
+    if letter == ""
+        c.note(unit, at, "this format specifier has no conversion: a `%` right after a hole begins one, such as `%d` or `%s`")
+        return None
+    // The flags each conversion has a use for, beside `-`, which every one takes.
+    var signs = false
+    var zeros = false
+    var alternate = false
+    var wanted = ""
+    var fits = false
+    if letter == "d" || letter == "i"
+        signs = true
+        zeros = true
+        wanted = "an integer"
+        fits = integer_type(c, t) || *t is Byte
+    elif letter == "x" || letter == "X" || letter == "o" || letter == "b"
+        signs = true
+        zeros = true
+        alternate = true
+        wanted = "an integer"
+        fits = integer_type(c, t) || *t is Byte
+    elif letter == "f" || letter == "e" || letter == "g" || letter == "E" || letter == "G"
+        signs = true
+        zeros = true
+        alternate = true
+        wanted = "a real"
+        fits = *t is Real
+    elif letter == "c"
+        wanted = "a char"
+        fits = *t is Char
+    elif letter == "s"
+        wanted = "a string or another value that is not a number"
+        fits = !(integer_type(c, t) || *t is Byte || *t is Real)
+    elif letter == "?"
+        fits = true
+    elif letter == "u"
+        c.note(unit, at, "`%u` is not a format conversion: integers are signed, so `%d` writes every one")
+        return None
+    else
+        c.note(unit, at, s"`%$letter` is not a format conversion: the conversions are `d`, `i`, `x`, `X`, `o`, `b`, `f`, `e`, `g`, `E`, `G`, `c`, `s` and `?`")
+        return None
+    if !fits
+        c.note(unit, at, s"format `%$letter` expects $wanted, but the value has type `${type_name(t)}`")
+        return None
+    var ok = true
+    if p.plus && !signs then ok = no_effect(c, at, "the flag `+`", letter)
+    if p.space && !signs then ok = no_effect(c, at, "the space flag", letter)
+    if p.zero && !zeros then ok = no_effect(c, at, "the flag `0`", letter)
+    if p.alternate && !alternate then ok = no_effect(c, at, "the flag `#`", letter)
+    if letter == "c" && (p.precision != "" || p.precision_hole is Some(_))
+        c.note(unit, at, "`%c` takes no precision")
+        ok = false
+    if letter == "?"
+        core_trait(c, "Debug") match
+            Some(debug) ->
+                if !conforms_to_bound(c, t, debug)
+                    c.note(unit, at, s"`${type_name(t)}` does not implement `Debug`, so `%?` cannot show it${underived_reason(c, t, "Debug")}")
+                    ok = false
+            None -> ok = false
+    elif !implements_display(c, value) then ok = false
+    if !count_fits(c, at, p.width, "width") then ok = false
+    if !count_fits(c, at, p.precision, "precision") then ok = false
+    if !count_hole_fits(c, p.width_hole) then ok = false
+    if !count_hole_fits(c, p.precision_hole) then ok = false
+    if !ok then return None
+    var args: Buf[Argument] = buf()
+    if p.width != "" then args.push(Argument(at, Some("width"), Expr(at, IntLit(p.width)), false))
+    if p.precision != "" then args.push(Argument(at, Some("precision"), Expr(at, IntLit(p.precision)), false))
+    if p.left then args.push(Argument(at, Some("left"), Expr(at, BoolLit(true)), false))
+    if p.zero then args.push(Argument(at, Some("zeroPad"), Expr(at, BoolLit(true)), false))
+    if p.plus then args.push(Argument(at, Some("plus"), Expr(at, BoolLit(true)), false))
+    if p.space then args.push(Argument(at, Some("space"), Expr(at, BoolLit(true)), false))
+    if p.alternate then args.push(Argument(at, Some("alternate"), Expr(at, BoolLit(true)), false))
+    args.push(Argument(at, Some("conversion"), Expr(at, CharLit(char(u32(letter.bytes[0])))), false))
+    var layout = Expr(at, Call(Expr(at, Name(core_path("FormatSpec"))), args))
+    if p.width_hole is Some(h)
+        var counted: Buf[Argument] = buf()
+        counted.push(Argument(h.span, None, checked_slot(c, h), false))
+        layout = Expr(at, Call(Expr(at, Member(layout, "withWidth")), counted))
+    if p.precision_hole is Some(h)
+        var counted: Buf[Argument] = buf()
+        counted.push(Argument(h.span, None, checked_slot(c, h), false))
+        layout = Expr(at, Call(Expr(at, Member(layout, "withPrecision")), counted))
+    Some(layout)
+
+private no_effect(c: *Checker, at: Span, flag: string, letter: string) -> bool
+    c.note(unit_of(c), at, s"$flag has no effect under `%$letter`")
+    false
+
+// Whether a width or precision written in digits fits an `int`, reporting it when it does not.
+private count_fits(c: *Checker, at: Span, digits: string, what: string) -> bool
+    var n: long = 0
+    for d in digits.bytes
+        n = n * 10 + long(d - u8('0'))
+        if n > 2147483647
+            c.note(unit_of(c), at, s"a format $what is at most 2147483647")
+            return false
+    true
+
+// Whether a width or precision written as a hole is an integer, reporting it when it is not.
+private count_hole_fits(c: *Checker, hole: Option[&TExpr]) -> bool
+    val h = hole match
+        Some(x) -> x
+        None -> return true
+    val t = zonk(c, h.ty)
+    if integer_type(c, t) || *t is ErrorType || *t is Nothing then return true
+    c.note(unit_of(c), h.span, s"a width or precision written as a hole is a count, so it has to be an integer, but this one has type `${type_name(t)}`")
+    false
 
 // Whether `StringContext` has a method `name` that this unit can call: one of the core library's,
 // or one an imported trait's impl gives it.
@@ -7484,25 +7728,6 @@ private interpolator_call(at: Span, prefix: string, parts: Buf[string], holes: B
     for h in holes
         args.push(Argument(h.span, None, h, false))
     Expr(at, Call(Expr(at, Member(context, prefix)), args))
-
-// A hole of a type other than the built-ins is rendered by its `Display` implementation, as
-// `h.toString()`. A type that does not implement `Display` cannot be interpolated.
-private displayed(c: *Checker, h: &TExpr) -> Option[&TExpr]
-    val unit = unit_of(c)
-    val t = zonk(c, h.ty)
-    val display = c.class_types.get(qualified(CoreModule, "Display")) match
-        Some(k) -> k
-        None ->
-            c.note(unit, h.span, "the core library declares no `Display`")
-            return None
-    if !conforms_to_bound(c, t, Class(display, "Display", buf()))
-        c.note(unit, h.span, s"`${type_name(t)}` does not implement `Display`, so it cannot be interpolated${underived_reason(c, t, "Display")}")
-        return None
-    val ms = methods_of(c, t, "toString")
-    if ms.len() == 0
-        c.note(unit, h.span, s"`${type_name(t)}` has no `toString`")
-        return None
-    Some(call_method(c, h.span, h.span, h, "toString", ms, buf(), None, None, false))
 
 // The type two branches agree on; where they have none (see `join`), the type expected of them,
 // when both conform to it: two classes sharing several unrelated traits agree on one of them only
@@ -10968,7 +11193,6 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
         Not(x) -> scan_init(c, s, x, unsafe)
         Complement(x) -> scan_init(c, s, x, unsafe)
         Convert(x) -> scan_init(c, s, x, unsafe)
-        Render(x) -> scan_init(c, s, x, unsafe)
         Box(x) -> scan_init(c, s, x, unsafe)
         Arith(_, a, b, _) ->
             val ok = scan_init(c, s, a, unsafe)

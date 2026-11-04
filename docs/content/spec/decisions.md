@@ -974,6 +974,25 @@ Settled by the user on 2026-11-04:
   built: `@tests` files, setup and teardown hooks, `should_trap`, `ignore` and `timeout` arguments,
   and tests answering with a `Result`.
 
+- Format specifiers ([strings and formatting](/spec/strings-and-formatting/#format-specifiers)):
+  - **Integers are signed in every base**: `%x`, `%X`, `%o` and `%b` write a negative value as `-`
+    and its magnitude's digits (`${-42}%x` is `-2a`), so the text does not depend on the value's
+    width, and `+` and the space flag apply to them as to `%d`. There is no `%u`; it is refused
+    with a pointer to `%d`.
+  - **A flag that changes nothing under its conversion is an error**, as is a precision under `%c`.
+    `%s` refuses the numbers (integers, `byte`, `real`), which have conversions of their own; it
+    takes every other `Display` value.
+  - **`%s` counts characters**: its width and precision are characters, not bytes, as every
+    `Display` width is.
+  - **Only a `%` right after a hole is special**: there is no `%%` escape; `%` anywhere else, doubled
+    or not, is text.
+  - **A count written as a hole is an integer of any width**, not a `byte`; a negative width pads on
+    the right, a negative precision is none, and a count beyond `int` is the largest `int`
+    (`FormatSpec.withWidth`, `withPrecision`).
+  - **`StringContext.f`, called directly**, reads its specifiers as it runs: a malformed one, `%?`
+    (its arguments are `Display` values) and a count that is not an `int` or a `long` trap; a value
+    under a conversion its type does not take renders in its own form.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
