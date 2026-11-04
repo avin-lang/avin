@@ -1127,13 +1127,62 @@ Settled by the user on 2026-11-04:
 - A collection added to itself ([collections](/spec/collections/#buffer)): `b.addAll(b)` and
   `b ++= b` on a `Buffer` or a `Deque` append the elements it held when the call began, once, and
   `s --= s` on a mutable `Set` empties it.
-- [`avin.time`](/spec/system-library/#avintime): `Duration`, `Instant` (monotonic) and `WallTime`
+- [`avin.time`](/spec/system-library/#avin-time): `Duration`, `Instant` (monotonic) and `WallTime`
   (wall clock, a `Duration` since the 1970 epoch) are data types counting whole microseconds in a
   `long`, overflow trapping; the two clocks are distinct types so their readings never mix. A
   duration implements `Add`, `Sub`, `Neg`; an instant combines with a duration through `plus`,
   `minus` and `since`, because an operator trait takes and yields the implementing type alone. The
   text forms are a duration's largest-unit form (`1.5ms`) and an ISO 8601 UTC timestamp. Sleeping
   and calendar fields beyond the timestamp text are not part of it yet.
+- The rest of the system library ([system library](/spec/system-library/)), each module following
+  the reference standard library's names and shapes where Avin's rules allow:
+  - **[The environment and the platform](/spec/system-library/#the-environment-and-the-platform)**
+    are functions of `avin.process`, beside `env`, not a module of their own: `environment()` as a
+    `Map`, `currentDir`, `homeDir`, `executable`, `processors`, `pid` and `os()`. There is no
+    property store and nothing sets a variable; a child's variables are set on its command. Bindings:
+    `sysl.fs.current_dir` and `home_dir`, `sysl.env.current_exe`, `sysl.process.pid` (a `u32`, which
+    fits a `long`), `sysl.os` through a mirror of `sysl.Os`, and the runtime's processor count.
+    `environment()` needs `sysl.env.vars`, which answers a `Buf` of pairs: it waits for tuples as a
+    boundary type, a stage-7 addition.
+  - **[Commands](/spec/system-library/#commands)** in `avin.process`: a `Command` value, combined
+    with `|` (a pipeline), `andThen`, `orElse` and `followedBy`, redirected with `toFile`,
+    `appendTo`, `fromFile` and `withInput`, and run by `run()` (the exit status), `output()` (the
+    text, any status but success an `Err`), `lines()` (an iterator as output arrives) and `start()`
+    (a `Child`). Importing the module adds `run()` and `output()` to `string`. **Operators Avin cannot
+    define**: postfix `!` and `!!` (no method is called postfix, and `!` is the language's), and
+    anything spelled with `#` (not an operator character), so `#|` is `|`, and `#&&`, `#||`, `###`,
+    `#>`, `#>>` and `#<` are words; `run()` is the status, where the reference's `run()` starts the
+    process, which here is `start()`. Bindings: `sysl.process.run`, `capture`, `start`, `spawn` and
+    `pipe`, with mirrors of `Status`, `Output` and `Var`. **Blocked on stage-7 opaque handles**:
+    `Stdio` carries a `sysl.fs.File`, and `Child` and `Spawned` are live processes.
+  - **[`Source`](/spec/system-library/#source)** in `avin.io`: `fromFile` (read whole, every failure
+    up front), `fromString`, `stdin()`, and `lines()`, `chars()` and `readAll()`, each consuming. The
+    reference's `getLines` and `mkString` are `lines` and `readAll`, the names `avin.io` already uses.
+    No new binding: it is written over `fs.readText` and standard input's buffer. Not blocked.
+  - **[`avin.random`](/spec/system-library/#avin-random)**: a `Random` class (`Random(seed)`
+    reproducible, `Random()` seeded by the platform) with `nextInt`, `nextLong`, bounded forms,
+    `between`, `nextReal`, `nextBoolean`, `nextGaussian`, `nextBytes`, `alphanumeric`, `shuffle` and
+    `setSeed`; the companion's methods use one shared, locked generator. PCG32, written in Avin with
+    the wrapping operators, so a seed gives the same sequence everywhere. Binding: one runtime
+    function for the platform's seed over `sysl.posix.rand.seed_from_os`, since its `u64` does not
+    fit a `long` at the boundary. `nextGaussian` needs a square root and a logarithm on `real`, which
+    Avin does not have yet. Not blocked on opaque handles.
+  - **[`avin.net`](/spec/system-library/#avin-net)**: `TcpStream` and `TcpListener`; `Url`, parsed
+    and percent-encoded, written in Avin; an HTTP/1.1 client (`get`, `post`, `send` with a `Request`)
+    written in Avin over the TCP stream, a status never an error. `IoError` gains
+    `ConnectionRefused`, `ConnectionReset` and `TimedOut`. Bindings: `sysl.net.resolve`, `socket`
+    and the `Socket` methods. **TCP is blocked on stage-7 opaque handles** (a `Socket`, and the
+    `Address` it connects to, are not boundary types); `Url` is not blocked. **`https` is blocked on
+    bindings to Sysl packages other than the standard library**, since TLS lives in a package of its
+    own.
+  - **[Concurrency](/spec/system-library/#concurrency)** stays in `avin.threads`; there is no
+    separate concurrency module. The reference's futures map onto what is there (`successful`, `all`
+    for `sequence`, `first` for `firstCompletedOf`, `await` for waiting with a time limit); added are
+    `Future.traverse`, `mapErr` and `orElse` on a future of a `Result` (its `recover` and
+    `fallbackTo`), an `Executor` for pools of one's own (its execution context, chosen explicitly),
+    `threads.blocking(body)` and `threads.sleep(d)`. There is no `failed` or `filter`, since a future
+    carries no failure. Bindings: none beyond a runtime timed wait for `sleep`. Not blocked.
+  - **JSON** is a package of its own, not part of the system library.
 
 ## Open
 
