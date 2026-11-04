@@ -28,7 +28,8 @@ alone.
 `Add` and `Mul` also name their identities, as [static members](/spec/declarations/#static-members) of
 the implementing type: `static zero() -> Self`, which `add` leaves a value unchanged by, and
 `static one() -> Self`, which `multiply` does. Every implementation gives them: the integers' are `0`
-and `1` at each width, `real`'s `0.0` and `1.0`, and `string`'s `zero` is the empty string. Generic
+and `1` at each width but `i1`, which holds 0 and -1 and has no `1`: `i1.one()` is a compile error, and
+`one()` reached at `i1` through a generic traps; `real`'s `0.0` and `1.0`, and `string`'s `zero` is the empty string. Generic
 code reaches them through the bound:
 
 ```text

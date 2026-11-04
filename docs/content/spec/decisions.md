@@ -501,6 +501,9 @@ Settled by the user on 2026-11-03:
   giving it too; its body has no `self`; a trait's default body cannot call one on `Self`; a trait
   with one is a bound and not a type; and a local, parameter, member or module value of a type's
   name hides the type as a receiver.
+- `i1` has no `1`: `i1.one()` is a compile error, and `one()` reached at `i1` through a generic
+  traps with "i1 has no 1" at the place the program called, so a generic that passes its bounds
+  compiles for every type meeting them.
 - An `impl` may add methods to a trait (`impl[T] Seq[T]`, `impl[T: Display] Seq[T]`). Its methods
   reach the value only through the trait's own methods, which are variance-checked, so, like the
   methods an impl adds to a `data` type, they are not variance positions: `contains(element: T)`,
@@ -563,7 +566,6 @@ Settled by the user on 2026-11-03:
   so a racing read sees some value written to that word, and a constructor ends with a release
   fence, so no thread sees an object without its header and constructor-set fields. Actors are
   scheduled onto a pool of these threads.
-- The width `i1` has no `1`, so its `one()` is `i1(1)`, which is `-1`.
 
 ## Open
 
