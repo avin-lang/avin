@@ -8,7 +8,7 @@ import sysl.slices.sort_by
 
 const Version: string = "0.0.2"
 const NoToolchain: string = "avin: cannot find the Avin library and runtime: they are installed in `share/avin` beside `bin/avin`; for a source checkout, set AVIN_ROOT to the directory that holds `library/` and `runtime/`"
-const Usage: string = "usage: avin [<program>] [-O0 | -O2] [-- <argument>...]\n       avin parse [<program>]\n       avin check [<program>]\n       avin emit-llvm [<program>] -o <module.ll>\n       avin build [<program>] [-o <executable>] [-O0 | -O2]\n       avin run [<program>] [-O0 | -O2] [-- <argument>...]\n       avin test [<program>] [<filter>] [-O0 | -O2]\n       avin new <dir> [--lib]\n       avin add <source>[@<version>] [<package>]\n       avin tidy [--check] [<package>]\n       avin fmt [--check] [<path>...]\n       avin tangle <file.lavin> [-o <path>]\n       avin weave <file.lavin> [-o <file.html>]\n       avin lsp [--stdio]\n       avin --help\n       avin --version\n<program> is a path in a package (a directory holding avin.hocon), a source file (`.avin`, or `.lavin` for a literate one), or a directory holding a program's modules; left out, it is the current directory\n`avin` alone is `avin run`, and `avin <program> ...` is `avin run <program> ...` when the first argument is not a command; reach a file or directory named like a command as `./test`\n`avin test`: an argument that names an existing file or directory is the program, any other is the filter; `avin test . <filter>` filters when a path of that name exists"
+const Usage: string = "usage: avin [<program>] [-O0 | -O2] [-- <argument>...]\n       avin parse [<program>]\n       avin check [<program>]\n       avin emit-llvm [<program>] -o <module.ll>\n       avin build [<program>] [-o <executable>] [-O0 | -O2]\n       avin run [<program>] [-O0 | -O2] [-- <argument>...]\n       avin test [<program>] [<filter>] [-O0 | -O2]\n       avin new <dir> [--lib]\n       avin add <source>[@<version>] [<package>]\n       avin tidy [--check] [<package>]\n       avin vendor [<package>]\n       avin fmt [--check] [<path>...]\n       avin tangle <file.lavin> [-o <path>]\n       avin weave <file.lavin> [-o <file.html>]\n       avin lsp [--stdio]\n       avin --help\n       avin --version\n<program> is a path in a package (a directory holding avin.hocon), a source file (`.avin`, or `.lavin` for a literate one), or a directory holding a program's modules; left out, it is the current directory\n`avin` alone is `avin run`, and `avin <program> ...` is `avin run <program> ...` when the first argument is not a command; reach a file or directory named like a command as `./test`\n`avin test`: an argument that names an existing file or directory is the program, any other is the filter; `avin test . <filter>` filters when a path of that name exists"
 
 // Output channels, the exit status and the toolchain location stay outside command dispatch, so
 // every command can be run and tested in memory. 0 is success, 1 a source, I/O or build failure,
@@ -22,7 +22,7 @@ run_cli_with(args: []const string, tc: Option[Toolchain], say: string -> unit, n
 
 /** Every command name; a first argument that is one is that command, never a path. */
 is_command(word: string) -> bool
-    for c in ["parse", "check", "emit-llvm", "build", "run", "test", "new", "add", "tidy", "fmt", "tangle", "weave", "lsp"]
+    for c in ["parse", "check", "emit-llvm", "build", "run", "test", "new", "add", "tidy", "vendor", "fmt", "tangle", "weave", "lsp"]
         if c == word then return true
     false
 
@@ -60,6 +60,7 @@ run_command(here: string, args: []const string, tc: Option[Toolchain], say: stri
     if args.len >= 2 && args[1] == "tidy" then return tidy_command(args, say, note)
     if args.len >= 2 && args[1] == "fmt" then return fmt_command(args, say, note)
     if args.len >= 2 && args[1] == "add" then return add_command(args, say, note)
+    if args.len >= 2 && args[1] == "vendor" then return vendor_command(args, say, note)
     val command = args[1]
     // The program is the next argument when it is one: not an option, and for `test`, naming an existing
     // path (otherwise that argument is the filter). Left out, it is `here`.
@@ -227,18 +228,9 @@ tidy_command(args: []const string, say: string -> unit, note: string -> unit) ->
         else
             note(Usage)
             return 2
-    val given = dir.unwrap_or(".")
-    // A workspace's root is tidied whole; any other path, by the package it is in.
-    var home = given
-    if !exists(given + "/" + ManifestName)
-        home = enclosing_package(given) match
-            Ok(Some(d)) -> d
-            Ok(None) ->
-                note(s"avin: $given is in no package: `avin tidy` reads a package's $ManifestName")
-                return 1
-            Err(message) ->
-                note(message.trim_end())
-                return 1
+    val home = project_of(dir.unwrap_or("."), "tidy", note) match
+        Some(h) -> h
+        None -> return 1
     tidy(home, default_fetching(), check, say) match
         Ok(true) -> 0
         Ok(false) ->
@@ -309,6 +301,38 @@ private fmt_collect(dir: string, files: *Buf[string])
         elif is_source_name(name) then files.push(full)
 
 private fmt_name_before(a: string, b: string) -> bool = a < b
+
+/** `avin vendor [<package>]`: every fetched package the package's whole resolution reads copied into
+ * `vendor/` beside its manifest, the workspace root's in a workspace, and what it no longer reads
+ * removed from there. */
+vendor_command(args: []const string, say: string -> unit, note: string -> unit) -> int
+    var dir: Option[string] = None
+    for i in 2..<args.len
+        if !args[i].starts_with("-") && dir is None then dir = Some(args[i])
+        else
+            note(Usage)
+            return 2
+    val home = project_of(dir.unwrap_or("."), "vendor", note) match
+        Some(h) -> h
+        None -> return 1
+    vendor(home, default_fetching(), say) match
+        Ok(_) -> 0
+        Err(message) ->
+            note(message.trim_end())
+            1
+
+// The package or workspace `avin <command>` given `given` works on: a workspace's root whole, and any
+// other path the package it is in. Says through `note` why there is none.
+private project_of(given: string, command: string, note: string -> unit) -> Option[string]
+    if exists(given + "/" + ManifestName) then return Some(given)
+    enclosing_package(given) match
+        Ok(Some(d)) -> Some(d)
+        Ok(None) ->
+            note(s"avin: $given is in no package: `avin $command` reads a package's $ManifestName")
+            None
+        Err(message) ->
+            note(message.trim_end())
+            None
 
 /** Where `avin build` writes when no `-o` is given: the package's name, or the source's name without
  * `.avin` or `.lavin`, or the program directory's name, in the working directory. */

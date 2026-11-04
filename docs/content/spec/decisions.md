@@ -1005,9 +1005,25 @@ Settled by the user on 2026-11-04:
     leading zeros. A manifest is optional: a directory or file with none above it is a program as
     before.
   - **Dependencies**: `{ git = "host/owner/name", version = "x.y.z" }` read at the tag `vx.y.z`
-    and cloned from `https://`; `{ path = "../dir" }`, relative to the manifest naming it and refused
-    in a fetched package; `{ workspace = true }`. A coordinate with `https://` or `.git` is refused.
+    and cloned from `https://`; `{ path = "../dir" }`, relative to the manifest naming it, and in a
+    fetched package naming another package of its repository at its version (refused when it leaves
+    the repository); `{ workspace = true }`. A coordinate with `https://` or `.git` is refused.
     Features and members of a repository are settled above.
+  - **Members, as built**: a fetched package's in-repository `path` and `workspace = true`
+    dependencies are read as the repository's own packages at its version whether the package is a
+    member or the repository's root package, since the root of a workspace with a `package` block is
+    its first member. A member's directory may hold no `.`, `..` or `*`. The clone is filed once per
+    repository and version; a repository whose root has no manifest is still filed when a member of
+    it is what was asked for.
+  - **Vendoring, as built**: `avin tidy` and `avin add` read the machine's cache, fetching into it,
+    whether or not the project has a `vendor/`, so a dependency is added to a vendored project and
+    then copied in by `avin vendor`. `avin vendor` checks every cache copy before writing anything, so
+    a refusal leaves `vendor/` as it was (and a project with none still has none); a vendored copy is
+    left alone only when its recorded hash and its files both match its line, so an edited copy is
+    replaced; directories left empty by a removal are removed; and it ends `vendored N packages into
+    vendor/`, the packages being `avin.sum`'s lines (a member and its repository's root package at
+    one version are two packages and one copy). The cache's `.hash` beside a vendored entry is trusted
+    by a build, as the cache's is: a build does not re-hash `vendor/`.
   - **`rev` pins**: `{ git = "…", rev = "<hex>" }`, seven to forty lowercase hexadecimal digits,
     refused with a `version` or without `git`. The repository is cloned whole and the commit
     resolved to its full id, fetched by that id when no branch or tag reaches it (only a full id
