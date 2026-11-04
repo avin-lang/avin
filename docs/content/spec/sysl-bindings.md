@@ -182,4 +182,7 @@ binds the C API with its own FFI, and Avin binds the Sysl API.
 
 The Avin **runtime** — program startup, the collector interface, traps, and the low-level string and
 number primitives — is written in Sysl. It is reached through a private ABI that only the compiler
-uses, not through bindings. Bindings are the public mechanism, and they are written in Avin.
+uses, not through bindings. Bindings are the public mechanism, and they are written in Avin. The one
+exception is a plain top-level function the runtime offers the library, such as the platform's
+sentence for a file-system error: the library binds it by its module and name, `avin.rt.<name>`, like
+any Sysl function.
