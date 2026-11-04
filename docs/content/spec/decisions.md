@@ -470,7 +470,8 @@ Settled by the user on 2026-11-03:
   `Set` and `Map` included (`val s: Set[int] = [3, 1, 2]`), until set and map literals have syntax of
   their own.
 - The arithmetic traits carry their identities: `Add` has `zero` and `Mul` has `one`, so `sum` and
-  `product` of an empty collection are those values rather than an `Option`.
+  `product` of an empty collection are those values rather than an `Option`. They are written once,
+  by impls on `Iterable` (`impl[T: Add] Iterable[T]`, `impl[T: Mul] Iterable[T]`).
 - `Seq[+T]` is a core trait over `Iterable[T]` with two abstract methods, `length()` and
   `apply(index)`; its other methods (`get`, `isEmpty`, `head`, `headOption`, `last`, `lastOption`,
   the folds, `foreach`, `exists`, `forall`, `find`, `indexWhere`, `count`, `toVector`, `toList`, an
