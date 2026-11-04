@@ -1381,6 +1381,15 @@ Settled by the user on 2026-11-04:
   needing Unicode data beyond the general category (scripts, blocks, `Alphabetic`, `Uppercase`,
   `Lowercase`, `Ideographic`, `Word`, emoji), the flags `U` and `c`, `\X`, `\b{g}` and `\N{…}` are
   refused with an `Unsupported` error until the runtime holds that data.
+- Sysl handles ([Sysl bindings](/spec/sysl-bindings/#handles)): a `class` declared with `@sysl`
+  naming a Sysl type has no parameters, fields or constructor and is made only by a binding that
+  returns it, directly or as the value of an `Option` or `Result`; a collection of handles does not
+  cross. A method without a body is bound to the Sysl method of its name's words in snake_case, or
+  to the one its own `@sysl("name")` names. Every handle has `close()`, which gives its counted
+  reference back and does nothing a second time; a bound method on a closed handle traps at the
+  call with "`Name` is closed"; a handle never closed is given back by a finalizer when the
+  collector frees it. A handle crosses back into Sysl only as the receiver of its own methods,
+  compares by identity, and has no `Display`.
 
 ## Open
 

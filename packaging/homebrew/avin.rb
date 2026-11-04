@@ -20,10 +20,9 @@ class Avin < Formula
   # LLVM's archiver with it.
   depends_on "sysl-lang/tap/sysl"
 
-  # The standard library's file functions report a file standing where a directory would go as
-  # `NotADirectory`, which needs Sysl 0.8.17. A dependency cannot name a least version, so it is
-  # checked here.
-  MINIMUM_SYSL = "0.8.17".freeze
+  # A Sysl handle held in an `Option` or a `Result` is converted by a generic shim function that
+  # needs Sysl 0.8.18. A dependency cannot name a least version, so it is checked here.
+  MINIMUM_SYSL = "0.8.18".freeze
 
   def install
     sysl = Formula["sysl-lang/tap/sysl"]
