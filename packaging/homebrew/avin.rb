@@ -20,7 +20,17 @@ class Avin < Formula
   # LLVM's archiver with it.
   depends_on "sysl-lang/tap/sysl"
 
+  # The standard library's file functions report a file standing where a directory would go as
+  # `NotADirectory`, which needs Sysl 0.8.17. A dependency cannot name a least version, so it is
+  # checked here.
+  MINIMUM_SYSL = "0.8.17".freeze
+
   def install
+    sysl = Formula["sysl-lang/tap/sysl"]
+    if sysl.any_version_installed? && sysl.version < Version.new(MINIMUM_SYSL)
+      odie "avin needs Sysl #{MINIMUM_SYSL} or later; run `brew upgrade sysl-lang/tap/sysl` first"
+    end
+
     # The tarball is already a prefix -- bin/avin, and share/avin holding the library, the runtime
     # and its prebuilt archive, and the editor grammars -- and the compiler finds share/avin beside
     # itself through the bin/ symlink. What it builds goes to the user's cache, never into the keg.
