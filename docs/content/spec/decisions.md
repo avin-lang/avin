@@ -428,6 +428,8 @@ a decision changes, this page and the chapter change together.
 
 Settled by the user on 2026-11-03:
 
+- `fail(message)` is public in the prelude: it traps with the message at the caller's place and has
+  type `Nothing`.
 - The methods an `impl` adds to a class whose fields are all immutable are not variance positions,
   as a `data` type's are not: such an instance holds nothing a method could store a value into. A
   class with a `var` field keeps every method a position.
@@ -497,7 +499,14 @@ Settled by the user on 2026-11-03:
 - A trait may declare `static` members, which belong to the implementing type rather than to a
   value: `static zero() -> Self` in `Add`, `static one() -> Self` in `Mul`. Every impl gives them,
   and they are called on a type, `int.zero()`, or on a bounded type parameter, `T.zero()`. `sum()`
-  and `product()` on the collections are written with them.
+  and `product()` on the collections are written with them. The details of
+  [static members](/spec/declarations/#static-members): `static` is a keyword, written after
+  `private` and before or after `override`; a static member is only a trait's or an implementation
+  of one, with no static members of a type's own; in a trait it has no default body, and no trait
+  overrides one; an implementation is `static` exactly where the trait's member is, an abstract class
+  giving it too; its body has no `self`; a trait's default body cannot call one on `Self`; a trait
+  with one is a bound and not a type; and a local, parameter, member or module value of a type's
+  name hides the type as a receiver.
 - An `impl` may add methods to a trait (`impl[T] Seq[T]`, `impl[T: Display] Seq[T]`). Its methods
   reach the value only through the trait's own methods, which are variance-checked, so, like the
   methods an impl adds to a `data` type, they are not variance positions: `contains(element: T)`,
@@ -560,14 +569,7 @@ Settled by the user on 2026-11-03:
   so a racing read sees some value written to that word, and a constructor ends with a release
   fence, so no thread sees an object without its header and constructor-set fields. Actors are
   scheduled onto a pool of these threads.
-- The details of [static members](/spec/declarations/#static-members): `static` is a keyword,
-  written after `private` and before or after `override`; a static member is only a trait's or an
-  implementation of one (no static members of a type's own yet); in a trait it has no default body,
-  and no trait overrides one; an implementation is `static` exactly where the trait's member is, an
-  abstract class giving it too; its body has no `self`; a trait's default body cannot call one on
-  `Self`; a trait with one is a bound and not a type; and a local, parameter, member or module value
-  of a type's name hides the type as a receiver. The width `i1` has no `1`, so its `one()` is
-  `i1(1)`, which is `-1`.
+- The width `i1` has no `1`, so its `one()` is `i1(1)`, which is `-1`.
 
 ## Open
 
