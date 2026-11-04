@@ -495,6 +495,49 @@ a context's state by its thread, so either the thread sees the flag and wakes th
 collector sees the thread safe. With one context attached the flag is never raised, so a program
 with one thread takes no poll's slow path and makes no system call for a collection.
 
+The emitter gives the [memory model](/spec/threads/#the-memory-model) its two guarantees.
+**Every load and store another thread can reach is an `unordered` atomic one**: a field of an
+object, which covers class and data fields, a closure's captures and the box of a captured `var`;
+an element of an array; a byte of a string; and a module-level value, in `@avin.roots` or a global
+of its own. A function's own slots, and the slots of its callers whose addresses a local function is
+given as parameters, belong to one thread and are accessed plainly, as are the header words and the
+constant descriptors behind them. An atomic access is made at the width the value is laid out at, a
+whole power-of-two number of bytes: a `bool` is a byte and an `i5` a byte, an `i24` four, an `i48`
+eight, truncated after a load and zero-extended before a store. An integer wider than 64 bits is
+accessed as its 64-bit words, lowest first, each an `unordered` access of its own, so no word is torn
+and a racing load may combine words of different stores. On arm64 and x86-64 an `unordered` load or
+store is the same instruction a plain one is.
+
+**Making an object ends with `fence release`**, once its last field is stored and before the
+reference can reach anything else: a data value or tuple after its fields, a closure after its
+captures, a box after its value, a value boxed as `Any` after the value, and a class's object at the
+end of its constructor, after the class body has run. A constant object needs none. On arm64 the
+fence is one `dmb ish`; on x86-64 it is no instruction at all, only an order the compiler keeps.
+Arrays and strings are made by the runtime, so the fence for them is the runtime's to make.
+
+**Starting a thread.** `avin.threads` reaches three intrinsics. `thread_start` calls
+`avin_rt_thread_start` with a closure taking nothing and returning nothing, which stores the body's
+result where the `Thread` reads it, and the stack size. The entry makes the new thread's context
+before the thread exists, with a frame of two slots at the bottom of its stack: the closure, and the
+thread's *joint*, the object it is joined by, allocated on the collected heap. That frame is linked
+onto the calling thread's own stack while the joint is allocated and the lock is awaited, then moved
+to the new context, which is attached, safe, before the operating system thread is started with the
+requested stack. So the closure is a root at every moment from the call to the thread's end. The
+new thread marks its context running, calls the closure's entry (the word before its descriptor)
+with its context and the closure, and detaches and frees its context when the closure returns.
+`thread_join` calls `avin_rt_thread_join`, which waits safe for the operating system thread under the
+joint's own lock, so of several joins one waits for the thread and the rest for it, and a later join
+returns at once; the joint, and with it the thread's handle, is collected once nothing reaches the
+`Thread`. `thread_current` answers the calling context's address, which the scope compares with
+its owner's.
+
+**Ending the program.** A trap, a failed allocation and `exit` begin by taking a lock that is never
+given back: the first thread to take it flushes standard output, reports and stops the process, and
+any other waits safe for the end, so a program stops once with one report however many threads fail.
+A trap ends the process with the trap signal from whichever thread raises it. When `main` returns,
+the entry's `main` returns its status to the C library, whose exit flushes standard output and ends
+the process with every other thread in it.
+
 ## Standard library
 
 `library/` holds Avin source under the module root `avin`, starting with the prelude every program

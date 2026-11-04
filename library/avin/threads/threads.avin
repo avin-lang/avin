@@ -1,0 +1,79 @@
+module avin.threads
+
+// Threads: a closure run on an operating system thread of its own, joined for its result. The heap
+// is shared, so what the closure captures is reachable from both threads; nothing is copied. A trap
+// in any thread stops the whole program, and the program ends when `main` returns, whatever other
+// threads are still running.
+
+// Starts a thread running `run` on a stack of `stack` bytes, and gives back the object it is joined
+// by. The thread's context is attached before it starts, so `run` is never out of the collector's
+// sight.
+@intrinsic("thread_start")
+private start(run: () -> unit, stack: long) -> Any
+
+// Waits for the thread `joint` was given back for, safe for the collector while it waits. Waiting a
+// second time returns at once.
+@intrinsic("thread_join")
+private await(joint: Any)
+
+// The calling thread's identity, which no other running thread shares.
+@intrinsic("thread_current")
+private current() -> long
+
+// Where a thread leaves its result, which `join` reads once the thread has finished.
+private class Outcome[T]()
+    var value: Option[T] = None
+
+    finish(v: T) = value = Some(v)
+
+// A running or finished thread whose body yields a `T`.
+class Thread[T](private val joint: Any, private val outcome: Outcome[T])
+    // Waits for the thread to finish and gives back what its body returned. Joining again gives the
+    // same result again.
+    join() -> T
+        await(joint)
+        outcome.value match
+            Some(v) -> v
+            None -> fail("a joined thread left no result")
+
+// Starts `body` on a new thread with a stack of `stack` bytes, 8 MiB unless asked otherwise.
+spawn[T](body: () -> T, stack: long = 8388608) -> Thread[T]
+    val outcome = Outcome[T]()
+    Thread(start(() -> outcome.finish(body()), stack), outcome)
+
+// What a scope has started: a join of each of its threads, newest first, and whether it is still
+// open. It belongs to the thread that runs the scope's body.
+private class Started()
+    val owner = current()
+    var open = true
+    var joins: List[() -> unit] = []
+
+    // Joins every thread started so far, and closes the scope.
+    close()
+        for j in joins do j()
+        open = false
+
+// The threads one call of `scope` starts, which it joins before it returns. They are started by the
+// thread that runs the scope's body, while the scope is open.
+class Scope(private val started: Started)
+    // Starts `body` on a new thread with a stack of `stack` bytes, as `spawn` does, which the scope
+    // joins before it returns.
+    spawn[T](body: () -> T, stack: long = 8388608) -> Thread[T]
+        if !started.open then fail("a scope's threads are started while it is open")
+        if current() != started.owner then fail("a scope's threads are started by the thread that runs its body")
+        val t = startThread(body, stack)
+        val joinIt: () -> unit = () ->
+            t.join()
+            ()
+        started.joins = joinIt :: started.joins
+        t
+
+private startThread[T](body: () -> T, stack: long) -> Thread[T] = spawn(body, stack)
+
+// Runs `body` with a new scope, and returns what it returns once every thread started through the
+// scope has finished.
+scope[T](body: (Scope) -> T) -> T
+    val started = Started()
+    val result = body(Scope(started))
+    started.close()
+    result

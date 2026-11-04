@@ -1,18 +1,15 @@
 ---
 title: Threads
-summary: A proposal for starting and joining threads, what they share, how they synchronize, and what a racing read sees.
+summary: Starting and joining threads, what they share, how they synchronize, and what a racing read sees.
 weight: 16
 ---
 
-**This chapter is a proposal, awaiting the user's decision** (see [decisions](/spec/decisions/)).
-The runtime machinery it rests on exists: contexts attached per thread, an allocation lock,
-safepoints and stop-the-world collection ([the runtime](/compiler/#runtime)). No thread API is
-exposed to programs yet.
+Avin programs run threads in parallel over one shared, collected heap.
 
 ## Starting and joining
 
-Threads are library code in `avin.threads`, over two runtime entries that make and retire a thread's
-context. A thread runs a closure and is joined for its result:
+Threads are library code in `avin.threads`, over runtime entries that start a thread with a context
+of its own and wait for it to finish. A thread runs a closure and is joined for its result:
 
 ```avin
 import avin.threads.spawn
@@ -25,12 +22,32 @@ main() -> int
 
 - `spawn[T](body: () -> T, stack: long = 8388608) -> Thread[T]` starts `body` on a new operating
   system thread with a stack of its own (8 MiB unless asked otherwise). `join() -> T` waits for it
-  and gives back the result; joining a second time gives the same result again.
+  and gives back the result; joining a second time gives the same result again. Any thread may
+  join, several at once: one waits for the thread and the others wait for that one. A `Thread` is
+  collected like any other object once nothing reaches it; a thread that is never joined keeps its
+  stack until the program ends.
 - **A trap in any thread stops the program**, as it does in a program with one thread: traps report
-  bugs, and a bug in one thread leaves the state the others share in doubt.
-- **The program ends when `main` returns**, whatever other threads are still running. A library
-  scope makes the joins structural: `scope(s -> …)` returns only once every thread started through
-  `s.spawn` has finished.
+  bugs, and a bug in one thread leaves the state the others share in doubt. Only the first thread to
+  stop the program reports: what was written is flushed once and one reason is printed, and a
+  thread that traps after it, or calls `exit`, waits for the end.
+- **The program ends when `main` returns**, whatever other threads are still running: standard
+  output is flushed and the process exits with `main`'s status, taking the other threads with it.
+- A library scope makes the joins structural: `scope(s -> …)` returns its body's result only once
+  every thread started through `s.spawn` has finished. `s.spawn` takes the same arguments as
+  `spawn` and is called by the thread that runs the scope's body, while the scope is open; a call
+  from another thread, or after the scope has returned, traps. A thread the scope started that
+  starts more uses a scope of its own.
+
+```avin
+import avin.threads.scope
+
+main() -> int
+    val parts = Array.fill(4, 0)
+    scope(s ->
+        for i in 0..<4
+            s.spawn(() -> parts(i) = (i + 1) * 10))
+    parts(0) + parts(1) + parts(2) + parts(3)
+```
 
 ## What is shared
 
@@ -65,16 +82,21 @@ mutable state is reached only under those edges sees sequentially consistent beh
 
 **A data race on a plain field or `var` is not undefined behaviour.** A racing read returns some
 value that was written to that location, never a mixture of two writes and never a value nothing
-wrote. Every field is at most a word, since a reference is one word and so is every built-in
-scalar, so the compiler gives each access to a heap field or a module-level variable LLVM's
-`unordered` atomic ordering: it costs nothing on the machines Avin targets, and it is exactly the
-promise that a word is never torn and a racing load is never undefined.
+wrote. The compiler gives each access to a heap field, an array element or a module-level variable
+LLVM's `unordered` atomic ordering: it costs nothing on the machines Avin targets, and it is exactly
+the promise that a word is never torn and a racing load is never undefined. A reference is one word,
+and so is every built-in scalar.
+
+**An integer wider than 64 bits is the one exception.** An `i128` or an `i257` is several words,
+and a field or variable of one is read and written as untorn 64-bit words, so a racing read of it
+may combine words of different writes. Each word is still one some write stored, and a program that
+shares such a value under the edges above, or through an `Atomic` or a `Mutex`, never sees a mixture.
 
 **An object is complete before any thread can see it.** A constructor ends with a release fence, so
 a thread that reads a reference to an object, however it got it, sees the object's header and every
 field its constructor set. Without it, a racing reader could see a reference field still zero,
-which no Avin type allows. The fence is free on x86-64 and one store barrier on ARM, paid once per
-object made.
+which no Avin type allows. The fence is no instruction at all on x86-64 and one `dmb ish` barrier
+on arm64, paid once per object made.
 
 ## Collection
 

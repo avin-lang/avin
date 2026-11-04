@@ -39,7 +39,7 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
 | [Declarations](/spec/declarations/) | `data`, `class`, `trait`, `object`, `impl`, members, modules, initialization |
 | [Generics and inference](/spec/generics/) | Reification, bounds, variance, type tests, local inference |
 | [Equality, identity and memory](/spec/equality-and-memory/) | `==`, `===`, hashing, display, values vs references, GC |
-| [Threads](/spec/threads/) | Proposed: starting and joining, sharing, synchronization, the memory model |
+| [Threads](/spec/threads/) | Starting and joining, sharing, synchronization, the memory model |
 | [Errors](/spec/errors/) | `Result`, `Option`, `?`, traps |
 | [Collections](/spec/collections/) | The Iterable hierarchy, arrays, literals, ranges, `for` |
 | [Sysl bindings](/spec/sysl-bindings/) | Calling Sysl from Avin |
