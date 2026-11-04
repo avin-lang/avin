@@ -271,8 +271,11 @@ open classes, impl-added methods and trait defaults keep their meaning:
   and so are `hasNext` and `next` on the iterator a sequence's `iterator()` makes: `for` keeps its
   settled meaning, a traversal through `iterator()`, and its calls become direct and inlinable.
 - **One implementation.** A call is direct when every descriptor in the program of a type conforming
-  to the receiver's class or trait, at any type arguments, holds one and the same method at the call's
-  position. A trait with one implementing class, or an open class no subclass overrides, needs no
+  to the receiver's class or trait, at any type arguments it can be seen through, holds one and the
+  same method at the call's position. An instance whose type argument is a number, `char`, `bool` or
+  `unit` where the receiver's is a different type, or the reverse, is left out: such a type has no
+  subtype but `Nothing` and is never boxed inside a container, so the `Vector[Any]` a call of
+  `println` makes never reaches a call on a `Vector[int]`. A trait with one implementing class, or an open class no subclass overrides, needs no
   table load. A boxed value's descriptor belongs to no class or data type, so it always counts as a
   method of its own.
 - **Guarded.** Otherwise, when the descriptors of the types the receiver's exact static type admits

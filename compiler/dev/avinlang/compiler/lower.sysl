@@ -1401,9 +1401,32 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
         Some(id) -> Some(Value(id))
         None -> None
 
+// Whether an object whose type is `up` as an instance of the class or trait `head` can never be a
+// value of the static type `receiver`: some type argument the parameter does not take the other way
+// is a number, a `char`, a `bool` or `unit` on one side and a different type on the other. A value of
+// such a type has no subtype but `Nothing` and is never boxed inside a container, so a `Vector[Any]`
+// or a `Vector[Shape]` is never a `Vector[int]`, and the reverse.
+private never_reaches(f: Conformances, head: usize, up: &Type, receiver: &Type) -> bool
+    val xs = *up match
+        Class(_, _, a) -> a
+        _ -> return false
+    val ys = *receiver match
+        Class(_, _, a) -> a
+        _ -> return false
+    val params = f.classes[head].decl.type_params
+    if xs.len() != ys.len() || xs.len() != params.len() then return false
+    for i in 0..<xs.len()
+        if params[i].variance is Contravariant then continue
+        if same_type(xs[i], ys[i]) || *xs[i] is Nothing || *ys[i] is Nothing then continue
+        if is_plain_value(xs[i]) || is_plain_value(ys[i]) then return true
+    false
+
+/** Whether `t` is a number, a `char`, a `bool` or `unit`: a built-in type held as its value. */
+private is_plain_value(t: &Type) -> bool = is_builtin(t) && !(*t is Str)
+
 // What the finished program shows of each call through a method table on a receiver of known static
 // type. Every object such a call can reach has a descriptor of a type that conforms to the receiver's
-// class or trait, whatever its type arguments: where all of those that hold a method at the call's
+// class or trait, with type arguments it can be seen through (`never_reaches`): where all of those that hold a method at the call's
 // position hold the same one, that method is the one every receiver runs. A descriptor of a type that
 // is no class or data type, a boxed value's, cannot be placed, so it counts as holding a method of
 // its own. The guards are the descriptors of the types a value of the receiver's exact static type
@@ -1426,7 +1449,11 @@ private dispatch_sites(l: *Lowering) -> Buf[DispatchSite]
                 None -> continue
             val t = l.record_types[descriptor.record]
             val placed = *t is Class(_, _, _) || *t is Data(_, _, _)
-            if placed && holding_ancestor(f, t, head) is None then continue
+            if placed
+                val up = holding_ancestor(f, t, head) match
+                    Some(up) -> up
+                    None -> continue
+                if never_reaches(f, head, up, call.receiver) then continue
             single match
                 Some(s) -> if s != g then many = true
                 None -> single = Some(g)

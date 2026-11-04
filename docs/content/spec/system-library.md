@@ -154,7 +154,8 @@ nothing the collector waits on, as `await` does not.
 
 Standard input, read as text, and the error every module that reads or writes shares. Standard
 output and standard error need no import: `print`, `println`, `eprint` and `eprintln` are in the prelude, beside the
-writers `StandardOutput` and `StandardError`.
+writers `StandardOutput` and `StandardError`; each is one function taking `Any*` (see
+[Strings and formatting](/spec/strings-and-formatting/)).
 
 ### `IoError`
 
@@ -228,7 +229,7 @@ stream a program consumes as it arrives, where a file is read whole: `fs.readTex
 **Writing to standard error flushes standard output first.** Standard output is buffered, and
 flushed when the program ends, exits or traps; standard error is not buffered. Each write to
 standard error first flushes what the program has written to standard output, so when both go to one
-terminal or one file they arrive in the order the program wrote them. `eprintln(x)` renders `x` and its
+terminal or one file they arrive in the order the program wrote them. `eprintln(x)` renders `x` (or all its arguments) and its
 new line first and writes them in one write, so a line is never split.
 
 **Tests see no input.** `avin test` gives each test an empty standard input, so a test never waits on
