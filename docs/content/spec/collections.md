@@ -120,6 +120,19 @@ pairs[A](xs: List[A]) -> List[(A, A)] = xs match
 the empty `List[int]`. `xs(i)` on a list takes time proportional to `i`; code that indexes wants a
 `Vector`.
 
+`List` is a `data` type of the core library with two variants, `Cons(first: T, rest: List[T])` and
+`Nil`; `x :: xs` is `Cons(x, xs)` and `[]` is `Nil`. `::`, `[]` built as a list, and list patterns
+always mean the core library's `List`, even where a program declares its own `List`, `Cons` or
+`Nil`. The element type of `x :: xs` is inferred as a call of `Cons` infers it, so a `Cat` goes in
+front of a `List[Dog]` where a `List[Animal]` is expected.
+
+Every operation on a list loops over it rather than recursing, so a list of any length is traversed,
+transformed, compared and hashed without deepening the stack; a method that yields a list in order,
+such as `map` or `filter`, builds it reversed and turns it around. `head()`, `tail()` and `last()`
+trap on the empty list, and `headOption()` and `get(i)` return an `Option`. Lists compare and hash by
+their contents, and order element by element when their elements are ordered, a list ordering
+before every longer list it begins.
+
 ## Sequence patterns
 
 A sequence is taken apart with the same brackets that build it. `[]` matches an empty sequence, and
