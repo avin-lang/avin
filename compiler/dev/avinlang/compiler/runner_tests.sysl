@@ -1,0 +1,191 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.fs.{exists, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.Stdio
+
+// `avin run` and `avin test`, through the command line as a person types it, with the program's
+// own output sent to files so it can be read back.
+
+private struct Session
+    status: int
+    said: string
+    noted: string
+    out: string
+    err: string
+
+private session(dir: string, args: []const string) -> Session
+    var said = ""
+    var noted = ""
+    val out = dir + "/run.out"
+    val err = dir + "/run.err"
+    val status = run_cli_with(args, Some(repository_toolchain()), s -> said = said + s + "\n", s -> noted = noted + s + "\n", Stdio.ToPath(out), Stdio.ToPath(err))
+    Session(status, said, noted, read_text(out).unwrap_or(""), read_text(err).unwrap_or(""))
+
+@test("run builds the program, runs it with its arguments, and forwards its output and exit status")
+run_forwards_output_and_status()
+    val dir = make_temp_dir("avin-run").unwrap()
+    defer _ = remove_dir_all(dir)
+    val source = dir + "/greet.avin"
+    write_text(source, "main() -> int\n    print(\"hello\")\n    3\n").unwrap()
+    val run = session(dir, ["avin", "run", source, "--", "first", "-O0", "--"])
+    assert_eq(run.noted, "")
+    assert_eq(run.said, "")
+    assert_eq(run.out, "hello\n")
+    assert_eq(run.err, "")
+    assert_eq(run.status, 3)
+    // The executable is kept in the cache beside the source, never written beside it as `build` does.
+    assert(exists(dir + "/.avin/build/greet-O2"))
+    assert(!exists(dir + "/greet"))
+    val unoptimized = session(dir, ["avin", "run", source, "-O0"])
+    assert_eq(unoptimized.status, 3)
+    assert_eq(unoptimized.out, "hello\n")
+    assert(exists(dir + "/.avin/build/greet-O0"))
+
+@test("run exits 128 and the signal's number when the program traps, with the trap's report on standard error")
+run_forwards_a_trap()
+    val dir = make_temp_dir("avin-run").unwrap()
+    defer _ = remove_dir_all(dir)
+    val source = dir + "/fails.avin"
+    write_text(source, "main()\n    print(\"before\")\n    assertEq(1 + 1, 3)\n").unwrap()
+    val run = session(dir, ["avin", "run", source])
+    assert(run.status > 128)
+    assert_eq(run.out, "before\n")
+    assert_eq(run.err, "avin: trap: assertion failed: expected 3, found 2 at fails.avin:3:5\n")
+    assert_eq(run.noted, "")
+
+@test("run reports a program's diagnostics and exits 1 without running anything")
+run_reports_diagnostics()
+    val dir = make_temp_dir("avin-run").unwrap()
+    defer _ = remove_dir_all(dir)
+    val source = dir + "/bad.avin"
+    write_text(source, "main() = missing\n").unwrap()
+    val run = session(dir, ["avin", "run", source])
+    assert_eq(run.status, 1)
+    assert(run.noted.contains("`missing` is not defined"))
+    assert_eq(run.out, "")
+    // A program built for its tests need not have `main`, but one built to run does.
+    val tests_only = dir + "/tests_only.avin"
+    write_text(tests_only, "@test\nholds()\n    assert(true)\n").unwrap()
+    assert(session(dir, ["avin", "run", tests_only]).noted.contains("a program needs a `main` function"))
+    assert_eq(session(dir, ["avin", "test", tests_only]).status, 0)
+
+@test("the cached executable is reused until a source, the optimization or the kind of build changes")
+cache_is_reused()
+    val dir = make_temp_dir("avin-run").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain()
+    val source = dir + "/cached.avin"
+    val text = "main() -> int = 7\n\n@test\nseven()\n    assertEq(main(), 7)\n"
+    write_text(source, text).unwrap()
+    val first = cached_build(tc, source, single_file(source_of(source, text)), false, "-O2").unwrap()
+    assert(first.built)
+    val again = cached_build(tc, source, single_file(source_of(source, text)), false, "-O2").unwrap()
+    assert(!again.built)
+    assert_eq(again.path, first.path)
+    assert(cached_build(tc, source, single_file(source_of(source, text)), false, "-O0").unwrap().built)
+    val tests = cached_build(tc, source, single_file(source_of(source, text)), true, "-O2").unwrap()
+    assert(tests.built)
+    assert(tests.path != first.path)
+    // A test executable taken from the cache still knows its tests, without compiling the program.
+    val cached_tests = cached_build(tc, source, single_file(source_of(source, text)), true, "-O2").unwrap()
+    assert(!cached_tests.built)
+    assert_eq(cached_tests.tests.len(), 1)
+    assert_eq(cached_tests.tests[0].name, "seven")
+    assert_eq(cached_tests.tests[0].line, 4)
+    val changed = "main() -> int = 8\n"
+    write_text(source, changed).unwrap()
+    assert(cached_build(tc, source, single_file(source_of(source, changed)), false, "-O2").unwrap().built)
+    // Through the command line, a second run of an unchanged program runs the same executable.
+    assert_eq(session(dir, ["avin", "run", source]).status, 8)
+    assert_eq(session(dir, ["avin", "run", source]).status, 8)
+
+// A program of two modules: three tests that fail in different ways among ones that pass.
+private write_tree(dir: string)
+    make_dir_all(dir + "/geom").unwrap()
+    write_text(dir + "/geom/clamp.avin", "module geom\n\nclamp(n: int, low: int, high: int) -> int = if n < low then low elif n > high then high else n\n\n@test(\"clamps below the low bound\")\nbelow()\n    assertEq(clamp(0, 1, 3), 1)\n\n@test\nleavesInRange()\n    print(\"checking 2\")\n    assertEq(clamp(2, 1, 3), 3)\n").unwrap()
+    write_text(dir + "/math.avin", "import geom.clamp\n\n@test\nadds()\n    assertEq(1 + 1, 2)\n\n@test\noverflows()\n    val big = 2147483647\n    assert(big + 1 > 0)\n\n@test\nmessage()\n    assert(clamp(5, 1, 3) == 5, \"five stays five\")\n\nmain() = 0\n").unwrap()
+
+@test("test runs every test of the tree in its own process, reports each failure with its place, and carries on")
+test_reports_and_continues()
+    val dir = make_temp_dir("avin-test").unwrap()
+    defer _ = remove_dir_all(dir)
+    val root = dir + "/tree"
+    write_tree(root)
+    val run = session(dir, ["avin", "test", root])
+    assert_eq(run.noted, "")
+    assert_eq(run.status, 1)
+    val lines = run.said.lines()
+    assert_eq(lines[0], "running 5 tests")
+    assert_eq(lines[1], "")
+    assert_eq(lines[2], "geom/clamp.avin")
+    assert(lines[3].starts_with("  ok    clamps below the low bound  "))
+    assert(lines[3].ends_with("ms"))
+    assert(lines[4].starts_with("  FAIL  leavesInRange "))
+    assert_eq(lines[5], "        assertion failed: expected 3, found 2 at clamp.avin:12:5")
+    assert_eq(lines[6], "        > checking 2")
+    assert_eq(lines[7], "")
+    assert_eq(lines[8], "math.avin")
+    assert(lines[9].starts_with("  ok    adds  "))
+    assert(lines[10].starts_with("  FAIL  overflows  "))
+    assert_eq(lines[11], "        integer overflow at math.avin:10:16")
+    assert(lines[12].starts_with("  FAIL  message  "))
+    assert_eq(lines[13], "        assertion failed: five stays five at math.avin:14:5")
+    assert_eq(lines[14], "")
+    assert(lines[15].starts_with("2 passed, 3 failed — "))
+    assert_eq(lines.len, 16)
+
+@test("a filter keeps the tests whose name or file contains it, and a run where every test passes exits 0")
+test_filter()
+    val dir = make_temp_dir("avin-test").unwrap()
+    defer _ = remove_dir_all(dir)
+    val root = dir + "/tree"
+    write_tree(root)
+    val by_name = session(dir, ["avin", "test", root, "low bound"])
+    assert_eq(by_name.status, 0)
+    assert(by_name.said.starts_with("running 1 of 5 tests\n\ngeom/clamp.avin\n  ok    clamps below the low bound  "))
+    assert(by_name.said.contains("\n\n1 passed, 0 failed — "))
+    val by_file = session(dir, ["avin", "test", root, "geom/", "-O0"])
+    assert_eq(by_file.status, 1)
+    assert(by_file.said.starts_with("running 2 of 5 tests\n"))
+    assert(by_file.said.contains("\n1 passed, 1 failed — "))
+    val none = session(dir, ["avin", "test", root, "nothing matches this"])
+    assert_eq(none.status, 0)
+    assert(none.said.starts_with("running 0 of 5 tests\n\n0 passed, 0 failed — "))
+
+@test("a program without tests runs none and passes; a test program of one file names the file")
+test_single_file()
+    val dir = make_temp_dir("avin-test").unwrap()
+    defer _ = remove_dir_all(dir)
+    val empty = dir + "/empty.avin"
+    write_text(empty, "main() = 0\n").unwrap()
+    val run = session(dir, ["avin", "test", empty])
+    assert_eq(run.status, 0)
+    assert(run.said.starts_with("running 0 tests\n\n0 passed, 0 failed — "))
+    val one = dir + "/one.avin"
+    write_text(one, "@test(\"a sentence names it\")\nnamed()\n    print(\"passing output is not shown\")\n").unwrap()
+    val single = session(dir, ["avin", "test", one])
+    assert_eq(single.status, 0)
+    assert(single.said.starts_with("running 1 test\n\none.avin\n  ok    a sentence names it  "))
+    assert(!single.said.contains("passing output"))
+
+@test("test and run are refused with the usage for flags they do not take")
+usage_of_run_and_test()
+    val dir = make_temp_dir("avin-run").unwrap()
+    defer _ = remove_dir_all(dir)
+    refused_usage(dir,["avin", "run"])
+    refused_usage(dir,["avin", "run", "x.avin", "-o", "y"])
+    refused_usage(dir,["avin", "run", "x.avin", "extra"])
+    refused_usage(dir,["avin", "test", "x.avin", "a", "b"])
+    refused_usage(dir,["avin", "test", "x.avin", "--", "a"])
+    refused_usage(dir,["avin", "test", "x.avin", "-O3"])
+    refused_usage(dir,["avin", "check", "x.avin", "-O2"])
+    refused_usage(dir,["avin", "emit-llvm", "x.avin", "-o", "x.ll", "-O0"])
+    refused_usage(dir,["avin", "build", "x.avin", "-O2", "-O0"])
+
+private refused_usage(dir: string, args: []const string)
+    val run = session(dir, args)
+    assert_eq(run.status, 2)
+    assert_eq(run.said, "")
+    assert(run.noted.starts_with("usage: avin "))

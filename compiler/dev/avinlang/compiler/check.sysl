@@ -538,7 +538,7 @@ private check_imports(c: *Checker, unit: usize)
  * name in `file.module_name`. `root_module` is the module that must declare `main`, and the last
  * unit is one of its files. Every file sees its own module's declarations, the names it imports and
  * the core library's public declarations, in that order: an inner name hides an outer one. */
-check_program(units: Buf[SourceUnit], root_module: string) -> Checked
+check_program(units: Buf[SourceUnit], root_module: string, testing: bool) -> Checked
     var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf())
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
@@ -628,19 +628,56 @@ check_program(units: Buf[SourceUnit], root_module: string) -> Checked
             val result = main.result.unwrap_or(ErrorType)
             if !(*result is Unit || *result is Int(_) || *result is ErrorType)
                 c.note(main_unit, main.decl.name_span, s"`main` yields unit or an integer, not ${type_name(result)}")
-        None -> c.note(main_unit, Span(0, 0), "a program needs a `main` function")
+        // A program built for its tests runs them rather than `main`, so it may have none.
+        None -> if !testing then c.note(main_unit, Span(0, 0), "a program needs a `main` function")
+    val tests = check_tests(&c)
     var failed = false
     for u in c.units
         if u.report.has_errors() then failed = true
     if failed then return Checked(c.units, None)
-    val id = entry.unwrap()
     var functions: Buf[TFunction] = buf()
     for i in 0..<c.symbols.len()
         functions.push(TFunction(i, c.bodies[i], c.locals[i]))
     var sources: Buf[Source] = buf()
     for u in c.units
         sources.push(u.src)
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, id, init, c.builtins, c.conditional, c.core)))
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, init, c.builtins, c.conditional, c.core, tests, testing)))
+
+// The program's `@test` functions, in the order they are declared. A test is a top-level function
+// that `avin test` calls with nothing and that passes by returning, so it takes no parameters, has no
+// type parameters and yields unit. `@test` names it after the function, and `@test("a sentence")` by
+// the sentence. The core library has no tests of its own in a program's run.
+private check_tests(c: *Checker) -> Buf[TestCase]
+    var tests: Buf[TestCase] = buf()
+    for id in 0..<c.symbols.len()
+        val f = c.symbols[id]
+        if f.default_param is Some(_) || f.lambda || f.delayed then continue
+        for a in f.decl.annotations
+            if a.name != "test" then continue
+            if f.root is Some(_) || f.owner_class is Some(_) || f.receiver is Some(_)
+                c.note(f.unit, a.span, "`@test` marks a top-level function, which `avin test` can call by itself")
+                break
+            var name = f.name
+            var described = a.args.len() == 0
+            if a.args.len() == 1 && a.args[0].name is None
+                if a.args[0].value.kind is StringLit(text)
+                    name = text
+                    described = text != ""
+            if !described
+                c.note(f.unit, a.span, s"`@test` takes a description, a string that is not empty, or nothing, and then `${f.name}` names the test")
+            if f.params.len() > 0
+                c.note(f.unit, f.decl.name_span, s"a `@test` function takes no parameters, and `${f.name}` takes ${count(f.params.len(), "parameter")}: `avin test` calls it with nothing")
+            if f.decl.type_params.len() > 0
+                c.note(f.unit, f.decl.name_span, s"a `@test` function has no type parameters, and `${f.name}` declares `${f.decl.type_params[0].name}`: the runner supplies no type arguments")
+            val result = f.result.unwrap_or(ErrorType)
+            if !(*result is Unit || *result is ErrorType)
+                c.note(f.unit, f.decl.name_span, s"a `@test` function yields unit, and `${f.name}` yields ${type_name(result)}: a test passes by returning, so there is nothing to read a value with")
+            if f.decl.body is None && f.decl.clauses.len() == 0
+                c.note(f.unit, f.decl.name_span, s"a `@test` function has a body, and `${f.name}` has none")
+            if f.module_name == CoreModule || f.module_name.starts_with(CoreModule + ".") then break
+            tests.push(TestCase(id, name))
+            break
+    tests
 
 private declare_unit(c: *Checker, unit: usize)
     val file = c.units[unit].file
@@ -3133,12 +3170,13 @@ private declare_defaults(c: *Checker, id: usize)
         defaults.push(Some(did))
     c.symbols[id].defaults = defaults
 
-// `@intrinsic("name")` and `@sysl("path")` are the annotations this compiler gives meaning to; each
-// is valid only on a function without a body. This reads the first; `sysl_binding_of` the second.
+// `@intrinsic("name")` and `@sysl("path")` are the annotations this compiler gives meaning to on a
+// function without a body, and `@test` the one it gives meaning to on a function with one. This reads
+// the first; `sysl_binding_of` the second; `check_tests` the third.
 private intrinsic_of(c: *Checker, unit: usize, f: &Function) -> Option[string]
     var out: Option[string] = None
     for a in f.annotations
-        if a.name == "sysl" then continue
+        if a.name == "sysl" || a.name == "test" then continue
         if a.name != "intrinsic"
             c.note(unit, a.span, s"unknown annotation `@${a.name}`")
             continue

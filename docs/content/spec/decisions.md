@@ -474,6 +474,19 @@ Settled by the user on 2026-11-03:
 
 ## Proposed
 
+- Running and testing (stage 10): `avin run <program> [-O0 | -O2] [-- args]` builds into
+  `.avin/build/` in the program's directory, reuses the executable while nothing it was built from
+  has changed, and exits with the program's status, or 128 and the signal's number for a trap. Its
+  arguments reach the process; reading them is `avin.process`'s, in the system library. A test is a
+  top-level `@test` function of the program, in any module, taking nothing and yielding unit, named
+  by the function or by `@test("a sentence")`; a program built for its tests need not have `main`.
+  `avin test <program> [filter]` builds one executable and runs each test in a process of its own, so
+  a trap stops only that test, reporting `ok` or `FAIL` per test grouped by file, the reason and the
+  test's output under a failure, and `N passed, M failed`; it exits 1 when any failed. The core
+  library's `assert(condition)`, `assert(condition, message)` and `assertEq(actual, expected)` (with
+  `Eq` and `Debug` bounds, showing both values' `Debug` forms) trap at the assertion's place. Not yet
+  built: `@tests` files, setup and teardown hooks, `should_trap`, `ignore` and `timeout` arguments,
+  and tests answering with a `Result`.
 - The thread model ([threads](/spec/threads/)): `avin.threads.spawn(body)` starts a closure on a
   new thread with an 8 MiB stack and `join()` gives back its result; a structured `scope` joins
   every thread started in it; a trap in any thread stops the program, and the program ends when
