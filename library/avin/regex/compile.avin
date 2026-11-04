@@ -1,0 +1,253 @@
+module avin.regex
+
+// Compiling a syntax tree into a program for the backtracking matcher. A program is an array of
+// operations, each naming the operation after it by index, so the program is a graph the matcher
+// walks; an operation that tries something and then continues takes the rest of the pattern as its
+// continuation, which is what lets every choice be undone by returning.
+
+// What a repetition does when it is atomic: the body is matched once, the first way it can be, and
+// never tried again.
+private val Independent: int = 3
+
+// One step of a program.
+private data Op
+    // The end of the pattern: the match ends here, and when the whole input must match, only at its end.
+    Accept
+    // The end of a part matched on its own, a repeated item or a lookahead: records where it ended.
+    SetLast
+    // The end of a lookbehind's body, which must end where the lookbehind stands.
+    LookbehindEnd
+    // One character of the set.
+    CharOp(set: CharSet, next: int)
+    // These characters exactly.
+    LiteralOp(codes: Array[int], next: int)
+    AnchorOp(kind: AnchorKind, next: int)
+    // `\b` when `boundary` is true, `\B` when false.
+    BoundaryOp(boundary: bool, next: int)
+    LineBreakOp(next: int)
+    // The start of a group: holds where the group began in `local` while the rest is tried.
+    GroupHead(local: int, next: int)
+    // The end of a group: records `group`'s span while the rest is tried, and restores it if the rest
+    // fails. A group without a number records nothing.
+    GroupTail(local: int, group: int, next: int)
+    // Alternatives, tried in order; each continues to the rest of the pattern itself.
+    Branch(alternatives: Array[int])
+    // An item tried at most once: `atom` runs to a `SetLast`.
+    Ques(atom: int, mode: int, next: int)
+    // An item repeated `least` to `most` times, each repetition the first way the item matches.
+    Curly(atom: int, least: int, most: int, mode: int, next: int)
+    // One character of the set repeated.
+    CharLoop(set: CharSet, least: int, most: int, mode: int, next: int)
+    // A group whose body always matches one length, repeated, recording each repetition's span.
+    GroupCurly(atom: int, least: int, most: int, mode: int, group: int, next: int)
+    // The entry to a `Loop`.
+    Prolog(start: int)
+    // A group of varying length repeated: the body runs through the group's head to its tail and back
+    // here, counting repetitions in `count`; `begin` is the group head's local, where the repetition
+    // being matched began. A greedy loop without an upper bound in a pattern without back references
+    // remembers, in its `memo`, the indices where a further repetition has already failed, and does
+    // not try one there again; -1 where it does not.
+    Loop(body: int, count: int, begin: int, least: int, most: int, lazy: bool, memo: int, next: int)
+    LookOp(kind: LookKind, cond: int, least: int, most: int, next: int)
+    BackReferenceOp(group: int, caseless: bool, unicode: bool, next: int)
+
+// A compiled pattern: its operations and the one to start from, the number of groups counting the
+// whole match as group 0, the locals the matcher keeps, the loops that remember where they failed,
+// the fewest characters a match takes, and whether a match can only start at the beginning of the
+// input.
+private data Program(ops: Array[Op], entry: int, groupCount: int, localCount: int, memoCount: int, minLength: int, startsAtBeginning: bool)
+
+// The fewest and most characters a tree can match; `bounded` is false where there is no most.
+private data Size(least: int, most: int, bounded: bool)
+
+private val Unbounded: int = 0x7fffffff
+
+private capped(n: long) -> int = if n > long(Unbounded) then Unbounded else int(n)
+
+// The lengths a tree can match, as a lookbehind needs them and as the search needs the least.
+private measure(t: Tree) -> Size = t match
+    Empty -> Size(0, 0, true)
+    Chars(_) -> Size(1, 1, true)
+    Literal(codes) -> Size(codes.length(), codes.length(), true)
+    Concat(items) ->
+        var least: long = 0
+        var most: long = 0
+        var bounded = true
+        for item in items
+            val s = measure(item)
+            least += long(s.least)
+            most += long(s.most)
+            bounded = bounded && s.bounded
+        Size(capped(least), capped(most), bounded && most <= long(Unbounded))
+    Alternation(alternatives) ->
+        var least = Unbounded
+        var most = 0
+        var bounded = true
+        for a in alternatives
+            val s = measure(a)
+            if s.least < least then least = s.least
+            if s.most > most then most = s.most
+            bounded = bounded && s.bounded
+        Size(least, most, bounded)
+    Capture(_, body) -> measure(body)
+    Plain(body) -> measure(body)
+    Atomic(body) -> measure(body)
+    Look(_, _, _, _) -> Size(0, 0, true)
+    Repeat(atom, least, most, mode, optional) ->
+        val s = measure(atom)
+        val leastTotal = capped(long(least) * long(s.least))
+        if isGroup(atom) && !optional && mode != Possessive && !deterministic(groupBody(atom))
+            Size(leastTotal, 0, false)
+        elif most == Unbounded
+            Size(leastTotal, 0, s.bounded && s.most == 0)
+        else
+            val mostTotal = long(most) * long(s.most)
+            Size(leastTotal, capped(mostTotal), s.bounded && mostTotal <= long(Unbounded))
+    Anchor(_) -> Size(0, 0, true)
+    WordBoundary(_) -> Size(0, 0, true)
+    BackReference(_, _, _) -> Size(0, 0, false)
+    LineBreak -> Size(1, 2, true)
+
+private isGroup(t: Tree) -> bool = t match
+    Capture(_, _) -> true
+    Plain(_) -> true
+    _ -> false
+
+private groupBody(t: Tree) -> Tree = t match
+    Capture(_, body) -> body
+    Plain(body) -> body
+    _ -> t
+
+// Whether a tree matches in one way only, at one length, so a repetition of a group of it can count
+// its repetitions instead of trying each one again: no alternation, and no repetition whose count
+// varies, outside a lookaround.
+private deterministic(t: Tree) -> bool = t match
+    Alternation(_) -> false
+    Repeat(atom, least, most, _, optional) -> !optional && least == most && deterministic(atom)
+    Concat(items) -> items.forall(deterministic)
+    Capture(_, body) -> deterministic(body)
+    Plain(body) -> deterministic(body)
+    Atomic(body) -> deterministic(body)
+    _ -> true
+
+// Whether every match of a tree starts at the beginning of the input.
+private anchoredAtBeginning(t: Tree) -> bool = t match
+    Anchor(Begin) -> true
+    Concat(items) -> items.nonEmpty() && anchoredAtBeginning(items(0))
+    Capture(_, body) -> anchoredAtBeginning(body)
+    Plain(body) -> anchoredAtBeginning(body)
+    Atomic(body) -> anchoredAtBeginning(body)
+    Alternation(alternatives) -> alternatives.forall(anchoredAtBeginning)
+    _ -> false
+
+private compileProgram(parsed: Parsed) -> Program
+    val c = Compiler(!refersBack(parsed.tree))
+    val entry = c.compile(parsed.tree, c.accept)
+    Program(c.ops.toArray(), entry, parsed.groupCount, c.locals, c.memos, measure(parsed.tree).least, anchoredAtBeginning(parsed.tree))
+
+// Whether a tree holds a back reference.
+private refersBack(t: Tree) -> bool = t match
+    BackReference(_, _, _) -> true
+    Concat(items) -> items.exists(refersBack)
+    Alternation(alternatives) -> alternatives.exists(refersBack)
+    Capture(_, body) -> refersBack(body)
+    Plain(body) -> refersBack(body)
+    Atomic(body) -> refersBack(body)
+    Look(_, body, _, _) -> refersBack(body)
+    Repeat(atom, _, _, _, _) -> refersBack(atom)
+    _ -> false
+
+private endings() -> Buffer[Op]
+    val b = Buffer[Op]()
+    b.add(Accept)
+    b.add(SetLast)
+    b.add(LookbehindEnd)
+    b
+
+private class Compiler(remembering: bool)
+    // The three ends every program has come first.
+    val ops: Buffer[Op] = endings()
+    var locals = 0
+    var memos = 0
+    // How many lookbehinds the operations being compiled are inside; a loop in one keeps no memo.
+    private var behind = 0
+    val accept: int = 0
+    val setLast: int = 1
+    val lookbehindEnd: int = 2
+
+    emit(op: Op) -> int
+        ops.add(op)
+        ops.length() - 1
+
+    private local() -> int
+        locals += 1
+        locals - 1
+
+    // The operations for `t`, continuing to `next`; the answer is where they start.
+    compile(t: Tree, next: int) -> int = t match
+        Empty -> next
+        Chars(set) -> emit(CharOp(set, next))
+        Literal(codes) -> emit(LiteralOp(codes, next))
+        Concat(items) ->
+            var at = next
+            var k = items.length() - 1
+            while k >= 0
+                at = compile(items(k), at)
+                k -= 1
+            at
+        Alternation(alternatives) ->
+            val starts = Buffer[int]()
+            for a in alternatives do starts.add(compile(a, next))
+            emit(Branch(starts.toArray()))
+        Capture(group, body) ->
+            val l = local()
+            val tail = emit(GroupTail(l, group, next))
+            emit(GroupHead(l, compile(body, tail)))
+        Plain(body) -> compile(body, next)
+        Atomic(body) -> emit(Ques(compile(body, setLast), Independent, next))
+        Look(kind, body, least, most) ->
+            val inBehind = kind match
+                Behind | NotBehind -> true
+                _ -> false
+            if inBehind then behind += 1
+            val cond = compile(body, if inBehind then lookbehindEnd else setLast)
+            if inBehind then behind -= 1
+            emit(LookOp(kind, cond, least, most, next))
+        Repeat(atom, least, most, mode, optional) -> repeat(atom, least, most, mode, optional, next)
+        Anchor(kind) -> emit(AnchorOp(kind, next))
+        WordBoundary(b) -> emit(BoundaryOp(b, next))
+        BackReference(group, caseless, unicode) -> emit(BackReferenceOp(group, caseless, unicode, next))
+        LineBreak -> emit(LineBreakOp(next))
+
+    // A repetition. A single character repeats in a loop of its own. A group written with `?`
+    // becomes a choice between the group and nothing; a group whose body matches one way repeats by
+    // counting; any other group repeats through a `Loop` that runs its body again from its tail. Any
+    // other item, and every possessive repetition, repeats the item matched on its own.
+    private repeat(atom: Tree, least: int, most: int, mode: int, optional: bool, next: int) -> int
+        if atom is Chars(set) then return emit(CharLoop(set, least, most, mode, next))
+        if atom is Literal(codes) && codes.length() == 1
+            val code = codes(0)
+            return emit(CharLoop(charSet(x -> x == code), least, most, mode, next))
+        if isGroup(atom) && mode != Possessive
+            if optional
+                val body = compile(atom, next)
+                val alternatives = if mode == Greedy then Array.tabulate(2, k -> if k == 0 then body else next) else Array.tabulate(2, k -> if k == 0 then next else body)
+                return emit(Branch(alternatives))
+            val group = atom match
+                Capture(g, _) -> g
+                _ -> -1
+            if deterministic(groupBody(atom))
+                return emit(GroupCurly(compile(groupBody(atom), setLast), least, most, mode, group, next))
+            val loopAt = emit(Accept)
+            val begin = local()
+            val count = local()
+            val tail = if group >= 0 then emit(GroupTail(begin, group, loopAt)) else loopAt
+            val body = emit(GroupHead(begin, compile(groupBody(atom), tail)))
+            var memo = -1
+            if remembering && mode == Greedy && most == Unbounded && behind == 0
+                memo = memos
+                memos += 1
+            ops(loopAt) = Loop(body, count, begin, least, most, mode == Lazy, memo, next)
+            return emit(Prolog(loopAt))
+        val inner = compile(atom, setLast)
+        if optional then emit(Ques(inner, mode, next)) else emit(Curly(inner, least, most, mode, next))
