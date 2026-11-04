@@ -526,6 +526,21 @@ share a block and two operations never do; the instances of a generic function s
 runtime flushes what the program has written to standard output first, so no output is lost, then
 writes the message and stops.
 
+A thread that runs out of stack stops the program the same way, with `avin: trap: stack overflow`
+and no place. The runtime's C handler (`runtime/avin/rt/__posix__/stack_guard.c`) is installed by
+each thread before it runs Avin code, on the main thread when the runtime starts and on a started
+thread before its closure runs, and removed when that closure returns. Installing it records the
+lowest address of the thread's own stack, read from the operating system, and gives the thread an
+alternate signal stack, which is what lets the handler run when the ordinary stack is the thing that
+is full. A fault is reported only if its address lies in the guard region at the bottom of the
+faulting thread's stack; any other fault is a real crash, so the handler restores the default action
+and returns, and the program ends with the segmentation fault it would have had. The place is left
+out because the context's caller site holds where the program last entered the library, which is not
+where its recursion was. The handler writes the message with `write(2)` first, then flushes standard
+output, which is not safe inside a signal handler: an alarm ends the process if the flush never
+returns, and output buffered at the moment of the fault may be lost when the fault came from inside
+the C library's own output routines. The process ends as any trap does.
+
 A trap inside the core library reports the program's own call instead, through the context's
 **caller site**, a word at offset 24 holding the address of a trap site. Code generated for the
 program's functions sets it, before each call that may enter the library, to a site with no reason

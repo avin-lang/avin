@@ -25,7 +25,8 @@ main() -> int
   and gives back the result; joining a second time gives the same result again. Any thread may
   join, several at once: one waits for the thread and the others wait for that one. A `Thread` is
   collected like any other object once nothing reaches it; a thread that is never joined keeps its
-  stack until the program ends.
+  stack until the program ends. A thread that overflows its own stack traps with `stack overflow`
+  like any other thread's trap.
 - **A trap in any thread stops the program**, as it does in a program with one thread: traps report
   bugs, and a bug in one thread leaves the state the others share in doubt. Only the first thread to
   stop the program reports: what was written is flushed once and one reason is printed, and a

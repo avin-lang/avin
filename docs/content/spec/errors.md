@@ -37,6 +37,11 @@ directly, through a trait or through a function value. When the library calls ba
 program, as `Array.tabulate` calls the function it is given, a trap the program's code reaches in
 the library again reports that inner call, the nearest one the program wrote.
 
+**Running out of stack is a trap.** Recursion that never reaches a base case stops the program with
+`avin: trap: stack overflow`, after the output it had already written. The message names no place.
+It holds on the main thread, whose stack is the operating system's to size, and on every thread
+`spawn` starts, whose stack is 8 MiB unless `spawn` is asked for another size.
+
 ## The ? operator
 
 `expr?` unwraps `Ok(v)` or `Some(v)` to `v`. On `Err(e)` or `None` it returns from the enclosing
