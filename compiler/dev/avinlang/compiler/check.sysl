@@ -121,6 +121,28 @@ struct ClassSymbol
     functions: Buf[&Type]
     /** For a class whose objects are functions, the `apply` a call of one as a function runs. */
     call: Option[usize]
+    /** For a trait, the fields it declares with a value, which every class conforming to it
+     * stores. */
+    state: Buf[TraitState]
+    /** For a class, the trait fields it stores itself, in the order it initializes them: they
+     * follow its parameters in `fields`, from `inherited` plus the parameters' count on. */
+    mixed: Buf[MixedField]
+
+/** A field a trait declares with a value. The trait reads it through `getter`, the `val` the field
+ * is to every type conforming to it, and assigns a `var` one through `setter`; `init` computes its
+ * value, with the object as the trait's receiver. Its type names the trait's own parameters. */
+struct TraitState
+    field: FieldSymbol
+    decl: FieldDecl
+    getter: usize
+    setter: Option[usize]
+    init: usize
+
+/** A trait field a class stores: the trait, as the class conforms to it, and which of its `state`. */
+struct MixedField
+    trait_type: &Type
+    trait_id: usize
+    state: usize
 
 /** A module-level value: a `val` or `var` declared at the top level of a file, or an object's one
  * instance. Each is computed once, before `main` runs, by its `init` function: a value's initializer,
@@ -467,6 +489,12 @@ struct Checker
     type_slots: Buf[&Type]
     /** Whether a template's own parameter is being declared, the one place `Shaped` is a bound. */
     declaring_template: bool
+    /** The methods that assign a trait's `var` field through the trait: each abstract, taking the
+     * receiver and the value, and filled in each conforming class's table by one of
+     * `field_setters`. */
+    trait_setters: Buf[usize]
+    /** The methods made to assign a class's field where it stores a trait's `var` field. */
+    field_setters: Buf[usize]
 
     note(*self, unit: usize, at: Span, message: string)
         // What goes wrong in an impl made from a template is the template's, already reported where
@@ -705,7 +733,7 @@ private check_imports(c: *Checker, unit: usize)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false)
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -733,6 +761,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     // A subclass's fields and methods follow its superclass's, wherever either is declared.
     for id in 0..<c.classes.len()
         inherit_fields(&c, id)
+    refuse_stateful_impls(&c)
     for u in 0..<c.units.len()
         declare_unit(&c, u)
         declare_methods(&c, u)
@@ -1237,7 +1266,7 @@ private declare_types(c: *Checker, unit: usize)
                 continue
             if file.private_items[i] then c.private_names.put(key, true)
             c.class_types.put(key, c.classes.len())
-            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, None, None, buf(), buf(), 0, None, buf(), None))
+            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, None, None, buf(), buf(), 0, None, buf(), None, buf(), buf()))
 
 // An object is a class with one instance. Named after a class or a data type of its module, in any of
 // the module's files, it is that type's companion and its type has no name of its own; otherwise its
@@ -1270,7 +1299,7 @@ private declare_objects(c: *Checker, unit: usize)
             else
                 c.class_types.put(key, id)
                 if file.private_items[i] then c.private_names.put(key, true)
-            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, companion, None, buf(), buf(), 0, companion_data, buf(), None))
+            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, companion, None, buf(), buf(), 0, companion_data, buf(), None, buf(), buf()))
 
 // Each impl's type and trait, resolved with the impl's type parameters in scope. They are the type's
 // own parameters under the names the impl gives them, so `impl[T] Box[T]` lists them in order. What
@@ -2121,9 +2150,13 @@ private declare_fields(c: *Checker, unit: usize)
         if declares_trait
             for m in d.members
                 m match
-                    FieldMember(f) -> c.note(unit, f.span, s"a trait holds no state, so it cannot declare the field `${f.name}`")
+                    FieldMember(f) ->
+                        val keyword = if f.mutable then "var" else "val"
+                        if !f.public then c.note(unit, f.span, s"`${f.name}` is declared in a trait, so it cannot be private")
+                        elif f.lazy then c.note(unit, f.span, s"`${f.name}` is declared in a trait, so it cannot be lazy: each conforming class computes it as it is made")
+                        elif f.declared is None then c.note(unit, f.span, s"`${f.name}` is a trait's field, so it declares its type, as in `$keyword ${f.name}: int = …`")
                     AbstractFieldMember(f) ->
-                        if f.mutable then c.note(unit, f.span, s"a trait declares `val` members, which are read and never assigned through it; write `val ${f.name}`")
+                        if f.mutable then c.note(unit, f.span, s"`${f.name}` has no value, so it is a trait's `val`, which is never assigned through the trait; write `val ${f.name}`, or give the `var` a value")
                         elif !f.public then c.note(unit, f.span, s"`${f.name}` is declared in a trait, so it cannot be private")
                     StatementMember(s) -> c.note(unit, s.span, "a trait has no constructor, so its body declares only methods")
                     _ -> ()
@@ -2187,16 +2220,28 @@ private declare_fields(c: *Checker, unit: usize)
             val written = resolve_type(c, unit, cp.param.ty)
             val field_type = if cp.param.variadic then vector_of(c, written) else written
             fields.push(FieldSymbol(name, cp.param.pattern.span, Some(field_type), cp.mutable, cp.public, true, id, false))
+        var state: Buf[TraitState] = buf()
         for m in d.members
             if m is FieldMember(f)
                 if field_named(fields, f.name) is Some(_) then c.note(unit, f.span, s"the field `${f.name}` is declared more than once")
                 var ty: Option[&Type] = None
                 if f.declared is Some(t) then ty = Some(resolve_type(c, unit, t))
+                // A trait's field is stored by each class conforming to it; the trait reads it
+                // through the method its `val` is.
+                if declares_trait
+                    if f.public && !f.lazy && ty is Some(_)
+                        var seen = false
+                        for s in state
+                            if s.field.name == f.name then seen = true
+                        if seen then c.note(unit, f.span, s"the field `${f.name}` is declared more than once")
+                        else state.push(TraitState(FieldSymbol(f.name, f.span, ty, f.mutable, true, false, id, false), f, 0, None, 0))
+                    continue
                 fields.push(FieldSymbol(f.name, f.span, ty, f.mutable, f.public, false, id, f.lazy))
                 if f.lazy
                     fields.push(FieldSymbol(s"<state of ${f.name}>", f.span, Some(Int(64)), false, false, false, id, false))
                     fields.push(FieldSymbol(s"<initializer of ${f.name}>", f.span, lazy_initializer_type(ty), false, false, false, id, false))
         c.classes[id].fields = fields
+        c.classes[id].state = state
         c.generic = outer_generic
 
 /** Whether a class may be extended: one declared `open` or `abstract`. */
@@ -2300,11 +2345,13 @@ private inherit_fields(c: *Checker, id: usize)
             args = a
     if k.superclass is None
         c.classes[id].linked = 2
+        mix_fields(c, id)
         return
     c.classes[id].linked = 1
     inherit_fields(c, sid)
     if c.classes[id].superclass is None
         c.classes[id].linked = 2
+        mix_fields(c, id)
         return
     var fields: Buf[FieldSymbol] = buf()
     for f in c.classes[sid].fields
@@ -2320,6 +2367,121 @@ private inherit_fields(c: *Checker, id: usize)
     c.classes[id].fields = fields
     c.classes[id].inherited = inherited
     c.classes[id].linked = 2
+    mix_fields(c, id)
+
+// A class stores the fields of the traits it conforms to that its superclass does not, after its
+// parameters: trait by trait, a trait's required traits before it and each trait once, in the order
+// of its `:` list, each trait's fields in declaration order. That is also the order the constructor
+// initializes them in. A field of a trait shares its name with no other field of the class.
+private mix_fields(c: *Checker, id: usize)
+    val k = c.classes[id]
+    if is_trait(c, id) then return
+    var order: Buf[&Type] = buf()
+    var visiting: Buf[usize] = buf()
+    for t in k.traits
+        mixing_order(c, k.superclass, t, &order, &visiting)
+    var fields: Buf[FieldSymbol] = buf()
+    val at = k.inherited + k.decl.params.len()
+    for i in 0..<at
+        fields.push(k.fields[i])
+    var mixed: Buf[MixedField] = buf()
+    for t in order
+        val tid = *t match
+            Class(x, _, _) -> x
+            _ -> continue
+        val args = *t match
+            Class(_, _, a) -> a
+            _ -> buf()
+        val state = c.classes[tid].state
+        for j in 0..<state.len()
+            val s = state[j]
+            val name = s.field.name
+            var clash = false
+            for i in 0..<k.fields.len()
+                val f = k.fields[i]
+                if f.name != name then continue
+                clash = true
+                if i >= k.inherited then c.note(k.unit, f.span, s"`$name` is a field of `${c.classes[tid].name}`, which `${k.name}` stores; a class does not declare a field of a trait's name")
+                else c.note(k.unit, k.decl.name_span, s"`$name` is already a field of `${c.classes[f.owner].name}`, so `${k.name}` cannot also store `${c.classes[tid].name}`'s field `$name`")
+            for m in mixed
+                val other = c.classes[m.trait_id].state[m.state].field
+                if other.name == name && !clash
+                    clash = true
+                    c.note(k.unit, k.decl.name_span, s"`${k.name}` conforms to `${c.classes[m.trait_id].name}` and `${c.classes[tid].name}`, which both declare the field `$name`; one class cannot store both")
+            if clash then continue
+            var copy = s.field
+            if s.field.ty is Some(ty) then copy.ty = Some(substitute(ty, class_owner(tid), args))
+            fields.push(copy)
+            mixed.push(MixedField(t, tid, j))
+    if mixed.len() == 0 then return
+    for i in at..<k.fields.len()
+        fields.push(k.fields[i])
+    c.classes[id].fields = fields
+    c.classes[id].mixed = mixed
+
+/** The trait among `t` and those it requires that declares a field with a value, if any. */
+private stateful_trait(c: *Checker, t: usize, depth: usize) -> Option[usize]
+    if depth > 64 then return None
+    if c.classes[t].state.len() > 0 then return Some(t)
+    for r in c.classes[t].traits
+        if *r is Class(x, _, _)
+            if stateful_trait(c, x, depth + 1) is Some(s) then return Some(s)
+    None
+
+// Only a class or an object stores a trait's fields: an impl of a trait that has any, or requires
+// one that has, for a data type, a built-in type, a tuple or a trait is an error.
+private refuse_stateful_impls(c: *Checker)
+    for i in 0..<c.impls.len()
+        val block = c.impls[i]
+        val t = block.trait_type match
+            Some(x) -> *x match
+                Class(t, _, _) -> t
+                _ -> continue
+            None -> continue
+        if *block.target is ErrorType then continue
+        if *block.target is Class(x, _, _)
+            if !is_trait(c, x) then continue
+        val holder = stateful_trait(c, t, 0) match
+            Some(s) -> s
+            None -> continue
+        val field = c.classes[holder].state[0].field.name
+        c.note(block.unit, written_trait_span(block.decl), s"`${c.classes[t].name}` holds state, the field `$field` of `${c.classes[holder].name}`, which only a class or an object stores; ${type_name(block.target)} cannot conform to it")
+        // The conformance the impl stated is withdrawn, so nothing more is reported of it.
+        if *block.target is Data(d, _, _)
+            var kept: Buf[&Type] = buf()
+            for x in c.data[d].traits
+                if *x is Class(k, _, _)
+                    if k == t then continue
+                kept.push(x)
+            c.data[d].traits = kept
+        var builtins: Buf[BuiltinConformance] = buf()
+        for b in c.builtins
+            if *b.trait_type is Class(k, _, _)
+                if k == t && same_type(b.ty, block.target) then continue
+            builtins.push(b)
+        c.builtins = builtins
+        c.impls[i].target = ErrorType
+
+/** Adds trait `t` to `order` after the traits it requires, unless it is there already or the
+ * superclass `sup` conforms to it, so that its fields are the superclass's. */
+private mixing_order(c: *Checker, sup: Option[&Type], t: &Type, order: *Buf[&Type], visiting: *Buf[usize])
+    val tid = *t match
+        Class(x, _, _) -> x
+        _ -> return
+    for i in 0..<visiting.len()
+        if visiting[i] == tid then return
+    visiting.push(tid)
+    val args = *t match
+        Class(_, _, a) -> a
+        _ -> buf()
+    for r in c.classes[tid].traits
+        mixing_order(c, sup, substitute(r, class_owner(tid), args), order, visiting)
+    for i in 0..<order.len()
+        if *order[i] is Class(x, _, _)
+            if x == tid then return
+    if sup is Some(s)
+        if ancestor_type(c.classes, c.data, s, tid) is Some(_) then return
+    order.push(t)
 
 // An inherited field declared without a type has its type once its own class's body is checked.
 private settle_inherited_fields(c: *Checker, id: usize)
@@ -2543,6 +2705,12 @@ private struct MethodDecl
     /** Whether this is a trait's `val`, read as a field and supplied by a field. */
     field: bool
     static_member: bool
+    /** For a trait's field declared with a value, which of its parts this is: 1 the method that
+     * assigns a `var` one through the trait, 2 the function that computes its value, 3 the `val`
+     * that reads it; 0 for anything else. */
+    state_part: u8
+    /** For a part of a trait's field, the field's place in the trait's `state`. */
+    state_index: usize
 
 // Each class's constructor, a function named after the class that takes its parameters and yields
 // a new instance, and its methods, each a function whose first parameter is the instance.
@@ -2618,15 +2786,34 @@ private declare_methods(c: *Checker, unit: usize)
         for m in d.members
             m match
                 MethodMember(f, public, overrides, static_member) ->
-                    declared.push(MethodDecl(f, public, overrides, unit, module_name, d.type_params, false, false, static_member))
+                    declared.push(MethodDecl(f, public, overrides, unit, module_name, d.type_params, false, false, static_member, 0, 0))
                     made_from.push(None)
                 // A trait's `val` is an abstract method of no parameters, read with field syntax.
                 AbstractFieldMember(f) ->
                     if is_trait(c, id) && !f.mutable && f.public
                         val getter = Function(buf(), f.span, f.name_span, f.name, buf(), buf(), Some(f.declared), None, buf())
-                        declared.push(MethodDecl(getter, true, false, unit, module_name, d.type_params, false, true, false))
+                        declared.push(MethodDecl(getter, true, false, unit, module_name, d.type_params, false, true, false, 0, 0))
                         made_from.push(None)
                 _ -> ()
+        // A trait's field with a value is a `val` of the trait, which each conforming class supplies
+        // with the field it stores; a `var` one is also assigned through a method, and its value is
+        // computed by a function of the trait's receiver.
+        for j in 0..<k.state.len()
+            val f = k.state[j].decl
+            val declared_type = f.declared.unwrap()
+            val getter = Function(buf(), f.span, f.span, f.name, buf(), buf(), Some(declared_type), None, buf())
+            declared.push(MethodDecl(getter, true, false, unit, module_name, d.type_params, false, true, false, 3, j))
+            made_from.push(None)
+            if f.mutable
+                var value_params: Buf[Param] = buf()
+                value_params.push(Param(f.span, Pattern(f.span, Name("value")), declared_type, None, false, false, buf()))
+                val unit_type = TypeExpr(f.span, Named("unit", buf()))
+                val setter = Function(buf(), f.span, f.span, f.name + "=", buf(), value_params, Some(unit_type), None, buf())
+                declared.push(MethodDecl(setter, true, false, unit, module_name, d.type_params, false, false, false, 1, j))
+                made_from.push(None)
+            val init = Function(buf(), f.span, f.span, s"<value of ${f.name}>", buf(), buf(), Some(declared_type), Some(f.value), buf())
+            declared.push(MethodDecl(init, true, false, unit, module_name, d.type_params, false, false, false, 2, j))
+            made_from.push(None)
         for block_index in 0..<c.impls.len()
             val block = c.impls[block_index]
             if *block.target is Class(target, _, _)
@@ -2643,7 +2830,7 @@ private declare_methods(c: *Checker, unit: usize)
                             if !trait_declares(c, t, f.name, 0)
                                 c.note(block.unit, f.name_span, s"`${f.name}` is not a method of `${c.classes[t].name}`; an impl of a trait implements the trait's methods, and `impl ${d.name}` adds others")
                                 continue
-                        declared.push(MethodDecl(f, public, overrides || trait_id is Some(_), block.unit, methods_module(c, block), block.decl.type_params, true, false, static_member))
+                        declared.push(MethodDecl(f, public, overrides || trait_id is Some(_), block.unit, methods_module(c, block), block.decl.type_params, true, false, static_member, 0, 0))
                         made_from.push(c.derived_context)
                 c.derived_context = None
         for entry_index in 0..<declared.len()
@@ -2721,6 +2908,19 @@ private declare_methods(c: *Checker, unit: usize)
                 else c.note(file_unit, f.name_span, s"`${f.name}` is declared more than once in `${d.name}` with the same parameter types; a method's overloads differ in their parameter types")
                 continue
             val method = c.symbols.len()
+            // The function computing a trait field's value is called by each conforming class's
+            // constructor, and is no method of the trait.
+            if entry.state_part == 2
+                c.classes[id].state[entry.state_index].init = method
+                c.symbols.push(symbol)
+                c.states.push(0)
+                c.bodies.push(None)
+                c.locals.push(buf())
+                continue
+            if entry.state_part == 3 then c.classes[id].state[entry.state_index].getter = method
+            if entry.state_part == 1
+                c.classes[id].state[entry.state_index].setter = Some(method)
+                c.trait_setters.push(method)
             if entry.field then c.trait_fields.push(method)
             if entry.from_impl then c.impl_methods.push(method)
             methods.push(method)
@@ -3610,7 +3810,9 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
                     overrides_matches(c, id, m, other)
                 else c.note(unit, c.symbols[m].decl.name_span, s"`$name` overrides nothing; no trait `${k.name}` requires has a method `$name`")
             elif target is Some(other)
-                c.note(unit, c.symbols[m].decl.name_span, s"`$name` is already a method of `${c.classes[c.symbols[other].owner_class.unwrap()].name}`, which `${k.name}` requires; mark it `override` to replace its default")
+                val owner = c.classes[c.symbols[other].owner_class.unwrap()].name
+                if is_trait_field(c, m) || is_trait_field(c, other) then c.note(unit, c.symbols[m].decl.name_span, s"`$name` is already a member of `$owner`, which `${k.name}` requires; a trait's field or `val` is declared once")
+                else c.note(unit, c.symbols[m].decl.name_span, s"`$name` is already a method of `$owner`, which `${k.name}` requires; mark it `override` to replace its default")
         return
     var slots: Buf[usize] = buf()
     var sid: Option[usize] = None
@@ -3945,6 +4147,9 @@ private build_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
         if is_trait_field(c, held)
             table.set(i, Some(supplied_field(c, id, held, sup_table, i)))
             continue
+        if contains_id(c.trait_setters, held)
+            table.set(i, Some(supplied_setter(c, id, held, sup_table, i)))
+            continue
         // Every method the class inherits that is this one; its own override, if it has one.
         var candidates: Buf[usize] = buf()
         var own: Option[usize] = None
@@ -3980,6 +4185,8 @@ private build_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
         for entry in table
             if entry is Some(m)
                 if abstract_class && !c.symbols[m].static_member then continue
+                // A trait's `var` field the class does not store was reported where it clashed.
+                if contains_id(c.trait_setters, m) then continue
                 val name = c.symbols[m].decl.name
                 val key = method_key(c, self_type, m)
                 if is_abstract_method(c.symbols[m]) && !is_universal(c, m) && !contains_name(missing, key)
@@ -4024,6 +4231,10 @@ private supplied_field(c: *Checker, id: usize, tm: usize, sup_table: Buf[Option[
 // that name: a class's method when `owner_class` is its class, otherwise one an impl adds to the
 // data type `self_type`.
 private field_getter(c: *Checker, unit: usize, module_name: string, type_name_of: string, at: Span, name: string, self_type: &Type, type_owner: usize, type_params: Buf[TypeParam], owner_class: Option[usize]) -> usize
+    // One field supplies the `val` of that name of every trait the type conforms to, through one
+    // method.
+    for g in c.field_getters
+        if c.symbols[g].type_owner == type_owner && c.symbols[g].decl.name == name then return g
     val read = Expr(at, Member(Expr(at, Name("self")), name))
     val decl = Function(buf(), at, at, name, buf(), buf(), None, Some(read), buf())
     var params: Buf[&Type] = buf()
@@ -4040,6 +4251,43 @@ private field_getter(c: *Checker, unit: usize, module_name: string, type_name_of
     c.locals.push(buf())
     c.field_getters.push(id)
     id
+
+// What fills the position of the method `tm` that assigns a trait's `var` field, at `position` of
+// class `id`'s table: the superclass's where it already stores the field, or else a method that
+// assigns the field the class stores, `self.name = value`.
+private supplied_setter(c: *Checker, id: usize, tm: usize, sup_table: Buf[Option[usize]], position: usize) -> usize
+    if position < sup_table.len()
+        if sup_table[position] is Some(m)
+            if contains_id(c.field_setters, m) then return m
+    val k = c.classes[id]
+    val written = c.symbols[tm].decl.name
+    var name = ""
+    for s in c.classes[c.symbols[tm].owner_class.unwrap()].state
+        if s.setter is Some(x)
+            if x == tm then name = s.field.name
+    for i in 0..<k.fields.len()
+        if k.fields[i].name == name && k.fields[i].owner == c.symbols[tm].owner_class.unwrap()
+            val self_type = own_class_type(k, id)
+            val at = k.fields[i].span
+            val store = Expr(at, Assign(Expr(at, Member(Expr(at, Name("self")), name)), None, Expr(at, Name("value")), false, at))
+            val decl = Function(buf(), at, at, written, buf(), buf(), None, Some(store), buf())
+            var params: Buf[&Type] = buf()
+            params.push(self_type)
+            params.push(k.fields[i].ty.unwrap_or(ErrorType))
+            var names: Buf[string] = buf()
+            names.push("self")
+            names.push("value")
+            var defaults: Buf[Option[usize]] = buf()
+            defaults.push(None)
+            defaults.push(None)
+            val setter = c.symbols.len()
+            c.symbols.push(FunctionSymbol(k.unit, k.module_name, k.name + "." + written, decl, params, names, Some(Unit), None, None, buf(), buf(), buf(), false, false, false, defaults, None, class_owner(id), k.decl.type_params, Some(id), false, true, "", None, false))
+            c.states.push(0)
+            c.bodies.push(None)
+            c.locals.push(buf())
+            c.field_setters.push(setter)
+            return setter
+    tm
 
 /** Class `id`'s method table, built first if it is not yet. */
 private ensure_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
@@ -4082,16 +4330,28 @@ private check_class_variance(c: *Checker, id: usize)
         variance_in(c, k.unit, params, owner, f, 1, at, s"the function type ${type_name(f)}")
     for i in k.inherited..<k.fields.len()
         val f = k.fields[i]
+        // A trait's field the class stores is checked with the trait, and the trait's arguments with
+        // the class's traits.
+        if f.owner != id then continue
         val ty = f.ty.unwrap_or(ErrorType)
         if f.mutable then variance_in(c, k.unit, params, owner, ty, 0, f.span, s"the mutable field `${f.name}`")
         else variance_in(c, k.unit, params, owner, ty, 1, f.span, s"the field `${f.name}`")
+    // A trait's fields are its own, though each conforming class stores them.
+    var immutable = true
+    for s in k.state
+        val ty = s.field.ty.unwrap_or(ErrorType)
+        if s.field.mutable
+            immutable = false
+            variance_in(c, k.unit, params, owner, ty, 0, s.field.span, s"the mutable field `${s.field.name}`")
+        else variance_in(c, k.unit, params, owner, ty, 1, s.field.span, s"the field `${s.field.name}`")
     // An instance whose fields are all immutable holds nothing a method could store a value into,
     // so the methods its impls add are not positions, as a `data` type's are not.
-    var immutable = true
     for f in k.fields
         if f.mutable then immutable = false
     for m in k.methods
         if immutable && contains_id(c.impl_methods, m) then continue
+        // The method assigning a trait's `var` field is the field, checked above.
+        if contains_id(c.trait_setters, m) then continue
         val symbol = c.symbols[m]
         val name = symbol.decl.name
         for j in 1..<symbol.params.len()
@@ -5625,8 +5885,22 @@ private check_constructor(c: *Checker, id: usize, upto: Option[usize])
     val count_params = symbol.params.len() - first
     for i in 0..<count_params
         items.push(TExpr(decl.span, Unit, StoreField(receiver, cls.inherited + i, TExpr(decl.name_span, symbol.params[first + i], Param(first + i)), false)))
-    c.classes[k].ready = cls.inherited + count_params
-    c.constructions.set(k, Some(Construction(c.body, items, receiver, 0, cls.inherited + count_params, finishes)))
+    // Then the fields of the traits the class stores, each computed by its trait's function of the
+    // object, in the order the class stores them.
+    var index = cls.inherited + count_params
+    for m in cls.mixed
+        val s = c.classes[m.trait_id].state[m.state]
+        val args = *m.trait_type match
+            Class(_, _, a) -> a
+            _ -> buf()
+        val ty = cls.fields[index].ty.unwrap_or(ErrorType)
+        var call_args: Buf[&TExpr] = buf()
+        call_args.push(receiver)
+        val value = TExpr(decl.name_span, ty, Call(s.init, call_args, args))
+        items.push(TExpr(decl.span, Unit, StoreField(receiver, index, value, false)))
+        index += 1
+    c.classes[k].ready = index
+    c.constructions.set(k, Some(Construction(c.body, items, receiver, 0, index, finishes)))
     construct(c, k, upto)
 
 // Checks class `k`'s body from where it stopped: to its end, or with `upto` until that field's type
@@ -5644,6 +5918,8 @@ private construct(c: *Checker, k: usize, upto: Option[usize])
         made.member += 1
         m match
             FieldMember(f) ->
+                // A trait's field is computed by the constructor of each class that stores it.
+                if is_trait(c, k) then continue
                 if f.lazy
                     lazy_field(c, k, &made, f)
                     continue
@@ -6741,12 +7017,16 @@ private assignable(c: *Checker, target: &Expr) -> Option[usize]
     None
 
 /** A field an assignment writes: the object, read once, and the field's index and type. `setup`
- * holds the object in a hidden local when it is computed rather than named. */
+ * holds the object in a hidden local when it is computed rather than named. A trait's `var` field
+ * seen through the trait, or through a type parameter it bounds, is read through its `val`,
+ * `getter`, and assigned through `setter`, which reach the field of the object's own class. */
 private struct FieldPlace
     setup: Option[&TExpr]
     object: &TExpr
     index: usize
     ty: &Type
+    getter: usize
+    setter: Option[usize]
 
     /** `body`, after the object is held. */
     wrap(self, at: Span, body: &TExpr) -> &TExpr = self.setup match
@@ -6762,8 +7042,70 @@ end FieldPlace
 // local or parameter hides.
 private targets_field(c: *Checker, target: &Expr) -> bool = target.kind match
     Member(_, _) -> true
-    Name(n) -> lookup_local(c, n) is None && param_index(c, n) is None && class_member(c, n) is Some(FieldOf(_))
+    Name(n) ->
+        if lookup_local(c, n) is Some(_) || param_index(c, n) is Some(_) then return false
+        class_member(c, n) match
+            Some(FieldOf(_)) -> true
+            Some(TraitFieldOf(m)) -> state_of_getter(c, m) is Some(_)
+            _ -> false
     _ -> false
+
+/** For the `val` a trait's field with a value is read through, the field. */
+private state_of_getter(c: *Checker, m: usize) -> Option[TraitState]
+    if !is_trait_field(c, m) then return None
+    for s in c.classes[c.symbols[m].owner_class?].state
+        if s.getter == m then return Some(s)
+    None
+
+// A trait's field assigned through the trait's type or a type parameter it bounds: through the
+// method that assigns it in the object's own class. Only a `var` one is assigned; a `val` without a
+// value is never assigned through the trait.
+private trait_field_place(c: *Checker, target: &Expr, object: &TExpr, m: usize, name: string, through: string) -> Option[FieldPlace]
+    val unit = unit_of(c)
+    val owner = c.classes[c.symbols[m].owner_class.unwrap()].name
+    val state = state_of_getter(c, m) match
+        Some(s) -> s
+        None ->
+            c.note(unit, target.span, s"`$name` is a `val` of `$owner`, which is read through $through and never assigned")
+            return None
+    val setter = state.setter match
+        Some(s) -> s
+        None ->
+            c.note(unit, target.span, s"`$name` is a `val` field of `$owner`; only a `var` field can be assigned")
+            return None
+    val ty = substitute(c.symbols[m].result.unwrap_or(ErrorType), class_owner(c.symbols[m].owner_class.unwrap()), receiver_type_args(c, object.ty, m))
+    if object.kind is Local(_) || object.kind is Param(_) then return Some(FieldPlace(None, object, 0, ty, m, Some(setter)))
+    val held = hidden_local(c, object.ty)
+    Some(FieldPlace(Some(TExpr(object.span, Unit, Let(held, object))), TExpr(object.span, object.ty, Local(held)), 0, ty, m, Some(setter)))
+
+/** The value a place holds now: its field, or for a trait's field seen through the trait, its
+ * `val`. */
+private place_read(c: *Checker, place: FieldPlace, at: Span) -> &TExpr
+    if place.setter is None then return TExpr(at, place.ty, Field(place.object, place.index))
+    var args: Buf[&TExpr] = buf()
+    args.push(place.object)
+    TExpr(at, place.ty, method_call_kind(c, place.object.ty, place.getter, args, receiver_type_args(c, place.object.ty, place.getter), false))
+
+/** Stores `value` into a place; with `yields`, the store yields the value stored. */
+private place_store(c: *Checker, place: FieldPlace, at: Span, value: &TExpr, yields: bool) -> &TExpr
+    val ty: &Type = if *value.ty is Nothing then Nothing elif yields then place.ty else Unit
+    val setter = place.setter match
+        Some(s) -> s
+        None -> return TExpr(at, ty, StoreField(place.object, place.index, value, yields))
+    var items: Buf[&TExpr] = buf()
+    var stored = value
+    if yields
+        val held = hidden_local(c, place.ty)
+        items.push(TExpr(at, Unit, Let(held, value)))
+        stored = TExpr(at, place.ty, Local(held))
+    var args: Buf[&TExpr] = buf()
+    args.push(place.object)
+    args.push(stored)
+    val call = TExpr(at, Unit, method_call_kind(c, place.object.ty, setter, args, receiver_type_args(c, place.object.ty, setter), false))
+    if !yields then return TExpr(at, ty, call.kind)
+    items.push(call)
+    items.push(stored)
+    TExpr(at, ty, Block(items))
 
 // The field an assignment writes, after reporting why it cannot be written: it must be a `var`
 // field, public unless the code is in its own class.
@@ -6775,13 +7117,20 @@ private field_place(c: *Checker, target: &Expr) -> Option[FieldPlace]
     target.kind match
         Name(n) ->
             name = n
-            k = fields_class(c).unwrap()
             object = self_ref(c, target.span)
+            k = fields_class(c) match
+                Some(x) -> x
+                // In a method an impl adds to a trait, `self` is a `Self` the trait bounds.
+                None -> return trait_field_place(c, target, object, bound_field(c, object.ty, n).unwrap(), n, "the trait")
         Member(t, n) ->
             name = n
             object = check_expr(c, t, None)
             *zonk(c, object.ty) match
                 Class(id, _, _) -> k = id
+                TypeVar(_, _, _) ->
+                    if bound_field(c, object.ty, n) is Some(m) then return trait_field_place(c, target, object, m, n, s"`${type_name(object.ty)}`")
+                    c.note(unit, target.span, s"${type_name(object.ty)} has no field `$n`")
+                    return None
                 ErrorType -> return None
                 Nothing -> return None
                 Data(_, _, _) ->
@@ -6798,7 +7147,7 @@ private field_place(c: *Checker, target: &Expr) -> Option[FieldPlace]
     val index = class_field(c, k, name) match
         Some(i) -> i
         None ->
-            if trait_field_named(c, k, name) is Some(m) then c.note(unit, target.span, s"`$name` is a `val` of `${c.classes[c.symbols[m].owner_class.unwrap()].name}`, which is read through `${cls.name}` and never assigned")
+            if trait_field_named(c, k, name) is Some(m) then return trait_field_place(c, target, object, m, name, s"`${cls.name}`")
             elif method_named(c, k, name) is Some(_) then c.note(unit, target.span, s"`$name` is a method of `${cls.name}`, which cannot be assigned")
             else c.note(unit, target.span, s"`${cls.name}` has no member `$name`")
             return None
@@ -6817,9 +7166,9 @@ private field_place(c: *Checker, target: &Expr) -> Option[FieldPlace]
         Class(_, _, a) -> a
         _ -> buf()
     val ty = substitute(field_type(c, k, index, target.span), class_owner(k), args)
-    if object.kind is Local(_) || object.kind is Param(_) then return Some(FieldPlace(None, object, index, ty))
+    if object.kind is Local(_) || object.kind is Param(_) then return Some(FieldPlace(None, object, index, ty, 0, None))
     val held = hidden_local(c, object.ty)
-    Some(FieldPlace(Some(TExpr(object.span, Unit, Let(held, object))), TExpr(object.span, object.ty, Local(held)), index, ty))
+    Some(FieldPlace(Some(TExpr(object.span, Unit, Let(held, object))), TExpr(object.span, object.ty, Local(held)), index, ty, 0, None))
 
 private assign_field(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp], value: &Expr, yields: bool, op_span: Span) -> &TExpr
     val place = field_place(c, target) match
@@ -6827,7 +7176,7 @@ private assign_field(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp],
         None ->
             check_statement(c, value)
             return TExpr(e.span, ErrorType, UnitConst)
-    val current = TExpr(target.span, place.ty, Field(place.object, place.index))
+    val current = place_read(c, place, target.span)
     if c.index is Some(_) then index_expr(c, target, current)
     val stored = op match
         Some(o) -> operate(c, e.span, op_span, o, binary_spelling(o) + (if yields then ":=" else "="), current, check_expr(c, value, Some(place.ty)))
@@ -6836,8 +7185,7 @@ private assign_field(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp],
             if !fits(c,typed.ty, place.ty)
                 c.note(unit_of(c), value.span, s"expected ${type_name(place.ty)}, found ${type_name(typed.ty)}")
             typed
-    val ty: &Type = if *stored.ty is Nothing then Nothing elif yields then place.ty else Unit
-    place.wrap(e.span, TExpr(e.span, ty, StoreField(place.object, place.index, stored, yields)))
+    place.wrap(e.span, place_store(c, place, e.span, stored, yields))
 
 // `++` and `--` on a field: the field is read, stepped with the usual overflow check, and stored.
 private update_field(c: *Checker, e: &Expr, target: &Expr, increment: bool, postfix: bool, op_span: Span) -> &TExpr
@@ -6850,14 +7198,14 @@ private update_field(c: *Checker, e: &Expr, target: &Expr, increment: bool, post
         return TExpr(e.span, ErrorType, UnitConst)
     val op = if increment then Add else Subtract
     val one = TExpr(op_span, ty, IntConst("1"))
-    val current = TExpr(target.span, ty, Field(place.object, place.index))
+    val current = place_read(c, place, target.span)
     if !postfix
-        return place.wrap(e.span, TExpr(e.span, ty, StoreField(place.object, place.index, TExpr(e.span, ty, Arith(op, current, one, op_span)), true)))
+        return place.wrap(e.span, place_store(c, place, e.span, TExpr(e.span, ty, Arith(op, current, one, op_span)), true))
     val old = hidden_local(c, ty)
     val previous = TExpr(target.span, ty, Local(old))
     var items: Buf[&TExpr] = buf()
     items.push(TExpr(e.span, Unit, Let(old, current)))
-    items.push(TExpr(e.span, Unit, StoreField(place.object, place.index, TExpr(e.span, ty, Arith(op, previous, one, op_span)), false)))
+    items.push(place_store(c, place, e.span, TExpr(e.span, ty, Arith(op, previous, one, op_span)), false))
     items.push(previous)
     place.wrap(e.span, TExpr(e.span, ty, Block(items)))
 
@@ -7556,8 +7904,8 @@ private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option
                 Some(local) ->
                     val ty = c.body.locals[local].ty
                     val old = hidden_local(c, ty)
-                    val current = fields[i] match
-                        Some(place) -> TExpr(targets[i].span, ty, Field(place.object, place.index))
+                    val current: &TExpr = fields[i] match
+                        Some(place) -> place_read(c, place, targets[i].span)
                         None -> TExpr(targets[i].span, ty, Local(local))
                     block.push(TExpr(e.span, Unit, Let(old, current)))
                     olds.push(Some(old))
@@ -7620,7 +7968,7 @@ private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option
     for i in 0..<fields.len()
         if fields[i] is Some(place)
             val held = TExpr(targets[i].span, place.ty, Local(locals[i].unwrap()))
-            block.push(TExpr(targets[i].span, Unit, StoreField(place.object, place.index, held, false)))
+            block.push(place_store(c, place, targets[i].span, held, false))
     TExpr(e.span, Unit, Block(block))
 
 /** A local the compiler introduces to hold a value for a moment; no name reaches it. */
@@ -11627,14 +11975,39 @@ struct InitScan
     last: string
     kind: string
     report: bool
+    /** For the function computing a trait's field, the names of the fields the class has
+     * initialized before it, which it may read through the trait's `val`s; empty otherwise. */
+    ready: Buf[string]
+    /** Whether the body scanned computes a trait's field, so its receiver is the object even where
+     * its type is the trait's `Self`. */
+    trait_init: bool
 
 /** Checks every class body's uses of `self`. */
 private check_initialization(c: *Checker)
     var unsafe = unsafe_methods(c)
+    var reported: Buf[usize] = buf()
     for k in 0..<c.classes.len()
-        check_class_initialization(c, k, &unsafe)
+        check_class_initialization(c, k, &unsafe, &reported)
 
-private check_class_initialization(c: *Checker, k: usize, unsafe: *Buf[bool])
+// The functions computing the fields of the traits a class stores run before the class body, each
+// on the object, so each may read only the fields initialized before its own and may not otherwise
+// use `self`, as the class body may not before its last field. One that does is reported once, at
+// the trait, in `reported`.
+private check_mixed_initialization(c: *Checker, k: usize, kind: string, unsafe: *Buf[bool], reported: *Buf[usize])
+    val cls = c.classes[k]
+    val first = cls.inherited + cls.decl.params.len()
+    for j in 0..<cls.mixed.len()
+        val init = c.classes[cls.mixed[j].trait_id].state[cls.mixed[j].state].init
+        if contains_id(*reported, init) then continue
+        val body = c.bodies[init] match
+            Some(b) -> b
+            None -> continue
+        var ready: Buf[string] = buf()
+        for i in 0..<first + j
+            if cls.fields[i].public then ready.push(cls.fields[i].name)
+        if !scan_init(c, InitScan(c.symbols[init].unit, None, cls.fields[first + j].name, kind, true, ready, true), body, unsafe) then reported.push(init)
+
+private check_class_initialization(c: *Checker, k: usize, unsafe: *Buf[bool], reported: *Buf[usize])
     val cls = c.classes[k]
     if is_trait(c, k) then return
     val body = c.bodies[cls.initializer] match
@@ -11668,11 +12041,12 @@ private check_class_initialization(c: *Checker, k: usize, unsafe: *Buf[bool])
     if items.len() < count + 1 then return
     val start = items.len() - 1 - count
     val kind = if is_open(c, k) then cls.decl.modifier else ""
+    check_mixed_initialization(c, k, kind, unsafe, reported)
     for i in 0..<count
         val early = i < last
         if !early && kind == "" then return
         if deferred[i] then continue
-        val scan = InitScan(cls.unit, Some(self_local), if early then last_name else "", kind, true)
+        val scan = InitScan(cls.unit, Some(self_local), if early then last_name else "", kind, true, buf(), false)
         val item = items[start + i]
         // A field's initializer is checked as it is stored.
         val e = item.kind match
@@ -11694,7 +12068,7 @@ private unsafe_methods(c: *Checker) -> Buf[bool]
         for m in 0..<c.symbols.len()
             if !unsafe[m] && is_class_method(c, m)
                 val safe = c.bodies[m] match
-                    Some(b) -> scan_init(c, InitScan(c.symbols[m].unit, None, "", "", false), b, &unsafe)
+                    Some(b) -> scan_init(c, InitScan(c.symbols[m].unit, None, "", "", false, buf(), false), b, &unsafe)
                     None -> false
                 if !safe
                     unsafe.set(m, true)
@@ -11721,7 +12095,8 @@ private captures_init_self(c: *Checker, s: InitScan, f: usize) -> bool = s.self_
  * initialized, `open` in an open or abstract class's body. Yields false, the scan's verdict. */
 private init_violation(c: *Checker, s: InitScan, at: Span, early: string, open: string) -> bool
     if s.report
-        if s.last != "" then c.note(s.unit, at, s"$early before `${s.last}` is initialized; a class body uses `self` for more than reading and assigning its fields only once every field is")
+        if s.trait_init then c.note(s.unit, at, s"$early in the value of the trait's field `${s.last}`, which a class computes before its body: it may read only the fields initialized before it, and use `self` for nothing else")
+        elif s.last != "" then c.note(s.unit, at, s"$early before `${s.last}` is initialized; a class body uses `self` for more than reading and assigning its fields only once every field is")
         else c.note(s.unit, at, s"$open in the body of an ${s.kind} class, which runs before a subclass's fields are initialized")
     false
 
@@ -11742,20 +12117,11 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
             for i in from..<args.len()
                 if !scan_init(c, s, args[i], unsafe) then ok = false
             ok
-        Dispatch(f, _, args, _) ->
-            var ok = true
-            var from = 0usize
-            val name = c.symbols[f].decl.name
-            if args.len() > 0 && is_init_self(s, args[0])
-                from = 1
-                // A trait's `val` is read through the method table, from a field a subclass may set.
-                if is_trait_field(c, f) then ok = init_violation(c, s, e.span, s"`$name` is read", s"`$name` is a trait's `val`, which a subclass may supply, so it cannot be read")
-                else ok = init_violation(c, s, e.span, s"`$name` is called", s"`$name` may be overridden, so it cannot be called")
-            for i in from..<args.len()
-                if !scan_init(c, s, args[i], unsafe) then ok = false
-            ok
-        // The receiver's type is a type parameter, so it is never the object being initialized.
-        BoundCall(_, _, args, _) -> scan_init_all(c, s, args, unsafe)
+        Dispatch(f, _, args, _) -> scan_dispatch(c, s, e, f, args, unsafe)
+        // The receiver's type is a type parameter, so it is never the object being initialized,
+        // except in the function computing a field of a trait whose methods take a `Self`.
+        BoundCall(f, _, args, _) ->
+            if s.trait_init then scan_dispatch(c, s, e, f, args, unsafe) else scan_init_all(c, s, args, unsafe)
         FunctionValue(f, _) ->
             if !captures_init_self(c, s, f) then return true
             val symbol = c.symbols[f]
@@ -11832,6 +12198,32 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
                     if !scan_init(c, s, b.body, unsafe) then ok = false
             ok
         _ -> true
+
+/** Scans a call of method `f` through a method table, `e`: on `self`, it reads a trait's `val`, which
+ * a field initialized already may supply, assigns a trait's `var` field, or calls a method that may be
+ * overridden. */
+private scan_dispatch(c: *Checker, s: InitScan, e: &TExpr, f: usize, args: Buf[&TExpr], unsafe: *Buf[bool]) -> bool
+    var ok = true
+    var from = 0usize
+    val name = c.symbols[f].decl.name
+    if args.len() > 0 && is_init_self(s, args[0])
+        from = 1
+        // A trait's `val` is read through the method table, from a field a subclass may set.
+        if is_trait_field(c, f)
+            if !contains_name(s.ready, name) then ok = init_violation(c, s, e.span, s"`$name` is read", s"`$name` is a trait's `val`, which a subclass may supply, so it cannot be read")
+        elif setter_field(c, f) is Some(field) then ok = init_violation(c, s, e.span, s"`$field` is assigned", s"`$field` cannot be assigned")
+        else ok = init_violation(c, s, e.span, s"`$name` is called", s"`$name` may be overridden, so it cannot be called")
+    for i in from..<args.len()
+        if !scan_init(c, s, args[i], unsafe) then ok = false
+    ok
+
+/** For the method that assigns a trait's `var` field through the trait, the field's name. */
+private setter_field(c: *Checker, m: usize) -> Option[string]
+    if !contains_id(c.trait_setters, m) then return None
+    for s in c.classes[c.symbols[m].owner_class?].state
+        if s.setter is Some(x)
+            if x == m then return Some(s.field.name)
+    None
 
 /** The method's name when `items` make a method of `self` a value: the receiver held in a local,
  * then a closure over that local that calls the method. */
