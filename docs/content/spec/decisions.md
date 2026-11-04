@@ -554,6 +554,11 @@ Settled by the user on 2026-11-03:
 
 Settled by the user on 2026-11-04:
 
+- **`compareAndSet` on a value without identity** — a data value, tuple, string, `Option` or `Any` —
+  **compares with `==`; on scalars and references it compares the word.** A class instance (even of
+  a class that derives `Eq`) and a function value keep identity. See
+  [threads](/spec/threads/).
+
 - **`Vector[+T]` is a persistent, radix-balanced tree of arrays of 32**, with a prefix and a suffix
   beside a balanced middle at every level, and stays the default sequence (`[1, 2]`, `[]T`,
   `main(args)`). Indexing and `updated` take one array per level, at most six; `:+` and `+:` take

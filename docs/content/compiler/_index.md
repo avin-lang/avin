@@ -130,8 +130,11 @@ binding \`name\` does not match \`module.name\`: …`. A mirror's import and its
 own lines, reported at its declaration as `the Sysl mirror \`Name\` does not match
 \`module.Name\`: …`. A diagnostic that falls elsewhere is reported with Sysl's whole output.
 
-The archive is cached under `.avin/shims/` in the toolchain's root, named by a SHA-256 of the
-manifest, the shim source, the `sysl --version` output and the runtime's source files. A build with
+The archive is cached under `shims/` in the user's cache for this compiler version
+(`~/Library/Caches/avin/<version>` on macOS, `AVIN_CACHE` when it is set), never in the toolchain's
+root, which an installed compiler only reads. It is named by a SHA-256 of the manifest, the shim
+source, the `sysl --version` output and the runtime's source files, each named by its path in the
+runtime. A build with
 the same bindings finds it there and runs no Sysl build; it is built under a temporary name and
 published by rename, so concurrent builds never see a partial archive. The `check` command builds
 the shims too, since only Sysl can say whether a binding is right.
@@ -139,7 +142,10 @@ the shims too, since only Sysl can say whether a binding is right.
 ## Runtime
 
 `runtime/` is a Sysl package, built into a library archive when its sources change rather than once
-per program, and linked into every executable. It contains:
+per program, and linked into every executable. The archive is named by a key over the compiler's
+version and the runtime's sources: a release ships it prebuilt as `share/avin/lib/libavinrt-<key>.a`,
+and otherwise it is built into `runtime/` in the user's cache, so a program that reaches no Sysl
+binding is built without Sysl. It contains:
 
 - program entry, arguments and exit status;
 - the collector interface over `sh.sysl.gc` — heap setup and growth, collect-on-pressure, a
@@ -667,7 +673,9 @@ on the field's address at the instance's type, and the emitter makes it one `seq
 the value's storage width: `load atomic`, `store atomic`, `atomicrmw xchg` and `cmpxchg`, whose
 success bit is the result. A `bool` or a narrow integer is widened as a shared field is, a `real` is
 accessed as the 64 bits of its encoding, and a reference as a `ptr`, so a compare-and-set compares
-identity. An integer wider than 64 bits has no single atomic access, so each operation on one is the
+identity. `compareAndSet` of a value without identity (data, tuple, string, `Any`) is library code
+over two intrinsics, `atomic_by_value`, which lowering folds to a constant for the instance's `T`,
+and `atomic_compare_set` on the word: it loops on `==` and a word compare-and-set. An integer wider than 64 bits has no single atomic access, so each operation on one is the
 field's word-at-a-time accesses between `avin_rt_wide_atomic_begin` and `avin_rt_wide_atomic_end`,
 which take and give back one spin lock every such operation shares. `add`, `sub` and `update` are
 library code, a loop of `load` and `compareAndSet`, so an integer that would overflow traps before

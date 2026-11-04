@@ -19,7 +19,8 @@ avin lsp
 
 `avin lsp --stdio` is the same command; the flag is what many protocol clients pass to say which
 transport they use, and standard input and output is the one there is. The server finds the
-library as the other commands do: through `AVIN_ROOT`, or beside the compiler. It runs until the
+library as the other commands do: in `share/avin` beside an installed compiler, in a source
+checkout beside its `compiler/avin`, or through `AVIN_ROOT`. It runs until the
 editor sends `shutdown` and then `exit`, and ends with status 0; an editor that closes the input
 without them, or a message whose framing cannot be read, ends it with status 1.
 
