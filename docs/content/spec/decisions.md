@@ -1369,8 +1369,8 @@ Settled by the user on 2026-11-04:
     `setSeed`; the companion's methods use one shared, locked generator. PCG32, written in Avin with
     the wrapping operators, so a seed gives the same sequence everywhere. Binding: one runtime
     function for the platform's seed over `sysl.posix.rand.seed_from_os`, since its `u64` does not
-    fit a `long` at the boundary. `nextGaussian` needs a square root and a logarithm on `real`, which
-    Avin does not have yet. Not blocked on opaque handles.
+    fit a `long` at the boundary. `nextGaussian` uses `avin.math`'s `sqrt` and `log`. Not blocked on
+    opaque handles.
   - **[`avin.net`](/spec/system-library/#avin-net)**: `TcpStream` and `TcpListener`; `Url`, parsed
     and percent-encoded, written in Avin; an HTTP/1.1 client (`get`, `post`, `send` with a `Request`)
     written in Avin over the TCP stream, a status never an error. `IoError` gains
@@ -1410,6 +1410,17 @@ Settled by the user on 2026-11-04:
   call with "`Name` is closed"; a handle never closed is given back by a finalizer when the
   collector frees it. A handle crosses back into Sysl only as the receiver of its own methods,
   compares by identity, and has no `Display`.
+- **The elementary functions are a module, `avin.math`** ([system library](/spec/system-library/#avin-math)),
+  with the reference library's names, called as `math.sqrt(x)` after `import avin.math` or imported
+  by name: `Pi` and `E`; `sqrt`, `cbrt`, `exp`, `expm1`, `log` (natural), `log10`, `log1p`, `pow`,
+  `hypot`; `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2(y, x)`, `sinh`, `cosh`, `tanh`;
+  `floor`, `ceil`, `rint` (ties to even), `abs`, `max`, `min` (NaN when either is, `-0.0` below
+  `0.0`), `signum`, `toRadians` and `toDegrees`. All take and give `real`, follow IEEE 754 and
+  never trap: `sqrt(-1.0)` is NaN, `log(0.0)` negative infinity. Not methods on `real`, and no
+  integer overloads of `abs`, `max` and `min` yet; the reference's `round`, which answers a `long`,
+  is left out until real-to-integer rounding is decided with the conversions. Bindings: one
+  runtime function per function, over the methods of Sysl's `Float` on `real`, since a binding names
+  a function and these are methods.
 
 ## Open
 
