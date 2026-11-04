@@ -2,27 +2,79 @@ module dev.avinlang.compiler
 
 import sh.sysl.parsing.{Source, Span, error, source_of, report}
 import sysl.buf.{Buf, buf}
-import sysl.fs.{entries, exists, is_dir, make_dir_all, make_temp_dir, metadata, pending_name, publish_file, read_text, remove_dir_all, remove_file, walk, write_text}
+import sysl.env.get
+import sysl.fs.{cache_dir, canonicalize, entries, exists, is_dir, make_dir_all, make_temp_dir, pending_name, publish_file, read_text, remove_dir_all, remove_file, write_text}
+import sysl.path.parent
 import sysl.process.capture
 import sysl.slices.sort
 
 /** Where the compiler finds what it compiles against: the standard library's Avin source and the
- * runtime's Sysl package. */
+ * runtime's Sysl package under `root`, which is only ever read, and the tools it runs. What it builds
+ * from them, the runtime's archive and the archives of binding shims, goes under `cache`, a directory
+ * of the user's own, so an installed toolchain may be read-only. */
 struct Toolchain
     root: string
+    cache: string
+    /** The C compiler that links every program. */
+    clang: string
+    /** The Sysl compiler, which builds the runtime and the shims of Sysl bindings. */
+    sysl: string
 
     library_dir(self) -> string = self.root + "/library"
     prelude_path(self) -> string = self.root + "/library/avin/prelude.avin"
     runtime_dir(self) -> string = self.root + "/runtime"
-    runtime_archive(self) -> string = self.root + "/runtime/.sysl/libavinrt.a"
+    /** The runtime's archive as a release ships it, built from the runtime's sources whose key is
+     * `key`. */
+    prebuilt_runtime(self, key: string) -> string = self.root + "/lib/libavinrt-" + key + ".a"
+    /** Where runtime archives built from the runtime's sources are kept, by key. */
+    runtime_cache(self) -> string = self.cache + "/runtime"
     /** Where the archives of the runtime with a program's binding shims are kept, by key. */
-    shim_cache(self) -> string = self.root + "/.avin/shims"
+    shim_cache(self) -> string = self.cache + "/shims"
 end Toolchain
 
-/** A toolchain rooted at `root`, if `root` holds the library and the runtime. */
-toolchain_at(root: string) -> Option[Toolchain]
-    val tc = Toolchain(root)
+/** A toolchain rooted at `root`, if `root` holds the library and the runtime, building into the
+ * user's cache. */
+toolchain_at(root: string) -> Option[Toolchain] = toolchain_in(root, toolchain_cache(get("AVIN_CACHE"), cache_dir(), get("TMPDIR")))
+
+/** A toolchain rooted at `root` that builds into `cache`, if `root` holds the library and the
+ * runtime. */
+toolchain_in(root: string, cache: string) -> Option[Toolchain]
+    val tc = Toolchain(root, cache, "clang", "sysl")
     if exists(tc.prelude_path()) && is_dir(tc.runtime_dir()) then Some(tc) else None
+
+/** Where this compiler keeps what it builds from a toolchain: `named` (`AVIN_CACHE`) when it is set,
+ * and otherwise `avin/<version>` in the user's cache directory, `machine` (`~/Library/Caches` on
+ * macOS, `$XDG_CACHE_HOME` or `~/.cache` elsewhere), or in the temporary directory `temp` (`TMPDIR`)
+ * on a machine with none. The version keeps one release's archives from another's. */
+toolchain_cache(named: Option[string], machine: Option[string], temp: Option[string]) -> string
+    if named is Some(dir)
+        if dir != "" then return dir
+    val base = machine match
+        Some(d) -> d
+        None -> temp.unwrap_or("/tmp")
+    (if base.ends_with("/") then base else base + "/") + "avin/" + Version
+
+/** The toolchain an installed compiler finds, given the `AVIN_ROOT` it was run with and the path of
+ * its own executable. `AVIN_ROOT` names one, for working on the library or the runtime; otherwise it
+ * is `share/avin` in the prefix the executable is installed in, `<prefix>/bin/avin`, through any
+ * symbolic links to the executable, or a source checkout's root when the executable is the
+ * checkout's `compiler/avin`. */
+locate_toolchain(avin_root: Option[string], exe: Option[string], cache: string) -> Option[Toolchain]
+    if avin_root is Some(root)
+        if root != "" then return toolchain_in(root, cache)
+    val named = exe match
+        Some(e) -> e
+        None -> return None
+    val real = canonicalize(named).unwrap_or(named)
+    val above = parent(parent(real).unwrap_or("/")).unwrap_or("/")
+    if toolchain_in(above + "/share/avin", cache) is Some(tc) then return Some(tc)
+    toolchain_in(above, cache)
+
+/** Why a tool could not be started, what it is for and how to install it. */
+missing_tool(tool: string, error: string) -> string
+    val sysl = "it builds the runtime and the Sysl bindings a program reaches; install it with `brew install sysl-lang/tap/sysl`"
+    val clang = "it links every Avin program; install Xcode's command-line tools with `xcode-select --install`"
+    s"cannot run `$tool` ($error): ${if tool.ends_with("sysl") then sysl else clang}"
 
 struct Compilation
     /** Every diagnostic, rendered; empty when compilation succeeded. */
@@ -202,37 +254,29 @@ private valid_module_name(name: string) -> bool
         start = false
     !start
 
-/** The runtime library archive, built from the runtime's Sysl package when it is missing or older
- * than any of its sources. It is built under a temporary name and published by rename, so builds
- * running at the same time never see a partial archive. */
+/** The runtime library archive for the runtime's sources as they are: the one a release ships beside
+ * them, or else one built from the runtime's Sysl package into the toolchain's cache. Both are named
+ * by a key over the sources, so an edited runtime is never linked from an archive of other sources. A
+ * build is written under a temporary name and published by rename, so builds running at the same time
+ * never see a partial archive. */
 ensure_runtime(tc: Toolchain) -> Result[string, string]
-    val archive = tc.runtime_archive()
-    if exists(archive) && !runtime_stale(tc, archive) then return Ok(archive)
-    make_dir_all(tc.root + "/runtime/.sysl").map_err(e -> e.to_string())?
+    val key = runtime_key(tc)
+    val shipped = tc.prebuilt_runtime(key)
+    if exists(shipped) then return Ok(shipped)
+    val archive = tc.runtime_cache() + "/libavinrt-" + key + ".a"
+    if exists(archive) then return Ok(archive)
+    make_dir_all(tc.runtime_cache()).map_err(e -> s"${tc.runtime_cache()}: ${e.to_string()}")?
     val pending = pending_name(archive)
     defer _ = remove_file(pending)
     defer _ = remove_file(pending + ".h")
-    val result = capture("sysl", ["build-c", tc.runtime_dir(), "-o", pending], stderr = true, timeout = 120000).map_err(e -> "could not run sysl: " + e.to_string())?
+    val result = capture(tc.sysl, ["build-c", tc.runtime_dir(), "-o", pending], stderr = true, timeout = 300000).map_err(e -> missing_tool(tc.sysl, e.to_string()))?
     if !result.status.ok()
         return Err("runtime build failed: " + result.status.to_string() + "\n" + result.err.unwrap_or("") + result.text)
     publish_file(pending, archive).map_err(e -> e.to_string())?
     Ok(archive)
 
-private runtime_stale(tc: Toolchain, archive: string) -> bool
-    val built = metadata(archive) match
-        Ok(m) -> m.modified
-        Err(_) -> return true
-    var entries = walk(tc.runtime_dir())
-    loop
-        val entry = entries.next() match
-            Some(Ok(e)) -> e
-            Some(Err(_)) -> return true
-            None -> return false
-        if entry.is_dir() && entry.path.ends_with("/.sysl")
-            entries.skip_dir()
-            continue
-        if entry.path.ends_with(".sysl") || entry.path.ends_with(".hocon")
-            if entry.meta.modified > built then return true
+/** The key a runtime archive is named by: the compiler's version and the runtime's sources. */
+runtime_key(tc: Toolchain) -> string = content_key("avin " + Version + "\n" + runtime_fingerprint(tc))
 
 /** Links LLVM IR with the runtime into an executable at `output`: with `shims`, the runtime with a
  * program's binding shims, when there is one, and otherwise the runtime's own archive. The
@@ -249,7 +293,7 @@ link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimiz
     val pending = pending_name(output)
     defer _ = remove_file(pending)
     val args = ["-x", "ir", optimization, "-Wno-override-module", ir, "-x", "none", archive, "-lm", "-o", pending]
-    val result = capture("clang", args, stderr = true, timeout = 120000).map_err(e -> "could not run clang: " + e.to_string())?
+    val result = capture(tc.clang, args, stderr = true, timeout = 120000).map_err(e -> missing_tool(tc.clang, e.to_string()))?
     if !result.status.ok()
         return Err("clang failed: " + result.status.to_string() + "\n" + result.err.unwrap_or("") + result.text)
     publish_file(pending, output).map_err(e -> e.to_string())?
