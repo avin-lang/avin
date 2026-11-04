@@ -130,6 +130,15 @@ a decision changes, this page and the chapter change together.
   its impls name are.
 - A type pattern matches an object whose type conforms to the pattern's type through variance, as
   the checker's subtyping does: a `List[Dog]` held as an `Any` matches `List[Animal]`.
+- Settled by the user 2026-11-04: [lower bounds](/spec/generics/#lower-bounds) on a function's or a
+  method's own type parameters, written first: `[W >: T]`, `[W >: T: Display]`. A lower bound is a
+  covariant position, so a covariant trait declares `put[W >: V](key: K, value: W) -> Bag[K, W]` as
+  a virtual method; impl methods that are not variance positions are no longer the only way a
+  covariant type takes its parameter in. A value of the bound is one of the parameter with no
+  conversion, so a type argument is the bound or a reference type it is seen as. A call infers the
+  join of the bound and the arguments, `Any` where they are references with no nearer common type;
+  a written or expected type argument is held to the bound. An override writes its method's lower
+  bound or none. A type's and an impl's parameters take none.
 - The built-in types belong to the core library's module, `avin`; a conformance of one is written
   there or in the trait's module. An impl that only adds methods may be written in any module
   (settled 2026-11-04, below).
