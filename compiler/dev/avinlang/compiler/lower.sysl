@@ -183,7 +183,12 @@ lower_program(program: TProgram) -> MirProgram
     // carries none of the library it does not use, and builds no shim for a binding it never calls.
     for i in 0..<program.symbols.len()
         if !is_generic(program, i) && !never_compiled(program, i) && !in_core_library(program, i) then instance(&l, i, buf())
-    val entry = instance(&l, program.entry, buf())
+    val entry: Option[usize] = program.entry match
+        Some(id) -> Some(instance(&l, id, buf()))
+        None -> None
+    var tests: Buf[usize] = buf()
+    for t in program.tests
+        tests.push(instance(&l, t.symbol, buf()))
     val init: Option[usize] = program.init match
         Some(id) -> Some(instance(&l, id, buf()))
         None -> None
@@ -208,7 +213,7 @@ lower_program(program: TProgram) -> MirProgram
             for b in bindings
                 if b.shim == shim then seen = true
             if !seen then bindings.push(MirBinding(shim, target, symbol.name, symbol.params, symbol.result.unwrap_or(Unit), symbol.unit, symbol.decl.name_span))
-    MirProgram(functions, l.strings, l.descriptors, l.records, l.closures, l.traps, global_types, entry, init, bindings)
+    MirProgram(functions, l.strings, l.descriptors, l.records, l.closures, l.traps, global_types, entry, init, bindings, tests, program.testing)
 
 /** Whether a function belongs to the core library's module, `avin`, or one under it. */
 private in_core_library(program: TProgram, id: usize) -> bool
@@ -876,10 +881,25 @@ private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr],
     val callee = l.program.symbols[function]
     if callee.intrinsic is Some(name)
         if name == "trap"
-            val reason = args[0].kind match
-                StrConst(text) -> text
-                _ -> "trap"
-            leave(l, trap_at(l, reason, e.span))
+            // A literal reason is written into the trap site; one made as the program runs, such as
+            // an assertion's message showing the values it compared, is passed with the site.
+            if args[0].kind is StrConst(text)
+                leave(l, trap_at(l, text, e.span))
+                return None
+            val reason = machine(l, args[0].ty)
+            if operands.len() != 1 || reason is None
+                leave(l, trap_at(l, "trap", e.span))
+                return None
+            val site = trap_site(l, "", e.span)
+            val entry = if l.library then "avin_rt_caller_trap_message" else "avin_rt_trap_message"
+            var types: Buf[MirType] = buf()
+            types.push(MPtr)
+            types.push(reason.unwrap())
+            var values: Buf[Operand] = buf()
+            values.push(TrapSiteAddress(site))
+            values.push(operands[0])
+            l.insts.push(Call(None, Runtime(entry, MirSignature(types, None)), values))
+            leave(l, Unreachable)
             return None
         if name.starts_with("array_")
             // The array is the receiver, or for a new one the result.

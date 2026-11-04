@@ -31,6 +31,14 @@ struct Compilation
     /** For a program with Sysl bindings, the archive it links in place of the runtime's: the runtime
      * with the bindings' shims, which Sysl has checked. */
     archive: Option[string]
+    /** The program's tests, in the order they are declared. */
+    tests: Buf[TestEntry]
+
+/** A test a program holds: its name, and the file and line of its `@test` function. */
+struct TestEntry
+    name: string
+    file: string
+    line: usize
 
 /** A source file of a program, with the module its place under the program's root directory gives
  * it. A program of one file has no root directory: its `module_name` is `None`, and its header, if it has
@@ -79,22 +87,26 @@ compile(tc: Toolchain, src: Source) -> Compilation = compile_files(tc, single_fi
 
 /** Compiles a program to LLVM IR against the toolchain's library, and builds the shims of its Sysl
  * bindings, so a binding Sysl rejects is reported as the program's error. */
-compile_files(tc: Toolchain, files: Buf[ProgramFile]) -> Compilation
-    val lowered = lower_units(tc, files) match
+compile_files(tc: Toolchain, files: Buf[ProgramFile]) -> Compilation = compile_program(tc, files, false)
+
+/** Compiles a program as `compile_files` does; with `testing`, into a program that runs one of its
+ * tests in each process rather than `main`, which it then need not have. */
+compile_program(tc: Toolchain, files: Buf[ProgramFile], testing: bool) -> Compilation
+    val lowered = lower_units(tc, files, testing) match
         Ok(l) -> l
-        Err(diagnostics) -> return Compilation(diagnostics, None, None)
+        Err(diagnostics) -> return Compilation(diagnostics, None, None, buf())
     var archive: Option[string] = None
     if lowered.program.bindings.len() > 0
         ensure_shims(tc, lowered.program.bindings, lowered.units) match
             Ok(a) -> archive = Some(a)
-            Err(diagnostics) -> return Compilation(diagnostics, None, None)
-    Compilation("", Some(emit_llvm(lowered.program)), archive)
+            Err(diagnostics) -> return Compilation(diagnostics, None, None, buf())
+    Compilation("", Some(emit_llvm(lowered.program)), archive, lowered.tests)
 
 /** Compiles a program of one file as far as MIR, or renders its diagnostics. */
 lower_source(tc: Toolchain, src: Source) -> Result[MirProgram, string] = lower_files(tc, single_file(src))
 
 /** Compiles a program as far as MIR against the toolchain's library, or renders its diagnostics. */
-lower_files(tc: Toolchain, files: Buf[ProgramFile]) -> Result[MirProgram, string] = lower_units(tc, files) match
+lower_files(tc: Toolchain, files: Buf[ProgramFile]) -> Result[MirProgram, string] = lower_units(tc, files, false) match
     Ok(lowered) -> Ok(lowered.program)
     Err(diagnostics) -> Err(diagnostics)
 
@@ -102,10 +114,11 @@ lower_files(tc: Toolchain, files: Buf[ProgramFile]) -> Result[MirProgram, string
 private struct Lowered
     program: MirProgram
     units: Buf[SourceUnit]
+    tests: Buf[TestEntry]
 
 // The library's directory is loaded as a program tree is, and every module in it is the core
 // library's, `avin` or under it; the program's own modules may not be.
-private lower_units(tc: Toolchain, files: Buf[ProgramFile]) -> Result[Lowered, string]
+private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool) -> Result[Lowered, string]
     val library = program_files(tc.library_dir()).map_err(message -> s"avin: $message\n")?
     var units: Buf[SourceUnit] = buf()
     var diagnostics = ""
@@ -123,10 +136,16 @@ private lower_units(tc: Toolchain, files: Buf[ProgramFile]) -> Result[Lowered, s
     // report the recovery rather than the program. A file in the wrong module is not checked either,
     // since every name it declares would be reported in a module it does not mean.
     if diagnostics != "" then return Err(diagnostics)
-    val checked = check_program(units, root_module)
+    val checked = check_program(units, root_module, testing)
     if checked.has_errors() then return Err(checked.render())
     checked.program match
-        Some(program) -> Ok(Lowered(lower_program(program), checked.units))
+        Some(program) ->
+            var tests: Buf[TestEntry] = buf()
+            for t in program.tests
+                val f = program.symbols[t.symbol]
+                val src = program.sources[f.unit]
+                tests.push(TestEntry(t.name, src.name, src.locate(f.decl.name_span.start).line))
+            Ok(Lowered(lower_program(program), checked.units, tests))
         None -> Err("avin: checking produced no program\n")
 
 // A file of a program tree belongs to the module its directory names, and its header, which every

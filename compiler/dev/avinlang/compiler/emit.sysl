@@ -91,9 +91,12 @@ emit_llvm(program: MirProgram) -> string
     for declaration in intrinsics
         out.push(declaration + "\n")
     out.push("\n")
-    val entry = program.functions[program.entry]
     out.push("declare ptr @avin_rt_start()\n")
     if roots > 0 then out.push("declare void @avin_rt_globals(ptr)\n")
+    if program.testing
+        emit_test_main(&out, program, roots)
+        return out.finish()
+    val entry = program.functions[program.entry.unwrap()]
     out.push("\ndefine i32 @main() {\nentry:\n")
     out.push("  %ctx = call ptr @avin_rt_start()\n")
     // The module-level values are roots before the first of them is stored, and are all
@@ -111,6 +114,30 @@ emit_llvm(program: MirProgram) -> string
             out.push("  ret i32 0\n")
     out.push("}\n")
     out.finish()
+
+// A program built for its tests runs one of them in each process: the one its first argument numbers,
+// counting from 0 in the order the checker found them. The module-level values are initialized
+// first, as for `main`, so a test sees the program as it starts. A test that returns exits 0; one that
+// fails stops the process, and the runner reads which way it went. A missing or unknown number exits
+// 2.
+private emit_test_main(out: *StrBuilder, program: MirProgram, roots: usize)
+    out.push("declare i32 @atoi(ptr)\n")
+    out.push("\ndefine i32 @main(i32 %argc, ptr %argv) {\nentry:\n")
+    out.push("  %given = icmp sge i32 %argc, 2\n  br i1 %given, label %pick, label %unknown\n")
+    out.push("unknown:\n  ret i32 2\n")
+    out.push("pick:\n  %slot = getelementptr inbounds ptr, ptr %argv, i64 1\n  %arg = load ptr, ptr %slot\n")
+    out.push("  %which = call i32 @atoi(ptr %arg)\n")
+    out.push("  %ctx = call ptr @avin_rt_start()\n")
+    if roots > 0 then out.push("  call void @avin_rt_globals(ptr @avin.roots)\n")
+    if program.init is Some(init) then out.push(s"  call void @\"${program.functions[init].symbol}\"(ptr %ctx)\n")
+    out.push("  switch i32 %which, label %unknown [")
+    for i in 0..<program.tests.len()
+        out.push(s" i32 $i, label %test$i")
+    out.push(" ]\n")
+    for i in 0..<program.tests.len()
+        val test = program.functions[program.tests[i]]
+        out.push(s"test$i:\n  call ${result_type(test.signature)} @\"${test.symbol}\"(ptr %ctx)\n  ret i32 0\n")
+    out.push("}\n")
 
 /** A type record's equality entry as an LLVM constant: the function's address, or null. */
 private entry_address(program: MirProgram, entry: Option[usize]) -> string = entry match

@@ -26,7 +26,72 @@ sysl build compiler -o compiler/avin
 without building it, and `avin emit-llvm file.avin -o file.ll` writes its LLVM IR. The compiler finds
 the standard library and runtime beside itself; `AVIN_ROOT` names another location.
 
-## Tests
+`avin run` builds a program and runs it in one step:
+
+```sh
+./compiler/avin run examples/hello.avin
+./compiler/avin run my-program -O0 -- first second
+```
+
+The program writes to the terminal as it runs, and `avin run` exits with the program's own status;
+when a trap stops the program, the status is 128 and the signal's number, as a shell reports it.
+Everything after `--` is passed to the program as its arguments. The executable is kept in `.avin/build/`
+in the program's directory, and the next run of an unchanged program starts it without building it
+again. Any change to the program's sources, the standard library, the runtime or the compiler
+builds it afresh.
+
+A program is a source file or a directory: `avin run my-program` builds every `.avin` file under
+`my-program/`. `build`, `run` and `test` all take `-O0` or `-O2`, and build at `-O2` by default.
+
+## Testing a program
+
+A test is a function marked `@test` that takes nothing and yields nothing. It passes by returning,
+and fails by stopping, which a failed assertion does:
+
+```avin
+clamp(n: int, low: int, high: int) -> int = if n < low then low elif n > high then high else n
+
+@test("clamps below the low bound")
+below()
+    assertEq(clamp(0, 1, 3), 1)
+
+@test
+leavesInRange()
+    print("clamping 4")
+    assert(clamp(4, 1, 3) == 4, "four is left as it is")
+```
+
+`assert(condition)` and `assert(condition, message)` stop the program when the condition is false;
+`assertEq(actual, expected)` stops it when the two differ, showing both in their `Debug` form. Each
+reports the place of the assertion itself.
+
+`avin test` builds the program's tests into one executable and runs each test in a process of its
+own, so a test that traps stops only itself:
+
+```sh
+./compiler/avin test my-program
+./compiler/avin test my-program "low bound"
+```
+
+```text
+running 2 tests
+
+clamp.avin
+  ok    clamps below the low bound  2ms
+  FAIL  leavesInRange               1ms
+        assertion failed: four is left as it is at clamp.avin:10:5
+        > clamping 4
+
+1 passed, 1 failed — 4ms
+```
+
+Tests are grouped by the file they are written in, in the order they are declared. A failing test
+shows why it failed, then everything it printed, each line after `>`; a passing test's output is
+not shown. The exit status is 1 when any test failed. A second argument keeps only the tests whose
+name or file contains it. A program built for its tests need not have `main`, and `avin run` and
+`avin build` never run its tests.
+
+## The compiler's tests
 
 ```sh
 sysl test compiler

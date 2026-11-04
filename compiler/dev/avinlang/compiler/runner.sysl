@@ -1,0 +1,192 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.env.current_exe
+import sysl.fs.{canonicalize, exists, is_dir, make_dir_all, metadata, read_text, write_text_atomic}
+import sysl.path.{file_name, parent, stem}
+import sysl.process.{Exited, Signalled, Status, Stdio, TimedOut, capture, run}
+import sysl.text.{StrBuilder, from_utf8_unchecked, parse_int, str_builder}
+import sysl.time.monotonic
+
+// `avin run` and `avin test` build into a cache beside the program, so running a program that has not
+// changed starts it at once. A cached executable is kept with a record of what it was built from: a
+// key over every input to the build, and for a test executable the tests it holds, which the runner
+// reports without compiling the program again.
+
+/** An executable built for `avin run` or `avin test`. */
+struct Built
+    path: string
+    tests: Buf[TestEntry]
+    /** Whether this call built it, rather than finding it in the cache built from the same inputs. */
+    built: bool
+
+/** Where the executables built for the program at `program` are kept: `.avin/build` in its root
+ * directory, or for a program of one file in the directory that holds the file. */
+build_cache(program: string) -> string
+    if is_dir(program) then return program + "/.avin/build"
+    parent(program).unwrap_or(".") + "/.avin/build"
+
+/** The executable of the program at `program`, made of `files`: the program itself, or with
+ * `testing` the executable that runs its tests, at `optimization` (`-O0` or `-O2`). It is taken from
+ * the cache when one there was built from the same inputs, and otherwise built and kept there. An
+ * error is the program's diagnostics, rendered, or a message saying why it could not be built. */
+cached_build(tc: Toolchain, program: string, files: Buf[ProgramFile], testing: bool, optimization: string) -> Result[Built, string]
+    val cache = build_cache(program)
+    val kind = if testing then "-tests" else ""
+    // A program named `.` is named by the directory it is.
+    val name = stem(canonicalize(program).unwrap_or(program)).unwrap_or("program")
+    val binary = cache + "/" + name + kind + optimization
+    val record = binary + ".key"
+    val key = build_key(tc, files, testing, optimization)
+    if exists(binary)
+        if read_text(record) is Ok(text)
+            if read_record(text, key) is Some(tests) then return Ok(Built(binary, tests, false))
+    val compiled = compile_program(tc, files, testing)
+    if compiled.diagnostics != "" then return Err(compiled.diagnostics)
+    make_dir_all(cache).map_err(e -> s"avin: $cache: ${e.to_string()}")?
+    link(tc, compiled.llvm.unwrap_or(""), compiled.archive, binary, optimization).map_err(message -> "avin: " + message)?
+    write_text_atomic(record, write_record(key, compiled.tests)).map_err(e -> s"avin: $record: ${e.to_string()}")?
+    Ok(Built(binary, compiled.tests, true))
+
+// Everything an executable is built from: the compiler, which a version names and the compiler's own
+// executable stamps, the kind of executable and its optimization, the runtime's sources, the
+// standard library's, and the program's.
+private build_key(tc: Toolchain, files: Buf[ProgramFile], testing: bool, optimization: string) -> string
+    var text = str_builder()
+    text.push("avin " + Version + "\n")
+    if current_exe() is Some(exe)
+        text.push(exe + "\n")
+        if metadata(exe) is Ok(m) then text.push(m.modified.us.to_string() + "\n")
+    text.push((if testing then "tests " else "program ") + optimization + "\n")
+    text.push(runtime_fingerprint(tc))
+    program_files(tc.library_dir()) match
+        Ok(library) -> push_files(&text, library)
+        Err(message) -> text.push(message + "\n")
+    push_files(&text, files)
+    content_key(text.finish())
+
+private push_files(text: *StrBuilder, files: Buf[ProgramFile])
+    for f in files
+        text.push(f.src.name + "\n" + f.module_name.unwrap_or("") + "\n")
+        text.push(from_utf8_unchecked(f.src.bytes) + "\n")
+
+// The record kept beside a cached executable: its key on the first line, then a line for each test,
+// its line number, file and name separated by tabs.
+private write_record(key: string, tests: Buf[TestEntry]) -> string
+    var out = str_builder()
+    out.push(key + "\n")
+    for t in tests
+        out.push(s"${t.line}\t${t.file.replace_all("\t", " ")}\t${t.name.replace_all("\n", " ")}\n")
+    out.finish()
+
+// The tests a record holds, when its key is `key`.
+private read_record(text: string, key: string) -> Option[Buf[TestEntry]]
+    val lines = text.lines()
+    if lines.len == 0 || lines[0] != key then return None
+    var tests: Buf[TestEntry] = buf()
+    for i in 1..<lines.len
+        val fields = lines[i].split("\t")
+        if fields.len < 3 then return None
+        val line = parse_int(fields[0]) match
+            Ok(n) -> usize(n)
+            Err(_) -> return None
+        var name = fields[2]
+        for j in 3..<fields.len
+            name = name + "\t" + fields[j]
+        tests.push(TestEntry(name, fields[1], line))
+    Some(tests)
+
+/** Runs `binary` with `args`, its output going where `stdout` and `stderr` say, and answers the
+ * status `avin run` exits with: the program's own, or for a program a signal stopped, a trap among
+ * them, 128 and the signal's number, as a shell reports it. */
+run_binary(binary: string, args: []const string, stdout: Stdio, stderr: Stdio) -> Result[int, string]
+    val state = run(binary, args, stdout = stdout, stderr = stderr).map_err(e -> s"avin: could not run $binary: ${e.to_string()}")?
+    Ok(state match
+        Exited(code) -> code
+        Signalled(signal) -> 128 + signal
+        TimedOut -> 1)
+
+/** How long one test may run, in milliseconds, before the runner stops it and reports it failed. */
+const TestTimeout: int = 60000
+
+/** Runs the tests of `built` whose name, or the file they are written in, contains `filter`, each in
+ * a process of its own, so a test that traps stops only itself. The report goes through `say`: the
+ * tests grouped by file, in the order they are declared, each `ok` or `FAIL` with its name and how
+ * long it took; under a failure, why it failed and everything it printed, each line after `> `; then
+ * how many passed and failed. Files are named from `root`, the program's directory, when it is one.
+ * Answers 0 when every test passed and 1 otherwise. */
+run_tests(built: Built, root: string, filter: string, say: string -> unit) -> int
+    var selected: Buf[usize] = buf()
+    for i in 0..<built.tests.len()
+        val t = built.tests[i]
+        if filter == "" || t.name.contains(filter) || shown_file(t.file, root).contains(filter) then selected.push(i)
+    val total = built.tests.len()
+    val count = selected.len()
+    val noun = if total == 1 then "test" else "tests"
+    say(if count == total then s"running $count $noun" else s"running $count of $total $noun")
+    var width = 0usize
+    for i in selected
+        if built.tests[i].name.len > width then width = built.tests[i].name.len
+    var passed = 0usize
+    var failed = 0usize
+    var file = ""
+    val started = monotonic()
+    for i in selected
+        val t = built.tests[i]
+        val shown = shown_file(t.file, root)
+        if shown != file
+            say("")
+            say(shown)
+            file = shown
+        val began = monotonic()
+        val result = capture(built.path, [i.to_string()], stderr = true, timeout = TestTimeout)
+        val ms = (monotonic() - began).us / 1000
+        val padded = t.name + " ".repeat(width - t.name.len)
+        val output = result match
+            Ok(o) -> o
+            Err(e) ->
+                failed += 1
+                say(s"  FAIL  $padded  ${ms}ms")
+                say(s"        could not be run: ${e.to_string()}")
+                continue
+        if output.status == Exited(0)
+            passed += 1
+            say(s"  ok    $padded  ${ms}ms")
+            continue
+        failed += 1
+        say(s"  FAIL  $padded  ${ms}ms")
+        failure(output.status, output.text, output.err.unwrap_or(""), say)
+    say("")
+    val elapsed = (monotonic() - started).us / 1000
+    say(s"$passed passed, $failed failed — ${elapsed}ms")
+    if failed > 0 then 1 else 0
+end run_tests
+
+// Why a test failed, then what it printed. A trap's report names the reason and the place, so it is
+// the reason given; a test that ended any other way is described by how it ended.
+private failure(state: Status, out: string, err: string, say: string -> unit)
+    var reason = state match
+        Exited(code) -> s"exited with status $code"
+        Signalled(signal) -> s"stopped by signal $signal"
+        TimedOut -> s"did not finish within ${TestTimeout / 1000} seconds"
+    var printed: Buf[string] = buf()
+    for line in out.lines()
+        printed.push(line)
+    var trapped = false
+    for line in err.lines()
+        if !trapped && line.starts_with(TrapPrefix)
+            reason = line[TrapPrefix.len..]
+            trapped = true
+        else printed.push(line)
+    say("        " + reason)
+    for line in printed
+        say("        > " + line)
+
+/** How the runtime begins its report of a trap on standard error. */
+private const TrapPrefix: string = "avin: trap: "
+
+// A test's file as the report names it: its path under the program's root directory, or for a
+// program of one file, its name.
+private shown_file(file: string, root: string) -> string
+    if is_dir(root) && file.starts_with(root + "/") then return file[root.len + 1..]
+    file_name(file).unwrap_or(file)

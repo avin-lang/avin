@@ -42,6 +42,38 @@ declaration, its file's import, and the `avin` module's public declaration that 
 checked once every declaration of the program is known, and a wrong one is dropped. Object-file
 symbols carry the module path, so two modules may each declare `helper`.
 
+## Running and testing
+
+`avin run` and `avin test` build through the same pipeline as `avin build`, into a cache in the
+program's directory, `.avin/build/` (beside the file, for a program of one file). Beside each
+executable, `<name>-O2` or `<name>-tests-O2`, a record holds the key it was built for: a hash over the
+compiler's version and its executable's modification time, the kind of build and its optimization,
+the runtime's sources, the standard library's and the program's. A run whose key matches the record
+starts the cached executable without compiling anything. `avin run` runs it with the program's
+arguments and the terminal's own output, and exits with its status, or 128 and the signal's number
+for a program a trap stopped.
+
+**A test is checked at its annotation.** The checker collects every top-level function marked
+`@test`, in declaration order, and holds it to taking no parameters, having no type parameters and
+yielding unit; `@test("a sentence")` names it by the sentence. A program built for its tests need not
+have `main`, and when it has one, its `main` is not run.
+
+**A test executable runs one test per process.** Its `main` reads the test's number, counting from 0
+in the checker's order, from its first argument, initializes the module-level values as a program's
+`main` does, and calls that test; a test that returns exits 0. The runner starts the executable once
+for each selected test, captures what it writes, and reads the outcome from how the process ended: a
+trap's report on standard error gives the reason and place. A test that stops, by a trap or a signal
+or after the runner's time limit of a minute, stops only its own process. The record of a test
+executable also lists its tests, each with its file and line, so a cached run reports them without
+compiling the program.
+
+**An assertion's message is made at run time.** The core library's `trap` intrinsic takes its
+reason either as a literal, which is written into the trap site, or as a string the program built,
+which is passed to the runtime with the site (`avin_rt_caller_trap_message`, or
+`avin_rt_trap_message` in the program's own code). `assertEq` builds its message from the `Debug`
+form of both values; as for every check in the core library, the place reported is where the program
+called it.
+
 ## Sysl bindings and the shim cache
 
 A [binding](/spec/sysl-bindings/) is checked as a top-level function without a body: its
@@ -480,8 +512,8 @@ length; only `Array.fill`, `tabulate` and `empty` call it, and they set every el
 array is seen. `avin_rt_array_slice` copies a range of elements into a new array of the same
 descriptor. `xs(i)` on a value whose type has an `apply` method calls it; `xs(i) = v` is checked as
 `xs.update(i, v)`, and the compound and yielding forms hold `xs` and the indices in hidden locals.
-A private intrinsic `fail(reason)`, of type `Nothing`, traps with a literal reason; `Range` and the
-library's iterators use it. Being the library's code, it reports the program's call that entered
+A private intrinsic `fail(reason)`, of type `Nothing`, traps with `reason`: a literal, as `Range`
+and the library's iterators give, or a string made at run time, as the assertions give. Being the library's code, it reports the program's call that entered
 the library (the caller site above).
 
 `FrozenArray[+T]`, private to the core library, is an array seen through a type that only reads it
@@ -535,6 +567,10 @@ in them are reported as unable to leave the comprehension.
   neither), and `NAME.out` and `NAME.err` beside it hold the output it must write.
 - **Rejection tests** are Avin programs in `tests/reject/` that must fail to compile; each
   `// error: TEXT` line names text the diagnostics must contain.
-- **Library tests** are Avin `@test` functions run by `avin test`, once that runner exists.
+- **Tooling tests** (`runner_tests.sysl`) drive `avin run` and `avin test` through the command line,
+  with the program's output sent to files: forwarded output and exit status, traps, the cache's reuse,
+  the runner's report and its filter.
+- **Library tests** will be Avin `@test` functions in the core library; `avin test` runs a program's
+  tests, and does not yet run the core library's own.
 - **Semantic references**: where Avin defines arithmetic as Sysl does, a test compares against an
   independently compiled Sysl program.
