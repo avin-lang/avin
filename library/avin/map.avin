@@ -1,0 +1,123 @@
+module avin
+
+// An immutable map from keys to values, each key present at most once. Keys are found by their hash
+// and compared with `==`, so any type can be a key; values are covariant, so a `Map[string, Dog]` is
+// a `Map[string, Animal]`. An update returns a new map that shares all but the changed path with the
+// old one, which is left as it was. Iteration visits the entries in an order fixed by the keys'
+// hashes, not by the order they were added. Two maps are equal when they hold the same keys bound to
+// equal values. `Map[K, V]()` is the empty map, and `MapBuilder[K, V]()` builds one from pairs.
+data Map[K: Eq + Hash, +V](root: HashTrie[K, V] = Empty)
+
+// The methods an `impl` adds to a data type are not variance positions, so `V` may appear in a
+// parameter: on a `Map[string, Dog]` seen as a `Map[string, Animal]`, `V` is `Animal`.
+impl[K, V] Map[K, V]
+    // The number of entries.
+    size() -> int = trieSize(root)
+
+    isEmpty() -> bool = root is Empty
+
+    nonEmpty() -> bool = !isEmpty()
+
+    // The value bound to `key`, or `None` when there is none.
+    get(key: K) -> Option[V] = trieFind(root, spreadHash(key.hash()), key)
+
+    // The value bound to `key`, which traps when there is none.
+    apply(key: K) -> V = get(key) match
+        Some(v) -> v
+        None -> fail("key not found in the map")
+
+    // The value bound to `key`, or `default`, which is evaluated only when there is none.
+    getOrElse(key: K, default: -> V) -> V = get(key) match
+        Some(v) -> v
+        None -> default
+
+    contains(key: K) -> bool = get(key) is Some(_)
+
+    // This map with `key` bound to `value`, replacing the value it had.
+    updated(key: K, value: V) -> Map[K, V] = Map(trieInsert(root, spreadHash(key.hash()), key, value))
+
+    // This map without `key`; the same map when `key` is absent.
+    removed(key: K) -> Map[K, V]
+        val h = spreadHash(key.hash())
+        if trieFind(root, h, key) is None then self else Map(trieRemove(root, h, key))
+
+    // This map with every entry of `other` added, `other`'s value winning for a key both hold.
+    concat(other: Map[K, V]) -> Map[K, V]
+        var t = root
+        for (k, v) in other do t = trieInsert(t, spreadHash(k.hash()), k, v)
+        Map(t)
+
+    // The keys, in iteration order.
+    keys() -> Iterator[K] = MapKeys(HashTrieIterator(root))
+
+    // The values, in iteration order.
+    values() -> Iterator[V] = MapValues(HashTrieIterator(root))
+
+    // Calls `f` with each key and its value.
+    foreach(f: (K, V) -> unit)
+        for (k, v) in iterator() do f(k, v)
+
+    // The entries whose key and value satisfy `p`.
+    filter(p: (K, V) -> bool) -> Map[K, V]
+        var t = root
+        for (k, v) in iterator()
+            if !p(k, v) then t = trieRemove(t, spreadHash(k.hash()), k)
+        Map(t)
+
+    // The map of the pairs `f` makes of each entry; where two make the same key, one of their values
+    // is kept.
+    map[L: Eq + Hash, W](f: (K, V) -> (L, W)) -> Map[L, W]
+        var t: HashTrie[L, W] = Empty
+        for (k, v) in iterator()
+            val (l, w) = f(k, v)
+            t = trieInsert(t, spreadHash(l.hash()), l, w)
+        Map(t)
+
+    // The same keys, each bound to `f` of its value.
+    mapValues[W](f: (V) -> W) -> Map[K, W]
+        var t: HashTrie[K, W] = Empty
+        for (k, v) in iterator() do t = trieInsert(t, spreadHash(k.hash()), k, f(v))
+        Map(t)
+
+// A map is iterable as its entries, `(key, value)` pairs.
+impl[K, V] Iterable[(K, V)] for Map[K, V]
+    iterator() -> Iterator[(K, V)] = HashTrieIterator(root)
+
+impl[K, V: Eq] Eq for Map[K, V]
+    equals(other: Map[K, V]) -> bool
+        if size() != other.size() then return false
+        for (k, v) in iterator()
+            other.get(k) match
+                Some(w) -> if w != v then return false
+                None -> return false
+        true
+
+// A sum over the entries, so that the hash does not depend on the order they are visited in.
+impl[K, V: Hash] Hash for Map[K, V]
+    hash() -> long
+        var h: long = 0
+        for (k, v) in iterator() do h = h +% spreadHash(k.hash() *% 31 +% v.hash())
+        h
+
+// Builds a map from `(key, value)` pairs.
+class MapBuilder[K: Eq + Hash, V]: Builder[(K, V), Map[K, V]]
+    private var trie: HashTrie[K, V] = Empty
+    private var spent = false
+
+    override add(element: (K, V))
+        if spent then fail("add to a builder whose result was taken")
+        val (k, v) = element
+        trie = trieInsert(trie, spreadHash(k.hash()), k, v)
+
+    override result() -> Map[K, V]
+        if spent then fail("result of a builder whose result was taken")
+        spent = true
+        Map(trie)
+
+private class MapKeys[K, V](entries: Iterator[(K, V)]): Iterator[K]
+    override hasNext() -> bool = entries.hasNext()
+    override next() -> K = entries.next().0
+
+private class MapValues[K, V](entries: Iterator[(K, V)]): Iterator[V]
+    override hasNext() -> bool = entries.hasNext()
+    override next() -> V = entries.next().1
