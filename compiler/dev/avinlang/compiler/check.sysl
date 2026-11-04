@@ -242,6 +242,8 @@ struct BodyState
     loops: Buf[usize]
     breaks: Buf[BreakSite]
     labels: usize
+    /** For each loop, by label, the type its `break`s' values are expected to have. */
+    loop_expected: Buf[Option[&Type]]
     /** Where the innermost block's locals start in `visible`. */
     block_start: usize
     /** The local functions in scope, innermost last. */
@@ -254,7 +256,7 @@ struct BodyState
     /** The locals bound by `is` tests, which are in scope only where their test is known to hold. */
     tested: Buf[usize]
 
-fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, 0, buf(), buf(), buf(), buf(), buf(), buf())
+fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf())
 
 /** A class body checked part way: its initializer's body so far, the code checked so far, the next
  * member to check and the next field it declares. */
@@ -6125,7 +6127,7 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Compare(operands, ops) -> compare_expr(c, e, operands, ops)
     If(condition, yes, no) -> if_expr(c, e, condition, yes, no, expected, used)
     While(condition, body, otherwise) -> while_expr(c, e, condition, body, otherwise, expected, used)
-    Loop(body) -> loop_expr(c, e, body)
+    Loop(body) -> loop_expr(c, e, body, expected, used)
 
     DoWhile(body, condition, otherwise) -> check_form(c, do_while_form(e, body, condition, otherwise), expected, used)
     For(pattern, source, body) -> for_expr(c, e, pattern, source, body)
@@ -8296,6 +8298,8 @@ private while_expr(c: *Checker, e: &Expr, condition: &Expr, body: &Expr, otherwi
     expect_bool(c, cond)
     val label = c.body.labels
     c.body.labels += 1
+    // Only a loop with an `else` yields its `break`s' values.
+    c.body.loop_expected.push(if otherwise is Some(_) && used then expected else None)
     c.body.loops.push(label)
     val b = tested_branch(c, body, tested.yes, None, false)
     c.body.loops.truncate(c.body.loops.len() - 1)
@@ -8323,9 +8327,10 @@ private while_expr(c: *Checker, e: &Expr, condition: &Expr, body: &Expr, otherwi
 
 // A `loop` is left only by a `break`, so it yields what its `break`s agree on, and never finishes
 // when none exists. It is lowered as a `while` whose condition always holds.
-private loop_expr(c: *Checker, e: &Expr, body: &Expr) -> &TExpr
+private loop_expr(c: *Checker, e: &Expr, body: &Expr, expected: Option[&Type], used: bool) -> &TExpr
     val label = c.body.labels
     c.body.labels += 1
+    c.body.loop_expected.push(if used then expected else None)
     c.body.loops.push(label)
     val b = branch(c, body, None, false)
     c.body.loops.truncate(c.body.loops.len() - 1)
@@ -8688,7 +8693,10 @@ private break_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
     var typed: Option[&TExpr] = None
     var ty: &Type = Unit
     if value is Some(v)
-        val t = check_expr(c, v, None)
+        val want = target match
+            Some(label) -> c.body.loop_expected[label]
+            None -> None
+        val t = check_expr(c, v, want)
         typed = Some(t)
         ty = t.ty
     target match
