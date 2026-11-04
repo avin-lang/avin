@@ -1,0 +1,346 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+
+// Calls through a method table made direct where the whole program shows which method runs.
+//
+// It runs on the finished program, once every descriptor and every method table is known. A call
+// through a table is rewritten in one of two ways, each of which runs exactly the method the table
+// would have given:
+//
+// - A direct call, when the receiver's descriptor is known where the call is made, or when every
+//   descriptor of every type that conforms to the receiver's static type holds one and the same method
+//   at the call's position. The receiver's descriptor is known for an object made in the function, one
+//   read back from a local slot that only ever holds objects of one descriptor, and one returned by a
+//   function that only ever returns objects of one descriptor.
+// - A guarded call, when the types the receiver's static type admits hold a few different methods: the
+//   receiver's descriptor is compared with each of theirs, a match calls its method directly, and any
+//   other object takes the method from its table as before. A direct call can be inlined, and a test of
+//   a descriptor that does not change in a loop can be taken out of it.
+
+/** A call through a method table that lowering made, in the function at index `function`, whose code
+ * is the value `code`: what the whole program shows of the objects it can reach. `single` is the one
+ * method every possible receiver runs, if there is one. `guards` pairs each descriptor of a type the
+ * call's static receiver type admits with the method its table holds at the call's position. */
+struct DispatchSite
+    function: usize
+    code: usize
+    single: Option[usize]
+    guards: Buf[DispatchGuard]
+
+struct DispatchGuard
+    descriptor: usize
+    function: usize
+
+/** The most methods, and the most descriptors, a guarded call tests for. */
+const MaxGuardedMethods: usize = 8
+const MaxGuards: usize = 16
+/** The most instructions, terminators included, a method a guarded call calls directly may have: a
+ * larger one would not be inlined, and a test before a call that stays a call costs about what the
+ * load from the table it replaces does. */
+const MaxGuardedSize: usize = 40
+
+// What is known of a value's object: not yet determined, unknown, or the descriptor `d`, held as
+// `d + Known`. A value starts undetermined and only moves down: to one descriptor, then to unknown.
+private const Undetermined: usize = 0
+private const Unknown: usize = 1
+private const Known: usize = 2
+
+private meet(a: usize, b: usize) -> usize
+    if a == Undetermined then return b
+    if b == Undetermined || a == b then return a
+    Unknown
+
+/** The program's functions with their calls through method tables made direct or guarded where they
+ * can be. `sites` is ordered by function. */
+devirtualize(functions: Buf[MirFunction], descriptors: Buf[Descriptor], sites: Buf[DispatchSite]) -> Buf[MirFunction]
+    val n = functions.len()
+    // What each function returns, from what the functions it calls return, until nothing changes.
+    var returns: Buf[usize] = buf()
+    for _ in 0..<n do returns.push(Undetermined)
+    var changed = true
+    while changed
+        changed = false
+        for i in 0..<n
+            val r = return_state(functions[i], value_states(functions[i], returns))
+            if r != returns[i]
+                returns[i] = r
+                changed = true
+    val callees = callees_of(functions)
+    var out: Buf[MirFunction] = buf()
+    var s = 0usize
+    for i in 0..<n
+        var own: Buf[DispatchSite] = buf()
+        while s < sites.len() && sites[s].function == i
+            own.push(sites[s])
+            s += 1
+        out.push(rewrite(functions[i], value_states(functions[i], returns), own, descriptors, callees))
+    out
+
+/** The number of instructions of each function, and its signature. */
+private callees_of(functions: Buf[MirFunction]) -> Callees
+    var sizes: Buf[usize] = buf()
+    var signatures: Buf[MirSignature] = buf()
+    for f in functions
+        var n = 0usize
+        for block in f.blocks
+            n += block.insts.len() + 1
+        sizes.push(n)
+        signatures.push(f.signature)
+    Callees(sizes, signatures)
+
+/** What is known of each value of `f`, given what each function returns. */
+private value_states(f: MirFunction, returns: Buf[usize]) -> Buf[usize]
+    var states: Buf[usize] = buf()
+    for _ in 0..<f.value_types.len() do states.push(Undetermined)
+    for i in 0..<f.signature.params.len()
+        states[i] = Unknown
+    // A slot is followed only while its address is used for nothing but loading and storing it: an
+    // address passed on lets another function store to it.
+    var slots: Buf[usize] = buf()
+    for _ in 0..<f.slots.len() do slots.push(Undetermined)
+    for block in f.blocks
+        for inst in block.insts
+            val operands = inst_operands(inst)
+            for k in 0..<operands.len()
+                if operands[k] is SlotAddress(x)
+                    if !(k == 0 && (inst is Load(_, _) || inst is Store(_, _))) then slots[x] = Unknown
+        block.term match
+            Return(Some(SlotAddress(x))) -> slots[x] = Unknown
+            Branch(SlotAddress(x), _, _) -> slots[x] = Unknown
+            _ -> ()
+    var changed = true
+    while changed
+        changed = false
+        for block in f.blocks
+            for inst in block.insts
+                if inst is Store(SlotAddress(x), v)
+                    val m = meet(slots[x], operand_state(states, v))
+                    if m != slots[x]
+                        slots[x] = m
+                        changed = true
+                    continue
+                val dest = inst_dest(inst) match
+                    Some(d) -> d
+                    None -> continue
+                val value = inst match
+                    Alloc(_, d) -> d + Known
+                    Call(_, Direct(g), _) -> returns[g]
+                    Load(_, SlotAddress(x)) -> slots[x]
+                    _ -> Unknown
+                val m = meet(states[dest], value)
+                if m != states[dest]
+                    states[dest] = m
+                    changed = true
+    states
+
+private operand_state(states: Buf[usize], o: Operand) -> usize = o match
+    Value(id) -> states[id]
+    ConstObject(d) -> d + Known
+    _ -> Unknown
+
+/** What `f` returns, from what is known of its values. */
+private return_state(f: MirFunction, states: Buf[usize]) -> usize
+    var r = Undetermined
+    for block in f.blocks
+        if block.term is Return(Some(v)) then r = meet(r, operand_state(states, v))
+    r
+
+/** How a call through a method table is made: unchanged, directly, or guarded by its receiver's
+ * descriptor. */
+private enum Target
+    Unchanged
+    DirectTo(function: usize)
+    Guarded(guards: Buf[DispatchGuard])
+
+/** What the program knows of each function: its size and its signature. */
+private struct Callees
+    sizes: Buf[usize]
+    signatures: Buf[MirSignature]
+
+private machine_key(t: MirType) -> string = t match
+    MInt(bits) -> s"i$bits"
+    MBool -> "bool"
+    MReal -> "real"
+    MPtr -> "address"
+    MRef -> "reference"
+
+/** Whether a function of signature `s` can be called where the call was spelled with `wanted`. An
+ * override whose result is `Nothing` returns nothing, where the method it overrides returns a value;
+ * such a call stays through the table. */
+private fits(s: MirSignature, wanted: MirSignature) -> bool
+    if s.params.len() != wanted.params.len() then return false
+    for i in 0..<s.params.len()
+        if machine_key(s.params[i]) != machine_key(wanted.params[i]) then return false
+    s.result match
+        Some(a) -> wanted.result match
+            Some(b) -> machine_key(a) == machine_key(b)
+            None -> false
+        None -> wanted.result is None
+
+private target_of(object: Operand, position: usize, code: usize, wanted: MirSignature, states: Buf[usize], sites: Buf[DispatchSite], descriptors: Buf[Descriptor], callees: Callees) -> Target
+    val known = operand_state(states, object)
+    if known >= Known
+        val methods = descriptors[known - Known].methods
+        if position < methods.len()
+            if methods[position] is Some(g)
+                if fits(callees.signatures[g], wanted) then return DirectTo(g)
+                return Unchanged
+    for site in sites
+        if site.code != code then continue
+        if site.single is Some(g)
+            if fits(callees.signatures[g], wanted) then return DirectTo(g)
+            return Unchanged
+        if site.guards.len() == 0 || site.guards.len() > MaxGuards then return Unchanged
+        var methods: Buf[usize] = buf()
+        for guard in site.guards
+            var seen = false
+            for m in methods
+                if m == guard.function then seen = true
+            if !seen then methods.push(guard.function)
+        if methods.len() > MaxGuardedMethods then return Unchanged
+        for m in methods
+            if callees.sizes[m] > MaxGuardedSize || !fits(callees.signatures[m], wanted) then return Unchanged
+        return Guarded(site.guards)
+    Unchanged
+
+/** The index of the call in `insts`, after `from`, of the code value `code`. */
+private call_of(insts: Buf[Inst], from: usize, code: usize) -> Option[usize]
+    for j in from + 1..<insts.len()
+        if insts[j] is Call(_, Indirect(Value(c), _), _)
+            if c == code then return Some(j)
+    None
+
+private rewrite(f: MirFunction, states: Buf[usize], sites: Buf[DispatchSite], descriptors: Buf[Descriptor], callees: Callees) -> MirFunction
+    var values: Buf[MirType] = buf()
+    for t in f.value_types do values.push(t)
+    var slots: Buf[MirType] = buf()
+    for t in f.slots do slots.push(t)
+    var blocks: Buf[MirBlock] = buf()
+    for block in f.blocks do blocks.push(block)
+    // The code values whose call becomes a direct call of the paired function.
+    var direct_codes: Buf[usize] = buf()
+    var direct_functions: Buf[usize] = buf()
+    // The blocks that take the method from the table when no guard matched, which stay as they are.
+    var fallbacks: Buf[usize] = buf()
+    var b = 0usize
+    while b < blocks.len()
+        var fallback = false
+        for x in fallbacks
+            if x == b then fallback = true
+        if fallback
+            b += 1
+            continue
+        val block = blocks[b]
+        var insts: Buf[Inst] = buf()
+        var i = 0usize
+        var split = false
+        while i < block.insts.len()
+            val inst = block.insts[i]
+            if inst is MethodSlot(code, object, position)
+                if call_of(block.insts, i, code) is Some(j)
+                    val wanted = block.insts[j] match
+                        Call(_, Indirect(_, s), _) -> s
+                        _ -> panic("a call through a method table that is not an indirect call")
+                    target_of(object, position, code, wanted, states, sites, descriptors, callees) match
+                        DirectTo(g) ->
+                            direct_codes.push(code)
+                            direct_functions.push(g)
+                            i += 1
+                            continue
+                        Guarded(guards) ->
+                            for k in i + 1..<j
+                                insts.push(block.insts[k])
+                            guard_call(&values, &slots, &blocks, b, insts, block, i, j, guards)
+                            // The fallback is the block before the last, which goes on after the call.
+                            fallbacks.push(blocks.len() - 2)
+                            split = true
+                            break
+                        Unchanged -> ()
+            if inst is Call(dest, Indirect(Value(c), _), args)
+                var redirected = false
+                for k in 0..<direct_codes.len()
+                    if direct_codes[k] == c
+                        insts.push(Call(dest, Direct(direct_functions[k]), args))
+                        redirected = true
+                        break
+                if redirected
+                    i += 1
+                    continue
+            insts.push(inst)
+            i += 1
+        if !split then blocks[b] = MirBlock(insts, block.term)
+        b += 1
+    MirFunction(f.symbol, f.signature, values, slots, blocks)
+
+// Replaces the call at `j` of block `b`, through the method table entry made at `i`, with a test of
+// the receiver's descriptor against each guard's, in turn: a match calls the guard's method directly;
+// no match takes the method from the table. The result is kept in a slot of its own, which the block
+// after the call reads, and that block goes on with the rest of the original one.
+private guard_call(values: *Buf[MirType], slots: *Buf[MirType], blocks: *Buf[MirBlock], b: usize, before: Buf[Inst], block: MirBlock, i: usize, j: usize, guards: Buf[DispatchGuard])
+    val (code, object, position) = block.insts[i] match
+        MethodSlot(c, o, p) -> (c, o, p)
+        _ -> panic("a guarded call that is not through a method table")
+    val (dest, signature, args) = block.insts[j] match
+        Call(d, Indirect(_, s), a) -> (d, s, a)
+        _ -> panic("a guarded call that is not an indirect call")
+    var methods: Buf[usize] = buf()
+    for guard in guards
+        var seen = false
+        for m in methods
+            if m == guard.function then seen = true
+        if !seen then methods.push(guard.function)
+    val result: Option[usize] = dest match
+        Some(d) ->
+            val s = slots.len()
+            slots.push((*values)[d])
+            Some(s)
+        None -> None
+    // The blocks this makes, in order: a test for each guard after the first, a call of each method,
+    // the call through the table, and the rest of the original block.
+    val base = blocks.len()
+    val tests = base
+    val calls = tests + guards.len() - 1
+    val fallback = calls + methods.len()
+    val join = fallback + 1
+    var head = before
+    val descriptor = values.len()
+    values.push(MPtr)
+    head.push(DescriptorOf(descriptor, object))
+    var heads: Buf[MirBlock] = buf()
+    for k in 0..<guards.len()
+        val cond = values.len()
+        values.push(MBool)
+        var insts: Buf[Inst] = if k == 0 then head else buf()
+        insts.push(Compare(cond, CmpEq, Value(descriptor), DescriptorAddress(guards[k].descriptor)))
+        var call = calls
+        for m in 0..<methods.len()
+            if methods[m] == guards[k].function then call = calls + m
+        val next = if k + 1 < guards.len() then tests + k else fallback
+        heads.push(MirBlock(insts, Branch(Value(cond), call, next)))
+    (*blocks)[b] = heads[0]
+    for k in 1..<heads.len()
+        blocks.push(heads[k])
+    for m in methods
+        var insts: Buf[Inst] = buf()
+        result_call(values, &insts, dest, result, Direct(m), args)
+        blocks.push(MirBlock(insts, Jump(join)))
+    var insts: Buf[Inst] = buf()
+    insts.push(MethodSlot(code, object, position))
+    result_call(values, &insts, dest, result, Indirect(Value(code), signature), args)
+    blocks.push(MirBlock(insts, Jump(join)))
+    var rest: Buf[Inst] = buf()
+    if dest is Some(d) && result is Some(s) then rest.push(Load(d, SlotAddress(s)))
+    for k in j + 1..<block.insts.len()
+        rest.push(block.insts[k])
+    blocks.push(MirBlock(rest, block.term))
+
+/** A call of `callee` whose result, if it has one, is stored in slot `result`. */
+private result_call(values: *Buf[MirType], insts: *Buf[Inst], dest: Option[usize], result: Option[usize], callee: Callee, args: Buf[Operand])
+    dest match
+        Some(d) ->
+            val v = values.len()
+            values.push((*values)[d])
+            insts.push(Call(Some(v), callee, args))
+            insts.push(Store(SlotAddress(result.unwrap()), Value(v)))
+        None -> insts.push(Call(None, callee, args))
