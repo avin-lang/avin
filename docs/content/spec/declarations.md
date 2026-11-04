@@ -426,8 +426,9 @@ trait Shape
     describe() -> string = s"area ${area()}"
 ```
 
-A trait declares methods, which may have default bodies, and abstract `val` members a class supplies
-with a field. **A trait holds no state.** A trait may require others: `trait Iterator[+A]: Iterable[A]`.
+A trait declares methods, which may have default bodies, abstract `val` members a class supplies
+with a field, and fields with values, which every class conforming to it stores (below). A trait may
+require others: `trait Iterator[+A]: Iterable[A]`.
 
 A trait is both a type and a bound. Used as a type, a value of it is a reference and calls dispatch
 dynamically. Used as a bound (`[T: Shape]`), calls are direct, because the code is monomorphized.
@@ -470,7 +471,8 @@ val n: Named = t
   a trait's method of the same name without being repeated.
 - A trait's default body is inherited like a superclass's method. A class that is not abstract
   implements every abstract method of its traits; an abstract class may leave them to a subclass.
-- A trait's body declares only methods, all public. A trait cannot be instantiated.
+- A trait's body declares methods and fields, all public, and no statements: it has no constructor.
+  A trait cannot be instantiated.
 - **A trait may override a method of a trait it requires**, marked `override` and with a body:
   `trait Square: Shape` with `override describe() -> string = …`. In every class and data type
   conforming to the trait, its body replaces the required trait's default, or gives an abstract
@@ -518,6 +520,50 @@ impl Named for Book
   `x.name()` calls the value it holds, which only a function-typed `val` can be.
 - An abstract class's body cannot read a trait's `val` it leaves to a subclass: it runs before the
   subclass's fields are set.
+
+### Fields
+
+```text
+data Position(line: int, column: int)
+
+trait Positional
+    var pos: Option[Position] = None
+    at(line: int, column: int) = pos = Some(Position(line, column))
+
+class Token(val text: string): Positional
+
+val t = Token("x")
+t.at(3, 4)
+val p: Positional = t
+p.pos = None
+```
+
+- **A trait may declare fields with values**, `val name: T = expr` and `var name: T = expr`. Each
+  declares its type, and is public. A field without a value is the abstract `val` above, and is
+  never `var`.
+- **Every class and object conforming to the trait stores the trait's fields**, each of its own. A
+  subclass of a class that conforms stores them once, in the superclass; a generic trait's fields
+  take the type arguments the class names it with, `class Ints: Box[int]`.
+- **They are read and assigned as fields**: by bare name and through `self` in the trait's methods,
+  and as `x.name` outside. Through a class type, `x.name` is the class's field; through the trait,
+  or a type parameter the trait bounds, it reaches the field of the object's own class through its
+  method table, for reading and, for a `var`, for assigning. A trait's field supplies the abstract
+  `val` of its name of any other trait the class conforms to.
+- **Construction runs from the top down**: the superclass's constructor, then the class's
+  parameters are stored, then the fields of the traits the superclass does not already conform to
+  are computed, then the class body runs. The traits come in the order of the `:` list, each after
+  the traits it requires and each once, and each trait's fields in the order it declares them.
+- **A field's value is computed with `self` as the trait's receiver**, in the trait's module. It may
+  read the fields initialized before it: those of a superclass, the class's parameters (as the
+  trait's `val`s they supply), and the trait fields computed earlier. It uses `self` for nothing
+  else: it calls no method of the object and does not pass it, as a class body before its last field
+  does not.
+- **Only a class or an object conforms to a trait with fields**, or to one requiring such a trait: an
+  impl of it for a `data` type, a built-in type or a tuple is an error. A trait's field is never
+  overridden: a class declaring a field or a method of its name is an error, and so is a class
+  conforming to two traits that declare fields of one name.
+- A `var` field makes it an invariant position: a covariant trait's type parameter cannot appear in
+  its type, as in a class's.
 
 ### Static members
 

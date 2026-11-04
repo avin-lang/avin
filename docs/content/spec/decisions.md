@@ -81,6 +81,18 @@ a decision changes, this page and the chapter change together.
   an impl. A `var` field satisfies a `val`; a method or a private field does not. Read through the
   trait it is a method table entry the compiler fills with a method that loads the field; read
   through a class type it is the field. It is never assigned through the trait.
+- Traits may hold state (settled, user, 2026-11-04). A trait declares a field with a value,
+  `val name: T = expr` or `var name: T = expr`, and every class and object conforming to it stores
+  one of its own. Through the class's type it is the class's field; through the trait, or a type
+  parameter the trait bounds, it is read and assigned through method table entries the compiler
+  fills with a method that loads or stores the class's field. Construction runs the superclass
+  first, then stores the class's parameters, then computes the fields of the traits the superclass
+  does not already conform to, a trait's required traits before it and each trait once, in the order
+  of the `:` list, then runs the class body. A trait's field's value may read the fields initialized
+  before it and uses `self` for nothing else. Only a class or an object conforms to a trait holding
+  state, or requiring one that does: an impl of it for a `data` type, a built-in type or a tuple is an
+  error. A class declaring a field of a trait field's name, or conforming to two traits that declare
+  fields of one name, is an error.
 - An `object` may extend an `open` or `abstract` class, constructed from the top down as a subclass
   is, overriding its methods and conforming to it; it implements every abstract member it inherits.
 - A trait's method, or an overridable class method, may have type parameters of its own and be
@@ -861,6 +873,11 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
+- Trait fields ([declarations](/spec/declarations/#trait)): a trait's field declares its type, since
+  each conforming class's layout and the trait's `val` are known before any body is checked; it is
+  public, as every member of a trait is, and is never `lazy`. A class never overrides a trait's
+  field, `val` or `var`: declaring a field of its name is an error rather than an override. A trait
+  never redeclares, with a value, a `val` of a trait it requires.
 - Literal shapes ([collections](/spec/collections/#literals)): each of the library's collections is
   built only by the literal of its own shape: every `Seq` by `[a, b]`, `Set`, `TreeSet` and the
   mutable `Set` by `{a, b}`, and `Map`, `TreeMap` and the mutable `Map` by `{k: v}`, so
