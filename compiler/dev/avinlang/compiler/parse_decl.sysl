@@ -39,7 +39,7 @@ parse(src: Source) -> Parsed
             file.items.push(ClassItem(parse_object(&p, start, annotations)))
         elif p.at("trait") && p.ahead(1) != "("
             file.items.push(ClassItem(parse_trait(&p, start, annotations)))
-        elif p.at("impl") && p.ahead(1) != "("
+        elif p.at("impl") && (p.ahead(1) != "(" || impl_of_function_ahead(&p))
             file.items.push(ImplItem(parse_impl(&p, start, annotations)))
         elif (p.at("val") || p.at("var")) && p.ahead(1) != "("
             file.items.push(parse_value(&p, start, annotations))
@@ -640,11 +640,7 @@ private parse_class(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &C
     val type_params = parse_type_params(p)
     var params: Buf[ClassParam] = buf()
     if p.at("(") then params = parse_class_params(p)
-    var parents: Buf[&Expr] = buf()
-    if p.accept(":")
-        loop
-            parents.push(expression(p, 0))
-            if !p.accept(",") then break
+    val parents = parse_parents(p)
     var derives: Buf[&TypeExpr] = buf()
     if p.accept("derives")
         loop
@@ -666,11 +662,7 @@ private parse_object(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &
     if p.at("(")
         p.report.add(error(p.toks.here(), "an object has one instance, made by its body, so it takes no parameters"))
         parse_class_params(p)
-    var parents: Buf[&Expr] = buf()
-    if p.accept(":")
-        loop
-            parents.push(expression(p, 0))
-            if !p.accept(",") then break
+    val parents = parse_parents(p)
     val members = parse_class_body(p, name)
     ClassDecl(annotations, start.to(p.toks.here()), name_span, name, "", start, buf(), buf(), parents, buf(), members, true)
 
@@ -687,13 +679,60 @@ private parse_trait(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &C
     if p.at("(")
         p.report.add(error(p.toks.here(), "a trait holds no state, so it takes no parameters"))
         parse_class_params(p)
-    var parents: Buf[&Expr] = buf()
-    if p.accept(":")
-        loop
-            parents.push(expression(p, 0))
-            if !p.accept(",") then break
+    val parents = parse_parents(p)
     val members = parse_class_body(p, name)
     ClassDecl(annotations, start.to(p.toks.here()), name_span, name, "trait", modifier_span, type_params, buf(), parents, buf(), members, false)
+
+// At `impl (`: whether `for` follows on the line, outside any brackets, as in
+// `impl (string) -> int for Lengths`; otherwise `impl` names a function, as in `impl(x: int) = x`.
+private impl_of_function_ahead(p: *Parser) -> bool
+    var depth = 0
+    var i = 1usize
+    loop
+        val token = p.toks.peek_at(i) match
+            Some(t) -> t
+            None -> return false
+        if token.value == Dedent || token.value == Newline || token.value == Indent then return false
+        val word = p.spelling(token)
+        if word == "(" || word == "[" then depth += 1
+        elif word == ")" || word == "]" then depth -= 1
+        elif word == "for" && depth == 0 then return true
+        elif word == "=" && depth == 0 then return false
+        i += 1
+    false
+
+// The parents after `:`, if any: a superclass with its constructor arguments, traits, and function
+// types, which begin with `(` or have `->` outside brackets, as no superclass or trait does.
+private parse_parents(p: *Parser) -> Buf[&Expr]
+    var parents: Buf[&Expr] = buf()
+    if !p.accept(":") then return parents
+    loop
+        if p.at("(") || arrow_ahead(p)
+            val ty = parse_type(p)
+            parents.push(Expr(ty.span, TypeParent(ty)))
+        else parents.push(expression(p, 0))
+        if !p.accept(",") then break
+    parents
+
+// Whether the parent ahead is a function type written without parentheses, `int -> string`: `->`
+// comes before the parent ends, outside any brackets.
+private arrow_ahead(p: *Parser) -> bool
+    var depth = 0
+    var i = 0usize
+    loop
+        val token = p.toks.peek_at(i) match
+            Some(t) -> t
+            None -> return false
+        if token.value == Dedent || token.value == Newline || token.value == Indent then return false
+        val word = p.spelling(token)
+        if word == "(" || word == "[" then depth += 1
+        elif word == ")" || word == "]"
+            if depth == 0 then return false
+            depth -= 1
+        elif depth == 0 && (word == "," || word == "derives") then return false
+        elif depth == 0 && word == "->" then return true
+        i += 1
+    false
 
 // `impl[T] Trait[T] for Type[T]` or `impl Type`, and an indented body of methods.
 private parse_impl(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &ImplDecl

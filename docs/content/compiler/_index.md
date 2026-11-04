@@ -182,9 +182,15 @@ slots in the same positions, each holding the class's override where it has one,
 overridable method the class adds. A method is identified by its name and parameter types, so
 each overload of a name has a slot of its own, and an override takes the slot of the inherited
 method with its parameter types; each overload is also a symbol of its own, named by its parameter
-types. The table is constant data placed directly before the class's
-descriptor, in one global, so slot `s` is the word `8(s + 1)` bytes before the object's
-descriptor; the descriptor itself keeps its layout and the runtime never reads the table. Each instance of a generic class has its own descriptor and table, filled with the method
+types. The table is constant data placed before the class's descriptor, in one global, with one
+word between them, the descriptor's call entry; so slot `s` is the word `8(s + 2)` bytes before the
+object's descriptor; the descriptor itself keeps its layout and the runtime never reads the table.
+Every descriptor has the call entry, the word directly before it: what a call of the object as a
+function value runs, taking the object and then the call's arguments. A closure's is its code, so a
+closure holds only what it captures; a class or data type that is a function (a sequence, a set, a
+map, or any type naming a function type as a parent) has its `apply` there, filled once the program
+calls a function value at all; any other object's is null. A call of a function value loads the
+descriptor and the call entry and calls it indirectly, the same for a lambda and a collection. Each instance of a generic class has its own descriptor and table, filled with the method
 instances for its type arguments. A call through a receiver whose static type is an `open` or
 `abstract` class loads the descriptor from the object's header, loads the slot, and calls it indirectly with the
 overridden method's machine signature, which every override shares; `super.m()` is a direct call.
