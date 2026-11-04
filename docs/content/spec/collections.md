@@ -54,10 +54,10 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
 - Operations that need something of the elements are added by impls bounding the element type, so
   a collection has them only where its elements do. `mkString` joins elements that have `Display`
   into a string: `mkString(sep = ", ")` separates them, `mkString(start, sep, end)` also brackets
-  them, so `[1, 2, 3].mkString()` is `1, 2, 3` and `.mkString("<", "|", ">")` is `<1|2|3>`. Lists,
-  vectors, arrays, buffers, deques and sets have it, and maps, whose entries join as `key: value`, the form
-  a displayed map shows. `max()` and `min()` on lists, vectors and arrays of `Ord` elements answer
-  `Some` of the greatest or least, the first of equal ones, and `None` when empty.
+  them, so `[1, 2, 3].mkString()` is `1, 2, 3` and `.mkString("<", "|", ">")` is `<1|2|3>`. Every
+  sequence has it, through an impl adding it to `Seq`, and so do sets, and maps, whose entries join
+  as `key: value`, the form a displayed map shows. `max()` and `min()` on every sequence of `Ord`
+  elements answer `Some` of the greatest or least, the first of equal ones, and `None` when empty.
 
 ## Builders
 
@@ -276,8 +276,17 @@ total([1, 2, 3])                   // a Vector
 total(Array.fill(4, 1))            // an Array
 ```
 
-`contains` and `indexOf` compare with an element of the sequence's own type, so each sequence type
-declares them for itself; on a `Seq[T]` known only as one, `exists` and `indexWhere` do the same work.
+Impls add more to every sequence ([impl](/spec/declarations/#impl)), written once on `Seq` and
+reached through generic code over `Seq[T]` as on each sequence type: `contains(element)` and
+`indexOf(element)`, which compare with `equals` and are `exists` and `indexWhere`, so a list walks
+itself once; where the elements display, `mkString`; and where they are ordered, `max()` and `min()`.
+
+```text
+present[T](xs: Seq[T], x: T) -> bool = xs.contains(x)
+
+present([3, 1, 4], 4)              // true
+Array.fill(2, "a").mkString("-")   // a-a
+```
 
 ## Deque
 

@@ -422,6 +422,8 @@ a decision changes, this page and the chapter change together.
 
 Settled by the user on 2026-11-03:
 
+- `fail(message)` is public in the prelude: it traps with the message at the caller's place and has
+  type `Nothing`.
 - The methods an `impl` adds to a class whose fields are all immutable are not variance positions,
   as a `data` type's are not: such an instance holds nothing a method could store a value into. A
   class with a `var` field keeps every method a position.
@@ -486,8 +488,10 @@ Settled by the user on 2026-11-03:
   the folds, `foreach`, `exists`, `forall`, `find`, `indexWhere`, `count`, `toVector`, `toList`, an
   iterator and `reverseIterator`) are default bodies written once over those two. `List` is a `Seq`
   and overrides every one that would index into it, so none takes more than linear time on a list.
-  `contains` and `indexOf` take an element, which a covariant trait's method cannot, so each
-  sequence type declares its own.
+  `contains` and `indexOf`, which take an element, and `mkString`, `max` and `min`, which need
+  something of the elements, are added to `Seq` by impls (`impl[T] Seq[T]`, `impl[T: Display]
+  Seq[T]`, `impl[T: Ord] Seq[T]`), written once for every sequence; `contains` and `indexOf` are
+  `exists` and `indexWhere`, so on a list they walk it once.
 - A sequence passed or stored where a function from one `int` is expected becomes that function,
   through the core library's `elementAt`; the conversion happens where the value is written, as a
   conversion to `Any` does.
@@ -499,12 +503,25 @@ Settled by the user on 2026-11-03:
 - A trait may declare `static` members, which belong to the implementing type rather than to a
   value: `static zero() -> Self` in `Add`, `static one() -> Self` in `Mul`. Every impl gives them,
   and they are called on a type, `int.zero()`, or on a bounded type parameter, `T.zero()`. `sum()`
-  and `product()` on the collections are written with them.
+  and `product()` on the collections are written with them. The details of
+  [static members](/spec/declarations/#static-members): `static` is a keyword, written after
+  `private` and before or after `override`; a static member is only a trait's or an implementation
+  of one, with no static members of a type's own; in a trait it has no default body, and no trait
+  overrides one; an implementation is `static` exactly where the trait's member is, an abstract class
+  giving it too; its body has no `self`; a trait's default body cannot call one on `Self`; a trait
+  with one is a bound and not a type; and a local, parameter, member or module value of a type's
+  name hides the type as a receiver.
 - An `impl` may add methods to a trait (`impl[T] Seq[T]`, `impl[T: Display] Seq[T]`). Its methods
   reach the value only through the trait's own methods, which are variance-checked, so, like the
   methods an impl adds to a `data` type, they are not variance positions: `contains(element: T)`,
   `indexOf`, `mkString`, `max` and `min` are written once on `Seq`, and generic code over `Seq[T]`
-  has them.
+  has them. A call is compiled for the receiver's static type, so the trait's methods the added one
+  calls are that type's, called directly, and go through the method table only where the receiver
+  is seen as the trait. Lookup takes the receiver's type's own methods first: an added method with
+  the name and parameter types of one the type has is passed over, so a type keeps a faster version
+  of its own where its static type is known. Two impls of different traits adding a method of one
+  name and parameter types to a type conforming to both make a call of it on that type an error; an
+  impl may not add a method the trait declares.
 - The form of a `for` with `yield` ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
   generators `pattern in source` separated by commas, each followed by any number of `if` guards,
   then `yield` and the value on the rest of the line or in an indented block; or the generators one
@@ -529,6 +546,10 @@ Settled by the user on 2026-11-03:
 
 ## Proposed
 
+- `avin.process` ([system library](/spec/system-library/)): `args() -> Vector[string]` holds the
+  arguments after the program's name, and `programName()` gives the name separately; `env(name)` is
+  an `Option[string]`; `exit(code: int) -> Nothing` flushes standard output first, as a trap does.
+  Arguments are checked as UTF-8 at startup. A test run by `avin test` sees no arguments.
 - Running and testing (stage 10): `avin run <program> [-O0 | -O2] [-- args]` builds into
   `.avin/build/` in the program's directory, reuses the executable while nothing it was built from
   has changed, and exits with the program's status, or 128 and the signal's number for a trap. Its
@@ -552,6 +573,7 @@ Settled by the user on 2026-11-03:
   so a racing read sees some value written to that word, and a constructor ends with a release
   fence, so no thread sees an object without its header and constructor-set fields. Actors are
   scheduled onto a pool of these threads.
+- The width `i1` has no `1`, so its `one()` is `i1(1)`, which is `-1`.
 
 ## Open
 

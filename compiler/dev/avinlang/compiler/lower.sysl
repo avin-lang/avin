@@ -921,10 +921,12 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
         Some(id) -> Some(Value(id))
         None -> None
 
-// A direct call of `function`, the receiver first for a method.
+// A direct call of `function`, the receiver first for a method. A static member's receiver is a
+// type, which is not passed.
 private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr], type_args: Buf[&Type]) -> Option[Operand]
     var operands: Buf[Operand] = buf()
     for a in args
+        if a.kind is TypeReceiver then continue
         val op = lower_expr(l, a)
         if machine(l, a.ty) is Some(_)
             op match
@@ -990,8 +992,11 @@ private bound_call(l: *Lowering, e: &TExpr, function: usize, slot: Option[usize]
         Some(s) -> s
         None -> return direct_call(l, e, function, args, type_args)
     val receiver = concrete(l, args[0].ty)
+    // A static member is called on a type, so the type's own table names it even where an object of
+    // the type could be of a subclass.
+    val on_type = args[0].kind is TypeReceiver
     if *receiver is Class(k, _, _)
-        if l.program.classes[k].decl.modifier != "" then return dispatch(l, function, position, args, type_args)
+        if l.program.classes[k].decl.modifier != "" && !on_type then return dispatch(l, function, position, args, type_args)
     val entries = checker_table(l, receiver)
     if position >= entries.len() then return dispatch(l, function, position, args, type_args)
     val m = entries[position] match
@@ -1060,14 +1065,20 @@ private concrete(l: *Lowering, t: &Type) -> &Type = substitute(solve(l.program.v
 
 private machine(l: *Lowering, t: &Type) -> Option[MirType] = mir_type(concrete(l, t))
 
+/** The machine type of parameter `i` of `symbol`, or `None` where nothing is passed for it: a type
+ * with no machine value, or a static member's receiver, which is a type. */
+private param_machine(l: *Lowering, symbol: FunctionSymbol, i: usize) -> Option[MirType]
+    if symbol.static_member && i == 0 then return None
+    machine(l, symbol.params[i])
+
 // A local function takes its declared parameters, then the address of each local it captures,
 // then the value of each top-level parameter it captures.
 private signature_of(l: *Lowering, f: TFunction) -> MirSignature
     val program = l.program
     val symbol = program.symbols[f.symbol]
     var params: Buf[MirType] = buf()
-    for p in symbol.params
-        if machine(l, p) is Some(t) then params.push(t)
+    for i in 0..<symbol.params.len()
+        if param_machine(l, symbol, i) is Some(t) then params.push(t)
     for x in symbol.captured_locals
         if machine(l, f.locals[x].ty) is Some(_) then params.push(MPtr)
     if symbol.root is Some(root)
@@ -1130,8 +1141,8 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     l.param_values = buf()
     symbol.root match
         None ->
-            for p in symbol.params
-                l.param_values.push(if machine(l, p) is Some(t) then Some(fresh(l, t)) else None)
+            for i in 0..<symbol.params.len()
+                l.param_values.push(if param_machine(l, symbol, i) is Some(t) then Some(fresh(l, t)) else None)
         Some(root) ->
             for i in 0..<symbol.params.len()
                 val value = if machine(l, symbol.params[i]) is Some(t) then Some(Value(fresh(l, t))) else None
@@ -1274,6 +1285,10 @@ private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
         Some(t) -> Some(fresh(l, t))
         None -> None
     l.insts.push(Call(dest, Runtime(found.0, MirSignature(params, result)), args))
+    // An entry point that never returns, such as ending the process, leaves nothing to return.
+    if *found.2 is Nothing
+        finish(l, Unreachable)
+        return
     finish(l, Return(dest match
         Some(id) -> Some(Value(id))
         None -> None))
@@ -1522,6 +1537,7 @@ private lower_kind(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         Some(id) -> Some(Value(id))
         None -> None
     Local(index) -> load(l, local_place(l, index))
+    TypeReceiver -> panic("a static member's receiver is a type, which has no value to lower")
     Call(function, args, type_args) -> direct_call(l, e, function, args, type_args)
     Dispatch(function, slot, args, type_args) -> dispatch(l, function, slot, args, type_args)
     BoundCall(function, slot, args, type_args) -> bound_call(l, e, function, slot, args, type_args)
