@@ -51,6 +51,6 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
 | [Packages](/spec/packages/) | Proposed: `avin.hocon`, dependencies, version selection, `avin.sum`, workspaces, `avin new` and `avin tidy` |
 | [Settled decisions](/spec/decisions/) | Every decision made so far, in one list |
 
-Syntax follows Sysl wherever Sysl has a form: indentation blocks, `name(params) -> T` functions,
-postfix `match` with `->` arms, `[T: Bound]` generics, `impl Trait for Type`. Where Avin needs a form
-Sysl lacks (classes, objects, variance), this specification defines it in the same style.
+The syntax is light and regular: blocks by indentation, functions as `name(params) -> T`, `match`
+written after the value with `->` arms, generics as `[T: Bound]`, conformance as `impl Trait for
+Type`, and classes, objects and variance in the same style.

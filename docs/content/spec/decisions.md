@@ -270,7 +270,7 @@ a decision changes, this page and the chapter change together.
   `, ` and ends with a newline. `print(debug(x))` selects `Debug`.
 - `debug(x)` yields `x`'s `Debug` form as a string. `Writer` writes strings (with `writeChar`,
   `writeInt`, `writeField` and `writeSpaces` beside `write`); `FormatSpec` is `width`, `precision`
-  and `left`, as in Sysl; `toString()` is a default body of `Display`.
+  and `left`; `toString()` is a default body of `Display`.
 - A built-in type conforms to a trait through an impl and implements every method of the trait,
   since a trait's default bodies are shared by objects and a built-in value is not one.
 - A variant's fields take defaults, each a function of the fields before it, as a constructor's
@@ -383,7 +383,7 @@ a decision changes, this page and the chapter change together.
   need across the whole program.
 - A class and its companion object are in one module, in any of its files.
 - One `avin` command does everything: build, run, test, deps and config.
-- Testing follows Sysl's model: `@test`, `@tests`, setup and teardown, and the built-in runner.
+- Testing is built in: `@test`, `@tests`, setup and teardown, and the built-in runner.
   Every feature ships with tests.
 - `avin build file.avin` writes `./file` by default; `-o` overrides it. A failed build leaves
   existing output untouched.
