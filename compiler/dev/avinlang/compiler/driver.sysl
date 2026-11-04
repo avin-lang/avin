@@ -8,6 +8,7 @@ import sysl.fs.{cache_dir, canonicalize, entries, exists, is_dir, make_dir_all, 
 import sysl.path.parent
 import sysl.process.capture
 import sysl.slices.sort
+import sysl.text.from_utf8_unchecked
 
 /** Where the compiler finds what it compiles against: the standard library's Avin source and the
  * runtime's Sysl package under `root`, which is only ever read, and the tools it runs. What it builds
@@ -114,11 +115,13 @@ struct ProgramFile
     src: Source
     module_name: Option[string]
     dependency: bool
+    /** The imports the file may not make, which its package's features gate. */
+    fences: Buf[Fence]
 
 /** A program of one file. */
 single_file(src: Source) -> Buf[ProgramFile]
     var files: Buf[ProgramFile] = buf()
-    files.push(ProgramFile(src, None, false))
+    files.push(ProgramFile(src, None, false, buf()))
     files
 
 /** The files of the program rooted at the directory `root`: every `.avin` and `.lavin` file under it, in order of
@@ -135,16 +138,20 @@ library_files(library: string) -> Result[Buf[ProgramFile], string] = package_fil
 /** The files of the package tree at `root`, as `program_files` finds them. With `dependency`, those a
  * package depending on it compiles: its modules, without its root directory's files and its `tests`
  * directory, which are its own. */
-package_files(root: string, dependency: bool) -> Result[Buf[ProgramFile], string]
+package_files(root: string, dependency: bool) -> Result[Buf[ProgramFile], string] = package_files_skipping(root, dependency, buf())
+
+/** The files of the package tree at `root`, as `package_files` finds them, without the modules `skip`
+ * names and those under them. */
+package_files_skipping(root: string, dependency: bool, skip: Buf[string]) -> Result[Buf[ProgramFile], string]
     var modules: Buf[ProgramFile] = buf()
     var root_files: Buf[ProgramFile] = buf()
-    collect_files(root, "", "", dependency, &modules, &root_files)?
+    collect_files(root, "", "", dependency, skip, &modules, &root_files)?
     if !dependency
         for f in root_files
             modules.push(f)
     Ok(modules)
 
-private collect_files(root: string, rel: string, module_name: string, dependency: bool, modules: *Buf[ProgramFile], root_files: *Buf[ProgramFile]) -> Result[unit, string]
+private collect_files(root: string, rel: string, module_name: string, dependency: bool, skip: Buf[string], modules: *Buf[ProgramFile], root_files: *Buf[ProgramFile]) -> Result[unit, string]
     val dir = if rel == "" then root else root + "/" + rel
     val names = entries(dir).map_err(e -> s"$dir: ${e.to_string()}")?
     val sorted = names.view()
@@ -158,11 +165,16 @@ private collect_files(root: string, rel: string, module_name: string, dependency
             if dependency && rel == "" && name == "tests" then continue
             // A package's `vendor/` holds the packages it depends on, not modules of its own.
             if rel == "" && name == VendorName && exists(root + "/" + ManifestName) then continue
-            collect_files(root, child, qualified(module_name, name), dependency, modules, root_files)?
+            val inner = qualified(module_name, name)
+            var skipped = false
+            for s in skip
+                if s == inner then skipped = true
+            if skipped then continue
+            collect_files(root, child, inner, dependency, skip, modules, root_files)?
         elif is_source_name(name)
             if dependency && rel == "" then continue
             val text = read_text(full).map_err(e -> s"$full: ${e.to_string()}")?
-            val file = ProgramFile(source_of(full, text), Some(module_name), dependency)
+            val file = ProgramFile(source_of(full, text), Some(module_name), dependency, buf())
             if rel == "" then root_files.push(file) else modules.push(file)
     Ok(())
 
@@ -303,7 +315,30 @@ load_units(library: string, files: Buf[ProgramFile], whole_library: bool, held: 
                 report.add(error(i.span, message))
                 broken = true
         units[k].report = report
+    // An import a feature's gate does not allow is refused whichever features are on, so a module that
+    // is off is told about by name rather than as missing.
+    for j in 0..<files.len()
+        val fences = files[j].fences
+        if fences.len() == 0 then continue
+        val k = library_units + j
+        var report = units[k].report
+        for i in units[k].file.imports
+            for fence in fences
+                if i.path == fence.prefix || i.path.starts_with(fence.prefix + ".")
+                    report.add(error(import_path_span(units[k].src, i), fence.message))
+                    broken = true
+                    break
+        units[k].report = report
     Ok(LoadedUnits(units, library_units, root_module, broken))
+
+// The place of the module path an import names, where it is written whole after `import `, and
+// otherwise the import's.
+private import_path_span(src: Source, i: Import) -> Span
+    val head = "import " + i.path
+    val end = i.span.start + head.bytes.len
+    if end <= src.bytes.len && from_utf8_unchecked(src.bytes[i.span.start..<end]) == head
+        return Span(i.span.start + 7, end)
+    i.span
 
 /** The library's module that gives a program its arguments. */
 const ProcessModule: string = "avin.process"
@@ -463,7 +498,7 @@ place_file(parsed: *Parsed, module_name: string, in_library: bool)
         parsed.report.add(error(at, s"the header names module `$header`, but the file is in module `$module_name`"))
     parsed.file.module_name = module_name
 
-private valid_module_name(name: string) -> bool
+valid_module_name(name: string) -> bool
     if name == "" then return true
     var start = true
     for b in name.bytes

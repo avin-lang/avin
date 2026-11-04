@@ -1,0 +1,354 @@
+module dev.avinlang.compiler
+
+import sh.sysl.hocon.{Field, Value}
+import sh.sysl.parsing.{Diagnostic, Source, Span, error}
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_dir
+
+// Features. A feature names a part of a package not every user wants: a set of the package's own
+// modules, which exist only while it is on, its optional dependencies, which are taken only while it
+// is on, and other features, its own or a dependency's. A manifest declares them; each dependency entry
+// asks for some of a package's features, every request for one package is added together, and the
+// command line chooses the root package's. Since a module may import a gated module or an optional
+// dependency's only where its own gate implies the other's, which is checked against the manifest
+// whatever is selected, turning a feature on only ever adds.
+
+/** A feature as its manifest declares it, each list as written with the place of each member. */
+struct Feature
+    name: string
+    span: Span
+    doc: string
+    /** Whether a user asking for nothing else gets it. */
+    on_by_default: bool
+    /** The modules that exist only while the feature is on, each with the modules under it. */
+    modules: Buf[string]
+    module_spans: Buf[Span]
+    /** What it turns on: a feature of this package, an optional dependency, `dep:x`, or `x/f`. */
+    enables: Buf[string]
+    enable_spans: Buf[Span]
+    /** Features of this package that must be on whenever this one is. */
+    requires: Buf[string]
+    require_spans: Buf[Span]
+
+/** What a member of a feature's `enables` turns on. */
+enum Enabled
+    /** Another feature of the same package. */
+    EnabledFeature(name: string)
+    /** The optional dependency of that label. */
+    EnabledDependency(label: string)
+    /** The feature `feature` of the dependency of that label, and the dependency where it is optional. */
+    EnabledDependencyFeature(label: string, feature: string)
+
+/** Which of the root package's features a command turns on: every one, or its defaults unless
+ * `defaults` is false, and the features `names` besides. */
+struct FeatureChoice
+    all: bool
+    defaults: bool
+    names: Buf[string]
+
+/** The defaults, as a build gets them when no flag says otherwise. */
+default_features() -> FeatureChoice = FeatureChoice(false, true, buf())
+
+/** Every feature, as `avin test`, `avin check`, the language server, `avin tidy` and `avin vendor` take
+ * them when no flag says otherwise. */
+every_feature() -> FeatureChoice = FeatureChoice(true, true, buf())
+
+/** An import a file may not make: of the module `prefix` or one under it, refused with `message`. */
+struct Fence
+    prefix: string
+    message: string
+
+// Reading the manifest's `features` block.
+
+read_features(f: Field, into: *Buf[Feature]) -> Result[unit, Diagnostic]
+    if !f.value.is_obj() then return Err(error(f.value.span, "`features` is a block naming each feature, `server { modules = [shapes.server] }` or `desktop = [webview]`"))
+    for g in f.value.fields()
+        if !valid_feature_name(g.key) then return Err(error(g.key_span, s"`${g.key}` is not a feature's name: a feature is named as a package is, and ${FeatureNameRule}"))
+        if g.key == "default" then return Err(error(g.key_span, "no feature is named `default`: a feature is made one of the defaults by `default = true` in its block"))
+        var feature = Feature(g.key, g.key_span, "", false, buf(), buf(), buf(), buf(), buf(), buf())
+        if g.value.is_arr()
+            feature_list(g, &feature.enables, &feature.enable_spans)?
+        elif g.value.is_obj()
+            for h in g.value.fields()
+                if h.key == "doc"
+                    feature.doc = h.value.as_text() match
+                        Some(s) -> s
+                        None -> return Err(error(h.value.span, "a feature's `doc` is written as a string, in quotes"))
+                elif h.key == "default"
+                    feature.on_by_default = h.value.as_bool() match
+                        Some(b) -> b
+                        None -> return Err(error(h.value.span, "a feature's `default` is `true` or `false`"))
+                elif h.key == "modules"
+                    feature_list(h, &feature.modules, &feature.module_spans)?
+                elif h.key == "enables"
+                    feature_list(h, &feature.enables, &feature.enable_spans)?
+                elif h.key == "requires"
+                    feature_list(h, &feature.requires, &feature.require_spans)?
+                else
+                    return Err(error(h.key_span, s"`${h.key}` is not a key of a feature, which holds `doc`, `default`, `modules`, `enables` and `requires`"))
+        else
+            return Err(error(g.value.span, s"the feature `${g.key}` is a block, `${g.key} { enables = [json] }`, or the list of what it enables, `${g.key} = [json]`"))
+        into.push(feature)
+    Ok(())
+
+// The members of the list `f` holds, each with its place.
+private feature_list(f: Field, into: *Buf[string], spans: *Buf[Span]) -> Result[unit, Diagnostic]
+    if !f.value.is_arr() then return Err(error(f.value.span, s"a feature's `${f.key}` is a list, `${f.key} = [a, b]`"))
+    for v in f.value.items()
+        v.as_text() match
+            Some(s) ->
+                into.push(s)
+                spans.push(v.span)
+            None -> return Err(error(v.span, s"a member of a feature's `${f.key}` is a name"))
+    Ok(())
+
+private const FeatureNameRule: string = "begins with a lowercase letter and holds lowercase letters, digits, `_` and `-`"
+
+/** Whether `name` names a feature: as a package is named. */
+valid_feature_name(name: string) -> bool = valid_package_name(name)
+
+/** What the member `member` of the `enables` of `feature` turns on, in a manifest declaring `features`. */
+enabled_by(features: Buf[Feature], feature: string, member: string) -> Enabled
+    val slash = byte_index(member, u8('/'))
+    if slash is Some(k) then return EnabledDependencyFeature(member[0..<k], member[k + 1..])
+    if member.starts_with("dep:") then return EnabledDependency(member[4..])
+    if member != feature && feature_index(features, member) is Some(_) then return EnabledFeature(member)
+    EnabledDependency(member)
+
+/** The place of the feature `name` among `features`. */
+feature_index(features: Buf[Feature], name: string) -> Option[usize]
+    for i in 0..<features.len()
+        if features[i].name == name then return Some(i)
+    None
+
+private byte_index(s: string, b: u8) -> Option[usize]
+    for k in 0..<s.bytes.len
+        if s.bytes[k] == b then return Some(k)
+    None
+
+/** The first thing wrong with the features of the manifest at `dir`, read but not yet checked against
+ * its dependencies: a module that is not one of the package's or is listed twice, a member of
+ * `enables` that names nothing or a dependency that is not optional, a `requires` naming no feature,
+ * features that turn each other on, and an optional dependency no feature turns on. */
+check_features(dir: string, features: Buf[Feature], dependencies: Buf[Dependency]) -> Result[unit, Diagnostic]
+    var listed: Buf[string] = buf()
+    var listed_by: Buf[string] = buf()
+    for f in features
+        for i in 0..<f.modules.len()
+            val name = f.modules[i]
+            val span = f.module_spans[i]
+            if name == "" || name.ends_with(".") || !valid_module_name(name)
+                return Err(error(span, s"`$name` is not a module's name: a module is named by its directory's path from the package's root, `shapes.server`"))
+            if name == "tests" || name.starts_with("tests.")
+                return Err(error(span, s"`$name` is the package's tests, which no feature lists: the tests are compiled whenever the package is tested"))
+            if !is_dir(dir + "/" + name.replace_all(".", "/"))
+                return Err(error(span, s"`$name` is not a module of this package: it has no directory `${name.replace_all(".", "/")}`"))
+            for k in 0..<listed.len()
+                if listed[k] == name
+                    return Err(error(span, s"`$name` is listed by the features `${listed_by[k]}` and `${f.name}`: a module is listed by one feature at most"))
+            listed.push(name)
+            listed_by.push(f.name)
+        for i in 0..<f.enables.len()
+            val member = f.enables[i]
+            val span = f.enable_spans[i]
+            enabled_by(features, f.name, member) match
+                EnabledFeature(_) -> ()
+                EnabledDependency(label) ->
+                    val explicit = member.starts_with("dep:")
+                    dependency_index(dependencies, label) match
+                        Some(k) ->
+                            if !dependencies[k].optional
+                                return Err(error(span, s"the feature `${f.name}` turns on the dependency `$label`, which is not optional: mark it `optional = true`, or take it out of `enables`, since it is always taken"))
+                        None ->
+                            if explicit then return Err(error(span, s"`$member` names the dependency `$label`, and the manifest declares none of that name"))
+                            return Err(error(span, s"`$member` is neither a feature of this package nor a dependency it declares"))
+                EnabledDependencyFeature(label, feature) ->
+                    if dependency_index(dependencies, label) is None
+                        return Err(error(span, s"`$member` names the dependency `$label`, and the manifest declares none of that name"))
+                    if !valid_feature_name(feature)
+                        return Err(error(span, s"`$member` names a dependency's feature, `$label/<feature>`, and `$feature` is not a feature's name"))
+        for i in 0..<f.requires.len()
+            val name = f.requires[i]
+            if name == f.name || feature_index(features, name) is None
+                return Err(error(f.require_spans[i], s"the feature `${f.name}` requires `$name`, which is not ${if name == f.name then "another" else "a"} feature of this package"))
+    // Features turning each other on: walk `enables` from each feature, and refuse one that reaches itself.
+    for f in features
+        var reached: Buf[string] = buf()
+        var queue: Buf[string] = buf()
+        queue.push(f.name)
+        var next = 0usize
+        while next < queue.len()
+            val at = features[feature_index(features, queue[next]).unwrap()]
+            next += 1
+            for i in 0..<at.enables.len()
+                if enabled_by(features, at.name, at.enables[i]) is EnabledFeature(g)
+                    if g == f.name
+                        val place = if at.name == f.name then at.enable_spans[i] else f.span
+                        return Err(error(place, s"the feature `${f.name}` turns itself on through `${at.name}`: features that turn each other on in a cycle would be one feature"))
+                    if !has_name(reached, g)
+                        reached.push(g)
+                        queue.push(g)
+    for d in dependencies
+        if !d.optional then continue
+        var named = false
+        for f in features
+            for member in f.enables
+                enabled_by(features, f.name, member) match
+                    EnabledDependency(label) -> if label == d.label then named = true
+                    EnabledDependencyFeature(label, _) -> if label == d.label then named = true
+                    _ -> ()
+        if !named
+            return Err(error(d.span, s"the dependency `${d.label}` is optional, and no feature turns it on: name it in a feature's `enables`, or take `optional` away"))
+    Ok(())
+
+private dependency_index(dependencies: Buf[Dependency], label: string) -> Option[usize]
+    for i in 0..<dependencies.len()
+        if dependencies[i].label == label then return Some(i)
+    None
+
+private has_name(names: Buf[string], name: string) -> bool
+    for n in names
+        if n == name then return true
+    false
+
+// Selecting.
+
+/** The features `request` adds, as the package declaring `features` reads it, or what is wrong with
+ * it: a feature it does not declare, or a `-` member that is not one of its defaults. */
+requested_features(features: Buf[Feature], all: bool, defaults: bool, names: Buf[string], without: Buf[string]) -> Result[Buf[string], string]
+    var on: Buf[string] = buf()
+    for n in names
+        if feature_index(features, n) is None then return Err(n)
+    for n in without
+        val i = feature_index(features, n) match
+            Some(i) -> i
+            None -> return Err("-" + n)
+        if !features[i].on_by_default then return Err("-" + n)
+    for f in features
+        if all || defaults && f.on_by_default && !has_name(without, f.name) || has_name(names, f.name)
+            on.push(f.name)
+    Ok(on)
+
+/** The message for a request of `asked` (a feature's name, or `-` and one) that the package `package`,
+ * declaring `features`, cannot grant. */
+refused_feature(package: string, features: Buf[Feature], asked: string) -> string
+    if asked.starts_with("-")
+        val name = asked[1..]
+        if feature_index(features, name) is Some(_)
+            return s"`$asked` takes away a default of `$package`, and `$name` is not one of its defaults"
+        return s"`$asked` takes away a default of `$package`, which has no feature `$name`${features_listing(features)}"
+    s"the package `$package` has no feature `$asked`${features_listing(features)}"
+
+private features_listing(features: Buf[Feature]) -> string
+    if features.len() == 0 then return "; it declares none"
+    var names: Buf[string] = buf()
+    for f in features
+        names.push(if f.doc == "" then s"`${f.name}`" else s"`${f.name}` (${f.doc})")
+    "; its features are " + listing(names)
+
+// `a`, `a and b`, `a, b and c`.
+private listing(items: Buf[string]) -> string
+    var out = ""
+    for i in 0..<items.len()
+        if i > 0 then out = out + (if i + 1 == items.len() then " and " else ", ")
+        out = out + items[i]
+    out
+
+/** `on` with every feature its members turn on, theirs too, in the order `features` declares them. */
+feature_closure(features: Buf[Feature], on: Buf[string]) -> Buf[string]
+    var reached: Buf[string] = buf()
+    for n in on
+        if !has_name(reached, n) then reached.push(n)
+    var next = 0usize
+    while next < reached.len()
+        val i = feature_index(features, reached[next]).unwrap()
+        next += 1
+        for member in features[i].enables
+            if enabled_by(features, features[i].name, member) is EnabledFeature(g)
+                if !has_name(reached, g) then reached.push(g)
+    var out: Buf[string] = buf()
+    for f in features
+        if has_name(reached, f.name) then out.push(f.name)
+    out
+
+/** Whether a feature among `on` turns on the dependency `label`. */
+dependency_turned_on(features: Buf[Feature], on: Buf[string], label: string) -> bool
+    for f in features
+        if !has_name(on, f.name) then continue
+        for member in f.enables
+            enabled_by(features, f.name, member) match
+                EnabledDependency(l) -> if l == label then return true
+                EnabledDependencyFeature(l, _) -> if l == label then return true
+                _ -> ()
+    false
+
+/** The features of the dependency `label` that a feature among `on` asks for, `label/feature`, each
+ * with its place. */
+dependency_features_asked(features: Buf[Feature], on: Buf[string], label: string, names: *Buf[string], spans: *Buf[Span])
+    for f in features
+        if !has_name(on, f.name) then continue
+        for i in 0..<f.enables.len()
+            if enabled_by(features, f.name, f.enables[i]) is EnabledDependencyFeature(l, feature)
+                if l == label
+                    names.push(feature)
+                    spans.push(f.enable_spans[i])
+
+/** The first `requires` of a feature among `on` that is not itself on, as a diagnostic at its place. */
+unmet_requirement(features: Buf[Feature], on: Buf[string]) -> Option[Diagnostic]
+    for f in features
+        if !has_name(on, f.name) then continue
+        for i in 0..<f.requires.len()
+            if !has_name(on, f.requires[i])
+                return Some(error(f.require_spans[i], s"the feature `${f.name}` requires `${f.requires[i]}`, which is off: turn `${f.requires[i]}` on beside `${f.name}`"))
+    None
+
+// Gates.
+
+/** The modules of a package declaring `features` that are not read while only `on` is on. */
+gated_off(features: Buf[Feature], on: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+    for f in features
+        if has_name(on, f.name) then continue
+        for m in f.modules
+            out.push(m)
+    out
+
+// The features the module `module_name` exists only while they are on: every one listing it or a
+// module it is under.
+private gate_of(features: Buf[Feature], module_name: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    for f in features
+        for m in f.modules
+            if (module_name == m || module_name.starts_with(m + ".")) && !has_name(out, f.name) then out.push(f.name)
+    out
+
+/** The imports a file of the module `module_name`, in a package declaring `features` whose optional
+ * dependencies taken are `optional` with the modules of each in `optional_modules`, may not make:
+ * every gated module its own gate does not imply, and every module of an optional dependency its gate
+ * does not turn on. A gate implies another when the features its `enables` reach include it. */
+fences_of(features: Buf[Feature], module_name: string, optional: Buf[string], optional_modules: Buf[Buf[string]]) -> Buf[Fence]
+    var out: Buf[Fence] = buf()
+    if features.len() == 0 then return out
+    val own = gate_of(features, module_name)
+    val implied = feature_closure(features, own)
+    val importer = if module_name == "" then "the package's root module" else s"`$module_name`"
+    for f in features
+        for m in f.modules
+            for g in gate_of(features, m)
+                if has_name(implied, g) then continue
+                out.push(Fence(m, s"`$m` exists only while the feature `$g` is on, and ${gated_importer(importer, module_name, own, g)}"))
+                break
+    for i in 0..<optional.len()
+        if dependency_turned_on(features, implied, optional[i]) then continue
+        for m in optional_modules[i]
+            out.push(Fence(m, s"`$m` is a module of the optional dependency `${optional[i]}`, and ${gated_importer(importer, module_name, own, optional[i])}"))
+    out
+
+// The second half of a fence's message: what the importing module is compiled with, and what to do.
+private gated_importer(importer: string, module_name: string, own: Buf[string], needed: string) -> string
+    val unlistable = module_name == "" || module_name == "tests" || module_name.starts_with("tests.")
+    if own.len() == 0 && unlistable
+        return s"$importer is always compiled: import it from a module listed under a feature that enables `$needed`"
+    if own.len() == 0
+        return s"$importer is always compiled: list $importer under a feature that enables `$needed`, or import it from a module that is"
+    s"$importer exists only while `${own[0]}` is on, which does not turn `$needed` on: add `$needed` to the `enables` of `${own[0]}`, or import it from a module listed under a feature that does"

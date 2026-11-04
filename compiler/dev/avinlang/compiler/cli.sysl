@@ -8,7 +8,7 @@ import sysl.slices.sort_by
 
 const Version: string = "0.0.2"
 const NoToolchain: string = "avin: cannot find the Avin library and runtime: they are installed in `share/avin` beside `bin/avin`; for a source checkout, set AVIN_ROOT to the directory that holds `library/` and `runtime/`"
-const Usage: string = "usage: avin [<program>] [-O0 | -O2] [-- <argument>...]\n       avin parse [<program>]\n       avin check [<program>]\n       avin emit-llvm [<program>] -o <module.ll>\n       avin build [<program>] [-o <executable>] [-O0 | -O2]\n       avin run [<program>] [-O0 | -O2] [-- <argument>...]\n       avin test [<program>] [<filter>] [-O0 | -O2]\n       avin new <dir> [--lib]\n       avin add <source>[@<version>] [<package>]\n       avin tidy [--check] [<package>]\n       avin vendor [<package>]\n       avin fmt [--check] [<path>...]\n       avin tangle <file.lavin> [-o <path>]\n       avin weave <file.lavin> [-o <file.html>]\n       avin lsp [--stdio]\n       avin --help\n       avin --version\n<program> is a path in a package (a directory holding avin.hocon), a source file (`.avin`, or `.lavin` for a literate one), or a directory holding a program's modules; left out, it is the current directory\n`avin` alone is `avin run`, and `avin <program> ...` is `avin run <program> ...` when the first argument is not a command; reach a file or directory named like a command as `./test`\n`avin test`: an argument that names an existing file or directory is the program, any other is the filter; `avin test . <filter>` filters when a path of that name exists"
+const Usage: string = "usage: avin [<program>] [-O0 | -O2] [-- <argument>...]\n       avin parse [<program>]\n       avin check [<program>] [<features>]\n       avin emit-llvm [<program>] -o <module.ll>\n       avin build [<program>] [-o <executable>] [-O0 | -O2] [<features>]\n       avin run [<program>] [-O0 | -O2] [<features>] [-- <argument>...]\n       avin test [<program>] [<filter>] [-O0 | -O2] [<features>]\n       avin new <dir> [--lib]\n       avin add <source>[@<version>] [<package>]\n       avin tidy [--check] [<package>]\n       avin vendor [<package>] [<features>]\n       avin fmt [--check] [<path>...]\n       avin tangle <file.lavin> [-o <path>]\n       avin weave <file.lavin> [-o <file.html>]\n       avin lsp [--stdio]\n       avin --help\n       avin --version\n<program> is a path in a package (a directory holding avin.hocon), a source file (`.avin`, or `.lavin` for a literate one), or a directory holding a program's modules; left out, it is the current directory\n`avin` alone is `avin run`, and `avin <program> ...` is `avin run <program> ...` when the first argument is not a command; reach a file or directory named like a command as `./test`\n`avin test`: an argument that names an existing file or directory is the program, any other is the filter; `avin test . <filter>` filters when a path of that name exists\n<features> are `--features a,b`, `--no-default-features` and `--all-features`, choosing the package's features; `avin test`, `avin check` and `avin vendor` turn every feature on unless one is given"
 
 // Output channels, the exit status and the toolchain location stay outside command dispatch, so
 // every command can be run and tested in memory. 0 is success, 1 a source, I/O or build failure,
@@ -70,6 +70,8 @@ run_command(here: string, args: []const string, tc: Option[Toolchain], say: stri
     var optimization: Option[string] = None
     var filter: Option[string] = None
     var program_args: Buf[string] = buf()
+    var flags = FeatureFlags(false, false, false, buf())
+    val takes_features = command == "build" || command == "run" || command == "check" || command == "test"
     var i = if named then 3usize else 2usize
     while i < args.len
         val a = args[i]
@@ -77,6 +79,11 @@ run_command(here: string, args: []const string, tc: Option[Toolchain], say: stri
             for j in i + 1..<args.len
                 program_args.push(args[j])
             break
+        if takes_features
+            val took = feature_flag(args, i, &flags)
+            if took > 0
+                i += took
+                continue
         if a == "-o" && i + 1 < args.len && output is None
             output = Some(args[i + 1])
             i += 2
@@ -104,7 +111,10 @@ run_command(here: string, args: []const string, tc: Option[Toolchain], say: stri
     if !named && is_dir(path) && !holds_program(path)
         note(s"avin: no Avin program here: $path holds no ${ManifestName} and no `.avin` or `.lavin` files")
         return 1
-    val program = load_program(path, default_fetching()) match
+    // `avin test` and `avin check` turn every feature on unless a flag says otherwise, since a module
+    // no build compiles is a module nothing checks.
+    val choice = flags.choice(command == "test" || command == "check")
+    val program = load_program_with(path, default_fetching(), choice) match
         Ok(p) -> p
         Err(message) ->
             note(message.trim_end())
@@ -307,19 +317,60 @@ private fmt_name_before(a: string, b: string) -> bool = a < b
  * removed from there. */
 vendor_command(args: []const string, say: string -> unit, note: string -> unit) -> int
     var dir: Option[string] = None
-    for i in 2..<args.len
+    var flags = FeatureFlags(false, false, false, buf())
+    var i = 2usize
+    while i < args.len
+        val took = feature_flag(args, i, &flags)
+        if took > 0
+            i += took
+            continue
         if !args[i].starts_with("-") && dir is None then dir = Some(args[i])
         else
             note(Usage)
             return 2
+        i += 1
     val home = project_of(dir.unwrap_or("."), "vendor", note) match
         Some(h) -> h
         None -> return 1
-    vendor(home, default_fetching(), say) match
+    vendor_with(home, default_fetching(), flags.choice(true), say) match
         Ok(_) -> 0
         Err(message) ->
             note(message.trim_end())
             1
+
+/** The feature flags a command was given: whether any was, `--all-features`, `--no-default-features`,
+ * and the names of every `--features`. */
+struct FeatureFlags
+    given: bool
+    all: bool
+    no_defaults: bool
+    names: Buf[string]
+
+    /** The root package's features the flags choose; with none given, every feature when `every`, and
+     * otherwise the defaults. */
+    choice(self, every: bool) -> FeatureChoice
+        if !self.given then return if every then every_feature() else default_features()
+        FeatureChoice(self.all, !self.no_defaults, self.names)
+end FeatureFlags
+
+// Reads the feature flag at `args[i]` into `flags`, answering how many arguments it took: 0 when
+// `args[i]` is none, and for `--features` with no names after it.
+private feature_flag(args: []const string, i: usize, flags: *FeatureFlags) -> usize
+    val a = args[i]
+    if a == "--all-features"
+        flags.given = true
+        flags.all = true
+        return 1
+    if a == "--no-default-features"
+        flags.given = true
+        flags.no_defaults = true
+        return 1
+    if a == "--features" && i + 1 < args.len && !args[i + 1].starts_with("-")
+        flags.given = true
+        for n in args[i + 1].split(",")
+            if n != "" then flags.names.push(n)
+        return 2
+    0
 
 // The package or workspace `avin <command>` given `given` works on: a workspace's root whole, and any
 // other path the package it is in. Says through `note` why there is none.

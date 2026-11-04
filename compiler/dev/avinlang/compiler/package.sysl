@@ -46,11 +46,17 @@ enum Origin
     /** The member of the package's workspace whose package has the dependency's name. */
     Member
 
-/** A dependency as a manifest lists it: its name there, where it comes from, and where it was written. */
+/** A dependency as a manifest lists it: its name there, where it comes from, and where it was written;
+ * whether it is taken only while a feature turns it on; and which of its package's features it asks
+ * for: its defaults unless `default_features` is false, less those in `without`, and `features`. */
 struct Dependency
     label: string
     origin: Origin
     span: Span
+    optional: bool
+    default_features: bool
+    features: Buf[string]
+    without: Buf[string]
 
 /** A package's manifest, read and checked. Its `sysl-dependencies` block names the Sysl packages,
  * other than Sysl's standard library, its bindings reach; they are written as Avin dependencies are,
@@ -70,6 +76,8 @@ struct Manifest
     /** Whether the manifest lists a workspace, and the directories it lists, as written. */
     has_workspace: bool
     workspace: Buf[string]
+    /** The features the package declares. */
+    features: Buf[Feature]
 
 /** The file that makes a directory a Sysl package. */
 const SyslManifestName: string = "sysl.hocon"
@@ -80,13 +88,14 @@ read_manifest(dir: string) -> Result[Manifest, string]
     val text = read_text(file).map_err(e -> s"avin: $file: ${e.to_string()}")?
     val src = source_of(file, text)
     val doc = parse_hocon(src).map_err(d -> d.render(src))?
-    var m = Manifest(dir, src, false, "", "", "", buf(), buf(), false, buf())
+    var m = Manifest(dir, src, false, "", "", "", buf(), buf(), false, buf(), buf())
     read_fields(&m, doc.root).map_err(d -> d.render(src))?
     Ok(m)
 
 private read_fields(m: *Manifest, root: Value) -> Result[unit, Diagnostic]
     var dependencies = Span(0, 0)
     var sysl_dependencies = Span(0, 0)
+    var features = Span(0, 0)
     for f in root.fields()
         if f.key == "package"
             m.has_package = true
@@ -99,14 +108,20 @@ private read_fields(m: *Manifest, root: Value) -> Result[unit, Diagnostic]
             read_dependencies(f, true, &m.sysl_dependencies)?
         elif f.key == "workspace"
             read_workspace(m, f)?
+        elif f.key == "features"
+            features = f.key_span
+            read_features(f, &m.features)?
         else
-            return Err(error(f.key_span, s"`${f.key}` is not a key of $ManifestName, which holds `package`, `dependencies`, `sysl-dependencies` and `workspace`"))
+            return Err(error(f.key_span, s"`${f.key}` is not a key of $ManifestName, which holds `package`, `dependencies`, `sysl-dependencies`, `features` and `workspace`"))
     if !m.has_package && !m.has_workspace
         return Err(error(Span(0, 0), s"$ManifestName has no `package` block: a package is named and versioned, `package { name = \"geom\", version = \"0.1.0\" }`"))
     if !m.has_package && m.dependencies.len() > 0
         return Err(error(dependencies, "a workspace with no `package` block compiles nothing of its own, so its dependencies would reach nothing: name each in the member that imports it"))
     if !m.has_package && m.sysl_dependencies.len() > 0
         return Err(error(sysl_dependencies, "a workspace with no `package` block compiles nothing of its own, so its Sysl dependencies would reach nothing: name each in the member whose bindings reach it"))
+    if !m.has_package && m.features.len() > 0
+        return Err(error(features, "a workspace with no `package` block compiles nothing of its own, so it has no features: declare each in the member it belongs to"))
+    check_features(m.dir, m.features, m.dependencies)?
     Ok(())
 
 private read_package(m: *Manifest, f: Field) -> Result[unit, Diagnostic]
@@ -146,6 +161,11 @@ private read_dependencies(f: Field, sysl: bool, into: *Buf[Dependency]) -> Resul
         var local: Option[string] = None
         var in_workspace = false
         var member: Option[string] = None
+        var optional = false
+        var default_features = true
+        var features: Buf[string] = buf()
+        var without: Buf[string] = buf()
+        var without_spans: Buf[Span] = buf()
         for g in d.value.fields()
             if g.key == "git"
                 val c = text_of(g)?
@@ -175,8 +195,30 @@ private read_dependencies(f: Field, sysl: bool, into: *Buf[Dependency]) -> Resul
                 val dir = text_of(g)?
                 if !valid_member(dir) then return Err(error(g.value.span, s"`$dir` is not a member's directory: ${MemberRule}"))
                 member = Some(dir)
+            elif g.key == "optional"
+                optional = g.value.as_bool() match
+                    Some(b) -> b
+                    None -> return Err(error(g.value.span, "a dependency's `optional` is `true` or `false`: an optional dependency is taken only while a feature turns it on"))
+            elif g.key == "default_features"
+                default_features = g.value.as_bool() match
+                    Some(b) -> b
+                    None -> return Err(error(g.value.span, "a dependency's `default_features` is `true` or `false`"))
+            elif g.key == "features"
+                if !g.value.is_arr() then return Err(error(g.value.span, "a dependency's `features` is a list of the package's features it asks for, `features = [desktop, -colour]`"))
+                for v in g.value.items()
+                    val name = v.as_text() match
+                        Some(s) -> s
+                        None -> return Err(error(v.span, "a member of a dependency's `features` is a feature's name, or `-` and one"))
+                    val bare = if name.starts_with("-") then name[1..] else name
+                    if !valid_feature_name(bare) then return Err(error(v.span, s"`$name` is not a feature's name, or `-` and one"))
+                    if name.starts_with("-")
+                        without.push(bare)
+                        without_spans.push(v.span)
+                    else features.push(name)
             else
-                return Err(error(g.key_span, s"`${g.key}` is not a key of a dependency, which holds `git` with `version` or `rev` and optionally `member`, `path`, or `workspace`"))
+                return Err(error(g.key_span, s"`${g.key}` is not a key of a dependency, which holds `git` with `version` or `rev` and optionally `member`, `path`, or `workspace`, and `optional`, `features` and `default_features`"))
+        if !default_features && without.len() > 0
+            return Err(error(without_spans[0], s"`-${without[0]}` takes away a default, and `default_features = false` leaves every default off already"))
         var sources = 0
         if git is Some(_) then sources += 1
         if local is Some(_) then sources += 1
@@ -195,16 +237,16 @@ private read_dependencies(f: Field, sysl: bool, into: *Buf[Dependency]) -> Resul
             if version is Some(_) && rev is Some(_)
                 return Err(error(d.key_span, s"the dependency `${d.key}` has a `version` and a `rev`: a git dependency is read at a release or at a commit, not both"))
             if rev is Some(x)
-                into.push(Dependency(d.key, Rev(c, x), d.key_span))
+                into.push(Dependency(d.key, Rev(c, x), d.key_span, optional, default_features, features, without))
                 continue
             version match
-                Some(v) -> into.push(Dependency(d.key, Git(c, v), d.key_span))
+                Some(v) -> into.push(Dependency(d.key, Git(c, v), d.key_span, optional, default_features, features, without))
                 None -> return Err(error(d.key_span, s"the dependency `${d.key}` names a repository and no version: a git dependency is read at a release, `version = \"1.0.0\"` being the tag `v1.0.0`, or at a commit, `rev = \"3f9a2c1\"`"))
             continue
         if rev is Some(_) then return Err(error(d.key_span, s"the dependency `${d.key}` has a `rev`, which belongs with `git`: a directory is read as it stands"))
         if version is Some(_) then return Err(error(d.key_span, s"the dependency `${d.key}` has a `version`, which belongs with `git`: a directory is read as it stands"))
-        if local is Some(p) then into.push(Dependency(d.key, Local(p), d.key_span))
-        else into.push(Dependency(d.key, Member, d.key_span))
+        if local is Some(p) then into.push(Dependency(d.key, Local(p), d.key_span, optional, default_features, features, without))
+        else into.push(Dependency(d.key, Member, d.key_span, optional, default_features, features, without))
     Ok(())
 
 private read_workspace(m: *Manifest, f: Field) -> Result[unit, Diagnostic]
@@ -528,6 +570,11 @@ struct ResolvedPackage
     dir: string
     manifest: Manifest
     fetched: bool
+    /** The features it is built with. */
+    features: Buf[string]
+    /** The labels of the optional dependencies a feature of it turned on, and each one's directory. */
+    optional: Buf[string]
+    optional_dirs: Buf[string]
 
 /** What resolving a package found: the packages, the one resolved first and then every package it
  * depends on, directly or through another; the sum file; the lines it holds; and a line for every
@@ -557,6 +604,59 @@ private struct Resolver
     /** Whether the packages are read from the project's `vendor/` rather than the machine's cache. */
     vendored: bool
     cloned: Buf[string]
+    /** Every request for a package's features made so far, each once. */
+    requests: Buf[FeatureRequest]
+    request_keys: Buf[string]
+
+/** A request for features of the package `key` names (its coordinate, or a directory), made at
+ * `place` in `src` or, with no place, by the command line: every feature, or the defaults unless
+ * `defaults` is false, less `without`, and `names`. */
+private struct FeatureRequest
+    key: string
+    all: bool
+    defaults: bool
+    names: Buf[string]
+    without: Buf[string]
+    place: Option[Span]
+    src: Source
+
+// Adds a request unless an identical one was made, and notes that resolution has changed when it does.
+private add_request(r: *Resolver, q: FeatureRequest)
+    var text = q.key + (if q.all then "|all|" else "|") + (if q.defaults then "defaults|" else "|")
+    for n in q.names
+        text = text + n + ","
+    text = text + "|"
+    for n in q.without
+        text = text + n + ","
+    text = text + "|" + q.src.name + "|"
+    if q.place is Some(s) then text = text + s.start.to_string()
+    if contains(r.request_keys, text) then return
+    r.request_keys.push(text)
+    r.requests.push(q)
+    r.changed = true
+
+// The features the package `key` names, whose manifest is `m`, is built with: what every request for
+// it adds, with what those turn on.
+private selected_features(r: Resolver, key: string, m: Manifest) -> Result[Buf[string], string]
+    var on: Buf[string] = buf()
+    for q in r.requests
+        if q.key != key then continue
+        val added = requested_features(m.features, q.all, q.defaults, q.names, q.without) match
+            Ok(a) -> a
+            Err(asked) ->
+                val message = refused_feature(m.name, m.features, asked)
+                return Err(q.place match
+                    Some(s) -> error(s, message).render(q.src)
+                    None -> "avin: " + message)
+        for n in added
+            if !contains(on, n) then on.push(n)
+    Ok(feature_closure(m.features, on))
+
+// The key a dependency's feature requests are made under: its coordinate, or its directory.
+private package_key(origin: Origin, dir: string) -> string = origin match
+    Git(c, _) -> c
+    Rev(c, _) -> c
+    _ -> dir
 
 /** The directory, beside a project's manifest or at its workspace's root, holding the packages it
  * resolves to, in the cache's layout. */
@@ -583,10 +683,17 @@ private struct Reached
  * every member's dependencies, so no two members are built against two versions of one package.
  *
  * A project with a `vendor/` directory resolves from it in place of the cache, and fetches nothing. */
-resolve(dir: string, fetching: Fetching, whole: bool) -> Result[Resolution, string] = resolve_from(dir, fetching, whole, true)
+resolve(dir: string, fetching: Fetching, whole: bool) -> Result[Resolution, string] = resolve_from(dir, fetching, whole, true, default_features())
 
-// Resolves as `resolve` does; without `vendored`, from the cache even where the project has a `vendor/`.
-private resolve_from(dir: string, fetching: Fetching, whole: bool, vendored: bool) -> Result[Resolution, string]
+/** Resolves as `resolve` does, the root package's features chosen by `choice`: with `whole`, every
+ * member's, each taking the names in `choice` that it declares. Each dependency is built with every
+ * feature any manifest in the graph asks of it, and an optional dependency is taken only while a
+ * feature turns it on. */
+resolve_with(dir: string, fetching: Fetching, whole: bool, choice: FeatureChoice) -> Result[Resolution, string] = resolve_from(dir, fetching, whole, true, choice)
+
+// Resolves as `resolve_with` does; without `vendored`, from the cache even where the project has a
+// `vendor/`.
+private resolve_from(dir: string, fetching: Fetching, whole: bool, vendored: bool, choice: FeatureChoice) -> Result[Resolution, string]
     val home = canonicalize(dir).map_err(e -> s"avin: $dir: ${e.to_string()}")?
     val m = read_manifest(home)?
     val ws = workspace_containing(m)?
@@ -603,34 +710,59 @@ private resolve_from(dir: string, fetching: Fetching, whole: bool, vendored: boo
     val vendor = sum_dir + "/" + VendorName
     val from_vendor = vendored && is_dir(vendor)
     val source = if from_vendor then Fetching(vendor, "", false) else fetching
-    var r = Resolver(source, ws, sums, buf(), buf(), buf(), false, from_vendor, buf())
-    // A version raised can name dependencies of its own, which can raise another: walk again until a
-    // walk raises nothing.
+    var r = Resolver(source, ws, sums, buf(), buf(), buf(), false, from_vendor, buf(), buf(), buf())
+    val all_roots = whole && (m.has_workspace || !m.has_package)
+    // The command line chooses the root's features; in a whole workspace, each member takes the names
+    // it declares, and a name no member declares is refused.
+    var declared: Buf[string] = buf()
+    for root in roots
+        val rm = read_manifest(root)?
+        var names: Buf[string] = buf()
+        for n in choice.names
+            if !all_roots || feature_index(rm.features, n) is Some(_) then names.push(n)
+            if feature_index(rm.features, n) is Some(_) then declared.push(n)
+        val chosen = all_roots || root == home
+        if chosen then add_request(&r, FeatureRequest(root, choice.all, choice.defaults, names, buf(), None, rm.src))
+        else add_request(&r, FeatureRequest(root, choice.all, true, buf(), buf(), None, rm.src))
+    if !contains(roots, home)
+        add_request(&r, FeatureRequest(home, choice.all, choice.defaults, choice.names, buf(), None, m.src))
+    if all_roots
+        for n in choice.names
+            if !contains(declared, n) then return Err(s"avin: no member of the workspace at ${home} has a feature `$n`")
+    // A version raised can name dependencies of its own, which can raise another, and a feature turned
+    // on can take a dependency or ask for another's features: walk again until a walk changes nothing.
     loop
         r.changed = false
         var seen: Buf[string] = buf()
         var reached: Buf[ResolvedPackage] = buf()
         for root in roots
-            visit(&r, root, None, &seen, &reached)?
+            visit(&r, root, None, root, &seen, &reached)?
         if !r.changed then break
     var seen: Buf[string] = buf()
     var packages: Buf[ResolvedPackage] = buf()
-    if whole && (m.has_workspace || !m.has_package)
+    if all_roots
         for root in roots
-            visit(&r, root, None, &seen, &packages)?
+            visit(&r, root, None, root, &seen, &packages)?
     else
-        visit(&r, home, None, &seen, &packages)?
+        visit(&r, home, None, home, &seen, &packages)?
+    for p in packages
+        if unmet_requirement(p.manifest.features, p.features) is Some(d) then return Err(d.render(p.manifest.src))
     Ok(Resolution(packages, sum_file, r.sums, r.read, r.cloned))
 
-// Visits the package at `dir`, which was fetched from `from` when that is given, and every package it
-// depends on.
-private visit(r: *Resolver, dir: string, from: Option[Clone], seen: *Buf[string], out: *Buf[ResolvedPackage]) -> Result[unit, string]
+// Visits the package at `dir`, which was fetched from `from` when that is given and whose feature
+// requests are made under `key`, and every package it depends on that its features take.
+private visit(r: *Resolver, dir: string, from: Option[Clone], key: string, seen: *Buf[string], out: *Buf[ResolvedPackage]) -> Result[unit, string]
     if contains(*seen, dir) then return Ok(())
     seen.push(dir)
     val m = read_manifest(dir)?
     if !m.has_package then return Err(s"avin: $dir is a workspace's root with no `package` block, which no package can depend on")
-    out.push(ResolvedPackage(m.name, dir, m, from is Some(_)))
+    val on = selected_features(*r, key, m)?
+    val at = out.len()
+    out.push(ResolvedPackage(m.name, dir, m, from is Some(_), on, buf(), buf()))
+    var optional: Buf[string] = buf()
+    var optional_dirs: Buf[string] = buf()
     for d in m.dependencies
+        if d.optional && !dependency_turned_on(m.features, on, d.label) then continue
         // A fetched package's path and workspace dependencies are other packages of its repository,
         // read at the version it was read at.
         val origin = from match
@@ -668,7 +800,21 @@ private visit(r: *Resolver, dir: string, from: Option[Clone], seen: *Buf[string]
                             Some(i) -> Reached(w.members[i], None)
                             None -> return Err(error(d.span, s"`${d.label}` is a workspace dependency, and no member of the workspace at ${w.root} is named `${d.label}`").render(m.src))
                     None -> return Err(error(d.span, s"`${d.label}` is a workspace dependency, and this package is in no workspace: a workspace's root lists its members, `workspace = [\"app\", \"${d.label}\"]`").render(m.src))
-        visit(r, reached.dir, reached.clone, seen, out)?
+        val dep_key = package_key(origin, reached.dir)
+        add_request(r, FeatureRequest(dep_key, false, d.default_features, d.features, d.without, Some(d.span), m.src))
+        var asked: Buf[string] = buf()
+        var places: Buf[Span] = buf()
+        dependency_features_asked(m.features, on, d.label, &asked, &places)
+        for i in 0..<asked.len()
+            var one: Buf[string] = buf()
+            one.push(asked[i])
+            add_request(r, FeatureRequest(dep_key, false, false, one, buf(), Some(places[i]), m.src))
+        if d.optional
+            optional.push(d.label)
+            optional_dirs.push(reached.dir)
+        visit(r, reached.dir, reached.clone, dep_key, seen, out)?
+    out[at].optional = optional
+    out[at].optional_dirs = optional_dirs
     Ok(())
 
 // The origin of the dependency `d` of the fetched package at `dir`, read from the clone `c`: a path or
@@ -885,10 +1031,10 @@ record_sums(res: Resolution) -> Result[unit, string]
 /** Rewrites the sum file of the package or workspace at `dir` to exactly the fetched packages its
  * whole resolution reads, keeping each line that stays where it was, and says through `say` what it
  * removed and added. With `check`, it writes nothing and fails when the file is not already that.
- * Answers whether the file was tidy. The resolution is read from the cache, whatever the project's
- * `vendor/` holds. */
+ * Answers whether the file was tidy. The resolution, with every feature of the root on, is read from
+ * the cache, whatever the project's `vendor/` holds. */
 tidy(dir: string, fetching: Fetching, check: bool, say: string -> unit) -> Result[bool, string]
-    val res = resolve_from(dir, fetching, true, false)?
+    val res = resolve_from(dir, fetching, true, false, every_feature())?
     var lines: Buf[SumLine] = buf()
     var changed = false
     for l in res.sums
@@ -924,8 +1070,11 @@ private struct VendorCopy
  * before it is copied, `.git` and the root's `.avin` left out. A copy already in place and hashing as
  * recorded is left alone; one the resolution no longer reads is removed. Says through `say` what it
  * fetched and removed, and how many packages it vendored. */
-vendor(dir: string, fetching: Fetching, say: string -> unit) -> Result[unit, string]
-    val res = resolve_from(dir, fetching, true, false)?
+vendor(dir: string, fetching: Fetching, say: string -> unit) -> Result[unit, string] = vendor_with(dir, fetching, every_feature(), say)
+
+/** Vendors as `vendor` does, the root package's features chosen by `choice`. */
+vendor_with(dir: string, fetching: Fetching, choice: FeatureChoice, say: string -> unit) -> Result[unit, string]
+    val res = resolve_from(dir, fetching, true, false, choice)?
     record_sums(res)?
     for c in res.cloned
         say(s"fetching $c")
@@ -1073,7 +1222,7 @@ add_dependency(dir: string, source: string, fetching: Fetching, say: string -> u
     else
         version = latest_version(fetching, repository)?
     // Fetch it alone first: the name it gives itself is what the manifest lists it under.
-    var fetcher = Resolver(fetching, None, buf(), buf(), buf(), buf(), false, false, buf())
+    var fetcher = Resolver(fetching, None, buf(), buf(), buf(), buf(), false, false, buf(), buf(), buf())
     var fetched = ""
     var shown = s"v$version"
     val within = if member == "" then "" else s", member = \"$member\""
@@ -1116,6 +1265,12 @@ add_dependency(dir: string, source: string, fetching: Fetching, say: string -> u
         val t = target match
             Some(t) -> t
             None -> return Err(s"avin: ${m.dir}/$ManifestName: cannot find where `${d.label}` is written")
+        // What the entry asks of the package's features stays as written; only where it comes from changes.
+        var kept = ""
+        for g in t.fields()
+            if g.key == "optional" || g.key == "features" || g.key == "default_features"
+                kept = kept + s", ${g.key} = " + text[g.value.span.start..<g.value.span.end]
+        if kept != "" then entry = entry[0..<entry.bytes.len - 2] + kept + " }"
         edited = text[0..<t.span.start] + entry + text[t.span.end..]
     elif block is Some(b)
         edited = insert_entry(text, b.span, s"$label $entry")?
@@ -1126,7 +1281,7 @@ add_dependency(dir: string, source: string, fetching: Fetching, say: string -> u
         out.push(s"\ndependencies {\n  $label $entry\n}\n")
         edited = out.finish()
     write_text_atomic(file, edited).map_err(e -> s"avin: $file: ${e.to_string()}")?
-    val outcome = resolve_from(m.dir, fetching, false, false)
+    val outcome = resolve_from(m.dir, fetching, false, false, every_feature())
     if outcome is Err(message)
         write_text_atomic(file, text).map_err(e -> s"avin: $file: ${e.to_string()}")?
         return Err(message)
@@ -1224,11 +1379,16 @@ private origin_text(o: Origin) -> string = o match
 /** The program `path` names. A path at or under a package's directory is that package, compiled with
  * every package it depends on; any other directory is a program of many files, and a file a program
  * by itself. */
-load_program(path: string, fetching: Fetching) -> Result[LoadedProgram, string]
+load_program(path: string, fetching: Fetching) -> Result[LoadedProgram, string] = load_program_with(path, fetching, default_features())
+
+/** The program `path` names, as `load_program` reads it, a package with the features `choice` turns on. */
+load_program_with(path: string, fetching: Fetching, choice: FeatureChoice) -> Result[LoadedProgram, string]
     if enclosing_package(path)? is Some(dir)
         // The package's directory is named as it was given, when it was given.
         val root = if dir == absolute_path(path) then path else dir
-        return load_package(root, fetching)
+        return load_package_with(root, fetching, choice)
+    if choice.names.len() > 0
+        return Err(s"avin: `--features` names features of a package, and $path is in none")
     if is_dir(path)
         val files = program_files(path).map_err(message -> "avin: " + message)?
         if files.len() == 0 then return Err(s"avin: $path: no `.avin` or `.lavin` files in the program")
@@ -1239,21 +1399,44 @@ load_program(path: string, fetching: Fetching) -> Result[LoadedProgram, string]
 /** The package at `root` with every package it depends on: each dependency's modules first, then the
  * package's own files. The sum file gains a line for any package fetched for the first time. A module
  * two packages both hold is refused. */
-load_package(root: string, fetching: Fetching) -> Result[LoadedProgram, string]
-    val res = resolve(root, fetching, false)?
+load_package(root: string, fetching: Fetching) -> Result[LoadedProgram, string] = load_package_with(root, fetching, default_features())
+
+/** The package at `root` as `load_package` reads it, with the features `choice` turns on. A module a
+ * feature that is off lists is not read, and each file carries the imports its gate does not allow. */
+load_package_with(root: string, fetching: Fetching, choice: FeatureChoice) -> Result[LoadedProgram, string]
+    val res = resolve_with(root, fetching, false, choice)?
     record_sums(res)?
+    // Each package's files, read without the modules its features that are off list, then the modules
+    // each holds, which are what an import of an optional dependency is checked against.
+    var each: Buf[Buf[ProgramFile]] = buf()
+    var each_modules: Buf[Buf[string]] = buf()
+    for i in 0..<res.packages.len()
+        val p = res.packages[i]
+        val read = package_files_skipping(if i == 0 then root else p.dir, i > 0, gated_off(p.manifest.features, p.features)).map_err(message -> "avin: " + message)?
+        var names: Buf[string] = buf()
+        for f in read
+            val n = f.module_name.unwrap_or("")
+            if n != "" && !contains(names, n) then names.push(n)
+        each.push(read)
+        each_modules.push(names)
+    if each[0].len() == 0 then return Err(s"avin: $root: no `.avin` or `.lavin` files in the package")
     var files: Buf[ProgramFile] = buf()
     var owners: Buf[string] = buf()
-    for i in 1..<res.packages.len()
+    // Dependencies' modules first, then the package's own files.
+    for step in 0..<res.packages.len()
+        val i = if step + 1 == res.packages.len() then 0usize else step + 1
         val p = res.packages[i]
-        for f in package_files(p.dir, true).map_err(message -> "avin: " + message)?
-            files.push(f)
+        var optional_modules: Buf[Buf[string]] = buf()
+        for d in p.optional_dirs
+            var found: Buf[string] = buf()
+            for k in 0..<res.packages.len()
+                if res.packages[k].dir == d then found = each_modules[k]
+            optional_modules.push(found)
+        for f in each[i]
+            var file = f
+            file.fences = fences_of(p.manifest.features, f.module_name.unwrap_or(""), p.optional, optional_modules)
+            files.push(file)
             owners.push(p.name)
-    val own = package_files(root, false).map_err(message -> "avin: " + message)?
-    for f in own
-        files.push(f)
-        owners.push(res.packages[0].name)
-    if own.len() == 0 then return Err(s"avin: $root: no `.avin` or `.lavin` files in the package")
     var modules: Buf[string] = buf()
     var holders: Buf[string] = buf()
     for i in 0..<files.len()
@@ -1270,12 +1453,13 @@ load_package(root: string, fetching: Fetching) -> Result[LoadedProgram, string]
     Ok(LoadedProgram(root, files, Some(res.packages[0].name), sysl))
 
 /** The files of the program tree at `root` as `program_files` finds them, or, when `root` holds a
- * manifest, of the package and its dependencies without fetching any: what the language server reads. */
+ * manifest, of the package with every feature on and its dependencies without fetching any: what the
+ * language server reads. */
 program_tree_files(root: string) -> Result[Buf[ProgramFile], string]
     if !exists(root + "/" + ManifestName) then return program_files(root)
     val fetching = default_fetching()
     val offline = Fetching(fetching.cache, fetching.base, false)
-    load_package(root, offline) match
+    load_package_with(root, offline, every_feature()) match
         Ok(p) -> Ok(p.files)
         Err(message) -> Err(message.trim())
 
