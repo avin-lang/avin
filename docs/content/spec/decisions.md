@@ -569,6 +569,11 @@ Settled by the user on 2026-11-04:
   is the same type; `Seq[string]` and `Array[string]` are errors), it has no default, and any other
   parameter list is an error naming the two forms. The result rules are unchanged. A program built
   for its tests does not run `main`, so tests see no arguments.
+- `[]T` in a type position means exactly `Vector[T]`: `xs: []int`, `[][]int`, `Option[[]string]`,
+  `main(args: []string)`. Its element is a name or a parenthesized type, so `[]int -> int` is a
+  function from a vector and `[](int -> int)` a vector of functions. A type pattern takes it
+  without parentheses, `v: []int -> body`. There is no fixed-length `[N]T` (an error); error
+  messages print `Vector[int]`.
 
 **Deferred**
 

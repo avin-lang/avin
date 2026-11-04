@@ -25,6 +25,9 @@ Iterable[+A]                 iterator(), and the operation families below
 └── Map[K, +V]               immutable; HashMap, TreeMap
 ```
 
+`[]T` is shorthand for `Vector[T]` in any type position (`xs: []int`, `[][]int`); see
+[types](/spec/types/).
+
 The mutable `Set` and `Map` variants live in `avin.collections.mutable`. `Buffer` is the one
 growable mutable sequence; code that adds and removes at both ends uses a `Deque`.
 

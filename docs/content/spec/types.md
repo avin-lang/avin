@@ -170,6 +170,16 @@ wherever that function type is expected.
 
 There is no arity limit.
 
+## Vector types
+
+`[]T` is another way to write `Vector[T]`: the same type, in any position a type may stand.
+`xs: []int`, `[][]int` (a `Vector[Vector[int]]`), `Option[[]string]` and `([]int, string)` all work,
+and a program's entry point may be `main(args: []string)`. The element is a name or a parenthesized
+type, so `[]int -> int` is a function taking a vector, `([]int) -> int`, and `[](int -> int)` is a
+vector of functions. A type pattern in a `match` arm takes the form without parentheses,
+`v: []int -> body`. There is no fixed-length `[N]T`; `[3]int` is an error, and `Array[T]` is the
+fixed-length contiguous collection. Compiler messages print the type as `Vector[int]`.
+
 ## Any and Nothing
 
 `Any` is the top type. Every reference type is a subtype of `Any`. A value type (built-ins, tuples,
