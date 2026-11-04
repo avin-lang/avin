@@ -648,9 +648,11 @@ for (name, age) in people
 
 A comprehension is `for`, one or more generators separated by commas, and `yield` with the value
 to collect, on the rest of the line or in an indented block. A generator is `pattern in source`,
-and any number of guards, `if condition`, may follow it. When the generators do not fit on one line
-they go one to a line in an indented block after `for`, a line starting with `if` adding a guard to
-the generator above it, and `yield` starts the line after the block. `yield` is a keyword.
+and any number of guards, `if condition`, may follow it. Between the generators, and after the last,
+come value definitions, `pattern = value`, each with guards of its own. When the generators do not
+fit on one line they go one to a line in an indented block after `for`, a line starting with `if`
+adding a guard to the generator or definition above it, and `yield` starts the line after the block.
+`yield` is a keyword.
 
 ```text
 val pairs = for x in xs, y in ys if x < y yield (x, y)
@@ -659,9 +661,10 @@ val grid = for
     row in 0 ..< height
     if row % 2 == 0
     col in 0 ..< width
-yield
-    val cell = row * width + col
-    cell * cell
+    cell = row * width + col
+yield cell * cell
+
+val priced = for item in order, (name, cost) = lookup(item) if cost > 0 yield s"$name: $cost"
 ```
 
 The last generator's source is called with `map` and the yielded value, every earlier one with
@@ -673,12 +676,39 @@ for x in xs if p(x), y in ys yield f(x, y)
 xs.withFilter(x -> p(x)).flatMap(x -> ys.map(y -> f(x, y)))
 ```
 
+A value definition is evaluated once for each element that reaches it and binds by its pattern,
+which matches every value as a `val`'s does, in its guards, the later generators and definitions,
+and the yielded value. Definitions that no guard follows are bound beside the element in the
+function passed to its generator's source, as `val`s are in a block:
+
+```text
+for x in xs, y = f(x), z in g(y) yield h(z)
+xs.flatMap(x ->
+    val y = f(x)
+    g(y).map(z -> h(z)))
+```
+
+A guard after a definition has to see its value before the element goes on, so the definition, and
+every one before it after the same generator, pairs each element with its value through `map`, and
+the guard and everything after it take the pair apart. On a collection `map` makes a collection, so
+such a definition is evaluated for every element before its guard tests any:
+
+```text
+for x in xs, y = f(x) if p(y) yield h(y)
+xs.map(x -> (x, f(x))).withFilter(pair -> p(pair.1)).map(pair -> h(pair.1))
+```
+
+A definition binds in its generator's scope, as a `val` does in a block: it may not bind a name the
+generator or an earlier definition after it binds, though a later generator may bind any name again.
+A comprehension starts with a generator.
+
 The calls are checked as if written out, so the first source decides the result's type: `map` and
 `flatMap` on a `List` give a `List`, on a `Vector`, an `Array`, a `Buffer` or a `Deque` that collection, on a
 `Set` a `Set`, on an `Option` an `Option`, and on a `Range`, which holds only a progression, or any
 other `Seq`, a sequence of the program's own among them, a `Vector`, through the
 [methods every Seq has](#methods-every-seq-has). A `Map`'s elements are its entries as `(key, value)` pairs, and a comprehension over one
-yields pairs and makes a `Map`. `flatMap` on the library's collections takes any `Iterable` from its
+yields pairs and makes a `Map`. Over a mutable `Set` or `Map` the result is a new mutable set or map,
+as over an `Array`, a `Buffer` or a `Deque` it is a new one of those, and the source is unchanged. `flatMap` on the library's collections takes any `Iterable` from its
 function, so a later generator may draw from another kind of collection than the first; an
 `Option`'s `flatMap` takes an `Option`. A type of the program's own works in a comprehension by
 having the methods it calls: `map` for one generator, `flatMap` for more, and `withFilter` for a
@@ -695,6 +725,7 @@ guard that prints shows its output interleaved with the yielded values', not all
 Each generator binds by its pattern, as a `for` loop does: a name, `_`, a tuple or a variant pattern
 that every element matches; a pattern some elements would not match is an error, not a filter. The
 bindings are visible to the generator's guards and to everything after it, and each element is a
-new binding. A guard is a `bool`. The guards and the yielded value are functions passed to the
-sources' methods, so `return`, `break`, `continue` and `?` cannot leave them, though a loop inside
-the yielded block may be left as usual. A `for` without `yield` has one generator and no guards.
+new binding. A guard is a `bool`. The guards, the value definitions and the yielded value are
+functions passed to the sources' methods, so `return`, `break`, `continue` and `?` cannot leave
+them, though a loop inside the yielded block may be left as usual. A `for` without `yield` has one
+generator, no guards and no value definitions.
