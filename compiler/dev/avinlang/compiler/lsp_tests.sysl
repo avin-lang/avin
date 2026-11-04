@@ -1,0 +1,443 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.{Span, source_of}
+import sysl.buf.{Buf, buf}
+import sysl.encoding.json.{parse as parse_json, quoted as json_quote}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.io.{bytes_reader, bytes_writer, Reader}
+import sysl.text.from_utf8_lossy
+import sysl.time.{monotonic, whole_millis}
+
+// `avin lsp`: the framing, the lifecycle, and scripted exchanges with the server, each answer
+// compared whole.
+
+// ---- framing ----
+
+@test("lsp: messages are read off a stream by Content-Length, a header name in any case")
+lsp_framing_reads_messages()
+    val wire = lsp_frame("{\"a\":1}") + "content-length: 2\r\nContent-Type: x\r\n\r\n[]"
+    var r = bytes_reader(wire.bytes)
+    var pending: Buf[u8] = buf()
+    assert_eq(lsp_test_read(&r, &pending), "{\"a\":1}")
+    assert_eq(lsp_test_read(&r, &pending), "[]")
+    assert_eq(lsp_test_read(&r, &pending), "<end>")
+
+private lsp_test_read(r: *Reader, pending: *Buf[u8]) -> string = lsp_read(r, pending) match
+    Ok(Some(body)) -> body
+    Ok(None) -> "<end>"
+    Err(why) -> s"<error: $why>"
+
+@test("lsp: a message cut short, one with no length and one with a bad length are refused")
+lsp_framing_refusals()
+    var pending: Buf[u8] = buf()
+    var short = bytes_reader("Content-Length: 10\r\n\r\n{}".bytes)
+    assert_eq(lsp_test_read(&short, &pending), "<error: the input ended inside a message>")
+    pending = buf()
+    var no_length = bytes_reader("X: 1\r\n\r\n{}".bytes)
+    assert_eq(lsp_test_read(&no_length, &pending), "<error: a message with no Content-Length header>")
+    pending = buf()
+    var bad_length = bytes_reader("Content-Length: ten\r\n\r\n{}".bytes)
+    assert_eq(lsp_test_read(&bad_length, &pending), "<error: 'Content-Length: ten' is not a length>")
+    pending = buf()
+    var cut_header = bytes_reader("Content-Length: 2\r\n".bytes)
+    assert_eq(lsp_test_read(&cut_header, &pending), "<error: the input ended inside a message's header>")
+
+@test("lsp: the server reads framed messages and answers framed, ending with exit's status")
+lsp_serves_a_stream()
+    val wire = lsp_frame(lsp_request(1, "initialize", "{}")) + lsp_frame(lsp_request(2, "shutdown", "null")) +
+        lsp_frame(lsp_notify("exit", "{}"))
+    var r = bytes_reader(wire.bytes)
+    var w = bytes_writer()
+    val code = lsp_serve(&r, &w, repository_toolchain(), _ -> ())
+    assert_eq(code, 0)
+    val written = from_utf8_lossy(w.view())
+    assert(written.starts_with("Content-Length: "))
+    assert(written.ends_with(lsp_frame("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}")))
+
+@test("lsp: input that ends without exit, or breaks its framing, ends the server with status 1")
+lsp_serve_failures()
+    var noted = ""
+    var ended = bytes_reader(lsp_frame(lsp_request(1, "initialize", "{}")).bytes)
+    var w = bytes_writer()
+    assert_eq(lsp_serve(&ended, &w, repository_toolchain(), s -> noted = noted + s), 1)
+    assert_eq(noted, "")
+    var broken = bytes_reader("Content-Length: x\r\n\r\n{}".bytes)
+    assert_eq(lsp_serve(&broken, &w, repository_toolchain(), s -> noted = noted + s), 1)
+    assert_eq(noted, "avin lsp: 'Content-Length: x' is not a length")
+
+@test("lsp: avin lsp takes only --stdio")
+lsp_command_line()
+    var noted = ""
+    assert_eq(run_cli(["avin", "lsp", "--tcp"], Some(repository_toolchain()), _ -> (), s -> noted = noted + s), 2)
+    assert_eq(noted, "usage: avin lsp [--stdio]")
+
+// ---- the protocol ----
+
+private lsp_request(id: int, method: string, params: string) -> string =
+    s"{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"$method\",\"params\":$params}"
+
+private lsp_notify(method: string, params: string) -> string =
+    s"{\"jsonrpc\":\"2.0\",\"method\":\"$method\",\"params\":$params}"
+
+private lsp_test_at(uri: string, line: int, character: int) -> string =
+    s"{\"textDocument\":{\"uri\":\"$uri\"},\"position\":{\"line\":$line,\"character\":$character}}"
+
+private lsp_open(uri: string, text: string) -> string =
+    lsp_notify("textDocument/didOpen", s"{\"textDocument\":{\"uri\":\"$uri\",\"languageId\":\"avin\",\"version\":1,\"text\":${json_quote(text)}}}")
+
+private lsp_change(uri: string, text: string) -> string =
+    lsp_notify("textDocument/didChange", s"{\"textDocument\":{\"uri\":\"$uri\",\"version\":2},\"contentChanges\":[{\"text\":${json_quote(text)}}]}")
+
+// A server past `initialize`.
+private lsp_ready() -> LspServer
+    var server = lsp_server(repository_toolchain())
+    lsp_answer(&server, lsp_request(1, "initialize", "{\"capabilities\":{}}"))
+    lsp_answer(&server, lsp_notify("initialized", "{}"))
+    server
+
+// The one message an exchange answered with.
+private lsp_one(server: *LspServer, body: string) -> string
+    val out = lsp_answer(server, body)
+    assert_eq(out.len(), 1)
+    out[0]
+
+private lsp_publish_of(uri: string, diagnostics: string) -> string =
+    s"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"$uri\",\"diagnostics\":[$diagnostics]}}"
+
+private lsp_test_range(l0: int, c0: int, l1: int, c1: int) -> string =
+    s"{\"start\":{\"line\":$l0,\"character\":$c0},\"end\":{\"line\":$l1,\"character\":$c1}}"
+
+private lsp_error_of(l0: int, c0: int, l1: int, c1: int, message: string) -> string =
+    s"{\"range\":${lsp_test_range(l0, c0, l1, c1)},\"severity\":1,\"source\":\"avin\",\"message\":${json_quote(message)}}"
+
+private lsp_reply(id: int, result: string) -> string = s"{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":$result}"
+
+private lsp_hover_of(id: int, code: string, doc: string, l0: int, c0: int, l1: int, c1: int) -> string
+    val value = if doc == "" then s"```avin\n$code\n```" else s"```avin\n$code\n```\n\n$doc"
+    lsp_reply(id, s"{\"contents\":{\"kind\":\"markdown\",\"value\":${json_quote(value)}},\"range\":${lsp_test_range(l0, c0, l1, c1)}}")
+
+private lsp_location_of(id: int, uri: string, l0: int, c0: int, l1: int, c1: int) -> string =
+    lsp_reply(id, s"{\"uri\":\"$uri\",\"range\":${lsp_test_range(l0, c0, l1, c1)}}")
+
+@test("lsp: initialize answers exactly the capabilities the server has")
+lsp_initialize()
+    var server = lsp_server(repository_toolchain())
+    assert_eq(lsp_one(&server, lsp_request(1, "initialize", "{\"capabilities\":{}}")),
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-16\"," +
+        "\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":true},\"hoverProvider\":true," +
+        "\"definitionProvider\":true,\"documentSymbolProvider\":true}," +
+        s"\"serverInfo\":{\"name\":\"avin\",\"version\":\"$Version\"}}}")
+    assert_eq(lsp_answer(&server, lsp_notify("initialized", "{}")).len(), 0)
+
+@test("lsp: a message that is not JSON, or names no method, is answered with an error")
+lsp_malformed_message()
+    var server = lsp_ready()
+    val answer = lsp_one(&server, "{oops")
+    assert(answer.starts_with("{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"the message is not JSON: "))
+    assert_eq(lsp_one(&server, "{\"jsonrpc\":\"2.0\",\"id\":4}"),
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"error\":{\"code\":-32600,\"message\":\"a request names a method\"}}")
+    assert_eq(lsp_answer(&server, "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":null}").len(), 0)
+
+@test("lsp: the lifecycle -- before initialize, an unknown method, after shutdown, and exit")
+lsp_lifecycle()
+    var server = lsp_server(repository_toolchain())
+    assert_eq(lsp_one(&server, lsp_request(0, "textDocument/hover", "{}")),
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32002,\"message\":\"'textDocument/hover' before 'initialize'\"}}")
+    lsp_answer(&server, lsp_request(1, "initialize", "{}"))
+    assert_eq(lsp_one(&server, lsp_request(2, "no/such", "{}")),
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32601,\"message\":\"'no/such' is not a method avin lsp answers\"}}")
+    assert_eq(lsp_answer(&server, lsp_notify("no/such", "{}")).len(), 0)
+    assert_eq(lsp_one(&server, lsp_request(3, "shutdown", "null")), lsp_reply(3, "null"))
+    assert_eq(lsp_one(&server, lsp_request(4, "textDocument/hover", "{}")),
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"error\":{\"code\":-32600,\"message\":\"'textDocument/hover' after 'shutdown'\"}}")
+    assert(server.exit_code is None)
+    lsp_answer(&server, lsp_notify("exit", "{}"))
+    assert_eq(server.exit_code.unwrap_or(-1), 0)
+    var abrupt = lsp_ready()
+    lsp_answer(&abrupt, lsp_notify("exit", "{}"))
+    assert_eq(abrupt.exit_code.unwrap_or(-1), 1)
+
+// ---- positions and paths ----
+
+@test("lsp: positions count UTF-16 units, a character outside the BMP as two")
+lsp_positions_are_utf16()
+    val src = source_of("t.avin", "ab\n\"😀é\" x\n")
+    // `x` is byte 12 of the text, the 10th byte, 5th character and 7th UTF-16 unit of its line.
+    assert_eq(lsp_position(src, 12).to_string(), "{\"line\":1,\"character\":6}")
+    assert_eq(lsp_offset(src, 1, 6), 12usize)
+    assert_eq(lsp_offset(src, 1, 99), 13usize)
+    assert_eq(lsp_offset(src, 9, 0), 14usize)
+    assert_eq(lsp_range(src, Span(12, 13)).to_string(), lsp_test_range(1, 6, 1, 7))
+
+@test("lsp: URIs and paths convert both ways, escapes and spellings of one path agreeing")
+lsp_uris()
+    assert_eq(lsp_file_uri("/a b/é.avin"), "file:///a%20b/%C3%A9.avin")
+    assert_eq(lsp_uri_file("file:///a%20b/%C3%A9.avin"), "/a b/é.avin")
+    assert_eq(lsp_uri_file("file:///x//y/./z/../w.avin"), "/x/y/w.avin")
+    assert_eq(lsp_normal("/r/compiler/../library"), "/r/library")
+
+@test("lsp: a file is in the program its header and its directory say")
+lsp_programs()
+    val dir = make_temp_dir("avin-lsp").unwrap()
+    make_dir_all(dir + "/app/geo").unwrap()
+    write_text(dir + "/app/geo/shapes.avin", "module geo\n").unwrap()
+    write_text(dir + "/app/main.avin", "main() = ()\n").unwrap()
+    make_dir_all(dir + "/solo").unwrap()
+    write_text(dir + "/solo/alone.avin", "main() = ()\n").unwrap()
+    val lib = "/r/library"
+    val in_module = lsp_program(lib, dir + "/app/geo/shapes.avin", "geo")
+    assert_eq(in_module.root, dir + "/app")
+    assert(in_module.directory)
+    val at_root = lsp_program(lib, dir + "/app/main.avin", "")
+    assert_eq(at_root.root, dir + "/app")
+    assert(at_root.directory)
+    val alone = lsp_program(lib, dir + "/solo/alone.avin", "")
+    assert_eq(alone.root, dir + "/solo/alone.avin")
+    assert(!alone.directory)
+    val misplaced = lsp_program(lib, dir + "/solo/alone.avin", "geo")
+    assert(!misplaced.directory)
+    val library = lsp_program(lib, "/r/library/avin/option.avin", "avin")
+    assert(library.library)
+    assert_eq(library.root, lib)
+    remove_dir_all(dir).unwrap_or(())
+
+// ---- diagnostics ----
+
+@test("lsp: a syntax error is published where it is, and a fix clears it")
+lsp_syntax_error()
+    val dir = make_temp_dir("avin-lsp").unwrap()
+    val uri = lsp_file_uri(lsp_normal(dir + "/t.avin"))
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(uri, "main()\n    val = 3\n")),
+        lsp_publish_of(uri, lsp_error_of(1, 8, 1, 9, "expected a name\nfound `=`")))
+    assert_eq(lsp_one(&server, lsp_change(uri, "main()\n    val x = 3\n")), lsp_publish_of(uri, ""))
+    assert_eq(lsp_one(&server, lsp_notify("textDocument/didClose", s"{\"textDocument\":{\"uri\":\"$uri\"}}")),
+        lsp_publish_of(uri, ""))
+    remove_dir_all(dir).unwrap_or(())
+
+@test("lsp: a type error is published in UTF-16 units, and a fix clears it")
+lsp_type_error()
+    val dir = make_temp_dir("avin-lsp").unwrap()
+    val uri = lsp_file_uri(lsp_normal(dir + "/t.avin"))
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(uri, "main()\n    val x: (string, int) = (\"😀é\", \"a\")\n")),
+        lsp_publish_of(uri, lsp_error_of(1, 27, 1, 39,"expected (string, int), found (string, string)")))
+    assert_eq(lsp_one(&server, lsp_change(uri, "main()\n    val x: int = 1\n")), lsp_publish_of(uri, ""))
+    remove_dir_all(dir).unwrap_or(())
+
+@test("lsp: a mistake in another file of the program is published for that file, and cleared")
+lsp_diagnostics_across_files()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    make_dir_all(dir + "/geo").unwrap()
+    write_text(dir + "/geo/shapes.avin", "module geo\n\narea(w: int, h: int) -> int = w * h\n").unwrap()
+    val main_uri = lsp_file_uri(dir + "/main.avin")
+    val geo_uri = lsp_file_uri(dir + "/geo/shapes.avin")
+    write_text(dir + "/main.avin", "").unwrap()
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(main_uri, "import geo.{area}\n\nmain()\n    print(area(2, 3))\n")), lsp_publish_of(main_uri, ""))
+    val out = lsp_answer(&server, lsp_open(geo_uri, "module geo\n\narea(w: int, h: int) -> int = w * \"h\"\n"))
+    assert_eq(out.len(), 1)
+    assert(out[0].starts_with(s"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"$geo_uri\",\"diagnostics\":[{\"range\":${lsp_test_range(2, 30, 2, 37)}"))
+    assert_eq(lsp_one(&server, lsp_change(geo_uri, "module geo\n\narea(w: int, h: int) -> int = w * h\n")), lsp_publish_of(geo_uri, ""))
+    remove_dir_all(dir).unwrap_or(())
+
+// ---- hover, definition, outline ----
+
+// The program the hover and definition exchanges read. Line 9 holds a character outside the BMP
+// before the names it is asked about, so a column counted in bytes or in characters would miss.
+private lsp_program_text() -> string =
+    "// A point on the plane.\n" +
+    "class Point(val x: int, val y: int)\n" +
+    "    // The distance from the origin, squared.\n" +
+    "    norm() -> int = x * x + y * y\n" +
+    "\n" +
+    "double(n: int) -> int = n * 2\n" +
+    "\n" +
+    "main()\n" +
+    "    val p = Point(3, 4)\n" +
+    "    val t = (\"😀é\", double(p.norm()))\n" +
+    "    print(p.x)\n" +
+    "    val v: Vector[int] = [1, 2]\n"
+
+private struct Opened
+    dir: string
+    uri: string
+    server: LspServer
+
+private lsp_opened() -> Opened
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    val uri = lsp_file_uri(dir + "/t.avin")
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(uri, lsp_program_text())), lsp_publish_of(uri, ""))
+    Opened(dir, uri, server)
+
+@test("lsp: hover shows a local's type, a function's and a method's signature, and their comments")
+lsp_hover()
+    var o = lsp_opened()
+    val uri = o.uri
+    assert_eq(lsp_one(&o.server, lsp_request(2, "textDocument/hover", lsp_test_at(uri, 9, 21))),
+        lsp_hover_of(2, "double(n: int) -> int", "", 9, 20, 9, 26))
+    assert_eq(lsp_one(&o.server, lsp_request(3, "textDocument/hover", lsp_test_at(uri, 9, 30))),
+        lsp_hover_of(3, "Point.norm() -> int", "The distance from the origin, squared.", 9, 29, 9, 33))
+    assert_eq(lsp_one(&o.server, lsp_request(4, "textDocument/hover", lsp_test_at(uri, 9, 27))),
+        lsp_hover_of(4, "val p: Point", "", 9, 27, 9, 28))
+    assert_eq(lsp_one(&o.server, lsp_request(5, "textDocument/hover", lsp_test_at(uri, 8, 14))),
+        lsp_hover_of(5, "class Point(val x: int, val y: int)", "A point on the plane.", 8, 12, 8, 17))
+    assert_eq(lsp_one(&o.server, lsp_request(6, "textDocument/hover", lsp_test_at(uri, 10, 12))),
+        lsp_hover_of(6, "val x: int", "", 10, 12, 10, 13))
+    // The cursor just past a name is on it, and on a parameter where it is declared.
+    assert_eq(lsp_one(&o.server, lsp_request(7, "textDocument/hover", lsp_test_at(uri, 5, 8))),
+        lsp_hover_of(7, "n: int", "", 5, 7, 5, 8))
+    assert_eq(lsp_one(&o.server, lsp_request(8, "textDocument/hover", lsp_test_at(uri, 4, 0))), lsp_reply(8, "null"))
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: hover on a library type shows its declaration and its comment")
+lsp_hover_library()
+    var o = lsp_opened()
+    val answer = lsp_one(&o.server, lsp_request(2, "textDocument/hover", lsp_test_at(o.uri, 11, 12)))
+    val value = parse_json(answer).unwrap().get("result").unwrap().get("contents").unwrap().get("value").unwrap().as_str().unwrap()
+    assert(value.starts_with("```avin\nabstract class Vector[+T]: Seq[T]\n```\n\nAn immutable indexed sequence, and the default one: `[1, 2, 3]` is a `Vector[int]`. Its elements\nare in a tree"))
+    assert(value.ends_with("\ndepth. Versions of a vector share every array they have in common."))
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: definition goes to a function, a method, a field, a local and a class in the same file")
+lsp_definition_same_file()
+    var o = lsp_opened()
+    val uri = o.uri
+    assert_eq(lsp_one(&o.server, lsp_request(2, "textDocument/definition", lsp_test_at(uri, 9, 22))),
+        lsp_location_of(2, uri, 5, 0, 5, 6))
+    assert_eq(lsp_one(&o.server, lsp_request(3, "textDocument/definition", lsp_test_at(uri, 9, 31))),
+        lsp_location_of(3, uri, 3, 4, 3, 8))
+    assert_eq(lsp_one(&o.server, lsp_request(4, "textDocument/definition", lsp_test_at(uri, 10, 12))),
+        lsp_location_of(4, uri, 1, 16, 1, 17))
+    assert_eq(lsp_one(&o.server, lsp_request(5, "textDocument/definition", lsp_test_at(uri, 9, 27))),
+        lsp_location_of(5, uri, 8, 8, 8, 9))
+    assert_eq(lsp_one(&o.server, lsp_request(6, "textDocument/definition", lsp_test_at(uri, 8, 12))),
+        lsp_location_of(6, uri, 1, 6, 1, 11))
+    // A field read inside the class reaches the parameter that declares it.
+    assert_eq(lsp_one(&o.server, lsp_request(7, "textDocument/definition", lsp_test_at(uri, 3, 20))),
+        lsp_location_of(7, uri, 1, 16, 1, 17))
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: definition goes into the library")
+lsp_definition_into_the_library()
+    var o = lsp_opened()
+    val file = lsp_normal(repository_toolchain().library_dir() + "/avin/vector.avin")
+    val text = read_text(file).unwrap()
+    var line = 0
+    for l in text.split("\n")
+        if l.starts_with("abstract class Vector[") then break
+        line += 1
+    assert_eq(lsp_one(&o.server, lsp_request(2, "textDocument/definition", lsp_test_at(o.uri, 11, 12))),
+        lsp_location_of(2, lsp_file_uri(file), line, 15, line, 21))
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: definition goes to another module, from a use and from the import")
+lsp_definition_across_modules()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    make_dir_all(dir + "/geo").unwrap()
+    write_text(dir + "/geo/shapes.avin", "module geo\n\n// The area of a rectangle.\narea(w: int, h: int) -> int = w * h\n").unwrap()
+    val text = "import geo.{area}\n\nmain()\n    print(area(2, 3))\n"
+    write_text(dir + "/main.avin", text).unwrap()
+    val uri = lsp_file_uri(dir + "/main.avin")
+    val geo_uri = lsp_file_uri(dir + "/geo/shapes.avin")
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(uri, text)), lsp_publish_of(uri, ""))
+    assert_eq(lsp_one(&server, lsp_request(2, "textDocument/definition", lsp_test_at(uri, 3, 11))),
+        lsp_location_of(2, geo_uri, 3, 0, 3, 4))
+    assert_eq(lsp_one(&server, lsp_request(3, "textDocument/definition", lsp_test_at(uri, 0, 13))),
+        lsp_location_of(3, geo_uri, 3, 0, 3, 4))
+    assert_eq(lsp_one(&server, lsp_request(4, "textDocument/hover", lsp_test_at(uri, 3, 11))),
+        lsp_hover_of(4, "area(w: int, h: int) -> int", "The area of a rectangle.", 3, 10, 3, 14))
+    remove_dir_all(dir).unwrap_or(())
+
+@test("lsp: the outline lists a document's declarations with their members")
+lsp_document_symbols()
+    var o = lsp_opened()
+    val answer = lsp_one(&o.server, lsp_request(2, "textDocument/documentSymbol", s"{\"textDocument\":{\"uri\":\"${o.uri}\"}}"))
+    val x = s"{\"name\":\"x\",\"kind\":8,\"range\":${lsp_test_range(1, 12, 1, 22)},\"selectionRange\":${lsp_test_range(1, 16, 1, 17)}}"
+    val y = s"{\"name\":\"y\",\"kind\":8,\"range\":${lsp_test_range(1, 24, 1, 34)},\"selectionRange\":${lsp_test_range(1, 28, 1, 29)}}"
+    val norm = s"{\"name\":\"norm\",\"kind\":6,\"range\":${lsp_test_range(3, 4, 3, 33)},\"selectionRange\":${lsp_test_range(3, 4, 3, 8)}}"
+    val point = s"{\"name\":\"Point\",\"kind\":5,\"range\":${lsp_test_range(1, 0, 3, 33)},\"selectionRange\":${lsp_test_range(1, 6, 1, 11)},\"children\":[$x,$y,$norm]}"
+    val double = s"{\"name\":\"double\",\"kind\":12,\"range\":${lsp_test_range(5, 0, 5, 29)},\"selectionRange\":${lsp_test_range(5, 0, 5, 6)}}"
+    val want = lsp_reply(2, s"[$point,$double,")
+    assert_eq(answer[0..<want.bytes.len - 1], want[0..<want.bytes.len - 1])
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: the outline lists data types with their variants, impls and module values")
+lsp_document_symbols_of_data()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    val uri = lsp_file_uri(dir + "/t.avin")
+    var server = lsp_ready()
+    lsp_answer(&server, lsp_open(uri, lsp_shapes_text()))
+    val answer = lsp_one(&server, lsp_request(2, "textDocument/documentSymbol", s"{\"textDocument\":{\"uri\":\"$uri\"}}"))
+    val circle = lsp_sym("Circle", 22, lsp_test_range(1, 4, 1, 18), lsp_test_range(1, 4, 1, 10), "")
+    val square = lsp_sym("Square", 22, lsp_test_range(2, 4, 2, 21), lsp_test_range(2, 4, 2, 10), "")
+    val shape = lsp_sym("Shape", 10, lsp_test_range(0, 0, 2, 21), lsp_test_range(0, 5, 0, 10), s"$circle,$square")
+    val area = lsp_sym("area", 6, lsp_test_range(5, 4, 7, 26), lsp_test_range(5, 4, 5, 8), "")
+    val added = lsp_sym("impl Shape", 3, lsp_test_range(4, 0, 7, 26), lsp_test_range(4, 5, 4, 10), area)
+    val limit = lsp_sym("limit", 14, lsp_test_range(9, 0, 9, 18), lsp_test_range(9, 4, 9, 9), "")
+    val count = lsp_sym("count", 13, lsp_test_range(10, 0, 10, 18), lsp_test_range(10, 4, 10, 9), "")
+    val main = lsp_sym("main", 12, lsp_test_range(12, 0, 14, 19), lsp_test_range(12, 0, 12, 4), "")
+    assert_eq(answer, lsp_reply(2, s"[$shape,$added,$limit,$count,$main]"))
+    remove_dir_all(dir).unwrap_or(())
+
+private lsp_shapes_text() -> string =
+    "data Shape\n    Circle(r: int)\n    Square(side: int)\n\nimpl Shape\n    area() -> int = self match\n" +
+    "        Circle(r) -> 3 * r * r\n        Square(s) -> s * s\n\nval limit: int = 1\nvar count: int = 0\n\n" +
+    "main()\n    val s: Shape = Circle(2)\n    print(s.area())\n"
+
+@test("lsp: definition and hover reach a data type, its variants in a construction and a pattern, and an impl's method")
+lsp_definition_of_data()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    val uri = lsp_file_uri(dir + "/t.avin")
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(uri, lsp_shapes_text())), lsp_publish_of(uri, ""))
+    assert_eq(lsp_one(&server, lsp_request(2, "textDocument/definition", lsp_test_at(uri, 13, 11))),
+        lsp_location_of(2, uri, 0, 5, 0, 10))
+    assert_eq(lsp_one(&server, lsp_request(3, "textDocument/definition", lsp_test_at(uri, 13, 20))),
+        lsp_location_of(3, uri, 1, 4, 1, 10))
+    assert_eq(lsp_one(&server, lsp_request(4, "textDocument/definition", lsp_test_at(uri, 6, 9))),
+        lsp_location_of(4, uri, 1, 4, 1, 10))
+    assert_eq(lsp_one(&server, lsp_request(5, "textDocument/definition", lsp_test_at(uri, 14, 13))),
+        lsp_location_of(5, uri, 5, 4, 5, 8))
+    assert_eq(lsp_one(&server, lsp_request(6, "textDocument/definition", lsp_test_at(uri, 6, 25))),
+        lsp_location_of(6, uri, 6, 15, 6, 16))
+    assert_eq(lsp_one(&server, lsp_request(7, "textDocument/hover", lsp_test_at(uri, 13, 20))),
+        lsp_hover_of(7, "Shape.Circle(r: int)", "", 13, 19, 13, 25))
+    assert_eq(lsp_one(&server, lsp_request(8, "textDocument/hover", lsp_test_at(uri, 13, 12))),
+        lsp_hover_of(8, "data Shape\n    Circle(r: int)\n    Square(side: int)", "", 13, 11, 13, 16))
+    assert_eq(lsp_one(&server, lsp_request(9, "textDocument/hover", lsp_test_at(uri, 6, 15))),
+        lsp_hover_of(9, "val r: int", "", 6, 15, 6, 16))
+    assert_eq(lsp_one(&server, lsp_request(10, "textDocument/hover", lsp_test_at(uri, 14, 13))),
+        lsp_hover_of(10, "Shape.area() -> int", "", 14, 12, 14, 16))
+    remove_dir_all(dir).unwrap_or(())
+
+private lsp_sym(name: string, kind: int, range: string, selection: string, children: string) -> string =
+    s"{\"name\":\"$name\",\"kind\":$kind,\"range\":$range,\"selectionRange\":$selection" +
+        (if children == "" then "}" else s",\"children\":[$children]}")
+
+@test("lsp: a library file opened is checked as the library, and its names are indexed")
+lsp_library_file()
+    val file = lsp_normal(repository_toolchain().library_dir() + "/avin/option.avin")
+    val uri = lsp_file_uri(file)
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(uri, read_text(file).unwrap())), lsp_publish_of(uri, ""))
+    // `data Option[+T]` is on line 3.
+    assert_eq(lsp_one(&server, lsp_request(2, "textDocument/definition", lsp_test_at(uri, 3, 6))),
+        lsp_location_of(2, uri, 3, 5, 3, 11))
+
+@test("lsp: analyzing again on a change takes a bounded time on the library and a large program")
+lsp_reanalysis_time()
+    val tc = repository_toolchain()
+    var server = lsp_ready()
+    val program = lsp_normal(tc.root + "/tests/run/vector_tree.avin")
+    val start = monotonic()
+    lsp_answer(&server, lsp_open(lsp_file_uri(program), read_text(program).unwrap()))
+    val first = whole_millis(monotonic() - start)
+    val again = monotonic()
+    lsp_answer(&server, lsp_change(lsp_file_uri(program), read_text(program).unwrap()))
+    val second = whole_millis(monotonic() - again)
+    print(s"lsp: vector_tree.avin analyzed in $first ms, again in $second ms")
+    assert(second < 20000)

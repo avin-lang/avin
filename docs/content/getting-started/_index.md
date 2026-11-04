@@ -100,6 +100,11 @@ sysl test compiler
 This runs the compiler's unit tests and every program in `tests/`, which are built and run at `-O0`
 and `-O2`.
 
+## Editors
+
+`avin lsp` is a language server for any editor with a Language Server Protocol client:
+[Editors](/getting-started/editors/) says what it answers.
+
 ## Documentation
 
 ```sh
