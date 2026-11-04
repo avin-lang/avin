@@ -305,6 +305,18 @@ a decision changes, this page and the chapter change together.
 - Settled 2026-11-03: an impl of a trait may bound the type's parameters further (`impl[T: Ord] Ord
   for Box[T]`), making the type conform only for type arguments meeting them; for now only on data
   types and traits that are only bounds.
+- Settled 2026-11-03: `derives` takes `Eq`, `Hash`, `Ord`, `Display` and `Debug`. A class derives
+  from its constructor parameters, plain, `val` and `var` alike, and not from fields its body
+  declares; a data type from each variant's fields. A class derives `Eq` and `Hash` together, and
+  `Ord` only with an `Eq` by the same fields, derived or its own; a data type has both already, so
+  deriving them there changes nothing. `Display` writes `Name(a, b)`, each field in its own `Display`
+  form, and a variant without fields as its name; `Debug` writes the same shape with each field's
+  `Debug`, so strings inside are quoted. A width pads the whole. Deriving a trait the type also
+  implements, or one a field's type does not implement, is an error naming the field. A generic data
+  type's derived `Ord` holds for the type arguments that are ordered; deriving `Display` or `Debug`
+  on a generic type, and `Ord` on a generic class, needs the parameters bounded by the trait where
+  the type declares them.
+- `x.equals(y)` and `x.hash()` may be called on a value of any type parameter, bounded or not.
 
 **Project and tooling**
 
