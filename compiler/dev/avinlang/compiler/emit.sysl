@@ -190,6 +190,9 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
     for b in 0..<f.blocks.len()
         out.push(s"b$b:\n")
         if b == 0
+            // The context's caller site, which calls into the core library set and calls out of it
+            // keep; offset 24 in the runtime's context.
+            if uses_caller_site(f) then out.push("  %caller.site = getelementptr inbounds i8, ptr %ctx, i64 24\n")
             if roots > 0
                 need(intrinsics, "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)")
                 out.push(s"  %frame = alloca $frame\n")
@@ -230,8 +233,23 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
                 // The runtime flushes the program's output, reports the site and stops.
                 need(intrinsics, "declare void @avin_rt_trap(ptr, ptr) noreturn cold")
                 out.push(s"  call void @avin_rt_trap(ptr %ctx, ptr @avin.trap.$site)\n  unreachable\n")
+            CallerTrap(site) ->
+                // The runtime reports the site's reason at the place the program entered the core
+                // library.
+                need(intrinsics, "declare void @avin_rt_caller_trap(ptr, ptr) noreturn cold")
+                out.push(s"  call void @avin_rt_caller_trap(ptr %ctx, ptr @avin.trap.$site)\n  unreachable\n")
             Unreachable -> out.push("  unreachable\n")
     out.push("}\n\n")
+
+// Whether any instruction of `f` reads or writes the context's caller site.
+private uses_caller_site(f: MirFunction) -> bool
+    for block in f.blocks
+        for inst in block.insts
+            inst match
+                Load(_, CallerSite) -> return true
+                Store(CallerSite, _) -> return true
+                _ -> ()
+    false
 
 // A safepoint poll: when a collection has asked the other threads to stop, the runtime parks this one
 // until the collection is over. Every reference the function holds is already in its frame, so the
@@ -741,6 +759,8 @@ private operand_type(program: MirProgram, f: MirFunction, a: Operand) -> MirType
     RecordAddress(_) -> MPtr
     DescriptorAddress(_) -> MPtr
     NullAddress -> MPtr
+    TrapSiteAddress(_) -> MPtr
+    CallerSite -> MPtr
 
 private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a match
     Value(id) -> s"%v$id"
@@ -756,6 +776,8 @@ private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a m
     RecordAddress(index) -> s"@avin.type.$index"
     DescriptorAddress(descriptor) -> s"@avin.desc.$descriptor"
     NullAddress -> "null"
+    TrapSiteAddress(site) -> s"@avin.trap.$site"
+    CallerSite -> "%caller.site"
 
 // A module-level value that holds a reference is a slot of the roots frame; any other is a global
 // of its own.
