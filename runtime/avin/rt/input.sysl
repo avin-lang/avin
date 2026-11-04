@@ -1,0 +1,81 @@
+module avin.rt
+
+import sysl.buf.{Buf, buf}
+import sysl.io.{Reader, fd_reader, find_byte}
+import sysl.slices.copy
+import sysl.text.from_utf8_lossy
+
+// Standard input, read as text. The runtime holds the one buffer every reader of it shares, so a
+// line, an iterator of lines and the rest of the input all take from the same place, and nothing read
+// ahead is lost between them.
+//
+// A line ends at `\n`, and a `\r` just before it goes with it; the last line of input needs no
+// terminator. Bytes that are not UTF-8 become U+FFFD, one for each maximal ill-formed run, as they are
+// turned into a string. A read that fails ends the input, as its end does.
+
+/** Bytes read and not yet taken: those of `input` from `input_at` on. */
+var input: Buf[u8] = buf()
+var input_at: usize = 0
+
+/** Whether standard input has ended: a read gave nothing, at its end or because it failed. */
+var input_done: bool = false
+
+/** How many bytes one read asks for. */
+const input_chunk: usize = 65536
+
+/** Reads more of standard input onto the end of `input`; false when there was no more. The bytes not
+ * yet taken are moved to the front first, so `input` holds at most the line being gathered and one
+ * read past it. */
+private read_more() -> bool
+    if input_done then return false
+    if input_at > 0
+        val kept = copy(input.view(), input.view()[input_at..])
+        input.truncate(kept)
+        input_at = 0
+    input.reserve(input_chunk)
+    var reader = fd_reader(0)
+    val got = reader.read(input.spare())
+    if got.len == 0
+        input_done = true
+        return false
+    input.set_len(input.len() + got.len)
+    true
+
+/** The bytes `b` as a new string, with ill-formed UTF-8 replaced. */
+private text_from(ctx: *Context, b: []const u8) -> *u8 = text_of(ctx, from_utf8_lossy(b))
+
+/** Whether standard input has nothing left to take, reading to find out when the buffer is empty. */
+@export("avin_rt_input_ended")
+input_ended(ctx: *Context) -> bool = input_at == input.len() && !read_more()
+
+/** The next line of standard input, without its terminator, as a new string. Past the end it is the
+ * empty string; the library asks only after `input_ended` has said there is more. */
+@export("avin_rt_read_line")
+read_line(ctx: *Context) -> *u8
+    // How far past `input_at` has been searched for a `\n` already, so a long line is scanned once.
+    var searched: usize = 0
+    while true
+        val have = input.view()[input_at..]
+        find_byte(have[searched..], 10) match
+            Some(i) ->
+                val until = searched + i
+                val trimmed = if until > 0 && have[until - 1] == 13 then until - 1 else until
+                val line = text_from(ctx, have[..<trimmed])
+                input_at += until + 1
+                return line
+            None -> searched = have.len
+        if !read_more()
+            val last = text_from(ctx, input.view()[input_at..])
+            input_at = input.len()
+            return last
+    text_from(ctx, input.view()[0..<0])
+
+/** Everything left on standard input, as a new string. */
+@export("avin_rt_read_rest")
+read_rest(ctx: *Context) -> *u8
+    var more = true
+    while more
+        more = read_more()
+    val rest = text_from(ctx, input.view()[input_at..])
+    input_at = input.len()
+    rest

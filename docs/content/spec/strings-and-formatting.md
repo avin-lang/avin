@@ -95,8 +95,9 @@ trait Debug
   field a spec describes, which is how most `display` methods end.
 - `toString()` renders into a `StringWriter`, a writer building a string, and returns its `text()`.
   `StandardOutput` is the writer for standard output; it writes an integer's digits without making
-  a string of them.
-- `print(x)` writes `x`'s `Display` form and a new line to standard output. `debug(x)` is `x`'s
+  a string of them. `StandardError` is the writer for standard error, which keeps no buffer.
+- `print(x)` writes `x`'s `Display` form and a new line to standard output; `eprint(x)` writes the
+  same to standard error, as one write, so a line is never split by another writer's. `debug(x)` is `x`'s
   `Debug` form as a string, so `print(debug(x))` prints it. Inside an implementation of `Debug`, the
   bare name `debug` is the method, and a part is written with `part.debug(out, spec)`.
 - The built-in types' `Debug` forms are their `Display` forms, except that a string and a `char`

@@ -3,8 +3,8 @@ module dev.avinlang.compiler
 
 import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
-import sysl.fs.{current_dir, entries, exists, is_dir, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
-import sysl.process.{Exited, Signalled, Var, capture}
+import sysl.fs.{create, current_dir, entries, exists, is_dir, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.{Exited, FromPath, Signalled, Stdio, ToFile, Var, capture, run}
 import sysl.text.from_utf8_unchecked
 
 // The execution corpus: Avin programs under `tests/` with their expected behaviour.
@@ -12,7 +12,8 @@ import sysl.text.from_utf8_unchecked
 // `tests/run/*.avin` must compile and, at -O0 and -O2, exit and print exactly as expected. A
 // program's leading comment says how it ends: `// expect: exit N`, or `// expect: trap` for a
 // program a trap stops; with neither, it exits 0. Its standard output and error are in `NAME.out`
-// and `NAME.err` beside it, when it writes any.
+// and `NAME.err` beside it, when it writes any. Its standard input is `NAME.in` beside it, and empty
+// when there is none, so no program reads the input of the test run.
 //
 // Every program runs with `AVIN_GC_STRESS=1`, so the collector runs at every allocation and a
 // reference the compiler failed to root is found at once. A `// env: NAME=VALUE` line sets a variable
@@ -94,6 +95,10 @@ private sidecar(base: string, suffix: string) -> string
     val other = base + suffix
     if exists(other) then read_text(other).unwrap_or("") else ""
 
+// What a program reads as standard input: the sidecar `base` + ".in", or nothing when there is none.
+private input_of(base: string) -> Stdio =
+    if exists(base + ".in") then FromPath(base + ".in") else FromPath("/dev/null")
+
 private without_extension(path: string) -> string = path[0..<path.bytes.len - ".avin".bytes.len]
 
 /** The programs in a directory of the repository. */
@@ -168,7 +173,7 @@ private run_case(tc: Toolchain, path: string, scratch: string) -> string
             env.push(v)
             if v.name == "AVIN_GC_STRESS" then stress = false
         if stress then env.push(Var("AVIN_GC_STRESS", "1"))
-        val run = capture(binary, args = want.args.view(), env = env.view(), stderr = true, timeout = 10000) match
+        val run = capture(binary, args = want.args.view(), env = env.view(), stderr = true, timeout = 10000, stdin = input_of(sidecar_base(path))) match
             Ok(r) -> r
             Err(e) ->
                 failures = failures + s"$path $level: did not run: ${e.to_string()}\n"
@@ -238,6 +243,48 @@ corpus_args_lines()
     assert(expectation("main() = 0\n").args.len() == 0)
     assert(split_args("").len() == 0)
     assert(split_args("   ").len() == 0)
+
+@test("a program's standard input is its .in sidecar, and empty when it has none")
+corpus_input_sidecars()
+    val dir = make_temp_dir("avin-corpus-in").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/fed.in", "text\n").unwrap()
+    input_of(dir + "/fed") match
+        FromPath(p) -> assert(p == dir + "/fed.in")
+        _ -> panic("a program with a .in sidecar reads it")
+    input_of(dir + "/unfed") match
+        FromPath(p) -> assert(p == "/dev/null")
+        _ -> panic("a program with no .in sidecar reads nothing")
+
+@test("standard input is read across reads: a \\r\\n split between two, and lines longer than one read")
+standard_input_spans_reads()
+    val tc = repository_toolchain()
+    val text = "import avin.io\n\nmain()\n    for line in io.lines() do print(s\"${line.byteLength()} ${line.endsWith(\"\\r\")} ${line.slice(0, 1)}\")\n"
+    val compiled = compile(tc, source_of("long_lines.avin", text))
+    if compiled.diagnostics != "" then panic(compiled.diagnostics)
+    val dir = make_temp_dir("avin-corpus-long").unwrap()
+    defer _ = remove_dir_all(dir)
+    link(tc, compiled.llvm.unwrap_or(""), compiled.archive, dir + "/long_lines", "-O2").unwrap()
+    // One read takes 65536 bytes, so the first line's `\r` ends the first read and its `\n` begins the
+    // second; the second line spans several reads.
+    write_text(dir + "/input", "a".repeat(65535) + "\r\n" + "b".repeat(200000) + "\n" + "end").unwrap()
+    val ran = capture(dir + "/long_lines", stdin = FromPath(dir + "/input"), timeout = 10000).unwrap()
+    assert(ran.status.ok())
+    assert(ran.text == "65535 false a\n200000 false b\n3 false e\n")
+
+@test("writing to standard error flushes standard output first, so the two streams interleave in order")
+standard_error_keeps_order()
+    val tc = repository_toolchain()
+    val text = "main()\n    print(\"one\")\n    eprint(\"two\")\n    print(\"three\")\n    StandardError.write(\"four\\n\")\n    print(\"five\")\n"
+    val compiled = compile(tc, source_of("ordered.avin", text))
+    if compiled.diagnostics != "" then panic(compiled.diagnostics)
+    val dir = make_temp_dir("avin-corpus-order").unwrap()
+    defer _ = remove_dir_all(dir)
+    link(tc, compiled.llvm.unwrap_or(""), compiled.archive, dir + "/ordered", "-O2").unwrap()
+    val both = create(dir + "/both.txt").unwrap()
+    val ended = run(dir + "/ordered", stdout = ToFile(both), stderr = ToFile(both), stdin = FromPath("/dev/null"), timeout = 10000).unwrap()
+    assert(ended.ok())
+    assert(read_text(dir + "/both.txt").unwrap() == "one\ntwo\nthree\nfour\nfive\n")
 
 private reject_all(tc: Toolchain, all: Buf[string]) -> string
     var failures = ""
