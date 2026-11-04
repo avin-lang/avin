@@ -46,6 +46,7 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
 | [Operators and control flow](/spec/operators-and-control-flow/) | Operators, blocks, `if`, `while`, `match` |
 | [Call-by-name](/spec/by-name/) | `value: -> T` parameters |
 | [Strings and formatting](/spec/strings-and-formatting/) | Interpolation and format specifiers |
+| [System library](/spec/system-library/) | Proposed: `avin.process` — arguments, environment, exit |
 | [Settled decisions](/spec/decisions/) | Every decision made so far, in one list |
 
 Syntax follows Sysl wherever Sysl has a form: indentation blocks, `name(params) -> T` functions,
