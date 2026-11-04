@@ -223,8 +223,10 @@ struct BodyState
     uses: Buf[CaptureUse]
     calls: Buf[LocalCall]
     early: Buf[EarlyCall]
+    /** The locals bound by `is` tests, which are in scope only where their test is known to hold. */
+    tested: Buf[usize]
 
-fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, 0, buf(), buf(), buf(), buf(), buf())
+fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, 0, buf(), buf(), buf(), buf(), buf(), buf())
 
 /** A class body checked part way: its initializer's body so far, the code checked so far, the next
  * member to check and the next field it declares. */
@@ -4093,7 +4095,7 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Return(value) -> return_expr(c, e, value)
     Propagate(value) -> propagate_expr(c, e, value)
     Match(subject, arms) -> match_expr(c, e, subject, arms, expected, used)
-    Is(value, pattern, negated) -> is_expr(c, e, value, pattern, negated)
+    Is(_, _, _) -> check_condition(c, e).expr
     Lambda(params, body) -> lambda_expr(c, e, params, body, expected, false)
     LocalFunction(decl) ->
         check_local_function(c, decl)
@@ -4155,6 +4157,7 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
     if variant_named(c, name) is Some(v)
         if c.data[v.data].variants[v.index].fields.len() == 0 then return construct(c, at, at, v, buf(), None, expected)
         c.note(symbol.unit, at, s"`$name` has fields; call it, as in `$name(…)`")
+    elif tested_named(c, name) then c.note(symbol.unit, at, s"`$name` is bound by an `is` test, and is in scope only where that test is known to hold")
     else c.note(symbol.unit, at, s"`$name` is not defined")
     TExpr(at, ErrorType, UnitConst)
 
@@ -4524,8 +4527,13 @@ private block_expr(c: *Checker, e: &Expr, items: Buf[&Expr], discard: bool, expe
     TExpr(e.span, ty, Block(typed))
 
 // Checks a branch of `if` or `while`, whose bindings are not visible after it.
-private branch(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -> &TExpr
+private branch(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -> &TExpr = tested_branch(c, e, buf(), expected, used)
+
+// Checks a branch that runs where a condition's outcome is known, with the names its `is` tests
+// bound for that outcome in scope.
+private tested_branch(c: *Checker, e: &Expr, names: Buf[usize], expected: Option[&Type], used: bool) -> &TExpr
     val mark = c.body.visible.len()
+    for x in names do c.body.visible.push(x)
     val t = check_value(c, e, expected, used)
     c.body.visible.truncate(mark)
     t
@@ -5168,10 +5176,7 @@ private expect_bool(c: *Checker, t: &TExpr)
     if !fits(c,t.ty, Bool) then c.note(unit_of(c), t.span, s"expected bool, found ${type_name(t.ty)}")
 
 private unary_expr(c: *Checker, e: &Expr, op: UnaryOp, operand: &Expr, expected: Option[&Type]) -> &TExpr
-    if op is Not
-        val x = check_expr(c, operand, Some(Bool))
-        expect_bool(c, x)
-        return TExpr(e.span, if *x.ty is Nothing then Nothing else Bool, Not(x))
+    if op is Not then return check_condition(c, e).expr
     if op is Negate && operand.kind is IntLit(spelling)
         return integer_literal(c, e.span, spelling, true, expected)
     val x = check_expr(c, operand, expected)
@@ -5197,13 +5202,7 @@ private unary_expr(c: *Checker, e: &Expr, op: UnaryOp, operand: &Expr, expected:
 // The operand that is not a bare literal is checked first, so a literal on either side takes the
 // other operand's type: in `1 + x` with `x: i8`, the `1` is an `i8`.
 private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Expr, op_span: Span, expected: Option[&Type]) -> &TExpr
-    if op is And || op is Or
-        val l = check_expr(c, left, Some(Bool))
-        val r = check_expr(c, right, Some(Bool))
-        expect_bool(c, l)
-        expect_bool(c, r)
-        // The right operand may not run, so only the left one decides that the operation never finishes.
-        return TExpr(e.span, if *l.ty is Nothing then Nothing else Bool, Logic(op is And, l, r))
+    if op is And || op is Or then return check_condition(c, e).expr
     if is_literal(left) && !is_literal(right)
         val r = check_expr(c, right, expected)
         return operate(c, e.span, op_span, op, binary_spelling(op), check_expr(c, left, Some(r.ty)), r)
@@ -5527,15 +5526,21 @@ private fits(c: *Checker, from: &Type, to: &Type) -> bool
     if has_unknowns(zonk(c, up)) || has_unknowns(zonk(c, to)) then unify(c, up, to) else false
 
 private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[&Expr], expected: Option[&Type], used: bool) -> &TExpr
-    val cond = check_expr(c, condition, Some(Bool))
+    val tested = check_condition(c, condition)
+    val cond = tested.expr
     expect_bool(c, cond)
     val other = no match
         Some(n) -> n
         None ->
-            // Without `else` the branch's value is discarded and the `if` yields unit.
-            return TExpr(e.span, Unit, If(cond, branch(c, yes, None, false), None))
-    val y = branch(c, yes, expected, used)
-    val n = branch(c, other, expected, used)
+            // Without `else` the branch's value is discarded and the `if` yields unit. After a
+            // branch that never finishes, the code that follows runs only where the condition failed.
+            val y = tested_branch(c, yes, tested.yes, None, false)
+            if *y.ty is Nothing then bring_into_scope(c, condition.span, tested.no)
+            return TExpr(e.span, Unit, If(cond, y, None))
+    val y = tested_branch(c, yes, tested.yes, expected, used)
+    val n = tested_branch(c, other, tested.no, expected, used)
+    if *y.ty is Nothing && !(*n.ty is Nothing) then bring_into_scope(c, condition.span, tested.no)
+    elif *n.ty is Nothing && !(*y.ty is Nothing) then bring_into_scope(c, condition.span, tested.yes)
     var ty: &Type = Unit
     if *y.ty is Nothing && *n.ty is Nothing then ty = Nothing
     elif used
@@ -5550,17 +5555,19 @@ private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[
 // `while true` that no `break` leaves never finishes.
 private while_expr(c: *Checker, e: &Expr, condition: &Expr, body: &Expr, otherwise: Option[&Expr], expected: Option[&Type], used: bool) -> &TExpr
     val unit = unit_of(c)
-    val cond = check_expr(c, condition, Some(Bool))
+    val tested = check_condition(c, condition)
+    val cond = tested.expr
     expect_bool(c, cond)
     val label = c.body.labels
     c.body.labels += 1
     c.body.loops.push(label)
-    val b = branch(c, body, None, false)
+    val b = tested_branch(c, body, tested.yes, None, false)
     c.body.loops.truncate(c.body.loops.len() - 1)
     var other: Option[&TExpr] = None
     var ty: &Type = Unit
     if otherwise is Some(o)
-        val t = branch(c, o, expected, used)
+        // The `else` runs once the test has failed.
+        val t = tested_branch(c, o, tested.no, expected, used)
         other = Some(t)
         ty = t.ty
     var broken = false
@@ -7288,10 +7295,77 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
         c.note(unit, e.span, s"this `match` does not cover every ${type_name(s.ty)} value; add an arm for the rest, such as `_`")
     TExpr(e.span, ty, Match(s, typed))
 
-private is_expr(c: *Checker, e: &Expr, value: &Expr, pattern: &Pattern, negated: bool) -> &TExpr
-    val v = check_expr(c, value, None)
-    val p = check_pattern(c, pattern, v.ty, "bindings in `is` patterns are not implemented")
-    TExpr(e.span, if *v.ty is Nothing then Nothing else Bool, Is(v, p, negated))
+/** A condition checked, and the locals its `is` tests bound: `yes` where it is known to hold, `no`
+ * where it is known to have failed. */
+struct Condition
+    expr: &TExpr
+    yes: Buf[usize]
+    no: Buf[usize]
+
+// Checks a condition whose `is` tests may bind names, and leaves none of them in scope: an `if` or
+// `while` brings back the ones its branches may use. A name is bound once in a condition, and may
+// shadow a local of the enclosing block, as an arm of `match` may.
+private check_condition(c: *Checker, e: &Expr) -> Condition
+    val outer_start = c.body.block_start
+    c.body.block_start = c.body.visible.len()
+    val t = condition_parts(c, e)
+    c.body.block_start = outer_start
+    t
+
+// `a && b` holds where both hold, so the right operand sees what the left one bound for holding,
+// and the whole binds both sides' names for holding and none for failing. `a || b` is the mirror
+// image, and `!a` swaps the two outcomes.
+private condition_parts(c: *Checker, e: &Expr) -> Condition
+    val mark = c.body.visible.len()
+    if e.kind is Is(value, pattern, negated)
+        val v = check_expr(c, value, None)
+        val p = check_pattern(c, pattern, v.ty, "")
+        var bound: Buf[usize] = buf()
+        for i in mark..<c.body.visible.len()
+            bound.push(c.body.visible[i])
+            c.body.tested.push(c.body.visible[i])
+        c.body.visible.truncate(mark)
+        val t = TExpr(e.span, if *v.ty is Nothing then Nothing else Bool, Is(v, p, negated))
+        return if negated then Condition(t, buf(), bound) else Condition(t, bound, buf())
+    if e.kind is Binary(op, left, right, _)
+        if op is And || op is Or
+            val and = op is And
+            val l = condition_parts(c, left)
+            expect_bool(c, l.expr)
+            for x in (if and then l.yes else l.no) do c.body.visible.push(x)
+            val r = condition_parts(c, right)
+            expect_bool(c, r.expr)
+            c.body.visible.truncate(mark)
+            // The right operand may not run, so only the left one decides that the operation never finishes.
+            val t = TExpr(e.span, if *l.expr.ty is Nothing then Nothing else Bool, Logic(and, l.expr, r.expr))
+            return if and then Condition(t, joined(l.yes, r.yes), buf()) else Condition(t, buf(), joined(l.no, r.no))
+    if e.kind is Unary(op, operand)
+        if op is Not
+            val x = condition_parts(c, operand)
+            expect_bool(c, x.expr)
+            return Condition(TExpr(e.span, if *x.expr.ty is Nothing then Nothing else Bool, Not(x.expr)), x.no, x.yes)
+    Condition(check_expr(c, e, Some(Bool)), buf(), buf())
+
+private joined(a: Buf[usize], b: Buf[usize]) -> Buf[usize]
+    var all: Buf[usize] = buf()
+    for x in a do all.push(x)
+    for x in b do all.push(x)
+    all
+
+// Brings the names a condition bound into the enclosing block, after an `if` whose other branch
+// never finishes.
+private bring_into_scope(c: *Checker, at: Span, names: Buf[usize])
+    for x in names
+        val name = c.body.locals[x].name
+        for i in c.body.block_start..<c.body.visible.len()
+            if c.body.locals[c.body.visible[i]].name == name
+                c.note(unit_of(c), at, s"`$name` is already defined in this block")
+        c.body.visible.push(x)
+
+private tested_named(c: *Checker, name: string) -> bool
+    for x in c.body.tested
+        if c.body.locals[x].name == name then return true
+    false
 
 // Checks a pattern against the type of the value it matches. `no_bind` is empty where the pattern
 // may bind names, and otherwise says why it may not.

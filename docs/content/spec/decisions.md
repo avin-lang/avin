@@ -336,6 +336,12 @@ a decision changes, this page and the chapter change together.
   on a generic type, and `Ord` on a generic class, needs the parameters bounded by the trait where
   the type declares them.
 - `x.equals(y)` and `x.hash()` may be called on a value of any type parameter, bounded or not.
+- Settled 2026-11-03: the names an [`is` pattern](/spec/operators-and-control-flow/#is) binds are in
+  scope where its test is known to have matched: the `then` branch of an `if`, the body of a
+  `while`, the right operand of `&&`, and for `is not` the `else` branches and the right operand of
+  `||`, with `!` swapping the two. After an `if` whose one branch never finishes, the rest of the
+  block sees the other branch's names. `a is P(v) || b is P(v)` binds no `v` for the whole. A
+  condition binds a name once, and its names may shadow the enclosing block's.
 
 **Project and tooling**
 
