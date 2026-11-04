@@ -130,6 +130,85 @@ element is asked for, `zip` ends with the shorter side, and `zipWithIndex` here 
 `Iterator[(T, int)]` rather than a vector. The new iterator shares its source, which must not then be
 read on its own.
 
+## Methods every Seq has
+
+Impls add these to `Seq`, each written once over `length()`, `apply(i)` and `iterator()`, so every
+sequence has them: lists, vectors, `ArraySeq`s, ranges, arrays, buffers, deques, and a class of the
+program's own that conforms to `Seq` by giving `length()` and `apply(i)`. Through `Seq[T]` each one
+that makes a sequence makes a `Vector`. Each concrete type keeps its own method of the same name and
+parameter types where it can answer faster or with its own kind, and that one is found first
+wherever the type is known:
+
+- **A list, a vector and an `ArraySeq` answer with their own kind**: `list.takeWhile(p)` is a
+  `List`, `vector.drop(2)` a `Vector`, `arraySeq.reverse()` an `ArraySeq`. A list shares what it
+  can: `drop`, `dropWhile`, `takeRight`, the second half of `splitAt` and `span`, and what follows the
+  replaced element in `updated` are its own tails.
+- **An array, a buffer and a deque keep their own kind for the element-wise methods**, `map`,
+  `flatMap`, `collect`, `filter` and `filterNot`, each a new collection, and answer the structural
+  ones with a `Vector`, leaving themselves unchanged. Their in-place operations (`update`, `sort`,
+  `add`, `insert`, `remove`) are their own.
+- **A range answers with a `Vector`**, since it holds only a progression.
+- `zip`, `zipAll`, `scanLeft`, `grouped`, `sliding` and `indices` have one form for every sequence.
+
+**A count is held to the sequence**: below zero it is zero and past the length it is the length, so
+`take(-1)` and `drop(100)` of three elements are both empty, and `splitAt(50)` is everything and
+nothing. **An index range is not**: `slice(from, until)` traps unless `0 <= from <= until <=
+length()`, as it does on a string and an array, and `updated(i, x)` traps where `xs(i)` would.
+`tail()` and `init()` trap on the empty sequence.
+
+**`intersect` and `diff` count as multisets.** Each occurrence in `other` matches the first
+unmatched equal element of the receiver: `[1, 1, 2].intersect([1, 3])` is `[1]` and
+`[1, 1, 2].diff([1, 3])` is `[1, 2]`; what is kept stays in the receiver's order. Equality is the
+elements' own `==`.
+
+n is the length of the receiver, m of the other operand, and k the count or size asked for. The cost
+on a vector is O(log₃₂ n) where it says so; elsewhere a vector, an `ArraySeq`, an array, a buffer, a
+deque and a range answer in the same time as a list, which walks from its front.
+
+| Method | Result through `Seq[T]` | Own result | Cost |
+|---|---|---|---|
+| `map(f)`, `flatMap(f)`, `collect(pf)` | `Vector[U]` | each type's own kind; a range's is a vector | O(n) |
+| `filter(p)`, `filterNot(p)` | `Vector[T]` | each type's own kind; a range's is a vector | O(n) |
+| `withFilter(p)` | lazy, for a guard | each type's own | O(1) |
+| `take(k)`, `drop(k)` | `Vector[T]` | List, Vector, ArraySeq | list O(k); vector O(log n); ArraySeq O(k) for `take`, O(n − k) for `drop`; others O(n) |
+| `takeRight(k)`, `dropRight(k)` | `Vector[T]` | List, Vector, ArraySeq | vector O(log n); others O(n) |
+| `takeWhile(p)`, `dropWhile(p)` | `Vector[T]` | List, ArraySeq; a vector's is a vector | O(n) |
+| `slice(from, until)` | `Vector[T]`; traps out of order | List, Vector, ArraySeq, Array | vector O(log n); others O(n) |
+| `splitAt(k)` | `(Vector[T], Vector[T])` | List, Vector, ArraySeq | vector O(log n); others O(n) |
+| `span(p)` | `(Vector[T], Vector[T])` | List, ArraySeq; a vector's are vectors | O(n) |
+| `tail()`, `init()` | `Vector[T]`; trap when empty | List, Vector, ArraySeq | list `tail` O(1); vector O(log n); others O(n) |
+| `reverse()` | `Vector[T]` | List, ArraySeq; a vector's is a vector | O(n) |
+| `xs ++ ys` | `Vector[T]`, `ys` any `Iterable[T]` | List (shares a list `ys`), Vector, ArraySeq | vector O(min(n, m)) for another vector; others O(n + m) |
+| `xs :+ x`, `x +: xs` | `Vector[T]` | List, Vector, ArraySeq | list `+:` O(1), `:+` O(n); vector amortized O(1); others O(n) |
+| `updated(i, x)` | `Vector[T]`; traps outside | List, Vector, ArraySeq | list O(i); vector O(log n); others O(n) |
+| `padTo(total, x)` | `Vector[T]` | List, ArraySeq; a vector's is a vector | O(max(n, total)) |
+| `distinct()`, `distinctBy(key)` | `Vector[T]`, the first of each | List, ArraySeq; a vector's is a vector | O(n) expected, a hash set |
+| `intersect(other)`, `diff(other)` | `Vector[T]`, as multisets | List, ArraySeq; a vector's is a vector | O(n + m) expected, a hash map |
+| `indices()` | `Range`, `0 ..< length()` | | O(1) after `length()` |
+| `zip(other)` | `Vector[(T, U)]`, as long as the shorter | | O(min(n, m)) |
+| `zipAll(other, thisElement, thatElement)` | `Vector[(T, U)]`, as long as the longer | | O(max(n, m)) |
+| `scanLeft(initial, f)` | `Vector[B]`: `initial` and each partial fold, n + 1 | | O(n) |
+| `grouped(size)` | `Iterator[Vector[T]]`; the last may be shorter; size < 1 traps | | O(n) |
+| `sliding(size, step = 1)` | `Iterator[Vector[T]]`; ends with the first window to reach the last element, which may be shorter; size or step < 1 traps | | O(n) to copy the elements, then O(log n) a window |
+| `lastIndexOf(x)`, `lastIndexWhere(p)` | `Option[int]` | | O(n), by `reverseIterator()` |
+| `startsWith(prefix)`, `endsWith(suffix)` | `bool` | | O(m), plus `length()` for `endsWith` |
+| `sameElements(other)` | `bool`: as many, each equal in order | | O(min(n, m)) |
+
+Each also has `length()`, `apply(i)`, `get(i)`, `head()`, `last()` and their `Option` forms,
+`indexWhere`, `indexOf`, `contains`, `foldRight`, `reverseIterator()`, the sorts
+([sorting](#sorting)), `mkString`, `min` and `max`, besides everything an `Iterable` has.
+
+```text
+[1, 2, 3, 4, 5].sliding(3, 2).toVector()     // [[1, 2, 3], [3, 4, 5]]
+[1, 2, 3, 4, 5].grouped(2).toVector()        // [[1, 2], [3, 4], [5]]
+(1 .. 4).scanLeft(0, (s, x) -> s + x)        // [0, 1, 3, 6, 10]
+val l: List[int] = [1, 2, 3]
+val s: Seq[int] = l
+l.takeWhile(x -> x < 3)                      // a List: [1, 2]
+s.takeWhile(x -> x < 3)                      // a Vector: [1, 2]
+[1, 2, 3].zipAll(["a"], 0, "-")              // [(1, "a"), (2, "-"), (3, "-")]
+```
+
 ## Builders
 
 Every collection type has a **builder**, through one library trait: `List.builder[int]()`,
@@ -229,7 +308,7 @@ is among their parents, and their `apply` is what a call of one as a function ru
 
 | Collection | Is a | `c(x)` is |
 |---|---|---|
-| `Seq[T]`: every list, vector, array, buffer and deque | `(int) -> T` | the element at index `x`, trapping outside the sequence |
+| `Seq[T]`: every list, vector, `ArraySeq`, range, array, buffer and deque | `(int) -> T` | the element at index `x`, trapping outside the sequence |
 | `Set[A]`, immutable and mutable | `(A) -> bool` | whether `x` is an element |
 | `Map[K, V]`, immutable and mutable | `(K) -> V` | the value bound to `x`, trapping when there is none |
 
@@ -249,7 +328,8 @@ val fs: Vector[(int) -> string] = [words, i -> s"#$i"]
 Variance holds through the function type: a `Vector[Dog]` is an `(int) -> Animal`, since `Seq` is
 covariant in its element and a function in its result, and a `Map[string, Dog]` is a
 `(string) -> Animal`. A set's element type and a map's key type are its own, so a `Set[int]` is no
-`(string) -> bool`. A `Range` is iterable but no sequence, so it is no function.
+`(string) -> bool`. A `Range` is a `Seq[int]`, so it is an `(int) -> int`: `(0 ..< 100 by 5)(3)` is
+`15`.
 
 ## Array
 
@@ -433,7 +513,7 @@ does, `[1, 2, 3]`, where their elements display.
 ## Seq
 
 `Seq[+T]` is what every indexed sequence shares, so a function over `Seq[T]` takes a list, a vector,
-an array, a buffer or a deque. A sequence supplies `length()` and `apply(index)`, and has the rest
+an `ArraySeq`, a range, an array, a buffer or a deque. A sequence supplies `length()` and `apply(index)`, and has the rest
 from them: `get`, `isEmpty`, `nonEmpty`, `head` and `last` (trapping when empty) with `headOption` and
 `lastOption`, `foldRight`, `indexWhere`, `toVector`, an iterator, and `reverseIterator`, which walks
 from the last element to the first. The [methods every Iterable has](#methods-every-iterable-has),
@@ -451,8 +531,9 @@ total(Array.fill(4, 1))            // an Array
 Impls add more to every sequence ([impl](/spec/declarations/#impl)), written once on `Seq` and
 reached through generic code over `Seq[T]` as on each sequence type: `contains(element)` and
 `indexOf(element)`, which compare with `equals` and are `exists` and `indexWhere`, so a list walks
-itself once; and where the elements are ordered, the sorts, `sorted()`, `sortedBy` and `sortedWith`
-([sorting](#sorting)).
+itself once; where the elements are ordered, the sorts, `sorted()`, `sortedBy` and `sortedWith`
+([sorting](#sorting)); and the transformations and structural methods in
+[methods every Seq has](#methods-every-seq-has).
 
 ```text
 present[T](xs: Seq[T], x: T) -> bool = xs.contains(x)
@@ -532,6 +613,15 @@ type's maximum. Range **patterns** in `match` arms are a separate feature: a tes
 step's direction, and `r.isEmpty()` says so. Iteration never steps past the largest or smallest
 value of the type: `for i in 2147483640..2147483647 by 5` yields 2147483640 and 2147483645 and stops.
 
+A `Range` of `int`s is a `Seq[int]`, and answers its own sequence questions from its bounds in
+constant time: `length()` (trapping for a range of more values than the largest `int`, such as
+`int.min .. int.max`), `r(i)`, which is `start + i * step` and traps outside `0 ..< length()`, and
+`contains(x)`, which is whether `x` lies between the first and last values a whole number of steps
+from the first, so `(1 ..< 10 by 3).contains(7)` is true and `.contains(8)` false. Everything else
+it has as [every sequence](#methods-every-seq-has) does, and what those make of it, `map` and
+`filter` as much as `take` and `reverse`, is a `Vector`: `(1 .. 5).map(x -> x * x)` is
+`[1, 4, 9, 16, 25]`.
+
 ## for comprehensions
 
 A `for` with `yield` is sugar over collection methods: generators become `flatMap`/`map` and guards
@@ -585,8 +675,9 @@ xs.withFilter(x -> p(x)).flatMap(x -> ys.map(y -> f(x, y)))
 
 The calls are checked as if written out, so the first source decides the result's type: `map` and
 `flatMap` on a `List` give a `List`, on a `Vector`, an `Array`, a `Buffer` or a `Deque` that collection, on a
-`Set` a `Set`, on an `Option` an `Option`, and on a `Range`, which holds only a progression, a
-`Vector`. A `Map`'s elements are its entries as `(key, value)` pairs, and a comprehension over one
+`Set` a `Set`, on an `Option` an `Option`, and on a `Range`, which holds only a progression, or any
+other `Seq`, a sequence of the program's own among them, a `Vector`, through the
+[methods every Seq has](#methods-every-seq-has). A `Map`'s elements are its entries as `(key, value)` pairs, and a comprehension over one
 yields pairs and makes a `Map`. `flatMap` on the library's collections takes any `Iterable` from its
 function, so a later generator may draw from another kind of collection than the first; an
 `Option`'s `flatMap` takes an `Option`. A type of the program's own works in a comprehension by

@@ -796,6 +796,26 @@ Settled by the user on 2026-11-04:
   element. `avin.fs.listDir` answers its names sorted by code point rather than in the file
   system's order.
 
+- The methods every `Seq` has ([collections](/spec/collections/#methods-every-seq-has)): `map`,
+  `flatMap`, `collect`, `filter`, `filterNot`, `withFilter`, `take`, `drop`, `takeWhile`,
+  `dropWhile`, `takeRight`, `dropRight`, `slice`, `splitAt`, `span`, `tail`, `init`, `reverse`,
+  `++`, `:+`, `+:`, `updated`, `padTo`, `indices`, `zip`, `zipAll`, `scanLeft`, `distinct`,
+  `distinctBy`, `grouped`, `sliding`, `lastIndexOf`, `lastIndexWhere`, `startsWith`, `endsWith`,
+  `sameElements`, `intersect` and `diff` are written once on `Seq`, answering a `Vector` (`indices`
+  a `Range`, `grouped` and `sliding` an `Iterator[Vector[T]]`). `List`, `Vector` and `ArraySeq`
+  keep or gain their own versions answering their own kind. The mutable `Array`, `Buffer` and
+  `Deque` answer the element-wise `map`, `flatMap`, `collect`, `filter` and `filterNot` with a new
+  collection of their own kind and the structural methods with a `Vector`, so a structural method
+  never shares or aliases a mutable receiver; `Array.slice` stays an `Array`. A count is clamped to
+  `0 .. length()`; `slice` traps unless its indices are in order within the sequence, as it does on
+  strings and arrays. `intersect` and `diff` are multiset operations: each occurrence in the
+  argument matches the first unmatched equal element, and the receiver's order is kept. `Range` is
+  a `Seq[int]` with constant-time `length`, `apply` and `contains`, and so an `(int) -> int`.
+  Overload resolution accepts an argument of a subtype of a parameter's type, as a single
+  function's call does, and compares candidates by the same conformance, so a type's own
+  `++(other: List[T])` and `Seq`'s `++(other: Iterable[T])` are overloads of which the first is
+  more specific.
+
 - `avin.process` ([system library](/spec/system-library/)): `args() -> Vector[string]` holds the
   arguments after the program's name, and `programName()` gives the name separately; `env(name)` is
   an `Option[string]`; `exit(code: int) -> Nothing` flushes standard output first, as a trap does.
