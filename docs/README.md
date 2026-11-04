@@ -1,6 +1,8 @@
 # Avin documentation
 
-This directory is the Juicer site for **https://avinlang.dev/**. Pages live in
+This directory is the Juicer site published at **https://avin-lang.github.io/avin/** (and at
+**https://avinlang.dev/** once its DNS points there). Pages link to one another by site paths
+(`/spec/`), so read them on the site rather than here. Pages live in
 `content/`, configuration in `site.toml`, and copied static files in `static/`.
 Keep language documentation and compiler changes in the same repository.
 
@@ -12,8 +14,9 @@ juicer serve -s docs -L
 ```
 
 The preview is available at http://localhost:8080/. Generated files in `public/`
-are ignored. `static/CNAME` supplies the intended domain for GitHub Pages; hosting
-and DNS have not been configured by this setup.
+are ignored. `.github/workflows/docs.yml` builds the site on every push to `dev` that touches
+`docs/` and deploys it to GitHub Pages, for the address in the repository variable
+`DOCS_BASE_URL`, or the Pages address until it is set.
 
 Pages use YAML frontmatter with `title`, `summary`, and optional navigation
 `weight`. Start Markdown headings at `##`, since the theme supplies the page title.
