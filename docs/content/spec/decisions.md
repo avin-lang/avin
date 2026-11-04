@@ -689,6 +689,31 @@ Settled by the user on 2026-11-04:
   meaning: `name()` or `name(x: T)` before a block declares one. A block whose only line is a name
   and an operand stays the infix-continuation error. A block for a last parameter that is neither
   by-name nor a function, already given, or absent is an error.
+- [`lazy val`](/spec/declarations/#initialization), at module level and in class and object bodies
+  (each instance its own), is computed on its first read, exactly once, and kept; never read, never
+  computed. `lazy` is a modifier only before `val`, an ordinary name elsewhere; `lazy var` and
+  `lazy` on parameters, class parameters, data fields and locals are errors. A module-level one
+  takes no place in the eager initialization order, its readers depending on what its initializer
+  reads; an initializer that needs its own value, directly or through other lazy values, traps at
+  that read, naming the value. A field's initializer may use every field and method; the class
+  body reads the field only where it could call a method. Concurrent first reads run the
+  initializer once, the others waiting safe for the collector; the value is published with a
+  release store paired with the readers' acquire load, a stored value read with one atomic load
+  and a branch.
+- [A companion's `apply`](/spec/declarations/) overloads the constructor its name has in call
+  position. Where an object declares `apply`, `Name(…)` chooses among the class's constructor (or
+  the data type's variant of its name) and every `apply` by the ordinary static overloading rules:
+  most specific by parameter types, with by-name parameters, defaults, repeated parameters, generic
+  inference and trailing blocks as for any call (`Future(fetch(url))`, `Future` + block). Type
+  arguments written at the call are the chosen candidate's: the class's or data type's for the
+  constructor, the method's for an `apply`. An `apply` with the constructor's parameter types, up to
+  type parameter names, is an error at its declaration. A name with no constructor in call position
+  (a data type with no variant of its name, an abstract class, a plain object) calls its `apply`
+  alone, and the library's `List`, `Set` and `Map` companions take their elements that way:
+  `List(1, 2, 3)`, `Set(…)`, `Map((k, v), …)`. Where a function type is expected, the name is the
+  constructor or `apply` that type chooses, as for an overloaded function value; elsewhere the bare
+  name stays the object. This amends the earlier rule that the name in call position is only the
+  constructor and that an object cannot be called.
 
 **Deferred**
 
