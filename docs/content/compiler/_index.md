@@ -344,6 +344,39 @@ string longer than the largest `int`, so every byte offset is an `int`. The othe
 Avin over these, and casing, replacing and the white-space test are Sysl bindings
 (`sysl.text.to_upper`, `to_lower`, `replace_all`, `sysl.unicode.is_space`).
 
+**Arrays.** `Array[T]` is a final class in `library/avin/array.avin`, conforming to `Iterable[T]`,
+whose objects are not laid out from fields: an array is its length, a 64-bit word, then its
+elements, each at its element type's store width (a power of two up to a word for integers, a byte
+for `bool`, a word for a real or a reference, none for `unit`), with no gaps. Each instance's
+descriptor gives one element's size where a class's gives the object's, lists no reference
+offsets, and carries the class's method table and type record as any class's does; when the
+elements are references its kind's tracer is the runtime's `avin_rt_trace_array`, which marks every
+element, and otherwise the ordinary tracer, which marks none. The checker recognizes the class by
+its module and name (`is_array_class`); it is the one class whose methods may be intrinsics, and its
+constructor cannot be called. `length`, `apply`, `update` and `slice` are intrinsics lowered at each
+call: the length word, then for an element an unsigned compare of the index against it (so a
+negative index is out of range too, trapping with `index out of range` at the caller's line), the
+element's address as the header plus the sign-extended index times the size, and a load or store.
+A private generic intrinsic, `newArray[T](n)`, traps on a negative length and calls
+`avin_rt_new_array` with the instance's descriptor, which allocates the zeroed object and stores the
+length; only `Array.fill`, `tabulate` and `empty` call it, and they set every element before the
+array is seen. `avin_rt_array_slice` copies a range of elements into a new array of the same
+descriptor. `xs(i)` on a value whose type has an `apply` method calls it; `xs(i) = v` is checked as
+`xs.update(i, v)`, and the compound and yielding forms hold `xs` and the indices in hidden locals.
+A private intrinsic `fail(reason)`, of type `Nothing`, traps with a literal reason at its call;
+`Range` and the library's iterators use it.
+
+**`for` loops** are checked as the `while` loops they mean, in the manner of `do … while`: the
+source is evaluated once into a hidden local, and the element is bound by the pattern at the top of
+each iteration, after which the loop steps, so `continue` goes straight to the test. A range written
+in place keeps its bounds in locals of their integer type and counts with a wrapping add that is
+only taken below the upper bound, so it makes no `Range`, no call and no allocation per element;
+a `Range` value is counted the same way from its fields, its step's sign choosing the comparison and
+a wrapped step ending the loop; an array is indexed from 0 below the length read once; any other
+source with an `iterator` method is traversed by `hasNext()` and `next()` on the iterator it hands
+out, dispatched through the trait. `loop_tests.sysl` holds the counts of calls and allocations each
+form makes.
+
 ## Tests
 
 `sysl test compiler`, run from the repository root, runs every test.

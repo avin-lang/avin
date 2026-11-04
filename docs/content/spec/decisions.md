@@ -239,6 +239,13 @@ a decision changes, this page and the chapter change together.
   There is no mutable list type: every collection has a builder, through one library trait, and
   `List`'s builder appends in constant time and yields an immutable `List`.
 - `..` and `..<` expressions construct iterable `Range` values.
+- An array is made with every element set, by `Array.fill(n, value)`, `Array.tabulate(n, f)` or
+  `Array.empty()`; Avin has no null, so no array holds an unset element, and `Array[T]()` is an error.
+  `xs(i)` calls `xs.apply(i)`, `xs(i) = v` calls `xs.update(i, v)`, and the compound, `:=` and `++`
+  forms evaluate `xs` and `i` once. A call with untyped arguments before `=` is an assignment, so a
+  local function's declaration types its parameters or has none.
+- A range's step is set with `by`; a step of zero traps, and iteration never steps past the limit or
+  the type's largest or smallest value.
 - `for` is comprehension sugar over `map`, `flatMap`, filtering and `foreach`.
 - The collection hierarchy is rooted at `Iterable`, and `Iterator` is itself `Iterable`.
 - `print` is an ordinary library function. It renders with `Display`, separates its arguments with
@@ -372,6 +379,15 @@ a decision changes, this page and the chapter change together.
 - A trait's `override` may also give an abstract method of a trait it requires a body, not only
   replace a default: `trait Square: Shape` with `override area() -> int = side() * side()` makes
   `area` concrete for every class conforming to `Square`.
+- An iterator is `hasNext()` and `next()`, and `next()` on an exhausted iterator traps. The
+  alternative, `next() -> Option[A]`, would make an `Option` per element.
+- A `for` without `yield` traverses its source through `iterator()` (a range written in place is
+  counted and an array indexed) rather than calling `foreach` with the body as a closure. For the
+  library's collections the two do the same thing; through the iterator, `break`, `continue` and
+  `return` leave the body directly, with no jump out of a closure. A type with `foreach` and no
+  iterator is then not a `for` source.
+- `Array.fill(n, value)` evaluates `value` once and shares it between the elements; per-element
+  values come from `Array.tabulate`. The alternative is a by-name `value`, evaluated per element.
 
 ## Open
 

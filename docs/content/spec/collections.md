@@ -33,6 +33,10 @@ current position, and traversing it consumes it. Every other collection returns 
 time. Generic code over `Iterable` must therefore not assume it can traverse its input twice. There
 is no separate traverse-once supertype.
 
+An iterator is two methods: `hasNext()` says whether an element remains, and `next()` yields it and
+moves past it. `next()` on an iterator with nothing left traps. A class of the program's own is
+iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its own from `iterator()`.
+
 ## Operations without higher-kinded types
 
 `Iterable` declares the operation families: transformation (`map`, `flatMap`, `filter`, `collect`,
@@ -80,6 +84,21 @@ literals.
 fixed-length, mutable buffer whose value elements are stored unboxed, so `Array[int]` holds `int`s and
 `Array[Point]` holds `Point`s inline. It can be created in generic code (`Array.fill(n, x)`), compares
 by contents, displays its contents, and has identity.
+
+Avin has no null reference, so an array never holds an element that is not yet a value. Every array
+is made with each element set:
+
+```text
+val zeros = Array.fill(8, 0)              // eight 0s; the value is evaluated once and shared
+val squares = Array.tabulate(5, i -> i * i)
+val none = Array.empty[string]()
+```
+
+`Array[int]()` is an error. `xs.length()` is the length, which never changes; `xs.slice(from, until)`
+and `xs.copy()` make new arrays; `xs.get(i)` is an `Option`. `xs(i) += 1`, `xs(i) := v` and `xs(i)++`
+work as they do on a variable, evaluating `xs` and `i` once. Because a call with untyped arguments
+before `=` assigns an element, a local function's declaration always types its parameters or has
+none: `f(x) = 1` is the assignment `f.update(x, 1)`.
 
 ## List and cons
 
@@ -159,8 +178,29 @@ Literals always build the library's types, even when a user type named `Vector` 
 +1, so a descending range is empty; `by` sets another step. Iteration stops without stepping past the
 type's maximum. Range **patterns** in `match` arms are a separate feature: a test, not a value.
 
+`a..b by s` is the infix call `(a..b).by(s)`: a negative step counts down, so `10..0 by -2` is 10, 8,
+…, 0, and a step of zero traps. A range is empty when its start already lies past its limit in the
+step's direction, and `r.isEmpty()` says so. Iteration never steps past the largest or smallest
+value of the type: `for i in 2147483640..2147483647 by 5` yields 2147483640 and 2147483645 and stops.
+
 ## for comprehensions
 
 `for` is sugar over collection methods: generators become `flatMap`/`map`, guards become
 lazy filters, and a `for` without `yield` becomes `foreach`. Scope and the order of evaluation follow
 the source. There is no separate loop protocol, so any type with these methods works in a `for`.
+
+`for pattern in xs` followed by an indented body, or `for pattern in xs do body` on one line, runs the
+body once per element, binding each by the pattern: a name, `_`, a tuple or a variant pattern that
+every element matches. Each element is a new binding, so a closure made in the body keeps the
+element it saw. `break` and `continue` work as in `while`. A range written in place (`0..<n`, of any
+integer type) is counted without making a `Range`, and an array is indexed; anything else is
+traversed through its `iterator()`, which is what `foreach` does for the library's collections, and
+lets `break`, `continue` and `return` leave the body directly. A source with no iterator, such as an
+`int`, is an error.
+
+```text
+for i in 0..<n do total += i
+for (name, age) in people
+    if age < 18 then continue
+    print(name)
+```
