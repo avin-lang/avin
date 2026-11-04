@@ -14,6 +14,14 @@ signature, and the caller must deal with it.
 exhausted iterator or a failed assertion stops the program with a message and the source location.
 A trap is not a value and cannot be caught.
 
+**`fail(message)` is how a program says "this cannot happen".** It is in the prelude, stops the
+program with `message` at the place it is called, and has type `Nothing`, so it stands where a value
+of any type is expected:
+
+```text
+val n: int = if ok then 1 else fail("no")    // avin: trap: no at main.avin:2:36
+```
+
 **The location is in the program's own code.** A trap reached inside the core library, whether the
 library asked for it, as `m(k)` on a missing key does, or a check failed there, such as an overflow,
 reports the place where the program last called into the library, with the library's reason:

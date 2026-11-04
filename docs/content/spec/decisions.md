@@ -422,6 +422,8 @@ a decision changes, this page and the chapter change together.
 
 Settled by the user on 2026-11-03:
 
+- `fail(message)` is public in the prelude: it traps with the message at the caller's place and has
+  type `Nothing`.
 - The methods an `impl` adds to a class whose fields are all immutable are not variance positions,
   as a `data` type's are not: such an instance holds nothing a method could store a value into. A
   class with a `var` field keeps every method a position.
