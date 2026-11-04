@@ -122,6 +122,11 @@ a decision changes, this page and the chapter change together.
   a trait mentioning it, itself or through a trait it requires, is only a bound. In its default
   bodies `self` is a `Self`. A trait type is a type argument for its own bound when it does not
   mention `Self`.
+- Settled 2026-11-04 (user): [polymorphic recursion](/spec/generics/#polymorphic-recursion), a
+  cycle of generic code whose type arguments grow on every round, is a compile-time error naming
+  the cycle, through functions, methods, local functions, lambdas and calls through traits and
+  bounds alike; recursion whose type arguments do not grow is legal. Checking never runs without
+  end on it.
 - [Variance](/spec/generics/#variance) applies only where both type arguments are reference types,
   so it never converts: `List[string]` is a `List[Any]`, `List[int]` is not. Tuple parts and
   function results are covariant and function parameters contravariant on the same terms.
@@ -970,6 +975,19 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
+- Nested data types ([generics](/spec/generics/#polymorphic-recursion)): a data type naming itself
+  at a larger instance in its fields (`Deeper(inner: Tree[Nest[T]])` in `Tree[T]`) is rejected at
+  the type as polymorphic recursion, even where no code compares, hashes or shows it, since every
+  data type's structural equality, hash and `Display` would need a copy for every depth. A class
+  naming itself so in a field is not rejected for that alone; only code that grows with it is.
+- Which growth counts ([generics](/spec/generics/#polymorphic-recursion)): growth is measured as
+  nesting depth, and a cycle is rejected when a round of it nests its type arguments deeper in
+  total. A call through a bound on a value of a type parameter takes that type's arguments apart
+  (a `Box[U]` reaching `Box`'s method at `U` is one level less); an implementation reached through
+  a method table whose static type names every type parameter of the receiver's class (an
+  `Iterator[(A, int)]` for an `IndexedIterator[A]`) takes them apart from the receiver's, while one
+  reached through a trait that leaves some unnamed (a trait with no type parameters) continues the
+  cycle from wherever the class's larger instance was made.
 - Trait fields ([declarations](/spec/declarations/#trait)): a trait's field declares its type, since
   each conforming class's layout and the trait's `val` are known before any body is checked; it is
   public, as every member of a trait is, and is never `lazy`. A class never overrides a trait's
