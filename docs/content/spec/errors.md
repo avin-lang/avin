@@ -100,6 +100,11 @@ Their methods:
 | `contains(x: T) -> bool` | `orElse[F](f: (E) -> Result[T, F]) -> Result[T, F]` |
 | `toList() -> List[T]`, `toVector() -> Vector[T]` | `toList() -> List[T]` |
 | `zip[U](other: Option[U]) -> Option[(T, U)]` | |
+| `get() -> T`, trapping on `None` | |
+| `filterNot(p: (T) -> bool) -> Option[T]` | |
+
+An `Option[Option[T]]` also has `flatten()`. There is no `isDefined`, `isEmpty` or `nonEmpty`:
+`isSome()` and `isNone()` say it, and there is no `orNull`, since Avin has no null.
 
 `exists` is false and `forall` true for `None` and for `Err`, which hold no value. `toList` and
 `toVector` give one element or none.

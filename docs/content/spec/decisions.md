@@ -834,6 +834,13 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
+- `char` methods ([types](/spec/types/#real-and-char)): `isDigit`, `isLetter`, `isLetterOrDigit`,
+  `isWhitespace`, `isUpper`, `isLower`, `isControl`, `toUpper`, `toLower` and `asDigit`, classifying
+  by the full Unicode Character Database. `isWhitespace` is the `White_Space` property (as `trim`
+  uses, so U+00A0 counts), `toUpper`/`toLower` are the simple mappings, and `asDigit` reads only
+  ASCII digits and letters (0 to 35) and traps otherwise. `isSpaceChar` is left out.
+- `Option.get` traps on `None`; `filterNot` is added; `isDefined`, `isEmpty`, `nonEmpty` and
+  `orNull` are not, since `isSome`/`isNone` exist and there is no null.
 - Literal shapes ([collections](/spec/collections/#literals)): each of the library's collections is
   built only by the literal of its own shape: every `Seq` by `[a, b]`, `Set`, `TreeSet` and the
   mutable `Set` by `{a, b}`, and `Map`, `TreeMap` and the mutable `Map` by `{k: v}`, so
