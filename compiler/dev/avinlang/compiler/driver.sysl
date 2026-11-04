@@ -2,6 +2,7 @@ module dev.avinlang.compiler
 
 import sh.sysl.parsing.{Source, Span, error, source_of, report}
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
 import sysl.env.get
 import sysl.fs.{cache_dir, canonicalize, entries, exists, is_dir, make_dir_all, make_temp_dir, pending_name, publish_file, read_text, remove_dir_all, remove_file, write_text}
 import sysl.path.parent
@@ -170,17 +171,18 @@ compile(tc: Toolchain, src: Source) -> Compilation = compile_files(tc, single_fi
 
 /** Compiles a program to LLVM IR against the toolchain's library, and builds the shims of its Sysl
  * bindings, so a binding Sysl rejects is reported as the program's error. */
-compile_files(tc: Toolchain, files: Buf[ProgramFile]) -> Compilation = compile_program(tc, files, false)
+compile_files(tc: Toolchain, files: Buf[ProgramFile]) -> Compilation = compile_program(tc, files, false, buf())
 
-/** Compiles a program as `compile_files` does; with `testing`, into a program that runs one of its
- * tests in each process rather than `main`, which it then need not have. */
-compile_program(tc: Toolchain, files: Buf[ProgramFile], testing: bool) -> Compilation
+/** Compiles a program as `compile_files` does, its bindings reaching the Sysl packages `sysl` as well
+ * as Sysl's standard library; with `testing`, into a program that runs one of its tests in each
+ * process rather than `main`, which it then need not have. */
+compile_program(tc: Toolchain, files: Buf[ProgramFile], testing: bool, sysl: Buf[SyslPackage]) -> Compilation
     val lowered = lower_units(tc, files, testing) match
         Ok(l) -> l
         Err(diagnostics) -> return Compilation(diagnostics, None, None, buf())
     var archive: Option[string] = None
     if lowered.program.bindings.len() > 0
-        ensure_shims(tc, lowered.program.bindings, lowered.units) match
+        ensure_shims(tc, lowered.program.bindings, lowered.units, sysl) match
             Ok(a) -> archive = Some(a)
             Err(diagnostics) -> return Compilation(diagnostics, None, None, buf())
     Compilation("", Some(emit_llvm(lowered.program)), archive, lowered.tests)
@@ -199,26 +201,222 @@ private struct Lowered
     units: Buf[SourceUnit]
     tests: Buf[TestEntry]
 
-// The library's directory is loaded as a program tree is, and every module in it is the core
-// library's, `avin` or under it; the program's own modules may not be.
-private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool) -> Result[Lowered, string]
-    val library = library_files(tc.library_dir()).map_err(message -> s"avin: $message\n")?
-    var units: Buf[SourceUnit] = buf()
-    var diagnostics = ""
+/** A file of the standard library, found before it is read: its path and the module its directory
+ * names. */
+struct LibraryFile
+    path: string
+    module_name: string
+
+/** Every file of the standard library in the directory `library`, unread, in the order the library's
+ * modules are compiled in: the order of their paths, as `library_files` finds them. */
+library_index(library: string) -> Result[Buf[LibraryFile], string]
+    var out: Buf[LibraryFile] = buf()
+    index_files(library, "", "", &out)?
+    Ok(out)
+
+private index_files(root: string, rel: string, module_name: string, out: *Buf[LibraryFile]) -> Result[unit, string]
+    val dir = if rel == "" then root else root + "/" + rel
+    val names = entries(dir).map_err(e -> s"$dir: ${e.to_string()}")?
+    val sorted = names.view()
+    sort(sorted)
+    for name in sorted
+        if name.starts_with(".") then continue
+        val child = if rel == "" then name else rel + "/" + name
+        val full = root + "/" + child
+        if is_dir(full)
+            if exists(full + "/" + ManifestName) then continue
+            if rel == "" && name == "tests" then continue
+            index_files(root, child, qualified(module_name, name), out)?
+        elif is_source_name(name) && rel != ""
+            out.push(LibraryFile(full, module_name))
+    Ok(())
+
+/** The units of a compilation, each parsed and placed in its module: the standard library's that it
+ * reads, first, then the program's. `library` of them are the library's. With `broken`, some unit's
+ * report holds an error, and the units are not to be checked. */
+struct LoadedUnits
+    units: Buf[SourceUnit]
+    library: usize
+    root_module: string
+    broken: bool
+
+/** Parses a program's `files` and the standard library's modules at `library` it reads: the prelude,
+ * `avin`, and every library module an import names, of the program's files or of a library module
+ * read, to the end. A library module nothing imports is not read. With `whole_library`, every module
+ * of the library is read, as when a file of the library is itself the one analyzed. `held` gives each
+ * file's source as it is to be read, which an editor's text may stand in for. An import of a module
+ * under `avin` the library does not have is an error at the import; with the whole library read, as
+ * for a completion whose import is half written, the check reports such an import itself. */
+load_units(library: string, files: Buf[ProgramFile], whole_library: bool, held: Source -> Source) -> Result[LoadedUnits, string]
+    val index = library_index(library)?
+    var modules: Map[string, bool] = map()
+    for f in index
+        modules.put(f.module_name, true)
+    // Each library file parsed so far, by its place in the index.
+    var parsed_library: Map[usize, SourceUnit] = map()
+    var wanted: Map[string, bool] = map()
+    var queue: Buf[string] = buf()
+    want_module(&wanted, &queue, CoreModule)
+    if whole_library
+        for f in index
+            want_module(&wanted, &queue, f.module_name)
+    var program: Buf[SourceUnit] = buf()
     var root_module = ""
-    for i in 0..<library.len() + files.len()
-        val in_library = i < library.len()
-        val file = if in_library then library[i] else files[i - library.len()]
-        var parsed = parse(file.src)
+    var broken = false
+    for file in files
+        var parsed = parse(held(file.src))
         file.module_name match
-            Some(m) -> place_file(&parsed, m, in_library)
+            Some(m) -> place_file(&parsed, m, false)
             None -> root_module = parsed.file.module_name
-        if parsed.report.has_errors() then diagnostics = diagnostics + parsed.report.render(parsed.source)
-        units.push(SourceUnit(parsed.source, parsed.file, parsed.report))
+        if parsed.report.has_errors() then broken = true
+        want_imports(parsed.file, modules, &wanted, &queue)
+        // A `main` taking the program's arguments is given them by `avin.process.args`, which the
+        // program need not import.
+        for item in parsed.file.items
+            if item is FunctionItem(f)
+                if f.name == "main" && f.params.len() > 0 then want_module(&wanted, &queue, ProcessModule)
+        program.push(SourceUnit(parsed.source, parsed.file, parsed.report))
+    var next = 0usize
+    while next < queue.len()
+        val module_name = queue[next]
+        next += 1
+        for i in 0..<index.len()
+            if index[i].module_name != module_name then continue
+            val path = index[i].path
+            val text = read_text(path).map_err(e -> s"$path: ${e.to_string()}")?
+            var parsed = parse(held(source_of(path, text)))
+            place_file(&parsed, module_name, true)
+            if parsed.report.has_errors() then broken = true
+            want_imports(parsed.file, modules, &wanted, &queue)
+            parsed_library.put(i, SourceUnit(parsed.source, parsed.file, parsed.report))
+    var units: Buf[SourceUnit] = buf()
+    for i in 0..<index.len()
+        if parsed_library.get(i) is Some(u) then units.push(u)
+    val library_units = units.len()
+    for u in program
+        units.push(u)
+    for k in 0..<units.len()
+        var report = units[k].report
+        for i in units[k].file.imports
+            if whole_library then break
+            if missing_library_module(i.path, modules, units) is Some(message)
+                report.add(error(i.span, message))
+                broken = true
+        units[k].report = report
+    Ok(LoadedUnits(units, library_units, root_module, broken))
+
+/** The library's module that gives a program its arguments. */
+const ProcessModule: string = "avin.process"
+
+private want_module(wanted:*Map[string, bool], queue: *Buf[string], module_name: string)
+    if wanted.get(module_name) is Some(_) then return
+    wanted.put(module_name, true)
+    queue.push(module_name)
+
+// The library modules a file's imports name: the module an import names whole, `import avin.fs`, or
+// the module of the declaration it names, `import avin.fs.readText`.
+private want_imports(file: SourceFile, modules: Map[string, bool], wanted: *Map[string, bool], queue: *Buf[string])
+    for i in file.imports
+        if !is_library_module_name(i.path) then continue
+        if modules.get(i.path) is Some(_) then want_module(wanted, queue, i.path)
+        val owner = enclosing_module(i.path)
+        if modules.get(owner) is Some(_) then want_module(wanted, queue, owner)
+
+private is_library_module_name(name: string) -> bool = name == CoreModule || name.starts_with(CoreModule + ".")
+
+// `a.b` for `a.b.c`, and "" for a name with no dot.
+private enclosing_module(path: string) -> string
+    var dot: Option[usize] = None
+    for k in 0..<path.bytes.len
+        if path.bytes[k] == u8('.') then dot = Some(k)
+    dot match
+        Some(k) -> path[0..<k]
+        None -> ""
+
+// The error for an import under `avin` that names neither a module of the library nor a declaration
+// of one: the module missing is the first part of the path below the deepest part the library has
+// modules in, whose modules it lists. A missing name in a module that would be a type's,
+// `avin.fs.Fil`, is left to the check, which says the module declares no such name.
+private missing_library_module(path: string, modules: Map[string, bool], units: Buf[SourceUnit]) -> Option[string]
+    if !is_library_module_name(path) || modules.get(path) is Some(_) then return None
+    val owner = enclosing_module(path)
+    val name = path[owner.bytes.len + 1..]
+    val owner_is_module = modules.get(owner) is Some(_)
+    if owner_is_module
+        if declares(units, owner, name) then return None
+        val first = name.bytes[0]
+        if first >= u8('A') && first <= u8('Z') then return None
+    var deepest = path
+    while deepest != CoreModule && !has_modules_under(modules, deepest)
+        deepest = enclosing_module(deepest)
+    var missing = path
+    if deepest != path
+        val rest = path[deepest.bytes.len + 1..]
+        var segment = rest
+        for k in 0..<rest.bytes.len
+            if rest.bytes[k] == u8('.')
+                segment = rest[0..<k]
+                break
+        missing = deepest + "." + segment
+    val under = modules_under(modules, deepest)
+    // A module with no modules under it is told about by the check: it declares no such name.
+    if under == "" then return None
+    Some(s"the standard library has no module `$missing`; the modules under `$deepest` are $under")
+
+// Whether a unit of module `module_name` declares `name`, a top-level declaration or a variant.
+private declares(units: Buf[SourceUnit], module_name: string, name: string) -> bool
+    for u in units
+        if u.file.module_name != module_name then continue
+        for item in u.file.items
+            if item_name(item) == name then return true
+            if item is DataItem(d)
+                for v in d.variants
+                    if v.name == name then return true
+    false
+
+// Whether the library has a module `prefix` or any under it.
+private has_modules_under(modules: Map[string, bool], prefix: string) -> bool
+    for (m, _) in modules
+        if m == prefix || m.starts_with(prefix + ".") then return true
+    false
+
+// The modules one level under `prefix`, `prefix.x`, each quoted, in order, joined by commas; a
+// directory holding only modules further down counts as one.
+private modules_under(modules: Map[string, bool], prefix: string) -> string
+    var seen: Map[string, bool] = map()
+    var names: Buf[string] = buf()
+    for (m, _) in modules
+        if !m.starts_with(prefix + ".") then continue
+        val rest = m[prefix.bytes.len + 1..]
+        var segment = rest
+        for k in 0..<rest.bytes.len
+            if rest.bytes[k] == u8('.')
+                segment = rest[0..<k]
+                break
+        if seen.get(segment) is Some(_) then continue
+        seen.put(segment, true)
+        names.push(prefix + "." + segment)
+    val sorted = names.view()
+    sort(sorted)
+    var out = ""
+    for n in sorted
+        out = out + (if out == "" then "" else ", ") + "`" + n + "`"
+    out
+
+// The library's modules a compilation reads are the prelude and those imported, and every module in
+// it is the core library's, `avin` or under it; the program's own modules may not be.
+private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool) -> Result[Lowered, string]
+    val loaded = load_units(tc.library_dir(), files, false, src -> src).map_err(message -> s"avin: $message\n")?
+    val units = loaded.units
+    val root_module = loaded.root_module
     // A file with syntax errors is not checked: its tree is a recovery, and checking it would
     // report the recovery rather than the program. A file in the wrong module is not checked either,
     // since every name it declares would be reported in a module it does not mean.
-    if diagnostics != "" then return Err(diagnostics)
+    if loaded.broken
+        var diagnostics = ""
+        for u in units
+            if u.report.has_errors() then diagnostics = diagnostics + u.report.render(u.src)
+        return Err(diagnostics)
     val checked = check_program(units, root_module, testing)
     if checked.has_errors() then return Err(checked.render())
     checked.program match
@@ -229,7 +427,7 @@ private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool) -> Re
             var own: Buf[TestCase] = buf()
             for t in program.tests
                 val unit = program.symbols[t.symbol].unit
-                if unit >= library.len() && !files[unit - library.len()].dependency then own.push(t)
+                if unit >= loaded.library && !files[unit - loaded.library].dependency then own.push(t)
             program.tests = own
             var tests: Buf[TestEntry] = buf()
             for t in program.tests

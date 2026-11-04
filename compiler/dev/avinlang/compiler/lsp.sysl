@@ -407,11 +407,6 @@ lsp_analyze(server: LspServer, file: string, text: string, completing: string = 
     var found: Buf[LspFound] = buf()
     found.push(LspFound(file, buf()))
     var names: Buf[string] = buf()
-    val library = library_files(library_dir) match
-        Ok(f) -> f
-        Err(message) ->
-            found[0].diagnostics.push(lsp_diagnostic(source_of(file, text), Span(0, 0), Error, s"avin: $message"))
-            return LspAnalysis(program, found, buf(), buf(), names, false, no_completions())
     var files: Buf[ProgramFile] = buf()
     if program.directory && !program.library
         files = program_tree_files(program.root) match
@@ -421,23 +416,21 @@ lsp_analyze(server: LspServer, file: string, text: string, completing: string = 
                 return LspAnalysis(program, found, buf(), buf(), names, false, no_completions())
     elif !program.library
         files = single_file(source_of(file, text))
-    var units: Buf[SourceUnit] = buf()
-    var root_module = ""
-    var broken = false
-    for i in 0..<library.len() + files.len()
-        val in_library = i < library.len()
-        val f = if in_library then library[i] else files[i - library.len()]
-        val src = lsp_held(server, f.src, file, text)
-        var parsed = parse(src)
-        f.module_name match
-            Some(m) -> place_file(&parsed, m, in_library)
-            None -> root_module = parsed.file.module_name
-        if parsed.report.has_errors() then broken = true
-        names.push(src.name)
-        units.push(SourceUnit(parsed.source, parsed.file, parsed.report))
+    // A file of the library is analyzed with the whole library, and so is a completion, which offers
+    // every module of the library after `import avin.`; a program otherwise with the library modules
+    // it reads, as a build does.
+    val loaded = load_units(library_dir, files, program.library || completing != "", src -> lsp_held(server, src, file, text)) match
+        Ok(l) -> l
+        Err(message) ->
+            found[0].diagnostics.push(lsp_diagnostic(source_of(file, text), Span(0, 0), Error, s"avin: $message"))
+            return LspAnalysis(program, found, buf(), buf(), names, false, no_completions())
+    val units = loaded.units
+    val root_module = loaded.root_module
+    for u in units
+        names.push(u.src.name)
     // A syntax error stops at the parse, as a build does: each file's syntax errors are reported, the
     // first on each line.
-    if broken
+    if loaded.broken
         for u in units
             if u.report.has_errors() then lsp_found(&found, u, true)
         return LspAnalysis(program, found, buf(), buf(), names, false, no_completions())

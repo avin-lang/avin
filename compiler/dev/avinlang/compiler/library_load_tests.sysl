@@ -1,0 +1,122 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.fs.{canonicalize, entries, make_dir_all, make_temp_dir, read_text, remove_dir_all, symlink, write_text}
+import sysl.process.Stdio
+
+// A compilation reads the standard library's prelude and only the library modules something
+// imports. These tests compile against a toolchain whose library is the repository's with modules
+// of their own added beside it: one that does not parse, and a few that import one another.
+
+// A toolchain at `root` whose library holds the repository's library and the modules `extra`, each a
+// path under `library/avin` and its text, and whose runtime is the repository's.
+private fixture_toolchain(root: string, extra: []const (string, string)) -> Toolchain
+    val real = repository_toolchain()
+    val library = root + "/library/avin"
+    make_dir_all(library).unwrap()
+    for name in entries(real.library_dir() + "/avin").unwrap()
+        symlink(real.library_dir() + "/avin/" + name, library + "/" + name).unwrap()
+    symlink(real.runtime_dir(), root + "/runtime").unwrap()
+    for (rel, text) in extra
+        val file = library + "/" + rel
+        make_dir_all(parent_of(file)).unwrap()
+        write_text(file, text).unwrap()
+    Toolchain(root, real.cache, real.clang, real.sysl)
+
+private parent_of(file: string) -> string
+    var at = 0usize
+    for k in 0..<file.bytes.len
+        if file.bytes[k] == u8('/') then at = k
+    file[0..<at]
+
+private const Broken: string = "module avin.broken\n\nthis is ( not Avin\n"
+
+private fixture_modules() -> []const (string, string) = [
+    ("broken/broken.avin", Broken),
+    ("leaf/leaf.avin", "module avin.leaf\n\nval base: int = 40\n\nvalue() -> int = base + 1\n"),
+    ("chain/chain.avin", "module avin.chain\n\nimport avin.leaf\n\nval offset: int = leaf.value() + 1\n\nanswer() -> int = offset\n"),
+    ("via/via.avin", "module avin.via\n\nimport avin.broken\n\nnothing() -> int = 0\n"),
+]
+
+private lowered(tc: Toolchain, text: string) -> Result[MirProgram, string] = lower_source(tc, source_of("probe.avin", text))
+
+@test("a program that imports nothing does not read a library module nothing imports")
+unimported_module_is_not_read()
+    val dir = canonicalize(make_temp_dir("avin-library-load").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = fixture_toolchain(dir, fixture_modules())
+    lowered(tc, "main()\n    println(\"hello\")\n") match
+        Ok(_) -> ()
+        Err(message) -> panic("a program importing nothing read a module it did not import:\n" + message)
+
+@test("an imported library module is read, and its errors are the program's")
+imported_module_is_read()
+    val dir = canonicalize(make_temp_dir("avin-library-load").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = fixture_toolchain(dir, fixture_modules())
+    lowered(tc, "import avin.broken\n\nmain()\n    println(\"hello\")\n") match
+        Ok(_) -> panic("the broken module was not read")
+        Err(message) -> assert(message.contains("broken/broken.avin"))
+
+@test("a library module imported only by another library module is read")
+transitive_module_is_read()
+    val dir = canonicalize(make_temp_dir("avin-library-load").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = fixture_toolchain(dir, fixture_modules())
+    lowered(tc, "import avin.via\n\nmain()\n    println(via.nothing().toString())\n") match
+        Ok(_) -> panic("the module avin.via imports was not read")
+        Err(message) -> assert(message.contains("broken/broken.avin"))
+
+@test("importing a declaration of a library module reads the module and the modules it imports")
+declaration_import_reads_its_module()
+    val dir = canonicalize(make_temp_dir("avin-library-load").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = fixture_toolchain(dir, fixture_modules())
+    lowered(tc, "import avin.chain.{answer}\n\nmain()\n    println(answer().toString())\n") match
+        Ok(_) -> ()
+        Err(message) -> panic(message)
+
+@test("library modules read through imports initialize their values in order, before main")
+transitive_module_values_initialize()
+    val dir = canonicalize(make_temp_dir("avin-library-load").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = fixture_toolchain(dir, fixture_modules())
+    val program = dir + "/main.avin"
+    write_text(program, "import avin.chain\n\nmain()\n    println(chain.answer().toString())\n").unwrap()
+    for level in ["-O0", "-O2"]
+        var noted = ""
+        val status = run_cli_in(".", ["avin", "run", program, level], Some(tc), s -> (), s -> noted = noted + s + "\n", Stdio.ToPath(dir + "/out"), Stdio.ToPath(dir + "/err"))
+        if status != 0 then panic(s"exit ${status.to_string()} at $level:\n$noted${read_text(dir + "/err").unwrap_or("")}")
+        assert_eq(read_text(dir + "/out").unwrap(), "42\n")
+
+@test("an import of a module the standard library does not have lists the modules where it would be")
+missing_library_module()
+    val dir = canonicalize(make_temp_dir("avin-library-load").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = fixture_toolchain(dir, fixture_modules())
+    lowered(tc, "import avin.jsn\n\nmain()\n    println(\"hello\")\n") match
+        Ok(_) -> panic("an import of avin.jsn compiled")
+        Err(message) ->
+            assert(message.contains("the standard library has no module `avin.jsn`; the modules under `avin` are `avin.broken`, `avin.chain`, `avin.collections`"))
+            assert(!message.contains("broken/broken.avin"))
+    lowered(tc, "import avin.jsn.Parser\n\nmain()\n    println(\"hello\")\n") match
+        Ok(_) -> panic("an import of avin.jsn.Parser compiled")
+        Err(message) -> assert(message.contains("the standard library has no module `avin.jsn`;"))
+    lowered(tc, "import avin.collections.sorted.{Heap}\n\nmain()\n    println(\"hello\")\n") match
+        Ok(_) -> panic("an import of avin.collections.sorted.Heap compiled")
+        Err(message) -> assert(message.contains("the standard library has no module `avin.collections.sorted`; the modules under `avin.collections` are `avin.collections.mutable`"))
+
+@test("a missing declaration of a library module is the check's error, not a missing module")
+missing_library_declaration()
+    val dir = canonicalize(make_temp_dir("avin-library-load").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = fixture_toolchain(dir, fixture_modules())
+    lowered(tc, "import avin.leaf.{Nothing}\n\nmain()\n    println(\"hello\")\n") match
+        Ok(_) -> panic("an import of avin.leaf.Nothing compiled")
+        Err(message) ->
+            assert(message.contains("module `avin.leaf` declares no `Nothing`"))
+            assert(!message.contains("has no module"))
+    lowered(tc, "import avin.leaf.{valu}\n\nmain()\n    println(\"hello\")\n") match
+        Ok(_) -> panic("an import of avin.leaf.valu compiled")
+        Err(message) -> assert(message.contains("module `avin.leaf` declares no `valu`"))

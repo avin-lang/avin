@@ -125,20 +125,34 @@ private program_cases_in(dir: string) -> Buf[string]
         if is_dir(dir + "/" + name) then out.push(dir + "/" + name)
     out
 
-/** A program to run or reject: its files, and the text of them all, which holds its expectations. */
+/** A program to run or reject: its files, the text of them all, which holds its expectations, the
+ * Sysl packages its manifest names, and why the package could not be loaded, or "". */
 private struct Case
     files: Buf[ProgramFile]
     text: string
+    sysl: Buf[SyslPackage]
+    refused: string
 
+// A directory holding a manifest is a package, loaded with its dependencies and fetching none; its
+// own files hold its expectations.
 private case_at(path: string) -> Case
     if is_dir(path)
         val files = program_files(path).unwrap()
         var text = ""
         for f in files
             text = text + expectation_text(f.src) + "\n"
-        return Case(files, text)
+        if !exists(path + "/" + ManifestName) then return Case(files, text, buf(), "")
+        val fetching = default_fetching()
+        return load_package(path, Fetching(fetching.cache, fetching.base, false)) match
+            Ok(p) -> Case(p.files, text, p.sysl, "")
+            Err(message) -> Case(files, text, buf(), message)
     val src = source_of(path, read_text(path).unwrap_or(""))
-    Case(single_file(src), expectation_text(src))
+    Case(single_file(src), expectation_text(src), buf(), "")
+
+// Compiles a case as the command line would, or answers why its package could not be loaded.
+private compile_case(tc: Toolchain, program: Case) -> Compilation =
+    if program.refused != "" then Compilation(program.refused, None, None, buf())
+    else compile_program(tc, program.files, false, program.sysl)
 
 // The lines a file's expectations are read from: its text, or a literate file's program, where its
 // expectation comments stand at the margin of the program rather than four columns in.
@@ -162,7 +176,7 @@ private run_all(tc: Toolchain, all: Buf[string]) -> string
 private run_case(tc: Toolchain, path: string, scratch: string) -> string
     val program = case_at(path)
     val want = expectation(program.text)
-    val compiled = compile_files(tc, program.files)
+    val compiled = compile_case(tc, program)
     if compiled.diagnostics != "" then return path + ": did not compile:\n" + compiled.diagnostics
     val llvm = compiled.llvm.unwrap_or("")
     val stdout = sidecar(sidecar_base(path), ".out")
@@ -327,7 +341,7 @@ private reject_all(tc: Toolchain, all: Buf[string]) -> string
         val program = case_at(path)
         val want = expectation(program.text)
         if want.errors.len() == 0 then failures = failures + s"$path: names no expected error\n"
-        val compiled = compile_files(tc, program.files)
+        val compiled = compile_case(tc, program)
         if compiled.diagnostics == "" then failures = failures + s"$path: compiled\n"
         for message in want.errors
             if !compiled.diagnostics.contains(message)

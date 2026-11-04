@@ -238,9 +238,9 @@ lower_program(program: TProgram) -> MirProgram
     for b in program.builtins
         if b.table.len() > generic_base then generic_base = b.table.len()
     var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false)
-    // Record 0 is for the objects no type pattern names: closures, and the boxes of captured
-    // variables.
-    l.records.push(TypeRecord("a closure or a captured variable", buf(), None, None))
+    // Record 0 is for the objects no value of the program's types is: the boxes of captured
+    // variables. A closure's record is its function type's.
+    l.records.push(TypeRecord("a captured variable", buf(), None, None))
     l.record_types.push(Unit)
     // A module-level value made at compile time has no storage: every read of it is the constant.
     for _ in program.globals
@@ -1127,11 +1127,13 @@ private type_test(l: *Lowering, object: Operand, t: &Type) -> Operand
     compare(l, CmpNe, found, ConstInt(32, "0"))
 
 /** Whether only a value of exactly type `t` has type `t`: true of every type but an open or
- * abstract class, a trait, an instance of a type with a parameter that is not invariant, and a tuple
- * with a part of one. */
+ * abstract class, a trait, an instance of a type with a parameter that is not invariant, a function
+ * type (whose parameters and result vary, and which a class may extend), and a tuple with a part of
+ * one. */
 private exact(l: *Lowering, t: &Type) -> bool = *t match
     Class(k, _, _) -> l.program.classes[k].decl.modifier == "" && all_invariant(l.program.classes[k].decl.type_params)
     Data(d, _, _) -> all_invariant(l.program.data[d].decl.type_params)
+    Function(_, _) -> false
     Tuple(items) ->
         for item in items
             if !exact(l, item) then return false
@@ -1263,10 +1265,21 @@ private closure_shape(l: *Lowering, function: usize, type_args: Buf[&Type], entr
                     fields.push(FieldSlot(size, m))
                     size += field_size(m)
         None -> ()
+    val record = record_of(l, closure_type(l, function, type_args))
     val shape = ClosureShape(l.descriptors.len(), fields)
-    l.descriptors.push(Descriptor("closure of " + function_symbol(l.program, function, type_args), 0, size, refs, false, buf(), 0, false, Some(entry)))
+    l.descriptors.push(Descriptor("closure of " + function_symbol(l.program, function, type_args), 0, size, refs, false, buf(), record, false, Some(entry)))
     l.shapes.put(key, shape)
     shape
+
+// The exact type of a closure of `function`'s copy at `type_args`: the function type its own
+// parameters and result make, in that copy. A type pattern on a function type tests it.
+private closure_type(l: *Lowering, function: usize, type_args: Buf[&Type]) -> &Type
+    val symbol = l.program.symbols[function]
+    val owner = l.program.symbols[symbol.root.unwrap_or(function)].type_owner
+    var params: Buf[&Type] = buf()
+    for p in symbol.params
+        params.push(substitute(solve(l.program.vars, p), owner, type_args))
+    Function(params, substitute(solve(l.program.vars, symbol.result.unwrap_or(Unit)), owner, type_args))
 
 // The type arguments of the copy of `symbol` a call or a function value in the instance being
 // lowered reaches. A local function without type parameters of its own shares those of the code it
@@ -1512,9 +1525,10 @@ private bound_call(l: *Lowering, e: &TExpr, function: usize, slot: Option[usize]
         if l.program.classes[k].decl.modifier != "" && !on_type then return dispatch(l, function, position, args, type_args)
     val entries = checker_table(l, receiver)
     if position >= entries.len() then return dispatch(l, function, position, args, type_args)
-    val m = entries[position] match
+    var m = entries[position] match
         Some(m) -> m
         None -> return dispatch(l, function, position, args, type_args)
+    if on_type then m = conformance_member(l, receiver, function, m, type_args)
     var concrete_args: Buf[&Type] = buf()
     for a in implementation_args(l, receiver, m)
         concrete_args.push(a)
@@ -1522,6 +1536,42 @@ private bound_call(l: *Lowering, e: &TExpr, function: usize, slot: Option[usize]
     for i in type_args.len() - own..<type_args.len()
         concrete_args.push(concrete(l, type_args[i]))
     direct_call(l, e, m, args, concrete_args)
+
+// A type implementing a trait at several type arguments has one static member of a name for each,
+// and its table holds only one of them: the one called is the one taking the parameter types the
+// trait's member takes at the call's type arguments. `table_member` is the table's.
+private conformance_member(l: *Lowering, receiver: &Type, function: usize, table_member: usize, type_args: Buf[&Type]) -> usize
+    val trait_member = l.program.symbols[function]
+    val k = trait_member.owner_class match
+        Some(k) -> k
+        None -> return table_member
+    if !several_conformances(l.program.classes[k].decl) then return table_member
+    var concrete_args: Buf[&Type] = buf()
+    for t in type_args
+        concrete_args.push(concrete(l, t))
+    var implementer: Buf[&Type] = buf()
+    implementer.push(receiver)
+    var wanted: Buf[&Type] = buf()
+    for i in 1..<trait_member.params.len()
+        wanted.push(substitute(substitute(trait_member.params[i], self_owner(k), implementer), trait_member.type_owner, concrete_args))
+    val chosen = l.program.symbols[table_member]
+    for x in 0..<l.program.symbols.len()
+        val candidate = l.program.symbols[x]
+        if !candidate.static_member || candidate.decl.name != trait_member.decl.name || candidate.params.len() != trait_member.params.len() then continue
+        // A built-in type's members are the methods of its impls, each impl with parameters of its
+        // own; any other type's share its owner.
+        if candidate.receiver is Some(r)
+            if chosen.receiver is Some(q)
+                if !same_type(r, q) then continue
+            else continue
+        elif chosen.receiver is Some(_) then continue
+        elif candidate.type_owner != chosen.type_owner || candidate.owner_class != chosen.owner_class then continue
+        val own = implementation_args(l, receiver, x)
+        var matches = true
+        for i in 1..<candidate.params.len()
+            if !same_type(substitute(candidate.params[i], candidate.type_owner, own), wanted[i - 1]) then matches = false
+        if matches then return x
+    table_member
 
 // Calls a function value, a closure or an object of a class or data type that is a function: its
 // descriptor's `call` takes the object before the arguments.
@@ -1832,6 +1882,14 @@ private library_instance(l: *Lowering, name: string, element: &Type) -> usize
             var args: Buf[&Type] = buf()
             args.push(element)
             return instance(l, id, args)
+    panic("the core library declares no " + name)
+
+/** The instance of the core library's function `name`, which is not generic. */
+private library_function(l: *Lowering, name: string) -> usize
+    for id in 0..<l.program.symbols.len()
+        val s = l.program.symbols[id]
+        if s.module_name == "avin" && s.name == name && s.owner_class is None && s.receiver is None
+            return instance(l, id, buf())
     panic("the core library declares no " + name)
 
 /** The element type of `t` when it is a sequence: the core library's `Seq` itself, or a class or
@@ -2372,9 +2430,9 @@ private lower_kind(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
             val name = binary_operator_method(op).unwrap().method
             return operator_call(l, t, name, [a, b], machine(l, t))
         Some(scalar_arith(l, t, op, a, b, op_span))
-    Convert(operand) ->
+    Convert(operand, wrap) ->
         val x = lower_expr(l, operand)?
-        Some(convert(l, concrete(l, operand.ty), concrete(l, e.ty), x, e.span))
+        Some(convert(l, concrete(l, operand.ty), concrete(l, e.ty), x, e.span, wrap))
     Box(value) ->
         val v = lower_expr(l, value)
         if v is None && machine(l, value.ty) is Some(_) then return None
@@ -2509,15 +2567,15 @@ private resize(l: *Lowering, x: Operand, from: u32, to: u32, signed: bool) -> Op
     if from > to then return convert_op(l, Truncate, MInt(to), x)
     convert_op(l, if signed then SignExtend else ZeroExtend, MInt(to), x)
 
-private convert(l: *Lowering, from: &Type, to: &Type, x: Operand, at: Span) -> Operand = *to match
+private convert(l: *Lowering, from: &Type, to: &Type, x: Operand, at: Span, wrap: bool) -> Operand = *to match
     Real -> *from match
         Real -> x
         Byte -> convert_op(l, UnsignedToReal, MReal, x)
         _ -> convert_op(l, SignedToReal, MReal, x)
     Int(bits) -> *from match
         Real -> convert_op(l, RealToInt, MInt(bits), x)
-        Int(width) -> resize(l, x, width, bits, true)
-        _ -> resize(l, x, int_bits(from), bits, false)
+        Int(width) -> if wrap then resize(l, x, width, bits, true) else narrow_signed(l, x, width, bits, to, at)
+        _ -> if wrap then resize(l, x, int_bits(from), bits, false) else narrow_unsigned(l, x, int_bits(from), bits, to, at)
     Byte -> *from match
         Int(width) -> to_byte(l, x, width, at)
         _ -> x
@@ -2526,6 +2584,22 @@ private convert(l: *Lowering, from: &Type, to: &Type, x: Operand, at: Span) -> O
         Byte -> resize(l, x, 8, 32, false)
         _ -> x
     _ -> x
+
+// A signed integer becomes one of another width: widening sign-extends, and narrowing traps when the
+// value does not survive the trip back to the wider width.
+private narrow_signed(l: *Lowering, x: Operand, from: u32, to: u32, target: &Type, at: Span) -> Operand
+    if from <= to then return resize(l, x, from, to, true)
+    val narrow = resize(l, x, from, to, true)
+    val back = resize(l, narrow, to, from, true)
+    trap_if(l, compare(l, CmpNe, back, x), s"value out of range for ${type_name(target)}", at)
+    narrow
+
+// A byte or a char, whose bits are unsigned, becomes a signed integer: it traps when the value is
+// above the greatest the width holds.
+private narrow_unsigned(l: *Lowering, x: Operand, from: u32, to: u32, target: &Type, at: Span) -> Operand
+    if from < to then return resize(l, x, from, to, false)
+    trap_if(l, compare(l, CmpUgt, x, ConstInt(from, max_digits(to))), s"value out of range for ${type_name(target)}", at)
+    resize(l, x, from, to, false)
 
 // An integer becomes a byte only when it is 0 to 255; anything else traps.
 private to_byte(l: *Lowering, x: Operand, width: u32, at: Span) -> Operand
@@ -2564,6 +2638,15 @@ min_digits(bits: u32) -> string
         i -= 1
         out = out + char(u8('0') + digits[i]).to_string()
     out
+
+/** The greatest value of a width, in decimal. */
+max_digits(bits: u32) -> string
+    // The magnitude of the least value is a power of two, which ends in 2, 4, 6 or 8, or is 1 for a
+    // width of one bit, so taking one from its last digit never borrows.
+    val least = min_digits(bits)
+    val head = least[1..<least.len - 1]
+    val last = least.bytes[least.len - 1] - 1
+    head + char(last).to_string()
 
 private logic(l: *Lowering, and: bool, left: &TExpr, right: &TExpr) -> Option[Operand]
     val a = lower_expr(l, left)?
@@ -2820,7 +2903,7 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
             val pointer = pointer_option(l, from)
             if always_is(l, from, to)
                 if (*to is AnyType && !(*from is AnyType)) || (pointer && !pointer_option(l, to)) then bound = box_value(l, from, value)
-            elif *from is AnyType || *from is Class(_, _, _) || *from is Tuple(_) || *from is Data(_, _, _)
+            elif *from is AnyType || *from is Class(_, _, _) || *from is Tuple(_) || *from is Data(_, _, _) || *from is Function(_, _)
                 // An object whose type is a subtype of its static type: its descriptor's record says.
                 if value is Some(v)
                     val object = if pointer then option_object(l, from, v) else v
@@ -3107,8 +3190,8 @@ private own_hash(l: *Lowering, t: &Type, a: Operand) -> Operand
         _ -> runtime_call(l, "avin_rt_identity_hash", [MRef], MInt(64), [a])
 
 /** Gives every type record that some object has as its own type equality entries; whether it made
- * any. A trait's record and an abstract class's belong to no object. Record 0, of closures, compares
- * by identity. */
+ * any. A trait's record and an abstract class's belong to no object. Record 0, of captured
+ * variables' boxes, and a function type's record, of closures, compare by identity. */
 private add_equality_entries(l: *Lowering) -> bool
     var added = false
     var r = 0usize
@@ -3357,9 +3440,13 @@ private record_entry(l: *Lowering, record: Operand, offset: usize) -> Operand
 // strings by their bytes, any other type through its record's `equals` entry.
 private any_equals(l: *Lowering, a: Operand, b: Operand)
     val unequal = new_block(l)
-    l.blocks[unequal].term = Return(Some(ConstBool(false)))
     val record = object_record(l, a)
     continue_if(l, compare(l, CmpEq, record, object_record(l, b)), unequal)
+    val matched = l.current
+    l.current = unequal
+    val by_elements = call_instance(l, library_function(l, "anySeqEquals"), two(a, b), Some(MBool)).unwrap()
+    finish(l, Return(Some(by_elements)))
+    l.current = matched
     val strings = new_block(l)
     val others = new_block(l)
     finish_into(l, Branch(compare(l, CmpEq, record, RecordAddress(record_of(l, Str))), strings, others), strings)

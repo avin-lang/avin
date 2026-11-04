@@ -51,15 +51,34 @@ type differs:
 ```text
 data ConfigError
     Unreadable(cause: IoError)
+    Malformed(cause: ParseError)
     Invalid(key: string)
 
 impl From[IoError] for ConfigError
-    from(e: IoError) -> ConfigError = Unreadable(e)
+    static from(value: IoError) -> ConfigError = Unreadable(value)
+
+impl From[ParseError] for ConfigError
+    static from(value: ParseError) -> ConfigError = Malformed(value)
 
 loadConfig(path: string) -> Result[Config, ConfigError]
     val text = readText(path)?
-    parseConfig(text)
+    val doc = parseDocument(text)?
+    configOf(doc)
 ```
+
+`From[E]` is a core trait with one static member, `static from(value: E) -> Self`, so an error type
+implements it once for each error it wraps. On `Err(e)`, with `e` of type `E` and the enclosing
+function yielding errors of `F`:
+
+- **Where `E` is an `F`**, `e` is passed on unchanged.
+- **Otherwise `F.from(e)`** makes the error passed on, through `F`'s conformance to `From[E]`. Where
+  `F` has none, a conformance `From[X]` with `E` an `X` serves, if exactly one is more specific
+  than every other: an error of a subclass converts through its superclass's.
+- **No conformance is an error** naming the one missing, `From[E]`; several equally specific are an
+  error naming them.
+- **A type parameter converts through its bounds**: in
+  `load[F: From[IoError] + From[ParseError]](path: string) -> Result[Doc, F]`, both errors convert,
+  and each instance calls its type argument's `from`.
 
 An `Option` `?` cannot exit a function returning `Result`, and the enclosing function's result type
 must be able to carry the failure.

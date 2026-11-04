@@ -88,7 +88,8 @@ class SortedPair[T: Ordered](first: T, second: T)
   `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Ord`, `Display` and `Debug`, so `[T: Integer]` has every
   operator and both text forms. A value of such a `T` converts to the other integer types and to
   `real`, `byte` and `char` as an integer does (`long(x)`), and a call of `T` converts to it
-  (`T(n)`, narrowing to the low bits as integers do); each instance converts at its width.
+  (`T(n)`, trapping when `n` does not fit, as integers do; `T.wrap(n)` keeps the low bits); each instance converts
+  at its width.
 
 ```text
 digits[T: Integer](x: T) -> int
@@ -117,6 +118,9 @@ arguments, so:
   matches when that type is the pattern's or a subtype of it, through [variance](#variance) too, so
   a `List[Dog]` held as an `Any` matches `xs: List[Animal]` and a `List[int]` does not match
   `xs: List[Any]`;
+- a function value's header names its function type, so `f: ((Dog) -> Animal) -> …` matches a
+  `(Animal) -> Dog` held as an `Any`, and a value of a class extending a function type, a `Vector[int]`
+  among them, matches that function type;
 - generic code can create an `Array[T]` without any evidence parameter;
 - there are no unchecked casts. A downcast is a `match` with a type pattern.
 

@@ -32,12 +32,22 @@ a parameter, the other operand) and defaults to `int`; a literal that does not f
 Where a `real` is expected, an integer literal is that real (`x * 2`), provided it is exact: its
 magnitude is at most 2^53.
 
-Conversions: widening sign-extends; narrowing keeps the low bits (`i8(300)` is `44`); real-to-integer
+Conversions: widening sign-extends; narrowing traps when the value does not fit the narrower width
+(`i8(300)` traps, `i8(127)` is `127`), and `i8.wrap(300)` is the explicit wrapping form, which keeps the low
+bits (`44`); real-to-integer
 truncates toward zero, saturates at the bounds and maps NaN to zero; `char(n)` traps on a value that
 is not a Unicode scalar. Conversions are written as a call of the target type, and these exist: between
 any two integer types; integers and `real` in both directions; an integer or `byte` to `byte` and
 `char`; `byte` and `char` to any integer type; `byte` to `real`. A conversion to the same type is
 allowed and does nothing.
+
+**Limits.** Every integer type has its least and greatest value as constants, `MinValue` and `MaxValue`:
+`int.MaxValue`, `long.MinValue`, `i8.MaxValue`, `i1.MinValue`, `i257.MaxValue`, and `byte.MaxValue` (255)
+and `byte.MinValue` (0). `char.MaxValue` is U+10FFFF and `char.MinValue` U+0000. `real` has `MaxValue`
+(the greatest finite value), `MinValue` (the least, its negation), `MinPositiveValue` (the least positive
+value, subnormal), `PositiveInfinity`, `NegativeInfinity` and `NaN`. They are written on the type, are
+folded at compile time, and have the type they are written on. Any other name written on one of these
+types is an error.
 
 **Arithmetic that overflows traps.** `+`, `-`, `*`, unary `-`, `++` and `--` trap when the
 mathematical result does not fit the width, and so does `/` for the one quotient that cannot fit
