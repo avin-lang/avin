@@ -853,6 +853,40 @@ Settled by the user on 2026-11-04:
     allowed.
   - Every type parameter of a generic deriving type is bounded by the derived trait.
 
+- Packages beyond the manifest, settled by the user (2026-11-04) as proposed:
+  - **Features** ([features](/spec/packages/#features)), Sysl's model with the module as the unit
+    gated: a feature block has `doc`, `default`, `modules`, `enables` and `requires`, and
+    `name = [x]` is its short form; optional dependencies, `"dep:x"`, `"dep/feature"`, users'
+    `features`, `default_features = false` and `-x`, unification by union and the
+    `--features`/`--no-default-features`/`--all-features` flags are Sysl's. Where Sysl gates lines
+    with `#if feature_x`, Avin has no conditional compilation: a feature lists whole **modules**
+    (with those under them), read only while it is on, and an import of a gated module or of an
+    optional dependency's module is allowed only from a module whose own gate implies it, checked
+    against the manifest whatever is selected, so features are additive by construction. `avin test`,
+    `avin check`, the language server and `avin tidy` turn every feature on. Not carried over: Sysl's
+    `choices`, a feature's `if` and `targets`, and options, which are about machines and C
+    configuration Avin's manifest does not describe.
+  - **Members of a repository** ([members](/spec/packages/#members-of-a-repository)), Sysl's:
+    `{ git, member = "dir", version | rev }`, the member a package named `<coordinate>//<dir>` for
+    selection and `avin.sum`, every member at one version one clone whose hash each member's line
+    carries, a fetched member's `workspace = true` and in-repository `path` siblings read as their
+    own coordinates at the member's version, and `avin add <coordinate>//<dir>@<version>`. Its modules
+    keep their own names, as every dependency's do, so Avin needs no `package.repository` key.
+  - **Vendoring** ([vendoring](/spec/packages/#vendoring)), Sysl's: `avin vendor` copies the
+    resolution with every feature on into `vendor/` at the project (workspace) root in the cache's
+    layout, each copy hashed against its `avin.sum` line first, `.git` and path dependencies left out;
+    a `vendor/` present is the cache, and the root's `vendor/` is never a module. Two choices of
+    Avin's own: a package missing from `vendor/` is **refused** rather than fetched into it, so a
+    vendored build never touches the network; and `avin vendor` **removes** packages the resolution
+    no longer reads, as `avin tidy` does for lines.
+  - **The standard library's modules** ([standard library](/spec/packages/#the-standard-library-s-modules)):
+    the `avin` tree shipped with the compiler (`share/avin/library`, or `AVIN_ROOT/library`),
+    versioned with it, never a dependency and never in `avin.sum`; `avin` is the prelude, seen
+    without an import, and every module under it is imported by name like any module. A
+    compilation reads the prelude and then only the library modules something imports,
+    transitively, so the library can grow without every program parsing all of it. Domain libraries
+    are packages (as settled for `dev.avinlang`). The standard library has no features.
+
 **Deferred**
 
 - Public C interoperability. Until then, C is reached through Sysl.
@@ -888,7 +922,7 @@ Settled by the user on 2026-11-04:
   - **Dependencies**: `{ git = "host/owner/name", version = "x.y.z" }` read at the tag `vx.y.z`
     and cloned from `https://`; `{ path = "../dir" }`, relative to the manifest naming it and refused
     in a fetched package; `{ workspace = true }`. A coordinate with `https://` or `.git` is refused.
-    No features or members of a repository yet.
+    Features and members of a repository are settled above.
   - **`rev` pins**: `{ git = "…", rev = "<hex>" }`, seven to forty lowercase hexadecimal digits,
     refused with a `version` or without `git`. The repository is cloned whole and the commit
     resolved to its full id, fetched by that id when no branch or tag reaches it (only a full id
@@ -1127,7 +1161,7 @@ Settled by the user on 2026-11-04:
 - A collection added to itself ([collections](/spec/collections/#buffer)): `b.addAll(b)` and
   `b ++= b` on a `Buffer` or a `Deque` append the elements it held when the call began, once, and
   `s --= s` on a mutable `Set` empties it.
-- [`avin.time`](/spec/system-library/#avintime): `Duration`, `Instant` (monotonic) and `WallTime`
+- [`avin.time`](/spec/system-library/#avin-time): `Duration`, `Instant` (monotonic) and `WallTime`
   (wall clock, a `Duration` since the 1970 epoch) are data types counting whole microseconds in a
   `long`, overflow trapping; the two clocks are distinct types so their readings never mix. A
   duration implements `Add`, `Sub`, `Neg`; an instant combines with a duration through `plus`,
@@ -1146,11 +1180,73 @@ Settled by the user on 2026-11-04:
   A fetched package may not name a Sysl directory. The shim archive and the cached executable are
   keyed by these entries and by the sources of each Sysl package named by directory. Sysl's other
   dependency keys (`mount`, `features`, `options`) are not offered yet.
+- The rest of the system library ([system library](/spec/system-library/)), each module following
+  the reference standard library's names and shapes where Avin's rules allow:
+  - **[The environment and the platform](/spec/system-library/#the-environment-and-the-platform)**
+    are functions of `avin.process`, beside `env`, not a module of their own: `environment()` as a
+    `Map`, `currentDir`, `homeDir`, `executable`, `processors`, `pid` and `os()`. There is no
+    property store and nothing sets a variable; a child's variables are set on its command. Bindings:
+    `sysl.fs.current_dir` and `home_dir`, `sysl.env.current_exe`, `sysl.process.pid` (a `u32`, which
+    fits a `long`), `sysl.os` through a mirror of `sysl.Os`, and the runtime's processor count.
+    `environment()` needs `sysl.env.vars`, which answers a `Buf` of pairs: it waits for tuples as a
+    boundary type, a stage-7 addition.
+  - **[Commands](/spec/system-library/#commands)** in `avin.process`: a `Command` value, combined
+    with `|` (a pipeline), `andThen`, `orElse` and `followedBy`, redirected with `toFile`,
+    `appendTo`, `fromFile` and `withInput`, and run by `run()` (the exit status), `output()` (the
+    text, any status but success an `Err`), `lines()` (an iterator as output arrives) and `start()`
+    (a `Child`). Importing the module adds `run()` and `output()` to `string`. **Operators Avin cannot
+    define**: postfix `!` and `!!` (no method is called postfix, and `!` is the language's), and
+    anything spelled with `#` (not an operator character), so `#|` is `|`, and `#&&`, `#||`, `###`,
+    `#>`, `#>>` and `#<` are words; `run()` is the status, where the reference's `run()` starts the
+    process, which here is `start()`. Bindings: `sysl.process.run`, `capture`, `start`, `spawn` and
+    `pipe`, with mirrors of `Status`, `Output` and `Var`. **Blocked on stage-7 opaque handles**:
+    `Stdio` carries a `sysl.fs.File`, and `Child` and `Spawned` are live processes.
+  - **[`Source`](/spec/system-library/#source)** in `avin.io`: `fromFile` (read whole, every failure
+    up front), `fromString`, `stdin()`, and `lines()`, `chars()` and `readAll()`, each consuming. The
+    reference's `getLines` and `mkString` are `lines` and `readAll`, the names `avin.io` already uses.
+    No new binding: it is written over `fs.readText` and standard input's buffer. Not blocked.
+  - **[`avin.random`](/spec/system-library/#avin-random)**: a `Random` class (`Random(seed)`
+    reproducible, `Random()` seeded by the platform) with `nextInt`, `nextLong`, bounded forms,
+    `between`, `nextReal`, `nextBoolean`, `nextGaussian`, `nextBytes`, `alphanumeric`, `shuffle` and
+    `setSeed`; the companion's methods use one shared, locked generator. PCG32, written in Avin with
+    the wrapping operators, so a seed gives the same sequence everywhere. Binding: one runtime
+    function for the platform's seed over `sysl.posix.rand.seed_from_os`, since its `u64` does not
+    fit a `long` at the boundary. `nextGaussian` needs a square root and a logarithm on `real`, which
+    Avin does not have yet. Not blocked on opaque handles.
+  - **[`avin.net`](/spec/system-library/#avin-net)**: `TcpStream` and `TcpListener`; `Url`, parsed
+    and percent-encoded, written in Avin; an HTTP/1.1 client (`get`, `post`, `send` with a `Request`)
+    written in Avin over the TCP stream, a status never an error. `IoError` gains
+    `ConnectionRefused`, `ConnectionReset` and `TimedOut`. Bindings: `sysl.net.resolve`, `socket`
+    and the `Socket` methods. **TCP is blocked on stage-7 opaque handles** (a `Socket`, and the
+    `Address` it connects to, are not boundary types); `Url` is not blocked. **`https` is blocked on
+    bindings to Sysl packages other than the standard library**, since TLS lives in a package of its
+    own.
+  - **[Concurrency](/spec/system-library/#concurrency)** stays in `avin.threads`; there is no
+    separate concurrency module. The reference's futures map onto what is there (`successful`, `all`
+    for `sequence`, `first` for `firstCompletedOf`, `await` for waiting with a time limit); added are
+    `Future.traverse`, `mapErr` and `orElse` on a future of a `Result` (its `recover` and
+    `fallbackTo`), an `Executor` for pools of one's own (its execution context, chosen explicitly),
+    `threads.blocking(body)` and `threads.sleep(d)`. There is no `failed` or `filter`, since a future
+    carries no failure. Bindings: none beyond a runtime timed wait for `sleep`. Not blocked.
+  - **JSON** is a package of its own, not part of the system library.
 
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
   over a `Map` yields when its values are not pairs (it needs `Iterable`'s own transformations).
+
+- Packages, where Sysl's choice does not transfer ([packages](/spec/packages/)):
+  - Whether a feature needs anything finer than a module: a compile-time `feature("x")` constant a
+    function could test (folded away when false), or nothing, the module being the only gate.
+  - Whether a module may be listed by more than one feature (on while any is on), or by one only, as
+    proposed.
+  - Whether a build should re-hash `vendor/` on every run, catching a hand edit to a committed
+    vendored package, or trust the hash recorded beside each package as it trusts the cache's.
+  - Whether a manifest names the oldest compiler it builds with (`package.avin = "0.x.y"`), since
+    the standard library's modules arrive with the compiler and a package using a new one fails on an
+    older compiler with "no module" rather than a version message.
+  - Whether manifests gain machine conditions (Sysl's `if`, `choices`, `targets`) once Avin builds
+    for more than one target.
 
 - Resource cleanup: a `defer` construct or a library `use`.
 - How actors work: how messages are declared and sent, mailboxes and replies, how actors are
