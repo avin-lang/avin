@@ -620,6 +620,18 @@ Settled by the user on 2026-11-04:
   core library adds `flatten` to `Option[Option[T]]`, `Result[Result[T, E], E]` and `Seq[Seq[T]]`
   (a `Vector[T]`), `toMap()` to `Iterable[(K, V)]` (keys bounded as a map's) and `unzip()` to
   `Seq[(A, B)]`.
+- [Trailing blocks](/spec/operators-and-control-flow/#trailing-blocks): an indented block on the
+  lines after a call is the call's last argument, given to the callee's last parameter. A by-name
+  parameter takes the block as its delayed expression (`retry(3)` + block); a function parameter
+  takes a lambda whose parameters end the call's line, one name or a parenthesized list after
+  the call's parentheses (`withFile(path) f ->`, `zipWith(a, b) (x, y) ->`). A callee with no
+  other arguments is written without parentheses (`scope s ->`, `s.spawn` + block). It applies
+  wherever an expression ends a line (`val r = retry(3)` + block, a method call, a match arm's
+  body), and never in the test of `if`, `elif`, `while` or `do … while`, a `for` source or guard,
+  or a class's parents, where the block is the form's body. A local function's header keeps its
+  meaning: `name()` or `name(x: T)` before a block declares one. A block whose only line is a name
+  and an operand stays the infix-continuation error. A block for a last parameter that is neither
+  by-name nor a function, already given, or absent is an error.
 
 **Deferred**
 
