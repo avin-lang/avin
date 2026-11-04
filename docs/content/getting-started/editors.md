@@ -50,9 +50,46 @@ The server announces exactly these capabilities in its answer to `initialize`:
 | `textDocument/hover` | For the name under the cursor, what the checker knew about it, as Avin code: a local's, a parameter's, a field's or a module value's type (`val p: Point`), a function's or a method's signature (`Point.norm() -> int`), a type's declaration, a variant with its fields. The `//` or `/** … */` comment directly above the declaration follows it |
 | `textDocument/definition` | Where the name under the cursor was declared: a local, a parameter, a function, a method, a field, a type, a variant, a module-level value, an imported name or module, in the same file, another file of the program or the library |
 | `textDocument/documentSymbol` | The document's outline: classes, traits and objects with their fields and methods, data types with their variants, impls with their methods, functions and module values. It is read from the parse, so it is there while the program has mistakes in it |
+| `textDocument/references` | Every place the program names what the name under the cursor names, in every file of the program and the library, in the order of their files; the declaration's own name with them when the request's `includeDeclaration` asks for it |
+| `textDocument/documentHighlight` | The places in the document that name the same thing, the declaration marked as a write and each use as a read |
+| `textDocument/semanticTokens/full` | Every name the checker resolved in the document, classified by what it names; the legend is below |
 
 A call through a method table goes to the method the receiver's static type declares, and a call of
-an overloaded function to the overload the checker chose.
+an overloaded function to the overload the checker chose. References follow the same choice: the
+references of a trait's method are the calls made through the trait, and those of a class's
+override are the calls on that class, so asking from `Shape.area` does not list a call the checker
+resolved to `Circle.area`.
+
+### Semantic tokens
+
+Names are coloured by what the checker resolved them to, so a field and a local of the same name,
+or a function and a variable, are told apart wherever they are written. Keywords, literals,
+operators and comments are left to the editor's grammar.
+
+| Token type | Names |
+| --- | --- |
+| `namespace` | A module, in an import and before a member read through it |
+| `class` | A class or an object |
+| `struct` | A data type with one variant, and that variant constructing it |
+| `enum` | A data type with several variants |
+| `interface` | A trait |
+| `typeParameter` | A type parameter |
+| `enumMember` | A variant of a data type with several |
+| `function` | A top-level or local function |
+| `method` | A method of a class, a trait or an impl |
+| `property` | A field |
+| `parameter` | A parameter |
+| `variable` | A local or a module-level value |
+
+| Modifier | Meaning |
+| --- | --- |
+| `declaration` | The name where it is declared |
+| `readonly` | A `val`: a local, a field or a module value that cannot be assigned |
+| `static` | A static member, a member of the type rather than of its values |
+| `defaultLibrary` | Declared in the standard library |
+
+A name the checker reached no declaration for has no token, so while a syntax error stops the
+analysis the editor's grammar alone colours the file.
 
 Positions are the protocol's: a line counted from zero and a character counted in UTF-16 code
 units, so a column after a non-ASCII character is the one the editor shows.

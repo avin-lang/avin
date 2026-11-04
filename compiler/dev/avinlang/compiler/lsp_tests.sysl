@@ -126,7 +126,11 @@ lsp_initialize()
     assert_eq(lsp_one(&server, lsp_request(1, "initialize", "{\"capabilities\":{}}")),
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-16\"," +
         "\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":true},\"hoverProvider\":true," +
-        "\"definitionProvider\":true,\"documentSymbolProvider\":true}," +
+        "\"definitionProvider\":true,\"documentSymbolProvider\":true,\"referencesProvider\":true," +
+        "\"documentHighlightProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\"," +
+        "\"class\",\"struct\",\"enum\",\"interface\",\"typeParameter\",\"enumMember\",\"function\",\"method\"," +
+        "\"property\",\"parameter\",\"variable\"],\"tokenModifiers\":[\"declaration\",\"readonly\",\"static\"," +
+        "\"defaultLibrary\"]},\"full\":true}}," +
         s"\"serverInfo\":{\"name\":\"avin\",\"version\":\"$Version\"}}}")
     assert_eq(lsp_answer(&server, lsp_notify("initialized", "{}")).len(), 0)
 
@@ -412,6 +416,9 @@ lsp_definition_of_data()
         lsp_hover_of(9, "val r: int", "", 6, 15, 6, 16))
     assert_eq(lsp_one(&server, lsp_request(10, "textDocument/hover", lsp_test_at(uri, 14, 13))),
         lsp_hover_of(10, "Shape.area() -> int", "", 14, 12, 14, 16))
+    // The `Display` every data type has is written by the compiler at the declaration, and names
+    // nothing at the keyword.
+    assert_eq(lsp_one(&server, lsp_request(11, "textDocument/hover", lsp_test_at(uri, 0, 2))), lsp_reply(11, "null"))
     remove_dir_all(dir).unwrap_or(())
 
 private lsp_sym(name: string, kind: int, range: string, selection: string, children: string) -> string =
@@ -427,6 +434,191 @@ lsp_library_file()
     // `data Option[+T]` is on line 3.
     assert_eq(lsp_one(&server, lsp_request(2, "textDocument/definition", lsp_test_at(uri, 3, 6))),
         lsp_location_of(2, uri, 3, 5, 3, 11))
+
+// ---- references, highlights, semantic tokens ----
+
+// A program of two modules naming one of every sort of thing. Line 16 holds a character outside the
+// BMP before the names on it, so a column counted in bytes or in characters would miss.
+private lsp_kinds_text() -> string =
+    "import geo\n" +
+    "\n" +
+    "trait Shape\n" +
+    "    size() -> int\n" +
+    "class Box[T](val item: T, var n: int): Shape\n" +
+    "    override size() -> int = n\n" +
+    "data Pair(a: int, b: int)\n" +
+    "impl Add for Pair\n" +
+    "    add(other: Pair) -> Pair = Pair(a + other.a, b + other.b)\n" +
+    "    static zero() -> Pair = Pair(0, 0)\n" +
+    "data Light\n" +
+    "    Red\n" +
+    "    Green\n" +
+    "val limit: int = 1\n" +
+    "main()\n" +
+    "    var k = geo.area(2, limit)\n" +
+    "    val t = (\"é😀\", Red, k, Pair.zero())\n" +
+    "    k = Box(t, 1).size()\n" +
+    "    print(k)\n"
+
+private struct Kinds
+    dir: string
+    uri: string
+    geo_uri: string
+    server: LspServer
+
+private lsp_kinds() -> Kinds
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    make_dir_all(dir + "/geo").unwrap()
+    write_text(dir + "/geo/shapes.avin", "module geo\n\narea(w: int, h: int) -> int = w * h\n").unwrap()
+    write_text(dir + "/main.avin", lsp_kinds_text()).unwrap()
+    val uri = lsp_file_uri(dir + "/main.avin")
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(uri, lsp_kinds_text())), lsp_publish_of(uri, ""))
+    Kinds(dir, uri, lsp_file_uri(dir + "/geo/shapes.avin"), server)
+
+private lsp_references_at(uri: string, line: int, character: int, declaration: bool) -> string =
+    s"{\"textDocument\":{\"uri\":\"$uri\"},\"position\":{\"line\":$line,\"character\":$character},\"context\":{\"includeDeclaration\":$declaration}}"
+
+private lsp_location(uri: string, l0: int, c0: int, l1: int, c1: int) -> string =
+    s"{\"uri\":\"$uri\",\"range\":${lsp_test_range(l0, c0, l1, c1)}}"
+
+@test("lsp: references to a local, a function in another module and a value, with and without the declaration")
+lsp_references_of_values()
+    var o = lsp_kinds()
+    val uri = o.uri
+    assert_eq(lsp_one(&o.server, lsp_request(2, "textDocument/references", lsp_references_at(uri, 17, 4, true))),
+        lsp_reply(2, s"[${lsp_location(uri, 15, 8, 15, 9)},${lsp_location(uri, 16, 25, 16, 26)},${lsp_location(uri, 17, 4, 17, 5)},${lsp_location(uri, 18, 10, 18, 11)}]"))
+    assert_eq(lsp_one(&o.server, lsp_request(3, "textDocument/references", lsp_references_at(uri, 15, 8, false))),
+        lsp_reply(3, s"[${lsp_location(uri, 16, 25, 16, 26)},${lsp_location(uri, 17, 4, 17, 5)},${lsp_location(uri, 18, 10, 18, 11)}]"))
+    // A function of another module, asked from a use: the declaration is in the other file, and the
+    // places are in the order of their files.
+    assert_eq(lsp_one(&o.server, lsp_request(4, "textDocument/references", lsp_references_at(uri, 15, 17, true))),
+        lsp_reply(4, s"[${lsp_location(o.geo_uri, 2, 0, 2, 4)},${lsp_location(uri, 15, 16, 15, 20)}]"))
+    // A module, from its import and from a member read through it.
+    assert_eq(lsp_one(&o.server, lsp_request(8, "textDocument/references", lsp_references_at(uri, 15, 13, false))),
+        lsp_reply(8, s"[${lsp_location(uri, 0, 7, 0, 10)},${lsp_location(uri, 15, 12, 15, 15)}]"))
+    assert_eq(lsp_one(&o.server, lsp_request(5, "textDocument/references", lsp_references_at(uri, 15, 17, false))),
+        lsp_reply(5, s"[${lsp_location(uri, 15, 16, 15, 20)}]"))
+    assert_eq(lsp_one(&o.server, lsp_request(6, "textDocument/references", lsp_references_at(uri, 13, 5, false))),
+        lsp_reply(6, s"[${lsp_location(uri, 15, 24, 15, 29)}]"))
+    // Nothing is named at a blank line.
+    assert_eq(lsp_one(&o.server, lsp_request(7, "textDocument/references", lsp_references_at(uri, 1, 0, true))), lsp_reply(7, "null"))
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: references to a method are to that declaration, not to the trait member it implements")
+lsp_references_of_methods()
+    var o = lsp_kinds()
+    val uri = o.uri
+    // The call is resolved through the receiver's static type, `Box`, to the override.
+    assert_eq(lsp_one(&o.server, lsp_request(2, "textDocument/references", lsp_references_at(uri, 5, 14, true))),
+        lsp_reply(2, s"[${lsp_location(uri, 5, 13, 5, 17)},${lsp_location(uri, 17, 18, 17, 22)}]"))
+    assert_eq(lsp_one(&o.server, lsp_request(3, "textDocument/references", lsp_references_at(uri, 3, 4, true))),
+        lsp_reply(3, s"[${lsp_location(uri, 3, 4, 3, 8)}]"))
+    // A static member, from its call on the type.
+    assert_eq(lsp_one(&o.server, lsp_request(4, "textDocument/references", lsp_references_at(uri, 16, 34, true))),
+        lsp_reply(4, s"[${lsp_location(uri, 9, 11, 9, 15)},${lsp_location(uri, 16, 33, 16, 37)}]"))
+    assert_eq(lsp_one(&o.server, lsp_request(5, "textDocument/references", lsp_references_at(uri, 16, 34, false))),
+        lsp_reply(5, s"[${lsp_location(uri, 16, 33, 16, 37)}]"))
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: references to a type reach every module and the library")
+lsp_references_of_types()
+    var o = lsp_kinds()
+    val uri = o.uri
+    assert_eq(lsp_one(&o.server, lsp_request(2, "textDocument/references", lsp_references_at(uri, 8, 16, false))),
+        lsp_reply(2, s"[${lsp_location(uri, 7, 13, 7, 17)},${lsp_location(uri, 8, 15, 8, 19)},${lsp_location(uri, 8, 24, 8, 28)},${lsp_location(uri, 8, 31, 8, 35)},${lsp_location(uri, 9, 21, 9, 25)},${lsp_location(uri, 9, 28, 9, 32)},${lsp_location(uri, 16, 28, 16, 32)}]"))
+    // A trait, named after `:` in a class header.
+    assert_eq(lsp_one(&o.server, lsp_request(4, "textDocument/references", lsp_references_at(uri, 2, 8, false))),
+        lsp_reply(4, s"[${lsp_location(uri, 4, 39, 4, 44)}]"))
+    // `Add` is the library's: its uses there are found with the program's own.
+    val answer = parse_json(lsp_one(&o.server, lsp_request(3, "textDocument/references", lsp_references_at(uri, 7, 6, true)))).unwrap().get("result").unwrap()
+    val library = lsp_file_uri(lsp_normal(repository_toolchain().library_dir()))
+    var mine = 0
+    var theirs = 0
+    for i in 0..<answer.len()
+        val at = answer.at(i).unwrap().get("uri").unwrap().as_str().unwrap()
+        if at == uri then mine += 1
+        if at.starts_with(library + "/") then theirs += 1
+    assert_eq(mine, 1)
+    assert(theirs > 1)
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: highlights are the document's uses of a name, its declaration a write")
+lsp_document_highlights()
+    var o = lsp_kinds()
+    assert_eq(lsp_one(&o.server, lsp_request(2, "textDocument/documentHighlight", lsp_test_at(o.uri, 4, 31))),
+        lsp_reply(2, s"[{\"range\":${lsp_test_range(4, 30, 4, 31)},\"kind\":3},{\"range\":${lsp_test_range(5, 29, 5, 30)},\"kind\":2}]"))
+    remove_dir_all(o.dir).unwrap_or(())
+
+// Semantic tokens decoded to absolute places, one `line:character:length:type:modifiers` each.
+private lsp_decoded_tokens(answer: string) -> string
+    val data = parse_json(answer).unwrap().get("result").unwrap().get("data").unwrap()
+    var out = ""
+    var line: long = 0
+    var character: long = 0
+    var i = 0usize
+    while i + 5 <= data.len()
+        var parts: Buf[long] = buf()
+        for j in 0..<5
+            parts.push(data.at(i + j).unwrap().as_int().unwrap())
+        if parts[0] > 0 then character = 0
+        line += parts[0]
+        character += parts[1]
+        if out != "" then out = out + " "
+        out = out + s"$line:$character:${parts[2]}:${LspTokenTypes[usize(parts[3])]}:${lsp_decoded_modifiers(parts[4])}"
+        i += 5
+    out
+
+private lsp_decoded_modifiers(bits: long) -> string
+    var out = ""
+    for k in 0..<LspTokenModifiers.len
+        if (bits & (long(1) << long(k))) != 0
+            out = out + (if out == "" then "" else "+") + LspTokenModifiers[k]
+    if out == "" then "-" else out
+
+@test("lsp: semantic tokens classify every name by what it names, with its modifiers, in UTF-16 columns")
+lsp_semantic_tokens_of_kinds()
+    var o = lsp_kinds()
+    val answer = lsp_one(&o.server, lsp_request(2, "textDocument/semanticTokens/full", s"{\"textDocument\":{\"uri\":\"${o.uri}\"}}"))
+    // Line 16 has `é` (one unit) and `😀` (two) before `Red`, which is at character 20.
+    assert_eq(lsp_decoded_tokens(answer),
+        "0:7:3:namespace:- " +
+        "2:6:5:interface:declaration " +
+        "3:4:4:method:declaration " +
+        "4:6:3:class:declaration 4:10:1:typeParameter:declaration 4:17:4:property:declaration+readonly " +
+        "4:23:1:typeParameter:- 4:30:1:property:declaration 4:39:5:interface:- " +
+        "5:13:4:method:declaration 5:29:1:property:- " +
+        "6:5:4:struct:declaration 6:10:1:property:declaration+readonly 6:18:1:property:declaration+readonly " +
+        "7:5:3:interface:defaultLibrary 7:13:4:struct:- " +
+        "8:4:3:method:declaration 8:8:5:parameter:declaration 8:15:4:struct:- 8:24:4:struct:- 8:31:4:struct:- " +
+        "8:36:1:property:readonly 8:40:5:parameter:- 8:46:1:property:readonly 8:49:1:property:readonly " +
+        "8:53:5:parameter:- 8:59:1:property:readonly " +
+        "9:11:4:method:declaration+static 9:21:4:struct:- 9:28:4:struct:- " +
+        "10:5:5:enum:declaration " +
+        "11:4:3:enumMember:declaration " +
+        "12:4:5:enumMember:declaration " +
+        "13:4:5:variable:declaration+readonly " +
+        "14:0:4:function:declaration " +
+        "15:8:1:variable:declaration 15:12:3:namespace:- 15:16:4:function:- 15:24:5:variable:readonly " +
+        "16:8:1:variable:declaration+readonly 16:20:3:enumMember:- 16:25:1:variable:- 16:28:4:struct:- " +
+        "16:33:4:method:static " +
+        "17:4:1:variable:- 17:8:3:class:- 17:12:1:variable:readonly 17:18:4:method:- " +
+        "18:4:5:function:defaultLibrary 18:10:1:variable:-")
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: semantic tokens of a large library file take a bounded time")
+lsp_semantic_tokens_time()
+    val file = lsp_normal(repository_toolchain().library_dir() + "/avin/vector.avin")
+    val uri = lsp_file_uri(file)
+    var server = lsp_ready()
+    lsp_answer(&server, lsp_open(uri, read_text(file).unwrap()))
+    val start = monotonic()
+    val answer = lsp_one(&server, lsp_request(2, "textDocument/semanticTokens/full", s"{\"textDocument\":{\"uri\":\"$uri\"}}"))
+    val took = whole_millis(monotonic() - start)
+    val count = parse_json(answer).unwrap().get("result").unwrap().get("data").unwrap().len() / 5
+    print(s"lsp: semantic tokens of vector.avin: $count tokens in $took ms")
+    assert(count > 100)
+    assert(took < 2000)
 
 @test("lsp: analyzing again on a change takes a bounded time on the library and a large program")
 lsp_reanalysis_time()
