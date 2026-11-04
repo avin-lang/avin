@@ -453,9 +453,9 @@ Settled by the user on 2026-11-03:
   that is not one of the language's operators names a method, declared like any method and called
   infix (`xs ++ ys`) or dotted (`xs.++(ys)`). The language's operators, including the yielding
   compound forms, are not method names: a type has them through their traits, and a method named
-  `+` is an error saying to implement `Add`. A symbol call binds at the infix-call level and groups
-  left, except that a name ending in `:` groups right with its receiver on the right (`x +: xs` is
-  `xs.+:(x)`, `x` evaluated first); left- and right-grouping calls do not mix without parentheses.
+  `+` is an error saying to implement `Add`. A symbol call groups left, except that a name ending in
+  `:` groups right with its receiver on the right (`x +: xs` is `xs.+:(x)`, `x` evaluated first).
+  The level it binds at, and the bitwise operators a type may define, are settled on 2026-11-04.
   There are no prefix or postfix symbol methods; `++` and `--` update when no operand follows on the
   line. `x op= y` calls the method `op=` where `x`'s type has one, and otherwise is the language's
   compound assignment or, for a symbol method `op`, `x = x op y`. The library uses symbols:
@@ -728,6 +728,26 @@ Settled by the user on 2026-11-04:
   constructor or `apply` that type chooses, as for an overloaded function value; elsewhere the bare
   name stays the object. This amends the earlier rule that the name in call position is only the
   constructor and that an object cannot be called.
+
+- **A method named by a symbol binds at the level of the language's operator its first character
+  belongs to**, on Avin's own table, tightest first: a name starting with any character that starts
+  no operator below (`~`, `?`) binds above multiplication; `*`, `/`, `%`, `<<` and `>>` names with
+  the multiplicative operators and shifts; `+` and `-` names with the additive operators; `&`, `^`
+  and `|` names with those bitwise operators, `&` tightest; `:` names with `::`; then ranges and
+  methods called by a word (`a max b`); `<`, `>`, `=` and `!` names with the comparisons; and a name
+  ending in `=` that is not a comparison (`+=`, `++=`, `|=`) is an assignment. A name ending in `:`
+  still groups right with its receiver on the right, and left- and right-grouping operators at one
+  level, symbol, word or the language's own, do not mix without parentheses (`1 :: xs :+ 2` is an
+  error; `1 +: xs :+ 2` is `(1 +: xs) :+ 2`). So `xs ++ ys :+ z` is `(xs ++ ys) :+ z`, and the
+  combinators `a ~ b ^^ f | c ~ d` read `((a ~ b) ^^ f) | (c ~ d)`. **`&`, `^`, `|` and `~`
+  between two operands are free method names** for every type but the integers and bytes, whose
+  bitwise operators stay the machine's and cannot be redefined, by an extension either; `a | b` on
+  such a type calls its method `|`, and `x |= y` calls `|=` where the type has one and is otherwise
+  `x = x | y`. Prefix `~` stays the integers' and bytes' complement. `+ - * / %` and the
+  comparisons still come only through their traits, and `&&`, `||`, `!`, `===`, `!==`, `::`, `=`,
+  `:=`, `->`, `?`, `..` and `..<` stay reserved. This replaces the earlier rule that every symbol
+  call binds at the level of `a max b`. See [methods named by
+  symbols](/spec/operators-and-control-flow/#methods-named-by-symbols).
 
 **Deferred**
 

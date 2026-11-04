@@ -1220,6 +1220,10 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
     // one overloads. Impls adding to different types built from one, as `Option[Option[T]]` and
     // `Option[List[T]]`, are told apart by the receiver at a call; extensions of two modules, by
     // which of the modules a file imports.
+    // The bitwise operators of the integers and bytes are the machine's, which no method replaces.
+    if bitwise_method_name(f.name) && (*target is Int(_) || *target is Byte)
+        c.note(unit, f.name_span, s"`${f.name}` is the language's operator on ${type_name(target)}, and no method can redefine it")
+        return
     var same_name: Buf[usize] = buf()
     for tm in c.trait_methods
         val other = c.symbols[tm.function]
@@ -6444,7 +6448,10 @@ private compound_assign(c: *Checker, e: &Expr, target: &Expr, spelling: string, 
             args.push(Argument(value.span, None, value, false))
             if !takes_one_argument(c, ms) then result = infix_arity_error(c, e.span, op_span, target, spelling, ms, args)
             else result = call_method(c, e.span, op_span, current, spelling, ms, args, None, None, false)
-        elif op is Some(_) then result = assign_place(c, e, place, op, value, false, op_span)
+        elif op is Some(o)
+            // `x |= y` on a type with a method `|` and none `|=` is `x = x | y`.
+            if bitwise_method(c, o, current.ty) then result = assign_place(c, e, place, None, Expr(e.span, Binary(o, place, value, op_span)), false, op_span)
+            else result = assign_place(c, e, place, op, value, false, op_span)
         else
             val name = spelling[0..<spelling.bytes.len - 1]
             if language_operator(name) || groups_right(name)
@@ -6876,7 +6883,24 @@ private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Ex
         val r = check_expr(c, right, expected)
         return operate(c, e.span, op_span, op, binary_spelling(op), check_expr(c, left, Some(r.ty)), r)
     val l = check_expr(c, left, expected)
+    if bitwise_method(c, op, l.ty) then return bitwise_call(c, e.span, op_span, left, l, binary_spelling(op), right, expected)
     operate(c, e.span, op_span, op, binary_spelling(op), l, check_expr(c, right, Some(l.ty)))
+
+/** Whether `a op b` with `a` of type `t` calls `a`'s method named `op`: `op` is `&`, `^` or `|`, and
+ * `t` is not an integer or a byte, whose bitwise operators are the machine's, but has such a method. */
+private bitwise_method(c: *Checker, op: BinaryOp, t: &Type) -> bool
+    if !(op is BitAnd || op is BitOr || op is BitXor) then return false
+    val known = zonk(c, t)
+    if *known is Int(_) || *known is Byte || !settled(known) then return false
+    methods_of(c, known, binary_spelling(op)).len() > 0
+
+// `a | b` on a type with a method `|` is the call `a.|(b)`, as a symbol method's infix call is.
+private bitwise_call(c: *Checker, at: Span, op_span: Span, left: &Expr, receiver: &TExpr, name: string, right: &Expr, expected: Option[&Type]) -> &TExpr
+    val ms = methods_of(c, receiver.ty, name)
+    var args: Buf[Argument] = buf()
+    args.push(Argument(right.span, None, right, false))
+    if !takes_one_argument(c, ms) then return infix_arity_error(c, at, op_span, left, name, ms, args)
+    call_method(c, at, op_span, receiver, name, ms, args, None, expected, false)
 
 // Arithmetic, bitwise and shift operators take two operands of one type and yield that type.
 // Integers have them all; reals have arithmetic; bytes have bitwise operators and shifts. `at` is
@@ -6905,6 +6929,10 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
                 return TExpr(at, ErrorType, UnitConst)
             if !operator_conforms(c, at, spelling, zonk(c, l.ty), om.trait_name) then return TExpr(at, ErrorType, UnitConst)
             return TExpr(at, zonk(c, l.ty), Arith(op, l, r, op_at))
+        // `&`, `^` and `|` on such a type are methods of those names, which this one lacks.
+        if op is BitAnd || op is BitOr || op is BitXor
+            c.note(unit_of(c), at, s"`${type_name(zonk(c, l.ty))}` has no method `$spelling`")
+            return TExpr(at, ErrorType, UnitConst)
     if !numeric || !same_type(l.ty, r.ty)
         c.note(unit_of(c), at, s"`$spelling` needs two numbers of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}")
         return TExpr(at, ErrorType, UnitConst)
@@ -8490,7 +8518,7 @@ private split_hint(name: string) -> string
     if n < 2 || !is_operator_spelling(name) || name == "++" || name == "--" then return ""
     val last = name[(n - 1)..<n]
     val head = name[0..<n - 1]
-    if (last == "-" || last == "+" || last == "!" || last == "~") && language_operator(head)
+    if (last == "-" || last == "+" || last == "!" || last == "~") && (language_operator(head) || compound_operator(head))
         return s"; `$head` followed by a prefix `$last` needs a space between them"
     ""
 
