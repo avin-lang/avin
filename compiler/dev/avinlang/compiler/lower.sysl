@@ -1771,14 +1771,44 @@ private crossing(l: *Lowering, t: &Type, layouts: *Buf[Operand]) -> &Crossing
 
 // The address of the core library's function `name` for vectors of `element`, which a shim calls to
 // make or to read a vector.
-private vector_function(l: *Lowering, name: string, element: &Type) -> Operand
+private vector_function(l: *Lowering, name: string, element: &Type) -> Operand = FunctionAddress(library_instance(l, name, element))
+
+/** The instance of the core library's function `name`, which has one type parameter, at `element`. */
+private library_instance(l: *Lowering, name: string, element: &Type) -> usize
     for id in 0..<l.program.symbols.len()
         val s = l.program.symbols[id]
         if s.module_name == "avin" && s.name == name && s.owner_class is None && s.receiver is None
             var args: Buf[&Type] = buf()
             args.push(element)
-            return FunctionAddress(instance(l, id, args))
+            return instance(l, id, args)
     panic("the core library declares no " + name)
+
+/** The element type of `t` when it is a sequence: the core library's `Seq` itself, or a class or
+ * data type conforming to it. */
+private seq_element(l: *Lowering, t: &Type) -> Option[&Type]
+    val seq = core_class(l, "Seq")?
+    if *t is Class(k, _, a)
+        if k == seq then return Some(a[0])
+    if !(*t is Class(_, _, _) || *t is Data(_, _, _)) then return None
+    var up: Buf[&Type] = buf()
+    class_ancestors(l, t, &up)
+    for p in up
+        if *p is Class(k, _, a)
+            if k == seq then return Some(a[0])
+    None
+
+/** Whether `t` is the core library's `Seq`. */
+private is_core_seq(l: *Lowering, t: &Type) -> bool
+    val seq = core_class(l, "Seq")
+    if seq is Some(s)
+        if *t is Class(k, _, _) then return k == s
+    false
+
+/** Whether `t` is a trait or an abstract class, whose values are of the types that implement it. */
+private is_abstract_or_trait(l: *Lowering, t: &Type) -> bool
+    if *t is Class(k, _, _)
+        return l.program.classes[k].decl.modifier == "trait" || l.program.classes[k].decl.modifier == "abstract"
+    false
 
 // The core library's `Array` of `element`.
 private array_type(l: *Lowering, element: &Type) -> &Type
@@ -2578,6 +2608,14 @@ private compare_link(l: *Lowering, op: CompareOp, x: &Type, y: &Type, a: Operand
     val s = concrete(l, x)
     val t = concrete(l, y)
     if op is Equal || op is NotEqual
+        // Two sequences compare by their elements, of whichever kinds, so the comparison is the
+        // library's own, at the element type.
+        if seq_element(l, s) is Some(es)
+            if seq_element(l, t) is Some(et)
+                if !same_type(s, t) || is_abstract_or_trait(l, s)
+                    val element = if is_core_seq(l, t) then et else es
+                    val equal = call_instance(l, library_instance(l, "seqEquals", element), two(a, b), Some(MBool)).unwrap()
+                    return if op is Equal then equal else binary(l, MBool, OpXor, equal, ConstBool(true))
         // A value whose type is decided at run time compares through its record, whichever side
         // holds it.
         val common = if decided_at_run_time(l, t) then t else s
@@ -2995,15 +3033,17 @@ private equals_values(l: *Lowering, t: &Type, a: Operand, b: Operand) -> Operand
     Function(_, _) -> compare(l, CmpEq, a, b)
     ByName(_) -> compare(l, CmpEq, a, b)
     _ ->
-        if decided_at_run_time(l, t) then call_instance(l, generated(l, AnyEquals, AnyType), two(a, b), Some(MBool)).unwrap()
+        if is_abstract_or_trait(l, t) && seq_element(l, t) is Some(e) then call_instance(l, library_instance(l, "seqEquals", e), two(a, b), Some(MBool)).unwrap()
+        elif decided_at_run_time(l, t) then call_instance(l, generated(l, AnyEquals, AnyType), two(a, b), Some(MBool)).unwrap()
         else own_equals(l, t, a, b)
 
 /** `a == b` for two values whose type is exactly `t`, a class, data or tuple type: the type's own
- * `equals`, or field by field, or by identity. */
+ * `equals`, or by elements for a sequence, or field by field, or by identity. */
 private own_equals(l: *Lowering, t: &Type, a: Operand, b: Operand) -> Operand
     if *t is Class(_, _, _) || *t is Data(_, _, _)
         if l.program.core.method_named("equals") is Some(eq)
             if explicit_implementation(l, t, eq) is Some(i) then return call_instance(l, i, two(a, b), Some(MBool)).unwrap()
+        if seq_element(l, t) is Some(e) then return call_instance(l, library_instance(l, "seqEquals", e), two(a, b), Some(MBool)).unwrap()
     *t match
         Data(_, _, _) -> call_instance(l, generated(l, StructuralEquals, t), two(a, b), Some(MBool)).unwrap()
         Tuple(_) -> call_instance(l, generated(l, StructuralEquals, t), two(a, b), Some(MBool)).unwrap()
@@ -3021,7 +3061,8 @@ private hash_value(l: *Lowering, t: &Type, a: Operand) -> Operand = *t match
     Function(_, _) -> runtime_call(l, "avin_rt_identity_hash", [MRef], MInt(64), [a])
     ByName(_) -> runtime_call(l, "avin_rt_identity_hash", [MRef], MInt(64), [a])
     _ ->
-        if decided_at_run_time(l, t) then call_instance(l, generated(l, AnyHash, AnyType), one(a), Some(MInt(64))).unwrap()
+        if is_abstract_or_trait(l, t) && seq_element(l, t) is Some(e) then call_instance(l, library_instance(l, "seqHash", e), one(a), Some(MInt(64))).unwrap()
+        elif decided_at_run_time(l, t) then call_instance(l, generated(l, AnyHash, AnyType), one(a), Some(MInt(64))).unwrap()
         else own_hash(l, t, a)
 
 /** The hash of a value whose type is exactly `t`, a class, data or tuple type. */
@@ -3029,6 +3070,7 @@ private own_hash(l: *Lowering, t: &Type, a: Operand) -> Operand
     if *t is Class(_, _, _) || *t is Data(_, _, _)
         if l.program.core.method_named("hash") is Some(h)
             if explicit_implementation(l, t, h) is Some(i) then return call_instance(l, i, one(a), Some(MInt(64))).unwrap()
+        if seq_element(l, t) is Some(e) then return call_instance(l, library_instance(l, "seqHash", e), one(a), Some(MInt(64))).unwrap()
     *t match
         Data(_, _, _) -> call_instance(l, generated(l, StructuralHash, t), one(a), Some(MInt(64))).unwrap()
         Tuple(_) -> call_instance(l, generated(l, StructuralHash, t), one(a), Some(MInt(64))).unwrap()

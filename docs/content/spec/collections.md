@@ -564,6 +564,12 @@ from the last element to the first. The [methods every Iterable has](#methods-ev
 its elements another way overrides the ones that would be slow: a list walks from its front, so on a
 list each of them takes time proportional to its length.
 
+**Equality is written once on `Seq`**: two sequences with equal elements in the same order are equal
+and hash alike, whichever kinds they are, so `[1, 2, 3] == List(1, 2, 3)` and `[1, 2, 3] == (1..3)`
+are `true`, and a `Seq[int]` key finds an entry stored under a vector, a list or a range of the same
+elements. The two sides need the same element type. A class of the program's own that implements
+`Seq` is compared the same way unless it implements `Eq` itself.
+
 ```text
 total(xs: Seq[int]) -> int = xs.foldLeft(0, (acc, x) -> acc + x)
 

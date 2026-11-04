@@ -940,6 +940,22 @@ Settled by the user on 2026-11-04:
   `++(other: List[T])` and `Seq`'s `++(other: Iterable[T])` are overloads of which the first is
   more specific.
 
+- **Two sequences are equal when they have the same elements in order, whichever kinds they are**:
+  a `Vector`, `List`, `ArraySeq`, `Array`, `Buffer`, `Deque` and `Range` of equal elements compare
+  equal with `==` and hash alike, with one comparison and one hash written once on `Seq` for them
+  all. `==` between two sequence types needs the same element type on both sides (a `Vector[int]`
+  and a `List[string]` are a compile-time error, as any two types with no common type are); a
+  value typed as `Seq[T]` compares with any sequence. A class that implements `Eq` itself keeps its
+  own equality between two of its instances. Through `Any` the values' own types still decide, so
+  a vector and a list held as `Any` are unequal. The mutable `Array`, `Buffer` and `Deque` compare
+  as they are when the comparison runs, so a hash held across a change is stale, as it was before.
+- Ranges of other integer types as values (`Range[long]`, `Range[i16]`) are not decided. The
+  endpoint type would be an `[T: Integer]` parameter, but the count of a range of `long`s or of
+  `i8`s needs a type wider than `T`, a `Seq[T]`'s `length()` is an `int` that a `long` range can
+  exceed (trapping, as `int.min .. int.max` does), and a bare `Range` written in signatures means
+  the `int` range today. `for` over a range written in place already counts any integer type.
+  Awaiting the user's choice of how `Range` is spelled and what type its `by` step has.
+
 - `avin.process` ([system library](/spec/system-library/)): `args() -> Vector[string]` holds the
   arguments after the program's name, and `programName()` gives the name separately; `env(name)` is
   an `Option[string]`; `exit(code: int) -> Nothing` flushes standard output first, as a trap does.
