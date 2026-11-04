@@ -284,7 +284,8 @@ total(Array.fill(4, 1))            // an Array
 Impls add more to every sequence ([impl](/spec/declarations/#impl)), written once on `Seq` and
 reached through generic code over `Seq[T]` as on each sequence type: `contains(element)` and
 `indexOf(element)`, which compare with `equals` and are `exists` and `indexWhere`, so a list walks
-itself once; where the elements display, `mkString`; and where they are ordered, `max()` and `min()`.
+itself once; where the elements display, `mkString`; where they are ordered, `max()` and `min()`;
+and the sorts, `sorted()`, `sortedBy` and `sortedWith` ([sorting](#sorting)).
 
 ```text
 present[T](xs: Seq[T], x: T) -> bool = xs.contains(x)
@@ -310,6 +311,47 @@ val pending: Deque[string] = ["build", "test"]
 pending.addFirst("fetch")
 while pending.nonEmpty() do run(pending.removeFirst())
 ```
+
+## Sorting
+
+Every sequence sorts into a new one, and the mutable sequences also sort in place. A comparison is
+what `Ord.compare` answers: negative, zero or positive as its first argument orders before, with or
+after its second.
+
+- On every `Seq`: `sorted()` where the elements are `Ord`, ascending; `sortedBy(key)`, ascending by
+  a key that is `Ord`; and `sortedWith(compare)`, by any comparison. They answer a `Vector` and leave
+  the sequence as it was. A `List` has its own three, which answer a `List`, as its `map` and
+  `filter` do: a list sorted is usually used as a list, walked from its front or matched with `::`,
+  and the conversion would otherwise be the caller's every time. A vector needs no sorts of its own,
+  since `Seq`'s already answer a vector.
+- On `Array`, `Buffer` and `Deque`: `sort()`, `sortBy(key)` and `sortWith(compare)` reorder the
+  elements in place and answer unit. A deque sorts front first, wherever its ring starts.
+
+**Every sort is stable**: elements that compare equal keep the order they had, so sorting by one
+field and then by another orders by the second with the first breaking ties. **Every sort takes
+time proportional to n log n comparisons in the worst case** and memory for one copy of the
+elements: it is a merge sort, which sorts runs of 16 elements by insertion and then merges them
+pairwise between the elements and one scratch array, the runs doubling each pass.
+
+**`sortBy` computes `key` once for each element**, before any comparison, and sorts the elements as
+their keys sort; so a key that is costly to compute, such as a string built from the element, costs
+n computations rather than one per comparison, at the price of an array of the keys. `sortWith`
+calls `compare` as the sort needs it, and `sorted()` is `sortWith` by `compare`.
+
+```text
+data Entry(rank: int, name: string)
+
+val entries = [Entry(2, "b"), Entry(1, "a"), Entry(2, "c")]
+entries.sortedBy(e -> e.rank)                       // a, b, c: b still before c
+entries.sortedWith((x, y) -> y.rank.compare(x.rank)) // b, c, a
+val scores: Array[int] = [3, 1, 2]
+scores.sort()                                        // [1, 2, 3]
+```
+
+Strings order by code point (their bytes, which in UTF-8 order the same), so every capital comes
+before every small letter; reals order as IEEE 754 does. Sorting elements without `Ord` by
+`sorted()` or `sort()` is a compile-time error naming the bound, and `sortWith` is the way to sort
+them.
 
 ## Ranges
 

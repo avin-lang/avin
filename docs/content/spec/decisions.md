@@ -561,6 +561,14 @@ Settled by the user on 2026-11-03:
 
 ## Proposed
 
+- Sorting ([collections](/spec/collections/#sorting)): every `Seq` has `sorted()` (elements `Ord`),
+  `sortedBy[K: Ord](key)` and `sortedWith(compare: (T, T) -> int)`, answering a `Vector`; `List`
+  has its own three answering a `List`. `Array`, `Buffer` and `Deque` sort in place with `sort()`,
+  `sortBy(key)` and `sortWith(compare)`. Every sort is a stable merge sort, O(n log n) comparisons
+  in the worst case with one scratch copy of the elements; `sortBy` computes `key` once per
+  element. `avin.fs.listDir` answers its names sorted by code point rather than in the file
+  system's order.
+
 - `avin.process` ([system library](/spec/system-library/)): `args() -> Vector[string]` holds the
   arguments after the program's name, and `programName()` gives the name separately; `env(name)` is
   an `Option[string]`; `exit(code: int) -> Nothing` flushes standard output first, as a trap does.
@@ -575,7 +583,8 @@ Settled by the user on 2026-11-03:
   each failure an `IoError` in a `Result`. Writing replaces a file and appending creates one;
   `createDirAll` accepts a directory already there and `removeDirAll` a path already gone.
   `listDir(dir) -> Result[Vector[string], IoError]` answers the entries' names, without the
-  directory and without `.` and `..`, in the file system's order, which is unspecified.
+  directory and without `.` and `..`, sorted by code point, so two listings of an unchanged
+  directory agree.
 - Standard input and error, in `avin.io` beside `IoError` ([system library](/spec/system-library/)):
   standard input as text through `readLine() -> Option[string]`, `lines() -> Iterator[string]` and
   `readAll() -> string`, sharing one runtime-held buffer. A line ends at `\n` with a `\r` before it
