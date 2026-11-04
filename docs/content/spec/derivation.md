@@ -482,8 +482,8 @@ impl DisplayFields
 
 `Eq` is `Ord`'s shape with `equals`, and `Debug` is `Display`'s with `debug`. The visitors of `Eq`
 and `Ord` take only a few values, each a module value, so comparing allocates nothing, and a derived
-`compare` is -1, 0 or 1; a derived `Display` allocates its one visitor, and a `Hash` one per field. A class without
-constructor parameters has a variant without fields, so it displays as its bare name, as such a
+`compare` is -1, 0 or 1. A derived `Display`'s visitor never leaves the method that makes it, so it
+is kept as its field and allocates nothing either. A class without constructor parameters has a variant without fields, so it displays as its bare name, as such a
 variant does.
 
 What stays the compiler's is when the templates apply. A class derives `Eq` and `Hash` together,
