@@ -1092,6 +1092,10 @@ Settled by the user on 2026-11-04:
   `minus` and `since`, because an operator trait takes and yields the implementing type alone. The
   text forms are a duration's largest-unit form (`1.5ms`) and an ISO 8601 UTC timestamp. Sleeping
   and calendar fields beyond the timestamp text are not part of it yet.
+- Raw strings ([strings and formatting](/spec/strings-and-formatting/)): `raw"…"` reads no escape,
+  so a backslash is an ordinary character (`raw"C:\dir"`, `raw"a\"` is `a\`) and the literal ends at
+  the first `"` outside a hole. A `"` cannot be written inside the text of a raw string; a hole can
+  supply one (`raw"${"\""}"`). Holes (`${…}`, `$name`) and `$$` work as in every interpolator.
 
 ## Open
 

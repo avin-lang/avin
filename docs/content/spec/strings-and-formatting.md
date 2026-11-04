@@ -11,7 +11,7 @@ here.
 | Form | Meaning |
 | --- | --- |
 | `"…"` | Ordinary string with escapes |
-| `raw"…"` | Raw string, with no escape processing |
+| `raw"…"` | Raw string, with no escape processing: a backslash is an ordinary character, and the literal ends at the first `"` outside a hole |
 | Text blocks | Multi-line literals with Sysl's indentation and line-joining rules |
 | `s"…"` | Interpolation: `$name`, `${expression}`, `$$` |
 | `f"…"` | Formatted interpolation: a specifier after a hole (`${x}%08.3f`) |
