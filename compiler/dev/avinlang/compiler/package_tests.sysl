@@ -469,3 +469,149 @@ tidy_command_line()
     put(dir + "/plain/main.avin", "main() = 0\n")
     assert(avin(dir, ["avin", "tidy", dir + "/plain"]).noted.contains("is in no package"))
     assert_eq(avin(dir, ["avin", "tidy", "--bad"]).status, 2)
+
+// `plain` at v1.0.0 holds no manifest, and `untagged` has a commit and no release, both served beside
+// the packages `published` makes.
+private not_packages(dir: string)
+    val plain = dir + "/work/plain"
+    put(plain + "/readme.txt", "no manifest here\n")
+    git(plain, ["init", "-q"])
+    commit_and_tag(plain, "v1.0.0")
+    val untagged = dir + "/work/untagged"
+    put(untagged + "/avin.hocon", manifest("untagged", ""))
+    git(untagged, ["init", "-q"])
+    git(untagged, ["add", "-A"])
+    git(untagged, ["commit", "-q", "-m", "first"])
+    git(dir, ["clone", "-q", "--bare", plain, dir + "/remotes/example.com/avin/plain.git"])
+    git(dir, ["clone", "-q", "--bare", untagged, dir + "/remotes/example.com/avin/untagged.git"])
+
+private sum_versions(file: string) -> string
+    var out = ""
+    for l in read_sums(file).unwrap()
+        out = out + l.coordinate + " v" + l.version + "\n"
+    out
+
+@test("avin add records a git dependency in the manifest, fetches it and adds its hash to avin.sum, leaving comments and layout alone")
+add_records_dependency()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    published(dir)
+    put(dir + "/other/avin.hocon", manifest("other", ""))
+    val app = dir + "/app"
+    val before = "# the app\npackage {\n  name = \"app\"  # its name\n  version = \"0.1.0\"\n}\n\n# what it uses\ndependencies {\n  other { path = \"../other\" }  # a sibling\n}\n"
+    put(app + "/avin.hocon", before)
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    var said = ""
+    add_dependency(app, "example.com/avin/shapes@0.1.0", fetching, s -> said = said + s + "\n").unwrap()
+    assert_eq(said, "added shapes: example.com/avin/shapes v0.1.0\n")
+    val after = read_text(app + "/avin.hocon").unwrap()
+    assert_eq(after, "# the app\npackage {\n  name = \"app\"  # its name\n  version = \"0.1.0\"\n}\n\n# what it uses\ndependencies {\n  other { path = \"../other\" }  # a sibling\n  shapes { git = \"example.com/avin/shapes\", version = \"0.1.0\" }\n}\n")
+    assert_eq(sum_versions(app + "/avin.sum"), "example.com/avin/shapes v0.1.0\n")
+    assert_eq(read_manifest(app).unwrap().dependencies.len(), 2)
+    // A second dependency, and one whose own dependencies are fetched and recorded too.
+    add_dependency(app, "example.com/avin/extra@0.1.0", fetching, s -> ()).unwrap()
+    assert_eq(sum_versions(app + "/avin.sum"), "example.com/avin/shapes v0.1.0\nexample.com/avin/extra v0.1.0\nexample.com/avin/shapes v0.2.0\n")
+    assert(read_text(app + "/avin.hocon").unwrap().contains("  extra { git = \"example.com/avin/extra\", version = \"0.1.0\" }\n}\n"))
+    assert(read_text(app + "/avin.hocon").unwrap().starts_with("# the app\n"))
+    // The result is a manifest tidy agrees with.
+    assert_eq(tidy(app, fetching, true, s -> ()).unwrap(), true)
+
+@test("avin add without a version takes the highest release, and adding again changes the version in place")
+add_without_version_and_again()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    published(dir)
+    val app = dir + "/app"
+    put(app + "/avin.hocon", manifest("app", ""))
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    // No dependencies block yet: one is added at the end.
+    add_dependency(app, "example.com/avin/shapes", fetching, s -> ()).unwrap()
+    assert_eq(read_text(app + "/avin.hocon").unwrap(), manifest("app", "\ndependencies {\n  shapes { git = \"example.com/avin/shapes\", version = \"0.2.0\" }\n}\n"))
+    assert_eq(sum_versions(app + "/avin.sum"), "example.com/avin/shapes v0.2.0\n")
+    // Asking for the older version changes the one line, and the sum file only gains.
+    var said = ""
+    add_dependency(app, "example.com/avin/shapes@0.1.0", fetching, s -> said = said + s + "\n").unwrap()
+    assert_eq(said, "updated shapes to example.com/avin/shapes v0.1.0\n")
+    assert_eq(read_text(app + "/avin.hocon").unwrap(), manifest("app", "\ndependencies {\n  shapes { git = \"example.com/avin/shapes\", version = \"0.1.0\" }\n}\n"))
+    assert_eq(sum_versions(app + "/avin.sum"), "example.com/avin/shapes v0.2.0\nexample.com/avin/shapes v0.1.0\n")
+    assert_eq(read_manifest(app).unwrap().dependencies.len(), 1)
+    // Adding it again with no version is the highest once more, and a dependency under another name
+    // is the same dependency.
+    put(app + "/avin.hocon", manifest("app", "dependencies {\n  shp { git = \"example.com/avin/shapes\", version = \"0.1.0\" }\n  # last\n}\n"))
+    add_dependency(app, "example.com/avin/shapes", fetching, s -> ()).unwrap()
+    assert_eq(read_text(app + "/avin.hocon").unwrap(), manifest("app", "dependencies {\n  shp { git = \"example.com/avin/shapes\", version = \"0.2.0\" }\n  # last\n}\n"))
+
+@test("avin add into an empty dependencies block, one written on a line, and a block closed after its last entry")
+add_into_block_shapes()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    published(dir)
+    val app = dir + "/app"
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    val entry = "  shapes { git = \"example.com/avin/shapes\", version = \"0.1.0\" }"
+    put(app + "/avin.hocon", manifest("app", "dependencies {}\n"))
+    add_dependency(app, "example.com/avin/shapes@0.1.0", fetching, s -> ()).unwrap()
+    assert_eq(read_text(app + "/avin.hocon").unwrap(), manifest("app", "dependencies {\n" + entry + "\n}\n"))
+    put(app + "/avin.hocon", manifest("app", "dependencies { extra { git = \"example.com/avin/extra\", version = \"0.1.0\" } }\n"))
+    add_dependency(app, "example.com/avin/shapes@0.1.0", fetching, s -> ()).unwrap()
+    assert_eq(read_text(app + "/avin.hocon").unwrap(), manifest("app", "dependencies { extra { git = \"example.com/avin/extra\", version = \"0.1.0\" }\n" + entry + "\n}\n"))
+    assert_eq(read_manifest(app).unwrap().dependencies.len(), 2)
+
+@test("avin add refuses what it cannot fetch or what is not a package, and leaves the manifest and avin.sum as they were")
+add_refusals()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    published(dir)
+    not_packages(dir)
+    val app = dir + "/app"
+    val text = manifest("app", "dependencies {\n  shapes { git = \"example.com/avin/shapes\", version = \"0.1.0\" }\n}\n")
+    put(app + "/avin.hocon", text)
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    add_dependency(app, "example.com/avin/shapes@0.1.0", fetching, s -> ()).unwrap()
+    val sums = read_text(app + "/avin.sum").unwrap()
+    val refused = (source: string) -> add_dependency(app, source, fetching, s -> ()).unwrap_err()
+    // A repository the host does not have, with and without a version.
+    assert(refused("example.com/avin/nothing").contains("cannot list the releases of example.com/avin/nothing"))
+    assert(refused("example.com/avin/nothing@1.0.0").contains("cannot fetch example.com/avin/nothing v1.0.0"))
+    // A tag the repository does not have, and a repository with no release at all.
+    assert(refused("example.com/avin/shapes@9.0.0").contains("cannot fetch example.com/avin/shapes v9.0.0"))
+    assert(refused("example.com/avin/untagged").contains("has no release tag"))
+    // A repository that is not an Avin package.
+    assert(refused("example.com/avin/plain@1.0.0").contains("holds no avin.hocon, so it is not an Avin package"))
+    assert(refused("example.com/avin/plain").contains("holds no avin.hocon, so it is not an Avin package"))
+    // A source that is not spelled as one.
+    assert(refused("https://example.com/avin/shapes").contains("is not a git coordinate"))
+    assert(refused("example.com/avin/shapes.git@1.0.0").contains("is not a git coordinate"))
+    assert(refused("example.com/avin/shapes@1.0").contains("is not a version"))
+    assert(refused("example.com/avin/shapes@1.0.0@2.0.0").contains("is not a source"))
+    assert(refused("shapes").contains("is not a git coordinate"))
+    assert_eq(read_text(app + "/avin.hocon").unwrap(), text)
+    assert_eq(read_text(app + "/avin.sum").unwrap(), sums)
+    // A package that depends on a path that is gone is refused after the edit, and the edit is undone.
+    put(app + "/avin.hocon", manifest("app", "dependencies {\n  gone { path = \"../gone\" }\n}\n"))
+    val broken = read_text(app + "/avin.hocon").unwrap()
+    assert(refused("example.com/avin/shapes@0.2.0").contains("`gone` is a path dependency"))
+    assert_eq(read_text(app + "/avin.hocon").unwrap(), broken)
+    // A workspace's root with no package of its own takes none, and a package cannot depend on itself.
+    put(dir + "/ws/avin.hocon", "workspace = [\"m\"]\n")
+    put(dir + "/ws/m/avin.hocon", manifest("m", ""))
+    assert(add_dependency(dir + "/ws", "example.com/avin/shapes@0.1.0", fetching, s -> ()).unwrap_err().contains("takes no dependencies"))
+    put(app + "/avin.hocon", manifest("shapes", ""))
+    assert(refused("example.com/avin/shapes@0.1.0").contains("cannot depend on itself"))
+
+@test("avin add on the command line: usage, and a path in no package")
+add_command_line()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    assert_eq(avin(dir, ["avin", "add"]).status, 2)
+    assert_eq(avin(dir, ["avin", "add", "--bad"]).status, 2)
+    assert_eq(avin(dir, ["avin", "add", "a", "b", "c"]).status, 2)
+    put(dir + "/plain/main.avin", "main() = 0\n")
+    val outside = avin(dir, ["avin", "add", "github.com/owner/json@1.0.0", dir + "/plain"])
+    assert_eq(outside.status, 1)
+    assert(outside.noted.contains("is in no package"))
+    put(dir + "/app/avin.hocon", manifest("app", ""))
+    val bad = avin(dir, ["avin", "add", "json", dir + "/app"])
+    assert_eq(bad.status, 1)
+    assert(bad.noted.contains("is not a git coordinate"))
+    assert_eq(read_text(dir + "/app/avin.hocon").unwrap(), manifest("app", ""))

@@ -1,0 +1,167 @@
+module avin.time
+
+// Measuring time and reading the clock. A `Duration` is a length of time, an `Instant` a reading of
+// the monotonic clock, which only moves forward and so is the one to measure with, and a `WallTime` a
+// reading of the wall clock, which anyone may set and which is the one to stamp something with. The
+// two clocks are different types, so a reading of one is never subtracted from a reading of the
+// other. Every quantity counts whole microseconds, and arithmetic that leaves the range of a `long`
+// of them, about 292,000 years, traps.
+
+@sysl("avin.rt.monotonic_micros")
+private monotonicMicros() -> long
+
+@sysl("avin.rt.wall_micros")
+private wallMicros() -> long
+
+private val MicrosPerMilli: long = 1000
+
+private val MicrosPerSecond: long = 1000000
+
+private val MicrosPerMinute: long = 60000000
+
+private val MicrosPerHour: long = 3600000000
+
+private val MicrosPerDay: long = 86400000000
+
+// A length of time, positive, zero or negative, in whole microseconds.
+data Duration(micros: long) derives Ord
+
+// The durations of `n` of each unit; a count too large for a duration traps.
+microseconds(n: long) -> Duration = Duration(n)
+milliseconds(n: long) -> Duration = Duration(n * MicrosPerMilli)
+seconds(n: long) -> Duration = Duration(n * MicrosPerSecond)
+minutes(n: long) -> Duration = Duration(n * MicrosPerMinute)
+hours(n: long) -> Duration = Duration(n * MicrosPerHour)
+
+// The zero-length duration.
+zero() -> Duration = Duration(0)
+
+impl Duration
+    // The whole units in the duration, a fraction of a unit dropped toward zero.
+    inMilliseconds() -> long = micros / MicrosPerMilli
+    inSeconds() -> long = micros / MicrosPerSecond
+    inMinutes() -> long = micros / MicrosPerMinute
+
+    // The duration in seconds, with the fraction.
+    inSecondsReal() -> real = real(micros) / 1000000.0
+
+    isNegative() -> bool = micros < 0
+
+    // The duration without its sign; the least duration has no absolute value and traps.
+    abs() -> Duration = if micros < 0 then Duration(-micros) else self
+
+    // The duration `n` times over, and the duration divided into `n` equal parts, a remainder
+    // dropped toward zero; dividing by zero traps.
+    times(n: long) -> Duration = Duration(micros * n)
+    dividedBy(n: long) -> Duration = Duration(micros / n)
+
+impl Add for Duration
+    add(other: Duration) -> Duration = Duration(micros + other.micros)
+    static zero() -> Duration = Duration(0)
+
+impl Sub for Duration
+    subtract(other: Duration) -> Duration = Duration(micros - other.micros)
+
+impl Neg for Duration
+    negate() -> Duration = Duration(-micros)
+
+// `n` written in decimal, padded on the left with zeros to `width` digits.
+private padded(n: long, width: int) -> string
+    var text = n.toString()
+    while text.byteLength() < width do text = "0" + text
+    text
+
+// A duration reads in the largest unit it fills, with its fraction and no trailing zeros: `3us`,
+// `1.5ms`, `2.25s`, `-0.5s`, and a minute or more as seconds, `90s`.
+private durationText(micros: long) -> string
+    var unit: long = MicrosPerSecond
+    if micros > -1000 && micros < 1000 then unit = 1
+    elif micros > -MicrosPerSecond && micros < MicrosPerSecond then unit = MicrosPerMilli
+    val suffix = if unit == 1 then "us" elif unit == MicrosPerMilli then "ms" else "s"
+    val whole = micros / unit
+    val part = (micros % unit).toString()
+    var fraction = if micros % unit < 0 then part.drop(1) else part
+    if unit > 1
+        val digits = if unit == MicrosPerMilli then 3 else 6
+        fraction = fraction.padStart(digits, '0')
+        while fraction.nonEmpty() && fraction.endsWith("0") do fraction = fraction.dropRight(1)
+    val sign = if micros < 0 && whole == 0 then "-" else ""
+    sign + whole.toString() + (if fraction == "" || unit == 1 then "" else "." + fraction) + suffix
+
+impl Display for Duration
+    display(out: Writer, spec: FormatSpec) = out.writeField(durationText(micros), spec)
+
+impl Debug for Duration
+    debug(out: Writer, spec: FormatSpec) = out.writeField("Duration(" + durationText(micros) + ")", spec)
+
+// A reading of the monotonic clock. One reading means nothing; the difference of two is the time
+// between them.
+data Instant(micros: long) derives Ord
+
+// The monotonic clock now.
+now() -> Instant = Instant(monotonicMicros())
+
+impl Instant
+    // The time from this reading to the clock now.
+    elapsed() -> Duration = now().since(self)
+
+    // The time from `earlier` to this reading, negative where `earlier` is the later.
+    since(earlier: Instant) -> Duration = Duration(micros - earlier.micros)
+
+    // The reading `d` after this one, or before it where `d` is negative.
+    plus(d: Duration) -> Instant = Instant(micros + d.micros)
+    minus(d: Duration) -> Instant = Instant(micros - d.micros)
+
+impl Display for Instant
+    display(out: Writer, spec: FormatSpec) = out.writeField("Instant(" + durationText(micros) + ")", spec)
+
+impl Debug for Instant
+    debug(out: Writer, spec: FormatSpec) = display(out, spec)
+
+// A reading of the wall clock: a count of microseconds since 1970-01-01T00:00:00 UTC, leap seconds
+// not counted.
+data WallTime(sinceEpoch: Duration) derives Ord
+
+// The wall clock now.
+wallClock() -> WallTime = WallTime(Duration(wallMicros()))
+
+// The wall-clock time `d` after the start of 1970 (UTC), or before it where `d` is negative.
+fromEpoch(d: Duration) -> WallTime = WallTime(d)
+
+impl WallTime
+    // The time from `earlier` to this reading, negative where the wall clock was set back between.
+    since(earlier: WallTime) -> Duration = sinceEpoch - earlier.sinceEpoch
+
+    plus(d: Duration) -> WallTime = WallTime(sinceEpoch + d)
+    minus(d: Duration) -> WallTime = WallTime(sinceEpoch - d)
+
+// `n` divided by `d`, rounded toward negative infinity.
+private floorDiv(n: long, d: long) -> long = if n % d < 0 then n / d - 1 else n / d
+
+// The `YYYY-MM-DDThh:mm:ss.ffffffZ` form of a wall-clock reading, in UTC. The date is the proleptic
+// Gregorian calendar's, found from the day count by its 400-year cycles.
+private wallText(micros: long) -> string
+    val days = floorDiv(micros, MicrosPerDay)
+    val inDay = micros - days * MicrosPerDay
+    val z = days + 719468
+    val era = floorDiv(z, 146097)
+    val dayOfEra = z - era * 146097
+    val yearOfEra = (dayOfEra - dayOfEra / 1460 + dayOfEra / 36524 - dayOfEra / 146096) / 365
+    val dayOfYear = dayOfEra - (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100)
+    val mp = (5 * dayOfYear + 2) / 153
+    val day = dayOfYear - (153 * mp + 2) / 5 + 1
+    val month = if mp < 10 then mp + 3 else mp - 9
+    val year = yearOfEra + era * 400 + (if month <= 2 then 1 else 0)
+    val hour = inDay / MicrosPerHour
+    val minute = inDay % MicrosPerHour / MicrosPerMinute
+    val second = inDay % MicrosPerMinute / MicrosPerSecond
+    val fraction = inDay % MicrosPerSecond
+    val date = padded(year, 4) + "-" + padded(month, 2) + "-" + padded(day, 2)
+    val clock = padded(hour, 2) + ":" + padded(minute, 2) + ":" + padded(second, 2)
+    date + "T" + clock + "." + padded(fraction, 6) + "Z"
+
+impl Display for WallTime
+    display(out: Writer, spec: FormatSpec) = out.writeField(wallText(sinceEpoch.micros), spec)
+
+impl Debug for WallTime
+    debug(out: Writer, spec: FormatSpec) = display(out, spec)

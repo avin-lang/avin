@@ -201,3 +201,43 @@ listing `InvalidUtf8` rather than leaving that name out.
 for name in fs.listDir(dir)?
     if name.endsWith(".txt") then print(name)
 ```
+
+## `avin.time`
+
+Measuring time and reading the clock. Every quantity is a count of whole microseconds, held in a
+`long`; arithmetic that leaves its range, about 292,000 years, traps like any integer overflow.
+
+**Three types, two clocks.** A `Duration` is a length of time, negative, zero or positive. An
+`Instant` is a reading of the **monotonic** clock, which only moves forward and starts from an origin
+that means nothing: one reading answers nothing, and the difference of two is the time between them.
+A `WallTime` is a reading of the **wall** clock, as a `Duration` since 1970-01-01T00:00:00 UTC, which
+anyone may set, so two readings may differ by a negative amount. The clocks are different types, so a
+reading of one is never taken from a reading of the other: measure with `Instant`, stamp with
+`WallTime`.
+
+```text
+import avin.time
+
+val start = time.now()
+work()
+print(s"took ${start.elapsed()}")
+```
+
+**Making durations.** `microseconds`, `milliseconds`, `seconds`, `minutes` and `hours` each take a
+`long` count; `zero()` is the empty duration. `inMilliseconds`, `inSeconds` and `inMinutes` answer
+whole units, a fraction dropped toward zero, and `inSecondsReal` the seconds with their fraction.
+Durations add, subtract and negate with `+`, `-` and unary `-` (they implement `Add`, `Sub` and
+`Neg`), and `times(n)` and `dividedBy(n)` scale one by a `long`; `abs()` drops the sign and
+`isNegative()` asks it.
+
+**Readings.** `now()` reads the monotonic clock and `wallClock()` the wall clock; `fromEpoch(d)`
+makes the wall-clock time `d` after the start of 1970. On an `Instant`, `elapsed()` is the time from
+it to now, `since(earlier)` the time from another reading, and `plus(d)` and `minus(d)` move it by a
+duration; a `WallTime` has `since`, `plus`, `minus` and the `sinceEpoch` duration. The arithmetic
+operators work on one type only, which is why an instant and a duration combine through methods.
+
+**Order, equality and text.** All three types compare by value and are ordered, so `<`, `==` and
+`max` work on them. A duration displays in the largest unit it fills, with its fraction and no
+trailing zeros: `3us`, `1.5ms`, `90.5s`, `-500ms`; its `Debug` form wraps that as `Duration(1.5ms)`.
+A `WallTime` displays as an ISO 8601 UTC timestamp with microseconds, `2026-11-04T12:34:56.000045Z`,
+in the proleptic Gregorian calendar.

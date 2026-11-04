@@ -860,6 +860,16 @@ Settled by the user on 2026-11-04:
   - **`avin new <dir> [--lib]`** names the package by the directory, writes a module of that name
     (`-` written `_`), `main.avin` unless `--lib`, a test in `tests/` and a `.gitignore` of `.avin/`;
     the names `avin` and `tests` are refused. `avin build` names the executable after the package.
+  - **`avin add <coordinate>[@<version>] [<package>]`** records a git dependency: the version is the
+    one given, or the highest release tag the host lists (`v` and three numbers; no release is an
+    error naming the way to give one). The package is fetched first and listed under the name its own
+    manifest gives it; a dependency already listed, under that coordinate or that name, has its entry
+    replaced in place, to a lower version too. The edit is made in the manifest's text, so comments
+    and layout stay: the entry goes last in the `dependencies` block, a block being made at the end
+    of the file when there is none. The result is resolved and `avin.sum` gains its lines (a
+    version that is no longer chosen keeps its line until `avin tidy`); where fetching or resolving
+    fails, the manifest is put back as it was. It adds only git dependencies: a path dependency is
+    written by hand.
 
 - Repeated parameters beside overloads and constructors
   ([declarations](/spec/declarations/#repeated-parameters)): an overload with a repeated parameter
@@ -1058,6 +1068,13 @@ Settled by the user on 2026-11-04:
 - A collection added to itself ([collections](/spec/collections/#buffer)): `b.addAll(b)` and
   `b ++= b` on a `Buffer` or a `Deque` append the elements it held when the call began, once, and
   `s --= s` on a mutable `Set` empties it.
+- [`avin.time`](/spec/system-library/#avintime): `Duration`, `Instant` (monotonic) and `WallTime`
+  (wall clock, a `Duration` since the 1970 epoch) are data types counting whole microseconds in a
+  `long`, overflow trapping; the two clocks are distinct types so their readings never mix. A
+  duration implements `Add`, `Sub`, `Neg`; an instant combines with a duration through `plus`,
+  `minus` and `since`, because an operator trait takes and yields the implementing type alone. The
+  text forms are a duration's largest-unit form (`1.5ms`) and an ISO 8601 UTC timestamp. Sleeping
+  and calendar fields beyond the timestamp text are not part of it yet.
 
 ## Open
 

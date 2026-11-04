@@ -177,6 +177,12 @@ without one, as before.
   module of that name (with `-` written `_`) holding one function, `main.avin` using it, a test of it in
   `tests/`, and a `.gitignore` naming `.avin/`. `avin new <dir> --lib` writes a library, the same
   without `main.avin`. It refuses a directory that exists and a name that is not a package's.
+- `avin add <coordinate>[@<version>] [<package>]` adds a git dependency to the package's manifest:
+  the version given, or the highest release the repository has tagged. It fetches the package, lists
+  it under the name its own manifest gives it, and adds its hash to `avin.sum`. Adding a dependency
+  already listed changes its version, to a lower one as well as a higher. The rest of the manifest,
+  comments and layout included, is left as written, and a dependency that cannot be fetched or is
+  not an Avin package changes nothing.
 - `avin tidy [--check] [<package>]` rewrites `avin.sum`, given a package, a path in one, or a
   workspace's root, which it tidies whole.
 - `avin lsp` analyzes a file in a package as the package, with its dependencies as the cache holds
