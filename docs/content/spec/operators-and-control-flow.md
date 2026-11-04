@@ -101,7 +101,8 @@ val widest = current max
 ```
 
 A name that starts a line never continues the line above, inside brackets too: end the line with the
-name instead.
+name instead. An indented block after a call is the call's [trailing block](#trailing-blocks), except
+that one holding only a name and an operand is reported as this mistake.
 
 The call is resolved exactly as `a.m(b)` is: overloads are chosen by the argument's type, a trait or
 `open` method dispatches on the receiver's class, an `impl` adds methods that can be called this way,
@@ -157,6 +158,71 @@ always been; where `op` is a symbol method, `x op= y` is `x = x op y`, so `xs ++
 value or an element `xs(i)`, and its object and indices are evaluated once. A right-grouping name
 has no compound form, and the yielding forms (`+:=`) belong to the language's operators alone. A
 multiple assignment uses only the language's compound forms.
+
+### Trailing blocks
+
+An indented block on the lines after a call is the call's last argument. The call's line ends right
+after its `)`, and the block is given to the callee's **last parameter**:
+
+```text
+retry(3)
+    fetch(url)
+
+withFile("data.txt") f ->
+    process(f)
+
+zipWith(xs, ys) (x, y) ->
+    x * y
+```
+
+A [by-name](/spec/by-name/) parameter (`body: -> T`) takes the block as its delayed expression,
+evaluated at each read of the parameter and not at the call, so `retry(3)` runs `fetch(url)` as many
+times as `retry` reads `body`. A function parameter takes a lambda whose body is the block: its
+parameters end the call's line before `->`, one name (`f ->`) or a parenthesized list
+(`(x, y) ->`, `(x: int) ->`), as an ordinary lambda's would be written.
+
+A callee with no other arguments is written without parentheses: a name, a member or a type
+application, then the block, or one parameter name and `->`:
+
+```text
+scope s ->
+    s.spawn
+        part(1)
+
+xs.foreach x ->
+    print(x)
+```
+
+A lambda of several parameters needs the call's parentheses before it, `run() (x, y) ->`: the
+parentheses right after a callee's name always hold its arguments.
+
+The block's position does not depend on the written arguments. With parentheses it comes after them,
+and it still goes to the last parameter, past any defaulted one in between: against
+`labelled(label: string, width: int = 4, body: -> string)`, `labelled("box")` and a block gives
+`width` its default. Positional and named arguments bind as they would without the block, and
+overloads are chosen with it: a candidate whose last parameter cannot take a block does not fit.
+
+A trailing block applies wherever an expression ends a line: a statement, a binding's value
+(`val r = retry(3)` and a block), an assignment, a `return` value, a lambda's or a `match` arm's
+body, the argument of an infix call, the operand of an operator. Inside brackets a line break is
+not significant, so a call written inside another call's parentheses takes no block. The forms that
+already put an indented block after their line keep it:
+
+- The test of `if`, `elif`, `while` and `do … while`, a `for` source and its `if` guards, and a
+  class's or object's parents: the block is the form's body, so `if ready(x)` and a block tests
+  `ready(x)`.
+- A local function's header: `helper()` or `helper(n: int)` and an indented block declare a local
+  function. A header's parameters are typed, so `retry(3)` and `retry(n)` are calls. A call with
+  no arguments and a block is written without parentheses.
+- A line that ends with an infix call's method name, `current max`: the block is its argument.
+- `x match` and the bare `match` function: the block holds the arms.
+- A block whose one line is a name and a single operand, `add 2`, reads as the method and argument
+  of an infix call that should have ended the line above, and is reported as that.
+
+It is an error to write a trailing block for a call whose last parameter is neither by-name nor a
+function (the message names the parameter and its type), whose last parameter is already given, or
+whose callee takes no arguments. A lambda on the call's own line, `f(1) x -> x`, is not a trailing
+form; it is written inside the parentheses.
 
 ## Comparison chains
 
