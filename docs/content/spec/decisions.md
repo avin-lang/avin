@@ -433,6 +433,8 @@ a decision changes, this page and the chapter change together.
 
 Settled by the user on 2026-11-03:
 
+- A mirror's fields are written in Avin's lowerCamelCase; the compiler matches each to the Sysl
+  field of the same words in snake_case.
 - `fail(message)` is public in the prelude: it traps with the message at the caller's place and has
   type `Nothing`.
 - The methods an `impl` adds to a class whose fields are all immutable are not variance positions,

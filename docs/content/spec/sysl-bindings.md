@@ -147,8 +147,13 @@ readText(file: string) -> Result[string, IoError]
 - **An enum** is mirrored variant by variant: each Avin variant is the Sysl variant of the same name,
   and its fields are the Sysl variant's payload, in order.
 - **A struct** is mirrored by a data type with one variant named as the type, whose fields are the
-  struct's fields of the same names: `data LocalDate` with the one variant `LocalDate(day: int)`
-  mirrors `sysl.time.LocalDate`.
+  struct's fields: `data LocalDate` with the one variant `LocalDate(day: int)` mirrors
+  `sysl.time.LocalDate`. A field is written in Avin's lowerCamelCase, and the compiler matches it to
+  the Sysl field of the same words in snake_case: each uppercase letter becomes an underscore and
+  its lowercase, and digits stay, so `restArePositional` is Sysl's `rest_are_positional` and
+  `utf8Offset` is `utf8_offset`. A field written with an underscore is an error that names the
+  lowerCamelCase spelling, so a field has one spelling. Variants of an enum keep Sysl's names,
+  which are PascalCase in both languages, and a variant's fields are matched by position.
 - **A field is a boundary type.** An integer field takes any Sysl integer, converted with a check in
   each direction: Avin has no unsigned integers, so Sysl's `usize` offset above is a `long`. A
   collection field is copied as a binding's collection is.
