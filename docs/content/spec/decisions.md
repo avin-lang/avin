@@ -85,8 +85,9 @@ a decision changes, this page and the chapter change together.
   through a table uses gets a slot of its own in the table of every type implementing the method,
   filled with that type's implementation instantiated at those arguments; such a call also costs one
   virtual call.
-- An `impl` adds methods and conformances, never state. Its methods are a class's or an object's own
-  methods; for a `data` or built-in type they are called directly. Inside them the receiver is
+- An `impl` adds methods and conformances, never state. Written in a class's or an object's module,
+  its methods are the class's own; for a `data` or built-in type, or written elsewhere, they are
+  called directly. Inside them the receiver is
   implicit, as in a class, with a one-variant `data` type's fields in scope by bare name.
 - The methods of `impl Trait for Type` implement the trait's methods without `override`, and each is
   a method of the trait or of one it requires. A `data` type's method implementing a trait method is
@@ -114,8 +115,9 @@ a decision changes, this page and the chapter change together.
   its impls name are.
 - A type pattern matches an object whose type conforms to the pattern's type through variance, as
   the checker's subtyping does: a `List[Dog]` held as an `Any` matches `List[Animal]`.
-- The built-in types belong to the core library's module, `avin`; an impl adding methods to one is
-  written there.
+- The built-in types belong to the core library's module, `avin`; a conformance of one is written
+  there or in the trait's module. An impl that only adds methods may be written in any module
+  (settled 2026-11-04, below).
 - Functions and methods may be overloaded by parameter types. A call takes the most specific
   overload that accepts its arguments, chosen at compile time; an ambiguous call is an error.
   Same-named declarations with the same parameter types are an error.
@@ -554,6 +556,22 @@ Settled by the user on 2026-11-03:
   guards or yielded value.
 
 Settled by the user on 2026-11-04:
+
+- **An impl that only adds methods may be written in any module** (a relaxed impl); in another module
+  than its type's or trait's it is an [extension](/spec/declarations/#extensions): `impl string`,
+  `impl[T: Ord] Seq[T]`, `impl[T] Option[Option[T]]`, `impl Box` for another module's class. Its
+  methods are seen in its own module and in every file importing that module, whole or any
+  declaration of it, with no further step; a file importing neither does not see them, and the
+  core library's are seen everywhere. A type's own methods are found first: an extension method a
+  type's own or inherited method of the same name and parameter types always hides is an error at
+  its declaration, and one added to a trait is passed over for a type that has such a method. Two
+  seen extensions of different modules adding one name and parameter types to a receiver make the
+  call an error naming both modules. An extension's `private` methods are private to its module. Its
+  methods reach no private member of another module's type, are in no method table and are not
+  overridden; `self` is the receiver and the type's public fields and methods are in scope by bare
+  name. Infix calls, method values and calls through a bound see extensions as dotted calls do,
+  a bound's where the generic function is written. Conformances, `impl Trait for Type`, stay in the
+  module of the type or of the trait.
 
 - **Sequences, sets and maps are functions, by subtyping.** `Seq[+T]` is a subtype of `(int) -> T`,
   through its `apply(index)`; `Set[A]`, immutable and mutable, of `(A) -> bool`; `Map[K, V]`,
