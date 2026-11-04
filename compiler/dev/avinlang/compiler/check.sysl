@@ -5832,7 +5832,7 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     CharLit(value) -> TExpr(e.span, Char, CharConst(u32(value)))
     RealLit(value) -> TExpr(e.span, Real, RealConst(value))
     StringLit(value) -> TExpr(e.span, Str, StrConst(value))
-    Interpolate(prefix, chunks, holes) -> interpolate_expr(c, e, prefix, chunks, holes)
+    Interpolate(prefix, chunks, parts, holes) -> interpolate_expr(c, e, prefix, chunks, parts, holes, expected)
     UnitLit -> TExpr(e.span, Unit, UnitConst)
     Name(name) -> name_expr(c, e.span, name, expected)
     TypeApply(target, types) -> type_apply(c, e, target, types, expected)
@@ -7424,15 +7424,20 @@ private operator_conforms(c: *Checker, at: Span, spelling: string, t: &Type, tra
     else c.note(unit_of(c), at, s"`$spelling` needs ${type_name(t)} to implement `$trait_name`")
     false
 
-// `s"a${x}b"` is the text pieces and the rendered holes joined in order, as
-// `"a" + x.toString() + "b"`; an empty piece is left out. Each hole is evaluated once, left to
-// right.
-private interpolate_expr(c: *Checker, e: &Expr, prefix: string, chunks: Buf[string], holes: Buf[&Expr]) -> &TExpr
+// `p"a${x}b"` is the method call `StringContext(["a", "b"]).p(x)`, the parts as written. `s"…"` is
+// written out directly instead, to the text that call makes: the decoded pieces and the rendered
+// holes joined in order, as `"a" + x.toString() + "b"`, an empty piece left out. Each hole is
+// evaluated once, left to right.
+private interpolate_expr(c: *Checker, e: &Expr, prefix: string, chunks: Buf[string], parts: Buf[string], holes: Buf[&Expr], expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
-    var ok = true
     if prefix != "s"
-        c.note(unit, e.span, s"`$prefix\"…\"` interpolation is not implemented; `s\"…\"` is")
-        ok = false
+        if !names_interpolator(c, prefix)
+            c.note(unit, e.span, s"`$prefix\"…\"` names no interpolator: `StringContext` has no method `$prefix` here")
+            for h in holes
+                check_statement(c, h)
+            return TExpr(e.span, ErrorType, UnitConst)
+        return check_expr(c, interpolator_call(e.span, prefix, parts, holes), expected)
+    var ok = true
     var pieces: Buf[&TExpr] = buf()
     var ty: &Type = Str
     for i in 0..<chunks.len()
@@ -7460,6 +7465,29 @@ private interpolate_expr(c: *Checker, e: &Expr, prefix: string, chunks: Buf[stri
     for k in 1..<pieces.len()
         out = TExpr(e.span, ty, Arith(Add, out, pieces[k], e.span))
     if *ty is Nothing then TExpr(e.span, Nothing, out.kind) else out
+
+// Whether `StringContext` has a method `name` that this unit can call: one of the core library's,
+// or one an imported trait's impl gives it.
+private names_interpolator(c: *Checker, name: string) -> bool
+    val id = c.types.get(qualified(CoreModule, "StringContext")) match
+        Some(k) -> k
+        None -> return false
+    val ty = Data(id, "StringContext", buf())
+    with_trait_methods(c, ty, name, visible_methods(c, receiver_methods(c, ty, name))).len() > 0
+
+// `StringContext([parts…]).prefix(holes…)`, naming the core library's `StringContext` whatever the
+// file calls its own declarations.
+private interpolator_call(at: Span, prefix: string, parts: Buf[string], holes: Buf[&Expr]) -> &Expr
+    var texts: Buf[&Expr] = buf()
+    for part in parts
+        texts.push(Expr(at, StringLit(part)))
+    var made: Buf[Argument] = buf()
+    made.push(Argument(at, None, Expr(at, ListLit(texts)), false))
+    val context = Expr(at, Call(Expr(at, Name(core_path("StringContext"))), made))
+    var args: Buf[Argument] = buf()
+    for h in holes
+        args.push(Argument(h.span, None, h, false))
+    Expr(at, Call(Expr(at, Member(context, prefix)), args))
 
 // A hole of a type other than the built-ins is rendered by its `Display` implementation, as
 // `h.toString()`. A type that does not implement `Display` cannot be interpolated.
