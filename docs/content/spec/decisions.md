@@ -598,6 +598,16 @@ Settled by the user on 2026-11-04:
   function from a vector and `[](int -> int)` a vector of functions. A type pattern takes it
   without parentheses, `v: []int -> body`. There is no fixed-length `[N]T` (an error); error
   messages print `Vector[int]`.
+- [Repeated parameters](/spec/declarations/#repeated-parameters): `values: T*` is the last
+  parameter, at most one, named, with no default and not by-name; inside the function it is a
+  `Vector[T]`. A call gives it every positional argument from its position on, each checked
+  against `T` (so generic `T` is inferred from them), or splices one `Iterable[T]` with `xs*` as
+  its only argument, written last: a `Vector[T]` is passed as it is, any other sequence copied.
+  `f(1, xs*)` into the one parameter, `xs*` anywhere else, and naming the repeated parameter are
+  errors. A function with one, used as a value, has the type `(…, Vector[T]) -> R`. A method
+  overriding or implementing another repeats the same parameter or neither does; `main` takes
+  none; `data` fields cannot be repeated. A method whose only required parameter precedes a
+  repeated one is called infix with one argument.
 - An impl without `for` adds methods to any type built from its parameters
   ([declarations](/spec/declarations/#impl)): `impl[T] Option[Option[T]]`,
   `impl[A, B] Pair[A, List[B]]`, `impl[T] Seq[Seq[T]]`, `impl[K, V] Iterable[(K, V)]`. Every
@@ -621,6 +631,14 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
+- Repeated parameters beside overloads and constructors
+  ([declarations](/spec/declarations/#repeated-parameters)): an overload with a repeated parameter
+  is a candidate only where no overload without one accepts the call, so `pick(x: long)` takes
+  `pick(1)` beside `pick(xs: int*)`; among those with one, the arguments are compared by the
+  element type. A class's constructor may end with a repeated parameter, whose field is a
+  `Vector[T]` (`class Path(val parts: string*)`), and a subclass passes it on with `: Path(parts*)`.
+  The core library gains `max(first, rest*)` and `min(first, rest*)` on `T: Ord`, answering the
+  greatest or least of one value or more, the first of equal ones.
 - Option, Result and string methods ([errors](/spec/errors/), [types](/spec/types/#string)):
   `Option` gains `exists`, `forall`, `contains` (on `T: Eq`, which every type meets), `toList`,
   `toVector` and `zip`; `Result` gains `exists`, `forall`, `toList` and `orElse(f)`, where `f`
