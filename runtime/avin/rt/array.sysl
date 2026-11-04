@@ -1,0 +1,55 @@
+module avin.rt
+
+import sh.sysl.gc
+import sysl.raw.ptr_cast
+
+// Avin's arrays. An array is a reference to an object holding its length and then its elements,
+// each its element type's width, with no gaps; its descriptor is in the header the collector keeps
+// before it. An array descriptor's `size` is one element's size, and it lists no reference offsets:
+// an array whose elements are references has `avin_rt_trace_array` as its kind's tracer, which marks
+// every element, and any other array has the ordinary tracer, which marks none.
+
+/** The header of an array object. `length` elements follow it. */
+struct ArrayHeader
+    length: usize
+
+/** The length of the array at `p`. */
+array_length(p: *u8) -> usize
+    val h: *ArrayHeader = ptr_cast(p)
+    h.length
+
+/** The first element of the array at `p`. */
+array_elements(p: *u8) -> *u8 = ptr_cast(usize(p) + sizeof(ArrayHeader))
+
+/** A new array of `length` elements laid out by `d`, every byte zero, for the caller to fill before
+ * anything else sees it. The compiler has checked that `length` is a non-negative `int`. Allocating
+ * may collect, so every reference the caller still needs must be a root. */
+@export("avin_rt_new_array")
+new_array(ctx: *Context, d: *Descriptor, length: usize) -> *u8
+    val p = allocate_sized(ctx, d, sizeof(ArrayHeader) + length * d.size)
+    val h: *ArrayHeader = ptr_cast(p)
+    h.length = length
+    p
+
+/** A new array of the elements of `p` from `from` up to `until`, which the compiler has checked lie
+ * in order within it. `p` stays alive while the new array is allocated, since the caller holds it as
+ * a root, and the collector never moves an object. */
+@export("avin_rt_array_slice")
+array_slice(ctx: *Context, p: *u8, from: int, until: int) -> *u8
+    val d = descriptor_of(p)
+    val n = usize(until - from)
+    val q = new_array(ctx, d, n)
+    val size = d.size
+    val source = array_elements(p)
+    val target = array_elements(q)
+    val start = usize(from) * size
+    for i in 0..<n * size do target[i] = source[start + i]
+    q
+
+// The tracer of an array whose elements are references. An element may still be null in an array
+// being filled, or a constant object outside the heap; the collector ignores both.
+@export("avin_rt_trace_array")
+trace_array(p: *u8, h: *gc.Heap)
+    val elements: **u8 = ptr_cast(array_elements(p))
+    for i in 0..<array_length(p)
+        gc.mark(h, elements[i])

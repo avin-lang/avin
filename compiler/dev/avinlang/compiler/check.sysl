@@ -1320,7 +1320,9 @@ private declare_methods(c: *Checker, unit: usize)
             val public = entry.public
             val overrides = entry.overrides
             val file_unit = entry.unit
-            if f.annotations.len() > 0 then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
+            // The core library's array class declares its element operations as intrinsics.
+            val intrinsic_method = is_array_class(c.classes[id]) && f.annotations.len() > 0
+            if f.annotations.len() > 0 && !intrinsic_method then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
             if overrides then refuse_override_defaults(c, file_unit, f)
             if is_trait(c, id)
                 if !public
@@ -1336,7 +1338,7 @@ private declare_methods(c: *Checker, unit: usize)
                 c.note(file_unit, f.name_span, s"`${f.name}` is already a field of `${c.classes[k.fields[i].owner].name}`")
                 continue
             val bodyless = f.body is None && f.clauses.len() == 0
-            if bodyless && !is_abstract_class(c, id)
+            if bodyless && !is_abstract_class(c, id) && !intrinsic_method
                 c.note(file_unit, f.name_span, s"`${f.name}` has no body; only an abstract class may leave a method without one")
             if bodyless && !public then c.note(file_unit, f.name_span, s"`${f.name}` is abstract, so it cannot be private: a subclass implements it")
             var same_name: Buf[usize] = buf()
@@ -2666,16 +2668,21 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
     val binding = has_annotation(f, "sysl")
     if binding then check_binding(c, unit, f, params, result, intrinsic is Some(_))
     if intrinsic is Some(name)
-        intrinsic_signature(name) match
-            Some(expected) ->
-                var with_receiver: Buf[&Type] = buf()
-                if receiver is Some(r) then with_receiver.push(r)
-                for p in params
-                    with_receiver.push(p)
-                val declared: &Type = Function(with_receiver, result.unwrap_or(Unit))
-                if !same_type(declared, expected)
-                    c.note(unit, f.name_span, s"intrinsic `$name` has type ${type_name(expected)}, not ${type_name(declared)}")
-            None -> c.note(unit, f.name_span, s"`$name` is not an intrinsic")
+        // The array operations are generic in the element type, and only the core library's
+        // `Array` declares them.
+        if name.starts_with("array_")
+            if module_name != CoreModule then c.note(unit, f.name_span, s"`$name` is an intrinsic of the core library's arrays")
+        else
+            intrinsic_signature(name) match
+                Some(expected) ->
+                    var with_receiver: Buf[&Type] = buf()
+                    if receiver is Some(r) then with_receiver.push(r)
+                    for p in params
+                        with_receiver.push(p)
+                    val declared: &Type = Function(with_receiver, result.unwrap_or(Unit))
+                    if !same_type(declared, expected)
+                        c.note(unit, f.name_span, s"intrinsic `$name` has type ${type_name(expected)}, not ${type_name(declared)}")
+                None -> c.note(unit, f.name_span, s"`$name` is not an intrinsic")
     elif f.body is None && f.clauses.len() == 0 && !bodyless && !binding
         c.note(unit, f.name_span, s"`${f.name}` needs a body, or clauses on the lines after it")
     c.generic = outer_generic
@@ -2753,6 +2760,7 @@ intrinsic_signature(name: string) -> Option[&Type]
     var params: Buf[&Type] = buf()
     params.push(Str)
     if name == "print_line" then return Some(Function(params, Unit))
+    if name == "trap" then return Some(Function(params, Nothing))
     if name == "string_byte_length" then return Some(Function(params, Int(32)))
     if name == "string_byte_at"
         params.push(Int(32))
@@ -3023,6 +3031,7 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                     return ErrorType
                 ty
             None ->
+                if path == "Nothing" && args.len() == 0 then return Nothing
                 c.variants.get(key) match
                     Some(v) -> c.note(unit, t.span, s"`$path` is a variant of `${c.data[v.data].name}`, not a type")
                     None -> c.note(unit, t.span, s"unknown type `$path`")
@@ -3606,6 +3615,8 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Loop(body) -> loop_expr(c, e, body)
 
     DoWhile(body, condition, otherwise) -> check_form(c, do_while_form(e, body, condition, otherwise), expected, used)
+    For(pattern, source, body) -> for_expr(c, e, pattern, source, body)
+    Range(lower, upper, inclusive) -> range_expr(c, e, lower, upper, inclusive)
     Break(value) -> break_expr(c, e, value)
     Continue -> continue_expr(c, e)
     Return(value) -> return_expr(c, e, value)
@@ -3876,6 +3887,9 @@ private abstract_constructor(c: *Checker, id: usize, at: Span) -> bool
     val symbol = c.symbols[id]
     if !symbol.constructor then return false
     val k = symbol.owner_class.unwrap()
+    if is_array_class(c.classes[k])
+        c.note(unit_of(c), at, "an array is made with every element set, by `Array.fill(n, value)`, `Array.tabulate(n, f)` or `Array.empty()`")
+        return true
     if !is_abstract_class(c, k) then return false
     if is_trait(c, k) then c.note(unit_of(c), at, s"`${c.classes[k].name}` is a trait, so it cannot be instantiated; instantiate a class that conforms to it")
     else c.note(unit_of(c), at, s"`${c.classes[k].name}` is abstract, so it cannot be instantiated; instantiate a subclass")
@@ -4375,6 +4389,7 @@ private initializer(c: *Checker, order: Buf[usize]) -> Option[usize]
     Some(id)
 
 private assign_expr(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp], value: &Expr, yields: bool, op_span: Span) -> &TExpr
+    if target.kind is Call(callee, args) then return check_form(c, element_assignment(e, callee, args, op, value, yields, op_span), None, yields)
     if targets_field(c, target) then return assign_field(c, e, target, op, value, yields, op_span)
     if targets_global(c, target) is Some(g) then return assign_global(c, e, target, g, op, value, yields, op_span)
     val unit = unit_of(c)
@@ -4394,6 +4409,62 @@ private assign_expr(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp], 
             typed
     val ty: &Type = if *stored.ty is Nothing then Nothing elif yields then local.ty else Unit
     TExpr(e.span, ty, Store(index, stored, yields))
+
+// `xs(i) = v` calls `xs.update(i, v)`, as `xs(i)` calls `xs.apply(i)`. The compound forms, and the
+// `:=` forms that yield the stored element, evaluate the sequence and the indices once each, into
+// locals named so that no source name can equal them, then read the element, store, and for `:=`
+// read the element back.
+private element_assignment(e: &Expr, callee: &Expr, args: Buf[Argument], op: Option[BinaryOp], value: &Expr, yields: bool, op_span: Span) -> &Expr
+    if op is None && !yields
+        var all: Buf[Argument] = buf()
+        for a in args do all.push(a)
+        all.push(Argument(value.span, None, value))
+        return Expr(e.span, Call(Expr(callee.span, Member(callee, "update")), all))
+    var items: Buf[&Expr] = buf()
+    val held = held_element(e, callee, args, &items)
+    val current = Expr(held.callee.span, Call(held.callee, held.args))
+    val stored: &Expr = op match
+        Some(o) -> Expr(e.span, Binary(o, current, value, op_span))
+        None -> value
+    var all: Buf[Argument] = buf()
+    for a in held.args do all.push(a)
+    all.push(Argument(value.span, None, stored))
+    items.push(Expr(e.span, Call(Expr(callee.span, Member(held.callee, "update")), all)))
+    if yields then items.push(current)
+    Expr(e.span, Block(items, !yields))
+
+// `xs(i)++` and `xs(i)--`, as `xs(i) += 1` and `xs(i) -= 1`; the prefix form yields the new element
+// and the postfix form the old one.
+private element_update(e: &Expr, callee: &Expr, args: Buf[Argument], increment: bool, postfix: bool, op_span: Span) -> &Expr
+    val op: BinaryOp = if increment then Add else Subtract
+    val one = Expr(op_span, IntLit("1"))
+    if !postfix then return element_assignment(e, callee, args, Some(op), one, true, op_span)
+    var items: Buf[&Expr] = buf()
+    val held = held_element(e, callee, args, &items)
+    val old = s"element old ${e.span.start}"
+    items.push(Expr(e.span, Binding(old, None, Expr(e.span, Call(held.callee, held.args)), false)))
+    var all: Buf[Argument] = buf()
+    for a in held.args do all.push(a)
+    all.push(Argument(op_span, None, Expr(e.span, Binary(op, Expr(e.span, Name(old)), one, op_span))))
+    items.push(Expr(e.span, Call(Expr(callee.span, Member(held.callee, "update")), all)))
+    items.push(Expr(e.span, Name(old)))
+    Expr(e.span, Block(items, false))
+
+/** A sequence and its indices, each named by a hidden local. */
+private struct HeldElement
+    callee: &Expr
+    args: Buf[Argument]
+
+// Binds the sequence and each index to a hidden local, adding the bindings to `items`.
+private held_element(e: &Expr, callee: &Expr, args: Buf[Argument], items: *Buf[&Expr]) -> HeldElement
+    val seq = s"element seq ${e.span.start}"
+    items.push(Expr(callee.span, Binding(seq, None, callee, false)))
+    var held: Buf[Argument] = buf()
+    for i in 0..<args.len()
+        val name = s"element index ${e.span.start} $i"
+        items.push(Expr(args[i].span, Binding(name, None, args[i].value, false)))
+        held.push(Argument(args[i].span, args[i].name, Expr(args[i].span, Name(name))))
+    HeldElement(Expr(callee.span, Name(seq)), held)
 
 // A tuple's parts take their expected types from an expected tuple of the same size. A part that
 // never finishes means the tuple is never made.
@@ -4573,6 +4644,7 @@ private hidden_local(c: *Checker, ty: &Type) -> usize
     index
 
 private update_expr(c: *Checker, e: &Expr, target: &Expr, increment: bool, postfix: bool, op_span: Span) -> &TExpr
+    if target.kind is Call(callee, args) then return check_form(c, element_update(e, callee, args, increment, postfix, op_span), None, true)
     if targets_field(c, target) then return update_field(c, e, target, increment, postfix, op_span)
     if targets_global(c, target) is Some(g) then return update_global(c, e, target, g, increment, postfix, op_span)
     val index = assignable(c, target) match
@@ -4703,6 +4775,10 @@ private compare_link(c: *Checker, op: CompareOp, a: &TExpr, b: &TExpr)
     // references. `===` always compares them by identity; `==` does too, until a class defines its
     // own equality (`Eq`), which `==` would then use in its place.
     if identity || *a.ty is Function(_, _) || *a.ty is Class(_, _, _)
+        // Arrays are equal when their contents are, which compares elements through `Eq`.
+        if !identity && (is_array_type(c, a.ty) || is_array_type(c, b.ty))
+            c.note(unit_of(c), at, s"`$spelling` on arrays compares their contents, which is not implemented yet; compare identities with `===`")
+            return
         if !identity && (is_trait_type(c, a.ty) || is_trait_type(c, b.ty))
             // A trait-typed value may hold a data value, which compares by value, or an object,
             // which compares by identity: telling them apart needs runtime equality entries.
@@ -4928,6 +5004,210 @@ private do_while_form(e: &Expr, body: &Expr, condition: &Expr, otherwise: Option
     items.push(Expr(e.span, While(test, body, otherwise)))
     Expr(e.span, Block(items, false))
 
+// `a..b` and `a..<b` written as values make the core library's `Range` of `int`s, by its
+// constructor, with a step of one.
+private range_expr(c: *Checker, e: &Expr, lower: &Expr, upper: &Expr, inclusive: bool) -> &TExpr
+    val k = core_class(c, "Range") match
+        Some(k) -> k
+        None -> return unsupported(c, e, "a range")
+    var args: Buf[Argument] = buf()
+    args.push(Argument(lower.span, None, lower))
+    args.push(Argument(upper.span, None, upper))
+    args.push(Argument(e.span, None, Expr(e.span, IntLit("1"))))
+    args.push(Argument(e.span, None, Expr(e.span, BoolLit(inclusive))))
+    call_function(c, e.span, e.span, c.classes[k].constructor, args, None, None, buf())
+
+// `for pattern in source body` runs the body once for each element of `source`, bound by `pattern`,
+// as a `while` loop whose `break` and `continue` are the `for`'s. Each kind of source has its own
+// loop, and every element is bound before the loop steps, so `continue` goes straight to the test:
+//
+// - a range written in place, `a..b` or `a..<b`, of any integer type, counts in a local and makes no
+//   `Range`; it never steps past its upper bound, so it never overflows;
+// - a `Range` value counts from its start by its step;
+// - an array is indexed from 0 to the length it has when the loop starts;
+// - any other `Iterable` is traversed by the iterator its `iterator()` hands out.
+//
+// The values the loop keeps are locals named so that no source name can equal them; the source and
+// a range's bounds are evaluated once, before the loop, left to right.
+private for_expr(c: *Checker, e: &Expr, pattern: &Pattern, source: &Expr, body: &Expr) -> &TExpr
+    val unit = unit_of(c)
+    val at = e.span
+    val tag = s"${at.start}"
+    val mark = c.body.visible.len()
+    var lets: Buf[&TExpr] = buf()
+    var items: Buf[&Expr] = buf()
+    source.kind match
+        Range(lower, upper, inclusive) ->
+            // An integer literal takes its type from the other bound.
+            val literal_first = is_literal(lower) && !is_literal(upper)
+            var lo: &TExpr = TExpr(at, ErrorType, UnitConst)
+            var hi: &TExpr = TExpr(at, ErrorType, UnitConst)
+            if literal_first
+                hi = check_expr(c, upper, None)
+                lo = check_expr(c, lower, Some(zonk(c, hi.ty)))
+            else
+                lo = check_expr(c, lower, None)
+                hi = check_expr(c, upper, Some(zonk(c, lo.ty)))
+            val ty = zonk(c, lo.ty)
+            var counted = *ty is Int(_)
+            if counted && !fits(c, hi.ty, ty)
+                c.note(unit, source.span, s"a range's bounds have one integer type, not ${type_name(ty)} and ${type_name(zonk(c, hi.ty))}")
+                counted = false
+            elif !counted && settled(ty)
+                c.note(unit, source.span, s"a range counts integers, not ${type_name(ty)}")
+            if !counted
+                hold(c, at, s"for item $tag", ErrorType, TExpr(at, ErrorType, UnitConst), &lets)
+                items.push(element_binding(pattern, name_at(at, s"for item $tag")))
+                items.push(body)
+            else
+                hold(c, at, s"for lo $tag", ty, lo, &lets)
+                hold(c, at, s"for hi $tag", ty, hi, &lets)
+                counted_range(at, tag, pattern, body, inclusive, &items)
+        _ ->
+            val typed = check_expr(c, source, None)
+            val ty = zonk(c, typed.ty)
+            val seq = s"for source $tag"
+            if is_array_type(c, ty)
+                hold(c, at, seq, ty, typed, &lets)
+                indexed_array(at, tag, pattern, body, &items)
+            elif is_range_type(c, ty)
+                hold(c, at, seq, ty, typed, &lets)
+                stepped_range(at, tag, pattern, body, &items)
+            elif iterator_methods(c, ty).len() > 0
+                hold(c, at, seq, ty, typed, &lets)
+                iterated(at, tag, pattern, body, &items)
+            else
+                if settled(ty) then c.note(unit, source.span, s"`for` goes over a range, an array or an Iterable, and ${type_name(ty)} is none of them")
+                else lets.push(typed)
+                hold(c, at, s"for item $tag", ErrorType, TExpr(at, ErrorType, UnitConst), &lets)
+                items.push(element_binding(pattern, name_at(at, s"for item $tag")))
+                items.push(body)
+    val looped = check_statement(c, Expr(at, Block(items, true)))
+    c.body.visible.truncate(mark)
+    var all: Buf[&TExpr] = buf()
+    var finishes = true
+    for t in lets
+        if *t.ty is Nothing then finishes = false
+        all.push(t)
+    all.push(looped)
+    TExpr(at, if finishes then Unit else Nothing, Block(all))
+
+/** Evaluates `value` into a new hidden local `name` of type `ty`, adding the binding to `lets`. */
+private hold(c: *Checker, at: Span, name: string, ty: &Type, value: &TExpr, lets: *Buf[&TExpr])
+    val index = declare_local(c, at, name, ty, false)
+    lets.push(TExpr(at, if *value.ty is Nothing then Nothing else Unit, Let(index, value)))
+
+private is_range_type(c: *Checker, t: &Type) -> bool = *t match
+    Class(k, _, _) -> c.classes[k].module_name == CoreModule && c.classes[k].name == "Range" && !c.classes[k].decl.object
+    _ -> false
+
+/** The `iterator` methods a value of type `t` has: those of its class, of its bounds for a type
+ * parameter, or of its impls. */
+private iterator_methods(c: *Checker, t: &Type) -> Buf[usize] = *t match
+    Class(k, _, _) -> methods_named(c, k, "iterator")
+    TypeVar(_, _, _) -> bound_methods(c, t, "iterator")
+    ErrorType -> buf()
+    Nothing -> buf()
+    _ -> visible_methods(c, receiver_methods(c, t, "iterator"))
+
+private name_at(at: Span, name: string) -> &Expr = Expr(at, Name(name))
+
+private call_at(at: Span, target: &Expr, method: string) -> &Expr = Expr(at, Call(Expr(at, Member(target, method)), buf()))
+
+private assign_at(at: Span, name: string, value: &Expr) -> &Expr = Expr(at, Assign(name_at(at, name), None, value, false, at))
+
+private compare_at(at: Span, op: CompareOp, a: &Expr, b: &Expr) -> &Expr
+    var operands: Buf[&Expr] = buf()
+    operands.push(a)
+    operands.push(b)
+    var ops: Buf[CompareOp] = buf()
+    ops.push(op)
+    Expr(at, Compare(operands, ops))
+
+/** Binds the loop's element by the `for`'s pattern: a name as a `val`, `_` not at all, and any other
+ * pattern by taking the element apart. */
+private element_binding(pattern: &Pattern, value: &Expr) -> &Expr = pattern.kind match
+    Name(n) -> Expr(pattern.span, Binding(n, None, value, false))
+    Wildcard -> value
+    _ -> Expr(pattern.span, Destructure(pattern, None, value, false))
+
+/** The loop's body: the element bound, the loop stepped, then the `for`'s own body. */
+private loop_body(element: &Expr, steps: Buf[&Expr], body: &Expr) -> &Expr
+    var items: Buf[&Expr] = buf()
+    items.push(element)
+    for s in steps do items.push(s)
+    items.push(body)
+    Expr(body.span, Block(items, true))
+
+// `lo..hi` and `lo..<hi` count in `i`, while `go` says whether `i` is in the range. The step is taken
+// only from below the upper bound, so it never overflows.
+private counted_range(at: Span, tag: string, pattern: &Pattern, body: &Expr, inclusive: bool, items: *Buf[&Expr])
+    val lo = s"for lo $tag"
+    val hi = s"for hi $tag"
+    val i = s"for i $tag"
+    val go = s"for go $tag"
+    val within: CompareOp = if inclusive then LessEqual else Less
+    items.push(Expr(at, Binding(i, None, name_at(at, lo), true)))
+    items.push(Expr(at, Binding(go, None, compare_at(at, within, name_at(at, lo), name_at(at, hi)), true)))
+    val next = Expr(at, Binary(AddWrapping, name_at(at, i), Expr(at, IntLit("1")), at))
+    var steps: Buf[&Expr] = buf()
+    if inclusive
+        steps.push(Expr(at, If(compare_at(at, Equal, name_at(at, i), name_at(at, hi)), assign_at(at, go, Expr(at, BoolLit(false))), Some(assign_at(at, i, next)))))
+    else
+        steps.push(assign_at(at, i, next))
+        steps.push(assign_at(at, go, compare_at(at, Less, name_at(at, i), name_at(at, hi))))
+    items.push(Expr(at, While(name_at(at, go), loop_body(element_binding(pattern, name_at(at, i)), steps, body), None)))
+
+// A `Range` value counts from its start by its step. The next value is taken with wrapping
+// arithmetic, and the loop ends when it wrapped, having passed the largest or smallest `int`, or when
+// it lies past the limit.
+private stepped_range(at: Span, tag: string, pattern: &Pattern, body: &Expr, items: *Buf[&Expr])
+    val r = name_at(at, s"for source $tag")
+    val i = s"for i $tag"
+    val go = s"for go $tag"
+    val limit = s"for limit $tag"
+    val step = s"for step $tag"
+    val inclusive = s"for inclusive $tag"
+    val next = s"for next $tag"
+    items.push(Expr(at, Binding(limit, None, Expr(at, Member(r, "limit")), false)))
+    items.push(Expr(at, Binding(step, None, Expr(at, Member(r, "step")), false)))
+    items.push(Expr(at, Binding(inclusive, None, Expr(at, Member(r, "inclusive")), false)))
+    items.push(Expr(at, Binding(i, None, Expr(at, Member(r, "start")), true)))
+    items.push(Expr(at, Binding(go, None, call_at(at, r, "nonEmpty"), true)))
+    val zero = Expr(at, IntLit("0"))
+    val upward = compare_at(at, Greater, name_at(at, step), zero)
+    val n = name_at(at, next)
+    val below = Expr(at, If(name_at(at, inclusive), compare_at(at, LessEqual, n, name_at(at, limit)), Some(compare_at(at, Less, n, name_at(at, limit)))))
+    val above = Expr(at, If(name_at(at, inclusive), compare_at(at, GreaterEqual, n, name_at(at, limit)), Some(compare_at(at, Greater, n, name_at(at, limit)))))
+    val advanced = Expr(at, If(upward, compare_at(at, Greater, n, name_at(at, i)), Some(compare_at(at, Less, n, name_at(at, i)))))
+    val within = Expr(at, If(compare_at(at, Greater, name_at(at, step), Expr(at, IntLit("0"))), below, Some(above)))
+    var steps: Buf[&Expr] = buf()
+    steps.push(Expr(at, Binding(next, None, Expr(at, Binary(AddWrapping, name_at(at, i), name_at(at, step), at)), false)))
+    steps.push(assign_at(at, go, Expr(at, Binary(And, advanced, within, at))))
+    steps.push(assign_at(at, i, n))
+    items.push(Expr(at, While(name_at(at, go), loop_body(element_binding(pattern, name_at(at, i)), steps, body), None)))
+
+// An array is indexed from 0 below its length, read once: an array's length never changes.
+private indexed_array(at: Span, tag: string, pattern: &Pattern, body: &Expr, items: *Buf[&Expr])
+    val a = name_at(at, s"for source $tag")
+    val n = s"for length $tag"
+    val i = s"for i $tag"
+    items.push(Expr(at, Binding(n, None, call_at(at, a, "length"), false)))
+    items.push(Expr(at, Binding(i, None, Expr(at, IntLit("0")), true)))
+    var args: Buf[Argument] = buf()
+    args.push(Argument(at, None, name_at(at, i)))
+    val element = Expr(at, Call(a, args))
+    var steps: Buf[&Expr] = buf()
+    steps.push(assign_at(at, i, Expr(at, Binary(AddWrapping, name_at(at, i), Expr(at, IntLit("1")), at))))
+    items.push(Expr(at, While(compare_at(at, Less, name_at(at, i), name_at(at, n)), loop_body(element_binding(pattern, element), steps, body), None)))
+
+// Any other `Iterable` hands out an iterator, asked for each element until it has none left.
+private iterated(at: Span, tag: string, pattern: &Pattern, body: &Expr, items: *Buf[&Expr])
+    val it = s"for iterator $tag"
+    items.push(Expr(at, Binding(it, None, call_at(at, name_at(at, s"for source $tag"), "iterator"), false)))
+    val element = call_at(at, name_at(at, it), "next")
+    items.push(Expr(at, While(call_at(at, name_at(at, it), "hasNext"), loop_body(element_binding(pattern, element), buf(), body), None)))
+
 private innermost_loop(c: *Checker, e: &Expr, word: string) -> Option[usize]
     if c.body.loops.len() == 0
         if c.symbols[c.current].delayed
@@ -4982,6 +5262,20 @@ private return_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
             else c.note(unit, e.span, s"`${symbol.name}` uses `return`, so it needs a declared result type")
             if value is Some(v) then typed = Some(check_expr(c, v, None))
     TExpr(e.span, Nothing, Return(typed))
+
+/** Whether a class is the core library's `Array`: its objects hold their length and then their
+ * elements, not fields, and only the library's intrinsics make them. */
+is_array_class(k: ClassSymbol) -> bool = k.module_name == CoreModule && k.name == "Array" && !k.decl.object
+
+private is_array_type(c: *Checker, t: &Type) -> bool = *t match
+    Class(k, _, _) -> is_array_class(c.classes[k])
+    _ -> false
+
+/** The core library's class `name`, by its index, unless a program has none. */
+private core_class(c: *Checker, name: string) -> Option[usize]
+    for i in 0..<c.classes.len()
+        if c.classes[i].module_name == CoreModule && c.classes[i].name == name && !c.classes[i].decl.object then return Some(i)
+    None
 
 /** The core library's data type `name`, by its index, unless a program has none. */
 private core_data(c: *Checker, name: string) -> Option[usize]
@@ -5967,6 +6261,13 @@ private function_value(c: *Checker, at: Span, id: usize, explicit: Option[Buf[&T
     c.symbols[id].value = true
     TExpr(at, zonk(c, ty), FunctionValue(id, solved))
 
+/** The `apply` methods a value of type `t` may be called through: those of its class, of its bounds
+ * for a type parameter, or of its impls. */
+private apply_methods(c: *Checker, t: &Type) -> Buf[usize] = *t match
+    Class(k, _, _) -> methods_named(c, k, "apply")
+    TypeVar(_, _, _) -> bound_methods(c, t, "apply")
+    _ -> visible_methods(c, receiver_methods(c, t, "apply"))
+
 // A call of a value of a function type: a local, a parameter, or any expression that yields a
 // function.
 private value_call(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument]) -> &TExpr = call_checked(c, at, callee.span, check_expr(c, callee, None), args)
@@ -5991,6 +6292,9 @@ private call_checked(c: *Checker, at: Span, callee_span: Span, f: &TExpr, args: 
                 if *t.ty is Nothing then r = Nothing
             TExpr(at, r, CallValue(f, typed))
         _ ->
+            // A sequence is a function from index to element: calling one calls its `apply`.
+            val applies = apply_methods(c, ty)
+            if applies.len() > 0 then return call_method(c, at, callee_span, f, "apply", applies, args, None, None, false)
             if settled(ty) then c.note(unit, callee_span, s"a value of type ${type_name(ty)} cannot be called; only a function can")
             for a in args
                 check_statement(c, a.value)

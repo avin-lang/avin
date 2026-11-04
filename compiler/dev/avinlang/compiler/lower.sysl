@@ -231,10 +231,18 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
                 variants.push(variant_layout(l, key + "." + d.variants[v].name, v, variant_fields(d, id, v, args), true, methods, record))
         Tuple(items) -> variants.push(variant_layout(l, key, 0, items, true, buf(), record))
         Class(id, _, args) ->
-            var fields: Buf[&Type] = buf()
-            for f in l.program.classes[id].fields
-                fields.push(substitute(f.ty.unwrap_or(ErrorType), class_owner(id), args))
-            variants.push(variant_layout(l, key, 0, fields, false, method_table(l, t), record))
+            if is_array_class(l.program.classes[id])
+                // An array's descriptor gives the size of an element; the elements follow the length.
+                val element = mir_type(args[0])
+                val methods = method_table(l, t)
+                val shape = VariantLayout(l.descriptors.len(), buf())
+                l.descriptors.push(Descriptor(key, 0, element_size(element), buf(), false, methods, record, element is Some(MRef)))
+                variants.push(shape)
+            else
+                var fields: Buf[&Type] = buf()
+                for f in l.program.classes[id].fields
+                    fields.push(substitute(f.ty.unwrap_or(ErrorType), class_owner(id), args))
+                variants.push(variant_layout(l, key, 0, fields, false, method_table(l, t), record))
         _ -> panic("a layout of a type that is not data, a tuple or a class: " + key)
     if holds_generic_methods(l, t)
         for v in variants
@@ -258,8 +266,16 @@ private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[
                 size += field_size(m)
             None -> fields.push(None)
     val shape = VariantLayout(l.descriptors.len(), fields)
-    l.descriptors.push(Descriptor(name, tag, size, refs, shared && size == 0, methods, record))
+    l.descriptors.push(Descriptor(name, tag, size, refs, shared && size == 0, methods, record, false))
     shape
+
+/** The bytes an array element of machine type `t` takes: what storing one writes, a power of two up
+ * to a word and whole words past it, and none for a type with no runtime value. */
+private element_size(t: Option[MirType]) -> usize = t match
+    Some(MInt(bits)) -> if bits <= 8 then 1 elif bits <= 16 then 2 elif bits <= 32 then 4 else field_size(MInt(bits))
+    Some(MBool) -> 1
+    Some(_) -> 8
+    None -> 0
 
 // The method table of a class instance or a data value: for each slot, the instance of the method
 // that fills it, with the type arguments of the class or trait that declares the method as the
@@ -470,7 +486,7 @@ private box_descriptor(l: *Lowering, t: MirType) -> usize
     var refs: Buf[usize] = buf()
     if t is MRef then refs.push(0)
     val d = l.descriptors.len()
-    l.descriptors.push(Descriptor("box of " + key, 0, field_size(t), refs, false, buf(), 0))
+    l.descriptors.push(Descriptor("box of " + key, 0, field_size(t), refs, false, buf(), 0, false))
     l.boxes.put(key, d)
     d
 
@@ -562,7 +578,7 @@ private value_box(l: *Lowering, t: &Type) -> usize
         Some(m) -> field_size(m)
         None -> 0
     val d = l.descriptors.len()
-    l.descriptors.push(Descriptor("box of " + type_name(t), 0, size, buf(), size == 0, buf(), record_of(l, t)))
+    l.descriptors.push(Descriptor("box of " + type_name(t), 0, size, buf(), size == 0, buf(), record_of(l, t), false))
     l.boxes.put(key, d)
     d
 
@@ -685,7 +701,7 @@ private closure_shape(l: *Lowering, function: usize, type_args: Buf[&Type]) -> C
                     size += field_size(m)
         None -> ()
     val shape = ClosureShape(l.descriptors.len(), fields)
-    l.descriptors.push(Descriptor("closure of " + function_symbol(l.program, function, type_args), 0, size, refs, false, buf(), 0))
+    l.descriptors.push(Descriptor("closure of " + function_symbol(l.program, function, type_args), 0, size, refs, false, buf(), 0, false))
     l.shapes.put(key, shape)
     shape
 
@@ -771,6 +787,16 @@ private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr],
     // A string operation is lowered where it is called, so its checks report the call's place.
     val callee = l.program.symbols[function]
     if callee.intrinsic is Some(name)
+        if name == "trap"
+            val reason = args[0].kind match
+                StrConst(text) -> text
+                _ -> "trap"
+            leave(l, trap_at(l, reason, e.span))
+            return None
+        if name.starts_with("array_")
+            // The array is the receiver, or for a new one the result.
+            val array = concrete(l, if name == "array_new" then e.ty else args[0].ty)
+            return array_operation(l, name, array, operands, e.span)
         if name != "print_line" then return intrinsic_operation(l, name, operands, e.span)
     // A local function also receives what it captures, from where the caller keeps it.
     for x in callee.captured_locals
@@ -1056,9 +1082,20 @@ private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
         l.insts.push(Call(None, Runtime("avin_rt_print_line", MirSignature(params, None)), args))
         finish(l, Return(None))
         return
+    // A trap's reason is a literal at each call; called as a value it has none to name.
+    if name == "trap"
+        finish(l, trap_at(l, "trap", symbol.decl.name_span))
+        return
     var args: Buf[Operand] = buf()
-    for i in 0..<symbol.params.len()
-        args.push(Value(i))
+    var k = 0usize
+    for p in symbol.params
+        if machine(l, p) is Some(_)
+            args.push(Value(k))
+            k += 1
+    if name.starts_with("array_")
+        val array = concrete(l, if name == "array_new" then symbol.result.unwrap_or(Unit) else symbol.params[0])
+        finish(l, Return(array_operation(l, name, array, args, symbol.decl.name_span)))
+        return
     val result = intrinsic_operation(l, name, args, symbol.decl.name_span)
     finish(l, Return(result))
 
@@ -1093,6 +1130,49 @@ private intrinsic_operation(l: *Lowering, name: string, args: Buf[Operand], at: 
         trap_if(l, compare(l, CmpLt, args[1], ConstInt(32, "0")), "negative repeat count", at)
         return Some(runtime_call(l, "avin_rt_string_repeat", [MRef, MInt(32)], MRef, [s, args[1]]))
     None
+
+/** The bytes of an array's header, its length, before its elements. */
+private const ArrayHeader: usize = 8
+
+// The array operations, on an array of type `array`, whose element type decides each element's
+// width and machine type. An array's length is a 64-bit word at its start, at most the largest
+// `int`, so indices are `int`s; an index compared unsigned against the length is out of range when
+// negative too. Every operand that is a reference is a root, so the array survives the allocation a
+// new array makes.
+private array_operation(l: *Lowering, name: string, array: &Type, args: Buf[Operand], at: Span) -> Option[Operand]
+    val element: &Type = *array match
+        Class(_, _, type_args) -> type_args[0]
+        _ -> Unit
+    val m = mir_type(element)
+    val size = element_size(m)
+    if name == "array_new"
+        trap_if(l, compare(l, CmpLt, args[0], ConstInt(32, "0")), "negative array length", at)
+        val descriptor = layout(l, array).variants[0].descriptor
+        val length = convert_op(l, SignExtend, MInt(64), args[0])
+        return Some(runtime_call(l, "avin_rt_new_array", [MPtr, MInt(64)], MRef, [DescriptorAddress(descriptor), length]))
+    val a = args[0]
+    if name == "array_length" then return Some(byte_length(l, a))
+    if name == "array_slice"
+        trap_if(l, compare(l, CmpUgt, args[2], byte_length(l, a)), "slice out of range", at)
+        trap_if(l, compare(l, CmpUgt, args[1], args[2]), "slice out of range", at)
+        return Some(runtime_call(l, "avin_rt_array_slice", [MRef, MInt(32), MInt(32)], MRef, [a, args[1], args[2]]))
+    // `array_apply` and `array_update`: the element at the index, checked against the length.
+    trap_if(l, compare(l, CmpUge, args[1], byte_length(l, a)), "index out of range", at)
+    val t = m match
+        Some(t) -> t
+        None -> return None
+    val elements = fresh(l, MPtr)
+    l.insts.push(Offset(elements, a, ArrayHeader))
+    val index = convert_op(l, SignExtend, MInt(64), args[1])
+    val offset = if size == 1 then index else binary(l, MInt(64), OpMul, index, ConstInt(64, s"$size"))
+    val address = fresh(l, MPtr)
+    l.insts.push(Index(address, Value(elements), offset))
+    if name == "array_update"
+        l.insts.push(Store(Value(address), args[2]))
+        return None
+    val value = fresh(l, t)
+    l.insts.push(Load(value, Value(address)))
+    Some(Value(value))
 
 /** The length in bytes of the string `s`, as an `int`. */
 private byte_length(l: *Lowering, s: Operand) -> Operand
