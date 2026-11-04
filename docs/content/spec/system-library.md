@@ -86,7 +86,9 @@ data IoError
 
 An `IoError` is a value like any other: it is matched by its variants, shows as one (`NotFound`,
 `InvalidUtf8(2)`) wherever a value is displayed, and `e.message()` gives a sentence for a person
-(`no such file or directory`). An operation that can fail answers a `Result[T, IoError]`, so `?`
+(`no such file or directory`). **The named cases have one sentence each, the same on every platform;
+`Other` carries the platform's own wording** (`File name too long`), so a failure with no case of its
+own still says what happened. An operation that can fail answers a `Result[T, IoError]`, so `?`
 passes the failure on from a function that answers one too.
 
 ### Standard input
