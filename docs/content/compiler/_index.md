@@ -735,8 +735,8 @@ for `bool` and `unit`); a hole of any other type, a type parameter's included, b
 
 A built-in type's impl may declare a method as an intrinsic; its declared type takes the receiver
 first. `impl string` in `library/avin/string.avin` does so for the string operations that read the
-object itself: `byteLength` (the length word, loaded and narrowed to `int`), a private `byteAt` (a
-checked byte load), `slice`, `repeat` and a private `find`, the last three over the runtime's
+object itself: `byteLength` (the length word, loaded and narrowed to `int`), `byteAt` (a checked
+byte load), `slice`, `repeat` and a private `find`, the last three over the runtime's
 `avin_rt_string_slice`, `avin_rt_string_repeat` and `avin_rt_string_find`, and a private
 `parseReal` over `avin_rt_string_parse_real`, which reads the number with Sysl's parser and answers
 not-a-number for a refusal. A direct call of one is
