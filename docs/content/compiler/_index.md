@@ -476,6 +476,17 @@ function that loads both records, answers false when they differ, compares strin
 made for every record an object can have, once a program makes such a comparison at all; making them
 can lay out more types, so lowering repeats until no record lacks them.
 
+Two **rendering entries** follow (offsets 24 and 32): `display` and `debug` on an object of the type,
+a writer and a spec, through the type's own implementation where it conforms, or writing the type's
+name in the spec's field where it does not. A call of `display`, `debug` or `toString()` through a
+table on a receiver of `Any`, or of a trait that does not require the method's trait, does not use
+the table, which may have no such position for the object's type: `display` and `debug` call a
+generated function that loads the object's record and calls its entry, and `toString()` calls the
+core library's `displayString` at `Any`, which does the same through `display`. A receiver of
+`Display`, `Debug` or a trait requiring them keeps the table, since every object it holds conforms.
+The `display` entries are made like the equality entries, once a program shows such a value at all,
+and the `debug` entries once it debugs one.
+
 **Conditional conformance.** An impl with bounds of its own is recorded as a
 `ConditionalConformance`: the type's owner, the trait, and the bounds per type parameter, in the
 type's own parameters. The trait joins the type's `traits` as any other, so trait positions and

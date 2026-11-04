@@ -5334,6 +5334,7 @@ meets_bound(f: Conformances, x: &Type, bound: &Type) -> bool
         _ -> return true
     // Every type compares and hashes, a type parameter without a bound too.
     if names_core_trait(f.core, k, "Eq") || names_core_trait(f.core, k, "Hash") then return true
+    if rendered_at_run_time(f.classes, x) && names_rendering_trait(f.core, k) then return true
     *x match
         ErrorType -> true
         Nothing -> true
@@ -5363,6 +5364,17 @@ meets_bound(f: Conformances, x: &Type, bound: &Type) -> bool
 private names_core_trait(core: CoreTraits, k: usize, name: string) -> bool = core.trait_named(name) match
     Some(t) -> t == k
     None -> false
+
+/** Whether `k` is the core library's `Display` or `Debug`. */
+names_rendering_trait(core: CoreTraits, k: usize) -> bool = names_core_trait(core, k, "Display") || names_core_trait(core, k, "Debug")
+
+/** Whether a value of type `t` is shown by the type it has at run time: a value of `Any` or of a
+ * trait. Such a value has `Display` and `Debug` whatever its static type declares, rendered by its
+ * own type's implementation, or as its type's name where that type has none. */
+rendered_at_run_time(classes: Buf[ClassSymbol], t: &Type) -> bool = *t match
+    AnyType -> true
+    Class(k, _, _) -> classes[k].decl.modifier == "trait"
+    _ -> false
 
 /** `t` as an instance of the class or trait `target`, as `ancestor_type` finds it, through only the
  * conformances that hold at `t`'s type arguments: one an impl with bounds of its own states holds
@@ -5440,7 +5452,7 @@ unmet_condition(f: Conformances, owner: usize, conditions: Buf[Buf[&Type]], args
 private find_core_traits(c: *Checker)
     var traits: Map[string, usize] = map()
     var methods: Map[string, usize] = map()
-    for name in ["Eq", "Hash", "Ord", "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Integer"]
+    for name in ["Eq", "Hash", "Ord", "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Integer", "Display", "Debug"]
         if c.class_types.get(qualified(CoreModule, name)) is Some(k)
             if is_trait(c, k)
                 traits.put(name, k)
@@ -6849,8 +6861,20 @@ private field_type(c: *Checker, k: usize, index: usize, at: Span) -> &Type
 // built-in type.
 private method_of(c: *Checker, t: &Type, name: string) -> Option[usize]
     val known = zonk(c, t)
-    if *known is Class(k, _, _) then return method_named(c, k, name)
-    receiver_method(c, known, name)
+    val found = if *known is Class(k, _, _) then method_named(c, k, name) else receiver_method(c, known, name)
+    if found is Some(_) then return found
+    val rendering = rendering_methods(c, known, name)
+    if rendering.len() > 0 then Some(rendering[0]) else None
+
+// The methods of `Display` and `Debug` named `name` that a value of `Any` or of a trait has without
+// declaring them: see `rendered_at_run_time`.
+private rendering_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
+    if !rendered_at_run_time(c.classes, t) then return buf()
+    for trait_name in ["Display", "Debug"]
+        if c.core.trait_named(trait_name) is Some(k)
+            val ms = methods_named(c, k, name)
+            if ms.len() > 0 then return ms
+    buf()
 
 // A method of `name` named without a call, chosen among `ms`, the overloads the receiver's type has
 // that the code being checked may call. An overloaded name takes its overload from the expected
@@ -6889,9 +6913,9 @@ private overloaded_method_value(c: *Checker, at: Span, receiver: &TExpr, name: s
  * list of parameter types. */
 methods_of(c: *Checker, t: &Type, name: string) -> Buf[usize]
     val known = zonk(c, t)
-    if *known is Class(k, _, _) then return with_trait_methods(c, known, name, methods_named(c, k, name))
     if *known is TypeVar(_, _, _) then return with_trait_methods(c, known, name, bound_methods(c, known, name))
-    in_scope_on_context(c, known, with_trait_methods(c, known, name, visible_methods(c, receiver_methods(c, known, name))))
+    val found = if *known is Class(k, _, _) then with_trait_methods(c, known, name, methods_named(c, k, name)) else in_scope_on_context(c, known, with_trait_methods(c, known, name, visible_methods(c, receiver_methods(c, known, name))))
+    if found.len() > 0 then found else rendering_methods(c, known, name)
 
 // The methods of `StringContext`, its interpolators, are seen only where their module is: the core
 // library's, those of the file's own module and those of the modules it imports.
@@ -10517,6 +10541,11 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
             val ms = buf1u(m)
             if infix && !takes_one_argument(c, ms) then return infix_arity_error(c, at, name_span, target, name, ms, args)
             return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
+    // A value of `Any` or of a trait has `Display`'s and `Debug`'s methods, which its own type answers.
+    val rendering = rendering_methods(c, zonk(c, object.ty), name)
+    if rendering.len() > 0
+        if infix && !takes_one_argument(c, rendering) then return infix_arity_error(c, at, name_span, target, name, rendering, args)
+        return call_method(c, at, name_span, object, name, rendering, args, explicit, expected, false)
     if infix
         if !(*zonk(c, object.ty) is ErrorType)
             c.note(unit, name_span, s"`${type_name(zonk(c, object.ty))}` has no method `$name` to call infix" + split_hint(name))
@@ -10827,6 +10856,10 @@ private dispatch_slot(c: *Checker, receiver_type: &Type, m: usize) -> Option[usi
     if *zonk(c, receiver_type) is Class(r, _, _)
         if is_trait(c, r) then return Some(trait_slot(c, m))
         if is_open(c, r) then return table_position(c, r, m)
+    // `Any` has the methods of `Display` and `Debug`, which its value's own type answers.
+    if *zonk(c, receiver_type) is AnyType
+        if c.symbols[m].owner_class is Some(k)
+            if is_trait(c, k) then return Some(trait_slot(c, m))
     None
 
 // How a call of method `m` on a receiver of type `receiver_type` is made, with `args` the receiver

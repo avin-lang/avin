@@ -138,6 +138,32 @@ as the same value, written out without an exponent (`2.5`, `1`, `0.1`), a `bool`
 implements neither is a compile error. There is no fallback that prints an address. The specifier
 applies to the whole rendered value.
 
+A value whose static type is `Any` or a trait is shown by the type it has when the program runs.
+`Any` and every trait meet `Display` and `Debug`, as every type meets `Eq`: such a value meets a
+`Display` or `Debug` bound, has `display`, `debug` and `toString()`, and may be interpolated, whatever
+the trait itself declares. It does not convert to `Display` or `Debug` as a value: a value of either
+trait holds only objects whose types implement it. It renders through its own type's implementation, so a `Seq[int]` holding
+a vector prints `[1, 2, 3]`, as the vector would, and a `Vector[Seq[int]]` prints
+`[[1, 2, 3], [4]]`. A type with no `Display` (or no `Debug`) of its own renders as its name, `Cat` or
+`Box[int]`, and a function value as `<function>`, in the field the spec describes. The rule is for
+values whose type is decided at run time only: a value whose static type is a class or a data type
+still needs that type's own `Display`, and a type parameter its bound's. No impl gives a trait a
+`Display` of its own; its values are always shown by their own types.
+
+```avin
+trait Pet
+    name() -> string
+
+class Cat(): Pet
+    override name() -> string = "cat"
+
+main()
+    val xs: Seq[int] = [1, 2, 3]
+    val pet: Pet = Cat()
+    val anything: Any = (1, "two")
+    println(s"$xs $pet $anything")    // [1, 2, 3] Cat (1, two)
+```
+
 The core library declares the traits:
 
 ```text
