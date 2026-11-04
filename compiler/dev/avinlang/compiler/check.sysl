@@ -345,6 +345,9 @@ struct Checker
     builtins: Buf[BuiltinConformance]
     /** The core library's operator and equality traits, found once every method is declared. */
     core: CoreTraits
+    /** The derived traits whose methods read the fields through the trait: each field's type must
+     * implement it. */
+    derivations: Buf[Derivation]
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -475,9 +478,12 @@ private check_imports(c: *Checker, unit: usize)
  * unit is one of its files. Every file sees its own module's declarations, the names it imports and
  * the core library's public declarations, in that order: an inner name hides an outer one. */
 check_program(units: Buf[SourceUnit], root_module: string) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()))
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf())
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
+    // `derives` is written out as the methods and impls it stands for before anything is declared.
+    for u in 0..<c.units.len()
+        derive_unit(&c, u)
     // Every type is named before any is used, so a data type may refer to itself or to one
     // declared after it, and functions are declared once every type is known. A class is named
     // before any object, so an object finds its companion in any file of the module.
@@ -514,6 +520,8 @@ check_program(units: Buf[SourceUnit], root_module: string) -> Checked
         hold_to_bounds(&c, p.unit, p.at, p.what, p.owner, p.params, p.args, 0)
         c.generic = outer_generic
     c.pending = buf()
+    for dv in c.derivations
+        check_derivation(&c, dv)
     for u in 0..<c.units.len()
         declare_globals(&c, u)
     for u in 0..<c.units.len()
@@ -685,8 +693,6 @@ private declare_types(c: *Checker, unit: usize)
             if file.private_items[i] then c.private_names.put(key, true)
             for a in d.annotations
                 c.note(unit, a.span, s"unknown annotation `@${a.name}`")
-            for t in d.derives
-                c.note(unit, t.span, "`derives` is not implemented")
             c.types.put(key, c.data.len())
             c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf(), buf(), buf(), buf(), buf()))
     for i in 0..<file.items.len()
@@ -994,8 +1000,6 @@ private declare_fields(c: *Checker, unit: usize)
         val d = k.decl
         for a in d.annotations
             c.note(unit, a.span, s"unknown annotation `@${a.name}`")
-        for t in d.derives
-            c.note(unit, t.span, "`derives` is not implemented")
         val declares_trait = is_trait(c, id)
         if declares_trait
             for m in d.members
@@ -3224,6 +3228,57 @@ private conditions_hold(c: *Checker, t: &Type, k: usize) -> bool
                 if !conforms_to_bound(c, args[i], substitute(b, block.owner, args)) then holds = false
         if holds then return true
     !reached
+
+// Holds each field of a type deriving a trait to the trait, which the derived method calls on it: a
+// class's constructor parameters, a data type's variants' fields, seen with the bounds the type's
+// parameters have there. A field that falls short is reported by name, and the derived method is
+// then left unchecked, since each of its failures would be that one again.
+private check_derivation(c: *Checker, dv: Derivation)
+    val k = c.class_types.get(qualified(CoreModule, dv.trait_name)) match
+        Some(k) -> k
+        None -> return
+    val bound = own_class_type(c.classes[k], k)
+    val key = qualified(c.units[dv.unit].file.module_name, dv.type_name)
+    var names: Buf[string] = buf()
+    var types: Buf[&Type] = buf()
+    var scope: Option[GenericScope] = None
+    if dv.data
+        val id = c.types.get(key) match
+            Some(id) -> id
+            None -> return
+        for block in c.impls
+            if block.unit == dv.unit && block.decl.span.start == dv.span.start && block.decl.span.end == dv.span.end
+                scope = Some(GenericScope(data_owner(id), block.decl.type_params))
+        if scope is None then return
+        val d = c.data[id]
+        for v in d.variants
+            for i in 0..<v.fields.len()
+                names.push(if d.variants.len() == 1 then v.field_names[i] else s"${v.name}.${v.field_names[i]}")
+                types.push(v.fields[i])
+    else
+        val id = c.class_types.get(key) match
+            Some(id) -> id
+            None -> return
+        scope = Some(GenericScope(class_owner(id), c.classes[id].decl.type_params))
+        for f in c.classes[id].fields
+            if f.param && f.owner == id && f.ty is Some(t)
+                names.push(f.name)
+                types.push(t)
+    val outer_generic = c.generic
+    c.generic = scope
+    var failed = false
+    for i in 0..<types.len()
+        if conforms_to_bound(c, types[i], bound) then continue
+        failed = true
+        val shown = type_name(zonk(c, types[i]))
+        val hint = if *types[i] is TypeVar(_, _, _) then s"; bound the parameter, as in `[$shown: ${dv.trait_name}]`" else ""
+        c.note(dv.unit, dv.span, s"`${dv.type_name}` cannot derive `${dv.trait_name}`: its field `${names[i]}` has type `$shown`, which does not implement `${dv.trait_name}`$hint")
+    c.generic = outer_generic
+    if !failed then return
+    for id in 0..<c.symbols.len()
+        val decl = c.symbols[id].decl
+        if c.symbols[id].unit == dv.unit && decl.name_span.start == dv.span.start && decl.name_span.end == dv.span.end
+            c.states.set(id, 2)
 
 // Holds type arguments written on a type to the bounds of its parameters: at once when every
 // conformance is known, and otherwise once it is.
@@ -6247,14 +6302,18 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
             for a in args
                 check_statement(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
-    // A value of a type parameter has the methods of its bounds, and no others.
+    // A value of a type parameter has the methods of its bounds, and no others but the `equals` and
+    // `hash` every value has.
     if *zonk(c, object.ty) is TypeVar(_, _, _)
         val ty = zonk(c, object.ty)
         val ms = bound_methods(c, ty, name)
         if ms.len() > 0
             if infix && !takes_one_argument(c, ms) then return infix_arity_error(c, at, name_span, target, name, ms, args)
             return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
-        if bound_field(c, ty, name) is None && bound_class_field(c, ty, name) is None
+        val universal = c.core.method_named(name) match
+            Some(m) -> is_universal(c, m)
+            None -> false
+        if !universal && bound_field(c, ty, name) is None && bound_class_field(c, ty, name) is None
             no_bound_member(c, name_span, ty, name)
             for a in args
                 check_statement(c, a.value)
@@ -6271,7 +6330,7 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
         return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
     // Every value has `Eq`'s `equals` and `Hash`'s `hash`, its own or by value or identity.
     if c.core.method_named(name) is Some(m)
-        if is_universal(c, m) && !(*zonk(c, object.ty) is ErrorType) && !(*zonk(c, object.ty) is TypeVar(_, _, _))
+        if is_universal(c, m) && !(*zonk(c, object.ty) is ErrorType)
             val ms = buf1u(m)
             if infix && !takes_one_argument(c, ms) then return infix_arity_error(c, at, name_span, target, name, ms, args)
             return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)

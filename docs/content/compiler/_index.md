@@ -237,6 +237,23 @@ their parameters' own. The trait is one that is only a bound, so no value is eve
 no type pattern tests it; the type's method table at an instance whose arguments miss the bounds
 still holds the impl's methods, compiled but never reached.
 
+**Derived traits.** `derives` is written out on the syntax tree (`derive.sysl`) before the checker
+declares anything, so a derived method is declared, checked and compiled as one written by hand, and
+every node made for it carries the span of its `derives` entry. A class gains each derived trait
+after its parents and an `override` of the trait's method over its constructor parameters, read
+through `self` and `other`; a data type gains an impl per trait (none for `Eq` and `Hash`, which it
+has by value), its method matching `(self, other)` or `self` against each variant, and for `Ord`
+comparing variant positions when the variants differ. `Eq` joins `equals` calls with `&&`, `Hash`
+folds the fields' `hash` with wrapping `*% 31 +%`, `Ord` returns the first nonzero `compare`, and
+`Display` and `Debug` write the name and each field through the trait's own method, rendering into a
+`StringWriter` first when the spec has a width. A generic data type's `Ord` impl bounds every
+parameter by `Ord`, a conditional conformance; `Display` and `Debug` cannot be conditional, being
+types too. The rules a list breaks on its own (an unknown trait, a repeat, a trait the type also
+implements, `Eq` without `Hash` on a class) are reported while writing it out. The rest needs types:
+once every conformance is known, the checker holds each field to the trait derived from it, with the
+bounds the parameters have in the derived impl, names a field that falls short, and leaves that
+derived method unchecked.
+
 The supertypes an instance has through **variance** are open-ended (`List[Dog]` is a `List[Animal]`
 and a `List[Any]`), so a record does not list them all. Lowering notes each record a type pattern
 tests through `avin_rt_conforms`; once every function is lowered, each record gains those tested
