@@ -1400,7 +1400,12 @@ Settled by the user on 2026-11-04:
   `Result[Regex, PatternError]`; a group number or name the match does not have traps. Properties
   needing Unicode data beyond the general category (scripts, blocks, `Alphabetic`, `Uppercase`,
   `Lowercase`, `Ideographic`, `Word`, emoji), the flags `U` and `c`, `\X`, `\b{g}` and `\N{…}` are
-  refused with an `Unsupported` error until the runtime holds that data.
+  refused with an `Unsupported` error until the runtime holds that data. Replacing and splitting
+  follow the same dialect: `replaceAllIn` (a replacement, or a `(Match) -> string` whose result is
+  read as one), `replaceFirstIn`, `replaceSomeIn`, `split` answering an `Array[string]` with the
+  empty pieces at the end dropped, `Pattern.split(s, limit = 0)`, `Regex.quote` and
+  `Regex.quoteReplacement`; `$n` takes digits while they name a group, `${name}` is the pattern's
+  own name only, and a reference that cannot be resolved traps with the dialect's message.
 - Sysl handles ([Sysl bindings](/spec/sysl-bindings/#handles)): a `class` declared with `@sysl`
   naming a Sysl type has no parameters, fields or constructor and is made only by a binding that
   returns it, directly or as the value of an `Option` or `Result`; a collection of handles does not

@@ -1,6 +1,6 @@
 ---
 title: Regular expressions
-summary: "Proposed: `avin.regex` — the pattern language, backtracking matching with leftmost-first results, and `Regex`, `Match` and `MatchIterator`."
+summary: "Proposed: `avin.regex` — the pattern language, backtracking matching with leftmost-first results, `Regex`, `Match` and `MatchIterator`, replacing and splitting."
 weight: 26
 ---
 
@@ -115,9 +115,39 @@ is repeated or tried more than once:
 | `findPrefixOf(s)`, `findPrefixMatchOf(s)` | A match starting at the start of `s` |
 | `findAllIn(s)` | A `MatchIterator`: every match, left to right, not overlapping |
 | `findAllMatchIn(s)` | The same, as an `Iterator[Match]` |
+| `replaceAllIn(s, replacement)` | `s` with every match replaced by the replacement, its group references filled in |
+| `replaceAllIn(s, f)` | `s` with every match `m` replaced by `f(m)`, `f` a `(Match) -> string`; its result is read as a replacement |
+| `replaceFirstIn(s, replacement)` | `s` with its first match replaced |
+| `replaceSomeIn(s, f)` | `s` with each match `m` replaced where `f(m)`, an `Option[string]`, is `Some`, and kept where it is `None` |
+| `split(s)` | `pattern().split(s)`: the pieces of `s` between the matches, as an `Array[string]` |
 | `unanchored()`, `anchored()` | The same regex with `matches` asking about any part, or the whole |
-| `regex()`, `toString()`, `pattern()` | The pattern as written; `pattern()` is a `Pattern`, with `pattern()` and `groupCount()` |
+| `regex()`, `toString()`, `pattern()` | The pattern as written; `pattern()` is a `Pattern`, with `pattern()`, `groupCount()` and `split` |
+| `Regex.quote(text)` | A pattern matching `text` literally: `\Q`, the text, `\E`, each `\E` in the text written so it does not end the quotation |
+| `Regex.quoteReplacement(text)` | A replacement writing `text` literally: each `\` and `$` with a backslash before it |
 
+**Replacements.** In a replacement, `$` followed by digits is what a group matched: the first digit
+always counts, and each digit after it is taken while the number still names a group the pattern
+has, so `$10` with one group is group 1 and then `0`. `${name}` is the group the pattern names
+`name` (the names given to the `Regex` do not count here). A group that took no part writes nothing.
+A backslash makes the character after it literal, so `\$` writes `$` and `\\` one backslash. A
+replacement computed by `f` is read the same way; `Regex.quoteReplacement` makes any text safe to
+use. A reference that cannot be resolved traps, with these messages: `No group 2` for a number the
+pattern does not have, `No group with name {n}`, `Illegal group reference` for `$` followed by
+anything else, `Illegal group reference: group index is missing` for a `$` at the end, `named
+capturing group has 0 length name`, `named capturing group is missing trailing '}'`, `capturing
+group name {1n} starts with digit character`, and `character to be escaped is missing` for a
+backslash at the end.
+
+Matches are found as by `findAllIn`, so an empty match is replaced at each position between
+characters: `Regex("").replaceAllIn("é😀", "-")` is `-é-😀-`, and `Regex("a*").replaceAllIn("baaac",
+"-")` is `-b--c-`. Text with no match comes back unchanged.
+
+**Splitting.** `Pattern.split(s, limit = 0)` gives the pieces of `s` between the matches, left to
+right. An empty match at the very start makes no empty first piece, while a match of some length
+there does (`Regex(",").split(",a")` is `["", "a"]`); a text the pattern does not match is one piece,
+the empty text included. With `limit` above 0 there are at most `limit` pieces, the last the rest of
+the text; with 0, the empty pieces at the end are dropped, so `Regex(",").split("a,,b,,")` is
+`["a", "", "b"]` and `Regex(",").split(",,")` has none; below 0 every piece is kept.
 A `PatternError` has a `description`, the `pattern` and the `index` of the character the error was
 found at (-1 where no one character is to blame); `message()` writes the description, ` near index`
 and the index, then the pattern on a line of its own and, where the index is inside it, a caret
