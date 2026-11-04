@@ -29,7 +29,10 @@ a decision changes, this page and the chapter change together.
   [bindings written in Avin](/spec/sysl-bindings/), which the compiler turns into shims that Sysl
   checks. The runtime is written in Sysl.
 - The domain is `avinlang.dev`. Compiler modules use `dev.avinlang.compiler`, and the standard
-  library uses the reserved root `avin`.
+  library uses the reserved root `avin`. A library the project publishes outside the core library is
+  a package in its own repository of the `avin-lang` organization, with modules under
+  `dev.avinlang`: parser combinators are `github.com/avin-lang/parsing`, module
+  `dev.avinlang.parsing`, written as literate Avin.
 - Building the Kutter video editor natively is a long-term application goal.
 - Sysl's Ada-inspired features (contracts and the like) are a long-term direction.
 
@@ -970,42 +973,6 @@ Settled by the user on 2026-11-04:
   `Eq` and `Debug` bounds, showing both values' `Debug` forms) trap at the assertion's place. Not yet
   built: `@tests` files, setup and teardown hooks, `should_trap`, `ignore` and `timeout` arguments,
   and tests answering with a `Result`.
-- Parser combinators, `avin.parsing` ([parsing](/spec/parsing/)), in the core library until
-  packages exist. The choices for the user:
-  - **Representation.** `Parser[+T]` is a class holding `run: Input -> Option[T]`; `Input` is
-    mutable (the byte offset, the furthest failure and its expectations, a committed flag), so a
-    success allocates only its `Some` and backtracking restores one offset. A parser of a megabyte of
-    JSON runs in about a tenth of a second unoptimized. The alternative, an immutable input and a
-    result carrying the next input, allocates a result per step.
-  - **Backtracking by default, with commit points.** `p | q` retries from where `p` started however
-    far it read. `p ~! q` and `commit(p)` make a later failure fail the whole parse, for errors that
-    name what the committed rule expected.
-  - **Errors.** The furthest failure wins; its distinct expectations are listed in the order tried
-    (``2:5: expected `,` or `]`, found '4'``). `label(what)` renames a failure that got no further than
-    the rule's first character.
-  - **Names.** `~`, `~>`, `<~`, `~!`, `|`, `^^`, `^^^` and methods `map`, `flatMap`, `filter`,
-    `label`, `opt`, `rep`, `rep1`, `repSep`, `rep1Sep`, `commit`, `positioned`, `parse`,
-    `parsePrefix`, each repetition also as a function (`rep(p)`). `>>` is a shift and cannot name
-    a method, so binding is `flatMap` alone. `not` is a keyword, so the negative look ahead is
-    `notFollowedBy`; the positive one is `guard`. `lit` takes a string or a character, since
-    `char`, `int` and `real` name types: the number parsers are `integer` (`long`) and `decimal`
-    (`real`). `symbol(s)` is `token(lit(s))`. There is one whole-input entry point, `parse`, and no
-    `parseAll`.
-  - **Recursion.** Rules are `lazy val`s and a cycle reads through `defer(p)`, a by-name parameter
-    evaluated on the first run and kept.
-  - **`<~` binds with the comparisons**, below `^^` and `|`, as its first character places it, so
-    `"(" ~> e <~ ")" ^^ f` and `a | "(" ~> e <~ ")"` misgroup, the second without a type error. The
-    library writes such rules in parentheses or as rules of their own. Placing a symbol method that
-    begins with `<` and continues with `~` (or any name containing `~`) at the level of other
-    symbols would remove the trap.
-  - **No regular expressions**: a compiled pattern would cross from Sysl as a handle, and bindings
-    carry none yet.
-  - **The core library's `string` gains** `byteAt(at)`, `charAt(at)` and `startsWith(prefix, at)`,
-    which the parsers read the text with; `charAt` reads the character whose encoding begins at a
-    byte offset.
-  - **Depth.** Nesting is recursion: about 3,000 levels of parentheses on the main thread
-    unoptimized, more on a thread given a larger stack. An exhausted stack ends the program with a
-    segmentation fault and no message.
 
 ## Open
 
