@@ -378,6 +378,16 @@ a decision changes, this page and the chapter change together.
 - `?` returns from the function or lambda it is written in, so that one's result type must be
   declared or, for a lambda, known where it is written. It cannot leave a delayed argument or a class
   body.
+- Builders are the trait `Builder[-A, +C]` (`add`, `addAll`, `result`); a collection's companion
+  object makes one with `builder[T]()`, and a sequence literal is built through the expected
+  collection's, so a program's own class with such a companion is written as a literal too. A `List`
+  literal is built from the back with `::`, since `List` is a data type.
+- A collection literal compared with `==`, `!=` or an ordering takes the other operand's type.
+- `Vector` keeps its elements in one array that is never written after the vector is made: indexing
+  is constant time and a changed vector is a copy. A persistent structure may replace it without
+  changing its interface.
+- Core-library functions marked `@trapsAtCaller` report their traps at the program's call, as the
+  language's own operations do; the annotation is the core library's alone.
 
 **Deferred**
 
@@ -387,6 +397,13 @@ a decision changes, this page and the chapter change together.
 - Partial-function literal syntax, which the user has explicitly left undecided.
 
 ## Proposed
+
+- The methods an `impl` adds to a class whose fields are all immutable are not variance positions,
+  as a `data` type's are not: such an instance holds nothing a method could store a value into. It
+  lets `Vector[+T]` take `T` in `appended`, `updated` and `contains`, and implement `Eq`, without
+  lower bounds. A class with a `var` field keeps every method a position.
+- Until methods can be named by symbols, a vector's `:+`, `+:` and `++` are `appended`,
+  `prepended` and `concat`, and a buffer's `+=` is `add`.
 
 - A module is not named in code: `import a.b` is an error, and `b.X` does not reach `a.b`'s `X`.
   Every use of another module's declaration goes through an import of that declaration. The
