@@ -582,7 +582,28 @@ built-in type implements every method of the trait, defaults included.
   the data type itself is direct.
 - **A generic impl names the type's parameters**, in order: `impl[T] Show for Box[T]`,
   `impl[K, V] Map[K, V]`. The names are the impl's own and need not be the declaration's. An impl
-  for particular type arguments (`impl Show for Box[int]`) is not part of the language.
+  of a trait always does: a conformance holds for every instance of a type, so an impl of a trait
+  for particular type arguments (`impl Show for Box[int]`) or for a type built from its parameters
+  (`impl[T] Show for Box[List[T]]`) is an error, and no two conformances of one type can overlap.
+- **An impl without `for` may add methods to any type built from its parameters**:
+  `impl[T] Option[Option[T]]`, `impl[A, B] Pair[A, List[B]]`, and, adding to a trait,
+  `impl[T] Seq[Seq[T]]` and `impl[K, V] Iterable[(K, V)]`. Each of its parameters is part of that
+  type, so a call learns them from the receiver; one that is not is an error. The type is matched
+  against the receiver's static type: `Option[Option[int]]` matches `Option[Option[T]]` with `T` as
+  `int`, and `flatten` on an `Option[int]` is an error saying what the receiver would need to be
+  ("`flatten` is for an `Option` of an `Option`; this is `Option[int]`"). Where a part of the type is
+  covariant, a reference matches through its traits and superclasses, as it would be passed:
+  a `Vector[List[int]]` is a `Seq[Seq[int]]`, with `T` as `int`. Elsewhere a part matches only its
+  own type, and a parameter written twice (`impl[T] Pair[T, T]`, `impl[T, E] Result[Result[T, E],
+  E]`) takes one type. The impl's bounds apply as for any impl: with `impl[A: Ord, B] Seq[(A, B)]`,
+  a sequence of pairs whose first parts are not ordered lacks its methods. Inside the methods `self`
+  has the type the impl names (or, adding to a trait, is a `Self` of it), and the methods are
+  called directly, as other added methods are.
+- **Two impls whose types both match a receiver** and that add a method of one name and parameter
+  types make a call of it an error, as two traits' added methods do; so does a method of the type's
+  own with the name and parameter types of one an impl adds to a type built from its parameters.
+  Impls whose types no receiver matches both, as `Box[List[T]]` and `Box[Option[T]]`, may add
+  methods of one name and parameter types, and the receiver says which is called.
 - **An impl may bound the type's parameters further** (`impl[T: Display] List[T]`,
   `impl[T: Ord] Ord for Box[T]`), and then holds only for the type arguments that meet the bounds:
   the trait's conformance, or the methods it adds. Calling one of those methods on an instance that
