@@ -22,8 +22,10 @@ Iterable[+A]                 iterator(), and the operation families below
 │   ├── Array[A]             mutable, fixed length, contiguous
 │   ├── Buffer[A]            mutable, growable at the end, contiguous
 │   └── Deque[A]             mutable, growable at both ends
-├── Set[A]                   immutable; HashSet, TreeSet
-└── Map[K, +V]               immutable; HashMap, TreeMap
+├── Set[A]                   immutable, by hash
+├── TreeSet[A]               immutable, sorted by Ord
+├── Map[K, +V]               immutable, by hash
+└── TreeMap[K, +V]           immutable, sorted by Ord
 ```
 
 `[]T` is shorthand for `Vector[T]` in any type position (`xs: []int`, `[][]int`); see
@@ -294,6 +296,47 @@ Mutable maps and sets, like arrays, compare and hash by their contents at the mo
 compared; `===` tells two of them apart. Every map and set displays in the shape of its literal,
 `{a: 1, b: 2}` and `{1, 2, 3}`, each part in its own `Display`, and its `Debug` uses the parts'
 `Debug`, `{"a": 1}`, each where the parts have it.
+
+## Sorted maps and sets
+
+`TreeMap[K, +V]` and `TreeSet[A]` keep their keys in the order of `compare`, so a key must be `Ord`:
+`TreeSet(Point(1, 2))` is an error naming the bound when `Point` has no order. They are persistent
+like `Map` and `Set`, an update copying one path, and they are balanced trees, so a lookup, an update
+and each ordered operation below take time in the logarithm of the size. Iteration, `keys()`,
+`values()`, `foreach`, `mkString` and the display all visit the keys in ascending order.
+
+A tree map has every method of `Map`, and a tree set every method of `Set`, with the same meaning and
+the same traits: each is `Iterable`, a function (`(K) -> V` and `(A) -> bool`), `Eq`, `Hash`,
+`Display` and `Debug`, so code written over those traits takes either kind. A tree collection equals
+another of its type holding the same entries, and hashes to what the `Map` or `Set` of the same
+entries does. The methods that make a collection keyed by something new — `map`, `collect` and
+`flatMap` — need the new key to be `Ord` and answer a tree collection; where two entries make the same
+key, the later one in key order wins. A tree map's `keySet()` is a `TreeSet`.
+
+The ordered operations, on both kinds, answering a map's entries as `(key, value)` pairs:
+
+| Operation | Answers |
+|---|---|
+| `first()`, `last()` | the least and the greatest entry, as an `Option` |
+| `floor(k)`, `ceiling(k)` | the entry with the greatest key at most `k`, and the least at least `k`, as an `Option` |
+| `from(low)` | the entries whose keys are at least `low` |
+| `until(high)` | the entries whose keys are less than `high` |
+| `range(low, high)` | the entries from `low` until `high`; none when `high` is not greater |
+| `reverseIterator()` | the entries in descending order |
+
+The three slices are collections of the same kind, sharing their structure with the original.
+
+```text
+val scores = TreeMap(("cy", 7), ("al", 9), ("bo", 4))
+print(scores)                     // {al: 9, bo: 4, cy: 7}
+print(scores.range("b", "c"))     // {bo: 4}
+print(scores.floor("bz"))         // Some((bo, 4))
+val small: TreeSet[int] = [5, 1, 3]
+print(small.until(4))             // {1, 3}
+```
+
+`TreeMap.empty`, `TreeMap.builder` and `TreeMap((k, v), …)`, and the same for `TreeSet`, make them as
+their hash-based counterparts' companions do, and a sequence literal builds one where one is expected.
 
 ## Indexing and callable sequences
 
