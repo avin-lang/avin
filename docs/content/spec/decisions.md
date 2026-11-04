@@ -556,6 +556,14 @@ Settled by the user on 2026-11-03:
 
 Settled by the user on 2026-11-04:
 
+- A function type with one parameter is written without parentheses: `int -> string`,
+  `Option[T] -> bool`. `->` in a type groups to the right, so `int -> int -> int` is
+  `int -> (int -> int)`; `(A) -> B` is the same type as `A -> B`, `(A, B) -> C` takes two
+  parameters, a function taking one tuple is `((A, B)) -> C`, and a function taking a function is
+  `(int -> int) -> int`. A function type needs no parentheses in a parameter, field, result,
+  type argument, tuple part or `val` annotation, nor as a supertype; a type pattern in a `match`
+  arm still writes it in parentheses, since the arm's own `->` follows it. Error messages print
+  every function type with a parameter list, `(int) -> int`.
 - `main` is `main()` or `main(args: Vector[string])`, the arguments after the program's name, the
   same as `avin.process.args()`. The parameter is exactly `Vector[string]` (a name for that type
   is the same type; `Seq[string]` and `Array[string]` are errors), it has no default, and any other
