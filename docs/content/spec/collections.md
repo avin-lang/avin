@@ -73,6 +73,52 @@ squares(n: int) -> List[int]
     b.result()
 ```
 
+## Maps and sets
+
+`Map[K, +V]` and `Set[A]` find keys by their hash and compare them with `==`. Every type has both, so
+any type is a key: strings and tuples by value, `data` values field by field, class instances by
+identity unless their class implements `Eq` and `Hash`. Each key's hash is spread over all 64 bits
+before it is used, so sequential integers and strings sharing long prefixes do not cluster.
+
+The immutable map and set are persistent: `m.updated(k, v)`, `m.removed(k)`, `s.added(x)` and
+`s.removed(x)` return a new collection sharing all but the changed path with the old one, which is
+left as it was. They are hash tries, branching on one bit of the spread hash at a time, so an update
+copies a path proportional to the logarithm of the size. Two maps are equal when they hold the same
+keys bound to equal values, and two sets when they hold the same elements; equal collections hash
+alike, whatever order they were built in.
+
+```text
+var counts = Map[string, int]()
+for w in words do counts = counts.updated(w, counts.getOrElse(w, 0) + 1)
+for (word, n) in counts do print(s"$word $n")
+```
+
+`m(k)` reads a value and traps when the key is absent; `m.get(k)` returns an `Option`, and
+`m.getOrElse(k, d)` evaluates `d` only when the key is absent. A set is a function from elements to
+`bool`: `s(x)` is `s.contains(x)`. Sets have `union`, `intersect`, `diff` and `subsetOf`, which read
+well infix: `odds union evens`.
+
+`avin.collections.mutable` holds `Map[K, V]` and `Set[A]`, invariant, updated in place:
+`m(k) = v` binds a key, `m(k) += 1` updates its value, and `remove` answers the value removed as an
+`Option`. They are open-addressed tables, probed linearly, kept at most two thirds full. A program
+importing them alongside the immutable ones renames them:
+
+```text
+import avin.collections.mutable.{Map as MutableMap}
+
+val seen = MutableMap[string, int]()
+seen("a") = 1
+```
+
+Iteration visits a map's entries as `(key, value)` pairs in an order the program cannot rely on. For
+the immutable collections it depends only on the keys' hashes, so equal maps iterate alike; for the
+mutable ones it is the table's order.
+
+Mutable maps and sets, like arrays, compare and hash by their contents at the moment they are
+compared; `===` tells two of them apart. Every map and set displays in the shape of its literal,
+`{a: 1, b: 2}` and `{1, 2, 3}`, each part in its own `Display`, and its `Debug` uses the parts'
+`Debug`, `{"a": 1}`, each where the parts have it.
+
 ## Indexing and callable sequences
 
 A `Seq[A]` is a function from index to element: `xs(i)` reads an element, and a `Seq[A]` can be

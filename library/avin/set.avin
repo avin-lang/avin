@@ -1,0 +1,116 @@
+module avin
+
+// An immutable set: each element present at most once, found by its hash and compared with `==`, so
+// any type can be an element. An update returns a new set that shares all but the changed path with
+// the old one, which is left as it was. Iteration visits the elements in an order fixed by their
+// hashes, not by the order they were added. Two sets are equal when they hold the same elements.
+// `Set[A]()` is the empty set, and `SetBuilder[A]()` builds one from elements.
+data Set[A: Eq + Hash](root: HashTrie[A, unit] = Empty)
+
+impl[A] Set[A]
+    // The number of elements.
+    size() -> int = trieSize(root)
+
+    isEmpty() -> bool = root is Empty
+
+    nonEmpty() -> bool = !isEmpty()
+
+    contains(element: A) -> bool = trieFind(root, spreadHash(element.hash()), element) is Some(_)
+
+    // Whether `element` is in the set, so that a set is a function from elements to `bool`.
+    apply(element: A) -> bool = contains(element)
+
+    // This set with `element` in it; the same set when it already was.
+    added(element: A) -> Set[A]
+        val h = spreadHash(element.hash())
+        if trieFind(root, h, element) is Some(_) then self else Set(trieInsert(root, h, element, ()))
+
+    // This set without `element`; the same set when it was absent.
+    removed(element: A) -> Set[A]
+        val h = spreadHash(element.hash())
+        if trieFind(root, h, element) is None then self else Set(trieRemove(root, h, element))
+
+    // The elements in this set, in `other`, or in both.
+    union(other: Set[A]) -> Set[A]
+        val (larger, smaller) = if size() >= other.size() then (self, other) else (other, self)
+        var result = larger
+        for x in smaller do result = result.added(x)
+        result
+
+    // The elements in both this set and `other`.
+    intersect(other: Set[A]) -> Set[A]
+        val (larger, smaller) = if size() >= other.size() then (self, other) else (other, self)
+        smaller.filter(x -> larger.contains(x))
+
+    // The elements in this set and not in `other`.
+    diff(other: Set[A]) -> Set[A] = filter(x -> !other.contains(x))
+
+    // Whether every element of this set is in `other`.
+    subsetOf(other: Set[A]) -> bool
+        if size() > other.size() then return false
+        for x in self
+            if !other.contains(x) then return false
+        true
+
+    // The elements that satisfy `p`.
+    filter(p: (A) -> bool) -> Set[A]
+        var t = root
+        for x in self
+            if !p(x) then t = trieRemove(t, spreadHash(x.hash()), x)
+        Set(t)
+
+    // The set of `f` of each element; elements that `f` maps alike become one.
+    map[B: Eq + Hash](f: (A) -> B) -> Set[B]
+        var t: HashTrie[B, unit] = Empty
+        for x in self
+            val y = f(x)
+            t = trieInsert(t, spreadHash(y.hash()), y, ())
+        Set(t)
+
+    // Calls `f` with each element.
+    foreach(f: (A) -> unit)
+        for x in self do f(x)
+
+impl[A] Iterable[A] for Set[A]
+    iterator() -> Iterator[A] = SetElements(HashTrieIterator(root))
+
+impl[A] Eq for Set[A]
+    equals(other: Set[A]) -> bool = size() == other.size() && subsetOf(other)
+
+// A sum over the elements, so that the hash does not depend on the order they are visited in.
+impl[A] Hash for Set[A]
+    hash() -> long
+        var h: long = 0
+        for x in self do h = h +% spreadHash(x.hash())
+        h
+
+// A set of displayable elements displays as `{1, 2, 3}`, the shape of a set literal. A field width
+// pads the whole.
+impl[A: Display] Display for Set[A]
+    display(out: Writer, spec: FormatSpec)
+        writeElement(w: Writer, x: A) = x.display(w, FormatSpec())
+        writeBraced(out, spec, iterator(), writeElement)
+
+// A set's diagnostic form is its elements' diagnostic forms in braces: `{"a", "b"}`.
+impl[A: Debug] Debug for Set[A]
+    debug(out: Writer, spec: FormatSpec)
+        writeElement(w: Writer, x: A) = x.debug(w, FormatSpec())
+        writeBraced(out, spec, iterator(), writeElement)
+
+// Builds a set from elements, an element added twice held once.
+class SetBuilder[A: Eq + Hash]: Builder[A, Set[A]]
+    private var trie: HashTrie[A, unit] = Empty
+    private var spent = false
+
+    override add(element: A)
+        if spent then fail("add to a builder whose result was taken")
+        trie = trieInsert(trie, spreadHash(element.hash()), element, ())
+
+    override result() -> Set[A]
+        if spent then fail("result of a builder whose result was taken")
+        spent = true
+        Set(trie)
+
+private class SetElements[A](entries: Iterator[(A, unit)]): Iterator[A]
+    override hasNext() -> bool = entries.hasNext()
+    override next() -> A = entries.next().0

@@ -272,6 +272,39 @@ destructuring binding, whose `:` begins the binding's type, a type pattern is in
 function type in a type pattern is written in parentheses, because an arm's `->` follows it:
 `f: ((int) -> int) -> …`.
 
+## is
+
+`x is P` tests a value against any pattern a `match` arm takes and yields a `bool`; `x is not P` is
+its negation. The names `P` binds are in scope only where the test is known to have matched:
+
+```text
+area(shape: Option[Shape]) -> int
+    if shape is not Some(Rect(w, h)) then return 0
+    w * h
+
+total(xs: List[int]) -> int
+    var rest = xs
+    var sum = 0
+    while rest is head :: more
+        sum += head
+        rest = more
+    sum
+```
+
+- `if x is P` binds them in the `then` branch, `while x is P` in the body, and `a && b` in `b`.
+- `x is not P` binds them where the test failed: the `else` of an `if`, the `else` of a `while`, and
+  the right operand of `||`.
+- `!` swaps the two: `!(x is P)` binds like `x is not P`.
+- A condition binds its operands' names where it holds, for `&&`, or where it fails, for `||`. Neither
+  side of `a is P(v) || b is Q(v)` holds wherever the whole does, so the `then` branch sees no `v`.
+- After an `if` whose one branch never finishes (a `return`, `break`, `continue` or trap), the rest of
+  the block sees the names bound for the other branch, as `w` and `h` above.
+
+Nowhere else: not in the other branch, not after an `if` both of whose branches finish, not in the
+test of `do … while`, and not after an `is` used as a value (`val big = o is Some(n) && n > 100`).
+Using a name outside its scope is an error that says so. A condition binds a name once; its names
+may shadow the enclosing block's, as an arm's may, except those the block keeps after an `if`.
+
 ## return and end markers
 
 `return expr` exits the enclosing function. Inside a lambda it exits the lambda. Where a `return` or
