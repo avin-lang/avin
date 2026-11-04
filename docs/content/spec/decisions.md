@@ -556,6 +556,14 @@ Settled by the user on 2026-11-03:
 
 Settled by the user on 2026-11-04:
 
+- A function type with one parameter is written without parentheses: `int -> string`,
+  `Option[T] -> bool`. `->` in a type groups to the right, so `int -> int -> int` is
+  `int -> (int -> int)`; `(A) -> B` is the same type as `A -> B`, `(A, B) -> C` takes two
+  parameters, a function taking one tuple is `((A, B)) -> C`, and a function taking a function is
+  `(int -> int) -> int`. A function type needs no parentheses in a parameter, field, result,
+  type argument, tuple part or `val` annotation, nor as a supertype; a type pattern in a `match`
+  arm still writes it in parentheses, since the arm's own `->` follows it. Error messages print
+  every function type with a parameter list, `(int) -> int`.
 - `main` is `main()` or `main(args: Vector[string])`, the arguments after the program's name, the
   same as `avin.process.args()`. The parameter is exactly `Vector[string]` (a name for that type
   is the same type; `Seq[string]` and `Array[string]` are errors), it has no default, and any other
@@ -571,6 +579,11 @@ Settled by the user on 2026-11-04:
   `applyOrElse`; a literal tests its patterns and guards once per call, `lift` or `applyOrElse`.
   Every collection with `map` has `collect`, every `Iterable` has `collectFirst`, and `Option` has
   `collect`.
+- `[]T` in a type position means exactly `Vector[T]`: `xs: []int`, `[][]int`, `Option[[]string]`,
+  `main(args: []string)`. Its element is a name or a parenthesized type, so `[]int -> int` is a
+  function from a vector and `[](int -> int)` a vector of functions. A type pattern takes it
+  without parentheses, `v: []int -> body`. There is no fixed-length `[N]T` (an error); error
+  messages print `Vector[int]`.
 
 **Deferred**
 
@@ -579,6 +592,20 @@ Settled by the user on 2026-11-04:
 - Async and await.
 
 ## Proposed
+
+- Option, Result and string methods ([errors](/spec/errors/), [types](/spec/types/#string)):
+  `Option` gains `exists`, `forall`, `contains` (on `T: Eq`, which every type meets), `toList`,
+  `toVector` and `zip`; `Result` gains `exists`, `forall`, `toList` and `orElse(f)`, where `f`
+  takes the error and answers a `Result` that may have another error type. `forall` is true of
+  `None` and of an `Err`. `string` gains `chars`, `count`, `split`, `lines`, `isBlank`, `reverse`,
+  `padStart`, `padEnd`, `equalsIgnoreCase`, `take`, `drop`, `takeRight` and `dropRight`, which count
+  characters where the older methods count bytes. `split` keeps every empty piece and traps on an
+  empty separator (no piece boundary is defined there). `lines` ends a line at `\n` or `\r\n`; a
+  terminator at the end starts no further line, the empty string has no lines, and a lone `\r`
+  stays in its line. `take`, `drop`, `takeRight`, `dropRight` and the padding widths clamp rather
+  than trap. `flatten` on `Option[Option[T]]` and `Result[Result[T, E], E]` is not offered: an
+  `impl` cannot name a nested type, and a method on the unnested type has no way to ask `T` to be
+  an option.
 
 - Sorting ([collections](/spec/collections/#sorting)): every `Seq` has `sorted()` (elements `Ord`),
   `sortedBy[K: Ord](key)` and `sortedWith(compare: (T, T) -> int)`, answering a `Vector`; `List`

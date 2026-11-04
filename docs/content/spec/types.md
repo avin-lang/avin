@@ -103,6 +103,16 @@ most the largest `int` bytes.
 | `replace(old, new)` | Every occurrence of `old`, left to right and not overlapping, replaced by `new`; an empty `old` occurs nowhere |
 | `indexOf(p)`, `indexOf(p, from)` | `Some` of the byte offset of the first `p`, at or after `from` (default 0; below 0 counts as 0); `None` when there is none or `from` is past the end. The empty string is found at `from` |
 | `lastIndexOf(p)` | `Some` of the byte offset of the last `p`; `None` when there is none. The empty string is found at `byteLength()` |
+| `chars()` | The characters, in order, as a `Vector[char]` |
+| `count(p)` | The number of characters satisfying `p` |
+| `split(sep)` | The pieces between the occurrences of `sep`, as a `Vector[string]`; empty pieces are kept (`",a,,b,".split(",")` has five pieces), and a string without `sep` is one piece. An empty `sep` traps |
+| `lines()` | The lines as a `Vector[string]`, each ended by `\n` or `\r\n` and shown without it; a terminator at the very end starts no further line, so `"a\nb\n".lines()` is two lines and `""` has none. A `\r` not before `\n` stays in its line |
+| `isBlank()` | Whether it has only `White_Space` characters, so the empty string is blank |
+| `reverse()` | The characters in the opposite order |
+| `padStart(w, c)`, `padEnd(w, c)` | At least `w` characters, `c` (default `' '`) repeated before, after; `w` counts characters, not bytes, and a string already that long is unchanged |
+| `equalsIgnoreCase(o)` | Whether the two are equal after each character's simple lower-case mapping |
+| `take(n)`, `drop(n)` | The first `n` characters, all but the first `n`; `n` counts characters, not bytes, and is clamped to the string, so 0 or less takes none |
+| `takeRight(n)`, `dropRight(n)` | The last `n` characters, all but the last `n` |
 | `toInt()`, `toLong()` | `Some` of the number written in decimal: an optional `-` or `+`, then one or more ASCII digits and nothing else; `None` otherwise, or when it does not fit the type |
 | `toReal()` | `Some` of the number written as a decimal fraction, correctly rounded: an optional sign, digits with an optional point, an optional exponent (`3.25`, `-.5`, `1e10`); `None` for anything else, including white space, `nan`, `inf`, hexadecimal, and a number too large to be finite |
 
@@ -145,6 +155,24 @@ patterns in `match` and in clauses.
 ## Function types
 
 `(A, B) -> C` is the type of a function taking `A` and `B` and returning `C`; `() -> C` takes nothing.
+A function taking one parameter may drop the parentheses: `int -> string`, `Option[T] -> bool`.
+`(A) -> B` and `A -> B` are the same type. `->` groups to the right, so `int -> int -> int` is
+`int -> (int -> int)`, a function returning a function; a function taking a function writes the
+parameter in parentheses, `(int -> int) -> int`. A tuple parameter takes a second pair of
+parentheses, `((A, B)) -> C`, since `(A, B) -> C` takes two parameters.
+
+```text
+twice(f: int -> int, x: int) -> int = f(f(x))
+adder(n: int) -> int -> int = x -> x + n      // the result is a function type
+val fs: List[int -> int] = [adder(1), adder(2)]
+val add: int -> int -> int = a -> b -> a + b
+```
+
+The form works wherever a type does: parameters, fields, results, type arguments, tuple parts,
+`val` annotations and supertypes. A result of function form needs no parentheses, since the
+declaration's `=` ends it. A type pattern in a `match` arm is the exception: the arm's `->` follows
+the type, so a function type there is written in parentheses, `f: (int -> int) -> body`.
+Compiler messages print every function type with a parameter list, `(int) -> int`.
 A by-name parameter type is written `-> T` inside a parameter list; see
 [call-by-name](/spec/by-name/). Function types are traits: a class may list a function type among its
 supertypes and implement `apply`, and its instances are then callable as `value(args)` and usable
@@ -168,6 +196,16 @@ val half: PartialFunction[int, int] = match n if n % 2 == 0 -> n / 2
 half.isDefinedAt(3)           // false
 half.applyOrElse(3, n -> n)   // 3
 ```
+
+## Vector types
+
+`[]T` is another way to write `Vector[T]`: the same type, in any position a type may stand.
+`xs: []int`, `[][]int` (a `Vector[Vector[int]]`), `Option[[]string]` and `([]int, string)` all work,
+and a program's entry point may be `main(args: []string)`. The element is a name or a parenthesized
+type, so `[]int -> int` is a function taking a vector, `([]int) -> int`, and `[](int -> int)` is a
+vector of functions. A type pattern in a `match` arm takes the form without parentheses,
+`v: []int -> body`. There is no fixed-length `[N]T`; `[3]int` is an error, and `Array[T]` is the
+fixed-length contiguous collection. Compiler messages print the type as `Vector[int]`.
 
 ## Any and Nothing
 
