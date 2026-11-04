@@ -411,40 +411,40 @@ class's method is decided at the arguments the receiver gives the declaring clas
 `ancestor_type`, so a subclass instance is held to its superclass's impls. The methods are ordinary
 generic methods, compiled for an instance only where a call reaches them.
 
-**Derived traits.** `derives` is written out on the syntax tree (`derive.sysl`) before the checker
-declares anything, so a derived method is declared, checked and compiled as one written by hand, and
-every node made for it carries the span of its `derives` entry. What the written-out code names from
-the core library, the traits, `Writer`, `FormatSpec` and `StringWriter`, it names by `core_path`: a
-path no source can spell, which `resolve_name` takes straight to the core library's declaration, so a
-module's own `Display`, an imported one, a variant or function of a core trait's name, or a type
-parameter called `Writer` changes nothing about it. An impl or parent the module writes counts as a
-core trait's only where its bare name reaches the core library from that file (`names_core`).
-Every type parameter carries a `site`, its file and offset, or for a derived impl's the type's
-place and the trait; the bounds a parameter has are recorded by owner, position and site
-(`bound_key`), so two impls of one type, wherever each is declared, keep their bounds apart. A
-class gains each derived trait
-after its parents and an `override` of the trait's method over its constructor parameters, read
-through `self` and `other`; a data type gains an impl per trait (none for `Eq` and `Hash`, which it
-has by value), its method matching `(self, other)` or `self` against each variant, and for `Ord`
-comparing variant positions when the variants differ. `Eq` joins `equals` calls with `&&`, `Hash`
-folds the fields' `hash` with wrapping `*% 31 +%`, `Ord` returns the first nonzero `compare`, and
-`Display` and `Debug` write the name and each field through the trait's own method, rendering into a
-`StringWriter` first when the spec has a width. A generic type's `Ord`, `Display` and `Debug` are
-conditional conformances: an impl bounding every parameter by the trait, for a data type as always
-and for a generic class in place of the parent and the method. The rules a list breaks on its own (an unknown trait, a repeat, a trait the type also
-implements, `Eq` without `Hash` on a class) are reported while writing it out. The rest needs types:
-once every conformance is known, the checker holds each field to the trait derived from it, with the
-bounds the parameters have in the derived impl, names a field that falls short, and leaves that
-derived method unchecked.
+**Derived traits.** Every derivable trait has a template, `derive Trait for T`, in its own module;
+the core library's `Eq`, `Hash` (`equality.avin`), `Ord` (`ordering.avin`), `Display` and `Debug`
+(`format.avin`) are templates like any library's. `derives` is written out on the syntax tree
+(`derive.sysl`) before the checker declares anything: each entry makes an impl of the template's
+body for the type (`derive_through_template`), declared in the template's file so that the body's
+names resolve as the template's do, and carrying a `DeriveSite` that names the type, its unit and
+the entry. The impl's type parameters are the type's, by position, each bounded by the trait and
+renamed to a name no source can spell, so the template's `T`, `Writer` or any other name it uses
+means what its author meant whatever the type calls its parameters. The type gains its shape, as
+private module values of its module. A template is checked once over its `T`; in each impl made
+from it, every call of a member of `Shaped` on `T` is replaced by code written for the type's
+variants and fields (`shaped_call`), checked in the type's file, and what goes wrong in the impl is
+reported at the `derives` entry (`report_derived`).
 
-Every data type gains a `Display` and a `Debug` impl this way without `derives`, unless an impl of
-its own in the module implements the core trait or declares its method; both are declared at the
-type, their parameters told apart by site. These
+What is the compiler's own is when the core library's five apply. A class derives `Eq` and `Hash`
+together and `Ord` only beside an `Eq`; a data type takes no `Eq` or `Hash` impl, having both by
+value; a name among the five always means the core library's trait (`core_template`), and an impl or
+parent the module writes counts as a core trait's only where its bare name reaches the core library
+from that file (`names_core`). Every type parameter carries a `site`, its file and offset, or for a
+derived impl's the type's place and the trait; the bounds a parameter has are recorded by owner,
+position and site (`bound_key`), so two impls of one type, wherever each is declared, keep their
+bounds apart. The rules a list breaks on its own (an unknown trait, a repeat, a trait the type also
+implements, `Eq` without `Hash` on a class) are reported while writing it out. The rest needs types:
+once every conformance is known, and before any body is checked, the checker holds each field to
+the `Ord`, `Display` or `Debug` derived from it (`check_derivation`), with the bounds the parameters
+have in the derived impl, names a field that falls short, and leaves that impl's methods unchecked.
+
+Every data type derives `Display` and `Debug` this way without `derives`, unless an impl of its own
+in the module implements the core trait or declares its method; both are declared at the type. These
 **automatic derivations** are held to the fields after the written ones, repeatedly until nothing
 changes, since a type left without `Display` leaves the types holding it without `Display` in turn.
 A field that falls short is not reported: the type is withdrawn from the trait (its conformance,
-its table positions and the method go, the method recorded as withdrawn so lowering never compiles
-it), and a bound or interpolation that then fails names the field in its diagnostic.
+its table positions and the impl's methods go, recorded as withdrawn so lowering never compiles
+them), and a bound or interpolation that then fails names the field in its diagnostic.
 
 Lowering compiles a data type's trait implementations only when called, and fills a method table
 position only once some call goes through it: each new position is filled in every table made so

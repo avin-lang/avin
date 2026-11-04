@@ -59,7 +59,9 @@ impl FieldShape                                 // and the same on TypeShape and
   its body declares take no part. A repeated parameter is a field of type `Vector[T]`.
 - **A shape is made once.** The shapes of a type, its variants and its fields are module values
   private to the type's module, made before `main` like any other; reading one costs a load. A type
-  has them where it derives a trait through a template or carries annotations, and no other does.
+  has them where it derives a trait through a template or carries annotations, and no other does;
+  every data type derives `Display` and `Debug` through the core library's templates unless it
+  implements both itself, so every other data type has its shape.
 - The core library declares `TypeShape`, `VariantShape`, `FieldShape`, `Annotation`, `Shaped`, and
   the visitor and builder traits below, in the prelude's module.
 
@@ -417,38 +419,80 @@ the same without `"home"`, gives it back with `visits` at `0`. `Rect(2.0, 3.0)` 
 object's first key is refused by this decoder; a library that wants to accept it reads that object
 into a tree first and decodes from the tree, with nothing new from the language.
 
-## The built-in derivations, re-expressed
+## The built-in derivations
 
-The five traits the compiler derives itself are to be re-expressed in the same mould, each a short
-template in the core library:
+The five traits the core library derives are templates in the same mould, each a few lines in the
+trait's own file of the core library, compiled for each deriving type as any library's are:
 
 ```text
 derive Hash for T
-    hash() -> long = T.walk(self, HashWalk(0)).h
+    hash() -> long = T.walk(self, hashFrom).h
 
-data HashWalk(h: long)
-impl ShapeVisitor for HashWalk
-    variant(v: VariantShape) -> HashWalk = HashWalk(long(v.index))
-impl HashWalk
-    field[F: Hash](f: FieldShape, value: F) -> HashWalk = HashWalk(h *% 31 +% value.hash())
+private data HashFields(h: long)
+private val hashFrom = HashFields(0)
+
+impl ShapeVisitor for HashFields
+    variant(v: VariantShape) -> HashFields = if v.index == 0 then self else HashFields(long(v.index))
+
+impl HashFields
+    field[F: Hash](f: FieldShape, value: F) -> HashFields = HashFields(h *% 31 +% value.hash())
 
 derive Ord for T
-    compare(other: T) -> int = T.walkPair(self, other, OrdWalk(0)).result
+    compare(other: T) -> int = T.walkPair(self, other, orderedSoFar).result
 
-data OrdWalk(result: int)
-impl ShapePairVisitor for OrdWalk
-    variants(a: VariantShape, b: VariantShape) -> OrdWalk = OrdWalk(a.index.compare(b.index))
-impl OrdWalk
-    field[F: Ord](f: FieldShape, a: F, b: F) -> OrdWalk =
-        if result != 0 then self else OrdWalk(a.compare(b))
+private data OrderFields(result: int)
+private val orderedSoFar = OrderFields(0)
+private val orderedBefore = OrderFields(-1)
+private val orderedAfter = OrderFields(1)
+
+impl ShapePairVisitor for OrderFields
+    variants(a: VariantShape, b: VariantShape) -> OrderFields =
+        if a.index == b.index then self elif a.index < b.index then orderedBefore else orderedAfter
+
+impl OrderFields
+    field[F: Ord](f: FieldShape, a: F, b: F) -> OrderFields =
+        if result != 0 then return self
+        val c = a.compare(b)
+        if c == 0 then self elif c < 0 then orderedBefore else orderedAfter
+
+derive Display for T
+    display(out: Writer, spec: FormatSpec)
+        if spec.width > 0
+            val text = StringWriter()
+            display(text, FormatSpec())
+            out.writeField(text.text(), spec)
+        else
+            T.walk(self, DisplayFields(out))
+            if T.variantOf(self).fieldCount > 0 then out.write(")")
+
+private data DisplayFields(out: Writer)
+
+impl ShapeVisitor for DisplayFields
+    variant(v: VariantShape) -> DisplayFields =
+        out.write(v.name)
+        self
+
+impl DisplayFields
+    field[F: Display](f: FieldShape, value: F) -> DisplayFields =
+        out.write(if f.index == 0 then "(" else ", ")
+        value.display(out, FormatSpec())
+        self
 ```
 
-`Eq` is `Ord`'s shape with `equals`; `Display` and `Debug` write `v.name`, then the fields between
-parentheses through `display` or `debug`, closing where `T.variantOf(self).fieldCount > 0`. The
-rules of the built-in derivations stay: a class derives `Eq` and `Hash` together; a data type's `==` and hash
-stay the language's own, by value, as they are for tuples; the automatic `Display` and `Debug` of
-every data type are these templates applied without asking, where a field missing the hook's bound
-leaves the type without the trait instead of being an error.
+`Eq` is `Ord`'s shape with `equals`, and `Debug` is `Display`'s with `debug`. The visitors of `Eq`
+and `Ord` take only a few values, each a module value, so comparing allocates nothing, and a derived
+`compare` is -1, 0 or 1; a derived `Display` allocates its one visitor, and a `Hash` one per field. A class without
+constructor parameters has a variant without fields, so it displays as its bare name, as such a
+variant does.
+
+What stays the compiler's is when the templates apply. A class derives `Eq` and `Hash` together,
+and `Ord` only beside an `Eq` by the same fields; a data type's `==` and hash stay the language's
+own, by value, as they are for tuples, so `derives Eq, Hash` there adds nothing; and the automatic
+`Display` and `Debug` of every data type are these templates applied without asking, where a field
+missing the hook's bound leaves the type without the trait instead of being an error. A field
+missing `Ord`, `Display` or `Debug` where the type derives it is reported before any body is
+checked: *`Ranked` cannot derive `Ord`: its field `plain` has type `Plain`, which does not implement
+`Ord`*.
 
 ## What this does not do
 

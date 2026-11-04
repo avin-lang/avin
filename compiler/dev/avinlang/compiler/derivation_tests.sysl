@@ -26,13 +26,15 @@ private struct Cost
     allocations: int
     direct: Buf[string]
 
-private cost_of(program: MirProgram, name: string) -> Cost
+private cost_of(program: MirProgram, name: string) -> Cost = cost_of_function(program, function_of(program, name))
+
+private cost_of_function(program: MirProgram, f: MirFunction) -> Cost
     var tables = 0
     var entries = 0
     var compared = 0
     var allocations = 0
     var direct: Buf[string] = buf()
-    for block in function_of(program, name).blocks
+    for block in f.blocks
         for inst in block.insts
             inst match
                 MethodSlot(_, _, _) -> tables = tables + 1
@@ -80,3 +82,30 @@ hooks_are_direct()
     assert_eq(number.through_tables, 0)
     assert_eq(number.allocations, 0)
     assert(calls(number, "int.encode"))
+
+private const Builtins: string = "data Record(id: int, name: string) derives Ord\n\ndata Level derives Ord\n    Low\n    High(n: int)\n\nclass Key(val id: int, val name: string) derives Eq, Hash\n\nmain()\n    print(Record(1, \"a\").compare(Record(1, \"b\")))\n    print(High(1) < Low)\n    print(Key(1, \"a\") == Key(1, \"a\"))\n    print(Record(1, \"a\"))\n"
+
+/** The cost of a function of `program` whose symbol is `symbol` exactly. */
+private cost_named(program: MirProgram, symbol: string) -> Cost
+    for f in program.functions
+        if f.symbol == symbol then return cost_of_function(program, f)
+    panic("no function " + symbol)
+
+@test("the core library's derived Ord and Eq allocate no visitor, and Display only its one")
+builtin_derivations_cost()
+    val program = lowered(Builtins)
+    for name in ["<program>.Key.equals", "avin.OrderFields.field[int]", "avin.OrderFields.field[string]", "avin.OrderFields.variants", "avin.EqualFields.field[int]"]
+        val c = cost_named(program, name)
+        assert_eq(c.through_tables, 0)
+        assert_eq(c.allocations, 0)
+    // A data type's `compare` matches on the pair of values, which is all it allocates.
+    for name in ["<program>.Record.compare", "<program>.Level.compare"]
+        val c = cost_named(program, name)
+        assert_eq(c.through_tables, 0)
+        assert_eq(c.allocations, 1)
+    val shown = cost_named(program, "<program>.Record.display")
+    assert_eq(shown.through_tables, 0)
+    var visitors = 0
+    for d in shown.direct
+        if d == "avin.DisplayFields.field[int]" || d == "avin.DisplayFields.field[string]" then visitors += 1
+    assert_eq(visitors, 2)

@@ -30,7 +30,8 @@ field of a data value or a part of a tuple, and as an `Any`.
 Equal values must have equal hashes. `derives Eq, Hash` gives both from the same fields, so they
 agree. A class that implements one of `==` and the hash by hand must implement the other, and keeping
 the two consistent is then its author's responsibility. `Ord` is never derived implicitly;
-`derives Ord` orders lexicographically by field, and by variant declaration order.
+`derives Ord` orders lexicographically by field, and by variant declaration order; its `compare` is
+-1, 0 or 1.
 
 A class derives from its constructor parameters, whether plain, `val` or `var`, in the order they are
 written; fields its body declares take no part. It derives `Eq` and `Hash` together, and `Ord` only
@@ -41,6 +42,10 @@ implement what is derived from it: `class Ranked(p: Plain) derives Eq, Hash, Ord
 or a class's, hold for the type arguments that implement the trait: `data Pair[A, B](a: A, b: B)
 derives Display` displays a `Pair[int, string]`, and a `Pair[Plain, int]` is still made but does not
 display.
+
+All five derivations are [derive templates](../derivation/#the-built-in-derivations) in the core
+library, written against the type's shape as any library's are; what is the language's own is only
+when they apply.
 
 ## Identity
 
@@ -62,12 +67,12 @@ type is allowed and means the same. An impl of the type's own replaces the autom
 Display for Money` gives `Money` its own `Display` while its `Debug` stays the derived one, and `List`,
 `Map` and `Set` keep their literal forms this way. A field without the trait leaves the type without
 it rather than being an error: `data Wrapper(p: Plain)` is made, compared and matched, and only a use
-that needs its `Display` is rejected, naming the field. A program that never shows a value carries
-none of this code.
+that needs its `Display` is rejected, naming the field. A program that never shows a value compiles
+none of this code; it makes only each type's shape, before `main`.
 
 A derived `Display` writes the type's or variant's name and its fields in parentheses, separated by
 `, `, each in its own `Display` form: `Point(1, 2)`, `Named(ada, Point(1, 2))`. A variant without
-fields is its bare name, `Empty`. A derived `Debug` has the same shape with each field's `Debug`
+fields is its bare name, `Empty`, and so is a class without constructor parameters. A derived `Debug` has the same shape with each field's `Debug`
 form, so strings and chars inside are quoted and escaped: `Named("ada", Point(1, 2))`. A field width
 in the `FormatSpec` pads the whole rendering; the fields themselves are written without one. Derived
 on a generic type, either holds for the type arguments that implement the trait: `data Box[T](item:

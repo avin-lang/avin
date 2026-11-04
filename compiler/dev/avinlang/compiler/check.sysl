@@ -2332,7 +2332,7 @@ private declare_methods(c: *Checker, unit: usize)
                             if !trait_declares(c, t, f.name, 0)
                                 c.note(block.unit, f.name_span, s"`${f.name}` is not a method of `${c.classes[t].name}`; an impl of a trait implements the trait's methods, and `impl ${d.name}` adds others")
                                 continue
-                        declared.push(MethodDecl(f, public, overrides || trait_id is Some(_), block.unit, block.module_name, block.decl.type_params, true, false, static_member))
+                        declared.push(MethodDecl(f, public, overrides || trait_id is Some(_), block.unit, methods_module(c, block), block.decl.type_params, true, false, static_member))
                         made_from.push(c.derived_context)
                 c.derived_context = None
         for entry_index in 0..<declared.len()
@@ -2474,6 +2474,12 @@ private register_derived_symbols(c: *Checker)
                     _ -> false
                 if mine then c.derived_symbols.put(s"$id", x)
 
+/** The module an impl's methods belong to: for an impl made from a template, the deriving type's,
+ * so that two modules' types of one name keep their derived methods apart; otherwise the impl's. */
+private methods_module(c: *Checker, block: ImplSymbol) -> string = c.derived_context match
+    Some(x) -> c.units[c.derived[x].site.unit].file.module_name
+    None -> block.module_name
+
 private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, overrides: bool, static_member: bool)
     val block = c.impls[i]
     val unit = block.unit
@@ -2532,7 +2538,7 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
         type_params.push(tp)
     for tp in f.type_params
         type_params.push(tp)
-    var symbol = signature(c, unit, block.module_name, f, owner, type_params, false, Some(target))
+    var symbol = signature(c, unit, methods_module(c, block), f, owner, type_params, false, Some(target))
     // The receiver comes first, named `self`.
     var receiver_types: Buf[&Type] = buf()
     var receiver_names: Buf[string] = buf()
@@ -4650,7 +4656,7 @@ private check_derivation(c: *Checker, dv: Derivation) -> bool
             None -> return false
         data_id = Some(id)
         for block in c.impls
-            if made_for(block.unit, block.decl, dv)
+            if made_for(block.decl, dv)
                 scope = Some(GenericScope(data_owner(id), block.decl.type_params))
         if scope is None then return false
         val d = c.data[id]
@@ -4665,7 +4671,7 @@ private check_derivation(c: *Checker, dv: Derivation) -> bool
         scope = Some(GenericScope(class_owner(id), c.classes[id].decl.type_params))
         // A generic class's derived impl bounds its parameters by the trait.
         for block in c.impls
-            if made_for(block.unit, block.decl, dv)
+            if made_for(block.decl, dv)
                 scope = Some(GenericScope(class_owner(id), block.decl.type_params))
         for f in c.classes[id].fields
             if f.param && f.owner == id && f.ty is Some(t)
@@ -4685,13 +4691,17 @@ private check_derivation(c: *Checker, dv: Derivation) -> bool
         c.note(dv.unit, dv.span, s"`${dv.type_name}` cannot derive `${dv.trait_name}`: its field `${names[i]}` has type `$shown`, which does not implement `${dv.trait_name}`$hint")
     c.generic = outer_generic
     if !failed then return false
-    val method = derived_method(dv.trait_name)
-    var made: Option[usize] = None
-    for id in 0..<c.symbols.len()
-        val decl = c.symbols[id].decl
-        if c.symbols[id].unit == dv.unit && decl.name == method && decl.name_span.start == dv.span.start && decl.name_span.end == dv.span.end
-            c.states.set(id, 2)
-            made = Some(id)
+    // The impl made from the template is left unchecked, and has nothing more to report: its every
+    // failure would be the field's again.
+    var made: Buf[usize] = buf()
+    for x in 0..<c.derived.len()
+        if !made_for(c.impls[c.derived[x].impl_index].decl, dv) then continue
+        c.derived[x].notes = buf()
+        for id in 0..<c.symbols.len()
+            if c.derived_symbols.get(s"$id") is Some(y)
+                if y == x
+                    c.states.set(id, 2)
+                    made.push(id)
     if dv.automatic
         if data_id is Some(id) then withdraw_derivation(c, id, k, made)
     true
@@ -4719,9 +4729,9 @@ private settle_automatic_derivations(c: *Checker)
                 done.set(i, true)
                 changed = true
 
-// Leaves data type `id` without trait `k` and without `made`, the method its automatic derivation
-// declared: the conformance, the trait's positions of its method table and the method go.
-private withdraw_derivation(c: *Checker, id: usize, k: usize, made: Option[usize])
+// Leaves data type `id` without trait `k` and without `made`, the methods its automatic derivation
+// declared: the conformance, the trait's positions of its method table and the methods go.
+private withdraw_derivation(c: *Checker, id: usize, k: usize, made: Buf[usize])
     var traits: Buf[&Type] = buf()
     for t in c.data[id].traits
         if *t is Class(x, _, _)
@@ -4735,28 +4745,28 @@ private withdraw_derivation(c: *Checker, id: usize, k: usize, made: Option[usize
     var methods: Buf[usize] = buf()
     var implementing: Buf[bool] = buf()
     for j in 0..<c.data[id].methods.len()
-        if made is Some(m)
-            if c.data[id].methods[j] == m then continue
+        var dropped = false
+        for m in made
+            if c.data[id].methods[j] == m then dropped = true
+        if dropped then continue
         methods.push(c.data[id].methods[j])
         implementing.push(c.data[id].implementing[j])
     c.data[id].methods = methods
     c.data[id].implementing = implementing
-    if made is Some(m)
-        var withdrawn = c.data[id].withdrawn
+    var withdrawn = c.data[id].withdrawn
+    for m in made
         withdrawn.push(m)
-        c.data[id].withdrawn = withdrawn
+    c.data[id].withdrawn = withdrawn
     var conditional: Buf[ConditionalConformance] = buf()
     for x in c.conditional
         if x.owner == data_owner(id) && x.trait_id == k then continue
         conditional.push(x)
     c.conditional = conditional
 
-/** Whether impl `decl`, of unit `unit`, is the one derivation `dv` made. */
-private made_for(unit: usize, decl: &ImplDecl, dv: Derivation) -> bool
-    if unit != dv.unit || decl.span.start != dv.span.start || decl.span.end != dv.span.end then return false
-    if decl.trait_name is Some(t)
-        if t.kind is Named(path, _) then return path == core_path(dv.trait_name)
-    false
+/** Whether impl `decl` is the one derivation `dv` made from the core library's template. */
+private made_for(decl: &ImplDecl, dv: Derivation) -> bool = decl.derived match
+    Some(site) -> site.unit == dv.unit && site.at.start == dv.span.start && site.at.end == dv.span.end && site.trait_text == dv.trait_name
+    None -> false
 
 // The reason a data type that has no `trait_name` lacks it, where it would have had it without asking
 // but for a field: appended to a diagnostic saying `t` does not implement the trait.

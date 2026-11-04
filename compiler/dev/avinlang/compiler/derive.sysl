@@ -3,30 +3,26 @@ module dev.avinlang.compiler
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 
-// `derives` written out as ordinary declarations, before anything is declared. A class that derives
-// a trait lists it after its other parents and gains the trait's method, written over its constructor
-// parameters; a data type gains an impl of the trait, its method matching the type's variants. The
-// methods are checked and compiled like any written by hand, and every node made for one carries the
-// span of the `derives` entry that asked for it.
+// `derives` written out as ordinary declarations, before anything is declared. Every derivable trait
+// has a template, `derive Trait for T`, in its own module: the core library's `Eq`, `Hash`, `Ord`,
+// `Display` and `Debug` as much as a library's own. Each `derives` entry makes an impl of the
+// template's body for the type, and the type's shape, as module values of its module.
 //
-// - `Eq` and `Hash` compare and hash the fields, each through its type's own `equals` and `hash`. A
-//   data type already compares and hashes by its fields, so deriving them there adds nothing.
-// - `Ord` compares the fields in order, the first that differs deciding; a data value's variant
-//   decides first, in declaration order.
-// - `Display` writes `Name(a, b)` with each field's `Display`, a variant without fields as its name;
-//   `Debug` writes the same with each field's `Debug`, so strings inside are quoted. A field width
-//   pads the whole.
+// What is the compiler's own is when the core library's templates apply:
 //
-// A generic data type's `Ord` holds where its type arguments are ordered: the impl bounds each
-// parameter by `Ord`. Each field's type must implement what is derived from it, which the checker
-// holds it to once every conformance is known (`Derivation`).
+// - A class derives `Eq` and `Hash` together, so that equal instances hash alike, and `Ord` only
+//   beside an equality by the same fields.
+// - A data type already compares and hashes by its fields, so deriving `Eq` or `Hash` there adds
+//   nothing.
+// - Every data type has `Display` and `Debug` without asking, as though it derived them, unless an
+//   impl of its own implements the trait or declares the trait's method. That derivation is the
+//   type's only where its fields allow it: a field without the trait leaves the type without it, and
+//   only a use that needs it is an error.
 //
-// Every data type has `Display` and `Debug` without asking, as though it derived them, unless an impl
-// of its own implements the trait or declares the trait's method. That derivation is the type's only
-// where its fields allow it: a field without the trait leaves the type without it, and only a use
-// that needs it is an error.
+// Each field's type must implement the `Ord`, `Display` or `Debug` derived from it, which the checker
+// holds it to once every conformance is known (`Derivation`), before any body is checked.
 
-/** A trait a declaration derives through a method whose fields must implement the trait: `Ord`,
+/** A core library trait a declaration derives whose fields must implement the trait: `Ord`,
  * `Display` or `Debug`. */
 struct Derivation
     unit: usize
@@ -34,8 +30,8 @@ struct Derivation
     type_name: string
     data: bool
     trait_name: string
-    /** The `derives` entry; the method made for it is declared there. A data type's own `Display`
-     * and `Debug` are declared at the type. */
+    /** The `derives` entry, where the impl made for it is declared. A data type's own `Display` and
+     * `Debug` are declared at the type. */
     span: Span
     /** Whether the type has the trait without naming it in `derives`: a field without the trait
      * then leaves the type without it, rather than being an error. */
@@ -72,12 +68,7 @@ derive_unit(c: *Checker, unit: usize)
             ClassItem(d) ->
                 var library: Buf[LibraryDerived] = buf()
                 var made_class = d
-                if d.derives.len() > 0
-                    var impls: Buf[&ImplDecl] = buf()
-                    made_class = derive_class(c, unit, d, &impls, &library)
-                    for made in impls
-                        items.push(ImplItem(made))
-                        private_items.push(false)
+                if d.derives.len() > 0 then derive_class(c, unit, d, &library)
                 if is_shaped_class(made_class)
                     val shaped = class_shape_parts(d)
                     if library.len() > 0 || annotated(shaped, d.annotations)
@@ -90,9 +81,7 @@ derive_unit(c: *Checker, unit: usize)
                 items.set(items_position(items, item), ClassItem(made_class))
             DataItem(d) ->
                 var library: Buf[LibraryDerived] = buf()
-                for made in derive_data(c, unit, d, &library)
-                    items.push(ImplItem(made))
-                    private_items.push(false)
+                derive_data(c, unit, d, &library)
                 var own: Buf[Annotation] = buf()
                 var written: Buf[Annotation] = buf()
                 for a in d.annotations
@@ -129,12 +118,14 @@ struct TemplateImpl
     unit: usize
     decl: &ImplDecl
 
-/** A trait a `derives` list names that a template derives: the entry, and the template. */
+/** A trait a `derives` list names that a template derives: the entry, and the template. `builtin`
+ * when it is one of the core library's five, whose rules are the compiler's. */
 private struct LibraryDerived
     name: string
     at: Span
     template_unit: usize
     template: &ImplDecl
+    builtin: bool
 
 /** The position of the item just pushed for `item`: the last one that is it. */
 private items_position(items: Buf[Item], item: Item) -> usize
@@ -168,18 +159,23 @@ private template_bounded(d: &ImplDecl) -> &ImplDecl
 
 // The impl a `derives` entry makes from a template for the type named `type_name`, declared in the
 // template's file: the template's body, its `T` standing for the type, each of the type's parameters
-// bounded by the trait.
+// bounded by the trait. An impl's parameters are the type's by position, so each is renamed to a
+// name no source can write: the template's body, which sees them, then means by `T`, `Writer` or any
+// other name what the template's author did, whatever the type calls its parameters.
 private derive_through_template(c: *Checker, unit: usize, lib: LibraryDerived, type_name: string, type_params: Buf[TypeParam], data: bool)
     val at = lib.at
     val t = lib.template
     val trait_expr = t.trait_name.unwrap()
     var params: Buf[TypeParam] = buf()
+    var renamed: Buf[TypeParam] = buf()
     for tp in type_params
         var bounds: Buf[&TypeExpr] = buf()
         bounds.push(trait_expr)
-        params.push(TypeParam(at, tp.name, Invariant, bounds, s"${c.units[unit].src.name}:${at.start}:derives ${lib.name}"))
+        val name = tp.name + "'"
+        params.push(TypeParam(at, name, Invariant, bounds, s"${c.units[unit].src.name}:${at.start}:derives ${lib.name}"))
+        renamed.push(TypeParam(tp.span, name, tp.variance, tp.bounds, tp.site))
     val site = DeriveSite(unit, type_name, at, lib.name, t.type_params[0].name, data, t.span)
-    val decl = ImplDecl(at, params, Some(trait_expr), own_type(at, type_name, type_params), t.members, false, Some(site))
+    val decl = ImplDecl(at, params, Some(trait_expr), own_type(at, type_name, renamed), t.members, false, Some(site))
     c.template_impls.push(TemplateImpl(lib.template_unit, decl))
 
 // The template deriving the trait `t` names, as unit `unit` sees it: one declared in the unit's own
@@ -198,10 +194,21 @@ private find_template(c: *Checker, unit: usize, path: string) -> Option[LibraryD
                     _ -> ""
                 if name != bare then continue
                 if !module_sees(c, unit, other, path) then continue
-                val candidate = LibraryDerived(bare, Span(0, 0), u, d)
+                val candidate = LibraryDerived(bare, Span(0, 0), u, d, false)
                 if other == module_name then return Some(candidate)
                 if found is None then found = Some(candidate)
     found
+
+// The core library's template deriving its trait `name`.
+private core_template(c: *Checker, name: string) -> Option[LibraryDerived]
+    for u in 0..<c.units.len()
+        if c.units[u].file.module_name != CoreModule then continue
+        for item in c.units[u].file.items
+            if item is ImplItem(d)
+                if !d.template then continue
+                if d.trait_name.unwrap().kind is Named(p, _)
+                    if last_segment(p) == name then return Some(LibraryDerived(name, Span(0, 0), u, d, true))
+    None
 
 private module_sees(c: *Checker, unit: usize, other: string, path: string) -> bool
     val file = c.units[unit].file
@@ -338,46 +345,38 @@ private declares_type(c: *Checker, module_name: string, name: string) -> bool
                 _ -> ()
     false
 
-/** One trait a `derives` list names, and the entry naming it. */
-private struct Derived
-    name: string
-    at: Span
-
-// The traits `derives` names, each once, with what cannot be derived reported. `implemented` names
-// the traits the type also implements by hand.
-private derived_traits(c: *Checker, unit: usize, type_name: string, derives: Buf[&TypeExpr], implemented: Buf[string], library: *Buf[LibraryDerived]) -> Buf[Derived]
-    var out: Buf[Derived] = buf()
+// The traits `derives` names, each once, with the templates deriving them and what cannot be
+// derived reported. The core library's five are its own whatever the file declares; `implemented`
+// names those of them the type also implements by hand.
+private derived_traits(c: *Checker, unit: usize, type_name: string, derives: Buf[&TypeExpr], implemented: Buf[string]) -> Buf[LibraryDerived]
+    var out: Buf[LibraryDerived] = buf()
     for t in derives
         val name = t.kind match
             Named(path, args) -> if args.len() == 0 then path else ""
             _ -> ""
-        if derived_method(name) == "" && name != ""
-            find_template(c, unit, name) match
-                Some(found) ->
-                    var seen = false
-                    for l in *library
-                        if l.name == found.name then seen = true
-                    if seen
-                        c.note(unit, t.span, s"`$name` is derived twice")
-                        continue
-                    library.push(LibraryDerived(found.name, t.span, found.template_unit, found.template))
-                    continue
-                None -> ()
-        if derived_method(name) == ""
-            c.note(unit, t.span, s"`${type_text(t)}` cannot be derived; a type derives `Eq`, `Hash`, `Ord`, `Display`, `Debug`, and a trait whose module declares a template for it, `derive ${type_text(t)} for T`")
-            continue
-        if has_trait(out, name)
+        val builtin = derived_method(name) != ""
+        val found = if builtin then core_template(c, name) elif name != "" then find_template(c, unit, name) else None
+        val template = found match
+            Some(f) -> f
+            None ->
+                c.note(unit, t.span, s"`${type_text(t)}` cannot be derived; a type derives `Eq`, `Hash`, `Ord`, `Display`, `Debug`, and a trait whose module declares a template for it, `derive ${type_text(t)} for T`")
+                continue
+        var seen = false
+        for earlier in out
+            if earlier.name == template.name then seen = true
+        if seen
             c.note(unit, t.span, s"`$name` is derived twice")
             continue
-        if contains_name(implemented, name)
+        if builtin && contains_name(implemented, name)
             c.note(unit, t.span, s"`$type_name` derives `$name` and also implements it; a conformance is stated once, so drop one of the two")
             continue
-        out.push(Derived(name, t.span))
+        out.push(LibraryDerived(template.name, t.span, template.template_unit, template.template, builtin))
     out
 
-private has_trait(traits: Buf[Derived], name: string) -> bool
+/** Whether `traits` holds the core library's trait `name`. */
+private has_trait(traits: Buf[LibraryDerived], name: string) -> bool
     for t in traits
-        if t.name == name then return true
+        if t.builtin && t.name == name then return true
     false
 
 private contains_name(names: Buf[string], name: string) -> bool
@@ -415,14 +414,12 @@ private impl_traits(c: *Checker, unit: usize, type_name: string) -> Buf[string]
                         elif names_core(c, u, path) then out.push(path)
     out
 
-// A class that derives lists the traits after its parents and gains their methods. `Eq` and `Hash`
-// come together, so that equal instances hash alike, and `Ord` comes with an equality by the same
-// fields. A generic class's `Ord`, `Display` and `Debug` are impls in `impls` instead, holding where
-// the type arguments implement the trait.
-private derive_class(c: *Checker, unit: usize, d: &ClassDecl, impls: *Buf[&ImplDecl], library: *Buf[LibraryDerived]) -> &ClassDecl
+// The traits a class derives, each through its template, into `library`. `Eq` and `Hash` come
+// together, so that equal instances hash alike, and `Ord` comes with an equality by the same fields.
+private derive_class(c: *Checker, unit: usize, d: &ClassDecl, library: *Buf[LibraryDerived])
     if d.modifier == "trait"
         c.note(unit, d.derives[0].span, "a trait derives nothing; the types implementing it do")
-        return d
+        return
     var implemented = impl_traits(c, unit, d.name)
     for parent in d.parents
         parent.kind match
@@ -432,81 +429,44 @@ private derive_class(c: *Checker, unit: usize, d: &ClassDecl, impls: *Buf[&ImplD
         if m is MethodMember(f, _, _, _)
             for trait_name in ["Eq", "Hash", "Ord", "Display", "Debug"]
                 if f.name == derived_method(trait_name) then implemented.push(trait_name)
-    val traits = derived_traits(c, unit, d.name, d.derives, implemented, library)
+    val traits = derived_traits(c, unit, d.name, d.derives, implemented)
     val equality_by_hand = contains_name(implemented, "Eq")
     for t in traits
+        if !t.builtin then continue
         if t.name == "Eq" && !has_trait(traits, "Hash")
             c.note(unit, t.at, s"`${d.name}` derives `Eq` without `Hash`; equal instances must hash alike, so derive both: `derives Eq, Hash`")
-            return d
+            return
         if t.name == "Hash" && !has_trait(traits, "Eq") && !equality_by_hand
             c.note(unit, t.at, s"`${d.name}` derives `Hash` without `Eq`; the hash follows the fields `==` compares, so derive both: `derives Eq, Hash`")
-            return d
+            return
         if t.name == "Ord" && !has_trait(traits, "Eq") && !equality_by_hand
             c.note(unit, t.at, s"`${d.name}` derives `Ord` without `Eq`; ordering by the fields needs `==` by the same fields, so derive `Eq, Hash` with it")
-            return d
-    if traits.len() == 0 then return d
-    var fields: Buf[string] = buf()
-    for p in d.params
-        if p.param.pattern.kind is Name(n) then fields.push(n)
-    var parents: Buf[&Expr] = buf()
-    for p in d.parents
-        parents.push(p)
-    var members: Buf[ClassMember] = buf()
-    for m in d.members
-        members.push(m)
+            return
     for t in traits
-        val name = t.name
-        val at = t.at
-        val other = own_type(at, d.name, d.type_params)
-        var mine: Buf[&Expr] = buf()
-        var theirs: Buf[&Expr] = buf()
-        for f in fields
-            mine.push(Expr(at, Member(Expr(at, Name("self")), f)))
-            theirs.push(Expr(at, Member(Expr(at, Name("other")), f)))
-        val method = class_method(at, name, d.name, other, mine, theirs)
-        val conditional = name == "Ord" || name == "Display" || name == "Debug"
-        if conditional && d.type_params.len() > 0
-            var members_of_impl: Buf[ClassMember] = buf()
-            members_of_impl.push(MethodMember(method, true, false, false))
-            impls.push(ImplDecl(at, bounded_params(c, unit, at, d.type_params, name), Some(named_type(at, core_path(name))), other, members_of_impl, false, None))
-        else
-            parents.push(Expr(at, Name(core_path(name))))
-            members.push(MethodMember(method, true, true, false))
-        if conditional then c.derivations.push(Derivation(unit, d.name, false, name, at, false))
-    ClassDecl(d.annotations, d.span, d.name_span, d.name, d.modifier, d.modifier_span, d.type_params, d.params, parents, d.derives, members, d.object)
+        if t.builtin && fields_held(t.name) then c.derivations.push(Derivation(unit, d.name, false, t.name, t.at, false))
+        library.push(t)
 
-// The method implementing `trait_name` for class `name` over its fields, read from `self` in `mine`
-// and from `other`, of type `other_type`, in `theirs`.
-private class_method(at: Span, trait_name: string, name: string, other_type: &TypeExpr, mine: Buf[&Expr], theirs: Buf[&Expr]) -> &Function
-    if trait_name == "Eq" then return method_of(at, "equals", one_param(at, "other", other_type), named_type(at, "bool"), equal_fields(at, mine, theirs))
-    if trait_name == "Hash" then return method_of(at, "hash", buf(), named_type(at, "long"), hash_fields(at, mine))
-    if trait_name == "Ord" then return method_of(at, "compare", one_param(at, "other", other_type), named_type(at, "int"), compare_fields(at, mine, theirs))
-    render_with_width(at, trait_name, render_parts(at, trait_name, name + "(", mine, ")"))
+/** Whether the fields of a type deriving the core library's trait `name` must implement it: every
+ * type has `Eq` and `Hash`. */
+private fields_held(name: string) -> bool = name == "Ord" || name == "Display" || name == "Debug"
 
-// A data type that derives gains an impl per trait. `Eq` and `Hash` it has already, by its fields,
-// and `Display` and `Debug` unless its own impls give them.
-private derive_data(c: *Checker, unit: usize, d: &DataDecl, library: *Buf[LibraryDerived]) -> Buf[&ImplDecl]
-    var out: Buf[&ImplDecl] = buf()
+// The traits a data type derives, each through its template, into `library`. `Eq` and `Hash` it has
+// already, by its fields, and `Display` and `Debug` unless its own impls give them.
+private derive_data(c: *Checker, unit: usize, d: &DataDecl, library: *Buf[LibraryDerived])
     val implemented = impl_traits(c, unit, d.name)
-    val traits = if d.derives.len() == 0 then buf() else derived_traits(c, unit, d.name, d.derives, implemented, library)
+    val traits = if d.derives.len() == 0 then buf() else derived_traits(c, unit, d.name, d.derives, implemented)
     for t in traits
-        if t.name == "Eq" || t.name == "Hash" then continue
-        out.push(data_impl(c, unit, d, t.name, t.at, false))
+        if t.builtin && !fields_held(t.name) then continue
+        if t.builtin then c.derivations.push(Derivation(unit, d.name, true, t.name, t.at, false))
+        library.push(t)
     // Each is declared at the type. A type declared twice is reported as such, and has none.
-    if declarations_named(c, unit, d.name) > 1 then return out
+    if declarations_named(c, unit, d.name) > 1 then return
     for name in ["Display", "Debug"]
         if has_trait(traits, name) || contains_name(implemented, name) then continue
         if contains_name(impl_methods(c, unit, d.name), derived_method(name)) then continue
-        out.push(data_impl(c, unit, d, name, d.span, true))
-    out
-
-// The impl of `trait_name` derived for data type `d`, declared at `at`.
-private data_impl(c: *Checker, unit: usize, d: &DataDecl, trait_name: string, at: Span, automatic: bool) -> &ImplDecl
-    val target = own_type(at, d.name, d.type_params)
-    var members: Buf[ClassMember] = buf()
-    members.push(MethodMember(data_method(at, trait_name, d, target), true, false, false))
-    c.derivations.push(Derivation(unit, d.name, true, trait_name, at, automatic))
-    ImplDecl(at, bounded_params(c, unit, at, d.type_params, trait_name), Some(named_type(at, core_path(trait_name))), target, members, false, None)
+        if core_template(c, name) is Some(t)
+            c.derivations.push(Derivation(unit, d.name, true, name, d.span, true))
+            library.push(LibraryDerived(name, d.span, t.template_unit, t.template, true))
 
 // Whether the bare name `name`, written in unit `unit`, denotes the core library's declaration of it:
 // no declaration of the unit's module and no import of its file takes the name first. The core
@@ -557,23 +517,6 @@ private impl_methods(c: *Checker, unit: usize, type_name: string) -> Buf[string]
                     if m is MethodMember(f, _, _, _) then out.push(f.name)
     out
 
-// The type parameters of an impl of `trait_name` derived for a type with parameters `params`, in unit
-// `unit`: each bounded by the trait, so the conformance holds where every type argument implements
-// it. Each impl derived for a type is declared at one place, so the trait tells their parameters
-// apart.
-private bounded_params(c: *Checker, unit: usize, at: Span, params: Buf[TypeParam], trait_name: string) -> Buf[TypeParam]
-    var out: Buf[TypeParam] = buf()
-    for tp in params
-        var bounds: Buf[&TypeExpr] = buf()
-        bounds.push(named_type(at, core_path(trait_name)))
-        out.push(TypeParam(at, tp.name, Invariant, bounds, s"${c.units[unit].src.name}:${at.start}:derives $trait_name"))
-    out
-
-// The method implementing `trait_name` for data type `d`, whose type is `target`.
-private data_method(at: Span, trait_name: string, d: &DataDecl, target: &TypeExpr) -> &Function
-    if trait_name == "Ord" then return method_of(at, "compare", one_param(at, "other", target), named_type(at, "int"), compare_variants(at, d))
-    render_variants(at, trait_name, d)
-
 // `Name[T, U]`, the type with its own parameters as arguments.
 private own_type(at: Span, name: string, type_params: Buf[TypeParam]) -> &TypeExpr
     var args: Buf[&TypeExpr] = buf()
@@ -583,149 +526,4 @@ private own_type(at: Span, name: string, type_params: Buf[TypeParam]) -> &TypeEx
 
 private named_type(at: Span, name: string) -> &TypeExpr = TypeExpr(at, Named(name, buf()))
 
-private one_param(at: Span, name: string, ty: &TypeExpr) -> Buf[Param]
-    var out: Buf[Param] = buf()
-    out.push(Param(at, Pattern(at, Name(name)), ty, None, false, false, buf()))
-    out
-
-private method_of(at: Span, name: string, params: Buf[Param], result: &TypeExpr, body: &Expr) -> &Function =
-    Function(buf(), at, at, name, buf(), params, Some(result), Some(body), buf())
-
-private call(at: Span, target: &Expr, name: string, args: Buf[&Expr]) -> &Expr
-    var written: Buf[Argument] = buf()
-    for a in args
-        written.push(Argument(at, None, a, false))
-    Expr(at, Call(Expr(at, Member(target, name)), written))
-
-private call0(at: Span, target: &Expr, name: string) -> &Expr = call(at, target, name, buf())
-
-private call1(at: Span, target: &Expr, name: string, arg: &Expr) -> &Expr
-    var args: Buf[&Expr] = buf()
-    args.push(arg)
-    call(at, target, name, args)
-
-private call2(at: Span, target: &Expr, name: string, a: &Expr, b: &Expr) -> &Expr
-    var args: Buf[&Expr] = buf()
-    args.push(a)
-    args.push(b)
-    call(at, target, name, args)
-
 private int_lit(at: Span, spelling: string) -> &Expr = Expr(at, IntLit(spelling))
-
-// `a0.equals(b0) && a1.equals(b1) …`, or `true` for no fields.
-private equal_fields(at: Span, mine: Buf[&Expr], theirs: Buf[&Expr]) -> &Expr
-    if mine.len() == 0 then return Expr(at, BoolLit(true))
-    var out = call1(at, mine[0], "equals", theirs[0])
-    for i in 1..<mine.len()
-        out = Expr(at, Binary(And, out, call1(at, mine[i], "equals", theirs[i]), at))
-    out
-
-// Each field's hash folded into the last's, multiplying by 31 and adding, wrapping on overflow.
-private hash_fields(at: Span, mine: Buf[&Expr]) -> &Expr
-    if mine.len() == 0 then return int_lit(at, "0")
-    var out = call0(at, mine[0], "hash")
-    for i in 1..<mine.len()
-        val scaled = Expr(at, Binary(MultiplyWrapping, out, int_lit(at, "31"), at))
-        out = Expr(at, Binary(AddWrapping, scaled, call0(at, mine[i], "hash"), at))
-    out
-
-// The first field whose `compare` is not zero decides: `{ val c0 = a0.compare(b0); if c0 != 0 then
-// c0 else … }`, the last field's comparison the answer when every earlier one is zero.
-private compare_fields(at: Span, mine: Buf[&Expr], theirs: Buf[&Expr]) -> &Expr = compare_from(at, mine, theirs, 0)
-
-private compare_from(at: Span, mine: Buf[&Expr], theirs: Buf[&Expr], i: usize) -> &Expr
-    if i >= mine.len() then return int_lit(at, "0")
-    val here = call1(at, mine[i], "compare", theirs[i])
-    if i + 1 == mine.len() then return here
-    val name = s"c$i"
-    var operands: Buf[&Expr] = buf()
-    operands.push(Expr(at, Name(name)))
-    operands.push(int_lit(at, "0"))
-    var ops: Buf[CompareOp] = buf()
-    ops.push(NotEqual)
-    val differs = Expr(at, Compare(operands, ops))
-    var items: Buf[&Expr] = buf()
-    items.push(Expr(at, Binding(name, None, here, false)))
-    items.push(Expr(at, If(differs, Expr(at, Name(name)), Some(compare_from(at, mine, theirs, i + 1)))))
-    Expr(at, Block(items, false))
-
-// A variant's pattern binding its fields to `prefix0`, `prefix1`, …; a variant without fields is its
-// bare name.
-private variant_pattern(at: Span, v: Variant, prefix: string) -> &Pattern
-    if v.fields.len() == 0 then return Pattern(at, Name(v.name))
-    var args: Buf[&Pattern] = buf()
-    for i in 0..<v.fields.len()
-        args.push(if prefix == "" then Pattern(at, Wildcard) else Pattern(at, Name(s"$prefix$i")))
-    Pattern(at, Constructor(v.name, args))
-
-private bound_fields(at: Span, v: Variant, prefix: string) -> Buf[&Expr]
-    var out: Buf[&Expr] = buf()
-    for i in 0..<v.fields.len()
-        out.push(Expr(at, Name(s"$prefix$i")))
-    out
-
-// Within one variant the fields decide; between two, their order in the declaration does.
-private compare_variants(at: Span, d: &DataDecl) -> &Expr
-    var subject_items: Buf[&Expr] = buf()
-    subject_items.push(Expr(at, Name("self")))
-    subject_items.push(Expr(at, Name("other")))
-    var arms: Buf[Arm] = buf()
-    for v in d.variants
-        var pair: Buf[&Pattern] = buf()
-        pair.push(variant_pattern(at, v, "a"))
-        pair.push(variant_pattern(at, v, "b"))
-        arms.push(Arm(Pattern(at, Tuple(pair)), None, compare_fields(at, bound_fields(at, v, "a"), bound_fields(at, v, "b"))))
-    if d.variants.len() > 1
-        val by_order = call1(at, variant_index(at, d, Expr(at, Name("self"))), "compare", variant_index(at, d, Expr(at, Name("other"))))
-        arms.push(Arm(Pattern(at, Wildcard), None, by_order))
-    Expr(at, Match(Expr(at, Tuple(subject_items)), arms))
-
-// The position of `value`'s variant in the declaration.
-private variant_index(at: Span, d: &DataDecl, value: &Expr) -> &Expr
-    var arms: Buf[Arm] = buf()
-    for i in 0..<d.variants.len()
-        arms.push(Arm(variant_pattern(at, d.variants[i], ""), None, int_lit(at, s"$i")))
-    Expr(at, Match(value, arms))
-
-// `display` or `debug` for a data type: each variant written by `render_parts`.
-private render_variants(at: Span, trait_name: string, d: &DataDecl) -> &Function
-    var arms: Buf[Arm] = buf()
-    for v in d.variants
-        val opening = if v.fields.len() == 0 then v.name else v.name + "("
-        val closing = if v.fields.len() == 0 then "" else ")"
-        arms.push(Arm(variant_pattern(at, v, "a"), None, render_parts(at, trait_name, opening, bound_fields(at, v, "a"), closing)))
-    render_with_width(at, trait_name, Expr(at, Match(Expr(at, Name("self")), arms)))
-
-// `opening`, the fields rendered by the trait's method and separated by `, `, then `closing`.
-private render_parts(at: Span, trait_name: string, opening: string, fields: Buf[&Expr], closing: string) -> &Expr
-    val method = derived_method(trait_name)
-    val out = Expr(at, Name("out"))
-    var items: Buf[&Expr] = buf()
-    items.push(call1(at, out, "write", Expr(at, StringLit(opening))))
-    for i in 0..<fields.len()
-        if i > 0 then items.push(call1(at, out, "write", Expr(at, StringLit(", "))))
-        items.push(call2(at, fields[i], method, out, Expr(at, Call(Expr(at, Name(core_path("FormatSpec"))), buf()))))
-    if closing != "" then items.push(call1(at, out, "write", Expr(at, StringLit(closing))))
-    Expr(at, Block(items, true))
-
-// The method rendering the value: `plain` writes it, and a field width pads the whole, rendered into
-// a string first.
-private render_with_width(at: Span, trait_name: string, plain: &Expr) -> &Function
-    val method = derived_method(trait_name)
-    val out = Expr(at, Name("out"))
-    val spec = Expr(at, Name("spec"))
-    var operands: Buf[&Expr] = buf()
-    operands.push(Expr(at, Member(spec, "width")))
-    operands.push(int_lit(at, "0"))
-    var ops: Buf[CompareOp] = buf()
-    ops.push(Greater)
-    val padded = Expr(at, Compare(operands, ops))
-    var whole: Buf[&Expr] = buf()
-    whole.push(Expr(at, Binding("text", None, Expr(at, Call(Expr(at, Name(core_path("StringWriter"))), buf())), false)))
-    whole.push(call2(at, Expr(at, Name("self")), method, Expr(at, Name("text")), Expr(at, Call(Expr(at, Name(core_path("FormatSpec"))), buf()))))
-    whole.push(call2(at, out, "writeField", call0(at, Expr(at, Name("text")), "text"), spec))
-    val body = Expr(at, If(padded, Expr(at, Block(whole, true)), Some(plain)))
-    var params: Buf[Param] = buf()
-    params.push(Param(at, Pattern(at, Name("out")), named_type(at, core_path("Writer")), None, false, false, buf()))
-    params.push(Param(at, Pattern(at, Name("spec")), named_type(at, core_path("FormatSpec")), None, false, false, buf()))
-    Function(buf(), at, at, method, buf(), params, Some(named_type(at, "unit")), Some(body), buf())
