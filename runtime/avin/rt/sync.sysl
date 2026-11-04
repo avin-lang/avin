@@ -2,7 +2,7 @@ module avin.rt
 
 import sysl.raw.ptr_cast
 import sysl.sync.*
-import sysl.threads.{Condvar, Mutex}
+import sysl.threads.{Condvar, Mutex, SleepLock}
 import sysl.time.monotonic
 
 // The waiting the synchronization library is built on: a lock that sleeps and a condition variable,
@@ -131,6 +131,47 @@ wide_atomic_begin()
 @export("avin_rt_wide_atomic_end")
 wide_atomic_end()
     wide_atomics.unlock()
+
+// The first reads of `lazy val`s. A lazy value's state is a word: 0 before anything has read it, the
+// context of the thread running its initializer while that runs, and `LazyReady` once the value is
+// stored. Compiled code reads a ready value with one load and calls here otherwise. Threads that
+// find another running the initializer sleep on one lock and condition shared by every lazy value,
+// which only first reads ever touch.
+private const LazyReady: i64 = 1
+
+private var lazy_lock: SleepLock = SleepLock.new()
+
+private var lazy_stored: Condvar = Condvar.new()
+
+/** Begins a read of the lazy value whose state is at `state` that did not find it ready: answers 1
+ * where the calling thread has claimed the value and is to run its initializer, and 0 once another
+ * thread has stored it, having waited for that thread, safe for the collector. A thread whose read
+ * of a value runs while its own initialization of the value is running, so that the initializer
+ * needs its own result, stops the program at `site`. */
+@export("avin_rt_lazy_begin")
+lazy_begin(ctx: *Context, state: *i64, site: *TrapSite) -> int
+    val me = i64(usize(ctx))
+    val found = atomic_cas(state, 0, me, AcqRel)
+    if found == 0 then return 1
+    if found == LazyReady then return 0
+    if found == me then stop(ctx, site)
+    enter_safe(ctx)
+    lazy_lock.lock()
+    while atomic_load(state, Acquire) != LazyReady
+        lazy_stored.wait_raw(&lazy_lock)
+    lazy_lock.unlock()
+    leave_safe(ctx)
+    0
+
+/** Ends the initialization of the lazy value whose state is at `state`, which the calling thread has
+ * stored: marks it ready with a release store, so a thread that sees the mark sees the whole value,
+ * and wakes every thread waiting for a lazy value. */
+@export("avin_rt_lazy_end")
+lazy_end(ctx: *Context, state: *i64)
+    lazy_lock.lock()
+    atomic_store(state, LazyReady, Release)
+    lazy_stored.notify_all()
+    lazy_lock.unlock()
 
 /** `p`, an object the runtime has just made, once it is complete: a release fence makes every store
  * before it, the object's header and contents, visible to another thread no later than any store

@@ -91,7 +91,10 @@ from the new thread too.
   many at once: every other call waits until that body has returned, and returns without running its
   own. `isDone()` says whether it has run. A body that runs its own `Once` again traps, as a mutex
   taken twice does.
-- `lazy` module values, initialized by exactly one thread, as a `Once` is run.
+- **`lazy val`s**, module-level and fields alike ([Initialization](declarations.md#initialization)),
+  initialized by exactly one thread, as a `Once` is run: a thread that reads one while another runs
+  its initializer waits, safe for the collector, and the stored value is published with a release
+  store that every read pairs with an acquire load, so no thread sees it half made.
 
 ```avin
 import avin.threads.{Channel, scope}

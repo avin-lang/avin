@@ -42,7 +42,10 @@ parse(src: Source) -> Parsed
         elif p.at("impl") && (p.ahead(1) != "(" || impl_of_function_ahead(&p))
             file.items.push(ImplItem(parse_impl(&p, start, annotations)))
         elif (p.at("val") || p.at("var")) && p.ahead(1) != "("
-            file.items.push(parse_value(&p, start, annotations))
+            file.items.push(parse_value(&p, start, annotations, false))
+        elif lazy_ahead(&p)
+            p.toks.advance()
+            file.items.push(parse_value(&p, start, annotations, true))
         else
             if is_operator_spelling(p.ahead(0))
                 p.report.add(error(p.toks.here(), s"`${p.ahead(0)}` names a function, but only a method can be named by a symbol: declare it in a class, trait, object or impl"))
@@ -77,6 +80,14 @@ required_name(p: *Parser) -> string
         None ->
             p.report.add(error(p.toks.here(), "expected a name"))
             ""
+
+/** Whether `lazy` begins a `lazy val` here: like `open` before `class`, `lazy` is a modifier only
+ * before `val` or `var`, and elsewhere an ordinary name. */
+lazy_ahead(p: *Parser) -> bool = p.at("lazy") && (p.ahead(1) == "val" || p.ahead(1) == "var")
+
+/** Reports `lazy var`: a lazy value is computed once and never assigned. */
+private reject_lazy_var(p: *Parser, at: Span, mutable: bool)
+    if mutable then p.report.add(error(at, "a `lazy` value is computed once and never assigned, so it is declared `lazy val`"))
 
 /** Whether a word may not be declared as a name. `end` is contextual (it closes a form only when a
  * name follows), `open` is a modifier only before `class`, and `self` is rejected by the checker
@@ -392,6 +403,11 @@ parse_params(p: *Parser, function: bool) -> Buf[Param]
     if !p.at(")")
         loop
             val start = p.toks.here()
+            if p.at("lazy") && (p.ahead(2) == ":" || lazy_ahead(p))
+                val what = if function then "a parameter is given by its caller, so it cannot be `lazy`; a by-name parameter, `x: -> T`, is computed where it is read" else "a data field is given when the value is made, so it cannot be `lazy`"
+                p.report.add(error(start, what))
+                p.toks.advance()
+                if p.at("val") || p.at("var") then p.toks.advance()
             val pattern = parse_untyped_pattern(p)
             val named = pattern.kind is Name(_)
             p.expect(":")
@@ -773,18 +789,19 @@ private parse_class_body(p: *Parser, name: string) -> Buf[ClassMember]
         optional_end(p, name, true)
     members
 
-// A module-level `val x = …` or `var x: T = …`, one name to a declaration.
-private parse_value(p: *Parser, start: Span, annotations: Buf[Annotation]) -> Item
+// A module-level `val x = …`, `var x: T = …` or `lazy val x = …`, one name to a declaration.
+private parse_value(p: *Parser, start: Span, annotations: Buf[Annotation], lazy: bool) -> Item
     for a in annotations
         p.report.add(error(a.span, s"unknown annotation `@${a.name}`"))
     val mutable = p.at("var")
+    if lazy then reject_lazy_var(p, start, mutable)
     p.toks.advance()
     val binding = parse_binding(p, start, mutable)
     binding.kind match
-        Binding(name, declared, value, _) -> ValueItem(FieldDecl(binding.span, name, declared, value, mutable, true))
+        Binding(name, declared, value, _) -> ValueItem(FieldDecl(binding.span, name, declared, value, mutable && !lazy, true, lazy))
         _ ->
             p.report.add(error(binding.span, "a module-level declaration names one value"))
-            ValueItem(FieldDecl(binding.span, "_", None, Expr(binding.span, Invalid), mutable, true))
+            ValueItem(FieldDecl(binding.span, "_", None, Expr(binding.span, Invalid), mutable, true, false))
 
 // `owner: string`, `val name: string`, `var balance: int`, `private var count: int`
 private parse_class_params(p: *Parser) -> Buf[ClassParam]
@@ -794,6 +811,9 @@ private parse_class_params(p: *Parser) -> Buf[ClassParam]
         loop
             val start = p.toks.here()
             val hidden = p.accept("private")
+            if lazy_ahead(p)
+                p.report.add(error(p.toks.here(), "a class parameter is given when the object is made, so it cannot be `lazy`; declare a `lazy val` in the class body"))
+                p.toks.advance()
             var mutable = false
             var marked = false
             if p.accept("var")
@@ -832,6 +852,8 @@ private parse_class_member(p: *Parser) -> ClassMember
     var static_member = p.accept("static")
     val overrides = p.accept("override")
     if !static_member then static_member = p.accept("static")
+    val lazy = lazy_ahead(p)
+    if lazy then p.toks.advance()
     if annotations.len() > 0
         if p.at("val") || p.at("var") then p.report.add(error(annotations[0].span, "a field takes no annotations"))
         else return MethodMember(parse_function(p, annotations), !hidden, overrides, static_member)
@@ -840,6 +862,7 @@ private parse_class_member(p: *Parser) -> ClassMember
         p.toks.advance()
         if overrides then p.report.add(error(start, "only a method can be marked `override`"))
         if static_member then p.report.add(error(start, "only a method can be `static`; a field belongs to a value"))
+        if lazy then reject_lazy_var(p, start, mutable)
         // `val name: T` at the end of its line declares the field without a value, as a trait does.
         var binding: &Expr = Expr(start, Invalid)
         if !p.at("(") && p.ahead(1) == ":"
@@ -847,11 +870,13 @@ private parse_class_member(p: *Parser) -> ClassMember
             val name = required_name(p)
             p.expect(":")
             val declared = parse_type(p)
-            if p.at_line_end() then return AbstractFieldMember(AbstractField(start.to(declared.span), name_span, name, declared, mutable, !hidden))
+            if p.at_line_end()
+                if lazy then p.report.add(error(start.to(declared.span), "a `lazy val` is computed from its initializer, so it needs one"))
+                return AbstractFieldMember(AbstractField(start.to(declared.span), name_span, name, declared, mutable, !hidden))
             binding = binding_value(p, start, mutable, None, name, Some(declared))
         else binding = parse_binding(p, start, mutable)
         binding.kind match
-            Binding(name, declared, value, _) -> return FieldMember(FieldDecl(binding.span, name, declared, value, mutable, !hidden))
+            Binding(name, declared, value, _) -> return FieldMember(FieldDecl(binding.span, name, declared, value, mutable && !lazy, !hidden, lazy))
             _ ->
                 p.report.add(error(binding.span, "a field declaration names one field"))
                 return StatementMember(Expr(binding.span, Invalid))

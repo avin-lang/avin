@@ -135,6 +135,8 @@ struct GlobalSymbol
     init: usize
     /** For an object, its class. */
     object: Option[usize]
+    /** A `lazy val`: `init` runs on the value's first read instead of before `main`. */
+    lazy: bool
 
 /** A field of a class; `ty` is `None` until the constructor's check infers it from the field's
  * initializer, when the declaration has no type. */
@@ -147,6 +149,9 @@ struct FieldSymbol
     param: bool
     /** The class that declares the field: a subclass inherits its superclass's fields. */
     owner: usize
+    /** A `lazy val`, whose value is computed on its first read. The two fields after it hold its
+     * state, which a read tests, and the closure that computes it, which the constructor stores. */
+    lazy: bool
 
 /** A `data` type and its variants. Field types name the type's own parameters as
  * `TypeVar(data_owner(id), i)`, so a field of a particular value's type is its declared type with the
@@ -1697,13 +1702,16 @@ private declare_fields(c: *Checker, unit: usize)
             if field_named(fields, name) is Some(_) then c.note(unit, cp.param.pattern.span, s"the field `$name` is declared more than once")
             val written = resolve_type(c, unit, cp.param.ty)
             val field_type = if cp.param.variadic then vector_of(c, written) else written
-            fields.push(FieldSymbol(name, cp.param.pattern.span, Some(field_type), cp.mutable, cp.public, true, id))
+            fields.push(FieldSymbol(name, cp.param.pattern.span, Some(field_type), cp.mutable, cp.public, true, id, false))
         for m in d.members
             if m is FieldMember(f)
                 if field_named(fields, f.name) is Some(_) then c.note(unit, f.span, s"the field `${f.name}` is declared more than once")
                 var ty: Option[&Type] = None
                 if f.declared is Some(t) then ty = Some(resolve_type(c, unit, t))
-                fields.push(FieldSymbol(f.name, f.span, ty, f.mutable, f.public, false, id))
+                fields.push(FieldSymbol(f.name, f.span, ty, f.mutable, f.public, false, id, f.lazy))
+                if f.lazy
+                    fields.push(FieldSymbol(s"<state of ${f.name}>", f.span, Some(Int(64)), false, false, false, id, false))
+                    fields.push(FieldSymbol(s"<initializer of ${f.name}>", f.span, lazy_initializer_type(ty), false, false, false, id, false))
         c.classes[id].fields = fields
         c.generic = outer_generic
 
@@ -2629,7 +2637,7 @@ private declare_globals(c: *Checker, unit: usize)
                 c.locals.push(buf())
                 if file.private_items[i] then c.private_names.put(key, true)
                 c.global_names.put(key, c.globals.len())
-                c.globals.push(GlobalSymbol(unit, file.module_name, v.name, v.span, v.mutable, init, None))
+                c.globals.push(GlobalSymbol(unit, file.module_name, v.name, v.span, v.mutable, init, None, v.lazy))
             ClassItem(d) ->
                 if !d.object then continue
                 // A second object of one name has no class, and was reported.
@@ -2639,7 +2647,7 @@ private declare_globals(c: *Checker, unit: usize)
                         if global_name_taken(c, unit, d.name, d.name_span, true) then break
                         c.classes[k].global = Some(c.globals.len())
                         c.global_names.put(key, c.globals.len())
-                        c.globals.push(GlobalSymbol(unit, file.module_name, d.name, d.name_span, false, cls.constructor, Some(k)))
+                        c.globals.push(GlobalSymbol(unit, file.module_name, d.name, d.name_span, false, cls.constructor, Some(k), false))
             _ -> ()
 
 // A companion's `apply` overloads the constructor its name has in call position, so it cannot take
@@ -5032,6 +5040,9 @@ private construct(c: *Checker, k: usize, upto: Option[usize])
         made.member += 1
         m match
             FieldMember(f) ->
+                if f.lazy
+                    lazy_field(c, k, &made, f)
+                    continue
                 val index = made.index
                 val declared = c.classes[k].fields[index].ty
                 val mark = c.unknowns.len()
@@ -5071,6 +5082,37 @@ private construct(c: *Checker, k: usize, upto: Option[usize])
     else
         items.push(TExpr(decl.span, Unit, UnitConst))
         c.bodies.set(id, Some(TExpr(decl.span, if made.finishes then Unit else Nothing, Block(items))))
+
+// A `lazy val` field's initializer is checked as a lambda with no parameters, which the constructor
+// stores in the field's initializer slot and the first read runs. Like any lambda in the class body it
+// may read every field and call every method, since it runs only once the object is complete: a read
+// of the field in the body itself is checked as a call of a method is.
+private lazy_field(c: *Checker, k: usize, made: *Construction, f: FieldDecl)
+    val index = made.index
+    val unit = c.classes[k].unit
+    val declared = c.classes[k].fields[index].ty
+    val mark = c.unknowns.len()
+    val typed = check_expr(c, Expr(f.value.span, Lambda(buf(), f.value)), lazy_initializer_type(declared))
+    if declared is None
+        settle_unknowns(c, mark)
+        val result: &Type = *zonk(c, typed.ty) match
+            Function(_, r) -> r
+            _ -> ErrorType
+        if has_unknowns(result)
+            c.note(unit, f.span, s"cannot infer the type of the field `${f.name}`; declare it, as in `lazy val ${f.name}: int = …`")
+            c.classes[k].fields[index].ty = Some(ErrorType)
+        else c.classes[k].fields[index].ty = Some(if *result is Nothing then ErrorType else result)
+    c.classes[k].fields[index + 2].ty = lazy_initializer_type(c.classes[k].fields[index].ty)
+    made.items.push(TExpr(f.span, Unit, StoreField(made.receiver, index + 2, typed, false)))
+    made.index = index + 3
+    c.classes[k].ready = made.index
+
+/** The type of the closure that computes a `lazy val` of type `t`, where `t` is known. */
+private lazy_initializer_type(t: Option[&Type]) -> Option[&Type] = t match
+    Some(x) ->
+        val f: &Type = Function(buf(), x)
+        Some(f)
+    None -> None
 
 // The call of the superclass's initializer on the object, with the arguments written after the
 // superclass's name. They are checked before the class stores its parameters, so a parameter's name
@@ -5574,7 +5616,28 @@ private field_read(c: *Checker, at: Span, name_span: Span, object: &TExpr, k: us
     val args = *zonk(c, object.ty) match
         Class(_, _, a) -> a
         _ -> buf()
-    TExpr(at, substitute(ty, class_owner(k), args), Field(object, index))
+    val read = substitute(ty, class_owner(k), args)
+    if field.lazy then return lazy_field_read(c, at, object, index, read, field.name)
+    TExpr(at, read, Field(object, index))
+
+// A `lazy val` field's read: the object is evaluated once, into a hidden local unless it is one
+// already, and the read runs the closure in the field's initializer slot when it is the first.
+private lazy_field_read(c: *Checker, at: Span, object: &TExpr, index: usize, ty: &Type, name: string) -> &TExpr
+    val pure = object.kind is Local(_) || object.kind is Param(_)
+    val held: Option[usize] = if pure then None else Some(hidden_local(c, object.ty))
+    val target: &TExpr = held match
+        Some(h) -> TExpr(object.span, object.ty, Local(h))
+        None -> object
+    val run: &Type = Function(buf(), ty)
+    val initialize = TExpr(at, ty, CallValue(TExpr(at, run, Field(target, index + 2)), buf()))
+    val read = TExpr(at, ty, LazyField(target, index, initialize, name))
+    held match
+        Some(h) ->
+            var items: Buf[&TExpr] = buf()
+            items.push(TExpr(object.span, Unit, Let(h, object)))
+            items.push(read)
+            TExpr(at, ty, Block(items))
+        None -> read
 
 /** Field `index` of the one variant of `object`'s data type. */
 private data_field_read(c: *Checker, at: Span, object: &TExpr, index: usize) -> &TExpr = *zonk(c, object.ty) match
@@ -6136,7 +6199,12 @@ private global_type(c: *Checker, g: usize, at: Span) -> &Type
     c.note(unit_of(c), at, s"the type of `$name` is needed while its initializer is checked; declare it, as in `val $name: int = …`")
     ErrorType
 
-private global_read(c: *Checker, at: Span, g: usize) -> &TExpr = TExpr(at, global_type(c, g, at), Global(g))
+// A `lazy val` is read through its initializer's call, which the read makes when it is the first.
+private global_read(c: *Checker, at: Span, g: usize) -> &TExpr
+    val ty = global_type(c, g, at)
+    val global = c.globals[g]
+    if !global.lazy then return TExpr(at, ty, Global(g))
+    TExpr(at, ty, LazyGlobal(g, TExpr(at, ty, Call(global.init, buf(), buf())), global.name))
 
 // A value declared without a type takes its initializer's, which must be fully known.
 private settle_global(c: *Checker, g: usize)
@@ -6158,6 +6226,7 @@ private targets_global(c: *Checker, target: &Expr) -> Option[usize] = target.kin
 private writable_global(c: *Checker, at: Span, g: usize) -> bool
     val global = c.globals[g]
     if global.object is Some(_) then c.note(unit_of(c), at, s"`${global.name}` is an object, which cannot be assigned")
+    elif global.lazy then c.note(unit_of(c), at, s"`${global.name}` is a `lazy val`, computed once on its first read, which cannot be assigned")
     elif !global.mutable then c.note(unit_of(c), at, s"`${global.name}` is a module-level `val`; only a `var` can be assigned")
     else return true
     false
@@ -6260,8 +6329,10 @@ private initialization_order(c: *Checker) -> Buf[usize]
     for g in c.globals
         o.needs.push(globals_reached(direct, g.init))
         o.state.push(0)
+    // A `lazy val` has no place in the order: nothing reads it as a module-level value, since its
+    // reads call its initializer, so the values that initializer needs are needed by its readers.
     for g in 0..<c.globals.len()
-        if o.state[g] == 0 then order_global(c, &o, g)
+        if o.state[g] == 0 && !c.globals[g].lazy then order_global(c, &o, g)
     o.order
 
 private order_global(c: *Checker, o: *InitOrder, g: usize)
@@ -6290,7 +6361,7 @@ private report_cycle(c: *Checker, o: *InitOrder, start: usize)
 // One function initializes every module-level value in order, storing each initializer's result.
 // The program's `main` runs it before the entry.
 private initializer(c: *Checker, order: Buf[usize]) -> Option[usize]
-    if c.globals.len() == 0 then return None
+    if order.len() == 0 then return None
     val unit = c.units.len() - 1
     val module_name = c.units[unit].file.module_name
     val at = Span(0, 0)
@@ -10302,13 +10373,18 @@ private check_class_initialization(c: *Checker, k: usize, unsafe: *Buf[bool])
     var count = 0usize
     var last = 0usize
     var last_name = ""
+    // A `lazy val`'s item stores the closure that computes it, which runs only when it is read.
+    var deferred: Buf[bool] = buf()
     for m in cls.decl.members
         m match
             FieldMember(f) ->
                 count += 1
                 last = count
                 last_name = f.name
-            StatementMember(_) -> count += 1
+                deferred.push(f.lazy)
+            StatementMember(_) ->
+                count += 1
+                deferred.push(false)
             AbstractFieldMember(_) -> ()
             MethodMember(_, _, _, _) -> ()
     if items.len() < count + 1 then return
@@ -10317,6 +10393,7 @@ private check_class_initialization(c: *Checker, k: usize, unsafe: *Buf[bool])
     for i in 0..<count
         val early = i < last
         if !early && kind == "" then return
+        if deferred[i] then continue
         val scan = InitScan(cls.unit, Some(self_local), if early then last_name else "", kind, true)
         val item = items[start + i]
         // A field's initializer is checked as it is stored.
@@ -10408,6 +10485,11 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
             elif symbol.lambda then init_violation(c, s, e.span, "a lambda that captures `self` is made", "a lambda cannot capture `self`")
             else init_violation(c, s, e.span, s"`${symbol.decl.name}`, which uses `self`, is used as a value", s"`${symbol.decl.name}` uses `self`, so it cannot be used as a value")
         Field(value, _) -> is_init_self(s, value) || scan_init(c, s, value, unsafe)
+        // A lazy field's first read runs its initializer, which may use `self` as a method does.
+        LazyField(object, _, _, name) ->
+            if is_init_self(s, object) then return init_violation(c, s, e.span, s"the `lazy val` `$name`, whose initializer may use `self`, is read", s"the `lazy val` `$name` may use `self`, so it cannot be read")
+            scan_init(c, s, object, unsafe)
+        LazyGlobal(_, initialize, _) -> scan_init(c, s, initialize, unsafe)
         StoreField(object, _, value, _) ->
             val target = is_init_self(s, object) || scan_init(c, s, object, unsafe)
             scan_init(c, s, value, unsafe) && target
