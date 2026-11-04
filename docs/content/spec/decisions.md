@@ -702,6 +702,20 @@ Settled by the user on 2026-11-04:
   up to one per processor (`sysl.platform.cpu_count`), never joins them, and starts one more in the
   place of each worker waiting in `await` while work is queued, so nested waits never deadlock it;
   `await` inside a body is allowed.
+- [A companion's `apply`](/spec/declarations/) overloads the constructor its name has in call
+  position. Where an object declares `apply`, `Name(…)` chooses among the class's constructor (or
+  the data type's variant of its name) and every `apply` by the ordinary static overloading rules:
+  most specific by parameter types, with by-name parameters, defaults, repeated parameters, generic
+  inference and trailing blocks as for any call (`Future(fetch(url))`, `Future` + block). Type
+  arguments written at the call are the chosen candidate's: the class's or data type's for the
+  constructor, the method's for an `apply`. An `apply` with the constructor's parameter types, up to
+  type parameter names, is an error at its declaration. A name with no constructor in call position
+  (a data type with no variant of its name, an abstract class, a plain object) calls its `apply`
+  alone, and the library's `List`, `Set` and `Map` companions take their elements that way:
+  `List(1, 2, 3)`, `Set(…)`, `Map((k, v), …)`. Where a function type is expected, the name is the
+  constructor or `apply` that type chooses, as for an overloaded function value; elsewhere the bare
+  name stays the object. This amends the earlier rule that the name in call position is only the
+  constructor and that an object cannot be called.
 
 **Deferred**
 
