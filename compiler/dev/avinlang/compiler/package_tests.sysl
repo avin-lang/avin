@@ -615,3 +615,213 @@ add_command_line()
     assert_eq(bad.status, 1)
     assert(bad.noted.contains("is not a git coordinate"))
     assert_eq(read_text(dir + "/app/avin.hocon").unwrap(), manifest("app", ""))
+
+// The full id of the commit `ref` names in the repository at `dir`.
+private commit_of(dir: string, name: string) -> string
+    val result = capture("git", ["-C", dir, "rev-parse", name], stderr = true, timeout = 60000).unwrap()
+    assert(result.status.ok())
+    result.text.trim()
+
+// The repository `example.com/avin/pinned` as a host would serve it: `main` holding two commits, the
+// first of which has `size` 1 and the second 2, and a third commit, `size` 3, that no branch or tag
+// reaches, which the host serves to anyone who asks for it by its full id. Answers the three ids.
+private pinned(dir: string) -> Buf[string]
+    val work = dir + "/work/pinned"
+    put(work + "/avin.hocon", manifest("pinned", ""))
+    put(work + "/pinned/pinned.avin", "module pinned\n\nsize() -> int = 1\n")
+    git(work, ["init", "-q"])
+    git(work, ["add", "-A"])
+    git(work, ["commit", "-q", "-m", "first"])
+    put(work + "/pinned/pinned.avin", "module pinned\n\nsize() -> int = 2\n")
+    git(work, ["add", "-A"])
+    git(work, ["commit", "-q", "-m", "second"])
+    git(work, ["checkout", "-q", "--detach"])
+    put(work + "/pinned/pinned.avin", "module pinned\n\nsize() -> int = 3\n")
+    git(work, ["add", "-A"])
+    git(work, ["commit", "-q", "-m", "third"])
+    val third = commit_of(work, "HEAD")
+    git(work, ["checkout", "-q", "main"])
+    val bare = dir + "/remotes/example.com/avin/pinned.git"
+    make_dir_all(dir + "/remotes/example.com/avin").unwrap()
+    git(dir, ["clone", "-q", "--bare", work, bare])
+    git(bare, ["fetch", "-q", work, third])
+    git(bare, ["config", "uploadpack.allowAnySHA1InWant", "true"])
+    var ids: Buf[string] = buf()
+    ids.push(commit_of(work, "main~1"))
+    ids.push(commit_of(work, "main"))
+    ids.push(third)
+    ids
+
+private pinned_app(dir: string, dependencies: string)
+    put(dir + "/app/avin.hocon", manifest("app", "dependencies {\n" + dependencies + "}\n"))
+    put(dir + "/app/main.avin", "import pinned.size\n\nmain() = print(s\"${size()}\")\n")
+
+private pinned_fetching(dir: string) -> Fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+
+private pinned_names(program: LoadedProgram) -> string
+    var names = ""
+    for f in program.files
+        names = names + f.src.name + "\n"
+    names
+
+@test("a rev is a commit's id, written alone beside git, in lowercase hexadecimal")
+rev_manifest()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/avin.hocon", manifest("a", "dependencies {\n  b { git = \"example.com/o/b\", rev = \"3f9a2c1\" }\n}\n")).unwrap()
+    val m = read_manifest(dir).unwrap()
+    assert(m.dependencies[0].origin is Rev("example.com/o/b", "3f9a2c1"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { git = \"example.com/o/b\", rev = \"3f9a2c1\", version = \"1.0.0\" }\n}\n")).contains("has a `version` and a `rev`"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { git = \"example.com/o/b\", rev = \"3F9A2C1\" }\n}\n")).contains("is not a revision"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { git = \"example.com/o/b\", rev = \"3f9a2c\" }\n}\n")).contains("is not a revision"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { git = \"example.com/o/b\", rev = \"main\" }\n}\n")).contains("is not a revision"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { path = \"../b\", rev = \"3f9a2c1\" }\n}\n")).contains("has a `rev`, which belongs with `git`"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { rev = \"3f9a2c1\" }\n}\n")).contains("says once where it comes from"))
+
+@test("a rev is fetched into the cache under the commit's full id, abbreviated or not, and avin.sum records it once")
+rev_fetched_and_summed()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    val ids = pinned(dir)
+    val fetching = pinned_fetching(dir)
+    val app = dir + "/app"
+    pinned_app(dir, s"  pinned { git = \"example.com/avin/pinned\", rev = \"${ids[0]}\" }\n")
+    val full = load_package(app, fetching).unwrap()
+    assert(pinned_names(full).contains(s"/cache/example.com/avin/pinned/@r${ids[0]}/pinned/pinned.avin"))
+    assert_eq(compile_files(repository_toolchain(), full.files).diagnostics, "")
+    val entry = cached_revision_dir(dir + "/cache", "example.com/avin/pinned", ids[0])
+    assert(!exists(entry + "/.git"))
+    val hash = tree_hash(entry).unwrap()
+    assert_eq(read_text(entry + ".hash").unwrap(), hash + "\n")
+    val sums = read_text(app + "/avin.sum").unwrap()
+    assert_eq(sums, s"example.com/avin/pinned r${ids[0]} $hash\n")
+    // The commit before `main`'s tip is not the tip: the first commit's tree is what was read.
+    assert_eq(read_text(entry + "/pinned/pinned.avin").unwrap(), "module pinned\n\nsize() -> int = 1\n")
+    // Written abbreviated, the same commit is the same cache entry and the same line, with no clone.
+    pinned_app(dir, s"  pinned { git = \"example.com/avin/pinned\", rev = \"${ids[0][0..<7]}\" }\n")
+    val offline = Fetching(dir + "/cache", "", false)
+    val short = load_package(app, offline).unwrap()
+    assert(pinned_names(short).contains(s"/@r${ids[0]}/pinned/pinned.avin"))
+    assert_eq(read_text(app + "/avin.sum").unwrap(), sums)
+    // A fresh machine resolves the abbreviation to the same full id, and the sum file agrees.
+    val fresh = load_package(app, Fetching(dir + "/cache2", "file://" + dir + "/remotes/", true)).unwrap()
+    assert(pinned_names(fresh).contains(s"/cache2/example.com/avin/pinned/@r${ids[0]}/"))
+    assert_eq(read_text(app + "/avin.sum").unwrap(), sums)
+    // A repeated load moves nothing.
+    load_package(app, fetching).unwrap()
+    assert_eq(read_text(app + "/avin.sum").unwrap(), sums)
+    // Another commit of the same repository is another cache entry and another line.
+    pinned_app(dir, s"  pinned { git = \"example.com/avin/pinned\", rev = \"${ids[1]}\" }\n")
+    load_package(app, fetching).unwrap()
+    assert_eq(read_sums(app + "/avin.sum").unwrap().len(), 2)
+    assert(exists(cached_revision_dir(dir + "/cache", "example.com/avin/pinned", ids[1])))
+
+@test("a commit no branch or tag reaches is fetched by its full id, and an abbreviation of it is not found")
+rev_without_a_branch()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    val ids = pinned(dir)
+    val fetching = pinned_fetching(dir)
+    val app = dir + "/app"
+    pinned_app(dir, s"  pinned { git = \"example.com/avin/pinned\", rev = \"${ids[2]}\" }\n")
+    val program = load_package(app, fetching).unwrap()
+    assert(pinned_names(program).contains(s"/@r${ids[2]}/pinned/pinned.avin"))
+    assert_eq(read_text(cached_revision_dir(dir + "/cache", "example.com/avin/pinned", ids[2]) + "/pinned/pinned.avin").unwrap(), "module pinned\n\nsize() -> int = 3\n")
+    assert(read_text(app + "/avin.sum").unwrap().starts_with(s"example.com/avin/pinned r${ids[2]} sha256:"))
+    pinned_app(dir, s"  pinned { git = \"example.com/avin/pinned\", rev = \"${ids[2][0..<9]}\" }\n")
+    val lost = load_package(app, Fetching(dir + "/cache2", "file://" + dir + "/remotes/", true)).unwrap_err()
+    assert(lost.contains(s"has no commit `${ids[2][0..<9]}`"))
+    assert(lost.contains("only by its full id"))
+
+@test("a rev the repository does not have is reported, and nothing is cached or recorded")
+rev_missing()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    pinned(dir)
+    val app = dir + "/app"
+    pinned_app(dir, "  pinned { git = \"example.com/avin/pinned\", rev = \"0123456789abcdef0123456789abcdef01234567\" }\n")
+    val fetching = pinned_fetching(dir)
+    assert(load_package(app, fetching).unwrap_err().contains("has no commit `0123456789abcdef0123456789abcdef01234567`"))
+    pinned_app(dir, "  pinned { git = \"example.com/avin/pinned\", rev = \"0123abc\" }\n")
+    assert(load_package(app, fetching).unwrap_err().contains("has no commit `0123abc`"))
+    assert(!exists(app + "/avin.sum"))
+    assert(!exists(dir + "/cache/example.com/avin/pinned/@r0123abc"))
+    // With fetching off, a rev the cache lacks is not fetched.
+    assert(load_package(app, Fetching(dir + "/cache", "", false)).unwrap_err().contains("is not fetched yet"))
+
+@test("a package asked for at a rev and at a version, or at two commits, is refused naming both")
+rev_conflicts()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    val ids = pinned(dir)
+    git(dir + "/work/pinned", ["tag", "v1.0.0", ids[1]])
+    git(dir + "/remotes/example.com/avin/pinned.git", ["fetch", "-q", dir + "/work/pinned", "v1.0.0:refs/tags/v1.0.0"])
+    val fetching = pinned_fetching(dir)
+    val app = dir + "/app"
+    pinned_app(dir, s"  a { git = \"example.com/avin/pinned\", rev = \"${ids[0]}\" }\n  b { git = \"example.com/avin/pinned\", rev = \"${ids[1]}\" }\n")
+    val two = load_package(app, fetching).unwrap_err()
+    assert(two.contains(s"`b` pins example.com/avin/pinned to the commit ${ids[1]}"))
+    assert(two.contains(ids[0]))
+    pinned_app(dir, s"  a { git = \"example.com/avin/pinned\", rev = \"${ids[0]}\" }\n  b { git = \"example.com/avin/pinned\", version = \"1.0.0\" }\n")
+    val rev_then_version = load_package(app, fetching).unwrap_err()
+    assert(rev_then_version.contains("asks for example.com/avin/pinned at the release v1.0.0"))
+    assert(rev_then_version.contains("pins it to the commit"))
+    pinned_app(dir, s"  a { git = \"example.com/avin/pinned\", version = \"1.0.0\" }\n  b { git = \"example.com/avin/pinned\", rev = \"${ids[1]}\" }\n")
+    val version_then_rev = load_package(app, fetching).unwrap_err()
+    assert(version_then_rev.contains("pins example.com/avin/pinned to the commit"))
+    assert(version_then_rev.contains("asks for it at the release v1.0.0"))
+    // An abbreviation and a full id of one commit are one pin.
+    pinned_app(dir, s"  a { git = \"example.com/avin/pinned\", rev = \"${ids[1]}\" }\n  b { git = \"example.com/avin/pinned\", rev = \"${ids[1][0..<10]}\" }\n")
+    load_package(app, fetching).unwrap()
+
+@test("tidy keeps a rev's line while it is read and removes it once it is not")
+rev_tidy()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    val ids = pinned(dir)
+    val fetching = pinned_fetching(dir)
+    val app = dir + "/app"
+    pinned_app(dir, s"  pinned { git = \"example.com/avin/pinned\", rev = \"${ids[0][0..<8]}\" }\n")
+    var said = ""
+    assert_eq(tidy(app, fetching, true, s -> said = said + s + "\n").unwrap(), false)
+    assert_eq(said, s"would add example.com/avin/pinned r${ids[0]}\n")
+    tidy(app, fetching, false, s -> ()).unwrap()
+    assert_eq(tidy(app, fetching, true, s -> ()).unwrap(), true)
+    // Moving the pin leaves the old line to be removed, named by its commit.
+    pinned_app(dir, s"  pinned { git = \"example.com/avin/pinned\", rev = \"${ids[1]}\" }\n")
+    load_package(app, fetching).unwrap()
+    assert_eq(read_sums(app + "/avin.sum").unwrap().len(), 2)
+    said = ""
+    tidy(app, fetching, false, s -> said = said + s + "\n").unwrap()
+    assert_eq(said, s"removed example.com/avin/pinned r${ids[0]}\n")
+    assert_eq(read_sums(app + "/avin.sum").unwrap().len(), 1)
+    assert_eq(tidy(app, fetching, true, s -> ()).unwrap(), true)
+    // A sum line for a commit must give its full id.
+    write_text(app + "/avin.sum", "example.com/avin/pinned rabc1234 sha256:00\n").unwrap()
+    assert(load_package(app, fetching).unwrap_err().contains("avin.sum:1: a line is a coordinate"))
+
+@test("avin add records a commit as its full id, whether given in full or abbreviated, and changes a release to a pin in place")
+add_rev()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    val ids = pinned(dir)
+    val fetching = pinned_fetching(dir)
+    val app = dir + "/app"
+    put(app + "/avin.hocon", manifest("app", ""))
+    var said = ""
+    add_dependency(app, s"example.com/avin/pinned@${ids[0][0..<7]}", fetching, s -> said = said + s + "\n").unwrap()
+    assert_eq(said, s"added pinned: example.com/avin/pinned r${ids[0]}\n")
+    assert_eq(read_text(app + "/avin.hocon").unwrap(), manifest("app", s"\ndependencies {\n  pinned { git = \"example.com/avin/pinned\", rev = \"${ids[0]}\" }\n}\n"))
+    assert_eq(read_sums(app + "/avin.sum").unwrap()[0].version, "r" + ids[0])
+    assert_eq(tidy(app, fetching, true, s -> ()).unwrap(), true)
+    // Asking again for another commit replaces the entry where it is.
+    said = ""
+    add_dependency(app, s"example.com/avin/pinned@${ids[1]}", fetching, s -> said = said + s + "\n").unwrap()
+    assert_eq(said, s"updated pinned to example.com/avin/pinned r${ids[1]}\n")
+    assert_eq(read_manifest(app).unwrap().dependencies.len(), 1)
+    assert(read_text(app + "/avin.hocon").unwrap().contains(s"rev = \"${ids[1]}\""))
+    // A commit the repository lacks changes nothing.
+    val before = read_text(app + "/avin.hocon").unwrap()
+    assert(add_dependency(app, "example.com/avin/pinned@0123abc", fetching, s -> ()).unwrap_err().contains("has no commit"))
+    assert_eq(read_text(app + "/avin.hocon").unwrap(), before)
+    assert(add_dependency(app, "example.com/avin/pinned@main", fetching, s -> ()).unwrap_err().contains("neither a version nor a revision"))

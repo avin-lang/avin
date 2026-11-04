@@ -846,7 +846,15 @@ Settled by the user on 2026-11-04:
   - **Dependencies**: `{ git = "host/owner/name", version = "x.y.z" }` read at the tag `vx.y.z`
     and cloned from `https://`; `{ path = "../dir" }`, relative to the manifest naming it and refused
     in a fetched package; `{ workspace = true }`. A coordinate with `https://` or `.git` is refused.
-    No `rev` pins, features or members of a repository yet.
+    No features or members of a repository yet.
+  - **`rev` pins**: `{ git = "…", rev = "<hex>" }`, seven to forty lowercase hexadecimal digits,
+    refused with a `version` or without `git`. The repository is cloned whole and the commit
+    resolved to its full id, fetched by that id when no branch or tag reaches it (only a full id
+    can); the cache entry is `@r<full id>` and the `avin.sum` line `<coordinate> r<full id>
+    sha256:…`, so an abbreviation and the full id are one package. A cached commit an abbreviation
+    begins is found without the network. A package pinned at two commits, or at a commit and a
+    release, anywhere in the graph is refused naming both: a commit is not chosen among, since
+    none is higher. `avin add <coordinate>@<rev>` writes the full id.
   - **What a dependency brings in**: its modules, under their own names; not its root directory's
     files (its `main`) nor its `tests` directory, so a program can be depended on and `avin test`
     runs only the package's own tests. One module in two packages is refused. A directory holding its
