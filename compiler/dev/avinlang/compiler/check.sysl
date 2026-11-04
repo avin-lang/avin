@@ -7328,9 +7328,9 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
             typed_parts.push(typed_values[i])
             val failed = *typed_keys[i].ty is ErrorType || *typed_values[i].ty is ErrorType
             val never = *typed_keys[i].ty is Nothing || *typed_values[i].ty is Nothing
-            val ty: &Type = if failed then ErrorType elif never then Nothing else pair
             var given: Buf[Option[&TExpr]] = buf()
-            given.push(Some(TExpr(span, ty, Construct(0, typed_parts))))
+            if never && !failed then given.push(Some(never_made(span, typed_parts)))
+            else given.push(Some(TExpr(span, if failed then ErrorType else pair, Construct(0, typed_parts))))
             steps.push(method_call(c, span, span, receiver, adds[0], args, None, None, false, given))
     elif *element is Var(_)
         // No element type is expected, so the elements decide it.
@@ -7362,6 +7362,12 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
             var args: Buf[Argument] = buf()
             args.push(Argument(item.span, None, item, false))
             steps.push(call_method(c, item.span, item.span, receiver, "add", adds, args, None, None, false))
+    // An element that never finishes means the collection is never made: the builder is made and
+    // given the elements before it, and nothing after it is reached.
+    for i in 1..<steps.len()
+        if *steps[i].ty is Nothing
+            steps.truncate(i + 1)
+            return TExpr(at, Nothing, Block(steps))
     steps.push(result)
     val built = TExpr(at, zonk(c, result.ty), Block(steps))
     // Each step between making the builder and taking its result adds one element, its last
@@ -7394,8 +7400,17 @@ private tuple_expr(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Option[&T
         if *t.ty is ErrorType then failed = true
         typed.push(t)
         types.push(t.ty)
-    val ty: &Type = if failed then ErrorType elif never then Nothing else Tuple(types)
-    TExpr(e.span, ty, Construct(0, typed))
+    if never && !failed then return never_made(e.span, typed)
+    TExpr(e.span, if failed then ErrorType else Tuple(types), Construct(0, typed))
+
+// A value that is never made, since one of its parts never finishes: the parts are evaluated in
+// order up to that one, and nothing after it is reached.
+private never_made(at: Span, parts: Buf[&TExpr]) -> &TExpr
+    var run: Buf[&TExpr] = buf()
+    for p in parts
+        run.push(p)
+        if *p.ty is Nothing then break
+    TExpr(at, Nothing, Block(run))
 
 // `t.0` reads a part of a tuple by its position.
 private tuple_index(c: *Checker, e: &Expr, target: &Expr, index: usize) -> &TExpr
@@ -10111,6 +10126,12 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
             val bound = substitute(b, owner, type_args)
             if *bound is Class(bk, _, _)
                 if ancestor_type(c.classes, c.data, arg, bk) is Some(up) then unify(c, up, bound)
+    // An argument of type `Nothing` never produces a value, so the call is never made and constrains
+    // nothing: a type argument it alone would have decided is `Nothing`, the least type, as in
+    // `identity(break 42)` or `print(fail("unreachable"))`.
+    var never = false
+    for t in typed
+        if *zonk(c, t.ty) is Nothing then never = true
     var solved: Buf[&Type] = buf()
     for i in 0..<type_args.len()
         val t = zonk(c, type_args[i])
@@ -10120,7 +10141,10 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
         // unless its parameter has bounds, which the type argument is held to here.
         var mine = false
         if *t is Var(v) then mine = v >= first
-        if mine && *t is Var(v)
+        if mine && never && *t is Var(v)
+            c.vars.set(v, Some(Nothing))
+            solved.push(Nothing)
+        elif mine && *t is Var(v)
             val subject = if called then s"this call to `$name`" else s"this `$name`"
             // Written type arguments fill a leading prefix, so the example spells every one up to
             // the unsettled parameter: those already settled by their types, the others by name.
