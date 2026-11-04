@@ -59,19 +59,60 @@ from the new thread too.
 
 ## Synchronization
 
-The library offers, all written in Avin over Sysl's atomics and futex-based locks:
+`avin.threads` offers, all written in Avin over Sysl's atomics and futex-based locks:
 
-- `Mutex[T]`, which owns the value it guards: `m.with(v -> …)` is the only way to reach it.
-- `Condition`, waited on with a held `Mutex`.
-- `Atomic[T]` for `int`, `long`, `bool` and references, with `load`, `store`, `swap`,
-  `compareAndSet` and, for the integers, `add` and `sub`. Sequentially consistent; there are no
-  weaker orderings in the library.
-- `Channel[T]`, bounded or unbounded, with `send`, `receive` and `close`.
-- `Once` and `lazy` module values, initialized by exactly one thread.
+- **`Mutex[T](value)`**, which owns the value it guards. `m.with(v -> …)` takes the lock, runs the
+  body with the value and lets the lock go when the body returns, giving back what it returned; it
+  is the way to a mutable value, such as a `Buffer`, which the body changes in place. For an
+  immutable value, `get()` reads it, `set(v)` replaces it and `update(f)` replaces it with `f` of it
+  under the lock, giving back the new value. A mutex is not reentrant: a thread that takes one it
+  already holds, from inside a body, would wait for ever, so it traps instead.
+- **`Condition`**, made by a mutex's `condition()` and waited for inside that mutex's `with`.
+  `wait()` lets the mutex go while it sleeps and holds it again before it returns; `notify()` wakes
+  one waiting thread and `notifyAll()` every one. A wait may end with nothing having changed, so the
+  state is checked again in a loop. Waiting from a thread that does not hold the mutex traps.
+- **`Atomic[T](value)`**, with `load`, `store`, `swap`, `compareAndSet(expected, desired) -> bool`
+  and `update(f)`, and for the integers `add(n)` and `sub(n)`, each giving back the new value and
+  trapping on overflow, as `+` and `-` do, before anything is stored. Every operation is
+  sequentially consistent; there are no weaker orderings in the library. `int`, `long`, `bool` and
+  references are the types it is for, and it holds any type: a value of one word is accessed
+  lock-free, an integer wider than 64 bits under a lock the runtime keeps for them. A
+  compare-and-set of a reference compares identity, as `===` does, so a reference held in an
+  `Atomic` is also kept alive by it.
+- **`Channel[T](capacity = 0)`**, a queue between threads, unbounded when the capacity is zero and
+  bounded otherwise, where `send` waits while the channel is full. `receive()` waits for a value and
+  gives `Some` of it, or `None` once the channel is closed and every value sent before is received.
+  `close()` wakes every waiting thread, and a send to a closed channel traps; closing twice does
+  nothing. `trySend(x) -> bool` and `tryReceive() -> Option[T]` never wait, and `isClosed()` asks.
+  A channel is `Iterable`: `for x in ch` receives until it is closed and drained.
+- **`Once`**, whose `run(body)` runs its body exactly once, whichever threads call it and however
+  many at once: every other call waits until that body has returned, and returns without running its
+  own. `isDone()` says whether it has run. A body that runs its own `Once` again traps, as a mutex
+  taken twice does.
+- `lazy` module values, initialized by exactly one thread, as a `Once` is run.
+
+```avin
+import avin.threads.{Channel, scope}
+
+main() -> int
+    val jobs = Channel[int](16)
+    val results = Channel[int]()
+    scope(s ->
+        for w in 0..<4
+            s.spawn(() ->
+                for n in jobs do results.send(n * n))
+        for n in 1..100 do jobs.send(n)
+        jobs.close())
+    results.close()
+    var total = 0
+    for r in results do total += r
+    total % 256
+```
 
 Every operation that can wait marks its thread safe for the collector while it waits, so a thread
-blocked on a lock, a channel, a join or input never holds up a collection. A Sysl binding declared
-as blocking does the same.
+blocked on a lock, a condition, a channel, a join or input never holds up a collection. A Sysl
+binding declared as blocking does the same. **A deadlock is not detected**, apart from a thread
+taking a lock it already holds: threads that each wait for another sleep for ever.
 
 ## The memory model
 

@@ -658,6 +658,18 @@ Settled by the user on 2026-11-04:
   `Seq[(A, B)]`.
 - A heap field or module variable wider than 64 bits is accessed as untorn 64-bit words: a racing
   read of it may combine words of different writes ([threads](/spec/threads/#the-memory-model)).
+- Details of [synchronization](/spec/threads/#synchronization): `Mutex[T].with` hands its body the
+  value itself, and an immutable value is read with `get`, replaced with `set` and changed with
+  `update(f)` under the lock. A mutex is not reentrant, and a thread taking one it already holds
+  traps rather than waiting for ever; no other deadlock is detected. A `Condition` is made by its
+  mutex's `condition()`, so it is waited for with that mutex only, and `wait()` from a thread not
+  holding it traps. `Atomic[T]` holds any type: a value of one word lock-free, an integer wider
+  than 64 bits under one runtime lock; `compareAndSet` compares identity for a reference and the
+  bits for a real; `add` and `sub` give back the new value and trap on overflow before storing, and
+  `update(f)` retries `f` until its compare-and-set succeeds. `Channel[T](capacity = 0)` is
+  unbounded at zero and a negative capacity traps; a send to a closed channel traps, closing twice
+  does nothing, and a channel is `Iterable`, receiving until it is closed and drained. `Once.run`
+  makes every other caller wait for the running body; a body running its own `Once` again traps.
 
 **Deferred**
 

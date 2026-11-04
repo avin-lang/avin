@@ -2148,8 +2148,9 @@ private declare_methods(c: *Checker, unit: usize)
             val public = entry.public
             val overrides = entry.overrides
             val file_unit = entry.unit
-            // The core library's array classes declare their element operations as intrinsics.
-            val intrinsic_method = is_array_storage(c.classes[id]) && f.annotations.len() > 0
+            // The core library's array classes declare their element operations as intrinsics, and
+            // `avin.threads.Atomic` its operations on the value it holds.
+            val intrinsic_method = (is_array_storage(c.classes[id]) || is_atomic_storage(c.classes[id])) && f.annotations.len() > 0
             if f.annotations.len() > 0 && !intrinsic_method then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
             if overrides then refuse_override_defaults(c, file_unit, f)
             if entry.static_member && !static_member_allowed(c, file_unit, f, c.classes[id].name, is_trait(c, id), overrides) then continue
@@ -3868,6 +3869,10 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
         // `Array` declares them.
         if name.starts_with("array_")
             if module_name != CoreModule then c.note(unit, f.name_span, s"`$name` is an intrinsic of the core library's arrays")
+        // The atomic operations are generic in the value held, and only `avin.threads.Atomic`
+        // declares them, as methods on the value that is its first field.
+        elif is_atomic_intrinsic(name)
+            if module_name != "avin.threads" then c.note(unit, f.name_span, s"`$name` is an intrinsic of `avin.threads.Atomic`")
         else
             intrinsic_signature(name) match
                 Some(expected) ->
@@ -3949,6 +3954,10 @@ private intrinsic_of(c: *Checker, unit: usize, f: &Function) -> Option[string]
             _ -> c.note(unit, a.span, "`@intrinsic` takes one string, the intrinsic's name")
         if f.body is Some(_) then c.note(unit, a.span, "an intrinsic function has no body")
     out
+
+/** Whether `name` is one of the operations of `avin.threads.Atomic`. */
+is_atomic_intrinsic(name: string) -> bool =
+    name == "atomic_load" || name == "atomic_store" || name == "atomic_swap" || name == "atomic_compare_set"
 
 /** The intrinsics the compiler implements, with the type each must be declared with. A method's
  * type takes its receiver first. */
@@ -4053,6 +4062,30 @@ intrinsic_entry(name: string) -> Option[(string, Buf[&Type], &Type)]
     elif name == "thread_current"
         entry = "avin_rt_thread_current"
         result = Int(64)
+    // A sleeping lock and a condition variable, each an opaque object on the collected heap.
+    elif name == "lock_new"
+        entry = "avin_rt_lock_new"
+        result = AnyType
+    elif name == "lock_acquire"
+        entry = "avin_rt_lock_acquire"
+        params.push(AnyType)
+    elif name == "lock_release"
+        entry = "avin_rt_lock_release"
+        params.push(AnyType)
+    elif name == "condition_new"
+        entry = "avin_rt_condition_new"
+        result = AnyType
+    elif name == "condition_wait"
+        // The condition, and the lock its waiter holds.
+        entry = "avin_rt_condition_wait"
+        params.push(AnyType)
+        params.push(AnyType)
+    elif name == "condition_notify"
+        entry = "avin_rt_condition_notify"
+        params.push(AnyType)
+    elif name == "condition_notify_all"
+        entry = "avin_rt_condition_notify_all"
+        params.push(AnyType)
     else return None
     Some((entry, params, result))
 
@@ -7504,6 +7537,9 @@ private repeated_element(t: &Type) -> &Type = *t match
  * read-only `FrozenArray` a vector keeps its elements in. Their methods may be array intrinsics. */
 private is_array_storage(k: ClassSymbol) -> bool =
     k.module_name == CoreModule && (k.name == "Array" || k.name == "FrozenArray") && !k.decl.object
+
+private is_atomic_storage(k: ClassSymbol) -> bool =
+    k.module_name == "avin.threads" && k.name == "Atomic" && !k.decl.object
 
 private is_array_type(c: *Checker, t: &Type) -> bool = *t match
     Class(k, _, _) -> is_array_class(c.classes[k])

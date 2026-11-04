@@ -1,0 +1,110 @@
+module avin.rt
+
+import sysl.raw.ptr_cast
+import sysl.sync.*
+import sysl.threads.{Condvar, SleepLock}
+
+// The waiting the synchronization library is built on: a lock that sleeps and a condition variable,
+// each the payload of an object on the collected heap, which the library keeps as an opaque `Any`.
+// The collector never moves an object, so a thread may sleep on a word inside one, and a thread that
+// sleeps keeps what it sleeps on as a root of its own until it wakes. A thread that has to wait is
+// safe for the collector while it waits, so it holds up no collection however long it sleeps.
+
+/** The descriptor of a lock: a `SleepLock`, holding no reference and naming no type record. */
+var lock_descriptor: Descriptor = descriptor(0, sizeof(SleepLock), 0)
+
+/** The descriptor of a condition: a `Condvar`, holding no reference and naming no type record. */
+var condition_descriptor: Descriptor = descriptor(0, sizeof(Condvar), 0)
+
+// A frame of two slots holding what a thread waits on, pushed on its context's stack for the wait, so
+// the objects stay alive while it sleeps on them whatever the program still holds.
+private struct Waiting
+    frame: Frame
+    first: *u8
+    second: *u8
+
+@assert(offsetof(Waiting, first) == offsetof(Waiting, frame) + sizeof(Frame), "a frame's slots follow its header")
+
+/** A new lock, free. */
+@export("avin_rt_lock_new")
+lock_new(ctx: *Context) -> *u8
+    val p = allocate(ctx, &lock_descriptor)
+    val l: *SleepLock = ptr_cast(p)
+    *l = SleepLock.new()
+    published(p)
+
+/** Takes the lock `p`, safe for the collector while it waits for another thread to let it go. */
+@export("avin_rt_lock_acquire")
+lock_acquire(ctx: *Context, p: *u8)
+    val l: *SleepLock = ptr_cast(p)
+    if l.try_lock() then return
+    var w = Waiting(Frame(ctx.top, 1), p, null)
+    ctx.top = &w.frame
+    enter_safe(ctx)
+    l.lock()
+    leave_safe(ctx)
+    ctx.top = w.frame.prev
+
+/** Lets the lock `p` go, which the calling thread holds. */
+@export("avin_rt_lock_release")
+lock_release(ctx: *Context, p: *u8)
+    val l: *SleepLock = ptr_cast(p)
+    l.unlock()
+
+/** A new condition, with no thread waiting on it. */
+@export("avin_rt_condition_new")
+condition_new(ctx: *Context) -> *u8
+    val p = allocate(ctx, &condition_descriptor)
+    val c: *Condvar = ptr_cast(p)
+    *c = Condvar.new()
+    published(p)
+
+/** Lets the lock `lock` go, which the calling thread holds, sleeps until the condition `p` is
+ * notified, and takes the lock again. The thread is safe for the collector from before it lets the
+ * lock go until it holds it again. A wait may also end with no notification, so the caller checks
+ * what it waits for again. */
+@export("avin_rt_condition_wait")
+condition_wait(ctx: *Context, p: *u8, lock: *u8)
+    val c: *Condvar = ptr_cast(p)
+    val l: *SleepLock = ptr_cast(lock)
+    var w = Waiting(Frame(ctx.top, 2), p, lock)
+    ctx.top = &w.frame
+    enter_safe(ctx)
+    c.wait_raw(l)
+    leave_safe(ctx)
+    ctx.top = w.frame.prev
+
+/** Wakes one thread waiting on the condition `p`, if any is. */
+@export("avin_rt_condition_notify")
+condition_notify(ctx: *Context, p: *u8)
+    val c: *Condvar = ptr_cast(p)
+    c.notify_one()
+
+/** Wakes every thread waiting on the condition `p`. */
+@export("avin_rt_condition_notify_all")
+condition_notify_all(ctx: *Context, p: *u8)
+    val c: *Condvar = ptr_cast(p)
+    c.notify_all()
+
+// Held for each operation on an `Atomic` whose value is wider than a word, which has no single atomic
+// access: every such operation takes this one lock, so each is indivisible from every other. No
+// operation under it allocates or waits for anything but the lock.
+private var wide_atomics: SpinLock = SpinLock(0)
+
+/** Begins an operation on an `Atomic` wider than a word. */
+@export("avin_rt_wide_atomic_begin")
+wide_atomic_begin()
+    wide_atomics.lock()
+
+/** Ends an operation on an `Atomic` wider than a word. */
+@export("avin_rt_wide_atomic_end")
+wide_atomic_end()
+    wide_atomics.unlock()
+
+/** `p`, an object the runtime has just made, once it is complete: a release fence makes every store
+ * before it, the object's header and contents, visible to another thread no later than any store
+ * after it, such as the one that hands the object over. Compiled code ends the making of its own
+ * objects the same way. */
+published(p: *u8) -> *u8
+    atomic_fence(Release)
+    p

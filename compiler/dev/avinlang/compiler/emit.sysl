@@ -438,6 +438,17 @@ private inst_operands(inst: Inst) -> Buf[Operand]
             out.push(value)
         Alloc(_, _) -> ()
         Publish -> ()
+        AtomicLoad(_, address) -> out.push(address)
+        AtomicStore(address, value) ->
+            out.push(address)
+            out.push(value)
+        AtomicSwap(_, address, value) ->
+            out.push(address)
+            out.push(value)
+        AtomicCompareSet(_, address, expected, desired) ->
+            out.push(address)
+            out.push(expected)
+            out.push(desired)
         Offset(_, base, _) -> out.push(base)
         Index(_, base, index) ->
             out.push(base)
@@ -613,6 +624,10 @@ private inst_dest(inst: Inst) -> Option[usize] = inst match
     Store(_, _) -> None
     Alloc(dest, _) -> Some(dest)
     Publish -> None
+    AtomicLoad(dest, _) -> Some(dest)
+    AtomicStore(_, _) -> None
+    AtomicSwap(dest, _, _) -> Some(dest)
+    AtomicCompareSet(dest, _, _, _) -> Some(dest)
     Offset(dest, _, _) -> Some(dest)
     Index(dest, _, _) -> Some(dest)
     DescriptorOf(dest, _) -> Some(dest)
@@ -732,6 +747,18 @@ private emit_inst(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgra
                 next += 1
             else out.push("  store " + typed_operand(program, f, value) + ", ptr " + operand(program, f, address) + alignment(operand_type(program, f, value)) + "\n")
         Publish -> out.push("  fence release\n")
+        AtomicLoad(dest, address) ->
+            emit_atomic_load(out, intrinsics, f.value_types[dest], s"%v$dest", operand(program, f, address))
+        AtomicStore(address, value) ->
+            emit_atomic_store(out, intrinsics, s"%t$next", operand_type(program, f, value), operand(program, f, value), operand(program, f, address))
+            next += 1
+        AtomicSwap(dest, address, value) ->
+            emit_atomic_swap(out, intrinsics, s"%t$next", f.value_types[dest], s"%v$dest", operand(program, f, value), operand(program, f, address))
+            next += 1
+        AtomicCompareSet(dest, address, expected, desired) ->
+            val t = operand_type(program, f, expected)
+            emit_atomic_compare_set(out, intrinsics, s"%t$next", t, s"%v$dest", operand(program, f, expected), operand(program, f, desired), operand(program, f, address))
+            next += 1
         Alloc(dest, descriptor) ->
             need(intrinsics, "declare ptr @avin_rt_alloc(ptr, ptr)")
             out.push(s"  %v$dest = call ptr @avin_rt_alloc(ptr %ctx, ptr @avin.desc.$descriptor)\n")
@@ -938,6 +965,99 @@ private store_shared(out: *StrBuilder, temp: string, t: MirType, value: string, 
         val raw = temp + ".raw"
         out.push(s"  $raw = zext $ty $value to i$w\n")
         out.push(s"  store atomic i$w $raw, ptr $address unordered, align ${w / 8}\n")
+
+// An `Atomic`'s value is accessed at its storage width, as a shared field is, and every access is
+// sequentially consistent. A real is accessed as the 64 bits of its encoding, since LLVM compares and
+// exchanges only integers and addresses, and a bool or a narrow integer is widened to its storage
+// width. An integer wider than 64 bits has no single atomic access on the machines Avin targets, so
+// every operation on one is made under the runtime's lock for wide atomics, which they all take.
+private atomic_type(t: MirType) -> string = t match
+    MRef -> "ptr"
+    _ -> s"i${storage_bits(t)}"
+
+private atomic_alignment(t: MirType) -> string = s"align ${storage_bits(t) / 8}"
+
+private is_wide(t: MirType) -> bool = t match
+    MInt(bits) -> bits > 64
+    _ -> false
+
+// Whether a value of `t` differs from the word it is stored as.
+private converts_to_word(t: MirType) -> bool = t match
+    MReal -> true
+    MBool -> true
+    MInt(bits) -> bits != storage_bits(t)
+    _ -> false
+
+// `value` as the word it is stored as, in a temporary named `temp` where it needs converting.
+private to_word(out: *StrBuilder, temp: string, t: MirType, value: string) -> string
+    if !converts_to_word(t) then return value
+    if t is MReal then out.push(s"  $temp = bitcast double $value to i64\n")
+    else out.push(s"  $temp = zext ${llvm_type(t)} $value to i${storage_bits(t)}\n")
+    temp
+
+// Where an access yielding a value of `t` into `dest` puts the word it reads.
+private word_dest(t: MirType, dest: string) -> string = if converts_to_word(t) then dest + ".word" else dest
+
+// Makes `dest` the value of the word an access put at `word_dest`.
+private from_word(out: *StrBuilder, t: MirType, dest: string)
+    if !converts_to_word(t) then return
+    val word = dest + ".word"
+    if t is MReal then out.push(s"  $dest = bitcast i64 $word to double\n")
+    else out.push(s"  $dest = trunc i${storage_bits(t)} $word to ${llvm_type(t)}\n")
+
+// Takes or gives back the runtime's lock for atomics wider than a word.
+private wide_atomic(out: *StrBuilder, intrinsics: *Buf[string], step: string)
+    need(intrinsics, s"declare void @avin_rt_wide_atomic_$step()")
+    out.push(s"  call void @avin_rt_wide_atomic_$step()\n")
+
+private emit_atomic_load(out: *StrBuilder, intrinsics: *Buf[string], t: MirType, dest: string, address: string)
+    if is_wide(t)
+        wide_atomic(out, intrinsics, "begin")
+        load_shared(out, dest, t, address)
+        wide_atomic(out, intrinsics, "end")
+        return
+    out.push(s"  ${word_dest(t, dest)} = load atomic ${atomic_type(t)}, ptr $address seq_cst, ${atomic_alignment(t)}\n")
+    from_word(out, t, dest)
+
+private emit_atomic_store(out: *StrBuilder, intrinsics: *Buf[string], temp: string, t: MirType, value: string, address: string)
+    if is_wide(t)
+        wide_atomic(out, intrinsics, "begin")
+        store_shared(out, temp, t, value, address)
+        wide_atomic(out, intrinsics, "end")
+        return
+    val word = to_word(out, temp + ".in", t, value)
+    out.push(s"  store atomic ${atomic_type(t)} $word, ptr $address seq_cst, ${atomic_alignment(t)}\n")
+
+private emit_atomic_swap(out: *StrBuilder, intrinsics: *Buf[string], temp: string, t: MirType, dest: string, value: string, address: string)
+    if is_wide(t)
+        wide_atomic(out, intrinsics, "begin")
+        load_shared(out, dest, t, address)
+        store_shared(out, temp, t, value, address)
+        wide_atomic(out, intrinsics, "end")
+        return
+    val word = to_word(out, temp + ".in", t, value)
+    out.push(s"  ${word_dest(t, dest)} = atomicrmw xchg ptr $address, ${atomic_type(t)} $word seq_cst, ${atomic_alignment(t)}\n")
+    from_word(out, t, dest)
+
+// A compare-and-set compares the stored words: the same object for a reference, the same bits for a
+// scalar.
+private emit_atomic_compare_set(out: *StrBuilder, intrinsics: *Buf[string], temp: string, t: MirType, dest: string, expected: string, desired: string, address: string)
+    if is_wide(t)
+        val ty = llvm_type(t)
+        val seen = temp + ".seen"
+        val kept = temp + ".kept"
+        wide_atomic(out, intrinsics, "begin")
+        load_shared(out, seen, t, address)
+        out.push(s"  $dest = icmp eq $ty $seen, $expected\n")
+        out.push(s"  $kept = select i1 $dest, $ty $desired, $ty $seen\n")
+        store_shared(out, temp, t, kept, address)
+        wide_atomic(out, intrinsics, "end")
+        return
+    val ty = atomic_type(t)
+    val e = to_word(out, temp + ".e", t, expected)
+    val d = to_word(out, temp + ".d", t, desired)
+    out.push(s"  $temp = cmpxchg ptr $address, $ty $e, $ty $d seq_cst seq_cst, ${atomic_alignment(t)}\n")
+    out.push(s"  $dest = extractvalue { $ty, i1 } $temp, 1\n")
 
 // Fields sit at multiples of 8 bytes, so an integer wider than 64 bits is accessed at that alignment
 // rather than its natural one; every other type's natural alignment is at most 8.

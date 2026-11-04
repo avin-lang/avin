@@ -1,0 +1,67 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// The code of `avin.threads.Atomic`: each operation is one sequentially consistent LLVM atomic made at
+// the width the value is laid out at, a real as the 64 bits of its encoding, and a value wider than
+// 64 bits under the runtime's lock for wide atomics.
+
+private const Probe: string = "import avin.threads.Atomic\n\nclass Node(val n: int)\n\nmain()\n    val a = Atomic(long(1))\n    val b = Atomic(true)\n    val c = Atomic(i5(3))\n    val r = Atomic(0.5)\n    val first = Node(1)\n    val o = Atomic(first)\n    val w = Atomic(i128(7))\n    a.store(a.load() + 1)\n    print(a.swap(5))\n    print(a.compareAndSet(5, 6))\n    print(b.compareAndSet(true, false))\n    print(c.swap(i5(1)))\n    print(r.compareAndSet(0.5, 0.25))\n    print(o.compareAndSet(first, Node(2)))\n    print(w.swap(i128(8)))\n"
+
+private probe_main() -> Buf[string]
+    val program = lower_source(repository_toolchain(), source_of("probe.avin", Probe)) match
+        Ok(p) -> p
+        Err(d) -> panic(d)
+    val ir = emit_llvm(program)
+    var out: Buf[string] = buf()
+    var inside = false
+    for line in ir.split("\n")
+        if line.starts_with("define ") && line.contains("@\"<program>.main\"(") then inside = true
+        elif inside
+            if line == "}" then return out
+            out.push(line)
+    out
+
+private has(lines: Buf[string], parts: []string) -> bool
+    for line in lines
+        var all = true
+        for p in parts
+            if !line.contains(p) then all = false
+        if all then return true
+    false
+
+private shown(lines: Buf[string]) -> string
+    var out = ""
+    for line in lines
+        out = out + line + "\n"
+    out
+
+@test("an Atomic of a long is loaded, stored, swapped and compared-and-set sequentially consistently")
+long_atomics_are_seq_cst()
+    val main = probe_main()
+    assert(has(main, ["= load atomic i64, ptr ", "seq_cst, align 8"]), shown(main))
+    assert(has(main, ["store atomic i64 ", "seq_cst, align 8"]), shown(main))
+    assert(has(main, ["= atomicrmw xchg ptr ", ", i64 ", "seq_cst, align 8"]), shown(main))
+    assert(has(main, ["= cmpxchg ptr ", ", i64 ", "seq_cst seq_cst, align 8"]), shown(main))
+
+@test("an Atomic of a bool or a narrow integer is accessed at its storage width")
+narrow_atomics_use_storage_width()
+    val main = probe_main()
+    assert(has(main, ["= cmpxchg ptr ", ", i8 ", "seq_cst seq_cst, align 1"]), shown(main))
+    assert(has(main, ["= atomicrmw xchg ptr ", ", i8 ", "seq_cst, align 1"]), shown(main))
+    assert(!has(main, ["cmpxchg ptr ", " i1 "]) && !has(main, ["xchg ptr ", " i5 "]), shown(main))
+
+@test("an Atomic of a real compares the 64 bits of its encoding, and one of a reference the address")
+real_and_reference_atomics()
+    val main = probe_main()
+    assert(has(main, ["= bitcast double ", " to i64"]), shown(main))
+    assert(has(main, ["= cmpxchg ptr ", ", ptr ", "seq_cst seq_cst, align 8"]), shown(main))
+
+@test("an Atomic wider than 64 bits is accessed under the runtime's lock for wide atomics")
+wide_atomics_take_the_lock()
+    val main = probe_main()
+    assert(has(main, ["call void @avin_rt_wide_atomic_begin()"]), shown(main))
+    assert(has(main, ["call void @avin_rt_wide_atomic_end()"]), shown(main))
+    assert(!has(main, ["atomic i128"]) && !has(main, ["xchg ptr ", " i128 "]), shown(main))
