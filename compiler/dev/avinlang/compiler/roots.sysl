@@ -1,0 +1,409 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+
+// Which references a function keeps in its frame on the shadow stack.
+//
+// The collector runs only at a collection point: an allocation, a call that may collect, and a
+// safepoint poll. A reference needs a frame slot only if it is live across one of them, defined
+// before it and used after it, since that is the only kind of place where the collector reads the
+// frame while the function still needs the reference. A function whose references are never live
+// across a collection point has no frame at all.
+//
+// Two references that are never live at once share a slot. Each reference is stored to its slot
+// where it is made, and every slot the collector might read before anything is stored to it on some
+// path is set to null on entry; the rest are not touched there. A slot whose reference has died
+// still holds a valid reference until the next store: the object stays reachable through it, so the
+// collector never meets a dangling pointer. Collection is never moving, so a stale slot only keeps
+// garbage alive a little longer.
+//
+// An address computed from a reference, a field's or a byte's, keeps the object alive as long as the
+// address is in use: a use of the address counts as a use of the reference it was computed from.
+//
+// A call of one of the program's functions passes its references in registers; the callee keeps in
+// its own frame those it still needs across its own collection points. A runtime entry point that
+// may collect is given references the caller still holds as roots, so those are live across that
+// call.
+
+/** Where a function keeps the references the collector must find. */
+struct RootPlan
+    /** The number of slots of the function's frame; 0 means the function has no frame. */
+    cells: usize
+    /** For each value, the frame slot it is stored to where it is made, if it needs one. */
+    value_cells: Buf[Option[usize]]
+    /** For each local slot of reference type, the frame slot that is its storage, if it has one;
+     * every other local slot is the function's own, outside the frame. */
+    slot_cells: Buf[Option[usize]]
+    /** For each frame slot, whether it is set to null on entry. */
+    zeroed: Buf[bool]
+    /** For each local slot of reference type outside the frame, whether it is set to null on entry,
+     * because it may be read before it is written. */
+    slot_zeroed: Buf[bool]
+
+/** The runtime entry points that never allocate, never poll and never block, so that no collection
+ * can run while one is called. Every other entry point, and every shim of a Sysl binding, may. */
+private runtime_collects(symbol: string) -> bool
+    val quiet = ["avin_rt_conforms", "avin_rt_string_compare", "avin_rt_string_find",
+        "avin_rt_string_parse_real", "avin_rt_string_hash", "avin_rt_identity_hash",
+        "avin_rt_real_hash", "avin_rt_array_clear"]
+    for q in quiet
+        if q == symbol then return false
+    true
+
+/** For each function of the program, whether calling it may run the collector: it allocates, polls,
+ * calls through a function value, calls a runtime entry point that may collect, or calls a function
+ * that may. A function with a loop or one that may recurse polls. */
+collecting_functions(program: MirProgram, graph: CallGraph) -> Buf[bool]
+    val n = program.functions.len()
+    var collects: Buf[bool] = buf()
+    for index in 0..<n
+        val f = program.functions[index]
+        var found = false
+        for back in back_edges(f)
+            if back then found = true
+        for block in f.blocks
+            for inst in block.insts
+                if closes_cycle(graph, index, inst) then found = true
+                inst match
+                    Alloc(_, _) -> found = true
+                    Call(_, Indirect(_, _), _) -> found = true
+                    Call(_, Runtime(symbol, _), _) ->
+                        if runtime_collects(symbol) then found = true
+                    _ -> ()
+        collects.push(found)
+    var changed = true
+    while changed
+        changed = false
+        for index in 0..<n
+            if collects[index] then continue
+            for block in program.functions[index].blocks
+                for inst in block.insts
+                    if inst is Call(_, Direct(g), _)
+                        if collects[g] && !collects[index]
+                            collects[index] = true
+                            changed = true
+    collects
+
+// How an instruction lets the collector run: 0 not at all; 1 during it, with the values live after
+// it as the roots, as a call of a function or an allocation does; 2 during it, with the values live
+// before it too, as a runtime entry point that reads its arguments after collecting does.
+private collection_kind(collects: Buf[bool], inst: Inst) -> u8 = inst match
+    Alloc(_, _) -> 1
+    Call(_, Direct(g), _) -> if collects[g] then 1 else 0
+    Call(_, Indirect(_, _), _) -> 1
+    Call(_, Runtime(symbol, _), _) -> if runtime_collects(symbol) then 2 else 0
+    _ -> 0
+
+// Sets of the function's tracked variables, `words` 64-bit words each, stored one after another.
+private has(bits: Buf[u64], set: usize, words: usize, v: usize) -> bool =
+    (bits[set * words + v / 64] & (1u64 << u64(v % 64))) != 0u64
+
+private add(bits: *Buf[u64], set: usize, words: usize, v: usize)
+    val i = set * words + v / 64
+    (*bits)[i] = (*bits)[i] | (1u64 << u64(v % 64))
+
+private remove(bits: *Buf[u64], set: usize, words: usize, v: usize)
+    val i = set * words + v / 64
+    (*bits)[i] = (*bits)[i] & ~(1u64 << u64(v % 64))
+
+/** The tracked variables a use of `o` reads: the reference itself, and the reference an address was
+ * computed from. */
+private operand_vars(o: Operand, value_var: Buf[Option[usize]], base_var: Buf[Option[usize]]) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    if o is Value(v)
+        if value_var[v] is Some(x) then out.push(x)
+        if base_var[v] is Some(x) then out.push(x)
+    out
+
+/** The tracked variables `inst` reads. Reading a local slot of reference type reads its variable;
+ * the slot's address itself is not a use. */
+private inst_uses(inst: Inst, value_var: Buf[Option[usize]], base_var: Buf[Option[usize]], slot_var: Buf[Option[usize]]) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    val operands = inst_operands(inst)
+    for k in 0..<operands.len()
+        val o = operands[k]
+        if k == 0 && o is SlotAddress(s)
+            if inst is Load(_, _)
+                if slot_var[s] is Some(x) then out.push(x)
+                continue
+            if inst is Store(_, _) then continue
+        for x in operand_vars(o, value_var, base_var)
+            out.push(x)
+    out
+
+/** The tracked variable `inst` writes: the reference it defines, or the local slot it stores to. */
+private inst_def(inst: Inst, value_var: Buf[Option[usize]], slot_var: Buf[Option[usize]]) -> Option[usize]
+    if inst is Store(SlotAddress(s), _) then return slot_var[s]
+    inst_dest(inst) match
+        Some(d) -> value_var[d]
+        None -> None
+
+private term_uses(term: Terminator, value_var: Buf[Option[usize]], base_var: Buf[Option[usize]]) -> Buf[usize]
+    term match
+        Return(Some(o)) -> operand_vars(o, value_var, base_var)
+        Branch(o, _, _) -> operand_vars(o, value_var, base_var)
+        _ -> buf()
+
+/** The frame of function `index`: which of its references are live across a collection point, the
+ * slot each one is kept in, and which slots start null. */
+plan_roots(program: MirProgram, graph: CallGraph, collects: Buf[bool], index: usize) -> RootPlan
+    val f = program.functions[index]
+    val nb = f.blocks.len()
+    // The tracked variables: every value of reference type, then every local slot of reference type
+    // that is only read and written, never given away by its address.
+    var escaped: Buf[bool] = buf()
+    for _ in f.slots do escaped.push(false)
+    for block in f.blocks
+        for inst in block.insts
+            val operands = inst_operands(inst)
+            for k in 0..<operands.len()
+                if operands[k] is SlotAddress(s)
+                    val direct = k == 0 && (inst is Load(_, _) || inst is Store(_, _))
+                    if !direct then escaped[s] = true
+        block.term match
+            Return(Some(SlotAddress(s))) -> escaped[s] = true
+            _ -> ()
+    var count = 0usize
+    var value_var: Buf[Option[usize]] = buf()
+    for t in f.value_types
+        if t is MRef
+            value_var.push(Some(count))
+            count += 1
+        else value_var.push(None)
+    var var_value: Buf[Option[usize]] = buf()
+    var var_slot: Buf[Option[usize]] = buf()
+    for v in 0..<f.value_types.len()
+        if value_var[v] is Some(_)
+            var_value.push(Some(v))
+            var_slot.push(None)
+    var slot_var: Buf[Option[usize]] = buf()
+    for s in 0..<f.slots.len()
+        if f.slots[s] is MRef && !escaped[s]
+            slot_var.push(Some(count))
+            var_value.push(None)
+            var_slot.push(Some(s))
+            count += 1
+        else slot_var.push(None)
+    // The reference each address was computed from.
+    var base_var: Buf[Option[usize]] = buf()
+    for _ in f.value_types do base_var.push(None)
+    var moved = true
+    while moved
+        moved = false
+        for block in f.blocks
+            for inst in block.insts
+                val dest = inst match
+                    Offset(d, Value(_), _) -> d
+                    Index(d, Value(_), _) -> d
+                    _ -> continue
+                val b = inst match
+                    Offset(_, Value(v), _) -> v
+                    Index(_, Value(v), _) -> v
+                    _ -> continue
+                val root = if value_var[b] is Some(x) then Some(x) else base_var[b]
+                if root is Some(r) && base_var[dest] is None
+                    base_var[dest] = Some(r)
+                    moved = true
+    val words = (count + 63) / 64
+    // Liveness, backward over the blocks: what each block reads before writing, and writes.
+    var gen: Buf[u64] = buf()
+    var kill: Buf[u64] = buf()
+    var live_in: Buf[u64] = buf()
+    var live_out: Buf[u64] = buf()
+    for _ in 0..<nb * words
+        gen.push(0u64)
+        kill.push(0u64)
+        live_in.push(0u64)
+        live_out.push(0u64)
+    for b in 0..<nb
+        val block = f.blocks[b]
+        for x in term_uses(block.term, value_var, base_var) do add(&gen, b, words, x)
+        var i = block.insts.len()
+        while i > 0
+            i -= 1
+            val inst = block.insts[i]
+            if inst_def(inst, value_var, slot_var) is Some(x)
+                remove(&gen, b, words, x)
+                add(&kill, b, words, x)
+            for x in inst_uses(inst, value_var, base_var, slot_var) do add(&gen, b, words, x)
+    var changed = true
+    while changed
+        changed = false
+        var b = nb
+        while b > 0
+            b -= 1
+            for w in 0..<words
+                var out = 0u64
+                for s in successors(f.blocks[b].term)
+                    out = out | live_in[s * words + w]
+                val into = gen[b * words + w] | (out & ~kill[b * words + w])
+                if out != live_out[b * words + w] || into != live_in[b * words + w]
+                    live_out[b * words + w] = out
+                    live_in[b * words + w] = into
+                    changed = true
+    // Each variable's extent over the blocks laid end to end, and whether it is live across a
+    // collection point.
+    val back = back_edges(f)
+    val polled_on_entry = polled_before(graph, index, f)
+    var first: Buf[usize] = buf()
+    var last: Buf[usize] = buf()
+    var needed: Buf[bool] = buf()
+    for _ in 0..<count
+        first.push(1usize << 62)
+        last.push(0)
+        needed.push(false)
+    var block_start: Buf[usize] = buf()
+    var position = 0usize
+    for block in f.blocks
+        block_start.push(position)
+        position += block.insts.len() + 2
+    var live: Buf[u64] = buf()
+    for _ in 0..<words do live.push(0u64)
+    for b in 0..<nb
+        val block = f.blocks[b]
+        // The instruction a poll is placed before, as code generation places it.
+        var poll_at = block.insts.len()
+        if !polled_on_entry[b]
+            for i in 0..<block.insts.len()
+                if poll_at == block.insts.len() && closes_cycle(graph, index, block.insts[i]) then poll_at = i
+        val end = block_start[b] + block.insts.len() + 1
+        for w in 0..<words do live[w] = live_out[b * words + w]
+        for x in term_uses(block.term, value_var, base_var) do add(&live, 0, words, x)
+        for x in 0..<count
+            if has(live, 0, words, x)
+                if end > last[x] then last[x] = end
+                if end < first[x] then first[x] = end
+                if back[b] then needed[x] = true
+        var i = block.insts.len()
+        while i > 0
+            i -= 1
+            val inst = block.insts[i]
+            val at = block_start[b] + 1 + i
+            val def = inst_def(inst, value_var, slot_var)
+            val kind = collection_kind(collects, inst)
+            if kind == 1
+                for x in 0..<count
+                    if has(live, 0, words, x) && def != Some(x) then needed[x] = true
+            if def is Some(x)
+                remove(&live, 0, words, x)
+                if at > last[x] then last[x] = at
+                if at < first[x] then first[x] = at
+            for x in inst_uses(inst, value_var, base_var, slot_var)
+                add(&live, 0, words, x)
+                if at > last[x] then last[x] = at
+                if at < first[x] then first[x] = at
+            if kind == 2 || i == poll_at
+                for x in 0..<count
+                    if has(live, 0, words, x) then needed[x] = true
+        for x in 0..<count
+            if has(live, 0, words, x) && block_start[b] < first[x] then first[x] = block_start[b]
+    // The frame's slots: one of its own for each local slot whose address is given away, then shared
+    // slots for the rest, given out in the order the variables' extents begin, each to a variable
+    // whose extent begins after the extent of the slot's last variable ended. A local slot is written
+    // only within its extent, as a value is, so two variables whose extents do not overlap never
+    // overwrite what the other still needs.
+    var cells = 0usize
+    var slot_cells: Buf[Option[usize]] = buf()
+    for s in 0..<f.slots.len()
+        if f.slots[s] is MRef && escaped[s]
+            slot_cells.push(Some(cells))
+            cells += 1
+        else slot_cells.push(None)
+    val own = cells
+    var value_cells: Buf[Option[usize]] = buf()
+    for _ in f.value_types do value_cells.push(None)
+    var starts: Buf[usize] = buf()
+    for _ in 0..<position + 1 do starts.push(0)
+    for x in 0..<count
+        if needed[x] then starts[first[x]] += 1
+    var total = 0usize
+    for p in 0..<position + 1
+        val k = starts[p]
+        starts[p] = total
+        total += k
+    var order: Buf[usize] = buf()
+    for _ in 0..<total do order.push(0)
+    for x in 0..<count
+        if needed[x]
+            order[starts[first[x]]] = x
+            starts[first[x]] += 1
+    var ends: Buf[usize] = buf()
+    for x in order
+        var cell = ends.len()
+        for c in 0..<ends.len()
+            if cell == ends.len() && ends[c] < first[x] then cell = c
+        if cell == ends.len() then ends.push(last[x]) else ends[cell] = last[x]
+        if var_value[x] is Some(v) then value_cells[v] = Some(own + cell)
+        if var_slot[x] is Some(s) then slot_cells[s] = Some(own + cell)
+    cells += ends.len()
+    // Which slots the collector might read before anything is stored to them: forward over the
+    // blocks, a slot is written at a point when every path from the entry to it stores to it.
+    var zeroed: Buf[bool] = buf()
+    for _ in 0..<cells do zeroed.push(false)
+    var slot_zeroed: Buf[bool] = buf()
+    for _ in f.slots do slot_zeroed.push(false)
+    for s in 0..<f.slots.len()
+        if slot_cells[s] is Some(c) && escaped[s] then zeroed[c] = true
+        if slot_var[s] is Some(x) && nb > 0 && has(live_in, 0, words, x)
+            slot_cells[s] match
+                Some(c) -> zeroed[c] = true
+                None -> slot_zeroed[s] = true
+    if cells > 0
+        var preds: Buf[Buf[usize]] = buf()
+        for _ in 0..<nb do preds.push(buf())
+        for b in 0..<nb
+            for s in successors(f.blocks[b].term) do preds[s].push(b)
+        var written_in: Buf[bool] = buf()
+        var written_out: Buf[bool] = buf()
+        for b in 0..<nb
+            for c in 0..<cells
+                written_in.push(b != 0)
+                written_out.push(true)
+        for p in 0..<f.signature.params.len()
+            if value_cells[p] is Some(c) then written_in[c] = true
+        var flowing = true
+        while flowing
+            flowing = false
+            for b in 0..<nb
+                var state: Buf[bool] = buf()
+                for c in 0..<cells
+                    var on = written_in[b * cells + c]
+                    if b != 0
+                        on = true
+                        for p in preds[b]
+                            if !written_out[p * cells + c] then on = false
+                    if on != written_in[b * cells + c]
+                        written_in[b * cells + c] = on
+                        flowing = true
+                    state.push(on)
+                for inst in f.blocks[b].insts
+                    if cell_written(inst, value_cells, slot_cells) is Some(c) then state[c] = true
+                for c in 0..<cells
+                    if state[c] != written_out[b * cells + c]
+                        written_out[b * cells + c] = state[c]
+                        flowing = true
+        for b in 0..<nb
+            val block = f.blocks[b]
+            var poll_at = block.insts.len()
+            if !polled_on_entry[b]
+                for i in 0..<block.insts.len()
+                    if poll_at == block.insts.len() && closes_cycle(graph, index, block.insts[i]) then poll_at = i
+            var state: Buf[bool] = buf()
+            for c in 0..<cells do state.push(written_in[b * cells + c])
+            for i in 0..<block.insts.len()
+                val inst = block.insts[i]
+                if collection_kind(collects, inst) != 0 || i == poll_at
+                    for c in 0..<cells
+                        if !state[c] then zeroed[c] = true
+                if cell_written(inst, value_cells, slot_cells) is Some(c) then state[c] = true
+            if back[b]
+                for c in 0..<cells
+                    if !state[c] then zeroed[c] = true
+    RootPlan(cells, value_cells, slot_cells, zeroed, slot_zeroed)
+
+/** The frame slot `inst` stores a reference to, if any. */
+private cell_written(inst: Inst, value_cells: Buf[Option[usize]], slot_cells: Buf[Option[usize]]) -> Option[usize]
+    if inst is Store(SlotAddress(s), _) then return slot_cells[s]
+    inst_dest(inst) match
+        Some(d) -> value_cells[d]
+        None -> None

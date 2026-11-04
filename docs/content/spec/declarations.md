@@ -131,6 +131,14 @@ Choosing an overload works as follows:
   `f(x: -> int)` and `f(x: int)` are the same parameter types. An argument that some candidate takes
   by name is delayed, as that candidate needs it; when the chosen overload takes it strictly, it is
   evaluated once, at the call.
+- **Repeated parameters.** An overload with a [repeated parameter](#repeated-parameters) is a
+  candidate only where no overload without one accepts the call: `describe(n: int)` beside
+  `describe(ns: int*)` takes `describe(1)`, and `pick(x: long)` beside `pick(xs: int*)` takes
+  `pick(1)`, though the repeated one would take the literal as its own type. Among the candidates
+  with one, each argument given to it is compared by the element type, so `kind(xs: int*)` and
+  `kind(xs: string*)` are told apart by `kind(1, 2)` and `kind("a")`; `kind()` is ambiguous. Inside
+  the function the parameter is a vector, so `f(xs: int*)` and `f(xs: Vector[int])` have the same
+  parameter types.
 - **Scopes.** Overloads are the functions of one name in one scope: the top-level functions of one
   file, or the local functions of one block. A block's local functions of a name hide every outer
   function of that name, whatever their parameter types, and a program's own top-level functions of
@@ -142,8 +150,58 @@ Choosing an overload works as follows:
 Two declarations with the same name and the **same** parameter types are an error: a function that
 chooses by its arguments' values is written with clauses, described next.
 
-Variadic parameters are final and written `values: T*`. A call passes zero or more `T`s, or splices
-an existing sequence with `f(xs*)`.
+### Repeated parameters
+
+```text
+total(values: int*) -> int
+    var sum = 0
+    for v in values do sum += v
+    sum
+
+total()                                 // 0
+total(1, 2, 3)                          // 6
+val xs = [4, 5]
+total(xs*)                              // 9
+total((1..10)*)                         // 55
+max(0, xs*)                             // 5
+```
+
+A parameter written `values: T*` is **repeated** (variadic): a call gives it zero or more `T`s, and
+inside the function it is a `Vector[T]` of them, in the order written. The rules:
+
+- **It is the last parameter**, and there is at most one. It has a name, no default (a call that
+  gives it nothing passes an empty vector), and is not [by-name](/spec/by-name/). The parameters
+  before it may have defaults: `framed(left: string = "[", right: string = "]", items: int*)` is
+  called `framed()`, `framed("<", ">", 1, 2)` or `framed(right = ")")`.
+- **Its arguments are positional.** Every positional argument from its position on is one element,
+  checked against `T` like any argument, so a literal takes `T` and a lambda its parameter types
+  from it, and a generic `T` is inferred from them as from any arguments:
+  `max[T: Ord](first: T, rest: T*)` is called `max(3, 9, 4)`. A repeated parameter cannot be named
+  at a call, and the call's named arguments, which follow its positional ones, name only the
+  parameters before it.
+- **`xs*` splices a sequence**: written as the call's last argument, in the repeated parameter's
+  position, it passes the elements of `xs`, which is any `Iterable[T]`: a vector, a list, an array,
+  a range, a set. A `Vector[T]` is passed as it is; any other sequence is copied into a new vector.
+  The spliced sequence is the parameter's only argument: `f(1, 2, xs*)` gives the parameter both
+  `1, 2` and `xs`, and is an error, as is `xs*` given to a parameter that is not repeated, written
+  before another argument, named, or anywhere but a call's argument list. Writing the other
+  elements into the sequence, `f(([1, 2] ++ xs)*)`, says the same thing. The `*` binds as
+  multiplication does, so a spliced expression of a looser operator is parenthesized.
+- **The arguments are evaluated in the order written**, as any call's are, and the vector is made
+  from them before the call.
+- **Methods and constructors** take one the same way: a method of a class, a trait or an impl, a
+  method of an object, a local function, a function defined by clauses (whose clauses match the
+  vector: `f([]) = …`, `f([x]) = …`), and a class's constructor, whose field is then a vector:
+  `class Path(val parts: string*)` is made by `Path("usr", "bin")`, and a subclass passes its
+  superclass's repeated argument on with `: Path(parts*)`. A `data` field cannot be repeated. An
+  override, and a method implementing a trait's, repeats the same last parameter as the method it
+  overrides, or neither does.
+- **As a value**, a function with a repeated parameter takes the vector itself:
+  `val f: (Vector[int]) -> int = total` is called `f([1, 2])`, since a function value is called with
+  all of its arguments by position.
+- **Called infix**, a method whose parameters are a repeated one, or one required parameter and a
+  repeated one, takes the one argument: `w surround "!"` calls `w.surround("!")`.
+- **`main`** takes no repeated parameter: its one parameter is `args: Vector[string]`.
 
 ### Clauses
 
@@ -490,9 +548,11 @@ impl Shape
     perimeter() -> real = …
 ```
 
-`impl Type` without a trait adds methods to a type declared in the same module. An `impl` lives in
-the module of the trait or of the type; the built-in types belong to the core library's module,
-`avin`, which is where `impl string` is written. Declaring a trait in a class's header and writing a
+`impl Type` without a trait adds methods to a type, and may be written in any module: in the type's
+own module its methods are the type's, and in another module the impl is an **extension**, whose
+methods are seen where that module is imported (below). A conformance, `impl Trait for Type`, lives in
+the module of the trait or of the type, so a type has one answer to it everywhere; the built-in types
+belong to the core library's module, `avin`. Declaring a trait in a class's header and writing a
 separate `impl` for it are the same conformance; it may be stated once.
 
 `impl` is how Avin expresses type classes (`Ord`, `Hash`, `Display`) and adds methods to types you
@@ -504,10 +564,10 @@ trait's default bodies, which every conforming object shares, do not reach it: a
 built-in type implements every method of the trait, defaults included.
 
 - **An impl adds methods, never state.** Its body declares methods only: no fields and no
-  statements. A method an impl adds to a class or an object is one of its methods, as if the class's
-  body declared it: it sees the private fields, is inherited by a subclass, and a subclass may
-  override it. A method with the name and parameter types of one the type already has is an error;
-  one with other parameter types overloads it.
+  statements. A method an impl in a class's or an object's module adds to it is one of its methods,
+  as if the class's body declared it: it sees the private fields, is inherited by a subclass, and a
+  subclass may override it. A method with the name and parameter types of one the type already has
+  is an error; one with other parameter types overloads it.
 - **Inside an impl's methods the receiver is implicit**, as in a class: `self` is the value, the
   type's methods are in scope by bare name, and so are the fields of a `data` type with one variant,
   the fields `self.name` reaches. A type with several variants takes `self` apart with `match`.
@@ -524,7 +584,28 @@ built-in type implements every method of the trait, defaults included.
   the data type itself is direct.
 - **A generic impl names the type's parameters**, in order: `impl[T] Show for Box[T]`,
   `impl[K, V] Map[K, V]`. The names are the impl's own and need not be the declaration's. An impl
-  for particular type arguments (`impl Show for Box[int]`) is not part of the language.
+  of a trait always does: a conformance holds for every instance of a type, so an impl of a trait
+  for particular type arguments (`impl Show for Box[int]`) or for a type built from its parameters
+  (`impl[T] Show for Box[List[T]]`) is an error, and no two conformances of one type can overlap.
+- **An impl without `for` may add methods to any type built from its parameters**:
+  `impl[T] Option[Option[T]]`, `impl[A, B] Pair[A, List[B]]`, and, adding to a trait,
+  `impl[T] Seq[Seq[T]]` and `impl[K, V] Iterable[(K, V)]`. Each of its parameters is part of that
+  type, so a call learns them from the receiver; one that is not is an error. The type is matched
+  against the receiver's static type: `Option[Option[int]]` matches `Option[Option[T]]` with `T` as
+  `int`, and `flatten` on an `Option[int]` is an error saying what the receiver would need to be
+  ("`flatten` is for an `Option` of an `Option`; this is `Option[int]`"). Where a part of the type is
+  covariant, a reference matches through its traits and superclasses, as it would be passed:
+  a `Vector[List[int]]` is a `Seq[Seq[int]]`, with `T` as `int`. Elsewhere a part matches only its
+  own type, and a parameter written twice (`impl[T] Pair[T, T]`, `impl[T, E] Result[Result[T, E],
+  E]`) takes one type. The impl's bounds apply as for any impl: with `impl[A: Ord, B] Seq[(A, B)]`,
+  a sequence of pairs whose first parts are not ordered lacks its methods. Inside the methods `self`
+  has the type the impl names (or, adding to a trait, is a `Self` of it), and the methods are
+  called directly, as other added methods are.
+- **Two impls whose types both match a receiver** and that add a method of one name and parameter
+  types make a call of it an error, as two traits' added methods do; so does a method of the type's
+  own with the name and parameter types of one an impl adds to a type built from its parameters.
+  Impls whose types no receiver matches both, as `Box[List[T]]` and `Box[Option[T]]`, may add
+  methods of one name and parameter types, and the receiver says which is called.
 - **An impl may bound the type's parameters further** (`impl[T: Display] List[T]`,
   `impl[T: Ord] Ord for Box[T]`), and then holds only for the type arguments that meet the bounds:
   the trait's conformance, or the methods it adds. Calling one of those methods on an instance that
@@ -532,7 +613,7 @@ built-in type implements every method of the trait, defaults included.
 - A method added to a built-in type (`impl string`, `impl int`) is called on a value of that type,
   `"hi".shout()`, `7.squared()`.
 - **An impl without `for` whose type is a trait adds methods to the trait** (`impl[T] Seq[T]`,
-  `impl[T: Display] Seq[T]`), in the trait's module. Every value whose type conforms to the trait has
+  `impl[T: Display] Seq[T]`). Every value whose type conforms to the trait has
   them: a class or `data` type implementing it, the trait's own type, a type parameter it bounds.
   Inside them `self` is the value and `Self` its type; the trait's methods, and those other impls add
   to it, are in scope by bare name. They reach the value only through the trait's methods, so they
@@ -554,6 +635,52 @@ impl[T] Seq[T]
 
 present[T](xs: Seq[T], x: T) -> bool = xs.contains(x)
 ```
+
+### Extensions
+
+An impl without `for` written outside the module of the type or trait it adds to is an
+**extension**. Every form above may be one: `impl string`, `impl[T: Ord] Seq[T]`,
+`impl[T] Option[Option[T]]`, `impl Box` for a class another module declares.
+
+```text
+// words/words.avin
+module words
+
+impl string
+    shout() -> string = s"${self}!"
+
+impl[T: Ord] Seq[T]
+    median() -> T = sorted().apply(length() / 2)
+
+// main.avin
+import words
+
+main() = print("hey".shout())       // hey!
+```
+
+- **An extension's methods are seen by its own module and by every file that imports the module**:
+  whole (`import a.b`, `import a.b as c`), or any declaration of it (`import a.b.X`,
+  `import a.b.{X, y}`). Nothing else is needed, and a file that imports neither does not see them:
+  a call there is an error naming the module that adds the method and saying the file does not
+  import it. The core library's impls are seen everywhere. Importing is per file, as for names.
+- **An extension adds methods, never meaning.** Its methods are not the type's: they reach no private
+  field or method of a type of another module, are in no method table, are not inherited as the
+  type's and are not overridden; a call is compiled for the receiver's static type, as the methods
+  added to a trait are. Inside them `self` is the receiver, and the type's public fields and methods
+  are in scope by bare name.
+- **A type's own methods are found first.** An extension's method with the name and parameter types
+  of a method the type has, its own or an inherited one, could never be called, and is an error where
+  it is declared; one with other parameter types overloads the type's. A method an extension adds to
+  a trait is passed over for a type that has one of its name and parameter types, as other methods
+  added to a trait are, so an extension never changes what an existing call means.
+- **Two extensions a file sees, from different modules**, that add a method of one name and
+  parameter types to types a receiver matches make a call of it on that receiver an error naming both
+  modules. Within one module the second is an error where it is declared.
+- **A `private` method of an extension is private to its module**: the module's other code calls it,
+  and a file importing the module does not.
+- **Infix calls, method values and calls through a bound see extensions as dotted calls do.** In
+  `middle[S: Seq[int]](xs: S) -> int = xs.median()`, `median` is found where `middle` is written,
+  so `middle`'s own file must see the extension; each instance calls it at its type arguments.
 
 ## object
 
@@ -672,6 +799,8 @@ main() = print(s"${circleArea(Circle(2))}")
   import, and a local, parameter or member of the enclosing class named like the module hides it.
   Importing `a.b` makes only `a.b` reachable, not its submodules; each module named in code is
   imported.
+- **Importing a module, or any declaration of it, also brings in the methods its
+  [extensions](#extensions) add**, so `"hey".shout()` works in every file that imports `words`.
 - **What a name means** is decided in that order: the file's module, then its imports, then the
   public declarations of the standard library's module `avin`, which every file sees without an
   import. The nearer hides the farther, whatever kind each declaration is. A program's own modules

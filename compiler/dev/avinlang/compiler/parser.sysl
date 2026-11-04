@@ -18,6 +18,10 @@ struct Parser
     /** The spans of the expressions written in parentheses of their own, which the rule against
      * mixing left- and right-grouping infix calls lets through. */
     grouped: Buf[Span]
+    /** Whether the parser is in the header of a form whose indented body follows: an `if` or `while`
+     * test, a `for` source, a class's parents. An indented block there is the form's body, never a
+     * call's trailing block. A block's own lines clear it. */
+    in_header: bool
 
     spelling(self, t: Spanned[Token]) -> string = from_utf8_unchecked(self.src.text(t.span))
 
@@ -76,7 +80,7 @@ impl TokenStream for Parser
 
 parser_for(src: Source) -> Parser
     val lexed = lex(src)
-    Parser(src, lexed.items, lexed.report, None, false, buf())
+    Parser(src, lexed.items, lexed.report, None, false, buf(), false)
 
 // Whether the `++` or `--` token `t` is followed, on its own line, by something that begins an
 // operand and is not itself an operator: a name, a literal or an opening bracket, or an indented
@@ -174,7 +178,7 @@ private hole(p: *Parser, span: Span) -> &Expr
         p.report.add(error(span, "an interpolation hole needs an expression"))
         return Expr(span, Invalid)
     val lexed = lex_hole(p.src, span)
-    var inner = Parser(p.src, lexed.items, lexed.report, None, false, buf())
+    var inner = Parser(p.src, lexed.items, lexed.report, None, false, buf(), false)
     val e = expression(&inner, 0)
     if !inner.toks.at_end() then inner.report.add(error(inner.toks.here(), "unexpected input after the expression in this hole"))
     p.report.absorb(inner.report)
@@ -203,6 +207,7 @@ private prefix(t: Spanned[Token], p: *Parser) -> &Expr
                 Ok(v) -> Expr(t.span, StringLit(v))
                 Err(_) -> Expr(t.span, Invalid)
         Interpolated -> interpolation(p, t)
+        MatchKeyword -> match_function(p, t.span)
         Word -> word_prefix(t, text, p)
         SymbolOp ->
             p.report.add(error(t.span, s"`$text` is a method's name, called between its two operands; a symbol method has no prefix form, and a prefix operator written right before another needs a space between them"))
@@ -244,7 +249,8 @@ private word_prefix(t: Spanned[Token], text: string, p: *Parser) -> &Expr
         val kind: ExprKind = if text == "return" then Return(value) else Break(value)
         return Expr(t.span.to(p.toks.here()), kind)
     if text == "continue" then return Expr(t.span, Continue)
-    Expr(t.span, Name(text))
+    if is_keyword(text) then return Expr(t.span, Name(text))
+    bare_call(p, Expr(t.span, Name(text)))
 
 /** A value that fills the rest of a line: an expression, or several separated by commas, which
  * make a tuple without parentheses. */
@@ -347,6 +353,9 @@ private infix(left: &Expr, t: Spanned[Token], p: *Parser) -> &Expr
         SymbolOp -> symbol_call(left, t, op, p)
         Postfix -> postfix(left, t, op, p)
         _ ->
+            // `xs*` with nothing after the `*` in an argument list is a splice, which the checker
+            // accepts only as the last argument of a call to a function with a repeated parameter.
+            if op == "*" && (p.at(")") || p.at(",")) then return Expr(left.span.to(t.span), Splice(left))
             val right = expression(p, binding(t))
             Expr(left.span.to(right.span), Binary(binary_op(op), left, right, t.span))
 
@@ -401,7 +410,7 @@ private mixed_grouping(p: *Parser, operand: &Expr, right: bool, at: Span)
 private argument_cannot_start(p: *Parser) -> bool
     p.toks.peek() match
         Some(next) -> next.value match
-            CompareOp | MultiplyOp | AssignOp | AndOp | OrOp | BitOrOp | BitXorOp | BitAndOp | RangeOp | ConsOp | SymbolOp | IsKeyword | MatchKeyword -> true
+            CompareOp | MultiplyOp | AssignOp | AndOp | OrOp | BitOrOp | BitXorOp | BitAndOp | RangeOp | ConsOp | SymbolOp | IsKeyword -> true
             _ -> p.at("then") || p.at("do")
         None -> true
 
@@ -421,7 +430,7 @@ private type_application(left: &Expr, p: *Parser) -> &Expr
             if !p.accept(",") || p.at("]") then break
     val end = p.toks.here()
     p.expect("]")
-    Expr(left.span.to(end), TypeApply(left, args))
+    bare_call(p, Expr(left.span.to(end), TypeApply(left, args)))
 
 private call(left: &Expr, p: *Parser) -> &Expr
     var args: Buf[Argument] = buf()
@@ -436,12 +445,99 @@ private call(left: &Expr, p: *Parser) -> &Expr
                 name = Some(p.spelling(p.toks.advance().unwrap()))
                 p.toks.advance()
             val value = expression(p, 0)
-            args.push(Argument(start.to(value.span), name, value))
+            args.push(Argument(start.to(value.span), name, value, false))
             if !p.accept(",") || p.at(")") then break
     p.in_list = outer
-    val end = p.toks.here()
+    var end = p.toks.here()
     p.expect(")")
+    trailing_block(p, true) match
+        Some(block) ->
+            args.push(Argument(block.span, None, block, true))
+            end = block.span
+        None -> ()
     Expr(left.span.to(end), Call(left, args))
+
+// A name, a member or a type application with no parentheses after it is called with a trailing
+// block alone: `scope` and an indented block, or `scope s ->` and one.
+private bare_call(p: *Parser, callee: &Expr) -> &Expr
+    val block = trailing_block(p, false) match
+        Some(b) -> b
+        None -> return callee
+    var args: Buf[Argument] = buf()
+    args.push(Argument(block.span, None, block, true))
+    Expr(callee.span.to(block.span), Call(callee, args))
+
+/** A trailing block: the call's line ends, and an indented block on the lines after it is the call's
+ * last argument. The line may instead end with a lambda's parameters and `->`, one name or, after a
+ * call's parentheses, a parenthesized list, and the block is that lambda's body. Nothing is taken in
+ * the header of a form whose body follows, or where the indented line reads as the method and
+ * argument of an infix call continued from the line above. */
+private trailing_block(p: *Parser, parenthesized: bool) -> Option[&Expr]
+    if p.in_header then return None
+    if p.at_kind(Indent)
+        if infix_line_ahead(p) then return None
+        return Some(parse_body(p, false))
+    if p.at_kind(Word) && !is_keyword(p.ahead(0)) && p.ahead(1) == "->" && arrow_ends_line(p, 1)
+        val name = p.toks.advance().unwrap()
+        p.toks.advance()
+        var params: Buf[LambdaParam] = buf()
+        params.push(LambdaParam(name.span, p.spelling(name), None))
+        val body = parse_body(p, false)
+        return Some(Expr(name.span.to(body.span), Lambda(params, body)))
+    if parenthesized && p.at("(")
+        var depth = 0
+        var i = 0usize
+        loop
+            val token = p.toks.peek_at(i) match
+                Some(t) -> t
+                None -> return None
+            if token.value == Newline || token.value == Dedent || token.value == Indent then return None
+            val word = p.spelling(token)
+            if word == "(" then depth += 1
+            elif word == ")"
+                depth -= 1
+                if depth == 0 then break
+            i += 1
+        if p.ahead(i + 1) != "->" || !arrow_ends_line(p, i + 1) then return None
+        val open = p.toks.advance().unwrap()
+        return Some(parse_lambda(p, open.span))
+    None
+
+// Whether the `->` at `offset` ends its line, an indented block after it, and is not the arrow that
+// ends a match guard.
+private arrow_ends_line(p: *Parser, offset: usize) -> bool
+    if p.lambda_boundary == Some(p.toks.position + offset) then return false
+    p.toks.peek_at(offset + 1) match
+        Some(t) -> t.value == Indent
+        None -> false
+
+// Whether the indented line ahead is only a name and one operand, `add 2`: the method and argument
+// of an infix call that should have been continued from the line above, which is reported as that.
+private infix_line_ahead(p: *Parser) -> bool
+    val name = p.toks.peek_at(1) match
+        Some(t) -> t
+        None -> return false
+    if name.value != Word || is_keyword(p.spelling(name)) then return false
+    val operand = p.toks.peek_at(2) match
+        Some(t) -> t
+        None -> return false
+    val single = operand.value match
+        Word -> !is_keyword(p.spelling(operand))
+        Number | RealNumber | Quoted | Interpolated | CharQuoted -> true
+        _ -> false
+    if !single then return false
+    p.toks.peek_at(3) match
+        Some(t) -> t.value == Newline || t.value == Dedent
+        None -> true
+
+/** An expression in the header of a form whose indented body follows it, which no trailing block
+ * attaches to. */
+header_expression(p: *Parser) -> &Expr
+    val outer = p.in_header
+    p.in_header = true
+    val e = expression(p, 0)
+    p.in_header = outer
+    e
 
 // `t.name` is a member; `t.0` is a tuple element. The lexer reads `t.0.1` as `t` `.` `0.1`, so a
 // real-number spelling after a dot is split back into two element indices.
@@ -453,7 +549,7 @@ private member(left: &Expr, t: Spanned[Token], p: *Parser) -> &Expr
             return Expr(left.span.to(t.span), Invalid)
     val text = p.spelling(next)
     next.value match
-        Word -> Expr(left.span.to(next.span), Member(left, text))
+        Word -> bare_call(p, Expr(left.span.to(next.span), Member(left, text)))
         Number -> Expr(left.span.to(next.span), TupleIndex(left, element_index(p, next.span, text)))
         RealNumber ->
             var target = left

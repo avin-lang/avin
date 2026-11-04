@@ -182,9 +182,15 @@ slots in the same positions, each holding the class's override where it has one,
 overridable method the class adds. A method is identified by its name and parameter types, so
 each overload of a name has a slot of its own, and an override takes the slot of the inherited
 method with its parameter types; each overload is also a symbol of its own, named by its parameter
-types. The table is constant data placed directly before the class's
-descriptor, in one global, so slot `s` is the word `8(s + 1)` bytes before the object's
-descriptor; the descriptor itself keeps its layout and the runtime never reads the table. Each instance of a generic class has its own descriptor and table, filled with the method
+types. The table is constant data placed before the class's descriptor, in one global, with one
+word between them, the descriptor's call entry; so slot `s` is the word `8(s + 2)` bytes before the
+object's descriptor; the descriptor itself keeps its layout and the runtime never reads the table.
+Every descriptor has the call entry, the word directly before it: what a call of the object as a
+function value runs, taking the object and then the call's arguments. A closure's is its code, so a
+closure holds only what it captures; a class or data type that is a function (a sequence, a set, a
+map, or any type naming a function type as a parent) has its `apply` there, filled once the program
+calls a function value at all; any other object's is null. A call of a function value loads the
+descriptor and the call entry and calls it indirectly, the same for a lambda and a collection. Each instance of a generic class has its own descriptor and table, filled with the method
 instances for its type arguments. A call through a receiver whose static type is an `open` or
 `abstract` class loads the descriptor from the object's header, loads the slot, and calls it indirectly with the
 overridden method's machine signature, which every override shares; `super.m()` is a direct call.
@@ -342,10 +348,15 @@ its table positions and the method go, the method recorded as withdrawn so lower
 it), and a bound or interpolation that then fails names the field in its diagnostic.
 
 Lowering compiles a data type's trait implementations only when called, and fills a method table
-position only once some call goes through it (`used_slots`): each new position is filled in every
-table made so far, which may make instances to compile, until no position is new. So a program that
-never shows a value carries no `Display` or `Debug` code, and one calling `toString()` through
-`Display` carries it only for the types it makes.
+position only once some call goes through it: each new position is filled in every table made so
+far, which may make instances to compile, until no position is new. So a program that never shows a
+value carries no `Display` or `Debug` code, and one calling `toString()` through `Display` carries it
+only for the types it makes. A call records its receiver's static type at the position
+(`slot_receivers`; a generic method's slot carries it too), and a table is filled there only where
+its type always is one of those types; a call lowering makes with no static receiver, an equality
+decided at run time, fills the position in every table (`used_slots`). Without that, a trait method
+making an instance at a larger type argument, as `Iterator.zipWithIndex` makes an
+`Iterator[(T, int)]`, would fill that instance's table, make the next larger one, and never end.
 
 The supertypes an instance has through **variance** are open-ended (`List[Dog]` is a `List[Animal]`
 and a `List[Any]`), so a record does not list them all. Lowering notes each record a type pattern
@@ -452,6 +463,33 @@ context; the main thread's is attached before the program's entry function runs.
 gets a context of its own from `avin_rt_thread_attach` before it runs compiled code and gives it
 back with `avin_rt_thread_detach` when it has finished, with no frame left on it.
 
+**What a frame holds.** The collector can run only at a *collection point*: an allocation, a poll
+(below), a call of one of the program's functions that may collect, a call through a function value,
+and a call of a runtime entry point that may allocate, poll or block. A function may collect when it
+allocates, polls, calls through a function value or calls a runtime entry point or function that
+may; this is found for the whole program at once, so a call of an accessor that only reads fields is
+no collection point. Only the eight runtime entry points that do none of these (comparing, hashing
+and searching strings, hashing reals and identities, testing conformance, clearing array elements)
+are known to be quiet; every other entry point and every Sysl binding's shim may collect.
+
+A reference, whether a value or a local variable, is a root only where it is **live across** a
+collection point: made before it and used after it. Liveness is computed backward over the
+function's blocks, and an address computed from a reference, a field's or an element's, keeps that
+reference live while the address is in use. References passed to a function of the program are the
+callee's to keep: inside the callee a parameter is a root only if the callee uses it after one of its
+own collection points. A runtime entry point that may collect is the exception, since it reads its
+arguments after allocating, so references passed to it are live across the call.
+
+References that are never live at once share a frame slot: slots are given out in the order the
+references' extents over the function begin, each to a reference whose extent begins after that of
+the slot's last occupant ended. A value is stored to its slot where it is made, and a local variable
+that needs a slot lives in it. The frame is not cleared on entry: only a slot the collector could read
+before the function has stored to it on some path is set to null, and a slot whose reference has died
+still holds a valid reference, since its object has been kept alive by that same slot at every
+collection since. A function with no reference live across a collection point has **no frame** at
+all, so a leaf that only reads fields, or one whose branches only read fields and trap, pushes
+nothing.
+
 Threads share the heap, and one lock serializes allocation, collection and changes to the list of
 contexts; the collector itself runs single-threaded. **A collection stops the world.** Each context
 is either *running*, when its thread may touch references, or *safe*, when its frames hold every
@@ -471,7 +509,8 @@ safe, collects, lowers the flag and wakes the others. A thread becomes safe in t
   its callees' and its own loops' polls, and never polls at all for its calls. A poll is a relaxed
   atomic load of the flag and a branch, weighted as almost never taken, to a call of
   `avin_rt_safepoint`, which is declared cold and laid out of line; the thread parks there until the
-  collection is over. Every reference is already in a frame wherever a poll is placed.
+  collection is over. Every reference live across a poll is already in a frame where the poll is
+  placed.
 - **Waiting for the lock.** Allocation takes the lock with one compare-and-swap when it is free; a
   thread that has to wait for it waits safe, since the holder may be collecting. Allocation is
   therefore a safepoint.
@@ -483,6 +522,49 @@ The handshake is a pair of sequentially consistent stores and loads, the flag by
 a context's state by its thread, so either the thread sees the flag and wakes the collector, or the
 collector sees the thread safe. With one context attached the flag is never raised, so a program
 with one thread takes no poll's slow path and makes no system call for a collection.
+
+The emitter gives the [memory model](/spec/threads/#the-memory-model) its two guarantees.
+**Every load and store another thread can reach is an `unordered` atomic one**: a field of an
+object, which covers class and data fields, a closure's captures and the box of a captured `var`;
+an element of an array; a byte of a string; and a module-level value, in `@avin.roots` or a global
+of its own. A function's own slots, and the slots of its callers whose addresses a local function is
+given as parameters, belong to one thread and are accessed plainly, as are the header words and the
+constant descriptors behind them. An atomic access is made at the width the value is laid out at, a
+whole power-of-two number of bytes: a `bool` is a byte and an `i5` a byte, an `i24` four, an `i48`
+eight, truncated after a load and zero-extended before a store. An integer wider than 64 bits is
+accessed as its 64-bit words, lowest first, each an `unordered` access of its own, so no word is torn
+and a racing load may combine words of different stores. On arm64 and x86-64 an `unordered` load or
+store is the same instruction a plain one is.
+
+**Making an object ends with `fence release`**, once its last field is stored and before the
+reference can reach anything else: a data value or tuple after its fields, a closure after its
+captures, a box after its value, a value boxed as `Any` after the value, and a class's object at the
+end of its constructor, after the class body has run. A constant object needs none. On arm64 the
+fence is one `dmb ish`; on x86-64 it is no instruction at all, only an order the compiler keeps.
+Arrays and strings are made by the runtime, so the fence for them is the runtime's to make.
+
+**Starting a thread.** `avin.threads` reaches three intrinsics. `thread_start` calls
+`avin_rt_thread_start` with a closure taking nothing and returning nothing, which stores the body's
+result where the `Thread` reads it, and the stack size. The entry makes the new thread's context
+before the thread exists, with a frame of two slots at the bottom of its stack: the closure, and the
+thread's *joint*, the object it is joined by, allocated on the collected heap. That frame is linked
+onto the calling thread's own stack while the joint is allocated and the lock is awaited, then moved
+to the new context, which is attached, safe, before the operating system thread is started with the
+requested stack. So the closure is a root at every moment from the call to the thread's end. The
+new thread marks its context running, calls the closure's entry (the word before its descriptor)
+with its context and the closure, and detaches and frees its context when the closure returns.
+`thread_join` calls `avin_rt_thread_join`, which waits safe for the operating system thread under the
+joint's own lock, so of several joins one waits for the thread and the rest for it, and a later join
+returns at once; the joint, and with it the thread's handle, is collected once nothing reaches the
+`Thread`. `thread_current` answers the calling context's address, which the scope compares with
+its owner's.
+
+**Ending the program.** A trap, a failed allocation and `exit` begin by taking a lock that is never
+given back: the first thread to take it flushes standard output, reports and stops the process, and
+any other waits safe for the end, so a program stops once with one report however many threads fail.
+A trap ends the process with the trap signal from whichever thread raises it. When `main` returns,
+the entry's `main` returns its status to the C library, whose exit flushes standard output and ends
+the process with every other thread in it.
 
 ## Standard library
 

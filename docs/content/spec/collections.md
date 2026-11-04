@@ -16,7 +16,8 @@ Iterable[+A]                 iterator(), and the operation families below
 ├── Iterator[+A]             single-pass; iterator() returns itself
 ├── Seq[+A]                  ordered, (Int) -> A
 │   ├── List[+A]             immutable linked list
-│   ├── Vector[+A]           immutable indexed; the default sequence
+│   ├── Vector[+A]           immutable, persistent tree; the default sequence
+│   ├── ArraySeq[+A]         immutable, one array; built once, then read
 │   ├── Range[A]             immutable arithmetic progression
 │   ├── Array[A]             mutable, fixed length, contiguous
 │   ├── Buffer[A]            mutable, growable at the end, contiguous
@@ -58,14 +59,76 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
   a collection has them only where its elements do. `mkString` joins elements that have `Display`
   into a string: `mkString(sep = ", ")` separates them, `mkString(start, sep, end)` also brackets
   them, so `[1, 2, 3].mkString()` is `1, 2, 3` and `.mkString("<", "|", ">")` is `<1|2|3>`. Every
-  sequence has it, through an impl adding it to `Seq`, and so do sets, and maps, whose entries join
-  as `key: value`, the form a displayed map shows. `max()` and `min()` on every sequence of `Ord`
-  elements answer `Some` of the greatest or least, the first of equal ones, and `None` when empty.
+  collection and iterator has it, through an impl adding it to `Iterable`, and a map keeps its own,
+  whose entries join as `key: value`, the form a displayed map shows. `max()` and `min()` on every
+  collection of `Ord` elements answer `Some` of the greatest or least, the first of equal ones, and
+  `None` when empty. The free functions `max(first, rest*)` and `min(first, rest*)` take one value or more, with a
+  [repeated](/spec/declarations/#repeated-parameters) parameter, and answer the greatest or least
+  itself: `max(3, 9, 4)` is `9`, `min(x, ys*)` the least of `x` and the elements of `ys`.
   `sum()` and `product()` are added to `Iterable` the same way, so every collection has them, ranges
   and sets included, where its elements have `Add` or `Mul`: they answer the total or the product,
   and the identity (`T.zero()`, `T.one()`) when empty, so `[1, 2, 3].sum()` is `6`, `(1..5).product()`
   is `120`, and the `sum` of no `real`s is `0.0` and of no strings is `""`. Overflow traps as `+` does,
   and strings concatenate in `sum` but have no `product`.
+- `collect(pf)` takes a [`PartialFunction`](/spec/types/#partial-functions) and keeps `pf` of each
+  element it is defined at, in order, in the collection `map` would make: `shapes.collect(match
+  Circle(r) -> r)` is the radii of the circles. Every collection with `map` has it, and so does
+  `Option`. `collectFirst(pf)`, on every `Iterable`, is `Some` of `pf` of the first element it is
+  defined at, or `None`, and reaches no element after that one. A `Map` collects its entries as
+  pairs into a `Map`.
+
+## Methods every Iterable has
+
+Impls add these to `Iterable`, each written once over `iterator()`, so every collection has them:
+lists, vectors, arrays, buffers, deques, ranges, sets, maps (whose elements are their entries, as
+`(key, value)` pairs), the mutable sets and maps, iterators, and a class of the program's own that
+conforms to `Iterable`. They visit the elements in iteration order. On an iterator they consume it.
+A type with a faster way to answer one keeps its own method of the same name and parameter types,
+which is found first wherever the type is known: a list walks itself for `foldLeft`, `find` and the
+rest, a set and a range know at once whether they are empty, a vector is its own `toVector()`.
+Collections they make are vectors, maps and sets; n is the number of elements.
+
+| Method | Result | Cost |
+|---|---|---|
+| `isEmpty()`, `nonEmpty()` | `bool` | O(1) |
+| `foldLeft(initial, f)` | `B` | O(n) |
+| `reduce(f)` | `T`; traps when empty | O(n) |
+| `reduceOption(f)` | `Option[T]`, `None` when empty | O(n) |
+| `foreach(f)` | `unit` | O(n) |
+| `exists(p)`, `forall(p)` | `bool`; stops at the first that decides | O(n) |
+| `find(p)` | `Option[T]`, the first that satisfies `p` | O(n) |
+| `count(p)` | `int` | O(n) |
+| `minBy(key)`, `maxBy(key)` (`K: Ord`) | `Option[T]`, the first of equal keys | O(n), `key` once per element |
+| `min()`, `max()` (`T: Ord`) | `Option[T]`, the first of equal ones | O(n) |
+| `sum()` (`T: Add`), `product()` (`T: Mul`) | `T`; the identity when empty | O(n) |
+| `mkString(sep)`, `mkString(start, sep, end)` (`T: Display`) | `string` | O(n) |
+| `partition(p)` | `(Vector[T], Vector[T])`: those that satisfy `p`, those that do not | O(n) |
+| `groupBy(key)` | `Map[K, Vector[T]]` | O(n) |
+| `groupMap(key, f)` | `Map[K, Vector[V]]` | O(n) |
+| `groupMapReduce(key, f, combine)` | `Map[K, V]` | O(n) |
+| `toList()`, `toVector()`, `toArray()`, `toBuffer()` | the collection, in order | O(n) |
+| `toSet()` | `Set[T]` | O(n) |
+| `toMap()`, on pairs | `Map[K, V]`, a later key's value replacing | O(n) |
+| `zipWithIndex()` | `Vector[(T, int)]`, positions from 0 | O(n) |
+| `collectFirst(pf)` | `Option[B]` | O(n) |
+
+Each group of `groupBy` and `groupMap` keeps its elements' order; `groupMapReduce` combines a key's
+values in that order, so `words.groupMapReduce(w -> w.take(1), w -> 1, (a, b) -> a + b)` counts the
+words by their first letter. The map's own order is its keys' hashes.
+
+```text
+val (small, large) = [5, 12, 3, 40].partition(x -> x < 10)    // [5, 3], [12, 40]
+(1..6).groupBy(x -> x % 3)                                     // {0: [3, 6], 1: [1, 4], 2: [2, 5]}
+["b", "a"].zipWithIndex()                                      // [("b", 0), ("a", 1)]
+```
+
+**An iterator's transformations are lazy.** `Iterator` itself has `map(f)`, `filter(p)`, `take(n)`,
+`drop(n)`, `takeWhile(p)`, `dropWhile(p)`, `zip(other)` with another iterator, and `zipWithIndex()`,
+each answering an iterator that reads its source only as far as its own `hasNext()` and `next()` ask:
+`it.map(f).take(2).toVector()` calls `f` twice however long `it` is. `drop(n)` skips when the first
+element is asked for, `zip` ends with the shorter side, and `zipWithIndex` here is an
+`Iterator[(T, int)]` rather than a vector. The new iterator shares its source, which must not then be
+read on its own.
 
 ## Builders
 
@@ -110,7 +173,7 @@ for (word, n) in counts do print(s"$word $n")
 
 `m(k)` reads a value and traps when the key is absent; `m.get(k)` returns an `Option`, and
 `m.getOrElse(k, d)` evaluates `d` only when the key is absent. A set is a function from elements to
-`bool`: `s(x)` is `s.contains(x)`. Sets have `union`, `intersect`, `diff` and `subsetOf`, which read
+`bool`: `s(x)` is `true` when `x` is an element of `s` and `false` otherwise, `s.contains(x)`. Sets have `union`, `intersect`, `diff` and `subsetOf`, which read
 well infix: `odds union evens`.
 
 `avin.collections.mutable` holds `Map[K, V]` and `Set[A]`, invariant, updated in place:
@@ -136,10 +199,38 @@ compared; `===` tells two of them apart. Every map and set displays in the shape
 
 ## Indexing and callable sequences
 
-A `Seq[A]` is a function from index to element: `xs(i)` reads an element, and a `Seq[A]` can be
-passed where an `(int) -> A` is expected. Mutable sequences assign with `xs(i) = v`. An index out of
-bounds traps; `xs.get(i)` returns an `Option`. Square brackets never index; they are for types and
-literals.
+A `Seq[A]` is a function from index to element: `xs(i)` reads an element. Mutable sequences assign
+with `xs(i) = v`. An index out of bounds traps; `xs.get(i)` returns an `Option`. Square brackets
+never index; they are for types and literals.
+
+## Collections as functions
+
+A sequence, a set and a map are each a function, by subtyping: a [function type](/spec/types/#function-types)
+is among their parents, and their `apply` is what a call of one as a function runs.
+
+| Collection | Is a | `c(x)` is |
+|---|---|---|
+| `Seq[T]`: every list, vector, array, buffer and deque | `(int) -> T` | the element at index `x`, trapping outside the sequence |
+| `Set[A]`, immutable and mutable | `(A) -> bool` | whether `x` is an element |
+| `Map[K, V]`, immutable and mutable | `(K) -> V` | the value bound to `x`, trapping when there is none |
+
+So a collection is passed, stored and called wherever its function type is expected, with no
+conversion, and a lambda of the same type may stand beside it:
+
+```text
+val words = ["zero", "one", "two"]
+(0 ..< 2).map(words)                 // [zero, one]
+val allowed = Set[string]().added("one")
+words.filter(allowed)                // [one]
+val table = Map[string, int]().updated("one", 1)
+["one", "one"].map(table)            // [1, 1]
+val fs: Vector[(int) -> string] = [words, i -> s"#$i"]
+```
+
+Variance holds through the function type: a `Vector[Dog]` is an `(int) -> Animal`, since `Seq` is
+covariant in its element and a function in its result, and a `Map[string, Dog]` is a
+`(string) -> Animal`. A set's element type and a map's key type are its own, so a `Set[int]` is no
+`(string) -> bool`. A `Range` is iterable but no sequence, so it is no function.
 
 ## Array
 
@@ -253,7 +344,7 @@ one.
 
 Literals always build the library's types, even when a user type named `Vector` is in scope.
 
-## Buffer and Vector
+## Buffer
 
 `Buffer[T]` is invariant, growable and mutable. `Buffer[int]()` is an empty buffer; `add(x)`, or
 `b += x`, appends in amortized constant time, `addAll(xs)`, or `b ++= xs`, appends each in turn, `insert(i, x)` and `remove(i)` work at any index, and `clear()` empties
@@ -261,21 +352,75 @@ it. `b(i)` and `b(i) = v` read and replace an element, and an index outside `0 .
 at the caller's line. Its elements live in an array with spare capacity, which never holds a value
 that is read before one is written, so a buffer needs no value to fill it with.
 
-`Vector[+T]` is the default sequence: immutable, covariant and indexed in constant time. Its
-elements are in one array that nothing writes to after the vector is made, so an operation that
-makes a changed vector (`xs :+ x`, `x +: xs`, `xs ++ ys`, `updated`) copies them. Both compare and
-hash by their elements in order, and display as an array does, `[1, 2, 3]`, where their elements
-display.
+## Vector
+
+`Vector[+T]` is the default sequence: immutable, covariant and persistent. A changed vector shares
+almost everything with the one it came from, so keeping both costs little, and either may be
+changed again.
+
+Its elements are in a tree of arrays of 32. The tree has a balanced middle and, at every level, a
+prefix and a suffix beside it: the arrays at the two ends, which is where a vector grows. Reading
+an element takes one array per level, and a vector of up to 2^31 elements has at most six. Adding
+an element at either end makes a new array at that end of the bottom level, and only when that
+array is full does the next level gain one; so `:+` and `+:` take amortized constant time.
+`updated` copies the arrays on one path from the top of the tree to the element. Slicing cuts the
+arrays at its two edges and shares the rest, so it takes time in the depth of the tree, not in the
+length of the slice.
+
+Every array in a vector's tree is exactly the size it holds and is never written once it is in the
+tree. Each is written before the object that holds it is made, and a constructor ends with the
+release fence [threads](/spec/threads/) describe, so a vector made by one thread is whole to any
+other thread that reads it.
+
+| Operation | Cost |
+|---|---|
+| `xs(i)`, `head()`, `last()` | O(log₃₂ n), at most six arrays |
+| `xs :+ x`, `x +: xs` | amortized O(1) |
+| `updated(i, x)` | O(log₃₂ n), one path copied |
+| `slice`, `take`, `drop`, `takeRight`, `dropRight`, `splitAt`, `tail`, `init` | O(log₃₂ n) |
+| `xs ++ ys` | O(min(length of xs, length of ys)) |
+| `length()`, `isEmpty()` | O(1) |
+| `iterator()`, `reverseIterator()`, `for`, `foldLeft`, `map`, `filter` | O(n), a leaf at a time |
+| `Vector.builder()`, `toVector()` | O(n), each array made once |
+
+A vector's iterators read one leaf after another, finding the next leaf only when one is used up.
+A builder fills leaves of 32 as elements come and makes the tree above them once, at `result()`.
+
+## ArraySeq
+
+`ArraySeq[+T]` is the immutable sequence whose elements are in one array that nothing writes to
+after it is made. There is no level between an index and its element, so `xs(i)` reads one array
+however long the sequence is, but every operation that makes a changed sequence (`xs :+ x`,
+`x +: xs`, `xs ++ ys`, `updated`) copies all of them: it is for elements built once and then read.
+`slice` copies the elements it keeps. `ArraySeq.empty[T]()` and `ArraySeq.builder[T]()` make one, as
+does `toArraySeq()` on any collection, or a literal whose expected type is an `ArraySeq`:
+
+```avin
+val xs: ArraySeq[int] = [1, 2, 3]
+val ys = xs :+ 4                    // [1, 2, 3, 4], a copy; xs is unchanged
+val v = ys.toVector()               // a Vector of the same elements
+```
+
+| Operation | Cost |
+|---|---|
+| `xs(i)`, `length()` | O(1) |
+| `xs :+ x`, `x +: xs`, `updated(i, x)`, `slice` | O(n), a copy |
+| `xs ++ ys` | O(length of xs + length of ys) |
+| `map`, `filter`, `collect`, `flatMap`, iteration | O(n) |
+
+Both `Vector` and `ArraySeq` compare and hash by their elements in order, and display as an array
+does, `[1, 2, 3]`, where their elements display.
 
 ## Seq
 
 `Seq[+T]` is what every indexed sequence shares, so a function over `Seq[T]` takes a list, a vector,
 an array, a buffer or a deque. A sequence supplies `length()` and `apply(index)`, and has the rest
 from them: `get`, `isEmpty`, `nonEmpty`, `head` and `last` (trapping when empty) with `headOption` and
-`lastOption`, `foldLeft`, `foldRight`, `foreach`, `exists`, `forall`, `find`, `indexWhere`, `count`,
-`toVector`, `toList`, an iterator, and `reverseIterator`, which walks from the last element to the
-first. A sequence that reaches its elements another way overrides the ones that would be slow: a list
-walks from its front, so on a list each of them takes time proportional to its length.
+`lastOption`, `foldRight`, `indexWhere`, `toVector`, an iterator, and `reverseIterator`, which walks
+from the last element to the first. The [methods every Iterable has](#methods-every-iterable-has),
+`foldLeft`, `exists`, `count` and the rest, it has as every collection does. A sequence that reaches
+its elements another way overrides the ones that would be slow: a list walks from its front, so on a
+list each of them takes time proportional to its length.
 
 ```text
 total(xs: Seq[int]) -> int = xs.foldLeft(0, (acc, x) -> acc + x)
@@ -287,8 +432,8 @@ total(Array.fill(4, 1))            // an Array
 Impls add more to every sequence ([impl](/spec/declarations/#impl)), written once on `Seq` and
 reached through generic code over `Seq[T]` as on each sequence type: `contains(element)` and
 `indexOf(element)`, which compare with `equals` and are `exists` and `indexWhere`, so a list walks
-itself once; where the elements display, `mkString`; where they are ordered, `max()` and `min()`;
-and the sorts, `sorted()`, `sortedBy` and `sortedWith` ([sorting](#sorting)).
+itself once; and where the elements are ordered, the sorts, `sorted()`, `sortedBy` and `sortedWith`
+([sorting](#sorting)).
 
 ```text
 present[T](xs: Seq[T], x: T) -> bool = xs.contains(x)

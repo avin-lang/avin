@@ -101,12 +101,15 @@ val widest = current max
 ```
 
 A name that starts a line never continues the line above, inside brackets too: end the line with the
-name instead.
+name instead. An indented block after a call is the call's [trailing block](#trailing-blocks), except
+that one holding only a name and an operand is reported as this mistake.
 
 The call is resolved exactly as `a.m(b)` is: overloads are chosen by the argument's type, a trait or
 `open` method dispatches on the receiver's class, an `impl` adds methods that can be called this way,
 and a generic method's type arguments are inferred. The name must be a method of the receiver's type
-that can take one argument. A field holding a function is not called infix, and neither is a
+that can take one argument, which a method with a [repeated](/spec/declarations/#repeated-parameters)
+last parameter can: `w surround "!"` gives `surround(marks: string*)` one mark. A field holding a
+function is not called infix, and neither is a
 function `m(a, b)` declared outside the type: `a m b` never means `m(a, b)`. A method of two
 parameters is not called infix even with a tuple after its name: `a put (1, 2)` against
 `put(i: int, j: int)` is an error that says to write `a.put(1, 2)`.
@@ -155,6 +158,71 @@ always been; where `op` is a symbol method, `x op= y` is `x = x op y`, so `xs ++
 value or an element `xs(i)`, and its object and indices are evaluated once. A right-grouping name
 has no compound form, and the yielding forms (`+:=`) belong to the language's operators alone. A
 multiple assignment uses only the language's compound forms.
+
+### Trailing blocks
+
+An indented block on the lines after a call is the call's last argument. The call's line ends right
+after its `)`, and the block is given to the callee's **last parameter**:
+
+```text
+retry(3)
+    fetch(url)
+
+withFile("data.txt") f ->
+    process(f)
+
+zipWith(xs, ys) (x, y) ->
+    x * y
+```
+
+A [by-name](/spec/by-name/) parameter (`body: -> T`) takes the block as its delayed expression,
+evaluated at each read of the parameter and not at the call, so `retry(3)` runs `fetch(url)` as many
+times as `retry` reads `body`. A function parameter takes a lambda whose body is the block: its
+parameters end the call's line before `->`, one name (`f ->`) or a parenthesized list
+(`(x, y) ->`, `(x: int) ->`), as an ordinary lambda's would be written.
+
+A callee with no other arguments is written without parentheses: a name, a member or a type
+application, then the block, or one parameter name and `->`:
+
+```text
+scope s ->
+    s.spawn
+        part(1)
+
+xs.foreach x ->
+    print(x)
+```
+
+A lambda of several parameters needs the call's parentheses before it, `run() (x, y) ->`: the
+parentheses right after a callee's name always hold its arguments.
+
+The block's position does not depend on the written arguments. With parentheses it comes after them,
+and it still goes to the last parameter, past any defaulted one in between: against
+`labelled(label: string, width: int = 4, body: -> string)`, `labelled("box")` and a block gives
+`width` its default. Positional and named arguments bind as they would without the block, and
+overloads are chosen with it: a candidate whose last parameter cannot take a block does not fit.
+
+A trailing block applies wherever an expression ends a line: a statement, a binding's value
+(`val r = retry(3)` and a block), an assignment, a `return` value, a lambda's or a `match` arm's
+body, the argument of an infix call, the operand of an operator. Inside brackets a line break is
+not significant, so a call written inside another call's parentheses takes no block. The forms that
+already put an indented block after their line keep it:
+
+- The test of `if`, `elif`, `while` and `do … while`, a `for` source and its `if` guards, and a
+  class's or object's parents: the block is the form's body, so `if ready(x)` and a block tests
+  `ready(x)`.
+- A local function's header: `helper()` or `helper(n: int)` and an indented block declare a local
+  function. A header's parameters are typed, so `retry(3)` and `retry(n)` are calls. A call with
+  no arguments and a block is written without parentheses.
+- A line that ends with an infix call's method name, `current max`: the block is its argument.
+- `x match` and the bare `match` function: the block holds the arms.
+- A block whose one line is a name and a single operand, `add 2`, reads as the method and argument
+  of an infix call that should have ended the line above, and is reported as that.
+
+It is an error to write a trailing block for a call whose last parameter is neither by-name nor a
+function (the message names the parameter and its type), whose last parameter is already given, or
+whose callee takes no arguments. A lambda on the call's own line, `f(1) x -> x`, is not a trailing
+form; it is written inside the parentheses.
 
 ## Comparison chains
 
@@ -340,6 +408,36 @@ but one naming the parameter's own type is an error, since the signature already
 destructuring binding, whose `:` begins the binding's type, a type pattern is in parentheses. A
 function type in a type pattern is written in parentheses, because an arm's `->` follows it:
 `f: ((int) -> int) -> …`.
+
+A `match` that does not cover every value names one it leaves out, written as a pattern:
+`` this `match` does not cover every Shape value, such as `Rect(_, _)` ``.
+
+### Match functions
+
+A `match` with nothing before it is a function of one value, which its arms match. The arms are
+exactly those of a `match`: patterns, `if` guards, `->` and block bodies. One arm may stand on the
+`match` line; several go in an indented block, which may open inside parentheses or after an infix
+method's name at the end of a line:
+
+```text
+val radii = shapes.collect(match Circle(r) -> r)
+val sizes = shapes.map(match
+    Circle(r) -> r * r * 3.14
+    Rect(w, h) -> w * h)
+val firstBig = shapes collectFirst match
+    Circle(r) if r > 10.0 -> r
+```
+
+The type of the value it matches comes from the type expected where it is written, as a lambda's
+parameter type does; a `match` function with no expected type is an error asking for one. Where a
+function type `A -> B` is expected, the function is `x -> x match …` and its arms must cover every
+`A`, as any `match`'s do: `pairs.map(match (k, v) -> s"$k=$v")`. A function of two or more
+parameters is not a `match` function's type.
+
+Where a [`PartialFunction[A, B]`](/spec/types/#partial-functions) is expected, the arms need not
+cover every `A`: the function is defined at the values some arm matches. A partial function made
+this way tests its patterns and guards once each time it is called, lifted or given to
+`applyOrElse`; `isDefinedAt` tests them without running an arm's body.
 
 ## is
 

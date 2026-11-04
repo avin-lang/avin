@@ -148,23 +148,36 @@ private struct Lowering
     library: bool
     /** The span of the innermost expression being lowered, where a call made for it is placed. */
     here: Span
-    /** For each position of a method table, whether a call goes through it. A table holds a method
-     * only at a position some call uses, so a method reached only through tables is compiled only
-     * when called: a data type's `Display` costs nothing in a program that never shows it. */
-    used_slots: Buf[bool]
+    /** For each position of a method table, the calls through it: the method's name, and the static
+     * type of the receiver, `Any` where that is not known. A table holds a method only at a position
+     * some call reaching its type uses, so a method reached only through tables is compiled only when
+     * called: a data type's `Display` costs nothing in a program that never shows it. And a method
+     * that makes an instance of a larger type, as an iterator's `zipWithIndex` does, does not fill
+     * the tables of every type it makes in turn. */
+    slot_calls: Buf[Buf[SlotCall]]
     /** Whether a position has come into use since the tables were last filled. */
     new_slots: bool
     /** The Sysl bindings whose bodies have been compiled, in that order. */
     bound: Buf[MirBinding]
+    /** Whether the program calls a function value: until it does, no descriptor of a class or data
+     * type holds the `apply` such a call would run, so none is compiled for it. */
+    calls_values: bool
 
 /** One slot for a method with type parameters of its own, at one list of its own type arguments: a
- * call through a method table to `name` at checker position `position` with `type_args` reaches it.
- * Each type holding that method at that position fills the slot with its implementation instantiated
- * at those arguments. */
+ * call through a method table to `name` at checker position `position` with `type_args`, on a
+ * receiver of static type `receiver`, reaches it. Each type of that receiver holding that method at
+ * that position fills the slot with its implementation instantiated at those arguments. */
 private struct GenericSlot
     position: usize
     name: string
     type_args: Buf[&Type]
+    receiver: &Type
+
+/** A call through a method table position: of the method `name`, on a receiver of static type
+ * `receiver`. */
+private struct SlotCall
+    name: string
+    receiver: &Type
 
 private struct GenericHolder
     descriptor: usize
@@ -182,7 +195,7 @@ lower_program(program: TProgram) -> MirProgram
         if k.table.len() > generic_base then generic_base = k.table.len()
     for d in program.data
         if d.table.len() > generic_base then generic_base = d.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf())
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false)
     // Record 0 is for the objects no type pattern names: closures, and the boxes of captured
     // variables.
     l.records.push(TypeRecord("a closure or a captured variable", buf(), None, None))
@@ -236,6 +249,13 @@ private in_core_library(program: TProgram, id: usize) -> bool
     val m = program.symbols[id].module_name
     m == "avin" || m.starts_with("avin.")
 
+/** Whether a function is the constructor of a class, which allocates the object it yields. */
+private is_class_constructor(program: TProgram, id: usize) -> bool
+    val symbol = program.symbols[id]
+    symbol.owner_class match
+        Some(k) -> symbol.constructor && program.classes[k].constructor == id
+        None -> false
+
 /** Whether a function has no code: an abstract method, or an abstract class's or a trait's constructor. */
 private never_compiled(program: TProgram, id: usize) -> bool
     val symbol = program.symbols[id]
@@ -266,22 +286,23 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
         Data(id, _, args) ->
             val d = l.program.data[id]
             val methods = method_table(l, t)
+            val call = call_entry(l, t)
             for v in 0..<d.variants.len()
-                variants.push(variant_layout(l, key + "." + d.variants[v].name, v, variant_fields(d, id, v, args), true, methods, record))
-        Tuple(items) -> variants.push(variant_layout(l, key, 0, items, true, buf(), record))
+                variants.push(variant_layout(l, key + "." + d.variants[v].name, v, variant_fields(d, id, v, args), true, methods, record, call))
+        Tuple(items) -> variants.push(variant_layout(l, key, 0, items, true, buf(), record, None))
         Class(id, _, args) ->
             if is_array_class(l.program.classes[id])
                 // An array's descriptor gives the size of an element; the elements follow the length.
                 val element = mir_type(args[0])
                 val methods = method_table(l, t)
                 val shape = VariantLayout(l.descriptors.len(), buf())
-                l.descriptors.push(Descriptor(key, 0, element_size(element), buf(), false, methods, record, element is Some(MRef)))
+                l.descriptors.push(Descriptor(key, 0, element_size(element), buf(), false, methods, record, element is Some(MRef), call_entry(l, t)))
                 variants.push(shape)
             else
                 var fields: Buf[&Type] = buf()
                 for f in l.program.classes[id].fields
                     fields.push(substitute(f.ty.unwrap_or(ErrorType), class_owner(id), args))
-                variants.push(variant_layout(l, key, 0, fields, false, method_table(l, t), record))
+                variants.push(variant_layout(l, key, 0, fields, false, method_table(l, t), record, call_entry(l, t)))
         _ -> panic("a layout of a type that is not data, a tuple or a class: " + key)
     if holds_generic_methods(l, t)
         for v in variants
@@ -293,7 +314,7 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
 
 // One variant's fields at their offsets, and its descriptor; a variant with no field data is one
 // constant object, unless `shared` is false: every object of a class is its own, for its identity.
-private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[&Type], shared: bool, methods: Buf[Option[usize]], record: usize) -> VariantLayout
+private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[&Type], shared: bool, methods: Buf[Option[usize]], record: usize, call: Option[usize]) -> VariantLayout
     var fields: Buf[Option[FieldSlot]] = buf()
     var refs: Buf[usize] = buf()
     var size = 0usize
@@ -305,7 +326,7 @@ private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[
                 size += field_size(m)
             None -> fields.push(None)
     val shape = VariantLayout(l.descriptors.len(), fields)
-    l.descriptors.push(Descriptor(name, tag, size, refs, shared && size == 0, methods, record, false))
+    l.descriptors.push(Descriptor(name, tag, size, refs, shared && size == 0, methods, record, false, call))
     shape
 
 /** The bytes an array element of machine type `t` takes: what storing one writes, a power of two up
@@ -334,20 +355,58 @@ private method_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
                 table.push(None)
                 continue
         val symbol = l.program.symbols[m]
-        if is_abstract_method(symbol) || symbol.decl.type_params.len() > 0 || missing[p] || !slot_used(l, p)
+        if is_abstract_method(symbol) || symbol.decl.type_params.len() > 0 || missing[p] || !slot_used(l, p, symbol.decl.name, t)
             table.push(None)
             continue
         table.push(Some(instance(l, m, implementation_args(l, t, m))))
     table
 
-private slot_used(l: *Lowering, position: usize) -> bool = position < l.used_slots.len() && l.used_slots[position]
+/** The function a call of a value of class or data type `t` as a function value runs: the type's
+ * `apply` for the function type it is a subtype of, once the program calls a function value. */
+private call_entry(l: *Lowering, t: &Type) -> Option[usize]
+    if !l.calls_values then return None
+    val m = *t match
+        Class(k, _, _) -> l.program.classes[k].call?
+        Data(d, _, _) -> l.program.data[d].call?
+        _ -> return None
+    Some(instance(l, m, implementation_args(l, t, m)))
 
-/** Records a call through `position` of a method table. */
-private use_slot(l: *Lowering, position: usize)
-    while l.used_slots.len() <= position
-        l.used_slots.push(false)
-    if l.used_slots[position] then return
-    l.used_slots.set(position, true)
+/** Whether `t` names a type parameter or an unsolved type anywhere in it. */
+private names_type_parameter(t: &Type) -> bool = *t match
+    TypeVar(_, _, _) -> true
+    Var(_) -> true
+    Tuple(items) -> any_names_type_parameter(items)
+    Function(params, result) -> any_names_type_parameter(params) || names_type_parameter(result)
+    ByName(inner) -> names_type_parameter(inner)
+    Data(_, _, args) -> any_names_type_parameter(args)
+    Class(_, _, args) -> any_names_type_parameter(args)
+    _ -> false
+
+private any_names_type_parameter(items: Buf[&Type]) -> bool
+    for item in items
+        if names_type_parameter(item) then return true
+    false
+
+/** Whether a call through `position` of a method table reaches the method `name` on an object of type
+ * `t`: one of that method whose receiver's static type `t` has. Different traits' methods may share
+ * a position in different types' tables, so the name tells them apart. */
+private slot_used(l: *Lowering, position: usize, name: string, t: &Type) -> bool
+    if position >= l.slot_calls.len() then return false
+    for call in l.slot_calls[position]
+        if call.name == name && always_is(l, t, call.receiver) then return true
+    false
+
+/** Records a call through `position` of a method table, of the method `name`, on a receiver of static
+ * type `receiver`, `Any` where any object may be the receiver. */
+private use_slot(l: *Lowering, position: usize, name: string, receiver: &Type)
+    while l.slot_calls.len() <= position
+        l.slot_calls.push(buf())
+    var known: Buf[SlotCall] = buf()
+    for k in l.slot_calls[position]
+        if k.name == name && same_type(k.receiver, receiver) then return
+        known.push(k)
+    known.push(SlotCall(name, receiver))
+    l.slot_calls.set(position, known)
     l.new_slots = true
 
 // Fills the positions that came into use since the last time in the method tables already made, each
@@ -359,6 +418,8 @@ private fill_used_slots(l: *Lowering) -> bool
     for i in 0..<l.descriptors.len()
         val t = l.record_types[l.descriptors[i].record]
         if !(*t is Data(_, _, _) || *t is Class(_, _, _)) then continue
+        if l.descriptors[i].call is None
+            if call_entry(l, t) is Some(f) then l.descriptors[i].call = Some(f)
         val old = l.descriptors[i].methods
         val table = method_table(l, t)
         var methods: Buf[Option[usize]] = buf()
@@ -453,13 +514,13 @@ private hold_generic_slots(l: *Lowering, descriptor: usize, t: &Type)
 /** The table slot of a call through a method table to the method at checker position `position`,
  * named `name`, with its own type arguments `type_args`: made when first asked for, and filled in
  * every descriptor holding such a method there. */
-private generic_slot(l: *Lowering, position: usize, name: string, type_args: Buf[&Type]) -> usize
-    var key = s"$position $name"
+private generic_slot(l: *Lowering, position: usize, name: string, type_args: Buf[&Type], receiver: &Type) -> usize
+    var key = s"$position $name ${type_key(receiver)}"
     for t in type_args
         key = key + "|" + type_key(t)
     if l.generic_index.get(key) is Some(index) then return l.generic_base + index
     val index = l.generic_slots.len()
-    l.generic_slots.push(GenericSlot(position, name, type_args))
+    l.generic_slots.push(GenericSlot(position, name, type_args, receiver))
     l.generic_index.put(key, index)
     for h in l.generic_holders
         fill_generic_slot(l, h.descriptor, h.ty, index)
@@ -468,9 +529,10 @@ private generic_slot(l: *Lowering, position: usize, name: string, type_args: Buf
 // Fills generic slot `s` of a descriptor of type `t` with `t`'s implementation of the method, at the
 // slot's own type arguments after those of the type that declares the implementation. A type holding
 // another method at that position, or none, or an abstract one, leaves the slot empty: no call reaching
-// the slot is made on it.
+// the slot is made on it. So does a type a value of the slot's receiver type never has.
 private fill_generic_slot(l: *Lowering, descriptor: usize, t: &Type, s: usize)
     val slot = l.generic_slots[s]
+    if !always_is(l, t, slot.receiver) then return
     val entries = checker_table(l, t)
     if slot.position >= entries.len() then return
     val m = entries[slot.position] match
@@ -514,6 +576,7 @@ private construct(l: *Lowering, e: &TExpr, variant: usize, args: Buf[&TExpr]) ->
     for i in 0..<values.len()
         if shape.fields[i] is Some(field)
             if values[i] is Some(v) then l.insts.push(Store(field_address(l, Value(object), field), v))
+    l.insts.push(Publish)
     Some(Value(object))
 
 // The parts of a tuple-typed expression, in order. A tuple written out is never made: its parts are
@@ -625,7 +688,7 @@ private box_descriptor(l: *Lowering, t: MirType) -> usize
     var refs: Buf[usize] = buf()
     if t is MRef then refs.push(0)
     val d = l.descriptors.len()
-    l.descriptors.push(Descriptor("box of " + key, 0, field_size(t), refs, false, buf(), 0, false))
+    l.descriptors.push(Descriptor("box of " + key, 0, field_size(t), refs, false, buf(), 0, false, None))
     l.boxes.put(key, d)
     d
 
@@ -720,7 +783,7 @@ private value_box(l: *Lowering, t: &Type) -> usize
         Some(m) -> field_size(m)
         None -> 0
     val d = l.descriptors.len()
-    l.descriptors.push(Descriptor("box of " + type_name(t), 0, size, buf(), size == 0, buf(), record_of(l, t), false))
+    l.descriptors.push(Descriptor("box of " + type_name(t), 0, size, buf(), size == 0, buf(), record_of(l, t), false, None))
     l.boxes.put(key, d)
     d
 
@@ -734,6 +797,7 @@ private box_value(l: *Lowering, t: &Type, value: Option[Operand]) -> Option[Oper
     val object = fresh(l, MRef)
     l.insts.push(Alloc(object, value_box(l, t)))
     l.insts.push(Store(field_address(l, Value(object), FieldSlot(0, m)), v))
+    l.insts.push(Publish)
     Some(Value(object))
 
 /** Where a descriptor's type record is: after the collector's kind and three words. */
@@ -819,15 +883,15 @@ private machine_name(t: MirType) -> string = t match
     MPtr -> "address"
     MRef -> "reference"
 
-// A closure is its entry's address and then the value of each local and top-level
-// parameter the function captures; a boxed local is captured as its box, so it stays shared.
-private closure_shape(l: *Lowering, function: usize, type_args: Buf[&Type]) -> ClosureShape
+// A closure is the value of each local and top-level parameter the function captures; a boxed local
+// is captured as its box, so it stays shared. Its descriptor's `call` is `entry`, the function's code.
+private closure_shape(l: *Lowering, function: usize, type_args: Buf[&Type], entry: usize) -> ClosureShape
     val key = instance_key(function, type_args, false)
     if l.shapes.get(key) is Some(shape) then return shape
     val symbol = l.program.symbols[function]
     var fields: Buf[FieldSlot] = buf()
     var refs: Buf[usize] = buf()
-    var size = 8usize
+    var size = 0usize
     symbol.root match
         Some(root) ->
             for x in symbol.captured_locals
@@ -843,7 +907,7 @@ private closure_shape(l: *Lowering, function: usize, type_args: Buf[&Type]) -> C
                     size += field_size(m)
         None -> ()
     val shape = ClosureShape(l.descriptors.len(), fields)
-    l.descriptors.push(Descriptor("closure of " + function_symbol(l.program, function, type_args), 0, size, refs, false, buf(), 0, false))
+    l.descriptors.push(Descriptor("closure of " + function_symbol(l.program, function, type_args), 0, size, refs, false, buf(), 0, false, Some(entry)))
     l.shapes.put(key, shape)
     shape
 
@@ -858,7 +922,7 @@ private function_value(l: *Lowering, function: usize, type_args: Buf[&Type]) -> 
         for t in type_args
             concrete_args.push(concrete(l, t))
     val entry = entry_instance(l, function, concrete_args)
-    val shape = closure_shape(l, function, concrete_args)
+    val shape = closure_shape(l, function, concrete_args, entry)
     if shape.fields.len() == 0
         val key = instance_key(function, concrete_args, false)
         if l.closure_index.get(key) is Some(index) then return ConstClosure(index)
@@ -875,9 +939,9 @@ private function_value(l: *Lowering, function: usize, type_args: Buf[&Type]) -> 
         if l.param_values[x] is Some(v) then values.push(Value(v))
     val object = fresh(l, MRef)
     l.insts.push(Alloc(object, shape.descriptor))
-    l.insts.push(Store(field_address(l, Value(object), FieldSlot(0, MPtr)), FunctionAddress(entry)))
     for i in 0..<values.len()
         l.insts.push(Store(field_address(l, Value(object), shape.fields[i]), values[i]))
+    l.insts.push(Publish)
     Value(object)
 
 // Calls a method through the method table of the receiver, `args[0]`: whichever override fills the
@@ -901,14 +965,18 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
     val result = machine(l, substitute(symbol.result.unwrap_or(Unit), symbol.type_owner, concrete_args))
     // A method with type parameters of its own has a slot for each list of its own type arguments.
     var position = slot
+    // A receiver whose type still names a type parameter, as `Self` does in a trait's default body
+    // compiled once for every type, may be an object of any type.
+    val seen = concrete(l, args[0].ty)
+    val receiver: &Type = if names_type_parameter(seen) then AnyType else seen
     val own = symbol.decl.type_params.len()
     if own > 0
         var own_args: Buf[&Type] = buf()
         for i in concrete_args.len() - own..<concrete_args.len()
             own_args.push(concrete_args[i])
-        position = generic_slot(l, slot, symbol.decl.name, own_args)
+        position = generic_slot(l, slot, symbol.decl.name, own_args, receiver)
     else
-        use_slot(l, position)
+        use_slot(l, position, symbol.decl.name, receiver)
     val code = fresh(l, MPtr)
     l.insts.push(MethodSlot(code, operands[0], position))
     val dest = result match
@@ -1008,8 +1076,12 @@ private bound_call(l: *Lowering, e: &TExpr, function: usize, slot: Option[usize]
         concrete_args.push(concrete(l, type_args[i]))
     direct_call(l, e, m, args, concrete_args)
 
-// Calls a function value: its entry is at offset 0, and takes the closure before the arguments.
+// Calls a function value, a closure or an object of a class or data type that is a function: its
+// descriptor's `call` takes the object before the arguments.
 private call_value(l: *Lowering, callee: &TExpr, args: Buf[&TExpr]) -> Option[Operand]
+    if !l.calls_values
+        l.calls_values = true
+        l.new_slots = true
     val target = lower_expr(l, callee)?
     var operands: Buf[Operand] = buf()
     operands.push(target)
@@ -1029,11 +1101,12 @@ private call_value(l: *Lowering, callee: &TExpr, args: Buf[&TExpr]) -> Option[Op
             result = machine(l, r)
         ByName(r) -> result = machine(l, r)
         _ -> panic("a call of a value that is not a function")
-    val code = load_field(l, target, FieldSlot(0, MPtr))
+    val code = fresh(l, MPtr)
+    l.insts.push(CallEntry(code, target))
     val dest = result match
         Some(t) -> Some(fresh(l, t))
         None -> None
-    push_call(l, dest, Indirect(code, MirSignature(params, result)), operands)
+    push_call(l, dest, Indirect(Value(code), MirSignature(params, result)), operands)
     dest match
         Some(id) -> Some(Value(id))
         None -> None
@@ -1056,6 +1129,7 @@ private bind_local(l: *Lowering, x: usize, value: Option[Operand])
     val box = fresh(l, MRef)
     l.insts.push(Alloc(box, box_descriptor(l, t)))
     l.insts.push(Store(field_address(l, Value(box), FieldSlot(0, t)), v))
+    l.insts.push(Publish)
     store(l, l.local_slots[x], Some(Value(box)))
 
 /** A type of the code being lowered, with the instance's type arguments substituted. */
@@ -1155,6 +1229,8 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     f.body match
         Some(body) ->
             val result = lower_expr(l, body)
+            // A class's object is made by its constructor and complete when the constructor is.
+            if is_class_constructor(l.program, f.symbol) then l.insts.push(Publish)
             finish(l, returning(l, result))
         None ->
             if binding_target(symbol.decl) is Some(_) then binding_body(l, symbol, shim_symbol(function_symbol(l.program, f.symbol, inst.type_args)))
@@ -1178,7 +1254,7 @@ private lower_entry(l: *Lowering, inst: Instance) -> MirFunction
     l.returns_value = direct.result is Some(_)
     l.current = new_block(l)
     val symbol = l.program.symbols[inst.function]
-    val shape = closure_shape(l, inst.function, inst.type_args)
+    val shape = closure_shape(l, inst.function, inst.type_args, entry_instance(l, inst.function, inst.type_args))
     var i = 0usize
     for x in symbol.captured_locals
         if machine(l, l.locals[x].ty) is Some(_)
@@ -1211,19 +1287,26 @@ private returning(l: *Lowering, value: Option[Operand]) -> Terminator
 // A Sysl binding is a function like any other in the object file; its body passes its parameters to
 // the binding's shim, with the context first, and returns what the shim returns. The shim is
 // generated Sysl, called with the C convention, which converts each value at the boundary. A result
-// the shim makes objects for comes with the descriptors and constant objects it makes them by.
+// the shim makes objects for comes with the descriptors and constant objects it makes them by, and a
+// parameter the shim reads through the core library, a vector, with the functions it reads it by:
+// each parameter's layouts after the parameters, then the result's.
 private binding_body(l: *Lowering, symbol: FunctionSymbol, shim: string)
     var args: Buf[Operand] = buf()
     var params: Buf[MirType] = buf()
     var crossings: Buf[&Crossing] = buf()
-    var unused: Buf[Operand] = buf()
+    var layouts: Buf[Operand] = buf()
     for i in 0..<symbol.params.len()
-        crossings.push(crossing(l, concrete(l, symbol.params[i]), &unused))
+        var own: Buf[Operand] = buf()
+        val c = crossing(l, concrete(l, symbol.params[i]), &own)
+        crossings.push(c)
+        // An array of bytes is copied into Sysl as it is, with no layout.
+        if !(c.form is Bytes)
+            for operand in own
+                layouts.push(operand)
         if l.param_values[i] is Some(v)
             args.push(Value(v))
             params.push(l.values[v])
     val result_type = concrete(l, symbol.result.unwrap_or(Unit))
-    var layouts: Buf[Operand] = buf()
     val result_crossing = crossing(l, result_type, &layouts)
     for operand in layouts
         params.push(if operand is ConstObject(_) then MRef else MPtr)
@@ -1251,19 +1334,19 @@ private crossing(l: *Lowering, t: &Type, layouts: *Buf[Operand]) -> &Crossing
             if array && *args[0] is Byte
                 layouts.push(DescriptorAddress(layout(l, t).variants[0].descriptor))
                 return Crossing(t, Bytes, buf(), 1)
-            // A vector's elements are an array made as an `Array` of its element type is, which the
-            // vector holds in its one field.
+            // A vector out of Sysl is made from an array made as an `Array` of its element type is;
+            // into Sysl, its elements are read a leaf at a time. The core library's functions that do
+            // both follow the array's descriptor.
             val start = layouts.len()
-            var vector: Option[usize] = None
             if array
                 layouts.push(DescriptorAddress(layout(l, t).variants[0].descriptor))
             else
                 layouts.push(DescriptorAddress(layout(l, array_type(l, args[0])).variants[0].descriptor))
-                val shape = layout(l, t)
-                layouts.push(DescriptorAddress(shape.variants[0].descriptor))
-                vector = Some(shape.variants[0].fields[0].unwrap().offset)
+                layouts.push(vector_function(l, "vectorOfArray", args[0]))
+                layouts.push(vector_function(l, "vectorLength", args[0]))
+                layouts.push(vector_function(l, "vectorLeaf", args[0]))
             val element = crossing(l, args[0], layouts)
-            return Crossing(t, Elements(element, vector), buf(), layouts.len() - start)
+            return Crossing(t, Elements(element, !array), buf(), layouts.len() - start)
         Data(id, _, args) ->
             val d = l.program.data[id]
             val shape = layout(l, t)
@@ -1286,6 +1369,17 @@ private crossing(l: *Lowering, t: &Type, layouts: *Buf[Operand]) -> &Crossing
                 None -> if d.name == "Option" then OptionForm else ResultForm
             return Crossing(t, form, variants, layouts.len() - start)
         _ -> return Crossing(t, Plain, buf(), 0)
+
+// The address of the core library's function `name` for vectors of `element`, which a shim calls to
+// make or to read a vector.
+private vector_function(l: *Lowering, name: string, element: &Type) -> Operand
+    for id in 0..<l.program.symbols.len()
+        val s = l.program.symbols[id]
+        if s.module_name == "avin" && s.name == name && s.owner_class is None && s.receiver is None
+            var args: Buf[&Type] = buf()
+            args.push(element)
+            return FunctionAddress(instance(l, id, args))
+    panic("the core library declares no " + name)
 
 // The core library's `Array` of `element`.
 private array_type(l: *Lowering, element: &Type) -> &Type
@@ -2292,7 +2386,7 @@ private operator_call(l: *Lowering, t: &Type, name: string, args: []Operand, res
 
 private operator_values(l: *Lowering, t: &Type, name: string, values: Buf[Operand], result: Option[MirType]) -> Option[Operand]
     val m = l.program.core.method_named(name).unwrap()
-    if decided_at_run_time(l, t) then return dispatch_operands(l, core_position(l, m), values, result)
+    if decided_at_run_time(l, t) then return dispatch_operands(l, core_position(l, m), name, values, result)
     explicit_implementation(l, t, m) match
         Some(index) -> call_instance(l, index, values, result)
         None ->
@@ -2322,12 +2416,13 @@ private call_instance(l: *Lowering, index: usize, operands: Buf[Operand], result
         Some(id) -> Some(Value(id))
         None -> None
 
-/** A call of the method at `position` of the method table of `operands[0]`'s object. */
-private dispatch_operands(l: *Lowering, position: usize, operands: Buf[Operand], result: Option[MirType]) -> Option[Operand]
+/** A call of the method `name` at `position` of the method table of `operands[0]`'s object, which
+ * may be of any type. */
+private dispatch_operands(l: *Lowering, position: usize, name: string, operands: Buf[Operand], result: Option[MirType]) -> Option[Operand]
     var params: Buf[MirType] = buf()
     for o in operands
         params.push(operand_type(l, o))
-    use_slot(l, position)
+    use_slot(l, position, name, AnyType)
     val code = fresh(l, MPtr)
     l.insts.push(MethodSlot(code, operands[0], position))
     val dest = result match

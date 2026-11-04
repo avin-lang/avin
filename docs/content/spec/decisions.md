@@ -85,15 +85,18 @@ a decision changes, this page and the chapter change together.
   through a table uses gets a slot of its own in the table of every type implementing the method,
   filled with that type's implementation instantiated at those arguments; such a call also costs one
   virtual call.
-- An `impl` adds methods and conformances, never state. Its methods are a class's or an object's own
-  methods; for a `data` or built-in type they are called directly. Inside them the receiver is
+- An `impl` adds methods and conformances, never state. Written in a class's or an object's module,
+  its methods are the class's own; for a `data` or built-in type, or written elsewhere, they are
+  called directly. Inside them the receiver is
   implicit, as in a class, with a one-variant `data` type's fields in scope by bare name.
 - The methods of `impl Trait for Type` implement the trait's methods without `override`, and each is
   a method of the trait or of one it requires. A `data` type's method implementing a trait method is
   declared in an impl of that trait.
 - A `data` type conforming to a trait gives every variant's descriptor the same method table, at the
   trait positions classes use, so a trait-typed call costs the same whatever the value is.
-- A generic impl writes the type's parameters, in order, as its own: `impl[T] Show for Box[T]`.
+- A generic impl of a trait writes the type's parameters, in order, as its own:
+  `impl[T] Show for Box[T]`. An impl without `for` may also name a type built from its parameters
+  (settled 2026-11-04, below).
 - Settled 2026-11-03: [bounds](/spec/generics/#bounds) are traits or classes, written `[T: A + B]`.
   A value of a bounded `T` has its bounds' methods, `val`s and visible fields, and is a value of
   each bound's type; type arguments are held to their bounds where written and where inferred, and
@@ -112,8 +115,9 @@ a decision changes, this page and the chapter change together.
   its impls name are.
 - A type pattern matches an object whose type conforms to the pattern's type through variance, as
   the checker's subtyping does: a `List[Dog]` held as an `Any` matches `List[Animal]`.
-- The built-in types belong to the core library's module, `avin`; an impl adding methods to one is
-  written there.
+- The built-in types belong to the core library's module, `avin`; a conformance of one is written
+  there or in the trait's module. An impl that only adds methods may be written in any module
+  (settled 2026-11-04, below).
 - Functions and methods may be overloaded by parameter types. A call takes the most specific
   overload that accepts its arguments, chosen at compile time; an ambiguous call is an error.
   Same-named declarations with the same parameter types are an error.
@@ -422,9 +426,6 @@ a decision changes, this page and the chapter change together.
   collection's, so a program's own class with such a companion is written as a literal too. A `List`
   literal is built from the back with `::`, since `List` is a data type.
 - A collection literal compared with `==`, `!=` or an ordering takes the other operand's type.
-- `Vector` keeps its elements in one array that is never written after the vector is made: indexing
-  is constant time and a changed vector is a copy. A persistent structure may replace it without
-  changing its interface.
 - A trap inside the core library, a `fail` or a failed check such as an overflow alike, reports the
   place where the program last entered the library: the program's own call, however many library
   calls deep the trap is and whether the program reached the library directly, through a method
@@ -506,9 +507,6 @@ Settled by the user on 2026-11-03:
   something of the elements, are added to `Seq` by impls (`impl[T] Seq[T]`, `impl[T: Display]
   Seq[T]`, `impl[T: Ord] Seq[T]`), written once for every sequence; `contains` and `indexOf` are
   `exists` and `indexWhere`, so on a list they walk it once.
-- A sequence passed or stored where a function from one `int` is expected becomes that function,
-  through the core library's `elementAt`; the conversion happens where the value is written, as a
-  conversion to `Any` does.
 - A sequence pattern on a sequence other than a list asks `length()` once and then reads, with
   `apply`, each element whose pattern is not `_`, in order, stopping at the first that fails.
 - `Deque[T]` is a ring over an array, doubling when full as a buffer does, its spare places zero
@@ -556,6 +554,46 @@ Settled by the user on 2026-11-03:
 
 Settled by the user on 2026-11-04:
 
+- **`Vector[+T]` is a persistent, radix-balanced tree of arrays of 32**, with a prefix and a suffix
+  beside a balanced middle at every level, and stays the default sequence (`[1, 2]`, `[]T`,
+  `main(args)`). Indexing and `updated` take one array per level, at most six; `:+` and `+:` take
+  amortized constant time; slicing, `take`, `drop` and their kin take time in the depth and share
+  every array they do not cut; `++` takes time in the shorter operand. A vector's arrays are
+  exactly sized and never written once they are in a tree. The one-array immutable sequence
+  remains as **`ArraySeq[+T]`**, for elements built once and then read, with no level between an
+  index and its element; every changed `ArraySeq` is a copy. Every collection has `toArraySeq()`.
+  See [collections](/spec/collections/#vector).
+
+- **An impl that only adds methods may be written in any module** (a relaxed impl); in another module
+  than its type's or trait's it is an [extension](/spec/declarations/#extensions): `impl string`,
+  `impl[T: Ord] Seq[T]`, `impl[T] Option[Option[T]]`, `impl Box` for another module's class. Its
+  methods are seen in its own module and in every file importing that module, whole or any
+  declaration of it, with no further step; a file importing neither does not see them, and the
+  core library's are seen everywhere. A type's own methods are found first: an extension method a
+  type's own or inherited method of the same name and parameter types always hides is an error at
+  its declaration, and one added to a trait is passed over for a type that has such a method. Two
+  seen extensions of different modules adding one name and parameter types to a receiver make the
+  call an error naming both modules. An extension's `private` methods are private to its module. Its
+  methods reach no private member of another module's type, are in no method table and are not
+  overridden; `self` is the receiver and the type's public fields and methods are in scope by bare
+  name. Infix calls, method values and calls through a bound see extensions as dotted calls do,
+  a bound's where the generic function is written. Conformances, `impl Trait for Type`, stay in the
+  module of the type or of the trait.
+
+- **Sequences, sets and maps are functions, by subtyping.** `Seq[+T]` is a subtype of `(int) -> T`,
+  through its `apply(index)`; `Set[A]`, immutable and mutable, of `(A) -> bool`; `Map[K, V]`,
+  immutable and mutable, of `(K) -> V`, whose `apply` traps on a missing key as `m(k)` does. A
+  collection is passed, stored and called where its function type is expected with no conversion,
+  and variance holds through it: a `Vector[Dog]` is an `(int) -> Animal`. For a set `s`, `s(x)` is
+  legal: `true` when `x` is an element of `s` and `false` otherwise, the set's `apply(x) -> bool`,
+  which is `contains`.
+- A class or trait names a function type among its parents after `:` (`trait Seq[+T]: Iterable[T],
+  (int) -> T`), and a data type or class through an impl with no bounds of its own (`impl[K, V] (K)
+  -> V for Map[K, V]`), in the type's own module. The type then has an `apply` taking exactly that
+  type's parameters and yielding its result or a subtype; `apply` implements no trait method, so it
+  is not marked `override` for it. A type is at most one function type, counting those of its
+  superclass and its traits, and its parameters keep their variance there. A built-in type is no
+  function.
 - A function type with one parameter is written without parentheses: `int -> string`,
   `Option[T] -> bool`. `->` in a type groups to the right, so `int -> int -> int` is
   `int -> (int -> int)`; `(A) -> B` is the same type as `A -> B`, `(A, B) -> C` takes two
@@ -569,21 +607,93 @@ Settled by the user on 2026-11-04:
   is the same type; `Seq[string]` and `Array[string]` are errors), it has no default, and any other
   parameter list is an error naming the two forms. The result rules are unchanged. A program built
   for its tests does not run `main`, so tests see no arguments.
+- A `match` with nothing before it is a [function literal](/spec/operators-and-control-flow/#match-functions)
+  of one value, whose arms are ordinary `match` arms: `xs.collect(match Some(n) -> n)`, one arm on
+  the `match` line, or an indented block of them, inside parentheses or after an infix method's
+  name. Its parameter type comes from the expected type, as a lambda's does, and with none it is an
+  error. Where `A -> B` is expected its arms must cover every `A`; where `PartialFunction[A, B]` is
+  expected they need not. `PartialFunction[-A, +B]` is a core-library trait with `isDefinedAt`, a
+  call that traps at the program's call site outside its domain, `lift`, `orElse` and
+  `applyOrElse`; a literal tests its patterns and guards once per call, `lift` or `applyOrElse`.
+  Every collection with `map` has `collect`, every `Iterable` has `collectFirst`, and `Option` has
+  `collect`. A `PartialFunction[A, B]` is a subtype of `A -> B`, through its `apply`, so it passes
+  wherever one is expected and traps there outside its domain.
 - `[]T` in a type position means exactly `Vector[T]`: `xs: []int`, `[][]int`, `Option[[]string]`,
   `main(args: []string)`. Its element is a name or a parenthesized type, so `[]int -> int` is a
   function from a vector and `[](int -> int)` a vector of functions. A type pattern takes it
   without parentheses, `v: []int -> body`. There is no fixed-length `[N]T` (an error); error
   messages print `Vector[int]`.
+- The thread model ([threads](/spec/threads/)): `avin.threads.spawn(body)` starts a closure on a
+  new thread with an 8 MiB stack and `join()` gives back its result; a structured `scope` joins
+  every thread started in it; a trap in any thread stops the program, and the program ends when
+  `main` returns. The heap, module-level values and captured `var`s are shared. The library offers
+  `Mutex[T]` owning its value, `Condition`, sequentially consistent `Atomic[T]`, `Channel[T]` and
+  `Once`, and every wait marks its thread safe for the collector. A data race is not undefined
+  behaviour: heap fields and module-level variables are accessed with LLVM's `unordered` ordering,
+  so a racing read sees some value written to that word, and a constructor ends with a release
+  fence, so no thread sees an object without its header and constructor-set fields. Actors are
+  scheduled onto a pool of these threads.
+- Details of starting and joining: `spawn` gives back a `Thread[T]` whose `join()` any thread may
+  call, any number of times and at once; one waits for the thread and the others for that wait. A
+  thread's handle is collected like any object once nothing reaches it; a thread never joined keeps
+  its stack until the program ends. `s.spawn` is called by the thread running the scope's body
+  while the scope is open, and anything else traps, so the scope sees every thread it has to join;
+  a thread the scope started starts more through a scope of its own. When several threads trap at
+  once, or one traps while another calls `exit`, only the first stops the program: its output is
+  flushed once and its reason is the one reported.
+- [Repeated parameters](/spec/declarations/#repeated-parameters): `values: T*` is the last
+  parameter, at most one, named, with no default and not by-name; inside the function it is a
+  `Vector[T]`. A call gives it every positional argument from its position on, each checked
+  against `T` (so generic `T` is inferred from them), or splices one `Iterable[T]` with `xs*` as
+  its only argument, written last: a `Vector[T]` is passed as it is, any other sequence copied.
+  `f(1, xs*)` into the one parameter, `xs*` anywhere else, and naming the repeated parameter are
+  errors. A function with one, used as a value, has the type `(…, Vector[T]) -> R`. A method
+  overriding or implementing another repeats the same parameter or neither does; `main` takes
+  none; `data` fields cannot be repeated. A method whose only required parameter precedes a
+  repeated one is called infix with one argument.
+- An impl without `for` adds methods to any type built from its parameters
+  ([declarations](/spec/declarations/#impl)): `impl[T] Option[Option[T]]`,
+  `impl[A, B] Pair[A, List[B]]`, `impl[T] Seq[Seq[T]]`, `impl[K, V] Iterable[(K, V)]`. Every
+  parameter must appear in the type. A call matches the receiver's static type against it,
+  seeing a reference through its traits and superclasses only at covariant parts, and holds the
+  learned parameters to the impl's bounds; a receiver that does not match is an error saying what
+  it would need to be. Two impls that both match a receiver and add a method of one name and
+  parameter types make the call an error, as does such a method clashing with the type's own. An
+  impl of a trait still names its type's parameters in order, so conformances never overlap. The
+  core library adds `flatten` to `Option[Option[T]]`, `Result[Result[T, E], E]` and `Seq[Seq[T]]`
+  (a `Vector[T]`), `toMap()` to `Iterable[(K, V)]` (keys bounded as a map's) and `unzip()` to
+  `Seq[(A, B)]`.
+- A heap field or module variable wider than 64 bits is accessed as untorn 64-bit words: a racing
+  read of it may combine words of different writes ([threads](/spec/threads/#the-memory-model)).
+- [Trailing blocks](/spec/operators-and-control-flow/#trailing-blocks): an indented block on the
+  lines after a call is the call's last argument, given to the callee's last parameter. A by-name
+  parameter takes the block as its delayed expression (`retry(3)` + block); a function parameter
+  takes a lambda whose parameters end the call's line, one name or a parenthesized list after
+  the call's parentheses (`withFile(path) f ->`, `zipWith(a, b) (x, y) ->`). A callee with no
+  other arguments is written without parentheses (`scope s ->`, `s.spawn` + block). It applies
+  wherever an expression ends a line (`val r = retry(3)` + block, a method call, a match arm's
+  body), and never in the test of `if`, `elif`, `while` or `do … while`, a `for` source or guard,
+  or a class's parents, where the block is the form's body. A local function's header keeps its
+  meaning: `name()` or `name(x: T)` before a block declares one. A block whose only line is a name
+  and an operand stays the infix-continuation error. A block for a last parameter that is neither
+  by-name nor a function, already given, or absent is an error.
 
 **Deferred**
 
 - Public C interoperability. Until then, C is reached through Sysl.
 - Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
 - Async and await.
-- Partial-function literal syntax, which the user has explicitly left undecided.
 
 ## Proposed
 
+- Repeated parameters beside overloads and constructors
+  ([declarations](/spec/declarations/#repeated-parameters)): an overload with a repeated parameter
+  is a candidate only where no overload without one accepts the call, so `pick(x: long)` takes
+  `pick(1)` beside `pick(xs: int*)`; among those with one, the arguments are compared by the
+  element type. A class's constructor may end with a repeated parameter, whose field is a
+  `Vector[T]` (`class Path(val parts: string*)`), and a subclass passes it on with `: Path(parts*)`.
+  The core library gains `max(first, rest*)` and `min(first, rest*)` on `T: Ord`, answering the
+  greatest or least of one value or more, the first of equal ones.
 - Option, Result and string methods ([errors](/spec/errors/), [types](/spec/types/#string)):
   `Option` gains `exists`, `forall`, `contains` (on `T: Eq`, which every type meets), `toList`,
   `toVector` and `zip`; `Result` gains `exists`, `forall`, `toList` and `orElse(f)`, where `f`
@@ -594,9 +704,22 @@ Settled by the user on 2026-11-04:
   empty separator (no piece boundary is defined there). `lines` ends a line at `\n` or `\r\n`; a
   terminator at the end starts no further line, the empty string has no lines, and a lone `\r`
   stays in its line. `take`, `drop`, `takeRight`, `dropRight` and the padding widths clamp rather
-  than trap. `flatten` on `Option[Option[T]]` and `Result[Result[T, E], E]` is not offered: an
-  `impl` cannot name a nested type, and a method on the unnested type has no way to ask `T` to be
-  an option.
+  than trap.
+
+- The methods every `Iterable` has ([collections](/spec/collections/#methods-every-iterable-has)):
+  folds, `reduce` (trapping when empty) and `reduceOption`, searches, `count`, `minBy`/`maxBy` and
+  `min`/`max` (answering `Option`), `mkString`, `partition`, `groupBy`, `groupMap`,
+  `groupMapReduce`, the conversions and `zipWithIndex` are written once on `Iterable` and replace
+  the copies `Seq` and `Set` had. A collection they make is a `Vector`, whatever the receiver:
+  `partition` answers `(Vector[T], Vector[T])`, `groupBy` a `Map[K, Vector[T]]`, `zipWithIndex` a
+  `Vector[(T, int)]`, so a set's or a map's partition keeps every element, equal results included,
+  and a list's comes back indexed. A type's own method of the same signature still answers where the
+  type is known (`List.toList()` is the list itself). `Iterator` has lazy `map`, `filter`, `take`,
+  `drop`, `takeWhile`, `dropWhile`, `zip` and `zipWithIndex` answering iterators; its
+  `zipWithIndex` is the trait's own method and so is found before `Iterable`'s. To compile these, a
+  method table holds a method at a position only for the types a call through that position can
+  reach, by the receiver's static type, so a trait method that makes an instance at a larger type
+  argument (`zipWithIndex` on an `Iterator[(T, int)]`) is not compiled for every type it makes.
 
 - Sorting ([collections](/spec/collections/#sorting)): every `Seq` has `sorted()` (elements `Ord`),
   `sortedBy[K: Ord](key)` and `sortedWith(compare: (T, T) -> int)`, answering a `Vector`; `List`
@@ -644,17 +767,6 @@ Settled by the user on 2026-11-04:
   `Eq` and `Debug` bounds, showing both values' `Debug` forms) trap at the assertion's place. Not yet
   built: `@tests` files, setup and teardown hooks, `should_trap`, `ignore` and `timeout` arguments,
   and tests answering with a `Result`.
-- The thread model ([threads](/spec/threads/)): `avin.threads.spawn(body)` starts a closure on a
-  new thread with an 8 MiB stack and `join()` gives back its result; a structured `scope` joins
-  every thread started in it; a trap in any thread stops the program, and the program ends when
-  `main` returns. The heap, module-level values and captured `var`s are shared. The library offers
-  `Mutex[T]` owning its value, `Condition`, sequentially consistent `Atomic[T]`, `Channel[T]` and
-  `Once`, and every wait marks its thread safe for the collector. A data race is not undefined
-  behaviour: heap fields and module-level variables are accessed with LLVM's `unordered` ordering,
-  so a racing read sees some value written to that word, and a constructor ends with a release
-  fence, so no thread sees an object without its header and constructor-set fields. Actors are
-  scheduled onto a pool of these threads.
-
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

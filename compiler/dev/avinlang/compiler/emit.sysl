@@ -50,11 +50,11 @@ emit_llvm(program: MirProgram) -> string
                 out.push(s"ptr @avin.type.${r.ancestors[j]}")
             out.push("]")
         out.push(" }, align 8\n")
-    // A closure that captures nothing is constant: a header naming its descriptor, then its entry's
-    // address.
+    // A closure that captures nothing is constant: only a header naming its descriptor, whose `call`
+    // is its entry.
     for i in 0..<program.closures.len()
         val k = program.closures[i]
-        out.push(s"@avin.fn.$i.const = private constant { ptr, i64, ptr } { ptr @avin.desc.${k.descriptor}, i64 0, ptr @\"${program.functions[k.function].symbol}\" }, align 16\n")
+        out.push(s"@avin.fn.$i.const = private constant { ptr, i64 } { ptr @avin.desc.${k.descriptor}, i64 0 }, align 16\n")
         constant_payload(&out, s"@avin.fn.$i")
     // A trap site is what the runtime reports when the program stops there: the reason and the file
     // as constant strings, then the line and column.
@@ -87,8 +87,9 @@ emit_llvm(program: MirProgram) -> string
     out.push("\n")
     var intrinsics: Buf[string] = buf()
     val graph = call_graph(program)
+    val collects = collecting_functions(program, graph)
     for i in 0..<program.functions.len()
-        emit_function(&out, &intrinsics, program, graph, i)
+        emit_function(&out, &intrinsics, program, graph, plan_roots(program, graph, collects, i), i)
     for declaration in intrinsics
         out.push(declaration + "\n")
     out.push("\n")
@@ -197,26 +198,20 @@ private c_params(s: MirSignature) -> string
         out = out + ", " + c_type(t)
     out
 
-private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgram, graph: CallGraph, index: usize)
+private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgram, graph: CallGraph, plan: RootPlan, index: usize)
     val f = program.functions[index]
     out.push("define " + result_type(f.signature) + " @\"" + f.symbol + "\"(ptr %ctx")
     for i in 0..<f.signature.params.len()
         out.push(", " + llvm_type(f.signature.params[i]) + s" %v$i")
     out.push(") {\n")
-    // Every reference the function holds is a root: each slot of reference type lives in the
-    // function's frame on the shadow stack, and each reference value is stored to a frame slot of
-    // its own as soon as it exists, so a collection at any call finds all of them. The frame's first
+    // The references live across a collection point are the function's roots, kept in its frame on
+    // the shadow stack (see `plan_roots`): each such value is stored to its frame slot where it is
+    // made, and a local slot of reference type that needs one is that frame slot. The frame's first
     // word links it to the caller's frame; the context's first word is the top frame, which the
-    // function sets to its own on entry and gives back to the caller's on every return.
-    var value_roots: Buf[Option[usize]] = buf()
-    var roots = 0usize
-    for s in f.slots
-        if s is MRef then roots += 1
-    for t in f.value_types
-        if t is MRef
-            value_roots.push(Some(roots))
-            roots += 1
-        else value_roots.push(None)
+    // function sets to its own on entry and gives back to the caller's on every return. A function
+    // with no roots has no frame.
+    val value_roots = plan.value_cells
+    val roots = plan.cells
     val frame = s"{ ptr, i64, [$roots x ptr] }"
     var temp = 0usize
     var polls = 0usize
@@ -229,22 +224,22 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
             // keep; offset 24 in the runtime's context.
             if uses_caller_site(f) then out.push("  %caller.site = getelementptr inbounds i8, ptr %ctx, i64 24\n")
             if roots > 0
-                need(intrinsics, "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)")
+                // Only the slots the collector might read before the function stores to them start
+                // null; every other slot is written before any collection can see it.
                 out.push(s"  %frame = alloca $frame\n")
-                out.push(s"  call void @llvm.memset.p0.i64(ptr %frame, i8 0, i64 ${16 + 8 * roots}, i1 false)\n")
                 out.push(s"  %frame.count = getelementptr inbounds $frame, ptr %frame, i32 0, i32 1\n")
                 out.push(s"  store i64 $roots, ptr %frame.count\n")
                 for k in 0..<roots
                     out.push(s"  %root$k = getelementptr inbounds $frame, ptr %frame, i32 0, i32 2, i64 $k\n")
+                    if plan.zeroed[k] then out.push(s"  store ptr null, ptr %root$k\n")
                 out.push("  %caller = load ptr, ptr %ctx\n")
                 out.push("  store ptr %caller, ptr %frame\n")
                 out.push("  store ptr %frame, ptr %ctx\n")
-            var next_root = 0usize
             for s in 0..<f.slots.len()
-                if f.slots[s] is MRef
-                    out.push(s"  %s$s = getelementptr inbounds $frame, ptr %frame, i32 0, i32 2, i64 $next_root\n")
-                    next_root += 1
-                else out.push(s"  %s$s = alloca ${llvm_type(f.slots[s])}\n")
+                if plan.slot_cells[s] is Some(k) then out.push(s"  %s$s = getelementptr inbounds $frame, ptr %frame, i32 0, i32 2, i64 $k\n")
+                else
+                    out.push(s"  %s$s = alloca ${llvm_type(f.slots[s])}\n")
+                    if plan.slot_zeroed[s] then out.push(s"  store ptr null, ptr %s$s\n")
             for i in 0..<f.signature.params.len()
                 if value_roots[i] is Some(k) then out.push(s"  store ptr %v$i, ptr %root$k\n")
         val block = f.blocks[b]
@@ -287,8 +282,8 @@ private uses_caller_site(f: MirFunction) -> bool
     false
 
 // A safepoint poll: when a collection has asked the other threads to stop, the runtime parks this one
-// until the collection is over. Every reference the function holds is already in its frame, so the
-// stack is consistent wherever a poll is placed. The flag is read with a relaxed atomic load and the
+// until the collection is over. Every reference the function still needs after the poll is already
+// in its frame, so the stack is consistent wherever a poll is placed. The flag is read with a relaxed atomic load and the
 // slow path is a call to a cold function behind a branch weighted as almost never taken, so the
 // common case is one load and a branch that falls through, and the slow path is laid out of line.
 // Polls are placed before every terminator with a back edge, which every cycle of the control flow
@@ -307,7 +302,7 @@ private emit_poll(out: *StrBuilder, intrinsics: *Buf[string], n: usize) -> usize
     out.push(s"run$n:\n")
     n + 1
 
-private successors(term: Terminator) -> Buf[usize]
+successors(term: Terminator) -> Buf[usize]
     var out: Buf[usize] = buf()
     term match
         Jump(target) -> out.push(target)
@@ -320,7 +315,7 @@ private successors(term: Terminator) -> Buf[usize]
 // For each block of `f`, whether its terminator has a back edge: an edge to a block on the
 // depth-first path from the entry to it. Every cycle of the control flow contains one, whatever order
 // the blocks are numbered in, and an `if`'s join is never reached by one.
-private back_edges(f: MirFunction) -> Buf[bool]
+back_edges(f: MirFunction) -> Buf[bool]
     // 0: not reached yet; 1: on the current path; 2: finished.
     var state: Buf[u8] = buf()
     var back: Buf[bool] = buf()
@@ -363,14 +358,14 @@ private const Unlikely: string = "!0 = !{!\"branch_weights\", i32 1, i32 1048575
  * caller's component. Runtime entry points and the shims of Sysl bindings never call compiled code,
  * so they add no edges; a binding that takes an Avin function would add one to every function whose
  * address is taken. */
-private struct CallGraph
+struct CallGraph
     /** The component of each function. */
     component: Buf[usize]
     /** For each component, whether one of its functions has its address taken, so that a call
      * through a function value from that component may come back to it. */
     reentered: Buf[bool]
 
-private call_graph(program: MirProgram) -> CallGraph
+call_graph(program: MirProgram) -> CallGraph
     val n = program.functions.len()
     var taken: Buf[bool] = buf()
     for _ in 0..<n do taken.push(false)
@@ -378,6 +373,7 @@ private call_graph(program: MirProgram) -> CallGraph
     for d in program.descriptors
         for m in d.methods
             if m is Some(g) then taken[g] = true
+        if d.call is Some(g) then taken[g] = true
     for f in program.functions
         for block in f.blocks
             for inst in block.insts
@@ -411,7 +407,7 @@ private call_graph(program: MirProgram) -> CallGraph
 private take(taken: *Buf[bool], o: Operand)
     if o is FunctionAddress(g) then (*taken)[g] = true
 
-private inst_operands(inst: Inst) -> Buf[Operand]
+inst_operands(inst: Inst) -> Buf[Operand]
     var out: Buf[Operand] = buf()
     inst match
         Call(_, callee, args) ->
@@ -436,12 +432,14 @@ private inst_operands(inst: Inst) -> Buf[Operand]
             out.push(address)
             out.push(value)
         Alloc(_, _) -> ()
+        Publish -> ()
         Offset(_, base, _) -> out.push(base)
         Index(_, base, index) ->
             out.push(base)
             out.push(index)
         DescriptorOf(_, object) -> out.push(object)
         MethodSlot(_, object, _) -> out.push(object)
+        CallEntry(_, object) -> out.push(object)
     out
 
 // The strongly connected components of a graph of `n` vertices, numbered from 0, by Tarjan's
@@ -504,7 +502,7 @@ private components(n: usize, starts: Buf[usize], edges: Buf[usize]) -> Buf[usize
     component
 
 // Whether `inst`, in function `caller`, is a call that may close a cycle of the call graph.
-private closes_cycle(graph: CallGraph, caller: usize, inst: Inst) -> bool = inst match
+closes_cycle(graph: CallGraph, caller: usize, inst: Inst) -> bool = inst match
     Call(_, Direct(g), _) -> graph.component[g] == graph.component[caller]
     Call(_, Indirect(_, _), _) -> graph.reentered[graph.component[caller]]
     _ -> false
@@ -515,7 +513,7 @@ private closes_cycle(graph: CallGraph, caller: usize, inst: Inst) -> bool = inst
 // call passes a poll, and the time between that poll and the call is bounded by the code between them,
 // the calls they make, which poll for themselves, and loops, which poll on their back edges. A
 // function that recurses on only some paths polls only on those, and its leaf calls never poll.
-private polled_before(graph: CallGraph, index: usize, f: MirFunction) -> Buf[bool]
+polled_before(graph: CallGraph, index: usize, f: MirFunction) -> Buf[bool]
     val n = f.blocks.len()
     var polled: Buf[bool] = buf()
     var polls: Buf[bool] = buf()
@@ -539,10 +537,12 @@ private polled_before(graph: CallGraph, index: usize, f: MirFunction) -> Buf[boo
 
 // A descriptor is the collector's kind, then the header the runtime reads (tag, size, reference
 // count, type record), then the reference offsets. An object's descriptor is the kind the collector keeps in its
-// header, `KindBack` bytes before the object. A class's method table sits directly before its
-// descriptor, in the same constant, so slot `s` is the word 8(s + 1) bytes before the descriptor;
-// `@avin.desc.N` names the descriptor's address. An abstract method's slot is null: no object of its
-// class exists. A variant with no field data is one constant object, which is only its header.
+// header, `KindBack` bytes before the object. The word directly before the descriptor is its `call`,
+// what a call of the object as a function value runs, null for an object that is no function; a
+// class's method table sits before that, in the same constant, so slot `s` is the word 8(s + 2) bytes
+// before the descriptor; `@avin.desc.N` names the descriptor's address. An abstract method's slot is
+// null: no object of its class exists. A variant with no field data is one constant object, which is
+// only its header.
 private emit_descriptor(out: *StrBuilder, program: MirProgram, i: usize)
     val d = program.descriptors[i]
     val n = d.refs.len()
@@ -560,17 +560,18 @@ private emit_descriptor(out: *StrBuilder, program: MirProgram, i: usize)
     body.push(" }")
     val value = body.finish()
     val m = d.methods.len()
-    if m == 0 then out.push(s"; ${d.name}\n@avin.desc.$i = private constant $header $value\n")
-    else
-        val whole = s"{ [$m x ptr], $header }"
-        out.push(s"; ${d.name}\n@avin.methods.$i = private constant $whole { [$m x ptr] [")
-        for j in 0..<m
-            if j > 0 then out.push(", ")
-            d.methods[m - 1 - j] match
-                Some(f) -> out.push("ptr @\"" + program.functions[f].symbol + "\"")
-                None -> out.push("ptr null")
-        out.push(s"], $header $value }, align 8\n")
-        out.push(s"@avin.desc.$i = private alias $header, ptr getelementptr inbounds ($whole, ptr @avin.methods.$i, i32 0, i32 1)\n")
+    val words = m + 1
+    val whole = s"{ [$words x ptr], $header }"
+    out.push(s"; ${d.name}\n@avin.methods.$i = private constant $whole { [$words x ptr] [")
+    for j in 0..<m
+        d.methods[m - 1 - j] match
+            Some(f) -> out.push("ptr @\"" + program.functions[f].symbol + "\", ")
+            None -> out.push("ptr null, ")
+    d.call match
+        Some(f) -> out.push("ptr @\"" + program.functions[f].symbol + "\"")
+        None -> out.push("ptr null")
+    out.push(s"], $header $value }, align 8\n")
+    out.push(s"@avin.desc.$i = private alias $header, ptr getelementptr inbounds ($whole, ptr @avin.methods.$i, i32 0, i32 1)\n")
     if d.constant
         out.push(s"@avin.obj.$i.const = private constant { ptr, i64 } { ptr @avin.desc.$i, i64 0 }, align 16\n")
         constant_payload(out, s"@avin.obj.$i")
@@ -592,11 +593,11 @@ private const KindBack: usize = 16
 private constant_payload(out: *StrBuilder, name: string)
     out.push(s"$name = private alias i8, ptr getelementptr inbounds (i8, ptr $name.const, i64 $KindBack)\n")
 
-/** The byte offset from a descriptor to the method in slot `slot` of the table before it. */
-private method_slot_offset(slot: usize) -> string = "-" + ((slot + 1) * 8).to_string()
+/** The byte offset from a descriptor to the method in slot `slot` of the table before its `call`. */
+private method_slot_offset(slot: usize) -> string = "-" + ((slot + 2) * 8).to_string()
 
 /** The value an instruction defines, if any. */
-private inst_dest(inst: Inst) -> Option[usize] = inst match
+inst_dest(inst: Inst) -> Option[usize] = inst match
     Call(dest, _, _) -> dest
     Binary(dest, _, _, _) -> Some(dest)
     Checked(dest, _, _, _, _) -> Some(dest)
@@ -606,10 +607,12 @@ private inst_dest(inst: Inst) -> Option[usize] = inst match
     Load(dest, _) -> Some(dest)
     Store(_, _) -> None
     Alloc(dest, _) -> Some(dest)
+    Publish -> None
     Offset(dest, _, _) -> Some(dest)
     Index(dest, _, _) -> Some(dest)
     DescriptorOf(dest, _) -> Some(dest)
     MethodSlot(dest, _, _) -> Some(dest)
+    CallEntry(dest, _) -> Some(dest)
 
 private need(intrinsics: *Buf[string], declaration: string)
     if !contains(*intrinsics, declaration) then intrinsics.push(declaration)
@@ -716,9 +719,14 @@ private emit_inst(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgra
             out.push(s"  %v$dest = select i1 " + operand(program, f, condition) + ", " + typed_operand(program, f, yes) + ", " + typed_operand(program, f, no) + "\n")
         Load(dest, address) ->
             val t = f.value_types[dest]
-            out.push(s"  %v$dest = load ${llvm_type(t)}, ptr " + operand(program, f, address) + alignment(t) + "\n")
+            if is_shared(f, address) then load_shared(out, s"%v$dest", t, operand(program, f, address))
+            else out.push(s"  %v$dest = load ${llvm_type(t)}, ptr " + operand(program, f, address) + alignment(t) + "\n")
         Store(address, value) ->
-            out.push("  store " + typed_operand(program, f, value) + ", ptr " + operand(program, f, address) + alignment(operand_type(program, f, value)) + "\n")
+            if is_shared(f, address)
+                store_shared(out, s"%t$next", operand_type(program, f, value), operand(program, f, value), operand(program, f, address))
+                next += 1
+            else out.push("  store " + typed_operand(program, f, value) + ", ptr " + operand(program, f, address) + alignment(operand_type(program, f, value)) + "\n")
+        Publish -> out.push("  fence release\n")
         Alloc(dest, descriptor) ->
             need(intrinsics, "declare ptr @avin_rt_alloc(ptr, ptr)")
             out.push(s"  %v$dest = call ptr @avin_rt_alloc(ptr %ctx, ptr @avin.desc.$descriptor)\n")
@@ -730,6 +738,12 @@ private emit_inst(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgra
             out.push(s"  %t$next = getelementptr i8, ptr " + operand(program, f, object) + s", i64 -$KindBack\n")
             out.push(s"  %v$dest = load ptr, ptr %t$next, align 8\n")
             next += 1
+        CallEntry(dest, object) ->
+            out.push(s"  %t$next = getelementptr i8, ptr " + operand(program, f, object) + s", i64 -$KindBack\n")
+            out.push(s"  %t${next + 1} = load ptr, ptr %t$next, align 8\n")
+            out.push(s"  %t${next + 2} = getelementptr inbounds i8, ptr %t${next + 1}, i64 -8\n")
+            out.push(s"  %v$dest = load ptr, ptr %t${next + 2}, align 8\n")
+            next += 3
         MethodSlot(dest, object, slot) ->
             out.push(s"  %t$next = getelementptr i8, ptr " + operand(program, f, object) + s", i64 -$KindBack\n")
             out.push(s"  %t${next + 1} = load ptr, ptr %t$next, align 8\n")
@@ -832,6 +846,93 @@ private root_count(program: MirProgram) -> usize
 
 private typed_operand(program: MirProgram, f: MirFunction, a: Operand) -> string =
     llvm_type(operand_type(program, f, a)) + " " + operand(program, f, a)
+
+// Memory another thread can reach, a field of an object, an element of an array or a module-level
+// value, is accessed with unordered atomic loads and stores, so a racing load returns a value some
+// store wrote and never one nothing wrote. The function's own slots, and its callers' slots whose
+// addresses a local function is passed as parameters, belong to one thread and are accessed plainly.
+private is_shared(f: MirFunction, address: Operand) -> bool = address match
+    Value(id) -> !(id < f.signature.params.len() && f.value_types[id] is MPtr)
+    GlobalAddress(_) -> true
+    ConstStr(_) -> true
+    ConstObject(_) -> true
+    _ -> false
+
+// The width in bits an integer or bool is stored at: a whole power-of-two number of bytes up to a
+// word, as fields and array elements are laid out. An atomic access is made at that width, so a bool
+// is a byte and an `i5` is a byte, and the value is truncated after a load and zero-extended before a
+// store.
+private storage_bits(t: MirType) -> u32 = t match
+    MBool -> 8
+    MInt(bits) -> if bits <= 8 then 8 elif bits <= 16 then 16 elif bits <= 32 then 32 else 64
+    _ -> 64
+
+// A shared load into `dest`. An integer wider than 64 bits is loaded a word at a time, lowest word
+// first, so each word is untorn while a racing load may combine words of different stores.
+private load_shared(out: *StrBuilder, dest: string, t: MirType, address: string)
+    val ty = llvm_type(t)
+    t match
+        MInt(bits) ->
+            if bits > 64
+                val words = usize((bits + 63) / 64)
+                var acc = ""
+                for k in 0..<words
+                    val p = dest + s".p$k"
+                    val word = dest + s".w$k"
+                    val wide = dest + s".z$k"
+                    out.push(s"  $p = getelementptr inbounds i64, ptr $address, i64 $k\n")
+                    out.push(s"  $word = load atomic i64, ptr $p unordered, align 8\n")
+                    out.push(s"  $wide = zext i64 $word to $ty\n")
+                    if k == 0 then acc = wide
+                    else
+                        val shifted = dest + s".s$k"
+                        out.push(s"  $shifted = shl $ty $wide, ${64 * k}\n")
+                        val combined = if k + 1 == words then dest else dest + s".o$k"
+                        out.push(s"  $combined = or $ty $acc, $shifted\n")
+                        acc = combined
+                return
+        _ -> ()
+    val w = storage_bits(t)
+    val exact = t match
+        MInt(bits) -> bits == w
+        MBool -> false
+        _ -> true
+    if exact then out.push(s"  $dest = load atomic $ty, ptr $address unordered, align ${w / 8}\n")
+    else
+        val raw = dest + ".raw"
+        out.push(s"  $raw = load atomic i$w, ptr $address unordered, align ${w / 8}\n")
+        out.push(s"  $dest = trunc i$w $raw to $ty\n")
+
+// A shared store of `value`, naming its temporaries after `temp`. An integer wider than 64 bits is
+// stored a word at a time, lowest word first.
+private store_shared(out: *StrBuilder, temp: string, t: MirType, value: string, address: string)
+    val ty = llvm_type(t)
+    t match
+        MInt(bits) ->
+            if bits > 64
+                val words = usize((bits + 63) / 64)
+                for k in 0..<words
+                    var part = value
+                    if k > 0
+                        part = temp + s".h$k"
+                        out.push(s"  $part = lshr $ty $value, ${64 * k}\n")
+                    val word = temp + s".w$k"
+                    val p = temp + s".p$k"
+                    out.push(s"  $word = trunc $ty $part to i64\n")
+                    out.push(s"  $p = getelementptr inbounds i64, ptr $address, i64 $k\n")
+                    out.push(s"  store atomic i64 $word, ptr $p unordered, align 8\n")
+                return
+        _ -> ()
+    val w = storage_bits(t)
+    val exact = t match
+        MInt(bits) -> bits == w
+        MBool -> false
+        _ -> true
+    if exact then out.push(s"  store atomic $ty $value, ptr $address unordered, align ${w / 8}\n")
+    else
+        val raw = temp + ".raw"
+        out.push(s"  $raw = zext $ty $value to i$w\n")
+        out.push(s"  store atomic i$w $raw, ptr $address unordered, align ${w / 8}\n")
 
 // Fields sit at multiples of 8 bytes, so an integer wider than 64 bits is accessed at that alignment
 // rather than its natural one; every other type's natural alignment is at most 8.
