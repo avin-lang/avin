@@ -51,6 +51,13 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
   `Iterable` whose run-time type is still the concrete collection.
 - `xs.view()` returns a lazy `Iterator`, for pipelines that should not build intermediate
   collections.
+- Operations that need something of the elements are added by impls bounding the element type, so
+  a collection has them only where its elements do. `mkString` joins elements that have `Display`
+  into a string: `mkString(sep = ", ")` separates them, `mkString(start, sep, end)` also brackets
+  them, so `[1, 2, 3].mkString()` is `1, 2, 3` and `.mkString("<", "|", ">")` is `<1|2|3>`. Lists,
+  vectors, arrays, buffers and sets have it, and maps, whose entries join as `key: value`, the form
+  a displayed map shows. `max()` and `min()` on lists, vectors and arrays of `Ord` elements answer
+  `Some` of the greatest or least, the first of equal ones, and `None` when empty.
 
 ## Builders
 
