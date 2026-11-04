@@ -666,7 +666,9 @@ A `Range` of `int`s is a `Seq[int]`, and answers its own sequence questions from
 constant time: `length()` (trapping for a range of more values than the largest `int`, such as
 `int.min .. int.max`), `r(i)`, which is `start + i * step` and traps outside `0 ..< length()`, and
 `contains(x)`, which is whether `x` lies between the first and last values a whole number of steps
-from the first, so `(1 ..< 10 by 3).contains(7)` is true and `.contains(8)` false. Everything else
+from the first, so `(1 ..< 10 by 3).contains(7)` is true and `.contains(8)` false. `get(i)`, `head()`,
+`last()` and their `Option` forms are answered from the bounds too, so they work on a range too long
+for `length()`. Everything else
 it has as [every sequence](#methods-every-seq-has) does, and what those make of it, `map` and
 `filter` as much as `take` and `reverse`, is a `Vector`: `(1 .. 5).map(x -> x * x)` is
 `[1, 4, 9, 16, 25]`.
