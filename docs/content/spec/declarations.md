@@ -440,6 +440,43 @@ impl Named for Book
 - An abstract class's body cannot read a trait's `val` it leaves to a subclass: it runs before the
   subclass's fields are set.
 
+### Static members
+
+```text
+trait Add
+    add(other: Self) -> Self
+    static zero() -> Self
+
+impl Add for Point
+    add(other: Point) -> Point = Point(x + other.x, y + other.y)
+    static zero() -> Point = Point(0, 0)
+
+total[T: Add](a: T, b: T) -> T = T.zero() + a + b
+
+val origin = Point.zero()
+```
+
+A trait may declare **`static` members**, which belong to the implementing type rather than to a
+value: `Add`'s `zero` and `Mul`'s `one` are the identities of their operators.
+
+- **A static member is called on a type**: a type's name (`int.zero()`, `Point.zero()`,
+  `Pair[int, string].zero()`) or a type parameter whose bounds have it (`T.zero()` with `T: Add`).
+  Through a bound each instance calls its type argument's own directly, an open class's included,
+  since no object is involved. Calling one on a value is an error, and so is calling a value's method
+  on a type. A local, a parameter, a member or a module value of the name hides the type.
+- **In a trait a static member has no body**: a trait's default bodies are shared by every
+  conforming type, and a static member is each type's own. `Self` in its signature is the
+  implementing type, as in a method's. A trait never overrides a static member, and its default
+  bodies cannot call one on `Self`, which there is no one type.
+- **Every implementation gives it, with a body**, marked `static` as the trait's member is: an impl,
+  and a class's body with `override static`. An abstract class gives it too, since it belongs to the
+  type and not to a subclass's objects. A static member is static exactly where the trait's member
+  is, and is only a trait's member or an implementation of one.
+- **A static member's body has no `self`**: neither `self` nor the members of a value by bare name.
+  It may have parameters, defaults and type parameters as a method does.
+- **A trait with a static member is a bound and not a type**, as one mentioning `Self` is: a value of
+  the trait's type would have no type to give the member.
+
 ## impl
 
 `impl Trait for Type` makes an existing type conform to a trait after the fact, including the
@@ -494,6 +531,29 @@ built-in type implements every method of the trait, defaults included.
   misses a bound is an error naming the bound. [Generics](generics.md) has the rules.
 - A method added to a built-in type (`impl string`, `impl int`) is called on a value of that type,
   `"hi".shout()`, `7.squared()`.
+- **An impl without `for` whose type is a trait adds methods to the trait** (`impl[T] Seq[T]`,
+  `impl[T: Display] Seq[T]`), in the trait's module. Every value whose type conforms to the trait has
+  them: a class or `data` type implementing it, the trait's own type, a type parameter it bounds.
+  Inside them `self` is the value and `Self` its type; the trait's methods, and those other impls add
+  to it, are in scope by bare name. They reach the value only through the trait's methods, so they
+  are not variance positions: `contains(element: T)` is written on `Seq[+T]`.
+- **A call of an added method is compiled for the receiver's static type.** Where that is a class or
+  a `data` type, the trait's methods the added one calls are that type's, called directly; where it
+  is the trait, they go through the object's method table. An added method is in no method table and
+  nothing overrides it; it may not take the name of a method the trait declares.
+- **A type's own methods are found before those added to its traits.** An added method with the name
+  and parameter types of a method the receiver's type has (its own, an inherited one, or one of a trait
+  it conforms to) is passed over, so a type keeps a faster version of its own wherever its static type
+  is known; code that sees only the trait calls the added one. An added method with other parameter
+  types overloads the type's. Where a type conforms to two traits and impls of both add a method of one
+  name and parameter types, a call of it on that type is an error.
+
+```text
+impl[T] Seq[T]
+    contains(element: T) -> bool = exists(x -> x.equals(element))
+
+present[T](xs: Seq[T], x: T) -> bool = xs.contains(x)
+```
 
 ## object
 

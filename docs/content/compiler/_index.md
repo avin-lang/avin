@@ -378,6 +378,15 @@ type or an open class it dispatches as a call on that type does. A trait's defau
 function for every conforming type, so `Self` stays in them, lowered as a reference, and their
 calls on `Self` values dispatch.
 
+A static member is declared as a method is, its first parameter standing for the receiver, so
+implementations line up with the trait's member, take its table position and are compared with it
+exactly as methods are; the symbol is marked `static_member`. A call on a type (`int.zero()`,
+`T.zero()`) is a method call whose receiver is a `TypeReceiver`, an expression with the type and no
+value: on a known type it is a `Call` of that type's member, and on a type parameter a `BoundCall`.
+Lowering passes nothing for the receiver and gives the function no parameter for it, and a
+`BoundCall` on a type takes the implementation from the type's own table even for an open class,
+since no object is involved.
+
 An `object` is an instance of a class of its own, kept apart from its companion class's: its
 constructor and methods are separate functions, and its layout and descriptor are its own. Each
 module-level `val`, `var` and object is a **global** of the program, and its initializer is
