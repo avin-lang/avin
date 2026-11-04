@@ -616,6 +616,24 @@ Settled by the user on 2026-11-04:
   function from a vector and `[](int -> int)` a vector of functions. A type pattern takes it
   without parentheses, `v: []int -> body`. There is no fixed-length `[N]T` (an error); error
   messages print `Vector[int]`.
+- The thread model ([threads](/spec/threads/)): `avin.threads.spawn(body)` starts a closure on a
+  new thread with an 8 MiB stack and `join()` gives back its result; a structured `scope` joins
+  every thread started in it; a trap in any thread stops the program, and the program ends when
+  `main` returns. The heap, module-level values and captured `var`s are shared. The library offers
+  `Mutex[T]` owning its value, `Condition`, sequentially consistent `Atomic[T]`, `Channel[T]` and
+  `Once`, and every wait marks its thread safe for the collector. A data race is not undefined
+  behaviour: heap fields and module-level variables are accessed with LLVM's `unordered` ordering,
+  so a racing read sees some value written to that word, and a constructor ends with a release
+  fence, so no thread sees an object without its header and constructor-set fields. Actors are
+  scheduled onto a pool of these threads.
+- Details of starting and joining: `spawn` gives back a `Thread[T]` whose `join()` any thread may
+  call, any number of times and at once; one waits for the thread and the others for that wait. A
+  thread's handle is collected like any object once nothing reaches it; a thread never joined keeps
+  its stack until the program ends. `s.spawn` is called by the thread running the scope's body
+  while the scope is open, and anything else traps, so the scope sees every thread it has to join;
+  a thread the scope started starts more through a scope of its own. When several threads trap at
+  once, or one traps while another calls `exit`, only the first stops the program: its output is
+  flushed once and its reason is the one reported.
 - [Repeated parameters](/spec/declarations/#repeated-parameters): `values: T*` is the last
   parameter, at most one, named, with no default and not by-name; inside the function it is a
   `Vector[T]`. A call gives it every positional argument from its position on, each checked
@@ -715,17 +733,6 @@ Settled by the user on 2026-11-04:
   `Eq` and `Debug` bounds, showing both values' `Debug` forms) trap at the assertion's place. Not yet
   built: `@tests` files, setup and teardown hooks, `should_trap`, `ignore` and `timeout` arguments,
   and tests answering with a `Result`.
-- The thread model ([threads](/spec/threads/)): `avin.threads.spawn(body)` starts a closure on a
-  new thread with an 8 MiB stack and `join()` gives back its result; a structured `scope` joins
-  every thread started in it; a trap in any thread stops the program, and the program ends when
-  `main` returns. The heap, module-level values and captured `var`s are shared. The library offers
-  `Mutex[T]` owning its value, `Condition`, sequentially consistent `Atomic[T]`, `Channel[T]` and
-  `Once`, and every wait marks its thread safe for the collector. A data race is not undefined
-  behaviour: heap fields and module-level variables are accessed with LLVM's `unordered` ordering,
-  so a racing read sees some value written to that word, and a constructor ends with a release
-  fence, so no thread sees an object without its header and constructor-set fields. Actors are
-  scheduled onto a pool of these threads.
-
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
