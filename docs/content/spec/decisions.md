@@ -506,9 +506,6 @@ Settled by the user on 2026-11-03:
   something of the elements, are added to `Seq` by impls (`impl[T] Seq[T]`, `impl[T: Display]
   Seq[T]`, `impl[T: Ord] Seq[T]`), written once for every sequence; `contains` and `indexOf` are
   `exists` and `indexWhere`, so on a list they walk it once.
-- A sequence passed or stored where a function from one `int` is expected becomes that function,
-  through the core library's `elementAt`; the conversion happens where the value is written, as a
-  conversion to `Any` does.
 - A sequence pattern on a sequence other than a list asks `length()` once and then reads, with
   `apply`, each element whose pattern is not `_`, in order, stopping at the first that fails.
 - `Deque[T]` is a ring over an array, doubling when full as a buffer does, its spare places zero
@@ -553,6 +550,23 @@ Settled by the user on 2026-11-03:
 - A generator's pattern must match every element, as in a `for` loop, rather than filtering out the
   elements it does not match. `return`, `break`, `continue` and `?` cannot leave a comprehension's
   guards or yielded value.
+
+Settled by the user on 2026-11-04:
+
+- **Sequences, sets and maps are functions, by subtyping.** `Seq[+T]` is a subtype of `(int) -> T`,
+  through its `apply(index)`; `Set[A]`, immutable and mutable, of `(A) -> bool`; `Map[K, V]`,
+  immutable and mutable, of `(K) -> V`, whose `apply` traps on a missing key as `m(k)` does. A
+  collection is passed, stored and called where its function type is expected with no conversion,
+  and variance holds through it: a `Vector[Dog]` is an `(int) -> Animal`. For a set `s`, `s(x)` is
+  legal: `true` when `x` is an element of `s` and `false` otherwise, the set's `apply(x) -> bool`,
+  which is `contains`.
+- A class or trait names a function type among its parents after `:` (`trait Seq[+T]: Iterable[T],
+  (int) -> T`), and a data type or class through an impl with no bounds of its own (`impl[K, V] (K)
+  -> V for Map[K, V]`), in the type's own module. The type then has an `apply` taking exactly that
+  type's parameters and yielding its result or a subtype; `apply` implements no trait method, so it
+  is not marked `override` for it. A type is at most one function type, counting those of its
+  superclass and its traits, and its parameters keep their variance there. A built-in type is no
+  function.
 
 **Deferred**
 

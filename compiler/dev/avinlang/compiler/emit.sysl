@@ -50,11 +50,11 @@ emit_llvm(program: MirProgram) -> string
                 out.push(s"ptr @avin.type.${r.ancestors[j]}")
             out.push("]")
         out.push(" }, align 8\n")
-    // A closure that captures nothing is constant: a header naming its descriptor, then its entry's
-    // address.
+    // A closure that captures nothing is constant: only a header naming its descriptor, whose `call`
+    // is its entry.
     for i in 0..<program.closures.len()
         val k = program.closures[i]
-        out.push(s"@avin.fn.$i.const = private constant { ptr, i64, ptr } { ptr @avin.desc.${k.descriptor}, i64 0, ptr @\"${program.functions[k.function].symbol}\" }, align 16\n")
+        out.push(s"@avin.fn.$i.const = private constant { ptr, i64 } { ptr @avin.desc.${k.descriptor}, i64 0 }, align 16\n")
         constant_payload(&out, s"@avin.fn.$i")
     // A trap site is what the runtime reports when the program stops there: the reason and the file
     // as constant strings, then the line and column.
@@ -372,6 +372,7 @@ private call_graph(program: MirProgram) -> CallGraph
     for d in program.descriptors
         for m in d.methods
             if m is Some(g) then taken[g] = true
+        if d.call is Some(g) then taken[g] = true
     for f in program.functions
         for block in f.blocks
             for inst in block.insts
@@ -436,6 +437,7 @@ private inst_operands(inst: Inst) -> Buf[Operand]
             out.push(index)
         DescriptorOf(_, object) -> out.push(object)
         MethodSlot(_, object, _) -> out.push(object)
+        CallEntry(_, object) -> out.push(object)
     out
 
 // The strongly connected components of a graph of `n` vertices, numbered from 0, by Tarjan's
@@ -533,10 +535,12 @@ private polled_before(graph: CallGraph, index: usize, f: MirFunction) -> Buf[boo
 
 // A descriptor is the collector's kind, then the header the runtime reads (tag, size, reference
 // count, type record), then the reference offsets. An object's descriptor is the kind the collector keeps in its
-// header, `KindBack` bytes before the object. A class's method table sits directly before its
-// descriptor, in the same constant, so slot `s` is the word 8(s + 1) bytes before the descriptor;
-// `@avin.desc.N` names the descriptor's address. An abstract method's slot is null: no object of its
-// class exists. A variant with no field data is one constant object, which is only its header.
+// header, `KindBack` bytes before the object. The word directly before the descriptor is its `call`,
+// what a call of the object as a function value runs, null for an object that is no function; a
+// class's method table sits before that, in the same constant, so slot `s` is the word 8(s + 2) bytes
+// before the descriptor; `@avin.desc.N` names the descriptor's address. An abstract method's slot is
+// null: no object of its class exists. A variant with no field data is one constant object, which is
+// only its header.
 private emit_descriptor(out: *StrBuilder, program: MirProgram, i: usize)
     val d = program.descriptors[i]
     val n = d.refs.len()
@@ -554,17 +558,18 @@ private emit_descriptor(out: *StrBuilder, program: MirProgram, i: usize)
     body.push(" }")
     val value = body.finish()
     val m = d.methods.len()
-    if m == 0 then out.push(s"; ${d.name}\n@avin.desc.$i = private constant $header $value\n")
-    else
-        val whole = s"{ [$m x ptr], $header }"
-        out.push(s"; ${d.name}\n@avin.methods.$i = private constant $whole { [$m x ptr] [")
-        for j in 0..<m
-            if j > 0 then out.push(", ")
-            d.methods[m - 1 - j] match
-                Some(f) -> out.push("ptr @\"" + program.functions[f].symbol + "\"")
-                None -> out.push("ptr null")
-        out.push(s"], $header $value }, align 8\n")
-        out.push(s"@avin.desc.$i = private alias $header, ptr getelementptr inbounds ($whole, ptr @avin.methods.$i, i32 0, i32 1)\n")
+    val words = m + 1
+    val whole = s"{ [$words x ptr], $header }"
+    out.push(s"; ${d.name}\n@avin.methods.$i = private constant $whole { [$words x ptr] [")
+    for j in 0..<m
+        d.methods[m - 1 - j] match
+            Some(f) -> out.push("ptr @\"" + program.functions[f].symbol + "\", ")
+            None -> out.push("ptr null, ")
+    d.call match
+        Some(f) -> out.push("ptr @\"" + program.functions[f].symbol + "\"")
+        None -> out.push("ptr null")
+    out.push(s"], $header $value }, align 8\n")
+    out.push(s"@avin.desc.$i = private alias $header, ptr getelementptr inbounds ($whole, ptr @avin.methods.$i, i32 0, i32 1)\n")
     if d.constant
         out.push(s"@avin.obj.$i.const = private constant { ptr, i64 } { ptr @avin.desc.$i, i64 0 }, align 16\n")
         constant_payload(out, s"@avin.obj.$i")
@@ -586,8 +591,8 @@ private const KindBack: usize = 16
 private constant_payload(out: *StrBuilder, name: string)
     out.push(s"$name = private alias i8, ptr getelementptr inbounds (i8, ptr $name.const, i64 $KindBack)\n")
 
-/** The byte offset from a descriptor to the method in slot `slot` of the table before it. */
-private method_slot_offset(slot: usize) -> string = "-" + ((slot + 1) * 8).to_string()
+/** The byte offset from a descriptor to the method in slot `slot` of the table before its `call`. */
+private method_slot_offset(slot: usize) -> string = "-" + ((slot + 2) * 8).to_string()
 
 /** The value an instruction defines, if any. */
 private inst_dest(inst: Inst) -> Option[usize] = inst match
@@ -604,6 +609,7 @@ private inst_dest(inst: Inst) -> Option[usize] = inst match
     Index(dest, _, _) -> Some(dest)
     DescriptorOf(dest, _) -> Some(dest)
     MethodSlot(dest, _, _) -> Some(dest)
+    CallEntry(dest, _) -> Some(dest)
 
 private need(intrinsics: *Buf[string], declaration: string)
     if !contains(*intrinsics, declaration) then intrinsics.push(declaration)
@@ -724,6 +730,12 @@ private emit_inst(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgra
             out.push(s"  %t$next = getelementptr i8, ptr " + operand(program, f, object) + s", i64 -$KindBack\n")
             out.push(s"  %v$dest = load ptr, ptr %t$next, align 8\n")
             next += 1
+        CallEntry(dest, object) ->
+            out.push(s"  %t$next = getelementptr i8, ptr " + operand(program, f, object) + s", i64 -$KindBack\n")
+            out.push(s"  %t${next + 1} = load ptr, ptr %t$next, align 8\n")
+            out.push(s"  %t${next + 2} = getelementptr inbounds i8, ptr %t${next + 1}, i64 -8\n")
+            out.push(s"  %v$dest = load ptr, ptr %t${next + 2}, align 8\n")
+            next += 3
         MethodSlot(dest, object, slot) ->
             out.push(s"  %t$next = getelementptr i8, ptr " + operand(program, f, object) + s", i64 -$KindBack\n")
             out.push(s"  %t${next + 1} = load ptr, ptr %t$next, align 8\n")

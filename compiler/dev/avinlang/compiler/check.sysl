@@ -116,6 +116,11 @@ struct ClassSymbol
     /** For an object named after a data type of its module, that type: the object is its companion,
      * and each uses the other's private members. */
     companion_data: Option[usize]
+    /** The function types written after `:` or named by an impl for the class, in its own type
+     * parameters: a class or trait is a subtype of each. */
+    functions: Buf[&Type]
+    /** For a class whose objects are functions, the `apply` a call of one as a function runs. */
+    call: Option[usize]
 
 /** A module-level value: a `val` or `var` declared at the top level of a file, or an object's one
  * instance. Each is computed once, before `main` runs, by its `init` function: a value's initializer,
@@ -168,6 +173,10 @@ struct DataSymbol
     /** The methods of the `Display` and `Debug` it would have had without asking, but which a field
      * of it lacks: unchecked, and never compiled. */
     withdrawn: Buf[usize]
+    /** The function types its impls name, in its own type parameters: the type is a subtype of each. */
+    functions: Buf[&Type]
+    /** For a type whose values are functions, the `apply` a call of one as a function runs. */
+    call: Option[usize]
 
 /** One constructor of a data type. */
 struct VariantSymbol
@@ -655,6 +664,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool) -> Che
     for id in 0..<c.data.len()
         check_data_implementations(&c, id)
         check_data_variance(&c, id)
+    check_function_types(&c)
     check_equality_pairs(&c)
     for g in 0..<c.globals.len()
         settle_global(&c, g)
@@ -851,7 +861,7 @@ private declare_types(c: *Checker, unit: usize)
                     None -> c.note(unit, a.span, "`@sysl` on a data type takes one string, the module and name of the Sysl enum or struct it mirrors, as in `@sysl(\"sysl.fs.IoError\")`")
                 if d.type_params.len() > 0 then c.note(unit, a.span, "a Sysl mirror has no type parameters: it mirrors one Sysl type")
             c.types.put(key, c.data.len())
-            c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf(), buf(), buf(), buf(), buf(), None, buf()))
+            c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf(), buf(), buf(), buf(), buf(), None, buf(), buf(), None))
     for i in 0..<file.items.len()
         if file.items[i] is ClassItem(d)
             if d.object then continue
@@ -864,7 +874,7 @@ private declare_types(c: *Checker, unit: usize)
                 continue
             if file.private_items[i] then c.private_names.put(key, true)
             c.class_types.put(key, c.classes.len())
-            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, None, None, buf(), buf(), 0, None))
+            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, None, None, buf(), buf(), 0, None, buf(), None))
 
 // An object is a class with one instance. Named after a class or a data type of its module, in any of
 // the module's files, it is that type's companion and its type has no name of its own; otherwise its
@@ -897,7 +907,7 @@ private declare_objects(c: *Checker, unit: usize)
             else
                 c.class_types.put(key, id)
                 if file.private_items[i] then c.private_names.put(key, true)
-            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, companion, None, buf(), buf(), 0, companion_data))
+            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, companion, None, buf(), buf(), 0, companion_data, buf(), None))
 
 // Each impl's type and trait, resolved with the impl's type parameters in scope. They are the type's
 // own parameters under the names the impl gives them, so `impl[T] Box[T]` lists them in order. What
@@ -966,7 +976,12 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
     val target = resolve_type(c, unit, d.target)
     var trait_type: Option[&Type] = None
     var trait_home = ""
+    var function_type: Option[&Type] = None
     if d.trait_name is Some(written_trait)
+        if written_trait.kind is Function(_, _)
+            function_type = Some(resolve_type(c, unit, written_trait))
+            if conditional then c.note(unit, written_trait.span, "an impl naming a function type has no bounds of its own")
+    if d.trait_name is Some(written_trait) && function_type is None
         val t = resolve_bound(c, unit, written_trait)
         *t match
             Class(k, _, _) ->
@@ -986,6 +1001,26 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
             conditions.push(c.bounds.get(bound_key(owner, i, d.type_params[i])).unwrap_or(buf()))
     c.generic = outer_generic
     if *target is ErrorType then return invalid
+    // An impl naming a function type makes the type a subtype of it; its body, if any, adds methods
+    // as a plain impl's does, and the type's `apply` is what a call of a value as a function runs.
+    if function_type is Some(f)
+        if conditional then return invalid
+        if module_name != home
+            c.note(unit, d.target.span, s"`$path` is declared in another module; an impl making it a function belongs in that module")
+            return invalid
+        *target match
+            Data(id, _, _) ->
+                var functions = c.data[id].functions
+                functions.push(f)
+                c.data[id].functions = functions
+            Class(id, _, _) ->
+                var functions = c.classes[id].functions
+                functions.push(f)
+                c.classes[id].functions = functions
+            _ ->
+                c.note(unit, d.target.span, s"`$path` is a built-in type, which is not a function")
+                return invalid
+        return ImplSymbol(unit, module_name, d, target, owner, None, conditions)
     if d.trait_name is Some(_) && trait_type is None then return invalid
     if trait_type is Some(t)
         if refuse_closed_trait(c, unit, written_trait_span(d), t) then return invalid
@@ -1399,9 +1434,14 @@ private declare_fields(c: *Checker, unit: usize)
         c.generic = Some(GenericScope(class_owner(id), d.type_params))
         declare_bounds(c, unit, class_owner(id), d.type_params, 0)
         var traits: Buf[&Type] = buf()
+        var functions = c.classes[id].functions
         for i in 0..<d.parents.len()
             val parent = d.parents[i]
-            if parent_trait(c, unit, parent) is Some(t)
+            if parent.kind is TypeParent(written)
+                val f = resolve_type(c, unit, written)
+                if *f is Function(_, _) then functions.push(f)
+                elif !(*f is ErrorType) then c.note(unit, parent.span, s"${type_name(f)} is neither a class nor a trait")
+            elif parent_trait(c, unit, parent) is Some(t)
                 if trait_type(c, unit, t, parent) is Some(ty)
                     var repeated = false
                     for other in traits
@@ -1430,6 +1470,7 @@ private declare_fields(c: *Checker, unit: usize)
                     c.impls[i].target = ErrorType
                 else traits.push(t)
         c.classes[id].traits = traits
+        c.classes[id].functions = functions
         var fields: Buf[FieldSymbol] = buf()
         for cp in d.params
             val name = cp.param.pattern.kind match
@@ -1602,6 +1643,37 @@ ancestor_type(classes: Buf[ClassSymbol], data: Buf[DataSymbol], t: &Type, target
         if ancestor_type(classes, data, substitute(required, class_owner(k), args), target) is Some(found) then return Some(found)
     ancestor_type(classes, data, substitute(classes[k].superclass?, class_owner(k), args), target)
 
+/** The function type a value of type `t`, an instance of a class, a trait or a data type, is a
+ * subtype of: one its own declaration or an impl names, or one of its superclass's or of a trait it
+ * conforms to, in `t`'s type arguments; `None` where it is no function. */
+function_ancestor(classes: Buf[ClassSymbol], data: Buf[DataSymbol], t: &Type) -> Option[&Type]
+    var found: Buf[&Type] = buf()
+    function_ancestors(classes, data, t, &found, 0)
+    if found.len() > 0 then Some(found[0]) else None
+
+/** Every function type `t` is a subtype of, each once, as `function_ancestor` finds them. */
+function_ancestors(classes: Buf[ClassSymbol], data: Buf[DataSymbol], t: &Type, out: *Buf[&Type], depth: usize)
+    if depth > 64 then return
+    *t match
+        Data(d, _, xs) ->
+            for f in data[d].functions
+                add_function_type(out, substitute(f, data_owner(d), xs))
+            for required in data[d].traits
+                function_ancestors(classes, data, substitute(required, data_owner(d), xs), out, depth + 1)
+        Class(k, _, xs) ->
+            for f in classes[k].functions
+                add_function_type(out, substitute(f, class_owner(k), xs))
+            for required in classes[k].traits
+                function_ancestors(classes, data, substitute(required, class_owner(k), xs), out, depth + 1)
+            if classes[k].superclass is Some(sup)
+                function_ancestors(classes, data, substitute(sup, class_owner(k), xs), out, depth + 1)
+        _ -> ()
+
+private add_function_type(out: *Buf[&Type], f: &Type)
+    for i in 0..<out.len()
+        if same_type(out[i], f) then return
+    out.push(f)
+
 // `x`, the type of a value, seen as the type `to`: what the value already is as an instance of
 // `to`'s class, trait, data type, tuple or function type, with no conversion. An instance of a
 // subclass is one of its superclass; an instance of a generic type is another instance of it where
@@ -1635,8 +1707,17 @@ view_as(f: Conformances, x: &Type, to: &Type) -> &Type = *to match
             for i in 0..<xs.len()
                 params.push(view_contra(f, xs[i], ys[i]))
             Function(params, view_part(f, r, s))
+        // A class or data type whose values are functions is a subtype of its function type.
+        Class(_, _, _) -> view_function(f, x, to)
+        Data(_, _, _) -> view_function(f, x, to)
         _ -> x
     _ -> x
+
+// A value of class or data type `x` seen as the function type `to`, through the function type `x` is
+// a subtype of; `x` itself where it is none.
+private view_function(f: Conformances, x: &Type, to: &Type) -> &Type = function_ancestor(f.classes, f.data, x) match
+    Some(up) -> view_as(f, up, to)
+    None -> x
 
 // The type arguments `xs` seen as `ys`, one parameter's variance at a time.
 private vary_args(f: Conformances, params: Buf[TypeParam], xs: Buf[&Type], ys: Buf[&Type]) -> Buf[&Type]
@@ -3081,6 +3162,8 @@ private check_class_variance(c: *Checker, id: usize)
     if k.superclass is Some(sup) then variance_in(c, k.unit, params, owner, sup, 1, at, s"the superclass ${type_name(sup)}")
     for t in k.traits
         variance_in(c, k.unit, params, owner, t, 1, at, s"the trait ${type_name(t)}")
+    for f in k.functions
+        variance_in(c, k.unit, params, owner, f, 1, at, s"the function type ${type_name(f)}")
     for i in k.inherited..<k.fields.len()
         val f = k.fields[i]
         val ty = f.ty.unwrap_or(ErrorType)
@@ -3126,6 +3209,8 @@ private check_data_variance(c: *Checker, id: usize)
             variance_in(c, d.unit, params, owner, v.fields[i], 1, v.span, s"the field `$name` of `${v.name}`")
     for t in d.traits
         variance_in(c, d.unit, params, owner, t, 1, d.decl.span, s"the trait ${type_name(t)}")
+    for f in d.functions
+        variance_in(c, d.unit, params, owner, f, 1, d.decl.span, s"the function type ${type_name(f)}")
 
 // Reports the first type parameter of `owner` that `t` names in a position its variance forbids.
 // `polarity` is 1 where a value is read out, -1 where one is passed in, 0 where both happen; it flips
@@ -3268,6 +3353,52 @@ private result_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) ->
     if *want is Class(b, _, _)
         if ancestor_type(c.classes, c.data, own, b) is Some(up) then fits = alike_or_error(up, want)
     if fits then None else Some(s"which yields ${type_name(want)}, not ${type_name(own)}")
+
+// A class, trait or data type that is a function is one function type, and has an `apply` taking
+// that type's parameters and yielding its result: what a call of its value as a function runs.
+// Checked once every body is, since a result may be inferred.
+private check_function_types(c: *Checker)
+    for k in 0..<c.classes.len()
+        val self_type = own_class_type(c.classes[k], k)
+        c.classes[k].call = function_call(c, c.classes[k].unit, c.classes[k].decl.name_span, self_type, c.classes[k].name, methods_named(c, k, "apply"))
+    for d in 0..<c.data.len()
+        val self_type = own_type(c.data[d], d)
+        c.data[d].call = function_call(c, c.data[d].unit, c.data[d].decl.span, self_type, c.data[d].name, receiver_methods(c, self_type, "apply"))
+
+// The `apply`, among `applies`, that implements the function type `self_type` is a subtype of; `None`
+// where it is no function, or reported where it is two or lacks that `apply`.
+private function_call(c: *Checker, unit: usize, at: Span, self_type: &Type, name: string, applies: Buf[usize]) -> Option[usize]
+    var found: Buf[&Type] = buf()
+    function_ancestors(c.classes, c.data, self_type, &found, 0)
+    if found.len() == 0 then return None
+    if found.len() > 1
+        c.note(unit, at, s"`$name` is a subtype of both ${type_name(found[0])} and ${type_name(found[1])}; a type is at most one function type")
+        return None
+    val f = found[0]
+    var params: Buf[&Type] = buf()
+    var result: &Type = ErrorType
+    *f match
+        Function(ps, r) ->
+            params = ps
+            result = r
+        _ -> return None
+    for m in applies
+        val have = c.symbols[m].params
+        if have.len() != params.len() + 1 || own_type_params(c, m) > 0 then continue
+        var same = true
+        for i in 0..<params.len()
+            if !same_type(seen_from(c, self_type, m, have[i + 1]), params[i]) then same = false
+        if !same then continue
+        val yields = seen_from(c, self_type, m, c.symbols[m].result.unwrap_or(ErrorType))
+        if alike_or_error(yields, result) || *yields is Nothing || same_type(view_as(conformances(c), yields, result), result) then return Some(m)
+        c.note(unit, at, s"`$name` is a subtype of ${type_name(f)}, so its `apply` yields ${type_name(result)}, not ${type_name(yields)}")
+        return None
+    var written = ""
+    for i in 0..<params.len()
+        if i > 0 then written = written + ", "
+        written = written + type_name(params[i])
+    c.note(unit, at, s"`$name` is a subtype of ${type_name(f)}, so it has `apply($written) -> ${type_name(result)}`")
+    None
 
 // The methods in a data type's table implement its traits' methods with their parameters and yield
 // their results, or types conforming to them, as the data type sees both; compared once every body
@@ -4846,41 +4977,9 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
     val want = expected match
         Some(w) -> w
         None -> return check_form(c, e, None, used)
-    if is_index_function(zonk(c, want)) then return as_index_function(c, check_form(c, e, expected, used))
     if !(*zonk(c, want) is AnyType) then return check_form(c, e, expected, used)
     val passes = e.kind is Block(_, _) || e.kind is If(_, _, _) || e.kind is Match(_, _) || e.kind is While(_, _, _) || e.kind is Loop(_) || e.kind is DoWhile(_, _, _)
     to_any(c, check_form(c, e, if passes then expected else None, used))
-
-/** Whether `t` is a function from one `int`, which a sequence is wherever one is expected. */
-private is_index_function(t: &Type) -> bool = *t match
-    Function(params, _) -> params.len() == 1 && *params[0] is Int(IntBits)
-    _ -> false
-
-/** `typed`, where a function from an index is expected: a sequence becomes the function from an
- * index to its element, through the core library's `elementAt`, and any other value stays as it is,
- * for the caller to hold to the function type. */
-private as_index_function(c: *Checker, typed: &TExpr) -> &TExpr
-    val t = zonk(c, typed.ty)
-    if !(*t is Class(_, _, _) || *t is Data(_, _, _)) then return typed
-    val seq = c.class_types.get(qualified(CoreModule, "Seq")) match
-        Some(k) -> k
-        None -> return typed
-    val element = holding_ancestor(conformances(c), t, seq) match
-        Some(up) -> *up match
-            Class(_, _, args) -> if args.len() == 1 then args[0] else return typed
-            _ -> return typed
-        None -> return typed
-    val ids = c.scope.get(qualified(CoreModule, "elementAt")) match
-        Some(ids) -> ids
-        None -> return typed
-    if ids.len() != 1 then return typed
-    var params: Buf[&Type] = buf()
-    params.push(Int(IntBits))
-    var args: Buf[&TExpr] = buf()
-    args.push(typed)
-    var type_args: Buf[&Type] = buf()
-    type_args.push(element)
-    TExpr(typed.span, Function(params, element), Call(ids[0], args, type_args))
 
 /** `typed` as an `Any`: put in a box where its type needs one. An unknown type is decided as
  * `Any`. */
@@ -4903,6 +5002,9 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     UnitLit -> TExpr(e.span, Unit, UnitConst)
     Name(name) -> name_expr(c, e.span, name, expected)
     TypeApply(target, types) -> type_apply(c, e, target, types, expected)
+    TypeParent(_) ->
+        c.note(unit_of(c), e.span, "a type is not a value")
+        TExpr(e.span, ErrorType, UnitConst)
     Member(target, name) ->
         if module_use(c, e) is Some(q) then check_form(c, q, expected, used)
         else member_expr(c, e, target, name, expected)
@@ -6563,6 +6665,9 @@ private upcast(c: *Checker, from: &Type, to: &Type) -> &Type
         if *zonk(c, to) is Class(k, _, _)
             for b in bounds_of(c, x)
                 if holding_ancestor(conformances(c), b, k) is Some(_) then return view_as(conformances(c), b, zonk(c, to))
+        if *zonk(c, to) is Function(_, _)
+            for b in bounds_of(c, x)
+                if function_ancestor(c.classes, c.data, b) is Some(_) then return view_as(conformances(c), b, zonk(c, to))
     view_as(conformances(c), x, zonk(c, to))
 
 /** Whether a value of type `from` may be used where `to` is expected: an instance of a subclass is an

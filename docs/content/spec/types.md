@@ -146,9 +146,30 @@ patterns in `match` and in clauses.
 
 `(A, B) -> C` is the type of a function taking `A` and `B` and returning `C`; `() -> C` takes nothing.
 A by-name parameter type is written `-> T` inside a parameter list; see
-[call-by-name](/spec/by-name/). Function types are traits: a class may list a function type among its
-supertypes and implement `apply`, and its instances are then callable as `value(args)` and usable
-wherever that function type is expected.
+[call-by-name](/spec/by-name/). Function types are traits: a class or trait may list a function type
+among its parents after `:`, and a data type or class may name one in an impl, and its values are
+then subtypes of that function type, callable as `value(args)` and usable wherever it is expected,
+with no conversion. Such a type has an `apply` taking exactly the function type's parameters and
+yielding its result or a subtype, and a call of the value as a function runs that `apply`.
+
+```text
+class Shout: (string) -> string
+    apply(s: string) -> string = s + "!"
+
+data Lengths(extra: int)
+
+impl (string) -> int for Lengths
+    apply(s: string) -> int = s.charCount() + extra
+
+val f: (string) -> string = Shout()
+["a", "b"].map(Lengths(1))      // [2, 2]
+```
+
+A function type in a parent list follows the variance rules of any parent: its parameters are
+contravariant positions and its result a covariant one. A type is at most one function type,
+counting those its superclass and traits are, and a built-in type is none. The core library's
+collections are functions this way: a `Seq[T]` is an `(int) -> T`, a `Set[A]` an `(A) -> bool` and a
+`Map[K, V]` a `(K) -> V` (see [collections](/spec/collections/#collections-as-functions)).
 
 There is no arity limit.
 
