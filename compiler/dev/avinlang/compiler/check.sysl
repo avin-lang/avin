@@ -498,6 +498,11 @@ struct Checker
     /** The instance of a trait a type implements at several type arguments that a member of the trait
      * is being seen as, while one of those conformances is checked. */
     seen_instance: Option[&Type]
+    /** The module of an interpolator the file does not import, which `interpolators_named` found
+     * beside those in scope; empty otherwise. */
+    hidden_module: string
+    /** How many errors have been reported, for a check that asks whether one call added any. */
+    reported_count: usize
 
     note(*self, unit: usize, at: Span, message: string)
         // What goes wrong in an impl made from a template is the template's, already reported where
@@ -507,6 +512,7 @@ struct Checker
             notes.push(message)
             self.derived[i].notes = notes
             return
+        self.reported_count = self.reported_count + 1
         self.units[unit].report.add(error(at, message))
 end Checker
 
@@ -736,7 +742,7 @@ private check_imports(c: *Checker, unit: usize)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None)
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0)
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -6787,7 +6793,22 @@ methods_of(c: *Checker, t: &Type, name: string) -> Buf[usize]
     val known = zonk(c, t)
     if *known is Class(k, _, _) then return with_trait_methods(c, known, name, methods_named(c, k, name))
     if *known is TypeVar(_, _, _) then return with_trait_methods(c, known, name, bound_methods(c, known, name))
-    with_trait_methods(c, known, name, visible_methods(c, receiver_methods(c, known, name)))
+    in_scope_on_context(c, known, with_trait_methods(c, known, name, visible_methods(c, receiver_methods(c, known, name))))
+
+// The methods of `StringContext`, its interpolators, are seen only where their module is: the core
+// library's, those of the file's own module and those of the modules it imports.
+private in_scope_on_context(c: *Checker, t: &Type, ms: Buf[usize]) -> Buf[usize]
+    val core = c.types.get(qualified(CoreModule, "StringContext")) match
+        Some(k) -> k
+        None -> return ms
+    *t match
+        Data(k, _, _) -> if k != core then return ms
+        _ -> return ms
+    var out: Buf[usize] = buf()
+    for m in ms
+        val home = c.symbols[m].module_name
+        if home == CoreModule || sees_module(c, unit_of(c), home) then out.push(m)
+    out
 
 /** The methods of `name` a value of type parameter `t` has: those of its bounds, each once. */
 bound_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
@@ -8424,12 +8445,20 @@ private operator_conforms(c: *Checker, at: Span, spelling: string, t: &Type, tra
 private interpolate_expr(c: *Checker, e: &Expr, prefix: string, chunks: Buf[string], parts: Buf[string], holes: Buf[&Expr], expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
     if prefix != "s" && prefix != "f"
-        if !names_interpolator(c, prefix)
-            c.note(unit, e.span, s"`$prefix\"…\"` names no interpolator: `StringContext` has no method `$prefix` here")
+        c.hidden_module = ""
+        val found = interpolators_named(c, e.span, prefix)
+        val hidden = c.hidden_module
+        if found.len() == 0
             for h in holes
                 check_statement(c, h)
             return TExpr(e.span, ErrorType, UnitConst)
-        return check_expr(c, interpolator_call(e.span, prefix, parts, holes), expected)
+        val before = c.reported_count
+        val result = check_expr(c, interpolator_call(e.span, prefix, parts, holes), expected)
+        // Where a call fails and another module also declares an interpolator of the name, which
+        // the file does not import, the error is followed by the module that would be imported.
+        if hidden != "" && c.reported_count > before
+            c.note(unit, e.span, s"another interpolator `$prefix\"…\"` is declared in ${module_label(hidden)}, which this file does not import; add `import $hidden`")
+        return result
     formatted_text(c, e, prefix == "f", chunks, holes)
 
 /** What an `f"…"` specifier writes after its hole's `%`: the flags, the width and the precision, each
@@ -8697,14 +8726,33 @@ private count_hole_fits(c: *Checker, hole: Option[&TExpr]) -> bool
     c.note(unit_of(c), h.span, s"a width or precision written as a hole is a count, so it has to be an integer, but this one has type `${type_name(t)}`")
     false
 
-// Whether `StringContext` has a method `name` that this unit can call: one of the core library's,
-// or one an imported trait's impl gives it.
-private names_interpolator(c: *Checker, name: string) -> bool
+// The interpolators `name` this unit may use: the methods of `StringContext` called `name` that are
+// the core library's, or are declared in this file's module or one it imports, whole or by a name. Where
+// there are none, the error is reported here, naming the module to import where one declares it, and
+// the list is empty.
+private interpolators_named(c: *Checker, at: Span, name: string) -> Buf[usize]
+    var seen: Buf[usize] = buf()
     val id = c.types.get(qualified(CoreModule, "StringContext")) match
         Some(k) -> k
-        None -> return false
+        None -> return seen
     val ty = Data(id, "StringContext", buf())
-    with_trait_methods(c, ty, name, visible_methods(c, receiver_methods(c, ty, name))).len() > 0
+    val unit = unit_of(c)
+    var elsewhere: Buf[string] = buf()
+    for m in with_trait_methods(c, ty, name, visible_methods(c, receiver_methods(c, ty, name)))
+        val home = c.symbols[m].module_name
+        if home == CoreModule || sees_module(c, unit, home) then seen.push(m)
+        else
+            var known = false
+            for h in elsewhere
+                if h == home then known = true
+            if !known then elsewhere.push(home)
+    if seen.len() > 0
+        if elsewhere.len() > 0 then c.hidden_module = elsewhere[0]
+        return seen
+    if elsewhere.len() > 0
+        c.note(unit, at, s"the interpolator `$name\"…\"` is declared in ${module_label(elsewhere[0])}, which this file does not import; add `import ${elsewhere[0]}`")
+    else c.note(unit, at, s"`$name\"…\"` names no interpolator: `StringContext` has no method `$name` here")
+    seen
 
 // `StringContext([parts…]).prefix(holes…)`, naming the core library's `StringContext` whatever the
 // file calls its own declarations.
@@ -10300,8 +10348,8 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
             for a in args
                 check_statement(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
-    val all = receiver_methods(c, zonk(c, object.ty), name)
-    val ms = with_trait_methods(c, object.ty, name, visible_methods(c, all))
+    val all = in_scope_on_context(c, zonk(c, object.ty), receiver_methods(c, zonk(c, object.ty), name))
+    val ms = in_scope_on_context(c, zonk(c, object.ty), with_trait_methods(c, object.ty, name, visible_methods(c, all)))
     if all.len() > 0 || ms.len() > 0
         if ms.len() == 0
             c.note(unit, name_span, s"`$name` is private to the impls of `${type_name(c.symbols[all[0]].receiver.unwrap())}`")
