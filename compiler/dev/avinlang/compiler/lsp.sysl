@@ -14,7 +14,8 @@ import sysl.text.{from_utf8, from_utf8_lossy, parse_uint, str_builder, to_lower}
 //
 // **Every answer comes from the analysis `avin check` makes**, not from a second reading of the
 // language: a diagnostic is one the parser or the checker reports, a hover is what the checker knew
-// about the name, and a definition is where the checker resolved it to (`definition_index.sysl`).
+// about the name, a definition is where the checker resolved it to (`definition_index.sysl`), and a
+// completion is what the checker found in scope where the cursor is (`completion.sysl`).
 // What an editor holds and has not saved is read in place of the disk, so nothing is written
 // anywhere for the server to read back.
 //
@@ -62,13 +63,16 @@ struct LspServer
     published: Buf[LspPublished]
     /** The last whole analysis of each program, for what is asked across all of it. */
     programs: Buf[LspIndexed]
+    /** Whether the editor said at `initialize` that it expands snippets, so a completed call can
+     * leave its arguments to fill in. */
+    snippets: bool
 
 /** A file the server last published diagnostics for, and the program that found them. */
 struct LspPublished
     root: string
     uri: string
 
-lsp_server(tc: Toolchain) -> LspServer = LspServer(tc, false, false, None, buf(), buf(), buf())
+lsp_server(tc: Toolchain) -> LspServer = LspServer(tc, false, false, None, buf(), buf(), buf(), false)
 
 const LspUsage: string = "usage: avin lsp [--stdio]"
 
@@ -187,6 +191,9 @@ lsp_answer(server: *LspServer, body: string) -> Buf[string]
     out.push(method match
         "initialize" ->
             server.initialized = true
+            server.snippets = lsp_at(params, ["capabilities", "textDocument", "completion", "completionItem", "snippetSupport"]) match
+                Some(Json.Bool(b)) -> b
+                _ -> false
             lsp_result(asked, lsp_capabilities())
         "shutdown" ->
             server.shut_down = true
@@ -197,6 +204,7 @@ lsp_answer(server: *LspServer, body: string) -> Buf[string]
         "textDocument/references" -> lsp_result(asked, lsp_references(*server, params))
         "textDocument/documentHighlight" -> lsp_result(asked, lsp_highlights(*server, params))
         "textDocument/semanticTokens/full" -> lsp_result(asked, lsp_semantic_tokens(*server, params))
+        "textDocument/completion" -> lsp_result(asked, lsp_completion(*server, params))
         _ -> lsp_error(asked, LspMethodNotFound, s"'$method' is not a method avin lsp answers"))
     out
 
@@ -226,8 +234,8 @@ private lsp_notified(server: *LspServer, method: string, msg: Json, out: *Buf[st
         out.push(lsp_publish(uri, buf()))
 
 // The capabilities the server announces: full-text synchronization, hover, definition, the outline,
-// references, highlights and semantic tokens, with positions counted in UTF-16, the protocol's
-// default.
+// references, highlights, semantic tokens and completion, with positions counted in UTF-16, the
+// protocol's default.
 private lsp_capabilities() -> Json
     var sync: Buf[JsonMember] = buf()
     lsp_put(&sync, "openClose", Json.Bool(true))
@@ -242,6 +250,11 @@ private lsp_capabilities() -> Json
     lsp_put(&caps, "referencesProvider", Json.Bool(true))
     lsp_put(&caps, "documentHighlightProvider", Json.Bool(true))
     lsp_put(&caps, "semanticTokensProvider", lsp_token_legend())
+    var completion: Buf[JsonMember] = buf()
+    var triggers: Buf[Json] = buf()
+    triggers.push(Json.Str("."))
+    lsp_put(&completion, "triggerCharacters", Json.Arr(triggers))
+    lsp_put(&caps, "completionProvider", Json.Obj(completion))
     var info: Buf[JsonMember] = buf()
     lsp_put(&info, "name", Json.Str("avin"))
     lsp_put(&info, "version", Json.Str(Version))
@@ -370,10 +383,13 @@ struct LspAnalysis
     references: Buf[Reference]
     files: Buf[string]
     whole: bool
+    completions: Completions
 
-/** Analyzes the program `file` belongs to as `avin check` does, the editor's text in place of the
- * disk for every file it holds. */
-lsp_analyze(server: LspServer, file: string, text: string) -> LspAnalysis
+/** Analyzes the program `file` belongs to as `avin check` does, `text` in place of the disk for
+ * `file` and the editor's text for every other file it holds. With `completing`, the stand-in name
+ * written in `text` where a completion is asked for, the check also records what could be written
+ * there. */
+lsp_analyze(server: LspServer, file: string, text: string, completing: string = "") -> LspAnalysis
     val library_dir = lsp_normal(server.toolchain.library_dir())
     val first = parse(source_of(file, text))
     val program = lsp_program(library_dir, file, first.file.module_name)
@@ -384,14 +400,14 @@ lsp_analyze(server: LspServer, file: string, text: string) -> LspAnalysis
         Ok(f) -> f
         Err(message) ->
             found[0].diagnostics.push(lsp_diagnostic(source_of(file, text), Span(0, 0), Error, s"avin: $message"))
-            return LspAnalysis(program, found, buf(), names, false)
+            return LspAnalysis(program, found, buf(), names, false, no_completions())
     var files: Buf[ProgramFile] = buf()
     if program.directory && !program.library
         files = program_tree_files(program.root) match
             Ok(f) -> f
             Err(message) ->
                 found[0].diagnostics.push(lsp_diagnostic(source_of(file, text), Span(0, 0), Error, s"avin: $message"))
-                return LspAnalysis(program, found, buf(), names, false)
+                return LspAnalysis(program, found, buf(), names, false, no_completions())
     elif !program.library
         files = single_file(source_of(file, text))
     var units: Buf[SourceUnit] = buf()
@@ -400,7 +416,7 @@ lsp_analyze(server: LspServer, file: string, text: string) -> LspAnalysis
     for i in 0..<library.len() + files.len()
         val in_library = i < library.len()
         val f = if in_library then library[i] else files[i - library.len()]
-        val src = lsp_held(server, f.src)
+        val src = lsp_held(server, f.src, file, text)
         var parsed = parse(src)
         f.module_name match
             Some(m) -> place_file(&parsed, m, in_library)
@@ -413,15 +429,16 @@ lsp_analyze(server: LspServer, file: string, text: string) -> LspAnalysis
     if broken
         for u in units
             if u.report.has_errors() then lsp_found(&found, u, true)
-        return LspAnalysis(program, found, buf(), names, false)
-    val checked = check_program(units, root_module, program.library, true)
+        return LspAnalysis(program, found, buf(), names, false, no_completions())
+    val checked = check_program(units, root_module, program.library, completing == "", completing)
     for u in checked.units
         if u.report.len() > 0 then lsp_found(&found, u, false)
-    LspAnalysis(program, found, checked.references, names, true)
+    LspAnalysis(program, found, checked.references, names, true, checked.completions)
 
-// A file's source as the editor holds it, where it holds it.
-private lsp_held(server: LspServer, src: Source) -> Source
+// A file's source as the editor holds it, where it holds it: `text` for the file being analyzed.
+private lsp_held(server: LspServer, src: Source, file: string, text: string) -> Source
     val name = lsp_normal(src.name)
+    if name == file then return source_of(name, text)
     for d in server.documents
         if d.file == name then return source_of(name, d.text)
     if name == src.name then src else source(name, src.bytes)
@@ -606,6 +623,95 @@ lsp_hover(server: LspServer, params: Json) -> Json
     lsp_put(&out, "contents", Json.Obj(contents))
     lsp_put(&out, "range", lsp_range(source_of(d.file, d.text), r.at_span))
     Json.Obj(out)
+
+// ---- completion ----
+
+/** `textDocument/completion`: what the checker finds may be written at the cursor
+ * (`completion.sysl`). The document's word at the cursor is replaced by a stand-in in a copy of its
+ * text, the first copy that parses is analyzed with its program, and what the check recorded at the
+ * stand-in is answered, with the keywords that begin an expression where a name in one is being
+ * written. Nothing the analysis finds is published or kept: the editor's document, its diagnostics
+ * and its references are those of its last change. The editor filters the list by what is typed. */
+lsp_completion(server: LspServer, params: Json) -> Json
+    val (d, offset) = lsp_point(server, params) match
+        Some(p) -> p
+        None -> return Json.Null
+    var items: Buf[Json] = buf()
+    if !completion_in_code(d.file, d.text, offset) then return lsp_completion_list(items)
+    val word = completion_word(d.text, offset)
+    var chosen = ""
+    for t in completion_texts(d.text, word)
+        if !parse(source_of(d.file, t)).report.has_errors()
+            chosen = t
+            break
+    if chosen == "" then return lsp_completion_list(items)
+    val found = lsp_analyze(server, d.file, chosen, CompletionMarker).completions
+    for c in found.items
+        items.push(lsp_completion_item(server, c))
+    if found.site is ValueSite
+        for k in ["val", "var", "if", "match", "for", "while", "loop", "return", "break", "continue", "true", "false"]
+            items.push(lsp_keyword_item(k))
+    lsp_completion_list(items)
+
+private lsp_completion_list(items: Buf[Json]) -> Json
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "isIncomplete", Json.Bool(false))
+    lsp_put(&out, "items", Json.Arr(items))
+    Json.Obj(out)
+
+// One completion: sorted by how near its scope is, then by name; a call written as a snippet with
+// a placeholder for each argument where the editor expands snippets.
+private lsp_completion_item(server: LspServer, c: Completion) -> Json
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "label", Json.Str(c.label))
+    lsp_put(&out, "kind", Json.Int(lsp_completion_kind(c)))
+    lsp_put(&out, "detail", Json.Str(c.detail))
+    if c.doc != ""
+        var doc: Buf[JsonMember] = buf()
+        lsp_put(&doc, "kind", Json.Str("markdown"))
+        lsp_put(&doc, "value", Json.Str(c.doc))
+        lsp_put(&out, "documentation", Json.Obj(doc))
+    lsp_put(&out, "sortText", Json.Str(s"${c.group}_${c.label}"))
+    val callable = !c.property && (c.kind is FunctionName || c.kind is MethodName)
+    if server.snippets && callable && c.params.len() > 0
+        var text = c.label + "("
+        for i in 0..<c.params.len()
+            if i > 0 then text = text + ", "
+            text = text + "${" + s"${i + 1}:${c.params[i]}" + "}"
+        lsp_put(&out, "insertText", Json.Str(text + ")"))
+        lsp_put(&out, "insertTextFormat", Json.Int(2))
+    else
+        lsp_put(&out, "insertText", Json.Str(c.label))
+        lsp_put(&out, "insertTextFormat", Json.Int(1))
+    Json.Obj(out)
+
+private lsp_keyword_item(word: string) -> Json
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "label", Json.Str(word))
+    lsp_put(&out, "kind", Json.Int(14))
+    lsp_put(&out, "sortText", Json.Str("5_" + word))
+    lsp_put(&out, "insertText", Json.Str(word))
+    lsp_put(&out, "insertTextFormat", Json.Int(1))
+    Json.Obj(out)
+
+// The protocol's kind of completion item for what a completion names.
+private lsp_completion_kind(c: Completion) -> long
+    if c.property then return 10
+    if c.builtin then return 22
+    c.kind match
+        ModuleName -> 9
+        ClassName -> 7
+        RecordName -> 22
+        EnumName -> 13
+        TraitName -> 8
+        TypeParamName -> 25
+        VariantName -> 20
+        FunctionName -> 3
+        MethodName -> 2
+        FieldName -> 5
+        ParamName -> 6
+        LocalName -> 6
+        GlobalName -> 6
 
 /** `textDocument/definition`: where the name under the cursor was declared, its range the name the
  * declaration spells. */

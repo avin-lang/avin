@@ -60,12 +60,40 @@ The server announces exactly these capabilities in its answer to `initialize`:
 | `textDocument/references` | Every place the program names what the name under the cursor names, in every file of the program and the library, in the order of their files; the declaration's own name with them when the request's `includeDeclaration` asks for it |
 | `textDocument/documentHighlight` | The places in the document that name the same thing, the declaration marked as a write and each use as a read |
 | `textDocument/semanticTokens/full` | Every name the checker resolved in the document, classified by what it names; the legend is below |
+| `textDocument/completion` | What may be written at the cursor, as the checker sees the scope there; triggered by `.` as well as by typing a name. [Completion](#completion) below says what each place offers |
 
 A call through a method table goes to the method the receiver's static type declares, and a call of
 an overloaded function to the overload the checker chose. References follow the same choice: the
 references of a trait's method are the calls made through the trait, and those of a class's
 override are the calls on that class, so asking from `Shape.area` does not list a call the checker
 resolved to `Circle.area`.
+
+### Completion
+
+Completion is answered by the checker, at the place the cursor is, so what it offers is exactly
+what would compile there:
+
+| Where | What it offers |
+| --- | --- |
+| After `.` on a value | Its static type's members: fields, methods, inherited ones and those of the traits it conforms to, the methods impls add to it or to its traits, and an extension's where the file sees it; a private member only where the code may use it |
+| After a module's name, `io.` | The module's public declarations |
+| After a type's name, `Map.` | Its static members, and the members of its companion object |
+| A name in an expression | The locals and parameters in scope at the cursor, then the enclosing class's members, then the module's declarations, then the file's imports, then the core library's, then the keywords that begin an expression: `val`, `var`, `if`, `match`, `for`, `while`, `loop`, `return`, `break`, `continue`, `true`, `false` |
+| Where a type is written: after `:`, after `->`, in `[…]` | Types only: type parameters, the module's types, imported ones, the core library's and the built-in types |
+| In an import, `import a.` or `import a.b.{…}` | The modules below the one named and its public declarations; inside braces, the declarations only |
+
+Each item carries what hover would show for it, a signature or a type, and the comment above its
+declaration, and is sorted by how near its scope is. The editor filters the list as you type. Where
+the editor says at `initialize` that it expands snippets, a call is completed with a placeholder for
+each argument without a default: `fetch(${1:thing}, ${2:times})`.
+
+The line being typed rarely parses, so the server completes in a copy of the document: the word at
+the cursor is replaced by a stand-in name, and where that still does not parse, the rest of the line
+is replaced by the brackets that close it, then the lines after the cursor's declaration are blanked.
+The first copy that parses is checked with the program, and what the checker found at the stand-in
+is the answer. Nothing else is kept: the document's diagnostics, hover and references stay those of
+its last change. In a literate document only the program is completed; the prose, comments and
+strings offer nothing. A completion in the largest file of the library takes about 130 ms.
 
 ### Semantic tokens
 
