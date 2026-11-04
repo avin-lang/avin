@@ -1429,6 +1429,26 @@ Settled by the user on 2026-11-04:
   empty pieces at the end dropped, `Pattern.split(s, limit = 0)`, `Regex.quote` and
   `Regex.quoteReplacement`; `$n` takes digits while they name a group, `${name}` is the pattern's
   own name only, and a reference that cannot be resolved traps with the dialect's message.
+- Extractor patterns ([control flow](/spec/operators-and-control-flow/#extractor-patterns)):
+  `Name(p…)` names a variant wherever one of that name is in scope, and only otherwise a value (an
+  object, a companion, a local) whose type has `unapply` or `unapplySeq`; where it has both,
+  `unapply` is used. `unapply` answers a `bool`, matched with no patterns (`Even()`), or an
+  `Option`, one pattern matching its value whole and several a tuple's parts. `unapplySeq` answers
+  an `Option` of a sequence, matched as a sequence pattern; the prefix-and-sequence form is not
+  taken. The matched value is passed to the method as it is, with no type test first, so the
+  method's parameter accepts the matched value's type. An extractor pattern never counts toward
+  exhaustiveness, and since a binding's or a `for`'s pattern must cover every value, extractors
+  appear in `match`, `is`, clauses and match functions only.
+- Rest patterns ([collections](/spec/collections/#sequence-patterns)): `rest*` or `_*`, last in a
+  sequence pattern or an `unapplySeq` extractor's patterns, binds what the patterns before it leave:
+  on a list the tail, so `[]` and `[head, tail*]` cover every list; on another sequence what
+  `drop(n)` answers, a `Vector`. `[rest*]` alone is the whole sequence, of its own type.
+- A regex as an extractor ([regular expressions](/spec/regex/#regex)): `Regex.unapplySeq(s)`
+  answers the groups' texts as a `List[string]` where `s` matches as `matches` asks, the whole of it
+  or, unanchored, any part. A group that took no part gives the empty string, since a `string` has
+  no null. `Groups`, a top-level object of `avin.regex`, takes apart any `Match`'s groups, `None`
+  for a pattern with none. There is no `unapplySeq` taking a `Match` on `Regex` itself, which
+  would need a match to know the regex that found it.
 - Sysl handles ([Sysl bindings](/spec/sysl-bindings/#handles)): a `class` declared with `@sysl`
   naming a Sysl type has no parameters, fields or constructor and is made only by a binding that
   returns it, directly or as the value of an `Option` or `Result`; a collection of handles does not
