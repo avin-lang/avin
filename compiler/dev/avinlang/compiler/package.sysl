@@ -50,7 +50,9 @@ struct Dependency
     origin: Origin
     span: Span
 
-/** A package's manifest, read and checked. */
+/** A package's manifest, read and checked. Its `sysl-dependencies` block names the Sysl packages,
+ * other than Sysl's standard library, its bindings reach; they are written as Avin dependencies are,
+ * and Sysl fetches and checks them when it builds the bindings' shims. */
 struct Manifest
     dir: string
     src: Source
@@ -60,9 +62,15 @@ struct Manifest
     version: string
     description: string
     dependencies: Buf[Dependency]
+    /** The Sysl packages the package's bindings reach beyond Sysl's standard library. A `Member`
+     * origin is never among them: a workspace's members are Avin packages. */
+    sysl_dependencies: Buf[Dependency]
     /** Whether the manifest lists a workspace, and the directories it lists, as written. */
     has_workspace: bool
     workspace: Buf[string]
+
+/** The file that makes a directory a Sysl package. */
+const SyslManifestName: string = "sysl.hocon"
 
 /** The manifest of the package at `dir`, or the first thing wrong with it, rendered with its place. */
 read_manifest(dir: string) -> Result[Manifest, string]
@@ -70,27 +78,33 @@ read_manifest(dir: string) -> Result[Manifest, string]
     val text = read_text(file).map_err(e -> s"avin: $file: ${e.to_string()}")?
     val src = source_of(file, text)
     val doc = parse_hocon(src).map_err(d -> d.render(src))?
-    var m = Manifest(dir, src, false, "", "", "", buf(), false, buf())
+    var m = Manifest(dir, src, false, "", "", "", buf(), buf(), false, buf())
     read_fields(&m, doc.root).map_err(d -> d.render(src))?
     Ok(m)
 
 private read_fields(m: *Manifest, root: Value) -> Result[unit, Diagnostic]
     var dependencies = Span(0, 0)
+    var sysl_dependencies = Span(0, 0)
     for f in root.fields()
         if f.key == "package"
             m.has_package = true
             read_package(m, f)?
         elif f.key == "dependencies"
             dependencies = f.key_span
-            read_dependencies(m, f)?
+            read_dependencies(f, false, &m.dependencies)?
+        elif f.key == "sysl-dependencies"
+            sysl_dependencies = f.key_span
+            read_dependencies(f, true, &m.sysl_dependencies)?
         elif f.key == "workspace"
             read_workspace(m, f)?
         else
-            return Err(error(f.key_span, s"`${f.key}` is not a key of $ManifestName, which holds `package`, `dependencies` and `workspace`"))
+            return Err(error(f.key_span, s"`${f.key}` is not a key of $ManifestName, which holds `package`, `dependencies`, `sysl-dependencies` and `workspace`"))
     if !m.has_package && !m.has_workspace
         return Err(error(Span(0, 0), s"$ManifestName has no `package` block: a package is named and versioned, `package { name = \"geom\", version = \"0.1.0\" }`"))
     if !m.has_package && m.dependencies.len() > 0
         return Err(error(dependencies, "a workspace with no `package` block compiles nothing of its own, so its dependencies would reach nothing: name each in the member that imports it"))
+    if !m.has_package && m.sysl_dependencies.len() > 0
+        return Err(error(sysl_dependencies, "a workspace with no `package` block compiles nothing of its own, so its Sysl dependencies would reach nothing: name each in the member whose bindings reach it"))
     Ok(())
 
 private read_package(m: *Manifest, f: Field) -> Result[unit, Diagnostic]
@@ -114,10 +128,14 @@ private read_package(m: *Manifest, f: Field) -> Result[unit, Diagnostic]
     if !versioned then return Err(error(f.key_span, "the `package` block has no `version`: every package has one, `version = \"0.1.0\"`"))
     Ok(())
 
-private read_dependencies(m: *Manifest, f: Field) -> Result[unit, Diagnostic]
-    if !f.value.is_obj() then return Err(error(f.value.span, "`dependencies` is a block naming each dependency, `json { git = \"github.com/owner/json\", version = \"1.0.0\" }`"))
+// The dependencies a `dependencies` block lists, or with `sysl` a `sysl-dependencies` block, whose
+// entries are written the same way except that a workspace holds no Sysl package.
+private read_dependencies(f: Field, sysl: bool, into: *Buf[Dependency]) -> Result[unit, Diagnostic]
+    if !f.value.is_obj() then return Err(error(f.value.span, s"`${f.key}` is a block naming each dependency, `json { git = \"github.com/owner/json\", version = \"1.0.0\" }`"))
     for d in f.value.fields()
         if !valid_package_name(d.key) then return Err(error(d.key_span, s"`${d.key}` is not a dependency's name: ${PackageNameRule}"))
+        if sysl && !d.value.is_obj()
+            return Err(error(d.value.span, s"the Sysl dependency `${d.key}` is a block saying where it comes from: `{ git = \"github.com/owner/name\", version = \"1.0.0\" }` or `{ path = \"../name\" }`"))
         if !d.value.is_obj()
             return Err(error(d.value.span, s"the dependency `${d.key}` is a block saying where it comes from: `{ git = \"github.com/owner/name\", version = \"1.0.0\" }`, `{ path = \"../name\" }` or `{ workspace = true }`"))
         var git: Option[string] = None
@@ -142,32 +160,38 @@ private read_dependencies(m: *Manifest, f: Field) -> Result[unit, Diagnostic]
                 val p = text_of(g)?
                 if p == "" then return Err(error(g.value.span, "a dependency's `path` names a directory"))
                 local = Some(p)
+            elif g.key == "workspace" && sysl
+                return Err(error(g.key_span, s"`workspace` is not a key of a Sysl dependency, which holds `git` with `version` or `rev`, or `path`: a workspace's members are Avin packages"))
             elif g.key == "workspace"
                 g.value.as_bool() match
                     Some(true) -> member = true
                     _ -> return Err(error(g.value.span, "a dependency's `workspace` is `true`: the dependency is the member of the workspace with its name"))
+            elif sysl
+                return Err(error(g.key_span, s"`${g.key}` is not a key of a Sysl dependency, which holds `git` with `version` or `rev`, or `path`"))
             else
                 return Err(error(g.key_span, s"`${g.key}` is not a key of a dependency, which holds `git` with `version` or `rev`, `path`, or `workspace`"))
         var sources = 0
         if git is Some(_) then sources += 1
         if local is Some(_) then sources += 1
         if member then sources += 1
+        if sources != 1 && sysl
+            return Err(error(d.key_span, s"the Sysl dependency `${d.key}` says once where it comes from: `git` with a `version` or a `rev`, or `path`"))
         if sources != 1
             return Err(error(d.key_span, s"the dependency `${d.key}` says once where it comes from: `git` with a `version` or a `rev`, `path`, or `workspace = true`"))
         if git is Some(c)
             if version is Some(_) && rev is Some(_)
                 return Err(error(d.key_span, s"the dependency `${d.key}` has a `version` and a `rev`: a git dependency is read at a release or at a commit, not both"))
             if rev is Some(x)
-                m.dependencies.push(Dependency(d.key, Rev(c, x), d.key_span))
+                into.push(Dependency(d.key, Rev(c, x), d.key_span))
                 continue
             version match
-                Some(v) -> m.dependencies.push(Dependency(d.key, Git(c, v), d.key_span))
+                Some(v) -> into.push(Dependency(d.key, Git(c, v), d.key_span))
                 None -> return Err(error(d.key_span, s"the dependency `${d.key}` names a repository and no version: a git dependency is read at a release, `version = \"1.0.0\"` being the tag `v1.0.0`, or at a commit, `rev = \"3f9a2c1\"`"))
             continue
         if rev is Some(_) then return Err(error(d.key_span, s"the dependency `${d.key}` has a `rev`, which belongs with `git`: a directory is read as it stands"))
         if version is Some(_) then return Err(error(d.key_span, s"the dependency `${d.key}` has a `version`, which belongs with `git`: a directory is read as it stands"))
-        if local is Some(p) then m.dependencies.push(Dependency(d.key, Local(p), d.key_span))
-        else m.dependencies.push(Dependency(d.key, Member, d.key_span))
+        if local is Some(p) then into.push(Dependency(d.key, Local(p), d.key_span))
+        else into.push(Dependency(d.key, Member, d.key_span))
     Ok(())
 
 private read_workspace(m: *Manifest, f: Field) -> Result[unit, Diagnostic]
@@ -453,11 +477,13 @@ private digest(bytes: []const u8) -> string
 
 // Resolution.
 
-/** A package a program is made of: its name, its directory and its manifest. */
+/** A package a program is made of: its name, its directory, its manifest, and whether it was fetched
+ * or reached through a package that was. */
 struct ResolvedPackage
     name: string
     dir: string
     manifest: Manifest
+    fetched: bool
 
 /** What resolving a package found: the packages, the one resolved first and then every package it
  * depends on, directly or through another; the sum file; the lines it holds; and a line for every
@@ -527,7 +553,7 @@ private visit(r: *Resolver, dir: string, fetched: bool, seen: *Buf[string], out:
     seen.push(dir)
     val m = read_manifest(dir)?
     if !m.has_package then return Err(s"avin: $dir is a workspace's root with no `package` block, which no package can depend on")
-    out.push(ResolvedPackage(m.name, dir, m))
+    out.push(ResolvedPackage(m.name, dir, m, fetched))
     for d in m.dependencies
         val target = d.origin match
             Git(coordinate, version) ->
@@ -881,6 +907,60 @@ struct LoadedProgram
     files: Buf[ProgramFile]
     /** The package's name, when the program is a package. */
     package: Option[string]
+    /** The Sysl packages its bindings may reach beyond Sysl's standard library. */
+    sysl: Buf[SyslPackage]
+
+/** A Sysl package a program's bindings may reach: its name in the shim package's manifest, and where
+ * it comes from, a directory made absolute. */
+struct SyslPackage
+    label: string
+    origin: Origin
+
+/** The Sysl packages every package of a resolution names, each once. Two packages naming one Sysl
+ * package at two releases take the higher, as for an Avin package; one name given two different
+ * origins is refused, and so is a path dependency of a fetched package or a path holding no Sysl
+ * package. */
+sysl_packages(res: Resolution) -> Result[Buf[SyslPackage], string]
+    var out: Buf[SyslPackage] = buf()
+    var named_by: Buf[string] = buf()
+    for p in res.packages
+        for d in p.manifest.sysl_dependencies
+            val origin = d.origin match
+                Local(dir) ->
+                    if p.fetched then return Err(error(d.span, s"`${d.label}` is a Sysl path dependency of a fetched package: a directory is only where it is on the machine that published it").render(p.manifest.src))
+                    val full = if is_absolute(dir) then dir else p.dir + "/" + dir
+                    val c = canonicalize(full) match
+                        Ok(c) -> c
+                        Err(_) -> return Err(error(d.span, s"`${d.label}` is a Sysl path dependency, and `$dir` is not a directory").render(p.manifest.src))
+                    if !is_dir(c) then return Err(error(d.span, s"`${d.label}` is a Sysl path dependency, and `$dir` is not a directory").render(p.manifest.src))
+                    if !exists(c + "/" + SyslManifestName) then return Err(error(d.span, s"`${d.label}` is a Sysl path dependency, and `$dir` holds no $SyslManifestName, so it is not a Sysl package").render(p.manifest.src))
+                    Local(c)
+                o -> o
+            var found: Option[usize] = None
+            for i in 0..<out.len()
+                if out[i].label == d.label then found = Some(i)
+            val i = found match
+                Some(i) -> i
+                None ->
+                    out.push(SyslPackage(d.label, origin))
+                    named_by.push(p.name)
+                    continue
+            if same_origin(out[i].origin, origin) then continue
+            if out[i].origin is Git(c, v)
+                if origin is Git(c2, v2)
+                    if c == c2
+                        if version_after(v2, v) then out[i].origin = origin
+                        continue
+            return Err(error(d.span, s"the Sysl dependency `${d.label}` is ${origin_text(origin)} here and ${origin_text(out[i].origin)} in `${named_by[i]}`: one name is one Sysl package, so make them agree").render(p.manifest.src))
+    Ok(out)
+
+private same_origin(a: Origin, b: Origin) -> bool = origin_text(a) == origin_text(b)
+
+private origin_text(o: Origin) -> string = o match
+    Git(c, v) -> s"$c v$v"
+    Rev(c, r) -> s"$c at the commit $r"
+    Local(d) -> s"the directory $d"
+    Member -> "a workspace member"
 
 /** The program `path` names. A path at or under a package's directory is that package, compiled with
  * every package it depends on; any other directory is a program of many files, and a file a program
@@ -893,9 +973,9 @@ load_program(path: string, fetching: Fetching) -> Result[LoadedProgram, string]
     if is_dir(path)
         val files = program_files(path).map_err(message -> "avin: " + message)?
         if files.len() == 0 then return Err(s"avin: $path: no `.avin` or `.lavin` files in the program")
-        return Ok(LoadedProgram(path, files, None))
+        return Ok(LoadedProgram(path, files, None, buf()))
     val text = read_text(path).map_err(e -> s"avin: $path: ${e.to_string()}")?
-    Ok(LoadedProgram(path, single_file(source_of(path, text)), None))
+    Ok(LoadedProgram(path, single_file(source_of(path, text)), None, buf()))
 
 /** The package at `root` with every package it depends on: each dependency's modules first, then the
  * package's own files. The sum file gains a line for any package fetched for the first time. A module
@@ -927,7 +1007,8 @@ load_package(root: string, fetching: Fetching) -> Result[LoadedProgram, string]
             None ->
                 modules.push(module_name)
                 holders.push(owners[i])
-    Ok(LoadedProgram(root, files, Some(res.packages[0].name)))
+    val sysl = sysl_packages(res)?
+    Ok(LoadedProgram(root, files, Some(res.packages[0].name), sysl))
 
 /** The files of the program tree at `root` as `program_files` finds them, or, when `root` holds a
  * manifest, of the package and its dependencies without fetching any: what the language server reads. */
