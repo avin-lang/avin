@@ -78,7 +78,15 @@ private class Pool()
             task()
             lock.acquire()
 
-private val pool = Pool()
+// The pool, made by the first thread to need it; a program that makes no future never makes it.
+private val poolMaking = Once()
+private var poolMade: Option[Pool] = None
+
+private pool() -> Pool
+    poolMaking.run(() -> poolMade = Some(Pool()))
+    poolMade match
+        Some(p) -> p
+        None -> fail("the pool of workers is made before it is used")
 
 // Where a future's value is left, once, and what is to run with it.
 private class Cell[T]()
@@ -125,7 +133,7 @@ private class Cell[T]()
     // Waits until there is a value, or for at most `timeoutMillis` milliseconds where it is given.
     waitFor(timeoutMillis: Option[long]) -> Option[T]
         if peek() is Some(v) then return Some(v)
-        val counted = pool.blocking()
+        val counted = pool().blocking()
         lock.acquire()
         timeoutMillis match
             None -> while value.isNone() do done.wait()
@@ -137,7 +145,7 @@ private class Cell[T]()
                     left = deadline - monotonicMillis()
         val v = value
         lock.release()
-        if counted then pool.resumed()
+        if counted then pool().resumed()
         v
 
 // A value that is being computed, or has been. It is completed once, by its body on the pool or by
@@ -165,12 +173,12 @@ class Future[T](private val cell: Cell[T])
     value() -> Option[T] = cell.peek()
 
     // Runs `f` with the value on a pool thread once it is there.
-    onComplete(f: (T) -> unit) = cell.whenDone(v -> pool.submit(() -> f(v)))
+    onComplete(f: (T) -> unit) = cell.whenDone(v -> pool().submit(() -> f(v)))
 
     // The future of `f` of the value, which runs on a pool thread once the value is there.
     map[U](f: (T) -> U) -> Future[U]
         val next = Cell[U]()
-        cell.whenDone(v -> pool.submit(() ->
+        cell.whenDone(v -> pool().submit(() ->
             next.complete(f(v))
             ()))
         Future(next)
@@ -179,7 +187,7 @@ class Future[T](private val cell: Cell[T])
     // value is there.
     flatMap[U](f: (T) -> Future[U]) -> Future[U]
         val next = Cell[U]()
-        cell.whenDone(v -> pool.submit(() ->
+        cell.whenDone(v -> pool().submit(() ->
             f(v).cell.whenDone(u ->
                 next.complete(u)
                 ())))
@@ -208,7 +216,7 @@ object Future
     // Runs `body` on the pool and gives back the future of what it returns.
     apply[T](body: -> T) -> Future[T]
         val cell = Cell[T]()
-        pool.submit(() ->
+        pool().submit(() ->
             cell.complete(body)
             ())
         Future(cell)
