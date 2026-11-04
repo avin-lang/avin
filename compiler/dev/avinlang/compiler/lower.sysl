@@ -284,11 +284,17 @@ private method_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
         table.push(Some(instance(l, m, implementation_args(l, t, m))))
     table
 
-/** The checker's method table of class or data type `t`: the method at each position. */
+/** The checker's method table of class, data or built-in type `t`: the method at each position. */
 private checker_table(l: *Lowering, t: &Type) -> Buf[Option[usize]] = *t match
     Class(k, _, _) -> l.program.classes[k].table
     Data(d, _, _) -> l.program.data[d].table
-    _ -> buf()
+    _ -> builtin_table(l, t)
+
+/** A built-in type's table, which the first of its conformances keeps. */
+private builtin_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
+    for b in l.program.builtins
+        if same_type(b.ty, t) then return b.table
+    buf()
 
 /** The type arguments of the class or trait declaring method `m` as a value of `t` sees them, or for
  * a method an impl adds to a data type, the value's own: the leading type arguments of the instance
@@ -771,7 +777,7 @@ private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr],
     // A string operation is lowered where it is called, so its checks report the call's place.
     val callee = l.program.symbols[function]
     if callee.intrinsic is Some(name)
-        if name != "print_line" then return intrinsic_operation(l, name, operands, e.span)
+        if name.starts_with("string_") then return intrinsic_operation(l, name, operands, e.span)
     // A local function also receives what it captures, from where the caller keeps it.
     for x in callee.captured_locals
         if l.local_slots[x] is Some(p) then operands.push(p.address)
@@ -1048,19 +1054,33 @@ shim_symbol(function: string) -> string
 // place instead, so a value of one reports its checks at the intrinsic's declaration.
 private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
     val name = symbol.intrinsic.unwrap_or("")
-    if name == "print_line"
-        var args: Buf[Operand] = buf()
-        args.push(Value(0))
-        var params: Buf[MirType] = buf()
-        params.push(MRef)
-        l.insts.push(Call(None, Runtime("avin_rt_print_line", MirSignature(params, None)), args))
-        finish(l, Return(None))
+    if name.starts_with("string_")
+        var operands: Buf[Operand] = buf()
+        for i in 0..<symbol.params.len()
+            operands.push(Value(i))
+        val result = intrinsic_operation(l, name, operands, symbol.decl.name_span)
+        finish(l, Return(result))
         return
+    // Every other intrinsic calls one runtime entry point.
+    val found = intrinsic_entry(name) match
+        Some(f) -> f
+        None ->
+            finish(l, Unreachable)
+            return
     var args: Buf[Operand] = buf()
-    for i in 0..<symbol.params.len()
-        args.push(Value(i))
-    val result = intrinsic_operation(l, name, args, symbol.decl.name_span)
-    finish(l, Return(result))
+    var params: Buf[MirType] = buf()
+    for i in 0..<found.1.len()
+        if machine(l, found.1[i]) is Some(t)
+            if l.param_values[i] is Some(v) then args.push(Value(v))
+            params.push(t)
+    val result = machine(l, found.2)
+    val dest = result match
+        Some(t) -> Some(fresh(l, t))
+        None -> None
+    l.insts.push(Call(dest, Runtime(found.0, MirSignature(params, result)), args))
+    finish(l, Return(dest match
+        Some(id) -> Some(Value(id))
+        None -> None))
 
 /** The bytes of a string's header, its length, before its UTF-8 bytes. */
 private const TextHeader: usize = 8

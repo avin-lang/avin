@@ -69,6 +69,40 @@ as the same value, written out without an exponent (`2.5`, `1`, `0.1`), a `bool`
 implements neither is a compile error. There is no fallback that prints an address. The specifier
 applies to the whole rendered value.
 
+The core library declares the traits:
+
+```text
+trait Writer
+    write(text: string)
+    writeChar(c: char) = …
+    writeInt(n: long) = …
+    writeField(text: string, spec: FormatSpec) = …
+    writeSpaces(n: long) = …
+
+data FormatSpec(width: int = 0, precision: int = -1, left: bool = false)
+
+trait Display
+    display(out: Writer, spec: FormatSpec)
+    toString() -> string = …
+
+trait Debug
+    debug(out: Writer, spec: FormatSpec)
+```
+
+- `FormatSpec` is the field a value fills: `width` characters, padded with spaces on the left, or on
+  the right when `left`; 0 asks for no padding, and wider text is written whole. `precision`, -1 for
+  none, is read by a renderer that takes one, in its own terms. `writeField` writes a text in the
+  field a spec describes, which is how most `display` methods end.
+- `toString()` renders into a `StringWriter`, a writer building a string, and returns its `text()`.
+  `StandardOutput` is the writer for standard output; it writes an integer's digits without making
+  a string of them.
+- `print(x)` writes `x`'s `Display` form and a new line to standard output. `debug(x)` is `x`'s
+  `Debug` form as a string, so `print(debug(x))` prints it. Inside an implementation of `Debug`, the
+  bare name `debug` is the method, and a part is written with `part.debug(out, spec)`.
+- The built-in types' `Debug` forms are their `Display` forms, except that a string and a `char`
+  are written as the literals that make them: quoted, with the quote, the backslash and control
+  characters escaped (`"a\"b\n"`, `'\''`).
+
 ## Lowering
 
 For `s` and `f`, the compiler keeps literal segments, typed holes, parsed specifiers and source spans

@@ -161,6 +161,8 @@ struct VariantSymbol
     span: Span
     field_names: Buf[string]
     fields: Buf[&Type]
+    /** For each field, the function computing its value where a construction omits it. */
+    defaults: Buf[Option[usize]]
 
 /** A variant, by its data type's index and its own position among the type's variants. */
 struct VariantRef
@@ -335,6 +337,9 @@ struct Checker
     private_names: Map[string, bool]
     /** The program's root module, which declares `main`. */
     root_module: string
+    /** The built-in types' conformances to traits, one for each impl of a trait for a built-in
+     * type. */
+    builtins: Buf[BuiltinConformance]
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -465,7 +470,7 @@ private check_imports(c: *Checker, unit: usize)
  * unit is one of its files. Every file sees its own module's declarations, the names it imports and
  * the core library's public declarations, in that order: an inner name hides an outer one. */
 check_program(units: Buf[SourceUnit], root_module: string) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module)
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf())
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
     // Every type is named before any is used, so a data type may refer to itself or to one
@@ -559,7 +564,7 @@ check_program(units: Buf[SourceUnit], root_module: string) -> Checked
     var sources: Buf[Source] = buf()
     for u in c.units
         sources.push(u.src)
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, id, init)))
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, id, init, c.builtins)))
 
 private declare_unit(c: *Checker, unit: usize)
     val file = c.units[unit].file
@@ -811,9 +816,18 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
                 c.data[id].traits = traits
             Class(_, _, _) -> ()
             _ ->
-                c.note(unit, d.target.span, "conforming a built-in type to a trait is not implemented")
-                return invalid
+                if conforms_directly(builtin_traits(c, target), t)
+                    c.note(unit, written_trait_span(d), s"`$path` already conforms to `${type_name(t)}`; a conformance is stated once")
+                    return invalid
+                c.builtins.push(BuiltinConformance(target, t, unit, d.target.span, buf()))
     ImplSymbol(unit, module_name, d, target, owner, trait_type)
+
+/** The traits built-in type `t` conforms to through its impls. */
+private builtin_traits(c: *Checker, t: &Type) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    for b in c.builtins
+        if same_type(b.ty, t) then out.push(b.trait_type)
+    out
 
 /** Whether `traits` already holds the trait `t` names, with any type arguments. */
 private conforms_directly(traits: Buf[&Type], t: &Type) -> bool
@@ -868,15 +882,42 @@ private declare_variants(c: *Checker, unit: usize)
                     _ ->
                         c.note(unit, f.pattern.span, "a field is a name and a type")
                         names.push("_")
-                if f.default is Some(e) then c.note(unit, e.span, "default field values are not implemented")
                 fields.push(resolve_type(c, unit, f.ty))
             // A variant is a name of its type's module, private where its type is.
             val key = qualified(c.data[id].module_name, v.name)
             c.variants.put(key, VariantRef(id, variants.len()))
             if c.private_names.get(qualified(c.data[id].module_name, c.data[id].name)) is Some(_) then c.private_names.put(key, true)
-            variants.push(VariantSymbol(v.name, v.span, names, fields))
+            variants.push(VariantSymbol(v.name, v.span, names, fields, field_defaults(c, unit, id, v, names, fields)))
         c.data[id].variants = variants
         c.generic = outer_generic
+
+// The defaults of a variant's fields, as a constructor's: each a function of the fields before it,
+// sharing the data type's type parameters, called where a construction omits the field.
+private field_defaults(c: *Checker, unit: usize, id: usize, v: Variant, names: Buf[string], fields: Buf[&Type]) -> Buf[Option[usize]]
+    val d = c.data[id]
+    var defaults: Buf[Option[usize]] = buf()
+    for i in 0..<v.fields.len()
+        val value = v.fields[i].default match
+            Some(e) -> e
+            None ->
+                defaults.push(None)
+                continue
+        val did = c.symbols.len()
+        var params: Buf[&Type] = buf()
+        var param_names: Buf[string] = buf()
+        var decls: Buf[Param] = buf()
+        for k in 0..<i
+            params.push(fields[k])
+            param_names.push(names[k])
+            decls.push(v.fields[k])
+        val name = s"${v.name}/${names[i]}"
+        val decl = Function(buf(), value.span, v.fields[i].span, name, d.decl.type_params, decls, None, Some(value), buf())
+        c.symbols.push(FunctionSymbol(unit, d.module_name, name, decl, params, param_names, Some(fields[i]), None, None, buf(), buf(), buf(), false, false, false, buf(), Some(names[i]), data_owner(id), d.decl.type_params, None, false, true, "", None))
+        c.states.push(0)
+        c.bodies.push(None)
+        c.locals.push(buf())
+        defaults.push(Some(did))
+    defaults
 
 /** The type of an instance of a class, with the class's own parameters as its arguments: the type of
  * `self` in its constructor and methods. */
@@ -1865,6 +1906,15 @@ private table_position(c: *Checker, k: usize, target: usize) -> Option[usize]
  * its superclass's, each as an instance of `t` sees it. A trait conformed to with two different type
  * argument lists appears twice. */
 private collect_traits(c: *Checker, t: &Type, out: *Buf[&Type])
+    if is_builtin(t)
+        for r in builtin_traits(c, t)
+            var seen = false
+            for i in 0..<out.len()
+                if same_type(out[i], r) then seen = true
+            if !seen
+                out.push(r)
+                collect_traits(c, r, out)
+        return
     if *t is Data(d, _, xs)
         for required in c.data[d].traits
             val r = substitute(required, data_owner(d), xs)
@@ -2086,6 +2136,16 @@ private place_traits(c: *Checker)
         data_conformed.push(ids)
         holders.push(ids)
         slot_counts.push(0)
+    // A built-in type's conformances are gathered under the first impl that names it.
+    var builtin_conformed: Buf[Buf[usize]] = buf()
+    for b in 0..<c.builtins.len()
+        var first = true
+        for e in 0..<b
+            if same_type(c.builtins[e].ty, c.builtins[b].ty) then first = false
+        val ids = if first then trait_ids(c, c.builtins[b].ty) else buf()
+        builtin_conformed.push(ids)
+        holders.push(ids)
+        slot_counts.push(0)
     var placed: Buf[bool] = buf()
     for _ in c.classes
         placed.push(false)
@@ -2112,6 +2172,44 @@ private place_traits(c: *Checker)
         if !is_trait(c, k) then ensure_table(c, k, conformed)
     for d in 0..<c.data.len()
         build_data_table(c, d, data_conformed[d])
+    for b in 0..<c.builtins.len()
+        build_builtin_table(c, b, builtin_conformed[b])
+
+// A built-in type's method table, kept by the first of its conformances: at each position of a
+// trait it conforms to, the method of the type's impl that implements it. A built-in value is no
+// object, so it cannot take a trait's default body, which is shared by objects of every conforming
+// type; its impl implements every method of the trait.
+private build_builtin_table(c: *Checker, b: usize, conformed: Buf[usize])
+    if conformed.len() == 0 then return
+    val ty = c.builtins[b].ty
+    val name_of = type_name(ty)
+    var size = 0usize
+    for t in conformed
+        val end = c.classes[t].base + c.classes[t].methods.len()
+        if end > size then size = end
+    var table: Buf[Option[usize]] = buf()
+    for _ in 0..<size
+        table.push(None)
+    for t in conformed
+        val methods = c.classes[t].methods
+        for j in 0..<methods.len()
+            if is_trait_override(c, methods[j]) then continue
+            val name = c.symbols[methods[j]].decl.name
+            var own: Option[usize] = None
+            for m in c.builtin_methods
+                if own is None && same_type(c.symbols[m].receiver.unwrap(), ty) && same_method(c, ty, m, methods[j]) then own = Some(m)
+            own match
+                Some(m) ->
+                    inherit_defaults(c, m, methods[j])
+                    table.set(c.classes[t].base + j, Some(m))
+                None ->
+                    var at = b
+                    for e in 0..<c.builtins.len()
+                        if same_type(c.builtins[e].ty, ty) && *c.builtins[e].trait_type is Class(k, _, _)
+                            if k == t then at = e
+                    val what = if is_trait_field(c, methods[j]) then s"`val $name`, which a built-in type has no field to supply" else s"`$name`; a built-in type takes no default bodies, so its impl implements every method of the trait"
+                    c.note(c.builtins[at].unit, c.builtins[at].span, s"`$name_of` does not implement ${c.classes[t].name}'s $what")
+    c.builtins[b].table = table
 
 // A data type's method table: at each position of a trait it conforms to, the type's own method of
 // that name, which an impl of a trait declares, or else the trait's default body. Two different
@@ -2760,10 +2858,72 @@ private intrinsic_of(c: *Checker, unit: usize, f: &Function) -> Option[string]
 /** The intrinsics the compiler implements, with the type each must be declared with. A method's
  * type takes its receiver first. */
 intrinsic_signature(name: string) -> Option[&Type]
-    // Each takes a string first, then these.
+    if name.starts_with("string_") then return string_intrinsic(name)
+    val found = intrinsic_entry(name)?
+    Some(Function(found.1, found.2))
+
+/** The runtime entry point an intrinsic calls, with its parameters and result. Each intrinsic is a
+ * call of one entry point, which takes the thread's context first and then the intrinsic's own
+ * arguments. */
+intrinsic_entry(name: string) -> Option[(string, Buf[&Type], &Type)]
+    var params: Buf[&Type] = buf()
+    var result: &Type = Unit
+    var entry = ""
+    if name == "print_line"
+        entry = "avin_rt_print_line"
+        params.push(Str)
+    elif name == "write_out"
+        entry = "avin_rt_write_out"
+        params.push(Str)
+    elif name == "write_int"
+        entry = "avin_rt_write_int"
+        params.push(Int(64))
+    elif name == "render_int"
+        entry = "avin_rt_render_int"
+        params.push(Int(64))
+        result = Str
+    elif name == "render_real"
+        entry = "avin_rt_render_real"
+        params.push(Real)
+        result = Str
+    elif name == "render_char"
+        entry = "avin_rt_render_char"
+        params.push(Char)
+        result = Str
+    elif name == "text_size"
+        entry = "avin_rt_text_size"
+        params.push(Str)
+        result = Int(64)
+    elif name == "text_width"
+        entry = "avin_rt_text_width"
+        params.push(Str)
+        result = Int(64)
+    elif name == "text_append"
+        entry = "avin_rt_text_append"
+        params.push(Str)
+        params.push(Int(64))
+        params.push(Str)
+        result = Str
+    elif name == "text_take"
+        entry = "avin_rt_text_take"
+        params.push(Str)
+        params.push(Int(64))
+        result = Str
+    elif name == "quote_text"
+        entry = "avin_rt_quote_text"
+        params.push(Str)
+        result = Str
+    elif name == "quote_char"
+        entry = "avin_rt_quote_char"
+        params.push(Char)
+        result = Str
+    else return None
+    Some((entry, params, result))
+
+// The string operations, which lowering expands in place. Each takes a string first, then these.
+private string_intrinsic(name: string) -> Option[&Type]
     var params: Buf[&Type] = buf()
     params.push(Str)
-    if name == "print_line" then return Some(Function(params, Unit))
     if name == "string_byte_length" then return Some(Function(params, Int(32)))
     if name == "string_byte_at"
         params.push(Int(32))
@@ -2862,9 +3022,16 @@ private conforms_to_bound(c: *Checker, t: &Type, bound: &Type) -> bool
                 if ancestor_type(c.classes, c.data, b, k) is Some(up)
                     if conforms(zonk(c, up), zonk(c, bound)) then return true
             false
-        _ -> ancestor_type(c.classes, c.data, x, k) match
-            Some(up) -> conforms(zonk(c, up), zonk(c, bound))
-            None -> false
+        _ ->
+            if is_builtin(x)
+                var traits: Buf[&Type] = buf()
+                collect_traits(c, x, &traits)
+                for t in traits
+                    if conforms(t, zonk(c, bound)) then return true
+                return false
+            ancestor_type(c.classes, c.data, x, k) match
+                Some(up) -> conforms(zonk(c, up), zonk(c, bound))
+                None -> false
 
 // Holds type arguments written on a type to the bounds of its parameters: at once when every
 // conformance is known, and otherwise once it is.
@@ -4788,15 +4955,37 @@ private interpolate_expr(c: *Checker, e: &Expr, prefix: string, chunks: Buf[stri
                     ty = Nothing
                     pieces.push(h)
                 ErrorType -> ok = false
-                _ ->
-                    c.note(unit, h.span, s"rendering a ${type_name(h.ty)} value is not implemented")
-                    ok = false
+                _ -> displayed(c, h) match
+                    Some(text) -> pieces.push(text)
+                    None -> ok = false
     if !ok then return TExpr(e.span, ErrorType, UnitConst)
     if pieces.len() == 0 then return TExpr(e.span, Str, StrConst(""))
     var out = pieces[0]
     for k in 1..<pieces.len()
         out = TExpr(e.span, ty, Arith(Add, out, pieces[k], e.span))
     if *ty is Nothing then TExpr(e.span, Nothing, out.kind) else out
+
+// A hole of a type other than the built-ins is rendered by its `Display` implementation, as
+// `h.toString()`. A type that does not implement `Display` cannot be interpolated.
+private displayed(c: *Checker, h: &TExpr) -> Option[&TExpr]
+    val unit = unit_of(c)
+    val t = zonk(c, h.ty)
+    if *t is Tuple(_)
+        c.note(unit, h.span, s"rendering a tuple is not implemented; interpolate its parts")
+        return None
+    val display = c.class_types.get(qualified(CoreModule, "Display")) match
+        Some(k) -> k
+        None ->
+            c.note(unit, h.span, "the core library declares no `Display`")
+            return None
+    if !conforms_to_bound(c, t, Class(display, "Display", buf()))
+        c.note(unit, h.span, s"`${type_name(t)}` does not implement `Display`, so it cannot be interpolated")
+        return None
+    val ms = methods_of(c, t, "toString")
+    if ms.len() == 0
+        c.note(unit, h.span, s"`${type_name(t)}` has no `toString`")
+        return None
+    Some(call_method(c, h.span, h.span, h, "toString", ms, buf(), None, None, false))
 
 // The type two branches agree on; where they have no nearest common superclass, the type expected
 // of them, when both conform to it: two classes conforming to one trait agree on the trait only
@@ -5674,10 +5863,7 @@ private construct(c: *Checker, at: Span, name_span: Span, v: VariantRef, args: B
     val d = c.data[v.data]
     val variant = d.variants[v.index]
     val called = variant.fields.len() > 0
-    var defaults: Buf[Option[usize]] = buf()
-    for _ in variant.fields
-        defaults.push(None)
-    val signature = Signature(variant.name, called, d.decl.type_params, data_owner(v.data), variant.fields, variant.field_names, defaults, own_type(d, v.data), buf(), None)
+    val signature = Signature(variant.name, called, d.decl.type_params, data_owner(v.data), variant.fields, variant.field_names, variant.defaults, own_type(d, v.data), buf(), None)
     val applied = apply(c, at, name_span, signature, args, explicit, expected, buf())
     applied.wrap(at, Construct(v.index, applied.args))
 

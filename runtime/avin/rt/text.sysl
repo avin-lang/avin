@@ -3,7 +3,7 @@ module avin.rt
 import sysl.buf.{Buf, buf}
 import sysl.raw.ptr_cast
 import sysl.slices.copy
-import sysl.text.parse_real
+import sysl.text.{from_utf8_unchecked, parse_real}
 
 // Avin's strings. A string is a reference to an object holding its length in bytes and then its
 // UTF-8 bytes; its descriptor is in the header the collector keeps before it. A literal is a constant object the compiler emits; a string the program
@@ -210,3 +210,101 @@ render_real(ctx: *Context, value: real) -> *u8 = text_of(ctx, value.to_string())
 /** The character itself. */
 @export("avin_rt_render_char")
 render_char(ctx: *Context, value: char) -> *u8 = text_of(ctx, value.to_string())
+
+/** The length of a string in bytes. */
+@export("avin_rt_text_size")
+text_size(ctx: *Context, text: *u8) -> long = long(text_length(text))
+
+/** The number of characters in a string: its bytes that do not continue a UTF-8 sequence. */
+@export("avin_rt_text_width")
+text_width(ctx: *Context, text: *u8) -> long
+    val data = text_bytes(text)
+    var n: long = 0
+    for i in 0..<text_length(text)
+        if data[i] & 0xC0 != 0x80 then n += 1
+    n
+
+// A string writer keeps what has been written in a string object of its own, the storage, whose
+// length is its capacity; only the first `used` bytes are text. The writer never hands its storage
+// out, so filling it in place is seen by nothing else. An empty storage, such as the constant `""`
+// a writer starts with, has no room, so a constant is never written to.
+
+/** The storage holding the `used` bytes of `store` followed by `text`: `store` itself when it has
+ * room, or else a new storage of twice the size needed so far. */
+@export("avin_rt_text_append")
+text_append(ctx: *Context, store: *u8, used: long, text: *u8) -> *u8
+    val n = text_length(text)
+    val at = usize(used)
+    var target = store
+    if at + n > text_length(store)
+        var room = text_length(store) * 2
+        if room < 32 then room = 32
+        while room < at + n do room = room * 2
+        // Allocating may collect; `store` and `text` stay alive because the caller holds them as
+        // roots, and the collector never moves an object.
+        target = new_text(ctx, room)
+        val from = text_bytes(store)
+        val to = text_bytes(target)
+        for i in 0..<at do to[i] = from[i]
+    val to = text_bytes(target)
+    val bytes = text_bytes(text)
+    for i in 0..<n do to[at + i] = bytes[i]
+    target
+
+/** A new string holding the first `used` bytes of the storage `store`. */
+@export("avin_rt_text_take")
+text_take(ctx: *Context, store: *u8, used: long) -> *u8
+    val n = usize(used)
+    val p = new_text(ctx, n)
+    val from = text_bytes(store)
+    val to = text_bytes(p)
+    for i in 0..<n do to[i] = from[i]
+    p
+
+/** A string as the literal that writes it: in double quotes, with each quote, backslash and control
+ * character escaped. */
+@export("avin_rt_quote_text")
+quote_text(ctx: *Context, text: *u8) -> *u8
+    var out: Buf[u8] = buf()
+    val data = text_bytes(text)
+    quote_bytes(&out, data[0..<text_length(text)], 34)
+    text_of(ctx, from_utf8_unchecked(out.view()))
+
+/** A character as the literal that writes it: in single quotes, escaped as in a string. */
+@export("avin_rt_quote_char")
+quote_char(ctx: *Context, value: char) -> *u8
+    var out: Buf[u8] = buf()
+    quote_bytes(&out, value.to_string().bytes, 39)
+    text_of(ctx, from_utf8_unchecked(out.view()))
+
+// `data` between two `quote` bytes, with the quote, the backslash and the control characters
+// escaped: `\n`, `\t`, `\r`, `\0` by name, and the others as `\u{…}` in hex.
+private quote_bytes(out: *Buf[u8], data: []const u8, quote: u8)
+    val hex = "0123456789abcdef".bytes
+    out.push(quote)
+    for i in 0..<data.len
+        val b = data[i]
+        if b == quote || b == 92
+            out.push(92)
+            out.push(b)
+        elif b == 10
+            out.push(92)
+            out.push(u8('n'))
+        elif b == 9
+            out.push(92)
+            out.push(u8('t'))
+        elif b == 13
+            out.push(92)
+            out.push(u8('r'))
+        elif b == 0
+            out.push(92)
+            out.push(u8('0'))
+        elif b < 32 || b == 127
+            out.push(92)
+            out.push(u8('u'))
+            out.push(u8('{'))
+            out.push(hex[b >> 4])
+            out.push(hex[b & 15])
+            out.push(u8('}'))
+        else out.push(b)
+    out.push(quote)

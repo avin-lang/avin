@@ -48,7 +48,8 @@ from the values before it. An argument that never finishes, such as a `return`, 
 Names and defaults belong to a function's declaration, not to its type. A function value, such as a
 lambda or a function passed as an argument, is called with positional arguments only, all of them.
 A variant is called the same way as a function, so its fields may be given by name:
-`Point(y = 2, x = 1)`. A function defined by [clauses](#clauses) writes its defaults on its
+`Point(y = 2, x = 1)`, and its fields may have defaults, each a function of the fields before it:
+`data Range(low: int = 0, high: int = low + 10)`. A function defined by [clauses](#clauses) writes its defaults on its
 signature line, and its clauses match every parameter, defaulted or not. The default of a
 [by-name](/spec/by-name/) parameter is delayed like any argument to it.
 
@@ -457,6 +458,11 @@ separate `impl` for it are the same conformance; it may be stated once.
 
 `impl` is how Avin expresses type classes (`Ord`, `Hash`, `Display`) and adds methods to types you
 do not own. Resolution is coherent: one implementation per trait and type, found without search.
+
+A built-in type conforms to a trait only through an impl, and meets the trait as a bound: each
+instance of generic code calls the impl's method directly. A built-in value is not an object, so a
+trait's default bodies, which every conforming object shares, do not reach it: an impl for a
+built-in type implements every method of the trait, defaults included.
 
 - **An impl adds methods, never state.** Its body declares methods only: no fields and no
   statements. A method an impl adds to a class or an object is one of its methods, as if the class's
