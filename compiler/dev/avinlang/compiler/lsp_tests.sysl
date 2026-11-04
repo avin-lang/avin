@@ -130,7 +130,7 @@ lsp_initialize()
         "\"documentHighlightProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\"," +
         "\"class\",\"struct\",\"enum\",\"interface\",\"typeParameter\",\"enumMember\",\"function\",\"method\"," +
         "\"property\",\"parameter\",\"variable\"],\"tokenModifiers\":[\"declaration\",\"readonly\",\"static\"," +
-        "\"defaultLibrary\"]},\"full\":true}}," +
+        "\"defaultLibrary\"]},\"full\":true},\"completionProvider\":{\"triggerCharacters\":[\".\"]}}," +
         s"\"serverInfo\":{\"name\":\"avin\",\"version\":\"$Version\"}}}")
     assert_eq(lsp_answer(&server, lsp_notify("initialized", "{}")).len(), 0)
 
@@ -633,3 +633,229 @@ lsp_reanalysis_time()
     val second = whole_millis(monotonic() - again)
     print(s"lsp: vector_tree.avin analyzed in $first ms, again in $second ms")
     assert(second < 20000)
+
+// ---- completion ----
+
+// One completion item as the editor receives it.
+private struct Offered
+    label: string
+    kind: int
+    sort: string
+    insert: string
+    format: int
+    detail: string
+    doc: string
+
+// The items a completion request was answered with.
+private lsp_offered(answer: string) -> Buf[Offered]
+    var out: Buf[Offered] = buf()
+    val items = lsp_at(parse_json(answer).unwrap(), ["result", "items"]).unwrap()
+    for i in 0..<items.len()
+        val it = items.at(i).unwrap()
+        out.push(Offered(lsp_text_at(it, ["label"]).unwrap_or(""), lsp_int_at(it, ["kind"]).unwrap_or(0),
+            lsp_text_at(it, ["sortText"]).unwrap_or(""), lsp_text_at(it, ["insertText"]).unwrap_or(""),
+            lsp_int_at(it, ["insertTextFormat"]).unwrap_or(0), lsp_text_at(it, ["detail"]).unwrap_or(""),
+            lsp_text_at(it, ["documentation", "value"]).unwrap_or("")))
+    out
+
+// The item of a label; a missing one is an item with no label, which every check of it fails.
+private lsp_item(items: Buf[Offered], label: string) -> Offered
+    for it in items
+        if it.label == label then return it
+    Offered("", 0, "", "", 0, "", "")
+
+private lsp_offers(items: Buf[Offered], label: string) -> bool = lsp_item(items, label).label == label
+
+// A program opened in a fresh directory, and what completion answers at a position in it.
+private lsp_complete_in(name: string, text: string, line: int, character: int, snippets: bool) -> Buf[Offered]
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    val uri = lsp_file_uri(dir + "/" + name)
+    var server = lsp_server(repository_toolchain())
+    val caps = if snippets then "{\"capabilities\":{\"textDocument\":{\"completion\":{\"completionItem\":{\"snippetSupport\":true}}}}}" else "{\"capabilities\":{}}"
+    lsp_answer(&server, lsp_request(1, "initialize", caps))
+    lsp_answer(&server, lsp_open(uri, text))
+    val answer = lsp_one(&server, lsp_request(2, "textDocument/completion", lsp_test_at(uri, line, character)))
+    remove_dir_all(dir).unwrap_or(())
+    lsp_offered(answer)
+
+private lsp_animals() -> string =
+    "// An animal.\n" +
+    "open class Animal(val name: string)\n" +
+    "    // What it says.\n" +
+    "    speak() -> string = \"...\"\n" +
+    "\n" +
+    "class Dog(name: string, var age: int) : Animal(name)\n" +
+    "    fetch(thing: string, times: int) -> string = thing\n" +
+    "    private secret() -> int = 1\n" +
+    "\n" +
+    "main()\n" +
+    "    val d = Dog(\"rex\", 3)\n" +
+    "    val total = 1\n"
+
+@test("lsp: completion after a dot offers a class's fields and methods, inherited ones too, with their signatures and comments")
+lsp_completion_members()
+    val items = lsp_complete_in("t.avin", lsp_animals() + "    d.\n", 12, 6, false)
+    assert_eq(lsp_item(items, "age").kind, 5)
+    assert_eq(lsp_item(items, "age").detail, "var age: int")
+    assert_eq(lsp_item(items, "name").kind, 5)
+    assert_eq(lsp_item(items, "fetch").kind, 2)
+    assert_eq(lsp_item(items, "fetch").detail, "Dog.fetch(thing: string, times: int) -> string")
+    assert_eq(lsp_item(items, "speak").detail, "Animal.speak() -> string")
+    assert_eq(lsp_item(items, "speak").doc, "What it says.")
+    assert_eq(lsp_item(items, "speak").sort, "1_speak")
+    // A private method is not the caller's to call, and a local is not a member.
+    assert(!lsp_offers(items, "secret"))
+    assert(!lsp_offers(items, "total"))
+    assert(!lsp_offers(items, "val"))
+
+@test("lsp: completion after a dot offers the fields of a type that derives a template and the methods the template provides")
+lsp_completion_derived()
+    val text = "trait Kind\n    kind() -> string\n\nderive Kind for T\n    kind() -> string = T.shape().name\n\n" +
+        "data Pair(a: int, b: string) derives Kind\n\nmain()\n    val p = Pair(1, \"x\")\n    p.\n"
+    val items = lsp_complete_in("t.avin", text, 10, 6, false)
+    assert_eq(lsp_item(items, "a").kind, 5)
+    assert_eq(lsp_item(items, "b").kind, 5)
+    assert(lsp_offers(items, "kind"))
+    assert_eq(lsp_item(items, "kind").kind, 2)
+
+@test("lsp: a completed call is a snippet with a placeholder per argument only where the editor expands snippets")
+lsp_completion_snippets()
+    val plain = lsp_complete_in("t.avin", lsp_animals() + "    d.\n", 12, 6, false)
+    assert_eq(lsp_item(plain, "fetch").insert, "fetch")
+    assert_eq(lsp_item(plain, "fetch").format, 1)
+    val snippet = lsp_complete_in("t.avin", lsp_animals() + "    d.\n", 12, 6, true)
+    assert_eq(lsp_item(snippet, "fetch").insert, "fetch(${1:thing}, ${2:times})")
+    assert_eq(lsp_item(snippet, "fetch").format, 2)
+    // A field, and a method with nothing to pass, are their names.
+    assert_eq(lsp_item(snippet, "age").insert, "age")
+    assert_eq(lsp_item(snippet, "speak").insert, "speak")
+
+@test("lsp: completion on a Vector offers its own methods and those impls add to its traits")
+lsp_completion_vector()
+    val text = "main()\n    val xs = [1, 2, 3]\n    xs.ma\n"
+    val items = lsp_complete_in("t.avin", text, 2, 9, false)
+    assert_eq(lsp_item(items, "map").kind, 2)
+    assert(lsp_offers(items, "length"))
+    assert(lsp_offers(items, "foldLeft"))
+    assert(lsp_offers(items, "groupBy"))
+    // `sum` is added to the iterables of a type with `Add`, which `int` is.
+    assert(lsp_offers(items, "sum"))
+
+@test("lsp: completion after a module's name offers its public declarations")
+lsp_completion_module()
+    val text = "import avin.io\n\nmain()\n    io.\n"
+    val items = lsp_complete_in("t.avin", text, 3, 7, false)
+    assert_eq(lsp_item(items, "readLine").kind, 3)
+    assert(lsp_offers(items, "lines"))
+    assert(lsp_offers(items, "readAll"))
+    assert(!lsp_offers(items, "inputEnded"))
+
+@test("lsp: completion after a companion's name offers the companion's members")
+lsp_completion_companion()
+    val text = "main()\n    val m = Map.\n"
+    val items = lsp_complete_in("t.avin", text, 1, 16, false)
+    assert_eq(lsp_item(items, "empty").kind, 2)
+    assert_eq(lsp_item(items, "empty").doc, "A map with no entries.")
+    assert(lsp_offers(items, "builder"))
+    assert(!lsp_offers(items, "Map"))
+
+@test("lsp: a bare name offers locals and parameters, then the class's members, then the module's, then the core library's, then keywords")
+lsp_completion_scope()
+    val text = "helper() -> int = 1\n\nclass Counter(var count: int)\n    bump(by: int) -> int\n        val next = count + by\n        n\n"
+    val items = lsp_complete_in("t.avin", text, 5, 9, false)
+    assert_eq(lsp_item(items, "next").sort, "0_next")
+    assert_eq(lsp_item(items, "next").kind, 6)
+    assert_eq(lsp_item(items, "by").sort, "0_by")
+    assert_eq(lsp_item(items, "count").sort, "1_count")
+    assert_eq(lsp_item(items, "bump").sort, "1_bump")
+    assert_eq(lsp_item(items, "helper").sort, "2_helper")
+    assert_eq(lsp_item(items, "helper").kind, 3)
+    assert_eq(lsp_item(items, "Counter").kind, 7)
+    assert_eq(lsp_item(items, "print").sort, "4_print")
+    assert_eq(lsp_item(items, "Vector").sort, "4_Vector")
+    assert_eq(lsp_item(items, "val").kind, 14)
+    assert_eq(lsp_item(items, "val").sort, "5_val")
+
+@test("lsp: completion sees the scope at the cursor: not a later local, not an ended block's, a class's private members inside it, a bound's methods")
+lsp_completion_scope_edges()
+    val text = "main()\n    val before = 1\n    if true\n        val inner = 2\n    b\n    val after = 3\n"
+    val items = lsp_complete_in("t.avin", text, 4, 5, false)
+    assert(lsp_offers(items, "before"))
+    assert(!lsp_offers(items, "inner"))
+    assert(!lsp_offers(items, "after"))
+    val own = lsp_complete_in("t.avin", "class Box(private val secret: int)\n    peek() -> int = self.\n\nmain() = ()\n", 1, 25, false)
+    assert(lsp_offers(own, "secret"))
+    assert(lsp_offers(own, "peek"))
+    val bounded = lsp_complete_in("t.avin", "trait Named\n    label() -> string\n\nshow[T: Named](x: T) -> string = x.\n\nmain() = ()\n", 3, 35, false)
+    assert_eq(lsp_item(bounded, "label").kind, 2)
+
+@test("lsp: completion in an import offers modules after a dot and a module's public declarations in braces")
+lsp_completion_imports()
+    val after_dot = lsp_complete_in("t.avin", "import avin.i\n\nmain() = ()\n", 0, 13, false)
+    assert_eq(lsp_item(after_dot, "io").kind, 9)
+    assert(!lsp_offers(after_dot, "val"))
+    val braces = lsp_complete_in("t.avin", "import avin.io.{rea}\n\nmain() = ()\n", 0, 19, false)
+    assert_eq(lsp_item(braces, "readLine").kind, 3)
+    assert(lsp_offers(braces, "readAll"))
+    assert(!lsp_offers(braces, "inputEnded"))
+    assert(!lsp_offers(braces, "io"))
+
+@test("lsp: completion where a type is written offers types only, a type argument included")
+lsp_completion_types()
+    val text = "data Shape\n    Circle(r: real)\n    Square(s: real)\n\narea(s: Sh) -> real = 0.0\n\nmain() = ()\n"
+    val items = lsp_complete_in("t.avin", text, 4, 10, false)
+    assert_eq(lsp_item(items, "Shape").kind, 13)
+    assert_eq(lsp_item(items, "string").kind, 22)
+    assert_eq(lsp_item(items, "Vector").kind, 7)
+    assert(!lsp_offers(items, "area"))
+    assert(!lsp_offers(items, "Circle"))
+    assert(!lsp_offers(items, "print"))
+    assert(!lsp_offers(items, "val"))
+    val argument = lsp_complete_in("t.avin", "main()\n    val v: Vector[St] = []\n", 1, 20, false)
+    assert(lsp_offers(argument, "string"))
+    assert(!lsp_offers(argument, "print"))
+
+@test("lsp: completion in a literate file works in its program and offers nothing in its prose")
+lsp_completion_literate()
+    val text = "# Lists\n\nSome prose about xs.\n\n    main()\n        val xs = [1, 2]\n        xs.\n"
+    assert_eq(lsp_complete_in("t.lavin", text, 2, 20, false).len(), 0)
+    assert(lsp_offers(lsp_complete_in("t.lavin", text, 6, 11, false), "map"))
+
+@test("lsp: completion on a half-written line: a dot with nothing after it, an unclosed call, a word begun")
+lsp_completion_half_written()
+    assert(lsp_offers(lsp_complete_in("t.avin", lsp_animals() + "    val x = d.\n", 12, 14, false), "fetch"))
+    assert(lsp_offers(lsp_complete_in("t.avin", lsp_animals() + "    print(d.\n", 12, 12, false), "fetch"))
+    assert(lsp_offers(lsp_complete_in("t.avin", lsp_animals() + "    print(d.fe\n    print(total)\n", 12, 14, false), "fetch"))
+    // A comment or a string is not code.
+    assert_eq(lsp_complete_in("t.avin", lsp_animals() + "    // d.\n", 12, 9, false).len(), 0)
+    assert_eq(lsp_complete_in("t.avin", lsp_animals() + "    print(\"d.\")\n", 12, 13, false).len(), 0)
+
+@test("lsp: a completion request publishes nothing and leaves the document's diagnostics and references as they were")
+lsp_completion_leaves_the_document()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    val uri = lsp_file_uri(dir + "/t.avin")
+    var server = lsp_ready()
+    val text = lsp_animals() + "    print(total)\n    val wrong: int = \"no\"\n"
+    val published = lsp_one(&server, lsp_open(uri, text))
+    assert(published.contains("\"severity\":1"))
+    val answer = lsp_one(&server, lsp_request(2, "textDocument/completion", lsp_test_at(uri, 12, 13)))
+    assert(lsp_offers(lsp_offered(answer), "total"))
+    assert_eq(lsp_one(&server, lsp_request(3, "textDocument/hover", lsp_test_at(uri, 12, 12))),
+        lsp_hover_of(3, "val total: int", "", 12, 10, 12, 15))
+    assert_eq(lsp_one(&server, lsp_change(uri, text)), published)
+    remove_dir_all(dir).unwrap_or(())
+
+@test("lsp: completion in a large library file takes an interactive time")
+lsp_completion_time()
+    val file = lsp_normal(repository_toolchain().library_dir() + "/avin/vector_tree.avin")
+    val uri = lsp_file_uri(file)
+    var server = lsp_ready()
+    lsp_answer(&server, lsp_open(uri, read_text(file).unwrap()))
+    // `        val n = v.length()`, the cursor after the dot.
+    val start = monotonic()
+    val answer = lsp_one(&server, lsp_request(2, "textDocument/completion", lsp_test_at(uri, 957, 18)))
+    val took = whole_millis(monotonic() - start)
+    val items = lsp_offered(answer)
+    print(s"lsp: completion in vector_tree.avin: ${items.len()} items in $took ms")
+    assert(lsp_offers(items, "length"))
+    assert(took < 2000)

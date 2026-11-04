@@ -489,6 +489,9 @@ struct Checked
     program: Option[TProgram]
     /** What each name resolved to, when the check was asked to record it; empty otherwise. */
     references: Buf[Reference]
+    /** What may be written where the check was asked to complete, and what kind of place that is
+     * (`completion.sysl`). */
+    completions: Completions
 
     has_errors(self) -> bool
         for u in self.units
@@ -530,13 +533,13 @@ struct FileScope
 qualified(module_name: string, name: string) -> string = if module_name == "" then name else module_name + "." + name
 
 /** Whether a declaration has the qualified name `key`, whatever kind it is. */
-private declared(c: *Checker, key: string) -> bool =
+declared(c: *Checker, key: string) -> bool =
     c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_) || c.variants.get(key) is Some(_) ||
         c.global_names.get(key) is Some(_) || c.scope.get(key) is Some(_)
 
 /** Whether the declaration named `key` may be seen from another module: it is not `private`. A
  * function's name is while any of its overloads is public. */
-private exported(c: *Checker, key: string) -> bool
+exported(c: *Checker, key: string) -> bool
     if c.private_names.get(key) is Some(_) then return false
     if c.scope.get(key) is Some(ids)
         for id in ids
@@ -548,7 +551,7 @@ private exported(c: *Checker, key: string) -> bool
  * else the one the file imports under it, else the core library's public one. The nearer hides the
  * farther whatever kind each is, so a module's function hides a core library type of its name. When
  * none exists, the module's own, which no table holds, so the use is reported as unknown. */
-private resolve_name(c: *Checker, unit: usize, name: string) -> string
+resolve_name(c: *Checker, unit: usize, name: string) -> string
     if name.starts_with(CorePrefix) then return qualified(CoreModule, name[CorePrefix.bytes.len..])
     val scope = c.files[unit]
     // `m.X`, with `m` a module the file imports: that module's public `X`, else nothing.
@@ -594,6 +597,7 @@ private check_imports(c: *Checker, unit: usize)
     var kept: Map[string, string] = map()
     var mods: Map[string, string] = map()
     for i in file.imports
+        if completing_import(c, unit, i) then continue
         // A whole module, `import a.b`, is reached by its binding: `b.X`.
         var dotted = false
         for k in 0..<i.path.bytes.len
@@ -658,9 +662,11 @@ private check_imports(c: *Checker, unit: usize)
  * name in `file.module_name`. `root_module` is the module that must declare `main`, and the last
  * unit is one of its files. Every file sees its own module's declarations, the names it imports and
  * the core library's public declarations, in that order: an inner name hides an outer one. With
- * `indexing`, the check also records where each name resolved to, in `Checked.references`. */
-check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing then Some(definition_index()) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false)
+ * `indexing`, the check also records where each name resolved to, in `Checked.references`. With
+ * `completing`, a name written in the program as a stand-in for the one being typed, the check also
+ * records what could be written there, in `Checked.completions`. */
+check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false)
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
     // `derives` is written out as the methods and impls it stands for before anything is declared.
@@ -775,11 +781,12 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
         None -> if !testing then c.note(main_unit, Span(0, 0), "a program needs a `main` function")
     report_derived(&c)
     val tests = check_tests(&c)
+    val completions = finish_completion(&c)
     val references = finish_index(&c)
     var failed = false
     for u in c.units
         if u.report.has_errors() then failed = true
-    if failed then return Checked(c.units, None, references)
+    if failed then return Checked(c.units, None, references, completions)
     var functions: Buf[TFunction] = buf()
     for i in 0..<c.symbols.len()
         functions.push(TFunction(i, c.bodies[i], c.locals[i]))
@@ -788,7 +795,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
         sources.push(u.src)
     val views = solved_views(c.vars, c.views)
     val type_tests = solved_views(c.vars, c.type_tests)
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, init, c.builtins, c.conditional, c.core, tests, testing, views, type_tests)), references)
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, init, c.builtins, c.conditional, c.core, tests, testing, views, type_tests)), references, completions)
 
 /** Each view with its unknowns solved, each distinct one once. */
 private solved_views(vars: Buf[Option[&Type]], views: Buf[TypeView]) -> Buf[TypeView]
@@ -1428,7 +1435,7 @@ private impls_owner(c: *Checker, m: usize) -> string = trait_method_of(c, m) mat
     None -> type_name(c.symbols[m].receiver.unwrap())
 
 /** The impl's record of method `m` where an impl adds it to a trait. */
-private trait_method_of(c: *Checker, m: usize) -> Option[TraitMethod]
+trait_method_of(c: *Checker, m: usize) -> Option[TraitMethod]
     for tm in c.trait_methods
         if tm.function == m then return Some(tm)
     None
@@ -1449,7 +1456,7 @@ private added_applies(c: *Checker, t: &Type, tm: TraitMethod) -> bool
 /** The impl's type arguments a call of method `tm` takes on a value of type `t`: what the
  * receiver's static type gives each parameter in the type the impl adds to, or `None` where the
  * receiver's type does not match it. */
-private added_args(c: *Checker, t: &Type, tm: TraitMethod) -> Option[Buf[&Type]]
+added_args(c: *Checker, t: &Type, tm: TraitMethod) -> Option[Buf[&Type]]
     var binds: Buf[Option[&Type]] = buf()
     for _ in 0..<tm.impl_params
         binds.push(None)
@@ -1888,7 +1895,7 @@ private is_open(c: *Checker, k: usize) -> bool = c.classes[k].decl.modifier != "
 private is_abstract_class(c: *Checker, k: usize) -> bool = c.classes[k].decl.modifier == "abstract" || is_trait(c, k)
 
 /** Whether a class symbol is a trait. */
-private is_trait(c: *Checker, k: usize) -> bool = c.classes[k].decl.modifier == "trait"
+is_trait(c: *Checker, k: usize) -> bool = c.classes[k].decl.modifier == "trait"
 
 /** The trait a parent after `:` names, if it names one: `Shape`, `Source[int]`, or a mistaken
  * `Shape(…)`, which `trait_type` reports. */
@@ -2151,7 +2158,7 @@ is_reference(t: &Type) -> bool = *t match
 
 /** Whether a field may be used from the code being checked: a public one, or a private one from
  * code of the class that declares it or of its companion. */
-private field_visible(c: *Checker, f: FieldSymbol) -> bool = f.public || inside_class(c, f.owner)
+field_visible(c: *Checker, f: FieldSymbol) -> bool = f.public || inside_class(c, f.owner)
 
 /** Whether a method may be called from the code being checked. */
 private method_visible(c: *Checker, m: usize) -> bool
@@ -2593,7 +2600,7 @@ private receiver_method(c: *Checker, t: &Type, name: string) -> Option[usize]
 /** Every method named `name` that a value of data or built-in type `t` has, one for each list of
  * parameter types: those its impls add, then for a data type what its method table holds under the
  * name through the traits it conforms to. */
-private receiver_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
+receiver_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
     var out: Buf[usize] = buf()
     *t match
         Data(id, _, _) ->
@@ -2767,7 +2774,7 @@ private added_label(c: *Checker, tm: TraitMethod) -> string
     type_name(tm.target)
 
 /** The methods of `ms` the code being checked may call. */
-private visible_methods(c: *Checker, ms: Buf[usize]) -> Buf[usize]
+visible_methods(c: *Checker, ms: Buf[usize]) -> Buf[usize]
     var out: Buf[usize] = buf()
     for m in ms
         if method_visible(c, m) then out.push(m)
@@ -2984,7 +2991,7 @@ private add_method(c: *Checker, self_type: &Type, out: *Buf[usize], m: usize)
 /** The methods of `name` a value of class or trait `id` has that the code being checked may call: one
  * for each list of parameter types, found in the order `method_named` searches, so each is the
  * implementation the value's static type knows. */
-private methods_named(c: *Checker, id: usize, name: string) -> Buf[usize]
+methods_named(c: *Checker, id: usize, name: string) -> Buf[usize]
     val self_type = own_class_type(c.classes[id], id)
     var out: Buf[usize] = buf()
     for m in c.classes[id].methods
@@ -4482,7 +4489,7 @@ private scope_bounds(f: Conformances, owner: usize, params: Buf[TypeParam], inde
     out
 
 /** The bounds of type parameter `t` as the code being checked names it. */
-private bounds_of(c: *Checker, t: &Type) -> Buf[&Type] = type_var_bounds(conformances(c), t)
+bounds_of(c: *Checker, t: &Type) -> Buf[&Type] = type_var_bounds(conformances(c), t)
 
 private type_var_bounds(f: Conformances, t: &Type) -> Buf[&Type]
     var params: Buf[TypeParam] = buf()
@@ -4984,6 +4991,7 @@ private has_annotation(f: &Function, name: string) -> bool
 resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
     InvalidType -> ErrorType
     Named(path, args) ->
+        if completing_type(c, unit, path) then return ErrorType
         // In an impl made from a template, the template's `T` is the deriving type.
         if args.len() == 0 && c.unit_override is None
             if c.derived_context is Some(x)
@@ -5504,7 +5512,7 @@ private module_use(c: *Checker, e: &Expr) -> Option[&Expr]
                 return Some(Expr(e.span, Name(m + "." + name)))
     None
 
-private local_function(c: *Checker, name: string) -> Option[usize]
+local_function(c: *Checker, name: string) -> Option[usize]
     var i = c.body.functions.len()
     while i > 0
         i -= 1
@@ -5512,7 +5520,7 @@ private local_function(c: *Checker, name: string) -> Option[usize]
     None
 
 /** The class whose constructor or method the code being checked belongs to. */
-private enclosing_class(c: *Checker) -> Option[usize] = c.symbols[c.body.root].owner_class
+enclosing_class(c: *Checker) -> Option[usize] = c.symbols[c.body.root].owner_class
 
 /** The class whose fields a bare name reaches: the enclosing class, or the class of the receiver of
  * a method an impl adds to a type built from a class's parameters or to another module's class. */
@@ -5524,7 +5532,7 @@ private fields_class(c: *Checker) -> Option[usize]
         _ -> None
 
 /** A member of the enclosing class named by its bare name: a field or a method. */
-private enum MemberRef
+enum MemberRef
     FieldOf(index: usize)
     /** A field of the one variant of the data type an impl's method works on. */
     DataFieldOf(index: usize)
@@ -5535,7 +5543,7 @@ private enum MemberRef
 
 // Inside a class, its fields and methods are in scope by bare name, behind the locals, parameters
 // and local functions, and ahead of top-level declarations.
-private class_member(c: *Checker, name: string) -> Option[MemberRef]
+class_member(c: *Checker, name: string) -> Option[MemberRef]
     val k = enclosing_class(c) match
         Some(k) -> k
         None -> return impl_member(c, name)
@@ -5551,7 +5559,7 @@ private class_member(c: *Checker, name: string) -> Option[MemberRef]
     None
 
 /** The `val` named `name` of a trait that class or trait `k` conforms to or requires. */
-private trait_field_named(c: *Checker, k: usize, name: string) -> Option[usize]
+trait_field_named(c: *Checker, k: usize, name: string) -> Option[usize]
     val m = any_method_named(c, k, name)?
     if is_trait_field(c, m) then Some(m) else None
 
@@ -5664,7 +5672,7 @@ private check_local_symbol(c: *Checker, id: usize)
     c.current = previous
     c.states.set(id, 2)
 
-private unit_of(c: *Checker) -> usize = c.unit_override.unwrap_or(c.symbols[c.current].unit)
+unit_of(c: *Checker) -> usize = c.unit_override.unwrap_or(c.symbols[c.current].unit)
 
 /** A function as diagnostics name it. */
 private described(symbol: FunctionSymbol) -> string
@@ -5711,6 +5719,7 @@ private to_any(c: *Checker, typed: &TExpr) -> &TExpr
     TExpr(typed.span, AnyType, Box(typed))
 
 private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -> &TExpr
+    if completing_expr(c, e) then return TExpr(e.span, ErrorType, UnitConst)
     val t = check_kind(c, e, expected, used)
     if c.index is Some(_) then index_expr(c, e, t)
     t
@@ -5778,7 +5787,7 @@ private unsupported(c: *Checker, e: &Expr, what: string) -> &TExpr
     c.note(unit_of(c), e.span, s"$what is not implemented")
     TExpr(e.span, ErrorType, UnitConst)
 
-private lookup_local(c: *Checker, name: string) -> Option[usize]
+lookup_local(c: *Checker, name: string) -> Option[usize]
     if name == "_" then return None
     var i = c.body.visible.len()
     while i > 0
@@ -5790,7 +5799,7 @@ private lookup_local(c: *Checker, name: string) -> Option[usize]
 // Parameters of the top-level function; a local function's own parameters are locals. A
 // constructor's parameters are only stored into their fields, so a class's parameter is named
 // through its field, which a `var` field's assignments change.
-private param_index(c: *Checker, name: string) -> Option[usize]
+param_index(c: *Checker, name: string) -> Option[usize]
     val symbol = c.symbols[c.body.root]
     if symbol.constructor
         // A superclass's arguments read the parameters themselves; an initializer's object is not
@@ -5943,14 +5952,14 @@ private overloaded_method_value(c: *Checker, at: Span, receiver: &TExpr, name: s
 
 /** The methods of `name` a value of type `t` has that the code being checked may call, one for each
  * list of parameter types. */
-private methods_of(c: *Checker, t: &Type, name: string) -> Buf[usize]
+methods_of(c: *Checker, t: &Type, name: string) -> Buf[usize]
     val known = zonk(c, t)
     if *known is Class(k, _, _) then return with_trait_methods(c, known, name, methods_named(c, k, name))
     if *known is TypeVar(_, _, _) then return with_trait_methods(c, known, name, bound_methods(c, known, name))
     with_trait_methods(c, known, name, visible_methods(c, receiver_methods(c, known, name)))
 
 /** The methods of `name` a value of type parameter `t` has: those of its bounds, each once. */
-private bound_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
+bound_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
     var out: Buf[usize] = buf()
     for b in bounds_of(c, t)
         if *b is Class(k, _, _)
@@ -6170,7 +6179,7 @@ private bound_member_value(c: *Checker, at: Span, value: &TExpr, ty: &Type, name
     TExpr(at, ErrorType, UnitConst)
 
 /** The `val` named `name` of a trait bounding type parameter `ty`, read with field syntax. */
-private bound_field(c: *Checker, ty: &Type, name: string) -> Option[usize]
+bound_field(c: *Checker, ty: &Type, name: string) -> Option[usize]
     for b in bounds_of(c, ty)
         if *b is Class(k, _, _)
             if trait_field_named(c, k, name) is Some(m) then return Some(m)
@@ -6425,7 +6434,7 @@ private update_field(c: *Checker, e: &Expr, target: &Expr, increment: bool, post
 
 // A module-level value or object named by a bare name, unless a local function of that name hides
 // it or a declaration of a nearer module, the file's own over the core library's, shadows it.
-private global_named(c: *Checker, name: string) -> Option[usize]
+global_named(c: *Checker, name: string) -> Option[usize]
     if local_function(c, name) is Some(_) then return None
     c.global_names.get(resolve_name(c, unit_of(c), name))
 
@@ -8586,7 +8595,7 @@ private candidate_text(name: string, type_params: Buf[TypeParam], names: Buf[str
 // The type `target` names where it is the receiver of a call, as `int` in `int.zero()`, `T` in
 // `T.zero()` and `Box[int]` in `Box[int].zero()`; `None` where it is a value, a value of the name
 // hiding the type. A trait names no type with static members of its own, which is reported.
-private static_receiver(c: *Checker, target: &Expr, member: string) -> Option[&Type]
+static_receiver(c: *Checker, target: &Expr, member: string) -> Option[&Type]
     var name = ""
     var written: Buf[&TypeExpr] = buf()
     target.kind match
@@ -10546,7 +10555,7 @@ private fresh_var(c: *Checker) -> &Type
     Var(id)
 
 /** `t` with every solved variable replaced by its solution. */
-private zonk(c: *Checker, t: &Type) -> &Type = solve(c.vars, t)
+zonk(c: *Checker, t: &Type) -> &Type = solve(c.vars, t)
 
 // Makes two types equal by solving variables, and reports whether they can be. A value that never
 // finishes, or one whose type already failed, fits anything without deciding a variable.

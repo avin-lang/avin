@@ -1,0 +1,546 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.{Source, Span, source_of, tangle_literate}
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.text.from_utf8_lossy
+
+// What may be written where an editor's cursor is: the answer to a completion request, made by the
+// checker itself.
+//
+// **The cursor's word is replaced by a stand-in name before anything is parsed** (`completion_text`),
+// so `val x = xs.` reads as `val x = xs.<stand-in>`, an ordinary member, and the text around it parses
+// as it will once the word is written. Where the line is still unfinished -- a call whose parenthesis
+// is not yet closed -- the rest of the line is replaced by the brackets that close it, and where the
+// file still does not parse, the lines after the cursor's declaration are blanked, one step at a
+// time. Every replacement keeps the offsets before the cursor, and none touches what the editor holds.
+//
+// **The checker answers where it meets the stand-in**, with the scope it has at that moment: the
+// locals and parameters visible there, the enclosing class's members, the module's declarations,
+// the file's imports and the core library's (`completing_expr`); the members of a receiver's static
+// type, with the methods impls and traits add to it (`member_candidates`); a module's public
+// declarations after its name and a type's static members after the type's (`completing_member`);
+// the types a type position may name (`completing_type`); and the modules and declarations an import
+// may name (`completing_import`). Everything else about the program is checked as always, its
+// mistakes reported and ignored, so a broken line elsewhere costs nothing.
+//
+// **Candidates are rendered once checking is over** (`finish_completion`), as hover renders a
+// reference, so a candidate shows the signature and doc comment hover would.
+
+/** The name written in place of the word being completed. No program spells it. */
+const CompletionMarker: string = "avin__completion__"
+
+/** What kind of place the stand-in was found at. */
+enum CompletionSite
+    NoSite
+    /** A name in an expression: what is in scope there. */
+    ValueSite
+    /** A member after a dot: what the receiver has. */
+    MemberSite
+    /** A type: the types in scope. */
+    TypeSite
+    /** An import: modules and their public declarations. */
+    ImportSite
+
+/** One thing the checker found could be written at the stand-in. `group` orders them: 0 the locals
+ * and parameters, 1 the members, 2 the module's declarations, 3 the imported ones, 4 the core
+ * library's. */
+struct Candidate
+    label: string
+    group: usize
+    target: Target
+    /** Where the declaration is, for its doc comment, when it has one worth showing. */
+    home: Option[(usize, usize)]
+    /** A trait's `val`, read as a field though it is a method. */
+    property: bool
+    /** A module-level value, whose type is known only once checking is over. */
+    global: Option[usize]
+    /** A built-in type, which has no declaration. */
+    builtin: bool
+
+/** What the checker recorded at the stand-in: the last time it met it, since a body may be checked
+ * more than once. */
+struct CompletionProbe
+    site: CompletionSite
+    candidates: Buf[Candidate]
+
+completion_probe() -> CompletionProbe = CompletionProbe(NoSite, buf())
+
+/** One completion, rendered: what it is called, what sort of thing it is, what hover would show for
+ * it, and, for a function, the parameters a call writes. */
+struct Completion
+    label: string
+    kind: NameKind
+    property: bool
+    builtin: bool
+    detail: string
+    doc: string
+    group: usize
+    params: Buf[string]
+
+/** The completions one check found, and the kind of place they are for. */
+struct Completions
+    site: CompletionSite
+    items: Buf[Completion]
+
+no_completions() -> Completions = Completions(NoSite, buf())
+
+// ---- what the checker calls ----
+
+// The stand-in, while the check is asked to complete.
+private marker_of(c: *Checker) -> string = c.index match
+    Some(ix) -> ix.completing
+    None -> ""
+
+// Whether a written name is the stand-in, alone or as the last part of a dotted path.
+private is_marker(name: string, marker: string) -> bool = marker != "" && (name == marker || name.ends_with("." + marker))
+
+private begin_site(c: *Checker, site: CompletionSite)
+    if c.index is Some(ix)
+        ix.probe = CompletionProbe(site, buf())
+
+private add_candidate(c: *Checker, cand: Candidate)
+    if c.index is Some(ix) then ix.probe.candidates.push(cand)
+
+/** Whether `e` is the stand-in, or a member or a call of it; if so, what may be written there is
+ * recorded, and the expression is checked as nothing more. */
+completing_expr(c: *Checker, e: &Expr) -> bool
+    val marker = marker_of(c)
+    if marker == "" then return false
+    val head = e.kind match
+        Call(callee, _) -> callee
+        _ -> e
+    head.kind match
+        Name(n) ->
+            if n != marker then return false
+            completing_scope(c)
+            true
+        Member(target, n) ->
+            if n != marker then return false
+            completing_member(c, target)
+            true
+        _ -> false
+
+/** Whether a type written in `unit` is the stand-in; if so, the types it may name are recorded. */
+completing_type(c: *Checker, unit: usize, path: string) -> bool
+    val marker = marker_of(c)
+    if !is_marker(path, marker) then return false
+    begin_site(c, TypeSite)
+    if path != marker
+        // `m.<stand-in>`: the types of a module the file imports whole.
+        val binding = path[0..<path.bytes.len - marker.bytes.len - 1]
+        if c.files[unit].modules.get(binding) is Some(module_path) then declaration_candidates(c, module_path, true, 1, true)
+        return true
+    for name in ["int", "long", "bool", "string", "char", "real", "byte", "unit", "Any", "i8", "i16", "i32", "i64"]
+        add_candidate(c, Candidate(name, 4, TypeParamTarget(name), None, false, None, true))
+    if c.generic is Some(scope)
+        for p in scope.params
+            add_candidate(c, Candidate(p.name, 0, TypeParamTarget(p.name), None, false, None, false))
+    if c.self_trait is Some(_) then add_candidate(c, Candidate("Self", 0, TypeParamTarget("Self"), None, false, None, false))
+    val scope = c.files[unit]
+    declaration_candidates(c, scope.module_name, false, 2, true)
+    for (binding, key) in scope.imports
+        if c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_) then imported_candidate(c, binding, key)
+    for (binding, module_path) in scope.modules
+        add_candidate(c, Candidate(binding, 3, ModuleTarget(module_path), None, false, None, false))
+    declaration_candidates(c, CoreModule, true, 4, true)
+    true
+
+/** Whether an import names the stand-in; if so, the modules and declarations it may name are
+ * recorded. */
+completing_import(c: *Checker, unit: usize, i: Import) -> bool
+    val marker = marker_of(c)
+    if !is_marker(i.path, marker) then return false
+    begin_site(c, ImportSite)
+    val prefix = if i.path == marker then "" else i.path[0..<i.path.bytes.len - marker.bytes.len - 1]
+    val own = c.files[unit].module_name
+    // Inside braces only declarations are named; after a dot, a module below too.
+    var braces = false
+    val b = c.units[unit].src.bytes
+    for k in i.span.start..<(if i.span.end > b.len then b.len else i.span.end)
+        if b[k] == u8('{') then braces = true
+    if !braces
+        var seen: Map[string, bool] = map()
+        for f in c.files
+            val m = f.module_name
+            if m == "" || m == own then continue
+            var rest = m
+            if prefix != ""
+                if !m.starts_with(prefix + ".") then continue
+                rest = m[prefix.bytes.len + 1..]
+            var segment = rest
+            for k in 0..<rest.bytes.len
+                if rest.bytes[k] == u8('.')
+                    segment = rest[0..<k]
+                    break
+            if seen.get(segment) is Some(_) then continue
+            seen.put(segment, true)
+            val full = if prefix == "" then segment else prefix + "." + segment
+            add_candidate(c, Candidate(segment, 2, ModuleTarget(full), None, false, None, false))
+    if prefix != "" && prefix != own then declaration_candidates(c, prefix, true, 1, false)
+    true
+
+// A bare name: what is in scope where it is written, nearest first.
+private completing_scope(c: *Checker)
+    begin_site(c, ValueSite)
+    val unit = unit_of(c)
+    for index in c.body.visible
+        val l = c.body.locals[index]
+        if !plain_name(l.name) then continue
+        add_candidate(c, Candidate(l.name, 0, ValueTarget(if l.mutable then "var " else "val ", l.name, zonk(c, l.ty), LocalRole), None, false, None, false))
+    val root = c.symbols[c.body.root]
+    if !root.constructor
+        for i in 0..<root.param_names.len()
+            if plain_name(root.param_names[i]) then add_candidate(c, Candidate(root.param_names[i], 0, ValueTarget("", root.param_names[i], root.params[i], ParamRole), None, false, None, false))
+    for f in c.body.functions
+        function_candidate(c, f, 0)
+    // The members a bare name reaches: the enclosing class's, or those of the type an impl adds to.
+    if !root.static_member
+        if enclosing_class(c) is Some(k) then member_candidates(c, own_class_type(c.classes[k], k), 1, true)
+        elif root.receiver is Some(t) then member_candidates(c, t, 1, true)
+    val scope = c.files[unit]
+    declaration_candidates(c, scope.module_name, false, 2, false)
+    for (binding, key) in scope.imports
+        imported_candidate(c, binding, key)
+    for (binding, module_path) in scope.modules
+        add_candidate(c, Candidate(binding, 3, ModuleTarget(module_path), None, false, None, false))
+    declaration_candidates(c, CoreModule, true, 4, false)
+
+// `target.<stand-in>`: a module's declarations, a type's static members, or a value's members.
+private completing_member(c: *Checker, target: &Expr)
+    begin_site(c, MemberSite)
+    val marker = marker_of(c)
+    val unit = unit_of(c)
+    var name = ""
+    target.kind match
+        Name(n) -> name = n
+        TypeApply(inner, _) -> if inner.kind is Name(n) then name = n
+        _ -> ()
+    if name != ""
+        val bound = lookup_local(c, name) is Some(_) || param_index(c, name) is Some(_) || class_member(c, name) is Some(_) || local_function(c, name) is Some(_)
+        if !bound
+            if target.kind is Name(_)
+                if c.files[unit].modules.get(name) is Some(module_path)
+                    declaration_candidates(c, module_path, true, 1, false)
+                    return
+            if global_named(c, name) is None
+                if static_receiver(c, target, marker) is Some(t)
+                    member_candidates(c, t, 1, false)
+                    return
+            else
+                // An object named after a type of its module is its companion: the object's members
+                // and the type's static ones.
+                val key = resolve_name(c, unit, name)
+                if c.types.get(key) is Some(id) then member_candidates(c, own_type(c.data[id], id), 1, false)
+                if c.class_types.get(key) is Some(k)
+                    if !c.classes[k].decl.object then member_candidates(c, own_class_type(c.classes[k], k), 1, false)
+    member_candidates(c, check_expr(c, target, None).ty, 1, true)
+
+// Whether a name is one a program writes, not one the compiler made.
+private plain_name(name: string) -> bool
+    if name == "" || name == "_" then return false
+    val first = name.bytes[0]
+    first == u8('_') || (first >= u8('a') && first <= u8('z')) || (first >= u8('A') && first <= u8('Z')) || first >= 0x80
+
+/** The members of a value of type `t` (`instance`), or the static members of type `t`: fields, the
+ * `val`s of its traits, and its methods, inherited and added by impls and traits included, each as
+ * the code being checked may see it. */
+private member_candidates(c: *Checker, t: &Type, group: usize, instance: bool)
+    val ty = zonk(c, t)
+    if instance
+        *ty match
+            Class(k, _, _) -> class_field_candidates(c, k, group)
+            Data(id, _, args) ->
+                val d = c.data[id]
+                if d.variants.len() == 1 && d.decl.variants.len() == 1
+                    val fields = variant_fields(d, id, 0, args)
+                    val names = d.variants[0].field_names
+                    for i in 0..<names.len()
+                        if i >= fields.len() || i >= d.decl.variants[0].fields.len() then break
+                        add_candidate(c, Candidate(names[i], group, ValueTarget("val ", names[i], fields[i], FieldRole), Some((d.unit, d.decl.variants[0].fields[i].span.start)), false, None, false))
+            TypeVar(_, _, _) ->
+                for b in bounds_of(c, ty)
+                    if *b is Class(k, _, _)
+                        if !is_trait(c, k) then class_field_candidates(c, k, group)
+            _ -> ()
+    var taken: Buf[usize] = buf()
+    for name in member_names(c)
+        var ms: Buf[usize] = buf()
+        if instance then ms = methods_of(c, ty, name)
+        else
+            ms = *ty match
+                Class(k, _, _) -> methods_named(c, k, name)
+                TypeVar(_, _, _) -> bound_methods(c, ty, name)
+                _ -> visible_methods(c, receiver_methods(c, ty, name))
+        for m in ms
+            if c.symbols[m].static_member == instance then continue
+            // A method added to some other instance of a type built from parameters is not this one's.
+            if trait_method_of(c, m) is Some(tm)
+                if added_args(c, ty, tm) is None then continue
+            if contains_symbol(taken, m) then continue
+            taken.push(m)
+            function_candidate(c, m, group)
+        if !instance then continue
+        var field: Option[usize] = None
+        *ty match
+            Class(k, _, _) -> field = trait_field_named(c, k, name)
+            TypeVar(_, _, _) -> field = bound_field(c, ty, name)
+            _ -> ()
+        if field is Some(m)
+            if !contains_symbol(taken, m)
+                taken.push(m)
+                val s = c.symbols[m]
+                add_candidate(c, Candidate(name, group, FunctionTarget(m), Some((s.unit, s.decl.span.start)), true, None, false))
+
+private class_field_candidates(c: *Checker, k: usize, group: usize)
+    for i in 0..<c.classes[k].fields.len()
+        val f = c.classes[k].fields[i]
+        if !plain_name(f.name) || !field_visible(c, f) then continue
+        val keyword = if f.mutable then "var " else "val "
+        add_candidate(c, Candidate(f.name, group, ValueTarget(keyword, f.name, f.ty.unwrap_or(ErrorType), FieldRole), Some((c.classes[f.owner].unit, f.span.start)), false, None, false))
+
+private contains_symbol(ids: Buf[usize], id: usize) -> bool
+    for i in ids
+        if i == id then return true
+    false
+
+// Every name a method of any type is declared with, each once: what a member may be called.
+private member_names(c: *Checker) -> Buf[string]
+    var seen: Map[string, bool] = map()
+    var out: Buf[string] = buf()
+    for s in c.symbols
+        if s.lambda || s.constructor || s.default_param is Some(_) then continue
+        if s.owner_class is None && s.receiver is None && !s.static_member then continue
+        if !plain_name(s.decl.name) || seen.get(s.decl.name) is Some(_) then continue
+        seen.put(s.decl.name, true)
+        out.push(s.decl.name)
+    for tm in c.trait_methods
+        val name = c.symbols[tm.function].decl.name
+        if !plain_name(name) || seen.get(name) is Some(_) then continue
+        seen.put(name, true)
+        out.push(name)
+    out
+
+// A function or a method, by its symbol.
+private function_candidate(c: *Checker, id: usize, group: usize)
+    val s = c.symbols[id]
+    if s.lambda || s.default_param is Some(_) || !plain_name(s.decl.name) then return
+    add_candidate(c, Candidate(s.decl.name, group, FunctionTarget(id), Some((s.unit, s.decl.span.start)), false, None, false))
+
+/** The declarations of module `module_name` at the top level, only the public ones where `public`,
+ * only the types where `types`. */
+private declaration_candidates(c: *Checker, module_name: string, public: bool, group: usize, types: bool)
+    var type_names: Map[string, bool] = map()
+    for k in 0..<c.classes.len()
+        val cls = c.classes[k]
+        if cls.module_name != module_name || cls.decl.object || !plain_name(cls.name) then continue
+        if public && !exported(c, qualified(module_name, cls.name)) then continue
+        type_names.put(cls.name, true)
+        add_candidate(c, Candidate(cls.name, group, ClassTarget(k), Some((cls.unit, cls.decl.span.start)), false, None, false))
+    for id in 0..<c.data.len()
+        val d = c.data[id]
+        if d.module_name != module_name || !plain_name(d.name) then continue
+        if public && !exported(c, qualified(module_name, d.name)) then continue
+        type_names.put(d.name, true)
+        add_candidate(c, Candidate(d.name, group, DataTarget(id), Some((d.unit, d.decl.span.start)), false, None, false))
+        if types then continue
+        for i in 0..<d.decl.variants.len()
+            val v = d.decl.variants[i]
+            if v.name == d.name || !plain_name(v.name) then continue
+            add_candidate(c, Candidate(v.name, group, VariantTarget(id, i), Some((d.unit, v.span.start)), false, None, false))
+    if types then return
+    for k in 0..<c.classes.len()
+        val cls = c.classes[k]
+        if cls.module_name != module_name || !cls.decl.object || !plain_name(cls.name) then continue
+        if type_names.get(cls.name) is Some(_) then continue
+        if public && !exported(c, qualified(module_name, cls.name)) then continue
+        add_candidate(c, Candidate(cls.name, group, ClassTarget(k), Some((cls.unit, cls.decl.span.start)), false, None, false))
+    for g in 0..<c.globals.len()
+        val v = c.globals[g]
+        if v.module_name != module_name || v.object is Some(_) || !plain_name(v.name) then continue
+        if public && !exported(c, qualified(module_name, v.name)) then continue
+        val keyword = if v.lazy then "lazy val " elif v.mutable then "var " else "val "
+        add_candidate(c, Candidate(v.name, group, ValueTarget(keyword, v.name, ErrorType, GlobalRole), Some((v.unit, v.span.start)), false, Some(g), false))
+    for id in 0..<c.symbols.len()
+        val s = c.symbols[id]
+        if s.module_name != module_name || s.root is Some(_) || s.owner_class is Some(_) || s.receiver is Some(_) || s.static_member || s.constructor then continue
+        if s.lambda || s.default_param is Some(_) || !plain_name(s.decl.name) then continue
+        if public && !s.public then continue
+        // Only a function the module's scope names: not one an impl adds to a trait.
+        val ids = c.scope.get(qualified(module_name, s.decl.name)) match
+            Some(found) -> found
+            None -> continue
+        if !contains_symbol(ids, id) then continue
+        add_candidate(c, Candidate(s.decl.name, group, FunctionTarget(id), Some((s.unit, s.decl.span.start)), false, None, false))
+
+// A declaration a file imports under `binding`, by its qualified name.
+private imported_candidate(c: *Checker, binding: string, key: string)
+    if c.types.get(key) is Some(id)
+        val d = c.data[id]
+        return add_candidate(c, Candidate(binding, 3, DataTarget(id), Some((d.unit, d.decl.span.start)), false, None, false))
+    if c.class_types.get(key) is Some(k)
+        val cls = c.classes[k]
+        return add_candidate(c, Candidate(binding, 3, ClassTarget(k), Some((cls.unit, cls.decl.span.start)), false, None, false))
+    if c.variants.get(key) is Some(v)
+        val d = c.data[v.data]
+        return add_candidate(c, Candidate(binding, 3, VariantTarget(v.data, v.index), Some((d.unit, d.decl.variants[v.index].span.start)), false, None, false))
+    if c.global_names.get(key) is Some(g)
+        val v = c.globals[g]
+        return add_candidate(c, Candidate(binding, 3, ValueTarget(if v.mutable then "var " else "val ", binding, ErrorType, GlobalRole), Some((v.unit, v.span.start)), false, Some(g), false))
+    if c.scope.get(key) is Some(ids)
+        for id in ids
+            if c.symbols[id].public && !c.symbols[id].constructor
+                val s = c.symbols[id]
+                add_candidate(c, Candidate(binding, 3, FunctionTarget(id), Some((s.unit, s.decl.span.start)), false, None, false))
+
+// ---- rendering ----
+
+/** What the stand-in may be replaced by, rendered: a name a nearer scope declares hides the same
+ * name further out, as it does for the checker. */
+finish_completion(c: *Checker) -> Completions
+    val ix = c.index match
+        Some(i) -> i
+        None -> return no_completions()
+    if ix.completing == "" then return no_completions()
+    var nearest: Map[string, usize] = map()
+    for cand in ix.probe.candidates
+        if nearest.get(cand.label) is None then nearest.put(cand.label, cand.group)
+    var shown: Map[string, bool] = map()
+    var items: Buf[Completion] = buf()
+    for cand in ix.probe.candidates
+        if nearest.get(cand.label) is Some(g)
+            if g != cand.group then continue
+        val target = cand.global match
+            Some(g) -> cand.target match
+                ValueTarget(keyword, name, _, role) -> ValueTarget(keyword, name, global_shown_type(c, g), role)
+                other -> other
+            None -> cand.target
+        val (kind, _, _) = target_kind(c, target)
+        val detail = if cand.builtin then "built-in type " + cand.label else render_target(c, target)
+        // The same declaration reached twice in one scope is shown once.
+        val key = s"${cand.group}:${cand.label}:$detail"
+        if shown.get(key) is Some(_) then continue
+        shown.put(key, true)
+        val doc = cand.home match
+            Some((unit, starts)) -> doc_before(c.units[unit].src.bytes, starts)
+            None -> ""
+        items.push(Completion(cand.label, kind, cand.property, cand.builtin, detail, doc, cand.group, call_params(c, target)))
+    Completions(ix.probe.site, items)
+
+// The parameters a call of a function writes, past a method's receiver and leaving out those with a
+// default.
+private call_params(c: *Checker, target: Target) -> Buf[string]
+    var out: Buf[string] = buf()
+    val id = target match
+        FunctionTarget(f) -> f
+        _ -> return out
+    val s = c.symbols[id]
+    if trait_field_reads(c, id) then return out
+    val first = if s.owner_class is Some(_) || s.receiver is Some(_) || s.static_member then 1usize else 0usize
+    for i in first..<s.param_names.len()
+        if i < s.defaults.len() && s.defaults[i] is Some(_) then continue
+        out.push(s.param_names[i])
+    out
+
+private trait_field_reads(c: *Checker, id: usize) -> bool
+    for m in c.trait_fields
+        if m == id then return true
+    false
+
+// ---- the text the checker reads ----
+
+/** The word at `offset` in `text`, from its start to the cursor, and where it begins and ends. */
+struct CompletionWord
+    start: usize
+    end: usize
+    prefix: string
+
+completion_word(text: string, offset: usize) -> CompletionWord
+    val b = text.bytes
+    val at = if offset > b.len then b.len else offset
+    var start = at
+    while start > 0 && word_byte(b[start - 1])
+        start -= 1
+    var end = at
+    while end < b.len && word_byte(b[end])
+        end += 1
+    CompletionWord(start, end, from_utf8_lossy(b[start..<at]))
+
+/** Whether the cursor at `offset` is somewhere a name may be written: in a literate file's program
+ * rather than its prose, and in code rather than a comment or a string. */
+completion_in_code(name: string, text: string, offset: usize) -> bool
+    val b = text.bytes
+    val at = if offset > b.len then b.len else offset
+    var line_start = at
+    while line_start > 0 && b[line_start - 1] != u8('\n')
+        line_start -= 1
+    if is_literate(name)
+        val doc = source_of(name, text)
+        val tangled = tangle_literate(doc) match
+            Ok(t) -> t
+            Err(_) -> return false
+        if tangled.line_span(doc.locate(line_start).line).is_empty() then return false
+    // A comment or a string on the line before the cursor: quotes counted, `//` outside them.
+    var quoted = false
+    var k = line_start
+    while k < at
+        val ch = b[k]
+        if quoted
+            if ch == u8('\\') then k += 1
+            elif ch == u8('"') then quoted = false
+        elif ch == u8('"') then quoted = true
+        elif ch == u8('/') && k + 1 < at && b[k + 1] == u8('/') then return false
+        k += 1
+    !quoted
+
+/** The texts to try in turn, each with the word at the cursor replaced by the stand-in: as written;
+ * with the rest of the line replaced by the brackets that close the line's open ones; and with that,
+ * the lines after the cursor's blanked up to the next declaration at the margin, then all of them. */
+completion_texts(text: string, word: CompletionWord) -> Buf[string]
+    val b = text.bytes
+    val before = from_utf8_lossy(b[0..<word.start]) + CompletionMarker
+    var out: Buf[string] = buf()
+    out.push(before + from_utf8_lossy(b[word.end..]))
+    var line_start = word.start
+    while line_start > 0 && b[line_start - 1] != u8('\n')
+        line_start -= 1
+    var line_end = word.end
+    while line_end < b.len && b[line_end] != u8('\n')
+        line_end += 1
+    var open: Buf[u8] = buf()
+    for k in line_start..<word.start
+        val ch = b[k]
+        if ch == u8('(') then open.push(u8(')'))
+        elif ch == u8('[') then open.push(u8(']'))
+        elif ch == u8('{') then open.push(u8('}'))
+        elif (ch == u8(')') || ch == u8(']') || ch == u8('}')) && open.len() > 0 then open.pop()
+    var closing = ""
+    var i = open.len()
+    while i > 0
+        i -= 1
+        closing = closing + from_utf8_lossy([open[i]])
+    val closed = before + closing
+    out.push(closed + from_utf8_lossy(b[line_end..]))
+    // The lines after the cursor's, blanked to the next line at the margin, then to the end.
+    var next = line_end
+    while next < b.len
+        val starts = next + 1
+        if starts >= b.len then break
+        val ch = b[starts]
+        if ch != u8(' ') && ch != u8('\t') && ch != u8('\n') && ch != u8('\r') && ch != u8('/')
+            break
+        next = starts
+        while next < b.len && b[next] != u8('\n')
+            next += 1
+    out.push(closed + blanked(b, line_end, next) + from_utf8_lossy(b[(if next > b.len then b.len else next)..]))
+    out.push(closed + blanked(b, line_end, b.len))
+    out
+
+// The bytes from `from` to `to` with every one but a line break made a space, so lines keep their
+// numbers.
+private blanked(b: []const u8, from: usize, to: usize) -> string
+    var out: Buf[u8] = buf()
+    val end = if to > b.len then b.len else to
+    for k in from..<end
+        out.push(if b[k] == u8('\n') then u8('\n') else u8(' '))
+    from_utf8_lossy(out.view())
