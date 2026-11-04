@@ -50,6 +50,17 @@ struct Parser
     expect_kind(*self, kind: Token, message: string)
         if !self.accept_kind(kind) then self.report.add(error(self.toks.here(), message))
 
+    /** The span of the last token consumed that is written in the source: the layout tokens a line
+     * break or a closed block adds are skipped, so a construct that ends there ends at its own last
+     * word or bracket and not at the start of whatever follows. */
+    ended(self) -> Span
+        var i = self.toks.position
+        while i > 0
+            val t = self.toks.items[i - 1]
+            if t.value != Newline && t.value != Indent && t.value != Dedent then return t.span
+            i -= 1
+        self.toks.here()
+
     /** The spelling of the token `offset` places ahead, or "" past the end. */
     ahead(self, offset: usize) -> string = self.toks.peek_at(offset) match
         Some(t) -> self.spelling(t)
@@ -72,9 +83,13 @@ impl TokenStream for Parser
         val next = self.toks.peek()
         if next is Some(t)
             if t.value == Word && self.toks.position > 0 && !is_keyword(self.spelling(t)) then return Some(Spanned(InfixName, t.span))
+            // A method named by a symbol binds at the level its first character gives it, and `~`
+            // after an operand is the method `~`, binding tightest.
+            if t.value == SymbolOp && self.toks.position > 0 then return Some(Spanned(symbol_token(self.spelling(t)), t.span))
+            if t.value == Symbol && self.toks.position > 0 && self.spelling(t) == "~" then return Some(Spanned(SymbolTight, t.span))
             // `++` and `--` with an operand after them on the line call a method of that name:
             // `xs ++ ys`. Otherwise they update the operand before them: `i++`.
-            if t.value == Postfix && self.toks.position > 0 && operand_follows(self, t) then return Some(Spanned(SymbolOp, t.span))
+            if t.value == Postfix && self.toks.position > 0 && operand_follows(self, t) then return Some(Spanned(SymbolAdd, t.span))
         next
     take(*self) -> Option[Spanned[Token]] = self.toks.advance()
 
@@ -132,23 +147,51 @@ private binding(t: Spanned[Token]) -> u16
         AndOp -> 20
         CompareOp -> 30
         IsKeyword -> 30
+        SymbolCompare -> 30
         InfixName -> InfixBinding
-        SymbolOp -> InfixBinding
         RangeOp -> 34
         ConsOp -> 35
+        SymbolCons -> 35
         BitOrOp -> 36
+        SymbolBitOr -> 36
         BitXorOp -> 37
+        SymbolBitXor -> 37
         BitAndOp -> 38
+        SymbolBitAnd -> 38
         AddOp -> 40
+        SymbolAdd -> 40
         MultiplyOp -> 50
+        SymbolMultiply -> 50
+        SymbolTight -> 55
         Postfix -> 80
         _ -> 0
 
 private const PrefixBinding: u16 = 60
 
-// An infix method call binds more loosely than ranges and every arithmetic operator, and more
-// tightly than comparisons.
+// A method called infix by its name binds more loosely than ranges and every arithmetic operator,
+// and more tightly than comparisons.
 private const InfixBinding: u16 = 32
+
+/** The level a method named by a symbol binds at: that of the language's operator its first
+ * character belongs to. Names starting `<<` or `>>` bind with the shifts, at the multiplicative
+ * level; `<`, `>`, `=` and `!` with the comparisons; any character that starts no operator of a level,
+ * `~` and `?` among them, binds tightest of all. A name ending in `=` is an assignment, and never
+ * reaches here. */
+symbol_token(name: string) -> Token
+    if name.starts_with("<<") || name.starts_with(">>") then return SymbolMultiply
+    val first = name[0..<1]
+    if first == "*" || first == "/" || first == "%" then SymbolMultiply
+    elif first == "+" || first == "-" then SymbolAdd
+    elif first == "&" then SymbolBitAnd
+    elif first == "^" then SymbolBitXor
+    elif first == "|" then SymbolBitOr
+    elif first == ":" then SymbolCons
+    elif first == "<" || first == ">" || first == "=" || first == "!" then SymbolCompare
+    else SymbolTight
+
+/** The binding power of a method named by a symbol, or of one named by a word. */
+private call_level(name: string) -> u16 =
+    if is_operator_spelling(name) then binding(Spanned(symbol_token(name), Span(0, 0))) else InfixBinding
 
 // Words that keep their meaning after an operand, and so never name a method called infix.
 is_keyword(word: string) -> bool
@@ -252,7 +295,7 @@ private word_prefix(t: Spanned[Token], text: string, p: *Parser) -> &Expr
         var value: Option[&Expr] = None
         if !p.at_line_end() then value = Some(if p.in_list then expression(p, 0) else line_value(p))
         val kind: ExprKind = if text == "return" then Return(value) else Break(value)
-        return Expr(t.span.to(p.toks.here()), kind)
+        return Expr(t.span.to(p.ended()), kind)
     if text == "continue" then return Expr(t.span, Continue)
     if is_keyword(text) then return Expr(t.span, Name(text))
     bare_call(p, Expr(t.span, Name(text)))
@@ -302,7 +345,7 @@ line_statement(p: *Parser) -> &Expr
 // `()` is unit, `(e)` groups, `(a, b)` is a tuple, and `(x, y) -> body` is a lambda.
 private parenthesized(p: *Parser, start: Span) -> &Expr
     if lambda_params_ahead(p) then return parse_lambda(p, start)
-    if p.accept(")") then return Expr(start.to(p.toks.here()), UnitLit)
+    if p.accept(")") then return Expr(start.to(p.ended()), UnitLit)
     val outer = p.in_list
     p.in_list = true
     val first = expression(p, 0)
@@ -336,7 +379,9 @@ private infix(left: &Expr, t: Spanned[Token], p: *Parser) -> &Expr
             Expr(left.span.to(upper.span), Range(left, upper, op == ".."))
         ConsOp ->
             // `::` groups to the right: its right operand takes in a following `::`.
+            mixed_grouping(p, left, true, 35, t.span)
             val tail = expression(p, 34)
+            mixed_grouping(p, tail, true, 35, t.span)
             Expr(left.span.to(tail.span), Cons(left, tail, t.span))
         CompareOp ->
             var operands: Buf[&Expr] = buf()
@@ -355,7 +400,7 @@ private infix(left: &Expr, t: Spanned[Token], p: *Parser) -> &Expr
             Expr(left.span.to(pattern.span), Is(left, pattern, negated))
         MatchKeyword -> match_expression(p, left)
         InfixName -> infix_call(left, t, op, p)
-        SymbolOp -> symbol_call(left, t, op, p)
+        SymbolTight | SymbolMultiply | SymbolAdd | SymbolBitAnd | SymbolBitXor | SymbolBitOr | SymbolCons | SymbolCompare -> symbol_call(left, t, op, p)
         Postfix -> postfix(left, t, op, p)
         _ ->
             // `xs*` with nothing after the `*` in an argument list is a splice, which the checker
@@ -379,10 +424,10 @@ private infix_call(left: &Expr, t: Spanned[Token], name: string, p: *Parser) -> 
     val arg = if p.at_kind(Indent) then parse_body(p, false) else expression(p, InfixBinding)
     Expr(left.span.to(arg.span), InfixCall(left, name, t.span, arg))
 
-// `xs ++ ys` calls the method `++` of `xs` with `ys`, at the level and with the rules of `a max b`. A
-// name ending in `:` groups to the right and takes its receiver on the right: `x +: xs` is
-// `xs.+:(x)`, and `a +: b +: xs` is `a +: (b +: xs)`. Left- and right-grouping calls do not mix
-// without parentheses.
+// `xs ++ ys` calls the method `++` of `xs` with `ys`, with the rules of `a max b`, at the level of
+// the operator its first character belongs to (`symbol_token`). A name ending in `:` groups to the
+// right and takes its receiver on the right: `x +: xs` is `xs.+:(x)`, and `a +: b +: xs` is
+// `a +: (b +: xs)`. Left- and right-grouping operators do not mix at one level without parentheses.
 private symbol_call(left: &Expr, t: Spanned[Token], name: string, p: *Parser) -> &Expr
     for b in p.src.text(Span(left.span.end, t.span.start))
         if b == u8('\n')
@@ -392,24 +437,33 @@ private symbol_call(left: &Expr, t: Spanned[Token], name: string, p: *Parser) ->
         p.report.add(error(t.span, s"`$name` has no right operand: a method named by a symbol is called between two operands, and has no postfix form"))
         return Expr(left.span.to(t.span), Invalid)
     val right = groups_right(name)
-    mixed_grouping(p, left, right, t.span)
-    val arg = if p.at_kind(Indent) then parse_body(p, false) else expression(p, if right then InfixBinding - 1 else InfixBinding)
+    val level = binding(t)
+    mixed_grouping(p, left, right, level, t.span)
+    val arg = if p.at_kind(Indent) then parse_body(p, false) else expression(p, if right then level - 1 else level)
     if !right then return Expr(left.span.to(arg.span), InfixCall(left, name, t.span, arg))
-    mixed_grouping(p, arg, right, t.span)
+    mixed_grouping(p, arg, right, level, t.span)
     Expr(left.span.to(arg.span), InfixCall(arg, name, t.span, left))
 
 /** Whether an infix method of this name groups to the right: a symbol ending in `:`. */
 groups_right(name: string) -> bool = name.ends_with(":") && is_operator_spelling(name)
 
-// Reports an operand that is an infix call grouping the other way, written without parentheses:
-// `a ++ b +: c` could mean either grouping.
-private mixed_grouping(p: *Parser, operand: &Expr, right: bool, at: Span)
-    if operand.kind is InfixCall(_, other, _, _)
-        if groups_right(other) == right then return
-        for g in p.grouped
-            if g.start == operand.span.start && g.end == operand.span.end then return
-        val (l, r) = if right then (other, p.spelling(Spanned(SymbolOp, at))) else (p.spelling(Spanned(SymbolOp, at)), other)
-        p.report.add(error(at, s"`$l` groups to the left and `$r` to the right, so they cannot be mixed at one level: add parentheses"))
+// Reports an operand written without parentheses that is an operation at the same level as the
+// operator at `at` but grouping the other way: `a ++ b +: c` and `1 :: xs :+ 2` could mean either
+// grouping.
+private mixed_grouping(p: *Parser, operand: &Expr, right: bool, level: u16, at: Span)
+    val (other, other_level, other_right) = operand.kind match
+        InfixCall(_, name, _, _) -> (name, call_level(name), groups_right(name))
+        Cons(_, _, _) -> ("::", 35u16, true)
+        Binary(_, _, _, op_span) ->
+            val spelled = from_utf8_unchecked(p.src.text(op_span))
+            (spelled, binding(Spanned(operator_token(spelled), op_span)), false)
+        _ -> return
+    if other_level != level || other_right == right then return
+    for g in p.grouped
+        if g.start == operand.span.start && g.end == operand.span.end then return
+    val own = p.spelling(Spanned(SymbolOp, at))
+    val (l, r) = if right then (other, own) else (own, other)
+    p.report.add(error(at, s"`$l` groups to the left and `$r` to the right, so they cannot be mixed at one level: add parentheses"))
 
 // Whether the next token only continues an expression, as `==` or `then` does, and cannot begin one.
 private argument_cannot_start(p: *Parser) -> bool
@@ -643,7 +697,7 @@ private parse_lambda(p: *Parser, at: Span) -> &Expr
             val name = declared_name(p, "a parameter")
             var declared: Option[&TypeExpr] = None
             if p.accept(":") then declared = Some(parse_type(p))
-            params.push(LambdaParam(start.to(p.toks.here()), name, declared))
+            params.push(LambdaParam(start.to(p.ended()), name, declared))
             if !p.accept(",") || p.at(")") then break
         p.expect(")")
     p.expect("->")
@@ -706,6 +760,10 @@ private compare_op(text: string) -> CompareOp
     elif text == "<=" then LessEqual
     elif text == ">" then Greater
     else GreaterEqual
+
+/** Whether `name` is one of the integers' bitwise operators that a method of another type may be
+ * named: `&`, `^`, `|`, and `~` between two operands. */
+bitwise_method_name(name: string) -> bool = name == "&" || name == "^" || name == "|" || name == "~"
 
 /** The operators of the language that have compound assignment forms, `+=` and `+:=`. */
 compound_operator(text: string) -> bool

@@ -13,7 +13,7 @@ parse(src: Source) -> Parsed
     val header = p.toks.here()
     if p.accept("module")
         file.module_name = qualified_name(&p)
-        file.module_span = header.to(p.toks.here())
+        file.module_span = header.to(p.ended())
         p.expect_kind(Newline, "expected a new line after the module header")
     loop
         if p.toks.at_end() then break
@@ -31,7 +31,7 @@ parse(src: Source) -> Parsed
             continue
         val hidden = p.accept("private")
         if hidden && p.at("impl")
-            p.report.add(error(start.to(p.toks.here()), "an impl has no name, so it cannot be private: mark its methods `private`"))
+            p.report.add(error(start.to(p.ended()), "an impl has no name, so it cannot be private: mark its methods `private`"))
         if p.accept("data") then file.items.push(DataItem(parse_data(&p, start, annotations)))
         elif p.at("class") || (p.ahead(1) == "class" && (p.at("open") || p.at("abstract")))
             file.items.push(ClassItem(parse_class(&p, start, annotations)))
@@ -120,11 +120,14 @@ private symbol_name(p: *Parser) -> string
         else p.report.add(error(t.span, s"`$name` is an operator of the language and cannot name a method"))
     name
 
-/** Whether `name` is one of the language's operators, which no method may be named. */
+/** Whether `name` is one of the language's operators, which no method may be named. The bitwise `&`,
+ * `^` and `|`, and `~` between two operands, are the integers' operators and free to name a method of
+ * any other type. */
 language_operator(name: string) -> bool
+    if bitwise_method_name(name) then return false
     if compound_operator(name) then return true
     if name.ends_with(":=") && compound_operator(name[0..<name.bytes.len - 2]) then return true
-    for op in ["&&", "||", "!", "~", "==", "!=", "<", "<=", ">", ">=", "===", "!==", "::", "=", ":=", ":", "?", "->", "=>"]
+    for op in ["&&", "||", "!", "==", "!=", "<", "<=", ">", ">=", "===", "!==", "::", "=", ":=", ":", "?", "->", "=>"]
         if name == op then return true
     false
 
@@ -170,7 +173,7 @@ parse_type(p: *Parser) -> &TypeExpr
             if param.by_name then p.report.add(error(param.ty.span, "only a function type's parameter may be by-name"))
             items.push(param.ty)
         if items.len() == 1 then return items[0]
-        return TypeExpr(start.to(p.toks.here()), Tuple(items))
+        return TypeExpr(start.to(p.ended()), Tuple(items))
     if !p.at("[") && !p.at_kind(Word)
         p.report.add(expected(start, "a type", found_at(p.src, start)))
         p.toks.advance()
@@ -205,7 +208,7 @@ private named_type(p: *Parser, start: Span) -> &TypeExpr
             args.push(parse_type(p))
             if !p.accept(",") || p.at("]") then break
         p.expect("]")
-    TypeExpr(start.to(p.toks.here()), Named(path, args))
+    TypeExpr(start.to(p.ended()), Named(path, args))
 
 // The type of a type pattern, which a match arm's `->` may follow, so a function type there is
 // written in parentheses: `f: ((int) -> int)`.
@@ -223,7 +226,7 @@ private parse_pattern_type(p: *Parser) -> &TypeExpr
             if !p.accept(",") || p.at(")") then break
     p.expect(")")
     if items.len() == 1 then return items[0]
-    TypeExpr(start.to(p.toks.here()), Tuple(items))
+    TypeExpr(start.to(p.ended()), Tuple(items))
 
 parse_pattern(p: *Parser) -> &Pattern = pattern_of(p, true)
 
@@ -239,7 +242,7 @@ private pattern_of(p: *Parser, typed: bool) -> &Pattern
     loop
         options.push(parse_named_pattern(p, typed))
         if !pattern_separator(p) then break
-    Pattern(first.span.to(p.toks.here()), Alternatives(options))
+    Pattern(first.span.to(p.ended()), Alternatives(options))
 
 // A bar continues an unfinished pattern, including on the next line at the arm margin.
 private pattern_separator(p: *Parser) -> bool
@@ -338,14 +341,14 @@ private at_comparison(p: *Parser) -> bool = p.at("<") || p.at("<=") || p.at(">")
 private parse_pattern_atom(p: *Parser) -> &Pattern
     val start = p.toks.here()
     if p.accept("(")
-        if p.accept(")") then return Pattern(start.to(p.toks.here()), Literal(Expr(start.to(p.toks.here()), UnitLit)))
+        if p.accept(")") then return Pattern(start.to(p.ended()), Literal(Expr(start.to(p.ended()), UnitLit)))
         var items: Buf[&Pattern] = buf()
         loop
             items.push(parse_pattern(p))
             if !p.accept(",") || p.at(")") then break
         p.expect(")")
         if items.len() == 1 then return items[0]
-        return Pattern(start.to(p.toks.here()), Tuple(items))
+        return Pattern(start.to(p.ended()), Tuple(items))
     if p.accept("[")
         var items: Buf[&Pattern] = buf()
         if !p.at("]")
@@ -353,7 +356,7 @@ private parse_pattern_atom(p: *Parser) -> &Pattern
                 items.push(parse_pattern(p))
                 if !p.accept(",") || p.at("]") then break
         p.expect("]")
-        return Pattern(start.to(p.toks.here()), Sequence(items))
+        return Pattern(start.to(p.ended()), Sequence(items))
     val token = p.toks.peek() match
         Some(t) -> t
         None ->
@@ -384,15 +387,15 @@ private parse_pattern_atom(p: *Parser) -> &Pattern
     reject_keyword(p, start, word, "a value")
     val path = qualified_name(p)
     if !p.accept("(")
-        if path.contains(".") then return Pattern(start.to(p.toks.here()), Constructor(path, buf()))
-        return Pattern(start.to(p.toks.here()), Name(path))
+        if path.contains(".") then return Pattern(start.to(p.ended()), Constructor(path, buf()))
+        return Pattern(start.to(p.ended()), Name(path))
     var args: Buf[&Pattern] = buf()
     if !p.at(")")
         loop
             args.push(parse_pattern(p))
             if !p.accept(",") || p.at(")") then break
     p.expect(")")
-    Pattern(start.to(p.toks.here()), Constructor(path, args))
+    Pattern(start.to(p.ended()), Constructor(path, args))
 end parse_pattern_atom
 
 // A function parameter is `pattern: type`, optionally by-name (`: -> T`), repeated (`T*`), or
@@ -426,7 +429,7 @@ parse_params(p: *Parser, function: bool) -> Buf[Param]
                 if !function then p.report.add(error(pattern.span, "a data field cannot be by-name"))
                 if variadic then p.report.add(error(pattern.span, "a repeated parameter cannot be by-name"))
                 if !named then p.report.add(error(pattern.span, "a by-name parameter needs a name"))
-            params.push(Param(start.to(p.toks.here()), pattern, ty, default, by_name, variadic))
+            params.push(Param(start.to(p.ended()), pattern, ty, default, by_name, variadic))
             if !p.accept(",") || p.at(")") then break
     p.expect(")")
     params
@@ -448,7 +451,7 @@ parse_type_params(p: *Parser) -> Buf[TypeParam]
                 loop
                     bounds.push(parse_type(p))
                     if !p.accept("+") then break
-            params.push(TypeParam(start.to(p.toks.here()), name, variance, bounds, s"${p.src.name}:${start.start}"))
+            params.push(TypeParam(start.to(p.ended()), name, variance, bounds, s"${p.src.name}:${start.start}"))
             if !p.accept(",") || p.at("]") then break
     p.expect("]")
     params
@@ -463,7 +466,7 @@ parse_function(p: *Parser, annotations: Buf[Annotation]) -> &Function
     val declaring = p.at("object") || p.at("trait") || p.at("impl")
     val symbol = is_operator_spelling(p.ahead(0))
     val name = if symbol then symbol_name(p) elif declaring then required_name(p) else declared_name(p, "a function")
-    val name_span = start.to(p.toks.here())
+    val name_span = start.to(p.ended())
     val type_params = parse_type_params(p)
     val params = parse_params(p, true)
     var result: Option[&TypeExpr] = None
@@ -476,7 +479,7 @@ parse_function(p: *Parser, annotations: Buf[Annotation]) -> &Function
     var body: Option[&Expr] = None
     val indented = p.at_kind(Indent)
     var clauses: Buf[Clause] = buf()
-    var end = p.toks.here()
+    var end = p.ended()
     if equals || indented
         // An indented body after a header with neither `=` nor a result type is a procedure body:
         // its last value is discarded and the function yields unit.
@@ -625,13 +628,13 @@ private parse_data(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &Da
     val one_line = p.at("(")
     if one_line
         val fields = parse_params(p, false)
-        variants.push(Variant(start.to(p.toks.here()), name, fields))
+        variants.push(Variant(start.to(p.ended()), name, fields))
     var derives: Buf[&TypeExpr] = buf()
     if p.accept("derives")
         loop
             derives.push(parse_type(p))
             if !p.accept(",") then break
-    if one_line then return DataDecl(annotations, start.to(p.toks.here()), name, type_params, variants, derives)
+    if one_line then return DataDecl(annotations, start.to(p.ended()), name, type_params, variants, derives)
     p.expect_kind(Indent, "expected indented data variants")
     loop
         if p.toks.at_end() || p.accept_kind(Dedent) then break
@@ -641,9 +644,9 @@ private parse_data(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &Da
         val variant = declared_name(p, "a variant")
         var fields: Buf[Param] = buf()
         if p.at("(") then fields = parse_params(p, false)
-        variants.push(Variant(at.to(p.toks.here()), variant, fields))
+        variants.push(Variant(at.to(p.ended()), variant, fields))
         if p.toks.position == before then p.toks.advance()
-    DataDecl(annotations, start.to(p.toks.here()), name, type_params, variants, derives)
+    DataDecl(annotations, start.to(p.ended()), name, type_params, variants, derives)
 
 // `class Name[T](params): Parent(args), Trait derives Eq` and an optional indented body of fields,
 // methods and statements, each possibly `private`; `open` or `abstract` may come first.
@@ -656,7 +659,7 @@ private parse_class(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &C
     p.expect("class")
     val name_start = p.toks.here()
     val name = declared_name(p, "a type")
-    val name_span = name_start.to(p.toks.here())
+    val name_span = name_start.to(p.ended())
     val type_params = parse_type_params(p)
     var params: Buf[ClassParam] = buf()
     if p.at("(") then params = parse_class_params(p)
@@ -667,7 +670,7 @@ private parse_class(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &C
             derives.push(parse_type(p))
             if !p.accept(",") then break
     val members = parse_class_body(p, name)
-    ClassDecl(annotations, start.to(p.toks.here()), name_span, name, modifier, modifier_span, type_params, params, parents, derives, members, false)
+    ClassDecl(annotations, start.to(p.ended()), name_span, name, modifier, modifier_span, type_params, params, parents, derives, members, false)
 
 // `object Name: Parent, Trait` and an optional indented body like a class's. An object is its one
 // instance, so it takes neither type parameters nor parameters.
@@ -675,7 +678,7 @@ private parse_object(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &
     p.expect("object")
     val name_start = p.toks.here()
     val name = declared_name(p, "an object")
-    val name_span = name_start.to(p.toks.here())
+    val name_span = name_start.to(p.ended())
     if p.at("[")
         p.report.add(error(p.toks.here(), "an object has one instance, so it cannot be generic"))
         parse_type_params(p)
@@ -684,7 +687,7 @@ private parse_object(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &
         parse_class_params(p)
     val parents = parse_parents(p)
     val members = parse_class_body(p, name)
-    ClassDecl(annotations, start.to(p.toks.here()), name_span, name, "", start, buf(), buf(), parents, buf(), members, true)
+    ClassDecl(annotations, start.to(p.ended()), name_span, name, "", start, buf(), buf(), parents, buf(), members, true)
 
 // `trait Name[+T]: Required, Other` and an optional indented body of methods, each with or without
 // a body. A trait is recorded as a class whose modifier is `trait`; it takes no parameters, since it
@@ -694,14 +697,14 @@ private parse_trait(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &C
     p.expect("trait")
     val name_start = p.toks.here()
     val name = declared_name(p, "a type")
-    val name_span = name_start.to(p.toks.here())
+    val name_span = name_start.to(p.ended())
     val type_params = parse_type_params(p)
     if p.at("(")
         p.report.add(error(p.toks.here(), "a trait holds no state, so it takes no parameters"))
         parse_class_params(p)
     val parents = parse_parents(p)
     val members = parse_class_body(p, name)
-    ClassDecl(annotations, start.to(p.toks.here()), name_span, name, "trait", modifier_span, type_params, buf(), parents, buf(), members, false)
+    ClassDecl(annotations, start.to(p.ended()), name_span, name, "trait", modifier_span, type_params, buf(), parents, buf(), members, false)
 
 // At `impl (`: whether `for` follows on the line, outside any brackets, as in
 // `impl (string) -> int for Lengths`; otherwise `impl` names a function, as in `impl(x: int) = x`.
@@ -770,7 +773,7 @@ private parse_impl(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &Im
         Named(path, _) -> path
         _ -> "impl"
     val members = parse_class_body(p, name)
-    ImplDecl(start.to(p.toks.here()), type_params, trait_name, target, members)
+    ImplDecl(start.to(p.ended()), type_params, trait_name, target, members)
 
 // The indented body of a class or an object: fields, methods and statements, one per line.
 private parse_class_body(p: *Parser, name: string) -> Buf[ClassMember]
@@ -823,7 +826,7 @@ private parse_class_params(p: *Parser) -> Buf[ClassParam]
             if hidden && !marked then p.report.add(error(start, "a plain class parameter is already private; `private` goes before `val` or `var`"))
             val name_at = p.toks.here()
             val name = declared_name(p, "a field")
-            val pattern = Pattern(name_at.to(p.toks.here()), Name(name))
+            val pattern = Pattern(name_at.to(p.ended()), Name(name))
             p.expect(":")
             if p.at("->")
                 p.report.add(error(p.toks.here(), "a class parameter is a field, so it cannot be by-name"))
@@ -836,7 +839,7 @@ private parse_class_params(p: *Parser) -> Buf[ClassParam]
             if variadic
                 if !p.at(")") then p.report.add(error(star, "a repeated parameter must be last"))
                 if default is Some(d) then p.report.add(error(d.span, "a repeated parameter cannot have a default: a call that gives it nothing passes an empty vector"))
-            params.push(ClassParam(Param(start.to(p.toks.here()), pattern, ty, default, false, variadic), mutable, marked && !hidden))
+            params.push(ClassParam(Param(start.to(p.ended()), pattern, ty, default, false, variadic), mutable, marked && !hidden))
             if !p.accept(",") || p.at(")") then break
     p.expect(")")
     params
@@ -922,7 +925,7 @@ private parse_import(p: *Parser, at: Span, imports: Buf[Import])
                 val aliased = p.accept("as")
                 val binding = if aliased then declared_name(p, "an import") else name
                 if !aliased then reject_keyword(p, at, name, "an import")
-                imports.push(Import(at.to(p.toks.here()), path + "." + name, binding))
+                imports.push(Import(at.to(p.ended()), path + "." + name, binding))
                 if !p.accept(",") || p.at("}") then break
             p.expect("}")
             return
@@ -930,7 +933,7 @@ private parse_import(p: *Parser, at: Span, imports: Buf[Import])
     val aliased = p.accept("as")
     val binding = if aliased then declared_name(p, "an import") else last_segment(path)
     if !aliased then reject_keyword(p, at, binding, "an import")
-    imports.push(Import(at.to(p.toks.here()), path, binding))
+    imports.push(Import(at.to(p.ended()), path, binding))
 
 private last_segment(path: string) -> string
     var start = 0usize
@@ -957,7 +960,7 @@ parse_annotations(p: *Parser) -> Buf[Annotation]
                     args.push(AnnotationArg(key, expression(p, 0)))
                     if !p.accept(",") || p.at(")") then break
             p.expect(")")
-        out.push(Annotation(start.to(p.toks.here()), name, args))
+        out.push(Annotation(start.to(p.ended()), name, args))
         p.expect_kind(Newline, "expected a new line after an annotation")
         if name == "tests" then break
     out

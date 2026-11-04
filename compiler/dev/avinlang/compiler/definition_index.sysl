@@ -1,0 +1,640 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.{Source, Span}
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.text.{from_utf8_lossy, str_builder}
+
+// Where the things a program names were declared, and what the checker knew about them: what an
+// editor asks of a compiler beside anything a build does.
+//
+// **Every reference is recorded where the checker resolved the name**, because that is the one moment
+// both halves are in hand: the place the name is written and the declaration the checker decided it
+// means. An expression that names something -- a name, a member, a call, an infix call -- is recorded
+// from what checking it produced (`index_expr`): a local, a parameter, a function the overloads
+// settled on, a method (for a call through a method table, the method the receiver's static type
+// names), a field, a module-level value, a variant. A type is recorded where a written type resolves
+// (`resolve_type`), a variant in a pattern where the pattern is checked, and an import where it is
+// checked. Every declaration is also recorded at its own name, so a cursor on a declaration shows
+// what it declares.
+//
+// **It costs nothing when nobody asked.** `Checker.index` is `None` for every build, and every
+// recording site is one test of it; only an analysis an editor asks for gives the checker an index.
+//
+// **What is shown is rendered once checking is over** (`finish_index`), so a local whose type a later
+// use settled is shown at the settled type, and each reference is classified there by what it names
+// (`NameKind`), for an editor's colouring.
+//
+// **Only a name written there is recorded.** Code the compiler writes for a declaration carries the
+// declaration's span, so a place whose words do not spell the name it would record is left out
+// (`spells`); an import's binding, which may rename, is the exception.
+
+/** One name written somewhere, standing for something declared somewhere else: the file and span
+ * of the name as written, of the name the declaration spells, what the checker knew about it (a
+ * type, a signature, a declaration's header) as Avin code, and the declaration's doc comment. */
+struct Reference
+    at_file: string
+    at_span: Span
+    declared_file: string
+    declared_span: Span
+    detail: string
+    doc: string
+    /** What sort of thing the declaration is, and what an editor colours it by: whether it cannot be
+     * assigned, whether it is a member of a type rather than of a value, and whether the standard
+     * library declares it. */
+    kind: NameKind
+    readonly: bool
+    static_member: bool
+    library: bool
+
+    /** Whether this is the declaration's own name rather than a use of it. */
+    declares(self) -> bool = self.at_file == self.declared_file && self.at_span.start == self.declared_span.start && self.at_span.end == self.declared_span.end
+
+/** The sorts of thing a name can stand for. A data type with one variant is a record, its variant
+ * the record itself, and one with several an enumeration, whose variants are its members. */
+enum NameKind
+    ModuleName
+    ClassName
+    RecordName
+    EnumName
+    TraitName
+    TypeParamName
+    VariantName
+    FunctionName
+    MethodName
+    FieldName
+    ParamName
+    LocalName
+    GlobalName
+
+/** Which sort of value a `ValueTarget` is. */
+enum ValueRole
+    LocalRole
+    ParamRole
+    FieldRole
+    GlobalRole
+
+/** What a name resolved to. */
+enum Target
+    /** A local, a parameter, a field or a module-level value, shown as `keyword name: T`. */
+    ValueTarget(keyword: string, name: string, ty: &Type, role: ValueRole)
+    FunctionTarget(symbol: usize)
+    DataTarget(id: usize)
+    ClassTarget(id: usize)
+    VariantTarget(data: usize, index: usize)
+    ModuleTarget(name: string)
+    /** A type parameter, by its name. */
+    TypeParamTarget(name: string)
+
+/** A reference as the checker records it: units rather than files, and a target still to render. */
+struct Noted
+    at_unit: usize
+    at: Span
+    declared_unit: usize
+    declared: Span
+    /** Where the declaration begins, which its doc comment is above. */
+    starts: usize
+    target: Target
+
+/** Where a local's name is written. */
+struct LocalPlace
+    unit: usize
+    span: Span
+
+/** The references one analysis made, each place kept once. A body can be checked more than once
+ * (an argument against each overload it might match), so the last recording of a place is the one
+ * kept: it is the one checking settled on. */
+struct DefinitionIndex
+    noted: Buf[Noted]
+    places: Map[string, usize]
+    /** Where each local was declared, by its function and its index there. */
+    locals: Map[string, LocalPlace]
+    /** Set while an import is recorded, whose binding may rename what it imports. */
+    renaming: bool
+
+    note(*self, n: Noted)
+        val key = s"${n.at_unit}:${n.at.start}:${n.at.end}"
+        if self.places.get(key) is Some(i)
+            self.noted[i] = n
+        else
+            self.places.put(key, self.noted.len())
+            self.noted.push(n)
+
+/** An index with nothing in it, for an analysis an editor is asking for. */
+definition_index() -> &DefinitionIndex = DefinitionIndex(buf(), map(), map(), false)
+
+private current_unit(c: *Checker) -> usize = c.symbols[c.current].unit
+
+private local_key(c: *Checker, index: usize) -> string = s"${c.body.root}:$index"
+
+/** Records that the name written at `at` in `unit` means `target`, declared at `declared`. */
+private index_note(c: *Checker, unit: usize, at: Span, declared_unit: usize, declared: Span, starts: usize, target: Target)
+    if c.index is Some(ix)
+        if at.end <= at.start then return
+        if !ix.renaming && !(target is ModuleTarget(_)) && !spells(c.units[unit].src.bytes, at, c.units[declared_unit].src.bytes, declared) then return
+        ix.note(Noted(unit, at, declared_unit, declared, starts, target))
+
+// Whether the text at `at` can be a name for the declaration whose name is at `declared`: the name
+// itself, a path ending in it, or an operator. Code the compiler writes for a declaration -- the
+// `Display` every data type has, the methods `derives` asks for -- carries the span of the
+// declaration or of the `derives` entry, where the words written are not the names it uses.
+private spells(b: []const u8, at: Span, home: []const u8, declared: Span) -> bool
+    if at.end > b.len || declared.end > home.len then return false
+    val first = b[at.start]
+    val word = first == u8('_') || (first >= u8('a') && first <= u8('z')) || (first >= u8('A') && first <= u8('Z')) || first >= 0x80
+    if !word then return true
+    val n = declared.end - declared.start
+    val m = at.end - at.start
+    if m < n then return false
+    for i in 0..<n
+        if b[at.end - n + i] != home[declared.start + i] then return false
+    m == n || b[at.end - n - 1] == u8('.')
+
+/** A function, by its symbol: a constructor is its class, and a lambda or a function the compiler
+ * made for a default is nothing a name can mean. */
+index_function(c: *Checker, unit: usize, at: Span, id: usize)
+    if c.index is None then return
+    val s = c.symbols[id]
+    if s.lambda || s.default_param is Some(_) then return
+    if s.constructor
+        if s.owner_class is Some(k) then index_class(c, unit, at, k)
+        return
+    if s.decl.name_span.end <= s.decl.name_span.start then return
+    index_note(c, unit, at, s.unit, function_name(c, id), s.decl.span.start, FunctionTarget(id))
+
+// Where a declaration's name is written: a parsed declaration's name span runs on to the token after
+// the name, so the name is found in it.
+private function_name(c: *Checker, id: usize) -> Span =
+    name_in(c.units[c.symbols[id].unit].src, c.symbols[id].decl.name_span, c.symbols[id].decl.name)
+
+private class_name(c: *Checker, k: usize) -> Span = name_in(c.units[c.classes[k].unit].src, c.classes[k].decl.name_span, c.classes[k].decl.name)
+
+index_class(c: *Checker, unit: usize, at: Span, k: usize)
+    if c.index is None then return
+    index_note(c, unit, at, c.classes[k].unit, class_name(c, k), c.classes[k].decl.span.start, ClassTarget(k))
+
+index_data(c: *Checker, unit: usize, at: Span, id: usize)
+    if c.index is None then return
+    val d = c.data[id]
+    index_note(c, unit, at, d.unit, name_in(c.units[d.unit].src, d.decl.span, d.name), d.decl.span.start, DataTarget(id))
+
+index_variant(c: *Checker, unit: usize, at: Span, id: usize, index: usize)
+    if c.index is None then return
+    val d = c.data[id]
+    if index >= d.decl.variants.len() then return
+    val v = d.decl.variants[index]
+    index_note(c, unit, at, d.unit, name_in(c.units[d.unit].src, v.span, v.name), v.span.start, VariantTarget(id, index))
+
+/** A field of a class, by the class whose objects hold it and its index there. */
+index_class_field(c: *Checker, unit: usize, at: Span, k: usize, index: usize)
+    if c.index is None then return
+    if index >= c.classes[k].fields.len() then return
+    val f = c.classes[k].fields[index]
+    if f.name.starts_with("<") then return
+    val home = c.classes[f.owner].unit
+    val keyword = if f.mutable then "var " else "val "
+    val ty: &Type = f.ty.unwrap_or(ErrorType)
+    index_note(c, unit, at, home, name_in(c.units[home].src, f.span, f.name), f.span.start, ValueTarget(keyword, f.name, ty, FieldRole))
+
+/** A field of a data type with one variant, at the type the value it is read from gives it. */
+index_data_field(c: *Checker, unit: usize, at: Span, id: usize, index: usize, ty: &Type)
+    if c.index is None then return
+    val d = c.data[id]
+    if d.decl.variants.len() == 0 || index >= d.decl.variants[0].fields.len() then return
+    val p = d.decl.variants[0].fields[index]
+    val name = pattern_name(p.pattern)
+    index_note(c, unit, at, d.unit, name_in(c.units[d.unit].src, p.span, name), p.span.start, ValueTarget("val ", name, ty, FieldRole))
+
+/** A module-level value; an object is its class. */
+index_global(c: *Checker, unit: usize, at: Span, g: usize, ty: &Type)
+    if c.index is None then return
+    val v = c.globals[g]
+    if v.object is Some(k) then return index_class(c, unit, at, k)
+    val keyword = if v.lazy then "lazy val " elif v.mutable then "var " else "val "
+    index_note(c, unit, at, v.unit, name_in(c.units[v.unit].src, v.span, v.name), v.span.start, ValueTarget(keyword, v.name, ty, GlobalRole))
+
+/** A parameter of the top-level function being checked. */
+private index_param(c: *Checker, unit: usize, at: Span, i: usize, ty: &Type)
+    val s = c.symbols[c.body.root]
+    if i >= s.param_names.len() then return
+    val name = s.param_names[i]
+    for p in s.decl.params
+        if pattern_name(p.pattern) == name
+            index_note(c, unit, at, s.unit, name_in(c.units[s.unit].src, p.span, name), p.span.start, ValueTarget("", name, ty, ParamRole))
+            return
+
+/** A local of the function being checked, by its index in the function's table. */
+private index_local(c: *Checker, unit: usize, at: Span, index: usize, ty: &Type)
+    val ix = c.index match
+        Some(i) -> i
+        None -> return
+    if ix.locals.get(local_key(c, index)) is Some(place)
+        val l = c.body.locals[index]
+        index_note(c, unit, at, place.unit, place.span, place.span.start, ValueTarget(if l.mutable then "var " else "val ", l.name, ty, LocalRole))
+
+/** A module, at its first file's header. */
+index_module(c: *Checker, unit: usize, at: Span, name: string)
+    if c.index is None then return
+    for u in 0..<c.units.len()
+        if c.units[u].file.module_name == name
+            index_note(c, unit, at, u, c.units[u].file.module_span, 0, ModuleTarget(name))
+            return
+
+/** A type parameter of the declaration whose types are being resolved in `unit`, written at `at`:
+ * recorded as a use of its declaration, and its declaration as itself. */
+index_type_param(c: *Checker, unit: usize, at: Span, p: TypeParam)
+    if c.index is None then return
+    val declared = name_in(c.units[unit].src, p.span, p.name)
+    if declared.end <= declared.start then return
+    index_note(c, unit, at, unit, declared, p.span.start, TypeParamTarget(p.name))
+    index_note(c, unit, declared, unit, declared, p.span.start, TypeParamTarget(p.name))
+
+/** A new local, declared by a statement or a pattern spanning `at`: where its name is written, kept
+ * for the reads of it, and recorded as a reference to itself. */
+index_declared_local(c: *Checker, at: Span, name: string, index: usize, ty: &Type)
+    val ix = c.index match
+        Some(i) -> i
+        None -> return
+    if name == "" || name.starts_with("?") then return
+    val unit = current_unit(c)
+    val written = name_in(c.units[unit].src, at, name)
+    ix.locals.put(local_key(c, index), LocalPlace(unit, written))
+    index_note(c, unit, written, unit, written, written.start, ValueTarget(if c.body.locals[index].mutable then "var " else "val ", name, ty, LocalRole))
+
+/** Records what an expression that names something resolved to, from what checking it produced. */
+index_expr(c: *Checker, e: &Expr, t: &TExpr)
+    val unit = current_unit(c)
+    val at = e.kind match
+        Name(_) -> e.span
+        Member(target, name) ->
+            index_module_prefix(c, unit, target)
+            member_span(c.units[unit].src, e.span, name)
+        Call(callee, _) ->
+            if callee.kind is Member(target, _) then index_module_prefix(c, unit, target)
+            callee_span(c, unit, callee)
+        InfixCall(_, name, name_span, _) -> name_in(c.units[unit].src, name_span, name)
+        TypeApply(target, _) -> callee_span(c, unit, target)
+        _ -> return
+    if at.end <= at.start then return
+    index_typed(c, unit, at, t)
+
+// The module a member is read from, where the name before the dot is one the file imported.
+private index_module_prefix(c: *Checker, unit: usize, target: &Expr)
+    if target.kind is Name(m)
+        if c.files[unit].modules.get(m) is Some(path) then index_module(c, unit, target.span, path)
+
+// Where the name a call is made by is written: a name, or the member after the last dot.
+private callee_span(c: *Checker, unit: usize, callee: &Expr) -> Span = callee.kind match
+    Name(_) -> callee.span
+    Member(_, name) -> member_span(c.units[unit].src, callee.span, name)
+    TypeApply(target, _) -> callee_span(c, unit, target)
+    _ -> Span(0, 0)
+
+// The declaration a checked expression reaches, looking through what checking wrapped around it: a
+// conversion to `Any`, the block a call's defaults are computed in, a read of a by-name parameter.
+private index_typed(c: *Checker, unit: usize, at: Span, t: &TExpr)
+    t.kind match
+        Box(v) -> index_typed(c, unit, at, v)
+        Render(v) -> index_typed(c, unit, at, v)
+        Block(items) -> if items.len() > 0 then index_typed(c, unit, at, items[items.len() - 1])
+        CallValue(callee, _) -> index_typed(c, unit, at, callee)
+        Local(i) -> index_local(c, unit, at, i, t.ty)
+        Param(i) -> index_param(c, unit, at, i, t.ty)
+        Call(f, _, _) -> index_function(c, unit, at, f)
+        Dispatch(f, _, _, _) -> index_function(c, unit, at, f)
+        BoundCall(f, _, _, _) -> index_function(c, unit, at, f)
+        FunctionValue(f, _) -> index_function(c, unit, at, f)
+        Construct(variant, _) -> *solve(c.vars, t.ty) match
+            Data(id, _, _) -> index_variant(c, unit, at, id, variant)
+            _ -> ()
+        Field(value, index) -> index_field(c, unit, at, value, index, t.ty)
+        LazyField(object, index, _, _) -> index_field(c, unit, at, object, index, t.ty)
+        Global(g) -> index_global(c, unit, at, g, t.ty)
+        LazyGlobal(g, _, _) -> index_global(c, unit, at, g, t.ty)
+        TypeReceiver -> index_type(c, unit, at, t.ty)
+        _ -> ()
+
+private index_field(c: *Checker, unit: usize, at: Span, value: &TExpr, index: usize, ty: &Type)
+    *solve(c.vars, value.ty) match
+        Class(k, _, _) -> index_class_field(c, unit, at, k, index)
+        Data(id, _, _) -> index_data_field(c, unit, at, id, index, ty)
+        _ -> ()
+
+/** A type written at `at`: the class or data type it names. */
+index_type(c: *Checker, unit: usize, at: Span, ty: &Type)
+    if c.index is None then return
+    *ty match
+        Class(k, _, _) -> index_class(c, unit, at, k)
+        Data(id, _, _) -> index_data(c, unit, at, id)
+        _ -> ()
+
+/** A checked pattern that names a variant. */
+index_pattern(c: *Checker, p: &Pattern, t: &TPattern)
+    val name = p.kind match
+        Name(n) -> n
+        Constructor(path, _) -> path
+        _ -> return
+    val index = t.kind match
+        PVariant(i, _) -> i
+        _ -> return
+    *solve(c.vars, t.ty) match
+        Data(id, _, _) -> index_variant(c, current_unit(c), Span(p.span.start, p.span.start + name.bytes.len), id, index)
+        _ -> ()
+
+/** An import the checker kept: its binding, written last in the import, means the declaration or the
+ * module it imports. */
+index_import(c: *Checker, unit: usize, i: Import, whole: bool)
+    val ix = c.index match
+        Some(x) -> x
+        None -> return
+    ix.renaming = true
+    index_imported(c, unit, i, whole)
+    ix.renaming = false
+
+private index_imported(c: *Checker, unit: usize, i: Import, whole: bool)
+    val at = last_name_in(c.units[unit].src, i.span, i.binding)
+    if whole then return index_module(c, unit, at, i.path)
+    if c.types.get(i.path) is Some(id) then return index_data(c, unit, at, id)
+    if c.class_types.get(i.path) is Some(k) then return index_class(c, unit, at, k)
+    if c.variants.get(i.path) is Some(v) then return index_variant(c, unit, at, v.data, v.index)
+    if c.global_names.get(i.path) is Some(g) then return index_global(c, unit, at, g, global_shown_type(c, g))
+    if c.scope.get(i.path) is Some(ids)
+        if ids.len() > 0 then index_function(c, unit, at, ids[0])
+
+// The type a module-level value is shown at: its initializer's result.
+private global_shown_type(c: *Checker, g: usize) -> &Type = c.symbols[c.globals[g].init].result.unwrap_or(ErrorType)
+
+/** Records every declaration at its own name, then renders what the index holds. */
+finish_index(c: *Checker) -> Buf[Reference]
+    var out: Buf[Reference] = buf()
+    val ix = c.index match
+        Some(i) -> i
+        None -> return out
+    index_declarations(c)
+    for n in ix.noted
+        val home = c.units[n.declared_unit].src
+        val module_name = c.units[n.declared_unit].file.module_name
+        val library = module_name == CoreModule || module_name.starts_with(CoreModule + ".")
+        val (kind, readonly, static_member) = target_kind(c, n.target)
+        out.push(Reference(c.units[n.at_unit].src.name, n.at, home.name, n.declared, render_target(c, n.target), doc_before(home.bytes, n.starts), kind, readonly, static_member, library))
+    out
+
+// What sort of thing a target is, whether it cannot be assigned, and whether it is a static member.
+private target_kind(c: *Checker, target: Target) -> (NameKind, bool, bool) = target match
+    ValueTarget(keyword, _, _, role) -> role match
+        LocalRole -> (LocalName, keyword != "var ", false)
+        ParamRole -> (ParamName, false, false)
+        FieldRole -> (FieldName, keyword != "var ", false)
+        GlobalRole -> (GlobalName, keyword != "var ", false)
+    FunctionTarget(id) ->
+        val s = c.symbols[id]
+        val method = s.owner_class is Some(_) || s.receiver is Some(_)
+        (if method then MethodName else FunctionName, false, s.static_member)
+    DataTarget(id) -> (if c.data[id].decl.variants.len() == 1 then RecordName else EnumName, false, false)
+    ClassTarget(k) -> (if c.classes[k].decl.modifier == "trait" then TraitName else ClassName, false, false)
+    VariantTarget(id, _) -> (if c.data[id].decl.variants.len() == 1 then RecordName else VariantName, false, false)
+    ModuleTarget(_) -> (ModuleName, false, false)
+    TypeParamTarget(_) -> (TypeParamName, false, false)
+
+private index_declarations(c: *Checker)
+    for id in 0..<c.symbols.len()
+        val s = c.symbols[id]
+        if s.lambda || s.default_param is Some(_) || s.constructor then continue
+        index_function(c, s.unit, function_name(c, id), id)
+        // A local function's parameters are its locals, recorded where they were declared.
+        if s.root is Some(_) then continue
+        for j in 0..<s.param_names.len()
+            for p in s.decl.params
+                if pattern_name(p.pattern) == s.param_names[j]
+                    val at = name_in(c.units[s.unit].src, p.span, s.param_names[j])
+                    index_note(c, s.unit, at, s.unit, at, p.span.start, ValueTarget("", s.param_names[j], s.params[j], ParamRole))
+    for k in 0..<c.classes.len()
+        index_class(c, c.classes[k].unit, class_name(c, k), k)
+        for i in 0..<c.classes[k].fields.len()
+            val f = c.classes[k].fields[i]
+            if f.owner != k || f.name.starts_with("<") then continue
+            val home = c.classes[k].unit
+            index_class_field(c, home, name_in(c.units[home].src, f.span, f.name), k, i)
+    for id in 0..<c.data.len()
+        val d = c.data[id]
+        index_data(c, d.unit, name_in(c.units[d.unit].src, d.decl.span, d.name), id)
+        for i in 0..<d.decl.variants.len()
+            val v = d.decl.variants[i]
+            index_variant(c, d.unit, name_in(c.units[d.unit].src, v.span, v.name), id, i)
+        // A record's fields are read by name, so each is declared where its variant names it.
+        if d.decl.variants.len() == 1 && d.variants.len() == 1
+            val fields = d.decl.variants[0].fields
+            for i in 0..<fields.len()
+                if i >= d.variants[0].fields.len() then break
+                val at = name_in(c.units[d.unit].src, fields[i].span, pattern_name(fields[i].pattern))
+                index_data_field(c, d.unit, at, id, i, d.variants[0].fields[i])
+    for g in 0..<c.globals.len()
+        val v = c.globals[g]
+        if v.object is Some(_) then continue
+        index_global(c, v.unit, name_in(c.units[v.unit].src, v.span, v.name), g, global_shown_type(c, g))
+
+// ---- what a reference shows ----
+
+private render_target(c: *Checker, target: Target) -> string = target match
+    ValueTarget(keyword, name, ty, _) -> s"$keyword$name: ${type_name(shown_type(c, ty))}"
+    FunctionTarget(id) -> function_header(c, id)
+    DataTarget(id) -> data_header(c, id)
+    ClassTarget(k) -> class_header(c, k)
+    VariantTarget(id, index) -> s"${c.data[id].name}.${variant_header(c.data[id].decl.variants[index])}"
+    ModuleTarget(name) -> s"module $name"
+    TypeParamTarget(name) -> s"type parameter $name"
+
+// A type as a reader sees it: solved, and a by-name parameter's type as the type it reads as.
+private shown_type(c: *Checker, ty: &Type) -> &Type = solve(c.vars, ty)
+
+/** A function's signature, as its declaration would be written: a method is named with the type it
+ * belongs to, and a result of `unit` is left out, as a declaration leaves it out. */
+private function_header(c: *Checker, id: usize) -> string
+    val s = c.symbols[id]
+    var out = str_builder()
+    var first = 0usize
+    if s.owner_class is Some(k)
+        out.push(c.classes[k].name + ".")
+        first = 1
+    elif s.receiver is Some(r)
+        out.push(type_name(shown_type(c, r)) + ".")
+        first = 1
+    elif s.static_member then first = 1
+    out.push(s.decl.name)
+    out.push(type_params_text(s.decl.type_params))
+    out.push("(")
+    for i in first..<s.params.len()
+        if i > first then out.push(", ")
+        val name = if i < s.param_names.len() then s.param_names[i] else "_"
+        out.push(s"$name: ${type_name(shown_type(c, s.params[i]))}")
+    out.push(")")
+    if s.result is Some(r)
+        val result = shown_type(c, r)
+        if !(*result is Unit) then out.push(" -> " + type_name(result))
+    out.finish()
+
+private class_header(c: *Checker, k: usize) -> string
+    val d = c.classes[k].decl
+    if d.object then return "object " + d.name
+    var out = str_builder()
+    if d.modifier == "trait" then out.push("trait ")
+    else
+        if d.modifier != "" then out.push(d.modifier + " ")
+        out.push("class ")
+    out.push(d.name)
+    out.push(type_params_text(d.type_params))
+    if d.modifier != "trait" && d.params.len() > 0
+        out.push("(")
+        for i in 0..<d.params.len()
+            if i > 0 then out.push(", ")
+            val cp = d.params[i]
+            if cp.mutable && !cp.public then out.push("private ")
+            if cp.mutable then out.push("var ")
+            elif cp.public then out.push("val ")
+            out.push(param_text(cp.param))
+        out.push(")")
+    for i in 0..<d.parents.len()
+        out.push((if i == 0 then ": " else ", ") + parent_text(d.parents[i]))
+    for i in 0..<d.derives.len()
+        out.push((if i == 0 then " derives " else ", ") + show_type(d.derives[i]))
+    out.finish()
+
+// A parent after `:` as it is written: a type, with its type arguments, and a superclass's
+// constructor arguments elided.
+private parent_text(e: &Expr) -> string = e.kind match
+    Name(n) -> n
+    Member(target, name) -> parent_text(target) + "." + name
+    TypeApply(target, args) ->
+        var out = parent_text(target) + "["
+        for i in 0..<args.len()
+            if i > 0 then out = out + ", "
+            out = out + show_type(args[i])
+        out + "]"
+    Call(callee, args) -> parent_text(callee) + (if args.len() == 0 then "()" else "(…)")
+    _ -> show_expr(e)
+
+private data_header(c: *Checker, id: usize) -> string
+    val d = c.data[id].decl
+    var out = str_builder()
+    out.push("data " + d.name + type_params_text(d.type_params))
+    for i in 0..<d.derives.len()
+        out.push((if i == 0 then " derives " else ", ") + show_type(d.derives[i]))
+    for v in d.variants
+        out.push("\n    " + variant_header(v))
+    out.finish()
+
+private variant_header(v: Variant) -> string
+    if v.fields.len() == 0 then return v.name
+    var out = v.name + "("
+    for i in 0..<v.fields.len()
+        if i > 0 then out = out + ", "
+        out = out + param_text(v.fields[i])
+    out + ")"
+
+private param_text(p: Param) -> string =
+    pattern_name(p.pattern) + ": " + (if p.by_name then "-> " else "") + show_type(p.ty) + (if p.variadic then "*" else "")
+
+private type_params_text(params: Buf[TypeParam]) -> string
+    if params.len() == 0 then return ""
+    var out = "["
+    for i in 0..<params.len()
+        if i > 0 then out = out + ", "
+        val tp = params[i]
+        out = out + (tp.variance match
+            Invariant -> ""
+            Covariant -> "+"
+            Contravariant -> "-") + tp.name
+        for j in 0..<tp.bounds.len()
+            out = out + (if j == 0 then ": " else " + ") + show_type(tp.bounds[j])
+    out + "]"
+
+private pattern_name(p: &Pattern) -> string = p.kind match
+    Name(n) -> n
+    _ -> show_pattern(p)
+
+// ---- places in source text ----
+
+/** Where `name` is written as a whole word in `within`: its first occurrence, or the empty span at
+ * the start where it is not written there. */
+name_in(src: Source, within: Span, name: string) -> Span = find_name(src.bytes, within, name, false)
+
+/** `name_in`, the last occurrence. */
+last_name_in(src: Source, within: Span, name: string) -> Span = find_name(src.bytes, within, name, true)
+
+private find_name(b: []const u8, within: Span, name: string, last: bool) -> Span
+    val limit = if within.end > b.len then b.len else within.end
+    val n = name.bytes.len
+    var found = Span(within.start, within.start)
+    if n == 0 || within.start + n > limit then return found
+    for i in within.start..limit - n + 1
+        var same = true
+        for j in 0..<n
+            if b[i + j] != name.bytes[j]
+                same = false
+                break
+        if !same then continue
+        val before_ok = i == 0 || !word_byte(b[i - 1])
+        val after_ok = i + n >= b.len || !word_byte(b[i + n])
+        if before_ok && after_ok
+            found = Span(i, i + n)
+            if !last then return found
+    found
+
+/** Where a member's name is written in a member expression spanning `whole`: after its last dot. */
+member_span(src: Source, whole: Span, name: string) -> Span
+    val n = name.bytes.len
+    val b = src.bytes
+    if whole.end <= b.len && whole.end >= whole.start + n
+        val at = whole.end - n
+        var same = true
+        for j in 0..<n
+            if b[at + j] != name.bytes[j] then same = false
+        if same then return Span(at, whole.end)
+    last_name_in(src, whole, name)
+
+word_byte(c: u8) -> bool =
+    c >= u8('a') && c <= u8('z') || c >= u8('A') && c <= u8('Z') || c >= u8('0') && c <= u8('9') || c == u8('_') || c >= 0x80
+
+/** The comment directly above a declaration beginning at `starts`, past any annotations between:
+ * its `//` lines, or a `/** … */` block, as text. Empty when there is none. */
+doc_before(b: []const u8, starts: usize) -> string
+    var line_start = if starts > b.len then b.len else starts
+    while line_start > 0 && b[line_start - 1] != u8('\n')
+        line_start -= 1
+        // A declaration after something else on its line, a class's parameter, has no comment of its own.
+        if b[line_start] != u8(' ') && b[line_start] != u8('\t') && line_start < starts then return ""
+    var lines: Buf[string] = buf()
+    var in_block = false
+    while line_start > 0
+        val end = line_start - 1
+        var begin = end
+        while begin > 0 && b[begin - 1] != u8('\n')
+            begin -= 1
+        val text = from_utf8_lossy(b[begin..<end]).trim()
+        line_start = begin
+        if in_block
+            if text.starts_with("/*")
+                val rest = text.trim_start_matches("/").trim_start_matches("*").trim()
+                if rest != "" then lines.push(rest)
+                break
+            lines.push(text.trim_start_matches("*").trim())
+            continue
+        if text.starts_with("//")
+            val rest = text[2..]
+            lines.push(if rest.starts_with(" ") then rest[1..] else rest)
+        elif text.ends_with("*/")
+            val inner = text[0..<text.bytes.len - 2].trim()
+            if inner.starts_with("/*")
+                val rest = inner.trim_start_matches("/").trim_start_matches("*").trim()
+                if rest != "" then lines.push(rest)
+                break
+            in_block = true
+            if inner != "" then lines.push(inner.trim_start_matches("*").trim())
+        elif text.starts_with("@") && lines.len() == 0 then continue
+        else break
+    var out = ""
+    var i = lines.len()
+    while i > 0
+        i -= 1
+        out = out + lines[i] + (if i > 0 then "\n" else "")
+    out

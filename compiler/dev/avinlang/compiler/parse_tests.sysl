@@ -1,7 +1,8 @@
 module dev.avinlang.compiler
 @tests
 
-import sh.sysl.parsing.source_of
+import sh.sysl.parsing.{source_of, Span}
+import sysl.text.from_utf8_unchecked
 
 private tree(text: string) -> string
     val parsed = parse_expression(source_of("test.avin", text))
@@ -82,11 +83,11 @@ infix_errors()
 
 @test("an operator is the longest run of operator characters, and one the language lacks names a method")
 symbol_calls()
-    assert_eq(tree("a ++ b + c"), "(call (. a ++) (+ b c))")
+    assert_eq(tree("a ++ b + c"), "(+ (call (. a ++) b) c)")
     assert_eq(tree("a ++ b ++ c"), "(call (. (call (. a ++) b) ++) c)")
     assert_eq(tree("a ++ b == c"), "((call (. a ++) b) == c)")
     assert_eq(tree("a ++ b max c"), "(call (. (call (. a ++) b) max) c)")
-    assert_eq(tree("1 :: xs ++ ys"), "(call (. (:: 1 xs) ++) ys)")
+    assert_eq(tree("1 :: xs ++ ys"), "(:: 1 (call (. xs ++) ys))")
     assert_eq(tree("x +: xs"), "(call (. xs +:) x)")
     assert_eq(tree("a +: b +: xs"), "(call (. (call (. xs +:) b) +:) a)")
     assert_eq(tree("(a ++ b) :+ c"), "(call (. (call (. a ++) b) :+) c)")
@@ -98,11 +99,69 @@ symbol_calls()
     assert_eq(tree("xs ++= ys"), "(++= xs ys)")
     assert_eq(tree("xs :+= y"), "(:+= xs y)")
 
+@test("a symbol method binds at the level of the operator its first character belongs to")
+symbol_levels()
+    // `~` and `?` start no operator of a level, and bind tightest, below prefix operators.
+    assert_eq(tree("a ~ b * c"), "(* (call (. a ~) b) c)")
+    assert_eq(tree("a * b ~ c"), "(* a (call (. b ~) c))")
+    assert_eq(tree("a ?? b + c"), "(+ (call (. a ??) b) c)")
+    assert_eq(tree("-a ~> b"), "(call (. (- a) ~>) b)")
+    // Multiplicative, with the shifts.
+    assert_eq(tree("a *~ b + c"), "(+ (call (. a *~) b) c)")
+    assert_eq(tree("a + b *~ c"), "(+ a (call (. b *~) c))")
+    assert_eq(tree("a <<< b + c"), "(+ (call (. a <<<) b) c)")
+    assert_eq(tree("a * b %% c"), "(call (. (* a b) %%) c)")
+    // Additive.
+    assert_eq(tree("a ++ b * c"), "(call (. a ++) (* b c))")
+    assert_eq(tree("a + b ++ c"), "(call (. (+ a b) ++) c)")
+    assert_eq(tree("a -- b & c"), "(& (call (. a --) b) c)")
+    // Bitwise: `&`, then `^`, then `|`.
+    assert_eq(tree("a && b"), "(&& a b)")
+    assert_eq(tree("a &&& b | c"), "(| (call (. a &&&) b) c)")
+    assert_eq(tree("a ^^ b & c"), "(call (. a ^^) (& b c))")
+    assert_eq(tree("a ^^ b | c"), "(| (call (. a ^^) b) c)")
+    assert_eq(tree("a |> b ^ c"), "(call (. a |>) (^ b c))")
+    assert_eq(tree("a |> b :: c"), "(:: (call (. a |>) b) c)")
+    // Cons.
+    assert_eq(tree("xs ++ ys :+ z"), "(call (. (call (. xs ++) ys) :+) z)")
+    assert_eq(tree("x :+ y .. z"), "(.. (call (. x :+) y) z)")
+    assert_eq(tree("1 :: xs :: ys"), "(:: 1 (:: xs ys))")
+    assert_eq(tree("1 +: xs :+ 2"), "(call (. (call (. xs +:) 1) :+) 2)")
+    assert_eq(tree("a ::: b ::: c"), "(call (. (call (. c :::) b) :::) a)")
+    // Named calls sit between ranges and comparisons.
+    assert_eq(tree("a :+ b max c"), "(call (. (call (. a :+) b) max) c)")
+    // Comparison.
+    assert_eq(tree("a <=> b max c"), "(call (. a <=>) (call (. b max) c))")
+    assert_eq(tree("a <~ b ~ c"), "(call (. a <~) (call (. b ~) c))")
+    assert_eq(tree("a !! b && c"), "(&& (call (. a !!) b) c)")
+    assert_eq(tree("a <=> b == 0"), "((call (. a <=>) b) == 0)")
+    // A name ending in `=` is an assignment.
+    assert_eq(tree("a |= b ~ c"), "(|= a (call (. b ~) c))")
+    assert_eq(tree("a ++= b ++ c"), "(++= a (call (. b ++) c))")
+    // Combinators read as written.
+    assert_eq(tree("a ~ b ^^ f | c ~ d"), "(| (call (. (call (. a ~) b) ^^) f) (call (. c ~) d))")
+    assert_eq(tree("a ~> b <~ c"), "(call (. (call (. a ~>) b) <~) c)")
+    // Prefix `~` stays the complement.
+    assert_eq(tree("~a ~ ~b"), "(call (. (~ a) ~) (~ b))")
+
+@test("left- and right-grouping operators at one level do not mix, and at different levels do")
+symbol_level_grouping()
+    assert(diagnostics("f(a: A) -> A = 1 :: a :+ 2\n").contains("`:+` groups to the left and `::` to the right"))
+    assert(diagnostics("f(a: A) -> A = a :+ 2 :: b\n").contains("`:+` groups to the left and `::` to the right"))
+    assert(diagnostics("f(a: A) -> A = a + b +: c\n").contains("`+` groups to the left and `+:` to the right"))
+    assert(diagnostics("f(a: A) -> A = a +: b + c\n").contains("`+` groups to the left and `+:` to the right"))
+    assert(diagnostics("f(a: A) -> A = a | b |: c\n").contains("`|` groups to the left and `|:` to the right"))
+    assert(parses("f(a: A) -> A = 1 +: a :+ 2\n"))
+    assert(parses("f(a: A) -> A = (1 :: a) :+ 2\n"))
+    assert(parses("f(a: A) -> A = 1 :: (a :+ 2)\n"))
+    assert(parses("f(a: A) -> A = 1 *: a + 2\n"))
+
 @test("a symbol method cannot be one of the language's operators, and groups one way at a time")
 symbol_errors()
     assert(diagnostics("class A\n    -(o: A) -> A = o\n").contains("`-` is an operator of the language, which a type has by implementing `Sub`"))
     assert(diagnostics("class A\n    <=(o: A) -> bool = true\n").contains("by implementing `Ord`"))
     assert(diagnostics("class A\n    &&(o: A) -> A = o\n").contains("`&&` is an operator of the language and cannot name a method"))
+    assert(parses("class A\n    |(o: A) -> A = o\n    &(o: A) -> A = o\n    ^(o: A) -> A = o\n    ~(o: A) -> A = o\n"))
     assert(diagnostics("f(a: A) -> A = a ++ a +: a\n").contains("`++` groups to the left and `+:` to the right"))
     assert(diagnostics("f(a: A) -> A = a +: a ++ a\n").contains("`++` groups to the left and `+:` to the right"))
     assert(diagnostics("f(a: A) -> A = !!a\n").contains("a symbol method has no prefix form"))
@@ -555,3 +614,155 @@ trailing_block_neighbours()
     // A line holding only a name and an operand is reported as a misplaced infix call.
     assert(diagnostics("main() -> int\n    val s = b\n        add 2\n    s\n").contains("a line cannot start with the method of an infix call"))
     assert(diagnostics("main() -> int\n    f(1)\n        add 2\n    0\n").contains("a line cannot start with the method of an infix call"))
+
+// The source text a span covers: a span is exact when this is exactly the construct's own words.
+private cut(text: string, span: Span) -> string = from_utf8_unchecked(source_of("test.avin", text).text(span))
+
+private parsed_file(text: string) -> SourceFile
+    val src = source_of("test.avin", text)
+    val parsed = parse(src)
+    if parsed.report.has_errors() then panic(parsed.report.render(src))
+    parsed.file
+
+private function_at(file: SourceFile, index: usize) -> &Function = file.items[index] match
+    FunctionItem(f) -> f
+    _ -> panic("not a function")
+
+private class_at(file: SourceFile, index: usize) -> &ClassDecl = file.items[index] match
+    ClassItem(c) -> c
+    _ -> panic("not a class")
+
+@test("a function's span ends at its own last token: one-line, block, clause and signature-only forms")
+function_spans()
+    val text = "add(a: int, b: int) -> int = a + b\nsub(a: int, b: int) -> int\n    a - b\nfact(n: int) -> int\nfact(0) = 1\nfact(n) = n * fact(n - 1)\nnamed(x: int) -> int\nmain() -> int = 0\n"
+    val file = parsed_file(text)
+    val add = function_at(file, 0)
+    assert_eq(cut(text, add.span), "add(a: int, b: int) -> int = a + b")
+    assert_eq(cut(text, add.name_span), "add")
+    assert_eq(cut(text, add.params[0].span), "a: int")
+    assert_eq(cut(text, add.params[1].span), "b: int")
+    val sub = function_at(file, 1)
+    assert_eq(cut(text, sub.span), "sub(a: int, b: int) -> int\n    a - b")
+    val fact = function_at(file, 2)
+    assert_eq(cut(text, fact.span), "fact(n: int) -> int\nfact(0) = 1\nfact(n) = n * fact(n - 1)")
+    assert_eq(cut(text, fact.clauses[0].span), "fact(0) = 1")
+    assert_eq(cut(text, fact.clauses[1].span), "fact(n) = n * fact(n - 1)")
+    assert_eq(cut(text, function_at(file, 3).span), "named(x: int) -> int")
+    assert_eq(cut(text, function_at(file, 4).span), "main() -> int = 0")
+
+@test("the last function of a file ends at its last token with or without a final new line")
+function_spans_at_the_end_of_a_file()
+    val bare = "main() -> int = 0"
+    assert_eq(cut(bare, function_at(parsed_file(bare), 0).span), "main() -> int = 0")
+    val block = "main() -> int\n    val x = 1\n    x"
+    assert_eq(cut(block, function_at(parsed_file(block), 0).span), block)
+    val padded = "main() -> int\n    val x = 1\n    x\n\n\n"
+    assert_eq(cut(padded, function_at(parsed_file(padded), 0).span), "main() -> int\n    val x = 1\n    x")
+
+@test("a parameter's span covers its default, by-name arrow and repeat mark, and no more")
+parameter_spans()
+    val text = "f(a: int = 1, b: -> int, c: int*) -> int = a\n"
+    val params = function_at(parsed_file(text), 0).params
+    assert_eq(cut(text, params[0].span), "a: int = 1")
+    assert_eq(cut(text, params[1].span), "b: -> int")
+    assert_eq(cut(text, params[2].span), "c: int*")
+
+@test("a data declaration, its variants and their fields end at their own last token")
+data_spans()
+    val text = "data Color\n    Red\n    Green(shade: int)\ndata Point(x: int, y: int)\ndata Pair[A, B: Ord](a: A, b: B)\n"
+    val file = parsed_file(text)
+    val color = file.items[0] match
+        DataItem(d) -> d
+        _ -> panic("not data")
+    assert_eq(cut(text, color.span), "data Color\n    Red\n    Green(shade: int)")
+    assert_eq(cut(text, color.variants[0].span), "Red")
+    assert_eq(cut(text, color.variants[1].span), "Green(shade: int)")
+    assert_eq(cut(text, color.variants[1].fields[0].span), "shade: int")
+    val point = file.items[1] match
+        DataItem(d) -> d
+        _ -> panic("not data")
+    assert_eq(cut(text, point.span), "data Point(x: int, y: int)")
+    assert_eq(cut(text, point.variants[0].fields[1].span), "y: int")
+    val pair = file.items[2] match
+        DataItem(d) -> d
+        _ -> panic("not data")
+    assert_eq(cut(text, pair.span), "data Pair[A, B: Ord](a: A, b: B)")
+    assert_eq(cut(text, pair.type_params[0].span), "A")
+    assert_eq(cut(text, pair.type_params[1].span), "B: Ord")
+
+@test("a class, its parameters, fields and methods end at their own last token")
+class_spans()
+    val text = "class Account[T: Ord](val owner: string, var balance: int = 0) : Base(1)\n    val id: int = 1\n    var count = 0\n    deposit(n: int) = n\n    show() -> string\n        \"a\"\nclass Empty\nclass Last(n: int)"
+    val file = parsed_file(text)
+    val account = class_at(file, 0)
+    assert_eq(cut(text, account.span), "class Account[T: Ord](val owner: string, var balance: int = 0) : Base(1)\n    val id: int = 1\n    var count = 0\n    deposit(n: int) = n\n    show() -> string\n        \"a\"")
+    assert_eq(cut(text, account.name_span), "Account")
+    assert_eq(cut(text, account.type_params[0].span), "T: Ord")
+    assert_eq(cut(text, account.params[0].param.span), "val owner: string")
+    assert_eq(cut(text, account.params[1].param.span), "var balance: int = 0")
+    account.members[0] match
+        FieldMember(f) -> assert_eq(cut(text, f.span), "val id: int = 1")
+        _ -> panic("not a field")
+    account.members[1] match
+        FieldMember(f) -> assert_eq(cut(text, f.span), "var count = 0")
+        _ -> panic("not a field")
+    account.members[2] match
+        MethodMember(m, _, _, _) -> assert_eq(cut(text, m.span), "deposit(n: int) = n")
+        _ -> panic("not a method")
+    account.members[3] match
+        MethodMember(m, _, _, _) -> assert_eq(cut(text, m.span), "show() -> string\n        \"a\"")
+        _ -> panic("not a method")
+    assert_eq(cut(text, class_at(file, 1).span), "class Empty")
+    assert_eq(cut(text, class_at(file, 2).span), "class Last(n: int)")
+    assert_eq(cut(text, class_at(file, 2).params[0].param.span), "n: int")
+
+@test("a trait, an object and an impl end at their own last token, with abstract members too")
+trait_object_and_impl_spans()
+    val text = "trait Shape[+T]\n    area() -> int\n    val label: string\nobject Registry\n    lookup(k: int) = k\nimpl Registry\n    other() = 1\nimpl Shape for Registry\n    area() = 2\n"
+    val file = parsed_file(text)
+    val shape = class_at(file, 0)
+    assert_eq(cut(text, shape.span), "trait Shape[+T]\n    area() -> int\n    val label: string")
+    assert_eq(cut(text, shape.type_params[0].span), "+T")
+    shape.members[0] match
+        MethodMember(m, _, _, _) -> assert_eq(cut(text, m.span), "area() -> int")
+        _ -> panic("not a method")
+    shape.members[1] match
+        AbstractFieldMember(f) -> assert_eq(cut(text, f.span), "val label: string")
+        _ -> panic("not an abstract field")
+    assert_eq(cut(text, class_at(file, 1).span), "object Registry\n    lookup(k: int) = k")
+    file.items[2] match
+        ImplItem(d) -> assert_eq(cut(text, d.span), "impl Registry\n    other() = 1")
+        _ -> panic("not an impl")
+    file.items[3] match
+        ImplItem(d) -> assert_eq(cut(text, d.span), "impl Shape for Registry\n    area() = 2")
+        _ -> panic("not an impl")
+
+@test("module values, lazy values and imports end at their own last token")
+value_spans()
+    val text = "import a.b\nval limit = 10\nvar total: int = limit\nlazy val big = limit + 1\nval last = 2"
+    val file = parsed_file(text)
+    assert_eq(cut(text, file.imports[0].span), "import a.b")
+    file.items[0] match
+        ValueItem(v) -> assert_eq(cut(text, v.span), "val limit = 10")
+        _ -> panic("not a value")
+    file.items[1] match
+        ValueItem(v) -> assert_eq(cut(text, v.span), "var total: int = limit")
+        _ -> panic("not a value")
+    file.items[2] match
+        ValueItem(v) -> assert_eq(cut(text, v.span), "lazy val big = limit + 1")
+        _ -> panic("not a value")
+    file.items[3] match
+        ValueItem(v) -> assert_eq(cut(text, v.span), "val last = 2")
+        _ -> panic("not a value")
+
+@test("expression spans of calls, lambdas, matches and blocks end at their own last token")
+expression_spans()
+    val call = "f(1, 2)"
+    assert_eq(cut(call, parse_expression(source_of("test.avin", call)).tree.span), "f(1, 2)")
+    val lambda = "xs.map(x -> x + 1)"
+    assert_eq(cut(lambda, parse_expression(source_of("test.avin", lambda)).tree.span), lambda)
+    val matched = "x match\n    Some(v) -> v\n    None -> 0"
+    assert_eq(cut(matched, parse_expression(source_of("test.avin", matched)).tree.span), matched)
+    val text = "main() -> int\n    val r = x match\n        Some(v) -> v\n        None -> 0\n    if r > 0 then r else 0\nother() = 1\n"
+    val main = function_at(parsed_file(text), 0)
+    assert_eq(cut(text, main.span), "main() -> int\n    val r = x match\n        Some(v) -> v\n        None -> 0\n    if r > 0 then r else 0")

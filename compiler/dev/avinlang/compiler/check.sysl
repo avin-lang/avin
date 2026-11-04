@@ -438,6 +438,9 @@ struct Checker
     /** The name spans of the infix calls that take their receiver on the right (`x +: xs`), whose
      * argument, written first, is evaluated before the receiver. */
     operand_first: Buf[Span]
+    /** Where each name the program writes resolved to, for an editor; `None` for a build, which
+     * records nothing (`definition_index.sysl`). */
+    index: Option[&DefinitionIndex]
     /** The views `upcast` made and the type patterns checked, for lowering: see `TProgram.views`. */
     views: Buf[TypeView]
     type_tests: Buf[TypeView]
@@ -449,6 +452,8 @@ end Checker
 struct Checked
     units: Buf[SourceUnit]
     program: Option[TProgram]
+    /** What each name resolved to, when the check was asked to record it; empty otherwise. */
+    references: Buf[Reference]
 
     has_errors(self) -> bool
         for u in self.units
@@ -565,7 +570,9 @@ private check_imports(c: *Checker, unit: usize)
                 c.note(unit, i.span, s"`${i.binding}` is a module and also declared in this module")
             elif imported_from(kept, mods, i.binding) != ""
                 c.note(unit, i.span, s"`${i.binding}` is already imported, from `${imported_from(kept, mods, i.binding)}`")
-            else mods.put(i.binding, i.path)
+            else
+                mods.put(i.binding, i.path)
+                index_import(c, unit, i, true)
             continue
         var dot: Option[usize] = None
         for k in 0..<i.path.bytes.len
@@ -608,15 +615,17 @@ private check_imports(c: *Checker, unit: usize)
             c.note(unit, i.span, s"`${i.binding}` is already imported, from `${imported_from(kept, mods, i.binding)}`")
             continue
         kept.put(i.binding, i.path)
+        index_import(c, unit, i, false)
     c.files[unit].imports = kept
     c.files[unit].modules = mods
 
 /** Checks a program: the core library's units, then the program's own, each heading its module's
  * name in `file.module_name`. `root_module` is the module that must declare `main`, and the last
  * unit is one of its files. Every file sees its own module's declarations, the names it imports and
- * the core library's public declarations, in that order: an inner name hides an outer one. */
-check_program(units: Buf[SourceUnit], root_module: string, testing: bool) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
+ * the core library's public declarations, in that order: an inner name hides an outer one. With
+ * `indexing`, the check also records where each name resolved to, in `Checked.references`. */
+check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false) -> Checked
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing then Some(definition_index()) else None, buf(), buf())
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
     // `derives` is written out as the methods and impls it stands for before anything is declared.
@@ -727,10 +736,11 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool) -> Che
         // A program built for its tests runs them rather than `main`, so it may have none.
         None -> if !testing then c.note(main_unit, Span(0, 0), "a program needs a `main` function")
     val tests = check_tests(&c)
+    val references = finish_index(&c)
     var failed = false
     for u in c.units
         if u.report.has_errors() then failed = true
-    if failed then return Checked(c.units, None)
+    if failed then return Checked(c.units, None, references)
     var functions: Buf[TFunction] = buf()
     for i in 0..<c.symbols.len()
         functions.push(TFunction(i, c.bodies[i], c.locals[i]))
@@ -739,7 +749,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool) -> Che
         sources.push(u.src)
     val views = solved_views(c.vars, c.views)
     val type_tests = solved_views(c.vars, c.type_tests)
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, init, c.builtins, c.conditional, c.core, tests, testing, views, type_tests)))
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, init, c.builtins, c.conditional, c.core, tests, testing, views, type_tests)), references)
 
 /** Each view with its unknowns solved, each distinct one once. */
 private solved_views(vars: Buf[Option[&Type]], views: Buf[TypeView]) -> Buf[TypeView]
@@ -1228,6 +1238,10 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
     // one overloads. Impls adding to different types built from one, as `Option[Option[T]]` and
     // `Option[List[T]]`, are told apart by the receiver at a call; extensions of two modules, by
     // which of the modules a file imports.
+    // The bitwise operators of the integers and bytes are the machine's, which no method replaces.
+    if bitwise_method_name(f.name) && (*target is Int(_) || *target is Byte)
+        c.note(unit, f.name_span, s"`${f.name}` is the language's operator on ${type_name(target)}, and no method can redefine it")
+        return
     var same_name: Buf[usize] = buf()
     for tm in c.trait_methods
         val other = c.symbols[tm.function]
@@ -1686,6 +1700,9 @@ private declare_fields(c: *Checker, unit: usize)
         var functions = c.classes[id].functions
         for i in 0..<d.parents.len()
             val parent = d.parents[i]
+            if c.index is Some(_)
+                if parent_name(parent) is Some(n)
+                    if c.class_types.get(resolve_name(c, unit, n)) is Some(k) then index_class(c, unit, Span(parent.span.start, parent.span.start + n.bytes.len), k)
             if parent.kind is TypeParent(written)
                 val f = resolve_type(c, unit, written)
                 if *f is Function(_, _) then functions.push(f)
@@ -4795,6 +4812,7 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
             for i in 0..<scope.params.len()
                 if scope.params[i].name == path
                     if args.len() > 0 then c.note(unit, t.span, s"`$path` takes no type arguments")
+                    index_type_param(c, unit, Span(t.span.start, t.span.start + path.bytes.len), scope.params[i])
                     return TypeVar(scope.owner, i, path)
         if path == "Self"
             if args.len() > 0 then c.note(unit, t.span, "`Self` takes no type arguments")
@@ -4811,6 +4829,7 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                 c.note(unit, t.span, s"`$path` takes ${count(d.decl.type_params.len(), "type argument")}, not ${resolved.len()}")
                 return ErrorType
             check_type_args(c, unit, t.span, s"`$path`", data_owner(id), d.decl.type_params, resolved)
+            index_data(c, unit, Span(t.span.start, t.span.start + path.bytes.len), id)
             return Data(id, d.name, resolved)
         if c.class_types.get(key) is Some(id)
             val k = c.classes[id]
@@ -4824,6 +4843,7 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                 c.note(unit, t.span, s"`$path` mentions `Self`, so it is a bound, as in `[T: $path]`, and not a type")
                 return ErrorType
             check_type_args(c, unit, t.span, s"`$path`", class_owner(id), k.decl.type_params, resolved)
+            index_class(c, unit, Span(t.span.start, t.span.start + path.bytes.len), id)
             return Class(id, k.name, resolved)
         builtin_type(path) match
             Some(ty) ->
@@ -5499,7 +5519,12 @@ private to_any(c: *Checker, typed: &TExpr) -> &TExpr
     if *t is AnyType || *t is Nothing || *t is ErrorType || *t is ByName(_) then return typed
     TExpr(typed.span, AnyType, Box(typed))
 
-private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -> &TExpr = e.kind match
+private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -> &TExpr
+    val t = check_kind(c, e, expected, used)
+    if c.index is Some(_) then index_expr(c, e, t)
+    t
+
+private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -> &TExpr = e.kind match
     IntLit(spelling) -> integer_literal(c, e.span, spelling, false, expected)
     Unary(op, operand) -> unary_expr(c, e, op, operand, expected)
     BoolLit(value) -> TExpr(e.span, Bool, BoolConst(value))
@@ -6060,6 +6085,7 @@ private declare_local(c: *Checker, at: Span, name: string, ty: &Type, mutable: b
     val index = c.body.locals.len()
     c.body.locals.push(TLocal(name, ty, mutable, c.current))
     c.body.visible.push(index)
+    if c.index is Some(_) then index_declared_local(c, at, name, index, ty)
     index
 
 // The mutable local an assignment or update writes, after reporting why anything else cannot be
@@ -6172,6 +6198,7 @@ private assign_field(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp],
             check_statement(c, value)
             return TExpr(e.span, ErrorType, UnitConst)
     val current = TExpr(target.span, place.ty, Field(place.object, place.index))
+    if c.index is Some(_) then index_expr(c, target, current)
     val stored = op match
         Some(o) -> operate(c, e.span, op_span, o, binary_spelling(o) + (if yields then ":=" else "="), current, check_expr(c, value, Some(place.ty)))
         None ->
@@ -6263,6 +6290,7 @@ private assign_global(c: *Checker, e: &Expr, target: &Expr, g: usize, op: Option
         return TExpr(e.span, ErrorType, UnitConst)
     val ty = global_type(c, g, target.span)
     val current = TExpr(target.span, ty, Global(g))
+    if c.index is Some(_) then index_expr(c, target, current)
     val stored = op match
         Some(o) -> operate(c, e.span, op_span, o, binary_spelling(o) + (if yields then ":=" else "="), current, check_expr(c, value, Some(ty)))
         None ->
@@ -6283,6 +6311,7 @@ private update_global(c: *Checker, e: &Expr, target: &Expr, g: usize, increment:
     val op = if increment then Add else Subtract
     val one = TExpr(op_span, ty, IntConst("1"))
     val current = TExpr(target.span, ty, Global(g))
+    if c.index is Some(_) then index_expr(c, target, current)
     if !postfix then return TExpr(e.span, ty, StoreGlobal(g, TExpr(e.span, ty, Arith(op, current, one, op_span)), true))
     val old = hidden_local(c, ty)
     val previous = TExpr(target.span, ty, Local(old))
@@ -6444,7 +6473,10 @@ private compound_assign(c: *Checker, e: &Expr, target: &Expr, spelling: string, 
             args.push(Argument(value.span, None, value, false))
             if !takes_one_argument(c, ms) then result = infix_arity_error(c, e.span, op_span, target, spelling, ms, args)
             else result = call_method(c, e.span, op_span, current, spelling, ms, args, None, None, false)
-        elif op is Some(_) then result = assign_place(c, e, place, op, value, false, op_span)
+        elif op is Some(o)
+            // `x |= y` on a type with a method `|` and none `|=` is `x = x | y`.
+            if bitwise_method(c, o, current.ty) then result = assign_place(c, e, place, None, Expr(e.span, Binary(o, place, value, op_span)), false, op_span)
+            else result = assign_place(c, e, place, op, value, false, op_span)
         else
             val name = spelling[0..<spelling.bytes.len - 1]
             if language_operator(name) || groups_right(name)
@@ -6470,6 +6502,7 @@ private assign_place(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp],
             return TExpr(e.span, ErrorType, UnitConst)
     val local = c.body.locals[index]
     val current = TExpr(target.span, local.ty, Local(index))
+    if c.index is Some(_) then index_expr(c, target, current)
     val stored = op match
         Some(o) -> operate(c, e.span, op_span, o, binary_spelling(o) + (if yields then ":=" else "="), current, check_expr(c, value, Some(local.ty)))
         None ->
@@ -6876,7 +6909,24 @@ private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Ex
         val r = check_expr(c, right, expected)
         return operate(c, e.span, op_span, op, binary_spelling(op), check_expr(c, left, Some(r.ty)), r)
     val l = check_expr(c, left, expected)
+    if bitwise_method(c, op, l.ty) then return bitwise_call(c, e.span, op_span, left, l, binary_spelling(op), right, expected)
     operate(c, e.span, op_span, op, binary_spelling(op), l, check_expr(c, right, Some(l.ty)))
+
+/** Whether `a op b` with `a` of type `t` calls `a`'s method named `op`: `op` is `&`, `^` or `|`, and
+ * `t` is not an integer or a byte, whose bitwise operators are the machine's, but has such a method. */
+private bitwise_method(c: *Checker, op: BinaryOp, t: &Type) -> bool
+    if !(op is BitAnd || op is BitOr || op is BitXor) then return false
+    val known = zonk(c, t)
+    if *known is Int(_) || *known is Byte || !settled(known) then return false
+    methods_of(c, known, binary_spelling(op)).len() > 0
+
+// `a | b` on a type with a method `|` is the call `a.|(b)`, as a symbol method's infix call is.
+private bitwise_call(c: *Checker, at: Span, op_span: Span, left: &Expr, receiver: &TExpr, name: string, right: &Expr, expected: Option[&Type]) -> &TExpr
+    val ms = methods_of(c, receiver.ty, name)
+    var args: Buf[Argument] = buf()
+    args.push(Argument(right.span, None, right, false))
+    if !takes_one_argument(c, ms) then return infix_arity_error(c, at, op_span, left, name, ms, args)
+    call_method(c, at, op_span, receiver, name, ms, args, None, expected, false)
 
 // Arithmetic, bitwise and shift operators take two operands of one type and yield that type.
 // Integers have them all; reals have arithmetic; bytes have bitwise operators and shifts. `at` is
@@ -6905,6 +6955,10 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
                 return TExpr(at, ErrorType, UnitConst)
             if !operator_conforms(c, at, spelling, zonk(c, l.ty), om.trait_name) then return TExpr(at, ErrorType, UnitConst)
             return TExpr(at, zonk(c, l.ty), Arith(op, l, r, op_at))
+        // `&`, `^` and `|` on such a type are methods of those names, which this one lacks.
+        if op is BitAnd || op is BitOr || op is BitXor
+            c.note(unit_of(c), at, s"`${type_name(zonk(c, l.ty))}` has no method `$spelling`")
+            return TExpr(at, ErrorType, UnitConst)
     if !numeric || !same_type(l.ty, r.ty)
         c.note(unit_of(c), at, s"`$spelling` needs two numbers of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}")
         return TExpr(at, ErrorType, UnitConst)
@@ -8502,7 +8556,7 @@ private split_hint(name: string) -> string
     if n < 2 || !is_operator_spelling(name) || name == "++" || name == "--" then return ""
     val last = name[(n - 1)..<n]
     val head = name[0..<n - 1]
-    if (last == "-" || last == "+" || last == "!" || last == "~") && language_operator(head)
+    if (last == "-" || last == "+" || last == "!" || last == "~") && (language_operator(head) || compound_operator(head))
         return s"; `$head` followed by a prefix `$last` needs a space between them"
     ""
 
@@ -9993,6 +10047,11 @@ private tested_named(c: *Checker, name: string) -> bool
 // Checks a pattern against the type of the value it matches. `no_bind` is empty where the pattern
 // may bind names, and otherwise says why it may not.
 private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &TPattern
+    val t = check_pattern_kind(c, p, ty, no_bind)
+    if c.index is Some(_) then index_pattern(c, p, t)
+    t
+
+private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &TPattern
     val unit = unit_of(c)
     p.kind match
         Wildcard -> TPattern(p.span, ty, PWildcard)
