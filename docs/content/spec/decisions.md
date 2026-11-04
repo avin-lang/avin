@@ -795,6 +795,24 @@ Settled by the user on 2026-11-04:
   already a free name. This amends the rule above. See [methods named by
   symbols](/spec/operators-and-control-flow/#methods-named-by-symbols).
 
+- **The arithmetic operators `+ - * / %` and the orderings `< <= > >=` are free method names on
+  data types, classes and traits, with any operand and result types** (user, 2026-11-04), beside
+  the operator traits, which stay for generic code: `Instant + Duration -> Instant`,
+  `Instant - Instant -> Duration`, `Vec * real`. Such methods overload by the operand's type like
+  any other. `a + b` calls `a`'s method `+` where `a`'s type (a data type, a class, or a type
+  parameter through its bounds) has one taking one argument, at the built-in operator's own
+  precedence; where it has none, the operator is the core trait's (`Add`'s `add`), as before. The
+  method is just a method: on a type with both, the operator calls the method and code bounded by
+  `Add` calls `add`. Prefix `-a` calls a method `-` taking no argument (`-() -> Vec`), and otherwise
+  is `Neg`'s `negate`. `a < b` alone calls the method `<`, whatever it yields; a comparison by a
+  method does not chain, and `a < b < c` through one is an error saying to join the comparisons with
+  `&&`. `x += y` calls `+=` where the type has one and is otherwise `x = x + y`, the method `+`
+  included. The built-in types keep their operators: a method of one of these names on `int`,
+  `real`, `byte`, `char`, `string`, `bool` or a tuple, by an extension or a trait implementation, is
+  an error. `==` and `!=` stay `Eq`'s, and the wrapping, saturating and yielding forms stay
+  reserved. `avin.time` spells its reading arithmetic with them. This amends the two rules above.
+  See [methods named by symbols](/spec/operators-and-control-flow/#methods-named-by-symbols).
+
 - **`not` is a soft keyword: a keyword only directly after `is`** (user, 2026-11-04), so the parsing
   library can name its negative lookahead `not(p)`. After `is` it is always the keyword, so `x is
   not(y)` negates the pattern `(y)`; everywhere else it is an ordinary name, and a function, method,
@@ -1130,8 +1148,9 @@ Settled by the user on 2026-11-04:
 - [`avin.time`](/spec/system-library/#avintime): `Duration`, `Instant` (monotonic) and `WallTime`
   (wall clock, a `Duration` since the 1970 epoch) are data types counting whole microseconds in a
   `long`, overflow trapping; the two clocks are distinct types so their readings never mix. A
-  duration implements `Add`, `Sub`, `Neg`; an instant combines with a duration through `plus`,
-  `minus` and `since`, because an operator trait takes and yields the implementing type alone. The
+  duration implements `Add`, `Sub`, `Neg`, and scales by a `long` with its methods `*` and `/`; a
+  reading combines with a duration through its methods `+` and `-`, and two readings of one clock
+  through `-` (or `since`), which yields their `Duration`. The
   text forms are a duration's largest-unit form (`1.5ms`) and an ISO 8601 UTC timestamp. Sleeping
   and calendar fields beyond the timestamp text are not part of it yet.
 

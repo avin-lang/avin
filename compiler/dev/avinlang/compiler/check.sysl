@@ -1614,6 +1614,12 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
     if bitwise_method_name(f.name) && (*target is Int(_) || *target is Byte)
         c.note(unit, f.name_span, s"`${f.name}` is the language's operator on ${type_name(target)}, and no method can redefine it")
         return
+    // So are the arithmetic and orderings of every built-in type: only a data type, a class or a trait
+    // has methods of those names, and an impl for every type would reach the built-in ones.
+    if arithmetic_method_name(f.name) && !(*target is Data(_, _, _) || *target is Class(_, _, _))
+        if *target is TypeVar(_, _, _) then c.note(unit, f.name_span, s"`${f.name}` names a method only of a data type, a class or a trait, and an impl for every type would redefine the built-in types' operator")
+        else c.note(unit, f.name_span, s"`${f.name}` is the language's operator on ${type_name(target)}, and no method can redefine it")
+        return
     var same_name: Buf[usize] = buf()
     for tm in c.trait_methods
         val other = c.symbols[tm.function]
@@ -2807,6 +2813,11 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
         if a.name != "intrinsic" || !builtin || trait_id is Some(_)
             c.note(unit, f.name_span, "annotations on methods are not implemented")
             break
+    // A built-in type's arithmetic and orderings are the machine's, which no method replaces, in a
+    // trait's implementation either.
+    if arithmetic_method_name(f.name) && !(*target is Data(_, _, _))
+        c.note(unit, f.name_span, s"`${f.name}` is the language's operator on ${type_name(target)}, and no method can redefine it")
+        return
     if trait_id is Some(_) || overrides then refuse_override_defaults(c, unit, f)
     if trait_id is Some(t)
         if !trait_declares(c, t, f.name, 0)
@@ -7088,9 +7099,9 @@ private compound_assign(c: *Checker, e: &Expr, target: &Expr, spelling: string, 
             if !takes_one_argument(c, ms) then result = infix_arity_error(c, e.span, op_span, target, spelling, ms, args)
             else result = call_method(c, e.span, op_span, current, spelling, ms, args, None, None, false)
         elif op is Some(o)
-            // `x |= y` on a type with a method `|` and none `|=` is `x = x | y`, and `x <<= y` is
-            // `x = x << y` the same way.
-            if bitwise_method(c, o, current.ty) then result = assign_place(c, e, place, None, Expr(e.span, Binary(o, place, value, op_span)), false, op_span)
+            // `x |= y` on a type with a method `|` and none `|=` is `x = x | y`, and `x <<= y` and
+            // `x += y` are `x = x << y` and `x = x + y` the same way.
+            if operator_method(c, o, current.ty) then result = assign_place(c, e, place, None, Expr(e.span, Binary(o, place, value, op_span)), false, op_span)
             else result = assign_place(c, e, place, op, value, false, op_span)
         else
             val name = spelling[0..<spelling.bytes.len - 1]
@@ -7649,7 +7660,11 @@ private unary_expr(c: *Checker, e: &Expr, op: UnaryOp, operand: &Expr, wanted: O
         return integer_literal(c, e.span, spelling, true, expected)
     if op is Negate && operand.kind is RealLit(value) then return TExpr(e.span, Real, RealConst(-value))
     val x = check_expr(c, operand, expected)
-    // On a type parameter, a data type or a class, `-` is `Neg`'s `negate`.
+    // On a data type, a class or a type parameter with a method `-` taking no argument, `-a` calls it.
+    if op is Negate && has_operator_traits(zonk(c, x.ty)) && settled(zonk(c, x.ty))
+        val ms = methods_of(c, zonk(c, x.ty), "-")
+        if takes_no_argument(c, ms) then return call_method(c, e.span, e.span, x, "-", ms, buf(), None, wanted, false)
+    // Otherwise `-` is `Neg`'s `negate` there.
     if op is Negate && has_operator_traits(zonk(c, x.ty))
         if !operator_conforms(c, e.span, "-", zonk(c, x.ty), "Neg") then return TExpr(e.span, ErrorType, UnitConst)
         return TExpr(e.span, zonk(c, x.ty), Negate(x))
@@ -7677,20 +7692,27 @@ private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Ex
         val r = check_expr(c, right, expected)
         return operate(c, e.span, op_span, op, binary_spelling(op), check_expr(c, left, Some(r.ty)), r)
     val l = check_expr(c, left, expected)
-    if bitwise_method(c, op, l.ty) then return bitwise_call(c, e.span, op_span, left, l, binary_spelling(op), right, expected)
+    if operator_method(c, op, l.ty) then return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), right, expected)
     operate(c, e.span, op_span, op, binary_spelling(op), l, check_expr(c, right, Some(l.ty)))
 
-/** Whether `a op b` with `a` of type `t` calls `a`'s method named `op`: `op` is `&`, `^`, `|`, `<<` or
+/** Whether `a op b` with `a` of type `t` calls `a`'s method named `op`. `op` is `&`, `^`, `|`, `<<` or
  * `>>`, and `t` is not an integer or a byte, whose bitwise and shift operators are the machine's, but
- * has such a method. */
-private bitwise_method(c: *Checker, op: BinaryOp, t: &Type) -> bool
-    if !(op is BitAnd || op is BitOr || op is BitXor || op is ShiftLeft || op is ShiftRight) then return false
+ * has such a method; or `op` is `+`, `-`, `*`, `/` or `%`, and `t` is a data type, a class or a type
+ * parameter with a method of that name taking one argument. Where it has none, the operator is its
+ * core trait's. */
+private operator_method(c: *Checker, op: BinaryOp, t: &Type) -> bool
     val known = zonk(c, t)
-    if *known is Int(_) || *known is Byte || !settled(known) then return false
-    methods_of(c, known, binary_spelling(op)).len() > 0
+    if !settled(known) then return false
+    val name = binary_spelling(op)
+    if op is BitAnd || op is BitOr || op is BitXor || op is ShiftLeft || op is ShiftRight
+        if *known is Int(_) || *known is Byte then return false
+        return methods_of(c, known, name).len() > 0
+    if !arithmetic_method_name(name) || !has_operator_traits(known) then return false
+    takes_one_argument(c, methods_of(c, known, name))
 
-// `a | b` on a type with a method `|` is the call `a.|(b)`, as a symbol method's infix call is.
-private bitwise_call(c: *Checker, at: Span, op_span: Span, left: &Expr, receiver: &TExpr, name: string, right: &Expr, expected: Option[&Type]) -> &TExpr
+// `a | b` on a type with a method `|` is the call `a.|(b)`, as a symbol method's infix call is, and
+// `a + b` on a type with a method `+` is `a.+(b)`.
+private operator_method_call(c: *Checker, at: Span, op_span: Span, left: &Expr, receiver: &TExpr, name: string, right: &Expr, expected: Option[&Type]) -> &TExpr
     val ms = methods_of(c, receiver.ty, name)
     var args: Buf[Argument] = buf()
     args.push(Argument(right.span, None, right, false))
@@ -7752,12 +7774,18 @@ private has_operator_traits(t: &Type) -> bool = *t match
 private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[CompareOp]) -> &TExpr
     var early: Buf[Option[&TExpr]] = buf()
     var anchor: Option[&Type] = None
+    // `a < b` alone, on a type with a method `<` taking one argument, calls it, whatever it yields.
+    var first: Option[&TExpr] = None
+    if ops.len() == 1 && ordering_op(ops[0]) && !is_literal(operands[0]) && !is_collection_literal(operands[0])
+        val l = check_expr(c, operands[0], None)
+        if ordering_method(c, ops[0], l.ty) then return operator_method_call(c, e.span, e.span, operands[0], l, compare_spelling(ops[0]), operands[1], None)
+        first = Some(l)
     // A number or collection literal takes its type from another operand: `xs == [1, 2]` builds the
     // collection `xs` is.
     for o in operands
         if is_literal(o) || is_collection_literal(o) then early.push(None)
         else
-            val t = check_expr(c, o, None)
+            val t = if early.len() == 0 && first is Some(_) then first.unwrap() else check_expr(c, o, None)
             if anchor is None && settled(t.ty) then anchor = Some(t.ty)
             early.push(Some(t))
     var typed: Buf[&TExpr] = buf()
@@ -7780,6 +7808,15 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
     for t in typed
         if *t.ty is Nothing then ty = Nothing
     TExpr(e.span, ty, Compare(typed, ops))
+
+private ordering_op(op: CompareOp) -> bool = op is Less || op is LessEqual || op is Greater || op is GreaterEqual
+
+/** Whether `a op b` with `a` of type `t` calls `a`'s method named `op`: `op` is `<`, `<=`, `>` or
+ * `>=`, and `t` is a data type, a class or a type parameter with a method of that name taking one
+ * argument. Where it has none, the comparison is `Ord`'s. */
+private ordering_method(c: *Checker, op: CompareOp, t: &Type) -> bool
+    val known = zonk(c, t)
+    settled(known) && has_operator_traits(known) && takes_one_argument(c, methods_of(c, known, compare_spelling(op)))
 
 private is_trait_type(c: *Checker, t: &Type) -> bool = *t match
     Class(id, _, _) -> is_trait(c, id)
@@ -7847,6 +7884,10 @@ private equality_link(c: *Checker, at: Span, spelling: string, x: &Type, y: &Typ
 // `<`, `<=`, `>` and `>=` are `Ord`'s: the numbers, chars, bytes and strings have them, and a type
 // parameter, a data type or a class through `Ord`.
 private ordering_link(c: *Checker, at: Span, spelling: string, x: &Type, y: &Type)
+    // A method `<` is a call of its own, which may yield anything, and so is not a link of a chain.
+    if has_operator_traits(x) && takes_one_argument(c, methods_of(c, x, spelling))
+        c.note(unit_of(c), at, s"`$spelling` is a method of ${type_name(x)}, and a comparison by a method does not chain; join the comparisons with `&&`")
+        return
     if !same_type(x, y)
         c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(x)} with ${type_name(y)}")
         return
@@ -9640,6 +9681,18 @@ private takes_one_argument(c: *Checker, ms: Buf[usize]) -> bool
             if repeated && i + 1 == s.params.len() then continue
             if i >= s.defaults.len() || s.defaults[i] is None then required += 1
         if required <= 1 && s.params.len() >= 2 then return true
+    false
+
+// Whether one of the methods `ms` can be called with no argument: the method `-` a prefix `-` calls.
+private takes_no_argument(c: *Checker, ms: Buf[usize]) -> bool
+    for m in ms
+        val s = c.symbols[m]
+        var required = 0usize
+        val repeated = declares_variadic(s.decl)
+        for i in 1..<s.params.len()
+            if repeated && i + 1 == s.params.len() then continue
+            if i >= s.defaults.len() || s.defaults[i] is None then required += 1
+        if required == 0 then return true
     false
 
 // An infix call of a method that takes some other number of arguments. A tuple written as the
