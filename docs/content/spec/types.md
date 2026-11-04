@@ -106,6 +106,7 @@ most the largest `int` bytes.
 | `indexOf(p)`, `indexOf(p, from)` | `Some` of the byte offset of the first `p`, at or after `from` (default 0; below 0 counts as 0); `None` when there is none or `from` is past the end. The empty string is found at `from` |
 | `lastIndexOf(p)` | `Some` of the byte offset of the last `p`; `None` when there is none. The empty string is found at `byteLength()` |
 | `chars()` | The characters, in order, as a `Vector[char]` |
+| `bytes()` | The bytes of the encoding, in order, as a `Vector[byte]` |
 | `count(p)` | The number of characters satisfying `p` |
 | `split(sep)` | The pieces between the occurrences of `sep`, as a `Vector[string]`; empty pieces are kept (`",a,,b,".split(",")` has five pieces), and a string without `sep` is one piece. An empty `sep` traps |
 | `lines()` | The lines as a `Vector[string]`, each ended by `\n` or `\r\n` and shown without it; a terminator at the very end starts no further line, so `"a\nb\n".lines()` is two lines and `""` has none. A `\r` not before `\n` stays in its line |
