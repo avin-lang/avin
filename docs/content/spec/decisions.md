@@ -315,8 +315,15 @@ a decision changes, this page and the chapter change together.
   operators have, in the core library, and an operator on a built-in type is the machine's
   operation, in generic instances too.
 - Settled 2026-11-03: an impl of a trait may bound the type's parameters further (`impl[T: Ord] Ord
-  for Box[T]`), making the type conform only for type arguments meeting them; for now only on data
-  types and traits that are only bounds.
+  for Box[T]`), making the type conform only for type arguments meeting them; on data types and
+  classes, for any trait.
+- Settled 2026-11-03: a conformance through such an impl to a trait that is also a type holds
+  wherever one is decided: at conversions (as a covariant type argument too), in type patterns, and
+  for calls of the trait's methods, which an instance missing the bounds does not have.
+- Settled 2026-11-03: a generic type's derived `Ord`, `Display` and `Debug` are impls bounding each
+  parameter by the trait, so they hold where the type arguments implement it.
+- Settled 2026-11-03: arrays compare and hash by contents (`===` stays identity); arrays and lists
+  display as `[1, 2, 3]`, their `Debug` as `["a", "b"]`, each only when the elements do.
 - Settled 2026-11-03: `derives` takes `Eq`, `Hash`, `Ord`, `Display` and `Debug`. A class derives
   from its constructor parameters, plain, `val` and `var` alike, and not from fields its body
   declares; a data type from each variant's fields. A class derives `Eq` and `Hash` together, and
@@ -336,6 +343,12 @@ a decision changes, this page and the chapter change together.
   contravariant use decides it for good. Two classes with no common superclass join to the one trait
   they share that every other trait they share is a parent of; sharing several unrelated traits is
   no join, an error naming them, rather than a choice among them. The same holds for branches.
+- Settled 2026-11-03: the names an [`is` pattern](/spec/operators-and-control-flow/#is) binds are in
+  scope where its test is known to have matched: the `then` branch of an `if`, the body of a
+  `while`, the right operand of `&&`, and for `is not` the `else` branches and the right operand of
+  `||`, with `!` swapping the two. After an `if` whose one branch never finishes, the rest of the
+  block sees the other branch's names. `a is P(v) || b is P(v)` binds no `v` for the whole. A
+  condition binds a name once, and its names may shadow the enclosing block's.
 
 **Project and tooling**
 
