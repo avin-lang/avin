@@ -1015,8 +1015,11 @@ Settled by the user on 2026-11-04:
   all. `==` between two sequence types needs the same element type on both sides (a `Vector[int]`
   and a `List[string]` are a compile-time error, as any two types with no common type are); a
   value typed as `Seq[T]` compares with any sequence. A class that implements `Eq` itself keeps its
-  own equality between two of its instances. Through `Any` the values' own types still decide, so
-  a vector and a list held as `Any` are unequal. The mutable `Array`, `Buffer` and `Deque` compare
+  own equality between two of its instances. Settled (user, 2026-11-04): through `Any` and
+  trait-typed values sequences of equal elements in order are equal whatever their class, with
+  hashes that agree (`val a: Any = [1, 2]; a == List(1, 2)` is `true`); the elements are compared
+  as `Any` values are, so `[1] == ["a"]` held as `Any` is `false`. An `Array` is a `Seq` here and
+  compares by contents, as it already did. The mutable `Array`, `Buffer` and `Deque` compare
   as they are when the comparison runs, so a hash held across a change is stale, as it was before.
 - Ranges of other integer types as values (`Range[long]`, `Range[i16]`) are not decided. The
   endpoint type would be an `[T: Integer]` parameter, but the count of a range of `long`s or of

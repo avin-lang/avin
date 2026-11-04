@@ -590,7 +590,10 @@ list each of them takes time proportional to its length.
 and hash alike, whichever kinds they are, so `[1, 2, 3] == List(1, 2, 3)` and `[1, 2, 3] == (1..3)`
 are `true`, and a `Seq[int]` key finds an entry stored under a vector, a list or a range of the same
 elements. The two sides need the same element type. A class of the program's own that implements
-`Seq` is compared the same way unless it implements `Eq` itself.
+`Seq` is compared the same way unless it implements `Eq` itself. The same holds through `Any` and
+trait-typed values: an `Any` holding a vector equals a list of the same elements, compared element
+by element as `Any` values are, and the hashes agree, so a set or map keyed by `Any` finds a
+sequence under any class of the same elements.
 
 ```text
 total(xs: Seq[int]) -> int = xs.foldLeft(0, (acc, x) -> acc + x)
