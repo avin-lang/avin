@@ -700,6 +700,8 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool) -> Che
                     _ -> false
             if main.params.len() > 1 || (main.params.len() == 1 && !takes_arguments && !(*main.params[0] is ErrorType))
                 c.note(main_unit, main.decl.name_span, "`main` is `main()` or `main(args: Vector[string])`")
+            elif takes_arguments && declares_variadic(main.decl)
+                c.note(main_unit, main.decl.name_span, "`main`'s `args` is not a repeated parameter; `main` is `main()` or `main(args: Vector[string])`")
             if takes_arguments && main.defaults.len() > 0 && main.defaults[0] is Some(_)
                 c.note(main_unit, main.decl.name_span, "`main`'s `args` has no default; `main` is `main()` or `main(args: Vector[string])`")
             if main.decl.type_params.len() > 0 then c.note(main_unit, main.decl.name_span, "`main` cannot be generic")
@@ -1677,7 +1679,9 @@ private declare_fields(c: *Checker, unit: usize)
                 Name(n) -> n
                 _ -> "_"
             if field_named(fields, name) is Some(_) then c.note(unit, cp.param.pattern.span, s"the field `$name` is declared more than once")
-            fields.push(FieldSymbol(name, cp.param.pattern.span, Some(resolve_type(c, unit, cp.param.ty)), cp.mutable, cp.public, true, id))
+            val written = resolve_type(c, unit, cp.param.ty)
+            val field_type = if cp.param.variadic then vector_of(c, written) else written
+            fields.push(FieldSymbol(name, cp.param.pattern.span, Some(field_type), cp.mutable, cp.public, true, id))
         for m in d.members
             if m is FieldMember(f)
                 if field_named(fields, f.name) is Some(_) then c.note(unit, f.span, s"the field `${f.name}` is declared more than once")
@@ -3574,6 +3578,12 @@ private param_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) -> 
         val w = seen_from(c, self_type, base, want[i])
         val h = seen_from(c, self_type, m, have[i])
         if !same_type(h, w) then return Some(s"whose parameter `${c.symbols[base].param_names[i]}` is ${type_name(w)}, not ${type_name(h)}")
+    // A call through either method passes the same arguments, so both repeat their last parameter or
+    // neither does.
+    val repeats = declares_variadic(c.symbols[base].decl)
+    if repeats != declares_variadic(c.symbols[m].decl)
+        val last = c.symbols[base].param_names[want.len() - 1]
+        return Some(if repeats then s"whose parameter `$last` is repeated" else s"whose parameter `$last` is not repeated")
     None
 
 /** How method `m`'s result differs from that of `base`, which it overrides or implements for
@@ -3779,10 +3789,10 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
             _ ->
                 c.note(unit, p.pattern.span, "parameter patterns are not implemented")
                 names.push("_")
-        if p.variadic then c.note(unit, p.span, "repeated parameters are not implemented")
         if p.by_name && f.clauses.len() > 0
             c.note(unit, p.pattern.span, s"`${f.name}` is defined by clauses, which match its arguments, so its parameters cannot be by-name")
-        val ty = resolve_type(c, unit, p.ty)
+        val written = resolve_type(c, unit, p.ty)
+        val ty = if p.variadic then vector_of(c, written) else written
         if p.by_name && f.clauses.len() == 0 then params.push(ByName(ty)) else params.push(ty)
     var result: Option[&Type] = None
     if f.result is Some(r) then result = Some(resolve_type(c, unit, r))
@@ -4900,7 +4910,7 @@ private super_initialization(c: *Checker, receiver: &TExpr, sup: &Type, parent: 
         name_span = callee.span
     val s = c.classes[sid]
     val constructor = c.symbols[s.constructor]
-    val signature = Signature(s.name, true, constructor.type_params, class_owner(sid), constructor.params, constructor.param_names, constructor.defaults, Unit, sargs, None)
+    val signature = Signature(s.name, true, constructor.type_params, class_owner(sid), constructor.params, constructor.param_names, constructor.defaults, Unit, sargs, None, declares_variadic(constructor.decl))
     val outer = c.super_args
     c.super_args = true
     val applied = apply(c, parent.span, name_span, signature, args, None, None, buf())
@@ -5269,6 +5279,10 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Continue -> continue_expr(c, e)
     Return(value) -> return_expr(c, e, value)
     Propagate(value) -> propagate_expr(c, e, value)
+    Splice(value) ->
+        c.note(unit_of(c), e.span, "`*` after an argument passes a sequence as a repeated parameter's arguments; it is written only as the last argument of a call to a function with one")
+        check_statement(c, value)
+        TExpr(e.span, ErrorType, UnitConst)
     Match(subject, arms) -> match_expr(c, e, subject, arms, expected, used)
     Is(_, _, _) -> check_condition(c, e).expr
     Lambda(params, body) -> lambda_expr(c, e, params, body, expected, false)
@@ -7374,6 +7388,27 @@ is_array_class(k: ClassSymbol) -> bool = k.module_name == CoreModule && k.name =
 /** Whether a class is the core library's `Vector`, whose one field is the array of its elements. */
 is_vector_class(k: ClassSymbol) -> bool = k.module_name == CoreModule && k.name == "Vector" && !k.decl.object
 
+/** Whether a function's last parameter is repeated, `values: T*`. */
+declares_variadic(f: &Function) -> bool = f.params.len() > 0 && f.params[f.params.len() - 1].variadic
+
+/** `Vector[t]`: inside its function, a repeated parameter of element type `t` is a vector. */
+private vector_of(c: *Checker, t: &Type) -> &Type = core_class_of(c, "Vector", t)
+
+/** The core library's generic class or trait `name`, of the one type argument `t`. */
+private core_class_of(c: *Checker, name: string, t: &Type) -> &Type
+    c.class_types.get(qualified(CoreModule, name)) match
+        Some(k) ->
+            var args: Buf[&Type] = buf()
+            args.push(t)
+            Class(k, name, args)
+        None -> ErrorType
+
+/** The element type of a repeated parameter, from its type `Vector[T]` with the call's type
+ * arguments in place. */
+private repeated_element(t: &Type) -> &Type = *t match
+    Class(_, _, args) -> if args.len() == 1 then args[0] else ErrorType
+    _ -> ErrorType
+
 /** Whether `k` is one of the core library's classes whose objects are arrays: `Array`, or the
  * read-only `FrozenArray` a vector keeps its elements in. Their methods may be array intrinsics. */
 private is_array_storage(k: ClassSymbol) -> bool =
@@ -7572,7 +7607,7 @@ private call_function(c: *Checker, at: Span, name_span: Span, id: usize, args: B
 
 private function_signature(c: *Checker, id: usize, result: &Type) -> Signature
     val f = c.symbols[id]
-    Signature(f.name, true, f.type_params, f.type_owner, f.params, f.param_names, f.defaults, result, buf(), None)
+    Signature(f.name, true, f.type_params, f.type_owner, f.params, f.param_names, f.defaults, result, buf(), None, declares_variadic(f.decl))
 
 /** The overload a call chooses, if it chooses one, and its arguments as checked while choosing: one
  * entry per written argument, `None` for one left to be checked against the chosen parameter. */
@@ -7624,12 +7659,12 @@ private choose(c: *Checker, at: Span, name_span: Span, name: string, ids: Buf[us
         c.note(unit, name_span, s"no overload of `$name` accepts these arguments; the overloads are ${overload_list(c, ids)}")
         return Choice(None, typed)
     for j in 0..<args.len()
-        val value = args[j].value
+        val value = argument_value(args[j])
         var delayed = false
         var agree = true
-        val shared = views[0][bindings[0].targets[j].unwrap()]
+        val shared = argument_type(c, bound_signatures[0], views[0], bindings[0], args, j).unwrap()
         for k in 0..<bound.len()
-            val p = views[k][bindings[k].targets[j].unwrap()]
+            val p = argument_type(c, bound_signatures[k], views[k], bindings[k], args, j).unwrap()
             if *p is ByName(_) then delayed = true
             if bound_signatures[k].type_params.len() > bound_signatures[k].known.len() || !same_type(p, shared) then agree = false
         if takes_parameter_type(value) || is_literal(value) then typed.push(None)
@@ -7637,12 +7672,17 @@ private choose(c: *Checker, at: Span, name_span: Span, name: string, ids: Buf[us
         else typed.push(Some(check_expr(c, value, if agree then Some(shared) else None)))
     var fitting: Buf[usize] = buf()
     var compared: Buf[Buf[&Type]] = buf()
+    // A candidate with a repeated parameter is chosen only where no candidate without one fits.
+    var fixed_fits = false
     for k in 0..<bound.len()
+        if !bound_signatures[k].variadic && fits_call(c, bound_signatures[k], bindings[k], args, typed, written) then fixed_fits = true
+    for k in 0..<bound.len()
+        if fixed_fits && bound_signatures[k].variadic then continue
         if !fits_call(c, bound_signatures[k], bindings[k], args, typed, written) then continue
         fitting.push(bound[k])
         var params: Buf[&Type] = buf()
-        for t in bindings[k].targets
-            params.push(views[k][t.unwrap()])
+        for j in 0..<args.len()
+            params.push(argument_type(c, bound_signatures[k], views[k], bindings[k], args, j).unwrap())
         compared.push(params)
     if fitting.len() == 0
         c.note(unit, name_span, s"no overload of `$name` accepts these arguments; the overloads are ${overload_list(c, ids)}")
@@ -7740,16 +7780,19 @@ private fits_call(c: *Checker, s: Signature, binding: Binding, args: Buf[Argumen
         unify(c, type_args[s.known.len() + i], written[i])
     var open = open_type_args(c, type_args, s.known.len())
     var ok = true
+    val params = substitute_all(s.params, s.owner, type_args)
     for j in 0..<args.len()
         if typed[j] is Some(t)
-            val p = strict(substitute(s.params[binding.targets[j].unwrap()], s.owner, type_args))
+            val p = strict(argument_type(c, s, params, binding, args, j).unwrap())
+            // A sequence spliced into a repeated parameter is any `Iterable` of its elements.
+            val spliced = args[j].value.kind is Splice(_)
             if ok && !(*t.ty is Nothing)
-                val agrees = if mentions_open(p, &open) then constrain(c, p, strict(t.ty), &open, true) else unify(c, p, strict(t.ty))
+                val agrees = if mentions_open(p, &open) || spliced then constrain(c, p, strict(t.ty), &open, true) else unify(c, p, strict(t.ty))
                 if !agrees then ok = false
     for j in 0..<args.len()
         if ok && typed[j] is None
-            val p = zonk(c, strict(substitute(s.params[binding.targets[j].unwrap()], s.owner, type_args)))
-            if !open_argument_fits(args[j].value, p) then ok = false
+            val p = zonk(c, strict(argument_type(c, s, params, binding, args, j).unwrap()))
+            if !open_argument_fits(argument_value(args[j]), p) then ok = false
     restore_vars(c, saved)
     ok
 
@@ -7988,7 +8031,10 @@ private takes_one_argument(c: *Checker, ms: Buf[usize]) -> bool
     for m in ms
         val s = c.symbols[m]
         var required = 0usize
+        // A repeated parameter takes zero arguments or more, so it is never required.
+        val repeated = declares_variadic(s.decl)
         for i in 1..<s.params.len()
+            if repeated && i + 1 == s.params.len() then continue
             if i >= s.defaults.len() || s.defaults[i] is None then required += 1
         if required <= 1 && s.params.len() >= 2 then return true
     false
@@ -8080,7 +8126,7 @@ private method_signature(c: *Checker, receiver: &TExpr, m: usize, result: &Type)
         params.push(with_self(c, m, receiver.ty, target.params[i]))
         names.push(target.param_names[i])
         defaults.push(if i < target.defaults.len() then target.defaults[i] else None)
-    Signature(target.decl.name, true, target.type_params, target.type_owner, params, names, defaults, with_self(c, m, receiver.ty, result), known, Some(receiver))
+    Signature(target.decl.name, true, target.type_params, target.type_owner, params, names, defaults, with_self(c, m, receiver.ty, result), known, Some(receiver), declares_variadic(target.decl))
 
 /** Type `t` of method `m` with the `Self` of a trait declaring `m` as the receiver's type. */
 private with_self(c: *Checker, m: usize, receiver_type: &Type, t: &Type) -> &Type
@@ -8275,7 +8321,7 @@ private construct(c: *Checker, at: Span, name_span: Span, v: VariantRef, args: B
     val d = c.data[v.data]
     val variant = d.variants[v.index]
     val called = variant.fields.len() > 0
-    val signature = Signature(variant.name, called, d.decl.type_params, data_owner(v.data), variant.fields, variant.field_names, variant.defaults, own_type(d, v.data), buf(), None)
+    val signature = Signature(variant.name, called, d.decl.type_params, data_owner(v.data), variant.fields, variant.field_names, variant.defaults, own_type(d, v.data), buf(), None, false)
     val applied = apply(c, at, name_span, signature, args, explicit, expected, buf())
     applied.wrap(at, Construct(v.index, applied.args))
 
@@ -8297,6 +8343,9 @@ private struct Signature
     known: Buf[&Type]
     /** A method's receiver, as the call holds it: its defaults take it before the parameters. */
     receiver: Option[&TExpr]
+    /** Whether the last parameter is repeated: its type is `Vector[T]`, and the call gives it any
+     * number of `T`s, or one sequence spliced with `xs*`. */
+    variadic: bool
 
 /** A call's arguments, one per parameter in parameter order, its solved type arguments, and its
  * result type. `prelude` evaluates what the call needs first: the written arguments in the order
@@ -8344,8 +8393,12 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
     var fits = true
     var named = false
     var positional = 0usize
+    // A repeated parameter takes every positional argument from its position on, or one sequence
+    // spliced with `xs*` as the only one.
+    val repeated: Option[usize] = if s.variadic then Some(s.params.len() - 1) else None
     for j in 0..<args.len()
         val a = args[j]
+        val spliced = a.value.kind is Splice(_)
         a.name match
             None ->
                 if named
@@ -8354,6 +8407,23 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
                     targets.push(None)
                     continue
                 positional += 1
+                if repeated is Some(r)
+                    if j >= r
+                        if spliced && (j != r || j + 1 < args.len())
+                            if report then c.note(unit, a.span, s"a spliced sequence is the only argument of the repeated parameter `${s.names[r]}`; write the other elements into the sequence")
+                            fits = false
+                        elif !spliced && j > r && args[r].value.kind is Splice(_)
+                            fits = false
+                        if slots[r] is None then slots.set(r, Some(j))
+                        targets.push(Some(r))
+                        continue
+                if spliced
+                    if report
+                        val given = if j < s.params.len() then s"`${s.names[j]}`, which is not repeated" else "no parameter"
+                        c.note(unit, a.span, s"`*` passes a sequence to a repeated parameter, but this argument of `${s.name}` is given to $given")
+                    fits = false
+                    targets.push(None)
+                    continue
                 if j < s.params.len()
                     slots.set(j, Some(j))
                     targets.push(Some(j))
@@ -8363,6 +8433,14 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
                 var k: Option[usize] = None
                 for i in 0..<s.names.len()
                     if s.names[i] == n && n != "_" then k = Some(i)
+                if k is Some(i) && repeated == Some(i)
+                    if report then c.note(unit, a.span, s"`$n` is a repeated parameter, given its arguments by position: `${s.name}(…, a, b)` or `${s.name}(…, xs*)`")
+                    fits = false
+                    targets.push(None)
+                    continue
+                if spliced
+                    if report then c.note(unit, a.span, "`*` passes a sequence to a repeated parameter, by position, not to a named argument")
+                    fits = false
                 k match
                     None ->
                         if report then c.note(unit, a.span, s"`${s.name}` has no $noun `$n`")
@@ -8379,7 +8457,7 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
     var has_defaults = false
     for d in s.defaults
         if d is Some(_) then has_defaults = true
-    if positional > s.params.len()
+    if positional > s.params.len() && !s.variadic
         if report then c.note(unit, at, s"`${s.name}` takes ${count(s.params.len(), "argument")}, not $positional")
         return Binding(slots, targets, false)
     // A call already reported for a misplaced or misnamed argument is not also reported for the
@@ -8387,11 +8465,13 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
     if !fits then return Binding(slots, targets, false)
     var missing: Buf[string] = buf()
     for i in 0..<s.params.len()
-        if slots[i] is None && s.defaults[i] is None then missing.push(s.names[i])
+        if slots[i] is None && s.defaults[i] is None && repeated != Some(i) then missing.push(s.names[i])
     if missing.len() > 0
         fits = false
         if !report then return Binding(slots, targets, false)
-        if !named && !has_defaults
+        if !named && !has_defaults && s.variadic
+            c.note(unit, at, s"`${s.name}` takes at least ${count(s.params.len() - 1, "argument")}, not ${args.len()}")
+        elif !named && !has_defaults
             c.note(unit, at, s"`${s.name}` takes ${count(s.params.len(), "argument")}, not ${args.len()}")
         else
             for m in missing
@@ -8410,7 +8490,7 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     val params = s.params
     val result = s.result
     val known = s.known
-    val binding = bind_arguments(c, at, s, args, true)
+    var binding = bind_arguments(c, at, s, args, true)
     val first = c.vars.len()
     var type_args: Buf[&Type] = buf()
     for i in 0..<type_params.len()
@@ -8427,10 +8507,14 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     val declared = substitute(result, owner, type_args)
     if expected is Some(want) then unify(c, declared, want)
     var targets: Buf[Option[&Type]] = buf()
-    for t in binding.targets
-        targets.push(if t is Some(i) then Some(wanted[i]) else None)
+    for j in 0..<binding.targets.len()
+        targets.push(argument_type(c, s, wanted, binding, args, j))
     var open = open_type_args(c, type_args, known.len())
-    val typed = check_arguments(c, args, targets, checked, &open)
+    // Binding has placed, or reported, each spliced sequence, which is checked as the sequence it is.
+    var passed_args: Buf[Argument] = buf()
+    for a in args
+        passed_args.push(Argument(a.span, a.name, argument_value(a)))
+    var typed = check_arguments(c, passed_args, targets, checked, &open)
     // A type argument the arguments settled settles those its bounds name: `[S: Source[A], A]`
     // takes `A` from the source `S` is.
     for i in known.len()..<type_params.len()
@@ -8474,6 +8558,12 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     var ty = zonk(c, declared)
     for t in typed
         if *t.ty is Nothing then ty = Nothing
+    // The arguments of a repeated parameter become one vector, made where the first of them is
+    // written, or after the others when there are none.
+    if s.variadic && binding.fits
+        val packed = pack_repeated(c, at, wanted, binding, args, typed)
+        typed = packed.typed
+        binding = packed.binding
     // Arguments written in parameter order with none omitted are passed as they are; otherwise each
     // written argument is held in a local, in the order written, and the omitted ones' defaults are
     // computed after them, in parameter order, each from the parameters before it.
@@ -8510,6 +8600,104 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
                 prelude.push(TExpr(at, Unit, Let(local, TExpr(at, wanted_ty, Call(default, before, default_type_args(c, s, default, solved))))))
                 passed.push(TExpr(at, wanted_ty, Local(local)))
     Applied(passed, solved, ty, prelude, false)
+
+/** The type written argument `j` is checked against, of the parameter types `params` (with the
+ * call's type arguments in place): its parameter's, or for an argument of a repeated parameter of
+ * type `Vector[T]`, the element type `T`; a sequence spliced into it is any `Iterable[T]`. None for
+ * an argument that fits no parameter. */
+private argument_type(c: *Checker, s: Signature, params: Buf[&Type], binding: Binding, args: Buf[Argument], j: usize) -> Option[&Type]
+    val i = binding.targets[j] match
+        Some(i) -> i
+        None -> return None
+    if !s.variadic || i + 1 != params.len() then return Some(params[i])
+    val element = repeated_element(params[i])
+    if args[j].value.kind is Splice(_) then Some(core_class_of(c, "Iterable", element)) else Some(element)
+
+/** The expression an argument passes: the sequence itself for one spliced with `xs*`. */
+private argument_value(a: Argument) -> &Expr = a.value.kind match
+    Splice(inner) -> inner
+    _ -> a.value
+
+/** A call's checked arguments and their binding after a repeated parameter's are made one vector. */
+private struct Packed
+    typed: Buf[&TExpr]
+    binding: Binding
+
+// Replaces the arguments of the repeated parameter, the last of `params`, with the vector they make,
+// at the place of the first of them; with none, an empty vector follows the other arguments.
+private pack_repeated(c: *Checker, at: Span, params: Buf[&Type], binding: Binding, args: Buf[Argument], typed: Buf[&TExpr]) -> Packed
+    val r = params.len() - 1
+    val element = zonk(c, repeated_element(params[r]))
+    var out: Buf[&TExpr] = buf()
+    var targets: Buf[Option[usize]] = buf()
+    var items: Buf[&TExpr] = buf()
+    var spliced: Option[&TExpr] = None
+    var place: Option[usize] = None
+    for j in 0..<typed.len()
+        if binding.targets[j] == Some(r)
+            if place is None
+                place = Some(out.len())
+                out.push(typed[j])
+                targets.push(Some(r))
+            if args[j].value.kind is Splice(_) then spliced = Some(typed[j]) else items.push(typed[j])
+        else
+            out.push(typed[j])
+            targets.push(binding.targets[j])
+    val vector = repeated_vector(c, at, element, items, spliced)
+    place match
+        Some(k) -> out.set(k, vector)
+        None ->
+            out.push(vector)
+            targets.push(Some(r))
+    var slots: Buf[Option[usize]] = buf()
+    for _ in params
+        slots.push(None)
+    for k in 0..<targets.len()
+        if targets[k] is Some(i) then slots.set(i, Some(k))
+    Packed(out, Binding(slots, targets, true))
+
+// The vector a repeated parameter of element type `element` receives: `items` in order, through the
+// core library's vector builder, or the sequence `spliced` as a vector. A spliced vector of that very
+// type is passed as it is; any other sequence is copied.
+private repeated_vector(c: *Checker, at: Span, element: &Type, items: Buf[&TExpr], spliced: Option[&TExpr]) -> &TExpr
+    val unit = unit_of(c)
+    val vector = vector_of(c, element)
+    if spliced is Some(xs)
+        if same_type(zonk(c, xs.ty), vector) || *xs.ty is Nothing || *xs.ty is ErrorType then return xs
+    val o = c.class_types.get(qualified(CoreModule, "Vector")) match
+        Some(k) -> c.classes[k].companion
+        None -> None
+    val companion = o match
+        Some(o) -> o
+        None ->
+            c.note(unit, at, "a repeated parameter needs the core library's `Vector`")
+            return TExpr(at, ErrorType, UnitConst)
+    val builder = call_method(c, at, at, global_read(c, at, c.classes[companion].global.unwrap()), "builder", methods_named(c, companion, "builder"), buf(), None, None, false)
+    *zonk(c, builder.ty) match
+        Class(_, _, a) -> if a.len() == 1 then unify(c, a[0], element)
+        _ -> return TExpr(at, ErrorType, UnitConst)
+    val held = hidden_local(c, builder.ty)
+    val receiver = TExpr(at, builder.ty, Local(held))
+    var steps: Buf[&TExpr] = buf()
+    steps.push(TExpr(at, Unit, Let(held, builder)))
+    val adding = if spliced is Some(_) then "addAll" else "add"
+    val ms = methods_of(c, builder.ty, adding)
+    if ms.len() != 1
+        c.note(unit, at, s"${type_name(builder.ty)} has no one `$adding` method to take a repeated parameter's arguments")
+        return TExpr(at, ErrorType, UnitConst)
+    val type_args = receiver_type_args(c, builder.ty, ms[0])
+    var given = items
+    if spliced is Some(xs)
+        given = buf()
+        given.push(xs)
+    for item in given
+        var call_args: Buf[&TExpr] = buf()
+        call_args.push(receiver)
+        call_args.push(item)
+        steps.push(TExpr(item.span, Unit, method_call_kind(c, builder.ty, ms[0], call_args, type_args, false)))
+    val result = call_method(c, at, at, receiver, "result", methods_of(c, builder.ty, "result"), buf(), None, None, false)
+    steps.push(result)
+    TExpr(at, zonk(c, result.ty), Block(steps))
 
 // The type arguments of a call of `default`, a default of the function `s` describes, made by a call
 // that solved `solved`. A method that overrides another takes that one's defaults, which belong to the
@@ -8550,7 +8738,7 @@ private check_arguments(c: *Checker, args: Buf[Argument], wanted: Buf[Option[&Ty
                         // once, at the call, by one that takes it strictly.
                         if param is Some(p)
                             if *given.ty is ByName(_) && !(*zonk(c, p) is ByName(_)) then t = evaluated(given)
-                            val agrees = *t.ty is Nothing || (if mentions_open(p, open) then constrain(c, p, t.ty, open, true) else unify(c, p, t.ty))
+                            val agrees = *t.ty is Nothing || constrain(c, p, t.ty, open, true)
                             if !agrees
                                 c.note(unit_of(c), value.span, mismatch(c, zonk(c, p), t.ty))
                         early.set(i, Some(t))

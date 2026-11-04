@@ -131,6 +131,14 @@ Choosing an overload works as follows:
   `f(x: -> int)` and `f(x: int)` are the same parameter types. An argument that some candidate takes
   by name is delayed, as that candidate needs it; when the chosen overload takes it strictly, it is
   evaluated once, at the call.
+- **Repeated parameters.** An overload with a [repeated parameter](#repeated-parameters) is a
+  candidate only where no overload without one accepts the call: `describe(n: int)` beside
+  `describe(ns: int*)` takes `describe(1)`, and `pick(x: long)` beside `pick(xs: int*)` takes
+  `pick(1)`, though the repeated one would take the literal as its own type. Among the candidates
+  with one, each argument given to it is compared by the element type, so `kind(xs: int*)` and
+  `kind(xs: string*)` are told apart by `kind(1, 2)` and `kind("a")`; `kind()` is ambiguous. Inside
+  the function the parameter is a vector, so `f(xs: int*)` and `f(xs: Vector[int])` have the same
+  parameter types.
 - **Scopes.** Overloads are the functions of one name in one scope: the top-level functions of one
   file, or the local functions of one block. A block's local functions of a name hide every outer
   function of that name, whatever their parameter types, and a program's own top-level functions of
@@ -142,8 +150,58 @@ Choosing an overload works as follows:
 Two declarations with the same name and the **same** parameter types are an error: a function that
 chooses by its arguments' values is written with clauses, described next.
 
-Variadic parameters are final and written `values: T*`. A call passes zero or more `T`s, or splices
-an existing sequence with `f(xs*)`.
+### Repeated parameters
+
+```text
+total(values: int*) -> int
+    var sum = 0
+    for v in values do sum += v
+    sum
+
+total()                                 // 0
+total(1, 2, 3)                          // 6
+val xs = [4, 5]
+total(xs*)                              // 9
+total((1..10)*)                         // 55
+max(0, xs*)                             // 5
+```
+
+A parameter written `values: T*` is **repeated** (variadic): a call gives it zero or more `T`s, and
+inside the function it is a `Vector[T]` of them, in the order written. The rules:
+
+- **It is the last parameter**, and there is at most one. It has a name, no default (a call that
+  gives it nothing passes an empty vector), and is not [by-name](/spec/by-name/). The parameters
+  before it may have defaults: `framed(left: string = "[", right: string = "]", items: int*)` is
+  called `framed()`, `framed("<", ">", 1, 2)` or `framed(right = ")")`.
+- **Its arguments are positional.** Every positional argument from its position on is one element,
+  checked against `T` like any argument, so a literal takes `T` and a lambda its parameter types
+  from it, and a generic `T` is inferred from them as from any arguments:
+  `max[T: Ord](first: T, rest: T*)` is called `max(3, 9, 4)`. A repeated parameter cannot be named
+  at a call, and the call's named arguments, which follow its positional ones, name only the
+  parameters before it.
+- **`xs*` splices a sequence**: written as the call's last argument, in the repeated parameter's
+  position, it passes the elements of `xs`, which is any `Iterable[T]`: a vector, a list, an array,
+  a range, a set. A `Vector[T]` is passed as it is; any other sequence is copied into a new vector.
+  The spliced sequence is the parameter's only argument: `f(1, 2, xs*)` gives the parameter both
+  `1, 2` and `xs`, and is an error, as is `xs*` given to a parameter that is not repeated, written
+  before another argument, named, or anywhere but a call's argument list. Writing the other
+  elements into the sequence, `f(([1, 2] ++ xs)*)`, says the same thing. The `*` binds as
+  multiplication does, so a spliced expression of a looser operator is parenthesized.
+- **The arguments are evaluated in the order written**, as any call's are, and the vector is made
+  from them before the call.
+- **Methods and constructors** take one the same way: a method of a class, a trait or an impl, a
+  method of an object, a local function, a function defined by clauses (whose clauses match the
+  vector: `f([]) = …`, `f([x]) = …`), and a class's constructor, whose field is then a vector:
+  `class Path(val parts: string*)` is made by `Path("usr", "bin")`, and a subclass passes its
+  superclass's repeated argument on with `: Path(parts*)`. A `data` field cannot be repeated. An
+  override, and a method implementing a trait's, repeats the same last parameter as the method it
+  overrides, or neither does.
+- **As a value**, a function with a repeated parameter takes the vector itself:
+  `val f: (Vector[int]) -> int = total` is called `f([1, 2])`, since a function value is called with
+  all of its arguments by position.
+- **Called infix**, a method whose parameters are a repeated one, or one required parameter and a
+  repeated one, takes the one argument: `w surround "!"` calls `w.surround("!")`.
+- **`main`** takes no repeated parameter: its one parameter is `args: Vector[string]`.
 
 ### Clauses
 
