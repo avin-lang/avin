@@ -128,16 +128,28 @@ emit_llvm(program: MirProgram) -> string
 // A program built for its tests runs one of them in each process: the one its first argument numbers,
 // counting from 0 in the order the checker found them. The module-level values are initialized
 // first, as for `main`, so a test sees the program as it starts; its arguments are its name alone,
-// since the number is the runner's and not the test's. A test that returns exits 0; one that
-// fails stops the process, and the runner reads which way it went. A missing or unknown number exits
-// 2.
+// since the number is the runner's and not the test's. A missing or unknown number exits 2.
+//
+// With no second argument the process runs the module's `@setup`, the test and the module's
+// `@teardown`, and writes a line to standard error after the setup and after the test, so the runner
+// can tell from a process that trapped which of the three it was in. A test answering with a
+// `Result` hands the answer to the library's reader, which traps on an `Err`. A second argument
+// starting `t` runs only the module's `@teardown`, for a test whose own process ended before it
+// could; `a` runs its `@setup_all`, and `z` its `@teardown_all`.
 private emit_test_main(out: *StrBuilder, program: MirProgram, roots: usize)
     out.push("declare i32 @atoi(ptr)\n")
+    out.push("declare i64 @write(i32, ptr, i64)\n")
+    out.push(s"@avin.test.ready = private unnamed_addr constant [${TestReady.len + 1} x i8] c\"$TestReady\\0A\"\n")
+    out.push(s"@avin.test.returned = private unnamed_addr constant [${TestReturned.len + 1} x i8] c\"$TestReturned\\0A\"\n")
     out.push("\ndefine i32 @main(i32 %argc, ptr %argv) {\nentry:\n")
     out.push("  %given = icmp sge i32 %argc, 2\n  br i1 %given, label %pick, label %unknown\n")
     out.push("unknown:\n  ret i32 2\n")
     out.push("pick:\n  %slot = getelementptr inbounds ptr, ptr %argv, i64 1\n  %arg = load ptr, ptr %slot\n")
     out.push("  %which = call i32 @atoi(ptr %arg)\n")
+    out.push("  %moded = icmp sge i32 %argc, 3\n  br i1 %moded, label %mode, label %start\n")
+    out.push("mode:\n  %mode_slot = getelementptr inbounds ptr, ptr %argv, i64 2\n  %mode_arg = load ptr, ptr %mode_slot\n")
+    out.push("  %mode_char = load i8, ptr %mode_arg\n  br label %start\n")
+    out.push("start:\n  %how = phi i8 [ 0, %pick ], [ %mode_char, %mode ]\n")
     out.push("  %ctx = call ptr @avin_rt_start(i32 1, ptr %argv)\n")
     out.push(s"  call void @avin_rt_string_descriptor(ptr @avin.desc.${program.string_descriptor})\n")
     if roots > 0 then out.push("  call void @avin_rt_globals(ptr @avin.roots)\n")
@@ -147,9 +159,41 @@ private emit_test_main(out: *StrBuilder, program: MirProgram, roots: usize)
         out.push(s" i32 $i, label %test$i")
     out.push(" ]\n")
     for i in 0..<program.tests.len()
-        val test = program.functions[program.tests[i]]
-        out.push(s"test$i:\n  call ${result_type(test.signature)} @\"${test.symbol}\"(ptr %ctx)\n  ret i32 0\n")
+        val t = program.tests[i]
+        out.push(s"test$i:\n  switch i8 %how, label %unknown [ i8 0, label %run$i i8 116, label %teardown$i i8 97, label %setup_all$i i8 122, label %teardown_all$i ]\n")
+        out.push(s"run$i:\n")
+        call_hook(out, program, t.setup)
+        out.push(s"  call i64 @write(i32 2, ptr @avin.test.ready, i64 ${TestReady.len + 1})\n")
+        val test = program.functions[t.function]
+        t.answer match
+            Some(a) ->
+                val reader = program.functions[a]
+                out.push(s"  %answer$i = call ${result_type(test.signature)} @\"${test.symbol}\"(ptr %ctx)\n")
+                // The context's caller site, which the reader's trap reports.
+                out.push(s"  %site$i = getelementptr inbounds i8, ptr %ctx, i64 24\n  store ptr @avin.trap.${t.answer_site}, ptr %site$i\n")
+                out.push(s"  call ${result_type(reader.signature)} @\"${reader.symbol}\"(ptr %ctx, ${llvm_type(reader.signature.params[0])} %answer$i)\n")
+            None -> out.push(s"  call ${result_type(test.signature)} @\"${test.symbol}\"(ptr %ctx)\n")
+        out.push(s"  call i64 @write(i32 2, ptr @avin.test.returned, i64 ${TestReturned.len + 1})\n")
+        call_hook(out, program, t.teardown)
+        out.push(s"  ret i32 0\nteardown$i:\n")
+        call_hook(out, program, t.teardown)
+        out.push(s"  ret i32 0\nsetup_all$i:\n")
+        call_hook(out, program, t.setup_all)
+        out.push(s"  ret i32 0\nteardown_all$i:\n")
+        call_hook(out, program, t.teardown_all)
+        out.push("  ret i32 0\n")
     out.push("}\n")
+
+private call_hook(out: *StrBuilder, program: MirProgram, hook: Option[usize])
+    if hook is Some(h)
+        val f = program.functions[h]
+        out.push(s"  call ${result_type(f.signature)} @\"${f.symbol}\"(ptr %ctx)\n")
+
+/** The line a test's process writes to standard error once the module's `@setup` has returned. */
+const TestReady: string = "avin: test: ready"
+
+/** The line a test's process writes to standard error once the test itself has returned. */
+const TestReturned: string = "avin: test: returned"
 
 /** A type record's equality entry as an LLVM constant: the function's address, or null. */
 private entry_address(program: MirProgram, entry: Option[usize]) -> string = entry match

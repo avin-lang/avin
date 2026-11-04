@@ -2,7 +2,7 @@ module dev.avinlang.compiler
 @tests
 
 import sh.sysl.parsing.source_of
-import sysl.fs.{exists, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.fs.{exists, make_dir_all, make_temp_dir, read_text, remove_dir_all, remove_file, write_text}
 import sysl.process.Stdio
 
 // `avin run` and `avin test`, through the command line as a person types it, with the program's
@@ -318,6 +318,122 @@ test_single_file()
     assert_eq(single.status, 0)
     assert(single.said.starts_with("running 1 test\n\none.avin\n  ok    a sentence names it  "))
     assert(!single.said.contains("passing output"))
+
+// A program whose tests say how they are run: by trapping, with or without the text the trap must
+// print; with a limit of their own; not at all; and by answering with a `Result`.
+private write_attributes(dir: string)
+    make_dir_all(dir).unwrap()
+    write_text(dir + "/checks.avin", "@test(should_trap)\ntrapsAtAll()\n    val v = [1]\n    print(v(3))\n\n@test(should_trap: \"index out of range\")\ntrapsWithTheText()\n    val v = [1]\n    print(v(3))\n\n@test(should_trap: \"nowhere\")\ntrapsWithoutTheText()\n    val v = [1]\n    print(v(3))\n\n@test(should_trap)\nreturnsInstead()\n    print(\"returned\")\n\n@test(timeout: 1)\nspins()\n    var n = 0\n    while true\n        n = n + 0\n\n@test(\"waits for a fix\", ignore: \"the fix is not in\")\nwaits()\n    assert(false)\n\n@test\nanswersOk() -> Result[unit, string]\n    Ok(())\n\n@test(\"answers an error\")\nanswersErr() -> Result[unit, string]\n    Err(\"empty input\")\n").unwrap()
+
+@test("should_trap passes a trap and fails a return, ignore runs nothing, timeout stops the test, and an Err answer fails")
+test_attributes()
+    val dir = make_temp_dir("avin-test").unwrap()
+    defer _ = remove_dir_all(dir)
+    val root = dir + "/tree"
+    write_attributes(root)
+    // The second run takes the executable and what it knows of its tests from the cache.
+    for _ in 0..<2
+        val run = session(dir, ["avin", "test", root])
+        assert_eq(run.noted, "")
+        assert_eq(run.status, 1)
+        val lines = run.said.lines()
+        assert_eq(lines[0], "running 8 tests")
+        assert_eq(lines[2], "checks.avin")
+        assert(lines[3].starts_with("  ok    trapsAtAll  "))
+        assert(lines[4].starts_with("  ok    trapsWithTheText  "))
+        assert(lines[5].starts_with("  FAIL  trapsWithoutTheText  "))
+        assert_eq(lines[6], "        trapped without printing \"nowhere\": index out of range at checks.avin:14:11")
+        assert(lines[7].starts_with("  FAIL  returnsInstead  "))
+        assert_eq(lines[8], "        returned, and should have trapped")
+        assert_eq(lines[9], "        > returned")
+        assert(lines[10].starts_with("  FAIL  spins  "))
+        assert_eq(lines[11], "        timed out after 1s")
+        assert_eq(lines[12], "  skip  waits for a fix      ignored: the fix is not in")
+        assert(lines[13].starts_with("  ok    answersOk  "))
+        assert(lines[14].starts_with("  FAIL  answers an error  "))
+        assert_eq(lines[15], "        test answered Err: empty input at checks.avin:35:1")
+        assert(lines[17].starts_with("3 passed, 4 failed, 1 ignored — "))
+        assert_eq(lines.len, 18)
+    // A filter that leaves only tests that pass, and the ignored one, exits 0.
+    val ok = session(dir, ["avin", "test", root, "answersOk"])
+    assert_eq(ok.status, 0)
+    val ignored = session(dir, ["avin", "test", root, "waits"])
+    assert_eq(ignored.status, 0)
+    assert(ignored.said.contains("\n0 passed, 0 failed, 1 ignored — "))
+
+// A module with all four hooks, each writing its name to `log` as the tests write theirs, beside a
+// root module whose tests have no hooks, one of them in a `@tests` file.
+private write_hooked(dir: string, log: string)
+    make_dir_all(dir + "/life").unwrap()
+    write_text(dir + "/life/life.avin", "module life\n\nimport avin.fs\n\nnote(line: string)\n    fs.appendText(\"" + log + "\", line + \"\\n\")\n\n@setup_all\nopensAll()\n    note(\"setup_all\")\n\n@setup\nopens()\n    note(\"setup\")\n\n@teardown\ncloses()\n    note(\"teardown\")\n\n@teardown_all\nclosesAll()\n    note(\"teardown_all\")\n\n@test\npasses()\n    note(\"passes\")\n\n@test\nfails()\n    note(\"fails\")\n    assert(false, \"on purpose\")\n\n@test(should_trap)\ntraps()\n    note(\"traps\")\n    val v = [1]\n    print(v(3))\n\n@test(ignore: \"not yet\")\nwaits()\n    note(\"waits\")\n").unwrap()
+    write_text(dir + "/plain.avin", "@test\nplain()\n    assertEq(fixture(), 42)\n\nmain()\n    print(\"main\")\n").unwrap()
+    write_text(dir + "/fixtures.avin", "@tests\n\nfixture() -> int = 42\n\n@test\ninTestsFile()\n    assertEq(fixture(), 42)\n").unwrap()
+
+@test("setup and teardown run around each test, teardown after a failed test too, and setup_all and teardown_all once around the module's tests")
+test_hooks_order()
+    val dir = make_temp_dir("avin-test").unwrap()
+    defer _ = remove_dir_all(dir)
+    val root = dir + "/tree"
+    val log = dir + "/log.txt"
+    write_hooked(root, log)
+    val run = session(dir, ["avin", "test", root])
+    assert_eq(run.noted, "")
+    assert_eq(run.status, 1)
+    val lines = run.said.lines()
+    assert_eq(lines[0], "running 6 tests")
+    assert_eq(lines[2], "life/life.avin")
+    assert(lines[3].starts_with("  ok    passes  "))
+    assert(lines[4].starts_with("  FAIL  fails  "))
+    assert_eq(lines[5], "        assertion failed: on purpose at life.avin:31:5")
+    assert(lines[6].starts_with("  ok    traps  "))
+    assert_eq(lines[7], "  skip  waits        ignored: not yet")
+    assert_eq(lines[9], "fixtures.avin")
+    assert(lines[10].starts_with("  ok    inTestsFile  "))
+    assert_eq(lines[12], "plain.avin")
+    assert(lines[13].starts_with("  ok    plain  "))
+    assert(lines[15].starts_with("4 passed, 1 failed, 1 ignored — "))
+    // The teardown after a trapped test runs in a process of its own, and an ignored test runs no hook.
+    assert_eq(read_text(log).unwrap(), "setup_all\nsetup\npasses\nteardown\nsetup\nfails\nteardown\nsetup\ntraps\nteardown\nteardown_all\n")
+    // The program itself runs no test, no hook and nothing a `@tests` file declares.
+    val program = session(dir, ["avin", "run", root])
+    assert_eq(program.out, "main\n")
+    assert_eq(program.status, 0)
+    // A run that selects no test of the module runs none of its hooks.
+    remove_file(log).unwrap()
+    assert_eq(session(dir, ["avin", "test", root, "plain"]).status, 0)
+    assert(!exists(log))
+
+@test("a setup that fails fails its tests without running them, and a teardown or setup_all that fails is a failure of its own")
+test_hook_failures()
+    val dir = make_temp_dir("avin-test").unwrap()
+    defer _ = remove_dir_all(dir)
+    val root = dir + "/tree"
+    make_dir_all(root + "/a").unwrap()
+    make_dir_all(root + "/b").unwrap()
+    make_dir_all(root + "/c").unwrap()
+    write_text(root + "/a/a.avin", "module a\n\n@setup\nbreaks()\n    print(\"setting up\")\n    assert(false, \"no setup\")\n\n@test\nneverRuns()\n    print(\"ran\")\n").unwrap()
+    write_text(root + "/b/b.avin", "module b\n\n@teardown\nbreaks()\n    assert(false, \"no teardown\")\n\n@test\nholds()\n    print(\"held\")\n").unwrap()
+    write_text(root + "/c/c.avin", "module c\n\n@setup_all\nbreaks()\n    assert(false, \"no setup_all\")\n\n@test\nfirst()\n    print(\"first\")\n\n@test\nsecond()\n    print(\"second\")\n").unwrap()
+    val run = session(dir, ["avin", "test", root])
+    assert_eq(run.status, 1)
+    val lines = run.said.lines()
+    assert_eq(lines[2], "a/a.avin")
+    assert(lines[3].starts_with("  FAIL  neverRuns  "))
+    assert_eq(lines[4], "        not run: `@setup` `breaks` failed: assertion failed: no setup at a.avin:6:5")
+    assert_eq(lines[5], "        > setting up")
+    assert_eq(lines[7], "b/b.avin")
+    assert(lines[8].starts_with("  ok    holds  "))
+    assert_eq(lines[9], "  FAIL  @teardown breaks")
+    assert_eq(lines[10], "        assertion failed: no teardown at b.avin:5:5")
+    assert_eq(lines[11], "        > held")
+    assert_eq(lines[13], "c/c.avin")
+    assert_eq(lines[14], "  FAIL  @setup_all breaks")
+    assert_eq(lines[15], "        assertion failed: no setup_all at c.avin:5:5")
+    assert_eq(lines[16], "  FAIL  first")
+    assert_eq(lines[17], "        not run: `@setup_all` `breaks` failed")
+    assert_eq(lines[18], "  FAIL  second")
+    assert_eq(lines[19], "        not run: `@setup_all` `breaks` failed")
+    assert(lines[21].starts_with("1 passed, 5 failed — "))
 
 @test("test and run are refused with the usage for flags they do not take")
 usage_of_run_and_test()

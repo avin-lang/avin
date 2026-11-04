@@ -666,7 +666,7 @@ private check_imports(c: *Checker, unit: usize)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false)
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false)
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -751,7 +751,9 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     check_equality_pairs(&c)
     for g in 0..<c.globals.len()
         settle_global(&c, g)
-    val init = initializer(&c, initialization_order(&c))
+    check_tests_impls(&c)
+    check_tests_files(&c)
+    val init = initializer(&c, initialization_order(&c), testing)
     // A program without `main` is told so in its last file.
     var main_unit = given - 1
     var entry: Option[usize] = None
@@ -760,6 +762,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
             entry = Some(ids[0])
             main_unit = c.symbols[ids[0]].unit
             if ids.len() > 1 then c.note(c.symbols[ids[1]].unit, c.symbols[ids[1]].decl.name_span, "`main` cannot be overloaded")
+            if c.units[main_unit].file.tests_only then c.note(main_unit, c.symbols[ids[0]].decl.name_span, "`main` is declared in a `@tests` file, which only `avin test` builds: a program starts in an ordinary file")
         None -> ()
     entry match
         Some(id) ->
@@ -816,10 +819,13 @@ private solved_views(vars: Buf[Option[&Type]], views: Buf[TypeView]) -> Buf[Type
     out
 
 // The program's `@test` functions, in the order they are declared. A test is a top-level function
-// that `avin test` calls with nothing and that passes by returning, so it takes no parameters, has no
-// type parameters and yields unit. `@test` names it after the function, and `@test("a sentence")` by
-// the sentence. The core library has no tests of its own in a program's run.
+// that `avin test` calls with nothing and that passes by returning, or by answering `Ok`, so it takes
+// no parameters, has no type parameters and yields unit or a `Result[unit, E]` whose error is
+// displayed. `@test` names it after the function, and `@test("a sentence")` by the sentence; after
+// the description come `should_trap`, `timeout` and `ignore`. Each test carries its module's hooks.
+// The core library has no tests of its own in a program's run.
 private check_tests(c: *Checker) -> Buf[TestCase]
+    val hooks = check_hooks(c)
     var tests: Buf[TestCase] = buf()
     for id in 0..<c.symbols.len()
         val f = c.symbols[id]
@@ -829,27 +835,222 @@ private check_tests(c: *Checker) -> Buf[TestCase]
             if f.root is Some(_) || f.owner_class is Some(_) || f.receiver is Some(_)
                 c.note(f.unit, a.span, "`@test` marks a top-level function, which `avin test` can call by itself")
                 break
-            var name = f.name
-            var described = a.args.len() == 0
-            if a.args.len() == 1 && a.args[0].name is None
-                if a.args[0].value.kind is StringLit(text)
-                    name = text
-                    described = text != ""
-            if !described
-                c.note(f.unit, a.span, s"`@test` takes a description, a string that is not empty, or nothing, and then `${f.name}` names the test")
+            var test = TestCase(id, f.name, f.module_name, None, None, None, None, None, None, None, None)
+            read_test_arguments(c, f.unit, a, f.name, &test)
             if f.params.len() > 0
                 c.note(f.unit, f.decl.name_span, s"a `@test` function takes no parameters, and `${f.name}` takes ${count(f.params.len(), "parameter")}: `avin test` calls it with nothing")
             if f.decl.type_params.len() > 0
                 c.note(f.unit, f.decl.name_span, s"a `@test` function has no type parameters, and `${f.name}` declares `${f.decl.type_params[0].name}`: the runner supplies no type arguments")
-            val result = f.result.unwrap_or(ErrorType)
-            if !(*result is Unit || *result is Nothing || *result is ErrorType)
-                c.note(f.unit, f.decl.name_span, s"a `@test` function yields unit, and `${f.name}` yields ${type_name(result)}: a test passes by returning, so there is nothing to read a value with")
+            val result = zonk(c, f.result.unwrap_or(ErrorType))
+            test.answers = test_answer(c, result)
+            if test.answers is Some(e)
+                if !(*e is ErrorType) && !displays(c, e)
+                    c.note(f.unit, f.decl.name_span, s"a `@test` function's error is shown by its `Display`, and `${type_name(e)}`, the error `${f.name}` answers, does not implement `Display`")
+            elif !(*result is Unit || *result is Nothing || *result is ErrorType)
+                c.note(f.unit, f.decl.name_span, s"a `@test` function yields unit or a `Result[unit, E]`, and `${f.name}` yields ${type_name(result)}: a test passes by returning, or by answering `Ok`, so there is nothing to read a value with")
             if f.decl.body is None && f.decl.clauses.len() == 0
                 c.note(f.unit, f.decl.name_span, s"a `@test` function has a body, and `${f.name}` has none")
             if f.module_name == CoreModule || f.module_name.starts_with(CoreModule + ".") then break
-            tests.push(TestCase(id, name))
+            if hooks.get(f.module_name) is Some(h)
+                test.setup = h.setup
+                test.teardown = h.teardown
+                test.setup_all = h.setup_all
+                test.teardown_all = h.teardown_all
+            tests.push(test)
             break
     tests
+
+// What `@test`'s arguments say about a test: a description first, a string that is not empty; then
+// `should_trap`, alone or with the text the run must print; `timeout`, whole seconds from 0 to
+// 2147483; and `ignore` with the reason the test is not run. Each at most once.
+private read_test_arguments(c: *Checker, unit: usize, a: Annotation, function: string, test: *TestCase)
+    var timed = false
+    for i in 0..<a.args.len()
+        val arg = a.args[i]
+        val key = arg.name match
+            Some(k) -> k
+            None -> arg.value.kind match
+                Name(word) -> if word == "should_trap" || word == "ignore" || word == "timeout" then word else ""
+                _ -> ""
+        if key == ""
+            val text = arg.value.kind match
+                StringLit(t) -> t
+                _ -> ""
+            if i > 0 || text == ""
+                c.note(unit, a.span, s"`@test` takes a description, a string that is not empty, or nothing, and then `$function` names the test")
+            else test.name = text
+        elif key == "should_trap"
+            if test.should_trap is Some(_) then c.note(unit, a.span, "`@test` takes `should_trap` once")
+            if arg.name is None then test.should_trap = Some("")
+            else arg.value.kind match
+                StringLit(t) ->
+                    if t == "" then c.note(unit, arg.value.span, "`should_trap` is written alone, or with the text the trap must print: `@test(should_trap: \"out of bounds\")`")
+                    test.should_trap = Some(t)
+                _ -> c.note(unit, arg.value.span, "`should_trap` is written alone, or with the text the trap must print: `@test(should_trap: \"out of bounds\")`")
+        elif key == "ignore"
+            if test.ignore is Some(_) then c.note(unit, a.span, "`@test` takes `ignore` once")
+            val reason = if arg.name is None then "" else arg.value.kind match
+                StringLit(t) -> t
+                _ -> ""
+            if reason == "" then c.note(unit, if arg.name is None then a.span else arg.value.span, "`ignore` needs the reason the test is not run, written as a string: `@test(ignore: \"the parser drops the second arm\")`")
+            test.ignore = Some(reason)
+        elif key == "timeout"
+            if timed then c.note(unit, a.span, "`@test` takes `timeout` once")
+            timed = true
+            val seconds = if arg.name is None then None else arg.value.kind match
+                IntLit(spelling) -> whole_seconds(spelling)
+                _ -> None
+            seconds match
+                Some(s) -> test.timeout = Some(s)
+                None -> c.note(unit, if arg.name is None then a.span else arg.value.span, "`timeout` is a whole number of seconds from 0, for no limit, to 2147483: `@test(timeout: 30)`")
+        else c.note(unit, a.span, s"`@test` has no argument `$key`: it takes a description, then `should_trap`, `timeout` and `ignore`")
+
+// The seconds an integer literal spells, when it is at most 2147483, the most milliseconds an `int`
+// counts.
+private whole_seconds(spelling: string) -> Option[int]
+    val digits = literal_magnitude(spelling) match
+        Some(d) -> d
+        None -> return None
+    if digits.len > 7 then return None
+    var value = 0
+    for b in digits.bytes
+        value = value * 10 + int(b - u8('0'))
+    if value > 2147483 then None else Some(value)
+
+// The error type of a test that answers with a `Result[unit, E]`.
+private test_answer(c: *Checker, result: &Type) -> Option[&Type]
+    val result_id = core_data(c, "Result") match
+        Some(r) -> r
+        None -> return None
+    *result match
+        Data(id, _, args) -> if id == result_id && args.len() == 2 && *args[0] is Unit then Some(args[1]) else None
+        _ -> None
+
+// Whether values of `t` implement the core library's `Display`.
+private displays(c: *Checker, t: &Type) -> bool = c.class_types.get(qualified(CoreModule, "Display")) match
+    Some(k) -> conforms_to_bound(c, t, Class(k, "Display", buf()))
+    None -> false
+
+/** The functions `avin test` calls around a module's tests: `@setup` before each test and `@teardown`
+ * after it, `@setup_all` once before the module's first test and `@teardown_all` once after its last. */
+private struct TestHooks
+    setup: Option[usize]
+    teardown: Option[usize]
+    setup_all: Option[usize]
+    teardown_all: Option[usize]
+
+// Whether any of `units` is a `@tests` file.
+private has_tests_file(units: Buf[SourceUnit]) -> bool
+    for u in units
+        if u.file.tests_only then return true
+    false
+
+/** Whether `name` is the name of an annotation marking a test hook. */
+is_hook_annotation(name: string) -> bool = name == "setup" || name == "teardown" || name == "setup_all" || name == "teardown_all"
+
+// The hooks of each module, by its name. A hook is a top-level function the runner calls with
+// nothing, like a test, which yields unit, and a module declares at most one of each kind.
+private check_hooks(c: *Checker) -> Map[string, TestHooks]
+    var hooks: Map[string, TestHooks] = map()
+    for id in 0..<c.symbols.len()
+        val f = c.symbols[id]
+        if f.default_param is Some(_) || f.lambda || f.delayed then continue
+        for a in f.decl.annotations
+            if !is_hook_annotation(a.name) then continue
+            if f.root is Some(_) || f.owner_class is Some(_) || f.receiver is Some(_)
+                c.note(f.unit, a.span, s"`@${a.name}` marks a top-level function, which `avin test` can call by itself")
+                break
+            if a.args.len() > 0 then c.note(f.unit, a.span, s"`@${a.name}` takes no arguments")
+            if f.params.len() > 0
+                c.note(f.unit, f.decl.name_span, s"a `@${a.name}` function takes no parameters, and `${f.name}` takes ${count(f.params.len(), "parameter")}: `avin test` calls it with nothing")
+            if f.decl.type_params.len() > 0
+                c.note(f.unit, f.decl.name_span, s"a `@${a.name}` function has no type parameters, and `${f.name}` declares `${f.decl.type_params[0].name}`: the runner supplies no type arguments")
+            val result = f.result.unwrap_or(ErrorType)
+            if !(*result is Unit || *result is Nothing || *result is ErrorType)
+                c.note(f.unit, f.decl.name_span, s"a `@${a.name}` function yields unit, and `${f.name}` yields ${type_name(result)}: the runner reads nothing from it")
+            if f.decl.body is None && f.decl.clauses.len() == 0
+                c.note(f.unit, f.decl.name_span, s"a `@${a.name}` function has a body, and `${f.name}` has none")
+            if f.module_name == CoreModule || f.module_name.starts_with(CoreModule + ".") then break
+            var h = hooks.get(f.module_name).unwrap_or(TestHooks(None, None, None, None))
+            val existing = if a.name == "setup" then h.setup elif a.name == "teardown" then h.teardown elif a.name == "setup_all" then h.setup_all else h.teardown_all
+            if existing is Some(other)
+                c.note(f.unit, f.decl.name_span, s"a module declares at most one `@${a.name}`, and this one already has `${c.symbols[other].name}`")
+                break
+            if a.name == "setup" then h.setup = Some(id)
+            elif a.name == "teardown" then h.teardown = Some(id)
+            elif a.name == "setup_all" then h.setup_all = Some(id)
+            else h.teardown_all = Some(id)
+            hooks.put(f.module_name, h)
+            break
+    hooks
+
+// What a `@tests` file declares is there for the tests: `avin test` builds it, and no other build
+// keeps it. So nothing else may name it: only a `@test` function, a test hook or another `@tests`
+// file. A lambda counts as the function it is written in.
+private check_tests_files(c: *Checker)
+    var any = false
+    for u in c.units
+        if u.file.tests_only then any = true
+    if !any then return
+    val ix = c.index match
+        Some(i) -> i
+        None -> return
+    // Where test code is written: the declarations of tests and hooks, by unit.
+    var code_units: Buf[usize] = buf()
+    var code_spans: Buf[Span] = buf()
+    for s in c.symbols
+        if s.root is Some(_) || s.owner_class is Some(_) || s.receiver is Some(_) || s.lambda then continue
+        for a in s.decl.annotations
+            if a.name == "test" || is_hook_annotation(a.name)
+                code_units.push(s.unit)
+                code_spans.push(s.decl.span)
+                break
+    // A path is noted as a whole and by its last name, which is one use, reported once.
+    var reported_units: Buf[usize] = buf()
+    var reported_spans: Buf[Span] = buf()
+    for n in ix.noted
+        if !c.units[n.declared_unit].file.tests_only || c.units[n.at_unit].file.tests_only then continue
+        var again = false
+        for k in 0..<reported_units.len()
+            val r = reported_spans[k]
+            if reported_units[k] == n.at_unit && n.at.start < r.end && r.start < n.at.end then again = true
+        if again then continue
+        val name = n.target match
+            FunctionTarget(id) -> c.symbols[id].name
+            DataTarget(id) -> c.data[id].name
+            ClassTarget(k) -> c.classes[k].decl.name
+            VariantTarget(d, i) -> c.data[d].decl.variants[i].name
+            ValueTarget(_, value, _, role) -> if role is GlobalRole then value else ""
+            _ -> ""
+        if name == "" then continue
+        var inside = false
+        for k in 0..<code_units.len()
+            val span = code_spans[k]
+            if code_units[k] == n.at_unit && span.start <= n.at.start && n.at.end <= span.end then inside = true
+        if !inside
+            reported_units.push(n.at_unit)
+            reported_spans.push(n.at)
+            c.note(n.at_unit, n.at, s"`$name` is declared in a `@tests` file, so only `avin test` builds it: a `@test` function, a test hook or another `@tests` file may name it, and nothing else")
+
+// An impl written in a `@tests` file is for a type, or of a trait, the file declares: an impl of
+// anything else would make a type behave one way while the tests run and another in the program that
+// ships.
+private check_tests_impls(c: *Checker)
+    for i in c.impls
+        if !c.units[i.unit].file.tests_only || i.decl.derived is Some(_) || *i.target is ErrorType then continue
+        if declared_in(c, i.target, i.unit) then continue
+        if i.trait_type is Some(t)
+            if declared_in(c, t, i.unit) then continue
+        c.note(i.unit, i.decl.target.span, s"an impl in a `@tests` file is for a type or of a trait the file declares, and `${type_name(i.target)}` is declared elsewhere: the tests would see the impl and the program that ships would not")
+    for t in c.trait_impls
+        if !c.units[t.unit].file.tests_only || c.classes[t.trait_id].unit == t.unit then continue
+        c.note(t.unit, t.decl.target.span, s"an impl in a `@tests` file is for a type or of a trait the file declares, and `${c.classes[t.trait_id].decl.name}` is declared elsewhere: the tests would see the impl and the program that ships would not")
+
+// Whether `t` is a data type or class declared in `unit`.
+private declared_in(c: *Checker, t: &Type, unit: usize) -> bool = *t match
+    Data(id, _, _) -> c.data[id].unit == unit
+    Class(k, _, _) -> c.classes[k].unit == unit
+    _ -> false
 
 private declare_unit(c: *Checker, unit: usize)
     val file = c.units[unit].file
@@ -4317,12 +4518,17 @@ private declare_defaults(c: *Checker, id: usize)
     c.symbols[id].defaults = defaults
 
 // `@intrinsic("name")` and `@sysl("path")` are the annotations this compiler gives meaning to on a
-// function without a body, and `@test` the one it gives meaning to on a function with one. This reads
-// the first; `sysl_binding_of` the second; `check_tests` the third.
+// function without a body, and `@test` and the test hooks the ones it gives meaning to on a function
+// with one. This reads the first; `sysl_binding_of` the second; `check_tests` and `check_hooks` the
+// rest.
 private intrinsic_of(c: *Checker, unit: usize, f: &Function) -> Option[string]
     var out: Option[string] = None
     for a in f.annotations
-        if a.name == "sysl" || a.name == "test" then continue
+        if a.name == "sysl" || a.name == "test" || is_hook_annotation(a.name) then continue
+        if a.name == "should_trap" || a.name == "timeout" || a.name == "ignore"
+            val example = if a.name == "should_trap" then "should_trap" elif a.name == "timeout" then "timeout: 30" else "ignore: \"why\""
+            c.note(unit, a.span, s"`${a.name}` is said of a test, as an argument of `@test`: `@test($example)`")
+            continue
         if a.name != "intrinsic"
             c.note(unit, a.span, s"unknown annotation `@${a.name}`")
             continue
@@ -6717,7 +6923,11 @@ private report_cycle(c: *Checker, o: *InitOrder, start: usize)
 
 // One function initializes every module-level value in order, storing each initializer's result.
 // The program's `main` runs it before the entry.
-private initializer(c: *Checker, order: Buf[usize]) -> Option[usize]
+private initializer(c: *Checker, all: Buf[usize], testing: bool) -> Option[usize]
+    // A `@tests` file's values are the tests', and only a program built for its tests has them.
+    var order: Buf[usize] = buf()
+    for g in all
+        if testing || !c.units[c.globals[g].unit].file.tests_only then order.push(g)
     if order.len() == 0 then return None
     val unit = c.units.len() - 1
     val module_name = c.units[unit].file.module_name

@@ -1,6 +1,7 @@
 module dev.avinlang.compiler
 
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
 import sysl.env.current_exe
 import sysl.fs.{canonicalize, exists, is_dir, make_dir_all, metadata, read_text, write_text_atomic}
 import sysl.path.{file_name, parent, stem}
@@ -71,13 +72,43 @@ private push_files(text: *StrBuilder, files: Buf[ProgramFile])
         text.push(from_utf8_unchecked(f.src.bytes) + "\n")
 
 // The record kept beside a cached executable: its key on the first line, then a line for each test,
-// its line number, file and name separated by tabs.
+// its fields separated by tabs, each with its backslashes, tabs and line breaks escaped: the line
+// number, file, module, `should_trap`, `ignore` and `timeout` (empty for none, and otherwise the
+// value after `=`), the module's four hooks, and the name.
 private write_record(key: string, tests: Buf[TestEntry]) -> string
     var out = str_builder()
     out.push(key + "\n")
     for t in tests
-        out.push(s"${t.line}\t${t.file.replace_all("\t", " ")}\t${t.name.replace_all("\n", " ")}\n")
+        val fields = [t.line.to_string(), t.file, t.module_name, optional(t.should_trap), optional(t.ignore), optional(seconds_of(t.timeout)),t.setup, t.teardown, t.setup_all, t.teardown_all, t.name]
+        for j in 0..<fields.len
+            if j > 0 then out.push("\t")
+            out.push(escaped(fields[j]))
+        out.push("\n")
     out.finish()
+
+private seconds_of(timeout: Option[int]) -> Option[string] = timeout match
+    Some(s) -> Some(s.to_string())
+    None -> None
+
+private optional(value: Option[string]) -> string = value match
+    Some(v) -> "=" + v
+    None -> ""
+
+private escaped(text: string) -> string = text.replace_all("\\", "\\\\").replace_all("\t", "\\t").replace_all("\n", "\\n")
+
+private unescaped(text: string) -> string
+    var out = str_builder()
+    var escaping = false
+    for b in text.bytes
+        if escaping
+            out.push_char(if b == u8('t') then '\t' elif b == u8('n') then '\n' else char(b))
+            escaping = false
+        elif b == u8('\\') then escaping = true
+        else out.push_char(char(b))
+    out.finish()
+
+// The value of a field `optional` wrote.
+private read_optional(field: string) -> Option[string] = if field.starts_with("=") then Some(field[1..]) else None
 
 // The tests a record holds, when its key is `key`.
 private read_record(text: string, key: string) -> Option[Buf[TestEntry]]
@@ -85,15 +116,20 @@ private read_record(text: string, key: string) -> Option[Buf[TestEntry]]
     if lines.len == 0 || lines[0] != key then return None
     var tests: Buf[TestEntry] = buf()
     for i in 1..<lines.len
-        val fields = lines[i].split("\t")
-        if fields.len < 3 then return None
-        val line = parse_int(fields[0]) match
+        val raw = lines[i].split("\t")
+        if raw.len != 11 then return None
+        var f: Buf[string] = buf()
+        for field in raw
+            f.push(unescaped(field))
+        val line = parse_int(f[0]) match
             Ok(n) -> usize(n)
             Err(_) -> return None
-        var name = fields[2]
-        for j in 3..<fields.len
-            name = name + "\t" + fields[j]
-        tests.push(TestEntry(name, fields[1], line))
+        var timeout: Option[int] = None
+        if read_optional(f[5]) is Some(seconds)
+            timeout = parse_int(seconds) match
+                Ok(n) -> Some(int(n))
+                Err(_) -> return None
+        tests.push(TestEntry(f[10], f[1], line, f[2], read_optional(f[3]), read_optional(f[4]), timeout, f[6], f[7], f[8], f[9]))
     Some(tests)
 
 /** Runs `binary` with `args`, its output going where `stdout` and `stderr` say, and answers the
@@ -106,15 +142,17 @@ run_binary(binary: string, args: []const string, stdout: Stdio, stderr: Stdio) -
         Signalled(signal) -> 128 + signal
         TimedOut -> 1)
 
-/** How long one test may run, in milliseconds, before the runner stops it and reports it failed. */
+/** How long one test may run, in milliseconds, before the runner stops it and reports it failed,
+ * unless the test gives a limit of its own; and how long each test hook may run. */
 const TestTimeout: int = 60000
 
 /** Runs the tests of `built` whose name, or the file they are written in, contains `filter`, each in
  * a process of its own, so a test that traps stops only itself. The report goes through `say`: the
  * tests grouped by file, in the order they are declared, each `ok` or `FAIL` with its name and how
- * long it took; under a failure, why it failed and everything it printed, each line after `> `; then
- * how many passed and failed. Files are named from `root`, the program's directory, when it is one.
- * Answers 0 when every test passed and 1 otherwise. */
+ * long it took, or `skip` with the reason an ignored test is not run; under a failure, why it failed
+ * and everything it printed, each line after `> `; a hook that failed on a row of its own; then how
+ * many passed, failed and were ignored. Files are named from `root`, the program's directory, when
+ * it is one. Answers 0 when every test that ran passed and every hook succeeded, and 1 otherwise. */
 run_tests(built: Built, root: string, filter: string, say: string -> unit) -> int
     var selected: Buf[usize] = buf()
     for i in 0..<built.tests.len()
@@ -127,8 +165,16 @@ run_tests(built: Built, root: string, filter: string, say: string -> unit) -> in
     var width = 0usize
     for i in selected
         if built.tests[i].name.len > width then width = built.tests[i].name.len
+    // The last test each module runs, after which its `@teardown_all` runs. An ignored test runs
+    // nothing, not even its module's hooks.
+    var last: Map[string, usize] = map()
+    for i in selected
+        if built.tests[i].ignore is None then last.put(built.tests[i].module_name, i)
+    // Each module whose `@setup_all` has run, and how it ended: "" when it succeeded.
+    var set_up: Map[string, string] = map()
     var passed = 0usize
     var failed = 0usize
+    var ignored = 0usize
     var file = ""
     val started = monotonic()
     for i in selected
@@ -138,49 +184,135 @@ run_tests(built: Built, root: string, filter: string, say: string -> unit) -> in
             say("")
             say(shown)
             file = shown
-        val began = monotonic()
-        // A test reads no input: it never waits on the terminal `avin test` was started from.
-        val result = capture(built.path, [i.to_string()], stderr = true, timeout = TestTimeout, stdin = Stdio.FromPath("/dev/null"))
-        val ms = (monotonic() - began).us / 1000
         val padded = t.name + " ".repeat(width - t.name.len)
-        val output = result match
-            Ok(o) -> o
-            Err(e) ->
+        if t.ignore is Some(reason)
+            ignored += 1
+            say(s"  skip  $padded  ignored: $reason")
+            continue
+        if t.setup_all != "" && set_up.get(t.module_name) is None
+            val ran = run_part(built, i, "a", TestTimeout)
+            set_up.put(t.module_name, if ran.status == Exited(0) then "" else ran.reason)
+            if ran.status != Exited(0)
                 failed += 1
-                say(s"  FAIL  $padded  ${ms}ms")
-                say(s"        could not be run: ${e.to_string()}")
+                say(s"  FAIL  @setup_all ${t.setup_all}")
+                report(ran, say)
+        if set_up.get(t.module_name) is Some(fault)
+            if fault != ""
+                failed += 1
+                say(s"  FAIL  ${t.name}")
+                say(s"        not run: `@setup_all` `${t.setup_all}` failed")
                 continue
-        if output.status == Exited(0)
+        val limit = t.timeout match
+            Some(seconds) -> seconds * 1000
+            None -> TestTimeout
+        val began = monotonic()
+        val ran = run_part(built, i, "", limit)
+        val ms = (monotonic() - began).us / 1000
+        // Why the test failed, or "" when it passed; whether its process ended before the module's
+        // `@teardown` could run in it; and whether that teardown, run in the test's process, failed.
+        var verdict = ""
+        var teardown_apart = false
+        var teardown_failed = false
+        if ran.status == Exited(0)
+            if t.should_trap is Some(_) then verdict = "returned, and should have trapped"
+        elif ran.status is TimedOut
+            verdict = ran.reason
+            teardown_apart = ran.ready && !ran.returned
+        elif !ran.ready
+            verdict = if t.setup != "" && !ran.reason.starts_with(CouldNotRun) then s"not run: `@setup` `${t.setup}` failed: ${ran.reason}" else ran.reason
+        elif !ran.returned
+            teardown_apart = true
+            verdict = ran.reason
+            if t.should_trap is Some(text)
+                if ran.status is Signalled(_)
+                    verdict = if text == "" || ran.everything.contains(text) then "" else s"trapped without printing \"$text\": ${ran.reason}"
+        elif t.teardown != ""
+            teardown_failed = true
+            if t.should_trap is Some(_) then verdict = "returned, and should have trapped"
+        else verdict = ran.reason
+        if verdict == ""
             passed += 1
             say(s"  ok    $padded  ${ms}ms")
-            continue
-        failed += 1
-        say(s"  FAIL  $padded  ${ms}ms")
-        failure(output.status, output.text, output.err.unwrap_or(""), say)
+        else
+            failed += 1
+            say(s"  FAIL  $padded  ${ms}ms")
+            say("        " + verdict)
+            if !teardown_failed then printed(ran, say)
+        if teardown_failed
+            failed += 1
+            say(s"  FAIL  @teardown ${t.teardown}")
+            report(ran, say)
+        if teardown_apart && t.teardown != ""
+            val apart = run_part(built, i, "t", TestTimeout)
+            if apart.status != Exited(0)
+                failed += 1
+                say(s"  FAIL  @teardown ${t.teardown}")
+                report(apart, say)
+        if t.teardown_all != "" && last.get(t.module_name) is Some(final)
+            if final == i
+                val ran_last = run_part(built, i, "z", TestTimeout)
+                if ran_last.status != Exited(0)
+                    failed += 1
+                    say(s"  FAIL  @teardown_all ${t.teardown_all}")
+                    report(ran_last, say)
     say("")
     val elapsed = (monotonic() - started).us / 1000
-    say(s"$passed passed, $failed failed — ${elapsed}ms")
+    say(if ignored > 0 then s"$passed passed, $failed failed, $ignored ignored — ${elapsed}ms" else s"$passed passed, $failed failed — ${elapsed}ms")
     if failed > 0 then 1 else 0
 end run_tests
 
-// Why a test failed, then what it printed. A trap's report names the reason and the place, so it is
-// the reason given; a test that ended any other way is described by how it ended.
-private failure(state: Status, out: string, err: string, say: string -> unit)
-    var reason = state match
+/** One process of a test's run: how it ended; whether the module's `@setup` and then the test had
+ * returned in it; why it stopped, for one that did not exit 0; what it printed, standard output then
+ * standard error without the trap's report; and everything it wrote, the trap's report included. */
+private struct Ran
+    status: Status
+    ready: bool
+    returned: bool
+    reason: string
+    printed: Buf[string]
+    everything: string
+
+/** The reason given for a process that could not be started. */
+private const CouldNotRun: string = "could not be run"
+
+// Runs one part of test `i` in a process of its own: the module's setup, the test and the module's
+// teardown for `part` "", or one hook (`part` "t", "a" or "z"), stopping it after `limit` milliseconds
+// unless `limit` is 0. A test reads no input: it never waits on the terminal `avin test` was started
+// from.
+private run_part(built: Built, i: usize, part: string, limit: int) -> Ran
+    var args: Buf[string] = buf()
+    args.push(i.to_string())
+    if part != "" then args.push(part)
+    val output = capture(built.path, args.view(), stderr = true, timeout = limit, stdin = Stdio.FromPath("/dev/null")) match
+        Ok(o) -> o
+        Err(e) -> return Ran(Exited(1), false, false, s"$CouldNotRun: ${e.to_string()}", buf(), "")
+    val err = output.err.unwrap_or("")
+    var reason = output.status match
         Exited(code) -> s"exited with status $code"
         Signalled(signal) -> s"stopped by signal $signal"
-        TimedOut -> s"did not finish within ${TestTimeout / 1000} seconds"
+        TimedOut -> s"timed out after ${limit / 1000}s"
     var printed: Buf[string] = buf()
-    for line in out.lines()
+    for line in output.text.lines()
         printed.push(line)
+    var ready = false
+    var returned = false
     var trapped = false
     for line in err.lines()
-        if !trapped && line.starts_with(TrapPrefix)
+        if line == TestReady then ready = true
+        elif line == TestReturned then returned = true
+        elif !trapped && line.starts_with(TrapPrefix)
             reason = line[TrapPrefix.len..]
             trapped = true
         else printed.push(line)
-    say("        " + reason)
-    for line in printed
+    Ran(output.status, ready, returned, reason, printed, output.text + err)
+
+// A failed hook's report: why it stopped, then what it printed.
+private report(ran: Ran, say: string -> unit)
+    say("        " + ran.reason)
+    printed(ran, say)
+
+private printed(ran: Ran, say: string -> unit)
+    for line in ran.printed
         say("        > " + line)
 
 /** How the runtime begins its report of a trap on standard error. */

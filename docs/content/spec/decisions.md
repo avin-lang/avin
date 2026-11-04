@@ -970,9 +970,27 @@ Settled by the user on 2026-11-04:
   a trap stops only that test, reporting `ok` or `FAIL` per test grouped by file, the reason and the
   test's output under a failure, and `N passed, M failed`; it exits 1 when any failed. The core
   library's `assert(condition)`, `assert(condition, message)` and `assertEq(actual, expected)` (with
-  `Eq` and `Debug` bounds, showing both values' `Debug` forms) trap at the assertion's place. Not yet
-  built: `@tests` files, setup and teardown hooks, `should_trap`, `ignore` and `timeout` arguments,
-  and tests answering with a `Result`.
+  `Eq` and `Debug` bounds, showing both values' `Debug` forms) trap at the assertion's place.
+- Test attributes, hooks and `@tests` files ([declarations](/spec/declarations/#tests)), following
+  Sysl's model:
+  - **A test yields unit or a `Result[unit, E]`** with `E: Display`; an `Err` fails it, reading
+    `test answered Err: <error>` at the test's name.
+  - **`@test`'s arguments**: a description first, then `should_trap` (alone, or with text the run's
+    output must contain), `timeout: N` (whole seconds, 0 to 2147483, 0 for none, in place of the
+    run's 60) and `ignore: "reason"` (required and not empty), each at most once. `should_trap` is
+    satisfied by a trap, not by a non-zero exit. An ignored test starts no process and runs no hook,
+    and the summary adds `, K ignored` when K is not 0.
+  - **Hooks** `@setup`, `@teardown`, `@setup_all`, `@teardown_all`, at most one of each per module,
+    top-level, taking and yielding nothing. `@setup` runs in the test's process; `@teardown` there
+    after a test that returned and in a process of its own after one that trapped or timed out (not
+    after a failed `@setup`); the `_all` pair each in a process of their own, around the module's
+    selected tests that are not ignored. A failed `@setup` fails its test unrun; a failed
+    `@setup_all` is a failure of its own and fails each of the module's tests unrun, and skips
+    `@teardown_all`; a failed `@teardown` or `@teardown_all` is a failure of its own.
+  - **`@tests` files** are checked by every command and built only by `avin test`: their
+    module-level values are not computed in a program that runs. Only a `@test` function, a hook
+    (a lambda in either counting as it) or another `@tests` file may name what one declares; an impl
+    in one is for a type or of a trait it declares; `main` is not declared in one.
 
 ## Open
 

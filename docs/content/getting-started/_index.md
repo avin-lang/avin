@@ -168,6 +168,13 @@ not shown. The exit status is 1 when any test failed. A second argument keeps on
 name or file contains it. A program built for its tests need not have `main`, and `avin run` and
 `avin build` never run its tests.
 
+A test may answer with a `Result[unit, E]` instead, failing on an `Err`, and `@test` may say more
+about running it: `should_trap` for a test that passes by trapping, `timeout: 5` for a limit of its
+own, `ignore: "why"` for one that is checked and not run. `@setup` and `@teardown` mark functions run
+around each of a module's tests, and `@setup_all` and `@teardown_all` once around them all. A file
+whose header says `@tests` holds fixtures and helpers only the tests may use, and only `avin test`
+builds. The [declarations chapter](/spec/declarations/#tests) has the details.
+
 ## Packages
 
 `avin new` writes a package: a directory with an `avin.hocon` manifest, a module, a test and a

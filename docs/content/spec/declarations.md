@@ -983,6 +983,92 @@ with the document, and `avin weave` renders the document as HTML with its progra
 read the file as a build does, so a file the compiler refuses is refused with the same diagnostic.
 [Getting started](/getting-started/#literate-programs) shows them.
 
+## Tests
+
+A test is a top-level function marked `@test`. `avin test` calls it with nothing, so it takes no
+parameters and has no type parameters; it passes by returning, and fails by stopping, which a failed
+assertion does. It yields unit, or a `Result[unit, E]` whose error has `Display`: an `Ok` passes, and
+an `Err` fails the test with the error shown as the reason (`test answered Err: empty input`,
+reported at the test's name).
+
+```text
+parse(text: string) -> Result[int, string] = if text == "" then Err("empty input") else Ok(text.length())
+
+@test("reads a word")
+readsAWord() -> Result[unit, string]
+    val n = parse("word")?
+    assertEq(n, 4)
+    Ok(())
+```
+
+`@test` names the test after its function, or after a description written first, a string that is
+not empty. After it come, each at most once:
+
+| written | means |
+|---|---|
+| `@test(should_trap)` | the test **passes** by trapping, and fails by returning |
+| `@test(should_trap: "index out of range")` | …and what the run printed contains the text |
+| `@test(timeout: 30)` | the test may run for 30 seconds, in place of the run's limit of 60; `0` is no limit |
+| `@test(ignore: "why")` | the test is compiled and checked, and **not run**; the reason is required |
+
+So `@test("keeps both arms", should_trap: "index out of range", timeout: 5, ignore: "the parser drops
+the second arm")` is one annotation. A timeout is a whole number of seconds from 0 to 2147483. A test
+past its limit is stopped and fails, reading `timed out after Ns`. An ignored test is reported with
+its reason, `skip  name  ignored: why`, starts no process, runs none of its module's hooks and fails
+nothing; the summary counts it, `3 passed, 1 failed, 1 ignored`.
+
+### Hooks
+
+Four more annotations each mark a top-level function `avin test` calls around a module's tests:
+`@setup` before each test and `@teardown` after it, `@setup_all` once before the module's first test
+and `@teardown_all` once after its last. A hook takes nothing, yields unit and takes no arguments in
+its annotation, and a module declares at most one of each. Each test runs in a process of its own,
+which decides what a hook can share:
+
+- `@setup` runs in the test's own process, immediately before the test, so what it stores in a
+  module-level `var` is there when the test reads it.
+- `@teardown` runs in the test's own process after a test that returned, and in a process of its own
+  after a test that trapped or was stopped, so it can rely on releasing only what outlives a process:
+  a file, a directory, a path. It runs after a failed test too.
+- `@setup_all` and `@teardown_all` each run in a process of their own, sharing nothing with the tests
+  but what outlives a process.
+
+A `@setup` that fails fails the test without running it, reading ``not run: `@setup` `name` failed:``
+and the reason; neither the test nor the teardown runs. A `@setup_all` that fails is a failure of its
+own, and each of the module's tests fails without running; its `@teardown_all` does not run. A
+`@teardown` or `@teardown_all` that fails is a failure of its own, on a row naming the hook, beside
+the verdict the test already had.
+
+### `@tests` files
+
+A file whose header says `@tests` holds what the tests need and the program does not: fixtures,
+helpers, types made for the tests, and tests themselves.
+
+```text
+module shapes
+@tests
+
+unitSquare() -> Square = Square(1)
+
+@test
+perimeterOfTheUnitSquare()
+    assertEq(unitSquare().perimeter(), 4)
+```
+
+Every command checks it with the rest of the program, and only `avin test` builds it: a program that
+runs leaves out what it declares, and its module-level values are never computed. So nothing else may
+name what it declares, and the restriction is on the code that names it: a `@test` function or a hook
+in any file may, and so may another `@tests` file; a lambda counts as the function it is written in.
+Anything else is refused where the name is written:
+
+```text
+`unitSquare` is declared in a `@tests` file, so only `avin test` builds it: a `@test` function, a test hook or another `@tests` file may name it, and nothing else
+```
+
+An impl in a `@tests` file is for a type or of a trait that file declares: an impl of anything else
+would make a type behave one way while the tests run and another in the program that ships. And a
+program does not start in a `@tests` file: `main` is declared in an ordinary one.
+
 ## Initialization
 
 - Creating an instance runs the superclass's constructor first, then stores the class parameters,
