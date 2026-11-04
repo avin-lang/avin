@@ -91,10 +91,13 @@ build_and_run()
     assert_eq(avin(["avin", "emit-llvm", source, "-o", ir]).status, 0)
     assert(read_text(ir).unwrap().contains("define i32 @main()"))
 
-// The text of the function `name` in `ir`, from its `define` to its closing brace. A call of the
-// function names it the same way, so the definition is the mention whose line opens a body.
-private function_text(ir: string, name: string) -> string
-    val key = "@\"<program>." + name + "\"("
+// The text of the program's function `name` in `ir`, from its `define` to its closing brace.
+private function_text(ir: string, name: string) -> string = definition_text(ir, "<program>." + name)
+
+// The text of the function whose symbol is `symbol` in `ir`. A call of the function names it the
+// same way, so the definition is the mention whose line opens a body.
+private definition_text(ir: string, symbol: string) -> string
+    val key = "@\"" + symbol + "\"("
     var from = 0usize
     var start = 0usize
     var found = false
@@ -150,6 +153,39 @@ safepoint_polls()
     val binary = dir + "/polls"
     assert_eq(avin(["avin", "build", source, "-o", binary]).status, 0)
     assert(capture(binary, stderr = true, timeout = 10000).unwrap().status == Exited(10))
+
+@test("a call sets the caller site only where it may enter the core library, which keeps it across calls out")
+caller_sites()
+    val dir = make_temp_dir("avin-cli").unwrap()
+    defer _ = remove_dir_all(dir)
+    val source = dir + "/sites.avin"
+    write_text(source, "inc(n: int) -> int = n + 1\n\ntwiceInc(n: int) -> int = inc(inc(n))\n\nmake(n: int) -> int = Array.fill(n, 0).length()\n\napply(f: (int) -> int, x: int) -> int = f(x)\n\nsquares(n: int) -> int = Array.tabulate(n, i -> i * i).length()\n\nmain() -> int = twiceInc(1) + make(2) + apply(inc, 3) + squares(3) - 12\n").unwrap()
+    val out = dir + "/sites.ll"
+    val emitted = avin(["avin", "emit-llvm", source, "-o", out])
+    assert_eq(emitted.noted, "")
+    val ir = read_text(out).unwrap()
+    // The program's functions take no parameter beyond the context and their own.
+    assert(ir.contains("define i32 @\"<program>.inc\"(ptr %ctx, i32 %v0) {"))
+    assert(ir.contains("define i32 @\"<program>.apply\"(ptr %ctx, ptr %v0, i32 %v1) {"))
+    // A call between the program's own functions touches no caller site.
+    assert(!function_text(ir, "twiceInc").contains("%caller.site"))
+    // A direct call into the library sets the site to the call's place, as does a call of a value,
+    // which may be the library's.
+    assert_eq(function_text(ir, "make").count_of(", ptr %caller.site\n"), 1usize)
+    assert(function_text(ir, "make").contains("store ptr @avin.trap."))
+    assert_eq(function_text(ir, "apply").count_of(", ptr %caller.site\n"), 1usize)
+    // The library traps at its caller, and a library call of the library leaves the site alone.
+    val fill = definition_text(ir, "avin.object Array.fill[int]")
+    assert(fill.contains("call void @avin_rt_caller_trap(ptr %ctx, "))
+    assert(!fill.contains("@avin_rt_trap("))
+    assert(!fill.contains("%caller.site"))
+    // A library call of a function value, which may be the program's, keeps the site across it.
+    val tabulate = definition_text(ir, "avin.object Array.tabulate[int]")
+    assert_eq(tabulate.count_of(" = load ptr, ptr %caller.site\n"), 1usize)
+    assert_eq(tabulate.count_of(", ptr %caller.site\n"), 2usize)
+    assert(!tabulate.contains("store ptr @avin.trap."))
+    // A trap in the program's own code reports its own place.
+    assert(function_text(ir, "inc").contains("call void @avin_rt_trap(ptr %ctx, "))
 
 @test("a failed build leaves existing output untouched and never overwrites the source")
 output_protection()
