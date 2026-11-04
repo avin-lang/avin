@@ -57,3 +57,23 @@ test("a list item runs on through blank and indented lines, and ends at the marg
     assert.ok(!end.test("      an example under the item"))
     assert.ok(end.test("Back at the margin."))
 })
+
+test("the prose rules are self-contained: no other grammar is included, and every pattern compiles", () => {
+    const includes: string[] = []
+    const visit = (node: unknown): void => {
+        if (Array.isArray(node)) node.forEach(visit)
+        else if (node && typeof node === "object") {
+            for (const [key, value] of Object.entries(node)) {
+                if (key === "include") includes.push(value as string)
+                else if (["match", "begin", "end"].includes(key)) new RegExp((value as string).replace("\\1", "x"))
+                else visit(value)
+            }
+        }
+    }
+    visit(grammar)
+    assert.deepEqual(includes.filter((i) => !i.startsWith("#")), ["source.avin", "source.avin"])
+})
+
+test("the literate language configuration names its block comment", () => {
+    assert.deepEqual(read("../language-configuration-literate.json").comments, { blockComment: ["<!--", "-->"] })
+})

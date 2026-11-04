@@ -80,8 +80,15 @@ from the new thread too.
   sequentially consistent; there are no weaker orderings in the library. `int`, `long`, `bool` and
   references are the types it is for, and it holds any type: a value of one word is accessed
   lock-free, an integer wider than 64 bits under a lock the runtime keeps for them. A
-  compare-and-set of a reference compares identity, as `===` does, so a reference held in an
-  `Atomic` is also kept alive by it.
+  compare-and-set of a reference to an object of a class compares identity, as `===` does (even for
+  a class that derives `Eq`), and of a function value likewise, so a reference held in an `Atomic`
+  is also kept alive by it. A compare-and-set of a scalar compares the value (a `real`, its bits).
+  A compare-and-set of a value without identity (a data value, an `Option` among them, a tuple, a
+  string or an `Any`) compares with `==`: it succeeds where the current value is `==` to `expected`,
+  however the two were made. It loads the value, compares, and compares-and-sets the word it
+  loaded, trying again where another thread changed it in between. The kind is known for each
+  `T`, so a scalar or a class reference costs one hardware compare-and-set. `update(f)` retries by
+  the same rule.
 - **`Channel[T](capacity = 0)`**, a queue between threads, unbounded when the capacity is zero and
   bounded otherwise, where `send` waits while the channel is full. `receive()` waits for a value and
   gives `Some` of it, or `None` once the channel is closed and every value sent before is received.
