@@ -167,6 +167,19 @@ private struct Lowering
     /** The calls through method tables made on a receiver of a known static type, in the order the
      * functions holding them are lowered. */
     dispatches: Buf[DispatchCall]
+    /** Whether options of pointer-shaped types are kept as pointers: see `representation.sysl`. */
+    options: OptionPlan
+    /** For each instance that adapts a method of an option kept as a pointer to its object's method
+     * table, by the instance's index, where it converts. */
+    adapters: Map[usize, TableAdapter]
+
+/** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
+ * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
+ * object back for a `Self` result. */
+private struct TableAdapter
+    option: &Type
+    selfs: Buf[bool]
+    result: bool
 
 /** A call through a method table position, in the function at index `function`, whose code is the
  * value `code`: at position `position`, on a receiver of static type `receiver`. */
@@ -211,7 +224,7 @@ lower_program(program: TProgram) -> MirProgram
         if k.table.len() > generic_base then generic_base = k.table.len()
     for d in program.data
         if d.table.len() > generic_base then generic_base = d.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf())
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map())
     // Record 0 is for the objects no type pattern names: closures, and the boxes of captured
     // variables.
     l.records.push(TypeRecord("a closure or a captured variable", buf(), None, None))
@@ -375,8 +388,43 @@ private method_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
         if is_abstract_method(symbol) || symbol.decl.type_params.len() > 0 || missing[p] || !slot_used(l, p, symbol.decl.name, t)
             table.push(None)
             continue
-        table.push(Some(instance(l, m, implementation_args(l, t, m))))
+        table.push(Some(table_entry(l, t, m, implementation_args(l, t, m), p)))
     table
+
+// What a method table of type `t` holds for method `m` at checker position `position`: the instance
+// of `m`, or, for an option kept as a pointer, whose table only the object it stands for carries, one
+// that takes that object where the trait's method takes `Self` and calls `m` with the pointer. A
+// trait's default body takes the object itself.
+private table_entry(l: *Lowering, t: &Type, m: usize, type_args: Buf[&Type], position: usize) -> usize
+    val code = instance(l, m, type_args)
+    if !pointer_option(l, t) || is_trait_method(l, l.program.symbols[m]) then return code
+    val key = s"adapter ${instance_key(m, type_args, false)}"
+    if l.instance_index.get(key) is Some(index) then return index
+    val symbol = l.program.symbols[m]
+    val declared = trait_method_at(l, t, position, symbol.decl.name)
+    var selfs: Buf[bool] = buf()
+    for i in 0..<symbol.params.len()
+        selfs.push(i == 0 || (declared match
+            Some(d) -> i < l.program.symbols[d].params.len() && is_self_type(l.program.symbols[d].params[i])
+            None -> false))
+    val result = declared match
+        Some(d) -> is_self_type(l.program.symbols[d].result.unwrap_or(Unit))
+        None -> false
+    val index = l.instances.len()
+    l.instances.push(Instance(m, type_args, false, OptionAdapter))
+    l.instance_index.put(key, index)
+    l.adapters.put(index, TableAdapter(t, selfs, result))
+    index
+
+/** The method a trait `t` conforms to declares at checker position `position`, named `name`. */
+private trait_method_at(l: *Lowering, t: &Type, position: usize, name: string) -> Option[usize]
+    for k in 0..<l.program.classes.len()
+        val c = l.program.classes[k]
+        if c.decl.modifier != "trait" || position < c.base || position >= c.base + c.methods.len() then continue
+        val m = c.methods[position - c.base]
+        if l.program.symbols[m].decl.name != name then continue
+        if ancestor_type(l.program.classes, l.program.data, t, k) is Some(_) then return Some(m)
+    None
 
 /** The function a call of a value of class or data type `t` as a function value runs: the type's
  * `apply` for the function type it is a subtype of, once the program calls a function value. */
@@ -562,7 +610,7 @@ private fill_generic_slot(l: *Lowering, descriptor: usize, t: &Type, s: usize)
         args.push(a)
     for a in slot.type_args
         args.push(a)
-    val code = instance(l, m, args)
+    val code = table_entry(l, t, m, args, slot.position)
     val index = l.generic_base + s
     val old = l.descriptors[descriptor].methods
     var methods: Buf[Option[usize]] = buf()
@@ -586,6 +634,8 @@ private construct(l: *Lowering, e: &TExpr, variant: usize, args: Buf[&TExpr]) ->
         val v = lower_expr(l, a)
         if v is None && machine(l, a.ty) is Some(_) then return None
         values.push(v)
+    // An option kept as a pointer is its value, or null for `None`: nothing is allocated.
+    if pointer_option(l, e.ty) then return if variant == some_variant(l) then values[0] else Some(NullAddress)
     val shape = layout(l, concrete(l, e.ty)).variants[variant]
     if l.descriptors[shape.descriptor].constant then return Some(ConstObject(shape.descriptor))
     val object = fresh(l, MRef)
@@ -805,11 +855,13 @@ private value_box(l: *Lowering, t: &Type) -> usize
     d
 
 // A value as an `Any`. One the program already keeps as a reference to an object is that object;
-// a built-in value is put in a new box, and unit is its one constant box.
+// a built-in value is put in a new box, and unit is its one constant box. An option kept as a
+// pointer becomes the object it stands for.
 private box_value(l: *Lowering, t: &Type, value: Option[Operand]) -> Option[Operand]
     if *t is Unit then return Some(ConstObject(value_box(l, t)))
     val v = value?
     val m = machine(l, t)?
+    if pointer_option(l, t) then return Some(option_object(l, t, v))
     if m is MRef then return Some(v)
     val object = fresh(l, MRef)
     l.insts.push(Alloc(object, value_box(l, t)))
@@ -879,11 +931,64 @@ private add_variant_ancestors(l: *Lowering)
                 grew = true
         if grew then l.records.set(r, TypeRecord(l.records[r].name, ancestors, l.records[r].equals, l.records[r].hash))
 
-/** The value of type `t` an object that has that type holds: a built-in value is in its box. */
-private unbox(l: *Lowering, t: &Type, object: Operand) -> Option[Operand] = machine(l, t) match
-    Some(MRef) -> Some(object)
-    Some(m) -> Some(load_field(l, object, FieldSlot(0, m)))
-    None -> None
+/** The value of type `t` an object that has that type holds: a built-in value is in its box, and an
+ * option kept as a pointer is the `Some`'s value or null. */
+private unbox(l: *Lowering, t: &Type, object: Operand) -> Option[Operand]
+    if pointer_option(l, t) then return Some(option_pointer(l, t, object))
+    machine(l, t) match
+        Some(MRef) -> Some(object)
+        Some(m) -> Some(load_field(l, object, FieldSlot(0, m)))
+        None -> None
+
+/** Whether `t` is an option kept as a pointer: see `representation.sysl`. */
+private pointer_option(l: *Lowering, t: &Type) -> bool = option_is_pointer(l.options, concrete(l, t))
+
+/** The position of `Some` among `Option`'s variants: the one with a field. */
+private some_variant(l: *Lowering) -> usize
+    val d = l.program.data[l.options.option.unwrap()]
+    for v in 0..<d.variants.len()
+        if d.variants[v].fields.len() == 1 then return v
+    0
+
+private none_variant(l: *Lowering) -> usize = if some_variant(l) == 0 then 1 else 0
+
+// The object an option kept as a pointer stands for: `None`'s one constant object for null, and a new
+// `Some` holding any other pointer. It has the layout every option of its type has as an object, so
+// a type pattern, a trait's method table and equality on `Any` read it as any other option.
+private option_object(l: *Lowering, t: &Type, pointer: Operand) -> Operand
+    val shape = layout(l, concrete(l, t))
+    val slot = machine_slot(l, MRef)
+    val absent = new_block(l)
+    val present = new_block(l)
+    val join = new_block(l)
+    finish_into(l, Branch(compare(l, CmpEq, pointer, NullAddress), absent, present), absent)
+    store(l, slot, Some(ConstObject(shape.variants[none_variant(l)].descriptor)))
+    finish_into(l, Jump(join), present)
+    val variant = shape.variants[some_variant(l)]
+    val object = fresh(l, MRef)
+    l.insts.push(Alloc(object, variant.descriptor))
+    if variant.fields[0] is Some(field) then l.insts.push(Store(field_address(l, Value(object), field), pointer))
+    l.insts.push(Publish)
+    store(l, slot, Some(Value(object)))
+    finish_into(l, Jump(join), join)
+    load(l, slot).unwrap()
+
+// The pointer an option object stands for, where its type keeps it as one: a `Some`'s value, or
+// null for `None`.
+private option_pointer(l: *Lowering, t: &Type, object: Operand) -> Operand
+    val shape = layout(l, concrete(l, t))
+    val slot = machine_slot(l, MRef)
+    val absent = new_block(l)
+    val present = new_block(l)
+    val join = new_block(l)
+    val some = ConstInt(64, some_variant(l).to_string())
+    finish_into(l, Branch(compare(l, CmpEq, variant_tag(l, object), some), present, absent), absent)
+    store(l, slot, Some(NullAddress))
+    finish_into(l, Jump(join), present)
+    val field = shape.variants[some_variant(l)].fields[0].unwrap()
+    store(l, slot, Some(load_field(l, object, field)))
+    finish_into(l, Jump(join), join)
+    load(l, slot).unwrap()
 
 // Whether a value of static type `from` always has type `to`: `to` is `Any`, or `from` itself, or
 // a type a value of `from` is with no conversion: an ancestor, an instance of the same generic type
@@ -972,6 +1077,8 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
             op match
                 Some(v) -> operands.push(v)
                 None -> return None
+    // Only the object an option kept as a pointer stands for has a method table.
+    if pointer_option(l, args[0].ty) then operands.set(0, option_object(l, args[0].ty, operands[0]))
     val symbol = l.program.symbols[function]
     var concrete_args: Buf[&Type] = buf()
     for t in type_args
@@ -1041,16 +1148,41 @@ private dispatch_sites(l: *Lowering) -> Buf[DispatchSite]
 // A direct call of `function`, the receiver first for a method. A static member's receiver is a
 // type, which is not passed.
 private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr], type_args: Buf[&Type]) -> Option[Operand]
+    val callee = l.program.symbols[function]
+    // A trait's default body is compiled once for every conforming type, its `Self` an object: an
+    // option kept as a pointer goes in as the object it stands for, and comes out as a pointer again.
+    val default_body = is_trait_method(l, callee)
     var operands: Buf[Operand] = buf()
-    for a in args
+    for i in 0..<args.len()
+        val a = args[i]
         if a.kind is TypeReceiver then continue
         val op = lower_expr(l, a)
         if machine(l, a.ty) is Some(_)
             op match
-                Some(v) -> operands.push(v)
+                Some(v) ->
+                    val self_typed = i == 0 || (i < callee.params.len() && is_self_type(callee.params[i]))
+                    if default_body && self_typed && pointer_option(l, a.ty) then operands.push(option_object(l, a.ty, v))
+                    else operands.push(v)
                 None -> return None
+    if default_body && is_self_type(callee.result.unwrap_or(Unit)) && pointer_option(l, e.ty)
+        val object = call_resolved(l, e, function, callee, args, operands, type_args)?
+        return Some(option_pointer(l, e.ty, object))
+    call_resolved(l, e, function, callee, args, operands, type_args)
+
+/** Whether a function is a method a trait declares, compiled once for every conforming type. */
+private is_trait_method(l: *Lowering, symbol: FunctionSymbol) -> bool = symbol.owner_class match
+    Some(k) -> l.program.classes[k].decl.modifier == "trait"
+    None -> false
+
+/** Whether `t` is a trait's `Self`. */
+private is_self_type(t: &Type) -> bool = *t match
+    TypeVar(owner, _, _) -> is_self_owner(owner)
+    _ -> false
+
+// A direct call of `function` with its arguments already lowered.
+private call_resolved(l: *Lowering, e: &TExpr, function: usize, callee: FunctionSymbol, args: Buf[&TExpr], given: Buf[Operand], type_args: Buf[&Type]) -> Option[Operand]
+    var operands = given
     // A string operation is lowered where it is called, so its checks report the call's place.
-    val callee = l.program.symbols[function]
     if callee.intrinsic is Some(name)
         if name == "trap"
             // A literal reason is written into the trap site; one made as the program runs, such as
@@ -1419,7 +1551,7 @@ private crossing(l: *Lowering, t: &Type, layouts: *Buf[Operand]) -> &Crossing
                 variants.push(CrossVariant(d.variants[v].name, l.descriptors[shape.variants[v].descriptor].constant, fields))
             val form = mirror_target(d.decl) match
                 Some(target) -> Mirror(d.name, target, d.unit, d.decl.span, d.variants.len() == 1 && d.variants[0].name == d.name)
-                None -> if d.name == "Option" then OptionForm else ResultForm
+                None -> if d.name == "Option" then OptionForm(pointer_option(l, t)) else ResultForm
             return Crossing(t, form, variants, layouts.len() - start)
         _ -> return Crossing(t, Plain, buf(), 0)
 
@@ -2381,13 +2513,17 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
             val from = concrete(l, p.ty)
             val to = concrete(l, target)
             var bound = value
+            // An option kept as a pointer is the same pointer as any option it is seen as; seen as
+            // anything else, or tested as an object, it is the object it stands for.
+            val pointer = pointer_option(l, from)
             if always_is(l, from, to)
-                if *to is AnyType && !(*from is AnyType) then bound = box_value(l, from, value)
+                if (*to is AnyType && !(*from is AnyType)) || (pointer && !pointer_option(l, to)) then bound = box_value(l, from, value)
             elif *from is AnyType || *from is Class(_, _, _) || *from is Tuple(_) || *from is Data(_, _, _)
                 // An object whose type is a subtype of its static type: its descriptor's record says.
                 if value is Some(v)
-                    continue_if(l, type_test(l, v, to), fail)
-                    bound = unbox(l, to, v)
+                    val object = if pointer then option_object(l, from, v) else v
+                    continue_if(l, type_test(l, object, to), fail)
+                    bound = unbox(l, to, object)
             else
                 // A value that is neither `Any` nor an object of a class has exactly its static
                 // type, which a copy of generic code may find is not `to`.
@@ -2402,6 +2538,13 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
                 test_pattern(l, items[i], lower_expr(l, elements[i]), fail)
         PVariant(variant, fields) ->
             if value is Some(v)
+                // An option kept as a pointer is `None` where it is null, and otherwise the `Some`
+                // whose value it is.
+                if pointer_option(l, p.ty)
+                    val some = variant == some_variant(l)
+                    continue_if(l, compare(l, if some then CmpNe else CmpEq, v, NullAddress), fail)
+                    if some && fields.len() == 1 && !(fields[0].kind is PWildcard) then test_pattern(l, fields[0], Some(v), fail)
+                    return
                 val shape = layout(l, concrete(l, p.ty))
                 // A type with one variant needs no test; otherwise the tag is in the descriptor.
                 if shape.variants.len() > 1
@@ -2446,6 +2589,8 @@ private const RecordHash: u8 = 4
 private const AnyEquals: u8 = 5
 /** The hash of a value of unknown type, through its record. */
 private const AnyHash: u8 = 6
+/** A method table's entry for an option kept as a pointer: see `table_entry`. */
+private const OptionAdapter: u8 = 7
 
 /** Where a type record's `equals` and `hash` entries are: after the ancestor count. */
 private const RecordEqualsEntry: usize = 8
@@ -2690,6 +2835,7 @@ private lower_generated(l: *Lowering, inst: Instance) -> MirFunction
     l.param_values = buf()
     l.returns_value = true
     l.current = new_block(l)
+    if inst.generated == OptionAdapter then return lower_adapter(l, inst)
     val t = inst.type_args[0]
     val key = type_key(t)
     val kind = inst.generated
@@ -2727,6 +2873,33 @@ private lower_generated(l: *Lowering, inst: Instance) -> MirFunction
     any_hash(l, a)
     MirFunction("avin.any.hash", MirSignature(single(MRef), Some(MInt(64))), l.values, l.slots, l.blocks)
 
+// A method table's entry for an option kept as a pointer: each parameter its trait's method takes as
+// `Self` arrives as the object the option stands for and is passed on as the pointer, and a `Self`
+// result goes back as an object.
+private lower_adapter(l: *Lowering, inst: Instance) -> MirFunction
+    val shape = l.adapters.get(l.function_index).unwrap()
+    val symbol = l.program.symbols[inst.function]
+    l.subst = inst.type_args
+    l.subst_owner = symbol.type_owner
+    val signature = signature_of(l, l.program.functions[inst.function])
+    var given: Buf[Option[Operand]] = buf()
+    for p in 0..<symbol.params.len()
+        given.push(param_machine(l, symbol, p) match
+            Some(m) -> Some(Value(fresh(l, m)))
+            None -> None)
+    var operands: Buf[Operand] = buf()
+    for p in 0..<given.len()
+        if given[p] is Some(v) then operands.push(if shape.selfs[p] then option_pointer(l, shape.option, v) else v)
+    val dest = signature.result match
+        Some(m) -> Some(fresh(l, m))
+        None -> None
+    push_call(l, dest, Direct(instance(l, inst.function, inst.type_args)), operands)
+    val result = dest match
+        Some(d) -> Some(if shape.result then option_object(l, shape.option, Value(d)) else Value(d))
+        None -> None
+    finish(l, Return(result))
+    MirFunction("avin.adapter." + function_symbol(l.program, inst.function, inst.type_args), signature, l.values, l.slots, l.blocks)
+
 private pair(m: MirType) -> Buf[MirType]
     var out: Buf[MirType] = buf()
     out.push(m)
@@ -2763,9 +2936,21 @@ private has_field_data(fields: Buf[Option[FieldSlot]]) -> bool
 // Two values of one tuple or data type are equal when they are of one variant and each field is
 // equal; the first difference decides.
 private structural_equals(l: *Lowering, t: &Type, a: Operand, b: Operand)
-    val shape = layout(l, t)
     val unequal = new_block(l)
     l.blocks[unequal].term = Return(Some(ConstBool(false)))
+    // Two options kept as pointers: of one variant when both or neither is null, and two `Some`s by
+    // their values.
+    if pointer_option(l, t)
+        val absent = compare(l, CmpEq, a, NullAddress)
+        continue_if(l, compare(l, CmpEq, absent, compare(l, CmpEq, b, NullAddress)), unequal)
+        val both_none = new_block(l)
+        val both_some = new_block(l)
+        finish_into(l, Branch(absent, both_none, both_some), both_none)
+        finish_into(l, Return(Some(ConstBool(true))), both_some)
+        val inner = field_types(l, t, some_variant(l))[0]
+        finish(l, Return(Some(equals_values(l, inner, a, b))))
+        return
+    val shape = layout(l, t)
     if shape.variants.len() == 1
         equal_fields(l, field_types(l, t, 0), shape.variants[0].fields, a, b, unequal)
         finish(l, Return(Some(ConstBool(true))))
@@ -2791,6 +2976,17 @@ private equal_fields(l: *Lowering, types: Buf[&Type], fields: Buf[Option[FieldSl
 
 // A tuple's or data value's hash combines its variant's tag with its fields' hashes, in order.
 private structural_hash(l: *Lowering, t: &Type, a: Operand)
+    // An option kept as a pointer hashes as the object it stands for does: `None` by its tag, and a
+    // `Some` by its tag and its value.
+    if pointer_option(l, t)
+        val none = new_block(l)
+        val some = new_block(l)
+        finish_into(l, Branch(compare(l, CmpEq, a, NullAddress), none, some), none)
+        finish_into(l, Return(Some(ConstInt(64, none_variant(l).to_string()))), some)
+        val inner = field_types(l, t, some_variant(l))[0]
+        val start = binary(l, MInt(64), OpMul, ConstInt(64, some_variant(l).to_string()), ConstInt(64, "31"))
+        finish(l, Return(Some(binary(l, MInt(64), OpAdd, start, hash_value(l, inner, a)))))
+        return
     val shape = layout(l, t)
     if shape.variants.len() == 1
         finish(l, Return(Some(hash_fields(l, field_types(l, t, 0), shape.variants[0].fields, a, ConstInt(64, "0")))))

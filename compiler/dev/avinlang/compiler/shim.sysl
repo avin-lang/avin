@@ -234,7 +234,7 @@ private mirror_of(w: *ShimWriter, c: &Crossing) -> Option[usize]
 private sysl_type(w: *ShimWriter, c: &Crossing) -> string = c.form match
     Plain -> sysl_side(c.ty)
     Bytes -> "[]u8"
-    OptionForm -> s"Option[${sysl_type(w, payload(c, "Some"))}]"
+    OptionForm(_) -> s"Option[${sysl_type(w, payload(c, "Some"))}]"
     ResultForm -> s"Result[${sysl_type(w, payload(c, "Ok"))}, ${sysl_type(w, payload(c, "Err"))}]"
     Mirror(_, _, _, _, _) -> s"mirror_${mirror_of(w, c).unwrap()}"
     Elements(element, _) -> s"[]${sysl_type(w, element)}"
@@ -244,7 +244,7 @@ private sysl_type(w: *ShimWriter, c: &Crossing) -> string = c.form match
 private sysl_types(w: *ShimWriter, c: &Crossing) -> Buf[string]
     var out: Buf[string] = buf()
     c.form match
-        OptionForm ->
+        OptionForm(_) ->
             for t in sysl_types(w, payload(c, "Some"))
                 out.push(s"Option[$t]")
         ResultForm ->
@@ -264,6 +264,12 @@ private payload(c: &Crossing, name: string) -> &Crossing
     for v in c.variants
         if v.name == name then return v.fields[0].crossing
     c
+
+// The field of an option's `Some`.
+private payload_field(c: &Crossing) -> CrossField
+    for v in c.variants
+        if v.name == "Some" then return v.fields[0]
+    panic("an option's crossing without `Some`")
 
 // How a value of `c`'s type is passed with the C convention.
 private crossing_c_side(c: &Crossing) -> string = if c.form is Plain then c_side(c.ty) else "*u8"
@@ -317,6 +323,13 @@ private in_function(w: *ShimWriter, k: usize)
     put(w, "\n")
     val start = w.line
     put(w, s"// ${type_name(c.ty)} into Sysl.\nprivate in_$k(ctx: *Context, p: *u8, ds: **u8) -> ${sysl_type(w, c)}\n")
+    // An option Avin keeps as a pointer is `None` where it is null, and otherwise its value.
+    if c.form is OptionForm(true)
+        val f = payload_field(c)
+        put(w, "    if p == null then return None\n")
+        put(w, "    Some(" + into_expr(w, f.crossing, "p", "ds", f.base) + ")\n")
+        mirror_lines(w, c, start)
+        return
     if c.variants.len() > 1 then put(w, "    val tag = descriptor_of(p).tag\n")
     for t in 0..<c.variants.len()
         val v = c.variants[t]
@@ -356,6 +369,11 @@ private out_overload(w: *ShimWriter, k: usize, c: &Crossing, spelling: string)
     val mirrored = c.form is Mirror(_, _, _, _, _)
     val structure = c.form is Mirror(_, _, _, _, true)
     put(w, s"private out_$k(ctx: *Context, v: $spelling, ds: **u8) -> *u8\n")
+    if c.form is OptionForm(true)
+        val f = payload_field(c)
+        put(w, "    v match\n        None -> null\n")
+        put(w, "        Some(f0) -> " + out_expr(w, f.crossing, "f0", "ds", f.base, false) + "\n")
+        return
     if !structure then put(w, "    v match\n")
     for t in 0..<c.variants.len()
         val v = c.variants[t]
