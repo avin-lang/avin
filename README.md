@@ -32,11 +32,13 @@ values. The compiler is written in Sysl; the standard library is written in Avin
 - **Naturalness**: code that flows naturally. Writing code should feel like expressing an idea, not
   negotiating with a compiler.
 
-The whole of it is in [The AVIN philosophy](docs/content/spec/philosophy.md).
+The whole of it is in [The AVIN philosophy](https://avin-lang.github.io/avin/spec/philosophy/).
 
 ## Status
 
-Avin is early. The [specification](docs/content/spec/) is the design, and the
-[roadmap](docs/content/compiler/roadmap.md) tracks the compiler being built to it. The
-[examples](examples/) are programs the compiler builds today, and the test suite runs each one.
-[Getting started](docs/content/getting-started/_index.md) shows how to build and test it.
+Avin is early. The [specification](https://avin-lang.github.io/avin/spec/) is the design, and the
+[roadmap](https://avin-lang.github.io/avin/compiler/roadmap/) tracks the compiler being built to it.
+The [examples](examples/) are programs the compiler builds today, and the test suite runs each one.
+[Getting started](https://avin-lang.github.io/avin/getting-started/) shows how to build and test
+it, and [editor support](https://avin-lang.github.io/avin/getting-started/editors/) covers VS Code
+and the language server. The documentation's sources are in [docs/](docs/).
