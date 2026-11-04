@@ -1387,10 +1387,10 @@ Settled by the user on 2026-11-04:
     and percent-encoded, written in Avin; an HTTP/1.1 client (`get`, `post`, `send` with a `Request`)
     written in Avin over the TCP stream, a status never an error. `IoError` gains
     `ConnectionRefused`, `ConnectionReset` and `TimedOut`. Bindings: `sysl.net.resolve`, `socket`
-    and the `Socket` methods. **TCP is blocked on stage-7 opaque handles** (a `Socket`, and the
-    `Address` it connects to, are not boundary types); `Url` is not blocked. **`https` is blocked on
-    bindings to Sysl packages other than the standard library**, since TLS lives in a package of its
-    own.
+    and the `Socket` methods, held as an opaque handle (a `Socket`, and the `Address` it connects
+    to, are not boundary types). `Url` needs neither. `https` takes a Sysl TLS package, named in
+    the library's `sysl-dependencies` and bound as any package is; opaque handles and bindings to
+    Sysl packages beyond the standard library are both in the compiler.
   - **[Concurrency](/spec/system-library/#concurrency)** stays in `avin.threads`; there is no
     separate concurrency module. The reference's futures map onto what is there (`successful`, `all`
     for `sequence`, `first` for `firstCompletedOf`, `await` for waiting with a time limit); added are
