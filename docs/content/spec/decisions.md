@@ -495,9 +495,10 @@ Settled by the user on 2026-11-03:
   share its name with a variant of another type, nor with a fieldless variant of its own type's name.
   A `builder` returning a `Builder` of its collection takes its type arguments from the type a
   literal expects, so their bounds are checked at the call.
-- A sequence literal builds whatever collection is expected through its companion's `builder`,
-  `Set` and `Map` included (`val s: Set[int] = [3, 1, 2]`), until set and map literals have syntax of
-  their own.
+- A collection literal builds whatever collection is expected through its companion's `builder`: a
+  sequence literal a sequence, a set literal `{a, b}` a set and a map literal `{k: v}` a map, giving
+  the builder each entry as a `(key, value)` pair; with no expected collection they are a `Vector`, a
+  `Set` and a `Map`.
 - The arithmetic traits carry their identities: `Add` has `zero` and `Mul` has `one`, so `sum` and
   `product` of an empty collection are those values rather than an `Option`. They are written once,
   by impls on `Iterable` (`impl[T: Add] Iterable[T]`, `impl[T: Mul] Iterable[T]`).
@@ -818,6 +819,14 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
+- Literal shapes ([collections](/spec/collections/#literals)): each of the library's collections is
+  built only by the literal of its own shape: every `Seq` by `[a, b]`, `Set`, `TreeSet` and the
+  mutable `Set` by `{a, b}`, and `Map`, `TreeMap` and the mutable `Map` by `{k: v}`, so
+  `val s: Set[int] = [1, 2]` is an error naming the literal to write; `{}` is the empty set or the
+  empty map, whichever is expected. A program's own collection with a builder is built by any
+  literal whose elements its builder takes, a map literal only by a builder of pairs. A map literal's
+  keys agree on one type and its values on another, each as `if` branches do. The mutable `Set` and
+  `Map` gain companions with `empty` and `builder`.
 - Sorted collections ([collections](/spec/collections/#sorted-maps-and-sets)): `TreeMap[K: Ord, +V]`
   and `TreeSet[A: Ord]` are data types of their own beside `Map` and `Set`, not variants of them, and
   `Map` and `Set` stay the hash-based collections rather than becoming traits over a `HashMap` and a
