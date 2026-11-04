@@ -140,16 +140,73 @@ parse_while(p: *Parser, at: Span) -> &Expr
     Expr(at.to(p.toks.here()), While(condition, body, otherwise))
 
 // `for pattern in source` and an indented body, or `for pattern in source do body` on one line.
+// With `yield`, a comprehension: generators separated by commas, each followed by its `if` guards,
+// or written one to a line in an indented block after `for`, with `yield` on the line after it.
 parse_for(p: *Parser, at: Span) -> &Expr
-    val pattern = parse_pattern(p)
-    p.expect("in")
-    val source = expression(p, 0)
+    var generators: Buf[Generator] = buf()
+    if p.accept_kind(Indent)
+        // A line starting with `if` adds guards to the generator above it.
+        var guards: Buf[&Expr] = buf()
+        var start = p.toks.here()
+        var pattern: Option[&Pattern] = None
+        var source: &Expr = Expr(start, Invalid)
+        loop
+            if p.toks.at_end() || p.accept_kind(Dedent) then break
+            if p.accept_kind(Newline) then continue
+            val before = p.toks.position
+            if p.at("if") && pattern is Some(_)
+                guards_after(p, &guards)
+            else
+                if pattern is Some(shape) then generators.push(generator_of(start, shape, source, guards))
+                guards = buf()
+                start = p.toks.here()
+                pattern = Some(parse_pattern(p))
+                p.expect("in")
+                source = expression(p, 0)
+                guards_after(p, &guards)
+            if p.toks.position == before then break
+        pattern match
+            Some(shape) -> generators.push(generator_of(start, shape, source, guards))
+            None -> generators.push(generator(p))
+        if !following(p, "yield")
+            p.report.add(error(p.toks.here(), "generators written in a block after `for` need `yield` on the line after them"))
+            return Expr(at.to(p.toks.here()), Invalid)
+    else
+        generators.push(generator(p))
+        while p.accept(",")
+            generators.push(generator(p))
+    if p.accept("yield")
+        val indented = p.at_kind(Indent)
+        val body = parse_line_body(p, false)
+        optional_end(p, "for", indented)
+        return Expr(at.to(p.toks.here()), ForYield(generators, body))
+    val first = generators[0]
+    if generators.len() > 1 || first.guards.len() > 0
+        p.report.add(error(first.span.to(generators[generators.len() - 1].span), "a `for` without `yield` has one generator and no guards; nest the loops, or test in the body"))
     val do_word = p.accept("do")
     val indented = p.at_kind(Indent)
     if !do_word && !indented then p.report.add(error(p.toks.here(), "a one-line `for` needs `do`"))
     val body = parse_body(p, true)
     optional_end(p, "for", indented)
-    Expr(at.to(p.toks.here()), For(pattern, source, body))
+    Expr(at.to(p.toks.here()), For(first.pattern, first.source, body))
+
+// `pattern in source` and the `if` guards after it.
+private generator(p: *Parser) -> Generator
+    val start = p.toks.here()
+    val pattern = parse_pattern(p)
+    p.expect("in")
+    val source = expression(p, 0)
+    var guards: Buf[&Expr] = buf()
+    guards_after(p, &guards)
+    generator_of(start, pattern, source, guards)
+
+// A generator spans from its pattern through its last guard.
+private generator_of(start: Span, pattern: &Pattern, source: &Expr, guards: Buf[&Expr]) -> Generator
+    val end = if guards.len() > 0 then guards[guards.len() - 1].span else source.span
+    Generator(start.to(end), pattern, source, guards)
+
+private guards_after(p: *Parser, guards: *Buf[&Expr])
+    while p.accept("if") do guards.push(expression(p, 0))
 
 // `loop` and an indented body, or `loop do body` on one line; only `break` or `return` leaves it.
 parse_loop(p: *Parser, at: Span) -> &Expr

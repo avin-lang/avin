@@ -559,6 +559,17 @@ source with an `iterator` method is traversed by `hasNext()` and `next()` on the
 out, dispatched through the trait. `loop_tests.sysl` holds the counts of calls and allocations each
 form makes.
 
+**`for` with `yield`** is parsed as `ForYield`, its generators each holding their pattern, source and
+guards, and checked as the calls it means (`for_yield_expr`). The first source is checked; each of
+its guards becomes a `withFilter` call on what came before, and the whole is called with `map` (the
+last generator) or `flatMap`, each given a lambda of one hidden parameter whose body binds it by the
+generator's pattern, as a loop's element is bound, and goes on with the guard, the yielded value or
+a `ForYield` of the remaining generators. Each call goes through the method resolution a written call
+uses, overloads included, with the comprehension's expected type passed to the outermost one; a
+receiver without the method is reported at the generator's source. The lambdas are named apart so a
+diagnostic says "this guard" rather than "this lambda", and `return`, `break`, `continue` and `?`
+in them are reported as unable to leave the comprehension.
+
 ## Tests
 
 `sysl test compiler`, run from the repository root, runs every test.

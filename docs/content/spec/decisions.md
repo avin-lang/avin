@@ -469,6 +469,21 @@ Settled by the user on 2026-11-03:
   their own.
 - The arithmetic traits carry their identities: `Add` has `zero` and `Mul` has `one`, so `sum` and
   `product` of an empty collection are those values rather than an `Option`.
+- `Seq[+T]` is a core trait over `Iterable[T]` with two abstract methods, `length()` and
+  `apply(index)`; its other methods (`get`, `isEmpty`, `head`, `headOption`, `last`, `lastOption`,
+  the folds, `foreach`, `exists`, `forall`, `find`, `indexWhere`, `count`, `toVector`, `toList`, an
+  iterator and `reverseIterator`) are default bodies written once over those two. `List` is a `Seq`
+  and overrides every one that would index into it, so none takes more than linear time on a list.
+  `contains` and `indexOf` take an element, which a covariant trait's method cannot, so each
+  sequence type declares its own.
+- A sequence passed or stored where a function from one `int` is expected becomes that function,
+  through the core library's `elementAt`; the conversion happens where the value is written, as a
+  conversion to `Any` does.
+- A sequence pattern on a sequence other than a list asks `length()` once and then reads, with
+  `apply`, each element whose pattern is not `_`, in order, stopping at the first that fails.
+- `Deque[T]` is a ring over an array, doubling when full as a buffer does, its spare places zero
+  bytes. `removeFirst()` and `removeLast()` return the element and trap on an empty deque, as
+  `Buffer.remove` traps outside the buffer; `isEmpty()` is the test before them.
 
 **Deferred**
 
@@ -479,6 +494,20 @@ Settled by the user on 2026-11-03:
 
 ## Proposed
 
+- The form of a `for` with `yield` ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
+  generators `pattern in source` separated by commas, each followed by any number of `if` guards,
+  then `yield` and the value on the rest of the line or in an indented block; or the generators one
+  to a line in a block after `for`, a line starting with `if` guarding the generator above, with
+  `yield` on the line after the block. `yield` is a keyword. A `for` without `yield` keeps one
+  generator and no guards.
+- A guard is `withFilter`, a lazy view each collection provides (`Option`'s is its `filter`); a type
+  of the program's own needs `withFilter` for a guard, with no fallback to `filter`. `flatMap` on
+  the library's collections takes any `Iterable` from its function; a `Range` maps to a `Vector`;
+  a `Map`'s entries reach a comprehension as pairs, through `map` and `flatMap` overloads taking
+  a function of one pair, and yield a `Map`.
+- A generator's pattern must match every element, as in a `for` loop, rather than filtering out the
+  elements it does not match. `return`, `break`, `continue` and `?` cannot leave a comprehension's
+  guards or yielded value.
 - Running and testing (stage 10): `avin run <program> [-O0 | -O2] [-- args]` builds into
   `.avin/build/` in the program's directory, reuses the executable while nothing it was built from
   has changed, and exits with the program's status, or 128 and the signal's number for a trap. Its
@@ -502,8 +531,17 @@ Settled by the user on 2026-11-03:
   so a racing read sees some value written to that word, and a constructor ends with a release
   fence, so no thread sees an object without its header and constructor-set fields. Actors are
   scheduled onto a pool of these threads.
+- An `impl` adding methods to a trait (`impl[T] Seq[T]`, `impl[T: Display] Seq[T]`), which an impl
+  cannot do today. Its methods would reach the value only through the trait's own methods, which
+  are variance-checked, so, like the methods an impl adds to a `data` type, they would not be
+  variance positions: `contains(element: T)`, `indexOf`, `mkString` and `max`/`min` could then be
+  written once on `Seq` instead of on each sequence type, and generic code over `Seq[T]` would have
+  them.
 
 ## Open
+
+- Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
+  over a `Map` yields when its values are not pairs (it needs `Iterable`'s own transformations).
 
 - Resource cleanup: a `defer` construct or a library `use`.
 - How actors work: how messages are declared and sent, mailboxes and replies, how actors are
