@@ -4,7 +4,7 @@ module avin.rt
 import sh.sysl.gc
 import sysl.raw.ptr_cast
 import sysl.sync.*
-import sysl.threads.{Thread, spawn, yield_now}
+import sysl.threads.{Mutex, Thread, spawn, yield_now}
 
 // Real threads sharing the heap, each running as compiled code does: a context attached for the
 // thread, a frame of roots linked onto it, allocation through the runtime and polls of `requested`.
@@ -245,3 +245,59 @@ thread_contexts()
     assert(contexts == a)
     thread_detach(a)
     assert(contexts == null)
+
+// A frame of two references, holding a lock and a condition while a test waits on them.
+private struct TwoRoots
+    frame: Frame
+    first: *u8
+    second: *u8
+
+private var w: TwoRoots = TwoRoots(Frame(null, 2), null, null)
+
+@test("a timed condition wait nobody notifies runs out, answers false and holds the lock again")
+timed_wait_runs_out()
+    val me = thread_attach()
+    w.frame.prev = me.top
+    me.top = &w.frame
+    w.first = lock_new(me)
+    w.second = condition_new(me)
+    val lock = w.first
+    val condition = w.second
+    lock_acquire(me, lock)
+    assert(!condition_wait_for(me, condition, lock, 20))
+    val l: *Mutex[unit] = ptr_cast(lock)
+    assert(l.try_lock_raw().is_none())
+    assert(!condition_wait_for(me, condition, lock, 0))
+    assert(!condition_wait_for(me, condition, lock, -5))
+    assert(l.try_lock_raw().is_none())
+    lock_release(me, lock)
+    assert(l.try_lock_raw().is_some())
+    l.unlock_raw()
+    me.top = w.frame.prev
+    thread_detach(me)
+    collect_now()
+    assert_eq(gc.live(&space), 0usize)
+
+@test("the pool's size is the machine's processor count, and at least one")
+pool_size()
+    assert(processors() >= 1)
+
+@test("the monotonic clock never runs backward, and a timed wait that runs out has waited its time")
+monotonic_clock()
+    val me = thread_attach()
+    w.frame.prev = me.top
+    me.top = &w.frame
+    w.first = lock_new(me)
+    w.second = condition_new(me)
+    lock_acquire(me, w.first)
+    val before = monotonic_millis()
+    assert(!condition_wait_for(me, w.second, w.first, 30))
+    val after = monotonic_millis()
+    assert(after - before >= 29, s"a 30 ms wait ran out after ${after - before} ms")
+    lock_release(me, w.first)
+    me.top = w.frame.prev
+    w.first = null
+    w.second = null
+    thread_detach(me)
+    collect_now()
+    assert_eq(gc.live(&space), 0usize)

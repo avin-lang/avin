@@ -203,6 +203,9 @@ lower_program(program: TProgram) -> MirProgram
     var global_types: Buf[Option[MirType]] = buf()
     for g in program.globals
         global_types.push(mir_type(solve(program.vars, program.symbols[g.init].result.unwrap_or(Unit))))
+    // Each `lazy val` also has a state word, after every module-level value: see `lazy_state`.
+    for g in program.globals
+        if g.lazy then global_types.push(Some(MInt(64)))
     var generic_base = 0usize
     for k in program.classes
         if k.table.len() > generic_base then generic_base = k.table.len()
@@ -1664,6 +1667,64 @@ private machine_slot(l: *Lowering, m: MirType) -> Option[Place]
     l.slots.push(m)
     Some(Place(SlotAddress(id), m))
 
+/** The index of the state word of the module-level `lazy val` `g`: the state words follow the
+ * values, one for each lazy value in declaration order. */
+private lazy_state(l: *Lowering, g: usize) -> usize
+    var index = l.program.globals.len()
+    for i in 0..<g
+        if l.program.globals[i].lazy then index += 1
+    index
+
+// The read of a lazy value whose state word is at `state`. The word is 0 before the first read, the
+// reading thread's context while that thread runs the initializer, and 1 once the value is stored. A
+// read that finds 1 loads the value at once: one atomic load and a branch the processor predicts.
+// Any other asks the runtime, which answers whether this thread is to run the initializer, having
+// claimed the word, or the value is now stored, having waited, safe for the collector, for the
+// thread running it; a thread that finds its own context there traps at the read. The thread that
+// runs it stores the value and then marks the word with a release store, so a thread that sees the
+// mark sees the whole value.
+private lazy_read(l: *Lowering, at: Span, name: string, p: LazyPlace, initialize: &TExpr) -> Option[Operand]
+    val word = fresh(l, MInt(64))
+    l.insts.push(AtomicLoad(word, lazy_state_address(l, p)))
+    val ready = compare(l, CmpEq, Value(word), ConstInt(64, "1"))
+    val slow = new_block(l)
+    val run = new_block(l)
+    val done = new_block(l)
+    finish_into(l, Branch(ready, done, slow), slow)
+    val site = trap_site(l, s"`$name` is read while it is being initialized", at)
+    val first = runtime_call(l, "avin_rt_lazy_begin", [MPtr, MPtr], MInt(32), [lazy_state_address(l, p), TrapSiteAddress(site)])
+    finish_into(l, Branch(compare(l, CmpNe, first, ConstInt(32, "0")), run, done), run)
+    val value = lower_expr(l, initialize)
+    // An initializer that never returns traps or ends the program.
+    if value is None && machine(l, initialize.ty) is Some(_) then finish_into(l, Unreachable, done)
+    else
+        store(l, lazy_value_place(l, p), value)
+        var types: Buf[MirType] = buf()
+        types.push(MPtr)
+        var args: Buf[Operand] = buf()
+        args.push(lazy_state_address(l, p))
+        l.insts.push(Call(None, Runtime("avin_rt_lazy_end", MirSignature(types, None)), args))
+        finish_into(l, Jump(done), done)
+    load(l, lazy_value_place(l, p))
+
+/** Where a lazy value is kept: module-level value `global`'s storage, or the fields `state` and
+ * `value` of `object`, `value` being `None` for a value with no runtime representation. */
+private struct LazyPlace
+    object: Option[Operand]
+    global: usize
+    state: Option[FieldSlot]
+    value: Option[FieldSlot]
+
+private lazy_state_address(l: *Lowering, p: LazyPlace) -> Operand = p.object match
+    Some(o) -> field_address(l, o, p.state.unwrap())
+    None -> GlobalAddress(lazy_state(l, p.global))
+
+private lazy_value_place(l: *Lowering, p: LazyPlace) -> Option[Place] = p.object match
+    Some(o) -> p.value match
+        Some(f) -> Some(Place(field_address(l, o, f), f.ty))
+        None -> None
+    None -> global_place(l, p.global)
+
 /** Where a module-level value is kept, or `None` for one with no runtime value. */
 private global_place(l: *Lowering, g: usize) -> Option[Place] = l.global_types[g] match
     Some(t) -> Some(Place(GlobalAddress(g), t))
@@ -1796,6 +1857,11 @@ private lower_kind(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         l.insts.push(Alloc(object, layout(l, concrete(l, e.ty)).variants[0].descriptor))
         Some(Value(object))
     Global(index) -> load(l, global_place(l, index))
+    LazyGlobal(index, initialize, name) -> lazy_read(l, e.span, name, LazyPlace(None, index, None, None), initialize)
+    LazyField(value, index, initialize, name) ->
+        val object = lower_expr(l, value)?
+        val fields = layout(l, concrete(l, value.ty)).variants[0].fields
+        lazy_read(l, e.span, name, LazyPlace(Some(object), 0, fields[index + 1], fields[index]), initialize)
     StoreGlobal(index, value, yields) ->
         val v = lower_expr(l, value)
         if v is None && machine(l, value.ty) is Some(_) then return None

@@ -689,6 +689,45 @@ Settled by the user on 2026-11-04:
   meaning: `name()` or `name(x: T)` before a block declares one. A block whose only line is a name
   and an operand stays the infix-continuation error. A block for a last parameter that is neither
   by-name nor a function, already given, or absent is an error.
+- [Futures](/spec/threads/#futures) in `avin.threads`: `Future(body)`, the companion's
+  `apply[T](body: -> T)`, runs a by-name body on a shared pool and gives back a `Future[T]` at once;
+  `await()` waits safe for the collector, `await(timeoutMillis: long)` gives an `Option`, and times
+  are milliseconds as a `long`, as in a condition's `waitFor(timeoutMillis) -> bool`. `map`,
+  `flatMap`, `zip`, `onComplete`, `Future.all` (a `Vector` in the order given), `Future.first`
+  (trapping on no futures) and `Future.successful` never wait, and every function given to one
+  runs on a pool thread. A future carries no failure: a computation that can fail is a
+  `Future[Result[T, E]]`, which also has `mapOk` and `flatMapOk`, and a trap in a body stops the
+  program. `Promise[T]()` has a `future` field; `complete(x)` a second time traps, and
+  `tryComplete(x) -> bool` completes only where nothing has. The pool starts workers as work comes,
+  up to one per processor (`sysl.platform.cpu_count`), never joins them, and starts one more in the
+  place of each worker waiting in `await` while work is queued, so nested waits never deadlock it;
+  `await` inside a body is allowed. The pool is a module's `lazy val`, so a program that makes no
+  future never makes it.
+- [`lazy val`](/spec/declarations/#initialization), at module level and in class and object bodies
+  (each instance its own), is computed on its first read, exactly once, and kept; never read, never
+  computed. `lazy` is a modifier only before `val`, an ordinary name elsewhere; `lazy var` and
+  `lazy` on parameters, class parameters, data fields and locals are errors. A module-level one
+  takes no place in the eager initialization order, its readers depending on what its initializer
+  reads; an initializer that needs its own value, directly or through other lazy values, traps at
+  that read, naming the value. A field's initializer may use every field and method; the class
+  body reads the field only where it could call a method. Concurrent first reads run the
+  initializer once, the others waiting safe for the collector; the value is published with a
+  release store paired with the readers' acquire load, a stored value read with one atomic load
+  and a branch.
+- [A companion's `apply`](/spec/declarations/) overloads the constructor its name has in call
+  position. Where an object declares `apply`, `Name(…)` chooses among the class's constructor (or
+  the data type's variant of its name) and every `apply` by the ordinary static overloading rules:
+  most specific by parameter types, with by-name parameters, defaults, repeated parameters, generic
+  inference and trailing blocks as for any call (`Future(fetch(url))`, `Future` + block). Type
+  arguments written at the call are the chosen candidate's: the class's or data type's for the
+  constructor, the method's for an `apply`. An `apply` with the constructor's parameter types, up to
+  type parameter names, is an error at its declaration. A name with no constructor in call position
+  (a data type with no variant of its name, an abstract class, a plain object) calls its `apply`
+  alone, and the library's `List`, `Set` and `Map` companions take their elements that way:
+  `List(1, 2, 3)`, `Set(…)`, `Map((k, v), …)`. Where a function type is expected, the name is the
+  constructor or `apply` that type chooses, as for an overloaded function value; elsewhere the bare
+  name stays the object. This amends the earlier rule that the name in call position is only the
+  constructor and that an object cannot be called.
 
 **Deferred**
 
