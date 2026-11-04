@@ -270,7 +270,7 @@ a decision changes, this page and the chapter change together.
   `, ` and ends with a newline. `print(debug(x))` selects `Debug`.
 - `debug(x)` yields `x`'s `Debug` form as a string. `Writer` writes strings (with `writeChar`,
   `writeInt`, `writeField` and `writeSpaces` beside `write`); `FormatSpec` is `width`, `precision`
-  and `left`, as in Sysl; `toString()` is a default body of `Display`.
+  and `left`; `toString()` is a default body of `Display`.
 - A built-in type conforms to a trait through an impl and implements every method of the trait,
   since a trait's default bodies are shared by objects and a built-in value is not one.
 - A variant's fields take defaults, each a function of the fields before it, as a constructor's
@@ -383,7 +383,7 @@ a decision changes, this page and the chapter change together.
   need across the whole program.
 - A class and its companion object are in one module, in any of its files.
 - One `avin` command does everything: build, run, test, deps and config.
-- Testing follows Sysl's model: `@test`, `@tests`, setup and teardown, and the built-in runner.
+- Testing is built in: `@test`, `@tests`, setup and teardown, and the built-in runner.
   Every feature ships with tests.
 - `avin build file.avin` writes `./file` by default; `-o` overrides it. A failed build leaves
   existing output untouched.
@@ -769,6 +769,39 @@ Settled by the user on 2026-11-04:
 - Async and await.
 
 ## Proposed
+
+- Packages ([packages](/spec/packages/)), modelled on Sysl's package system:
+  - **The manifest**: `package { name, version, description }`, `dependencies { … }` and `workspace
+    = [ … ]`, and no other key; an unknown key is an error, not a warning. A name is a lowercase
+    letter then lowercase letters, digits, `_` and `-`; a version is `major.minor.patch` with no
+    leading zeros. A manifest is optional: a directory or file with none above it is a program as
+    before.
+  - **Dependencies**: `{ git = "host/owner/name", version = "x.y.z" }` read at the tag `vx.y.z`
+    and cloned from `https://`; `{ path = "../dir" }`, relative to the manifest naming it and refused
+    in a fetched package; `{ workspace = true }`. A coordinate with `https://` or `.git` is refused.
+    No `rev` pins, features or members of a repository yet.
+  - **What a dependency brings in**: its modules, under their own names; not its root directory's
+    files (its `main`) nor its `tests` directory, so a program can be depended on and `avin test`
+    runs only the package's own tests. One module in two packages is refused. A directory holding its
+    own manifest is another package and never a module of the tree above it.
+  - **Version selection**: the highest version any manifest in the graph asks for, over every member
+    of a workspace.
+  - **The cache** is the machine's, `<cache>/avin/pkg/<coordinate>/@v<version>/`, the clone's
+    `.git` removed and the tree's hash written beside it. Builds fetch; the language server does not.
+  - **`avin.sum`**: `<coordinate> v<version> sha256:<hex>` per fetched package and version read,
+    one file per project (the workspace root's); the hash is Sysl's tree hash (SHA-256 of a sorted
+    listing of each file's SHA-256 and path, `.git` and the root's `.avin/` left out). A mismatch is
+    refused; a build only adds lines; `avin tidy [--check]` rewrites it to what the whole resolution
+    reads.
+  - **Workspaces**: Sysl's: members listed by directory with `*` within a name, a root with a
+    `package` block a member, a root without one taking no dependencies and refused as a program.
+  - **Finding the package**: every command walks up from the path it is given to the nearest
+    manifest with a `package` block, a workspace root without one being passed over. Sysl looks only
+    beside the path; walking up is what lets a file, a test directory or an editor's open file name
+    its package.
+  - **`avin new <dir> [--lib]`** names the package by the directory, writes a module of that name
+    (`-` written `_`), `main.avin` unless `--lib`, a test in `tests/` and a `.gitignore` of `.avin/`;
+    the names `avin` and `tests` are refused. `avin build` names the executable after the package.
 
 - Repeated parameters beside overloads and constructors
   ([declarations](/spec/declarations/#repeated-parameters)): an overload with a repeated parameter

@@ -33,8 +33,13 @@ A file whose header disagrees with its directory, or that has none outside the r
 before anything is checked. `avin build <file>` is a program of that one file, in the module its
 header names. The standard library is loaded the same way, from `library/` under the toolchain's
 root, where every module is `avin` or under it; `library/avin/prelude.avin` is one ordinary file of
-module `avin`. A package manifest will name the roots the loader walks; the files and their modules
-are what the later stages see.
+module `avin`. A path in a package, a directory with an `avin.hocon` found by walking up, is the
+package: `package.sysl` reads the manifest with Sysl's HOCON reader, resolves the dependency graph
+(the highest version asked for of each git coordinate, fetched into the machine's cache and checked
+against `avin.sum`), and the loader walks each dependency's tree without its root files and `tests/`,
+then the package's own; a directory holding its own manifest is passed over. The files and their
+modules are what the later stages see; a dependency's `@test` functions are dropped from the program
+after checking, so `avin test` runs only the package's own.
 
 A [literate](/spec/declarations/#literate-source) `.lavin` file is read by the parser as its program
 laid over the document (`literate.sysl`): the parsing package's `tangle_literate` decides which lines

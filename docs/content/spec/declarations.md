@@ -812,7 +812,7 @@ the program, read and (for a `var`) assigned from any function by its name.
 
 Declarations are public unless marked `private` (visible in the module). A directory is a module;
 `module a.b` heads each file. A **package** is a build unit with an `avin.hocon` manifest; a
-**project** lists packages. `import a.b.{X, y as z}` brings names into a file. The root module `avin`
+**project** lists packages ([packages](/spec/packages/)). `import a.b.{X, y as z}` brings names into a file. The root module `avin`
 is reserved for the standard library.
 
 ```text

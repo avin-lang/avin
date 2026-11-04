@@ -116,6 +116,37 @@ not shown. The exit status is 1 when any test failed. A second argument keeps on
 name or file contains it. A program built for its tests need not have `main`, and `avin run` and
 `avin build` never run its tests.
 
+## Packages
+
+`avin new` writes a package: a directory with an `avin.hocon` manifest, a module, a test and a
+`.gitignore`. `--lib` makes a library, which has no `main`:
+
+```sh
+./compiler/avin new hello
+./compiler/avin run hello
+./compiler/avin test hello
+./compiler/avin new geometry --lib
+```
+
+```hocon
+package {
+  name = "hello"
+  version = "0.1.0"
+}
+
+dependencies {
+  geometry { path = "../geometry" }
+  json { git = "github.com/owner/json", version = "1.4.0" }
+}
+```
+
+Every command takes a path anywhere in a package and compiles the whole package, with the packages
+it depends on: `avin run hello/main.avin` and `avin test hello/tests` both mean `hello`. A
+dependency's modules are imported by their own names. `avin build` names the executable after the
+package. Fetched packages are kept in the machine's cache, and `avin.sum` beside the manifest records
+what each one hashed to; commit it. `avin tidy` rewrites it to exactly what the package uses, and
+`avin tidy --check` fails when it is not. The [packages chapter](/spec/packages/) has the rest.
+
 ## The compiler's tests
 
 ```sh

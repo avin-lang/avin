@@ -1,13 +1,12 @@
 module dev.avinlang.compiler
 
-import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
-import sysl.fs.{canonicalize, is_dir, read_text, write_text_atomic}
+import sysl.fs.{canonicalize, exists, is_dir, write_text_atomic}
 import sysl.path.stem
 import sysl.process.Stdio
 
 const Version: string = "0.1.0"
-const Usage: string = "usage: avin parse <program>\n       avin check <program>\n       avin emit-llvm <program> -o <module.ll>\n       avin build <program> [-o <executable>] [-O0 | -O2]\n       avin run <program> [-O0 | -O2] [-- <argument>...]\n       avin test <program> [<filter>] [-O0 | -O2]\n       avin tangle <file.lavin> [-o <path>]\n       avin weave <file.lavin> [-o <file.html>]\n       avin lsp [--stdio]\n       avin --help\n       avin --version\n<program> is a source file (`.avin`, or `.lavin` for a literate one), or a directory holding a program's modules"
+const Usage: string = "usage: avin parse <program>\n       avin check <program>\n       avin emit-llvm <program> -o <module.ll>\n       avin build <program> [-o <executable>] [-O0 | -O2]\n       avin run <program> [-O0 | -O2] [-- <argument>...]\n       avin test <program> [<filter>] [-O0 | -O2]\n       avin new <dir> [--lib]\n       avin tidy [--check] [<package>]\n       avin tangle <file.lavin> [-o <path>]\n       avin weave <file.lavin> [-o <file.html>]\n       avin lsp [--stdio]\n       avin --help\n       avin --version\n<program> is a path in a package (a directory holding avin.hocon), a source file (`.avin`, or `.lavin` for a literate one), or a directory holding a program's modules"
 
 // Output channels, the exit status and the toolchain location stay outside command dispatch, so
 // every command can be run and tested in memory. 0 is success, 1 a source, I/O or build failure,
@@ -25,6 +24,8 @@ run_cli_with(args: []const string, tc: Option[Toolchain], say: string -> unit, n
         return 0
     if args.len >= 2 && args[1] == "lsp" then return lsp_command(args, tc, note)
     if args.len >= 2 && (args[1] == "tangle" || args[1] == "weave") then return literate_command(args, say, note)
+    if args.len >= 2 && args[1] == "new" then return new_command(args, say, note)
+    if args.len >= 2 && args[1] == "tidy" then return tidy_command(args, say, note)
     if args.len < 3
         note(Usage)
         return 2
@@ -63,24 +64,14 @@ run_cli_with(args: []const string, tc: Option[Toolchain], say: string -> unit, n
                 if a == b
                     note("avin: the output would overwrite the source file")
                     return 2
-    // A directory is the root of a program of many files; a file is a program by itself.
-    var files: Buf[ProgramFile] = buf()
-    if is_dir(path)
-        files = program_files(path) match
-            Ok(f) -> f
-            Err(message) ->
-                note("avin: " + message)
-                return 1
-        if files.len() == 0
-            note(s"avin: $path: no `.avin` or `.lavin` files in the program")
+    // A path in a package is the package; another directory is the root of a program of many files;
+    // a file is a program by itself.
+    val program = load_program(path, default_fetching()) match
+        Ok(p) -> p
+        Err(message) ->
+            note(message.trim_end())
             return 1
-    else
-        val text = read_text(path) match
-            Ok(t) -> t
-            Err(e) ->
-                note(s"avin: $path: ${e.to_string()}")
-                return 1
-        files = single_file(source_of(path, text))
+    val files = program.files
     if command == "parse" then return run_parse(files, say, note)
     val toolchain = tc match
         Some(t) -> t
@@ -89,12 +80,12 @@ run_cli_with(args: []const string, tc: Option[Toolchain], say: string -> unit, n
             return 1
     val level = optimization.unwrap_or("-O2")
     if command == "run" || command == "test"
-        val built = cached_build(toolchain, path, files, command == "test", level) match
+        val built = cached_build(toolchain, program.root, files, command == "test", level) match
             Ok(b) -> b
             Err(message) ->
                 note(message)
                 return 1
-        if command == "test" then return run_tests(built, path, filter.unwrap_or(""), say)
+        if command == "test" then return run_tests(built, program.root, filter.unwrap_or(""), say)
         return run_binary(built.path, program_args.view(), stdout, stderr) match
             Ok(status) -> status
             Err(message) ->
@@ -114,7 +105,7 @@ run_cli_with(args: []const string, tc: Option[Toolchain], say: string -> unit, n
             Err(e) ->
                 note("avin: " + e.to_string())
                 return 1
-    val executable = output.unwrap_or(default_output(path))
+    val executable = output.unwrap_or(program.package.unwrap_or(default_output(path)))
     if is_dir(executable)
         note(s"avin: `$executable` is a directory; name the executable with -o")
         return 1
@@ -125,8 +116,64 @@ run_cli_with(args: []const string, tc: Option[Toolchain], say: string -> unit, n
             1
 end run_cli_with
 
-/** Where `avin build` writes when no `-o` is given: the source's name without `.avin` or `.lavin`, or the
- * program directory's name, in the working directory. */
+/** `avin new <dir> [--lib]`: a new package at `dir`, a program or with `--lib` a library. */
+new_command(args: []const string, say: string -> unit, note: string -> unit) -> int
+    var dir: Option[string] = None
+    var library = false
+    for i in 2..<args.len
+        if args[i] == "--lib" && !library then library = true
+        elif !args[i].starts_with("-") && dir is None then dir = Some(args[i])
+        else
+            note(Usage)
+            return 2
+    val target = dir match
+        Some(d) -> d
+        None ->
+            note(Usage)
+            return 2
+    new_package(target, library) match
+        Ok(name) ->
+            say(s"created ${if library then "library" else "program"} package `$name` in $target")
+            0
+        Err(message) ->
+            note(message)
+            1
+
+/** `avin tidy [--check] [<package>]`: the sum file rewritten to what the package's whole resolution
+ * reads, or with `--check` a failure when it is not that already. */
+tidy_command(args: []const string, say: string -> unit, note: string -> unit) -> int
+    var dir: Option[string] = None
+    var check = false
+    for i in 2..<args.len
+        if args[i] == "--check" && !check then check = true
+        elif !args[i].starts_with("-") && dir is None then dir = Some(args[i])
+        else
+            note(Usage)
+            return 2
+    val given = dir.unwrap_or(".")
+    // A workspace's root is tidied whole; any other path, by the package it is in.
+    var home = given
+    if !exists(given + "/" + ManifestName)
+        home = enclosing_package(given) match
+            Ok(Some(d)) -> d
+            Ok(None) ->
+                note(s"avin: $given is in no package: `avin tidy` reads a package's $ManifestName")
+                return 1
+            Err(message) ->
+                note(message.trim_end())
+                return 1
+    tidy(home, default_fetching(), check, say) match
+        Ok(true) -> 0
+        Ok(false) ->
+            if !check then return 0
+            note(s"avin: $SumName is not tidy; `avin tidy` rewrites it to what the package resolves to")
+            1
+        Err(message) ->
+            note(message.trim_end())
+            1
+
+/** Where `avin build` writes when no `-o` is given: the package's name, or the source's name without
+ * `.avin` or `.lavin`, or the program directory's name, in the working directory. */
 default_output(path: string) -> string = stem(path).unwrap_or("a.out")
 
 run_parse(files: Buf[ProgramFile], say: string -> unit, note: string -> unit) -> int

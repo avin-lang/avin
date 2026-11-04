@@ -50,7 +50,7 @@ identity to compare, and on `Any`, which may hold one.
 
 ## Display and Debug
 
-Text rendering comes from two traits, as in Sysl. `Display` is the human form, used by `print`,
+Text rendering comes from two traits. `Display` is the human form, used by `print`,
 interpolation and `toString()`. `Debug` is the diagnostic form, used by `debug(x)`, where strings are
 quoted and escaped. Both render into a `Writer` with a `FormatSpec`, so formatting a value needs no
 intermediate string. `data` types and tuples derive both; classes declare them. Nothing has a default
