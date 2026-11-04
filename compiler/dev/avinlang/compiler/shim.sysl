@@ -6,7 +6,7 @@ import sysl.crypto.sha256
 import sysl.fs.{exists, make_dir_all, make_temp_dir, pending_name, publish_file, read_text, remove_dir_all, remove_file, walk, write_text}
 import sysl.process.capture
 import sysl.slices.sort
-import sysl.text.str_builder
+import sysl.text.{StrBuilder, str_builder}
 
 // Sysl bindings. Each binding's body calls a shim: a Sysl function, generated here, exported with the
 // C convention under the symbol the binding's body names. The shim converts each argument from its
@@ -20,12 +20,28 @@ import sysl.text.str_builder
 // Sysl's library: one standard output, one allocator.
 
 /** The generated shim package's source, and where each binding's part of it is: the line of its
- * import and the lines of its function, counted from one. */
+ * import and the lines of its function, counted from one. A mirror's import and conversions are its
+ * own part. */
 struct ShimSource
     text: string
     imports: Buf[usize]
     first: Buf[usize]
     last: Buf[usize]
+    mirrors: Buf[Mirrored]
+    mirror_lines: Buf[MirrorLines]
+
+/** A data type's `@sysl` mirror of the Sysl enum or struct `target`, declared at `span`. */
+struct Mirrored
+    name: string
+    target: string
+    unit: usize
+    span: Span
+
+/** Lines of a shim that a mirror answers for, by its position: its import, or one conversion. */
+struct MirrorLines
+    mirror: usize
+    first: usize
+    last: usize
 
 /** The manifest of the shim package, depending on the runtime package at `runtime_dir`. */
 shim_manifest(runtime_dir: string) -> string =
@@ -33,49 +49,269 @@ shim_manifest(runtime_dir: string) -> string =
     "dependencies {\n  avin-runtime { path = \"" + runtime_dir + "\" }\n}\n" +
     "requires { heap = true, posix = true }\n"
 
+// The shim source as it is written, the line the next text starts on, and the conversions of data
+// types it holds: one function for each type in each direction, named by its position here, with
+// the mirrors those types include.
+private struct ShimWriter
+    out: StrBuilder
+    line: usize
+    ins: Buf[&Crossing]
+    outs: Buf[&Crossing]
+    mirrors: Buf[Mirrored]
+    mirror_lines: Buf[MirrorLines]
+
+private put(w: *ShimWriter, text: string)
+    w.out.push(text)
+    for b in text.bytes
+        if b == u8('\n') then w.line += 1
+
 /** The shim module for a program's bindings. */
 shim_source(bindings: Buf[MirBinding]) -> ShimSource
-    var out = str_builder()
-    var line = 1usize
+    var w = ShimWriter(str_builder(), 1, buf(), buf(), buf(), buf())
     var imports: Buf[usize] = buf()
     var first: Buf[usize] = buf()
     var last: Buf[usize] = buf()
-    val head = "module avin.shims\n\nimport avin.rt.{Context, text_bytes, text_length, text_of}\nimport sysl.raw.str_cast\n"
-    out.push(head)
-    line += 4
+    for b in bindings
+        for p in b.params
+            gather(&w, p, false)
+        gather(&w, b.result, true)
+    val converts = w.ins.len() + w.outs.len() > 0 || uses_bytes(bindings)
+    put(&w, "module avin.shims\n\nimport avin.rt.{Context, text_bytes, text_length, text_of}\nimport sysl.raw.str_cast\n")
+    if converts then put(&w, "import avin.rt.{Frame, allocate, array_elements, array_length, descriptor_of, new_array}\nimport sysl.raw.ptr_cast\nimport sysl.slices.copy\n")
     for i in 0..<bindings.len()
-        out.push(s"import ${bindings[i].target} as bound_$i\n")
-        imports.push(line)
-        line += 1
-    out.push("\n// An Avin string's bytes, copied into a Sysl string.\nprivate text_in(p: *u8) -> string = str_cast(text_bytes(p)[0..<text_length(p)])\n")
-    line += 3
+        imports.push(w.line)
+        put(&w, s"import ${bindings[i].target} as bound_$i\n")
+    for m in 0..<w.mirrors.len()
+        w.mirror_lines.push(MirrorLines(m, w.line, w.line))
+        put(&w, s"import ${w.mirrors[m].target} as mirror_$m\n")
+    put(&w, "\n// An Avin string's bytes, copied into a Sysl string.\nprivate text_in(p: *u8) -> string = str_cast(text_bytes(p)[0..<text_length(p)])\n")
+    if converts then put(&w, ConversionHelpers)
     for i in 0..<bindings.len()
         val b = bindings[i]
-        out.push("\n")
-        line += 1
-        first.push(line)
-        out.push(s"// ${b.name}\n@export(\"${b.shim}\")\nshim_$i(ctx: *Context")
+        put(&w, "\n")
+        first.push(w.line)
+        put(&w, s"// ${b.name}\n@export(\"${b.shim}\")\nshim_$i(ctx: *Context")
         var args: Buf[string] = buf()
         for k in 0..<b.params.len()
             val p = b.params[k]
-            if *p is Unit
+            if *p.ty is Unit
                 args.push("()")
                 continue
-            out.push(s", a$k: ${c_side(p)}")
-            args.push(into_sysl(p, s"a$k"))
-        out.push(")")
-        if !(*b.result is Unit) then out.push(" -> " + c_side(b.result))
-        out.push(s"\n    val r: ${sysl_side(b.result)} = bound_$i(")
+            put(&w, s", a$k: ${crossing_c_side(p)}")
+            args.push(into_expr(&w, p, s"a$k"))
+        for k in 0..<b.result.layouts
+            put(&w, s", d$k: *u8")
+        put(&w, ")")
+        if !(*b.result.ty is Unit) then put(&w, " -> " + crossing_c_side(b.result))
+        put(&w, s"\n    val r: ${sysl_type(&w, b.result)} = bound_$i(")
         for k in 0..<args.len()
-            if k > 0 then out.push(", ")
-            out.push(args[k])
-        out.push(")\n")
-        line += 4
-        if !(*b.result is Unit)
-            out.push("    " + out_of_sysl(b.result, "r") + "\n")
-            line += 1
-        last.push(line - 1)
-    ShimSource(out.finish(), imports, first, last)
+            if k > 0 then put(&w, ", ")
+            put(&w, args[k])
+        put(&w, ")\n")
+        if b.result.form is Plain
+            if !(*b.result.ty is Unit) then put(&w, "    " + out_of_sysl(b.result.ty, "r") + "\n")
+        elif b.result.form is Bytes
+            put(&w, "    bytes_of(ctx, r, d0)\n")
+        else
+            put(&w, s"    var ds: [${b.result.layouts}]*u8 = [")
+            for k in 0..<b.result.layouts
+                if k > 0 then put(&w, ", ")
+                put(&w, s"d$k")
+            put(&w, "]\n    val dp: **u8 = ptr_cast(&ds)\n")
+            put(&w, "    " + out_expr(&w, b.result, "r", "dp", 0, false) + "\n")
+        last.push(w.line - 1)
+    var k = 0usize
+    while k < w.ins.len()
+        in_function(&w, k)
+        k += 1
+    k = 0
+    while k < w.outs.len()
+        out_function(&w, k)
+        k += 1
+    ShimSource(w.out.finish(), imports, first, last, w.mirrors, w.mirror_lines)
+
+// The conversions of arrays of bytes, and the frame that keeps an object a conversion has made while
+// it makes the objects of the object's fields.
+private const ConversionHelpers: string =
+    "\n// An Avin array of bytes, copied into a Sysl slice.\n" +
+    "private bytes_in(p: *u8) -> []u8\n" +
+    "    val n = array_length(p)\n" +
+    "    var out: []u8 = [0; n]\n" +
+    "    copy(out, array_elements(p)[0..<n])\n" +
+    "    out\n" +
+    "\n// A Sysl slice of bytes, copied into a new Avin array laid out by `d`.\n" +
+    "private bytes_of(ctx: *Context, b: []const u8, d: *u8) -> *u8\n" +
+    "    val p = new_array(ctx, ptr_cast(d), b.len)\n" +
+    "    copy(array_elements(p)[0..<b.len], b)\n" +
+    "    p\n" +
+    "\n// An object a conversion has made, kept as a frame of the thread's stack, as compiled code keeps\n" +
+    "// its references, while the conversion makes the objects of its fields.\n" +
+    "private struct Root\n" +
+    "    frame: Frame\n" +
+    "    object: *u8\n" +
+    "\n// An integer converted to the Sysl integer type its place asks for, as a mirror's field.\n" +
+    "private integer_in[T: Integer](x: long) -> T = T(x)\n"
+
+// Whether a binding passes or returns an array of bytes, which no data type's conversion holds.
+private uses_bytes(bindings: Buf[MirBinding]) -> bool
+    for b in bindings
+        if b.result.form is Bytes then return true
+        for p in b.params
+            if p.form is Bytes then return true
+    false
+
+// Records the conversions a value of `c`'s type needs, in the direction `out` says, and the mirrors
+// they include, each once.
+private gather(w: *ShimWriter, c: &Crossing, out: bool)
+    if c.form is Plain || c.form is Bytes then return
+    if function_of(w, c, out) is Some(_) then return
+    if out then w.outs.push(c) else w.ins.push(c)
+    if c.form is Mirror(name, target, unit, span, _)
+        if mirror_of(w, c) is None then w.mirrors.push(Mirrored(name, target, unit, span))
+    for v in c.variants
+        for f in v.fields
+            gather(w, f.crossing, out)
+
+// The position of the conversion of `c`'s type in the direction `out` says.
+private function_of(w: *ShimWriter, c: &Crossing, out: bool) -> Option[usize]
+    val key = type_key(c.ty)
+    if out
+        for i in 0..<w.outs.len()
+            if type_key(w.outs[i].ty) == key then return Some(i)
+    else
+        for i in 0..<w.ins.len()
+            if type_key(w.ins[i].ty) == key then return Some(i)
+    None
+
+// The position of the mirror `c`'s type is.
+private mirror_of(w: *ShimWriter, c: &Crossing) -> Option[usize]
+    if c.form is Mirror(name, target, unit, _, _)
+        for i in 0..<w.mirrors.len()
+            val m = w.mirrors[i]
+            if m.name == name && m.target == target && m.unit == unit then return Some(i)
+    None
+
+// The Sysl type a value of `c`'s type is converted to.
+private sysl_type(w: *ShimWriter, c: &Crossing) -> string = c.form match
+    Plain -> sysl_side(c.ty)
+    Bytes -> "[]u8"
+    OptionForm -> s"Option[${sysl_type(w, payload(c, "Some"))}]"
+    ResultForm -> s"Result[${sysl_type(w, payload(c, "Ok"))}, ${sysl_type(w, payload(c, "Err"))}]"
+    Mirror(_, _, _, _, _) -> s"mirror_${mirror_of(w, c).unwrap()}"
+
+// The one field of `c`'s variant `name`.
+private payload(c: &Crossing, name: string) -> &Crossing
+    for v in c.variants
+        if v.name == name then return v.fields[0].crossing
+    c
+
+// How a value of `c`'s type is passed with the C convention.
+private crossing_c_side(c: &Crossing) -> string = if c.form is Plain then c_side(c.ty) else "*u8"
+
+// A value of `c`'s type as Avin passes or stores it, `value`, converted into Sysl.
+private into_expr(w: *ShimWriter, c: &Crossing, value: string) -> string = c.form match
+    Plain -> into_sysl(c.ty, value)
+    Bytes -> s"bytes_in($value)"
+    _ -> s"in_${function_of(w, c, false).unwrap()}($value)"
+
+// The Sysl value `value` of `c`'s type converted out of Sysl, with its layouts from `base` among the
+// ones `ds` points at. A field of a mirror of an integer type takes any Sysl integer, converted.
+private out_expr(w: *ShimWriter, c: &Crossing, value: string, ds: string, base: usize, mirrored: bool) -> string = c.form match
+    Plain ->
+        if mirrored && *c.ty is Int(_) then out_of_sysl(c.ty, s"${sysl_side(c.ty)}($value)") else out_of_sysl(c.ty, value)
+    Bytes -> s"bytes_of(ctx, $value, $ds[$base])"
+    _ ->
+        val at = if base == 0 then ds else s"ptr_cast(usize($ds) + ${base * 8}usize)"
+        s"out_${function_of(w, c, true).unwrap()}(ctx, $value, $at)"
+
+// The Sysl spelling of `c`'s variant `v` made of the values `args`.
+private construction(w: *ShimWriter, c: &Crossing, v: CrossVariant, args: Buf[string]) -> string
+    var joined = ""
+    for i in 0..<args.len()
+        if i > 0 then joined = joined + ", "
+        joined = joined + args[i]
+    c.form match
+        Mirror(_, _, _, _, structure) ->
+            val m = s"mirror_${mirror_of(w, c).unwrap()}"
+            if structure then s"$m($joined)"
+            elif args.len() == 0 then s"$m.${v.name}"
+            else s"$m.${v.name}($joined)"
+        _ -> if args.len() == 0 then v.name else s"${v.name}($joined)"
+
+// The conversion into Sysl of a value of the `k`th data type that crosses that way: its variant is
+// its descriptor's tag, and each field is read at its offset. A mirror's integer field becomes the
+// integer type the Sysl variant or struct declares.
+private in_function(w: *ShimWriter, k: usize)
+    val c = w.ins[k]
+    val mirrored = c.form is Mirror(_, _, _, _, _)
+    put(w, "\n")
+    val start = w.line
+    put(w, s"// ${type_name(c.ty)} into Sysl.\nprivate in_$k(p: *u8) -> ${sysl_type(w, c)}\n")
+    if c.variants.len() > 1 then put(w, "    val tag = descriptor_of(p).tag\n")
+    for t in 0..<c.variants.len()
+        val v = c.variants[t]
+        val lastly = t + 1 == c.variants.len()
+        val indent = if lastly then "    " else "        "
+        if !lastly then put(w, s"    if tag == ${t}usize\n")
+        var args: Buf[string] = buf()
+        for i in 0..<v.fields.len()
+            val f = v.fields[i]
+            f.offset match
+                Some(offset) ->
+                    put(w, indent + s"val q$i: *${crossing_c_side(f.crossing)} = ptr_cast(usize(p) + ${offset}usize)\n")
+                    if mirrored && *f.crossing.ty is Int(_) then args.push(s"integer_in(long(q$i[0]))")
+                    else args.push(into_expr(w, f.crossing, s"q$i[0]"))
+                None -> args.push("()")
+        put(w, indent + (if lastly then "" else "return ") + construction(w, c, v, args) + "\n")
+    mirror_lines(w, c, start)
+
+// The conversion out of Sysl of a value of the `k`th data type that crosses that way: each variant
+// is made by its layout, among the ones `ds` points at, and each field converted and stored at its
+// offset.
+private out_function(w: *ShimWriter, k: usize)
+    val c = w.outs[k]
+    val mirrored = c.form is Mirror(_, _, _, _, _)
+    val structure = c.form is Mirror(_, _, _, _, true)
+    put(w, "\n")
+    val start = w.line
+    put(w, s"// ${type_name(c.ty)} out of Sysl.\nprivate out_$k(ctx: *Context, v: ${sysl_type(w, c)}, ds: **u8) -> *u8\n")
+    if !structure then put(w, "    v match\n")
+    for t in 0..<c.variants.len()
+        val v = c.variants[t]
+        var values: Buf[string] = buf()
+        var names: Buf[string] = buf()
+        for i in 0..<v.fields.len()
+            if structure then values.push(s"v.${v.fields[i].name}")
+            else values.push(s"f$i")
+            names.push(if *v.fields[i].crossing.ty is Unit then "_" else s"f$i")
+        val indent = if structure then "    " else "            "
+        if !structure
+            put(w, "        " + construction(w, c, v, names) + " ->")
+            if v.constant
+                put(w, s" ds[$t]\n")
+                continue
+            put(w, "\n")
+        elif v.constant
+            put(w, s"    ds[$t]\n")
+            continue
+        put(w, indent + "var root = Root(Frame(ctx.top, 1usize), null)\n")
+        put(w, indent + "ctx.top = ptr_cast(&root)\n")
+        put(w, indent + s"root.object = allocate(ctx, ptr_cast(ds[$t]))\n")
+        for i in 0..<v.fields.len()
+            val f = v.fields[i]
+            if f.offset is Some(offset)
+                val side = crossing_c_side(f.crossing)
+                put(w, indent + s"val x$i: $side = " + out_expr(w, f.crossing, values[i], "ds", f.base, mirrored) + "\n")
+                put(w, indent + s"val p$i: *$side = ptr_cast(usize(root.object) + ${offset}usize)\n")
+                put(w, indent + s"p$i[0] = x$i\n")
+        put(w, indent + "ctx.top = root.frame.prev\n")
+        put(w, indent + "root.object\n")
+    mirror_lines(w, c, start)
+
+// Makes the lines of a conversion from `start` to the last written its mirror's, when its type is
+// one.
+private mirror_lines(w: *ShimWriter, c: &Crossing, start: usize)
+    if mirror_of(w, c) is Some(m) then w.mirror_lines.push(MirrorLines(m, start, w.line - 1))
 
 // How a boundary type is passed with the C convention: as Avin's compiled code passes it.
 private c_side(t: &Type) -> string = *t match
@@ -152,14 +388,23 @@ shim_diagnostics(output: string, shim: ShimSource, bindings: Buf[MirBinding], un
             at += 1
         if message == "" || !text[at..].starts_with("--> ") then continue
         val place = text[at + 4..]
-        val k = if place.contains("/avin/shims/shims.sysl:") then owner_of(shim, line_of(place)) else None
-        k match
-            Some(i) ->
-                val b = bindings[i]
-                var r = report()
-                r.add(error(b.span, s"the Sysl binding `${b.name}` does not match `${b.target}`: $message"))
-                rendered = rendered + r.render(units[b.unit].src)
-            None -> unplaced = true
+        val in_shims = place.contains("/avin/shims/shims.sysl:")
+        val line = line_of(place)
+        val m = if in_shims then mirror_owning(shim, line) else None
+        val k = if in_shims && m is None then owner_of(shim, line) else None
+        if m is Some(j)
+            val mirror = shim.mirrors[j]
+            var r = report()
+            r.add(error(mirror.span, s"the Sysl mirror `${mirror.name}` does not match `${mirror.target}`: $message"))
+            rendered = rendered + r.render(units[mirror.unit].src)
+        else
+            k match
+                Some(i) ->
+                    val b = bindings[i]
+                    var r = report()
+                    r.add(error(b.span, s"the Sysl binding `${b.name}` does not match `${b.target}`: $message"))
+                    rendered = rendered + r.render(units[b.unit].src)
+                None -> unplaced = true
         message = ""
     if unplaced || rendered == "" then return "avin: Sysl could not build the bindings' shims:\n" + output
     rendered
@@ -174,6 +419,12 @@ private line_of(place: string) -> usize
     for b in parts[parts.len() - 2].bytes
         if b >= u8('0') && b <= u8('9') then n = n * 10 + usize(b - u8('0'))
     n
+
+// The mirror whose import or conversion holds a line of the shim.
+private mirror_owning(shim: ShimSource, line: usize) -> Option[usize]
+    for part in shim.mirror_lines
+        if line >= part.first && line <= part.last then return Some(part.mirror)
+    None
 
 // The binding whose import or function holds a line of the shim.
 private owner_of(shim: ShimSource, line: usize) -> Option[usize]

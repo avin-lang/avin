@@ -398,7 +398,13 @@ a decision changes, this page and the chapter change together.
   copy of Sysl's library. The archive is cached by a hash of the shims, the Sysl version and the
   runtime's source.
 - A binding is a top-level function. Across the boundary a `bool` is a byte and a `char` its code
-  point; `string` is copied each way.
+  point; `string` and `Array[byte]` are copied each way.
+- A data type mirrors a Sysl enum or struct with `@sysl("module.Name")` on its declaration. An
+  enum's variants are matched by name and their fields by position; a struct is mirrored by one
+  variant named as the type, whose fields are matched by name. A mirror has no type parameters and
+  never holds itself. An integer field takes any Sysl integer, converted with a check in each
+  direction, so a Sysl `usize` is mirrored by a `long`. Of the collections only `Array[byte]`
+  crosses.
 - `Option[+T]` and `Result[+T, +E]` are `data` types of the core library, written in Avin, with
   their methods in an `impl`. Those methods are not variance positions, so `getOrElse(default: -> T)`
   takes `T` in a parameter and needs no lower bound: on an `Option[Dog]` seen as an `Option[Animal]`,
@@ -472,7 +478,8 @@ Settled by the user on 2026-11-03:
   `Set` and `Map` included (`val s: Set[int] = [3, 1, 2]`), until set and map literals have syntax of
   their own.
 - The arithmetic traits carry their identities: `Add` has `zero` and `Mul` has `one`, so `sum` and
-  `product` of an empty collection are those values rather than an `Option`.
+  `product` of an empty collection are those values rather than an `Option`. They are written once,
+  by impls on `Iterable` (`impl[T: Add] Iterable[T]`, `impl[T: Mul] Iterable[T]`).
 - `Seq[+T]` is a core trait over `Iterable[T]` with two abstract methods, `length()` and
   `apply(index)`; its other methods (`get`, `isEmpty`, `head`, `headOption`, `last`, `lastOption`,
   the folds, `foreach`, `exists`, `forall`, `find`, `indexWhere`, `count`, `toVector`, `toList`, an

@@ -79,26 +79,37 @@ called it.
 A [binding](/spec/sysl-bindings/) is checked as a top-level function without a body: its
 `@sysl("module.name")` must name a Sysl function by module path and name, and its parameters and
 result must be boundary types — integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`,
-`unit` and `string`. Lowering gives it a body that passes its parameters, after the context, to a
-shim symbol, `avin_shim_` followed by the binding's own symbol with every character other than a
-letter or digit written as `_` and two hex digits, and returns what the shim returns. Since it is an
-ordinary function, a binding can be passed as a value. The MIR program lists every binding of the
-functions it compiles.
+`unit`, `string`, `Array[byte]`, `Option` and `Result` of boundary types, and data types declared
+with `@sysl("module.Name")`, which mirror a Sysl enum or struct. A mirror's fields are held to the
+boundary types once every variant is declared, and a mirror that holds itself is rejected. Lowering
+gives a binding a body that passes its parameters, after the context, to a shim symbol, `avin_shim_`
+followed by the binding's own symbol with every character other than a letter or digit written as
+`_` and two hex digits, and returns what the shim returns. A result the shim makes objects for
+follows the parameters with its **layouts**: the descriptor of each variant of each data type in it,
+or the variant's one constant object, and an array's descriptor, in an order the binding's
+`Crossing` records. Since it is an ordinary function, a binding can be passed as a value. The MIR
+program lists every binding of the functions it compiles, with how each value crosses.
 
 For a program with bindings, the driver generates one Sysl module, `avin.shims`, in a package whose
 manifest depends on the runtime's package. Each binding gets an import of its Sysl function under a
 private name, and an exported shim that converts each argument (a `bool` arrives as a byte, a `char`
 as its code point, a `string` is copied into a Sysl `string`), calls the function with the result
 declared at the binding's type, and converts the result back (a `string` is copied into a new Avin
-string through the runtime's `avin_rt_new_text`). `sysl build-c` checks and builds the package into
+string through the runtime's `avin_rt_new_text`). An `Option`, a `Result` or a mirror has one
+conversion function per type and direction, shared by every binding: into Sysl it reads the variant
+from the object's descriptor and each field at its offset; out of Sysl it matches the Sysl value,
+allocates the variant by its layout and stores each converted field, keeping the object in a frame
+of the thread's stack while its fields' objects are made. A mirror's integer field converts to and
+from whatever integer type Sysl declares. `sysl build-c` checks and builds the package into
 one archive holding the runtime, the shims and the part of Sysl's library they reach, which the
 program links instead of the runtime's own archive. One archive means one copy of Sysl's library, so
 Sysl and Avin share standard output and keep their writes in order.
 
 A Sysl diagnostic is placed by its line in the shim: the driver records the line of each binding's
 import and the lines of its function, and reports the message at the binding's name as `the Sysl
-binding \`name\` does not match \`module.name\`: …`. A diagnostic that falls elsewhere is reported
-with Sysl's whole output.
+binding \`name\` does not match \`module.name\`: …`. A mirror's import and its conversions are its
+own lines, reported at its declaration as `the Sysl mirror \`Name\` does not match
+\`module.Name\`: …`. A diagnostic that falls elsewhere is reported with Sysl's whole output.
 
 The archive is cached under `.avin/shims/` in the toolchain's root, named by a SHA-256 of the
 manifest, the shim source, the `sysl --version` output and the runtime's source files. A build with
