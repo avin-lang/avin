@@ -81,6 +81,34 @@ A dependency that cannot be found is reported at the manifest line naming it: a 
 directory, a directory holding no manifest, a workspace dependency outside a workspace or naming no
 member, a tag the repository does not have.
 
+### Sysl dependencies
+
+A package whose [bindings](/spec/sysl-bindings/) reach a Sysl package other than Sysl's standard
+library names it in `sysl-dependencies`, written exactly as an Avin dependency is, by `git` with a
+`version` or a `rev`, or by `path`:
+
+```hocon
+sysl-dependencies {
+  regex  { git = "github.com/sysl-lang/regex", version = "0.2.0" }
+  digits { path = "../digits" }
+}
+```
+
+These are Sysl packages, not Avin ones: Sysl fetches, selects and checks them when it builds the
+bindings' shims, so they get no line in `avin.sum` and `avin add` and `avin tidy` leave them alone.
+A `path` names a directory holding a `sysl.hocon`, relative to the manifest that names it, and a
+fetched package may not name one. A workspace holds no Sysl package, so `workspace = true` is refused
+here.
+
+**A program builds with the Sysl dependencies of every package in it**, so a library binding a Sysl
+package works in every program that uses the library, which need not name the Sysl package itself.
+Two packages naming one Sysl dependency at two releases of one repository take the higher; one name
+given any two other origins is refused at the manifest line, naming both:
+
+```text
+error: the Sysl dependency `digits` is github.com/o/digits v0.1.0 here and the directory /work/digits in `app`: one name is one Sysl package, so make them agree
+```
+
 ### What a dependency brings in
 
 **A dependency's modules come in under their own names.** A package `geometry` whose directory holds

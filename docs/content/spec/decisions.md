@@ -1134,6 +1134,18 @@ Settled by the user on 2026-11-04:
   `minus` and `since`, because an operator trait takes and yields the implementing type alone. The
   text forms are a duration's largest-unit form (`1.5ms`) and an ISO 8601 UTC timestamp. Sleeping
   and calendar fields beyond the timestamp text are not part of it yet.
+- Bindings to Sysl packages ([packages](/spec/packages/#sysl-dependencies),
+  [bindings](/spec/sysl-bindings/#sysl-packages)): a manifest names the Sysl packages its bindings
+  reach in a block of its own, `sysl-dependencies`, beside `dependencies`, each entry written as an
+  Avin dependency is (`git` with `version` or `rev`, or `path`; never `workspace`). The block is
+  separate because Sysl, not Avin, resolves, fetches and verifies those packages: they are not
+  Avin packages, so they take no part in Avin's version selection, `avin.sum`, `avin add` or
+  `avin tidy`. The shim package's manifest lists every Sysl dependency of every package in the
+  program, so a library's bindings build in any program that uses it; one name at two releases of
+  one coordinate takes the higher, and one name with any other two origins is refused naming both.
+  A fetched package may not name a Sysl directory. The shim archive and the cached executable are
+  keyed by these entries and by the sources of each Sysl package named by directory. Sysl's other
+  dependency keys (`mount`, `features`, `options`) are not offered yet.
 
 ## Open
 

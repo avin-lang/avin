@@ -48,12 +48,41 @@ error: the Sysl binding `upper` does not match `sysl.text.to_upper`: 's' of 'sys
    declaration**, so a wrong binding or a Sysl signature change fails the build with a Sysl
    diagnostic that the Avin compiler maps back to the binding. Avin never guesses a mangled name or a
    Sysl memory layout.
-4. The shim library is cached by a hash of its source and the Sysl version, and rebuilt only when a
-   binding changes. It is built together with the runtime, so the program holds one copy of Sysl's
+4. The shim library is cached by a hash of its source, the Sysl version and the
+   [Sysl packages](#sysl-packages) it depends on, and rebuilt only when one of them changes. It is built together with the runtime, so the program holds one copy of Sysl's
    library, and what Sysl and Avin each write to standard output stays in order.
 
 The Avin compiler does not need Sysl's compiler as a library. It needs only the `sysl` command at
 build time; the produced executable does not.
+
+## Sysl packages
+
+A binding reaches Sysl's standard library, and any Sysl package the package's manifest names in
+[`sysl-dependencies`](/spec/packages/#sysl-dependencies). The binding names the package's function
+by the module the package declares it in, as Sysl code importing it would:
+
+```hocon
+sysl-dependencies {
+  digits { path = "../digits" }
+}
+```
+
+```text
+@sysl("avintest.digits.digit_sum")
+digitSum(n: int) -> int
+```
+
+The shim package depends on each Sysl package every package of the program names, so Sysl checks a
+binding against the package's own declaration exactly as it checks one against the standard
+library, and a library's bindings build in any program that uses the library. A binding to a module
+no named package holds is reported at the binding:
+
+```text
+error: the Sysl binding `digitCount` does not match `avintest.digits.digit_count`: no module is called 'avintest.digits.digit_count', and nothing declares it: a binding reaches Sysl's standard library and the Sysl packages the manifest names in `sysl-dependencies`
+```
+
+A new release of a Sysl package, a different commit, or a change to the sources of one named by
+directory builds the shims again; nothing else about it does.
 
 ## Boundary types
 
