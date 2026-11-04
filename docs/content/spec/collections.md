@@ -266,9 +266,9 @@ value of the type: `for i in 2147483640..2147483647 by 5` yields 2147483640 and 
 
 ## for comprehensions
 
-`for` is sugar over collection methods: generators become `flatMap`/`map`, guards become
-lazy filters, and a `for` without `yield` becomes `foreach`. Scope and the order of evaluation follow
-the source. There is no separate loop protocol, so any type with these methods works in a `for`.
+A `for` with `yield` is sugar over collection methods: generators become `flatMap`/`map` and guards
+become lazy filters, so any type with those methods works in it. Scope and the order of evaluation
+follow the source. A `for` without `yield` is a loop over the source's `iterator()`, described next.
 
 `for pattern in xs` followed by an indented body, or `for pattern in xs do body` on one line, runs the
 body once per element, binding each by the pattern: a name, `_`, a tuple or a variant pattern that

@@ -259,7 +259,8 @@ a decision changes, this page and the chapter change together.
   local function's declaration types its parameters or has none.
 - A range's step is set with `by`; a step of zero traps, and iteration never steps past the limit or
   the type's largest or smallest value.
-- `for` is comprehension sugar over `map`, `flatMap`, filtering and `foreach`.
+- A `for` with `yield` is comprehension sugar over `map`, `flatMap` and filtering; a `for` without
+  `yield` loops over the source's iterator.
 - The collection hierarchy is rooted at `Iterable`, and `Iterator` is itself `Iterable`.
 - `print` is an ordinary library function. It renders with `Display`, separates its arguments with
   `, ` and ends with a newline. `print(debug(x))` selects `Debug`.
@@ -412,6 +413,47 @@ a decision changes, this page and the chapter change together.
   table or through a function value. No annotation asks for it and no function of the program pays
   for it. See [errors](/spec/errors/).
 
+Settled by the user on 2026-11-03:
+
+- The methods an `impl` adds to a class whose fields are all immutable are not variance positions,
+  as a `data` type's are not: such an instance holds nothing a method could store a value into. A
+  class with a `var` field keeps every method a position.
+- A one-variant `data` type may have a companion `object`, as a class may: the name in call position
+  is the constructor and `Name.member` the companion (`Map.empty`, `Map.builder`, `List.builder`).
+- An `impl` may add methods for some type arguments only: `impl[T: Display] List[T]` gives
+  `mkString` to lists of displayable elements, and calling it on any other list is an error.
+- The integers are one family: a closed core trait `Integer`, whose members the compiler decides (every
+  `iN`), lets the core library implement a trait once for every width (`impl[T: Integer] Display for
+  T`). Such an impl over a bare type parameter is allowed only for closed core traits, in the core
+  library.
+- Until methods can be named by symbols, a vector's `:+`, `+:` and `++` are `appended`,
+  `prepended` and `concat`, and a buffer's `+=` is `add`.
+- A module may be named in code through an import of the module itself: `import a.b`, then `b.X`
+  reaches `a.b`'s public `X`, alongside imports of single declarations.
+- An infix method call binds more loosely than arithmetic, bitwise, shift, cons and range operators
+  and more tightly than comparisons, `is`, `&&` and `||`, and groups to the left, so
+  `xs contains x && ok` is `(xs contains x) && ok`.
+- A literal pattern does not match an `Any` (`5 -> …` on an `Any` is an error); `n: int if n == 5`
+  says it.
+- A tuple's type at run time is the type it was made with: `(animal, 1)` with `animal: Animal` is an
+  `(Animal, int)` whatever its class, and a type pattern `(Dog, int)` does not match it.
+- After its own last field, an `open` or `abstract` class's body may call a private method that is
+  safe: it uses `self` only to read and assign fields and to call other safe methods.
+- A string's byte offsets and lengths are `int`, and a string holds at most the largest `int` bytes.
+- A trait's `override` may give an abstract method of a trait it requires a body, not only replace a
+  default.
+- An iterator is `hasNext()` and `next()`, and `next()` on an exhausted iterator traps.
+- A `for` without `yield` traverses its source through `iterator()` (a range written in place is
+  counted and an array indexed); `break`, `continue` and `return` leave the body directly. A type
+  with `foreach` and no iterator is not a `for` source.
+- `Array.fill(n, value)` evaluates `value` once and shares it between the elements; per-element
+  values come from `Array.tabulate`.
+- The hash-based maps and sets iterate in an order the program cannot rely on: the immutable ones in
+  an order fixed by the keys' hashes alone, so equal maps iterate alike, and the mutable ones in
+  table order.
+- Maps and sets display in the shape of their literals: `{a: 1, b: 2}`, `{1, 2, 3}`, and `{"a": 1}`
+  with each part's `Debug`. Mutable maps and sets compare and hash by contents, as arrays do.
+
 **Deferred**
 
 - Public C interoperability. Until then, C is reached through Sysl.
@@ -421,33 +463,6 @@ a decision changes, this page and the chapter change together.
 
 ## Proposed
 
-- The methods an `impl` adds to a class whose fields are all immutable are not variance positions,
-  as a `data` type's are not: such an instance holds nothing a method could store a value into. It
-  lets `Vector[+T]` take `T` in `appended`, `updated` and `contains`, and implement `Eq`, without
-  lower bounds. A class with a `var` field keeps every method a position. It is implemented, and is
-  one of the alternatives named below for `Map` and `Set`: with it they could be classes with
-  companions.
-- Until methods can be named by symbols, a vector's `:+`, `+:` and `++` are `appended`,
-  `prepended` and `concat`, and a buffer's `+=` is `add`.
-
-- A module is not named in code: `import a.b` is an error, and `b.X` does not reach `a.b`'s `X`.
-  Every use of another module's declaration goes through an import of that declaration. The
-  alternative is qualified access through an imported module name, `import a.b` then `b.X`.
-
-- An infix method call binds more loosely than arithmetic, bitwise, shift, cons and range operators
-  and more tightly than comparisons, `is`, `&&` and `||`, and groups to the left, so
-  `xs contains x && ok` is `(xs contains x) && ok`.
-
-- A literal pattern does not match an `Any` (`5 -> …` on an `Any` is an error); `n: int if n == 5`
-  says it.
-- A tuple's type at run time is the type it was made with: `(animal, 1)` with `animal: Animal` is an
-  `(Animal, int)` whatever its class, and a type pattern `(Dog, int)` does not match it. A tuple made
-  as `(Dog, int)` matches `(Animal, int)` too.
-- After its own last field, an `open` or `abstract` class's body may call a method that cannot be
-  overridden (a private one) when that method is safe: it uses `self` only to read and assign
-  fields and to call other safe methods, so it cannot reach a subclass's field before the subclass
-  sets it. The settled rule read literally forbids every method call in such a body, since the
-  subclass's fields are not yet set; this allows the calls that provably observe nothing unset.
 - The thread model ([threads](/spec/threads/)): `avin.threads.spawn(body)` starts a closure on a
   new thread with an 8 MiB stack and `join()` gives back its result; a structured `scope` joins
   every thread started in it; a trap in any thread stops the program, and the program ends when
@@ -458,35 +473,6 @@ a decision changes, this page and the chapter change together.
   so a racing read sees some value written to that word, and a constructor ends with a release
   fence, so no thread sees an object without its header and constructor-set fields. Actors are
   scheduled onto a pool of these threads.
-- A string's byte offsets and lengths are `int`, and a string holds at most the largest `int`
-  (2,147,483,647) bytes; making a longer one stops the program as running out of memory does. The
-  alternative is `long` offsets, which every caller would then narrow to index with an `int`.
-- A trait's `override` may also give an abstract method of a trait it requires a body, not only
-  replace a default: `trait Square: Shape` with `override area() -> int = side() * side()` makes
-  `area` concrete for every class conforming to `Square`.
-- An iterator is `hasNext()` and `next()`, and `next()` on an exhausted iterator traps. The
-  alternative, `next() -> Option[A]`, would make an `Option` per element.
-- A `for` without `yield` traverses its source through `iterator()` (a range written in place is
-  counted and an array indexed) rather than calling `foreach` with the body as a closure. For the
-  library's collections the two do the same thing; through the iterator, `break`, `continue` and
-  `return` leave the body directly, with no jump out of a closure. A type with `foreach` and no
-  iterator is then not a `for` source.
-- `Array.fill(n, value)` evaluates `value` once and shares it between the elements; per-element
-  values come from `Array.tabulate`. The alternative is a by-name `value`, evaluated per element.
-- A one-variant `data` type may have a companion `object`, as a class may: the name in call position
-  is the constructor and `Name.member` the companion. The immutable `Map[K, +V]` and `Set[A]` are
-  `data` types, since the methods an impl adds to a `data` type are not variance positions
-  (`updated(key: K, value: V)` needs no lower bound) and impls with bounds of their own (`Eq` when
-  the values have it) exist for `data` types; `Map.empty` and `Map.builder` then need a companion.
-  Until this is settled the empty map is `Map[K, V]()`, through a default field, and the builders
-  are named `MapBuilder` and `SetBuilder`. The alternatives are to exempt the methods of a class's
-  impls from variance as a `data` type's are, or to add lower bounds (`[W >: V]`).
-- The hash-based maps and sets iterate in an order the program cannot rely on: the immutable ones in
-  an order fixed by the keys' hashes alone, so equal maps iterate alike, and the mutable ones in
-  table order. The alternative is insertion order, which costs an index array beside the table.
-- Maps and sets display in the shape of their literals: `{a: 1, b: 2}` with each key and value in its
-  own `Display`, `{1, 2, 3}` for a set, and `{"a": 1}` with each part's `Debug`. Mutable maps and
-  sets compare and hash by contents, as arrays do.
 
 ## Open
 
