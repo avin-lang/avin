@@ -356,7 +356,9 @@ A built-in type's impl may declare a method as an intrinsic; its declared type t
 first. `impl string` in `library/avin/string.avin` does so for the string operations that read the
 object itself: `byteLength` (the length word, loaded and narrowed to `int`), a private `byteAt` (a
 checked byte load), `slice`, `repeat` and a private `find`, the last three over the runtime's
-`avin_rt_string_slice`, `avin_rt_string_repeat` and `avin_rt_string_find`. A direct call of one is
+`avin_rt_string_slice`, `avin_rt_string_repeat` and `avin_rt_string_find`, and a private
+`parseReal` over `avin_rt_string_parse_real`, which reads the number with Sysl's parser and answers
+not-a-number for a refusal. A direct call of one is
 lowered where it is made, so its checks (an offset out of range, an offset inside a character, a
 negative count) trap at the caller's line; the intrinsic's function body, used when the method is
 passed as a value, reports them at its declaration. The runtime's `avin_rt_new_text` refuses a

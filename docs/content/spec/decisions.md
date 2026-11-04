@@ -155,11 +155,16 @@ a decision changes, this page and the chapter change together.
   when its offsets are out of order or outside the string, or either falls inside a character;
   `repeat` traps on a negative count. Casing is the simple mapping, one character for one; trimming
   removes Unicode `White_Space`; `replace` replaces every occurrence, left to right and not
-  overlapping, and an empty pattern occurs nowhere. A method whose natural result is optional
-  (`indexOf`, `toInt`, `toReal`) waits for `Option`, and those yielding a collection or iterator
-  (`split`, `chars`, `bytes`) for the collections.
+  overlapping, and an empty pattern occurs nowhere. Methods yielding a collection or iterator
+  (`split`, `chars`, `bytes`) wait for the collections.
 - Settled 2026-11-03: a built-in type's impl in the core library may declare a method as an
   `@intrinsic`, whose type takes the receiver first.
+- Settled 2026-11-03: the string methods answering with `Option` are `indexOf` (with an optional
+  starting offset), `lastIndexOf`, `toInt`, `toLong` and `toReal`. Offsets are bytes. A number is read
+  whole: `toInt` and `toLong` take an optional `+` or `-` and ASCII digits, so `"+3"` is 3 and
+  `"-0"` is 0, and refuse white space, separators and overflow (`"-9223372036854775808"` is a
+  `long`); `toReal` is correctly rounded, takes decimal only, and refuses white space, `nan`, `inf`,
+  hexadecimal and a value too large to be finite. A refusal is `None`, never a trap.
 - A generic overload is compared by the same rule as any other: `f(x: int)` is more specific than
   `f[T](x: T)`, which accepts an `int` while `f(int)` does not accept a `T`.
 - Whether a parameter is by-name does not distinguish overloads. An argument some candidate takes by
