@@ -55,10 +55,14 @@ class SortedPair[T: Ordered](first: T, second: T)
   trait may bound them further**, making the type conform only for the type arguments that meet the
   bounds: with `impl[T: Ord] Ord for Box[T]`, a `Box[int]` is an `Ord` and a `Box[Plain]` is not. Each
   type argument written or inferred for a bound is held to them, and the impl's methods have the
-  bounds' members. Such an impl is of a data type and of a trait that is only a bound, one that
-  mentions `Self`, as `Eq`, `Ord` and `Add` do; an impl of `Eq` or `Hash` may be bounded only by them,
-  since every type meets them. An impl adding methods to some type arguments only is not part of the
-  language.
+  bounds' members. Such an impl is of a data type or a class, and of any trait. Where the trait is
+  also a type, a `Box[int]` converts to `Display` and a `Box[Plain]` does not, also as a covariant
+  type argument (`List[Box[Plain]]` is no `List[Display]`); a `d: Display` type pattern on an `Any`
+  matches only an instance that conforms; and the trait's methods, the impl's included, are called
+  on an instance only where it conforms, in the type's own methods too, where its parameters have
+  only the bounds the type declares. Inside generic code, `Box[T]` conforms where `T`'s bounds meet
+  the impl's. An impl of `Eq` or `Hash` may be bounded only by them, since every type meets them. An
+  impl adding methods to some type arguments only is not part of the language.
 - **A call through a bound is direct**: each instance calls the implementation of its own type
   argument. Where the argument is a trait type or an open class, any conforming object may arrive,
   and the call goes through the object's method table as a call on that type does.

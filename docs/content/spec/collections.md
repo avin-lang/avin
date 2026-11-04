@@ -112,6 +112,11 @@ Iteration visits a map's entries as `(key, value)` pairs in an order the program
 the immutable collections it depends only on the keys' hashes, so equal maps iterate alike; for the
 mutable ones it is the table's order.
 
+Mutable maps and sets, like arrays, compare and hash by their contents at the moment they are
+compared; `===` tells two of them apart. Every map and set displays in the shape of its literal,
+`{a: 1, b: 2}` and `{1, 2, 3}`, each part in its own `Display`, and its `Debug` uses the parts'
+`Debug`, `{"a": 1}`, each where the parts have it.
+
 ## Indexing and callable sequences
 
 A `Seq[A]` is a function from index to element: `xs(i)` reads an element, and a `Seq[A]` can be
@@ -160,6 +165,19 @@ pairs[A](xs: List[A]) -> List[(A, A)] = xs match
 `::` needs a `List` on its right, so a literal there is built as one: in `1 :: 2 :: []`, the `[]` is
 the empty `List[int]`. `xs(i)` on a list takes time proportional to `i`; code that indexes wants a
 `Vector`.
+
+`List` is a `data` type of the core library with two variants, `Cons(first: T, rest: List[T])` and
+`Nil`; `x :: xs` is `Cons(x, xs)` and `[]` is `Nil`. `::`, `[]` built as a list, and list patterns
+always mean the core library's `List`, even where a program declares its own `List`, `Cons` or
+`Nil`. The element type of `x :: xs` is inferred as a call of `Cons` infers it, so a `Cat` goes in
+front of a `List[Dog]` where a `List[Animal]` is expected.
+
+Every operation on a list loops over it rather than recursing, so a list of any length is traversed,
+transformed, compared and hashed without deepening the stack; a method that yields a list in order,
+such as `map` or `filter`, builds it reversed and turns it around. `head()`, `tail()` and `last()`
+trap on the empty list, and `headOption()` and `get(i)` return an `Option`. Lists compare and hash by
+their contents, and order element by element when their elements are ordered, a list ordering
+before every longer list it begins.
 
 ## Sequence patterns
 

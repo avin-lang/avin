@@ -57,19 +57,31 @@ private branch[K, V](prefix: long, bit: long, zero: HashTrie[K, V], one: HashTri
     elif one is Empty then zero
     else Branch(prefix, bit, trieSize(zero) + trieSize(one), zero, one)
 
-// The value at `key`, whose spread hash is `h`.
-private trieFind[K: Eq, V](t: HashTrie[K, V], h: long, key: K) -> Option[V] = t match
-    Empty -> None
-    Leaf(lh, k, v) -> if lh == h && k == key then Some(v) else None
-    Collision(ch, _, entries) -> if ch == h then chainFind(entries, key) else None
-    Branch(p, b, _, z, o) ->
-        if below(h, b) != p then None
-        elif h & b == 0 then trieFind(z, h, key)
-        else trieFind(o, h, key)
+// The value at `key`, whose spread hash is `h`, found by descending in a loop. A branch whose shared
+// bits differ from `h`'s ends the search early, since `key` would have to lie below it.
+private trieFind[K: Eq, V](root: HashTrie[K, V], h: long, key: K) -> Option[V]
+    var t = root
+    loop
+        t match
+            Branch(p, b, _, z, o) ->
+                if below(h, b) != p then return None
+                t = if h & b == 0 then z else o
+            Leaf(lh, k, v) -> return if lh == h && k == key then Some(v) else None
+            Collision(ch, _, entries) -> return if ch == h then chainFind(entries, key) else None
+            Empty -> return None
 
-private chainFind[K: Eq, V](c: Chain[K, V], key: K) -> Option[V] = c match
-    End -> None
-    Link(k, v, next) -> if k == key then Some(v) else chainFind(next, key)
+// The value at `key` in a collision's entries.
+private chainFind[K: Eq, V](entries: Chain[K, V], key: K) -> Option[V]
+    var c = entries
+    loop
+        c match
+            Link(k, v, next) ->
+                if k == key then return Some(v)
+                c = next
+            End -> return None
+
+// Updates recurse, rebuilding the path on the way back up. Each level consumes one bit of the 64-bit
+// hash, so the recursion is never deeper than 64, however large the map.
 
 // The trie with `key` bound to `value`, replacing any value it had.
 private trieInsert[K: Eq, V](t: HashTrie[K, V], h: long, key: K, value: V) -> HashTrie[K, V] = t match
@@ -80,16 +92,12 @@ private trieInsert[K: Eq, V](t: HashTrie[K, V], h: long, key: K, value: V) -> Ha
         else Collision(h, 2, Link(key, value, Link(k, v, End)))
     Collision(ch, n, entries) ->
         if ch != h then join(h, Leaf(h, key, value), ch, t)
-        elif chainFind(entries, key) is Some(_) then Collision(h, n, chainReplace(entries, key, value))
+        elif chainFind(entries, key) is Some(_) then Collision(h, n, Link(key, value, chainRemove(entries, key)))
         else Collision(h, n + 1, Link(key, value, entries))
     Branch(p, b, _, z, o) ->
         if below(h, b) != p then join(h, Leaf(h, key, value), p, t)
         elif h & b == 0 then branch(p, b, trieInsert(z, h, key, value), o)
         else branch(p, b, z, trieInsert(o, h, key, value))
-
-private chainReplace[K: Eq, V](c: Chain[K, V], key: K, value: V) -> Chain[K, V] = c match
-    End -> End
-    Link(k, v, next) -> if k == key then Link(key, value, next) else Link(k, v, chainReplace(next, key, value))
 
 // The trie without `key`, which must be in it.
 private trieRemove[K: Eq, V](t: HashTrie[K, V], h: long, key: K) -> HashTrie[K, V] = t match
@@ -105,14 +113,22 @@ private trieRemove[K: Eq, V](t: HashTrie[K, V], h: long, key: K) -> HashTrie[K, 
         if h & b == 0 then branch(p, b, trieRemove(z, h, key), o)
         else branch(p, b, z, trieRemove(o, h, key))
 
-private chainRemove[K: Eq, V](c: Chain[K, V], key: K) -> Chain[K, V] = c match
-    End -> End
-    Link(k, v, next) -> if k == key then next else Link(k, v, chainRemove(next, key))
+// A collision's entries without `key`. A collision's entries are in no particular order, so the ones
+// kept are moved onto a new chain in a loop, which reverses them.
+private chainRemove[K: Eq, V](entries: Chain[K, V], key: K) -> Chain[K, V]
+    var kept: Chain[K, V] = End
+    var c = entries
+    loop
+        c match
+            Link(k, v, next) ->
+                if k != key then kept = Link(k, v, kept)
+                c = next
+            End -> return kept
 
 // Steps through a trie's entries, depth first, the subtries still to visit on `pending` and the
 // remaining entries of a collision on `chain`.
 private class HashTrieIterator[K, V](root: HashTrie[K, V]): Iterator[(K, V)]
-    private var pending: Chain[HashTrie[K, V], unit] = Link(root, (), End)
+    private var pending: List[HashTrie[K, V]] = [root]
     private var chain: Chain[K, V] = End
     private var ready: Option[(K, V)] = None
     advance()
@@ -134,9 +150,9 @@ private class HashTrieIterator[K, V](root: HashTrie[K, V]): Iterator[(K, V)]
                 chain = next
                 return
             End -> ()
-        while ready is None && pending is Link(_, _, _)
+        while ready is None
             pending match
-                Link(t, _, rest) ->
+                t :: rest ->
                     pending = rest
                     t match
                         Empty -> ()
@@ -145,5 +161,5 @@ private class HashTrieIterator[K, V](root: HashTrie[K, V]): Iterator[(K, V)]
                             ready = Some((k, v))
                             chain = next
                         Collision(_, _, End) -> ()
-                        Branch(_, _, _, z, o) -> pending = Link(z, (), Link(o, (), rest))
-                End -> ()
+                        Branch(_, _, _, z, o) -> pending = z :: o :: rest
+                [] -> return

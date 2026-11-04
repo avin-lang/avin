@@ -10,7 +10,9 @@ Every value can be compared with `==` and hashed, so any value can be a key in a
 element of a `Set`. `!=` is the negation.
 
 - Built-in types, strings, tuples and `data` types compare and hash by value, structurally.
-- Collections compare by contents when their elements do. This includes `Array` and `Buffer`.
+- Collections compare by contents when their elements do. This includes `Array` and `Buffer`: two
+  arrays are equal when they have the same length and equal elements in order, and `===` compares
+  their identities.
 - Class instances, `object`s and closures compare and hash by identity, which always agree, unless
   the class implements or derives `Eq`. `class Point(x: int, y: int) derives Eq, Hash` compares and
   hashes by its fields.
@@ -30,6 +32,16 @@ agree. A class that implements one of `==` and the hash by hand must implement t
 the two consistent is then its author's responsibility. `Ord` is never derived implicitly;
 `derives Ord` orders lexicographically by field, and by variant declaration order.
 
+A class derives from its constructor parameters, whether plain, `val` or `var`, in the order they are
+written; fields its body declares take no part. It derives `Eq` and `Hash` together, and `Ord` only
+beside an `Eq` by the same fields. A data type derives from each variant's fields, and already
+compares and hashes by them, so `derives Eq, Hash` on it changes nothing. Each field's type must
+implement what is derived from it: `class Ranked(p: Plain) derives Eq, Hash, Ord` is an error naming
+`p` when `Plain` has no `Ord`. A generic type's derived `Ord`, `Display` and `Debug`, a data type's
+or a class's, hold for the type arguments that implement the trait: `data Pair[A, B](a: A, b: B)
+derives Display` displays a `Pair[int, string]`, and a `Pair[Plain, int]` is still made but does not
+display.
+
 ## Identity
 
 `a === b` is reference identity. It is defined only on reference types: class instances, `object`s,
@@ -43,6 +55,19 @@ interpolation and `toString()`. `Debug` is the diagnostic form, used by `debug(x
 quoted and escaped. Both render into a `Writer` with a `FormatSpec`, so formatting a value needs no
 intermediate string. `data` types and tuples derive both; classes declare them. Nothing has a default
 that prints an address.
+
+A derived `Display` writes the type's or variant's name and its fields in parentheses, separated by
+`, `, each in its own `Display` form: `Point(1, 2)`, `Named(ada, Point(1, 2))`. A variant without
+fields is its bare name, `Empty`. A derived `Debug` has the same shape with each field's `Debug`
+form, so strings and chars inside are quoted and escaped: `Named("ada", Point(1, 2))`. A field width
+in the `FormatSpec` pads the whole rendering; the fields themselves are written without one. Derived
+on a generic type, either holds for the type arguments that implement the trait: `data Box[T](item:
+T) derives Display` displays a `Box[int]`, and a `Box` of a type without `Display` does not display.
+
+A collection displays as its elements in brackets, separated by `, `, each in its own `Display` form:
+an `Array[int]` or a `List[int]` as `[1, 2, 3]`, an empty one as `[]`, nested ones as `[[1], [2,
+3]]`. Its `Debug` has the same shape with each element's `Debug` form, `["a", "b"]`. A field width
+pads the whole. A collection displays only when its elements do.
 
 ## Values and references
 

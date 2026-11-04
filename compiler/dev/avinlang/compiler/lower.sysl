@@ -299,18 +299,49 @@ private element_size(t: Option[MirType]) -> usize = t match
 private method_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
     var table: Buf[Option[usize]] = buf()
     val entries = checker_table(l, t)
-    for entry in entries
-        val m = entry match
+    val missing = unheld_positions(l, t)
+    for p in 0..<entries.len()
+        val m = entries[p] match
             Some(m) -> m
             None ->
                 table.push(None)
                 continue
         val symbol = l.program.symbols[m]
-        if is_abstract_method(symbol) || symbol.decl.type_params.len() > 0
+        if is_abstract_method(symbol) || symbol.decl.type_params.len() > 0 || missing[p]
             table.push(None)
             continue
         table.push(Some(instance(l, m, implementation_args(l, t, m))))
     table
+
+/** The lowering's view of conformances: of concrete types only, so with no type parameters in scope. */
+private lowering_conformances(l: *Lowering) -> Conformances =
+    Conformances(l.program.classes, l.program.data, l.program.builtins, l.program.conditional, l.program.core, map(), None)
+
+// For each position of `t`'s method table, whether it belongs to a trait `t` does not conform to at
+// its type arguments, though an impl with bounds of its own places the trait in every instance's
+// table. No call reaches such a position, so it stays empty and its methods are not compiled for
+// this instance.
+private unheld_positions(l: *Lowering, t: &Type) -> Buf[bool]
+    val entries = checker_table(l, t)
+    var out: Buf[bool] = buf()
+    for _ in entries do out.push(false)
+    val owner = *t match
+        Class(k, _, _) -> class_owner(k)
+        Data(d, _, _) -> data_owner(d)
+        _ -> return out
+    var conditional = false
+    for x in l.program.conditional
+        if x.owner == owner then conditional = true
+    if !conditional then return out
+    val f = lowering_conformances(l)
+    for k in 0..<l.program.classes.len()
+        val symbol = l.program.classes[k]
+        if symbol.decl.modifier != "trait" then continue
+        if ancestor_type(l.program.classes, l.program.data, t, k) is None then continue
+        if holding_ancestor(f, t, k) is Some(_) then continue
+        for j in 0..<symbol.methods.len()
+            if symbol.base + j < out.len() then out.set(symbol.base + j, true)
+    out
 
 /** The checker's method table of class, data or built-in type `t`: the method at each position. */
 private checker_table(l: *Lowering, t: &Type) -> Buf[Option[usize]] = *t match
@@ -567,11 +598,14 @@ private supertypes(l: *Lowering, t: &Type) -> Buf[&Type]
         _ -> ()
     out
 
-// Adds the superclasses of the class `t` and the traits it and they conform to, each once.
+// Adds the superclasses of the class `t` and the traits it and they conform to, each once. A
+// conformance an impl with bounds of its own states is an ancestor only of the instances whose type
+// arguments meet them.
 private class_ancestors(l: *Lowering, t: &Type, out: *Buf[&Type])
     // A data type's ancestors are the traits its impls name, and what those require.
     if *t is Data(d, _, xs)
         for required in l.program.data[d].traits
+            if !conformance_holds(lowering_conformances(l), data_owner(d), required, xs) then continue
             val parent = substitute(required, data_owner(d), xs)
             var seen = false
             for i in 0..<out.len()
@@ -589,7 +623,7 @@ private class_ancestors(l: *Lowering, t: &Type, out: *Buf[&Type])
     val symbol = l.program.classes[k]
     var parents: Buf[&Type] = buf()
     for required in symbol.traits
-        parents.push(substitute(required, class_owner(k), args))
+        if conformance_holds(lowering_conformances(l), class_owner(k), required, args) then parents.push(substitute(required, class_owner(k), args))
     if symbol.superclass is Some(sup) then parents.push(substitute(sup, class_owner(k), args))
     for parent in parents
         var seen = false
@@ -681,7 +715,7 @@ private add_variant_ancestors(l: *Lowering)
                 if a == target then listed = true
             if listed then continue
             val to = l.record_types[target]
-            if same_type(view_as(l.program.classes, l.program.data, from, to), to)
+            if same_type(view_as(lowering_conformances(l), from, to), to)
                 ancestors.push(target)
                 grew = true
         if grew then l.records.set(r, TypeRecord(l.records[r].name, ancestors, l.records[r].equals, l.records[r].hash))
@@ -698,7 +732,7 @@ private unbox(l: *Lowering, t: &Type, object: Operand) -> Option[Operand] = mach
 private always_is(l: *Lowering, from: &Type, to: &Type) -> bool
     if *to is AnyType || same_type(from, to) then return true
     if !is_reference(from) then return false
-    same_type(view_as(l.program.classes, l.program.data, from, to), to)
+    same_type(view_as(lowering_conformances(l), from, to), to)
 
 private machine_name(t: MirType) -> string = t match
     MInt(bits) -> s"i$bits"

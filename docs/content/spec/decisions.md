@@ -241,6 +241,11 @@ a decision changes, this page and the chapter change together.
   `{a: 1}` means `{"a": 1}`. `{}` is the empty Set and `Map.empty` the empty Map.
 - `x :: xs` prepends to an immutable `List`, and `head :: tail` is a list pattern, for recursive
   list code. `::` is right-associative.
+- Settled 2026-11-03: `List[+T]` is the core library's `data` type with variants `Cons(first, rest)`
+  and `Nil`. `::` and list patterns always mean the core library's `List`, whatever `List`, `Cons`
+  or `Nil` name where they are written. Every `List` method loops rather than recursing, so no
+  length deepens the stack, and lists compare and hash by contents and order lexicographically when
+  their elements are ordered.
 - Sequences are matched with the brackets that build them: `[]` matches any empty sequence and
   `[a, b]` any sequence of exactly two elements.
 - `Buffer` is the only growable mutable sequence, and `Deque` the mutable sequence for both ends.
@@ -310,8 +315,27 @@ a decision changes, this page and the chapter change together.
   operators have, in the core library, and an operator on a built-in type is the machine's
   operation, in generic instances too.
 - Settled 2026-11-03: an impl of a trait may bound the type's parameters further (`impl[T: Ord] Ord
-  for Box[T]`), making the type conform only for type arguments meeting them; for now only on data
-  types and traits that are only bounds.
+  for Box[T]`), making the type conform only for type arguments meeting them; on data types and
+  classes, for any trait.
+- Settled 2026-11-03: a conformance through such an impl to a trait that is also a type holds
+  wherever one is decided: at conversions (as a covariant type argument too), in type patterns, and
+  for calls of the trait's methods, which an instance missing the bounds does not have.
+- Settled 2026-11-03: a generic type's derived `Ord`, `Display` and `Debug` are impls bounding each
+  parameter by the trait, so they hold where the type arguments implement it.
+- Settled 2026-11-03: arrays compare and hash by contents (`===` stays identity); arrays and lists
+  display as `[1, 2, 3]`, their `Debug` as `["a", "b"]`, each only when the elements do.
+- Settled 2026-11-03: `derives` takes `Eq`, `Hash`, `Ord`, `Display` and `Debug`. A class derives
+  from its constructor parameters, plain, `val` and `var` alike, and not from fields its body
+  declares; a data type from each variant's fields. A class derives `Eq` and `Hash` together, and
+  `Ord` only with an `Eq` by the same fields, derived or its own; a data type has both already, so
+  deriving them there changes nothing. `Display` writes `Name(a, b)`, each field in its own `Display`
+  form, and a variant without fields as its name; `Debug` writes the same shape with each field's
+  `Debug`, so strings inside are quoted. A width pads the whole. Deriving a trait the type also
+  implements, or one a field's type does not implement, is an error naming the field. A generic data
+  type's derived `Ord` holds for the type arguments that are ordered; deriving `Display` or `Debug`
+  on a generic type, and `Ord` on a generic class, needs the parameters bounded by the trait where
+  the type declares them.
+- `x.equals(y)` and `x.hash()` may be called on a value of any type parameter, bounded or not.
 
 **Project and tooling**
 
@@ -425,6 +449,9 @@ a decision changes, this page and the chapter change together.
 - The hash-based maps and sets iterate in an order the program cannot rely on: the immutable ones in
   an order fixed by the keys' hashes alone, so equal maps iterate alike, and the mutable ones in
   table order. The alternative is insertion order, which costs an index array beside the table.
+- Maps and sets display in the shape of their literals: `{a: 1, b: 2}` with each key and value in its
+  own `Display`, `{1, 2, 3}` for a set, and `{"a": 1}` with each part's `Debug`. Mutable maps and
+  sets compare and hash by contents, as arrays do.
 
 ## Open
 
