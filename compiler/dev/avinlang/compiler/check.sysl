@@ -512,8 +512,15 @@ struct Checker
     /** The inference variables of type arguments with a lower bound, whose lower bounds join to
      * `Any` where they are references with no nearer common type. */
     widening: Buf[usize]
+    /** While above zero, diagnostics are counted in `muted_notes` rather than reported: a pattern
+     * asks this way whether its name is a value with an extractor method. */
+    muted: usize
+    muted_notes: usize
 
     note(*self, unit: usize, at: Span, message: string)
+        if self.muted > 0
+            self.muted_notes = self.muted_notes + 1
+            return
         // What goes wrong in an impl made from a template is the template's, already reported where
         // it is declared, or the deriving type's, reported at its `derives` entry once all is checked.
         if self.derived_context is Some(i)
@@ -751,7 +758,7 @@ private check_imports(c: *Checker, unit: usize)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0)
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -12503,11 +12510,11 @@ private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string)
             TPattern(p.span, ty, PAlternatives(typed))
         Constructor(path, args) -> variant_named(c, path) match
             Some(v) -> variant_pattern(c, p, v, args, ty, no_bind)
-            None ->
-                c.note(unit, p.span, s"`$path` is not a variant")
-                for a in args
-                    check_pattern(c, a, ErrorType, no_bind)
-                TPattern(p.span, ErrorType, PWildcard)
+            None -> extractor_pattern(c, p, path, args, ty, no_bind)
+        Rest(binder) ->
+            c.note(unit, p.span, "`rest*` stands for the rest of a sequence, last in a sequence pattern or in an `unapplySeq` extractor's patterns")
+            check_pattern(c, binder, ErrorType, no_bind)
+            TPattern(p.span, ErrorType, PWildcard)
         Cons(head, tail) ->
             var parts: Buf[&Pattern] = buf()
             parts.push(head)
@@ -12518,6 +12525,9 @@ private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string)
             if !is_list_type(c, t)
                 if seq_element(c, t) is Some(element) then return sequence_pattern(c, p, items, t, element, no_bind)
             if items.len() == 0 then return list_pattern(c, p, "Nil", buf(), ty, no_bind, "sequence patterns match a `Seq`")
+            // `[rest*]` on a list is the whole list.
+            if items.len() == 1 && is_list_type(c, t)
+                if items[0].kind is Rest(binder) then return check_pattern(c, binder, t, no_bind)
             // `[a, b, c]` on a list is `a :: [b, c]`.
             var rest: Buf[&Pattern] = buf()
             for i in 1..<items.len()
@@ -12666,20 +12676,129 @@ private seq_element(c: *Checker, t: &Type) -> Option[&Type]
 // A sequence pattern on a sequence other than a list, `[a, b, c]`, matches one of exactly that many
 // elements. The matched sequence is held in a local of its own, through which the pattern asks its
 // `length()` once and then reads each element it tests with `apply`, in order, stopping at the first
-// that fails; an element matched by `_` is not read.
+// that fails; an element matched by `_` is not read. Ending in `rest*`, it matches a sequence of at
+// least the elements before it, and binds the rest to `rest` as `drop` gives it.
 private sequence_pattern(c: *Checker, p: &Pattern, items: Buf[&Pattern], ty: &Type, element: &Type, no_bind: string) -> &TPattern
     val at = p.span
+    val rest = items.len() > 0 && items[items.len() - 1].kind is Rest(_)
+    val fixed = if rest then items.len() - 1 else items.len()
+    // `[rest*]` is the whole sequence.
+    if rest && fixed == 0
+        if items[0].kind is Rest(binder) then return check_pattern(c, binder, ty, no_bind)
     val name = s"sequence pattern ${at.start}"
     val local = declare_local(c, at, name, ty, false)
-    val length = check_expr(c, compare_at(at, Equal, call_at(at, name_at(at, name), "length"), Expr(at, IntLit(items.len().to_string()))), None)
+    val length = check_expr(c, compare_at(at, if rest then GreaterEqual else Equal, call_at(at, name_at(at, name), "length"), Expr(at, IntLit(fixed.to_string()))), None)
     var elements: Buf[&TExpr] = buf()
     var typed: Buf[&TPattern] = buf()
-    for i in 0..<items.len()
+    for i in 0..<fixed
         var args: Buf[Argument] = buf()
         args.push(Argument(at, None, Expr(at, IntLit(i.to_string())), false))
         elements.push(check_expr(c, Expr(at, Call(name_at(at, name), args)), None))
         typed.push(check_pattern(c, items[i], element, no_bind))
+    if rest
+        if items[fixed].kind is Rest(binder)
+            var args: Buf[Argument] = buf()
+            args.push(Argument(at, None, Expr(at, IntLit(fixed.to_string())), false))
+            val dropped = check_expr(c, Expr(at, Call(Expr(at, Member(name_at(at, name), "drop")), args)), None)
+            elements.push(dropped)
+            typed.push(check_pattern(c, binder, dropped.ty, no_bind))
     TPattern(p.span, ty, PSequence(local, length, elements, typed))
+
+// An extractor pattern, `Name(p1, p2)`, where `Name` is not a variant but a value, an object or a
+// local, whose type has an `unapply` or an `unapplySeq` method. The matched value is held in a local
+// of its own and passed to the method. An `unapply` answering a `bool` matches where it answers
+// `true`, with no patterns; one answering an `Option` matches its `Some`, whose value one pattern
+// matches whole and several match part by part, as a tuple of as many parts. An `unapplySeq`
+// answers an `Option` of a sequence, which the patterns match as a sequence pattern does, `rest*`
+// included. A variant of the name is always the variant.
+private extractor_pattern(c: *Checker, p: &Pattern, path: string, args: Buf[&Pattern], ty: &Type, no_bind: string) -> &TPattern
+    val unit = unit_of(c)
+    val at = p.span
+    val target = path_expr(at, path)
+    var method = ""
+    if extractor_type(c, target) is Some(t)
+        if methods_of(c, t, "unapply").len() > 0 then method = "unapply"
+        elif methods_of(c, t, "unapplySeq").len() > 0 then method = "unapplySeq"
+        else c.note(unit, at, s"`$path` is not a variant, and ${type_name(t)} has no `unapply` or `unapplySeq` to make it an extractor")
+    else c.note(unit, at, s"`$path` is not a variant or an extractor")
+    if method == "" then return failed_extractor(c, p, args, no_bind)
+    val name = s"extractor ${at.start}"
+    val local = declare_local(c, at, name, ty, false)
+    var call_args: Buf[Argument] = buf()
+    call_args.push(Argument(at, None, name_at(at, name), false))
+    val view = check_expr(c, Expr(at, Call(Expr(at, Member(target, method)), call_args)), None)
+    val result = zonk(c, view.ty)
+    if *result is ErrorType then return failed_extractor(c, p, args, no_bind)
+    val written = s"`$path.$method`"
+    if method == "unapply" && *result is Bool
+        if args.len() > 0
+            c.note(unit, at, s"$written answers a bool, so it takes no patterns: write `$path()`")
+            return failed_extractor(c, p, args, no_bind)
+        return TPattern(at, ty, PView(local, view, TPattern(at, result, PLiteral(TExpr(at, result, BoolConst(true))))))
+    val option = core_data(c, "Option") match
+        Some(d) -> d
+        None -> return failed_extractor(c, p, args, no_bind)
+    val inner: &Type = *result match
+        Data(id, _, type_args) if id == option && type_args.len() == 1 -> type_args[0]
+        _ ->
+            if method == "unapply" then c.note(unit, at, s"$written answers ${type_name(result)}; an extractor's `unapply` answers an Option or a bool")
+            else c.note(unit, at, s"$written answers ${type_name(result)}; an extractor's `unapplySeq` answers an Option of a sequence")
+            return failed_extractor(c, p, args, no_bind)
+    val some = VariantRef(option, variant_index(c, option, "Some"))
+    var part: &Pattern = p
+    if method == "unapplySeq"
+        val seq = zonk(c, inner)
+        if !is_list_type(c, seq) && seq_element(c, seq) is None
+            if !(*seq is ErrorType) then c.note(unit, at, s"$written answers ${type_name(result)}; an extractor's `unapplySeq` answers an Option of a sequence")
+            return failed_extractor(c, p, args, no_bind)
+        part = Pattern(at, Sequence(args))
+    elif args.len() == 0
+        c.note(unit, at, s"$written answers ${type_name(result)}, so it takes one pattern or more, one for each part of the value it gives")
+        return failed_extractor(c, p, args, no_bind)
+    elif args.len() == 1 then part = args[0]
+    else
+        var parts = 0usize
+        if *zonk(c, inner) is Tuple(types) then parts = types.len()
+        if parts != args.len()
+            val gives = if parts == 0 then "one value" else s"$parts values"
+            c.note(unit, at, s"$written gives ${type_name(zonk(c, inner))}, $gives, so it takes ${if parts == 0 then "one pattern" else s"$parts patterns"}, not ${args.len()}")
+            return failed_extractor(c, p, args, no_bind)
+        part = Pattern(at, Tuple(args))
+    var fields: Buf[&Pattern] = buf()
+    fields.push(part)
+    TPattern(at, ty, PView(local, view, variant_pattern(c, p, some, fields, result, no_bind)))
+
+// An extractor pattern that could not be checked: its patterns are checked against nothing, so that
+// the names they bind are declared, and it reports no gap in coverage.
+private failed_extractor(c: *Checker, p: &Pattern, args: Buf[&Pattern], no_bind: string) -> &TPattern
+    for a in args
+        check_pattern(c, a, ErrorType, no_bind)
+    TPattern(p.span, ErrorType, PWildcard)
+
+// `a.b.c` as an expression: the name `a` and its members.
+private path_expr(at: Span, path: string) -> &Expr
+    var e: &Expr = Expr(at, Invalid)
+    var first = true
+    for part in path.split(".")
+        e = if first then name_at(at, part) else Expr(at, Member(e, part))
+        first = false
+    e
+
+// The type of the value `target` names, as the receiver of a call; `None`, with nothing reported,
+// where it names none.
+private extractor_type(c: *Checker, target: &Expr) -> Option[&Type]
+    c.muted = c.muted + 1
+    val before = c.muted_notes
+    var found: Option[&Type] = None
+    if static_receiver(c, target, "unapply") is Some(t) then found = Some(t)
+    else
+        val typed = check_expr(c, target, None)
+        found = Some(zonk(c, typed.ty))
+    c.muted = c.muted - 1
+    if c.muted_notes != before then return None
+    if found is Some(t)
+        if *t is ErrorType then return None
+    found
 
 // A list pattern is the core library's `List` variant `name` with the patterns `parts` for its
 // fields, whatever `Cons` and `Nil` name where it is written. On any other type it is reported with

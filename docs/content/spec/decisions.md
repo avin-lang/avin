@@ -238,9 +238,13 @@ a decision changes, this page and the chapter change together.
   kind; `map`, `collect` and `flatMap` through the trait answer a hash-based collection. Maps and sets
   of different kinds with equal contents are equal, through the traits and `Any`, and hash alike. A
   map has no `mkString` of its own: it joins its entries as pairs, `(a, 1)`, through `Iterable`'s.
-  The ordered operations keep their names, `first`, `last`, `floor`, `ceiling`, `from`, `until`,
-  `range` (from inclusive, until exclusive) and `reverseIterator`; the tree is balanced by weight,
-  each side at most three times the other.
+  The ordered operations take the reference library's names (user, 2026-11-04): `headOption` and
+  `lastOption`, `head`, `last`, `firstKey` and `lastKey` (trapping when empty), `minAfter(k)` (the
+  least at least `k`), `maxBefore(k)` (the greatest less than `k`), `rangeFrom` and `rangeTo`
+  (inclusive), `rangeUntil` (exclusive), `range` (from inclusive, until exclusive), `iteratorFrom`
+  (and a map's `keysIteratorFrom` and `valuesIteratorFrom`), and `reverseIterator`, which the
+  reference's sorted collections lack and which is kept; the tree is balanced by weight, each side
+  at most three times the other.
 - Settled by the user 2026-11-04: the elementary functions are a module, `avin.math` ([system library](/spec/system-library/#avin-math)),
   with the reference library's names, called as `math.sqrt(x)` after `import avin.math` or imported
   by name: `Pi` and `E`; `sqrt`, `cbrt`, `exp`, `expm1`, `log` (natural), `log10`, `log1p`, `pow`,
@@ -1052,29 +1056,12 @@ Settled by the user on 2026-11-04:
   compile-time constants. Narrowing integer conversions (`i8(x)`, `int(l)`, `T(n)`, and a byte or char to
   a narrower integer) trap when the value does not fit; real-to-integer still saturates. The wrapping
   form, `i8.wrap(x)` (spelling proposed below), keeps the low bits. Not yet: the limits of a type parameter bounded by `Integer` (`T.MaxValue`).
-
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- Lower bounds and the expected type ([generics](/spec/generics/#lower-bounds)): the expected type
-  decides a lower-bounded type argument only where it admits the bound; otherwise the argument is
-  inferred from the bound and the arguments, and the result is passed as any value is. So
-  `println(m.getOrElse(k, "none"), n)` on a `Map[string, string]`, where each argument expects a
-  `Display`, takes `W` as `string` rather than reporting `Display` as no supertype of `string`. A
-  delayed (by-name) argument widens an open lower-bounded type argument as any other argument does:
-  `cats.getOrElse(k, dog)` is an `Animal`. Both keep programs working that called the methods before
-  they took `[W >: V]`. Awaiting the user.
-- Nested data types ([generics](/spec/generics/#polymorphic-recursion)): a data type naming itself
+- Settled by the user 2026-11-04: Nested data types ([generics](/spec/generics/#polymorphic-recursion)): a data type naming itself
   at a larger instance in its fields (`Deeper(inner: Tree[Nest[T]])` in `Tree[T]`) is rejected at
   the type as polymorphic recursion, even where no code compares, hashes or shows it, since every
   data type's structural equality, hash and `Display` would need a copy for every depth. A class
   naming itself so in a field is not rejected for that alone; only code that grows with it is.
-- Which growth counts ([generics](/spec/generics/#polymorphic-recursion)): growth is measured as
+- Settled by the user 2026-11-04: Which growth counts ([generics](/spec/generics/#polymorphic-recursion)): growth is measured as
   nesting depth, and a cycle is rejected when a round of it nests its type arguments deeper in
   total. A call through a bound on a value of a type parameter takes that type's arguments apart
   (a `Box[U]` reaching `Box`'s method at `U` is one level less); an implementation reached through
@@ -1082,17 +1069,7 @@ Settled by the user on 2026-11-04:
   `Iterator[(A, int)]` for an `IndexedIterator[A]`) takes them apart from the receiver's, while one
   reached through a trait that leaves some unnamed (a trait with no type parameters) continues the
   cycle from wherever the class's larger instance was made.
-- Trait fields ([declarations](/spec/declarations/#trait)): a trait's field declares its type, since
-  each conforming class's layout and the trait's `val` are known before any body is checked; it is
-  public, as every member of a trait is, and is never `lazy`. A class never overrides a trait's
-  field, `val` or `var`: declaring a field of its name is an error rather than an override. A trait
-  never redeclares, with a value, a `val` of a trait it requires.
-- The wrapping conversion is spelled `i8.wrap(x)`, as the wrapping operators are spelled `+%`: the
-  integer type's name, `.wrap`, one operand, any integer target (a bounded type parameter included,
-  `T.wrap(n)`). The core library needs it to test whether a value fits a narrower width (the formatter
-  converts a generic integer to `long` and back). Awaiting the user.
-
-- Literal shapes ([collections](/spec/collections/#literals)): each of the library's collections is
+- Settled by the user 2026-11-04: Literal shapes ([collections](/spec/collections/#literals)): each of the library's collections is
   built only by the literal of its own shape: every `Seq` by `[a, b]`, `Set`, `TreeSet` and the
   mutable `Set` by `{a, b}`, and `Map`, `TreeMap` and the mutable `Map` by `{k: v}`, so
   `val s: Set[int] = [1, 2]` is an error naming the literal to write; `{}` is the empty set or the
@@ -1100,7 +1077,7 @@ Settled by the user on 2026-11-04:
   literal whose elements its builder takes, a map literal only by a builder of pairs. A map literal's
   keys agree on one type and its values on another, each as `if` branches do. The mutable `Set` and
   `Map` gain companions with `empty` and `builder`.
-- Packages ([packages](/spec/packages/)), modelled on Sysl's package system:
+- Settled by the user 2026-11-04: Packages ([packages](/spec/packages/)), modelled on Sysl's package system:
   - **The manifest**: `package { name, version, description }`, `dependencies { … }` and `workspace
     = [ … ]`, and no other key; an unknown key is an error, not a warning. A name is a lowercase
     letter then lowercase letters, digits, `_` and `-`; a version is `major.minor.patch` with no
@@ -1166,8 +1143,7 @@ Settled by the user on 2026-11-04:
     version that is no longer chosen keeps its line until `avin tidy`); where fetching or resolving
     fails, the manifest is put back as it was. It adds only git dependencies: a path dependency is
     written by hand.
-
-- Repeated parameters beside overloads and constructors
+- Settled by the user 2026-11-04: Repeated parameters beside overloads and constructors
   ([declarations](/spec/declarations/#repeated-parameters)): an overload with a repeated parameter
   is a candidate only where no overload without one accepts the call, so `pick(x: long)` takes
   `pick(1)` beside `pick(xs: int*)`; among those with one, the arguments are compared by the
@@ -1175,7 +1151,7 @@ Settled by the user on 2026-11-04:
   `Vector[T]` (`class Path(val parts: string*)`), and a subclass passes it on with `: Path(parts*)`.
   The core library gains `max(first, rest*)` and `min(first, rest*)` on `T: Ord`, answering the
   greatest or least of one value or more, the first of equal ones.
-- Option, Result and string methods ([errors](/spec/errors/), [types](/spec/types/#string)):
+- Settled by the user 2026-11-04: Option, Result and string methods ([errors](/spec/errors/), [types](/spec/types/#string)):
   `Option` gains `exists`, `forall`, `contains` (on `T: Eq`, which every type meets), `toList`,
   `toVector` and `zip`; `Result` gains `exists`, `forall`, `toList` and `orElse(f)`, where `f`
   takes the error and answers a `Result` that may have another error type. `forall` is true of
@@ -1186,10 +1162,10 @@ Settled by the user on 2026-11-04:
   terminator at the end starts no further line, the empty string has no lines, and a lone `\r`
   stays in its line. `take`, `drop`, `takeRight`, `dropRight` and the padding widths clamp rather
   than trap.
-
-- The methods every `Iterable` has ([collections](/spec/collections/#methods-every-iterable-has)):
+- Settled by the user 2026-11-04: The methods every `Iterable` has ([collections](/spec/collections/#methods-every-iterable-has)):
   folds, `reduce` (trapping when empty) and `reduceOption`, searches, `count`, `minBy`/`maxBy` and
-  `min`/`max` (answering `Option`), `mkString`, `partition`, `groupBy`, `groupMap`,
+  `min`/`max` (trapping when empty) with `minByOption`/`maxByOption` and `minOption`/`maxOption`
+  (answering `Option`), the reference library's names, `mkString`, `partition`, `groupBy`, `groupMap`,
   `groupMapReduce`, the conversions and `zipWithIndex` are written once on `Iterable` and replace
   the copies `Seq` and `Set` had. A collection they make is a `Vector`, whatever the receiver:
   `partition` answers `(Vector[T], Vector[T])`, `groupBy` a `Map[K, Vector[T]]`, `zipWithIndex` a
@@ -1201,11 +1177,10 @@ Settled by the user on 2026-11-04:
   method table holds a method at a position only for the types a call through that position can
   reach, by the receiver's static type, so a trait method that makes an instance at a larger type
   argument (`zipWithIndex` on an `Iterator[(T, int)]`) is not compiled for every type it makes.
-
-- Set and map methods ([collections](/spec/collections/#maps-and-sets)): an immutable `Set` has
+- Settled by the user 2026-11-04: Set and map methods ([collections](/spec/collections/#maps-and-sets)): an immutable `Set` has
   `++` and `--` taking any `Iterable[A]` beside `union`, `intersect`, `diff` and `subsetOf`, which
   keep their names and their `Set` parameter; `+` and `-` stay reserved for `Add` and `Sub`, so one
-  element is `added`/`removed`. An immutable `Map`'s `++` takes any `Iterable[(K, V)]` and `--` any
+  element goes in with `incl` and out with `excl`, the reference library's names. An immutable `Map`'s `++` takes any `Iterable[(K, V)]` and `--` any
   `Iterable[K]`. `Map.keys()` and `values()` answer a `Vector` in iteration order, so the two
   line up by index, rather than one-shot iterators; `keysIterator()` and `valuesIterator()` are the
   lazy forms, and `keySet()` answers a `Set`. A mutable map's `keys()` and `values()` are likewise
@@ -1213,20 +1188,18 @@ Settled by the user on 2026-11-04:
   taking the key and the value (`mapValues` takes the value alone) on both maps, and a mutable map
   has no in-place `transform`. Everything that builds a collection from a mutable set or map
   (`map`, `flatMap`, `union`, `intersect`, `diff`, `mapValues`, `transform`, `filterKeys`) answers a
-  new mutable one; `retain(p)` and `updateWith(k, f)` change in place, `updateWith` answering the
+  new mutable one; `filterInPlace(p)` and `updateWith(k, f)` change in place, `updateWith` answering the
   new binding as an `Option`. `+=`, `-=`, `++=` and `--=` are methods on the mutable collections
   (a map's `+=` takes a `(key, value)` pair), so they work on a `val`; removing an absent element
   or key is not an error.
-
-- Sorting ([collections](/spec/collections/#sorting)): every `Seq` has `sorted()` (elements `Ord`),
-  `sortedBy[K: Ord](key)` and `sortedWith(compare: (T, T) -> int)`, answering a `Vector`; `List`
-  has its own three answering a `List`. `Array`, `Buffer` and `Deque` sort in place with `sort()`,
-  `sortBy(key)` and `sortWith(compare)`. Every sort is a stable merge sort, O(n log n) comparisons
-  in the worst case with one scratch copy of the elements; `sortBy` computes `key` once per
-  element. `avin.fs.listDir` answers its names sorted by code point rather than in the file
+- Settled by the user 2026-11-04: Sorting ([collections](/spec/collections/#sorting)): every `Seq` has `sorted()` (elements `Ord`),
+  `sortBy[K: Ord](key)` and `sortWith(compare: (T, T) -> int)`, answering a `Vector`; `List`
+  has its own three answering a `List`. `Array`, `Buffer` and `Deque` sort in place with
+  `sortInPlace()`, `sortInPlaceBy(key)` and `sortInPlaceWith(compare)`, the reference library's
+  names. Every sort is a stable merge sort, O(n log n) comparisons in the worst case with one
+  scratch copy of the elements; `sortBy` and `sortInPlaceBy` compute `key` once per element. `avin.fs.listDir` answers its names sorted by code point rather than in the file
   system's order.
-
-- The methods every `Seq` has ([collections](/spec/collections/#methods-every-seq-has)): `map`,
+- Settled by the user 2026-11-04: The methods every `Seq` has ([collections](/spec/collections/#methods-every-seq-has)): `map`,
   `flatMap`, `collect`, `filter`, `filterNot`, `withFilter`, `take`, `drop`, `takeWhile`,
   `dropWhile`, `takeRight`, `dropRight`, `slice`, `splitAt`, `span`, `tail`, `init`, `reverse`,
   `++`, `:+`, `+:`, `updated`, `padTo`, `indices`, `zip`, `zipAll`, `scanLeft`, `distinct`,
@@ -1245,8 +1218,7 @@ Settled by the user on 2026-11-04:
   function's call does, and compares candidates by the same conformance, so a type's own
   `++(other: List[T])` and `Seq`'s `++(other: Iterable[T])` are overloads of which the first is
   more specific.
-
-- **Two sequences are equal when they have the same elements in order, whichever kinds they are**:
+- Settled by the user 2026-11-04: **Two sequences are equal when they have the same elements in order, whichever kinds they are**:
   a `Vector`, `List`, `ArraySeq`, `Array`, `Buffer`, `Deque` and `Range` of equal elements compare
   equal with `==` and hash alike, with one comparison and one hash written once on `Seq` for them
   all. `==` between two sequence types needs the same element type on both sides (a `Vector[int]`
@@ -1258,7 +1230,7 @@ Settled by the user on 2026-11-04:
   as `Any` values are, so `[1] == ["a"]` held as `Any` is `false`. An `Array` is a `Seq` here and
   compares by contents, as it already did. The mutable `Array`, `Buffer` and `Deque` compare
   as they are when the comparison runs, so a hash held across a change is stale, as it was before.
-- **Ranges of other integer types are `NumericRange[T: Integer]`** (settled, user, 2026-11-04).
+- Settled by the user 2026-11-04: **Ranges of other integer types are `NumericRange[T: Integer]`**.
   `Range` stays the `int` range, and a bare `Range` in a signature means it. `a..b` and `a..<b`
   written as values make a `NumericRange[T]` where the bounds are integers of any type other than
   `int` (`long`, `i8`, `i16`, …); an integer literal bound takes its type from the other bound, and
@@ -1270,7 +1242,7 @@ Settled by the user on 2026-11-04:
   questions that count the values trap for a range whose ends are more than the largest `long`
   apart (the smallest `long` to the largest), which only a range of `long`s can be. `for` over a range
   written in place already counted any integer type, and still does.
-- Value definitions in a `for` with `yield` ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
+- Settled by the user 2026-11-04: Value definitions in a `for` with `yield` ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
   `pattern = value` after a generator, each with its own `if` guards, written with no `val`, and
   never first. It is evaluated once per element that reaches it and binds in what follows. Where no
   guard follows, it is a `val` in the function passed to its generator's source; where a guard
@@ -1278,18 +1250,17 @@ Settled by the user on 2026-11-04:
   value through the source's `map`, so it is evaluated for every element before that guard tests
   any, and over a set or map the pair has to be hashable. A definition may not rebind a name its
   generator or an earlier definition after it binds; a later generator may.
-- Comprehensions over the mutable collections ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
+- Settled by the user 2026-11-04: Comprehensions over the mutable collections ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
   a mutable `Set` and `Map` have `withFilter`, a lazy view as the immutable ones have, and a
   mutable `Map` a `map` over its entries as pairs, so the first source's kind decides the result as
   elsewhere: a new mutable set or map, as an `Array`, a `Buffer` or a `Deque` gives a new one of its
   own kind, the source unchanged.
-
-- `avin.process` ([system library](/spec/system-library/)): `args() -> Vector[string]` holds the
+- Settled by the user 2026-11-04: `avin.process` ([system library](/spec/system-library/)): `args() -> Vector[string]` holds the
   arguments after the program's name, and `programName()` gives the name separately; `env(name)` is
   an `Option[string]`; `exit(code: int) -> Nothing` flushes standard output first, as a trap does.
   Arguments are checked as UTF-8 at startup. A test run by `avin test` sees no arguments. `main`
   may take the same vector: `main(args: Vector[string])` (settled above).
-- `avin.fs` and `avin.io` ([system library](/spec/system-library/)): `IoError`, shared by every
+- Settled by the user 2026-11-04: `avin.fs` and `avin.io` ([system library](/spec/system-library/)): `IoError`, shared by every
   module that does input or output, lives in `avin.io` as a plain `data` type with the variants
   `NotFound`, `PermissionDenied`, `AlreadyExists`, `IsADirectory`, `NotADirectory`,
   `DirectoryNotEmpty`, `InvalidUtf8(offset: long)` and `Other(text: string)`, and a `message()`
@@ -1301,7 +1272,7 @@ Settled by the user on 2026-11-04:
   `listDir(dir) -> Result[Vector[string], IoError]` answers the entries' names, without the
   directory and without `.` and `..`, sorted by code point, so two listings of an unchanged
   directory agree.
-- Standard input and error, in `avin.io` beside `IoError` ([system library](/spec/system-library/)):
+- Settled by the user 2026-11-04: Standard input and error, in `avin.io` beside `IoError` ([system library](/spec/system-library/)):
   standard input as text through `readLine() -> Option[string]`, `lines() -> Iterator[string]` and
   `readAll() -> string`, sharing one runtime-held buffer. A line ends at `\n` with a `\r` before it
   trimmed; the last line needs no terminator. Ill-formed UTF-8 becomes U+FFFD and a failed read ends
@@ -1309,7 +1280,7 @@ Settled by the user on 2026-11-04:
   `InvalidUtf8`. `eprintln(x)` mirrors `println` on standard error and is in the prelude with
   `StandardError`, an unbuffered `Writer`; every write to standard error flushes standard output
   first. A test run by `avin test` reads empty input.
-- Running and testing (stage 10): `avin run <program> [-O0 | -O2] [-- args]` builds into
+- Settled by the user 2026-11-04: Running and testing (stage 10): `avin run <program> [-O0 | -O2] [-- args]` builds into
   `.avin/build/` in the program's directory, reuses the executable while nothing it was built from
   has changed, and exits with the program's status, or 128 and the signal's number for a trap. Its
   arguments reach the process; reading them is `avin.process`'s, in the system library. A test is a
@@ -1325,7 +1296,7 @@ Settled by the user on 2026-11-04:
   test's output under a failure, and `N passed, M failed`; it exits 1 when any failed. The core
   library's `assert(condition)`, `assert(condition, message)` and `assertEq(actual, expected)` (with
   `Eq` and `Debug` bounds, showing both values' `Debug` forms) trap at the assertion's place.
-- Test attributes, hooks and `@tests` files ([declarations](/spec/declarations/#tests)), following
+- Settled by the user 2026-11-04: Test attributes, hooks and `@tests` files ([declarations](/spec/declarations/#tests)), following
   Sysl's model:
   - **A test yields unit or a `Result[unit, E]`** with `E: Display`; an `Err` fails it, reading
     `test answered Err: <error>` at the test's name.
@@ -1345,8 +1316,7 @@ Settled by the user on 2026-11-04:
     module-level values are not computed in a program that runs. Only a `@test` function, a hook
     (a lambda in either counting as it) or another `@tests` file may name what one declares; an impl
     in one is for a type or of a trait it declares; `main` is not declared in one.
-
-- Format specifiers ([strings and formatting](/spec/strings-and-formatting/#format-specifiers)):
+- Settled by the user 2026-11-04: Format specifiers ([strings and formatting](/spec/strings-and-formatting/#format-specifiers)):
   - **Integers are signed in every base**: `%x`, `%X`, `%o` and `%b` write a negative value as `-`
     and its magnitude's digits (`${-42}%x` is `-2a`), so the text does not depend on the value's
     width, and `+` and the space flag apply to them as to `%d`. There is no `%u`; it is refused
@@ -1364,16 +1334,16 @@ Settled by the user on 2026-11-04:
   - **`StringContext.f`, called directly**, reads its specifiers as it runs: a malformed one, `%?`
     (its arguments are `Display` values) and a count that is not an `int` or a `long` trap; a value
     under a conversion its type does not take renders in its own form.
-- The core library's own tests ([tests](/spec/declarations/#tests)): they live in `library/tests`,
+- Settled by the user 2026-11-04: The core library's own tests ([tests](/spec/declarations/#tests)): they live in `library/tests`,
   as a package's live in its `tests` directory, and are an ordinary program of `@test` functions in
   its root module, which `avin test library/tests` runs and the compiler's gate runs at `-O0` and
   `-O2`. They test the library through its public names, as a program sees it. The directory is no
   part of the core library every program is compiled with, and a `@test` in the core library's own
   modules, like one in a dependency, is never a program's test.
-- A collection added to itself ([collections](/spec/collections/#buffer)): `b.addAll(b)` and
+- Settled by the user 2026-11-04: A collection added to itself ([collections](/spec/collections/#buffer)): `b.addAll(b)` and
   `b ++= b` on a `Buffer` or a `Deque` append the elements it held when the call began, once, and
   `s --= s` on a mutable `Set` empties it.
-- [`avin.time`](/spec/system-library/#avin-time): `Duration`, `Instant` (monotonic) and `WallTime`
+- Settled by the user 2026-11-04: [`avin.time`](/spec/system-library/#avin-time): `Duration`, `Instant` (monotonic) and `WallTime`
   (wall clock, a `Duration` since the 1970 epoch) are data types counting whole microseconds in a
   `long`, overflow trapping; the two clocks are distinct types so their readings never mix. A
   duration implements `Add`, `Sub`, `Neg`, and scales by a `long` with its methods `*` and `/`; a
@@ -1381,7 +1351,7 @@ Settled by the user on 2026-11-04:
   through `-` (or `since`), which yields their `Duration`. The
   text forms are a duration's largest-unit form (`1.5ms`) and an ISO 8601 UTC timestamp. Sleeping
   and calendar fields beyond the timestamp text are not part of it yet.
-- Bindings to Sysl packages ([packages](/spec/packages/#sysl-dependencies),
+- Settled by the user 2026-11-04: Bindings to Sysl packages ([packages](/spec/packages/#sysl-dependencies),
   [bindings](/spec/sysl-bindings/#sysl-packages)): a manifest names the Sysl packages its bindings
   reach in a block of its own, `sysl-dependencies`, beside `dependencies`, each entry written as an
   Avin dependency is (`git` with `version` or `rev`, or `path`; never `workspace`). The block is
@@ -1393,7 +1363,7 @@ Settled by the user on 2026-11-04:
   A fetched package may not name a Sysl directory. The shim archive and the cached executable are
   keyed by these entries and by the sources of each Sysl package named by directory. Sysl's other
   dependency keys (`mount`, `features`, `options`) are not offered yet.
-- The rest of the system library ([system library](/spec/system-library/)), each module following
+- Settled by the user 2026-11-04: The rest of the system library ([system library](/spec/system-library/)), each module following
   the reference standard library's names and shapes where Avin's rules allow:
   - **[The environment and the platform](/spec/system-library/#the-environment-and-the-platform)**
     are functions of `avin.process`, beside `env`, not a module of their own: `environment()` as a
@@ -1442,7 +1412,25 @@ Settled by the user on 2026-11-04:
     `threads.blocking(body)` and `threads.sleep(d)`. There is no `failed` or `filter`, since a future
     carries no failure. Bindings: none beyond a runtime timed wait for `sleep`. Not blocked.
   - **JSON** is a package of its own, not part of the system library.
-- [`avin.regex`](/spec/regex/): the pattern language and its matching follow the established
+
+- Settled by the user 2026-11-04: Lower bounds and the expected type ([generics](/spec/generics/#lower-bounds)): the expected type
+  decides a lower-bounded type argument only where it admits the bound; otherwise the argument is
+  inferred from the bound and the arguments, and the result is passed as any value is. So
+  `println(m.getOrElse(k, "none"), n)` on a `Map[string, string]`, where each argument expects a
+  `Display`, takes `W` as `string` rather than reporting `Display` as no supertype of `string`. A
+  delayed (by-name) argument widens an open lower-bounded type argument as any other argument does:
+  `cats.getOrElse(k, dog)` is an `Animal`. Both keep programs working that called the methods before
+  they took `[W >: V]`.
+- Settled by the user 2026-11-04: Trait fields ([declarations](/spec/declarations/#trait)): a trait's field declares its type, since
+  each conforming class's layout and the trait's `val` are known before any body is checked; it is
+  public, as every member of a trait is, and is never `lazy`. A class never overrides a trait's
+  field, `val` or `var`: declaring a field of its name is an error rather than an override. A trait
+  never redeclares, with a value, a `val` of a trait it requires.
+- Settled by the user 2026-11-04: The wrapping conversion is spelled `i8.wrap(x)`, as the wrapping operators are spelled `+%`: the
+  integer type's name, `.wrap`, one operand, any integer target (a bounded type parameter included,
+  `T.wrap(n)`). The core library needs it to test whether a value fits a narrower width (the formatter
+  converts a generic integer to `long` and back).
+- Settled by the user 2026-11-04: [`avin.regex`](/spec/regex/): the pattern language and its matching follow the established
   backtracking dialect exactly: leftmost-first alternation, greedy, reluctant and possessive
   repetition, atomic groups, bounded lookbehind (a repetition without an upper bound in one is an
   error), and the same rules for what a repeated group captures; `\d`, `\s`, `\w`, `\b` and the
@@ -1461,7 +1449,27 @@ Settled by the user on 2026-11-04:
   empty pieces at the end dropped, `Pattern.split(s, limit = 0)`, `Regex.quote` and
   `Regex.quoteReplacement`; `$n` takes digits while they name a group, `${name}` is the pattern's
   own name only, and a reference that cannot be resolved traps with the dialect's message.
-- Sysl handles ([Sysl bindings](/spec/sysl-bindings/#handles)): a `class` declared with `@sysl`
+- Settled by the user 2026-11-04: Extractor patterns ([control flow](/spec/operators-and-control-flow/#extractor-patterns)):
+  `Name(p…)` names a variant wherever one of that name is in scope, and only otherwise a value (an
+  object, a companion, a local) whose type has `unapply` or `unapplySeq`; where it has both,
+  `unapply` is used. `unapply` answers a `bool`, matched with no patterns (`Even()`), or an
+  `Option`, one pattern matching its value whole and several a tuple's parts. `unapplySeq` answers
+  an `Option` of a sequence, matched as a sequence pattern; the prefix-and-sequence form is not
+  taken. The matched value is passed to the method as it is, with no type test first, so the
+  method's parameter accepts the matched value's type. An extractor pattern never counts toward
+  exhaustiveness, and since a binding's or a `for`'s pattern must cover every value, extractors
+  appear in `match`, `is`, clauses and match functions only.
+- Settled by the user 2026-11-04: Rest patterns ([collections](/spec/collections/#sequence-patterns)): `rest*` or `_*`, last in a
+  sequence pattern or an `unapplySeq` extractor's patterns, binds what the patterns before it leave:
+  on a list the tail, so `[]` and `[head, tail*]` cover every list; on another sequence what
+  `drop(n)` answers, a `Vector`. `[rest*]` alone is the whole sequence, of its own type.
+- Settled by the user 2026-11-04: A regex as an extractor ([regular expressions](/spec/regex/#regex)): `Regex.unapplySeq(s)`
+  answers the groups' texts as a `List[string]` where `s` matches as `matches` asks, the whole of it
+  or, unanchored, any part. A group that took no part gives the empty string, since a `string` has
+  no null. `Groups`, a top-level object of `avin.regex`, takes apart any `Match`'s groups, `None`
+  for a pattern with none. There is no `unapplySeq` taking a `Match` on `Regex` itself, which
+  would need a match to know the regex that found it.
+- Settled by the user 2026-11-04: Sysl handles ([Sysl bindings](/spec/sysl-bindings/#handles)): a `class` declared with `@sysl`
   naming a Sysl type has no parameters, fields or constructor and is made only by a binding that
   returns it, directly or as the value of an `Option` or `Result`; a collection of handles does not
   cross. A method without a body is bound to the Sysl method of its name's words in snake_case, or
@@ -1470,6 +1478,16 @@ Settled by the user on 2026-11-04:
   call with "`Name` is closed"; a handle never closed is given back by a finalizer when the
   collector frees it. A handle crosses back into Sysl only as the receiver of its own methods,
   compares by identity, and has no `Display`.
+
+**Deferred**
+
+- Public C interoperability. Until then, C is reached through Sysl.
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 

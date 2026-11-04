@@ -70,8 +70,8 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
   them, so `[1, 2, 3].mkString()` is `1, 2, 3` and `.mkString("<", "|", ">")` is `<1|2|3>`. Every
   collection and iterator has it, through an impl adding it to `Iterable`, and a map keeps its own,
   whose entries join as `key: value`, the form a displayed map shows. `max()` and `min()` on every
-  collection of `Ord` elements answer `Some` of the greatest or least, the first of equal ones, and
-  `None` when empty. The free functions `max(first, rest*)` and `min(first, rest*)` take one value or more, with a
+  collection of `Ord` elements answer the greatest or least, the first of equal ones, and trap when
+  it is empty; `maxOption()` and `minOption()` answer `Some` of it, or `None`. The free functions `max(first, rest*)` and `min(first, rest*)` take one value or more, with a
   [repeated](/spec/declarations/#repeated-parameters) parameter, and answer the greatest or least
   itself: `max(3, 9, 4)` is `9`, `min(x, ys*)` the least of `x` and the elements of `ys`.
   `sum()` and `product()` are added to `Iterable` the same way, so every collection has them, ranges
@@ -107,8 +107,10 @@ Collections they make are vectors, maps and sets; n is the number of elements.
 | `exists(p)`, `forall(p)` | `bool`; stops at the first that decides | O(n) |
 | `find(p)` | `Option[T]`, the first that satisfies `p` | O(n) |
 | `count(p)` | `int` | O(n) |
-| `minBy(key)`, `maxBy(key)` (`K: Ord`) | `Option[T]`, the first of equal keys | O(n), `key` once per element |
-| `min()`, `max()` (`T: Ord`) | `Option[T]`, the first of equal ones | O(n) |
+| `minBy(key)`, `maxBy(key)` (`K: Ord`) | `T`, the first of equal keys; traps when empty | O(n), `key` once per element |
+| `minByOption(key)`, `maxByOption(key)` (`K: Ord`) | `Option[T]`, the first of equal keys | O(n), `key` once per element |
+| `min()`, `max()` (`T: Ord`) | `T`, the first of equal ones; traps when empty | O(n) |
+| `minOption()`, `maxOption()` (`T: Ord`) | `Option[T]`, the first of equal ones | O(n) |
 | `sum()` (`T: Add`), `product()` (`T: Mul`) | `T`; the identity when empty | O(n) |
 | `mkString(sep)`, `mkString(start, sep, end)` (`T: Display`) | `string` | O(n) |
 | `partition(p)` | `(Vector[T], Vector[T])`: those that satisfy `p`, those that do not | O(n) |
@@ -168,8 +170,8 @@ wherever the type is known:
   replaced element in `updated` are its own tails.
 - **An array, a buffer and a deque keep their own kind for the element-wise methods**, `map`,
   `flatMap`, `collect`, `filter` and `filterNot`, each a new collection, and answer the structural
-  ones with a `Vector`, leaving themselves unchanged. Their in-place operations (`update`, `sort`,
-  `add`, `insert`, `remove`) are their own.
+  ones with a `Vector`, leaving themselves unchanged. Their in-place operations (`update`,
+  `sortInPlace`, `add`, `insert`, `remove`) are their own.
 - **A range answers with a `Vector`**, since it holds only a progression.
 - `zip`, `zipAll`, `scanLeft`, `grouped`, `sliding` and `indices` have one form for every sequence.
 
@@ -266,8 +268,8 @@ any type is a key: strings and tuples by value, `data` values field by field, cl
 identity unless their class implements `Eq` and `Hash`. Each key's hash is spread over all 64 bits
 before it is used, so sequential integers and strings sharing long prefixes do not cluster.
 
-The immutable maps and sets are persistent: `m.updated(k, v)`, `m.removed(k)`, `s.added(x)` and
-`s.removed(x)` return a new collection of the same kind, sharing all but the changed path with the
+The immutable maps and sets are persistent: `m.updated(k, v)`, `m.removed(k)`, `s.incl(x)` and
+`s.excl(x)` return a new collection of the same kind, sharing all but the changed path with the
 old one, which is left as it was, even when called through the trait: a `TreeMap` held as a `Map`
 answers a `TreeMap`. The same holds for `++`, `--`, `updatedWith`, `filter`, `filterKeys`,
 `transform`, `mapValues` and a set's `union`, `intersect` and `diff`. The methods that make keys or
@@ -297,7 +299,7 @@ for (word, n) in counts do println(s"$word $n")
 well infix: `odds union evens`. Their symbol forms take any collection: `s ++ xs` is `s` with every
 element of `xs` in it and `s -- xs` is `s` without them, an element of `xs` that `s` lacks being
 ignored. The `+` and `-` spellings belong to `Add` and `Sub`, so a single element goes in with
-`s.added(x)` and out with `s.removed(x)`.
+`s.incl(x)` and out with `s.excl(x)`.
 
 An immutable map has the same two forms: `m ++ pairs` takes any collection of `(key, value)` pairs,
 the last pair for a key winning, and `m -- keys` takes any collection of keys. `m.keys()` and
@@ -321,7 +323,7 @@ seen("a") = 1
 
 A mutable set or map changes through its compound-assignment methods, which need no `var`: `s += x`,
 `s -= x`, `s ++= xs`, `s --= xs`, and for a map `m += (k, v)`, `m -= k`, `m ++= pairs`, `m --= keys`;
-removing what is absent is not an error, and `s --= s` empties the set. `retain(p)` removes what fails `p`, and a map's
+removing what is absent is not an error, and `s --= s` empties the set. `filterInPlace(p)` removes what fails `p`, and a map's
 `updateWith(k, f)` does what `updatedWith` does, in place, answering the new binding. The methods
 that build a collection — `map`, `flatMap`, `filter`, `mapValues`, `transform`, `filterKeys` and a
 set's `union`, `intersect` and `diff` — answer a new mutable one; a mutable map's `keys()` and
@@ -349,9 +351,9 @@ Iteration, `keys()`, `values()`, `foreach`, `mkString` and the display all visit
 ascending order.
 
 A sorted map is a `Map`, and a sorted set a `Set`, so code over `Map` or `Set` takes either kind. An
-update through `SortedMap` or `SortedSet` answers one, so `sorted.updated(k, v).first()` type-checks:
-the sorted traits re-declare `updated`, `removed`, `++`, `--`, `updatedWith`, `filter`, `filterKeys`,
-`transform`, `mapValues`, a set's `added`, `removed`, `union`, `intersect` and `diff` with the sorted
+update through `SortedMap` or `SortedSet` answers one, so `sorted.updated(k, v).headOption()`
+type-checks: the sorted traits re-declare `updated`, `removed`, `++`, `--`, `updatedWith`, `filter`,
+`filterKeys`, `transform`, `mapValues`, a set's `incl`, `excl`, `union`, `intersect` and `diff` with the sorted
 result, and a sorted map's `keySet()` is a `SortedSet` (a tree map's a `TreeSet`). A tree
 collection's own `map`, `collect` and `flatMap` need the new key to be `Ord` and answer a tree
 collection; where two entries make the same key, the later one in key order wins.
@@ -361,22 +363,29 @@ The ordered operations, members of `SortedMap` and `SortedSet`, answering a map'
 
 | Operation | Answers |
 |---|---|
-| `first()`, `last()` | the least and the greatest entry, as an `Option` |
-| `floor(k)`, `ceiling(k)` | the entry with the greatest key at most `k`, and the least at least `k`, as an `Option` |
-| `from(low)` | the entries whose keys are at least `low` |
-| `until(high)` | the entries whose keys are less than `high` |
+| `headOption()`, `lastOption()` | the least and the greatest entry, as an `Option` |
+| `head()`, `last()` | the least and the greatest entry; trap when empty |
+| `firstKey()`, `lastKey()` | the least and the greatest key (of a set, element); trap when empty |
+| `minAfter(k)` | the entry with the least key at least `k`, as an `Option` |
+| `maxBefore(k)` | the entry with the greatest key less than `k`, as an `Option` |
+| `rangeFrom(low)` | the entries whose keys are at least `low` |
+| `rangeTo(high)` | the entries whose keys are at most `high` |
+| `rangeUntil(high)` | the entries whose keys are less than `high` |
 | `range(low, high)` | the entries from `low` until `high`; none when `high` is not greater |
+| `iteratorFrom(k)` | the entries whose keys are at least `k`, in ascending order; a map also has `keysIteratorFrom(k)` and `valuesIteratorFrom(k)` |
 | `reverseIterator()` | the entries in descending order |
 
-The three slices are collections of the same kind, sharing their structure with the original.
+The four slices are collections of the same kind, sharing their structure with the original.
 
 ```text
 val scores = TreeMap(("cy", 7), ("al", 9), ("bo", 4))
 println(scores)                     // {al: 9, bo: 4, cy: 7}
 println(scores.range("b", "c"))     // {bo: 4}
-println(scores.floor("bz"))         // Some((bo, 4))
+println(scores.maxBefore("bz"))     // Some((bo, 4))
+println(scores.minAfter("bo"))      // Some((bo, 4))
 val small: TreeSet[int] = {5, 1, 3}
-println(small.until(4))             // {1, 3}
+println(small.rangeUntil(4))        // {1, 3}
+println(small.rangeTo(3))           // {1, 3}
 ```
 
 `TreeMap.empty`, `TreeMap.builder` and `TreeMap((k, v), …)`, and the same for `TreeSet`, make them as
@@ -407,7 +416,7 @@ conversion, and a lambda of the same type may stand beside it:
 ```text
 val words = ["zero", "one", "two"]
 (0 ..< 2).map(words)                 // [zero, one]
-val allowed = Set[string]().added("one")
+val allowed = Set[string]().incl("one")
 words.filter(allowed)                // [one]
 val table = Map[string, int]().updated("one", 1)
 ["one", "one"].map(table)            // [1, 1]
@@ -491,8 +500,23 @@ describe(xs: Vector[string]) -> string = xs match
     _ -> s"${xs(0)} and ${xs.length() - 1} others"
 ```
 
-For exhaustiveness, `[]` together with `head :: tail` covers every `List`; fixed-length patterns
-cover only their lengths, so a match that uses only them needs a catch-all.
+The last part may be `rest*`, or `_*` where the rest is not used: the pattern then matches a
+sequence of at least the elements before it, and `rest` is bound to the elements after them. On a
+`List` that is the tail, so `[first, rest*]` is `first :: rest`; on any other sequence it is what
+`drop(n)` answers, a `Vector`. `[rest*]` alone matches every sequence and binds the whole of it.
+
+```text
+total(xs: List[int]) -> int = xs match
+    [] -> 0
+    [head, tail*] -> head + total(tail)
+
+firstTwo(xs: Vector[string]) -> string = xs match
+    [a, b, _*] -> s"$a and $b"
+    _ -> "fewer than two"
+```
+
+For exhaustiveness, `[]` together with `head :: tail`, or `[head, tail*]`, covers every `List`;
+fixed-length patterns cover only their lengths, so a match that uses only them needs a catch-all.
 
 ## Literals
 
@@ -637,7 +661,7 @@ total(Array.fill(4, 1))            // an Array
 Impls add more to every sequence ([impl](/spec/declarations/#impl)), written once on `Seq` and
 reached through generic code over `Seq[T]` as on each sequence type: `contains(element)` and
 `indexOf(element)`, which compare with `equals` and are `exists` and `indexWhere`, so a list walks
-itself once; where the elements are ordered, the sorts, `sorted()`, `sortedBy` and `sortedWith`
+itself once; where the elements are ordered, the sorts, `sorted()`, `sortBy` and `sortWith`
 ([sorting](#sorting)); and the transformations and structural methods in
 [methods every Seq has](#methods-every-seq-has).
 
@@ -673,14 +697,16 @@ Every sequence sorts into a new one, and the mutable sequences also sort in plac
 what `Ord.compare` answers: negative, zero or positive as its first argument orders before, with or
 after its second.
 
-- On every `Seq`: `sorted()` where the elements are `Ord`, ascending; `sortedBy(key)`, ascending by
-  a key that is `Ord`; and `sortedWith(compare)`, by any comparison. They answer a `Vector` and leave
+- On every `Seq`: `sorted()` where the elements are `Ord`, ascending; `sortBy(key)`, ascending by
+  a key that is `Ord`; and `sortWith(compare)`, by any comparison. They answer a `Vector` and leave
   the sequence as it was. A `List` has its own three, which answer a `List`, as its `map` and
   `filter` do: a list sorted is usually used as a list, walked from its front or matched with `::`,
   and the conversion would otherwise be the caller's every time. A vector needs no sorts of its own,
   since `Seq`'s already answer a vector.
-- On `Array`, `Buffer` and `Deque`: `sort()`, `sortBy(key)` and `sortWith(compare)` reorder the
-  elements in place and answer unit. A deque sorts front first, wherever its ring starts.
+- On `Array`, `Buffer` and `Deque`: `sortInPlace()`, `sortInPlaceBy(key)` and
+  `sortInPlaceWith(compare)` reorder the elements in place and answer unit. A deque sorts front
+  first, wherever its ring starts. Being sequences, they also have `sorted()`, `sortBy` and
+  `sortWith`, answering a sorted `Vector` and leaving the collection as it was.
 
 **Every sort is stable**: elements that compare equal keep the order they had, so sorting by one
 field and then by another orders by the second with the first breaking ties. **Every sort takes
@@ -688,24 +714,24 @@ time proportional to n log n comparisons in the worst case** and memory for one 
 elements: it is a merge sort, which sorts runs of 16 elements by insertion and then merges them
 pairwise between the elements and one scratch array, the runs doubling each pass.
 
-**`sortBy` computes `key` once for each element**, before any comparison, and sorts the elements as
-their keys sort; so a key that is costly to compute, such as a string built from the element, costs
-n computations rather than one per comparison, at the price of an array of the keys. `sortWith`
-calls `compare` as the sort needs it, and `sorted()` is `sortWith` by `compare`.
+**`sortBy` and `sortInPlaceBy` compute `key` once for each element**, before any comparison, and
+sort the elements as their keys sort; so a key that is costly to compute, such as a string built from
+the element, costs n computations rather than one per comparison, at the price of an array of the
+keys. `sortWith` calls `compare` as the sort needs it, and `sorted()` is `sortWith` by `compare`.
 
 ```text
 data Entry(rank: int, name: string)
 
 val entries = [Entry(2, "b"), Entry(1, "a"), Entry(2, "c")]
-entries.sortedBy(e -> e.rank)                       // a, b, c: b still before c
-entries.sortedWith((x, y) -> y.rank.compare(x.rank)) // b, c, a
+entries.sortBy(e -> e.rank)                         // a, b, c: b still before c
+entries.sortWith((x, y) -> y.rank.compare(x.rank))   // b, c, a
 val scores: Array[int] = [3, 1, 2]
-scores.sort()                                        // [1, 2, 3]
+scores.sortInPlace()                                 // [1, 2, 3]
 ```
 
 Strings order by code point (their bytes, which in UTF-8 order the same), so every capital comes
 before every small letter; reals order as IEEE 754 does. Sorting elements without `Ord` by
-`sorted()` or `sort()` is a compile-time error naming the bound, and `sortWith` is the way to sort
+`sorted()` or `sortInPlace()` is a compile-time error naming the bound, and `sortWith` is the way to sort
 them.
 
 ## Ranges
