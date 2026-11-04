@@ -484,7 +484,7 @@ val n: Named = t
   implementations, which a class conforming to both overrides.
 - **A trait's override may have no body**, re-declaring the method with a narrower result:
   `trait SortedMap[K, +V]: Map[K, V]` with `override updated[W >: V](key: K, value: W) ->
-  SortedMap[K, W]`, so `sorted.updated(k, v).first()` type-checks through the sub-trait. It takes
+  SortedMap[K, W]`, so `sorted.updated(k, v).headOption()` type-checks through the sub-trait. It takes
   the overridden method's parameters, type parameters and lower bounds, and yields its result or,
   where that is a class or trait, one conforming to it; its result is checked against the trait's
   variance. It shares the overridden method's position, so a type conforming to the sub-trait has one
