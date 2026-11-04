@@ -936,7 +936,12 @@ Settled by the user on 2026-11-04:
   arguments reach the process; reading them is `avin.process`'s, in the system library. A test is a
   top-level `@test` function of the program, in any module, taking nothing and yielding unit, named
   by the function or by `@test("a sentence")`; a program built for its tests need not have `main`.
-  `avin test <program> [filter]` builds one executable and runs each test in a process of its own, so
+  `run` is the default command and the current directory the default program: `avin` is `avin run .`,
+  `avin <path> ...` is `avin run <path> ...` when the first argument is not a command name, and the
+  commands taking a program default it to `.`. A command name is always the command; a path that
+  spells one is reached as `./test`. `avin test`'s first argument is the program when it names an
+  existing path and the filter otherwise.
+  `avin test [<program>] [filter]` builds one executable and runs each test in a process of its own, so
   a trap stops only that test, reporting `ok` or `FAIL` per test grouped by file, the reason and the
   test's output under a failure, and `N passed, M failed`; it exits 1 when any failed. The core
   library's `assert(condition)`, `assert(condition, message)` and `assertEq(actual, expected)` (with
