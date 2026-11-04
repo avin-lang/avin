@@ -1052,12 +1052,18 @@ Settled by the user on 2026-11-04:
   own equality between two of its instances. Through `Any` the values' own types still decide, so
   a vector and a list held as `Any` are unequal. The mutable `Array`, `Buffer` and `Deque` compare
   as they are when the comparison runs, so a hash held across a change is stale, as it was before.
-- Ranges of other integer types as values (`Range[long]`, `Range[i16]`) are not decided. The
-  endpoint type would be an `[T: Integer]` parameter, but the count of a range of `long`s or of
-  `i8`s needs a type wider than `T`, a `Seq[T]`'s `length()` is an `int` that a `long` range can
-  exceed (trapping, as `int.min .. int.max` does), and a bare `Range` written in signatures means
-  the `int` range today. `for` over a range written in place already counts any integer type.
-  Awaiting the user's choice of how `Range` is spelled and what type its `by` step has.
+- **Ranges of other integer types are `NumericRange[T: Integer]`** (settled, user, 2026-11-04).
+  `Range` stays the `int` range, and a bare `Range` in a signature means it. `a..b` and `a..<b`
+  written as values make a `NumericRange[T]` where the bounds are integers of any type other than
+  `int` (`long`, `i8`, `i16`, …); an integer literal bound takes its type from the other bound, and
+  bounds of two types are an error. `by` takes a step of the same type, `T`. It is a `Seq[T]`
+  with the `Range` rules: a zero step traps, a range is empty when its start lies past its limit in
+  the step's direction, and iteration stops without stepping past the limit, so it never passes
+  either end of `T`. `get`, `apply`, `head`, `contains` and `isEmpty` are answered from the bounds
+  and never wrap, at any width; `length()` traps beyond `int`, and `last()` and the other
+  questions that count the values trap for a range whose ends are more than the largest `long`
+  apart (the smallest `long` to the largest), which only a range of `long`s can be. `for` over a range
+  written in place already counted any integer type, and still does.
 - Value definitions in a `for` with `yield` ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
   `pattern = value` after a generator, each with its own `if` guards, written with no `val`, and
   never first. It is evaluated once per element that reaches it and binds in what follows. Where no
@@ -1168,6 +1174,18 @@ Settled by the user on 2026-11-04:
   `minus` and `since`, because an operator trait takes and yields the implementing type alone. The
   text forms are a duration's largest-unit form (`1.5ms`) and an ISO 8601 UTC timestamp. Sleeping
   and calendar fields beyond the timestamp text are not part of it yet.
+- Bindings to Sysl packages ([packages](/spec/packages/#sysl-dependencies),
+  [bindings](/spec/sysl-bindings/#sysl-packages)): a manifest names the Sysl packages its bindings
+  reach in a block of its own, `sysl-dependencies`, beside `dependencies`, each entry written as an
+  Avin dependency is (`git` with `version` or `rev`, or `path`; never `workspace`). The block is
+  separate because Sysl, not Avin, resolves, fetches and verifies those packages: they are not
+  Avin packages, so they take no part in Avin's version selection, `avin.sum`, `avin add` or
+  `avin tidy`. The shim package's manifest lists every Sysl dependency of every package in the
+  program, so a library's bindings build in any program that uses it; one name at two releases of
+  one coordinate takes the higher, and one name with any other two origins is refused naming both.
+  A fetched package may not name a Sysl directory. The shim archive and the cached executable are
+  keyed by these entries and by the sources of each Sysl package named by directory. Sysl's other
+  dependency keys (`mount`, `features`, `options`) are not offered yet.
 - The rest of the system library ([system library](/spec/system-library/)), each module following
   the reference standard library's names and shapes where Avin's rules allow:
   - **[The environment and the platform](/spec/system-library/#the-environment-and-the-platform)**
