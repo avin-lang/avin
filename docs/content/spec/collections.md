@@ -66,6 +66,12 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
   and the identity (`T.zero()`, `T.one()`) when empty, so `[1, 2, 3].sum()` is `6`, `(1..5).product()`
   is `120`, and the `sum` of no `real`s is `0.0` and of no strings is `""`. Overflow traps as `+` does,
   and strings concatenate in `sum` but have no `product`.
+- `collect(pf)` takes a [`PartialFunction`](/spec/types/#partial-functions) and keeps `pf` of each
+  element it is defined at, in order, in the collection `map` would make: `shapes.collect(match
+  Circle(r) -> r)` is the radii of the circles. Every collection with `map` has it, and so does
+  `Option`. `collectFirst(pf)`, on every `Iterable`, is `Some` of `pf` of the first element it is
+  defined at, or `None`, and reaches no element after that one. A `Map` collects its entries as
+  pairs into a `Map`.
 
 ## Builders
 
@@ -110,7 +116,7 @@ for (word, n) in counts do print(s"$word $n")
 
 `m(k)` reads a value and traps when the key is absent; `m.get(k)` returns an `Option`, and
 `m.getOrElse(k, d)` evaluates `d` only when the key is absent. A set is a function from elements to
-`bool`: `s(x)` is `s.contains(x)`. Sets have `union`, `intersect`, `diff` and `subsetOf`, which read
+`bool`: `s(x)` is `true` when `x` is an element of `s` and `false` otherwise, `s.contains(x)`. Sets have `union`, `intersect`, `diff` and `subsetOf`, which read
 well infix: `odds union evens`.
 
 `avin.collections.mutable` holds `Map[K, V]` and `Set[A]`, invariant, updated in place:
@@ -136,10 +142,38 @@ compared; `===` tells two of them apart. Every map and set displays in the shape
 
 ## Indexing and callable sequences
 
-A `Seq[A]` is a function from index to element: `xs(i)` reads an element, and a `Seq[A]` can be
-passed where an `(int) -> A` is expected. Mutable sequences assign with `xs(i) = v`. An index out of
-bounds traps; `xs.get(i)` returns an `Option`. Square brackets never index; they are for types and
-literals.
+A `Seq[A]` is a function from index to element: `xs(i)` reads an element. Mutable sequences assign
+with `xs(i) = v`. An index out of bounds traps; `xs.get(i)` returns an `Option`. Square brackets
+never index; they are for types and literals.
+
+## Collections as functions
+
+A sequence, a set and a map are each a function, by subtyping: a [function type](/spec/types/#function-types)
+is among their parents, and their `apply` is what a call of one as a function runs.
+
+| Collection | Is a | `c(x)` is |
+|---|---|---|
+| `Seq[T]`: every list, vector, array, buffer and deque | `(int) -> T` | the element at index `x`, trapping outside the sequence |
+| `Set[A]`, immutable and mutable | `(A) -> bool` | whether `x` is an element |
+| `Map[K, V]`, immutable and mutable | `(K) -> V` | the value bound to `x`, trapping when there is none |
+
+So a collection is passed, stored and called wherever its function type is expected, with no
+conversion, and a lambda of the same type may stand beside it:
+
+```text
+val words = ["zero", "one", "two"]
+(0 ..< 2).map(words)                 // [zero, one]
+val allowed = Set[string]().added("one")
+words.filter(allowed)                // [one]
+val table = Map[string, int]().updated("one", 1)
+["one", "one"].map(table)            // [1, 1]
+val fs: Vector[(int) -> string] = [words, i -> s"#$i"]
+```
+
+Variance holds through the function type: a `Vector[Dog]` is an `(int) -> Animal`, since `Seq` is
+covariant in its element and a function in its result, and a `Map[string, Dog]` is a
+`(string) -> Animal`. A set's element type and a map's key type are its own, so a `Set[int]` is no
+`(string) -> bool`. A `Range` is iterable but no sequence, so it is no function.
 
 ## Array
 

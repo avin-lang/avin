@@ -508,9 +508,6 @@ Settled by the user on 2026-11-03:
   something of the elements, are added to `Seq` by impls (`impl[T] Seq[T]`, `impl[T: Display]
   Seq[T]`, `impl[T: Ord] Seq[T]`), written once for every sequence; `contains` and `indexOf` are
   `exists` and `indexWhere`, so on a list they walk it once.
-- A sequence passed or stored where a function from one `int` is expected becomes that function,
-  through the core library's `elementAt`; the conversion happens where the value is written, as a
-  conversion to `Any` does.
 - A sequence pattern on a sequence other than a list asks `length()` once and then reads, with
   `apply`, each element whose pattern is not `_`, in order, stopping at the first that fails.
 - `Deque[T]` is a ring over an array, doubling when full as a buffer does, its spare places zero
@@ -558,6 +555,20 @@ Settled by the user on 2026-11-03:
 
 Settled by the user on 2026-11-04:
 
+- **Sequences, sets and maps are functions, by subtyping.** `Seq[+T]` is a subtype of `(int) -> T`,
+  through its `apply(index)`; `Set[A]`, immutable and mutable, of `(A) -> bool`; `Map[K, V]`,
+  immutable and mutable, of `(K) -> V`, whose `apply` traps on a missing key as `m(k)` does. A
+  collection is passed, stored and called where its function type is expected with no conversion,
+  and variance holds through it: a `Vector[Dog]` is an `(int) -> Animal`. For a set `s`, `s(x)` is
+  legal: `true` when `x` is an element of `s` and `false` otherwise, the set's `apply(x) -> bool`,
+  which is `contains`.
+- A class or trait names a function type among its parents after `:` (`trait Seq[+T]: Iterable[T],
+  (int) -> T`), and a data type or class through an impl with no bounds of its own (`impl[K, V] (K)
+  -> V for Map[K, V]`), in the type's own module. The type then has an `apply` taking exactly that
+  type's parameters and yielding its result or a subtype; `apply` implements no trait method, so it
+  is not marked `override` for it. A type is at most one function type, counting those of its
+  superclass and its traits, and its parameters keep their variance there. A built-in type is no
+  function.
 - A function type with one parameter is written without parentheses: `int -> string`,
   `Option[T] -> bool`. `->` in a type groups to the right, so `int -> int -> int` is
   `int -> (int -> int)`; `(A) -> B` is the same type as `A -> B`, `(A, B) -> C` takes two
@@ -571,6 +582,17 @@ Settled by the user on 2026-11-04:
   is the same type; `Seq[string]` and `Array[string]` are errors), it has no default, and any other
   parameter list is an error naming the two forms. The result rules are unchanged. A program built
   for its tests does not run `main`, so tests see no arguments.
+- A `match` with nothing before it is a [function literal](/spec/operators-and-control-flow/#match-functions)
+  of one value, whose arms are ordinary `match` arms: `xs.collect(match Some(n) -> n)`, one arm on
+  the `match` line, or an indented block of them, inside parentheses or after an infix method's
+  name. Its parameter type comes from the expected type, as a lambda's does, and with none it is an
+  error. Where `A -> B` is expected its arms must cover every `A`; where `PartialFunction[A, B]` is
+  expected they need not. `PartialFunction[-A, +B]` is a core-library trait with `isDefinedAt`, a
+  call that traps at the program's call site outside its domain, `lift`, `orElse` and
+  `applyOrElse`; a literal tests its patterns and guards once per call, `lift` or `applyOrElse`.
+  Every collection with `map` has `collect`, every `Iterable` has `collectFirst`, and `Option` has
+  `collect`. A `PartialFunction[A, B]` is a subtype of `A -> B`, through its `apply`, so it passes
+  wherever one is expected and traps there outside its domain.
 - `[]T` in a type position means exactly `Vector[T]`: `xs: []int`, `[][]int`, `Option[[]string]`,
   `main(args: []string)`. Its element is a name or a parenthesized type, so `[]int -> int` is a
   function from a vector and `[](int -> int)` a vector of functions. A type pattern takes it
@@ -594,7 +616,6 @@ Settled by the user on 2026-11-04:
 - Public C interoperability. Until then, C is reached through Sysl.
 - Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
 - Async and await.
-- Partial-function literal syntax, which the user has explicitly left undecided.
 
 ## Proposed
 

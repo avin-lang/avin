@@ -174,11 +174,50 @@ declaration's `=` ends it. A type pattern in a `match` arm is the exception: the
 the type, so a function type there is written in parentheses, `f: (int -> int) -> body`.
 Compiler messages print every function type with a parameter list, `(int) -> int`.
 A by-name parameter type is written `-> T` inside a parameter list; see
-[call-by-name](/spec/by-name/). Function types are traits: a class may list a function type among its
-supertypes and implement `apply`, and its instances are then callable as `value(args)` and usable
-wherever that function type is expected.
+[call-by-name](/spec/by-name/). Function types are traits: a class or trait may list a function type
+among its parents after `:`, and a data type or class may name one in an impl, and its values are
+then subtypes of that function type, callable as `value(args)` and usable wherever it is expected,
+with no conversion. Such a type has an `apply` taking exactly the function type's parameters and
+yielding its result or a subtype, and a call of the value as a function runs that `apply`.
+
+```text
+class Shout: (string) -> string
+    apply(s: string) -> string = s + "!"
+
+data Lengths(extra: int)
+
+impl (string) -> int for Lengths
+    apply(s: string) -> int = s.charCount() + extra
+
+val f: (string) -> string = Shout()
+["a", "b"].map(Lengths(1))      // [2, 2]
+```
+
+A function type in a parent list follows the variance rules of any parent: its parameters are
+contravariant positions and its result a covariant one. A type is at most one function type,
+counting those its superclass and traits are, and a built-in type is none. The core library's
+collections are functions this way: a `Seq[T]` is an `(int) -> T`, a `Set[A]` an `(A) -> bool` and a
+`Map[K, V]` a `(K) -> V` (see [collections](/spec/collections/#collections-as-functions)).
 
 There is no arity limit.
+
+### Partial functions
+
+`PartialFunction[-A, +B]` is a core-library trait, and a subtype of `A -> B`: a function defined at
+some values of `A` and not others. `isDefinedAt(a)` says whether it is defined at `a`; calling it,
+`pf(a)`, at a value it is not defined at traps, and the trap names the program's call. `lift()` is
+the total function `A -> Option[B]`, `None` where it is not defined; `applyOrElse(a, default)` is its
+value at `a`, or `default(a)` where it is not defined; `pf.orElse(other)` is `pf` where it is
+defined and `other` elsewhere. A [`match` with nothing before
+it](/spec/operators-and-control-flow/#match-functions), written where a `PartialFunction` is
+expected, makes one:
+
+```text
+val half: PartialFunction[int, int] = match n if n % 2 == 0 -> n / 2
+half.isDefinedAt(3)           // false
+half.applyOrElse(3, n -> n)   // 3
+[2, 4].map(half)              // [1, 2]: a partial function passes where `int -> int` is expected
+```
 
 ## Vector types
 
