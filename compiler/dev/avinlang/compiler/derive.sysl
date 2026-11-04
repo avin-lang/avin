@@ -61,7 +61,11 @@ derive_unit(c: *Checker, unit: usize)
         item match
             ClassItem(d) ->
                 if d.derives.len() > 0
-                    items.set(items.len() - 1, ClassItem(derive_class(c, unit, d)))
+                    var impls: Buf[&ImplDecl] = buf()
+                    items.set(items.len() - 1, ClassItem(derive_class(c, unit, d, &impls)))
+                    for made in impls
+                        items.push(ImplItem(made))
+                        private_items.push(false)
             DataItem(d) ->
                 for made in derive_data(c, unit, d)
                     items.push(ImplItem(made))
@@ -132,8 +136,9 @@ private impl_traits(c: *Checker, unit: usize, type_name: string) -> Buf[string]
 
 // A class that derives lists the traits after its parents and gains their methods. `Eq` and `Hash`
 // come together, so that equal instances hash alike, and `Ord` comes with an equality by the same
-// fields.
-private derive_class(c: *Checker, unit: usize, d: &ClassDecl) -> &ClassDecl
+// fields. A generic class's `Ord`, `Display` and `Debug` are impls in `impls` instead, holding where
+// the type arguments implement the trait.
+private derive_class(c: *Checker, unit: usize, d: &ClassDecl, impls: *Buf[&ImplDecl]) -> &ClassDecl
     if d.modifier == "trait"
         c.note(unit, d.derives[0].span, "a trait derives nothing; the types implementing it do")
         return d
@@ -171,16 +176,22 @@ private derive_class(c: *Checker, unit: usize, d: &ClassDecl) -> &ClassDecl
     for t in traits
         val name = t.name
         val at = t.at
-        parents.push(Expr(at, Name(name)))
         val other = own_type(at, d.name, d.type_params)
         var mine: Buf[&Expr] = buf()
         var theirs: Buf[&Expr] = buf()
         for f in fields
             mine.push(Expr(at, Member(Expr(at, Name("self")), f)))
             theirs.push(Expr(at, Member(Expr(at, Name("other")), f)))
-        members.push(MethodMember(class_method(at, name, d.name, other, mine, theirs), true, true))
-        if name == "Ord" || name == "Display" || name == "Debug"
-            c.derivations.push(Derivation(unit, d.name, false, name, at))
+        val method = class_method(at, name, d.name, other, mine, theirs)
+        val conditional = name == "Ord" || name == "Display" || name == "Debug"
+        if conditional && d.type_params.len() > 0
+            var members_of_impl: Buf[ClassMember] = buf()
+            members_of_impl.push(MethodMember(method, true, false))
+            impls.push(ImplDecl(at, bounded_params(at, d.type_params, name), Some(named_type(at, name)), other, members_of_impl))
+        else
+            parents.push(Expr(at, Name(name)))
+            members.push(MethodMember(method, true, true))
+        if conditional then c.derivations.push(Derivation(unit, d.name, false, name, at))
     ClassDecl(d.annotations, d.span, d.name_span, d.name, d.modifier, d.modifier_span, d.type_params, d.params, parents, d.derives, members, d.object)
 
 // The method implementing `trait_name` for class `name` over its fields, read from `self` in `mine`
@@ -200,16 +211,21 @@ private derive_data(c: *Checker, unit: usize, d: &DataDecl) -> Buf[&ImplDecl]
         val name = t.name
         val at = t.at
         if name == "Eq" || name == "Hash" then continue
-        var type_params: Buf[TypeParam] = buf()
-        for tp in d.type_params
-            var bounds: Buf[&TypeExpr] = buf()
-            if name == "Ord" then bounds.push(named_type(at, "Ord"))
-            type_params.push(TypeParam(at, tp.name, Invariant, bounds))
         val target = own_type(at, d.name, d.type_params)
         var members: Buf[ClassMember] = buf()
         members.push(MethodMember(data_method(at, name, d, target), true, false))
-        out.push(ImplDecl(at, type_params, Some(named_type(at, name)), target, members))
+        out.push(ImplDecl(at, bounded_params(at, d.type_params, name), Some(named_type(at, name)), target, members))
         c.derivations.push(Derivation(unit, d.name, true, name, at))
+    out
+
+// The type parameters of an impl of `trait_name` derived for a type with parameters `params`: each
+// bounded by the trait, so the conformance holds where every type argument implements it.
+private bounded_params(at: Span, params: Buf[TypeParam], trait_name: string) -> Buf[TypeParam]
+    var out: Buf[TypeParam] = buf()
+    for tp in params
+        var bounds: Buf[&TypeExpr] = buf()
+        bounds.push(named_type(at, trait_name))
+        out.push(TypeParam(at, tp.name, Invariant, bounds))
     out
 
 // The method implementing `trait_name` for data type `d`, whose type is `target`.
