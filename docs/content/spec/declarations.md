@@ -627,6 +627,15 @@ separate `impl` for it are the same conformance; it may be stated once.
 `impl` is how Avin expresses type classes (`Ord`, `Hash`, `Display`) and adds methods to types you
 do not own. Resolution is coherent: one implementation per trait and type, found without search.
 
+**A generic trait whose members are all static, and which requires no other trait, may be
+implemented by one type at several type arguments**, once at each: `impl From[IoError] for
+AppError` beside `impl From[ParseError] for AppError`, or `class Note : Make[int], Make[string]`.
+No value of such a trait exists, so each call names a type, and the member called is the one taking
+the arguments' types: `AppError.from(e)` as any overloaded method, and on a type parameter bounded
+by several instances, `T: Make[int] + Make[string]`, the instance whose member the arguments fit.
+Each conformance gives every member of the trait at its own type arguments. Any other trait is
+implemented once, at one list of type arguments.
+
 A built-in type conforms to a trait only through an impl, and meets the trait as a bound: each
 instance of generic code calls the impl's method directly. A built-in value is not an object, so a
 trait's default bodies, which every conforming object shares, do not reach it: an impl for a

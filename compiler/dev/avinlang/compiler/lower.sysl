@@ -1512,9 +1512,10 @@ private bound_call(l: *Lowering, e: &TExpr, function: usize, slot: Option[usize]
         if l.program.classes[k].decl.modifier != "" && !on_type then return dispatch(l, function, position, args, type_args)
     val entries = checker_table(l, receiver)
     if position >= entries.len() then return dispatch(l, function, position, args, type_args)
-    val m = entries[position] match
+    var m = entries[position] match
         Some(m) -> m
         None -> return dispatch(l, function, position, args, type_args)
+    if on_type then m = conformance_member(l, receiver, function, m, type_args)
     var concrete_args: Buf[&Type] = buf()
     for a in implementation_args(l, receiver, m)
         concrete_args.push(a)
@@ -1522,6 +1523,42 @@ private bound_call(l: *Lowering, e: &TExpr, function: usize, slot: Option[usize]
     for i in type_args.len() - own..<type_args.len()
         concrete_args.push(concrete(l, type_args[i]))
     direct_call(l, e, m, args, concrete_args)
+
+// A type implementing a trait at several type arguments has one static member of a name for each,
+// and its table holds only one of them: the one called is the one taking the parameter types the
+// trait's member takes at the call's type arguments. `table_member` is the table's.
+private conformance_member(l: *Lowering, receiver: &Type, function: usize, table_member: usize, type_args: Buf[&Type]) -> usize
+    val trait_member = l.program.symbols[function]
+    val k = trait_member.owner_class match
+        Some(k) -> k
+        None -> return table_member
+    if !several_conformances(l.program.classes[k].decl) then return table_member
+    var concrete_args: Buf[&Type] = buf()
+    for t in type_args
+        concrete_args.push(concrete(l, t))
+    var implementer: Buf[&Type] = buf()
+    implementer.push(receiver)
+    var wanted: Buf[&Type] = buf()
+    for i in 1..<trait_member.params.len()
+        wanted.push(substitute(substitute(trait_member.params[i], self_owner(k), implementer), trait_member.type_owner, concrete_args))
+    val chosen = l.program.symbols[table_member]
+    for x in 0..<l.program.symbols.len()
+        val candidate = l.program.symbols[x]
+        if !candidate.static_member || candidate.decl.name != trait_member.decl.name || candidate.params.len() != trait_member.params.len() then continue
+        // A built-in type's members are the methods of its impls, each impl with parameters of its
+        // own; any other type's share its owner.
+        if candidate.receiver is Some(r)
+            if chosen.receiver is Some(q)
+                if !same_type(r, q) then continue
+            else continue
+        elif chosen.receiver is Some(_) then continue
+        elif candidate.type_owner != chosen.type_owner || candidate.owner_class != chosen.owner_class then continue
+        val own = implementation_args(l, receiver, x)
+        var matches = true
+        for i in 1..<candidate.params.len()
+            if !same_type(substitute(candidate.params[i], candidate.type_owner, own), wanted[i - 1]) then matches = false
+        if matches then return x
+    table_member
 
 // Calls a function value, a closure or an object of a class or data type that is a function: its
 // descriptor's `call` takes the object before the arguments.
