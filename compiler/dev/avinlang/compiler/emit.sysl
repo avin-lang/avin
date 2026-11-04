@@ -437,6 +437,7 @@ private inst_operands(inst: Inst) -> Buf[Operand]
             out.push(address)
             out.push(value)
         Alloc(_, _) -> ()
+        Publish -> ()
         Offset(_, base, _) -> out.push(base)
         Index(_, base, index) ->
             out.push(base)
@@ -611,6 +612,7 @@ private inst_dest(inst: Inst) -> Option[usize] = inst match
     Load(dest, _) -> Some(dest)
     Store(_, _) -> None
     Alloc(dest, _) -> Some(dest)
+    Publish -> None
     Offset(dest, _, _) -> Some(dest)
     Index(dest, _, _) -> Some(dest)
     DescriptorOf(dest, _) -> Some(dest)
@@ -722,9 +724,14 @@ private emit_inst(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgra
             out.push(s"  %v$dest = select i1 " + operand(program, f, condition) + ", " + typed_operand(program, f, yes) + ", " + typed_operand(program, f, no) + "\n")
         Load(dest, address) ->
             val t = f.value_types[dest]
-            out.push(s"  %v$dest = load ${llvm_type(t)}, ptr " + operand(program, f, address) + alignment(t) + "\n")
+            if is_shared(f, address) then load_shared(out, s"%v$dest", t, operand(program, f, address))
+            else out.push(s"  %v$dest = load ${llvm_type(t)}, ptr " + operand(program, f, address) + alignment(t) + "\n")
         Store(address, value) ->
-            out.push("  store " + typed_operand(program, f, value) + ", ptr " + operand(program, f, address) + alignment(operand_type(program, f, value)) + "\n")
+            if is_shared(f, address)
+                store_shared(out, s"%t$next", operand_type(program, f, value), operand(program, f, value), operand(program, f, address))
+                next += 1
+            else out.push("  store " + typed_operand(program, f, value) + ", ptr " + operand(program, f, address) + alignment(operand_type(program, f, value)) + "\n")
+        Publish -> out.push("  fence release\n")
         Alloc(dest, descriptor) ->
             need(intrinsics, "declare ptr @avin_rt_alloc(ptr, ptr)")
             out.push(s"  %v$dest = call ptr @avin_rt_alloc(ptr %ctx, ptr @avin.desc.$descriptor)\n")
@@ -844,6 +851,93 @@ private root_count(program: MirProgram) -> usize
 
 private typed_operand(program: MirProgram, f: MirFunction, a: Operand) -> string =
     llvm_type(operand_type(program, f, a)) + " " + operand(program, f, a)
+
+// Memory another thread can reach, a field of an object, an element of an array or a module-level
+// value, is accessed with unordered atomic loads and stores, so a racing load returns a value some
+// store wrote and never one nothing wrote. The function's own slots, and its callers' slots whose
+// addresses a local function is passed as parameters, belong to one thread and are accessed plainly.
+private is_shared(f: MirFunction, address: Operand) -> bool = address match
+    Value(id) -> !(id < f.signature.params.len() && f.value_types[id] is MPtr)
+    GlobalAddress(_) -> true
+    ConstStr(_) -> true
+    ConstObject(_) -> true
+    _ -> false
+
+// The width in bits an integer or bool is stored at: a whole power-of-two number of bytes up to a
+// word, as fields and array elements are laid out. An atomic access is made at that width, so a bool
+// is a byte and an `i5` is a byte, and the value is truncated after a load and zero-extended before a
+// store.
+private storage_bits(t: MirType) -> u32 = t match
+    MBool -> 8
+    MInt(bits) -> if bits <= 8 then 8 elif bits <= 16 then 16 elif bits <= 32 then 32 else 64
+    _ -> 64
+
+// A shared load into `dest`. An integer wider than 64 bits is loaded a word at a time, lowest word
+// first, so each word is untorn while a racing load may combine words of different stores.
+private load_shared(out: *StrBuilder, dest: string, t: MirType, address: string)
+    val ty = llvm_type(t)
+    t match
+        MInt(bits) ->
+            if bits > 64
+                val words = usize((bits + 63) / 64)
+                var acc = ""
+                for k in 0..<words
+                    val p = dest + s".p$k"
+                    val word = dest + s".w$k"
+                    val wide = dest + s".z$k"
+                    out.push(s"  $p = getelementptr inbounds i64, ptr $address, i64 $k\n")
+                    out.push(s"  $word = load atomic i64, ptr $p unordered, align 8\n")
+                    out.push(s"  $wide = zext i64 $word to $ty\n")
+                    if k == 0 then acc = wide
+                    else
+                        val shifted = dest + s".s$k"
+                        out.push(s"  $shifted = shl $ty $wide, ${64 * k}\n")
+                        val combined = if k + 1 == words then dest else dest + s".o$k"
+                        out.push(s"  $combined = or $ty $acc, $shifted\n")
+                        acc = combined
+                return
+        _ -> ()
+    val w = storage_bits(t)
+    val exact = t match
+        MInt(bits) -> bits == w
+        MBool -> false
+        _ -> true
+    if exact then out.push(s"  $dest = load atomic $ty, ptr $address unordered, align ${w / 8}\n")
+    else
+        val raw = dest + ".raw"
+        out.push(s"  $raw = load atomic i$w, ptr $address unordered, align ${w / 8}\n")
+        out.push(s"  $dest = trunc i$w $raw to $ty\n")
+
+// A shared store of `value`, naming its temporaries after `temp`. An integer wider than 64 bits is
+// stored a word at a time, lowest word first.
+private store_shared(out: *StrBuilder, temp: string, t: MirType, value: string, address: string)
+    val ty = llvm_type(t)
+    t match
+        MInt(bits) ->
+            if bits > 64
+                val words = usize((bits + 63) / 64)
+                for k in 0..<words
+                    var part = value
+                    if k > 0
+                        part = temp + s".h$k"
+                        out.push(s"  $part = lshr $ty $value, ${64 * k}\n")
+                    val word = temp + s".w$k"
+                    val p = temp + s".p$k"
+                    out.push(s"  $word = trunc $ty $part to i64\n")
+                    out.push(s"  $p = getelementptr inbounds i64, ptr $address, i64 $k\n")
+                    out.push(s"  store atomic i64 $word, ptr $p unordered, align 8\n")
+                return
+        _ -> ()
+    val w = storage_bits(t)
+    val exact = t match
+        MInt(bits) -> bits == w
+        MBool -> false
+        _ -> true
+    if exact then out.push(s"  store atomic $ty $value, ptr $address unordered, align ${w / 8}\n")
+    else
+        val raw = temp + ".raw"
+        out.push(s"  $raw = zext $ty $value to i$w\n")
+        out.push(s"  store atomic i$w $raw, ptr $address unordered, align ${w / 8}\n")
 
 // Fields sit at multiples of 8 bytes, so an integer wider than 64 bits is accessed at that alignment
 // rather than its natural one; every other type's natural alignment is at most 8.

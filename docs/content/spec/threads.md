@@ -65,16 +65,21 @@ mutable state is reached only under those edges sees sequentially consistent beh
 
 **A data race on a plain field or `var` is not undefined behaviour.** A racing read returns some
 value that was written to that location, never a mixture of two writes and never a value nothing
-wrote. Every field is at most a word, since a reference is one word and so is every built-in
-scalar, so the compiler gives each access to a heap field or a module-level variable LLVM's
-`unordered` atomic ordering: it costs nothing on the machines Avin targets, and it is exactly the
-promise that a word is never torn and a racing load is never undefined.
+wrote. The compiler gives each access to a heap field, an array element or a module-level variable
+LLVM's `unordered` atomic ordering: it costs nothing on the machines Avin targets, and it is exactly
+the promise that a word is never torn and a racing load is never undefined. A reference is one word,
+and so is every built-in scalar.
+
+**An integer wider than 64 bits is the one exception.** An `i128` or an `i257` is several words,
+and a field or variable of one is read and written as untorn 64-bit words, so a racing read of it
+may combine words of different writes. Each word is still one some write stored, and a program that
+shares such a value under the edges above, or through an `Atomic` or a `Mutex`, never sees a mixture.
 
 **An object is complete before any thread can see it.** A constructor ends with a release fence, so
 a thread that reads a reference to an object, however it got it, sees the object's header and every
 field its constructor set. Without it, a racing reader could see a reference field still zero,
-which no Avin type allows. The fence is free on x86-64 and one store barrier on ARM, paid once per
-object made.
+which no Avin type allows. The fence is no instruction at all on x86-64 and one `dmb ish` barrier
+on arm64, paid once per object made.
 
 ## Collection
 
