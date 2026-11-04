@@ -34,6 +34,45 @@ shim_lines()
     assert_eq(shim.last[1] - shim.first[1], 3usize)
     assert_eq(shim.last[2] - shim.first[2], 4usize)
 
+private const MirrorProgram: string = "@sysl(\"sysl.time.LocalDate\")\ndata LocalDate\n    LocalDate(day: int)\n\n@sysl(\"sysl.time.checked_date\")\nchecked(y: int, m: int, d: int) -> Option[LocalDate]\n\n@sysl(\"sysl.hint.black_box\")\nsame(o: Option[LocalDate]) -> Option[LocalDate]\n\n@sysl(\"sysl.hint.black_box\")\nbytes(b: Array[byte]) -> Array[byte]\n\nmain() = 0\n"
+
+@test("each type's conversion is written once in each direction, and a mirror's lines are its own")
+shim_conversions()
+    val program = lower_source(repository_toolchain(), source_of("/probe/mirrors.avin", MirrorProgram)).unwrap()
+    val shim = shim_source(program.bindings)
+    val text = lines(shim.text)
+    // Two bindings return an `Option[LocalDate]` and one takes one: one conversion each way for it
+    // and one for the mirror inside it.
+    var outs = 0
+    var ins = 0
+    for line in text
+        if line.starts_with("private out_") then outs += 1
+        if line.starts_with("private in_") then ins += 1
+    assert_eq(outs, 2)
+    assert_eq(ins, 2)
+    assert_eq(shim.mirrors.len(), 1usize)
+    assert_eq(shim.mirrors[0].target, "sysl.time.LocalDate")
+    // The mirror's import, and the first line of each of its conversions, are among its lines.
+    var import_owned = false
+    var conversions = 0
+    for part in shim.mirror_lines
+        if text[part.first - 1] == "import sysl.time.LocalDate as mirror_0" then import_owned = true
+        if text[part.first - 1].starts_with("// LocalDate ") then conversions += 1
+    assert(import_owned)
+    assert_eq(conversions, 2)
+    // An array of bytes is copied in bulk, and the result's layouts follow its parameters.
+    assert(shim.text.contains("copy(out, array_elements(p)[0..<n])"))
+    assert(shim.text.contains("bytes_of(ctx, r, d0)"))
+
+@test("a binding's result is made by the layouts its body passes after its parameters")
+shim_layouts()
+    val program = lower_source(repository_toolchain(), source_of("/probe/mirrors.avin", MirrorProgram)).unwrap()
+    for b in program.bindings
+        // `Option[LocalDate]`: `Some`, `None`, then `LocalDate`'s one variant; an array, its descriptor.
+        if b.name == "checked" || b.name == "same" then assert_eq(b.result.layouts, 3usize)
+        if b.name == "bytes" then assert_eq(b.result.layouts, 1usize)
+        assert(b.result.variants.len() == 0 || b.result.variants[0].fields[0].base == 2usize)
+
 @test("a binding's shim is built once and found in the cache after that")
 shim_cache()
     val text = "@sysl(\"sysl.text.to_lower\")\nlower(s: string) -> string\n\nmain() = 0\n"

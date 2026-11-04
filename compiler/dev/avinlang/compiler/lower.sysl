@@ -154,6 +154,8 @@ private struct Lowering
     used_slots: Buf[bool]
     /** Whether a position has come into use since the tables were last filled. */
     new_slots: bool
+    /** The Sysl bindings whose bodies have been compiled, in that order. */
+    bound: Buf[MirBinding]
 
 /** One slot for a method with type parameters of its own, at one list of its own type arguments: a
  * call through a method table to `name` at checker position `position` with `type_args` reaches it.
@@ -180,7 +182,7 @@ lower_program(program: TProgram) -> MirProgram
         if k.table.len() > generic_base then generic_base = k.table.len()
     for d in program.data
         if d.table.len() > generic_base then generic_base = d.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false)
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf())
     // Record 0 is for the objects no type pattern names: closures, and the boxes of captured
     // variables.
     l.records.push(TypeRecord("a closure or a captured variable", buf(), None, None))
@@ -220,18 +222,7 @@ lower_program(program: TProgram) -> MirProgram
         // the program makes one, every record gets them; making them may lay out more types.
         if !l.runtime_equality || !add_equality_entries(&l) then break
     add_variant_ancestors(&l)
-    var bindings: Buf[MirBinding] = buf()
-    for inst in l.instances
-        if inst.generated != Written then continue
-        val symbol = program.symbols[inst.function]
-        if binding_target(symbol.decl) is Some(target)
-            val shim = shim_symbol(function_symbol(program, inst.function, inst.type_args))
-            // A function used as a value is an instance twice, its body and its closure's entry.
-            var seen = false
-            for b in bindings
-                if b.shim == shim then seen = true
-            if !seen then bindings.push(MirBinding(shim, target, symbol.name, symbol.params, symbol.result.unwrap_or(Unit), symbol.unit, symbol.decl.name_span))
-    MirProgram(functions, l.strings, l.descriptors, l.records, l.closures, l.traps, global_types, entry, init, bindings, tests, program.testing)
+    MirProgram(functions, l.strings, l.descriptors, l.records, l.closures, l.traps, global_types, entry, init, l.bound, tests, program.testing)
 
 /** Whether a function belongs to the core library's module, `avin`, or one under it. */
 private in_core_library(program: TProgram, id: usize) -> bool
@@ -1201,14 +1192,28 @@ private returning(l: *Lowering, value: Option[Operand]) -> Terminator
 
 // A Sysl binding is a function like any other in the object file; its body passes its parameters to
 // the binding's shim, with the context first, and returns what the shim returns. The shim is
-// generated Sysl, called with the C convention, which converts each value at the boundary.
+// generated Sysl, called with the C convention, which converts each value at the boundary. A result
+// the shim makes objects for comes with the descriptors and constant objects it makes them by.
 private binding_body(l: *Lowering, symbol: FunctionSymbol, shim: string)
     var args: Buf[Operand] = buf()
     var params: Buf[MirType] = buf()
+    var crossings: Buf[&Crossing] = buf()
+    var unused: Buf[Operand] = buf()
     for i in 0..<symbol.params.len()
+        crossings.push(crossing(l, concrete(l, symbol.params[i]), &unused))
         if l.param_values[i] is Some(v)
             args.push(Value(v))
             params.push(l.values[v])
+    val result_type = concrete(l, symbol.result.unwrap_or(Unit))
+    var layouts: Buf[Operand] = buf()
+    val result_crossing = crossing(l, result_type, &layouts)
+    for operand in layouts
+        params.push(if operand is ConstObject(_) then MRef else MPtr)
+        args.push(operand)
+    var seen = false
+    for b in l.bound
+        if b.shim == shim then seen = true
+    if !seen then l.bound.push(MirBinding(shim, binding_target(symbol.decl).unwrap(), symbol.name, crossings, result_crossing, symbol.unit, symbol.decl.name_span))
     val result = machine(l, symbol.result.unwrap_or(Unit))
     val dest = result match
         Some(t) -> Some(fresh(l, t))
@@ -1217,6 +1222,37 @@ private binding_body(l: *Lowering, symbol: FunctionSymbol, shim: string)
     finish(l, Return(dest match
         Some(d) -> Some(Value(d))
         None -> None))
+
+// How a shim converts a value of boundary type `t`, the checker having held every binding's types
+// to those. A data type's or an array's layouts are pushed onto `layouts` in the order the
+// conversion numbers them: each variant's descriptor, or its one constant object, then each field's.
+private crossing(l: *Lowering, t: &Type, layouts: *Buf[Operand]) -> &Crossing
+    *t match
+        Class(_, _, _) ->
+            layouts.push(DescriptorAddress(layout(l, t).variants[0].descriptor))
+            return Crossing(t, Bytes, buf(), 1)
+        Data(id, _, args) ->
+            val d = l.program.data[id]
+            val shape = layout(l, t)
+            val start = layouts.len()
+            for v in shape.variants
+                layouts.push(if l.descriptors[v.descriptor].constant then ConstObject(v.descriptor) else DescriptorAddress(v.descriptor))
+            var variants: Buf[CrossVariant] = buf()
+            for v in 0..<d.variants.len()
+                val types = variant_fields(d, id, v, args)
+                var fields: Buf[CrossField] = buf()
+                for k in 0..<types.len()
+                    val base = layouts.len() - start
+                    val offset: Option[usize] = shape.variants[v].fields[k] match
+                        Some(slot) -> Some(slot.offset)
+                        None -> None
+                    fields.push(CrossField(d.variants[v].field_names[k], offset, crossing(l, types[k], layouts), base))
+                variants.push(CrossVariant(d.variants[v].name, l.descriptors[shape.variants[v].descriptor].constant, fields))
+            val form = mirror_target(d.decl) match
+                Some(target) -> Mirror(d.name, target, d.unit, d.decl.span, d.variants.len() == 1 && d.variants[0].name == d.name)
+                None -> if d.name == "Option" then OptionForm else ResultForm
+            return Crossing(t, form, variants, layouts.len() - start)
+        _ -> return Crossing(t, Plain, buf(), 0)
 
 /** The symbol of the shim a binding's body calls: `avin_shim_` and the binding's own symbol, with
  * each character other than a letter or a digit written as `_` and its two hex digits. */

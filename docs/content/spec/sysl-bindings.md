@@ -12,7 +12,7 @@ time, hashing, text encoding, C libraries through Sysl's own FFI — Avin code r
 module avin.fs
 
 @sysl("sysl.fs.read_text")
-private readTextRaw(path: string) -> Result[string, SyslError]
+private readTextRaw(path: string) -> Result[string, SyslIoError]
 
 readText(path: string) -> Result[string, IoError] =
     readTextRaw(path).mapErr(IoError.fromSysl)
@@ -63,15 +63,67 @@ Data crosses the boundary in a fixed set of shapes:
 | --- | --- |
 | `i8`, `i16`, `int`, `long`, `byte`, `real`, `char`, `bool`, `unit` | By value; Sysl's `u8` is `byte` |
 | `string` | Copied into a Sysl `string` in each direction |
-| `Array[byte]` | Copied |
+| `Array[byte]` | Copied into a Sysl `[]u8` in each direction |
 | `Option[T]`, `Result[T, E]` of boundary types | Converted variant by variant by the generated shim |
 | `data` declared with `@sysl("…")` mirroring a Sysl struct or enum of boundary types | Converted field by field |
 | `class` declared with `@sysl("…")` | An **opaque handle**: an Avin object owning one counted Sysl reference, released by `close()` or, as a safety net, a finalizer. Its methods are bindings too. |
+
+These shapes nest: a `Result[Option[string], IoError]` crosses, and so does a mirror whose fields
+are `Option`s or other mirrors. No other collection crosses: an `Array` of anything but `byte`, a
+`Vector` or a `Map` is converted by the Avin function that wraps the binding.
+
+```text
+error: `Vector[string]` cannot cross to Sysl; a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, `Array[byte]`, `Option` and `Result` of these, and data types declared with `@sysl` to mirror a Sysl enum or struct
+```
 
 **Avin heap references never enter Sysl memory.** A Sysl container cannot hold an Avin object,
 because Sysl's reference counting cannot keep an Avin object alive and the collector cannot see Sysl
 memory. Avin's own collections are written in Avin, so the standard library has no need for Sysl
 containers of Avin values.
+
+## Mirrors
+
+A `data` type declared with `@sysl("module.Name")` **mirrors** a Sysl enum or struct: values of
+either convert into the other wherever a binding's types hold one.
+
+```text
+@sysl("sysl.fs.IoError")
+data IoError
+    NotFound
+    PermissionDenied
+    AlreadyExists
+    NotADirectory
+    IsADirectory
+    DirectoryNotEmpty
+    TooManyOpenFiles
+    NoSpaceLeft
+    Interrupted
+    NotOpen
+    NotPermitted
+    InvalidUtf8(offset: long)
+    Other(code: int)
+
+@sysl("sysl.fs.read_text")
+readText(file: string) -> Result[string, IoError]
+```
+
+- **An enum** is mirrored variant by variant: each Avin variant is the Sysl variant of the same name,
+  and its fields are the Sysl variant's payload, in order.
+- **A struct** is mirrored by a data type with one variant named as the type, whose fields are the
+  struct's fields of the same names: `data LocalDate` with the one variant `LocalDate(day: int)`
+  mirrors `sysl.time.LocalDate`.
+- **A field is a boundary type.** An integer field takes any Sysl integer, converted with a check in
+  each direction: Avin has no unsigned integers, so Sysl's `usize` offset above is a `long`.
+- A mirror has no type parameters, and none of its fields holds the mirror itself, directly or
+  through an `Option`, a `Result` or another mirror.
+
+Sysl checks a mirror against the type it names when it checks a shim that converts one, so a missing
+variant, a field of the wrong type or a name Sysl does not declare is reported at the mirror, in
+Sysl's words:
+
+```text
+error: the Sysl mirror `IoError` does not match `sysl.fs.IoError`: match on 'IoError' is not exhaustive; missing PermissionDenied, …
+```
 
 ## Generics
 

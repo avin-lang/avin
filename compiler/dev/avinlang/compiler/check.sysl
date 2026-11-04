@@ -572,6 +572,8 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool) -> Che
     for u in 0..<c.units.len()
         declare_variants(&c, u)
         declare_fields(&c, u)
+    for id in 0..<c.data.len()
+        check_mirror(&c, id)
     // A subclass's fields and methods follow its superclass's, wherever either is declared.
     for id in 0..<c.classes.len()
         inherit_fields(&c, id)
@@ -806,7 +808,17 @@ private declare_types(c: *Checker, unit: usize)
                 continue
             if file.private_items[i] then c.private_names.put(key, true)
             for a in d.annotations
-                c.note(unit, a.span, s"unknown annotation `@${a.name}`")
+                if a.name != "sysl"
+                    c.note(unit, a.span, s"unknown annotation `@${a.name}`")
+                    continue
+                var target: Option[string] = None
+                if a.args.len() == 1 && a.args[0].name is None
+                    if a.args[0].value.kind is StringLit(p) then target = Some(p)
+                target match
+                    Some(p) ->
+                        if !is_sysl_path(p) then c.note(unit, a.span, s"`@sysl` on a data type names a Sysl enum or struct by its module and name, as in `sysl.fs.IoError`; `$p` is not one")
+                    None -> c.note(unit, a.span, "`@sysl` on a data type takes one string, the module and name of the Sysl enum or struct it mirrors, as in `@sysl(\"sysl.fs.IoError\")`")
+                if d.type_params.len() > 0 then c.note(unit, a.span, "a Sysl mirror has no type parameters: it mirrors one Sysl type")
             c.types.put(key, c.data.len())
             c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf(), buf(), buf(), buf(), buf(), None, buf()))
     for i in 0..<file.items.len()
@@ -3725,16 +3737,16 @@ private check_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Type]
         for i in 0..<f.params.len()
             val p = f.params[i]
             if p.by_name then c.note(unit, p.pattern.span, "a by-name parameter cannot cross to Sysl")
-            elif !crosses_to_sysl(params[i]) then c.note(unit, p.ty.span, s"`${type_name(params[i])}` cannot cross to Sysl; ${BoundaryTypes}")
+            elif !crosses_to_sysl(c, params[i]) then c.note(unit, p.ty.span, s"`${type_name(params[i])}` cannot cross to Sysl; ${BoundaryTypes}")
         if result is Some(r)
-            if !crosses_to_sysl(r)
+            if !crosses_to_sysl(c, r)
                 val at = if f.result is Some(t) then t.span else f.name_span
                 c.note(unit, at, s"`${type_name(r)}` cannot cross to Sysl; ${BoundaryTypes}")
 
-const BoundaryTypes: string = "a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit` and `string`"
+const BoundaryTypes: string = "a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, `Array[byte]`, `Option` and `Result` of these, and data types declared with `@sysl` to mirror a Sysl enum or struct"
 
 /** Whether a value of type `t` crosses between Avin and Sysl, converted by a binding's shim. */
-crosses_to_sysl(t: &Type) -> bool = *t match
+crosses_to_sysl(c: *Checker, t: &Type) -> bool = *t match
     ErrorType -> true
     Unit -> true
     Bool -> true
@@ -3743,7 +3755,60 @@ crosses_to_sysl(t: &Type) -> bool = *t match
     Str -> true
     Byte -> true
     Int(bits) -> bits == 8 || bits == 16 || bits == 32 || bits == 64
+    Data(id, _, args) ->
+        val d = c.data[id]
+        if mirror_target(d.decl) is Some(_) then return true
+        if d.module_name != CoreModule then return false
+        if d.name == "Option" && args.len() == 1 then return crosses_to_sysl(c, args[0])
+        d.name == "Result" && args.len() == 2 && crosses_to_sysl(c, args[0]) && crosses_to_sysl(c, args[1])
+    Class(k, _, args) -> is_array_class(c.classes[k]) && args.len() == 1 && *args[0] is Byte
     _ -> false
+
+/** The Sysl enum or struct a data type mirrors: the string of its `@sysl` annotation, when it has
+ * one. */
+mirror_target(d: &DataDecl) -> Option[string]
+    for a in d.annotations
+        if a.name == "sysl" && a.args.len() == 1
+            if a.args[0].value.kind is StringLit(path) then return Some(path)
+    None
+
+// A data type declared with `@sysl("module.Name")` mirrors a Sysl enum or struct: each variant is
+// the Sysl variant of its name, and its fields are the variant's payload in order, of boundary
+// types. A mirror of one variant named as the type mirrors a struct, whose fields it names. Sysl
+// checks the correspondence when it checks a shim that converts one.
+private check_mirror(c: *Checker, id: usize)
+    val d = c.data[id]
+    if mirror_target(d.decl) is None || d.decl.type_params.len() > 0 then return
+    for v in 0..<d.variants.len()
+        val variant = d.variants[v]
+        for k in 0..<variant.fields.len()
+            val t = variant.fields[k]
+            val at = d.decl.variants[v].fields[k].ty.span
+            if !crosses_to_sysl(c, t)
+                c.note(d.unit, at, s"`${type_name(t)}` cannot cross to Sysl, so a Sysl mirror's field cannot be one; ${BoundaryTypes}")
+            else
+                var seen: Buf[usize] = buf()
+                if holds_mirror(c, t, id, &seen) then c.note(d.unit, at, s"a Sysl mirror cannot hold itself: `${type_name(t)}` holds `${d.name}`")
+
+// Whether a value of boundary type `t` holds a value of the mirror `target`, through the fields of
+// the mirrors and the type arguments of the `Option` and `Result` it holds.
+private holds_mirror(c: *Checker, t: &Type, target: usize, seen: *Buf[usize]) -> bool
+    var id = 0usize
+    *t match
+        Data(d, _, args) ->
+            if d == target then return true
+            for a in args
+                if holds_mirror(c, a, target, seen) then return true
+            id = d
+        _ -> return false
+    if mirror_target(c.data[id].decl) is None then return false
+    for i in 0..<seen.len()
+        if seen[i] == id then return false
+    seen.push(id)
+    for v in c.data[id].variants
+        for f in v.fields
+            if holds_mirror(c, f, target, seen) then return true
+    false
 
 // A module path and a name: two or more identifiers joined by dots.
 private is_sysl_path(p: string) -> bool
