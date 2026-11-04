@@ -103,6 +103,16 @@ most the largest `int` bytes.
 | `replace(old, new)` | Every occurrence of `old`, left to right and not overlapping, replaced by `new`; an empty `old` occurs nowhere |
 | `indexOf(p)`, `indexOf(p, from)` | `Some` of the byte offset of the first `p`, at or after `from` (default 0; below 0 counts as 0); `None` when there is none or `from` is past the end. The empty string is found at `from` |
 | `lastIndexOf(p)` | `Some` of the byte offset of the last `p`; `None` when there is none. The empty string is found at `byteLength()` |
+| `chars()` | The characters, in order, as a `Vector[char]` |
+| `count(p)` | The number of characters satisfying `p` |
+| `split(sep)` | The pieces between the occurrences of `sep`, as a `Vector[string]`; empty pieces are kept (`",a,,b,".split(",")` has five pieces), and a string without `sep` is one piece. An empty `sep` traps |
+| `lines()` | The lines as a `Vector[string]`, each ended by `\n` or `\r\n` and shown without it; a terminator at the very end starts no further line, so `"a\nb\n".lines()` is two lines and `""` has none. A `\r` not before `\n` stays in its line |
+| `isBlank()` | Whether it has only `White_Space` characters, so the empty string is blank |
+| `reverse()` | The characters in the opposite order |
+| `padStart(w, c)`, `padEnd(w, c)` | At least `w` characters, `c` (default `' '`) repeated before, after; `w` counts characters, not bytes, and a string already that long is unchanged |
+| `equalsIgnoreCase(o)` | Whether the two are equal after each character's simple lower-case mapping |
+| `take(n)`, `drop(n)` | The first `n` characters, all but the first `n`; `n` counts characters, not bytes, and is clamped to the string, so 0 or less takes none |
+| `takeRight(n)`, `dropRight(n)` | The last `n` characters, all but the last `n` |
 | `toInt()`, `toLong()` | `Some` of the number written in decimal: an optional `-` or `+`, then one or more ASCII digits and nothing else; `None` otherwise, or when it does not fit the type |
 | `toReal()` | `Some` of the number written as a decimal fraction, correctly rounded: an optional sign, digits with an optional point, an optional exponent (`3.25`, `-.5`, `1e10`); `None` for anything else, including white space, `nan`, `inf`, hexadecimal, and a number too large to be finite |
 
