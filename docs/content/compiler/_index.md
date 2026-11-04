@@ -305,6 +305,21 @@ once every conformance is known, the checker holds each field to the trait deriv
 bounds the parameters have in the derived impl, names a field that falls short, and leaves that
 derived method unchecked.
 
+Every data type gains a `Display` and a `Debug` impl this way without `derives`, unless an impl of
+its own in the module implements the trait or declares its method; each is declared at the type,
+the two at different offsets so the bounds their parameters carry are kept apart. These
+**automatic derivations** are held to the fields after the written ones, repeatedly until nothing
+changes, since a type left without `Display` leaves the types holding it without `Display` in turn.
+A field that falls short is not reported: the type is withdrawn from the trait (its conformance,
+its table positions and the method go, the method recorded as withdrawn so lowering never compiles
+it), and a bound or interpolation that then fails names the field in its diagnostic.
+
+Lowering compiles a data type's trait implementations only when called, and fills a method table
+position only once some call goes through it (`used_slots`): each new position is filled in every
+table made so far, which may make instances to compile, until no position is new. So a program that
+never shows a value carries no `Display` or `Debug` code, and one calling `toString()` through
+`Display` carries it only for the types it makes.
+
 The supertypes an instance has through **variance** are open-ended (`List[Dog]` is a `List[Animal]`
 and a `List[Any]`), so a record does not list them all. Lowering notes each record a type pattern
 tests through `avin_rt_conforms`; once every function is lowered, each record gains those tested

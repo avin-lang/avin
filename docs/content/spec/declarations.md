@@ -225,8 +225,9 @@ data Option[+T]
 
 The single-line form declares a one-variant type whose variant has the type's name. Variants are
 constructors, not types: `Some(1)` has type `Option[int]`. `data` values have no identity, derive
-`Eq`, `Hash`, `Display` and `Debug` when their fields do, and are matched exhaustively. Methods are
-added in an `impl` block.
+`Eq`, `Hash`, `Display` and `Debug` when their fields do, without `derives`, and are matched
+exhaustively. Methods are added in an `impl` block; an impl of `Display` or `Debug` replaces the
+derived one ([Display and Debug](/spec/equality-and-memory/#display-and-debug)).
 
 ## class
 

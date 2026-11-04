@@ -336,6 +336,11 @@ a decision changes, this page and the chapter change together.
   type's derived `Ord` holds for the type arguments that are ordered; deriving `Display` or `Debug`
   on a generic type, and `Ord` on a generic class, needs the parameters bounded by the trait where
   the type declares them.
+- Settled 2026-11-03: every data type has `Display` and `Debug` without `derives`, where its fields
+  have them, conditional on its type arguments as a derived one is; `derives Display, Debug` on a
+  data type means the same. An impl of the type's own replaces the automatic one, with no conflict.
+  A field without the trait leaves the type without it, which is an error only where a use needs it,
+  naming the field. A program that never shows a value compiles none of this code.
 - `x.equals(y)` and `x.hash()` may be called on a value of any type parameter, bounded or not.
 - Settled 2026-11-03: a type argument a call's arguments decide is the
   [join](/spec/generics/#inference) of the types they give it where a value is read out, as two

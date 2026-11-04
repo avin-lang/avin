@@ -56,13 +56,22 @@ quoted and escaped. Both render into a `Writer` with a `FormatSpec`, so formatti
 intermediate string. `data` types and tuples derive both; classes declare them. Nothing has a default
 that prints an address.
 
+A `data` type has both without asking, wherever its fields have them: `print(Some(3))` writes
+`Some(3)`, and `assertEq(Some(3), Some(3))` needs nothing written. `derives Display, Debug` on a data
+type is allowed and means the same. An impl of the type's own replaces the automatic one: `impl
+Display for Money` gives `Money` its own `Display` while its `Debug` stays the derived one, and `List`,
+`Map` and `Set` keep their literal forms this way. A field without the trait leaves the type without
+it rather than being an error: `data Wrapper(p: Plain)` is made, compared and matched, and only a use
+that needs its `Display` is rejected, naming the field. A program that never shows a value carries
+none of this code.
+
 A derived `Display` writes the type's or variant's name and its fields in parentheses, separated by
 `, `, each in its own `Display` form: `Point(1, 2)`, `Named(ada, Point(1, 2))`. A variant without
 fields is its bare name, `Empty`. A derived `Debug` has the same shape with each field's `Debug`
 form, so strings and chars inside are quoted and escaped: `Named("ada", Point(1, 2))`. A field width
 in the `FormatSpec` pads the whole rendering; the fields themselves are written without one. Derived
 on a generic type, either holds for the type arguments that implement the trait: `data Box[T](item:
-T) derives Display` displays a `Box[int]`, and a `Box` of a type without `Display` does not display.
+T)` displays a `Box[int]`, and a `Box` of a type without `Display` does not display.
 
 A collection displays as its elements in brackets, separated by `, `, each in its own `Display` form:
 an `Array[int]` or a `List[int]` as `[1, 2, 3]`, an empty one as `[]`, nested ones as `[[1], [2,

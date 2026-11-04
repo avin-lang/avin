@@ -160,6 +160,9 @@ struct DataSymbol
     /** The object of the same name in its module, its companion: the bare name and `Name.member`
      * are the object, while a variant of the type's name is still called to make a value. */
     companion: Option[usize]
+    /** The methods of the `Display` and `Debug` it would have had without asking, but which a field
+     * of it lacks: unchecked, and never compiled. */
+    withdrawn: Buf[usize]
 
 /** One constructor of a data type. */
 struct VariantSymbol
@@ -373,6 +376,9 @@ struct Checker
     /** The impls with bounds of their own that add methods without a trait: their methods exist only
      * at type arguments meeting the bounds. */
     conditional_methods: Buf[ConditionalImpl]
+    /** The `Display` and `Debug` a data type would have had without asking, but which a field of it
+     * does not implement: the type is left without the trait, and a use needing it names the field. */
+    underived: Buf[Underived]
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -539,7 +545,7 @@ private check_imports(c: *Checker, unit: usize)
  * unit is one of its files. Every file sees its own module's declarations, the names it imports and
  * the core library's public declarations, in that order: an inner name hides an outer one. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf())
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
     // `derives` is written out as the methods and impls it stands for before anything is declared.
@@ -582,7 +588,8 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool) -> Che
         c.generic = outer_generic
     c.pending = buf()
     for dv in c.derivations
-        check_derivation(&c, dv)
+        if !dv.automatic then check_derivation(&c, dv)
+    settle_automatic_derivations(&c)
     for u in 0..<c.units.len()
         declare_globals(&c, u)
     for u in 0..<c.units.len()
@@ -792,7 +799,7 @@ private declare_types(c: *Checker, unit: usize)
             for a in d.annotations
                 c.note(unit, a.span, s"unknown annotation `@${a.name}`")
             c.types.put(key, c.data.len())
-            c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf(), buf(), buf(), buf(), buf(), None))
+            c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf(), buf(), buf(), buf(), buf(), None, buf()))
     for i in 0..<file.items.len()
         if file.items[i] is ClassItem(d)
             if d.object then continue
@@ -3490,24 +3497,28 @@ private core_trait_type(c: *Checker, name: string) -> Option[&Type]
 // Holds each field of a type deriving a trait to the trait, which the derived method calls on it: a
 // class's constructor parameters, a data type's variants' fields, seen with the bounds the type's
 // parameters have there. A field that falls short is reported by name, and the derived method is
-// then left unchecked, since each of its failures would be that one again.
-private check_derivation(c: *Checker, dv: Derivation)
+// then left unchecked, since each of its failures would be that one again. A data type's automatic
+// `Display` or `Debug` is not reported: the type is left without the trait (`withdraw_derivation`).
+// Whether one failed is the result.
+private check_derivation(c: *Checker, dv: Derivation) -> bool
     val k = c.class_types.get(qualified(CoreModule, dv.trait_name)) match
         Some(k) -> k
-        None -> return
+        None -> return false
     val bound = own_class_type(c.classes[k], k)
     val key = qualified(c.units[dv.unit].file.module_name, dv.type_name)
     var names: Buf[string] = buf()
     var types: Buf[&Type] = buf()
     var scope: Option[GenericScope] = None
+    var data_id: Option[usize] = None
     if dv.data
         val id = c.types.get(key) match
             Some(id) -> id
-            None -> return
+            None -> return false
+        data_id = Some(id)
         for block in c.impls
-            if block.unit == dv.unit && block.decl.span.start == dv.span.start && block.decl.span.end == dv.span.end
+            if made_for(block.unit, block.decl, dv)
                 scope = Some(GenericScope(data_owner(id), block.decl.type_params))
-        if scope is None then return
+        if scope is None then return false
         val d = c.data[id]
         for v in d.variants
             for i in 0..<v.fields.len()
@@ -3516,11 +3527,11 @@ private check_derivation(c: *Checker, dv: Derivation)
     else
         val id = c.class_types.get(key) match
             Some(id) -> id
-            None -> return
+            None -> return false
         scope = Some(GenericScope(class_owner(id), c.classes[id].decl.type_params))
         // A generic class's derived impl bounds its parameters by the trait.
         for block in c.impls
-            if block.unit == dv.unit && block.decl.span.start == dv.span.start && block.decl.span.end == dv.span.end
+            if made_for(block.unit, block.decl, dv)
                 scope = Some(GenericScope(class_owner(id), block.decl.type_params))
         for f in c.classes[id].fields
             if f.param && f.owner == id && f.ty is Some(t)
@@ -3533,14 +3544,96 @@ private check_derivation(c: *Checker, dv: Derivation)
         if conforms_to_bound(c, types[i], bound) then continue
         failed = true
         val shown = type_name(zonk(c, types[i]))
+        if dv.automatic
+            c.underived.push(Underived(data_id.unwrap_or(0), dv.trait_name, names[i], shown))
+            break
         val hint = if *types[i] is TypeVar(_, _, _) then s"; bound the parameter, as in `[$shown: ${dv.trait_name}]`" else ""
         c.note(dv.unit, dv.span, s"`${dv.type_name}` cannot derive `${dv.trait_name}`: its field `${names[i]}` has type `$shown`, which does not implement `${dv.trait_name}`$hint")
     c.generic = outer_generic
-    if !failed then return
+    if !failed then return false
+    val method = derived_method(dv.trait_name)
+    var made: Option[usize] = None
     for id in 0..<c.symbols.len()
         val decl = c.symbols[id].decl
-        if c.symbols[id].unit == dv.unit && decl.name_span.start == dv.span.start && decl.name_span.end == dv.span.end
+        if c.symbols[id].unit == dv.unit && decl.name == method && decl.name_span.start == dv.span.start && decl.name_span.end == dv.span.end
             c.states.set(id, 2)
+            made = Some(id)
+    if dv.automatic
+        if data_id is Some(id) then withdraw_derivation(c, id, k, made)
+    true
+
+/** A data type's `Display` or `Debug` that a field of it does not implement: the field's name, as a
+ * variant's when the type has several, and its type as written. */
+struct Underived
+    data: usize
+    trait_name: string
+    field: string
+    field_type: string
+
+// Holds every data type's automatic `Display` and `Debug` to its fields until none changes: a type
+// left without one may leave another, whose field it is, without it too. A type that holds itself
+// through its own fields, a list's tail, keeps the trait.
+private settle_automatic_derivations(c: *Checker)
+    var done: Buf[bool] = buf()
+    for _ in c.derivations do done.push(false)
+    var changed = true
+    while changed
+        changed = false
+        for i in 0..<c.derivations.len()
+            if done[i] || !c.derivations[i].automatic then continue
+            if check_derivation(c, c.derivations[i])
+                done.set(i, true)
+                changed = true
+
+// Leaves data type `id` without trait `k` and without `made`, the method its automatic derivation
+// declared: the conformance, the trait's positions of its method table and the method go.
+private withdraw_derivation(c: *Checker, id: usize, k: usize, made: Option[usize])
+    var traits: Buf[&Type] = buf()
+    for t in c.data[id].traits
+        if *t is Class(x, _, _)
+            if x == k then continue
+        traits.push(t)
+    c.data[id].traits = traits
+    var table = c.data[id].table
+    for j in 0..<c.classes[k].methods.len()
+        if c.classes[k].base + j < table.len() then table.set(c.classes[k].base + j, None)
+    c.data[id].table = table
+    var methods: Buf[usize] = buf()
+    var implementing: Buf[bool] = buf()
+    for j in 0..<c.data[id].methods.len()
+        if made is Some(m)
+            if c.data[id].methods[j] == m then continue
+        methods.push(c.data[id].methods[j])
+        implementing.push(c.data[id].implementing[j])
+    c.data[id].methods = methods
+    c.data[id].implementing = implementing
+    if made is Some(m)
+        var withdrawn = c.data[id].withdrawn
+        withdrawn.push(m)
+        c.data[id].withdrawn = withdrawn
+    var conditional: Buf[ConditionalConformance] = buf()
+    for x in c.conditional
+        if x.owner == data_owner(id) && x.trait_id == k then continue
+        conditional.push(x)
+    c.conditional = conditional
+
+/** Whether impl `decl`, of unit `unit`, is the one derivation `dv` made. */
+private made_for(unit: usize, decl: &ImplDecl, dv: Derivation) -> bool
+    if unit != dv.unit || decl.span.start != dv.span.start || decl.span.end != dv.span.end then return false
+    if decl.trait_name is Some(t)
+        if t.kind is Named(path, _) then return path == dv.trait_name
+    false
+
+// The reason a data type that has no `trait_name` lacks it, where it would have had it without asking
+// but for a field: appended to a diagnostic saying `t` does not implement the trait.
+private underived_reason(c: *Checker, t: &Type, trait_name: string) -> string
+    val id = *t match
+        Data(id, _, _) -> id
+        _ -> return ""
+    for u in c.underived
+        if u.data == id && u.trait_name == trait_name
+            return s"; `${c.data[id].name}` has no `$trait_name` because its field `${u.field}` has type `${u.field_type}`, which does not implement `$trait_name`"
+    ""
 
 // Holds type arguments written on a type to the bounds of its parameters: at once when every
 // conformance is known, and otherwise once it is.
@@ -3558,7 +3651,8 @@ private hold_to_bounds(c: *Checker, unit: usize, at: Span, what: string, owner: 
         for b in bounds_at(c, owner, params, i)
             val bound = substitute(b, owner, args)
             if !conforms_to_bound(c, args[i], bound)
-                c.note(unit, at, s"`${type_name(zonk(c, args[i]))}` does not conform to `${type_name(bound)}`, the bound of `${params[i].name}` in $what")
+                val arg = zonk(c, args[i])
+                c.note(unit, at, s"`${type_name(arg)}` does not conform to `${type_name(bound)}`, the bound of `${params[i].name}` in $what${underived_reason(c, arg, type_name(bound))}")
 
 /** Whether trait `k`'s methods, or those of a trait it requires, mention `Self` other than as the
  * receiver: such a trait is only a bound. */
@@ -5782,7 +5876,7 @@ private displayed(c: *Checker, h: &TExpr) -> Option[&TExpr]
             c.note(unit, h.span, "the core library declares no `Display`")
             return None
     if !conforms_to_bound(c, t, Class(display, "Display", buf()))
-        c.note(unit, h.span, s"`${type_name(t)}` does not implement `Display`, so it cannot be interpolated")
+        c.note(unit, h.span, s"`${type_name(t)}` does not implement `Display`, so it cannot be interpolated${underived_reason(c, t, "Display")}")
         return None
     val ms = methods_of(c, t, "toString")
     if ms.len() == 0

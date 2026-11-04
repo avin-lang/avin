@@ -148,6 +148,12 @@ private struct Lowering
     library: bool
     /** The span of the innermost expression being lowered, where a call made for it is placed. */
     here: Span
+    /** For each position of a method table, whether a call goes through it. A table holds a method
+     * only at a position some call uses, so a method reached only through tables is compiled only
+     * when called: a data type's `Display` costs nothing in a program that never shows it. */
+    used_slots: Buf[bool]
+    /** Whether a position has come into use since the tables were last filled. */
+    new_slots: bool
 
 /** One slot for a method with type parameters of its own, at one list of its own type arguments: a
  * call through a method table to `name` at checker position `position` with `type_args` reaches it.
@@ -174,15 +180,25 @@ lower_program(program: TProgram) -> MirProgram
         if k.table.len() > generic_base then generic_base = k.table.len()
     for d in program.data
         if d.table.len() > generic_base then generic_base = d.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0))
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false)
     // Record 0 is for the objects no type pattern names: closures, and the boxes of captured
     // variables.
     l.records.push(TypeRecord("a closure or a captured variable", buf(), None, None))
     l.record_types.push(Unit)
     // The core library's functions are compiled only as the program reaches them, so a program
     // carries none of the library it does not use, and builds no shim for a binding it never calls.
+    // A data type's implementation of a trait is compiled as it is called, directly or through a
+    // method table, and a method the checker withdrew, a derived `Display` a field of its type
+    // lacks, never is.
+    var implementing: Buf[bool] = buf()
+    for _ in program.symbols do implementing.push(false)
+    for d in program.data
+        for j in 0..<d.methods.len()
+            if d.implementing[j] then implementing.set(d.methods[j], true)
+        for m in d.withdrawn
+            implementing.set(m, true)
     for i in 0..<program.symbols.len()
-        if !is_generic(program, i) && !never_compiled(program, i) && !in_core_library(program, i) then instance(&l, i, buf())
+        if !is_generic(program, i) && !never_compiled(program, i) && !in_core_library(program, i) && !implementing[i] then instance(&l, i, buf())
     val entry: Option[usize] = program.entry match
         Some(id) -> Some(instance(&l, id, buf()))
         None -> None
@@ -198,6 +214,8 @@ lower_program(program: TProgram) -> MirProgram
         while k < l.instances.len()
             functions.push(lower_function(&l, k))
             k += 1
+        // A call through a position no call used before fills it in every table made so far.
+        if fill_used_slots(&l) then continue
         // A comparison of values of unknown type calls the entries of their type's record, so once
         // the program makes one, every record gets them; making them may lay out more types.
         if !l.runtime_equality || !add_equality_entries(&l) then break
@@ -318,11 +336,44 @@ private method_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
                 table.push(None)
                 continue
         val symbol = l.program.symbols[m]
-        if is_abstract_method(symbol) || symbol.decl.type_params.len() > 0 || missing[p]
+        if is_abstract_method(symbol) || symbol.decl.type_params.len() > 0 || missing[p] || !slot_used(l, p)
             table.push(None)
             continue
         table.push(Some(instance(l, m, implementation_args(l, t, m))))
     table
+
+private slot_used(l: *Lowering, position: usize) -> bool = position < l.used_slots.len() && l.used_slots[position]
+
+/** Records a call through `position` of a method table. */
+private use_slot(l: *Lowering, position: usize)
+    while l.used_slots.len() <= position
+        l.used_slots.push(false)
+    if l.used_slots[position] then return
+    l.used_slots.set(position, true)
+    l.new_slots = true
+
+// Fills the positions that came into use since the last time in the method tables already made, each
+// with its type's method there. Whether that made an instance to compile is the result.
+private fill_used_slots(l: *Lowering) -> bool
+    if !l.new_slots then return false
+    l.new_slots = false
+    val before = l.instances.len()
+    for i in 0..<l.descriptors.len()
+        val t = l.record_types[l.descriptors[i].record]
+        if !(*t is Data(_, _, _) || *t is Class(_, _, _)) then continue
+        val old = l.descriptors[i].methods
+        val table = method_table(l, t)
+        var methods: Buf[Option[usize]] = buf()
+        var changed = false
+        for p in 0..<old.len()
+            var entry = old[p]
+            if entry is None && p < table.len()
+                if table[p] is Some(_)
+                    entry = table[p]
+                    changed = true
+            methods.push(entry)
+        if changed then l.descriptors[i].methods = methods
+    l.instances.len() > before
 
 /** The lowering's view of conformances: of concrete types only, so with no type parameters in scope. */
 private lowering_conformances(l: *Lowering) -> Conformances =
@@ -858,6 +909,8 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
         for i in concrete_args.len() - own..<concrete_args.len()
             own_args.push(concrete_args[i])
         position = generic_slot(l, slot, symbol.decl.name, own_args)
+    else
+        use_slot(l, position)
     val code = fresh(l, MPtr)
     l.insts.push(MethodSlot(code, operands[0], position))
     val dest = result match
@@ -2185,6 +2238,7 @@ private dispatch_operands(l: *Lowering, position: usize, operands: Buf[Operand],
     var params: Buf[MirType] = buf()
     for o in operands
         params.push(operand_type(l, o))
+    use_slot(l, position)
     val code = fresh(l, MPtr)
     l.insts.push(MethodSlot(code, operands[0], position))
     val dest = result match
