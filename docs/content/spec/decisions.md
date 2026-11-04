@@ -93,6 +93,14 @@ a decision changes, this page and the chapter change together.
   state, or requiring one that does: an impl of it for a `data` type, a built-in type or a tuple is an
   error. A class declaring a field of a trait field's name, or conforming to two traits that declare
   fields of one name, is an error.
+- A trait may re-declare a method of a trait it requires without a body, marked `override`, with a
+  narrower result (settled, user, 2026-11-04): `trait SortedMap[K, +V]: Map[K, V]` re-declares
+  `override updated[W >: V](key: K, value: W) -> SortedMap[K, W]`, so a call through the sub-trait
+  yields the sub-trait. The re-declaration takes the same parameters, type parameters and lower
+  bounds and yields a result conforming to the overridden one, and shares its position in the method
+  table, so one implementation serves both traits and must yield the narrowest result. Re-declaring a
+  method that has a default makes it abstract again in the sub-trait: its implementers give their own.
+  [Declarations](/spec/declarations/#trait).
 - An `object` may extend an `open` or `abstract` class, constructed from the top down as a subclass
   is, overriding its methods and conforming to it; it implements every abstract member it inherits.
 - A trait's method, or an overridable class method, may have type parameters of its own and be

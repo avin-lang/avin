@@ -482,6 +482,17 @@ val n: Named = t
   the defaults of the method it overrides. Declaring a required trait's method
   again without `override` is an error. Two traits overriding one default differently are two
   implementations, which a class conforming to both overrides.
+- **A trait's override may have no body**, re-declaring the method with a narrower result:
+  `trait SortedMap[K, +V]: Map[K, V]` with `override updated[W >: V](key: K, value: W) ->
+  SortedMap[K, W]`, so `sorted.updated(k, v).first()` type-checks through the sub-trait. It takes
+  the overridden method's parameters, type parameters and lower bounds, and yields its result or,
+  where that is a class or trait, one conforming to it; its result is checked against the trait's
+  variance. It shares the overridden method's position, so a type conforming to the sub-trait has one
+  implementation, reached through either trait, and that implementation yields the narrowest
+  result. A re-declaration without a body of a method that has a default makes it abstract again:
+  the default is not inherited, and each implementer of the sub-trait gives its own (or a trait
+  further down gives a body again). A method a class inherits from its superclass implements the
+  re-declaration only if it yields the narrower result.
 - **A trait's method may have type parameters of its own**, as `map[B](f: (A) -> B) -> Iterable[B]`.
   Its implementations declare as many, matched by position. A call through the trait's type
   reaches the implementation of the object's class at the call's type arguments: the whole program
