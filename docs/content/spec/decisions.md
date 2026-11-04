@@ -1311,6 +1311,20 @@ Settled by the user on 2026-11-04:
     `threads.blocking(body)` and `threads.sleep(d)`. There is no `failed` or `filter`, since a future
     carries no failure. Bindings: none beyond a runtime timed wait for `sleep`. Not blocked.
   - **JSON** is a package of its own, not part of the system library.
+- [`avin.regex`](/spec/regex/): the pattern language and its matching follow the established
+  backtracking dialect exactly: leftmost-first alternation, greedy, reluctant and possessive
+  repetition, atomic groups, bounded lookbehind (a repetition without an upper bound in one is an
+  error), and the same rules for what a repeated group captures; `\d`, `\s`, `\w`, `\b` and the
+  POSIX classes are ASCII, and `i` folds only ASCII without `u`. Matching walks characters (scalar
+  values); every offset in the API is a byte offset, and a `PatternError`'s index counts the
+  pattern's characters. There is no null: `group(i)`, `group(name)`, `before(i)`, `after(i)` answer
+  `Option[string]`, `subgroups()` a `List[Option[string]]`, and `start(i)`/`end(i)` -1 for a group
+  that took no part. Members without arguments are methods (`"a+".r()`, `m.start()`). `Regex(p)`
+  traps on an invalid pattern with the error's message and `Regex.compile(p)` answers a
+  `Result[Regex, PatternError]`; a group number or name the match does not have traps. Properties
+  needing Unicode data beyond the general category (scripts, blocks, `Alphabetic`, `Uppercase`,
+  `Lowercase`, `Ideographic`, `Word`, emoji), the flags `U` and `c`, `\X`, `\b{g}` and `\N{…}` are
+  refused with an `Unsupported` error until the runtime holds that data.
 
 ## Open
 
