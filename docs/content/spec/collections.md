@@ -174,7 +174,18 @@ for (word, n) in counts do print(s"$word $n")
 `m(k)` reads a value and traps when the key is absent; `m.get(k)` returns an `Option`, and
 `m.getOrElse(k, d)` evaluates `d` only when the key is absent. A set is a function from elements to
 `bool`: `s(x)` is `true` when `x` is an element of `s` and `false` otherwise, `s.contains(x)`. Sets have `union`, `intersect`, `diff` and `subsetOf`, which read
-well infix: `odds union evens`.
+well infix: `odds union evens`. Their symbol forms take any collection: `s ++ xs` is `s` with every
+element of `xs` in it and `s -- xs` is `s` without them, an element of `xs` that `s` lacks being
+ignored. The `+` and `-` spellings belong to `Add` and `Sub`, so a single element goes in with
+`s.added(x)` and out with `s.removed(x)`.
+
+An immutable map has the same two forms: `m ++ pairs` takes any collection of `(key, value)` pairs,
+the last pair for a key winning, and `m -- keys` takes any collection of keys. `m.keys()` and
+`m.values()` are vectors in the map's iteration order, the value at each index belonging to the key at
+the same index, and `m.keySet()` is the set of the keys; `keysIterator()` and `valuesIterator()` visit
+them lazily instead. `m.filterKeys(p)` keeps the entries whose key passes, `m.transform((k, v) -> w)`
+binds each key to a value made from both, and `m.updatedWith(k, f)` calls `f` with `m.get(k)` and
+binds `k` to the `Some` it answers or leaves it unbound for `None`, so it adds, replaces or removes.
 
 `avin.collections.mutable` holds `Map[K, V]` and `Set[A]`, invariant, updated in place:
 `m(k) = v` binds a key, `m(k) += 1` updates its value, and `remove` answers the value removed as an
@@ -187,6 +198,14 @@ import avin.collections.mutable.{Map as MutableMap}
 val seen = MutableMap[string, int]()
 seen("a") = 1
 ```
+
+A mutable set or map changes through its compound-assignment methods, which need no `var`: `s += x`,
+`s -= x`, `s ++= xs`, `s --= xs`, and for a map `m += (k, v)`, `m -= k`, `m ++= pairs`, `m --= keys`;
+removing what is absent is not an error. `retain(p)` removes what fails `p`, and a map's
+`updateWith(k, f)` does what `updatedWith` does, in place, answering the new binding. The methods
+that build a collection — `map`, `flatMap`, `filter`, `mapValues`, `transform`, `filterKeys` and a
+set's `union`, `intersect` and `diff` — answer a new mutable one; a mutable map's `keys()` and
+`values()` are vector snapshots and its `keySet()` an immutable set.
 
 Iteration visits a map's entries as `(key, value)` pairs in an order the program cannot rely on. For
 the immutable collections it depends only on the keys' hashes, so equal maps iterate alike; for the

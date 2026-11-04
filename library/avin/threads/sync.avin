@@ -1,0 +1,137 @@
+module avin.threads
+
+// Mutual exclusion, conditions to wait for, and initialization run once. Each waits for another thread
+// in the runtime, safe for the collector while it sleeps, so a thread blocked here never holds up a
+// collection.
+
+// A new lock, free: an opaque object on the collected heap that a thread sleeps on while another
+// holds it.
+@intrinsic("lock_new")
+private lockNew() -> Any
+
+// Takes `lock`, sleeping safe for the collector until no other thread holds it.
+@intrinsic("lock_acquire")
+private lockAcquire(lock: Any)
+
+// Lets `lock` go, which the calling thread holds.
+@intrinsic("lock_release")
+private lockRelease(lock: Any)
+
+// A new condition, with no thread waiting on it.
+@intrinsic("condition_new")
+private conditionNew() -> Any
+
+// Lets `lock` go, sleeps safe for the collector until `condition` is notified, and takes `lock`
+// again. A wait may also end with no notification.
+@intrinsic("condition_wait")
+private conditionWait(condition: Any, lock: Any)
+
+@intrinsic("condition_notify")
+private conditionNotify(condition: Any)
+
+@intrinsic("condition_notify_all")
+private conditionNotifyAll(condition: Any)
+
+// A lock and the thread holding it. Only the holder writes its own identity to `holder` and only the
+// holder clears it, so a thread that reads its own identity there holds the lock, whatever other
+// threads are writing: taking the lock a second time is found before it waits for ever.
+private class Lock()
+    private val handle = lockNew()
+    private var holder: long = 0
+
+    // Takes the lock, waiting for any other thread holding it; traps where this thread holds it.
+    acquire()
+        val me = current()
+        if holder == me then fail("a thread takes a lock it already holds, which would wait for ever")
+        lockAcquire(handle)
+        holder = me
+
+    release()
+        holder = 0
+        lockRelease(handle)
+
+    // Lets the lock go while waiting for `condition`, and holds it again after; traps where this
+    // thread does not hold it.
+    await(condition: Any)
+        val me = current()
+        if holder != me then fail("a condition is waited for by the thread that holds its mutex")
+        holder = 0
+        conditionWait(condition, handle)
+        holder = me
+
+// A value only one thread reaches at a time. `with` is the way to it: it takes the lock, runs its body
+// with the value, and lets the lock go when the body returns. A body that changes a mutable value,
+// such as a buffer, changes the one the mutex holds; for an immutable value, `update` replaces it and
+// `get` reads it. A thread that takes a mutex it already holds, from inside a body, traps instead of
+// waiting for ever.
+class Mutex[T](private var value: T)
+    private val lock = Lock()
+
+    // Runs `body` with the value while holding the lock, and gives back what it returns.
+    with[R](body: (T) -> R) -> R
+        lock.acquire()
+        val result = body(value)
+        lock.release()
+        result
+
+    // The value, read under the lock.
+    get() -> T
+        lock.acquire()
+        val v = value
+        lock.release()
+        v
+
+    // Replaces the value under the lock.
+    set(v: T)
+        lock.acquire()
+        value = v
+        lock.release()
+
+    // Replaces the value with `f` of it, holding the lock throughout, and gives back the new value.
+    update(f: (T) -> T) -> T
+        lock.acquire()
+        val v = f(value)
+        value = v
+        lock.release()
+        v
+
+    // A new condition to wait for with this mutex held.
+    condition() -> Condition = Condition(lock)
+
+// A place for threads to wait, inside their mutex's `with`, until another says something has changed.
+// `wait` lets the mutex go while it sleeps and holds it again before it returns, so the state it
+// guards is checked again in a loop: a wait may also end with nothing having changed.
+//
+//     while queue.isEmpty() do ready.wait()
+//
+// A condition is made by its mutex's `condition()` and waited for with that mutex only; waiting from a
+// thread that does not hold it traps.
+class Condition(private val lock: Lock)
+    private val handle = conditionNew()
+
+    // Lets the mutex go, sleeps until notified, and holds the mutex again.
+    wait() = lock.await(handle)
+
+    // Wakes one thread waiting, if any is.
+    notify() = conditionNotify(handle)
+
+    // Wakes every thread waiting.
+    notifyAll() = conditionNotifyAll(handle)
+
+// Initialization run exactly once, whichever threads ask for it and however many at once: the first
+// call of `run` runs its body, every other waits until that body has returned and then returns
+// without running its own. A body that runs the same `Once` again traps.
+class Once()
+    private val lock = Lock()
+    private val done = Atomic(false)
+
+    run(body: () -> unit)
+        if done.load() then return
+        lock.acquire()
+        if !done.load()
+            body()
+            done.store(true)
+        lock.release()
+
+    // Whether a body has run to the end.
+    isDone() -> bool = done.load()

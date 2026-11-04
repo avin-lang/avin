@@ -515,8 +515,8 @@ safe, collects, lowers the flag and wakes the others. A thread becomes safe in t
   thread that has to wait for it waits safe, since the holder may be collecting. Allocation is
   therefore a safepoint.
 - **Around a blocking call.** `avin_rt_enter_safe` and `avin_rt_leave_safe` bracket an operation
-  that may wait (a lock, a channel, a join, reading input), so a blocked thread never holds up a
-  collection; leaving waits for a collection in progress to finish.
+  that may wait (a lock, a condition, a channel, a join, reading input), so a blocked thread never
+  holds up a collection; leaving waits for a collection in progress to finish.
 
 The handshake is a pair of sequentially consistent stores and loads, the flag by the collector and
 a context's state by its thread, so either the thread sees the flag and wakes the collector, or the
@@ -541,7 +541,36 @@ reference can reach anything else: a data value or tuple after its fields, a clo
 captures, a box after its value, a value boxed as `Any` after the value, and a class's object at the
 end of its constructor, after the class body has run. A constant object needs none. On arm64 the
 fence is one `dmb ish`; on x86-64 it is no instruction at all, only an order the compiler keeps.
-Arrays and strings are made by the runtime, so the fence for them is the runtime's to make.
+Arrays and strings are made by the runtime, which makes the fence for them through `published`: a
+string after its bytes are written, `avin_rt_new_array` after the array's length and zero bytes, and
+a slice after its elements are copied, as are the runtime's lock and condition objects. A string
+writer's storage is never handed out, so filling it needs none. The elements the library stores into
+a new array after `avin_rt_new_array` returns are ordered only by the next fence its thread makes: a
+`Vector`'s constructor makes one after its array is filled, and `Array.fill` and `Array.tabulate`
+make none of their own.
+
+**Atomics.** `avin.threads.Atomic[T]` holds its value as its first field and declares `load`,
+`store`, `swap` and `compareAndSet` as the intrinsics `atomic_load`, `atomic_store`, `atomic_swap`
+and `atomic_compare_set`, which only that class may declare. Lowering makes each one MIR instruction
+on the field's address at the instance's type, and the emitter makes it one `seq_cst` LLVM atomic at
+the value's storage width: `load atomic`, `store atomic`, `atomicrmw xchg` and `cmpxchg`, whose
+success bit is the result. A `bool` or a narrow integer is widened as a shared field is, a `real` is
+accessed as the 64 bits of its encoding, and a reference as a `ptr`, so a compare-and-set compares
+identity. An integer wider than 64 bits has no single atomic access, so each operation on one is the
+field's word-at-a-time accesses between `avin_rt_wide_atomic_begin` and `avin_rt_wide_atomic_end`,
+which take and give back one spin lock every such operation shares. `add`, `sub` and `update` are
+library code, a loop of `load` and `compareAndSet`, so an integer that would overflow traps before
+anything is stored.
+
+**Locks and conditions.** The synchronization library reaches seven intrinsics, each a runtime
+entry: `lock_new`, `lock_acquire`, `lock_release`, `condition_new`, `condition_wait`,
+`condition_notify` and `condition_notify_all`. A lock is an object on the collected heap holding a
+Sysl `SleepLock`, the three-state futex lock, and a condition one holding a `Condvar`; neither holds
+a reference, and the collector never moves either, so a thread sleeps on a word inside it. Taking a
+free lock is one compare-and-swap; a thread that has to wait, and every condition wait, links a frame
+holding the objects it waits on onto its stack, waits safe, and unlinks the frame once it is running
+again, so what it sleeps on stays alive whatever the program still holds. A condition wait lets the
+lock go and takes it again inside the safe region.
 
 **Starting a thread.** `avin.threads` reaches three intrinsics. `thread_start` calls
 `avin_rt_thread_start` with a closure taking nothing and returning nothing, which stores the body's

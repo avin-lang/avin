@@ -1027,6 +1027,7 @@ private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr],
             val array = concrete(l, if name == "array_new" then e.ty else args[0].ty)
             return array_operation(l, name, array, operands, e.span)
         if name.starts_with("string_") then return intrinsic_operation(l, name, operands, e.span)
+        if name.starts_with("atomic_") then return atomic_operation(l, name, concrete(l, args[0].ty), operands)
     // A local function also receives what it captures, from where the caller keeps it.
     for x in callee.captured_locals
         if l.local_slots[x] is Some(p) then operands.push(p.address)
@@ -1429,6 +1430,12 @@ private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
         val array = concrete(l, if name == "array_new" then symbol.result.unwrap_or(Unit) else symbol.params[0])
         finish(l, Return(array_operation(l, name, array, elements, symbol.decl.name_span)))
         return
+    if name.starts_with("atomic_")
+        var operands: Buf[Operand] = buf()
+        for i in 0..<symbol.params.len()
+            if l.param_values[i] is Some(v) then operands.push(Value(v))
+        finish(l, Return(atomic_operation(l, name, concrete(l, symbol.params[0]), operands)))
+        return
     // Every other intrinsic calls one runtime entry point.
     val found = intrinsic_entry(name) match
         Some(f) -> f
@@ -1540,6 +1547,26 @@ private array_operation(l: *Lowering, name: string, array: &Type, args: Buf[Oper
         return None
     val value = fresh(l, t)
     l.insts.push(Load(value, Value(address)))
+    Some(Value(value))
+
+// The operations of `avin.threads.Atomic`, on the value its object holds as its first field: the
+// receiver is the first operand, and a value to store or compare follows it. A value with no runtime
+// representation is never stored, so every compare-and-set of one succeeds.
+private atomic_operation(l: *Lowering, name: string, atomic: &Type, args: Buf[Operand]) -> Option[Operand]
+    val field = layout(l, atomic).variants[0].fields[0] match
+        Some(f) -> f
+        None -> return if name == "atomic_compare_set" then Some(ConstBool(true)) else None
+    val address = field_address(l, args[0], field)
+    if name == "atomic_store"
+        l.insts.push(AtomicStore(address, args[1]))
+        return None
+    if name == "atomic_compare_set"
+        val done = fresh(l, MBool)
+        l.insts.push(AtomicCompareSet(done, address, args[1], args[2]))
+        return Some(Value(done))
+    val value = fresh(l, field.ty)
+    if name == "atomic_swap" then l.insts.push(AtomicSwap(value, address, args[1]))
+    else l.insts.push(AtomicLoad(value, address))
     Some(Value(value))
 
 /** The length in bytes of the string `s`, as an `int`. */
