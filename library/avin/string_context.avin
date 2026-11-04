@@ -1,0 +1,98 @@
+module avin
+
+// An interpolated string is a method call on a `StringContext`. `p"text $a and ${b + 1}"` is
+// `StringContext(["text ", " and ", ""]).p(a, b + 1)`: the literal pieces between the holes become
+// the context's parts, as written, with their escapes not yet decoded, and the holes become the
+// method's arguments. There is always one more part than there are holes. `s` and `raw` are the
+// core library's interpolators; a program adds its own with a trait and an `impl` of it for
+// `StringContext`.
+data StringContext(parts: Vector[string])
+
+impl StringContext
+    // The parts with their escapes decoded and each argument's `Display` form between them. The
+    // compiler writes an `s"…"` literal out directly, to the same text.
+    s(args: Display*) -> string = joined(args, true)
+
+    // The parts exactly as written, escapes and all, with each argument's `Display` form between
+    // them.
+    raw(args: Display*) -> string = joined(args, false)
+
+    // The parts, decoded when `decode`, alternating with the arguments. A context given a number of
+    // arguments other than one fewer than its parts traps.
+    private joined(args: Vector[Display], decode: bool) -> string
+        if args.length() != parts.length() - 1 then fail(s"an interpolator was given ${args.length()} arguments for ${parts.length()} parts")
+        val out = StringWriter()
+        for i in 0..<parts.length()
+            if i > 0 then args(i - 1).display(out, FormatSpec())
+            if decode then writeDecoded(out, parts(i)) else out.write(parts(i))
+        out.text()
+
+// Writes `part` with its escapes decoded, as a string literal's are: `\n`, `\t`, `\r`, `\0`, `\a`,
+// `\b`, `\f`, `\v`, `\e`, a backslash before `\`, `"`, `'`, `` ` `` or `/` for that character,
+// `\xHH`, `\uHHHH` (a surrogate pair as two of them), `\u{H…}` and `\UHHHHHHHH`. Anything else after
+// a backslash traps, as it is no escape.
+private writeDecoded(out: Writer, part: string)
+    val n = part.byteLength()
+    var from = 0
+    var at = 0
+    while at < n
+        if part.byteAt(at) != byte(0x5c)
+            at += 1
+            continue
+        out.write(part.slice(from, at))
+        if at + 1 >= n then fail("a backslash ends the text, escaping nothing")
+        val letter = part.charAt(at + 1)
+        at += 2
+        letter match
+            'n' -> out.writeChar('\n')
+            't' -> out.writeChar('\t')
+            'r' -> out.writeChar('\r')
+            '0' -> out.writeChar(char(0))
+            'a' -> out.writeChar(char(7))
+            'b' -> out.writeChar(char(8))
+            'f' -> out.writeChar(char(12))
+            'v' -> out.writeChar(char(11))
+            'e' -> out.writeChar(char(27))
+            '\\' | '"' | '\'' | '`' | '/' -> out.writeChar(letter)
+            'x' ->
+                out.writeChar(char(hexDigits(part, at, 2)))
+                at += 2
+            'U' ->
+                out.writeChar(char(hexDigits(part, at, 8)))
+                at += 8
+            'u' ->
+                if at < n && part.byteAt(at) == byte(0x7b)
+                    val close = part.indexOf("}", at) match
+                        Some(k) -> k
+                        None -> fail("`\\u{` is not closed")
+                    if close == at + 1 || close > at + 7 then fail("`\\u{…}` takes one to six hexadecimal digits")
+                    out.writeChar(char(hexDigits(part, at + 1, close - at - 1)))
+                    at = close + 1
+                else
+                    val high = hexDigits(part, at, 4)
+                    at += 4
+                    if high >= 0xd800 && high <= 0xdbff
+                        if !part.startsWith("\\u", at) then fail("a high surrogate escape needs a low one after it")
+                        val low = hexDigits(part, at + 2, 4)
+                        if low < 0xdc00 || low > 0xdfff then fail("a high surrogate escape needs a low one after it")
+                        out.writeChar(char(0x10000 + ((high - 0xd800) << 10) + (low - 0xdc00)))
+                        at += 6
+                    else out.writeChar(char(high))
+            _ -> fail(s"`\\$letter` is not an escape")
+        from = at
+    out.write(part.slice(from, n))
+
+// The value of the `count` hexadecimal digits at byte offset `at`, which traps when any is missing or
+// is not a hexadecimal digit.
+private hexDigits(text: string, at: int, count: int) -> int
+    if at + count > text.byteLength() then fail(s"an escape needs $count hexadecimal digits")
+    var value = 0
+    for i in at..<at + count
+        val b = int(text.byteAt(i))
+        val digit =
+            if b >= 0x30 && b <= 0x39 then b - 0x30
+            elif b >= 0x61 && b <= 0x66 then b - 0x61 + 10
+            elif b >= 0x41 && b <= 0x46 then b - 0x41 + 10
+            else fail(s"an escape needs $count hexadecimal digits")
+        value = value * 16 + digit
+    value
