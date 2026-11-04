@@ -269,7 +269,9 @@ A local function's name is its block's: a `val`, a `var` or a pattern binding of
 the same block is an error, whether it is written before or after the function, because the
 function is visible across the whole block. A block nested inside, a lambda's body and the enclosing
 function's parameters are other scopes, and a local there may hide the function as any local hides
-an outer name. The block's own local functions of one name are overloads of each other.
+an outer name; likewise a local function declared in a nested block or a lambda's body hides an
+enclosing value, parameter or local function of its name there, so the innermost declaration wins
+whichever kind each is. The block's own local functions of one name are overloads of each other.
 
 A local function may declare type parameters of its own, with bounds, exactly as a top-level
 function does. Its calls write its type arguments or leave them to be inferred, and used as a value
