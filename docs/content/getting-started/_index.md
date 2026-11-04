@@ -72,6 +72,26 @@ A program is a source file or a directory: `avin run my-program` builds every `.
 file under `my-program/`. `build`, `run` and `test` all take `-O0` or `-O2`, and build at `-O2` by
 default.
 
+`run` is the default command and the current directory the default program, so inside a package
+(or a directory of `.avin` files) these are all the same:
+
+```sh
+avin
+avin run
+avin run .
+```
+
+`avin hello.avin -O0 -- first second` is `avin run hello.avin -O0 -- first second`: a first argument
+that is not a command name is the program to run. Options with no program before them, as in
+`avin -O0` or `avin -- first`, are for the current directory's program. `parse`, `check`, `build`,
+`emit-llvm`, `run` and `test` likewise take the current directory when no program is named (`avin
+build`, `avin check`, `avin test`); `tangle` and `weave` always name their file. A directory with no
+`avin.hocon` above it and no `.avin` or `.lavin` files is not a program, and `avin` there says so.
+
+A command name is always the command. A file or directory named like one is reached by a path that
+is not the bare word: `avin ./test`, or `avin run test`. A first argument that is neither a command
+nor an existing path is refused with the list of commands.
+
 ## Literate programs
 
 A `.lavin` file is a Markdown document whose lines indented four columns are the program
@@ -125,6 +145,10 @@ own, so a test that traps stops only itself:
 ./compiler/avin test my-program
 ./compiler/avin test my-program "low bound"
 ```
+
+With no program named, `avin test` tests the current directory. Its first argument is the program
+when it names an existing file or directory, and the filter otherwise: `avin test "low bound"` filters
+the current directory's tests, and `avin test . low` filters when a path called `low` also exists.
 
 ```text
 running 2 tests
