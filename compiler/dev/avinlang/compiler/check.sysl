@@ -345,6 +345,9 @@ struct Checker
     builtins: Buf[BuiltinConformance]
     /** The core library's operator and equality traits, found once every method is declared. */
     core: CoreTraits
+    /** The derived traits whose methods read the fields through the trait: each field's type must
+     * implement it. */
+    derivations: Buf[Derivation]
     /** The methods impls add to classes, which are not variance positions in a class whose fields
      * are all immutable. */
     impl_methods: Buf[usize]
@@ -481,9 +484,12 @@ private check_imports(c: *Checker, unit: usize)
  * unit is one of its files. Every file sees its own module's declarations, the names it imports and
  * the core library's public declarations, in that order: an inner name hides an outer one. */
 check_program(units: Buf[SourceUnit], root_module: string) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf())
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
+    // `derives` is written out as the methods and impls it stands for before anything is declared.
+    for u in 0..<c.units.len()
+        derive_unit(&c, u)
     // Every type is named before any is used, so a data type may refer to itself or to one
     // declared after it, and functions are declared once every type is known. A class is named
     // before any object, so an object finds its companion in any file of the module.
@@ -520,6 +526,8 @@ check_program(units: Buf[SourceUnit], root_module: string) -> Checked
         hold_to_bounds(&c, p.unit, p.at, p.what, p.owner, p.params, p.args, 0)
         c.generic = outer_generic
     c.pending = buf()
+    for dv in c.derivations
+        check_derivation(&c, dv)
     for u in 0..<c.units.len()
         declare_globals(&c, u)
     for u in 0..<c.units.len()
@@ -691,8 +699,6 @@ private declare_types(c: *Checker, unit: usize)
             if file.private_items[i] then c.private_names.put(key, true)
             for a in d.annotations
                 c.note(unit, a.span, s"unknown annotation `@${a.name}`")
-            for t in d.derives
-                c.note(unit, t.span, "`derives` is not implemented")
             c.types.put(key, c.data.len())
             c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf(), buf(), buf(), buf(), buf()))
     for i in 0..<file.items.len()
@@ -857,15 +863,12 @@ private buf1u(x: usize) -> Buf[usize]
 // An impl with bounds of its own makes a data type conform to a trait that is only a bound, as `Eq`,
 // `Ord` or `Add` are, for the type arguments that meet them. Such a conformance is decided where a
 // bound is checked; a trait that is also a type would need it decided at conversions and type
-// patterns too, which is not implemented, and neither is a class's. An impl that only adds methods,
-// with bounds every type meets (`Eq`, `Hash`), holds for every type argument, so its methods may
-// compare and hash the type's elements.
+// patterns too, which is not implemented, and neither is a class's.
 private conditional_impl_refused(c: *Checker, unit: usize, d: &ImplDecl, target: &Type, trait_type: Option[&Type]) -> bool
     val at = d.type_params[0].span
     val t = trait_type match
         Some(t) -> t
         None ->
-            if only_universal_bounds(d) then return false
             c.note(unit, at, "an impl that adds methods for some type arguments only is not implemented; bound the type's own parameters")
             return true
     if !(*target is Data(_, _, _))
@@ -888,16 +891,6 @@ private conditional_impl_refused(c: *Checker, unit: usize, d: &ImplDecl, target:
             c.note(unit, at, s"an impl with bounds of its own is implemented for traits that are only bounds, which mention `Self`; `${type_name(t)}` is also a type")
             return true
     false
-
-/** Whether every bound of the impl's type parameters is `Eq` or `Hash`, which every type meets. */
-private only_universal_bounds(d: &ImplDecl) -> bool
-    for tp in d.type_params
-        for b in tp.bounds
-            val name = b.kind match
-                Named(path, _) -> path
-                _ -> ""
-            if name != "Eq" && name != "Hash" then return false
-    true
 
 /** The traits built-in type `t` conforms to through its impls. */
 private builtin_traits(c: *Checker, t: &Type) -> Buf[&Type]
@@ -1013,8 +1006,6 @@ private declare_fields(c: *Checker, unit: usize)
         val d = k.decl
         for a in d.annotations
             c.note(unit, a.span, s"unknown annotation `@${a.name}`")
-        for t in d.derives
-            c.note(unit, t.span, "`derives` is not implemented")
         val declares_trait = is_trait(c, id)
         if declares_trait
             for m in d.members
@@ -3259,6 +3250,57 @@ private conditions_hold(c: *Checker, t: &Type, k: usize) -> bool
         if holds then return true
     !reached
 
+// Holds each field of a type deriving a trait to the trait, which the derived method calls on it: a
+// class's constructor parameters, a data type's variants' fields, seen with the bounds the type's
+// parameters have there. A field that falls short is reported by name, and the derived method is
+// then left unchecked, since each of its failures would be that one again.
+private check_derivation(c: *Checker, dv: Derivation)
+    val k = c.class_types.get(qualified(CoreModule, dv.trait_name)) match
+        Some(k) -> k
+        None -> return
+    val bound = own_class_type(c.classes[k], k)
+    val key = qualified(c.units[dv.unit].file.module_name, dv.type_name)
+    var names: Buf[string] = buf()
+    var types: Buf[&Type] = buf()
+    var scope: Option[GenericScope] = None
+    if dv.data
+        val id = c.types.get(key) match
+            Some(id) -> id
+            None -> return
+        for block in c.impls
+            if block.unit == dv.unit && block.decl.span.start == dv.span.start && block.decl.span.end == dv.span.end
+                scope = Some(GenericScope(data_owner(id), block.decl.type_params))
+        if scope is None then return
+        val d = c.data[id]
+        for v in d.variants
+            for i in 0..<v.fields.len()
+                names.push(if d.variants.len() == 1 then v.field_names[i] else s"${v.name}.${v.field_names[i]}")
+                types.push(v.fields[i])
+    else
+        val id = c.class_types.get(key) match
+            Some(id) -> id
+            None -> return
+        scope = Some(GenericScope(class_owner(id), c.classes[id].decl.type_params))
+        for f in c.classes[id].fields
+            if f.param && f.owner == id && f.ty is Some(t)
+                names.push(f.name)
+                types.push(t)
+    val outer_generic = c.generic
+    c.generic = scope
+    var failed = false
+    for i in 0..<types.len()
+        if conforms_to_bound(c, types[i], bound) then continue
+        failed = true
+        val shown = type_name(zonk(c, types[i]))
+        val hint = if *types[i] is TypeVar(_, _, _) then s"; bound the parameter, as in `[$shown: ${dv.trait_name}]`" else ""
+        c.note(dv.unit, dv.span, s"`${dv.type_name}` cannot derive `${dv.trait_name}`: its field `${names[i]}` has type `$shown`, which does not implement `${dv.trait_name}`$hint")
+    c.generic = outer_generic
+    if !failed then return
+    for id in 0..<c.symbols.len()
+        val decl = c.symbols[id].decl
+        if c.symbols[id].unit == dv.unit && decl.name_span.start == dv.span.start && decl.name_span.end == dv.span.end
+            c.states.set(id, 2)
+
 // Holds type arguments written on a type to the bounds of its parameters: at once when every
 // conformance is known, and otherwise once it is.
 private check_type_args(c: *Checker, unit: usize, at: Span, what: string, owner: usize, params: Buf[TypeParam], args: Buf[&Type])
@@ -4009,7 +4051,6 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Assign(target, op, value, yields, op_span) -> assign_expr(c, e, target, op, value, yields, op_span)
     MultiAssign(targets, op, value, op_span) -> multi_assign_expr(c, e, targets, op, value, op_span)
     Tuple(items) -> tuple_expr(c, e, items, expected)
-    ListLit(items) -> sequence_literal(c, e, items, expected)
     TupleIndex(target, index) -> tuple_index(c, e, target, index)
     Update(target, increment, postfix, op_span) -> update_expr(c, e, target, increment, postfix, op_span)
     Binary(op, left, right, op_span) -> binary_expr(c, e, op, left, right, op_span, expected)
@@ -4021,6 +4062,8 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     DoWhile(body, condition, otherwise) -> check_form(c, do_while_form(e, body, condition, otherwise), expected, used)
     For(pattern, source, body) -> for_expr(c, e, pattern, source, body)
     Range(lower, upper, inclusive) -> range_expr(c, e, lower, upper, inclusive)
+    Cons(head, tail, op_span) -> cons_expr(c, e, head, tail, op_span, expected)
+    ListLit(items) -> sequence_literal(c, e, items, expected)
     Break(value) -> break_expr(c, e, value)
     Continue -> continue_expr(c, e)
     Return(value) -> return_expr(c, e, value)
@@ -4898,7 +4941,8 @@ private held_element(e: &Expr, callee: &Expr, args: Buf[Argument], items: *Buf[&
         held.push(Argument(args[i].span, args[i].name, Expr(args[i].span, Name(name))))
     HeldElement(Expr(callee.span, Name(seq)), held)
 
-// A sequence literal `[a, b, c]` is built with a builder: the collection the expected type names
+// A sequence literal `[a, b, c]` is built with a builder, except where a `List` is expected (see
+// `list_literal`): the collection the expected type names
 // supplies one when its companion object has a `builder` method, and otherwise the literal is the
 // core library's `Vector`, whatever a `Vector` of the program's own is called. The builder is held in
 // a hidden local, given each element in order with `add`, and its `result()` is the literal's value.
@@ -4910,6 +4954,9 @@ private sequence_literal(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Opt
     val at = e.span
     var want: Option[&Type] = None
     if expected is Some(t) then want = Some(zonk(c, t))
+    // A `List` is a data type, built from the back with `::`, which needs no builder.
+    if want is Some(t)
+        if is_list_type(c, t) then return list_literal(c, e, items, expected)
     var collection: Option[usize] = None
     if want is Some(t)
         if *t is Class(k, _, _)
@@ -4948,7 +4995,11 @@ private sequence_literal(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Opt
     if adds.len() == 0
         c.note(unit, at, s"${type_name(builder.ty)} has no `add` method to take the literal's elements")
         return TExpr(at, ErrorType, UnitConst)
-    val element = zonk(c, method_signature(c, receiver, adds[0], ErrorType).params[0])
+    val adding = method_signature(c, receiver, adds[0], ErrorType)
+    if adding.params.len() != 1 || adding.known.len() != adding.type_params.len()
+        c.note(unit, at, s"the `add` method of ${type_name(builder.ty)} does not take one element, so it cannot build a literal")
+        return TExpr(at, ErrorType, UnitConst)
+    val element = zonk(c, substitute(adding.params[0], adding.owner, adding.known))
     if *element is Var(_)
         // No element type is expected, so the elements decide it.
         var typed: Buf[&TExpr] = buf()
@@ -5277,8 +5328,10 @@ private has_operator_traits(t: &Type) -> bool = *t match
 private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[CompareOp]) -> &TExpr
     var early: Buf[Option[&TExpr]] = buf()
     var anchor: Option[&Type] = None
+    // A number or collection literal takes its type from another operand: `xs == [1, 2]` builds the
+    // collection `xs` is.
     for o in operands
-        if is_literal(o) then early.push(None)
+        if is_literal(o) || o.kind is ListLit(_) then early.push(None)
         else
             val t = check_expr(c, o, None)
             if anchor is None && settled(t.ty) then anchor = Some(t.ty)
@@ -5732,6 +5785,43 @@ private hold(c: *Checker, at: Span, name: string, ty: &Type, value: &TExpr, lets
 private is_range_type(c: *Checker, t: &Type) -> bool = *t match
     Class(k, _, _) -> c.classes[k].module_name == CoreModule && c.classes[k].name == "Range" && !c.classes[k].decl.object
     _ -> false
+
+/** The core library's `List` variant `name`: `Cons`, a head and a tail, or `Nil`, the empty list. */
+private list_variant(c: *Checker, name: string) -> Option[VariantRef]
+    val d = core_data(c, "List")?
+    Some(VariantRef(d, variant_index(c, d, name)))
+
+/** Whether `t` is an instance of the core library's `List`. */
+private is_list_type(c: *Checker, t: &Type) -> bool = *t match
+    Data(d, _, _) -> c.data[d].module_name == CoreModule && c.data[d].name == "List"
+    _ -> false
+
+// `head :: tail` is the core library's `Cons(head, tail)`, whatever `Cons` names where it is written,
+// so the element type is inferred as a call of the variant infers it: from the expected type and from
+// both operands, a `List` of their common type.
+private cons_expr(c: *Checker, e: &Expr, head: &Expr, tail: &Expr, op_span: Span, expected: Option[&Type]) -> &TExpr
+    val v = list_variant(c, "Cons") match
+        Some(v) -> v
+        None -> return unsupported(c, e, "`::`")
+    var args: Buf[Argument] = buf()
+    args.push(Argument(head.span, None, head))
+    args.push(Argument(tail.span, None, tail))
+    construct(c, e.span, op_span, v, args, None, expected)
+
+// A sequence literal where a `List` is expected builds that list, element by element from the front:
+// `[a, b]` is `a :: b :: []`, and `[]` is the empty list.
+private list_literal(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Option[&Type]) -> &TExpr
+    if items.len() == 0
+        val nil = list_variant(c, "Nil").unwrap()
+        return construct(c, e.span, e.span, nil, buf(), None, expected)
+    var rest: Buf[&Expr] = buf()
+    for i in 1..<items.len()
+        rest.push(items[i])
+    val tail = Expr(Span(if rest.len() > 0 then rest[0].span.start else e.span.end, e.span.end), ListLit(rest))
+    var args: Buf[Argument] = buf()
+    args.push(Argument(items[0].span, None, items[0]))
+    args.push(Argument(tail.span, None, tail))
+    construct(c, e.span, items[0].span, list_variant(c, "Cons").unwrap(), args, None, expected)
 
 /** The `iterator` methods a value of type `t` has: those of its class, of its bounds for a type
  * parameter, or of its impls. */
@@ -6333,14 +6423,18 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
             for a in args
                 check_statement(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
-    // A value of a type parameter has the methods of its bounds, and no others.
+    // A value of a type parameter has the methods of its bounds, and no others but the `equals` and
+    // `hash` every value has.
     if *zonk(c, object.ty) is TypeVar(_, _, _)
         val ty = zonk(c, object.ty)
         val ms = bound_methods(c, ty, name)
         if ms.len() > 0
             if infix && !takes_one_argument(c, ms) then return infix_arity_error(c, at, name_span, target, name, ms, args)
             return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
-        if bound_field(c, ty, name) is None && bound_class_field(c, ty, name) is None
+        val universal = c.core.method_named(name) match
+            Some(m) -> is_universal(c, m)
+            None -> false
+        if !universal && bound_field(c, ty, name) is None && bound_class_field(c, ty, name) is None
             no_bound_member(c, name_span, ty, name)
             for a in args
                 check_statement(c, a.value)
@@ -6357,7 +6451,7 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
         return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
     // Every value has `Eq`'s `equals` and `Hash`'s `hash`, its own or by value or identity.
     if c.core.method_named(name) is Some(m)
-        if is_universal(c, m) && !(*zonk(c, object.ty) is ErrorType) && !(*zonk(c, object.ty) is TypeVar(_, _, _))
+        if is_universal(c, m) && !(*zonk(c, object.ty) is ErrorType)
             val ms = buf1u(m)
             if infix && !takes_one_argument(c, ms) then return infix_arity_error(c, at, name_span, target, name, ms, args)
             return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
@@ -7327,6 +7421,21 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
                 for a in args
                     check_pattern(c, a, ErrorType, no_bind)
                 TPattern(p.span, ErrorType, PWildcard)
+        Cons(head, tail) ->
+            var parts: Buf[&Pattern] = buf()
+            parts.push(head)
+            parts.push(tail)
+            list_pattern(c, p, "Cons", parts, ty, no_bind, "`::` patterns match a `List`")
+        Sequence(items) ->
+            if items.len() == 0 then return list_pattern(c, p, "Nil", buf(), ty, no_bind, "sequence patterns match a `List`")
+            // `[a, b, c]` on a list is `a :: [b, c]`.
+            var rest: Buf[&Pattern] = buf()
+            for i in 1..<items.len()
+                rest.push(items[i])
+            var parts: Buf[&Pattern] = buf()
+            parts.push(items[0])
+            parts.push(Pattern(Span(if rest.len() > 0 then rest[0].span.start else p.span.end, p.span.end), Sequence(rest)))
+            list_pattern(c, p, "Cons", parts, ty, no_bind, "sequence patterns match a `List`")
         Tuple(items) ->
             // A tuple pattern takes apart a tuple of the same size; a tuple is matched as a value
             // with one variant whose fields are its parts.
@@ -7467,6 +7576,21 @@ private variant_pattern(c: *Checker, p: &Pattern, v: VariantRef, args: Buf[&Patt
         typed.push(check_pattern(c, args[i], field, no_bind))
     if !ok || *ty is ErrorType then return TPattern(p.span, ErrorType, PWildcard)
     TPattern(p.span, ty, PVariant(v.index, typed))
+
+// A list pattern is the core library's `List` variant `name` with the patterns `parts` for its
+// fields, whatever `Cons` and `Nil` name where it is written. On any other type it is reported with
+// `what`.
+private list_pattern(c: *Checker, p: &Pattern, name: string, parts: Buf[&Pattern], ty: &Type, no_bind: string, what: string) -> &TPattern
+    val t = zonk(c, ty)
+    val v = list_variant(c, name)
+    if v is Some(found)
+        if is_list_type(c, t) then return variant_pattern(c, p, found, parts, t, no_bind)
+    if !(*t is ErrorType)
+        if is_array_type(c, t) then c.note(unit_of(c), p.span, "sequence patterns on arrays are not implemented")
+        else c.note(unit_of(c), p.span, s"$what, not ${type_name(t)}")
+    for part in parts
+        check_pattern(c, part, ErrorType, no_bind)
+    TPattern(p.span, ErrorType, PWildcard)
 
 // A literal in a pattern takes the matched value's type, as it would beside it in `==`.
 private pattern_constant(c: *Checker, value: &Expr, ty: &Type) -> &TExpr
