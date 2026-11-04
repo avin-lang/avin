@@ -166,8 +166,10 @@ lower_program(program: TProgram) -> MirProgram
     // variables.
     l.records.push(TypeRecord("a closure or a captured variable", buf()))
     l.record_types.push(Unit)
+    // The core library's functions are compiled only as the program reaches them, so a program
+    // carries none of the library it does not use, and builds no shim for a binding it never calls.
     for i in 0..<program.symbols.len()
-        if !is_generic(program, i) && !never_compiled(program, i) then instance(&l, i, buf())
+        if !is_generic(program, i) && !never_compiled(program, i) && !in_core_library(program, i) then instance(&l, i, buf())
     val entry = instance(&l, program.entry, buf())
     val init: Option[usize] = program.init match
         Some(id) -> Some(instance(&l, id, buf()))
@@ -189,6 +191,11 @@ lower_program(program: TProgram) -> MirProgram
                 if b.shim == shim then seen = true
             if !seen then bindings.push(MirBinding(shim, target, symbol.name, symbol.params, symbol.result.unwrap_or(Unit), symbol.unit, symbol.decl.name_span))
     MirProgram(functions, l.strings, l.descriptors, l.records, l.closures, l.traps, global_types, entry, init, bindings)
+
+/** Whether a function belongs to the core library's module, `avin`, or one under it. */
+private in_core_library(program: TProgram, id: usize) -> bool
+    val m = program.symbols[id].module_name
+    m == "avin" || m.starts_with("avin.")
 
 /** Whether a function has no code: an abstract method, or an abstract class's or a trait's constructor. */
 private never_compiled(program: TProgram, id: usize) -> bool
@@ -767,8 +774,11 @@ private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr],
             op match
                 Some(v) -> operands.push(v)
                 None -> return None
-    // A local function also receives what it captures, from where the caller keeps it.
+    // A string operation is lowered where it is called, so its checks report the call's place.
     val callee = l.program.symbols[function]
+    if callee.intrinsic is Some(name)
+        if name.starts_with("string_") then return intrinsic_operation(l, name, operands, e.span)
+    // A local function also receives what it captures, from where the caller keeps it.
     for x in callee.captured_locals
         if l.local_slots[x] is Some(p) then operands.push(p.address)
     for x in callee.captured_params
@@ -1040,9 +1050,19 @@ shim_symbol(function: string) -> string
     from_utf8_unchecked(out.view())
 
 // An intrinsic is a function like any other in the object file; its body is the operation the
-// intrinsic names, so it can be called directly and, later, passed as a value.
+// intrinsic names, so it can be passed as a value. A direct call of a string operation is lowered in
+// place instead, so a value of one reports its checks at the intrinsic's declaration.
 private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
-    val found = intrinsic_entry(symbol.intrinsic.unwrap_or("")) match
+    val name = symbol.intrinsic.unwrap_or("")
+    if name.starts_with("string_")
+        var operands: Buf[Operand] = buf()
+        for i in 0..<symbol.params.len()
+            operands.push(Value(i))
+        val result = intrinsic_operation(l, name, operands, symbol.decl.name_span)
+        finish(l, Return(result))
+        return
+    // Every other intrinsic calls one runtime entry point.
+    val found = intrinsic_entry(name) match
         Some(f) -> f
         None ->
             finish(l, Unreachable)
@@ -1061,6 +1081,44 @@ private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
     finish(l, Return(dest match
         Some(id) -> Some(Value(id))
         None -> None))
+
+/** The bytes of a string's header, its length, before its UTF-8 bytes. */
+private const TextHeader: usize = 8
+
+// The string operations. A string's length is a 64-bit word at its start, but no string is longer
+// than the largest `int`, so byte offsets and lengths are `int`. An offset compared unsigned against
+// a length is out of range when negative too.
+private intrinsic_operation(l: *Lowering, name: string, args: Buf[Operand], at: Span) -> Option[Operand]
+    val s = args[0]
+    if name == "string_byte_length" then return Some(byte_length(l, s))
+    if name == "string_byte_at"
+        trap_if(l, compare(l, CmpUge, args[1], byte_length(l, s)), "byte offset out of range", at)
+        val bytes = fresh(l, MPtr)
+        l.insts.push(Offset(bytes, s, TextHeader))
+        val address = fresh(l, MPtr)
+        l.insts.push(Index(address, Value(bytes), args[1]))
+        val b = fresh(l, MInt(8))
+        l.insts.push(Load(b, Value(address)))
+        return Some(Value(b))
+    if name == "string_slice"
+        // The runtime answers no string when an offset falls inside a character.
+        trap_if(l, compare(l, CmpUgt, args[2], byte_length(l, s)), "slice out of range", at)
+        trap_if(l, compare(l, CmpUgt, args[1], args[2]), "slice out of range", at)
+        val part = runtime_call(l, "avin_rt_string_slice", [MRef, MInt(32), MInt(32)], MRef, [s, args[1], args[2]])
+        trap_if(l, compare(l, CmpEq, part, NullAddress), "slice offset is not a character boundary", at)
+        return Some(part)
+    if name == "string_find"
+        return Some(runtime_call(l, "avin_rt_string_find", [MRef, MRef, MInt(32)], MInt(32), [s, args[1], args[2]]))
+    if name == "string_repeat"
+        trap_if(l, compare(l, CmpLt, args[1], ConstInt(32, "0")), "negative repeat count", at)
+        return Some(runtime_call(l, "avin_rt_string_repeat", [MRef, MInt(32)], MRef, [s, args[1]]))
+    None
+
+/** The length in bytes of the string `s`, as an `int`. */
+private byte_length(l: *Lowering, s: Operand) -> Operand
+    val word = fresh(l, MInt(64))
+    l.insts.push(Load(word, s))
+    convert_op(l, Truncate, MInt(32), Value(word))
 
 private new_block(l: *Lowering) -> usize
     val id = l.blocks.len()

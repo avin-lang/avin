@@ -299,12 +299,19 @@ reference it still needs and it touches none until it is running again. The coll
 holding the lock, raises the flag `avin_rt_requested`, waits until every other attached context is
 safe, collects, lowers the flag and wakes the others. A thread becomes safe in three ways:
 
-- **At a poll.** The emitter places a poll at the entry of every function that calls another,
-  after its frame is linked and its arguments stored, and before every terminator with a back edge,
-  found by a depth-first walk of the function's blocks, so every loop polls once per iteration and
-  every recursion once per call. A poll is a relaxed atomic load of the flag and a branch to a call
-  of `avin_rt_safepoint`, which is declared cold; the thread parks there until the collection is
-  over. A function with neither calls nor loops never polls.
+- **At a poll.** The emitter places a poll before every terminator with a back edge, found by a
+  depth-first walk of the function's blocks, so every loop polls once per iteration, and before
+  every call that may recur. Which calls may recur comes from the strongly connected components of
+  the whole program's call graph, in which a call through a function value may reach every
+  function whose address is taken (every closure entry and every method-table entry): a call
+  recurs when its callee is in the caller's component. Such a call needs a poll only where no poll
+  has run yet in this call of the function on every path to it, so every recursion polls once per
+  level, on the paths that recurse: `fib` polls before its first recursive call and its leaves never
+  poll. A function that no recursion passes through runs for a bounded time between its callers',
+  its callees' and its own loops' polls, and never polls at all for its calls. A poll is a relaxed
+  atomic load of the flag and a branch, weighted as almost never taken, to a call of
+  `avin_rt_safepoint`, which is declared cold and laid out of line; the thread parks there until the
+  collection is over. Every reference is already in a frame wherever a poll is placed.
 - **Waiting for the lock.** Allocation takes the lock with one compare-and-swap when it is free; a
   thread that has to wait for it waits safe, since the holder may be collecting. Allocation is
   therefore a safepoint.
@@ -325,7 +332,7 @@ sees. The compiler knows a small, declared set of
 Each is declared in Avin source with `@intrinsic("…")` and has no body. Everything else, including
 `print`, is ordinary library code.
 
-An intrinsic is lowered to a function whose body calls one runtime entry point, named in the
+An intrinsic that is not a string operation is lowered to a function whose body calls one runtime entry point, named in the
 checker's `intrinsic_entry` table with its parameters and result. The formatting library
 (`format.avin`) reaches the runtime this way: `write_out` and `write_int` write to standard output,
 an integer's digits rendered on the stack; `render_int`, `render_real` and `render_char` make a
@@ -344,6 +351,18 @@ argument is a built-in type finds its method in that table and calls it directly
 built-in type becomes a `Render` node, lowered to the runtime's rendering of the value (a constant
 for `bool` and `unit`); a hole of any other type, a type parameter's included, becomes a call of its
 `toString()`, which needs the type to implement `Display`.
+
+A built-in type's impl may declare a method as an intrinsic; its declared type takes the receiver
+first. `impl string` in `library/avin/string.avin` does so for the string operations that read the
+object itself: `byteLength` (the length word, loaded and narrowed to `int`), a private `byteAt` (a
+checked byte load), `slice`, `repeat` and a private `find`, the last three over the runtime's
+`avin_rt_string_slice`, `avin_rt_string_repeat` and `avin_rt_string_find`. A direct call of one is
+lowered where it is made, so its checks (an offset out of range, an offset inside a character, a
+negative count) trap at the caller's line; the intrinsic's function body, used when the method is
+passed as a value, reports them at its declaration. The runtime's `avin_rt_new_text` refuses a
+string longer than the largest `int`, so every byte offset is an `int`. The other string methods are
+Avin over these, and casing, replacing and the white-space test are Sysl bindings
+(`sysl.text.to_upper`, `to_lower`, `replace_all`, `sysl.unicode.is_space`).
 
 ## Tests
 

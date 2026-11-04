@@ -21,6 +21,9 @@ a decision changes, this page and the chapter change together.
 - Typing is nominal. Classes instantiate objects; there are no duck-typed objects.
 - Inference is a useful approximation of Hindley–Milner, not full HM: see
   [inference](/spec/generics/#inference).
+- A call's type argument that nothing at the call decides stays open until the end of the
+  enclosing function body, settled by the first later use that needs it (a branch it joins, a
+  store, a use as a value of a known type), and is an error at the call if nothing settles it.
 - The compiler is written in Sysl. Self-hosting is optional.
 - **The standard library is written in Avin.** Sysl is reached through
   [bindings written in Avin](/spec/sysl-bindings/), which the compiler turns into shims that Sysl
@@ -146,6 +149,17 @@ a decision changes, this page and the chapter change together.
 - `string` is a built-in type, not a class: it is final, has its own representation, gets its
   methods from the library through `impl string`, conforms to traits through `impl`, and is matched
   by the type pattern `s: string` like any other type.
+- Settled 2026-11-03: the library's [string methods](/spec/types/#string) are `byteLength`,
+  `charCount`, `isEmpty`, `nonEmpty`, `startsWith`, `endsWith`, `contains`, `slice`, `toUpper`,
+  `toLower`, `trim`, `trimStart`, `trimEnd`, `repeat` and `replace`. A slice traps at its call
+  when its offsets are out of order or outside the string, or either falls inside a character;
+  `repeat` traps on a negative count. Casing is the simple mapping, one character for one; trimming
+  removes Unicode `White_Space`; `replace` replaces every occurrence, left to right and not
+  overlapping, and an empty pattern occurs nowhere. A method whose natural result is optional
+  (`indexOf`, `toInt`, `toReal`) waits for `Option`, and those yielding a collection or iterator
+  (`split`, `chars`, `bytes`) for the collections.
+- Settled 2026-11-03: a built-in type's impl in the core library may declare a method as an
+  `@intrinsic`, whose type takes the receiver first.
 - A generic overload is compared by the same rule as any other: `f(x: int)` is more specific than
   `f[T](x: T)`, which accepts an `int` while `f(int)` does not accept a `T`.
 - Whether a parameter is by-name does not distinguish overloads. An argument some candidate takes by
@@ -317,6 +331,13 @@ a decision changes, this page and the chapter change together.
   runtime's source.
 - A binding is a top-level function. Across the boundary a `bool` is a byte and a `char` its code
   point; `string` is copied each way.
+- `Option[+T]` and `Result[+T, +E]` are `data` types of the core library, written in Avin, with
+  their methods in an `impl`. Those methods are not variance positions, so `getOrElse(default: -> T)`
+  takes `T` in a parameter and needs no lower bound: on an `Option[Dog]` seen as an `Option[Animal]`,
+  the default is an `Animal`. See [errors](/spec/errors/#option-and-result).
+- `?` returns from the function or lambda it is written in, so that one's result type must be
+  declared or, for a lambda, known where it is written. It cannot leave a delayed argument or a class
+  body.
 
 **Deferred**
 
@@ -355,6 +376,9 @@ a decision changes, this page and the chapter change together.
   so a racing read sees some value written to that word, and a constructor ends with a release
   fence, so no thread sees an object without its header and constructor-set fields. Actors are
   scheduled onto a pool of these threads.
+- A string's byte offsets and lengths are `int`, and a string holds at most the largest `int`
+  (2,147,483,647) bytes; making a longer one stops the program as running out of memory does. The
+  alternative is `long` offsets, which every caller would then narrow to index with an `int`.
 - A trait's `override` may also give an abstract method of a trait it requires a body, not only
   replace a default: `trait Square: Shape` with `override area() -> int = side() * side()` makes
   `area` concrete for every class conforming to `Square`.

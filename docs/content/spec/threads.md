@@ -80,8 +80,8 @@ object made.
 
 A collection stops the world. The collecting thread raises a flag, waits until every other thread is
 parked at a safepoint or is in a safe region (waiting, or blocked in a call), collects alone, and
-lets them go. Compiled code polls the flag at the entry of every function that makes calls and on
-every back edge of its loops, one load and a branch that is not taken; allocation is itself a
+lets them go. Compiled code polls the flag on every back edge of its loops and once per level of
+every recursion, one load and a branch that is not taken; allocation is itself a
 safepoint. A program with one thread never stops anything.
 
 ## Actors
