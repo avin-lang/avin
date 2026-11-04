@@ -1,0 +1,123 @@
+// Sysl values held opaquely: a class declared with `@sysl` is a handle on a Sysl type, made by the
+// bindings that return one and holding the Sysl value, which its methods without a body reach. The
+// handles are passed through Avin functions, kept in collections and made in numbers that make the
+// collector run, and `close()` gives each one's Sysl value back.
+// expect: exit 0
+
+@sysl("sysl.checksum.Crc32")
+class Crc32
+    update(bytes: Array[byte])
+    // Sysl's `finish` answers a `u32`, which a `long` holds.
+    finish() -> long
+    // A method with a body is an ordinary method, written over the bound ones.
+    hex() -> string = s"${finish()}"
+
+@sysl("sysl.checksum.new_crc32")
+newCrc32() -> Crc32
+
+@sysl("sysl.checksum.crc32")
+crc32(bytes: Array[byte]) -> long
+
+@sysl("sysl.fs.IoError")
+data IoError
+    NotFound
+    PermissionDenied
+    AlreadyExists
+    NotADirectory
+    IsADirectory
+    DirectoryNotEmpty
+    TooManyOpenFiles
+    NoSpaceLeft
+    Interrupted
+    NotOpen
+    NotPermitted
+    InvalidUtf8(offset: long)
+    Other(code: int)
+
+// A Sysl type with a destructor, held by a counted reference: `close()` unmaps the file.
+@sysl("sysl.fs.Mapped")
+class Mapped
+    // Bound to the Sysl method `is_empty`, by its name's words in snake_case.
+    isEmpty() -> bool
+    @sysl("bytes")
+    contents() -> Array[byte]
+
+@sysl("sysl.fs.map_file")
+mapFile(file: string) -> Result[Mapped, IoError]
+
+@sysl("sysl.fs.make_temp_dir")
+makeTempDir(prefix: string) -> Result[string, IoError]
+
+@sysl("sysl.fs.write_text")
+writeText(file: string, text: string) -> Result[unit, IoError]
+
+@sysl("sysl.fs.remove_dir_all")
+removeDirAll(dir: string) -> Result[unit, IoError]
+
+@sysl("sysl.encoding.hex_string")
+hex(bytes: Array[byte]) -> string
+
+bytesOf(s: string) -> Array[byte]
+    val v = s.bytes()
+    Array.tabulate(v.length(), i -> v(i))
+
+// A handle passed to an Avin function, which updates it, and returned from one.
+feed(c: Crc32, text: string) -> Crc32
+    c.update(bytesOf(text))
+    c
+
+main()
+    val c = newCrc32()
+    c.update(bytesOf("1234"))
+    feed(c, "56789")
+    print(s"${c.finish()} ${crc32(bytesOf("123456789"))} ${c.hex()}")
+    // A function value bound to a handle's method.
+    val add = c.update
+    add(bytesOf("x"))
+    print(c.finish() == crc32(bytesOf("123456789x")))
+    // A handle compares by identity.
+    val d = newCrc32()
+    print(s"${c == c} ${c == d} ${c === feed(c, "")}")
+    // Handles in collections, made in numbers, each its own Sysl value.
+    var all: Vector[Crc32] = []
+    for i in 0..<200
+        val h = newCrc32()
+        h.update(bytesOf(s"$i"))
+        all = all :+ h
+    var same = true
+    for i in 0..<200
+        if all(i).finish() != crc32(bytesOf(s"$i")) then same = false
+    print(same)
+    val byText = Map.empty[string, Crc32]().updated("a", newCrc32()).updated("b", d)
+    byText("b").update(bytesOf("123456789"))
+    print(d.finish() == crc32(bytesOf("123456789")))
+    // Handles nothing holds any longer are collected, their Sysl values given back.
+    for i in 0..<2000
+        val h = newCrc32()
+        h.update(bytesOf("garbage"))
+    print(all(199).finish() == crc32(bytesOf("199")))
+    // `close()` gives the Sysl value back, and closing again does nothing.
+    c.close()
+    c.close()
+    for h in all
+        h.close()
+    // A mapped file, out of a `Result`, closed, and one that is never closed.
+    val dir = makeTempDir("avin-handles") match
+        Ok(p) -> p
+        Err(e) ->
+            print(s"no directory: $e")
+            return
+    print(writeText(dir + "/a.txt", "mapped"))
+    print(writeText(dir + "/empty", ""))
+    mapFile(dir + "/a.txt") match
+        Ok(m) ->
+            print(s"${m.isEmpty()} ${hex(m.contents())}")
+            m.close()
+        Err(e) -> print(s"$e")
+    mapFile(dir + "/empty") match
+        Ok(m) -> print(s"${m.isEmpty()} ${m.contents().length()}")
+        Err(e) -> print(s"$e")
+    mapFile(dir + "/missing") match
+        Ok(_) -> print("mapped a missing file")
+        Err(e) -> print(s"$e")
+    print(removeDirAll(dir))

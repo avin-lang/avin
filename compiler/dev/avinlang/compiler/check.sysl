@@ -1230,6 +1230,7 @@ private declare_types(c: *Checker, unit: usize)
                 c.note(unit, d.name_span, s"the type `${d.name}` is declared more than once")
                 continue
             if file.private_items[i] then c.private_names.put(key, true)
+            check_handle_declaration(c, unit, d)
             c.class_types.put(key, c.classes.len())
             c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, None, None, buf(), buf(), 0, None, buf(), None))
 
@@ -2108,8 +2109,9 @@ private declare_fields(c: *Checker, unit: usize)
         val k = c.classes[id]
         if k.unit != unit then continue
         val d = k.decl
+        // `@sysl` on a class is checked where the class is declared.
         for a in d.annotations
-            c.note(unit, a.span, s"unknown annotation `@${a.name}`")
+            if a.name != "sysl" || d.object then c.note(unit, a.span, s"unknown annotation `@${a.name}`")
         val declares_trait = is_trait(c, id)
         if declares_trait
             for m in d.members
@@ -2620,6 +2622,19 @@ private declare_methods(c: *Checker, unit: usize)
                         declared.push(MethodDecl(getter, true, false, unit, module_name, d.type_params, false, true, false))
                         made_from.push(None)
                 _ -> ()
+        // Every Sysl handle has `close()`, which gives back its Sysl value.
+        val handle = handle_target(d) is Some(_)
+        if handle
+            var named = false
+            for m in d.members
+                if m is MethodMember(f, _, _, _)
+                    if f.name == "close" then named = true
+            if !named
+                var marks: Buf[Annotation] = buf()
+                marks.push(Annotation(d.name_span, HandleRelease, buf()))
+                val release = Function(marks, d.name_span, d.name_span, "close", buf(), buf(), None, None, buf())
+                declared.push(MethodDecl(release, true, false, unit, module_name, d.type_params, false, false, false))
+                made_from.push(None)
         for block_index in 0..<c.impls.len()
             val block = c.impls[block_index]
             if *block.target is Class(target, _, _)
@@ -2649,7 +2664,10 @@ private declare_methods(c: *Checker, unit: usize)
             // The core library's array classes declare their element operations as intrinsics, and
             // `avin.threads.Atomic` its operations on the value it holds.
             val intrinsic_method = (is_array_storage(c.classes[id]) || is_atomic_storage(c.classes[id])) && f.annotations.len() > 0
-            if f.annotations.len() > 0 && !intrinsic_method then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
+            // A Sysl handle's own methods without a body are bound to its Sysl value's; the
+            // declaration of the handle has checked their annotations.
+            val bound_method = handle && !entry.from_impl && !entry.static_member && f.body is None && f.clauses.len() == 0
+            if f.annotations.len() > 0 && !intrinsic_method && !(handle && !entry.from_impl) then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
             if overrides then refuse_override_defaults(c, file_unit, f)
             if entry.static_member && !static_member_allowed(c, file_unit, f, c.classes[id].name, is_trait(c, id), overrides) then continue
             if is_trait(c, id)
@@ -2666,9 +2684,9 @@ private declare_methods(c: *Checker, unit: usize)
                 c.note(file_unit, f.name_span, s"`${f.name}` is already a field of `${c.classes[k.fields[i].owner].name}`")
                 continue
             val bodyless = f.body is None && f.clauses.len() == 0
-            if bodyless && !is_abstract_class(c, id) && !intrinsic_method
+            if bodyless && !is_abstract_class(c, id) && !intrinsic_method && !bound_method
                 c.note(file_unit, f.name_span, s"`${f.name}` has no body; only an abstract class may leave a method without one")
-            if bodyless && !public && !intrinsic_method then c.note(file_unit, f.name_span, s"`${f.name}` is abstract, so it cannot be private: a subclass implements it")
+            if bodyless && !public && !intrinsic_method && !bound_method then c.note(file_unit, f.name_span, s"`${f.name}` is abstract, so it cannot be private: a subclass implements it")
             var same_name: Buf[usize] = buf()
             for other in methods
                 if c.symbols[other].decl.name == f.name then same_name.push(other)
@@ -2680,8 +2698,15 @@ private declare_methods(c: *Checker, unit: usize)
             // In a trait, `Self` names the type implementing it.
             val outer_trait = c.self_trait
             if is_trait(c, id) then c.self_trait = Some(id)
-            var symbol = signature(c, file_unit, entry.module_name, f, class_owner(id), type_params, true, None)
+            // A bound method's `@sysl` names a Sysl method, which the handle's declaration has
+            // checked, rather than a function, so its signature is read without it.
+            val written: &Function = if bound_method then Function(buf(), f.span, f.name_span, f.name, f.type_params, f.params, f.result, f.body, f.clauses) else f
+            var symbol = signature(c, file_unit, entry.module_name, written, class_owner(id), type_params, true, None)
+            symbol.decl = f
             c.self_trait = outer_trait
+            if bound_method
+                if f.type_params.len() > 0 then c.note(file_unit, f.name_span, "generic Sysl bindings are not implemented")
+                else check_crossings(c, file_unit, f, symbol.params, 0, symbol.result)
             // The receiver comes first, named `self`. In a trait that mentions `Self`, it is a `Self`,
             // so the trait's methods can pass it where their parameters take one.
             var receiver_types: Buf[&Type] = buf()
@@ -5185,19 +5210,33 @@ private check_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Type]
         if f.type_params.len() > 0
             c.note(unit, f.name_span, "generic Sysl bindings are not implemented")
             continue
-        for i in 0..<f.params.len()
-            val p = f.params[i]
-            if p.by_name then c.note(unit, p.pattern.span, "a by-name parameter cannot cross to Sysl")
-            elif !crosses_to_sysl(c, params[i]) then c.note(unit, p.ty.span, s"`${type_name(params[i])}` cannot cross to Sysl; ${BoundaryTypes}")
-        if result is Some(r)
-            if !crosses_to_sysl(c, r)
-                val at = if f.result is Some(t) then t.span else f.name_span
-                c.note(unit, at, s"`${type_name(r)}` cannot cross to Sysl; ${BoundaryTypes}")
+        check_crossings(c, unit, f, params, 0, result)
+
+// A binding's parameters, from `first` on, cross into Sysl, and its result out of Sysl.
+private check_crossings(c: *Checker, unit: usize, f: &Function, params: Buf[&Type], first: usize, result: Option[&Type])
+    for i in 0..<f.params.len()
+        val p = f.params[i]
+        val t = params[first + i]
+        if p.by_name then c.note(unit, p.pattern.span, "a by-name parameter cannot cross to Sysl")
+        elif holds_handle(c, t) then c.note(unit, p.ty.span, s"`${type_name(t)}` cannot cross to Sysl: a Sysl handle goes back into Sysl only as the receiver of its own methods")
+        elif !crosses_to_sysl(c, t) then c.note(unit, p.ty.span, s"`${type_name(t)}` cannot cross to Sysl; ${BoundaryTypes}")
+    if result is Some(r)
+        if !crosses_out_of_sysl(c, r)
+            val at = if f.result is Some(t) then t.span else f.name_span
+            if holds_handle(c, r) then c.note(unit, at, s"`${type_name(r)}` cannot cross out of Sysl: a Sysl handle is a binding's result, or the value of its `Option` or `Result`")
+            else c.note(unit, at, s"`${type_name(r)}` cannot cross to Sysl; ${BoundaryTypes}")
 
 const BoundaryTypes: string = "a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, data types declared with `@sysl` to mirror a Sysl enum or struct, and `Array`, `Vector`, `Option` and `Result` of these"
 
-/** Whether a value of type `t` crosses between Avin and Sysl, converted by a binding's shim. */
-crosses_to_sysl(c: *Checker, t: &Type) -> bool = *t match
+/** Whether a value of type `t` crosses between Avin and Sysl, converted by a binding's shim. A Sysl
+ * handle crosses only out of Sysl, as a binding's result or the payload of its `Option` or
+ * `Result`, which is what `crosses_out_of_sysl` asks. */
+crosses_to_sysl(c: *Checker, t: &Type) -> bool = crosses(c, t, false)
+
+/** Whether a value of type `t` crosses out of Sysl as a binding's result. */
+crosses_out_of_sysl(c: *Checker, t: &Type) -> bool = crosses(c, t, true)
+
+private crosses(c: *Checker, t: &Type, handles: bool) -> bool = *t match
     ErrorType -> true
     Unit -> true
     Bool -> true
@@ -5210,10 +5249,97 @@ crosses_to_sysl(c: *Checker, t: &Type) -> bool = *t match
         val d = c.data[id]
         if mirror_target(d.decl) is Some(_) then return true
         if d.module_name != CoreModule then return false
-        if d.name == "Option" && args.len() == 1 then return crosses_to_sysl(c, args[0])
-        d.name == "Result" && args.len() == 2 && crosses_to_sysl(c, args[0]) && crosses_to_sysl(c, args[1])
-    Class(k, _, args) -> (is_array_class(c.classes[k]) || is_vector_class(c.classes[k])) && args.len() == 1 && crosses_to_sysl(c, args[0])
+        if d.name == "Option" && args.len() == 1 then return crosses(c, args[0], handles)
+        d.name == "Result" && args.len() == 2 && crosses(c, args[0], handles) && crosses(c, args[1], handles)
+    Class(k, _, args) ->
+        if handle_target(c.classes[k].decl) is Some(_) then return handles
+        (is_array_class(c.classes[k]) || is_vector_class(c.classes[k])) && args.len() == 1 && crosses_to_sysl(c, args[0])
     _ -> false
+
+/** Whether `t` is a Sysl handle, or a collection, `Option` or `Result` that holds one. */
+private holds_handle(c: *Checker, t: &Type) -> bool = *t match
+    Data(id, _, args) ->
+        if c.data[id].module_name != CoreModule then return false
+        for a in args
+            if holds_handle(c, a) then return true
+        false
+    Class(k, _, args) ->
+        if handle_target(c.classes[k].decl) is Some(_) then return true
+        for a in args
+            if holds_handle(c, a) then return true
+        false
+    _ -> false
+
+/** The Sysl type a class declared with `@sysl` is a handle on: the string of its annotation, when it
+ * has one. */
+handle_target(d: &ClassDecl) -> Option[string]
+    if d.object then return None
+    for a in d.annotations
+        if a.name == "sysl" && a.args.len() == 1
+            if a.args[0].value.kind is StringLit(path) then return Some(path)
+    None
+
+// A class declared with `@sysl("module.Name")` is a handle on that Sysl type: its objects are made by
+// the bindings that return one and hold the Sysl value and nothing else, so the class has no
+// parameters, fields or statements, no type parameters and no parents, and is final. Its methods
+// without a body are bound to the Sysl type's methods.
+private check_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
+    var annotated = false
+    for a in d.annotations
+        if a.name != "sysl" then continue
+        annotated = true
+        var target: Option[string] = None
+        if a.args.len() == 1 && a.args[0].name is None
+            if a.args[0].value.kind is StringLit(p) then target = Some(p)
+        target match
+            Some(p) ->
+                if !is_sysl_path(p) then c.note(unit, a.span, s"`@sysl` on a class names the Sysl type it is a handle on, by its module and name, as in `sysl.checksum.Crc32`; `$p` is not one")
+            None -> c.note(unit, a.span, "`@sysl` on a class takes one string, the module and name of the Sysl type it is a handle on, as in `@sysl(\"sysl.checksum.Crc32\")`")
+    if !annotated then return
+    if d.type_params.len() > 0 then c.note(unit, d.type_params[0].span, "a Sysl handle has no type parameters: it holds one Sysl type")
+    if d.params.len() > 0 then c.note(unit, d.params[0].param.pattern.span, "a Sysl handle has no parameters: the bindings that return one make it")
+    if d.modifier != "" then c.note(unit, d.modifier_span, s"a Sysl handle is final, so it cannot be `${d.modifier}`")
+    if d.parents.len() > 0 then c.note(unit, d.parents[0].span, "a Sysl handle has no parents; an `impl` makes it conform to a trait")
+    if d.derives.len() > 0 then c.note(unit, d.derives[0].span, "a Sysl handle derives nothing: it compares by identity, and an `impl` gives it `Display`")
+    for m in d.members
+        m match
+            FieldMember(f) -> c.note(unit, f.span, "a Sysl handle holds its Sysl value and nothing else, so its body declares only methods")
+            AbstractFieldMember(f) -> c.note(unit, f.span, "a Sysl handle holds its Sysl value and nothing else, so its body declares only methods")
+            StatementMember(s) -> c.note(unit, s.span, "a Sysl handle holds its Sysl value and nothing else, so its body declares only methods")
+            MethodMember(f, _, _, static_member) ->
+                if f.name == "close" then c.note(unit, f.name_span, "every Sysl handle has `close()`, which gives back its Sysl value; bind the Sysl type's own `close` under another name, with `@sysl(\"close\")`")
+                val bodyless = f.body is None && f.clauses.len() == 0
+                if bodyless && static_member then c.note(unit, f.name_span, s"`${f.name}` is static, so it needs a body: a handle's methods without one are bound to its Sysl value's")
+                for a in f.annotations
+                    if a.name != "sysl"
+                        c.note(unit, a.span, s"unknown annotation `@${a.name}` on a method of a Sysl handle")
+                        continue
+                    if !bodyless then c.note(unit, a.span, "a method with a body is not bound to Sysl, so it takes no `@sysl`")
+                    var name: Option[string] = None
+                    if a.args.len() == 1 && a.args[0].name is None
+                        if a.args[0].value.kind is StringLit(p) then name = Some(p)
+                    name match
+                        Some(p) ->
+                            if !is_sysl_path("x." + p) || p.contains(".") then c.note(unit, a.span, s"`@sysl` on a handle's method names the Sysl method it is bound to, as in `@sysl(\"close\")`; `$p` is not one")
+                        None -> c.note(unit, a.span, "`@sysl` on a handle's method takes one string, the name of the Sysl method it is bound to, as in `@sysl(\"close\")`")
+
+/** The Sysl method a bound method of a handle calls: the one its `@sysl("name")` names, or the one of
+ * its own name's words in snake_case. */
+handle_method_name(f: &Function) -> string
+    for a in f.annotations
+        if a.name == "sysl" && a.args.len() == 1
+            if a.args[0].value.kind is StringLit(name) then return name
+    sysl_field_of(f.name)
+
+/** Whether a method of a Sysl handle is its built-in `close()`, which gives back the handle's Sysl
+ * value: the checker declares it for every handle, marked so. */
+is_handle_release(f: &Function) -> bool
+    for a in f.annotations
+        if a.name == HandleRelease then return true
+    false
+
+// The mark of a handle's built-in `close()`. No annotation written in source has this name.
+private const HandleRelease: string = "<release>"
 
 /** The Sysl enum or struct a data type mirrors: the string of its `@sysl` annotation, when it has
  * one. */
@@ -6456,6 +6582,9 @@ private abstract_constructor(c: *Checker, id: usize, at: Span) -> bool
     val k = symbol.owner_class.unwrap()
     if is_array_class(c.classes[k])
         c.note(unit_of(c), at, "an array is made with every element set, by `Array.fill(n, value)`, `Array.tabulate(n, f)` or `Array.empty()`")
+        return true
+    if handle_target(c.classes[k].decl) is Some(target)
+        c.note(unit_of(c), at, s"`${c.classes[k].name}` is a handle on the Sysl type `$target`, so only a Sysl binding that returns one makes it")
         return true
     if !is_abstract_class(c, k) then return false
     if is_trait(c, k) then c.note(unit_of(c), at, s"`${c.classes[k].name}` is a trait, so it cannot be instantiated; instantiate a class that conforms to it")
