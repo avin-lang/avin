@@ -405,6 +405,9 @@ struct Checker
     /** The impls that add methods to a trait, and the methods they add. */
     trait_impls: Buf[TraitImpl]
     trait_methods: Buf[TraitMethod]
+    /** The name spans of the infix calls that take their receiver on the right (`x +: xs`), whose
+     * argument, written first, is evaluated before the receiver. */
+    operand_first: Buf[Span]
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -580,7 +583,7 @@ private check_imports(c: *Checker, unit: usize)
  * unit is one of its files. Every file sees its own module's declarations, the names it imports and
  * the core library's public declarations, in that order: an inner name hides an outer one. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
     // `derives` is written out as the methods and impls it stands for before anything is declared.
@@ -4856,6 +4859,7 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Binding(name, declared, value, mutable) -> binding_expr(c, e, name, declared, value, mutable)
     Destructure(pattern, declared, value, mutable) -> destructure_expr(c, e, pattern, declared, value, mutable)
     Assign(target, op, value, yields, op_span) -> assign_expr(c, e, target, op, value, yields, op_span)
+    SymbolAssign(target, spelling, value, op_span) -> compound_assign(c, e, target, spelling, None, value, op_span)
     MultiAssign(targets, op, value, op_span) -> multi_assign_expr(c, e, targets, op, value, op_span)
     Tuple(items) -> tuple_expr(c, e, items, expected)
     TupleIndex(target, index) -> tuple_index(c, e, target, index)
@@ -5694,6 +5698,60 @@ private initializer(c: *Checker, order: Buf[usize]) -> Option[usize]
     Some(id)
 
 private assign_expr(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp], value: &Expr, yields: bool, op_span: Span) -> &TExpr
+    if op is Some(o)
+        if !yields then return compound_assign(c, e, target, binary_spelling(o) + "=", op, value, op_span)
+    assign_place(c, e, target, op, value, yields, op_span)
+
+// `x op= y` calls `x`'s method named `op=` when the target's type has one, so `buffer += 3` adds to
+// the buffer, which need not be a `var`. Otherwise it assigns: `op` is the language's operator
+// (`n += 1`), or a method named by a symbol, and `xs ++= ys` is `xs = xs ++ ys`. The target's object
+// and indices are evaluated once, before the method is chosen by the target's type.
+private compound_assign(c: *Checker, e: &Expr, target: &Expr, spelling: string, op: Option[BinaryOp], value: &Expr, op_span: Span) -> &TExpr
+    val unit = unit_of(c)
+    var items: Buf[&Expr] = buf()
+    var place = target
+    target.kind match
+        Name(_) -> ()
+        Member(object, field) ->
+            if !(object.kind is Name(_))
+                val held = s"compound object ${op_span.start}"
+                items.push(Expr(object.span, Binding(held, None, object, false)))
+                place = Expr(target.span, Member(Expr(object.span, Name(held)), field))
+        Call(callee, args) ->
+            val h = held_element(Expr(op_span, UnitLit), callee, args, &items)
+            place = Expr(target.span, Call(h.callee, h.args))
+        _ -> return assign_place(c, e, target, op, value, false, op_span)
+    val mark = c.body.visible.len()
+    var typed: Buf[&TExpr] = buf()
+    for item in items
+        typed.push(check_statement(c, item))
+    val before = c.units[unit].report.len()
+    val current = check_expr(c, place, None)
+    var result: &TExpr = TExpr(e.span, ErrorType, UnitConst)
+    if c.units[unit].report.len() > before || *zonk(c, current.ty) is ErrorType
+        check_statement(c, value)
+    else
+        val ms = methods_of(c, current.ty, spelling)
+        if ms.len() > 0
+            var args: Buf[Argument] = buf()
+            args.push(Argument(value.span, None, value))
+            if !takes_one_argument(c, ms) then result = infix_arity_error(c, e.span, op_span, target, spelling, ms, args)
+            else result = call_method(c, e.span, op_span, current, spelling, ms, args, None, None, false)
+        elif op is Some(_) then result = assign_place(c, e, place, op, value, false, op_span)
+        else
+            val name = spelling[0..<spelling.bytes.len - 1]
+            if language_operator(name) || groups_right(name)
+                c.note(unit, op_span, s"`${type_name(current.ty)}` has no method `$spelling`, and `$name` is not a method that `$spelling` can assign through")
+                check_statement(c, value)
+            else
+                val combined = Expr(e.span, InfixCall(place, name, op_span, value))
+                result = assign_place(c, e, place, None, combined, false, op_span)
+    c.body.visible.truncate(mark)
+    if typed.len() == 0 then return result
+    typed.push(result)
+    TExpr(e.span, result.ty, Block(typed))
+
+private assign_place(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp], value: &Expr, yields: bool, op_span: Span) -> &TExpr
     if target.kind is Call(callee, args) then return check_form(c, element_assignment(e, callee, args, op, value, yields, op_span), None, yields)
     if targets_field(c, target) then return assign_field(c, e, target, op, value, yields, op_span)
     if targets_global(c, target) is Some(g) then return assign_global(c, e, target, g, op, value, yields, op_span)
@@ -7488,7 +7546,7 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
             return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
     if infix
         if !(*zonk(c, object.ty) is ErrorType)
-            c.note(unit, name_span, s"`${type_name(zonk(c, object.ty))}` has no method `$name` to call infix")
+            c.note(unit, name_span, s"`${type_name(zonk(c, object.ty))}` has no method `$name` to call infix" + split_hint(name))
         for a in args
             check_statement(c, a.value)
         return TExpr(at, ErrorType, UnitConst)
@@ -7503,8 +7561,23 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
 private infix_call(c: *Checker, at: Span, target: &Expr, name: string, name_span: Span, arg: &Expr, expected: Option[&Type]) -> &TExpr
     var args: Buf[Argument] = buf()
     args.push(Argument(arg.span, None, arg))
-    val callee = Expr(target.span.to(name_span), Member(target, name))
+    var callee_span = target.span.to(name_span)
+    if groups_right(name)
+        c.operand_first.push(name_span)
+        callee_span = name_span.to(target.span)
+    val callee = Expr(callee_span, Member(target, name))
     member_call(c, at, callee, name_span, target, name, args, None, expected, true)
+
+// An operator is the longest run of operator characters, so `x=-1` reads `=-` as one name. When a
+// name is an operator of the language followed by a prefix operator, the message says so.
+private split_hint(name: string) -> string
+    val n = name.bytes.len
+    if n < 2 || !is_operator_spelling(name) || name == "++" || name == "--" then return ""
+    val last = name[(n - 1)..<n]
+    val head = name[0..<n - 1]
+    if (last == "-" || last == "+" || last == "!" || last == "~") && language_operator(head)
+        return s"; `$head` followed by a prefix `$last` needs a space between them"
+    ""
 
 // Whether one of the methods `ms` can be called with exactly one argument.
 private takes_one_argument(c: *Checker, ms: Buf[usize]) -> bool
@@ -7681,19 +7754,39 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
         val held = hidden_local(c, receiver.ty)
         setup = Some(TExpr(receiver.span, Unit, Let(held, receiver)))
         object = TExpr(receiver.span, receiver.ty, Local(held))
-    val applied = apply(c, at, name_span, method_signature(c, object, m, result_of(c, m, at)), args, explicit, expected, checked)
+    var applied = apply(c, at, name_span, method_signature(c, object, m, result_of(c, m, at)), args, explicit, expected, checked)
+    // A call written `x +: xs` evaluates `x`, written first, before the receiver `xs`.
+    var first: Option[&TExpr] = None
+    if !applied.cut && applied.args.len() > 0 && operand_first(c, name_span)
+        if applied.prelude.len() > 0
+            first = Some(applied.prelude[0])
+            var rest: Buf[&TExpr] = buf()
+            for i in 1..<applied.prelude.len()
+                rest.push(applied.prelude[i])
+            applied.prelude = rest
+        else
+            val a = applied.args[0]
+            if !(a.kind is Local(_) || a.kind is Param(_) || a.kind is IntConst(_) || a.kind is BoolConst(_) || a.kind is CharConst(_) || a.kind is RealConst(_) || a.kind is StrConst(_))
+                val held = hidden_local(c, a.ty)
+                first = Some(TExpr(a.span, Unit, Let(held, a)))
+                applied.args.set(0, TExpr(a.span, a.ty, Local(held)))
     var typed: Buf[&TExpr] = buf()
     typed.push(object)
     for a in applied.args
         typed.push(a)
     val call = applied.wrap(at, method_call_kind(c, receiver.ty, m, typed, applied.type_args, direct))
-    setup match
-        Some(s) ->
-            var items: Buf[&TExpr] = buf()
-            items.push(s)
-            items.push(call)
-            TExpr(at, call.ty, Block(items))
-        None -> call
+    if setup is None && first is None then return call
+    var items: Buf[&TExpr] = buf()
+    if first is Some(f) then items.push(f)
+    if setup is Some(s) then items.push(s)
+    items.push(call)
+    TExpr(at, call.ty, Block(items))
+
+// Whether the call whose method name is at `name_span` is written with its receiver on the right.
+private operand_first(c: *Checker, name_span: Span) -> bool
+    for s in c.operand_first
+        if s.start == name_span.start && s.end == name_span.end then return true
+    false
 
 // The type arguments of method `m`'s class, or of the data type an impl adds it to, as a receiver of
 // type `receiver_type` has them. An inherited method's types name its own class's parameters, so the

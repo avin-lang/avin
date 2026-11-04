@@ -171,7 +171,7 @@ The checker verifies each declared parameter's positions:
 - The traits a `data` type's `impl`s make it conform to are parents, like a class's. The methods an
   `impl` adds to a `data` type are not positions: they receive the value as whichever instance of
   the type it is seen as, and data is immutable. The same holds for the methods an `impl` adds to a
-  class whose fields are all immutable, so `Vector[+T]` takes `T` in `appended` and `contains`; a
+  class whose fields are all immutable, so `Vector[+T]` takes `T` in `:+` and `contains`; a
   class with a `var` field keeps every method a position. So, too, for the methods an `impl` adds to
   a trait (`impl[T] Seq[T]`), which reach the value only through the trait's own methods.
 
