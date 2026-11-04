@@ -462,8 +462,10 @@ looking a name up without regard to case, its `body` as an `Array[byte]` and `te
 UTF-8. **A status is an answer, not a failure**: `404` is an `Ok`. `HttpError` is `Io(IoError)`,
 `BadUrl(UrlError)`, `Malformed(text)` for a reply that is not HTTP, and `Unsupported(text)`. The
 client speaks HTTP/1.1, one request to a connection, reads bodies by `Content-Length`, chunked or to
-the connection's end, and follows up to five redirects of a `GET` or `HEAD`. `https` is
-`Unsupported` until the library has TLS.
+the connection's end, and follows up to five redirects of a `GET` or `HEAD`. A request for `https`
+is `Unsupported` where the library has no TLS; TLS lives in a Sysl package of its own, which the
+library reaches through a binding to a package named in its `sysl-dependencies`, as any program
+reaches one.
 
 ## Concurrency
 
