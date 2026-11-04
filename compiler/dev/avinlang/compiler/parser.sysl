@@ -22,6 +22,10 @@ struct Parser
      * test, a `for` source, a class's parents. An indented block there is the form's body, never a
      * call's trailing block. A block's own lines clear it. */
     in_header: bool
+    /** The continuation lines an expression has entered and not yet left in the current block: each
+     * line that starts with a binary operator and is indented deeper than the one above it opens
+     * one. A block's own lines start again from none. */
+    open_lines: usize
 
     spelling(self, t: Spanned[Token]) -> string = from_utf8_unchecked(self.src.text(t.span))
 
@@ -70,40 +74,131 @@ struct Parser
     at_line_end(self) -> bool =
         self.toks.at_end() || self.at_kind(Newline) || self.at_kind(Dedent) || self.at(")") ||
             self.at("]") || self.at("}") || self.at(",") || self.at("else") || self.at("elif")
+
+    /** How many layout tokens stand between a complete operand and a binary operator that starts a
+     * continuation line: one line indented deeper than the line above it, or another line of a
+     * continuation already entered, at its depth or back at a shallower one it entered. `None`
+     * when the next line does not continue the expression, and always in the header of a form,
+     * whose indented lines are its body. */
+    continues_line(self) -> Option[usize]
+        if self.in_header then return None
+        val next = self.toks.peek() match
+            Some(t) -> t
+            None -> return None
+        var skipped = 0usize
+        if next.value == Indent then skipped = 1
+        elif next.value == Newline
+            if self.open_lines == 0 then return None
+            skipped = 1
+        elif next.value == Dedent
+            loop
+                val closing = self.toks.peek_at(skipped) match
+                    Some(t) -> t.value == Dedent
+                    None -> false
+                if !closing then break
+                skipped += 1
+            if skipped >= self.open_lines then return None
+        // After an indented block that closed inside a continuation, the next continuation line
+        // follows the block's last line with no layout token of its own.
+        elif self.open_lines == 0 || !after_dedent(self) then return None
+        if starts_binary(self, skipped) then Some(skipped) else None
 end Parser
 
 impl TokenStream for Parser
     type Token = Spanned[Token]
     look(self) -> Option[Spanned[Token]]
+        var offset = 0usize
+        if self.continues_line() is Some(skipped) then offset = skipped
         // A dedent closes an expression's indented body. The next line may begin with `-` or `(`,
         // which must not attach to the closed expression as an infix or postfix operator.
-        if self.toks.position > 0 && self.toks.items[self.toks.position - 1].value == Dedent then return None
-        // A name right after a complete operand is an infix method call. Inside brackets, where a
-        // line break makes no token, the name may be on a later line; `infix_call` rejects that.
-        val next = self.toks.peek()
-        if next is Some(t)
-            if t.value == Word && self.toks.position > 0 && !is_keyword(self.spelling(t)) then return Some(Spanned(InfixName, t.span))
-            // A method named by a symbol binds at the level its first character gives it, and `~`
-            // after an operand is the method `~`, binding tightest.
-            if t.value == SymbolOp && self.toks.position > 0 then return Some(Spanned(symbol_token(self.spelling(t)), t.span))
-            if t.value == Symbol && self.toks.position > 0 && self.spelling(t) == "~" then return Some(Spanned(SymbolTight, t.span))
-            // `++` and `--` with an operand after them on the line call a method of that name:
-            // `xs ++ ys`. Otherwise they update the operand before them: `i++`.
-            if t.value == Postfix && self.toks.position > 0 && operand_follows(self, t) then return Some(Spanned(SymbolAdd, t.span))
-        next
-    take(*self) -> Option[Spanned[Token]] = self.toks.advance()
+        elif after_dedent(self) then return None
+        self.toks.peek_at(offset) match
+            Some(t) -> Some(as_infix(self, t, offset))
+            None -> None
+    take(*self) -> Option[Spanned[Token]]
+        if operand_ended(self) && self.continues_line() is Some(skipped)
+            for i in 0..<skipped
+                val layout = self.toks.advance().unwrap()
+                if layout.value == Indent then self.open_lines += 1
+                if layout.value == Dedent then self.open_lines -= 1
+        self.toks.advance()
 
 parser_for(src: Source) -> Parser
     val lexed = lex(src)
-    Parser(src, lexed.items, lexed.report, None, false, buf(), false)
+    Parser(src, lexed.items, lexed.report, None, false, buf(), false, 0)
 
-// Whether the `++` or `--` token `t` is followed, on its own line, by something that begins an
-// operand and is not itself an operator: a name, a literal or an opening bracket, or an indented
-// block on the next line.
-private operand_follows(p: Parser, t: Spanned[Token]) -> bool
+private after_dedent(p: Parser) -> bool = p.toks.position > 0 && p.toks.items[p.toks.position - 1].value == Dedent
+
+// The token `t`, `offset` places ahead, as the operator loop sees it after a complete operand. A name
+// there is an infix method call; inside brackets, where a line break makes no token, the name may be
+// on a later line, which `infix_call` rejects. A method named by a symbol binds at the level its
+// name gives it, and `~` is the method `~`, binding tightest. `++` and `--` with an operand after
+// them on the line call a method of that name, `xs ++ ys`; otherwise they update the operand before
+// them, `i++`.
+private as_infix(p: Parser, t: Spanned[Token], offset: usize) -> Spanned[Token]
+    if p.toks.position == 0 then return t
+    if t.value == Word && !is_keyword(p.spelling(t)) then return Spanned(InfixName, t.span)
+    if t.value == SymbolOp then return Spanned(symbol_token(p.spelling(t)), t.span)
+    if t.value == Symbol && p.spelling(t) == "~" then return Spanned(SymbolTight, t.span)
+    if t.value == Postfix && operand_follows(p, t, offset) then return Spanned(SymbolAdd, t.span)
+    t
+
+// Whether the token `offset` places ahead is an operator that can stand between two operands, and so
+// can start a continuation line: every operator of the language's binary families, a method named by
+// a symbol, `~`, and `++` or `--` with an operand after it. `!`, `=` and the compound assignments,
+// `.`, `?` and brackets cannot.
+private starts_binary(p: Parser, offset: usize) -> bool
+    val t = p.toks.peek_at(offset) match
+        Some(t) -> t
+        None -> return false
+    t.value match
+        AddOp | MultiplyOp | CompareOp | RangeOp | ConsOp | BitOrOp | BitXorOp | BitAndOp | AndOp | OrOp | SymbolOp -> true
+        Symbol -> p.spelling(t) == "~"
+        Postfix -> operand_follows(p, t, offset)
+        _ -> false
+
+// Whether the last token taken completes an operand, so that a continuation line may follow it: a
+// name, a literal, a closing bracket, a postfix operator, or the end of a block inside a continuation.
+private operand_ended(p: *Parser) -> bool
+    if p.toks.position == 0 then return false
+    val last = p.toks.items[p.toks.position - 1]
+    last.value match
+        Word ->
+            val w = p.spelling(last)
+            !is_keyword(w) || w == "self" || w == "true" || w == "false"
+        Number | RealNumber | Quoted | Interpolated | CharQuoted | Postfix -> true
+        Dedent -> p.open_lines > 0
+        _ ->
+            val w = p.spelling(last)
+            w == ")" || w == "]" || w == "}"
+
+/** Leaves the continuation lines an expression entered beyond `base`, when no operator continues it:
+ * the lines that follow are back at the depth the expression began on. A line inside the
+ * continuation that does not start with an operator is reported, and skipped with any block nested
+ * under it. */
+private leave_lines(p: *Parser, base: usize)
+    if p.open_lines <= base then return
+    if p.look() is Some(t) && binding(t) > 0 then return
+    var reported = false
+    while p.open_lines > base
+        val t = p.toks.advance() match
+            Some(t) -> t
+            None ->
+                p.open_lines = base
+                return
+        if t.value == Dedent then p.open_lines -= 1
+        elif t.value == Indent then p.open_lines += 1
+        elif !reported && t.value != Newline
+            p.report.add(error(t.span, "a line indented under a continued expression continues it, so it starts with a binary operator"))
+            reported = true
+
+// Whether the `++` or `--` token `t`, `offset` places ahead, is followed on its own line by something
+// that begins an operand and is not itself an operator: a name, a literal or an opening bracket, or
+// an indented block on the next line.
+private operand_follows(p: Parser, t: Spanned[Token], offset: usize) -> bool
     val word = p.spelling(t)
     if word != "++" && word != "--" then return false
-    val next = p.toks.peek_at(1) match
+    val next = p.toks.peek_at(offset + 1) match
         Some(n) -> n
         None -> return false
     if next.value == Indent then return true
@@ -130,8 +225,11 @@ parse_expression(src: Source) -> ParsedExpr
     ParsedExpr(tree, p.report)
 
 expression(p: *Parser, minimum: u16) -> &Expr
+    val base = p.open_lines
     pratt(p, minimum, prefix, infix, binding) match
-        Some(e) -> e
+        Some(e) ->
+            leave_lines(p, base)
+            e
         None ->
             val at = p.toks.here()
             p.report.add(expected(at, "an expression", found_at(p.src, at)))
@@ -175,9 +273,12 @@ private const InfixBinding: u16 = 32
 /** The level a method named by a symbol binds at: that of the language's operator its first
  * character belongs to. Names starting `<<` or `>>` bind with the shifts, at the multiplicative
  * level; `<`, `>`, `=` and `!` with the comparisons; any character that starts no operator of a level,
- * `~` and `?` among them, binds tightest of all. A name ending in `=` is an assignment, and never
- * reaches here. */
+ * `~` and `?` among them, binds tightest of all. A name with `~` anywhere in it binds tightest too,
+ * so a grammar's `~`, `~>`, `<~` and `^~` read together. A name ending in `=` is an assignment, and
+ * never reaches here. */
 symbol_token(name: string) -> Token
+    for b in name.bytes
+        if b == u8('~') then return SymbolTight
     if name.starts_with("<<") || name.starts_with(">>") then return SymbolMultiply
     val first = name[0..<1]
     if first == "*" || first == "/" || first == "%" then SymbolMultiply
@@ -221,7 +322,7 @@ private hole(p: *Parser, span: Span) -> &Expr
         p.report.add(error(span, "an interpolation hole needs an expression"))
         return Expr(span, Invalid)
     val lexed = lex_hole(p.src, span)
-    var inner = Parser(p.src, lexed.items, lexed.report, None, false, buf(), false)
+    var inner = Parser(p.src, lexed.items, lexed.report, None, false, buf(), false, 0)
     val e = expression(&inner, 0)
     if !inner.toks.at_end() then inner.report.add(error(inner.toks.here(), "unexpected input after the expression in this hole"))
     p.report.absorb(inner.report)
@@ -389,8 +490,13 @@ private infix(left: &Expr, t: Spanned[Token], p: *Parser) -> &Expr
             operands.push(left)
             ops.push(compare_op(op))
             operands.push(expression(p, 30))
-            while p.at_kind(CompareOp)
-                val next = p.toks.advance().unwrap()
+            // A chain goes on across a continuation line: `a < b` then `    < c` is `a < b < c`.
+            loop
+                val more = p.look() match
+                    Some(t) -> t.value == CompareOp
+                    None -> false
+                if !more then break
+                val next = p.take().unwrap()
                 ops.push(compare_op(p.spelling(next)))
                 operands.push(expression(p, 30))
             Expr(left.span.to(operands[operands.len() - 1].span), Compare(operands, ops))
@@ -424,15 +530,12 @@ private infix_call(left: &Expr, t: Spanned[Token], name: string, p: *Parser) -> 
     val arg = if p.at_kind(Indent) then parse_body(p, false) else expression(p, InfixBinding)
     Expr(left.span.to(arg.span), InfixCall(left, name, t.span, arg))
 
-// `xs ++ ys` calls the method `++` of `xs` with `ys`, with the rules of `a max b`, at the level of
-// the operator its first character belongs to (`symbol_token`). A name ending in `:` groups to the
-// right and takes its receiver on the right: `x +: xs` is `xs.+:(x)`, and `a +: b +: xs` is
-// `a +: (b +: xs)`. Left- and right-grouping operators do not mix at one level without parentheses.
+// `xs ++ ys` calls the method `++` of `xs` with `ys`, with the rules of `a max b`, at the level its
+// name gives it (`symbol_token`). Unlike a name, a symbol may start a line, which continues the
+// expression above it as any binary operator does. A name ending in `:` groups to the right and
+// takes its receiver on the right: `x +: xs` is `xs.+:(x)`, and `a +: b +: xs` is `a +: (b +: xs)`.
+// Left- and right-grouping operators do not mix at one level without parentheses.
 private symbol_call(left: &Expr, t: Spanned[Token], name: string, p: *Parser) -> &Expr
-    for b in p.src.text(Span(left.span.end, t.span.start))
-        if b == u8('\n')
-            p.report.add(error(t.span, s"an infix call starts on its receiver's line: end that line with `$name` to put the operand on the next"))
-            break
     if !p.at_kind(Indent) && (p.at_line_end() || argument_cannot_start(p))
         p.report.add(error(t.span, s"`$name` has no right operand: a method named by a symbol is called between two operands, and has no postfix form"))
         return Expr(left.span.to(t.span), Invalid)
@@ -534,7 +637,7 @@ private bare_call(p: *Parser, callee: &Expr) -> &Expr
 private trailing_block(p: *Parser, parenthesized: bool) -> Option[&Expr]
     if p.in_header then return None
     if p.at_kind(Indent)
-        if infix_line_ahead(p) then return None
+        if infix_line_ahead(p) || p.continues_line() is Some(_) then return None
         return Some(parse_body(p, false))
     if p.at_kind(Word) && !is_keyword(p.ahead(0)) && p.ahead(1) == "->" && arrow_ends_line(p, 1)
         val name = p.toks.advance().unwrap()

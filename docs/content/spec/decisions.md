@@ -749,6 +749,29 @@ Settled by the user on 2026-11-04:
   call binds at the level of `a max b`. See [methods named by
   symbols](/spec/operators-and-control-flow/#methods-named-by-symbols).
 
+- **A method named by a symbol with `~` anywhere in its name binds at the tightest symbol level**,
+  whatever its first character: `~`, `~>`, `<~`, `~!`, `<~>` and `^~` bind together there and group
+  left, so `num | symbol("(") ~> expr <~ symbol(")")` is `num | ((symbol("(") ~> expr) <~
+  symbol(")"))`, `"[" ~> items <~ "]" ^^ f` is `(("[" ~> items) <~ "]") ^^ f`, and `a <~ b ~ c` is
+  `(a <~ b) ~ c`. Every other name keeps the first-character rule; a `~` name ending in `=` (`~=`)
+  is still a compound assignment, and prefix `~` is unchanged. This amends the rule above, under
+  which `<~` bound with the comparisons.
+
+- **A line that starts with a binary operator, indented deeper than the line where its expression
+  began, continues that expression**, with the operator's own precedence: the line break means
+  nothing. Every binary operator of the language, every method named by a symbol, `~`, and `++` or
+  `--` with an operand after it start one; a word, `!`, `.`, `?`, a bracket and the assignments do
+  not. It applies wherever an expression with a complete operand ends a line (a binding's value, an
+  assignment, a `return` value, an infix call's argument, a `match` arm's or a lambda's body, an
+  expression statement) and ends at the first line back at the depth the expression began on; a
+  line inside it that does not start with an operator is an error. Blank lines and comments between
+  continuation lines are skipped. After an operand `-x` and `+x` there are binary; after the test of
+  `if`, `elif` or `while`, a `for` source, a class's parents, and after anything that is not a
+  complete operand (`=`, `->`, `else`, `do`, a signature), an indented line is a block's line, so
+  `if c` over `-1` is a block yielding `-1`. An indented line starting with an operator after a call
+  is a continuation, not the call's trailing block. See [continuation
+  lines](/spec/operators-and-control-flow/#continuation-lines).
+
 **Deferred**
 
 - Public C interoperability. Until then, C is reached through Sysl.

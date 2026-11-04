@@ -64,7 +64,7 @@ impl Add for Point
 | Assignment | `=` and compound forms (`+=`, `<<=`, `+%=`, …) |
 | Yielding assignment | `:=` and compound forms, which return the stored value |
 | Update | prefix and postfix `++` `--`; prefix yields the new value, postfix the old |
-| Symbol methods | any other run of operator characters names a method, called infix at the level of its first character: `xs ++ ys`, `x +: xs` |
+| Symbol methods | any other run of operator characters names a method, called infix at the level of its first character, or tightest when it has a `~` in it: `xs ++ ys`, `x +: xs`, `a <~ b` |
 
 An operator is the longest run of the characters `+ - * / % < > = ! & | ^ ~ : ?`, so a prefix
 operator written directly after another operator needs a space: `a = -1`, `x * -y`. A run stops
@@ -104,7 +104,8 @@ val widest = current max
 ```
 
 A name that starts a line never continues the line above, inside brackets too: end the line with the
-name instead. An indented block after a call is the call's [trailing block](#trailing-blocks), except
+name instead. A method named by a symbol is an operator and may start a
+[continuation line](#continuation-lines). An indented block after a call is the call's [trailing block](#trailing-blocks), except
 that one holding only a name and an operand is reported as this mistake.
 
 The call is resolved exactly as `a.m(b)` is: overloads are chosen by the argument's type, a trait or
@@ -156,12 +157,15 @@ val rw = Flags(1) | Flags(2)
 ```
 
 A symbol method's call binds at the level of the language's operator its name's first character
-belongs to, so a name reads with the operator it resembles. The levels, tightest first:
+belongs to, so a name reads with the operator it resembles. One character overrides the first: a
+name with `~` anywhere in it binds at the tightest symbol level, so `~`, `~>`, `<~`, `<~>`, `~!` and
+`^~` all bind together, the way a grammar's sequencing operators are read. The levels, tightest
+first:
 
 | Level | Operators | Symbol methods whose name starts with |
 | --- | --- | --- |
 | Prefix | unary `-` `+` `!` `~` | |
-| Other symbols | | `~` `?`, and any character no lower level takes: `~>`, `??` |
+| Other symbols | | `~` `?`, and any character no lower level takes: `~>`, `??`; and every name with a `~` in it: `<~`, `^~` |
 | Multiplicative | `*` `/` `%` `<<` `>>` `*%` `*\|` | `*` `/` `%`, `<<` and `>>`: `*:`, `<<<` |
 | Additive | `+` `-` `+%` `-%` `+\|` `-\|` | `+` `-`: `++`, `+:`, `--` |
 | Bitwise and | `&` | `&`: `&&&` |
@@ -170,14 +174,16 @@ belongs to, so a name reads with the operator it resembles. The levels, tightest
 | Cons | `::` | `:`: `:+`, `:::` |
 | Range | `..` `..<` | |
 | Named calls | `a max b` | |
-| Comparison | `==` `!=` `<` `<=` `>` `>=` `===` `!==`, `is` | `<` `>` `=` `!`: `<=>`, `<~`, `!!` |
+| Comparison | `==` `!=` `<` `<=` `>` `>=` `===` `!==`, `is` | `<` `>` `=` `!`: `<=>`, `<>`, `!!` |
 | Logical and | `&&` | |
 | Logical or | `\|\|` | |
 | Assignment | `=` `:=` and compound forms | a name ending in `=` that is not a comparison: `+=`, `++=`, `\|=` |
 
 So `a ++ b + c` is `(a ++ b) + c`, `a ++ b * c` is `a ++ (b * c)`, `xs ++ ys :+ z` is
 `(xs ++ ys) :+ z`, and `xs ++ ys == zs` compares the joined sequence. A grammar written with
-combinators reads as it would on paper: `a ~ b ^^ f | c ~ d` is `((a ~ b) ^^ f) | (c ~ d)`.
+combinators reads as it would on paper: `a ~ b ^^ f | c ~ d` is `((a ~ b) ^^ f) | (c ~ d)`,
+`"[" ~> items <~ "]" ^^ f` is `(("[" ~> items) <~ "]") ^^ f`, and `a <~ b ~ c` is `(a <~ b) ~ c`.
+A `~` name ending in `=` is still a compound assignment: `p ~= q` is `p = p ~ q`.
 
 A symbol call groups to the left, except that a name ending in `:` groups to the right and takes its
 receiver on the right: `x +: xs` is `xs.+:(x)`, and `a +: b +: xs` is `a +: (b +: xs)`. The operands
@@ -200,6 +206,61 @@ name, `x op= y` is `x = x op y`, so `flags |= Flags(4)` combines flags into a `v
 value or an element `xs(i)`, and its object and indices are evaluated once. A right-grouping name
 has no compound form, and the yielding forms (`+:=`) belong to the language's operators alone. A
 multiple assignment uses only the language's compound forms.
+
+### Continuation lines
+
+A line that starts with a binary operator, indented deeper than the line above it, continues the
+expression that line left open:
+
+```text
+val atom = number
+    | symbol("(") ~> defer(expr) <~ symbol(")")
+    | ident ^^ Var
+
+val total = a
+    + b * c
+    - d
+```
+
+The line break means nothing to precedence: the operators group exactly as they would on one line,
+so `total` is `(a + (b * c)) - d`, `atom` has three alternatives, and `a + b` with `* c` on the
+next line is `a + (b * c)`. A comparison chain goes on across the lines too.
+
+- **What starts one.** Every operator that stands between two operands: the arithmetic, wrapping,
+  saturating, shift, bitwise, comparison, logical, range and cons operators, a method named by a
+  symbol, `~`, and `++` or `--` with an operand after it. `-` and `+` there are binary, written
+  `- d` or `-d`. A word never starts one (a named infix call ends its line instead, as
+  [above](#infix-method-calls)), and neither do `!`, `.`, `?`, a bracket, `=` and the compound
+  assignments.
+- **Where.** Wherever an expression ends a line and has a complete operand: a binding's value, an
+  assignment, a `return` value, a call's argument, a `match` arm's or a lambda's body, a branch of a
+  one-line `if`, an expression statement.
+- **How far.** Each following line that starts with such an operator and is still deeper than the
+  line the expression began on continues it, at the depth of a continuation line above it or deeper
+  (indentation that matches no line above is an error, as in any block); the depth means nothing
+  beyond that. The expression ends at the first line back at the depth it began
+  on, or shallower. A line inside the continuation that does not start with an operator is an error,
+  except a call's trailing block or an infix call's argument, indented under its own line as usual.
+- **Blank lines and comments** between continuation lines are skipped, as they are everywhere.
+- **Not after a header.** The indented lines after the test of `if`, `elif`, `while` and
+  `do … while`, a `for` source and a class's parents are the form's body. There, and wherever else
+  an indented block follows a word or a symbol that is not a complete operand (`=`, `->`, `else`,
+  `do`, `then`, a declaration's signature), a line that starts with `-x` is a block's line:
+
+```text
+negate(x: int) -> int
+    -x
+
+sign(x: int) -> int
+    if x < 0
+        -1
+    else
+        1
+```
+
+Inside brackets a line break is not significant, so a line in a call's arguments may start with any
+operator at any depth, a method named by a symbol included. A block opened inside the brackets, a
+lambda's body, starts its own lines again.
 
 ### Trailing blocks
 
@@ -260,6 +321,8 @@ already put an indented block after their line keep it:
 - `x match` and the bare `match` function: the block holds the arms.
 - A block whose one line is a name and a single operand, `add 2`, reads as the method and argument
   of an infix call that should have ended the line above, and is reported as that.
+- A block whose first line starts with a binary operator is a
+  [continuation line](#continuation-lines): `f(1)` and `    - x` is `f(1) - x`.
 
 It is an error to write a trailing block for a call whose last parameter is neither by-name nor a
 function (the message names the parameter and its type), whose last parameter is already given, or

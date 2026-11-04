@@ -132,7 +132,7 @@ symbol_levels()
     assert_eq(tree("a :+ b max c"), "(call (. (call (. a :+) b) max) c)")
     // Comparison.
     assert_eq(tree("a <=> b max c"), "(call (. a <=>) (call (. b max) c))")
-    assert_eq(tree("a <~ b ~ c"), "(call (. a <~) (call (. b ~) c))")
+    assert_eq(tree("a <=> b ~ c"), "(call (. a <=>) (call (. b ~) c))")
     assert_eq(tree("a !! b && c"), "(&& (call (. a !!) b) c)")
     assert_eq(tree("a <=> b == 0"), "((call (. a <=>) b) == 0)")
     // A name ending in `=` is an assignment.
@@ -143,6 +143,76 @@ symbol_levels()
     assert_eq(tree("a ~> b <~ c"), "(call (. (call (. a ~>) b) <~) c)")
     // Prefix `~` stays the complement.
     assert_eq(tree("~a ~ ~b"), "(call (. (~ a) ~) (~ b))")
+
+@test("a symbol method with `~` anywhere in its name binds tightest and groups left, whatever its first character")
+tilde_levels()
+    assert_eq(tree("a <~ b ~ c"), "(call (. (call (. a <~) b) ~) c)")
+    assert_eq(tree("a ~ b <~ c"), "(call (. (call (. a ~) b) <~) c)")
+    assert_eq(tree("num | symbol(\"(\") ~> expr <~ symbol(\")\")"), "(| num (call (. (call (. (call symbol \"(\") ~>) expr) <~) (call symbol \")\")))")
+    assert_eq(tree("\"[\" ~> items <~ \"]\" ^^ f"), "(call (. (call (. (call (. \"[\" ~>) items) <~) \"]\") ^^) f)")
+    assert_eq(tree("a <~> b ~ c"), "(call (. (call (. a <~>) b) ~) c)")
+    assert_eq(tree("a ^~ b ^^ c"), "(call (. (call (. a ^~) b) ^^) c)")
+    assert_eq(tree("a ~! b * c"), "(* (call (. a ~!) b) c)")
+    assert_eq(tree("a <~ b == c"), "((call (. a <~) b) == c)")
+    // The first character still decides every other name, and `~=` is still an assignment.
+    assert_eq(tree("a <> b ~ c"), "(call (. a <>) (call (. b ~) c))")
+    assert_eq(tree("a ~= b <~ c"), "(~= a (call (. b <~) c))")
+    assert(diagnostics("f(a: A) -> A = a <~ b ~: c\n").contains("`<~` groups to the left and `~:` to the right"))
+
+@test("a line that starts with a binary operator and is indented deeper continues the expression above it, at the operator's own precedence")
+continuation_lines()
+    assert_eq(tree("if c\n    val total = a\n        + b * c\n        - d\n    total\n"), "(if c (block (val total (- (+ a (* b c)) d)) total))")
+    assert_eq(tree("if c\n    val atom = number\n        | symbol(\"(\") ~> e <~ symbol(\")\")\n        | ident ^^ Var\n    atom\n"), "(if c (block (val atom (| (| number (call (. (call (. (call symbol \"(\") ~>) e) <~) (call symbol \")\"))) (call (. ident ^^) Var))) atom))")
+    // The line break means nothing to precedence.
+    assert_eq(tree("a + b\n    * c\n"), "(+ a (* b c))")
+    assert_eq(tree("a * b\n    + c * d\n"), "(+ (* a b) (* c d))")
+    assert_eq(tree("a max b\n    + c\n"), "(call (. a max) (+ b c))")
+    assert_eq(tree("a < b\n    < c\n"), "(a < b < c)")
+    assert_eq(tree("ok\n    && a\n    || b\n"), "(|| (&& ok a) b)")
+    assert_eq(tree("xs\n    ++ ys\n    :+ z\n"), "(call (. (call (. xs ++) ys) :+) z)")
+    assert_eq(tree("1\n    :: xs\n"), "(:: 1 xs)")
+    // A deeper line goes on continuing, and its depth means nothing either.
+    assert_eq(tree("a\n    + b\n        - c\n    + d\n"), "(+ (- (+ a b) c) d)")
+    // `-` and `+` after an operand are binary, with or without a space after them.
+    assert_eq(tree("if c\n    val y = a\n        -b\n    y\n"), "(if c (block (val y (- a b)) y))")
+    // A return value, an assignment, a match arm, a lambda body and a one-line `if` branch.
+    assert_eq(tree("if c\n    return a\n        + b\n"), "(if c (block (return (+ a b))))")
+    assert_eq(tree("if c\n    x = a\n        * b\n"), "(if c (block (= x (* a b))))")
+    assert_eq(tree("x match\n    0 -> a\n        + b\n    _ -> c\n"), "(match x (0 -> (+ a b)) (_ -> c))")
+    assert_eq(tree("if c\n    val f = n -> n\n        * 2\n    f\n"), "(if c (block (val f (fn (n) (* n 2))) f))")
+    assert_eq(tree("if c then a\n    + b\nelse d\n"), "(if c (+ a b) d)")
+    // Blank lines and comments between continuation lines are skipped.
+    assert_eq(tree("a\n    + b\n\n    // and the last\n    + c\n"), "(+ (+ a b) c)")
+    // A trailing block and a line ending with an infix method's name compose with it.
+    assert_eq(tree("a\n    + f(1)\n        y\n    + c\n"), "(+ (+ a (call f 1 block=(block y))) c)")
+    assert_eq(tree("a max\n    b\n        + c\n"), "(call (. a max) (block (+ b c)))")
+    // In brackets every line break is insignificant, so a symbol method may start a line there too.
+    assert_eq(tree("f(a\n~> b)\n"), "(call f (call (. a ~>) b))")
+
+@test("a line that starts with a prefix operator is a block's line wherever a block follows, and continues nothing")
+continuation_blocks()
+    assert_eq(tree("if c\n    -x\n"), "(if c (block (- x)))")
+    assert_eq(tree("if c\n    a\n    -x\n"), "(if c (block a (- x)))")
+    assert_eq(tree("while c\n    -x\n"), "(while c (block! (- x)))")
+    assert_eq(tree("if a\n    + b\n"), "(if a (block (+ b)))")
+    assert_eq(tree("x match\n    1 -> a\n    -1 -> b\n"), "(match x (1 -> a) ((- 1) -> b))")
+    assert_eq(tree("if c\n    val y =\n        -x\n    y\n"), "(if c (block (val y (block (- x))) y))")
+    assert_eq(declarations("f(x: int) -> int\n    -x\n"), "(def f(x: int) -> int (block (- x)))\n")
+    assert(tree("for i in xs\n    -i\n").contains("(block! (- i))"))
+    assert(tree("if c\n    a\nelse\n    -x\n").contains("(block (- x))"))
+    assert(declarations("f(x: int) -> int\n    helper()\n        -x\n    helper()\n").contains("(def helper() (block! (- x)))"))
+    // After a call, an indented line starting with an operator continues it rather than being its
+    // trailing block.
+    assert_eq(tree("if c\n    val y = f(1)\n        -x\n    y\n"), "(if c (block (val y (- (call f 1) x)) y))")
+    assert_eq(tree("if c\n    val y = xs\n        ++ys\n    y\n"), "(if c (block (val y (call (. xs ++) ys)) y))")
+    // The lines of a block inside a continuation start again: the block's own `-x` line is a statement.
+    assert_eq(tree("a\n    + run(() ->\n        y\n        -x)\n"), "(+ a (call run (fn () (block y (- x)))))")
+
+@test("a line indented under a continued expression starts with an operator")
+continuation_errors()
+    assert(diagnostics("f(a: int, b: int) -> int\n    val x = a\n        + b\n        b\n    x\n").contains("a line indented under a continued expression continues it, so it starts with a binary operator"))
+    assert(parses("f(a: int, b: int) -> int\n    val x = a\n        + b\n    x\n"))
+    assert(parses("val x = 1\n    + 2\nval y = x\n"))
 
 @test("left- and right-grouping operators at one level do not mix, and at different levels do")
 symbol_level_grouping()
