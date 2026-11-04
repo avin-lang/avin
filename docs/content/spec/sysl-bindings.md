@@ -90,7 +90,7 @@ Data crosses the boundary in a fixed set of shapes:
 
 | Avin type | Crossing |
 | --- | --- |
-| `i8`, `i16`, `int`, `long`, `byte`, `real`, `char`, `bool`, `unit` | By value; Sysl's `u8` is `byte` |
+| `i8`, `i16`, `int`, `long`, `byte`, `real`, `char`, `bool`, `unit` | By value; Sysl's `u8` is `byte`. An integer result takes [any Sysl integer](#integer-results) |
 | `string` | Copied into a Sysl `string` in each direction |
 | `Array[byte]` | Copied into a Sysl `[]u8`, and out of a Sysl `[]u8` or `[]const u8` |
 | `Array[T]`, `Vector[T]` of any other boundary type | **Copied**, element by element: into a Sysl slice `[]T`, and out of a Sysl `[]T` or `Buf[T]` into a new array or vector |
@@ -101,6 +101,35 @@ Data crosses the boundary in a fixed set of shapes:
 These shapes nest: a `Result[Option[string], IoError]` crosses, and so do a
 `Result[Vector[string], IoError]`, a `Vector[Vector[string]]`, a `Vector[Array[byte]]` and a mirror
 whose fields are `Option`s, collections or other mirrors.
+
+### Integer results
+
+A binding's integer result takes any Sysl integer, of any width and either sign, converted with a
+check into the integer type the binding declares. Avin has no unsigned integers, so a Sysl `usize`
+or `u64` result is bound as a `long`, and a narrower type is fine where the values fit:
+
+```text
+@sysl("sysl.math.bigint.BigInt")
+class BigInt
+    limbs() -> long
+```
+
+A value the declared type cannot hold — a `u64` past the largest `long`, an `i64` result bound as
+an `int` that does not fit — stops the program where the binding was called, as an Avin conversion
+does:
+
+```text
+avin: trap: value out of range for long at main.avin:13:13
+```
+
+A result of any other type is not converted to an integer, and the binding is rejected:
+
+```text
+error: the Sysl binding `upperCount` does not match `sysl.text.to_upper`: an integer is made from a Sysl integer, but the value is string
+```
+
+An integer parameter is passed as the type it is declared, which Sysl accepts where its own
+parameter's type holds every value of it: an `i16` reaches an `i32` parameter, and a `long` does not.
 
 ### Collections are copies
 
@@ -184,8 +213,9 @@ readText(file: string) -> Result[string, IoError]
   lowerCamelCase spelling, so a field has one spelling. Variants of an enum keep Sysl's names,
   which are PascalCase in both languages, and a variant's fields are matched by position.
 - **A field is a boundary type.** An integer field takes any Sysl integer, converted with a check in
-  each direction: Avin has no unsigned integers, so Sysl's `usize` offset above is a `long`. A
-  collection field is copied as a binding's collection is.
+  each direction as an [integer result](#integer-results) is: Avin has no unsigned integers, so
+  Sysl's `usize` offset above is a `long`, and a value the other side's type cannot hold stops the
+  program where the binding was called. A collection field is copied as a binding's collection is.
 - A mirror has no type parameters, and none of its fields holds the mirror itself, directly or
   through an `Option`, a `Result`, a collection or another mirror.
 

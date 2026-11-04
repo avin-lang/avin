@@ -227,7 +227,7 @@ happens inside a container: `List[int]` is not a `List[Display]`.
 Type parameters of `data` types, classes and traits declare variance: `+T` covariant, `-T`
 contravariant, plain `T` invariant. A function's or an `impl`'s type parameters take none.
 
-- Immutable collections are covariant: `List[+A]`, `Map[K, +V]`, `Option[+T]`.
+- Immutable collections are covariant: `List[+A]`, `Map[K, +V]`, `Option[+T]`, `Either[+L, +R]`.
 - Mutable collections are invariant: `Array[T]`, `Buffer[T]`. A covariant mutable collection would
   accept a store that is only checkable at run time.
 - Variance applies where the arguments are reference types: `Any`, strings, tuples, functions,

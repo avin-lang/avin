@@ -533,6 +533,15 @@ a decision changes, this page and the chapter change together.
   their methods in an `impl`. Those methods are not variance positions, so `getOrElse(default: -> T)`
   takes `T` in a parameter and needs no lower bound: on an `Option[Dog]` seen as an `Option[Animal]`,
   the default is an `Animal`. See [errors](/spec/errors/#option-and-result).
+- Settled by the user 2026-11-04: the core library has `Either[+L, +R]`, with `Left(value)` and
+  `Right(value)`, because the reference library has it. It follows that library's `Either` in names
+  and meaning and is right-biased: `isLeft`, `isRight`, `fold`, `swap`, `map`, `flatMap`,
+  `getOrElse`, `orElse`, `contains`, `exists`, `forall`, `filterOrElse`, `toOption`, `toList`,
+  `toVector`, `foreach`, `iterator`; `merge` on `Either[A, A]`, `joinLeft` and `joinRight` on the
+  nested shapes; `Either.cond(test, right, left)`. `Option` gains `toRight(left)` and
+  `toLeft(right)`. Defaults are by name and `L`, `R` take no lower bounds, as for `Option`. There is
+  no left projection (`swap` serves), no `?` on an `Either`, and no conversion between `Either` and
+  `Result`, which stays the type for failure. See [errors](/spec/errors/#either).
 - `?` returns from the function or lambda it is written in, so that one's result type must be
   declared or, for a lambda, known where it is written. It cannot leave a delayed argument or a class
   body.
