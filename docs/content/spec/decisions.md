@@ -542,6 +542,14 @@ Settled by the user on 2026-11-03:
   so a racing read sees some value written to that word, and a constructor ends with a release
   fence, so no thread sees an object without its header and constructor-set fields. Actors are
   scheduled onto a pool of these threads.
+- The details of [static members](/spec/declarations/#static-members): `static` is a keyword,
+  written after `private` and before or after `override`; a static member is only a trait's or an
+  implementation of one (no static members of a type's own yet); in a trait it has no default body,
+  and no trait overrides one; an implementation is `static` exactly where the trait's member is, an
+  abstract class giving it too; its body has no `self`; a trait's default body cannot call one on
+  `Self`; a trait with one is a bound and not a type; and a local, parameter, member or module value
+  of a type's name hides the type as a receiver. The width `i1` has no `1`, so its `one()` is
+  `i1(1)`, which is `-1`.
 
 ## Open
 

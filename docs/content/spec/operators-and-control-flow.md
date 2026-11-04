@@ -25,6 +25,26 @@ built-in types implement the traits their operators have, so `int` is an `Add` a
 are of one type. The wrapping, saturating, bitwise and shift operators belong to the built-in types
 alone.
 
+`Add` and `Mul` also name their identities, as [static members](/spec/declarations/#static-members) of
+the implementing type: `static zero() -> Self`, which `add` leaves a value unchanged by, and
+`static one() -> Self`, which `multiply` does. Every implementation gives them: the integers' are `0`
+and `1` at each width, `real`'s `0.0` and `1.0`, and `string`'s `zero` is the empty string. Generic
+code reaches them through the bound:
+
+```text
+total[T: Add](items: Vector[T]) -> T
+    var sum = T.zero()
+    for x in items
+        sum = sum + x
+    sum
+
+data Point(x: int, y: int)
+
+impl Add for Point
+    add(other: Point) -> Point = Point(x + other.x, y + other.y)
+    static zero() -> Point = Point(0, 0)
+```
+
 | Family | Operators |
 | --- | --- |
 | Arithmetic | unary `+` `-`; `+` `-` `*` `/` `%` |
