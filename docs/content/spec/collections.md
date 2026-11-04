@@ -696,6 +696,26 @@ it has as [every sequence](#methods-every-seq-has) does, and what those make of 
 `filter` as much as `take` and `reverse`, is a `Vector`: `(1 .. 5).map(x -> x * x)` is
 `[1, 4, 9, 16, 25]`.
 
+### Ranges of other integer types
+
+Where the endpoints are integers of a type other than `int`, `a..b` and `a..<b` make a
+`NumericRange[T]` of that type, a `Seq[T]` that behaves as `Range` does: an integer literal endpoint
+takes its type from the other, `by` takes a step of type `T`, a zero step traps, and iteration never
+passes the largest or smallest value of `T`. `get`, `r(i)`, `head()`, `contains(x)` and `isEmpty()`
+are answered from the bounds without wrapping, so a range from the smallest `long` to the largest contains 0, and an
+`i8` range from 100 to 127 by 20 has the values 100 and 120. `length()` traps for more values than an `int`
+holds, as it does for `Range`; a range of `long`s past that still answers `head()`, `last()` and
+`get(i)`. A range whose ends lie more than the largest `long` apart cannot be counted, so
+`last()` and `length()` on it trap, while iterating it, `get` and `contains` work.
+
+```text
+val big: long = 5000000000
+val r = 0 .. big by 1000000000
+r.length()      // 6
+r.last()        // 5000000000
+r.contains(3000000000)   // true
+```
+
 ## for comprehensions
 
 A `for` with `yield` is sugar over collection methods: generators become `flatMap`/`map` and guards

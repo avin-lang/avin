@@ -1052,12 +1052,18 @@ Settled by the user on 2026-11-04:
   own equality between two of its instances. Through `Any` the values' own types still decide, so
   a vector and a list held as `Any` are unequal. The mutable `Array`, `Buffer` and `Deque` compare
   as they are when the comparison runs, so a hash held across a change is stale, as it was before.
-- Ranges of other integer types as values (`Range[long]`, `Range[i16]`) are not decided. The
-  endpoint type would be an `[T: Integer]` parameter, but the count of a range of `long`s or of
-  `i8`s needs a type wider than `T`, a `Seq[T]`'s `length()` is an `int` that a `long` range can
-  exceed (trapping, as `int.min .. int.max` does), and a bare `Range` written in signatures means
-  the `int` range today. `for` over a range written in place already counts any integer type.
-  Awaiting the user's choice of how `Range` is spelled and what type its `by` step has.
+- **Ranges of other integer types are `NumericRange[T: Integer]`** (settled, user, 2026-11-04).
+  `Range` stays the `int` range, and a bare `Range` in a signature means it. `a..b` and `a..<b`
+  written as values make a `NumericRange[T]` where the bounds are integers of any type other than
+  `int` (`long`, `i8`, `i16`, …); an integer literal bound takes its type from the other bound, and
+  bounds of two types are an error. `by` takes a step of the same type, `T`. It is a `Seq[T]`
+  with the `Range` rules: a zero step traps, a range is empty when its start lies past its limit in
+  the step's direction, and iteration stops without stepping past the limit, so it never passes
+  either end of `T`. `get`, `apply`, `head`, `contains` and `isEmpty` are answered from the bounds
+  and never wrap, at any width; `length()` traps beyond `int`, and `last()` and the other
+  questions that count the values trap for a range whose ends are more than the largest `long`
+  apart (the smallest `long` to the largest), which only a range of `long`s can be. `for` over a range
+  written in place already counted any integer type, and still does.
 - Value definitions in a `for` with `yield` ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
   `pattern = value` after a generator, each with its own `if` guards, written with no `val`, and
   never first. It is evaluated once per element that reaches it and binds in what follows. Where no
