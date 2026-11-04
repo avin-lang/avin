@@ -265,6 +265,20 @@ A call made before the local function's declaration must not reach a local that 
 initialized there, directly or through the local functions it calls, and the function needs a
 declared result type for such a call, as it does for recursion.
 
+A local function may declare type parameters of its own, with bounds, exactly as a top-level
+function does. Its calls write its type arguments or leave them to be inferred, and used as a value
+it takes them from the expected function type. Inside a generic function it also sees the enclosing
+type parameters, which every call shares and none writes. A type parameter of a local function may
+not reuse the name of one already in scope:
+
+```text
+pairs[T: Display](first: T) -> string
+    pair[U](x: U) -> (T, U) = (first, x)
+    s"${pair(1)} ${pair("a")} ${pair[real](2.5)}"
+
+pairs("p")               // "(p, 1) (p, a) (p, 2.5)"
+```
+
 ## data
 
 `data` declares an algebraic data type: an immutable value with one or more variants.

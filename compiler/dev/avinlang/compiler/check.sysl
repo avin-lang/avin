@@ -4519,7 +4519,7 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
 private declare_defaults(c: *Checker, id: usize)
     val f = c.symbols[id]
     val first = if is_method(f) then 1usize else 0usize
-    val shared = f.owner_class is Some(_) || f.receiver is Some(_)
+    val shared = f.owner_class is Some(_) || f.receiver is Some(_) || (f.root is Some(_) && f.decl.type_params.len() > 0)
     var defaults: Buf[Option[usize]] = buf()
     for _ in 0..<first
         defaults.push(None)
@@ -5791,14 +5791,30 @@ private declare_local_functions(c: *Checker, items: Buf[&Expr])
     for item in items
         if item.kind is LocalFunction(decl)
             val enclosing = c.symbols[c.current]
-            if decl.type_params.len() > 0
-                c.note(unit_of(c), decl.name_span, "generic local functions are not implemented")
-                continue
             var set: Buf[usize] = buf()
             for i in start..<c.body.functions.len()
                 if c.symbols[c.body.functions[i]].name == decl.name then set.push(c.body.functions[i])
             val id = c.symbols.len()
-            var symbol = signature(c, enclosing.unit, enclosing.module_name, decl, id, decl.type_params, false, None)
+            // A generic local function's type parameters follow those in scope where it is declared,
+            // all owned by the owner of the top-level function's, so each copy of it is a copy of
+            // that function's with type arguments of its own added.
+            var owner = id
+            var type_params: Buf[TypeParam] = buf()
+            if decl.type_params.len() > 0
+                owner = c.symbols[c.body.root].type_owner
+                if c.generic is Some(scope)
+                    owner = scope.owner
+                    for tp in scope.params
+                        type_params.push(tp)
+                var clash = false
+                for tp in decl.type_params
+                    if names_type_param(type_params, tp.name)
+                        c.note(unit_of(c), tp.span, s"`${tp.name}` is already a type parameter where `${decl.name}` is declared; name this one differently")
+                        clash = true
+                if clash then continue
+                for tp in decl.type_params
+                    type_params.push(tp)
+            var symbol = signature(c, enclosing.unit, enclosing.module_name, decl, owner, type_params, false, None)
             symbol.root = Some(c.body.root)
             if same_as_overload(c, symbol, set)
                 c.note(unit_of(c), decl.name_span, s"`${decl.name}` is declared more than once in this block with the same parameter types")
@@ -6010,6 +6026,10 @@ private check_local_symbol(c: *Checker, id: usize)
     c.current = id
     c.body.loops = buf()
     c.body.block_start = mark
+    // A generic local function's own type parameters are in scope in its body, after the enclosing
+    // ones it shares.
+    val outer_generic = c.generic
+    if decl.type_params.len() > 0 && symbol.type_params.len() > 0 then c.generic = Some(GenericScope(symbol.type_owner, symbol.type_params))
     var param_locals: Buf[usize] = buf()
     for i in 0..<symbol.params.len()
         param_locals.push(declare_local(c, decl.span, symbol.param_names[i], symbol.params[i], false))
@@ -6018,6 +6038,7 @@ private check_local_symbol(c: *Checker, id: usize)
     for i in 0..<param_locals.len()
         subjects.push(TExpr(decl.name_span, symbol.params[i], Local(param_locals[i])))
     check_definition(c, id, subjects)
+    c.generic = outer_generic
     c.body.visible.truncate(mark)
     c.body.block_start = outer_start
     c.body.loops = loops
@@ -9081,7 +9102,16 @@ private apply_value(c: *Checker, at: Span, name: string, o: usize, ids: Buf[usiz
 
 private function_signature(c: *Checker, id: usize, result: &Type) -> Signature
     val f = c.symbols[id]
-    Signature(f.name, true, f.type_params, f.type_owner, f.params, f.param_names, f.defaults, result, buf(), None, declares_variadic(f.decl), function_sites(c, id, 0))
+    Signature(f.name, true, f.type_params, f.type_owner, f.params, f.param_names, f.defaults, result, enclosing_type_args(f), None, declares_variadic(f.decl), function_sites(c, id, 0))
+
+/** A generic local function's type arguments for the type parameters it shares with the code it is
+ * declared in: those parameters themselves, as every call it can be named from sees them. */
+private enclosing_type_args(f: FunctionSymbol) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    if f.root is None || f.decl.type_params.len() == 0 || f.type_params.len() <= f.decl.type_params.len() then return out
+    for i in 0..<f.type_params.len() - f.decl.type_params.len()
+        out.push(TypeVar(f.type_owner, i, f.type_params[i].name))
+    out
 
 /** The overload a call chooses, if it chooses one, and its arguments as checked while choosing: one
  * entry per written argument, `None` for one left to be checked against the chosen parameter. */
@@ -9367,7 +9397,8 @@ private overload_text(c: *Checker, id: usize) -> string
     for i in first..<f.params.len()
         names.push(f.param_names[i])
         params.push(f.params[i])
-    candidate_text(f.name, f.type_params, names, params)
+    // A local function shows its own type parameters, not those it shares with the enclosing code.
+    candidate_text(f.name, if f.root is Some(_) then f.decl.type_params else f.type_params, names, params)
 
 /** A candidate of a call as written, for a diagnostic: "`f[T](x: T)`". */
 private candidate_text(name: string, type_params: Buf[TypeParam], names: Buf[string], params: Buf[&Type]) -> string
@@ -10411,18 +10442,20 @@ private function_value(c: *Checker, at: Span, id: usize, explicit: Option[Buf[&T
     local_use(c, id, at)
     val result = result_of(c, id, at)
     val type_params = target.type_params
+    val known = enclosing_type_args(target)
     val first = c.vars.len()
     var type_args: Buf[&Type] = buf()
-    for _ in type_params
-        type_args.push(fresh_var(c))
+    for i in 0..<type_params.len()
+        type_args.push(if i < known.len() then known[i] else fresh_var(c))
     if explicit is Some(types)
-        if types.len() > type_params.len()
-            c.note(unit, at, s"`${target.name}` takes ${count(type_params.len(), "type argument")}, not ${types.len()}")
-            for t in type_args
-                unify(c, t, ErrorType)
+        val own = type_params.len() - known.len()
+        if types.len() > own
+            c.note(unit, at, s"`${target.name}` takes ${count(own, "type argument")}, not ${types.len()}")
+            for i in known.len()..<type_args.len()
+                unify(c, type_args[i], ErrorType)
         else
             for i in 0..<types.len()
-                unify(c, type_args[i], resolve_type(c, unit, types[i]))
+                unify(c, type_args[known.len() + i], resolve_type(c, unit, types[i]))
     val declared: &Type = Function(target.params, result)
     val ty = substitute(declared, target.type_owner, type_args)
     if expected is Some(want) then unify(c, ty, want)
@@ -10434,6 +10467,9 @@ private function_value(c: *Checker, at: Span, id: usize, explicit: Option[Buf[&T
                 c.note(unit, at, s"cannot infer `${type_params[i].name}` for `${target.name}` used as a value; write it, as in `${target.name}[int]`")
                 c.vars.set(v, Some(ErrorType))
         solved.push(zonk(c, t))
+    // The type arguments, written or taken from the expected type, are held to their bounds as a
+    // call's are.
+    hold_to_bounds(c, unit, at, s"`${target.name}`", target.type_owner, type_params, solved, known.len())
     c.symbols[id].value = true
     TExpr(at, zonk(c, ty), FunctionValue(id, solved))
 

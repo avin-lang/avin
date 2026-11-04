@@ -819,6 +819,11 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
+- Generic local functions ([declarations](/spec/declarations/#functions)): a local function's type
+  parameters follow the enclosing ones it shares, which its calls never write, so `pair[int](1)`
+  writes only `pair`'s own. A local function's type parameter may not take the name of one already
+  in scope rather than hiding it. Written type arguments and those an expected type gives a generic
+  function used as a value are held to its bounds, as a call's are.
 - Literal shapes ([collections](/spec/collections/#literals)): each of the library's collections is
   built only by the literal of its own shape: every `Seq` by `[a, b]`, `Set`, `TreeSet` and the
   mutable `Set` by `{a, b}`, and `Map`, `TreeMap` and the mutable `Map` by `{k: v}`, so
