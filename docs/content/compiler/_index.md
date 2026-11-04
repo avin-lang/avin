@@ -667,7 +667,9 @@ on the field's address at the instance's type, and the emitter makes it one `seq
 the value's storage width: `load atomic`, `store atomic`, `atomicrmw xchg` and `cmpxchg`, whose
 success bit is the result. A `bool` or a narrow integer is widened as a shared field is, a `real` is
 accessed as the 64 bits of its encoding, and a reference as a `ptr`, so a compare-and-set compares
-identity. An integer wider than 64 bits has no single atomic access, so each operation on one is the
+identity. `compareAndSet` of a value without identity (data, tuple, string, `Any`) is library code
+over two intrinsics, `atomic_by_value`, which lowering folds to a constant for the instance's `T`,
+and `atomic_compare_set` on the word: it loops on `==` and a word compare-and-set. An integer wider than 64 bits has no single atomic access, so each operation on one is the
 field's word-at-a-time accesses between `avin_rt_wide_atomic_begin` and `avin_rt_wide_atomic_end`,
 which take and give back one spin lock every such operation shares. `add`, `sub` and `update` are
 library code, a loop of `load` and `compareAndSet`, so an integer that would overflow traps before
