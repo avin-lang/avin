@@ -238,9 +238,9 @@ lower_program(program: TProgram) -> MirProgram
     for b in program.builtins
         if b.table.len() > generic_base then generic_base = b.table.len()
     var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false)
-    // Record 0 is for the objects no type pattern names: closures, and the boxes of captured
-    // variables.
-    l.records.push(TypeRecord("a closure or a captured variable", buf(), None, None))
+    // Record 0 is for the objects no value of the program's types is: the boxes of captured
+    // variables. A closure's record is its function type's.
+    l.records.push(TypeRecord("a captured variable", buf(), None, None))
     l.record_types.push(Unit)
     // A module-level value made at compile time has no storage: every read of it is the constant.
     for _ in program.globals
@@ -1127,11 +1127,13 @@ private type_test(l: *Lowering, object: Operand, t: &Type) -> Operand
     compare(l, CmpNe, found, ConstInt(32, "0"))
 
 /** Whether only a value of exactly type `t` has type `t`: true of every type but an open or
- * abstract class, a trait, an instance of a type with a parameter that is not invariant, and a tuple
- * with a part of one. */
+ * abstract class, a trait, an instance of a type with a parameter that is not invariant, a function
+ * type (whose parameters and result vary, and which a class may extend), and a tuple with a part of
+ * one. */
 private exact(l: *Lowering, t: &Type) -> bool = *t match
     Class(k, _, _) -> l.program.classes[k].decl.modifier == "" && all_invariant(l.program.classes[k].decl.type_params)
     Data(d, _, _) -> all_invariant(l.program.data[d].decl.type_params)
+    Function(_, _) -> false
     Tuple(items) ->
         for item in items
             if !exact(l, item) then return false
@@ -1263,10 +1265,21 @@ private closure_shape(l: *Lowering, function: usize, type_args: Buf[&Type], entr
                     fields.push(FieldSlot(size, m))
                     size += field_size(m)
         None -> ()
+    val record = record_of(l, closure_type(l, function, type_args))
     val shape = ClosureShape(l.descriptors.len(), fields)
-    l.descriptors.push(Descriptor("closure of " + function_symbol(l.program, function, type_args), 0, size, refs, false, buf(), 0, false, Some(entry)))
+    l.descriptors.push(Descriptor("closure of " + function_symbol(l.program, function, type_args), 0, size, refs, false, buf(), record, false, Some(entry)))
     l.shapes.put(key, shape)
     shape
+
+// The exact type of a closure of `function`'s copy at `type_args`: the function type its own
+// parameters and result make, in that copy. A type pattern on a function type tests it.
+private closure_type(l: *Lowering, function: usize, type_args: Buf[&Type]) -> &Type
+    val symbol = l.program.symbols[function]
+    val owner = l.program.symbols[symbol.root.unwrap_or(function)].type_owner
+    var params: Buf[&Type] = buf()
+    for p in symbol.params
+        params.push(substitute(solve(l.program.vars, p), owner, type_args))
+    Function(params, substitute(solve(l.program.vars, symbol.result.unwrap_or(Unit)), owner, type_args))
 
 // The type arguments of the copy of `symbol` a call or a function value in the instance being
 // lowered reaches. A local function without type parameters of its own shares those of the code it
@@ -2820,7 +2833,7 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
             val pointer = pointer_option(l, from)
             if always_is(l, from, to)
                 if (*to is AnyType && !(*from is AnyType)) || (pointer && !pointer_option(l, to)) then bound = box_value(l, from, value)
-            elif *from is AnyType || *from is Class(_, _, _) || *from is Tuple(_) || *from is Data(_, _, _)
+            elif *from is AnyType || *from is Class(_, _, _) || *from is Tuple(_) || *from is Data(_, _, _) || *from is Function(_, _)
                 // An object whose type is a subtype of its static type: its descriptor's record says.
                 if value is Some(v)
                     val object = if pointer then option_object(l, from, v) else v
@@ -3107,8 +3120,8 @@ private own_hash(l: *Lowering, t: &Type, a: Operand) -> Operand
         _ -> runtime_call(l, "avin_rt_identity_hash", [MRef], MInt(64), [a])
 
 /** Gives every type record that some object has as its own type equality entries; whether it made
- * any. A trait's record and an abstract class's belong to no object. Record 0, of closures, compares
- * by identity. */
+ * any. A trait's record and an abstract class's belong to no object. Record 0, of captured
+ * variables' boxes, and a function type's record, of closures, compare by identity. */
 private add_equality_entries(l: *Lowering) -> bool
     var added = false
     var r = 0usize
