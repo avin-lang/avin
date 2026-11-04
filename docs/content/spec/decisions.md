@@ -150,7 +150,8 @@ a decision changes, this page and the chapter change together.
   covariant type takes its parameter in. A value of the bound is one of the parameter with no
   conversion, so a type argument is the bound or a reference type it is seen as. A call infers the
   join of the bound and the arguments, `Any` where they are references with no nearer common type;
-  a written or expected type argument is held to the bound. An override writes its method's lower
+  a written or expected type argument is held to the bound (the expected type's part is refined,
+  proposed below). An override writes its method's lower
   bound or none. A type's and an impl's parameters take none.
 - The built-in types belong to the core library's module, `avin`; a conformance of one is written
   there or in the trait's module. An impl that only adds methods may be written in any module
@@ -225,6 +226,19 @@ a decision changes, this page and the chapter change together.
   differs from `trim`'s `White_Space`; `isSpaceChar` is the categories `Zs`, `Zl` and `Zp`.
   `asDigit` is the digit's value in radix 36 (Unicode decimal digits give their value, ASCII and
   fullwidth letters give 10 to 35) and is -1 for any other character, never a trap.
+- Settled by the user 2026-11-04 ([collections](/spec/collections/#maps-and-sets)): `Map[K, +V]` and
+  `Set[A]` are traits, as in the reference library. The hash-based collections are `HashMap` and
+  `HashSet`; `TreeMap` and `TreeSet` conform to `SortedMap[K, +V]` and `SortedSet[A]`, which require
+  `Map` and `Set` and re-declare the updating methods with the sorted result. Map and set literals,
+  `Map(…)`, `Set(…)`, `Map.empty`, `Set.empty` and the two builders make the hash-based ones, typed as
+  the traits; `SortedMap` and `SortedSet` companions, and a literal where one is expected, make tree
+  ones. A method putting a value in takes `[W >: V]`. An update through a trait answers the same
+  kind; `map`, `collect` and `flatMap` through the trait answer a hash-based collection. Maps and sets
+  of different kinds with equal contents are equal, through the traits and `Any`, and hash alike. A
+  map has no `mkString` of its own: it joins its entries as pairs, `(a, 1)`, through `Iterable`'s.
+  The ordered operations keep their names, `first`, `last`, `floor`, `ceiling`, `from`, `until`,
+  `range` (from inclusive, until exclusive) and `reverseIterator`; the tree is balanced by weight,
+  each side at most three times the other.
 - A generic overload is compared by the same rule as any other: `f(x: int)` is more specific than
   `f[T](x: T)`, which accepts an `int` while `f(int)` does not accept a `T`.
 - Whether a parameter is by-name does not distinguish overloads. An argument some candidate takes by
@@ -1004,6 +1018,14 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
+- Lower bounds and the expected type ([generics](/spec/generics/#lower-bounds)): the expected type
+  decides a lower-bounded type argument only where it admits the bound; otherwise the argument is
+  inferred from the bound and the arguments, and the result is passed as any value is. So
+  `println(m.getOrElse(k, "none"), n)` on a `Map[string, string]`, where each argument expects a
+  `Display`, takes `W` as `string` rather than reporting `Display` as no supertype of `string`. A
+  delayed (by-name) argument widens an open lower-bounded type argument as any other argument does:
+  `cats.getOrElse(k, dog)` is an `Animal`. Both keep programs working that called the methods before
+  they took `[W >: V]`. Awaiting the user.
 - Nested data types ([generics](/spec/generics/#polymorphic-recursion)): a data type naming itself
   at a larger instance in its fields (`Deeper(inner: Tree[Nest[T]])` in `Tree[T]`) is rejected at
   the type as polymorphic recursion, even where no code compares, hashes or shows it, since every
@@ -1035,16 +1057,6 @@ Settled by the user on 2026-11-04:
   literal whose elements its builder takes, a map literal only by a builder of pairs. A map literal's
   keys agree on one type and its values on another, each as `if` branches do. The mutable `Set` and
   `Map` gain companions with `empty` and `builder`.
-- Sorted collections ([collections](/spec/collections/#sorted-maps-and-sets)): `TreeMap[K: Ord, +V]`
-  and `TreeSet[A: Ord]` are data types of their own beside `Map` and `Set`, not variants of them, and
-  `Map` and `Set` stay the hash-based collections rather than becoming traits over a `HashMap` and a
-  `HashSet`. A tree collection has the same traits as its hash-based counterpart (`Iterable`, the
-  function type, `Eq`, `Hash`, `Display`, `Debug`) and the same methods, so code over those traits
-  takes either; a method that makes a collection of another key (`map`, `collect`, `flatMap`) bounds
-  it by `Ord` and answers a tree collection. A tree collection hashes to what the hash-based one with
-  the same contents does. The ordered operations are `first`, `last`, `floor`, `ceiling`, `from`,
-  `until`, `range` (from inclusive, until exclusive) and `reverseIterator`. The tree is balanced by
-  weight, each side at most three times the other.
 - Packages ([packages](/spec/packages/)), modelled on Sysl's package system:
   - **The manifest**: `package { name, version, description }`, `dependencies { … }` and `workspace
     = [ … ]`, and no other key; an unknown key is an error, not a warning. A name is a lowercase
