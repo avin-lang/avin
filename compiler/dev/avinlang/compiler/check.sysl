@@ -5667,6 +5667,18 @@ private hold_to_bounds(c: *Checker, unit: usize, at: Span, what: string, owner: 
                 if !same_type(lower, arg) then c.views.push(TypeView(one_part(lower), one_part(arg)))
             else c.note(unit, at, s"`${type_name(arg)}` is not a supertype of `${type_name(lower)}`, the lower bound of `${params[i].name}` in $what")
 
+/** Whether each of `args` decided so far, from position `from` on, is a supertype of its parameter's
+ * lower bound as `hold_to_bounds` requires; one not yet known, or whose bound is not, passes. */
+private admits_lowers(c: *Checker, owner: usize, params: Buf[TypeParam], from: usize, args: Buf[&Type]) -> bool
+    for i in from..<params.len()
+        if i >= args.len() then break
+        if lower_at(c, owner, params, i) is Some(l)
+            val lower = zonk(c, substitute(l, owner, args))
+            val arg = zonk(c, args[i])
+            if *arg is ErrorType || *lower is ErrorType || has_unknowns(arg) || has_unknowns(lower) then continue
+            if !conforms(lower, arg) && !conforms(view_part(conformances(c), lower, arg), arg) then return false
+    true
+
 /** Whether trait `k`'s methods, or those of a trait it requires, mention `Self` other than as the
  * receiver: such a trait is only a bound. */
 private mentions_self(c: *Checker, k: usize, depth: usize) -> bool
@@ -7931,7 +7943,8 @@ private is_collection_literal(e: &Expr) -> bool =e.kind is ListLit(_) || e.kind 
 const MutableModule: string = "avin.collections.mutable"
 
 // Which literal the library's collection `t` is written as: "sequence" for every `Seq`, "set" for
-// the hash-based and sorted sets, immutable and mutable, "map" for the maps, and "" for any other
+// the sets, immutable and mutable, the `Set` and `SortedSet` traits and the hash-based and tree sets
+// among them, "map" for the maps likewise, and "" for any other
 // type, a program's own collection included, which any literal its builder takes can build.
 private collection_shape(c: *Checker, t: &Type) -> string
     if seq_element(c, t) is Some(_) then return "sequence"
@@ -7946,8 +7959,9 @@ private collection_shape(c: *Checker, t: &Type) -> string
             name = c.data[d].name
         _ -> return ""
     if module_name != CoreModule && module_name != MutableModule then return ""
-    if name == "Set" || (name == "TreeSet" && module_name == CoreModule) then return "set"
-    if name == "Map" || (name == "TreeMap" && module_name == CoreModule) then return "map"
+    val core = module_name == CoreModule
+    if name == "Set" || (core && (name == "HashSet" || name == "SortedSet" || name == "TreeSet")) then return "set"
+    if name == "Map" || (core && (name == "HashMap" || name == "SortedMap" || name == "TreeMap")) then return "map"
     ""
 
 // A collection literal is built with a builder, except where a `List` is expected (see
@@ -11152,7 +11166,13 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
                 unify(c, type_args[known.len() + i], resolve_type(c, unit, types[i]))
     val wanted = substitute_all(params, owner, type_args)
     val declared = substitute(result, owner, type_args)
-    if expected is Some(want) then unify(c, declared, want)
+    // The expected type decides a type argument only where it admits that argument's lower bound: a
+    // `getOrElse[W >: V]` of `string` values passed where a `Display` is expected takes `W` from its
+    // bound, and its `string` result is then passed as a `Display` is.
+    if expected is Some(want)
+        val saved = save_vars(c)
+        unify(c, declared, want)
+        if !admits_lowers(c, owner, type_params, known.len(), type_args) then restore_vars(c, saved)
     var targets: Buf[Option[&Type]] = buf()
     for j in 0..<binding.targets.len()
         targets.push(argument_type(c, s, wanted, binding, args, j))
@@ -11741,7 +11761,17 @@ private call_argument(c: *Checker, arg: Argument, param: Option[&Type], open: *B
         val known = loosen(c, p, open, true)
         if !(*known is Var(_)) then wanted = Some(known)
     if param is Some(p)
-        if *zonk(c, p) is ByName(inner) then return delayed_argument(c, arg, p, inner)
+        if *zonk(c, p) is ByName(inner)
+            // A delayed argument widens an open type argument as any other does: `getOrElse(k, dog)`
+            // on a map of cats takes `W >: Cat` as `Animal`.
+            val raw = if *p is ByName(r) then r else inner
+            val loose = loosen(c, raw, open, true)
+            if same_type(zonk(c, loose), inner) then return delayed_argument(c, arg, p, inner)
+            val delayed = delayed_argument(c, arg, ByName(loose), loose)
+            if *delayed.ty is ByName(yields)
+                if !(*yields is Nothing) && !constrain(c, raw, yields, open, true)
+                    c.note(unit, arg.value.span, mismatch(c, zonk(c, raw), yields))
+            return delayed
     val value = check_expr(c, arg.value, wanted)
     if param is Some(p)
         if !(*value.ty is Nothing) && !constrain(c, p, value.ty, open, true)
