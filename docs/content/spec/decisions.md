@@ -441,8 +441,18 @@ Settled by the user on 2026-11-03:
   `iN`), lets the core library implement a trait once for every width (`impl[T: Integer] Display for
   T`). Such an impl over a bare type parameter is allowed only for closed core traits, in the core
   library.
-- Until methods can be named by symbols, a vector's `:+`, `+:` and `++` are `appended`,
-  `prepended` and `concat`, and a buffer's `+=` is `add`.
+- Settled by the user 2026-11-03: any run of the operator characters `+ - * / % < > = ! & | ^ ~ : ?`
+  that is not one of the language's operators names a method, declared like any method and called
+  infix (`xs ++ ys`) or dotted (`xs.++(ys)`). The language's operators, including the yielding
+  compound forms, are not method names: a type has them through their traits, and a method named
+  `+` is an error saying to implement `Add`. A symbol call binds at the infix-call level and groups
+  left, except that a name ending in `:` groups right with its receiver on the right (`x +: xs` is
+  `xs.+:(x)`, `x` evaluated first); left- and right-grouping calls do not mix without parentheses.
+  There are no prefix or postfix symbol methods; `++` and `--` update when no operand follows on the
+  line. `x op= y` calls the method `op=` where `x`'s type has one, and otherwise is the language's
+  compound assignment or, for a symbol method `op`, `x = x op y`. The library uses symbols:
+  `Vector`'s `++`, `:+` and `+:`, `List`'s and `Map`'s `++`, and a buffer's `+=` and `++=` beside
+  `add` and `addAll`.
 - A module may be named in code through an import of the module itself: `import a.b`, then `b.X`
   reaches `a.b`'s public `X`, alongside imports of single declarations.
 - An infix method call binds more loosely than arithmetic, bitwise, shift, cons and range operators
@@ -508,6 +518,9 @@ Settled by the user on 2026-11-03:
   giving it too; its body has no `self`; a trait's default body cannot call one on `Self`; a trait
   with one is a bound and not a type; and a local, parameter, member or module value of a type's
   name hides the type as a receiver.
+- `i1` has no `1`: `i1.one()` is a compile error, and `one()` reached at `i1` through a generic
+  traps with "i1 has no 1" at the place the program called, so a generic that passes its bounds
+  compiles for every type meeting them.
 - An `impl` may add methods to a trait (`impl[T] Seq[T]`, `impl[T: Display] Seq[T]`). Its methods
   reach the value only through the trait's own methods, which are variance-checked, so, like the
   methods an impl adds to a `data` type, they are not variance positions: `contains(element: T)`,
@@ -580,7 +593,6 @@ Settled by the user on 2026-11-03:
   so a racing read sees some value written to that word, and a constructor ends with a release
   fence, so no thread sees an object without its header and constructor-set fields. Actors are
   scheduled onto a pool of these threads.
-- The width `i1` has no `1`, so its `one()` is `i1(1)`, which is `-1`.
 
 ## Open
 
