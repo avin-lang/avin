@@ -260,8 +260,17 @@ lower_program(program: TProgram) -> MirProgram
             if d.implementing[j] then implementing.set(d.methods[j], true)
         for m in d.withdrawn
             implementing.set(m, true)
+    // A top-level function with a generic local function compiles the code inside that function
+    // only through the calls and function values that reach it, each with its type arguments.
+    var generic_locals: Buf[bool] = buf()
+    for _ in program.symbols do generic_locals.push(false)
+    for s in program.symbols
+        if s.root is Some(r)
+            if s.decl.type_params.len() > 0 then generic_locals.set(r, true)
     for i in 0..<program.symbols.len()
-        if !is_generic(program, i) && !never_compiled(program, i) && !in_core_library(program, i) && !implementing[i] then instance(&l, i, buf())
+        var inside_generic_local = false
+        if program.symbols[i].root is Some(r) then inside_generic_local = generic_locals[r]
+        if !inside_generic_local && !is_generic(program, i) && !never_compiled(program, i) && !in_core_library(program, i) && !implementing[i] then instance(&l, i, buf())
     val entry: Option[usize] = program.entry match
         Some(id) -> Some(instance(&l, id, buf()))
         None -> None
@@ -1259,16 +1268,47 @@ private closure_shape(l: *Lowering, function: usize, type_args: Buf[&Type], entr
     l.shapes.put(key, shape)
     shape
 
+// The type arguments of the copy of `symbol` a call or a function value in the instance being
+// lowered reaches. A local function without type parameters of its own shares those of the code it
+// is declared in, a prefix of the instance's; a lambda is made where it is written, so it shares all
+// of them. A generic local function has those it shares, which the call names as its enclosing type
+// parameters, followed by its own; a generic function is instantiated with the call's. Each is made
+// concrete for the instance being lowered.
+private instance_args(l: *Lowering, symbol: FunctionSymbol, type_args: Buf[&Type]) -> Buf[&Type]
+    if symbol.root is Some(root) && symbol.decl.type_params.len() == 0
+        // Only inside a generic local function's copy does the instance have more than the
+        // top-level function's.
+        if symbol.lambda || l.subst.len() <= l.program.symbols[root].type_params.len() then return l.subst
+        val shared = shared_type_params(l.program, root, symbol)
+        if shared >= l.subst.len() then return l.subst
+        var prefix: Buf[&Type] = buf()
+        for i in 0..<shared
+            prefix.push(l.subst[i])
+        return prefix
+    var out: Buf[&Type] = buf()
+    for t in type_args
+        out.push(concrete(l, t))
+    out
+
+// How many type parameters are in scope where local function `symbol` of `root` is declared: the
+// top-level function's, and those of the innermost generic local function it is declared in.
+private shared_type_params(program: TProgram, root: usize, symbol: FunctionSymbol) -> usize
+    var shared = program.symbols[root].type_params.len()
+    for s in program.symbols
+        val sibling = s.root match
+            Some(r) -> r == root
+            None -> false
+        if !sibling || s.decl.type_params.len() == 0 || s.unit != symbol.unit then continue
+        if s.decl.span.start <= symbol.decl.span.start && symbol.decl.span.end <= s.decl.span.end && s.type_params.len() > shared
+            shared = s.type_params.len()
+    shared
+
 // A function as a value. One that captures nothing is a constant closure; otherwise the captured
 // values are read first and the closure is allocated after, so a collection while allocating sees
 // each of them as a root.
 private function_value(l: *Lowering, function: usize, type_args: Buf[&Type]) -> Operand
     val symbol = l.program.symbols[function]
-    var concrete_args: Buf[&Type] = buf()
-    if symbol.root is Some(_) then concrete_args = l.subst
-    else
-        for t in type_args
-            concrete_args.push(concrete(l, t))
+    val concrete_args = instance_args(l, symbol, type_args)
     val entry = entry_instance(l, function, concrete_args)
     val shape = closure_shape(l, function, concrete_args, entry)
     if shape.fields.len() == 0
@@ -1446,14 +1486,7 @@ private call_resolved(l: *Lowering, e: &TExpr, function: usize, callee: Function
         if l.local_slots[x] is Some(p) then operands.push(p.address)
     for x in callee.captured_params
         if l.param_values[x] is Some(v) then operands.push(Value(v))
-    // A local function shares its top-level function's type arguments; a generic function is
-    // instantiated with the call's, made concrete for the instance being lowered.
-    var concrete_args: Buf[&Type] = buf()
-    if callee.root is Some(_) then concrete_args = l.subst
-    else
-        for t in type_args
-            concrete_args.push(concrete(l, t))
-    val index = instance(l, function, concrete_args)
+    val index = instance(l, function, instance_args(l, callee, type_args))
     val dest = machine(l, e.ty) match
         Some(t) -> Some(fresh(l, t))
         None -> None

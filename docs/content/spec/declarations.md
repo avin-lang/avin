@@ -271,6 +271,20 @@ function is visible across the whole block. A block nested inside, a lambda's bo
 function's parameters are other scopes, and a local there may hide the function as any local hides
 an outer name. The block's own local functions of one name are overloads of each other.
 
+A local function may declare type parameters of its own, with bounds, exactly as a top-level
+function does. Its calls write its type arguments or leave them to be inferred, and used as a value
+it takes them from the expected function type. Inside a generic function it also sees the enclosing
+type parameters, which every call shares and none writes. A type parameter of a local function may
+not reuse the name of one already in scope:
+
+```text
+pairs[T: Display](first: T) -> string
+    pair[U](x: U) -> (T, U) = (first, x)
+    s"${pair(1)} ${pair("a")} ${pair[real](2.5)}"
+
+pairs("p")               // "(p, 1) (p, a) (p, 2.5)"
+```
+
 ## data
 
 `data` declares an algebraic data type: an immutable value with one or more variants.
