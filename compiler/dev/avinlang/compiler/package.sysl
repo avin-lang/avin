@@ -615,6 +615,117 @@ tidy(dir: string, fetching: Fetching, check: bool, say: string -> unit) -> Resul
         write_text_atomic(res.sum_file, render_sums(lines)).map_err(e -> s"avin: ${res.sum_file}: ${e.to_string()}")?
     Ok(false)
 
+// Adding a dependency.
+
+/** The highest version the repository at `coordinate` has a release tag for, read from the tags the
+ * host lists: a tag `v` and a version, such as `v1.4.0`; any other tag is not a release. */
+latest_version(fetching: Fetching, coordinate: string) -> Result[string, string]
+    val url = fetching.base + coordinate + ".git"
+    val result = capture("git", ["ls-remote", "--tags", url], stderr = true, timeout = 600000).map_err(e -> s"avin: cannot list the releases of $coordinate: could not run git: ${e.to_string()}")?
+    if !result.status.ok()
+        return Err(s"avin: cannot list the releases of $coordinate at $url:\n${result.err.unwrap_or("")}${result.text}")
+    var best = ""
+    for line in result.text.lines()
+        val fields = line.split("\t")
+        if fields.len != 2 || !fields[1].starts_with("refs/tags/v") then continue
+        var tag = fields[1]["refs/tags/v".bytes.len..]
+        if tag.ends_with("^{}") then tag = tag[0..<tag.bytes.len - 3]
+        if !valid_version(tag) then continue
+        if best == "" || version_after(tag, best) then best = tag
+    if best == "" then return Err(s"avin: $coordinate has no release tag, `v1.0.0` being the tag of version 1.0.0; name a version, `avin add $coordinate@1.0.0`")
+    Ok(best)
+
+/** Records the dependency `source`, a coordinate with an optional `@version` (the highest release
+ * when none is given), in the manifest of the package at `dir`, fetches it, and adds what it and its
+ * own dependencies hashed to to the sum file. A dependency already listed, under its coordinate or
+ * under the name the added package gives itself, has its version changed in place. Everything else
+ * in the manifest, its comments and layout included, is left as written; where the dependency cannot
+ * be fetched or is not a package, the manifest is as it was. Says through `say` what it did. */
+add_dependency(dir: string, source: string, fetching: Fetching, say: string -> unit) -> Result[unit, string]
+    val home = canonicalize(dir).map_err(e -> s"avin: $dir: ${e.to_string()}")?
+    val m = read_manifest(home)?
+    if !m.has_package then return Err(s"avin: $home is a workspace's root with no `package` block, which takes no dependencies: add to one of its members")
+    val parts = source.split("@")
+    if parts.len > 2 then return Err(s"avin: `$source` is not a source: a coordinate and optionally a version, `github.com/owner/name@1.0.0`")
+    val coordinate = parts[0]
+    if !valid_coordinate(coordinate)
+        return Err(s"avin: `$coordinate` is not a git coordinate: a coordinate names a repository as `host/owner/name`, such as `github.com/owner/json`, with no `https://` and no `.git`")
+    var version = ""
+    if parts.len == 2
+        version = parts[1]
+        if !valid_version(version) then return Err("avin: " + bad_version(version))
+    else
+        version = latest_version(fetching, coordinate)?
+    // Fetch it alone first: the name it gives itself is what the manifest lists it under.
+    var fetcher = Resolver(fetching, None, buf(), buf(), buf(), false)
+    val fetched = fetch_package(&fetcher, coordinate, version)?
+    val added = read_manifest(fetched)?
+    if !added.has_package then return Err(s"avin: $coordinate v$version is a workspace's root with no `package` block, which no package can depend on")
+    var label = added.name
+    var existing: Option[Dependency] = None
+    for d in m.dependencies
+        if d.origin is Git(c, _) && c == coordinate && existing is None then existing = Some(d)
+    if existing is None
+        for d in m.dependencies
+            if d.label == label then existing = Some(d)
+    if existing is Some(d) then label = d.label
+    if label == m.name then return Err(s"avin: $coordinate is this package, `$label`, which cannot depend on itself")
+    val entry = s"{ git = \"$coordinate\", version = \"$version\" }"
+    val file = m.dir + "/" + ManifestName
+    val text = read_text(file).map_err(e -> s"avin: $file: ${e.to_string()}")?
+    val doc = parse_hocon(m.src).map_err(d -> d.render(m.src))?
+    var edited = ""
+    var block: Option[Value] = None
+    for f in doc.root.fields()
+        if f.key == "dependencies" then block = Some(f.value)
+    if existing is Some(d)
+        var target: Option[Value] = None
+        if block is Some(b)
+            for f in b.fields()
+                if f.key == d.label then target = Some(f.value)
+        val t = target match
+            Some(t) -> t
+            None -> return Err(s"avin: ${m.dir}/$ManifestName: cannot find where `${d.label}` is written")
+        edited = text[0..<t.span.start] + entry + text[t.span.end..]
+    elif block is Some(b)
+        edited = insert_entry(text, b.span, s"$label $entry")?
+    else
+        var out = str_builder()
+        out.push(text)
+        if !text.ends_with("\n") then out.push("\n")
+        out.push(s"\ndependencies {\n  $label $entry\n}\n")
+        edited = out.finish()
+    write_text_atomic(file, edited).map_err(e -> s"avin: $file: ${e.to_string()}")?
+    val outcome = resolve(m.dir, fetching, false)
+    if outcome is Err(message)
+        write_text_atomic(file, text).map_err(e -> s"avin: $file: ${e.to_string()}")?
+        return Err(message)
+    record_sums(outcome.unwrap())?
+    if existing is Some(d)
+        say(s"updated $label to $coordinate v$version")
+    else
+        say(s"added $label: $coordinate v$version")
+    Ok(())
+
+// `entry` written as the last line of the dependencies block at `block`, which is the braces and what
+// they hold.
+private insert_entry(text: string, block: Span, entry: string) -> Result[string, string]
+    if block.end < 2 || text.bytes[block.end - 1] != 125u8
+        return Err("avin: cannot find where the dependencies block ends")
+    val close = block.end - 1
+    var at = close
+    while at > block.start + 1 && is_blank_byte(text.bytes[at - 1])
+        at -= 1
+    var out = str_builder()
+    out.push(text[0..<at])
+    out.push("\n  " + entry)
+    val gap = text[at..<close]
+    out.push(if gap.contains("\n") then gap else "\n")
+    out.push(text[close..])
+    Ok(out.finish())
+
+private is_blank_byte(b: u8) -> bool = b == 32u8 || b == 10u8 || b == 13u8 || b == 9u8
+
 // Loading a program.
 
 /** A program the command line or the editor names, with its files. */
