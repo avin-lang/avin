@@ -127,6 +127,10 @@ a decision changes, this page and the chapter change together.
 - [Overloads](/spec/declarations/#functions) are the functions of one name in one scope. A block's
   local functions of a name hide every outer function of that name, whatever their parameter types,
   and a program's own top-level functions hide the prelude's of the same name.
+- A local value (`val`, `var` or a pattern binding) and a local function of the same block may not
+  share a name, whichever is written first (settled, user, 2026-11-04). In a nested block, a lambda
+  or as a parameter of the enclosing function, a local may hide an outer local function like any
+  outer name (**Proposed**: only the same-block case was decided).
 - Choosing an overload tries integer literals and lambdas against each candidate's parameter; every
   other argument is checked once on its own, and only its type is tried. A literal fits any
   parameter that can hold it.
