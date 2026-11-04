@@ -1,6 +1,6 @@
 ---
 title: Regular expressions
-summary: Proposed: `avin.regex` — the pattern language, backtracking matching with leftmost-first results, and `Regex`, `Match` and `MatchIterator`.
+summary: "Proposed: `avin.regex` — the pattern language, backtracking matching with leftmost-first results, and `Regex`, `Match` and `MatchIterator`."
 weight: 26
 ---
 
