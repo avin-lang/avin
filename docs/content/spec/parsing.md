@@ -26,10 +26,10 @@ op(text: string, f: (long, long) -> long) -> Parser[(long, long) -> long] = symb
 
 lazy val number: Parser[long] = token(integer)
 
-// The grammar refers to `expr` before it is complete, so it reads it through `defer`.
-lazy val parens: Parser[long] = symbol("(") ~> defer(expr) <~ symbol(")")
-
-lazy val atom: Parser[long] = number | parens | symbol("-") ~> defer(atom) ^^ (n -> -n)
+// The grammar refers to `expr` and `atom` before they are complete, so it reads them through `defer`.
+lazy val atom: Parser[long] = number
+    | symbol("(") ~> defer(expr) <~ symbol(")")
+    | symbol("-") ~> defer(atom) ^^ (n -> -n)
 
 lazy val factor: Parser[long] = chainRight(atom, op("^", power))
 
@@ -108,28 +108,26 @@ had. A run of a repeated parser that reads nothing ends the repetition without a
 `rep` of a parser that can succeed on nothing does not loop. A separator must be followed by a
 value: `[1, 2,]` fails at the `]`.
 
-The operators bind by the first character of their names, as every method named by symbols does
-([operators](/spec/operators-and-control-flow/#methods-named-by-symbols)): `~`, `~>` and `~!`
-tightest, then `^^` and `^^^`, then `|`, then `<~` with the comparisons. So
-`a ~ b ^^ f | c ~ d` is `((a ~ b) ^^ f) | (c ~ d)`. A `<~` binds more loosely than `^^` and `|`, so
-a rule that maps or offers an alternative after one is written in parentheses:
+The operators bind as every method named by symbols does
+([operators](/spec/operators-and-control-flow/#methods-named-by-symbols)): `~`, `~>`, `<~` and
+`~!`, every name with a `~` in it, tightest and grouping left, then `^^` and `^^^`, then `|`. So
+`a ~ b ^^ f | c ~ d` is `((a ~ b) ^^ f) | (c ~ d)`, and a rule reads as written, with no
+parentheses:
 
 ```text
-lazy val parens: Parser[long] = symbol("(") ~> defer(expr) <~ symbol(")")                   // one rule
-lazy val factor: Parser[long] = number | (symbol("(") ~> defer(expr) <~ symbol(")"))       // in parentheses
-lazy val array: Parser[Json] = (symbol("[") ~> items <~ symbol("]")) ^^ (xs -> JArray(xs))
-lazy val wrong: Parser[long] = number | symbol("(") ~> defer(expr) <~ symbol(")")          // (number | ( ~> expr) <~ )
+lazy val factor: Parser[long] = number | symbol("(") ~> defer(expr) <~ symbol(")")
+lazy val array: Parser[Json] = symbol("[") ~> items <~ symbol("]") ^^ (xs -> JArray(xs))
 ```
 
-The last line type-checks and parses `1)` but not `(1)`. A grammar of several alternatives spans
-lines inside parentheses, each line after the first starting with its `|`:
+`factor` is `number | ((symbol("(") ~> defer(expr)) <~ symbol(")"))`. A grammar of several
+alternatives spans lines, each line after the first indented and starting with its `|`, a
+[continuation line](/spec/operators-and-control-flow/#continuation-lines):
 
 ```text
-lazy val value: Parser[Json] = (
-    symbol("null") ^^^ JNull
+lazy val value: Parser[Json] = symbol("null") ^^^ JNull
     | symbol("true") ^^^ JBool(true)
     | token(decimal) ^^ (x -> JNumber(x))
-    | defer(array))
+    | defer(array)
 ```
 
 A function of the pair a `~` yields is written as a `match` function:
