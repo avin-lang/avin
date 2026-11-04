@@ -6562,6 +6562,7 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Checked(slot) -> c.checked_slots[slot]
     Member(target, name) ->
         if module_use(c, e) is Some(q) then check_form(c, q, expected, used)
+        elif limit_constant(c, e.span, target, name) is Some(k) then k
         else member_expr(c, e, target, name, expected)
     Call(callee, args) -> call_expr(c, e.span, callee, args, expected)
     InfixCall(target, name, name_span, arg) -> infix_call(c, e.span, target, name, name_span, arg, expected)
@@ -6989,6 +6990,40 @@ private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], 
 // A field is read by name from a value of a data type with one variant; a type with several is
 // taken apart by `match`, since which fields a value has depends on its variant.
 // A method named without a call is a function value bound to the value; see `method_value`.
+// The limits a built-in scalar type names: `int.MaxValue`, `i8.MinValue`, `byte.MaxValue`,
+// `char.MaxValue`, and for `real` the greatest and least finite values, the least positive one, the
+// infinities and NaN. Each is a constant. A name written on one of these types that is none of them
+// is reported; `None` where `target` is not such a type.
+private limit_constant(c: *Checker, at: Span, target: &Expr, name: string) -> Option[&TExpr]
+    if !(target.kind is Name(_)) then return None
+    if !(name.bytes.len > 0 && name.bytes[0] >= u8('A') && name.bytes[0] <= u8('Z')) then return None
+    val ty = static_receiver(c, target, name)?
+    val t = zonk(c, ty)
+    if !(*t is Int(_) || *t is Byte || *t is Char || *t is Real) then return None
+    val least = name == "MinValue"
+    val greatest = name == "MaxValue"
+    *t match
+        Int(bits) ->
+            if greatest then return Some(TExpr(at, t, IntConst(max_digits(bits))))
+            if least then return Some(TExpr(at, t, IntConst(min_digits(bits))))
+        Byte ->
+            if greatest then return Some(TExpr(at, t, IntConst("255")))
+            if least then return Some(TExpr(at, t, IntConst("0")))
+        Char ->
+            if greatest then return Some(TExpr(at, t, CharConst(1114111)))
+            if least then return Some(TExpr(at, t, CharConst(0)))
+        _ ->
+            val zero = 0.0
+            val infinity = 1.0 / zero
+            if greatest then return Some(TExpr(at, t, RealConst(1.7976931348623157e308)))
+            if least then return Some(TExpr(at, t, RealConst(-1.7976931348623157e308)))
+            if name == "MinPositiveValue" then return Some(TExpr(at, t, RealConst(4.9e-324)))
+            if name == "PositiveInfinity" then return Some(TExpr(at, t, RealConst(infinity)))
+            if name == "NegativeInfinity" then return Some(TExpr(at, t, RealConst(-infinity)))
+            if name == "NaN" then return Some(TExpr(at, t, RealConst(infinity - infinity)))
+    c.note(unit_of(c), at, s"`${type_name(t)}` has no member `$name`")
+    Some(TExpr(at, ErrorType, UnitConst))
+
 private member_expr(c: *Checker, e: &Expr, target: &Expr, name: string, expected: Option[&Type]) -> &TExpr = member_of(c, e, check_expr(c, target, None), name, expected)
 
 private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: Option[&Type]) -> &TExpr
@@ -9716,8 +9751,8 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
                 return TExpr(at, ErrorType, UnitConst)
             return construct(c, at, named.span, v, args, explicit, expected)
         if explicit is None
-            if builtin_type(name) is Some(target) then return conversion(c, at, target, args)
-            if integer_param_named(c, name) is Some(target) then return conversion(c, at, target, args)
+            if builtin_type(name) is Some(target) then return conversion(c, at, target, args, false)
+            if integer_param_named(c, name) is Some(target) then return conversion(c, at, target, args, false)
             if c.generic is Some(scope)
                 if names_type_param(scope.params, name)
                     c.note(unit, named.span, s"`$name` is a type parameter, which a call converts to only where it is bounded by `Integer`")
@@ -10315,6 +10350,12 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
     if target.kind is Name("super")
         if lookup_local(c, "super") is None && enclosing_class(c) is Some(_)
             return super_call(c, at, name_span, target.span, name, args, explicit, expected)
+    // `i8.wrap(x)` converts an integer keeping the low bits, where `i8(x)` traps on a value that does
+    // not fit; a value of the name hides the type.
+    if !infix && name == "wrap" && explicit is None && target.kind is Name(type_name_written)
+        if lookup_local(c, type_name_written) is None && param_index(c, type_name_written) is None
+            if builtin_type(type_name_written) is Some(to) then return conversion(c, at, to, args, true)
+            if integer_param_named(c, type_name_written) is Some(to) then return conversion(c, at, to, args, true)
     if !infix
         if static_receiver(c, target, name) is Some(ty) then return static_call(c, at, name_span, target, ty, name, args, explicit, expected)
     val object = check_expr(c, target, None)
@@ -11687,8 +11728,13 @@ private delayed_argument(c: *Checker, arg: Argument, param: &Type, inner: &Type)
 // A built-in type called with one value converts it. Integers convert among themselves (widening
 // sign-extends, narrowing keeps the low bits), to and from `real`, and to `byte` and `char`, which
 // trap on a value they cannot hold; `byte` and `char` convert to integers.
-private conversion(c: *Checker, at: Span, target: &Type, args: Buf[Argument]) -> &TExpr
+private conversion(c: *Checker, at: Span, target: &Type, args: Buf[Argument], wrap: bool) -> &TExpr
     val unit = unit_of(c)
+    if wrap && !(*as_integer(c, target) is Int(_))
+        c.note(unit, at, s"`wrap` converts to an integer type, which `${type_name(target)}` is not")
+        for a in args
+            check_statement(c, a.value)
+        return TExpr(at, ErrorType, UnitConst)
     if args.len() != 1 || args[0].name is Some(_)
         c.note(unit, at, s"`${type_name(target)}(…)` converts exactly one value")
         for a in args
@@ -11707,11 +11753,11 @@ private conversion(c: *Checker, at: Span, target: &Type, args: Buf[Argument]) ->
             _ -> Some(int_type())
     val x = check_expr(c, arg, want)
     if !settled(x.ty)
-        return TExpr(at, if *x.ty is Nothing then Nothing else ErrorType, Convert(x))
+        return TExpr(at, if *x.ty is Nothing then Nothing else ErrorType, Convert(x, wrap))
     if !convertible(as_integer(c, x.ty), as_integer(c, target))
         c.note(unit, at, s"cannot convert ${type_name(x.ty)} to ${type_name(target)}")
         return TExpr(at, ErrorType, UnitConst)
-    TExpr(at, target, Convert(x))
+    TExpr(at, target, Convert(x, wrap))
 
 /** The type parameter in scope named `name` when it is bounded by `Integer`, so that calling it
  * converts to the width each instance has. */
@@ -12525,7 +12571,7 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
         Negate(x) -> scan_init(c, s, x, unsafe)
         Not(x) -> scan_init(c, s, x, unsafe)
         Complement(x) -> scan_init(c, s, x, unsafe)
-        Convert(x) -> scan_init(c, s, x, unsafe)
+        Convert(x, _) -> scan_init(c, s, x, unsafe)
         Box(x) -> scan_init(c, s, x, unsafe)
         Arith(_, a, b, _) ->
             val ok = scan_init(c, s, a, unsafe)

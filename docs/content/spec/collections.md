@@ -690,7 +690,7 @@ value of the type: `for i in 2147483640..2147483647 by 5` yields 2147483640 and 
 
 A `Range` of `int`s is a `Seq[int]`, and answers its own sequence questions from its bounds in
 constant time: `length()` (trapping for a range of more values than the largest `int`, such as
-`int.min .. int.max`), `r(i)`, which is `start + i * step` and traps outside `0 ..< length()`, and
+`int.MinValue .. int.MaxValue`), `r(i)`, which is `start + i * step` and traps outside `0 ..< length()`, and
 `contains(x)`, which is whether `x` lies between the first and last values a whole number of steps
 from the first, so `(1 ..< 10 by 3).contains(7)` is true and `.contains(8)` false. `get(i)`, `head()`,
 `last()` and their `Option` forms are answered from the bounds too, so they work on a range too long

@@ -933,6 +933,12 @@ Settled by the user on 2026-11-04:
     compilation reads the prelude and then only the library modules something imports,
     transitively, so the library can grow without every program parsing all of it. Domain libraries
     are packages (as settled for `dev.avinlang`). The standard library has no features.
+- **Integer limits and narrowing** (user, 2026-11-04). `MinValue` and `MaxValue` on every integer type
+  (`int.MaxValue`, `long.MinValue`, `i8.MaxValue`, any `iN`), on `byte` and on `char`, and on `real`
+  `MaxValue`, `MinValue`, `MinPositiveValue`, `PositiveInfinity`, `NegativeInfinity` and `NaN`, all
+  compile-time constants. Narrowing integer conversions (`i8(x)`, `int(l)`, `T(n)`, and a byte or char to
+  a narrower integer) trap when the value does not fit; real-to-integer still saturates. The wrapping
+  form, `i8.wrap(x)` (spelling proposed below), keeps the low bits. Not yet: the limits of a type parameter bounded by `Integer` (`T.MaxValue`).
 
 **Deferred**
 
@@ -947,6 +953,11 @@ Settled by the user on 2026-11-04:
   public, as every member of a trait is, and is never `lazy`. A class never overrides a trait's
   field, `val` or `var`: declaring a field of its name is an error rather than an override. A trait
   never redeclares, with a value, a `val` of a trait it requires.
+- The wrapping conversion is spelled `i8.wrap(x)`, as the wrapping operators are spelled `+%`: the
+  integer type's name, `.wrap`, one operand, any integer target (a bounded type parameter included,
+  `T.wrap(n)`). The core library needs it to test whether a value fits a narrower width (the formatter
+  converts a generic integer to `long` and back). Awaiting the user.
+
 - Literal shapes ([collections](/spec/collections/#literals)): each of the library's collections is
   built only by the literal of its own shape: every `Seq` by `[a, b]`, `Set`, `TreeSet` and the
   mutable `Set` by `{a, b}`, and `Map`, `TreeMap` and the mutable `Map` by `{k: v}`, so
