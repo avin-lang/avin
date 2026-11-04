@@ -162,6 +162,19 @@ private struct Lowering
     /** Whether the program calls a function value: until it does, no descriptor of a class or data
      * type holds the `apply` such a call would run, so none is compiled for it. */
     calls_values: bool
+    /** The index of the function being lowered among the program's functions. */
+    function_index: usize
+    /** The calls through method tables made on a receiver of a known static type, in the order the
+     * functions holding them are lowered. */
+    dispatches: Buf[DispatchCall]
+
+/** A call through a method table position, in the function at index `function`, whose code is the
+ * value `code`: at position `position`, on a receiver of static type `receiver`. */
+private struct DispatchCall
+    function: usize
+    code: usize
+    position: usize
+    receiver: &Type
 
 /** One slot for a method with type parameters of its own, at one list of its own type arguments: a
  * call through a method table to `name` at checker position `position` with `type_args`, on a
@@ -198,7 +211,7 @@ lower_program(program: TProgram) -> MirProgram
         if k.table.len() > generic_base then generic_base = k.table.len()
     for d in program.data
         if d.table.len() > generic_base then generic_base = d.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false)
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf())
     // Record 0 is for the objects no type pattern names: closures, and the boxes of captured
     // variables.
     l.records.push(TypeRecord("a closure or a captured variable", buf(), None, None))
@@ -245,7 +258,8 @@ lower_program(program: TProgram) -> MirProgram
         // the program makes one, every record gets them; making them may lay out more types.
         if !l.runtime_equality || !add_equality_entries(&l) then break
     add_variant_ancestors(&l)
-    MirProgram(functions, l.strings, l.descriptors, l.records, l.closures, l.traps, global_types, entry, init, l.bound, tests, program.testing, entry_arguments)
+    functions = devirtualize(functions, l.descriptors, dispatch_sites(&l))
+    MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.traps, global_types, entry, init, l.bound, tests, program.testing, entry_arguments)
 
 /** Whether a function belongs to the core library's module, `avin`, or one under it. */
 private in_core_library(program: TProgram, id: usize) -> bool
@@ -982,6 +996,7 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
         use_slot(l, position, symbol.decl.name, receiver)
     val code = fresh(l, MPtr)
     l.insts.push(MethodSlot(code, operands[0], position))
+    if !(*receiver is AnyType) then l.dispatches.push(DispatchCall(l.function_index, code, position, receiver))
     val dest = result match
         Some(t) -> Some(fresh(l, t))
         None -> None
@@ -989,6 +1004,39 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
     dest match
         Some(id) -> Some(Value(id))
         None -> None
+
+// What the finished program shows of each call through a method table on a receiver of known static
+// type. Every object such a call can reach has a descriptor of a type that conforms to the receiver's
+// class or trait, whatever its type arguments: where all of those that hold a method at the call's
+// position hold the same one, that method is the one every receiver runs. A descriptor of a type that
+// is no class or data type, a boxed value's, cannot be placed, so it counts as holding a method of
+// its own. The guards are the descriptors of the types a value of the receiver's exact static type
+// may have, each with its method.
+private dispatch_sites(l: *Lowering) -> Buf[DispatchSite]
+    val f = lowering_conformances(l)
+    var out: Buf[DispatchSite] = buf()
+    for call in l.dispatches
+        val head = *call.receiver match
+            Class(k, _, _) -> k
+            _ -> continue
+        var single: Option[usize] = None
+        var many = false
+        var guards: Buf[DispatchGuard] = buf()
+        for d in 0..<l.descriptors.len()
+            val descriptor = l.descriptors[d]
+            if call.position >= descriptor.methods.len() then continue
+            val g = descriptor.methods[call.position] match
+                Some(g) -> g
+                None -> continue
+            val t = l.record_types[descriptor.record]
+            val placed = *t is Class(_, _, _) || *t is Data(_, _, _)
+            if placed && holding_ancestor(f, t, head) is None then continue
+            single match
+                Some(s) -> if s != g then many = true
+                None -> single = Some(g)
+            if placed && always_is(l, t, call.receiver) then guards.push(DispatchGuard(d, g))
+        out.push(DispatchSite(call.function, call.code, if many then None else single, guards))
+    out
 
 // A direct call of `function`, the receiver first for a method. A static member's receiver is a
 // type, which is not passed.
@@ -1187,6 +1235,7 @@ function_symbol(program: TProgram, id: usize, type_args: Buf[&Type]) -> string
 
 private lower_function(l: *Lowering, k: usize) -> MirFunction
     val inst = l.instances[k]
+    l.function_index = k
     if inst.generated != Written then return lower_generated(l, inst)
     val f = l.program.functions[inst.function]
     val symbol = l.program.symbols[f.symbol]
