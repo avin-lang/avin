@@ -126,6 +126,40 @@ that implements the trait and every `B` the program uses, and generates the disp
 
 Trait-typed values give one shared copy of code where monomorphizing would be wasteful.
 
+### Polymorphic recursion
+
+Because every list of type arguments gets its own copy, a program must need only finitely many of
+them. **Polymorphic recursion**, a cycle of generic code whose type arguments grow on every round,
+needs infinitely many, and is a compile-time error naming the cycle:
+
+```avin
+data Nest[T](x: T)
+
+depth[T](x: T, n: int) -> int = if n == 0 then 0 else depth(Nest(x), n - 1)
+// error: polymorphic recursion: each round of the cycle `depth` -> `depth` passes `Nest[T]`
+// for `T`, so its type arguments grow without end and the code has no finite set of copies
+```
+
+The cycle may run through any generic code: functions, methods, generic local functions, lambdas,
+and calls through a trait or a bound, where a class's implementation is reached with a larger
+instance of the class. A type argument grows when it is built from the cycle's own type parameter,
+as `Nest[T]`, `(T, T)`, `Vector[T]` or `(T) -> int` are from `T`.
+
+Recursion whose type arguments do not grow is ordinary: `f[T]` calling `f[T]`, `f[A, B]` calling
+`f[B, A]`, a call at a fixed type such as `f[int]`, and a type that grows once outside any cycle all
+have finitely many copies.
+
+A data type naming itself at a larger instance in its fields, a **nested data type** such as
+
+```avin
+data Tree[T]
+    Leaf(value: T)
+    Deeper(inner: Tree[Nest[T]])
+```
+
+is rejected the same way, at the type: every data type compares, hashes and shows its values field
+by field, and each of those needs a copy for every depth.
+
 ## Subtyping
 
 `S <: T` holds when:
