@@ -1,0 +1,269 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+
+// Which instances of the core library's `Option` are kept as one pointer.
+//
+// An `Option[T]` whose `T` is always a non-null reference to an object (a class, a trait, `Any`, a
+// string, a tuple, a function, or a data type other than `Option`) is the pointer itself: `Some(x)` is
+// `x` and `None` is null, so making a `Some` allocates nothing. Such an option is no object, so where
+// it becomes one (an `Any`, or the receiver of a trait's default body) lowering makes the `Some` or
+// `None` object it stands for, and takes the pointer back out where an object becomes such an option.
+//
+// A value is taken as another type with no conversion in two places, and the pointer must not meet
+// either where an object is expected: a view through variance, where an `Option[Dog]` inside a
+// `List[Option[Dog]]` seen as a `List[Any]` would be read as an `Any`, and a type pattern on an object
+// that finds type arguments wider than those it was made with. The checker records every view and
+// every type pattern, and where one of them could let the pointer be read as something else, no
+// option in the program is a pointer:
+//
+// - a view of an option as anything but another option, except as an `Any` where it is written (so
+//   it is boxed), or of an option with a pointer argument as one with an object argument, such as an
+//   `Option[Option[C]]` as an `Option[Any]`;
+// - a view of a type parameter as anything but a boxed `Any`, since an option could be the type
+//   argument of some copy of the generic code, unless it is through a bound no option can meet and
+//   widens no argument to a type an option could be seen as (see `bound_view`);
+// - a type pattern whose target's type arguments the tested value's static type does not fix, as on
+//   an `Any`, where the target names `Any`, a type parameter or a trait `Option` conforms to inside
+//   it;
+// - a trait `Option` conforms to with a method taking or returning `Self` inside another type, which
+//   could not be converted where it crosses.
+//
+// Views between two options whose arguments are both pointers need nothing: every such option is the
+// same pointer.
+
+/** Whether the program keeps its pointer-shaped options as pointers, and which data type is
+ * `Option`. */
+struct OptionPlan
+    option: Option[usize]
+    pointers: bool
+    /** Where they are not, what decided it. */
+    reason: string
+
+    /** Keeps every option an object, for `why`. */
+    objects(*self, why: string)
+        if self.pointers
+            self.pointers = false
+            self.reason = why
+
+end OptionPlan
+
+/** Decides, for a whole program, whether its pointer-shaped options are pointers. */
+option_plan(program: TProgram) -> OptionPlan
+    var option: Option[usize] = None
+    for i in 0..<program.data.len()
+        if program.data[i].module_name == "avin" && program.data[i].name == "Option" then option = Some(i)
+    var plan = OptionPlan(option, option is Some(_), "")
+    if !plan.pointers then return plan
+    if nests_self(program, option.unwrap()) then plan.objects("a trait `Option` conforms to takes `Self` inside another type")
+    for v in program.views
+        if !plan.pointers then break
+        walk_view(program, &plan, v.from, v.to, true, 0)
+        if !plan.pointers then plan.reason = s"${plan.reason}: ${type_name(v.from)} as ${type_name(v.to)}"
+    for t in program.type_tests
+        if !plan.pointers then break
+        walk_test(program, &plan, t.from, t.to)
+        if !plan.pointers then plan.reason = s"${plan.reason}: a type pattern ${type_name(t.to)} on ${type_name(t.from)}"
+    plan
+
+/** Whether `t` is an instance of `Option` kept as a pointer. */
+option_is_pointer(plan: OptionPlan, t: &Type) -> bool
+    if !plan.pointers then return false
+    val x = option_argument(plan, t) match
+        Some(x) -> x
+        None -> return false
+    pointer_shaped(plan, x)
+
+/** The argument of an instance of `Option`. */
+option_argument(plan: OptionPlan, t: &Type) -> Option[&Type] = *t match
+    Data(d, _, args) -> if plan.option is Some(o) && o == d && args.len() == 1 then Some(args[0]) else None
+    _ -> None
+
+// A type whose every value is a non-null reference to an object with a descriptor. A value type is
+// none, and neither is an option, whose `None` would be null too.
+private pointer_shaped(plan: OptionPlan, t: &Type) -> bool = *t match
+    AnyType -> true
+    Str -> true
+    Tuple(_) -> true
+    Function(_, _) -> true
+    Class(_, _, _) -> true
+    Data(_, _, _) -> option_argument(plan, t) is None
+    _ -> false
+
+private walk_view(program: TProgram, plan: *OptionPlan, x: &Type, to: &Type, top: bool, depth: usize)
+    if depth > 32 || !plan.pointers || same_type(x, to) then return
+    if *x is Nothing || *x is ErrorType || *to is ErrorType then return
+    // A failed check of an argument against a type parameter or an unknown is no view.
+    if unknown(to) then return
+    // A trait's `Self` in its default bodies is always an object: an option is converted on its way in.
+    if *x is TypeVar(owner, _, _)
+        if is_self_owner(owner) then return
+    if unknown(x)
+        if !(top && *to is AnyType) && !bound_view(program, *plan, to) then plan.objects("a type parameter is viewed as another type")
+        return
+    if option_argument(*plan, x) is Some(a)
+        option_argument(*plan, to) match
+            Some(b) ->
+                if pointer_shaped(*plan, a) != pointer_shaped(*plan, b) || unknown(a) || unknown(b) then plan.objects("options of differing forms are viewed as one another")
+                else walk_view(program, plan, a, b, false, depth + 1)
+                return
+            // Written as an `Any`, the option is boxed, which makes the object it stands for.
+            None ->
+                if !(top && *to is AnyType) then plan.objects("an option is viewed as another type")
+                return
+    *to match
+        Data(d, _, ys) -> *x match
+            Data(e, _, xs) -> if d == e then walk_args(program, plan, program.data[d].decl.type_params, xs, ys, depth)
+            _ -> ()
+        Class(k, _, ys) -> ancestor_type(program.classes, program.data, x, k) match
+            Some(up) -> *up match
+                Class(_, _, xs) -> walk_args(program, plan, program.classes[k].decl.type_params, xs, ys, depth)
+                _ -> ()
+            None -> ()
+        Tuple(ys) -> *x match
+            Tuple(xs) ->
+                if xs.len() == ys.len()
+                    for i in 0..<xs.len()
+                        walk_view(program, plan, xs[i], ys[i], false, depth + 1)
+            _ -> ()
+        Function(ys, s) -> *x match
+            Function(xs, r) ->
+                if xs.len() == ys.len()
+                    for i in 0..<xs.len()
+                        walk_view(program, plan, ys[i], xs[i], false, depth + 1)
+                walk_view(program, plan, r, s, false, depth + 1)
+            Class(_, _, _) -> if function_ancestor(program.classes, program.data, x) is Some(f) then walk_view(program, plan, f, to, false, depth + 1)
+            Data(_, _, _) -> if function_ancestor(program.classes, program.data, x) is Some(f) then walk_view(program, plan, f, to, false, depth + 1)
+            _ -> ()
+        _ -> ()
+
+private walk_args(program: TProgram, plan: *OptionPlan, params: Buf[TypeParam], xs: Buf[&Type], ys: Buf[&Type], depth: usize)
+    if xs.len() != ys.len() || xs.len() != params.len() then return
+    for i in 0..<xs.len()
+        val v = params[i].variance
+        if v is Covariant then walk_view(program, plan, xs[i], ys[i], false, depth + 1)
+        elif v is Contravariant then walk_view(program, plan, ys[i], xs[i], false, depth + 1)
+
+// A type pattern on a value whose static type fixes the target's type arguments narrows it as a view
+// widens, so the two must agree as a view of one as the other would. One on a value that does not fix
+// them, such as an `Any`, may find any object the program made.
+private walk_test(program: TProgram, plan: *OptionPlan, from: &Type, to: &Type)
+    if *from is ErrorType || *to is ErrorType then return
+    val fixed = *from match
+        Data(d, _, _) -> *to match
+            Data(e, _, _) -> d == e
+            _ -> false
+        Class(k, _, _) -> ancestor_type(program.classes, program.data, to, k) is Some(_)
+        Tuple(_) -> *to is Tuple(_)
+        _ -> false
+    if fixed
+        walk_view(program, plan, to, from, true, 0)
+        return
+    if open_inside(program, *plan, to, true) then plan.objects("a type pattern may find an option inside an object")
+
+// Whether a type pattern's target names, inside it, a type an option could be seen as: `Any`, a trait
+// `Option` conforms to, or a type parameter. The target itself may be any of those: the object a
+// pattern finds is its own, and an option is boxed into the object it stands for. An option inside
+// is the same form as any option it may find there, unless its own argument is one of those.
+private open_inside(program: TProgram, plan: OptionPlan, t: &Type, top: bool) -> bool = *t match
+    AnyType -> !top
+    TypeVar(_, _, _) -> !top
+    Var(_) -> !top
+    Class(_, _, args) ->
+        if !top && option_may_be(program, plan, t) then return true
+        any_open(program, plan, args)
+    Data(_, _, args) -> any_open(program, plan, args)
+    Tuple(items) -> any_open(program, plan, items)
+    Function(params, result) -> any_open(program, plan, params) || open_inside(program, plan, result, false)
+    _ -> false
+
+private any_open(program: TProgram, plan: OptionPlan, items: Buf[&Type]) -> bool
+    for item in items
+        if open_inside(program, plan, item, false) then return true
+    false
+
+// Whether a type parameter's view as `up`, a class or trait through its bound, keeps every option an
+// instance may put there as it is. A bound holds exactly, with no variance, so an instance's type
+// argument has the bound's ancestor with the bound's own arguments; the view harms nothing where no
+// option can be the parameter (`Option` does not conform to `up`'s class) and `up` widens no argument
+// to a type an option could be seen as.
+private bound_view(program: TProgram, plan: OptionPlan, up: &Type) -> bool = *up match
+    Class(_, _, args) -> !option_may_be(program, plan, up) && !any_widened(program, plan, args)
+    Function(params, result) ->
+        val option = plan.option match
+            Some(o) -> o
+            None -> return true
+        function_ancestor(program.classes, program.data, own_type(program.data[option], option)) is None && !any_widened(program, plan, params) && !widened(program, plan, result)
+    _ -> false
+
+/** Whether an option may be seen as the class or trait `t`: `Option` conforms to it, at some type
+ * arguments. */
+private option_may_be(program: TProgram, plan: OptionPlan, t: &Type) -> bool
+    val option = plan.option match
+        Some(o) -> o
+        None -> return false
+    *t match
+        Class(k, _, _) -> ancestor_type(program.classes, program.data, own_type(program.data[option], option), k) is Some(_)
+        AnyType -> true
+        _ -> false
+
+// Whether a type argument names, anywhere in it, a type an option may be seen as: `Any`, or a trait
+// `Option` conforms to.
+private widened(program: TProgram, plan: OptionPlan, t: &Type) -> bool = *t match
+    AnyType -> true
+    Class(_, _, args) -> option_may_be(program, plan, t) || any_widened(program, plan, args)
+    Data(_, _, args) -> any_widened(program, plan, args)
+    Tuple(items) -> any_widened(program, plan, items)
+    Function(params, result) -> any_widened(program, plan, params) || widened(program, plan, result)
+    _ -> false
+
+private any_widened(program: TProgram, plan: OptionPlan, items: Buf[&Type]) -> bool
+    for item in items
+        if widened(program, plan, item) then return true
+    false
+
+/** Whether `t` is still a type parameter or an unknown, which any type may turn out to be. */
+private unknown(t: &Type) -> bool = *t is TypeVar(_, _, _) || *t is Var(_)
+
+// Whether a trait `Option` conforms to has a method taking or returning `Self` inside another type:
+// such a value is neither the pointer nor the object, and could not be converted where it crosses.
+private nests_self(program: TProgram, option: usize) -> bool
+    var pending: Buf[&Type] = buf()
+    for t in program.data[option].traits do pending.push(t)
+    var seen: Buf[usize] = buf()
+    while pending.len() > 0
+        val t = pending.pop().unwrap()
+        val k = *t match
+            Class(k, _, _) -> k
+            _ -> continue
+        var known = false
+        for s in seen
+            if s == k then known = true
+        if known then continue
+        seen.push(k)
+        for r in program.classes[k].traits do pending.push(r)
+        for m in program.classes[k].methods
+            val symbol = program.symbols[m]
+            for i in 1..<symbol.params.len()
+                if nested_self(symbol.params[i]) then return true
+            if symbol.result is Some(r)
+                if nested_self(r) then return true
+    false
+
+private nested_self(t: &Type) -> bool = *t match
+    TypeVar(_, _, _) -> false
+    _ -> mentions_self(t)
+
+private mentions_self(t: &Type) -> bool = *t match
+    TypeVar(owner, _, _) -> is_self_owner(owner)
+    Tuple(items) -> any_self(items)
+    Function(params, result) -> any_self(params) || mentions_self(result)
+    ByName(inner) -> mentions_self(inner)
+    Data(_, _, args) -> any_self(args)
+    Class(_, _, args) -> any_self(args)
+    _ -> false
+
+private any_self(items: Buf[&Type]) -> bool
+    for item in items
+        if mentions_self(item) then return true
+    false

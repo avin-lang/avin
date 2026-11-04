@@ -441,6 +441,9 @@ struct Checker
     /** Where each name the program writes resolved to, for an editor; `None` for a build, which
      * records nothing (`definition_index.sysl`). */
     index: Option[&DefinitionIndex]
+    /** The views `upcast` made and the type patterns checked, for lowering: see `TProgram.views`. */
+    views: Buf[TypeView]
+    type_tests: Buf[TypeView]
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -622,7 +625,7 @@ private check_imports(c: *Checker, unit: usize)
  * the core library's public declarations, in that order: an inner name hides an outer one. With
  * `indexing`, the check also records where each name resolved to, in `Checked.references`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing then Some(definition_index()) else None)
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing then Some(definition_index()) else None, buf(), buf())
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
     // `derives` is written out as the methods and impls it stands for before anything is declared.
@@ -744,7 +747,22 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     var sources: Buf[Source] = buf()
     for u in c.units
         sources.push(u.src)
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, init, c.builtins, c.conditional, c.core, tests, testing)), references)
+    val views = solved_views(c.vars, c.views)
+    val type_tests = solved_views(c.vars, c.type_tests)
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, init, c.builtins, c.conditional, c.core, tests, testing, views, type_tests)), references)
+
+/** Each view with its unknowns solved, each distinct one once. */
+private solved_views(vars: Buf[Option[&Type]], views: Buf[TypeView]) -> Buf[TypeView]
+    var seen: Map[string, bool] = map()
+    var out: Buf[TypeView] = buf()
+    for v in views
+        val from = solve(vars, v.from)
+        val to = solve(vars, v.to)
+        val key = type_key(from) + " as " + type_key(to)
+        if seen.get(key) is Some(_) then continue
+        seen.put(key, true)
+        out.push(TypeView(from, to))
+    out
 
 // The program's `@test` functions, in the order they are declared. A test is a top-level function
 // that `avin test` calls with nothing and that passes by returning, so it takes no parameters, has no
@@ -7157,6 +7175,13 @@ private join_expected(c: *Checker, a: &Type, b: &Type, expected: Option[&Type]) 
 // they share (see `shared_traits`). Two instances of one generic type agree on the instance whose
 // covariant arguments are their arguments' agreement.
 private join(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
+    val t = joined(c, a, b)?
+    // Each side is taken as the type they agree on with no conversion, as an upcast is.
+    if !same_type(zonk(c, a), zonk(c, t)) then c.views.push(TypeView(a, t))
+    if !same_type(zonk(c, b), zonk(c, t)) then c.views.push(TypeView(b, t))
+    Some(t)
+
+private joined(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
     if *a is Nothing || *a is ErrorType then return Some(b)
     if *b is Nothing || *b is ErrorType then return Some(a)
     if same_type(a, b) then return Some(a)
@@ -7245,6 +7270,11 @@ private ancestor_parent(c: *Checker, t: &Type) -> Option[&Type] = *t match
  * otherwise `from` itself, or a type that differs from `to`. */
 private upcast(c: *Checker, from: &Type, to: &Type) -> &Type
     val x = zonk(c, from)
+    val up = viewed(c, x, to)
+    if !same_type(x, zonk(c, up)) then c.views.push(TypeView(x, up))
+    up
+
+private viewed(c: *Checker, x: &Type, to: &Type) -> &Type
     // Every value converts to `Any`, by boxing where it is written; never inside a tuple or as a
     // type argument, whose parts are already laid out.
     if *zonk(c, to) is AnyType && !(*x is Var(_) || *x is ByName(_)) then return AnyType
@@ -10145,6 +10175,7 @@ private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string)
             if !may_match(c, ty, target)
                 c.note(unit, p.span, s"a value of type ${type_name(zonk(c, ty))} is never ${type_article(target)}, so this type pattern never matches")
                 return TPattern(p.span, ErrorType, PWildcard)
+            c.type_tests.push(TypeView(ty, target))
             TPattern(p.span, ty, PType(target, local, !fits(c, ty, target)))
 
 /** Whether a function type is `t` or a part of it. */

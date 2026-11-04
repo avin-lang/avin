@@ -49,6 +49,7 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
 | [Strings and formatting](/spec/strings-and-formatting/) | Interpolation and format specifiers |
 | [System library](/spec/system-library/) | Proposed: `avin.process` — arguments, environment, exit; `avin.io` — `IoError`, standard input; `avin.fs` — files and directories |
 | [Packages](/spec/packages/) | Proposed: `avin.hocon`, dependencies, version selection, `avin.sum`, workspaces, `avin new` and `avin tidy` |
+| [Parsing](/spec/parsing/) | Proposed: `avin.parsing` — parser combinators, leaf parsers for numbers, names and strings, errors with positions |
 | [Settled decisions](/spec/decisions/) | Every decision made so far, in one list |
 
 The syntax is light and regular: blocks by indentation, functions as `name(params) -> T`, `match`
