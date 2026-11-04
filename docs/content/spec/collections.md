@@ -51,6 +51,13 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
   `Iterable` whose run-time type is still the concrete collection.
 - `xs.view()` returns a lazy `Iterator`, for pipelines that should not build intermediate
   collections.
+- Operations that need something of the elements are added by impls bounding the element type, so
+  a collection has them only where its elements do. `mkString` joins elements that have `Display`
+  into a string: `mkString(sep = ", ")` separates them, `mkString(start, sep, end)` also brackets
+  them, so `[1, 2, 3].mkString()` is `1, 2, 3` and `.mkString("<", "|", ">")` is `<1|2|3>`. Lists,
+  vectors, arrays, buffers and sets have it, and maps, whose entries join as `key: value`, the form
+  a displayed map shows. `max()` and `min()` on lists, vectors and arrays of `Ord` elements answer
+  `Some` of the greatest or least, the first of equal ones, and `None` when empty.
 
 ## Builders
 
@@ -88,7 +95,7 @@ keys bound to equal values, and two sets when they hold the same elements; equal
 alike, whatever order they were built in.
 
 ```text
-var counts = Map[string, int]()
+var counts = Map.empty[string, int]()
 for w in words do counts = counts.updated(w, counts.getOrElse(w, 0) + 1)
 for (word, n) in counts do print(s"$word $n")
 ```
@@ -208,7 +215,7 @@ cover only their lengths, so a match that uses only them needs a catch-all.
 | `{1, 2, 3}`, `{}` | Immutable `Set` |
 | `{"a": 1, "b": 2}` | Immutable `Map` |
 | `{a: 1, b: 2}` | The same map; a bare identifier directly before `:` is a string key |
-| `Map.empty` | Empty `Map` |
+| `Map.empty[string, int]()` | Empty `Map` |
 
 **A literal builds the collection its expected type asks for.** With no expected collection type,
 or one the default satisfies (`Seq[int]`, `Iterable[int]`), a sequence literal is a `Vector`, a set
@@ -226,8 +233,8 @@ val seen: mutable.Set[int] = {}
 A literal is built with its collection's [builder](#builders): sequence types (`List`, `Vector`,
 `Array`, `Buffer`, `Deque`) from sequence literals, set types from set literals and map types from
 map literals. A library or user collection with a builder can be written as a literal the same way:
-a class whose companion object has a `builder()` method, returning a `Builder` of the elements and
-the class, is built by a sequence literal wherever that class is expected. The elements take their
+a class or `data` type whose companion object has a `builder()` method, returning a `Builder` of the
+elements and the type, is built by a sequence literal wherever that class is expected. The elements take their
 types from the expected element type when there is one (`Array[byte]` makes each literal a
 `byte`), and otherwise from the elements themselves, which agree on a type as the branches of an
 `if` do: `[dog, cat]` is a `Vector[Animal]`, and `[1, "two"]` is an error. An empty literal with

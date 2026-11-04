@@ -61,8 +61,15 @@ class SortedPair[T: Ordered](first: T, second: T)
   matches only an instance that conforms; and the trait's methods, the impl's included, are called
   on an instance only where it conforms, in the type's own methods too, where its parameters have
   only the bounds the type declares. Inside generic code, `Box[T]` conforms where `T`'s bounds meet
-  the impl's. An impl of `Eq` or `Hash` may be bounded only by them, since every type meets them. An
-  impl adding methods to some type arguments only is not part of the language.
+  the impl's. An impl of `Eq` or `Hash` may be bounded only by them, since every type meets them.
+- **An impl without a trait may bound its parameters too**, adding its methods only for the type
+  arguments that meet the bounds: with `impl[T: Display] List[T]`, a `List[int]` has `mkString` and a
+  `List[Plain]` does not. Calling such a method, or taking it as a value, on an instance that misses
+  a bound is an error naming the bound; a subclass has the methods at the type arguments it gives
+  its superclass; in generic code, `List[U]` has them where `U`'s bounds meet the impl's. Inside the
+  impl its parameters have the bounds' members. Its methods overload the type's other methods by
+  parameter types, as any method does, so two of the same parameter types are an error even where
+  their bounds could never both hold.
 - **A call through a bound is direct**: each instance calls the implementation of its own type
   argument. Where the argument is a trait type or an open class, any conforming object may arrive,
   and the call goes through the object's method table as a call on that type does.

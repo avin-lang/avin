@@ -108,6 +108,9 @@ struct ClassSymbol
     /** For a trait, the position of its first method in the table of every class conforming to it;
      * its methods follow in declaration order. */
     base: usize
+    /** For an object named after a data type of its module, that type: the object is its companion,
+     * and each uses the other's private members. */
+    companion_data: Option[usize]
 
 /** A module-level value: a `val` or `var` declared at the top level of a file, or an object's one
  * instance. Each is computed once, before `main` runs, by its `init` function: a value's initializer,
@@ -154,6 +157,9 @@ struct DataSymbol
      * the implementation of each of the trait's methods, the type's own method of that name or the
      * trait's default body. Empty when the type conforms to no trait. */
     table: Buf[Option[usize]]
+    /** The object of the same name in its module, its companion: the bare name and `Name.member`
+     * are the object, while a variant of the type's name is still called to make a value. */
+    companion: Option[usize]
 
 /** One constructor of a data type. */
 struct VariantSymbol
@@ -268,6 +274,15 @@ struct ImplSymbol
      * holds only for type arguments that meet them. Empty for an impl without any. */
     conditions: Buf[Buf[&Type]]
 
+/** An impl with bounds of its own that adds methods to a data type or class: `impl[T: Display]
+ * List[T]`. Its methods are the ones whose type parameters begin with `params`, and a receiver has
+ * them only where its type arguments meet `conditions`, the bounds of each parameter. */
+struct ConditionalImpl
+    owner: usize
+    conditions: Buf[Buf[&Type]]
+    unit: usize
+    params: Buf[TypeParam]
+
 /** An unknown type argument of a call, open until a later use settles it: where it was made, and
  * what to report if nothing does. */
 struct Unknown
@@ -355,6 +370,9 @@ struct Checker
     /** The methods impls add to classes, which are not variance positions in a class whose fields
      * are all immutable. */
     impl_methods: Buf[usize]
+    /** The impls with bounds of their own that add methods without a trait: their methods exist only
+     * at type arguments meeting the bounds. */
+    conditional_methods: Buf[ConditionalImpl]
 
     note(*self, unit: usize, at: Span, message: string)
         self.units[unit].report.add(error(at, message))
@@ -381,14 +399,14 @@ end Checked
  * the built-in types belong to it. */
 const CoreModule: string = "avin"
 
-/** The annotation of a core-library function whose traps report the place it is called from. */
-const TrapsAtCaller: string = "trapsAtCaller"
-
 /** What a file sees besides its own module's declarations and the core library's: each name its
  * imports bring in, bound to the qualified name of the declaration it imports. */
 struct FileScope
     module_name: string
     imports: Map[string, string]
+    /** Each module the file imports whole, `import a.b`, bound to the name it is reached by and
+     * holding the module's path. */
+    modules: Map[string, string]
 
 /** The name a declaration `name` of module `module_name` has in the symbol tables: `a.b.name`, or
  * `name` alone in the root module. A declaration's name holds no dot, so two declarations of
@@ -416,6 +434,15 @@ private exported(c: *Checker, key: string) -> bool
  * none exists, the module's own, which no table holds, so the use is reported as unknown. */
 private resolve_name(c: *Checker, unit: usize, name: string) -> string
     val scope = c.files[unit]
+    // `m.X`, with `m` a module the file imports: that module's public `X`, else nothing.
+    var dot: Option[usize] = None
+    for k in 0..<name.bytes.len
+        if dot is None && name.bytes[k] == u8('.') then dot = Some(k)
+    if dot is Some(k)
+        if scope.modules.get(name[0..<k]) is Some(module_path)
+            val key = qualified(module_path, name[k + 1..])
+            if declared(c, key) && exported(c, key) then return key
+        return name
     val own = qualified(scope.module_name, name)
     if declared(c, own) then return own
     if scope.imports.get(name) is Some(key) then return key
@@ -428,7 +455,13 @@ private file_scope(c: *Checker, unit: usize) -> FileScope
     var imports: Map[string, string] = map()
     for i in file.imports
         if imports.get(i.binding) is None then imports.put(i.binding, i.path)
-    FileScope(file.module_name, imports)
+    FileScope(file.module_name, imports, map())
+
+// What an earlier import bound a name to, a declaration or a module, or "" when none did.
+private imported_from(kept: Map[string, string], mods: Map[string, string], binding: string) -> string
+    if kept.get(binding) is Some(earlier) then return earlier
+    if mods.get(binding) is Some(earlier) then return earlier
+    ""
 
 private module_exists(c: *Checker, name: string) -> bool
     for f in c.files
@@ -442,7 +475,21 @@ private check_imports(c: *Checker, unit: usize)
     val file = c.units[unit].file
     val own = file.module_name
     var kept: Map[string, string] = map()
+    var mods: Map[string, string] = map()
     for i in file.imports
+        // A whole module, `import a.b`, is reached by its binding: `b.X`.
+        var dotted = false
+        for k in 0..<i.path.bytes.len
+            if i.path.bytes[k] == u8('.') then dotted = true
+        if module_exists(c, i.path) && !(dotted && declared(c, i.path))
+            if i.path == own
+                c.note(unit, i.span, s"`${i.path}` is this file's own module")
+            elif declared(c, qualified(own, i.binding))
+                c.note(unit, i.span, s"`${i.binding}` is a module and also declared in this module")
+            elif imported_from(kept, mods, i.binding) != ""
+                c.note(unit, i.span, s"`${i.binding}` is already imported, from `${imported_from(kept, mods, i.binding)}`")
+            else mods.put(i.binding, i.path)
+            continue
         var dot: Option[usize] = None
         for k in 0..<i.path.bytes.len
             if i.path.bytes[k] == u8('.') then dot = Some(k)
@@ -470,25 +517,29 @@ private check_imports(c: *Checker, unit: usize)
         val local = qualified(own, i.binding)
         if declared(c, local)
             var companion = false
+            var data_companion = false
             if c.class_types.get(local) is Some(k)
                 if c.classes[k].decl.object
                     if c.class_types.get(i.path) is Some(j)
                         if !c.classes[j].decl.object then companion = true
+                    if c.types.get(i.path) is Some(_) then data_companion = true
             if companion then c.note(unit, i.span, s"`${i.binding}` is a class of module `$module_name`; its companion object is declared in the class's own module")
+            elif data_companion then c.note(unit, i.span, s"`${i.binding}` is a data type of module `$module_name`; its companion object is declared in the type's own module")
             else c.note(unit, i.span, s"`${i.binding}` is imported and also declared in this module")
             continue
-        if kept.get(i.binding) is Some(earlier)
-            c.note(unit, i.span, s"`${i.binding}` is already imported, from `$earlier`")
+        if imported_from(kept, mods, i.binding) != ""
+            c.note(unit, i.span, s"`${i.binding}` is already imported, from `${imported_from(kept, mods, i.binding)}`")
             continue
         kept.put(i.binding, i.path)
     c.files[unit].imports = kept
+    c.files[unit].modules = mods
 
 /** Checks a program: the core library's units, then the program's own, each heading its module's
  * name in `file.module_name`. `root_module` is the module that must declare `main`, and the last
  * unit is one of its files. Every file sees its own module's declarations, the names it imports and
  * the core library's public declarations, in that order: an inner name hides an outer one. */
 check_program(units: Buf[SourceUnit], root_module: string) -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf())
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
     // `derives` is written out as the methods and impls it stands for before anything is declared.
@@ -704,7 +755,7 @@ private declare_types(c: *Checker, unit: usize)
             for a in d.annotations
                 c.note(unit, a.span, s"unknown annotation `@${a.name}`")
             c.types.put(key, c.data.len())
-            c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf(), buf(), buf(), buf(), buf()))
+            c.data.push(DataSymbol(unit, file.module_name, d.name, d, buf(), buf(), buf(), buf(), buf(), None))
     for i in 0..<file.items.len()
         if file.items[i] is ClassItem(d)
             if d.object then continue
@@ -717,12 +768,12 @@ private declare_types(c: *Checker, unit: usize)
                 continue
             if file.private_items[i] then c.private_names.put(key, true)
             c.class_types.put(key, c.classes.len())
-            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, None, None, buf(), buf(), 0))
+            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, None, None, buf(), buf(), 0, None))
 
-// An object is a class with one instance. Named after a class of its module, in any of the module's
-// files, it is that class's companion and its type has no name of its own; otherwise its name is
-// also its type's. A class and its companion are one name, so a companion is private where its class
-// is.
+// An object is a class with one instance. Named after a class or a data type of its module, in any of
+// the module's files, it is that type's companion and its type has no name of its own; otherwise its
+// name is also its type's. A type and its companion are one name, so a companion is private where its
+// type is.
 private declare_objects(c: *Checker, unit: usize)
     val file = c.units[unit].file
     for i in 0..<file.items.len()
@@ -734,19 +785,23 @@ private declare_objects(c: *Checker, unit: usize)
                 continue
             val id = c.classes.len()
             var companion: Option[usize] = None
+            var companion_data: Option[usize] = None
             if c.class_types.get(key) is Some(k)
                 if c.classes[k].decl.object || c.classes[k].companion is Some(_)
                     c.note(unit, d.name_span, s"the object `${d.name}` is declared more than once")
                     continue
                 companion = Some(k)
                 c.classes[k].companion = Some(id)
-            elif c.types.get(key) is Some(_)
-                c.note(unit, d.name_span, s"`${d.name}` is already a data type; an object may share its name only with a class")
-                continue
+            elif c.types.get(key) is Some(t)
+                if c.data[t].companion is Some(_)
+                    c.note(unit, d.name_span, s"the object `${d.name}` is declared more than once")
+                    continue
+                companion_data = Some(t)
+                c.data[t].companion = Some(id)
             else
                 c.class_types.put(key, id)
                 if file.private_items[i] then c.private_names.put(key, true)
-            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, companion, None, buf(), buf(), 0))
+            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, companion, None, buf(), buf(), 0, companion_data))
 
 // Each impl's type and trait, resolved with the impl's type parameters in scope. They are the type's
 // own parameters under the names the impl gives them, so `impl[T] Box[T]` lists them in order. What
@@ -858,6 +913,7 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
                 c.builtins.push(BuiltinConformance(target, t, unit, d.target.span, buf()))
         if conditional
             if *t is Class(k, _, _) then c.conditional.push(ConditionalConformance(owner, k, conditions, unit, d.type_params))
+    elif conditional then c.conditional_methods.push(ConditionalImpl(owner, conditions, unit, d.type_params))
     ImplSymbol(unit, module_name, d, target, owner, trait_type, conditions)
 
 /** Whether `name` is one of `params`. */
@@ -934,20 +990,18 @@ private buf1u(x: usize) -> Buf[usize]
     out.push(x)
     out
 
-// An impl with bounds of its own makes a data type or a class conform to a trait for the type
-// arguments that meet them. The conformance is decided wherever one is: where a bound is checked,
-// where a value converts to the trait, where a type pattern tests it, and where one of the impl's
-// methods is called.
+// An impl with bounds of its own makes a data type or a class conform to a trait, or adds methods to
+// it, for the type arguments that meet them. The conformance is decided wherever one is: where a
+// bound is checked, where a value converts to the trait, where a type pattern tests it, and where one
+// of the impl's methods is called; an added method, where it is called or taken as a value.
 private conditional_impl_refused(c: *Checker, unit: usize, d: &ImplDecl, target: &Type, trait_type: Option[&Type]) -> bool
     val at = d.type_params[0].span
-    val t = trait_type match
-        Some(t) -> t
-        None ->
-            c.note(unit, at, "an impl that adds methods for some type arguments only is not implemented; bound the type's own parameters")
-            return true
     if !(*target is Data(_, _, _) || *target is Class(_, _, _))
         c.note(unit, at, "an impl with bounds of its own is implemented for data types and classes only")
         return true
+    val t = trait_type match
+        Some(t) -> t
+        None -> return false
     if *t is Class(k, _, _)
         // Every type compares and hashes, so an impl of `Eq` or `Hash` holds at every type argument,
         // and its bounds may only be ones every type meets.
@@ -1383,9 +1437,12 @@ private method_visible(c: *Checker, m: usize) -> bool
             Some(t) -> inside_impl(c, t)
             None -> false
 
-/** Whether the code being checked is a method an impl adds to the data or built-in type of `t`, so it
- * may call that type's private methods. */
+/** Whether the code being checked is a method an impl adds to the data or built-in type of `t`, or
+ * code of a data type's companion object, so it may call that type's private methods. */
 private inside_impl(c: *Checker, t: &Type) -> bool
+    if *t is Data(b, _, _)
+        if c.data[b].companion is Some(o)
+            if enclosing_class(c) == Some(o) then return true
     val here = c.symbols[c.body.root].receiver match
         Some(r) -> r
         None -> return false
@@ -1435,9 +1492,20 @@ private declare_methods(c: *Checker, unit: usize)
         val k = c.classes[id]
         if k.unit != unit then continue
         val d = k.decl
-        // A function of the same name was reported when it was declared.
+        // A function of the same name was reported when it was declared, unless the object is a data
+        // type's companion. A data type's own variant of its name stays its constructor in call
+        // position, as a class's does; a variant with no fields is a value by its bare name, which
+        // the companion would take.
         val key = qualified(module_name, d.name)
-        if c.variants.get(key) is Some(v) then c.note(unit, d.name_span, s"`${d.name}` is already a variant of `${c.data[v.data].name}`")
+        if c.variants.get(key) is Some(v)
+            if k.companion_data != Some(v.data) then c.note(unit, d.name_span, s"`${d.name}` is already a variant of `${c.data[v.data].name}`")
+            elif c.data[v.data].variants[v.index].fields.len() == 0 then c.note(unit, d.name_span, s"`${d.name}` is a variant of `${d.name}` with no fields, a value by its bare name; a companion object cannot share it")
+        if k.companion_data is Some(_) && c.variants.get(key) is None
+            if c.scope.get(key) is Some(ids)
+                for f in ids
+                    if !c.symbols[f].constructor
+                        c.note(unit, d.name_span, s"`${d.name}` is already a function")
+                        break
         val self_type = own_class_type(k, id)
         var params: Buf[Param] = buf()
         var types: Buf[&Type] = buf()
@@ -1514,10 +1582,9 @@ private declare_methods(c: *Checker, unit: usize)
             val public = entry.public
             val overrides = entry.overrides
             val file_unit = entry.unit
-            // The core library's array classes declare their element operations as intrinsics, and
-            // its methods may trap at their callers.
+            // The core library's array classes declare their element operations as intrinsics.
             val intrinsic_method = is_array_storage(c.classes[id]) && f.annotations.len() > 0
-            if f.annotations.len() > 0 && !intrinsic_method && !only_traps_at_caller(f) then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
+            if f.annotations.len() > 0 && !intrinsic_method then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
             if overrides then refuse_override_defaults(c, file_unit, f)
             if is_trait(c, id)
                 if !public
@@ -1621,10 +1688,9 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
             _ -> None
         None -> None
     // A built-in type's operations are intrinsics, so its impls may declare them; no other method
-    // takes an annotation but the core library's `@trapsAtCaller`.
+    // takes an annotation.
     val builtin = !(*target is Data(_, _, _)) && !family
     for a in f.annotations
-        if a.name == TrapsAtCaller then continue
         if a.name != "intrinsic" || !builtin || trait_id is Some(_)
             c.note(unit, f.name_span, "annotations on methods are not implemented")
             break
@@ -3069,16 +3135,10 @@ private declare_defaults(c: *Checker, id: usize)
 
 // `@intrinsic("name")` and `@sysl("path")` are the annotations this compiler gives meaning to; each
 // is valid only on a function without a body. This reads the first; `sysl_binding_of` the second.
-// The core library's `@trapsAtCaller` marks a function whose traps report the place it is called
-// from, as an operation of the language does.
 private intrinsic_of(c: *Checker, unit: usize, f: &Function) -> Option[string]
     var out: Option[string] = None
     for a in f.annotations
         if a.name == "sysl" then continue
-        if a.name == TrapsAtCaller
-            if c.units[unit].file.module_name != CoreModule then c.note(unit, a.span, s"`@$TrapsAtCaller` is for the core library's operations")
-            elif a.args.len() != 0 then c.note(unit, a.span, s"`@$TrapsAtCaller` takes no arguments")
-            continue
         if a.name != "intrinsic"
             c.note(unit, a.span, s"unknown annotation `@${a.name}`")
             continue
@@ -3352,12 +3412,16 @@ conformance_holds(f: Conformances, owner: usize, required: &Type, args: Buf[&Typ
     true
 
 /** Whether type arguments `args` meet the bounds of conditional conformance `x`. */
-conditions_met(f: Conformances, x: ConditionalConformance, args: Buf[&Type]) -> bool
-    for i in 0..<x.conditions.len()
+conditions_met(f: Conformances, x: ConditionalConformance, args: Buf[&Type]) -> bool = unmet_condition(f, x.owner, x.conditions, args) is None
+
+/** The first type parameter, by position, and bound of `conditions` that type arguments `args` of the
+ * type `owner` owns miss; `None` where they meet them all. */
+unmet_condition(f: Conformances, owner: usize, conditions: Buf[Buf[&Type]], args: Buf[&Type]) -> Option[(usize, &Type)]
+    for i in 0..<conditions.len()
         if i >= args.len() then break
-        for b in x.conditions[i]
-            if !meets_bound(f, args[i], substitute(b, x.owner, args)) then return false
-    true
+        for b in conditions[i]
+            if !meets_bound(f, args[i], substitute(b, owner, args)) then return Some((i, b))
+    None
 
 /** The core library's operator and equality traits and their methods, by name. */
 private find_core_traits(c: *Checker)
@@ -4017,6 +4081,25 @@ private lookup_function(c: *Checker, name: string) -> Option[usize]
     val ids = lookup_functions(c, name)
     if ids.len() == 0 then None else Some(ids[0])
 
+// `m.X` where `m` is a module the file imports whole and no local, parameter, local function or
+// member of the enclosing class hides it: the declaration `X` of that module, written as the name
+// `m.X`. A module without a public `X` is reported, and the use is left invalid.
+private module_use(c: *Checker, e: &Expr) -> Option[&Expr]
+    val unit = unit_of(c)
+    if e.kind is Member(target, name)
+        if target.kind is Name(m)
+            if lookup_local(c, m) is Some(_) || param_index(c, m) is Some(_) || class_member(c, m) is Some(_) || local_function(c, m) is Some(_) then return None
+            if c.files[unit].modules.get(m) is Some(module_path)
+                val key = qualified(module_path, name)
+                if !declared(c, key)
+                    c.note(unit, e.span, s"module `$module_path` declares no `$name`")
+                    return Some(Expr(e.span, Invalid))
+                if !exported(c, key)
+                    c.note(unit, e.span, s"`$name` is private to module `$module_path`")
+                    return Some(Expr(e.span, Invalid))
+                return Some(Expr(e.span, Name(m + "." + name)))
+    None
+
 private local_function(c: *Checker, name: string) -> Option[usize]
     var i = c.body.functions.len()
     while i > 0
@@ -4181,7 +4264,9 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     UnitLit -> TExpr(e.span, Unit, UnitConst)
     Name(name) -> name_expr(c, e.span, name, expected)
     TypeApply(target, types) -> type_apply(c, e, target, types, expected)
-    Member(target, name) -> member_expr(c, e, target, name, expected)
+    Member(target, name) ->
+        if module_use(c, e) is Some(q) then check_form(c, q, expected, used)
+        else member_expr(c, e, target, name, expected)
     Call(callee, args) -> call_expr(c, e.span, callee, args, expected)
     InfixCall(target, name, name_span, arg) -> infix_call(c, e.span, target, name, name_span, arg, expected)
     Block(items, discard) -> block_expr(c, e, items, discard, expected, used)
@@ -4466,8 +4551,12 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
     TExpr(at, ty, Block(items))
 
 // Whether code that may use the private members of class `k` is being checked: code of the class
-// itself, or of its companion.
+// itself, or of its companion; for a data type's companion object, a method an impl adds to the type.
 private inside_class(c: *Checker, k: usize) -> bool
+    if c.classes[k].companion_data is Some(d)
+        if c.symbols[c.body.root].receiver is Some(r)
+            if *r is Data(a, _, _)
+                if a == d then return true
     val here = enclosing_class(c) match
         Some(h) -> h
         None -> return false
@@ -4508,6 +4597,7 @@ private evaluated(t: &TExpr) -> &TExpr = *t.ty match
 // Type arguments written on a name that is not called: a function or a method used as a value, or a
 // variant with no fields, as in `None[int]`.
 private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], expected: Option[&Type]) -> &TExpr
+    if module_use(c, target) is Some(q) then return type_apply(c, e, q, types, expected)
     if target.kind is Name(name)
         // A method of the enclosing class by bare name, bound to `self`, as in `convert[int]`.
         if lookup_local(c, name) is None && param_index(c, name) is None
@@ -5109,9 +5199,13 @@ private sequence_literal(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Opt
         if is_list_type(c, t) then return list_literal(c, e, items, expected)
     var collection: Option[usize] = None
     if want is Some(t)
-        if *t is Class(k, _, _)
-            if c.classes[k].companion is Some(o)
-                if methods_named(c, o, "builder").len() > 0 then collection = Some(o)
+        val companion = *t match
+            Class(k, _, _) -> c.classes[k].companion
+            Data(d, _, _) -> c.data[d].companion
+            _ -> None
+        if companion is Some(o)
+            if methods_named(c, o, "builder").len() > 0 then collection = Some(o)
+    val from_expected = collection is Some(_)
     if collection is None
         if c.class_types.get(qualified(CoreModule, "Vector")) is Some(k) then collection = c.classes[k].companion
     val o = collection match
@@ -5122,10 +5216,21 @@ private sequence_literal(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Opt
             c.note(unit, at, "a collection literal needs the core library's `Vector`")
             return TExpr(at, ErrorType, UnitConst)
     val companion = global_read(c, at, c.classes[o].global.unwrap())
+    // A `builder` declared to return a `Builder` of the expected collection takes its type
+    // arguments from it at the call, where bounds on them are checked: `Set.builder[A: Eq + Hash]`
+    // learns `A` from the `Set[int]` expected.
+    var wanted_builder: Option[&Type] = None
+    if want is Some(w)
+        if from_expected
+            if c.class_types.get(qualified(CoreModule, "Builder")) is Some(b)
+                var args: Buf[&Type] = buf()
+                args.push(fresh_var(c))
+                args.push(w)
+                wanted_builder = Some(Class(b, "Builder", args))
     // The builder's element type is open until the expected type or the elements settle it; an
     // empty literal with neither is reported as one.
     val first_unknown = c.unknowns.len()
-    val builder = call_method(c, at, at, companion, "builder", methods_named(c, o, "builder"), buf(), None, None, false)
+    val builder = call_method(c, at, at, companion, "builder", methods_named(c, o, "builder"), buf(), None, wanted_builder, false)
     for i in first_unknown..<c.unknowns.len()
         c.unknowns[i].message = "cannot infer the element type of an empty collection literal; give it a type, as in `val xs: Vector[int] = []`"
     if *builder.ty is ErrorType
@@ -6171,12 +6276,6 @@ is_array_class(k: ClassSymbol) -> bool = k.module_name == CoreModule && k.name =
 private is_array_storage(k: ClassSymbol) -> bool =
     k.module_name == CoreModule && (k.name == "Array" || k.name == "FrozenArray") && !k.decl.object
 
-/** Whether every annotation of `f` is `@trapsAtCaller`. */
-private only_traps_at_caller(f: &Function) -> bool
-    for a in f.annotations
-        if a.name != TrapsAtCaller then return false
-    true
-
 private is_array_type(c: *Checker, t: &Type) -> bool = *t match
     Class(k, _, _) -> is_array_class(c.classes[k])
     _ -> false
@@ -6288,6 +6387,9 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
     if callee.kind is TypeApply(inner, types)
         explicit = Some(types)
         named = inner
+    if module_use(c, named) is Some(q)
+        if explicit is Some(types) then return call_expr(c, at, Expr(callee.span, TypeApply(q, types)), args, expected)
+        return call_expr(c, at, q, args, expected)
     if named.kind is Member(target, member) then return member_call(c, at, callee, named.span, target, member, args, explicit, expected, false)
     val name = named.kind match
         Name(n) -> n
@@ -6311,9 +6413,15 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
         Some(TraitFieldOf(_)) -> if explicit is None then return value_call(c, at, callee, args)
         None -> ()
     // A module-level value is called as a value; a class's name in call position is its
-    // constructor, even where its companion object shares the name.
+    // constructor, and a data type's variant of its own name, even where a companion object shares
+    // the name.
     val ids = lookup_functions(c, name)
-    if explicit is None && ids.len() == 0 && global_named(c, name) is Some(g)
+    var global = if explicit is None && ids.len() == 0 then global_named(c, name) else None
+    if global is Some(g)
+        if c.globals[g].object is Some(k)
+            if variant_named(c, name) is Some(v)
+                if c.classes[k].companion_data == Some(v.data) then global = None
+    if global is Some(g)
         if c.globals[g].object is Some(_)
             c.note(unit, named.span, s"`$name` is an object, made once before `main`; it cannot be called")
             for a in args
@@ -6769,19 +6877,29 @@ private with_self(c: *Checker, m: usize, receiver_type: &Type, t: &Type) -> &Typ
 
 // Reports a call of method `m` on a receiver of type `receiver_type` that has the method only through
 // a conformance that does not hold at its type arguments: a method of an impl with bounds of its own
-// the arguments miss, or a trait's method the type reaches only through such an impl.
+// the arguments miss, or a trait's method the type reaches only through such an impl. A method a
+// class's subclass inherits is decided at the type arguments the subclass gives that class.
 private refuse_unmet_conformance(c: *Checker, at: Span, receiver_type: &Type, m: usize) -> bool
     val t = zonk(c, receiver_type)
-    val owner = *t match
+    val symbol = c.symbols[m]
+    var declaring = t
+    if symbol.owner_class is Some(k)
+        if !is_trait(c, k) then declaring = ancestor_type(c.classes, c.data, t, k).unwrap_or(t)
+    val owner = *declaring match
         Class(k, _, _) -> class_owner(k)
         Data(d, _, _) -> data_owner(d)
         _ -> return false
-    val args = *t match
+    val args = *declaring match
         Class(_, _, a) -> a
         Data(_, _, a) -> a
         _ -> buf()
     val f = conformances(c)
-    val symbol = c.symbols[m]
+    for x in c.conditional_methods
+        if x.owner != owner || x.params.len() == 0 || symbol.unit != x.unit then continue
+        if symbol.type_params.len() < x.params.len() || symbol.type_params[0].span.start != x.params[0].span.start then continue
+        if unmet_condition(f, x.owner, x.conditions, args) is Some((i, b))
+            c.note(unit_of(c), at, s"`${symbol.decl.name}` needs `${x.params[i].name}: ${type_name(b)}`, which ${type_name(t)} does not meet")
+            return true
     var missing: Option[usize] = None
     for x in c.conditional
         if x.owner != owner || x.params.len() == 0 || symbol.unit != x.unit then continue

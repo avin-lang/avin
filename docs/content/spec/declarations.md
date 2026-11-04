@@ -487,6 +487,10 @@ built-in type implements every method of the trait, defaults included.
 - **A generic impl names the type's parameters**, in order: `impl[T] Show for Box[T]`,
   `impl[K, V] Map[K, V]`. The names are the impl's own and need not be the declaration's. An impl
   for particular type arguments (`impl Show for Box[int]`) is not part of the language.
+- **An impl may bound the type's parameters further** (`impl[T: Display] List[T]`,
+  `impl[T: Ord] Ord for Box[T]`), and then holds only for the type arguments that meet the bounds:
+  the trait's conformance, or the methods it adds. Calling one of those methods on an instance that
+  misses a bound is an error naming the bound. [Generics](generics.md) has the rules.
 - A method added to a built-in type (`impl string`, `impl int`) is called on a value of that type,
   `"hi".shout()`, `7.squared()`.
 
@@ -499,8 +503,8 @@ object Config
     port(env: Map[string, string]) -> int = …
 ```
 
-An `object` is a singleton value. An `object` with the same name as a class in the same module is its
-companion and may access its private members. `object`s may extend a class and traits.
+An `object` is a singleton value. An `object` with the same name as a class or `data` type in the same
+module is its companion and may access its private members. `object`s may extend a class and traits.
 
 ```text
 object Default: Account("none", 0), Display
@@ -520,8 +524,8 @@ once, before `main`, to make the one instance, and its methods have the same imp
 `self`. The object's name is a value of the object's own type, so it can be stored and passed like
 any other; it cannot be called, since there is no second instance to make.
 
-An object shares its name only with its companion class. Where both exist, the name in call
-position, `Account(…)`, is the class's constructor, and the bare name `Account` or a member
+An object shares its name only with its companion class or `data` type. Where both exist, the name in
+call position, `Account(…)`, is the class's constructor, and the bare name `Account` or a member
 `Account.open(…)` is the companion. The class and its companion each use the other's private
 members.
 
@@ -536,6 +540,23 @@ object Account
     private issue() -> int
         next++
         next
+```
+
+A `data` type has a companion the same way: an object of its name in its module. A variant of the
+type's own name stays its constructor in call position, so `Point(1, 2)` makes a point while
+`Point.origin()` is the companion's; a type with no variant of its name, such as `List`, has
+nothing of that name to call. The methods the type's impls add and the companion's methods each
+use the other's private members. A companion cannot share its name with a variant of another type,
+nor with a variant of its own type's name that has no fields, whose bare name is already a value.
+
+```text
+data Point(x: int, y: int)
+
+object Point
+    origin() -> Point = Point(0, 0)
+
+object List
+    builder[T]() -> ListBuilder[T] = ListBuilder()
 ```
 
 A file may also declare `val`s and `var`s at module level, beside its functions. Each is a value of
@@ -582,6 +603,14 @@ main() = print(s"${circleArea(Circle(2))}")
   import. Importing a name the module does not declare, a private declaration, a name the file's own
   module declares or one another import already brings in is an error; an import the file does not
   use is not.
+- **A module may be imported whole.** `import a.b` binds the module under its last segment and
+  `import a.b as c` under `c`; `b.X` then reaches `a.b`'s public `X`, whatever it is: a type
+  (`b.Point`, in type position too), function, value, object or variant (`b.Some(x)`, in patterns
+  as well). A private `X` or one the module does not declare is an error. The name is the module's
+  alone: a declaration of the file's module or another import under the same name is an error at the
+  import, and a local, parameter or member of the enclosing class named like the module hides it.
+  Importing `a.b` makes only `a.b` reachable, not its submodules; each module named in code is
+  imported.
 - **What a name means** is decided in that order: the file's module, then its imports, then the
   public declarations of the standard library's module `avin`, which every file sees without an
   import. The nearer hides the farther, whatever kind each declaration is. A program's own modules
