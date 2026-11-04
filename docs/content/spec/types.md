@@ -121,9 +121,9 @@ most the largest `int` bytes.
 
 ```text
 val word = "café"
-print(s"${word.byteLength()} ${word.charCount()}")   // 5 4
-print(word.slice(3, 5))                               // é
-print(word.slice(0, 4))                               // traps: offset 4 is inside `é`
+println(s"${word.byteLength()} ${word.charCount()}")   // 5 4
+println(word.slice(3, 5))                               // é
+println(word.slice(0, 4))                               // traps: offset 4 is inside `é`
 ```
 
 ## unit

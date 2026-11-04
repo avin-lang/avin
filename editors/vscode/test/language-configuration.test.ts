@@ -31,7 +31,7 @@ test("a line that opens a block indents the next one", () => {
 
 test("a line that is complete in itself does not", () => {
     for (const line of [
-        "    print(total)",
+        "    println(total)",
         "    if n < 2 then return false",
         "    while i < n do i += 1",
         "    val x = 1",

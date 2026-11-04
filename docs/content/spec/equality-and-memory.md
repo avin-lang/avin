@@ -55,13 +55,13 @@ identity to compare, and on `Any`, which may hold one.
 
 ## Display and Debug
 
-Text rendering comes from two traits. `Display` is the human form, used by `print`,
+Text rendering comes from two traits. `Display` is the human form, used by `println`,
 interpolation and `toString()`. `Debug` is the diagnostic form, used by `debug(x)`, where strings are
 quoted and escaped. Both render into a `Writer` with a `FormatSpec`, so formatting a value needs no
 intermediate string. `data` types and tuples derive both; classes declare them. Nothing has a default
 that prints an address.
 
-A `data` type has both without asking, wherever its fields have them: `print(Some(3))` writes
+A `data` type has both without asking, wherever its fields have them: `println(Some(3))` writes
 `Some(3)`, and `assertEq(Some(3), Some(3))` needs nothing written. `derives Display, Debug` on a data
 type is allowed and means the same. An impl of the type's own replaces the automatic one: `impl
 Display for Money` gives `Money` its own `Display` while its `Debug` stays the derived one, and `List`,

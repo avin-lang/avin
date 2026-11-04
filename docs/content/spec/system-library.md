@@ -20,10 +20,10 @@ import avin.process
 main()
     val files = process.args()
     if files.isEmpty()
-        print(s"usage: ${process.programName()} FILE...")
+        println(s"usage: ${process.programName()} FILE...")
         process.exit(2)
     val home = process.env("HOME").getOrElse("/")
-    for f in files do print(s"$home: $f")
+    for f in files do println(s"$home: $f")
 ```
 
 | Function | Meaning |
@@ -40,7 +40,7 @@ remain available everywhere.
 
 ```text
 main(args: Vector[string]) -> int
-    for f in args do print(f)
+    for f in args do println(f)
     0
 ```
 
@@ -65,7 +65,7 @@ second `--` included.
 ## `avin.io`
 
 Standard input, read as text, and the error every module that reads or writes shares. Standard
-output and standard error need no import: `print` and `eprint` are in the prelude, beside the
+output and standard error need no import: `print`, `println`, `eprint` and `eprintln` are in the prelude, beside the
 writers `StandardOutput` and `StandardError`.
 
 ### `IoError`
@@ -112,8 +112,8 @@ main()
     for line in io.lines()
         line.trim().toInt() match
             Some(n) -> total += n
-            None -> eprint(s"not a number: $line")
-    print(total)
+            None -> eprintln(s"not a number: $line")
+    println(total)
 ```
 
 | Function | Meaning |
@@ -140,7 +140,7 @@ stream a program consumes as it arrives, where a file is read whole: `fs.readTex
 **Writing to standard error flushes standard output first.** Standard output is buffered, and
 flushed when the program ends, exits or traps; standard error is not buffered. Each write to
 standard error first flushes what the program has written to standard output, so when both go to one
-terminal or one file they arrive in the order the program wrote them. `eprint(x)` renders `x` and its
+terminal or one file they arrive in the order the program wrote them. `eprintln(x)` renders `x` and its
 new line first and writes them in one write, so a line is never split.
 
 **Tests see no input.** `avin test` gives each test an empty standard input, so a test never waits on
@@ -199,7 +199,7 @@ listing `InvalidUtf8` rather than leaving that name out.
 
 ```text
 for name in fs.listDir(dir)?
-    if name.endsWith(".txt") then print(name)
+    if name.endsWith(".txt") then println(name)
 ```
 
 ## `avin.time`
@@ -220,7 +220,7 @@ import avin.time
 
 val start = time.now()
 work()
-print(s"took ${start.elapsed()}")
+println(s"took ${start.elapsed()}")
 ```
 
 **Making durations.** `microseconds`, `milliseconds`, `seconds`, `minutes` and `hours` each take a

@@ -24,7 +24,7 @@ the value is laid out:
 
 ```text
 val n = 7
-print(f"${n}%03d|${2.5}%08.2f|${"hi"}%-5s|")     // 007|00002.50|hi   |
+println(f"${n}%03d|${2.5}%08.2f|${"hi"}%-5s|")     // 007|00002.50|hi   |
 ```
 
 A specifier is `%`, then any flags, then a width, then `.` and a precision, then one conversion
@@ -71,11 +71,11 @@ is an integer.
 
 ```text
 val n = 7
-print(f"${n}%s")       // format `%s` expects a string or another value that is not a number, but the value has type `int`
-print(f"${n}%#d")      // the flag `#` has no effect under `%d`
-print(f"${n}%u")       // `%u` is not a format conversion: integers are signed, so `%d` writes every one
-print(f"${n}%")        // this format specifier has no conversion: …
-print(f"${2.5}%.${2.5}f")  // a width or precision written as a hole is a count, so it has to be an integer, …
+println(f"${n}%s")       // format `%s` expects a string or another value that is not a number, but the value has type `int`
+println(f"${n}%#d")      // the flag `#` has no effect under `%d`
+println(f"${n}%u")       // `%u` is not a format conversion: integers are signed, so `%d` writes every one
+println(f"${n}%")        // this format specifier has no conversion: …
+println(f"${2.5}%.${2.5}f")  // a width or precision written as a hole is a count, so it has to be an integer, …
 ```
 
 A value of a type that renders itself is handed what the specifier says in its `FormatSpec`: the
@@ -169,11 +169,12 @@ trait Debug
 - `toString()` renders into a `StringWriter`, a writer building a string, and returns its `text()`.
   `StandardOutput` is the writer for standard output; it writes an integer's digits without making
   a string of them. `StandardError` is the writer for standard error, which keeps no buffer.
-- `print(x)` writes `x`'s `Display` form and a new line to standard output; `eprint(x)` writes the
-  same to standard error, as one write, so a line is never split by another writer's. Given several
-  values, of any types that implement `Display`, each writes them separated by `, `:
-  `print("total", 3, (1, 2))` writes `total, 3, (1, 2)`. `debug(x)` is `x`'s
-  `Debug` form as a string, so `print(debug(x))` prints it. Inside an implementation of `Debug`, the
+- `print(x)` writes `x`'s `Display` form to standard output with no new line; `println(x)` writes it
+  and a new line. `print()` writes nothing and `println()` writes just a new line. `eprint` and
+  `eprintln` are the same for standard error, each a single write, so a line is never split by another
+  writer's. Given several values, of any types that implement `Display`, each writes them separated
+  by `, ` (they are not a tuple): `println("total", 3, (1, 2))` writes `total, 3, (1, 2)`. `debug(x)` is `x`'s
+  `Debug` form as a string, so `println(debug(x))` prints it. Inside an implementation of `Debug`, the
   bare name `debug` is the method, and a part is written with `part.debug(out, spec)`.
 - The built-in types' `Debug` forms are their `Display` forms, except that a string and a `char`
   are written as the literals that make them: quoted, with the quote, the backslash and control

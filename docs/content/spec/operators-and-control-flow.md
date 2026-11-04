@@ -293,7 +293,7 @@ scope s ->
         part(1)
 
 xs.foreach x ->
-    print(x)
+    println(x)
 ```
 
 A lambda of several parameters needs the call's parentheses before it, `run() (x, y) ->`: the

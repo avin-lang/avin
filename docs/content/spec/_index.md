@@ -25,7 +25,7 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
    names happen to match.
 4. **Two failure channels.** A failure a correct caller can meet is a value (`Result`, `Option`); a
    bug is a trap. There is no `null` and there are no exceptions.
-5. **Library, not compiler.** `print`, collections, formatting and the rest are ordinary Avin code in
+5. **Library, not compiler.** `println`, collections, formatting and the rest are ordinary Avin code in
    the standard library. The compiler knows only the built-in types and a declared set of intrinsics.
 6. **Sysl is the system layer.** Avin reaches Sysl — and through Sysl, C — with
    [bindings written in Avin](/spec/sysl-bindings/). The standard library is written in Avin.

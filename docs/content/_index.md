@@ -24,7 +24,7 @@ area(shape: Shape) -> real = shape match
 
 main()
     val shapes = [Circle(1.0), Rect(2.0, 3.0)]
-    print(shapes.map(area).sum())
+    println(shapes.map(area).sum())
 ```
 
 - [The AVIN philosophy](/spec/philosophy/): Abstraction, Versatility, Intuition and Naturalness

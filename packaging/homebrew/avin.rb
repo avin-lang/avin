@@ -47,8 +47,8 @@ class Avin < Formula
 
     (testpath/"hello.avin").write <<~AVIN
       main()
-          print("Hello, Avin!")
-          print(6 * 7)
+          println("Hello, Avin!")
+          println(6 * 7)
     AVIN
 
     # Drives the whole toolchain: the installed library, the shipped runtime archive, IR emission and
