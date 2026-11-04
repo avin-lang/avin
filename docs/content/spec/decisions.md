@@ -1049,6 +1049,13 @@ Settled by the user on 2026-11-04:
   - **`StringContext.f`, called directly**, reads its specifiers as it runs: a malformed one, `%?`
     (its arguments are `Display` values) and a count that is not an `int` or a `long` trap; a value
     under a conversion its type does not take renders in its own form.
+- [`avin.time`](/spec/system-library/#avintime): `Duration`, `Instant` (monotonic) and `WallTime`
+  (wall clock, a `Duration` since the 1970 epoch) are data types counting whole microseconds in a
+  `long`, overflow trapping; the two clocks are distinct types so their readings never mix. A
+  duration implements `Add`, `Sub`, `Neg`; an instant combines with a duration through `plus`,
+  `minus` and `since`, because an operator trait takes and yields the implementing type alone. The
+  text forms are a duration's largest-unit form (`1.5ms`) and an ISO 8601 UTC timestamp. Sleeping
+  and calendar fields beyond the timestamp text are not part of it yet.
 
 ## Open
 
