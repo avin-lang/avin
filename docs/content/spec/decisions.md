@@ -571,6 +571,20 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
+- Option, Result and string methods ([errors](/spec/errors/), [types](/spec/types/#string)):
+  `Option` gains `exists`, `forall`, `contains` (on `T: Eq`, which every type meets), `toList`,
+  `toVector` and `zip`; `Result` gains `exists`, `forall`, `toList` and `orElse(f)`, where `f`
+  takes the error and answers a `Result` that may have another error type. `forall` is true of
+  `None` and of an `Err`. `string` gains `chars`, `count`, `split`, `lines`, `isBlank`, `reverse`,
+  `padStart`, `padEnd`, `equalsIgnoreCase`, `take`, `drop`, `takeRight` and `dropRight`, which count
+  characters where the older methods count bytes. `split` keeps every empty piece and traps on an
+  empty separator (no piece boundary is defined there). `lines` ends a line at `\n` or `\r\n`; a
+  terminator at the end starts no further line, the empty string has no lines, and a lone `\r`
+  stays in its line. `take`, `drop`, `takeRight`, `dropRight` and the padding widths clamp rather
+  than trap. `flatten` on `Option[Option[T]]` and `Result[Result[T, E], E]` is not offered: an
+  `impl` cannot name a nested type, and a method on the unnested type has no way to ask `T` to be
+  an option.
+
 - Sorting ([collections](/spec/collections/#sorting)): every `Seq` has `sorted()` (elements `Ord`),
   `sortedBy[K: Ord](key)` and `sortedWith(compare: (T, T) -> int)`, answering a `Vector`; `List`
   has its own three answering a `List`. `Array`, `Buffer` and `Deque` sort in place with `sort()`,
