@@ -1,0 +1,459 @@
+module dev.avinlang.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.path.parent
+import sysl.process.{Stdio, capture}
+
+// Packages: manifests, dependencies by path, by git and within a workspace, the sum file, `avin new`
+// and `avin tidy`, through the functions and through the command line as a person types it.
+
+private struct Session
+    status: int
+    said: string
+    noted: string
+    out: string
+
+private avin(dir: string, args: []const string) -> Session
+    var said = ""
+    var noted = ""
+    val out = dir + "/run.out"
+    val status = run_cli_with(args, Some(repository_toolchain()), s -> said = said + s + "\n", s -> noted = noted + s + "\n", Stdio.ToPath(out), Stdio.Inherit)
+    Session(status, said, noted, read_text(out).unwrap_or(""))
+
+// Writes `text` to `file`, making the directories above it.
+private put(file: string, text: string)
+    make_dir_all(parent(file).unwrap()).unwrap()
+    write_text(file, text).unwrap()
+
+private manifest(name: string, rest: string) -> string = s"package {\n  name = \"$name\"\n  version = \"0.1.0\"\n}\n$rest"
+
+// The message reading a manifest of `text` fails with.
+private manifest_error(text: string) -> string
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/avin.hocon", text).unwrap()
+    read_manifest(dir) match
+        Ok(_) -> "read"
+        Err(message) -> message
+
+@test("a manifest names the package, its version, its description and its dependencies")
+manifest_is_read()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/avin.hocon", "package {\n  name = \"geom-tools\"\n  version = \"1.20.3\"\n  description = \"shapes\"\n}\ndependencies {\n  json { git = \"github.com/owner/json\", version = \"0.4.0\" }\n  helper { path = \"../helper\" }\n  core_bits { workspace = true }\n}\n").unwrap()
+    val m = read_manifest(dir).unwrap()
+    assert(m.has_package)
+    assert_eq(m.name, "geom-tools")
+    assert_eq(m.version, "1.20.3")
+    assert_eq(m.description, "shapes")
+    assert_eq(m.dependencies.len(), 3)
+    assert_eq(m.dependencies[0].label, "json")
+    assert(m.dependencies[0].origin is Git(_, _))
+    assert(m.dependencies[1].origin is Local(_))
+    assert(m.dependencies[2].origin is Member)
+    assert(!m.has_workspace)
+
+@test("a manifest that is wrong says what is wrong and where")
+manifest_errors()
+    assert(manifest_error("package {\n  version = \"0.1.0\"\n}\n").contains("the `package` block has no `name`"))
+    assert(manifest_error("package {\n  name = \"a\"\n}\n").contains("the `package` block has no `version`"))
+    val version = manifest_error("package {\n  name = \"a\"\n  version = \"1.0\"\n}\n")
+    assert(version.contains("`1.0` is not a version"))
+    assert(version.contains("avin.hocon:3:"))
+    assert(manifest_error("package {\n  name = \"a\"\n  version = \"01.0.0\"\n}\n").contains("is not a version"))
+    assert(manifest_error("package {\n  name = \"Geom\"\n  version = \"0.1.0\"\n}\n").contains("`Geom` is not a package name"))
+    assert(manifest_error("package {\n  name = \"a\"\n  version = \"0.1.0\"\n  author = \"me\"\n}\n").contains("`author` is not a key of `package`"))
+    assert(manifest_error(manifest("a", "build = true\n")).contains("`build` is not a key of avin.hocon"))
+    assert(manifest_error("dependencies {\n}\n").contains("has no `package` block"))
+    assert(manifest_error("package = 3\n").contains("`package` is a block"))
+    assert(manifest_error("package {\n  name = \"a\"\n  version = 1\n}\n").contains("`version` is written as a string"))
+    assert(manifest_error("package {\n  name = \"a\"\n  version = \"0.1.0\"\n").contains("avin.hocon"))
+
+@test("a dependency says once where it comes from, and a git dependency names its version")
+dependency_manifest_errors()
+    assert(manifest_error(manifest("a", "dependencies {\n  b { }\n}\n")).contains("the dependency `b` says once where it comes from"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { path = \"../b\", workspace = true }\n}\n")).contains("says once where it comes from"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { git = \"github.com/o/b\" }\n}\n")).contains("names a repository and no version"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { path = \"../b\", version = \"1.0.0\" }\n}\n")).contains("has a `version`, which belongs with `git`"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { git = \"https://github.com/o/b\", version = \"1.0.0\" }\n}\n")).contains("is not a git coordinate"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { git = \"github.com/o/b.git\", version = \"1.0.0\" }\n}\n")).contains("is not a git coordinate"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { git = \"github.com/b\", version = \"1.0.0\" }\n}\n")).contains("is not a git coordinate"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { git = \"github.com/o/b\", version = \"1.0\" }\n}\n")).contains("`1.0` is not a version"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { workspace = false }\n}\n")).contains("a dependency's `workspace` is `true`"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b { tag = \"v1\" }\n}\n")).contains("`tag` is not a key of a dependency"))
+    assert(manifest_error(manifest("a", "dependencies {\n  B { path = \"../b\" }\n}\n")).contains("`B` is not a dependency's name"))
+    assert(manifest_error(manifest("a", "dependencies {\n  b = \"1.0.0\"\n}\n")).contains("the dependency `b` is a block"))
+
+@test("a workspace lists its members' directories, and a root with no package takes no dependencies")
+workspace_manifest_errors()
+    assert(manifest_error("workspace = \"app\"\n").contains("`workspace` is a list"))
+    assert(manifest_error("workspace = [\"../app\"]\n").contains("is not a member's directory"))
+    assert(manifest_error("workspace = [\"/app\"]\n").contains("`workspace` is a list"))
+    assert(manifest_error("workspace = [\"libs/**\"]\n").contains("is not a member's directory"))
+    assert(manifest_error("workspace = [\"app\"]\ndependencies {\n  b { path = \"b\" }\n}\n").contains("would reach nothing"))
+    assert_eq(manifest_error("workspace = [\"app\", \"libs/*\"]\n"), "read")
+
+@test("names, versions and coordinates")
+names_versions_coordinates()
+    assert(valid_package_name("a"))
+    assert(valid_package_name("geom-tools_2"))
+    assert(!valid_package_name(""))
+    assert(!valid_package_name("2d"))
+    assert(!valid_package_name("-a"))
+    assert(!valid_package_name("a.b"))
+    assert(valid_version("0.0.0"))
+    assert(valid_version("10.2.30"))
+    assert(!valid_version("1.2"))
+    assert(!valid_version("1.2.3.4"))
+    assert(!valid_version("1.02.3"))
+    assert(!valid_version("v1.2.3"))
+    assert(!valid_version("1.2.x"))
+    assert(version_after("0.10.0", "0.9.9"))
+    assert(version_after("1.0.0", "0.99.99"))
+    assert(!version_after("1.0.0", "1.0.0"))
+    assert(!version_after("0.1.9", "0.2.0"))
+    assert(valid_coordinate("github.com/owner/name"))
+    assert(valid_coordinate("example.com/a/b/c"))
+    assert(!valid_coordinate("github.com/name"))
+    assert(!valid_coordinate("github.com//name"))
+    assert(!valid_coordinate("github.com/o/../name"))
+    assert(!valid_coordinate("github.com/o/n m"))
+
+// Two packages side by side: `geom`, a library whose root directory has a `main` and whose `tests`
+// directory has a failing test, neither of which is a package using it compiles; and `app`, which
+// depends on it by path.
+private two_packages(dir: string)
+    put(dir + "/geom/avin.hocon", manifest("geom", ""))
+    put(dir + "/geom/geom/geom.avin", "module geom\n\narea(side: int) -> int = side * side\n")
+    put(dir + "/geom/geom/solid/solid.avin", "module geom.solid\n\nimport geom.area\n\nvolume(side: int) -> int = side * area(side)\n")
+    put(dir + "/geom/main.avin", "main()\n    print(\"geom's own main\")\n")
+    put(dir + "/geom/tests/geom_tests.avin", "module tests\n\n@test\nfailsInGeom()\n    assert(false)\n")
+    put(dir + "/app/avin.hocon", manifest("app", "dependencies {\n  geom { path = \"../geom\" }\n}\n"))
+    put(dir + "/app/main.avin", "import geom.area\nimport geom.solid.volume\n\nmain()\n    print(s\"${area(3)} ${volume(2)}\")\n")
+    put(dir + "/app/tests/app_tests.avin", "module tests\n\nimport geom.area\n\n@test\nareaOfTwo()\n    assertEq(area(2), 4)\n")
+    put(dir + "/app/tools/notes.txt", "not source\n")
+
+@test("a package's path dependency's modules are imported by their names, and its own files and tests stay its own")
+path_dependency()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    two_packages(dir)
+    val run = avin(dir, ["avin", "run", dir + "/app"])
+    assert_eq(run.noted, "")
+    assert_eq(run.out, "9 8\n")
+    assert_eq(run.status, 0)
+    val tests = avin(dir, ["avin", "test", dir + "/app", "-O0"])
+    assert_eq(tests.status, 0)
+    assert(tests.said.starts_with("running 1 test\n"))
+    assert(tests.said.contains("tests/app_tests.avin"))
+    assert(tests.said.contains("areaOfTwo"))
+    assert(!tests.said.contains("failsInGeom"))
+    // A path dependency gets no line in the sum file: a directory beside you is expected to change.
+    assert(!exists(dir + "/app/avin.sum"))
+    // The dependency is a package of its own, run and tested by itself.
+    assert_eq(avin(dir, ["avin", "run", dir + "/geom"]).out, "geom's own main\n")
+    assert_eq(avin(dir, ["avin", "test", dir + "/geom", "-O0"]).status, 1)
+
+@test("a path in a package names the package: a file or a directory in it, found by walking up to the manifest")
+path_inside_a_package()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    two_packages(dir)
+    val app = absolute_path(dir + "/app")
+    assert_eq(enclosing_package(dir + "/app/tests/app_tests.avin").unwrap(), Some(app))
+    assert_eq(enclosing_package(dir + "/app/tools").unwrap(), Some(app))
+    assert_eq(enclosing_package(dir + "/app").unwrap(), Some(app))
+    assert_eq(enclosing_package(dir).unwrap(), None)
+    assert_eq(avin(dir, ["avin", "run", dir + "/app/main.avin"]).out, "9 8\n")
+    val check = avin(dir, ["avin", "check", dir + "/app/tools"])
+    assert_eq(check.status, 0)
+    val program = load_program(dir + "/app/tests/app_tests.avin", default_fetching()).unwrap()
+    assert_eq(program.root, app)
+    assert_eq(program.package, Some("app"))
+    // Without a manifest above it, a directory is a program and a file is a program by itself.
+    put(dir + "/plain/main.avin", "main() = 7\n")
+    val plain = load_program(dir + "/plain", default_fetching()).unwrap()
+    assert_eq(plain.package, None)
+    assert_eq(plain.root, dir + "/plain")
+    assert_eq(load_program(dir + "/plain/main.avin", default_fetching()).unwrap().files.len(), 1)
+
+@test("the language server reads a file in a package as the package with its dependencies, and fetches nothing")
+language_server_reads_packages()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    two_packages(dir)
+    val program = lsp_program("/no-library", dir + "/app/tests/app_tests.avin", "tests")
+    assert_eq(program.root, absolute_path(dir + "/app"))
+    assert(program.directory)
+    var names = ""
+    for f in program_tree_files(program.root).unwrap()
+        names = names + f.src.name + "\n"
+    assert(names.contains("/geom/geom/geom.avin\n"))
+    assert(names.contains("/app/tests/app_tests.avin\n"))
+    assert(!names.contains("/geom/main.avin"))
+    assert(!names.contains("/geom/tests/"))
+    put(dir + "/app/avin.hocon", manifest("app", "dependencies {\n  far { git = \"example.com/avin/not-fetched\", version = \"0.1.0\" }\n}\n"))
+    assert(program_tree_files(program.root).unwrap_err().contains("is not fetched yet"))
+
+@test("a dependency's problems are reported at the manifest line that names it")
+dependency_errors()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    put(dir + "/app/main.avin", "main() = 0\n")
+    put(dir + "/empty/readme.txt", "no manifest\n")
+    put(dir + "/app/avin.hocon", manifest("app", "dependencies {\n  geom { path = \"../absent\" }\n}\n"))
+    val absent = avin(dir, ["avin", "check", dir + "/app"])
+    assert_eq(absent.status, 1)
+    assert(absent.noted.contains("`geom` is a path dependency, and `../absent` is not a directory"))
+    assert(absent.noted.contains("avin.hocon:6:"))
+    put(dir + "/app/avin.hocon", manifest("app", "dependencies {\n  geom { path = \"../empty\" }\n}\n"))
+    assert(avin(dir, ["avin", "check", dir + "/app"]).noted.contains("`../empty` holds no avin.hocon"))
+    put(dir + "/app/avin.hocon", manifest("app", "dependencies {\n  geom { workspace = true }\n}\n"))
+    assert(avin(dir, ["avin", "check", dir + "/app"]).noted.contains("`geom` is a workspace dependency, and this package is in no workspace"))
+    put(dir + "/app/avin.hocon", "package {\n  name = \"app\"\n}\n")
+    val unnamed = avin(dir, ["avin", "run", dir + "/app"])
+    assert_eq(unnamed.status, 1)
+    assert(unnamed.noted.contains("has no `version`"))
+
+@test("one module in two packages is refused, naming both")
+module_in_two_packages()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    two_packages(dir)
+    put(dir + "/app/geom/extra.avin", "module geom\n\nmore() = 1\n")
+    val run = avin(dir, ["avin", "check", dir + "/app"])
+    assert_eq(run.status, 1)
+    assert(run.noted.contains("the module `geom` is in two packages, `geom` and `app`"))
+
+@test("a directory holding its own manifest is another package, not a module of the one above it")
+nested_package_is_not_a_module()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    put(dir + "/outer/main.avin", "main() = print(\"outer\")\n")
+    put(dir + "/outer/inner/avin.hocon", manifest("inner", ""))
+    put(dir + "/outer/inner/main.avin", "this is not avin\n")
+    assert_eq(program_files(dir + "/outer").unwrap().len(), 1)
+    put(dir + "/outer/avin.hocon", manifest("outer", ""))
+    assert_eq(avin(dir, ["avin", "run", dir + "/outer"]).out, "outer\n")
+
+@test("a workspace's members depend on each other by name, and the workspace's root is not a program")
+workspace_members()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    val ws = dir + "/ws"
+    put(ws + "/avin.hocon", "workspace = [\"app\", \"libs/*\"]\n")
+    put(ws + "/libs/geom/avin.hocon", manifest("geom", ""))
+    put(ws + "/libs/geom/geom/geom.avin", "module geom\n\narea(side: int) -> int = side * side\n")
+    put(ws + "/libs/notes/readme.txt", "not a member\n")
+    put(ws + "/app/avin.hocon", manifest("app", "dependencies {\n  geom { workspace = true }\n}\n"))
+    put(ws + "/app/main.avin", "import geom.area\n\nmain()\n    print(s\"${area(5)}\")\n")
+    assert_eq(avin(dir, ["avin", "run", ws + "/app"]).out, "25\n")
+    val root = avin(dir, ["avin", "run", ws])
+    assert_eq(root.status, 1)
+    assert(root.noted.contains("is a workspace, which compiles nothing of its own"))
+    assert(root.noted.contains("/libs/geom"))
+    put(ws + "/app/avin.hocon", manifest("app", "dependencies {\n  shapes { workspace = true }\n}\n"))
+    assert(avin(dir, ["avin", "check", ws + "/app"]).noted.contains("no member of the workspace at"))
+    // A root with a package block is a member too, and its members' directories are not its modules.
+    put(ws + "/main.avin", "import geom.area\n\nmain()\n    print(s\"${area(4)}\")\n")
+    put(ws + "/app/avin.hocon", manifest("app", "dependencies {\n  geom { workspace = true }\n}\n"))
+    put(ws + "/avin.hocon", manifest("tools", "workspace = [\"app\", \"libs/*\"]\ndependencies {\n  geom { workspace = true }\n}\n"))
+    assert_eq(avin(dir, ["avin", "run", ws]).out, "16\n")
+    assert_eq(avin(dir, ["avin", "run", ws + "/app"]).out, "25\n")
+    put(ws + "/avin.hocon", "workspace = [\"app\", \"missing\"]\n")
+    assert(avin(dir, ["avin", "check", ws + "/app"]).noted.contains("the workspace lists `missing`"))
+
+@test("avin new writes a program package and a library package whose tests pass")
+new_packages()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    val made = avin(dir, ["avin", "new", dir + "/hello-app"])
+    assert_eq(made.status, 0)
+    assert_eq(made.said, s"created program package `hello-app` in $dir/hello-app\n")
+    assert_eq(read_text(dir + "/hello-app/.gitignore").unwrap(), ".avin/\n")
+    assert(exists(dir + "/hello-app/hello_app/hello_app.avin"))
+    val m = read_manifest(dir + "/hello-app").unwrap()
+    assert_eq(m.name, "hello-app")
+    assert_eq(m.version, "0.1.0")
+    assert_eq(avin(dir, ["avin", "run", dir + "/hello-app"]).out, "Hello, world!\n")
+    val tests = avin(dir, ["avin", "test", dir + "/hello-app", "-O0"])
+    assert_eq(tests.status, 0)
+    assert(tests.said.contains("1 passed, 0 failed"))
+    assert_eq(avin(dir, ["avin", "build", dir + "/hello-app", "-o", dir + "/hello", "-O0"]).status, 0)
+    assert(exists(dir + "/hello"))
+    val lib = avin(dir, ["avin", "new", dir + "/geom", "--lib"])
+    assert_eq(lib.said, s"created library package `geom` in $dir/geom\n")
+    assert(!exists(dir + "/geom/main.avin"))
+    assert(avin(dir, ["avin", "test", dir + "/geom", "-O0"]).said.contains("1 passed, 0 failed"))
+    assert(avin(dir, ["avin", "run", dir + "/geom"]).noted.contains("a program needs a `main` function"))
+    val again = avin(dir, ["avin", "new", dir + "/geom"])
+    assert_eq(again.status, 1)
+    assert(again.noted.contains("already exists"))
+    assert(avin(dir, ["avin", "new", dir + "/Geom2"]).noted.contains("`Geom2` is not a package name"))
+    assert(avin(dir, ["avin", "new", dir + "/avin"]).noted.contains("the standard library's"))
+    assert(avin(dir, ["avin", "new", dir + "/tests"]).noted.contains("its own tests' directory"))
+    assert_eq(avin(dir, ["avin", "new"]).status, 2)
+    assert_eq(avin(dir, ["avin", "new", "a", "b"]).status, 2)
+    assert_eq(avin(dir, ["avin", "new", "a", "--bin"]).status, 2)
+
+// Runs git in `dir` as a fixed author that signs nothing, so a test's repositories are made alike on
+// every machine.
+private git(dir: string, args: []const string)
+    var all: Buf[string] = buf()
+    for a in ["-C", dir, "-c", "user.name=avin", "-c", "user.email=avin@example.com", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "-c", "init.defaultBranch=main"]
+        all.push(a)
+    for a in args
+        all.push(a)
+    val result = capture("git", all.view(), stderr = true, timeout = 60000).unwrap()
+    if !result.status.ok() then eprints(result.err.unwrap_or("") + result.text)
+    assert(result.status.ok())
+
+private commit_and_tag(work: string, tag: string)
+    git(work, ["add", "-A"])
+    git(work, ["commit", "-q", "-m", tag])
+    git(work, ["tag", tag])
+
+// A repository at `remotes/<coordinate>.git`, as a host would serve it, holding `shapes` at 0.1.0 and
+// 0.2.0, and `extra` at 0.1.0, which asks for `shapes` 0.2.0.
+private published(dir: string)
+    val shapes = dir + "/work/shapes"
+    put(shapes + "/avin.hocon", manifest("shapes", ""))
+    put(shapes + "/shapes/shapes.avin", "module shapes\n\nsize() -> int = 1\n")
+    git(shapes, ["init", "-q"])
+    commit_and_tag(shapes, "v0.1.0")
+    put(shapes + "/avin.hocon", "package {\n  name = \"shapes\"\n  version = \"0.2.0\"\n}\n")
+    put(shapes + "/shapes/shapes.avin", "module shapes\n\nsize() -> int = 2\n")
+    commit_and_tag(shapes, "v0.2.0")
+    val extra = dir + "/work/extra"
+    put(extra + "/avin.hocon", manifest("extra", "dependencies {\n  shapes { git = \"example.com/avin/shapes\", version = \"0.2.0\" }\n}\n"))
+    put(extra + "/extra/extra.avin", "module extra\n\nimport shapes.size\n\ndoubled() -> int = 2 * size()\n")
+    git(extra, ["init", "-q"])
+    commit_and_tag(extra, "v0.1.0")
+    make_dir_all(dir + "/remotes/example.com/avin").unwrap()
+    git(dir, ["clone", "-q", "--bare", shapes, dir + "/remotes/example.com/avin/shapes.git"])
+    git(dir, ["clone", "-q", "--bare", extra, dir + "/remotes/example.com/avin/extra.git"])
+
+@test("git dependencies are fetched at their tags into the cache, the highest version asked for is chosen, and avin.sum records each")
+git_dependencies()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    published(dir)
+    val app = dir + "/app"
+    put(app + "/avin.hocon", manifest("app", "dependencies {\n  shapes { git = \"example.com/avin/shapes\", version = \"0.1.0\" }\n  extra { git = \"example.com/avin/extra\", version = \"0.1.0\" }\n}\n"))
+    put(app + "/main.avin", "import shapes.size\nimport extra.doubled\n\nmain()\n    print(s\"${size()} ${doubled()}\")\n")
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    val program = load_package(app, fetching).unwrap()
+    var names = ""
+    for f in program.files
+        names = names + f.src.name + "\n"
+    assert(names.contains("/cache/example.com/avin/shapes/@v0.2.0/shapes/shapes.avin"))
+    assert(!names.contains("@v0.1.0/shapes"))
+    assert(names.contains("/cache/example.com/avin/extra/@v0.1.0/extra/extra.avin"))
+    assert_eq(compile_files(repository_toolchain(), program.files).diagnostics, "")
+    // Fetching leaves no history in the cache, and the hash recorded beside it is the tree's.
+    val shapes = cached_package_dir(dir + "/cache", "example.com/avin/shapes", "0.2.0")
+    assert(!exists(shapes + "/.git"))
+    val hash = tree_hash(shapes).unwrap()
+    assert(hash.starts_with("sha256:"))
+    assert_eq(read_text(shapes + ".hash").unwrap(), hash + "\n")
+    // Every version resolution read is recorded, the one it read on the way to a higher one too.
+    val sums = read_sums(app + "/avin.sum").unwrap()
+    assert_eq(sums.len(), 3)
+    assert_eq(sums[0].coordinate, "example.com/avin/shapes")
+    assert_eq(sums[0].version, "0.1.0")
+    var shapes_line = ""
+    for l in sums
+        if l.version == "0.2.0" then shapes_line = l.hash
+    assert_eq(shapes_line, hash)
+    // A second load reads the cache and leaves the sum file as it was.
+    val before = read_text(app + "/avin.sum").unwrap()
+    assert_eq(load_package(app, fetching).unwrap().files.len(), program.files.len())
+    assert_eq(read_text(app + "/avin.sum").unwrap(), before)
+    // A cache missing a package is not fetched into when fetching is off, as for the editor.
+    val offline = load_package(app, Fetching(dir + "/empty-cache", "file://" + dir + "/remotes/", false))
+    assert(offline.unwrap_err().contains("is not fetched yet"))
+    // A tag the repository does not have is reported with what git said.
+    put(app + "/avin.hocon", manifest("app", "dependencies {\n  shapes { git = \"example.com/avin/shapes\", version = \"0.3.0\" }\n}\n"))
+    assert(load_package(app, fetching).unwrap_err().contains("cannot fetch example.com/avin/shapes v0.3.0"))
+
+@test("a package whose hash is not the one avin.sum records is refused")
+sum_mismatch()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    published(dir)
+    val app = dir + "/app"
+    put(app + "/avin.hocon", manifest("app", "dependencies {\n  shapes { git = \"example.com/avin/shapes\", version = \"0.2.0\" }\n}\n"))
+    put(app + "/main.avin", "import shapes.size\n\nmain() = print(s\"${size()}\")\n")
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    load_package(app, fetching).unwrap()
+    val recorded = read_text(app + "/avin.sum").unwrap()
+    val wrong = "example.com/avin/shapes v0.2.0 sha256:0000000000000000000000000000000000000000000000000000000000000000\n"
+    write_text(app + "/avin.sum", wrong).unwrap()
+    val cached = load_package(app, fetching).unwrap_err()
+    assert(cached.contains("avin.sum records example.com/avin/shapes v0.2.0 as sha256:0000"))
+    // A fresh fetch is checked the same way as a cached one.
+    val fresh = load_package(app, Fetching(dir + "/cache2", "file://" + dir + "/remotes/", true)).unwrap_err()
+    assert(fresh.contains("avin.sum records example.com/avin/shapes v0.2.0"))
+    // A cache entry with no hash beside it was not written by a fetch, and is refused.
+    write_text(app + "/avin.sum", recorded).unwrap()
+    remove_dir_all(dir + "/cache2").unwrap()
+    make_dir_all(cached_package_dir(dir + "/cache2", "example.com/avin/shapes", "0.2.0")).unwrap()
+    assert(load_package(app, Fetching(dir + "/cache2", "", true)).unwrap_err().contains("no record of what it hashed to"))
+    write_text(app + "/avin.sum", "not a sum line\n").unwrap()
+    assert(load_package(app, fetching).unwrap_err().contains("avin.sum:1: a line is a coordinate"))
+
+@test("tidy rewrites avin.sum to what the package resolves to, and --check fails while it is not")
+tidy_sums()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    published(dir)
+    val app = dir + "/app"
+    put(app + "/avin.hocon", manifest("app", "dependencies {\n  extra { git = \"example.com/avin/extra\", version = \"0.1.0\" }\n}\n"))
+    put(app + "/main.avin", "main() = 0\n")
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    var said = ""
+    // Tidying a package with no sum file writes the lines a build would.
+    assert_eq(tidy(app, fetching, true, s -> said = said + s + "\n").unwrap(), false)
+    assert(said.contains("would add example.com/avin/extra v0.1.0"))
+    assert(!exists(app + "/avin.sum"))
+    said = ""
+    assert_eq(tidy(app, fetching, false, s -> said = said + s + "\n").unwrap(), false)
+    assert_eq(read_sums(app + "/avin.sum").unwrap().len(), 2)
+    said = ""
+    assert_eq(tidy(app, fetching, true, s -> said = said + s + "\n").unwrap(), true)
+    assert_eq(said, "")
+    // A line nothing resolves to any more is removed, and the lines that stay are kept as they were.
+    val tidied = read_text(app + "/avin.sum").unwrap()
+    write_text(app + "/avin.sum", "example.com/avin/gone v1.0.0 sha256:00\n" + tidied).unwrap()
+    assert_eq(tidy(app, fetching, true, s -> said = said + s + "\n").unwrap(), false)
+    assert_eq(said, "would remove example.com/avin/gone v1.0.0\n")
+    said = ""
+    tidy(app, fetching, false, s -> said = said + s + "\n").unwrap()
+    assert_eq(said, "removed example.com/avin/gone v1.0.0\n")
+    assert_eq(read_text(app + "/avin.sum").unwrap(), tidied)
+    // A package depending on nothing it fetches is tidy with no sum file.
+    put(app + "/avin.hocon", manifest("app", ""))
+    tidy(app, fetching, false, s -> ()).unwrap()
+    assert(!exists(app + "/avin.sum"))
+
+@test("avin tidy on the command line: a package, --check, and a path in no package")
+tidy_command_line()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    two_packages(dir)
+    val tidied = avin(dir, ["avin", "tidy", dir + "/app"])
+    assert_eq(tidied.status, 0)
+    assert_eq(tidied.said, "")
+    assert_eq(avin(dir, ["avin", "tidy", "--check", dir + "/app/tests"]).status, 0)
+    write_text(dir + "/app/avin.sum", "example.com/avin/gone v1.0.0 sha256:00\n").unwrap()
+    val check = avin(dir, ["avin", "tidy", "--check", dir + "/app"])
+    assert_eq(check.status, 1)
+    assert_eq(check.said, "would remove example.com/avin/gone v1.0.0\n")
+    assert(check.noted.contains("avin.sum is not tidy"))
+    assert_eq(avin(dir, ["avin", "tidy", dir + "/app"]).status, 0)
+    assert(!exists(dir + "/app/avin.sum"))
+    put(dir + "/plain/main.avin", "main() = 0\n")
+    assert(avin(dir, ["avin", "tidy", dir + "/plain"]).noted.contains("is in no package"))
+    assert_eq(avin(dir, ["avin", "tidy", "--bad"]).status, 2)

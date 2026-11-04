@@ -42,30 +42,39 @@ struct TestEntry
 
 /** A source file of a program, with the module its place under the program's root directory gives
  * it. A program of one file has no root directory: its `module_name` is `None`, and its header, if it has
- * one, names its module. */
+ * one, names its module. A file of a package the program depends on is a `dependency`: its tests are
+ * not the program's. */
 struct ProgramFile
     src: Source
     module_name: Option[string]
+    dependency: bool
 
 /** A program of one file. */
 single_file(src: Source) -> Buf[ProgramFile]
     var files: Buf[ProgramFile] = buf()
-    files.push(ProgramFile(src, None))
+    files.push(ProgramFile(src, None, false))
     files
 
 /** The files of the program rooted at the directory `root`: every `.avin` file under it, in order of
  * path, each in the module its directory's path from the root names, `a/b` being `a.b`. The files of
  * the root directory itself are the root module, which has no name, and come last. Directories whose
- * names begin with `.` are passed over. */
-program_files(root: string) -> Result[Buf[ProgramFile], string]
+ * names begin with `.` are passed over, and so is a directory below the root holding an `avin.hocon`,
+ * which is another package. */
+program_files(root: string) -> Result[Buf[ProgramFile], string] = package_files(root, false)
+
+/** The files of the package tree at `root`, as `program_files` finds them. With `dependency`, those a
+ * package depending on it compiles: its modules, without its root directory's files and its `tests`
+ * directory, which are its own. */
+package_files(root: string, dependency: bool) -> Result[Buf[ProgramFile], string]
     var modules: Buf[ProgramFile] = buf()
     var root_files: Buf[ProgramFile] = buf()
-    collect_files(root, "", "", &modules, &root_files)?
-    for f in root_files
-        modules.push(f)
+    collect_files(root, "", "", dependency, &modules, &root_files)?
+    if !dependency
+        for f in root_files
+            modules.push(f)
     Ok(modules)
 
-private collect_files(root: string, rel: string, module_name: string, modules: *Buf[ProgramFile], root_files: *Buf[ProgramFile]) -> Result[unit, string]
+private collect_files(root: string, rel: string, module_name: string, dependency: bool, modules: *Buf[ProgramFile], root_files: *Buf[ProgramFile]) -> Result[unit, string]
     val dir = if rel == "" then root else root + "/" + rel
     val names = entries(dir).map_err(e -> s"$dir: ${e.to_string()}")?
     val sorted = names.view()
@@ -75,10 +84,13 @@ private collect_files(root: string, rel: string, module_name: string, modules: *
         val child = if rel == "" then name else rel + "/" + name
         val full = root + "/" + child
         if is_dir(full)
-            collect_files(root, child, qualified(module_name, name), modules, root_files)?
+            if exists(full + "/" + ManifestName) then continue
+            if dependency && rel == "" && name == "tests" then continue
+            collect_files(root, child, qualified(module_name, name), dependency, modules, root_files)?
         elif name.ends_with(".avin")
+            if dependency && rel == "" then continue
             val text = read_text(full).map_err(e -> s"$full: ${e.to_string()}")?
-            val file = ProgramFile(source_of(full, text), Some(module_name))
+            val file = ProgramFile(source_of(full, text), Some(module_name), dependency)
             if rel == "" then root_files.push(file) else modules.push(file)
     Ok(())
 
@@ -139,7 +151,14 @@ private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool) -> Re
     val checked = check_program(units, root_module, testing)
     if checked.has_errors() then return Err(checked.render())
     checked.program match
-        Some(program) ->
+        Some(checked_program) ->
+            // A package's dependencies are compiled into its program, and their tests are theirs.
+            var program = checked_program
+            var own: Buf[TestCase] = buf()
+            for t in program.tests
+                val unit = program.symbols[t.symbol].unit
+                if unit < library.len() || !files[unit - library.len()].dependency then own.push(t)
+            program.tests = own
             var tests: Buf[TestEntry] = buf()
             for t in program.tests
                 val f = program.symbols[t.symbol]
