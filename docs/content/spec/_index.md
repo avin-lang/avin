@@ -47,9 +47,9 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
 | [Operators and control flow](/spec/operators-and-control-flow/) | Operators, blocks, `if`, `while`, `match` |
 | [Call-by-name](/spec/by-name/) | `value: -> T` parameters |
 | [Strings and formatting](/spec/strings-and-formatting/) | Interpolation and format specifiers |
-| [System library](/spec/system-library/) | Proposed: `avin.process` — arguments, environment, exit; `avin.io` — `IoError`, standard input; `avin.fs` — files and directories |
+| [System library](/spec/system-library/) | Proposed: `avin.process` — arguments, environment, exit; `avin.io` — `IoError`, standard input; `avin.fs` — files and directories; `avin.time`; the environment, commands and pipelines, `Source`, `avin.random`, `avin.net` (TCP, URLs, HTTP) and futures' additions |
 | [Regular expressions](/spec/regex/) | Proposed: `avin.regex` — the pattern language, leftmost-first backtracking, `Regex`, `Match` and `MatchIterator` |
-| [Packages](/spec/packages/) | Proposed: `avin.hocon`, dependencies, version selection, `avin.sum`, workspaces, `avin new` and `avin tidy` |
+| [Packages](/spec/packages/) | Proposed: `avin.hocon`, dependencies, version selection, `avin.sum`, workspaces, `avin new` and `avin tidy`; settled: features, members of a repository, vendoring and the standard library's modules |
 | [Derivation](/spec/derivation/) | Library-defined `derives`: shapes of data types and classes, `derive` templates, annotations, a JSON library written with them |
 | [Settled decisions](/spec/decisions/) | Every decision made so far, in one list |
 
