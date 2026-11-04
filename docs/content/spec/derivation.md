@@ -57,8 +57,10 @@ impl FieldShape                                 // and the same on TypeShape and
 - **A class's shape** has one variant, of the class's name, whose fields are its constructor
   parameters, plain, `val` and `var` alike, in order: what the built-in derivations read. Fields
   its body declares take no part. A repeated parameter is a field of type `Vector[T]`.
-- **A shape is made once.** The shapes of a type, its variants and its fields are module values
-  private to the type's module, made before `main` like any other; reading one costs a load. A type
+- **A shape is constant data.** The shapes of a type, its variants and its fields are module values
+  private to the type's module, built only of literals, so the compiler makes them itself and writes
+  them as read-only data: nothing runs before `main` to make them, and code reading a field of one
+  is compiled to the field's value. A type
   has them where it derives a trait through a template or carries annotations, and no other does;
   every data type derives `Display` and `Debug` through the core library's templates unless it
   implements both itself, so every other data type has its shape.
@@ -107,17 +109,22 @@ trait Shaped
 ### Walking a value
 
 `T.walk(value, v)` calls `v.variant` with the value's variant, then `v.field` once per field of that
-variant, in order, each call taking the visitor the one before returned:
+variant, in order, then `v.finish` with the variant, each call taking the visitor the one before
+returned. `finish` does nothing unless the visitor's type says otherwise:
 
 ```text
 trait ShapeVisitor
     variant(v: VariantShape) -> Self
+    finish(v: VariantShape) -> Self = self
 
 // for data Shape = Circle(radius: real) | Rect(width: real, height: real), the compiler writes:
 value match
-    Circle(r) -> visitor.variant(CIRCLE).field[real](CIRCLE_RADIUS, r)
-    Rect(w, h) -> visitor.variant(RECT).field[real](RECT_WIDTH, w).field[real](RECT_HEIGHT, h)
+    Circle(r) -> visitor.variant(CIRCLE).field[real](CIRCLE_RADIUS, r).finish(CIRCLE)
+    Rect(w, h) -> visitor.variant(RECT).field[real](RECT_WIDTH, w).field[real](RECT_HEIGHT, h).finish(RECT)
 ```
+
+Each arm passes its own variant's shape, so what a hook reads of it is known where the arm is
+compiled: `v.fieldCount > 0` in `Rect`'s `finish` is `true`.
 
 **The field hook is not in the trait**, because its bound is the deriving library's own: a visitor
 type declares one method `field` with exactly one type parameter of its own, `field[F: Bound](f:
@@ -245,15 +252,13 @@ walk is `FieldWriter(…).variant(PERSON_0).field[string](NAME, name).field[int]
 
 **What holds now.** Every call is direct: the visitor's type is known and each hook is compiled for
 one field type, so there is no call through a method table, no lookup by name and no boxing. A shape
-is read with a load of a module value. The visitor costs nothing: `FieldWriter` is data that never
+is constant data, and what a hook reads of it is a constant in the compiled code:
+`shape.variantCount > 1` is `false`, `f.has(JsonOmit)` is `false` and the key is `"name"`. The
+visitor costs nothing: `FieldWriter` is data that never
 leaves `encode`, so the walk and the hooks are inlined into it and the visitor is kept as its
 fields, with no allocation. The compiler's tests hold a derived encoder to exactly this: it
-allocates no more than a hand-written one, and calls each field's own method directly.
-
-**What a later compiler feature adds.** Constant data is to be emitted once in read-only data, so
-the shapes become constants and code reading them folds: `shape.variantCount > 1` is `false`,
-`f.has(JsonOmit)` is `false` and the key is `"name"`, all known to the compiler. With that, what
-remains is exactly the hand-written encoder:
+allocates no more than a hand-written one, and calls each field's own method directly. What remains
+is the hand-written encoder:
 
 ```text
 encode(out: JsonWriter) =
@@ -267,8 +272,7 @@ encode(out: JsonWriter) =
 
 The hooks are inlined at `-O0` too, since the compiler inlines them to keep the visitor as its
 fields; there are no lookups by name and no boxing either way. A program
-that never encodes a `Person` compiles none of the encoder, though it still makes `Person`'s shape
-before `main`.
+that never encodes a `Person` compiles none of the encoder.
 
 ## A JSON library
 
@@ -464,13 +468,16 @@ derive Display for T
             out.writeField(text.text(), spec)
         else
             T.walk(self, DisplayFields(out))
-            if T.variantOf(self).fieldCount > 0 then out.write(")")
 
 private data DisplayFields(out: Writer)
 
 impl ShapeVisitor for DisplayFields
     variant(v: VariantShape) -> DisplayFields =
         out.write(v.name)
+        self
+
+    finish(v: VariantShape) -> DisplayFields =
+        if v.fieldCount > 0 then out.write(")")
         self
 
 impl DisplayFields
@@ -481,8 +488,8 @@ impl DisplayFields
 ```
 
 `Eq` is `Ord`'s shape with `equals`, and `Debug` is `Display`'s with `debug`. The visitors of `Eq`
-and `Ord` take only a few values, each a module value, so comparing allocates nothing, and a derived
-`compare` is -1, 0 or 1. A derived `Display`'s visitor never leaves the method that makes it, so it
+and `Ord` take only a few values, each a module value made at compile time, so comparing allocates
+nothing and each step of a comparison compiles to integers, and a derived `compare` is -1, 0 or 1. A derived `Display`'s visitor never leaves the method that makes it, so it
 is kept as its field and allocates nothing either. A class without constructor parameters has a variant without fields, so it displays as its bare name, as such a
 variant does.
 

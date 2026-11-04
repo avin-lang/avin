@@ -1,0 +1,175 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// Which module-level values are made at compile time: a `val` built only of literals, other such
+// values, data constructors, tuples and vector literals of at most 32 elements. Such a value has no
+// storage, nothing initializes it, and a read of one of its fields is the field's value.
+
+private lowered(text: string) -> MirProgram = lower_source(repository_toolchain(), source_of("probe.avin", text)) match
+    Ok(p) -> p
+    Err(d) -> panic(d)
+
+private function_of(program: MirProgram, name: string) -> MirFunction
+    for f in program.functions
+        if f.symbol == "<program>." + name then return f
+    panic("no function " + name)
+
+/** The loads `name` makes from memory, and what it returns where every return is the same constant. */
+private struct Reads
+    loads: int
+    returned: string
+
+private reads(program: MirProgram, name: string) -> Reads
+    var loads = 0
+    var returned = ""
+    for block in function_of(program, name).blocks
+        for inst in block.insts
+            inst match
+                // A function's own slots, which hold its locals, are not memory a value is read from.
+                Load(_, SlotAddress(_)) -> ()
+                Load(_, _) -> loads = loads + 1
+                AtomicLoad(_, _) -> loads = loads + 1
+                _ -> ()
+        block.term match
+            Return(Some(ConstInt(_, digits))) -> returned = digits
+            Return(Some(ConstBool(value))) -> returned = if value then "true" else "false"
+            Return(Some(ConstData(_, _))) -> returned = "object"
+            Return(Some(NullAddress)) -> returned = "null"
+            Return(Some(_)) -> returned = "value"
+            _ -> ()
+    Reads(loads, returned)
+
+private indirect_calls(program: MirProgram, name: string) -> int
+    var n = 0
+    for block in function_of(program, name).blocks
+        for inst in block.insts
+            if inst is Call(_, Indirect(_, _), _) then n = n + 1
+    n
+
+/** How many module-level values keep storage, those made at run time, and how many objects are made
+ * at compile time, beyond the core library's own: what a program declaring no values has. */
+private struct Counts
+    stored: int
+    constants: int
+
+private counts(program: MirProgram) -> Counts
+    var n = 0
+    for g in program.globals
+        if g is Some(_) then n = n + 1
+    Counts(n, int(program.constants.len()))
+
+private val base = counts(lowered("read() -> int = 0\n\nmain()\n    print(read())\n"))
+
+private stored(program: MirProgram) -> int = counts(program).stored - base.stored
+
+private constants(program: MirProgram) -> int = counts(program).constants - base.constants
+
+private const Main: string = "\n\nmain()\n    print(read())\n"
+
+@test("a data value of literals is made at compile time, and a read of its field is the field's value")
+data_of_literals()
+    val program = lowered("data Pt(x: int, y: int)\n\nval origin = Pt(3, 4)\n\nread() -> int = origin.y" + Main)
+    assert_eq(stored(program), 0)
+    val r = reads(program, "read")
+    assert_eq(r.loads, 0)
+    assert_eq(r.returned, "4")
+
+@test("a value naming another constant value points at it, and fields read through both fold")
+nested_constants()
+    val text = "data Pt(x: int, y: int)\n\ndata Seg(a: Pt, b: Pt, name: string)\n\nval a = Pt(1, 2)\n\nval s = Seg(a, Pt(5, 6), \"s\")\n\nread() -> int = s.a.x + s.b.y" + Main
+    val program = lowered(text)
+    assert_eq(stored(program), 0)
+    assert_eq(reads(program, "read").loads, 0)
+
+@test("a value of a built-in type made of a literal is the literal wherever it is read")
+scalar_value()
+    val program = lowered("val limit = 40\n\nval on = true\n\nread() -> int = if on then limit else 0" + Main)
+    assert_eq(stored(program), 0)
+    assert_eq(constants(program), 0)
+    assert_eq(reads(program, "read").loads, 0)
+
+@test("options in a constant: `None` and `Some` of a reference are the null pointer and the object")
+option_fields()
+    val text = "data Pt(x: int, y: int)\n\ndata Tag(label: string, at: Option[Pt])\n\nval none = Tag(\"n\", None)\n\nval some = Tag(\"s\", Some(Pt(1, 2)))\n\nread() -> int = (if none.at is None then 1 else 0) + (if some.at is Some(_) then 2 else 0)" + Main
+    val program = lowered(text)
+    assert_eq(stored(program), 0)
+
+@test("a vector literal of constants is a constant vector over a constant leaf; an empty one is a constant `Vector0`")
+vector_literals()
+    val text = "data Pt(x: int, y: int)\n\nval points = [Pt(1, 2), Pt(3, 4)]\n\nval nothing: Vector[Pt] = []\n\nval numbers = [1, 2, 3]\n\ncount() -> int = numbers.length()\n\nread() -> int = points.length() + nothing.length() + numbers(2) + count()" + Main
+    val program = lowered(text)
+    assert_eq(stored(program), 0)
+    // The vector's class is known, so its `length` is called directly, not through its table.
+    assert_eq(indirect_calls(program, "count"), 0)
+
+@test("a vector literal of more than 32 elements is built at run time")
+long_vector_literal()
+    var items = ""
+    for i in 0..<33
+        if i > 0 then items = items + ", "
+        items = items + i.to_string()
+    val program = lowered(s"val numbers = [$items]\n\nread() -> int = numbers(32)" + Main)
+    assert_eq(stored(program), 1)
+    assert_eq(constants(program), 0)
+
+@test("a value whose initializer calls a function, a `var`, a `lazy val` and an object of a class are made at run time")
+run_time_values()
+    val text = "data Pt(x: int, y: int)\n\nclass Box(val v: int)\n\ntwice(n: int) -> int = n * 2\n\nval called = Pt(twice(2), 1)\n\nvar moving = Pt(1, 2)\n\nlazy val later = Pt(3, 4)\n\nval boxed = Box(7)\n\nval inVector = [Pt(1, 2), called]\n\nread() -> int = called.x + moving.x + later.x + boxed.v + inVector.length()" + Main
+    val program = lowered(text)
+    // `called`, `moving`, `later` and its state word, `boxed` and `inVector`.
+    assert_eq(stored(program), 6)
+
+/** The allocations `name` makes. */
+private allocations(program: MirProgram, name: string) -> int
+    var n = 0
+    for block in function_of(program, name).blocks
+        for inst in block.insts
+            inst match
+                Alloc(_, _) -> n = n + 1
+                Call(_, Runtime(entry, _), _) -> if entry == "avin_rt_alloc" then n = n + 1
+                _ -> ()
+    n
+
+private returned_object(program: MirProgram, name: string) -> usize
+    for block in function_of(program, name).blocks
+        if block.term is Return(Some(ConstData(index, _))) then return index
+    panic(name + " returns no constant object")
+
+private const Pairs: string = "data Pt(x: int, y: int)\n\nfixed() -> Pt = Pt(1, 2)\n\nagain() -> Pt = Pt(1, 2)\n\nmoved(n: int) -> Pt = Pt(n, 2)\n\nnumbers() -> Vector[int] = [1, 2, 3]\n\nlisted(n: int) -> Vector[int] = [1, n]\n\nmain()\n    print(fixed())\n    print(again())\n    print(moved(3))\n    print(numbers())\n    print(listed(4))\n"
+
+@test("a data value of constants written in a function is made at compile time, and allocates nothing")
+constants_in_functions()
+    val program = lowered(Pairs)
+    assert_eq(allocations(program, "fixed"), 0)
+    assert_eq(reads(program, "fixed").returned, "object")
+
+@test("a vector literal in a function is made each time it runs, since a vector has an identity")
+vector_in_function()
+    assert_eq(reads(lowered(Pairs), "numbers").returned, "value")
+
+@test("two equal vector literals of module-level values are two objects")
+equal_vectors_apart()
+    val program = lowered("val a = [1, 2]\n\nval b = [1, 2]\n\nfirst() -> Vector[int] = a\n\nsecond() -> Vector[int] = b\n\nmain()\n    print(first() === second())\n")
+    assert_eq(stored(program), 0)
+    assert(returned_object(program, "first") != returned_object(program, "second"))
+
+@test("a value with an argument known only at run time is made at run time")
+run_time_arguments()
+    val program = lowered(Pairs)
+    assert_eq(allocations(program, "moved"), 1)
+    assert_eq(reads(program, "listed").returned, "value")
+
+@test("equal constants written in two places are one object")
+equal_constants_shared()
+    val program = lowered(Pairs)
+    assert_eq(returned_object(program, "fixed"), returned_object(program, "again"))
+
+@test("the shapes a derivation reads are made at compile time")
+derived_shapes()
+    val text = "data Level derives Ord\n    Low(n: int)\n    High(n: int, m: int)\n\nread() -> int = Low(1).compare(High(1, 2))" + Main
+    val program = lowered(text)
+    assert_eq(stored(program), 0)
+    assert(constants(program) > 0)

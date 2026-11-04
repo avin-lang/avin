@@ -168,9 +168,27 @@ begins with that kind — the runtime's tracer, and no finalizer or weak hooks �
 variant's tag, its size, the number of its references, its type record, and the offsets of its
 fields that hold references, so the kind an object
 was allocated with is its descriptor, one load away. Constant objects (string literals, variants
-with no fields, closures that capture nothing) live outside the heap as constant data with the same
-16 bytes ahead of them, their descriptor and a word left zero; the collector ignores any reference
-outside its heap, so it leaves them alone. `AVIN_GC_STRESS=1` makes every
+with no fields, closures that capture nothing, and the values made at compile time below) live
+outside the heap as constant data with the same 16 bytes ahead of them, their descriptor and a word
+left zero; the collector ignores any reference outside its heap, so it leaves them alone. Code names
+a constant object by the address of its payload written out, `getelementptr inbounds (i8, ptr
+@avin.data.3.const, i64 16)`, rather than by an alias: LLVM sees through the expression to the
+constant, so a load from it folds, and so does a load from a `select` or `phi` of two of them.
+
+**Values made at compile time.** A data value or a tuple built only of literals and other such
+values is not allocated: lowering lays it out as its descriptor lays out an object, fields at their
+offsets, and the emitter writes it as read-only data. Equal ones are one object, since a data value
+has no identity, so `FormatSpec()` passed to every field of a derived `display` is one constant. A
+module-level `val` whose initializer is built of such values, other such `val`s and vector literals
+of at most 32 of them is made the same way and has no storage: nothing initializes it before `main`,
+a read of it is the constant, and a read of a field of it the field's value. A vector literal is a
+`Vector1` over a constant `FrozenArray` leaf (a `Vector0` when empty), laid out as the library lays
+out the vectors it builds; since a vector has an identity, only a module-level value's literal,
+which runs once, is made this way, and two equal ones are two objects. The checker keeps a
+collection literal's elements beside the builder calls that make it (`Collection` in the typed
+tree), so lowering can choose. A derivation's shapes are such values, so what a template reads of
+them, a variant's index, a field's name, whether it has an annotation, is a constant in the
+compiled code. `AVIN_GC_STRESS=1` makes every
 allocation collect first, and the execution tests run that way, so a reference the compiler failed
 to root is found at the first allocation that could lose it.
 
@@ -281,8 +299,12 @@ three steps:
   are: whether everything it returns is an object it makes (or one an inlined call of its own
   makes), and, for each parameter, whether the function lets the object go anywhere but into its
   fields, its descriptor, a null test, its own return and the parameters of functions with the same
-  property. Inlining runs in rounds, each exposing the calls the next inlines, up to 8 rounds and
-  2000 added instructions per function. An inlined body's parameters are the call's arguments, its
+  property. A third summary marks the functions that return only parameters they are handed, a
+  visitor's methods returning the visitor: a call of one is not a source the object could not be
+  kept through, since once inlined its result is its argument. So the chains of a `match`'s arms,
+  `visitor.variant(V).field(…).finish(V)`, are inlined call by call to the end, though they meet in
+  one result and a short arm finishes first. Inlining runs in rounds, each exposing the calls the
+  next inlines, up to 8 rounds and 2000 added instructions per function. An inlined body's parameters are the call's arguments, its
   values, slots and blocks are numbered after the caller's, and each return stores the result to a
   slot of its own and jumps to a block that loads it and goes on with the rest of the caller's block.
 - **Replacement.** The references of a function are grouped: a value, the local slots it is stored

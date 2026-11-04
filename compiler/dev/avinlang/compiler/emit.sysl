@@ -56,6 +56,8 @@ emit_llvm(program: MirProgram) -> string
         val k = program.closures[i]
         out.push(s"@avin.fn.$i.const = private constant { ptr, i64 } { ptr @avin.desc.${k.descriptor}, i64 0 }, align 16\n")
         constant_payload(&out, s"@avin.fn.$i")
+    for i in 0..<program.constants.len()
+        emit_constant(&out, program, i)
     // A trap site is what the runtime reports when the program stops there: the reason and the file
     // as constant strings, then the line and column.
     for i in 0..<program.traps.len()
@@ -602,10 +604,65 @@ private const ArrayKindValue: string = "{ ptr, ptr, ptr, ptr } { ptr @avin_rt_tr
  * left zero, which the collector never reads for an object it does not own. */
 private const KindBack: usize = 16
 
+// An object made at compile time is laid out as one the collector made, but in read-only data: its
+// header, then each field at its offset in the width a store would write it, the bytes between them
+// zero.
+private emit_constant(out: *StrBuilder, program: MirProgram, i: usize)
+    val k = program.constants[i]
+    var types = str_builder()
+    var values = str_builder()
+    types.push("ptr, i64")
+    values.push(s"ptr @avin.desc.${k.descriptor}, i64 0")
+    var at = 0usize
+    for f in k.fields
+        if f.offset > at then pad_bytes(&types, &values, f.offset - at)
+        val cell = constant_cell(f)
+        types.push(", " + cell.ty)
+        values.push(", " + cell.ty + " " + cell.text)
+        at = f.offset + cell.width
+    val end = (if k.size > at then k.size else at) + 7
+    val whole = end - end % 8
+    if whole > at then pad_bytes(&types, &values, whole - at)
+    out.push(s"@avin.data.$i.const = private constant <{ ${types.finish()} }> <{ ${values.finish()} }>, align 16\n")
+    constant_payload(out, s"@avin.data.$i")
+
+private pad_bytes(types: *StrBuilder, values: *StrBuilder, n: usize)
+    types.push(s", [$n x i8]")
+    values.push(s", [$n x i8] zeroinitializer")
+
+/** A field of a constant object as LLVM writes it: its type, its width in bytes, and its value. */
+private struct Cell
+    ty: string
+    width: usize
+    text: string
+
+private constant_cell(f: ConstantField) -> Cell
+    val text = f.value match
+        ConstInt(_, digits) -> digits
+        ConstBool(value) -> if value then "1" else "0"
+        ConstReal(value) -> real_constant(value)
+        ConstStr(index) -> payload_address(s"@avin.str.$index")
+        ConstObject(descriptor) -> payload_address(s"@avin.obj.$descriptor")
+        ConstData(index, _) -> payload_address(s"@avin.data.$index")
+        ConstClosure(index) -> payload_address(s"@avin.fn.$index")
+        _ -> "null"
+    f.ty match
+        MInt(_) ->
+            val w = storage_bits(f.ty)
+            Cell(s"i$w", usize(w / 8), text)
+        MBool -> Cell("i8", 1, text)
+        MReal -> Cell("double", 8, text)
+        _ -> Cell("ptr", 8, text)
+
 // Names the payload of the constant object `name.const`, which follows its two header words, as
 // `name`: every reference to the object is to its payload.
 private constant_payload(out: *StrBuilder, name: string)
     out.push(s"$name = private alias i8, ptr getelementptr inbounds (i8, ptr $name.const, i64 $KindBack)\n")
+
+// The address of the payload of the constant object `name.const`, written out rather than by its
+// alias: LLVM sees through the expression to the constant, so it knows the object can be read on
+// either side of a choice between two of them, and folds what is read.
+private payload_address(name: string) -> string = s"getelementptr inbounds (i8, ptr $name.const, i64 $KindBack)"
 
 /** The byte offset from a descriptor to the method in slot `slot` of the table before its `call`. */
 private method_slot_offset(slot: usize) -> string = "-" + ((slot + 2) * 8).to_string()
@@ -832,6 +889,7 @@ private operand_type(program: MirProgram, f: MirFunction, a: Operand) -> MirType
     SlotAddress(_) -> MPtr
     ConstStr(_) -> MRef
     ConstObject(_) -> MRef
+    ConstData(_, _) -> MRef
     ConstClosure(_) -> MRef
     FunctionAddress(_) -> MPtr
     GlobalAddress(_) -> MPtr
@@ -847,9 +905,10 @@ private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a m
     ConstBool(value) -> if value then "true" else "false"
     ConstReal(value) -> real_constant(value)
     SlotAddress(slot) -> s"%s$slot"
-    ConstObject(descriptor) -> s"@avin.obj.$descriptor"
-    ConstStr(index) -> s"@avin.str.$index"
-    ConstClosure(index) -> s"@avin.fn.$index"
+    ConstObject(descriptor) -> payload_address(s"@avin.obj.$descriptor")
+    ConstData(index, _) -> payload_address(s"@avin.data.$index")
+    ConstStr(index) -> payload_address(s"@avin.str.$index")
+    ConstClosure(index) -> payload_address(s"@avin.fn.$index")
     FunctionAddress(function) -> "@\"" + program.functions[function].symbol + "\""
     GlobalAddress(index) -> global_address(program, index)
     RecordAddress(index) -> s"@avin.type.$index"
@@ -886,6 +945,7 @@ private is_shared(f: MirFunction, address: Operand) -> bool = address match
     GlobalAddress(_) -> true
     ConstStr(_) -> true
     ConstObject(_) -> true
+    ConstData(_, _) -> true
     _ -> false
 
 // The width in bits an integer or bool is stored at: a whole power-of-two number of bytes up to a

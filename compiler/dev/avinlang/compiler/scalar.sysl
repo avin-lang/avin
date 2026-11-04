@@ -63,13 +63,19 @@ private const BadUse: u32 = 128
 private const Returned: u32 = 256
 /** The descriptor of an object of the group is read. */
 private const Described: u32 = 512
+/** A call's result belongs to the group, and the call is of a small function that returns only what
+ * it is handed: once inlined, the result is the argument. A chain of such calls, a visitor's methods
+ * each returning the visitor, is inlined call by call, and where the chains of several branches meet
+ * in one result, the branch finished first does not stop the others. */
+private const Passing: u32 = 1024
 
 /** What the whole program shows of each function: whether it may be inlined, whether what it
- * returns is always an object it made, and for each parameter whether the function keeps it only
- * where inlining can follow it. */
+ * returns is always an object it made, whether it returns only parameters it is handed, and for each
+ * parameter whether the function keeps it only where inlining can follow it. */
 private struct Summary
     inlinable: Buf[bool]
     fresh: Buf[bool]
+    passes: Buf[bool]
     param_ok: Buf[Buf[bool]]
 
 /** A load or store of a field of an object of a group, at a byte offset, of a machine type. */
@@ -142,9 +148,11 @@ private cyclic_functions(functions: Buf[MirFunction]) -> Buf[bool]
 private summarize(functions: Buf[MirFunction], inlinable: Buf[bool]) -> Summary
     val n = functions.len()
     var fresh: Buf[bool] = buf()
+    var passes: Buf[bool] = buf()
     var param_ok: Buf[Buf[bool]] = buf()
     for f in functions
         fresh.push(false)
+        passes.push(false)
         var row: Buf[bool] = buf()
         for _ in f.signature.params do row.push(false)
         param_ok.push(row)
@@ -154,9 +162,12 @@ private summarize(functions: Buf[MirFunction], inlinable: Buf[bool]) -> Summary
         for i in 0..<n
             if !inlinable[i] then continue
             val f = functions[i]
-            val a = analyze(f, Summary(inlinable, fresh, param_ok))
+            val a = analyze(f, Summary(inlinable, fresh, passes, param_ok))
             if !fresh[i] && returns_fresh(f, a)
                 fresh[i] = true
+                changed = true
+            if !passes[i] && returns_params(f, a)
+                passes[i] = true
                 changed = true
             var row: Buf[bool] = buf()
             var grew = false
@@ -170,7 +181,7 @@ private summarize(functions: Buf[MirFunction], inlinable: Buf[bool]) -> Summary
             if grew
                 param_ok[i] = row
                 changed = true
-    Summary(inlinable, fresh, param_ok)
+    Summary(inlinable, fresh, passes, param_ok)
 
 /** Whether every value `f` returns is an object it makes, or one a call it would inline makes. */
 private returns_fresh(f: MirFunction, a: Analysis) -> bool
@@ -184,7 +195,25 @@ private returns_fresh(f: MirFunction, a: Analysis) -> bool
                     None -> return false
                 val flags = a.flags[g]
                 if (flags & (Allocated | FromCall)) == 0u32 then return false
-                if (flags & (Foreign | FromParam | BadSource | Escapes | BadUse)) != 0u32 then return false
+                if (flags & (Foreign | FromParam | BadSource | Passing | Escapes | BadUse)) != 0u32 then return false
+                any = true
+            Return(Some(_)) -> return false
+            _ -> ()
+    any
+
+/** Whether every value `f` returns is one of its parameters, which no call it makes could replace. */
+private returns_params(f: MirFunction, a: Analysis) -> bool
+    if !(f.signature.result is Some(MRef)) then return false
+    var any = false
+    for block in f.blocks
+        block.term match
+            Return(Some(Value(v))) ->
+                val g = a.value_group[v] match
+                    Some(g) -> g
+                    None -> return false
+                val flags = a.flags[g]
+                if (flags & FromParam) == 0u32 then return false
+                if (flags & (Foreign | Allocated | FromCall | Escapes | BadUse)) != 0u32 then return false
                 any = true
             Return(Some(_)) -> return false
             _ -> ()
@@ -233,6 +262,7 @@ private operand_type_of(f: MirFunction, o: Operand) -> MirType = o match
     ConstReal(_) -> MReal
     ConstStr(_) -> MRef
     ConstObject(_) -> MRef
+    ConstData(_, _) -> MRef
     ConstClosure(_) -> MRef
     _ -> MPtr
 
@@ -307,7 +337,8 @@ private analyze(f: MirFunction, s: Summary) -> Analysis
                 Alloc(_, _) -> mark(&flags, Some(g), Allocated)
                 Call(_, Direct(callee), _) ->
                     mark(&flags, Some(g), FromCall)
-                    if !(s.inlinable[callee] && s.fresh[callee]) then mark(&flags, Some(g), BadSource)
+                    if s.inlinable[callee] && s.passes[callee] then mark(&flags, Some(g), Passing)
+                    elif !(s.inlinable[callee] && s.fresh[callee]) then mark(&flags, Some(g), BadSource)
                 Load(_, SlotAddress(x)) ->
                     if slot_group[x] is None then mark(&flags, Some(g), Foreign)
                 Select(_, _, yes, no) ->
@@ -419,7 +450,9 @@ private worthy(a: Analysis, group: Option[usize]) -> bool
         Some(g) -> g
         None -> return false
     val flags = a.flags[g]
-    (flags & (Allocated | FromCall)) != 0u32 && (flags & (Foreign | FromParam | BadSource | Escapes | BadUse | Returned)) == 0u32
+    // A group whose only sources are calls handing back what they were given has nothing to keep.
+    val made = (flags & Allocated) != 0u32 || ((flags & FromCall) != 0u32 && (flags & Passing) == 0u32)
+    made && (flags & (Foreign | FromParam | BadSource | Escapes | BadUse | Returned)) == 0u32
 
 /** How the code of an inlined function is placed in its caller: its values, slots and blocks are
  * numbered after the caller's, and its parameters are the call's arguments. A value with a

@@ -6885,7 +6885,19 @@ private sequence_literal(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Opt
             args.push(Argument(item.span, None, item, false))
             steps.push(call_method(c, item.span, item.span, receiver, "add", adds, args, None, None, false))
     steps.push(result)
-    TExpr(at, zonk(c, result.ty), Block(steps))
+    val built = TExpr(at, zonk(c, result.ty), Block(steps))
+    // Each step between making the builder and taking its result adds one element, its last
+    // argument.
+    var elements: Buf[&TExpr] = buf()
+    for i in 1..<steps.len() - 1
+        val args = steps[i].kind match
+            Call(_, a, _) -> a
+            Dispatch(_, _, a, _) -> a
+            BoundCall(_, _, a, _) -> a
+            _ -> return built
+        if args.len() == 0 then return built
+        elements.push(args[args.len() - 1])
+    TExpr(at, built.ty, Collection(elements, built))
 
 // A tuple's parts take their expected types from an expected tuple of the same size. A part that
 // never finishes means the tuple is never made.
@@ -10810,6 +10822,7 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
             val ok = scan_init(c, s, callee, unsafe)
             scan_init_all(c, s, args, unsafe) && ok
         Construct(_, args) -> scan_init_all(c, s, args, unsafe)
+        Collection(_, built) -> scan_init(c, s, built, unsafe)
         Block(items) ->
             if method_value_of_self(c, s, items) is Some(name) then return init_violation(c, s, e.span, s"`$name` is used as a value", s"`$name` cannot be used as a value")
             scan_init_all(c, s, items, unsafe)
@@ -11109,7 +11122,9 @@ private fields_meet_hook(c: *Checker, x: usize, variants: Buf[ShapeVariant], hoo
     ok
 
 // `T.walk(value, visitor)`: the visitor's `variant` with the value's variant, then its `field` once
-// per field of that variant, in order, each call on what the one before returned.
+// per field of that variant, in order, then its `finish` with the variant, each call on what the one
+// before returned. Each variant's arm passes its own shape as written, so code reading it is compiled
+// for that variant.
 private walk_code(c: *Checker, x: usize, at: Span, target: &Type, variants: Buf[ShapeVariant], value: &Expr, visitor: &Expr, visitor_type: &Type) -> Option[&Expr]
     val hook = shape_hook(c, x, zonk(c, visitor_type), "field", "visitor", "field[F: Bound](f: FieldShape, value: F)")?
     if !fields_meet_hook(c, x, variants, hook) then return None
@@ -11124,6 +11139,7 @@ private walk_code(c: *Checker, x: usize, at: Span, target: &Type, variants: Buf[
         var chain = method_call(at, local(at, "__shape_visitor"), "variant", one(shape_name_expr(at, site.type_name, Some(i), None)), None)
         for j in 0..<v.fields.len()
             chain = method_call(at, chain, "field", two(shape_name_expr(at, site.type_name, Some(i), Some(j)), field_value(at, site.data, subject, "__shape_f", v.fields[j], j)), None)
+        chain = method_call(at, chain, "finish", one(shape_name_expr(at, site.type_name, Some(i), None)), None)
         if !site.data
             items.push(chain)
             return Some(block_of(at, items))
@@ -11132,7 +11148,9 @@ private walk_code(c: *Checker, x: usize, at: Span, target: &Type, variants: Buf[
     Some(block_of(at, items))
 
 // `T.walkPair(a, b, visitor)`: the visitor's `variants` with both values' variants, then, where they
-// are the same variant, its `field` once per field with both values' fields.
+// are the same variant, its `field` once per field with both values' fields. Where they are, that
+// variant's shape is passed as written, so code reading it is compiled for that variant; only values
+// of different variants look theirs up.
 private walk_pair_code(c: *Checker, x: usize, at: Span, target: &Type, variants: Buf[ShapeVariant], a: &Expr, b: &Expr, visitor: &Expr, visitor_type: &Type) -> Option[&Expr]
     val hook = shape_hook(c, x, zonk(c, visitor_type), "field", "visitor", "field[F: Bound](f: FieldShape, a: F, b: F)")?
     if !fields_meet_hook(c, x, variants, hook) then return None
@@ -11143,13 +11161,11 @@ private walk_pair_code(c: *Checker, x: usize, at: Span, target: &Type, variants:
     items.push(bind(at, "__shape_a", a))
     items.push(bind(at, "__shape_b", b))
     items.push(bind(at, "__shape_visitor", visitor))
-    val variant_a = variant_of_code(at, site.data, site.type_name, variants, first)
-    val variant_b = variant_of_code(at, site.data, site.type_name, variants, second)
-    items.push(bind(at, "__shape_start", method_call(at, local(at, "__shape_visitor"), "variants", two(variant_a, variant_b), None)))
     var arms: Buf[Arm] = buf()
     for i in 0..<variants.len()
         val v = variants[i]
-        var chain = local(at, "__shape_start")
+        val shape = shape_name_expr(at, site.type_name, Some(i), None)
+        var chain = method_call(at, local(at, "__shape_visitor"), "variants", two(shape, shape_name_expr(at, site.type_name, Some(i), None)), None)
         for j in 0..<v.fields.len()
             val mine = field_value(at, site.data, first, "__shape_a", v.fields[j], j)
             val theirs = field_value(at, site.data, second, "__shape_b", v.fields[j], j)
@@ -11161,7 +11177,10 @@ private walk_pair_code(c: *Checker, x: usize, at: Span, target: &Type, variants:
         pair.push(shape_pattern(at, v, "__shape_a"))
         pair.push(shape_pattern(at, v, "__shape_b"))
         arms.push(Arm(Pattern(at, Tuple(pair)), None, chain))
-    if variants.len() > 1 then arms.push(Arm(Pattern(at, Wildcard), None, local(at, "__shape_start")))
+    if variants.len() > 1
+        val variant_a = variant_of_code(at, site.data, site.type_name, variants, first)
+        val variant_b = variant_of_code(at, site.data, site.type_name, variants, second)
+        arms.push(Arm(Pattern(at, Wildcard), None, method_call(at, local(at, "__shape_visitor"), "variants", two(variant_a, variant_b), None)))
     items.push(Expr(at, Match(Expr(at, Tuple(two(first, second))), arms)))
     Some(block_of(at, items))
 

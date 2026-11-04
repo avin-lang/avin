@@ -172,6 +172,17 @@ private struct Lowering
     /** For each instance that adapts a method of an option kept as a pointer to its object's method
      * table, by the instance's index, where it converts. */
     adapters: Map[usize, TableAdapter]
+    /** The objects made at compile time, and for each module-level value whether it is one: 0 not
+     * yet looked at, 1 being looked at, 2 decided, with `constant_values` holding the object, or
+     * `None` for a value made before `main` runs. */
+    constants: Buf[ConstantObject]
+    /** Each constant object's index, by its descriptor and fields, so equal ones are made once. */
+    constant_index: Map[string, usize]
+    constant_state: Buf[u8]
+    constant_values: Buf[Option[Operand]]
+    /** Whether a module-level value's initializer is being made at compile time, where a vector
+     * literal may be too: it runs once, so its one object is the object it would have made. */
+    in_global: bool
 
 /** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
  * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
@@ -224,11 +235,17 @@ lower_program(program: TProgram) -> MirProgram
         if k.table.len() > generic_base then generic_base = k.table.len()
     for d in program.data
         if d.table.len() > generic_base then generic_base = d.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map())
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false)
     // Record 0 is for the objects no type pattern names: closures, and the boxes of captured
     // variables.
     l.records.push(TypeRecord("a closure or a captured variable", buf(), None, None))
     l.record_types.push(Unit)
+    // A module-level value made at compile time has no storage: every read of it is the constant.
+    for _ in program.globals
+        l.constant_state.push(0)
+        l.constant_values.push(None)
+    for g in 0..<program.globals.len()
+        if global_constant(&l, g) is Some(_) then l.global_types.set(g, None)
     // The core library's functions are compiled only as the program reaches them, so a program
     // carries none of the library it does not use, and builds no shim for a binding it never calls.
     // A data type's implementation of a trait is compiled as it is called, directly or through a
@@ -273,7 +290,7 @@ lower_program(program: TProgram) -> MirProgram
     add_variant_ancestors(&l)
     functions = devirtualize(functions, l.descriptors, dispatch_sites(&l))
     functions = scalar_replace(functions, l.descriptors)
-    MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.traps, global_types, entry, init, l.bound, tests, program.testing, entry_arguments)
+    MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, tests, program.testing, entry_arguments)
 
 /** Whether a function belongs to the core library's module, `avin`, or one under it. */
 private in_core_library(program: TProgram, id: usize) -> bool
@@ -630,6 +647,8 @@ private field_address(l: *Lowering, object: Operand, field: FieldSlot) -> Operan
 // The fields are evaluated in order before the object is allocated, so a collection while
 // allocating sees every one of them as a root.
 private construct(l: *Lowering, e: &TExpr, variant: usize, args: Buf[&TExpr]) -> Option[Operand]
+    // A value built only of constants is made at compile time, once, however often this runs.
+    if constant_construct(l, e, variant, args) is Some(k) then return k.value
     var values: Buf[Option[Operand]] = buf()
     for a in args
         val v = lower_expr(l, a)
@@ -646,6 +665,152 @@ private construct(l: *Lowering, e: &TExpr, variant: usize, args: Buf[&TExpr]) ->
             if values[i] is Some(v) then l.insts.push(Store(field_address(l, Value(object), field), v))
     l.insts.push(Publish)
     Some(Value(object))
+
+// Values made at compile time. A data value or a tuple built only of literals and other such values
+// is an object written as read-only data, made once however often the expression runs, and equal
+// ones are one object: nothing in it can change, and a data value has no identity to tell two equal
+// ones apart. A module-level `val` whose initializer is built of such values, other such `val`s and
+// vector literals of at most 32 of them is made at compile time too, and not before `main`; one of a
+// built-in type is the value itself. A vector is an object with an identity, so it is made at compile
+// time only there, where its literal runs once, and never shared with another. A read of such a
+// value is its address, and a read of one of its fields is the field's value, so code that reads a
+// table of constants compiles to the constants. Anything else, a call or a class's constructor among
+// them, leaves the value to be made at run time.
+
+/** What a module-level value's initializer is at compile time: its value, `None` for one with no
+ * runtime value. */
+private struct Constant
+    value: Option[Operand]
+
+/** The value module-level value `g` is at compile time, or `None` where it is made at run time,
+ * decided when first asked. */
+private global_constant(l: *Lowering, g: usize) -> Option[Operand]
+    if l.constant_state[g] == 2 then return l.constant_values[g]
+    // A value its own initializer reaches is the checker's to report; it is made at run time.
+    if l.constant_state[g] == 1 then return None
+    l.constant_state.set(g, 1)
+    val global = l.program.globals[g]
+    var made: Option[Operand] = None
+    if !global.mutable && !global.lazy && global.object is None
+        if l.program.functions[global.init].body is Some(body)
+            val outer = l.in_global
+            l.in_global = true
+            if constant_of(l, body) is Some(k) then made = k.value
+            l.in_global = outer
+    l.constant_state.set(g, 2)
+    l.constant_values.set(g, made)
+    made
+
+private constant_of(l: *Lowering, e: &TExpr) -> Option[Constant] = e.kind match
+    IntConst(digits) ->
+        val bits = int_bits(e.ty)
+        if bits > 64 then None else Some(Constant(Some(ConstInt(bits, digits))))
+    BoolConst(value) -> Some(Constant(Some(ConstBool(value))))
+    CharConst(code) -> Some(Constant(Some(ConstInt(32, code.to_string()))))
+    RealConst(value) -> Some(Constant(Some(ConstReal(value))))
+    StrConst(value) -> Some(Constant(Some(string_constant(l, value))))
+    UnitConst -> Some(Constant(None))
+    Global(g) -> global_constant(l, g) match
+        Some(k) -> Some(Constant(Some(k)))
+        None -> None
+    Block(items) -> if items.len() == 1 then constant_of(l, items[0]) else None
+    Construct(variant, args) -> constant_construct(l, e, variant, args)
+    Collection(elements, _) -> if l.in_global then constant_vector(l, e, elements) else None
+    _ -> None
+
+/** The values of `items` at compile time, `None` where one of them is not known then. */
+private constants_of(l: *Lowering, items: Buf[&TExpr]) -> Option[Buf[Option[Operand]]]
+    var values: Buf[Option[Operand]] = buf()
+    for x in items
+        values.push(constant_of(l, x)?.value)
+    Some(values)
+
+// A data value or a tuple, laid out as `construct` lays it out.
+private constant_construct(l: *Lowering, e: &TExpr, variant: usize, args: Buf[&TExpr]) -> Option[Constant]
+    val values = constants_of(l, args)?
+    if pointer_option(l, e.ty)
+        if variant != some_variant(l) then return Some(Constant(Some(NullAddress)))
+        return if values[0] is Some(v) then Some(Constant(Some(v))) else None
+    val shape = layout(l, concrete(l, e.ty)).variants[variant]
+    if l.descriptors[shape.descriptor].constant then return Some(Constant(Some(ConstObject(shape.descriptor))))
+    var fields: Buf[ConstantField] = buf()
+    for i in 0..<values.len()
+        if shape.fields[i] is Some(slot)
+            val v = values[i] match
+                Some(v) -> v
+                None -> return None
+            fields.push(ConstantField(slot.offset, slot.ty, v))
+    Some(Constant(Some(constant_object(l, shape.descriptor, l.descriptors[shape.descriptor].size, fields, true))))
+
+// A vector literal, laid out as the library lays out the vectors it builds: no elements is a
+// `Vector0`, and 1 to 32 a `Vector1` holding them in its one leaf, a frozen array.
+private constant_vector(l: *Lowering, e: &TExpr, elements: Buf[&TExpr]) -> Option[Constant]
+    val t = concrete(l, e.ty)
+    val args = *t match
+        Class(k, _, a) -> if core_class(l, "Vector") is Some(v) && v == k then a else return None
+        _ -> return None
+    if elements.len() > 32 then return None
+    val values = constants_of(l, elements)?
+    if elements.len() == 0
+        val empty = layout(l, Class(core_class(l, "Vector0")?, "Vector0", args)).variants[0]
+        return Some(Constant(Some(constant_object(l, empty.descriptor, l.descriptors[empty.descriptor].size, buf(), false))))
+    val element = mir_type(args[0])?
+    val size = element_size(Some(element))
+    var cells: Buf[ConstantField] = buf()
+    cells.push(ConstantField(0, MInt(64), ConstInt(64, elements.len().to_string())))
+    for i in 0..<values.len()
+        val v = values[i] match
+            Some(v) -> v
+            None -> return None
+        cells.push(ConstantField(ArrayHeader + i * size, element, v))
+    val array = layout(l, Class(core_class(l, "Array")?, "Array", args)).variants[0].descriptor
+    val leaf = constant_object(l, array, ArrayHeader + elements.len() * size, cells, false)
+    val one = layout(l, Class(core_class(l, "Vector1")?, "Vector1", args)).variants[0]
+    if one.fields.len() != 1 then return None
+    val slot = one.fields[0]?
+    var fields: Buf[ConstantField] = buf()
+    fields.push(ConstantField(slot.offset, slot.ty, leaf))
+    Some(Constant(Some(constant_object(l, one.descriptor, l.descriptors[one.descriptor].size, fields, false))))
+
+/** The core library's class `name`. */
+private core_class(l: *Lowering, name: string) -> Option[usize]
+    for k in 0..<l.program.classes.len()
+        val c = l.program.classes[k]
+        if c.module_name == "avin" && c.name == name then return Some(k)
+    None
+
+/** A new constant object; with `shared`, the one already made with the same descriptor and fields,
+ * if there is one. */
+private constant_object(l: *Lowering, descriptor: usize, size: usize, fields: Buf[ConstantField], shared: bool) -> Operand
+    var key = s"$descriptor:$size"
+    for f in fields
+        key = key + s";${f.offset}=" + constant_key(f.value)
+    // A real's text need not tell two reals apart, so an object holding one is never shared.
+    if shared && !key.contains("?")
+        if l.constant_index.get(key) is Some(index) then return ConstData(index, descriptor)
+        l.constant_index.put(key, l.constants.len())
+    l.constants.push(ConstantObject(descriptor, size, fields))
+    ConstData(l.constants.len() - 1, descriptor)
+
+/** A constant operand as text that tells it from every other. */
+private constant_key(o: Operand) -> string = o match
+    ConstInt(bits, digits) -> s"i$bits:$digits"
+    ConstBool(value) -> if value then "t" else "f"
+    ConstStr(index) -> s"s$index"
+    ConstObject(descriptor) -> s"o$descriptor"
+    ConstData(index, _) -> s"d$index"
+    ConstClosure(index) -> s"c$index"
+    NullAddress -> "n"
+    _ -> "?"
+
+/** A field of an object made at compile time is its value; `None` for any other object. */
+private constant_field(l: *Lowering, object: Operand, field: FieldSlot) -> Option[Operand]
+    val index = object match
+        ConstData(k, _) -> k
+        _ -> return None
+    for f in l.constants[index].fields
+        if f.offset == field.offset then return Some(f.value)
+    None
 
 // The parts of a tuple-typed expression, in order. A tuple written out is never made: its parts are
 // evaluated directly. None when the expression never finishes.
@@ -1993,24 +2158,31 @@ private lower_kind(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
     Dispatch(function, slot, args, type_args) -> dispatch(l, function, slot, args, type_args)
     BoundCall(function, slot, args, type_args) -> bound_call(l, e, function, slot, args, type_args)
     Construct(variant, args) -> construct(l, e, variant, args)
+    Collection(_, built) -> lower_expr(l, built)
     FunctionValue(function, type_args) -> Some(function_value(l, function, type_args))
     CallValue(callee, args) -> call_value(l, callee, args)
     Field(value, index) ->
         val object = lower_expr(l, value)?
         layout(l, concrete(l, value.ty)).variants[0].fields[index] match
-            Some(field) -> Some(load_field(l, object, field))
+            Some(field) -> constant_field(l, object, field) match
+                Some(known) -> Some(known)
+                None -> Some(load_field(l, object, field))
             None -> None
     New ->
         val object = fresh(l, MRef)
         l.insts.push(Alloc(object, layout(l, concrete(l, e.ty)).variants[0].descriptor))
         Some(Value(object))
-    Global(index) -> load(l, global_place(l, index))
+    Global(index) -> l.constant_values[index] match
+        Some(object) -> Some(object)
+        None -> load(l, global_place(l, index))
     LazyGlobal(index, initialize, name) -> lazy_read(l, e.span, name, LazyPlace(None, index, None, None), initialize)
     LazyField(value, index, initialize, name) ->
         val object = lower_expr(l, value)?
         val fields = layout(l, concrete(l, value.ty)).variants[0].fields
         lazy_read(l, e.span, name, LazyPlace(Some(object), 0, fields[index + 1], fields[index]), initialize)
     StoreGlobal(index, value, yields) ->
+        // A value made at compile time is never initialized: its initializer has no effects.
+        if l.constant_values[index] is Some(object) then return if yields then Some(object) else None
         val v = lower_expr(l, value)
         if v is None && machine(l, value.ty) is Some(_) then return None
         store(l, global_place(l, index), v)
@@ -2748,6 +2920,7 @@ private operand_type(l: *Lowering, o: Operand) -> MirType = o match
     ConstReal(_) -> MReal
     ConstStr(_) -> MRef
     ConstObject(_) -> MRef
+    ConstData(_, _) -> MRef
     ConstClosure(_) -> MRef
     _ -> MPtr
 
