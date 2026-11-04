@@ -250,13 +250,17 @@ struct BodyState
     functions: Buf[usize]
     /** For each of `functions`, where its block's local functions start in `functions`. */
     function_starts: Buf[usize]
+    /** For each of `functions`, how many locals were in scope where its block began: a local of the
+     * function's name at or past that position is declared inside the block and hides the function,
+     * and one before it is outside the block and is hidden by it. */
+    function_marks: Buf[usize]
     uses: Buf[CaptureUse]
     calls: Buf[LocalCall]
     early: Buf[EarlyCall]
     /** The locals bound by `is` tests, which are in scope only where their test is known to hold. */
     tested: Buf[usize]
 
-fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf())
+fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf())
 
 /** A class body checked part way: its initializer's body so far, the code checked so far, the next
  * member to check and the next field it declares. */
@@ -5829,6 +5833,7 @@ private declare_local_functions(c: *Checker, items: Buf[&Expr])
             c.locals.push(buf())
             c.body.functions.push(id)
             c.body.function_starts.push(start)
+            c.body.function_marks.push(c.body.visible.len())
             declare_defaults(c, id)
             set.push(id)
             if set.len() > 1 then mark_overloads(c, set)
@@ -6188,13 +6193,27 @@ lookup_local(c: *Checker, name: string) -> Option[usize]
     while i > 0
         i -= 1
         val index = c.body.visible[i]
-        if c.body.locals[index].name == name then return Some(index)
+        if c.body.locals[index].name == name
+            if function_hides(c, name, i) then return None
+            return Some(index)
     None
+
+/** Whether the innermost local function of `name` is declared in a block nested inside the scope of
+ * the local at position `at` of `visible`, and so hides it: the innermost declaration of a name
+ * wins, whichever kind each is. A parameter of the top-level function encloses every block, so any
+ * local function of its name hides it (see `param_index`). */
+private function_hides(c: *Checker, name: string, at: usize) -> bool
+    var i = c.body.functions.len()
+    while i > 0
+        i -= 1
+        if c.symbols[c.body.functions[i]].name == name then return c.body.function_marks[i] > at
+    false
 
 // Parameters of the top-level function; a local function's own parameters are locals. A
 // constructor's parameters are only stored into their fields, so a class's parameter is named
 // through its field, which a `var` field's assignments change.
 param_index(c: *Checker, name: string) -> Option[usize]
+    if local_function(c, name) is Some(_) then return None
     val symbol = c.symbols[c.body.root]
     if symbol.constructor
         // A superclass's arguments read the parameters themselves; an initializer's object is not
@@ -6656,6 +6675,7 @@ private block_expr(c: *Checker, e: &Expr, items: Buf[&Expr], discard: bool, expe
     c.body.visible.truncate(mark)
     c.body.functions.truncate(function_mark)
     c.body.function_starts.truncate(function_mark)
+    c.body.function_marks.truncate(function_mark)
     c.body.block_start = outer_start
     var ty: &Type = Unit
     if !finishes then ty = Nothing
