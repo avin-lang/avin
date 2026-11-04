@@ -122,7 +122,8 @@ Their methods:
 | `get() -> T`, trapping on `None` | |
 | `filterNot(p: (T) -> bool) -> Option[T]` | |
 
-An `Option[Option[T]]` also has `flatten()`, and an `Option` has `nonEmpty()` beside `isDefined()` and
+An `Option` also has `iterator()` (one element or none) and `knownSize()` (1 or 0), an
+`Option[(A, B)]` has `unzip()` giving the two options, an `Option[Option[T]]` also has `flatten()`, and an `Option` has `nonEmpty()` beside `isDefined()` and
 `isEmpty()`. There is no `orNull`, since Avin has no null.
 
 `exists` is false and `forall` true for `None` and for `Err`, which hold no value. `toList` and
