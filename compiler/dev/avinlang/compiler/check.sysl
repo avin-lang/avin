@@ -62,6 +62,11 @@ struct FunctionSymbol
      * `self`, with the impl's type parameters as its arguments. Such a method is called directly:
      * the type has no subclasses. A class's methods, its impls' included, have `owner_class`. */
     receiver: Option[&Type]
+    /** Whether this is a static member, or computes a default of one: a member of the type rather
+     * than of a value. Its first parameter stands for the receiver, as a method's does, so it lines
+     * up with the trait's member it implements, and it is given no value: a call names a type, and
+     * nothing is passed for it. */
+    static_member: bool
 
 /** A class. Its fields are its parameters, in order, then the fields its body declares; their types
  * name the class's own type parameters as `TypeVar(class_owner(id), i)`. */
@@ -903,7 +908,7 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
             FieldMember(f) -> c.note(unit, f.span, s"an impl adds methods, not state, so it cannot declare the field `${f.name}`")
             AbstractFieldMember(f) -> c.note(unit, f.span, s"an impl adds methods, not state, so it cannot declare the field `${f.name}`")
             StatementMember(s) -> c.note(unit, s.span, "an impl's body declares only methods")
-            MethodMember(_, _, _) -> ()
+            MethodMember(_, _, _, _) -> ()
     val path = d.target.kind match
         Named(p, _) -> p
         _ ->
@@ -1021,13 +1026,16 @@ private resolve_trait_impl(c: *Checker, unit: usize, module_name: string, d: &Im
 // for the receiver's static type.
 private declare_trait_methods(c: *Checker, i: usize)
     for m in c.trait_impls[i].decl.members
-        if m is MethodMember(f, public, overrides) then declare_trait_method(c, i, f, public, overrides)
+        if m is MethodMember(f, public, overrides, static_member) then declare_trait_method(c, i, f, public, overrides, static_member)
 
-private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, overrides: bool)
+private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, overrides: bool, static_member: bool)
     val block = c.trait_impls[i]
     val unit = block.unit
     val k = block.trait_id
     val trait_name = c.classes[k].name
+    if static_member
+        c.note(unit, f.name_span, s"`${f.name}` is static, which only a trait's member and its implementations are; an impl adding to `$trait_name` adds methods of values")
+        return
     if f.annotations.len() > 0
         c.note(unit, f.name_span, "annotations on methods are not implemented")
         return
@@ -1226,13 +1234,57 @@ private trait_declares(c: *Checker, t: usize, name: string, depth: usize) -> boo
     if depth > c.classes.len() then return false
     for m in c.classes[t].decl.members
         m match
-            MethodMember(f, _, _) -> if f.name == name then return true
+            MethodMember(f, _, _, _) -> if f.name == name then return true
             AbstractFieldMember(f) -> if f.name == name then return true
             _ -> ()
     for required in c.classes[t].traits
         if *required is Class(r, _, _)
             if trait_declares(c, r, name, depth + 1) then return true
     false
+
+/** Whether the member `name` of trait `t`, or of a trait it requires, is static; `None` where neither
+ * declares one of that name. */
+private trait_member_static(c: *Checker, t: usize, name: string, depth: usize) -> Option[bool]
+    if depth > c.classes.len() then return None
+    for m in c.classes[t].decl.members
+        m match
+            MethodMember(f, _, _, static_member) -> if f.name == name then return Some(static_member)
+            AbstractFieldMember(f) -> if f.name == name then return Some(false)
+            _ -> ()
+    for required in c.classes[t].traits
+        if *required is Class(r, _, _)
+            if trait_member_static(c, r, name, depth + 1) is Some(s) then return Some(s)
+    None
+
+// An implementation of trait `t`'s member is static exactly where the member is.
+private static_mirrors_trait(c: *Checker, unit: usize, f: &Function, t: usize, static_member: bool) -> bool
+    val declared = trait_member_static(c, t, f.name, 0) match
+        Some(s) -> s
+        None -> return true
+    if declared == static_member then return true
+    report_static_mismatch(c, unit, f.name_span, f.name, c.classes[t].name, declared)
+    false
+
+private report_static_mismatch(c: *Checker, unit: usize, at: Span, name: string, trait_name: string, declared: bool)
+    if declared then c.note(unit, at, s"`$name` is a static member of `$trait_name`, so its implementation is `static` too")
+    else c.note(unit, at, s"`$name` is a method of `$trait_name`'s values, so its implementation is not `static`")
+
+// A static member of a trait is abstract: each implementing type gives its own, and no trait's
+// default body could be any type's. Anywhere else a static member has a body.
+private static_member_allowed(c: *Checker, unit: usize, f: &Function, owner_name: string, in_trait: bool, overrides: bool) -> bool
+    val bodyless = f.body is None && f.clauses.len() == 0
+    if in_trait
+        if overrides
+            c.note(unit, f.name_span, s"`${f.name}` is static, so no trait overrides it: each type implementing the trait gives its own")
+            return false
+        if !bodyless
+            c.note(unit, f.name_span, s"`${f.name}` is a static member of `$owner_name`, so it has no default body: each type implementing `$owner_name` gives its own")
+            return false
+        return true
+    if bodyless
+        c.note(unit, f.name_span, s"`${f.name}` is static, so it needs a body: it belongs to `$owner_name` itself")
+        return false
+    true
 
 // A variant's fields are resolved with its type's parameters in scope. Variant names share one
 // space within a file, since a variant is named on its own (`Some(1)`, `None`) wherever it is used.
@@ -1290,7 +1342,7 @@ private field_defaults(c: *Checker, unit: usize, id: usize, v: Variant, names: B
             decls.push(v.fields[k])
         val name = s"${v.name}/${names[i]}"
         val decl = Function(buf(), value.span, v.fields[i].span, name, d.decl.type_params, decls, None, Some(value), buf())
-        c.symbols.push(FunctionSymbol(unit, d.module_name, name, decl, params, param_names, Some(fields[i]), None, None, buf(), buf(), buf(), false, false, false, buf(), Some(names[i]), data_owner(id), d.decl.type_params, None, false, true, "", None))
+        c.symbols.push(FunctionSymbol(unit, d.module_name, name, decl, params, param_names, Some(fields[i]), None, None, buf(), buf(), buf(), false, false, false, buf(), Some(names[i]), data_owner(id), d.decl.type_params, None, false, true, "", None, false))
         c.states.push(0)
         c.bodies.push(None)
         c.locals.push(buf())
@@ -1671,6 +1723,7 @@ private struct MethodDecl
     from_impl: bool
     /** Whether this is a trait's `val`, read as a field and supplied by a field. */
     field: bool
+    static_member: bool
 
 // Each class's constructor, a function named after the class that takes its parameters and yields
 // a new instance, and its methods, each a function whose first parameter is the instance.
@@ -1708,7 +1761,7 @@ private declare_methods(c: *Checker, unit: usize)
         for _ in d.params
             no_defaults.push(None)
         // An object's constructor makes its one instance before `main` and cannot be called.
-        c.symbols.push(FunctionSymbol(unit, module_name, d.name, decl, types, names, Some(self_type), None, None, buf(), buf(), buf(), false, false, false, no_defaults, None, class_owner(id), d.type_params, Some(id), true, !d.object, "", None))
+        c.symbols.push(FunctionSymbol(unit, module_name, d.name, decl, types, names, Some(self_type), None, None, buf(), buf(), buf(), false, false, false, no_defaults, None, class_owner(id), d.type_params, Some(id), true, !d.object, "", None, false))
         c.states.push(0)
         c.bodies.push(None)
         c.locals.push(buf())
@@ -1732,7 +1785,7 @@ private declare_methods(c: *Checker, unit: usize)
                 init_names.push(names[i])
                 init_defaults.push(None)
             c.classes[id].initializer = c.symbols.len()
-            c.symbols.push(FunctionSymbol(unit, module_name, d.name + ".<init>", decl, init_types, init_names, Some(Unit), None, None, buf(), buf(), buf(), false, false, false, init_defaults, None, class_owner(id), d.type_params, Some(id), true, true, "", None))
+            c.symbols.push(FunctionSymbol(unit, module_name, d.name + ".<init>", decl, init_types, init_names, Some(Unit), None, None, buf(), buf(), buf(), false, false, false, init_defaults, None, class_owner(id), d.type_params, Some(id), true, true, "", None, false))
             c.states.push(0)
             c.bodies.push(None)
             c.locals.push(buf())
@@ -1743,12 +1796,12 @@ private declare_methods(c: *Checker, unit: usize)
         var declared: Buf[MethodDecl] = buf()
         for m in d.members
             m match
-                MethodMember(f, public, overrides) -> declared.push(MethodDecl(f, public, overrides, unit, module_name, d.type_params, false, false))
+                MethodMember(f, public, overrides, static_member) -> declared.push(MethodDecl(f, public, overrides, unit, module_name, d.type_params, false, false, static_member))
                 // A trait's `val` is an abstract method of no parameters, read with field syntax.
                 AbstractFieldMember(f) ->
                     if is_trait(c, id) && !f.mutable && f.public
                         val getter = Function(buf(), f.span, f.name_span, f.name, buf(), buf(), Some(f.declared), None, buf())
-                        declared.push(MethodDecl(getter, true, false, unit, module_name, d.type_params, false, true))
+                        declared.push(MethodDecl(getter, true, false, unit, module_name, d.type_params, false, true, false))
                 _ -> ()
         for block in c.impls
             if *block.target is Class(target, _, _)
@@ -1759,12 +1812,12 @@ private declare_methods(c: *Checker, unit: usize)
                         _ -> None
                     None -> None
                 for m in block.decl.members
-                    if m is MethodMember(f, public, overrides)
+                    if m is MethodMember(f, public, overrides, static_member)
                         if trait_id is Some(t)
                             if !trait_declares(c, t, f.name, 0)
                                 c.note(block.unit, f.name_span, s"`${f.name}` is not a method of `${c.classes[t].name}`; an impl of a trait implements the trait's methods, and `impl ${d.name}` adds others")
                                 continue
-                        declared.push(MethodDecl(f, public, overrides || trait_id is Some(_), block.unit, block.module_name, block.decl.type_params, true, false))
+                        declared.push(MethodDecl(f, public, overrides || trait_id is Some(_), block.unit, block.module_name, block.decl.type_params, true, false, static_member))
         for entry in declared
             val f = entry.f
             val public = entry.public
@@ -1774,6 +1827,7 @@ private declare_methods(c: *Checker, unit: usize)
             val intrinsic_method = is_array_storage(c.classes[id]) && f.annotations.len() > 0
             if f.annotations.len() > 0 && !intrinsic_method then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
             if overrides then refuse_override_defaults(c, file_unit, f)
+            if entry.static_member && !static_member_allowed(c, file_unit, f, c.classes[id].name, is_trait(c, id), overrides) then continue
             if is_trait(c, id)
                 if !public
                     c.note(file_unit, f.name_span, s"`${f.name}` is declared in a trait, so it cannot be private")
@@ -1820,6 +1874,7 @@ private declare_methods(c: *Checker, unit: usize)
             symbol.name = d.name + "." + f.name
             symbol.owner_class = Some(id)
             symbol.public = public
+            symbol.static_member = entry.static_member
             var method_defaults: Buf[Option[usize]] = buf()
             for _ in receiver_types
                 method_defaults.push(None)
@@ -1860,9 +1915,9 @@ private declare_impl_methods(c: *Checker, i: usize)
     val target = c.impls[i].target
     if *target is ErrorType || *target is Class(_, _, _) then return
     for m in c.impls[i].decl.members
-        if m is MethodMember(f, public, overrides) then declare_impl_method(c, i, f, public, overrides)
+        if m is MethodMember(f, public, overrides, static_member) then declare_impl_method(c, i, f, public, overrides, static_member)
 
-private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, overrides: bool)
+private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, overrides: bool, static_member: bool)
     val block = c.impls[i]
     val unit = block.unit
     val target = block.target
@@ -1889,6 +1944,12 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
             return
     elif overrides
         c.note(unit, f.name_span, s"`${f.name}` overrides nothing; `$type_name_of` has no superclass")
+    if static_member && !static_member_allowed(c, unit, f, type_name_of, false, false) then return
+    if trait_id is Some(t)
+        if !static_mirrors_trait(c, unit, f, t, static_member) then return
+    elif static_member
+        c.note(unit, f.name_span, s"`${f.name}` is static, which only a trait's member and its implementations are; an impl without a trait adds methods of values")
+        return
     if *target is Data(id, _, _)
         var field = false
         for v in c.data[id].variants
@@ -1929,6 +1990,7 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
     symbol.name = type_name_of + "." + f.name
     symbol.public = public
     symbol.receiver = Some(target)
+    symbol.static_member = static_member
     var method_defaults: Buf[Option[usize]] = buf()
     for _ in receiver_types
         method_defaults.push(None)
@@ -2577,6 +2639,16 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
             if *t is Class(tid, _, _)
                 if own_matching(c, tid, self_type, m) is Some(tm)
                     if !contains_id(implemented, tm) then implemented.push(tm)
+        // A static member implements a trait's static member, and a method a trait's method.
+        var mismatched = false
+        for tm in implemented
+            if c.symbols[tm].static_member != symbol.static_member && !mismatched
+                mismatched = true
+                report_static_mismatch(c, symbol.unit, symbol.decl.name_span, name, c.classes[c.symbols[tm].owner_class.unwrap()].name, c.symbols[tm].static_member)
+        if mismatched then continue
+        if symbol.static_member && implemented.len() == 0
+            c.note(symbol.unit, symbol.decl.name_span, s"`$name` is static, which only a trait's member and its implementations are; `${k.name}` conforms to no trait with a static `$name`")
+            continue
         var supplies_field = false
         for tm in implemented
             if is_trait_field(c, tm) && !supplies_field
@@ -2890,15 +2962,21 @@ private build_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
                 c.note(k.unit, k.decl.name_span, s"`${k.name}` inherits two implementations of `$name`, `${c.symbols[bodies[0]].name}` and `${c.symbols[bodies[1]].name}`; override it")
         if chosen is Some(m) then table.set(i, Some(m))
     c.classes[id].table = table
-    if !is_abstract_class(c, id)
+    // A static member belongs to the type, so an abstract class implements its traits' too.
+    val abstract_class = is_abstract_class(c, id)
+    if !is_trait(c, id)
         var missing: Buf[string] = buf()
         for entry in table
             if entry is Some(m)
+                if abstract_class && !c.symbols[m].static_member then continue
                 val name = c.symbols[m].decl.name
                 val key = method_key(c, self_type, m)
                 if is_abstract_method(c.symbols[m]) && !is_universal(c, m) && !contains_name(missing, key)
                     missing.push(key)
                     val owner = c.symbols[m].owner_class.unwrap()
+                    if abstract_class
+                        c.note(k.unit, k.decl.name_span, s"`${k.name}` does not implement the static member `$name` from `${c.classes[owner].name}`; implement it: it belongs to the type, so an abstract class gives it too")
+                        continue
                     // An object is its one instance, so it cannot be left abstract.
                     val otherwise = if k.decl.object then "" else s", or declare `${k.name}` abstract"
                     if is_trait_field(c, m)
@@ -2945,7 +3023,7 @@ private field_getter(c: *Checker, unit: usize, module_name: string, type_name_of
     defaults.push(None)
     val receiver = if owner_class is None then Some(self_type) else None
     val id = c.symbols.len()
-    c.symbols.push(FunctionSymbol(unit, module_name, type_name_of + "." + name, decl, params, names, None, None, None, buf(), buf(), buf(), false, false, false, defaults, None, type_owner, type_params, owner_class, false, true, "", receiver))
+    c.symbols.push(FunctionSymbol(unit, module_name, type_name_of + "." + name, decl, params, names, None, None, None, buf(), buf(), buf(), false, false, false, defaults, None, type_owner, type_params, owner_class, false, true, "", receiver, false))
     c.states.push(0)
     c.bodies.push(None)
     c.locals.push(buf())
@@ -3355,7 +3433,7 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
     elif f.body is None && f.clauses.len() == 0 && !bodyless && !binding
         c.note(unit, f.name_span, s"`${f.name}` needs a body, or clauses on the lines after it")
     c.generic = outer_generic
-    FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf(), false, false, false, buf(), None, owner, type_params, None, false, true, "", None)
+    FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf(), false, false, false, buf(), None, owner, type_params, None, false, true, "", None, false)
 
 // Each default argument becomes a function of its own, declared beside the function whose parameter
 // it belongs to: it takes the parameters before that one, so the default may use them, and yields
@@ -3397,7 +3475,7 @@ private declare_defaults(c: *Checker, id: usize)
         val type_owner = if shared then f.type_owner else did
         val type_params = if shared then f.type_params else f.decl.type_params
         val owner_class = if f.constructor then None else f.owner_class
-        c.symbols.push(FunctionSymbol(f.unit, f.module_name, name, decl, params, names, Some(result), None, f.root, buf(), buf(), buf(), false, false, false, buf(), Some(f.param_names[i]), type_owner, type_params, owner_class, false, true, "", f.receiver))
+        c.symbols.push(FunctionSymbol(f.unit, f.module_name, name, decl, params, names, Some(result), None, f.root, buf(), buf(), buf(), false, false, false, buf(), Some(f.param_names[i]), type_owner, type_params, owner_class, false, true, "", f.receiver, f.static_member))
         c.states.push(0)
         c.bodies.push(None)
         c.locals.push(buf())
@@ -3898,7 +3976,9 @@ private mentions_self(c: *Checker, k: usize, depth: usize) -> bool
     if depth > c.classes.len() then return false
     for m in c.classes[k].decl.members
         m match
-            MethodMember(f, _, _) ->
+            // A static member is the implementing type's, which a value of the trait's type has none of.
+            MethodMember(f, _, _, static_member) ->
+                if static_member then return true
                 for p in f.params
                     if names_self(p.ty) then return true
                 if f.result is Some(r)
@@ -4301,7 +4381,7 @@ private construct(c: *Checker, k: usize, upto: Option[usize])
                 if *t.ty is Nothing then made.finishes = false
                 made.items.push(t)
             AbstractFieldMember(_) -> ()
-            MethodMember(_, _, _) -> ()
+            MethodMember(_, _, _, _) -> ()
     if upto is Some(_)
         made.body = c.body
         c.constructions.set(k, Some(made))
@@ -4552,8 +4632,20 @@ private bare_methods(c: *Checker, name: string) -> Buf[usize]
  * not the integer family's. */
 private is_trait_self(t: &Type) -> bool = *t is TypeVar(_, _, _) && !is_integer_family(t)
 
-/** `self`, the instance the enclosing constructor or method works on. */
-private self_ref(c: *Checker, at: Span) -> &TExpr = binding_ref(c, at, "self").unwrap()
+/** `self`, the instance the enclosing constructor or method works on. A static member works on no
+ * instance, so there the receiver's members are an error. */
+private self_ref(c: *Checker, at: Span) -> &TExpr
+    if refuse_static_self(c, at, " and cannot use the members of a value") then return TExpr(at, ErrorType, UnitConst)
+    binding_ref(c, at, "self").unwrap()
+
+/** Whether the code being checked is a static member's, or a lambda or local function within one. */
+private in_static(c: *Checker) -> bool = c.symbols[c.body.root].static_member
+
+private refuse_static_self(c: *Checker, at: Span, what: string) -> bool
+    if !in_static(c) then return false
+    val name = c.symbols[c.body.root].decl.name
+    c.note(unit_of(c), at, s"`$name` is static: it belongs to the type, not to a value, so it has no `self`$what")
+    true
 
 // A local function is checked where it is declared, seeing the locals declared before it. Its
 // parameters become locals of its own, and loops outside it are not its loops.
@@ -4765,6 +4857,7 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
     if c.super_args && name == "self"
         c.note(unit_of(c), at, "`self` cannot be used in a superclass's arguments, which run before the object is initialized")
         return TExpr(at, ErrorType, UnitConst)
+    if name == "self" && refuse_static_self(c, at, "") then return TExpr(at, ErrorType, UnitConst)
     if binding_ref(c, at, name) is Some(t) then return evaluated(t)
     val symbol = c.symbols[c.current]
     if name == "super" && enclosing_class(c) is Some(_)
@@ -4910,6 +5003,7 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
     val unit = unit_of(c)
     if *receiver.ty is Nothing then return receiver
     if refuse_unmet_conformance(c, at, receiver.ty, m) then return TExpr(at, ErrorType, UnitConst)
+    if refuse_static_on_value(c, at, receiver, m) then return TExpr(at, ErrorType, UnitConst)
     val target = c.symbols[m]
     val name = target.decl.name
     val known = receiver_type_args(c, receiver.ty, m)
@@ -4956,7 +5050,7 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
     val enclosing = c.symbols[c.current]
     val decl = Function(buf(), at, at, "lambda", buf(), buf(), None, None, buf())
     val id = c.symbols.len()
-    c.symbols.push(FunctionSymbol(enclosing.unit, enclosing.module_name, "lambda", decl, lambda_params, names, Some(lambda_result), None, Some(c.body.root), buf(), buf(), buf(), true, false, true, buf(), None, id, buf(), None, false, true, "", None))
+    c.symbols.push(FunctionSymbol(enclosing.unit, enclosing.module_name, "lambda", decl, lambda_params, names, Some(lambda_result), None, Some(c.body.root), buf(), buf(), buf(), true, false, true, buf(), None, id, buf(), None, false, true, "", None, false))
     c.states.push(2)
     c.bodies.push(None)
     c.locals.push(buf())
@@ -5523,7 +5617,7 @@ private initializer(c: *Checker, order: Buf[usize]) -> Option[usize]
     val at = Span(0, 0)
     val id = c.symbols.len()
     val decl = Function(buf(), at, at, "<init>", buf(), buf(), None, None, buf())
-    c.symbols.push(FunctionSymbol(unit, module_name, "<init>", decl, buf(), buf(), Some(Unit), None, None, buf(), buf(), buf(), false, false, false, buf(), None, id, buf(), None, false, true, "", None))
+    c.symbols.push(FunctionSymbol(unit, module_name, "<init>", decl, buf(), buf(), Some(Unit), None, None, buf(), buf(), buf(), false, false, false, buf(), None, id, buf(), None, false, true, "", None, false))
     var items: Buf[&TExpr] = buf()
     for g in order
         val init = c.globals[g].init
@@ -7193,6 +7287,79 @@ private overload_list(c: *Checker, ids: Buf[usize]) -> string
         out = out + "`" + text + ")`"
     out
 
+// The type `target` names where it is the receiver of a call, as `int` in `int.zero()`, `T` in
+// `T.zero()` and `Box[int]` in `Box[int].zero()`; `None` where it is a value, a value of the name
+// hiding the type. A trait names no type with static members of its own, which is reported.
+private static_receiver(c: *Checker, target: &Expr, member: string) -> Option[&Type]
+    var name = ""
+    var written: Buf[&TypeExpr] = buf()
+    target.kind match
+        Name(n) -> name = n
+        TypeApply(inner, types) ->
+            if inner.kind is Name(n)
+                name = n
+                written = types
+            else return None
+        _ -> return None
+    if name == "self" || name == "super" || name == "_" then return None
+    if lookup_local(c, name) is Some(_) || param_index(c, name) is Some(_) then return None
+    if class_member(c, name) is Some(_) || global_named(c, name) is Some(_) then return None
+    // A class's name is also its constructor's, which a call on the name does not mean.
+    for f in lookup_functions(c, name)
+        if !c.symbols[f].constructor then return None
+    val unit = unit_of(c)
+    var names_type = builtin_type(name) is Some(_) || (name == "Self" && c.self_trait is Some(_))
+    if c.generic is Some(scope)
+        if names_type_param(scope.params, name) then names_type = true
+    val key = resolve_name(c, unit, name)
+    if c.types.get(key) is Some(_) then names_type = true
+    if c.class_types.get(key) is Some(k)
+        if is_trait(c, k)
+            c.note(unit, target.span, s"`$name` is a trait, which has no static members of its own: call one on a type implementing it, as in `T.$member()` with `T: $name`")
+            return Some(ErrorType)
+        names_type = true
+    if !names_type then return None
+    Some(resolve_type(c, unit, TypeExpr(target.span, Named(name, written))))
+
+// A call of the static member `name` of type `ty`: the type's own where the type is known, and its
+// type argument's in each instance where it is a type parameter.
+private static_call(c: *Checker, at: Span, name_span: Span, target: &Expr, ty: &Type, name: string, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+    val unit = unit_of(c)
+    val t = zonk(c, ty)
+    var ms: Buf[usize] = buf()
+    var reported = *t is ErrorType
+    *t match
+        ErrorType -> ()
+        TypeVar(owner, _, _) ->
+            // A trait's default body is shared by every type implementing it, so its `Self` is no
+            // one type whose static member it could call.
+            if c.self_trait is Some(k)
+                if owner == self_owner(k)
+                    c.note(unit, target.span, s"`Self.$name()` cannot be called in a trait's default body, which every type implementing the trait shares; a function bounded by the trait calls it, as `T.$name()`")
+                    reported = true
+            if !reported then ms = bound_methods(c, t, name)
+        Class(k, _, _) -> ms = methods_named(c, k, name)
+        _ -> ms = visible_methods(c, receiver_methods(c, t, name))
+    var statics: Buf[usize] = buf()
+    for m in ms
+        if c.symbols[m].static_member then statics.push(m)
+    if statics.len() == 0
+        if !reported
+            if ms.len() > 0 then c.note(unit, name_span, s"`$name` is a method of a value of `${type_name(t)}`, not of the type; call it on a value")
+            else c.note(unit, name_span, s"`${type_name(t)}` has no static member `$name`")
+        for a in args
+            check_statement(c, a.value)
+        return TExpr(at, ErrorType, UnitConst)
+    call_method(c, at, name_span, TExpr(target.span, t, TypeReceiver), name, statics, args, explicit, expected, false)
+
+// A static member belongs to its type, so it is called on the type and never on a value.
+private refuse_static_on_value(c: *Checker, at: Span, receiver: &TExpr, m: usize) -> bool
+    val target = c.symbols[m]
+    if !target.static_member || receiver.kind is TypeReceiver then return false
+    val shown = type_name(zonk(c, receiver.ty))
+    c.note(unit_of(c), at, s"`${target.decl.name}` is static: it belongs to the type, so it is called on the type, as in `$shown.${target.decl.name}()`, not on a value")
+    true
+
 // `object.name(args)`: a method of the object's class, or a field holding a function, which is
 // called as a value.
 private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, target: &Expr, name: string, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], infix: bool) -> &TExpr
@@ -7200,6 +7367,8 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
     if target.kind is Name("super")
         if lookup_local(c, "super") is None && enclosing_class(c) is Some(_)
             return super_call(c, at, name_span, target.span, name, args, explicit, expected)
+    if !infix
+        if static_receiver(c, target, name) is Some(ty) then return static_call(c, at, name_span, target, ty, name, args, explicit, expected)
     val object = check_expr(c, target, None)
     if *zonk(c, object.ty) is Class(k, _, _)
         val ms = with_trait_methods(c, object.ty, name, methods_named(c, k, name))
@@ -7430,7 +7599,7 @@ private refuse_unmet_conformance(c: *Checker, at: Span, receiver_type: &Type, m:
 // type, and the method's own, which follow them, are written or inferred as for a function.
 private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m: usize, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], direct: bool, checked: Buf[Option[&TExpr]]) -> &TExpr
     val target = c.symbols[m]
-    val unmet = refuse_unmet_conformance(c, name_span, receiver.ty, m)
+    val unmet = refuse_unmet_conformance(c, name_span, receiver.ty, m) || refuse_static_on_value(c, name_span, receiver, m)
     if *receiver.ty is Nothing || unmet
         for i in 0..<args.len()
             if i >= checked.len() || checked[i] is None then check_statement(c, args[i].value)
@@ -7438,7 +7607,7 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
     // The receiver is evaluated before the arguments, so one that is computed is held while they are.
     var setup: Option[&TExpr] = None
     var object = receiver
-    if !(receiver.kind is Local(_) || receiver.kind is Param(_))
+    if !(receiver.kind is Local(_) || receiver.kind is Param(_) || receiver.kind is TypeReceiver)
         val held = hidden_local(c, receiver.ty)
         setup = Some(TExpr(receiver.span, Unit, Let(held, receiver)))
         object = TExpr(receiver.span, receiver.ty, Local(held))
@@ -7510,6 +7679,9 @@ private method_call_kind(c: *Checker, receiver_type: &Type, m: usize, args: Buf[
     // A method an impl adds to a trait is in no method table: its instance for the receiver's type
     // is called.
     if direct || trait_method_of(c, m) is Some(_) then return Call(m, args, type_args)
+    // A static member called on a type that is known is that type's own; on a type parameter, each
+    // instance calls its type argument's.
+    if c.symbols[m].static_member && !(*zonk(c, receiver_type) is TypeVar(_, _, _)) then return Call(m, args, type_args)
     // `equals` and `hash` are decided by the receiver's type in every instance: its own, or by value
     // or identity.
     if is_universal(c, m) then return BoundCall(m, Some(trait_slot(c, m)), args, type_args)
@@ -7977,7 +8149,7 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     val enclosing = c.symbols[c.current]
     val decl = Function(buf(), e.span, e.span, "lambda", buf(), buf(), None, Some(body), buf())
     val id = c.symbols.len()
-    c.symbols.push(FunctionSymbol(enclosing.unit, enclosing.module_name, "lambda", decl, types, names, result, None, Some(c.body.root), buf(), buf(), buf(), true, delayed, true, buf(), None, id, buf(), None, false, true, "", None))
+    c.symbols.push(FunctionSymbol(enclosing.unit, enclosing.module_name, "lambda", decl, types, names, result, None, Some(c.body.root), buf(), buf(), buf(), true, delayed, true, buf(), None, id, buf(), None, false, true, "", None, false))
     c.states.push(1)
     c.bodies.push(None)
     c.locals.push(buf())
@@ -8876,7 +9048,7 @@ private check_class_initialization(c: *Checker, k: usize, unsafe: *Buf[bool])
                 last_name = f.name
             StatementMember(_) -> count += 1
             AbstractFieldMember(_) -> ()
-            MethodMember(_, _, _) -> ()
+            MethodMember(_, _, _, _) -> ()
     if items.len() < count + 1 then return
     val start = items.len() - 1 - count
     val kind = if is_open(c, k) then cls.decl.modifier else ""
