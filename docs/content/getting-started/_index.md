@@ -203,7 +203,8 @@ Every command takes a path anywhere in a package and compiles the whole package,
 it depends on: `avin run hello/main.avin` and `avin test hello/tests` both mean `hello`. A
 dependency's modules are imported by their own names. `avin build` names the executable after the
 package. Fetched packages are kept in the machine's cache, and `avin.sum` beside the manifest records
-what each one hashed to; commit it. `avin tidy` rewrites it to exactly what the package uses, and
+what each one hashed to; commit it. `avin add github.com/owner/json@1.4.0` writes the dependency
+into the manifest and fetches it, and without `@1.4.0` takes the highest release. `avin tidy` rewrites it to exactly what the package uses, and
 `avin tidy --check` fails when it is not. The [packages chapter](/spec/packages/) has the rest.
 
 ## The compiler's tests

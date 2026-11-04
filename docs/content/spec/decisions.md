@@ -860,6 +860,16 @@ Settled by the user on 2026-11-04:
   - **`avin new <dir> [--lib]`** names the package by the directory, writes a module of that name
     (`-` written `_`), `main.avin` unless `--lib`, a test in `tests/` and a `.gitignore` of `.avin/`;
     the names `avin` and `tests` are refused. `avin build` names the executable after the package.
+  - **`avin add <coordinate>[@<version>] [<package>]`** records a git dependency: the version is the
+    one given, or the highest release tag the host lists (`v` and three numbers; no release is an
+    error naming the way to give one). The package is fetched first and listed under the name its own
+    manifest gives it; a dependency already listed, under that coordinate or that name, has its entry
+    replaced in place, to a lower version too. The edit is made in the manifest's text, so comments
+    and layout stay: the entry goes last in the `dependencies` block, a block being made at the end
+    of the file when there is none. The result is resolved and `avin.sum` gains its lines (a
+    version that is no longer chosen keeps its line until `avin tidy`); where fetching or resolving
+    fails, the manifest is put back as it was. It adds only git dependencies: a path dependency is
+    written by hand.
 
 - Repeated parameters beside overloads and constructors
   ([declarations](/spec/declarations/#repeated-parameters)): an overload with a repeated parameter
