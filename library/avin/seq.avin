@@ -2,13 +2,14 @@ module avin
 
 // An ordered collection whose elements are numbered from 0: `xs(i)` is the element at `i`, and an
 // index outside `0 ..< length()` traps, while `xs.get(i)` answers `None` there. Every list, vector,
-// array, buffer and deque is a `Seq`, so a function over `Seq[T]` takes any of them. A sequence is
+// array, buffer, deque and range is a `Seq`, so a function over `Seq[T]` takes any of them. A sequence is
 // also the function from an index to its element, `(int) -> T`, so `(0 ..< 3).map(xs)` is the first
 // three elements of `xs`.
 //
 // A sequence implements `length()` and `apply(index)`; everything else here is written once over
-// those two, in index order. A sequence that reaches its elements faster another way, as a list does
-// by walking from its front, overrides the methods that would be slow for it.
+// those two and the iterator they give, in index order. A sequence that reaches its elements faster
+// another way, as a list does by walking from its front, overrides the methods that would be slow
+// for it.
 trait Seq[+T]: Iterable[T], (int) -> T
     // The number of elements.
     length() -> int
@@ -104,6 +105,199 @@ impl[T] Seq[T]
         sortElementsBy(a, a.length(), key)
         vectorOf(freeze(a))
 
+    // The methods from here on make a vector of what they select or compute. A list, a vector and an
+    // `ArraySeq` have their own versions that answer with one of their own kind; an array, a buffer,
+    // a deque or a range answers with these. A count of elements is held to the sequence: one below
+    // zero is zero and one past the length is the length, so `take(-1)` is empty and `drop(100)` of
+    // three elements is empty. Each walks the elements once, by `iterator()`, unless it says
+    // otherwise, so a list answers each in time proportional to its length.
+
+    // The vector of `f` of each element, in order.
+    map[U](f: (T) -> U) -> Vector[U] = mappedInto(self, f, Vector.builder[U]())
+
+    // The vector of the elements of the collections `f` makes of each element, joined in order.
+    flatMap[U](f: (T) -> Iterable[U]) -> Vector[U] = flatMappedInto(self, f, Vector.builder[U]())
+
+    // The vector of `pf` of each element it is defined at, in order.
+    collect[U](pf: PartialFunction[T, U]) -> Vector[U] = collectedInto(self, pf, Vector.builder[U]())
+
+    // The elements that satisfy `p`, in order.
+    filter(p: (T) -> bool) -> Vector[T] = keptInto(self, p, true, Vector.builder[T]())
+
+    // The elements that do not satisfy `p`, in order.
+    filterNot(p: (T) -> bool) -> Vector[T] = keptInto(self, p, false, Vector.builder[T]())
+
+    // The elements that satisfy `p`, tested only as `map`, `flatMap` or `foreach` reaches each one.
+    withFilter(p: (T) -> bool) -> FilteredSeq[T] = FilteredSeq(self, p)
+
+    // The first `n` elements, or all of them when there are fewer.
+    take(n: int) -> Vector[T] = rangeInto(self, 0, n, Vector.builder[T]())
+
+    // The elements after the first `n`; empty when there are no more.
+    drop(n: int) -> Vector[T] = droppedInto(self, n, Vector.builder[T]())
+
+    // The elements before the first that does not satisfy `p`.
+    takeWhile(p: (T) -> bool) -> Vector[T] = takenWhileInto(self, p, Vector.builder[T]())
+
+    // The elements from the first that does not satisfy `p` on.
+    dropWhile(p: (T) -> bool) -> Vector[T] = droppedWhileInto(self, p, Vector.builder[T]())
+
+    // The last `n` elements, or all of them when there are fewer.
+    takeRight(n: int) -> Vector[T]
+        val total = length()
+        rangeInto(self, total - clamped(n, total), total, Vector.builder[T]())
+
+    // The elements before the last `n`; empty when there are no more.
+    dropRight(n: int) -> Vector[T]
+        val total = length()
+        rangeInto(self, 0, total - clamped(n, total), Vector.builder[T]())
+
+    // The elements from `from` up to `until`, which traps when the indices are not in order within
+    // the sequence.
+    slice(from: int, until: int) -> Vector[T]
+        if from < 0 || until > length() || from > until then fail("slice out of range")
+        rangeInto(self, from, until, Vector.builder[T]())
+
+    // The first `n` elements and the rest: `(take(n), drop(n))`, in one walk.
+    splitAt(n: int) -> (Vector[T], Vector[T]) = splitInto(self, n, Vector.builder[T](), Vector.builder[T]())
+
+    // The elements before the first that does not satisfy `p`, and the rest:
+    // `(takeWhile(p), dropWhile(p))`, in one walk.
+    span(p: (T) -> bool) -> (Vector[T], Vector[T]) = spanInto(self, p, Vector.builder[T](), Vector.builder[T]())
+
+    // Every element after the first, which traps on the empty sequence.
+    tail() -> Vector[T]
+        if isEmpty() then fail("tail of an empty sequence")
+        droppedInto(self, 1, Vector.builder[T]())
+
+    // Every element before the last, which traps on the empty sequence.
+    init() -> Vector[T]
+        val total = length()
+        if total == 0 then fail("init of an empty sequence")
+        rangeInto(self, 0, total - 1, Vector.builder[T]())
+
+    // The elements in the opposite order, read by `reverseIterator()`.
+    reverse() -> Vector[T] = reversedInto(self, Vector.builder[T]())
+
+    // The elements followed by those of `other`: `xs ++ ys`.
+    ++(other: Iterable[T]) -> Vector[T] = joinedInto(self, other, Vector.builder[T]())
+
+    // The elements with `element` after them: `xs :+ x`.
+    :+(element: T) -> Vector[T] = appendedInto(self, element, Vector.builder[T]())
+
+    // The elements with `element` before them: `x +: xs`.
+    +:(element: T) -> Vector[T] = prependedInto(element, self, Vector.builder[T]())
+
+    // The elements with the one at `index` replaced by `element`; traps when there is none.
+    updated(index: int, element: T) -> Vector[T]
+        if index < 0 || index >= length() then fail("index out of range")
+        replacedInto(self, index, element, Vector.builder[T]())
+
+    // The elements followed by as many copies of `element` as make `total` of them; just the elements
+    // when there are already `total` or more.
+    padTo(total: int, element: T) -> Vector[T] = paddedInto(self, total, element, Vector.builder[T]())
+
+    // The elements with each one equal to an earlier one left out.
+    distinct() -> Vector[T] = distinctInto(self, x -> x, Vector.builder[T]())
+
+    // The elements with each one whose `key` equals an earlier one's left out.
+    distinctBy[K](key: (T) -> K) -> Vector[T] = distinctInto(self, key, Vector.builder[T]())
+
+    // The elements that are also in `other`, counted as a multiset: an element `other` holds `k`
+    // times is kept at most `k` times, its first `k` occurrences, in this sequence's order.
+    intersect(other: Seq[T]) -> Vector[T] = multisetInto(self, other, true, Vector.builder[T]())
+
+    // The elements less those in `other`, counted as a multiset: an element `other` holds `k` times
+    // loses its first `k` occurrences, and the rest keep this sequence's order.
+    diff(other: Seq[T]) -> Vector[T] = multisetInto(self, other, false, Vector.builder[T]())
+
+    // The indices of the elements, `0 ..< length()`.
+    indices() -> Range = Range(0, length(), 1, false)
+
+    // Pairs of an element of this sequence and the one at the same place in `other`, as many as the
+    // shorter of the two has.
+    zip[U](other: Iterable[U]) -> Vector[(T, U)]
+        val b = Vector.builder[(T, U)]()
+        val left = iterator()
+        val right = other.iterator()
+        while left.hasNext() && right.hasNext() do b.add((left.next(), right.next()))
+        b.result()
+
+    // Pairs as `zip` makes them, as many as the longer of the two has: where this sequence has run
+    // out its place holds `thisElement`, and where `other` has, `thatElement`.
+    zipAll[U](other: Iterable[U], thisElement: T, thatElement: U) -> Vector[(T, U)]
+        val b = Vector.builder[(T, U)]()
+        val left = iterator()
+        val right = other.iterator()
+        while left.hasNext() || right.hasNext()
+            val x = if left.hasNext() then left.next() else thisElement
+            val y = if right.hasNext() then right.next() else thatElement
+            b.add((x, y))
+        b.result()
+
+    // `initial`, then each partial result of `foldLeft(initial, f)`, in order: one more than there
+    // are elements.
+    scanLeft[B](initial: B, f: (B, T) -> B) -> Vector[B]
+        val b = Vector.builder[B]()
+        var acc = initial
+        b.add(acc)
+        for x in self
+            acc = f(acc, x)
+            b.add(acc)
+        b.result()
+
+    // Vectors of `size` consecutive elements, in order, the last holding what remains when it is
+    // fewer. A size below 1 traps.
+    grouped(size: int) -> Iterator[Vector[T]]
+        if size < 1 then fail("group size is not positive")
+        SlidingIterator(toVector(), size, size, 0, false)
+
+    // Vectors of `size` consecutive elements starting at every `step`th one, in order, up to the
+    // first that reaches the last element, which holds what remains when it is fewer; a sequence
+    // shorter than `size` gives one window of all of it, and an empty one none. A size or step below
+    // 1 traps.
+    sliding(size: int, step: int = 1) -> Iterator[Vector[T]]
+        if size < 1 then fail("window size is not positive")
+        if step < 1 then fail("window step is not positive")
+        SlidingIterator(toVector(), size, step, 0, false)
+
+    // The index of the last element equal to `element`, or `None` when there is none.
+    lastIndexOf(element: T) -> Option[int] = lastIndexWhere(x -> x.equals(element))
+
+    // The index of the last element that satisfies `p`, or `None`, found by `reverseIterator()`.
+    lastIndexWhere(p: (T) -> bool) -> Option[int]
+        var i = length() - 1
+        for x in reverseIterator()
+            if p(x) then return Some(i)
+            i -= 1
+        None
+
+    // Whether the first elements are equal to those of `prefix`, in order.
+    startsWith(prefix: Seq[T]) -> bool
+        val mine = iterator()
+        for y in prefix
+            if !mine.hasNext() || !mine.next().equals(y) then return false
+        true
+
+    // Whether the last elements are equal to those of `suffix`, in order.
+    endsWith(suffix: Seq[T]) -> bool
+        val total = length()
+        val wanted = suffix.length()
+        if wanted > total then return false
+        val mine = iterator()
+        for _ in 0 ..< total - wanted do mine.next()
+        for y in suffix
+            if !mine.next().equals(y) then return false
+        true
+
+    // Whether `other` has as many elements, each equal to the one at the same place here.
+    sameElements(other: Iterable[T]) -> bool
+        val mine = iterator()
+        val theirs = other.iterator()
+        while mine.hasNext() && theirs.hasNext()
+            if !mine.next().equals(theirs.next()) then return false
+        !mine.hasNext() && !theirs.hasNext()
+
 // A sequence of ordered elements sorts.
 impl[T: Ord] Seq[T]
     // A vector of the elements in ascending order; the sort is stable, so equal elements keep their
@@ -150,3 +344,175 @@ impl[A, B] Seq[(A, B)]
             firsts.add(a)
             seconds.add(b)
         (firsts.result(), seconds.result())
+
+// A sequence seen through a test, which a guard of a `for` with `yield` makes: each element is tested
+// just before the call after it would use it.
+class FilteredSeq[T](private val seq: Seq[T], private val p: (T) -> bool)
+    // The vector of `f` of each element that passes the test, in order.
+    map[U](f: (T) -> U) -> Vector[U]
+        val b = Vector.builder[U]()
+        for x in seq
+            if p(x) then b.add(f(x))
+        b.result()
+
+    // The vector of the elements of the collections `f` makes of each element that passes the test.
+    flatMap[U](f: (T) -> Iterable[U]) -> Vector[U]
+        val b = Vector.builder[U]()
+        for x in seq
+            if p(x) then b.addAll(f(x))
+        b.result()
+
+    // The elements that pass this test and then `q`.
+    withFilter(q: (T) -> bool) -> FilteredSeq[T] = FilteredSeq(seq, x -> p(x) && q(x))
+
+    // Calls `f` with each element that passes the test, in order.
+    foreach(f: (T) -> unit)
+        for x in seq
+            if p(x) then f(x)
+
+// Steps through windows of `items`: each is the `size` elements from `start`, or as many as remain,
+// and the next starts `step` further on; `done` once a window has reached the last element.
+private class SlidingIterator[T](items: Vector[T], size: int, step: int, private var start: int, private var done: bool): Iterator[Vector[T]]
+    override hasNext() -> bool = !done && start < items.length()
+
+    override next() -> Vector[T]
+        if !hasNext() then fail("next on an exhausted iterator")
+        val total = items.length()
+        val end = if size >= total - start then total else start + size
+        val window = items.slice(start, end)
+        if end == total then done = true
+        else start = if step >= total - start then total else start + step
+        window
+
+// The collection-making methods of every sequence, each written once over an `Iterable` and a builder
+// of the kind of collection the caller answers with.
+
+// The elements of `items` that satisfy `p` when `keep` holds, or that do not when it does not.
+private keptInto[T, C](items: Iterable[T], p: (T) -> bool, keep: bool, into: Builder[T, C]) -> C
+    for x in items
+        if p(x) == keep then into.add(x)
+    into.result()
+
+private mappedInto[T, U, C](items: Iterable[T], f: (T) -> U, into: Builder[U, C]) -> C
+    for x in items do into.add(f(x))
+    into.result()
+
+private flatMappedInto[T, U, C](items: Iterable[T], f: (T) -> Iterable[U], into: Builder[U, C]) -> C
+    for x in items do into.addAll(f(x))
+    into.result()
+
+private collectedInto[T, U, C](items: Iterable[T], pf: PartialFunction[T, U], into: Builder[U, C]) -> C
+    val f = pf.lift()
+    for x in items
+        if f(x) is Some(u) then into.add(u)
+    into.result()
+
+// The elements at the indices from `from` up to `until`, either held to the elements there are.
+private rangeInto[T, C](items: Iterable[T], from: int, until: int, into: Builder[T, C]) -> C
+    val it = items.iterator()
+    var i = 0
+    while i < until && it.hasNext()
+        val x = it.next()
+        if i >= from then into.add(x)
+        i += 1
+    into.result()
+
+// The elements after the first `n`.
+private droppedInto[T, C](items: Iterable[T], n: int, into: Builder[T, C]) -> C
+    val it = items.iterator()
+    var i = 0
+    while i < n && it.hasNext()
+        it.next()
+        i += 1
+    while it.hasNext() do into.add(it.next())
+    into.result()
+
+private takenWhileInto[T, C](items: Iterable[T], p: (T) -> bool, into: Builder[T, C]) -> C
+    for x in items
+        if !p(x) then return into.result()
+        into.add(x)
+    into.result()
+
+private droppedWhileInto[T, C](items: Iterable[T], p: (T) -> bool, into: Builder[T, C]) -> C
+    var dropping = true
+    for x in items
+        if dropping && !p(x) then dropping = false
+        if !dropping then into.add(x)
+    into.result()
+
+// The first `n` elements into `first` and the rest into `second`.
+private splitInto[T, C](items: Iterable[T], n: int, first: Builder[T, C], second: Builder[T, C]) -> (C, C)
+    var i = 0
+    for x in items
+        if i < n then first.add(x) else second.add(x)
+        i += 1
+    (first.result(), second.result())
+
+// The elements before the first that does not satisfy `p` into `first`, and the rest into `second`.
+private spanInto[T, C](items: Iterable[T], p: (T) -> bool, first: Builder[T, C], second: Builder[T, C]) -> (C, C)
+    var taking = true
+    for x in items
+        if taking && !p(x) then taking = false
+        if taking then first.add(x) else second.add(x)
+    (first.result(), second.result())
+
+private reversedInto[T, C](items: Seq[T], into: Builder[T, C]) -> C
+    for x in items.reverseIterator() do into.add(x)
+    into.result()
+
+private joinedInto[T, C](items: Iterable[T], other: Iterable[T], into: Builder[T, C]) -> C
+    into.addAll(items)
+    into.addAll(other)
+    into.result()
+
+private appendedInto[T, C](items: Iterable[T], element: T, into: Builder[T, C]) -> C
+    into.addAll(items)
+    into.add(element)
+    into.result()
+
+private prependedInto[T, C](element: T, items: Iterable[T], into: Builder[T, C]) -> C
+    into.add(element)
+    into.addAll(items)
+    into.result()
+
+// The elements with the one at `index`, which the caller has found to be there, replaced.
+private replacedInto[T, C](items: Iterable[T], index: int, element: T, into: Builder[T, C]) -> C
+    var i = 0
+    for x in items
+        into.add(if i == index then element else x)
+        i += 1
+    into.result()
+
+private paddedInto[T, C](items: Iterable[T], total: int, element: T, into: Builder[T, C]) -> C
+    var n = 0
+    for x in items
+        into.add(x)
+        n += 1
+    while n < total
+        into.add(element)
+        n += 1
+    into.result()
+
+// The elements whose keys differ from every earlier element's.
+private distinctInto[T, K, C](items: Iterable[T], key: (T) -> K, into: Builder[T, C]) -> C
+    var seen = Set.empty[K]()
+    for x in items
+        val k = key(x)
+        if !seen.contains(k)
+            seen = seen.added(k)
+            into.add(x)
+    into.result()
+
+// The elements matched against `other` as multisets: each occurrence in `other` matches the first
+// unmatched equal element here. The matched elements when `matched` holds, the others when not.
+private multisetInto[T, C](items: Iterable[T], other: Seq[T], matched: bool, into: Builder[T, C]) -> C
+    var counts = Map.empty[T, int]()
+    for y in other
+        counts = counts.updated(y, counts.get(y).getOrElse(0) + 1)
+    for x in items
+        val left = counts.get(x).getOrElse(0)
+        if left > 0
+            counts = counts.updated(x, left - 1)
+            if matched then into.add(x)
+        elif !matched then into.add(x)
+    into.result()

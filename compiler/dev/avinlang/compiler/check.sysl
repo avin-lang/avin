@@ -835,7 +835,13 @@ private mark_overloads(c: *Checker, set: Buf[usize])
 // Whether a function with the parameter types `general`, whose own `type_params` type parameters
 // belong to `owner`, accepts arguments of the types `specific`, once those type parameters are
 // solved. The inference variables it makes and solves are discarded, whatever it answers.
-private accepts(c: *Checker, general: Buf[&Type], owner: usize, type_params: usize, specific: Buf[&Type]) -> bool
+private accepts(c: *Checker, general: Buf[&Type], owner: usize, type_params: usize, specific: Buf[&Type]) -> bool = accepting(c, general, owner, type_params, specific, false)
+
+// As `accepts`, where an argument may also be of a subtype of its parameter's type: what a call's
+// candidates are compared by, so `f(x: Iterable[int])` accepts what `f(x: Vector[int])` does.
+private accepts_conforming(c: *Checker, general: Buf[&Type], owner: usize, type_params: usize, specific: Buf[&Type]) -> bool = accepting(c, general, owner, type_params, specific, true)
+
+private accepting(c: *Checker, general: Buf[&Type], owner: usize, type_params: usize, specific: Buf[&Type], subtypes: bool) -> bool
     if general.len() != specific.len() then return false
     val saved = save_vars(c)
     var type_args: Buf[&Type] = buf()
@@ -843,7 +849,9 @@ private accepts(c: *Checker, general: Buf[&Type], owner: usize, type_params: usi
         type_args.push(fresh_var(c))
     var ok = true
     for i in 0..<general.len()
-        if ok && !unify(c, strict(substitute(general[i], owner, type_args)), strict(specific[i])) then ok = false
+        val p = strict(substitute(general[i], owner, type_args))
+        val a = strict(specific[i])
+        if ok && !unify(c, p, if subtypes then upcast(c, a, p) else a) then ok = false
     restore_vars(c, saved)
     ok
 
@@ -7283,14 +7291,7 @@ private comprehension_call(c: *Checker, at: Span, source_span: Span, receiver: &
     call_method(c, at, source_span, receiver, name, ms, args, None, expected, false)
 
 /** The methods of `name` a call on a value of type `t` chooses among, as a call written out sees them. */
-private comprehension_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
-    if *t is Class(k, _, _)
-        val ms = methods_named(c, k, name)
-        if ms.len() > 0 then return ms
-    if *t is TypeVar(_, _, _)
-        val ms = bound_methods(c, t, name)
-        if ms.len() > 0 then return ms
-    visible_methods(c, receiver_methods(c, t, name))
+private comprehension_methods(c: *Checker, t: &Type, name: string) -> Buf[usize] = methods_of(c, t, name)
 
 /** Evaluates `value` into a new hidden local `name` of type `ty`, adding the binding to `lets`. */
 private hold(c: *Checker, at: Span, name: string, ty: &Type, value: &TExpr, lets: *Buf[&TExpr])
@@ -7852,7 +7853,7 @@ private literal_preferred(c: *Checker, ids: Buf[usize], compared: Buf[Buf[&Type]
     val a = preferred[0]
     for b in 0..<ids.len()
         if a != b
-            if !accepts(c, rest[b], c.symbols[ids[b]].type_owner, c.symbols[ids[b]].type_params.len(), rest[a]) then return None
+            if !accepts_conforming(c, rest[b], c.symbols[ids[b]].type_owner, c.symbols[ids[b]].type_params.len(), rest[a]) then return None
     Some(ids[a])
 
 // The type an integer literal, possibly negated, has where nothing else decides it.
@@ -7892,7 +7893,7 @@ private most_specific(c: *Checker, ids: Buf[usize], compared: Buf[Buf[&Type]]) -
         var wins = true
         for b in 0..<ids.len()
             if a != b && wins
-                if !accepts(c, compared[b], c.symbols[ids[b]].type_owner, c.symbols[ids[b]].type_params.len(), compared[a]) then wins = false
+                if !accepts_conforming(c, compared[b], c.symbols[ids[b]].type_owner, c.symbols[ids[b]].type_params.len(), compared[a]) then wins = false
         if wins then best.push(ids[a])
     if best.len() == 1 then Some(best[0]) else None
 
@@ -7914,7 +7915,8 @@ private fits_call(c: *Checker, s: Signature, binding: Binding, args: Buf[Argumen
             // A sequence spliced into a repeated parameter is any `Iterable` of its elements.
             val spliced = args[j].value.kind is Splice(_)
             if ok && !(*t.ty is Nothing)
-                val agrees = if mentions_open(p, &open) || spliced then constrain(c, p, strict(t.ty), &open, true) else unify(c, p, strict(t.ty))
+                // An argument of a subtype, or of a covariant instance, fits as it would the call.
+                val agrees = if mentions_open(p, &open) || spliced then constrain(c, p, strict(t.ty), &open, true) else fits(c, strict(t.ty), p)
                 if !agrees then ok = false
     for j in 0..<args.len()
         if ok && typed[j] is None
