@@ -545,9 +545,11 @@ Arrays and strings are made by the runtime, which makes the fence for them throu
 string after its bytes are written, `avin_rt_new_array` after the array's length and zero bytes, and
 a slice after its elements are copied, as are the runtime's lock and condition objects. A string
 writer's storage is never handed out, so filling it needs none. The elements the library stores into
-a new array after `avin_rt_new_array` returns are ordered only by the next fence its thread makes: a
-`Vector`'s constructor makes one after its array is filled, and `Array.fill` and `Array.tabulate`
-make none of their own.
+a new array after `avin_rt_new_array` returns are published by the library: the intrinsic
+`array_publish`, which only the core library may declare, lowers to the same `fence release` and
+ends the fill in `Array.fill`, `Array.tabulate`, `Deque.toArray` and the growth of a buffer's or a
+deque's array. An array filled and then wrapped in a `Vector` is covered by the vector's
+constructor. A function that fills a new array and lets it escape ends the fill with `publish`.
 
 **Atomics.** `avin.threads.Atomic[T]` holds its value as its first field and declares `load`,
 `store`, `swap` and `compareAndSet` as the intrinsics `atomic_load`, `atomic_store`, `atomic_swap`
