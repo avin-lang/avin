@@ -426,7 +426,12 @@ Two options whose arguments are both pointer-shaped share the one form, so their
 `Any`; lowering makes it nothing for a value already kept as a reference to an object with a
 descriptor (a string, a tuple, a `data` value, an object, a closure), and for a number, `char` or
 `bool` a new one-field object whose descriptor is that type's box descriptor; `unit` has one
-constant box. A **type record** per type is constant data that every descriptor of the type names,
+constant box. A built-in value or a tuple converts to a trait it implements the same way (`to_trait`
+in the checker, which overload resolution also accepts through `boxes_to`): a box descriptor holds
+its type's method table, each entry an adapter that reads the value out of the box (and boxes a
+`Self` result) before calling the built-in's method, and a tuple's descriptor holds its table
+directly. Tables of boxes, tuples and strings are filled as calls through new positions appear, as
+data types' are. A **type record** per type is constant data that every descriptor of the type names,
 at offset 56: the number of the type's ancestors and their records' addresses. A class's ancestors
 are its superclasses and every trait it and they conform to, with their type arguments as it sees
 them; a tuple's are the tuple types its parts' ancestors make, one combination at a time. A type
@@ -436,8 +441,10 @@ with the target's record; for an open class, a trait, an instance of a type with
 contravariant parameter, or a tuple with a part of one, a call of the runtime's `avin_rt_conforms`, which
 scans the record's ancestors, so the test costs the number of ancestors. A generic instance is its
 own type with its own record, so `Box[int]` and `Box[string]` differ by address. Strings are made by
-the runtime as well as written as literals, so a string's descriptor names no record, and a null
-record is the mark of a string. Closures and the boxes of captured variables share one record no
+the runtime as well as written as literals, so the program emits one descriptor for every string
+(`string_descriptor`), naming the record of `string` and holding its method table; its literals
+name it, and `main` hands it to the runtime (`avin_rt_string_descriptor`) before anything else, so
+the strings the runtime makes have it too. Closures and the boxes of captured variables share one record no
 type pattern names. A type pattern on a value whose static type already conforms to the target tests
 nothing, and on a value of another value type (possible only in a copy of generic code) never
 matches.
@@ -456,8 +463,8 @@ and for a tuple or data type a function lowering makes per instance, comparing v
 fields; the hash likewise, combining tag and field hashes. A type record also holds two **equality
 entries** after the ancestor count (offsets 8 and 16): its type's `equals` on two objects and `hash` on
 one, compared as exactly that type. `==` on `Any`, a trait type or an open class calls one generated
-function that loads both records, answers false when they differ, compares strings (null record) by
-bytes, and otherwise calls the record's entry; the hash reads the entry the same way. The entries are
+function that loads both records, answers false when they differ, compares strings (the record of
+`string`) by bytes, and otherwise calls the record's entry; the hash reads the entry the same way. The entries are
 made for every record an object can have, once a program makes such a comparison at all; making them
 can lay out more types, so lowering repeats until no record lacks them.
 

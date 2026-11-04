@@ -257,6 +257,12 @@ How a value is boxed is the compiler's choice, and invisible except in cost. A s
 number, a `char`, a `bool` and `unit` get one. A tuple's type at run time is the type it was made
 with: `(animal, 1)` with `animal: Animal` is an `(Animal, int)`, whatever class the animal is.
 
+A value of a built-in type or a tuple converts the same way to a trait it implements, at the same
+sites: `val shown: Vector[Display] = [1, "two", (3, 4)]`, `describe(d: Display)` called as
+`describe(42)`. Calls through the trait reach the type's own implementation, and a type pattern
+recovers the value: `d match n: int -> …`. An overload taking the value's own type is more specific
+than one taking a trait it implements.
+
 An `Any` has no equality and no identity: `==`, `!=`, `===` and `!==` are not defined on it, since
 it may hold a value with neither. A type pattern recovers the value's type, and with it the
 comparisons that type has.

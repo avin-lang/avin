@@ -235,6 +235,8 @@ lower_program(program: TProgram) -> MirProgram
         if k.table.len() > generic_base then generic_base = k.table.len()
     for d in program.data
         if d.table.len() > generic_base then generic_base = d.table.len()
+    for b in program.builtins
+        if b.table.len() > generic_base then generic_base = b.table.len()
     var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false)
     // Record 0 is for the objects no type pattern names: closures, and the boxes of captured
     // variables.
@@ -270,6 +272,7 @@ lower_program(program: TProgram) -> MirProgram
             if s.module_name == "avin.process" && s.name == "args" && s.params.len() == 0 && s.owner_class is None && s.receiver is None
                 entry_arguments = Some(instance(&l, i, buf()))
                 break
+    val strings = string_descriptor(&l)
     var tests: Buf[usize] = buf()
     for t in program.tests
         tests.push(instance(&l, t.symbol, buf()))
@@ -290,7 +293,7 @@ lower_program(program: TProgram) -> MirProgram
     add_variant_ancestors(&l)
     functions = devirtualize(functions, l.descriptors, dispatch_sites(&l))
     functions = scalar_replace(functions, l.descriptors)
-    MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, tests, program.testing, entry_arguments)
+    MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, tests, program.testing, entry_arguments, strings)
 
 /** Whether a function belongs to the core library's module, `avin`, or one under it. */
 private in_core_library(program: TProgram, id: usize) -> bool
@@ -337,7 +340,7 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
             val call = call_entry(l, t)
             for v in 0..<d.variants.len()
                 variants.push(variant_layout(l, key + "." + d.variants[v].name, v, variant_fields(d, id, v, args), true, methods, record, call))
-        Tuple(items) -> variants.push(variant_layout(l, key, 0, items, true, buf(), record, None))
+        Tuple(items) -> variants.push(variant_layout(l, key, 0, items, true, method_table(l, t), record, None))
         Class(id, _, args) ->
             if is_array_class(l.program.classes[id])
                 // An array's descriptor gives the size of an element; the elements follow the length.
@@ -415,7 +418,8 @@ private method_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
 // trait's default body takes the object itself.
 private table_entry(l: *Lowering, t: &Type, m: usize, type_args: Buf[&Type], position: usize) -> usize
     val code = instance(l, m, type_args)
-    if !pointer_option(l, t) || is_trait_method(l, l.program.symbols[m]) then return code
+    if is_trait_method(l, l.program.symbols[m]) then return code
+    if !pointer_option(l, t) && !value_boxed(l, t) then return code
     val key = s"adapter ${instance_key(m, type_args, false)}"
     if l.instance_index.get(key) is Some(index) then return index
     val symbol = l.program.symbols[m]
@@ -433,6 +437,10 @@ private table_entry(l: *Lowering, t: &Type, m: usize, type_args: Buf[&Type], pos
     l.instance_index.put(key, index)
     l.adapters.put(index, TableAdapter(t, selfs, result))
     index
+
+/** Whether a value of type `t` is kept in a box when it is an `Any` or a trait's value: a built-in
+ * value that is no reference. */
+private value_boxed(l: *Lowering, t: &Type) -> bool = is_builtin(t) && !(machine(l, t) is Some(MRef))
 
 /** The method a trait `t` conforms to declares at checker position `position`, named `name`. */
 private trait_method_at(l: *Lowering, t: &Type, position: usize, name: string) -> Option[usize]
@@ -500,7 +508,7 @@ private fill_used_slots(l: *Lowering) -> bool
     val before = l.instances.len()
     for i in 0..<l.descriptors.len()
         val t = l.record_types[l.descriptors[i].record]
-        if !(*t is Data(_, _, _) || *t is Class(_, _, _)) then continue
+        if !(*t is Data(_, _, _) || *t is Class(_, _, _) || *t is Tuple(_) || is_builtin(t)) then continue
         if l.descriptors[i].call is None
             if call_entry(l, t) is Some(f) then l.descriptors[i].call = Some(f)
         val old = l.descriptors[i].methods
@@ -1010,6 +1018,16 @@ private class_ancestors(l: *Lowering, t: &Type, out: *Buf[&Type])
         out.push(parent)
         class_ancestors(l, parent, out)
 
+// Every string has the program's descriptor: the runtime's layout of a string, a length and then the
+// bytes, with no references, and the type record of `string` and its method table, so a string is a
+// value of `Any` and of each trait it implements as it is, with no box.
+private string_descriptor(l: *Lowering) -> usize
+    val record = record_of(l, Str)
+    val methods = method_table(l, Str)
+    val d = l.descriptors.len()
+    l.descriptors.push(Descriptor("string", 0, 8, buf(), false, methods, record, false, None))
+    d
+
 /** The descriptor of a box holding a value of the built-in type `t` as an `Any`; unit's is one
  * constant object. */
 private value_box(l: *Lowering, t: &Type) -> usize
@@ -1018,8 +1036,10 @@ private value_box(l: *Lowering, t: &Type) -> usize
     val size = machine(l, t) match
         Some(m) -> field_size(m)
         None -> 0
+    val record = record_of(l, t)
+    val methods = method_table(l, t)
     val d = l.descriptors.len()
-    l.descriptors.push(Descriptor("box of " + type_name(t), 0, size, buf(), size == 0, buf(), record_of(l, t), false, None))
+    l.descriptors.push(Descriptor("box of " + type_name(t), 0, size, buf(), size == 0, methods, record, false, None))
     l.boxes.put(key, d)
     d
 
@@ -1051,7 +1071,6 @@ private type_test(l: *Lowering, object: Operand, t: &Type) -> Operand
     l.insts.push(Offset(address, Value(descriptor), DescriptorRecord))
     val record = fresh(l, MPtr)
     l.insts.push(Load(record, Value(address)))
-    if *t is Str then return compare(l, CmpEq, Value(record), NullAddress)
     val index = record_of(l, t)
     val target = RecordAddress(index)
     if exact(l, t) then return compare(l, CmpEq, Value(record), target)
@@ -1095,7 +1114,7 @@ private add_variant_ancestors(l: *Lowering)
                 if a == target then listed = true
             if listed then continue
             val to = l.record_types[target]
-            if same_type(view_as(lowering_conformances(l), from, to), to)
+            if always_is(l, from, to) || same_type(view_as(lowering_conformances(l), from, to), to)
                 ancestors.push(target)
                 grew = true
         if grew then l.records.set(r, TypeRecord(l.records[r].name, ancestors, l.records[r].equals, l.records[r].hash))
@@ -1164,6 +1183,8 @@ private option_pointer(l: *Lowering, t: &Type, object: Operand) -> Operand
 // as variance allows, a tuple part by part.
 private always_is(l: *Lowering, from: &Type, to: &Type) -> bool
     if *to is AnyType || same_type(from, to) then return true
+    // A built-in value or a tuple is a value of each trait it conforms to, once boxed as one.
+    if (is_builtin(from) || *from is Tuple(_)) && *to is Class(_, _, _) then return meets_bound(lowering_conformances(l), from, to)
     if !is_reference(from) then return false
     same_type(view_as(lowering_conformances(l), from, to), to)
 
@@ -3068,29 +3089,45 @@ private lower_generated(l: *Lowering, inst: Instance) -> MirFunction
 // A method table's entry for an option kept as a pointer: each parameter its trait's method takes as
 // `Self` arrives as the object the option stands for and is passed on as the pointer, and a `Self`
 // result goes back as an object.
+// A boxed built-in value's entry takes the box where the method takes the value, reads the value
+// out, and boxes a `Self` result; an option kept as a pointer's converts between the object and the
+// pointer the same way.
 private lower_adapter(l: *Lowering, inst: Instance) -> MirFunction
     val shape = l.adapters.get(l.function_index).unwrap()
     val symbol = l.program.symbols[inst.function]
     l.subst = inst.type_args
     l.subst_owner = symbol.type_owner
+    val boxed = value_boxed(l, shape.option)
     val signature = signature_of(l, l.program.functions[inst.function])
+    var params: Buf[MirType] = buf()
     var given: Buf[Option[Operand]] = buf()
     for p in 0..<symbol.params.len()
-        given.push(param_machine(l, symbol, p) match
-            Some(m) -> Some(Value(fresh(l, m)))
+        val m = if boxed && shape.selfs[p] then Some(MRef) else param_machine(l, symbol, p)
+        given.push(m match
+            Some(m) ->
+                params.push(m)
+                Some(Value(fresh(l, m)))
             None -> None)
     var operands: Buf[Operand] = buf()
     for p in 0..<given.len()
-        if given[p] is Some(v) then operands.push(if shape.selfs[p] then option_pointer(l, shape.option, v) else v)
+        if !shape.selfs[p]
+            if given[p] is Some(v) then operands.push(v)
+        elif boxed
+            if unbox(l, shape.option, given[p].unwrap()) is Some(v) then operands.push(v)
+        elif given[p] is Some(v) then operands.push(option_pointer(l, shape.option, v))
     val dest = signature.result match
         Some(m) -> Some(fresh(l, m))
         None -> None
     push_call(l, dest, Direct(instance(l, inst.function, inst.type_args)), operands)
-    val result = dest match
-        Some(d) -> Some(if shape.result then option_object(l, shape.option, Value(d)) else Value(d))
+    var result = dest match
+        Some(d) -> Some(Value(d))
         None -> None
+    if shape.result
+        result = if boxed then box_value(l, shape.option, result) else Some(option_object(l, shape.option, result.unwrap()))
+    var returned = signature.result
+    if boxed && shape.result then returned = Some(MRef)
     finish(l, Return(result))
-    MirFunction("avin.adapter." + function_symbol(l.program, inst.function, inst.type_args), signature, l.values, l.slots, l.blocks)
+    MirFunction("avin.adapter." + function_symbol(l.program, inst.function, inst.type_args), MirSignature(params, returned), l.values, l.slots, l.blocks)
 
 private pair(m: MirType) -> Buf[MirType]
     var out: Buf[MirType] = buf()
@@ -3229,7 +3266,7 @@ private any_equals(l: *Lowering, a: Operand, b: Operand)
     continue_if(l, compare(l, CmpEq, record, object_record(l, b)), unequal)
     val strings = new_block(l)
     val others = new_block(l)
-    finish_into(l, Branch(compare(l, CmpEq, record, NullAddress), strings, others), strings)
+    finish_into(l, Branch(compare(l, CmpEq, record, RecordAddress(record_of(l, Str))), strings, others), strings)
     finish(l, Return(Some(compare_values(l, Equal, Str, a, b))))
     l.current = others
     val code = record_entry(l, record, RecordEqualsEntry)
@@ -3241,7 +3278,7 @@ private any_hash(l: *Lowering, a: Operand)
     val record = object_record(l, a)
     val strings = new_block(l)
     val others = new_block(l)
-    finish_into(l, Branch(compare(l, CmpEq, record, NullAddress), strings, others), strings)
+    finish_into(l, Branch(compare(l, CmpEq, record, RecordAddress(record_of(l, Str))), strings, others), strings)
     finish(l, Return(Some(runtime_call(l, "avin_rt_string_hash", [MRef], MInt(64), [a]))))
     l.current = others
     val code = record_entry(l, record, RecordHashEntry)

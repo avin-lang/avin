@@ -937,7 +937,8 @@ private accepting(c: *Checker, general: Buf[&Type], owner: usize, type_params: u
     for i in 0..<general.len()
         val p = strict(substitute(general[i], owner, type_args))
         val a = strict(specific[i])
-        if ok && !unify(c, p, if subtypes then upcast(c, a, p) else a) then ok = false
+        // A built-in value or a tuple is a value of each trait it implements, boxed as one.
+        if ok && !unify(c, p, if subtypes then upcast(c, a, p) else a) && !(subtypes && boxes_to(c, a, p)) then ok = false
     restore_vars(c, saved)
     ok
 
@@ -5788,7 +5789,7 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
     val want = expected match
         Some(w) -> w
         None -> return check_form(c, e, None, used)
-    if !(*zonk(c, want) is AnyType) then return check_form(c, e, expected, used)
+    if !(*zonk(c, want) is AnyType) then return to_trait(c, check_form(c, e, expected, used), zonk(c, want))
     val passes = e.kind is Block(_, _) || e.kind is If(_, _, _) || e.kind is Match(_, _) || e.kind is While(_, _, _) || e.kind is Loop(_) || e.kind is DoWhile(_, _, _)
     to_any(c, check_form(c, e, if passes then expected else None, used))
 
@@ -5801,6 +5802,22 @@ private to_any(c: *Checker, typed: &TExpr) -> &TExpr
         return typed
     if *t is AnyType || *t is Nothing || *t is ErrorType || *t is ByName(_) then return typed
     TExpr(typed.span, AnyType, Box(typed))
+
+// A built-in value or a tuple expected as a trait it conforms to converts to it where it is written:
+// it is put in a box, as for `Any`, whose method table holds the type's implementations. A data value
+// and an object already are values of every trait they conform to.
+private to_trait(c: *Checker, typed: &TExpr, want: &Type) -> &TExpr
+    if !is_trait_type(c, want) then return typed
+    val t = zonk(c, typed.ty)
+    if !(is_builtin(t) || *t is Tuple(_)) then return typed
+    if !conforms_to_bound(c, t, want) then return typed
+    TExpr(typed.span, want, Box(typed))
+
+/** Whether a value of type `t` converts to `want` by being boxed as a trait's value: see `to_trait`. */
+private boxes_to(c: *Checker, t: &Type, want: &Type) -> bool
+    val x = zonk(c, t)
+    val w = zonk(c, want)
+    is_trait_type(c, w) && (is_builtin(x) || *x is Tuple(_)) && conforms_to_bound(c, x, w)
 
 private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -> &TExpr
     if completing_expr(c, e) then return TExpr(e.span, ErrorType, UnitConst)
@@ -7299,6 +7316,9 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
         val y = zonk(c, typed[1].ty)
         if *x is AnyType && settled(y) && !(*y is AnyType) then typed.set(1, to_any(c, typed[1]))
         elif *y is AnyType && settled(x) && !(*x is AnyType) then typed.set(0, to_any(c, typed[0]))
+        // and between a trait's value and a built-in value or a tuple implementing it, as the trait's.
+        elif settled(y) then typed.set(1, to_trait(c, typed[1], x))
+        if settled(x) then typed.set(0, to_trait(c, typed[0], zonk(c, typed[1].ty)))
     for i in 0..<ops.len()
         compare_link(c, ops[i], typed[i], typed[i + 1])
     var ty: &Type = Bool
@@ -8596,12 +8616,14 @@ private fits_call(c: *Checker, s: Signature, binding: Binding, args: Buf[Argumen
             val spliced = args[j].value.kind is Splice(_)
             if ok && !(*t.ty is Nothing)
                 // An argument of a subtype, or of a covariant instance, fits as it would the call.
-                val agrees = if mentions_open(p, &open) || spliced then constrain(c, p, strict(t.ty), &open, true) else fits(c, strict(t.ty), p)
+                val agrees = if mentions_open(p, &open) || spliced then constrain(c, p, strict(t.ty), &open, true) else fits(c, strict(t.ty), p) || boxes_to(c, strict(t.ty), p)
                 if !agrees then ok = false
     for j in 0..<args.len()
         if ok && typed[j] is None
             val p = zonk(c, strict(argument_type(c, s, params, binding, args, j).unwrap()))
-            if !open_argument_fits(argument_value(args[j]), p) then ok = false
+            val value = argument_value(args[j])
+            val boxed = is_literal(value) && boxes_to(c, literal_own_type(value), p)
+            if !boxed && !open_argument_fits(value, p) then ok = false
     restore_vars(c, saved)
     ok
 
@@ -9608,6 +9630,7 @@ private check_arguments(c: *Checker, args: Buf[Argument], wanted: Buf[Option[&Ty
                         // once, at the call, by one that takes it strictly.
                         if param is Some(p)
                             if *given.ty is ByName(_) && !(*zonk(c, p) is ByName(_)) then t = evaluated(given)
+                            t = to_trait(c, t, zonk(c, p))
                             val agrees = *t.ty is Nothing || constrain(c, p, t.ty, open, true)
                             if !agrees
                                 c.note(unit_of(c), value.span, mismatch(c, zonk(c, p), t.ty))
@@ -9635,7 +9658,13 @@ private local_use(c: *Checker, id: usize, at: Span)
 // A function used as a value by name. An overloaded name takes its overload from the expected
 // function type: of the overloads whose parameters accept that type's, the most specific.
 private named_function_value(c: *Checker, at: Span, name: string, explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
-    val ids = lookup_functions(c, name)
+    var ids = lookup_functions(c, name)
+    // Type arguments written on the name choose among the overloads with that many type parameters.
+    if explicit is Some(written)
+        var taking: Buf[usize] = buf()
+        for id in ids
+            if c.symbols[id].decl.type_params.len() == written.len() then taking.push(id)
+        if taking.len() > 0 then ids = taking
     if ids.len() == 1 then return function_value(c, at, ids[0], explicit, expected)
     val unit = unit_of(c)
     var wanted: Option[Buf[&Type]] = None
@@ -10517,6 +10546,8 @@ private may_match(c: *Checker, from: &Type, to: &Type) -> bool
     // or, for a contravariant parameter, supertypes.
     if !(*y is AnyType) && fits(c, y, x) then return true
     if variant_instances(c, x, y) then return true
+    // A trait's value may be a built-in value or a tuple that implements it.
+    if is_trait_type(c, x) && (is_builtin(y) || *y is Tuple(_)) then return conforms_to_bound(c, y, x)
     *x match
         Class(k, _, _) -> *y match
             Class(j, _, _) ->
