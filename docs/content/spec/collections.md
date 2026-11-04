@@ -387,9 +387,9 @@ arrays at its two edges and shares the rest, so it takes time in the depth of th
 length of the slice.
 
 Every array in a vector's tree is exactly the size it holds and is never written once it is in the
-tree. Each is written before the object that holds it is made, and a constructor ends with the
-release fence [threads](/spec/threads/) describe, so a vector made by one thread is whole to any
-other thread that reads it.
+tree. The library ends the filling of each with a release fence, before the array is stored in
+another, and the vector's constructor ends with the fence [threads](/spec/threads/) describe, so a
+vector made by one thread is whole to any other thread that reads it.
 
 | Operation | Cost |
 |---|---|
