@@ -70,6 +70,20 @@ literal in a `byte` context must be in 0–255: `val mask: byte = 0xf0`.
 except `!=`. There is no implicit fused multiply-add. `char` supports ordering and equality but no
 arithmetic; `int(c)` and `char(n)` convert.
 
+A `char` has these methods, classifying by the Unicode Character Database:
+
+| Method | Meaning |
+|---|---|
+| `isDigit()` | A decimal digit of any script (category `Nd`) |
+| `isLetter()` | A letter of any script (categories `Lu`, `Ll`, `Lt`, `Lm`, `Lo`) |
+| `isLetterOrDigit()` | `isLetter()` or `isDigit()` |
+| `isWhitespace()` | A space separator other than the non-breaking ones (U+00A0, U+2007, U+202F), or U+0009 to U+000D, or U+001C to U+001F; this is not `trim`'s test, which is the `White_Space` property and so counts U+00A0 |
+| `isSpaceChar()` | A character of category `Zs`, `Zl` or `Zp` |
+| `isUpper()`, `isLower()` | Cased and upper, cased and lower |
+| `isControl()` | U+0000 to U+001F and U+007F to U+009F |
+| `toUpper()`, `toLower()` | The simple case mapping, one character for one: `'ß'.toUpper()` is `'ß'` |
+| `asDigit()` | The digit's value in radix 36: a decimal digit of any script gives its value, an ASCII or fullwidth letter, either case, gives 10 to 35; any other character gives -1 |
+
 ## string
 
 `string` is a built-in value type with no identity: two equal strings are interchangeable, and

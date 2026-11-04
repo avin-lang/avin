@@ -87,7 +87,7 @@ Their methods:
 
 | `Option[T]` | `Result[T, E]` |
 |---|---|
-| `isSome()`, `isNone()` | `isOk()`, `isErr()` |
+| `isDefined()`, `isEmpty()` | `isOk()`, `isErr()` |
 | `getOrElse(default: -> T) -> T` | `getOrElse(default: -> T) -> T` |
 | `orElse(other: -> Option[T]) -> Option[T]` | `ok() -> Option[T]`, `err() -> Option[E]` |
 | `map[U](f: (T) -> U) -> Option[U]` | `map[U](f: (T) -> U) -> Result[U, E]` |
@@ -103,8 +103,8 @@ Their methods:
 | `get() -> T`, trapping on `None` | |
 | `filterNot(p: (T) -> bool) -> Option[T]` | |
 
-An `Option[Option[T]]` also has `flatten()`. There is no `isDefined`, `isEmpty` or `nonEmpty`:
-`isSome()` and `isNone()` say it, and there is no `orNull`, since Avin has no null.
+An `Option[Option[T]]` also has `flatten()`, and an `Option` has `nonEmpty()` beside `isDefined()` and
+`isEmpty()`. There is no `orNull`, since Avin has no null.
 
 `exists` is false and `forall` true for `None` and for `Err`, which hold no value. `toList` and
 `toVector` give one element or none.

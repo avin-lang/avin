@@ -181,6 +181,16 @@ a decision changes, this page and the chapter change together.
   `"-0"` is 0, and refuse white space, separators and overflow (`"-9223372036854775808"` is a
   `long`); `toReal` is correctly rounded, takes decimal only, and refuses white space, `nan`, `inf`,
   hexadecimal and a value too large to be finite. A refusal is `None`, never a trap.
+- Settled 2026-11-04: the core library follows the reference language's library in names and
+  behaviour unless it genuinely improves on it. `Option` has `isDefined`, `isEmpty` and `nonEmpty`
+  (not `isSome`/`isNone`), `get` (trapping on `None`) and `filterNot`; there is no `orNull`, since
+  there is no null. `char` has `isDigit`, `isLetter`, `isLetterOrDigit`, `isWhitespace`,
+  `isSpaceChar`, `isUpper`, `isLower`, `isControl`, `toUpper`, `toLower` and `asDigit`, classifying
+  by the Unicode Character Database. `isWhitespace` is true for the space separators except the
+  non-breaking ones (U+00A0, U+2007, U+202F) and for U+0009 to U+000D and U+001C to U+001F, so it
+  differs from `trim`'s `White_Space`; `isSpaceChar` is the categories `Zs`, `Zl` and `Zp`.
+  `asDigit` is the digit's value in radix 36 (Unicode decimal digits give their value, ASCII and
+  fullwidth letters give 10 to 35) and is -1 for any other character, never a trap.
 - A generic overload is compared by the same rule as any other: `f(x: int)` is more specific than
   `f[T](x: T)`, which accepts an `int` while `f(int)` does not accept a `T`.
 - Whether a parameter is by-name does not distinguish overloads. An argument some candidate takes by
@@ -834,13 +844,6 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
-- `char` methods ([types](/spec/types/#real-and-char)): `isDigit`, `isLetter`, `isLetterOrDigit`,
-  `isWhitespace`, `isUpper`, `isLower`, `isControl`, `toUpper`, `toLower` and `asDigit`, classifying
-  by the full Unicode Character Database. `isWhitespace` is the `White_Space` property (as `trim`
-  uses, so U+00A0 counts), `toUpper`/`toLower` are the simple mappings, and `asDigit` reads only
-  ASCII digits and letters (0 to 35) and traps otherwise. `isSpaceChar` is left out.
-- `Option.get` traps on `None`; `filterNot` is added; `isDefined`, `isEmpty`, `nonEmpty` and
-  `orNull` are not, since `isSome`/`isNone` exist and there is no null.
 - Literal shapes ([collections](/spec/collections/#literals)): each of the library's collections is
   built only by the literal of its own shape: every `Seq` by `[a, b]`, `Set`, `TreeSet` and the
   mutable `Set` by `{a, b}`, and `Map`, `TreeMap` and the mutable `Map` by `{k: v}`, so

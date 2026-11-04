@@ -167,7 +167,7 @@ var slot0: Option[F0] = None                   // one slot per field, each at it
 var slot1: Option[F1] = None
 while b.next(VARIANT)? is Some(i)
     i match
-        0 -> if slot0.isSome() then return Err(b.duplicate(FIELD_0))
+        0 -> if slot0.isDefined() then return Err(b.duplicate(FIELD_0))
              else slot0 = Some(b.field[F0](FIELD_0)?)
         1 -> …
 val x0 = slot0 or else field 0's default or else b.missing[F0](FIELD_0)?
