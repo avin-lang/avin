@@ -56,7 +56,7 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
 - So code that knows it has a `List` gets a `List` back, and generic code over `Iterable` gets an
   `Iterable` whose run-time type is still the concrete collection.
 - `xs.view()` returns a lazy `Iterator`, for pipelines that should not build intermediate
-  collections.
+  collections (see [views](#methods-every-iterable-has) below).
 - Operations that need something of the elements are added by impls bounding the element type, so
   a collection has them only where its elements do. `mkString` joins elements that have `Display`
   into a string: `mkString(sep = ", ")` separates them, `mkString(start, sep, end)` also brackets
@@ -113,6 +113,7 @@ Collections they make are vectors, maps and sets; n is the number of elements.
 | `toMap()`, on pairs | `Map[K, V]`, a later key's value replacing | O(n) |
 | `zipWithIndex()` | `Vector[(T, int)]`, positions from 0 | O(n) |
 | `collectFirst(pf)` | `Option[B]` | O(n) |
+| `view()` | `Iterator[T]`, lazy; see below | O(1) |
 
 Each group of `groupBy` and `groupMap` keeps its elements' order; `groupMapReduce` combines a key's
 values in that order, so `words.groupMapReduce(w -> w.take(1), w -> 1, (a, b) -> a + b)` counts the
@@ -124,13 +125,26 @@ val (small, large) = [5, 12, 3, 40].partition(x -> x < 10)    // [5, 3], [12, 40
 ["b", "a"].zipWithIndex()                                      // [("b", 0), ("a", 1)]
 ```
 
-**An iterator's transformations are lazy.** `Iterator` itself has `map(f)`, `filter(p)`, `take(n)`,
-`drop(n)`, `takeWhile(p)`, `dropWhile(p)`, `zip(other)` with another iterator, and `zipWithIndex()`,
-each answering an iterator that reads its source only as far as its own `hasNext()` and `next()` ask:
-`it.map(f).take(2).toVector()` calls `f` twice however long `it` is. `drop(n)` skips when the first
-element is asked for, `zip` ends with the shorter side, and `zipWithIndex` here is an
-`Iterator[(T, int)]` rather than a vector. The new iterator shares its source, which must not then be
-read on its own.
+**An iterator's transformations are lazy.** `Iterator` itself has `map(f)`, `filter(p)`,
+`flatMap(f)`, `collect(pf)`, `take(n)`, `drop(n)`, `takeWhile(p)`, `dropWhile(p)`, `zip(other)` with
+any collection, and `zipWithIndex()`, each answering an iterator that reads its source only as far as
+its own `hasNext()` and `next()` ask: `it.map(f).take(2).toVector()` calls `f` twice however long `it`
+is. `drop(n)` skips when the first element is asked for, `flatMap` calls `f` on an element only once
+the collection made of the one before is used up, `zip` ends with the shorter side, and
+`zipWithIndex` here is an `Iterator[(T, int)]` rather than a vector. The new iterator shares its
+source, which must not then be read on its own. `withFilter(p)` is its `filter(p)`, already lazy, so a
+comprehension over an iterator is an iterator, read element by element.
+
+**A view is an iterator.** `xs.view()`, on every collection, is `xs.iterator()` taken as the start of
+a lazy pipeline: nothing is computed until the view is read, each element is computed once as it is
+read, and no intermediate collection is made. `toVector()`, `toList()` and the other conversions, or
+any method every `Iterable` has, force it. A view is single-pass like any iterator, and it reads its
+source as it goes, so a mutable source changed before the view is read is seen changed.
+
+```text
+(1..1000000000).view().filter(isPrime).map(x -> x * x).take(3).toList()   // reads up to 5
+map.view().filter(e -> e.1 > 0).map(e -> e.0).toVector()                     // a map's entries as pairs
+```
 
 ## Methods every Seq has
 
