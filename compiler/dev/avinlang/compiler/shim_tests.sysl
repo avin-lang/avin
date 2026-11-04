@@ -3,7 +3,7 @@ module dev.avinlang.compiler
 
 import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
-import sysl.fs.{metadata, read_text}
+import sysl.fs.{make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, write_text}
 
 // The shims of Sysl bindings: where each binding's part of the generated source is, and the cache of
 // built archives.
@@ -130,6 +130,51 @@ shim_cache()
     // Another binding is another archive.
     val other = compiled("@sysl(\"sysl.text.to_upper\")\nlower(s: string) -> string\n\nmain() = 0\n")
     assert(other.archive.unwrap() != archive)
+
+@test("the shim package's manifest names each Sysl package a program's manifests name")
+shim_manifest_sysl_packages()
+    var sysl: Buf[SyslPackage] = buf()
+    sysl.push(SyslPackage("regex", Git("github.com/sysl-lang/regex", "0.2.0")))
+    sysl.push(SyslPackage("orbits", Rev("github.com/o/orbits", "3f9a2c1")))
+    sysl.push(SyslPackage("digits", Local("/work/sysl \"digits\"")))
+    val text = shim_manifest("/rt", sysl)
+    assert(text.contains("  avin-runtime { path = \"/rt\" }\n"))
+    assert(text.contains("  regex { git = \"github.com/sysl-lang/regex\", version = \"0.2.0\" }\n"))
+    assert(text.contains("  orbits { git = \"github.com/o/orbits\", rev = \"3f9a2c1\" }\n"))
+    assert(text.contains("  digits { path = \"/work/sysl \\\"digits\\\"\" }\n"))
+    assert(!shim_manifest("/rt", buf()).contains("regex"))
+
+// The key of one shim source built with the Sysl packages `sysl`.
+private key(sysl: Buf[SyslPackage]) -> string = shim_key(shim_manifest("/rt", sysl), "shim", "sysl 0.8.17", "runtime", sysl)
+
+private one(label: string, origin: Origin) -> Buf[SyslPackage]
+    var b: Buf[SyslPackage] = buf()
+    b.push(SyslPackage(label, origin))
+    b
+
+@test("a shim archive's key changes with a Sysl package's release, commit or directory sources, and with nothing else")
+shim_key_sysl_packages()
+    val dir = make_temp_dir("avin-shim-key").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/sysl.hocon", "package { name = \"d\", version = \"0.1.0\" }\n").unwrap()
+    write_text(dir + "/d.sysl", "module d\n\none() -> i32 = 1\n").unwrap()
+    write_text(dir + "/notes.txt", "not source\n").unwrap()
+    val released = key(one("regex", Git("github.com/sysl-lang/regex", "0.2.0")))
+    assert_eq(key(one("regex", Git("github.com/sysl-lang/regex", "0.2.0"))), released)
+    assert(key(one("regex", Git("github.com/sysl-lang/regex", "0.2.1"))) != released)
+    assert(key(one("regex", Rev("github.com/sysl-lang/regex", "3f9a2c1"))) != released)
+    assert(key(buf()) != released)
+    val local = key(one("d", Local(dir)))
+    // A file that is not source changes nothing; a source file does.
+    write_text(dir + "/notes.txt", "still not source\n").unwrap()
+    assert_eq(key(one("d", Local(dir))), local)
+    write_text(dir + "/d.sysl", "module d\n\none() -> i32 = 2\n").unwrap()
+    assert(key(one("d", Local(dir))) != local)
+    // A package's working directory is not its source.
+    make_dir_all(dir + "/.sysl").unwrap()
+    val changed = key(one("d", Local(dir)))
+    write_text(dir + "/.sysl/build.sysl", "module scratch\n").unwrap()
+    assert_eq(key(one("d", Local(dir))), changed)
 
 @test("a program without bindings links the runtime's own archive")
 no_shims()

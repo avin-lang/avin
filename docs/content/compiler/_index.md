@@ -103,7 +103,10 @@ its array and of the vector, in an order the binding's `Crossing` records. Since
 program lists every binding of the functions it compiles, with how each value crosses.
 
 For a program with bindings, the driver generates one Sysl module, `avin.shims`, in a package whose
-manifest depends on the runtime's package. Each binding gets an import of its Sysl function under a
+manifest depends on the runtime's package and on every Sysl package that the `sysl-dependencies` of
+the program's packages name: loading a package gathers them over its whole dependency graph, a
+directory made absolute and two releases of one name reduced to the higher, and the program carries
+them to the build. Each binding gets an import of its Sysl function under a
 private name, and an exported shim that converts each argument (a `bool` arrives as a byte, a `char`
 as its code point, a `string` is copied into a Sysl `string`), calls the function with the result
 declared at the binding's type, and converts the result back (a `string` is copied into a new Avin
@@ -132,9 +135,11 @@ own lines, reported at its declaration as `the Sysl mirror \`Name\` does not mat
 
 The archive is cached under `shims/` in the user's cache for this compiler version
 (`~/Library/Caches/avin/<version>` on macOS, `AVIN_CACHE` when it is set), never in the toolchain's
-root, which an installed compiler only reads. It is named by a SHA-256 of the manifest, the shim
-source, the `sysl --version` output and the runtime's source files, each named by its path in the
-runtime. A build with
+root, which an installed compiler only reads. It is named by a SHA-256 of the manifest, which names each Sysl package
+at its release or commit, the shim source, the `sysl --version` output, the runtime's source files,
+each named by its path in the runtime, and the source files of each Sysl package named by directory;
+a package's source files are its Sysl, manifest, sum and C files, outside its `.sysl` working
+directory. The executables `avin run` and `avin test` cache are keyed by the same Sysl packages. A build with
 the same bindings finds it there and runs no Sysl build; it is built under a temporary name and
 published by rename, so concurrent builds never see a partial archive. The `check` command builds
 the shims too, since only Sysl can say whether a binding is right.
@@ -440,7 +445,10 @@ final class, a `data` type, a tuple of such, each with only invariant parameters
 with the target's record; for an open class, a trait, an instance of a type with a covariant or
 contravariant parameter, or a tuple with a part of one, a call of the runtime's `avin_rt_conforms`, which
 scans the record's ancestors, so the test costs the number of ancestors. A generic instance is its
-own type with its own record, so `Box[int]` and `Box[string]` differ by address. Strings are made by
+own type with its own record, so `Box[int]` and `Box[string]` differ by address. A closure's
+descriptor names the record of its function's own type in the copy it was made from, and a function
+type, whose parameters and result vary and which a class may extend, is always tested through
+`avin_rt_conforms`. Strings are made by
 the runtime as well as written as literals, so the program emits one descriptor for every string
 (`string_descriptor`), naming the record of `string` and holding its method table; its literals
 name it, and `main` hands it to the runtime (`avin_rt_string_descriptor`) before anything else, so

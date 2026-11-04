@@ -109,7 +109,11 @@ StringContext(["text ", " and ", ""]).p(a, b + 1)
   own form.
 
 A program adds its own interpolator by giving `StringContext` a method through a trait it declares
-and an `impl` of that trait. The interpolator is available wherever the trait is imported:
+and an `impl` of that trait. The interpolator is available wherever it is imported: in the module that
+declares it, in a file that imports that module (`import sql`), and in a file that imports one of its
+declarations by name (`import sql.{Query}`). Importing a module that itself imports `sql` does not
+bring `sql"…"` into scope, and `s`, `f` and `raw` need no import. Using an interpolator that is not
+in scope is an error that names the module to import:
 
 ```text
 trait SqlInterpolation
