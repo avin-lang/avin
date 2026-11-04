@@ -1,18 +1,45 @@
 ---
 title: Getting started
-summary: Build the compiler, run a program, and run the tests.
+summary: Install Avin, run a program, and run the tests.
 weight: 5
 ---
 
 Avin is early in its [roadmap](/compiler/roadmap/): the compiler builds whole programs to native
 executables, but the language it accepts is still a small part of the [specification](/spec/).
 
-## Prerequisites
+## Install
+
+On an Apple silicon Mac, with Homebrew:
+
+```sh
+brew install avin-lang/tap/avin
+avin --version
+```
+
+The release is also a tarball, `avin-<version>-darwin-arm64.tar.gz`, laid out as a prefix: put its
+`bin/` on your `PATH`, and `avin` finds the standard library and runtime in `share/avin` beside
+itself, through any symbolic link to it. It never writes there: the runtime archives and binding
+shims it builds are kept in `~/Library/Caches/avin/<version>` (`$XDG_CACHE_HOME/avin` or
+`~/.cache/avin` elsewhere; `AVIN_CACHE` names another directory), and a program's executables in
+`.avin/` beside the program.
+
+What an installed `avin` runs:
+
+- **clang**, which links every program: Xcode's command-line tools (`xcode-select --install`)
+  provide it.
+- **sysl**, which builds the shims of the Sysl bindings a program reaches, and the runtime archive
+  when the shipped one does not match the runtime's sources. A program that reaches no binding needs
+  no Sysl at all, since the runtime ships prebuilt; the standard library's string case mapping,
+  files, processes and threads are bindings. Homebrew installs it with Avin.
+
+A missing tool is reported by name, with what installs it.
+
+## Build from source
+
+Working on the compiler, the library or the runtime needs:
 
 - Sysl 0.8.13, with a checkout of `parsing` at `../sysl-lang/` relative to the repository
 - clang on `PATH`
-
-## Build and run
 
 From the repository root:
 
@@ -23,8 +50,9 @@ sysl build compiler -o compiler/avin
 ```
 
 `avin build file.avin` writes `./file`, and `-o` chooses another path. `avin check` checks a program
-without building it, and `avin emit-llvm file.avin -o file.ll` writes its LLVM IR. The compiler finds
-the standard library and runtime beside itself; `AVIN_ROOT` names another location.
+without building it, and `avin emit-llvm file.avin -o file.ll` writes its LLVM IR. A checkout's
+`compiler/avin` finds the standard library and runtime in the checkout; `AVIN_ROOT` names another
+location, and is only for development: an installed `avin` needs no setting.
 
 `avin run` builds a program and runs it in one step:
 
