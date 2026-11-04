@@ -239,6 +239,17 @@ a decision changes, this page and the chapter change together.
   The ordered operations keep their names, `first`, `last`, `floor`, `ceiling`, `from`, `until`,
   `range` (from inclusive, until exclusive) and `reverseIterator`; the tree is balanced by weight,
   each side at most three times the other.
+- Settled by the user 2026-11-04: the elementary functions are a module, `avin.math` ([system library](/spec/system-library/#avin-math)),
+  with the reference library's names, called as `math.sqrt(x)` after `import avin.math` or imported
+  by name: `Pi` and `E`; `sqrt`, `cbrt`, `exp`, `expm1`, `log` (natural), `log10`, `log1p`, `pow`,
+  `hypot`; `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2(y, x)`, `sinh`, `cosh`, `tanh`;
+  `floor`, `ceil`, `rint` (ties to even), `abs`, `max`, `min` (NaN when either is, `-0.0` below
+  `0.0`), `signum`, `toRadians` and `toDegrees`. All take and give `real`, follow IEEE 754 and
+  never trap: `sqrt(-1.0)` is NaN, `log(0.0)` negative infinity. Not methods on `real`, and no
+  integer overloads of `abs`, `max` and `min` yet; the reference's `round`, which answers a `long`,
+  is left out until real-to-integer rounding is decided with the conversions. Bindings: one
+  runtime function per function, over the methods of Sysl's `Float` on `real`, since a binding names
+  a function and these are methods.
 - A generic overload is compared by the same rule as any other: `f(x: int)` is more specific than
   `f[T](x: T)`, which accepts an `int` while `f(int)` does not accept a `T`.
 - Whether a parameter is by-name does not distinguish overloads. An argument some candidate takes by
@@ -1422,17 +1433,6 @@ Settled by the user on 2026-11-04:
   call with "`Name` is closed"; a handle never closed is given back by a finalizer when the
   collector frees it. A handle crosses back into Sysl only as the receiver of its own methods,
   compares by identity, and has no `Display`.
-- **The elementary functions are a module, `avin.math`** ([system library](/spec/system-library/#avin-math)),
-  with the reference library's names, called as `math.sqrt(x)` after `import avin.math` or imported
-  by name: `Pi` and `E`; `sqrt`, `cbrt`, `exp`, `expm1`, `log` (natural), `log10`, `log1p`, `pow`,
-  `hypot`; `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2(y, x)`, `sinh`, `cosh`, `tanh`;
-  `floor`, `ceil`, `rint` (ties to even), `abs`, `max`, `min` (NaN when either is, `-0.0` below
-  `0.0`), `signum`, `toRadians` and `toDegrees`. All take and give `real`, follow IEEE 754 and
-  never trap: `sqrt(-1.0)` is NaN, `log(0.0)` negative infinity. Not methods on `real`, and no
-  integer overloads of `abs`, `max` and `min` yet; the reference's `round`, which answers a `long`,
-  is left out until real-to-integer rounding is decided with the conversions. Bindings: one
-  runtime function per function, over the methods of Sysl's `Float` on `real`, since a binding names
-  a function and these are methods.
 
 ## Open
 
