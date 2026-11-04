@@ -1,0 +1,885 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+
+// Objects that never leave the function that makes them, kept as their fields.
+//
+// A data value, a tuple or an object of a class that is made in a function and never stored into
+// another object or a module-level value, never returned, never passed to a call and never compared
+// by identity is visible to nothing but that function, and so to one thread. Such an object needs no
+// heap memory, no header and no fence: each of its fields becomes a local slot of the function, a
+// field's load or store becomes the slot's, and a test of its descriptor reads the descriptor it was
+// made with. Its fields that hold references are local slots of reference type, which the frame plan
+// keeps as roots wherever they are live across a collection point, as it does any local variable.
+//
+// The pass runs on the finished program, after devirtualization, in three steps:
+//
+// - Inlining. A call is inlined where it makes such an object or is handed one: a call of a small
+//   function that returns an object it made, or of one that only reads, writes and returns the object
+//   it is passed. Which functions those are is found for the whole program at once, bottom up, from a
+//   summary of each function: whether what it returns is always an object it made, and for each
+//   parameter, whether it lets the object go anywhere but back to its caller. A function that may
+//   recur, directly or through other functions, is never inlined.
+// - Replacement. Within each function, the references that may stand for the same objects are
+//   grouped: a value, the local slots it is stored to and the values loaded back from them. A group
+//   made only by allocations, used only to reach fields, to read the descriptor and to compare with
+//   null, is replaced by its fields, provided that no two of its objects are ever in use at once: an
+//   allocation in a loop makes a new object each time round, and every reference read after it must be
+//   to that newest one.
+// - Fences. A fence that ends the making of an object is needed only if a store another thread could
+//   see was made since the last fence. Where the object it ended is now fields, and nothing else was
+//   stored to shared memory since, the fence goes.
+
+/** The most instructions, terminators included, a function may have and still be inlined. */
+const MaxInlineSize: usize = 80
+/** The most instructions inlining may add to one function. */
+const MaxGrowth: usize = 2000
+/** The most rounds of inlining in one function; each round can expose calls the next inlines. */
+const MaxRounds: usize = 8
+/** The most fields an object kept as its fields may have. */
+const MaxFields: usize = 32
+
+// What the analysis finds of a group of references, as bits.
+/** A reference of the group comes from something other than an allocation, a call or a parameter:
+ * a field, a module-level value, a constant or a call through a table. */
+private const Foreign: u32 = 1
+/** A parameter belongs to the group. */
+private const FromParam: u32 = 2
+/** An allocation of the function makes objects of the group. */
+private const Allocated: u32 = 4
+/** A call's result belongs to the group. */
+private const FromCall: u32 = 8
+/** A call's result belongs to the group, and the call is not of a small function that returns an
+ * object it made. */
+private const BadSource: u32 = 16
+/** A reference of the group is stored into memory other than a local slot, or used in any way other
+ * than reaching a field, reading the descriptor or comparing with null. */
+private const Escapes: u32 = 32
+/** A reference of the group is passed to a call. */
+private const Called: u32 = 64
+/** A reference of the group is passed to a call that would keep it, or that is not inlined. */
+private const BadUse: u32 = 128
+/** A reference of the group is returned. */
+private const Returned: u32 = 256
+/** The descriptor of an object of the group is read. */
+private const Described: u32 = 512
+
+/** What the whole program shows of each function: whether it may be inlined, whether what it
+ * returns is always an object it made, and for each parameter whether the function keeps it only
+ * where inlining can follow it. */
+private struct Summary
+    inlinable: Buf[bool]
+    fresh: Buf[bool]
+    param_ok: Buf[Buf[bool]]
+
+/** A load or store of a field of an object of a group, at a byte offset, of a machine type. */
+private struct Access
+    group: usize
+    offset: usize
+    ty: MirType
+
+/** The references of one function, grouped by the objects they may stand for. */
+private struct Analysis
+    /** The group of each value of reference type. */
+    value_group: Buf[Option[usize]]
+    /** The group of each local slot of reference type whose address is only loaded and stored. */
+    slot_group: Buf[Option[usize]]
+    flags: Buf[u32]
+    /** For each value that is the address of a field of a grouped object, its group. */
+    field_group: Buf[Option[usize]]
+    field_offset: Buf[usize]
+    accesses: Buf[Access]
+
+/** The program's functions with objects that never leave a function kept as their fields. */
+scalar_replace(functions: Buf[MirFunction], descriptors: Buf[Descriptor]) -> Buf[MirFunction]
+    val n = functions.len()
+    val cyclic = cyclic_functions(functions)
+    var inlinable: Buf[bool] = buf()
+    for i in 0..<n
+        inlinable.push(!cyclic[i] && size_of(functions[i]) <= MaxInlineSize)
+    val summary = summarize(functions, inlinable)
+    var out: Buf[MirFunction] = buf()
+    for i in 0..<n
+        val inlined = inline_for_objects(functions[i], functions, summary)
+        out.push(replace_objects(inlined, descriptors, summary))
+    remove_fences(out)
+
+/** The number of instructions of `f`, a terminator counting as one. */
+private size_of(f: MirFunction) -> usize
+    var n = 0usize
+    for block in f.blocks
+        n += block.insts.len() + 1
+    n
+
+/** For each function, whether it may call itself through direct calls, by itself or through others. */
+private cyclic_functions(functions: Buf[MirFunction]) -> Buf[bool]
+    val n = functions.len()
+    var starts: Buf[usize] = buf()
+    var edges: Buf[usize] = buf()
+    var own: Buf[bool] = buf()
+    for i in 0..<n
+        starts.push(edges.len())
+        var self_call = false
+        for block in functions[i].blocks
+            for inst in block.insts
+                if inst is Call(_, Direct(g), _)
+                    edges.push(g)
+                    if g == i then self_call = true
+        own.push(self_call)
+    starts.push(edges.len())
+    val component = components(n, starts, edges)
+    var members: Buf[usize] = buf()
+    for _ in 0..<n do members.push(0)
+    for i in 0..<n
+        members[component[i]] = members[component[i]] + 1
+    var out: Buf[bool] = buf()
+    for i in 0..<n
+        out.push(own[i] || members[component[i]] > 1)
+    out
+
+// The summaries only grow: a function is found to return objects it made, and a parameter to be
+// kept only where inlining can follow it, once what it calls is known to; nothing is ever taken back.
+private summarize(functions: Buf[MirFunction], inlinable: Buf[bool]) -> Summary
+    val n = functions.len()
+    var fresh: Buf[bool] = buf()
+    var param_ok: Buf[Buf[bool]] = buf()
+    for f in functions
+        fresh.push(false)
+        var row: Buf[bool] = buf()
+        for _ in f.signature.params do row.push(false)
+        param_ok.push(row)
+    var changed = true
+    while changed
+        changed = false
+        for i in 0..<n
+            if !inlinable[i] then continue
+            val f = functions[i]
+            val a = analyze(f, Summary(inlinable, fresh, param_ok))
+            if !fresh[i] && returns_fresh(f, a)
+                fresh[i] = true
+                changed = true
+            var row: Buf[bool] = buf()
+            var grew = false
+            for p in 0..<f.signature.params.len()
+                var ok = param_ok[i][p]
+                if !ok && a.value_group[p] is Some(g)
+                    if (a.flags[g] & (Escapes | BadUse)) == 0u32
+                        ok = true
+                        grew = true
+                row.push(ok)
+            if grew
+                param_ok[i] = row
+                changed = true
+    Summary(inlinable, fresh, param_ok)
+
+/** Whether every value `f` returns is an object it makes, or one a call it would inline makes. */
+private returns_fresh(f: MirFunction, a: Analysis) -> bool
+    if !(f.signature.result is Some(MRef)) then return false
+    var any = false
+    for block in f.blocks
+        block.term match
+            Return(Some(Value(v))) ->
+                val g = a.value_group[v] match
+                    Some(g) -> g
+                    None -> return false
+                val flags = a.flags[g]
+                if (flags & (Allocated | FromCall)) == 0u32 then return false
+                if (flags & (Foreign | FromParam | BadSource | Escapes | BadUse)) != 0u32 then return false
+                any = true
+            Return(Some(_)) -> return false
+            _ -> ()
+    any
+
+/** For each local slot, whether it holds references and its address is only loaded from and stored
+ * to, so that every value it holds is one stored to it in this function. */
+private private_slots(f: MirFunction) -> Buf[bool]
+    var out: Buf[bool] = buf()
+    for t in f.slots do out.push(t is MRef)
+    for block in f.blocks
+        for inst in block.insts
+            val operands = inst_operands(inst)
+            for k in 0..<operands.len()
+                if operands[k] is SlotAddress(x)
+                    if !(k == 0 && (inst is Load(_, _) || inst is Store(_, _))) then out[x] = false
+        block.term match
+            Return(Some(SlotAddress(x))) -> out[x] = false
+            Branch(SlotAddress(x), _, _) -> out[x] = false
+            _ -> ()
+    out
+
+private find_root(parent: *Buf[usize], x: usize) -> usize
+    var y = x
+    while (*parent)[y] != y
+        (*parent)[y] = (*parent)[(*parent)[y]]
+        y = (*parent)[y]
+    y
+
+private unite(parent: *Buf[usize], a: usize, b: usize)
+    val x = find_root(parent, a)
+    val y = find_root(parent, b)
+    if x != y then (*parent)[x] = y
+
+private grouped(a: Buf[Option[usize]], o: Operand) -> Option[usize] = o match
+    Value(v) -> a[v]
+    _ -> None
+
+private mark(flags: *Buf[u32], group: Option[usize], bits: u32)
+    if group is Some(g) then (*flags)[g] = (*flags)[g] | bits
+
+private operand_type_of(f: MirFunction, o: Operand) -> MirType = o match
+    Value(id) -> f.value_types[id]
+    ConstInt(bits, _) -> MInt(bits)
+    ConstBool(_) -> MBool
+    ConstReal(_) -> MReal
+    ConstStr(_) -> MRef
+    ConstObject(_) -> MRef
+    ConstClosure(_) -> MRef
+    _ -> MPtr
+
+/** The groups of `f`'s references, and what is done with each. */
+private analyze(f: MirFunction, s: Summary) -> Analysis
+    val values = f.value_types.len()
+    val slots = private_slots(f)
+    var parent: Buf[usize] = buf()
+    for i in 0..<values + slots.len() do parent.push(i)
+    for block in f.blocks
+        for inst in block.insts
+            inst match
+                Store(SlotAddress(x), Value(v)) ->
+                    if slots[x] && f.value_types[v] is MRef then unite(&parent, v, values + x)
+                Load(d, SlotAddress(x)) ->
+                    if slots[x] && f.value_types[d] is MRef then unite(&parent, d, values + x)
+                Select(d, _, yes, no) ->
+                    if f.value_types[d] is MRef
+                        if yes is Value(y) then unite(&parent, d, y)
+                        if no is Value(z) then unite(&parent, d, z)
+                _ -> ()
+    // Number the groups.
+    var number: Buf[Option[usize]] = buf()
+    for _ in 0..<values + slots.len() do number.push(None)
+    var count = 0usize
+    var value_group: Buf[Option[usize]] = buf()
+    for v in 0..<values
+        if f.value_types[v] is MRef
+            val r = find_root(&parent, v)
+            if number[r] is None
+                number[r] = Some(count)
+                count += 1
+            value_group.push(number[r])
+        else value_group.push(None)
+    var slot_group: Buf[Option[usize]] = buf()
+    for x in 0..<slots.len()
+        if slots[x]
+            val r = find_root(&parent, values + x)
+            if number[r] is None
+                number[r] = Some(count)
+                count += 1
+            slot_group.push(number[r])
+        else slot_group.push(None)
+    var flags: Buf[u32] = buf()
+    for _ in 0..<count do flags.push(0u32)
+    for p in 0..<f.signature.params.len()
+        mark(&flags, value_group[p], FromParam)
+    // Where each group's references come from, and which values are addresses of their fields.
+    var field_group: Buf[Option[usize]] = buf()
+    var field_offset: Buf[usize] = buf()
+    for _ in 0..<values
+        field_group.push(None)
+        field_offset.push(0)
+    for block in f.blocks
+        for inst in block.insts
+            inst match
+                Offset(d, base, bytes) ->
+                    if grouped(value_group, base) is Some(g)
+                        field_group[d] = Some(g)
+                        field_offset[d] = bytes
+                Store(SlotAddress(x), v) ->
+                    if slot_group[x] is Some(g)
+                        if grouped(value_group, v) is None then mark(&flags, Some(g), Foreign)
+                _ -> ()
+            val dest = inst_dest(inst) match
+                Some(d) -> d
+                None -> continue
+            val g = value_group[dest] match
+                Some(g) -> g
+                None -> continue
+            inst match
+                Alloc(_, _) -> mark(&flags, Some(g), Allocated)
+                Call(_, Direct(callee), _) ->
+                    mark(&flags, Some(g), FromCall)
+                    if !(s.inlinable[callee] && s.fresh[callee]) then mark(&flags, Some(g), BadSource)
+                Load(_, SlotAddress(x)) ->
+                    if slot_group[x] is None then mark(&flags, Some(g), Foreign)
+                Select(_, _, yes, no) ->
+                    if grouped(value_group, yes) is None || grouped(value_group, no) is None then mark(&flags, Some(g), Foreign)
+                _ -> mark(&flags, Some(g), Foreign)
+    // How each group's references are used.
+    var accesses: Buf[Access] = buf()
+    for block in f.blocks
+        for inst in block.insts
+            inst match
+                Store(SlotAddress(x), Value(v)) ->
+                    if slot_group[x] is None then escape_operands(&flags, value_group, field_group, inst)
+                Load(_, SlotAddress(_)) -> ()
+                Select(d, _, _, _) ->
+                    if value_group[d] is None then escape_operands(&flags, value_group, field_group, inst)
+                Offset(_, base, _) ->
+                    if grouped(value_group, base) is None then escape_operands(&flags, value_group, field_group, inst)
+                Load(d, address) ->
+                    if field_of(value_group, field_group, field_offset, address) is Some(at)
+                        accesses.push(Access(at.group, at.offset, f.value_types[d]))
+                    else escape_operands(&flags, value_group, field_group, inst)
+                Store(address, value) ->
+                    if field_of(value_group, field_group, field_offset, address) is Some(at)
+                        accesses.push(Access(at.group, at.offset, operand_type_of(f, value)))
+                        mark(&flags, grouped(value_group, value), Escapes)
+                        mark(&flags, grouped(field_group, value), Escapes)
+                    else escape_operands(&flags, value_group, field_group, inst)
+                DescriptorOf(_, object) ->
+                    if grouped(value_group, object) is Some(g) then mark(&flags, Some(g), Described)
+                    else escape_operands(&flags, value_group, field_group, inst)
+                Compare(_, op, left, right) ->
+                    val null_test = (op is CmpEq || op is CmpNe) && ((right is NullAddress && grouped(value_group, left) is Some(_)) || (left is NullAddress && grouped(value_group, right) is Some(_)))
+                    if !null_test then escape_operands(&flags, value_group, field_group, inst)
+                Call(_, callee, args) ->
+                    if callee is Indirect(target, _)
+                        mark(&flags, grouped(value_group, target), Escapes)
+                        mark(&flags, grouped(field_group, target), Escapes)
+                    for i in 0..<args.len()
+                        mark(&flags, grouped(field_group, args[i]), Escapes)
+                        val g = grouped(value_group, args[i]) match
+                            Some(g) -> g
+                            None -> continue
+                        mark(&flags, Some(g), Called)
+                        var kept = true
+                        if callee is Direct(h)
+                            if s.inlinable[h] && i < s.param_ok[h].len() && s.param_ok[h][i] then kept = false
+                        if kept then mark(&flags, Some(g), BadUse)
+                _ -> escape_operands(&flags, value_group, field_group, inst)
+        block.term match
+            Return(Some(o)) ->
+                mark(&flags, grouped(value_group, o), Returned)
+                mark(&flags, grouped(field_group, o), Escapes)
+            Branch(o, _, _) -> mark(&flags, grouped(field_group, o), Escapes)
+            _ -> ()
+    Analysis(value_group, slot_group, flags, field_group, field_offset, accesses)
+
+/** The group and offset of the field `address` names: an object's own address is its first field. */
+private field_of(value_group: Buf[Option[usize]], field_group: Buf[Option[usize]], field_offset: Buf[usize], address: Operand) -> Option[FieldAt]
+    val v = address match
+        Value(v) -> v
+        _ -> return None
+    if value_group[v] is Some(g) then return Some(FieldAt(g, 0))
+    if field_group[v] is Some(g) then return Some(FieldAt(g, field_offset[v]))
+    None
+
+/** A field of the objects of a group, by its byte offset. */
+private struct FieldAt
+    group: usize
+    offset: usize
+
+/** Marks every group a reference or field address among `inst`'s operands belongs to as escaping. */
+private escape_operands(flags: *Buf[u32], value_group: Buf[Option[usize]], field_group: Buf[Option[usize]], inst: Inst)
+    for o in inst_operands(inst)
+        mark(flags, grouped(value_group, o), Escapes)
+        mark(flags, grouped(field_group, o), Escapes)
+
+// ---- Inlining
+
+/** `f` with the calls that make or are handed objects it could keep as fields inlined, round by
+ * round, while it grows by no more than `MaxGrowth` instructions. */
+private inline_for_objects(f: MirFunction, functions: Buf[MirFunction], s: Summary) -> MirFunction
+    var current = f
+    var grown = 0usize
+    for _ in 0..<MaxRounds
+        val a = analyze(current, s)
+        var marks: Buf[bool] = buf()
+        var any = false
+        for block in current.blocks
+            for inst in block.insts
+                var wanted = false
+                if grown < MaxGrowth
+                    if inst is Call(dest, Direct(g), args)
+                        if s.inlinable[g]
+                            if dest is Some(d)
+                                if worthy(a, a.value_group[d]) then wanted = true
+                            for arg in args
+                                if worthy(a, grouped(a.value_group, arg)) then wanted = true
+                        if wanted then grown += size_of(functions[g])
+                if wanted then any = true
+                marks.push(wanted)
+        if !any then break
+        current = inline_marked(current, marks, functions)
+    current
+
+/** Whether a group's objects could be kept as fields once the calls that make or take them are
+ * inlined. */
+private worthy(a: Analysis, group: Option[usize]) -> bool
+    val g = group match
+        Some(g) -> g
+        None -> return false
+    val flags = a.flags[g]
+    (flags & (Allocated | FromCall)) != 0u32 && (flags & (Foreign | FromParam | BadSource | Escapes | BadUse | Returned)) == 0u32
+
+/** How the code of an inlined function is placed in its caller: its values, slots and blocks are
+ * numbered after the caller's, and its parameters are the call's arguments. A value with a
+ * replacement in `subst` reads as the replacement. */
+private struct Remap
+    values: usize
+    slots: usize
+    blocks: usize
+    params: usize
+    args: Buf[Operand]
+    subst: Buf[Option[Operand]]
+
+private map_operand(r: Remap, o: Operand) -> Operand
+    o match
+        Value(v) ->
+            if v < r.params then return r.args[v]
+            if v < r.subst.len()
+                if r.subst[v] is Some(x) then return x
+            Value(r.values + v)
+        SlotAddress(x) -> SlotAddress(r.slots + x)
+        _ -> o
+
+private map_operands(r: Remap, os: Buf[Operand]) -> Buf[Operand]
+    var out: Buf[Operand] = buf()
+    for o in os do out.push(map_operand(r, o))
+    out
+
+private map_inst(r: Remap, inst: Inst) -> Inst
+    val v = r.values
+    inst match
+        Call(dest, callee, args) ->
+            val d: Option[usize] = dest match
+                Some(x) -> Some(v + x)
+                None -> None
+            val c = callee match
+                Indirect(target, signature) -> Indirect(map_operand(r, target), signature)
+                _ -> callee
+            Call(d, c, map_operands(r, args))
+        Binary(dest, op, left, right) -> Binary(v + dest, op, map_operand(r, left), map_operand(r, right))
+        Checked(dest, overflow, op, left, right) -> Checked(v + dest, v + overflow, op, map_operand(r, left), map_operand(r, right))
+        Compare(dest, op, left, right) -> Compare(v + dest, op, map_operand(r, left), map_operand(r, right))
+        Select(dest, condition, yes, no) -> Select(v + dest, map_operand(r, condition), map_operand(r, yes), map_operand(r, no))
+        Convert(dest, conv, value) -> Convert(v + dest, conv, map_operand(r, value))
+        Load(dest, address) -> Load(v + dest, map_operand(r, address))
+        Store(address, value) -> Store(map_operand(r, address), map_operand(r, value))
+        Alloc(dest, descriptor) -> Alloc(v + dest, descriptor)
+        Publish -> Publish
+        AtomicLoad(dest, address) -> AtomicLoad(v + dest, map_operand(r, address))
+        AtomicStore(address, value) -> AtomicStore(map_operand(r, address), map_operand(r, value))
+        AtomicSwap(dest, address, value) -> AtomicSwap(v + dest, map_operand(r, address), map_operand(r, value))
+        AtomicCompareSet(dest, address, expected, desired) -> AtomicCompareSet(v + dest, map_operand(r, address), map_operand(r, expected), map_operand(r, desired))
+        Offset(dest, base, bytes) -> Offset(v + dest, map_operand(r, base), bytes)
+        Index(dest, base, index) -> Index(v + dest, map_operand(r, base), map_operand(r, index))
+        DescriptorOf(dest, object) -> DescriptorOf(v + dest, map_operand(r, object))
+        MethodSlot(dest, object, slot) -> MethodSlot(v + dest, map_operand(r, object), slot)
+        CallEntry(dest, object) -> CallEntry(v + dest, map_operand(r, object))
+
+private map_term(r: Remap, term: Terminator) -> Terminator = term match
+    Return(Some(o)) -> Return(Some(map_operand(r, o)))
+    Jump(target) -> Jump(r.blocks + target)
+    Branch(condition, yes, no) -> Branch(map_operand(r, condition), r.blocks + yes, r.blocks + no)
+    _ -> term
+
+// Each inlined call ends the block it is in: the block jumps to the callee's entry, the callee's
+// blocks follow, each return stores the result to a slot of its own and jumps to a new block that
+// loads it and goes on with the rest of the original block. A block keeps its number, so every jump
+// to it still lands at its start.
+private inline_marked(f: MirFunction, marks: Buf[bool], functions: Buf[MirFunction]) -> MirFunction
+    var values: Buf[MirType] = buf()
+    for t in f.value_types do values.push(t)
+    var slots: Buf[MirType] = buf()
+    for t in f.slots do slots.push(t)
+    var blocks: Buf[MirBlock] = buf()
+    for block in f.blocks do blocks.push(block)
+    var k = 0usize
+    for b in 0..<f.blocks.len()
+        val block = f.blocks[b]
+        var current = b
+        var insts: Buf[Inst] = buf()
+        for inst in block.insts
+            val wanted = marks[k]
+            k += 1
+            if !wanted
+                insts.push(inst)
+                continue
+            val (dest, callee, args) = inst match
+                Call(d, Direct(g), a) -> (d, g, a)
+                _ -> panic("an inlined instruction that is not a direct call")
+            val g = functions[callee]
+            val rest = blocks.len()
+            blocks.push(MirBlock(buf(), Unreachable))
+            val result: Option[usize] = dest match
+                Some(d) ->
+                    slots.push(values[d])
+                    Some(slots.len() - 1)
+                None -> None
+            val r = Remap(values.len(), slots.len(), blocks.len(), g.signature.params.len(), args, buf())
+            for t in g.value_types do values.push(t)
+            for t in g.slots do slots.push(t)
+            for gb in g.blocks
+                var body: Buf[Inst] = buf()
+                for i in gb.insts do body.push(map_inst(r, i))
+                val term = gb.term match
+                    Return(value) ->
+                        if result is Some(x) && value is Some(o) then body.push(Store(SlotAddress(x), map_operand(r, o)))
+                        Jump(rest)
+                    _ -> map_term(r, gb.term)
+                blocks.push(MirBlock(body, term))
+            blocks[current] = MirBlock(insts, Jump(r.blocks))
+            current = rest
+            insts = buf()
+            if dest is Some(d) && result is Some(x) then insts.push(Load(d, SlotAddress(x)))
+        blocks[current] = MirBlock(insts, block.term)
+    MirFunction(f.symbol, f.signature, values, slots, blocks)
+
+// ---- Replacement
+
+/** The local slot that holds one field of the objects of one group. */
+private struct KeptField
+    group: usize
+    offset: usize
+    ty: MirType
+    slot: usize
+
+private type_class(t: MirType) -> usize = t match
+    MInt(bits) -> 16 + usize(bits)
+    MBool -> 1
+    MReal -> 2
+    MPtr -> 3
+    MRef -> 3
+
+private zero_of(t: MirType) -> Operand = t match
+    MInt(bits) -> ConstInt(bits, "0")
+    MBool -> ConstBool(false)
+    MReal -> ConstReal(0.0)
+    _ -> NullAddress
+
+/** `f` with every group of objects that never leaves it, and of which no two are in use at once,
+ * kept as local slots, one for each field. */
+private replace_objects(f: MirFunction, descriptors: Buf[Descriptor], s: Summary) -> MirFunction
+    val a = analyze(f, s)
+    val groups = a.flags.len()
+    var valid: Buf[bool] = buf()
+    for g in 0..<groups
+        val flags = a.flags[g]
+        valid.push((flags & Allocated) != 0u32 && (flags & (Foreign | FromParam | FromCall | Escapes | Called | Returned)) == 0u32)
+    // The descriptors each group's objects are made with.
+    var made: Buf[Buf[usize]] = buf()
+    for _ in 0..<groups do made.push(buf())
+    var any = false
+    for block in f.blocks
+        for inst in block.insts
+            if inst is Alloc(d, descriptor)
+                if a.value_group[d] is Some(g)
+                    if valid[g]
+                        val desc = descriptors[descriptor]
+                        if desc.constant || desc.elements then valid[g] = false
+                        var seen = false
+                        for x in made[g]
+                            if x == descriptor then seen = true
+                        if !seen
+                            var row = made[g]
+                            row.push(descriptor)
+                            made[g] = row
+    for g in 0..<groups
+        if valid[g] then any = true
+    if !any then return f
+    // One slot for each field of each group, of one machine type.
+    var fields: Buf[KeptField] = buf()
+    for access in a.accesses
+        val g = access.group
+        if !valid[g] then continue
+        var holds_reference = false
+        for d in made[g]
+            for r in descriptors[d].refs
+                if r == access.offset then holds_reference = true
+        var ty = access.ty
+        if type_class(ty) == 3
+            ty = if holds_reference || ty is MRef then MRef else MPtr
+        var found = false
+        for i in 0..<fields.len()
+            if fields[i].group == g && fields[i].offset == access.offset
+                found = true
+                if type_class(fields[i].ty) != type_class(ty) then valid[g] = false
+                if ty is MRef then fields[i] = KeptField(g, access.offset, MRef, 0)
+        if !found then fields.push(KeptField(g, access.offset, ty, 0))
+    var per_group: Buf[usize] = buf()
+    for _ in 0..<groups do per_group.push(0)
+    for fs in fields
+        per_group[fs.group] = per_group[fs.group] + 1
+    for g in 0..<groups
+        if per_group[g] > MaxFields then valid[g] = false
+    // No two objects of a group may be in use at once.
+    val stale = overlapping(f, a, valid)
+    any = false
+    for g in 0..<groups
+        if stale[g] then valid[g] = false
+        if valid[g] then any = true
+    if !any then return f
+    var slots: Buf[MirType] = buf()
+    for t in f.slots do slots.push(t)
+    var kept: Buf[KeptField] = buf()
+    for fs in fields
+        if valid[fs.group]
+            kept.push(KeptField(fs.group, fs.offset, fs.ty, slots.len()))
+            slots.push(fs.ty)
+    var descriptor_slot: Buf[Option[usize]] = buf()
+    for g in 0..<groups
+        if valid[g] && (a.flags[g] & Described) != 0u32 && made[g].len() > 1
+            descriptor_slot.push(Some(slots.len()))
+            slots.push(MPtr)
+        else descriptor_slot.push(None)
+    // Values that become constants: a descriptor known from the one allocation that made the
+    // object, and a comparison of an object with null.
+    var subst: Buf[Option[Operand]] = buf()
+    for _ in 0..<f.value_types.len() do subst.push(None)
+    for block in f.blocks
+        for inst in block.insts
+            inst match
+                DescriptorOf(dest, object) ->
+                    if valid_group(a, valid, object) is Some(g)
+                        if descriptor_slot[g] is None then subst[dest] = Some(DescriptorAddress(made[g][0]))
+                Compare(dest, op, left, right) ->
+                    if valid_group(a, valid, left) is Some(_) || valid_group(a, valid, right) is Some(_)
+                        subst[dest] = Some(ConstBool(op is CmpNe))
+                _ -> ()
+    val r = Remap(0, 0, 0, 0, buf(), subst)
+    var blocks: Buf[MirBlock] = buf()
+    for block in f.blocks
+        var insts: Buf[Inst] = buf()
+        for inst in block.insts
+            inst match
+                Alloc(d, descriptor) ->
+                    if valid_group(a, valid, Value(d)) is Some(g)
+                        for fs in kept
+                            if fs.group == g then insts.push(Store(SlotAddress(fs.slot), zero_of(fs.ty)))
+                        if descriptor_slot[g] is Some(x) then insts.push(Store(SlotAddress(x), DescriptorAddress(descriptor)))
+                        continue
+                Store(SlotAddress(x), _) ->
+                    if a.slot_group[x] is Some(g)
+                        if valid[g] then continue
+                Load(d, SlotAddress(_)) ->
+                    if valid_group(a, valid, Value(d)) is Some(_) then continue
+                Select(d, _, _, _) ->
+                    if valid_group(a, valid, Value(d)) is Some(_) then continue
+                Offset(_, base, _) ->
+                    if valid_group(a, valid, base) is Some(_) then continue
+                Load(d, address) ->
+                    if valid_field(a, valid, kept, address) is Some(x)
+                        insts.push(Load(d, SlotAddress(x)))
+                        continue
+                Store(address, value) ->
+                    if valid_field(a, valid, kept, address) is Some(x)
+                        insts.push(Store(SlotAddress(x), map_operand(r, value)))
+                        continue
+                DescriptorOf(dest, object) ->
+                    if valid_group(a, valid, object) is Some(g)
+                        if descriptor_slot[g] is Some(x) then insts.push(Load(dest, SlotAddress(x)))
+                        continue
+                Compare(dest, _, _, _) ->
+                    if subst[dest] is Some(_) then continue
+                _ -> ()
+            insts.push(map_inst(r, inst))
+        blocks.push(MirBlock(insts, map_term(r, block.term)))
+    MirFunction(f.symbol, f.signature, f.value_types, slots, blocks)
+
+private valid_group(a: Analysis, valid: Buf[bool], o: Operand) -> Option[usize]
+    val g = grouped(a.value_group, o) match
+        Some(g) -> g
+        None -> return None
+    if valid[g] then Some(g) else None
+
+/** The slot of the field `address` names, where it is a field of an object kept as its fields. */
+private valid_field(a: Analysis, valid: Buf[bool], kept: Buf[KeptField], address: Operand) -> Option[usize]
+    val at = field_of(a.value_group, a.field_group, a.field_offset, address) match
+        Some(at) -> at
+        None -> return None
+    if !valid[at.group] then return None
+    for fs in kept
+        if fs.group == at.group && fs.offset == at.offset then return Some(fs.slot)
+    None
+
+// Whether two objects of a group may be in use at once, found forward over the blocks. Each
+// reference of a candidate group, and each address of a field of one, is *current* from where it is
+// made until the next allocation of its group, which makes a newer object; it is current again once
+// stored to or loaded from a current one. A use of a reference, or of a field address, that may not
+// be current on some path means an older object is still in use beside a newer one.
+private overlapping(f: MirFunction, a: Analysis, valid: Buf[bool]) -> Buf[bool]
+    val groups = valid.len()
+    var stale: Buf[bool] = buf()
+    for _ in 0..<groups do stale.push(false)
+    var value_bit: Buf[Option[usize]] = buf()
+    var slot_bit: Buf[Option[usize]] = buf()
+    var bit_group: Buf[usize] = buf()
+    for v in 0..<f.value_types.len()
+        var g: Option[usize] = a.value_group[v]
+        if g is None then g = a.field_group[v]
+        if g is Some(x) && valid[x]
+            value_bit.push(Some(bit_group.len()))
+            bit_group.push(x)
+        else value_bit.push(None)
+    for x in 0..<f.slots.len()
+        if a.slot_group[x] is Some(g) && valid[g]
+            slot_bit.push(Some(bit_group.len()))
+            bit_group.push(g)
+        else slot_bit.push(None)
+    val k = bit_group.len()
+    if k == 0 then return stale
+    val n = f.blocks.len()
+    var entry: Buf[bool] = buf()
+    for b in 0..<n
+        for _ in 0..<k do entry.push(b != 0)
+    var changed = true
+    while changed
+        changed = false
+        for b in 0..<n
+            var state: Buf[bool] = buf()
+            for j in 0..<k do state.push(entry[b * k + j])
+            for inst in f.blocks[b].insts
+                currency(inst, &state, value_bit, slot_bit, bit_group, &stale, false)
+            for t in successors(f.blocks[b].term)
+                for j in 0..<k
+                    if entry[t * k + j] && !state[j]
+                        entry[t * k + j] = false
+                        changed = true
+    for b in 0..<n
+        var state: Buf[bool] = buf()
+        for j in 0..<k do state.push(entry[b * k + j])
+        for inst in f.blocks[b].insts
+            currency(inst, &state, value_bit, slot_bit, bit_group, &stale, true)
+    stale
+
+/** Moves the currency of references past `inst`; with `check`, marks the group of any reference used
+ * while it may not be current. */
+private currency(inst: Inst, state: *Buf[bool], value_bit: Buf[Option[usize]], slot_bit: Buf[Option[usize]], bit_group: Buf[usize], stale: *Buf[bool], check: bool)
+    inst match
+        Alloc(d, _) ->
+            if value_bit[d] is Some(j)
+                for i in 0..<bit_group.len()
+                    if bit_group[i] == bit_group[j] then (*state)[i] = false
+                (*state)[j] = true
+            return
+        Store(SlotAddress(x), value) ->
+            if slot_bit[x] is Some(j)
+                require_current(value, state, value_bit, bit_group, stale, check)
+                (*state)[j] = true
+                return
+        Load(d, SlotAddress(x)) ->
+            if slot_bit[x] is Some(j)
+                if check && !(*state)[j] then (*stale)[bit_group[j]] = true
+                if value_bit[d] is Some(i) then (*state)[i] = true
+                return
+        Select(d, _, yes, no) ->
+            if value_bit[d] is Some(i)
+                require_current(yes, state, value_bit, bit_group, stale, check)
+                require_current(no, state, value_bit, bit_group, stale, check)
+                (*state)[i] = true
+                return
+        Offset(d, base, _) ->
+            if value_bit[d] is Some(i)
+                require_current(base, state, value_bit, bit_group, stale, check)
+                (*state)[i] = true
+                return
+        _ -> ()
+    for o in inst_operands(inst)
+        require_current(o, state, value_bit, bit_group, stale, check)
+
+private require_current(o: Operand, state: *Buf[bool], value_bit: Buf[Option[usize]], bit_group: Buf[usize], stale: *Buf[bool], check: bool)
+    if !check then return
+    if o is Value(v)
+        if value_bit[v] is Some(j)
+            if !(*state)[j] then (*stale)[bit_group[j]] = true
+
+// ---- Fences
+
+/** The runtime entry points that store nothing another thread can reach. */
+private runtime_stores(symbol: string) -> bool
+    val quiet = ["avin_rt_conforms", "avin_rt_string_compare", "avin_rt_string_find",
+        "avin_rt_string_parse_real", "avin_rt_string_hash", "avin_rt_identity_hash",
+        "avin_rt_real_hash"]
+    for q in quiet
+        if q == symbol then return false
+    true
+
+/** Whether, after `inst`, a store another thread could see may have been made since the last fence,
+ * given whether one may have been before it. */
+private dirty_after(inst: Inst, before: bool, exits: Buf[bool]) -> bool = inst match
+    Publish -> false
+    Store(SlotAddress(_), _) -> before
+    Store(CallerSite, _) -> before
+    Store(_, _) -> true
+    AtomicStore(_, _) -> true
+    AtomicSwap(_, _, _) -> true
+    AtomicCompareSet(_, _, _, _) -> true
+    Alloc(_, _) -> true
+    Call(_, Direct(g), _) -> before || exits[g]
+    Call(_, Runtime(symbol, _), _) -> before || runtime_stores(symbol)
+    Call(_, Indirect(_, _), _) -> true
+    _ -> before
+
+/** For each block of `f`, whether a store another thread could see may have been made since the last
+ * fence when the block starts; a function starts with none. */
+private dirty_entries(f: MirFunction, exits: Buf[bool]) -> Buf[bool]
+    val n = f.blocks.len()
+    var entry: Buf[bool] = buf()
+    for _ in 0..<n do entry.push(false)
+    var changed = true
+    while changed
+        changed = false
+        for b in 0..<n
+            var state = entry[b]
+            for inst in f.blocks[b].insts
+                state = dirty_after(inst, state, exits)
+            if state
+                for t in successors(f.blocks[b].term)
+                    if !entry[t]
+                        entry[t] = true
+                        changed = true
+    entry
+
+/** The functions with every fence dropped that no store another thread could see precedes since the
+ * last fence. Whether a function may return with such a store not yet fenced is found for the whole
+ * program at once. */
+private remove_fences(functions: Buf[MirFunction]) -> Buf[MirFunction]
+    val n = functions.len()
+    var exits: Buf[bool] = buf()
+    for _ in 0..<n do exits.push(false)
+    var changed = true
+    while changed
+        changed = false
+        for i in 0..<n
+            if exits[i] then continue
+            val f = functions[i]
+            val entry = dirty_entries(f, exits)
+            for b in 0..<f.blocks.len()
+                if !(f.blocks[b].term is Return(_)) then continue
+                var state = entry[b]
+                for inst in f.blocks[b].insts
+                    state = dirty_after(inst, state, exits)
+                if state
+                    exits[i] = true
+                    changed = true
+                    break
+    var out: Buf[MirFunction] = buf()
+    for f in functions
+        var fences = false
+        for block in f.blocks
+            for inst in block.insts
+                if inst is Publish then fences = true
+        if !fences
+            out.push(f)
+            continue
+        val entry = dirty_entries(f, exits)
+        var blocks: Buf[MirBlock] = buf()
+        for b in 0..<f.blocks.len()
+            var state = entry[b]
+            var insts: Buf[Inst] = buf()
+            for inst in f.blocks[b].insts
+                if !(inst is Publish && !state) then insts.push(inst)
+                state = dirty_after(inst, state, exits)
+            blocks.push(MirBlock(insts, f.blocks[b].term))
+        out.push(MirFunction(f.symbol, f.signature, f.value_types, f.slots, blocks))
+    out

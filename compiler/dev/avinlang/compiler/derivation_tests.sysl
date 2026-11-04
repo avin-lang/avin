@@ -6,8 +6,9 @@ import sysl.buf.{Buf, buf}
 
 // What a method derived through a template costs: the code written for the type's fields calls the
 // visitor's hooks directly, each compiled for one field type, with no call through a method table,
-// no lookup and no boxing. The visitor, a data value, is allocated once per call until data can live
-// in registers; a hand-written encoder allocates nothing.
+// no lookup and no boxing. The visitor, a data value that never leaves the method, is kept as its
+// fields once the walk and the hooks are inlined, so the derived method allocates nothing, as a
+// hand-written encoder does not.
 
 private lowered(text: string) -> MirProgram = lower_source(repository_toolchain(), source_of("probe.avin", text)) match
     Ok(p) -> p
@@ -51,23 +52,26 @@ private calls(c: Cost, symbol: string) -> bool
 
 private const Encoder: string = "class Out\n    var text = \"\"\n    key(k: string) = text = text + k + \":\"\n    value(v: string) = text = text + v + \";\"\n\ntrait Encode\n    encode(out: Out)\n\nimpl Encode for int\n    encode(out: Out) = out.value(s\"$self\")\n\nimpl Encode for string\n    encode(out: Out) = out.value(self)\n\nderive Encode for T\n    encode(out: Out)\n        T.walk(self, FieldWriter(out))\n        ()\n\ndata FieldWriter(out: Out)\n\nimpl ShapeVisitor for FieldWriter\n    variant(v: VariantShape) -> FieldWriter = self\n\nimpl FieldWriter\n    field[F: Encode](f: FieldShape, value: F) -> FieldWriter =\n        out.key(f.name)\n        value.encode(out)\n        self\n\ndata Person(name: string, age: int) derives Encode\n\ndata Hand(name: string, age: int)\n\nimpl Hand\n    encode(out: Out) =\n        out.key(\"name\")\n        name.encode(out)\n        out.key(\"age\")\n        age.encode(out)\n\nmain()\n    val out = Out()\n    Person(\"Ada\", 36).encode(out)\n    Hand(\"Ada\", 36).encode(out)\n    print(out.text)\n"
 
-@test("a derived method calls the visitor's hooks directly, one for each field's type")
+@test("a derived method inlines the visitor's hooks, one for each field's type, and calls each field's own method directly")
 derived_calls_are_direct()
     val c = cost_of(lowered(Encoder), "Person.encode")
     assert_eq(c.through_tables, 0)
     assert_eq(c.entries, 0)
     assert_eq(c.compared, 0)
-    assert(calls(c, "FieldWriter.variant"))
-    assert(calls(c, "FieldWriter.field[string]"))
-    assert(calls(c, "FieldWriter.field[int]"))
+    assert(!calls(c, "FieldWriter.variant"))
+    assert(!calls(c, "FieldWriter.field[string]"))
+    assert(!calls(c, "FieldWriter.field[int]"))
+    assert(calls(c, "Out.key"))
+    assert(calls(c, "string.encode"))
+    assert(calls(c, "int.encode"))
 
-@test("a derived method allocates only its visitor, beyond what the hand-written one does")
-derived_allocates_only_the_visitor()
+@test("a derived method allocates no more than the hand-written one: its visitor is kept as its fields")
+derived_allocates_no_visitor()
     val program = lowered(Encoder)
     val derived = cost_of(program, "Person.encode")
     val hand = cost_of(program, "Hand.encode")
     assert_eq(hand.allocations, 0)
-    assert_eq(derived.allocations, hand.allocations + 1)
+    assert_eq(derived.allocations, hand.allocations)
 
 @test("each hook is compiled for one field type and calls its field's own method directly")
 hooks_are_direct()
