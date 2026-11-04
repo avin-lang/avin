@@ -90,6 +90,14 @@ Their methods:
 | `filter(p: (T) -> bool) -> Option[T]` | `flatMap[U](f: (T) -> Result[U, E]) -> Result[U, E]` |
 | `fold[U](ifNone: -> U, f: (T) -> U) -> U` | `fold[U](onErr: (E) -> U, onOk: (T) -> U) -> U` |
 | `foreach(f: (T) -> unit)` | `foreach(f: (T) -> unit)` |
+| `exists(p: (T) -> bool) -> bool` | `exists(p: (T) -> bool) -> bool` |
+| `forall(p: (T) -> bool) -> bool` | `forall(p: (T) -> bool) -> bool` |
+| `contains(x: T) -> bool` | `orElse[F](f: (E) -> Result[T, F]) -> Result[T, F]` |
+| `toList() -> List[T]`, `toVector() -> Vector[T]` | `toList() -> List[T]` |
+| `zip[U](other: Option[U]) -> Option[(T, U)]` | |
+
+`exists` is false and `forall` true for `None` and for `Err`, which hold no value. `toList` and
+`toVector` give one element or none.
 
 A default or an alternative is passed by name, so it is evaluated only when it is used. The methods
 an `impl` adds are not [variance](/spec/generics/#variance) positions, so `T` may appear in a

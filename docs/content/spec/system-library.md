@@ -33,6 +33,17 @@ main()
 | `env(name: string) -> Option[string]` | The environment variable's value, `None` when it is not set; a variable set to nothing is `Some("")`. |
 | `exit(code: int) -> Nothing` | Ends the program now with `code` as its exit status, after flushing what it has written. |
 
+**`main` may take the arguments itself.** `main(args: Vector[string])` receives the vector `args()`
+answers, and `main()` is the form for a program that does not read them. The parameter is exactly
+`Vector[string]` with no default; any other parameter list is an error. `args()` and `programName()`
+remain available everywhere.
+
+```text
+main(args: Vector[string]) -> int
+    for f in args do print(f)
+    0
+```
+
 **The program's name is not an argument.** `args()` holds only what the user typed after it, so
 `args()(0)` is the first real argument, and the name is asked for by `programName()` when a
 program wants it, for a usage line.
