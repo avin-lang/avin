@@ -130,7 +130,12 @@ a decision changes, this page and the chapter change together.
 - A local value (`val`, `var` or a pattern binding) and a local function of the same block may not
   share a name, whichever is written first (settled, user, 2026-11-04). In a nested block, a lambda
   or as a parameter of the enclosing function, a local may hide an outer local function like any
-  outer name (**Proposed**: only the same-block case was decided).
+  outer name (settled, user, 2026-11-04).
+- Generic local functions ([declarations](/spec/declarations/#functions)): a local function's type
+  parameters follow the enclosing ones it shares, which its calls never write, so `pair[int](1)`
+  writes only `pair`'s own. A local function's type parameter may not take the name of one already
+  in scope rather than hiding it. Written type arguments and those an expected type gives a generic
+  function used as a value are held to its bounds, as a call's are (settled, user, 2026-11-04).
 - Choosing an overload tries integer literals and lambdas against each candidate's parameter; every
   other argument is checked once on its own, and only its type is tried. A literal fits any
   parameter that can hold it.
