@@ -65,6 +65,11 @@ A dependency is named in `dependencies` and says once where it comes from:
   `v` and the version. A coordinate is identity, not a URL: `https://` and `.git` are refused rather
   than stripped, since two spellings of one package would be two packages. The repository is cloned
   from `https://` and the coordinate.
+- **`git` and `rev`**: the same repository read at one commit, `{ git = "github.com/owner/json", rev =
+  "3f9a2c1" }`, for a package that has no release or a fix not yet released. A `rev` is a commit's id
+  in lowercase hexadecimal, seven to forty digits, so an abbreviation and the full id name one
+  package: it is cached and recorded in `avin.sum` under the full id. A commit that no branch or tag
+  reaches is found by its full id alone. A dependency has a `version` or a `rev`, never both.
 - **`path`**: a directory holding a package, relative to the manifest that names it, for a package
   developed beside the one using it. A path dependency may name paths of its own, each relative to its
   own manifest. A fetched package may not name a path, which exists only on the machine that
@@ -109,6 +114,14 @@ table 0.4.0    depends on json 1.4.0
                json resolves to 1.4.0
 ```
 
+**A commit is never chosen among.** Every manifest in the graph that pins a package to a `rev` must
+name one commit, and a package pinned to a commit is not also asked for at a release; either
+disagreement is refused at the manifest line, naming both:
+
+```text
+avin: `b` pins example.com/avin/pinned to the commit 4c1e…, and another dependency pins it to 9a07…: a package is read at one commit, so make them agree
+```
+
 Selection is a function of the manifests, so builds are reproducible without a lockfile, adding a
 dependency cannot silently upgrade an unrelated one, and upgrading is an edit to a number.
 
@@ -123,7 +136,11 @@ package and version the project has read:
 
 ```text
 github.com/owner/json v1.4.0 sha256:6f1b…
+github.com/owner/table r3f9a2c1d5e8b4a6f7c0d1e2f3a4b5c6d7e8f9a0b sha256:41c0…
 ```
+
+A package pinned to a commit is kept in the cache at `<cache>/avin/pkg/<coordinate>/@r<commit>/`, and
+its line gives `r` and the commit's full id where a release gives `v` and its version.
 
 The hash is SHA-256 over a listing of the package's files, one line each: the file's own SHA-256 in
 lowercase hexadecimal, two spaces, and its path from the package's root, sorted by path. A `.git`
@@ -177,8 +194,9 @@ without one, as before.
   module of that name (with `-` written `_`) holding one function, `main.avin` using it, a test of it in
   `tests/`, and a `.gitignore` naming `.avin/`. `avin new <dir> --lib` writes a library, the same
   without `main.avin`. It refuses a directory that exists and a name that is not a package's.
-- `avin add <coordinate>[@<version>] [<package>]` adds a git dependency to the package's manifest:
-  the version given, or the highest release the repository has tagged. It fetches the package, lists
+- `avin add <coordinate>[@<version>|@<rev>] [<package>]` adds a git dependency to the package's
+  manifest: the version given, the commit given (written to the manifest as its full id), or the
+  highest release the repository has tagged. It fetches the package, lists
   it under the name its own manifest gives it, and adds its hash to `avin.sum`. Adding a dependency
   already listed changes its version, to a lower one as well as a higher. The rest of the manifest,
   comments and layout included, is left as written, and a dependency that cannot be fetched or is

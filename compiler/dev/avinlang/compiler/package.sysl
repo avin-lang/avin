@@ -36,6 +36,9 @@ const DigestPrefix: string = "sha256:"
 enum Origin
     /** A git repository, by its coordinate (`github.com/owner/name`), at the tag of `version`. */
     Git(coordinate: string, version: string)
+    /** A git repository, by its coordinate, at the commit `rev` names: a full or abbreviated
+     * lowercase hexadecimal id. */
+    Rev(coordinate: string, rev: string)
     /** A directory, as the manifest wrote it, for a package developed beside the one using it. */
     Local(dir: string)
     /** The member of the package's workspace whose package has the dependency's name. */
@@ -119,6 +122,7 @@ private read_dependencies(m: *Manifest, f: Field) -> Result[unit, Diagnostic]
             return Err(error(d.value.span, s"the dependency `${d.key}` is a block saying where it comes from: `{ git = \"github.com/owner/name\", version = \"1.0.0\" }`, `{ path = \"../name\" }` or `{ workspace = true }`"))
         var git: Option[string] = None
         var version: Option[string] = None
+        var rev: Option[string] = None
         var local: Option[string] = None
         var member = false
         for g in d.value.fields()
@@ -130,6 +134,10 @@ private read_dependencies(m: *Manifest, f: Field) -> Result[unit, Diagnostic]
                 val v = text_of(g)?
                 if !valid_version(v) then return Err(error(g.value.span, bad_version(v)))
                 version = Some(v)
+            elif g.key == "rev"
+                val v = text_of(g)?
+                if !valid_rev(v) then return Err(error(g.value.span, bad_rev(v)))
+                rev = Some(v)
             elif g.key == "path"
                 val p = text_of(g)?
                 if p == "" then return Err(error(g.value.span, "a dependency's `path` names a directory"))
@@ -139,18 +147,24 @@ private read_dependencies(m: *Manifest, f: Field) -> Result[unit, Diagnostic]
                     Some(true) -> member = true
                     _ -> return Err(error(g.value.span, "a dependency's `workspace` is `true`: the dependency is the member of the workspace with its name"))
             else
-                return Err(error(g.key_span, s"`${g.key}` is not a key of a dependency, which holds `git` and `version`, `path`, or `workspace`"))
+                return Err(error(g.key_span, s"`${g.key}` is not a key of a dependency, which holds `git` with `version` or `rev`, `path`, or `workspace`"))
         var sources = 0
         if git is Some(_) then sources += 1
         if local is Some(_) then sources += 1
         if member then sources += 1
         if sources != 1
-            return Err(error(d.key_span, s"the dependency `${d.key}` says once where it comes from: `git` with a `version`, `path`, or `workspace = true`"))
+            return Err(error(d.key_span, s"the dependency `${d.key}` says once where it comes from: `git` with a `version` or a `rev`, `path`, or `workspace = true`"))
         if git is Some(c)
+            if version is Some(_) && rev is Some(_)
+                return Err(error(d.key_span, s"the dependency `${d.key}` has a `version` and a `rev`: a git dependency is read at a release or at a commit, not both"))
+            if rev is Some(x)
+                m.dependencies.push(Dependency(d.key, Rev(c, x), d.key_span))
+                continue
             version match
                 Some(v) -> m.dependencies.push(Dependency(d.key, Git(c, v), d.key_span))
-                None -> return Err(error(d.key_span, s"the dependency `${d.key}` names a repository and no version: a git dependency is read at a release, `version = \"1.0.0\"` being the tag `v1.0.0`"))
+                None -> return Err(error(d.key_span, s"the dependency `${d.key}` names a repository and no version: a git dependency is read at a release, `version = \"1.0.0\"` being the tag `v1.0.0`, or at a commit, `rev = \"3f9a2c1\"`"))
             continue
+        if rev is Some(_) then return Err(error(d.key_span, s"the dependency `${d.key}` has a `rev`, which belongs with `git`: a directory is read as it stands"))
         if version is Some(_) then return Err(error(d.key_span, s"the dependency `${d.key}` has a `version`, which belongs with `git`: a directory is read as it stands"))
         if local is Some(p) then m.dependencies.push(Dependency(d.key, Local(p), d.key_span))
         else m.dependencies.push(Dependency(d.key, Member, d.key_span))
@@ -187,6 +201,18 @@ valid_package_name(name: string) -> bool
         val lower = b >= u8('a') && b <= u8('z')
         val other = b >= u8('0') && b <= u8('9') || b == u8('_') || b == u8('-')
         if !lower && !(other && i > 0) then return false
+    true
+
+private bad_rev(v: string) -> string = s"`$v` is not a revision: a revision is a commit's id in lowercase hexadecimal, seven to forty digits, such as `3f9a2c1`"
+
+/** Whether `v` names a commit: seven to forty lowercase hexadecimal digits. */
+valid_rev(v: string) -> bool = v.bytes.len >= 7 && v.bytes.len <= 40 && all_hex(v)
+
+private valid_full_rev(v: string) -> bool = v.bytes.len == 40 && all_hex(v)
+
+private all_hex(v: string) -> bool
+    for b in v.bytes
+        if !(b >= u8('0') && b <= u8('9') || b >= u8('a') && b <= u8('f')) then return false
     true
 
 /** Whether `v` is a version: three numbers separated by dots, none with a leading zero. */
@@ -369,16 +395,25 @@ read_sums(file: string) -> Result[Buf[SumLine], string]
         n += 1
         if line == "" then continue
         val fields = line.split(" ")
-        if fields.len != 3 || !fields[1].starts_with("v") || !valid_version(fields[1][1..]) || !fields[2].starts_with(DigestPrefix)
-            return Err(s"avin: $file:$n: a line is a coordinate, a version and a hash, `github.com/owner/name v1.0.0 sha256:…`")
-        out.push(SumLine(fields[0], fields[1][1..], fields[2]))
+        val release = fields.len == 3 && fields[1].starts_with("v") && valid_version(fields[1][1..])
+        val commit = fields.len == 3 && fields[1].starts_with("r") && valid_full_rev(fields[1][1..])
+        if fields.len != 3 || !(release || commit) || !fields[2].starts_with(DigestPrefix)
+            return Err(s"avin: $file:$n: a line is a coordinate, a version or a commit, and a hash, `github.com/owner/name v1.0.0 sha256:…`")
+        // A release is kept as its number, a commit as `r` and its full id.
+        out.push(SumLine(fields[0], if commit then fields[1] else fields[1][1..], fields[2]))
     Ok(out)
 
 private render_sums(lines: Buf[SumLine]) -> string
     var out = str_builder()
     for l in lines
-        out.push(s"${l.coordinate} v${l.version} ${l.hash}\n")
+        out.push(s"${l.coordinate} ${sum_label(l.version)} ${l.hash}\n")
     out.finish()
+
+/** How a sum line's version key is written: a release as `v1.4.0`, a commit as `r` and its id. */
+private sum_label(key: string) -> string = if key.starts_with("r") then key else "v" + key
+
+/** The sum key of a commit: `r` and its full id. */
+private rev_key(sha: string) -> string = "r" + sha
 
 private find_sum(lines: Buf[SumLine], coordinate: string, version: string) -> Option[SumLine]
     for l in lines
@@ -443,6 +478,8 @@ private struct Resolver
     sums: Buf[SumLine]
     read: Buf[SumLine]
     selected: Buf[Selected]
+    /** The commit, by full id, each coordinate asked for at a `rev` is pinned to. */
+    pinned: Buf[Selected]
     changed: bool
 
 /** Resolves the package at `dir` and everything it depends on, fetching what the cache has not got
@@ -466,7 +503,7 @@ resolve(dir: string, fetching: Fetching, whole: bool) -> Result[Resolution, stri
         None -> roots.push(home)
     val sum_file = sum_dir + "/" + SumName
     val sums = read_sums(sum_file)?
-    var r = Resolver(fetching, ws, sums, buf(), buf(), false)
+    var r = Resolver(fetching, ws, sums, buf(), buf(), buf(), false)
     // A version raised can name dependencies of its own, which can raise another: walk again until a
     // walk raises nothing.
     loop
@@ -494,8 +531,19 @@ private visit(r: *Resolver, dir: string, fetched: bool, seen: *Buf[string], out:
     for d in m.dependencies
         val target = d.origin match
             Git(coordinate, version) ->
+                if pinned_sha(*r, coordinate) != ""
+                    return Err(error(d.span, s"`${d.label}` asks for $coordinate at the release v$version, and another dependency pins it to the commit ${pinned_sha(*r, coordinate)}: a package is read at one release or at one commit, so make them agree").render(m.src))
                 select(r, coordinate, version)
                 fetch_package(r, coordinate, selected_version(*r, coordinate))?
+            Rev(coordinate, rev) ->
+                if selected_version(*r, coordinate) != ""
+                    return Err(error(d.span, s"`${d.label}` pins $coordinate to the commit $rev, and another dependency asks for it at the release v${selected_version(*r, coordinate)}: a package is read at one release or at one commit, so make them agree").render(m.src))
+                val got = fetch_revision(r, coordinate, rev)?
+                if pinned_sha(*r, coordinate) == ""
+                    r.pinned.push(Selected(coordinate, got.sha))
+                elif pinned_sha(*r, coordinate) != got.sha
+                    return Err(error(d.span, s"`${d.label}` pins $coordinate to the commit ${got.sha}, and another dependency pins it to ${pinned_sha(*r, coordinate)}: a package is read at one commit, so make them agree").render(m.src))
+                got.dir
             Local(p) ->
                 if fetched then return Err(error(d.span, s"`${d.label}` is a path dependency of a fetched package: a directory is only where it is on the machine that published it").render(m.src))
                 val full = if is_absolute(p) then p else dir + "/" + p
@@ -513,7 +561,7 @@ private visit(r: *Resolver, dir: string, fetched: bool, seen: *Buf[string], out:
                             Some(i) -> w.members[i]
                             None -> return Err(error(d.span, s"`${d.label}` is a workspace dependency, and no member of the workspace at ${w.root} is named `${d.label}`").render(m.src))
                     None -> return Err(error(d.span, s"`${d.label}` is a workspace dependency, and this package is in no workspace: a workspace's root lists its members, `workspace = [\"app\", \"${d.label}\"]`").render(m.src))
-        val into_fetched = fetched || d.origin is Git(_, _)
+        val into_fetched = fetched || d.origin is Git(_, _) || d.origin is Rev(_, _)
         visit(r, target, into_fetched, seen, out)?
     Ok(())
 
@@ -550,11 +598,93 @@ private fetch_package(r: *Resolver, coordinate: string, version: string) -> Resu
         return Err(s"avin: $coordinate v$version is not fetched yet; `avin build` fetches it")
     else
         hash = clone_package(r.fetching, coordinate, version, dir)?
-    if find_sum(r.sums, coordinate, version) is Some(line)
-        if line.hash != hash
-            return Err(s"avin: $SumName records $coordinate v$version as ${line.hash}, and the package hashes to $hash: the tag may have moved or the repository been rewritten. If the new contents are the ones you want, remove the line and build again")
-    if find_sum(r.read, coordinate, version) is None then r.read.push(SumLine(coordinate, version, hash))
+    check_sum(r, coordinate, version, hash)?
     Ok(dir)
+
+// Holds a fetched package's hash to the sum file's line for it, and notes that resolution read it.
+// `key` is the version, or `r` and the commit.
+private check_sum(r: *Resolver, coordinate: string, key: string, hash: string) -> Result[unit, string]
+    if find_sum(r.sums, coordinate, key) is Some(line)
+        if line.hash != hash
+            return Err(s"avin: $SumName records $coordinate ${sum_label(key)} as ${line.hash}, and the package hashes to $hash: the tag may have moved or the repository been rewritten. If the new contents are the ones you want, remove the line and build again")
+    if find_sum(r.read, coordinate, key) is None then r.read.push(SumLine(coordinate, key, hash))
+    Ok(())
+
+/** A package fetched at a commit: where it is kept, and the commit's full id. */
+struct FetchedRevision
+    dir: string
+    sha: string
+
+/** Where `coordinate` at the commit `sha` (a full id) is kept in the cache `cache`. */
+cached_revision_dir(cache: string, coordinate: string, sha: string) -> string = s"$cache/$coordinate/@r$sha"
+
+private pinned_sha(r: Resolver, coordinate: string) -> string
+    for s in r.pinned
+        if s.coordinate == coordinate then return s.version
+    ""
+
+// The cache entries of `coordinate` whose commit begins with `rev`, as full ids.
+private cached_commits(cache: string, coordinate: string, rev: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    for name in entries(cache + "/" + coordinate).unwrap_or(buf())
+        if name.starts_with("@r" + rev) && !name.ends_with(".hash") then out.push(name[2..])
+    out
+
+// A package at a commit, by a full or abbreviated id: from the cache when an entry's commit begins
+// with it, or cloned and resolved to the commit's full id. The cache and the sum file are keyed by the
+// full id, so two spellings of one commit are one package.
+private fetch_revision(r: *Resolver, coordinate: string, rev: string) -> Result[FetchedRevision, string]
+    if r.fetching.cache == "" then return Err(s"avin: cannot fetch $coordinate at $rev: this machine has no cache directory to keep packages in; set XDG_CACHE_HOME")
+    var sha = ""
+    val have = cached_commits(r.fetching.cache, coordinate, rev)
+    if have.len() > 1 then return Err(s"avin: `$rev` is the start of more than one commit of $coordinate the cache holds: write more of it")
+    if have.len() == 1 then sha = have[0]
+    if sha == "" && !r.fetching.online then return Err(s"avin: $coordinate at $rev is not fetched yet; `avin build` fetches it")
+    var hash = ""
+    if sha != ""
+        val dir = cached_revision_dir(r.fetching.cache, coordinate, sha)
+        hash = read_text(dir + ".hash") match
+            Ok(t) -> t.trim()
+            Err(_) -> return Err(s"avin: $dir holds $coordinate at $sha and no record of what it hashed to, so $SumName cannot be checked against it; remove that directory and build again")
+    else
+        val cloned = clone_revision(r.fetching, coordinate, rev)?
+        sha = cloned.sha
+        hash = read_text(cached_revision_dir(r.fetching.cache, coordinate, sha) + ".hash").map_err(e -> s"avin: ${e.to_string()}")?.trim()
+    check_sum(r, coordinate, rev_key(sha), hash)?
+    Ok(FetchedRevision(cached_revision_dir(r.fetching.cache, coordinate, sha), sha))
+
+// Clones the repository, finds the commit `rev` names (fetching it by its full id when no branch or
+// tag reaches it), checks it out, and files the tree in the cache under the commit's full id with its
+// hash beside it. A commit already filed by another build is the same tree.
+private clone_revision(fetching: Fetching, coordinate: string, rev: string) -> Result[FetchedRevision, string]
+    val above = fetching.cache + "/" + coordinate
+    make_dir_all(above).map_err(e -> s"avin: $above: ${e.to_string()}")?
+    val partial = pending_name(above + "/@r" + rev)
+    defer _ = remove_dir_all(partial)
+    val url = fetching.base + coordinate + ".git"
+    val cloned = capture("git", ["clone", "--quiet", url, partial], stderr = true, timeout = 600000).map_err(e -> s"avin: cannot fetch $coordinate at $rev: could not run git: ${e.to_string()}")?
+    if !cloned.status.ok()
+        return Err(s"avin: cannot fetch $coordinate at $rev from $url:\n${cloned.err.unwrap_or("")}${cloned.text}")
+    var found = capture("git", ["-C", partial, "rev-parse", "--verify", "--quiet", rev + "^{commit}"], stderr = true, timeout = 600000).map_err(e -> s"avin: cannot fetch $coordinate at $rev: could not run git: ${e.to_string()}")?
+    if !found.status.ok() && valid_full_rev(rev)
+        // No branch or tag reaches it: ask the host for the commit itself.
+        val asked = capture("git", ["-C", partial, "fetch", "--quiet", "origin", rev], stderr = true, timeout = 600000).map_err(e -> s"avin: cannot fetch $coordinate at $rev: could not run git: ${e.to_string()}")?
+        found = capture("git", ["-C", partial, "rev-parse", "--verify", "--quiet", rev + "^{commit}"], stderr = true, timeout = 600000).map_err(e -> s"avin: cannot fetch $coordinate at $rev: could not run git: ${e.to_string()}")?
+    val sha = found.text.trim()
+    if !found.status.ok() || !valid_full_rev(sha)
+        val hint = if valid_full_rev(rev) then "" else s", or `$rev` starts more than one commit; a commit no branch or tag reaches is found only by its full id"
+        return Err(s"avin: $coordinate has no commit `$rev`$hint")
+    val checkout = capture("git", ["-C", partial, "checkout", "--quiet", "--detach", sha], stderr = true, timeout = 600000).map_err(e -> s"avin: cannot fetch $coordinate at $rev: could not run git: ${e.to_string()}")?
+    if !checkout.status.ok()
+        return Err(s"avin: cannot check out $coordinate at $sha:\n${checkout.err.unwrap_or("")}${checkout.text}")
+    remove_dir_all(partial + "/.git").map_err(e -> s"avin: $partial/.git: ${e.to_string()}")?
+    if !exists(partial + "/" + ManifestName) then return Err(s"avin: $coordinate at $sha holds no $ManifestName, so it is not an Avin package")
+    val hash = tree_hash(partial)?
+    val dir = cached_revision_dir(fetching.cache, coordinate, sha)
+    write_text_atomic(dir + ".hash", hash + "\n").map_err(e -> s"avin: $dir.hash: ${e.to_string()}")?
+    if publish_dir(partial, dir) is Err(e)
+        if !is_dir(dir) then return Err(s"avin: $dir: ${e.to_string()}")
+    Ok(FetchedRevision(dir, sha))
 
 // Clones the tag into a directory of this fetch's own beside the cache entry, hashes it, records the
 // hash and then moves it into place, so nothing ever reads a package half fetched.
@@ -601,11 +731,11 @@ tidy(dir: string, fetching: Fetching, check: bool, say: string -> unit) -> Resul
         if find_sum(res.read, l.coordinate, l.version) is Some(_)
             lines.push(l)
         else
-            say(s"${if check then "would remove" else "removed"} ${l.coordinate} v${l.version}")
+            say(s"${if check then "would remove" else "removed"} ${l.coordinate} ${sum_label(l.version)}")
             changed = true
     for l in res.read
         if find_sum(lines, l.coordinate, l.version) is None
-            say(s"${if check then "would add" else "added"} ${l.coordinate} v${l.version}")
+            say(s"${if check then "would add" else "added"} ${l.coordinate} ${sum_label(l.version)}")
             lines.push(l)
             changed = true
     if check || !changed then return Ok(!changed)
@@ -651,26 +781,41 @@ add_dependency(dir: string, source: string, fetching: Fetching, say: string -> u
     if !valid_coordinate(coordinate)
         return Err(s"avin: `$coordinate` is not a git coordinate: a coordinate names a repository as `host/owner/name`, such as `github.com/owner/json`, with no `https://` and no `.git`")
     var version = ""
+    var rev = ""
     if parts.len == 2
-        version = parts[1]
-        if !valid_version(version) then return Err("avin: " + bad_version(version))
+        if valid_version(parts[1]) then version = parts[1]
+        elif valid_rev(parts[1]) then rev = parts[1]
+        else return Err(s"avin: `${parts[1]}` is neither a version nor a revision: " + bad_version(parts[1]))
     else
         version = latest_version(fetching, coordinate)?
     // Fetch it alone first: the name it gives itself is what the manifest lists it under.
-    var fetcher = Resolver(fetching, None, buf(), buf(), buf(), false)
-    val fetched = fetch_package(&fetcher, coordinate, version)?
+    var fetcher = Resolver(fetching, None, buf(), buf(), buf(), buf(), false)
+    var fetched = ""
+    var shown = s"v$version"
+    var entry = ""
+    if rev != ""
+        val got = fetch_revision(&fetcher, coordinate, rev)?
+        fetched = got.dir
+        shown = rev_key(got.sha)
+        entry = s"{ git = \"$coordinate\", rev = \"${got.sha}\" }"
+    else
+        fetched = fetch_package(&fetcher, coordinate, version)?
+        entry = s"{ git = \"$coordinate\", version = \"$version\" }"
     val added = read_manifest(fetched)?
-    if !added.has_package then return Err(s"avin: $coordinate v$version is a workspace's root with no `package` block, which no package can depend on")
+    if !added.has_package then return Err(s"avin: $coordinate $shown is a workspace's root with no `package` block, which no package can depend on")
     var label = added.name
     var existing: Option[Dependency] = None
     for d in m.dependencies
-        if d.origin is Git(c, _) && c == coordinate && existing is None then existing = Some(d)
+        if existing is None
+            d.origin match
+                Git(c, _) -> if c == coordinate then existing = Some(d)
+                Rev(c, _) -> if c == coordinate then existing = Some(d)
+                _ -> ()
     if existing is None
         for d in m.dependencies
             if d.label == label then existing = Some(d)
     if existing is Some(d) then label = d.label
     if label == m.name then return Err(s"avin: $coordinate is this package, `$label`, which cannot depend on itself")
-    val entry = s"{ git = \"$coordinate\", version = \"$version\" }"
     val file = m.dir + "/" + ManifestName
     val text = read_text(file).map_err(e -> s"avin: $file: ${e.to_string()}")?
     val doc = parse_hocon(m.src).map_err(d -> d.render(m.src))?
@@ -702,9 +847,9 @@ add_dependency(dir: string, source: string, fetching: Fetching, say: string -> u
         return Err(message)
     record_sums(outcome.unwrap())?
     if existing is Some(d)
-        say(s"updated $label to $coordinate v$version")
+        say(s"updated $label to $coordinate $shown")
     else
-        say(s"added $label: $coordinate v$version")
+        say(s"added $label: $coordinate $shown")
     Ok(())
 
 // `entry` written as the last line of the dependencies block at `block`, which is the braces and what
