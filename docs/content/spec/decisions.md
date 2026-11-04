@@ -21,6 +21,9 @@ a decision changes, this page and the chapter change together.
 - Typing is nominal. Classes instantiate objects; there are no duck-typed objects.
 - Inference is a useful approximation of Hindley–Milner, not full HM: see
   [inference](/spec/generics/#inference).
+- A call's type argument that nothing at the call decides stays open until the end of the
+  enclosing function body, settled by the first later use that needs it (a branch it joins, a
+  store, a use as a value of a known type), and is an error at the call if nothing settles it.
 - The compiler is written in Sysl. Self-hosting is optional.
 - **The standard library is written in Avin.** Sysl is reached through
   [bindings written in Avin](/spec/sysl-bindings/), which the compiler turns into shims that Sysl
@@ -152,11 +155,16 @@ a decision changes, this page and the chapter change together.
   when its offsets are out of order or outside the string, or either falls inside a character;
   `repeat` traps on a negative count. Casing is the simple mapping, one character for one; trimming
   removes Unicode `White_Space`; `replace` replaces every occurrence, left to right and not
-  overlapping, and an empty pattern occurs nowhere. A method whose natural result is optional
-  (`indexOf`, `toInt`, `toReal`) waits for `Option`, and those yielding a collection or iterator
-  (`split`, `chars`, `bytes`) for the collections.
+  overlapping, and an empty pattern occurs nowhere. Methods yielding a collection or iterator
+  (`split`, `chars`, `bytes`) wait for the collections.
 - Settled 2026-11-03: a built-in type's impl in the core library may declare a method as an
   `@intrinsic`, whose type takes the receiver first.
+- Settled 2026-11-03: the string methods answering with `Option` are `indexOf` (with an optional
+  starting offset), `lastIndexOf`, `toInt`, `toLong` and `toReal`. Offsets are bytes. A number is read
+  whole: `toInt` and `toLong` take an optional `+` or `-` and ASCII digits, so `"+3"` is 3 and
+  `"-0"` is 0, and refuse white space, separators and overflow (`"-9223372036854775808"` is a
+  `long`); `toReal` is correctly rounded, takes decimal only, and refuses white space, `nan`, `inf`,
+  hexadecimal and a value too large to be finite. A refusal is `None`, never a trap.
 - A generic overload is compared by the same rule as any other: `f(x: int)` is more specific than
   `f[T](x: T)`, which accepts an `int` while `f(int)` does not accept a `T`.
 - Whether a parameter is by-name does not distinguish overloads. An argument some candidate takes by
@@ -250,6 +258,13 @@ a decision changes, this page and the chapter change together.
 - The collection hierarchy is rooted at `Iterable`, and `Iterator` is itself `Iterable`.
 - `print` is an ordinary library function. It renders with `Display`, separates its arguments with
   `, ` and ends with a newline. `print(debug(x))` selects `Debug`.
+- `debug(x)` yields `x`'s `Debug` form as a string. `Writer` writes strings (with `writeChar`,
+  `writeInt`, `writeField` and `writeSpaces` beside `write`); `FormatSpec` is `width`, `precision`
+  and `left`, as in Sysl; `toString()` is a default body of `Display`.
+- A built-in type conforms to a trait through an impl and implements every method of the trait,
+  since a trait's default bodies are shared by objects and a built-in value is not one.
+- A variant's fields take defaults, each a function of the fields before it, as a constructor's
+  parameters do.
 - Avin has Sysl's full string interpolation and formatting.
 - An interpolated string is a method call on `StringContext`: `p"a $x b"` is
   `StringContext(["a ", " b"]).p(x)`. `s`, `f` and `raw` are library methods, and a program defines
@@ -286,6 +301,17 @@ a decision changes, this page and the chapter change together.
 - `==` between two values whose static types share no common type is a compile error. On `Any` and
   on trait-typed values `==` is decided at run time through the type's entries: values of different
   run-time types are unequal. `===` stays defined only on reference types, and not on `Any`.
+- Settled 2026-11-03: the operator traits are the core library's `Eq` (`equals(other: Self) ->
+  bool`), `Hash` (`hash() -> long`), `Ord: Eq` (`compare(other: Self) -> int`, with `less`,
+  `lessOrEqual`, `greater` and `greaterOrEqual` defaulting from it), and `Add`, `Sub`, `Mul`, `Div`,
+  `Rem` (`add`, `subtract`, `multiply`, `divide`, `remainder`, each `(other: Self) -> Self`) and `Neg`
+  (`negate() -> Self`). Every type conforms to `Eq` and `Hash` implicitly; `==` on a type parameter
+  still needs a bound that is or requires `Eq`. The built-in types implement the traits their
+  operators have, in the core library, and an operator on a built-in type is the machine's
+  operation, in generic instances too.
+- Settled 2026-11-03: an impl of a trait may bound the type's parameters further (`impl[T: Ord] Ord
+  for Box[T]`), making the type conform only for type arguments meeting them; for now only on data
+  types and traits that are only bounds.
 
 **Project and tooling**
 

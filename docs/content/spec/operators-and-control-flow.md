@@ -10,6 +10,21 @@ Avin has Sysl's operator set and precedence. Operators are trait methods (`+` is
 `==` is `Eq`), so a generic needs the bound that supplies one, and a user type gains one through an
 `impl`.
 
+| Operator | Trait | Method |
+| --- | --- | --- |
+| `+` `-` `*` `/` `%` | `Add` `Sub` `Mul` `Div` `Rem` | `add` `subtract` `multiply` `divide` `remainder` |
+| unary `-` | `Neg` | `negate` |
+| `==` `!=` | `Eq` | `equals`, and its negation |
+| `<` `<=` `>` `>=` | `Ord` | `less` `lessOrEqual` `greater` `greaterOrEqual` |
+
+Each method takes and yields the implementing type: `add(other: Self) -> Self`. `Ord` requires `Eq`;
+a type implements its `compare(other: Self) -> int`, negative, zero or positive, and inherits the
+four comparisons from it, implementing any of them as well where it can answer more directly. The
+built-in types implement the traits their operators have, so `int` is an `Add` and an `Ord`, and
+`string` is an `Add` (joining) and an `Ord`. Both operands of an operator on a data type or a class
+are of one type. The wrapping, saturating, bitwise and shift operators belong to the built-in types
+alone.
+
 | Family | Operators |
 | --- | --- |
 | Arithmetic | unary `+` `-`; `+` `-` `*` `/` `%` |

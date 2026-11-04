@@ -211,6 +211,32 @@ type pattern names. A type pattern on a value whose static type already conforms
 nothing, and on a value of another value type (possible only in a copy of generic code) never
 matches.
 
+**Operators and equality.** The checker keeps an operator as its `Arith`, `Negate` or `Compare` node
+whatever its operands' type, after holding a data type, a class or a type parameter to the core
+trait the operator needs (`Add`, `Ord`, `Eq`, found by name in module `avin`). Lowering decides per
+instance from the concrete type: a built-in type gets the machine operation (so `a + b` in
+`sum[T: Add]` at `int` is a checked add with its trap at the operator, and no call); a final class
+or a data type gets a direct call of what its method table holds at the trait method's position,
+its own method or the trait's default body; an open class, a trait and a trait's `Self` get a call
+through the object's method table. A call written through a bound to a core operator method, or of
+`equals` and `hash` on any value, is lowered the same way. `==` on a type with no `equals` of its own
+is the type's built-in equality: machine comparison, string bytes, identity for objects and closures,
+and for a tuple or data type a function lowering makes per instance, comparing variant tags and then
+fields; the hash likewise, combining tag and field hashes. A type record also holds two **equality
+entries** after the ancestor count (offsets 8 and 16): its type's `equals` on two objects and `hash` on
+one, compared as exactly that type. `==` on `Any`, a trait type or an open class calls one generated
+function that loads both records, answers false when they differ, compares strings (null record) by
+bytes, and otherwise calls the record's entry; the hash reads the entry the same way. The entries are
+made for every record an object can have, once a program makes such a comparison at all; making them
+can lay out more types, so lowering repeats until no record lacks them.
+
+**Conditional conformance.** An impl with bounds of its own records them per type parameter. A
+data type's conformance to a trait through such an impl holds at a type argument list when the
+arguments meet them, which is checked where a bound is checked; the impl's methods see the bounds as
+their parameters' own. The trait is one that is only a bound, so no value is ever converted to it and
+no type pattern tests it; the type's method table at an instance whose arguments miss the bounds
+still holds the impl's methods, compiled but never reached.
+
 The supertypes an instance has through **variance** are open-ended (`List[Dog]` is a `List[Animal]`
 and a `List[Any]`), so a record does not list them all. Lowering notes each record a type pattern
 tests through `avin_rt_conforms`; once every function is lowered, each record gains those tested
@@ -332,11 +358,33 @@ sees. The compiler knows a small, declared set of
 Each is declared in Avin source with `@intrinsic("…")` and has no body. Everything else, including
 `print`, is ordinary library code.
 
+An intrinsic that is not a string operation is lowered to a function whose body calls one runtime entry point, named in the
+checker's `intrinsic_entry` table with its parameters and result. The formatting library
+(`format.avin`) reaches the runtime this way: `write_out` and `write_int` write to standard output,
+an integer's digits rendered on the stack; `render_int`, `render_real` and `render_char` make a
+value's text; `quote_text` and `quote_char` its quoted, escaped literal; `text_size` and
+`text_width` count a string's bytes and characters; `text_append` and `text_take` keep a
+`StringWriter`'s text in a string object of its own whose length is its capacity, filled in place
+and doubled when full, and copy the written part out.
+
+**Built-in types conforming to traits.** An `impl Trait for int` records a conformance, and the
+checker builds a method table for each built-in type, as for a data type, but holding only the
+impl's methods: a built-in value is no object, so it can neither carry a table nor take a trait's
+default bodies, which are compiled once for objects. A bounded call in an instance whose type
+argument is a built-in type finds its method in that table and calls it directly.
+
+**Rendering an interpolation.** `s"…"` is checked into a join of its pieces with `+`. A hole of a
+built-in type becomes a `Render` node, lowered to the runtime's rendering of the value (a constant
+for `bool` and `unit`); a hole of any other type, a type parameter's included, becomes a call of its
+`toString()`, which needs the type to implement `Display`.
+
 A built-in type's impl may declare a method as an intrinsic; its declared type takes the receiver
 first. `impl string` in `library/avin/string.avin` does so for the string operations that read the
 object itself: `byteLength` (the length word, loaded and narrowed to `int`), a private `byteAt` (a
 checked byte load), `slice`, `repeat` and a private `find`, the last three over the runtime's
-`avin_rt_string_slice`, `avin_rt_string_repeat` and `avin_rt_string_find`. A direct call of one is
+`avin_rt_string_slice`, `avin_rt_string_repeat` and `avin_rt_string_find`, and a private
+`parseReal` over `avin_rt_string_parse_real`, which reads the number with Sysl's parser and answers
+not-a-number for a refusal. A direct call of one is
 lowered where it is made, so its checks (an offset out of range, an offset inside a character, a
 negative count) trap at the caller's line; the intrinsic's function body, used when the method is
 passed as a value, reports them at its declaration. The runtime's `avin_rt_new_text` refuses a

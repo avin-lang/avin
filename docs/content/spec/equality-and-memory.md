@@ -19,6 +19,12 @@ element of a `Set`. `!=` is the negation.
 error, not `false`. Where the common type is `Any` or a trait, the comparison is decided at run time
 by the values' own types, and values of different types are unequal.
 
+`==` is `Eq`'s `equals(other: Self) -> bool` and the hash is `Hash`'s `hash() -> long`. Every type
+conforms to both without declaring it, so `[K: Eq + Hash]` admits any key type, and `x.equals(y)`
+and `x.hash()` may be called on any value. A type that implements `Eq` in an impl, or in a class's
+header, compares by its own `equals` wherever it is compared: written directly, through a bound, as a
+field of a data value or a part of a tuple, and as an `Any`.
+
 Equal values must have equal hashes. `derives Eq, Hash` gives both from the same fields, so they
 agree. A class that implements one of `==` and the hash by hand must implement the other, and keeping
 the two consistent is then its author's responsibility. `Ord` is never derived implicitly;
