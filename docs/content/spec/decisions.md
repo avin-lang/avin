@@ -853,6 +853,40 @@ Settled by the user on 2026-11-04:
     allowed.
   - Every type parameter of a generic deriving type is bounded by the derived trait.
 
+- Packages beyond the manifest, settled by the user (2026-11-04) as proposed:
+  - **Features** ([features](/spec/packages/#features)), Sysl's model with the module as the unit
+    gated: a feature block has `doc`, `default`, `modules`, `enables` and `requires`, and
+    `name = [x]` is its short form; optional dependencies, `"dep:x"`, `"dep/feature"`, users'
+    `features`, `default_features = false` and `-x`, unification by union and the
+    `--features`/`--no-default-features`/`--all-features` flags are Sysl's. Where Sysl gates lines
+    with `#if feature_x`, Avin has no conditional compilation: a feature lists whole **modules**
+    (with those under them), read only while it is on, and an import of a gated module or of an
+    optional dependency's module is allowed only from a module whose own gate implies it, checked
+    against the manifest whatever is selected, so features are additive by construction. `avin test`,
+    `avin check`, the language server and `avin tidy` turn every feature on. Not carried over: Sysl's
+    `choices`, a feature's `if` and `targets`, and options, which are about machines and C
+    configuration Avin's manifest does not describe.
+  - **Members of a repository** ([members](/spec/packages/#members-of-a-repository)), Sysl's:
+    `{ git, member = "dir", version | rev }`, the member a package named `<coordinate>//<dir>` for
+    selection and `avin.sum`, every member at one version one clone whose hash each member's line
+    carries, a fetched member's `workspace = true` and in-repository `path` siblings read as their
+    own coordinates at the member's version, and `avin add <coordinate>//<dir>@<version>`. Its modules
+    keep their own names, as every dependency's do, so Avin needs no `package.repository` key.
+  - **Vendoring** ([vendoring](/spec/packages/#vendoring)), Sysl's: `avin vendor` copies the
+    resolution with every feature on into `vendor/` at the project (workspace) root in the cache's
+    layout, each copy hashed against its `avin.sum` line first, `.git` and path dependencies left out;
+    a `vendor/` present is the cache, and the root's `vendor/` is never a module. Two choices of
+    Avin's own: a package missing from `vendor/` is **refused** rather than fetched into it, so a
+    vendored build never touches the network; and `avin vendor` **removes** packages the resolution
+    no longer reads, as `avin tidy` does for lines.
+  - **The standard library's modules** ([standard library](/spec/packages/#the-standard-library-s-modules)):
+    the `avin` tree shipped with the compiler (`share/avin/library`, or `AVIN_ROOT/library`),
+    versioned with it, never a dependency and never in `avin.sum`; `avin` is the prelude, seen
+    without an import, and every module under it is imported by name like any module. A
+    compilation reads the prelude and then only the library modules something imports,
+    transitively, so the library can grow without every program parsing all of it. Domain libraries
+    are packages (as settled for `dev.avinlang`). The standard library has no features.
+
 **Deferred**
 
 - Public C interoperability. Until then, C is reached through Sysl.
@@ -888,7 +922,7 @@ Settled by the user on 2026-11-04:
   - **Dependencies**: `{ git = "host/owner/name", version = "x.y.z" }` read at the tag `vx.y.z`
     and cloned from `https://`; `{ path = "../dir" }`, relative to the manifest naming it and refused
     in a fetched package; `{ workspace = true }`. A coordinate with `https://` or `.git` is refused.
-    Features and members of a repository are the entries below.
+    Features and members of a repository are settled above.
   - **`rev` pins**: `{ git = "…", rev = "<hex>" }`, seven to forty lowercase hexadecimal digits,
     refused with a `version` or without `git`. The repository is cloned whole and the commit
     resolved to its full id, fetched by that id when no branch or tag reaches it (only a full id
@@ -929,38 +963,6 @@ Settled by the user on 2026-11-04:
     version that is no longer chosen keeps its line until `avin tidy`); where fetching or resolving
     fails, the manifest is put back as it was. It adds only git dependencies: a path dependency is
     written by hand.
-  - **Features** ([features](/spec/packages/#features)), Sysl's model with the module as the unit
-    gated: a feature block has `doc`, `default`, `modules`, `enables` and `requires`, and
-    `name = [x]` is its short form; optional dependencies, `"dep:x"`, `"dep/feature"`, users'
-    `features`, `default_features = false` and `-x`, unification by union and the
-    `--features`/`--no-default-features`/`--all-features` flags are Sysl's. Where Sysl gates lines
-    with `#if feature_x`, Avin has no conditional compilation: a feature lists whole **modules**
-    (with those under them), read only while it is on, and an import of a gated module or of an
-    optional dependency's module is allowed only from a module whose own gate implies it, checked
-    against the manifest whatever is selected, so features are additive by construction. `avin test`,
-    `avin check`, the language server and `avin tidy` turn every feature on. Not carried over: Sysl's
-    `choices`, a feature's `if` and `targets`, and options, which are about machines and C
-    configuration Avin's manifest does not describe.
-  - **Members of a repository** ([members](/spec/packages/#members-of-a-repository)), Sysl's:
-    `{ git, member = "dir", version | rev }`, the member a package named `<coordinate>//<dir>` for
-    selection and `avin.sum`, every member at one version one clone whose hash each member's line
-    carries, a fetched member's `workspace = true` and in-repository `path` siblings read as their
-    own coordinates at the member's version, and `avin add <coordinate>//<dir>@<version>`. Its modules
-    keep their own names, as every dependency's do, so Avin needs no `package.repository` key.
-  - **Vendoring** ([vendoring](/spec/packages/#vendoring)), Sysl's: `avin vendor` copies the
-    resolution with every feature on into `vendor/` at the project (workspace) root in the cache's
-    layout, each copy hashed against its `avin.sum` line first, `.git` and path dependencies left out;
-    a `vendor/` present is the cache, and the root's `vendor/` is never a module. Two choices of
-    Avin's own: a package missing from `vendor/` is **refused** rather than fetched into it, so a
-    vendored build never touches the network; and `avin vendor` **removes** packages the resolution
-    no longer reads, as `avin tidy` does for lines.
-  - **The standard library's modules** ([standard library](/spec/packages/#the-standard-library-s-modules)):
-    the `avin` tree shipped with the compiler (`share/avin/library`, or `AVIN_ROOT/library`),
-    versioned with it, never a dependency and never in `avin.sum`; `avin` is the prelude, seen
-    without an import, and every module under it is imported by name like any module. A
-    compilation reads the prelude and then only the library modules something imports,
-    transitively, so the library can grow without every program parsing all of it. Domain libraries
-    are packages (as settled for `dev.avinlang`). The standard library has no features.
 
 - Repeated parameters beside overloads and constructors
   ([declarations](/spec/declarations/#repeated-parameters)): an overload with a repeated parameter
