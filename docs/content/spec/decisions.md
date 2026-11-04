@@ -426,9 +426,6 @@ a decision changes, this page and the chapter change together.
   collection's, so a program's own class with such a companion is written as a literal too. A `List`
   literal is built from the back with `::`, since `List` is a data type.
 - A collection literal compared with `==`, `!=` or an ordering takes the other operand's type.
-- `Vector` keeps its elements in one array that is never written after the vector is made: indexing
-  is constant time and a changed vector is a copy. A persistent structure may replace it without
-  changing its interface.
 - A trap inside the core library, a `fail` or a failed check such as an overflow alike, reports the
   place where the program last entered the library: the program's own call, however many library
   calls deep the trap is and whether the program reached the library directly, through a method
@@ -556,6 +553,16 @@ Settled by the user on 2026-11-03:
   guards or yielded value.
 
 Settled by the user on 2026-11-04:
+
+- **`Vector[+T]` is a persistent, radix-balanced tree of arrays of 32**, with a prefix and a suffix
+  beside a balanced middle at every level, and stays the default sequence (`[1, 2]`, `[]T`,
+  `main(args)`). Indexing and `updated` take one array per level, at most six; `:+` and `+:` take
+  amortized constant time; slicing, `take`, `drop` and their kin take time in the depth and share
+  every array they do not cut; `++` takes time in the shorter operand. A vector's arrays are
+  exactly sized and never written once they are in a tree. The one-array immutable sequence
+  remains as **`ArraySeq[+T]`**, for elements built once and then read, with no level between an
+  index and its element; every changed `ArraySeq` is a copy. Every collection has `toArraySeq()`.
+  See [collections](/spec/collections/#vector).
 
 - **An impl that only adds methods may be written in any module** (a relaxed impl); in another module
   than its type's or trait's it is an [extension](/spec/declarations/#extensions): `impl string`,

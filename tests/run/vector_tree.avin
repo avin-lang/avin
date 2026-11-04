@@ -1,0 +1,174 @@
+// expect: exit 0
+// env: AVIN_GC_STRESS=0
+// A vector's elements are in a tree of arrays of 32 with a prefix and a suffix at every level, so
+// its shape changes as it crosses 32, 1024 and 32768 elements, and again at 2^20. Every vector here
+// is checked against a buffer that holds the elements it should: by index, forwards, backwards,
+// by equality and by hash. A check that fails traps, so the output is only the sizes covered.
+
+element(i: int) -> int = i * 7 + 3
+
+modelOf(n: int) -> Buffer[int]
+    val b = Buffer[int]()
+    for i in 0 ..< n do b.add(element(i))
+    b
+
+check(label: string, v: Vector[int], model: Buffer[int])
+    val n = model.length()
+    if v.length() != n then fail(s"$label: length ${v.length()}, expected $n")
+    for i in 0 ..< n
+        if v(i) != model(i) then fail(s"$label: element $i is ${v(i)}, expected ${model(i)}")
+    var i = 0
+    for x in v
+        if x != model(i) then fail(s"$label: iterator element $i")
+        i += 1
+    if i != n then fail(s"$label: the iterator gave $i elements")
+    val r = v.reverseIterator()
+    var j = n - 1
+    while r.hasNext()
+        if r.next() != model(j) then fail(s"$label: reverse iterator element $j")
+        j -= 1
+    if j != -1 then fail(s"$label: the reverse iterator stopped before ${j + 1}")
+    if v.foldLeft(0, (acc, x) -> acc +% x) != model.foldLeft(0, (acc, x) -> acc +% x) then fail(s"$label: foldLeft")
+    if n > 0 && (v.head() != model(0) || v.last() != model(n - 1)) then fail(s"$label: ends")
+
+appended(n: int) -> Vector[int]
+    var v: Vector[int] = []
+    for i in 0 ..< n do v = v :+ element(i)
+    v
+
+prepended(n: int) -> Vector[int]
+    var v: Vector[int] = []
+    var i = n - 1
+    while i >= 0
+        v = element(i) +: v
+        i -= 1
+    v
+
+// Grows from the middle outwards, a third of the elements at the front, so both the prefixes and
+// the suffixes fill at every level.
+mixed(n: int) -> Vector[int]
+    val front = n / 3
+    var v: Vector[int] = []
+    var i = front
+    while i < n
+        v = v :+ element(i)
+        if i - front < front then v = element(front - 1 - (i - front)) +: v
+        i += 1
+    v
+
+built(n: int) -> Vector[int]
+    val b = Vector.builder[int]()
+    for i in 0 ..< n do b.add(element(i))
+    b.result()
+
+sameEverywhere(label: string, vs: Vector[Vector[int]])
+    for v in vs
+        if v != vs(0) || v.hash() != vs(0).hash() then fail(s"$label: equality or hash differs")
+
+// Each index replaced in a copy: the copy has the new element, its neighbours and the total of the
+// rest are as they were, and the original keeps its own.
+updates(label: string, v: Vector[int], model: Buffer[int], at: Vector[int])
+    val n = model.length()
+    val total = model.foldLeft(0, (acc, x) -> acc +% x)
+    for i in at
+        val u = v.updated(i, -1)
+        if u(i) != -1 then fail(s"$label: updated($i)")
+        if v(i) != model(i) then fail(s"$label: updated($i) changed the original")
+        if u.length() != n then fail(s"$label: updated($i) has another length")
+        if i > 0 && u(i - 1) != model(i - 1) || i + 1 < n && u(i + 1) != model(i + 1) then fail(s"$label: updated($i) changed a neighbour")
+        if u.foldLeft(0, (acc, x) -> acc +% x) != total -% model(i) +% -1 then fail(s"$label: updated($i) changed another element")
+    check(s"$label after updates", v, model)
+
+sliceModel(model: Buffer[int], from: int, until: int) -> Buffer[int]
+    val b = Buffer[int]()
+    for i in from ..< until do b.add(model(i))
+    b
+
+// Slices at the boundaries of the leaves and levels: each is the elements it should be, it grows at
+// either end without changing the vector it came from, and a slice of it is right too.
+slices(label: string, v: Vector[int], model: Buffer[int], cuts: Vector[int])
+    val n = model.length()
+    for from in cuts
+        for back in cuts
+            val until = n - back
+            if from > until then continue
+            val s = v.slice(from, until)
+            val sm = sliceModel(model, from, until)
+            check(s"$label slice($from, $until)", s, sm)
+            val grown = (-5 +: s) :+ -6
+            if grown.length() != s.length() + 2 || grown(0) != -5 || grown(grown.length() - 1) != -6 then fail(s"$label: grown slice")
+            check(s"$label slice($from, $until) after growing", s, sm)
+            val half = s.length() / 2
+            check(s"$label slice($from, $until).drop($half)", s.drop(half), sliceModel(sm, half, sm.length()))
+    check(s"$label after slicing", v, model)
+
+main()
+    val sizes = [0, 1, 31, 32, 33, 1023, 1024, 1025, 32768, 32769]
+    for n in sizes
+        val model = modelOf(n)
+        val a = appended(n)
+        val p = prepended(n)
+        val m = mixed(n)
+        val b = built(n)
+        val t = Array.tabulate(n, element).toVector()
+        check(s"appended $n", a, model)
+        check(s"prepended $n", p, model)
+        check(s"mixed $n", m, model)
+        check(s"built $n", b, model)
+        check(s"from an array $n", t, model)
+        check(s"mapped $n", a.map(x -> x), model)
+        check(s"from a slice $n", ((-1 +: m) :+ -2).slice(1, n + 1), model)
+        sameEverywhere(s"$n", [a, p, m, b, t, (-1 +: p).tail(), (b :+ -1).init()])
+        if n > 0 then updates(s"$n", m, model, [0, n / 2, n - 1])
+        print(s"$n elements")
+
+    // Updates at every level of trees of each depth, built at both ends.
+    for n in [1025, 32769]
+        val model = modelOf(n)
+        val at = [0, 1, 31, 32, 33, 500, 1023, 1024, n / 2, n - 1025, n - 33, n - 32, n - 1]
+        updates(s"appended $n", appended(n), model, at)
+        updates(s"prepended $n", prepended(n), model, at)
+        updates(s"mixed $n", mixed(n), model, at)
+        print(s"updated $n")
+
+    // Slicing at the boundaries of leaves and of levels, and the other ways of cutting a vector.
+    val shortModel = modelOf(2100)
+    val cuts = [0, 1, 31, 32, 33, 1023, 1024, 1025]
+    slices("appended 2100", appended(2100), shortModel, cuts)
+    slices("mixed 2100", mixed(2100), shortModel, cuts)
+    val n = 33000
+    val model = modelOf(n)
+    slices("mixed", mixed(n), model, [0, 33, 1025, 16500])
+    val v = mixed(n)
+    check("take", v.take(1025), sliceModel(model, 0, 1025))
+    check("drop", v.drop(1025), sliceModel(model, 1025, n))
+    check("takeRight", v.takeRight(33), sliceModel(model, n - 33, n))
+    check("dropRight", v.dropRight(32768), sliceModel(model, 0, n - 32768))
+    val (left, right) = v.splitAt(32768)
+    check("splitAt left", left, sliceModel(model, 0, 32768))
+    check("splitAt right", right, sliceModel(model, 32768, n))
+    check("take beyond", v.take(n + 5), model)
+    check("drop beyond", v.drop(n + 5), Buffer[int]())
+    check("rejoined", left ++ right, model)
+    check("joined to a short one", v.take(3) ++ v.drop(3), model)
+    print(s"sliced $n")
+
+    // Over 2^20 elements, a tree of five levels, once each way it is made.
+    val big = 1048576 + 40
+    val bigModel = modelOf(big)
+    val grown = appended(big)
+    check("2^20 appended", grown, bigModel)
+    check("2^20 built", built(big), bigModel)
+    sameEverywhere("2^20", [grown, built(big)])
+    updates("2^20", grown, bigModel, [0, 32768, 1048576, big - 1])
+    check("2^20 sliced", grown.slice(1000, big - 1000), sliceModel(bigModel, 1000, big - 1000))
+    print(s"$big elements")
+
+    // Concatenation of every pairing of short and long.
+    for x in [0, 1, 33, 1025]
+        for y in [0, 1, 33, 1025]
+            val joined = appended(x) ++ prepended(y).map(e -> e + 1000000)
+            val jm = modelOf(x)
+            for e in modelOf(y) do jm.add(e + 1000000)
+            check(s"$x ++ $y", joined, jm)
+    print("joined")
