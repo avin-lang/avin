@@ -292,22 +292,32 @@ struct ConditionalImpl
     params: Buf[TypeParam]
 
 /** An impl that adds methods to a trait, `impl[T] Seq[T]`: every value whose type conforms to the
- * trait has them. */
+ * trait has them. Or an impl adding methods to a type built from its parameters, `impl[T]
+ * Seq[Seq[T]]` or `impl[T] Option[Option[T]]`: the values whose type matches it have them. `on_trait`
+ * tells which the type the impl adds to is; `trait_id` is that trait's. */
 struct TraitImpl
     unit: usize
     module_name: string
     decl: &ImplDecl
     trait_id: usize
+    on_trait: bool
 
 /** A method an impl adds to trait `trait_id`. It is a generic function whose type parameters are the
  * impl's (`impl_params` of them), then `Self`, the receiver's type, bounded by the trait at the impl's
  * parameters, then its own. A call gives the receiver's static type as `Self`, so each instance calls
  * the trait's methods of that type directly, or through the method table where the receiver is seen
- * only as the trait. */
+ * only as the trait.
+ *
+ * Where the impl adds to a data type, a class or a built-in type built from its parameters
+ * (`on_trait` false), there is no `Self`: the receiver is of the type the impl names. Either way
+ * `target` is that type, naming the impl's parameters as this function's, and a call learns them
+ * by matching the receiver's static type against it. */
 struct TraitMethod
     function: usize
     trait_id: usize
     impl_params: usize
+    on_trait: bool
+    target: &Type
 
 /** An unknown type argument of a call, open until a later use settles it: where it was made, and
  * what to report if nothing does. */
@@ -967,8 +977,16 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
             written[i].kind match
                 Named(n, inner) -> if n != d.type_params[i].name || inner.len() > 0 then in_order = false
                 _ -> in_order = false
+    // Any other type built from the parameters is matched against each receiver's type, so its
+    // methods are a call's to find; a conformance is a type's, at every instance of it.
     if !in_order
-        c.note(unit, d.target.span, "the type an impl adds to takes the impl's type parameters, in order, as in `impl[T] Box[T]`")
+        if d.trait_name is Some(_)
+            c.note(unit, d.target.span, "the type an impl of a trait is for takes the impl's type parameters, in order, as in `impl[T] Display for Box[T]`")
+            return invalid
+        if module_name != home
+            c.note(unit, d.target.span, s"`$path` is declared in another module; an impl adding methods to it belongs in that module")
+            return invalid
+        c.trait_impls.push(TraitImpl(unit, module_name, d, 0, false))
         return invalid
     val outer_generic = c.generic
     c.generic = Some(GenericScope(owner, d.type_params))
@@ -1022,43 +1040,64 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
     elif conditional then c.conditional_methods.push(ConditionalImpl(owner, conditions, unit, d.type_params))
     ImplSymbol(unit, module_name, d, target, owner, trait_type, conditions)
 
-// An impl without `for` whose type is a trait adds methods to the trait: it names the trait's
-// parameters in order, as an impl of a type does, and lives in the trait's module. Its methods are
-// declared once every trait's own methods are.
+// An impl without `for` whose type is a trait adds methods to the trait, at any arguments built from
+// the impl's parameters: `impl[T] Seq[T]` to every sequence, `impl[T] Seq[Seq[T]]` to a sequence of
+// sequences. It lives in the trait's module. Its methods are declared once every trait's own methods
+// are.
 private resolve_trait_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl, id: usize)
     val k = c.classes[id]
-    val written = d.target.kind match
-        Named(_, args) -> args
-        _ -> buf()
-    var in_order = written.len() == d.type_params.len() && written.len() == k.decl.type_params.len()
-    if in_order
-        for i in 0..<written.len()
-            written[i].kind match
-                Named(n, inner) -> if n != d.type_params[i].name || inner.len() > 0 then in_order = false
-                _ -> in_order = false
-    if !in_order
-        c.note(unit, d.target.span, s"the trait an impl adds to takes the impl's type parameters, in order, as in `impl[T] ${k.name}[T]`")
-        return
     if module_name != k.module_name
         c.note(unit, d.target.span, s"`${k.name}` is declared in another module; an impl adding methods to it belongs in that module")
         return
-    c.trait_impls.push(TraitImpl(unit, module_name, d, id))
+    c.trait_impls.push(TraitImpl(unit, module_name, d, id, true))
 
 // Each method an impl adds to a trait is a generic function over the impl's parameters, then `Self`,
 // the type of the value it is called on, bounded by the trait, then its own. Its receiver, `self`, is
 // a `Self`, so its body reaches the value only through the trait's methods, and a call compiles it
 // for the receiver's static type.
+// The type the impl adds to is resolved once, with its parameters as those of a placeholder owner, to
+// hold it to naming each of them: a call learns the impl's parameters only from its receiver's type.
 private declare_trait_methods(c: *Checker, i: usize)
-    for m in c.trait_impls[i].decl.members
-        if m is MethodMember(f, public, overrides, static_member) then declare_trait_method(c, i, f, public, overrides, static_member)
+    val block = c.trait_impls[i]
+    val placeholder = c.symbols.len()
+    val outer_generic = c.generic
+    c.generic = Some(GenericScope(placeholder, block.decl.type_params))
+    val target = resolve_type(c, block.unit, block.decl.target)
+    c.generic = outer_generic
+    if *target is ErrorType then return
+    var complete = true
+    for j in 0..<block.decl.type_params.len()
+        if !names_param(target, placeholder, j)
+            val tp = block.decl.type_params[j]
+            c.note(block.unit, tp.span, s"`${tp.name}` is not part of `${show_type(block.decl.target)}`; each of an impl's type parameters is, so a call learns it from the receiver's type")
+            complete = false
+    if !complete then return
+    for m in block.decl.members
+        if m is MethodMember(f, public, overrides, static_member) then declare_trait_method(c, i, f, public, overrides, static_member, target, placeholder)
 
-private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, overrides: bool, static_member: bool)
+/** Whether type `t` names the `index`th type parameter of `owner`. */
+private names_param(t: &Type, owner: usize, index: usize) -> bool = *t match
+    TypeVar(o, i, _) -> o == owner && i == index
+    Tuple(items) -> any_names_param(items, owner, index)
+    Function(params, result) -> any_names_param(params, owner, index) || names_param(result, owner, index)
+    ByName(inner) -> names_param(inner, owner, index)
+    Data(_, _, args) -> any_names_param(args, owner, index)
+    Class(_, _, args) -> any_names_param(args, owner, index)
+    _ -> false
+
+private any_names_param(items: Buf[&Type], owner: usize, index: usize) -> bool
+    for t in items
+        if names_param(t, owner, index) then return true
+    false
+
+private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, overrides: bool, static_member: bool, written_target: &Type, placeholder: usize)
     val block = c.trait_impls[i]
     val unit = block.unit
     val k = block.trait_id
-    val trait_name = c.classes[k].name
+    val trait_name = if block.on_trait then c.classes[k].name else head_name(written_target)
     if static_member
-        c.note(unit, f.name_span, s"`${f.name}` is static, which only a trait's member and its implementations are; an impl adding to `$trait_name` adds methods of values")
+        val adds = if block.on_trait then "a trait's member and its implementations are" else "a type's own member is"
+        c.note(unit, f.name_span, s"`${f.name}` is static, which only $adds; an impl adding to `$trait_name` adds methods of values")
         return
     if f.annotations.len() > 0
         c.note(unit, f.name_span, "annotations on methods are not implemented")
@@ -1066,17 +1105,22 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
     if overrides
         c.note(unit, f.name_span, s"`${f.name}` overrides nothing; the methods an impl adds to `$trait_name` are not the trait's, so no type implements or overrides them")
         return
-    if trait_declares(c, k, f.name, 0)
+    if block.on_trait && trait_declares(c, k, f.name, 0)
         c.note(unit, f.name_span, s"`${f.name}` is already a method of `$trait_name`; an impl adds to a trait only methods the trait does not declare")
         return
     val id = c.symbols.len()
     val impl_params = block.decl.type_params.len()
+    var renamed: Buf[&Type] = buf()
+    for j in 0..<impl_params
+        renamed.push(TypeVar(id, j, block.decl.type_params[j].name))
+    val target = substitute(written_target, placeholder, renamed)
     var type_params: Buf[TypeParam] = buf()
     for tp in block.decl.type_params
         type_params.push(tp)
-    var bound: Buf[&TypeExpr] = buf()
-    bound.push(block.decl.target)
-    type_params.push(TypeParam(block.decl.target.span, "Self", Invariant, bound, s"${c.units[unit].src.name}:${block.decl.span.start}:Self"))
+    if block.on_trait
+        var bound: Buf[&TypeExpr] = buf()
+        bound.push(block.decl.target)
+        type_params.push(TypeParam(block.decl.target.span, "Self", Invariant, bound, s"${c.units[unit].src.name}:${block.decl.span.start}:Self"))
     for tp in f.type_params
         type_params.push(tp)
     // The impl's parameters and `Self` are bounded here, in this function's scope; `signature`
@@ -1085,7 +1129,7 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
     c.generic = Some(GenericScope(id, type_params))
     declare_bounds(c, unit, id, type_params, 0)
     c.generic = outer_generic
-    val receiver: &Type = TypeVar(id, impl_params, "Self")
+    val receiver: &Type = if block.on_trait then TypeVar(id, impl_params, "Self") else target
     var symbol = signature(c, unit, block.module_name, f, id, type_params, false, Some(receiver))
     var receiver_types: Buf[&Type] = buf()
     var receiver_names: Buf[string] = buf()
@@ -1097,32 +1141,71 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
         receiver_names.push(n)
     symbol.params = receiver_types
     symbol.param_names = receiver_names
-    symbol.name = trait_name + "." + f.name
+    // A method added to a type built from the impl's parameters is named with that type, which tells
+    // it from a method of the same name another such impl adds.
+    val nested = !block.on_trait || !in_order_target(target, id, impl_params)
+    symbol.name = if nested then type_name(target) + "." + f.name else trait_name + "." + f.name
     symbol.public = public
     symbol.receiver = Some(receiver)
     var method_defaults: Buf[Option[usize]] = buf()
     for _ in receiver_types
         method_defaults.push(None)
     symbol.defaults = method_defaults
-    // The methods impls have added to this trait under the name so far, which this one overloads.
+    // The methods impls have added to this type under the name so far, which this one overloads.
+    // Impls adding to different types built from one, as `Option[Option[T]]` and `Option[List[T]]`,
+    // are told apart by the receiver at a call.
     var same_name: Buf[usize] = buf()
     for tm in c.trait_methods
-        if tm.trait_id == k && c.symbols[tm.function].decl.name == f.name then same_name.push(tm.function)
+        if c.symbols[tm.function].decl.name == f.name && same_added_target(c, tm, block.on_trait, k, target, id, impl_params) then same_name.push(tm.function)
     if same_as_overload(c, symbol, same_name)
-        c.note(unit, f.name_span, s"`${f.name}` is already added to `$trait_name` with the same parameter types; a method's overloads differ in their parameter types")
+        c.note(unit, f.name_span, s"`${f.name}` is already added to `${if nested then type_name(target) else trait_name}` with the same parameter types; a method's overloads differ in their parameter types")
         return
     c.symbols.push(symbol)
     c.states.push(0)
     c.bodies.push(None)
     c.locals.push(buf())
     declare_defaults(c, id)
-    c.trait_methods.push(TraitMethod(id, k, impl_params))
+    c.trait_methods.push(TraitMethod(id, k, impl_params, block.on_trait, target))
     same_name.push(id)
     if same_name.len() > 1 then mark_overloads(c, same_name)
 
+/** The name of the type `t` is an instance of, as a diagnostic names it: `Option` for
+ * `Option[Option[T]]`. */
+private head_name(t: &Type) -> string = *t match
+    Data(_, name, _) -> name
+    Class(_, name, _) -> name
+    _ -> type_name(t)
+
+/** Whether `target`, the type an impl adds to, is its type at the impl's `count` parameters of
+ * `owner`, in order, as `Seq[T]` is. */
+private in_order_target(target: &Type, owner: usize, count: usize) -> bool
+    val args = *target match
+        Data(_, _, a) -> a
+        Class(_, _, a) -> a
+        _ -> return count == 0
+    if args.len() != count then return false
+    for j in 0..<count
+        val named = *args[j] match
+            TypeVar(o, i, _) -> o == owner && i == j
+            _ -> false
+        if !named then return false
+    true
+
+/** Whether method `tm` is added to the same type as an impl adding to `target`, whose parameters
+ * are owner `owner`'s: to the same trait, or the same type built from parameters, the parameters
+ * renamed alike. */
+private same_added_target(c: *Checker, tm: TraitMethod, on_trait: bool, k: usize, target: &Type, owner: usize, count: usize) -> bool
+    if tm.on_trait != on_trait then return false
+    if on_trait && tm.trait_id != k then return false
+    if tm.impl_params != count then return false
+    var names: Buf[&Type] = buf()
+    for j in 0..<count
+        names.push(TypeVar(method_params_owner(), j, "T"))
+    same_type(substitute(tm.target, tm.function, names), substitute(target, owner, names))
+
 /** What the impls adding method `m` add to, as a diagnostic names it: a trait, or a type. */
 private impls_owner(c: *Checker, m: usize) -> string = trait_method_of(c, m) match
-    Some(tm) -> c.classes[tm.trait_id].name
+    Some(tm) -> if tm.on_trait then c.classes[tm.trait_id].name else head_name(tm.target)
     None -> type_name(c.symbols[m].receiver.unwrap())
 
 /** The impl's record of method `m` where an impl adds it to a trait. */
@@ -1130,6 +1213,113 @@ private trait_method_of(c: *Checker, m: usize) -> Option[TraitMethod]
     for tm in c.trait_methods
         if tm.function == m then return Some(tm)
     None
+
+/** Whether a value of type `t` is an instance of the type method `tm` is added to, at whatever
+ * arguments: it conforms to the trait, or is of the data type, of the class or a subclass, or of the
+ * built-in type. Whether its arguments match is `added_args`'s to say. */
+private added_applies(c: *Checker, t: &Type, tm: TraitMethod) -> bool
+    if tm.on_trait then return trait_view(c, t, tm.trait_id) is Some(_)
+    val x = zonk(c, t)
+    *tm.target match
+        Data(d, _, _) -> *x match
+            Data(e, _, _) -> d == e
+            _ -> false
+        Class(k, _, _) -> trait_view(c, x, k) is Some(_)
+        _ -> added_args(c, x, tm) is Some(_)
+
+/** The impl's type arguments a call of method `tm` takes on a value of type `t`: what the
+ * receiver's static type gives each parameter in the type the impl adds to, or `None` where the
+ * receiver's type does not match it. */
+private added_args(c: *Checker, t: &Type, tm: TraitMethod) -> Option[Buf[&Type]]
+    var binds: Buf[Option[&Type]] = buf()
+    for _ in 0..<tm.impl_params
+        binds.push(None)
+    if !match_target(c, tm.target, t, tm.function, &binds, true) then return None
+    var out: Buf[&Type] = buf()
+    for b in binds
+        out.push(b.unwrap_or(ErrorType))
+    Some(out)
+
+// Matches `pattern`, a type built from the impl parameters `owner` owns, against `t`, a receiver's
+// static type or a part of it, binding each parameter in `binds`. Where `covariant`, at the top and
+// inside a covariant parameter, a reference is seen as the pattern's trait or class through its
+// conformances and superclasses, as it is passed where one is expected: a `Vector[Vector[int]]` is a
+// `Seq[Seq[int]]`. Elsewhere each part is the pattern's own type, and a parameter named twice takes
+// one type.
+private match_target(c: *Checker, pattern: &Type, t: &Type, owner: usize, binds: *Buf[Option[&Type]], covariant: bool) -> bool
+    val x = zonk(c, t)
+    if *x is ErrorType then return true
+    *pattern match
+        TypeVar(o, i, _) ->
+            if o != owner then return same_type(pattern, x)
+            binds[i] match
+                Some(b) -> same_type(zonk(c, b), x)
+                None ->
+                    binds.set(i, Some(x))
+                    true
+        Data(d, _, ps) -> *x match
+            Data(e, _, xs) -> d == e && match_args(c, c.data[d].decl.type_params, ps, xs, owner, binds, covariant)
+            _ -> false
+        Class(k, _, ps) ->
+            var seen: Option[&Type] = None
+            val same_class = *x match
+                Class(j, _, _) -> j == k
+                _ -> false
+            if same_class then seen = Some(x)
+            elif covariant then seen = trait_view(c, x, k)
+            seen match
+                Some(up) -> *up match
+                    Class(_, _, xs) -> match_args(c, c.classes[k].decl.type_params, ps, xs, owner, binds, covariant)
+                    _ -> false
+                None -> false
+        Tuple(ps) -> *x match
+            Tuple(xs) -> ps.len() == xs.len() && match_parts(c, ps, xs, owner, binds, covariant)
+            _ -> false
+        Function(ps, r) -> *x match
+            Function(xs, s) -> ps.len() == xs.len() && match_parts(c, ps, xs, owner, binds, false) && match_target(c, r, s, owner, binds, false)
+            _ -> false
+        _ -> same_type(pattern, x)
+
+// The type arguments `ps` of a pattern matched against `xs`, each in a covariant position where the
+// parameter it is for is covariant and the whole is.
+private match_args(c: *Checker, params: Buf[TypeParam], ps: Buf[&Type], xs: Buf[&Type], owner: usize, binds: *Buf[Option[&Type]], covariant: bool) -> bool
+    if ps.len() != xs.len() then return false
+    for i in 0..<ps.len()
+        val co = covariant && i < params.len() && params[i].variance is Covariant
+        if !match_target(c, ps[i], xs[i], owner, binds, co) then return false
+    true
+
+private match_parts(c: *Checker, ps: Buf[&Type], xs: Buf[&Type], owner: usize, binds: *Buf[Option[&Type]], covariant: bool) -> bool
+    for i in 0..<ps.len()
+        if !match_target(c, ps[i], xs[i], owner, binds, covariant) then return false
+    true
+
+/** What a receiver must be for method `tm`, as a diagnostic says it: `an `Option` of an `Option``
+ * for `Option[Option[T]]`, `a `Seq` of pairs` for `Seq[(A, B)]`; the type written out where it has
+ * more than one part built from the parameters. */
+private added_target_phrase(tm: TraitMethod) -> string = target_phrase(tm.target)
+
+private target_phrase(t: &Type) -> string
+    val inner = *t match
+        Tuple(items) -> return if items.len() == 2 then "a pair" else s"a tuple of ${items.len()}"
+        Data(_, _, args) -> args
+        Class(_, _, args) -> args
+        _ -> return s"`${type_name(t)}`"
+    val name = head_name(t)
+    var built: Option[&Type] = None
+    for a in inner
+        if !(*a is TypeVar(_, _, _))
+            if built is Some(_) then return s"`${type_name(t)}`"
+            built = Some(a)
+    val article = if starts_with_vowel(name) then "an" else "a"
+    built match
+        Some(a) -> s"$article `$name` of ${target_phrase(a)}"
+        None -> s"$article `$name`"
+
+private starts_with_vowel(name: string) -> bool
+    for v in ["A", "E", "I", "O", "U", "a", "e", "i", "o", "u"]
+        if name.starts_with(v) then return true
+    false
 
 /** Whether `name` is one of `params`. */
 private names_type_param(params: Buf[TypeParam], name: string) -> bool
@@ -1691,10 +1881,12 @@ private field_visible(c: *Checker, f: FieldSymbol) -> bool = f.public || inside_
 private method_visible(c: *Checker, m: usize) -> bool
     if c.symbols[m].public then return true
     // A private method an impl adds to a trait is called from the methods impls add to that trait.
+    // One an impl adds to a type built from its parameters is private to the type's own impls.
     if trait_method_of(c, m) is Some(tm)
-        return trait_method_of(c, c.body.root) match
-            Some(here) -> here.trait_id == tm.trait_id
-            None -> false
+        if tm.on_trait
+            return trait_method_of(c, c.body.root) match
+                Some(here) -> here.on_trait && here.trait_id == tm.trait_id
+                None -> false
     c.symbols[m].owner_class match
         Some(k) -> inside_class(c, k)
         None -> c.symbols[m].receiver match
@@ -2103,19 +2295,32 @@ private trait_view(c: *Checker, t: &Type, k: usize) -> Option[&Type]
 // The methods of `name` a value of type `t` has: `own`, those of its type, then each that an impl
 // adds to a trait `t` conforms to. The type's own method takes precedence over an added one with the
 // same parameter types, which is left out.
+//
+// An impl adding to a type built from its parameters, as `impl[T] Option[Option[T]]`, adds to the
+// values whose type matches it. Where some added method's type matches, only those are offered;
+// where none does, those whose type the receiver is an instance of are, so the call reports what the
+// receiver would need to be. Such a method is not hidden by the type's own of the same parameter
+// types: both are the type's, so the call is ambiguous, as `refuse_trait_clash` reports.
 private with_trait_methods(c: *Checker, t: &Type, name: string, own: Buf[usize]) -> Buf[usize]
     if c.trait_methods.len() == 0 then return own
     var out: Buf[usize] = buf()
     for m in own
         out.push(m)
+    var matching: Buf[usize] = buf()
+    var unmatched: Buf[usize] = buf()
     for tm in c.trait_methods
         val m = tm.function
         if c.symbols[m].decl.name != name || !method_visible(c, m) then continue
-        if trait_view(c, t, tm.trait_id) is None then continue
+        if !added_applies(c, t, tm) then continue
+        val matches = added_args(c, t, tm) is Some(_)
         var hidden = false
         for o in own
             if same_params_seen(c, t, o, m) then hidden = true
-        if !hidden then out.push(m)
+        if hidden && (tm.on_trait || !matches) then continue
+        if matches then matching.push(m) else unmatched.push(m)
+    val offered = if matching.len() > 0 || own.len() > 0 then matching else unmatched
+    for m in offered
+        out.push(m)
     out
 
 /** The parameter types of method `m` past the receiver, as a call on a value of type `t` sees them,
@@ -2151,26 +2356,43 @@ private refuse_private_trait_method(c: *Checker, at: Span, t: &Type, name: strin
     for tm in c.trait_methods
         val m = tm.function
         if c.symbols[m].decl.name != name || method_visible(c, m) then continue
-        if trait_view(c, t, tm.trait_id) is None then continue
-        c.note(unit_of(c), at, s"`$name` is private to the impls of `${c.classes[tm.trait_id].name}`")
+        if !added_applies(c, t, tm) then continue
+        c.note(unit_of(c), at, s"`$name` is private to the impls of `${impls_owner(c, m)}`")
         return true
     false
 
 // Reports a call of `name` on a value of type `t` that reaches, among `ms`, two methods impls add to
 // two traits `t` conforms to, with the same parameter types: neither trait's is the one meant.
+//
+// An impl adding to a type built from its parameters clashes the same way with another such impl, or
+// with the type's own method, where the receiver matches both.
 private refuse_trait_clash(c: *Checker, at: Span, t: &Type, name: string, ms: Buf[usize]) -> bool
     for i in 0..<ms.len()
         val a = trait_method_of(c, ms[i]) match
             Some(x) -> x
             None -> continue
+        if !a.on_trait && added_args(c, t, a) is Some(_)
+            for o in ms
+                if trait_method_of(c, o) is Some(_) then continue
+                if same_params_seen(c, t, o, ms[i])
+                    c.note(unit_of(c), at, s"`$name` is ambiguous on ${type_name(zonk(c, t))}: `${head_name(a.target)}` has it, and an impl adding to `${type_name(a.target)}` adds it with the same parameter types")
+                    return true
         for j in i + 1..<ms.len()
             val b = trait_method_of(c, ms[j]) match
                 Some(x) -> x
                 None -> continue
-            if a.trait_id != b.trait_id && same_params_seen(c, t, ms[i], ms[j])
-                c.note(unit_of(c), at, s"`$name` is ambiguous on ${type_name(zonk(c, t))}: impls of `${c.classes[a.trait_id].name}` and of `${c.classes[b.trait_id].name}` each add it with the same parameter types")
+            if same_added_target(c, a, b.on_trait, b.trait_id, b.target, b.function, b.impl_params) then continue
+            if added_args(c, t, a) is None || added_args(c, t, b) is None then continue
+            if same_params_seen(c, t, ms[i], ms[j])
+                c.note(unit_of(c), at, s"`$name` is ambiguous on ${type_name(zonk(c, t))}: impls of `${added_label(c, a)}` and of `${added_label(c, b)}` each add it with the same parameter types")
                 return true
     false
+
+/** The type an impl adding method `tm` adds to, as a diagnostic names it: the trait, for an impl of
+ * it at its parameters in order, or the type built from them. */
+private added_label(c: *Checker, tm: TraitMethod) -> string
+    if tm.on_trait && in_order_target(tm.target, tm.function, tm.impl_params) then return c.classes[tm.trait_id].name
+    type_name(tm.target)
 
 /** The methods of `ms` the code being checked may call. */
 private visible_methods(c: *Checker, ms: Buf[usize]) -> Buf[usize]
@@ -7763,6 +7985,10 @@ private refuse_unmet_conformance(c: *Checker, at: Span, receiver_type: &Type, m:
     // A method an impl with bounds of its own adds to a trait needs the trait's arguments, as the
     // receiver has them, to meet those bounds.
     if trait_method_of(c, m) is Some(tm)
+        // One an impl adds to a type built from its parameters needs the receiver to match it.
+        if added_args(c, t, tm) is None
+            c.note(unit_of(c), at, s"`${symbol.decl.name}` is for ${added_target_phrase(tm)}; this is `${type_name(t)}`")
+            return true
         val known = receiver_type_args(c, t, m)
         val f = conformances(c)
         for i in 0..<tm.impl_params
@@ -7858,17 +8084,17 @@ private operand_first(c: *Checker, name_span: Span) -> bool
 // receiver is seen as an instance of that class.
 private receiver_type_args(c: *Checker, receiver_type: &Type, m: usize) -> Buf[&Type]
     val t = zonk(c, receiver_type)
-    // A method an impl adds to a trait takes the trait's arguments as the receiver sees it, then the
-    // receiver's own type as `Self`.
+    // A method an impl adds to a trait takes the impl's arguments as the receiver's type gives them
+    // in the type the impl adds to, then the receiver's own type as `Self`; one an impl adds to a
+    // data type, a class or a built-in type built from its parameters has no `Self`.
     if trait_method_of(c, m) is Some(tm)
         var args: Buf[&Type] = buf()
-        if trait_view(c, t, tm.trait_id) is Some(up)
-            if *up is Class(_, _, a)
-                for x in a
-                    args.push(x)
+        if added_args(c, t, tm) is Some(found)
+            for x in found
+                args.push(x)
         while args.len() < tm.impl_params
             args.push(ErrorType)
-        args.push(t)
+        if tm.on_trait then args.push(t)
         return args
     // A method of an impl for every integer width takes the receiver's width as its parameter.
     if c.symbols[m].type_owner == integer_owner()

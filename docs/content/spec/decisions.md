@@ -93,7 +93,9 @@ a decision changes, this page and the chapter change together.
   declared in an impl of that trait.
 - A `data` type conforming to a trait gives every variant's descriptor the same method table, at the
   trait positions classes use, so a trait-typed call costs the same whatever the value is.
-- A generic impl writes the type's parameters, in order, as its own: `impl[T] Show for Box[T]`.
+- A generic impl of a trait writes the type's parameters, in order, as its own:
+  `impl[T] Show for Box[T]`. An impl without `for` may also name a type built from its parameters
+  (settled 2026-11-04, below).
 - Settled 2026-11-03: [bounds](/spec/generics/#bounds) are traits or classes, written `[T: A + B]`.
   A value of a bounded `T` has its bounds' methods, `val`s and visible fields, and is a value of
   each bound's type; type arguments are held to their bounds where written and where inferred, and
@@ -574,6 +576,18 @@ Settled by the user on 2026-11-04:
   function from a vector and `[](int -> int)` a vector of functions. A type pattern takes it
   without parentheses, `v: []int -> body`. There is no fixed-length `[N]T` (an error); error
   messages print `Vector[int]`.
+- An impl without `for` adds methods to any type built from its parameters
+  ([declarations](/spec/declarations/#impl)): `impl[T] Option[Option[T]]`,
+  `impl[A, B] Pair[A, List[B]]`, `impl[T] Seq[Seq[T]]`, `impl[K, V] Iterable[(K, V)]`. Every
+  parameter must appear in the type. A call matches the receiver's static type against it,
+  seeing a reference through its traits and superclasses only at covariant parts, and holds the
+  learned parameters to the impl's bounds; a receiver that does not match is an error saying what
+  it would need to be. Two impls that both match a receiver and add a method of one name and
+  parameter types make the call an error, as does such a method clashing with the type's own. An
+  impl of a trait still names its type's parameters in order, so conformances never overlap. The
+  core library adds `flatten` to `Option[Option[T]]`, `Result[Result[T, E], E]` and `Seq[Seq[T]]`
+  (a `Vector[T]`), `toMap()` to `Iterable[(K, V)]` (keys bounded as a map's) and `unzip()` to
+  `Seq[(A, B)]`.
 
 **Deferred**
 
@@ -594,9 +608,7 @@ Settled by the user on 2026-11-04:
   empty separator (no piece boundary is defined there). `lines` ends a line at `\n` or `\r\n`; a
   terminator at the end starts no further line, the empty string has no lines, and a lone `\r`
   stays in its line. `take`, `drop`, `takeRight`, `dropRight` and the padding widths clamp rather
-  than trap. `flatten` on `Option[Option[T]]` and `Result[Result[T, E], E]` is not offered: an
-  `impl` cannot name a nested type, and a method on the unnested type has no way to ask `T` to be
-  an option.
+  than trap.
 
 - Sorting ([collections](/spec/collections/#sorting)): every `Seq` has `sorted()` (elements `Ord`),
   `sortedBy[K: Ord](key)` and `sortedWith(compare: (T, T) -> int)`, answering a `Vector`; `List`
