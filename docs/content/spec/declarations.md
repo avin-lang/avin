@@ -1069,6 +1069,14 @@ An impl in a `@tests` file is for a type or of a trait that file declares: an im
 would make a type behave one way while the tests run and another in the program that ships. And a
 program does not start in a `@tests` file: `main` is declared in an ordinary one.
 
+### The core library's tests
+
+The core library's own tests are in `library/tests`, beside its modules, as a package's are in its
+`tests` directory: a program of `@test` functions that uses the library through its public names, as
+any program does, and that `avin test library/tests` runs. That directory is no part of the library
+every program is compiled with, and `avin test` on a program runs that program's tests only, never a
+test the core library or a dependency declares.
+
 ## Initialization
 
 - Creating an instance runs the superclass's constructor first, then stores the class parameters,

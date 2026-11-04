@@ -296,7 +296,7 @@ seen("a") = 1
 
 A mutable set or map changes through its compound-assignment methods, which need no `var`: `s += x`,
 `s -= x`, `s ++= xs`, `s --= xs`, and for a map `m += (k, v)`, `m -= k`, `m ++= pairs`, `m --= keys`;
-removing what is absent is not an error. `retain(p)` removes what fails `p`, and a map's
+removing what is absent is not an error, and `s --= s` empties the set. `retain(p)` removes what fails `p`, and a map's
 `updateWith(k, f)` does what `updatedWith` does, in place, answering the new binding. The methods
 that build a collection — `map`, `flatMap`, `filter`, `mapValues`, `transform`, `filterKeys` and a
 set's `union`, `intersect` and `diff` — answer a new mutable one; a mutable map's `keys()` and
@@ -512,7 +512,7 @@ Literals always build the library's types, even when a user type named `Vector` 
 
 `Buffer[T]` is invariant, growable and mutable. `Buffer[int]()` is an empty buffer; `add(x)`, or
 `b += x`, appends in amortized constant time, `addAll(xs)`, or `b ++= xs`, appends each in turn, `insert(i, x)` and `remove(i)` work at any index, and `clear()` empties
-it. `b(i)` and `b(i) = v` read and replace an element, and an index outside `0 ..< length()` traps
+it. A buffer added to itself, `b ++= b`, appends the elements it held when the call began, once. `b(i)` and `b(i) = v` read and replace an element, and an index outside `0 ..< length()` traps
 at the caller's line. Its elements live in an array with spare capacity, which never holds a value
 that is read before one is written, so a buffer needs no value to fill it with.
 
@@ -620,7 +620,8 @@ Array.fill(2, "a").mkString("-")   // a-a
 `removeFirst()` and `removeLast()` take one off and return it, trapping on an empty deque. So a deque
 is a queue, `addLast` with `removeFirst`, and a stack, `addLast` with `removeLast`. `d(i)` and
 `d(i) = v` read and replace the element `i` places from the front, an index outside
-`0 ..< length()` trapping, and `clear()` empties it. Its elements live in an array as a ring that wraps
+`0 ..< length()` trapping, and `clear()` empties it; `addAll(d)` of itself appends the elements it
+held when the call began, once. Its elements live in an array as a ring that wraps
 around from the array's end to its start, doubling as a buffer's does when full. A deque compares and
 hashes by its elements in order, displays as `[1, 2, 3]`, has `mkString` where its elements display,
 and is built by `Deque.builder` and by a sequence literal where one is expected.
