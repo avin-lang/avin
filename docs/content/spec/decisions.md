@@ -1049,6 +1049,15 @@ Settled by the user on 2026-11-04:
   - **`StringContext.f`, called directly**, reads its specifiers as it runs: a malformed one, `%?`
     (its arguments are `Display` values) and a count that is not an `int` or a `long` trap; a value
     under a conversion its type does not take renders in its own form.
+- The core library's own tests ([tests](/spec/declarations/#tests)): they live in `library/tests`,
+  as a package's live in its `tests` directory, and are an ordinary program of `@test` functions in
+  its root module, which `avin test library/tests` runs and the compiler's gate runs at `-O0` and
+  `-O2`. They test the library through its public names, as a program sees it. The directory is no
+  part of the core library every program is compiled with, and a `@test` in the core library's own
+  modules, like one in a dependency, is never a program's test.
+- A collection added to itself ([collections](/spec/collections/#buffer)): `b.addAll(b)` and
+  `b ++= b` on a `Buffer` or a `Deque` append the elements it held when the call began, once, and
+  `s --= s` on a mutable `Set` empties it.
 
 ## Open
 
