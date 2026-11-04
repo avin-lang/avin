@@ -92,7 +92,7 @@ Data crosses the boundary in a fixed set of shapes:
 | --- | --- |
 | `i8`, `i16`, `int`, `long`, `byte`, `real`, `char`, `bool`, `unit` | By value; Sysl's `u8` is `byte` |
 | `string` | Copied into a Sysl `string` in each direction |
-| `Array[byte]` | Copied into a Sysl `[]u8` in each direction |
+| `Array[byte]` | Copied into a Sysl `[]u8`, and out of a Sysl `[]u8` or `[]const u8` |
 | `Array[T]`, `Vector[T]` of any other boundary type | **Copied**, element by element: into a Sysl slice `[]T`, and out of a Sysl `[]T` or `Buf[T]` into a new array or vector |
 | `Option[T]`, `Result[T, E]` of boundary types | Converted variant by variant by the generated shim |
 | `data` declared with `@sysl("…")` mirroring a Sysl struct or enum of boundary types | Converted field by field |
@@ -196,6 +196,56 @@ Sysl's words:
 ```text
 error: the Sysl mirror `IoError` does not match `sysl.fs.IoError`: match on 'IoError' is not exhaustive; missing PermissionDenied, …
 ```
+
+## Handles
+
+A Sysl value that Avin should hold without seeing inside — a checksum in progress, a mapped file, a
+big integer — is reached through a **handle**: a `class` declared with `@sysl` naming the Sysl type.
+Its body declares only methods. A method without a body is bound to the Sysl method of the same words
+in snake_case (`isEmpty` is `is_empty`), or to the one its own `@sysl("name")` names; a method with a
+body is an ordinary method, and may call the bound ones:
+
+```avin
+@sysl("sysl.checksum.Crc32")
+class Crc32
+    update(bytes: Array[byte])
+    finish() -> long
+    hex() -> string = s"${finish()}"
+
+@sysl("sysl.checksum.new_crc32")
+newCrc32() -> Crc32
+
+@sysl("sysl.math.bigint.BigInt")
+class BigInt
+    sign() -> int
+    neg() -> BigInt
+
+@sysl("sysl.math.bigint.parse")
+parseBigInt(s: string) -> Option[BigInt]
+```
+
+- **Only a binding makes a handle.** A handle has no parameters and no constructor; a binding that
+  returns one — directly, in an `Option` or a `Result`, or from a handle's own method — makes the
+  object, holding one counted reference to the Sysl value it was given (a value is moved into a
+  reference of its own; a counted reference is shared).
+- **A handle goes back into Sysl only as the receiver of its own methods.** A binding taking a handle
+  as a parameter, even inside an `Option`, is an error, and so is a collection of handles or a
+  mirror holding one: a handle crosses out of Sysl only as a result or the value of its `Option` or
+  `Result`. Its Sysl value's fields are not the handle's members.
+- **`close()` gives the value back.** Every handle has it. Closing again does nothing; a bound method
+  called on a closed handle stops the program at the call:
+
+  ```text
+  avin: trap: `Crc32` is closed at main.avin:18:13
+  ```
+
+- **A handle never closed is given back by the collector**, when it frees the object, through a
+  finalizer the shim generates for the class. When that happens is not specified: a value that holds
+  something scarce, such as a file, is closed.
+- **A handle is compared by identity**, and has no `Display` of its own.
+
+The bytes a handle's method answers may be a view of the handle's own value; they are copied out
+before anything else runs, so the Avin array never reads the Sysl value's memory.
 
 ## Generics
 

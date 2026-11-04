@@ -183,6 +183,8 @@ private struct Lowering
     /** Whether a module-level value's initializer is being made at compile time, where a vector
      * literal may be too: it runs once, so its one object is the object it would have made. */
     in_global: bool
+    /** The Sysl handles whose objects have been laid out, each once. */
+    handles: Buf[MirHandle]
     /** Whether the program shows a value of unknown type, which reads the `display` or `debug`
      * entry of its type's record: every record then gets them. */
     runtime_rendering: bool
@@ -240,7 +242,7 @@ lower_program(program: TProgram) -> MirProgram
         if d.table.len() > generic_base then generic_base = d.table.len()
     for b in program.builtins
         if b.table.len() > generic_base then generic_base = b.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, false)
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false)
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
     l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None))
@@ -327,7 +329,7 @@ lower_program(program: TProgram) -> MirProgram
     add_variant_ancestors(&l)
     functions = devirtualize(functions, l.descriptors, dispatch_sites(&l))
     functions = scalar_replace(functions, l.descriptors)
-    MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, tests, program.testing, entry_arguments, strings)
+    MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, l.handles, tests, program.testing, entry_arguments, strings)
 
 /** Whether a function belongs to the core library's module, `avin`, or one under it. */
 private in_core_library(program: TProgram, id: usize) -> bool
@@ -387,7 +389,15 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
                 var fields: Buf[&Type] = buf()
                 for f in l.program.classes[id].fields
                     fields.push(substitute(f.ty.unwrap_or(ErrorType), class_owner(id), args))
-                variants.push(variant_layout(l, key, 0, fields, false, method_table(l, t), record, call_entry(l, t)))
+                val shape = variant_layout(l, key, 0, fields, false, method_table(l, t), record, call_entry(l, t))
+                variants.push(shape)
+                // A Sysl handle has no fields of its own: its one word is the counted Sysl reference
+                // the shim keeps there, which the collector does not trace, and gives back in the
+                // handle's finalizer.
+                val k = l.program.classes[id]
+                if handle_target(k.decl) is Some(target)
+                    l.descriptors[shape.descriptor].size = 8
+                    l.handles.push(MirHandle(k.name, target, handle_finalizer(id), shape.descriptor, k.unit, k.decl.name_span))
         _ -> panic("a layout of a type that is not data, a tuple or a class: " + key)
     if holds_generic_methods(l, t)
         for v in variants
@@ -396,6 +406,9 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
     l.layout_index.put(identity, l.layouts.len())
     l.layouts.push(result)
     result
+
+/** The symbol of the shim's finalizer for the Sysl handle class `id`. */
+private handle_finalizer(id: usize) -> string = s"avin_handle_finalize_$id"
 
 // One variant's fields at their offsets, and its descriptor; a variant with no field data is one
 // constant object, unless `shared` is false: every object of a class is its own, for its identity.
@@ -1768,7 +1781,7 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
             if is_class_constructor(l.program, f.symbol) then l.insts.push(Publish)
             finish(l, returning(l, result))
         None ->
-            if binding_target(symbol.decl) is Some(_) then binding_body(l, symbol, shim_symbol(function_symbol(l.program, f.symbol, inst.type_args)))
+            if binding_target(symbol.decl) is Some(_) || handle_of(l, symbol) is Some(_) then binding_body(l, symbol, shim_symbol(function_symbol(l.program, f.symbol, inst.type_args)))
             else intrinsic_body(l, symbol)
     MirFunction(function_symbol(l.program, f.symbol, inst.type_args), signature, l.values, l.slots, l.blocks)
 
@@ -1834,8 +1847,9 @@ private binding_body(l: *Lowering, symbol: FunctionSymbol, shim: string)
         var own: Buf[Operand] = buf()
         val c = crossing(l, concrete(l, symbol.params[i]), &own)
         crossings.push(c)
-        // An array of bytes is copied into Sysl as it is, with no layout.
-        if !(c.form is Bytes)
+        // An array of bytes is copied into Sysl as it is, with no layout, and a handle's method reads
+        // the receiver's Sysl value where it is.
+        if !(c.form is Bytes) && !(c.form is Handle(_))
             for operand in own
                 layouts.push(operand)
         if l.param_values[i] is Some(v)
@@ -1849,7 +1863,24 @@ private binding_body(l: *Lowering, symbol: FunctionSymbol, shim: string)
     var seen = false
     for b in l.bound
         if b.shim == shim then seen = true
-    if !seen then l.bound.push(MirBinding(shim, binding_target(symbol.decl).unwrap(), symbol.name, crossings, result_crossing, symbol.unit, symbol.decl.name_span))
+    val handle = handle_of(l, symbol)
+    val reach = handle match
+        Some(_) -> if is_handle_release(symbol.decl) then Release else Method(handle_method_name(symbol.decl))
+        None -> TopLevel
+    val target = handle match
+        Some(k) -> handle_target(l.program.classes[k].decl).unwrap()
+        None -> binding_target(symbol.decl).unwrap()
+    if !seen then l.bound.push(MirBinding(shim, target, symbol.name, crossings, result_crossing, symbol.unit, symbol.decl.name_span, reach))
+    // A method other than `close()` runs only while its handle holds a Sysl value: on one `close()`
+    // has given back, it stops the program where the method was called.
+    if reach is Method(_)
+        val word = load_field(l, args[0], FieldSlot(0, MPtr))
+        val closed = compare(l, CmpEq, word, NullAddress)
+        val site = trap_site(l, s"`${l.program.classes[handle.unwrap()].name}` is closed", symbol.decl.name_span)
+        val stop = new_block(l)
+        l.blocks[stop].term = CallerTrap(site)
+        val next = new_block(l)
+        finish_into(l, Branch(closed, stop, next), next)
     val result = machine(l, symbol.result.unwrap_or(Unit))
     val dest = result match
         Some(t) -> Some(fresh(l, t))
@@ -1859,12 +1890,31 @@ private binding_body(l: *Lowering, symbol: FunctionSymbol, shim: string)
         Some(d) -> Some(Value(d))
         None -> None))
 
+// Whether an instance is a method of a Sysl handle bound to its Sysl value.
+private handle_instance(l: *Lowering, index: usize) -> bool
+    val inst = l.instances[index]
+    inst.generated == Written && handle_of(l, l.program.symbols[inst.function]) is Some(_)
+
+/** The Sysl handle class whose method `symbol` is, where it is one without a body: a method bound to
+ * the handle's Sysl value, or its `close()`. */
+private handle_of(l: *Lowering, symbol: FunctionSymbol) -> Option[usize]
+    val k = symbol.owner_class match
+        Some(k) -> k
+        None -> return None
+    if handle_target(l.program.classes[k].decl) is None || symbol.constructor then return None
+    if symbol.decl.body is Some(_) || symbol.decl.clauses.len() > 0 then return None
+    Some(k)
+
 // How a shim converts a value of boundary type `t`, the checker having held every binding's types
 // to those. A data type's or an array's layouts are pushed onto `layouts` in the order the
 // conversion numbers them: each variant's descriptor, or its one constant object, then each field's.
 private crossing(l: *Lowering, t: &Type, layouts: *Buf[Operand]) -> &Crossing
     *t match
         Class(id, _, args) ->
+            // A handle is made by its class's descriptor, whose finalizer gives its Sysl value back.
+            if handle_target(l.program.classes[id].decl) is Some(_)
+                layouts.push(DescriptorAddress(layout(l, t).variants[0].descriptor))
+                return Crossing(t, Handle(handle_finalizer(id)), buf(), 1)
             val array = is_array_class(l.program.classes[id])
             if array && *args[0] is Byte
                 layouts.push(DescriptorAddress(layout(l, t).variants[0].descriptor))
@@ -2303,8 +2353,10 @@ private trap_terminator(l: *Lowering, site: usize) -> Terminator = if l.library 
 // between two of the program's functions, or between two of the library's, touches nothing. A call
 // through a method table or a function value may reach either, so it is treated as both.
 private push_call(l: *Lowering, dest: Option[usize], callee: Callee, args: Buf[Operand])
+    // A Sysl handle's bound method reports a call on a closed handle as the library does, at the
+    // call, so a call to one is placed as a call into the library is.
     val target: Option[bool] = callee match
-        Direct(index) -> Some(library_instance(l, index))
+        Direct(index) -> Some(library_instance(l, index) || handle_instance(l, index))
         _ -> None
     if l.library
         if target is Some(true)
