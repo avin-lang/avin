@@ -527,6 +527,10 @@ Settled by the user on 2026-11-03:
 
 ## Proposed
 
+- `avin.process` ([system library](/spec/system-library/)): `args() -> Vector[string]` holds the
+  arguments after the program's name, and `programName()` gives the name separately; `env(name)` is
+  an `Option[string]`; `exit(code: int) -> Nothing` flushes standard output first, as a trap does.
+  Arguments are checked as UTF-8 at startup. A test run by `avin test` sees no arguments.
 - Running and testing (stage 10): `avin run <program> [-O0 | -O2] [-- args]` builds into
   `.avin/build/` in the program's directory, reuses the executable while nothing it was built from
   has changed, and exits with the program's status, or 128 and the signal's number for a trap. Its

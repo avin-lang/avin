@@ -5,6 +5,7 @@ import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
 import sysl.fs.{current_dir, entries, exists, is_dir, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
 import sysl.process.{Exited, Signalled, Var, capture}
+import sysl.text.from_utf8_unchecked
 
 // The execution corpus: Avin programs under `tests/` with their expected behaviour.
 //
@@ -15,7 +16,9 @@ import sysl.process.{Exited, Signalled, Var, capture}
 //
 // Every program runs with `AVIN_GC_STRESS=1`, so the collector runs at every allocation and a
 // reference the compiler failed to root is found at once. A `// env: NAME=VALUE` line sets a variable
-// for the program's run, and may turn stress off for a program that allocates heavily.
+// for the program's run, and may turn stress off for a program that allocates heavily. An
+// `// args: ARG ...` line gives the program arguments, separated by spaces, an argument in double
+// quotes holding spaces or nothing at all.
 //
 // `examples/*.avin` are held to the same standard as `tests/run`, so every example shown to a
 // reader builds and does what its header says.
@@ -41,9 +44,10 @@ private struct Expectation
     trap: bool
     errors: Buf[string]
     env: Buf[Var]
+    args: Buf[string]
 
 private expectation(text: string) -> Expectation
-    var e = Expectation(0, false, buf(), buf())
+    var e = Expectation(0, false, buf(), buf(), buf())
     for line in text.split("\n")
         if line.starts_with("// expect: exit ") then e.exit = parse_int(line["// expect: exit ".bytes.len..])
         elif line == "// expect: trap" then e.trap = true
@@ -54,7 +58,30 @@ private expectation(text: string) -> Expectation
                 if setting.bytes[i] == u8('=')
                     e.env.push(Var(setting[0..<i], setting[i + 1..]))
                     break
+        elif line.starts_with("// args: ")
+            for a in split_args(line["// args: ".bytes.len..]) do e.args.push(a)
     e
+
+/** The arguments of an `// args:` line: words separated by spaces, a double-quoted word holding
+ * spaces or nothing at all. */
+private split_args(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var word: Buf[u8] = buf()
+    var quoted = false
+    var started = false
+    for b in text.bytes
+        if b == u8('"')
+            quoted = !quoted
+            started = true
+        elif b == u8(' ') && !quoted
+            if started then out.push(from_utf8_unchecked(word.view()))
+            word = buf()
+            started = false
+        else
+            word.push(b)
+            started = true
+    if started then out.push(from_utf8_unchecked(word.view()))
+    out
 
 private parse_int(text: string) -> int
     var n = 0
@@ -141,7 +168,7 @@ private run_case(tc: Toolchain, path: string, scratch: string) -> string
             env.push(v)
             if v.name == "AVIN_GC_STRESS" then stress = false
         if stress then env.push(Var("AVIN_GC_STRESS", "1"))
-        val run = capture(binary, env = env.view(), stderr = true, timeout = 10000) match
+        val run = capture(binary, args = want.args.view(), env = env.view(), stderr = true, timeout = 10000) match
             Ok(r) -> r
             Err(e) ->
                 failures = failures + s"$path $level: did not run: ${e.to_string()}\n"
@@ -199,6 +226,18 @@ listings_skip_dot_entries()
     val programs = program_cases_in(dir)
     assert(programs.len() == 1)
     assert(programs[0] == dir + "/prog")
+
+@test("an args line splits on spaces, a quoted argument keeping its spaces or being empty")
+corpus_args_lines()
+    val want = expectation("// args: one  \"two words\" \"\" x\"y z\"\nmain() = 0\n")
+    assert(want.args.len() == 4)
+    assert(want.args[0] == "one")
+    assert(want.args[1] == "two words")
+    assert(want.args[2] == "")
+    assert(want.args[3] == "xy z")
+    assert(expectation("main() = 0\n").args.len() == 0)
+    assert(split_args("").len() == 0)
+    assert(split_args("   ").len() == 0)
 
 private reject_all(tc: Toolchain, all: Buf[string]) -> string
     var failures = ""
