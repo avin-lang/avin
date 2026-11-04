@@ -726,6 +726,22 @@ Settled by the user on 2026-11-04:
   reach, by the receiver's static type, so a trait method that makes an instance at a larger type
   argument (`zipWithIndex` on an `Iterator[(T, int)]`) is not compiled for every type it makes.
 
+- Set and map methods ([collections](/spec/collections/#maps-and-sets)): an immutable `Set` has
+  `++` and `--` taking any `Iterable[A]` beside `union`, `intersect`, `diff` and `subsetOf`, which
+  keep their names and their `Set` parameter; `+` and `-` stay reserved for `Add` and `Sub`, so one
+  element is `added`/`removed`. An immutable `Map`'s `++` takes any `Iterable[(K, V)]` and `--` any
+  `Iterable[K]`. `Map.keys()` and `values()` answer a `Vector` in iteration order, so the two
+  line up by index, rather than one-shot iterators; `keysIterator()` and `valuesIterator()` are the
+  lazy forms, and `keySet()` answers a `Set`. A mutable map's `keys()` and `values()` are likewise
+  vector snapshots and its `keySet()` an immutable `Set` snapshot. `transform` is the new-map form
+  taking the key and the value (`mapValues` takes the value alone) on both maps, and a mutable map
+  has no in-place `transform`. Everything that builds a collection from a mutable set or map
+  (`map`, `flatMap`, `union`, `intersect`, `diff`, `mapValues`, `transform`, `filterKeys`) answers a
+  new mutable one; `retain(p)` and `updateWith(k, f)` change in place, `updateWith` answering the
+  new binding as an `Option`. `+=`, `-=`, `++=` and `--=` are methods on the mutable collections
+  (a map's `+=` takes a `(key, value)` pair), so they work on a `val`; removing an absent element
+  or key is not an error.
+
 - Sorting ([collections](/spec/collections/#sorting)): every `Seq` has `sorted()` (elements `Ord`),
   `sortedBy[K: Ord](key)` and `sortedWith(compare: (T, T) -> int)`, answering a `Vector`; `List`
   has its own three answering a `List`. `Array`, `Buffer` and `Deque` sort in place with `sort()`,
