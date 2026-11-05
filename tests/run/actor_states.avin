@@ -1,0 +1,90 @@
+// expect: exit 0
+// An actor's body takes `state` blocks, so it is a machine driven by its mailbox: each message is an
+// event, handled by the current state's own arms and then the shared `receive` arms, and an arm's
+// value is the next state: a state written as a constructor, which carries that state's data, or
+// `stay`, which keeps the current state and its data. The first state is where the actor starts, and
+// its `enter` runs after the body. On a transition the arm runs first, then the left state's `leave`,
+// in which `state()` still answers the state being left, then the entered state's `enter`, in which it
+// answers the new one. An arm yielding the current state is a transition and runs both blocks; `stay`
+// runs neither. The actor's own fields are the data every state shares, and its states' arms, `enter`
+// and `leave` blocks read their parameters by name.
+import avin.actors.{ActorRef, spawn}
+import avin.threads.Channel
+import avin.time
+
+data DoorMsg
+    Open
+    Close
+    Lock(code: int)
+    Unlock(code: int)
+    Again
+    Report(reply: ActorRef[string])
+
+actor Door(log: Channel[string]) receives DoorMsg
+    var opened = 0
+    log.send("body")
+
+    state Closed
+        enter
+            log.send(s"enter closed, state ${state()}")
+        leave
+            log.send(s"leave closed, state ${state()}")
+        Open ->
+            log.send("arm open")
+            opened += 1
+            Opened
+        Lock(code) -> Locked(code)
+        Again -> Closed
+
+    state Opened
+        enter
+            log.send(s"enter opened, state ${state()}, opened $opened")
+        Close -> Closed
+
+    state Locked(code: int)
+        enter
+            log.send(s"locked with $code")
+        leave
+            log.send(s"unlocking $code")
+        Unlock(c) if c == code -> Closed
+        Unlock(c) ->
+            log.send(s"wrong code $c")
+            stay
+
+    receive
+        Report(r) ->
+            r.tell(s"${state()} after $opened")
+            stay
+        _ ->
+            log.send(s"ignored in ${state()}")
+            stay
+
+main()
+    val log = Channel[string]()
+    val d = spawn(Door(log))
+    println(log.receive().get())
+    println(log.receive().get())
+    d.tell(Open)
+    println(log.receive().get())
+    println(log.receive().get())
+    println(log.receive().get())
+    d.tell(Open)
+    println(log.receive().get())
+    d.tell(Close)
+    println(log.receive().get())
+    d.tell(Again)
+    println(log.receive().get())
+    println(log.receive().get())
+    d.tell(Lock(42))
+    println(log.receive().get())
+    println(log.receive().get())
+    d.tell(Unlock(7))
+    println(log.receive().get())
+    d.tell(Close)
+    println(log.receive().get())
+    println(d.ask(r -> Report(r), timeout = time.seconds(60)).await())
+    d.tell(Unlock(42))
+    println(log.receive().get())
+    println(log.receive().get())
+    println(d.ask(r -> Report(r), timeout = time.seconds(60)).await())
+    println(log.tryReceive())
