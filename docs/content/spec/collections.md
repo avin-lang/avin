@@ -56,12 +56,16 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
 `zip`), folds and reductions, predicates and searches, grouping and partitioning, and conversions
 (`toList()`, `toVector()`, `toArray()`, `toSet()`, `toMap()`).
 
-- A transformation declared on `Iterable` returns `Iterable[B]`. Each concrete collection
-  **overrides** it with a more precise result type: `List.map` returns `List[B]`, `Set.map` returns
-  `Set[B]`, and `Iterator.map` returns a lazy `Iterator[B]`. Covariant result types make each override
-  legal.
-- So code that knows it has a `List` gets a `List` back, and generic code over `Iterable` gets an
-  `Iterable` whose run-time type is still the concrete collection.
+- A transformation on `Iterable` (`map`, `flatMap`, `filter`, `withFilter`, `collect`, `zip`)
+  returns `Iterable[B]`, built in iteration order, so a class of the program's own that conforms to
+  `Iterable` has every one of them. Each concrete collection keeps its own of the same name and
+  parameter types with a more precise result type: `List.map` returns `List[B]`, `Set.map` returns
+  `Set[B]`, a sequence's returns a `Vector[B]`, and `Iterator.map` returns a lazy `Iterator[B]`.
+- They are added by an impl, so the receiver's static type decides which is called: code that
+  knows it has a `List` gets a `List` back, and code that sees only an `Iterable` gets an `Iterable`,
+  whatever collection it holds. An impl adding to a trait is passed over where one adding the same
+  name and parameter types to a trait requiring it applies, so `Seq`'s `map` is a sequence's, not
+  `Iterable`'s.
 - `xs.view()` returns a lazy `Iterator`, for pipelines that should not build intermediate
   collections (see [views](#methods-every-iterable-has) below).
 - Operations that need something of the elements are added by impls bounding the element type, so
@@ -518,7 +522,10 @@ describe(xs: Vector[string]) -> string = xs match
 The last part may be `rest*`, or `_*` where the rest is not used: the pattern then matches a
 sequence of at least the elements before it, and `rest` is bound to the elements after them. On a
 `List` that is the tail, so `[first, rest*]` is `first :: rest`; on any other sequence it is what
-`drop(n)` answers, a `Vector`. `[rest*]` alone matches every sequence and binds the whole of it.
+`drop(n)` answers, a `Vector`. That is the one rule, `n` being the elements before `rest*`, and it
+holds where `n` is 0: `[rest*]` alone matches every sequence and binds what `drop(0)` answers, the
+list itself on a list, and a `Vector` of the elements on a range, an array, a buffer or a deque,
+made when the pattern matches.
 
 ```text
 total(xs: List[int]) -> int = xs match
@@ -574,9 +581,16 @@ branches of an `if` do: `[dog, cat]` is a `Vector[Animal]`, and `[1, "two"]` is 
 literal's keys agree on one type and its values on another, so `{a: dog, b: cat}` is a
 `Map[string, Animal]`. A literal in braces is all elements or all entries; `{1, b: 2}` is an
 error. Set and map literals nest inside one another and inside sequence literals, and like them may
-spread over lines, a trailing comma allowed. An empty literal with
-nothing to say what it holds takes its type from a later use, as `None` does, and is otherwise an
-error asking for an annotation. A literal compared with `==`, `!=` or an ordering takes the other
+spread over lines, a trailing comma allowed. An empty literal, `[]` or `{}`, or a literal holding
+one anywhere among its parts, joined with values of a collection type takes its type from them
+where nothing useful is expected of the join (nothing, or `Any`): among the elements of a literal,
+the keys or the values of a map literal, the branches of an `if` and the arms of a `match`, it is
+checked after the others and against the type they agree on. So `[{1: [2]}, {}]` is a
+`Vector[Map[int, Vector[int]]]`, `if c then {1: [2]} else {}` a `Map[int, Vector[int]]`, and
+`[{1: {}}, {2: {3: "x"}}]` a vector of `Map[int, Map[int, string]]`; `{}` beside a set is the empty
+set, and beside a sequence, which a set literal cannot build, it is still a set. An empty literal
+with nothing else to say what it holds takes its type from a later use, as `None` does, and is
+otherwise an error asking for an annotation: `if c then {} else {}` and `[{}, {}]` are. A literal compared with `==`, `!=` or an ordering takes the other
 operand's type as its expected type, so `xs == [1, 2]` compares a `List` with a `List` when `xs` is
 one.
 
@@ -780,6 +794,11 @@ for `length()`. Everything else
 it has as [every sequence](#methods-every-seq-has) does, and what those make of it, `map` and
 `filter` as much as `take` and `reverse`, is a `Vector`: `(1 .. 5).map(x -> x * x)` is
 `[1, 4, 9, 16, 25]`.
+
+A range displays as it is written, its bounds as given and `by` and the step where the step is not
+1: `1..5`, `0..<10`, `0..<10 by 2`, `10..1 by -3`. Its `Debug` form is the same, so `println(r)`,
+`s"$r"`, `f"${r}%8s"` and `debug(r)` all show that text, and a range inside a collection, an option or
+a tuple shows it there. A `NumericRange` displays the same way.
 
 ### Ranges of other integer types
 

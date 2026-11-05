@@ -806,8 +806,10 @@ built-in type implements every method of the trait, defaults included.
   and parameter types of a method the receiver's type has (its own, an inherited one, or one of a trait
   it conforms to) is passed over, so a type keeps a faster version of its own wherever its static type
   is known; code that sees only the trait calls the added one. An added method with other parameter
-  types overloads the type's. Where a type conforms to two traits and impls of both add a method of one
-  name and parameter types, a call of it on that type is an error.
+  types overloads the type's. Where impls add a method of one name and parameter types to two traits
+  a type conforms to, the one added to the nearer trait is the type's when that trait requires the
+  other: `impl[T] Seq[T]`'s `map` hides `impl[T] Iterable[T]`'s on every sequence. Where neither
+  trait requires the other, a call of it on that type is an error.
 
 ```text
 impl[T] Seq[T]

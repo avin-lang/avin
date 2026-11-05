@@ -1857,6 +1857,55 @@ their words are reserved.
     shadow-stack frame before the call, and are built on branch `tailcalls` with their own entry.
   - The language has no `try`, `defer` or `finally`, so there is no pending cleanup to take a call
     out of tail position; when such a construct is added, a call inside it is not in tail position.
+- Settled on the user's delegation 2026-11-05: **`Iterable`'s transformations**
+  ([collections](/spec/collections/#operations-without-higher-kinded-types)), following the
+  reference collection library (branch `coll-followups`). `map`, `flatMap`, `filter`, `withFilter`,
+  `collect` and `zip` are added to every `Iterable` by `impl[T] Iterable[T]`, each returning an
+  `Iterable` (a `Vector` underneath) of the results in iteration order, so a program's own class
+  conforming to `Iterable` has them; the library's collections keep their own of the same name and
+  parameter types, of their own kind. To let `Seq`'s, `Set`'s and the other traits' versions stand,
+  an impl adding to a trait is passed over where an impl adding the same name and parameter types to
+  a trait that requires it applies ([declarations](/spec/declarations/#impl)); impls on unrelated
+  traits still clash. Why: the item asked for the members the chapter already claimed, and the
+  impl is how every other `Iterable` operation is written. Alternatives: methods with bodies
+  declared in the trait, dispatched through the object's table, so generic code would get the
+  concrete collection back at run time; that would make every collection's `map` an `override`,
+  rule out the bounded versions (`TreeSet.map[B: Ord]` cannot override an unbounded `map[B]`),
+  and dispatch every call. The chapter's earlier claim that generic code gets the concrete
+  collection back is withdrawn. **Review with the user**: a `Map` receiver still offers only its
+  pair-making `map`, so `m.map(e -> e.0)` is rejected rather than answering an `Iterable`; making
+  it fall back needs overload resolution that checks a lambda's body against each candidate.
+- Settled on the user's delegation 2026-11-05: **`rest*` binds what `drop(n)` answers**
+  ([collections](/spec/collections/#sequence-patterns)), branch `coll-followups`. One rule for every `n`,
+  `n = 0` included: `[rest*]` binds `drop(0)`, the list itself on a list and a `Vector` on a range,
+  an array, a buffer or a deque, where it used to bind the scrutinee itself at its own type. Why:
+  one rule the reader can predict, and a binding that never aliases a mutable array or buffer
+  through a pattern that elsewhere copies. Alternative: `[rest*]` as the scrutinee, as before, which
+  made the binding's type depend on whether any element came before `rest*`.
+- Settled on the user's delegation 2026-11-05: **An empty collection literal joins to its siblings'
+  type** ([collections](/spec/collections/#literals)), branch `coll-followups`. Among the elements of
+  a literal, the keys or values of a map literal, the branches of an `if` and the arms of a `match`,
+  an empty literal (`[]`, `{}`, or a literal holding one anywhere) is checked after the others and
+  against the type they agree on, where nothing useful is expected (nothing, or `Any`), and where
+  that type is a collection its literal shape can build. So `[{1: [2]}, {}]` and
+  `if c then {1: [2]} else {}` are maps. Why: `{}` alone defaults to a set, and an invariant `Set`
+  never joins a `Map`, so the sibling has to settle it before it defaults; the reference language
+  gets the same result from inference. Alternatives: a join rule turning `Set[_]` into the other
+  side's map after the fact (the literal's builder is already chosen by then), or asking for an
+  annotation, as before.
+- Settled on the user's delegation 2026-11-05: **A range displays as written**
+  ([collections](/spec/collections/#ranges)), branch `coll-followups`: `1..5`, `0..<10`,
+  `0..<10 by 2`, the bounds as given, the step only where it is not 1; `Debug` the same, and a
+  `NumericRange` the same. Why: it reads back as the expression that made it and costs nothing to
+  render. Alternative: the elements, `[1, 2, 3, 4, 5]`, as a vector shows, which hides that a range
+  is a progression and is unbounded in size.
+- Settled on the user's delegation 2026-11-05: **Precision under `%s` and `%?` is the formatter's**
+  ([strings and formatting](/spec/strings-and-formatting/#rendering)), branch `coll-followups`: the
+  value is rendered with no width and no precision through `writeDisplayed` or `writeDebugged`, and
+  its first N code points fill the field, for every type; renderers see a precision only under the
+  other conversions. Why: the chapter promised it for every value and only strings honoured it; cut
+  once, no renderer can get it wrong. Alternative: every renderer reading the precision, which each
+  collection and data type would have to implement.
 
 **Deferred**
 
