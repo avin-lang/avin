@@ -204,7 +204,11 @@ a decision changes, this page and the chapter change together.
   `charCount`, `isEmpty`, `nonEmpty`, `startsWith`, `endsWith`, `contains`, `slice`,
   `toUpperCase`, `toLowerCase`, `trim`, `strip`, `stripLeading`, `stripTrailing`, `repeat`,
   `replace` and `padTo` beside `padStart` and `padEnd`, with the reference library's names (user,
-  2026-11-04). A slice traps at its call when its offsets are out of order or outside the string, or
+  2026-11-04), and, with the reference's names and behaviour (user, 2026-11-04), `stripPrefix`,
+  `stripSuffix`, `capitalize` (only a lower-case first character changes), `stripMargin` with the
+  bar or a given margin character (the characters up to U+0020 and the margin removed from each
+  line's start, the terminators kept), and `head`, `last`, `headOption` and `lastOption` of the
+  characters, `head` and `last` trapping on the empty string. A slice traps at its call when its offsets are out of order or outside the string, or
   either falls inside a character; `repeat` traps on a negative count. Casing is the simple mapping,
   one character for one; stripping removes Unicode `White_Space`, and `trim`, as the reference's,
   the characters up to U+0020; `replace` replaces every occurrence, left to right and not
@@ -216,17 +220,19 @@ a decision changes, this page and the chapter change together.
   starting offset), `lastIndexOf` (with an optional last offset), `indexWhere` (with an optional
   starting offset) and `lastIndexWhere` answer a byte offset, -1 when there is none, as the reference
   library's do, and so do a sequence's `indexOf`, `indexWhere`, `lastIndexOf` and `lastIndexWhere`,
-  each with the same optional bound. The string methods answering with `Option` are `toInt`, `toLong`
-  and `toReal`. Offsets are bytes. A number is read
+  each with the same optional bound; a string's `indexOf` and `lastIndexOf` take a `char` as well
+  as a string. Offsets are bytes. A number is read
   whole: `toInt` and `toLong` take an optional `+` or `-` and ASCII digits, so `"+3"` is 3 and
   `"-0"` is 0, and refuse white space, separators and overflow (`"-9223372036854775808"` is a
   `long`); `toReal` is correctly rounded, takes decimal only, and refuses white space, `nan`, `inf`,
-  hexadecimal and a value too large to be finite. A refusal is `None`, never a trap.
+  hexadecimal and a value too large to be finite. Revised 2026-11-04 by the user to the reference
+  library's: `toInt`, `toLong` and `toReal` answer the number and trap on a refusal with
+  `For input string: "…"`, and `toIntOption`, `toLongOption` and `toRealOption` answer `None` for it.
 - Settled 2026-11-04: the core library follows the reference language's library in names and
   behaviour unless it genuinely improves on it. `Option` has `isDefined`, `isEmpty` and `nonEmpty`
   (not `isSome`/`isNone`), `get` (trapping on `None`) and `filterNot`; there is no `orNull`, since
   there is no null. `char` has `isDigit`, `isLetter`, `isLetterOrDigit`, `isWhitespace`,
-  `isSpaceChar`, `isUpper`, `isLower`, `isControl`, `toUpperCase`, `toLowerCase` and `asDigit`,
+  `isSpaceChar`, `isUpper`, `isLower`, `isControl`, `toUpper`, `toLower` and `asDigit`,
   classifying by the Unicode Character Database. `isWhitespace` is true for the space separators
   except the non-breaking ones (U+00A0, U+2007, U+202F) and for U+0009 to U+000D and U+001C to
   U+001F, so it differs from `strip`'s `White_Space`; `isSpaceChar` is the categories `Zs`, `Zl` and `Zp`.
@@ -555,7 +561,10 @@ a decision changes, this page and the chapter change together.
 - `?` returns from the function or lambda it is written in, so that one's result type must be
   declared or, for a lambda, known where it is written. It cannot leave a delayed argument or a class
   body.
-- Builders are the trait `Builder[-A, +C]` (`addOne`, `addAll`, `result`); a collection's companion
+- Builders are the trait `Builder[-A, +C]` (`addOne`, `addAll`, `result`, and, as the reference
+  library's, `clear`, which every builder defines and which readies a spent one for a new
+  collection, `sizeHint`, a hint that changes no result, and `knownSize`, -1 where a builder does not
+  know it cheaply); a collection's companion
   object makes one with `newBuilder[T]()` (the reference library's names, user 2026-11-04), and a sequence literal is built through the expected
   collection's, so a program's own class with such a companion is written as a literal too. A `List`
   literal is built from the back with `::`, since `List` is a data type.
@@ -594,7 +603,7 @@ Settled by the user on 2026-11-03:
   line. `x op= y` calls the method `op=` where `x`'s type has one, and otherwise is the language's
   compound assignment or, for a symbol method `op`, `x = x op y`. The library uses symbols:
   `Vector`'s `++`, `:+` and `+:`, `List`'s and `Map`'s `++`, and a buffer's `+=` and `++=` beside
-  `add` and `addAll`.
+  `addOne` and `addAll`.
 - A module may be named in code through an import of the module itself: `import a.b`, then `b.X`
   reaches `a.b`'s public `X`, alongside imports of single declarations.
 - An infix method call binds more loosely than arithmetic, bitwise, shift, cons and range operators
@@ -648,8 +657,11 @@ Settled by the user on 2026-11-03:
 - A sequence pattern on a sequence other than a list asks `length()` once and then reads, with
   `apply`, each element whose pattern is not `_`, in order, stopping at the first that fails.
 - `Deque[T]` is a ring over an array, doubling when full as a buffer does, its spare places zero
-  bytes. `removeFirst()` and `removeLast()` return the element and trap on an empty deque, as
-  `Buffer.remove` traps outside the buffer; `isEmpty()` is the test before them.
+  bytes. `removeHead()` and `removeLast()` return the element and trap on an empty deque, as
+  `Buffer.remove` traps outside the buffer; `isEmpty()` is the test before them. Settled 2026-11-04
+  by the user: a buffer and a deque take the reference library's names for adding, `addOne`,
+  `append`, `prepend`, `addAll`, `appendAll`, `prependAll`, `insert` and `insertAll`, and a deque's
+  ends are `prepend`, `append`, `removeHead` and `removeLast`.
 - A trait may declare `static` members, which belong to the implementing type rather than to a
   value: `static zero() -> Self` in `Add`, `static one() -> Self` in `Mul`. Every impl gives them,
   and they are called on a type, `int.zero()`, or on a bounded type parameter, `T.zero()`. `sum()`

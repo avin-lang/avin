@@ -93,7 +93,7 @@ A `char` has these methods, classifying by the Unicode Character Database:
 | `isSpaceChar()` | A character of category `Zs`, `Zl` or `Zp` |
 | `isUpper()`, `isLower()` | Cased and upper, cased and lower |
 | `isControl()` | U+0000 to U+001F and U+007F to U+009F |
-| `toUpperCase()`, `toLowerCase()` | The simple case mapping, one character for one: `'ß'.toUpperCase()` is `'ß'` |
+| `toUpper()`, `toLower()` | The simple case mapping, one character for one: `'ß'.toUpper()` is `'ß'` |
 | `asDigit()` | The digit's value in radix 36: a decimal digit of any script gives its value, an ASCII or fullwidth letter, either case, gives 10 to 35; any other character gives -1 |
 
 ## string
@@ -130,9 +130,16 @@ most the largest `int` bytes.
 | `trim()` | Without the characters up to U+0020, the ASCII controls and the space, at both ends |
 | `repeat(n)` | `n` copies joined; empty for zero; traps when `n` is negative |
 | `replace(old, new)` | Every occurrence of `old`, left to right and not overlapping, replaced by `new`; an empty `old` occurs nowhere |
-| `indexOf(p)`, `indexOf(p, from)` | The byte offset of the first `p`, at or after `from` (default 0; below 0 counts as 0); -1 when there is none or `from` is past the end. The empty string is found at `from` |
-| `lastIndexOf(p)`, `lastIndexOf(p, end)` | The byte offset of the last `p` beginning at or before `end` (default `byteLength()`); -1 when there is none. The empty string is found at `end`, or at `byteLength()` when `end` is past it |
-| `indexWhere(f)`, `indexWhere(f, from)`, `lastIndexWhere(f)` | The byte offset of the first character satisfying `f`, at or after `from`, or of the last; -1 when none does || `chars()` | The characters, in order, as a `Vector[char]` |
+| `indexOf(p)`, `indexOf(p, from)` | The byte offset of the first `p`, a string or a `char`, at or after `from` (default 0; below 0 counts as 0); -1 when there is none or `from` is past the end. The empty string is found at `from` |
+| `lastIndexOf(p)`, `lastIndexOf(p, end)` | The byte offset of the last `p`, a string or a `char`, beginning at or before `end` (default `byteLength()`); -1 when there is none. The empty string is found at `end`, or at `byteLength()` when `end` is past it |
+| `indexWhere(f)`, `indexWhere(f, from)` | The byte offset of the first character satisfying `f`, at or after `from`; -1 when none does |
+| `lastIndexWhere(f)`, `lastIndexWhere(f, end)` | The byte offset of the last character satisfying `f` that begins at or before `end` (default: the whole string); -1 when none does or `end` is below 0 |
+| `head()`, `last()` | The first and the last character; each traps on the empty string |
+| `headOption()`, `lastOption()` | `Some` of the first or the last character; `None` for the empty string |
+| `stripPrefix(p)`, `stripSuffix(s)` | Without `p` at the start, without `s` at the end; the string unchanged where it is not there |
+| `capitalize()` | With a lower-case first character mapped to upper case, and unchanged otherwise |
+| `stripMargin()`, `stripMargin(c)` | Each line with its leading characters up to U+0020 and the margin character after them (a vertical bar, or `c`) removed; a line whose first other character is not the margin is unchanged, and the line terminators stay |
+| `chars()` | The characters, in order, as a `Vector[char]` |
 | `bytes()` | The bytes of the encoding, in order, as a `Vector[byte]` |
 | `count(p)` | The number of characters satisfying `p` |
 | `split(sep)` | The pieces between the occurrences of `sep`, as a `Vector[string]`; empty pieces are kept (`",a,,b,".split(",")` has five pieces), and a string without `sep` is one piece. An empty `sep` traps |
@@ -144,8 +151,9 @@ most the largest `int` bytes.
 | `equalsIgnoreCase(o)` | Whether the two are equal after each character's simple lower-case mapping |
 | `take(n)`, `drop(n)` | The first `n` characters, all but the first `n`; `n` counts characters, not bytes, and is clamped to the string, so 0 or less takes none |
 | `takeRight(n)`, `dropRight(n)` | The last `n` characters, all but the last `n` |
-| `toInt()`, `toLong()` | `Some` of the number written in decimal: an optional `-` or `+`, then one or more ASCII digits and nothing else; `None` otherwise, or when it does not fit the type |
-| `toReal()` | `Some` of the number written as a decimal fraction, correctly rounded: an optional sign, digits with an optional point, an optional exponent (`3.25`, `-.5`, `1e10`); `None` for anything else, including white space, `nan`, `inf`, hexadecimal, and a number too large to be finite |
+| `toInt()`, `toLong()` | The number written in decimal: an optional `-` or `+`, then one or more ASCII digits and nothing else; a trap, `For input string: "…"`, otherwise or when it does not fit the type |
+| `toReal()` | The number written as a decimal fraction, correctly rounded: an optional sign, digits with an optional point, an optional exponent (`3.25`, `-.5`, `1e10`); a trap, as `toInt`'s, for anything else, including white space, `nan`, `inf`, hexadecimal, and a number too large to be finite |
+| `toIntOption()`, `toLongOption()`, `toRealOption()` | `Some` of the number `toInt`, `toLong` or `toReal` reads, and `None` where it would trap |
 
 ```text
 val word = "café"
