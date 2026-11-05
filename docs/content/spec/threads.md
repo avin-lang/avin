@@ -107,7 +107,9 @@ will own its handles across every message, whichever thread runs it.
 - **`lazy val`s**, module-level and fields alike ([Initialization](declarations.md#initialization)),
   initialized by exactly one thread, as a `Once` is run: a thread that reads one while another runs
   its initializer waits, safe for the collector, and the stored value is published with a release
-  store that every read pairs with an acquire load, so no thread sees it half made.
+  store that every read pairs with an acquire load, so no thread sees it half made. A read by the
+  initializing thread itself traps, as a `Once` run again from its body does, and a trap in the
+  initializer stops the program.
 
 ```avin
 import avin.threads.{Channel, scope}

@@ -1823,8 +1823,9 @@ their words are reserved.
     implementing either is held to it.
   - `Sendable` is only a bound and a promise; it is not the type of a value.
   - A `lazy val` field is sendable where its type is, since it is initialized by exactly one thread.
-    (That rests on the runtime initializing a `lazy val` once under contention; a test of two
-    threads forcing one `lazy val` at once pins it.)
+    (That rests on the runtime initializing a `lazy val` once under contention, which the tests
+    `lazy_threads`, `lazy_threads_many` and `sendable_lazy` pin: threads and futures reading one
+    first together, counting a single run of each initializer.)
 - Settled on the user's delegation 2026-11-05 (built on branch `mirror-handle-fields`): **a mirror
   holding a handle goes into Sysl wherever any mirror does** ([Sysl
   bindings](/spec/sysl-bindings/#mirrors)) — a parameter by itself, or inside an `Option`, a
