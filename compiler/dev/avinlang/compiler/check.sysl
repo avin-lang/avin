@@ -11312,8 +11312,33 @@ private refuse_static_on_value(c: *Checker, at: Span, receiver: &TExpr, m: usize
     c.note(unit_of(c), at, s"`${target.decl.name}` is static: it belongs to the type, so it is called on the type, as in `$shown.${target.decl.name}()`, not on a value")
     true
 
+// The data type `target` names where it is the bare name of the type's variant of its own name with
+// no fields, as `Lone` of `data Lone()` or `Empty[int]` of `data Empty[T]()`: a name that is both
+// the type and a value of it.
+private names_fieldless_value(c: *Checker, target: &Expr) -> Option[usize]
+    val name = target.kind match
+        Name(n) -> n
+        TypeApply(inner, _) -> inner.kind match
+            Name(n) -> n
+            _ -> return None
+        _ -> return None
+    if lookup_local(c, name) is Some(_) || param_index(c, name) is Some(_) then return None
+    if class_member(c, name) is Some(_) || global_named(c, name) is Some(_) then return None
+    val v = variant_named(c, name)?
+    if c.data[v.data].name != name || c.data[v.data].variants[v.index].fields.len() > 0 then return None
+    Some(v.data)
+
+// Whether data type `id` has a static member `name`, which a call on the type's name means even
+// where the name is also a value.
+private has_static_member(c: *Checker, id: usize, name: string) -> bool
+    for m in members_of_type(c, own_type(c.data[id], id), name)
+        if c.symbols[m].static_member then return true
+    false
+
 // `object.name(args)`: a method of the object's class, or a field holding a function, which is
-// called as a value.
+// called as a value. On the name of a data type whose variant of its own name has no fields, a
+// static member of the type is called where it has one of the name, and otherwise the method of the
+// value the name also is.
 private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, target: &Expr, name: string, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], infix: bool) -> &TExpr
     val unit = unit_of(c)
     if target.kind is Name("super")
@@ -11325,9 +11350,15 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
         if lookup_local(c, type_name_written) is None && param_index(c, type_name_written) is None
             if builtin_type(type_name_written) is Some(to) then return conversion(c, at, to, args, true)
             if integer_param_named(c, type_name_written) is Some(to) then return conversion(c, at, to, args, true)
+    var named_value: Option[&TExpr] = None
     if !infix
-        if static_receiver(c, target, name) is Some(ty) then return static_call(c, at, name_span, target, ty, name, args, explicit, expected)
-    val object = check_expr(c, target, None)
+        if names_fieldless_value(c, target) is Some(id)
+            if !has_static_member(c, id, name) then named_value = Some(check_expr(c, target, None))
+        if named_value is None
+            if static_receiver(c, target, name) is Some(ty) then return static_call(c, at, name_span, target, ty, name, args, explicit, expected)
+    val object = named_value match
+        Some(v) -> v
+        None -> check_expr(c, target, None)
     if *zonk(c, object.ty) is Class(k, _, _)
         val ms = with_trait_methods(c, object.ty, name, methods_named(c, k, name))
         if ms.len() > 0

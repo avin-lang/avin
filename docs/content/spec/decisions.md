@@ -1866,7 +1866,20 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- **A member call on the name of a data type whose variant of its own name has no fields**
+  (`Lone.m(…)` with `data Lone()`; branch `fix-lone-value`). The name is both the type and a value
+  of it. Proposed: where the type has a static member named `m`, the call is the type's and chooses
+  among its static members alone; otherwise it is the value's method, its trait methods and
+  impl-added methods included. A method value `Lone.m` follows the same order. Why: a static member
+  can only be reached through the type's name, while the value's method is always reachable through
+  a value, so giving the static the name loses nothing; and it keeps `Name.m(…)` with a static
+  member meaning what it means on every other type. Alternatives weighed: the value always wins
+  (makes a fieldless type's static members unreachable by name); choosing among the static members
+  and the value's methods together by parameter types (a call on a type name would then mix two
+  kinds of receiver in one overload set, which nothing else in the language does); refusing a
+  static member and a value method of one name on such a type (an extra rule for a rare case). The
+  companion object needs no rule: it cannot share the name of a fieldless variant
+  ([declarations](/spec/declarations/#object)).
 
 ## Open
 
