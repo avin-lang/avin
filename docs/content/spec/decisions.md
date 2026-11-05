@@ -1494,13 +1494,19 @@ Settled by the user on 2026-11-04:
   would need a match to know the regex that found it.
 - Settled by the user 2026-11-04: Sysl handles ([Sysl bindings](/spec/sysl-bindings/#handles)): a `class` declared with `@sysl`
   naming a Sysl type has no parameters, fields or constructor and is made only by a binding that
-  returns it, directly or as the value of an `Option` or `Result`; a collection of handles does not
-  cross. A method without a body is bound to the Sysl method of its name's words in snake_case, or
-  to the one its own `@sysl("name")` names. Every handle has `close()`, which gives its counted
-  reference back and does nothing a second time; a bound method on a closed handle traps at the
-  call with "`Name` is closed"; a handle never closed is given back by a finalizer when the
-  collector frees it. A handle crosses back into Sysl only as the receiver of its own methods,
-  compares by identity, and has no `Display`.
+  returns it, directly or as the value of an `Option` or `Result`. A method without a body is bound
+  to the Sysl method of its name's words in snake_case, or to the one its own `@sysl("name")`
+  names. Every handle has `close()`, which gives its counted reference back and does nothing a
+  second time; a bound method on a closed handle traps at the call with "`Name` is closed"; a
+  handle never closed is given back by a finalizer when the collector frees it. A handle compares
+  by identity, and has no `Display`.
+  Settled by the user 2026-11-04, replacing "a collection of handles does not cross" and "a handle
+  crosses back into Sysl only as the receiver of its own methods": a binding's result may also be
+  an `Array` or `Vector` of handles, also inside an `Option` or `Result`, made from a Sysl slice or
+  `Buf`, each element a handle of its own with its own reference and finalizer. A handle by itself
+  goes into Sysl as the receiver of its own methods or as a parameter of any binding or bound
+  method; a closed one passed traps at the call as a bound method on one does. A handle inside an
+  `Option` or a collection still does not go into Sysl. How it is passed is Proposed below.
 
 - Settled by the user 2026-11-04: **Text blocks under an interpolator that reads no escapes** ([text
   blocks](/spec/strings-and-formatting/#text-blocks)). The parts `raw"""…"""` and a program's own
@@ -1543,7 +1549,13 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
-None at present.
+- **How a handle is passed to a Sysl parameter** ([Sysl bindings](/spec/sysl-bindings/#handles)).
+  The shim cannot see the Sysl parameter's type, so it lets Sysl choose: a Sysl type with a
+  destructor, always held by a counted reference, is passed as the handle's reference, which the
+  parameter shares; one without is passed as the parameter's type asks of a generic helper, by
+  value (a copy) or as a pointer to the handle's own value. A `&T` parameter of a type without a
+  destructor receives a reference to a copy, since Sysl binds the helper's type parameter to `T`
+  where a `&T` is expected; a `*T` parameter of a type with one is refused by Sysl at the binding.
 
 ## Open
 

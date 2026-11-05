@@ -264,15 +264,37 @@ parseBigInt(s: string) -> Option[BigInt]
 ```
 
 - **Only a binding makes a handle.** A handle has no parameters and no constructor; a binding that
-  returns one — directly, in an `Option` or a `Result`, or from a handle's own method — makes the
-  object, holding one counted reference to the Sysl value it was given (a value is moved into a
-  reference of its own; a counted reference is shared).
-- **A handle goes back into Sysl only as the receiver of its own methods.** A binding taking a handle
-  as a parameter, even inside an `Option`, is an error, and so is a collection of handles or a
-  mirror holding one: a handle crosses out of Sysl only as a result or the value of its `Option` or
-  `Result`. Its Sysl value's fields are not the handle's members.
+  returns one — directly, in an `Array`, a `Vector`, an `Option` or a `Result`, or from a handle's
+  own method — makes the object, holding one counted reference to the Sysl value it was given (a
+  value is moved into a reference of its own; a counted reference is shared). A collection of
+  handles comes from a Sysl slice or `Buf` of values or of counted references, and each element is
+  a handle of its own, closed and collected on its own.
+- **A handle goes back into Sysl by itself**: as the receiver of its own methods, or as a parameter
+  of a binding or of another handle's method. A Sysl type with a destructor is always held by a
+  counted reference, and its parameter shares the handle's; a type without one is passed as the
+  Sysl parameter takes it — by value, a copy, or as a pointer to the handle's own value. A handle
+  inside an `Option` or a collection does not go into Sysl, and no mirror holds one. Its Sysl
+  value's fields are not the handle's members.
+
+  ```avin
+  @sysl("sysl.net.Address")
+  class Address
+      port() -> int
+
+  @sysl("sysl.net.Socket")
+  class Socket
+      connect(to: Address) -> Result[unit, IoError]
+
+  @sysl("sysl.net.resolve")
+  resolve(host: string, port: int) -> Result[Vector[Address], IoError]
+
+  @sysl("sysl.net.socket")
+  socket(forAddress: Address) -> Result[Socket, IoError]
+  ```
+
 - **`close()` gives the value back.** Every handle has it. Closing again does nothing; a bound method
-  called on a closed handle stops the program at the call:
+  called on a closed handle, or a closed handle passed to Sysl as a parameter, stops the program at
+  the call:
 
   ```text
   avin: trap: `Crc32` is closed at main.avin:18:13
