@@ -1471,7 +1471,8 @@ Settled by the user on 2026-11-04:
 - Settled by the user 2026-11-04: Rest patterns ([collections](/spec/collections/#sequence-patterns)): `rest*` or `_*`, last in a
   sequence pattern or an `unapplySeq` extractor's patterns, binds what the patterns before it leave:
   on a list the tail, so `[]` and `[head, tail*]` cover every list; on another sequence what
-  `drop(n)` answers, a `Vector`. `[rest*]` alone is the whole sequence, of its own type.
+  `drop(n)` answers, a `Vector`, and there too sequence patterns count lengths, so `[]` and
+  `[head, tail*]` cover every sequence. `[rest*]` alone is the whole sequence, of its own type.
 - Settled by the user 2026-11-04: A regex as an extractor ([regular expressions](/spec/regex/#regex)): `Regex.unapplySeq(s)`
   answers the groups' texts as a `List[string]` where `s` matches as `matches` asks, the whole of it
   or, unanchored, any part. A group that took no part gives the empty string, since a `string` has
