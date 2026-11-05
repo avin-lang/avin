@@ -329,6 +329,8 @@ machine Door receives DoorEvent
 - **`enter` runs when the machine moves into the state, and `leave` when it moves out**, `leave`
   before `enter`. An arm yielding a state, even the current one, is a transition and runs both;
   `stay` runs neither. The first state's `enter` runs when the machine is made, after the body.
+  The arm runs first; in `leave`, `state()` still answers the state being left, and in `enter` the
+  new one.
 - **`receive` holds the arms every state shares**, tried after the current state's own. **Every
   state must handle every event**: the compiler checks, state by state, that its own arms and the
   shared ones together cover the event type, as a `match` is checked, guarded arms not counting.
@@ -342,7 +344,8 @@ machine Door receives DoorEvent
   one event and answers the new state, and `state() -> Door.State` reads the current one, where
   `Door.State` is a `data` type the declaration makes, with a variant for each state and the state's
   parameters as its fields, so a program matches on it:
-  `door.state() is Locked(_)`. A machine is a mutable object, so it is not sendable; handling an
+  `door.state() is Locked(_)`. Its variants are names of the machine's module, as every variant
+  is, so a state's name is one no other variant of the module has. A machine is a mutable object, so it is not sendable; handling an
   event from inside one of its own arms, `enter` or `leave` blocks traps, as taking a held mutex does.
 
 ### An actor's states

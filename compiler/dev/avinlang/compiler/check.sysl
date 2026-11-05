@@ -620,6 +620,10 @@ exported(c: *Checker, key: string) -> bool
         return false
     true
 
+/** What `resolve_name` puts before a machine's state type, `Door.State`, written where it denotes
+ * nothing the file may see: no key starts with a dot. */
+const Unresolved: string = "."
+
 /** The qualified name a bare `name` denotes in a unit: its own module's declaration of that name,
  * else the one the file imports under it, else the core library's public one. The nearer hides the
  * farther whatever kind each is, so a module's function hides a core library type of its name. When
@@ -635,7 +639,16 @@ resolve_name(c: *Checker, unit: usize, name: string) -> string
         if scope.modules.get(name[0..<k]) is Some(module_path)
             val key = qualified(module_path, name[k + 1..])
             if declared(c, key) && exported(c, key) then return key
-        return name
+            return name
+        // `Door.State`, the state type of a machine: declared in the file's own module, or in the
+        // module the file imports `Door` from. Its name holds one dot.
+        if name[k + 1..].contains(".") then return Unresolved + name
+        val own_member = qualified(scope.module_name, name)
+        if declared(c, own_member) then return own_member
+        if scope.imports.get(name[0..<k]) is Some(owner)
+            val member = owner + name[k..]
+            if declared(c, member) && exported(c, member) then return member
+        return Unresolved + name
     val own = qualified(scope.module_name, name)
     if declared(c, own) then return own
     if scope.imports.get(name) is Some(key) then return key
@@ -2210,7 +2223,9 @@ private declare_variants(c: *Checker, unit: usize)
         var variants: Buf[VariantSymbol] = buf()
         for v in d.decl.variants
             if seen.get(v.name) is Some(_) || c.variants.get(qualified(d.module_name, v.name)) is Some(_)
-                c.note(unit, v.span, s"the variant `${v.name}` is declared more than once")
+                machine_site(c, unit, v.span) match
+                    Some(site) -> c.note(unit, v.span, s"the state `${v.name}` of `${site.machine}` has the name of another variant of its module; a state is a variant of `${d.name}`, named on its own as every variant is, so it needs a name of its own")
+                    None -> c.note(unit, v.span, s"the variant `${v.name}` is declared more than once")
                 continue
             seen.put(v.name, v.span)
             var names: Buf[string] = buf()
@@ -5793,6 +5808,8 @@ private structural_sendability(f: Conformances, x: &Type, k: usize, a: SendAssum
                 return CannotSend(s"it is `${cls.decl.modifier}`, so a subclass could add a `var`; make it final, or declare it `: Sendable`, and every subclass is checked to be sendable")
             for fld in cls.fields
                 if fld.name.starts_with("<") then continue
+                // A machine's current state is a hidden `var` every machine has.
+                if fld.name == "machine$state" then return CannotSend("it is a machine, a mutable object that moves between its states")
                 if fld.mutable
                     if library && !top then return CannotSend("it is mutable, and not made to be shared between threads")
                     return CannotSend(s"its field `${fld.name}` is a `var`; make it a `val`")
@@ -7124,6 +7141,16 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
             c.note(unit, t.span, "`Self` is the type implementing a trait, so it is written only in a trait's methods")
             return ErrorType
         val key = resolve_name(c, unit, path)
+        // `m.T`, written for a private `T` of another module `m`.
+        if path.contains(".") && !exported(c, key)
+            var home: Option[string] = None
+            if c.types.get(key) is Some(id) then home = Some(c.data[id].module_name)
+            elif c.class_types.get(key) is Some(id) then home = Some(c.classes[id].module_name)
+            if home is Some(m)
+                if m != c.files[unit].module_name
+                    val declared_as = if m == "" then key else key[m.bytes.len + 1..]
+                    c.note(unit, t.span, s"`$declared_as` is private to module `$m`")
+                    return ErrorType
         if c.types.get(key) is Some(id)
             val d = c.data[id]
             var resolved: Buf[&Type] = buf()
@@ -14006,7 +14033,11 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
     if !agreed then ty = ErrorType
     elif !used then ty = if never then Nothing else Unit
     if settled(s.ty)
-        if missing_case(typed, s.ty, c.data, false) is Some(_)
+        if machine_site(c, unit, e.span) is Some(site)
+            val missing = missing_cases(typed, s.ty, c.data)
+            if missing.len() > 0
+                c.note(unit, e.span, s"state `${site.state}` of `${site.machine}` does not handle ${case_list(missing)}")
+        elif missing_case(typed, s.ty, c.data, false) is Some(_)
             val subject = s"this `match` does not cover every ${type_name(s.ty)} value"
             // A value is named only when no arm can match it whatever the extractors answer, and
             // when there is more to say of it than `_`.
@@ -14016,6 +14047,22 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
                     else c.note(unit, e.span, s"$subject, such as `$case`; add an arm for it, or `_` for the rest")
                 None -> c.note(unit, e.span, s"$subject, since an extractor may answer that it does not match; add an arm for the rest, such as `_`")
     TExpr(e.span, ty, Match(s, typed))
+
+// The state of a machine whose arms a match at `at` holds, if it is one.
+private machine_site(c: *Checker, unit: usize, at: Span) -> Option[MachineSite]
+    for site in c.units[unit].file.machine_states
+        if site.span.start == at.start && site.span.end == at.end then return Some(site)
+    None
+
+// `Open`, `Close` or `Lock(_)`, each case a guarded arm could have taken followed by where its guard
+// is false.
+private case_list(cases: Buf[MissingCase]) -> string
+    var out = ""
+    for i in 0..<cases.len()
+        if i > 0 then out = out + (if i == cases.len() - 1 then " or " else ", ")
+        out = out + "`" + cases[i].text + "`"
+        if cases[i].guarded then out = out + " where the guard is false"
+    out
 
 /** A condition checked, and the locals its `is` tests bound: `yes` where it is known to hold, `no`
  * where it is known to have failed. */

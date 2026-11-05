@@ -2370,7 +2370,50 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- **State machines, the choices [the chapter](/spec/actors/#state-machines) leaves open** (branch
+  `state-machines`, 2026-11-05). A machine is read into its `Door.State` data type and a final class
+  holding the current state, so it needs no runtime. Proposed:
+  - **Order inside a transition.** The arm runs first; then the current state's `leave`, in which
+    `state()` still answers the state being left; then the new state is current and its `enter`
+    runs, in which `state()` answers it; `handle` answers the state after `enter`. Why: an arm
+    computes where to go, `leave` cleans up the old state's data, which it can still read, and
+    `enter` sees the machine as it will be. Alternatives: switching the state before `leave` (it
+    would then read data no longer current); running `leave` before the arm (an arm yielding `stay`
+    would have left).
+  - **A state is a variant of its module**, as every data type's variant is: `Locked(code)` and
+    `door.state() is Locked(_)` name it bare, so two machines of one module cannot share a state's
+    name, nor a state an event's variant; the error says so, naming the state and the machine.
+    Why: it follows from `Door.State` being an ordinary data type matched by bare names, as the
+    chapter writes. Alternatives: scoping state names to their machine, written bare only inside
+    it and `Door.State.Locked` outside (the chapter's own `door.state() is Locked(_)` would no
+    longer read). **Review with the user**: common names such as `Idle` or `Done` collide between
+    machines of one module.
+  - **`Door.State` takes all of the machine's type parameters, with their bounds**, so a state of a
+    generic machine may hold values of them: `Cell.State[string]`. Why: the smallest rule that lets
+    any state hold any of them. Alternative: only the parameters the states use (the type's
+    arguments would then depend on which states mention which parameter).
+  - **`stay` is the value of an arm where it is the arm's value**: the arm's whole body, the last
+    line of a block, and each branch of an `if` or a `match` that is itself in such a place.
+    Elsewhere `stay` is an ordinary name. Why: the chapter makes `stay` a keyword only as an arm's
+    value. Alternative: anywhere in an arm's body (it would then be a value that could be stored,
+    with a meaning only at the end).
+  - **The trap on handling from inside a handler names the machine and is reported at its
+    declaration**: ``avin: trap: `Relay` handles an event from inside one of its own arms, `enter`
+    or `leave` blocks at file:line:col``. The first state's `enter`, run as the machine is made, is
+    such a block too. Why: the check is in the code the declaration makes. Alternative: reporting
+    the `handle` call that re-entered, as a library trap reports the program's call (it needs the
+    machine's code to count as the library's for its traps, which its arms are not).
+  - **The coverage error lists every case left out**: each variant of the event type not covered in
+    full, written as its first uncovered value (`Lock(_)`, `Both(true, None)`), followed by "where
+    the guard is false" when a guarded arm could have taken it; for an event type without variants,
+    one value (`-1`). Why: it is the chapter's own message, extended to the shapes it does not show.
+  - **A machine takes no parents and no `derives`** in its header in this step, and a state and the
+    `receive` block take `else` arms as a `match` does. Alternative: parents after the parameters, as
+    a class's; nothing in the chapter needs them yet.
+  - **Handling an event from the machine's own body**, before the first state's `enter` has run, is
+    allowed: the machine is in its first state then. Alternative: trapping as from inside a handler.
+  - **Not sendable, said as such**: a machine passed where a sendable value is needed is reported as
+    "a machine, a mutable object that moves between its states", not by its hidden state field.
 
 ## Open
 
