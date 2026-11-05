@@ -303,6 +303,33 @@ parseBigInt(s: string) -> Option[BigInt]
 - **A handle never closed is given back by the collector**, when it frees the object, through a
   finalizer the shim generates for the class. When that happens is not specified: a value that holds
   something scarce, such as a file, is closed.
+- **A handle belongs to one owner at a time.** Its Sysl value is held by a counted reference whose
+  count is not atomic, so a handle is never used by two threads at once. Each handle records its
+  owner, the code that made it, and every use — a bound method, the handle passed as a parameter,
+  `close()` — compares it with the owner of the code running and stops the program at the call where
+  they differ:
+
+  ```text
+  avin: trap: `Socket` belongs to another thread at main.avin:31:5
+  ```
+
+  The owner is not an operating system thread but whatever the runtime is running: a thread's body,
+  a task on the futures' pool (whichever worker runs it), and, once there are actors, an actor, which
+  keeps its handles from one message to the next whichever thread runs it. The check is one compare
+  of two words, the handle's owner and the running code's, which the runtime sets when it starts
+  running something else.
+
+  **Ownership moves with what is handed to code that runs elsewhere.** The handles a thread's body or
+  a future's body reaches — captured directly, or through any object or collection — that the
+  calling code owns become the body's when it is started, and the caller's next use of one traps.
+  When the body returns, what it was given and what it returns are **in transit**, as is a value a
+  future or promise is completed with and what a callback given to `onComplete` or `map` reaches: a
+  handle in transit is taken by the first code to use it. A value sent on a channel keeps its owner.
+  How a program hands a handle over explicitly is [proposed](/spec/decisions/#proposed).
+
+  The finalizer never checks the owner: a handle is finalized only once nothing can reach it, so no
+  other code can be using it, and the collector, which runs finalizers on whichever thread collects
+  while every other is stopped, gives its reference back.
 - **A handle is compared by identity**, and has no `Display` of its own.
 
 The bytes a handle's method answers may be a view of the handle's own value; they are copied out

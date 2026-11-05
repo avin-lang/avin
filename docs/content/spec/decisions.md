@@ -1506,7 +1506,27 @@ Settled by the user on 2026-11-04:
   `Buf`, each element a handle of its own with its own reference and finalizer. A handle by itself
   goes into Sysl as the receiver of its own methods or as a parameter of any binding or bound
   method; a closed one passed traps at the call as a bound method on one does. A handle inside an
-  `Option` or a collection still does not go into Sysl. How it is passed is Proposed below.
+  `Option` or a collection still does not go into Sysl.
+  Settled by the user 2026-11-04: **how a handle is passed to a Sysl parameter**. The shim cannot
+  see the Sysl parameter's type, so it lets Sysl choose: a Sysl type with a destructor, always held
+  by a counted reference, is passed as the handle's reference, which the parameter shares; one
+  without is passed as the parameter's type asks of a generic helper, by value (a copy) or as a
+  pointer to the handle's own value. A `&T` parameter of a type without a destructor receives a
+  reference to a copy, since Sysl binds the helper's type parameter to `T` where a `&T` is expected;
+  a `*T` parameter of a type with one is refused by Sysl at the binding.
+  Settled by the user 2026-11-04: **a handle is never used by two threads at once**, since its
+  counted reference's count is not atomic. Each handle records an owner, and every use (a bound
+  method, the handle passed as a parameter, `close()`) compares it with the running code's and traps
+  with "`Name` belongs to another thread" where they differ. The owner is an execution context the
+  runtime can hand over, not an operating system thread: a thread's body, a pool task whichever
+  worker runs it, and later an actor, re-pointed to whichever thread runs it, so an actor's handles
+  never trap between its messages; the check is one compare with a word of the running thread's
+  context, which the runtime sets. Ownership moves: what a thread's or a future's body reaches that
+  the caller owns becomes the body's at its start, and the caller's later use traps; when the body
+  returns, what it was given and what it returns are in transit, as are a future's value and what a
+  callback registered on one reaches, and the first code to use a handle in transit takes it. The
+  finalizer never checks: it runs only on an unreachable handle, on the collecting thread while the
+  others are stopped.
 
 - Settled by the user 2026-11-04: **Text blocks under an interpolator that reads no escapes** ([text
   blocks](/spec/strings-and-formatting/#text-blocks)). The parts `raw"""…"""` and a program's own
@@ -1549,13 +1569,12 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
-- **How a handle is passed to a Sysl parameter** ([Sysl bindings](/spec/sysl-bindings/#handles)).
-  The shim cannot see the Sysl parameter's type, so it lets Sysl choose: a Sysl type with a
-  destructor, always held by a counted reference, is passed as the handle's reference, which the
-  parameter shares; one without is passed as the parameter's type asks of a generic helper, by
-  value (a copy) or as a pointer to the handle's own value. A `&T` parameter of a type without a
-  destructor receives a reference to a copy, since Sysl binds the helper's type parameter to `T`
-  where a `&T` is expected; a `*T` parameter of a type with one is refused by Sysl at the binding.
+- **Handing a handle over explicitly** ([Sysl bindings](/spec/sysl-bindings/#handles)). The
+  spec has no spelling for it. Proposed: `handOff(value: Any)` in `avin.threads`, putting every
+  handle `value` reaches that the running code owns in transit, for the next code to use it; and
+  `Channel.send` doing the same with what it sends, which it does not do now because handing a value
+  over walks it, and a channel of plain values should not pay for that (the compiler would skip
+  the walk for a type that cannot reach a handle).
 
 ## Open
 

@@ -30,10 +30,20 @@ private class Pool()
     private var idle = 0
     private var blocked = 0
 
-    // Runs `task` on a worker, soon.
+    // Runs `task` on a worker, soon. The Sysl handles `task` reaches that the calling code owns are
+    // the task's, an owner of its own whichever worker runs it, until it returns; then they are in
+    // transit, for the next code to use them.
     submit(task: () -> unit)
+        val owner = newOwner()
+        handOver(task, currentOwner(), owner)
+        val run: () -> unit = () ->
+            val worker = currentOwner()
+            runAs(owner)
+            task()
+            handOver(task, owner, inTransit)
+            runAs(worker)
         lock.acquire()
-        tasks.append(task)
+        tasks.append(run)
         if idle > 0 then work.notify()
         if tasks.length() > idle + starting && workers.length() + starting - blocked < target then start()
         lock.release()
@@ -92,11 +102,14 @@ private class Cell[T]()
 
     // Leaves `v` where there is no value yet, waking every thread waiting and running what waits;
     // answers whether it did.
+    // The Sysl handles `v` reaches that the completing code owns are in transit from then on, for
+    // the next code to use them, whichever thread that is.
     complete(v: T) -> bool
         lock.acquire()
         if value.isDefined()
             lock.release()
             return false
+        handOver(v, currentOwner(), inTransit)
         value = Some(v)
         val run = waiting
         waiting = []
@@ -112,8 +125,11 @@ private class Cell[T]()
         lock.release()
         v
 
-    // Runs `f` with the value on the thread that completes the cell, or now where it is complete.
+    // Runs `f` with the value on the thread that completes the cell, or now where it is complete. The
+    // Sysl handles `f` reaches that the calling code owns are in transit from now on, for wherever
+    // `f`, or what it hands them to, runs.
     whenDone(f: (T) -> unit)
+        handOver(f, currentOwner(), inTransit)
         lock.acquire()
         value match
             Some(v) ->

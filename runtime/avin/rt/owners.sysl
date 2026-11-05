@@ -1,0 +1,80 @@
+module avin.rt
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+import sysl.raw.ptr_cast
+import sysl.sync.*
+
+// Who may use a Sysl handle. A handle's Sysl value is held by a counted reference whose count is not
+// atomic, so a handle is never used by two threads at once: each records an owner, and every use
+// compares it with the owner of the code running, the word `owner` of its context. An owner is not a
+// thread but whatever the runtime is running: a thread's own body, a task it runs for the pool, or,
+// later, an actor, whose turn re-points the word of the thread that runs it. Owners are numbered
+// from one and never reused. A handle whose owner is zero is in transit, given up by the thread that
+// owned it with no one yet to take it, and the first use takes it.
+
+/** The owner word's offset in a context, which compiled code reads at every use of a handle. */
+const OwnerOffset: usize = 32
+
+/** The owner word's offset in a handle's object, after its counted reference. */
+const HandleOwnerOffset: usize = 8
+
+/** The owner a handle in transit has, which no running code ever is. */
+const InTransit: u64 = 0
+
+/** The last owner given out. */
+var owners: Atomic[u64] = Atomic(0)
+
+/** A new owner, which nothing has been given yet. */
+fresh_owner() -> u64 = owners.add(1) + 1
+
+/** A new owner, for the library to give what it hands to code that will run elsewhere. */
+@export("avin_rt_owner_new")
+owner_new(ctx: *Context) -> long = long(fresh_owner())
+
+/** The owner of the code `ctx`'s thread is running. */
+@export("avin_rt_owner_current")
+owner_current(ctx: *Context) -> long = long(ctx.owner)
+
+/** Makes `owner` the owner of the code `ctx`'s thread runs from now on. */
+@export("avin_rt_owner_set")
+owner_set(ctx: *Context, owner: long)
+    ctx.owner = u64(owner)
+
+/** Takes the handle `h`, whose owner is not the running code's, for that code where it is in transit;
+ * answers whether the running code owns it now. Called only where the inline compare failed. */
+@export("avin_rt_handle_claim")
+handle_claim(ctx: *Context, h: *u8) -> bool
+    val word: *Atomic[u64] = ptr_cast(usize(h) + HandleOwnerOffset)
+    val was = word.cas(InTransit, ctx.owner)
+    was == InTransit || was == ctx.owner
+
+/** Gives every handle that the value at `root` reaches and `from` owns to `to`: what the value holds,
+ * through every object and array of references, each visited once. A value handed to code that runs
+ * on another thread is handed over by the thread that gives it, before the other can run; `to` may
+ * be `InTransit`, for a value whose next user is not known. */
+@export("avin_rt_hand_over")
+hand_over(ctx: *Context, root: *u8, from: long, to: long)
+    if root == null then return
+    val f = u64(from)
+    val t = u64(to)
+    var seen: Set[usize] = set()
+    var work: Buf[*u8] = buf()
+    work.push(root)
+    while work.len() > 0
+        val p = work.pop().unwrap()
+        if !seen.add(usize(p)) then continue
+        val d = descriptor_of(p)
+        if d.kind.finalize != null
+            val word: *Atomic[u64] = ptr_cast(usize(p) + HandleOwnerOffset)
+            _ = word.cas(f, t)
+            continue
+        if d.kind.trace == &trace_array
+            val elements: **u8 = ptr_cast(array_elements(p))
+            for i in 0..<array_length(p)
+                if elements[i] != null then work.push(elements[i])
+            continue
+        val offsets: *usize = ptr_cast(usize(d) + sizeof(Descriptor))
+        for i in 0..<d.refs
+            val field: **u8 = ptr_cast(usize(p) + offsets[i])
+            if field[0] != null then work.push(field[0])
