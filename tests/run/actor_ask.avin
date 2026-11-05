@@ -1,0 +1,121 @@
+// expect: exit 0
+// `ref.ask(make, timeout)` builds the message around a reference that accepts one reply, sends it,
+// and gives back the future of the reply, its type taken from the message the lambda builds: `Ok` of
+// the first reply, a later one dropped; `Err(TimedOut)` where none comes in time, a timeout of zero
+// included; `Err(Ended)` where the actor had ended, or was ending, so the question was never
+// delivered. The reply reference is an ordinary `ActorRef`: shown as `Reply#n`, numbered apart from
+// the actors, unequal to every other, ended once its ask is answered, and itself asked with `Ended`
+// once used. Reply types of every shape: `int`, `unit`, `string`, an `Option`, a tuple, a `Result`, a
+// data type, a generic actor's at two instances, a reference; the type written explicitly too.
+import avin.actors.{ActorRef, AskError, Ended, TimedOut, spawn}
+import avin.time
+
+data Point(x: int, y: int)
+
+data Msg
+    Increment(n: int)
+    Get(reply: ActorRef[int])
+    Twice(reply: ActorRef[int])
+    Add(n: int, reply: ActorRef[int])
+    Done(reply: ActorRef[unit])
+    Name(reply: ActorRef[string])
+    Find(key: int, reply: ActorRef[Option[string]])
+    Both(reply: ActorRef[(int, string)])
+    Parse(text: string, reply: ActorRef[Result[int, string]])
+    Where(reply: ActorRef[Point])
+    Me(reply: ActorRef[ActorRef[Msg]])
+    Ignore(reply: ActorRef[int])
+    Keep(reply: ActorRef[int])
+    Hand(to: ActorRef[ActorRef[int]])
+    Quit
+
+actor Counter(start: int) receives Msg
+    var count = start
+    var kept: Vector[ActorRef[int]] = Vector()
+    receive
+        Increment(n) -> count += n
+        Get(reply) -> reply.tell(count)
+        Twice(reply) ->
+            reply.tell(count)
+            reply.tell(-1)
+        Add(n, reply) ->
+            count += n
+            reply tell count
+        Done(reply) -> reply.tell(())
+        Name(reply) -> reply.tell(s"counter at $count")
+        Find(key, reply) -> reply.tell(if key == count then Some("found") else None)
+        Both(reply) -> reply.tell((count, "both"))
+        Parse(text, reply) -> reply.tell(if text == "" then Err("empty") else Ok(text.byteLength()))
+        Where(reply) -> reply.tell(Point(count, -count))
+        Me(reply) -> reply.tell(self)
+        Ignore(_) -> ()
+        Keep(reply) -> kept = kept :+ reply
+        Hand(to) ->
+            for r in kept do to.tell(r)
+            kept = Vector()
+        Quit -> stop()
+
+actor Echo[T: Sendable] receives (T, ActorRef[T])
+    receive
+        (value, reply) -> reply.tell(value)
+
+show(r: Result[int, AskError]) -> string = r match
+    Ok(n) -> s"ok $n"
+    Err(TimedOut) -> "timed out"
+    Err(Ended) -> "ended"
+
+main() -> int
+    val long = time.seconds(30)
+    val counter = spawn(Counter(10))
+    counter.tell(Increment(5))
+    counter tell Increment(2)
+    // The chapter's example.
+    val answer = counter.ask(r -> Get(r), timeout = time.seconds(1)).await()
+    println(answer)
+    // Positional timeout, a message with other fields, and every reply shape.
+    println(show(counter.ask(r -> Add(3, r), long).await()))
+    println(counter.ask(r -> Done(r), long).await())
+    println(counter.ask(r -> Name(r), long).await())
+    println(counter.ask(r -> Find(20, r), long).await())
+    println(counter.ask(r -> Find(21, r), long).await())
+    println(counter.ask(r -> Both(r), long).await())
+    println(counter.ask(r -> Parse("four", r), long).await())
+    println(counter.ask(r -> Parse("", r), long).await())
+    println(counter.ask(r -> Where(r), long).await())
+    println(counter.ask(r -> Me(r), long).await().map(m -> m == counter))
+    println(counter.ask[int](r -> Get(r), long).await())
+    // The first reply completes the ask; the second is dropped, and the actor goes on.
+    println(show(counter.ask(r -> Twice(r), long).await()))
+    println(show(counter.ask(r -> Get(r), long).await()))
+    // No reply in time: a short timeout, and one of zero.
+    println(show(counter.ask(r -> Ignore(r), time.milliseconds(5)).await()))
+    println(show(counter.ask(r -> Ignore(r), time.zero()).await()))
+    // A reply reference: shown as `Reply#n`, unequal to others, ended once its ask is done, and
+    // answered with `Ended` once it has its answer.
+    val k1 = counter.ask(r -> Keep(r), long)
+    val ref1 = counter.ask(r -> Hand(r), long).await().ok().get()
+    val k2 = counter.ask(r -> Keep(r), long)
+    val ref2 = counter.ask(r -> Hand(r), long).await().ok().get()
+    println(s"$ref1 $ref2 ${ref1 == ref1} ${ref1 == ref2} ${ref1.hash() == ref2.hash()}")
+    println(k1.isCompleted())
+    println(ref1.ended().isCompleted())
+    ref1.tell(5)
+    println(show(k1.await()))
+    ref1.tell(6)
+    println(ref1.ended().await())
+    println(show(ref1.ask[int](r -> 7, long).await()))
+    ref2 tell 8
+    println(show(k2.await()))
+    // A generic actor at two instances.
+    val ints = spawn(Echo[int]())
+    val words = spawn(Echo[string]())
+    println(ints.ask(r -> (42, r), long).await())
+    println(words.ask(r -> ("word", r), long).await())
+    // An ended actor: the ask is never delivered.
+    counter.tell(Quit)
+    counter.ended().await()
+    println(show(counter.ask(r -> Get(r), long).await()))
+    println(show(counter.ask(r -> Ignore(r), time.zero()).await()))
+    answer match
+        Ok(17) -> 0
+        _ -> 1

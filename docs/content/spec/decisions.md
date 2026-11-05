@@ -3243,7 +3243,42 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+From building `ask`, `adapter` and `pipeToSelf` (branch `actor-ask`, 2026-11-05):
+
+- **`Ended` means "not delivered", decided at the send.** An ask completes with `Err(Ended)` exactly
+  where the asked actor was ending or had ended when the question was sent, so the message was
+  dropped. A question that was queued and then dropped because the actor ended before handling it
+  times out. Why: the chapter defines `Ended` as "the message could not be delivered", and an actor
+  may legitimately forward the reply reference and end, the reply still to come from another actor;
+  watching the asked actor's end for every ask would also hold a callback per ask on long-lived
+  actors. Alternative: complete with `Ended` as soon as the asked actor ends before a reply (quicker
+  failure for a question dropped from a mailbox, wrong for forwarded replies).
+- **An ask's reply reference** is an ordinary `ActorRef[R]` shown as `Reply#n`, numbered from one
+  apart from the actors (so asks never disturb the actors' numbering), unequal to every other
+  reference; its `ended()` completes (`Stopped`) once the ask has its answer or has timed out, and
+  an ask *of* a used reply reference answers `Ended`. Why: it is a one-shot address, so it ends
+  when it can accept nothing more. Alternatives: no identity of its own (sharing the asker's, which
+  `main` and threads do not have), or numbering it among the actors.
+- **The timeout is set once the question is delivered**; a timeout of zero or less times out at
+  once unless the reply was already there. Alternative: trap on a timeout not more than zero as
+  `every` does on its interval (a zero timeout is a legitimate "only if it is already answered").
+- **`adapter(f)`'s `f` runs where the message is sent**, so it is `@sendable`, and the adapter
+  refers to the adapting actor: equal to its `self`, the same hash and display, the same `ended()`;
+  a message sent to it once the actor has ended is dropped, and an ask of it answers `Ended`. Why:
+  the mailbox holds the actor's own message type, so translating at the send keeps it so, and the
+  chapter says a reference compares by the actor it refers to. Alternative: translate in the
+  actor's own turn, which would let `f` read the actor's state but needs a mailbox of translations.
+- **`pipeToSelf` of a future complete already sends at once**, so its message precedes any the actor
+  sends itself after the call, and two such pipes arrive in the order they were made; an
+  incomplete one sends from wherever the future completes, so `f` is `@sendable`. `T` carries no
+  `Sendable` bound, the value never leaving the future's own handing-over. Alternative: always go
+  through `onComplete`, leaving the order of an already-complete pipe and a later `tell` open.
+- **A lambda's parameter of a known shape with an open type argument** (`Promise[T]`,
+  `ActorRef[R]`) takes that shape, and the body decides the argument, as `p -> ReadLine(p)` decides
+  `T` from `ReadLine`'s parameter; a body that leaves it open is reported at the parameter, once.
+  A wholly unknown parameter type is still an error. Why: inference fails otherwise exactly where
+  the explicit form succeeds, and `ask(r -> Get(r), …)` is the chapter's idiom. Alternative:
+  require the type argument at every request-style call.
 
 ## Open
 

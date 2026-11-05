@@ -119,7 +119,10 @@ main() -> int
   reference `ask` makes, or its own `self` where its message type is `R`, or an **adapter**:
   `adapter[R: Sendable](f: R -> M) -> ActorRef[R]`, called in an actor, makes a reference whose
   messages arrive in this actor's mailbox as `f` of them, so an actor talks to one with another
-  protocol without widening its own message type.
+  protocol without widening its own message type. `f` runs where the message is sent, so it is
+  `@sendable`; the adapter refers to this actor, equal to its `self` and ending with it. The
+  reference an ask makes is shown as `Reply#1`, the replies numbered apart from the actors, and
+  ends once its ask is answered or has timed out.
 - **`ActorRef[-M]`** is contravariant: a reference that accepts every `Shape` is also one that
   accepts `Circle`s. It compares by the actor it refers to (`==` and `hash`), is `Sendable` and is shown
   as the declaration's name and a number, `Counter#3`, the actors of a program being numbered from
@@ -129,7 +132,8 @@ main() -> int
 Any thread may `tell` and `ask`. Inside an actor, waiting for an ask's future with `await` holds the
 actor: it handles no other message until the reply comes, which is sometimes what is wanted. The
 usual way is **`pipeToSelf[T](future: Future[T], f: T -> M)`**, which sends the actor `f` of the
-value once the future completes, so the actor goes on handling messages meanwhile. An actor that
+value once the future completes, so the actor goes on handling messages meanwhile; a future complete
+already sends at once, before anything the actor sends itself after the call. An actor that
 awaits an ask of itself waits until the timeout.
 
 ### Mailboxes and order

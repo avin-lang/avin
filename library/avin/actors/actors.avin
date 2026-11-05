@@ -176,9 +176,16 @@ private class Actor[M: Sendable](private val behaviour: Behaviour[M], private va
     // Puts `m` in the mailbox and queues the actor where it was neither queued nor running. A message
     // to an actor that is ending or has ended is dropped.
     post(m: M, guard: Option[Guard])
-        if phase.load() != Live then return
+        offer(m, guard)
+        ()
+
+    // Puts `m` in the mailbox as `post` does, and answers whether it did: `false` where the actor is
+    // ending or has ended, and the message was dropped.
+    offer(m: M, guard: Option[Guard]) -> bool
+        if phase.load() != Live then return false
         mailbox.put(m, guard)
         wake()
+        true
 
     // Asks the actor to end once the message it is handling is handled.
     override requestStop()
@@ -323,15 +330,59 @@ class Behaviour[M: Sendable](val name: string, val start: @sendable (ActorRef[M]
 // actor's number, `Counter#3`. A reference that accepts every message of a type accepts those of
 // its subtypes, so every reference is an `ActorRef[Nothing]`, which may be watched and compared but
 // not sent to.
-class ActorRef[-M: Sendable](private val send: @sendable (M) -> unit, val name: string, val number: long, private val end: Future[Ending]): Sendable
+//
+// The reference an `ask` makes for its reply is one too, which accepts one message: it is shown as
+// `Reply#1`, the replies of a program being numbered from one apart from the actors, and it ends
+// once the ask has its answer or has timed out. `send` answers whether the message was delivered.
+class ActorRef[-M: Sendable](private val send: @sendable (M) -> bool, val name: string, val number: long, private val end: Future[Ending]): Sendable
     // Puts `message` in the actor's mailbox and returns at once: it never waits and never fails.
     // Messages one sender tells one actor are handled in the order they were told; a message told to
     // an actor that has ended is dropped.
-    tell(message: M) = send(message)
+    tell(message: M)
+        send(message)
+        ()
+
+    // Sends the message `make` builds around a new reference that accepts one reply, and gives back
+    // the future of that reply: `Ok` of the first message the reference is sent, which completes it,
+    // a later one being dropped; `Err(TimedOut)` where none arrives within `timeout`; and
+    // `Err(Ended)` where the actor had ended, so the message could not be delivered. `make` runs at
+    // once, in the asking code.
+    //
+    //     counter.ask(r -> Get(r), timeout = time.seconds(1)).await()
+    ask[R: Sendable](make: (ActorRef[R]) -> M, timeout: Duration) -> Future[Result[R, AskError]]
+        val answer = Promise[Result[R, AskError]]()
+        val g = Guard(-1, true)
+        val reply = ActorRef[R](r -> answered(answer, g, Ok(r)), "Reply", -replies.add(1), answer.future.map(_ -> Stopped))
+        // The timer is set once the question is delivered, and taken out again where the reply came
+        // before it was set.
+        if !send(make(reply)) then answered(answer, g, Err(Ended))
+        else
+            clock.add(g, timeout.micros, 0, () ->
+                answered(answer, g, Err(TimedOut))
+                ())
+            if answer.isCompleted() then clock.remove(g)
+        answer.future
 
     // The future of how the actor ends, complete once it has, its children and its `stopping` block
     // done. `main` waits for the actor that runs the program with `spawn(App()).ended().await()`.
     ended() -> Future[Ending] = end
+
+// Why an ask has no answer: `TimedOut` where no reply arrived within its timeout, `Ended` where the
+// actor asked had ended, so the question was never delivered.
+data AskError
+    TimedOut
+    Ended
+
+// The last number given to an ask's reply reference.
+private val replies = Atomic[long](0)
+
+// Completes an ask with `outcome` where it has no answer yet, its timer then cancelled, and answers
+// whether it did.
+private answered[R: Sendable](answer: Promise[Result[R, AskError]], g: Guard, outcome: Result[R, AskError]) -> bool
+    if !answer.tryComplete(outcome) then return false
+    g.cancel()
+    clock.remove(g)
+    true
 
 // Two references are equal where they refer to the same actor.
 impl[M] Eq for ActorRef[M]
@@ -341,7 +392,7 @@ impl[M] Hash for ActorRef[M]
     hash() -> long = number
 
 impl[M: Sendable] Display for ActorRef[M]
-    display(out: Writer, spec: FormatSpec) = out.writeField(s"$name#$number", spec)
+    display(out: Writer, spec: FormatSpec) = out.writeField(if number < 0 then s"$name#${-number}" else s"$name#$number", spec)
 
 // Starts an actor of `behaviour` on `executor`, the shared pool unless another is given, and gives
 // back its reference at once. Its start runs on the executor's workers, and messages told before it
@@ -352,7 +403,7 @@ spawn[M: Sendable](behaviour: Behaviour[M], executor: Executor = Executor.shared
     val parent = registry.current()
     val actor = Actor(behaviour, executor, parent)
     handOver(behaviour, currentOwner(), actor.owner)
-    val ref = ActorRef[M](m -> actor.post(m, None), behaviour.name, actor.number, actor.end.future)
+    val ref = ActorRef[M](m -> actor.offer(m, None), behaviour.name, actor.number, actor.end.future)
     registry.enrol(actor.owner, actor)
     if parent is Some(p) then p.adopt(actor)
     actor.start(ref)
@@ -513,6 +564,26 @@ open class ActorContext[M: Sendable](private val actorRef: ActorRef[M])
     parent() -> Option[ActorRef[Nothing]]
         check("parent")
         actorCell.parent.map(p -> p.ref())
+
+    // A reference to this actor that accepts another protocol: each message `R` sent to it arrives in
+    // this actor's mailbox as `f` of it, so the actor answers an actor of another protocol without
+    // widening its own message type. `f` runs where the message is sent, so it is `@sendable`. The
+    // adapter refers to this actor: it is equal to `self`, shown as it is, and ends with it.
+    adapter[R: Sendable](f: @sendable (R) -> M) -> ActorRef[R]
+        check("adapter")
+        val a = actorCell
+        ActorRef[R](r -> a.offer(f(r), None), actorRef.name, actorRef.number, actorRef.ended())
+
+    // Sends the actor `f` of the value of `future` once it completes, so the actor goes on handling
+    // messages meanwhile; `f` runs where the value is known, so it is `@sendable`. A future complete
+    // already sends at once, so its message comes before any this code sends the actor after it. The
+    // message of an actor that has ended by then is dropped.
+    pipeToSelf[T](future: Future[T], f: @sendable (T) -> M)
+        check("pipeToSelf")
+        val a = actorCell
+        future.value() match
+            Some(v) -> a.post(f(v), None)
+            None -> future.onComplete(v -> a.post(f(v), None))
 
     // Runs `f` when the actor ends, after its children have ended; an `actor` declaration's
     // `stopping` block is one. Several run in the order they were given.

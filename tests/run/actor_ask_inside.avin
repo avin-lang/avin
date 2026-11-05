@@ -1,0 +1,104 @@
+// expect: exit 0
+// An actor asks another. With `pipeToSelf` the reply comes back as one of its own messages, and the
+// actor goes on handling others while it waits: the asker answers a ping while the asked actor holds
+// the reply back, and the reply, released after, arrives with what it answers; a timed-out ask comes
+// back as its error. Awaiting an ask inside an actor holds the actor until the reply comes, so a
+// message told meanwhile waits behind it. An actor that awaits an ask of itself waits until the
+// timeout, since it is the one that would answer. One actor asks the next down a chain of five,
+// each reply piped back up.
+import avin.actors.{ActorRef, AskError, Ended, TimedOut, spawn}
+import avin.threads.Channel
+import avin.time
+
+data Store
+    Fetch(key: string, reply: ActorRef[string])
+    Release
+    Drop(reply: ActorRef[string])
+
+// Holds every fetch until it is released, then answers them in the order they came.
+actor Slow receives Store
+    var held: Vector[(string, ActorRef[string])] = Vector()
+    receive
+        Fetch(key, reply) -> held = held :+ (key, reply)
+        Release ->
+            for (key, reply) in held do reply.tell(s"value of $key")
+            held = Vector()
+        Drop(_) -> ()
+
+data Front
+    Lookup(key: string)
+    Lost
+    Got(key: string, value: Result[string, AskError])
+    Ping(reply: ActorRef[string])
+    Hold(key: string)
+    Self(reply: ActorRef[string])
+    Echo(reply: ActorRef[string])
+
+actor Asker(store: ActorRef[Store], log: Channel[string]) receives Front
+    var answered = 0
+    receive
+        Lookup(key) -> pipeToSelf(store.ask(r -> Fetch(key, r), time.seconds(30)), v -> Got(key, v))
+        Lost -> pipeToSelf(store.ask(r -> Drop(r), time.milliseconds(5)), v -> Got("lost", v))
+        Got(key, Ok(v)) ->
+            answered += 1
+            log.send(s"$key: $v")
+        Got(key, Err(e)) -> log.send(s"$key: ${show(e)}")
+        Ping(reply) -> reply.tell(s"pong after $answered")
+        Hold(key) ->
+            val asked = store.ask(r -> Fetch(key, r), time.seconds(30))
+            log.send(s"holding for $key")
+            log.send(s"held $key: ${asked.await()}")
+            answered += 1
+        Self(reply) ->
+            val v = self.ask(r -> Echo(r), time.milliseconds(5)).await()
+            reply.tell(v match
+                Ok(s) -> s
+                Err(e) -> show(e))
+        Echo(reply) -> reply.tell("echo")
+
+show(e: AskError) -> string = e match
+    TimedOut -> "timed out"
+    Ended -> "ended"
+
+// One link of a chain: asks the next and pipes the answer back, adding its own name.
+data Link
+    Call(reply: ActorRef[string])
+    Back(reply: ActorRef[string], answer: Result[string, AskError])
+
+actor Chain(name: string, next: Option[ActorRef[Link]]) receives Link
+    receive
+        Call(reply) -> next match
+            Some(n) -> pipeToSelf(n.ask(r -> Call(r), time.seconds(30)), a -> Back(reply, a))
+            None -> reply.tell(name)
+        Back(reply, Ok(s)) -> reply.tell(s"$name<$s")
+        Back(reply, Err(e)) -> reply.tell(s"$name: ${show(e)}")
+
+main()
+    val long = time.seconds(30)
+    val log = Channel[string](16)
+    val store = spawn(Slow())
+    val asker = spawn(Asker(store, log))
+    asker.tell(Lookup("a"))
+    asker.tell(Lookup("b"))
+    // The asker is not held by its asks.
+    println(asker.ask(r -> Ping(r), long).await())
+    store.tell(Release)
+    println(log.receive().get())
+    println(log.receive().get())
+    println(asker.ask(r -> Ping(r), long).await())
+    asker.tell(Lost)
+    println(log.receive().get())
+    // An await holds the actor: the ping told after the hold is answered only once it is released.
+    asker.tell(Hold("c"))
+    println(log.receive().get())
+    val ping = asker.ask(r -> Ping(r), long)
+    store.tell(Release)
+    println(log.receive().get())
+    println(ping.await())
+    // An ask of itself, awaited, can only time out.
+    println(asker.ask(r -> Self(r), long).await())
+    // A chain of five, each asking the next.
+    var next: Option[ActorRef[Link]] = None
+    for i in 0..<5
+        next = Some(spawn(Chain(s"c$i", next)))
+    println(next.get().ask(r -> Call(r), long).await())

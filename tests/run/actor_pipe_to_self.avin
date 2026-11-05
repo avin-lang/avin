@@ -1,0 +1,102 @@
+// expect: exit 0
+// `pipeToSelf(future, f)` sends the actor `f` of the future's value once it completes, and the actor
+// handles other messages meanwhile. A future that succeeds, and one whose `Result` is a failure, each
+// arrive as the message `f` makes of it. A future complete already sends at once, so its message comes
+// before any the actor sends itself after the call, and two such pipes arrive in the order they were
+// made. A promise completed later from outside arrives after the messages handled while it waited.
+// A pipe whose future completes after the actor has ended is dropped. A generic actor pipes at its
+// own type argument, and many pipes at once each arrive exactly once.
+import avin.actors.{ActorRef, spawn}
+import avin.threads.{Channel, Future, Promise}
+import avin.time
+
+data Msg
+    Compute(n: int)
+    Parse(text: string)
+    Ready
+    Wait(p: Promise[int])
+    Other(label: string)
+    Value(label: string, n: int)
+    Parsed(r: Result[int, string])
+    Many(count: int)
+    Report(reply: ActorRef[string])
+    Quit
+
+parse(text: string) -> Result[int, string] = if text == "" then Err("nothing to parse") else Ok(text.byteLength())
+
+actor Worker(log: Channel[string]) receives Msg
+    var seen: Vector[string] = Vector()
+    var piped = 0
+    receive
+        Compute(n) -> pipeToSelf(Future(n * n), v -> Value("computed", v))
+        Parse(text) -> pipeToSelf(Future(parse(text)), r -> Parsed(r))
+        Ready ->
+            // Both complete already: they arrive at once and in order, before the message told after.
+            pipeToSelf(Future.successful(1), v -> Value("first", v))
+            pipeToSelf(Future.successful(2), v -> Value("second", v))
+            self.tell(Other("told after"))
+        Wait(p) ->
+            pipeToSelf(p.future, v -> Value("waited", v))
+            log.send("waiting")
+        Other(label) ->
+            seen = seen :+ label
+            log.send(label)
+        Value(label, n) ->
+            seen = seen :+ s"$label $n"
+            piped += 1
+            log.send(s"$label $n")
+        Parsed(Ok(n)) -> log.send(s"parsed $n")
+        Parsed(Err(e)) -> log.send(s"failed: $e")
+        Many(count) -> for i in 0..<count do pipeToSelf(Future(i), v -> Value("many", v))
+        Report(reply) -> reply.tell(s"$piped piped")
+        Quit -> stop()
+
+// A generic actor piping a value of its own type argument.
+actor Boxer[T: Sendable + Display](value: T, log: Channel[string]) receives Option[T]
+    pipeToSelf(Future.successful(value), v -> Some(v))
+    receive
+        Some(v) -> log.send(s"boxed $v")
+        None -> ()
+
+main()
+    val patience = time.seconds(30)
+    val log = Channel[string](64)
+    val w = spawn(Worker(log))
+    w.tell(Compute(7))
+    println(log.receive().get())
+    w.tell(Parse("four"))
+    println(log.receive().get())
+    w.tell(Parse(""))
+    println(log.receive().get())
+    w.tell(Ready)
+    for _ in 0..<3 do println(log.receive().get())
+    // The actor goes on while the promise waits.
+    val p = Promise[int]()
+    w.tell(Wait(p))
+    println(log.receive().get())
+    w.tell(Other("meanwhile"))
+    println(log.receive().get())
+    p.complete(99)
+    println(log.receive().get())
+    // A thousand pipes, each arriving once.
+    w.tell(Many(1000))
+    var sum = 0
+    for _ in 0..<1000
+        val line = log.receive().get()
+        if line.startsWith("many ") then sum += 1
+    println(sum)
+    println(w.ask(r -> Report(r), patience).await())
+    // Generic, at two instances.
+    spawn(Boxer(5, log))
+    println(log.receive().get())
+    spawn(Boxer("five", log))
+    println(log.receive().get())
+    // A pipe that completes after its actor has ended is dropped.
+    val late = Promise[int]()
+    w.tell(Wait(late))
+    println(log.receive().get())
+    w.tell(Quit)
+    w.ended().await()
+    late.complete(1)
+    println(late.future.await())
+    println(log.tryReceive())

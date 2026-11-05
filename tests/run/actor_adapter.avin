@@ -1,0 +1,114 @@
+// expect: exit 0
+// `adapter(f)`, called in an actor, makes a reference of another protocol whose messages arrive in
+// the actor's own mailbox as `f` of them, so the actor talks to a service of another protocol without
+// widening its message type: passed as the reply address of a request the service answers, given out
+// once and used many times, and made several times with different functions. The adapter refers to
+// the actor: it is equal to `self`, hashes as it does, is shown as it is, and ends with it, after which
+// what is sent to it is dropped and an ask of it answers `Ended`. `f` runs where the message is sent,
+// so it captures only sendable values. A generic actor adapts at its own type argument, and an adapter
+// translates a generic message type at two instances.
+import avin.actors.{ActorRef, AskError, Ended, TimedOut, spawn}
+import avin.threads.{Channel, Promise}
+import avin.time
+
+// Whether two references of different protocols refer to one actor: every reference is one of
+// `Nothing`.
+same(a: ActorRef[Nothing], b: ActorRef[Nothing]) -> bool = a == b
+
+// The service's protocol, which knows nothing of its clients'.
+data Lookup(key: string, reply: ActorRef[Option[int]])
+
+actor Directory receives Lookup
+    receive
+        Lookup(key, reply) -> reply.tell(if key == "one" then Some(1) elif key == "two" then Some(2) else None)
+
+// A generic reply wrapper of the service's, at two instances.
+data Tagged[T: Sendable](tag: string, value: T)
+
+data Pair[T: Sendable](tag: string, reply: ActorRef[Tagged[T]])
+
+actor Tagger[T: Sendable](value: T) receives Pair[T]
+    receive
+        Pair(tag, reply) -> reply.tell(Tagged(tag, value))
+
+data Client
+    Find(key: string)
+    Found(key: string, value: Option[int])
+    Tags(ints: ActorRef[Pair[int]], words: ActorRef[Pair[string]])
+    Number(t: Tagged[int])
+    Word(t: Tagged[string])
+    Same(reply: ActorRef[string])
+    Quit
+
+actor Reader(directory: ActorRef[Lookup], log: Channel[string]) receives Client
+    // One adapter made once and given out for every request.
+    val counted: ActorRef[Option[int]] = adapter(v -> Found("counted", v))
+    receive
+        Find(key) ->
+            directory.tell(Lookup(key, adapter(v -> Found(key, v))))
+            directory.tell(Lookup(key, counted))
+        Found(key, value) -> log.send(s"$key: $value")
+        Tags(ints, words) ->
+            ints.tell(Pair("n", adapter(t -> Number(t))))
+            words.tell(Pair("w", adapter(t -> Word(t))))
+        Number(t) -> log.send(s"number ${t.tag} ${t.value + 1}")
+        Word(t) -> log.send(s"word ${t.tag} ${t.value}!")
+        Same(reply) ->
+            val a = adapter((n: int) -> Quit)
+            val b = adapter((s: string) -> Quit)
+            reply.tell(s"${same(a, self)} ${same(b, self)} ${same(a, directory)} ${a.hash() == self.hash()} $a $counted ${s"$a" == s"$self"}")
+        Quit -> stop()
+
+// A generic actor that adapts at its own type argument: plain values `T` arrive tagged.
+actor Wrapper[T: Sendable + Display](log: Channel[string], out: Promise[ActorRef[T]]) receives Tagged[T]
+    out.complete(adapter(v -> Tagged("raw", v)))
+    receive
+        Tagged(tag, v) -> log.send(s"wrapped $tag $v")
+
+// Hands out an adapter of its own, so another actor sends to it after it has ended.
+data Out
+    Give(reply: ActorRef[ActorRef[string]])
+    Said(s: string)
+    Stop
+
+actor Speaker(log: Channel[string]) receives Out
+    receive
+        Give(reply) -> reply.tell(adapter(s -> Said(s)))
+        Said(s) -> log.send(s"said $s")
+        Stop -> stop()
+
+main()
+    val patience = time.seconds(30)
+    val log = Channel[string](32)
+    val directory = spawn(Directory())
+    val reader = spawn(Reader(directory, log))
+    reader.tell(Find("one"))
+    for _ in 0..<2 do println(log.receive().get())
+    reader.tell(Find("three"))
+    for _ in 0..<2 do println(log.receive().get())
+    reader.tell(Tags(spawn(Tagger(41)), spawn(Tagger("hi"))))
+    val tags = Vector(log.receive().get(), log.receive().get()).sortWith((a, b) -> a.compare(b))
+    for t in tags do println(t)
+    println(reader.ask(r -> Same(r), patience).await())
+    // A generic actor's adapter, at two instances.
+    val ints = Promise[ActorRef[int]]()
+    spawn(Wrapper(log, ints))
+    ints.future.await().tell(7)
+    println(log.receive().get())
+    val words = Promise[ActorRef[string]]()
+    spawn(Wrapper(log, words))
+    words.future.await() tell "seven"
+    println(log.receive().get())
+    // An adapter outlives nothing: once its actor ends, it is dropped into.
+    val speaker = spawn(Speaker(log))
+    val said = speaker.ask(r -> Give(r), patience).await().ok().get()
+    said.tell("hello")
+    println(log.receive().get())
+    println(s"${same(said, speaker)} $said")
+    speaker.tell(Stop)
+    println(said.ended().await())
+    said.tell("unheard")
+    println(said.ask[unit](r -> "never asked", patience).await())
+    reader.tell(Quit)
+    reader.ended().await()
+    println(log.tryReceive())
