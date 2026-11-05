@@ -13925,6 +13925,7 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     var types: Buf[&Type] = buf()
     var names: Buf[string] = buf()
     var local_types: Buf[&Type] = buf()
+    var open_params: Buf[usize] = buf()
     for i in 0..<params.len()
         val p = params[i]
         names.push(p.name)
@@ -13947,6 +13948,12 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
             None ->
                 val known: &Type = if i < wanted.len() then zonk(c, wanted[i]) else Var(0)
                 if i < wanted.len() && !has_unknowns(known) then ty = known
+                // A parameter whose type is known in shape but not in every argument, a `Promise[T]`
+                // of an open `T`, takes that shape, and the body's use of it decides the rest:
+                // `p -> ReadLine(p)` passes it where a `Promise[Option[string]]` is expected.
+                elif i < wanted.len() && !(*known is Var(_)) && !mismatched
+                    ty = known
+                    open_params.push(i)
                 elif !mismatched then c.note(unit, p.span, s"cannot infer the type of `${p.name}`; write it, as in `(${p.name}: int) -> …`")
         types.push(ty)
         local_types.push(local.unwrap_or(ty))
@@ -13979,6 +13986,13 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
         param_locals.push(declare_local(c, params[i].span, names[i], local_types[i], false))
     c.symbols[id].param_locals = param_locals
     check_body(c, id, body, hint)
+    // One the body left open is reported here, and its unknowns are made errors, so the call does
+    // not report the same gap a second time.
+    for i in open_params
+        val left = zonk(c, types[i])
+        if has_unknowns(left)
+            c.note(unit, params[i].span, s"cannot infer the type of `${params[i].name}`; write it, as in `(${params[i].name}: int) -> …`")
+            give_up_unknowns(c, left)
     c.body.visible.truncate(mark)
     c.body.block_start = outer_start
     c.body.loops = loops
@@ -13993,6 +14007,19 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     // which holds what it captures and what it reaches to the rules for one (`check_sendable_arguments`).
     val ty: &Type = if mismatched then ErrorType else Function(types, yields, sendable_wanted(c, expected))
     TExpr(e.span, ty, FunctionValue(id, buf()))
+
+/** Solves every unknown left in `t` as an error, which says nothing more about it. */
+private give_up_unknowns(c: *Checker, t: &Type)
+    *t match
+        Var(_) -> unify(c, t, ErrorType)
+        Tuple(items) -> for item in items do give_up_unknowns(c, item)
+        Function(params, result, _) ->
+            for p in params do give_up_unknowns(c, p)
+            give_up_unknowns(c, result)
+        ByName(inner) -> give_up_unknowns(c, inner)
+        Data(_, _, args) -> for a in args do give_up_unknowns(c, a)
+        Class(_, _, args) -> for a in args do give_up_unknowns(c, a)
+        _ -> ()
 
 /** The elements of `t` where it is a tuple, and none otherwise. */
 private tuple_elements(t: &Type) -> Buf[&Type] = *t match
