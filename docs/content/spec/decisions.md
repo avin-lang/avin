@@ -3728,14 +3728,8 @@ spelling is better, as each entry says.
   (`Even() -> …` twice) should count as unreachable, since an extractor is a function that could
   answer differently each time.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- **C arrays as pointers and `blocking` calls, as built** (branch `c-bindings-arrays`, stage 13
+- Settled on the user's delegation 2026-11-05: **C arrays as pointers and `blocking` calls, as
+  built** (branch `c-bindings-arrays`, stage 13
   step 6, [chapter](/spec/c-bindings/#arrays-and-out-parameters)). The chapter left these open:
   - **An `Array[int]` or `Array[long]` goes only to a pointer to a *signed* integer of its size;
     an `Array[byte]` to any one-byte integer; an `Array[real]` to any eight-byte floating-point
@@ -3773,6 +3767,13 @@ spelling is better, as each entry says.
     not.
   - **Arrays of mirrors, strings, handles, `bool` and the narrower integers are refused** with the
     four element types the chapter lists; arrays of mirrors arrive with struct mirrors (step 7).
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
 
 ## Open
 
