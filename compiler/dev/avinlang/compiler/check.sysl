@@ -2865,6 +2865,16 @@ private declare_methods(c: *Checker, unit: usize)
         if c.variants.get(key) is Some(v)
             if k.companion_data != Some(v.data) then c.note(unit, d.name_span, s"`${d.name}` is already a variant of `${c.data[v.data].name}`")
             elif c.data[v.data].variants[v.index].fields.len() == 0 then c.note(unit, d.name_span, s"`${d.name}` is a variant of `${d.name}` with no fields, a value by its bare name; a companion object cannot share it")
+        // `T.V` is the variant, so the companion cannot declare a member the variant would hide.
+        if k.companion_data is Some(data_id)
+            for m in d.members
+                val member = m match
+                    MethodMember(f, _, _, _) -> Some((f.name, f.name_span))
+                    FieldMember(f) -> Some((f.name, f.span))
+                    _ -> None
+                if member is Some((name, span))
+                    for v in c.data[data_id].variants
+                        if v.name == name then c.note(unit, span, s"`$name` is a variant of `${d.name}`, which `${d.name}.$name` names; its companion object cannot declare a member of that name")
         if k.companion_data is Some(_) && c.variants.get(key) is None
             if c.scope.get(key) is Some(ids)
                 for f in ids
@@ -7489,6 +7499,7 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Checked(slot) -> c.checked_slots[slot]
     Member(target, name) ->
         if module_use(c, e) is Some(q) then check_form(c, q, expected, used)
+        elif variant_use(c, e.span, target, name) is Some((found, explicit)) then qualified_variant_value(c, e.span, found, explicit, expected)
         elif limit_constant(c, e.span, target, name) is Some(k) then k
         elif static_value(c, e.span, target, name, expected) is Some(v) then v
         else member_expr(c, e, target, name, expected)
@@ -8363,8 +8374,156 @@ global_named(c: *Checker, name: string) -> Option[usize]
     if local_function(c, name) is Some(_) then return None
     c.global_names.get(resolve_name(c, unit_of(c), name))
 
-/** The variant a bare name refers to in the code being checked, if it refers to one. */
-private variant_named(c: *Checker, name: string) -> Option[VariantRef] = c.variants.get(resolve_name(c, unit_of(c), name))
+/** The variant a name refers to in the code being checked, if it refers to one: a bare name, a
+ * module's `m.V`, or the type's own `T.V` and `m.T.V`. */
+private variant_named(c: *Checker, name: string) -> Option[VariantRef]
+    val key = resolve_name(c, unit_of(c), name)
+    // A name another module's declaration is reached by is that module's public one.
+    if c.variants.get(key) is Some(v)
+        if !name.contains(".") || exported(c, key) then return Some(v)
+    qualified_variant(c, name)
+
+/** Where `path` is `T.V` or `m.T.V`, `T` naming a data type: the type and the last part, `V`. `None`
+ * where the part before the last dot names no data type, or a local, a parameter, a member of the
+ * enclosing class or a local function of the first part's name hides it. */
+private variant_qualifier(c: *Checker, path: string) -> Option[(usize, string)]
+    var dot: Option[usize] = None
+    for k in 0..<path.bytes.len
+        if path.bytes[k] == u8('.') then dot = Some(k)
+    val last = dot?
+    val prefix = path[0..<last]
+    var first = prefix
+    for k in 0..<prefix.bytes.len
+        if prefix.bytes[k] == u8('.')
+            first = prefix[0..<k]
+            break
+    if lookup_local(c, first) is Some(_) || param_index(c, first) is Some(_) || class_member(c, first) is Some(_) || local_function(c, first) is Some(_) then return None
+    val key = resolve_name(c, unit_of(c), prefix)
+    if prefix.contains(".") && !exported(c, key) then return None
+    val d = c.types.get(key)?
+    Some((d, path[last + 1..]))
+
+/** The variant `T.V` or `m.T.V` names: data type `T`'s own variant `V`. A variant of the type comes
+ * before any member of its companion or static member of the type of that name. */
+private qualified_variant(c: *Checker, path: string) -> Option[VariantRef]
+    val (d, name) = variant_qualifier(c, path)?
+    for i in 0..<c.data[d].variants.len()
+        if c.data[d].variants[i].name == name then return Some(VariantRef(d, i))
+    None
+
+// `T.V` where `T` is a type and `V`, capitalized as a variant is, is neither a variant of it nor a
+// member its name reaches: reported, naming the type's variants or saying it has none. Whether it
+// reported.
+private no_such_variant(c: *Checker, at: Span, path: string) -> bool
+    var dot: Option[usize] = None
+    for k in 0..<path.bytes.len
+        if path.bytes[k] == u8('.') then dot = Some(k)
+    val last = dot match
+        Some(k) -> k
+        None -> return false
+    val prefix = path[0..<last]
+    val name = path[last + 1..]
+    if name.bytes.len == 0 || name.bytes[0] < u8('A') || name.bytes[0] > u8('Z') then return false
+    val unit = unit_of(c)
+    // `m.V` or `m.T.V` where module `m`'s `V` or `T` is private to it.
+    if c.variants.get(resolve_name(c, unit, path)) is Some(v)
+        if !exported(c, resolve_name(c, unit, path))
+            c.note(unit, at, s"`$name` is private to module `${c.data[v.data].module_name}`")
+            return true
+    val type_key = resolve_name(c, unit, prefix)
+    if prefix.contains(".") && !exported(c, type_key)
+        if c.types.get(type_key) is Some(d)
+            c.note(unit, at, s"`${c.data[d].name}` is private to module `${c.data[d].module_name}`")
+            return true
+    if variant_qualifier(c, path) is Some((d, _))
+        if has_static_member(c, d, name) then return false
+        if c.data[d].companion is Some(o)
+            if companion_member(c, o, name) then return false
+        var names: Buf[string] = buf()
+        for v in c.data[d].variants
+            names.push(s"`${v.name}`")
+        val type_name_written = c.data[d].name
+        if names.len() == 1 then c.note(unit, at, s"`$type_name_written` has no variant `$name`; its one variant is ${names[0]}")
+        else c.note(unit, at, s"`$type_name_written` has no variant `$name`; its variants are ${spoken_list(names)}")
+        return true
+    if prefix.contains(".") then return false
+    if lookup_local(c, prefix) is Some(_) || param_index(c, prefix) is Some(_) || class_member(c, prefix) is Some(_) || local_function(c, prefix) is Some(_) then return false
+    if global_named(c, prefix) is Some(_) then return false
+    val key = resolve_name(c, unit, prefix)
+    if c.class_types.get(key) is Some(k)
+        if is_trait(c, k) then return false
+        if members_of_type(c, own_class_type(c.classes[k], k), name).len() > 0 then return false
+        c.note(unit, at, s"`$prefix` is a class, not a data type, so it has no variant `$name`")
+        return true
+    false
+
+/** `a.b.c` for an expression of names and members, `None` for any other. */
+private written_path(e: &Expr) -> Option[string] = e.kind match
+    Name(n) -> Some(n)
+    Member(target, name) -> Some(written_path(target)? + "." + name)
+    _ -> None
+
+// `T.V`, `m.T.V` or `T[A].V` as an expression, `target.name`: the variant named and the type
+// arguments written on `T`, or the report that `V` is none, as `Some(None)`. `None` where `target`
+// names no type, so the expression is read as any other member.
+private variant_use(c: *Checker, at: Span, target: &Expr, name: string) -> Option[(Option[VariantRef], Option[Buf[&TypeExpr]])]
+    var written = target
+    var explicit: Option[Buf[&TypeExpr]] = None
+    if target.kind is TypeApply(inner, types)
+        written = inner
+        explicit = Some(types)
+    val prefix = written_path(written)?
+    val path = prefix + "." + name
+    if qualified_variant(c, path) is Some(v) then return Some((Some(v), explicit))
+    if no_such_variant(c, at, path) then return Some((None, None))
+    None
+
+// `T.V` not called: a variant without fields, made; one with fields is reported, as its bare name is.
+private qualified_variant_value(c: *Checker, at: Span, found: Option[VariantRef], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+    val v = found match
+        Some(v) -> v
+        None -> return TExpr(at, ErrorType, UnitConst)
+    if c.data[v.data].variants[v.index].fields.len() == 0 then return construct(c, at, at, v, buf(), explicit, expected)
+    val written = c.data[v.data].name + "." + c.data[v.data].variants[v.index].name
+    c.note(unit_of(c), at, s"`$written` has fields; call it, as in `$written(…)`")
+    TExpr(at, ErrorType, UnitConst)
+
+// `T.V(args)`: the variant made from the arguments. Type arguments are written once, on the type,
+// `T[A].V(…)`, or on the variant, `T.V[A](…)`.
+private qualified_variant_call(c: *Checker, at: Span, name_span: Span, found: Option[VariantRef], on_type: Option[Buf[&TypeExpr]], on_variant: Option[Buf[&TypeExpr]], args: Buf[Argument], expected: Option[&Type]) -> &TExpr
+    val unit = unit_of(c)
+    var explicit = on_variant
+    var chosen = found
+    if on_type is Some(_)
+        if on_variant is Some(_)
+            c.note(unit, name_span, "a variant's type arguments are written once, on its type or on the variant")
+            chosen = None
+        else explicit = on_type
+    val v = chosen match
+        Some(v) -> v
+        None ->
+            for a in args
+                check_statement(c, a.value)
+            return TExpr(at, ErrorType, UnitConst)
+    if c.data[v.data].variants[v.index].fields.len() == 0
+        val written = c.data[v.data].name + "." + c.data[v.data].variants[v.index].name
+        c.note(unit, at, s"`$written` has no fields; write it without parentheses")
+        for a in args
+            check_statement(c, a.value)
+        return TExpr(at, ErrorType, UnitConst)
+    construct(c, at, name_span, v, args, explicit, expected)
+
+// Whether object `o` declares a method or a field `name`.
+private companion_member(c: *Checker, o: usize, name: string) -> bool =
+    methods_named(c, o, name).len() > 0 || field_named(c.classes[o].fields, name) is Some(_)
+
+// `a`, `a and b`, `a, b and c`.
+private spoken_list(items: Buf[string]) -> string
+    var out = ""
+    for i in 0..<items.len()
+        if i > 0 then out = out + (if i + 1 == items.len() then " and " else ", ")
+        out = out + items[i]
+    out
 
 // A module-level value's type is its initializer's result: declared, or inferred by checking the
 // initializer first, which is not possible while that initializer is itself being checked.
@@ -10865,7 +11024,9 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
     if module_use(c, named) is Some(q)
         if explicit is Some(types) then return call_expr(c, at, Expr(callee.span, TypeApply(q, types)), args, expected)
         return call_expr(c, at, q, args, expected)
-    if named.kind is Member(target, member) then return member_call(c, at, callee, named.span, target, member, args, explicit, expected, false)
+    if named.kind is Member(target, member)
+        if variant_use(c, named.span, target, member) is Some((found, on_type)) then return qualified_variant_call(c, at, named.span, found, on_type, explicit, args, expected)
+        return member_call(c, at, callee, named.span, target, member, args, explicit, expected, false)
     val name = named.kind match
         Name(n) -> n
         _ -> return value_call(c, at, callee, args)
@@ -13514,7 +13675,9 @@ private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string)
             TPattern(p.span, ty, PAlternatives(typed))
         Constructor(path, args) -> variant_named(c, path) match
             Some(v) -> variant_pattern(c, p, v, args, ty, no_bind)
-            None -> extractor_pattern(c, p, path, args, ty, no_bind)
+            None ->
+                if no_such_variant(c, p.span, path) then return failed_extractor(c, p, args, no_bind)
+                extractor_pattern(c, p, path, args, ty, no_bind)
         Rest(binder) ->
             c.note(unit, p.span, "`rest*` stands for the rest of a sequence, last in a sequence pattern or in an `unapplySeq` extractor's patterns")
             check_pattern(c, binder, ErrorType, no_bind)
