@@ -213,8 +213,40 @@ bounds(a: int, b: int) -> (int, int)
 ```
 
 A tuple is taken apart by a binding (`val q, r = divmod(17, 5)`, `val (a, (b, c)) = t`), by a
-[multiple assignment](/spec/operators-and-control-flow/#multiple-assignment), and by tuple
-patterns in `match` and in clauses.
+[multiple assignment](/spec/operators-and-control-flow/#multiple-assignment), by tuple
+patterns in `match` and in clauses, and by a lambda's parameters.
+
+Where a function of one parameter whose type is a tuple of *n* elements is expected, *n* at least
+two, a lambda of exactly *n* parameters takes the tuple apart: its parameters are the tuple's
+elements, in order, each typed from its element. A lambda of one parameter takes the tuple whole,
+as it would anywhere.
+
+```text
+val xs = [1, 2, 3]
+xs.zip(xs).forall((x, y) -> x == y)          // true
+xs.zip(["a", "b", "c"]).map((n, s) -> s"$s$n") // [a1, b2, c3]
+[((1, 2), 3)].map((p, z) -> p.0 + p.1 + z)   // [6]: an inner tuple is one element
+map.filter((k, _) -> k != "skip")
+```
+
+- A parameter written with a type takes an element of that type, or of a narrower one as any
+  lambda's parameter may, and its body sees the type written: `(a: Animal, n) -> …` over
+  `(Dog, int)` pairs. A declared type the element does not fit is an error naming the element.
+- An element the expected type leaves unknown, as in a generic function's `((A, B)) -> C` whose
+  `A` and `B` nothing else fixes, takes its type from the parameter's declaration; one with neither
+  is an error asking for the type.
+- `_` takes an element and binds nothing. Each parameter is a `val`, as any lambda's is.
+- It applies only where the lambda's parameters are not as many as the expected function's: a
+  lambda of two parameters where `(A, B) -> C` is expected takes two arguments. Among overloads, a
+  candidate that has a lambda take a tuple apart is chosen only where no candidate takes it as
+  written, so `Map`'s `map((k, v) -> (v, k))` is its `(K, V) -> (L, W)` overload.
+- A lambda whose parameters are as many as neither the function's nor the tuple's elements is an
+  error naming both shapes: `expected a function of 1 parameter, (int, int), but this lambda takes
+  3: a lambda takes that tuple as one parameter or as 2 parameters, one for each element`.
+
+A [`match` function](/spec/operators-and-control-flow/#match-functions), `match (x, y) -> …`, still
+takes a tuple apart by a pattern, for shapes a list of names cannot write: nested tuples, literals,
+variants.
 
 ## Function types
 
