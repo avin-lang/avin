@@ -115,11 +115,16 @@ is passed for it was checked where it was passed: a `@sendable` lambda captures 
 on for another `@sendable` parameter as it is. So what is passed for one that does not take a
 function is itself sendable: a [`match` function](/spec/operators-and-control-flow/#match-functions)
 written in place, whose arms are checked as a lambda's body is, by what they capture and the
-module-level state they reach; a value of a sendable type; or a parameter so marked. A class's `val`
-parameter so marked is a field whose value is sendable, so it leaves the class sendable by its
-structure; a `var` one does not, since it may be assigned anything later. The mark belongs to the
-parameter, not to its type: a marked value copied into a local, stored in a data field of the
-trait's type, or combined into another (`f.orElse(g)`) is a value of that type again.
+module-level state they reach; a value of a sendable type; a parameter so marked; or `f.orElse(g)`
+of two of these, chains of it included, which holds only the two. A class's `val` parameter so
+marked is a field whose value is sendable, so it leaves the class sendable by its structure; a `var`
+one does not, since it may be assigned anything later. The mark belongs to the parameter, not to its
+type: a marked value copied into a local, a combination held in one, or one stored in a data field
+of the trait's type is a value of that type again. `orElse` is sendable of sendable parts by the
+standard library's promise, `@sendable_result`, which says a function's result holds nothing but its
+receiver and its arguments; nothing checks the promise against the body, so only the standard
+library makes it, and a function of the program's own that passes its marked arguments back is not
+taken as one.
 
 ```avin
 data Rule[T](run: @sendable (char) -> Option[T])
@@ -129,11 +134,30 @@ pick[U](@sendable f: PartialFunction[char, U]) -> Rule[U] = Rule(c -> if f.isDef
 pickAgain[U](@sendable f: PartialFunction[char, U]) -> Rule[U] = pick(f)
 
 val digit: Rule[int] = pickAgain(match c if '0' <= c <= '9' -> int(c) - int('0'))
+
+either[U](@sendable f: PartialFunction[char, U], @sendable g: PartialFunction[char, U]) -> Rule[U] = pick(f.orElse(g))
+
+val sign: Rule[int] = either(match '+' -> 1, match '-' -> -1)
 ```
 
 A lambda or a `match` function passed for a type argument bounded by `Sendable`, as
 `take[U: Sendable](value: U)` has, is made as a `@sendable` function and checked as one where it is
 made; a plain function type the expected type gives that argument is taken as its `@sendable` form.
+A `match` function written where a `PartialFunction` is expected is made of two `@sendable`
+functions there, one testing its patterns and guards and one running its arms, checked as one
+function whose fault is reported once. `PartialFunction` itself does not promise `Sendable`, so the
+bound holds at that call only where every value the call gives of the type argument is such a
+`match` function: an argument of exactly that type for each parameter whose type could give the
+callee a value of it (one naming it as what a function passed takes gives none). A written type
+argument is held to the bound as written.
+
+```avin
+take[U: Sendable](value: U) -> U = value
+
+val vowel: PartialFunction[char, int] = take(match
+    'a' -> 1
+    'e' -> 2)
+```
 
 ```avin
 import avin.threads.spawn

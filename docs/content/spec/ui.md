@@ -9,7 +9,8 @@ A program with a window reaches it through the **`ui` package**, which binds two
 **syslui-sdl**, which opens the window, runs the frame loop and turns the platform's events into
 syslui's. The package is a thin binding: every view, control and signal in it is syslui's own,
 reached through [handles](/spec/sysl-bindings/#handles), and its functions are syslui's under Avin's
-names. A layer of components and signals written in Avin is to stand on it.
+names. On it stands a layer written in Avin, [components and state](#components-and-state): an
+interface built by functions from state the program keeps, and built again when the state changes.
 
 The package lives in this repository at `packages/ui`, its module is `ui`, and a program names it as
 a dependency:
@@ -168,8 +169,110 @@ A key no control on screen answers to, and a name two controls share, are `Err(M
 Unknown: nothing on screen is called 'nothing'
 ```
 
+## Components and state
+
+An interface is a function of the program's state, built again whenever that state changes. The
+state is held in **`State[T]`**, an Avin object holding a value of any type, made by `state(v)`:
+
+| Member | |
+| --- | --- |
+| `get()` | The value |
+| `set(v)` | Replaces it; one write, which the frame loop builds again after |
+| `update(f)` | `set(f(get()))` |
+
+A set is one write whatever it writes, the same value included, so nothing else is called after
+one. A state of a reference holds the reference: changing the object in place is no write.
+
+```text
+import ui.{View, button, column, component, root, text}
+
+counter(step: int) -> View = component c ->
+    val count = c.state(0)
+    column([text(s"${count.get()}"), button(s"Add $step", () -> count.update(n -> n + step))])
+```
+
+### Components
+
+A **component** is a function building a view, whose body is written `component c -> …`: the
+body is given the component's **`Scope`**, which keeps values from one build to the next. Its props
+are its function's parameters, read afresh on every build.
+
+| Scope member | |
+| --- | --- |
+| `c.state(init)` | A `State` holding `init` on the component's first build, the same state on every build after; `init` is by-name, evaluated only then |
+| `c.remember(make)` | Any value, made by the by-name `make` on the first build and kept |
+| `c.derived(f)` | The value of a [derived](#derived-values) `f`, kept across builds |
+
+A scope answers by order: the component's *n*th request on every build is the same value. A request
+for another type than the last build's in that place, or a request made after the build, from a
+callback the build left behind, stops the program:
+
+```text
+avin: trap: a component asked for the values it keeps in a different order from its last build
+avin: trap: a component's scope was asked for a value outside the component's build
+```
+
+**`root(body)`** answers the function a frame loop calls for its tree, `app(title, root(screen),
+ground)`: each call is one **build**, and every component built during it is in the root's tree. A
+component is found again on the next build by its **place** among the components its parent builds
+without a key, the first, the second, and so on; **`keyed(key) c -> …`** finds it by its key, a
+`string` or an `int` (an `int` key and its decimal string are one key), wherever among its parent's
+components it is built. A list reordered keeps its keyed components' state; unkeyed, the state stays
+in its place, and a component that disappears from before another gives that one its state.
+Components nest: each keeps its own inside its parent's, and separate roots keep separate trees.
+
+**A component the build of its parent leaves out is gone**, with everything it kept and every
+component inside it: a component shown again after a build without it starts afresh. A component
+built in a tab's body is built during the build, and is one place whichever tab shows it.
+
+Two components built under one parent with one key, a component built while no root is building,
+and a root built inside its own build each stop the program:
+
+```text
+avin: trap: two components built under one parent have the key 'x'
+avin: trap: a component was built outside the build of a root
+avin: trap: a root was built again inside its own build
+```
+
+A root built inside a component's build is a tree of its own, and is fine.
+
+### Controls over state
+
+Every control that holds a value has an overload taking a `State` in place of a signal:
+`switch`, `checkbox`, `radio`, `radioGroup`, `slider` over a `State[int]` or a `State[real]`,
+`textField`, `textArea`, `tabs` and `scroll`. It reads and writes the state's own signal,
+`State.signal(s)`, which is made from the state's value on the first call and is from then on
+where the value lives: a control's write is the state's value at once, with no build in between,
+and a set is the signal's write. There is one value, so no write echoes back, and either way a
+change is one write.
+
+```text
+val done = state(false)
+checkbox(done, "Done")              // a tap flips `done`
+done.set(true)                      // the next build shows it checked
+```
+
+### Derived values
+
+`derived(f)` is a `Derived[T]` whose `get()` computes `f` when first asked, and again only after
+something has been written since: a state's set, a signal's write, an `invalidate()`. Otherwise it
+answers the value it kept. Derived values may read other derived values.
+
+### Threads
+
+The interface runs on the thread that called `run`, and its state belongs to that thread. A
+`State`, a `Derived` and a `Scope` are mutable, so none is [sendable](/spec/threads/#what-is-shared),
+and a closure for another thread cannot capture one:
+
+```text
+error: what is passed for `body` of `spawn` may use only sendable values from around it, but it uses `count`, a `State[int]`, whose field `held` is a `var`; make it a `val`
+```
+
+There is no way yet to hand a change to the interface from another thread.
+
 ## What is not bound
 
+- Changing the interface's state from another thread.
 - Overlays (`popover`, `modal`, `menu_bar`), tables, images, selection, the theme and its
   `restyle`, keyboard input to a recording canvas, `on_event`, `on_frame` and the control socket;
   each is bound when something needs it.

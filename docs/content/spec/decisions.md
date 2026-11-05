@@ -2636,6 +2636,121 @@ their words are reserved.
     function where a `PartialFunction` is expected is not changed by the bound: it is a
     `PartialFunction`, which does not promise `Sendable`.
 
+- Settled on the user's delegation 2026-11-05 (built on branch `mixed-lambda-inference`): **the lambdas and `match` functions of a call are
+  checked in turn, each the first in the call whose parameter types are known**
+  ([generics](/spec/generics/#inference)): declared by it, or decided by the arguments checked so
+  far; where none is, the first one left is checked and reports what it cannot infer. Found as a
+  bug: they were checked strictly left to right after the other arguments, so
+  `both(match n -> n + 1, (x: int) -> x * 10)` for `both[A, B](g: (A) -> B, f: (A) -> B)` failed
+  with "cannot infer the type of the value this `match` matches", as did an untyped lambda written
+  before the typed one, while the same arguments swapped were accepted. *Why*: the smallest rule
+  under which argument order does not matter for what can be inferred, and every call accepted
+  before is checked in the same order as before (each lambda it checked was already the first
+  ready one). *Alternatives*: keep left to right (order-sensitive, as the bug shows); check the
+  lambdas with declared parameters first, then the rest left to right (misses chains, where a
+  `match` function's type comes from an untyped lambda's result); or solve all of them together
+  as constraints, checking each body against partly unknown parameters (a larger change, with
+  diagnostics harder to place). **Review with the user**: the order rule is visible in which calls infer, so a later
+  constraint solver would be a language change.
+- Settled on the user's delegation 2026-11-05 (built on branch `sendable-followups`): **three follow-ups to `@sendable` parameters**
+  ([threads](/spec/threads/#what-is-shared), [callbacks](/spec/sysl-bindings/#callbacks)). They
+  amend the `sendable-params` entry above where it says a combination, and a `match` function where
+  a `PartialFunction` is expected, are not sendable.
+  - A binding's `@threaded` parameter takes a value of a `@sendable` function type and a parameter
+    marked `@sendable` as they are, and a lambda passed there may capture a marked parameter. A
+    plain function value, an unmarked or `@isolated` parameter, and an unmarked parameter captured
+    stay refused. *Why*: each was checked where it was made or passed to be what any thread may
+    run, which is all the `@threaded` check asks. *Alternative*: none sound is narrower; requiring
+    a lambda around it (`x -> f(x)`) is the contortion this removes.
+  - **`f.orElse(g)` is sendable where `f` and `g` are**, by a promise the standard library writes on
+    the method, `@sendable_result`: a call of a function so marked is sendable where its receiver
+    and every argument are a `match` function written in place, a value of a sendable type, a
+    marked parameter or class field, or another such call; chains of `orElse` follow. The promise
+    is refused outside the standard library, since nothing checks it against the body, and a call
+    that names the method statically reaches no override. A combination held in a local is a
+    `PartialFunction` again, as a marked parameter copied into one is. Only `orElse` makes the
+    promise: `lift` answers a function whose captures a program's own `PartialFunction`
+    implementation decides, and `applyOrElse` answers a value, not a partial function.
+    *Alternatives weighed*: a general rule that any call whose parts are sendable is sendable
+    (unsound: the call may answer a fresh object with a `var`, or reach module-level state); a
+    conditional `Sendable` impl for `OrElsePartialFunction` (the result's static type is the trait,
+    which no impl of the class reaches); hard-coding `PartialFunction.orElse` in the checker (the
+    annotation says the same and names its users); a `@sendable` mark on trait types, under review
+    in the entry above, which would subsume this. **Review with the user**: whether a program's own
+    combinators should be able to make the promise, checked against the body (a body that only
+    builds an object of a final class from its parameters).
+  - **A `match` function where a `PartialFunction` is expected, passed for a type argument bounded
+    by `Sendable`, meets the bound**, as a lambda there does: its two lambdas are made as
+    `@sendable` functions and checked where they are made, the one running its arms holding every
+    pattern, guard and body, so a fault is reported once. `PartialFunction` itself does not promise
+    `Sendable`, so the bound is waived at that call only where every value the call gives the
+    callee of the type argument is such a function: each parameter whose type could give one (any
+    position but what a function passed takes, a data type's or a class's argument counted whatever
+    its variance) is of exactly that type and given such a function. A written type argument is
+    held to the bound as written, as `take[(int) -> int](…)` is. *Why*: the callee obtains values
+    of its type argument only from its arguments, each of which was checked. *Alternatives
+    weighed*: a sendable form of the `PartialFunction` type (the trait-type mark under review
+    above); making `MatchPartialFunction` promise `Sendable` (it holds two plain function fields,
+    which are not sendable, and a `match` function's static type is the trait anyway).
+
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-components`): **Interface state is a generic Avin class
+  `State[T]`, with `get`, `set` and `update(f)`, and a set is one write: an `invalidate()` for a
+  state held in Avin, or a write of its signal for one a control has linked**
+  ([components](/spec/ui/#components-and-state)). Why: the state lives in Avin, so it holds any
+  type; making the set the frame loop's write means nothing else has to be called after one, and a
+  set is counted exactly as a signal's is. Alternatives weighed: syslui's own signals for every
+  state (only four instances exist, so a list or a data value could not be state); a set that skips
+  the write when the value is unchanged (needs `Eq` on every `T`, and a function or a class has
+  none).
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-components`): **A control over a state reads and writes the
+  state's own signal, made once by `State.signal(s)`, which is from then on where the value lives**,
+  rather than a second copy kept in step. Why: one place for the value means a control's write is
+  the state's value at once, with no build in between, and no write can echo back into the other
+  side, so there is no loop to break. Alternatives weighed: a bridge copying both ways at each
+  build, comparing against the last value it saw (stale between a tap and the next build, and a
+  conflict to resolve when both change); a callback from syslui on each write (not in the binding).
+  The controls taking a `State` are overloads of the binding's own (`switch`, `checkbox`, `radio`,
+  `radioGroup`, both `slider`s, `textField`, `textArea`, `tabs`, `scroll`).
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-components`): **Components are functions returning `View`, written
+  `component c -> …` or `keyed(key) c -> …`; what a component keeps across builds is asked of its
+  `Scope` by order (`c.state(init)`, `c.remember(make)`, `c.derived(f)`), and a component is found
+  again by its place among its parent's unkeyed components, or by its key.** A build is a call of
+  the function `root(body)` answers; a component the build of its parent leaves out is dropped with
+  everything inside it. Why: a component stays a plain function of its arguments, so props are
+  ordinary parameters and need no class; reified type tests make the positional slots sound (a slot
+  asked for as another type stops the program rather than being misread); the scope is a parameter,
+  so a request outside a component cannot be written by mistake. Alternatives weighed: a class per
+  component with fields as state (props would have to be copied into an instance kept from an
+  earlier build, and every component would need a class and a table of instances by type); a
+  state machine per component (fits a component with modes, not one holding a value); a scope
+  passed from parent to child explicitly (every call of a component would carry it). Review with
+  the user: the shape of the API, and whether keys should be any `Hash` value rather than a
+  `string` or an `int`. **Review with the user**: the component API's shape, and whether keys should be any `Hash` rather than a string or an int.
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-components`): **The mistakes the order and the keys can make stop
+  the program**: a component built with no root building, two components under one parent with one
+  key, a slot asked for as another type than the last build's, a scope asked after its build, and a
+  root built inside its own build. Why: each would otherwise give one component another's state
+  silently. Alternatives weighed: starting the slot or the component afresh (hides the mistake), a
+  warning (Avin has no runtime warning channel).
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-components`): **`derived(f)` computes again only after something
+  has been written since its last computation, by the counter `writes()` answers**, rather than by
+  the states it read. Why: every state, signal and `invalidate()` moves the counter, so it is never
+  stale where the frame loop would rebuild, and it needs no record of what `f` read. Alternatives
+  weighed: tracking the states read during `f` (finer, but a hidden global and a cost on every
+  `get`), computing on every call (no use as a value of its own).
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-components`): **The interface's state belongs to the thread running
+  it, and the type system keeps it there**: a `State`, a `Derived` and a `Scope` are mutable, so not
+  sendable, and a closure for another thread cannot capture one. There is no `post` or `runOnUi` yet.
+  Why: the frame loop's write counter and syslui's signals are not synchronized, so the only sound
+  cross-thread path is a queue the frame loop drains, and nothing in the binding wakes the loop from
+  another thread. Alternatives weighed: a sendable `post(@sendable f)` queuing a change (its
+  function could not capture the state it is meant to change, so it would need a sendable handle
+  to a state, a design of its own). Review with the user: a worker reporting to the interface
+  needs that handle and a way to wake the frame loop. **Review with the user**: the path from another thread, which needs a sendable handle and a way to wake the frame loop.
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-components`): **An example program is one package, so the to-do
+  example is `examples/ui-todo` beside `examples/ui`**, since the corpus builds each directory of
+  `examples` as one program with one `main`.
+
 **C bindings**
 
 - Settled by the user 2026-11-05: **public C interoperability is no longer deferred.** The user's

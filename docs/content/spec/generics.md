@@ -345,6 +345,14 @@ infer is.
   the type the lower bounds so far fit, and a later argument must be an instance of that. A number
   literal takes the type the other arguments decide. Two value types have no join, so
   `pair(1, "one")` is an error naming both, unless `Any` is expected.
+- The lambdas and `match` functions of a call take their parameter types from what the other
+  arguments decide, so they are checked after them, and in turn among themselves: each time, the
+  first one in the call whose parameter types are known, declared by it or decided by the arguments
+  checked so far. So what a typed lambda decides reaches one written before it:
+  `both(match n -> n + 1, (x: int) -> x * 10)` for `both[A, B](g: (A) -> B, f: (A) -> B)`,
+  and `back(match s -> s.byteLength(), (x: int) -> s"<$x>")` for `back[A, B](g: (B) -> A, f: (A) -> B)`,
+  whose `match` takes `B` from the lambda's result. Where none is known, the first one left is
+  checked and reports what it cannot infer.
 - Two classes join to their nearest common superclass. Where they have none, they join to the trait
   they both conform to that every other trait they share is a parent of: a `Parrot` and a
   `Goldfish` that are both `Pet: Named` join to `Pet`. Where they share several unrelated traits,
