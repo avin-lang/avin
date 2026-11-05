@@ -3701,6 +3701,33 @@ spelling is better, as each entry says.
   match quality is wanted, and whether a machine's compiler-written `state()`/`handle()` should be
   listed (they are, at the machine's name).
 
+- Settled on the user's delegation 2026-11-05: **An arm no value can reach is an error** (branch
+  `unreachable-arms`). An arm of a `match`, a `match` function, an actor's `receive` or a machine
+  state, and a clause of a function, is an error when the arms before it without a guard already
+  match every value it would: after `_`, after a binding, after a pattern covering the whole type,
+  or covered by several earlier arms together. The message names the earlier arm that alone covers
+  it, by pattern and line, *"this arm is never reached: the arm `_` on line 3 already matches every
+  value it would"*, or says the arms before it do together. Where the covering arm binds a name
+  spelled as a type or a variant is (an upper-case first letter), it adds *"`Live` binds a new
+  value there, since no variant `Live` is in scope"*. A guard never hides the arms after it; a
+  clause hides the ones after it only when one of its bodies has no guard; a clause body after a body
+  with no guard is an error too. Reachability is decided on the coverage matrix, so it knows what
+  coverage knows (variants, `true`/`false`, literals, ranges, comparisons, `n + k`, strings by
+  equality, sequences by length, nesting); an extractor or a type test is taken to match every value
+  in the arm judged and none in the arms above it, so an arm is called unreachable only when it is,
+  whatever the extractors answer. A machine state's own arms are judged against each other; the
+  shared `receive` arms, which a state may override by handling an event itself, are judged against
+  each other once. A match whose patterns already failed to check is not judged. WHY: an arm
+  `Live -> …` meant as a variant that was not in scope bound a new name, matched every phase, and
+  hid the arms after it: the actor runtime hung and spun at 900% CPU with nothing reported. A dead
+  arm is always a mistake, either in the arm or in an arm above it, and it is found by a check the
+  compiler already makes. ALTERNATIVES: a warning (Avin has no warnings channel; every diagnostic is
+  an error, and a warning shown only sometimes is the one that is missed); an error only after an
+  irrefutable arm (catches the bug that prompted this, but not `Some(_)` before `Some(0)`, which is
+  as dead); leaving it as it was. Review with the user: whether two identical extractor arms
+  (`Even() -> …` twice) should count as unreachable, since an extractor is a function that could
+  answer differently each time.
+
 **Deferred**
 
 - Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.

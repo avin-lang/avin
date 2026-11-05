@@ -291,6 +291,11 @@ The clauses must cover every combination of arguments, as the arms of a `match` 
 clause counts toward that only when one of its bodies has no guard, or `| _`, so the clauses above
 end with one that matches anything. A local function may be defined by clauses too.
 
+A clause no argument can reach is an error, as an [unreachable arm](/spec/operators-and-control-flow/#match)
+is: one whose arguments the clauses before it already match, counting a clause only when one of its
+bodies has no guard. Within a clause, a body after one with no guard (or `| _`) is never tried, and
+is an error too.
+
 A function declared inside a block is a **local function**. It can be called from anywhere in its
 block, including before its declaration, and it sees the locals declared before it, the enclosing
 function's parameters, and the enclosing local functions. It reads and assigns those locals

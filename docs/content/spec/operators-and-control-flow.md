@@ -574,6 +574,29 @@ arms and every value, the message says so instead:
 `` this `match` does not cover every int value, since an extractor may answer that it does not
 match; add an arm for the rest, such as `_` ``.
 
+An arm no value can reach is an error: one after `_` or a binding, one after a pattern that covers
+the whole type, and one whose values earlier arms already match, alone or together. The message
+names the earlier arm that covers it, by its pattern and line. A guard never hides the arms after
+it, since it may fail; an extractor and a type test are taken to match every value in the arm
+judged and none in the arms above it, so an arm is called unreachable only when it is, whatever
+the extractors answer.
+
+```text
+data Phase
+    Open
+    Closing
+
+code(p: Phase) -> int = p match
+    Open -> 1
+    Live -> 2         // binds a new name, matching every Phase
+    Closing -> 3      // error: this arm is never reached: the arm `Live` on line 7 already matches
+                      // every value it would; `Live` binds a new value there, since no variant
+                      // `Live` is in scope
+```
+
+A bare name that is not a variant in scope binds, so a variant's name misspelled or not imported
+matches everything; the message says so when the covering arm's name starts with a capital letter.
+
 ### Extractor patterns
 
 A pattern `Name(p1, p2)` whose `Name` is not a variant is an **extractor**: a value, such as an

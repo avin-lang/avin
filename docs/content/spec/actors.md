@@ -46,7 +46,7 @@ actor Counter(start: int) receives CounterMsg
   nothing its body, its arms or its methods reach may be a module-level `var` or a module-level
   value that is not sendable.
 - **`receive` holds the arms** that handle a message: exactly a `match`'s arms over `M`, with
-  patterns, guards and block bodies, and checked for exhaustiveness in the same way. A message the
+  patterns, guards and block bodies, and checked for exhaustiveness and for unreachable arms in the same way. A message the
   actor wants to ignore is handled by an arm that does nothing, `_ -> ()`, so ignoring one is always
   written down. Each arm's value is discarded.
 - **Methods** in the body are the actor's own helpers, with the implicit receiver a class's methods
@@ -422,6 +422,9 @@ machine Door receives DoorEvent
 - **`receive` holds the arms every state shares**, tried after the current state's own. **Every
   state must handle every event**: the compiler checks, state by state, that its own arms and the
   shared ones together cover the event type, as a `match` is checked, guarded arms not counting.
+  A state's own arm that its arms above it already cover, and a shared arm the shared arms above
+  it already cover, is never reached and is an error; a shared arm that a state's own arms cover is
+  not, since a state overrides a shared arm by handling the event itself.
   Without its shared `receive`, `Door` would be refused:
 
   ```text

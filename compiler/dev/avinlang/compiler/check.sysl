@@ -8156,6 +8156,8 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
         params.push(symbol.params[i])
         matched.push(subjects[i])
     var typed: Buf[TClause] = buf()
+    // A pattern that failed to check is not judged for reachability, nor are the ones after it.
+    var pattern_errors = false
     var ty: &Type = Nothing
     var agreed = true
     for clause in decl.clauses
@@ -8167,7 +8169,9 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
         c.body.block_start = mark
         var patterns: Buf[&TPattern] = buf()
         for i in 0..<clause.patterns.len()
+            val reported = c.reported_count
             val pattern = check_pattern(c, clause.patterns[i], params[i], "")
+            if c.reported_count > reported then pattern_errors = true
             // A type pattern naming the parameter's own type tests nothing: it is the signature's.
             if pattern.kind is PType(target, _, _)
                 if same_type(target, params[i]) then c.note(unit, pattern.span, "a clause's arguments are patterns; their types are in the signature")
@@ -8204,6 +8208,22 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
         for i in 0..<params.len()
             blanks = blanks + (if i == 0 then "_" else ", _")
         c.note(unit, decl.name_span, s"the clauses of `${decl.name}` do not cover every argument; add a clause for the rest, such as `${decl.name}($blanks)`")
+    if settled_params && typed.len() == decl.clauses.len() && !pattern_errors
+        for u in unreached_clauses(typed, params, c.data)
+            val at = decl.clauses[u.index].span
+            u.by match
+                Some(j) ->
+                    val line = c.units[unit].src.locate(decl.clauses[j].span.start).line
+                    c.note(unit, at, s"this clause is never reached: the clause on line $line already matches every argument it would${binds_hint(c, typed[j].patterns)}")
+                None -> c.note(unit, at, "this clause is never reached: the clauses before it already match every argument it would")
+    // A body after one with no guard is never tried.
+    for clause in decl.clauses
+        var open = true
+        for b in clause.bodies
+            if !open
+                c.note(unit, b.body.span, "this body is never reached: a body before it in the clause has no guard, so it is always taken")
+                break
+            if b.guard is None then open = false
     val result = c.symbols[id].result.unwrap_or(ErrorType)
     c.bodies[id] = Some(TExpr(decl.span, result, Clauses(matched, typed)))
 
@@ -15326,12 +15346,16 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
     val wanted = expected_of_branches(c, expected, used, waiting)
     val settled_outside = useful_hint(c, wanted) is Some(_)
     val deferring = used && !settled_outside && waiting && others
+    // A pattern that failed to check is not judged for reachability, nor are the ones after it.
+    var pattern_errors = false
     var deferred: Buf[usize] = buf()
     for arm in arms
         val mark = c.body.visible.len()
         val outer_start = c.body.block_start
         c.body.block_start = mark
+        val reported = c.reported_count
         val pattern = check_pattern(c, arm.pattern, s.ty, "")
+        if c.reported_count > reported then pattern_errors = true
         var guard: Option[&TExpr] = None
         if arm.guard is Some(g)
             val t = check_expr(c, g, Some(Bool))
@@ -15393,7 +15417,84 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
                     if case == "_" then c.note(unit, e.span, s"$subject; add an arm for the rest, such as `_`")
                     else c.note(unit, e.span, s"$subject, such as `$case`; add an arm for it, or `_` for the rest")
                 None -> c.note(unit, e.span, s"$subject, since an extractor may answer that it does not match; add an arm for the rest, such as `_`")
+        if !pattern_errors then report_match_unreached(c, unit, e.span, typed, s.ty)
     TExpr(e.span, ty, Match(s, typed))
+
+// The arms of a match no value reaches, each an error.
+private report_match_unreached(c: *Checker, unit: usize, at: Span, typed: Buf[TArm], ty: &Type)
+    machine_site(c, unit, at) match
+        // A state's match holds its own arms and then the shared ones, which a state may override
+        // by handling an event itself; so its own arms are judged here, and the shared ones
+        // against each other, once, with the first state.
+        Some(site) ->
+            var own: Buf[TArm] = buf()
+            var shared: Buf[TArm] = buf()
+            for i in 0..<typed.len()
+                if i < site.own then own.push(typed[i]) else shared.push(typed[i])
+            report_unreached_arms(c, unit, own, ty)
+            if first_state(c, unit, site) then report_unreached_arms(c, unit, shared, ty)
+        None ->
+            // A `match` function made as a partial function ends in a `_` arm of its own,
+            // written at the whole match, which answers where the program's arms do not.
+            var written: Buf[TArm] = buf()
+            for arm in typed
+                val p = arm.pattern
+                if !(p.kind is PWildcard && p.span.start == at.start && p.span.end == at.end) then written.push(arm)
+            report_unreached_arms(c, unit, written, ty)
+
+// Whether a state is its machine's first, written first among the states.
+private first_state(c: *Checker, unit: usize, site: MachineSite) -> bool
+    for other in c.units[unit].file.machine_states
+        if other.machine == site.machine then return other.span.start == site.span.start
+    false
+
+// An arm no value can reach is an error: the arms before it without a guard already match every
+// value it would. The message names the earlier arm that alone does so, when one does.
+private report_unreached_arms(c: *Checker, unit: usize, typed: Buf[TArm], ty: &Type)
+    for u in unreached_arms(typed, ty, c.data)
+        val at = typed[u.index].pattern.span
+        u.by match
+            Some(j) ->
+                val earlier = typed[j].pattern
+                var patterns: Buf[&TPattern] = buf()
+                patterns.push(earlier)
+                c.note(unit, at, s"this arm is never reached: ${arm_named(c, unit, earlier)} already matches every value it would${binds_hint(c, patterns)}")
+            None -> c.note(unit, at, "this arm is never reached: the arms before it already match every value it would")
+
+// An earlier arm as an unreachable arm's message names it: its pattern, when that is short, and its
+// line. An `else` arm has no pattern of its own to show.
+private arm_named(c: *Checker, unit: usize, p: &TPattern) -> string
+    val src = c.units[unit].src
+    val line = src.locate(p.span.start).line
+    val text = from_utf8_unchecked(src.text(p.span))
+    if p.kind is PWildcard && text != "_" then return s"the `else` arm on line $line"
+    if text.len == 0 || text.len > 40 || text.contains("\n") then return s"the arm on line $line"
+    s"the arm `$text` on line $line"
+
+// Where an arm that hides later ones binds a name spelled as a type or a variant is, says so: the
+// name was most likely meant as a variant that is not in scope, and binds whatever value comes.
+private binds_hint(c: *Checker, patterns: Buf[&TPattern]) -> string
+    var out = ""
+    for p in patterns
+        out = out + capitalized_binders(c, p)
+    out
+
+private capitalized_binders(c: *Checker, p: &TPattern) -> string = p.kind match
+    PBind(local) ->
+        val name = c.body.locals[local].name
+        if name.len > 0 && name.bytes[0] >= u8('A') && name.bytes[0] <= u8('Z') then s"; `$name` binds a new value there, since no variant `$name` is in scope" else ""
+    PNamed(_, inner) -> capitalized_binders(c, inner)
+    PVariant(_, fields) ->
+        var out = ""
+        for f in fields
+            out = out + capitalized_binders(c, f)
+        out
+    PSequence(_, _, _, items, _) ->
+        var out = ""
+        for item in items
+            out = out + capitalized_binders(c, item)
+        out
+    _ -> ""
 
 // The state of a machine whose arms a match at `at` holds, if it is one.
 private machine_site(c: *Checker, unit: usize, at: Span) -> Option[MachineSite]

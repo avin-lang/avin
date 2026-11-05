@@ -394,23 +394,7 @@ private witness_sequence(rows: Buf[Row], rest: Buf[&Type], data: Buf[DataSymbol]
         val longer = n == longest + 1
         var specialized: Buf[Row] = buf()
         for row in rows
-            val head = row.items[0]
-            var items: Buf[&TPattern] = buf()
-            var matched = false
-            if unconstrained(head, views)
-                matched = true
-            elif head.kind is PSequence(_, _, _, parts, open)
-                val fixed = if open then parts.len() - 1 else parts.len()
-                matched = if open then fixed <= n && unconstrained(parts[fixed], views) else fixed == n && !longer
-                if matched
-                    for i in 0..<fixed
-                        items.push(parts[i])
-            if !matched then continue
-            while items.len() < n
-                items.push(TPattern(Span(0, 0), element, PWildcard))
-            for i in 1..<row.items.len()
-                items.push(row.items[i])
-            specialized.push(Row(items))
+            if sequence_case(row, n, longer, element, views) is Some(r) then specialized.push(r)
         var columns: Buf[&Type] = buf()
         for i in 0..<n
             columns.push(element)
@@ -428,6 +412,28 @@ private witness_sequence(rows: Buf[Row], rest: Buf[&Type], data: Buf[DataSymbol]
                 out.push(parts[i])
             return Some(out)
     None
+
+// A row whose first column is a sequence, specialized to the case of `n` elements, or of more than
+// any pattern names when `longer`, as `witness_sequence` describes; `None` when its first pattern
+// matches no sequence of that case.
+private sequence_case(row: Row, n: usize, longer: bool, element: &Type, views: bool) -> Option[Row]
+    val head = row.items[0]
+    var items: Buf[&TPattern] = buf()
+    var matched = false
+    if unconstrained(head, views)
+        matched = true
+    elif head.kind is PSequence(_, _, _, parts, open)
+        val fixed = if open then parts.len() - 1 else parts.len()
+        matched = if open then fixed <= n && unconstrained(parts[fixed], views) else fixed == n && !longer
+        if matched
+            for i in 0..<fixed
+                items.push(parts[i])
+    if !matched then return None
+    while items.len() < n
+        items.push(TPattern(Span(0, 0), element, PWildcard))
+    for i in 1..<row.items.len()
+        items.push(row.items[i])
+    Some(Row(items))
 
 private in_front(head: string, found: Option[Buf[string]]) -> Option[Buf[string]] = found match
     Some(parts) ->
@@ -523,3 +529,228 @@ private expand_heads(rows: Buf[Row]) -> Buf[Row]
                     expanded.push(with_head(row, o))
             _ -> expanded.push(row)
     if changed then expand_heads(expanded) else expanded
+
+// Reachability. An arm is reached only if it matches some value that no arm before it without a
+// guard already matches; one that matches none is never reached. It is decided on the same matrix,
+// row by row: a row is useful against the rows above it when some combination of values matches it
+// and none of them. Where a pattern's values cannot be decided, as for an extractor or a type test,
+// it is taken to match every value in the row being judged and none in the rows above it, so an arm
+// is found unreachable only when it is, whatever the extractors answer.
+
+/** An arm or clause that is never reached, by its place, and the one before it that alone matches
+ * every value it would, when there is one; otherwise the ones before it do so together. */
+struct Unreached
+    index: usize
+    by: Option[usize]
+
+/** The arms of a match on a value of type `ty` that are never reached, in order. */
+unreached_arms(arms: Buf[TArm], ty: &Type, data: Buf[DataSymbol]) -> Buf[Unreached]
+    var rows: Buf[Row] = buf()
+    var always: Buf[bool] = buf()
+    for arm in arms
+        var items: Buf[&TPattern] = buf()
+        items.push(arm.pattern)
+        rows.push(Row(items))
+        always.push(arm.guard is None)
+    var types: Buf[&Type] = buf()
+    types.push(ty)
+    unreached_rows(rows, always, types, data)
+
+/** The clauses of a function over arguments of the parameter types that are never reached, in
+ * order; a clause makes the ones after it unreachable only when one of its bodies has no guard. */
+unreached_clauses(clauses: Buf[TClause], params: Buf[&Type], data: Buf[DataSymbol]) -> Buf[Unreached]
+    var rows: Buf[Row] = buf()
+    var always: Buf[bool] = buf()
+    for clause in clauses
+        rows.push(Row(clause.patterns))
+        var unguarded = false
+        for b in clause.bodies
+            if b.guard is None then unguarded = true
+        always.push(unguarded)
+    unreached_rows(rows, always, params, data)
+
+private unreached_rows(rows: Buf[Row], always: Buf[bool], types: Buf[&Type], data: Buf[DataSymbol]) -> Buf[Unreached]
+    var out: Buf[Unreached] = buf()
+    // A pattern that failed to check matches anything here, so it would hide the arms after it.
+    for row in rows
+        for p in row.items
+            if erroneous(p) then return out
+    var before: Buf[Row] = buf()
+    for i in 0..<rows.len()
+        if !useful(before, rows[i], types, data)
+            var by: Option[usize] = None
+            for j in 0..<i
+                if !always[j] then continue
+                var one: Buf[Row] = buf()
+                one.push(rows[j])
+                if !useful(one, rows[i], types, data)
+                    by = Some(j)
+                    break
+            out.push(Unreached(i, by))
+        elif always[i]
+            before.push(rows[i])
+    out
+
+private erroneous(p: &TPattern) -> bool
+    if *p.ty is ErrorType then return true
+    p.kind match
+        PAlternatives(options) ->
+            for o in options
+                if erroneous(o) then return true
+        PNamed(_, inner) -> return erroneous(inner)
+        PVariant(_, fields) ->
+            for f in fields
+                if erroneous(f) then return true
+        PSequence(_, _, _, items, _) ->
+            for item in items
+                if erroneous(item) then return true
+        PView(_, _, inner) -> return erroneous(inner)
+        _ -> ()
+    false
+
+// Whether some combination of values matches `q` and none of `rows`.
+private useful(rows: Buf[Row], q: Row, types: Buf[&Type], data: Buf[DataSymbol]) -> bool
+    if rows.len() == 0 then return true
+    if types.len() == 0 then return false
+    val head = q.items[0]
+    head.kind match
+        PNamed(_, inner) -> return useful(rows, with_head(q, inner), types, data)
+        PAlternatives(options) ->
+            for o in options
+                if useful(rows, with_head(q, o), types, data) then return true
+            return false
+        _ -> ()
+    val expanded = expand_heads(rows)
+    var rest: Buf[&Type] = buf()
+    for i in 1..<types.len()
+        rest.push(types[i])
+    val t = types[0]
+    if head.kind is PSequence(_, _, _, _, _) then return useful_sequence(expanded, q, rest, data)
+    // A string literal is matched by the same literal and by any pattern that matches everything.
+    if head.kind is PLiteral(value)
+        if value.kind is StrConst(text)
+            var same: Buf[Row] = buf()
+            for row in expanded
+                val other = row.items[0]
+                if unconstrained(other, false)
+                    same.push(tail_of(row))
+                elif other.kind is PLiteral(v)
+                    if v.kind is StrConst(o)
+                        if o == text then same.push(tail_of(row))
+            return useful(same, tail_of(q), rest, data)
+    val domain = domain_of(t)
+    if domain.len() > 0
+        val least = domain[0].low
+        val greatest = domain[domain.len() - 1].high
+        var ordered = interval_of(head, least, greatest) is Some(_)
+        for row in expanded
+            if interval_of(row.items[0], least, greatest) is Some(_) then ordered = true
+        if ordered then return useful_ordered(expanded, q, domain, rest, data)
+    val cases = cases_of(t, data)
+    val anything = unconstrained(head, false) || head.kind is PType(_, _, _) || head.kind is PView(_, _, _)
+    if !anything
+        for case in cases
+            if matches_case(head, case) then return useful(specialize_rows(expanded, case), specialize(q, case), case_columns(case, rest), data)
+        // A pattern this does not decide, such as a literal of a real number.
+        return true
+    var sequence = false
+    var constrained = false
+    for row in expanded
+        if row.items[0].kind is PSequence(_, _, _, _, _) then sequence = true
+        if !unconstrained(row.items[0], false) then constrained = true
+    if sequence then return useful_sequence(expanded, q, rest, data)
+    if cases.len() > 0 && constrained
+        for case in cases
+            if useful(specialize_rows(expanded, case), specialize(q, case), case_columns(case, rest), data) then return true
+        return false
+    var defaults: Buf[Row] = buf()
+    for row in expanded
+        if unconstrained(row.items[0], false) then defaults.push(tail_of(row))
+    useful(defaults, tail_of(q), rest, data)
+
+// The rows that match a case, each specialized to it.
+private specialize_rows(rows: Buf[Row], case: Case) -> Buf[Row]
+    var out: Buf[Row] = buf()
+    for row in rows
+        val head = row.items[0]
+        if unconstrained(head, false) || matches_case(head, case) then out.push(specialize(row, case))
+    out
+
+// The columns a case's fields become, in front of the remaining ones.
+private case_columns(case: Case, rest: Buf[&Type]) -> Buf[&Type]
+    var columns: Buf[&Type] = buf()
+    if case is VariantCase(_, fields)
+        for t in fields
+            columns.push(t)
+    for t in rest
+        columns.push(t)
+    columns
+
+// An ordered column: the values `q` matches are cut, with every row's, into pieces each row matches
+// entirely or not at all, and `q` is useful when it is on the remaining columns for some piece.
+private useful_ordered(rows: Buf[Row], q: Row, domain: Buf[Interval], rest: Buf[&Type], data: Buf[DataSymbol]) -> bool
+    val least = domain[0].low
+    val greatest = domain[domain.len() - 1].high
+    val wanted = interval_of(q.items[0], least, greatest) match
+        Some(i) -> i
+        None -> Interval(least, greatest)
+    if compare_signed(wanted.low, wanted.high) > 0 then return false
+    var cuts: Buf[string] = buf()
+    for d in domain
+        add_cut(cuts, d.low)
+        add_cut(cuts, successor(d.high))
+    add_cut(cuts, wanted.low)
+    add_cut(cuts, successor(wanted.high))
+    for row in rows
+        if interval_of(row.items[0], least, greatest) is Some(i)
+            if compare_signed(i.low, i.high) <= 0
+                add_cut(cuts, i.low)
+                add_cut(cuts, successor(i.high))
+    for k in 0..<cuts.len() - 1
+        val start = cuts[k]
+        if compare_signed(start, wanted.low) < 0 || compare_signed(wanted.high, start) < 0 then continue
+        var inside = false
+        for d in domain
+            if compare_signed(d.low, start) <= 0 && compare_signed(start, d.high) <= 0 then inside = true
+        if !inside then continue
+        var specialized: Buf[Row] = buf()
+        for row in rows
+            val other = row.items[0]
+            var matched = unconstrained(other, false)
+            if interval_of(other, least, greatest) is Some(i)
+                matched = compare_signed(i.low, start) <= 0 && compare_signed(start, i.high) <= 0
+            if matched then specialized.push(tail_of(row))
+        if useful(specialized, tail_of(q), rest, data) then return true
+    false
+
+// A sequence column, split on its length as `witness_sequence` splits it.
+private useful_sequence(rows: Buf[Row], q: Row, rest: Buf[&Type], data: Buf[DataSymbol]) -> bool
+    var longest = 0usize
+    var element: &Type = ErrorType
+    var all: Buf[Row] = buf()
+    all.push(q)
+    for row in rows
+        all.push(row)
+    for row in all
+        if row.items[0].kind is PSequence(_, _, elements, items, open)
+            val fixed = if open then items.len() - 1 else items.len()
+            if fixed > longest then longest = fixed
+            if fixed > 0 then element = elements[0].ty
+    // A rest that constrains what it takes is not decided here.
+    if q.items[0].kind is PSequence(_, _, _, items, open)
+        if open && !unconstrained(items[items.len() - 1], false) then return true
+    for n in 0..<longest + 2
+        val longer = n == longest + 1
+        val wanted = sequence_case(q, n, longer, element, false) match
+            Some(r) -> r
+            None -> continue
+        var specialized: Buf[Row] = buf()
+        for row in rows
+            if sequence_case(row, n, longer, element, false) is Some(r) then specialized.push(r)
+        var columns: Buf[&Type] = buf()
+        for i in 0..<n
+            columns.push(element)
+        for t in rest
+            columns.push(t)
+        if useful(specialized, wanted, columns, data) then return true
+    false
