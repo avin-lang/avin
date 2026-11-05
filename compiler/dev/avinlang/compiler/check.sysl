@@ -3348,8 +3348,26 @@ private with_trait_methods(c: *Checker, t: &Type, name: string, own: Buf[usize])
         if matches then matching.push(m) else unmatched.push(m)
     val offered = if matching.len() > 0 || own.len() > 0 then matching else unmatched
     for m in offered
-        out.push(m)
+        if !hidden_by_nearer_trait(c, t, m, offered) then out.push(m)
     out
+
+// Whether method `m`, which an impl adds to a trait, is hidden among `offered` by one of the same
+// parameter types that an impl adds to a trait requiring that trait: the nearer trait's is the
+// receiver's, as a type's own method is, so `Seq`'s `map` is a sequence's, not `Iterable`'s.
+private hidden_by_nearer_trait(c: *Checker, t: &Type, m: usize, offered: Buf[usize]) -> bool
+    val a = trait_method_of(c, m) match
+        Some(x) -> x
+        None -> return false
+    if !a.on_trait then return false
+    for o in offered
+        if o == m then continue
+        val b = trait_method_of(c, o) match
+            Some(x) -> x
+            None -> continue
+        if !b.on_trait || b.trait_id == a.trait_id then continue
+        if ancestor_type(c.classes, c.data, b.target, a.trait_id) is None then continue
+        if same_params_seen(c, t, o, m) then return true
+    false
 
 /** Whether the code being checked sees the methods impl method `tm` is added with: those of an impl
  * in the module of the type or trait it adds to are seen wherever the type is; an extension's, by
@@ -8650,19 +8668,19 @@ private literal_parts(c: *Checker, exprs: Buf[&Expr], want: &Type, what: string)
         out.push(if same then t else TExpr(t.span, agreed_type, t.kind))
     out
 
-// Whether `e` is a collection literal whose element types only a type expected of it can settle:
-// one with nothing in it, `[]` or `{}`, or one holding only such literals, as `[{}]` and
-// `{[]: {}}` do.
+// Whether `e` is a collection literal whose element types a type expected of it has to settle: one
+// with nothing in it, `[]` or `{}`, or one holding such a literal anywhere among its parts, as
+// `[{}]` and `{1: {}}` do.
 private empty_literal(e: &Expr) -> bool = e.kind match
-    ListLit(items) -> all_empty_literals(items)
-    SetLit(items) -> all_empty_literals(items)
-    MapLit(keys, values) -> all_empty_literals(keys) && all_empty_literals(values)
+    ListLit(items) -> items.len() == 0 || any_empty_literal(items)
+    SetLit(items) -> items.len() == 0 || any_empty_literal(items)
+    MapLit(keys, values) -> keys.len() == 0 || any_empty_literal(keys) || any_empty_literal(values)
     _ -> false
 
-private all_empty_literals(exprs: Buf[&Expr]) -> bool
+private any_empty_literal(exprs: Buf[&Expr]) -> bool
     for x in exprs
-        if !empty_literal(x) then return false
-    true
+        if empty_literal(x) then return true
+    false
 
 // The type expected of an `if` or a `match` with a branch that is an empty collection literal: none
 // where the type expected is `Any`, which says nothing of the literal's element types, so the
@@ -8686,7 +8704,19 @@ private empties_last(exprs: Buf[&Expr]) -> Buf[usize]
 // empty collection literal and `agreed` says something of a type; otherwise nothing is expected.
 private empty_hint(c: *Checker, e: &Expr, agreed: Option[&Type]) -> Option[&Type]
     if !empty_literal(e) then return None
-    useful_hint(c, agreed)
+    shaped_hint(c, e, useful_hint(c, agreed))
+
+// `hint`, where it is a collection of the kind literal `e` is written as, or one any literal builds;
+// a set literal's kind admits a map, since `{}` is both.
+private shaped_hint(c: *Checker, e: &Expr, hint: Option[&Type]) -> Option[&Type]
+    val t = hint?
+    val written = e.kind match
+        ListLit(_) -> "sequence"
+        SetLit(_) -> "set"
+        MapLit(_, _) -> "map"
+        _ -> return hint
+    val shape = collection_shape(c, t)
+    if shape == "" || shape == written || (written == "set" && shape == "map") then hint else None
 
 // `t`, where it is a type a value can be checked against: not open, not `Any`, and not the type of
 // a branch that never finishes.
@@ -9959,10 +9989,10 @@ private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[
     var n: &TExpr = TExpr(e.span, ErrorType, UnitConst)
     if used && !settled_outside && empty_literal(yes) && !empty_literal(other)
         n = tested_branch(c, other, tested.no, wanted, used)
-        y = tested_branch(c, yes, tested.yes, hint_or(useful_hint(c, Some(n.ty)), wanted), used)
+        y = tested_branch(c, yes, tested.yes, hint_or(shaped_hint(c, yes, useful_hint(c, Some(n.ty))), wanted), used)
     else
         y = tested_branch(c, yes, tested.yes, wanted, used)
-        val hint = if used && !settled_outside && empty_literal(other) then useful_hint(c, Some(y.ty)) else None
+        val hint = if used && !settled_outside && empty_literal(other) then shaped_hint(c, other, useful_hint(c, Some(y.ty))) else None
         n = tested_branch(c, other, tested.no, hint_or(hint, wanted), used)
     if used
         // A branch that is an `Option[Nothing]` converts to the other's option.
@@ -13096,7 +13126,7 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
         typed.push(TArm(pattern, guard, body))
     for k in deferred
         val arm = arms[k]
-        val body = check_value(c, arm.body, hint_or(useful_hint(c, Some(ty)), wanted), used)
+        val body = check_value(c, arm.body, hint_or(shaped_hint(c, arm.body, useful_hint(c, Some(ty))), wanted), used)
         never = false
         typed[k] = TArm(typed[k].pattern, typed[k].guard, body)
         if agreed
@@ -13284,7 +13314,7 @@ private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string)
             if !is_list_type(c, t)
                 if seq_element(c, t) is Some(element) then return sequence_pattern(c, p, items, t, element, no_bind)
             if items.len() == 0 then return list_pattern(c, p, "Nil", buf(), ty, no_bind, "sequence patterns match a `Seq`")
-            // `[rest*]` on a list is the whole list.
+            // `[rest*]` on a list is the whole list, which is what its `drop(0)` answers.
             if items.len() == 1 && is_list_type(c, t)
                 if items[0].kind is Rest(binder) then return check_pattern(c, binder, t, no_bind)
             // `[a, b, c]` on a list is `a :: [b, c]`.
@@ -13436,14 +13466,12 @@ private seq_element(c: *Checker, t: &Type) -> Option[&Type]
 // elements. The matched sequence is held in a local of its own, through which the pattern asks its
 // `length()` once and then reads each element it tests with `apply`, in order, stopping at the first
 // that fails; an element matched by `_` is not read. Ending in `rest*`, it matches a sequence of at
-// least the elements before it, and binds the rest to `rest` as `drop` gives it.
+// least the elements before it, and binds the rest to `rest` as `drop` gives it, `[rest*]` included:
+// it binds what `drop(0)` answers for the sequence's type.
 private sequence_pattern(c: *Checker, p: &Pattern, items: Buf[&Pattern], ty: &Type, element: &Type, no_bind: string) -> &TPattern
     val at = p.span
     val rest = items.len() > 0 && items[items.len() - 1].kind is Rest(_)
     val fixed = if rest then items.len() - 1 else items.len()
-    // `[rest*]` is the whole sequence.
-    if rest && fixed == 0
-        if items[0].kind is Rest(binder) then return check_pattern(c, binder, ty, no_bind)
     val name = s"sequence pattern ${at.start}"
     val local = declare_local(c, at, name, ty, false)
     val length = check_expr(c, compare_at(at, if rest then GreaterEqual else Equal, call_at(at, name_at(at, name), "length"), Expr(at, IntLit(fixed.to_string()))), None)
