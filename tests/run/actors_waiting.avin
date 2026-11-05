@@ -1,0 +1,46 @@
+// An actor that waits in `await` holds its worker, and the executor starts another in its place, so
+// the actor it waits for runs even on an executor of one worker: a client actor asks a server actor
+// on the same `Executor.fixed(1)` and awaits the reply inside its handler, many times over, and waits
+// inside `blocking` for a value another actor there sends. While it waits it handles no other
+// message: what it is told meanwhile is handled afterwards, in order.
+import avin.actors.{ActorRef, Behaviour, spawn}
+import avin.threads.{Channel, Executor, Promise, blocking}
+
+data Request(n: int, reply: Promise[int])
+
+server() -> Behaviour[Request] = Behaviour("Server", me -> r -> r.reply.complete(r.n * r.n))
+
+data ClientMsg
+    Run(times: int, done: Promise[int])
+    Note(text: string)
+    Pass(from: Channel[string], log: Channel[string])
+
+client(s: ActorRef[Request], log: Channel[string]) -> Behaviour[ClientMsg] = Behaviour("Client", me -> m -> m match
+    Run(times, done) ->
+        var sum = 0
+        for i in 1..times
+            val p = Promise[int]()
+            s.tell(Request(i, p))
+            sum += p.future.await()
+        done.complete(sum)
+    Note(text) -> log.send(text)
+    Pass(from, out) -> out.send(blocking(from.receive().get())))
+
+main()
+    val ex = Executor.fixed(1)
+    val log = Channel[string]()
+    val c = spawn(client(spawn(server(), ex), log), ex)
+    val done = Promise[int]()
+    c.tell(Run(100, done))
+    c.tell(Note("told while it waited"))
+    println(done.future.await())
+    println(log.receive())
+    val from = Channel[string]()
+    val out = Channel[string]()
+    c.tell(Pass(from, out))
+    c.tell(Note("after the pass"))
+    // The value the client waits for comes from another actor on its one worker.
+    spawn(Behaviour[string]("Sender", me -> t -> from.send(t)), ex).tell("passed")
+    println(out.receive())
+    println(log.receive())
+    ex.shutdown()

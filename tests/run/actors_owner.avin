@@ -1,0 +1,69 @@
+// The Sysl handles an actor owns are its own on whichever worker runs it: before each turn the
+// worker makes the actor the owner of the code it runs. A connection the behaviour holds is the
+// actor's from `spawn` on, the bytes read ahead with it, and a connection the actor opens in one
+// turn is used in the next. Each turn is a task of its own, on one of four workers kept busy by other
+// actors, so without the actor's owner each turn would find the handles another's.
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream}
+import avin.actors.{Behaviour, spawn}
+import avin.threads.{Executor, Future, Promise}
+import avin.threads as threads
+import avin.time
+
+ok[T](r: Result[T, IoError]) -> T = r match
+    Ok(v) -> v
+    Err(e) -> fail(e.message())
+
+data Msg
+    ReadLine(reply: Promise[Option[string]])
+    Open(port: int, reply: Promise[unit])
+    Write(text: string, reply: Promise[unit])
+    Close(reply: Promise[unit])
+
+// An actor serving the connection `given`, and one it opens itself.
+conn(given: TcpStream) -> Behaviour[Msg] = Behaviour("Conn", me ->
+    var opened: Option[TcpStream] = None
+    m -> m match
+        ReadLine(reply) -> reply.complete(ok(given.readLine()))
+        Open(port, reply) ->
+            opened = Some(ok(TcpStream.connect("127.0.0.1", port)))
+            reply.complete(())
+        Write(text, reply) ->
+            ok(opened.get().writeText(text))
+            reply.complete(())
+        Close(reply) ->
+            opened.get().close()
+            given.close()
+            reply.complete(()))
+
+// An actor that holds its worker a moment for each message, so the others move between workers.
+busy() -> Behaviour[long] = Behaviour("Busy", me -> n -> threads.sleep(time.milliseconds(n)))
+
+request[T: Sendable](f: (Promise[T]) -> Msg, r: avin.actors.ActorRef[Msg]) -> T
+    val p = Promise[T]()
+    r.tell(f(p))
+    p.future.await()
+
+main()
+    val ex = Executor.fixed(4)
+    val l = ok(TcpListener.bind("127.0.0.1", 0))
+    val c = ok(TcpStream.connect("127.0.0.1", l.port()))
+    val s = ok(l.accept())
+    ok(c.writeText("ahead\none\ntwo\n"))
+    println(ok(s.readLine()))
+    val a = spawn(conn(s), ex)
+    val others = (0..<6).map(_ -> spawn(busy(), ex)).toVector()
+    println(request[Option[string]](p -> ReadLine(p), a))
+    println(request[Option[string]](p -> ReadLine(p), a))
+    request[unit](p -> Open(l.port(), p), a)
+    val back = ok(l.accept())
+    for round in 0..<20
+        for o in others do o.tell(1)
+        ok(c.writeText(s"line $round\n"))
+        val line = request[Option[string]](p -> ReadLine(p), a)
+        request[unit](p -> Write(s"echo ${line.get()}\n", p), a)
+        println(ok(back.readLine()).get())
+    request[unit](p -> Close(p), a)
+    println(ok(c.readLine()))
+    println(ok(back.readLine()))
+    ex.shutdown()

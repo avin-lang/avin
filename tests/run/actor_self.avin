@@ -1,0 +1,70 @@
+// expect: exit 0
+// `self` in an actor is its reference, an `ActorRef` of its message type: told from the body and
+// from an arm, a countdown; handed out in messages, a ping-pong between two declarations whose
+// references travel in the messages; read in a helper method, in a lambda inside an arm and in a
+// field's initializer; compared with the reference `spawn` gave back; and shown as the
+// declaration's name and the actor's number.
+import avin.actors.{ActorRef, spawn}
+import avin.threads.{Channel, Promise}
+
+data Count
+    Down(n: int)
+    Start
+    Same(other: ActorRef[Count], reply: Promise[bool])
+
+actor Countdown(log: Channel[string]) receives Count
+    val me: ActorRef[Count] = self
+    log.send("start")
+    self.tell(Start)
+
+    receive
+        Start ->
+            log.send("first message")
+            again(3)
+        Down(n) ->
+            log.send(s"down $n")
+            if n > 0 then again(n - 1)
+        Same(other, reply) -> reply.complete(other == self && me == self)
+
+    again(n: int) = self.tell(Down(n))
+
+data Ping(back: ActorRef[Pong], n: int, done: Promise[string])
+data Pong(back: ActorRef[Ping], n: int, done: Promise[string])
+
+actor Pinger receives Ping
+    receive
+        Ping(back, n, done) ->
+            if n == 0 then done.complete(s"$self ends")
+            else back.tell(Pong(self, n - 1, done))
+
+actor Ponger receives Pong
+    receive
+        Pong(back, n, done) -> back.tell(Ping(self, n, done))
+
+data Spread(times: int, done: Promise[int])
+
+// `self` captured by a lambda inside an arm: each element tells the actor itself.
+actor Spreader receives Spread
+    var seen = 0
+    receive
+        Spread(0, done) -> done.complete(seen)
+        Spread(times, done) ->
+            seen += times
+            List(times - 1).foreach(t -> self.tell(Spread(t, done)))
+
+main()
+    val log = Channel[string](16)
+    val c = spawn(Countdown(log))
+    for _ in 0..<6 do println(log.receive().get())
+    val same = Promise[bool]()
+    c.tell(Same(c, same))
+    println(same.future.await())
+    val pinger = spawn(Pinger())
+    val ponger = spawn(Ponger())
+    val done = Promise[string]()
+    pinger.tell(Ping(ponger, 5, done))
+    println(done.future.await())
+    println(s"$pinger $ponger")
+    val total = Promise[int]()
+    spawn(Spreader()).tell(Spread(4, total))
+    println(total.future.await())

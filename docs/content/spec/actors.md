@@ -41,7 +41,10 @@ actor Counter(start: int) receives CounterMsg
   for a class's, with defaults and named arguments.
 - **The body is the actor's start.** Its fields and statements run once, on the actor's own
   execution, before it handles any message: that is where its state is made. The parameters are its
-  immutable fields, as a class's plain parameters are.
+  immutable fields, as a class's plain parameters are, and each one's type must be `Sendable`, which
+  is checked where the actor is declared. Since an actor runs on any of an executor's workers,
+  nothing its body, its arms or its methods reach may be a module-level `var` or a module-level
+  value that is not sendable.
 - **`receive` holds the arms** that handle a message: exactly a `match`'s arms over `M`, with
   patterns, guards and block bodies, and checked for exhaustiveness in the same way. A message the
   actor wants to ignore is handled by an arm that does nothing, `_ -> ()`, so ignoring one is always
@@ -57,6 +60,30 @@ actor Counter(start: int) receives CounterMsg
 holding the declaration and its arguments, which `spawn` starts. Keeping the two apart lets the
 program say how a new actor is to be supervised and where it runs before it starts, and lets the
 runtime start the actor again from the same arguments after a failure ([Supervision](#supervision)).
+
+A behaviour is also made without a declaration, from a name and a start:
+**`Behaviour[M](name: string, start: @sendable (ActorRef[M]) -> (M) -> unit)`**. The start runs
+once, on the actor's first turn, is given the actor's own reference, makes the actor's state in its
+locals and gives back the handler of each message. It is a [`@sendable`
+function](/spec/types/#function-types), so it captures only sendable values and no `var`, and
+reaches no module-level mutable state. An `actor` declaration is this, written as a class is:
+
+```avin
+import avin.actors.{Behaviour, spawn}
+import avin.threads.Promise
+
+main()
+    val total = Promise[int]()
+    val counter = spawn(Behaviour[int]("Counter", me ->
+        var count = 0
+        n ->
+            count += n
+            if n == 0 then total.complete(count)))
+    counter.tell(5)
+    counter tell 2
+    counter.tell(0)
+    println(total.future.await())
+```
 
 ## Starting, telling and asking
 
@@ -95,7 +122,8 @@ main() -> int
   protocol without widening its own message type.
 - **`ActorRef[-M]`** is contravariant: a reference that accepts every `Shape` is also one that
   accepts `Circle`s. It compares by the actor it refers to (`==` and `hash`), is `Sendable` and is shown
-  as the declaration's name and a number, `Counter#3`. It holds no state, so holding one keeps
+  as the declaration's name and a number, `Counter#3`, the actors of a program being numbered from
+  one in the order they are spawned. It holds no state, so holding one keeps
   nothing but the reference alive.
 
 Any thread may `tell` and `ask`. Inside an actor, waiting for an ask's future with `await` holds the
@@ -269,9 +297,13 @@ shared pool `Future(body)` uses, with one worker per processor:
 - **Fairness.** A worker handles at most 16 messages of one actor before putting the actor at the
   back of the queue, so a busy actor cannot hold a worker from the others. Within one message there
   is no preemption: an arm that computes for a second holds its worker for that second.
+  The body runs in the actor's first turn and is not one of the 16; a turn ends early when the
+  mailbox is empty. An actor's executor being shut down does not end it: its turns still run there,
+  on a worker started for them where none is left, so `tell` never fails.
 - **An actor may move between threads between messages.** Before handling an actor's messages, the
   worker sets its context's owner word to the actor, so the handles an actor owns are its own on any
-  worker and never trap.
+  worker and never trap. `spawn` gives the actor the handles its behaviour reaches that the
+  spawning code owns, as a thread's `spawn` does with its body.
 - **Waiting.** An actor that waits, in `await`, a [blocking binding](/spec/sysl-bindings/#calls-that-wait)
   or `threads.blocking(body)`, holds its worker, and the pool starts another in its place while it
   waits, as it does for any waiting future, so the other actors keep running. An actor that waits

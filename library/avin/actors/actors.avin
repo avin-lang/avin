@@ -1,0 +1,165 @@
+module avin.actors
+
+// Actors: many small owners of state, each reached only by the messages sent to it, run a message at
+// a time on the workers of an executor. `spawn(behaviour)` starts one and gives back at once its
+// `ActorRef`; `tell` puts a message in its mailbox and returns, never waiting. An actor with
+// messages is one task on its executor: a worker handles at most `throughput` of them before putting
+// the actor at the back of the queue, so a busy actor never holds a worker from the others, and the
+// actor never runs on two threads at once. Before each turn the worker makes the actor the owner of
+// the code it runs, so the Sysl handles the actor owns are its own on whichever worker it is.
+
+import avin.threads.{Atomic, Executor}
+
+// A new owner of Sysl handles, which nothing has been given yet.
+@intrinsic("owner_new")
+private newOwner() -> long
+
+// The owner of the code running, who alone may use the Sysl handles it owns.
+@intrinsic("owner_current")
+private currentOwner() -> long
+
+// Makes `owner` the owner of the code running from now on.
+@intrinsic("owner_set")
+private runAs(owner: long)
+
+// Gives every Sysl handle `value` reaches that `from` owns to `to`.
+@intrinsic("hand_over")
+private handOver(value: Any, from: long, to: long)
+
+// The most messages of one actor a worker handles before the actor goes to the back of its
+// executor's queue.
+private val throughput = 16
+
+// The last number given to an actor; each actor's is one more, never reused.
+private val numbers = Atomic[long](0)
+
+// One message in a mailbox, and the link to the one sent after it, which its sender sets once the
+// message is the newest.
+private class Node[M](private var message: Option[M])
+    val next = Atomic[Option[Node[M]]](None)
+
+    // The message, which the node gives up so that the mailbox does not keep it alive.
+    take() -> Option[M]
+        val m = message
+        message = None
+        m
+
+// An unbounded queue many threads put messages in and the actor alone takes them from, without a
+// lock: a sender swaps its node in as the newest, then links the one it replaced to it, so two
+// messages one sender sends arrive in the order it sent them. The oldest node is always one whose
+// message was taken already; the next is the next message.
+private class Mailbox[M]()
+    private var oldest = Node[M](None)
+    private val newest = Atomic[Node[M]](oldest)
+
+    // Puts `m` at the back; called by any thread.
+    put(m: M)
+        val n = Node(Some(m))
+        newest.swap(n).next.store(Some(n))
+
+    // The message at the front, taken out, where one is there; called by the actor alone. A message
+    // whose sender has swapped its node in but not yet linked it is not there yet, and its sender
+    // schedules the actor once it is.
+    take() -> Option[M] = oldest.next.load() match
+        Some(n) ->
+            oldest = n
+            n.take()
+        None -> None
+
+    // Whether a message is there to take; called by the actor alone.
+    isEmpty() -> bool = oldest.next.load().isEmpty()
+
+// A running actor: its mailbox, whether it is queued on its executor or running there, its owner of
+// Sysl handles, and its handler, made by its behaviour's start on its first turn. Its turns are the
+// only code that reads or changes its handler, and one ends before the next begins, through the
+// executor's queue, so it is sendable.
+private class Actor[M: Sendable](private val behaviour: Behaviour[M], private val executor: Executor): Sendable
+    val number: long = numbers.add(1)
+    val owner: long = newOwner()
+    private val mailbox = Mailbox[M]()
+    private val scheduled = Atomic[bool](false)
+    private var handler: Option[(M) -> unit] = None
+    private var reference: Option[ActorRef[M]] = None
+
+    // Starts the actor: its first turn runs the start of its behaviour as `ref`, then its messages.
+    start(ref: ActorRef[M])
+        reference = Some(ref)
+        scheduled.store(true)
+        schedule()
+
+    // Puts `m` in the mailbox and queues the actor where it was neither queued nor running.
+    post(m: M)
+        mailbox.put(m)
+        if scheduled.compareAndSet(false, true) then schedule()
+
+    private schedule() = executor.execute(() -> turn())
+
+    // One turn on a worker, as the actor's owner: the start where it has not run, then at most
+    // `throughput` messages. With messages left the actor goes to the back of the queue; without,
+    // it is no longer scheduled, unless a message arrived as it stopped, which queues it again.
+    private turn()
+        val worker = currentOwner()
+        runAs(owner)
+        val handled = handle(started())
+        runAs(worker)
+        if handled == throughput && !mailbox.isEmpty() then return schedule()
+        scheduled.store(false)
+        if !mailbox.isEmpty() && scheduled.compareAndSet(false, true) then schedule()
+
+    // The handler, made by the behaviour's start where this is the first turn.
+    private started() -> (M) -> unit = handler match
+        Some(h) -> h
+        None ->
+            val h = behaviour.start(reference.get())
+            handler = Some(h)
+            h
+
+    // Hands at most `throughput` messages to `h`, and answers how many it handed.
+    private handle(h: (M) -> unit) -> int
+        var n = 0
+        while n < throughput
+            mailbox.take() match
+                Some(m) -> h(m)
+                None -> return n
+            n += 1
+        n
+
+// What an actor is before it starts: a name, which its references are shown by, and its start, run
+// once on the actor's own execution before it handles any message, which makes the actor's state and
+// gives back the handler of each message. The start is given the actor's own reference, which it may
+// keep and hand out. Starting the same behaviour twice starts two actors, each with state of its own.
+//
+//     val counter = Behaviour[int]("Counter", me ->
+//         var count = 0
+//         n -> count += n)
+class Behaviour[M: Sendable](val name: string, val start: @sendable (ActorRef[M]) -> (M) -> unit)
+
+// The reference by which an actor is sent messages. Any thread may hold and use it; it holds no state
+// of the actor's, compares by the actor it refers to, and is shown as its behaviour's name and the
+// actor's number, `Counter#3`. A reference that accepts every message of a type accepts those of
+// its subtypes.
+class ActorRef[-M: Sendable](private val send: @sendable (M) -> unit, val name: string, val number: long): Sendable
+    // Puts `message` in the actor's mailbox and returns at once: it never waits and never fails.
+    // Messages one sender tells one actor are handled in the order they were told.
+    tell(message: M) = send(message)
+
+// Two references are equal where they refer to the same actor.
+impl[M] Eq for ActorRef[M]
+    equals(other: ActorRef[M]) -> bool = number == other.number
+
+impl[M] Hash for ActorRef[M]
+    hash() -> long = number
+
+impl[M: Sendable] Display for ActorRef[M]
+    display(out: Writer, spec: FormatSpec) = out.writeField(s"$name#$number", spec)
+
+// Starts an actor of `behaviour` on `executor`, the shared pool unless another is given, and gives
+// back its reference at once. Its start runs on the executor's workers, and messages told before it
+// has finished wait behind it. The Sysl handles `behaviour` reaches that the calling code owns are
+// the actor's from then on.
+spawn[M: Sendable](behaviour: Behaviour[M], executor: Executor = Executor.shared()) -> ActorRef[M]
+    val actor = Actor(behaviour, executor)
+    handOver(behaviour, currentOwner(), actor.owner)
+    val ref = ActorRef[M](m -> actor.post(m), behaviour.name, actor.number)
+    actor.start(ref)
+    ref

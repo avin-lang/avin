@@ -2751,6 +2751,74 @@ their words are reserved.
   example is `examples/ui-todo` beside `examples/ui`**, since the corpus builds each directory of
   `examples` as one program with one `main`.
 
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-runtime`): **A behaviour's library form is
+  `Behaviour[M](name: string, start: @sendable (ActorRef[M]) -> (M) -> unit)`** ([declaring an
+  actor](/spec/actors/#declaring-an-actor)). The start runs once on the actor's first turn, is
+  given the actor's own reference (`self`), makes the actor's state in its locals and gives back the
+  handler of each message; `actor` declarations will lower to exactly this, the name being the
+  declaration's. Why: it is the smallest value that holds "the declaration and its arguments" and
+  can be started again for a restart, and making the start a `@sendable` function puts the existing
+  capture and module-level-state checks on everything an actor's body reaches, with no new check.
+  Alternatives weighed: a trait with a `receive` method implemented by a class per actor (the state
+  would be an object the program sees, which the spec rules out); a constructor hidden from
+  programs (then the runtime could not be tested before declarations exist, and a program could not
+  build an actor from a function).
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-runtime`): **`Executor.execute(task)`** runs a task on
+  the executor's workers with no future, as an owner of its own with nothing handed to it, and runs
+  after `shutdown` as a future's functions do ([executors](/spec/threads/#executors)). Why: an
+  actor's turns are queued on its executor again and again, and `avin.actors` cannot reach the
+  pool's module-private queue; the path `future` takes hands over by walking everything the task
+  reaches, which for an actor is its whole state and mailbox at every turn. Alternatives weighed:
+  putting `avin.actors` inside `avin.threads` (the spec names the module); walking at each turn
+  (cost grows with the actor's state); a compiler-known hook visible only to the library (new
+  machinery for one call). **Review with the user:** it adds a public method whose owner rule
+  (handles the giver owns trap in the task) differs from `future`'s.
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-runtime`): **Scheduling details**
+  ([scheduling](/spec/actors/#scheduling)). An actor's number is one sequence for the whole
+  program, from one in the order actors are spawned, not one per declaration. `spawn` hands the Sysl
+  handles its behaviour reaches to the actor, as a thread's `spawn` does with its body. The start
+  runs in the first turn and is not one of the 16 messages; a turn ends early when the mailbox is
+  empty; an actor on an executor that has been shut down goes on handling what it is told, so
+  `tell` never fails. Why: each is the smallest rule that keeps `tell` from waiting or failing and
+  keeps a handle usable by whoever runs the actor. Alternatives weighed: numbers per declaration
+  (`Counter#1`, `Logger#1`; needs a registry of names); dropping messages to an actor whose executor
+  is shut down (a silent loss the spec does not ask for).
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-declarations`): **An `actor` declaration is read into
+  a function and a hidden class** ([declaring an actor](/spec/actors/#declaring-an-actor)).
+  `actor Counter(start: int) receives M` is the function `Counter(start: int) -> Behaviour[M]`,
+  with the parameters' defaults, and a private class holding the actor's reference, the parameters
+  and the body's fields and methods, whose name (`actor Counter`) no program can write. The start
+  of the behaviour makes one object of that class, which runs the body, and gives back the call of
+  its `receive` match; inside the body `self` reads the reference. Why: it lowers onto the library's
+  `Behaviour` with no runtime support, as the chapter says a declaration is, and the class gives the
+  body's methods the implicit receiver and its fields their life across messages for free, while
+  the object never becomes a value the program sees. Alternatives weighed: the body's fields as the
+  start lambda's locals and its methods as local functions (no implicit receiver, and forward
+  references between methods break); a runtime-known actor class (machinery the runtime does not
+  need).
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-declarations`): **What an actor's parameters may be.**
+  Each parameter's type is held to `Sendable` where the actor is declared, not where the start
+  captures it, so the error names the actor and the parameter; one the program marks `@sendable`
+  is exempt, as a marked parameter of a function is sendable inside it whatever its type. A `var`
+  parameter is a field the actor may change, each start beginning again from the argument; a
+  repeated parameter is allowed; a by-name one is refused. An argument is checked only by its type,
+  so `Worker(s"$label$made")` computed from an actor's own `var` is accepted. Why: the chapter says
+  the parameters follow a class's rules and must be sendable; this is the reading that adds no rule
+  of its own. Alternatives weighed: marking every parameter `@sendable` (then an argument computed
+  from a `var` is refused, since what is passed for a marked parameter is checked by what it reads);
+  refusing `val` and `var` parameters (no gain: nothing outside the actor reaches its fields).
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-declarations`): **An actor's diagnostics name the
+  actor.** A message type that is not sendable is reported once where it is written after
+  `receives` (`` `Buffer[int]` does not conform to `Sendable`, so the actor `Buffers` cannot receive
+  it ``), not once for the behaviour and once for the reference; a `receive` that does not cover the
+  message type says `` actor `Partial` does not handle `C` `` and how a message is ignored; module-level
+  state reached from the body, an arm or a method is `` the actor `Arm` may run on another thread ``,
+  the path naming the actor's methods by their own names; a method value carrying the state is `the
+  state of the actor`. Why: the program wrote an actor, not a behaviour and a lambda. Alternatives
+  weighed: the generic messages of the `@sendable` start (they name a function type the program
+  never wrote). **Review with the user**: the hidden class is spelled `actor Counter`, with a
+  space, so it reads well where a diagnostic names it.
+
 **C bindings**
 
 - Settled by the user 2026-11-05: **public C interoperability is no longer deferred.** The user's
@@ -2772,14 +2840,7 @@ their words are reserved.
   recommendation), which would have had Sysl's ABI lowering of aggregates for free but no check
   against C's header, since Sysl does not read headers.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- **C bindings** ([chapter](/spec/c-bindings/); designed on branch `c-interop-design`, 2026-11-05).
+- Settled on the user's delegation 2026-11-05 (built on branch `c-interop-design`): **C bindings** ([chapter](/spec/c-bindings/)).
   Each is the recommendation the chapter is written to:
   - **The binding copies the C prototype as a string**, `@c("char *mlt_properties_get(mlt_properties
     self, const char *name)")`, beside an Avin signature in Avin types, matched by position. *Why*:
@@ -2847,6 +2908,19 @@ their words are reserved.
     a binding's pleasant layer be written in Avin but makes every Avin file a possible hole.
   - **`errno`** is not read by a binding yet; an `errno` flag answering `Result[T, int]` from a `-1`
     result is the likely form when a POSIX library needs it.
+  - **Review with the user**: the prototype-string form of `@c`, the largest syntax choice here; whether a
+    package may carry C sources, which widens the trusted surface beyond the `@c` lines; the two
+    parser additions (`val` with no initializer for `@c(const:)`, list-valued annotation
+    arguments); and a missing `@threaded` on a callback C calls from its own thread being caught
+    only by a trap at run time.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
 - **C bindings of scalars** (stage 13 step 1, branch `c-bindings-scalars`, 2026-11-05): the choices
   building it made where the chapter is silent.
   - **A typedef's kind is decided by the Avin type and checked by the C unit** with
