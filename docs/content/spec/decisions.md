@@ -1824,7 +1824,6 @@ their words are reserved.
   passes each handle field wherever it is called, though a bare handle in an `Option` or a collection
   still does not go into Sysl. The alternative is a mirror holding a handle only by itself, as a
   handle is.
->>>>>>> origin/dev
 
 ## Open
 
