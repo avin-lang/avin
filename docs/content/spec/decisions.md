@@ -1750,6 +1750,7 @@ their words are reserved.
   (text made as it is read, a socket later) and hand it to any function that takes one; the kinds
   `avin.io` makes are private classes reached only through `Source.fromFile`, `fromString` and
   `stdin`. The alternative is a final class whose kinds are fixed by the library.
+
 **Deferred**
 
 - Public C interoperability. Until then, C is reached through Sysl.
