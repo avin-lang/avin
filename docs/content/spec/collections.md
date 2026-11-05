@@ -175,7 +175,7 @@ wherever the type is known:
 - **An array, a buffer and a deque keep their own kind for the element-wise methods**, `map`,
   `flatMap`, `collect`, `filter` and `filterNot`, each a new collection, and answer the structural
   ones with a `Vector`, leaving themselves unchanged. Their in-place operations (`update`,
-  `sortInPlace`, `add`, `insert`, `remove`) are their own.
+  `sortInPlace`, `addOne`, `append`, `prepend`, `insert`, `remove`) are their own.
 - **A range answers with a `Vector`**, since it holds only a progression.
 - `zip`, `zipAll`, `scanLeft`, `grouped`, `sliding` and `indices` have one form for every sequence.
 
@@ -244,10 +244,14 @@ s.takeWhile(x -> x < 3)                      // a Vector: [1, 2]
 Every collection type has a **builder**, through one library trait: `List.newBuilder[int]()`,
 `Vector.newBuilder[string]()`, `Set.newBuilder[A]()`. A builder takes elements with `addOne(x)` and
 `addAll(xs)`, and `result()` hands over the finished collection; the builder is then spent, and using
-it again traps. Transformations, conversions such as `toList()` and collection literals all build
-through builders, and code that assembles a collection element by element uses one too. The trait
-is `Builder[-A, +C]`: `addOne(element: A)`, `addAll(elements: Iterable[A])`, which adds each in turn
-unless a builder does better, and `result() -> C`.
+it again traps until `clear()` empties it to build another. Transformations, conversions such as
+`toList()` and collection literals all build through builders, and code that assembles a collection
+element by element uses one too. The trait is `Builder[-A, +C]`: `addOne(element: A)`,
+`addAll(elements: Iterable[A])`, which adds each in turn unless a builder does better,
+`result() -> C`, `clear()`, which every builder defines and which leaves a collection already handed
+over unchanged, `sizeHint(size: int)`, a hint that about `size` elements are coming, which a builder
+over an array uses to make room once and the others ignore, and `knownSize() -> int`, the number of
+elements a builder holds where it knows it cheaply and -1 otherwise.
 
 A builder is how an immutable collection is built efficiently without being mutable itself. `List`'s
 builder appends in constant time and hands back an ordinary immutable `List`, so building a list in
@@ -571,9 +575,12 @@ Literals always build the library's types, even when a user type named `Vector` 
 
 ## Buffer
 
-`Buffer[T]` is invariant, growable and mutable. `Buffer[int]()` is an empty buffer; `add(x)`, or
-`b += x`, appends in amortized constant time, `addAll(xs)`, or `b ++= xs`, appends each in turn, `insert(i, x)` and `remove(i)` work at any index, and `clear()` empties
-it. A buffer added to itself, `b ++= b`, appends the elements it held when the call began, once. `b(i)` and `b(i) = v` read and replace an element, and an index outside `0 ..< length()` traps
+`Buffer[T]` is invariant, growable and mutable. `Buffer[int]()` is an empty buffer; `addOne(x)`,
+`append(x)` or `b += x` appends in amortized constant time, `addAll(xs)`, `appendAll(xs)` or
+`b ++= xs` appends each in turn, `prepend(x)` and `prependAll(xs)` put elements in front,
+`insert(i, x)`, `insertAll(i, xs)` and `remove(i)` work at any index, `sizeHint(n)` makes room for
+`n` elements at once, and `clear()` empties it. A buffer given itself to add or insert, `b ++= b`,
+places the elements it held when the call began, once. `b(i)` and `b(i) = v` read and replace an element, and an index outside `0 ..< length()` traps
 at the caller's line. Its elements live in an array with spare capacity, which never holds a value
 that is read before one is written, so a buffer needs no value to fill it with.
 
@@ -681,20 +688,22 @@ Array.fill(2, "a").mkString("-")   // a-a
 ## Deque
 
 `Deque[T]` is invariant, growable and mutable at both ends. `Deque[int]()` is an empty deque;
-`addFirst(x)` and `addLast(x)` put an element at the front or the back in amortized constant time, and
-`removeFirst()` and `removeLast()` take one off and return it, trapping on an empty deque. So a deque
-is a queue, `addLast` with `removeFirst`, and a stack, `addLast` with `removeLast`. `d(i)` and
-`d(i) = v` read and replace the element `i` places from the front, an index outside
-`0 ..< length()` trapping, and `clear()` empties it; `addAll(d)` of itself appends the elements it
-held when the call began, once. Its elements live in an array as a ring that wraps
+`prepend(x)` and `append(x)` (or `addOne(x)`) put an element at the front or the back in amortized
+constant time, and `removeHead()` and `removeLast()` take one off and return it, trapping on an empty
+deque. So a deque is a queue, `append` with `removeHead`, and a stack, `append` with `removeLast`.
+`prependAll(xs)` and `appendAll(xs)` (or `addAll(xs)`) put several at an end in their order, and
+`insert(i, x)` and `insertAll(i, xs)` at an index, moving the rest along. `d(i)` and `d(i) = v` read
+and replace the element `i` places from the front, an index outside `0 ..< length()` trapping, and
+`clear()` empties it; a deque given itself to add places the elements it held when the call began,
+once. Its elements live in an array as a ring that wraps
 around from the array's end to its start, doubling as a buffer's does when full. A deque compares and
 hashes by its elements in order, displays as `[1, 2, 3]`, has `mkString` where its elements display,
 and is built by `Deque.newBuilder` and by a sequence literal where one is expected.
 
 ```text
 val pending: Deque[string] = ["build", "test"]
-pending.addFirst("fetch")
-while pending.nonEmpty() do run(pending.removeFirst())
+pending.prepend("fetch")
+while pending.nonEmpty() do run(pending.removeHead())
 ```
 
 ## Sorting
