@@ -327,6 +327,40 @@ an override; and for a recursive call to give a generic function other type argu
 another instance rather than looping. A function defined by clauses may be `@tailrec`, written before
 its signature.
 
+**Every other call in tail position replaces the caller's frame.** A call of another function, a
+method, a local function, a method through a trait or an open class, or a function value, made in tail
+position, does not keep the caller waiting on the stack: the callee runs in the caller's place and
+returns straight to the caller's caller. So functions that call each other, state machines written as
+functions, and continuation passing run in constant stack however deep they go, at every
+optimization level, with no annotation:
+
+```text
+isEven(n: long) -> bool = if n == 0 then true else isOdd(n - 1)
+isOdd(n: long) -> bool = n != 0 && isEven(n - 1)
+
+isEven(10000000)         // true, in constant stack
+
+sumTo(n: long, k: (long) -> long) -> long =
+    if n == 0 then k(0) else sumTo(n - 1, s -> k(s + n))
+
+sumTo(1000000, s -> s)   // 500000500000: a million continuations, each calling the next
+```
+
+A call in tail position keeps its frame in a few places, where something of the caller is still
+needed once the callee has started:
+
+- a call of a local function that is given the place of a local it captures, which lives in the
+  caller's frame;
+- a call into the program's code from the core library, which puts back the place a trap in the
+  library reports once the call returns;
+- a call in a class's body, which completes the object after the body;
+- a call of a lambda or local function value that captures a local of the function it is written in
+  (not only its parameters): the closure's entry holds the local where the code can reach it, so each
+  such call adds the entry's frame.
+
+A trap reports the place it happened as always, but the frames a tail call replaced are gone: a
+program stopped after a million tail calls was not a million calls deep.
+
 ## data
 
 `data` declares an algebraic data type: an immutable value with one or more variants.

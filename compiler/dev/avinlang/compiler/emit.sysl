@@ -95,6 +95,10 @@ emit_llvm(program: MirProgram) -> string
     val collects = collecting_functions(program, graph)
     for i in 0..<program.functions.len()
         emit_function(&out, &intrinsics, program, graph, plan_roots(program, graph, collects, i), i)
+    val outside = called_from_outside(program)
+    for g in outside.functions
+        emit_c_wrapper(&out, program, g)
+    if outside.runner then emit_closure_runner(&out)
     for declaration in intrinsics
         out.push(declaration + "\n")
     out.push("\n")
@@ -111,21 +115,21 @@ emit_llvm(program: MirProgram) -> string
     // The module-level values are roots before the first of them is stored, and are all
     // initialized before the entry runs.
     if roots > 0 then out.push("  call void @avin_rt_globals(ptr @avin.roots)\n")
-    if program.init is Some(init) then out.push(s"  call void @\"${program.functions[init].symbol}\"(ptr %ctx)\n")
+    if program.init is Some(init) then out.push(s"  call tailcc void @\"${program.functions[init].symbol}\"(ptr %ctx)\n")
     // An entry that takes the program's arguments is given the vector the library builds from them.
     var given = "ptr %ctx"
     if program.entry_arguments is Some(a)
         val builder = program.functions[a]
-        out.push(s"  %arguments = call ${result_type(builder.signature)} @\"${builder.symbol}\"(ptr %ctx)\n")
+        out.push(s"  %arguments = call tailcc ${result_type(builder.signature)} @\"${builder.symbol}\"(ptr %ctx)\n")
         given = "ptr %ctx, ptr %arguments"
     entry.signature.result match
         Some(MInt(bits)) ->
-            out.push(s"  %result = call i$bits @\"${entry.symbol}\"($given)\n")
+            out.push(s"  %result = call tailcc i$bits @\"${entry.symbol}\"($given)\n")
             if bits < 32 then out.push(s"  %status = sext i$bits %result to i32\n  ret i32 %status\n")
             elif bits > 32 then out.push(s"  %status = trunc i$bits %result to i32\n  ret i32 %status\n")
             else out.push("  ret i32 %result\n")
         _ ->
-            out.push(s"  call ${result_type(entry.signature)} @\"${entry.symbol}\"($given)\n")
+            out.push(s"  call tailcc ${result_type(entry.signature)} @\"${entry.symbol}\"($given)\n")
             out.push("  ret i32 0\n")
     out.push("}\n")
     out.finish()
@@ -158,7 +162,7 @@ private emit_test_main(out: *StrBuilder, program: MirProgram, roots: usize)
     out.push("  %ctx = call ptr @avin_rt_start(i32 1, ptr %argv)\n")
     out.push(s"  call void @avin_rt_string_descriptor(ptr @avin.desc.${program.string_descriptor})\n")
     if roots > 0 then out.push("  call void @avin_rt_globals(ptr @avin.roots)\n")
-    if program.init is Some(init) then out.push(s"  call void @\"${program.functions[init].symbol}\"(ptr %ctx)\n")
+    if program.init is Some(init) then out.push(s"  call tailcc void @\"${program.functions[init].symbol}\"(ptr %ctx)\n")
     out.push("  switch i32 %which, label %unknown [")
     for i in 0..<program.tests.len()
         out.push(s" i32 $i, label %test$i")
@@ -173,11 +177,11 @@ private emit_test_main(out: *StrBuilder, program: MirProgram, roots: usize)
         t.answer match
             Some(a) ->
                 val reader = program.functions[a]
-                out.push(s"  %answer$i = call ${result_type(test.signature)} @\"${test.symbol}\"(ptr %ctx)\n")
+                out.push(s"  %answer$i = call tailcc ${result_type(test.signature)} @\"${test.symbol}\"(ptr %ctx)\n")
                 // The context's caller site, which the reader's trap reports.
                 out.push(s"  %site$i = getelementptr inbounds i8, ptr %ctx, i64 24\n  store ptr @avin.trap.${t.answer_site}, ptr %site$i\n")
-                out.push(s"  call ${result_type(reader.signature)} @\"${reader.symbol}\"(ptr %ctx, ${llvm_type(reader.signature.params[0])} %answer$i)\n")
-            None -> out.push(s"  call ${result_type(test.signature)} @\"${test.symbol}\"(ptr %ctx)\n")
+                out.push(s"  call tailcc ${result_type(reader.signature)} @\"${reader.symbol}\"(ptr %ctx, ${llvm_type(reader.signature.params[0])} %answer$i)\n")
+            None -> out.push(s"  call tailcc ${result_type(test.signature)} @\"${test.symbol}\"(ptr %ctx)\n")
         out.push(s"  call i64 @write(i32 2, ptr @avin.test.returned, i64 ${TestReturned.len + 1})\n")
         call_hook(out, program, t.teardown)
         out.push(s"  ret i32 0\nteardown$i:\n")
@@ -192,7 +196,7 @@ private emit_test_main(out: *StrBuilder, program: MirProgram, roots: usize)
 private call_hook(out: *StrBuilder, program: MirProgram, hook: Option[usize])
     if hook is Some(h)
         val f = program.functions[h]
-        out.push(s"  call ${result_type(f.signature)} @\"${f.symbol}\"(ptr %ctx)\n")
+        out.push(s"  call tailcc ${result_type(f.signature)} @\"${f.symbol}\"(ptr %ctx)\n")
 
 /** The line a test's process writes to standard error once the module's `@setup` has returned. */
 const TestReady: string = "avin: test: ready"
@@ -254,8 +258,11 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
     val f = program.functions[index]
     // Nothing outside the module calls a function of the program by its name: the runtime reaches the
     // ones it runs through descriptors, records and `main`. So each is internal, which lets the
-    // optimizer inline it wherever that pays and drop the copy no call needs any more.
-    out.push("define internal " + result_type(f.signature) + " @\"" + f.symbol + "\"(ptr %ctx")
+    // optimizer inline it wherever that pays and drop the copy no call needs any more. Every one has
+    // the program's own calling convention, `tailcc`, under which a call in tail position replaces
+    // the caller's stack frame (see `tail_call_at`); code outside the program reaches one only
+    // through a wrapper with the C convention (see `emit_c_wrapper` and `emit_closure_runner`).
+    out.push("define internal tailcc " + result_type(f.signature) + " @\"" + f.symbol + "\"(ptr %ctx")
     for i in 0..<f.signature.params.len()
         out.push(", " + llvm_type(f.signature.params[i]) + s" %v$i")
     out.push(") {\n")
@@ -301,15 +308,24 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
                 if value_roots[i] is Some(k) then out.push(s"  store ptr %v$i, ptr %root$k\n")
         val block = f.blocks[b]
         var polled = polled_on_entry[b]
-        for inst in block.insts
+        val tail = tail_call_at(program, f, block)
+        for i in 0..<block.insts.len()
+            val inst = block.insts[i]
             if !polled && closes_cycle(graph, index, inst)
                 polls = emit_poll(out, intrinsics, polls)
                 polled = true
-            temp = emit_inst(out, intrinsics, program, f, inst, temp)
-            if inst_dest(inst) is Some(d)
+            val last = tail && i + 1 == block.insts.len()
+            // A tail call gives the caller's frame back before it is made, exactly as a return does,
+            // since the callee's frame takes its place. Its arguments are then roots of no frame until
+            // the callee links its own, which is the first thing it does: nothing between the two
+            // allocates, polls or stores a reference, so no collection can run while they are
+            // unrooted.
+            if last && roots > 0 then out.push("  store ptr %caller, ptr %ctx\n")
+            temp = emit_inst(out, intrinsics, program, f, inst, temp, last)
+            if !last && inst_dest(inst) is Some(d)
                 if value_roots[d] is Some(k) then out.push(s"  store ptr %v$d, ptr %root$k\n")
         if back[b] then polls = emit_poll(out, intrinsics, polls)
-        if block.term is Return(_)
+        if block.term is Return(_) && !tail
             if roots > 0 then out.push("  store ptr %caller, ptr %ctx\n")
         block.term match
             Return(Some(value)) -> out.push("  ret " + typed_operand(program, f, value) + "\n")
@@ -327,6 +343,117 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
                 out.push(s"  call void @avin_rt_caller_trap(ptr %ctx, ptr @avin.trap.$site)\n  unreachable\n")
             Unreachable -> out.push("  unreachable\n")
     out.push("}\n\n")
+
+// Whether `block` of `f` ends in a call that is made as a tail call. Its last instruction calls a
+// function of the program, by name or through an address a method table, a type record or a function
+// value holds (every one of them a function of the program, with its convention), and the block
+// returns what the call returned, at the caller's own result type. LLVM makes such a call with
+// `musttail` under `tailcc`, the callee's frame replacing the caller's, so mutual recursion and calls
+// of function values in tail position run in constant stack at every optimization level. A call stays
+// an ordinary one when an argument may be the address of the caller's own stack: one of its slots, or
+// a pointer it made rather than received, which the callee would read after the frame is gone.
+private tail_call_at(program: MirProgram, f: MirFunction, block: MirBlock) -> bool
+    val n = block.insts.len()
+    if n == 0 then return false
+    var dest: Option[usize] = None
+    var result: Option[MirType] = None
+    var args: Buf[Operand] = buf()
+    block.insts[n - 1] match
+        Call(d, Direct(g), a) ->
+            dest = d
+            result = program.functions[g].signature.result
+            args = a
+        Call(d, Indirect(_, signature), a) ->
+            dest = d
+            result = signature.result
+            args = a
+        _ -> return false
+    if !same_result(result, f.signature.result) then return false
+    val returned = block.term match
+        Return(Some(Value(v))) -> dest == Some(v)
+        Return(None) -> result is None
+        _ -> false
+    if !returned then return false
+    for a in args
+        a match
+            SlotAddress(_) -> return false
+            Value(id) -> if f.value_types[id] is MPtr && id >= f.signature.params.len() then return false
+            _ -> ()
+    true
+
+private same_result(a: Option[MirType], b: Option[MirType]) -> bool = a match
+    Some(x) -> b match
+        Some(y) -> llvm_type(x) == llvm_type(y)
+        None -> false
+    None -> b is None
+
+// The start of a call of a function of the program, which has its convention.
+private call_head(tail: bool) -> string = if tail then "musttail call tailcc " else "call tailcc "
+
+/** The functions of the program that code outside it calls, each through its wrapper with the C
+ * convention, and whether the runtime is handed the closure runner. */
+private struct Outside
+    functions: Buf[usize]
+    runner: bool
+
+// A function's address is taken only for a Sysl binding's shim to call it, and the closure runner
+// only for the runtime to start a thread with.
+private called_from_outside(program: MirProgram) -> Outside
+    var taken: Buf[bool] = buf()
+    for _ in program.functions do taken.push(false)
+    var runner = false
+    for f in program.functions
+        for block in f.blocks
+            for inst in block.insts
+                for o in inst_operands(inst)
+                    o match
+                        FunctionAddress(g) -> taken[g] = true
+                        ClosureRunner -> runner = true
+                        _ -> ()
+    var functions: Buf[usize] = buf()
+    for g in 0..<taken.len()
+        if taken[g] then functions.push(g)
+    Outside(functions, runner)
+
+private c_wrapper_name(program: MirProgram, function: usize) -> string = "@\"" + program.functions[function].symbol + "!c\""
+
+// A function of the program as code outside it calls it, with the C convention: the wrapper calls it
+// with the program's own and returns what it returns, a bool crossing as a byte.
+private emit_c_wrapper(out: *StrBuilder, program: MirProgram, function: usize)
+    val f = program.functions[function]
+    out.push("define internal " + c_result(f.signature) + " " + c_wrapper_name(program, function) + "(ptr %ctx")
+    for i in 0..<f.signature.params.len()
+        out.push(", " + c_type(f.signature.params[i]) + s" %a$i")
+    out.push(") {\nentry:\n")
+    var given = "ptr %ctx"
+    for i in 0..<f.signature.params.len()
+        val t = f.signature.params[i]
+        if t is MBool
+            out.push(s"  %p$i = icmp ne i8 %a$i, 0\n")
+            given = given + s", i1 %p$i"
+        else given = given + ", " + llvm_type(t) + s" %a$i"
+    val call = "call tailcc " + result_type(f.signature) + " @\"" + f.symbol + "\"(" + given + ")\n"
+    f.signature.result match
+        Some(MBool) ->
+            out.push("  %r = " + call)
+            out.push("  %b = zext i1 %r to i8\n  ret i8 %b\n")
+        Some(t) ->
+            out.push("  %r = " + call)
+            out.push("  ret " + llvm_type(t) + " %r\n")
+        None ->
+            out.push("  " + call)
+            out.push("  ret void\n")
+    out.push("}\n\n")
+
+// What the runtime calls, with the C convention, to run a started thread's closure: it runs the code
+// the closure's descriptor names (see `emit_descriptor`) with the program's own convention.
+private emit_closure_runner(out: *StrBuilder)
+    out.push("define internal void @avin.run_closure(ptr %ctx, ptr %closure) {\nentry:\n")
+    out.push(s"  %kind = getelementptr i8, ptr %closure, i64 -$KindBack\n")
+    out.push("  %descriptor = load ptr, ptr %kind, align 8\n")
+    out.push("  %call = getelementptr inbounds i8, ptr %descriptor, i64 -8\n")
+    out.push("  %code = load ptr, ptr %call, align 8\n")
+    out.push("  call tailcc void %code(ptr %ctx, ptr %closure)\n  ret void\n}\n\n")
 
 // Whether any instruction of `f` reads or writes the context's caller site.
 private uses_caller_site(f: MirFunction) -> bool
@@ -900,7 +1027,8 @@ private real_to_wide_int(out: *StrBuilder, dest: string, p: string, bits: u32, r
     out.push(s"  ${p}.whole = select i1 ${p}.small, $t 0, $t ${p}.clamped\n")
     out.push(s"  $dest = select i1 ${p}.nan, $t 0, $t ${p}.whole\n")
 
-private emit_inst(out: *StrBuilder,intrinsics: *Buf[string], program: MirProgram, f: MirFunction, inst: Inst, temp: usize) -> usize
+// With `tail`, `inst` is a call that `tail_call_at` has found in tail position, made as one.
+private emit_inst(out: *StrBuilder,intrinsics: *Buf[string], program: MirProgram, f: MirFunction, inst: Inst, temp: usize, tail: bool) -> usize
     var next = temp
     inst match
         Binary(dest, op, left, right) ->
@@ -990,14 +1118,14 @@ private emit_inst(out: *StrBuilder,intrinsics: *Buf[string], program: MirProgram
             val callee = program.functions[index]
             out.push("  ")
             if dest is Some(d) then out.push(s"%v$d = ")
-            out.push("call " + result_type(callee.signature) + " @\"" + callee.symbol + "\"(ptr %ctx")
+            out.push(call_head(tail) + result_type(callee.signature) + " @\"" + callee.symbol + "\"(ptr %ctx")
             for a in args
                 out.push(", " + typed_operand(program, f, a))
             out.push(")\n")
         Call(dest, Indirect(target, signature), args) ->
             out.push("  ")
             if dest is Some(d) then out.push(s"%v$d = ")
-            out.push("call " + result_type(signature) + " " + operand(program, f, target) + "(ptr %ctx")
+            out.push(call_head(tail) + result_type(signature) + " " + operand(program, f, target) + "(ptr %ctx")
             for a in args
                 out.push(", " + typed_operand(program, f, a))
             out.push(")\n")
@@ -1048,6 +1176,7 @@ private operand_type(program: MirProgram, f: MirFunction, a: Operand) -> MirType
     TrapSiteAddress(_) -> MPtr
     CallerSite -> MPtr
     OwnerWord -> MPtr
+    ClosureRunner -> MPtr
 
 private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a match
     Value(id) -> s"%v$id"
@@ -1059,7 +1188,7 @@ private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a m
     ConstData(index, _) -> payload_address(s"@avin.data.$index")
     ConstStr(index) -> payload_address(s"@avin.str.$index")
     ConstClosure(index) -> payload_address(s"@avin.fn.$index")
-    FunctionAddress(function) -> "@\"" + program.functions[function].symbol + "\""
+    FunctionAddress(function) -> c_wrapper_name(program, function)
     GlobalAddress(index) -> global_address(program, index)
     RecordAddress(index) -> s"@avin.type.$index"
     DescriptorAddress(descriptor) -> s"@avin.desc.$descriptor"
@@ -1067,6 +1196,7 @@ private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a m
     TrapSiteAddress(site) -> s"@avin.trap.$site"
     CallerSite -> "%caller.site"
     OwnerWord -> "%owner.word"
+    ClosureRunner -> "@avin.run_closure"
 
 // A module-level value that holds a reference is a slot of the roots frame; any other is a global
 // of its own.

@@ -1750,6 +1750,35 @@ their words are reserved.
   (text made as it is read, a socket later) and hand it to any function that takes one; the kinds
   `avin.io` makes are private classes reached only through `Source.fromFile`, `fromString` and
   `stdin`. The alternative is a final class whose kinds are fixed by the library.
+- Settled on the user's delegation 2026-11-05: **[Guaranteed tail calls](/spec/declarations/#tail-calls)**
+  (branch `tailcalls`). Every call in tail position of a function of the program, by name, through
+  a method table or of a function value, replaces the caller's stack frame, at `-O0` as at `-O2`,
+  so mutual recursion, state machines of functions and continuation passing run in constant stack.
+  A self-call is still a jump within the function, which is cheaper. `@tailrec` stays about
+  self-recursion.
+  - Every compiled function has LLVM's `tailcc` convention, and a tail call is `musttail call
+    tailcc` followed at once by its `ret`. The C convention is kept only where code outside the
+    program calls in: `main`, a C-convention wrapper for each function whose address a Sysl
+    binding's shim is given, and the closure runner the runtime calls to start a thread.
+  - Calls through method tables and of function values are tail calls too, since every address a
+    table, a type record or a closure holds is a function of the program with its convention. A call
+    the whole-program pass guards by the receiver's descriptor returns from each of its branches.
+  - The caller gives its shadow-stack frame back just before the call, as a return does. The
+    arguments are then roots of no frame until the callee links its own, its first act, and nothing
+    between the two allocates, polls or stores, so no collection can see the gap.
+  - A call stays an ordinary one where an argument may point into the caller's own stack (a local
+    function given the address of a local it captures), where the core library calls the program's
+    code (it restores the caller site after), where the result is converted, and in a class's
+    constructor, which publishes its object after its body. A lambda or local function value that
+    captures a local of its enclosing function is entered through an entry that keeps the local on
+    its own stack, so that entry's call adds one frame per call; capturing only parameters and values
+    adds none.
+  - Alternatives weighed: merging each group of mutually recursive functions into one function that
+    switches on which one is running (no convention change, but only for calls by name, and code
+    size grows with the group); a trampoline in the library (no compiler work, but every tail call
+    pays an allocation and an indirect return, and the program must be written for it).
+  - **Review with the user.** Error backtraces lose the frames a tail call replaced; the user may
+    prefer this only at -O2.
 
 **Deferred**
 
@@ -1778,9 +1807,8 @@ their words are reserved.
   - **`@tailrec` is accepted on top-level functions, methods and local functions**, and is the one
     annotation a local function takes; a lambda cannot be annotated. It refuses a function with no
     recursive call, as the reference language does, rather than accepting it silently.
-  - **Mutual recursion is not made a loop**, only a function calling itself. Alternative: general
-    tail calls (LLVM `musttail`) — they need every caller and callee to agree on a calling
-    convention, and Avin's calls pass a context and keep a shadow-stack frame.
+  - **Only a function calling itself is made a loop**; every other call in tail position is a
+    guaranteed tail call (under Settled), which `@tailrec` does not ask about.
   - The language has no `try`, `defer` or `finally`, so there is no pending cleanup to take a call
     out of tail position; when such a construct is added, a call inside it is not in tail position.
 
