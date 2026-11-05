@@ -37,7 +37,7 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
 | [The AVIN philosophy](/spec/philosophy/) | Abstraction, Versatility, Intuition and Naturalness: the principles behind the design |
 | [Design choices](/spec/design/) | The choices that shape the type system, runtime and library |
 | [Types](/spec/types/) | Built-in types, numbers, strings, tuples, functions, `Any`/`Nothing` |
-| [Declarations](/spec/declarations/) | `data`, `class`, `trait`, `object`, `impl`, members, modules, initialization |
+| [Declarations](/spec/declarations/) | Names in any script, `data`, `class`, `trait`, `object`, `impl`, members, modules, initialization |
 | [Generics and inference](/spec/generics/) | Reification, bounds, variance, type tests, local inference |
 | [Equality, identity and memory](/spec/equality-and-memory/) | `==`, `===`, hashing, display, values vs references, GC |
 | [Threads](/spec/threads/) | Starting and joining, sharing, synchronization, the memory model |

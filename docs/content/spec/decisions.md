@@ -2370,7 +2370,48 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- **Names in any script** (branch `unicode-identifiers`, 2026-11-05; [names](/spec/declarations/#names)).
+  A name starts with a character of Unicode's `XID_Start` or `_` and continues with `XID_Continue`
+  (UAX #31, the Unicode identifier rule), at the Unicode version the compiler's tables were cut
+  from (17.0.0). Why: domain vocabulary is written in the programmer's own language, and the XID
+  properties are the ones designed to be stable under normalization and across Unicode versions.
+  Alternatives weighed: ASCII only (what the lexer had; refuses `größe` for no reason a reader
+  could guess); any non-ASCII character that is not a space (admits emoji, arrows and operators
+  of other scripts, so `a→b` would be one name); General_Category letters, marks and digits
+  (Sysl's rule; close to XID but not stable under normalization, and admits pattern characters
+  such as U+2E2F).
+- **A name in a normal form other than NFC is an error, with its NFC spelling** (branch
+  `unicode-identifiers`). Why: every name stays byte for byte the text written, so spans, rename,
+  lookup and emitted symbols need no second spelling, and two spellings that look identical can
+  never be two names, which is what normalizing would also guarantee. Alternatives weighed:
+  normalizing to NFC silently (friendlier to an input method that writes decomposed text, but
+  every name then has a spelling the source does not contain); no normalization (Sysl's choice:
+  `café` and `cafe` with U+0301 are two names that look the same); NFKC (folds `ﬁ` into `fi` and
+  full-width letters into ASCII, which changes what a name visibly is). A module's directory name
+  is held to the same rule. Review with the user: whether silent normalization is preferred.
+- **Capitalized means an uppercase or titlecase first letter (`Lu`, `Lt`); a caseless letter is
+  not capitalized** (branch `unicode-identifiers`). Every place the compiler asks whether a name
+  is capitalized (a missing variant written `T.V`, a scalar type's `MaxValue`-style constants, a
+  missing type in an import of a library module, a handle's `named:`, the highlighting of types)
+  uses this test, so `Ärger`, `Δelta` and `ǅemal` read as type-like names and `名前` as a value's.
+  A bare name in a pattern is a variant when one of that name is in scope and a binding otherwise,
+  whatever its case, so a caseless name is a binding unless it names a variant. Why: a caseless
+  script has no way to write a capital, and treating its names as lowercase keeps them usable for
+  the commonest names (values, functions); its types are still declared and used by name.
+  Alternatives weighed: caseless counting as capitalized (every CJK local would read as a
+  constructor-like name); refusing caseless names where a capital is expected (a CJK program could
+  not name a type). Review with the user: this is the choice most likely to matter to a program
+  written wholly in a caseless script.
+- **Look-alike names in different scripts are different names, with no warning** (branch
+  `unicode-identifiers`): Latin `a` and Cyrillic `а` are two names. Why: confusable detection
+  (UTS #39) needs data the compiler does not carry and warns on legitimate mixed-script code.
+  Alternative: a mixed-script warning per name. Review with the user if spoofed names in shared
+  packages become a concern.
+- **A character above ASCII that begins no token is reported with its code point and stepped over
+  whole** (branch `unicode-identifiers`): an emoji is "not a character a name or an operator is
+  spelled with", and a digit or mark of another script where a name begins "cannot begin a name",
+  each naming the character and its `U+` code point. Why: the bytes of one character used to be read as separate
+  symbols, which the parser then reported one at a time.
 
 ## Open
 
