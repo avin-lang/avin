@@ -157,10 +157,15 @@ main() -> int
   at once where it is already there. `Future.successful(x)` is complete from the start.
   `Future.all(fs)` is the future of every value of an `Iterable` of futures, as a `Vector` in the
   order given, and `Future.first(fs)` of the value of whichever completes first; the first of no
-  futures traps.
+  futures traps. `Future.traverse(xs, f)` is `Future.all` of `f` of each element: `f` is called for
+  the elements in turn on the calling thread, so their futures start in that order, and the values
+  come back in it however the futures finish.
 - **A future carries no failure.** A computation that can fail returns `Future[Result[T, E]]`, and
   such a future also has `mapOk(f)` and `flatMapOk(f)`, which go on from an `Ok` and pass an `Err`
-  through unchanged. A trap inside a body stops the program, as it does in any thread.
+  through unchanged, `mapErr(f)`, which turns one failure into another, and `orElse(other)`, which
+  goes on to the future `other` gives only where this one ended in `Err`: `other` is by-name, so it
+  is not even evaluated after an `Ok`, and its value may widen to a supertype as `Result.orElse`'s
+  does. A trap inside a body stops the program, as it does in any thread.
 - **A `Promise[T]()`** is completed by another thread: its `future` field is the future it completes,
   `complete(x)` completes it and traps where it is already complete, and `tryComplete(x) -> bool`
   completes it only where nothing has yet, answering whether it did, for threads that race to give
@@ -173,6 +178,54 @@ waits in `await` for a value not yet there counts as not working, and where work
 worker free, the pool starts another in its place; that one stays afterwards and is idle while there
 is nothing to do. So waits nested in bodies never leave the pool without a thread to run the future
 they wait for, however deep they go, and the pool grows only by as many workers as wait at once.
+
+**`blocking(body)`** says a body waits on something other than a future: a channel, a lock, a
+blocking binding, a sleep. On a worker of a pool, the pool counts it as waiting while `body` runs,
+exactly as it counts one in `await`, so a full pool whose workers all wait on a channel still runs
+the task that fills it. A `blocking` inside another, or an `await` inside one, is counted once; on a
+thread of no pool, `body` simply runs. **`sleep(d: Duration)`** pauses the calling thread for at
+least `d` (from [`avin.time`](/spec/system-library/#avin-time)), safe for the collector while it
+sleeps; a duration of zero or less returns at once. A worker that sleeps keeps its place, and
+`blocking(sleep(d))` gives it up.
+
+```avin
+import avin.threads.{blocking, Channel, Future}
+
+main() -> int
+    val jobs = Channel[int]()
+    val workers = (0..<64).map(i -> Future(blocking(jobs.receive().getOrElse(0)))).toVector()
+    Future
+        for n in 1..64 do jobs.send(n)
+    println(Future.all(workers).await().sum())
+    0
+```
+
+### Executors
+
+**An `Executor`** is a pool of threads of one's own, chosen explicitly. `Executor.fixed(n)` keeps at
+most `n` tasks working at once, `n` at least one, and starts its workers as work comes, as the shared
+pool does; a worker waiting in `await` or `blocking` leaves its place to another there too.
+`ex.future(body)` runs `body` on it, and **a future runs its `map`, `flatMap` and `onComplete` on the
+executor it was made on**, so a chain begun on an executor stays there. `Executor.shared()` is the
+pool `Future(body)` uses; `Future.successful`, `Future.all`, `Future.first`, `Future.traverse` and a
+promise's future belong to it.
+
+`ex.shutdown()` lets the workers end once the queued work is done, and `isShutdown()` asks. A new
+body given to an executor after its shutdown traps, but the functions of futures already made on it
+still run there, on a worker started for them where none is left, so no future made before is
+stranded. The shared executor is never shut down, and asking traps.
+
+```avin
+import avin.threads.{Executor, Future}
+
+main() -> int
+    val io = Executor.fixed(4)
+    val sizes = (1..100).map(n -> io.future(n * n)).toVector()
+    val total = Future.all(sizes).await().sum()
+    io.shutdown()
+    println(total)
+    0
+```
 
 ## The memory model
 
