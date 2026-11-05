@@ -156,7 +156,19 @@ comprehension over an iterator is an iterator, read element by element.
 elements remaining as an `int`, found by reading them all: `hasNext()` is false afterwards and a second
 `size()` is 0. On an iterator made by `map`, `filter` and the rest, the source is read to its end, and
 `f` or `p` is called for each element as in any other traversal. An infinite iterator never returns.
-`Iterable` itself has no `size`: collections each have their own, which counts without consuming.
+
+**Every `Iterable` has `size()`, `knownSize()` and `sizeCompare(n)`.** `size()` is the number of
+elements as an `int`: by default it counts them by traversing the iterable, so on an iterator it uses
+it up, and a collection that holds its count overrides it to answer at once without consuming. A
+sequence has `length()` and `size()`, equal; sets, maps (immutable and mutable), `Vector`, `Array`,
+`ArraySeq`, `Buffer`, `Deque`, `Range` and `NumericRange` answer from their own count. `knownSize()` is
+the count when it is known without traversing and `-1` otherwise: an iterator, a view, a `List` (except
+the empty one, which is 0) and a program's own `Iterable` that has not overridden it answer `-1`, and
+`size()` then counts. Both are overridable members, so the answer through `Iterable[T]` is the
+collection's own. `xs.sizeCompare(n)` is negative, zero or positive as the count is less than, equal to
+or greater than `n` (`-1`, `0` or `1`), reading at most `n` elements of an iterable whose count is not
+known. A class that implements `Iterable` cannot have a member named `size`, `knownSize` or
+`sizeCompare` of its own other than as an `override`.
 
 **A view is an iterator.** `xs.view()`, on every collection, is `xs.iterator()` taken as the start of
 a lazy pipeline: nothing is computed until the view is read, each element is computed once as it is
