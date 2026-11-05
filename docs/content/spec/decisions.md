@@ -3767,15 +3767,7 @@ spelling is better, as each entry says.
     not.
   - **Arrays of mirrors, strings, handles, `bool` and the narrower integers are refused** with the
     four element types the chapter lists; arrays of mirrors arrive with struct mirrors (step 7).
-
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- Proposed (built on branch `sysl-generic-bindings`): **generic bindings are bounded by `Boundary`**
+- Settled on the user's delegation 2026-11-05 (built on branch `sysl-generic-bindings`): **generic bindings are bounded by `Boundary`**
   ([Sysl bindings](/spec/sysl-bindings/#generics)). A binding's type parameters, a generic handle
   class's, and a bound method's own are each bounded by `Boundary`, a core trait the compiler decides
   from a type's structure as it decides `Sendable`: the integers of 8, 16, 32 and 64 bits, `byte`,
@@ -3803,7 +3795,7 @@ spelling is better, as each entry says.
   own bounds anyway). **Review with the user:** the name `Boundary`, and whether handles should become
   type arguments of generic handles (`Signal[View]`), which needs the shim to pass a handle inside a
   generic Sysl value.
-- Proposed (built on branch `sysl-generic-bindings`): **a callback closure's parameters are written
+- Settled on the user's delegation 2026-11-05 (built on branch `sysl-generic-bindings`): **a callback closure's parameters are written
   out where Sysl cannot infer them**. A Sysl closure taking the function's own type parameter
   (`applied[T, U](x: T, f: &Fn(T) -> U)`) left the shim's lambda `(q0) -> …` untyped, which Sysl
   refuses, for generic and non-generic bindings alike; the shim now writes each parameter as the Avin
@@ -3812,6 +3804,13 @@ spelling is better, as each entry says.
   Rationale: the same retry the shim already made for integer answers and parameters, extended.
   Alternatives weighed: always typing the lambda (wrong where Sysl hands a collection as a `Buf`
   rather than a slice, which only inference gets right); refusing such bindings.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
 
 ## Open
 
