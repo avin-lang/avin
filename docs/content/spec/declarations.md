@@ -354,6 +354,11 @@ needed once the callee has started:
 - a call into the program's code from the core library, which puts back the place a trap in the
   library reports once the call returns;
 - a call in a class's body, which completes the object after the body;
+- a call of a function whose arguments do not all travel in registers: one with more than five
+  parameters that are integers, bools or references (a method's receiver and the values a local
+  function captures count), more than eight `real`s, or an integer wider than `long` among its
+  parameters or as its result; the call is made in its own frame, and so is a tail call such a
+  function makes;
 - a call of a lambda or local function value that captures a local of the function it is written in
   (not only its parameters): the closure's entry holds the local where the code can reach it, so each
   such call adds the entry's frame.

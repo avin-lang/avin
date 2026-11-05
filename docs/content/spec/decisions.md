@@ -1780,6 +1780,16 @@ their words are reserved.
     captures a local of its enclosing function is entered through an entry that keeps the local on
     its own stack, so that entry's call adds one frame per call; capturing only parameters and values
     adds none.
+  - **Only a function whose arguments all travel in registers has `tailcc`**: the context and at
+    most five integers, bools or references, at most eight reals, and no integer wider than `long`
+    as a parameter or the result. The rest keep the C convention and make and receive ordinary
+    calls. Under `tailcc` the callee pops the arguments passed on the stack, and LLVM's unoptimized
+    code generation reloads spilled values from the wrong place after such a call (seen as crashes
+    and wrong results at `-O0`); with every argument in a register there is nothing to pop. The
+    limits are those of the smallest target (x86-64: six integer registers, eight vector ones), so a
+    program's stack use is the same everywhere. **Review with the user**: a function with six or more
+    such parameters gets no tail call; lifting the limit means passing the extra arguments in a
+    block the caller's caller owns, or a fixed LLVM.
   - Alternatives weighed: merging each group of mutually recursive functions into one function that
     switches on which one is running (no convention change, but only for calls by name, and code
     size grows with the group); a trampoline in the library (no compiler work, but every tail call
