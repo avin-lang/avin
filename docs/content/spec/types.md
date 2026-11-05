@@ -297,6 +297,31 @@ collections are functions this way: a `Seq[T]` is an `(int) -> T`, a `Set[A]` an
 
 There is no arity limit.
 
+**`@sendable` before a function type**, `@sendable (A) -> B`, makes the type of a function that may
+run on any thread: it captures only sendable values and no `var`, and the code it runs reaches no
+module-level mutable state ([threads](/spec/threads/#what-is-shared)). Such a type is `Sendable`, and
+a plain function type is not, since it does not say what its values capture. Only a function type
+may be marked; `@sendable int` is an error. A `@sendable (A) -> B` is a `(A) -> B`, with no
+conversion, so it is passed wherever the plain type is expected and a vector of them is a vector of
+the plain type; a plain function value is not a `@sendable` one. A lambda, a reference to a function
+and a method value written where a `@sendable` function type is expected are made as one, and are
+checked there as a thread's body is. Inside a function, a parameter marked
+[`@sendable`](/spec/threads/#what-is-shared) that takes a function holds a `@sendable` function.
+
+```text
+val step: @sendable (int) -> int = (x) -> x + 1       // checked: captures nothing
+val named: @sendable (int) -> int = double            // checked: what `double` reaches
+val plain: (int) -> int = step                        // a @sendable function is a plain one
+val back: @sendable (int) -> int = plain              // error: `plain`'s type does not say what it captures
+adder(n: int) -> @sendable (int) -> int = (x) -> x + n
+```
+
+Two overloads that differ only in whether a function parameter is `@sendable` are the same
+overload, as two that differ only in a by-name parameter are, since one lambda may be passed for
+either. An override takes the parameter types of the method it overrides, the mark included, and
+may yield a `@sendable` function where that method yields the plain type. Messages print the mark
+as it is written, `@sendable (int) -> int`.
+
 ### Partial functions
 
 `PartialFunction[-A, +B]` is a core-library trait, and a subtype of `A -> B`: a function defined at

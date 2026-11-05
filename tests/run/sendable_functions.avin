@@ -1,0 +1,108 @@
+// expect: exit 0
+// A `@sendable` function type: a lambda, a function reference and a method value written where one
+// is expected are converted to it, and its values are `Sendable`, so they are captured by a thread's
+// body, held in data and objects that are sendable in turn, kept in vectors and options, passed to
+// `spawn`, `Future` and a future's `map`, returned from functions and taken and made by higher-order
+// combinators. A `@sendable` function is a plain one too, a parameter marked `@sendable` holds one,
+// and an override may yield one where the method it overrides yields a plain function.
+import avin.threads.{Future, spawn}
+
+data Point(x: int, y: int)
+
+data Task(name: string, run: @sendable (int) -> int)
+
+class Job(val label: string, val step: @sendable () -> string)
+
+class Scale(val factor: int)
+    apply(x: int) -> int = x * factor
+
+double(x: int) -> int = x * 2
+
+trait Maker
+    make() -> () -> int
+
+class SendMaker(): Maker
+    override make() -> @sendable () -> int = () -> 5
+
+generic[T](x: T) -> T = x
+
+send[T: Sendable](value: T) -> T = value
+
+adder(n: int) -> @sendable (int) -> int = (x) -> x + n
+
+pointAdder(p: Point) -> @sendable (int) -> int = (x) -> x + p.x + p.y
+
+compose(f: @sendable (int) -> int, g: @sendable (int) -> int) -> @sendable (int) -> int = (x) -> g(f(x))
+
+twice(@sendable f: (int) -> int) -> @sendable (int) -> int = (x) -> f(f(x))
+
+background(@sendable body: () -> int) -> int = spawn(body).join()
+
+runTyped(body: @sendable () -> int) -> int = spawn(body).join()
+
+applyPlain(f: (int) -> int, x: int) -> int = f(x)
+
+mapAll[A: Sendable, B: Sendable](xs: Vector[A], f: @sendable (A) -> B) -> Vector[B] = spawn(() -> xs.map(f)).join()
+
+wrap(@sendable f: (int) -> int) -> Task = Task("wrapped", f)
+
+pick(first: bool) -> @sendable () -> string = if first then () -> "first" else () -> "second"
+
+main()
+    val words = Vector("a", "bb", "ccc")
+    val lambda: @sendable (int) -> int = (x) -> x + words.length()
+    val reference: @sendable (int) -> int = double
+    val scale = Scale(3)
+    val method: @sendable (int) -> int = scale.apply
+    val instance: @sendable (int) -> int = generic[int]
+    println(spawn(() -> lambda(1) + reference(2) + method(3) + instance(4)).join())
+
+    // Subtyping: a `@sendable` function is a plain one.
+    val plain: (int) -> int = lambda
+    println(plain(10))
+    println(applyPlain(reference, 10))
+
+    // Passed to `spawn`, to a parameter marked `@sendable` and to one of a `@sendable` type, as it is.
+    val body: @sendable () -> int = () -> 7
+    println(spawn(body).join())
+    println(background(body) + runTyped(body))
+    println(runTyped(() -> words.length()))
+    println(Future(body() * 2).await())
+    println(Future(2).map(reference).await())
+
+    // Closures returned from functions, and combinators taking and making `@sendable` functions.
+    val add5 = adder(5)
+    val both = compose(add5, double)
+    val four = twice(add5)
+    println(spawn(() -> add5(1) + both(1) + four(0) + pointAdder(Point(1, 2))(0)).join())
+    println(mapAll(Vector(1, 2, 3), add5))
+    println(mapAll(words, (w) -> w.byteLength()))
+    println(spawn(() -> pick(true)() + pick(false)()).join())
+
+    // A data type and a class whose fields hold `@sendable` functions are sendable.
+    val task = Task("inc", (x) -> x + 1)
+    val job = Job("hello", () -> "hi")
+    println(spawn(() -> task.run(41)).join())
+    val wrapped = wrap((x) -> x * 3)
+    println(spawn(() -> wrapped.name + wrapped.run(5).toString()).join())
+    println(spawn(() -> job.label + " " + job.step()).join())
+    println(send(task).name + " " + send(job).label + " " + send(body)().toString())
+
+    // In a vector and an option, written where the element type is expected.
+    val tasks: Vector[@sendable () -> int] = [() -> 1, () -> 2, () -> words.length()]
+    println(spawn(() -> tasks.map((t) -> t()).sum()).join())
+    val maybe: Option[@sendable () -> int] = Some(() -> 9)
+    println(spawn(() -> maybe.map((f) -> f()).getOrElse(0)).join())
+
+    // The empty capture and one capture at the integer bounds.
+    val big = 2147483647
+    val small: @sendable () -> int = () -> big
+    val none: @sendable () -> unit = () -> ()
+    println(spawn(() -> small()).join())
+    spawn(none).join()
+    // An override may yield a `@sendable` function where the method it overrides yields a plain one.
+    val maker = SendMaker()
+    val made = maker.make()
+    val viaTrait: Maker = maker
+    println(spawn(() -> made()).join() + viaTrait.make()())
+    println("done")

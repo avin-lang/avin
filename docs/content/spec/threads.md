@@ -72,8 +72,32 @@ it, so it is never captured for another thread, whatever its type: the closure c
 `val` first, or the two share an `Atomic`. A closure is checked by what it captures, the closures
 it makes and the local functions it calls included; a method value captures its object, so
 `spawn(counter.tick)` needs a sendable `counter`; and a by-name body, as `Future(body)` takes, is a
-closure too. A function value held in a `val` is not sendable, since its type does not say what it
-captures: the closure is written where it is passed.
+closure too. A function value held in a `val` of a plain function type is not sendable, since its
+type does not say what it captures: the closure is written where it is passed, or the `val` is of a
+`@sendable` function type.
+
+**A `@sendable` function type says it.** `@sendable (A) -> B` ([function
+types](/spec/types/#function-types)) is the type of a function that may run on another thread, and
+it is `Sendable`. A lambda, a function reference or a method value written where one is expected is
+checked where it is made exactly as what is passed for a `@sendable` parameter is: what it captures,
+and the module-level state it reaches (below); the error names the type. A value already of a
+`@sendable` type is passed, stored, captured and sent as it is, so a data type or a class whose
+fields are `@sendable` functions is sendable by its structure, and grammars, handlers and tasks held
+in module-level values may be used by every thread:
+
+```avin
+import avin.threads.spawn
+
+data Rule[T](run: @sendable (string) -> Option[T])
+
+val digits: Rule[int] = Rule((s) -> s.toIntOption())
+
+main() = println(spawn(() -> digits.run("42")).join())
+```
+
+```text
+error: a `@sendable (int) -> int` may use only sendable values from around it, but it uses `a`, an `Array[int]`, which is mutable; an immutable copy (`toVector`) is sendable
+```
 
 **The checks are two marks on a parameter, which any function may use.** What is passed for an
 **`@isolated`** parameter may use only sendable values from around it: a closure captures only
