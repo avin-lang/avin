@@ -281,8 +281,17 @@ struct BodyState
     early: Buf[EarlyCall]
     /** The locals bound by `is` tests, which are in scope only where their test is known to hold. */
     tested: Buf[usize]
+    /** The functions the body passes to `@threaded` parameters, checked once its captures are known. */
+    threaded: Buf[ThreadedArgument]
 
-fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf())
+fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
+
+/** A function passed to a binding's `@threaded` parameter `param` of `binding`. */
+struct ThreadedArgument
+    unit: usize
+    value: &TExpr
+    binding: string
+    param: string
 
 /** A class body checked part way: its initializer's body so far, the code checked so far, the next
  * member to check and the next field it declares. */
@@ -5076,6 +5085,9 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
     val intrinsic = intrinsic_of(c, unit, f)
     val binding = has_annotation(f, "sysl")
     if binding then check_binding(c, unit, f, params, result, intrinsic is Some(_))
+    elif f.body is Some(_) || f.clauses.len() > 0
+        for p in f.params
+            if is_threaded_param(p) then c.note(unit, p.pattern.span, "`@threaded` marks a Sysl binding's parameter, whose function Sysl may call from any thread")
     if intrinsic is Some(name)
         // The array operations are generic in the element type, and only the core library's
         // `Array` declares them.
@@ -6267,7 +6279,10 @@ private check_crossings(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
     for i in 0..<f.params.len()
         val p = f.params[i]
         val t = params[first + i]
+        val threaded = is_threaded_param(p)
+        if threaded && !(*t is Function(_, _)) then c.note(unit, p.pattern.span, "`@threaded` marks a parameter that takes a function, which Sysl may call from any thread")
         if p.by_name then c.note(unit, p.pattern.span, "a by-name parameter cannot cross to Sysl")
+        elif *t is Function(ps, r) then check_callback_crossing(c, unit, p, ps, r)
         elif is_handle(c, t) then ()
         elif holds_handle(c, t) then c.note(unit, p.ty.span, s"`${type_name(t)}` cannot cross to Sysl: a Sysl handle goes back into Sysl only by itself, as a parameter or the receiver of its own methods")
         elif !crosses_to_sysl(c, t) then c.note(unit, p.ty.span, s"`${type_name(t)}` cannot cross to Sysl; ${BoundaryTypes}")
@@ -6276,6 +6291,25 @@ private check_crossings(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
             val at = if f.result is Some(t) then t.span else f.name_span
             if holds_handle(c, r) then c.note(unit, at, s"`${type_name(r)}` cannot cross out of Sysl: a Sysl handle is a binding's result, held in its `Array`, `Vector`, `Option` or `Result`, or a part of a tuple that is one of these")
             else c.note(unit, at, s"`${type_name(r)}` cannot cross to Sysl; ${BoundaryTypes}")
+
+// A binding's parameter taking a function, which the shim hands Sysl as a closure: Sysl calls it with
+// arguments that cross out of Sysl, as a binding's result does, and it answers a value that crosses
+// into Sysl, as a binding's parameter does.
+private check_callback_crossing(c: *Checker, unit: usize, p: Param, ps: Buf[&Type], r: &Type)
+    for q in ps
+        if *q is Function(_, _) then c.note(unit, p.ty.span, s"`${type_name(q)}` cannot be a callback's parameter: a function crosses to Sysl only as a binding's own parameter")
+        elif !crosses_out_of_sysl(c, q) then c.note(unit, p.ty.span, s"`${type_name(q)}` cannot be a callback's parameter, which Sysl gives it; ${BoundaryTypes}")
+    if *r is Function(_, _) then c.note(unit, p.ty.span, s"`${type_name(r)}` cannot be a callback's result: a function crosses to Sysl only as a binding's own parameter")
+    elif is_handle(c, r) then ()
+    elif holds_handle(c, r) then c.note(unit, p.ty.span, s"`${type_name(r)}` cannot be a callback's result: a Sysl handle goes back into Sysl only by itself")
+    elif !crosses_to_sysl(c, r) then c.note(unit, p.ty.span, s"`${type_name(r)}` cannot be a callback's result, which goes into Sysl; ${BoundaryTypes}")
+
+/** Whether a binding's parameter is marked `@threaded`: Sysl may call the function it is given from
+ * any thread. */
+is_threaded_param(p: Param) -> bool
+    for a in p.annotations
+        if a.name == "threaded" then return true
+    false
 
 const BoundaryTypes: string = "a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, data types declared with `@sysl` to mirror a Sysl enum or struct, and `Array`, `Vector`, `Option`, `Result` and tuples of these"
 
@@ -7023,6 +7057,36 @@ private finish_captures(c: *Checker)
             if !contains_index(call.initialized, x)
                 c.note(callee.unit, call.span, s"`${callee.name}` uses `${c.body.locals[x].name}`, which is not initialized where `${callee.name}` is used here")
                 break
+    check_threaded_arguments(c)
+
+// Holds each function the body passes to a `@threaded` parameter to what another thread may run: a
+// function named by itself, which captures nothing, or a lambda or method value whose every capture
+// is a `val` or a parameter of a sendable type. Any other function value is refused, since its type
+// does not say what it captures.
+private check_threaded_arguments(c: *Checker)
+    val sendable = c.core.trait_named("Sendable")
+    for t in c.body.threaded
+        if *t.value.ty is ErrorType then continue
+        val what = s"the function passed to `${t.param}` of `${t.binding}`, which Sysl may call from any thread"
+        // A method value is its receiver held in a local, then the closure capturing it.
+        var value = t.value
+        if value.kind is Block(items)
+            if items.len() > 0 then value = items[items.len() - 1]
+        value.kind match
+            FunctionValue(f, _) ->
+                val symbol = c.symbols[f]
+                if symbol.root is None then continue
+                for x in symbol.captured_locals
+                    val local = c.body.locals[x]
+                    val name = if local.name == "" then "its receiver" else s"`${local.name}`"
+                    if local.mutable then c.note(t.unit, t.value.span, s"$what, captures ${name}, a `var`, which that thread would share with the code here; capture a `val` holding its value")
+                    elif sendable is Some(k) then hold_to_sendable(c, t.unit, t.value.span, s"captured as $name by $what", local.ty, k)
+                val root = c.symbols[c.body.root]
+                for x in symbol.captured_params
+                    if x >= root.params.len() then continue
+                    if sendable is Some(k) then hold_to_sendable(c, t.unit, t.value.span, s"captured as `${root.param_names[x]}` by $what", root.params[x], k)
+            _ -> c.note(t.unit, t.value.span, s"$what, is not a lambda, a method value or a function named here: a function value's type does not say what it captures")
+    c.body.threaded = buf()
 
 private contains_index(items: Buf[usize], x: usize) -> bool
     for i in items
@@ -10707,7 +10771,26 @@ private call_function(c: *Checker, at: Span, name_span: Span, id: usize, args: B
     local_use(c, id, at)
     val declared = result_of(c, id, at)
     val applied = apply(c, at, name_span, function_signature(c, id, declared), args, explicit, expected, typed)
+    note_threaded_arguments(c, id, applied)
     applied.wrap(at, Call(id, applied.args, applied.type_args))
+
+// Records each function a call of `id` passes to a `@threaded` parameter, which is held to what
+// another thread may run once the body's captures are known. A method's parameters follow its
+// receiver, which `applied` does not hold.
+private note_threaded_arguments(c: *Checker, id: usize, applied: Applied)
+    val decl = c.symbols[id].decl
+    for i in 0..<decl.params.len()
+        if i >= applied.args.len() || !is_threaded_param(decl.params[i]) then continue
+        var arg = applied.args[i]
+        // An argument the call evaluates first is held in a local the prelude binds.
+        if arg.kind is Local(x)
+            for p in applied.prelude
+                if p.kind is Let(y, v)
+                    if y == x then arg = v
+        val name = decl.params[i].pattern.kind match
+            Name(n) -> n
+            _ -> "_"
+        c.body.threaded.push(ThreadedArgument(unit_of(c), arg, decl.name, name))
 
 // The object a call by `name` reaches through its `apply` methods: the object of that name, where it
 // declares `apply` and the name is not a function's, only, if anything, its companion class's
@@ -11609,6 +11692,7 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
         setup = Some(TExpr(receiver.span, Unit, Let(held, receiver)))
         object = TExpr(receiver.span, receiver.ty, Local(held))
     var applied = apply(c, at, name_span, method_signature(c, object, m, result_of(c, m, at)), args, explicit, expected, checked)
+    note_threaded_arguments(c, m, applied)
     // A call written `x +: xs` evaluates `x`, written first, before the receiver `xs`.
     var first: Option[&TExpr] = None
     if !applied.cut && applied.args.len() > 0 && operand_first(c, name_span)
@@ -12317,6 +12401,11 @@ private named_function_value(c: *Checker, at: Span, name: string, explicit: Opti
 private function_value(c: *Checker, at: Span, id: usize, explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
     val target = c.symbols[id]
+    // What a `@threaded` parameter is given is checked at the call, which a function value hides.
+    for p in target.decl.params
+        if is_threaded_param(p)
+            c.note(unit, at, s"`${target.name}` has a `@threaded` parameter, so it is called by name, where the function it is given is checked, and is not a value")
+            break
     local_use(c, id, at)
     val result = result_of(c, id, at)
     val type_params = target.type_params

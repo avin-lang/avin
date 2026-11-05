@@ -1,0 +1,139 @@
+module avin.rt
+
+import sh.sysl.gc
+import sysl.buf.{Buf, buf, Frozen}
+import sysl.raw.ptr_cast
+import sysl.slices.as_ptr
+import sysl.text.from_utf8_unchecked
+import sysl.threads.SleepLock
+
+// Avin functions handed to Sysl. A binding's shim makes a Sysl closure of each one it passes: the
+// closure holds a `Callback`, which keeps the Avin function value a root of every collection for as
+// long as Sysl keeps the closure, and gives it back when Sysl drops it. A call of the closure finds
+// the context of the thread making it, checks that the thread may run the function, makes the
+// thread's context running if it was in a blocking call, and runs the function's code there.
+
+/** The context of the thread running, or null on a thread the runtime has not attached: each thread
+ * that runs compiled code sets it when it begins and clears it when it detaches. */
+@thread_local var current_context: *Context = null
+
+/** The Avin function values Sysl holds, each a root of every collection: a slot per callback held,
+ * null where none is. Freed slots are reused, and both are touched only under `pins_lock`, which no
+ * thread holds while it may stop for a collection. */
+private var pinned: Buf[*u8] = buf()
+private var free_slots: Buf[usize] = buf()
+private var held_count: usize = 0
+private var pins_lock: SleepLock = SleepLock.new()
+
+/** An Avin function value a Sysl closure holds: its object, rooted in slot `slot`, the owner of the
+ * code that gave it, whether any thread may call it, the layouts its arguments and result are
+ * converted by, and the binding it was given to, which a trap names. */
+struct Callback
+    object: *u8
+    slot: usize
+    owner: u64
+    threaded: bool
+    layouts: &sync Frozen[*u8]
+    binding: &sync Frozen[u8]
+
+impl Drop for Callback
+    drop(self) = unpin(self.slot)
+
+/** Makes `object` a root of every collection and answers the callback holding it, for code owned by
+ * `ctx`'s owner: the `count` layouts at `layouts` are copied. */
+callback_pin(ctx: *Context, object: *u8, layouts: **u8, count: usize, binding: string) -> &Callback = Callback(object, pin(object), ctx.owner, false, copied(layouts, count), name_of(binding))
+
+/** A callback any thread may call, as `callback_pin` makes one for the code that gave it. */
+callback_pin_threaded(ctx: *Context, object: *u8, layouts: **u8, count: usize, binding: string) -> &sync Callback = Callback(object, pin(object), ctx.owner, true, copied(layouts, count), name_of(binding))
+
+private copied(layouts: **u8, count: usize) -> &sync Frozen[*u8]
+    var own: Buf[*u8] = buf()
+    for i in 0..<count
+        own.push(layouts[i])
+    own.freeze()
+
+private name_of(binding: string) -> &sync Frozen[u8]
+    var own: Buf[u8] = buf()
+    for b in binding.bytes
+        own.push(b)
+    own.freeze()
+
+private binding_name(cb: *Callback) -> string = from_utf8_unchecked(cb.binding.view())
+
+private pin(object: *u8) -> usize
+    pins_lock.lock()
+    held_count += 1
+    val slot = free_slots.pop() match
+        Some(s) ->
+            pinned[s] = object
+            s
+        None ->
+            pinned.push(object)
+            pinned.len() - 1
+    pins_lock.unlock()
+    slot
+
+private unpin(slot: usize)
+    pins_lock.lock()
+    pinned[slot] = null
+    free_slots.push(slot)
+    held_count -= 1
+    pins_lock.unlock()
+
+/** Marks every pinned function value. The collector calls it with every attached thread stopped. */
+mark_pinned(h: *gc.Heap)
+    pins_lock.lock()
+    for p in pinned
+        if p != null then gc.mark(h, p)
+    pins_lock.unlock()
+
+/** How many Avin functions Sysl holds as callbacks now. */
+callbacks_held() -> long
+    pins_lock.lock()
+    val n = held_count
+    pins_lock.unlock()
+    long(n)
+
+/** The layouts of `cb`'s conversions, in the order the shim numbers them. */
+callback_layouts(cb: *Callback) -> **u8 = ptr_cast(as_ptr(cb.layouts.view()))
+
+/** A call of a callback in progress: the context it runs with, whether that context was safe for
+ * the collector when the call began, the place the program last entered the library, and whether
+ * the thread was attached for this call alone. */
+struct Entered
+    ctx: *Context
+    was_safe: bool
+    caller: *TrapSite
+    attached: bool
+
+/** Begins a call of `cb` on the calling thread. A thread the runtime knows runs it with its own
+ * context, made running first where the thread is inside a blocking call. A thread it does not know
+ * is attached for the call where any thread may run the callback; otherwise the program stops. A
+ * callback no thread but its giver's may run stops the program where other code calls it. */
+callback_enter(cb: *Callback) -> Entered
+    var c = current_context
+    var attached = false
+    if c == null
+        if !cb.threaded then stop_foreign("the callback given to `" + binding_name(cb) + "` was called by a thread the program did not start; mark the parameter `@threaded` where Sysl may call it from any thread")
+        c = thread_attach()
+        install_stack_guard()
+        attached = true
+    val was_safe = !attached && c.state.load() == Safe
+    if was_safe then leave_safe(c)
+    if !cb.threaded && c.owner != cb.owner then stop_in_binding(c, "the callback given to `" + binding_name(cb) + "` belongs to another thread")
+    Entered(c, was_safe, c.caller, attached)
+
+/** Ends the call `e` began: the context is as it was before it. */
+callback_leave(e: Entered)
+    e.ctx.caller = e.caller
+    if e.attached
+        remove_stack_guard()
+        thread_detach(e.ctx)
+    elif e.was_safe then enter_safe(e.ctx)
+
+// Stops the program from a thread with no context: only the first thread to stop it reports.
+private stop_foreign(reason: string) -> never
+    begin_stop_foreign()
+    flush()
+    eprints("avin: trap: " + reason + "\n")
+    trap()

@@ -465,8 +465,69 @@ generates one shim per instantiation the program uses.
 
 ## Callbacks
 
-Passing an Avin function to Sysl is deferred. It needs a rooted handle and a generated trampoline,
-and will be specified when a library needs it.
+A binding's parameter may take a **function**. Sysl is handed a closure the shim makes of it, so a
+Sysl function taking a `&Fn(A) -> B`, a `&sync Fn(A) -> B` or a bare `A -> B` takes any Avin function
+of the matching type: a lambda, a closure capturing locals or objects, a method value, a local or a
+top-level function, a function value held in a variable.
+
+```text
+@sysl("ui.widgets.on_click")
+onClick(button: Button, handler: (Point) -> unit)
+
+@sysl("ui.app.run_every", blocking)
+runEvery(ms: long, @threaded tick: () -> bool)
+```
+
+- **The callback's parameters cross out of Sysl and its result into Sysl**, as a binding's result
+  and parameters do: any boundary type, a handle included. An integer Sysl calls it with in a wider
+  type is [checked](#integer-results), stopping the program where the binding Sysl is running in
+  was called. A function is not a callback's parameter or result, and a binding does not return
+  one. A type that does not fit the closure Sysl takes is reported at the binding in Sysl's words:
+
+  ```text
+  error: the Sysl binding `wrongParameter` does not match `avintest.callbacks.apply`: the function's parameter 1 is string, but Sysl calls it with int
+  ```
+
+- **Sysl keeps the function alive for as long as it holds the closure.** The closure holds a root of
+  the collector, made when the binding is called, so a callback Sysl stores and calls later runs
+  even after the Avin code that gave it has let go of it. When Sysl drops the closure, its last
+  counted reference, the root goes with it, and the function is collected like any other object.
+  A closure Sysl only calls during the binding is dropped when the binding returns. Each call of a
+  binding makes a closure of its own: the same function passed twice is held twice.
+- **A call runs on the thread that makes it**, with that thread's context: the program's arguments
+  and results never move between threads. Calls nest to any depth, Avin calling Sysl calling Avin,
+  and a callback may call bindings, blocking ones included. A callback Sysl calls while its thread
+  waits in a [blocking call](#calls-that-wait) makes the thread running for the call, so it may
+  allocate and collect, and safe again after. A Sysl call that waits for another thread to call a
+  callback is declared `blocking`: otherwise that thread's first collection waits for the waiting
+  one, which never comes.
+- **A callback belongs to the code that gave it**, as a [handle](#handles) does: one called by any
+  other — another thread, a task on the futures' pool, a thread Sysl started — stops the program,
+  before any of the function runs:
+
+  ```text
+  avin: trap: the callback given to `keep` belongs to another thread at main.avin:15:25
+  ```
+
+  The place is where the calling code entered Sysl; a thread Sysl started itself has no such place.
+- **A parameter marked `@threaded` takes a function any thread may call.** A thread Sysl started,
+  which the program never knew, is attached to the runtime for the call and detached after. The
+  function is checked where the binding is called: a top-level function, which captures nothing,
+  or a lambda, local function or method value whose every capture is a `val` or a parameter of a
+  [sendable](/spec/actors/#what-may-be-sent) type. A function value whose type does not say what it
+  captures is refused, as is a captured `var`, which the other thread would share; a binding with
+  a `@threaded` parameter is called by name, never used as a value, so no call escapes the check.
+  A Sysl parameter of type `&sync Fn` needs the mark, and Sysl's refusal says so:
+
+  ```text
+  error: the function passed to `f` of `share`, which Sysl may call from any thread, captures `count`, a `var`, which that thread would share with the code here; capture a `val` holding its value
+  error: the Sysl binding `shareUnmarked` does not match `avintest.callbacks.share`: Sysl may call the function it is given from another thread, so the parameter that takes it is marked `@threaded`
+  ```
+
+- **A trap inside a callback stops the program**, as any trap does, reported at its own place in
+  the callback's code, however deep in Sysl it was called.
+- `avin.rt.callbacks_held`, a function the runtime offers the library, answers how many functions
+  Sysl holds now.
 
 ## Relationship to C
 

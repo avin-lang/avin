@@ -97,6 +97,9 @@ emit_llvm(program: MirProgram) -> string
         emit_function(&out, &intrinsics, program, graph, plan_roots(program, graph, collects, i), i)
     for declaration in intrinsics
         out.push(declaration + "\n")
+    for b in program.bindings
+        for k in 0..<b.params.len()
+            if b.params[k].form is Callback(_, _, machine, answer, _) then emit_invoker(&out, callback_invoker(b.shim, k), machine, answer)
     out.push("\n")
     out.push("declare ptr @avin_rt_start(i32, ptr)\n")
     out.push("declare void @avin_rt_string_descriptor(ptr)\n")
@@ -652,6 +655,34 @@ private emit_descriptor(out: *StrBuilder, program: MirProgram, i: usize)
     if d.constant
         out.push(s"@avin.obj.$i.const = private constant { ptr, i64 } { ptr @avin.desc.$i, i64 0 }, align 16\n")
         constant_payload(out, s"@avin.obj.$i")
+
+/** The symbol of the entry a binding's shim calls a function value passed as its parameter `k`
+ * through. */
+callback_invoker(shim: string, k: usize) -> string = s"${shim}_cb$k"
+
+// The entry through which a binding's shim calls a function value Sysl was given, with the C
+// convention the shim calls with: the context, the closure, then its arguments, a bool as a byte. It
+// runs the closure's code, the word before its descriptor, and gives back what it answers.
+private emit_invoker(out: *StrBuilder, name: string, machine: Buf[MirType], answer: Option[MirType])
+    val result = answer match
+        Some(t) -> c_type(t)
+        None -> "void"
+    out.push(s"\ndefine $result @$name(ptr %ctx, ptr %f")
+    for i in 0..<machine.len()
+        out.push(s", ${c_type(machine[i])} %a$i")
+    out.push(s") {\nentry:\n  %h = getelementptr i8, ptr %f, i64 -$KindBack\n  %d = load ptr, ptr %h, align 8\n  %e = getelementptr inbounds i8, ptr %d, i64 -8\n  %code = load ptr, ptr %e, align 8\n")
+    var args = "ptr %ctx, ptr %f"
+    for i in 0..<machine.len()
+        if machine[i] is MBool
+            out.push(s"  %b$i = icmp ne i8 %a$i, 0\n")
+            args = args + s", i1 %b$i"
+        else args = args + s", ${llvm_type(machine[i])} %a$i"
+    answer match
+        Some(t) ->
+            out.push(s"  %r = call ${llvm_type(t)} %code($args)\n")
+            if t is MBool then out.push("  %rb = zext i1 %r to i8\n  ret i8 %rb\n}\n")
+            else out.push(s"  ret ${llvm_type(t)} %r\n}\n")
+        None -> out.push(s"  call void %code($args)\n  ret void\n}\n")
 
 /** The collector's `Kind` as a descriptor begins with it: the runtime's tracer, and no finalizer,
  * weak hook or ephemeron hook. A Sysl handle's kind has its finalizer. */
