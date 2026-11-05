@@ -373,6 +373,12 @@ still run there, on a worker started for them where none is left, so no future m
 stranded. The shared executor is never shut down: `isShutdown()` answers `false`, and
 `shutdown()` on it traps.
 
+**`ex.execute(task)`** runs a `@sendable` task on the executor's workers with no future of it, the
+way to give a pool work that queues itself again and again, as an [actor's](/spec/actors/#scheduling)
+turns do. The task runs as an owner of its own and nothing is handed to it: a Sysl handle it reaches
+that the giving code owns traps there, and one in transit is taken by its first use. Work given
+after `shutdown` still runs, as the functions of futures do.
+
 ```avin
 import avin.threads.{Executor, Future}
 
