@@ -935,7 +935,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
         sources.push(u.src)
     val views = solved_views(c.vars, c.views)
     val type_tests = solved_views(c.vars, c.type_tests)
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, init, c.builtins, c.conditional, c.core, c.bounds, tests, testing, views, type_tests)), references, overrides, completions)
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, init, c.builtins, c.conditional, c.core, c.bounds, tests, testing, views, type_tests, map())), references, overrides, completions)
 
 /** Each view with its unknowns solved, each distinct one once. */
 private solved_views(vars: Buf[Option[&Type]], views: Buf[TypeView]) -> Buf[TypeView]
@@ -5146,6 +5146,8 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
         if b.kind is Block(_, true) then result = Some(Unit)
     val intrinsic = intrinsic_of(c, unit, module_name, f)
     val binding = has_annotation(f, "sysl")
+    val c_binding = has_annotation(f, "c")
+    if c_binding then check_c_binding(c, unit, f, params, result, intrinsic is Some(_), binding, bodyless || receiver is Some(_))
     if binding then check_binding(c, unit, f, params, result, intrinsic is Some(_))
     elif f.body is Some(_) || f.clauses.len() > 0
         for p in f.params
@@ -5170,7 +5172,7 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
                     if !same_type(declared, expected)
                         c.note(unit, f.name_span, s"intrinsic `$name` has type ${type_name(expected)}, not ${type_name(declared)}")
                 None -> c.note(unit, f.name_span, s"`$name` is not an intrinsic")
-    elif f.body is None && f.clauses.len() == 0 && !bodyless && !binding
+    elif f.body is None && f.clauses.len() == 0 && !bodyless && !binding && !c_binding
         c.note(unit, f.name_span, s"`${f.name}` needs a body, or clauses on the lines after it")
     c.generic = outer_generic
     FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf(), false, false, false, buf(), None, owner, type_params, None, false, true, "", None, false)
@@ -5231,7 +5233,7 @@ private declare_defaults(c: *Checker, id: usize)
 private intrinsic_of(c: *Checker, unit: usize, module_name: string, f: &Function) -> Option[string]
     var out: Option[string] = None
     for a in f.annotations
-        if a.name == "sysl" || a.name == "test" || a.name == "tailrec" || is_hook_annotation(a.name) then continue
+        if a.name == "sysl" || a.name == "c" || a.name == "test" || a.name == "tailrec" || is_hook_annotation(a.name) then continue
         if a.name == "sendable_result"
             if !in_standard_library(module_name) then c.note(unit, a.span, "`@sendable_result` is the standard library's promise about a method it defines, which nothing checks against the method's body; a function outside it returns a value of a sendable type or a `@sendable` function")
             elif a.args.len() > 0 || f.body is None then c.note(unit, a.span, "`@sendable_result` takes no arguments and marks a function with a body")
@@ -6902,6 +6904,61 @@ private check_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Type]
             c.note(unit, f.name_span, "generic Sysl bindings are not implemented")
             continue
         check_crossings(c, unit, f, params, 0, result)
+
+// A C binding is a top-level function without a body whose `@c("<prototype>")` copies the C
+// function's prototype from the library's header. Its parameters correspond to the prototype's by
+// position, and each, and the result, crosses by the rules of `c_crossing_problem`. Whether the
+// prototype is the header's is the C unit's question, asked when the program is built.
+private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Type], result: Option[&Type], intrinsic: bool, sysl: bool, method: bool)
+    var seen = false
+    for a in f.annotations
+        if a.name != "c" then continue
+        if seen
+            c.note(unit, a.span, "a C binding has one `@c`")
+            continue
+        seen = true
+        if intrinsic then c.note(unit, a.span, "a function is an intrinsic or a C binding, not both")
+        if sysl then c.note(unit, a.span, "a function is a Sysl binding or a C binding, not both")
+        if f.body is Some(_) || f.clauses.len() > 0 then c.note(unit, a.span, "a C binding has no body: the C function its prototype names is its body")
+        if method
+            c.note(unit, a.span, "`@c` binds a top-level function; methods of C handles are not implemented")
+            continue
+        if f.type_params.len() > 0
+            c.note(unit, f.name_span, "a C binding is not generic: the C function has one signature")
+            continue
+        var text: Option[string] = None
+        if a.args.len() == 1 && a.args[0].name is None
+            if a.args[0].value.kind is StringLit(t) then text = Some(t)
+        val written = text match
+            Some(t) -> t
+            None ->
+                c.note(unit, a.span, "`@c` takes the C function's prototype as one string, as the header writes it: `@c(\"int abs(int)\")`")
+                continue
+        val p = parse_prototype(written) match
+            Ok(p) -> p
+            Err(why) ->
+                c.note(unit, a.args[0].value.span, s"`@c` takes the C function's prototype as the header writes it, as in `@c(\"int abs(int)\")`, and this one is not: $why")
+                continue
+        if p.params.len() != params.len()
+            c.note(unit, f.name_span, s"the C binding `${f.name}` has ${count(params.len(), "parameter")} and its prototype ${count(p.params.len(), "parameter")}: they correspond by position")
+            continue
+        for i in 0..<params.len()
+            val decl = f.params[i]
+            val t = params[i]
+            if *t is ErrorType then continue
+            if decl.by_name
+                c.note(unit, decl.pattern.span, "a by-name parameter cannot cross a C binding")
+                continue
+            if decl.variadic
+                c.note(unit, decl.pattern.span, "a repeated parameter cannot cross a C binding")
+                continue
+            val problem = c_crossing_problem(p.params[i].ty, t, false)
+            if problem != "" then c.note(unit, decl.ty.span, s"parameter ${i + 1} of the C binding `${f.name}` is `${type_name(t)}` in Avin and `${p.params[i].text}` in C: $problem")
+        val r = result.unwrap_or(Unit)
+        if !(*r is ErrorType)
+            val problem = c_crossing_problem(p.result, r, true)
+            val at = if f.result is Some(t) then t.span else f.name_span
+            if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(r)}` in Avin and `${p.result_text}` in C: $problem")
 
 // A binding's parameters, from `first` on, cross into Sysl, and its result out of Sysl.
 private check_crossings(c: *Checker, unit: usize, f: &Function, params: Buf[&Type], first: usize, result: Option[&Type])

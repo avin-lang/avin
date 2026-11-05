@@ -21,6 +21,9 @@ struct Toolchain
     clang: string
     /** The Sysl compiler, which builds the runtime and the shims of Sysl bindings. */
     sysl: string
+    /** What answers for the C libraries' `pkg-config` modules: `pkg-config` itself, or the one a
+     * build for another machine asks. */
+    pkg_config: string
 
     library_dir(self) -> string = self.root + "/library"
     prelude_path(self) -> string = self.root + "/library/avin/prelude.avin"
@@ -32,6 +35,8 @@ struct Toolchain
     runtime_cache(self) -> string = self.cache + "/runtime"
     /** Where the archives of the runtime with a program's binding shims are kept, by key. */
     shim_cache(self) -> string = self.cache + "/shims"
+    /** Where the objects of programs' C units are kept, by key. */
+    c_unit_cache(self) -> string = self.cache + "/cunit"
 end Toolchain
 
 /** A toolchain rooted at `root`, if `root` holds the library and the runtime, building into the
@@ -41,7 +46,7 @@ toolchain_at(root: string) -> Option[Toolchain] = toolchain_in(root, toolchain_c
 /** A toolchain rooted at `root` that builds into `cache`, if `root` holds the library and the
  * runtime. */
 toolchain_in(root: string, cache: string) -> Option[Toolchain]
-    val tc = Toolchain(root, cache, "clang", "sysl")
+    val tc = Toolchain(root, cache, "clang", "sysl", "pkg-config")
     if exists(tc.prelude_path()) && is_dir(tc.runtime_dir()) then Some(tc) else None
 
 /** Where this compiler keeps what it builds from a toolchain: `named` (`AVIN_CACHE`) when it is set,
@@ -87,6 +92,9 @@ struct Compilation
     archive: Option[string]
     /** The program's tests, in the order they are declared. */
     tests: Buf[TestEntry]
+    /** What the link adds for the program's C libraries: its C unit's object, when it has C
+     * bindings, then the libraries' link flags. */
+    c_link: Buf[string]
 
 /** A test a program holds: its name, and the file and line of its `@test` function; what its
  * annotation says about running it; and the names of its module's hooks, empty for one the module
@@ -117,11 +125,13 @@ struct ProgramFile
     dependency: bool
     /** The imports the file may not make, which its package's features gate. */
     fences: Buf[Fence]
+    /** The name of the package the file belongs to, or "" in a program with no manifest. */
+    package: string
 
 /** A program of one file. */
 single_file(src: Source) -> Buf[ProgramFile]
     var files: Buf[ProgramFile] = buf()
-    files.push(ProgramFile(src, None, false, buf()))
+    files.push(ProgramFile(src, None, false, buf(), ""))
     files
 
 /** The files of the program rooted at the directory `root`: every `.avin` and `.lavin` file under it, in order of
@@ -174,7 +184,7 @@ private collect_files(root: string, rel: string, module_name: string, dependency
         elif is_source_name(name)
             if dependency && rel == "" then continue
             val text = read_text(full).map_err(e -> s"$full: ${e.to_string()}")?
-            val file = ProgramFile(source_of(full, text), Some(module_name), dependency, buf())
+            val file = ProgramFile(source_of(full, text), Some(module_name), dependency, buf(), "")
             if rel == "" then root_files.push(file) else modules.push(file)
     Ok(())
 
@@ -183,27 +193,27 @@ compile(tc: Toolchain, src: Source) -> Compilation = compile_files(tc, single_fi
 
 /** Compiles a program to LLVM IR against the toolchain's library, and builds the shims of its Sysl
  * bindings, so a binding Sysl rejects is reported as the program's error. */
-compile_files(tc: Toolchain, files: Buf[ProgramFile]) -> Compilation = compile_program(tc, files, false, buf())
+compile_files(tc: Toolchain, files: Buf[ProgramFile]) -> Compilation = compile_program(tc, files, false, buf(), buf())
 
 /** Compiles a program as `compile_files` does, its bindings reaching the Sysl packages `sysl` as well
- * as Sysl's standard library; with `testing`, into a program that runs one of its tests in each
- * process rather than `main`, which it then need not have. */
-compile_program(tc: Toolchain, files: Buf[ProgramFile], testing: bool, sysl: Buf[SyslPackage]) -> Compilation
-    val lowered = lower_units(tc, files, testing) match
+ * as Sysl's standard library and its C bindings the C libraries `c`; with `testing`, into a program
+ * that runs one of its tests in each process rather than `main`, which it then need not have. */
+compile_program(tc: Toolchain, files: Buf[ProgramFile], testing: bool, sysl: Buf[SyslPackage], c: Buf[CLibrary]) -> Compilation
+    val lowered = lower_units(tc, files, testing, c) match
         Ok(l) -> l
-        Err(diagnostics) -> return Compilation(diagnostics, None, None, buf())
+        Err(diagnostics) -> return Compilation(diagnostics, None, None, buf(), buf())
     var archive: Option[string] = None
     if lowered.program.bindings.len() > 0 || lowered.program.handles.len() > 0
         ensure_shims(tc, lowered.program.bindings, lowered.program.handles, lowered.units, sysl) match
             Ok(a) -> archive = Some(a)
-            Err(diagnostics) -> return Compilation(diagnostics, None, None, buf())
-    Compilation("", Some(emit_llvm(lowered.program)), archive, lowered.tests)
+            Err(diagnostics) -> return Compilation(diagnostics, None, None, buf(), buf())
+    Compilation("", Some(emit_llvm(lowered.program)), archive, lowered.tests, lowered.c_link)
 
 /** Compiles a program of one file as far as MIR, or renders its diagnostics. */
 lower_source(tc: Toolchain, src: Source) -> Result[MirProgram, string] = lower_files(tc, single_file(src))
 
 /** Compiles a program as far as MIR against the toolchain's library, or renders its diagnostics. */
-lower_files(tc: Toolchain, files: Buf[ProgramFile]) -> Result[MirProgram, string] = lower_units(tc, files, false) match
+lower_files(tc: Toolchain, files: Buf[ProgramFile]) -> Result[MirProgram, string] = lower_units(tc, files, false, buf()) match
     Ok(lowered) -> Ok(lowered.program)
     Err(diagnostics) -> Err(diagnostics)
 
@@ -212,6 +222,7 @@ private struct Lowered
     program: MirProgram
     units: Buf[SourceUnit]
     tests: Buf[TestEntry]
+    c_link: Buf[string]
 
 /** A file of the standard library, found before it is read: its path and the module its directory
  * names. */
@@ -437,8 +448,9 @@ private modules_under(modules: Map[string, bool], prefix: string) -> string
     out
 
 // The library's modules a compilation reads are the prelude and those imported, and every module in
-// it is the core library's, `avin` or under it; the program's own modules may not be.
-private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool) -> Result[Lowered, string]
+// it is the core library's, `avin` or under it; the program's own modules may not be. A program's
+// C unit is built between checking and lowering, which converts at the widths it measured.
+private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool, c: Buf[CLibrary]) -> Result[Lowered, string]
     val loaded = load_units(tc.library_dir(), files, false, src -> src).map_err(message -> s"avin: $message\n")?
     val units = loaded.units
     val root_module = loaded.root_module
@@ -467,7 +479,13 @@ private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool) -> Re
                 val f = program.symbols[t.symbol]
                 val src = program.sources[f.unit]
                 tests.push(TestEntry(t.name, src.name, src.locate(f.decl.name_span.start).line, t.module_name, t.should_trap, t.ignore, t.timeout, hook_name(program, t.setup), hook_name(program, t.teardown), hook_name(program, t.setup_all), hook_name(program, t.teardown_all)))
-            Ok(Lowered(lower_program(program), checked.units, tests))
+            val c_unit = ensure_c_unit(tc, c_unit_bindings(program, files, loaded.library), c, program.sources)?
+            program.c_measures = c_unit.measures
+            var c_link: Buf[string] = buf()
+            if c_unit.object is Some(o) then c_link.push(o)
+            for flag in c_unit.link
+                c_link.push(flag)
+            Ok(Lowered(lower_program(program), checked.units, tests, c_link))
         None -> Err("avin: checking produced no program\n")
 
 // The name of a test hook, or "" for none.
@@ -534,9 +552,10 @@ runtime_key(tc: Toolchain) -> string = content_key("avin " + Version + "\n" + ru
 
 /** Links LLVM IR with the runtime into an executable at `output`: with `shims`, the runtime with a
  * program's binding shims, when there is one, together with the C libraries its Sysl packages need,
- * and otherwise the runtime's own archive. The executable is written under a temporary name and
- * published by rename, so a failed link leaves any previous output in place. */
-link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimization: string) -> Result[unit, string]
+ * and otherwise the runtime's own archive; then `c_link`, the program's C unit and the flags of its
+ * C libraries. The executable is written under a temporary name and published by rename, so a failed
+ * link leaves any previous output in place. */
+link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimization: string, c_link: Buf[string]) -> Result[unit, string]
     var libraries: Buf[string] = buf()
     val archive = shims match
         Some(a) ->
@@ -555,6 +574,8 @@ link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimiz
     var args: Buf[string] = buf()
     for a in ["-x", "ir", optimization, "-Wno-override-module", ir, "-x", "none", archive]
         args.push(a)
+    for flag in c_link
+        args.push(flag)
     for flag in libraries
         args.push(flag)
     for a in ["-lm", "-o", pending]

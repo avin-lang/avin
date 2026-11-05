@@ -2891,7 +2891,7 @@ their words are reserved.
     replace a frame's image on the next call, so validity is "until the owner changes", and the owner
     check catches every use after that. *Alternatives*: views valid only inside a block
     (`frame.withImage { … }`), which forbids keeping one at all; copy only, which costs a copy per
-    frame. **Review with the user**: whether writable views are wanted for producing frames.
+    frame. Writable views are proposed below, from the Cairo survey.
   - **Callbacks**: one C-convention trampoline per function type, the closure found through the
     `userdata`, the runtime's Sysl-callback record and `callback_enter` reused; `keeps:` holds a
     registered callback on its handle, whose `forget:` unregisters each before `release`; a
@@ -2913,6 +2913,217 @@ their words are reserved.
     parser additions (`val` with no initializer for `@c(const:)`, list-valued annotation
     arguments); and a missing `@threaded` on a callback C calls from its own thread being caught
     only by a trap at run time.
+
+- Settled on the user's delegation 2026-11-05 (built on branch `c-bindings-scalars`): **C bindings of scalars** (stage 13 step 1), the choices
+  building it made where the chapter is silent.
+  - **A typedef's kind is decided by the Avin type and checked by the C unit** with
+    `__builtin_classify_type`: an integer type for an integer, an integer one byte wide (of either
+    sign, as a C `char` is) for `byte`, `bool` for `bool`, a floating-point type for `real`, its
+    width measured to choose `float` or `double`. *Why*: the checker cannot see the header, and the
+    Avin type says what the binding means. *Alternatives*: a kind written in the prototype; measuring
+    every typedef's kind and refusing in the driver, which needs an expression valid for any type
+    and C has none.
+  - **`unsigned char` crosses as `byte` or as an integer type, `char` (and a `char` typedef) only
+    as `byte`, `signed char` only as an integer type.** *Why*: the table lists `unsigned char` in
+    both rows and `char` only as a byte. *Alternative*: `char` as an integer at its measured sign,
+    which makes a program's meaning depend on the machine.
+  - **An argument's trap names the C type, `value out of range for u64 (size_t)`; a result's names
+    the Avin type, `value out of range for long`**, as a Sysl binding's do. *Alternative*: naming
+    both types in both directions.
+  - **A result the binding declares `unit` is declared `void` in the IR**, so a discarded pointer or
+    integer needs no measurement; a struct result is refused even then, since it may be returned
+    through memory. *Alternative*: declaring the measured type and ignoring the value.
+  - **The measurements are found by a marker in the object's bytes**, one table of two bytes per
+    type (width, sign), rather than by its symbol, so no object format (Mach-O, ELF, COFF) is parsed.
+    *Alternative*: reading the symbol table, a reader per format.
+  - **The mismatch diagnostic takes its two types from a pointer of the prototype's type set to
+    the header's function**, whose clang diagnostic keeps the typedefs' names, and the header from
+    the note of a redeclaration as the prototype says it; the `_Static_assert` stays the check, so a
+    clang that only warns on the pointer still refuses the binding. *Alternative*: the assertion's
+    own text, which clang writes with every typedef expanded.
+  - **The toolchain names the `pkg-config` it asks** (`Toolchain.pkg_config`), so a build for
+    another machine can ask that machine's, and the corpus asks one that also finds the C fixture in
+    `tests/c`, which it builds. *Alternatives*: the environment's `PKG_CONFIG_PATH`, which a test
+    cannot set for the compiler it runs in its own process; a package-relative `.pc` path in the
+    manifest, which the chapter does not have. **Review with the user**: whether `avin` should read
+    `PKG_CONFIG` as autotools does.
+  - **A function a header declares `static inline` is not caught by the header check**: C lets the
+    unit's redeclaration inherit the internal linkage, so the binding fails at the link, where the
+    linker names the missing symbol. *Alternative*: reading the C unit's symbol table for a local
+    definition, a reader per object format.
+
+- Settled on the user's delegation 2026-11-05 (built on branch `cairo-survey`): **C bindings, from the Cairo survey** ([chapter](/spec/c-bindings/)). The user asked for `avin-lang/cairo`, Cairo 1.18 bound over the C bindings beside
+  `avin-lang/mlt`, ported from the reference binding's surface. Mapping it onto the chapter found these
+  lacks; each is the smallest addition that covers it:
+  - **An integer bound as `bool`** is `false` for zero, `true` otherwise; a `bool` passes `0`/`1`.
+    *Why*: `cairo_bool_t` is an `int`, and so is every pre-C99 library's truth value. *Alternatives*:
+    binding it as `int` and comparing in Avin at every call site; a `truth` marker word in the
+    prototype, which says what the Avin type already does.
+  - **A status that is a C enum binds as `Result[unit, E]`** with `E` its mirror: `Ok` for the zero
+    enumerator, `Err(variant)` otherwise; the mirror keeps its zero variant, which a callback answers.
+    *Why*: Cairo's `cairo_status_t` is the error type itself, and mapping an `int` back to it by hand
+    repeats the enum. *Alternatives*: `Result[unit, int]` and a mapping function; requiring the mirror
+    to omit its zero variant, which a callback answering `Success` could not then name.
+  - **Latched errors need nothing new**: the status query is an ordinary binding, and the library
+    asks it after constructors, before output (`writePng`, `finish`, the PNG stream) and on request,
+    answering `Result[_, CairoError]` there and `unit` from the drawing calls. *Why*: Cairo latches
+    errors on the object and makes every later call a no-op, so the next query sees every failure.
+    *Alternatives*: a per-class `status:` expression the compiler checks after every call, trapping
+    or answering `Result` from all ~150 drawing calls, which costs a call each and makes every line of
+    drawing code carry a `?`; trapping on any latched error, which turns a bad PNG file into a crash.
+    **Review with the user**: whether drawing calls should trap on a latched error in a debug build.
+  - **`attach:` ties what a handle keeps to the C object's lifetime**, through the library's
+    destroy notification (`cairo_surface_set_user_data`, `mlt_properties_set_data`): the kept
+    objects move to a pinned runtime record that C's `destroy` releases; `key:` names the static key
+    type the C unit defines per class. *Why*: Cairo contexts and surface patterns reference their
+    surface, so the Avin `Surface` can be collected while C still draws into the `ByteBlock` (or font
+    file) it was made over — a use after free that `keeps:` on the handle does not prevent. The same
+    gap reaches MLT wherever a C object that keeps a pointer (a producer keeping its profile) is held
+    by another C object (a playlist) after its Avin handle is collected. *Alternatives*: keeping the
+    kept objects for the rest of the program, a leak per surface; refusing `keeps:` on handles C can
+    reference, which refuses `create_for_data`; making the library hold every surface in an Avin
+    table. **Review with the user**: whether the MLT `keeps:` bindings should move to `attach:` too.
+  - **Field accessors take expressions and bounded indices**: `field:` a C lvalue in `self` and the
+    accessor's parameters, `bound:` the C expression an index is checked below; an index with no bound
+    is refused. *Why*: `cairo_path_t` is a C-owned array of a union, which no mirror may hold, and
+    reading it element by element through glue keeps the union out of Avin. *Alternatives*: an
+    opaque value per element, which needs by-value glue for every read; a package-carried C file
+    flattening the path into doubles, the trusted escape hatch proposed above, wider than one line.
+  - **`Option` of a mirror for a nullable `const T *`.** *Why*: `cairo_recording_surface_create`
+    takes null for unbounded extents. *Alternative*: two bindings, one passing a sentinel struct.
+  - **Upper-case enumerators match an upper-case prefix** (`CAIRO_FORMAT_` → `Argb32`). *Why*:
+    most C libraries write enumerators in upper case. *Alternative*: `@c("name")` on every variant.
+  - **String and `real` constants**: `@c(const:)` reads a string literal's bytes as a measurement,
+    checked as UTF-8. *Why*: Cairo's tag names (`CAIRO_TAG_DEST`) are string macros. *Alternative*:
+    copying the literals into Avin, which drifts if the header changes them.
+  - **Arrays of mirrors** go to `const T *` converted into C memory for the call; **arrays C
+    allocates** are copied out with `array:`, `length:` and `free:` (generalizing `bytes:`). *Why*:
+    Cairo's glyph arrays, in (`cairo_show_glyphs`) and out (`cairo_scaled_font_text_to_glyphs`).
+    *Alternatives*: a handle on `cairo_glyph_allocate`'s array with indexed writers, a C-shaped API
+    in Avin code; writing a converted array back for non-`const` pointers, which no Cairo call needs.
+  - **`view` on the result, and writable views**: a bare `view` names the C result as the memory;
+    `writable` answers an `avin.c.MutByteView` (a `ByteView` with `update`, `fill`, `write`),
+    closed by the owner's next use like any view. *Why*: Cairo's pixel access is
+    `cairo_image_surface_get_data`'s result, and the reference program writes pixels and calls
+    `mark_dirty`, which, being a use, closes the view so a write after it traps. *Alternatives*:
+    copy out, edit, copy back with `create_for_data` (a full copy per edit); a block-scoped
+    `withPixels { … }`, which the chapter already weighed against for reading; one `ByteView` type
+    with a run-time writable flag, which moves a type error to run time. A `stable` marker for
+    owner methods that do not close views (Cairo's `get_width` after `get_data`) was weighed and left
+    out: the library reads those first.
+  - **`avin.c.ByteBlock`, memory Avin gives C**: fixed-length, zeroed, outside the collected heap,
+    never copied at a call, read and written like a `MutByteView`, freed when collected, kept by C
+    through `keeps:` (and `attach:`). *Why*: `cairo_image_surface_create_for_data` keeps the pointer
+    and writes into it for the surface's life, which neither a copied array nor a heap array (moved
+    out of the heap for `blocking` calls) can be. *Alternatives*: pinning an `Array[byte]` in the
+    collector, which pins the collector's design to non-moving arrays; leaving `create_for_data`
+    unbound (the reference program uses it).
+  - **Memory lent to a callback is a view** closed when it returns, `const` a `ByteView`, otherwise a
+    `MutByteView`, its length from a `length(p)` beside it; a function-pointer typedef is written out
+    in the prototype. *Why*: Cairo's PNG write and read streams pass `(closure, data, length)`.
+    *Alternatives*: a copied `Array[byte]` per chunk (fine for writing, impossible for reading, where
+    the callback must fill C's buffer).
+  - **Steps 8 and 9 of stage 13 swap**: buffers before callbacks, so callbacks can take views.
+    *Why*: the PNG stream needs both, and neither MLT step needs the other. *Alternative*: callbacks
+    first with copied arrays, the read stream deferred.
+  - The survey's three questions, settled with it. **`attach:` for MLT**: only where C keeps
+    something Avin owns that C's own reference count does not cover (memory Avin gives C, a callback's
+    closure); MLT's playlists, tractors and services take their own reference to what they are given,
+    so a counted handle needs nothing more, and the MLT steps are audited for the other cases.
+    **Review with the user.** **No trap on a latched error in debug builds**: a program behaves the
+    same at every optimization level; the binding checks the status after constructors and before
+    output, as the chapter says. **A FreeType binding** (`avin-lang/freetype`) waits until Cairo's
+    font-face step needs it; the toy font API and the platform's own font backend come first.
+
+- Settled on the user's delegation 2026-11-05 (built on branch `freetype-design`): **C bindings, from the FreeType survey** ([chapter](/spec/c-bindings/)). The user: *"Yes we'll need a freetype binding to work with cairo."*
+  The user (2026-11-05): *"Yes we'll need a freetype binding to work with cairo."* A third stressor,
+  `avin-lang/freetype`, binds FreeType 2 (`pkg-config freetype2`) to the reference binding's surface,
+  and `avin-lang/cairo` depends on it for Cairo's FreeType font faces (`cairo-ft.h`). This replaces
+  the Cairo survey's "a FreeType binding waits until Cairo's font-face step needs it". Mapping the
+  reference surface onto the chapter found these lacks; each is the smallest addition that covers it:
+  - **A binding may name a handle class of another package** its package depends on: the prototype
+    names the class's own C type or an `as:` type; the class's glue is the declaring package's,
+    compiled once; the package's bindings are checked after the `headers`, and with the `pkg-config`
+    flags, of every package whose handle classes they name, in dependency order; ownership (lent,
+    `keeps:`, `consumes:`, `attach:`, owned and `borrowed` results) crosses unchanged. *Why*:
+    `cairo_ft_font_face_create_for_ft_face` takes FreeType's `FT_Face`, and a header of one library
+    need not include the other's (Cairo's happens to; most do not). *Alternatives*: a third package
+    holding only the shared handle class, which the reference binding needs only to break a
+    dependency cycle Avin does not have; Cairo declaring its own `FT_Face` handle, two handles with
+    two owners and two `release`s on one C object, a double free; trusting each library's header to
+    include the other's.
+  - **A header may be named by a macro**: an entry of `headers` that is a C identifier is emitted
+    as `#include NAME`, defined by an earlier entry, and a macro no earlier header defines is
+    reported at the entry. *Why*: FreeType documents its headers by macro (`#include <ft2build.h>`
+    then `#include FT_FREETYPE_H`), and Cairo's own `cairo-ft.h` includes it so. *Alternatives*:
+    naming the path the macro expands to (`<freetype/freetype.h>`), which the installed FreeType's
+    own `ft2build.h` shows and which needs nothing new, but writes into the manifest a layout that
+    FreeType's macros exist to keep its users out of; a `prelude` string of raw C lines in the manifest, wider than
+    one rule and the start of a C file in HOCON.
+  - **A kept handle whose class declares `retain` is held by a C reference**, taken through that
+    `retain` when the call succeeds and given back through its `release` after the holder's own
+    `release`. *Why*: the collector finalizes the unreachable in address order, so a `Face` and the
+    `Library` it keeps, dead in one collection, may be finalized library first; `FT_Done_FreeType`
+    frees every face still in it, and the face's `FT_Done_Face` then frees one twice. With the
+    reference, `FT_Done_FreeType` only drops a count. MLT's `Consumer` keeping its `Playlist`
+    (`keeps: "source"`) gains the same order. *Alternatives*: ordered finalization in the collector
+    (kept before keeper), which Avin cannot change and which the collector's address-order sweep
+    does not offer; holding the Avin object and taking the order on trust, a use after free whenever
+    a `release` touches what it keeps; making the library's `release` a no-op while faces exist, a
+    count in Avin of what C already counts.
+  - **`kept: "name: Class"` lets a holder's `release:`/`retain:` name what it keeps**, as that
+    handle's C pointer; the class is made only by bindings keeping exactly one handle of that class,
+    and an unused name is refused. *Why*: `FT_Done_MM_Var(library, master)` frees the variation
+    descriptor through a library the descriptor does not record; the face it came from publishes it
+    (`face->glyph->library`), and the C reference above keeps that face valid until after the
+    `release`. *Alternatives*: walking the descriptor into Avin data and freeing it inside one
+    binding, which needs a binding that copies a C struct holding arrays of structs (a larger
+    addition); a `release` taking a second argument from a per-handle C field the runtime stores,
+    the same thing with a less readable spelling; leaving the variation API unbound.
+  - **`keeps:` takes a list** (`keeps: ["library", "base"]`). *Why*: `FT_New_Memory_Face` keeps its
+    library and its memory. *Alternative*: repeating the key, which HOCON merges rather than lists.
+  - **`keeps:` naming an array parameter is refused**, since its C copy lives for the call; memory C
+    keeps is a `ByteBlock`. *Why*: `FT_New_Memory_Face` reads its buffer lazily for the face's
+    life. *Alternative*: pinning the array, which the `ByteBlock` decision already weighed against.
+  - **`length(p)` may mark an `inout` pointer to an integer**: the array's length is written in, C's
+    answer is part of the result, checked to be no more than the length; `None` for an `Option` of
+    the array passes null and zero. *Why*: `FT_Load_Sfnt_Table` takes `FT_ULong *length`, and is
+    called once with no buffer to learn a table's size, then again to fill one. *Alternatives*: an
+    `inout` length the caller passes, which lets the length and the array disagree (a read past the
+    end); a `ByteBlock` sized by a first call, the same disagreement.
+  - **A field accessor may answer a `view`** of a byte-pointer field, `length:` a C expression in
+    `self`. *Why*: the glyph bitmap is `face->glyph->bitmap.buffer`, `|pitch| * rows` bytes the next
+    load replaces; the view's closing on the face's next use is exactly FreeType's rule.
+    *Alternatives*: `bytes:` on a field, a copy of every glyph before the library walks it, which the
+    library could still choose; a glue function per field answering the pointer, the same with more
+    C. The view's bounds check catches the reference binding's `row * pitch` indexing, which reads
+    before the buffer when `pitch` is negative.
+  - **Cairo's FreeType font face is an `attach:` class keeping the `Face`.** Cairo keeps the
+    `FT_Face` without a reference, documents that it must outlive every font face made from it, and
+    asks for it to be given back from `cairo_font_face_set_user_data`'s destructor; contexts and
+    scaled fonts reference the font face, so `keeps:` on the Avin handle is not enough. The destroy
+    unpins the record and the `Face` is then finalized as usual. *Alternative*: a destroy that calls
+    `FT_Done_Face` itself, from whatever thread drops the last reference, while an Avin `Face` may
+    still be in use: FreeType's face count is not atomic.
+  - **`FT_Error_String` binds as `Option[string]`**, and the library carries its own names for the
+    codes, as `@c(const:)` values of `fterrors.h`'s `FT_Err_*`. *Why*: Homebrew's FreeType is built
+    without `FT_CONFIG_OPTION_ERROR_STRINGS`, so the function answers null there.
+  - **The test font is Kaisei Decol Regular**, from the reference repository, under the SIL Open
+    Font License 1.1 (Copyright 2020 The Kaisei Project Authors, no Reserved Font Name), bundled
+    with its `OFL.txt` in the package's tests. *Alternative*: a smaller OFL Latin font (4.4 MB is
+    large for a test fixture), at the cost of a font the reference program's output was not made
+    with. **Review with the user**: the fixture's size.
+  - Left out: `cairo_ft_font_options_substitute`, which takes a fontconfig `FcPattern *` and waits on
+    a fontconfig binding; `FT_Outline_Decompose` and the other callback APIs, which the reference
+    binding does not reach.
+  - The survey's two questions, settled with it. **The test font is a small OFL font**, not Kaisei
+    Decol Regular (OFL 1.1 and usable, but 4.4 MB): a Latin face of a few hundred kilobytes, its
+    licence file beside it in the package's tests, keeps the repository light, and the reference
+    binding's outputs that need Kaisei's glyphs are reproduced with the small face's instead.
+    **`cairo_ft_font_options_substitute` waits on a fontconfig binding**: it takes a fontconfig
+    pattern, and nothing else in `cairo` or `freetype` needs fontconfig. The macro-named headers and
+    `FT_Error_String`, which the survey placed in step 2, ride step 3, since step 2 was already being
+    built.
 
 **Deferred**
 

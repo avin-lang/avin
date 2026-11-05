@@ -3,7 +3,7 @@ module dev.avinlang.compiler
 
 import sh.sysl.parsing.{Source, source_of}
 import sysl.buf.{Buf, buf}
-import sysl.fs.{create, current_dir, entries, exists, is_dir, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.fs.{create, current_dir, entries, exists, is_dir, make_dir_all, make_temp_dir, read_text, remove_dir_all, set_permissions, write_text}
 import sysl.process.{Exited, FromPath, Signalled, Stdio, ToFile, Var, capture, run}
 import sysl.text.from_utf8_unchecked
 
@@ -141,6 +141,7 @@ private struct Case
     files: Buf[ProgramFile]
     text: string
     sysl: Buf[SyslPackage]
+    c: Buf[CLibrary]
     refused: string
 
 // A directory holding a manifest is a package, loaded with its dependencies and fetching none; its
@@ -151,18 +152,18 @@ private case_at(path: string) -> Case
         var text = ""
         for f in files
             text = text + expectation_text(f.src) + "\n"
-        if !exists(path + "/" + ManifestName) then return Case(files, text, buf(), "")
+        if !exists(path + "/" + ManifestName) then return Case(files, text, buf(), buf(), "")
         val fetching = default_fetching()
         return load_package(path, Fetching(fetching.cache, fetching.base, false)) match
-            Ok(p) -> Case(p.files, text, p.sysl, "")
-            Err(message) -> Case(files, text, buf(), message)
+            Ok(p) -> Case(p.files, text, p.sysl, p.c, "")
+            Err(message) -> Case(files, text, buf(), buf(), message)
     val src = source_of(path, read_text(path).unwrap_or(""))
-    Case(single_file(src), expectation_text(src), buf(), "")
+    Case(single_file(src), expectation_text(src), buf(), buf(), "")
 
 // Compiles a case as the command line would, or answers why its package could not be loaded.
 private compile_case(tc: Toolchain, program: Case) -> Compilation =
-    if program.refused != "" then Compilation(program.refused, None, None, buf())
-    else compile_program(tc, program.files, false, program.sysl)
+    if program.refused != "" then Compilation(program.refused, None, None, buf(), buf())
+    else compile_program(tc, program.files, false, program.sysl, program.c)
 
 // The lines a file's expectations are read from: its text, or a literate file's program, where its
 // expectation comments stand at the margin of the program rather than four columns in.
@@ -229,7 +230,7 @@ private run_case(tc: Toolchain, path: string, program: Case, want: Expectation, 
     var failures = ""
     for level in ["-O0", "-O2"]
         val binary = scratch + "/program" + level
-        link(tc, llvm, compiled.archive, binary, level) match
+        link(tc, llvm, compiled.archive, binary, level, compiled.c_link) match
             Err(message) ->
                 failures = failures + s"$path $level: did not link: $message\n"
                 continue
@@ -314,8 +315,25 @@ corpus_parts_cover()
 
 @test("every program of many modules in tests/programs/run builds, exits and prints as expected at -O0 and -O2")
 programs_run()
-    val tc = repository_toolchain()
+    val dir = make_temp_dir("avin-c-fixture").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = fixture_toolchain(repository_toolchain(), dir)
     finish("tests/programs/run", run_all(tc, program_cases(tc, "tests/programs/run")))
+
+/** The repository's toolchain, whose `pkg-config` also answers for `avin-c-fixture`: the C library in
+ * `tests/c` the C binding tests call, built into `dir` with a module file naming it there. */
+fixture_toolchain(tc: Toolchain, dir: string) -> Toolchain
+    val object = dir + "/avin_fixture.o"
+    val compiled = capture(tc.clang, ["-c", "-O1", tc.root + "/tests/c/avin_fixture.c", "-o", object], stderr = true, timeout = 120000).unwrap()
+    if !compiled.status.ok() then panic("the C fixture did not compile: " + compiled.err.unwrap_or("") + compiled.text)
+    val archived = capture("ar", ["rcs", dir + "/libavin_fixture.a", object], stderr = true, timeout = 60000).unwrap()
+    if !archived.status.ok() then panic("the C fixture was not archived: " + archived.err.unwrap_or("") + archived.text)
+    make_dir_all(dir + "/pkgconfig").unwrap()
+    write_text(dir + "/pkgconfig/avin-c-fixture.pc", "Name: avin-c-fixture\nDescription: the C library the C binding tests call\nVersion: 1.0.0\nCflags: -I" + tc.root + "/tests/c\nLibs: -L" + dir + " -lavin_fixture\n").unwrap()
+    val wrapper = dir + "/pkg-config"
+    write_text(wrapper, "#!/bin/sh\nPKG_CONFIG_PATH=\"" + dir + "/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}\" exec pkg-config \"$@\"\n").unwrap()
+    set_permissions(wrapper, 493u32).unwrap()
+    Toolchain(tc.root, tc.cache, tc.clang, tc.sysl, wrapper)
 
 @test("every example builds, exits and prints as its header says at -O0 and -O2")
 examples_run()
@@ -336,7 +354,7 @@ example_packages_build()
             failures = failures + path + ": did not compile:\n" + compiled.diagnostics
             continue
         for level in ["-O0", "-O2"]
-            link(tc, compiled.llvm.unwrap_or(""), compiled.archive, scratch + "/example" + level, level) match
+            link(tc, compiled.llvm.unwrap_or(""), compiled.archive, scratch + "/example" + level, level, compiled.c_link) match
                 Err(message) -> failures = failures + s"$path $level: did not link: $message\n"
                 Ok(_) -> ()
     if failures != "" then panic(failures)
@@ -348,7 +366,9 @@ corpus_rejects()
 
 @test("every program of many modules in tests/programs/reject fails to compile with the expected diagnostics")
 programs_reject()
-    val tc = repository_toolchain()
+    val dir = make_temp_dir("avin-c-fixture").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = fixture_toolchain(repository_toolchain(), dir)
     finish("tests/programs/reject", reject_all(tc, program_cases(tc, "tests/programs/reject")))
 
 // The core library's own tests are a program of `@test` functions in `library/tests`, which `avin test`
@@ -422,7 +442,7 @@ standard_input_spans_reads()
     if compiled.diagnostics != "" then panic(compiled.diagnostics)
     val dir = make_temp_dir("avin-corpus-long").unwrap()
     defer _ = remove_dir_all(dir)
-    link(tc, compiled.llvm.unwrap_or(""), compiled.archive, dir + "/long_lines", "-O2").unwrap()
+    link(tc, compiled.llvm.unwrap_or(""), compiled.archive, dir + "/long_lines", "-O2", compiled.c_link).unwrap()
     // One read takes 65536 bytes, so the first line's `\r` ends the first read and its `\n` begins the
     // second; the second line spans several reads.
     write_text(dir + "/input", "a".repeat(65535) + "\r\n" + "b".repeat(200000) + "\n" + "end").unwrap()
@@ -438,7 +458,7 @@ standard_error_keeps_order()
     if compiled.diagnostics != "" then panic(compiled.diagnostics)
     val dir = make_temp_dir("avin-corpus-order").unwrap()
     defer _ = remove_dir_all(dir)
-    link(tc, compiled.llvm.unwrap_or(""), compiled.archive, dir + "/ordered", "-O2").unwrap()
+    link(tc, compiled.llvm.unwrap_or(""), compiled.archive, dir + "/ordered", "-O2", compiled.c_link).unwrap()
     val both = create(dir + "/both.txt").unwrap()
     val ended = run(dir + "/ordered", stdout = ToFile(both), stderr = ToFile(both), stdin = FromPath("/dev/null"), timeout = 10000).unwrap()
     assert(ended.ok())
