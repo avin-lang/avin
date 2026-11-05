@@ -211,7 +211,8 @@ safepoint. A program with one thread never stops anything.
 
 ## Actors
 
-Actors (stage 12) are scheduled by the runtime onto a pool of these threads. An actor handles one
-message at a time, so its own state needs no lock; its mailbox is a runtime queue on the shared
-heap, and a message is a reference to a heap value. What an actor may send — any value, or only
-values no other actor can mutate — is part of the open question on actors.
+[Actors](/spec/actors/) are scheduled by the runtime onto a pool of these threads. An actor handles
+one message at a time, so its own state needs no lock; its mailbox is a runtime queue on the shared
+heap, and a message is a reference to a heap value. A message holds only values no other actor can
+change, or hands over the ownership of what it carries, and the compiler checks every message type
+for it ([what may be sent](/spec/actors/#what-may-be-sent)).

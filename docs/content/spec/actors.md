@@ -1,0 +1,384 @@
+---
+title: Actors and state machines
+summary: "`actor` and `machine` declarations: typed messages, what may be sent and how the compiler checks it, `tell` and `ask`, supervision of a trap, lifecycle and watching, scheduling on a pool, and states with transitions."
+weight: 27
+---
+
+Avin's way to thread safety is **no shared data where it can be avoided**. An actor owns its state
+outright, and the only way to reach that state is to send the actor a message. Messages carry
+immutable values, or hand over the ownership of something mutable, and never a reference that two
+actors could both change. The compiler checks every message type, so a program that compiles never
+shares mutable data through a message.
+
+The pieces fit together without special cases: an actor is declared like a class, its messages are a
+`data` type, receiving one is a `match`, a reply arrives as a [`Future`](/spec/threads/#futures), and
+an actor's behaviour, where it has distinct phases, is written as a state machine in the same body.
+Everything runs on the threads, executors and memory model of [`avin.threads`](/spec/threads/); the
+library is `avin.actors`.
+
+## Declaring an actor
+
+```text
+import avin.actors.{ActorRef, spawn}
+
+data CounterMsg
+    Increment(by: int)
+    Get(replyTo: ActorRef[int])
+    Reset
+
+actor Counter(start: int) receives CounterMsg
+    var count = start
+
+    receive
+        Increment(by) -> count += by
+        Get(replyTo) -> replyTo.tell(count)
+        Reset -> count = 0
+```
+
+- **`actor Name(params) receives M`** declares an actor whose messages are of type `M`, usually a
+  `data` type whose variants are the messages. An actor may be generic, `actor Cache[K: Hash +
+  Sendable, V: Sendable](limit: int) receives CacheMsg[K, V]`, and its parameters follow the rules
+  for a class's, with defaults and named arguments.
+- **The body is the actor's start.** Its fields and statements run once, on the actor's own
+  execution, before it handles any message: that is where its state is made. The parameters are its
+  immutable fields, as a class's plain parameters are.
+- **`receive` holds the arms** that handle a message: exactly a `match`'s arms over `M`, with
+  patterns, guards and block bodies, and checked for exhaustiveness in the same way. A message the
+  actor wants to ignore is handled by an arm that does nothing, `_ -> ()`, so ignoring one is always
+  written down. Each arm's value is discarded.
+- **Methods** in the body are the actor's own helpers, with the implicit receiver a class's methods
+  have. They are private: an actor has no members anyone else can call, since only its messages
+  reach it.
+- **`self` is the actor's reference**, an `ActorRef[M]`, which it hands out so others can reply to
+  it or send it more work. The object holding the actor's fields is never a value the program sees,
+  so no reference to an actor's state can escape the actor.
+
+`Counter(0)` does not start anything. It makes a **`Behaviour[CounterMsg]`**: an immutable value
+holding the declaration and its arguments, which `spawn` starts. Keeping the two apart lets the
+program say how a new actor is to be supervised and where it runs before it starts, and lets the
+runtime start the actor again from the same arguments after a failure ([Supervision](#supervision)).
+
+## Starting, telling and asking
+
+```text
+import avin.actors.{spawn, AskError}
+import avin.time
+
+main() -> int
+    val counter = spawn(Counter(10))
+    counter.tell(Increment(5))
+    counter tell Increment(2)
+    val answer = counter.ask(r -> Get(r), timeout = time.seconds(1)).await()
+    answer match
+        Ok(n) -> n
+        Err(_) -> 1
+```
+
+- **`spawn[M](behaviour: Behaviour[M], onFailure: Supervision = Escalate, executor: Executor =
+  Executor.shared()) -> ActorRef[M]`** starts the actor and gives back its reference at once; the
+  body runs on the executor's threads, and messages sent before it has finished queue behind it.
+  Called by code an actor is running, `spawn` starts a **child** of that actor; called anywhere else
+  (`main`, a thread, a future's body) it starts a **top-level** actor.
+- **`tell(message: M)`** puts the message in the actor's mailbox and returns at once; it never waits
+  and never fails. `!` is a reserved spelling in Avin, so there is no operator for it, and `tell` is
+  written infix where that reads better (`counter tell Reset`).
+- **`ask[R: Sendable](make: ActorRef[R] -> M, timeout: Duration) -> Future[Result[R, AskError]]`**
+  makes a reference that accepts one reply, builds the message around it with `make`, sends it, and
+  gives back the future of the reply. The first message to the reply reference completes the future
+  with `Ok`; any later one is dropped. `AskError` is `TimedOut` where no reply arrived within
+  `timeout`, and `Ended` where the asked actor had already ended, so the message could not be
+  delivered. The timeout is required: an ask always ends.
+- **A reply address is an ordinary `ActorRef[R]`.** An actor that asks another passes the reply
+  reference `ask` makes, or its own `self` where its message type is `R`, or an **adapter**:
+  `adapter[R: Sendable](f: R -> M) -> ActorRef[R]`, called in an actor, makes a reference whose
+  messages arrive in this actor's mailbox as `f` of them, so an actor talks to one with another
+  protocol without widening its own message type.
+- **`ActorRef[-M]`** is contravariant: a reference that accepts every `Shape` is also one that
+  accepts `Circle`s. It compares by the actor it refers to (`==` and `hash`), is `Sendable` and is shown
+  as the declaration's name and a number, `Counter#3`. It holds no state, so holding one keeps
+  nothing but the reference alive.
+
+Any thread may `tell` and `ask`. Inside an actor, waiting for an ask's future with `await` holds the
+actor: it handles no other message until the reply comes, which is sometimes what is wanted. The
+usual way is **`pipeToSelf[T](future: Future[T], f: T -> M)`**, which sends the actor `f` of the
+value once the future completes, so the actor goes on handling messages meanwhile. An actor that
+awaits an ask of itself waits until the timeout.
+
+### Mailboxes and order
+
+A mailbox is an unbounded queue. **Two messages one sender sends to one actor arrive in the order
+they were sent**; messages from different senders interleave in any order. A message sent to an
+actor that has ended is dropped, since an actor ending while messages are on their way to it is an
+ordinary race and not a bug; a program that needs to know when an actor ends [watches](#lifecycle)
+it, and an ask of one completes with `Ended`. Mailboxes are not bounded: a producer that must not
+outrun its consumer asks rather than tells, and waits for each answer, or for every *n*th.
+
+## What may be sent
+
+**A message type, an actor's parameters and every type `ask` and `adapter` carry must be
+`Sendable`.** `Sendable` is a trait the compiler decides for each type from its structure; it is
+written as a bound like any trait (`[T: Sendable]`), and `ActorRef[M]`'s parameter is bounded by it,
+so the check is made once, where the type is named, and never at a send:
+
+| Sendable | Why |
+| --- | --- |
+| `int` and the other integers, `byte`, `real`, `char`, `bool`, `unit`, `string` | immutable values |
+| tuples, `data` types (`Option`, `Result` and `Either` among them) whose fields are all sendable | immutable values |
+| `List`, `Vector`, `ArraySeq`, `Range`, the immutable `Map` and `Set`, of sendable elements | immutable, persistent collections |
+| a class with no `var` field, whose fields are all sendable, and which is not `open` or `abstract`; an `object` likewise | deeply immutable: no code can change it, and a subclass cannot add a `var` |
+| a trait declared `: Sendable` | every type implementing it is checked to be sendable, at its `impl` or declaration |
+| `ActorRef[M]`, `Behaviour[M]`, `Future[T]` and `Promise[T]` of a sendable `T` | made to be handed between threads |
+| `Channel[T]` and `Atomic[T]` of a sendable `T`, `Mutex[T]` of any `T`, `Once` | synchronization: every access is synchronized, and a mutex's value is reached only under its lock, so a mutex is the one deliberate door to shared mutable state |
+| a [Sysl handle](/spec/sysl-bindings/#handles) | sent by handing over its ownership, checked when it is used (below) |
+| `Isolated[T]` | an object graph nothing else reaches (below) |
+
+**Not sendable**: `Array`, `Buffer`, `Deque`, the mutable maps and sets, a class with a `var` field
+or a field that is not sendable, an `open` or `abstract` class, a [machine](#state-machines), a
+function value, and `Any`. A function value is not sendable because its type does not say what it
+captures, and a captured `var` is shared with the scope that made it. The error names the part that
+is not sendable:
+
+```text
+error: `JobMsg` cannot be sent between actors: its variant `Fill` holds a `Buffer[byte]`, which is mutable; send an immutable copy (`toVector`), or the buffer as an `Isolated[Buffer[byte]]`
+```
+
+### Handing over ownership
+
+Some mutable things have to move: a socket accepted by a listener goes to the actor that serves the
+connection, and a large buffer filled by one actor goes to the next.
+
+- **A Sysl handle in a message is handed over.** A handle has an owner, the execution that may use
+  it ([Sysl bindings](/spec/sysl-bindings/#handles)), and an actor is an owner. Sending a message
+  puts every handle it holds in transit, and the first code to use one takes it: the receiving
+  actor. The sender's later use of it traps (`` `Socket` belongs to another thread ``). The compiler
+  knows which types can hold a handle, so a send walks the message only for those.
+- **A mutable object graph moves inside an `Isolated[T]`.** `isolate(body)` runs its body, a by-name
+  argument written in place or as a trailing block, and wraps what it returns:
+
+  ```text
+  val chunk = isolate
+      val b = Buffer[byte]()
+      for i in 0..<size do b.add(byte.wrap(i))
+      b
+  worker tell Fill(chunk)
+  ```
+
+  The compiler checks that **the body reads nothing from around it that is not sendable**, and that
+  **nothing it calls, however indirectly, reaches module-level mutable state** (a module-level
+  `var`, or a module-level value or `object` whose type is not sendable). Avin compiles the whole
+  program, so the second is known for every function, through every trait method a call may reach
+  and every function value made inside the body. Every mutable object the body leaves reachable from
+  its result was therefore made inside it, and nothing outside holds one. The receiver gets the
+  objects out with **`take() -> T`**, after which they are ordinary objects it owns; a second `take`,
+  by anyone, traps with `` `Isolated` was already taken ``, one atomic swap deciding which take
+  wins. **`with[R: Sendable](f: T -> R) -> R`** works on the objects while leaving them isolated, `f`
+  being checked by the body's rule, so a pipeline of actors can fill, pass, change and pass one
+  buffer without a copy.
+
+The cheapest way across stays the plainest: build with a `Buffer` or a builder, turn the result into
+an immutable collection, and send that.
+
+## Supervision
+
+A trap reports a bug. In a thread it stops the program, because the state the threads share is in
+doubt. **An actor shares no mutable state**, so a trap in one leaves only that actor's own state in
+doubt, and the runtime can contain it:
+
+- **A trap in an actor fails the actor**: in its body, an arm, a timer's message, or an `enter` or
+  `leave` block. The runtime unwinds the actor's frames back to the worker running it, drops the
+  message being handled, and reports the trap as it reports any, naming the actor:
+
+  ```text
+  avin: trap in Counter#3: integer overflow at counter.avin:12:31
+  ```
+
+- **Where the trap leaves shared state in doubt, the program stops instead**, as it would for a
+  thread: a trap while the actor holds a `Mutex`, runs a `Once` body or initializes a `lazy val`
+  (each of which other threads may be waiting on), or inside a Sysl call.
+- **The supervision given to `spawn` decides what follows**, a value of the `data` type
+  `Supervision`:
+  - **`Escalate`**, the default: the parent fails as if it had trapped, and its own supervision
+    decides. A top-level actor that escalates stops the program, with the trap already reported. So a
+    program that supervises nothing behaves as it would with threads: a bug stops it.
+  - **`Stop`**: the actor ends, its children first, and its watchers are told it failed.
+  - **`Restart(limit: int, within: Duration)`**: the actor's children are stopped, its `stopping`
+    block runs, and its body runs again from the same `Behaviour`, so it starts again with fresh
+    state; the messages still in its mailbox stay there. A restart is reported on standard error. A
+    failure that would make more than `limit` restarts within the last `within` escalates instead.
+- **There is no resuming with the old state.** The trap stopped the actor part-way through changing
+  its state, so the state is not kept.
+
+## Lifecycle
+
+- **An actor runs until it stops.** `stop()` in an actor ends it once the current message is
+  handled; what is left in its mailbox is dropped. `stop(child)` ends one of its own children, and
+  stopping any other actor is an error: an actor that should end on request is sent a message
+  saying so.
+- **Children end first.** An ending actor stops each child, and waits for their ends, before it ends
+  itself; an actor's tree of children is torn down from the leaves.
+- **`stopping`** is a block in the actor's body that runs whenever the actor ends or restarts, the
+  place to close handles and tell others. It runs after a failure too, on state the trap may have
+  left half changed, so it does only what is safe on any state. A trap inside it is reported and the
+  actor ends without running it again.
+- **Watching.** `watch(ref, message: M)` asks for `message` in this actor's own mailbox when the
+  actor `ref` ends, for whatever reason, and `watch(ref, f: Ending -> M)` for `f` of how it ended;
+  `unwatch(ref)` stops asking. Watching an actor that has already ended delivers at once. `Ending` is
+  `Stopped` or `Failed(reason: string)`; a restart is not an ending.
+- **From outside any actor**, `ref.ended() -> Future[Ending]` completes when the actor ends, so `main`
+  waits for the top-level actor that runs the program with `spawn(App()).ended().await()`.
+- **An actor is not collected because nothing refers to it**: an actor nobody can send to still runs
+  its timers and its children. It ends by stopping, by its parent ending, or with the program.
+- **The program ends when `main` returns**, as it does with threads, with every actor still running.
+
+An actor also has **`children() -> Vector[ActorRef[Nothing]]`**, its own reference `self` and its
+parent's in **`parent() -> Option[ActorRef[Nothing]]`**, an `ActorRef[Nothing]` being one that may be
+watched and compared but not sent to.
+
+### Timers
+
+`after(delay: Duration, message: M) -> Timer` sends the actor `message` once `delay` has passed, and
+`every(interval: Duration, message: M) -> Timer` each time `interval` passes. `cancel()` on the
+`Timer` stops it; an actor's timers are all cancelled when it ends or restarts. A timer's message is
+queued like any other, so it never interrupts an arm.
+
+## Scheduling
+
+**Actors are many; threads are few.** Every actor runs on an `Executor`'s workers, by default the
+shared pool `Future(body)` uses, with one worker per processor:
+
+- **An actor with messages is one task.** A send to an actor with an empty mailbox queues the actor
+  on its executor; a worker takes it and handles its messages one at a time. **An actor never runs
+  on two threads at once**, and the handling of each message happens before the handling of the
+  next, wherever each runs, so an actor's fields need no lock and no `Atomic`.
+- **Fairness.** A worker handles at most 16 messages of one actor before putting the actor at the
+  back of the queue, so a busy actor cannot hold a worker from the others. Within one message there
+  is no preemption: an arm that computes for a second holds its worker for that second.
+- **An actor may move between threads between messages.** Before handling an actor's messages, the
+  worker sets its context's owner word to the actor, so the handles an actor owns are its own on any
+  worker and never trap.
+- **Waiting.** An actor that waits, in `await`, a [blocking binding](/spec/sysl-bindings/#calls-that-wait)
+  or `threads.blocking(body)`, holds its worker, and the pool starts another in its place while it
+  waits, as it does for any waiting future, so the other actors keep running. An actor that waits
+  most of the time is better given an executor of its own: `spawn(b, executor = Executor.fixed(1))`.
+- **Memory model.** A `tell` happens before the handling of the message it sent, and a reply's
+  `tell` happens before the `await` or `pipeToSelf` that delivers it, joining the edges of
+  [the memory model](/spec/threads/#the-memory-model).
+
+### Threads, channels and futures
+
+Actors are built on `avin.threads` and live beside it. Any thread may start, tell and ask actors;
+an ask is a future, and a future's value reaches an actor by `pipeToSelf`. A `Channel` is the tool
+for a fixed pipeline of threads, and an actor that receives from a channel holds its worker while
+it waits, so between actors, messages are the channel. Locks remain for the state that genuinely
+must be shared; a `Mutex` is sendable for that reason.
+
+## State machines
+
+**`machine`** declares a type whose objects move between declared **states**, driven by **events**:
+
+```text
+data DoorEvent
+    Open
+    Close
+    Lock(code: int)
+    Unlock(code: int)
+
+machine Door receives DoorEvent
+    var opened = 0
+
+    state Closed
+        Open ->
+            opened += 1
+            Opened
+        Lock(code) -> Locked(code)
+
+    state Opened
+        enter
+            println("open")
+        Close -> Closed
+
+    state Locked(code: int)
+        Unlock(c) if c == code -> Closed
+
+    receive
+        _ -> stay
+```
+
+- **Each `state` declares a state**, optionally with parameters, the data that state holds; its
+  arms, `enter` and `leave` blocks read them by name. The machine's own fields and parameters are
+  the data every state shares. A machine is declared like a class, generic and with parameters, and
+  its other methods are ordinary methods.
+- **An arm's value is the next state**: a state written as a constructor (`Locked(code)`), or
+  **`stay`**, which keeps the current state and its data. There is no separate transition statement:
+  what an arm yields is where the machine goes.
+- **The first `state` is where the machine starts**, and takes no parameters.
+- **`enter` runs when the machine moves into the state, and `leave` when it moves out**, `leave`
+  before `enter`. An arm yielding a state, even the current one, is a transition and runs both;
+  `stay` runs neither. The first state's `enter` runs when the machine is made, after the body.
+- **`receive` holds the arms every state shares**, tried after the current state's own. **Every
+  state must handle every event**: the compiler checks, state by state, that its own arms and the
+  shared ones together cover the event type, as a `match` is checked, guarded arms not counting.
+  Without its shared `receive`, `Door` would be refused:
+
+  ```text
+  error: state `Locked` of `Door` does not handle `Open`, `Close`, `Lock(_)` or `Unlock(_)` where the guard is false
+  ```
+
+- **Using a machine.** `Door()` makes one in its first state. `handle(event) -> Door.State` applies
+  one event and answers the new state, and `state() -> Door.State` reads the current one, where
+  `Door.State` is a `data` type the declaration makes, with a variant for each state and the state's
+  parameters as its fields, so a program matches on it:
+  `door.state() is Locked(_)`. A machine is a mutable object, so it is not sendable; handling an
+  event from inside one of its own arms, `enter` or `leave` blocks traps, as taking a held mutex does.
+
+### An actor's states
+
+An actor's body takes the same `state` blocks, so an actor with phases is written as a machine
+driven by its mailbox. Each message is an event, the arms yield the next state, and `enter`,
+`leave`, `stay` and the check that every state handles every message work as they do in a machine:
+
+```text
+data ConnMsg
+    Connect(host: string)
+    Connected(socket: Socket)
+    Send(bytes: Vector[byte])
+    Closed
+
+actor Connection receives ConnMsg
+    var pending = Vector[Vector[byte]]()
+
+    state Idle
+        Connect(host) ->
+            pipeToSelf(openSocket(host), s -> Connected(s))
+            Connecting
+
+    state Connecting
+        Connected(socket) ->
+            for b in pending do socket.write(b)
+            pending = Vector()
+            Ready(socket)
+        Send(bytes) ->
+            pending = pending :+ bytes
+            stay
+
+    state Ready(socket: Socket)
+        leave
+            socket.close()
+        Send(bytes) ->
+            socket.write(bytes)
+            stay
+        Closed -> Idle
+
+    receive
+        _ -> stay
+```
+
+A restarted actor starts again in its first state. An actor without `state` blocks is one whose
+arms all `stay`, which is why its arms yield nothing.
+
+## Keywords
+
+`actor` and `machine` are keywords only where a declaration starts, before the declaration's name;
+`receives` only after an actor's or machine's header; and `state`, `receive`, `enter`, `leave`,
+`stopping` and `stay` only inside an actor's or a machine's body, at the start of a line (`stay` as
+an arm's value). Everywhere else they are ordinary names, so a variable called `state` stays legal.
