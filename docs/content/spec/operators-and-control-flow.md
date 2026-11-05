@@ -561,7 +561,11 @@ function type in a type pattern is written in parentheses, because an arm's `->`
 `f: ((int) -> int) -> …`.
 
 A `match` that does not cover every value names one it leaves out, written as a pattern:
-`` this `match` does not cover every Shape value, such as `Rect(_, _)` ``.
+`` this `match` does not cover every Shape value, such as `Rect(_, _)` ``. A value is named only
+where no arm can match it whatever its extractors answer; where only extractors stand between the
+arms and every value, the message says so instead:
+`` this `match` does not cover every int value, since an extractor may answer that it does not
+match; add an arm for the rest, such as `_` ``.
 
 ### Extractor patterns
 

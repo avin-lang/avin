@@ -8,8 +8,10 @@ import sysl.buf.{Buf, buf}
 // row. A column is decided by splitting it on the cases its type enumerates: `true` and `false` for
 // `bool`, and the variants of a data type, whose fields become columns of their own. An integer,
 // byte or char column is split into the stretches of values that no pattern's bounds divide, so
-// literals, ranges, comparisons and `n + k` together cover it when every stretch is matched. Rows
-// with a guard are left out, since a guard may always fail.
+// literals, ranges, comparisons and `n + k` together cover it when every stretch is matched. A
+// column of sequence patterns is split on the sequence's length. Rows with a guard are left out,
+// since a guard may always fail, and an extractor pattern matches no case, since it may answer that
+// it does not match.
 
 private struct Row
     items: Buf[&TPattern]
@@ -61,12 +63,14 @@ private cases_of(t: &Type, data: Buf[DataSymbol]) -> Buf[Case]
 
 // A pattern that matches every value of its type: a wildcard, a binding, a type pattern naming a
 // type the value's type already conforms to, `()` for unit, and any pattern that already failed to
-// check, so that one error is not reported again as a gap.
-private unconstrained(p: &TPattern) -> bool = p.kind match
+// check, so that one error is not reported again as a gap. With `views`, an extractor pattern is
+// taken to match every value too: the gaps left then are values no extractor could have taken.
+private unconstrained(p: &TPattern, views: bool) -> bool = p.kind match
     PWildcard -> true
     PBind(_) -> true
     PType(_, _, tested) -> !tested || *p.ty is ErrorType
     PLiteral(_) -> *p.ty is Unit || *p.ty is ErrorType
+    PView(_, _, _) -> views || *p.ty is ErrorType
     _ -> *p.ty is ErrorType
 
 private matches_case(p: &TPattern, case: Case) -> bool = case match
@@ -143,7 +147,7 @@ private interval_of(p: &TPattern, least: string, greatest: string) -> Option[Int
 // Every boundary of every row's stretch and of the domain cuts the values into pieces that each row
 // either matches entirely or not at all; each piece inside the domain must be covered by the rows
 // that match it, on the remaining columns.
-private witness_ordered(rows: Buf[Row], domain: Buf[Interval], t: &Type, rest: Buf[&Type], data: Buf[DataSymbol]) -> Option[Buf[string]]
+private witness_ordered(rows: Buf[Row], domain: Buf[Interval], t: &Type, rest: Buf[&Type], data: Buf[DataSymbol], views: bool) -> Option[Buf[string]]
     val least = domain[0].low
     val greatest = domain[domain.len() - 1].high
     var cuts: Buf[string] = buf()
@@ -164,11 +168,11 @@ private witness_ordered(rows: Buf[Row], domain: Buf[Interval], t: &Type, rest: B
         var specialized: Buf[Row] = buf()
         for row in rows
             val head = row.items[0]
-            var matched = unconstrained(head)
+            var matched = unconstrained(head, views)
             if interval_of(head, least, greatest) is Some(i)
                 matched = compare_signed(i.low, start) <= 0 && compare_signed(start, i.high) <= 0
             if matched then specialized.push(tail_of(row))
-        if witness(specialized, rest, data) is Some(parts)
+        if witness(specialized, rest, data, views) is Some(parts)
             val example = if *t is Char then printable_in(start, predecessor(cuts[k + 1])) else example_in(start, predecessor(cuts[k + 1]))
             return in_front(spell_value(t, example), Some(parts))
     None
@@ -298,11 +302,13 @@ private tail_of(row: Row) -> Row
         items.push(row.items[i])
     Row(items)
 
-private covers(rows: Buf[Row], types: Buf[&Type], data: Buf[DataSymbol]) -> bool = witness(rows, types, data) is None
+private covers(rows: Buf[Row], types: Buf[&Type], data: Buf[DataSymbol]) -> bool = witness(rows, types, data, false) is None
 
 /** A value the unguarded arms of a match on a value of type `ty` leave out, written as a pattern,
- * such as `Rect(_, _)` or `-1`; `None` when they cover every value. */
-missing_case(arms: Buf[TArm], ty: &Type, data: Buf[DataSymbol]) -> Option[string]
+ * such as `Rect(_, _)` or `-1`; `None` when they cover every value. With `views`, an extractor
+ * pattern is taken to match every value, so a value found is one no arm can match, whatever its
+ * extractors answer. */
+missing_case(arms: Buf[TArm], ty: &Type, data: Buf[DataSymbol], views: bool) -> Option[string]
     var rows: Buf[Row] = buf()
     for arm in arms
         if arm.guard is Some(_) then continue
@@ -311,14 +317,15 @@ missing_case(arms: Buf[TArm], ty: &Type, data: Buf[DataSymbol]) -> Option[string
         rows.push(Row(items))
     var types: Buf[&Type] = buf()
     types.push(ty)
-    witness(rows, types, data) match
+    witness(rows, types, data, views) match
         Some(parts) -> if parts.len() > 0 then Some(parts[0]) else None
         None -> None
 
 // The columns of one combination of values that no row matches, each written as a pattern, or `None`
 // when the rows cover every combination. It decides as `covers` describes: split the first column on
-// its cases, or on the stretches of its ordered values, and look for a gap in each.
-private witness(rows: Buf[Row], types: Buf[&Type], data: Buf[DataSymbol]) -> Option[Buf[string]]
+// its cases, on the lengths of a sequence, or on the stretches of its ordered values, and look for a
+// gap in each.
+private witness(rows: Buf[Row], types: Buf[&Type], data: Buf[DataSymbol], views: bool) -> Option[Buf[string]]
     if rows.len() == 0
         var all: Buf[string] = buf()
         for t in types
@@ -340,30 +347,86 @@ private witness(rows: Buf[Row], types: Buf[&Type], data: Buf[DataSymbol]) -> Opt
                 for o in options
                     expanded.push(with_head(row, o))
             _ -> expanded.push(row)
-    if changed then return witness(expanded, types, data)
+    if changed then return witness(expanded, types, data, views)
     var rest: Buf[&Type] = buf()
     for i in 1..<types.len()
         rest.push(types[i])
     var defaults: Buf[Row] = buf()
+    var sequence = false
     for row in rows
-        if unconstrained(row.items[0]) then defaults.push(tail_of(row))
+        if unconstrained(row.items[0], views) then defaults.push(tail_of(row))
+        elif row.items[0].kind is PSequence(_, _, _, _, _) then sequence = true
+    if sequence then return witness_sequence(rows, rest, data, views)
     if defaults.len() < rows.len()
         val domain = domain_of(types[0])
-        if domain.len() > 0 then return witness_ordered(rows, domain, types[0], rest, data)
+        if domain.len() > 0 then return witness_ordered(rows, domain, types[0], rest, data, views)
     val cases = cases_of(types[0], data)
-    if defaults.len() == rows.len() || cases.len() == 0 then return in_front("_", witness(defaults, rest, data))
+    if defaults.len() == rows.len() || cases.len() == 0 then return in_front("_", witness(defaults, rest, data, views))
     for case in cases
         var specialized: Buf[Row] = buf()
         for row in rows
             val head = row.items[0]
-            if unconstrained(head) || matches_case(head, case) then specialized.push(specialize(row, case))
+            if unconstrained(head, views) || matches_case(head, case) then specialized.push(specialize(row, case))
         var columns: Buf[&Type] = buf()
         if case is VariantCase(_, fields)
             for t in fields
                 columns.push(t)
         for t in rest
             columns.push(t)
-        if witness(specialized, columns, data) is Some(parts) then return Some(spell_case(types[0], case, parts, data))
+        if witness(specialized, columns, data, views) is Some(parts) then return Some(spell_case(types[0], case, parts, data))
+    None
+
+// A column of a sequence other than a list, split on its length. With `longest` the most elements
+// any sequence pattern names, every length up to it is a case of its own, and every longer length is
+// one more case, written with `_*`. A case of `n` elements has a column for each: a pattern of that
+// many elements gives its own, one with a rest gives its own and wildcards for the elements its rest
+// takes, and a pattern matching any sequence gives wildcards. A rest that constrains what it takes,
+// and any other pattern, matches no case.
+private witness_sequence(rows: Buf[Row], rest: Buf[&Type], data: Buf[DataSymbol], views: bool) -> Option[Buf[string]]
+    var longest = 0usize
+    var element: &Type = ErrorType
+    for row in rows
+        if row.items[0].kind is PSequence(_, _, elements, items, open)
+            val fixed = if open then items.len() - 1 else items.len()
+            if fixed > longest then longest = fixed
+            if fixed > 0 then element = elements[0].ty
+    for n in 0..<longest + 2
+        val longer = n == longest + 1
+        var specialized: Buf[Row] = buf()
+        for row in rows
+            val head = row.items[0]
+            var items: Buf[&TPattern] = buf()
+            var matched = false
+            if unconstrained(head, views)
+                matched = true
+            elif head.kind is PSequence(_, _, _, parts, open)
+                val fixed = if open then parts.len() - 1 else parts.len()
+                matched = if open then fixed <= n && unconstrained(parts[fixed], views) else fixed == n && !longer
+                if matched
+                    for i in 0..<fixed
+                        items.push(parts[i])
+            if !matched then continue
+            while items.len() < n
+                items.push(TPattern(Span(0, 0), element, PWildcard))
+            for i in 1..<row.items.len()
+                items.push(row.items[i])
+            specialized.push(Row(items))
+        var columns: Buf[&Type] = buf()
+        for i in 0..<n
+            columns.push(element)
+        for t in rest
+            columns.push(t)
+        if witness(specialized, columns, data, views) is Some(parts)
+            var inner = ""
+            for i in 0..<n
+                if i > 0 then inner = inner + ", "
+                inner = inner + parts[i]
+            if longer then inner = inner + ", _*"
+            var out: Buf[string] = buf()
+            out.push("[" + inner + "]")
+            for i in n..<parts.len()
+                out.push(parts[i])
+            return Some(out)
     None
 
 private in_front(head: string, found: Option[Buf[string]]) -> Option[Buf[string]] = found match

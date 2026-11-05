@@ -524,8 +524,11 @@ firstTwo(xs: Vector[string]) -> string = xs match
     _ -> "fewer than two"
 ```
 
-For exhaustiveness, `[]` together with `head :: tail`, or `[head, tail*]`, covers every `List`;
-fixed-length patterns cover only their lengths, so a match that uses only them needs a catch-all.
+For exhaustiveness, a sequence pattern covers its own length, and one ending in a rest covers
+every length from its own on, on a sequence of any type. So `[]` together with `[head, tail*]`
+covers every sequence, as `[]` with `head :: tail` covers every `List`; fixed-length patterns cover
+only their lengths, so a match that uses only them needs a catch-all. A match that leaves lengths
+out names one, such as `[_, _, _*]` for every length from two on.
 
 ## Literals
 
