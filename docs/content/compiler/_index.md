@@ -17,10 +17,11 @@ the standard library — in one run.
 | Resolve | AST → resolved AST | Scopes and symbol tables. Every name is bound to a declaration symbol, and imports, visibility and shadowing are decided here, once. |
 | Check | resolved AST → typed HIR | A `Type` algebra over declaration symbols; local bidirectional inference with subtype constraints; bounds, variance and `impl` coherence; initialization; what `@sendable` and `@isolated` arguments capture and read, once every closure's captures are known; pattern exhaustiveness; a finite set of instances, rejecting generic cycles whose type arguments grow. |
 | Bindings | `@sysl` declarations → shim archive | Generates the Sysl shim source and its boundary signatures, and has Sysl check and build it. |
+| C unit | `@c` declarations → C unit object + measurements | Generates one C file of header checks, measurements and glue, compiles it with clang under the C libraries' flags, and reads the measurements out of the object ([stage 13](/compiler/roadmap/)). |
 | Monomorphize | typed HIR → mono HIR | Instantiates functions, types and generic trait methods for every use, and computes the dispatch for trait-typed calls over the closed world. |
 | Lower | mono HIR → MIR | Explicit control flow, object layouts and headers, type descriptors, vtables, closures and environments, allocation, GC root slots, traps. |
 | Emit | MIR → LLVM IR | Spelling only: no typing, layout or semantic decisions. |
-| Link | `.ll` + runtime + shim → executable | clang; the runtime library; the cached shim library. |
+| Link | `.ll` + runtime + shim → executable | clang; the runtime library; the cached shim library; the C unit's object and the C libraries' link flags. |
 
 Each stage has its own data structures and its own tests. No stage reaches back into an earlier stage's
 input. **Types are an enum over symbols, never strings**: built-in types, nominal types, functions,
@@ -150,6 +151,49 @@ directory. The executables `avin run` and `avin test` cache are keyed by the sam
 the same bindings finds it there and runs no Sysl build; it is built under a temporary name and
 published by rename, so concurrent builds never see a partial archive. The `check` command builds
 the shims too, since only Sysl can say whether a binding is right.
+
+## C bindings and the C unit
+
+Built by [stage 13](/compiler/roadmap/); the language is in [C bindings](/spec/c-bindings/). A C
+binding is **not** a shim: it is a direct call from the program's own code.
+
+- **Check** parses each `@c` prototype into a C signature (scalars, pointers, `const`, typedef
+  names, function pointers, and the `out`, `inout`, `userdata` and `length(p)` markers) and holds it
+  against the Avin signature: which Avin type each C type may cross as, out values joined into the
+  result, a callback's parameters without its `userdata`. It records each binding's **crossing**,
+  as a Sysl binding's is recorded.
+- **The C unit.** The driver writes one C file for the program, `#include`s the headers every
+  package's `c-libraries` names, and emits per binding a `_Static_assert` that
+  `__builtin_types_compatible_p(__typeof__(&symbol), <the prototype's function pointer type>)`; per
+  typedef in an integer position, its size and sign; per mirror, size, alignment and offsets; per
+  enumerator and constant, its value. Measurements are stored in one `const` table whose symbol the
+  driver reads from the object file's data, so nothing is run and a build for another target
+  measures that target. The same file defines the glue: a function per field accessor, expression
+  `retain`/`release`/`forget`/`as`, buffer `length`, and per binding or callback that passes a struct
+  by value (taking and answering it through pointers, so clang does the platform's aggregate
+  classification). A clang diagnostic is placed back at the binding by the line the driver recorded
+  for it. The object is cached under `cunit/` in the user's cache by a SHA-256 of the C source, the
+  `pkg-config --cflags` and `--libs` answers and `clang --version`.
+- **Lower** gives each binding a body in MIR: convert each argument (a string into a NUL-terminated
+  copy in memory off the heap, a checked integer narrowing to the measured width, `None` to null, a
+  handle to its C pointer after the closed and owner checks, through its `as` glue where needed),
+  call the C symbol or its glue, then convert the result (a string copied in through
+  `avin_rt_new_text` and checked as UTF-8, null to `None` or a trap, a status to `Result`, a pointer
+  to a new handle object, through `retain` when `borrowed`). A `blocking` call is bracketed by
+  `avin_rt_enter_safe` and `avin_rt_leave_safe` after every argument is converted (an array argument
+  copied off the heap) and before the result is. A handle object holds its C pointer, its owner word,
+  its open views and its kept objects and callbacks; its finalizer runs `forget` for each kept
+  callback, then `release`.
+- **Callbacks.** For each C function type a callback parameter has, lowering makes one trampoline
+  with C's convention. It reads the `userdata` as the runtime's callback record (`callback_pin` when
+  the binding is called, unpinned at return or when the keeping handle is released), calls
+  `callback_enter`, which attaches a thread the runtime has never seen and checks the owner unless
+  the parameter is `@threaded`, converts the arguments, calls the closure, converts the answer, and
+  calls `callback_leave`, which detaches a thread attached for the call.
+- **Emit** declares each C symbol and glue function with the target's parameter attributes
+  (`signext`/`zeroext` below 32 bits) and calls it; nothing in the emitter knows about C beyond that.
+- **Link** adds the C unit's object and, for each package's C libraries, `-l<name>` or the words
+  `pkg-config --libs` prints, asked at every link.
 
 ## Runtime
 

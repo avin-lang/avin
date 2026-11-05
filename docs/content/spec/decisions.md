@@ -2751,15 +2751,7 @@ their words are reserved.
   example is `examples/ui-todo` beside `examples/ui`**, since the corpus builds each directory of
   `examples` as one program with one `main`.
 
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- Proposed 2026-11-05 (built on branch `actor-runtime`): **A behaviour's library form is
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-runtime`): **A behaviour's library form is
   `Behaviour[M](name: string, start: @sendable (ActorRef[M]) -> (M) -> unit)`** ([declaring an
   actor](/spec/actors/#declaring-an-actor)). The start runs once on the actor's first turn, is
   given the actor's own reference (`self`), makes the actor's state in its locals and gives back the
@@ -2771,7 +2763,7 @@ their words are reserved.
   would be an object the program sees, which the spec rules out); a constructor hidden from
   programs (then the runtime could not be tested before declarations exist, and a program could not
   build an actor from a function).
-- Proposed 2026-11-05 (built on branch `actor-runtime`): **`Executor.execute(task)`** runs a task on
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-runtime`): **`Executor.execute(task)`** runs a task on
   the executor's workers with no future, as an owner of its own with nothing handed to it, and runs
   after `shutdown` as a future's functions do ([executors](/spec/threads/#executors)). Why: an
   actor's turns are queued on its executor again and again, and `avin.actors` cannot reach the
@@ -2781,7 +2773,7 @@ their words are reserved.
   (cost grows with the actor's state); a compiler-known hook visible only to the library (new
   machinery for one call). **Review with the user:** it adds a public method whose owner rule
   (handles the giver owns trap in the task) differs from `future`'s.
-- Proposed 2026-11-05 (built on branch `actor-runtime`): **Scheduling details**
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-runtime`): **Scheduling details**
   ([scheduling](/spec/actors/#scheduling)). An actor's number is one sequence for the whole
   program, from one in the order actors are spawned, not one per declaration. `spawn` hands the Sysl
   handles its behaviour reaches to the actor, as a thread's `spawn` does with its body. The start
@@ -2791,6 +2783,110 @@ their words are reserved.
   keeps a handle usable by whoever runs the actor. Alternatives weighed: numbers per declaration
   (`Counter#1`, `Logger#1`; needs a registry of names); dropping messages to an actor whose executor
   is shut down (a silent loss the spec does not ask for).
+
+**C bindings**
+
+- Settled by the user 2026-11-05: **public C interoperability is no longer deferred.** The user's
+  words, on how to build the MLT library: *"Doing it as a c binding would force c interoperability
+  and would provide a good stressor for it. The sysl MLT binding isn't being used."* So Avin binds C
+  libraries itself ([C bindings](/spec/c-bindings/)), and `avin-lang/mlt`, MLT 7 bound over them,
+  is the stressor that drives the work (roadmap stage 13). Until it is built, C is reached through
+  Sysl as before.
+- Settled 2026-11-05 on the user's question *"Why should C interop go through Sysl since avin
+  generates LLVM IR?"*: **a C binding is a direct call** ([how a C binding is
+  compiled](/spec/c-bindings/#how-a-c-binding-is-compiled)). The emitter declares the C symbol in
+  the LLVM IR and Avin's own code calls it; clang links the library with the flags `pkg-config`
+  answers. What the Sysl shim does for a Sysl binding — converting arguments and results, the
+  `enter_safe`/`leave_safe` bracket of a `blocking` call, keeping a handle's reference, callback
+  trampolines and attaching a C-owned thread — is done by Avin's lowering and the runtime. *Why*:
+  the shim exists so that Sysl checks a binding against a Sysl signature, and a C binding has none,
+  so a shim would add a compile step, a cache and a Sysl dependency and check nothing. *Alternative
+  weighed*: lowering each C binding into the Sysl shim as an `extern` (the director's first
+  recommendation), which would have had Sysl's ABI lowering of aggregates for free but no check
+  against C's header, since Sysl does not read headers.
+
+- Settled on the user's delegation 2026-11-05 (built on branch `c-interop-design`): **C bindings** ([chapter](/spec/c-bindings/)).
+  Each is the recommendation the chapter is written to:
+  - **The binding copies the C prototype as a string**, `@c("char *mlt_properties_get(mlt_properties
+    self, const char *name)")`, beside an Avin signature in Avin types, matched by position. *Why*:
+    C's `unsigned`, `long`, `const` and typedefs cannot be said in Avin types, the prototype is what a
+    reader compares with the header, and clang can check it exactly. Three marker words (`out`,
+    `inout`, `userdata`) and `length(p)` say what C's types do not. *Alternatives*: a vocabulary of C
+    types in Avin (`CInt`, `CSize`, …), a second type system in safe code; C types implied by the
+    Avin types, which cannot spell a `uint32_t` or a typedef.
+  - **Every binding is checked against its header, by clang, in a generated C unit**: a
+    `_Static_assert` of `__builtin_types_compatible_p` per binding, the kind of each typedef, every
+    mirror's layout; the unit also measures typedef widths, enumerators and constants as object-file
+    data read without running it (cross builds measure the target). A package with bindings and no
+    `headers` is refused. *Why*: it is the one check on the trusted surface that can be automatic.
+    *Alternatives*: trusting the declaration as a Sysl `extern` does; parsing headers in the
+    compiler (the Sysl project refused that too).
+  - **C libraries are named in the manifest**, `c-libraries { mlt { pkg-config, headers, install } }`
+    (or `link = [...]`), and every program links the C libraries of all its packages. *Why*: it is
+    the shape of `sysl-dependencies`, and a library's requirement travels with it. *Alternative*: a
+    module-header `@link`, as Sysl writes it, which cannot carry headers or the install message.
+  - **Struct by value goes through clang-compiled glue**, which takes and answers the struct by
+    pointer; scalars, pointers and structs by pointer are called directly. *Why*: clang's ABI
+    classification is right on every target at once, and the C unit already exists. *Alternatives*:
+    implementing AAPCS64 (Darwin first) and then System V x86-64 classification in lowering, a
+    per-target body of code whose bugs corrupt arguments silently; refusing by-value structs, which
+    MLT's `mlt_color` and `mlt_event_data` need. **Review with the user** if the extra call is ever
+    measured to matter.
+  - **Handles own one C reference**: a pointer answered is owned unless the binding says
+    `borrowed`, which needs a `retain`; `release`/`retain` are a C function or a C expression in
+    `self`; `as:` lists the other C types a handle passes as (C's first-member inheritance), each by
+    a C conversion that lends; `keeps:` makes the holder keep an Avin object (MLT's profile),
+    `consumes:` closes a handle the call takes. *Why*: the sysl MLT binding found exactly these
+    shapes, and every one is written once per class or binding. *Alternative*: one Avin handle class
+    per C type with explicit upcast bindings, many more declarations for the same check.
+  - **C handles keep the single-owner check**; `shared` exempts a thread-safe C object and makes it
+    sendable. *Why*: most C objects are not thread-safe. *Alternative*: no check for C handles.
+  - **Strings**: `const char *` from a `string` copied with a NUL, a held NUL trapping; a `char *`
+    result copied and UTF-8-checked (trapping), `Array[byte]` for unchecked bytes, borrowed unless
+    `free:` names the freeing function. *Alternatives*: truncating at a NUL, replacing invalid UTF-8
+    with U+FFFD (what standard input does), a `Result` per string result.
+  - **Null is `Option`; a null bound as the type itself traps.** A C integer bound as
+    `Result[unit, int]` is `Ok` on zero. *Alternative*: a `Result` for null pointers, which would need
+    an error the C call never gave.
+  - **Out parameters join the result**, as a tuple after the C result or in a status's `Ok`. *Why*:
+    Avin has no pointers to pass. *Alternative*: filled one-element arrays, which work today but read
+    badly.
+  - **Buffers are copied (`bytes:`) or borrowed as an `avin.c.ByteView`** (`view:`), a read-only,
+    bounds-checked handle holding its owner, **closed when its owner is next used**. *Why*: MLT may
+    replace a frame's image on the next call, so validity is "until the owner changes", and the owner
+    check catches every use after that. *Alternatives*: views valid only inside a block
+    (`frame.withImage { … }`), which forbids keeping one at all; copy only, which costs a copy per
+    frame. **Review with the user**: whether writable views are wanted for producing frames.
+  - **Callbacks**: one C-convention trampoline per function type, the closure found through the
+    `userdata`, the runtime's Sysl-callback record and `callback_enter` reused; `keeps:` holds a
+    registered callback on its handle, whose `forget:` unregisters each before `release`; a
+    keeping class without `forget` is refused; `@threaded` as for Sysl, a C thread attached per call.
+    *Alternative*: a registration object returned to the caller, which the user must keep alive.
+  - **Varargs are refused.** A package needing one may carry C. *Why*: an argument's type cannot be
+    checked against `...`, and a format string from Avin is a hole. *Alternatives*: allowing calls
+    whose extra arguments the prototype fixes. Whether an Avin package may carry C sources of its
+    own, compiled into the C unit, is itself proposed: it is the trusted escape hatch for macros with
+    arguments and odd shapes, and it widens the trusted surface beyond `@c(`.
+  - **No pointer type and no `unsafe` block in Avin; the `@c` declarations (and the glue they
+    generate) are the whole trusted surface.** *Why*: soundness in safe code, and one grep finds
+    everything to review. *Alternative*: an `unsafe` region with a raw pointer type, which would let
+    a binding's pleasant layer be written in Avin but makes every Avin file a possible hole.
+  - **`errno`** is not read by a binding yet; an `errno` flag answering `Result[T, int]` from a `-1`
+    result is the likely form when a POSIX library needs it.
+  - **Review with the user**: the prototype-string form of `@c`, the largest syntax choice here; whether a
+    package may carry C sources, which widens the trusted surface beyond the `@c` lines; the two
+    parser additions (`val` with no initializer for `@c(const:)`, list-valued annotation
+    arguments); and a missing `@threaded` on a callback C calls from its own thread being caught
+    only by a trap at run time.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
