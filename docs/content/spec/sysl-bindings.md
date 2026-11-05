@@ -92,15 +92,19 @@ Data crosses the boundary in a fixed set of shapes:
 | --- | --- |
 | `i8`, `i16`, `int`, `long`, `byte`, `real`, `char`, `bool`, `unit` | By value; Sysl's `u8` is `byte`. An integer result, and an integer a result holds, takes [any Sysl integer](#integer-results) |
 | `string` | Copied into a Sysl `string` in each direction |
-| `Array[byte]` | Copied into a Sysl `[]u8`, and out of a Sysl `[]u8` or `[]const u8` |
-| `Array[T]`, `Vector[T]` of any other boundary type | **Copied**, element by element: into a Sysl slice `[]T`, and out of a Sysl `[]T` or `Buf[T]` into a new array or vector |
+| `Array[byte]` | Copied into a Sysl `[]u8` and, as a binding's own parameter, [copied back](#filled-arrays) after the call; out of a Sysl `[]u8` or `[]const u8` |
+| `Array[T]`, `Vector[T]` of any other boundary type | **Copied**, element by element: into a Sysl slice, and out of a Sysl `[]T` or `Buf[T]` into a new array or vector. An array of numbers, booleans or characters as a binding's own parameter is [copied back](#filled-arrays); any other array goes in as a `[]const T` |
 | `Option[T]`, `Result[T, E]` of boundary types | Converted variant by variant by the generated shim |
 | `data` declared with `@sysl("…")` mirroring a Sysl struct or enum of boundary types | Converted field by field |
+| `(T1, T2, …)`, a tuple of boundary types | A Sysl tuple of the same arity, converted part by part in each direction |
 | `class` declared with `@sysl("…")` | An **opaque handle**: an Avin object owning one counted Sysl reference, released by `close()` or, as a safety net, a finalizer. Its methods are bindings too. |
 
 These shapes nest: a `Result[Option[string], IoError]` crosses, and so do a
-`Result[Vector[string], IoError]`, a `Vector[Vector[string]]`, a `Vector[Array[byte]]` and a mirror
-whose fields are `Option`s, collections or other mirrors.
+`Result[Vector[string], IoError]`, a `Vector[Vector[string]]`, a `Vector[Array[byte]]`, a
+`Vector[(string, string)]`, an `Option[(string, (int, long))]` and a mirror whose fields are
+`Option`s, collections, tuples or other mirrors. Sysl's `vars()`, a `Buf[(string, string)]`, is
+bound as a `Vector[(string, string)]`, and a Sysl `(usize, u64)` as an `(int, long)`, each part
+checked as an integer result is.
 
 ### Integer results
 
@@ -123,7 +127,7 @@ avin: trap: value out of range for long at main.avin:13:13
 ```
 
 An integer a result holds converts the same way, wherever it is: the value of an `Option`, either
-side of a `Result`, the elements of an `Array` or a `Vector`, and these nested in one another. A
+side of a `Result`, the elements of an `Array` or a `Vector`, the parts of a tuple, and these nested in one another. A
 Sysl `Option[usize]` is bound as an `Option[long]`, a `Result[u32, E]` as a `Result[int, E]`, and a
 slice of `u8` or a `Buf[u16]` as a `Vector[int]`. Each value is checked as it is converted, and the
 first that does not fit stops the program at the binding's call. A `byte` is not converted: it is
@@ -144,9 +148,11 @@ widened: an `Option[int]` reaches an `Option[i32]` parameter only.
 
 A collection crosses the boundary **as a copy**, so neither side ever holds the other's memory:
 
-- **Into Sysl**, an `Array[T]` or a `Vector[T]` parameter becomes a fresh Sysl slice `[]T` of its
-  elements, each converted; the Sysl function may take it as a `[]T` or a `[]const T`. Changing the
-  slice does not change the Avin array.
+- **Into Sysl**, an `Array[T]` or a `Vector[T]` parameter becomes a fresh Sysl slice of its
+  elements, each converted. A vector's slice is a `[]T`, which the Sysl function may take as a `[]T`
+  or a `[]const T`: a vector never changes, so what Sysl writes into its copy is never missed. An
+  array the Sysl function may fill is [copied back](#filled-arrays) after the call; any other array
+  goes in as a `[]const T`, so a Sysl function that would write into it is refused.
 - **Out of Sysl**, a slice or a `Buf` of a boundary type becomes a fresh Avin collection. A binding
   usually declares a **`Vector[T]`**, the immutable sequence the standard library's functions answer
   with; it may declare an **`Array[T]`** instead, a new array no one else holds. Which of `[]T` and
@@ -175,13 +181,58 @@ error: the Sysl binding `splitInts` does not match `sysl.text.split`: `Vector[in
 No other collection crosses: a `List`, a `Buffer`, a `Map` or a `Set` is converted by the Avin
 function that wraps the binding, and an `Array` or a `Vector` crosses only when its elements do.
 
+### Filled arrays
+
+A Sysl function that fills a buffer its caller hands it, as a stream's `read` does, is bound with
+an `Array` parameter. An `Array` of `byte`, of an integer type, of `real`, `bool` or `char` that is
+the binding's **own parameter** is copied into a slice the Sysl function may write, `[]T`, and when
+the function returns, what it left in the slice is copied back into the array, element by element.
+The function's result says how much it wrote, and the rest of the array keeps what it held:
+
 ```text
-error: `Vector[(int, int)]` cannot cross to Sysl; a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, data types declared with `@sysl` to mirror a Sysl enum or struct, and `Array`, `Vector`, `Option` and `Result` of these
+@sysl("avintest.digits.fill_digits")
+fillDigits(n: long, into: Array[byte]) -> long
+
+main()
+    val buffer = Array.fill(6, byte(9))
+    println(s"${fillDigits(42, buffer)} $buffer")
+```
+
+```text
+2 [4, 2, 9, 9, 9, 9]
+```
+
+A slice never grows, so the copy back covers the whole array, and an empty array is an empty
+slice. A handle's method fills an array as a function does. The array is kept as a root of the
+thread's stack from before the call until it is filled, so it lives through a collection that runs
+while the call waits or while its result is made, even where nothing else holds it. A function that
+takes its slice as a `[]const T` reads the copy, and the copy back leaves the array as it was.
+
+An array anywhere else — of strings, mirrors or other collections, or held in an `Option`, a
+`Result`, a collection or a mirror's field — has nothing to write back into, since Sysl's value and
+the Avin one are not alike. It crosses as a `[]const T`, a slice Sysl may only read, so a Sysl type
+that would let the function write into it is reported at the binding rather than handed a copy
+whose writes are lost:
+
+```text
+error: the Sysl binding `names` does not match `avintest.digits.name_all`: Sysl may write the elements of its `[]string`, and an `Array` there crosses as a copy it may only read, so what it wrote would never reach the array: an `Array` is written back only as the binding's own parameter, of bytes, integers, reals, booleans or characters
+```
+
+The array is copied rather than handed to Sysl as a view of its own elements. The collector never
+moves an object, so a view would be sound for the length of the call, but a Sysl slice of memory it
+does not own carries no owner, and nothing stops the Sysl function from keeping it: in a structure,
+a buffer, another thread. Once the call returns, the collector may free the array under that slice.
+A copy keeps the rule below whole, and costs one pass over the array each way, which beside the
+system call a buffer is usually filled by is nothing.
+
+```text
+error: `Vector[List[int]]` cannot cross to Sysl; a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, data types declared with `@sysl` to mirror a Sysl enum or struct, and `Array`, `Vector`, `Option`, `Result` and tuples of these
 ```
 
 **Avin heap references never enter Sysl memory.** A Sysl container cannot hold an Avin object,
 because Sysl's reference counting cannot keep an Avin object alive and the collector cannot see Sysl
-memory. That is why a collection crosses as a copy of its elements, never as the Avin array itself.
+memory. That is why a collection crosses as a copy of its elements, never as the Avin array itself,
+even an array Sysl [fills](#filled-arrays).
 Avin's own collections are written in Avin, so the standard library has no need for Sysl
 containers of Avin values.
 
@@ -264,8 +315,8 @@ parseBigInt(s: string) -> Option[BigInt]
 ```
 
 - **Only a binding makes a handle.** A handle has no parameters and no constructor; a binding that
-  returns one — directly, in an `Array`, a `Vector`, an `Option` or a `Result`, or from a handle's
-  own method — makes the object, holding one counted reference to the Sysl value it was given (a
+  returns one — directly, in an `Array`, a `Vector`, an `Option` or a `Result`, as a part of a
+  tuple, or from a handle's own method — makes the object, holding one counted reference to the Sysl value it was given (a
   value is moved into a reference of its own; a counted reference is shared). A collection of
   handles comes from a Sysl slice or `Buf` of values or of counted references, and each element is
   a handle of its own, closed and collected on its own.
@@ -273,8 +324,10 @@ parseBigInt(s: string) -> Option[BigInt]
   of a binding or of another handle's method. A Sysl type with a destructor is always held by a
   counted reference, and its parameter shares the handle's; a type without one is passed as the
   Sysl parameter takes it — by value, a copy, or as a pointer to the handle's own value. A handle
-  inside an `Option` or a collection does not go into Sysl, and no mirror holds one. Its Sysl
-  value's fields are not the handle's members.
+  inside an `Option`, a collection or a tuple does not go into Sysl, and no mirror holds one; a
+  tuple holding a handle crosses out of Sysl as a result, the value of its `Option` or `Result`, or
+  a part of a tuple that is one of these, as `accept` answers `Result[(Socket, Address), IoError]`,
+  and never sits in a collection. Its Sysl value's fields are not the handle's members.
 
   ```avin
   @sysl("sysl.net.Address")
@@ -334,6 +387,53 @@ parseBigInt(s: string) -> Option[BigInt]
 
 The bytes a handle's method answers may be a view of the handle's own value; they are copied out
 before anything else runs, so the Avin array never reads the Sysl value's memory.
+
+## Calls that wait
+
+A Sysl function that may wait — for a connection, for data on a socket or a pipe, for a process to
+end, for time to pass — is bound with **`blocking`** after its name. A handle's method bound by its
+own name takes `@sysl(blocking)`:
+
+```text
+@sysl("sysl.net.accept", blocking)
+private acceptRaw(listener: long) -> Result[long, SyslIoError]
+
+@sysl("sysl.net.Socket")
+class Socket
+    @sysl(blocking)
+    recv(max: long) -> Result[Array[byte], SyslIoError]
+    @sysl("send_all", blocking)
+    write(bytes: Array[byte]) -> Result[unit, SyslIoError]
+```
+
+While a blocking call waits, its thread is **safe for the collector**, as a thread waiting on a
+lock, a channel or a join is ([threads](/spec/threads/)): every other thread goes on allocating, and
+a collection runs without waiting for this one. A call that is not declared blocking holds up every
+collection for as long as it runs, so a binding that can wait for something outside the program is
+declared blocking. On a program's only thread, `blocking` costs two stores and two loads.
+
+The shim keeps the Sysl call away from the Avin heap while the thread is safe, because the collector
+may then free any object no frame still holds:
+
+- **Every argument is converted before the call**, so the call reads Sysl copies, never an Avin
+  object. Since a collection [crosses as a copy](#collections-are-copies), no argument is a
+  pointer into the Avin heap.
+- **A handle's method takes its own share** of the handle's Sysl value before it waits, so the value
+  outlives the call even if the handle is collected, and its finalizer run, meanwhile.
+- **The result is converted after the call**, once the thread is running again, since converting
+  makes Avin objects. Bytes a handle's method answers, which may be a view of the handle's value,
+  are copied into Sysl memory first.
+- **A [filled array](#filled-arrays) is copied in before the call and back after it.** The Sysl
+  function writes its own slice while it waits, the array stays held by the calling thread's stack
+  throughout, and what the function left is copied into the array once the thread is running
+  again, after the result is converted. A blocking `read(into: Array[byte])` is bound this way.
+
+`blocking` is written alone and once, and only on a function or a handle's method: a type does not
+wait.
+
+```text
+error: `blocking` is written alone, after the Sysl function's name: `@sysl("sysl.net.accept", blocking)`
+```
 
 ## Generics
 

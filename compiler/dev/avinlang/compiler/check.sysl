@@ -1611,10 +1611,16 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
     val unit = block.unit
     val k = block.trait_id
     val trait_name = if block.on_trait then c.classes[k].name else head_name(written_target)
-    if static_member
+    // A built-in type's static members may be added where its methods may, as an extension.
+    if static_member && (block.on_trait || block.decl.type_params.len() > 0 || !scalar_builtin(written_target))
         val adds = if block.on_trait then "a trait's member and its implementations are" else "a type's own member is"
         c.note(unit, f.name_span, s"`${f.name}` is static, which only $adds; an impl adding to `$trait_name` adds methods of values")
         return
+    if static_member
+        if !static_member_allowed(c, unit, f, trait_name, false, false) then return
+        if language_static(written_target, f.name)
+            c.note(unit, f.name_span, s"`$trait_name.${f.name}` is the language's own, and no static member can redefine it")
+            return
     if f.annotations.len() > 0
         c.note(unit, f.name_span, "annotations on methods are not implemented")
         return
@@ -1689,6 +1695,16 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
     if same_as_overload(c, symbol, same_name)
         c.note(unit, f.name_span, s"`${f.name}` is already added to `${if nested then type_name(target) else trait_name}` with the same parameter types; a method's overloads differ in their parameter types")
         return
+    symbol.static_member = static_member
+    if scalar_builtin(target)
+        var named = receiver_methods(c, target, f.name)
+        for m in same_name
+            named.push(m)
+        for m in named
+            if c.symbols[m].static_member != static_member
+                if static_member then c.note(unit, f.name_span, s"`${f.name}` is already a method of a value of `$trait_name`, so it cannot also be a static member of the type")
+                else c.note(unit, f.name_span, s"`${f.name}` is already a static member of `$trait_name`, so it cannot also be a method of its values")
+                return
     c.symbols.push(symbol)
     c.states.push(0)
     c.bodies.push(None)
@@ -2142,6 +2158,25 @@ private static_member_allowed(c: *Checker, unit: usize, f: &Function, owner_name
         c.note(unit, f.name_span, s"`${f.name}` is static, so it needs a body: it belongs to `$owner_name` itself")
         return false
     true
+
+/** Whether `t` is one of the built-in scalar types, `string` among them, whose own static members an
+ * impl without a trait declares: no companion object can be declared for them. */
+private scalar_builtin(t: &Type) -> bool = *t match
+    Str -> true
+    Char -> true
+    Bool -> true
+    Real -> true
+    Byte -> true
+    Int(_) -> true
+    _ -> false
+
+/** Whether `t.name` is a member the language gives built-in type `t`: the conversion `wrap`, which
+ * every built-in type's name is read for, and the limits of a numeric type and `char`. */
+private language_static(t: &Type, name: string) -> bool
+    if name == "wrap" then return true
+    if !(*t is Int(_) || *t is Byte || *t is Char || *t is Real) then return false
+    if name == "MaxValue" || name == "MinValue" then return true
+    *t is Real && (name == "MinPositiveValue" || name == "PositiveInfinity" || name == "NegativeInfinity" || name == "NaN")
 
 // A variant's fields are resolved with its type's parameters in scope. Variant names share one
 // space within a file, since a variant is named on its own (`Some(1)`, `None`) wherever it is used.
@@ -3131,8 +3166,12 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
     if trait_id is Some(t)
         if !static_mirrors_trait(c, unit, f, t, static_member) then return
     elif static_member
-        c.note(unit, f.name_span, s"`${f.name}` is static, which only a trait's member and its implementations are; an impl without a trait adds methods of values")
-        return
+        if !scalar_builtin(target)
+            c.note(unit, f.name_span, s"`${f.name}` is static, which only a trait's member, its implementations and a built-in type's own members are; an impl of `$type_name_of` without a trait adds methods of values, and its companion object holds what belongs to the type")
+            return
+        if language_static(target, f.name)
+            c.note(unit, f.name_span, s"`$type_name_of.${f.name}` is the language's own, and no static member can redefine it")
+            return
     if *target is Data(id, _, _)
         var field = false
         for v in c.data[id].variants
@@ -3149,6 +3188,14 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
         _ ->
             for m in c.builtin_methods
                 if same_type(c.symbols[m].receiver.unwrap(), target) && c.symbols[m].decl.name == f.name then same_name.push(m)
+    // `string.name` and `s.name` would otherwise be two different functions, told apart only by
+    // whether a type or a value is written before the dot.
+    if scalar_builtin(target)
+        for m in same_name
+            if c.symbols[m].static_member != static_member
+                if static_member then c.note(unit, f.name_span, s"`${f.name}` is already a method of a value of `$type_name_of`, so it cannot also be a static member of the type")
+                else c.note(unit, f.name_span, s"`${f.name}` is already a static member of `$type_name_of`, so it cannot also be a method of its values")
+                return
     val id = c.symbols.len()
     // A data type's methods share its type parameters, then have their own, and so do the integer
     // family's and a tuple family's; a built-in type has none, so its methods' type parameters are
@@ -5790,19 +5837,49 @@ private names_self(t: &TypeExpr) -> bool
 /** The Sysl function a binding names: the string of its `@sysl` annotation, when it has one. */
 binding_target(f: &Function) -> Option[string]
     for a in f.annotations
-        if a.name == "sysl" && a.args.len() == 1
+        if a.name == "sysl" && a.args.len() >= 1 && a.args[0].name is None
             if a.args[0].value.kind is StringLit(path) then return Some(path)
     None
 
+/** Whether a binding's `@sysl` says its Sysl function may block, with the word `blocking` after the
+ * function's name: its shim marks the thread safe for the collector around the call. */
+is_blocking_binding(f: &Function) -> bool
+    for a in f.annotations
+        if a.name != "sysl" then continue
+        for arg in a.args
+            if is_blocking_word(arg) then return true
+    false
+
+private is_blocking_word(arg: AnnotationArg) -> bool
+    if arg.name is Some(_) then return false
+    arg.value.kind match
+        Name(word) -> word == "blocking"
+        _ -> false
+
+// The arguments of a function's `@sysl` after the Sysl function's name, or after none on a handle's
+// method bound by its own name: `blocking`, once and alone, and nothing else.
+private check_binding_flags(c: *Checker, unit: usize, a: Annotation, first: usize)
+    var blocking = false
+    for i in first..<a.args.len()
+        val arg = a.args[i]
+        if is_blocking_word(arg)
+            if blocking then c.note(unit, arg.value.span, "`@sysl` takes `blocking` once")
+            blocking = true
+        elif arg.name is Some(k) && k == "blocking"
+            c.note(unit, arg.value.span, "`blocking` is written alone, after the Sysl function's name: `@sysl(\"sysl.net.accept\", blocking)`")
+        else c.note(unit, arg.value.span, "`@sysl` takes the Sysl function's module and name, and after it only `blocking`, for a call that may wait: `@sysl(\"sysl.net.accept\", blocking)`")
+
 // A binding is a top-level function without a body whose `@sysl("module.path.name")` names a Sysl
-// function. Its parameters and result are boundary types, which the generated shim converts; a
-// binding with a wrong type is caught when Sysl checks the shim.
+// function, followed by `blocking` where the call may wait. Its parameters and result are boundary
+// types, which the generated shim converts; a binding with a wrong type is caught when Sysl checks
+// the shim.
 private check_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Type], result: Option[&Type], intrinsic: bool)
     for a in f.annotations
         if a.name != "sysl" then continue
         var path: Option[string] = None
-        if a.args.len() == 1 && a.args[0].name is None
+        if a.args.len() >= 1 && a.args[0].name is None
             if a.args[0].value.kind is StringLit(p) then path = Some(p)
+        if path is Some(_) then check_binding_flags(c, unit, a, 1)
         path match
             Some(p) ->
                 if !is_sysl_path(p) then c.note(unit, a.span, s"`@sysl` names a Sysl function by its module and name, as in `sysl.text.to_upper`; `$p` is not one")
@@ -5826,10 +5903,10 @@ private check_crossings(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
     if result is Some(r)
         if !crosses_out_of_sysl(c, r)
             val at = if f.result is Some(t) then t.span else f.name_span
-            if holds_handle(c, r) then c.note(unit, at, s"`${type_name(r)}` cannot cross out of Sysl: a Sysl handle is a binding's result, or held in its `Array`, `Vector`, `Option` or `Result`")
+            if holds_handle(c, r) then c.note(unit, at, s"`${type_name(r)}` cannot cross out of Sysl: a Sysl handle is a binding's result, held in its `Array`, `Vector`, `Option` or `Result`, or a part of a tuple that is one of these")
             else c.note(unit, at, s"`${type_name(r)}` cannot cross to Sysl; ${BoundaryTypes}")
 
-const BoundaryTypes: string = "a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, data types declared with `@sysl` to mirror a Sysl enum or struct, and `Array`, `Vector`, `Option` and `Result` of these"
+const BoundaryTypes: string = "a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, data types declared with `@sysl` to mirror a Sysl enum or struct, and `Array`, `Vector`, `Option`, `Result` and tuples of these"
 
 /** Whether a value of type `t` crosses between Avin and Sysl, converted by a binding's shim. A Sysl
  * handle held in another type crosses only out of Sysl, as a binding's result or held in its
@@ -5857,7 +5934,25 @@ private crosses(c: *Checker, t: &Type, handles: bool) -> bool = *t match
         d.name == "Result" && args.len() == 2 && crosses(c, args[0], handles) && crosses(c, args[1], handles)
     Class(k, _, args) ->
         if handle_target(c.classes[k].decl) is Some(_) then return handles
-        (is_array_class(c.classes[k]) || is_vector_class(c.classes[k])) && args.len() == 1 && crosses(c, args[0], handles)
+        // A collection's elements may be handles, but not tuples holding one.
+        (is_array_class(c.classes[k]) || is_vector_class(c.classes[k])) && args.len() == 1 && crosses(c, args[0], handles) && !tuple_holds_handle(c, args[0])
+    Tuple(items) ->
+        for item in items
+            if !crosses(c, item, handles) then return false
+        true
+    _ -> false
+
+/** Whether `t` is a tuple holding a Sysl handle, or holds one. */
+private tuple_holds_handle(c: *Checker, t: &Type) -> bool = *t match
+    Tuple(_) -> holds_handle(c, t)
+    Data(_, _, args) ->
+        for a in args
+            if tuple_holds_handle(c, a) then return true
+        false
+    Class(_, _, args) ->
+        for a in args
+            if tuple_holds_handle(c, a) then return true
+        false
     _ -> false
 
 /** Whether `t` is a Sysl handle itself. */
@@ -5865,8 +5960,12 @@ private is_handle(c: *Checker, t: &Type) -> bool = *t match
     Class(k, _, _) -> handle_target(c.classes[k].decl) is Some(_)
     _ -> false
 
-/** Whether `t` is a Sysl handle, or a collection, `Option` or `Result` that holds one. */
+/** Whether `t` is a Sysl handle, or a collection, `Option`, `Result` or tuple that holds one. */
 private holds_handle(c: *Checker, t: &Type) -> bool = *t match
+    Tuple(items) ->
+        for item in items
+            if holds_handle(c, item) then return true
+        false
     Data(id, _, args) ->
         if c.data[id].module_name != CoreModule then return false
         for a in args
@@ -5925,18 +6024,24 @@ private check_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
                         continue
                     if !bodyless then c.note(unit, a.span, "a method with a body is not bound to Sysl, so it takes no `@sysl`")
                     var name: Option[string] = None
-                    if a.args.len() == 1 && a.args[0].name is None
+                    if a.args.len() >= 1 && a.args[0].name is None
                         if a.args[0].value.kind is StringLit(p) then name = Some(p)
+                    // `@sysl(blocking)` binds a method that may wait to the Sysl method of its own
+                    // name's words.
+                    val own_name = name is None && a.args.len() >= 1 && (is_blocking_word(a.args[0]) || a.args[0].name is Some(_))
+                    if name is Some(_) then check_binding_flags(c, unit, a, 1)
+                    elif own_name then check_binding_flags(c, unit, a, 0)
                     name match
                         Some(p) ->
                             if !is_sysl_path("x." + p) || p.contains(".") then c.note(unit, a.span, s"`@sysl` on a handle's method names the Sysl method it is bound to, as in `@sysl(\"close\")`; `$p` is not one")
-                        None -> c.note(unit, a.span, "`@sysl` on a handle's method takes one string, the name of the Sysl method it is bound to, as in `@sysl(\"close\")`")
+                        None ->
+                            if !own_name then c.note(unit, a.span, "`@sysl` on a handle's method takes one string, the name of the Sysl method it is bound to, as in `@sysl(\"close\")`, or `blocking` alone where the method may wait")
 
 /** The Sysl method a bound method of a handle calls: the one its `@sysl("name")` names, or the one of
  * its own name's words in snake_case. */
 handle_method_name(f: &Function) -> string
     for a in f.annotations
-        if a.name == "sysl" && a.args.len() == 1
+        if a.name == "sysl" && a.args.len() >= 1 && a.args[0].name is None
             if a.args[0].value.kind is StringLit(name) then return name
     sysl_field_of(f.name)
 
@@ -6014,7 +6119,7 @@ private camel_of_sysl(name: string) -> string
     out.finish()
 
 // Whether a value of boundary type `t` holds a value of the mirror `target`, through the fields of
-// the mirrors and the type arguments of the `Option` and `Result` it holds.
+// the mirrors, the type arguments of the `Option` and `Result` it holds and the parts of its tuples.
 private holds_mirror(c: *Checker, t: &Type, target: usize, seen: *Buf[usize]) -> bool
     var id = 0usize
     *t match
@@ -6025,6 +6130,10 @@ private holds_mirror(c: *Checker, t: &Type, target: usize, seen: *Buf[usize]) ->
             id = d
         Class(_, _, args) ->
             for a in args
+                if holds_mirror(c, a, target, seen) then return true
+            return false
+        Tuple(items) ->
+            for a in items
                 if holds_mirror(c, a, target, seen) then return true
             return false
         _ -> return false
@@ -6909,6 +7018,7 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Member(target, name) ->
         if module_use(c, e) is Some(q) then check_form(c, q, expected, used)
         elif limit_constant(c, e.span, target, name) is Some(k) then k
+        elif static_value(c, e.span, target, name, expected) is Some(v) then v
         else member_expr(c, e, target, name, expected)
     Call(callee, args) -> call_expr(c, e.span, callee, args, expected)
     InfixCall(target, name, name_span, arg) -> infix_call(c, e.span, target, name, name_span, arg, expected)
@@ -7250,8 +7360,10 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
     if *ty is Function(ps, r)
         lambda_params = ps
         lambda_result = r
-    // The receiver is held in a local of the code making the value, which the closure captures.
-    val held = hidden_local(c, receiver.ty)
+    // The receiver is held in a local of the code making the value, which the closure captures; a
+    // static member's receiver is its type, which has no value to hold.
+    val on_type = receiver.kind is TypeReceiver
+    val held = if on_type then 0usize else hidden_local(c, receiver.ty)
     val enclosing = c.symbols[c.current]
     val decl = Function(buf(), at, at, "lambda", buf(), buf(), None, None, buf())
     val id = c.symbols.len()
@@ -7260,7 +7372,7 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
     c.bodies.push(None)
     c.locals.push(buf())
     var args: Buf[&TExpr] = buf()
-    args.push(TExpr(at, receiver.ty, Local(held)))
+    args.push(if on_type then receiver else TExpr(at, receiver.ty, Local(held)))
     var param_locals: Buf[usize] = buf()
     for i in 0..<lambda_params.len()
         val index = c.body.locals.len()
@@ -7268,12 +7380,12 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
         param_locals.push(index)
         args.push(TExpr(at, lambda_params[i], Local(index)))
     c.symbols[id].param_locals = param_locals
-    c.body.uses.push(CaptureUse(id, held, false))
+    if !on_type then c.body.uses.push(CaptureUse(id, held, false))
     c.body.calls.push(LocalCall(c.current, id))
     val call = method_call_kind(c, receiver.ty, m, args, solved, false)
     c.bodies.set(id, Some(TExpr(at, lambda_result, call)))
     var items: Buf[&TExpr] = buf()
-    items.push(TExpr(receiver.span, Unit, Let(held, receiver)))
+    if !on_type then items.push(TExpr(receiver.span, Unit, Let(held, receiver)))
     items.push(TExpr(at, ty, FunctionValue(id, buf())))
     TExpr(at, ty, Block(items))
 
@@ -10681,6 +10793,41 @@ static_receiver(c: *Checker, target: &Expr, member: string) -> Option[&Type]
 
 // A call of the static member `name` of type `ty`: the type's own where the type is known, and its
 // type argument's in each instance where it is a type parameter.
+/** The members named `name` of known type `t`, static or not, as a call on the type's name finds
+ * them; a built-in type's include those an extension the file sees adds. */
+private members_of_type(c: *Checker, t: &Type, name: string) -> Buf[usize] = *t match
+    Class(k, _, _) -> methods_named(c, k, name)
+    _ ->
+        val own = visible_methods(c, receiver_methods(c, t, name))
+        if scalar_builtin(t) then with_trait_methods(c, t, name, own) else own
+
+// `Type.name` without a call, where the type's static member `name` is meant: a function value of
+// it, which takes the member's parameters. Where the member is overloaded the expected function
+// type picks the one whose parameter types it has. `None` where `target` names no known type with
+// a static member `name`, so the expression is read as any other member.
+private static_value(c: *Checker, at: Span, target: &Expr, name: string, expected: Option[&Type]) -> Option[&TExpr]
+    if !(target.kind is Name(_) || target.kind is TypeApply(_, _)) then return None
+    val ty = static_receiver(c, target, name)?
+    val t = zonk(c, ty)
+    if *t is TypeVar(_, _, _) || *t is ErrorType then return None
+    var statics: Buf[usize] = buf()
+    for m in members_of_type(c, t, name)
+        if c.symbols[m].static_member then statics.push(m)
+    if statics.len() == 0 then return None
+    val receiver = TExpr(target.span, t, TypeReceiver)
+    if statics.len() == 1 then return Some(method_value(c, at, receiver, statics[0], None, expected))
+    if expected is Some(want)
+        if *zonk(c, want) is Function(ps, _)
+            for m in statics
+                val params = c.symbols[m].params
+                if params.len() == ps.len() + 1 && c.symbols[m].type_params.len() == 0
+                    var fits = true
+                    for i in 0..<ps.len()
+                        if !same_type(zonk(c, ps[i]), params[i + 1]) then fits = false
+                    if fits then return Some(method_value(c, at, receiver, m, None, expected))
+    c.note(unit_of(c), at, s"`${type_name(t)}.$name` has several overloads, and nothing here says which is meant; give it a function type, as in `val f: (…) -> … = ${type_name(t)}.$name`")
+    Some(TExpr(at, ErrorType, UnitConst))
+
 private static_call(c: *Checker, at: Span, name_span: Span, target: &Expr, ty: &Type, name: string, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
     // In an impl made from a template, `T`'s shape and the code over its fields are written here,
     // for the deriving type.
@@ -10700,15 +10847,14 @@ private static_call(c: *Checker, at: Span, name_span: Span, target: &Expr, ty: &
                     c.note(unit, target.span, s"`Self.$name()` cannot be called in a trait's default body, which every type implementing the trait shares; a function bounded by the trait calls it, as `T.$name()`")
                     reported = true
             if !reported then ms = bound_methods(c, t, name)
-        Class(k, _, _) -> ms = methods_named(c, k, name)
-        _ -> ms = visible_methods(c, receiver_methods(c, t, name))
+        _ -> ms = members_of_type(c, t, name)
     var statics: Buf[usize] = buf()
     for m in ms
         if c.symbols[m].static_member then statics.push(m)
     if statics.len() == 0
         if !reported
             if ms.len() > 0 then c.note(unit, name_span, s"`$name` is a method of a value of `${type_name(t)}`, not of the type; call it on a value")
-            else c.note(unit, name_span, s"`${type_name(t)}` has no static member `$name`")
+            elif !(scalar_builtin(t) && refuse_private_trait_method(c, name_span, t, name)) then c.note(unit, name_span, s"`${type_name(t)}` has no static member `$name`")
         for a in args
             check_statement(c, a.value)
         return TExpr(at, ErrorType, UnitConst)
@@ -10775,6 +10921,8 @@ private several_bound_call(c: *Checker, at: Span, name_span: Span, receiver: &TE
 private refuse_static_on_value(c: *Checker, at: Span, receiver: &TExpr, m: usize) -> bool
     val target = c.symbols[m]
     if !target.static_member || receiver.kind is TypeReceiver then return false
+    // A receiver already reported, as `self` in a static member's body is, names no type to show.
+    if *zonk(c, receiver.ty) is ErrorType then return true
     val shown = type_name(zonk(c, receiver.ty))
     c.note(unit_of(c), at, s"`${target.decl.name}` is static: it belongs to the type, so it is called on the type, as in `$shown.${target.decl.name}()`, not on a value")
     true

@@ -547,6 +547,18 @@ a decision changes, this page and the chapter change together.
   boundary type is copied into a Sysl slice. Collections nest, inside one another, `Option`,
   `Result` and mirrors' fields. `Array[byte]` stays a bulk copy to and from `[]u8`. No other Avin
   collection crosses.
+- Settled by the user 2026-11-04: **A Sysl function may fill an Avin array** ([Sysl
+  bindings](/spec/sysl-bindings/#filled-arrays)). An `Array` of `byte`, an integer type, `real`,
+  `bool` or `char` that is a binding's own parameter (a handle method's too) is copied into a `[]T`
+  the Sysl function may write, and copied back into the array element by element when it returns;
+  the shim keeps the array as a root of the thread's stack from before the call until the copy
+  back, which runs after the result is made. The representation is a copy, not a view of the
+  array's own elements: the collector never moves an object, but a Sysl slice of memory it does
+  not own has no owner, so a Sysl function that kept it would read freed memory once the call
+  returned; a copy keeps Avin memory out of Sysl. Every other array crossing into Sysl (of other
+  elements, or inside an `Option`, a `Result`, a collection or a mirror's field) goes in as a
+  `[]const T`, so a Sysl type that could write into it is refused at the binding instead of
+  silently losing the writes. A `Vector` stays a `[]T` copy: it never changes, so nothing is lost.
 - `Option[+T]` and `Result[+T, +E]` are `data` types of the core library, written in Avin, with
   their methods in an `impl`. See [errors](/spec/errors/#option-and-result).
 - Settled by the user 2026-11-04 ("follow the reference library"): `Option`, `Either` and `Result`
@@ -690,12 +702,30 @@ Settled by the user on 2026-11-03:
   and they are called on a type, `int.zero()`, or on a bounded type parameter, `T.zero()`. `sum()`
   and `product()` on the collections are written with them. The details of
   [static members](/spec/declarations/#static-members): `static` is a keyword, written after
-  `private` and before or after `override`; a static member is only a trait's or an implementation
-  of one, with no static members of a type's own; in a trait it has no default body, and no trait
+  `private` and before or after `override`; a static member is a trait's, an implementation of one,
+  or a built-in type's own (below), and a class or `data` type keeps what belongs to the type in its
+  companion object; in a trait it has no default body, and no trait
   overrides one; an implementation is `static` exactly where the trait's member is, an abstract class
   giving it too; its body has no `self`; a trait's default body cannot call one on `Self`; a trait
   with one is a bound and not a type; and a local, parameter, member or module value of a type's
   name hides the type as a receiver.
+- Settled by the user 2026-11-04: a built-in type declares
+  [static members of its own](/spec/declarations/#static-members-of-built-in-types), as `static`
+  members of an impl of the type without a trait (`impl string` with
+  `static fromUtf8(bytes: Array[byte]) -> Result[string, Utf8Error]`), for `string`, `char`,
+  `bool`, `real`, `byte` and each integer type, since a built-in type has no companion object. The
+  core library declares the built-in types' own; a program adds them in an extension, as it adds
+  methods, seen where the module is imported and private to it where marked so. They are called on
+  the type's name, never on a value, and their bodies have no `self`. A name is a static member or
+  a method of the type's values, never both; static members of one name overload by parameter
+  types; `wrap` and the numeric limits (`MaxValue`, `MinValue`, `real`'s `NaN` and the rest) are the
+  language's and cannot be redeclared. A generic impl, an impl adding to a trait and an impl of a
+  class or `data` type declare no static member of their own. Any static member named on a known
+  type without a call (`string.fromUtf8Lossy`, `int.zero`, `Point.zero`) is a function value of its
+  parameters; an overloaded one takes the expected function type's overload, and without one is an
+  error. The first use is `string.fromUtf8` and `string.fromUtf8Lossy`
+  ([strings from bytes](/spec/types/#strings-from-bytes)), bound to Sysl's UTF-8 decoders, with
+  `Utf8Error(offset: long, truncated: bool)` mirroring Sysl's error.
 - `i1` has no `1`: `i1.one()` is a compile error, and `one()` reached at `i1` through a generic
   traps with "i1 has no 1" at the place the program called, so a generic that passes its bounds
   compiles for every type meeting them.
@@ -1527,6 +1557,13 @@ Settled by the user on 2026-11-04:
   callback registered on one reaches, and the first code to use a handle in transit takes it. The
   finalizer never checks: it runs only on an unreachable handle, on the collecting thread while the
   others are stopped.
+- Settled by the user 2026-11-04: **Tuples cross the Sysl boundary** ([Sysl bindings](/spec/sysl-bindings/#boundary-types)).
+  A tuple of boundary types is a Sysl tuple of the same arity, in each direction, each part converted
+  as it would be alone: an integer part out of Sysl takes any Sysl integer with the range check, and
+  tuples nest in one another, in `Option`, `Result`, `Array` and `Vector`, and in a mirror's fields.
+  A handle may be a part of a tuple that is a binding's result or the value of its `Option` or
+  `Result`, so `accept` answers `Result[(Socket, Address), IoError]`; a tuple holding a handle does
+  not go into Sysl or sit in a collection. `avin.process` has `environment()` over `sysl.env.vars`.
 
 - Settled by the user 2026-11-04: **Text blocks under an interpolator that reads no escapes** ([text
   blocks](/spec/strings-and-formatting/#text-blocks)). The parts `raw"""…"""` and a program's own
@@ -1560,6 +1597,15 @@ Settled by the user on 2026-11-04:
   `PropertyValueAliases.txt`, ignoring case, and only the scripts `Scripts.txt` lists, with
   `Unknown`, exist; a block by its name in `Blocks.txt`, that name without spaces, or any of its
   names in `PropertyValueAliases.txt`, short ones included, ignoring case.
+- Settled by the user 2026-11-04: [blocking bindings](/spec/sysl-bindings/#calls-that-wait): a
+  binding whose Sysl call may wait is written `@sysl("module.name", blocking)`, and a handle's
+  method bound by its own name `@sysl(blocking)`; `blocking` is a bare word, written once, and
+  nothing else follows the name. The shim converts every argument and takes a handle method's own
+  share of the Sysl value, then marks the thread safe for the collector, makes the call, marks it
+  running again (waiting out a collection in progress) and only then converts the result; bytes a
+  handle's method answers are copied into Sysl memory before the thread leaves the safe region. A
+  blocking call therefore never reads or writes the Avin heap, and an argument that is a pointer
+  into it, such as a buffer Sysl fills, would need its object held by a frame for the whole call.
 
 **Deferred**
 

@@ -114,12 +114,19 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
     put(&w, "module avin.shims\n\nimport avin.rt.{Context, stop_in_binding, text_bytes, text_length, text_of}\nimport sysl.raw.str_cast\n")
     if converts then put(&w, "import avin.rt.{Frame, allocate, array_elements, array_length, descriptor_of, new_array}\nimport sysl.raw.ptr_cast\nimport sysl.slices.copy\n")
     elif handles.len() > 0 then put(&w, "import sysl.raw.ptr_cast\n")
+    var blocks = false
+    // A handle's method that blocks and answers bytes copies them into a buffer of the shim's own.
+    var owns_bytes = false
+    for b in bindings
+        if b.blocking then blocks = true
+        if b.blocking && !(b.reach is TopLevel) && b.result.form is Bytes then owns_bytes = true
+    if blocks then put(&w, "import avin.rt.{enter_safe, leave_safe}\n")
     var collects = false
     for c in w.ins
         if c.form is Elements(_, _) then collects = true
     for c in w.outs
         if c.form is Elements(_, _) then collects = true
-    if collects then put(&w, "import sysl.buf.{Buf, buf}\n")
+    if collects || owns_bytes then put(&w, "import sysl.buf.{Buf, buf}\n")
     for i in 0..<bindings.len()
         // A handle's method is reached through the handle's import.
         if !(bindings[i].reach is TopLevel)
@@ -164,6 +171,8 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
             if p.form is Handle(_)
                 handles.push(PassedHandle(args.len(), handle_index(&w, p), s"a$k"))
                 args.push("")
+            // An array the Sysl function may fill is passed as a slice of its own, read back after.
+            elif filled(p) then args.push(s"s$k")
             else args.push(into_expr(&w, p, s"a$k", s"ep$k", 0))
         // Each parameter's layouts, then the result's.
         for k in 0..<b.params.len()
@@ -184,12 +193,22 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
         receiver match
             Some(m) -> put(&w, s"\n    val s: *Slot_$m = ptr_cast(a0)")
             None -> ()
+        // Each array the Sysl function may fill is copied into a slice it may write, and kept as a
+        // frame of the thread's stack until its elements are copied back: the collector, which never
+        // moves an object, may run while the call waits or while the result is converted.
+        var fills: Buf[usize] = buf()
+        for k in 0..<b.params.len()
+            val p = b.params[k]
+            if (receiver is Some(_) && k == 0) || !filled(p) then continue
+            fills.push(k)
+            val made = if p.form is Bytes then s"bytes_in(a$k)" else s"in_${function_of(&w, p, false).unwrap()}(ctx, a$k, ep$k)"
+            put(&w, s"\n    val s$k = $made\n    var root$k = Root(Frame(ctx.top, 1usize), a$k)\n    ctx.top = ptr_cast(&root$k)")
         // `close()` gives back the handle's share of its Sysl value, and the handle holds nothing.
         if b.reach is Release
             put(&w, "\n    release(s.r)\n")
             last.push(w.line - 1)
             continue
-        val callee = b.reach match
+        var callee = b.reach match
             Method(name) -> s"s.r.$name"
             _ -> s"bound_$i"
         // A result that holds a collection may be spelled with a slice or a `Buf`, and one that holds
@@ -207,7 +226,8 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
                 if m == h.mirror then seen = true
             if !seen then types.push(h.mirror)
         put(&w, "\n")
-        call_arms(&w, b, callee, args, handles, types, 0, buf(), receiver is Some(_), "    ")
+        call_arms(&w, b, callee, args, handles, types, 0, buf(), receiver is Some(_), fills, "    ")
+        last.push(w.line - 1)
         last.push(w.line - 1)
     var k = 0usize
     while k < w.ins.len()
@@ -250,11 +270,10 @@ private struct PassedHandle
 // written once for each choice of the handles' types `types` from `depth` on having a destructor or
 // not: `dropped` holds the ones taken so far to have one. `method` says the callee is a handle's
 // method.
-private call_arms(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[string], handles: Buf[PassedHandle], types: Buf[usize], depth: usize, dropped: Buf[usize], method: bool, indent: string)
+private call_arms(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[string], handles: Buf[PassedHandle], types: Buf[usize], depth: usize, dropped: Buf[usize], method: bool, fills: Buf[usize], indent: string)
     if depth == types.len()
-        var call = callee + "("
+        var given: Buf[string] = buf()
         for k in 0..<args.len()
-            if k > 0 then call = call + ", "
             var arg = args[k]
             for h in handles
                 if h.arg != k then continue
@@ -262,9 +281,8 @@ private call_arms(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[stri
                 for m in dropped
                     if m == h.mirror then counted = true
                 arg = if counted then s"slot_${h.mirror}(${h.name}).r" else s"passed_${h.mirror}(${h.name})"
-            call = call + arg
-        call = call + ")"
-        call_lines(w, b, call, method, indent)
+            given.push(arg)
+        call_lines(w, b, callee, given, method, fills, indent)
         return
     val m = types[depth]
     var with: Buf[usize] = buf()
@@ -272,41 +290,94 @@ private call_arms(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[stri
         with.push(d)
     with.push(m)
     put(w, indent + s"if const mirror_$m: Drop\n")
-    call_arms(w, b, callee, args, handles, types, depth + 1, with, method, indent + "    ")
+    call_arms(w, b, callee, args, handles, types, depth + 1, with, method, fills, indent + "    ")
     put(w, indent + "else\n")
-    call_arms(w, b, callee, args, handles, types, depth + 1, dropped, method, indent + "    ")
+    call_arms(w, b, callee, args, handles, types, depth + 1, dropped, method, fills, indent + "    ")
 
-// The call `call` of binding `b`'s Sysl function and the conversion of its result, at `indent`.
-// `method` says the callee is a handle's method.
-private call_lines(w: *ShimWriter, b: &MirBinding, call: string, method: bool, indent: string)
+// The call of binding `b`'s Sysl function `callee` with `args`, and the conversion of its result, at
+// `indent`. `method` says the callee is a handle's method; `fills` are the parameters whose arrays the
+// function may fill, copied back once the result is made.
+private call_lines(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[string], method: bool, fills: Buf[usize], indent: string)
     // A result that holds a collection may be spelled with a slice or a `Buf`, and one that holds an
     // integer with any Sysl integer, so it takes the Sysl function's own type, and the overloads of
     // its conversion choose by it.
     var n = 0usize
     val spelled = spellings(w, b.result, true, &n)
+    var target = callee
+    var given: Buf[string] = buf()
+    // A call that may wait is made with the thread safe for the collector, which may run, and free
+    // a handle's object, meanwhile: every argument is converted, and each handle's share of its Sysl
+    // value taken, before it, so the call reads no Avin object; and what it answers is converted
+    // once the thread is running again.
+    if b.blocking
+        for k in 0..<args.len()
+            if args[k] == "()"
+                given.push("()")
+                continue
+            put(w, indent + s"val x$k = ${args[k]}\n")
+            given.push(s"x$k")
+        b.reach match
+            Method(name) ->
+                // Bytes the method answers may be a view of the handle's value, which no local may
+                // hold past the end of the safe region: they are copied, while the thread is still
+                // safe, into a buffer bound before the value's share.
+                if b.result.form is Bytes then put(w, indent + "var owned: Buf[u8] = buf()\n")
+                put(w, indent + "val h = s.r\n")
+                target = s"h.$name"
+            _ -> ()
+        put(w, indent + "enter_safe(ctx)\n")
+    else
+        for a in args
+            given.push(a)
+    var call = target + "("
+    for k in 0..<given.len()
+        if k > 0 then call = call + ", "
+        call = call + given[k]
+    call = call + ")"
     // A handle's method may answer a view of the handle's Sysl value, which Sysl lets no local hold
     // across a call that may free the value, as the conversion's allocation may: the conversion
     // takes the answer where the call gives it.
-    val direct = method && !(b.result.form is Plain)
+    val direct = method && !(b.result.form is Plain) && !b.blocking
     // An integer result takes any Sysl integer, converted with a check as a mirror's field is.
-    if *b.result.ty is Int(_)
+    val integral = *b.result.ty is Int(_)
+    if b.blocking
+        if integral
+            val side = sysl_side(b.result.ty)
+            put(w, indent + s"val raw = $call\n" + indent + "leave_safe(ctx)\n" + indent + s"val r: $side = integer_to(ctx, raw, \"$side\")\n")
+        // The bytes are copied before the thread leaves the safe region, touching only Sysl memory.
+        elif method && b.result.form is Bytes
+            put(w, indent + s"owned.extend($call)\n" + indent + "leave_safe(ctx)\n" + indent + "val r = owned.view()\n")
+        elif spelled.len() == 1 && n == 0 then put(w, indent + s"val r: ${spelled[0]} = $call\n" + indent + "leave_safe(ctx)\n")
+        else put(w, indent + s"val r = $call\n" + indent + "leave_safe(ctx)\n")
+    elif integral
         val side = sysl_side(b.result.ty)
         put(w, indent + s"val r: $side = integer_to(ctx, $call, \"$side\")\n")
     elif !direct
         if spelled.len() == 1 && n == 0 then put(w, indent + s"val r: ${spelled[0]} = $call\n")
         else put(w, indent + s"val r = $call\n")
     val r = if direct then call else "r"
+    var value = ""
     if b.result.form is Plain
-        if !(*b.result.ty is Unit) then put(w, indent + out_of_sysl(b.result.ty, r) + "\n")
+        if !(*b.result.ty is Unit) then value = out_of_sysl(b.result.ty, r)
     elif b.result.form is Bytes
-        put(w, indent + s"bytes_of(ctx, $r, d0)\n")
+        value = s"bytes_of(ctx, $r, d0)"
     else
         put(w, indent + s"var ds: [${b.result.layouts}]*u8 = [")
         for k in 0..<b.result.layouts
             if k > 0 then put(w, ", ")
             put(w, s"d$k")
         put(w, "]\n" + indent + "val dp: **u8 = ptr_cast(&ds)\n")
-        put(w, indent + out_expr(w, b.result, r, "dp", 0) + "\n")
+        value = out_expr(w, b.result, r, "dp", 0)
+    if fills.len() == 0
+        if value != "" then put(w, indent + value + "\n")
+    else
+        // The result is made while the arrays are still frames, and then what the Sysl function left
+        // in each slice is copied back into its array.
+        if value != "" then put(w, indent + s"val made: ${crossing_c_side(b.result)} = $value\n")
+        for k in fills
+            copy_back(w, b.params[k], k, indent)
+        put(w, indent + s"ctx.top = root${fills[0]}.frame.prev\n")
+        if value != "" then put(w, indent + "made\n")
 
 // The conversions of arrays of bytes, and the frame that keeps an object a conversion has made while
 // it makes the objects of the object's fields.
@@ -317,6 +388,9 @@ private const ConversionHelpers: string =
     "    var out: []u8 = [0; n]\n" +
     "    copy(out, array_elements(p)[0..<n])\n" +
     "    out\n" +
+    "\n// A copy of an Avin array as a Sysl function may only read it: what it wrote would never reach\n" +
+    "// the array.\n" +
+    "private read_only[T](s: []T) -> []const T = s\n" +
     "\n// A Sysl slice of bytes, copied into a new Avin array laid out by `d`.\n" +
     "private bytes_of(ctx: *Context, b: []const u8, d: *u8) -> *u8\n" +
     "    val p = new_array(ctx, ptr_cast(d), b.len)\n" +
@@ -357,6 +431,35 @@ private uses_bytes(bindings: Buf[MirBinding]) -> bool
         for p in b.params
             if p.form is Bytes then return true
     false
+
+// Whether a parameter is an array the Sysl function may fill: an array of bytes, integers, reals,
+// booleans or characters passed as the binding's own parameter, whose elements are copied back into
+// it after the call. An array anywhere else, or of any other elements, goes into Sysl read-only.
+private filled(p: &Crossing) -> bool = p.form match
+    Bytes -> true
+    Elements(element, vector) -> !vector && element.form is Plain && scalar(element.ty)
+    _ -> false
+
+// Whether a boundary type is a number, a boolean or a character, which a slice holds by value.
+private scalar(t: &Type) -> bool = *t match
+    Int(_) -> true
+    Real -> true
+    Bool -> true
+    Char -> true
+    _ -> false
+
+// Copies the slice `s<k>` the Sysl function was passed back into the array its frame `root<k>` holds:
+// it has the array's length, since a slice never grows.
+private copy_back(w: *ShimWriter, p: &Crossing, k: usize, indent: string)
+    if p.form is Bytes
+        put(w, indent + s"copy(array_elements(root$k.object)[0..<s$k.len], s$k)\n")
+        return
+    p.form match
+        Elements(element, _) ->
+            val side = crossing_c_side(element)
+            put(w, indent + s"val f$k: *$side = ptr_cast(array_elements(root$k.object))\n")
+            put(w, indent + s"for i in 0..<s$k.len do f$k[i] = ${out_of_sysl(element.ty, s"s$k[i]")}\n")
+        _ -> ()
 
 // Records the conversions a value of `c`'s type needs, in the direction `out` says, and the mirrors
 // they include, each once.
@@ -417,15 +520,30 @@ private handle_lines(w: *ShimWriter, m: usize, passed: bool)
     put(w, s"\nprivate passed_$m[P](p: *u8) -> P\n    val s: *Slot_$m = ptr_cast(p)\n    if const P::Kind == Kind.Ref\n        s.r\n    elif const P::Kind == Kind.Pointer\n        &*s.r\n    else\n        *s.r\n")
     w.passing.push(MirrorLines(m, helpers, w.line - 1))
 
-// The Sysl type a value of `c`'s type is converted to. A collection goes into Sysl as a slice.
+// The Sysl type a value of `c`'s type is converted to. A collection goes into Sysl as a slice, and an
+// array as one the Sysl function may only read, since what it wrote would never reach the array; only
+// a binding's own parameter that `filled` accepts is passed a slice it may write.
 private sysl_type(w: *ShimWriter, c: &Crossing) -> string = c.form match
     Plain -> sysl_side(c.ty)
-    Bytes -> "[]u8"
+    Bytes -> "[]const u8"
     OptionForm(_) -> s"Option[${sysl_type(w, payload(c, "Some"))}]"
     ResultForm -> s"Result[${sysl_type(w, payload(c, "Ok"))}, ${sysl_type(w, payload(c, "Err"))}]"
     Mirror(_, _, _, _, _) -> s"mirror_${mirror_of(w, c).unwrap()}"
-    Elements(element, _) -> s"[]${sysl_type(w, element)}"
+    Elements(element, vector) -> (if vector then "[]" else "[]const ") + sysl_type(w, element)
     Handle(_) -> s"mirror_${handle_index(w, c)}"
+    TupleForm ->
+        var parts: Buf[string] = buf()
+        for f in c.variants[0].fields
+            parts.push(sysl_type(w, f.crossing))
+        "(" + comma_list(parts) + ")"
+
+// `parts` separated by commas.
+private comma_list(parts: Buf[string]) -> string
+    var out = ""
+    for i in 0..<parts.len()
+        if i > 0 then out = out + ", "
+        out = out + parts[i]
+    out
 
 // Every Sysl type a value of `c`'s type is converted from. A collection comes out of Sysl as a slice
 // or a `Buf`, so a conversion that holds one is one overload for each way of spelling its type.
@@ -453,6 +571,23 @@ private spellings(w: *ShimWriter, c: &Crossing, generic: bool, n: *usize) -> Buf
             for t in oks
                 for e in errs
                     out.push(s"Result[$t, $e]")
+        // A tuple is spelled once for each way of spelling each of its parts.
+        TupleForm ->
+            var spelled: Buf[Buf[string]] = buf()
+            spelled.push(buf())
+            for f in c.variants[0].fields
+                val parts = spellings(w, f.crossing, generic, n)
+                var longer: Buf[Buf[string]] = buf()
+                for prefix in spelled
+                    for p in parts
+                        var next: Buf[string] = buf()
+                        for q in prefix
+                            next.push(q)
+                        next.push(p)
+                        longer.push(next)
+                spelled = longer
+            for s in spelled
+                out.push("(" + comma_list(s) + ")")
         Elements(element, _) ->
             for t in spellings(w, element, generic, n)
                 out.push(s"[]$t")
@@ -502,10 +637,11 @@ private passed_layouts(c: &Crossing) -> usize = if c.form is Plain || c.form is 
 // from `base` among the ones `ds` points at.
 private into_expr(w: *ShimWriter, c: &Crossing, value: string, ds: string, base: usize) -> string = c.form match
     Plain -> into_sysl(c.ty, value)
-    Bytes -> s"bytes_in($value)"
+    Bytes -> s"read_only(bytes_in($value))"
     _ ->
         val at = if base == 0 then ds else s"ptr_cast(usize($ds) + ${base * 8}usize)"
-        s"in_${function_of(w, c, false).unwrap()}(ctx, $value, $at)"
+        val made = s"in_${function_of(w, c, false).unwrap()}(ctx, $value, $at)"
+        if c.form is Elements(_, false) then s"read_only($made)" else made
 
 // The Sysl value `value` of `c`'s type converted out of Sysl, with its layouts from `base` among the
 // ones `ds` points at. An integer, a mirror's field or held in an option, a result or a collection,
@@ -530,6 +666,7 @@ private construction(w: *ShimWriter, c: &Crossing, v: CrossVariant, args: Buf[st
             if structure then s"$m($joined)"
             elif args.len() == 0 then s"$m.${v.name}"
             else s"$m.${v.name}($joined)"
+        TupleForm -> s"($joined)"
         _ -> if args.len() == 0 then v.name else s"${v.name}($joined)"
 
 // The conversion into Sysl of a value of the `k`th data type that crosses that way: its variant is
@@ -648,7 +785,7 @@ private out_overload(w: *ShimWriter, k: usize, c: &Crossing, spelling: string, p
 // library's function among the layouts, which neither allocates nor collects.
 private in_elements(w: *ShimWriter, k: usize, c: &Crossing, element: &Crossing, vector: bool)
     val own = if vector then 4usize else 1usize
-    put(w, s"\n// ${type_name(c.ty)} into Sysl.\nprivate in_$k(ctx: *Context, p: *u8, ds: **u8) -> ${sysl_type(w, c)}\n")
+    put(w, s"\n// ${type_name(c.ty)} into Sysl.\nprivate in_$k(ctx: *Context, p: *u8, ds: **u8) -> []${sysl_type(w, element)}\n")
     put(w, s"    var b: Buf[${sysl_type(w, element)}] = buf()\n")
     var indent = "    "
     if vector
@@ -894,6 +1031,9 @@ private unconverted_message(shim: ShimSource, message: string) -> string
     val integral = " to implement 'Integer', but "
     val refusal = " does not"
     val trimmed = message.trim()
+    read_only_refusal(trimmed) match
+        Some(wanted) -> return s"Sysl may write the elements of its `$wanted`, and an `Array` there crosses as a copy it may only read, so what it wrote would never reach the array: an `Array` is written back only as the binding's own parameter, of bytes, integers, reals, booleans or characters"
+        None -> ()
     if trimmed.starts_with("'avin.shims.") && trimmed.contains(integral) && trimmed.ends_with(refusal)
         var parts: Buf[string] = buf()
         for p in trimmed.split(integral)
@@ -910,6 +1050,32 @@ private unconverted_message(shim: ShimSource, message: string) -> string
         at += 1
     if at == prefix.bytes.len || k >= shim.unconverted.len() then return message
     shim.unconverted[k]
+
+// The Sysl type that wants to write, where Sysl's diagnostic `message` refuses a read-only slice in
+// its place: an array the shim passes read-only, given to a slice the Sysl function may write, alone
+// or inside another type.
+private read_only_refusal(message: string) -> Option[string]
+    val licence = "' is a licence to write them"
+    if message.contains(licence) && message.contains("' views elements it may not write, and a '")
+        var parts: Buf[string] = buf()
+        for p in message.split("' views elements it may not write, and a '")
+            parts.push(p)
+        var wanted: Buf[string] = buf()
+        for p in parts[1].split(licence)
+            wanted.push(p)
+        return Some(wanted[0])
+    val given = " was given"
+    if !message.ends_with(given) || !message.contains(", but ") || !message.contains("[]const ") then return None
+    var halves: Buf[string] = buf()
+    for p in message[0..<message.bytes.len - given.bytes.len].split(", but ")
+        halves.push(p)
+    if halves.len() != 2 then return None
+    var words: Buf[string] = buf()
+    for p in halves[0].split(" is ")
+        words.push(p)
+    val expected = words[words.len() - 1]
+    if expected.contains("[]const ") || halves[1].replace_all("[]const ", "[]") != expected then return None
+    Some(expected)
 
 // The line of a `path:line:col` place.
 private line_of(place: string) -> usize

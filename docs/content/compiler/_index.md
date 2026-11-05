@@ -751,7 +751,10 @@ safe, collects, lowers the flag and wakes the others. A thread becomes safe in t
   allocation the thread's chunk cannot serve is therefore a safepoint.
 - **Around a blocking call.** `avin_rt_enter_safe` and `avin_rt_leave_safe` bracket an operation
   that may wait (a lock, a condition, a channel, a join, reading input), so a blocked thread never
-  holds up a collection; leaving waits for a collection in progress to finish.
+  holds up a collection; leaving waits for a collection in progress to finish. The shim of a Sysl
+  binding declared `blocking` brackets its Sysl call the same way, after converting every argument
+  (and copying a handle's counted reference into a local) and before converting the result, so the
+  call touches nothing on the Avin heap while the collector may run.
 
 The handshake is a pair of sequentially consistent stores and loads, the flag by the collector and
 a context's state by its thread, so either the thread sees the flag and wakes the collector, or the

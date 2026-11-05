@@ -128,7 +128,7 @@ shim_bytes_results()
     val text = shim_source(program.bindings, program.handles).text
     // The result takes the Sysl function's own type, `[]u8` or `[]const u8`.
     assert(text.contains("    val r = bound_0("))
-    assert(text.contains("    bytes_of(ctx, r, d0)\n"))
+    assert(text.contains("    val made: *u8 = bytes_of(ctx, r, d0)\n"))
     assert(!text.contains("val r: []u8"))
     assert(text.contains(", v: Option[[]u8], ds: **u8) -> *u8\n"))
     assert(text.contains(", v: Option[[]const u8], ds: **u8) -> *u8\n"))
@@ -161,6 +161,33 @@ shim_handle_crossings()
     // The vector of handles is generic in the Sysl type of its elements.
     assert(shim.text.contains(", v: []E, ds: **u8) -> *u8 = elements_"))
     assert(shim.text.contains(", v: Buf[E], ds: **u8) -> *u8 = elements_"))
+
+@test("an array the Sysl function may fill is kept as a frame and copied back after the result is made")
+shim_filled_arrays()
+    val program = lower_source(repository_toolchain(), source_of("/probe/bytes.avin", BytesProgram)).unwrap()
+    val text = shim_source(program.bindings, program.handles).text
+    // The binding's own array parameter goes in as a slice Sysl may write, kept as a root.
+    assert(text.contains("    val s0 = bytes_in(a0)\n    var root0 = Root(Frame(ctx.top, 1usize), a0)\n    ctx.top = ptr_cast(&root0)\n"))
+    assert(text.contains("bound_0(s0)"))
+    // The result is made first, then the slice copied back, then the frame dropped.
+    assert(text.contains("    val made: *u8 = bytes_of(ctx, r, d0)\n    copy(array_elements(root0.object)[0..<s0.len], s0)\n    ctx.top = root0.frame.prev\n    made\n"))
+    // An array an option holds goes in read-only.
+    assert(text.contains("Some(read_only(bytes_in(p)))"))
+
+private const BlockingProgram: string = "@sysl(\"sysl.hint.black_box\", blocking)\nfill(b: Array[byte]) -> Array[byte]\n\n@sysl(\"sysl.hint.black_box\", blocking)\nsquares(a: Array[int]) -> Array[int]\n\n@sysl(\"sysl.hint.black_box\", blocking)\npair(p: (long, string)) -> (long, string)\n\nmain()\n    fill(Array.fill(2, byte(0)))\n    squares(Array.fill(2, 0))\n    pair((1, \"a\"))\n"
+
+@test("a blocking binding copies a filled array in before the thread is safe, and back after it runs again")
+shim_blocking_filled_arrays()
+    val program = lower_source(repository_toolchain(), source_of("/probe/blocking.avin", BlockingProgram)).unwrap()
+    val text = shim_source(program.bindings, program.handles).text
+    // The copy in and the root come before the safe region, which holds nothing but the Sysl call;
+    // the result and the copy back come after it.
+    assert(text.contains("    val s0 = bytes_in(a0)\n    var root0 = Root(Frame(ctx.top, 1usize), a0)\n    ctx.top = ptr_cast(&root0)\n    val x0 = s0\n    enter_safe(ctx)\n    val r = bound_0(x0)\n    leave_safe(ctx)\n    val made: *u8 = bytes_of(ctx, r, d0)\n    copy(array_elements(root0.object)[0..<s0.len], s0)\n    ctx.top = root0.frame.prev\n    made\n"))
+    // An array of integers is converted in, and its elements converted back, outside the region too.
+    assert(text.contains("    var root0 = Root(Frame(ctx.top, 1usize), a0)\n    ctx.top = ptr_cast(&root0)\n    val x0 = s0\n    enter_safe(ctx)\n    val r = bound_1(x0)\n    leave_safe(ctx)\n"))
+    assert(text.contains("    for i in 0..<s0.len do f0[i] = "))
+    // A tuple goes in as a local before the region, and the tuple answered is made after it.
+    assert(text.contains("    enter_safe(ctx)\n    val r = bound_2(x0)\n    leave_safe(ctx)\n"))
 
 @test("a mirror's lowerCamelCase field is matched to the snake_case Sysl field of the same words")
 mirror_field_names()

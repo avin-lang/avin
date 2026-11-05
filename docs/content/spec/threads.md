@@ -129,7 +129,7 @@ main() -> int
 
 Every operation that can wait marks its thread safe for the collector while it waits, so a thread
 blocked on a lock, a condition, a channel, a join or input never holds up a collection. A Sysl
-binding declared as blocking does the same. **A deadlock is not detected**, apart from a thread
+binding [declared `blocking`](/spec/sysl-bindings/#calls-that-wait) does the same. **A deadlock is not detected**, apart from a thread
 taking a lock it already holds: threads that each wait for another sleep for ever.
 
 ## Futures
