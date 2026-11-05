@@ -1331,6 +1331,7 @@ private declare_types(c: *Checker, unit: usize)
                 continue
             if file.private_items[i] then c.private_names.put(key, true)
             check_handle_declaration(c, unit, d)
+            check_c_handle_declaration(c, unit, d)
             c.class_types.put(key, c.classes.len())
             c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, None, None, buf(), buf(), 0, None, buf(), None, buf(), buf()))
 
@@ -2297,9 +2298,9 @@ private declare_fields(c: *Checker, unit: usize)
         val k = c.classes[id]
         if k.unit != unit then continue
         val d = k.decl
-        // `@sysl` on a class is checked where the class is declared.
+        // `@sysl` and `@c` on a class are checked where the class is declared.
         for a in d.annotations
-            if a.name != "sysl" || d.object
+            if (a.name != "sysl" && a.name != "c") || d.object
                 val what = if d.object then "an object" elif d.modifier == "trait" then "a trait" else "a class"
                 c.note(unit, a.span, misplaced_annotation(c, unit, a.name, what))
         val declares_trait = is_trait(c, id)
@@ -2970,9 +2971,10 @@ private declare_methods(c: *Checker, unit: usize)
                         declared.push(MethodDecl(getter, true, false, unit, module_name, d.type_params, false, true, false, 0, 0))
                         made_from.push(None)
                 _ -> ()
-        // Every Sysl handle has `close()`, which gives back its Sysl value.
+        // Every handle has `close()`, which gives back its Sysl value or its C object.
         val handle = handle_target(d) is Some(_)
-        if handle
+        val c_handle = c_handle_type(d) is Some(_)
+        if handle || c_handle
             var named = false
             for m in d.members
                 if m is MethodMember(f, _, _, _)
@@ -3034,7 +3036,9 @@ private declare_methods(c: *Checker, unit: usize)
             // A Sysl handle's own methods without a body are bound to its Sysl value's; the
             // declaration of the handle has checked their annotations.
             val bound_method = handle && !entry.from_impl && !entry.static_member && f.body is None && f.clauses.len() == 0
-            if method_annotations(f) > 0 && !intrinsic_method && !(handle && !entry.from_impl) then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
+            // A C handle's own methods without a body are C bindings, checked with their signatures.
+            val c_method = c_handle && !entry.from_impl && !entry.static_member && f.body is None && f.clauses.len() == 0
+            if method_annotations(f) > 0 && !intrinsic_method && !((handle || c_handle) && !entry.from_impl) then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
             if overrides then refuse_override_defaults(c, file_unit, f)
             if entry.static_member && !static_member_allowed(c, file_unit, f, c.classes[id].name, is_trait(c, id), overrides) then continue
             if is_trait(c, id)
@@ -3048,9 +3052,9 @@ private declare_methods(c: *Checker, unit: usize)
                 c.note(file_unit, f.name_span, s"`${f.name}` is already a field of `${c.classes[k.fields[i].owner].name}`")
                 continue
             val bodyless = f.body is None && f.clauses.len() == 0
-            if bodyless && !is_abstract_class(c, id) && !intrinsic_method && !bound_method
+            if bodyless && !is_abstract_class(c, id) && !intrinsic_method && !bound_method && !c_method && !c_handle
                 c.note(file_unit, f.name_span, s"`${f.name}` has no body; only an abstract class may leave a method without one")
-            if bodyless && !public && !intrinsic_method && !bound_method then c.note(file_unit, f.name_span, s"`${f.name}` is abstract, so it cannot be private: a subclass implements it")
+            if bodyless && !public && !intrinsic_method && !bound_method && !c_method then c.note(file_unit, f.name_span, s"`${f.name}` is abstract, so it cannot be private: a subclass implements it")
             var same_name: Buf[usize] = buf()
             for other in methods
                 if c.symbols[other].decl.name == f.name then same_name.push(other)
@@ -3064,7 +3068,7 @@ private declare_methods(c: *Checker, unit: usize)
             if is_trait(c, id) then c.self_trait = Some(id)
             // A bound method's `@sysl` names a Sysl method, which the handle's declaration has
             // checked, rather than a function, so its signature is read without it.
-            val written: &Function = if bound_method then Function(buf(), f.span, f.name_span, f.name, f.type_params, f.params, f.result, f.body, f.clauses) else f
+            val written: &Function = if bound_method || (c_method && is_handle_release(f)) then Function(buf(), f.span, f.name_span, f.name, f.type_params, f.params, f.result, f.body, f.clauses) else f
             var symbol = signature(c, file_unit, entry.module_name, written, class_owner(id), type_params, true, None)
             symbol.decl = f
             c.self_trait = outer_trait
@@ -5147,7 +5151,10 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
     val intrinsic = intrinsic_of(c, unit, module_name, f)
     val binding = has_annotation(f, "sysl")
     val c_binding = has_annotation(f, "c")
-    if c_binding then check_c_binding(c, unit, f, params, result, intrinsic is Some(_), binding, bodyless || receiver is Some(_))
+    // A class's own method is read with its class's type parameters' owner, which names the class.
+    var holder: Option[usize] = None
+    if bodyless && receiver is None && (1usize << 49) <= owner && owner < (1usize << 50) then holder = Some(owner - (1usize << 49))
+    if c_binding then check_c_binding(c, unit, f, params, result, intrinsic is Some(_), binding, bodyless || receiver is Some(_), holder)
     if binding then check_binding(c, unit, f, params, result, intrinsic is Some(_))
     elif f.body is Some(_) || f.clauses.len() > 0
         for p in f.params
@@ -5827,7 +5834,7 @@ private structural_sendability(f: Conformances, x: &Type, k: usize, a: SendAssum
                         CanSend -> ()
         Class(id, _, args) ->
             val cls = f.classes[id]
-            if handle_target(cls.decl) is Some(_) then return CanSend
+            if is_handle_class(cls.decl) then return CanSend
             val library = cls.module_name == CoreModule || cls.module_name.starts_with(CoreModule + ".")
             if library && !top
                 if cls.module_name == CoreModule && cls.name == "FrozenArray" && args.len() == 1
@@ -6921,7 +6928,12 @@ private check_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Type]
 // function's prototype from the library's header. Its parameters correspond to the prototype's by
 // position, and each, and the result, crosses by the rules of `c_crossing_problem`. Whether the
 // prototype is the header's is the C unit's question, asked when the program is built.
-private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Type], result: Option[&Type], intrinsic: bool, sysl: bool, method: bool)
+//
+// A method of a C handle is one too: its prototype takes the receiver first, named `self`, and the
+// method's parameters correspond to the rest. A handle crosses as a pointer of its class's own C type,
+// in an `Option` for null, and a C integer result as `Result[unit, E]` is a status. `borrowed`,
+// `keeps:` and `consumes:` say what the call does with the references it answers and is passed.
+private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Type], result: Option[&Type], intrinsic: bool, sysl: bool, method: bool, holder: Option[usize])
     var seen = false
     for a in f.annotations
         if a.name != "c" then continue
@@ -6932,9 +6944,15 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
         if intrinsic then c.note(unit, a.span, "a function is an intrinsic or a C binding, not both")
         if sysl then c.note(unit, a.span, "a function is a Sysl binding or a C binding, not both")
         if f.body is Some(_) || f.clauses.len() > 0 then c.note(unit, a.span, "a C binding has no body: the C function its prototype names is its body")
+        var receiver_class: Option[usize] = None
         if method
-            c.note(unit, a.span, "`@c` binds a top-level function; methods of C handles are not implemented")
-            continue
+            val k = holder match
+                Some(k) -> k
+                None -> c.classes.len()
+            if k >= c.classes.len() || c_handle_type(c.classes[k].decl) is None
+                c.note(unit, a.span, "`@c` on a method binds a method of a C handle, a class declared with `@c(type: …)`; a C binding is otherwise a top-level function")
+                continue
+            receiver_class = Some(k)
         if f.type_params.len() > 0
             c.note(unit, f.name_span, "a C binding is not generic: the C function has one signature")
             continue
@@ -6943,15 +6961,43 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
             if a.args[0].value.kind is StringLit(t) then text = Some(t)
         var free: Option[string] = None
         var named_ok = true
+        var borrowed = false
+        var keeps: Buf[string] = buf()
+        var consumes: Buf[string] = buf()
+        var given: Buf[string] = buf()
         for j in 1..<a.args.len()
             val arg = a.args[j]
             val n = arg.name match
                 Some(n) -> n
                 None ->
-                    named_ok = false
+                    if arg.value.kind is Name(word) && word == "borrowed"
+                        if borrowed then c.note(unit, arg.value.span, "`borrowed` is said once")
+                        borrowed = true
+                    elif arg.value.kind is Name(word) then c.note(unit, arg.value.span, s"`$word` is not a word of `@c` on a function; `borrowed` says C only lends the handle it answers")
+                    else named_ok = false
                     continue
+            if n == "keeps" || n == "consumes"
+                if contains_name(given, n)
+                    c.note(unit, arg.value.span, s"`$n:` is given once; it takes a list, as in `$n: [\"a\", \"b\"]`")
+                    continue
+                given.push(n)
+                var names: Buf[string] = buf()
+                var well_formed = true
+                arg.value.kind match
+                    StringLit(t) -> names.push(t)
+                    ListLit(items) ->
+                        for item in items
+                            if item.kind is StringLit(t) then names.push(t) else well_formed = false
+                        if items.len() == 0 then well_formed = false
+                    _ -> well_formed = false
+                if !well_formed
+                    c.note(unit, arg.value.span, s"`$n:` names a parameter, or a list of them, as strings, as in `$n: \"profile\"`")
+                    continue
+                for name in names
+                    if n == "keeps" then keeps.push(name) else consumes.push(name)
+                continue
             if n != "free"
-                c.note(unit, arg.value.span, s"`$n:` is not a word of `@c` on a function; `free:` names the C function that frees a string the binding answers")
+                c.note(unit, arg.value.span, s"`$n:` is not a word of `@c` on a function, which takes `free:`, `keeps:`, `consumes:` and `borrowed`")
                 continue
             if free is Some(_)
                 c.note(unit, arg.value.span, "`free:` is given once")
@@ -6971,12 +7017,26 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
             Err(why) ->
                 c.note(unit, a.args[0].value.span, s"`@c` takes the C function's prototype as the header writes it, as in `@c(\"int abs(int)\")`, and this one is not: $why")
                 continue
-        if p.params.len() != params.len()
-            c.note(unit, f.name_span, s"the C binding `${f.name}` has ${count(params.len(), "parameter")} and its prototype ${count(p.params.len(), "parameter")}: they correspond by position")
+        // A method's receiver is the prototype's first parameter, `self`.
+        val first = if receiver_class is Some(_) then 1usize else 0usize
+        if receiver_class is Some(k)
+            if p.params.len() == 0 || p.params[0].name != "self"
+                c.note(unit, a.args[0].value.span, s"the prototype of a C handle's method takes the receiver first, named `self`, as in `int cairo_status(cairo_t *self)`")
+                continue
+            val own = c_handle_type(c.classes[k].decl).unwrap()
+            val wanted = parse_c_type(own) match
+                Ok(t) -> t.text
+                Err(_) -> ""
+            if wanted != "" && !c_names_handle(p.params[0].text, wanted, false)
+                c.note(unit, a.args[0].value.span, s"the receiver `self` of `${f.name}` is a `${c.classes[k].name}`, whose C type is `$own`, and the prototype says `${p.params[0].text}`")
+                continue
+        if p.params.len() != params.len() + first
+            c.note(unit, f.name_span, s"the C binding `${f.name}` has ${count(params.len(), "parameter")} and its prototype ${count(p.params.len() - first, "parameter")}" + (if first == 1 then " after `self`" else "") + ": they correspond by position")
             continue
         for i in 0..<params.len()
             val decl = f.params[i]
             val t = params[i]
+            val cp = p.params[i + first]
             if *t is ErrorType then continue
             if decl.by_name
                 c.note(unit, decl.pattern.span, "a by-name parameter cannot cross a C binding")
@@ -6984,18 +7044,112 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
             if decl.variadic
                 c.note(unit, decl.pattern.span, "a repeated parameter cannot cross a C binding")
                 continue
-            val problem = c_crossing_problem(p.params[i].ty, t, c_text_form(t, c.data, c.classes), false)
-            if problem != "" then c.note(unit, decl.ty.span, s"parameter ${i + 1} of the C binding `${f.name}` is `${type_name(t)}` in Avin and `${p.params[i].text}` in C: $problem")
+            if c_handle_form(t, c.data, c.classes) is Some(h)
+                val problem = c_handle_problem(c, h.class_index, cp.text, false)
+                if problem != "" then c.note(unit, decl.ty.span, s"parameter ${i + 1} of the C binding `${f.name}` is `${type_name(t)}` in Avin and `${cp.text}` in C: $problem")
+                continue
+            val problem = c_crossing_problem(cp.ty, t, c_text_form(t, c.data, c.classes), false)
+            if problem != "" then c.note(unit, decl.ty.span, s"parameter ${i + 1} of the C binding `${f.name}` is `${type_name(t)}` in Avin and `${cp.text}` in C: $problem")
         val r = result.unwrap_or(Unit)
+        val at = if f.result is Some(t) then t.span else f.name_span
+        var made: Option[usize] = None
+        var status = false
         if !(*r is ErrorType)
             val form = c_text_form(r, c.data, c.classes)
-            val problem = c_crossing_problem(p.result, r, form, true)
-            val at = if f.result is Some(t) then t.span else f.name_span
-            if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(r)}` in Avin and `${p.result_text}` in C: $problem")
+            if c_handle_form(r, c.data, c.classes) is Some(h)
+                made = Some(h.class_index)
+                val problem = c_handle_problem(c, h.class_index, p.result_text, true)
+                if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(r)}` in Avin and `${p.result_text}` in C: $problem")
+            elif c_status_error(r, c.data) is Some(e)
+                status = true
+                // A status is an integer, of C's keywords, an enumeration or a typedef of one.
+                val integer = p.result match
+                    CKeyword(_) -> true
+                    CTypedef(_) -> true
+                    _ -> false
+                val problem = if integer then c_crossing_problem(p.result, e, NoText, true) else "a status is a C integer, `Ok(())` for zero and `Err` of the code otherwise"
+                if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(r)}` in Avin and `${p.result_text}` in C: $problem")
+            else
+                val problem = c_crossing_problem(p.result, r, form, true)
+                if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(r)}` in Avin and `${p.result_text}` in C: $problem")
             // Only a string C answers is freed, and one bound as `unit` is freed and discarded.
             val text = p.result is CText(_) || (p.result is CTypedef(_) && !(form is NoText))
             if free is Some(_) && !text
                 c.note(unit, at, s"`free:` names the C function that frees a string the binding answers, and `${f.name}` answers no string: its result is `${p.result_text}` in C")
+        check_c_ownership(c, unit, f, a, params, receiver_class, made, borrowed, keeps, consumes)
+
+// What is wrong with a handle of class `k` at a C position written `text`, or "": the position names
+// the class's own C type.
+private c_handle_problem(c: *Checker, k: usize, text: string, result: bool) -> string
+    val own = c_handle_type(c.classes[k].decl).unwrap()
+    val wanted = parse_c_type(own) match
+        Ok(t) -> t.text
+        Err(_) -> return ""
+    if c_names_handle(text, wanted, result) then "" else s"a `${c.classes[k].name}` crosses as its C type, `$own`"
+
+// What a C binding says of the references it is passed and answers: `borrowed` needs a handle
+// answered whose class can take a reference of its own; `keeps:` and `consumes:` name handle
+// parameters, or `self`, each once; what keeps them is the handle the binding answers, or for a
+// method answering none, its receiver; and a class with `kept:` is made only by a binding keeping
+// exactly one handle of the class it names.
+private check_c_ownership(c: *Checker, unit: usize, f: &Function, a: Annotation, params: Buf[&Type], receiver_class: Option[usize], made: Option[usize], borrowed: bool, keeps: Buf[string], consumes: Buf[string])
+    if borrowed
+        made match
+            Some(k) ->
+                if c_class_text(c.classes[k].decl, "retain") is None
+                    c.note(unit, a.span, s"the C binding `${f.name}` lends a `${c.classes[k].name}`, and `${c.classes[k].name}` declares no `retain`: a lent object is kept only by a reference of its own")
+            None -> c.note(unit, a.span, s"`borrowed` says C only lends the handle a binding answers, and `${f.name}` answers no handle")
+    var named: Buf[string] = buf()
+    var kept_classes: Buf[usize] = buf()
+    for which in 0..<2
+        val names = if which == 0 then keeps else consumes
+        val word = if which == 0 then "keeps" else "consumes"
+        for name in names
+            if contains_name(named, name)
+                c.note(unit, a.span, s"`$name` is named twice by `keeps:` and `consumes:`: a handle is kept or taken, once")
+                continue
+            named.push(name)
+            var class_index: Option[usize] = None
+            if name == "self"
+                if receiver_class is None
+                    c.note(unit, a.span, s"`$word:` names `self`, and `${f.name}` is not a method of a C handle")
+                    continue
+                if which == 0 && made is None
+                    c.note(unit, a.span, s"`keeps: \"self\"` makes the handle a method answers keep its receiver, and `${f.name}` answers no handle")
+                    continue
+                class_index = receiver_class
+            else
+                var position: Option[usize] = None
+                for i in 0..<f.params.len()
+                    if f.params[i].pattern.kind is Name(n) && n == name then position = Some(i)
+                val i = position match
+                    Some(i) -> i
+                    None ->
+                        c.note(unit, a.span, s"`$word:` names `$name`, which is not a parameter of `${f.name}`")
+                        continue
+                c_handle_form(params[i], c.data, c.classes) match
+                    Some(h) -> class_index = Some(h.class_index)
+                    None ->
+                        if !(*params[i] is ErrorType) then c.note(unit, f.params[i].ty.span, s"`$word:` names `$name`, of type `${type_name(params[i])}`: what a C binding keeps or takes is a handle, and anything else crosses for the call alone")
+                        continue
+                if which == 0 && made is None && receiver_class is None
+                    c.note(unit, a.span, s"`keeps:` makes the handle a binding answers keep what it names, and `${f.name}` answers no handle and is no method of one")
+                    continue
+            if which == 0 && class_index is Some(k) then kept_classes.push(k)
+    // A class whose `release:` names what it keeps is made only where exactly one is kept.
+    if made is Some(k)
+        if c_class_kept(c.classes[k].decl) is Some(kept)
+            c_kept_class(c.classes, k) match
+                Some(wanted) ->
+                    val w = c.classes[wanted].decl
+                    if c_handle_type(w) is None || c_class_text(w, "retain") is None || c_class_kept(w) is Some(_)
+                        c.note(unit, a.span, s"`${c.classes[k].name}` keeps a `${kept.class_name}` it names `${kept.name}`, which is a C pointer only while a C reference holds it: `${kept.class_name}` is a C handle declaring `retain` and no `kept:` of its own")
+                    else
+                        var n = 0
+                        for x in kept_classes
+                            if x == wanted then n += 1
+                        if n != 1 then c.note(unit, a.span, s"`${c.classes[k].name}` names the `${kept.class_name}` it keeps, `${kept.name}`, so every binding that makes one keeps exactly one `${kept.class_name}`; `${f.name}` keeps $n")
+                None -> c.note(unit, a.span, s"`${c.classes[k].name}`'s `kept:` names the class `${kept.class_name}`, which is not a class of its module")
 
 // A binding's parameters, from `first` on, cross into Sysl, and its result out of Sysl.
 private check_crossings(c: *Checker, unit: usize, f: &Function, params: Buf[&Type], first: usize, result: Option[&Type])
@@ -7193,6 +7347,93 @@ private check_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
                             if !is_sysl_path("x." + p) || p.contains(".") then c.note(unit, a.span, s"`@sysl` on a handle's method names the Sysl method it is bound to, as in `@sysl(\"close\")`; `$p` is not one")
                         None ->
                             if !own_name then c.note(unit, a.span, "`@sysl` on a handle's method takes one string, the name of the Sysl method it is bound to, as in `@sysl(\"close\")`, or `blocking` alone where the method may wait")
+
+// A class declared with `@c(type: "T", release: "f")` is a handle on a C pointer of type `T`: its
+// objects are made by the C bindings that answer one, and hold one reference to the C object, which
+// `release:` gives back. `retain:` takes another, `kept:` names the one handle of a class the holder
+// keeps, and `shared` says the C object may be used from any thread. `release:` and `retain:` are a C
+// function of the pointer or a C expression in `self`, which the C unit compiles. Like a Sysl
+// handle, the class has no parameters, fields or statements, no type parameters and no parents, and
+// its methods without a body are C bindings whose prototype takes the receiver first, as `self`.
+private check_c_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
+    // An object's annotations are refused where its fields are declared.
+    if d.object then return
+    var annotated = false
+    for a in d.annotations
+        if a.name != "c" then continue
+        if annotated
+            c.note(unit, a.span, "a C handle has one `@c`")
+            continue
+        annotated = true
+        if handle_target(d) is Some(_) then c.note(unit, a.span, "a class is a handle on a Sysl type or on a C pointer, not both")
+        var seen: Buf[string] = buf()
+        for arg in a.args
+            val key = arg.name match
+                Some(n) -> n
+                None ->
+                    if arg.value.kind is Name(word) && word == "shared"
+                        if contains_name(seen, "shared") then c.note(unit, arg.value.span, "`shared` is said once")
+                        seen.push("shared")
+                    elif arg.value.kind is StringLit(_) then c.note(unit, arg.value.span, "`@c` on a class names the C pointer type it is a handle on with `type:`, as in `@c(type: \"cairo_t *\", release: \"cairo_destroy\")`")
+                    else c.note(unit, arg.value.span, "`shared` is the one word `@c` on a class takes without a key")
+                    continue
+            if key == "as" || key == "attach" || key == "key" || key == "forget" || key == "value"
+                c.note(unit, arg.value.span, s"`$key:` on a C handle is not implemented")
+                continue
+            if key != "type" && key != "release" && key != "retain" && key != "kept"
+                c.note(unit, arg.value.span, s"`$key:` is not a word of `@c` on a class, which takes `type:`, `release:`, `retain:`, `kept:` and `shared`")
+                continue
+            if contains_name(seen, key)
+                c.note(unit, arg.value.span, s"`$key:` is given once")
+                continue
+            seen.push(key)
+            val text = arg.value.kind match
+                StringLit(t) -> t
+                _ ->
+                    c.note(unit, arg.value.span, s"`$key:` takes a string")
+                    continue
+            if key == "type"
+                parse_c_type(text) match
+                    Ok(t) -> t.ty match
+                        CPointerType -> ()
+                        CTypedef(_) -> ()
+                        CText(_) -> c.note(unit, arg.value.span, s"`$text` is a C string, which crosses as `string`; a handle is on a pointer to an object, as in `type: \"cairo_t *\"`")
+                        _ -> c.note(unit, arg.value.span, s"`$text` is not a pointer: a handle is on a pointer to a C object, or a typedef of one, as in `type: \"cairo_t *\"` or `type: \"FT_Library\"`")
+                    Err(why) -> c.note(unit, arg.value.span, s"`type:` names the C pointer type a handle is on, as in `type: \"cairo_t *\"`, and `$text` is not one: $why")
+            elif key == "kept"
+                c_class_kept(d) match
+                    Some(k) ->
+                        if k.name == "self" then c.note(unit, arg.value.span, "`self` is the handle's own pointer, so `kept:` names what it keeps by another name")
+                        val release = c_class_text(d, "release").unwrap_or("")
+                        val retain = c_class_text(d, "retain").unwrap_or("")
+                        if !c_uses_name(release, k.name) && !c_uses_name(retain, k.name)
+                            c.note(unit, arg.value.span, s"`kept:` names `${k.name}` for `release:` and `retain:` to use, and neither does")
+                    None -> c.note(unit, arg.value.span, s"`kept:` names the handle the class keeps and its class, as in `kept: \"face: Face\"`; `$text` is not that")
+            elif !is_c_identifier(text) && !c_uses_name(text, "self")
+                c.note(unit, arg.value.span, s"`$key:` names a C function of the handle's pointer, or a C expression in `self`; `$text` is neither")
+        if !contains_name(seen, "type") then c.note(unit, a.span, "`@c` on a class names the C pointer type it is a handle on, `type: \"cairo_t *\"`")
+        if !contains_name(seen, "release") then c.note(unit, a.span, "a C handle names the C function that gives its object back, `release: \"cairo_destroy\"`")
+    if !annotated then return
+    if d.type_params.len() > 0 then c.note(unit, d.type_params[0].span, "a C handle has no type parameters: it holds one C pointer")
+    if d.params.len() > 0 then c.note(unit, d.params[0].param.pattern.span, "a C handle has no parameters: the C bindings that answer one make it")
+    if d.modifier != "" then c.note(unit, d.modifier_span, s"a C handle is final, so it cannot be `${d.modifier}`")
+    if d.parents.len() > 0 then c.note(unit, d.parents[0].span, "a C handle has no parents; an `impl` makes it conform to a trait")
+    if d.derives.len() > 0 then c.note(unit, d.derives[0].span, "a C handle derives nothing: it compares by identity, and an `impl` gives it `Display`")
+    for m in d.members
+        m match
+            FieldMember(f) -> c.note(unit, f.span, "a C handle holds its C pointer and nothing else, so its body declares only methods")
+            AbstractFieldMember(f) -> c.note(unit, f.span, "a C handle holds its C pointer and nothing else, so its body declares only methods")
+            StatementMember(s) -> c.note(unit, s.span, "a C handle holds its C pointer and nothing else, so its body declares only methods")
+            MethodMember(f, _, _, static_member) ->
+                if f.name == "close" then c.note(unit, f.name_span, "every C handle has `close()`, which gives its object back through `release:`; bind a C function of that name under another")
+                val bodyless = f.body is None && f.clauses.len() == 0
+                if bodyless && static_member then c.note(unit, f.name_span, s"`${f.name}` is static, so it needs a body: a C handle's methods without one are C bindings")
+                elif bodyless && !has_annotation(f, "c") then c.note(unit, f.name_span, s"`${f.name}` has no body, so it is a C binding, and names its C function with `@c(\"<prototype>\")`")
+                for a in f.annotations
+                    if a.name != "c" then c.note(unit, a.span, s"unknown annotation `@${a.name}` on a method of a C handle")
+
+/** Whether a class is a handle: on a Sysl type, or on a C pointer. */
+is_handle_class(d: &ClassDecl) -> bool = handle_target(d) is Some(_) || c_handle_type(d) is Some(_)
 
 /** The Sysl method a bound method of a handle calls: the one its `@sysl("name")` names, or the one of
  * its own name's words in snake_case. */
@@ -8727,6 +8968,9 @@ private abstract_constructor(c: *Checker, id: usize, at: Span) -> bool
         return true
     if handle_target(c.classes[k].decl) is Some(target)
         c.note(unit_of(c), at, s"`${c.classes[k].name}` is a handle on the Sysl type `$target`, so only a Sysl binding that returns one makes it")
+        return true
+    if c_handle_type(c.classes[k].decl) is Some(target)
+        c.note(unit_of(c), at, s"`${c.classes[k].name}` is a handle on the C type `$target`, so only a C binding that answers one makes it")
         return true
     if !is_abstract_class(c, k) then return false
     if is_trait(c, k) then c.note(unit_of(c), at, s"`${c.classes[k].name}` is a trait, so it cannot be instantiated; instantiate a class that conforms to it")

@@ -35,6 +35,8 @@ enum CType
 struct CParam
     ty: CType
     text: string
+    /** The parameter's name, "" where the prototype gives none; `self` is a method's receiver. */
+    name: string
 
 /** A prototype read: the C function's symbol, its result and its parameters. */
 struct CPrototype
@@ -88,7 +90,7 @@ parse_prototype(text: string) -> Result[CPrototype, string]
             if at < tokens.len() && tokens[at] == "("
                 return Err("a parameter taking a function cannot cross a C binding: callbacks are not implemented")
             if p.ty is CVoidType then return Err("a parameter cannot be `void`; a function taking nothing is written `(void)`")
-            params.push(CParam(p.ty, p.text))
+            params.push(CParam(p.ty, p.text, p.name.unwrap_or("")))
             if at < tokens.len() && tokens[at] == ","
                 at += 1
                 continue
@@ -272,6 +274,156 @@ is_c_identifier(t: string) -> bool
 private is_c_keyword(t: string) -> bool =
     t == "const" || t == "volatile" || t == "restrict" || t == "void" || t == "char" || t == "short" || t == "int" || t == "long" || t == "signed" || t == "unsigned" || t == "float" || t == "double" || t == "_Bool" || t == "bool" || t == "struct" || t == "union" || t == "enum"
 
+/** A C type written alone, as a handle's `type:` writes it: its type and the text a prototype's
+ * parameter of that type has, so the two compare as text. */
+struct CTypeText
+    ty: CType
+    text: string
+
+/** Reads a C type written with no name after it, `cairo_surface_t *` or `FT_Library`. */
+parse_c_type(text: string) -> Result[CTypeText, string]
+    val tokens = c_tokens(text)?
+    var at = 0usize
+    val declared = c_declaration(tokens, &at)?
+    if declared.name is Some(n) then return Err(s"`$n` follows the type")
+    if at < tokens.len() then return Err(s"`${tokens[at]}` is not part of a C type")
+    Ok(CTypeText(declared.ty, declared.text))
+
+/** The `@c(…)` a class is declared with, which makes it a handle on a C pointer. */
+c_class_annotation(d: &ClassDecl) -> Option[Annotation]
+    if d.object then return None
+    for a in d.annotations
+        if a.name == "c" then return Some(a)
+    None
+
+/** The C pointer type a handle class's `@c(type: …)` names, as written. */
+c_handle_type(d: &ClassDecl) -> Option[string] = c_class_text(d, "type")
+
+/** The string a handle class's `@c` gives under `key`, `release`, `retain` or `kept`. */
+c_class_text(d: &ClassDecl, key: string) -> Option[string]
+    val a = c_class_annotation(d)?
+    for arg in a.args
+        if arg.name is Some(n) && n == key
+            if arg.value.kind is StringLit(text) then return Some(text)
+    None
+
+/** Whether a handle class's `@c` says `shared`: its C object is safe to use from any thread, so its
+ * owner is not checked. */
+c_class_shared(d: &ClassDecl) -> bool
+    val a = c_class_annotation(d) match
+        Some(a) -> a
+        None -> return false
+    for arg in a.args
+        if arg.name is None && arg.value.kind is Name(word) && word == "shared" then return true
+    false
+
+/** What a handle class's `kept: "name: Class"` says: the name its `release:` and `retain:` give the
+ * one handle of `Class` it keeps, and that class's name as written. */
+struct CKept
+    name: string
+    class_name: string
+
+/** The `kept:` of a handle class, read; `None` where it has none or it is not `name: Class`. */
+c_class_kept(d: &ClassDecl) -> Option[CKept]
+    val text = c_class_text(d, "kept")?
+    val parts = text.split(":")
+    if parts.len != 2 then return None
+    val name = parts[0].trim()
+    val class_name = parts[1].trim()
+    if !is_c_identifier(name) || class_name == "" then return None
+    Some(CKept(name, class_name))
+
+/** The class a handle class's `kept:` names, by its index: a class of the holder's own module, or one
+ * named with its module, `freetype.Face`. */
+c_kept_class(classes: Buf[ClassSymbol], holder: usize) -> Option[usize]
+    val kept = c_class_kept(classes[holder].decl)?
+    var module_name = classes[holder].module_name
+    var name = kept.class_name
+    val b = kept.class_name.bytes
+    var i = b.len
+    while i > 0
+        i -= 1
+        if b[i] == u8('.')
+            module_name = kept.class_name[..<i]
+            name = kept.class_name[i + 1..]
+            break
+    for k in 0..<classes.len()
+        if classes[k].module_name == module_name && classes[k].name == name then return Some(k)
+    None
+
+/** Whether the C expression `text` uses the identifier `name` as a word of its own. */
+c_uses_name(text: string, name: string) -> bool
+    val b = text.bytes
+    var i = 0usize
+    while i < b.len
+        if is_c_word_byte(b[i])
+            val start = i
+            while i < b.len && is_c_word_byte(b[i])
+                i += 1
+            // A word after `.` or `->` is a member's name, not the variable.
+            val member = start > 0 && (b[start - 1] == u8('.') || start > 1 && b[start - 1] == u8('>') && b[start - 2] == u8('-'))
+            if !member && text[start..<i] == name then return true
+            continue
+        i += 1
+    false
+
+/** Whether a C binding's `@c` says the bare word `word`, `borrowed`. */
+c_binding_flag(f: &Function, word: string) -> bool
+    for a in f.annotations
+        if a.name != "c" then continue
+        for arg in a.args
+            if arg.name is None && arg.value.kind is Name(w) && w == word then return true
+    false
+
+/** The parameters a C binding's `keeps:` or `consumes:` names: one string, or a list of them. */
+c_binding_names(f: &Function, key: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    for a in f.annotations
+        if a.name != "c" then continue
+        for arg in a.args
+            if arg.name != Some(key) then continue
+            arg.value.kind match
+                StringLit(text) -> out.push(text)
+                ListLit(items) ->
+                    for item in items
+                        if item.kind is StringLit(text) then out.push(text)
+                _ -> ()
+    out
+
+/** The handle class an Avin type is, or holds as an `Option`'s value: the class's index, and whether
+ * it is in an `Option`, which null's `None` is. */
+struct CHandleForm
+    class_index: usize
+    optional: bool
+
+/** The form in which `t` carries a C handle, if it does. */
+c_handle_form(t: &Type, data: Buf[DataSymbol], classes: Buf[ClassSymbol]) -> Option[CHandleForm]
+    var inner = t
+    var optional = false
+    *t match
+        Data(d, _, args) ->
+            if data[d].module_name == "avin" && data[d].name == "Option" && args.len() == 1
+                inner = args[0]
+                optional = true
+        _ -> ()
+    *inner match
+        Class(k, _, _) -> if c_handle_type(classes[k].decl) is Some(_) then Some(CHandleForm(k, optional)) else None
+        _ -> None
+
+/** The error type of a status result, `Result[unit, E]` with `E` an integer type: `Ok(())` for zero
+ * and `Err` of the code otherwise. */
+c_status_error(t: &Type, data: Buf[DataSymbol]) -> Option[&Type] = *t match
+    Data(d, _, args) ->
+        if data[d].module_name == "avin" && data[d].name == "Result" && args.len() == 2 && *args[0] is Unit && *args[1] is Int(_) then Some(args[1]) else None
+    _ -> None
+
+/** Whether a prototype's position, written `text`, takes or answers the handle whose `type:` reads as
+ * `handle`: the same type, or for a parameter that type `const`-qualified, which C passes the same
+ * pointer to. */
+c_names_handle(text: string, handle: string, result: bool) -> bool
+    if text == handle then return true
+    !result && text == "const " + handle
+
 /** The function a C binding's `@c(…, free: "name")` names to free the string C answers, when it
  * names one as a string. */
 c_free_text(f: &Function) -> Option[string]
@@ -330,7 +482,7 @@ c_crossing_problem(c: CType, avin: &Type, form: CTextForm, result: bool) -> stri
         CFloatType -> if *avin is Real then "" else "a C `float` crosses as `real`"
         CVoidType -> "the C function answers nothing, so the binding's result is `unit`"
         CText(_) -> if result then "a C string crosses as `string`, `Array[byte]`, or either in an `Option`" else "a C string crosses as `string` or `Option[string]`"
-        CPointerType -> "pointers are not implemented"
+        CPointerType -> "a C pointer crosses as a handle, a class declared with `@c(type: …)` naming the pointer's type"
         CRecordType(_) -> "a struct passed by value is not implemented"
 
 // What a string's Avin type `form` must be at the C position `c`, or "".
