@@ -3551,14 +3551,7 @@ spelling is better, as each entry says.
     rule (amending the settled machine entry above). An arm's result is its own `State`, `handle`'s
     argument the event type, so machine code needs nothing written.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- Proposed (built on branch `actor-state`): **`state` blocks in actors** (stage 12 step 8), the
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-state`): **`state` blocks in actors** (stage 12 step 8), the
   choices building it made where the [chapter](/spec/actors/#an-actors-states) is silent.
   - **Only a transition runs `leave`**: an actor that stops, fails or restarts runs its `stopping`
     block, which reads `state()`, and not the current state's `leave`. *Why*: the chapter defines
@@ -3576,8 +3569,8 @@ spelling is better, as each entry says.
     every transition.
   - **An actor's `State` type and its states are private to its module**, as the class holding its
     state is, and `state()` is one of the actor's own methods, not its reference's. The states are
-    still names of the module, so they share no name with another variant there, a machine's states
-    included. *Why*: nothing outside an actor reaches its state. *Alternative*: a public `State` type
+    still names of the module, and share a name with another type's variant there, a machine's
+    states included, by the rule for shared variant names above. *Why*: nothing outside an actor reaches its state. *Alternative*: a public `State` type
     another module could match on, which nothing could hand it.
   - **An actor with states needs no `receive` block**, as a machine needs none; without states it
     still needs one. A shared arm of an actor with states yields a state, as a machine's does.
@@ -3589,6 +3582,13 @@ spelling is better, as each entry says.
 
   **Review with the user**: the first choice; whether an ending should run the current state's
   `leave` is the one a program holding a resource in a state notices.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
 
 ## Open
 
