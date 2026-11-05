@@ -196,6 +196,8 @@ private struct Lowering
      * in tail position returns at once (see `returned_call`); a class's constructor publishes its
      * object after the body, and nothing generated has a body. */
     tail_calls: bool
+    /** The C handles whose objects have been laid out, each once. */
+    c_handles: Buf[MirHandle]
 
 /** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
  * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
@@ -250,7 +252,7 @@ lower_program(program: TProgram) -> MirProgram
         if d.table.len() > generic_base then generic_base = d.table.len()
     for b in program.builtins
         if b.table.len() > generic_base then generic_base = b.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false)
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf())
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
     l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None))
@@ -337,7 +339,7 @@ lower_program(program: TProgram) -> MirProgram
     add_variant_ancestors(&l)
     functions = devirtualize(functions, l.descriptors, dispatch_sites(&l))
     functions = scalar_replace(functions, l.descriptors)
-    MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, l.handles, tests, program.testing, entry_arguments, strings)
+    MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, l.handles, tests, program.testing, entry_arguments, strings, l.c_handles)
 
 /** Whether a function belongs to the core library's module, `avin`, or one under it. */
 private in_core_library(program: TProgram, id: usize) -> bool
@@ -406,6 +408,14 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
                 if handle_target(k.decl) is Some(target)
                     l.descriptors[shape.descriptor].size = 16
                     l.handles.push(MirHandle(handle_trap_name(k.decl, k.name), target, handle_finalizer(id), shape.descriptor, k.unit, k.decl.name_span))
+                // A C handle's first word is its C pointer and its second its owner, as a Sysl
+                // handle's; its third is the C references it holds to the handles it keeps, which
+                // the C unit's glue keeps off the heap, and its fourth, which the collector traces,
+                // the Avin objects it keeps. Its finalizer is the C unit's.
+                elif c_handle_type(k.decl) is Some(target)
+                    l.descriptors[shape.descriptor].size = CHandleSize
+                    l.descriptors[shape.descriptor].refs.push(CHandleKept)
+                    l.c_handles.push(MirHandle(k.name, target, s"avin_c_finalize_$id", shape.descriptor, k.unit, k.decl.name_span))
         _ -> panic("a layout of a type that is not data, a tuple or a class: " + key)
     if holds_generic_methods(l, t)
         for v in variants
@@ -1805,6 +1815,7 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
             finish(l, returning(l, result))
         None ->
             if binding_target(symbol.decl) is Some(_) || handle_of(l, symbol) is Some(_) then binding_body(l, symbol, shim_symbol(function_symbol(l.program, f.symbol, inst.type_args)))
+            elif c_close_class(l, symbol) is Some(k) then c_close_body(l, symbol, k)
             elif c_prototype_of(symbol.decl) is Some(p) then c_binding_body(l, symbol, p)
             else intrinsic_body(l, symbol)
     MirFunction(function_symbol(l.program, f.symbol, inst.type_args), signature, l.values, l.slots, l.blocks)
@@ -2036,6 +2047,14 @@ private binding_body(l: *Lowering, symbol: FunctionSymbol, shim: string)
 // copied onto the heap, checked as UTF-8 unless it is answered as an `Array[byte]`, and then freed
 // by the binding's `free:` function where it names one; a null answer is `None`, or stops the
 // program where the result is no `Option`.
+//
+// A handle passed, a method's receiver first, must belong to the code running, unless its class is
+// `shared`, and hold its C pointer, or the program stops at the call; C is passed the pointer, and
+// null for `None`. A pointer C answers as a handle is null-checked as a string is, then made the
+// handle's object, owned by the code running, after a reference of its own is taken through the
+// class's `retain` where the binding says `borrowed`. A status is `Ok(())` for zero and `Err` of the
+// code otherwise. Once the call has succeeded, what it `keeps:` is kept by the handle it answered, or
+// by a method's receiver, and what it `consumes:` is closed without its `release`.
 private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
     val outer = l.library
     l.library = true
@@ -2043,13 +2062,29 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
     var args: Buf[Operand] = buf()
     var scalars: Buf[CScalar] = buf()
     var copies: Buf[Operand] = buf()
+    // Each parameter's handle object, where it is a handle, perhaps null for `None`, and its class.
+    var objects: Buf[Option[Operand]] = buf()
+    var classes: Buf[usize] = buf()
+    var optionals: Buf[bool] = buf()
+    val skipped = symbol.params.len() - symbol.decl.params.len()
     for i in 0..<symbol.params.len()
         val t = concrete(l, symbol.params[i])
         val x = Value(l.param_values[i].unwrap())
+        objects.push(None)
+        classes.push(0)
+        optionals.push(false)
+        if c_handle_form(t, l.program.data, l.program.classes) is Some(h)
+            val object = if !h.optional then x elif pointer_option(l, t) then x else option_pointer(l, t, x)
+            objects[i] = Some(object)
+            classes[i] = h.class_index
+            optionals[i] = h.optional
+            scalars.push(CAddress)
+            args.push(c_handle_pointer(l, object, h.class_index, h.optional, at))
+            continue
         val form = c_text_form(t, l.program.data, l.program.classes)
         if form is TextString(optional)
             val text = if !optional then x elif pointer_option(l, t) then x else option_pointer(l, t, x)
-            val name = c_parameter_name(symbol.decl, i)
+            val name = c_parameter_name(symbol.decl, i - skipped)
             val site = trap_site(l, s"the string passed to `$name` of `${symbol.name}` holds a NUL", at)
             val copy = runtime_call(l, "avin_rt_c_string_in", [MRef, MPtr], MPtr, [text, TrapSiteAddress(site)])
             copies.push(copy)
@@ -2059,6 +2094,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
         val s = c_scalar_of(p.params[i].ty, t, l.program.c_measures)
         scalars.push(s)
         args.push(c_argument(l, x, t, s, c_integer_name(p.params[i].ty, s), at))
+    val calls = CCall(p.symbol, args, objects, classes, optionals, skipped)
     val result_type = concrete(l, symbol.result.unwrap_or(Unit))
     val free = c_free_text(symbol.decl)
     val result_form = c_text_form(result_type, l.program.data, l.program.classes)
@@ -2066,6 +2102,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
     if *result_type is Unit && !text_result
         l.insts.push(Call(None, CFunction(p.symbol, scalars, None), args))
         c_release_copies(l, copies)
+        c_after_call(l, symbol, calls, None, None)
         l.library = outer
         finish(l, Return(None))
         return
@@ -2075,16 +2112,277 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
         // C may answer a pointer into a string it was passed, so the copies outlive the answer's.
         val value = c_text_answer(l, Value(answer), result_type, result_form, free, p.symbol, at)
         c_release_copies(l, copies)
+        c_after_call(l, symbol, calls, None, None)
         l.library = outer
         finish(l, Return(value))
+        return
+    if c_handle_form(result_type, l.program.data, l.program.classes) is Some(h)
+        val answer = fresh(l, MPtr)
+        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(CAddress)), args))
+        c_release_copies(l, copies)
+        val value = c_handle_answer(l, symbol, calls, Value(answer), result_type, h, at)
+        l.library = outer
+        finish(l, Return(Some(value)))
+        return
+    if c_status_error(result_type, l.program.data) is Some(e)
+        val s = c_scalar_of(p.result, e, l.program.c_measures)
+        val answer = fresh(l, c_machine(s))
+        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), args))
+        c_release_copies(l, copies)
+        val zero = s match
+            CSigned(bits) -> ConstInt(bits, "0")
+            CUnsigned(bits) -> ConstInt(bits, "0")
+            _ -> ConstInt(32, "0")
+        val ok = compare(l, CmpEq, Value(answer), zero)
+        // What the call keeps and takes is kept and taken only when it succeeded.
+        c_after_call(l, symbol, calls, None, Some(ok))
+        val slot = machine_slot(l, MRef)
+        val yes = new_block(l)
+        val no = new_block(l)
+        val join = new_block(l)
+        finish_into(l, Branch(ok, yes, no), yes)
+        store(l, slot, Some(variant_object(l, result_type, "Ok", None)))
+        finish_into(l, Jump(join), no)
+        val code = c_answer(l, Value(answer), s, e, at)
+        store(l, slot, Some(variant_object(l, result_type, "Err", Some(code))))
+        finish_into(l, Jump(join), join)
+        val value = load(l, slot).unwrap()
+        l.library = outer
+        finish(l, Return(Some(value)))
         return
     val s = c_scalar_of(p.result, result_type, l.program.c_measures)
     val answer = fresh(l, c_machine(s))
     l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), args))
     c_release_copies(l, copies)
     val value = c_answer(l, Value(answer), s, result_type, at)
+    c_after_call(l, symbol, calls, None, None)
     l.library = outer
     finish(l, Return(Some(value)))
+
+// The size of a C handle's object, and the offsets of its owner, the C references it holds and the
+// Avin objects it keeps (see `layout`).
+private const CHandleSize: usize = 32
+private const CHandleOwner: usize = 8
+private const CHandleKept: usize = 24
+
+/** What a C binding's call was passed: the C symbol, the arguments, and for each parameter that is a
+ * handle its object, perhaps null for `None`, its class and whether it is in an `Option`. A method's
+ * receiver is the first `skipped` parameters, which its declaration does not list. */
+private struct CCall
+    symbol: string
+    args: Buf[Operand]
+    objects: Buf[Option[Operand]]
+    classes: Buf[usize]
+    optionals: Buf[bool]
+    skipped: usize
+
+// The C handle class whose built-in `close()` `symbol` is.
+private c_close_class(l: *Lowering, symbol: FunctionSymbol) -> Option[usize]
+    val k = symbol.owner_class?
+    if c_handle_type(l.program.classes[k].decl) is None || !is_handle_release(symbol.decl) then return None
+    Some(k)
+
+// `close()` of a C handle gives its object back through the class's `release`, and then the C
+// references it holds, and lets go of the Avin objects it keeps; a handle already closed holds
+// nothing to give back. Only the code that owns the handle may close it, unless it is `shared`.
+private c_close_body(l: *Lowering, symbol: FunctionSymbol, k: usize)
+    val outer = l.library
+    l.library = true
+    val object = Value(l.param_values[0].unwrap())
+    if !c_class_shared(l.program.classes[k].decl) then check_owner(l, object, k, symbol.decl.name_span)
+    c_glue_call(l, s"avin_c_give_back_$k", [object])
+    l.insts.push(Store(field_address(l, object, FieldSlot(CHandleKept, MRef)), NullAddress))
+    l.library = outer
+    finish(l, Return(None))
+
+// Calls the C unit's glue function `name`, which takes pointers and answers nothing.
+private c_glue_call(l: *Lowering, name: string, args: []Operand)
+    var params: Buf[CScalar] = buf()
+    var passed: Buf[Operand] = buf()
+    for a in args
+        params.push(CAddress)
+        passed.push(a)
+    l.insts.push(Call(None, CFunction(name, params, None), passed))
+
+// The C pointer of the handle `object` of class `k`, passed to C: the object must belong to the code
+// running, unless the class is `shared`, and must not be closed. An `optional` handle may be null,
+// which is passed as it is.
+private c_handle_pointer(l: *Lowering, object: Operand, k: usize, optional: bool, at: Span) -> Operand
+    if !optional then return c_checked_pointer(l, object, k, at)
+    val slot = machine_slot(l, MPtr)
+    val absent = new_block(l)
+    val present = new_block(l)
+    val join = new_block(l)
+    finish_into(l, Branch(compare(l, CmpEq, object, NullAddress), absent, present), absent)
+    store(l, slot, Some(NullAddress))
+    finish_into(l, Jump(join), present)
+    store(l, slot, Some(c_checked_pointer(l, object, k, at)))
+    finish_into(l, Jump(join), join)
+    load(l, slot).unwrap()
+
+private c_checked_pointer(l: *Lowering, object: Operand, k: usize, at: Span) -> Operand
+    if !c_class_shared(l.program.classes[k].decl) then check_owner(l, object, k, at)
+    val word = load_field(l, object, FieldSlot(0, MPtr))
+    trap_if(l, compare(l, CmpEq, word, NullAddress), s"`${trap_name(l, k)}` is closed", at)
+    word
+
+// The value `result_type` makes of the handle pointer C answered at `answer`: null is `None`, or
+// stops the program where the result is no `Option`; any other pointer is a new object of the
+// class, holding the pointer, owned by the code running, after a reference of its own is taken where
+// the binding says `borrowed`. What the call keeps, the new handle keeps.
+private c_handle_answer(l: *Lowering, symbol: FunctionSymbol, call: CCall, answer: Operand, result_type: &Type, h: CHandleForm, at: Span) -> Operand
+    val absent = compare(l, CmpEq, answer, NullAddress)
+    if !h.optional
+        trap_if(l, absent, s"`${call.symbol}` answered null", at)
+        val made = c_new_handle(l, symbol, call, answer, h.class_index)
+        c_after_call(l, symbol, call, Some(made), None)
+        return made
+    val slot = machine_slot(l, MRef)
+    val none = new_block(l)
+    val present = new_block(l)
+    val join = new_block(l)
+    finish_into(l, Branch(absent, none, present), none)
+    // Nothing was made, so nothing is kept; what the call takes, it takes whatever it answers.
+    c_after_call(l, symbol, call, None, None)
+    store(l, slot, Some(NullAddress))
+    finish_into(l, Jump(join), present)
+    val made = c_new_handle(l, symbol, call, answer, h.class_index)
+    c_after_call(l, symbol, call, Some(made), None)
+    store(l, slot, Some(made))
+    finish_into(l, Jump(join), join)
+    val value = load(l, slot).unwrap()
+    if pointer_option(l, result_type) then value else option_object(l, result_type, value)
+
+// A new handle object of class `k` holding `pointer`, owned by the code running; a `borrowed`
+// pointer has a reference of its own taken first, through the class's `retain`, which is given the
+// pointer of the handle of the class's `kept:` the call keeps, for its name.
+private c_new_handle(l: *Lowering, symbol: FunctionSymbol, call: CCall, pointer: Operand, k: usize) -> Operand
+    if c_binding_flag(symbol.decl, "borrowed")
+        var kept: Operand = NullAddress
+        if c_kept_class(l.program.classes, k) is Some(wanted)
+            for name in c_binding_names(symbol.decl, "keeps")
+                val i = c_named_parameter(symbol, call, name) match
+                    Some(i) -> i
+                    None -> continue
+                if call.objects[i] is Some(_) && call.classes[i] == wanted then kept = call.args[i]
+        c_glue_call(l, s"avin_c_retain_$k", [pointer, kept])
+    val t: &Type = Class(k, l.program.classes[k].name, buf())
+    val shape = layout(l, t).variants[0]
+    val object = fresh(l, MRef)
+    l.insts.push(Alloc(object, shape.descriptor))
+    l.insts.push(Store(field_address(l, Value(object), FieldSlot(0, MPtr)), pointer))
+    val mine = fresh(l, MInt(64))
+    l.insts.push(Load(mine, OwnerWord))
+    l.insts.push(Store(field_address(l, Value(object), FieldSlot(CHandleOwner, MInt(64))), Value(mine)))
+    l.insts.push(Publish)
+    Value(object)
+
+// The parameter of the call `keeps:` or `consumes:` names `name`: `self`, the receiver, or one of
+// the declared parameters, by its position among the call's.
+private c_named_parameter(symbol: FunctionSymbol, call: CCall, name: string) -> Option[usize]
+    if name == "self" then return if call.skipped > 0 then Some(0) else None
+    for i in 0..<symbol.decl.params.len()
+        if symbol.decl.params[i].pattern.kind is Name(n) && n == name then return Some(i + call.skipped)
+    None
+
+// What a call does once it has returned with what it keeps and takes: each handle `keeps:` names is
+// kept by `made`, the handle the call answered, or where it answered none by the receiver; each
+// handle `consumes:` names is closed without its `release`, C having taken its reference. Where
+// `succeeded` is given, nothing is kept unless it is true.
+private c_after_call(l: *Lowering, symbol: FunctionSymbol, call: CCall, made: Option[Operand], succeeded: Option[Operand])
+    val keeps = c_binding_names(symbol.decl, "keeps")
+    val consumes = c_binding_names(symbol.decl, "consumes")
+    if keeps.len() == 0 && consumes.len() == 0 then return
+    var holder: Option[Operand] = made
+    if holder is None && call.skipped > 0 && c_handle_result(l, symbol) is None then holder = call.objects[0]
+    var after: Option[usize] = None
+    if succeeded is Some(flag)
+        val yes = new_block(l)
+        val join = new_block(l)
+        finish_into(l, Branch(flag, yes, join), yes)
+        after = Some(join)
+    if holder is Some(o)
+        for name in keeps
+            val i = c_named_parameter(symbol, call, name) match
+                Some(i) -> i
+                None -> continue
+            val kept = call.objects[i] match
+                Some(k) -> k
+                None -> continue
+            c_keep(l, o, kept, call.args[i], call.classes[i], call.optionals[i])
+    if after is Some(join) then finish_into(l, Jump(join), join)
+    for name in consumes
+        val i = c_named_parameter(symbol, call, name) match
+            Some(i) -> i
+            None -> continue
+        val taken = call.objects[i] match
+            Some(t) -> t
+            None -> continue
+        val join = c_if_present(l, taken, call.optionals[i])
+        l.insts.push(Store(field_address(l, taken, FieldSlot(0, MPtr)), NullAddress))
+        c_end_present(l, join)
+
+// The handle class a binding answers, itself or in an `Option`.
+private c_handle_result(l: *Lowering, symbol: FunctionSymbol) -> Option[CHandleForm] = c_handle_form(concrete(l, symbol.result.unwrap_or(Unit)), l.program.data, l.program.classes)
+
+// Makes `holder` keep the handle `kept`, of class `k`, whose C pointer is `pointer`: by a C reference
+// of its own where the class declares `retain` and no `kept:`, given back after the holder's own, with
+// one to each C object `kept` so holds; and otherwise as the Avin object, on the list of what the
+// holder keeps, which the collector traces.
+private c_keep(l: *Lowering, holder: Operand, kept: Operand, pointer: Operand, k: usize, optional: bool)
+    val d = l.program.classes[k].decl
+    val join = c_if_present(l, kept, optional)
+    if c_class_text(d, "retain") is Some(_) && c_class_kept(d) is None then c_glue_call(l, s"avin_c_keep_$k", [holder, pointer, kept])
+    else c_keep_object(l, holder, kept)
+    c_end_present(l, join)
+
+// Puts `kept` at the head of the list of the Avin objects `holder` keeps: a pair of it and the rest.
+private c_keep_object(l: *Lowering, holder: Operand, kept: Operand)
+    var items: Buf[&Type] = buf()
+    items.push(AnyType)
+    items.push(AnyType)
+    val pair: &Type = Tuple(items)
+    val shape = layout(l, pair).variants[0]
+    val list = field_address(l, holder, FieldSlot(CHandleKept, MRef))
+    val rest = fresh(l, MRef)
+    l.insts.push(Load(rest, list))
+    val cell = fresh(l, MRef)
+    l.insts.push(Alloc(cell, shape.descriptor))
+    l.insts.push(Store(field_address(l, Value(cell), shape.fields[0].unwrap()), kept))
+    l.insts.push(Store(field_address(l, Value(cell), shape.fields[1].unwrap()), Value(rest)))
+    l.insts.push(Publish)
+    l.insts.push(Store(field_address(l, holder, FieldSlot(CHandleKept, MRef)), Value(cell)))
+
+// Starts code that runs only where `object` is not null, which only an `optional` handle may be: the
+// block after it, which `c_end_present` ends it with, or none where it always runs.
+private c_if_present(l: *Lowering, object: Operand, optional: bool) -> Option[usize]
+    if !optional then return None
+    val present = new_block(l)
+    val join = new_block(l)
+    finish_into(l, Branch(compare(l, CmpEq, object, NullAddress), join, present), present)
+    Some(join)
+
+private c_end_present(l: *Lowering, join: Option[usize])
+    if join is Some(j) then finish_into(l, Jump(j), j)
+
+// A value of the data type `t`, of its variant `name`, holding `value` where the variant has a field:
+// its one constant object where it holds nothing.
+private variant_object(l: *Lowering, t: &Type, name: string, value: Option[Operand]) -> Operand
+    val id = *t match
+        Data(d, _, _) -> d
+        _ -> panic("a variant of a type that is not data")
+    var v = 0usize
+    for i in 0..<l.program.data[id].variants.len()
+        if l.program.data[id].variants[i].name == name then v = i
+    val shape = layout(l, t).variants[v]
+    if l.descriptors[shape.descriptor].constant then return ConstObject(shape.descriptor)
+    val object = fresh(l, MRef)
+    l.insts.push(Alloc(object, shape.descriptor))
+    if value is Some(x)
+        if shape.fields.len() > 0
+            if shape.fields[0] is Some(field) then l.insts.push(Store(field_address(l, Value(object), field), x))
+    l.insts.push(Publish)
+    Value(object)
 
 // The name of a binding's parameter `i` as a trap names it: the name it was declared with, or its
 // position where it was declared with a pattern.
@@ -2234,7 +2532,7 @@ private bound_instance(l: *Lowering, index: usize) -> bool
     val inst = l.instances[index]
     if inst.generated != Written then return false
     val symbol = l.program.symbols[inst.function]
-    binding_target(symbol.decl) is Some(_) || handle_of(l, symbol) is Some(_) || c_prototype_text(symbol.decl) is Some(_)
+    binding_target(symbol.decl) is Some(_) || handle_of(l, symbol) is Some(_) || c_prototype_text(symbol.decl) is Some(_) || c_close_class(l, symbol) is Some(_)
 
 /** The Sysl handle class whose method `symbol` is, where it is one without a body: a method bound to
  * the handle's Sysl value, or its `close()`. */

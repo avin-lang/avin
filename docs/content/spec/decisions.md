@@ -3178,7 +3178,51 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- Proposed (built on branch `c-bindings-handles`): **C handles** (stage 13 step 3), the choices
+  building them made where the [chapter](/spec/c-bindings/#handles) is silent.
+  - **`shared` is a bare word of the class's `@c`**, `@c(type: …, release: …, shared)`. *Why*: the
+    `@c(` lines are the whole trusted surface, and a thread-safety claim is one of them; no class
+    modifier says it today. *Alternative*: a `shared class` modifier, a keyword for one use.
+  - **A handle's method is bound by a prototype taking the receiver first, named `self`**, of the
+    class's C type (or that type `const`); the method's parameters follow by position. *Why*: the
+    chapter's every example writes it so, and the name makes the receiver visible in the C text.
+    *Alternative*: the receiver at any position named `self`, which no surveyed library needs.
+  - **What keeps is the handle the binding answers, else a method's receiver**, and a method
+    answering a handle may name `self` in `keeps:` to have the new handle keep the receiver.
+    Nothing is kept unless the call succeeded: a handle answered (not null), or a zero status.
+    *Why*: a library object made by a method of another usually depends on it (a face's variation
+    descriptor). *Alternative*: the receiver always keeps for a method, which leaves the made
+    handle unprotected.
+  - **`consumes:` closes the handle passed whatever the call answers, and may name `self`**; the
+    consumed handle keeps what it kept until it is collected or closed. *Why*: C functions that take
+    a reference take it unconditionally, and giving back what the consumed object keeps while C
+    still holds the object would be a use after free. *Alternatives*: closing only on success,
+    which most taking functions do not distinguish; releasing what it keeps at once.
+  - **A holder keeping a handle by a C reference also takes one to each C object that handle so
+    holds**, after it, given back after it. *Why*: found under the collector's stress in the
+    fixture: a variation descriptor keeps a face, the face's own handle is collected first and gives
+    back its reference to the library, and the library is freed under a face the descriptor's
+    `release` reaches through. *Alternatives*: holding the kept handle as the Avin object as well,
+    which orders nothing within one collection; refusing chains of kept handles, which FreeType's
+    API is.
+  - **The class `kept:` names declares `retain` and no `kept:` of its own**, and is found in the
+    holder's module or by its module and name (`freetype.Face`); `retain:` sees the name only where
+    it takes a `borrowed` result's reference, as the pointer of the handle the binding keeps; a
+    holder keeping a handle whose class has `kept:` holds it as the Avin object. *Why*: the name is
+    a pointer only while a C reference holds it, and a class with `kept:` cannot be given back from
+    its pointer alone. *Alternative*: storing every kept name in the C reference's record, which
+    then has to hold references of its own, the same chain again.
+  - **A status's code is any integer type**, converted with the result's range check
+    (`Result[unit, long]` for `long long`; a `long long` code past `int` traps for
+    `Result[unit, int]`). *Alternative*: `int` only, which loses a `long` status's code.
+  - **The C unit includes a package's headers after those of every package whose handle classes
+    its bindings name**, and otherwise in the order the libraries are listed, the program's own
+    first. *Why*: that is the only order the header check depends on, and it is read from the
+    bindings themselves. *Alternative*: a topological order of the whole package graph, which
+    reorders headers no binding needs reordered.
+
+  **Review with the user**: `shared` as a word of `@c` rather than a modifier, and the chain of C
+  references a kept handle brings with it.
 
 ## Open
 

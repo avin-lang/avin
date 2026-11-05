@@ -114,7 +114,7 @@ c-libraries {
   A macro no earlier header defines is reported at the entry, with clang's own words:
 
   ```text
-  error: the header `FT_FREETYPE_H` of the C library `freetype` of package `freetype` is not a macro any earlier header defines: clang says '#include expects "FILENAME" or <FILENAME>'
+  error: the header `FT_FREETYPE_H` of the C library `freetype` of package `freetype` is not a macro any earlier header defines: clang says 'expected "FILENAME" or <FILENAME>'
   ```
 - `install` is what a build that cannot find the module says to do:
 
@@ -221,7 +221,8 @@ else is.
 ## Status results
 
 C reports most failures as an integer. A C integer result bound as `Result[unit, int]` is `Ok(())`
-when it is zero and `Err(code)` otherwise. With [out parameters](#arrays-and-out-parameters), a status result
+when it is zero and `Err(code)` otherwise. The code may be any integer type, converted with the check
+a scalar result has (`Result[unit, long]` for a `long long` status). With [out parameters](#arrays-and-out-parameters), a status result
 bound as `Result[T, int]` holds the out values in its `Ok`, and they are read only when the status is
 zero. Other conventions — a negative error number, `-1` beside `errno` — are written in Avin over the
 integer, and a public function maps the code to the library's own error type. Whether `errno` is read
@@ -294,6 +295,19 @@ A handle is the [Sysl handle](/spec/sysl-bindings/#handles) over a C pointer, an
   [sendable](/spec/actors/#what-may-be-sent). Whether a handle passed across threads hands its
   ownership on follows the [Sysl handle's rule](/spec/sysl-bindings/#handles).
 - **A handle is compared by identity**, and has no `Display` of its own.
+- **A handle's own method without a body is a C binding** whose prototype takes the receiver first,
+  named `self`, and the method's parameters after it, by position; a method with a body is an
+  ordinary method and may call the bound ones. `shared` is written among the class's words,
+  `@c(type: …, release: …, shared)` ([proposed](/spec/decisions/#proposed)).
+- **What keeps is the handle the binding answers**, and for a method that answers none, its
+  receiver; a method answering a handle names its receiver as `self` to have the new handle keep it
+  (`@c("FT_Error FT_Get_MM_Var(FT_Face self, …)", keeps: "self")`). What a call keeps is kept only
+  when it succeeds: the handle answered is not null, or the status answered is zero. **`consumes:`
+  closes the handle passed whatever the call answers**, and it may name `self`; what a consumed
+  handle keeps it goes on keeping until it is collected or closed
+  ([proposed](/spec/decisions/#proposed)).
+- **A parameter may take a handle as its class's C type `const`-qualified** (`const cairo_t *`),
+  the same pointer to C; a result answers exactly the class's type.
 
 ### When C holds the object longer than Avin does
 
@@ -345,6 +359,12 @@ class Library
 private newFace(library: Library, path: string, index: long) -> Result[Face, int]
 ```
 
+**The holder also takes a reference to each C object the kept handle so holds**, after the kept
+one's, and gives them back after it ([proposed](/spec/decisions/#proposed)). A variation descriptor
+keeping a face keeps the face's library too, so when the face's own handle is collected first, and
+gives back its reference to the library, the library still outlives the face the descriptor's
+`release` reaches through.
+
 A kept handle with no `retain`, a `ByteBlock` and a callback's closure are held as the Avin object, as
 before, and the holder's `release` must not use them: that is taken on [trust](#soundness).
 
@@ -363,7 +383,12 @@ private mmVar(face: Face) -> Result[MMVar, int]
 ```
 
 A class with `kept:` made by a binding that does not keep one handle of that class is refused at the
-binding, as is a `kept:` name that `release:` and `retain:` never use.
+binding, as is a `kept:` name that `release:` and `retain:` never use. The class `kept:` names is one
+of the holder's module, or one written with its module (`freetype.Face`), and it declares `retain`
+and no `kept:` of its own, since its pointer is valid only while a C reference holds it. `retain:`
+sees the name where it takes the reference of a `borrowed` result, as the pointer of the handle the
+binding keeps; a holder keeping a handle of a class with `kept:` holds it as the Avin object
+([proposed](/spec/decisions/#proposed)).
 
 ### Handles of another package
 

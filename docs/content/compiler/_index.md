@@ -163,7 +163,8 @@ binding is **not** a shim: it is a direct call from the program's own code.
   result, a callback's parameters without its `userdata`. It records each binding's **crossing**,
   as a Sysl binding's is recorded.
 - **The C unit.** The driver writes one C file for the program, `#include`s the headers every
-  package's `c-libraries` names, and emits per binding a `_Static_assert` that
+  package's `c-libraries` names (a package's after those of every package whose handle classes its
+  bindings name, and an entry that is a C identifier as `#include NAME`), and emits per binding a `_Static_assert` that
   `__builtin_types_compatible_p(__typeof__(&symbol), <the prototype's function pointer type>)`, and
   one that the function its `free:` names takes a pointer and answers nothing; per typedef crossing
   as a string, that it is `char *` or `const char *` (only the latter as a parameter); per
@@ -188,9 +189,16 @@ binding is **not** a shim: it is a direct call from the program's own code.
   status to `Result`, a pointer
   to a new handle object, through `retain` when `borrowed`). A `blocking` call is bracketed by
   `avin_rt_enter_safe` and `avin_rt_leave_safe` after every argument is converted (an array argument
-  copied off the heap) and before the result is. A handle object holds its C pointer, its owner word,
-  its open views and its kept objects and callbacks; its finalizer runs `forget` for each kept
-  callback, then `release`.
+  copied off the heap) and before the result is. A handle object is four words: its C pointer (null
+  once given back or taken by a `consumes:` call), its owner word, the list of C references it
+  holds to the handles it keeps (off the heap, the glue's), and the list of Avin objects it keeps,
+  pairs of `(Any, Any)` the collector traces. The C unit's glue defines per handle class `i`
+  `avin_c_give_back_i`, which `close()` calls, `avin_c_finalize_i`, the descriptor's finalizer, which
+  calls it, and with `retain` `avin_c_retain_i`; a class with `retain` and no `kept:` also gets
+  `avin_c_keep_i`, which takes a C reference for a holder and one to each C reference the kept
+  handle holds, given back in order after the holder's own `release`, so the collector's sweep order
+  never frees a kept object first. A `kept:` name is the pointer of the first held reference of its
+  class. Later, the finalizer will run `forget` for each kept callback before `release`.
 - **Callbacks.** For each C function type a callback parameter has, lowering makes one trampoline
   with C's convention. It reads the `userdata` as the runtime's callback record (`callback_pin` when
   the binding is called, unpinned at return or when the keeping handle is released), calls

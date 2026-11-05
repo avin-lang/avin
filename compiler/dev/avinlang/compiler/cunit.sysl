@@ -5,7 +5,7 @@ import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
 import sysl.fs.{exists, make_dir_all, make_temp_dir, pending_name, publish_file, read_bytes, remove_dir_all, remove_file, write_text}
 import sysl.process.capture
-import sysl.text.str_builder
+import sysl.text.{StrBuilder, str_builder}
 
 // The C unit. Every program with C bindings is built with one generated C file, compiled by clang
 // with the include flags of the program's C libraries. For each binding it holds a `_Static_assert`
@@ -34,6 +34,31 @@ struct CUnitBinding
     package: string
     forms: Buf[CTextForm]
     free: Option[string]
+    /** The packages of the handle classes it takes or answers, whose headers come before its own. */
+    uses: Buf[string]
+
+/** A handle class as the C unit compiles its glue: its name and index, which name its glue
+ * functions, the C type it is on as `parse_c_type` reads it and whether that is a typedef, whose
+ * kind is checked, its `release:` and `retain:`, what its `kept:` names, the unit and span that place
+ * it, and its package. */
+struct CUnitHandle
+    name: string
+    index: usize
+    ty: string
+    typedef: bool
+    release: string
+    retain: Option[string]
+    kept: Option[CUnitKept]
+    unit: usize
+    span: Span
+    package: string
+
+/** The handle a class's `kept:` names: the name `release:` gives its pointer, the kept class's index
+ * and its C type. */
+struct CUnitKept
+    name: string
+    index: usize
+    ty: string
 
 /** What building a program's C unit gave: the object, when the program has C bindings; whether this
  * build compiled it rather than finding it cached; what it measured, by `c_measure_key`; and the
@@ -55,26 +80,65 @@ const MeasureMarker: string = "avin.c-unit.measurements:"
 c_unit_bindings(program: TProgram, files: Buf[ProgramFile], library: usize) -> Buf[CUnitBinding]
     var out: Buf[CUnitBinding] = buf()
     for s in program.symbols
-        if s.root is Some(_) || s.owner_class is Some(_) || s.receiver is Some(_) then continue
+        if s.root is Some(_) || s.receiver is Some(_) then continue
+        // A method is a binding only on a C handle, and its receiver, the first of its parameters,
+        // is the prototype's first.
+        if s.owner_class is Some(k)
+            if c_handle_type(program.classes[k].decl) is None || s.constructor then continue
         val p = c_prototype_of(s.decl) match
             Some(p) -> p
             None -> continue
-        val package = if s.unit >= library && s.unit - library < files.len() then files[s.unit - library].package else ""
-        val result = s.result.unwrap_or(Unit)
+        val params = s.params
+        val package = package_of(s.unit, files, library)
+        // A status is measured as the integer its code is.
+        var result = s.result.unwrap_or(Unit)
+        if c_status_error(result, program.data) is Some(e) then result = e
         var forms: Buf[CTextForm] = buf()
         forms.push(c_text_form(result, program.data, program.classes))
-        for t in s.params
+        for t in params
             forms.push(c_text_form(t, program.data, program.classes))
-        out.push(CUnitBinding(s.name, p, s.params, result, s.unit, s.decl.name_span, package, forms, c_free_text(s.decl)))
+        var uses: Buf[string] = buf()
+        var positions: Buf[&Type] = buf()
+        positions.push(s.result.unwrap_or(Unit))
+        for t in params
+            positions.push(t)
+        for t in positions
+            if c_handle_form(t, program.data, program.classes) is Some(h)
+                val used = package_of(program.classes[h.class_index].unit, files, library)
+                if used != package && !contains_text(uses, used) then uses.push(used)
+        out.push(CUnitBinding(s.name, p, params, result, s.unit, s.decl.name_span, package, forms, c_free_text(s.decl), uses))
+    out
+
+private package_of(unit: usize, files: Buf[ProgramFile], library: usize) -> string = if unit >= library && unit - library < files.len() then files[unit - library].package else ""
+
+/** The handle classes of a checked program, whose glue the C unit compiles, in the order of the
+ * program's classes. */
+c_unit_handles(program: TProgram, files: Buf[ProgramFile], library: usize) -> Buf[CUnitHandle]
+    var out: Buf[CUnitHandle] = buf()
+    for k in 0..<program.classes.len()
+        val d = program.classes[k].decl
+        val written = c_handle_type(d) match
+            Some(t) -> t
+            None -> continue
+        val ty = parse_c_type(written) match
+            Ok(t) -> t
+            Err(_) -> continue
+        var kept: Option[CUnitKept] = None
+        if c_class_kept(d) is Some(name)
+            if c_kept_class(program.classes, k) is Some(j)
+                val kd = program.classes[j].decl
+                if c_handle_type(kd) is Some(kt) && c_class_text(kd, "retain") is Some(_) && c_class_kept(kd) is None
+                    kept = Some(CUnitKept(name.name, j, kt))
+        out.push(CUnitHandle(program.classes[k].name, k, ty.text, ty.ty is CTypedef(_), c_class_text(d, "release").unwrap_or(""), c_class_text(d, "retain"), kept, program.classes[k].unit, d.name_span, package_of(program.classes[k].unit, files, library)))
     out
 
 /** The C unit of a program whose C bindings are `bindings` and whose packages name `libraries`. Each
  * library's `pkg-config` module is asked for its flags; with no bindings there is no unit, and only
  * the link flags are answered. A binding the headers do not declare as its prototype says, or whose
  * package names no header, is reported at the binding, rendered with `sources`. */
-ensure_c_unit(tc: Toolchain, bindings: Buf[CUnitBinding], libraries: Buf[CLibrary], sources: Buf[Source]) -> Result[CUnit, string]
-    if bindings.len() == 0 && libraries.len() == 0 then return Ok(CUnit(None, false, map(), buf()))
-    // A binding is checked against a header, always.
+ensure_c_unit(tc: Toolchain, bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries: Buf[CLibrary], sources: Buf[Source]) -> Result[CUnit, string]
+    if bindings.len() == 0 && handles.len() == 0 && libraries.len() == 0 then return Ok(CUnit(None, false, map(), buf()))
+    // A binding is checked against a header, always, and a handle's glue compiled against one.
     var refused = ""
     for b in bindings
         var headers = 0usize
@@ -85,6 +149,15 @@ ensure_c_unit(tc: Toolchain, bindings: Buf[CUnitBinding], libraries: Buf[CLibrar
         var r = report()
         r.add(error(b.span, why))
         refused = refused + r.render(sources[b.unit])
+    for h in handles
+        var headers = 0usize
+        for library in libraries
+            if library.package == h.package then headers += library.headers.len()
+        if headers > 0 then continue
+        val why = if h.package == "" then s"the C handle `${h.name}` is compiled against the headers a package's manifest names under `c-libraries`, and this program has no avin.hocon" else s"the C handle `${h.name}` has no header to be compiled against: name the one that declares `${h.ty}` in a `headers` list of the `c-libraries` of package `${h.package}`"
+        var r = report()
+        r.add(error(h.span, why))
+        refused = refused + r.render(sources[h.unit])
     if refused != "" then return Err(refused)
     var cflags: Buf[string] = buf()
     var link: Buf[string] = buf()
@@ -102,8 +175,8 @@ ensure_c_unit(tc: Toolchain, bindings: Buf[CUnitBinding], libraries: Buf[CLibrar
             None ->
                 for name in library.link
                     add_flag(&link, "-l" + name)
-    if bindings.len() == 0 then return Ok(CUnit(None, false, map(), link))
-    val unit = c_unit_source(bindings, libraries)
+    if bindings.len() == 0 && handles.len() == 0 then return Ok(CUnit(None, false, map(), link))
+    val unit = c_unit_source(bindings, handles, libraries)
     val version = capture(tc.clang, ["--version"], timeout = 60000) match
         Ok(r) -> r.text
         Err(e) -> return Err("avin: " + missing_tool(tc.clang, e.to_string()) + "\n")
@@ -113,7 +186,7 @@ ensure_c_unit(tc: Toolchain, bindings: Buf[CUnitBinding], libraries: Buf[CLibrar
     val object = tc.c_unit_cache() + "/" + content_key(unit.text + "\n" + flags_text + answered + version) + ".o"
     var built = false
     if !exists(object)
-        compile_c_unit(tc, unit, cflags, object, bindings, libraries, sources)?
+        compile_c_unit(tc, unit, cflags, object, bindings, handles, libraries, sources)?
         built = true
     val bytes = read_bytes(object).map_err(e -> s"avin: $object: ${e.to_string()}\n")?
     val measures = read_measures(bytes, unit.measured) match
@@ -155,6 +228,9 @@ enum CUnitLine
     KindLine(binding: usize, position: usize, name: string, kind: CKind)
     /** The check that `free`, which `bindings[binding]`'s `free:` names, frees a string. */
     FreeLine(binding: usize, free: string)
+    /** A line of the glue of `handles[handle]` compiling what its `@c` says under `part`: `type`,
+     * `release`, `retain` or `kept`. */
+    GlueLine(handle: usize, part: string)
 
 /** A C unit's text, what each of its lines is for, counting from 1, and the measurement keys of its
  * table, in order. */
@@ -163,8 +239,11 @@ struct CUnitSource
     lines: Buf[CUnitLine]
     measured: Buf[string]
 
-/** The C unit for `bindings`, including every header of `libraries`. */
-c_unit_source(bindings: Buf[CUnitBinding], libraries: Buf[CLibrary]) -> CUnitSource
+/** The C unit for `bindings` and the glue of `handles`, including every header of `libraries`, in
+ * `header_order`, so a binding naming another package's handle is checked with that package's
+ * headers before its own. Each package's headers keep their order, and a header that is a C
+ * identifier is a macro an earlier header defines, included as `#include NAME`. */
+c_unit_source(bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries: Buf[CLibrary]) -> CUnitSource
     var out = str_builder()
     var lines: Buf[CUnitLine] = buf()
     // Line 0 does not exist; lines count from 1.
@@ -173,13 +252,20 @@ c_unit_source(bindings: Buf[CUnitBinding], libraries: Buf[CLibrary]) -> CUnitSou
     lines.push(Plain)
     out.push("#include <stdbool.h>\n")
     lines.push(Plain)
+    if handles.len() > 0
+        out.push("#include <stdlib.h>\n")
+        lines.push(Plain)
     var included: Buf[string] = buf()
-    for i in 0..<libraries.len()
-        for h in libraries[i].headers
-            if contains_text(included, h) then continue
-            included.push(h)
-            out.push("#include " + (if h.starts_with("<") || h.starts_with("\"") then h else "<" + h + ">") + "\n")
-            lines.push(IncludeLine(i, h))
+    for package in header_order(bindings, libraries)
+        for i in 0..<libraries.len()
+            if libraries[i].package != package then continue
+            for h in libraries[i].headers
+                if contains_text(included, h) then continue
+                included.push(h)
+                val spelled = if h.starts_with("<") || h.starts_with("\"") || is_c_identifier(h) then h else "<" + h + ">"
+                out.push("#include " + spelled + "\n")
+                lines.push(IncludeLine(i, h))
+    if handles.len() > 0 then handle_glue(&out, &lines, handles)
     var kinds: Buf[string] = buf()
     var measured: Buf[string] = buf()
     var measured_types: Buf[string] = buf()
@@ -242,6 +328,101 @@ c_unit_source(bindings: Buf[CUnitBinding], libraries: Buf[CLibrary]) -> CUnitSou
     lines.push(Plain)
     CUnitSource(out.finish(), lines, measured)
 
+// The glue of the handle classes. A handle's object is four words: its C pointer, null once given
+// back; its owner; the C references it holds to what it keeps, a list off the heap; and the Avin
+// objects it keeps, which the collector traces. For each class `i` the unit defines
+// `avin_c_give_back_i`, which gives the object's reference back through `release:` and then each C
+// reference it holds, in the order they were taken, and `avin_c_finalize_i`, the collector's
+// finalizer of its objects, which does the same; with `retain:`, `avin_c_retain_i`, which takes a
+// reference to a pointer C lent; and for a class whose handles another keeps by a C reference (one
+// with `retain:` and no `kept:`), `avin_c_keep_i`, which takes one for a holder, `avin_c_take_i` and
+// `avin_c_drop_i`, which take and give back one. A holder keeping a handle by a C reference also
+// takes one to everything that handle so holds, after it, so what the kept object needs outlives it
+// whichever finalizer runs first: a face's library outlives the face, though the face's own handle
+// is gone. A name `kept:` gives is the pointer of the one handle of its class the object holds a
+// reference to.
+private handle_glue(out: *StrBuilder, lines: *Buf[CUnitLine], handles: Buf[CUnitHandle])
+    glue(out, lines, "struct avin_c_kept { void *pointer; void (*take)(void *); void (*drop)(void *); struct avin_c_kept *next; };", Plain)
+    glue(out, lines, "static void avin_c_hold(void **o, void *p, void (*take)(void *), void (*drop)(void *)) { struct avin_c_kept *k = malloc(sizeof *k); struct avin_c_kept **at = (struct avin_c_kept **)&o[2]; if (!k) abort(); k->pointer = p; k->take = take; k->drop = drop; k->next = 0; while (*at) at = &(*at)->next; *at = k; }", Plain)
+    glue(out, lines, "static void avin_c_hold_all(void **o, void **kept) { for (struct avin_c_kept *k = kept[2]; k; k = k->next) { k->take(k->pointer); avin_c_hold(o, k->pointer, k->take, k->drop); } }", Plain)
+    glue(out, lines, "static void *avin_c_held(void **o, void (*drop)(void *)) { for (struct avin_c_kept *k = o[2]; k; k = k->next) if (k->drop == drop) return k->pointer; return 0; }", Plain)
+    glue(out, lines, "static void avin_c_drain(void **o) { struct avin_c_kept *k = o[2]; o[2] = 0; while (k) { struct avin_c_kept *next = k->next; k->drop(k->pointer); free(k); k = next; } }", Plain)
+    for h in handles
+        if kept_by_reference(h) then glue(out, lines, s"void avin_c_drop_${h.index}(void *p);", Plain)
+    // Each type is checked first, by a name of the unit's own, which only the check uses: a
+    // diagnostic of the glue names the types as the headers do.
+    for i in 0..<handles.len()
+        val h = handles[i]
+        glue(out, lines, s"typedef ${h.ty} avin_c_type_${h.index};", GlueLine(i, "type"))
+        if h.typedef then glue(out, lines, s"_Static_assert(__builtin_classify_type(*(avin_c_type_${h.index} *)0) == 5, \"avin: the C handle ${h.name}\");", GlueLine(i, "pointer"))
+    for i in 0..<handles.len()
+        val h = handles[i]
+        val n = h.index
+        val t = h.ty
+        val release = c_call_text(h.release)
+        if h.retain is Some(r)
+            glue(out, lines, s"void avin_c_retain_$n(void *p, void *k) {", Plain)
+            glue(out, lines, s"    $t self = ($t)p;", Plain)
+            if h.kept is Some(k) then glue(out, lines, s"    ${k.ty} ${k.name} = (${k.ty})k;", GlueLine(i, "kept"))
+            glue(out, lines, s"    (void)(${c_call_text(r)});", GlueLine(i, "retain"))
+            glue(out, lines, "}", Plain)
+        if kept_by_reference(h)
+            glue(out, lines, s"void avin_c_drop_$n(void *p) {", Plain)
+            glue(out, lines, s"    $t self = ($t)p;", Plain)
+            glue(out, lines, s"    (void)($release);", GlueLine(i, "release"))
+            glue(out, lines, "}", Plain)
+            glue(out, lines, s"void avin_c_take_$n(void *p) { avin_c_retain_$n(p, 0); }", Plain)
+            glue(out, lines, s"void avin_c_keep_$n(void **o, void *p, void **kept) { avin_c_take_$n(p); avin_c_hold(o, p, avin_c_take_$n, avin_c_drop_$n); avin_c_hold_all(o, kept); }", Plain)
+        glue(out, lines, s"void avin_c_give_back_$n(void **o) {", Plain)
+        glue(out, lines, "    if (o[0]) {", Plain)
+        glue(out, lines, s"        $t self = ($t)o[0];", Plain)
+        if h.kept is Some(k) then glue(out, lines, s"        ${k.ty} ${k.name} = (${k.ty})avin_c_held(o, avin_c_drop_${k.index});", GlueLine(i, "kept"))
+        glue(out, lines, "        o[0] = 0;", Plain)
+        glue(out, lines, s"        (void)($release);", GlueLine(i, "release"))
+        glue(out, lines, "    }", Plain)
+        glue(out, lines, "    avin_c_drain(o);", Plain)
+        glue(out, lines, "}", Plain)
+        glue(out, lines, s"void avin_c_finalize_$n(void *o, void *heap) { (void)heap; avin_c_give_back_$n((void **)o); }", Plain)
+
+/** The packages of `libraries` in the order their headers are included: each after every package
+ * whose handle classes its bindings name, and otherwise in the order the libraries are listed. A
+ * cycle, which dependencies cannot make, leaves the rest in that order. */
+header_order(bindings: Buf[CUnitBinding], libraries: Buf[CLibrary]) -> Buf[string]
+    var listed: Buf[string] = buf()
+    for library in libraries
+        if !contains_text(listed, library.package) then listed.push(library.package)
+    var placed: Buf[string] = buf()
+    while placed.len() < listed.len()
+        var next: Option[string] = None
+        for p in listed
+            if contains_text(placed, p) then continue
+            var ready = true
+            for b in bindings
+                if b.package != p then continue
+                for used in b.uses
+                    if contains_text(listed, used) && !contains_text(placed, used) then ready = false
+            if ready
+                next = Some(p)
+                break
+        next match
+            Some(p) -> placed.push(p)
+            None ->
+                for p in listed
+                    if !contains_text(placed, p) then placed.push(p)
+    placed
+
+private glue(out: *StrBuilder, lines: *Buf[CUnitLine], text: string, line: CUnitLine)
+    out.push(text + "\n")
+    lines.push(line)
+
+/** Whether a holder keeps a handle of `h`'s class by a C reference of its own: the class declares
+ * `retain:`, and no `kept:`, whose names only its own object holds. */
+kept_by_reference(h: CUnitHandle) -> bool = h.retain is Some(_) && h.kept is None
+
+// A `release:` or `retain:` as the C expression it compiles to: a function's name is called with the
+// handle's pointer.
+private c_call_text(text: string) -> string = if is_c_identifier(text.trim()) then text.trim() + "(self)" else text
+
 private c_spelling(c: CType) -> string = c match
     CKeyword(n) -> n
     CTypedef(n) -> n
@@ -275,7 +456,7 @@ private contains_text(xs: Buf[string], x: string) -> bool
     false
 
 // Compiles the C unit into `object`, published by rename, or renders why it did not compile.
-private compile_c_unit(tc: Toolchain, unit: CUnitSource, cflags: Buf[string], object: string, bindings: Buf[CUnitBinding], libraries: Buf[CLibrary], sources: Buf[Source]) -> Result[unit, string]
+private compile_c_unit(tc: Toolchain, unit: CUnitSource, cflags: Buf[string], object: string, bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries: Buf[CLibrary], sources: Buf[Source]) -> Result[unit, string]
     make_dir_all(tc.c_unit_cache()).map_err(e -> s"avin: ${tc.c_unit_cache()}: ${e.to_string()}\n")?
     val dir = make_temp_dir("avin-c-unit").map_err(e -> s"avin: ${e.to_string()}\n")?
     defer _ = remove_dir_all(dir)
@@ -289,7 +470,7 @@ private compile_c_unit(tc: Toolchain, unit: CUnitSource, cflags: Buf[string], ob
     for f in cflags
         args.push(f)
     val result = capture(tc.clang, args.view(), stderr = true, timeout = 120000).map_err(e -> "avin: " + missing_tool(tc.clang, e.to_string()) + "\n")?
-    if !result.status.ok() then return Err(c_unit_diagnostics(result.err.unwrap_or("") + result.text, unit, bindings, libraries, sources))
+    if !result.status.ok() then return Err(c_unit_diagnostics(result.err.unwrap_or("") + result.text, unit, bindings, handles, libraries, sources))
     publish_file(pending, object).map_err(e -> s"avin: $object: ${e.to_string()}\n")?
     Ok(())
 
@@ -308,10 +489,16 @@ private struct BindingTrouble
 
 /** Clang's diagnostics of the C unit `unit`, placed back at the bindings and the libraries they came
  * from; anything clang said that no line of the unit accounts for is passed on as it was. */
-c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding], libraries: Buf[CLibrary], sources: Buf[Source]) -> string
+c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries: Buf[CLibrary], sources: Buf[Source]) -> string
     var troubles: Buf[BindingTrouble] = buf()
     for _ in bindings
         troubles.push(BindingTrouble("", "", false, "", "", buf(), buf(), buf()))
+    // What each handle's glue said, one message for each part of its `@c`.
+    var glue_parts: Buf[Buf[string]] = buf()
+    var glue_messages: Buf[Buf[string]] = buf()
+    for _ in handles
+        glue_parts.push(buf())
+        glue_messages.push(buf())
     var unplaced = ""
     var libraries_text = ""
     var placed_any = false
@@ -333,8 +520,21 @@ c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding
             IncludeLine(k, header) ->
                 val library = libraries[k]
                 val tail = if library.install == "" then "" else " " + library.install
-                libraries_text = libraries_text + s"error: the header `$header` of the C library `${library.label}` of package `${library.package}` was not found: ${d.message}.$tail\n"
+                // A header named by a macro no earlier header defines is no header at all.
+                if is_c_identifier(header) && d.message.contains("\"FILENAME\" or <FILENAME>")
+                    libraries_text = libraries_text + s"error: the header `$header` of the C library `${library.label}` of package `${library.package}` is not a macro any earlier header defines: clang says '${d.message}'\n"
+                else libraries_text = libraries_text + s"error: the header `$header` of the C library `${library.label}` of package `${library.package}` was not found: ${d.message}.$tail\n"
                 placed_any = true
+            GlueLine(i, part) ->
+                placed_any = true
+                // A type the headers do not declare makes every later line of its glue wrong too.
+                if contains_text(glue_parts[i], part) || contains_text(glue_parts[i], "type") || contains_text(glue_parts[i], "pointer") then continue
+                glue_parts[i].push(part)
+                val h = handles[i]
+                var m = s"the `$part:` of the C handle `${h.name}` does not compile against its headers: clang says '${d.message}'"
+                if part == "type" then m = s"the C handle `${h.name}` is on `${h.ty}`, which its headers do not declare as a type: clang says '${d.message}'"
+                elif part == "pointer" then m = s"the C handle `${h.name}` is on `${h.ty}`, which is not a pointer in its headers"
+                glue_messages[i].push(m)
             AssertLine(i) ->
                 placed_any = true
                 val requirement = "static assertion failed due to requirement '__builtin_types_compatible_p("
@@ -387,6 +587,12 @@ c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding
                     troubles[i].frees.push(s"the C binding `${bindings[i].name}` frees its result with `$name`, which the headers do not declare as a function taking the string and answering nothing, `void $name(void *)` or `void $name(char *)`")
             Plain -> unplaced = unplaced + text + "\n"
     var rendered = libraries_text
+    for i in 0..<handles.len()
+        if glue_messages[i].len() == 0 then continue
+        var r = report()
+        for m in glue_messages[i]
+            r.add(error(handles[i].span, m))
+        rendered = rendered + r.render(sources[handles[i].unit])
     for i in 0..<bindings.len()
         val b = bindings[i]
         val t = troubles[i]
