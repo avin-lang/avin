@@ -111,6 +111,29 @@ class Command(
   // output has ended the command is waited for.
   lines() -> Result[Iterator[string], IoError]
     val (from, into) = makePipe().mapErr(ioError)?
+    // A sequence starts its later parts as its earlier ones end, which has to happen while the
+    // output is read, so a command holding one is started and driven on a thread of its own, which
+    // the job belongs to; whether it started comes back through a promise.
+    if sequenced()
+      val launched = threads.Promise[Result[unit, IoError]]()
+      val driver = threads.spawn(() ->
+        launch(Context(None, [], None), Streams(Inherit, None, ToFile(into), Some(into))) match
+          Ok(job) ->
+            launched.complete(Ok(()))
+            job.finish()
+          Err(e) -> launched.complete(Err(e)))
+      launched.future.await() match
+        Err(e) ->
+          closeFile(Some(from))
+          driver.join()
+          return Err(e)
+        Ok(_) -> ()
+      val descriptor = from.fd()
+      if descriptor.isErr()
+        closeFile(Some(from))
+        driver.join()
+        return Err(ioError(descriptor.err().get()))
+      return Ok(OutputLines(from, fdReader(descriptor.ok().get()), () -> driver.join()))
     val started = launch(Context(None, [], None), Streams(Inherit, None, ToFile(into), Some(into)))
     if started.isErr()
       closeFile(Some(from))
@@ -121,20 +144,19 @@ class Command(
       closeFile(Some(from))
       job.finish()
       return Err(ioError(descriptor.err().get()))
-    val reader = fdReader(descriptor.ok().get())
-    // A sequence starts its later parts as its earlier ones end, which has to happen while the
-    // output is read, so a command holding one is driven on a thread of its own.
-    if job.sequenced()
-      val driver = threads.spawn(() -> job.finish())
-      Ok(OutputLines(from, reader, () -> driver.join()))
-    else
-      Ok(OutputLines(from, reader, () -> job.finish()))
+    Ok(OutputLines(from, fdReader(descriptor.ok().get()), () -> job.finish()))
 
   // Starts the command and answers at once, with the `Child` it is waited for and stopped by.
   start() -> Result[Child, IoError] = launch(
     Context(None, [], None),
     Streams(Inherit, None, Inherit, None)
   ).map(job -> Child(job))
+
+  // Whether the command holds a sequence, whose later parts start as its earlier ones end.
+  private sequenced() -> bool = shape match
+    Program(_, _) -> false
+    Joined(_, _, _) -> true
+    Piped(from, into) -> from.sequenced() || into.sequenced()
 
   private joined(shape: Shape) -> Command = Command(shape, None, [], None, OwnOutput, OwnInput)
 
