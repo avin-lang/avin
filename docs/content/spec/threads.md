@@ -218,7 +218,8 @@ promise's future belong to it.
 `ex.shutdown()` lets the workers end once the queued work is done, and `isShutdown()` asks. A new
 body given to an executor after its shutdown traps, but the functions of futures already made on it
 still run there, on a worker started for them where none is left, so no future made before is
-stranded. The shared executor is never shut down, and asking traps.
+stranded. The shared executor is never shut down: `isShutdown()` answers `false`, and
+`shutdown()` on it traps.
 
 ```avin
 import avin.threads.{Executor, Future}
