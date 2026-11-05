@@ -488,7 +488,10 @@ is handled, not the one that asked for it. Only a transition runs `leave`: an ac
 fails runs its `stopping` block, where `state()` answers the state it ended in. A trap in an
 `enter` or `leave` fails the actor as one in an arm does. A restarted actor starts again in its
 first state. The actor's `State` type, its states and `state()` are its own, private to its module
-as the actor's state is. An actor without `state` blocks is one whose arms all `stay`, which is why
+as the actor's state is. Its states share names as a machine's do, with a message's variant, another
+actor's state or a machine's: an arm's result is the actor's own state, an arm's pattern the message
+type's, and a bare name nothing decides is refused, naming the qualified forms (`Ev.Idle`,
+`Connection.State.Idle`). An actor without `state` blocks is one whose arms all `stay`, which is why
 its arms yield nothing.
 
 ## Keywords
