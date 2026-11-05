@@ -864,7 +864,9 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     check_tests_files(&c)
     check_expansion(&c)
     check_tailrec(&c)
-    val init = initializer(&c, initialization_order(&c), testing)
+    val direct = direct_uses(&c)
+    check_module_state_in_threads(&c, direct)
+    val init = initializer(&c, initialization_order(&c, direct), testing)
     // A program without `main` is told so in its last file.
     var main_unit = given - 1
     var entry: Option[usize] = None
@@ -5773,7 +5775,8 @@ private structural_sendability(f: Conformances, x: &Type, k: usize, a: SendAssum
                         CannotSend(why) -> CannotSend(s"its elements are ${quoted_type(args[0])}, ${nested_reason(why)}")
                         other -> other
                 val copy = if cls.name == "Buffer" || cls.name == "Array" || cls.name == "Deque" then "; an immutable copy (`toVector`) is sendable" elif cls.name == "Map" then "; an immutable copy (`toMap`) is sendable" elif cls.name == "Set" then "; an immutable copy (`toSet`) is sendable" else ""
-                if copy != "" then return CannotSend(s"it is mutable$copy")
+                // A collection's companion object, which makes collections, holds none itself.
+                if copy != "" && !cls.decl.object then return CannotSend(s"it is mutable$copy")
             if cls.decl.modifier == "trait"
                 return CannotSend(s"it is a trait that does not promise to be sendable; declare it `trait ${cls.name}: Sendable`, and every type implementing it is checked to be")
             if !top && (cls.decl.modifier == "open" || cls.decl.modifier == "abstract")
@@ -6103,6 +6106,125 @@ private texpr_children(e: &TExpr) -> Buf[&TExpr]
 private push_all(out: *Buf[&TExpr], items: Buf[&TExpr])
     for x in items
         out.push(x)
+
+// What is passed for a `@sendable` parameter may run on another thread, and every thread shares the
+// program's module-level state. So the code it runs, directly or through every function it reaches,
+// reads and writes no module-level `var` and reads no module-level value or object (a `lazy val`
+// among them) whose type is not sendable. The whole program is known, so what a call reaches is:
+// the function it names, every implementation a call through a method table or an operator may
+// reach, and every closure made along the way. What is passed for an `@isolated` parameter runs at
+// once on the calling thread, and is not held to this.
+private check_module_state_in_threads(c: *Checker, direct: Buf[Option[Uses]])
+    val k = c.core.trait_named("Sendable") match
+        Some(k) -> k
+        None -> return
+    for id in 0..<c.symbols.len()
+        if id >= c.bodies.len() then break
+        val body = c.bodies[id] match
+            Some(b) -> b
+            None -> continue
+        val root = c.symbols[id].root.unwrap_or(id)
+        var held: Buf[HeldArgument] = buf()
+        scan_thread_bodies(c, id, root, body, k, direct, &held)
+
+private scan_thread_bodies(c: *Checker, id: usize, root: usize, e: &TExpr, k: usize, direct: Buf[Option[Uses]], held: *Buf[HeldArgument])
+    e.kind match
+        Call(f, args, _) -> thread_body_arguments(c, id, f, args, k, direct, held)
+        Dispatch(f, _, args, _) -> thread_body_arguments(c, id, f, args, k, direct, held)
+        BoundCall(f, _, args, _) -> thread_body_arguments(c, id, f, args, k, direct, held)
+        Let(x, value) ->
+            if x < c.locals[root].len() && c.locals[root][x].name == "" then held.push(HeldArgument(x, value))
+        _ -> ()
+    for x in texpr_children(e)
+        scan_thread_bodies(c, id, root, x, k, direct, held)
+
+/** A module-level value a thread's body reaches that it may not, and the functions it is reached
+ * through, from the body outwards. */
+private struct StateReached
+    global: usize
+    via: Buf[usize]
+
+private thread_body_arguments(c: *Checker, id: usize, f: usize, args: Buf[&TExpr], k: usize, direct: Buf[Option[Uses]], held: *Buf[HeldArgument])
+    for i in 0..<args.len()
+        if param_mark(c, f, i) != SendableMark then continue
+        var arg = args[i]
+        if arg.kind is Local(x)
+            for h in *held
+                if h.local == x then arg = h.value
+        val start = with_implementations(c, uses_of(arg))
+        if module_state_reached(c, direct, start, k) is Some(r)
+            val g = c.globals[r.global]
+            var through = ""
+            for step in r.via
+                val s = c.symbols[step]
+                if s.lambda || s.name == "" || s.name.starts_with("<") then continue
+                through = through + (if through == "" then "" else " → ") + s"`${s.name}`"
+            val via = if through == "" then "" else s"through $through "
+            val what = module_state_problem(c, r.global, k).unwrap_or("")
+            c.note(c.symbols[id].unit, args[i].span, s"what is passed for `${c.symbols[f].param_names[i]}` of `${c.symbols[f].name}` may run on another thread, which shares the program's module-level state, but ${via}it reaches $what")
+
+// The first module-level value the uses `start` reach that a thread's body may not, found breadth
+// first so that the path to it is a shortest one.
+private module_state_reached(c: *Checker, direct: Buf[Option[Uses]], start: Uses, k: usize) -> Option[StateReached]
+    if forbidden_global(c, start, k) is Some(g) then return Some(StateReached(g, buf()))
+    val none = c.symbols.len()
+    var parent: Buf[usize] = buf()
+    var seen: Buf[bool] = buf()
+    for _ in 0..<direct.len()
+        parent.push(none)
+        seen.push(false)
+    var pending: Buf[usize] = buf()
+    for f in start.functions
+        if f < direct.len() && !seen[f]
+            seen[f] = true
+            pending.push(f)
+    var next = 0usize
+    while next < pending.len()
+        val f = pending[next]
+        next += 1
+        val u = direct[f] match
+            Some(u) -> u
+            None -> continue
+        if forbidden_global(c, u, k) is Some(g)
+            var chain: Buf[usize] = buf()
+            var at = f
+            while at != none
+                chain.push(at)
+                at = parent[at]
+            var via: Buf[usize] = buf()
+            var j = chain.len()
+            while j > 0
+                j -= 1
+                via.push(chain[j])
+            return Some(StateReached(g, via))
+        for callee in u.functions
+            if callee < direct.len() && !seen[callee]
+                seen[callee] = true
+                parent[callee] = f
+                pending.push(callee)
+    None
+
+private forbidden_global(c: *Checker, u: Uses, k: usize) -> Option[usize]
+    for g in u.globals
+        if module_state_problem(c, g, k) is Some(_) then return Some(g)
+    for g in u.lazies
+        if module_state_problem(c, g, k) is Some(_) then return Some(g)
+    None
+
+// Why a thread's body may not reach module-level value `g`: it is a `var`, or its type is not
+// sendable.
+private module_state_problem(c: *Checker, g: usize, k: usize) -> Option[string]
+    val global = c.globals[g]
+    if global.mutable then return Some(s"`${global.name}`, a module-level `var`, which every thread would share; share it through an `Atomic` or a `Mutex` held in a `val`")
+    val t = c.symbols[global.init].result match
+        Some(t) -> zonk(c, t)
+        None -> return None
+    if *t is ErrorType then return None
+    sendability(conformances(c), t, k) match
+        CannotSend(why) ->
+            if global.object is Some(_) then return Some(s"the object `${global.name}`, ${nested_reason(why)}")
+            Some(s"`${global.name}`, a module-level value holding ${quoted_type(t)}, ${nested_reason(why)}")
+        _ -> None
 
 // Holds each type that promises `Sendable`, outside the standard library, to the promise: a class
 // whose header, superclass or impl makes it, and a data type an impl makes it for. The standard
@@ -8754,12 +8876,17 @@ private add_named(c: *Checker, u: *Uses, table: Buf[Option[usize]], name: string
         if entry is Some(m)
             if c.symbols[m].decl.name == name then add_function(u, m)
 
-private initialization_order(c: *Checker) -> Buf[usize]
+/** What each function's code uses directly, the implementations its calls through a method table and
+ * its operators may reach among its functions. */
+private direct_uses(c: *Checker) -> Buf[Option[Uses]]
     var direct: Buf[Option[Uses]] = buf()
     for b in c.bodies
         direct.push(b match
             Some(body) -> Some(with_implementations(c, uses_of(body)))
             None -> None)
+    direct
+
+private initialization_order(c: *Checker, direct: Buf[Option[Uses]]) -> Buf[usize]
     var o = InitOrder(buf(), buf(), buf(), buf())
     for g in c.globals
         o.needs.push(globals_reached(direct, g.init))

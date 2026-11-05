@@ -2213,7 +2213,46 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- Proposed 2026-11-05 (built on branch `module-var-threads`): **a thread's body reaches no
+  module-level mutable state** ([what is shared](/spec/threads/#what-is-shared)). What is passed
+  for a `@sendable` parameter, directly or through every function it reaches, reads and writes no
+  module-level `var` and reads no module-level value, `lazy val` or `object` whose type is not
+  sendable. Reached means: the function a call names; for a call through a method table or a bound,
+  every method of that name in that slot of any type's table; for an operator on a value that is not
+  a scalar, every implementation of the trait method it calls; every closure and function value
+  made along the way; and the code a pattern runs (an extractor's method, a sequence's length). The
+  error names the module-level item and the functions it is reached through, shortest path first.
+  *Why*: a module-level value is reached by name, not captured, so the capture rule of `@sendable`
+  never sees it, and a body that bumps a module-level counter races with `main`. Avin compiles the
+  whole program, so what a call can reach is known, as `isolate`'s check of its body already
+  assumes. *Alternatives*: no check (the memory model makes the race harmless to the collector, but
+  the threads chapter promises that threads share nothing mutable but the synchronized types);
+  rejecting only what the body names itself (misses every call, so it closes nothing); per-thread
+  copies of module-level `var`s (a different meaning for one declaration depending on which thread
+  reads it); and treating each module-level `var` as an implicit `Atomic` (hides a lock in every
+  read and does not make a read-modify-write atomic).
+  - The whole argument counts, not only the closure: `spawn(makeBody())` is checked through
+    `makeBody` and every closure it makes, since what runs on the thread is whatever it gives back.
+    The cost is a rejection where a call evaluated at once on the calling thread reads a `var` to
+    choose the body. *Alternative*: following only closures and function values, which misses a
+    body returned by a call.
+  - A call through a trait method or an operator counts every implementation in the program, since
+    which one a value has is not known where the body is checked. The cost is a rejection where one
+    implementation reads a module-level `var` and the body never meets a value of that type.
+    *Alternative*: following the receiver's static type only where the class is final, which is
+    finer but has to agree with devirtualization.
+  - What is passed for an `@isolated` parameter (a `Mutex`'s value and `with` body) is not held to
+    this, since it runs at once on the calling thread.
+  - Printing stays legal with no promise: `print`, `println`, `eprintln` and the `StandardOutput`
+    and `StandardError` objects reach the runtime's streams, which keep no state in Avin, and the
+    objects hold no field. The standard library's own module-level state is held to the rule like
+    a program's: the futures' worker registry, guarded by its lock, promises `Sendable`, and so does
+    the `Annotation` trait, since a type's shape is one module-level value every thread may read
+    (an annotation type holding a mutable field is now rejected where it implements the trait). A
+    collection's companion object (`Array`, `Buffer`, `Deque`, the mutable `Map` and `Set`) is
+    sendable like any object with no field; only the collections themselves are mutable.
+    Review with the user: whether the `Annotation` promise is wanted, and whether the trait and
+    operator over-approximation rejects too much in practice.
 
 ## Open
 
@@ -2235,10 +2274,6 @@ None at present.
 
 - Resource cleanup: a `defer` construct or a library `use`.
 - Whether a function value can ever be sent between actors, with a type that says what it captures.
-- Module-level mutable state reached by a thread's body: a `var`, or a value or `object` that is not
-  sendable, is shared by every thread, and nothing yet checks a body against it. `isolate`'s
-  whole-program check would; applied to threads it would reject every body that prints, unless
-  standard output is a synchronized object the library promises sendable.
 - A `TcpStream` handed to another thread keeps the bytes it read ahead in Avin fields; the code that
   handed it over traps when it next uses the socket, but a read served from those bytes alone does
   not reach the socket's owner check.
