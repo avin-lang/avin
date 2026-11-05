@@ -1733,6 +1733,23 @@ their words are reserved.
   (text made as it is read, a socket later) and hand it to any function that takes one; the kinds
   `avin.io` makes are private classes reached only through `Source.fromFile`, `fromString` and
   `stdin`. The alternative is a final class whose kinds are fixed by the library.
+- [`Sendable`'s promises](/spec/actors/#what-may-be-sent) (2026-11-04), where the design left them
+  open:
+  - A declaration promises `Sendable` as it conforms to any trait: after `:` in a class's or a
+    trait's header, or in an impl for a data type. The promise is checked against the structure,
+    outside the standard library, and an `open` or `abstract` class that promises it is sendable,
+    each subclass being checked. The standard library's promises are taken as made, since they are
+    for types whose structure cannot show it: `Future`, `Promise`, `Channel` and `Atomic` of a
+    sendable type (impls bounded by `Sendable`), `Mutex` of any type and `Once` (in their headers),
+    and `Vector` of sendable elements. `ArraySeq`, `List`, `Range`, the hash and tree maps and sets,
+    `Option`, `Result` and `Either` are sendable by their structure.
+  - A generic trait that promises `Sendable` is sendable at sendable type arguments; a type
+    implementing it has the parameters it passes to the trait, other than contravariantly, taken as
+    sendable where it is checked, and is sendable at sendable arguments for them. The immutable `Map`
+    and `Set` traits promise it, so `HashMap[K, V]` is sendable where `K` and `V` are, and a type
+    implementing either is held to it.
+  - `Sendable` is only a bound and a promise; it is not the type of a value.
+  - A `lazy val` field is sendable where its type is, since it is initialized by exactly one thread.
 
 ## Open
 
