@@ -21,9 +21,10 @@ class Avin < Formula
   depends_on "sysl-lang/tap/sysl"
 
   # A collection out of Sysl is converted by two generic shim overloads, for a slice and a `Buf`,
-  # that a program can reach at the same type argument, which needs Sysl 0.9.0. A dependency cannot
-  # name a least version, so it is checked here.
-  MINIMUM_SYSL = "0.9.0".freeze
+  # that a program can reach at the same type argument, which needs Sysl 0.9.0; a handle passed to a
+  # `&T` parameter is shared rather than copied, and a socket closes when its last copy goes, from
+  # Sysl 0.9.1. A dependency cannot name a least version, so it is checked here.
+  MINIMUM_SYSL = "0.9.1".freeze
 
   def install
     sysl = Formula["sysl-lang/tap/sysl"]

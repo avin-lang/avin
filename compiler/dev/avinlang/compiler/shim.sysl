@@ -55,7 +55,7 @@ struct MirrorLines
  * the Sysl packages `sysl` the program's manifests name. */
 shim_manifest(runtime_dir: string, sysl: Buf[SyslPackage]) -> string
     var out = str_builder()
-    out.push("package { name = \"avin-shims\", version = \"0.1.0\", sysl = \"0.9.0\" }\n")
+    out.push("package { name = \"avin-shims\", version = \"0.1.0\", sysl = \"0.9.1\" }\n")
     out.push("dependencies {\n  avin-runtime { path = " + hocon_text(runtime_dir) + " }\n")
     for p in sysl
         val entry = p.origin match
@@ -281,8 +281,9 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
         // an integer with any Sysl integer, so it takes the Sysl function's own type, and the
         // overloads of its conversion choose by it.
         // A handle passed as a parameter is passed as the Sysl parameter takes it, which only Sysl
-        // knows: a type with a destructor is always held by a counted reference, which the handle
-        // shares; any other is passed as the generic helper its expected type instantiates gives it.
+        // knows: a trait is always held by a counted reference, which the handle shares; any other
+        // type is passed as the generic helper its expected type instantiates gives it, the handle's
+        // own counted reference at a `&T`.
         // The call is written once for each choice among the handles' types, under `if const`, and
         // Sysl keeps the one that holds.
         var types: Buf[usize] = buf()
@@ -408,8 +409,8 @@ private callback_lambda(w: *ShimWriter, b: &MirBinding, i: usize, k: usize) -> s
         call = call + s", q$j"
     call = call + ")"
     // A handle is answered as the closure's type asks: a pointer to the value, the value or a counted
-    // reference, and a type with a destructor only by the counted reference, which the call written
-    // for that choice takes as it is.
+    // reference, and a trait only by the counted reference, which the call written for that choice
+    // takes as it is.
     if result.form is Handle(_) then call = s"given_${handle_index(w, result)}($call)"
     s"($names) -> $call"
 
@@ -514,11 +515,11 @@ private struct PassedHandle
     name: string
 
 // The call of binding `b`'s Sysl function `callee` with `args`, and the conversion of its result,
-// written once for each choice of the handles' types `types` from `depth` on having a destructor or
-// not: `dropped` holds the ones taken so far to have one. `method` says the callee is a handle's
-// method. A non-empty `lists[k]` is the helper that makes the shares a collection of handles was
-// converted into the slice its Sysl parameter asks for.
-private call_arms(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[string], lists: Buf[string], handles: Buf[PassedHandle], types: Buf[usize], depth: usize, dropped: Buf[usize], method: bool, fills: Buf[usize], indent: string)
+// written once for each choice of the handles' types `types` from `depth` on being a trait or not:
+// `traits` holds the ones taken so far to be one. `method` says the callee is a handle's method. A
+// non-empty `lists[k]` is the helper that makes the shares a collection of handles was converted
+// into the slice its Sysl parameter asks for.
+private call_arms(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[string], lists: Buf[string], handles: Buf[PassedHandle], types: Buf[usize], depth: usize, traits: Buf[usize], method: bool, fills: Buf[usize], indent: string)
     if depth == types.len()
         var given: Buf[string] = buf()
         var wrappers: Buf[string] = buf()
@@ -527,18 +528,15 @@ private call_arms(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[stri
             var wrapper = lists[k]
             for h in handles
                 if h.arg != k then continue
-                var counted = false
-                for m in dropped
-                    if m == h.mirror then counted = true
                 // A call that waits takes the handle's reference before it, into a local whose type
                 // is known, and the value the parameter asks for is made from that local at the call.
-                if counted then arg = s"cell_${h.mirror}(${h.name}).r"
+                if has_mirror(traits, h.mirror) then arg = s"cell_${h.mirror}(${h.name}).r"
                 elif b.blocking
                     arg = s"cell_${h.mirror}(${h.name}).r"
                     wrapper = s"given_${h.mirror}"
                 else arg = s"passed_${h.mirror}(${h.name})"
-            // A callback answering a handle of a type with a destructor answers its counted reference.
-            for m in dropped
+            // A callback answering a handle on a trait answers its counted reference.
+            for m in traits
                 arg = arg.replace_all(s"-> given_$m(call_", "-> (call_")
             given.push(arg)
             wrappers.push(wrapper)
@@ -546,13 +544,13 @@ private call_arms(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[stri
         return
     val m = types[depth]
     var with: Buf[usize] = buf()
-    for d in dropped
+    for d in traits
         with.push(d)
     with.push(m)
-    put(w, indent + s"if const counted_$m()\n")
+    put(w, indent + s"if const wide_$m()\n")
     call_arms(w, b, callee, args, lists, handles, types, depth + 1, with, method, fills, indent + "    ")
     put(w, indent + "else\n")
-    call_arms(w, b, callee, args, lists, handles, types, depth + 1, dropped, method, fills, indent + "    ")
+    call_arms(w, b, callee, args, lists, handles, types, depth + 1, traits, method, fills, indent + "    ")
 
 // The call of binding `b`'s Sysl function `callee` with `args`, and the conversion of its result, at
 // `indent`. `method` says the callee is a handle's method; `fills` are the parameters whose arrays the
@@ -786,12 +784,11 @@ private handle_index(w: *ShimWriter, c: &Crossing) -> usize = mirror_of(w, c).un
 // the reference is a trait object, which takes two words: it is then kept in a cell of its own, which
 // the first word points at, so that every handle's object has the same two words. The collector does
 // not trace the first word; the finalizer the handle's descriptor names gives the reference back when
-// the object is freed still holding it. Giving back a place that holds nothing does nothing. A type
-// with a destructor, and a trait, is always held by a counted reference, which is what `counted`
-// asks. Where the handle is `passed` to Sysl as a parameter, it is read by two helpers: one answering
-// it as the parameter's type `P` asks, a pointer to the value or the value itself, which `P` is when
-// the parameter is the value or a counted reference to one, and one answering the same of a
-// reference already taken. Where a mirror's field or a collection holding the handle goes into Sysl,
+// the object is freed still holding it. Giving back a place that holds nothing does nothing. A trait
+// is always held by a counted reference, which is what `wide` asks. Where the handle is `passed` to
+// Sysl as a parameter, it is read by two helpers: one answering it as the parameter's type `P` asks,
+// the counted reference itself, a pointer to the value or the value itself, and one answering the
+// same of a reference already taken. Where a mirror's field or a collection holding the handle goes into Sysl,
 // it is `held`: a third helper checks the handle as compiled code checks one passed as a parameter,
 // stopping the program at the call where it belongs to another thread or holds nothing. Where a
 // collection of the handles is a binding's parameter, they are `listed`: the shares the collection's
@@ -802,7 +799,6 @@ private handle_lines(w: *ShimWriter, m: usize, passed: bool, held: bool, listed:
     put(w, s"\n// The handle `$name`'s object.\nprivate struct Slot_$m\n    word: *u8\n    owner: u64\n")
     put(w, s"\n// Where the handle `$name`'s counted reference is kept.\nprivate struct Cell_$m\n    r: &mirror_$m\n")
     put(w, s"\n// Whether a reference to the handle's Sysl type takes two words, a trait object's.\nprivate const wide_$m() -> bool = sizeof(&mirror_$m) > sizeof(*u8)\n")
-    put(w, s"\n// Whether the handle's Sysl type is always held by a counted reference.\nprivate const counted_$m() -> bool\n    if const wide_$m()\n        true\n    elif const mirror_$m: Drop\n        true\n    else\n        false\n")
     put(w, s"\nprivate cell_$m(p: *u8) -> *Cell_$m\n    if const wide_$m()\n        val s: *Slot_$m = ptr_cast(p)\n        ptr_cast(s.word)\n    else\n        ptr_cast(p)\n")
     put(w, s"\nprivate hold_$m[V](ctx: *Context, o: *u8, v: V)\n    val s: *Slot_$m = ptr_cast(o)\n    if const wide_$m()\n        s.word = shim_calloc(1usize, sizeof(Cell_$m))\n        if s.word == null then stop_in_binding(ctx, \"out of memory\")\n    cell_$m(o).r = v\n    s.owner = ctx.owner\n")
     put(w, s"\nprivate give_back_$m(p: *u8)\n    if const wide_$m()\n        val s: *Slot_$m = ptr_cast(p)\n        if s.word == null then return\n        release(cell_$m(p).r)\n        shim_free(s.word)\n        s.word = null\n    else\n        release(cell_$m(p).r)\n")
@@ -1028,29 +1024,29 @@ private has_mirror(items: Buf[usize], m: usize) -> bool
     false
 
 // The construction of `c`'s variant `v` from `args`, after `prefix`, written once for each choice of
-// the handles' types `types` from `depth` on having a destructor or not, as `call_arms` writes a call:
-// a handle field is passed as a parameter is, its reference shared where its type has a destructor
-// and otherwise given as the field's type asks.
-private construction_arms(w: *ShimWriter, c: &Crossing, v: CrossVariant, args: Buf[string], handles: Buf[PassedHandle], types: Buf[usize], depth: usize, dropped: Buf[usize], prefix: string, indent: string)
+// the handles' types `types` from `depth` on being a trait or not, as `call_arms` writes a call: a
+// handle field is passed as a parameter is, its reference shared where its type is a trait and
+// otherwise given as the field's type asks.
+private construction_arms(w: *ShimWriter, c: &Crossing, v: CrossVariant, args: Buf[string], handles: Buf[PassedHandle], types: Buf[usize], depth: usize, traits: Buf[usize], prefix: string, indent: string)
     if depth == types.len()
         var given: Buf[string] = buf()
         for k in 0..<args.len()
             var arg = args[k]
             for h in handles
                 if h.arg != k then continue
-                arg = if has_mirror(dropped, h.mirror) then s"cell_${h.mirror}(${h.name}).r" else s"passed_${h.mirror}(${h.name})"
+                arg = if has_mirror(traits, h.mirror) then s"cell_${h.mirror}(${h.name}).r" else s"passed_${h.mirror}(${h.name})"
             given.push(arg)
         put(w, indent + prefix + construction(w, c, v, given) + "\n")
         return
     val m = types[depth]
     var with: Buf[usize] = buf()
-    for d in dropped
+    for d in traits
         with.push(d)
     with.push(m)
-    put(w, indent + s"if const counted_$m()\n")
+    put(w, indent + s"if const wide_$m()\n")
     construction_arms(w, c, v, args, handles, types, depth + 1, with, prefix, indent + "    ")
     put(w, indent + "else\n")
-    construction_arms(w, c, v, args, handles, types, depth + 1, dropped, prefix, indent + "    ")
+    construction_arms(w, c, v, args, handles, types, depth + 1, traits, prefix, indent + "    ")
 
 // The conversion out of Sysl of a value of the `k`th data type that crosses that way: each variant
 // is made by its layout, among the ones `ds` points at, and each field converted and stored at its

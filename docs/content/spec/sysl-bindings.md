@@ -341,9 +341,10 @@ parseBigInt(s: string) -> Option[BigInt]
   handles comes from a Sysl slice or `Buf` of values or of counted references, and each element is
   a handle of its own, closed and collected on its own.
 - **A handle goes back into Sysl by itself**: as the receiver of its own methods, or as a parameter
-  of a binding or of another handle's method. A Sysl type with a destructor, and a trait, is always
-  held by a counted reference, and its parameter shares the handle's; a type without one is passed
-  as the Sysl parameter takes it — by value, a copy, or as a pointer to the handle's own value. A
+  of a binding or of another handle's method. A trait is always held by a counted reference, and its
+  parameter shares the handle's; any other type is passed as the Sysl parameter takes it — by value,
+  a copy; as a pointer to the handle's own value; or, at a `&T`, as the handle's own counted
+  reference, so what the Sysl function sets through it the handle reads. A
   [mirror's field](#mirrors) that is a handle is passed the same way, and so is each element of a
   [collection of handles](#collections-of-handles) that is a parameter. A handle inside an
   `Option`, a tuple or any other collection does not go into Sysl, nor is it a mirror's field; a
@@ -456,7 +457,7 @@ column(children: Vector[View], spacing: int) -> View
   stops the program at the call, naming the handle's class, though the others are the caller's own.
 - **Each element is shared for the call**: the slice holds a share of each handle's Sysl value,
   taken before the call, made the elements the Sysl parameter takes — the counted references, or,
-  for a type without a destructor, the values or pointers to them. What Sysl keeps of the slice it
+  where it asks for them, the values or pointers to them. What Sysl keeps of the slice it
   keeps by its own shares, so a column outlives the vector it was made from, and a child closed
   afterwards. A call that [waits](#calls-that-wait) takes the shares before the thread is safe for the
   collector, and makes its slice from them, so it reads no Avin object.

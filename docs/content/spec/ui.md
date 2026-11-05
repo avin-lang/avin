@@ -148,10 +148,6 @@ Unknown: nothing on screen is called 'nothing'
 - **Colours.** syslui takes a colour as a `u32` parameter (`background`, `foreground`, `border`,
   `tinted`), which a binding's integer parameter does not reach; a control's colour is chosen by its
   `Role`, and a surface by `panel()`.
-- **A control writing the program's signal.** Sysl 0.9.0 gives a `&T` parameter a copy of a handle's
-  value where the type has no destructor, so a switch, checkbox, radio, slider, text field or tab
-  given a signal writes a copy; reading and setting a signal from Avin is unaffected. The next Sysl
-  release passes the handle's own value.
 - Overlays (`popover`, `modal`, `menu_bar`), tables, images, selection, the theme and its
   `restyle`, keyboard input to a recording canvas, `on_event`, `on_frame` and the control socket;
   each is bound when something needs it.

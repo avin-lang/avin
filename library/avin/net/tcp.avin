@@ -19,7 +19,14 @@ private data NetFailure
     TimedOut
     Failed(message: string)
 
-private ioError(e: NetFailure) -> IoError = e match
+// The error a socket's operations answer, which only the runtime looks into.
+@sysl("sysl.fs.IoError")
+private class SyslError
+
+@sysl("avin.rt.net_failure")
+private netFailure(e: SyslError) -> NetFailure
+
+private ioError(e: SyslError) -> IoError = netFailure(e) match
     Refused -> io.ConnectionRefused
     Reset -> io.ConnectionReset
     TimedOut -> io.TimedOut
@@ -30,39 +37,59 @@ private ioError(e: NetFailure) -> IoError = e match
 private class Address
     port() -> int
 
-// The socket under a connection, closed when its handle is. Its traps name the `TcpStream`.
-@sysl("avin.rt.Connection", named: "TcpStream")
+// How much of a connection is given up.
+@sysl("sysl.net.Shutdown")
+private data Shutdown
+    Read
+    Write
+    Both
+
+// The socket under a connection. Its descriptor is closed when its handle is closed or, for one the
+// program forgot, when the collector frees it. Its traps name the `TcpStream`.
+@sysl("sysl.net.Socket", named: "TcpStream")
 private class Socket
     @sysl(blocking)
-    connect(to: Address) -> Result[unit, NetFailure]
+    connect(to: Address) -> Result[unit, SyslError]
     @sysl(blocking)
-    sendAll(bytes: Array[byte]) -> Result[unit, NetFailure]
+    sendAll(bytes: Array[byte]) -> Result[unit, SyslError]
     @sysl(blocking)
-    recv(into: Array[byte]) -> Result[long, NetFailure]
-    shutdownOutput() -> Result[unit, NetFailure]
-    setTimeout(ms: int) -> Result[unit, NetFailure]
-    // Does nothing: calling it checks the socket belongs to the code running.
-    held() -> unit
+    recv(into: Array[byte]) -> Result[long, SyslError]
+    shutdown(how: Shutdown) -> Result[unit, SyslError]
+    readTimeout(ms: int) -> Result[unit, SyslError]
+    writeTimeout(ms: int) -> Result[unit, SyslError]
+    // The descriptor, which is never used: calling it checks the socket belongs to the code running.
+    @sysl("fd")
+    held() -> Result[int, SyslError]
 
-// The socket under a listener, closed when its handle is, on the same runtime type as a
-// connection's. Its traps name the `TcpListener`.
-@sysl("avin.rt.Connection", named: "TcpListener")
+// The socket under a listener, closed as a connection's is, on the same Sysl type. Its traps name
+// the `TcpListener`.
+@sysl("sysl.net.Socket", named: "TcpListener")
 private class ListenSocket
-    listenAt(to: Address) -> Result[unit, NetFailure]
-    localPort() -> Result[int, NetFailure]
+    reuseAddress(on: bool) -> Result[unit, SyslError]
+    bind(to: Address) -> Result[unit, SyslError]
+    listen(backlog: int) -> Result[unit, SyslError]
+    local() -> Result[Address, SyslError]
     @sysl(blocking)
-    accept() -> Result[Socket, NetFailure]
-    // Does nothing: calling it checks the socket belongs to the code running.
-    held() -> unit
+    accept() -> Result[(Socket, Address), SyslError]
+    // The descriptor, which is never used: calling it checks the socket belongs to the code running.
+    @sysl("fd")
+    held() -> Result[int, SyslError]
 
-@sysl("avin.rt.resolve_host")
-private resolveRaw(host: string, port: int) -> Result[Vector[Address], NetFailure]
+@sysl("sysl.net.resolve")
+private resolveRaw(host: string, port: int) -> Result[Vector[Address], SyslError]
 
-@sysl("avin.rt.open_connection")
-private openConnection(to: Address) -> Result[Socket, NetFailure]
+@sysl("sysl.net.socket")
+private openConnection(to: Address) -> Result[Socket, SyslError]
 
-@sysl("avin.rt.open_connection")
-private openListenSocket(to: Address) -> Result[ListenSocket, NetFailure]
+@sysl("sysl.net.socket")
+private openListenSocket(to: Address) -> Result[ListenSocket, SyslError]
+
+// Binds `s` to `to`, letting a port a recently stopped listener used be taken again, and listens
+// with the platform's usual backlog.
+private listening(s: ListenSocket, to: Address) -> Result[unit, SyslError]
+    s.reuseAddress(true)?
+    s.bind(to)?
+    s.listen(128)
 
 // Every address `host` and `port` resolve to, in the order the platform prefers them.
 private addressesOf(host: string, port: int) -> Result[Vector[Address], IoError]
@@ -152,13 +179,15 @@ class TcpStream(private val conn: Socket, private var ahead: Array[byte], privat
     setTimeout(d: Duration) -> Result[unit, IoError]
         mine()
         if closed then return Err(closedError())
-        conn.setTimeout(millisOf(d)).mapErr(ioError)
+        val ms = millisOf(d)
+        conn.readTimeout(ms).mapErr(ioError)?
+        conn.writeTimeout(ms).mapErr(ioError)
 
     // Tells the other end nothing more will be sent; reading goes on.
     shutdownOutput() -> Result[unit, IoError]
         mine()
         if closed then return Err(closedError())
-        conn.shutdownOutput().mapErr(ioError)
+        conn.shutdown(Write).mapErr(ioError)
 
     // Ends the connection; closing again does nothing. A read or write afterwards answers an error.
     close()
@@ -220,7 +249,7 @@ class TcpListener(private val conn: ListenSocket, private val boundPort: int, pr
         mine()
         if closed then return Err(io.Other("the listener is closed"))
         conn.accept() match
-            Ok(c) -> Ok(TcpStream(c, Array.empty[byte](), 0, false))
+            Ok((c, _)) -> Ok(TcpStream(c, Array.empty[byte](), 0, false))
             Err(e) -> Err(ioError(e))
 
     // Stops listening; closing again does nothing. An `accept` afterwards answers an error.
@@ -241,13 +270,13 @@ object TcpListener
         val addresses = addressesOf(host, port)?
         val a = addresses(0)
         val c = openListenSocket(a).mapErr(ioError)?
-        c.listenAt(a) match
+        listening(c, a) match
             Ok(_) -> ()
             Err(e) ->
                 c.close()
                 return Err(ioError(e))
-        c.localPort() match
-            Ok(p) -> Ok(TcpListener(c, p, false))
+        c.local() match
+            Ok(at) -> Ok(TcpListener(c, at.port(), false))
             Err(e) ->
                 c.close()
                 Err(ioError(e))

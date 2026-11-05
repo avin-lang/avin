@@ -1542,12 +1542,14 @@ Settled by the user on 2026-11-04:
   method; a closed one passed traps at the call as a bound method on one does. A handle inside an
   `Option` or a collection still does not go into Sysl.
   Settled by the user 2026-11-04: **how a handle is passed to a Sysl parameter**. The shim cannot
-  see the Sysl parameter's type, so it lets Sysl choose: a Sysl type with a destructor, always held
-  by a counted reference, is passed as the handle's reference, which the parameter shares; one
-  without is passed as the parameter's type asks of a generic helper, by value (a copy) or as a
-  pointer to the handle's own value. A `&T` parameter of a type without a destructor receives a
-  reference to a copy, since Sysl binds the helper's type parameter to `T` where a `&T` is expected;
-  a `*T` parameter of a type with one is refused by Sysl at the binding.
+  see the Sysl parameter's type, so it lets Sysl choose: a trait, always held by a counted
+  reference, is passed as the handle's reference, which the parameter shares; any other type is
+  passed as the parameter's type asks of a generic helper, by value (a copy), as a pointer to the
+  handle's own value, or at a `&T` as the handle's own counted reference, which the parameter
+  shares. A `*T` parameter of a type with a destructor is refused by Sysl at the binding. Revised
+  on the user's delegation 2026-11-05 (branch `sysl-091`): from Sysl 0.9.1 the helper settles at
+  the `&T`, so a type with a destructor needs no arm of its own and the shim tells only a trait
+  apart; under 0.9.0 a `&T` parameter of a type without a destructor received a reference to a copy.
   Settled by the user 2026-11-04: **a handle is never used by two threads at once**, since its
   counted reference's count is not atomic. Each handle records an owner, and every use (a bound
   method, the handle passed as a parameter, `close()`) compares it with the running code's and traps
@@ -1798,10 +1800,12 @@ their words are reserved.
     or less takes the limit away.
   - `bind` takes the host's first address and lets a port a recently stopped listener used be taken
     again; the backlog is the platform's usual 128.
-  - The socket is a handle on a runtime type, `avin.rt.Connection`, holding `sysl.net`'s `Socket`
-    with a destructor that closes it, since `sysl.net` closes a socket only when asked; so closing
-    the handle, or the collector freeing a forgotten one, closes the socket. The runtime also turns
-    `sysl.net`'s errors into the four a connection tells apart.
+  - The socket is a handle on `sysl.net`'s own `Socket`, which closes its descriptor when its last
+    copy goes (from Sysl 0.9.1; a runtime type wrapping it with a destructor did this before, and
+    was removed on branch `sysl-091`); so closing the handle, or the collector freeing a forgotten
+    one, closes the socket. The runtime turns `sysl.net`'s errors into the four a connection tells
+    apart (`avin.rt.net_failure`), the error crossing as a handle so that its variants do not join
+    the module's.
   - The HTTP client: a `Response` also has its `reason`; `text()` reads ill-formed UTF-8 as U+FFFD;
     `Request` is a class with `method`, `url`, `headers`, `body` and `timeout`, the last three
     defaulted; a method or header name that is not a token, and a header value with a line break,
@@ -2112,11 +2116,9 @@ their words are reserved.
   Rationale: `syslui` hands out `&Signal[T]`, and one class per instance needs no generic classes in
   bindings. Alternatives weighed: mirrors and handles as type arguments, which have Sysl spellings of
   their own but would make an annotation's text name Avin types; fully generic bindings, one class
-  for every `T`, which stay specified and unbuilt.
-  **Review with the user:** a `&Signal[T]` parameter of a type without a destructor receives a
-  reference to a copy under Sysl 0.9.0, as for every such handle, so a Sysl function setting a signal
-  is not seen by the handle; the next Sysl release settles the shim's helper at the `&T`, and
-  `tests/programs/run/sysl_generic_handle_sharing` waits on it.
+  for every `T`, which stay specified and unbuilt. A `&Signal[T]` parameter shares the handle's
+  own signal (from Sysl 0.9.1), so a Sysl function setting a signal is seen by the handle
+  (`tests/programs/run/sysl_generic_handle_sharing`, `tests/programs/run/ui_signal_widgets`).
 - Settled on the user's delegation 2026-11-05 (built on branch `tuple-ord`): [`Either[L, R]` and `Result[T, E]` are `Ord`](/spec/errors/#either)
   when both sides are. `Left` orders before every `Right`, following the reference library's
   ordering of eithers; `Result` is ordered as `Either` with `Err` in the place of `Left`, so every
@@ -2317,7 +2319,7 @@ their words are reserved.
   name the token holds (the check is inline, one compare in compiled code, and its text is fixed
   when the program is compiled); naming the trap after the class whose method made the call (a
   rule no reader would guess). `TcpStream` and `TcpListener` each keep a handle class of their
-  own over the one runtime type `avin.rt.Connection`, `named:` for the type, so their traps name
+  own over the one Sysl type `sysl.net.Socket`, `named:` for the type, so their traps name
   the type the user holds (branch `socket-trap-names`); two handle classes may share one Sysl
   type. The other library handles (`File`, `FdReader`, `Spawned`, `Address`) are held only inside
   private library values whose own checks come first, so none is named further.
