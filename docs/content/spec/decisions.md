@@ -2072,7 +2072,19 @@ their words are reserved.
   values, following the reference library's ordering of options. It makes `derives Ord` work on a
   data type with an `Option` field and lets options sort and have `max`/`min`. Alternative: no order
   on options, leaving a field of one underivable — rejected as the cost falls on every record with
-  an optional field. Tuples, `Either` and `Result` have no `Ord` here.
+  an optional field. (Tuples already had `Ord`; `Either` and `Result` follow in the next entry.)
+- Proposed (built on branch `tuple-ord`): [`Either[L, R]` and `Result[T, E]` are `Ord`](/spec/errors/#either)
+  when both sides are. `Left` orders before every `Right`, following the reference library's
+  ordering of eithers; `Result` is ordered as `Either` with `Err` in the place of `Left`, so every
+  `Err` before every `Ok`. Rationale: both types put the failure on the same side (`Left` and
+  `Err` are the reason, `Right` and `Ok` the value), so the one rule "failure before success" holds
+  for both, and `Err` agrees with `Left` under `toRight`/`toLeft` conversions. Alternatives weighed:
+  `Ok` before `Err`, matching the declaration order of `Result`'s variants (which is what
+  `derives Ord` would give a data type, and what a reader of `data Result` might expect) but
+  disagreeing with `Either`; and no order on `Result`, leaving a record with a result field
+  underivable. Review with the user: the `Err`-first choice is the one a reader of the declaration
+  could find surprising. Tuples needed no change: their `Ord`, lexicographic by part at every
+  arity, was already written by the compiler for each arity and is now covered by tests.
 
 - Settled on the user's delegation 2026-11-05 (built on branch `sysl-callbacks`): [passing Avin functions to
   Sysl](/spec/sysl-bindings/#callbacks), the choices the request left open:
