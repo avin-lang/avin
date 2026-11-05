@@ -1580,6 +1580,11 @@ Settled by the user on 2026-11-04:
   handle's method answers are copied into Sysl memory before the thread leaves the safe region. A
   blocking call therefore never reads or writes the Avin heap, and an argument that is a pointer
   into it, such as a buffer Sysl fills, would need its object held by a frame for the whole call.
+- Settled by the user 2026-11-04: [`Url`](/spec/system-library/#url) follows RFC 3986 as the
+  established library's URI does, beyond the first design: user information; IPv6 hosts in
+  brackets, with a zone; `base.resolve(ref)` by section 5.2, dot-segment removal included;
+  `withScheme`, `withUserInfo`, `withHost`, `withPort`, `withPath`, `withQuery` and `withFragment`;
+  and a trapping `Url(text)` beside `Url.parse(text)`, as `Regex(p)` beside `Regex.compile(p)`.
 
 **Deferred**
 
@@ -1589,7 +1594,27 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
-None at present.
+- `Url`'s details ([system library](/spec/system-library/#url)), where the design left them open:
+  - `Url` is a `data` type whose `host` is an `Option[string]`, `None` where there is no authority
+    (`mailto:a@b`) and `Some("")` where it is empty (`file:///etc`); an IPv6 host keeps its brackets;
+    `userInfo`, `query` and `fragment` are `Option`s like `port`.
+  - Components are kept as written, escapes and all; `Url.decode` is the way to their text.
+  - `parse` holds the scheme and host in lower case and a default port as `None`, so `==` compares
+    the normalized URL and display needs no work of its own. Defaults are 80 for `http` and `ws`,
+    443 for `https` and `wss`, and `portOrDefault()` answers an `Option[int]`, `None` for a scheme
+    with no default.
+  - Escapes that do not decode to UTF-8 make text no URL (`InvalidUtf8`), at `parse` and in each
+    `with` method, so `queryParams` keeps the plain `Vector` the design gives it; `Url.decode`
+    answers a `Result`.
+  - `queryParams` reads `+` as a space and skips empty pieces; `decode` keeps `+`.
+  - `UrlError` is `MissingScheme`, `BadScheme`, `BadCharacter`, `BadPercent`, `BadHost`, `BadPort`
+    and `InvalidUtf8`, each but the first with the byte offset `at`.
+  - A zone is accepted only as RFC 6874 writes it, after `%25`; hosts of a later form (`[v7.x]`)
+    are accepted; characters beyond ASCII other than controls and spaces are accepted in any
+    component and kept.
+  - `resolve(ref: string)` answers a `Result`, the reference being text; `resolve(ref: Url)` takes
+    one already read. The `with` methods take components as written and trap on one the URL cannot
+    hold; each optional component's method takes a value or an `Option`.
 
 ## Open
 

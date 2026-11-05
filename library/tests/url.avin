@@ -1,0 +1,288 @@
+// `avin.net.Url`: reading URLs into their components, the errors of text that is not one,
+// percent-encoding, query pairs, normalization, the `with` methods, and resolving references against
+// a base by RFC 3986's own examples.
+import avin.net.{Url, UrlError, MissingScheme, BadScheme, BadCharacter, BadPercent, BadHost, BadPort, InvalidUtf8}
+
+// A URL's components written out, one after another, absent ones as `-`.
+parts(u: Url) -> string = s"${u.scheme}|${u.userInfo.getOrElse("-")}|${u.host.getOrElse("-")}|${u.port.map(p -> p.toString()).getOrElse("-")}|${u.path}|${u.query.getOrElse("-")}|${u.fragment.getOrElse("-")}"
+
+// Each text read, as its components or its error, checked together so every mismatch is reported.
+readAll(cases: Vector[(string, string)])
+    val wrong = Buffer[string]()
+    for (text, expected) in cases
+        val actual = Url.parse(text) match
+            Ok(u) -> parts(u)
+            Err(e) -> s"error: $e"
+        if actual != expected then wrong.addOne(s"$text: expected $expected, found $actual")
+    assertEq(wrong.toVector(), Vector.empty[string]())
+
+// Each reference resolved against `base`, checked together.
+resolveAll(base: string, cases: Vector[(string, string)])
+    val b = Url(base)
+    val wrong = Buffer[string]()
+    for (ref, expected) in cases
+        val actual = b.resolve(ref) match
+            Ok(u) -> s"$u"
+            Err(e) -> s"error: $e"
+        if actual != expected then wrong.addOne(s"$ref: expected $expected, found $actual")
+    assertEq(wrong.toVector(), Vector.empty[string]())
+
+@test("a URL is read into its scheme, user information, host, port, path, query and fragment")
+components()
+    readAll([
+        ("http://example.com/a/b?x=1#top", "http|-|example.com|-|/a/b|x=1|top"),
+        ("ftp://user:pass@files.example.com:2121/pub/f.txt", "ftp|user:pass|files.example.com|2121|/pub/f.txt|-|-"),
+        ("mailto:someone@example.com", "mailto|-|-|-|someone@example.com|-|-"),
+        ("urn:isbn:0451450523", "urn|-|-|-|isbn:0451450523|-|-"),
+        ("file:///etc/hosts", "file|-||-|/etc/hosts|-|-"),
+        ("http://h/caf\u{e9}", "http|-|h|-|/caf\u{e9}|-|-"),
+        ("s3+x.y-z://b/k", "s3+x.y-z|-|b|-|/k|-|-"),
+        ("http://h/a:b@c;d=e/!$&'()*+,", "http|-|h|-|/a:b@c;d=e/!$&'()*+,|-|-"),
+        ("http://h/?q=/?:@#/?:@", "http|-|h|-|/|q=/?:@|/?:@")])
+
+@test("an empty component is present and an absent one is not")
+emptyAndAbsent()
+    readAll([
+        ("http://h", "http|-|h|-||-|-"),
+        ("http://h?", "http|-|h|-|||-"),
+        ("http://h#", "http|-|h|-||-|"),
+        ("http://h?#", "http|-|h|-|||"),
+        ("http://@h/", "http||h|-|/|-|-"),
+        ("http://h:/", "http|-|h|-|/|-|-"),
+        ("http://", "http|-||-||-|-"),
+        ("x:", "x|-|-|-||-|-")])
+    assertEq(Url("http://h?").query, Some(""))
+    assertEq(Url("http://h").query, None)
+    assertEq(s"${Url("http://h?")}", "http://h?")
+    assertEq(s"${Url("http://h#")}", "http://h#")
+    assertEq(s"${Url("http://h")}", "http://h")
+
+@test("IPv4, IPv6 and named hosts, with and without ports")
+hosts()
+    readAll([
+        ("http://192.168.0.1:8080/x", "http|-|192.168.0.1|8080|/x|-|-"),
+        ("http://999.1.1.1/", "http|-|999.1.1.1|-|/|-|-"),
+        ("http://[2001:DB8::1]/", "http|-|[2001:db8::1]|-|/|-|-"),
+        ("http://[2001:db8:0:0:0:0:2:1]:81/", "http|-|[2001:db8:0:0:0:0:2:1]|81|/|-|-"),
+        ("http://[::]/", "http|-|[::]|-|/|-|-"),
+        ("http://[::1]", "http|-|[::1]|-||-|-"),
+        ("http://[1:2:3:4:5:6:7::]/", "http|-|[1:2:3:4:5:6:7::]|-|/|-|-"),
+        ("http://[::ffff:192.0.2.1]/", "http|-|[::ffff:192.0.2.1]|-|/|-|-"),
+        ("http://[1:2:3:4:5:6:1.2.3.4]/", "http|-|[1:2:3:4:5:6:1.2.3.4]|-|/|-|-"),
+        ("http://[FE80::1%25Eth0]:8080/", "http|-|[fe80::1%25Eth0]|8080|/|-|-"),
+        ("http://[fe80::1%25en%30]/", "http|-|[fe80::1%25en%30]|-|/|-|-"),
+        ("http://[v7.Some:Thing]/", "http|-|[v7.some:thing]|-|/|-|-"),
+        ("http://Ex%41mple.COM/", "http|-|ex%41mple.com|-|/|-|-"),
+        ("http://a-b.c_d~e!$&'()*+,;=/", "http|-|a-b.c_d~e!$&'()*+,;=|-|/|-|-"),
+        ("http://h:0/", "http|-|h|0|/|-|-"),
+        ("http://h:65535/", "http|-|h|65535|/|-|-")])
+
+@test("text that is not a URL is the error saying what and where")
+invalid()
+    readAll([
+        ("::bad", "error: no scheme"),
+        ("", "error: no scheme"),
+        ("/a/b", "error: no scheme"),
+        ("//h/p", "error: no scheme"),
+        ("a/b:c", "error: no scheme"),
+        ("1http://h/", "error: not a scheme character at index 0"),
+        ("ht tp://h/", "error: not a scheme character at index 2"),
+        ("h\u{e9}://h/", "error: not a scheme character at index 1"),
+        ("http://h/a b", "error: character not allowed at index 10"),
+        ("http://h/a\tb", "error: character not allowed at index 10"),
+        ("http://h/\u{a0}", "error: character not allowed at index 9"),
+        ("http://h/<x>", "error: character not allowed at index 9"),
+        ("http://h/#a#b", "error: character not allowed at index 11"),
+        ("http://h/?a\"b", "error: character not allowed at index 11"),
+        ("http://h^/", "error: character not allowed at index 8"),
+        ("http://a@b@c/", "error: character not allowed at index 10"),
+        ("http://u s@h/", "error: character not allowed at index 8"),
+        ("http://h/%zz", "error: malformed percent-escape at index 9"),
+        ("http://h/%4", "error: malformed percent-escape at index 9"),
+        ("http://h/%", "error: malformed percent-escape at index 9"),
+        ("http://h:65536/", "error: malformed port at index 9"),
+        ("http://h:8a/", "error: malformed port at index 10"),
+        ("http://h:-1/", "error: malformed port at index 9"),
+        ("http://[1:2:3:4:5:6:7:8:9]/", "error: malformed host at index 7"),
+        ("http://[1::2::3]/", "error: malformed host at index 7"),
+        ("http://[1:2:3:4:5:6:7:8::]/", "error: malformed host at index 7"),
+        ("http://[12345::]/", "error: malformed host at index 7"),
+        ("http://[::1.2.3.256]/", "error: malformed host at index 7"),
+        ("http://[::01.2.3.4]/", "error: malformed host at index 7"),
+        ("http://[fe80::1%eth0]/", "error: malformed host at index 7"),
+        ("http://[fe80::1%25]/", "error: malformed host at index 7"),
+        ("http://[v.x]/", "error: malformed host at index 7"),
+        ("http://[::1/", "error: malformed host at index 7"),
+        ("http://[]/", "error: malformed host at index 7"),
+        ("http://[::1]x/", "error: malformed host at index 12"),
+        ("http://a]b/", "error: malformed host at index 8"),
+        ("http://h/%FF", "error: percent-escapes not UTF-8 at index 9"),
+        ("http://h/%C3", "error: percent-escapes not UTF-8 at index 9"),
+        ("http://h/a%C3%28", "error: percent-escapes not UTF-8 at index 10"),
+        ("http://h/?%ED%A0%80", "error: percent-escapes not UTF-8 at index 10"),
+        ("http://%FF@h/", "error: percent-escapes not UTF-8 at index 7"),
+        ("http://h/#x%C0%AF", "error: percent-escapes not UTF-8 at index 11")])
+    assertEq(Url.parse("http://h/a b"), Err(BadCharacter(10)))
+    assertEq(Url.parse("::bad"), Err(MissingScheme))
+    assertEq(Url.parse("1:x"), Err(BadScheme(0)))
+    assertEq(Url.parse("http://h/%g0"), Err(BadPercent(9)))
+    assertEq(Url.parse("http://[x]/"), Err(BadHost(7)))
+    assertEq(Url.parse("http://h:99999/"), Err(BadPort(9)))
+    assertEq(Url.parse("http://h/%80"), Err(InvalidUtf8(9)))
+
+@test("the scheme and host are held in lower case and a default port is left out")
+normalization()
+    val u = Url("HTTP://User@WWW.Example.COM:80/A%2fB?Q=X#F")
+    assertEq(s"$u", "http://User@www.example.com/A%2fB?Q=X#F")
+    assertEq(u.scheme, "http")
+    assertEq(u.port, None)
+    assertEq(s"${Url("https://h:443/")}", "https://h/")
+    assertEq(s"${Url("http://h:443/")}", "http://h:443/")
+    assertEq(s"${Url("WSS://h:443")}", "wss://h")
+    assertEq(s"${Url("ftp://h:21/")}", "ftp://h:21/")
+    assertEq(Url("http://H:80/"), Url("http://h/"))
+    assert(Url("http://h/A") != Url("http://h/a"))
+    assert(Url("http://h/") != Url("http://h"))
+
+@test("a normalized URL displays as the text it was read from, and reads back to the same URL")
+roundTrips()
+    val texts = [
+        "http://example.com/", "https://u:p@h:8443/a/b;c?d=e&f#g", "mailto:a@b.c", "file:///", "file:///etc/hosts",
+        "http://[2001:db8::7]:8080/", "http://[fe80::1%25eth0]/", "http://h?", "http://h#", "http://h?#",
+        "news:comp.infosystems.www.servers.unix", "tel:+1-816-555-1212", "http://h/caf\u{e9}?q=\u{20ac}#\u{1f600}",
+        "http://h/%C3%A9", "x:", "http://", "http://@h"]
+    for t in texts
+        val u = Url(t)
+        assertEq(s"$u", t)
+        assertEq(Url(s"$u"), u)
+
+@test("portOrDefault gives the written port or the scheme's default")
+portOrDefault()
+    assertEq(Url("http://h/").portOrDefault(), Some(80))
+    assertEq(Url("https://h/").portOrDefault(), Some(443))
+    assertEq(Url("ws://h/").portOrDefault(), Some(80))
+    assertEq(Url("wss://h/").portOrDefault(), Some(443))
+    assertEq(Url("https://h:8443/").portOrDefault(), Some(8443))
+    assertEq(Url("http://h:80/").portOrDefault(), Some(80))
+    assertEq(Url("foo://h/").portOrDefault(), None)
+    assertEq(Url("mailto:x@y").portOrDefault(), None)
+
+@test("encode escapes every byte but the unreserved characters, upper-case, and decode reverses it")
+encodeDecode()
+    assertEq(Url.encode(""), "")
+    assertEq(Url.encode("abcXYZ019-._~"), "abcXYZ019-._~")
+    assertEq(Url.encode("a b/c?d=e&f+g#h%"), "a%20b%2Fc%3Fd%3De%26f%2Bg%23h%25")
+    assertEq(Url.encode("caf\u{e9}"), "caf%C3%A9")
+    assertEq(Url.encode("\u{e9}t\u{e9}"), "%C3%A9t%C3%A9")
+    assertEq(Url.encode("\u{20ac}"), "%E2%82%AC")
+    assertEq(Url.encode("\u{1f600}"), "%F0%9F%98%80")
+    assertEq(Url.encode("\u{0}\u{7f}"), "%00%7F")
+    assertEq(Url.decode("a%20b+c"), Ok("a b+c"))
+    assertEq(Url.decode("%e2%82%ac"), Ok("\u{20ac}"))
+    assertEq(Url.decode("plain"), Ok("plain"))
+    assertEq(Url.decode(""), Ok(""))
+    assertEq(Url.decode("caf\u{e9}%21"), Ok("caf\u{e9}!"))
+    assertEq(Url.decode("%"), Err(BadPercent(0)))
+    assertEq(Url.decode("ab%4"), Err(BadPercent(2)))
+    assertEq(Url.decode("%xy"), Err(BadPercent(0)))
+    assertEq(Url.decode("%E2%82"), Err(InvalidUtf8(0)))
+    assertEq(Url.decode("ok%FFx"), Err(InvalidUtf8(2)))
+    for s in ["", "a b", "\u{20ac}uro & m\u{e1}s", "100%", "a+b=c", "\u{1f600}/\u{0}"]
+        assertEq(Url.decode(Url.encode(s)), Ok(s))
+
+@test("queryParams splits at & and the first =, skips empty pieces, and decodes + as a space")
+queryParams()
+    assertEq(Url("http://h/?a=1&b=&c&&d=x=y&e=%C3%A9+f").queryParams(), [("a", "1"), ("b", ""), ("c", ""), ("d", "x=y"), ("e", "\u{e9} f")])
+    assertEq(Url("http://h/?a+b%2B=1%26").queryParams(), [("a b+", "1&")])
+    assertEq(Url("http://h/?").queryParams(), Vector.empty[(string, string)]())
+    assertEq(Url("http://h/").queryParams(), Vector.empty[(string, string)]())
+    assertEq(Url("http://h/?&&").queryParams(), Vector.empty[(string, string)]())
+    assertEq(Url("http://h/?=v").queryParams(), [("", "v")])
+    assertEq(Url("http://h/?k=a&k=b").queryParams(), [("k", "a"), ("k", "b")])
+
+@test("RFC 3986 section 5.4.1: the normal examples")
+resolveNormal()
+    resolveAll("http://a/b/c/d;p?q", [
+        ("g:h", "g:h"),
+        ("g", "http://a/b/c/g"),
+        ("./g", "http://a/b/c/g"),
+        ("g/", "http://a/b/c/g/"),
+        ("/g", "http://a/g"),
+        ("//g", "http://g"),
+        ("?y", "http://a/b/c/d;p?y"),
+        ("g?y", "http://a/b/c/g?y"),
+        ("#s", "http://a/b/c/d;p?q#s"),
+        ("g#s", "http://a/b/c/g#s"),
+        ("g?y#s", "http://a/b/c/g?y#s"),
+        (";x", "http://a/b/c/;x"),
+        ("g;x", "http://a/b/c/g;x"),
+        ("g;x?y#s", "http://a/b/c/g;x?y#s"),
+        ("", "http://a/b/c/d;p?q"),
+        (".", "http://a/b/c/"),
+        ("./", "http://a/b/c/"),
+        ("..", "http://a/b/"),
+        ("../", "http://a/b/"),
+        ("../g", "http://a/b/g"),
+        ("../..", "http://a/"),
+        ("../../", "http://a/"),
+        ("../../g", "http://a/g")])
+
+@test("RFC 3986 section 5.4.2: the abnormal examples, resolved strictly")
+resolveAbnormal()
+    resolveAll("http://a/b/c/d;p?q", [
+        ("../../../g", "http://a/g"),
+        ("../../../../g", "http://a/g"),
+        ("/./g", "http://a/g"),
+        ("/../g", "http://a/g"),
+        ("g.", "http://a/b/c/g."),
+        (".g", "http://a/b/c/.g"),
+        ("g..", "http://a/b/c/g.."),
+        ("..g", "http://a/b/c/..g"),
+        ("./../g", "http://a/b/g"),
+        ("./g/.", "http://a/b/c/g/"),
+        ("g/./h", "http://a/b/c/g/h"),
+        ("g/../h", "http://a/b/c/h"),
+        ("g;x=1/./y", "http://a/b/c/g;x=1/y"),
+        ("g;x=1/../y", "http://a/b/c/y"),
+        ("g?y/./x", "http://a/b/c/g?y/./x"),
+        ("g?y/../x", "http://a/b/c/g?y/../x"),
+        ("g#s/./x", "http://a/b/c/g#s/./x"),
+        ("g#s/../x", "http://a/b/c/g#s/../x"),
+        ("http:g", "http:g")])
+
+@test("resolving against a base with an empty path or no authority, an absolute Url, and a bad reference")
+resolveEdges()
+    resolveAll("http://h", [("g", "http://h/g"), ("?q", "http://h?q"), ("#f", "http://h#f"), ("..", "http://h/")])
+    resolveAll("mailto:a", [("b", "mailto:b"), ("?x", "mailto:a?x")])
+    resolveAll("http://h/a/b?q#f", [
+        ("//OTHER:80/x/../y", "http://other/y"),
+        ("HTTPS://h:443/./z", "https://h/z"),
+        ("a b", "error: character not allowed at index 1"),
+        ("//[::1/", "error: malformed host at index 2"),
+        ("%zz", "error: malformed percent-escape at index 0"),
+        ("1x:y", "error: not a scheme character at index 0")])
+    assertEq(s"${Url("http://h/a/").resolve(Url("http://x/a/../b/./c"))}", "http://x/b/c")
+
+@test("the with methods replace one component, held as parse holds it")
+withMethods()
+    val u = Url("http://h/p?q#f")
+    assertEq(s"${u.withScheme("HTTPS")}", "https://h/p?q#f")
+    assertEq(s"${u.withUserInfo("me:pw")}", "http://me:pw@h/p?q#f")
+    assertEq(s"${u.withUserInfo("me").withUserInfo(None)}", "http://h/p?q#f")
+    assertEq(s"${u.withHost("EXAMPLE.org")}", "http://example.org/p?q#f")
+    assertEq(s"${u.withHost("[::1]")}", "http://[::1]/p?q#f")
+    assertEq(s"${u.withHost(None)}", "http:/p?q#f")
+    assertEq(s"${u.withPort(8080)}", "http://h:8080/p?q#f")
+    assertEq(s"${u.withPort(80)}", "http://h/p?q#f")
+    assertEq(u.withPort(80).port, None)
+    assertEq(s"${u.withPort(8080).withPort(None)}", "http://h/p?q#f")
+    assertEq(s"${Url("https://h:80/").withScheme("http")}", "http://h/")
+    assertEq(s"${u.withPath("/a/%C3%A9")}", "http://h/a/%C3%A9?q#f")
+    assertEq(s"${u.withPath("")}", "http://h?q#f")
+    assertEq(s"${u.withQuery("a=1&b=2")}", "http://h/p?a=1&b=2#f")
+    assertEq(s"${u.withQuery("")}", "http://h/p?#f")
+    assertEq(s"${u.withQuery(None)}", "http://h/p#f")
+    assertEq(s"${u.withFragment("x/y?z")}", "http://h/p?q#x/y?z")
+    assertEq(s"${u.withFragment(None)}", "http://h/p?q")
+    assertEq(u.withQuery("k=v").queryParams(), [("k", "v")])
+    assertEq(Url("mailto:x").withPath("y@z").path, "y@z")

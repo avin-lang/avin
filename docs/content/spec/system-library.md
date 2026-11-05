@@ -480,12 +480,41 @@ collector finds it unreachable, so a lost one leaks nothing for long, but only `
 
 ### `Url`
 
-`Url.parse(text) -> Result[Url, UrlError]` reads an absolute URL into its `scheme`, `host`, `port`
-(an `Option[int]`), `path`, `query` (an `Option[string]`) and `fragment`; `u.portOrDefault()` gives
-80 for `http` and 443 for `https` where none is written, and `u.queryParams() -> Vector[(string,
-string)]` the decoded pairs. `Url.encode(text)` and `Url.decode(text)` percent-encode and decode a
-component. A `Url` displays as the text it was parsed from, normalized: the scheme and host in lower
-case, a default port left out.
+`import avin.net.Url` brings in a URL as RFC 3986 reads a URI. `Url.parse(text) -> Result[Url,
+UrlError]` reads an absolute URL, one that begins with its scheme, and `Url(text)` reads one and
+traps on text that is not, with the error's message and the text, as `Regex(p)` traps where
+`Regex.compile(p)` answers a `Result`.
+
+A `Url` is a `data` type of its components: `scheme`, `userInfo`, `host`, `port` (an `Option[int]`),
+`path`, `query` and `fragment`, each optional one an `Option`. **An empty component is not an absent
+one**: `http://h?` has the query `Some("")` and `http://h` has `None`; `file:///etc` has the host
+`Some("")` and `mailto:a@b.c`, which has no authority, `None`. Components are kept as they were
+written, percent-escapes and all, and `Url.decode` turns one into text. A host is a name, an IPv4
+address, or an address in brackets, kept with them: an IPv6 address, with an optional zone written
+`%25` and its name (`[fe80::1%25eth0]`), or an address of a later form (`[v7.x]`). A component may
+hold characters beyond ASCII other than controls and spaces, kept as they are.
+
+The scheme and host are held in lower case (a zone's name and a host's percent-escapes as written),
+and a port that is the scheme's default is held as `None`, so URLs differing only in those are
+equal, and a `Url` displays as the text it was read from with exactly those differences:
+`Url("HTTP://Example.COM:80/A")` displays as `http://example.com/A`.
+
+| Member | Meaning |
+| --- | --- |
+| `u.portOrDefault() -> Option[int]` | The port, or where none is written the scheme's default: 80 for `http` and `ws`, 443 for `https` and `wss`. |
+| `u.queryParams() -> Vector[(string, string)]` | The query split at each `&` (an empty piece skipped) and each piece at its first `=`, decoded, a `+` standing for a space as a form writes one; no `=` gives an empty value, no query no pairs. |
+| `u.resolve(ref: string) -> Result[Url, UrlError]` | The reference, relative or absolute, resolved against `u` by RFC 3986 §5.2: its missing components taken from `u` and its dot segments removed, strictly, so `http:g` stays `http:g`. |
+| `u.resolve(ref: Url) -> Url` | An absolute reference with its dot segments removed. |
+| `u.withScheme(s)`, `withUserInfo(i)`, `withHost(h)`, `withPort(p)`, `withPath(p)`, `withQuery(q)`, `withFragment(f)` | The URL with one component replaced, as written with its escapes, held as `parse` holds it; the optional ones take a value or an `Option`, `None` taking the component away. A component the URL cannot hold traps: one with a character it may not, a port outside 0 to 65535, user information or a port without a host, a path beside a host not beginning with `/`. |
+| `Url.encode(text) -> string` | Every byte of the text's UTF-8 but a letter, a digit, `-`, `.`, `_` and `~` written `%XX` in upper case, so the result can stand as any component. |
+| `Url.decode(text) -> Result[string, UrlError]` | Each `%XX` replaced by its byte and the bytes read as UTF-8; a `+` is kept. |
+
+`UrlError` says why text is not a URL, with `at`, the byte offset of what is wrong: `MissingScheme`
+(a relative reference, or text beginning with `:`), `BadScheme(at)`, `BadCharacter(at)`,
+`BadPercent(at)`, `BadHost(at)`, `BadPort(at)` (not digits, or above 65535) and `InvalidUtf8(at)`;
+`message()` says it in words. **Every component's escapes must decode to UTF-8 for the text to be a
+URL**, so `parse` refuses `http://h/%FF` with `InvalidUtf8(9)` and `queryParams` never fails on a
+`Url` it read.
 
 ### `http`
 
