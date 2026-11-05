@@ -196,6 +196,13 @@ Recursion whose type arguments do not grow is ordinary: `f[T]` calling `f[T]`, `
 `f[B, A]`, a call at a fixed type such as `f[int]`, and a type that grows once outside any cycle all
 have finitely many copies.
 
+A method an impl with bounds of its own adds, `impl[T: Ord] Ord for Box[T]`, has copies only at the
+type arguments that meet them. A cycle through it counts only the type arguments that may: a
+`compare` that builds a `Box[Plain[T]]`, where `Plain` has no `Ord`, needs no `compare` of that box
+and compiles, while one building a `Box[Wide[T]]` of an ordered `Wide` grows without end and is
+rejected. A type argument whose outermost type is not known where it reaches the impl, such as a
+part taken apart from a larger type, is counted as one that may.
+
 A data type naming itself at a larger instance in its fields, a **nested data type** such as
 
 ```avin

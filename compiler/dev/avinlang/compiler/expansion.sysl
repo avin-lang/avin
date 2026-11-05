@@ -80,6 +80,23 @@ private struct Flow
     methods_by_name: Map[string, Buf[usize]]
     /** The generic local functions of each top-level function. */
     generic_locals: Map[usize, Buf[usize]]
+    /** The edges from a type's parameters to a method that a conformance or an impl with bounds of
+     * its own brings, connected once every type argument the program passes the type is known. */
+    guarded: Buf[GuardedEdge]
+
+/** An edge from the type parameter with node key `key` to the node with key `to_key`, of `weight`,
+ * which holds only where the parameter's type argument meets `bounds` (their own parameters taken as
+ * any type): the edge of a method an impl with bounds of its own adds. It is connected from each
+ * place that passes the parameter a type argument that may meet them, rather than from the
+ * parameter, so a type argument that cannot does not reach the method. `pass` says whether the
+ * method's parameter is the type's parameter itself, so it holds the very type argument passed. */
+private struct GuardedEdge
+    key: usize
+    bounds: Buf[&Type]
+    to_key: usize
+    weight: i64
+    pass: bool
+    arg: &Type
 
 /** Where code is: the key of its first type parameter's node, the owner its types name those
  * parameters by, its unit, and whether it has type parameters at all. */
@@ -99,7 +116,7 @@ private class_base(id: usize) -> usize = (1usize << 61) + id * 256
 
 /** Rejects every generic call cycle of the program whose type arguments grow. */
 check_expansion(c: *Checker)
-    var f = Flow(buf(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), map(), map(), map())
+    var f = Flow(buf(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), map(), map(), map(), buf())
     index_symbols(c, &f)
     for id in 0..<c.symbols.len()
         c.bodies[id] match
@@ -557,8 +574,12 @@ private undecided(c: *Checker, self_type: &Type, owner: usize, g: usize) -> bool
 // `self_type` has it: the type itself, a superclass, or a trait it implements. A method an impl adds
 // names the impl's own type parameters in its receiver's type, each standing for the type's
 // parameter at its position.
+//
+// Where an impl with bounds of its own brings `m`, an edge from a parameter the bounds constrain is
+// guarded: it holds only for the type arguments that meet them.
 private view_edges(c: *Checker, f: *Flow, self_type: &Type, site: Site, span: Span, m: usize)
     val symbol = c.symbols[m]
+    val conditions = impl_conditions(c, self_type, site.owner, m)
     if symbol.owner_class is None
         val receiver_args = symbol.receiver match
             Some(r) -> *r match
@@ -571,7 +592,12 @@ private view_edges(c: *Checker, f: *Flow, self_type: &Type, site: Site, span: Sp
             var params: Buf[usize] = buf()
             params_in(c, receiver_args[j], symbol.type_owner, &params)
             for i in params
-                if i < 256 then connect(f, site.base + j, function_base(m) + i, 0 - depth_of(c, receiver_args[j], symbol.type_owner, i), site.unit, span, receiver_args[j])
+                if i >= 256 then continue
+                val weight = 0 - depth_of(c, receiver_args[j], symbol.type_owner, i)
+                if j < conditions.len() && conditions[j].len() > 0
+                    val pass = *resolved(c, receiver_args[j]) is TypeVar(_, _, _)
+                    f.guarded.push(GuardedEdge(site.base + j, conditions[j], function_base(m) + i, weight, pass, receiver_args[j]))
+                else connect(f, site.base + j, function_base(m) + i, weight, site.unit, span, receiver_args[j])
         return
     val k = symbol.owner_class.unwrap()
     val view = ancestor_type(c.classes, c.data, self_type, k) match
@@ -580,13 +606,169 @@ private view_edges(c: *Checker, f: *Flow, self_type: &Type, site: Site, span: Sp
     val args = *view match
         Class(_, _, a) -> a
         _ -> return
-    flow_into(c, f, site, span, args, function_base(m), 0)
+    if conditions.len() == 0
+        flow_into(c, f, site, span, args, function_base(m), 0)
+        return
+    // A trait's default body the conformance brings: as `flow_into`, with each constrained
+    // parameter's edges guarded.
+    for j in 0..<args.len()
+        if j >= 256 then break
+        var params: Buf[usize] = buf()
+        params_in(c, args[j], site.owner, &params)
+        for i in params
+            if i >= 256 then continue
+            val weight = depth_of(c, args[j], site.owner, i)
+            if i < conditions.len() && conditions[i].len() > 0
+                val pass = *resolved(c, args[j]) is TypeVar(_, _, _)
+                f.guarded.push(GuardedEdge(site.base + i, conditions[i], function_base(m) + j, weight, pass, args[j]))
+            else
+                connect(f, site.base + i, function_base(m) + j, weight, site.unit, span, args[j])
+                val head = head_of(c, args[j])
+                if head != 0 then connect_nodes(f, node(f, site.base + i), head_node(f, function_base(m) + j, head, site.unit, span, args[j]), weight, site.unit, span, args[j])
+        if params.len() > 0
+            val head = head_of(c, args[j])
+            if head != 0 then add_head(f, function_base(m) + j, head)
+        mention(c, f, site, span, args[j])
+
+/** The outermost type of `t` as a head (see `Flow.heads`): its `data_base` or `class_base`, or 0. */
+private head_of(c: *Checker, t: &Type) -> usize = *resolved(c, t) match
+    Data(id, _, _) -> data_base(id)
+    Class(id, _, _) -> class_base(id)
+    _ -> 0
+
+/** The bounds an impl with bounds of its own puts on the parameters of the type `self_type`, whose
+ * parameters `owner` owns, where it brings method `m`: the impl's own method, or a default body of
+ * the trait the impl implements. Each is a bound by the type's parameter's position, with the type's
+ * parameters in it taken as any type. Empty where no such impl brings `m`. */
+private impl_conditions(c: *Checker, self_type: &Type, owner: usize, m: usize) -> Buf[Buf[&Type]]
+    val symbol = c.symbols[m]
+    var found: Option[Buf[Buf[&Type]]] = None
+    if symbol.owner_class is Some(k)
+        for x in c.conditional
+            if x.owner == owner && x.trait_id == k then found = Some(x.conditions)
+    elif symbol.type_params.len() > 0
+        for x in c.conditional_methods
+            if x.owner == owner && x.params.len() > 0 && x.unit == symbol.unit && symbol.type_params.len() >= x.params.len() && symbol.type_params[0].site == x.params[0].site then found = Some(x.conditions)
+        for x in c.conditional
+            if x.owner == owner && x.params.len() > 0 && x.unit == symbol.unit && symbol.type_params.len() >= x.params.len() && symbol.type_params[0].site == x.params[0].site then found = Some(x.conditions)
+    val conditions = found match
+        Some(x) -> x
+        None -> return buf()
+    var any: Buf[&Type] = buf()
+    val count = *self_type match
+        Data(_, _, a) -> a.len()
+        Class(_, _, a) -> a.len()
+        _ -> 0
+    for _ in 0..<count do any.push(ErrorType)
+    var out: Buf[Buf[&Type]] = buf()
+    for bounds in conditions
+        var each: Buf[&Type] = buf()
+        for b in bounds do each.push(substitute(b, owner, any))
+        out.push(each)
+    out
+
+// Each edge into a parameter that brings a value whose outermost type no head stands for: a tuple, a
+// function, a part taken apart from a larger type, or what a call through a bound passes. Its source
+// reaches the parameter as it holds an unknown type, `unknown_head`, too, so that every value a
+// parameter holds reaches it through one of its heads.
+private mark_unknown(c: *Checker, f: *Flow)
+    val count = f.edges.len()
+    for x in 0..<count
+        val e = f.edges[x]
+        if !plain(f, e.to) then continue
+        val key = f.keys[e.to]
+        if plain(f, e.from)
+            if e.weight == 0 && *resolved(c, e.arg) is TypeVar(_, _, _) then continue
+        elif f.keys[e.from] == key then continue
+        val head = head_of(c, e.arg)
+        if head != 0
+            if f.head_nodes.get(s"$key/$head") is Some(n)
+                if f.edge_index.get((e.from << 32) + n) is Some(_) then continue
+        connect_nodes(f, e.from, head_node(f, key, unknown_head(), e.unit, e.span, e.arg), e.weight, e.unit, e.span, e.arg)
+        add_head(f, key, unknown_head())
+
+/** The head standing for a value whose outermost type the flow does not know: no type's base. */
+private unknown_head() -> usize = 1
+
+// The guarded edges, from the parameter as it holds each outermost type that may meet the bounds,
+// so a type argument reaches the method only by the paths that bring such a type. A value of
+// unknown outermost type may meet them. Where the method's parameter is the type's parameter
+// itself, it holds the same outermost type.
+private connect_guarded(c: *Checker, f: *Flow, conformances: Conformances)
+    for g in f.guarded
+        val heads = f.heads.get(g.key) match
+            Some(h) -> h
+            None -> continue
+        for h in heads
+            if !head_may_meet(c, conformances, h, g.bounds) then continue
+            val from = f.head_nodes.get(s"${g.key}/$h") match
+                Some(n) -> n
+                None -> continue
+            // The edge that first brought the head names the place.
+            val e = f.edges[f.out[from][0]]
+            if g.pass
+                connect_nodes(f, from, head_node(f, g.to_key, h, e.unit, e.span, g.arg), g.weight, e.unit, e.span, g.arg)
+                add_head(f, g.to_key, h)
+            else
+                connect_nodes(f, from, node(f, g.to_key), g.weight, e.unit, e.span, g.arg)
+                val head = head_of(c, g.arg)
+                if head != 0
+                    connect_nodes(f, from, head_node(f, g.to_key, head, e.unit, e.span, g.arg), g.weight, e.unit, e.span, g.arg)
+                    add_head(f, g.to_key, head)
+
+/** Whether a value whose outermost type is head `h`, its type arguments taken as any types, may
+ * meet every one of `bounds`. */
+private head_may_meet(c: *Checker, f: Conformances, h: usize, bounds: Buf[&Type]) -> bool
+    if h == unknown_head() then return true
+    val t = if h >= (1usize << 62) then data_type_of(c, (h - (1usize << 62)) / 256) else class_type_of(c, (h - (1usize << 61)) / 256)
+    may_meet(c, f, t, bounds)
+
+/** Whether a type argument `t`, its type parameters taken as any type, may meet every one of
+ * `bounds`. */
+private may_meet(c: *Checker, f: Conformances, t: &Type, bounds: Buf[&Type]) -> bool
+    val x = any_params(c, t)
+    for b in bounds
+        if *b is Class(k, _, _)
+            if c.core.trait_named("Sendable") is Some(s)
+                if s == k then continue
+        if !meets_bound(f, x, b) then return false
+    true
+
+/** `t` with each type parameter and unsolved unknown in it as `ErrorType`, which conforms to
+ * everything. */
+private any_params(c: *Checker, t: &Type) -> &Type = *resolved(c, t) match
+    TypeVar(_, _, _) -> ErrorType
+    Var(_) -> ErrorType
+    Tuple(items) -> Tuple(all_any(c, items))
+    Function(params, result) -> Function(all_any(c, params), any_params(c, result))
+    ByName(inner) -> ByName(any_params(c, inner))
+    Data(id, name, args) -> Data(id, name, all_any(c, args))
+    Class(id, name, args) -> Class(id, name, all_any(c, args))
+    _ -> resolved(c, t)
+
+private all_any(c: *Checker, items: Buf[&Type]) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    for x in items do out.push(any_params(c, x))
+    out
 
 // The calls through bounds: each type parameter's outermost types reach the parameters it is passed
 // on to unchanged, and each call on a value of it reaches each such type's implementation.
+//
+// The guarded edges are connected here too, from the outermost types that reach them, and each
+// step can bring another a new one, so the steps repeat until none adds a node or an edge.
 private connect_bounds(c: *Checker, f: *Flow)
-    // A parameter passed on unchanged passes on each outermost type it holds, along the path that
-    // type takes.
+    val conformances = Conformances(c.classes, c.data, c.builtins, c.conditional, c.core, c.bounds, None, c.lowers)
+    var size = 0usize
+    while f.edges.len() + f.keys.len() != size
+        size = f.edges.len() + f.keys.len()
+        mark_unknown(c, f)
+        pass_heads(c, f)
+        connect_guarded(c, f, conformances)
+        bound_targets(c, f)
+
+/** A parameter passed on unchanged passes on each outermost type it holds, along the path that type
+ * takes. */
+private pass_heads(c: *Checker, f: *Flow)
     var changed = true
     while changed
         changed = false
@@ -601,6 +783,10 @@ private connect_bounds(c: *Checker, f: *Flow)
                     if add_head(f, f.keys[e.to], h) then changed = true
                     val from = head_node(f, f.keys[e.from], h, e.unit, e.span, e.arg)
                     connect_nodes(f, from, head_node(f, f.keys[e.to], h, e.unit, e.span, e.arg), 0, e.unit, e.span, e.arg)
+
+/** Each call on a value of a type parameter reaches the implementation of each outermost type the
+ * parameter holds. */
+private bound_targets(c: *Checker, f: *Flow)
     for x in 0..<f.bound_keys.len()
         val key = f.bound_keys[x]
         val slot = f.bound_slots[x]
@@ -608,6 +794,7 @@ private connect_bounds(c: *Checker, f: *Flow)
             Some(h) -> h
             None -> continue
         for h in heads
+            if h == unknown_head() then continue
             // The parameter as it holds this type, so only the paths that bring the type reach
             // its implementation.
             val from = f.head_nodes.get(s"$key/$h").unwrap_or(node(f, key))

@@ -2,9 +2,65 @@ module avin.regex
 
 // The backtracking matcher. It runs a program over the input's characters, held as code points with
 // the byte offset each one starts at. `run(pc, i)` answers whether the program from operation `pc`
-// matches at character index `i` and on to an end; each choice is tried in the pattern's order by
-// trying the rest of the pattern after it, so the first success found is the leftmost-first one, and
-// what a failed attempt recorded is undone as the attempt returns.
+// matches at character index `i` and on to an end. Each choice is tried in the pattern's order, so
+// the first success found is the leftmost-first one.
+//
+// The matcher keeps its own backtrack stack, an array of frames, so however many repetitions a match
+// takes, it takes no deeper a call stack. A choice pushes a frame naming the way not yet tried, and
+// whatever a step overwrites that a failure must put back (a group's span, where a group began, a
+// loop's count) pushes a frame holding the old value. A failure pops frames, putting values back,
+// until one names a way still to try, and goes on from there; with none left the attempt fails. Only
+// a part matched on its own (the item of a repetition matched one way, an atomic group, a
+// lookaround's body) runs in a call of its own, with its frames above the caller's; when it succeeds
+// its frames are dropped, so nothing it did is put back and none of its choices is tried again.
+//
+// Every attempt at a start has a step budget, each operation run and each frame popped one step; an
+// attempt that spends it traps, as catastrophic backtracking would otherwise run for ever.
+
+// The frames, each its fields and then its kind, so a frame is read from the top down.
+// Where `local` held `value`: (local, value).
+private val UndoLocal: int = 0
+// Where `group` spanned `start` to `end`: (group, start, end).
+private val UndoGroup: int = 1
+// Go on at `pc` from `i`: (pc, i).
+private val Resume: int = 2
+// The `k`th alternative of the branch at `pc`, from `i`: (pc, k, i).
+private val BranchNext: int = 3
+// A reluctant `Ques` at `pc` that went on without its item from `i`: (pc, i).
+private val QuesLazy: int = 4
+// A greedy `Curly` giving back: go on to `next` from `i` with `j` repetitions, each `k` long, while
+// `j` is at least `backLimit`: (next, i, j, k, backLimit).
+private val CurlyGive: int = 5
+// A reluctant `Curly` at `pc` that went on with `j` repetitions ending at `i`: (pc, i, j).
+private val CurlyLazy: int = 6
+// A greedy `CharLoop` giving back: go on to `next` from `i`, then from each index before it down to
+// `least`: (next, least, i).
+private val CharBack: int = 7
+// A reluctant `CharLoop` at `pc` that went on with `j` repetitions ending at `i`: (pc, i, j).
+private val CharLazy: int = 8
+// A greedy `GroupCurly` at `pc` giving back: go on from `i` with `j` repetitions, each `k` long,
+// down to `backLimit` of them, where the group spanned `start` to `end`: (pc, i, j, k, backLimit,
+// start, end).
+private val GroupCurlyGive: int = 9
+// A reluctant `GroupCurly` at `pc` that went on with `j` repetitions ending at `i`: (pc, i, j).
+private val GroupCurlyLazy: int = 10
+// A reluctant `Loop` at `pc` that went on without a first repetition from `i`: (pc, i).
+private val LoopLazyStart: int = 11
+// A reluctant `Loop` at `pc` that went on after `n` repetitions ending at `i`: (pc, i, n).
+private val LoopLazyMore: int = 12
+// A greedy `Loop` at `pc` that tried repetition `n + 1` from `i`: when that fails, the count is
+// `n` again, the failure is remembered, and the rest of the pattern is tried from `i`: (pc, i, n).
+private val LoopRepeatFail: int = 13
+
+// The steps an attempt may take, unless the regex sets its own: this many for each character of the
+// input and each operation of the program, and never fewer than `LeastStepBudget`.
+private val StepsPerCharacterAndOperation: long = 1000
+private val LeastStepBudget: long = 10000000
+
+// The step budget for an attempt over `length` characters with a program of `size` operations.
+private stepBudget(length: int, size: int) -> long
+    val b = long(length + 1) * long(size) * StepsPerCharacterAndOperation
+    if b < LeastStepBudget then LeastStepBudget else b
 
 private class Engine(val program: Program, val text: Array[int])
     private val ops: Array[Op] = program.ops
@@ -25,11 +81,21 @@ private class Engine(val program: Program, val text: Array[int])
     // Made when the first mark is.
     private var failures: Array[int] = Array.empty[int]()
     private var attempt = 0
+    // The backtrack stack: its frames are the first `top` elements.
+    private var stack: Array[int] = Array.fill(64, 0)
+    private var top = 0
+    // The steps the current attempt has taken, and how many it may.
+    private var steps: long = 0
+    private val budget: long = if program.stepLimit > 0 then program.stepLimit else stepBudget(text.length(), program.ops.length())
+    // Where a step goes on: the operation and the index.
+    private var nextPc = 0
+    private var nextAt = 0
 
     private clear()
         for k in 0..<groups.length() do groups(k) = -1
         for k in 0..<locals.length() do locals(k) = -1
         attempt += 1
+        top = 0
 
     private failedBefore(memo: int, i: int) -> bool = failures.length() > 0 && failures(memo * (to + 1) + i) == attempt
 
@@ -54,6 +120,7 @@ private class Engine(val program: Program, val text: Array[int])
         if oldLast < 0 then oldLast = from
         clear()
         wholeInput = whole
+        steps = 0
         val found = run(program.entry, from)
         if found
             groups(0) = from
@@ -66,6 +133,7 @@ private class Engine(val program: Program, val text: Array[int])
     private scan(from: int) -> bool
         val guard = to - program.minLength
         if program.startsAtBeginning
+            steps = 0
             if from == 0 && guard >= 0 && run(program.entry, 0)
                 return found(0)
             return false
@@ -76,6 +144,7 @@ private class Engine(val program: Program, val text: Array[int])
                 CharOp(set, _) -> i < to && set.contains(text(i))
                 LiteralOp(codes, _) -> i < to && text(i) == codes(0)
                 _ -> true
+            steps = 0
             if worth && run(program.entry, i) then return found(i)
             i += 1
         false
@@ -86,122 +155,361 @@ private class Engine(val program: Program, val text: Array[int])
         groups(1) = last
         true
 
-    // Whether the program from `start` matches at `from`. An operation that tests and then goes on
-    // to one continuation goes on in this same call, so only a choice that may have to be undone
-    // takes a call of its own.
+    // One step more of the attempt, trapping once the budget is spent.
+    private step()
+        steps += 1
+        if steps > budget
+            val limit = if program.stepLimit > 0 then s" (step limit ${program.stepLimit})" else ""
+            fail(s"pattern `${program.text}` backtracked too far on a ${to}-character input$limit; make a repetition possessive or atomic")
+
+    // Room on the stack for `n` more elements.
+    private reserve(n: int)
+        if top + n > stack.length()
+            var size = stack.length() * 2
+            while top + n > size do size *= 2
+            val bigger = Array.fill(size, 0)
+            for k in 0..<top do bigger(k) = stack(k)
+            stack = bigger
+
+    private push2(a: int, b: int, kind: int)
+        reserve(3)
+        stack(top) = a
+        stack(top + 1) = b
+        stack(top + 2) = kind
+        top += 3
+
+    private push3(a: int, b: int, c: int, kind: int)
+        reserve(4)
+        stack(top) = a
+        stack(top + 1) = b
+        stack(top + 2) = c
+        stack(top + 3) = kind
+        top += 4
+
+    private push5(a: int, b: int, c: int, d: int, e: int, kind: int)
+        reserve(6)
+        stack(top) = a
+        stack(top + 1) = b
+        stack(top + 2) = c
+        stack(top + 3) = d
+        stack(top + 4) = e
+        stack(top + 5) = kind
+        top += 6
+
+    private push7(a: int, b: int, c: int, d: int, e: int, f: int, g: int, kind: int)
+        reserve(8)
+        stack(top) = a
+        stack(top + 1) = b
+        stack(top + 2) = c
+        stack(top + 3) = d
+        stack(top + 4) = e
+        stack(top + 5) = f
+        stack(top + 6) = g
+        stack(top + 7) = kind
+        top += 8
+
+    // Goes on at `pc` from `i`.
+    private goOn(pc: int, i: int) -> bool
+        nextPc = pc
+        nextAt = i
+        true
+
+    // Whether the program from `start` matches at `from`. The frames this call pushes sit above
+    // `base`; on either answer the stack is cut back to it.
     run(start: int, from: int) -> bool
+        val base = top
         var pc = start
         var i = from
+        var failed = false
         loop
+            step()
+            if failed
+                if !backtrack(base) then return false
+                failed = false
+                pc = nextPc
+                i = nextAt
+                continue
             ops(pc) match
                 Accept ->
-                    if wholeInput && i != to then return false
-                    last = i
-                    return true
+                    if wholeInput && i != to
+                        failed = true
+                    else
+                        last = i
+                        top = base
+                        return true
                 SetLast ->
                     last = i
+                    top = base
                     return true
-                LookbehindEnd -> return i == lookbehindTo
+                LookbehindEnd ->
+                    if i != lookbehindTo
+                        failed = true
+                    else
+                        top = base
+                        return true
                 CharOp(set, next) ->
-                    if i >= to || !set.contains(text(i)) then return false
-                    pc = next
-                    i += 1
+                    if i >= to || !set.contains(text(i))
+                        failed = true
+                    else
+                        pc = next
+                        i += 1
                 LiteralOp(codes, next) ->
-                    val n = codes.length()
-                    if i + n > to then return false
-                    var k = 0
-                    while k < n
-                        if text(i + k) != codes(k) then return false
-                        k += 1
-                    pc = next
-                    i += n
+                    if literalAt(codes, i)
+                        pc = next
+                        i += codes.length()
+                    else
+                        failed = true
                 AnchorOp(kind, next) ->
-                    if !anchor(kind, i) then return false
-                    pc = next
+                    if anchor(kind, i) then pc = next else failed = true
                 BoundaryOp(boundary, unicode, next) ->
-                    if isBoundary(i, unicode) != boundary then return false
-                    pc = next
-                LineBreakOp(next) -> return lineBreak(i, next)
+                    if isBoundary(i, unicode) == boundary then pc = next else failed = true
+                LineBreakOp(next) ->
+                    val size = lineBreak(i)
+                    if size == 0
+                        failed = true
+                    else
+                        // `\r\n` gives back its `\n` if the rest fails.
+                        if size == 2 then push2(next, i + 1, Resume)
+                        pc = next
+                        i += size
                 GraphemeBoundaryOp(next) ->
-                    if !isGraphemeBoundary(text, i, to) then return false
-                    pc = next
+                    if isGraphemeBoundary(text, i, to) then pc = next else failed = true
                 GraphemeOp(next) ->
-                    if i >= to then return false
-                    i = graphemeEnd(text, i, to)
-                    pc = next
+                    if i >= to
+                        failed = true
+                    else
+                        i = graphemeEnd(text, i, to)
+                        pc = next
                 GroupHead(local, next) ->
-                    val saved = locals(local)
+                    push2(local, locals(local), UndoLocal)
                     locals(local) = i
-                    val matched = run(next, i)
-                    locals(local) = saved
-                    return matched
+                    pc = next
                 GroupTail(local, group, next) ->
-                    if group >= 0 then return groupTail(local, group, next, i)
+                    if group >= 0
+                        push3(group, groups(group * 2), groups(group * 2 + 1), UndoGroup)
+                        groups(group * 2) = locals(local)
+                        groups(group * 2 + 1) = i
                     pc = next
                 Branch(alternatives) ->
-                    val n = alternatives.length() - 1
-                    var k = 0
-                    while k < n
-                        if run(alternatives(k), i) then return true
-                        k += 1
-                    pc = alternatives(n)
+                    if alternatives.length() > 1 then push3(pc, 1, i, BranchNext)
+                    pc = alternatives(0)
                 Ques(atom, mode, next) ->
-                    if mode == Greedy then return (run(atom, i) && run(next, last)) || run(next, i)
-                    if mode == Lazy then return run(next, i) || (run(atom, i) && run(next, last))
-                    if mode == Possessive
+                    if mode == Greedy
+                        if run(atom, i)
+                            push2(next, i, Resume)
+                            i = last
+                    elif mode == Lazy
+                        push2(pc, i, QuesLazy)
+                    elif mode == Possessive
                         if run(atom, i) then i = last
                     elif run(atom, i)
                         i = last
                     else
-                        return false
+                        failed = true
                     pc = next
-                Curly(atom, least, most, mode, next) -> return curly(atom, least, most, mode, next, i)
-                CharLoop(set, least, most, mode, next) -> return charLoop(set, least, most, mode, next, i)
-                GroupCurly(atom, least, most, mode, group, next) -> return groupCurly(atom, least, most, mode, group, next, i)
-                Prolog(entry) -> return ops(entry) match
-                    Loop(body, count, begin, least, most, lazy, memo, next) -> loopStart(body, count, least, most, lazy, next, i)
-                    _ -> false
+                Curly(atom, least, most, mode, next) ->
+                    if curly(pc, atom, least, most, mode, next, i)
+                        pc = nextPc
+                        i = nextAt
+                    else
+                        failed = true
+                CharLoop(set, least, most, mode, next) ->
+                    if charLoop(pc, set, least, most, mode, next, i)
+                        pc = nextPc
+                        i = nextAt
+                    else
+                        failed = true
+                GroupCurly(atom, least, most, mode, group, next) ->
+                    if groupCurly(pc, atom, least, most, mode, group, next, i)
+                        pc = nextPc
+                        i = nextAt
+                    else
+                        failed = true
+                Prolog(entry) ->
+                    if loopStart(entry, i)
+                        pc = nextPc
+                        i = nextAt
+                    else
+                        failed = true
                 Loop(body, count, begin, least, most, lazy, memo, next) ->
-                    // The end of a repetition of the body: another repetition, or the rest of the
-                    // pattern. A repetition that matched nothing ends the loop.
-                    if i > locals(begin)
-                        val n = locals(count)
-                        if n < least then return repeatBody(body, count, n, i)
-                        if lazy
-                            if run(next, i) then return true
-                            return n < most && repeatBody(body, count, n, i)
-                        if n < most
-                            if memo < 0
-                                if repeatBody(body, count, n, i) then return true
-                            elif !failedBefore(memo, i)
-                                if repeatBody(body, count, n, i) then return true
-                                markFailed(memo, i)
-                    pc = next
+                    loopEnd(pc, body, count, begin, least, most, lazy, memo, next, i)
+                    pc = nextPc
+                    i = nextAt
                 LookOp(kind, cond, least, most, next) ->
-                    if !look(kind, cond, least, most, i) then return false
-                    pc = next
+                    if look(kind, cond, least, most, i) then pc = next else failed = true
                 BackReferenceOp(group, caseless, unicode, next) ->
                     val size = backReference(group, caseless, unicode, i)
-                    if size < 0 then return false
-                    pc = next
-                    i += size
+                    if size < 0
+                        failed = true
+                    else
+                        pc = next
+                        i += size
 
-    // One more repetition of a loop's body, counted while it is tried.
-    private repeatBody(body: int, count: int, n: int, i: int) -> bool
-        locals(count) = n + 1
-        if run(body, i) then return true
-        locals(count) = n
-        false
+    // Pops frames down to `base`, putting back what each held, until one names a way still to try;
+    // answers whether one did, with where to go on in `nextPc` and `nextAt`.
+    private backtrack(base: int) -> bool
+        loop
+            if top <= base then return false
+            val kind = stack(top - 1)
+            if kind == UndoLocal
+                top -= 3
+                locals(stack(top)) = stack(top + 1)
+            elif kind == UndoGroup
+                top -= 4
+                val group = stack(top)
+                groups(group * 2) = stack(top + 1)
+                groups(group * 2 + 1) = stack(top + 2)
+            elif kind == Resume
+                top -= 3
+                return goOn(stack(top), stack(top + 1))
+            elif kind == BranchNext
+                val at = top - 4
+                val pc = stack(at)
+                val k = stack(at + 1)
+                val i = stack(at + 2)
+                val alternatives = ops(pc) match
+                    Branch(alternatives) -> alternatives
+                    _ -> Array.empty[int]()
+                if k + 1 < alternatives.length() then stack(at + 1) = k + 1 else top = at
+                return goOn(alternatives(k), i)
+            elif kind == CharBack
+                val at = top - 4
+                val next = stack(at)
+                val least = stack(at + 1)
+                val i = stack(at + 2)
+                if i > least then stack(at + 2) = i - 1 else top = at
+                return goOn(next, i)
+            elif kind == CurlyGive
+                val at = top - 6
+                val next = stack(at)
+                val i = stack(at + 1)
+                val j = stack(at + 2)
+                val k = stack(at + 3)
+                if j - 1 >= stack(at + 4)
+                    stack(at + 1) = i - k
+                    stack(at + 2) = j - 1
+                else
+                    top = at
+                return goOn(next, i)
+            elif kind == GroupCurlyGive
+                val at = top - 8
+                return ops(stack(at)) match
+                    GroupCurly(_, _, _, _, group, next) -> groupGiveBack(at, group, next)
+                    _ -> false
+            elif kind == LoopRepeatFail
+                top -= 4
+                val pc = stack(top)
+                val i = stack(top + 1)
+                ops(pc) match
+                    Loop(_, count, _, _, _, _, memo, next) ->
+                        locals(count) = stack(top + 2)
+                        if memo >= 0 then markFailed(memo, i)
+                        return goOn(next, i)
+                    _ -> ()
+            elif retry(kind)
+                return true
+            step()
 
-    private groupTail(local: int, group: int, next: int, i: int) -> bool
-        val savedStart = groups(group * 2)
-        val savedEnd = groups(group * 2 + 1)
-        groups(group * 2) = locals(local)
-        groups(group * 2 + 1) = i
-        if run(next, i) then return true
-        groups(group * 2) = savedStart
-        groups(group * 2 + 1) = savedEnd
-        false
+    // The frames that try a reluctant item once more, or a loop's first repetition: whether the way
+    // `kind` names can still go on, with where in `nextPc` and `nextAt`. Each is popped first, as
+    // trying the item again is a part matched on its own, run above the frames below.
+    private retry(kind: int) -> bool
+        if kind == QuesLazy
+            top -= 3
+            val pc = stack(top)
+            val i = stack(top + 1)
+            return ops(pc) match
+                Ques(atom, _, next) -> run(atom, i) && goOn(next, last)
+                _ -> false
+        if kind == CharLazy
+            top -= 4
+            val pc = stack(top)
+            val i = stack(top + 1)
+            val j = stack(top + 2)
+            return ops(pc) match
+                CharLoop(set, _, most, _, next) ->
+                    if j >= most || i >= to || !set.contains(text(i)) then return false
+                    push3(pc, i + 1, j + 1, CharLazy)
+                    goOn(next, i + 1)
+                _ -> false
+        if kind == CurlyLazy
+            top -= 4
+            val pc = stack(top)
+            val i = stack(top + 1)
+            val j = stack(top + 2)
+            return ops(pc) match
+                Curly(atom, _, most, _, next) ->
+                    if j >= most || !run(atom, i) || i == last then return false
+                    val end = last
+                    push3(pc, end, j + 1, CurlyLazy)
+                    goOn(next, end)
+                _ -> false
+        if kind == GroupCurlyLazy
+            top -= 4
+            val pc = stack(top)
+            val i = stack(top + 1)
+            val j = stack(top + 2)
+            return ops(pc) match
+                GroupCurly(atom, _, most, _, group, next) ->
+                    if j >= most || !run(atom, i) || i == last then return false
+                    val end = last
+                    if group >= 0 then setGroup(group, i, end)
+                    push3(pc, end, j + 1, GroupCurlyLazy)
+                    goOn(next, end)
+                _ -> false
+        if kind == LoopLazyStart
+            top -= 3
+            val pc = stack(top)
+            val i = stack(top + 1)
+            return ops(pc) match
+                Loop(body, count, _, _, most, _, _, _) ->
+                    if 0 >= most then return false
+                    locals(count) = 1
+                    goOn(body, i)
+                _ -> false
+        if kind == LoopLazyMore
+            top -= 4
+            val pc = stack(top)
+            val i = stack(top + 1)
+            val n = stack(top + 2)
+            return ops(pc) match
+                Loop(body, count, _, _, most, _, _, _) ->
+                    if n >= most then return false
+                    push2(count, n, UndoLocal)
+                    locals(count) = n + 1
+                    goOn(body, i)
+                _ -> false
+        fail("unknown backtrack frame")
+
+    // The `GroupCurlyGive` frame at `at` giving back: the try from where it stands, with the span
+    // before it, and the frame stepped back one repetition; once it has given back all its level
+    // took, the span the level started with and the frame gone.
+    private groupGiveBack(at: int, group: int, next: int) -> bool
+        val i = stack(at + 1)
+        val j = stack(at + 2)
+        val k = stack(at + 3)
+        if j > stack(at + 4)
+            if group >= 0 then setGroup(group, i - k, i)
+            stack(at + 1) = i - k
+            stack(at + 2) = j - 1
+        else
+            if group >= 0 then setGroup(group, stack(at + 5), stack(at + 6))
+            top = at
+        goOn(next, i)
+
+    // Whether `codes` are the characters at `i`.
+    private literalAt(codes: Array[int], i: int) -> bool
+        val n = codes.length()
+        if i + n > to then return false
+        var k = 0
+        while k < n
+            if text(i + k) != codes(k) then return false
+            k += 1
+        true
+
+    private setGroup(group: int, start: int, end: int)
+        groups(group * 2) = start
+        groups(group * 2 + 1) = end
 
     private anchor(kind: AnchorKind, i: int) -> bool = kind match
         Begin -> i == 0
@@ -255,20 +563,18 @@ private class Engine(val program: Program, val text: Array[int])
         val right = i < to && isWordAt(i, unicode)
         left != right
 
-    // `\R`: `\r\n`, or one of the vertical characters, giving back the `\n` of a `\r\n` if the rest
-    // fails.
-    private lineBreak(i: int, next: int) -> bool
-        if i >= to then return false
+    // How many characters `\R` takes at `i`, 0 where it does not match: `\r\n`, or one of the
+    // vertical characters.
+    private lineBreak(i: int) -> int
+        if i >= to then return 0
         val ch = text(i)
-        if ch == 10 || ch == 11 || ch == 12 || ch == 0x85 || ch == 0x2028 || ch == 0x2029 then return run(next, i + 1)
-        if ch == 13
-            if i + 1 < to && text(i + 1) == 10 && run(next, i + 2) then return true
-            return run(next, i + 1)
-        false
+        if ch == 10 || ch == 11 || ch == 12 || ch == 0x85 || ch == 0x2028 || ch == 0x2029 then return 1
+        if ch == 13 then return if i + 1 < to && text(i + 1) == 10 then 2 else 1
+        0
 
     // An item repeated; each repetition is the item's first match, and a greedy repetition gives back
     // one repetition at a time.
-    private curly(atom: int, least: int, most: int, mode: int, next: int, start: int) -> bool
+    private curly(pc: int, atom: int, least: int, most: int, mode: int, next: int, start: int) -> bool
         var i = start
         var j = 0
         while j < least
@@ -277,46 +583,46 @@ private class Engine(val program: Program, val text: Array[int])
             j += 1
         if mode == Greedy then return curlyGreedy(atom, most, next, i, j)
         if mode == Lazy
-            loop
-                if run(next, i) then return true
-                if j >= most then return false
-                if !run(atom, i) then return false
-                if i == last then return false
-                i = last
-                j += 1
+            push3(pc, i, j, CurlyLazy)
+            return goOn(next, i)
         while j < most
             if !run(atom, i) then break
             if i == last then break
             i = last
             j += 1
-        run(next, i)
+        goOn(next, i)
 
+    // A greedy repetition takes repetitions while they are all one length, `k`, which it can give
+    // back by stepping back; where a repetition's length differs, it goes on from there as a
+    // repetition of its own, giving back to here once that has given back all it took.
     private curlyGreedy(atom: int, most: int, next: int, start: int, count: int) -> bool
         var i = start
         var j = count
-        if j >= most then return run(next, i)
-        val backLimit = j
-        if run(atom, i)
+        loop
+            if j >= most then return goOn(next, i)
+            val backLimit = j
+            if !run(atom, i) then return goOn(next, i)
             val k = last - i
-            if k == 0 then return run(next, i)
+            if k == 0 then return goOn(next, i)
             i = last
             j += 1
+            var again = false
             while j < most
                 if !run(atom, i) then break
                 if i + k != last
-                    if curlyGreedy(atom, most, next, last, j + 1) then return true
+                    push5(next, i, j, k, backLimit, CurlyGive)
+                    i = last
+                    j += 1
+                    again = true
                     break
                 i += k
                 j += 1
-            while j >= backLimit
-                if run(next, i) then return true
-                i -= k
-                j -= 1
-            return false
-        run(next, i)
+            if !again
+                if j - 1 >= backLimit then push5(next, i - k, j - 1, k, backLimit, CurlyGive)
+                return goOn(next, i)
 
     // One character of a set repeated.
-    private charLoop(set: CharSet, least: int, most: int, mode: int, next: int, start: int) -> bool
+    private charLoop(pc: int, set: CharSet, least: int, most: int, mode: int, next: int, start: int) -> bool
         var i = start
         var j = 0
         while j < least
@@ -324,69 +630,58 @@ private class Engine(val program: Program, val text: Array[int])
             i += 1
             j += 1
         if mode == Lazy
-            loop
-                if run(next, i) then return true
-                if j >= most || i >= to || !set.contains(text(i)) then return false
-                i += 1
-                j += 1
+            push3(pc, i, j, CharLazy)
+            return goOn(next, i)
         while j < most && i < to && set.contains(text(i))
             i += 1
             j += 1
-        if mode == Possessive then return run(next, i)
-        while j >= least
-            if run(next, i) then return true
-            i -= 1
-            j -= 1
-        false
+        if mode == Possessive then return goOn(next, i)
+        val lowest = i - (j - least)
+        if i > lowest then push3(next, lowest, i - 1, CharBack)
+        goOn(next, i)
 
-    // A group whose body has one length, repeated, its span recorded at each repetition.
-    private groupCurly(atom: int, least: int, most: int, mode: int, group: int, next: int, start: int) -> bool
+    // A group whose body has one length, repeated, its span recorded at each repetition; a failure
+    // puts back the span it had before.
+    private groupCurly(pc: int, atom: int, least: int, most: int, mode: int, group: int, next: int, start: int) -> bool
         val capture = group >= 0
-        var savedStart = 0
-        var savedEnd = 0
-        if capture
-            savedStart = groups(group * 2)
-            savedEnd = groups(group * 2 + 1)
+        if capture then push3(group, groups(group * 2), groups(group * 2 + 1), UndoGroup)
         var i = start
-        var matched = true
         var j = 0
         while j < least
-            if run(atom, i)
-                if capture then setGroup(group, i, last)
-                i = last
-            else
-                matched = false
-                break
+            if !run(atom, i) then return false
+            if capture then setGroup(group, i, last)
+            i = last
             j += 1
-        if matched
-            if mode == Greedy then matched = groupCurlyGreedy(atom, most, group, next, i, least)
-            elif mode == Lazy then matched = groupCurlyLazy(atom, most, group, next, i, least)
-            else matched = groupCurlyPossessive(atom, most, group, next, i, least)
-        if !matched && capture then setGroup(group, savedStart, savedEnd)
-        matched
+        if mode == Greedy then return groupCurlyGreedy(pc, atom, most, group, next, i, least)
+        if mode == Lazy
+            push3(pc, i, least, GroupCurlyLazy)
+            return goOn(next, i)
+        while j < most
+            if !run(atom, i) then break
+            if capture then setGroup(group, i, last)
+            if i == last then break
+            i = last
+            j += 1
+        goOn(next, i)
 
-    private setGroup(group: int, start: int, end: int)
-        groups(group * 2) = start
-        groups(group * 2 + 1) = end
-
-    private groupCurlyGreedy(atom: int, most: int, group: int, next: int, start: int, count: int) -> bool
+    // As `curlyGreedy`, recording the group's span: each repetition given back leaves the one before
+    // it as the span, and giving back every repetition this level took puts back the span the level
+    // started with.
+    private groupCurlyGreedy(pc: int, atom: int, most: int, group: int, next: int, start: int, count: int) -> bool
         val capture = group >= 0
         var i = start
         var j = count
-        val backLimit = j
-        var savedStart = 0
-        var savedEnd = 0
-        if capture
-            savedStart = groups(group * 2)
-            savedEnd = groups(group * 2 + 1)
         loop
-            if j >= most then break
-            if !run(atom, i) then break
+            val backLimit = j
+            val savedStart = if capture then groups(group * 2) else 0
+            val savedEnd = if capture then groups(group * 2 + 1) else 0
+            if j >= most || !run(atom, i) then return goOn(next, i)
             val k = last - i
             if k <= 0
-                if capture then setGroup(group, i, i + k)
                 i = i + k
-                break
+                if capture then setGroup(group, savedStart, savedEnd)
+                return goOn(next, i)
+            var again = false
             loop
                 if capture then setGroup(group, i, i + k)
                 i = i + k
@@ -394,66 +689,49 @@ private class Engine(val program: Program, val text: Array[int])
                 if j >= most then break
                 if !run(atom, i) then break
                 if i + k != last
-                    if groupCurlyGreedy(atom, most, group, next, i, j) then return true
+                    again = true
                     break
-            while j > backLimit
-                if run(next, i) then return true
-                i = i - k
-                if capture then setGroup(group, i - k, i)
-                j -= 1
-            break
-        if capture then setGroup(group, savedStart, savedEnd)
-        run(next, i)
+            push7(pc, i, j, k, backLimit, savedStart, savedEnd, GroupCurlyGive)
+            if !again then return false
 
-    private groupCurlyLazy(atom: int, most: int, group: int, next: int, start: int, count: int) -> bool
-        var i = start
-        var j = count
-        loop
-            if run(next, i) then return true
-            if j >= most then return false
-            if !run(atom, i) then return false
-            if i == last then return false
-            if group >= 0 then setGroup(group, i, last)
-            i = last
-            j += 1
-
-    private groupCurlyPossessive(atom: int, most: int, group: int, next: int, start: int, count: int) -> bool
-        var i = start
-        var j = count
-        while j < most
-            if !run(atom, i) then break
-            if group >= 0 then setGroup(group, i, last)
-            if i == last then break
-            i = last
-            j += 1
-        run(next, i)
-
-    // The first repetition of a `Loop`, from its `Prolog`; the count is restored afterwards so an
-    // enclosing repetition of the same loop finds its own.
-    private loopStart(body: int, count: int, least: int, most: int, lazy: bool, next: int, i: int) -> bool
-        val saved = locals(count)
-        var matched = false
-        if lazy
+    // The first repetition of a `Loop`, from its `Prolog`; the count is put back when it fails, so
+    // an enclosing repetition of the same loop finds its own.
+    private loopStart(entry: int, i: int) -> bool = ops(entry) match
+        Loop(body, count, _, least, most, lazy, _, next) ->
+            push2(count, locals(count), UndoLocal)
             if 0 < least
                 locals(count) = 1
-                matched = run(body, i)
-            elif run(next, i)
-                matched = true
-            elif 0 < most
+                return goOn(body, i)
+            if lazy
+                push2(entry, i, LoopLazyStart)
+                return goOn(next, i)
+            if 0 < most
                 locals(count) = 1
-                matched = run(body, i)
-        else
-            if 0 < least
-                locals(count) = 1
-                matched = run(body, i)
-            elif 0 < most
-                locals(count) = 1
-                matched = run(body, i)
-                if !matched then matched = run(next, i)
-            else
-                matched = run(next, i)
-        locals(count) = saved
-        matched
+                push2(next, i, Resume)
+                return goOn(body, i)
+            goOn(next, i)
+        _ -> false
+
+    // The end of a repetition of a loop's body: another repetition, or the rest of the pattern. A
+    // repetition that matched nothing ends the loop.
+    private loopEnd(pc: int, body: int, count: int, begin: int, least: int, most: int, lazy: bool, memo: int, next: int, i: int)
+        if i > locals(begin)
+            val n = locals(count)
+            if n < least
+                push2(count, n, UndoLocal)
+                locals(count) = n + 1
+                goOn(body, i)
+                return
+            if lazy
+                push3(pc, i, n, LoopLazyMore)
+                goOn(next, i)
+                return
+            if n < most && (memo < 0 || !failedBefore(memo, i))
+                push3(pc, i, n, LoopRepeatFail)
+                locals(count) = n + 1
+                goOn(body, i)
+                return
+        goOn(next, i)
 
     // A lookaround at `i`. A lookbehind tries its body from each start its lengths allow, nearest
     // first, and the body must end at `i`.

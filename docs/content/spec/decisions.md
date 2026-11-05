@@ -1909,6 +1909,34 @@ their words are reserved.
   other conversions. Why: the chapter promised it for every value and only strings honoured it; cut
   once, no renderer can get it wrong. Alternative: every renderer reading the precision, which each
   collection and data type would have to implement.
+- Settled on the user's delegation 2026-11-05 (built on branch `regex-hardening`): [`avin.regex`'s
+  limits on matching](/spec/regex/#matching), backtracking with leftmost-first results kept:
+  - **The matcher keeps its own backtrack stack**, an array of frames, so a repeated group over a
+    long input takes no deeper a call stack however many repetitions it makes; only a part matched
+    on its own (a repetition's item matched one way, an atomic group, a lookaround's body) takes a
+    call, so the call depth follows the pattern's nesting, never the input. Alternative: a
+    linear-time engine — rejected by the request, as back references, lookarounds and
+    leftmost-first captures need backtracking.
+  - **Each attempt at a start has a step budget, and spending it traps**, the message naming the
+    pattern and the input's length and saying to make a repetition possessive or atomic. A step is
+    an operation run or a backtrack frame popped; the budget is 1000 for each character of the
+    input (plus one) times each operation of the program, never fewer than 10,000,000, about a
+    tenth of a second of steps and far beyond what a pattern that backtracks only as far as its
+    input asks takes. The budget is per attempt, not per search, so a search is never stopped for
+    the number of starts it tries. Alternatives: answering a `Result` from every search — rejected,
+    as it would make every `findFirstIn` and `matches` a fallible call for what is a defect of the
+    pattern, which the trap's message says how to fix; no limit (the earlier behaviour) — rejected,
+    as one bad pattern hangs its program.
+  - **`withStepLimit(n)` sets an attempt's budget** (`n` above 0, or it traps), for a program that
+    wants a tighter bound on untrusted text or a looser one for a pattern known to be slow; the
+    trap's message then gives the limit. Alternative: a global setting — rejected, as the budget
+    belongs to the pattern.
+  - Review with the user: whether a search should also have a non-trapping form for untrusted
+    patterns (a `Result`-answering `tryFindFirstIn`, say), and whether the default budget's
+    constants are the right ones. A greedy, unbounded repetition of a group in a pattern without a
+    back reference already remembers where a further repetition failed, so the textbook
+    `(a+)+$`, `(a|a)*b` and `(a|aa)+$` finish in polynomial time and do not trap; their reluctant,
+    bounded and back-referencing forms are the ones that do.
 - Settled on the user's delegation 2026-11-05: **[Guaranteed tail calls](/spec/declarations/#tail-calls)**
   (branch `tailcalls`). Every call in tail position of a function of the program, by name, through
   a method table or of a function value, replaces the caller's stack frame, at `-O0` as at `-O2`,
@@ -2039,16 +2067,14 @@ their words are reserved.
   part". Rationale: a tuple's run-time type is one type, fixed when it is made, so the test agrees
   with the static type it was made at. Alternative weighed: testing part by part, which would make a
   tuple's run-time type depend on what it holds rather than on how it was made.
+- Settled on the user's delegation 2026-11-05 (built on branch `option-ord`): [`Option[T]` is an
+  `Ord` when `T` is](/spec/errors/#option-and-result), `None` before every `Some` and `Some`s as their
+  values, following the reference library's ordering of options. It makes `derives Ord` work on a
+  data type with an `Option` field and lets options sort and have `max`/`min`. Alternative: no order
+  on options, leaving a field of one underivable — rejected as the cost falls on every record with
+  an optional field. Tuples, `Either` and `Result` have no `Ord` here.
 
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- Proposed on branch `sysl-callbacks` 2026-11-05: [passing Avin functions to
+- Settled on the user's delegation 2026-11-05 (built on branch `sysl-callbacks`): [passing Avin functions to
   Sysl](/spec/sysl-bindings/#callbacks), the choices the request left open:
   - **The closure's lifetime is Sysl's**: the shim's closure captures a counted Sysl value with a
     destructor that holds a root of the collector, so the root is given back when Sysl drops its
@@ -2097,7 +2123,59 @@ their words are reserved.
     function pointer (ties the shim to Avin's internal convention for `bool`).
   - The runtime offers `avin.rt.callbacks_held`, the number of functions Sysl holds, for tests and
     for libraries that want to check they release what they register.
-- **A member call on the name of a data type whose variant of its own name has no fields**
+- Settled on the user's delegation 2026-11-05 (built on branch `sendable-spawn`): **`Sendable` where values cross threads
+  today** ([what is shared](/spec/threads/#what-is-shared)). The actors chapter's build order has no
+  step for it; it applies the rule of `isolate`'s body, less the whole-program half, to threads and
+  futures. Review with the user: it adds two annotations users can write.
+  - The check is two marks on a parameter, `@sendable` and `@isolated`, which any function may
+    write. What is passed for `@isolated` may use only sendable values from around it: a lambda, a
+    by-name argument, a local function or a method value by what it captures (its nested closures
+    and the local functions it calls included), any other expression by the locals and parameters it
+    reads; what it makes itself is its own. `@sendable` adds that a closure captures no `var`, whose
+    box it would share with the code that made it. A marked parameter holding a function may be
+    passed on for one with the same mark or a weaker one; an override may not add a mark or
+    strengthen one. *Why*: the library's thread entries are ordinary Avin functions, so a user's
+    wrapper of `spawn` needs the same spelling the library uses, and a mark on the parameter checks
+    every call where the closure is written and its captures are known. *Alternatives*: a list of
+    library functions known to the compiler (no user wrapper could pass a body on); a function type
+    that says it is sendable (`() -> T` that is `Sendable`), which would also let a sendable function
+    be stored and sent, but makes function types carry a flag through unification and subtyping
+    (the open question on function values below stays open); no check, leaving the data race the
+    memory model already makes harmless (the user's direction is that threads share nothing mutable
+    by default).
+  - The bodies of `spawn`, `s.spawn`, `Future(body)` and `ex.future(body)`, the functions of a
+    future's `map`, `flatMap` and `onComplete`, and `orElse`'s by-name argument are `@sendable`.
+    Their results are bounded by `Sendable`, as are `Future.successful`'s value, a `Promise`'s and
+    the results of `mapOk` and `mapErr`, so every future's value is sendable however it was made.
+    *Alternative*: bounding `Future[T]` itself, which would make every generic function naming a
+    future repeat the bound.
+  - A `Mutex` is sendable of any value, so its value is `@isolated` where it is made (a buffer the
+    caller keeps cannot be guarded), `with` is `with[R: Sendable](@isolated body: (T) -> R) -> R`
+    (the value cannot be returned or stored outside), and `get`, `set` and `update` exist only for a
+    sendable value. A `with` body may assign the caller's `var`s of sendable types, since it runs at
+    once on the calling thread. *Why*: without it, `Mutex(b)` or `m.with(v -> v)` hands the guarded
+    buffer to code that changes it without the lock, which is the shared mutable state the mutex is
+    the one door to. *Alternatives*: `Mutex` of any value unchecked, as written before; checking only
+    `with`'s result. The cost: a body cannot give back a fresh mutable value (`nextBytes` on the
+    shared random generator copies through a vector), and a generic body over an unbounded `T`
+    cannot take its argument in (the shared generator's `shuffle`, `choose` and `chooseWeighted`
+    now draw under the lock and pick outside it, with the same draws). Review with the user.
+  - The standard library promises `Sendable` for `Thread[T]` of a sendable `T`, `Executor`, a
+    mutex's `Condition`, and `TcpStream` and `TcpListener`, which hold a Sysl handle and are handed
+    over with it. A `Scope` is not sendable, so the trap on starting a scope's thread from another
+    thread is reached only through module-level state.
+  - Tests that shared mutable data across threads were changed to share it safely: a scope's
+    threads write `Atomic` slots rather than an array; a flag and a once-initialized value became
+    `Atomic`s; a vector built in a `var` is copied into a `val`; a test's own byte array is made by
+    each thread; a trait sent through futures promises `Sendable`; the run test of the scope trap
+    became a rejection test; a test's `Once` counter became an `Atomic`; a test helper passing a
+    function to its threads marks it `@sendable`.
+  - `Command.lines()` on a command holding a sequence starts the command on its driver thread, so
+    the mutable job belongs to that thread alone, and learns through a promise whether it started;
+    before, the job was made on the calling thread and handed to the driver. A started `Child` and
+    a lines iterator are mutable and not sendable; a thread starts and reads its own commands.
+    Moving one would need `Isolated` or a promise like `TcpStream`'s.
+- Settled on the user's delegation 2026-11-05 (built on branch `fix-lone-value`): **A member call on the name of a data type whose variant of its own name has no fields**
   (`Lone.m(…)` with `data Lone()`; branch `fix-lone-value`). The name is both the type and a value
   of it. Proposed: where the type has a static member named `m`, the call is the type's and chooses
   among its static members alone; otherwise it is the value's method, its trait methods and
@@ -2111,6 +2189,30 @@ their words are reserved.
   static member and a value method of one name on such a type (an extra rule for a rare case). The
   companion object needs no rule: it cannot share the name of a fieldless variant
   ([declarations](/spec/declarations/#object)).
+- Settled on the user's delegation 2026-11-05 (built on branch `option-ord-fix`): the [polymorphic recursion](/spec/generics/#polymorphic-recursion)
+  check counts a cycle through a method an impl with bounds of its own adds only along the paths
+  whose type argument's outermost type may meet the bounds, that type's own arguments taken as any
+  type; a type argument whose outermost type the check does not know (a tuple, a function, a part
+  taken apart from a larger type) counts as one that may. Why: the check must never miss a real
+  cycle, and the outermost type is what the flow already tracks per path; `impl[T: Ord] Ord for
+  Option[T]` otherwise made every program loading the threads library fail. Alternatives weighed:
+  connecting the impl's methods from the parameter as a whole (what it did: false cycles through
+  types that never meet the bounds); tracking type arguments deeper than the outermost type (exact
+  for nested shapes such as a `Box[Box[Plain[T]]]`, which is still counted, at the cost of a much
+  larger flow graph). Review with the user if a nested shape turns up in real code.
+- Settled on the user's delegation 2026-11-05 (built on branch `option-ord-fix`): an ordering, `<`, `<=`, `>`, `>=`, settles an unknown in one
+  operand's type from the other's, so `Some(1) < None` compares two `Option[int]`s, as `==` already
+  did. Why: the two operands of an ordering are one type, so the other operand is the only evidence
+  and the obvious one. Alternative: requiring `None[int]`, which `==` does not.
+
+**Deferred**
+
+- Public C interoperability. Until then, C is reached through Sysl.
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
 - **Qualified variant access, `Type.Variant`** (branch `qualified-variants`, 2026-11-05). Proposed:
   `T.V` and `m.T.V` name data type `T`'s variant `V`, beside the bare `V`, in expressions and
   patterns; the variant comes before any other member of that name, and a companion object
@@ -2148,4 +2250,11 @@ their words are reserved.
 
 - Resource cleanup: a `defer` construct or a library `use`.
 - Whether a function value can ever be sent between actors, with a type that says what it captures.
+- Module-level mutable state reached by a thread's body: a `var`, or a value or `object` that is not
+  sendable, is shared by every thread, and nothing yet checks a body against it. `isolate`'s
+  whole-program check would; applied to threads it would reject every body that prints, unless
+  standard output is a synchronized object the library promises sendable.
+- A `TcpStream` handed to another thread keeps the bytes it read ahead in Avin fields; the code that
+  handed it over traps when it next uses the socket, but a read served from those bytes alone does
+  not reach the socket's owner check.
 - Whether mailboxes may be bounded, and what a `tell` to a full one does, since `tell` never waits.

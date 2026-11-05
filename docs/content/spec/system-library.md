@@ -484,6 +484,10 @@ main() -> int
 
 ### TCP
 
+A connection and a listener are [sendable](/spec/actors/#what-may-be-sent): each holds a Sysl
+handle, so a thread or an actor given one takes it over, and the code that gave it traps where it
+uses it again.
+
 | Function | Meaning |
 | --- | --- |
 | `TcpStream.connect(host: string, port: int) -> Result[TcpStream, IoError]` | A connection to the first of the host's addresses that answers; where none does, the last one's error. |
