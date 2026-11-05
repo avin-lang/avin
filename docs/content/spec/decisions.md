@@ -1502,24 +1502,16 @@ Settled by the user on 2026-11-04:
   collector frees it. A handle crosses back into Sysl only as the receiver of its own methods,
   compares by identity, and has no `Display`.
 
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- **Text blocks under an interpolator that reads no escapes** ([text
+- Settled by the user 2026-11-04: **Text blocks under an interpolator that reads no escapes** ([text
   blocks](/spec/strings-and-formatting/#text-blocks)). The parts `raw"""…"""` and a program's own
   interpolators are given have the block's indentation and trailing blanks dropped but no escape
   read, and since joining a line with `\` is an escape, no line joined: the `\` and the line break
   after it reach the interpolator as written. `s` and `f` join lines in the lexer. A backslash
   directly before a quote or a backslash is taken with it under every prefix, so `\"""` does not end
   a `raw"""` block and `\\"""` does, as `raw"…"` does not end at `\"` and does at `\\"`.
-- **A block's first `"""` closes it** ([text blocks](/spec/strings-and-formatting/#text-blocks)),
+- Settled by the user 2026-11-04: **A block's first `"""` closes it** ([text blocks](/spec/strings-and-formatting/#text-blocks)),
   so `""""` is the end of the block and a stray quote; a block ending in a quote writes it `\"`.
-- **`avin.random`'s details** ([system library](/spec/system-library/#avin-random)), where the
+- Settled by the user 2026-11-04: **`avin.random`'s details** ([system library](/spec/system-library/#avin-random)), where the
   chapter left them open, so that a seed's numbers are fixed:
   - Every generator uses PCG32's stream 54 (increment 109), the reference implementation's
     demonstration stream, so `Random(42).nextInt()` gives its published first output, `0xa15c02b7`
@@ -1534,7 +1526,7 @@ Settled by the user on 2026-11-04:
   - `nextGaussian` is the polar method, keeping the second value of each pair for the next call;
     `setSeed` drops it. `nextBytes` takes four bytes from each draw, lowest first; a negative count
     traps. `alphanumeric` draws `nextInt(62)` per character, digits, then upper, then lower case.
-- [`avin.regex`](/spec/regex/#unicode-properties): `\b{g}` decides a boundary by the grapheme
+- Settled by the user 2026-11-04: [`avin.regex`](/spec/regex/#unicode-properties): `\b{g}` decides a boundary by the grapheme
   cluster rules over the whole text before it, so it is never inside a cluster: not between the
   two regional indicators of a flag, nor inside an emoji joined by a zero width joiner or an Indic
   conjunct. `\X` matches the cluster starting where it stands, one way only, and has no bounded
@@ -1542,6 +1534,16 @@ Settled by the user on 2026-11-04:
   `PropertyValueAliases.txt`, ignoring case, and only the scripts `Scripts.txt` lists, with
   `Unknown`, exist; a block by its name in `Blocks.txt`, that name without spaces, or any of its
   names in `PropertyValueAliases.txt`, short ones included, ignoring case.
+
+**Deferred**
+
+- Public C interoperability. Until then, C is reached through Sysl.
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
