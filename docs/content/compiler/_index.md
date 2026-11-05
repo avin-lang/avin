@@ -166,9 +166,10 @@ binding is **not** a shim: it is a direct call from the program's own code.
   package's `c-libraries` names, and emits per binding a `_Static_assert` that
   `__builtin_types_compatible_p(__typeof__(&symbol), <the prototype's function pointer type>)`; per
   typedef in an integer position, its size and sign; per mirror, size, alignment and offsets; per
-  enumerator and constant, its value. Measurements are stored in one `const` table whose symbol the
-  driver reads from the object file's data, so nothing is run and a build for another target
-  measures that target. The same file defines the glue: a function per field accessor, expression
+  enumerator and constant, its value. Measurements are stored in one `const` table of bytes after a
+  marker, which the driver finds in the object file's data, so nothing is run, no object format is
+  parsed, and a build for another target measures that target. `pkg-config` is asked through the
+  toolchain's `pkg_config`, which a build for another target points at that target's. The same file defines the glue: a function per field accessor, expression
   `retain`/`release`/`forget`/`as`, buffer `length`, and per binding or callback that passes a struct
   by value (taking and answering it through pointers, so clang does the platform's aggregate
   classification). A clang diagnostic is placed back at the binding by the line the driver recorded

@@ -78,6 +78,21 @@ struct Manifest
     workspace: Buf[string]
     /** The features the package declares. */
     features: Buf[Feature]
+    /** The C libraries the package's C bindings call, in the order its `c-libraries` block lists
+     * them. */
+    c_libraries: Buf[CLibrary]
+
+/** A C library a package's manifest names under `c-libraries`: its name there; the `pkg-config`
+ * module that finds it, or the libraries `link` names directly; the headers the package's bindings
+ * are checked against, as written; and what a build that cannot find it says to do. `package` is the
+ * name of the package whose manifest names it. */
+struct CLibrary
+    package: string
+    label: string
+    pkg_config: Option[string]
+    link: Buf[string]
+    headers: Buf[string]
+    install: string
 
 /** The file that makes a directory a Sysl package. */
 const SyslManifestName: string = "sysl.hocon"
@@ -88,7 +103,7 @@ read_manifest(dir: string) -> Result[Manifest, string]
     val text = read_text(file).map_err(e -> s"avin: $file: ${e.to_string()}")?
     val src = source_of(file, text)
     val doc = parse_hocon(src).map_err(d -> d.render(src))?
-    var m = Manifest(dir, src, false, "", "", "", buf(), buf(), false, buf(), buf())
+    var m = Manifest(dir, src, false, "", "", "", buf(), buf(), false, buf(), buf(), buf())
     read_fields(&m, doc.root).map_err(d -> d.render(src))?
     Ok(m)
 
@@ -96,6 +111,7 @@ private read_fields(m: *Manifest, root: Value) -> Result[unit, Diagnostic]
     var dependencies = Span(0, 0)
     var sysl_dependencies = Span(0, 0)
     var features = Span(0, 0)
+    var c_libraries = Span(0, 0)
     for f in root.fields()
         if f.key == "package"
             m.has_package = true
@@ -106,19 +122,26 @@ private read_fields(m: *Manifest, root: Value) -> Result[unit, Diagnostic]
         elif f.key == "sysl-dependencies"
             sysl_dependencies = f.key_span
             read_dependencies(f, true, &m.sysl_dependencies)?
+        elif f.key == "c-libraries"
+            c_libraries = f.key_span
+            read_c_libraries(f, &m.c_libraries)?
         elif f.key == "workspace"
             read_workspace(m, f)?
         elif f.key == "features"
             features = f.key_span
             read_features(f, &m.features)?
         else
-            return Err(error(f.key_span, s"`${f.key}` is not a key of $ManifestName, which holds `package`, `dependencies`, `sysl-dependencies`, `features` and `workspace`"))
+            return Err(error(f.key_span, s"`${f.key}` is not a key of $ManifestName, which holds `package`, `dependencies`, `sysl-dependencies`, `c-libraries`, `features` and `workspace`"))
     if !m.has_package && !m.has_workspace
         return Err(error(Span(0, 0), s"$ManifestName has no `package` block: a package is named and versioned, `package { name = \"geom\", version = \"0.1.0\" }`"))
     if !m.has_package && m.dependencies.len() > 0
         return Err(error(dependencies, "a workspace with no `package` block compiles nothing of its own, so its dependencies would reach nothing: name each in the member that imports it"))
     if !m.has_package && m.sysl_dependencies.len() > 0
         return Err(error(sysl_dependencies, "a workspace with no `package` block compiles nothing of its own, so its Sysl dependencies would reach nothing: name each in the member whose bindings reach it"))
+    if !m.has_package && m.c_libraries.len() > 0
+        return Err(error(c_libraries, "a workspace with no `package` block compiles nothing of its own, so it has no C bindings to call its C libraries: name each in the member whose bindings call it"))
+    for i in 0..<m.c_libraries.len()
+        m.c_libraries[i].package = m.name
     if !m.has_package && m.features.len() > 0
         return Err(error(features, "a workspace with no `package` block compiles nothing of its own, so it has no features: declare each in the member it belongs to"))
     check_features(m.dir, m.features, m.dependencies)?
@@ -248,6 +271,45 @@ private read_dependencies(f: Field, sysl: bool, into: *Buf[Dependency]) -> Resul
         if local is Some(p) then into.push(Dependency(d.key, Local(p), d.key_span, optional, default_features, features, without))
         else into.push(Dependency(d.key, Member, d.key_span, optional, default_features, features, without))
     Ok(())
+
+// The C libraries a `c-libraries` block names: each a block with `pkg-config` or `link`, or neither
+// for the C library itself, `headers` and `install`.
+private read_c_libraries(f: Field, into: *Buf[CLibrary]) -> Result[unit, Diagnostic]
+    if !f.value.is_obj() then return Err(error(f.value.span, "`c-libraries` is a block naming each C library, `zlib { pkg-config = \"zlib\", headers = [\"zlib.h\"] }`"))
+    for d in f.value.fields()
+        if !valid_package_name(d.key) then return Err(error(d.key_span, s"`${d.key}` is not a C library's name: ${PackageNameRule}"))
+        if !d.value.is_obj() then return Err(error(d.value.span, s"the C library `${d.key}` is a block saying how to find it and which headers declare it: `{ pkg-config = \"zlib\", headers = [\"zlib.h\"] }`"))
+        var library = CLibrary("", d.key, None, buf(), buf(), "")
+        var linked = false
+        for g in d.value.fields()
+            if g.key == "pkg-config"
+                val module_name = text_of(g)?
+                if module_name == "" || module_name.contains(" ") then return Err(error(g.value.span, "`pkg-config` names one module, as `pkg-config --list-all` lists it"))
+                library.pkg_config = Some(module_name)
+            elif g.key == "link"
+                linked = true
+                library.link = word_list(g, "`link` is a list of the libraries passed to the linker, each as `-l` would name it, `link = [\"z\"]`")?
+            elif g.key == "headers"
+                library.headers = word_list(g, "`headers` is a list of the headers the bindings are checked against, `headers = [\"zlib.h\"]` or `[\"<stdlib.h>\"]`")?
+            elif g.key == "install"
+                library.install = text_of(g)?
+            else return Err(error(g.key_span, s"`${g.key}` is not a key of a C library, which holds `pkg-config` or `link`, `headers` and `install`"))
+        if library.pkg_config is Some(_) && linked
+            return Err(error(d.key_span, s"the C library `${d.key}` names both `pkg-config` and `link`: `pkg-config` answers the flags it links with, so it is one or the other"))
+        into.push(library)
+    Ok(())
+
+// A list of strings none of which is empty or holds a space, or `wrong` at the list.
+private word_list(f: Field, wrong: string) -> Result[Buf[string], Diagnostic]
+    if !f.value.is_arr() then return Err(error(f.value.span, wrong))
+    var out: Buf[string] = buf()
+    for v in f.value.items()
+        val word = v.as_text() match
+            Some(t) -> t
+            None -> return Err(error(v.span, wrong))
+        if word == "" || word.contains(" ") then return Err(error(v.span, wrong))
+        out.push(word)
+    Ok(out)
 
 private read_workspace(m: *Manifest, f: Field) -> Result[unit, Diagnostic]
     val wrong = error(f.value.span, "`workspace` is a list of the members' directories, each relative to this file, `workspace = [\"app\", \"libs/*\"]`")
@@ -1323,6 +1385,8 @@ struct LoadedProgram
     package: Option[string]
     /** The Sysl packages its bindings may reach beyond Sysl's standard library. */
     sysl: Buf[SyslPackage]
+    /** The C libraries of every package in it, which its C bindings call. */
+    c: Buf[CLibrary]
 
 /** A Sysl package a program's bindings may reach: its name in the shim package's manifest, and where
  * it comes from, a directory made absolute. */
@@ -1392,9 +1456,9 @@ load_program_with(path: string, fetching: Fetching, choice: FeatureChoice) -> Re
     if is_dir(path)
         val files = program_files(path).map_err(message -> "avin: " + message)?
         if files.len() == 0 then return Err(s"avin: $path: no `.avin` or `.lavin` files in the program")
-        return Ok(LoadedProgram(path, files, None, buf()))
+        return Ok(LoadedProgram(path, files, None, buf(), buf()))
     val text = read_text(path).map_err(e -> s"avin: $path: ${e.to_string()}")?
-    Ok(LoadedProgram(path, single_file(source_of(path, text)), None, buf()))
+    Ok(LoadedProgram(path, single_file(source_of(path, text)), None, buf(), buf()))
 
 /** The package at `root` with every package it depends on: each dependency's modules first, then the
  * package's own files. The sum file gains a line for any package fetched for the first time. A module
@@ -1435,6 +1499,7 @@ load_package_with(root: string, fetching: Fetching, choice: FeatureChoice) -> Re
         for f in each[i]
             var file = f
             file.fences = fences_of(p.manifest.features, f.module_name.unwrap_or(""), p.optional, optional_modules)
+            file.package = p.name
             files.push(file)
             owners.push(p.name)
     var modules: Buf[string] = buf()
@@ -1450,7 +1515,12 @@ load_package_with(root: string, fetching: Fetching, choice: FeatureChoice) -> Re
                 modules.push(module_name)
                 holders.push(owners[i])
     val sysl = sysl_packages(res)?
-    Ok(LoadedProgram(root, files, Some(res.packages[0].name), sysl))
+    // Every package's C libraries, the package's own first, are the program's.
+    var c: Buf[CLibrary] = buf()
+    for p in res.packages
+        for library in p.manifest.c_libraries
+            c.push(library)
+    Ok(LoadedProgram(root, files, Some(res.packages[0].name), sysl, c))
 
 /** The files of the program tree at `root` as `program_files` finds them, or, when `root` holds a
  * manifest, of the package with every feature on and its dependencies without fetching any: what the

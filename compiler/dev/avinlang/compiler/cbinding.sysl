@@ -1,0 +1,339 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.Map
+
+// C bindings. A function declared `@c("<prototype>")` without a body is bound to the C function the
+// prototype names: the prototype is C's declaration as the library's header writes it, and its
+// parameters correspond to the Avin parameters by position. This file reads a prototype into a C
+// signature and holds it against the Avin signature, which the checker does at the binding; lowering
+// reads it again to convert each argument and the result, at the widths the C unit measured (see
+// `cunit.sysl`).
+
+/** A C type as a binding's prototype spells it. */
+enum CType
+    /** An integer type spelled with C's keywords, in one spelling per type (`unsigned long` for
+     * `long unsigned int`), or an enumeration, `enum name`. */
+    CKeyword(name: string)
+    /** A typedef's name. What kind of type it is the header says, so the C unit checks it is the
+     * kind the Avin type asks for. */
+    CTypedef(name: string)
+    CBoolType
+    CDoubleType
+    CFloatType
+    CVoidType
+    CPointerType
+    /** A struct or union by value, `struct name`. */
+    CRecordType(name: string)
+
+/** A parameter of a prototype: its type, and the type as C spells it without the parameter's name,
+ * which the header check compares. */
+struct CParam
+    ty: CType
+    text: string
+
+/** A prototype read: the C function's symbol, its result and its parameters. */
+struct CPrototype
+    symbol: string
+    result: CType
+    result_text: string
+    params: Buf[CParam]
+
+/** What a C unit measured of an integer type, or of a typedef in a `real` position: its width in
+ * bits, and whether it is signed. */
+struct CMeasure
+    bits: u32
+    signed: bool
+
+/** The prototype a function's `@c` gives, when it has one written as one string. */
+c_prototype_text(f: &Function) -> Option[string]
+    for a in f.annotations
+        if a.name == "c" && a.args.len() >= 1 && a.args[0].name is None
+            if a.args[0].value.kind is StringLit(text) then return Some(text)
+    None
+
+/** The prototype of a C binding, read; `None` for a function that is not one, or whose prototype the
+ * checker has refused. */
+c_prototype_of(f: &Function) -> Option[CPrototype] = c_prototype_text(f) match
+    Some(text) -> parse_prototype(text) match
+        Ok(p) -> Some(p)
+        Err(_) -> None
+    None -> None
+
+/** Reads a prototype: a result type, the function's name, and its parameters in parentheses, each a
+ * type with an optional name; `(void)` and `()` both take none. What cannot cross a C binding at all
+ * is refused here, saying why. */
+parse_prototype(text: string) -> Result[CPrototype, string]
+    val tokens = c_tokens(text)?
+    var at = 0usize
+    val declared = c_declaration(tokens, &at)?
+    val symbol = declared.name match
+        Some(n) -> n
+        None -> return Err("it names no function: a prototype is a result type, the function's name and its parameters, as in `int abs(int)`")
+    if at >= tokens.len() || tokens[at] != "("
+        return Err(s"`$symbol` is not followed by its parameters in parentheses")
+    at += 1
+    var params: Buf[CParam] = buf()
+    if at + 1 < tokens.len() && tokens[at] == "void" && tokens[at + 1] == ")"
+        at += 1
+    elif at < tokens.len() && tokens[at] != ")"
+        loop
+            if at < tokens.len() && tokens[at] == "..."
+                return Err("a variadic function cannot be bound: the types of the arguments `...` takes cannot be checked")
+            val p = c_declaration(tokens, &at)?
+            if at < tokens.len() && tokens[at] == "("
+                return Err("a parameter taking a function cannot cross a C binding: callbacks are not implemented")
+            if p.ty is CVoidType then return Err("a parameter cannot be `void`; a function taking nothing is written `(void)`")
+            params.push(CParam(p.ty, p.text))
+            if at < tokens.len() && tokens[at] == ","
+                at += 1
+                continue
+            break
+    if at >= tokens.len() || tokens[at] != ")"
+        return Err(if at < tokens.len() then s"`${tokens[at]}` is not part of a parameter list" else "the parameter list has no closing `)`")
+    at += 1
+    if at < tokens.len() && tokens[at] == ";" then at += 1
+    if at < tokens.len() then return Err(s"`${tokens[at]}` follows the parameter list")
+    Ok(CPrototype(symbol, declared.ty, declared.text, params))
+
+// A type and the name after it, as a declaration writes them.
+private struct CDeclared
+    ty: CType
+    text: string
+    name: Option[string]
+
+// The type specifiers, qualifiers and pointers of one declaration from `tokens[*at]`, and the name
+// after them when there is one.
+private c_declaration(tokens: Buf[string], at: *usize) -> Result[CDeclared, string]
+    var words: Buf[string] = buf()
+    var signed = false
+    var unsigned = false
+    var short = false
+    var longs = 0usize
+    var char_word = false
+    var int_word = false
+    var base: Option[CType] = None
+    var name: Option[string] = None
+    while *at < tokens.len()
+        val t = tokens[*at]
+        if !is_c_word(t) then break
+        if t == "extern"
+            *at = *at + 1
+            continue
+        if t == "out" || t == "inout" || t == "userdata" || t == "length"
+            return Err(s"`$t` parameters are not implemented")
+        if t == "static" || t == "inline" || t == "register" || t == "typedef"
+            return Err(s"`$t` is not part of a function's prototype")
+        if t == "_Complex" || t == "__int128" || t == "_Imaginary"
+            return Err(s"`$t` cannot cross a C binding")
+        val specifier = t == "signed" || t == "unsigned" || t == "short" || t == "long" || t == "char" || t == "int"
+        if specifier
+            if base is Some(_) && !(t == "long" && base is Some(CDoubleType))
+                return Err(s"`$t` does not combine with the type before it")
+            if t == "signed" then signed = true
+            elif t == "unsigned" then unsigned = true
+            elif t == "short" then short = true
+            elif t == "long" then longs += 1
+            elif t == "char" then char_word = true
+            else int_word = true
+            words.push(t)
+            *at = *at + 1
+            continue
+        if t == "const" || t == "volatile" || t == "restrict"
+            words.push(t)
+            *at = *at + 1
+            continue
+        val specified = signed || unsigned || short || longs > 0 || char_word || int_word
+        val keyword_base = t == "void" || t == "_Bool" || t == "bool" || t == "float" || t == "double"
+        if keyword_base
+            if base is Some(_) || (specified && !(t == "double" && longs == 1 && !signed && !unsigned && !short && !char_word && !int_word))
+                return Err(s"`$t` does not combine with the type before it")
+            base = Some(if t == "void" then CVoidType elif t == "float" then CFloatType elif t == "double" then CDoubleType else CBoolType)
+            words.push(t)
+            *at = *at + 1
+            continue
+        if t == "struct" || t == "union" || t == "enum"
+            if base is Some(_) || specified then return Err(s"`$t` does not combine with the type before it")
+            if *at + 1 >= tokens.len() || !is_c_word(tokens[*at + 1]) then return Err(s"`$t` is followed by its tag's name")
+            val tag = tokens[*at + 1]
+            base = Some(if t == "enum" then CKeyword("enum " + tag) else CRecordType(t + " " + tag))
+            words.push(t)
+            words.push(tag)
+            *at = *at + 2
+            continue
+        // Any other word is a typedef's name where no type has been said yet, and otherwise the name
+        // the declaration declares.
+        if base is None && !specified
+            base = Some(CTypedef(t))
+            words.push(t)
+            *at = *at + 1
+            continue
+        name = Some(t)
+        *at = *at + 1
+        break
+    val specified = signed || unsigned || short || longs > 0 || char_word || int_word
+    if base is Some(CDoubleType) && longs > 0 then return Err("`long double` cannot cross a C binding")
+    if base is None && !specified
+        return Err(if *at < tokens.len() then s"`${tokens[*at]}` is not a C type" else "a type is missing")
+    var ty = base match
+        Some(b) -> b
+        None -> CKeyword(integer_spelling(signed, unsigned, short, longs, char_word)?)
+    var text = joined_words(words)
+    // Pointers, each perhaps qualified, then the name if it was not before them.
+    var pointers = 0usize
+    while *at < tokens.len() && name is None
+        val t = tokens[*at]
+        if t == "*"
+            pointers += 1
+            text = text + " *"
+            *at = *at + 1
+        elif pointers > 0 && (t == "const" || t == "volatile" || t == "restrict")
+            text = text + t
+            *at = *at + 1
+        else break
+    if name is None && *at < tokens.len() && is_c_word(tokens[*at]) && !is_c_keyword(tokens[*at])
+        name = Some(tokens[*at])
+        *at = *at + 1
+    if *at < tokens.len() && tokens[*at] == "["
+        return Err("an array parameter cannot cross a C binding: arrays are not implemented")
+    if pointers > 0 then ty = CPointerType
+    Ok(CDeclared(ty, text, name))
+
+// The one spelling of an integer type its keywords make, `long unsigned int` being `unsigned long`.
+private integer_spelling(signed: bool, unsigned: bool, short: bool, longs: usize, char_word: bool) -> Result[string, string]
+    if signed && unsigned then return Err("`signed` and `unsigned` do not combine")
+    if longs > 2 then return Err("`long long long` is not a C type")
+    if (short && (longs > 0 || char_word)) || (char_word && longs > 0) then return Err("those keywords do not make one C type")
+    val prefix = if unsigned then "unsigned " else ""
+    if char_word then return Ok(if signed then "signed char" elif unsigned then "unsigned char" else "char")
+    if short then return Ok(prefix + "short")
+    if longs == 2 then return Ok(prefix + "long long")
+    if longs == 1 then return Ok(prefix + "long")
+    Ok(prefix + "int")
+
+private joined_words(words: Buf[string]) -> string
+    var out = ""
+    for w in words
+        out = if out == "" then w else out + " " + w
+    out
+
+// The words, `*`, parentheses, commas, brackets, `;` and `...` a prototype is made of.
+private c_tokens(text: string) -> Result[Buf[string], string]
+    var out: Buf[string] = buf()
+    val b = text.bytes
+    var i = 0usize
+    while i < b.len
+        val ch = b[i]
+        if ch == u8(' ') || ch == u8('\t') || ch == u8('\n') || ch == u8('\r')
+            i += 1
+            continue
+        // A word, or a number, which only an array's length is.
+        if is_c_word_byte(ch)
+            val start = i
+            while i < b.len && is_c_word_byte(b[i])
+                i += 1
+            out.push(text[start..<i])
+            continue
+        if ch == u8('.') && i + 2 < b.len && b[i + 1] == u8('.') && b[i + 2] == u8('.')
+            out.push("...")
+            i += 3
+            continue
+        if ch == u8('*') || ch == u8('(') || ch == u8(')') || ch == u8(',') || ch == u8('[') || ch == u8(']') || ch == u8(';')
+            out.push(text[i..<i + 1])
+            i += 1
+            continue
+        return Err(s"`${text[i..<i + 1]}` is not part of a C prototype")
+    Ok(out)
+
+private is_c_word_byte(b: u8) -> bool = b >= u8('a') && b <= u8('z') || b >= u8('A') && b <= u8('Z') || b == u8('_') || b >= u8('0') && b <= u8('9')
+
+private is_c_word(t: string) -> bool = t.bytes.len > 0 && is_c_word_byte(t.bytes[0]) && !(t.bytes[0] >= u8('0') && t.bytes[0] <= u8('9'))
+
+private is_c_keyword(t: string) -> bool =
+    t == "const" || t == "volatile" || t == "restrict" || t == "void" || t == "char" || t == "short" || t == "int" || t == "long" || t == "signed" || t == "unsigned" || t == "float" || t == "double" || t == "_Bool" || t == "bool" || t == "struct" || t == "union" || t == "enum"
+
+/** What the Avin type at a C position must be, as a diagnostic says it, or "" where `avin` may cross
+ * as `c`. A result whose Avin type is `unit` discards whatever C answers, except a struct, which is
+ * passed by value. */
+c_crossing_problem(c: CType, avin: &Type, result: bool) -> string
+    if result && *avin is Unit
+        return if c is CRecordType(_) then "a struct passed by value is not implemented" else ""
+    c match
+        CKeyword(name) ->
+            if name == "char" then return if *avin is Byte then "" else "a C `char` crosses as `byte`"
+            if name == "unsigned char" then return if *avin is Byte || *avin is Int(_) then "" else "it crosses as `byte` or an integer type"
+            if *avin is Int(_) then "" else "a C integer crosses as an integer type"
+        CTypedef(_) -> *avin match
+            Int(_) -> ""
+            Byte -> ""
+            Bool -> ""
+            Real -> ""
+            _ -> "a typedef crosses as an integer type, `byte`, `bool` or `real`, as the header's type is"
+        CBoolType -> if *avin is Bool then "" else "a C `bool` crosses as `bool`"
+        CDoubleType -> if *avin is Real then "" else "a C `double` crosses as `real`"
+        CFloatType -> if *avin is Real then "" else "a C `float` crosses as `real`"
+        CVoidType -> "the C function answers nothing, so the binding's result is `unit`"
+        CPointerType -> "pointers are not implemented"
+        CRecordType(_) -> "a struct passed by value is not implemented"
+
+/** How a typedef at a C position must be, by the Avin type it crosses as: the kind the C unit checks. */
+enum CKind
+    KindInteger
+    KindByte
+    KindBool
+    KindReal
+
+/** The kind of type the C type `c` must be to cross as `avin`, where the C unit checks or measures
+ * it: every integer type, which is measured, and every typedef, whose kind is checked. */
+c_kind_needed(c: CType, avin: &Type) -> Option[CKind]
+    val named = c match
+        CKeyword(_) -> true
+        CTypedef(_) -> true
+        _ -> false
+    if !named then return None
+    *avin match
+        Int(_) -> Some(KindInteger)
+        Byte -> Some(if c is CKeyword(_) then KindInteger else KindByte)
+        Bool -> if c is CTypedef(_) then Some(KindBool) else None
+        Real -> if c is CTypedef(_) then Some(KindReal) else None
+        _ -> None
+
+/** The name a measurement of a C type is kept under: the type's spelling, and for a typedef in a
+ * `real` position `real` before it. */
+c_measure_key(c: CType, kind: CKind) -> string
+    val name = c match
+        CKeyword(n) -> n
+        CTypedef(n) -> n
+        _ -> ""
+    if kind is KindReal then "real " + name else name
+
+/** How a value of the C type `c` crosses as `avin` at the call: the machine form the emitter passes
+ * it in, at the width measured. */
+c_scalar_of(c: CType, avin: &Type, measures: Map[string, CMeasure]) -> CScalar = c match
+    CBoolType -> CBoolean
+    CDoubleType -> CBinary64
+    CFloatType -> CBinary32
+    CTypedef(name) -> *avin match
+        Bool -> CBoolean
+        Real -> if measured(measures, "real " + name).bits == 32 then CBinary32 else CBinary64
+        _ -> integer_scalar(measured(measures, name))
+    CKeyword(name) -> integer_scalar(measured(measures, name))
+    _ -> panic("only a scalar crosses a C binding by value")
+
+private integer_scalar(m: CMeasure) -> CScalar = if m.signed then CSigned(m.bits) else CUnsigned(m.bits)
+
+private measured(measures: Map[string, CMeasure], key: string) -> CMeasure = measures.get(key) match
+    Some(m) -> m
+    None -> panic(s"the C unit measured no `$key`")
+
+/** The C integer type `c` as a trap names it: its sign and width, then its spelling, `u64 (size_t)`. */
+c_integer_name(c: CType, s: CScalar) -> string
+    val spelled = c match
+        CKeyword(n) -> n
+        CTypedef(n) -> n
+        _ -> ""
+    val width = s match
+        CSigned(bits) -> s"i$bits"
+        CUnsigned(bits) -> s"u$bits"
+        _ -> ""
+    s"$width ($spelled)"

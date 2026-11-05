@@ -88,6 +88,13 @@ emit_llvm(program: MirProgram) -> string
                         if !contains(declared, symbol)
                             declared.push(symbol)
                             out.push("declare " + c_result(signature) + " @" + symbol + "(" + c_params(signature, shim_extensions(program, symbol)) + ")\n")
+                    Call(_, CFunction(symbol, params, result), _) ->
+                        if !contains(declared, symbol)
+                            declared.push(symbol)
+                            var types = ""
+                            for i in 0..<params.len()
+                                types = types + (if i > 0 then ", " else "") + foreign_type(params[i]) + foreign_extension(params[i])
+                            out.push("declare " + foreign_result(result) + " @" + symbol + "(" + types + ")\n")
                     _ -> ()
     out.push("\n")
     var intrinsics: Buf[string] = buf()
@@ -1244,7 +1251,49 @@ private emit_inst(out: *StrBuilder,intrinsics: *Buf[string], program: MirProgram
                 if byte_result
                     out.push(s"  %v$d = icmp ne i8 %t$next, 0\n")
                     next += 1
+        Call(dest, CFunction(symbol, params, result), args) ->
+            // A C function takes no context. A `float` is rounded from the `real` carrying it on the
+            // way in, and widened back on the way out.
+            var parts = ""
+            for i in 0..<args.len()
+                val a = args[i]
+                if i > 0 then parts = parts + ", "
+                if params[i] is CBinary32
+                    out.push(s"  %t$next = fptrunc double " + operand(program, f, a) + " to float\n")
+                    parts = parts + s"float %t$next"
+                    next += 1
+                else parts = parts + foreign_type(params[i]) + foreign_extension(params[i]) + " " + operand(program, f, a)
+            val widened = result is Some(CBinary32)
+            out.push("  ")
+            if dest is Some(d)
+                if widened then out.push(s"%t$next = ") else out.push(s"%v$d = ")
+            out.push("call " + foreign_result(result) + " @" + symbol + "(" + parts + ")\n")
+            if dest is Some(d)
+                if widened
+                    out.push(s"  %v$d = fpext float %t$next to double\n")
+                    next += 1
     next
+
+// A C scalar's type in LLVM.
+private foreign_type(s: CScalar) -> string = s match
+    CSigned(bits) -> s"i$bits"
+    CUnsigned(bits) -> s"i$bits"
+    CBoolean -> "i1"
+    CBinary64 -> "double"
+    CBinary32 -> "float"
+
+// How a C scalar narrower than 32 bits is widened in a register with the C convention: a signed
+// integer sign-extended, an unsigned one and a bool zero-extended.
+private foreign_extension(s: CScalar) -> string = s match
+    CSigned(bits) -> if bits < 32 then " signext" else ""
+    CUnsigned(bits) -> if bits < 32 then " zeroext" else ""
+    CBoolean -> " zeroext"
+    _ -> ""
+
+// A C function's result as a declaration and a call write it: its extension, then its type.
+private foreign_result(result: Option[CScalar]) -> string = result match
+    Some(s) -> (if foreign_extension(s) == "" then "" else foreign_extension(s)[1..] + " ") + foreign_type(s)
+    None -> "void"
 
 private operand_type(program: MirProgram, f: MirFunction, a: Operand) -> MirType = a match
     Value(id) -> f.value_types[id]

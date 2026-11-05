@@ -1,0 +1,267 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.{Source, Span, source_of}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, read_text, remove_dir_all}
+import sysl.process.Stdio
+
+// C bindings: reading a prototype, the rules of what crosses as what, the C unit's source, its
+// measurements and its cache, and every checked conversion at its boundaries, which the C library in
+// tests/c answers.
+
+private prototype(text: string) -> CPrototype = parse_prototype(text).unwrap()
+
+private refused(text: string) -> string = parse_prototype(text) match
+    Ok(_) -> "read"
+    Err(why) -> why
+
+private keyword(t: CType) -> string = t match
+    CKeyword(n) -> "keyword " + n
+    CTypedef(n) -> "typedef " + n
+    CBoolType -> "bool"
+    CDoubleType -> "double"
+    CFloatType -> "float"
+    CVoidType -> "void"
+    CPointerType -> "pointer"
+    CRecordType(n) -> "record " + n
+
+@test("a prototype is read into its symbol, result and parameters, each with the text the header check compares")
+prototype_parts()
+    val p = prototype("char *mlt_properties_get(mlt_properties self, const char *name)")
+    assert_eq(p.symbol, "mlt_properties_get")
+    assert_eq(keyword(p.result), "pointer")
+    assert_eq(p.result_text, "char *")
+    assert_eq(p.params.len(), 2)
+    assert_eq(keyword(p.params[0].ty), "typedef mlt_properties")
+    assert_eq(p.params[0].text, "mlt_properties")
+    assert_eq(keyword(p.params[1].ty), "pointer")
+    assert_eq(p.params[1].text, "const char *")
+    // No parameters, written either way, and a declaration's own `extern` and `;`.
+    assert_eq(prototype("pid_t getpid(void)").params.len(), 0)
+    assert_eq(prototype("pid_t getpid()").params.len(), 0)
+    val e = prototype("  extern   int\tabs ( int n ) ; ")
+    assert_eq(e.symbol, "abs")
+    assert_eq(e.params[0].text, "int")
+    assert_eq(keyword(prototype("void srand(unsigned)").result), "void")
+    // A pointer qualified after its star, and one to a pointer.
+    assert_eq(prototype("int f(char *const p)").params[0].text, "char *const")
+    assert_eq(prototype("int f(char **p)").params[0].text, "char * *")
+
+@test("every spelling of a C integer type is read as the one spelling of its type")
+integer_spellings()
+    val cases = [
+        ("char", "char"), ("signed char", "signed char"), ("unsigned char", "unsigned char"), ("char signed", "signed char"),
+        ("short", "short"), ("short int", "short"), ("signed short int", "short"), ("unsigned short", "unsigned short"), ("short unsigned int", "unsigned short"),
+        ("int", "int"), ("signed", "int"), ("signed int", "int"), ("unsigned", "unsigned int"), ("unsigned int", "unsigned int"),
+        ("long", "long"), ("long int", "long"), ("signed long", "long"), ("long unsigned int", "unsigned long"), ("unsigned long", "unsigned long"),
+        ("long long", "long long"), ("long long int", "long long"), ("unsigned long long", "unsigned long long"), ("long unsigned long", "unsigned long long"),
+        ("const int", "int"), ("volatile unsigned", "unsigned int"), ("enum colour", "enum colour")]
+    for (written, read) in cases
+        val p = prototype(written + " f(" + written + " x)")
+        assert_eq(keyword(p.result), "keyword " + read, written)
+        assert_eq(keyword(p.params[0].ty), "keyword " + read, written)
+    assert_eq(keyword(prototype("_Bool f(bool b)").result), "bool")
+    assert_eq(keyword(prototype("bool f(_Bool b)").params[0].ty), "bool")
+    assert_eq(keyword(prototype("float f(double x)").result), "float")
+    assert_eq(keyword(prototype("float f(double x)").params[0].ty), "double")
+    assert_eq(keyword(prototype("size_t f(uint8_t x)").result), "typedef size_t")
+    assert_eq(keyword(prototype("struct point f(union u x)").result), "record struct point")
+    assert_eq(keyword(prototype("struct point f(union u x)").params[0].ty), "record union u")
+    assert_eq(keyword(prototype("struct point *f(void)").result), "pointer")
+
+@test("a prototype that is no C declaration, or names what cannot cross, is refused saying why")
+prototype_refusals()
+    assert_eq(refused("int"), "it names no function: a prototype is a result type, the function's name and its parameters, as in `int abs(int)`")
+    assert_eq(refused(""), "a type is missing")
+    assert_eq(refused("int f(int, ...)"), "a variadic function cannot be bound: the types of the arguments `...` takes cannot be checked")
+    assert_eq(refused("long double f(void)"), "`long double` cannot cross a C binding")
+    assert_eq(refused("double long f(void)"), "`long double` cannot cross a C binding")
+    assert_eq(refused("int f(unsigned __int128)"), "`__int128` cannot cross a C binding")
+    assert_eq(refused("int f(int (*g)(int))"), "a parameter taking a function cannot cross a C binding: callbacks are not implemented")
+    assert_eq(refused("int f(int a[])"), "an array parameter cannot cross a C binding: arrays are not implemented")
+    assert_eq(refused("int f(inout int *n)"), "`inout` parameters are not implemented")
+    assert_eq(refused("int f(userdata void *p)"), "`userdata` parameters are not implemented")
+    assert_eq(refused("int f(length(a) int n)"), "`length` parameters are not implemented")
+    assert_eq(refused("inline int f(void)"), "`inline` is not part of a function's prototype")
+    assert_eq(refused("int f(void) g"), "`g` follows the parameter list")
+    assert_eq(refused("int f(int, )"), "`)` is not a C type")
+    assert_eq(refused("int f(int;"), "`;` is not part of a parameter list")
+    assert_eq(refused("int f"), "`f` is not followed by its parameters in parentheses")
+    assert_eq(refused("int f(int @)"), "`@` is not part of a C prototype")
+    assert_eq(refused("short long f(void)"), "those keywords do not make one C type")
+    assert_eq(refused("long long long f(void)"), "`long long long` is not a C type")
+    assert_eq(refused("float int f(void)"), "`int` does not combine with the type before it")
+    assert_eq(refused("int float f(void)"), "`float` does not combine with the type before it")
+    assert_eq(refused("int f(struct)"), "`struct` is followed by its tag's name")
+    assert_eq(refused("int struct s f(void)"), "`struct` does not combine with the type before it")
+
+@test("each C type crosses as the Avin types its kind allows, and a unit result discards any answer but a struct")
+crossing_rules()
+    val int_type: &Type = Int(32)
+    val long_type: &Type = Int(64)
+    val byte_type: &Type = Byte
+    val bool_type: &Type = Bool
+    val real_type: &Type = Real
+    val unit_type: &Type = Unit
+    val string_type: &Type = Str
+    val char_type: &Type = Char
+    assert_eq(c_crossing_problem(CKeyword("int"), long_type, false), "")
+    assert_eq(c_crossing_problem(CKeyword("unsigned long"), int_type, true), "")
+    assert(c_crossing_problem(CKeyword("int"), byte_type, false) != "")
+    assert(c_crossing_problem(CKeyword("signed char"), byte_type, false) != "")
+    assert_eq(c_crossing_problem(CKeyword("unsigned char"), byte_type, false), "")
+    assert_eq(c_crossing_problem(CKeyword("unsigned char"), int_type, false), "")
+    assert_eq(c_crossing_problem(CKeyword("char"), byte_type, true), "")
+    assert(c_crossing_problem(CKeyword("char"), int_type, false) != "")
+    assert_eq(c_crossing_problem(CKeyword("enum e"), int_type, false), "")
+    for t in [int_type, byte_type, bool_type, real_type]
+        assert_eq(c_crossing_problem(CTypedef("t"), t, false), "")
+    assert(c_crossing_problem(CTypedef("t"), string_type, false) != "")
+    assert(c_crossing_problem(CTypedef("t"), char_type, false) != "")
+    assert_eq(c_crossing_problem(CBoolType, bool_type, false), "")
+    assert(c_crossing_problem(CBoolType, int_type, false) != "")
+    assert_eq(c_crossing_problem(CDoubleType, real_type, false), "")
+    assert_eq(c_crossing_problem(CFloatType, real_type, true), "")
+    assert(c_crossing_problem(CFloatType, long_type, false) != "")
+    assert_eq(c_crossing_problem(CVoidType, unit_type, true), "")
+    assert(c_crossing_problem(CVoidType, int_type, true) != "")
+    assert_eq(c_crossing_problem(CPointerType, unit_type, true), "")
+    assert_eq(c_crossing_problem(CPointerType, long_type, false), "pointers are not implemented")
+    assert_eq(c_crossing_problem(CRecordType("struct s"), unit_type, true), "a struct passed by value is not implemented")
+    assert_eq(c_crossing_problem(CKeyword("int"), unit_type, true), "")
+    assert(c_crossing_problem(CKeyword("int"), unit_type, false) != "")
+
+// A binding as the C unit takes it, in package `p`.
+private unit_binding(name: string, text: string, params: Buf[&Type], result: &Type) -> CUnitBinding =
+    CUnitBinding(name, prototype(text), params, result, 0, Span(0, 0), "p")
+
+private libc(headers: Buf[string]) -> Buf[CLibrary]
+    var out: Buf[CLibrary] = buf()
+    out.push(CLibrary("p", "libc", None, buf(), headers, ""))
+    out
+
+@test("the C unit checks each binding against the header, each typedef's kind, and measures each integer type once")
+unit_source()
+    var params: Buf[&Type] = buf()
+    params.push(Int(64))
+    var bindings: Buf[CUnitBinding] = buf()
+    bindings.push(unit_binding("labs", "long labs(long)", params, Int(64)))
+    bindings.push(unit_binding("echo", "size_t echo(size_t)", params, Int(64)))
+    var real_params: Buf[&Type] = buf()
+    real_params.push(Real)
+    bindings.push(unit_binding("half", "real_t half(real_t)", real_params, Real))
+    var headers: Buf[string] = buf()
+    headers.push("<stdlib.h>")
+    headers.push("framework/mlt.h")
+    headers.push("<stdlib.h>")
+    val unit = c_unit_source(bindings, libc(headers))
+    val text = unit.text
+    assert(text.contains("#include <stdlib.h>\n#include <framework/mlt.h>\n_Static"), text)
+    assert(text.contains("_Static_assert(__builtin_types_compatible_p(__typeof__(&labs), long (*)(long)), \"avin: the C binding labs\");\n"), text)
+    assert(text.contains("static long (*const avin_c_binding_0)(long) = &labs;\nlong labs(long);\n"), text)
+    assert(text.contains("_Static_assert(__builtin_classify_type(*(size_t *)0) == 1, \"avin: the C type size_t\");\n"), text)
+    assert(text.contains("_Static_assert(__builtin_classify_type(*(real_t *)0) == 8, \"avin: the C type real_t\");\n"), text)
+    // The result and the parameter name one typedef, checked once and measured once.
+    assert_eq(text.split("__builtin_classify_type(*(size_t *)0)").len, 2)
+    assert_eq(unit.measured.len(), 3)
+    assert_eq(unit.measured[0], "long")
+    assert_eq(unit.measured[1], "size_t")
+    assert_eq(unit.measured[2], "real real_t")
+    assert(text.contains("(unsigned char)sizeof(size_t), (unsigned char)((size_t)-1 < (size_t)0),\n"), text)
+    assert(text.contains("(unsigned char)sizeof(real_t), 0,\n"), text)
+    // Every line clang may name is known for what it is.
+    assert_eq(unit.lines.len(), text.split("\n").len)
+
+@test("the measurements are read out of an object's bytes after their marker, and only a table of the size expected")
+measurements_read()
+    var keys: Buf[string] = buf()
+    keys.push("int")
+    keys.push("real f")
+    var bytes: Buf[u8] = buf()
+    for b in "junk".bytes do bytes.push(b)
+    for b in MeasureMarker.bytes do bytes.push(b)
+    for b in [2u8, 0u8, 4u8, 1u8, 4u8, 0u8, 9u8] do bytes.push(b)
+    val m = read_measures(bytes.view(), keys).unwrap()
+    assert_eq(m.get("int").unwrap().bits, 32)
+    assert(m.get("int").unwrap().signed)
+    assert_eq(m.get("real f").unwrap().bits, 32)
+    var one: Buf[string] = buf()
+    one.push("int")
+    assert(read_measures(bytes.view(), one) is None)
+    var short: Buf[u8] = buf()
+    for b in MeasureMarker.bytes do short.push(b)
+    short.push(2u8)
+    short.push(0u8)
+    short.push(4u8)
+    assert(read_measures(short.view(), keys) is None)
+    var none: Buf[u8] = buf()
+    for b in "no table here".bytes do none.push(b)
+    assert(read_measures(none.view(), keys) is None)
+
+@test("the C unit is compiled once for its source, measured from the object without running it, and compiled again when a binding changes")
+unit_cached()
+    val dir = make_temp_dir("avin-c-unit").unwrap()
+    defer _ = remove_dir_all(dir)
+    val real = repository_toolchain()
+    val tc = Toolchain(real.root, dir, real.clang, real.sysl, real.pkg_config)
+    var params: Buf[&Type] = buf()
+    params.push(Int(32))
+    var bindings: Buf[CUnitBinding] = buf()
+    bindings.push(unit_binding("abs", "int abs(int)", params, Int(32)))
+    var headers: Buf[string] = buf()
+    headers.push("<stdlib.h>")
+    headers.push("<unistd.h>")
+    var sources: Buf[Source] = buf()
+    sources.push(source_of("main.avin", "abs(n: int) -> int\n"))
+    val first = ensure_c_unit(tc, bindings, libc(headers), sources).unwrap()
+    assert(first.built)
+    val object = first.object.unwrap()
+    assert(object.starts_with(dir + "/cunit/"), object)
+    assert_eq(first.measures.get("int").unwrap().bits, 32)
+    assert(first.measures.get("int").unwrap().signed)
+    assert_eq(first.link.len(), 0)
+    val again = ensure_c_unit(tc, bindings, libc(headers), sources).unwrap()
+    assert(!again.built)
+    assert_eq(again.object.unwrap(), object)
+    assert_eq(again.measures.get("int").unwrap().bits, 32)
+    var wide: Buf[&Type] = buf()
+    wide.push(Int(64))
+    bindings.push(unit_binding("labs", "unsigned long labs(unsigned long)", wide, Int(64)))
+    bindings.push(unit_binding("pid", "pid_t getpid(void)", buf(), Int(64)))
+    val changed = ensure_c_unit(tc, bindings, libc(headers), sources)
+    // `labs` answers `long`, so this unit does not compile, and nothing is cached for it.
+    assert(changed is Err(_))
+    bindings.pop()
+    bindings.pop()
+    bindings.push(unit_binding("labs", "long labs(long)", wide, Int(64)))
+    bindings.push(unit_binding("pid", "pid_t getpid(void)", buf(), Int(64)))
+    val third = ensure_c_unit(tc, bindings, libc(headers), sources).unwrap()
+    assert(third.built)
+    assert(third.object.unwrap() != object)
+    assert_eq(third.measures.get("long").unwrap().bits, 64)
+    assert_eq(third.measures.get("pid_t").unwrap().bits, 32)
+    assert(third.measures.get("pid_t").unwrap().signed)
+    // With no bindings there is no unit, and the libraries are still linked.
+    var linked: Buf[CLibrary] = buf()
+    var names: Buf[string] = buf()
+    names.push("m")
+    names.push("m")
+    linked.push(CLibrary("p", "libm", None, names, buf(), ""))
+    val none = ensure_c_unit(tc, buf(), linked, sources).unwrap()
+    assert(none.object is None)
+    assert_eq(none.link.len(), 1)
+    assert_eq(none.link[0], "-lm")
+
+@test("every checked conversion of a C binding stops the program at its boundaries, at -O0 and -O2")
+c_conversion_traps()
+    val dir = make_temp_dir("avin-c-traps").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = fixture_toolchain(repository_toolchain(), dir)
+    for level in ["-O0", "-O2"]
+        var said = ""
+        var noted = ""
+        val status = run_cli_in(".", ["avin", "test", tc.root + "/tests/c/traps", level], Some(tc), s -> said = said + s + "\n", s -> noted = noted + s + "\n", Stdio.ToPath(dir + "/out"), Stdio.ToPath(dir + "/err"))
+        val out = read_text(dir + "/out").unwrap_or("")
+        assert_eq(status, 0, said + noted + out)
+        assert((said + out).contains("48 passed, 0 failed"), said + noted + out)

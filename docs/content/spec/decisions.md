@@ -2732,6 +2732,43 @@ their words are reserved.
     a binding's pleasant layer be written in Avin but makes every Avin file a possible hole.
   - **`errno`** is not read by a binding yet; an `errno` flag answering `Result[T, int]` from a `-1`
     result is the likely form when a POSIX library needs it.
+- **C bindings of scalars** (stage 13 step 1, branch `c-bindings-scalars`, 2026-11-05): the choices
+  building it made where the chapter is silent.
+  - **A typedef's kind is decided by the Avin type and checked by the C unit** with
+    `__builtin_classify_type`: an integer type for an integer, an integer one byte wide (of either
+    sign, as a C `char` is) for `byte`, `bool` for `bool`, a floating-point type for `real`, its
+    width measured to choose `float` or `double`. *Why*: the checker cannot see the header, and the
+    Avin type says what the binding means. *Alternatives*: a kind written in the prototype; measuring
+    every typedef's kind and refusing in the driver, which needs an expression valid for any type
+    and C has none.
+  - **`unsigned char` crosses as `byte` or as an integer type, `char` (and a `char` typedef) only
+    as `byte`, `signed char` only as an integer type.** *Why*: the table lists `unsigned char` in
+    both rows and `char` only as a byte. *Alternative*: `char` as an integer at its measured sign,
+    which makes a program's meaning depend on the machine.
+  - **An argument's trap names the C type, `value out of range for u64 (size_t)`; a result's names
+    the Avin type, `value out of range for long`**, as a Sysl binding's do. *Alternative*: naming
+    both types in both directions.
+  - **A result the binding declares `unit` is declared `void` in the IR**, so a discarded pointer or
+    integer needs no measurement; a struct result is refused even then, since it may be returned
+    through memory. *Alternative*: declaring the measured type and ignoring the value.
+  - **The measurements are found by a marker in the object's bytes**, one table of two bytes per
+    type (width, sign), rather than by its symbol, so no object format (Mach-O, ELF, COFF) is parsed.
+    *Alternative*: reading the symbol table, a reader per format.
+  - **The mismatch diagnostic takes its two types from a pointer of the prototype's type set to
+    the header's function**, whose clang diagnostic keeps the typedefs' names, and the header from
+    the note of a redeclaration as the prototype says it; the `_Static_assert` stays the check, so a
+    clang that only warns on the pointer still refuses the binding. *Alternative*: the assertion's
+    own text, which clang writes with every typedef expanded.
+  - **The toolchain names the `pkg-config` it asks** (`Toolchain.pkg_config`), so a build for
+    another machine can ask that machine's, and the corpus asks one that also finds the C fixture in
+    `tests/c`, which it builds. *Alternatives*: the environment's `PKG_CONFIG_PATH`, which a test
+    cannot set for the compiler it runs in its own process; a package-relative `.pc` path in the
+    manifest, which the chapter does not have. **Review with the user**: whether `avin` should read
+    `PKG_CONFIG` as autotools does.
+  - **A function a header declares `static inline` is not caught by the header check**: C lets the
+    unit's redeclaration inherit the internal linkage, so the binding fails at the link, where the
+    linker names the missing symbol. *Alternative*: reading the C unit's symbol table for a local
+    definition, a reader per object format.
 
 ## Open
 
