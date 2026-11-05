@@ -90,7 +90,7 @@ Data crosses the boundary in a fixed set of shapes:
 
 | Avin type | Crossing |
 | --- | --- |
-| `i8`, `i16`, `int`, `long`, `byte`, `real`, `char`, `bool`, `unit` | By value; Sysl's `u8` is `byte`. An integer result takes [any Sysl integer](#integer-results) |
+| `i8`, `i16`, `int`, `long`, `byte`, `real`, `char`, `bool`, `unit` | By value; Sysl's `u8` is `byte`. An integer result, and an integer a result holds, takes [any Sysl integer](#integer-results) |
 | `string` | Copied into a Sysl `string` in each direction |
 | `Array[byte]` | Copied into a Sysl `[]u8`, and out of a Sysl `[]u8` or `[]const u8` |
 | `Array[T]`, `Vector[T]` of any other boundary type | **Copied**, element by element: into a Sysl slice `[]T`, and out of a Sysl `[]T` or `Buf[T]` into a new array or vector |
@@ -122,14 +122,23 @@ does:
 avin: trap: value out of range for long at main.avin:13:13
 ```
 
-A result of any other type is not converted to an integer, and the binding is rejected:
+An integer a result holds converts the same way, wherever it is: the value of an `Option`, either
+side of a `Result`, the elements of an `Array` or a `Vector`, and these nested in one another. A
+Sysl `Option[usize]` is bound as an `Option[long]`, a `Result[u32, E]` as a `Result[int, E]`, and a
+slice of `u8` or a `Buf[u16]` as a `Vector[int]`. Each value is checked as it is converted, and the
+first that does not fit stops the program at the binding's call. A `byte` is not converted: it is
+made from a Sysl `u8` only, in a collection as anywhere.
+
+A value of any other type is not converted to an integer, and the binding is rejected:
 
 ```text
 error: the Sysl binding `upperCount` does not match `sysl.text.to_upper`: an integer is made from a Sysl integer, but the value is string
 ```
 
-An integer parameter is passed as the type it is declared, which Sysl accepts where its own
-parameter's type holds every value of it: an `i16` reaches an `i32` parameter, and a `long` does not.
+An integer parameter, and an integer a parameter holds, is passed as the type it is declared, which
+Sysl accepts where its own parameter's type holds every value of it: an `i16` reaches an `i32`
+parameter, and a `long` does not. An integer in an `Option`, a `Result` or a collection is not
+widened: an `Option[int]` reaches an `Option[i32]` parameter only.
 
 ### Collections are copies
 
@@ -160,7 +169,7 @@ reached through a collection: Sysl's own functions take slices. A collection who
 fit the Sysl function is reported at the binding, in each direction:
 
 ```text
-error: the Sysl binding `splitInts` does not match `sysl.text.split`: `Vector[int]` is made from a Sysl `[]int` or `Buf[int]`, and the value is none of these
+error: the Sysl binding `splitInts` does not match `sysl.text.split`: `Vector[int]` is made from a Sysl `[]I` or `Buf[I]` of any integer type `I`, and the value is none of these
 ```
 
 No other collection crosses: a `List`, a `Buffer`, a `Map` or a `Set` is converted by the Avin

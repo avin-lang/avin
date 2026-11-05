@@ -177,9 +177,11 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
         val callee = b.reach match
             Method(name) -> s"s.r.$name"
             _ -> s"bound_$i"
-        // A result that holds a collection may be spelled with a slice or a `Buf`, so it takes the
-        // Sysl function's own type, and the overloads of its conversion choose by it.
-        val spellings = sysl_types(&w, b.result)
+        // A result that holds a collection may be spelled with a slice or a `Buf`, and one that holds
+        // an integer with any Sysl integer, so it takes the Sysl function's own type, and the
+        // overloads of its conversion choose by it.
+        var n = 0usize
+        val spelled = spellings(&w, b.result, true, &n)
         var call = callee + "("
         for k in 0..<args.len()
             if k > 0 then call = call + ", "
@@ -195,7 +197,7 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
             val side = sysl_side(b.result.ty)
             put(&w, s"\n    val r: $side = integer_to(ctx, $call, \"$side\")\n")
         elif !direct
-            if spellings.len() == 1 then put(&w, s"\n    val r: ${spellings[0]} = $call\n")
+            if spelled.len() == 1 && n == 0 then put(&w, s"\n    val r: ${spelled[0]} = $call\n")
             else put(&w, s"\n    val r = $call\n")
         else put(&w, "\n")
         val r = if direct then call else "r"
@@ -209,7 +211,7 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
                 if k > 0 then put(&w, ", ")
                 put(&w, s"d$k")
             put(&w, "]\n    val dp: **u8 = ptr_cast(&ds)\n")
-            put(&w, "    " + out_expr(&w, b.result, r, "dp", 0, false) + "\n")
+            put(&w, "    " + out_expr(&w, b.result, r, "dp", 0) + "\n")
         last.push(w.line - 1)
     var k = 0usize
     while k < w.ins.len()
@@ -222,10 +224,17 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
     var unconverted: Buf[string] = buf()
     for c in w.outs
         var from = ""
-        val spellings = sysl_types(&w, c)
-        for i in 0..<spellings.len()
-            if i > 0 then from = from + (if i + 1 == spellings.len() then " or " else ", ")
-            from = from + "`" + spellings[i] + "`"
+        var n = 0usize
+        val spelled = spellings(&w, c, true, &n)
+        for i in 0..<spelled.len()
+            if i > 0 then from = from + (if i + 1 == spelled.len() then " or " else ", ")
+            from = from + "`" + spelled[i] + "`"
+        // An integer is spelled in the shim by its type parameter, and here as any integer `I`.
+        var s = n
+        while s > 0
+            s -= 1
+            from = from.replace_all(s"S$s", "I")
+        if n > 0 then from = from + " of any integer type `I`"
         // A mirror is spelled in the shim by the name it is imported as, and here by the Sysl type's.
         var m = w.mirrors.len()
         while m > 0
@@ -265,6 +274,16 @@ private const IntegerHelper: string =
     "    val y = T.wrap(x)\n" +
     "    if S.wrap(y) != x || (y < T.wrap(0)) != (x < S.wrap(0)) then stop_in_binding(ctx, \"value out of range for \" + name)\n" +
     "    y\n"
+
+// The type parameters of a conversion generic in the Sysl types of the `n` integers it holds, each
+// any Sysl integer, or nothing where it holds none.
+private integer_parameters(n: usize) -> string
+    if n == 0 then return ""
+    var out = "["
+    for i in 0..<n
+        if i > 0 then out = out + ", "
+        out = out + s"S$i: Integer"
+    out + "]"
 
 // Whether a binding passes or returns an array of bytes, which no data type's conversion holds.
 private uses_bytes(bindings: Buf[MirBinding]) -> bool
@@ -338,18 +357,31 @@ private sysl_type(w: *ShimWriter, c: &Crossing) -> string = c.form match
 // Every Sysl type a value of `c`'s type is converted from. A collection comes out of Sysl as a slice
 // or a `Buf`, so a conversion that holds one is one overload for each way of spelling its type.
 private sysl_types(w: *ShimWriter, c: &Crossing) -> Buf[string]
+    var n = 0usize
+    spellings(w, c, false, &n)
+
+// Every Sysl type a value of `c`'s type is converted from, as `sysl_types` says, but where `generic`
+// is set, an integer an option, a result or a collection holds is any Sysl integer: it is spelled
+// with a type parameter, `S` and its number, counting from `n[0]`, which is left past the last.
+private spellings(w: *ShimWriter, c: &Crossing, generic: bool, n: *usize) -> Buf[string]
     var out: Buf[string] = buf()
     c.form match
+        Plain ->
+            if generic && *c.ty is Int(_)
+                out.push(s"S${n[0]}")
+                n[0] += 1
+            else out.push(sysl_type(w, c))
         OptionForm(_) ->
-            for t in sysl_types(w, payload(c, "Some"))
+            for t in spellings(w, payload(c, "Some"), generic, n)
                 out.push(s"Option[$t]")
         ResultForm ->
-            val errs = sysl_types(w, payload(c, "Err"))
-            for t in sysl_types(w, payload(c, "Ok"))
+            val oks = spellings(w, payload(c, "Ok"), generic, n)
+            val errs = spellings(w, payload(c, "Err"), generic, n)
+            for t in oks
                 for e in errs
                     out.push(s"Result[$t, $e]")
         Elements(element, _) ->
-            for t in sysl_types(w, element)
+            for t in spellings(w, element, generic, n)
                 out.push(s"[]$t")
                 out.push(s"Buf[$t]")
         // An array of bytes is copied out of a slice Sysl may write or one it may only read.
@@ -402,10 +434,11 @@ private into_expr(w: *ShimWriter, c: &Crossing, value: string, ds: string, base:
         s"in_${function_of(w, c, false).unwrap()}(ctx, $value, $at)"
 
 // The Sysl value `value` of `c`'s type converted out of Sysl, with its layouts from `base` among the
-// ones `ds` points at. A field of a mirror of an integer type takes any Sysl integer, converted.
-private out_expr(w: *ShimWriter, c: &Crossing, value: string, ds: string, base: usize, mirrored: bool) -> string = c.form match
+// ones `ds` points at. An integer, a mirror's field or held in an option, a result or a collection,
+// takes any Sysl integer, converted.
+private out_expr(w: *ShimWriter, c: &Crossing, value: string, ds: string, base: usize) -> string = c.form match
     Plain ->
-        if mirrored && *c.ty is Int(_) then s"integer_to(ctx, $value, \"${sysl_side(c.ty)}\")" else out_of_sysl(c.ty, value)
+        if *c.ty is Int(_) then s"integer_to(ctx, $value, \"${sysl_side(c.ty)}\")" else out_of_sysl(c.ty, value)
     Bytes -> s"bytes_of(ctx, $value, $ds[$base])"
     _ ->
         val at = if base == 0 then ds else s"ptr_cast(usize($ds) + ${base * 8}usize)"
@@ -481,23 +514,27 @@ private out_function(w: *ShimWriter, k: usize)
         put(w, s"private out_$k[V](ctx: *Context, v: V, ds: **u8) -> *u8\n    val o = allocate(ctx, ptr_cast(ds[0]))\n    val s: *Slot_$m = ptr_cast(o)\n    s.r = v\n    o\n")
         w.mirror_lines.push(MirrorLines(m, start, w.line - 1))
         return
-    if holds_handle(c) then out_overload(w, k, c, "")
+    if holds_handle(c) then out_overload(w, k, c, "", "")
     else
-        for spelling in sysl_types(w, c)
-            out_overload(w, k, c, spelling)
+        // A conversion that holds an integer is generic in the Sysl integer type of each.
+        var n = 0usize
+        val spelled = spellings(w, c, true, &n)
+        val parameters = integer_parameters(n)
+        for spelling in spelled
+            out_overload(w, k, c, spelling, parameters)
     mirror_lines(w, c, start)
 
 // One overload of the conversion out of Sysl of the `k`th data type that crosses that way, from the
-// Sysl type `spelling`, or the conversion generic in it where `spelling` is empty.
-private out_overload(w: *ShimWriter, k: usize, c: &Crossing, spelling: string)
-    val mirrored = c.form is Mirror(_, _, _, _, _)
+// Sysl type `spelling` with the type parameters `parameters`, or the conversion generic in it where
+// `spelling` is empty.
+private out_overload(w: *ShimWriter, k: usize, c: &Crossing, spelling: string, parameters: string)
     val structure = c.form is Mirror(_, _, _, _, true)
     if spelling == "" then put(w, s"private out_$k[V](ctx: *Context, v: V, ds: **u8) -> *u8\n")
-    else put(w, s"private out_$k(ctx: *Context, v: $spelling, ds: **u8) -> *u8\n")
+    else put(w, s"private out_$k$parameters(ctx: *Context, v: $spelling, ds: **u8) -> *u8\n")
     if c.form is OptionForm(true)
         val f = payload_field(c)
         put(w, "    v match\n        None -> null\n")
-        put(w, "        Some(f0) -> " + out_expr(w, f.crossing, "f0", "ds", f.base, false) + "\n")
+        put(w, "        Some(f0) -> " + out_expr(w, f.crossing, "f0", "ds", f.base) + "\n")
         return
     if !structure then put(w, "    v match\n")
     for t in 0..<c.variants.len()
@@ -525,7 +562,7 @@ private out_overload(w: *ShimWriter, k: usize, c: &Crossing, spelling: string)
             val f = v.fields[i]
             if f.offset is Some(offset)
                 val side = crossing_c_side(f.crossing)
-                put(w, indent + s"val x$i: $side = " + out_expr(w, f.crossing, values[i], "ds", f.base, mirrored) + "\n")
+                put(w, indent + s"val x$i: $side = " + out_expr(w, f.crossing, values[i], "ds", f.base) + "\n")
                 put(w, indent + s"val p$i: *$side = ptr_cast(usize(root.object) + ${offset}usize)\n")
                 put(w, indent + s"p$i[0] = x$i\n")
         put(w, indent + "ctx.top = root.frame.prev\n")
@@ -561,19 +598,28 @@ private in_elements(w: *ShimWriter, k: usize, c: &Crossing, element: &Crossing, 
 // The conversion out of Sysl of the `k`th collection that crosses that way: a new array laid out by
 // the first of the layouts `ds` points at, kept as a frame while each element is converted and stored
 // at its place, and for a vector, the vector the core library's function, the second layout, makes
-// of it. The elements' layouts follow. A `Buf` is converted as the slice of its elements.
+// of it. The elements' layouts follow. A `Buf` is converted as the slice of its elements, and each
+// way of spelling the elements' type is converted by a function of its own, which the overloads for a
+// slice and a `Buf` both call. A collection that holds an integer is generic in the Sysl integer type
+// of each.
 private out_elements(w: *ShimWriter, k: usize, c: &Crossing, element: &Crossing, vector: bool)
     val own = if vector then 4usize else 1usize
     val side = crossing_c_side(element)
     put(w, s"\n// ${type_name(c.ty)} out of Sysl.\n")
-    for t in sysl_types(w, element)
-        put(w, s"private out_$k(ctx: *Context, v: []$t, ds: **u8) -> *u8\n")
+    var n = 0usize
+    val elements = spellings(w, element, true, &n)
+    val parameters = integer_parameters(n)
+    for j in 0..<elements.len()
+        val t = elements[j]
+        put(w, s"private out_$k$parameters(ctx: *Context, v: []$t, ds: **u8) -> *u8 = elements_${k}_$j(ctx, v, ds)\n")
+        put(w, s"private out_$k$parameters(ctx: *Context, v: Buf[$t], ds: **u8) -> *u8 = elements_${k}_$j(ctx, v.view(), ds)\n")
+        put(w, s"private elements_${k}_$j$parameters(ctx: *Context, v: []$t, ds: **u8) -> *u8\n")
         put(w, "    var root = Root(Frame(ctx.top, 1usize), null)\n")
         put(w, "    ctx.top = ptr_cast(&root)\n")
         put(w, "    root.object = new_array(ctx, ptr_cast(ds[0]), v.len)\n")
         if !(*element.ty is Unit)
             put(w, "    for i in 0..<v.len\n")
-            put(w, s"        val x: $side = " + out_expr(w, element, "v[i]", "ds", own, false) + "\n")
+            put(w, s"        val x: $side = " + out_expr(w, element, "v[i]", "ds", own) + "\n")
             put(w, s"        val e: *$side = ptr_cast(array_elements(root.object))\n")
             put(w, "        e[i] = x\n")
         if vector
@@ -584,7 +630,6 @@ private out_elements(w: *ShimWriter, k: usize, c: &Crossing, element: &Crossing,
         else
             put(w, "    ctx.top = root.frame.prev\n")
             put(w, "    root.object\n")
-        put(w, s"private out_$k(ctx: *Context, v: Buf[$t], ds: **u8) -> *u8 = out_$k(ctx, v.view(), ds)\n")
 
 // Makes the lines of a conversion from `start` to the last written its mirror's, when its type is
 // one.
@@ -756,13 +801,18 @@ shim_diagnostics(output: string, shim: ShimSource, bindings: Buf[MirBinding], un
 // value it is called with, what that conversion makes and from what; when it says an integer's
 // conversion was given a value of another type, which type.
 private unconverted_message(shim: ShimSource, message: string) -> string
-    // An integer result or a mirror's integer field is converted from any Sysl integer, and only one.
-    val integral = "'avin.shims.integer_to' requires its type parameter 'S' to implement 'Integer', but "
+    // An integer result, a mirror's integer field and an integer an option, a result or a collection
+    // holds are converted from any Sysl integer, and only one.
+    val integral = " to implement 'Integer', but "
     val refusal = " does not"
     val trimmed = message.trim()
-    if trimmed.starts_with(integral) && trimmed.ends_with(refusal)
-        val given = trimmed[integral.bytes.len..<trimmed.bytes.len - refusal.bytes.len]
-        return s"an integer is made from a Sysl integer, but the value is $given"
+    if trimmed.starts_with("'avin.shims.") && trimmed.contains(integral) && trimmed.ends_with(refusal)
+        var parts: Buf[string] = buf()
+        for p in trimmed.split(integral)
+            parts.push(p)
+        if parts.len() == 2
+            val given = parts[1][0..<parts[1].bytes.len - refusal.bytes.len]
+            return s"an integer is made from a Sysl integer, but the value is $given"
     val prefix = "no 'avin.shims.out_"
     if !message.starts_with(prefix) then return message
     var k = 0usize
