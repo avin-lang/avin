@@ -3735,6 +3735,45 @@ spelling is better, as each entry says.
 
 ## Proposed
 
+- **C arrays as pointers and `blocking` calls, as built** (branch `c-bindings-arrays`, stage 13
+  step 6, [chapter](/spec/c-bindings/#arrays-and-out-parameters)). The chapter left these open:
+  - **An `Array[int]` or `Array[long]` goes only to a pointer to a *signed* integer of its size;
+    an `Array[byte]` to any one-byte integer; an `Array[real]` to any eight-byte floating-point
+    type**, typedefs included, all checked by the C unit (`__builtin_classify_type`, `sizeof` and
+    `(T)-1 < (T)0`). *Why*: "the element types must be the same size and kind, and nothing is
+    converted" — an unsigned element read as an `int` would turn its upper half negative, which Avin
+    has no unsigned type to hold, while a byte is an octet of no sign. *Alternatives*: any integer
+    of the size (silently reinterpreting unsigned elements); only the C types the chapter lists
+    by name (which refuses `FT_Fixed *`, `aa_octet *` and every typedef). **Review with the user**:
+    an unsigned element array (`uint32_t *` pixels) needs a binding per element or a buffer.
+  - **`length(data)` is written first, before the parameter's type and before `inout`**
+    (`length(buffer) inout FT_ULong *length`), as `out` and `inout` are; a parameter may still be
+    named `length`. It marks an integer of C's keywords (not `char`, not an enumeration) or a
+    typedef, which the C unit checks to be an integer. *Alternative*: after the type, which reads as
+    part of it.
+  - **An `Option` of an array is accepted wherever an array is**, not only beside an `inout` length:
+    `None` passes null and a length of zero to any binding. *Why*: C that takes null for "no data"
+    is common, and the rule is the chapter's for `inout`. *Alternative*: only beside an `inout`
+    length.
+  - **An array's length crosses as an `int` converted to the length's C type**, so an array too
+    long for an `unsigned char` length stops the program at the call, naming the length's type and
+    the array ("value out of range for u8 (unsigned char), the length of `p`"). **A length C writes
+    back through `inout` is read as an out value, then compared with the array's length**, the
+    program stopping where it is greater; `None` bounds nothing, since it asks C the length it
+    needs.
+  - **Every array position crosses as a pointer in place unless the call is `blocking`**: the
+    collector never moves an object and no collection runs while a call that is not `blocking` holds
+    the thread, so nothing is copied; a `blocking` call is passed a copy off the heap (an empty
+    array's a byte long, so C is never passed null for it), copied back only where the pointer is not
+    `const`, and freed once the thread is running again. *Alternative*: copying for every call,
+    which costs the common case for nothing.
+  - **A `blocking` call keeps each handle it is passed alive across the wait** by using its object
+    after `leave_safe`, so the collector, running while the call waits, cannot give the C pointer
+    back under C. *Alternative*: relying on the caller holding it, which a temporary argument does
+    not.
+  - **Arrays of mirrors, strings, handles, `bool` and the narrower integers are refused** with the
+    four element types the chapter lists; arrays of mirrors arrive with struct mirrors (step 7).
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

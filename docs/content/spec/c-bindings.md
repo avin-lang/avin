@@ -139,7 +139,8 @@ are written before the parameter's type and removed before the header check:
 | `userdata` | The `void *` that travels beside a [callback](#callbacks); not an Avin parameter |
 
 `length(data)` before an integer parameter says it is the length of the array parameter `data`, and
-it is filled in from the array rather than written by the caller.
+it is filled in from the array rather than written by the caller. It is written first, before the
+parameter's type and before `inout`.
 
 A binding whose Avin result is `unit` discards the C result, whatever it is. Every other C result is
 converted.
@@ -651,10 +652,15 @@ constant, and holds NaN, the infinities and minus zero as C defines them.
 - **An array parameter is a pointer.** An `Array[byte]` goes to a `uint8_t *`, `char *` or
   `unsigned char *`, an `Array[int]` to an `int32_t *` or `int *`, an `Array[long]` to an
   `int64_t *`, an `Array[real]` to a `double *`; the element types must be the same size and kind,
-  and nothing is converted. A `const` pointer is only read; a pointer that is not `const` may be
-  written, and what C writes is in the array after the call. Its length goes to the parameter
-  marked `length(data)`, which is not an Avin parameter; a binding taking an array whose length
-  nothing carries is refused, since C could read past its end.
+  and nothing is converted. A typedef of such a type takes the array too; the C unit checks what the
+  pointer points at, by kind and size, and an `int` or a `long` element as signed
+  ([proposed](/spec/decisions/#proposed)). A `const` pointer is only read; a pointer that is not
+  `const` may be written, and what C writes is in the array after the call. Its length goes to the
+  parameter marked `length(data)`, which is not an Avin parameter, converted to that parameter's C
+  type as any `int` argument is: an array too long for it stops the program at the call. The length
+  may come before the array or after it, and a call may take several arrays, each with its own. A
+  binding taking an array whose length nothing carries is refused, since C could read past its end.
+  An `Option` of an array passes null and a length of zero for `None`.
 
   ```avin
   @c("ssize_t read(int fd, uint8_t *into, length(into) size_t count)")
@@ -663,9 +669,9 @@ constant, and holds NaN, the infinities and minus zero as C defines them.
 
   `length(data)` may also mark an `inout` pointer to an integer, for C that is told the length and
   answers how much it used ([proposed](/spec/decisions/#proposed)): the array's length is written in
-  before the call, and the value C writes back is part of the result, stopping the program if it
-  exceeds the array's length. An `Option` of the array passes null and a length of zero for `None`,
-  which is how a C function is asked the size it needs. FreeType's `FT_Load_Sfnt_Table` is asked
+  before the call, and the value C writes back is part of the result, an integer, stopping the
+  program if it exceeds the array's length. An `Option` of the array passes null and a length of
+  zero for `None`, which is how a C function is asked the size it needs, and bounds nothing. FreeType's `FT_Load_Sfnt_Table` is asked
   twice, once with no buffer for the table's size and once to fill one:
 
   ```avin
@@ -814,6 +820,10 @@ copy is not on the heap, an array is copied into memory outside it and back afte
 handle's C pointer is a plain value whose object the call's frame keeps alive. The result is
 converted once the thread is running again.
 
+A `blocking` array's copy is copied back only where the pointer is not `const`, and freed, before
+the result is converted; a handle's object is used once the thread is running again, so the frame
+keeps it alive across the wait ([proposed](/spec/decisions/#proposed)).
+
 A call that is not `blocking` is made with the thread running, so it holds up every collection for
 as long as it runs, and may be passed pointers into the Avin heap — an array's elements — directly.
 
@@ -893,6 +903,8 @@ on(event: string, @threaded listener: (Properties, EventData) -> unit)
 | A binding with no header to check it against | Name the header in `c-libraries` |
 | Writing through a `ByteView`, or a `writable` binding of a `const` pointer | A `MutByteView` from a `writable` binding, an array C fills, or a `ByteBlock` |
 | An array of mirrors to a pointer that is not `const` | An `out` array C allocates (`array:`), or a binding per element |
+| An array of strings, handles, `bool`, or integers narrower than `int`; an `Array[int]` or `Array[long]` to unsigned elements | A binding per element, or a buffer |
+| An array whose length no parameter carries, or one passed `inout` | Mark the length `length(data)` |
 | An indexed field accessor with no `bound:` | Name the C expression that bounds the index |
 | `keeps:` naming an array parameter, whose C copy lives for the call ([proposed](/spec/decisions/#proposed)) | A `ByteBlock`, which is never copied |
 | `kept:` on a class some binding makes without keeping one handle of the named class | Keep it in every binding that makes the class |

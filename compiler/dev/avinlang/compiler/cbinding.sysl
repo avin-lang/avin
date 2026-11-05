@@ -39,9 +39,14 @@ struct CParam
     name: string
     /** How the value crosses: in, or written back by C through the pointer, `out` or `inout`. */
     mode: CMode
-    /** For an `out` or `inout` parameter, the type the pointer points at, and its text. */
+    /** For an `out` or `inout` parameter, the type the pointer points at, and its text; for a
+     * pointer passed in, what it points at, an array's element type, where the prototype writes it
+     * as one pointer, and otherwise `void` and "". */
     pointee: CType
     pointee_text: string
+    /** The name of the array parameter whose length this parameter carries, `length(data)`, or "".
+     * Such a parameter is no Avin parameter: it is filled in from the array. */
+    length_of: string
 
 /** How a prototype's parameter crosses: passed in, or `out`, a pointer C writes a value through that
  * is part of the binding's result, or `inout`, one C is also passed a value through. */
@@ -119,6 +124,14 @@ parse_prototype(text: string) -> Result[CPrototype, string]
         loop
             if at < tokens.len() && tokens[at] == "..."
                 return Err("a variadic function cannot be bound: the types of the arguments `...` takes cannot be checked")
+            var length_of = ""
+            if at < tokens.len() && tokens[at] == "length"
+                if at + 3 >= tokens.len() || tokens[at + 1] != "(" || !is_c_word(tokens[at + 2]) || tokens[at + 3] != ")"
+                    return Err("`length` names the array parameter whose length the parameter carries, in parentheses, as in `length(data) size_t n`")
+                length_of = tokens[at + 2]
+                at += 4
+                if at < tokens.len() && tokens[at] == "out"
+                    return Err(s"a length is filled in from the array `$length_of`, so `length($length_of)` marks a parameter passed in, or an `inout` pointer C writes the length it used through, not an `out` one")
             var mode = CIn
             if at < tokens.len() && (tokens[at] == "out" || tokens[at] == "inout")
                 mode = if tokens[at] == "out" then COut else CInOut
@@ -137,7 +150,13 @@ parse_prototype(text: string) -> Result[CPrototype, string]
                 if pointee_text.starts_with("const ") && !pointee_text.ends_with("*") || pointee_text.ends_with("const")
                     return Err(s"C cannot write through the `$word` parameter `${p.text}`: what it points at is `const`")
                 pointee = parse_c_type(pointee_text)?.ty
-            params.push(CParam(p.ty, p.text, p.name.unwrap_or(""), mode, pointee, pointee_text))
+            elif p.text.ends_with(" *")
+                // What a pointer passed in points at, which an array's elements are.
+                val inner = p.text[..<p.text.bytes.len - 2]
+                if parse_c_type(inner) is Ok(t)
+                    pointee = t.ty
+                    pointee_text = inner
+            params.push(CParam(p.ty, p.text, p.name.unwrap_or(""), mode, pointee, pointee_text, length_of))
             if at < tokens.len() && tokens[at] == ","
                 at += 1
                 continue
@@ -147,7 +166,48 @@ parse_prototype(text: string) -> Result[CPrototype, string]
     at += 1
     if at < tokens.len() && tokens[at] == ";" then at += 1
     if at < tokens.len() then return Err(s"`${tokens[at]}` follows the parameter list")
+    c_check_lengths(params)?
     Ok(CPrototype(symbol, declared.ty, declared.text, params))
+
+// Each `length(data)` names a pointer parameter passed in, `data`, which no other parameter's length
+// names, and marks an integer, or an `inout` pointer to one.
+private c_check_lengths(params: Buf[CParam]) -> Result[unit, string]
+    for k in 0..<params.len()
+        val q = params[k]
+        if q.length_of == "" then continue
+        val name = q.length_of
+        if q.name == "self" then return Err("`self` is the receiver, which carries no array's length")
+        val integer = (if q.mode is CInOut then q.pointee else q.ty) match
+            CKeyword(n) -> n != "char" && !n.starts_with("enum ")
+            CTypedef(_) -> true
+            _ -> false
+        if !integer
+            val shown = if q.mode is CInOut then q.pointee_text else q.text
+            return Err(s"`length($name)` marks the parameter carrying the length of `$name`, which is an integer, and `$shown` is not one")
+        var found = false
+        for j in 0..<params.len()
+            if j == k then continue
+            val a = params[j]
+            if a.length_of == name then return Err(s"the length of `$name` is carried by one parameter, and two say `length($name)`")
+            if a.name != name then continue
+            found = true
+            if name == "self" then return Err("`self` is the receiver, a handle, and no array")
+            if a.length_of != "" then return Err(s"`$name` carries a length itself, so it is no array")
+            if !(a.mode is CIn) then return Err(s"`$name` is an `out` or `inout` pointer, so it is no array; an array is a pointer passed in")
+            if !(a.ty is CPointerType || a.ty is CText(_)) then return Err(s"`$name` is `${a.text}`, and an array is passed as a pointer to its elements, as in `uint8_t *$name`")
+        if !found then return Err(s"`length($name)` names no parameter of the prototype")
+    Ok(())
+
+/** The index of the parameter carrying the length of the array parameter `name`, if one does. */
+c_length_param(p: CPrototype, name: string) -> Option[usize]
+    if name == "" then return None
+    for k in 0..<p.params.len()
+        if p.params[k].length_of == name then return Some(k)
+    None
+
+/** Whether parameter `k` of `p` is an array: a pointer passed in whose length another parameter
+ * carries. */
+c_is_array_param(p: CPrototype, k: usize) -> bool = p.params[k].mode is CIn && c_length_param(p, p.params[k].name) is Some(_)
 
 // A type and the name after it, as a declaration writes them.
 private struct CDeclared
@@ -175,8 +235,10 @@ private c_declaration(tokens: Buf[string], at: *usize) -> Result[CDeclared, stri
             continue
         if t == "out" || t == "inout"
             return Err(s"`$t` is written first, before the parameter's type, as in `$t int *x`")
-        if t == "userdata" || t == "length"
+        if t == "userdata"
             return Err(s"`$t` parameters are not implemented")
+        if t == "length" && *at + 1 < tokens.len() && tokens[*at + 1] == "("
+            return Err("`length(data)` is written first, before the parameter's type and before `inout`, as in `length(data) size_t n`")
         if t == "static" || t == "inline" || t == "register" || t == "typedef"
             return Err(s"`$t` is not part of a function's prototype")
         if t == "_Complex" || t == "__int128" || t == "_Imaginary"
@@ -250,7 +312,7 @@ private c_declaration(tokens: Buf[string], at: *usize) -> Result[CDeclared, stri
         name = Some(tokens[*at])
         *at = *at + 1
     if *at < tokens.len() && tokens[*at] == "["
-        return Err("an array parameter cannot cross a C binding: arrays are not implemented")
+        return Err("a parameter declared with brackets is written as the pointer C passes, as in `int *values`, its length carried by a parameter marked `length(values)`")
     val plain_char = ty match
         CKeyword(n) -> n == "char"
         _ -> false
@@ -582,12 +644,16 @@ struct CResultParts
     result: &Type
     outs: Buf[&Type]
 
-/** The prototype indices of the parameters an Avin binding takes, in order: all but the `out` ones. */
+/** The prototype indices of the parameters an Avin binding takes, in order: all but the `out` ones
+ * and those carrying an array's length, which is filled in from the array. */
 c_avin_positions(p: CPrototype) -> Buf[usize]
     var out: Buf[usize] = buf()
     for i in 0..<p.params.len()
-        if !(p.params[i].mode is COut) then out.push(i)
+        if c_is_avin_param(p.params[i]) then out.push(i)
     out
+
+/** Whether a prototype's parameter is one an Avin binding takes: not `out`, and carrying no length. */
+c_is_avin_param(q: CParam) -> bool = !(q.mode is COut) && q.length_of == ""
 
 /** The number of `out` and `inout` parameters of a prototype. */
 c_out_count(p: CPrototype) -> usize
@@ -730,6 +796,14 @@ c_free_text(f: &Function) -> Option[string]
                 if arg.value.kind is StringLit(text) then return Some(text)
     None
 
+/** Whether a C binding's `@c` says the call may wait, with the word `blocking`. */
+c_is_blocking(f: &Function) -> bool
+    for a in f.annotations
+        if a.name != "c" then continue
+        for arg in a.args
+            if arg.name is None && arg.value.kind is Name(word) && word == "blocking" then return true
+    false
+
 /** How an Avin type carries a C string, for the types that do: a `string`, copied and checked as
  * UTF-8, or an `Array[byte]`, copied as it is, each perhaps in an `Option`, which is null's `None`. */
 enum CTextForm
@@ -754,6 +828,46 @@ c_text_form(t: &Type, data: Buf[DataSymbol], classes: Buf[ClassSymbol]) -> CText
             val array = classes[k].module_name == "avin" && classes[k].name == "Array" && !classes[k].decl.object
             if array && args.len() == 1 && *args[0] is Byte then TextBytes(optional) else NoText
         _ -> NoText
+
+/** How an Avin type carries an array to C: its element type, and whether it is in an `Option`, whose
+ * `None` passes null and a length of zero. */
+struct CArrayForm
+    element: &Type
+    optional: bool
+
+/** The array form of the Avin type `t`, where it is an `Array` or an `Option` of one. */
+c_array_form(t: &Type, data: Buf[DataSymbol], classes: Buf[ClassSymbol]) -> Option[CArrayForm]
+    var inner = t
+    var optional = false
+    *t match
+        Data(d, _, args) ->
+            if data[d].module_name == "avin" && data[d].name == "Option" && args.len() == 1
+                inner = args[0]
+                optional = true
+        _ -> ()
+    *inner match
+        Class(k, _, args) ->
+            val array = classes[k].module_name == "avin" && classes[k].name == "Array" && !classes[k].decl.object
+            if array && args.len() == 1 then Some(CArrayForm(args[0], optional)) else None
+        _ -> None
+
+/** The size in bytes of an element of an array that crosses to C, or 0 for an element type that
+ * does not: a `byte`, an `int`, a `long` and a `real` do, as they are, since nothing is converted. */
+c_array_element_size(element: &Type) -> usize = *element match
+    Byte -> 1
+    Int(width) -> if width == 32 then 4 elif width == 64 then 8 else 0
+    Real -> 8
+    _ -> 0
+
+/** Why the Avin array type `t`, carried in `form`, cannot be passed to the array parameter `q`, or
+ * "". The C unit checks the element type C's pointer points at. */
+c_array_problem(q: CParam, form: CArrayForm) -> string
+    if c_array_element_size(form.element) == 0
+        return "an array crosses to C as `Array[byte]`, `Array[int]`, `Array[long]` or `Array[real]`, whose elements C reads as they are"
+    if !(q.ty is CPointerType || q.ty is CText(_)) || q.pointee_text == ""
+        return s"an array is passed as a pointer to its elements, as in `uint8_t *${q.name}`"
+    if q.ty is CText(_) && !(*form.element is Byte) then return "a pointer to `char` takes an `Array[byte]`"
+    ""
 
 /** What the Avin type at a C position must be, as a diagnostic says it, or "" where `avin` may cross
  * as `c`; `form` is how `avin` carries a string, if it does. A result whose Avin type is `unit`
@@ -784,9 +898,9 @@ c_crossing_problem(c: CType, avin: &Type, form: CTextForm, result: bool) -> stri
 // What a string's Avin type `form` must be at the C position `c`, or "".
 private c_text_problem(c: CType, form: CTextForm, result: bool) -> string
     val bytes = form is TextBytes(_)
-    if !result && bytes then return "an `Array[byte]` parameter is an array, and arrays are not implemented"
+    if !result && bytes then return "an `Array[byte]` parameter is an array, whose length a parameter marked `length(…)` carries"
     c match
-        CText(constant) -> if result || constant then "" else "C may write through a `char *`, so it takes an array rather than a `string`, and arrays are not implemented"
+        CText(constant) -> if result || constant then "" else "C may write through a `char *`, so it takes an `Array[byte]`, its length carried by a parameter marked `length(…)`, rather than a `string`"
         CTypedef(_) -> ""
         CVoidType -> "the C function answers nothing, so the binding's result is `unit`"
         _ -> "a string crosses as a C `const char *`" + (if result then " or `char *`" else "")

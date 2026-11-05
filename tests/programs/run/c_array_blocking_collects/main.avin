@@ -1,0 +1,89 @@
+// expect: exit 0
+// A blocking call lets collections run on other threads while it waits: another thread allocating,
+// with the collector running at every allocation, reaches the point where it sets the flag the call
+// waits for, which it could not if the waiting thread held up its collections. Meanwhile the call's
+// array and handle, held by no one but the call, stay alive: C reads the handle's object after the
+// wait, which stops the process had it been given back, and every object is given back exactly once
+// afterwards. Arrays made fresh in a loop, passed to calls that block and calls that do not while
+// another thread collects, read and write what they should. The corpus runs this with the collector
+// at every allocation, at -O0 and -O2.
+import avin.threads.spawn
+import fixture.{Object, newObject, objects}
+
+@c("void aa_set_flag(void)")
+setFlag()
+
+@c("void aa_clear_flag(void)")
+clearFlag()
+
+@c("int aa_wait_flag(int timeout_ms)", blocking)
+waitFlag(timeout: int) -> int
+
+@c("long long aa_wait_sum(const int32_t *p, length(p) size_t n, int timeout_ms)", blocking)
+waitSum(p: Array[int], timeout: int) -> long
+
+@c("int aa_wait_fill(uint8_t *p, length(p) size_t n, int timeout_ms)", blocking)
+waitFill(p: Array[byte], timeout: int) -> int
+
+@c("int aa_wait_object(const fx_object *o, int timeout_ms)", blocking)
+waitObject(o: Object, timeout: int) -> int
+
+@c("long long aa_sum_ints(const int32_t *p, length(p) int n)")
+sumInts(p: Array[int]) -> long
+
+@c("void aa_scale_ints(int *p, length(p) size_t n, int k)")
+scaleInts(p: Array[int], k: int)
+
+@c("void aa_scale_ints(int *p, length(p) size_t n, int k)", blocking)
+scaleIntsWaiting(p: Array[int], k: int)
+
+// Allocates `n` small vectors, then sets the flag.
+churn(n: int) -> int
+    var total = 0
+    for i in 0..<n
+        val v = [i, i + 1]
+        total += v(1) - v(0)
+    setFlag()
+    total
+
+// Allocates until every object has been freed, or gives up after a bound.
+settle() -> bool
+    var n = 0
+    while objects().freed < objects().created && n < 1000000
+        val v = [n, n + 1]
+        n += v(1) - v(0)
+    objects().freed == objects().created
+
+main()
+    clearFlag()
+    val first = spawn(() -> churn(500))
+    println(waitFlag(60000))
+    println(first.join())
+    clearFlag()
+    val second = spawn(() -> churn(500))
+    println(waitSum(Array.tabulate(1000, i -> i), 60000))
+    second.join()
+    clearFlag()
+    val third = spawn(() -> churn(500))
+    val bytes = Array.fill(256, byte(1))
+    println(waitFill(bytes, 60000))
+    third.join()
+    println(bytes(255))
+    clearFlag()
+    val fourth = spawn(() -> churn(500))
+    println(waitObject(newObject(31), 60000))
+    fourth.join()
+    println(settle())
+    val c = objects()
+    println(s"${c.created} ${c.freed}")
+    // Fresh arrays in a loop while another thread collects.
+    val noise = spawn(() -> churn(2000))
+    var good = 0
+    for round in 0..<200
+        val a = Array.tabulate(1000 + round, i -> i % 10)
+        val before = sumInts(a)
+        scaleInts(a, 2)
+        scaleIntsWaiting(a, 3)
+        if sumInts(a) == before * 6 then good += 1
+    noise.join()
+    println(good)

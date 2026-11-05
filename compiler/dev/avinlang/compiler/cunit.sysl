@@ -189,13 +189,20 @@ c_unit_bindings(program: TProgram, files: Buf[ProgramFile], library: usize) -> B
         var params: Buf[&Type] = buf()
         var out_at = 0usize
         var in_at = 0usize
+        // A length passed in is the array's, an `int`; an array's position has its element type,
+        // which the C unit checks the pointer points at.
         for i in 0..<p.params.len()
-            if p.params[i].mode is CIn
-                params.push(if in_at < s.params.len() then s.params[in_at] else Unit)
+            val q = p.params[i]
+            if q.mode is CIn && q.length_of != "" then params.push(Int(32))
+            elif q.mode is CIn
+                var t: &Type = if in_at < s.params.len() then s.params[in_at] else Unit
+                if c_is_array_param(p, i)
+                    if c_array_form(t, program.data, program.classes) is Some(form) then t = form.element
+                params.push(t)
             else
                 params.push(if out_at < parts.outs.len() then parts.outs[out_at] else Unit)
                 out_at += 1
-            if !(p.params[i].mode is COut) then in_at += 1
+            if c_is_avin_param(q) then in_at += 1
         if c_mirror_of(result, program.data) is Some(_) then result = Int(64)
         for i in 0..<params.len()
             if c_mirror_of(params[i], program.data) is Some(_) then params[i] = Int(64)
@@ -434,6 +441,9 @@ enum CUnitLine
     /** The check that the typedef `name`, parameter `position` of `bindings[binding]` (0 for the
      * result), is the kind `kind` needs. */
     KindLine(binding: usize, position: usize, name: string, kind: CKind)
+    /** The check that the type parameter `position` of `bindings[binding]` points at is the element
+     * type of the Avin array passed there, as it is, by kind, size and sign. */
+    ElementLine(binding: usize, position: usize)
     /** The check that `free`, which `bindings[binding]`'s `free:` names, frees a string. */
     FreeLine(binding: usize, free: string)
     /** A line of the glue of `handles[handle]` compiling what its `@c` says under `part`: `type`,
@@ -538,6 +548,11 @@ c_unit_source_of(parts: CUnitParts, libraries: Buf[CLibrary]) -> CUnitSource
                 takes = takes + (if takes == "" then "" else " || ") + s"__builtin_types_compatible_p($fp, void (*)($arg))"
             out.push(s"_Static_assert($takes, \"avin: the free function $f\");\n")
             lines.push(FreeLine(i, f))
+        // What each array parameter points at is its elements' type, as it is.
+        for k in 0..<p.params.len()
+            if !c_is_array_param(p, k) then continue
+            out.push(s"_Static_assert(${element_test(b.params[k], p.params[k].pointee_text)}, \"avin: the elements of parameter ${k + 1} of ${b.name}\");\n")
+            lines.push(ElementLine(i, k + 1))
         // Each named type at each position: the result first, then the parameters.
         for k in 0..<p.params.len() + 1
             // An `out` or `inout` parameter's value is the type its pointer points at, answered.
@@ -864,6 +879,22 @@ private kind_test(kind: CKind, name: string) -> string
         KindText -> s"__builtin_types_compatible_p($name, char *) || $constant"
         KindConstText -> constant
 
+// The constant expression that holds where the C type `e` holds the elements of an Avin array of
+// `element` as they are: an integer type of its size, signed for an `int` or a `long`, or a
+// floating-point type eight bytes wide for a `real`.
+private element_test(element: &Type, e: string) -> string
+    val class = s"__builtin_classify_type(*($e *)0)"
+    val size = c_array_element_size(element)
+    if *element is Real then return s"$class == 8 && sizeof($e) == 8"
+    val signed = if *element is Byte then "" else s" && ($e)-1 < ($e)0"
+    s"$class == 1 && sizeof($e) == $size$signed"
+
+// What the elements of an Avin array of `element` are in C, as a diagnostic says it.
+private element_text(element: &Type) -> string = *element match
+    Byte -> "an integer type one byte wide"
+    Real -> "a floating-point type eight bytes wide"
+    _ -> s"a signed integer type ${c_array_element_size(element)} bytes wide"
+
 private contains_text(xs: Buf[string], x: string) -> bool
     for y in xs
         if y == x then return true
@@ -1039,6 +1070,13 @@ c_unit_diagnostics_of(output: string, unit: CUnitSource, parts: CUnitParts, libr
                 if d.message.starts_with("static assertion failed") && !contains_text(troubles[i].kind_names, name)
                     troubles[i].kind_names.push(name)
                     troubles[i].kinds.push(s"the C type `$name` of $where is not $what in the headers, so it cannot cross as `${type_name(avin)}`")
+            ElementLine(i, position) ->
+                placed_any = true
+                val q = bindings[i].prototype.params[position - 1]
+                val element = bindings[i].params[position - 1]
+                // A type the headers do not declare at all is reported by the header check.
+                if d.message.starts_with("static assertion failed")
+                    troubles[i].kinds.push(s"the C type `${q.pointee_text}` parameter $position points at is not ${element_text(element)} in the headers, so it cannot hold the elements of an `Array[${type_name(element)}]` as they are")
             FreeLine(i, name) ->
                 placed_any = true
                 if troubles[i].frees.len() > 0 then continue

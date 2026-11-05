@@ -7004,6 +7004,7 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
         var free: Option[string] = None
         var named_ok = true
         var borrowed = false
+        var blocking = false
         var keeps: Buf[string] = buf()
         var consumes: Buf[string] = buf()
         var given: Buf[string] = buf()
@@ -7015,7 +7016,10 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                     if arg.value.kind is Name(word) && word == "borrowed"
                         if borrowed then c.note(unit, arg.value.span, "`borrowed` is said once")
                         borrowed = true
-                    elif arg.value.kind is Name(word) then c.note(unit, arg.value.span, s"`$word` is not a word of `@c` on a function; `borrowed` says C only lends the handle it answers")
+                    elif arg.value.kind is Name(word) && word == "blocking"
+                        if blocking then c.note(unit, arg.value.span, "`blocking` is said once")
+                        blocking = true
+                    elif arg.value.kind is Name(word) then c.note(unit, arg.value.span, s"`$word` is not a word of `@c` on a function; `borrowed` says C only lends the handle it answers, and `blocking` that the call may wait")
                     else named_ok = false
                     continue
             if n == "keeps" || n == "consumes"
@@ -7039,7 +7043,7 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                     if n == "keeps" then keeps.push(name) else consumes.push(name)
                 continue
             if n != "free"
-                c.note(unit, arg.value.span, s"`$n:` is not a word of `@c` on a function, which takes `free:`, `keeps:`, `consumes:` and `borrowed`")
+                c.note(unit, arg.value.span, s"`$n:` is not a word of `@c` on a function, which takes `free:`, `keeps:`, `consumes:`, `borrowed` and `blocking`")
                 continue
             if free is Some(_)
                 c.note(unit, arg.value.span, "`free:` is given once")
@@ -7094,7 +7098,15 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
             val ctype = if inout then cp.pointee else cp.ty
             val ctext = if inout then cp.pointee_text else cp.text
             var problem = ""
-            if c_handle_form(t, c.data, c.classes) is Some(h)
+            val array = c_array_form(t, c.data, c.classes)
+            if c_is_array_param(p, positions[i + first])
+                problem = array match
+                    Some(form) -> c_array_problem(cp, form)
+                    None -> s"`${cp.name}` is an array, its length carried by the parameter marked `length(${cp.name})`, so it crosses as an `Array` or an `Option` of one"
+            elif array is Some(_) && inout then problem = "an array is passed in, a pointer to its elements, and never `inout`"
+            elif array is Some(_) && cp.name == "" then problem = "C could read past the end of an array whose length nothing carries: name the pointer, and mark the integer parameter that carries its length `length(name)`"
+            elif array is Some(_) then problem = s"C could read past the end of an array whose length nothing carries: mark the integer parameter that carries it `length(${cp.name})`"
+            elif c_handle_form(t, c.data, c.classes) is Some(h)
                 problem = if inout then "a handle is not passed `inout`: whether C keeps the reference it is passed or replaces it, the binding cannot say" else c_handle_problem(c, h.class_index, cp.text, false)
             elif c_mirror_of(t, c.data) is Some(d) then problem = c_mirror_problem(c.data[d].decl, c.data[d].name, ctext)
             else problem = c_crossing_problem(ctype, t, c_text_form(t, c.data, c.classes), false)
@@ -7144,7 +7156,10 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                     j += 1
                     if *t is ErrorType then continue
                     var problem = ""
-                    if *t is Unit then problem = "an out value is a scalar, a string, a handle or an enum mirror"
+                    if q.length_of != ""
+                        if !(*t is Int(_)) then problem = s"the length C writes back through `${q.name}`, how much of `${q.length_of}` it used, is an integer"
+                        else problem = c_crossing_problem(q.pointee, t, NoText, true)
+                    elif *t is Unit then problem = "an out value is a scalar, a string, a handle or an enum mirror"
                     elif c_handle_form(t, c.data, c.classes) is Some(h)
                         if q.mode is CInOut then problem = "a handle is not passed `inout`: whether C keeps the reference it is passed or replaces it, the binding cannot say"
                         else
@@ -7334,7 +7349,9 @@ private check_c_ownership(c: *Checker, unit: usize, f: &Function, a: Annotation,
                 c_handle_form(params[i], c.data, c.classes) match
                     Some(h) -> class_index = Some(h.class_index)
                     None ->
-                        if !(*params[i] is ErrorType) then c.note(unit, f.params[i].ty.span, s"`$word:` names `$name`, of type `${type_name(params[i])}`: what a C binding keeps or takes is a handle, and anything else crosses for the call alone")
+                        if c_array_form(params[i], c.data, c.classes) is Some(_)
+                            c.note(unit, f.params[i].ty.span, s"`$word:` names the array `$name`, which C holds for the call alone; memory C keeps is a `ByteBlock`, which is never copied")
+                        elif !(*params[i] is ErrorType) then c.note(unit, f.params[i].ty.span, s"`$word:` names `$name`, of type `${type_name(params[i])}`: what a C binding keeps or takes is a handle, and anything else crosses for the call alone")
                         continue
                 if which == 0 && made is None && receiver_class is None
                     c.note(unit, a.span, s"`keeps:` makes the handle a binding answers keep what it names, and `${f.name}` answers no handle and is no method of one")

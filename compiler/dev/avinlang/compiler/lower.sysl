@@ -2089,10 +2089,39 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
     val parts = c_result_parts(p, result_type, l.program.data) match
         Ok(parts) -> parts
         Err(why) -> panic(why)
+    val blocking = c_is_blocking(symbol.decl)
+    // Each array parameter's pointer and length, the length an `int`, by the prototype's index.
+    val arrays = c_arrays_in(l, symbol, p, blocking)
     var in_at = 0usize
     var out_at = 0usize
     for k in 0..<p.params.len()
         val q = p.params[k]
+        // A length is the array's, filled in rather than passed by the caller.
+        if q.length_of != "" && q.mode is CIn
+            val a = arrays.of[c_param_index(p, q.length_of)].unwrap()
+            val s = c_scalar_of(q.ty, Int(32), l.program.c_measures)
+            scalars.push(s)
+            passed.push(c_argument(l, a.length, Int(32), s, s"${c_integer_name(q.ty, s)}, the length of `${q.length_of}`", at))
+            continue
+        if q.length_of != ""
+            val a = arrays.of[c_param_index(p, q.length_of)].unwrap()
+            val t = concrete(l, parts.outs[out_at])
+            out_at += 1
+            var slot = c_out_slot(l, symbol, q, t, Some(a.length), Int(32), &copies, at)
+            slot.limit = Some(a.limit)
+            outs.push(slot)
+            scalars.push(CAddress)
+            passed.push(SlotAddress(slot.slot))
+            continue
+        if arrays.of[k] is Some(a)
+            in_at += 1
+            args.push(a.pointer)
+            objects.push(None)
+            classes.push(0)
+            optionals.push(false)
+            scalars.push(CAddress)
+            passed.push(a.pointer)
+            continue
         if !(q.mode is CIn)
             val t = concrete(l, parts.outs[out_at])
             out_at += 1
@@ -2159,7 +2188,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
         val mirror = c_mirror_of(e, l.program.data)
         val s = c_scalar_of(p.result, if mirror is Some(_) then Int(64) else e, l.program.c_measures)
         val answer = fresh(l, c_machine(s))
-        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), passed))
+        c_call(l, Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), passed), blocking, arrays, objects)
         val ok = compare(l, CmpEq, Value(answer), c_zero(s))
         val slot = machine_slot(l, MRef)
         val yes = new_block(l)
@@ -2190,27 +2219,27 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
     var made_optional = false
     if text_result
         val answer = fresh(l, MPtr)
-        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(CAddress)), passed))
+        c_call(l, Call(Some(answer), CFunction(p.symbol, scalars, Some(CAddress)), passed), blocking, arrays, objects)
         // C may answer a pointer into a string it was passed, so the copies outlive the answer's.
         first = c_text_answer(l, Value(answer), answered, result_form, free, s"`${p.symbol}` answered", at)
     elif c_handle_form(answered, l.program.data, l.program.classes) is Some(h)
         val answer = fresh(l, MPtr)
-        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(CAddress)), passed))
+        c_call(l, Call(Some(answer), CFunction(p.symbol, scalars, Some(CAddress)), passed), blocking, arrays, objects)
         val handle = c_handle_out(l, symbol, calls, Value(answer), answered, h, s"`${p.symbol}` answered", at)
         first = Some(handle.value)
         made = Some(handle.object)
         made_optional = h.optional
     elif *answered is Unit
-        l.insts.push(Call(None, CFunction(p.symbol, scalars, None), passed))
+        c_call(l, Call(None, CFunction(p.symbol, scalars, None), passed), blocking, arrays, objects)
     elif c_mirror_of(answered, l.program.data) is Some(d)
         val s = c_scalar_of(p.result, Int(64), l.program.c_measures)
         val answer = fresh(l, c_machine(s))
-        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), passed))
+        c_call(l, Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), passed), blocking, arrays, objects)
         first = Some(c_mirror_answer(l, Value(answer), d, s, s"`${p.symbol}` answered", at))
     else
         val s = c_scalar_of(p.result, answered, l.program.c_measures)
         val answer = fresh(l, c_machine(s))
-        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), passed))
+        c_call(l, Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), passed), blocking, arrays, objects)
         first = Some(c_answer(l, Value(answer), s, answered, at))
     val read = c_read_outs(l, symbol, calls, outs, at)
     c_release_copies(l, copies)
@@ -2226,6 +2255,96 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
     val value = if outs.len() == 0 then first else c_assemble(l, result_type, values)
     l.library = outer
     finish(l, Return(value))
+
+/** An array passed to a binding: the array, perhaps null for `None`; the pointer C is passed, to its
+ * elements or, for a `blocking` call, to a copy of them off the heap, null for `None`; its length, an
+ * `int`, zero for `None`; the most a length C writes back may be, a `long`; its element size; and
+ * whether C may write through the pointer, so a copy is copied back. */
+private struct CArrayIn
+    array: Operand
+    pointer: Operand
+    length: Operand
+    limit: Operand
+    size: usize
+    write: bool
+
+/** The arrays a binding passes, by the prototype's index of each. */
+private struct CArraysIn
+    of: Buf[Option[CArrayIn]]
+
+// The arrays among the parameters of the binding `symbol`, each made ready to pass. A call that is
+// not `blocking` is passed a pointer to the elements in the heap, which no collection can run under;
+// a `blocking` one a copy outside it, since a collection runs while it waits.
+private c_arrays_in(l: *Lowering, symbol: FunctionSymbol, p: CPrototype, blocking: bool) -> CArraysIn
+    var of: Buf[Option[CArrayIn]] = buf()
+    var in_at = 0usize
+    for k in 0..<p.params.len()
+        val q = p.params[k]
+        val i = in_at
+        if c_is_avin_param(q) then in_at += 1
+        if !c_is_array_param(p, k)
+            of.push(None)
+            continue
+        val t = concrete(l, symbol.params[i])
+        val x = Value(l.param_values[i].unwrap())
+        val form = c_array_form(t, l.program.data, l.program.classes).unwrap()
+        val size = c_array_element_size(form.element)
+        val a = if !form.optional then x elif pointer_option(l, t) then x else option_pointer(l, t, x)
+        val write = q.ty match
+            CText(constant) -> !constant
+            _ -> !(" " + q.pointee_text + " ").contains(" const ")
+        var length = a
+        var limit = a
+        if form.optional
+            length = runtime_call(l, "avin_rt_c_array_length", [MRef], MInt(32), [a])
+            limit = runtime_call(l, "avin_rt_c_array_limit", [MRef], MInt(64), [a])
+        else
+            length = byte_length(l, a)
+            limit = convert_op(l, SignExtend, MInt(64), length)
+        var pointer = a
+        if blocking then pointer = runtime_call(l, "avin_rt_c_array_copy", [MRef, MInt(64)], MPtr, [a, ConstInt(64, size.to_string())])
+        elif form.optional then pointer = runtime_call(l, "avin_rt_c_array_elements", [MRef], MPtr, [a])
+        else
+            val elements = fresh(l, MPtr)
+            l.insts.push(Offset(elements, a, ArrayHeader))
+            pointer = Value(elements)
+        of.push(Some(CArrayIn(a, pointer, length, limit, size, write)))
+    CArraysIn(of)
+
+// The index of the prototype's parameter named `name`.
+private c_param_index(p: CPrototype, name: string) -> usize
+    for k in 0..<p.params.len()
+        if p.params[k].name == name then return k
+    panic(s"the prototype has no parameter `$name`")
+
+// Makes the C call `call`. A `blocking` one is bracketed by the runtime's `enter_safe` and
+// `leave_safe`, so a collection runs while it waits; once the thread is running again, each array's
+// copy is copied back where C may have written it, and freed, and each handle passed is used, so the
+// frame keeps its object, whose finalizer would give its C pointer back, alive across the call.
+private c_call(l: *Lowering, call: Inst, blocking: bool, arrays: CArraysIn, objects: Buf[Option[Operand]])
+    if !blocking
+        l.insts.push(call)
+        return
+    l.insts.push(Call(None, Runtime("avin_rt_enter_safe", MirSignature(buf(), None)), buf()))
+    l.insts.push(call)
+    l.insts.push(Call(None, Runtime("avin_rt_leave_safe", MirSignature(buf(), None)), buf()))
+    for x in arrays.of
+        if x is Some(a)
+            var types: Buf[MirType] = buf()
+            types.push(MRef)
+            types.push(MPtr)
+            types.push(MInt(64))
+            types.push(MInt(32))
+            var operands: Buf[Operand] = buf()
+            operands.push(a.array)
+            operands.push(a.pointer)
+            operands.push(ConstInt(64, a.size.to_string()))
+            operands.push(ConstInt(32, if a.write then "1" else "0"))
+            l.insts.push(Call(None, Runtime("avin_rt_c_array_back", MirSignature(types, None)), operands))
+    for o in objects
+        if o is Some(object)
+            val keep = machine_slot(l, MRef)
+            store(l, keep, Some(object))
 
 // The zero of the C integer crossing as `s`.
 private c_zero(s: CScalar) -> Operand = s match
@@ -2248,6 +2367,9 @@ private struct COutSlot
     t: &Type
     slot: usize
     scalar: CScalar
+    /** For a length C writes back, the most it may be, a `long`: the array's length, or the
+     * greatest `long` where `None` passed null. */
+    limit: Option[Operand]
 
 // The slot of the `out` or `inout` parameter `q`, whose value is of Avin type `t`, holding the
 // argument `given`, of Avin type `given_type`, converted to the C type `q` points at, or zero or null.
@@ -2265,7 +2387,7 @@ private c_out_slot(l: *Lowering, symbol: FunctionSymbol, q: CParam, t: &Type, gi
                 copies.push(copy)
                 start = copy
         store(l, place, Some(start))
-        return COutSlot(q, t, slot_of(place), CAddress)
+        return COutSlot(q, t, slot_of(place), CAddress, None)
     val mirror = c_mirror_of(t, l.program.data)
     val s = c_scalar_of(q.pointee, if mirror is Some(_) then Int(64) else t, l.program.c_measures)
     val m = if s is CBinary32 then MInt(32) else c_machine(s)
@@ -2282,7 +2404,7 @@ private c_out_slot(l: *Lowering, symbol: FunctionSymbol, q: CParam, t: &Type, gi
             start = c_argument(l, x, given_type, s, c_integer_name(q.pointee, s), at)
             if s is CBinary32 then start = convert_op(l, RealToBinary32, MInt(32), start)
     store(l, place, Some(start))
-    COutSlot(q, t, slot_of(place), s)
+    COutSlot(q, t, slot_of(place), s, None)
 
 // The position among a binding's declared parameters of the `inout` parameter `q`, for a trap's
 // name of it.
@@ -2327,7 +2449,15 @@ private c_read_outs(l: *Lowering, symbol: FunctionSymbol, call: CCall, outs: Buf
             values.push(Some(c_mirror_answer(l, x, d, o.scalar, who, at)))
             continue
         val v = if o.scalar is CBinary32 then convert_op(l, Binary32ToReal, MReal, x) else x
-        values.push(Some(c_answer(l, v, o.scalar, o.t, at)))
+        val answer = c_answer(l, v, o.scalar, o.t, at)
+        // A length C used may be no more than the array's.
+        if o.limit is Some(limit)
+            val width = *o.t match
+                Int(w) -> w
+                _ -> 64u32
+            val wide = if width < 64 then resize(l, answer, width, 64, true) else answer
+            trap_if(l, compare(l, CmpGt, wide, limit), s"${call.symbol} through `${o.q.name}` a length greater than the length of `${o.q.length_of}`", at)
+        values.push(Some(answer))
     COutValues(values, made, made_optional)
 
 // The binding's answer of Avin type `t` made of `values`: one value alone is itself, and more are a
