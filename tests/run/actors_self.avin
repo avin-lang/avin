@@ -1,0 +1,63 @@
+// An actor tells itself through the reference its start is given, and tells others from inside a
+// handler: a countdown told to itself, a ping-pong between two actors whose references travel in the
+// messages, a message told to itself from its start, which waits behind the messages already told,
+// and an actor spawned from inside another's handler. Telling oneself never waits, so a handler that
+// tells itself many times returns at once and handles them afterwards, in order.
+import avin.actors.{ActorRef, Behaviour, spawn}
+import avin.threads.{Channel, Executor, Promise}
+
+data Count
+    Down(n: int)
+    Burst(n: int)
+
+countdown(log: Channel[string]) -> Behaviour[Count] = Behaviour("Countdown", me ->
+    log.send("start")
+    me.tell(Down(-1))
+    m -> m match
+        Down(n) ->
+            log.send(s"down $n")
+            if n > 0 then me.tell(Down(n - 1))
+        Burst(n) ->
+            for i in 1..n do me.tell(Down(-100 - i))
+            log.send("burst told"))
+
+data Ball(hits: int, back: ActorRef[Ball], done: Promise[string])
+
+player(name: string) -> Behaviour[Ball] = Behaviour(name, me -> b ->
+    if b.hits == 0 then b.done.complete(s"$name ends the rally")
+    else b.back.tell(Ball(b.hits - 1, me, b.done)))
+
+data Make(reply: Promise[int])
+
+// An actor that spawns another inside its handler and asks it for its doubled number.
+maker() -> Behaviour[Make] = Behaviour("Maker", me -> m ->
+    val doubler = spawn(Behaviour[int]("Doubler", d -> n -> m.reply.complete(n * 2)))
+    doubler.tell(21))
+
+// An actor that holds its worker until `go` is sent a value.
+gate(go: Channel[int]) -> Behaviour[unit] = Behaviour("Gate", me -> _ ->
+    go.receive()
+    ())
+
+main()
+    // The countdown's start runs once the gate lets the one worker go, after both messages are told.
+    val ex = Executor.fixed(1)
+    val go = Channel[int]()
+    spawn(gate(go), ex).tell(())
+    val log = Channel[string]()
+    val c = spawn(countdown(log), ex)
+    c.tell(Down(3))
+    c.tell(Burst(2))
+    go.send(1)
+    for _ in 0..<9 do println(log.receive().get())
+    println(log.tryReceive())
+
+    val done = Promise[string]()
+    val ping = spawn(player("Ping"))
+    val pong = spawn(player("Pong"))
+    ping.tell(Ball(101, pong, done))
+    println(done.future.await())
+
+    val p = Promise[int]()
+    spawn(maker()).tell(Make(p))
+    println(p.future.await())

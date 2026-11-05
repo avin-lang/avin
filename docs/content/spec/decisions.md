@@ -2644,7 +2644,38 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- Proposed 2026-11-05 (built on branch `actor-runtime`): **A behaviour's library form is
+  `Behaviour[M](name: string, start: @sendable (ActorRef[M]) -> (M) -> unit)`** ([declaring an
+  actor](/spec/actors/#declaring-an-actor)). The start runs once on the actor's first turn, is
+  given the actor's own reference (`self`), makes the actor's state in its locals and gives back the
+  handler of each message; `actor` declarations will lower to exactly this, the name being the
+  declaration's. Why: it is the smallest value that holds "the declaration and its arguments" and
+  can be started again for a restart, and making the start a `@sendable` function puts the existing
+  capture and module-level-state checks on everything an actor's body reaches, with no new check.
+  Alternatives weighed: a trait with a `receive` method implemented by a class per actor (the state
+  would be an object the program sees, which the spec rules out); a constructor hidden from
+  programs (then the runtime could not be tested before declarations exist, and a program could not
+  build an actor from a function).
+- Proposed 2026-11-05 (built on branch `actor-runtime`): **`Executor.execute(task)`** runs a task on
+  the executor's workers with no future, as an owner of its own with nothing handed to it, and runs
+  after `shutdown` as a future's functions do ([executors](/spec/threads/#executors)). Why: an
+  actor's turns are queued on its executor again and again, and `avin.actors` cannot reach the
+  pool's module-private queue; the path `future` takes hands over by walking everything the task
+  reaches, which for an actor is its whole state and mailbox at every turn. Alternatives weighed:
+  putting `avin.actors` inside `avin.threads` (the spec names the module); walking at each turn
+  (cost grows with the actor's state); a compiler-known hook visible only to the library (new
+  machinery for one call). **Review with the user:** it adds a public method whose owner rule
+  (handles the giver owns trap in the task) differs from `future`'s.
+- Proposed 2026-11-05 (built on branch `actor-runtime`): **Scheduling details**
+  ([scheduling](/spec/actors/#scheduling)). An actor's number is one sequence for the whole
+  program, from one in the order actors are spawned, not one per declaration. `spawn` hands the Sysl
+  handles its behaviour reaches to the actor, as a thread's `spawn` does with its body. The start
+  runs in the first turn and is not one of the 16 messages; a turn ends early when the mailbox is
+  empty; an actor on an executor that has been shut down goes on handling what it is told, so
+  `tell` never fails. Why: each is the smallest rule that keeps `tell` from waiting or failing and
+  keeps a handle usable by whoever runs the actor. Alternatives weighed: numbers per declaration
+  (`Counter#1`, `Logger#1`; needs a registry of names); dropping messages to an actor whose executor
+  is shut down (a silent loss the spec does not ask for).
 
 ## Open
 

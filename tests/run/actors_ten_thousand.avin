@@ -1,0 +1,38 @@
+// Ten thousand actors on the shared pool: a ring of them passes a token round three times, each
+// actor telling the next, then every actor is told directly and answers with the messages it saw.
+// Actors are many and threads few: the ring runs on one worker per processor. Its smaller twin,
+// `actors_volume_stress`, runs a ring under the collector's stress.
+// env: AVIN_GC_STRESS=0
+import avin.actors.{ActorRef, Behaviour, spawn}
+import avin.threads.{Future, Promise}
+
+data Msg
+    Link(next: ActorRef[Msg])
+    Token(laps: int, done: Promise[int])
+    Seen(reply: Promise[int])
+
+// The ring's first actor counts the laps the token makes; the others pass it on.
+member(first: bool) -> Behaviour[Msg] = Behaviour("Member", me ->
+    var next: Option[ActorRef[Msg]] = None
+    var seen = 0
+    m -> m match
+        Link(n) -> next = Some(n)
+        Token(laps, done) ->
+            seen += 1
+            if first && laps == 0 then done.complete(seen)
+            else next.get().tell(Token(if first then laps - 1 else laps, done))
+        Seen(reply) -> reply.complete(seen))
+
+main()
+    val n = 10000
+    val ring = (0..<n).map(i -> spawn(member(i == 0))).toVector()
+    for i in 0..<n do ring(i).tell(Link(ring((i + 1) % n)))
+    val done = Promise[int]()
+    ring(0).tell(Token(3, done))
+    println(done.future.await())
+    val counts = Future.all(ring.map(r ->
+        val p = Promise[int]()
+        r.tell(Seen(p))
+        p.future)).await()
+    println(counts.sum())
+    println(counts.drop(1).forall(c -> c == 3))
