@@ -65,6 +65,7 @@ The server announces exactly these capabilities in its answer to `initialize`:
 | `textDocument/semanticTokens/full` | Every name the checker resolved in the document, classified by what it names; the legend is below |
 | `textDocument/completion` | What may be written at the cursor, as the checker sees the scope there; triggered by `.` as well as by typing a name. [Completion](#completion) below says what each place offers |
 | `textDocument/formatting` | The document in the style `avin fmt` writes, as one edit over the whole text; no edit when it is in the style already, and none while it does not parse. The request's options are not read: the style has no settings |
+| `textDocument/rangeFormatting` | The top-level declarations the range touches, formatted as one edit over their whole lines; nothing outside them changes, text blocks keep every byte, and in a literate file only program lines are edited. No edit when they are in the style already, when the range holds no declaration, and none while the file does not parse |
 
 A call through a method table goes to the method the receiver's static type declares, and a call of
 an overloaded function to the overload the checker chose. References follow the same choice: the
