@@ -96,11 +96,15 @@ Data crosses the boundary in a fixed set of shapes:
 | `Array[T]`, `Vector[T]` of any other boundary type | **Copied**, element by element: into a Sysl slice `[]T`, and out of a Sysl `[]T` or `Buf[T]` into a new array or vector |
 | `Option[T]`, `Result[T, E]` of boundary types | Converted variant by variant by the generated shim |
 | `data` declared with `@sysl("…")` mirroring a Sysl struct or enum of boundary types | Converted field by field |
+| `(T1, T2, …)`, a tuple of boundary types | A Sysl tuple of the same arity, converted part by part in each direction |
 | `class` declared with `@sysl("…")` | An **opaque handle**: an Avin object owning one counted Sysl reference, released by `close()` or, as a safety net, a finalizer. Its methods are bindings too. |
 
 These shapes nest: a `Result[Option[string], IoError]` crosses, and so do a
-`Result[Vector[string], IoError]`, a `Vector[Vector[string]]`, a `Vector[Array[byte]]` and a mirror
-whose fields are `Option`s, collections or other mirrors.
+`Result[Vector[string], IoError]`, a `Vector[Vector[string]]`, a `Vector[Array[byte]]`, a
+`Vector[(string, string)]`, an `Option[(string, (int, long))]` and a mirror whose fields are
+`Option`s, collections, tuples or other mirrors. Sysl's `vars()`, a `Buf[(string, string)]`, is
+bound as a `Vector[(string, string)]`, and a Sysl `(usize, u64)` as an `(int, long)`, each part
+checked as an integer result is.
 
 ### Integer results
 
@@ -123,7 +127,7 @@ avin: trap: value out of range for long at main.avin:13:13
 ```
 
 An integer a result holds converts the same way, wherever it is: the value of an `Option`, either
-side of a `Result`, the elements of an `Array` or a `Vector`, and these nested in one another. A
+side of a `Result`, the elements of an `Array` or a `Vector`, the parts of a tuple, and these nested in one another. A
 Sysl `Option[usize]` is bound as an `Option[long]`, a `Result[u32, E]` as a `Result[int, E]`, and a
 slice of `u8` or a `Buf[u16]` as a `Vector[int]`. Each value is checked as it is converted, and the
 first that does not fit stops the program at the binding's call. A `byte` is not converted: it is
@@ -176,7 +180,7 @@ No other collection crosses: a `List`, a `Buffer`, a `Map` or a `Set` is convert
 function that wraps the binding, and an `Array` or a `Vector` crosses only when its elements do.
 
 ```text
-error: `Vector[(int, int)]` cannot cross to Sysl; a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, data types declared with `@sysl` to mirror a Sysl enum or struct, and `Array`, `Vector`, `Option` and `Result` of these
+error: `Vector[List[int]]` cannot cross to Sysl; a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, data types declared with `@sysl` to mirror a Sysl enum or struct, and `Array`, `Vector`, `Option`, `Result` and tuples of these
 ```
 
 **Avin heap references never enter Sysl memory.** A Sysl container cannot hold an Avin object,
@@ -264,13 +268,15 @@ parseBigInt(s: string) -> Option[BigInt]
 ```
 
 - **Only a binding makes a handle.** A handle has no parameters and no constructor; a binding that
-  returns one — directly, in an `Option` or a `Result`, or from a handle's own method — makes the
+  returns one — directly, in an `Option` or a `Result`, as a part of a tuple, or from a handle's own
+  method — makes the
   object, holding one counted reference to the Sysl value it was given (a value is moved into a
   reference of its own; a counted reference is shared).
 - **A handle goes back into Sysl only as the receiver of its own methods.** A binding taking a handle
   as a parameter, even inside an `Option`, is an error, and so is a collection of handles or a
-  mirror holding one: a handle crosses out of Sysl only as a result or the value of its `Option` or
-  `Result`. Its Sysl value's fields are not the handle's members.
+  mirror holding one: a handle crosses out of Sysl only as a result, the value of its `Option` or
+  `Result`, or a part of a tuple that is one of these, as `accept` answers
+  `Result[(Socket, Address), IoError]`. Its Sysl value's fields are not the handle's members.
 - **`close()` gives the value back.** Every handle has it. Closing again does nothing; a bound method
   called on a closed handle stops the program at the call:
 
