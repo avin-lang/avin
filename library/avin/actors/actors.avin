@@ -12,6 +12,11 @@ module avin.actors
 // and an ending actor stops its children and waits for their ends before it ends itself, so a tree
 // of actors is torn down from its leaves. An actor's own code reaches its lifecycle through its
 // `ActorContext`: `stop`, `watch`, the timers `after` and `every`, its `children` and its `parent`.
+//
+// A trap in an actor's code fails the actor: the runtime reports it naming the actor and returns to
+// the actor's turn, dropping the message being handled, and the actor's `Supervision` decides what
+// follows: its parent fails in turn (`Escalate`), it ends (`Stop`), or it starts again with fresh
+// state and the same mailbox (`Restart`).
 
 import avin.collections.mutable.{Map as MutableMap}
 import avin.threads.{Atomic, Condition, Executor, Future, Mutex, Promise}
@@ -37,6 +42,27 @@ private handOver(value: Any, from: long, to: long)
 
 @intrinsic("trap")
 private fail(reason: string) -> Nothing
+
+// Runs `run` as the code of the actor shown as `name`, and answers whether it trapped: the runtime
+// reports a trap naming the actor, drops what `run` was doing, and stores the trap's reason as the
+// element of `outcome`, an array of one string. A trap that leaves state other threads share in
+// doubt stops the program instead.
+@intrinsic("actor_guarded")
+private guarded(run: () -> unit, name: string, outcome: Any) -> bool
+
+// Stops the program, whose trap was reported already, from an actor whose failure no parent took.
+@intrinsic("stop_reported")
+private stopProgram() -> Nothing
+
+// What follows a trap in an actor, given to `spawn`. `Escalate` fails the parent as if it had
+// trapped, its own supervision deciding next, and stops the program where the actor has no parent.
+// `Stop` ends the actor, its children first, and tells its watchers it failed. `Restart` stops its
+// children, runs its `stopping` blocks and runs its start again, the messages in its mailbox kept;
+// a failure that would make more than `limit` restarts within the last `within` escalates instead.
+data Supervision
+    Escalate
+    Stop
+    Restart(limit: int, within: Duration)
 
 // The most messages of one actor a worker handles before the actor goes to the back of its
 // executor's queue.
@@ -73,15 +99,25 @@ private class Guard(val key: long, val once: bool): Sendable
 private val guards = Atomic[long](0)
 
 // One message in a mailbox, and the link to the one sent after it, which its sender sets once the
-// message is the newest. A timer's or a watch's message carries its guard.
-private class Node[M](private var message: Option[M], val guard: Option[Guard])
+// message is the newest. A timer's or a watch's message carries its guard. A message a watch's or a
+// pipe's function makes is made when the actor takes it, in its own turn, so a trap in the function
+// fails the actor that asked for the message.
+private class Node[M](private var message: Option[M], private var make: Option[() -> M], val guard: Option[Guard])
     val next = Atomic[Option[Node[M]]](None)
 
     // The message, which the node gives up so that the mailbox does not keep it alive.
     take() -> Option[M]
+        if make is Some(f)
+            make = None
+            return Some(f())
         val m = message
         message = None
         m
+
+    // Gives up the message without making it.
+    drop()
+        message = None
+        make = None
 
     // Whether the message is still wanted.
     wanted() -> bool = guard match
@@ -93,13 +129,16 @@ private class Node[M](private var message: Option[M], val guard: Option[Guard])
 // messages one sender sends arrive in the order it sent them. The oldest node is always one whose
 // message was taken already; the next is the next message.
 private class Mailbox[M]()
-    private var oldest = Node[M](None, None)
+    private var oldest = Node[M](None, None, None)
     private val newest = Atomic[Node[M]](oldest)
 
     // Puts `m` at the back, with the guard of the timer or watch that sends it; called by any thread.
-    put(m: M, guard: Option[Guard])
-        val n = Node(Some(m), guard)
-        newest.swap(n).next.store(Some(n))
+    put(m: M, guard: Option[Guard]) = link(Node(Some(m), None, guard))
+
+    // Puts at the back the message `make` makes when the actor takes it.
+    putMade(make: () -> M, guard: Option[Guard]) = link(Node[M](None, Some(make), guard))
+
+    private link(n: Node[M]) = newest.swap(n).next.store(Some(n))
 
     // The node at the front, taken out, where one is there; called by the actor alone. A message
     // whose sender has swapped its node in but not yet linked it is not there yet, and its sender
@@ -112,7 +151,7 @@ private class Mailbox[M]()
 
     // Drops every message there.
     clear()
-        while take() is Some(n) do n.take()
+        while take() is Some(n) do n.drop()
 
     // Whether a message is there to take; called by the actor alone.
     isEmpty() -> bool = oldest.next.load().isEmpty()
@@ -138,13 +177,21 @@ private trait Core: Sendable
     // Tells the actor that its child `child` has ended.
     childEnded(child: Core) -> unit
 
+    // Tells the actor that a child escalated a failure for `reason` to it, which fails it in turn.
+    childFailed(reason: string) -> unit
+
 // A running actor: its mailbox, whether it is queued on its executor or running there, its owner of
 // Sysl handles, its handler, made by its behaviour's start on its first turn, and its place in the
 // tree of actors. Its turns are the only code that reads or changes its handler, its timers, its
 // watches and its `stopping` blocks, and one turn ends before the next begins, through the
 // executor's queue; what other threads reach (its mailbox, its phase, its children, its end) is
 // atomic, so it is sendable.
-private class Actor[M: Sendable](private val behaviour: Behaviour[M], private val executor: Executor, val parent: Option[Core]): Core
+//
+// A trap in its turn fails it, and its supervision decides: it ends, failed; it restarts, its
+// children stopped and waited for, its `stopping` blocks run and its start run again on the turn
+// after, its mailbox kept; or it escalates, ending failed and failing its parent, which takes the
+// failure on its own next turn.
+private class Actor[M: Sendable](private val behaviour: Behaviour[M], private val executor: Executor, val parent: Option[Core], private val supervision: Supervision): Core
     val number: long = numbers.add(1)
     val owner: long = newOwner()
     val end = Promise[Ending]()
@@ -157,6 +204,23 @@ private class Actor[M: Sendable](private val behaviour: Behaviour[M], private va
     val children = Atomic[Vector[Core]](Vector())
     private var handler: Option[(M) -> unit] = None
     private var reference: Option[ActorRef[M]] = None
+    // How the actor is shown, which a trap's report names.
+    private val label = s"${behaviour.name}#$number"
+    // Where the runtime puts the reason of a trap in the actor's code.
+    private val outcome = Array.fill(1, "")
+    // How many messages the last turn handled.
+    private var handled = 0
+    // The reason the actor is ending failed, where a trap ended it.
+    private var failure: Option[string] = None
+    // The failure a child escalated, which the actor takes on its next turn.
+    private val escalated = Atomic[Option[string]](None)
+    // Set from a failure that restarts the actor until its children have ended and it starts again.
+    private var restarting = false
+    // Set once the actor has escalated a failure to its parent: it handles nothing more, and waits
+    // for the parent's failure to stop it.
+    private var halted = false
+    // When the actor restarted, in microseconds of the monotonic clock, the earliest first.
+    private val restarts = Buffer[long]()
     // The guards of the timers not yet done, by the guard's number, and of the watches, by the number
     // of the actor watched.
     val timers = MutableMap[long, Guard]()
@@ -187,6 +251,13 @@ private class Actor[M: Sendable](private val behaviour: Behaviour[M], private va
         wake()
         true
 
+    // Puts in the mailbox the message `make` makes when the actor takes it, in its own turn; dropped
+    // where the actor is ending or has ended.
+    postMade(make: () -> M, guard: Option[Guard])
+        if phase.load() != Live then return ()
+        mailbox.putMade(make, guard)
+        wake()
+
     // Asks the actor to end once the message it is handling is handled.
     override requestStop()
         stopAsked.store(true)
@@ -207,6 +278,10 @@ private class Actor[M: Sendable](private val behaviour: Behaviour[M], private va
         children.update(cs -> cs.filter(c -> c.id() != gone))
         wake()
 
+    override childFailed(reason: string)
+        escalated.store(Some(reason))
+        wake()
+
     // Whether the actor is in its own turn: its code is running.
     running() -> bool = currentOwner() == owner
 
@@ -215,30 +290,40 @@ private class Actor[M: Sendable](private val behaviour: Behaviour[M], private va
 
     private schedule() = executor.execute(() -> turn())
 
-    // One turn on a worker, as the actor's owner: the start where it has not run, then at most
-    // `throughput` messages, stopping early where the actor is asked to end. An ending actor goes on
-    // to stop its children, and ends once none is left. With messages left the actor goes to the
-    // back of the queue; without, it is no longer scheduled, unless something arrived as it stopped,
-    // which queues it again.
+    // One turn on a worker, as the actor's owner: a failure a child escalated, then the start where
+    // it has not run and at most `throughput` messages, stopping early where the actor is asked to
+    // end; a trap in them fails the actor. A restarting actor starts again once its children have
+    // ended. An ending actor goes on to stop its children, and ends once none is left. With messages
+    // left the actor goes to the back of the queue; without, it is no longer scheduled, unless
+    // something arrived as it stopped, which queues it again.
     private turn()
         val worker = currentOwner()
         runAs(owner)
-        var handled = 0
-        if phase.load() == Live
-            handled = handle(started())
-            if stopAsked.load() then closing()
+        handled = 0
+        if escalated.swap(None) is Some(reason)
+            if phase.load() == Live && !restarting && !halted then failed(reason)
+        if phase.load() == Live && !restarting
+            if halted
+                if stopAsked.load() then closing()
+            elif guarded(() -> work(), label, outcome) then failed(outcome(0))
+            elif stopAsked.load() then closing()
+        if restarting && children.load().isEmpty() then restarted()
         if phase.load() == Closing && children.load().isEmpty() then ended()
         if phase.load() == Gone then mailbox.clear()
         runAs(worker)
-        if handled == throughput && phase.load() == Live && !mailbox.isEmpty() then return schedule()
+        if handled == throughput && phase.load() == Live && !restarting && !mailbox.isEmpty() then return schedule()
         scheduled.store(false)
         if pending() && scheduled.compareAndSet(false, true) then schedule()
 
     // Whether a turn has something to do.
     private pending() -> bool = phase.load() match
-        Live -> stopAsked.load() || !mailbox.isEmpty()
+        Live -> escalated.load().isDefined() || (if restarting then children.load().isEmpty() else stopAsked.load() || (!halted && (handler.isEmpty() || !mailbox.isEmpty())))
         Closing -> children.load().isEmpty()
         _ -> !mailbox.isEmpty()
+
+    // The start where it has not run, then the messages: the code a trap in fails the actor.
+    private work()
+        handled = handle(started())
 
     // The handler, made by the behaviour's start where this is the first turn.
     private started() -> (M) -> unit = handler match
@@ -255,10 +340,10 @@ private class Actor[M: Sendable](private val behaviour: Behaviour[M], private va
         while n < throughput && !stopAsked.load()
             mailbox.take() match
                 Some(node) ->
-                    val m = node.take()
                     if node.wanted()
                         if node.guard is Some(g) then forget(g)
-                        h(m.get())
+                        h(node.take().get())
+                    else node.drop()
                 None -> return n
             n += 1
         n
@@ -276,25 +361,88 @@ private class Actor[M: Sendable](private val behaviour: Behaviour[M], private va
     // asked to end.
     private closing()
         phase.store(Closing)
+        cancelAll()
+        mailbox.clear()
+        for c in children.load() do c.requestStop()
+
+    // Cancels every timer and every watch.
+    private cancelAll()
         for (_, g) in timers
             g.cancel()
             clock.remove(g)
         timers.clear()
         for (_, g) in watches do g.cancel()
         watches.clear()
-        mailbox.clear()
+
+    // Takes a trap's failure, for `reason`, as the actor's supervision says.
+    private failed(reason: string) = supervision match
+        Restart(limit, within) -> if mayRestart(limit, within) then restart() else escalate(reason)
+        Stop -> endFailed(reason)
+        Escalate -> escalate(reason)
+
+    // Begins to end, failed for `reason`.
+    private endFailed(reason: string)
+        failure = Some(reason)
+        closing()
+
+    // Fails the parent, or stops the program where there is none. The actor handles nothing more:
+    // its timers are cancelled, and it ends failed when its parent's failure stops it.
+    private escalate(reason: string) = parent match
+        Some(p) ->
+            failure = Some(reason)
+            halted = true
+            cancelAll()
+            p.childFailed(reason)
+        None -> stopProgram()
+
+    // Whether one more restart now keeps to at most `limit` within the last `within`; where it does,
+    // it is counted.
+    private mayRestart(limit: int, within: Duration) -> bool
+        val now = time.now().micros
+        while !restarts.isEmpty() && restarts(0) <= now - within.micros do restarts.remove(0)
+        if restarts.length() >= limit then return false
+        restarts.append(now)
+        true
+
+    // Begins a restart: it is reported, the timers and watches are cancelled and every child is
+    // asked to end; the messages stay.
+    private restart()
+        restarting = true
+        eprintln(s"avin: restarting $label")
+        cancelAll()
         for c in children.load() do c.requestStop()
+
+    // Ends a restart, every child having ended: the `stopping` blocks run and the start is to run
+    // again. A trap in a `stopping` block ends the actor instead, as a stop asked for meanwhile does.
+    private restarted()
+        restarting = false
+        handler = None
+        if runStoppings() || stopAsked.load() then closing()
+
+    // Runs the `stopping` blocks in the order they were given and forgets them, answering whether one
+    // trapped: that one is reported and fails the actor where nothing had, and the rest do not run.
+    private runStoppings() -> bool
+        var i = 0
+        while i < stoppings.length()
+            if guarded(stoppings(i), label, outcome)
+                if failure.isEmpty() then failure = Some(outcome(0))
+                stoppings.clear()
+                return true
+            i += 1
+        stoppings.clear()
+        false
 
     // Ends, every child having ended: the `stopping` blocks run, the end is told to whoever waits for
     // it, and the parent is told after.
     private ended()
-        for f in stoppings do f()
+        runStoppings()
         phase.store(Gone)
         mailbox.clear()
         handler = None
-        stoppings.clear()
         registry.leave(owner)
-        end.complete(Stopped)
+        end.complete(failure match
+            Some(reason) -> Failed(reason)
+            None -> Stopped)
         if parent is Some(p) then p.childEnded(self)
 
 // The running actors, by their owner of Sysl handles, so code finds the actor running it: `spawn`
@@ -398,10 +546,14 @@ impl[M: Sendable] Display for ActorRef[M]
 // back its reference at once. Its start runs on the executor's workers, and messages told before it
 // has finished wait behind it. Started by the code of an actor, it is that actor's child; started
 // elsewhere, it is a top-level actor. The Sysl handles `behaviour` reaches that the calling code owns
-// are the actor's from then on.
-spawn[M: Sendable](behaviour: Behaviour[M], executor: Executor = Executor.shared()) -> ActorRef[M]
+// are the actor's from then on. `onFailure` decides what follows a trap in the actor's code; a
+// `Restart` whose limit is less than zero or whose window is not more than zero traps.
+spawn[M: Sendable](behaviour: Behaviour[M], onFailure: Supervision = Escalate, executor: Executor = Executor.shared()) -> ActorRef[M]
+    if onFailure is Restart(limit, within)
+        if limit < 0 then fail(s"a restart limit of $limit is less than zero")
+        if within <= time.zero() then fail(s"restarts are counted within $within, which is not more than zero")
     val parent = registry.current()
-    val actor = Actor(behaviour, executor, parent)
+    val actor = Actor(behaviour, executor, parent, onFailure)
     handOver(behaviour, currentOwner(), actor.owner)
     val ref = ActorRef[M](m -> actor.offer(m, None), behaviour.name, actor.number, actor.end.future)
     registry.enrol(actor.owner, actor)
@@ -521,7 +673,7 @@ open class ActorContext[M: Sendable](private val actorRef: ActorRef[M])
         for c in actorCell.children.load()
             if c.id() == child.number then return c.requestStop()
         if child.ended().isCompleted() then return ()
-        fail(s"$actorRef stops $child, which is not one of its children: an actor that should end on request is sent a message saying so")
+        fail(s"stopping $child, which is not one of this actor's children: an actor that should end on request is sent a message saying so")
 
     // Asks for `message` in this actor's own mailbox when `actor` ends, for whatever reason, at once
     // where it has ended already. Watching an actor again replaces the earlier watch, and an actor
@@ -530,11 +682,12 @@ open class ActorContext[M: Sendable](private val actorRef: ActorRef[M])
         val a = actorCell
         if watching(actor) is Some(g) then actor.ended().onComplete(_ -> a.post(message, Some(g)))
 
-    // Asks for `f` of how `actor` ended in this actor's own mailbox when it ends; `f` runs where the
-    // end is known, so it is `@sendable`.
+    // Asks for `f` of how `actor` ended in this actor's own mailbox when it ends. `f` runs in this
+    // actor's own turn, when it takes the message, so a trap in it fails this actor; the end it is
+    // given crosses threads to get there, so it is `@sendable`.
     watch(actor: ActorRef[Nothing], f: @sendable (Ending) -> M)
         val a = actorCell
-        if watching(actor) is Some(g) then actor.ended().onComplete(e -> a.post(f(e), Some(g)))
+        if watching(actor) is Some(g) then actor.ended().onComplete(e -> a.postMade(() -> f(e), Some(g)))
 
     // Stops asking to be told of `actor`'s end; a message about it not yet handled is dropped.
     unwatch(actor: ActorRef[Nothing])
@@ -552,7 +705,7 @@ open class ActorContext[M: Sendable](private val actorRef: ActorRef[M])
     // ends; the interval must be more than zero.
     every(interval: Duration, message: M) -> Timer
         check("every")
-        if interval <= time.zero() then fail(s"$actorRef sets a timer to repeat every $interval, which is not more than zero")
+        if interval <= time.zero() then fail(s"a timer set to repeat every $interval, which is not more than zero")
         timer(interval, interval, message)
 
     // This actor's children that have not ended, in the order they started.
@@ -567,23 +720,25 @@ open class ActorContext[M: Sendable](private val actorRef: ActorRef[M])
 
     // A reference to this actor that accepts another protocol: each message `R` sent to it arrives in
     // this actor's mailbox as `f` of it, so the actor answers an actor of another protocol without
-    // widening its own message type. `f` runs where the message is sent, so it is `@sendable`. The
-    // adapter refers to this actor: it is equal to `self`, shown as it is, and ends with it.
+    // widening its own message type. `f` runs where the message is sent, so it is `@sendable`, and a
+    // trap in it is the sender's. The adapter refers to this actor: it is equal to `self`, shown as
+    // it is, and ends with it.
     adapter[R: Sendable](f: @sendable (R) -> M) -> ActorRef[R]
         check("adapter")
         val a = actorCell
         ActorRef[R](r -> a.offer(f(r), None), actorRef.name, actorRef.number, actorRef.ended())
 
     // Sends the actor `f` of the value of `future` once it completes, so the actor goes on handling
-    // messages meanwhile; `f` runs where the value is known, so it is `@sendable`. A future complete
-    // already sends at once, so its message comes before any this code sends the actor after it. The
-    // message of an actor that has ended by then is dropped.
+    // messages meanwhile. `f` runs in this actor's own turn, so a trap in it fails this actor; the
+    // value crosses threads to get there, so `f` is `@sendable`. A future complete already sends at
+    // once, so its message comes before any this code sends the actor after it. The message of an
+    // actor that has ended by then is dropped.
     pipeToSelf[T](future: Future[T], f: @sendable (T) -> M)
         check("pipeToSelf")
         val a = actorCell
         future.value() match
             Some(v) -> a.post(f(v), None)
-            None -> future.onComplete(v -> a.post(f(v), None))
+            None -> future.onComplete(v -> a.postMade(() -> f(v), None))
 
     // Runs `f` when the actor ends, after its children have ended; an `actor` declaration's
     // `stopping` block is one. Several run in the order they were given.

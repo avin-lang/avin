@@ -1,0 +1,97 @@
+module avin.rt
+
+import sysl.raw.ptr_cast
+
+// A trap in an actor fails only that actor. Its turn runs the actor's code through `guarded`, which
+// records where the turn began; a trap in that code is reported naming the actor, and the thread
+// returns to the turn with `_longjmp`, the frames of the actor's code dropped from its shadow stack.
+// Where the trap leaves state other threads share in doubt (a lock held, a `lazy val` being
+// initialized, an Avin function Sysl called and is waiting for), the program stops instead, as a
+// trap in a thread stops it, and the report still names the actor.
+
+@needs(os)
+extern "_setjmp" save_point(env: *u64) -> int
+
+@abandons
+@needs(os)
+extern "_longjmp" return_to(env: *u64, v: int) -> never
+
+/** Where an actor's turn returns to when its code traps: the saved registers, and what the context
+ * held when the turn began, which the return puts back. `name` is the actor's shown name and
+ * `outcome` the array of one string the reason is stored in, both Avin values its turn keeps alive;
+ * `reason` the trap's reason, an Avin string, once there is one. */
+struct Recovery
+    env: [64]u64
+    top: *Frame
+    caller: *TrapSite
+    owner: u64
+    doubt: u32
+    name: *u8
+    outcome: *u8
+    previous: *Recovery
+    reason: *u8
+
+/** Runs `run`, a closure that takes nothing and returns nothing, as the code of the actor shown as
+ * `name`, and answers whether it trapped. A trap the actor's failure can contain is reported, the
+ * frames of `run` are dropped, and its reason is stored as element 0 of `outcome`, an array of one
+ * string. `runner` is the program's closure runner, as `thread_start` is given it. */
+@export("avin_rt_actor_guarded")
+guarded(ctx: *Context, run: *u8, name: *u8, outcome: *u8, runner: *u8) -> bool
+    var r = Recovery([0u64; 64], ctx.top, ctx.caller, ctx.owner, ctx.doubt, name, outcome, ctx.recovery, null)
+    ctx.recovery = &r
+    if save_point(&r.env[0]) == 0
+        val entry: *extern(*Context, *u8) -> unit = ptr_cast(runner)
+        entry(ctx, run)
+        ctx.recovery = ctx.recovery.previous
+        return false
+    // Back from a trap, with the context as it was when the turn began. The record is read through
+    // the context, since the locals of this frame may not have survived the return. The reason is
+    // stored before anything is allocated, since nothing else reaches it now.
+    val back = ctx.recovery
+    ctx.recovery = back.previous
+    val elements: **u8 = ptr_cast(array_elements(back.outcome))
+    elements[0] = back.reason
+    true
+
+/** Stops the program from an actor whose failure was escalated past every parent: the trap was
+ * reported where it happened, so nothing more is written. */
+@export("avin_rt_stop_reported")
+stop_reported(ctx: *Context) -> never
+    begin_stop(ctx)
+    flush()
+    trap()
+
+/** Enters a region a trap may not be contained in. */
+enter_doubt(ctx: *Context)
+    ctx.doubt += 1
+
+/** Leaves the region `enter_doubt` entered. */
+leave_doubt(ctx: *Context)
+    if ctx.doubt > 0 then ctx.doubt -= 1
+
+/** How a trap's report begins on the thread of `ctx`: naming the actor whose code it runs, if any. */
+trap_prefix(ctx: *Context) -> string = if ctx.recovery == null then "avin: trap: " else "avin: trap in " + text_string(ctx.recovery.name) + ": "
+
+/** Fails the actor whose code traps on the thread of `ctx` for `reason`, an Avin string, at `place`
+ * (null where there is none), where its failure can be contained: the trap is reported naming the
+ * actor and the thread returns to the actor's turn. Elsewhere, outside any actor or where the trap
+ * leaves shared state in doubt, this returns, and the caller stops the program. */
+contain(ctx: *Context, reason: *u8, place: *TrapSite)
+    val r = ctx.recovery
+    if r == null || ctx.doubt > r.doubt then return
+    if stopping_now() then wait_for_end(ctx)
+    flush()
+    report_contained(ctx, reason, place)
+    r.reason = reason
+    ctx.top = r.top
+    ctx.caller = r.caller
+    ctx.owner = r.owner
+    ctx.doubt = r.doubt
+    if ctx.state.load() == Safe then leave_safe(ctx)
+    return_to(&r.env[0], 1)
+
+private report_contained(ctx: *Context, reason: *u8, place: *TrapSite)
+    eprints(trap_prefix(ctx) + text_string(reason) + (if place == null then "" else " at " + place_text(place)) + "\n")
+
+/** A place as a trap's report shows it: the file, the line and the column. */
+place_text(place: *TrapSite) -> string = text_string(place.file) + ":" + place.line.to_string() + ":" + place.col.to_string()

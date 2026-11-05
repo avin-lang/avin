@@ -1,0 +1,63 @@
+// expect: exit 0
+// A restart stops the actor's children and waits for their ends, their `stopping` blocks first,
+// before the actor's own `stopping` block runs and its body runs again, starting children anew.
+// The old children end `Stopped`; the new ones are numbered after every actor before them. A
+// child that is itself restarting or has escalated is stopped the same way.
+import avin.actors.{ActorRef, Restart, spawn}
+import avin.threads.Channel
+import avin.time
+
+actor Child(name: string, log: Channel[string]) receives int
+    receive
+        n -> log.send(s"$name got $n")
+    stopping
+        log.send(s"$self stopping")
+
+data Msg
+    Poke(n: int)
+    Fail
+    Kids(reply: ActorRef[string])
+
+actor Parent(refs: Channel[ActorRef[int]], log: Channel[string]) receives Msg
+    val a = spawn(Child("a", log))
+    val b = spawn(Child("b", log), onFailure = Restart(5, time.minutes(1)))
+    refs.send(a)
+    refs.send(b)
+    log.send(s"$self starts with ${children()}")
+    receive
+        Poke(n) ->
+            a.tell(n)
+            b.tell(n)
+        Fail -> log.send(s"${Vector[int]().head()}")
+        Kids(r) -> r.tell(children().toString())
+    stopping
+        log.send(s"$self stopping")
+
+drain(log: Channel[string], n: int) -> Vector[string]
+    var lines: Vector[string] = Vector()
+    for _ in 0..<n do lines = lines :+ log.receive().get()
+    lines
+
+main()
+    val refs = Channel[ActorRef[int]]()
+    val log = Channel[string]()
+    val p = spawn(Parent(refs, log), onFailure = Restart(1, time.minutes(1)))
+    val a = refs.receive().get()
+    val b = refs.receive().get()
+    println(drain(log, 1))
+    p.tell(Poke(1))
+    // The two children's lines come in either order.
+    println(drain(log, 2).sorted())
+    p.tell(Fail)
+    // The children stop in either order, then the parent's `stopping` block, then the new body.
+    val stops = drain(log, 2)
+    println(stops.sorted())
+    println(drain(log, 2))
+    println(a.ended().await())
+    println(b.ended().await())
+    val a2 = refs.receive().get()
+    val b2 = refs.receive().get()
+    println(s"$a2 $b2")
+    p.tell(Poke(2))
+    println(drain(log, 2).sorted())
+    println(p.ask(r -> Kids(r), timeout = time.seconds(60)).await())

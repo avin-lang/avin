@@ -133,8 +133,12 @@ Any thread may `tell` and `ask`. Inside an actor, waiting for an ask's future wi
 actor: it handles no other message until the reply comes, which is sometimes what is wanted. The
 usual way is **`pipeToSelf[T](future: Future[T], f: T -> M)`**, which sends the actor `f` of the
 value once the future completes, so the actor goes on handling messages meanwhile; a future complete
-already sends at once, before anything the actor sends itself after the call. An actor that
-awaits an ask of itself waits until the timeout.
+already sends at once, before anything the actor sends itself after the call. `f` runs in the
+actor's own turn, so a trap in it fails this actor, not whatever completed the future. An actor
+that awaits an ask of itself waits until the timeout.
+
+An adapter's `f` runs where the message is sent, so a trap in it is the sender's: it fails the
+actor that sent, or stops the program where `main` or a thread sent.
 
 ### Mailboxes and order
 
@@ -240,21 +244,37 @@ doubt, and the runtime can contain it:
   avin: trap in Counter#3: integer overflow at counter.avin:12:31
   ```
 
+  A trap inside the core library is reported where the actor's code called it, as any library trap
+  is. The actor's `Failed` reason is the trap's reason, without its place: `Failed(integer
+  overflow)`.
 - **Where the trap leaves shared state in doubt, the program stops instead**, as it would for a
   thread: a trap while the actor holds a `Mutex`, runs a `Once` body or initializes a `lazy val`
-  (each of which other threads may be waiting on), or inside a Sysl call.
+  (each of which other threads may be waiting on), or inside a Sysl call: an Avin function Sysl
+  called back, or a value a binding cannot take. The report still names the actor. A stack that
+  runs out stops the program too, with the same `avin: trap: stack overflow` a thread's does, since
+  it may run out anywhere, inside the runtime or the C library among the places.
 - **The supervision given to `spawn` decides what follows**, a value of the `data` type
   `Supervision`:
   - **`Escalate`**, the default: the parent fails as if it had trapped, and its own supervision
     decides. A top-level actor that escalates stops the program, with the trap already reported. So a
-    program that supervises nothing behaves as it would with threads: a bug stops it.
+    program that supervises nothing behaves as it would with threads: a bug stops it. The actor
+    that escalated handles nothing more and waits for its parent's failure to stop it, so a failure
+    escalated to the top stops the program with no `stopping` block run; it ends `Failed`.
   - **`Stop`**: the actor ends, its children first, and its watchers are told it failed.
-  - **`Restart(limit: int, within: Duration)`**: the actor's children are stopped, its `stopping`
-    block runs, and its body runs again from the same `Behaviour`, so it starts again with fresh
-    state; the messages still in its mailbox stay there. A restart is reported on standard error. A
-    failure that would make more than `limit` restarts within the last `within` escalates instead.
+  - **`Restart(limit: int, within: Duration)`**: the actor's children are stopped and waited for,
+    its timers and watches cancelled, its `stopping` block runs, and its body runs again from the
+    same `Behaviour`, so it starts again with fresh state; the messages still in its mailbox stay
+    there, and its reference, number and watchers are unchanged. A restart is reported on standard
+    error after the trap, as `avin: restarting Counter#3`. A failure that would make more than
+    `limit` restarts within the last `within` escalates instead, so `Restart(0, …)` never restarts.
+    A limit less than zero, or a window not more than zero, traps in `spawn`.
 - **There is no resuming with the old state.** The trap stopped the actor part-way through changing
   its state, so the state is not kept.
+- **What was asked of a failed actor.** The question whose message trapped is dropped with it, so
+  its ask times out; questions still in the mailbox are dropped and time out where the actor ends,
+  and are answered by the fresh state where it restarts; a question sent once it has ended answers
+  `Ended`. A failure escalated to a parent that is already ending or restarting changes nothing,
+  since the parent is stopping its children already.
 
 ## Lifecycle
 
@@ -267,7 +287,10 @@ doubt, and the runtime can contain it:
 - **`stopping`** is a block in the actor's body that runs whenever the actor ends or restarts, the
   place to close handles and tell others. It runs after a failure too, on state the trap may have
   left half changed, so it does only what is safe on any state. A trap inside it is reported and the
-  actor ends without running it again.
+  actor ends without running it again: `Failed` with that trap's reason, or with the first one where
+  a trap had failed it already, and with no supervision asked, so a block that traps during a
+  restart ends the actor instead. Of several `onStopping` functions, those after one that traps do
+  not run.
 - **Watching.** `watch(ref, message: M)` asks for `message` in this actor's own mailbox when the
   actor `ref` ends, for whatever reason, and `watch(ref, f: Ending -> M)` for `f` of how it ended;
   `unwatch(ref)` stops asking. Watching an actor that has already ended delivers at once. `Ending` is
@@ -294,8 +317,10 @@ is. Made, or called, by any code other than the actor's own, an `ActorContext` t
 - An actor started while its parent is ending, from its `stopping` block, is stopped at once, and the
   parent does not wait for it.
 - Watching an actor again replaces the earlier watch, so its end is told once. An actor that watches
-  itself is told nothing, since its mailbox ends with it. The `f` of `watch(ref, f)` is
-  `@sendable`, since it runs where the end is known. `unwatch`, and cancelling a timer, also drop
+  itself is told nothing, since its mailbox ends with it. The `f` of `watch(ref, f)` runs in this
+  actor's own turn, when it takes the message, so a trap in it fails this actor and never the one
+  watched; it is `@sendable`, since it is carried to the mailbox from wherever the end is known.
+  `unwatch`, and cancelling a timer, also drop
   the message already queued and not yet handled.
 - A `stopping` block runs once the body has run: the body gives it to the context last. An actor has
   one.

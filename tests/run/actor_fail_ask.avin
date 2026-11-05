@@ -1,0 +1,55 @@
+// expect: exit 0
+// The asks of an actor that fails: the question whose handling trapped is dropped with the
+// message, so it times out; questions queued behind it are dropped with the mailbox of an actor
+// that ends, and time out, but are answered by the fresh state of one that restarts; a question
+// sent after the actor has ended answers `Ended` at once. An actor that awaits an ask of one that
+// fails waits only until its timeout, and goes on.
+import avin.actors.{ActorRef, Restart, Stop, spawn}
+import avin.threads.{Channel, Executor}
+import avin.time
+
+data Msg
+    Get(reply: ActorRef[int])
+    Bad(reply: ActorRef[int])
+    Hold(gate: Channel[int])
+
+actor Server receives Msg
+    var served = 0
+    receive
+        Hold(gate) -> gate.receive()
+        Get(r) ->
+            served += 1
+            r.tell(served)
+        Bad(r) -> r.tell(served / (served - served))
+
+actor Client(server: ActorRef[Msg], out: Channel[string]) receives int
+    receive
+        _ -> out.send(s"client got ${server.ask(r -> Bad(r), timeout = time.milliseconds(50)).await()}")
+
+main()
+    // The supervision and the executor given by position: the server has a worker of its own.
+    val s = spawn(Server(), Stop, Executor.fixed(1))
+    println(s.ask(r -> Get(r), timeout = time.seconds(60)).await())
+    // Held, so both questions are in the mailbox before the first fails it.
+    val gate = Channel[int]()
+    s.tell(Hold(gate))
+    val bad = s.ask(r -> Bad(r), timeout = time.milliseconds(200))
+    val queued = s.ask(r -> Get(r), timeout = time.milliseconds(200))
+    gate.send(1)
+    println(bad.await())
+    println(queued.await())
+    println(s.ended().await())
+    println(s.ask(r -> Get(r), timeout = time.seconds(60)).await())
+    // A restarting server answers what was queued behind the failure, from fresh state.
+    val r = spawn(Server(), onFailure = Restart(3, time.minutes(1)))
+    println(r.ask(x -> Get(x), timeout = time.seconds(60)).await())
+    val bad2 = r.ask(x -> Bad(x), timeout = time.milliseconds(200))
+    val queued2 = r.ask(x -> Get(x), timeout = time.seconds(60))
+    println(bad2.await())
+    println(queued2.await())
+    // A client actor waiting on a failing server's answer times out and goes on.
+    val out = Channel[string]()
+    val c = spawn(Client(r, out))
+    c.tell(1)
+    println(out.receive().get())
+    println(r.ask(x -> Get(x), timeout = time.seconds(60)).await())

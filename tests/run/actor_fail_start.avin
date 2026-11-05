@@ -1,0 +1,59 @@
+// expect: exit 0
+// A trap in an actor's body, its start, fails it as a trap in an arm does: with `Stop` it ends
+// `Failed` before handling any message, its `stopping` block never given since the body gives it
+// last; with `Restart` the body runs again each time, until the restarts run out and the failure
+// escalates. A behaviour written as a library value fails the same way in its start.
+import avin.actors.{ActorRef, Behaviour, Restart, Stop, spawn}
+import avin.threads.{Atomic, Channel}
+import avin.time
+
+actor Broken(log: Channel[string]) receives int
+    log.send("body runs")
+    val parts = "a,b".split(",")
+    val third = parts(2)
+    receive
+        n -> log.send(s"got $n")
+    stopping
+        log.send("never given")
+
+// Fails in its body on its first two starts only.
+actor Flaky(starts: Atomic[int], log: Channel[string]) receives int
+    val n = starts.add(1)
+    log.send(s"start $n")
+    if n <= 2 then log.send(s"${n / (n - n)}")
+    receive
+        m -> log.send(s"got $m")
+
+actor Holder(log: Channel[string], refs: Channel[ActorRef[int]]) receives int
+    refs.send(spawn(Broken(log), onFailure = Restart(2, time.minutes(1))))
+    receive
+        _ -> ()
+    stopping
+        log.send("holder stopping")
+
+main()
+    val log = Channel[string]()
+    val b = spawn(Broken(log), onFailure = Stop)
+    b.tell(1)
+    println(log.receive().get())
+    println(b.ended().await())
+    println(log.tryReceive())
+    // A start that fails twice, then succeeds; the message waits through both restarts.
+    val f = spawn(Flaky(Atomic(0), log), onFailure = Restart(5, time.minutes(1)))
+    f.tell(7)
+    for _ in 0..<4 do println(log.receive().get())
+    // A start that always fails: two restarts, then escalation to a parent that stops.
+    val refs = Channel[ActorRef[int]]()
+    val h = spawn(Holder(log, refs), onFailure = Stop)
+    val child = refs.receive().get()
+    for _ in 0..<3 do println(log.receive().get())
+    println(child.ended().await())
+    println(h.ended().await())
+    println(log.receive().get())
+    // A library-form behaviour whose start traps.
+    val lib = Behaviour[int]("Lib", me ->
+        val xs = Vector[int]()
+        val first = xs(0)
+        n -> println(n + first))
+    val l = spawn(lib, onFailure = Stop)
+    println(l.ended().await())

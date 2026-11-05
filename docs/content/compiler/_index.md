@@ -732,6 +732,21 @@ entered the library at all, the caller site is null and the library's own place 
 function that initializes the module-level values counts as the library's: each value is computed
 by a function of its own, which is the program's.
 
+**A trap in an actor fails the actor** (`runtime/avin/rt/recovery.sysl`). The actors library runs
+an actor's start, its messages and its `stopping` blocks through `avin_rt_actor_guarded`, which
+records in the context a return point (`_setjmp`), the shadow stack's top, the caller site, the
+owner and the count of regions in doubt, and calls the closure through the closure runner. Every
+trap entry point first offers the trap there: with a return point recorded and no region in doubt
+entered since, the runtime flushes standard output, reports `avin: trap in Counter#3: <reason> at
+<place>`, puts the recorded words back and returns to the turn (`_longjmp`), the reason, an Avin
+string, stored in the array the library passed before anything is allocated. The regions in doubt
+are counted in the context: a lock held (`avin_rt_lock_acquire` to `avin_rt_lock_release`, so a
+`Mutex` and a `Once` body), a `lazy val` initializing, and an Avin function Sysl called; a trap
+inside one stops the program as before, its report naming the actor, as a binding's conversion
+trap does. The stack-overflow handler is unchanged, so an actor's overflow stops the program.
+`avin_rt_stop_reported` stops the program from an actor whose failure escalated past the top, the
+trap already reported.
+
 Programs are multi-threaded, so the runtime keeps no per-thread state in globals. Each thread has a
 **context**, and every compiled function, closure entry and runtime entry point takes the running
 thread's context as a hidden first argument. A function that holds references links its frame of

@@ -2918,6 +2918,59 @@ their words are reserved.
   A wholly unknown parameter type is still an error. Why: inference fails otherwise exactly where
   the explicit form succeeds, and `ask(r -> Get(r), …)` is the chapter's idiom. Alternative:
   require the type argument at every request-style call.
+- Proposed (built on branch `actor-failure`): **How a trap is contained.** The runtime runs an
+  actor's start, messages and `stopping` blocks under a return point (`_setjmp`), and a trap there
+  restores the shadow stack, caller site and owner it recorded and returns to the turn
+  (`_longjmp`). A count of regions in doubt on each thread (a lock held, which covers `Mutex` and
+  `Once`; a `lazy val` initializing; an Avin function Sysl called) makes a trap inside one stop the
+  program instead. *Why*: no unwinding tables are needed and the common path costs one `_setjmp`
+  per turn. *Alternatives*: unwinding through every frame (needs landing pads in every function),
+  or running each actor on a thread of its own (defeats many actors on few threads).
+- Proposed (built on branch `actor-failure`): **`Failed`'s reason is the trap's reason without its
+  place** (`Failed(integer overflow)`), the place being in the report. *Alternative*: the whole
+  report line, which ties the value to the file layout.
+- Proposed (built on branch `actor-failure`): **Every trap in an actor's code is reported naming the
+  actor, also where it stops the program** (a mutex held, a `Once`, a `lazy val`, a Sysl call), so
+  the report says where the bug ran. *Alternative*: the plain `avin: trap:` line where the program
+  stops, as a thread's.
+- Proposed (built on branch `actor-failure`): **A stack overflow in an actor stops the program**, as
+  in a thread, with `avin: trap: stack overflow`: the stack may run out inside the runtime or the C
+  library holding a lock, so nothing can be said about shared state. *Alternative*: contain it with
+  `siglongjmp` from the signal handler (unsafe where the fault came from inside a lock).
+  **Review with the user**: the chapter lists no exception for it.
+- Proposed (built on branch `actor-failure`): **An actor that escalates handles nothing more and
+  waits for its parent's failure to stop it** (it ends `Failed`), rather than ending at once; a
+  failure escalated to a parent that is already ending or restarting is dropped, since the parent
+  is stopping its children anyway. *Why*: a failure escalated to the top then stops the program
+  with no `stopping` block run anywhere, deterministically, and the parent's supervision decides
+  the whole branch's fate. *Alternative*: the child ends on its own and tells the parent, which
+  races the program's stop against the branch's `stopping` blocks.
+- Proposed (built on branch `actor-failure`): **A restart also cancels the actor's watches** (its
+  timers are cancelled as the chapter says), since the fresh state sets its own; its reference,
+  number, parent and watchers stay, and a stop asked for before the restart is honoured after it.
+  A restart is reported as `avin: restarting Counter#3`, after the trap's line. *Alternative*:
+  keep the watches, whose messages the fresh state may not expect.
+- Proposed (built on branch `actor-failure`): **`Restart`'s window counts restarts made within the
+  last `within`; a limit less than zero or a window not more than zero traps in `spawn`**, as an
+  `every` interval not more than zero does. *Alternative*: treat them as zero (a zero window would
+  silently mean "restart for ever").
+- Proposed (built on branch `actor-failure`): **A trap in a `stopping` block ends the actor `Failed`**
+  with that reason, or keeps the first reason where a trap had failed it already, asks no
+  supervision (so a block that traps during a restart ends the actor), and runs no later
+  `onStopping` function. *Alternative*: end it `Stopped` where it was stopping (hides the bug from
+  its watchers).
+- Proposed (built on branch `actor-failure`): **A `pipeToSelf` function and a watch's function run in
+  the receiving actor's own turn**, when it takes the message, rather than wherever the future or
+  the end completed, so a trap in one fails the actor that asked for it and never an unrelated
+  thread or the actor watched. The message of a pipe of a future complete already is still made
+  at once, in the actor's code. This revises the earlier pipe decision's "sends from wherever the
+  future completes". An adapter's function still runs at the send (its trap is the sender's), as
+  settled. *Alternative*: leave them where the value is known, where a trap stops the program from
+  a pool worker or fails the watched actor in the middle of ending. **Review with the user**: the
+  adapter and the pipe now differ in where their function runs.
+- Proposed (built on branch `actor-failure`): **`spawn`'s parameters are `(behaviour, onFailure,
+  executor)`**, as the chapter writes them, so an executor alone is given by name
+  (`executor = ex`). *Alternative*: keep the executor second.
 
 **C bindings**
 

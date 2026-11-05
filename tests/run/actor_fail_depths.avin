@@ -1,0 +1,66 @@
+// expect: exit 0
+// Each supervision at each depth of a tree: a child two deep with `Stop` ends `Failed`, its parent
+// told of its end and going on with one child fewer; a grandchild three deep with `Restart` starts
+// again under a parent that never notices; one three deep with `Stop` ends alone; and one three
+// deep that escalates fails its parent, whose `Restart` starts it again with a new child.
+import avin.actors.{ActorRef, Ending, Escalate, Restart, Stop, Supervision, spawn}
+import avin.threads.Channel
+import avin.time
+
+data Msg
+    Fail
+    Report(reply: ActorRef[string])
+    ChildEnded(e: Ending)
+
+actor Node(name: string, depth: int, below: Supervision, log: Channel[string]) receives Msg
+    var kids: Vector[ActorRef[Msg]] = Vector()
+    if depth > 1
+        val k = spawn(Node(s"$name.0", depth - 1, below, log), onFailure = below)
+        watch(k, e -> ChildEnded(e))
+        kids = Vector(k)
+    log.send(s"$name starts")
+    receive
+        Fail ->
+            if kids.isEmpty() then log.send(s"${100 / (depth - depth)}")
+            else for k in kids do k.tell(Fail)
+        Report(r) -> r.tell(s"$name has ${children().length()} children")
+        ChildEnded(e) -> log.send(s"$name told: $e")
+    stopping
+        log.send(s"$name stopping")
+
+ask(n: ActorRef[Msg]) -> string = n.ask(r -> Report(r), timeout = time.seconds(60)).await().getOrElse("no answer")
+
+lines(log: Channel[string], n: int) -> Vector[string]
+    var got: Vector[string] = Vector()
+    for _ in 0..<n do got = got :+ log.receive().get()
+    got
+
+main()
+    val log = Channel[string]()
+    // Two deep, the child stopped.
+    val a = spawn(Node("a", 2, Stop, log), onFailure = Stop)
+    println(lines(log, 2).sorted())
+    a.tell(Fail)
+    println(lines(log, 2))
+    println(ask(a))
+    // Three deep, each level restarting the one below: only the leaf starts again.
+    val b = spawn(Node("b", 3, Restart(5, time.minutes(1)), log), onFailure = Stop)
+    println(lines(log, 3).sorted())
+    b.tell(Fail)
+    println(lines(log, 2))
+    println(ask(b))
+    // Three deep, each level stopping the one below: the leaf ends, and its parent has none.
+    val c = spawn(Node("c", 3, Stop, log), onFailure = Stop)
+    println(lines(log, 3).sorted())
+    c.tell(Fail)
+    println(lines(log, 2))
+    println(ask(c))
+    println(ask(b))
+    // Three deep, escalating to a root that restarts: the tree is torn down from its leaves, no
+    // watch telling of the ends, and the whole tree starts again.
+    val d = spawn(Node("d", 3, Escalate, log), onFailure = Restart(5, time.minutes(1)))
+    println(lines(log, 3).sorted())
+    d.tell(Fail)
+    println(lines(log, 3))
+    println(lines(log, 3).sorted())
+    println(ask(d))

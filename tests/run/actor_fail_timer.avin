@@ -1,0 +1,44 @@
+// expect: exit 0
+// A trap in the arm a timer's message reaches fails the actor as any message does. A restart
+// cancels the timers the old state set, so the fresh state hears only its own: here the first
+// state's repeating timer would keep ticking into the second, which sets none. A failed actor's
+// timers are cancelled when it ends.
+import avin.actors.{ActorRef, Restart, Stop, spawn}
+import avin.threads.{Atomic, Channel, sleep}
+import avin.time
+
+data Msg
+    Tick
+    Count(reply: ActorRef[int])
+
+actor Ticker(starts: Atomic[int], log: Channel[string]) receives Msg
+    val incarnation = starts.add(1)
+    var ticks = 0
+    if incarnation == 1 then every(time.milliseconds(2), Tick)
+    receive
+        Tick ->
+            ticks += 1
+            log.send(s"tick $ticks")
+            if ticks == 3 then ticks = ticks / (ticks - ticks)
+        Count(r) -> r.tell(ticks)
+
+actor Once(log: Channel[string]) receives Msg
+    after(time.milliseconds(1), Tick)
+    every(time.milliseconds(2), Tick)
+    receive
+        Tick -> log.send(s"${Vector[int]()(0)}")
+        Count(r) -> r.tell(0)
+
+main()
+    val log = Channel[string]()
+    val t = spawn(Ticker(Atomic(0), log), onFailure = Restart(1, time.minutes(1)))
+    for _ in 0..<3 do println(log.receive().get())
+    // Long enough for several more ticks of the first state's timer, had it not been cancelled.
+    sleep(time.milliseconds(100))
+    println(t.ask(r -> Count(r), timeout = time.seconds(60)).await())
+    println(log.tryReceive())
+    // The first timer to fire fails the actor; the other is cancelled with it.
+    val o = spawn(Once(log), onFailure = Stop)
+    println(o.ended().await())
+    sleep(time.milliseconds(50))
+    println(log.tryReceive())

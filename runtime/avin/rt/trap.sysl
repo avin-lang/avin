@@ -16,12 +16,14 @@ struct TrapSite
  * a conversion cannot hold, a match no arm takes. What the program has written so far is flushed
  * first, so output that went to a pipe or a file before the failure is not lost; then the reason
  * and the place go to standard error, as `avin: trap: integer overflow at gcd.avin:12:9`. A trap in
- * any thread stops the whole program, and only the first thread to stop it reports. */
+ * any thread stops the whole program, and only the first thread to stop it reports; a trap in an
+ * actor's code fails only that actor where it can (`recovery.sysl`). */
 @export("avin_rt_trap")
 stop(ctx: *Context, site: *TrapSite) -> never
+    contain(ctx, site.reason, site)
     begin_stop(ctx)
     flush()
-    report(site.reason, site)
+    report(ctx, site.reason, site)
 
 /** Stops the program on a failed check inside the core library, at `site` in the library's own
  * code. The program's author did not write that code, so the place reported is the one where the
@@ -29,37 +31,40 @@ stop(ctx: *Context, site: *TrapSite) -> never
  * program has entered the library at all, it is `site` itself. */
 @export("avin_rt_caller_trap")
 stop_at_caller(ctx: *Context, site: *TrapSite) -> never
+    contain(ctx, site.reason, if ctx.caller == null then site else ctx.caller)
     begin_stop(ctx)
     flush()
-    report(site.reason, if ctx.caller == null then site else ctx.caller)
+    report(ctx, site.reason, if ctx.caller == null then site else ctx.caller)
 
 /** Stops the program on a failed check at `site` whose reason was made while the program ran: the
  * string at `reason` rather than the site's own. */
 @export("avin_rt_trap_message")
 stop_with(ctx: *Context, site: *TrapSite, reason: *u8) -> never
+    contain(ctx, reason, site)
     begin_stop(ctx)
     flush()
-    report(reason, site)
+    report(ctx, reason, site)
 
 /** Stops the program on a failed check inside the core library with the string at `reason` as its
  * reason, reported where the program last entered the library, as `stop_at_caller` reports it. A
  * failed assertion, whose message shows the values it compared, stops this way. */
 @export("avin_rt_caller_trap_message")
 stop_at_caller_with(ctx: *Context, site: *TrapSite, reason: *u8) -> never
+    contain(ctx, reason, if ctx.caller == null then site else ctx.caller)
     begin_stop(ctx)
     flush()
-    report(reason, if ctx.caller == null then site else ctx.caller)
+    report(ctx, reason, if ctx.caller == null then site else ctx.caller)
 
 /** Stops the program on a failed check in a Sysl binding's conversion, for `reason`, reported where
  * the program called the binding, which the context holds as its caller site, as `stop_at_caller`
- * reports it. */
+ * reports it. A trap here is inside a Sysl call, so it stops the program even in an actor. */
 stop_in_binding(ctx: *Context, reason: string) -> never
     begin_stop(ctx)
     flush()
     if ctx.caller == null
-        eprints("avin: trap: " + reason + "\n")
+        eprints(trap_prefix(ctx) + reason + "\n")
         trap()
-    report_place(reason, ctx.caller)
+    report_place(ctx, reason, ctx.caller)
 
 // A thread that runs out of stack stops the program with `avin: trap: stack overflow`, which a
 // handler written in C reports (`__posix__/stack_guard.c`): it runs on a stack of its own and may call
@@ -70,14 +75,14 @@ stop_in_binding(ctx: *Context, reason: string) -> never
 extern "avin_rt_stack_guard_install" install_stack_guard() -> unit
 extern "avin_rt_stack_guard_remove" remove_stack_guard() -> unit
 
-private report(reason: *u8, place: *TrapSite) -> never = report_place(text_string(reason), place)
+private report(ctx: *Context, reason: *u8, place: *TrapSite) -> never = report_place(ctx, text_string(reason), place)
 
-private report_place(reason: string, place: *TrapSite) -> never
-    eprints("avin: trap: " + reason + " at " + text_string(place.file) + ":" + place.line.to_string() + ":" + place.col.to_string() + "\n")
+private report_place(ctx: *Context, reason: string, place: *TrapSite) -> never
+    eprints(trap_prefix(ctx) + reason + " at " + place_text(place) + "\n")
     trap()
 
 /** The string at `p` as a Sysl string, copied. */
-private text_string(p: *u8) -> string
+text_string(p: *u8) -> string
     val data = text_bytes(p)
     var bytes: Buf[u8] = buf()
     for i in 0..<text_length(p) do bytes.push(data[i])

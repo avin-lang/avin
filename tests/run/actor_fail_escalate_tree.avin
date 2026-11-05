@@ -1,0 +1,66 @@
+// expect: exit 0
+// A child that escalates ends failed and fails its parent as if the parent had trapped, the parent's
+// own supervision deciding next: here the leaf of a tree three deep traps, its parent escalates in
+// turn, and the root, supervised with `Stop`, ends. The trap is reported once, at the leaf. Every
+// actor of the failed branches ends `Failed` with the leaf's reason, from the leaves up, and a
+// sibling that did nothing ends `Stopped` with the root. Actors outside the tree go on running.
+import avin.actors.{ActorRef, Escalate, Stop, spawn}
+import avin.threads.Channel
+import avin.time
+
+actor Leaf(refs: Channel[ActorRef[Nothing]], log: Channel[string]) receives int
+    refs.send(self)
+    receive
+        n -> println(s"leaf: ${100 / n}")
+    stopping
+        log.send("leaf stopping")
+
+actor Mid(refs: Channel[ActorRef[Nothing]], leafRefs: Channel[ActorRef[Nothing]], log: Channel[string]) receives int
+    val leaf = spawn(Leaf(leafRefs, log), onFailure = Escalate)
+    refs.send(self)
+    receive
+        n -> leaf.tell(n)
+    stopping
+        log.send("mid stopping")
+
+actor Sibling(log: Channel[string]) receives int
+    receive
+        _ -> ()
+    stopping
+        log.send("sibling stopping")
+
+actor Root(midRefs: Channel[ActorRef[Nothing]], leafRefs: Channel[ActorRef[Nothing]], siblingRefs: Channel[ActorRef[Nothing]], log: Channel[string]) receives int
+    siblingRefs.send(spawn(Sibling(log)))
+    val mid = spawn(Mid(midRefs, leafRefs, log))
+    receive
+        n -> mid.tell(n)
+    stopping
+        log.send("root stopping")
+
+actor Bystander receives ActorRef[string]
+    receive
+        r -> r.tell("still here")
+
+main()
+    val midRefs = Channel[ActorRef[Nothing]]()
+    val leafRefs = Channel[ActorRef[Nothing]]()
+    val siblingRefs = Channel[ActorRef[Nothing]]()
+    val log = Channel[string]()
+    val bystander = spawn(Bystander())
+    val root = spawn(Root(midRefs, leafRefs, siblingRefs, log), onFailure = Stop)
+    val leaf = leafRefs.receive().get()
+    val mid = midRefs.receive().get()
+    val sibling = siblingRefs.receive().get()
+    root.tell(5)
+    root.tell(0)
+    println(leaf.ended().await())
+    println(mid.ended().await())
+    println(root.ended().await())
+    println(sibling.ended().await())
+    // The leaf ends before its parent, and the parent before the root; the sibling ends with the
+    // root, at any time before it.
+    var lines: Vector[string] = Vector()
+    for _ in 0..<4 do lines = lines :+ log.receive().get()
+    println(lines.filter(l -> l != "sibling stopping"))
+    println(lines.contains("sibling stopping"))
+    println(bystander.ask(r -> r, timeout = time.seconds(60)).await())
