@@ -108,6 +108,63 @@ format_text(name: string, text: string) -> Result[string, string] = format_sourc
  * breaks where re-breaking would change its meaning. */
 format_reflowed(doc: Source) -> Result[string, string] = fmt_checked(doc, false)
 
+/** A replacement of part of a file: the bytes of the old text it covers, and the text that goes there. */
+struct FormatEdit
+    span: Span
+    text: string
+
+/** The edit that formats the part of `doc` between the byte offsets `from` and `to`, or `None` where
+ * that part is in the style already or the range holds no declaration.
+ *
+ * Formatting half of a declaration means nothing where blocks are made by indentation, so the range
+ * grows to the whole lines of every top-level declaration it touches (a declaration is the tokens
+ * between two line breaks at the margin, a comment on its last line and a text block inside it
+ * included). The file is formatted as a whole and the same declarations, counted from the top, are
+ * cut from the result, so nothing outside the grown range changes and the text inside it is what
+ * formatting the whole file gives. A file that does not parse is refused with its diagnostics. */
+format_range(doc: Source, from: usize, to: usize) -> Result[Option[FormatEdit], string]
+    val whole = format_source(doc)?
+    val old_units = fmt_units(parse(doc).source)
+    val formatted = source_of(doc.name, whole)
+    val new_units = fmt_units(parse(formatted).source)
+    if old_units.len() != new_units.len() then return Err(s"${doc.name}: the formatted file has other declarations than the source")
+    val first_line = doc.locate(from).line
+    val last_line = doc.locate(if to > from && doc.line_span(doc.locate(to).line).start == to then to - 1 else to).line
+    var lo = old_units.len()
+    var hi = 0usize
+    for i in 0..<old_units.len()
+        val a = doc.locate(old_units[i].start).line
+        val b = doc.locate(old_units[i].end - 1).line
+        if a > last_line || b < first_line then continue
+        if i < lo then lo = i
+        hi = i + 1
+    if lo >= hi then return Ok(None)
+    val old_region = Span(doc.line_span(doc.locate(old_units[lo].start).line).start, doc.line_span(doc.locate(old_units[hi - 1].end - 1).line).end)
+    val new_region = Span(formatted.line_span(formatted.locate(new_units[lo].start).line).start, formatted.line_span(formatted.locate(new_units[hi - 1].end - 1).line).end)
+    val replacement = from_utf8_unchecked(formatted.text(new_region))
+    if replacement == from_utf8_unchecked(doc.text(old_region)) then return Ok(None)
+    Ok(Some(FormatEdit(old_region, replacement)))
+
+// The top-level declarations of a lexed file, each as the span from its first token to its last: a
+// run of tokens that starts after a line break with no block open.
+private fmt_units(program: Source) -> Buf[Span]
+    var units: Buf[Span] = buf()
+    var depth = 0usize
+    var fresh = true
+    for t in lex(program).items.items
+        if t.value == Newline || t.value == Dedent
+            if t.value == Dedent && depth > 0 then depth -= 1
+            fresh = true
+        elif t.value == Indent
+            depth += 1
+        elif depth == 0 && fresh
+            units.push(t.span)
+            fresh = false
+        else
+            fresh = false
+            if units.len() > 0 then units[units.len() - 1].end = t.span.end
+    units
+
 private fmt_checked(doc: Source, keep_breaks: bool) -> Result[string, string]
     val parsed = parse(doc)
     if parsed.report.has_errors() then return Err(parsed.report.render(parsed.source).trim_end())
