@@ -23,7 +23,9 @@ struct Machine
     decl: &ClassDecl
     sites: Buf[MachineSite]
 
-private struct StateBlock
+/** A `state` block of a machine or an actor: its name and parameters, its `enter` and `leave`
+ * blocks and its own arms. */
+struct StateBlock
     span: Span
     name: string
     params: Buf[Param]
@@ -68,13 +70,7 @@ parse_machine(p: *Parser, start: Span, annotations: Buf[Annotation]) -> Machine
             if p.toks.at_end() || p.accept_kind(Dedent) then break
             if p.accept_kind(Newline) then continue
             val before = p.toks.position
-            if state_ahead(p)
-                val state = parse_state(p)
-                var again = false
-                for s in states
-                    if s.name == state.name then again = true
-                if again then p.report.add(error(state.span, s"`$name` declares the state `${state.name}` more than once"))
-                else states.push(state)
+            if state_member(p, name, &states) then ()
             elif p.at("receive") && next_is(p, Indent)
                 val at = p.toks.here()
                 p.toks.advance()
@@ -83,10 +79,6 @@ parse_machine(p: *Parser, start: Span, annotations: Buf[Annotation]) -> Machine
                 p.expect_kind(Indent, "expected indented arms after `receive`")
                 for arm in machine_arms(p)
                     shared.push(arm)
-            elif (p.at("enter") || p.at("leave")) && next_is(p, Indent)
-                p.report.add(error(p.toks.here(), s"`${p.ahead(0)}` belongs to a state: write it inside the `state` block it runs for"))
-                p.toks.advance()
-                parse_body(p, true)
             else members.push(parse_class_member(p))
             if p.toks.position == before then p.toks.advance()
             if !p.toks.at_end() && !p.at_kind(Newline) && !p.at_kind(Dedent) && !after_block(p)
@@ -95,9 +87,32 @@ parse_machine(p: *Parser, start: Span, annotations: Buf[Annotation]) -> Machine
         optional_end(p, name, true)
     val span = start.to(p.ended())
     if states.len() == 0 then p.report.add(error(name_span, s"a machine declares its states: `$name` has no `state` block"))
-    elif states[0].params.len() > 0
-        p.report.add(error(states[0].span, s"the first state is where `$name` starts, so it takes no parameters"))
+    else first_state_plain(p, name, states)
     machine_declarations(annotations, span, name_span, name, type_params, params, event, members, states, shared)
+
+/** Reads a member of a machine's or an actor's body that belongs to its states, if one starts here:
+ * a `state` block, added to `states` unless one of its name is there already, or an `enter` or
+ * `leave` block written outside a state, which is reported. */
+state_member(p: *Parser, name: string, states: *Buf[StateBlock]) -> bool
+    if state_ahead(p)
+        val state = parse_state(p)
+        var again = false
+        for i in 0..<states.len()
+            if states[i].name == state.name then again = true
+        if again then p.report.add(error(state.span, s"`$name` declares the state `${state.name}` more than once"))
+        else states.push(state)
+        return true
+    if (p.at("enter") || p.at("leave")) && next_is(p, Indent)
+        p.report.add(error(p.toks.here(), s"`${p.ahead(0)}` belongs to a state: write it inside the `state` block it runs for"))
+        p.toks.advance()
+        parse_body(p, true)
+        return true
+    false
+
+/** Reports a first state with parameters: it is where the machine or actor `name` starts. */
+first_state_plain(p: *Parser, name: string, states: Buf[StateBlock])
+    if states.len() > 0 && states[0].params.len() > 0
+        p.report.add(error(states[0].span, s"the first state is where `$name` starts, so it takes no parameters"))
 
 // `state Name` or `state Name(params)` at the start of a line; `state` followed by anything else is
 // an ordinary name, as in `state = 3` or `state()`.
@@ -226,10 +241,18 @@ private run_blocks(at: Span, subject: string, states: Buf[StateBlock], enter: bo
     if arms.len() < states.len() then arms.push(Arm(Pattern(at, Wildcard), None, Expr(at, UnitLit)))
     Some(Expr(at, Match(name_expr(at, subject), arms)))
 
-private machine_declarations(annotations: Buf[Annotation], span: Span, name_span: Span, name: string, type_params: Buf[TypeParam], params: Buf[ClassParam], event: &TypeExpr, written: Buf[ClassMember], states: Buf[StateBlock], shared: Buf[Arm]) -> Machine
-    val at = name_span
+/** The `State` type of a machine or an actor with states: its `data` declaration, the type as the
+ * declarations it is read into write it, and its states' places for the coverage check. */
+struct StateType
+    data: &DataDecl
+    ty: &TypeExpr
+    sites: Buf[MachineSite]
+
+/** The `data` type `Name.State` of the machine or actor `name`, with a variant for each state holding
+ * that state's parameters. It takes the declaration's type parameters, so a state may hold values of
+ * them. */
+state_type(span: Span, at: Span, name: string, type_params: Buf[TypeParam], states: Buf[StateBlock]) -> StateType
     val states_name = name + ".State"
-    // The state type takes the machine's type parameters, so a state may hold values of them.
     var state_params: Buf[TypeParam] = buf()
     var state_args: Buf[&TypeExpr] = buf()
     for tp in type_params
@@ -240,13 +263,47 @@ private machine_declarations(annotations: Buf[Annotation], span: Span, name_span
     for state in states
         variants.push(Variant(state.span, state.name, state.params, buf()))
         sites.push(MachineSite(state.span, name, state.name))
-    val data = DataDecl(buf(), span, states_name, state_params, variants, buf())
-    val state_type = type_named(at, states_name, state_args)
-    var members: Buf[ClassMember] = buf()
+    StateType(DataDecl(buf(), span, states_name, state_params, variants, buf()), type_named(at, states_name, state_args), sites)
+
+/** The fields holding the current state, which starts as the first, and whether the event being
+ * handled stays in it; and the method `state()` answering the current state. */
+state_members(at: Span, states: Buf[StateBlock], state_type: &TypeExpr, members: *Buf[ClassMember], public_state: bool)
     val first: &Expr = if states.len() > 0 then name_expr(states[0].span, states[0].name) else Expr(at, Invalid)
     members.push(FieldMember(FieldDecl(at, MachineCurrent, Some(state_type), first, true, false, false)))
-    members.push(FieldMember(FieldDecl(at, MachineBusy, None, Expr(at, BoolLit(false)), true, false, false)))
     members.push(FieldMember(FieldDecl(at, MachineStayed, None, Expr(at, BoolLit(false)), true, false, false)))
+    members.push(MethodMember(Function(buf(), at, at, "state", buf(), buf(), Some(state_type), Some(name_expr(at, MachineCurrent)), buf()), public_state, false, false))
+
+/** The statements handling the event the local `event` holds in the current state: the current
+ * state matched, and in it the event against the state's own arms followed by the shared ones, each
+ * arm's value the next state; then, unless the arm yielded `stay`, the current state's `leave`, the
+ * next state made current and its `enter`. */
+state_handling(at: Span, states: Buf[StateBlock], shared: Buf[Arm], state_type: &TypeExpr, event: string) -> Buf[&Expr]
+    var body: Buf[&Expr] = buf()
+    body.push(flag(at, MachineStayed, false))
+    var state_arms: Buf[Arm] = buf()
+    for state in states
+        var arms: Buf[Arm] = buf()
+        for arm in state.arms
+            arms.push(arm)
+        for arm in shared
+            arms.push(arm)
+        val events = Expr(state.span, Match(name_expr(state.span, event), stay_arms(arms, state_type)))
+        state_arms.push(Arm(state_pattern(state), None, events))
+    body.push(Expr(at, Binding(MachineNext, Some(state_type), Expr(at, Match(name_expr(at, MachineCurrent), state_arms)), false)))
+    var transition: Buf[&Expr] = buf()
+    if run_blocks(at, MachineCurrent, states, false) is Some(leave) then transition.push(leave)
+    transition.push(assign_expr(at, MachineCurrent, name_expr(at, MachineNext)))
+    if run_blocks(at, MachineNext, states, true) is Some(enter) then transition.push(enter)
+    body.push(Expr(at, If(Expr(at, Unary(Not, name_expr(at, MachineStayed))), Expr(at, Block(transition, true)), None)))
+    body
+
+private machine_declarations(annotations: Buf[Annotation], span: Span, name_span: Span, name: string, type_params: Buf[TypeParam], params: Buf[ClassParam], event: &TypeExpr, written: Buf[ClassMember], states: Buf[StateBlock], shared: Buf[Arm]) -> Machine
+    val at = name_span
+    val st = state_type(span, at, name, type_params, states)
+    val state_type = st.ty
+    var members: Buf[ClassMember] = buf()
+    state_members(at, states, state_type, &members, true)
+    members.push(FieldMember(FieldDecl(at, MachineBusy, None, Expr(at, BoolLit(false)), true, false, false)))
     for m in written
         members.push(m)
     // The first state's `enter` runs when the machine is made, after the body.
@@ -257,8 +314,6 @@ private machine_declarations(annotations: Buf[Annotation], span: Span, name_span
             items.push(body)
             items.push(flag(at, MachineBusy, false))
             members.push(StatementMember(Expr(at, Block(items, true))))
-    // `state() -> Door.State`
-    members.push(MethodMember(Function(buf(), at, at, "state", buf(), buf(), Some(state_type), Some(name_expr(at, MachineCurrent)), buf()), true, false, false))
     // `handle(event: Event) -> Door.State`
     var body: Buf[&Expr] = buf()
     var fail_args: Buf[Argument] = buf()
@@ -266,26 +321,12 @@ private machine_declarations(annotations: Buf[Annotation], span: Span, name_span
     val trap = Expr(at, Call(name_expr(at, "avin::fail"), fail_args))
     body.push(Expr(at, If(name_expr(at, MachineBusy), trap, None)))
     body.push(flag(at, MachineBusy, true))
-    body.push(flag(at, MachineStayed, false))
-    var state_arms: Buf[Arm] = buf()
-    for state in states
-        var arms: Buf[Arm] = buf()
-        for arm in state.arms
-            arms.push(arm)
-        for arm in shared
-            arms.push(arm)
-        val events = Expr(state.span, Match(name_expr(state.span, MachineEvent), stay_arms(arms, state_type)))
-        state_arms.push(Arm(state_pattern(state), None, events))
-    body.push(Expr(at, Binding(MachineNext, Some(state_type), Expr(at, Match(name_expr(at, MachineCurrent), state_arms)), false)))
-    var transition: Buf[&Expr] = buf()
-    if run_blocks(at, MachineCurrent, states, false) is Some(leave) then transition.push(leave)
-    transition.push(assign_expr(at, MachineCurrent, name_expr(at, MachineNext)))
-    if run_blocks(at, MachineNext, states, true) is Some(enter) then transition.push(enter)
-    body.push(Expr(at, If(Expr(at, Unary(Not, name_expr(at, MachineStayed))), Expr(at, Block(transition, true)), None)))
+    for item in state_handling(at, states, shared, state_type, MachineEvent)
+        body.push(item)
     body.push(flag(at, MachineBusy, false))
     body.push(name_expr(at, MachineCurrent))
     var handle_params: Buf[Param] = buf()
     handle_params.push(Param(at, Pattern(at, Name(MachineEvent)), event, None, false, false, buf()))
     members.push(MethodMember(Function(buf(), at, at, "handle", buf(), handle_params, Some(state_type), Some(Expr(at, Block(body, false))), buf()), true, false, false))
     val decl = ClassDecl(annotations, span, name_span, name, "", at, type_params, params, buf(), buf(), members, false)
-    Machine(data, decl, sites)
+    Machine(st.data, decl, st.sites)

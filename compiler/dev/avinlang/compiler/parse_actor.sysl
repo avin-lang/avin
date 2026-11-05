@@ -23,12 +23,24 @@ import sysl.buf.{Buf, buf}
 // The start is a `@sendable` function and captures the parameters; the checker holds each one's type
 // to `Sendable` where the actor is declared, rather than at the capture, and the message type where
 // it is named after `receives`.
+//
+// An actor whose body declares `state` blocks is also read into a private `data` type
+// `Counter.State`, as a machine's states are, and its class holds the current state as a machine's
+// does: `actor$receive` matches the current state, and in it the message against the state's own arms
+// followed by the `receive` block's, which is optional here; each arm's value is the next state, and
+// a transition runs the `leave` of the state left and the `enter` of the state entered. The first
+// state's `enter` runs as the last statement of the body, so a restart, which makes the state object
+// again, starts in the first state and runs its `enter` again.
 
-/** The two declarations an actor is read into, and what the checker needs to report on it. */
+/** The declarations an actor is read into, and what the checker needs to report on it. */
 struct ActorDeclarations
     decl: &ClassDecl
     function: &Function
     site: ActorSite
+    /** The actor's `State` type, where it declares states. */
+    states: Option[&DataDecl]
+    /** Its states' places, for the coverage check. */
+    state_sites: Buf[MachineSite]
 
 /** Whether an actor declaration starts here: `actor` before the name it declares. Elsewhere `actor`
  * is an ordinary name. */
@@ -68,12 +80,14 @@ parse_actor(p: *Parser, start: Span, annotations: Buf[Annotation]) -> ActorDecla
     var arms: Buf[Arm] = buf()
     var receive_at: Option[Span] = None
     var stopping: Option[&Expr] = None
+    var states: Buf[StateBlock] = buf()
     if p.accept_kind(Indent)
         loop
             if p.toks.at_end() || p.accept_kind(Dedent) then break
             if p.accept_kind(Newline) then continue
             val before = p.toks.position
-            if p.at("receive") && next_is(p, Indent)
+            if state_member(p, name, &states) then ()
+            elif p.at("receive") && next_is(p, Indent)
                 val at = p.toks.here()
                 p.toks.advance()
                 if receive_at is Some(_) then p.report.add(error(at, s"`$name` has one `receive` block, holding the arms that handle its messages"))
@@ -94,18 +108,33 @@ parse_actor(p: *Parser, start: Span, annotations: Buf[Annotation]) -> ActorDecla
                 skip_line(p)
         optional_end(p, name, true)
     val span = start.to(p.ended())
+    first_state_plain(p, name, states)
+    // An actor with states handles its messages in them, so its `receive` block is optional.
     val receive = receive_at match
         Some(at) -> at
         None ->
-            p.report.add(error(name_span, s"an actor handles its messages in a `receive` block: `$name` has none"))
+            if states.len() == 0 then p.report.add(error(name_span, s"an actor handles its messages in a `receive` block: `$name` has none"))
             name_span
     var sendable: Buf[bool] = buf()
     for cp in params
         sendable.push(!marked_sendable(cp.param))
     val site = ActorSite(name_span, name, message.span, receive, sendable)
-    val decl = actor_class(span, name_span, name, type_params, params, message, members, arms, receive_at, stopping)
+    var state_data: Option[&DataDecl] = None
+    var state_sites: Buf[MachineSite] = buf()
+    var with_states: Option[ActorStates] = None
+    if states.len() > 0
+        val st = state_type(span, name_span, name, type_params, states)
+        state_data = Some(st.data)
+        state_sites = st.sites
+        with_states = Some(ActorStates(states, st.ty))
+    val decl = actor_class(span, name_span, name, type_params, params, message, members, arms, receive_at, stopping, with_states)
     val function = behaviour_function(annotations, span, name_span, name, type_params, params, message)
-    ActorDeclarations(decl, function, site)
+    ActorDeclarations(decl, function, site, state_data, state_sites)
+
+// An actor's states and the type its class writes for them.
+private struct ActorStates
+    blocks: Buf[StateBlock]
+    ty: &TypeExpr
 
 // An actor's methods are its own helpers: nothing outside it reaches its state.
 private private_member(m: ClassMember) -> ClassMember = m match
@@ -139,7 +168,7 @@ private actors_type(message: &TypeExpr, name: string) -> &TypeExpr
     args.push(message)
     actor_type(message.span, core_path("actors." + name), args)
 
-private actor_class(span: Span, name_span: Span, name: string, type_params: Buf[TypeParam], params: Buf[ClassParam], message: &TypeExpr, written: Buf[ClassMember], arms: Buf[Arm], receive_at: Option[Span], stopping: Option[&Expr]) -> &ClassDecl
+private actor_class(span: Span, name_span: Span, name: string, type_params: Buf[TypeParam], params: Buf[ClassParam], message: &TypeExpr, written: Buf[ClassMember], arms: Buf[Arm], receive_at: Option[Span], stopping: Option[&Expr], states: Option[ActorStates]) -> &ClassDecl
     val at = name_span
     var fields: Buf[ClassParam] = buf()
     fields.push(ClassParam(Param(at, Pattern(at, Name(ActorSelf)), actors_type(message, "ActorRef"), None, false, false, buf()), false, false))
@@ -147,17 +176,28 @@ private actor_class(span: Span, name_span: Span, name: string, type_params: Buf[
         val q = cp.param
         fields.push(ClassParam(Param(q.span, q.pattern, q.ty, None, false, q.variadic, q.annotations), cp.mutable, false))
     var members: Buf[ClassMember] = buf()
+    // An actor with states holds the current state, starting as the first, and reads it with its
+    // own `state()`.
+    if states is Some(s) then state_members(at, s.blocks, s.ty, &members, false)
     for m in written
         members.push(m)
-    // `actor$receive(message: M)`: the arms, each one's value discarded.
-    var discarded: Buf[Arm] = buf()
-    for arm in arms
-        var items: Buf[&Expr] = buf()
-        items.push(arm.body)
-        discarded.push(Arm(arm.pattern, arm.guard, Expr(arm.body.span, Block(items, true))))
-    // Without a `receive` block, already reported, the message is not matched at all.
     val receive = receive_at.unwrap_or(at)
-    val body: &Expr = if receive_at is Some(_) then Expr(receive, Match(actor_name(receive, ActorMessage), discarded)) else Expr(at, UnitLit)
+    val body: &Expr = states match
+        // `actor$receive(message: M)`: the message handled in the current state, each arm's value the
+        // next state.
+        Some(s) ->
+            // The first state's `enter` runs when the actor starts, after its body.
+            if s.blocks[0].enter is Some(enter) then members.push(StatementMember(enter))
+            Expr(at, Block(state_handling(at, s.blocks, arms, s.ty, ActorMessage), true))
+        // `actor$receive(message: M)`: the arms, each one's value discarded. Without a `receive`
+        // block, already reported, the message is not matched at all.
+        None ->
+            var discarded: Buf[Arm] = buf()
+            for arm in arms
+                var items: Buf[&Expr] = buf()
+                items.push(arm.body)
+                discarded.push(Arm(arm.pattern, arm.guard, Expr(arm.body.span, Block(items, true))))
+            if receive_at is Some(_) then Expr(receive, Match(actor_name(receive, ActorMessage), discarded)) else Expr(at, UnitLit)
     var receive_params: Buf[Param] = buf()
     receive_params.push(Param(receive, Pattern(receive, Name(ActorMessage)), message, None, false, false, buf()))
     members.push(MethodMember(Function(buf(), receive, receive, ActorReceive, buf(), receive_params, Some(TypeExpr(receive, Named("unit", buf()))), Some(body), buf()), true, false, false))
