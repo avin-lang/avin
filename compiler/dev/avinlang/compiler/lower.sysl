@@ -255,7 +255,7 @@ lower_program(program: TProgram) -> MirProgram
     var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf())
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
-    l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None))
+    l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None, false))
     l.record_types.push(Unit)
     // A module-level value made at compile time has no storage: every read of it is the constant.
     for _ in program.globals
@@ -1027,14 +1027,72 @@ private record_of(l: *Lowering, t: &Type) -> usize
     val key = type_key(t)
     if l.record_index.get(key) is Some(r) then return r
     val index = l.records.len()
-    l.records.push(TypeRecord(type_name(t), buf(), None, None, None, None))
+    l.records.push(TypeRecord(type_name(t), buf(), None, None, None, None, false))
     l.record_types.push(t)
     l.record_index.put(key, index)
     var ancestors: Buf[usize] = buf()
     for up in supertypes(l, t)
         ancestors.push(record_of(l, up))
-    l.records[index] = TypeRecord(type_name(t), ancestors, None, None, None, None)
+    l.records[index] = TypeRecord(type_name(t), ancestors, None, None, None, None, keeps_owners(l, t))
     index
+
+/** Whether `t` is a class the standard library marks `@keeps_owners`: its objects are shared
+ * between owners, so handing over a value that reaches one leaves what it holds where it is. */
+private keeps_owners(l: *Lowering, t: &Type) -> bool
+    if *t is Class(id, _, _)
+        for a in l.program.classes[id].decl.annotations
+            if a.name == "keeps_owners" then return true
+    false
+
+// Whether a value of type `t` may reach a Sysl or C handle that a send hands over, so that sending it
+// walks it: a handle; a tuple, a data type or a class with a field that may; a generic type of the
+// standard library, such as a collection, at a type argument that may, or that keeps a function, as
+// a behaviour does; a function value, whose captures its type does not show; and `Any`, a trait or
+// an open or abstract class, which may hold anything. A class marked `@keeps_owners` stops the walk, so it holds none, and the scalars and
+// strings hold none. `seen` holds the types being decided, which a recursive type reaches again.
+private holds_handles(l: *Lowering, t: &Type, seen: *Buf[string]) -> bool
+    *t match
+        Tuple(items) ->
+            for item in items
+                if holds_handles(l, item, seen) then return true
+            false
+        Data(id, _, args) ->
+            val key = type_key(t)
+            for s in *seen
+                if s == key then return false
+            seen.push(key)
+            val d = l.program.data[id]
+            for v in 0..<d.variants.len()
+                for field in variant_fields(d, id, v, args)
+                    if holds_handles(l, field, seen) then return true
+            false
+        Class(id, _, args) ->
+            val k = l.program.classes[id]
+            if handle_target(k.decl) is Some(_) || c_handle_type(k.decl) is Some(_) then return true
+            if keeps_owners(l, t) then return false
+            val key = type_key(t)
+            for s in *seen
+                if s == key then return false
+            seen.push(key)
+            // A generic type of the standard library, a collection's trait among them, holds what its
+            // type arguments are and what a function it keeps captures; its other fields are its own
+            // structure, such as a vector's nodes.
+            if (k.module_name == CoreModule || k.module_name.starts_with("avin.")) && args.len() > 0
+                for a in args
+                    if holds_handles(l, a, seen) then return true
+                for f in k.fields
+                    if f.ty is Some(ft)
+                        if *ft is Function(_, _, _) || *ft is ByName(_) then return true
+                return false
+            if k.decl.modifier == "trait" || k.decl.modifier == "open" || k.decl.modifier == "abstract" then return true
+            for f in k.fields
+                if holds_handles(l, substitute(f.ty.unwrap_or(ErrorType), class_owner(id), args), seen) then return true
+            false
+        Function(_, _, _) -> true
+        ByName(_) -> true
+        AnyType -> true
+        TypeVar(_, _, _) -> true
+        _ -> false
 
 /** The types `t` conforms to besides itself and `Any`, each once. */
 private supertypes(l: *Lowering, t: &Type) -> Buf[&Type]
@@ -1207,7 +1265,7 @@ private add_variant_ancestors(l: *Lowering)
             if always_is(l, from, to) || same_type(view_as(lowering_conformances(l), from, to), to)
                 ancestors.push(target)
                 grew = true
-        if grew then l.records[r] = TypeRecord(l.records[r].name, ancestors, l.records[r].equals, l.records[r].hash, l.records[r].display, l.records[r].debug)
+        if grew then l.records[r] = TypeRecord(l.records[r].name, ancestors, l.records[r].equals, l.records[r].hash, l.records[r].display, l.records[r].debug, l.records[r].apart)
 
 /** The value of type `t` an object that has that type holds: a built-in value is in its box, and an
  * option kept as a pointer is the `Some`'s value or null. */
@@ -1570,6 +1628,9 @@ private call_resolved(l: *Lowering, e: &TExpr, function: usize, callee: Function
             return array_operation(l, name, array, operands, e.span)
         if name.starts_with("string_") then return intrinsic_operation(l, name, operands, e.span)
         if name.starts_with("atomic_") then return atomic_operation(l, name, concrete(l, args[0].ty), operands)
+        if name == "holds_handles"
+            var seen: Buf[string] = buf()
+            return Some(ConstBool(holds_handles(l, concrete(l, args[0].ty), &seen)))
     // A local function also receives what it captures, from where the caller keeps it.
     for x in callee.captured_locals
         if l.local_slots[x] is Some(p) then operands.push(p.address)
@@ -3123,6 +3184,10 @@ private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
             if l.param_values[i] is Some(v) then operands.push(Value(v))
         finish(l, Return(atomic_operation(l, name, concrete(l, symbol.params[0]), operands)))
         return
+    if name == "holds_handles"
+        var seen: Buf[string] = buf()
+        finish(l, Return(Some(ConstBool(holds_handles(l, concrete(l, symbol.params[0]), &seen)))))
+        return
     // Every other intrinsic calls one runtime entry point.
     val found = intrinsic_entry(name) match
         Some(f) -> f
@@ -4398,7 +4463,7 @@ private add_equality_entries(l: *Lowering) -> bool
         if owned
             val equals = generated(l, RecordEquals, t)
             val hash = generated(l, RecordHash, t)
-            l.records[r] = TypeRecord(record.name, l.records[r].ancestors, Some(equals), Some(hash), l.records[r].display, l.records[r].debug)
+            l.records[r] = TypeRecord(record.name, l.records[r].ancestors, Some(equals), Some(hash), l.records[r].display, l.records[r].debug, l.records[r].apart)
             added = true
         r += 1
     added
@@ -4424,7 +4489,7 @@ private add_rendering_entries(l: *Lowering) -> bool
             if displays && display is None then display = Some(generated(l, RecordDisplay, t))
             if debugs && debug is None then debug = Some(generated(l, RecordDebug, t))
             if !same_entry(display, record.display) || !same_entry(debug, record.debug)
-                l.records[r] = TypeRecord(record.name, record.ancestors, record.equals, record.hash, display, debug)
+                l.records[r] = TypeRecord(record.name, record.ancestors, record.equals, record.hash, display, debug, record.apart)
                 added = true
         r += 1
     added

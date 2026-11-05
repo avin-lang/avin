@@ -2317,8 +2317,14 @@ private declare_fields(c: *Checker, unit: usize)
         val k = c.classes[id]
         if k.unit != unit then continue
         val d = k.decl
-        // `@sysl` and `@c` on a class are checked where the class is declared.
+        // `@sysl` and `@c` on a class are checked where the class is declared. `@keeps_owners` is
+        // the standard library's mark on a class whose objects are shared between owners, so that
+        // handing over a value that reaches one stops there (`TypeRecord.apart`).
         for a in d.annotations
+            if a.name == "keeps_owners" && !d.object
+                if !in_standard_library(k.module_name) then c.note(unit, a.span, "`@keeps_owners` is the standard library's mark on a type shared between owners, such as `ActorRef`, whose handles a send does not hand over")
+                elif a.args.len() > 0 then c.note(unit, a.span, "`@keeps_owners` takes no arguments")
+                continue
             if (a.name != "sysl" && a.name != "c") || d.object
                 val what = if d.object then "an object" elif d.modifier == "trait" then "a trait" else "a class"
                 c.note(unit, a.span, misplaced_annotation(c, unit, a.name, what))
@@ -5195,6 +5201,11 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
         // declares them, as methods on the value that is its first field.
         elif is_atomic_intrinsic(name)
             if module_name != "avin.threads" then c.note(unit, f.name_span, s"`$name` is an intrinsic of `avin.threads.Atomic`")
+        // Whether a value of its parameter's type may reach a handle a send hands over, decided
+        // where the program is compiled for each type: `[T](value: T) -> bool`, the actors'.
+        elif name == "holds_handles"
+            if module_name != "avin.actors" then c.note(unit, f.name_span, s"`$name` is an intrinsic of `avin.actors`")
+            elif params.len() != 1 || !(*result.unwrap_or(Unit) is Bool) then c.note(unit, f.name_span, s"intrinsic `$name` takes one value and answers a `bool`")
         else
             intrinsic_signature(name) match
                 Some(expected) ->
@@ -5966,10 +5977,12 @@ private check_late_sendables(c: *Checker)
         c.generic = outer_generic
     c.late_sendables = buf()
 
-// Two marks on a parameter check what is passed for it. `@isolated`: it may use only sendable values
-// from around it, so nothing outside reaches a mutable value it makes or is given, as a mutex's value
-// and the body that works on it. `@sendable`: that, and it captures no `var`, since it may run on
-// another thread while the code that made it goes on, as a thread's body. A lambda, a by-name
+// Three marks on a parameter check what is passed for it. `@isolated`: it may use only sendable
+// values from around it, so nothing outside reaches a mutable value it makes or is given, as a
+// mutex's value and the body that works on it. `@isolating`: that, and nothing it runs reaches
+// module-level mutable state, as the body of `isolate` (`check_module_state_in_threads`).
+// `@sendable`: both, and it captures no `var`, since it may run on another thread while the code
+// that made it goes on, as a thread's body. A lambda, a by-name
 // argument, a local function or a method value is checked by what it captures, and any other
 // expression by the locals and parameters it uses; the values it makes itself are its own. A
 // parameter so marked that holds a function may be passed on for a parameter with the same mark or a
@@ -5977,7 +5990,8 @@ private check_late_sendables(c: *Checker)
 // the closures' captures are known.
 
 /** How parameter `i` of function `f`, counted as a call passes its arguments, a method's receiver
- * first, is marked: `NotMarked`, `IsolatedMark` or `SendableMark`, the stronger. */
+ * first, is marked: `NotMarked`, `IsolatedMark`, `IsolatingMark` or `SendableMark`, the strongest
+ * written. */
 private param_mark(c: *Checker, f: usize, i: usize) -> int
     val symbol = c.symbols[f]
     val written = symbol.decl.params
@@ -5986,15 +6000,19 @@ private param_mark(c: *Checker, f: usize, i: usize) -> int
     if i < offset || i - offset >= written.len() then return NotMarked
     var mark = NotMarked
     for a in written[i - offset].annotations
-        if a.name == "sendable" then mark = SendableMark
-        elif a.name == "isolated" && mark == NotMarked then mark = IsolatedMark
+        val m = if a.name == "sendable" then SendableMark elif a.name == "isolating" then IsolatingMark elif a.name == "isolated" then IsolatedMark else NotMarked
+        if m > mark then mark = m
     mark
 
+// Each mark asks what the weaker ones do, and more: `@isolating` adds to `@isolated` that nothing
+// the argument calls reaches module-level mutable state, and `@sendable` adds that it captures no
+// `var`.
 const NotMarked: int = 0
 const IsolatedMark: int = 1
-const SendableMark: int = 2
+const IsolatingMark: int = 2
+const SendableMark: int = 3
 
-private mark_name(mark: int) -> string = if mark == SendableMark then "@sendable" else "@isolated"
+private mark_name(mark: int) -> string = if mark == SendableMark then "@sendable" elif mark == IsolatingMark then "@isolating" else "@isolated"
 
 /** Where method `m` marks a parameter more strongly than `base`, which it overrides or implements: a
  * call through `base` would pass what the mark never checked. */
@@ -6364,8 +6382,10 @@ private push_all(out: *Buf[&TExpr], items: Buf[&TExpr])
 // reads and writes no module-level `var` and reads no module-level value or object (a `lazy val`
 // among them) whose type is not sendable. The whole program is known, so what a call reaches is:
 // the function it names, every implementation a call through a method table or an operator may
-// reach, and every closure made along the way. What is passed for an `@isolated` parameter runs at
-// once on the calling thread, and is not held to this.
+// reach, and every closure made along the way. What is passed for an `@isolating` parameter is held
+// to it too: it runs at once, but what it makes leaves isolated, as an `Isolated`'s objects do, and a
+// module-level value it stored one in would let code outside reach it. What is passed for an
+// `@isolated` parameter runs at once on the calling thread, and is not held to this.
 private check_module_state_in_threads(c: *Checker, direct: Buf[Option[Uses]])
     val k = c.core.trait_named("Sendable") match
         Some(k) -> k
@@ -6408,12 +6428,17 @@ private struct StateReached
 
 private thread_body_arguments(c: *Checker, id: usize, root: usize, f: usize, args: Buf[&TExpr], k: usize, direct: Buf[Option[Uses]], held: *Buf[HeldArgument])
     for i in 0..<args.len()
-        if param_mark(c, f, i) != SendableMark then continue
+        val mark = param_mark(c, f, i)
+        if mark < IsolatingMark then continue
         val arg = held_value(args[i], held)
         // A function made as a `@sendable` one is checked where it is made.
         if made_sendable(c, root, arg) then continue
         if module_state_path(c, arg, k, direct) is Some(why)
-            c.note(c.symbols[id].unit, args[i].span, s"what is passed for `${c.symbols[f].param_names[i]}` of `${c.symbols[f].name}` may run on another thread, which shares the program's module-level state, but $why")
+            val what = s"what is passed for `${c.symbols[f].param_names[i]}` of `${c.symbols[f].name}`"
+            // What an `@isolating` argument makes leaves isolated, so code outside must not reach it
+            // through module-level state.
+            if mark == IsolatingMark then c.note(c.symbols[id].unit, args[i].span, s"$what is isolated, so nothing it runs may reach module-level mutable state, but $why")
+            else c.note(c.symbols[id].unit, args[i].span, s"$what may run on another thread, which shares the program's module-level state, but $why")
 
 // Where the code `arg` runs reaches module-level state a thread's body may not: the functions it is
 // reached through and what it is.

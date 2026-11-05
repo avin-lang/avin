@@ -1,0 +1,69 @@
+// expect: exit 0
+// One buffer per job goes through a pipeline of actors without a copy: the first fills it inside
+// `isolate`, the middle ones change it in place with `with`, each passing the same `Isolated` on, and
+// the last takes it and adds it up. An actor's parameters are its state, which a body reads through
+// a `val` copied first. Many jobs are in flight at once on four workers, and a thread fed by a
+// channel takes an `Isolated` too.
+import avin.actors.{ActorRef, Isolated, isolate, spawn}
+import avin.threads.{Channel, Executor, Promise}
+import avin.threads as threads
+
+data Job(id: int, items: Isolated[Buffer[long]])
+
+actor Summer(results: Channel[(int, long)]) receives Job
+    receive
+        Job(id, items) ->
+            val b = items.take()
+            var total: long = 0
+            for x in b do total += x
+            results.send((id, total))
+
+actor Stage(factor: long, next: ActorRef[Job]) receives Job
+    receive
+        Job(id, items) ->
+            val by = factor
+            items.with(b ->
+                for i in 0..<b.size() do b(i) = b(i) * by
+                ())
+            next tell Job(id, items)
+
+actor Filler(size: int, next: ActorRef[Job]) receives int
+    receive
+        id ->
+            val n = size
+            val items = isolate
+                val b = Buffer[long]()
+                for i in 0..<n do b.append(long(id + i))
+                b
+            next tell Job(id, items)
+
+main()
+    val ex = Executor.fixed(4)
+    val jobs = 120
+    val size = 50
+    val results = Channel[(int, long)](jobs)
+    val summer = spawn(Summer(results), executor = ex)
+    val third = spawn(Stage(5, summer), executor = ex)
+    val second = spawn(Stage(3, third), executor = ex)
+    val fillers = (0..<4).map(_ -> spawn(Filler(size, second), executor = ex)).toVector()
+    for id in 0..<jobs do fillers(id % 4) tell id
+    var all: long = 0
+    var expected: long = 0
+    for _ in 0..<jobs
+        val (id, total) = results.receive().get()
+        var want: long = 0
+        for i in 0..<size do want += long(id + i) * 15
+        if total != want then println(s"job $id: $total, not $want")
+        all += total
+        expected += want
+    println(all == expected)
+    val handoff = Channel[Isolated[Buffer[string]]](1)
+    val t = threads.spawn(() -> handoff.receive().get().take().mkString("-"))
+    val words = isolate
+        val b = Buffer[string]()
+        b.append("ä")
+        b.append("ö")
+        b
+    handoff.send(words)
+    println(t.join())
+    ex.shutdown()

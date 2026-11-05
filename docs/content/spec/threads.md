@@ -99,12 +99,16 @@ main() = println(spawn(() -> digits.run("42")).join())
 error: a `@sendable (int) -> int` may use only sendable values from around it, but it uses `a`, an `Array[int]`, which is mutable; an immutable copy (`toVector`) is sendable
 ```
 
-**The checks are two marks on a parameter, which any function may use.** What is passed for an
+**The checks are three marks on a parameter, which any function may use.** What is passed for an
 **`@isolated`** parameter may use only sendable values from around it: a closure captures only
 sendable values (a `var` among them, where its type is sendable), and any other expression reads
 only sendable locals and parameters; what it makes itself is its own. Nothing outside therefore
-reaches a mutable value it makes or is given. A **`@sendable`** parameter asks that, and that a
-closure captures no `var`, since it may run on another thread while the code that made it goes on.
+reaches a mutable value it makes or is given. An **`@isolating`** parameter asks that, and that
+nothing it runs, however indirectly, reaches module-level mutable state (below), so no mutable
+object it makes can be stored where code outside reaches it: it is the mark of
+[`isolate`'s body and `with`'s function](/spec/actors/#handing-over-ownership). A **`@sendable`**
+parameter asks both, and that a closure captures no `var`, since it may run on another thread while
+the code that made it goes on.
 Inside the function, a parameter so marked that holds a function may be passed on for a parameter
 with the same mark or a weaker one; an unmarked one may not, and the error says to mark it. A
 method that overrides or implements another marks no parameter more strongly than the method it
@@ -195,8 +199,8 @@ error: what is passed for `body` of `spawn` may run on another thread, which sha
 
 With `val hits = Atomic(0)` and `record() = hits.add(1)` the program is legal. Printing is legal from any
 thread: `print`, `println` and `eprintln` reach the runtime's streams, which keep no state of the
-program's. What is passed for an `@isolated` parameter runs at once on the calling thread and is not
-held to this.
+program's. What is passed for an `@isolating` parameter is held to it too, and what is passed for an
+`@isolated` one, which runs at once on the calling thread, is not.
 
 A [Sysl handle](/spec/sysl-bindings/#handles) is the exception: it belongs to one owner at a time,
 and a use by any other code traps. The handles a thread's body or a future's body reaches move to
