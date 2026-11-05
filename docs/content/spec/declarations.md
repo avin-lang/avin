@@ -237,6 +237,9 @@ A clause may be guarded:
 - `f(patterns)` followed by an indented block of `| condition = body` lines tries each guard in
   order; `| _ = body` always holds and ends the block.
 - When the patterns match but every guard fails, the next clause is tried.
+- A `|` that starts a line continues the expression above it, so a second guard written on its own
+  line after a one-line guard is not a guard; it is reported, and the guards belong in the
+  indented block.
 
 A body after `=` is one expression on the same line or an indented block. Without a declared result
 type, the result is inferred from the clauses' bodies, which must agree; a recursive function
