@@ -130,7 +130,7 @@ lsp_initialize()
         "\"documentHighlightProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\"," +
         "\"class\",\"struct\",\"enum\",\"interface\",\"typeParameter\",\"enumMember\",\"function\",\"method\"," +
         "\"property\",\"parameter\",\"variable\"],\"tokenModifiers\":[\"declaration\",\"readonly\",\"static\"," +
-        "\"defaultLibrary\"]},\"full\":true},\"documentFormattingProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]}}," +
+        "\"defaultLibrary\"]},\"full\":true},\"documentFormattingProvider\":true,\"documentRangeFormattingProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]}}," +
         s"\"serverInfo\":{\"name\":\"avin\",\"version\":\"$Version\"}}}")
     assert_eq(lsp_answer(&server, lsp_notify("initialized", "{}")).len(), 0)
 
@@ -1049,6 +1049,50 @@ lsp_formatting_edits()
     assert_eq(lsp_one(&server, ask), lsp_reply(2, "null"))
     val unknown = lsp_request(3, "textDocument/formatting", "{\"textDocument\":{\"uri\":\"file:///nowhere/x.avin\"}}")
     assert_eq(lsp_one(&server, unknown), lsp_reply(3, "null"))
+
+private lsp_range_format(server: *LspServer, uri: string, l0: int, c0: int, l1: int, c1: int) -> string =
+    lsp_one(server, lsp_request(2, "textDocument/rangeFormatting", s"{\"textDocument\":{\"uri\":\"$uri\"},\"range\":${lsp_test_range(l0, c0, l1, c1)},\"options\":{\"tabSize\":2,\"insertSpaces\":true}}"))
+
+private lsp_range_edit(l0: int, c0: int, l1: int, c1: int, text: string) -> string =
+    lsp_reply(2, s"[{\"range\":${lsp_test_range(l0, c0, l1, c1)},\"newText\":${json_quote(text)}}]")
+
+@test("lsp: range formatting grows the range to the declarations it touches and edits nothing else")
+lsp_range_formatting_declarations()
+    val dir = make_temp_dir("avin-lsp-rfmt").unwrap()
+    defer _ = remove_dir_all(dir)
+    val uri = lsp_file_uri(lsp_normal(dir) + "/main.avin")
+    var server = lsp_ready()
+    lsp_answer(&server, lsp_open(uri, "f()=1\n\nmain()\n    println(1+2)\n    println(3+4)\n\ng()=2\n"))
+    // Inside one body: the whole function, and neither `f` nor `g`.
+    assert_eq(lsp_range_format(&server, uri, 3, 6, 3, 6), lsp_range_edit(2, 0, 4, 16, "main()\n  println(1 + 2)\n  println(3 + 4)"))
+    // Across two declarations, ending at the start of the line after the second.
+    assert_eq(lsp_range_format(&server, uri, 0, 2, 3, 4), lsp_range_edit(0, 0, 4, 16, "f() = 1\n\nmain()\n  println(1 + 2)\n  println(3 + 4)"))
+    // A range that ends at the start of a line does not reach that line.
+    assert_eq(lsp_range_format(&server, uri, 0, 0, 2, 0), lsp_range_edit(0, 0, 0, 5, "f() = 1"))
+    // Between declarations, nothing is touched.
+    assert_eq(lsp_range_format(&server, uri, 1, 0, 1, 0), lsp_reply(2, "[]"))
+    // A formatted declaration gives no edit while another in the file is not.
+    lsp_answer(&server, lsp_change(uri, "f()=1\n\nmain()\n  println(1 + 2)\n"))
+    assert_eq(lsp_range_format(&server, uri, 3, 0, 3, 3), lsp_reply(2, "[]"))
+    // A file that does not parse, or is not open, gives none.
+    lsp_answer(&server, lsp_change(uri, "main(\n"))
+    assert_eq(lsp_range_format(&server, uri, 0, 0, 0, 1), lsp_reply(2, "null"))
+    assert_eq(lsp_range_format(&server, "file:///nowhere/x.avin", 0, 0, 0, 1), lsp_reply(2, "null"))
+
+@test("lsp: range formatting in a literate file edits program lines only, and keeps a text block byte for byte")
+lsp_range_formatting_literate_and_blocks()
+    val dir = make_temp_dir("avin-lsp-rfmt").unwrap()
+    defer _ = remove_dir_all(dir)
+    val doc = lsp_file_uri(lsp_normal(dir) + "/doc.lavin")
+    var server = lsp_ready()
+    lsp_answer(&server, lsp_open(doc, "# Title\n\n    main()\n            println(1+2)\n\nSome  prose,   kept.\n\n    f()=1\n"))
+    assert_eq(lsp_range_format(&server, doc, 3, 14, 3, 14), lsp_range_edit(2, 0, 3, 24, "    main()\n      println(1 + 2)"))
+    assert_eq(lsp_range_format(&server, doc, 5, 0, 5, 4), lsp_reply(2, "[]"))
+    assert_eq(lsp_range_format(&server, doc, 7, 4, 7, 4), lsp_range_edit(7, 0, 7, 9, "    f() = 1"))
+    val uri = lsp_file_uri(lsp_normal(dir) + "/main.avin")
+    val q = "\"\"\""
+    lsp_answer(&server, lsp_open(uri, s"f()=1\n\nmain()\n    val t = $q\n        one  \n    $q\n    println( t )\n"))
+    assert_eq(lsp_range_format(&server, uri, 4, 2, 4, 2), lsp_range_edit(2, 0, 6, 16, s"main()\n  val t = $q\n        one  \n    $q\n  println(t)"))
 
 @test("lsp: an unknown module in an import is published at the module path, and an unknown member at the member")
 lsp_import_error_ranges()
