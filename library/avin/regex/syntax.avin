@@ -11,6 +11,7 @@ private val Comments: int = 4
 private val Multiline: int = 8
 private val DotAll: int = 32
 private val UnicodeCase: int = 64
+private val UnicodeCharacterClass: int = 256
 
 // The largest count a repetition can name; `*`, `+` and `{n,}` repeat up to it.
 private val MaxRepeat: int = 0x7fffffff
@@ -88,8 +89,13 @@ private data Tree
     // matched.
     Repeat(atom: Tree, least: int, most: int, mode: int, optional: bool)
     Anchor(kind: AnchorKind)
-    // `\b` when `boundary` is true, `\B` when it is false.
-    WordBoundary(boundary: bool)
+    // `\b` when `boundary` is true, `\B` when it is false; with `unicode`, a word character is one
+    // `\w` takes under the `U` flag.
+    WordBoundary(boundary: bool, unicode: bool)
+    // `\b{g}`: a boundary between grapheme clusters.
+    GraphemeBoundary
+    // `\X`: one extended grapheme cluster.
+    Grapheme
     BackReference(group: int, caseless: bool, unicode: bool)
     // `\R`: a line break, `\r\n` or any one vertical character.
     LineBreak
@@ -368,7 +374,8 @@ private class Parser(text: string)
             elif ch == 'd' then flags = flags | UnixLines
             elif ch == 'u' then flags = flags | UnicodeCase
             elif ch == 'x' then flags = flags | Comments
-            elif ch == 'c' || ch == 'U'
+            elif ch == 'U' then flags = flags | UnicodeCharacterClass | UnicodeCase
+            elif ch == 'c'
                 cursor += 1
                 return Err(error("Unsupported inline modifier '" + ch.toString() + "'"))
             elif ch == '-'
@@ -387,7 +394,8 @@ private class Parser(text: string)
             elif ch == 'd' then flags = flags & ~UnixLines
             elif ch == 'u' then flags = flags & ~UnicodeCase
             elif ch == 'x' then flags = flags & ~Comments
-            elif ch != 'c' && ch != 'U' then return Ok(())
+            elif ch == 'U' then flags = flags & ~(UnicodeCharacterClass | UnicodeCase)
+            elif ch != 'c' then return Ok(())
             ch = next()
 
     // A group's name: a Latin letter, then Latin letters and digits, then `>`.
@@ -535,24 +543,35 @@ private class Parser(text: string)
             return Ok(Construct(reference(int(ch) - 48)))
         ch match
             'A' -> if inClass then bad else Ok(Construct(Anchor(Begin)))
-            'B' -> if inClass then bad else Ok(Construct(WordBoundary(false)))
-            'D' -> Ok(Class(c -> !isAsciiDigit(c)))
+            'B' -> if inClass then bad else Ok(Construct(WordBoundary(false, has(UnicodeCharacterClass))))
+            'D' ->
+                val digit = digitClass()
+                Ok(Class(c -> !digit(c)))
             'G' -> if inClass then bad else Ok(Construct(Anchor(LastMatch)))
             'H' -> Ok(Class(c -> !isHorizontalSpace(c)))
             'N' -> Err(error("Unsupported escape \\N: the runtime has no Unicode character names"))
             'R' -> if inClass then bad else Ok(Construct(LineBreak))
-            'S' -> Ok(Class(c -> !isAsciiSpace(c)))
+            'S' ->
+                val space = spaceClass()
+                Ok(Class(c -> !space(c)))
             'V' -> Ok(Class(c -> !isVerticalSpace(c)))
-            'W' -> Ok(Class(c -> !isAsciiWord(c)))
-            'X' -> if inClass then bad else Err(error("Unsupported escape \\X: grapheme clusters are not matched"))
+            'W' ->
+                val word = wordClass()
+                Ok(Class(c -> !word(c)))
+            'X' -> if inClass then bad else Ok(Construct(Grapheme))
             'Z' -> if inClass then bad else Ok(Construct(Anchor(Dollar(false, has(UnixLines)))))
             'a' -> Ok(Code(7))
             'b' ->
                 if inClass then return bad
-                if peek() == '{' then return Err(error("Unsupported escape \\b{g}: grapheme clusters are not matched"))
-                Ok(Construct(WordBoundary(true)))
+                if peek() == '{'
+                    if skip() == 'g'
+                        if read() == '}' then return Ok(Construct(GraphemeBoundary))
+                        return Err(error("Illegal/unsupported escape sequence"))
+                    unread()
+                    unread()
+                Ok(Construct(WordBoundary(true, has(UnicodeCharacterClass))))
             'c' -> Ok(Code(control()?))
-            'd' -> Ok(Class(isAsciiDigit))
+            'd' -> Ok(Class(digitClass()))
             'e' -> Ok(Code(27))
             'f' -> Ok(Code(12))
             'h' -> Ok(Class(isHorizontalSpace))
@@ -565,14 +584,21 @@ private class Parser(text: string)
                 Err(error("named capturing group <" + name + "> does not exist"))
             'n' -> Ok(Code(10))
             'r' -> Ok(Code(13))
-            's' -> Ok(Class(isAsciiSpace))
+            's' -> Ok(Class(spaceClass()))
             't' -> Ok(Code(9))
             'u' -> Ok(Code(unicodeEscape()?))
             'v' -> if isRange then Ok(Code(11)) else Ok(Class(isVerticalSpace))
-            'w' -> Ok(Class(isAsciiWord))
+            'w' -> Ok(Class(wordClass()))
             'x' -> Ok(Code(hexadecimal()?))
             'z' -> if inClass then bad else Ok(Construct(Anchor(EndOfInput)))
             _ -> if isAsciiAlnum(int(ch)) then bad else Ok(Code(int(ch)))
+
+    // The classes of `\d`, `\s` and `\w`: over ASCII, or under the `U` flag over all of Unicode.
+    private digitClass() -> (int) -> bool = if has(UnicodeCharacterClass) then categories(bit(9)) else isAsciiDigit
+
+    private spaceClass() -> (int) -> bool = if has(UnicodeCharacterClass) then isWhiteSpace else isAsciiSpace
+
+    private wordClass() -> (int) -> bool = if has(UnicodeCharacterClass) then isWord else isAsciiWord
 
     // A back reference: more digits extend the number while it names a group already opened.
     private reference(first: int) -> Tree
@@ -790,31 +816,32 @@ private class Parser(text: string)
             if start + 1 >= cursor then return Err(error("Empty character family"))
             name = textOf(start, cursor - 1)
         val caseless = has(CaseInsensitive)
-        var found: Property = Unknown
         val sign = name.indexOf("=")
         if sign >= 0
             val key = name.slice(0, sign).toLowerCase()
             val value = name.slice(sign + 1, name.byteLength())
-            if key == "gc" || key == "general_category"
-                found = propertyByName(value, caseless)
-            elif key == "sc" || key == "script" || key == "blk" || key == "block"
-                found = Unsupported
-            if found is Found(test) then return Ok(negatedIf(complement, test))
-            if found is Unsupported then return Err(error("Unsupported Unicode property {" + name + "}: the runtime has no Unicode script or block data"))
-            return Err(error("Unknown Unicode property {name=<" + key + ">, value=<" + value + ">}"))
+            val found =
+                if key == "gc" || key == "general_category" then propertyByName(value, caseless)
+                elif key == "sc" || key == "script" then scriptProperty(value)
+                elif key == "blk" || key == "block" then blockProperty(value)
+                else None
+            return found match
+                Some(test) -> Ok(negatedIf(complement, test))
+                None -> Err(error("Unknown Unicode property {name=<" + key + ">, value=<" + value + ">}"))
+        var found: Option[(int) -> bool] = None
         if name.startsWith("In")
-            found = Unsupported
+            found = blockProperty(name.slice(2, name.byteLength()))
         elif name.startsWith("Is")
             val rest = name.slice(2, name.byteLength())
             found = binaryProperty(rest, caseless)
-            if found is Unknown then found = propertyByName(rest, caseless)
-            if found is Unknown then found = Unsupported
+            if found is None then found = propertyByName(rest, caseless)
+            if found is None then found = scriptProperty(rest)
         else
-            found = propertyByName(name, caseless)
+            if has(UnicodeCharacterClass) then found = unicodePosixClass(name.toUpperCase(), caseless)
+            if found is None then found = propertyByName(name, caseless)
         found match
-            Found(test) -> Ok(negatedIf(complement, test))
-            Unsupported -> Err(error("Unsupported character property {" + name + "}: it needs Unicode data the runtime does not have"))
-            Unknown -> Err(error("Unknown character property name {" + name + "}"))
+            Some(test) -> Ok(negatedIf(complement, test))
+            None -> Err(error("Unknown character property name {" + name + "}"))
 
     // The pattern's characters from `from` up to `until` as a string.
     private textOf(from: int, until: int) -> string

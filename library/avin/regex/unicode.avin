@@ -1,0 +1,207 @@
+module avin.regex
+
+// The Unicode data beyond the general category: scripts, blocks, the binary properties of the
+// database's property files, and the grapheme cluster break property. The tables live in
+// `unicode_tables.avin` as encoded text, written by `scripts/unicode_tables.avin`; each is decoded
+// the first time a pattern names it, so a program that never asks for one only carries its text.
+
+// The value of a digit of the tables' encoding: `0`–`9`, `A`–`Z`, `a`–`z`, `-` and `_` are 0 to 63,
+// and those from 32 on are followed by more digits of the same number.
+private digitValue(b: int) -> int
+    if b >= 48 && b <= 57 then return b - 48
+    if b >= 65 && b <= 90 then return b - 55
+    if b >= 97 && b <= 122 then return b - 61
+    if b == 45 then 62 else 63
+
+// The numbers a table's text encodes, each written most significant digit first.
+private decodeNumbers(text: string) -> Buffer[int]
+    val numbers = Buffer[int]()
+    var n = 0
+    for k in 0..<text.byteLength()
+        val d = digitValue(int(text.byteAt(k)))
+        if d >= 32
+            n = n * 32 + d - 32
+        else
+            numbers.add(n * 32 + d)
+            n = 0
+    numbers
+
+// How many of the ascending `starts` are at or below `c`.
+private startsAtOrBelow(starts: Array[int], c: int) -> int
+    var low = 0
+    var high = starts.length()
+    while low < high
+        val middle = (low + high) / 2
+        if starts(middle) <= c then low = middle + 1 else high = middle
+    low
+
+// A set of code points held as where each of its runs, and each gap between them, starts: the
+// encoded text is the lengths of the runs, the first a run of code points outside the set.
+private class RunSet(text: string)
+    private val starts: Array[int] = cumulative(decodeNumbers(text))
+
+    contains(c: int) -> bool = (startsAtOrBelow(starts, c) & 1) == 1
+
+private cumulative(lengths: Buffer[int]) -> Array[int]
+    val starts = Array.fill(lengths.length(), 0)
+    var at = 0
+    for k in 0..<lengths.length()
+        at += lengths(k)
+        starts(k) = at
+    starts
+
+// A property of many values held as runs: where each run starts, and its value. The runs cover every
+// code point from 0 to 0x10FFFF.
+private class RunMap(private val starts: Array[int], private val values: Array[int])
+    // The value of `c`, or `outside` for a number that is not a code point.
+    valueOf(c: int, outside: int) -> int = if c < 0 || c > 0x10ffff then outside else values(startsAtOrBelow(starts, c) - 1)
+
+// The runs an encoded text gives as each run's length followed by its value.
+private runMap(text: string) -> RunMap
+    val numbers = decodeNumbers(text)
+    val count = numbers.length() / 2
+    val starts = Array.fill(count, 0)
+    val values = Array.fill(count, 0)
+    var at = 0
+    for k in 0..<count
+        starts(k) = at
+        at += numbers(2 * k)
+        values(k) = numbers(2 * k + 1)
+    RunMap(starts, values)
+
+private lazy val Alphabetic: RunSet = RunSet(AlphabeticRuns)
+private lazy val Lowercase: RunSet = RunSet(LowercaseRuns)
+private lazy val Uppercase: RunSet = RunSet(UppercaseRuns)
+private lazy val Ideographic: RunSet = RunSet(IdeographicRuns)
+private lazy val Emoji: RunSet = RunSet(EmojiRuns)
+private lazy val EmojiPresentation: RunSet = RunSet(EmojiPresentationRuns)
+private lazy val EmojiModifier: RunSet = RunSet(EmojiModifierRuns)
+private lazy val EmojiModifierBase: RunSet = RunSet(EmojiModifierBaseRuns)
+private lazy val EmojiComponent: RunSet = RunSet(EmojiComponentRuns)
+private lazy val ExtendedPictographic: RunSet = RunSet(ExtendedPictographicRuns)
+
+private lazy val Scripts: RunMap = runMap(ScriptRuns)
+private lazy val ScriptNameList: Vector[Vector[string]] = ScriptNames.split(";").map(names -> names.split("|"))
+private lazy val Blocks: RunMap = runMap(BlockRuns)
+private lazy val BlockNameList: Vector[Vector[string]] = BlockNames.split(";").map(names -> names.split("|"))
+private lazy val Graphemes: RunMap = runMap(GraphemeRuns)
+
+// The index of the entry that lists `name`, compared upper-cased, or -1.
+private namedIn(list: Vector[Vector[string]], name: string) -> int
+    val wanted = name.toUpperCase()
+    var k = 0
+    while k < list.length()
+        if list(k).contains(wanted) then return k
+        k += 1
+    -1
+
+// The script `name` names, by its name or its four-letter code, ignoring case: the code points
+// `Scripts.txt` gives it, every other code point being of the script `Unknown`.
+private scriptProperty(name: string) -> Option[(int) -> bool]
+    val script = namedIn(ScriptNameList, name)
+    if script < 0 then return None
+    Some(c -> Scripts.valueOf(c, -1) == script)
+
+// The block `name` names, ignoring case: by its name in `Blocks.txt`, that name without its spaces,
+// or one of the names `PropertyValueAliases.txt` gives it.
+private blockProperty(name: string) -> Option[(int) -> bool]
+    val block = namedIn(BlockNameList, name) + 1
+    if block == 0 then return None
+    Some(c -> Blocks.valueOf(c, 0) == block)
+
+private isAlphabetic(c: int) -> bool = Alphabetic.contains(c)
+private isLowercase(c: int) -> bool = Lowercase.contains(c)
+private isUppercase(c: int) -> bool = Uppercase.contains(c)
+private isIdeographic(c: int) -> bool = Ideographic.contains(c)
+private isEmoji(c: int) -> bool = Emoji.contains(c)
+private isEmojiPresentation(c: int) -> bool = EmojiPresentation.contains(c)
+private isEmojiModifier(c: int) -> bool = EmojiModifier.contains(c)
+private isEmojiModifierBase(c: int) -> bool = EmojiModifierBase.contains(c)
+private isEmojiComponent(c: int) -> bool = EmojiComponent.contains(c)
+private isExtendedPictographic(c: int) -> bool = ExtendedPictographic.contains(c)
+
+// The grapheme cluster break values, as the tables number them.
+private val GraphemeCr: int = 1
+private val GraphemeLf: int = 2
+private val GraphemeControl: int = 3
+private val GraphemeExtend: int = 4
+private val GraphemeZwj: int = 5
+private val GraphemeRegionalIndicator: int = 6
+private val GraphemePrepend: int = 7
+private val GraphemeSpacingMark: int = 8
+private val GraphemeL: int = 9
+private val GraphemeV: int = 10
+private val GraphemeT: int = 11
+private val GraphemeLv: int = 12
+private val GraphemeLvt: int = 13
+
+// The `Indic_Conjunct_Break` values.
+private val ConjunctLinker: int = 1
+private val ConjunctConsonant: int = 2
+private val ConjunctExtend: int = 3
+
+private graphemeKind(c: int) -> int = Graphemes.valueOf(c, 0) & 15
+
+private isPictographic(c: int) -> bool = (Graphemes.valueOf(c, 0) & 16) != 0
+
+private conjunctBreak(c: int) -> int = Graphemes.valueOf(c, 0) >> 5
+
+private isGraphemeControl(kind: int) -> bool = kind == GraphemeCr || kind == GraphemeLf || kind == GraphemeControl
+
+// Whether the extended grapheme cluster rules break between `text(i - 1)` and `text(i)`, looking back
+// no further than `from`, where the text being segmented starts. `i` is above `from` and below the
+// text's end.
+private graphemeBreak(text: Array[int], from: int, i: int) -> bool
+    val before = text(i - 1)
+    val after = text(i)
+    val a = graphemeKind(before)
+    val b = graphemeKind(after)
+    if a == GraphemeCr && b == GraphemeLf then return false
+    if isGraphemeControl(a) || isGraphemeControl(b) then return true
+    if a == GraphemeL && (b == GraphemeL || b == GraphemeV || b == GraphemeLv || b == GraphemeLvt) then return false
+    if (a == GraphemeLv || a == GraphemeV) && (b == GraphemeV || b == GraphemeT) then return false
+    if (a == GraphemeLvt || a == GraphemeT) && b == GraphemeT then return false
+    if b == GraphemeExtend || b == GraphemeZwj || b == GraphemeSpacingMark || a == GraphemePrepend then return false
+    if conjunctBreak(after) == ConjunctConsonant && afterConjunctLinker(text, from, i) then return false
+    if a == GraphemeZwj && isPictographic(after) && afterPictographicZwj(text, from, i) then return false
+    if a == GraphemeRegionalIndicator && b == GraphemeRegionalIndicator then return regionalIndicatorsBefore(text, from, i) % 2 == 0
+    true
+
+// Whether the text before `i` ends in a consonant, then conjunct extenders and linkers with at least
+// one linker among them.
+private afterConjunctLinker(text: Array[int], from: int, i: int) -> bool
+    var linked = false
+    var k = i - 1
+    while k >= from
+        val value = conjunctBreak(text(k))
+        if value == ConjunctConsonant then return linked
+        if value == ConjunctLinker then linked = true
+        elif value != ConjunctExtend then return false
+        k -= 1
+    false
+
+// Whether the text before `i` ends in a pictographic character, extenders, and the zero width joiner
+// at `i - 1`.
+private afterPictographicZwj(text: Array[int], from: int, i: int) -> bool
+    var k = i - 2
+    while k >= from && graphemeKind(text(k)) == GraphemeExtend
+        k -= 1
+    k >= from && isPictographic(text(k))
+
+// How many regional indicators run back from `i - 1`.
+private regionalIndicatorsBefore(text: Array[int], from: int, i: int) -> int
+    var k = i - 1
+    while k >= from && graphemeKind(text(k)) == GraphemeRegionalIndicator
+        k -= 1
+    i - 1 - k
+
+// Where the extended grapheme cluster that starts at `i` ends, `i` being below `to`.
+private graphemeEnd(text: Array[int], i: int, to: int) -> int
+    var k = i + 1
+    while k < to && !graphemeBreak(text, i, k)
+        k += 1
+    k
+
+// Whether `i` is between two grapheme clusters of the text up to `to`: at either end, or where the
+// rules break between the characters on each side.
+private isGraphemeBoundary(text: Array[int], i: int, to: int) -> bool = i == 0 || i >= to || graphemeBreak(text, 0, i)
