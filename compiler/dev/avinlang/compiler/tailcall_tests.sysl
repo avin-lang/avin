@@ -1,0 +1,130 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// Which calls are made as tail calls: a call of a function of the program, by name, through a method
+// table or of a function value, whose value the caller returns at once, with nothing of the caller's
+// own stack among its arguments. The caller's frame is given back just before the call, and code
+// outside the program reaches the program's functions only through wrappers with the C convention.
+
+private lowered(text: string) -> MirProgram = lower_source(repository_toolchain(), source_of("probe.avin", text)) match
+    Ok(p) -> p
+    Err(d) -> panic(d)
+
+/** The LLVM text of the function whose symbol is `symbol` in `ir`. */
+private symbol_text(ir: string, symbol: string) -> string
+    val head = "@\"" + symbol + "\"("
+    var out = ""
+    var inside = false
+    for line in ir.split("\n")
+        if line.starts_with("define ") && line.contains(head) then inside = true
+        if inside
+            out = out + line + "\n"
+            if line == "}" then return out
+    out
+
+private function_text(text: string, name: string) -> string = symbol_text(emit_llvm(lowered(text)), "<program>." + name)
+
+/** The line of `text` after the one holding `needle`, or "" when there is none. */
+private line_after(text: string, needle: string) -> string
+    val lines = text.split("\n")
+    for i in 0..<lines.len
+        if lines[i].contains(needle) && i + 1 < lines.len then return lines[i + 1]
+    ""
+
+/** The line of `text` before the one holding `needle`, or "" when there is none. */
+private line_before(text: string, needle: string) -> string
+    val lines = text.split("\n")
+    for i in 1..<lines.len
+        if lines[i].contains(needle) then return lines[i - 1]
+    ""
+
+const Mutual: string = "isEven(n: long) -> bool = if n == 0 then true else isOdd(n - 1)\n\nisOdd(n: long) -> bool = n != 0 && isEven(n - 1)\n\nmain()\n    println(isEven(10))\n"
+
+@test("every function of the program has the program's convention")
+functions_are_tailcc()
+    val ir = emit_llvm(lowered(Mutual))
+    assert(ir.contains("define internal tailcc i1 @\"<program>.isEven\"(ptr %ctx, i64 %v0) {"))
+    assert(ir.contains("call tailcc void @\"<program>.main\"(ptr %ctx)"))
+    assert(ir.contains("define i32 @main(i32 %argc, ptr %argv) {"))
+
+@test("a call of another function in tail position is a musttail call followed by its return")
+mutual_recursion_is_musttail()
+    for name in ["isEven", "isOdd"]
+        val f = function_text(Mutual, name)
+        assert_eq(f.count_of("musttail call tailcc i1 @\"<program>."), 1usize)
+        assert(line_after(f, "musttail").starts_with("  ret i1 %v"))
+
+@test("a call whose value the caller goes on to use is an ordinary call")
+non_tail_call_is_ordinary()
+    val f = function_text("down(n: int) -> int = if n == 0 then 0 else n + up(n - 1)\n\nup(n: int) -> int = if n == 0 then 0 else down(n - 1)\n\nmain()\n    println(down(10))\n", "down")
+    assert(!f.contains("musttail"))
+    assert(f.contains("call tailcc i32 @\"<program>.up\""))
+
+@test("a tail call gives the caller's frame back just before it is made")
+frame_unlinked_before_tail_call()
+    val text = "data Box(n: int)\n\nping(n: int, b: Box) -> int = if n == 0 then b.n else pong(n - 1, Box(b.n + 1))\n\npong(n: int, b: Box) -> int\n    val c = Box(b.n * 2)\n    if n == 0 then c.n else ping(n - 1, Box(c.n - b.n))\n\nmain()\n    println(ping(10, Box(0)))\n"
+    val f = function_text(text, "pong")
+    // `b` is live across the allocation of the second box, so `pong` has a frame.
+    assert(f.contains("%frame = alloca"))
+    assert_eq(line_before(f, "musttail"), "  store ptr %caller, ptr %ctx")
+    assert(line_after(f, "musttail").starts_with("  ret ptr %v") || line_after(f, "musttail").starts_with("  ret i32 %v"))
+
+@test("a call passing the address of the caller's own slot stays an ordinary call")
+slot_address_disqualifies()
+    // `helper` reads `base` through the address of the slot `outer` keeps it in.
+    val f = function_text("outer(n: int) -> int\n    var base = n * 2\n    helper(k: int) -> int = k + base\n    base += 1\n    helper(n)\n\nmain()\n    println(outer(3))\n", "outer")
+    assert(!f.contains("musttail"))
+    assert(f.contains("call tailcc i32 @\"<program>.outer.helper"))
+
+@test("calls through a method table and of a function value in tail position are tail calls")
+indirect_tail_calls()
+    val text = "trait Step\n    next(n: int) -> int\n\nclass A: Step\n    override next(n: int) -> int = if n == 0 then 0 else go(B(), n - 1)\n\nclass B: Step\n    override next(n: int) -> int = if n == 0 then 1 else go(A(), n - 1)\n\ngo(s: Step, n: int) -> int = s.next(n)\n\napply(f: (int) -> int, x: int) -> int = f(x)\n\nmain()\n    println(go(A(), 10) + apply(n -> n + 1, 2))\n"
+    // The call is guarded by the receiver's descriptor: each method is called directly in a branch of
+    // its own, and any other object through its table, and every one of the calls returns at once.
+    val go = function_text(text, "go")
+    assert(go.contains("icmp eq ptr %v"))
+    assert_eq(go.count_of("musttail call tailcc"), go.count_of("call tailcc"))
+    assert(go.count_of("musttail call tailcc i32 @\"<program>.") >= 2usize)
+    val apply = function_text(text, "apply")
+    assert_eq(apply.count_of("musttail call tailcc i32 %v"), 1usize)
+
+@test("a function a Sysl binding's shim calls is reached through a wrapper with the C convention")
+shim_reaches_c_wrapper()
+    val ir = emit_llvm(lowered("@sysl(\"sysl.path.join_all\")\njoinAll(parts: Vector[string]) -> string\n\nmain()\n    println(joinAll([\"a\", \"b\"]))\n"))
+    // The wrapper has no convention named, so it is the C one, and calls the function with the
+    // program's.
+    var wrappers = 0
+    var inside = false
+    for line in ir.split("\n")
+        if line.starts_with("define internal ") && line.contains("!c\"(ptr %ctx")
+            assert(!line.contains("tailcc"))
+            wrappers = wrappers + 1
+            inside = true
+        elif inside && line.contains("call tailcc ")
+            inside = false
+    assert(wrappers > 0)
+    assert(!inside)
+
+@test("a started thread's closure is run through the closure runner, which has the C convention")
+thread_start_passes_runner()
+    val ir = emit_llvm(lowered("import avin.threads.spawn\n\nmain()\n    val t = spawn(() -> 3, 65536)\n    println(t.join())\n"))
+    assert(ir.contains("define internal void @avin.run_closure(ptr %ctx, ptr %closure) {"))
+    assert(ir.contains("call tailcc void %code(ptr %ctx, ptr %closure)"))
+    assert(ir.contains(", ptr @avin.run_closure)"))
+
+@test("a function whose arguments do not all travel in registers has the C convention and makes no tail call")
+stack_arguments_keep_c_convention()
+    val text = "spread(n: int, a: long, b: long, c: long, d: long, e: long) -> long = if n == 0 then a else gather(n - 1, a, b, c, d, e)\n\ngather(n: int, a: long, b: long, c: long, d: long, e: long) -> long = spread(n, a, b, c, d, e)\n\nfive(n: int, a: long, b: long, c: long, d: long) -> long = if n == 0 then a else five(n - 1, a, b, c, d)\n\nwide(n: i128) -> i128 = if n == 0 then 0 else other(n - 1)\n\nother(n: i128) -> i128 = wide(n)\n\nmain()\n    println(spread(3, 1, 2, 3, 4, 5) + five(2, 1, 2, 3, 4))\n    println(wide(3))\n"
+    val ir = emit_llvm(lowered(text))
+    // The context and six more integers are one too many for the registers of every target.
+    assert(ir.contains("define internal i64 @\"<program>.spread\"("))
+    assert(ir.contains("call i64 @\"<program>.gather\"("))
+    assert(!symbol_text(ir, "<program>.spread").contains("musttail"))
+    // The context and five fit.
+    assert(ir.contains("define internal tailcc i64 @\"<program>.five\"("))
+    // An integer wider than a register never has the program's convention.
+    assert(ir.contains("define internal i128 @\"<program>.wide\"("))
+    assert(!symbol_text(ir, "<program>.other").contains("musttail"))
