@@ -128,6 +128,11 @@ only for `None`, on the other. It also has `iterator()` (one element or none) an
 `Option[(A, B)]` has `unzip()` giving the two options, an `Option[Option[T]]` also has `flatten()`, and an `Option` has `nonEmpty()` beside `isDefined()` and
 `isEmpty()`. There is no `orNull`, since Avin has no null.
 
+An `Option[T]` is an `Ord` when `T` is: `None` orders before every `Some`, and two `Some`s order as
+their values. So `derives Ord` works on a data type with an `Option` field, a `Vector[Option[int]]`
+sorts and has a `max` and `min`, and `None < Some(0)`. The order nests (`None`, `Some(None)`,
+`Some(Some(1))`), and an option of a type without `Ord` has none.
+
 `exists` is false and `forall` true for `None` and for `Err`, which hold no value. `toList` and
 `toVector` give one element or none.
 
