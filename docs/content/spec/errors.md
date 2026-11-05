@@ -107,18 +107,18 @@ Their methods:
 | `Option[T]` | `Result[T, E]` |
 |---|---|
 | `isDefined()`, `isEmpty()` | `isOk()`, `isErr()` |
-| `getOrElse(default: -> T) -> T` | `getOrElse(default: -> T) -> T` |
-| `orElse(other: -> Option[T]) -> Option[T]` | `ok() -> Option[T]`, `err() -> Option[E]` |
+| `getOrElse[B >: T](default: -> B) -> B` | `getOrElse[U >: T](default: -> U) -> U` |
+| `orElse[B >: T](other: -> Option[B]) -> Option[B]` | `ok() -> Option[T]`, `err() -> Option[E]` |
 | `map[U](f: (T) -> U) -> Option[U]` | `map[U](f: (T) -> U) -> Result[U, E]` |
 | `flatMap[U](f: (T) -> Option[U]) -> Option[U]` | `mapErr[F](f: (E) -> F) -> Result[T, F]` |
-| `filter(p: (T) -> bool) -> Option[T]` | `flatMap[U](f: (T) -> Result[U, E]) -> Result[U, E]` |
+| `filter(p: (T) -> bool) -> Option[T]` | `flatMap[U, F >: E](f: (T) -> Result[U, F]) -> Result[U, F]` |
 | `fold[U](ifNone: -> U, f: (T) -> U) -> U` | `fold[U](onErr: (E) -> U, onOk: (T) -> U) -> U` |
 | `foreach(f: (T) -> unit)` | `foreach(f: (T) -> unit)` |
 | `exists(p: (T) -> bool) -> bool` | `exists(p: (T) -> bool) -> bool` |
 | `forall(p: (T) -> bool) -> bool` | `forall(p: (T) -> bool) -> bool` |
-| `contains(x: T) -> bool` | `orElse[F](f: (E) -> Result[T, F]) -> Result[T, F]` |
+| `contains[T1 >: T](x: T1) -> bool` | `orElse[U >: T, F](f: (E) -> Result[U, F]) -> Result[U, F]` |
 | `toList() -> List[T]`, `toVector() -> Vector[T]` | `toList() -> List[T]` |
-| `zip[U](other: Option[U]) -> Option[(T, U)]` | |
+| `zip[T1 >: T, U](other: Option[U]) -> Option[(T1, U)]` | |
 | `get() -> T`, trapping on `None` | |
 | `filterNot(p: (T) -> bool) -> Option[T]` | |
 
@@ -131,9 +131,16 @@ only for `None`, on the other. It also has `iterator()` (one element or none) an
 `exists` is false and `forall` true for `None` and for `Err`, which hold no value. `toList` and
 `toVector` give one element or none.
 
-A default or an alternative is passed by name, so it is evaluated only when it is used. The methods
-an `impl` adds are not [variance](/spec/generics/#variance) positions, so `T` may appear in a
-parameter: on an `Option[Dog]` seen as an `Option[Animal]`, `getOrElse` takes an `Animal`.
+A default or an alternative is passed by name, so it is evaluated only when it is used. A method
+that takes in a value which may be wider than the one held takes it as a type with `T` (or `E`) as
+its [lower bound](/spec/generics/#lower-bounds), and the result widens to it: on an `Option[Cat]`,
+`getOrElse(dog)` is an `Animal`, `orElse(Some(dog))` an `Option[Animal]`, and `contains(animal)`
+compares the cat with an `Animal`. On an `Option[int]` the bound admits only `int`.
+
+`None` with nothing to settle its type is an `Option[Nothing]`, and `Ok(1)` a `Result[int,
+Nothing]` (see [inference](/spec/generics/#inference)). No value has type `Nothing`, so either is an
+instance of any `Option` or `Result` with the other arguments: a module's `val none = None` is an
+`Option[int]` where one is wanted.
 
 ## Either
 
@@ -156,13 +163,13 @@ value look at a `Right`'s and pass a `Left` through unchanged, so a `Left` is wh
 | `fold[C](fa: (L) -> C, fb: (R) -> C) -> C` | `fb(b)` | `fa(a)` |
 | `swap() -> Either[R, L]` | `Left(b)` | `Right(a)` |
 | `map[R2](f: (R) -> R2) -> Either[L, R2]` | `Right(f(b))` | itself |
-| `flatMap[R2](f: (R) -> Either[L, R2]) -> Either[L, R2]` | `f(b)` | itself |
-| `getOrElse(default: -> R) -> R` | `b` | `default` |
-| `orElse(other: -> Either[L, R]) -> Either[L, R]` | itself | `other` |
-| `contains(x: R) -> bool` | `b == x` | false |
+| `flatMap[L1 >: L, R2](f: (R) -> Either[L1, R2]) -> Either[L1, R2]` | `f(b)` | itself |
+| `getOrElse[R1 >: R](default: -> R1) -> R1` | `b` | `default` |
+| `orElse[L1 >: L, R1 >: R](other: -> Either[L1, R1]) -> Either[L1, R1]` | itself | `other` |
+| `contains[R1 >: R](x: R1) -> bool` | `b == x` | false |
 | `exists(p: (R) -> bool) -> bool` | `p(b)` | false |
 | `forall(p: (R) -> bool) -> bool` | `p(b)` | true |
-| `filterOrElse(p: (R) -> bool, zero: -> L) -> Either[L, R]` | itself if `p(b)`, else `Left(zero)` | itself |
+| `filterOrElse[L1 >: L](p: (R) -> bool, zero: -> L1) -> Either[L1, R]` | itself if `p(b)`, else `Left(zero)` | itself |
 | `toOption() -> Option[R]` | `Some(b)` | `None` |
 | `toList() -> List[R]`, `toVector() -> Vector[R]` | one element | empty |
 | `foreach(f: (R) -> unit)` | calls `f(b)` | nothing |
@@ -177,7 +184,9 @@ Some methods are for an `Either` of a particular shape, added by an `impl` on it
 
 `Either.cond[L, R](test: bool, right: -> R, left: -> L) -> Either[L, R]` is `Right(right)` when
 `test` holds and `Left(left)` otherwise, evaluating only the side it uses. Defaults and alternatives
-are passed by name, and `L` and `R` appear in parameters without lower bounds, as for `Option`.
+are passed by name, and a value taken in may be wider than its side, through a lower bound, as for
+`Option`: on an `Either[string, Cat]`, `getOrElse(dog)` is an `Animal`. `Left(1)` with nothing to
+settle its right side is an `Either[int, Nothing]`, an instance of any `Either[int, R]`.
 
 A `match` covers an `Either` with a `Left` and a `Right` arm that each cover their value. Eithers are
 equal, hash and show by side and value: `Right(4)`, `Left(no)`, and under `debug` `Left("no")`.

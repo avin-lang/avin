@@ -23,7 +23,9 @@ a decision changes, this page and the chapter change together.
   [inference](/spec/generics/#inference).
 - A call's type argument that nothing at the call decides stays open until the end of the
   enclosing function body, settled by the first later use that needs it (a branch it joins, a
-  store, a use as a value of a known type), and is an error at the call if nothing settles it.
+  store, a use as a value of a known type). If nothing settles it, it is `Nothing` where the call
+  names it only where a value is read out (settled 2026-11-04, below), and an error at the call
+  otherwise.
 - The compiler is written in Sysl. Self-hosting is optional.
 - **The standard library is written in Avin.** Sysl is reached through
   [bindings written in Avin](/spec/sysl-bindings/), which the compiler turns into shims that Sysl
@@ -546,16 +548,37 @@ a decision changes, this page and the chapter change together.
   `Result` and mirrors' fields. `Array[byte]` stays a bulk copy to and from `[]u8`. No other Avin
   collection crosses.
 - `Option[+T]` and `Result[+T, +E]` are `data` types of the core library, written in Avin, with
-  their methods in an `impl`. Those methods are not variance positions, so `getOrElse(default: -> T)`
-  takes `T` in a parameter and needs no lower bound: on an `Option[Dog]` seen as an `Option[Animal]`,
-  the default is an `Animal`. See [errors](/spec/errors/#option-and-result).
+  their methods in an `impl`. See [errors](/spec/errors/#option-and-result).
+- Settled by the user 2026-11-04 ("follow the reference library"): `Option`, `Either` and `Result`
+  take lower bounds where the reference library's methods have them, so a value taken in may be
+  wider than the one held and the result widens to it: `getOrElse[B >: T](default: -> B) -> B`,
+  `orElse[B >: T](other: -> Option[B])`, `contains[T1 >: T](x: T1)` and
+  `zip[T1 >: T, U](other: Option[U]) -> Option[(T1, U)]` on `Option`; `getOrElse[R1 >: R]`,
+  `orElse[L1 >: L, R1 >: R]`, `contains[R1 >: R]`, `flatMap[L1 >: L, R2]` and
+  `filterOrElse[L1 >: L]` on `Either`; `getOrElse[U >: T]`, `flatMap[U, F >: E]` and
+  `orElse[U >: T, F]` on `Result`. On an `Option[Cat]`, `getOrElse(dog)` is an `Animal`. This
+  replaces the earlier reading that the impl's parameters, not being variance positions, needed no
+  bound: they still are not, but only a lower bound widens the result. `==` compares a value of a
+  type parameter with one of a parameter it is the lower bound of. `joinLeft` and `joinRight` keep
+  their shapes, `Either[Either[C, R], R]` and `Either[L, Either[L, C]]`, since a method takes one
+  lower bound per parameter and the reference's evidence form has no counterpart.
+- Settled by the user 2026-11-04 ("follow the reference library"): an unknown type argument still
+  open at the end of its body, that the call's parameters and result name only where a value is read
+  out, is `Nothing`: `None` alone is an `Option[Nothing]`, `Left(1)` an `Either[int, Nothing]`,
+  `Ok(1)` a `Result[int, Nothing]`, `[]` and `Vector.empty()` a `Vector[Nothing]`. A later use in the
+  body still settles it first. A covariant `Nothing` argument is any type, a value type's too, since
+  no value has it: an `Option[Nothing]` is an `Option[int]`, in a declared type, an argument and a
+  type pattern. An unknown named anywhere else (an invariant or contravariant argument, a lambda's
+  parameter) or nowhere stays an error asking for the type: `Buffer()`, `Map.empty()`, `{}`. A
+  `Buffer[Nothing]` could hold nothing, and a module's `val b = Buffer()` would only fail later, at
+  the first store, so the error stays where the type is missing.
 - Settled by the user 2026-11-04: the core library has `Either[+L, +R]`, with `Left(value)` and
   `Right(value)`, because the reference library has it. It follows that library's `Either` in names
   and meaning and is right-biased: `isLeft`, `isRight`, `fold`, `swap`, `map`, `flatMap`,
   `getOrElse`, `orElse`, `contains`, `exists`, `forall`, `filterOrElse`, `toOption`, `toList`,
   `toVector`, `foreach`, `iterator`; `merge` on `Either[A, A]`, `joinLeft` and `joinRight` on the
   nested shapes; `Either.cond(test, right, left)`. `Option` gains `toRight(left)` and
-  `toLeft(right)`. Defaults are by name and `L`, `R` take no lower bounds, as for `Option`. There is
+  `toLeft(right)`. Defaults are by name and take lower bounds as `Option`'s do (above). There is
   no left projection (`swap` serves), no `?` on an `Either`, and no conversion between `Either` and
   `Result`, which stays the type for failure. See [errors](/spec/errors/#either).
 - `?` returns from the function or lambda it is written in, so that one's result type must be

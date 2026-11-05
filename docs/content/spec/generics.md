@@ -235,6 +235,8 @@ contravariant, plain `T` invariant. A function's or an `impl`'s type parameters 
   an object whose header carries its type), `List[Dog]` is a `List[Animal]` with no conversion at
   all, and `List[string]` is a `List[Any]`. A value of a value type becomes an `Any` or a trait only
   by boxing, which never happens inside a container, so `List[int]` is not a `List[Any]`.
+  `Nothing` is the exception: no value has it, so a covariant `Nothing` argument is any type, and
+  `List[Nothing]` is a `List[int]` too.
 - Tuple parts are covariant and function types take contravariant parameters and covariant
   results, on the same terms: `(Animal) -> int` is a `(Dog) -> int`, and `() -> string` is a
   `() -> Any`, but `() -> int` is not.
@@ -301,8 +303,15 @@ infer is.
     `best match Some(b) if b >= i -> …` settles `b`, and with it `best`, as `i`'s type.
 
   A later use that disagrees with an earlier one is an error at the later use. An unknown still open
-  at the end of the body is an error at the call that made it, asking for the type to be written. A
-  field declared without a type has its initializer's type at once, since any function may read it.
+  at the end of the body that the call's parameters and result name only where a value is read out
+  (the whole type, a covariant argument, a tuple part, a function's result) is `Nothing`, the least
+  type: `val none = None` alone is an `Option[Nothing]`, `Left(1)` an `Either[int, Nothing]`, `Ok(1)`
+  a `Result[int, Nothing]`, `[]` a `Vector[Nothing]`, and `show(None)` for `show[T](o: Option[T])`
+  takes `T` as `Nothing`. Any other unknown still open is an error at the call that made it, asking
+  for the type to be written: `Buffer()`, `Map.empty()` (its `K` is invariant), `{}` (a `Set`), and a
+  type argument nothing at the call names. A field or module value declared without a type has its
+  initializer's type at once, since any function may read it, so `val none = None` there is an
+  `Option[Nothing]`.
   A type argument held to a bound is decided at its call.
 - Constraints are subtype constraints. A type variable collects lower and upper bounds and is solved
   to the least type that satisfies them, so `if c then dog else cat` is an `Animal`, and the branches
@@ -330,8 +339,12 @@ infer is.
   Likewise a tuple or a collection literal with a part of type `Nothing` is never made, and has
   type `Nothing`.
 - `None`, `[]`, `{}` and `Map.empty` take their type arguments from context. Where nothing determines
-  a type, the result is an error asking for an annotation, never a silent default to `Any` or
-  `Nothing`.
+  a type, the result is `Nothing` where the type argument is only read out, as above, and otherwise
+  an error asking for an annotation; never a silent default to `Any`.
+- No value has type `Nothing`, so an instance whose covariant argument is `Nothing` is an instance
+  with any type there, a value type's too: an `Option[Nothing]` is an `Option[int]` and an
+  `Either[int, Nothing]` an `Either[int, string]`, with no conversion, in a declared type, an
+  argument, a branch, and a type pattern alike.
 - Nothing is generalized implicitly: a local `val f = (x) -> x` with no use that settles `x` is an
   error. Polymorphic functions are declared with type parameters.
 
