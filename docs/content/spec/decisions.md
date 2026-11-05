@@ -3271,14 +3271,7 @@ their words are reserved.
 
   **Review with the user**: whether `free:` on a `unit` result should stay legal.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- Proposed (built on branch `c-bindings-handles`): **C handles** (stage 13 step 3), the choices
+- Settled on the user's delegation 2026-11-05 (built on branch `c-bindings-handles`): **C handles** (stage 13 step 3), the choices
   building them made where the [chapter](/spec/c-bindings/#handles) is silent.
   - **`shared` is a bare word of the class's `@c`**, `@c(type: …, release: …, shared)`. *Why*: the
     `@c(` lines are the whole trusted surface, and a thread-safety claim is one of them; no class
@@ -3323,6 +3316,15 @@ their words are reserved.
 
   **Review with the user**: `shared` as a word of `@c` rather than a modifier, and the chain of C
   references a kept handle brings with it.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
