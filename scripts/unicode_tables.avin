@@ -1,0 +1,236 @@
+// Writes `library/avin/regex/unicode_tables.avin`, the Unicode data `avin.regex` matches scripts,
+// blocks, binary properties and grapheme clusters with, from the files of the Unicode Character
+// Database:
+//
+//     avin run scripts/unicode_tables.avin -- <ucd directory> library/avin/regex/unicode_tables.avin
+//
+// The directory holds, side by side, `Scripts.txt`, `Blocks.txt`, `PropList.txt`,
+// `DerivedCoreProperties.txt`, `PropertyValueAliases.txt`, `emoji-data.txt` (from the database's
+// `emoji/` directory) and `GraphemeBreakProperty.txt` (from `auxiliary/`), all of the version the
+// general categories come from: the one `sysl.unicode` answers with, 17.0.0, at
+// `https://www.unicode.org/Public/17.0.0/ucd/`.
+//
+// A table is a run of code points per value: each value of a property is given to every code point
+// from 0 to 0x10FFFF, neighbours with the same value are merged into a run, and the runs' lengths
+// (and, for a property of many values, the values) are written as numbers in base 32, a digit to a
+// character. The library decodes a table the first time a pattern asks for it.
+
+import avin.fs
+import avin.process
+
+val Limit: int = 0x110000
+
+// The digits of the encoding: the first 32 end a number, the last 32 are followed by more digits.
+val Digits: string = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_"
+
+// One line of a database file: its first and last code point and its fields after the code points.
+data Entry(first: int, last: int, fields: Vector[string])
+
+hexValue(text: string) -> int
+    var n = 0
+    for ch in text.chars()
+        val c = int(ch)
+        val d = if c >= 48 && c <= 57 then c - 48 elif c >= 65 && c <= 70 then c - 55 elif c >= 97 && c <= 102 then c - 87 else -1
+        if d < 0
+            eprintln("not a hexadecimal number: " + text)
+            process.exit(1)
+        n = n * 16 + d
+    n
+
+readFile(dir: string, name: string) -> string = fs.readText(dir + "/" + name) match
+    Ok(text) -> text
+    Err(_) ->
+        eprintln("cannot read " + dir + "/" + name)
+        process.exit(1)
+
+// The data lines of a file: comments and blank lines dropped, fields trimmed.
+dataLines(dir: string, name: string) -> Vector[Vector[string]]
+    val lines = Buffer[Vector[string]]()
+    for line in readFile(dir, name).lines()
+        val hash = line.indexOf("#")
+        val content = (if hash >= 0 then line.slice(0, hash) else line).trim()
+        if content.nonEmpty() then lines.addOne(content.split(";").map(f -> f.trim()))
+    lines.toVector()
+
+// The lines of a file that give code points a value: `first..last ; fields`.
+entries(dir: string, name: string) -> Vector[Entry]
+    val found = Buffer[Entry]()
+    for fields in dataLines(dir, name)
+        val codes = fields(0)
+        val dots = codes.indexOf("..")
+        val first = hexValue(if dots >= 0 then codes.slice(0, dots) else codes)
+        val last = if dots >= 0 then hexValue(codes.slice(dots + 2, codes.byteLength())) else first
+        found.addOne(Entry(first, last, fields.drop(1)))
+    found.toVector()
+
+// The code points a file gives the binary property `property`, as a table of 0 and 1.
+binary(dir: string, name: string, property: string) -> Array[int]
+    val values = Array.fill(Limit, 0)
+    var any = false
+    for e in entries(dir, name)
+        if e.fields(0) == property
+            any = true
+            for c in e.first..e.last do values(c) = 1
+    if !any
+        eprintln("no property " + property + " in " + name)
+        process.exit(1)
+    values
+
+// A number in the encoding: its digits from the most significant, every one but the last marked as
+// followed by more.
+encodeNumber(out: StringWriter, n: int)
+    val digits = Buffer[int]()
+    var rest = n
+    loop
+        digits.addOne(rest % 32)
+        rest = rest / 32
+        if rest == 0 then break
+    var k = digits.length() - 1
+    while k >= 0
+        val d = if k > 0 then digits(k) + 32 else digits(k)
+        out.writeChar(Digits.charAt(d))
+        k -= 1
+
+// A set of code points as the lengths of its runs, starting with the run of code points not in it.
+encodeSet(values: Array[int]) -> string
+    val out = StringWriter()
+    var current = 0
+    var start = 0
+    for c in 0..<Limit
+        if values(c) != current
+            encodeNumber(out, c - start)
+            start = c
+            current = values(c)
+    out.text()
+
+// A property of many values as each run's length followed by its value.
+encodeMap(values: Array[int]) -> string
+    val out = StringWriter()
+    var start = 0
+    for c in 1..Limit
+        if c == Limit || values(c) != values(start)
+            encodeNumber(out, c - start)
+            encodeNumber(out, values(start))
+            start = c
+    out.text()
+
+// A text as one string literal, on one line, so that it is a single constant of the program. Neither
+// the encoding nor a name holds a quote or a backslash.
+literal(text: string) -> string = "\"" + text + "\""
+
+// A name compared the loose way the database matches names: case, spaces, hyphens and underscores
+// ignored.
+loose(name: string) -> string = name.toLowerCase().replace(" ", "").replace("_", "").replace("-", "")
+
+// The names the database gives each value of the property `key` in `PropertyValueAliases.txt`.
+aliases(dir: string, key: string) -> Vector[Vector[string]]
+    val found = Buffer[Vector[string]]()
+    for fields in dataLines(dir, "PropertyValueAliases.txt")
+        if fields(0) == key then found.addOne(fields.drop(1))
+    found.toVector()
+
+// The scripts `Scripts.txt` names, in the order of their long names, with `Unknown` for every code
+// point it does not list; each script's names, upper-cased, joined by `|`.
+scripts(dir: string, out: StringWriter)
+    val names = aliases(dir, "sc")
+    val listed = Buffer[string]()
+    for e in entries(dir, "Scripts.txt")
+        if !listed.contains(e.fields(0)) then listed.addOne(e.fields(0))
+    listed.addOne("Unknown")
+    listed.sortInPlace()
+    val values = Array.fill(Limit, listed.indexOf("Unknown"))
+    for e in entries(dir, "Scripts.txt")
+        val index = listed.indexOf(e.fields(0))
+        for c in e.first..e.last do values(c) = index
+    val joined = Buffer[string]()
+    for script in listed
+        var forms: Vector[string] = [script]
+        for alias in names
+            if alias.contains(script) then forms = alias
+        joined.addOne(forms.map(f -> f.toUpperCase()).mkString("|"))
+    out.write("// Each script's names, upper-cased, `|` between the names and `;` between the scripts.\n")
+    out.write("private val ScriptNames: string = " + literal(joined.mkString(";")) + "\n\n")
+    out.write("// The script of every code point, as runs of an index into `ScriptNames`.\n")
+    out.write("private val ScriptRuns: string = " + literal(encodeMap(values)) + "\n\n")
+
+// The blocks of `Blocks.txt` in order: each by its name, that name without its spaces, and every name
+// `PropertyValueAliases.txt` gives it, upper-cased; a code point outside every block has 0, the
+// first block 1.
+blocks(dir: string, out: StringWriter)
+    val names = aliases(dir, "blk")
+    val values = Array.fill(Limit, 0)
+    val joined = Buffer[string]()
+    for e in entries(dir, "Blocks.txt")
+        val name = e.fields(0)
+        val forms = Buffer[string]()
+        forms.addOne(name.toUpperCase())
+        val unspaced = name.replace(" ", "").toUpperCase()
+        if !forms.contains(unspaced) then forms.addOne(unspaced)
+        for alias in names
+            if alias.exists(a -> loose(a) == loose(name))
+                for a in alias
+                    if !forms.contains(a.toUpperCase()) then forms.addOne(a.toUpperCase())
+        joined.addOne(forms.mkString("|"))
+        for c in e.first..e.last do values(c) = joined.length()
+    out.write("// Each block's names, upper-cased, `|` between the names and `;` between the blocks.\n")
+    out.write("private val BlockNames: string = " + literal(joined.mkString(";")) + "\n\n")
+    out.write("// The block of every code point, as runs of 1 + an index into `BlockNames`, 0 outside every block.\n")
+    out.write("private val BlockRuns: string = " + literal(encodeMap(values)) + "\n\n")
+
+set(out: StringWriter, name: string, comment: string, values: Array[int])
+    out.write("// " + comment + "\n")
+    out.write("private val " + name + ": string = " + literal(encodeSet(values)) + "\n\n")
+
+// The grapheme cluster break property of `GraphemeBreakProperty.txt`, `Other` 0, with 16 added for
+// `Extended_Pictographic` and the `Indic_Conjunct_Break` value times 32.
+graphemes(dir: string, out: StringWriter)
+    val kinds: Vector[string] = ["Other", "CR", "LF", "Control", "Extend", "ZWJ", "Regional_Indicator", "Prepend", "SpacingMark", "L", "V", "T", "LV", "LVT"]
+    val values = Array.fill(Limit, 0)
+    for e in entries(dir, "GraphemeBreakProperty.txt")
+        val kind = kinds.indexOf(e.fields(0))
+        if kind < 0
+            eprintln("unknown grapheme break value " + e.fields(0))
+            process.exit(1)
+        for c in e.first..e.last do values(c) = kind
+    val pictographic = binary(dir, "emoji-data.txt", "Extended_Pictographic")
+    val conjunct: Vector[string] = ["None", "Linker", "Consonant", "Extend"]
+    for e in entries(dir, "DerivedCoreProperties.txt")
+        if e.fields(0) == "InCB"
+            val value = conjunct.indexOf(e.fields(1))
+            for c in e.first..e.last do values(c) = values(c) + value * 32
+    for c in 0..<Limit
+        if pictographic(c) == 1 then values(c) = values(c) + 16
+    out.write("// The grapheme cluster break property of every code point: `Other`, `CR`, `LF`, `Control`, `Extend`,\n")
+    out.write("// `ZWJ`, `Regional_Indicator`, `Prepend`, `SpacingMark`, `L`, `V`, `T`, `LV`, `LVT` as 0 to 13, 16\n")
+    out.write("// added for `Extended_Pictographic`, and `Indic_Conjunct_Break` `Linker`, `Consonant` or `Extend` as 32,\n")
+    out.write("// 64 or 96 added.\n")
+    out.write("private val GraphemeRuns: string = " + literal(encodeMap(values)) + "\n")
+
+main(args: Vector[string]) -> int
+    if args.length() != 2
+        eprintln("usage: unicode_tables <ucd directory> <output file>")
+        return 2
+    val dir = args(0)
+    val out = StringWriter()
+    out.write("module avin.regex\n\n")
+    out.write("// The Unicode Character Database 17.0.0's scripts, blocks, binary properties and grapheme cluster\n")
+    out.write("// break property, written by `scripts/unicode_tables.avin`, which says how they are encoded. Do not\n")
+    out.write("// edit: run the script again.\n\n")
+    scripts(dir, out)
+    blocks(dir, out)
+    set(out, "AlphabeticRuns", "`Alphabetic`, from `DerivedCoreProperties.txt`.", binary(dir, "DerivedCoreProperties.txt", "Alphabetic"))
+    set(out, "LowercaseRuns", "`Lowercase`, from `DerivedCoreProperties.txt`.", binary(dir, "DerivedCoreProperties.txt", "Lowercase"))
+    set(out, "UppercaseRuns", "`Uppercase`, from `DerivedCoreProperties.txt`.", binary(dir, "DerivedCoreProperties.txt", "Uppercase"))
+    set(out, "IdeographicRuns", "`Ideographic`, from `PropList.txt`.", binary(dir, "PropList.txt", "Ideographic"))
+    set(out, "EmojiRuns", "`Emoji`, from `emoji-data.txt`.", binary(dir, "emoji-data.txt", "Emoji"))
+    set(out, "EmojiPresentationRuns", "`Emoji_Presentation`, from `emoji-data.txt`.", binary(dir, "emoji-data.txt", "Emoji_Presentation"))
+    set(out, "EmojiModifierRuns", "`Emoji_Modifier`, from `emoji-data.txt`.", binary(dir, "emoji-data.txt", "Emoji_Modifier"))
+    set(out, "EmojiModifierBaseRuns", "`Emoji_Modifier_Base`, from `emoji-data.txt`.", binary(dir, "emoji-data.txt", "Emoji_Modifier_Base"))
+    set(out, "EmojiComponentRuns", "`Emoji_Component`, from `emoji-data.txt`.", binary(dir, "emoji-data.txt", "Emoji_Component"))
+    set(out, "ExtendedPictographicRuns", "`Extended_Pictographic`, from `emoji-data.txt`.", binary(dir, "emoji-data.txt", "Extended_Pictographic"))
+    graphemes(dir, out)
+    fs.writeText(args(1), out.text()) match
+        Ok(_) -> 0
+        Err(_) ->
+            eprintln("cannot write " + args(1))
+            1

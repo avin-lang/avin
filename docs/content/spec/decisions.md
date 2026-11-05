@@ -1414,9 +1414,9 @@ Settled by the user on 2026-11-04:
     `between`, `nextReal`, `nextBoolean`, `nextGaussian`, `nextBytes`, `alphanumeric`, `shuffle` and
     `setSeed`; the companion's methods use one shared, locked generator. PCG32, written in Avin with
     the wrapping operators, so a seed gives the same sequence everywhere. Binding: one runtime
-    function for the platform's seed over `sysl.posix.rand.seed_from_os`, since its `u64` does not
-    fit a `long` at the boundary. `nextGaussian` uses `avin.math`'s `sqrt` and `log`. Not blocked on
-    opaque handles.
+    function for the platform's seed over `sysl.posix.rand.seed_from_os`, since a `u64` above
+    `long.MaxValue` traps at a binding's result; it answers the entropy's top 63 bits.
+    `nextGaussian` uses `avin.math`'s `sqrt` and `log`.
   - **[`avin.net`](/spec/system-library/#avin-net)**: `TcpStream` and `TcpListener`; `Url`, parsed
     and percent-encoded, written in Avin; an HTTP/1.1 client (`get`, `post`, `send` with a `Request`)
     written in Avin over the TCP stream, a status never an error. `IoError` gains
@@ -1455,16 +1455,17 @@ Settled by the user on 2026-11-04:
   backtracking dialect exactly: leftmost-first alternation, greedy, reluctant and possessive
   repetition, atomic groups, bounded lookbehind (a repetition without an upper bound in one is an
   error), and the same rules for what a repeated group captures; `\d`, `\s`, `\w`, `\b` and the
-  POSIX classes are ASCII, and `i` folds only ASCII without `u`. Matching walks characters (scalar
+  POSIX classes are ASCII unless `U` makes them Unicode's, and `i` folds only ASCII without `u`. Matching walks characters (scalar
   values); every offset in the API is a byte offset, and a `PatternError`'s index counts the
   pattern's characters. There is no null: `group(i)`, `group(name)`, `before(i)`, `after(i)` answer
   `Option[string]`, `subgroups()` a `List[Option[string]]`, and `start(i)`/`end(i)` -1 for a group
   that took no part. Members without arguments are methods (`"a+".r()`, `m.start()`). `Regex(p)`
   traps on an invalid pattern with the error's message and `Regex.compile(p)` answers a
-  `Result[Regex, PatternError]`; a group number or name the match does not have traps. Properties
-  needing Unicode data beyond the general category (scripts, blocks, `Alphabetic`, `Uppercase`,
-  `Lowercase`, `Ideographic`, `Word`, emoji), the flags `U` and `c`, `\X`, `\b{g}` and `\N{…}` are
-  refused with an `Unsupported` error until the runtime holds that data. Replacing and splitting
+  `Result[Regex, PatternError]`; a group number or name the match does not have traps. Scripts,
+  blocks, the binary properties beyond the general category (`Alphabetic`, `Uppercase`,
+  `Lowercase`, `Ideographic`, `Word`, `Alnum`, emoji), the flag `U`, `\X` and `\b{g}` answer from
+  tables generated from the Unicode Character Database, of the version the general categories come
+  from; the flag `c` and `\N{…}` are refused with an `Unsupported` error. Replacing and splitting
   follow the same dialect: `replaceAllIn` (a replacement, or a `(Match) -> string` whose result is
   read as one), `replaceFirstIn`, `replaceSomeIn`, `split` answering an `Array[string]` with the
   empty pieces at the end dropped, `Pattern.split(s, limit = 0)`, `Regex.quote` and
@@ -1518,6 +1519,29 @@ Settled by the user on 2026-11-04:
   a `raw"""` block and `\\"""` does, as `raw"…"` does not end at `\"` and does at `\\"`.
 - **A block's first `"""` closes it** ([text blocks](/spec/strings-and-formatting/#text-blocks)),
   so `""""` is the end of the block and a stray quote; a block ending in a quote writes it `\"`.
+- **`avin.random`'s details** ([system library](/spec/system-library/#avin-random)), where the
+  chapter left them open, so that a seed's numbers are fixed:
+  - Every generator uses PCG32's stream 54 (increment 109), the reference implementation's
+    demonstration stream, so `Random(42).nextInt()` gives its published first output, `0xa15c02b7`
+    (as an `int`, `-1587805513`). Seeding is the reference's: one step from zero, the seed added,
+    one step more.
+  - `nextLong` is two draws, the first the high half; `nextBoolean` is a draw's top bit; `nextReal`
+    is a 64-bit draw's top 53 bits over 2^53; `nextInt(n)` rejects 32-bit draws below `2^32 % n`,
+    and `nextLong(n)` and `between` on `long` reject 64-bit draws below `2^64 % n`; `between` on `int`
+    is `nextInt` of the span where it fits an `int`, and `nextLong` of it otherwise.
+  - `between` on `real` draws `min + nextReal() * (max - min)` again while it rounds up to `max`,
+    and traps on a NaN bound and where `max - min` is infinite, besides `min >= max`.
+  - `nextGaussian` is the polar method, keeping the second value of each pair for the next call;
+    `setSeed` drops it. `nextBytes` takes four bytes from each draw, lowest first; a negative count
+    traps. `alphanumeric` draws `nextInt(62)` per character, digits, then upper, then lower case.
+- [`avin.regex`](/spec/regex/#unicode-properties): `\b{g}` decides a boundary by the grapheme
+  cluster rules over the whole text before it, so it is never inside a cluster: not between the
+  two regional indicators of a flag, nor inside an emoji joined by a zero width joiner or an Indic
+  conjunct. `\X` matches the cluster starting where it stands, one way only, and has no bounded
+  length, so a lookbehind may not hold it. A script is named by any of its names in
+  `PropertyValueAliases.txt`, ignoring case, and only the scripts `Scripts.txt` lists, with
+  `Unknown`, exist; a block by its name in `Blocks.txt`, that name without spaces, or any of its
+  names in `PropertyValueAliases.txt`, short ones included, ignoring case.
 
 ## Open
 
