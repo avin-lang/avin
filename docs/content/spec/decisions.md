@@ -616,9 +616,10 @@ Settled by the user on 2026-11-03:
   field of the same words in snake_case.
 - `fail(message)` is public in the prelude: it traps with the message at the caller's place and has
   type `Nothing`.
-- The methods an `impl` adds to a class whose fields are all immutable are not variance positions,
-  as a `data` type's are not: such an instance holds nothing a method could store a value into. A
-  class with a `var` field keeps every method a position.
+- The methods an `impl` adds to a final class whose fields are all immutable are not variance
+  positions, as a `data` type's are not: such an instance holds nothing a method could store a value
+  into. A class with a `var` field keeps every method a position, and so does an `open` or
+  `abstract` class (settled 2026-11-05, below).
 - A one-variant `data` type may have a companion `object`, as a class may: the name in call position
   is the constructor and `Name.member` the companion (`Map.empty`, `Map.newBuilder`, `List.newBuilder`).
 - An `impl` may add methods for some type arguments only: `impl[T: Display] List[T]` gives
@@ -1757,6 +1758,105 @@ their words are reserved.
   (text made as it is read, a socket later) and hand it to any function that takes one; the kinds
   `avin.io` makes are private classes reached only through `Source.fromFile`, `fromString` and
   `stdin`. The alternative is a final class whose kinds are fixed by the library.
+- Settled on the user's delegation 2026-11-05: **An override adds no bound to a type parameter of
+  its own** ([declarations](/spec/declarations/#inheritance)). Each bound an override, or a method
+  implementing a trait's, writes on its own type parameters is implied by the overridden method's
+  bounds on that parameter: one of them, a trait or class one of them conforms to, or `Eq` or
+  `Hash`, which every type meets; it may keep, weaken or drop bounds. Why: a call through the base
+  type passes any type argument the base's bounds admit, so an added bound let a program that
+  type-checked run the override at a type without the bound's methods, which trapped or crashed. The
+  alternatives were requiring the bounds to be exactly the same, which forbids a weakening that is
+  harmless; and checking the bound at each call through the base,
+  which a call cannot do, since it does not know which override it reaches.
+- Settled on the user's delegation 2026-11-05: **the methods an `impl` adds to an `open` or
+  `abstract` class are [variance](/spec/generics/#variance) positions**, whatever its fields; the
+  exemption stays for final classes whose fields are all immutable, `data` types and traits. Why:
+  such a method is in the class's method table, so a call through a wider view runs the copy for
+  the object's own type arguments, and `(b: Box[Animal]).with(cat)` on a `Box[Dog]` answered a
+  `Box[Dog]` holding a cat, whose dog's fields read past the object; the core library's `Vector` had
+  the hole. So `Vector` takes an element through a lower bound, as maps do:
+  `:+[W >: T](element: W) -> Vector[W]`, `+:`, `++`, `updated`, and `toArray[W >: T]()`, and
+  `Seq`'s added `:+`, `+:`, `++` and `updated` widen alike, so a vector's own hides them. A vector's
+  `iterator()` and `reverseIterator()` are `Iterator[T]`s, and its guard view is the one every
+  sequence has. The alternative, not taken: making an exempt impl method non-virtual, compiled for
+  the receiver's static type as a trait's added methods are, which keeps `:+(element: T)` but would
+  make an added method on an open class behave unlike a method written in its body.
+- Settled on the user's delegation 2026-11-05 (built on branch `avin-net`): `avin.net`'s TCP and
+  HTTP details ([system library](/spec/system-library/#avin-net)),
+  where the chapter left them open:
+  - `write`, `writeText`, `setTimeout` and `shutdownOutput` answer `Result[unit, IoError]`, since
+    each can fail; `readAll()` is added beside `read` and `readLine`, and `TcpListener` has `close()`.
+  - A read, write or `accept` after `close()` answers `Other("the connection is closed")` (or "the
+    listener is closed") rather than trapping, as a closed handle's method does.
+  - A host that resolves to no address is `Other(s"no address found for $host")`, not `NotFound`,
+    whose message speaks of files. A port outside 0 to 65535, and `read(max)` with `max` below one,
+    trap at the call, as a `Url`'s `withPort` does with a port it cannot hold.
+  - `ConnectionReset` also covers a write to a connection the other end has closed (`EPIPE`).
+  - `setTimeout` sets the read and the write limit together, in whole milliseconds rounded up; zero
+    or less takes the limit away.
+  - `bind` takes the host's first address and lets a port a recently stopped listener used be taken
+    again; the backlog is the platform's usual 128.
+  - The socket is a handle on a runtime type, `avin.rt.Connection`, holding `sysl.net`'s `Socket`
+    with a destructor that closes it, since `sysl.net` closes a socket only when asked; so closing
+    the handle, or the collector freeing a forgotten one, closes the socket. The runtime also turns
+    `sysl.net`'s errors into the four a connection tells apart.
+  - The HTTP client: a `Response` also has its `reason`; `text()` reads ill-formed UTF-8 as U+FFFD;
+    `Request` is a class with `method`, `url`, `headers`, `body` and `timeout`, the last three
+    defaulted; a method or header name that is not a token, and a header value with a line break,
+    trap; `Host`, `Content-Length` and `Connection: close` are written unless the request gives
+    them; an interim `1xx` is skipped; redirects are 301, 302, 303, 307 and 308, the sixth answered
+    as it is.
+- Settled on the user's delegation 2026-11-05 (built on branch `sendable`): [`Sendable`'s
+  promises](/spec/actors/#what-may-be-sent), where the design left them open:
+  - A declaration promises `Sendable` as it conforms to any trait: after `:` in a class's or a
+    trait's header, or in an impl for a data type. The promise is checked against the structure,
+    outside the standard library, and an `open` or `abstract` class that promises it is sendable,
+    each subclass being checked. The standard library's promises are taken as made, since they are
+    for types whose structure cannot show it: `Future`, `Promise`, `Channel` and `Atomic` of a
+    sendable type (impls bounded by `Sendable`), `Mutex` of any type and `Once` (in their headers),
+    and `Vector` of sendable elements. `ArraySeq`, `List`, `Range`, the hash and tree maps and sets,
+    `Option`, `Result` and `Either` are sendable by their structure.
+  - A generic trait that promises `Sendable` is sendable at sendable type arguments; a type
+    implementing it has the parameters it passes to the trait, other than contravariantly, taken as
+    sendable where it is checked, and is sendable at sendable arguments for them. The immutable `Map`
+    and `Set` traits promise it, so `HashMap[K, V]` is sendable where `K` and `V` are, and a type
+    implementing either is held to it.
+  - `Sendable` is only a bound and a promise; it is not the type of a value.
+  - A `lazy val` field is sendable where its type is, since it is initialized by exactly one thread.
+    (That rests on the runtime initializing a `lazy val` once under contention; a test of two
+    threads forcing one `lazy val` at once pins it.)
+- Settled on the user's delegation 2026-11-05 (built on branch `mirror-handle-fields`): **a mirror
+  holding a handle goes into Sysl wherever any mirror does** ([Sysl
+  bindings](/spec/sysl-bindings/#mirrors)) — a parameter by itself, or inside an `Option`, a
+  `Result`, a collection, a tuple or another mirror — since the shim's conversion of the mirror
+  checks and passes each handle field wherever it is called, though a bare handle in an `Option` or
+  a collection still does not go into Sysl. The alternative is a mirror holding a handle only by
+  itself, as a handle is.
+- Settled on the user's delegation 2026-11-05 (built on branch `tailrec`): [tail
+  calls](/spec/declarations/#tail-calls), the choices the request left open:
+  - **Every self-call in tail position is a loop, with or without `@tailrec`**, at `-O0` as at
+    `-O2`, so a program's stack use does not depend on its optimization level; the annotation only
+    adds the proof. Alternative: loop only where `@tailrec` asks, leaving the rest to LLVM at `-O2`
+    — rejected, since the same program would overflow at `-O0` and not at `-O2`.
+  - **The right operand of `&&` and `||` is in tail position**, as in the reference language:
+    `n == 0 || (ok(n) && f(n - 1))` is a loop. Alternative: only `if`/`match` branches — simpler to
+    explain, but it refuses a common shape of predicate.
+  - **A call on another receiver of the method's own type is a loop**, the receiver becoming
+    `self` for the next pass, as the reference language does for a method that cannot be
+    overridden; a call on a receiver of the class at other type arguments is another instance and
+    `@tailrec` refuses it. Alternative: only calls on `self` — it would refuse list-walking methods
+    such as `next.length(acc + 1)`.
+  - **A private method of an open or abstract class may be `@tailrec`**, since nothing overrides
+    it; a public one may not. There is no `final` modifier for a single method, so making a public
+    method of an open class a loop means making it private or the class final.
+  - **`@tailrec` is accepted on top-level functions, methods and local functions**, and is the one
+    annotation a local function takes; a lambda cannot be annotated. It refuses a function with no
+    recursive call, as the reference language does, rather than accepting it silently.
+  - **A function calling itself is made a loop; mutual recursion is left to general tail calls**,
+    which need every caller and callee to agree on a calling convention and to unlink the
+    shadow-stack frame before the call, and have their own entry (below).
+  - The language has no `try`, `defer` or `finally`, so there is no pending cleanup to take a call
+    out of tail position; when such a construct is added, a call inside it is not in tail position.
 - Settled on the user's delegation 2026-11-05: **[Guaranteed tail calls](/spec/declarations/#tail-calls)**
   (branch `tailcalls`). Every call in tail position of a function of the program, by name, through
   a method table or of a function value, replaces the caller's stack frame, at `-O0` as at `-O2`,
@@ -1805,35 +1905,7 @@ their words are reserved.
 
 ## Proposed
 
-- [Tail calls](/spec/declarations/#tail-calls) (2026-11-05). Choices the request left open:
-  - **Every self-call in tail position is a loop, with or without `@tailrec`**, at `-O0` as at
-    `-O2`, so a program's stack use does not depend on its optimization level; the annotation only
-    adds the proof. Alternative: loop only where `@tailrec` asks, leaving the rest to LLVM at `-O2`
-    — rejected, since the same program would overflow at `-O0` and not at `-O2`.
-  - **The right operand of `&&` and `||` is in tail position**, as in the reference language:
-    `n == 0 || (ok(n) && f(n - 1))` is a loop. Alternative: only `if`/`match` branches — simpler to
-    explain, but it refuses a common shape of predicate.
-  - **A call on another receiver of the method's own type is a loop**, the receiver becoming
-    `self` for the next pass, as the reference language does for a method that cannot be
-    overridden; a call on a receiver of the class at other type arguments is another instance and
-    `@tailrec` refuses it. Alternative: only calls on `self` — it would refuse list-walking methods
-    such as `next.length(acc + 1)`.
-  - **A private method of an open or abstract class may be `@tailrec`**, since nothing overrides
-    it; a public one may not. There is no `final` modifier for a single method, so making a public
-    method of an open class a loop means making it private or the class final.
-  - **`@tailrec` is accepted on top-level functions, methods and local functions**, and is the one
-    annotation a local function takes; a lambda cannot be annotated. It refuses a function with no
-    recursive call, as the reference language does, rather than accepting it silently.
-  - **Only a function calling itself is made a loop**; every other call in tail position is a
-    guaranteed tail call (under Settled), which `@tailrec` does not ask about.
-  - The language has no `try`, `defer` or `finally`, so there is no pending cleanup to take a call
-    out of tail position; when such a construct is added, a call inside it is not in tail position.
-- **Where a mirror holding a handle goes into Sysl** ([Sysl bindings](/spec/sysl-bindings/#mirrors)).
-  Proposed: wherever any mirror does — a parameter by itself, or inside an `Option`, a `Result`, a
-  collection, a tuple or another mirror — since the shim's conversion of the mirror checks and
-  passes each handle field wherever it is called, though a bare handle in an `Option` or a collection
-  still does not go into Sysl. The alternative is a mirror holding a handle only by itself, as a
-  handle is.
+None at present.
 
 ## Open
 

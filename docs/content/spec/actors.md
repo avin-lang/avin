@@ -142,6 +142,18 @@ is not sendable:
 error: `JobMsg` cannot be sent between actors: its variant `Fill` holds a `Buffer[byte]`, which is mutable; send an immutable copy (`toVector`), or the buffer as an `Isolated[Buffer[byte]]`
 ```
 
+A declaration may also **promise** `Sendable`: a trait or a class after `:` in its header, a data
+type in an impl (`impl Sendable for Reading`). The promise is checked against the structure, and
+the error says what breaks it (`` `Blob` promises to be `Sendable`, but its field `size` is a `var` ``).
+An `open` or `abstract` class that promises it is sendable, each subclass being checked in turn, as
+each type implementing a trait that promises it is. A generic trait that promises `Sendable` is
+sendable at sendable type arguments, and a type implementing it has the parameters it passes to the
+trait taken as sendable when it is checked. A type that implements one through a generic trait,
+`HashMap[K, V]` through `Map[K, V]`, is sendable at sendable arguments for those parameters. The
+standard library promises `Sendable` for the types whose structure cannot show it, the synchronized
+ones and `Vector`, and the immutable `Map` and `Set` traits promise it. `Sendable` is only a bound
+and a promise, never the type of a value.
+
 ### Handing over ownership
 
 Some mutable things have to move: a socket accepted by a listener goes to the actor that serves the

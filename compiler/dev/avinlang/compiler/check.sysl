@@ -516,6 +516,9 @@ struct Checker
      * asks this way whether its name is a value with an extractor method. */
     muted: usize
     muted_notes: usize
+    /** Types held to `Sendable` before the type of a field they hold was known, held to it again once
+     * every body is checked. */
+    late_sendables: Buf[LateSendable]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -758,7 +761,7 @@ private check_imports(c: *Checker, unit: usize)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0)
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -835,6 +838,8 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
         check_override_results(&c, id)
         check_class_variance(&c, id)
     settle_unknowns(&c, 0)
+    check_sendable_declarations(&c)
+    check_late_sendables(&c)
     check_initialization(&c)
     for id in 0..<c.data.len()
         check_data_implementations(&c, id)
@@ -1408,7 +1413,7 @@ private check_template_implementations(c: *Checker)
                 found = true
                 val described = s"`${c.symbols[m].decl.name}` implements `${c.symbols[base].name}`"
                 val at = c.symbols[m].decl.name_span
-                if param_mismatch(c, block.target, m, base) is Some(text) then c.note(block.unit, at, s"$described, $text")
+                if signature_mismatch(c, block.target, m, base) is Some(text) then c.note(block.unit, at, s"$described, $text")
                 elif result_mismatch(c, block.target, m, base) is Some(text) then c.note(block.unit, at, s"$described, $text")
             if !found && is_abstract_method(c.symbols[base]) && !contains_id(c.field_getters, base)
                 c.note(block.unit, block.decl.span, s"the template for `${c.classes[k].name}` does not implement `${c.symbols[base].decl.name}`, which the trait leaves to each type")
@@ -2180,7 +2185,8 @@ private language_static(t: &Type, name: string) -> bool
     *t is Real && (name == "MinPositiveValue" || name == "PositiveInfinity" || name == "NegativeInfinity" || name == "NaN")
 
 // A variant's fields are resolved with its type's parameters in scope. Variant names share one
-// space within a file, since a variant is named on its own (`Some(1)`, `None`) wherever it is used.
+// space within a module, across its files, since a variant is named on its own (`Some(1)`, `None`)
+// wherever it is used and is a name of its module.
 private declare_variants(c: *Checker, unit: usize)
     var seen: Map[string, Span] = map()
     for id in 0..<c.data.len()
@@ -2191,7 +2197,7 @@ private declare_variants(c: *Checker, unit: usize)
         declare_bounds(c, unit, data_owner(id), d.decl.type_params, 0, d.decl.type_params.len())
         var variants: Buf[VariantSymbol] = buf()
         for v in d.decl.variants
-            if seen.get(v.name) is Some(_)
+            if seen.get(v.name) is Some(_) || c.variants.get(qualified(d.module_name, v.name)) is Some(_)
                 c.note(unit, v.span, s"the variant `${v.name}` is declared more than once")
                 continue
             seen.put(v.name, v.span)
@@ -4161,6 +4167,9 @@ private build_builtin_table(c: *Checker, b: usize, conformed: Buf[usize])
             if several && own is None then continue
             own match
                 Some(m) ->
+                    if !several
+                        if bound_mismatch(c, c.symbols[m].receiver.unwrap(), m, methods[j]) is Some(text)
+                            c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`${c.symbols[m].name}` implements `${c.symbols[methods[j]].name}`, $text")
                     inherit_defaults(c, m, methods[j])
                     table.set(c.classes[t].base + j, Some(m))
                 None ->
@@ -4251,7 +4260,7 @@ private build_data_table(c: *Checker, id: usize, conformed: Buf[usize])
                 for k in 0..<mine.len()
                     if c.data[id].implementing[k] && c.symbols[mine[k]].decl.name == name && meant is None then meant = Some(mine[k])
                 if overloads == 1 && meant is Some(own)
-                    if param_mismatch(c, self_type, own, m) is Some(text)
+                    if signature_mismatch(c, self_type, own, m) is Some(text)
                         c.note(c.symbols[own].unit, c.symbols[own].decl.name_span, s"`${c.symbols[own].name}` implements `${c.symbols[m].name}`, $text")
                         continue
                 report_conformance(c, id, t, s"`$name_of` does not implement `$name` from `${c.classes[t].name}`; implement it in an impl of `${c.classes[t].name}`")
@@ -4479,7 +4488,7 @@ private ensure_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
 // position, and yields its result or, for a class, a subclass of it.
 private overrides_matches(c: *Checker, id: usize, m: usize, target: usize) -> bool
     val symbol = c.symbols[m]
-    if param_mismatch(c, own_class_type(c.classes[id], id), m, target) is Some(text)
+    if signature_mismatch(c, own_class_type(c.classes[id], id), m, target) is Some(text)
         c.note(c.classes[id].unit, symbol.decl.name_span, s"`${symbol.decl.name}` overrides `${c.symbols[target].name}`, $text")
         return false
     index_tie(c, m, target)
@@ -4525,12 +4534,17 @@ private check_class_variance(c: *Checker, id: usize)
             immutable = false
             variance_in(c, k.unit, params, owner, ty, 0, s.field.span, s"the mutable field `${s.field.name}`")
         else variance_in(c, k.unit, params, owner, ty, 1, s.field.span, s"the field `${s.field.name}`")
-    // An instance whose fields are all immutable holds nothing a method could store a value into,
-    // so the methods its impls add are not positions, as a `data` type's are not.
+    // An instance of a final class or a trait whose fields are all immutable holds nothing a method
+    // could store a value into, and the methods its impls add are called directly, receiving the
+    // value as whichever instance it is seen as, so they are not positions, as a `data` type's are
+    // not. An open or abstract class's added methods sit in its method table and run the copy for
+    // the object's own type arguments, so they are positions like every other method.
     for f in k.fields
         if f.mutable then immutable = false
+    val extensible = k.decl.modifier == "open" || k.decl.modifier == "abstract"
+    val exempt = immutable && !extensible
     for m in k.methods
-        if immutable && contains_id(c.impl_methods, m) then continue
+        if exempt && contains_id(c.impl_methods, m) then continue
         // The method assigning a trait's `var` field is the field, checked above.
         if contains_id(c.trait_setters, m) then continue
         val symbol = c.symbols[m]
@@ -4657,7 +4671,7 @@ private check_override_results(c: *Checker, id: usize)
             val own = c.symbols[m].owner_class == Some(id)
             val at = if own then c.symbols[m].decl.name_span else k.decl.name_span
             if !own
-                if param_mismatch(c, own_class_type(c.classes[id], id), m, base) is Some(text)
+                if signature_mismatch(c, own_class_type(c.classes[id], id), m, base) is Some(text)
                     c.note(k.unit, at, s"$described for `${k.name}`, $text")
                     continue
                 if defaults_conflict(c, m, base, s"override `${c.symbols[m].decl.name}`") is Some(text) then c.note(k.unit, at, s"$described for `${k.name}`, $text")
@@ -4742,6 +4756,49 @@ private method_lower(c: *Checker, m: usize, j: usize) -> Option[&Type]
     val outer = symbol.type_params.len() - symbol.decl.type_params.len()
     lower_at(c, symbol.type_owner, symbol.type_params, outer + j)
 
+/** The bounds method `m` writes on its own type parameter `j`. */
+private method_bounds(c: *Checker, m: usize, j: usize) -> Buf[&Type]
+    val symbol = c.symbols[m]
+    val outer = symbol.type_params.len() - symbol.decl.type_params.len()
+    c.bounds.get(bound_key(symbol.type_owner, outer + j, symbol.type_params[outer + j])).unwrap_or(buf())
+
+/** The bound method `m` writes on a type parameter of its own that `base`, which it overrides or
+ * implements for `self_type`, does not imply. A call through `base` passes any type argument `base`'s
+ * bounds admit, so an override assumes no more of it: each bound it writes is one of `base`'s, or a
+ * trait or class one of them conforms to, or a trait every type has. The two declare the same number
+ * of type parameters of their own. */
+private bound_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) -> Option[string]
+    val own = own_type_params(c, base)
+    if own_type_params(c, m) != own then return None
+    for j in 0..<own
+        var given: Buf[&Type] = buf()
+        for b in method_bounds(c, base, j)
+            given.push(seen_from(c, self_type, base, b))
+        for b in method_bounds(c, m, j)
+            val wanted = seen_from(c, self_type, m, b)
+            if !bound_implied(c, given, wanted)
+                val name = c.symbols[base].decl.type_params[j].name
+                return Some(s"whose type parameter `$name` is not bounded by ${type_name(wanted)}")
+    None
+
+/** Whether a type parameter with the bounds `given` conforms to `wanted`, a trait or a class. */
+private bound_implied(c: *Checker, given: Buf[&Type], wanted: &Type) -> bool
+    val k = *wanted match
+        Class(k, _, _) -> k
+        _ -> return true
+    // Every type compares and hashes.
+    if names_core_trait(c.core, k, "Eq") || names_core_trait(c.core, k, "Hash") then return true
+    for g in given
+        if ancestor_type(c.classes, c.data, g, k) is Some(up)
+            if conforms(up, wanted) then return true
+    false
+
+/** How method `m`'s signature differs from that of `base`, which it overrides or implements for
+ * `self_type`: in its parameters, or in a bound it adds to a type parameter of its own. */
+private signature_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) -> Option[string]
+    if param_mismatch(c, self_type, m, base) is Some(text) then return Some(text)
+    bound_mismatch(c, self_type, m, base)
+
 /** How method `m`'s result differs from that of `base`, which it overrides or implements for
  * `self_type`: it yields that result or, where that is a class or a trait, a type conforming to it. */
 private result_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) -> Option[string]
@@ -4824,9 +4881,9 @@ private check_data_implementations(c: *Checker, id: usize)
             c.derived_context = c.derived_symbols.get(s"$m")
             if c.symbols[m].receiver is Some(_)
                 val at = c.symbols[m].decl.name_span
-                if param_mismatch(c, self_type, m, base) is Some(text) then c.note(c.symbols[m].unit, at, s"$described, $text")
+                if signature_mismatch(c, self_type, m, base) is Some(text) then c.note(c.symbols[m].unit, at, s"$described, $text")
                 elif result_mismatch(c, self_type, m, base) is Some(text) then c.note(c.symbols[m].unit, at, s"$described, $text")
-            elif param_mismatch(c, self_type, m, base) is Some(text) then report_conformance(c, id, t, s"$described for `${c.data[id].name}`, $text")
+            elif signature_mismatch(c, self_type, m, base) is Some(text) then report_conformance(c, id, t, s"$described for `${c.data[id].name}`, $text")
             elif result_mismatch(c, self_type, m, base) is Some(text) then report_conformance(c, id, t, s"$described, $text")
             c.derived_context = None
 
@@ -4907,6 +4964,7 @@ private check_conformance_members(c: *Checker, self_type: &Type, t: &Type, unit:
         found match
             Some(m) ->
                 if result_mismatch(c, self_type, m, tm) is Some(text) then c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`$name` implements `$name` of ${type_name(t)}, $text")
+                elif bound_mismatch(c, self_type, m, tm) is Some(text) then c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`$name` implements `$name` of ${type_name(t)}, $text")
             None ->
                 var shown = ""
                 val want = c.symbols[tm].params
@@ -5467,6 +5525,8 @@ meets_bound(f: Conformances, x: &Type, bound: &Type) -> bool
         _ -> return true
     // Every type compares and hashes, a type parameter without a bound too.
     if names_core_trait(f.core, k, "Eq") || names_core_trait(f.core, k, "Hash") then return true
+    // Whether a type is sendable is decided from its structure.
+    if names_core_trait(f.core, k, "Sendable") then return !(sendability(f, x, k) is CannotSend(_))
     if rendered_at_run_time(f.classes, x) && names_rendering_trait(f.core, k) then return true
     *x match
         ErrorType -> true
@@ -5500,6 +5560,309 @@ private names_core_trait(core: CoreTraits, k: usize, name: string) -> bool = cor
 
 /** Whether `k` is the core library's `Display` or `Debug`. */
 names_rendering_trait(core: CoreTraits, k: usize) -> bool = names_core_trait(core, k, "Display") || names_core_trait(core, k, "Debug")
+
+/** Whether a value of a type may be handed to another thread, as `sendability` decides it. */
+enum Sendability
+    CanSend
+    /** It may not. `reason` says why, as a clause about the type, beginning `it ` or `its `, so
+     * that the clause of a part nests after the part as `which …` or `whose …`. */
+    CannotSend(reason: string)
+    /** Not known yet: the type holds a field whose type its initializer gives, before that is
+     * checked. */
+    NotYetKnown
+end Sendability
+
+/** The type parameters of `owner` taken as sendable while a declaration that promises `Sendable` is
+ * checked: those the promise holds only at sendable arguments for. */
+struct SendAssumed
+    owner: usize
+    params: Buf[bool]
+
+private no_assumptions() -> SendAssumed = SendAssumed(method_params_owner() + 1, buf())
+
+/** Whether a value of type `x` may be handed to another thread, `k` being the core library's
+ * `Sendable`: the scalars, `unit` and `string`; tuples and data types of sendable fields; a class
+ * that is neither `open` nor `abstract`, with no `var` and only sendable fields, an object likewise;
+ * a type parameter bounded by `Sendable`; a Sysl handle; and a type that promises `Sendable`, in its
+ * header, an impl or a trait it implements, where the promise holds (`promised_sendability`). Not
+ * `Any`, a function value, a trait that makes no promise or an `open` or `abstract` class. */
+sendability(f: Conformances, x: &Type, k: usize) -> Sendability
+    var seen: Buf[string] = buf()
+    type_sendability(f, x, k, no_assumptions(), &seen, 0)
+
+private type_sendability(f: Conformances, x: &Type, k: usize, a: SendAssumed, seen: *Buf[string], depth: usize) -> Sendability
+    if depth > 64 then return CanSend
+    *x match
+        AnyType -> CannotSend("it may hold a value of any type")
+        Function(_, _) -> CannotSend("it is a function value, whose type does not say what it captures")
+        ByName(_) -> CannotSend("it is a by-name value, a function whose type does not say what it captures")
+        Tuple(items) ->
+            var undecided = false
+            for i in 0..<items.len()
+                type_sendability(f, items[i], k, a, seen, depth + 1) match
+                    CannotSend(why) -> return CannotSend(s"its part ${i + 1} is ${quoted_type(items[i])}, ${nested_reason(why)}")
+                    NotYetKnown -> undecided = true
+                    CanSend -> ()
+            if undecided then NotYetKnown else CanSend
+        TypeVar(owner, index, name) ->
+            if owner == a.owner && index < a.params.len() && a.params[index] then return CanSend
+            for b in type_var_bounds(f, x)
+                if *b is Class(bk, _, _)
+                    if bk == k then return CanSend
+                    if ancestor_type(f.classes, f.data, b, k) is Some(_)
+                        if !(type_sendability(f, b, k, a, seen, depth + 1) is CannotSend(_)) then return CanSend
+            CannotSend(s"it is a type parameter that may stand for any type; bound it, as in `[$name: Sendable]`")
+        Data(_, _, _) -> named_sendability(f, x, k, a, seen, depth)
+        Class(_, _, _) -> named_sendability(f, x, k, a, seen, depth)
+        _ -> CanSend
+
+// A data type or a class: one being decided already, a part of itself, is decided by its other parts.
+private named_sendability(f: Conformances, x: &Type, k: usize, a: SendAssumed, seen: *Buf[string], depth: usize) -> Sendability
+    val key = type_key(x)
+    for s in *seen
+        if s == key then return CanSend
+    seen.push(key)
+    val result = if ancestor_type(f.classes, f.data, x, k) is Some(_) then promised_sendability(f, x, k, a, seen, depth) else structural_sendability(f, x, k, a, seen, depth, false)
+    _ = seen.pop()
+    result
+
+/** Whether a type that promises `Sendable` keeps the promise at its type arguments: the promise holds
+ * at sendable arguments for the parameters `sendable_params` names, and where the impl making it
+ * has bounds of its own, at arguments meeting them. */
+private promised_sendability(f: Conformances, x: &Type, k: usize, a: SendAssumed, seen: *Buf[string], depth: usize) -> Sendability
+    val args = *x match
+        Data(_, _, xs) -> xs
+        Class(_, _, xs) -> xs
+        _ -> buf()
+    val required = sendable_params(f, x, k)
+    var undecided = false
+    for i in 0..<args.len()
+        if i >= required.len() || !required[i] then continue
+        type_sendability(f, args[i], k, a, seen, depth + 1) match
+            CannotSend(why) ->
+                val arg = type_name_quoted(args[i])
+                if why.starts_with("it ") then return CannotSend(s"its type argument $arg ${why[3..]}")
+                return CannotSend(s"its type argument is $arg, ${nested_reason(why)}")
+            NotYetKnown -> undecided = true
+            CanSend -> ()
+    // The impl's other bounds; its `Sendable` ones were held above, with the type's parts being
+    // decided, so a type holding itself through one is decided by its other parts.
+    val owner = *x match
+        Data(d, _, _) -> data_owner(d)
+        Class(c, _, _) -> class_owner(c)
+        _ -> return CanSend
+    for cc in f.conditional
+        if cc.owner != owner then continue
+        if !(cc.trait_id == k || ancestor_type(f.classes, f.data, own_class_type(f.classes[cc.trait_id], cc.trait_id), k) is Some(_)) then continue
+        for i in 0..<cc.conditions.len()
+            if i >= args.len() then break
+            for b in cc.conditions[i]
+                if *b is Class(bk, _, _)
+                    if bk == k then continue
+                if !meets_bound(f, args[i], substitute(b, owner, args))
+                    return CannotSend(s"its type argument ${type_name_quoted(args[i])} does not meet the bound `${type_name(b)}` of the impl that makes it `Sendable`")
+    if undecided then NotYetKnown else CanSend
+
+/** For each type parameter of `x`'s type, whether `x` is sendable only where its argument is: one
+ * passed, other than contravariantly, to a trait that promises `Sendable`; one an impl making the
+ * type `Sendable` bounds by `Sendable`; and every parameter of a trait. */
+sendable_params(f: Conformances, x: &Type, k: usize) -> Buf[bool]
+    var out: Buf[bool] = buf()
+    var owner = 0usize
+    var count = 0usize
+    var is_trait_type = false
+    var parents: Buf[&Type] = buf()
+    *x match
+        Data(d, _, xs) ->
+            owner = data_owner(d)
+            count = xs.len()
+            for p in f.data[d].traits
+                parents.push(p)
+        Class(c, _, xs) ->
+            owner = class_owner(c)
+            count = xs.len()
+            is_trait_type = f.classes[c].decl.modifier == "trait"
+            for p in f.classes[c].traits
+                parents.push(p)
+            if f.classes[c].superclass is Some(s) then parents.push(s)
+        _ -> return out
+    for _ in 0..<count
+        out.push(is_trait_type)
+    for p in parents
+        if ancestor_type(f.classes, f.data, p, k) is None then continue
+        var pk = 0usize
+        var pargs: Buf[&Type] = buf()
+        *p match
+            Class(c, _, xs) ->
+                pk = c
+                pargs = xs
+            _ -> continue
+        for j in 0..<pargs.len()
+            if j < f.classes[pk].decl.type_params.len()
+                if f.classes[pk].decl.type_params[j].variance is Contravariant then continue
+            if *pargs[j] is TypeVar(o, i, _)
+                if o == owner && i < count then out.set(i, true)
+    for cc in f.conditional
+        if cc.owner != owner then continue
+        if !(cc.trait_id == k || ancestor_type(f.classes, f.data, own_class_type(f.classes[cc.trait_id], cc.trait_id), k) is Some(_)) then continue
+        for i in 0..<cc.conditions.len()
+            for b in cc.conditions[i]
+                if *b is Class(bk, _, _)
+                    if bk == k && i < count then out.set(i, true)
+    out
+
+/** Whether `x`, a data type or a class, is sendable by its structure, whatever it promises. `top`
+ * says that it is the type a declaration promising `Sendable` is checked for, where an `open` or
+ * `abstract` class may promise it: each subclass is checked in turn. */
+private structural_sendability(f: Conformances, x: &Type, k: usize, a: SendAssumed, seen: *Buf[string], depth: usize, top: bool) -> Sendability
+    var undecided = false
+    *x match
+        Data(id, _, args) ->
+            val d = f.data[id]
+            for v in 0..<d.variants.len()
+                val types = variant_fields(d, id, v, args)
+                for i in 0..<types.len()
+                    type_sendability(f, types[i], k, a, seen, depth + 1) match
+                        CannotSend(why) ->
+                            val name = if i < d.variants[v].field_names.len() then d.variants[v].field_names[i] else ""
+                            val part = if d.variants.len() > 1 then s"its variant `${d.variants[v].name}`" else s"its field `$name`"
+                            return CannotSend(s"$part holds ${quoted_type(types[i])}, ${nested_reason(why)}")
+                        NotYetKnown -> undecided = true
+                        CanSend -> ()
+        Class(id, _, args) ->
+            val cls = f.classes[id]
+            if handle_target(cls.decl) is Some(_) then return CanSend
+            val library = cls.module_name == CoreModule || cls.module_name.starts_with(CoreModule + ".")
+            if library && !top
+                if cls.module_name == CoreModule && cls.name == "FrozenArray" && args.len() == 1
+                    return type_sendability(f, args[0], k, a, seen, depth + 1) match
+                        CannotSend(why) -> CannotSend(s"its elements are ${quoted_type(args[0])}, ${nested_reason(why)}")
+                        other -> other
+                val copy = if cls.name == "Buffer" || cls.name == "Array" || cls.name == "Deque" then "; an immutable copy (`toVector`) is sendable" elif cls.name == "Map" then "; an immutable copy (`toMap`) is sendable" elif cls.name == "Set" then "; an immutable copy (`toSet`) is sendable" else ""
+                if copy != "" then return CannotSend(s"it is mutable$copy")
+            if cls.decl.modifier == "trait"
+                return CannotSend(s"it is a trait that does not promise to be sendable; declare it `trait ${cls.name}: Sendable`, and every type implementing it is checked to be")
+            if !top && (cls.decl.modifier == "open" || cls.decl.modifier == "abstract")
+                return CannotSend(s"it is `${cls.decl.modifier}`, so a subclass could add a `var`; make it final, or declare it `: Sendable`, and every subclass is checked to be sendable")
+            for fld in cls.fields
+                if fld.name.starts_with("<") then continue
+                if fld.mutable
+                    if library && !top then return CannotSend("it is mutable, and not made to be shared between threads")
+                    return CannotSend(s"its field `${fld.name}` is a `var`; make it a `val`")
+                val t = fld.ty match
+                    Some(t) -> substitute(t, class_owner(id), args)
+                    None ->
+                        undecided = true
+                        continue
+                type_sendability(f, t, k, a, seen, depth + 1) match
+                    CannotSend(why) ->
+                        if library && !top then return CannotSend("it is not made to be shared between threads")
+                        return CannotSend(s"its field `${fld.name}` holds ${quoted_type(t)}, ${nested_reason(why)}")
+                    NotYetKnown -> undecided = true
+                    CanSend -> ()
+        _ -> ()
+    if undecided then NotYetKnown else CanSend
+
+/** A type in a diagnostic, after an article: a `Buffer[byte]`, an `int`. */
+private quoted_type(t: &Type) -> string
+    val name = type_name(t)
+    var vowel = false
+    for v in ["a", "e", "i", "o", "A", "E", "I", "O"]
+        if name.starts_with(v) then vowel = true
+    if vowel then s"an `$name`" else s"a `$name`"
+
+/** The reason a part of a type is not sendable, said after the part: `it is …` becomes `which is …`
+ * and `its …` becomes `whose …`. */
+private nested_reason(why: string) -> string
+    if why.starts_with("its ") then return "whose " + why[4..]
+    if why.starts_with("it ") then return "which " + why[3..]
+    why
+
+/** The core library's `Sendable`, where `bound` is it. */
+private sendable_trait_of(c: *Checker, bound: &Type) -> Option[usize]
+    val k = c.core.trait_named("Sendable")?
+    if *bound is Class(b, _, _)
+        if b == k then return Some(k)
+    None
+
+// Reports `t` where it is held to `Sendable`, `context` naming where, with the part of it that is
+// not sendable; one holding a field whose type is not known yet is held again once it is.
+private hold_to_sendable(c: *Checker, unit: usize, at: Span, context: string, t: &Type, k: usize)
+    val arg = zonk(c, t)
+    sendability(conformances(c), arg, k) match
+        CannotSend(why) -> c.note(unit, at, s"${type_name_quoted(arg)} does not conform to `Sendable`, $context: $why")
+        NotYetKnown -> c.late_sendables.push(LateSendable(unit, at, context, arg, c.generic))
+        CanSend -> ()
+
+private type_name_quoted(t: &Type) -> string = s"`${type_name(t)}`"
+
+/** A type held to `Sendable` before the type of a field it holds was known. */
+struct LateSendable
+    unit: usize
+    at: Span
+    context: string
+    ty: &Type
+    scope: Option[GenericScope]
+
+// Holds again each type whose sendability waited for a field's type, now that every body is checked:
+// a field still unknown is one whose initializer failed, already reported.
+private check_late_sendables(c: *Checker)
+    val k = c.core.trait_named("Sendable") match
+        Some(k) -> k
+        None -> return
+    for late in c.late_sendables
+        val outer_generic = c.generic
+        c.generic = late.scope
+        if sendability(conformances(c), zonk(c, late.ty), k) is CannotSend(why)
+            c.note(late.unit, late.at, s"${type_name_quoted(zonk(c, late.ty))} does not conform to `Sendable`, ${late.context}: $why")
+        c.generic = outer_generic
+    c.late_sendables = buf()
+
+// Holds each type that promises `Sendable`, outside the standard library, to the promise: a class
+// whose header, superclass or impl makes it, and a data type an impl makes it for. The standard
+// library's promises are its own, made where the structure cannot show them: a mutex or a future is
+// synchronized, and a vector is never written once made.
+private check_sendable_declarations(c: *Checker)
+    val k = c.core.trait_named("Sendable") match
+        Some(k) -> k
+        None -> return
+    var by_impl: Buf[bool] = buf()
+    for _ in c.classes
+        by_impl.push(false)
+    for block in c.impls
+        val t = block.trait_type match
+            Some(t) -> t
+            None -> continue
+        if ancestor_type(c.classes, c.data, t, k) is None then continue
+        if in_standard_library(block.module_name) then continue
+        if *block.target is Class(id, _, _) then by_impl.set(id, true)
+        if *block.target is Data(_, _, _) || *block.target is Class(_, _, _)
+            keep_send_promise(c, block.unit, written_trait_span(block.decl), block.target, k, Some(GenericScope(block.owner, block.decl.type_params)))
+    for id in 0..<c.classes.len()
+        val cls = c.classes[id]
+        if by_impl[id] || cls.decl.modifier == "trait" || in_standard_library(cls.module_name) then continue
+        val own = own_class_type(cls, id)
+        if ancestor_type(c.classes, c.data, own, k) is None then continue
+        keep_send_promise(c, cls.unit, cls.decl.name_span, own, k, Some(GenericScope(class_owner(id), cls.decl.type_params)))
+
+private in_standard_library(module_name: string) -> bool = module_name == CoreModule || module_name.starts_with(CoreModule + ".")
+
+// Reports `t`, with its own type parameters as its arguments, where its structure does not keep its
+// promise to be `Sendable`: each parameter the promise holds only at sendable arguments for is taken
+// as sendable.
+private keep_send_promise(c: *Checker, unit: usize, at: Span, t: &Type, k: usize, scope: Option[GenericScope])
+    val owner = *t match
+        Data(d, _, _) -> data_owner(d)
+        Class(id, _, _) -> class_owner(id)
+        _ -> return
+    val outer_generic = c.generic
+    c.generic = scope
+    val g = conformances(c)
+    var seen: Buf[string] = buf()
+    seen.push(type_key(t))
+    if structural_sendability(g, t, k, SendAssumed(owner, sendable_params(g, t, k)), &seen, 0, true) is CannotSend(why)
+        c.note(unit, at, s"`${type_name(t)}` promises to be `Sendable`, but $why")
+    c.generic = outer_generic
 
 /** Whether a value of type `t` is shown by the type it has at run time: a value of `Any` or of a
  * trait. Such a value has `Display` and `Debug` whatever its static type declares, rendered by its
@@ -5585,7 +5948,7 @@ unmet_condition(f: Conformances, owner: usize, conditions: Buf[Buf[&Type]], args
 private find_core_traits(c: *Checker)
     var traits: Map[string, usize] = map()
     var methods: Map[string, usize] = map()
-    for name in ["Eq", "Hash", "Ord", "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Integer", "Display", "Debug"]
+    for name in ["Eq", "Hash", "Ord", "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Integer", "Display", "Debug", "Sendable"]
         if c.class_types.get(qualified(CoreModule, name)) is Some(k)
             if is_trait(c, k)
                 traits.put(name, k)
@@ -5767,6 +6130,9 @@ private hold_to_bounds(c: *Checker, unit: usize, at: Span, what: string, owner: 
         if i >= args.len() then break
         for b in bounds_at(c, owner, params, i)
             val bound = substitute(b, owner, args)
+            if sendable_trait_of(c, bound) is Some(k)
+                hold_to_sendable(c, unit, at, s"the bound of `${params[i].name}` in $what", args[i], k)
+                continue
             if !conforms_to_bound(c, args[i], bound)
                 val arg = zonk(c, args[i])
                 c.note(unit, at, s"`${type_name(arg)}` does not conform to `${type_name(bound)}`, the bound of `${params[i].name}` in $what${underived_reason(c, arg, type_name(bound))}")
@@ -6225,6 +6591,9 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                 resolved.push(resolve_type(c, unit, a))
             if resolved.len() != k.decl.type_params.len()
                 c.note(unit, t.span, s"`$path` takes ${count(k.decl.type_params.len(), "type argument")}, not ${resolved.len()}")
+                return ErrorType
+            if !as_bound && is_class_named(c, id, qualified(CoreModule, "Sendable"))
+                c.note(unit, t.span, "`Sendable` is a bound, as in `[T: Sendable]`, or a promise a declaration makes, as in `trait Shape: Sendable`, and not a type")
                 return ErrorType
             if !as_bound && is_trait(c, id) && mentions_self(c, id, 0)
                 c.note(unit, t.span, s"`$path` mentions `Self`, so it is a bound, as in `[T: $path]`, and not a type")

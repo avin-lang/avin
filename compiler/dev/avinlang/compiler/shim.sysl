@@ -284,16 +284,25 @@ private struct PassedHandle
 private call_arms(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[string], handles: Buf[PassedHandle], types: Buf[usize], depth: usize, dropped: Buf[usize], method: bool, fills: Buf[usize], indent: string)
     if depth == types.len()
         var given: Buf[string] = buf()
+        var wrappers: Buf[string] = buf()
         for k in 0..<args.len()
             var arg = args[k]
+            var wrapper = ""
             for h in handles
                 if h.arg != k then continue
                 var counted = false
                 for m in dropped
                     if m == h.mirror then counted = true
-                arg = if counted then s"slot_${h.mirror}(${h.name}).r" else s"passed_${h.mirror}(${h.name})"
+                // A call that waits takes the handle's reference before it, into a local whose type
+                // is known, and the value the parameter asks for is made from that local at the call.
+                if counted then arg = s"slot_${h.mirror}(${h.name}).r"
+                elif b.blocking
+                    arg = s"slot_${h.mirror}(${h.name}).r"
+                    wrapper = s"given_${h.mirror}"
+                else arg = s"passed_${h.mirror}(${h.name})"
             given.push(arg)
-        call_lines(w, b, callee, given, method, fills, indent)
+            wrappers.push(wrapper)
+        call_lines(w, b, callee, given, wrappers, method, fills, indent)
         return
     val m = types[depth]
     var with: Buf[usize] = buf()
@@ -307,8 +316,9 @@ private call_arms(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[stri
 
 // The call of binding `b`'s Sysl function `callee` with `args`, and the conversion of its result, at
 // `indent`. `method` says the callee is a handle's method; `fills` are the parameters whose arrays the
-// function may fill, copied back once the result is made.
-private call_lines(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[string], method: bool, fills: Buf[usize], indent: string)
+// function may fill, copied back once the result is made. A non-empty `wrappers[k]` is a helper the
+// argument `args[k]` is given to at the call.
+private call_lines(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[string], wrappers: Buf[string], method: bool, fills: Buf[usize], indent: string)
     // A result that holds a collection may be spelled with a slice or a `Buf`, and one that holds an
     // integer with any Sysl integer, so it takes the Sysl function's own type, and the overloads of
     // its conversion choose by it.
@@ -326,7 +336,7 @@ private call_lines(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[str
                 given.push("()")
                 continue
             put(w, indent + s"val x$k = ${args[k]}\n")
-            given.push(s"x$k")
+            given.push(if wrappers[k] != "" then s"${wrappers[k]}(x$k)" else s"x$k")
         b.reach match
             Method(name) ->
                 // Bytes the method answers may be a view of the handle's value, which no local may
@@ -338,8 +348,8 @@ private call_lines(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[str
             _ -> ()
         put(w, indent + "enter_safe(ctx)\n")
     else
-        for a in args
-            given.push(a)
+        for k in 0..<args.len()
+            given.push(if wrappers[k] != "" then s"${wrappers[k]}(${args[k]})" else args[k])
     var call = target + "("
     for k in 0..<given.len()
         if k > 0 then call = call + ", "
@@ -533,6 +543,7 @@ private handle_lines(w: *ShimWriter, m: usize, passed: bool, held: bool)
     val helpers = w.line + 1
     put(w, s"\nprivate slot_$m(p: *u8) -> *Slot_$m = ptr_cast(p)\n")
     put(w, s"\nprivate passed_$m[P](p: *u8) -> P\n    val s: *Slot_$m = ptr_cast(p)\n    if const P::Kind == Kind.Ref\n        s.r\n    elif const P::Kind == Kind.Pointer\n        &*s.r\n    else\n        *s.r\n")
+    put(w, s"\nprivate given_$m[P](r: &mirror_$m) -> P\n    if const P::Kind == Kind.Ref\n        r\n    elif const P::Kind == Kind.Pointer\n        &*r\n    else\n        *r\n")
     if held
         val name = w.mirrors[m].name
         put(w, s"\nprivate held_$m(ctx: *Context, p: *u8) -> *u8\n    val s: *Slot_$m = ptr_cast(p)\n    if s.owner != ctx.owner && !handle_claim(ctx, p) then stop_in_binding(ctx, \"`$name` belongs to another thread\")\n    val word: *usize = ptr_cast(p)\n    if word[0] == 0 then stop_in_binding(ctx, \"`$name` is closed\")\n    p\n")
