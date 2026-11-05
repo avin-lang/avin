@@ -58,6 +58,24 @@ test("a list item runs on through blank and indented lines, and ends at the marg
     assert.ok(end.test("Back at the margin."))
 })
 
+test("the prose is one region under meta.prose.lavin, running between program blocks", () => {
+    assert.deepEqual(grammar.patterns, [{ include: "#program" }, { include: "#prose" }])
+    const prose = grammar.repository.prose
+    assert.equal(prose.name, "meta.prose.lavin")
+    const begin = new RegExp(prose.begin)
+    const end = new RegExp(prose.end)
+    assert.ok(begin.test("# A heading"))
+    assert.ok(begin.test("   three columns"))
+    assert.ok(begin.test(""))
+    assert.ok(!begin.test("    main() = 0"))
+    assert.ok(end.test("    main() = 0"))
+    assert.ok(!end.test("Prose."))
+    assert.ok(!end.test(""))
+    const inside = prose.patterns.map((p: { include: string }) => p.include)
+    for (const rule of ["#fence-avin", "#fence", "#heading", "#quote", "#list", "#table", "#paragraph"]) assert.ok(inside.includes(rule), rule)
+    assert.ok(!inside.includes("#program"))
+})
+
 test("the prose rules are self-contained: no other grammar is included, and every pattern compiles", () => {
     const includes: string[] = []
     const visit = (node: unknown): void => {
