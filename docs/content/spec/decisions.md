@@ -3735,6 +3735,44 @@ spelling is better, as each entry says.
 
 ## Proposed
 
+- Proposed (built on branch `sysl-generic-bindings`): **generic bindings are bounded by `Boundary`**
+  ([Sysl bindings](/spec/sysl-bindings/#generics)). A binding's type parameters, a generic handle
+  class's, and a bound method's own are each bounded by `Boundary`, a core trait the compiler decides
+  from a type's structure as it decides `Sendable`: the integers of 8, 16, 32 and 64 bits, `byte`,
+  `real`, `char`, `bool`, `unit`, `string`, `@sysl` mirrors, and `Option`s, `Result`s and tuples of
+  these, and a type parameter bounded by it. It is only a bound: not a type, and no impl, trait or
+  derivation declares it. Each call's type arguments are held to it as to any bound, a generic
+  function passes its own type parameter on only where that one is bounded by it too, and every
+  instantiation gets a shim of its own that Sysl checks, so a Sysl bound the instance does not meet is
+  reported at the binding in Sysl's words; an Avin bound beside it (`[T: Boundary + Ord]`) is Avin's to
+  check, with no mapping between Sysl's traits and Avin's. A generic handle class,
+  `@sysl("m.Signal") class Signal[T: Boundary]`, names the generic type without arguments, its type
+  parameters invariant and the Sysl type's in order; each instance the program uses is a handle of its
+  own on the Sysl type's instance, with its own finalizer, spelled by the shim from the instance's
+  types, so a mirror may be a type argument (the annotation-text instances keep their narrower rule).
+  Rationale: the declaration can be checked once and every instantiation is then sound by the bound
+  machinery that already exists, including through a library's generic wrappers, with no
+  instantiation-time diagnostics in lowering (which reports none); "one Sysl type" is what a handle's
+  instance needs and what keeps a type argument's Sysl type the same in both directions.
+  Alternatives weighed: unbounded type parameters checked per call at concrete types only (refuses
+  every generic wrapper, or needs a closed-world pass in the checker that does not exist); an
+  implicit bound, never written (hides why a wrapper's `T` is refused); admitting collections (their
+  Sysl type is a slice going in and a slice or a `Buf` coming out, so a `T` a Sysl function stores
+  would not be one type) and handles (one goes into Sysl only by itself, so `Option[T]` at a handle
+  could not cross in); a mapping from Sysl traits to Avin bounds (no table exists, and Sysl checks its
+  own bounds anyway). **Review with the user:** the name `Boundary`, and whether handles should become
+  type arguments of generic handles (`Signal[View]`), which needs the shim to pass a handle inside a
+  generic Sysl value.
+- Proposed (built on branch `sysl-generic-bindings`): **a callback closure's parameters are written
+  out where Sysl cannot infer them**. A Sysl closure taking the function's own type parameter
+  (`applied[T, U](x: T, f: &Fn(T) -> U)`) left the shim's lambda `(q0) -> …` untyped, which Sysl
+  refuses, for generic and non-generic bindings alike; the shim now writes each parameter as the Avin
+  type's Sysl spelling on that diagnostic, and is rebuilt for as long as each build names something
+  more to write out (the lambda's types first, the integer answer after), not once.
+  Rationale: the same retry the shim already made for integer answers and parameters, extended.
+  Alternatives weighed: always typing the lambda (wrong where Sysl hands a collection as a `Buf`
+  rather than a slice, which only inference gets right); refusing such bindings.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

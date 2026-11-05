@@ -407,7 +407,13 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
                 val k = l.program.classes[id]
                 if handle_target(k.decl) is Some(target)
                     l.descriptors[shape.descriptor].size = 16
-                    l.handles.push(MirHandle(handle_trap_name(k.decl, k.name), target, handle_finalizer(id), shape.descriptor, k.unit, k.decl.name_span))
+                    // An instance of a generic handle class is a handle on the Sysl type's instance at
+                    // its type arguments, which the shim spells as it spells the values it converts.
+                    var arguments: Buf[&Crossing] = buf()
+                    for a in args
+                        var unused: Buf[Operand] = buf()
+                        arguments.push(crossing(l, a, &unused))
+                    l.handles.push(MirHandle(handle_trap_name(k.decl, k.name), target, handle_finalizer(id, args), shape.descriptor, k.unit, k.decl.name_span, arguments))
                 // A C handle's first word is its C pointer and its second its owner, as a Sysl
                 // handle's; its third is the C references it holds to the handles it keeps, which
                 // the C unit's glue keeps off the heap, and its fourth, which the collector traces,
@@ -415,7 +421,7 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
                 elif c_handle_type(k.decl) is Some(target)
                     l.descriptors[shape.descriptor].size = CHandleSize
                     l.descriptors[shape.descriptor].refs.push(CHandleKept)
-                    l.c_handles.push(MirHandle(k.name, target, s"avin_c_finalize_$id", shape.descriptor, k.unit, k.decl.name_span))
+                    l.c_handles.push(MirHandle(k.name, target, s"avin_c_finalize_$id", shape.descriptor, k.unit, k.decl.name_span, buf()))
         _ -> panic("a layout of a type that is not data, a tuple or a class: " + key)
     if holds_generic_methods(l, t)
         for v in variants
@@ -425,8 +431,14 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
     l.layouts.push(result)
     result
 
-/** The symbol of the shim's finalizer for the Sysl handle class `id`. */
-private handle_finalizer(id: usize) -> string = s"avin_handle_finalize_$id"
+/** The symbol of the shim's finalizer for the Sysl handle class `id` at the type arguments `args`:
+ * each instance of a generic handle class is a handle of its own, named by its type arguments. */
+private handle_finalizer(id: usize, args: Buf[&Type]) -> string
+    if args.len() == 0 then return s"avin_handle_finalize_$id"
+    var named: Buf[&Type] = buf()
+    for a in args
+        named.push(a)
+    s"avin_handle_finalize_${id}_${content_key(type_key(Tuple(named)))}"
 
 // One variant's fields at their offsets, and its descriptor; a variant with no field data is one
 // constant object, unless `shared` is false: every object of a class is its own, for its identity.
@@ -2964,7 +2976,7 @@ private crossing(l: *Lowering, t: &Type, layouts: *Buf[Operand]) -> &Crossing
             // A handle is made by its class's descriptor, whose finalizer gives its Sysl value back.
             if handle_target(l.program.classes[id].decl) is Some(_)
                 layouts.push(DescriptorAddress(layout(l, t).variants[0].descriptor))
-                return Crossing(t, Handle(handle_finalizer(id)), buf(), 1)
+                return Crossing(t, Handle(handle_finalizer(id, args)), buf(), 1)
             val array = is_array_class(l.program.classes[id])
             if array && *args[0] is Byte
                 layouts.push(DescriptorAddress(layout(l, t).variants[0].descriptor))

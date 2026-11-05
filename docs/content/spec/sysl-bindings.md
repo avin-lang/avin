@@ -97,7 +97,7 @@ Data crosses the boundary in a fixed set of shapes:
 | `Option[T]`, `Result[T, E]` of boundary types | Converted variant by variant by the generated shim |
 | `data` declared with `@sysl("…")` mirroring a Sysl struct or enum of boundary types | Converted field by field |
 | `(T1, T2, …)`, a tuple of boundary types | A Sysl tuple of the same arity, converted part by part in each direction |
-| `class` declared with `@sysl("…")` | An **opaque handle** on a Sysl struct, trait or instance of a generic type: an Avin object owning one counted Sysl reference, released by `close()` or, as a safety net, a finalizer. Its methods are bindings too. |
+| `class` declared with `@sysl("…")` | An **opaque handle** on a Sysl struct, trait or instance of a generic type, or a [generic handle](#generic-handles) on each of its instances: an Avin object owning one counted Sysl reference, released by `close()` or, as a safety net, a finalizer. Its methods are bindings too. |
 
 These shapes nest: a `Result[Option[string], IoError]` crosses, and so do a
 `Result[Vector[string], IoError]`, a `Vector[Vector[string]]`, a `Vector[Array[byte]]`, a
@@ -539,7 +539,7 @@ error: `Vector[int]` cannot be a type argument of the Sysl type a handle is on: 
 ```
 
 Each instance a program binds is its own class, and two classes may name the same instance; one Avin
-class for every instance of a generic type is a [generic binding](#generics).
+class for every instance of a generic type is a [generic handle](#generic-handles).
 
 ## Calls that wait
 
@@ -592,9 +592,92 @@ error: `blocking` is written alone, after the Sysl function's name: `@sysl("sysl
 
 ## Generics
 
-A binding may be generic when its type parameters are instantiated with boundary types. The compiler
-generates one shim per instantiation the program uses. A handle on one instance of a generic Sysl
-type is a class of its own, [above](#handles-on-generic-instances).
+A binding may be generic, bound once to a generic Sysl function and called at any type its type
+parameters admit. Each type parameter is bounded by **`Boundary`**, the types that cross to Sysl as
+one Sysl type each: the integers of 8, 16, 32 and 64 bits, `byte`, `real`, `char`, `bool`, `unit`,
+`string`, the data types declared with `@sysl` to [mirror](#mirrors) a Sysl enum or struct, and
+`Option`s, `Result`s and tuples of these. The binding's parameters and result build on its type
+parameters as on any boundary type, in collections, options, results, tuples and callbacks:
+
+```text
+@sysl("avintest.digits.same")
+same[T: Boundary](x: T) -> T
+
+@sysl("avintest.digits.first_some")
+firstSome[T: Boundary](xs: Vector[Option[T]]) -> Option[T]
+
+@sysl("avintest.digits.applied")
+applied[T: Boundary, U: Boundary](x: T, f: T -> U) -> U
+
+same(3)                          // 3
+firstSome([None, Some("b")])     // Some(b)
+applied(Spot(2, 3), s -> s.x * s.y)
+```
+
+The compiler generates **one shim per instantiation** the program uses, wherever in the program it
+is used, and Sysl checks each one at its types, so a type argument the Sysl function's own bound
+refuses is reported at the binding, in Sysl's words:
+
+```text
+error: the Sysl binding `largest` does not match `avintest.digits.larger`: 'digits.avintest.digits.larger' requires its type parameter 'T' to implement 'PartialOrd', but digits.avintest.digits.Spot does not
+```
+
+An Avin bound beside `Boundary`, `[T: Boundary + Ord]`, is checked by Avin at the call as any bound
+is; the two are not related, and the Sysl function's bounds are Sysl's to check. A collection, which
+crosses as a copy whose Sysl type differs by direction, a [handle](#handles), which goes into Sysl
+only by itself, and every other class, data type and function are not `Boundary`, and are refused at
+the call:
+
+```text
+error: `Plain` does not conform to `Boundary`, the bound of `T` in `same`; a value crosses to Sysl as one Sysl type where it is an integer of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, a data type declared with `@sysl` to mirror a Sysl enum or struct, or an `Option`, a `Result` or a tuple of these
+```
+
+`Boundary` is decided by the compiler from a type's structure, so it is written only as a bound: it
+is not a type, and no impl or trait declares it. A generic function passes its own type parameter on
+to a binding where that parameter is bounded by `Boundary` too, so a library's public generic
+function can wrap a private generic binding:
+
+```text
+echo[T: Boundary](x: T) -> T = rawSame(x)
+```
+
+A type parameter that is not bounded by it does not cross:
+
+```text
+error: `T` cannot cross to Sysl; a type parameter crosses as the type it is given, which its bound holds to one Sysl type, as in `[T: Boundary]`
+```
+
+### Generic handles
+
+A **generic handle class** is a handle on every instance of a generic Sysl type, struct or trait.
+Its `@sysl` names the generic type without arguments, and its type parameters are the Sysl type's
+own, in order: invariant, as Sysl's are, and each bounded by `Boundary`. Its methods are bound at
+every instance, and a method may have type parameters of its own, bounded the same way:
+
+```text
+@sysl("syslui.Signal")
+class Signal[T: Boundary]
+    get() -> T
+    set(v: T)
+    paired[U: Boundary](u: U) -> (T, U)
+
+@sysl("syslui.signal")
+signal[T: Boundary](v: T) -> Signal[T]
+```
+
+Each instance the program uses, `Signal[int]` or `Signal[Option[Spot]]`, is a handle on the Sysl
+type's instance at those arguments, a class of its own with its own finalizer, and is passed to a
+binding that takes that instance as any handle is. Sysl checks the instance, so a class with the
+wrong number of type parameters is reported at the class. A handle names an instance in its `@sysl`
+[by its arguments](#handles-on-generic-instances) or has type parameters, not both:
+
+```text
+error: a Sysl handle names an instance of a generic Sysl type or has type parameters, the Sysl type's own, but not both
+```
+
+A callback whose closure takes one of the Sysl function's type parameters, as `applied`'s does, gives
+Sysl nothing to infer the closure's parameter types from; the shim then writes each as the Avin
+type's.
 
 ## Callbacks
 

@@ -37,13 +37,14 @@ struct ShimSource
 
 /** A data type's `@sysl` mirror of the Sysl enum or struct `target`, declared at `span`; or, where
  * `finalizer` names the shim's finalizer for it, a class's `@sysl` handle on the Sysl type
- * `target`. */
+ * `target`, at the type `arguments` where it is an instance of a generic handle class. */
 struct Mirrored
     name: string
     target: string
     unit: usize
     span: Span
     finalizer: string
+    arguments: Buf[&Crossing]
 
 /** Lines of a shim that a mirror answers for, by its position: its import, or one conversion. */
 struct MirrorLines
@@ -122,11 +123,15 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
     var last: Buf[usize] = buf()
     // A handle is imported as a mirror is, and its part of the shim is its own.
     for h in handles
-        w.mirrors.push(Mirrored(h.name, h.target, h.unit, h.span, h.finalizer))
+        w.mirrors.push(Mirrored(h.name, h.target, h.unit, h.span, h.finalizer, h.arguments))
     for b in bindings
         for p in b.params
             gather(&w, p, false)
         gather(&w, b.result, true)
+    // A mirror a generic handle's instance is spelled with is imported as every mirror is.
+    for h in handles
+        for a in h.arguments
+            import_mirrors(&w, a)
     var calls_back = false
     for b in bindings
         for p in b.params
@@ -190,7 +195,7 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
         w.mirror_lines.push(MirrorLines(m, w.line, w.line))
         // An instance of a generic Sysl type imports the type, and is spelled with its arguments.
         val (path, arguments) = instance_parts(w.mirrors[m].target)
-        if arguments.len() == 0 then put(&w, s"import ${w.mirrors[m].target} as mirror_$m\n")
+        if arguments.len() == 0 && w.mirrors[m].arguments.len() == 0 then put(&w, s"import ${w.mirrors[m].target} as mirror_$m\n")
         else put(&w, s"import $path as instance_$m\n")
     put(&w, "\n// An Avin string's bytes, copied into a Sysl string.\nprivate text_in(p: *u8) -> string = str_cast(text_bytes(p)[0..<text_length(p)])\n")
     put(&w, IntegerHelper)
@@ -359,10 +364,12 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
     var text = w.out.finish()
     for m in 0..<w.mirrors.len()
         val (_, arguments) = instance_parts(w.mirrors[m].target)
-        if arguments.len() == 0 then continue
         var spelled: Buf[string] = buf()
         for a in arguments
             spelled.push(sysl_instance_argument(a.trim()))
+        for a in w.mirrors[m].arguments
+            spelled.push(sysl_type(&w, a))
+        if spelled.len() == 0 then continue
         text = replace_word(text, s"mirror_$m", s"instance_$m[${comma_list(spelled)}]")
     ShimSource(text, imports, first, last, w.mirrors, w.mirror_lines, unconverted, w.passing)
 
@@ -424,9 +431,13 @@ private callback_lambda(w: *ShimWriter, b: &MirBinding, i: usize, k: usize) -> s
     val (params, result) = callback_parts(b, k)
     var names = ""
     var call = s"call_${i}_$k(&*cb$k"
+    // Sysl infers the types of the closure's parameters from the closure Sysl takes; where that type
+    // is a type parameter of the Sysl function it cannot, and each is written as the Avin type's.
+    val typed = is_fixed(w, s"lambda_$i")
     for j in 0..<params.len()
         if j > 0 then names = names + ", "
         names = names + s"q$j"
+        if typed then names = names + ": " + (if params[j].form is Handle(_) then "&" + sysl_type(w, params[j]) else sysl_types(w, params[j])[0])
         call = call + s", q$j"
     call = call + ")"
     // A handle is answered as the closure's type asks: a pointer to the value, the value or a counted
@@ -819,11 +830,20 @@ private gather(w: *ShimWriter, c: &Crossing, out: bool)
     if function_of(w, c, out) is Some(_) then return
     if out then w.outs.push(c) else w.ins.push(c)
     if c.form is Mirror(name, target, unit, span, _)
-        if mirror_of(w, c) is None then w.mirrors.push(Mirrored(name, target, unit, span, ""))
+        if mirror_of(w, c) is None then w.mirrors.push(Mirrored(name, target, unit, span, "", buf()))
     if c.form is Elements(element, _) then gather(w, element, out)
     for v in c.variants
         for f in v.fields
             gather(w, f.crossing, out)
+
+// Every mirror `c`'s type is spelled with, imported where it is not yet.
+private import_mirrors(w: *ShimWriter, c: &Crossing)
+    if c.form is Mirror(name, target, unit, span, _)
+        if mirror_of(w, c) is None then w.mirrors.push(Mirrored(name, target, unit, span, "", buf()))
+        return
+    for v in c.variants
+        for f in v.fields
+            import_mirrors(w, f.crossing)
 
 // The position of the conversion of `c`'s type in the direction `out` says.
 private function_of(w: *ShimWriter, c: &Crossing, out: bool) -> Option[usize]
@@ -1339,14 +1359,22 @@ ensure_shims(tc: Toolchain, bindings: Buf[MirBinding], handles: Buf[MirHandle], 
     // A callback whose closure answers a type parameter of a generic Sysl function leaves the integer
     // its answer is converted into unsaid, so that callback answers the Avin type itself, and an
     // integer passed to a parameter of such a type leaves its Sysl type unsaid, so it is passed as
-    // the Avin type itself; the shims are built once more. The archive is kept under the first source's key, which decides the
-    // second.
-    if !result.status.ok()
-        val fixed = unsaid_answers(result.err.unwrap_or("") + result.text, shim, bindings)
-        if fixed.len() > 0
-            built = shim_source_fixing(bindings, handles, fixed)
-            write_text(dir + "/avin/shims/shims.sysl", built.text).map_err(e -> e.to_string())?
-            result = capture(tc.sysl, ["build-c", dir, "-o", pending], stderr = true, timeout = 300000).map_err(e -> "avin: " + missing_tool(tc.sysl, e.to_string()))?
+    // the Avin type itself; and a closure whose parameters' types Sysl cannot infer has each written as
+    // the Avin type's. The archive is kept under the first source's key, which decides the others.
+    // Sysl reports what it could not infer a part at a time, a closure's parameters before its answer,
+    // so the shims are built again while each build finds more to write out.
+    var fixed: Buf[string] = buf()
+    while !result.status.ok()
+        val more = unsaid_answers(result.err.unwrap_or("") + result.text, built, bindings)
+        var grown = false
+        for name in more
+            val before = fixed.len()
+            fixed = add_name(fixed, name)
+            if fixed.len() > before then grown = true
+        if !grown then break
+        built = shim_source_fixing(bindings, handles, fixed)
+        write_text(dir + "/avin/shims/shims.sysl", built.text).map_err(e -> e.to_string())?
+        result = capture(tc.sysl, ["build-c", dir, "-o", pending], stderr = true, timeout = 300000).map_err(e -> "avin: " + missing_tool(tc.sysl, e.to_string()))?
     if !result.status.ok()
         val output = result.err.unwrap_or("") + result.text
         return Err(shim_diagnostics(output, built, bindings, units))
@@ -1368,6 +1396,7 @@ private unsaid_answers(output: string, shim: ShimSource, bindings: Buf[MirBindin
     var out: Buf[string] = buf()
     val marker = "cannot infer the type argument '"
     var stalled = false
+    var untyped = false
     for text in output.split("\n")
         // The place of an error that left another type argument unsaid names its binding.
         if stalled && text.trim().starts_with("--> ") && text.contains("/avin/shims/shims.sysl:")
@@ -1378,7 +1407,18 @@ private unsaid_answers(output: string, shim: ShimSource, bindings: Buf[MirBindin
                         out = add_name(out, s"param_${i}_$k")
                 None -> ()
             continue
-        if text.starts_with("error: ") then stalled = false
+        // So does the place of a closure whose parameters' types Sysl could not infer, as where the
+        // Sysl function's closure takes its own type parameter.
+        if untyped && text.trim().starts_with("--> ") && text.contains("/avin/shims/shims.sysl:")
+            untyped = false
+            owner_of(shim, line_of(text.trim()["--> ".bytes.len..])) match
+                Some(i) -> out = add_name(out, s"lambda_$i")
+                None -> ()
+            continue
+        if text.starts_with("error: ")
+            stalled = false
+            untyped = text.contains("has no type here — nothing says what this closure takes")
+            if untyped then continue
         val parts = text.split(marker)
         if parts.len != 2 then continue
         val answer = parts[1].starts_with("R' of 'avin.shims.call_")
