@@ -132,12 +132,14 @@ so the check is made once, where the type is named, and never at a send:
 | `Thread[T]` of a sendable `T`, an `Executor` | joining a thread and giving an executor work are synchronized |
 | a [Sysl handle](/spec/sysl-bindings/#handles) | sent by handing over its ownership, checked when it is used (below) |
 | `Isolated[T]` | an object graph nothing else reaches (below) |
+| a [`@sendable` function type](/spec/types/#function-types), `@sendable (A) -> B` | checked where each value is made: it captures only sendable values and no `var`, and reaches no module-level mutable state |
 
 **Not sendable**: `Array`, `Buffer`, `Deque`, the mutable maps and sets, a class with a `var` field
 or a field that is not sendable, an `open` or `abstract` class, a [machine](#state-machines), a
-thread `Scope`, a function value, and `Any`. A function value is not sendable because its type does
-not say what it captures, and a captured `var` is shared with the scope that made it; a closure
-given to another thread is checked instead by what it captures, where it is written ([what is
+thread `Scope`, a value of a plain function type, and `Any`. A plain function value is not sendable
+because its type does not say what it captures, and a captured `var` is shared with the scope that
+made it; a closure given to another thread is checked instead by what it captures, where it is
+written, and one made as a `@sendable` function is checked where it is made ([what is
 shared](/spec/threads/#what-is-shared)). The error names the part that is not sendable:
 
 ```text

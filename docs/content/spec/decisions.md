@@ -2196,7 +2196,7 @@ their words are reserved.
     library functions known to the compiler (no user wrapper could pass a body on); a function type
     that says it is sendable (`() -> T` that is `Sendable`), which would also let a sendable function
     be stored and sent, but makes function types carry a flag through unification and subtyping
-    (the open question on function values below stays open); no check, leaving the data race the
+    (later taken up as `@sendable` function types, under Proposed); no check, leaving the data race the
     memory model already makes harmless (the user's direction is that threads share nothing mutable
     by default).
   - The bodies of `spawn`, `s.spawn`, `Future(body)` and `ex.future(body)`, the functions of a
@@ -2463,6 +2463,49 @@ their words are reserved.
   each naming the character and its `U+` code point. Why: the bytes of one character used to be read as separate
   symbols, which the parser then reported one at a time.
 
+- Settled on the user's delegation 2026-11-05 (built on branch `sendable-functions`): **`@sendable`
+  function types**, answering the open question whether a function value can be sent, with a type
+  that says what it captures ([function types](/spec/types/#function-types), [what is
+  shared](/spec/threads/#what-is-shared)).
+  - `@sendable (A) -> B` is a function type whose values capture only sendable values and no `var`
+    and reach no module-level mutable state; it is `Sendable`, and a plain function type is not.
+    Only a function type may carry the mark.
+  - A lambda, a function reference or a method value written where a `@sendable` function type is
+    expected is made as one, and is checked there by exactly the checks what is passed for a
+    `@sendable` parameter gets: its captures, and the whole-program reach of module-level state.
+    The error names the type (`` a `@sendable (int) -> int` may use only sendable values … ``). Any
+    other value of a plain function type is not one, and the mismatch says why.
+  - `@sendable (A) -> B` is a subtype of `(A) -> B` with no conversion: in covariant positions
+    (a vector's element, a result, an override's result) too, not through an invariant one (an
+    array's element). Two branches of the two types agree on the plain one.
+  - A parameter marked `@sendable` that takes a function holds a value of the `@sendable` function
+    type inside the function, so the mark and the type are one notion seen from the two sides; the
+    parameter's declared type is unchanged, so an override that drops the mark still overrides.
+    Passing a value already of a `@sendable` type to `spawn` or any marked parameter is accepted as
+    it is.
+  - Data and classes whose fields are `@sendable` functions are sendable by the existing structural
+    rules, at every type argument of a generic one (a `Parser[T]` holding a
+    `@sendable (Input) -> Option[T]`), so module-level parser grammars, `lazy val`s among them, pass
+    the module-state check and run on spawned threads.
+  - Two overloads that differ only in whether a function parameter is `@sendable` are one overload
+    (refused as declared twice), as two differing only in a by-name parameter are, since one lambda
+    may be passed for either and overload resolution runs before the sendability check.
+  - An override's parameter types match its method's exactly, the mark included; its result may be
+    the `@sendable` subtype.
+  - *Why*: the parsing library's grammars are module-level values holding functions, and could not
+    be used from a thread at all; the `@sendable` parameter mark already decides exactly what a
+    function value may capture and reach, so the same check at the point a value is made lets the
+    type carry the guarantee through storage, fields and module-level values, soundly, and the
+    spelling reuses the mark readers already know.
+  - *Alternatives*: inferring capture sendability into every function type with no mark (every
+    lambda's type would depend on its body, unification and overloads would see two function types
+    per signature, and an API could not promise it); effect-style capture sets in the type (precise,
+    but a large addition to the type system for one property); leaving functions never sendable
+    (sound, but module-level grammars, handler tables and task lists stay unusable from threads).
+  - **Review with the user**: the spelling `@sendable (A) -> B` (an annotation in type position, the
+    only one), against a keyword or a `Sendable`-bounded spelling; and whether two overloads
+    differing only in the mark should be refused or resolved to the plain one for a lambda.
+
 **Deferred**
 
 - Public C interoperability. Until then, C is reached through Sysl.
@@ -2537,5 +2580,4 @@ their words are reserved.
     for more than one target.
 
 - Resource cleanup: a `defer` construct or a library `use`.
-- Whether a function value can ever be sent between actors, with a type that says what it captures.
 - Whether mailboxes may be bounded, and what a `tell` to a full one does, since `tell` never waits.
