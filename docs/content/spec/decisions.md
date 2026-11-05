@@ -2390,7 +2390,44 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- **A callback's integer answer goes into whatever integer the closure Sysl takes answers, with a
+  check** ([Sysl bindings](/spec/sysl-bindings/#callbacks)). An Avin function answering a `long` or
+  an `int` reaches a Sysl closure answering any integer, `u32`, `u64` and `usize` among them, and
+  an answer the Sysl type cannot hold stops the program where the binding Sysl is running in was
+  called, naming the type by sign and width (`value out of range for u32`). Why: Avin has no
+  unsigned integers (settled 2026-11-02), and syslui asks for a colour by `&Fn() -> u32`; the
+  answer is the mirror image of an [integer result](/spec/sysl-bindings/#integer-results), which
+  already takes any Sysl integer, so one rule covers both directions of a value Sysl reads, and a
+  narrower signed answer is the same case. A closure answering a generic Sysl function's type
+  parameter names no integer, and answers the binding's own type; the compiler learns that from
+  Sysl's refusal to infer one and builds the shims once more. Alternatives weighed: an `int`
+  reinterpreted as the `u32`'s bits (a colour past `0x7FFFFFFF` written negative, and a reader
+  never sure which); refusing the binding (no window could be given a colour); converting only
+  into unsigned types (two rules for one shape). Built on `ui-binding`.
+- **The user interface binding is the package `ui`, in `packages/ui` of this repository, rather
+  than a module of the standard library** ([User interfaces](/spec/ui/)). Why: no package may
+  declare a module under `avin`, the standard library carries no Sysl dependencies, and a program
+  that does not draw should neither build syslui nor link SDL3; a domain library is a package of
+  its own ([packages](/spec/packages/#the-standard-librarys-modules)). Alternatives weighed: `avin.ui`
+  in the standard library (needs the library to name Sysl packages and every program to link SDL3);
+  a repository of its own (premature while the binding and the language move together). Built on
+  `ui-binding`. Review with the user: the name `avin.ui` was the plan's, and only the standard
+  library may hold it.
+- **The binding is thin and keeps syslui's shapes** ([User interfaces](/spec/ui/)). Each syslui
+  function is bound under its Avin name with syslui's defaults restated; a view is one handle class
+  on the trait; one signal class for each instance a control takes (`IntSignal`, `RealSignal`,
+  `BoolSignal`, `StringSignal`); `slider` is one overload for `int` and one for `real`; `Role`,
+  `Variant`, `TextStyle`, `MissKind`, `Missed` and `Rect` are mirrors. The package's one function of
+  its own is `tap(v, key, at)`, the draw, snapshot, press and release a test of an interface makes
+  every time. Why: the component and signal layer, which is Avin's, decides the shapes an
+  application writes; this layer only has to reach syslui. Alternatives weighed: a generic signal
+  class (Avin binds a handle at one instance); wrapping every binding in a private one (no name to
+  change yet). Built on `ui-binding`.
+- **`run` is `blocking`, and no ui callback is `@threaded`** ([User interfaces](/spec/ui/#the-application)).
+  The frame loop waits for events for most of its life, so the thread is safe for the collector
+  meanwhile, and syslui-sdl calls the tree, the ground and every control's callback on the thread
+  that called `run`. Alternatives weighed: an unmarked `run`, which would hold up every other
+  thread's collections for the life of the window. Built on `ui-binding`.
 
 ## Open
 
