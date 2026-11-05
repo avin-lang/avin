@@ -737,6 +737,8 @@ private parse_data(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &Da
         val before = p.toks.position
         val at = p.toks.here()
         val variant_annotations = parse_inline_annotations(p)
+        // An annotation may stand on the line before its variant.
+        if variant_annotations.len() > 0 then p.accept_kind(Newline)
         val variant = declared_name(p, "a variant")
         var fields: Buf[Param] = buf()
         if p.at("(") then fields = parse_params(p, false)
@@ -905,10 +907,41 @@ private parse_class_body(p: *Parser, name: string) -> Buf[ClassMember]
 
 // A module-level `val x = …`, `var x: T = …` or `lazy val x = …`, one name to a declaration.
 private parse_value(p: *Parser, start: Span, annotations: Buf[Annotation], lazy: bool) -> Item
+    var constant: Option[string] = None
     for a in annotations
-        p.report.add(error(a.span, s"unknown annotation `@${a.name}`"))
+        if a.name != "c"
+            p.report.add(error(a.span, s"unknown annotation `@${a.name}`"))
+            continue
+        if constant is Some(_)
+            p.report.add(error(a.span, "a C constant has one `@c`"))
+            continue
+        var named: Option[string] = None
+        if a.args.len() == 1 && a.args[0].name == Some("const")
+            if a.args[0].value.kind is StringLit(text) then named = Some(text)
+        named match
+            Some(text) ->
+                if !is_c_identifier(text) then p.report.add(error(a.args[0].value.span, s"`const:` names a C constant, and `$text` is not a C identifier"))
+                constant = Some(text)
+            None ->
+                p.report.add(error(a.span, "`@c` on a module-level value takes `const:`, the C constant it is, as a string: `@c(const: \"LIBMLT_VERSION_INT\")`"))
+                constant = Some("")
     val mutable = p.at("var")
     if lazy then reject_lazy_var(p, start, mutable)
+    if constant is Some(name)
+        if mutable || lazy then p.report.add(error(p.toks.here(), "a C constant is a `val`: its value is the header's"))
+        p.toks.advance()
+        val at = p.toks.here()
+        val declared_at = p.toks.here()
+        val value_name = declared_name(p, "a value")
+        var declared: Option[&TypeExpr] = None
+        if p.accept(":") then declared = Some(parse_type(p))
+        else p.report.add(error(declared_at, "a C constant declares its type, an integer type, `real` or `string`, as in `val mltVersion: int`"))
+        if p.at("=")
+            p.report.add(error(p.toks.here(), "a C constant has no initializer: its value is the header's"))
+            p.toks.advance()
+            _ = parse_line_body(p, false)
+        val span = start.to(p.ended())
+        return ValueItem(FieldDecl(span, value_name, declared, Expr(at.to(p.ended()), CConstant(name)), false, true, false))
     p.toks.advance()
     val binding = parse_binding(p, start, mutable)
     binding.kind match

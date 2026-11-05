@@ -943,7 +943,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
         sources.push(u.src)
     val views = solved_views(c.vars, c.views)
     val type_tests = solved_views(c.vars, c.type_tests)
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, init, c.builtins, c.conditional, c.core, c.bounds, tests, testing, views, type_tests, map())), references, overrides, completions)
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, init, c.builtins, c.conditional, c.core, c.bounds, tests, testing, views, type_tests, map(), map())), references, overrides, completions)
 
 /** Each view with its unknowns solved, each distinct one once. */
 private solved_views(vars: Buf[Option[&Type]], views: Buf[TypeView]) -> Buf[TypeView]
@@ -1313,7 +1313,9 @@ private declare_types(c: *Checker, unit: usize)
                 c.note(unit, d.span, s"the type `${d.name}` is declared more than once")
                 continue
             if file.private_items[i] then c.private_names.put(key, true)
+            check_c_enum_declaration(c, unit, d)
             for a in d.annotations
+                if a.name == "c" then continue
                 if a.name != "sysl"
                     c.note(unit, a.span, s"unknown annotation `@${a.name}`")
                     continue
@@ -7051,7 +7053,7 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
         // A method's receiver is the prototype's first parameter, `self`.
         val first = if receiver_class is Some(_) then 1usize else 0usize
         if receiver_class is Some(k)
-            if p.params.len() == 0 || p.params[0].name != "self"
+            if p.params.len() == 0 || p.params[0].name != "self" || !(p.params[0].mode is CIn)
                 c.note(unit, a.args[0].value.span, s"the prototype of a C handle's method takes the receiver first, named `self`, as in `int cairo_status(cairo_t *self)`")
                 continue
             val own = c_handle_type(c.classes[k].decl).unwrap()
@@ -7061,13 +7063,17 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
             if wanted != "" && !c_names_handle(p.params[0].text, wanted, false) && c_as_position(c.classes[k].decl, p.params[0].text) is None
                 c.note(unit, a.args[0].value.span, s"the receiver `self` of `${f.name}` is a `${c.classes[k].name}`, whose C type is `$own`" + c_as_list(c.classes[k].decl, false) + s", and the prototype says `${p.params[0].text}`")
                 continue
-        if p.params.len() != params.len() + first
-            c.note(unit, f.name_span, s"the C binding `${f.name}` has ${count(params.len(), "parameter")} and its prototype ${count(p.params.len() - first, "parameter")}" + (if first == 1 then " after `self`" else "") + ": they correspond by position")
+        // The Avin parameters correspond by position to the prototype's, but for its `out` ones.
+        val positions = c_avin_positions(p)
+        if positions.len() != params.len() + first
+            val shown = positions.len() - first
+            val tail = if p.params.len() > positions.len() then s", besides its ${count(p.params.len() - positions.len(), "`out` parameter")}, which are part of the result" else ""
+            c.note(unit, f.name_span, s"the C binding `${f.name}` has ${count(params.len(), "parameter")} and its prototype ${count(shown, "parameter")}" + (if first == 1 then " after `self`" else "") + tail + ": they correspond by position")
             continue
         for i in 0..<params.len()
             val decl = f.params[i]
             val t = params[i]
-            val cp = p.params[i + first]
+            val cp = p.params[positions[i + first]]
             if *t is ErrorType then continue
             if decl.by_name
                 c.note(unit, decl.pattern.span, "a by-name parameter cannot cross a C binding")
@@ -7075,38 +7081,74 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
             if decl.variadic
                 c.note(unit, decl.pattern.span, "a repeated parameter cannot cross a C binding")
                 continue
+            val inout = cp.mode is CInOut
+            val ctype = if inout then cp.pointee else cp.ty
+            val ctext = if inout then cp.pointee_text else cp.text
+            var problem = ""
             if c_handle_form(t, c.data, c.classes) is Some(h)
-                val problem = c_handle_problem(c, h.class_index, cp.text, false)
-                if problem != "" then c.note(unit, decl.ty.span, s"parameter ${i + 1} of the C binding `${f.name}` is `${type_name(t)}` in Avin and `${cp.text}` in C: $problem")
-                continue
-            val problem = c_crossing_problem(cp.ty, t, c_text_form(t, c.data, c.classes), false)
-            if problem != "" then c.note(unit, decl.ty.span, s"parameter ${i + 1} of the C binding `${f.name}` is `${type_name(t)}` in Avin and `${cp.text}` in C: $problem")
+                problem = if inout then "a handle is not passed `inout`: whether C keeps the reference it is passed or replaces it, the binding cannot say" else c_handle_problem(c, h.class_index, cp.text, false)
+            elif c_mirror_of(t, c.data) is Some(d) then problem = c_mirror_problem(c.data[d].decl, c.data[d].name, ctext)
+            else problem = c_crossing_problem(ctype, t, c_text_form(t, c.data, c.classes), false)
+            if problem != "" then c.note(unit, decl.ty.span, s"parameter ${i + 1} of the C binding `${f.name}` is `${type_name(t)}` in Avin and `${cp.text}` in C" + (if inout then ", `inout`" else "") + s": $problem")
         val r = result.unwrap_or(Unit)
         val at = if f.result is Some(t) then t.span else f.name_span
         var made: Option[usize] = None
-        var status = false
         if !(*r is ErrorType)
-            val form = c_text_form(r, c.data, c.classes)
-            if c_handle_form(r, c.data, c.classes) is Some(h)
-                made = Some(h.class_index)
-                val problem = c_handle_problem(c, h.class_index, p.result_text, true)
-                if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(r)}` in Avin and `${p.result_text}` in C: $problem")
-            elif c_status_error(r, c.data) is Some(e)
-                status = true
-                // A status is an integer, of C's keywords, an enumeration or a typedef of one.
-                val integer = p.result match
-                    CKeyword(_) -> true
-                    CTypedef(_) -> true
-                    _ -> false
-                val problem = if integer then c_crossing_problem(p.result, e, NoText, true) else "a status is a C integer, `Ok(())` for zero and `Err` of the code otherwise"
-                if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(r)}` in Avin and `${p.result_text}` in C: $problem")
-            else
-                val problem = c_crossing_problem(p.result, r, form, true)
-                if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(r)}` in Avin and `${p.result_text}` in C: $problem")
-            // Only a string C answers is freed, and one bound as `unit` is freed and discarded.
-            val text = p.result is CText(_) || (p.result is CTypedef(_) && !(form is NoText))
-            if free is Some(_) && !text
-                c.note(unit, at, s"`free:` names the C function that frees a string the binding answers, and `${f.name}` answers no string: its result is `${p.result_text}` in C")
+            val parts = c_result_parts(p, r, c.data) match
+                Ok(parts) -> Some(parts)
+                Err(why) ->
+                    c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(r)}`: $why")
+                    None
+            if parts is Some(split)
+                val answered = split.result
+                val form = c_text_form(answered, c.data, c.classes)
+                if *answered is ErrorType then ()
+                elif c_handle_form(answered, c.data, c.classes) is Some(h)
+                    made = Some(h.class_index)
+                    val problem = c_handle_problem(c, h.class_index, p.result_text, true)
+                    if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(answered)}` in Avin and `${p.result_text}` in C: $problem")
+                elif c_status_error(answered, c.data) is Some(e)
+                    // A status is an integer, of C's keywords, an enumeration or a typedef of one, or
+                    // the enum a mirror mirrors.
+                    val integer = p.result match
+                        CKeyword(_) -> true
+                        CTypedef(_) -> true
+                        _ -> false
+                    var problem = ""
+                    if !integer then problem = "a status is a C integer, `Ok` for zero and `Err` of the code otherwise"
+                    elif c_mirror_of(e, c.data) is Some(d) then problem = c_mirror_problem(c.data[d].decl, c.data[d].name, p.result_text)
+                    else problem = c_crossing_problem(p.result, e, NoText, true)
+                    if problem == "" && split.outs.len() == 0 && !(*c_status_ok(answered) is Unit) && !(*c_status_ok(answered) is ErrorType)
+                        problem = "a status with no out values is `Ok(())` for zero, so its `Ok` holds `unit`"
+                    if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(answered)}` in Avin and `${p.result_text}` in C: $problem")
+                elif c_mirror_of(answered, c.data) is Some(d)
+                    val problem = c_mirror_problem(c.data[d].decl, c.data[d].name, p.result_text)
+                    if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(answered)}` in Avin and `${p.result_text}` in C: $problem")
+                else
+                    val problem = c_crossing_problem(p.result, answered, form, true)
+                    if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(answered)}` in Avin and `${p.result_text}` in C: $problem")
+                // Each out value crosses as a result does, from the type its pointer points at.
+                var j = 0usize
+                for q in p.params
+                    if q.mode is CIn then continue
+                    val t = split.outs[j]
+                    j += 1
+                    if *t is ErrorType then continue
+                    var problem = ""
+                    if *t is Unit then problem = "an out value is a scalar, a string, a handle or an enum mirror"
+                    elif c_handle_form(t, c.data, c.classes) is Some(h)
+                        if q.mode is CInOut then problem = "a handle is not passed `inout`: whether C keeps the reference it is passed or replaces it, the binding cannot say"
+                        else
+                            problem = c_handle_problem(c, h.class_index, q.pointee_text, true)
+                            if made is None then made = Some(h.class_index)
+                    elif c_mirror_of(t, c.data) is Some(d) then problem = c_mirror_problem(c.data[d].decl, c.data[d].name, q.pointee_text)
+                    elif c_status_error(t, c.data) is Some(_) then problem = "an out value is a scalar, a string, a handle or an enum mirror"
+                    else problem = c_crossing_problem(q.pointee, t, c_text_form(t, c.data, c.classes), true)
+                    if problem != "" then c.note(unit, at, s"out value $j of the C binding `${f.name}`, `${q.name}`, is `${type_name(t)}` in Avin and `${q.pointee_text}` in C: $problem")
+                // Only a string C answers is freed, and one bound as `unit` is freed and discarded.
+                val text = p.result is CText(_) || (p.result is CTypedef(_) && !(form is NoText))
+                if free is Some(_) && !text
+                    c.note(unit, at, s"`free:` names the C function that frees a string the binding answers, and `${f.name}` answers no string: its result is `${p.result_text}` in C")
         check_c_ownership(c, unit, f, a, params, receiver_class, made, borrowed, keeps, consumes)
 
 // A field accessor is a method of a C handle bound with `@c(field: "<lvalue>")`, a member path of the
@@ -7508,6 +7550,87 @@ private check_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
 // function of the pointer or a C expression in `self`, which the C unit compiles. Like a Sysl
 // handle, the class has no parameters, fields or statements, no type parameters and no parents, and
 // its methods without a body are C bindings whose prototype takes the receiver first, as `self`.
+// A data type declared `@c(enum: "<C type>", prefix: "<prefix>")` mirrors a C enum: each of its
+// variants, which have no fields, is an enumerator, the prefix and its words or the one its own
+// `@c("name")` names. The C type is an enumeration or an integer type, which the C unit checks, as it
+// measures each enumerator. A variant's `@c` is only a mirror's.
+private check_c_enum_declaration(c: *Checker, unit: usize, d: &DataDecl)
+    var mirror = false
+    var seen = false
+    for a in d.annotations
+        if a.name == "sysl" && c_data_annotation(d) is Some(_) then c.note(unit, a.span, "a data type mirrors a Sysl type or a C enum, not both")
+        if a.name != "c" then continue
+        if seen
+            c.note(unit, a.span, "a C enum mirror has one `@c`")
+            continue
+        seen = true
+        mirror = true
+        var given: Buf[string] = buf()
+        var positional = false
+        for arg in a.args
+            val n = arg.name match
+                Some(n) -> n
+                None ->
+                    c.note(unit, arg.value.span, "`@c` on a data type mirrors a C enum: `@c(enum: \"cairo_format_t\", prefix: \"CAIRO_FORMAT_\")`")
+                    positional = true
+                    continue
+            if n != "enum" && n != "prefix"
+                c.note(unit, arg.value.span, s"`$n:` is not a word of `@c` on a data type, which takes `enum:` and `prefix:`")
+                continue
+            if contains_name(given, n)
+                c.note(unit, arg.value.span, s"`$n:` is given once")
+                continue
+            given.push(n)
+            val text = arg.value.kind match
+                StringLit(t) -> t
+                _ ->
+                    c.note(unit, arg.value.span, s"`$n:` takes a string, as in `$n: \"" + (if n == "enum" then "cairo_format_t" else "CAIRO_FORMAT_") + "\"`")
+                    continue
+            if n == "enum"
+                val problem = parse_c_type(text) match
+                    Ok(t) -> t.ty match
+                        CKeyword(_) -> ""
+                        CTypedef(_) -> ""
+                        _ -> s"`$text` is not an enumeration or an integer type"
+                    Err(why) -> s"`$text` is not a C type: $why"
+                if problem != "" then c.note(unit, arg.value.span, s"`enum:` names the C enum the type mirrors, and $problem")
+            elif text != "" && !is_c_identifier(text) && !is_c_identifier(text + "x")
+                c.note(unit, arg.value.span, s"`prefix:` is the start of the enumerators' names, and `$text` is not the start of a C identifier")
+        if !contains_name(given, "enum") && !positional then c.note(unit, a.span, "a C enum mirror names the enum it mirrors with `enum:`, as in `@c(enum: \"cairo_format_t\", prefix: \"CAIRO_FORMAT_\")`")
+        if d.type_params.len() > 0 then c.note(unit, a.span, "a C enum mirror has no type parameters: it mirrors one C enum")
+    var enumerators: Buf[string] = buf()
+    val e = c_enum_of(d)
+    for v in d.variants
+        for va in v.annotations
+            if va.name != "c" then continue
+            if !mirror
+                c.note(unit, va.span, s"`@c` on a variant names the enumerator a variant of a C enum mirror holds, and `${d.name}` mirrors no C enum")
+                continue
+            val named = c_variant_text(v)
+            if c_variant_annotations(v) > 1
+                if va.span.start != c_first_annotation(v).start then c.note(unit, va.span, "a variant of a C enum mirror has one `@c`")
+            elif named is None then c.note(unit, va.span, "`@c` on a variant names its enumerator as one string, as in `@c(\"CAIRO_PDF_VERSION_1_4\")`")
+            elif !is_c_identifier(named.unwrap()) then c.note(unit, va.span, s"`@c` on a variant names its enumerator, and `${named.unwrap()}` is not a C identifier")
+        if !mirror then continue
+        if v.fields.len() > 0
+            c.note(unit, v.span, s"the variant `${v.name}` of the C enum mirror `${d.name}` has fields, and a mirror's variants are enumerators, which hold none")
+            continue
+        if e is Some(m)
+            val name = c_enumerator(m, v)
+            if contains_name(enumerators, name) then c.note(unit, v.span, s"the variant `${v.name}` of the C enum mirror `${d.name}` mirrors `$name`, as a variant before it does")
+            enumerators.push(name)
+
+private c_first_annotation(v: Variant) -> Span
+    for a in v.annotations
+        if a.name == "c" then return a.span
+    v.span
+
+private c_variant_annotations(v: Variant) -> usize
+    var n = 0usize
+    for a in v.annotations
+        if a.name == "c" then n += 1
+    n
+
 private check_c_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
     // An object's annotations are refused where its fields are declared.
     if d.object then return
@@ -8748,6 +8871,24 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     if c.index is Some(_) then index_expr(c, e, t)
     t
 
+// A module-level `@c(const: "NAME") val` is the C constant, of its declared type: an integer type, a
+// `real` or a `string`. The C unit measures it, and the driver checks that it fits.
+private c_constant_expr(c: *Checker, e: &Expr, name: string, expected: Option[&Type]) -> &TExpr
+    val t = expected match
+        Some(t) -> t
+        None -> return TExpr(e.span, ErrorType, UnitConst)
+    val fits = *t match
+        Int(_) -> true
+        Real -> true
+        Str -> true
+        ErrorType -> return TExpr(e.span, ErrorType, UnitConst)
+        _ -> false
+    if !fits
+        c.note(unit_of(c), e.span, s"a C constant is an integer type, `real` or `string`, and this one is `${type_name(t)}`")
+        return TExpr(e.span, ErrorType, UnitConst)
+    if name == "" then return TExpr(e.span, t, UnitConst)
+    TExpr(e.span, t, CConst(name))
+
 private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -> &TExpr = e.kind match
     IntLit(spelling) -> integer_literal(c, e.span, spelling, false, expected)
     Unary(op, operand) -> unary_expr(c, e, op, operand, expected)
@@ -8757,6 +8898,7 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     StringLit(value) -> TExpr(e.span, Str, StrConst(value))
     Interpolate(prefix, chunks, parts, holes) -> interpolate_expr(c, e, prefix, chunks, parts, holes, expected)
     UnitLit -> TExpr(e.span, Unit, UnitConst)
+    CConstant(name) -> c_constant_expr(c, e, name, expected)
     Name(name) -> name_expr(c, e.span, name, expected)
     TypeApply(target, types) -> type_apply(c, e, target, types, expected)
     TypeParent(_) ->
