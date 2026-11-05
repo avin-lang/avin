@@ -329,7 +329,7 @@ impl[A: JsonDecoder] JsonDecoder for Vector[A]
         r.beginArray()?
         val items = Buffer[A]()
         while r.nextElement()?
-            items.add(A.decode(r).mapErr(e -> e.atIndex(items.length()))?)
+            items.addOne(A.decode(r).mapErr(e -> e.atIndex(items.length()))?)
         Ok(items.toVector())
     static whenMissing() -> Option[Vector[A]] = None
 ```
