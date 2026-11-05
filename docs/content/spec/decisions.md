@@ -3583,14 +3583,8 @@ spelling is better, as each entry says.
   **Review with the user**: the first choice; whether an ending should run the current state's
   `leave` is the one a program holding a resource in a state notices.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- **A variant pattern writes no type arguments** (branch `qualified-variant-targs`). In an
+- Settled on the user's delegation 2026-11-05: **A variant pattern writes no type arguments**
+  (branch `qualified-variant-targs`). In an
   expression a generic type's variant takes its type arguments on the type, `Heap[int].Leaf`, or on
   the variant, `Heap.Leaf[int]` and `Heap.Node[int](…)` (settled by the declarations chapter's
   `Option.Some[long](9)`; only the fieldless form had been missing, and is now built). In a pattern
@@ -3602,6 +3596,13 @@ spelling is better, as each entry says.
   symmetric with expressions, but adds a rule that only restates the type); accepting them and
   ignoring them (silently wrong where they differ). Revisit if a pattern on an `Any` scrutinee
   should match a variant at one instance, which would give written arguments a meaning.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
 
 ## Open
 
