@@ -1140,3 +1140,134 @@ lsp_import_error_ranges()
     assert_eq(lsp_one(&server, lsp_change(uri, "import avin.fs.{nothingHere}\n\nmain() = println(1)\n")),
         lsp_publish_of(uri, lsp_error_of(0, 16, 0, 27, "module `avin.fs` declares no `nothingHere`")))
     remove_dir_all(dir).unwrap_or(())
+
+// ---- variant names that several data types share ----
+
+private lsp_shared_text() -> string =
+    "data Slant\n" +
+    "    Normal\n" +
+    "    Italic\n" +
+    "data Weight\n" +
+    "    Bold\n" +
+    "    Normal\n" +
+    "\n" +
+    "describe(s: Slant, w: Weight) -> string = s\"$s/$w\"\n" +
+    "\n" +
+    "pick(s: Slant) -> int = s match\n" +
+    "    Normal -> 1\n" +
+    "    Italic -> 2\n" +
+    "\n" +
+    "main()\n" +
+    "    val a: Slant = Normal\n" +
+    "    val b: Weight = Normal\n" +
+    "    val same = b == Normal\n" +
+    "    println(describe(Normal, Normal))\n" +
+    "    println(Slant.Normal)\n" +
+    "    println(pick(Italic))\n"
+
+@test("lsp: a shared variant name's definition and hover are the variant the checker chose there")
+lsp_shared_variant_uses()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    val uri = lsp_file_uri(dir + "/t.avin")
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(uri, lsp_shared_text())), lsp_publish_of(uri, ""))
+    // A pattern's scrutinee, a declared type, a parameter's type (both arguments), a comparison's
+    // other operand, and the qualified form.
+    val slant = [1, 4, 1, 10]
+    val weight = [5, 4, 5, 10]
+    val uses = [(10, 5, slant), (14, 21, slant), (15, 21, weight), (16, 21, weight), (17, 22, slant), (17, 30, weight), (18, 20, slant)]
+    var id = 2
+    for u in uses
+        val (line, character, place) = u
+        assert_eq(lsp_one(&server, lsp_request(id, "textDocument/definition", lsp_test_at(uri, line, character))),
+            lsp_location_of(id, uri, place[0], place[1], place[2], place[3]))
+        id += 1
+    assert_eq(lsp_one(&server, lsp_request(id, "textDocument/hover", lsp_test_at(uri, 14, 21))),
+        lsp_hover_of(id, "Slant.Normal", "", 14, 19, 14, 25))
+    assert_eq(lsp_one(&server, lsp_request(id + 1, "textDocument/hover", lsp_test_at(uri, 15, 21))),
+        lsp_hover_of(id + 1, "Weight.Normal", "", 15, 20, 15, 26))
+    // A variant only one type has is as it was.
+    assert_eq(lsp_one(&server, lsp_request(id + 2, "textDocument/definition", lsp_test_at(uri, 19, 18))),
+        lsp_location_of(id + 2, uri, 2, 4, 2, 10))
+    assert_eq(lsp_one(&server, lsp_request(id + 3, "textDocument/definition", lsp_test_at(uri, 4, 6))),
+        lsp_location_of(id + 3, uri, 4, 4, 4, 8))
+    remove_dir_all(dir).unwrap_or(())
+
+private lsp_shared_files(dir: string, main: string)
+    make_dir_all(dir + "/fonts").unwrap()
+    write_text(dir + "/fonts/slant.avin", "module fonts\n\ndata Slant\n    Normal\n    Italic\n").unwrap()
+    write_text(dir + "/fonts/weight.avin", "module fonts\n\ndata Weight\n    Bold\n    Normal\n").unwrap()
+    write_text(dir + "/main.avin", main).unwrap()
+
+private lsp_shared_main() -> string =
+    "import fonts.{Slant, Weight, Normal}\n\nmain()\n    val s: Slant = Normal\n    val w: Weight = Normal\n    val x = No\n    println(s)\n    println(w)\n"
+
+private lsp_location_in(uri: string, l0: int, c0: int, l1: int, c1: int) -> string =
+    s"{\"uri\":\"$uri\",\"range\":${lsp_test_range(l0, c0, l1, c1)}}"
+
+@test("lsp: an import of a shared variant name offers every declaring variant, and uses reach the chosen one across files")
+lsp_shared_variant_import()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    lsp_shared_files(dir, lsp_shared_main())
+    val uri = lsp_file_uri(dir + "/main.avin")
+    val slant_uri = lsp_file_uri(dir + "/fonts/slant.avin")
+    val weight_uri = lsp_file_uri(dir + "/fonts/weight.avin")
+    var server = lsp_ready()
+    lsp_answer(&server, lsp_open(uri, lsp_shared_main()))
+    // The import: both declarations, whichever order they come in.
+    val both = lsp_one(&server, lsp_request(2, "textDocument/definition", lsp_test_at(uri, 0, 31)))
+    assert(both.contains(lsp_location_in(slant_uri, 3, 4, 3, 10)))
+    assert(both.contains(lsp_location_in(weight_uri, 4, 4, 4, 10)))
+    assert(both.contains("\"result\":["))
+    val hover = lsp_one(&server, lsp_request(3, "textDocument/hover", lsp_test_at(uri, 0, 31)))
+    assert(hover.contains("Slant.Normal"))
+    assert(hover.contains("Weight.Normal"))
+    // The uses, each by the type expected there.
+    assert_eq(lsp_one(&server, lsp_request(4, "textDocument/definition", lsp_test_at(uri, 3, 21))),
+        lsp_location_of(4, slant_uri, 3, 4, 3, 10))
+    assert_eq(lsp_one(&server, lsp_request(5, "textDocument/definition", lsp_test_at(uri, 4, 21))),
+        lsp_location_of(5, weight_uri, 4, 4, 4, 10))
+    remove_dir_all(dir).unwrap_or(())
+
+@test("lsp: completion of an imported shared variant name offers it once for each type, the type in its detail")
+lsp_shared_variant_completion()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    lsp_shared_files(dir, lsp_shared_main())
+    val uri = lsp_file_uri(dir + "/main.avin")
+    var server = lsp_ready()
+    lsp_answer(&server, lsp_open(uri, lsp_shared_main()))
+    var normals: Buf[string] = buf()
+    for it in lsp_offered(lsp_one(&server, lsp_request(2, "textDocument/completion", lsp_test_at(uri, 5, 14))))
+        if it.label == "Normal" then normals.push(it.detail)
+    assert_eq(normals.len(), 2)
+    assert(normals[0] != normals[1])
+    assert(normals[0] == "Slant.Normal" || normals[1] == "Slant.Normal")
+    assert(normals[0] == "Weight.Normal" || normals[1] == "Weight.Normal")
+    remove_dir_all(dir).unwrap_or(())
+
+@test("lsp: completion in a module offers a shared variant name once for each type")
+lsp_shared_variant_completion_in_module()
+    val text = "data Slant\n    Normal\n    Italic\ndata Weight\n    Bold\n    Normal\n\nmain()\n    val x = No\n"
+    var normals: Buf[string] = buf()
+    for it in lsp_complete_in("t.avin", text, 8, 14, false)
+        if it.label == "Normal" then normals.push(it.detail)
+    assert_eq(normals.len(), 2)
+    assert(normals[0] != normals[1])
+    assert(normals[0] == "Slant.Normal" || normals[1] == "Slant.Normal")
+    assert(normals[0] == "Weight.Normal" || normals[1] == "Weight.Normal")
+
+@test("lsp: a variant name one type has is imported, completed and defined as before")
+lsp_single_variant_import()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    lsp_shared_files(dir, "import fonts.{Slant, Italic}\n\nmain()\n    val s: Slant = Italic\n    val x = Ita\n    println(s)\n")
+    val uri = lsp_file_uri(dir + "/main.avin")
+    val slant_uri = lsp_file_uri(dir + "/fonts/slant.avin")
+    var server = lsp_ready()
+    lsp_answer(&server, lsp_open(uri, read_text(dir + "/main.avin").unwrap()))
+    assert_eq(lsp_one(&server, lsp_request(2, "textDocument/definition", lsp_test_at(uri, 0, 24))),
+        lsp_location_of(2, slant_uri, 4, 4, 4, 10))
+    var italics = 0
+    for it in lsp_offered(lsp_one(&server, lsp_request(3, "textDocument/completion", lsp_test_at(uri, 4, 15))))
+        if it.label == "Italic" then italics += 1
+    assert_eq(italics, 1)
+    remove_dir_all(dir).unwrap_or(())
