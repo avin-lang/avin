@@ -1,0 +1,142 @@
+// expect: exit 0
+// TCP over the loopback: a listener on a port the platform chooses, connections echoed by a thread and
+// by an executor's futures, each handed the connection it serves; lines, reads of a size, everything
+// to the end, a large transfer each way, the end of sending, timeouts, a refused connection, and what
+// a closed connection and listener answer.
+import avin.io.{IoError, ConnectionRefused, TimedOut, Other}
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.{Executor, spawn}
+import avin.time
+
+ok[T](r: Result[T, IoError]) -> T = r match
+    Ok(v) -> v
+    Err(e) -> fail(e.message())
+
+bytesOf(text: string) -> Array[byte] = Array.tabulate(text.byteLength(), i -> text.byteAt(i))
+
+// Echoes each line it reads, upper-cased, until the other end finishes sending, and says how many.
+echoLines(s: TcpStream) -> int
+    var n = 0
+    while true
+        ok(s.readLine()) match
+            Some(line) ->
+                ok(s.writeText(line.toUpperCase() + "\n"))
+                n += 1
+            None ->
+                s.close()
+                return n
+    n
+
+// Reads everything until the other end finishes sending, and sends it back reversed.
+reverseAll(s: TcpStream) -> int
+    val all = ok(s.readAll())
+    val back = Array.tabulate(all.length(), i -> all(all.length() - 1 - i))
+    ok(s.write(back))
+    s.close()
+    all.length()
+
+main()
+    val l = ok(TcpListener.bind("127.0.0.1", 0))
+    println(l.port() > 0 && l.port() <= 65535)
+    val port = l.port()
+
+    // A thread serves the first connection, which it is handed by the accept it makes itself.
+    val lines = spawn(() -> echoLines(ok(l.accept())))
+    val c = ok(TcpStream.connect("127.0.0.1", port))
+    ok(c.writeText("one\r\ntwo\n\nthree\n"))
+    for _ in 0..<4
+        println(ok(c.readLine()))
+    ok(c.shutdownOutput())
+    println(ok(c.readLine()))
+    c.close()
+    c.close()
+    println(lines.join())
+
+    // An executor's future serves connections accepted on the main thread: each is handed over.
+    val ex = Executor.fixed(2)
+    val big = Array.tabulate(300000, i -> byte(i % 251))
+    val clients = (0..<3).map(k ->
+        spawn(() ->
+            val s = ok(TcpStream.connect("localhost", port))
+            ok(s.write(big.slice(0, 100000 * (k + 1))))
+            ok(s.shutdownOutput())
+            val back = ok(s.readAll())
+            s.close()
+            val n = back.length()
+            n > 0 && back(0) == big(n - 1) && back(n - 1) == big(0))).toVector()
+    val served = (0..<3).map(_ ->
+        val s = ok(l.accept())
+        ex.future(reverseAll(s))).toVector()
+    println(served.map(f -> f.await()).sorted())
+    println(clients.map(t -> t.join()))
+    ex.shutdown()
+
+    // Reads of a size take what has arrived, at most the size; what a line read leaves comes first.
+    val reader = spawn(() ->
+        val s = ok(l.accept())
+        ok(s.writeText("head\nbody-bytes"))
+        ok(s.shutdownOutput())
+        ok(s.readAll()).length())
+    val r = ok(TcpStream.connect("127.0.0.1", port))
+    println(ok(r.readLine()))
+    println(string.fromUtf8Lossy(ok(r.read(4))))
+    println(string.fromUtf8Lossy(ok(r.readAll())))
+    println(ok(r.read(10)).length())
+    println(ok(r.readLine()))
+    r.close()
+    println(reader.join())
+
+    // A last line needs no terminator, and bytes that are not UTF-8 read as U+FFFD.
+    val raw = spawn(() ->
+        val s = ok(l.accept())
+        ok(s.write([byte(104), byte(0xFF), byte(105), byte(13), byte(10), byte(122)].toArray()))
+        s.close()
+        0)
+    val t = ok(TcpStream.connect("127.0.0.1", port))
+    println(ok(t.readLine()))
+    println(ok(t.readLine()))
+    println(ok(t.readLine()))
+    t.close()
+    raw.join()
+
+    // A read that waits longer than the timeout fails with `TimedOut`, and the connection stays.
+    val slow = spawn(() ->
+        val s = ok(l.accept())
+        ok(s.readLine())
+        ok(s.writeText("late\n"))
+        s.close()
+        0)
+    val w = ok(TcpStream.connect("127.0.0.1", port))
+    ok(w.setTimeout(time.milliseconds(50)))
+    println(w.readLine() match
+        Err(TimedOut) -> "timed out"
+        Err(e) -> e.message()
+        Ok(_) -> "read")
+    ok(w.setTimeout(time.zero()))
+    ok(w.writeText("go\n"))
+    println(ok(w.readLine()))
+    w.close()
+    slow.join()
+
+    // A closed connection answers an error to every read and write.
+    println(w.read(1).isErr())
+    println(w.readLine() match
+        Err(Other(m)) -> m
+        _ -> "?")
+    println(w.readAll().isErr())
+    println(w.writeText("x").isErr())
+    println(w.write(bytesOf("x")).isErr())
+    println(w.shutdownOutput().isErr())
+    println(w.setTimeout(time.milliseconds(1)).isErr())
+
+    // Nothing listens on a closed listener's port, so a connection there is refused.
+    l.close()
+    l.close()
+    println(l.accept() match
+        Err(Other(m)) -> m
+        _ -> "?")
+    println(TcpStream.connect("127.0.0.1", port) match
+        Err(ConnectionRefused) -> "refused"
+        Err(e) -> e.message()
+        Ok(_) -> "connected")
+    println(TcpStream.connect("no-such-host.invalid", 80).isErr())

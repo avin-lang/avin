@@ -440,7 +440,9 @@ may then free any object no frame still holds:
   object. Since a collection [crosses as a copy](#collections-are-copies), no argument is a
   pointer into the Avin heap.
 - **A handle's method takes its own share** of the handle's Sysl value before it waits, so the value
-  outlives the call even if the handle is collected, and its finalizer run, meanwhile.
+  outlives the call even if the handle is collected, and its finalizer run, meanwhile. A handle
+  passed as a parameter is held the same way: its share is taken before the call, and the copy or
+  pointer the parameter asks for is made from that share.
 - **The result is converted after the call**, once the thread is running again, since converting
   makes Avin objects. Bytes a handle's method answers, which may be a view of the handle's value,
   are copied into Sysl memory first.
