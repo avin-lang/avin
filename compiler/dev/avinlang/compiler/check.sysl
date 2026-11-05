@@ -11424,8 +11424,16 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
     var fixed_fits = false
     for k in 0..<bound.len()
         if !bound_signatures[k].variadic && fits_call(c, bound_signatures[k], bindings[k], args, typed, written) then fixed_fits = true
+    // A candidate that has a lambda take a tuple apart is chosen only where none takes it as written.
+    var direct_fits = false
+    var untupling: Buf[bool] = buf()
+    for k in 0..<bound.len()
+        val apart = untuples_lambda(c, bound_signatures[k], views[k], bindings[k], args)
+        untupling.push(apart)
+        if !apart && fits_call(c, bound_signatures[k], bindings[k], args, typed, written) then direct_fits = true
     for k in 0..<bound.len()
         if fixed_fits && bound_signatures[k].variadic then continue
+        if direct_fits && untupling[k] then continue
         if !fits_call(c, bound_signatures[k], bindings[k], args, typed, written) then continue
         fitting.push(bound[k])
         var params: Buf[&Type] = buf()
@@ -11567,6 +11575,20 @@ private fits_call(c: *Checker, s: Signature, binding: Binding, args: Buf[Argumen
     restore_vars(c, saved)
     ok
 
+/** Whether candidate `s` has a lambda among `args` take a tuple apart: a lambda whose parameters are
+ * not as many as those of the function it is given as. */
+private untuples_lambda(c: *Checker, s: Signature, params: Buf[&Type], binding: Binding, args: Buf[Argument]) -> bool
+    for j in 0..<args.len()
+        val value = argument_value(args[j])
+        if value.kind is Lambda(written, _)
+            argument_type(c, s, params, binding, args, j) match
+                Some(t) ->
+                    val p = zonk(c, strict(t))
+                    if *p is Function(ps, _)
+                        if ps.len() != written.len() then return true
+                None -> ()
+    false
+
 // Whether a literal or a lambda, which takes its type from its parameter, can be given one of type
 // `p`.
 private open_argument_fits(value: &Expr, p: &Type) -> bool
@@ -11574,7 +11596,7 @@ private open_argument_fits(value: &Expr, p: &Type) -> bool
     if is_literal(value) then return literal_fits(value, p)
     value.kind match
         Lambda(params, _) -> *p match
-            Function(ps, _) -> ps.len() == params.len()
+            Function(ps, _) -> ps.len() == params.len() || ps.len() == 1 && params.len() >= 2 && tuple_elements(ps[0]).len() == params.len()
             _ -> false
         MatchFunction(_) -> *p match
             Function(ps, _) -> ps.len() == 1
@@ -12971,7 +12993,13 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
                 wanted = ps
                 wanted_result = Some(r)
             else
-                c.note(unit, e.span, s"expected a function of ${count(ps.len(), "parameter")}, but this lambda takes ${params.len()}")
+                val elements = tuple_elements(zonk(c, if ps.len() == 1 then ps[0] else Unit))
+                if params.len() >= 2 && elements.len() == params.len()
+                    return untupled_lambda(c, e, params, body, elements, expected, delayed)
+                if params.len() >= 2 && elements.len() >= 2
+                    c.note(unit, e.span, s"expected a function of 1 parameter, ${type_name(zonk(c, ps[0]))}, but this lambda takes ${params.len()}: a lambda takes that tuple as one parameter or as ${count(elements.len(), "parameter")}, one for each element")
+                else
+                    c.note(unit, e.span, s"expected a function of ${count(ps.len(), "parameter")}, but this lambda takes ${params.len()}")
                 mismatched = true
     var types: Buf[&Type] = buf()
     var names: Buf[string] = buf()
@@ -13042,6 +13070,52 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
         if wanted_result is Some(r) then unify(c, r, yields)
     val ty: &Type = if mismatched then ErrorType else Function(types, yields)
     TExpr(e.span, ty, FunctionValue(id, buf()))
+
+/** The elements of `t` where it is a tuple, and none otherwise. */
+private tuple_elements(t: &Type) -> Buf[&Type] = *t match
+    Tuple(items) -> items
+    _ -> buf()
+
+// A lambda of n parameters, n at least two, where a function of one n-tuple is expected takes the
+// tuple's elements apart: it is the lambda of one parameter whose body first binds each of the
+// parameters written to its element, in order. A parameter declared with a type takes an element of
+// that type, or of a narrower one as any lambda's parameter may, and an element the expected type
+// leaves unknown takes its type from the declaration; a `_` binds nothing.
+private untupled_lambda(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr, elements: Buf[&Type], expected: Option[&Type], delayed: bool) -> &TExpr
+    val unit = unit_of(c)
+    val whole = s"untupled ${e.span.start}"
+    var ok = true
+    var declared: Buf[Option[&TypeExpr]] = buf()
+    for i in 0..<params.len()
+        val p = params[i]
+        val element = zonk(c, elements[i])
+        var keep = p.declared
+        if p.declared is Some(d)
+            val ty = resolve_type(c, unit, d)
+            if *ty is ErrorType
+                keep = None
+            elif !lambda_parameter_wider(c, ty, element) && !unify(c, element, ty)
+                c.note(unit, p.span, s"`${p.name}` is declared ${type_name(ty)}, but it takes element ${i} of ${type_name(zonk(c, Tuple(elements)))}, which is ${type_name(element)}")
+                keep = None
+                ok = false
+        elif has_unknowns(element) && p.name != "_"
+            c.note(unit, p.span, s"cannot infer the type of `${p.name}`; write it, as in `(${p.name}: int, …) -> …`")
+            ok = false
+        declared.push(keep)
+    if !ok || has_unknowns(zonk(c, Tuple(elements)))
+        if ok then c.note(unit, e.span, "cannot infer the type of the tuple this lambda takes apart; declare its parameters' types")
+        return TExpr(e.span, ErrorType, UnitConst)
+    var items: Buf[&Expr] = buf()
+    for i in 0..<params.len()
+        val p = params[i]
+        if p.name != "_"
+            val element = Expr(p.span, TupleIndex(name_at(p.span, whole), i))
+            items.push(Expr(p.span, Binding(p.name, declared[i], element, false)))
+    items.push(body)
+    var one: Buf[LambdaParam] = buf()
+    one.push(LambdaParam(e.span, whole, None))
+    val wrapped = Expr(body.span, Block(items, false))
+    lambda_expr(c, e, one, wrapped, expected, delayed)
 
 /** The parameter of the lambda a `match` function is checked as: a keyword, so no name written in
  * an arm can refer to it. */

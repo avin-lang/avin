@@ -2213,7 +2213,21 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- **A lambda takes a tuple apart by its parameters** ([tuples](/spec/types/#tuples); branch
+  `lambda-untupling`). Where a function of one parameter whose type is an *n*-tuple (*n* ≥ 2) is
+  expected, a lambda of exactly *n* parameters binds the tuple's elements in order, each typed from
+  its element; a declared parameter type must fit its element (a wider one is accepted, as for any
+  lambda parameter), and an element the expected type leaves unknown takes its declared type. `_`
+  binds nothing; an inner tuple is one element. It applies only where the lambda's parameter count
+  does not fit the expected function directly, and among overloads a candidate that needs it is
+  chosen only where none takes the lambda as written (`Map.map((k, v) -> …)` stays the
+  two-parameter overload). A count fitting neither shape is an error naming both. Why:
+  `xs.zip(ys).forall((x, y) -> x == y)` is the natural spelling and was rejected, leaving only
+  `match (x, y) -> …`, a pattern where two names suffice; the reference language takes tuples apart
+  the same way. Alternatives weighed: keeping the `match` function as the only way (no new rule,
+  but the common case pays for a pattern); allowing a pattern in any lambda parameter position,
+  `((a, b), c) -> …` (more general, but a second pattern syntax beside the `match` function, which
+  already covers nested and refutable shapes).
 
 ## Open
 
