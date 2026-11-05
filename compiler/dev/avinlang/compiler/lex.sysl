@@ -142,6 +142,211 @@ read_interpolated_literal(s: *Scanner, prefix: string) -> Result[Interpolation, 
     chunks.push(b.finish())
     Ok(Interpolation(chunks, holes))
 
+/** A text block's text: the pieces around its holes with escapes decoded (`chunks`) and as written
+ * (`parts`, where only `$$` and `$"` have become `$` and `"`), and the holes. A block with no holes
+ * has one piece. */
+struct BlockText
+    chunks: Buf[string]
+    parts: Buf[string]
+    holes: Buf[Span]
+
+/** Whether the cursor is on `"""`, which opens a text block after any prefix and ends one. */
+opens_text_block(s: *Scanner) -> bool =
+    s.peek() == Some(u8('"')) && s.peek_at(1) == Some(u8('"')) && s.peek_at(2) == Some(u8('"'))
+
+// What a text block treats as blank. A carriage return is among them, so a block means the same in a
+// file with either line ending: it goes with a line's trailing whitespace rather than into the value.
+private is_block_blank(c: u8) -> bool = c == u8(' ') || c == u8('\t') || c == u8('\r')
+
+private at_block_blank(s: *Scanner) -> bool =
+    s.peek() match
+        Some(c) -> is_block_blank(c)
+        None -> false
+
+// Whether nothing but blanks stands between the cursor and the next line break.
+private blanks_to_line_end(s: *Scanner) -> bool
+    val save = s.mark()
+    s.accept_while(is_block_blank)
+    val yes = s.peek() == Some(u8('\n'))
+    s.reset(save)
+    yes
+
+/** A text block, `"""` … `"""`, with the cursor on its opening quotes. Its content begins on the
+ * line after them, and three things happen to each of its lines. The block's incidental indentation
+ * is dropped: the least of the indentation of the lines that carry content and of the closing
+ * delimiter's line when the delimiter stands alone on it. Blanks at a line's end are dropped, since
+ * they cannot be seen; escapes are read afterwards, so `\u{20}` writes one that is meant. And where
+ * escapes are read (`decode`), a `\` at a line's end joins the line to the next. A closing delimiter
+ * alone on its line comes after the last line's break, so the value ends with one; a delimiter after
+ * content on its line leaves the value without one. A lone `"` is text. With `holes`, `$name` and
+ * `${…}` are holes and `$$` and `$"` write `$` and `"`, as in `name"…"`; a backslash directly before a
+ * quote or a backslash does not end the block even where escapes are not read. */
+read_text_block(s: *Scanner, decode: bool, holes: bool) -> Result[BlockText, Diagnostic]
+    val start = s.offset
+    val opening = Span(start, start + 3)
+    s.skip(3)
+    if !blanks_to_line_end(s)
+        // The block is stepped over to its closing delimiter, so its text is not read as code.
+        while !s.at_end() && !opens_text_block(s)
+            s.bump()
+        if !s.at_end() then s.skip(3)
+        return Err(error(opening, "a text block's content begins on the line after its opening `\"\"\"`"))
+    s.accept_while(is_block_blank)
+    s.accept_newline()
+    val strip = block_strip(s, decode, holes, opening)?
+    var chunks: Buf[string] = buf()
+    var parts: Buf[string] = buf()
+    var spans: Buf[Span] = buf()
+    var chunk = str_builder()
+    var part = str_builder()
+    var pending = str_builder()
+    var failure: Option[LitError] = None
+    skip_block_indent(s, strip)
+    loop
+        if s.at_end() then return Err(error(opening, "unterminated text block"))
+        if opens_text_block(s)
+            s.skip(3)
+            break
+        val c = s.peek().unwrap()
+        if c == u8('\n')
+            pending.clear()
+            chunk.push("\n")
+            part.push("\n")
+            s.bump()
+            skip_block_indent(s, strip)
+            continue
+        if is_block_blank(c)
+            pending.push_char(char(u32(c)))
+            s.bump()
+            continue
+        if decode && c == u8('\\') && s.peek_at(1) is Some(n) && (is_block_blank(n) || n == u8('\n'))
+            val save = s.mark()
+            s.bump()
+            if blanks_to_line_end(s)
+                pending.clear()
+                s.accept_while(is_block_blank)
+                s.accept_newline()
+                skip_block_indent(s, strip)
+                continue
+            s.reset(save)
+        val held = pending.finish()
+        chunk.push(held)
+        part.push(held)
+        pending = str_builder()
+        if holes && c == u8('$') && (s.peek_at(1) == Some(u8('$')) || s.peek_at(1) == Some(u8('"')))
+            s.bump()
+            val ch = char(u32(s.peek().unwrap()))
+            chunk.push_char(ch)
+            part.push_char(ch)
+            s.bump()
+        elif holes && c == u8('$') && s.peek_at(1) == Some(u8('{'))
+            s.skip(2)
+            val from = s.offset
+            if skip_raw_hole(s, start).is_err() then return Err(error(opening, "unterminated text block"))
+            spans.push(Span(from, s.offset - 1))
+            chunks.push(chunk.finish())
+            parts.push(part.finish())
+            chunk = str_builder()
+            part = str_builder()
+        elif holes && c == u8('$') && opens_name(s)
+            s.bump()
+            s.read_ident(is_ident_start, is_ident_cont) match
+                Some(at) -> spans.push(at)
+                None -> return Err(error(opening, "unterminated text block"))
+            chunks.push(chunk.finish())
+            parts.push(part.finish())
+            chunk = str_builder()
+            part = str_builder()
+        elif c == u8('\\') && decode
+            // A bad escape is reported once the block has been read to its end, so the text after it
+            // is not mistaken for code.
+            val at = s.offset
+            read_escape(s) match
+                Err(e) ->
+                    if failure.is_none() then failure = Some(e)
+                    if s.offset == at then s.bump()
+                Ok(ch) -> chunk.push_char(ch)
+            part.push(from_utf8_unchecked(s.src[at..<s.offset]))
+        elif c == u8('\\')
+            s.bump()
+            chunk.push("\\")
+            part.push("\\")
+            val next = s.peek()
+            if next == Some(u8('"')) || next == Some(u8('\\'))
+                s.bump()
+                val ch = char(u32(next.unwrap()))
+                chunk.push_char(ch)
+                part.push_char(ch)
+        else
+            s.next_char() match
+                Some(ch) ->
+                    chunk.push_char(ch)
+                    part.push_char(ch)
+                None -> return Err(error(opening, "unterminated text block"))
+    failure match
+        Some(e) -> return Err(error(where(e), e.to_string()))
+        None -> ()
+    chunks.push(chunk.finish())
+    parts.push(part.finish())
+    Ok(BlockText(chunks, parts, spans))
+end read_text_block
+
+// How many columns of leading blanks every line of the block gives up: the least indentation of the
+// lines that carry content, and of the closing delimiter's line when the delimiter stands alone on
+// it. A blank line says nothing about the block's shape. The strip has to be known at the first line
+// and only the last can lower it, so this reads ahead, and leaves the cursor where it began, at the
+// start of the first line of content.
+private block_strip(s: *Scanner, decode: bool, holes: bool, opening: Span) -> Result[usize, Diagnostic]
+    val first = s.mark()
+    var least: Option[usize] = None
+    var indent = 0usize
+    var blank = true
+    loop
+        // An unterminated block leaves the cursor at the end, so nothing after the opening is read as
+        // code.
+        if s.at_end() then return Err(error(opening, "unterminated text block"))
+        if opens_text_block(s)
+            val strip = least match
+                Some(n) -> if n < indent then n else indent
+                None -> indent
+            s.reset(first)
+            return Ok(strip)
+        val c = s.peek().unwrap()
+        if c == u8('\n')
+            if !blank
+                least match
+                    Some(n) -> if indent < n then least = Some(indent)
+                    None -> least = Some(indent)
+            indent = 0
+            blank = true
+            s.bump()
+            continue
+        if blank && is_block_blank(c)
+            indent += 1
+            s.bump()
+            continue
+        blank = false
+        // An escape, a doubled sigil and a hole are stepped over whole, so that a `"""` inside one of
+        // them does not read as the end of the block.
+        val next = s.peek_at(1)
+        if c == u8('\\') && (decode || next == Some(u8('"')) || next == Some(u8('\\'))) && next.is_some() && next != Some(u8('\n'))
+            s.skip(2)
+        elif holes && c == u8('$') && (next == Some(u8('$')) || next == Some(u8('"')))
+            s.skip(2)
+        elif holes && c == u8('$') && next == Some(u8('{'))
+            s.skip(2)
+            if skip_raw_hole(s, opening.start).is_err() then return Err(error(opening, "unterminated text block"))
+        else
+            s.bump()
+end block_strip
+
+// Steps over the incidental indentation at the head of a line; a line with less gives up what it has.
+private skip_block_indent(s: *Scanner, strip: usize)
+    var n = 0usize
+    while n < strip && at_block_blank(s)
+        s.bump()
+        n += 1
+
 private opens_name(s: *Scanner) -> bool =
     s.peek_at(1) match
         Some(n) -> is_ident_start(n)
@@ -210,7 +415,12 @@ private lex_range(text: []const u8, range: Span, lines: bool, margin: usize) -> 
         if is_ident_start(c)
             s.read_ident(is_ident_start, is_ident_cont)
             val word = from_utf8_unchecked(text[start..<s.mark()])
-            if s.peek() == Some(u8('"'))
+            if opens_text_block(&s)
+                // A block in error is still a token, so the expression it stands in is not reported
+                // as missing as well.
+                if read_text_block(&s, word == "s" || word == "f", true) is Err(d) then rep.add(d)
+                out.push(Interpolated, s.span_from(start))
+            elif s.peek() == Some(u8('"'))
                 read_interpolated_literal(&s, word) match
                     Ok(_) -> out.push(Interpolated, s.span_from(start))
                     Err(e) -> rep.add(error(where(e), e.to_string()))
@@ -229,6 +439,9 @@ private lex_range(text: []const u8, range: Span, lines: bool, margin: usize) -> 
             read_char_literal(&s, c) match
                 Ok(_) -> out.push(CharQuoted, s.span_from(start))
                 Err(e) -> rep.add(error(where(e), e.to_string()))
+        elif opens_text_block(&s)
+            if read_text_block(&s, true, false) is Err(d) then rep.add(d)
+            out.push(Quoted, s.span_from(start))
         elif c == u8('"')
             read_quoted(&s, c) match
                 Ok(_) -> out.push(Quoted, s.span_from(start))

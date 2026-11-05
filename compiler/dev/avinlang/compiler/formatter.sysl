@@ -82,6 +82,10 @@ private struct FmtLine
      * line's level. */
     end: usize
     next_level: usize
+    /** The last source line it reaches: past itself where a text block starts on it. */
+    through: usize
+    /** A line inside a text block that started on an earlier line, written out with that line. */
+    covered: bool
 
 // The file as the formatter reads it.
 private struct Fmt
@@ -153,21 +157,29 @@ private fmt_scan(doc: Source, program: Source, margin: usize) -> Result[Fmt, str
     val n = fmt_line_count(program)
     var lines: Buf[FmtLine] = buf()
     for i in 0..n
-        lines.push(FmtLine(0, 0, "", false, 0, false, 0, 0, 0, 0, 0, 0))
+        lines.push(FmtLine(0, 0, "", false, 0, false, 0, 0, 0, 0, 0, 0, i, false))
     var toks: Buf[FmtToken] = buf()
+    var physical = 1usize
+    // The line a token is written on: a token on the line a text block closes on is written after
+    // the block, on the line the block began on.
     var line = 1usize
     for t in lexed.items.items
         if t.value == Newline || t.value == Indent || t.value == Dedent then continue
-        while line < n && program.line_span(line + 1).start <= t.span.start
-            line += 1
-        if t.span.end > program.line_span(line).end
-            return Err(s"${doc.name}:$line: a literal runs past the end of its line, so the file is left as it is")
+        while physical < n && program.line_span(physical + 1).start <= t.span.start
+            physical += 1
+            if !lines[physical].covered then line = physical
+        var reach = physical
+        while reach < n && program.line_span(reach + 1).start < t.span.end
+            reach += 1
+            lines[reach].covered = true
+        if reach > lines[line].through then lines[line].through = reach
         var spaced = false
         if toks.len() > 0 && toks[toks.len() - 1].line == line then spaced = t.span.start > toks[toks.len() - 1].end
         toks.push(FmtToken(t.value, from_utf8_unchecked(program.text(t.span)), line, t.span.start, t.span.end, spaced))
         if lines[line].count == 0 then lines[line].first = toks.len() - 1
         lines[line].count += 1
     for l in 1..n
+        if lines[l].covered then continue
         val span = program.line_span(l)
         val bytes = program.text(span)
         var col = 0usize
@@ -176,14 +188,17 @@ private fmt_scan(doc: Source, program: Source, margin: usize) -> Result[Fmt, str
             col = if bytes[i] == u8('\t') then (col / 8 + 1) * 8 else col + 1
             i += 1
         lines[l].column = if col > margin then col - margin else 0
-        var from = if lines[l].count > 0 then toks[lines[l].first + lines[l].count - 1].end - span.start else i
-        while from < bytes.len && blank_byte(bytes[from])
+        // A comment follows the line's last token, which is on a later line after a text block.
+        val tail_span = program.line_span(lines[l].through)
+        val tail = program.text(tail_span)
+        var from = if lines[l].count > 0 then toks[lines[l].first + lines[l].count - 1].end - tail_span.start else i
+        while from < tail.len && blank_byte(tail[from])
             from += 1
-        if from + 1 < bytes.len && bytes[from] == u8('/') && bytes[from + 1] == u8('/')
-            var to = bytes.len
-            while to > from && blank_byte(bytes[to - 1])
+        if from + 1 < tail.len && tail[from] == u8('/') && tail[from + 1] == u8('/')
+            var to = tail.len
+            while to > from && blank_byte(tail[to - 1])
                 to -= 1
-            lines[l].comment = from_utf8_unchecked(bytes[from..<to])
+            lines[l].comment = from_utf8_unchecked(tail[from..<to])
         if lines[l].count == 0 && lines[l].comment == "" && !all_blank(doc.line_text(l)) then lines[l].prose = true
         var c = 0usize
         while c < lines[l].count && is_closer(toks[lines[l].first + c].text)
@@ -534,6 +549,8 @@ private fmt_reflowable(f: Fmt, l: usize) -> Option[usize]
         if i < last && f.lines[i].comment != "" then return None
     var depth = 0usize
     for k in ln.first..<ln.end
+        // A text block keeps its lines as they are, so the statement holding one keeps its own.
+        if f.lines[f.toks[k].line].through > f.toks[k].line then return None
         if is_opener(f.toks[k].text) then depth += 1
         elif is_closer(f.toks[k].text)
             if depth == 0 then return None
@@ -649,6 +666,9 @@ private fmt_layout(doc: Source, program: Source, reflow: bool) -> Result[string,
     var l = 1usize
     while l <= n
         val ln = f.lines[l]
+        if ln.covered
+            l += 1
+            continue
         if ln.prose
             out.prose(from_utf8_unchecked(doc.line_text(l)))
             l += 1
