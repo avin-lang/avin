@@ -3035,14 +3035,7 @@ their words are reserved.
     output, as the chapter says. **A FreeType binding** (`avin-lang/freetype`) waits until Cairo's
     font-face step needs it; the toy font API and the platform's own font backend come first.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- **C bindings, from the FreeType survey** (branch `freetype-design`; [chapter](/spec/c-bindings/)).
+- Settled on the user's delegation 2026-11-05 (built on branch `freetype-design`): **C bindings, from the FreeType survey** ([chapter](/spec/c-bindings/)). The user: *"Yes we'll need a freetype binding to work with cairo."*
   The user (2026-11-05): *"Yes we'll need a freetype binding to work with cairo."* A third stressor,
   `avin-lang/freetype`, binds FreeType 2 (`pkg-config freetype2`) to the reference binding's surface,
   and `avin-lang/cairo` depends on it for Cairo's FreeType font faces (`cairo-ft.h`). This replaces
@@ -3123,6 +3116,23 @@ their words are reserved.
   - Left out: `cairo_ft_font_options_substitute`, which takes a fontconfig `FcPattern *` and waits on
     a fontconfig binding; `FT_Outline_Decompose` and the other callback APIs, which the reference
     binding does not reach.
+  - The survey's two questions, settled with it. **The test font is a small OFL font**, not Kaisei
+    Decol Regular (OFL 1.1 and usable, but 4.4 MB): a Latin face of a few hundred kilobytes, its
+    licence file beside it in the package's tests, keeps the repository light, and the reference
+    binding's outputs that need Kaisei's glyphs are reproduced with the small face's instead.
+    **`cairo_ft_font_options_substitute` waits on a fontconfig binding**: it takes a fontconfig
+    pattern, and nothing else in `cairo` or `freetype` needs fontconfig. The macro-named headers and
+    `FT_Error_String`, which the survey placed in step 2, ride step 3, since step 2 was already being
+    built.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
