@@ -3652,14 +3652,8 @@ spelling is better, as each entry says.
   the day, minutes, seconds, microseconds). *Alternatives*: the part below the millisecond, which
   would need a `toMillisPart()` beside it to be complete.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- **An expected type reaches a core library variant that a nearer one hides** (branch
+- Settled on the user's delegation 2026-11-05: **An expected type reaches a core library variant
+  that a nearer one hides** (branch
   `none-shadowing`). A module's own variant `None` (a C mirror's `ImageFormat.None`) hid `Option`'s
   throughout the module, so `return None` from a `-> Option[T]` function, `val x: Option[int] =
   None` and a `None` pattern on an option were all refused. Now, where the type expected at a bare
@@ -3684,6 +3678,13 @@ spelling is better, as each entry says.
   silent pick, but breaks valid programs and asks for a qualified form on the module's own type);
   leaving shadowing as it was and requiring `Option.None` (the status quo the bug report was
   about); refusing a variant named like a core library variant (would rename C enumerators).
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
 
 ## Open
 
