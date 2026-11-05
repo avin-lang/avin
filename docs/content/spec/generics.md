@@ -340,7 +340,11 @@ infer is.
   (the whole parameter, a covariant argument of a generic type, a tuple part, a function's result)
   is a lower bound, so with nothing expected `cat :: dogs` is a `List[Animal]`, `pair(cat, dog)`
   for `pair[T](a: T, b: T)` takes `Animal`, and `firstOf(Some(cat), Some(dog))` takes it too. An
-  expected type decides the type argument before the arguments do. An invariant or contravariant
+  expected type decides the type argument before the arguments do, except where the result names it
+  as a contravariant argument of a generic type: there the expected type bounds it only from below
+  (a `Sink[T]` is a `Sink[Nothing]` whatever `T` is), so the arguments decide it, and the expected
+  type only where they leave it open. `watch(spawn(Worker()), …)`, whose parameter is an
+  `ActorRef[Nothing]`, takes `M` from the `Behaviour` passed to `spawn`. An invariant or contravariant
   use (an argument of `Box[T]` for an invariant `T`, a lambda's parameter) decides it for good, as
   the type the lower bounds so far fit, and a later argument must be an instance of that. A number
   literal takes the type the other arguments decide. Two value types have no join, so

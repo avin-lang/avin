@@ -4,13 +4,17 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 
 // An actor declaration, `actor Counter(params) receives CounterMsg` and a body of fields, methods,
-// statements and one `receive` block of arms. It is read into the two declarations it means:
+// statements, one `receive` block of arms and at most one `stopping` block. It is read into the two
+// declarations it means:
 //
-// - a private class `actor Counter`, holding the actor's reference first, then the parameters, as
-//   its fields, the body's fields, statements and methods, and a method `actor$receive(message)`
-//   that matches the message against the `receive` arms, each arm's value discarded. No name a
-//   program writes holds a space or a `$`, so the object of this class, the actor's state, is never
-//   a value the program sees; inside it `self` names the actor's reference (see the checker).
+// - a private class `actor Counter`, extending `avin.actors.ActorContext[CounterMsg]`, whose methods
+//   (`stop`, `watch`, `after`, `children`, ...) the actor's code calls as its own, holding the
+//   actor's reference first, then the parameters, as its fields, the body's fields, statements and
+//   methods, a method `actor$receive(message)` that matches the message against the `receive` arms,
+//   each arm's value discarded, and the `stopping` block as a method `actor$stopping()` the body
+//   gives to the context last. No name a program writes holds a space or a `$`, so the object of
+//   this class, the actor's state, is never a value the program sees; inside it `self` names the
+//   actor's reference (see the checker).
 // - a function `Counter(params) -> Behaviour[CounterMsg]`, taking the actor's parameters with their
 //   defaults, which makes the behaviour named "Counter" whose start, run on the actor's first turn,
 //   makes the state object from the parameters and the actor's reference and gives back the
@@ -47,6 +51,7 @@ const ActorSelf: string = "actor$self"
 const ActorReceive: string = "actor$receive"
 const ActorMessage: string = "actor$message"
 const ActorState: string = "actor$state"
+const ActorStopping: string = "actor$stopping"
 
 parse_actor(p: *Parser, start: Span, annotations: Buf[Annotation]) -> ActorDeclarations
     p.expect("actor")
@@ -62,6 +67,7 @@ parse_actor(p: *Parser, start: Span, annotations: Buf[Annotation]) -> ActorDecla
     var members: Buf[ClassMember] = buf()
     var arms: Buf[Arm] = buf()
     var receive_at: Option[Span] = None
+    var stopping: Option[&Expr] = None
     if p.accept_kind(Indent)
         loop
             if p.toks.at_end() || p.accept_kind(Dedent) then break
@@ -75,6 +81,12 @@ parse_actor(p: *Parser, start: Span, annotations: Buf[Annotation]) -> ActorDecla
                 p.expect_kind(Indent, "expected indented arms after `receive`")
                 for arm in machine_arms(p)
                     arms.push(arm)
+            elif p.at("stopping") && next_is(p, Indent)
+                val at = p.toks.here()
+                p.toks.advance()
+                val body = parse_body(p, true)
+                if stopping is Some(_) then p.report.add(error(at, s"`$name` has one `stopping` block, which runs when it ends"))
+                else stopping = Some(body)
             else members.push(private_member(parse_class_member(p)))
             if p.toks.position == before then p.toks.advance()
             if !p.toks.at_end() && !p.at_kind(Newline) && !p.at_kind(Dedent) && !after_block(p)
@@ -91,7 +103,7 @@ parse_actor(p: *Parser, start: Span, annotations: Buf[Annotation]) -> ActorDecla
     for cp in params
         sendable.push(!marked_sendable(cp.param))
     val site = ActorSite(name_span, name, message.span, receive, sendable)
-    val decl = actor_class(span, name_span, name, type_params, params, message, members, arms, receive_at)
+    val decl = actor_class(span, name_span, name, type_params, params, message, members, arms, receive_at, stopping)
     val function = behaviour_function(annotations, span, name_span, name, type_params, params, message)
     ActorDeclarations(decl, function, site)
 
@@ -127,7 +139,7 @@ private actors_type(message: &TypeExpr, name: string) -> &TypeExpr
     args.push(message)
     actor_type(message.span, core_path("actors." + name), args)
 
-private actor_class(span: Span, name_span: Span, name: string, type_params: Buf[TypeParam], params: Buf[ClassParam], message: &TypeExpr, written: Buf[ClassMember], arms: Buf[Arm], receive_at: Option[Span]) -> &ClassDecl
+private actor_class(span: Span, name_span: Span, name: string, type_params: Buf[TypeParam], params: Buf[ClassParam], message: &TypeExpr, written: Buf[ClassMember], arms: Buf[Arm], receive_at: Option[Span], stopping: Option[&Expr]) -> &ClassDecl
     val at = name_span
     var fields: Buf[ClassParam] = buf()
     fields.push(ClassParam(Param(at, Pattern(at, Name(ActorSelf)), actors_type(message, "ActorRef"), None, false, false, buf()), false, false))
@@ -149,7 +161,24 @@ private actor_class(span: Span, name_span: Span, name: string, type_params: Buf[
     var receive_params: Buf[Param] = buf()
     receive_params.push(Param(receive, Pattern(receive, Name(ActorMessage)), message, None, false, false, buf()))
     members.push(MethodMember(Function(buf(), receive, receive, ActorReceive, buf(), receive_params, Some(TypeExpr(receive, Named("unit", buf()))), Some(body), buf()), true, false, false))
-    ClassDecl(buf(), span, name_span, actor_class_name(name), "", at, type_params, fields, buf(), buf(), members, false)
+    // The `stopping` block is the method `actor$stopping()`, given to the context once the body has
+    // run: `onStopping(() -> actor$stopping())`.
+    if stopping is Some(block)
+        val bat = block.span
+        members.push(MethodMember(Function(buf(), bat, bat, ActorStopping, buf(), buf(), Some(TypeExpr(bat, Named("unit", buf()))), Some(block), buf()), false, false, false))
+        var call_stopping: Buf[Argument] = buf()
+        val run = Expr(bat, Lambda(buf(), Expr(bat, Call(actor_name(bat, ActorStopping), buf()))))
+        call_stopping.push(Argument(bat, None, run, false))
+        members.push(StatementMember(Expr(bat, Call(actor_name(bat, "onStopping"), call_stopping))))
+    // The class extends the actor's context, `avin.actors.ActorContext[M](actor$self)`, whose
+    // methods (`stop`, `watch`, `after`, `children`, ...) its code calls as its own.
+    var context_args: Buf[Argument] = buf()
+    context_args.push(Argument(at, None, actor_name(at, ActorSelf), false))
+    var context_types: Buf[&TypeExpr] = buf()
+    context_types.push(message)
+    var parents: Buf[&Expr] = buf()
+    parents.push(Expr(at, Call(Expr(at, TypeApply(actor_name(at, core_path("actors.ActorContext")), context_types)), context_args)))
+    ClassDecl(buf(), span, name_span, actor_class_name(name), "", at, type_params, fields, parents, buf(), members, false)
 
 // `Counter(params) -> Behaviour[M]`, making the behaviour whose start makes the state and gives back
 // the handler:

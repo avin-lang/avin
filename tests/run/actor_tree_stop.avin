@@ -1,0 +1,89 @@
+// expect: exit 0
+// Children end first: an ending actor stops each child and waits for their ends before its own
+// `stopping` block runs, so a tree is torn down from its leaves. A chain forty deep ends in
+// exactly the order from its last link to its first; sixty children of one actor all end
+// before it, its `stopping` block finding none left; and in a binary tree every node's block runs
+// after the blocks of all its descendants, whichever child ends first. An actor told to stop while
+// its children are still starting waits for them too, and a child that stopped itself earlier is
+// not waited for.
+import avin.actors.{ActorRef, spawn}
+import avin.threads.{Channel, Promise}
+
+data Msg
+    Quit
+    Ready(reply: Promise[int])
+
+actor Link(left: int, log: Channel[int]) receives Msg
+    if left > 0 then spawn(Link(left - 1, log))
+    receive
+        Quit -> stop()
+        _ -> ()
+    stopping
+        log.send(left)
+
+actor Hub(width: int, log: Channel[string]) receives Msg
+    for i in 0..<width do spawn(Leaf(i, log))
+    receive
+        Quit -> stop()
+        Ready(reply) -> reply.complete(children().length())
+    stopping
+        log.send(s"hub stopping with ${children().length()} children left")
+
+actor Leaf(n: int, log: Channel[string]) receives Msg
+    if n % 20 == 0 then stop()
+    receive
+        _ -> ()
+    stopping
+        log.send(s"leaf")
+
+actor Node(path: string, depth: int, log: Channel[string]) receives Msg
+    if depth > 0
+        spawn(Node(path + "0", depth - 1, log))
+        spawn(Node(path + "1", depth - 1, log))
+    receive
+        Quit -> stop()
+        _ -> ()
+    stopping
+        log.send(path)
+
+main()
+    val chain = Channel[int]()
+    val first = spawn(Link(40, chain))
+    first.tell(Quit)
+    first.ended().await()
+    chain.close()
+    var expected = 0
+    var inOrder = true
+    for left in chain
+        if left != expected then inOrder = false
+        expected += 1
+    println(s"chain ended from its last link: $inOrder, ${expected} links")
+
+    val log = Channel[string]()
+    val hub = spawn(Hub(60, log))
+    val ready = Promise[int]()
+    hub.tell(Ready(ready))
+    // The leaves that stop themselves may or may not have ended yet; the rest are there.
+    println(ready.future.await() >= 57)
+    hub.tell(Quit)
+    hub.ended().await()
+    log.close()
+    var leaves = 0
+    var last = ""
+    for line in log
+        if line == "leaf" then leaves += 1
+        last = line
+    println(s"$leaves leaves, then: $last")
+
+    val tree = Channel[string]()
+    val root = spawn(Node("r", 3, tree))
+    root.tell(Quit)
+    root.ended().await()
+    tree.close()
+    val order = tree.toVector()
+    var descendantsFirst = true
+    for i in 0..<order.length()
+        for j in i + 1..<order.length()
+            // A node that ends later is never a descendant of one that ended earlier.
+            if order(j).byteLength() > order(i).byteLength() && order(j).startsWith(order(i)) then descendantsFirst = false
+    println(s"${order.length()} nodes, every one after its descendants: $descendantsFirst, the root last: ${order(order.length() - 1)}")

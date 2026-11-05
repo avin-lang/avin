@@ -7,8 +7,17 @@ module avin.actors
 // the actor at the back of the queue, so a busy actor never holds a worker from the others, and the
 // actor never runs on two threads at once. Before each turn the worker makes the actor the owner of
 // the code it runs, so the Sysl handles the actor owns are its own on whichever worker it is.
+//
+// An actor runs until it stops. An actor started by code another actor runs is that actor's child,
+// and an ending actor stops its children and waits for their ends before it ends itself, so a tree
+// of actors is torn down from its leaves. An actor's own code reaches its lifecycle through its
+// `ActorContext`: `stop`, `watch`, the timers `after` and `every`, its `children` and its `parent`.
 
-import avin.threads.{Atomic, Executor}
+import avin.collections.mutable.{Map as MutableMap}
+import avin.threads.{Atomic, Condition, Executor, Future, Mutex, Promise}
+import avin.threads as threads
+import avin.time.Duration
+import avin.time as time
 
 // A new owner of Sysl handles, which nothing has been given yet.
 @intrinsic("owner_new")
@@ -26,6 +35,9 @@ private runAs(owner: long)
 @intrinsic("hand_over")
 private handOver(value: Any, from: long, to: long)
 
+@intrinsic("trap")
+private fail(reason: string) -> Nothing
+
 // The most messages of one actor a worker handles before the actor goes to the back of its
 // executor's queue.
 private val throughput = 16
@@ -33,9 +45,36 @@ private val throughput = 16
 // The last number given to an actor; each actor's is one more, never reused.
 private val numbers = Atomic[long](0)
 
+// How an actor ended: `Stopped` where it stopped, by its own `stop()`, by its parent's `stop(child)`
+// or because its parent ended; `Failed` with the trap's reason where a trap ended it.
+data Ending
+    Stopped
+    Failed(reason: string)
+
+// Where an actor is in its life: handling messages, ending (its children not yet all ended, its
+// messages dropped), or ended.
+private val Live = 0
+private val Closing = 1
+private val Gone = 2
+
+// Whether a message that waits in a mailbox for a timer or a watch is still wanted: cancelling the
+// timer or the watch drops it, whether or not it is queued already. `key` is the number of the actor
+// a watch watches, and `once` says that the message comes once, so the actor forgets the guard when
+// it handles it.
+private class Guard(val key: long, val once: bool): Sendable
+    val id: long = guards.add(1)
+    private val live = Atomic[bool](true)
+
+    isLive() -> bool = live.load()
+
+    cancel() = live.store(false)
+
+// The last number given to a guard.
+private val guards = Atomic[long](0)
+
 // One message in a mailbox, and the link to the one sent after it, which its sender sets once the
-// message is the newest.
-private class Node[M](private var message: Option[M])
+// message is the newest. A timer's or a watch's message carries its guard.
+private class Node[M](private var message: Option[M], val guard: Option[Guard])
     val next = Atomic[Option[Node[M]]](None)
 
     // The message, which the node gives up so that the mailbox does not keep it alive.
@@ -44,67 +83,155 @@ private class Node[M](private var message: Option[M])
         message = None
         m
 
+    // Whether the message is still wanted.
+    wanted() -> bool = guard match
+        Some(g) -> g.isLive()
+        None -> true
+
 // An unbounded queue many threads put messages in and the actor alone takes them from, without a
 // lock: a sender swaps its node in as the newest, then links the one it replaced to it, so two
 // messages one sender sends arrive in the order it sent them. The oldest node is always one whose
 // message was taken already; the next is the next message.
 private class Mailbox[M]()
-    private var oldest = Node[M](None)
+    private var oldest = Node[M](None, None)
     private val newest = Atomic[Node[M]](oldest)
 
-    // Puts `m` at the back; called by any thread.
-    put(m: M)
-        val n = Node(Some(m))
+    // Puts `m` at the back, with the guard of the timer or watch that sends it; called by any thread.
+    put(m: M, guard: Option[Guard])
+        val n = Node(Some(m), guard)
         newest.swap(n).next.store(Some(n))
 
-    // The message at the front, taken out, where one is there; called by the actor alone. A message
+    // The node at the front, taken out, where one is there; called by the actor alone. A message
     // whose sender has swapped its node in but not yet linked it is not there yet, and its sender
     // schedules the actor once it is.
-    take() -> Option[M] = oldest.next.load() match
+    take() -> Option[Node[M]] = oldest.next.load() match
         Some(n) ->
             oldest = n
-            n.take()
+            Some(n)
         None -> None
+
+    // Drops every message there.
+    clear()
+        while take() is Some(n) do n.take()
 
     // Whether a message is there to take; called by the actor alone.
     isEmpty() -> bool = oldest.next.load().isEmpty()
 
+// What every actor is, whatever the type of its messages: what its parent, its children and the
+// actors watching it use.
+private trait Core: Sendable
+    // The actor's number, which no other actor has.
+    id() -> long
+
+    // The actor's reference, which may be watched and compared but not sent to.
+    ref() -> ActorRef[Nothing]
+
+    // Asks the actor to end once the message it is handling is handled.
+    requestStop() -> unit
+
+    // Whether the actor has ended: it is so before its end is told to anyone.
+    isGone() -> bool
+
+    // Adds `child`, which this actor's code is starting.
+    adopt(child: Core) -> unit
+
+    // Tells the actor that its child `child` has ended.
+    childEnded(child: Core) -> unit
+
 // A running actor: its mailbox, whether it is queued on its executor or running there, its owner of
-// Sysl handles, and its handler, made by its behaviour's start on its first turn. Its turns are the
-// only code that reads or changes its handler, and one ends before the next begins, through the
-// executor's queue, so it is sendable.
-private class Actor[M: Sendable](private val behaviour: Behaviour[M], private val executor: Executor): Sendable
+// Sysl handles, its handler, made by its behaviour's start on its first turn, and its place in the
+// tree of actors. Its turns are the only code that reads or changes its handler, its timers, its
+// watches and its `stopping` blocks, and one turn ends before the next begins, through the
+// executor's queue; what other threads reach (its mailbox, its phase, its children, its end) is
+// atomic, so it is sendable.
+private class Actor[M: Sendable](private val behaviour: Behaviour[M], private val executor: Executor, val parent: Option[Core]): Core
     val number: long = numbers.add(1)
     val owner: long = newOwner()
+    val end = Promise[Ending]()
     private val mailbox = Mailbox[M]()
-    private val scheduled = Atomic[bool](false)
+    // Set until `start`, which queues the first turn, so nothing queues one before it.
+    private val scheduled = Atomic[bool](true)
+    private val stopAsked = Atomic[bool](false)
+    private val phase = Atomic[int](Live)
+    // The children that have not ended yet, in the order they started.
+    val children = Atomic[Vector[Core]](Vector())
     private var handler: Option[(M) -> unit] = None
     private var reference: Option[ActorRef[M]] = None
+    // The guards of the timers not yet done, by the guard's number, and of the watches, by the number
+    // of the actor watched.
+    val timers = MutableMap[long, Guard]()
+    val watches = MutableMap[long, Guard]()
+    // What runs when the actor ends, in the order it was given.
+    val stoppings = Buffer[() -> unit]()
+
+    override id() -> long = number
+
+    override ref() -> ActorRef[Nothing] = reference.get()
 
     // Starts the actor: its first turn runs the start of its behaviour as `ref`, then its messages.
     start(ref: ActorRef[M])
         reference = Some(ref)
-        scheduled.store(true)
         schedule()
 
-    // Puts `m` in the mailbox and queues the actor where it was neither queued nor running.
-    post(m: M)
-        mailbox.put(m)
+    // Puts `m` in the mailbox and queues the actor where it was neither queued nor running. A message
+    // to an actor that is ending or has ended is dropped.
+    post(m: M, guard: Option[Guard])
+        if phase.load() != Live then return
+        mailbox.put(m, guard)
+        wake()
+
+    // Asks the actor to end once the message it is handling is handled.
+    override requestStop()
+        stopAsked.store(true)
+        wake()
+
+    override isGone() -> bool = phase.load() == Gone
+
+    // Asks the actor to end from its own code, which looks again after each message.
+    stopSelf() = stopAsked.store(true)
+
+    // An actor that is ending already stops a child at once, and does not wait for it.
+    override adopt(child: Core)
+        children.update(cs -> cs :+ child)
+        if phase.load() != Live then child.requestStop()
+
+    override childEnded(child: Core)
+        val gone = child.id()
+        children.update(cs -> cs.filter(c -> c.id() != gone))
+        wake()
+
+    // Whether the actor is in its own turn: its code is running.
+    running() -> bool = currentOwner() == owner
+
+    private wake()
         if scheduled.compareAndSet(false, true) then schedule()
 
     private schedule() = executor.execute(() -> turn())
 
     // One turn on a worker, as the actor's owner: the start where it has not run, then at most
-    // `throughput` messages. With messages left the actor goes to the back of the queue; without,
-    // it is no longer scheduled, unless a message arrived as it stopped, which queues it again.
+    // `throughput` messages, stopping early where the actor is asked to end. An ending actor goes on
+    // to stop its children, and ends once none is left. With messages left the actor goes to the
+    // back of the queue; without, it is no longer scheduled, unless something arrived as it stopped,
+    // which queues it again.
     private turn()
         val worker = currentOwner()
         runAs(owner)
-        val handled = handle(started())
+        var handled = 0
+        if phase.load() == Live
+            handled = handle(started())
+            if stopAsked.load() then closing()
+        if phase.load() == Closing && children.load().isEmpty() then ended()
+        if phase.load() == Gone then mailbox.clear()
         runAs(worker)
-        if handled == throughput && !mailbox.isEmpty() then return schedule()
+        if handled == throughput && phase.load() == Live && !mailbox.isEmpty() then return schedule()
         scheduled.store(false)
-        if !mailbox.isEmpty() && scheduled.compareAndSet(false, true) then schedule()
+        if pending() && scheduled.compareAndSet(false, true) then schedule()
+
+    // Whether a turn has something to do.
+    private pending() -> bool = phase.load() match
+        Live -> stopAsked.load() || !mailbox.isEmpty()
+        Closing -> children.load().isEmpty()
+        _ -> !mailbox.isEmpty()
 
     // The handler, made by the behaviour's start where this is the first turn.
     private started() -> (M) -> unit = handler match
@@ -114,15 +241,72 @@ private class Actor[M: Sendable](private val behaviour: Behaviour[M], private va
             handler = Some(h)
             h
 
-    // Hands at most `throughput` messages to `h`, and answers how many it handed.
+    // Hands at most `throughput` messages to `h`, and answers how many it took; a message whose timer
+    // or watch was cancelled is dropped.
     private handle(h: (M) -> unit) -> int
         var n = 0
-        while n < throughput
+        while n < throughput && !stopAsked.load()
             mailbox.take() match
-                Some(m) -> h(m)
+                Some(node) ->
+                    val m = node.take()
+                    if node.wanted()
+                        if node.guard is Some(g) then forget(g)
+                        h(m.get())
                 None -> return n
             n += 1
         n
+
+    // Forgets a guard whose one message is being handled.
+    private forget(g: Guard)
+        if !g.once then return
+        if g.key < 0
+            timers.remove(g.id)
+            return
+        if watches.get(g.key) is Some(w)
+            if w.id == g.id then watches.remove(g.key)
+
+    // Begins to end: the timers and watches are cancelled, the messages dropped, and every child is
+    // asked to end.
+    private closing()
+        phase.store(Closing)
+        for (_, g) in timers
+            g.cancel()
+            clock.remove(g)
+        timers.clear()
+        for (_, g) in watches do g.cancel()
+        watches.clear()
+        mailbox.clear()
+        for c in children.load() do c.requestStop()
+
+    // Ends, every child having ended: the `stopping` blocks run, the end is told to whoever waits for
+    // it, and the parent is told after.
+    private ended()
+        for f in stoppings do f()
+        phase.store(Gone)
+        mailbox.clear()
+        handler = None
+        stoppings.clear()
+        registry.leave(owner)
+        end.complete(Stopped)
+        if parent is Some(p) then p.childEnded(self)
+
+// The running actors, by their owner of Sysl handles, so code finds the actor running it: `spawn`
+// its parent, and an `ActorContext` its actor. Every thread reaches it, under its mutex.
+private class Registry(): Sendable
+    private val actors = Mutex(MutableMap[long, Core]())
+
+    enrol(owner: long, a: Core) = actors.with(m -> m(owner) = a)
+
+    leave(owner: long) = actors.with(m ->
+        m.remove(owner)
+        ())
+
+    // The actor whose code is running, where an actor's is.
+    current() -> Option[Core]
+        val me = currentOwner()
+        actors.with(m -> m.get(me))
+
+private lazy val registry: Registry = Registry()
 
 // What an actor is before it starts: a name, which its references are shown by, and its start, run
 // once on the actor's own execution before it handles any message, which makes the actor's state and
@@ -137,11 +321,17 @@ class Behaviour[M: Sendable](val name: string, val start: @sendable (ActorRef[M]
 // The reference by which an actor is sent messages. Any thread may hold and use it; it holds no state
 // of the actor's, compares by the actor it refers to, and is shown as its behaviour's name and the
 // actor's number, `Counter#3`. A reference that accepts every message of a type accepts those of
-// its subtypes.
-class ActorRef[-M: Sendable](private val send: @sendable (M) -> unit, val name: string, val number: long): Sendable
+// its subtypes, so every reference is an `ActorRef[Nothing]`, which may be watched and compared but
+// not sent to.
+class ActorRef[-M: Sendable](private val send: @sendable (M) -> unit, val name: string, val number: long, private val end: Future[Ending]): Sendable
     // Puts `message` in the actor's mailbox and returns at once: it never waits and never fails.
-    // Messages one sender tells one actor are handled in the order they were told.
+    // Messages one sender tells one actor are handled in the order they were told; a message told to
+    // an actor that has ended is dropped.
     tell(message: M) = send(message)
+
+    // The future of how the actor ends, complete once it has, its children and its `stopping` block
+    // done. `main` waits for the actor that runs the program with `spawn(App()).ended().await()`.
+    ended() -> Future[Ending] = end
 
 // Two references are equal where they refer to the same actor.
 impl[M] Eq for ActorRef[M]
@@ -155,11 +345,201 @@ impl[M: Sendable] Display for ActorRef[M]
 
 // Starts an actor of `behaviour` on `executor`, the shared pool unless another is given, and gives
 // back its reference at once. Its start runs on the executor's workers, and messages told before it
-// has finished wait behind it. The Sysl handles `behaviour` reaches that the calling code owns are
-// the actor's from then on.
+// has finished wait behind it. Started by the code of an actor, it is that actor's child; started
+// elsewhere, it is a top-level actor. The Sysl handles `behaviour` reaches that the calling code owns
+// are the actor's from then on.
 spawn[M: Sendable](behaviour: Behaviour[M], executor: Executor = Executor.shared()) -> ActorRef[M]
-    val actor = Actor(behaviour, executor)
+    val parent = registry.current()
+    val actor = Actor(behaviour, executor, parent)
     handOver(behaviour, currentOwner(), actor.owner)
-    val ref = ActorRef[M](m -> actor.post(m), behaviour.name, actor.number)
+    val ref = ActorRef[M](m -> actor.post(m, None), behaviour.name, actor.number, actor.end.future)
+    registry.enrol(actor.owner, actor)
+    if parent is Some(p) then p.adopt(actor)
     actor.start(ref)
     ref
+
+// A timer of an actor, which `after` and `every` give back: `cancel()` stops it, and a message it has
+// sent that the actor has not yet handled is dropped. An actor's timers are all cancelled when it
+// ends.
+class Timer(private val guard: Guard): Sendable
+    // Stops the timer, from any thread; a timer that is done already stays done.
+    cancel()
+        guard.cancel()
+        clock.remove(guard)
+
+// A timer's next time: when it is due, in microseconds of the monotonic clock, the order it was set
+// in among timers due at the same time, the message it sends, and for a repeating one its interval.
+private class Due(val at: long, val order: long, val guard: Guard, val fire: @sendable () -> unit, val interval: long): Sendable
+
+// The thread that keeps every actor's timers, started with the first timer: it sleeps until the
+// earliest is due, sends its message, and sets a repeating timer again an interval after it fired.
+private class Clock(): Sendable
+    private val due = Mutex(Buffer[Due]())
+    private val changed = due.condition()
+    private val orders = Atomic[long](0)
+
+    // Sets a timer due `delay` microseconds from now.
+    add(guard: Guard, delay: long, interval: long, fire: @sendable () -> unit)
+        val d = Due(time.now().micros + delay, orders.add(1), guard, fire, interval)
+        val ready = changed
+        due.with(q ->
+            q.append(d)
+            ready.notify())
+
+    // Forgets the timer of `guard`.
+    remove(guard: Guard)
+        val id = guard.id
+        due.with(q -> removeTimer(q, id))
+
+    // The thread's life: fire each timer as it falls due, in the order of their times.
+    run()
+        loop
+            for d in next()
+                if d.guard.isLive()
+                    d.fire()
+                    if d.interval > 0 && d.guard.isLive() then add(d.guard, d.interval, d.interval, d.fire)
+
+    // Waits until a timer is due, and takes out every one due by then, earliest first.
+    private next() -> Vector[Due]
+        val ready = changed
+        due.with(q -> waitDue(q, ready))
+
+// Takes the timer of the guard numbered `id` out of `q`.
+private removeTimer(q: Buffer[Due], id: long)
+    var i = 0
+    while i < q.length()
+        if q(i).guard.id == id
+            q.remove(i)
+            return
+        i += 1
+
+// Waits, `ready` being the condition of the mutex that holds `q`, until a timer of `q` is due, and
+// takes out every one due by then.
+private waitDue(q: Buffer[Due], ready: Condition) -> Vector[Due]
+    loop
+        if q.isEmpty() then ready.wait()
+        else
+            val now = time.now().micros
+            var first = q(0)
+            for d in q do if earlier(d, first) then first = d
+            if first.at <= now then return takeDue(q, now)
+            ready.waitFor((first.at - now + 999) / 1000)
+
+// Whether `a` fires before `b`.
+private earlier(a: Due, b: Due) -> bool = a.at < b.at || (a.at == b.at && a.order < b.order)
+
+// Takes the timers of `q` due by `now` out of it, earliest first.
+private takeDue(q: Buffer[Due], now: long) -> Vector[Due]
+    var taken: Vector[Due] = Vector()
+    var i = 0
+    while i < q.length()
+        if q(i).at <= now then taken = taken :+ q.remove(i)
+        else i += 1
+    taken.sortWith((a, b) -> if earlier(a, b) then -1 elif earlier(b, a) then 1 else 0)
+
+private startClock() -> Clock
+    val c = Clock()
+    threads.spawn(() -> c.run())
+    c
+
+private lazy val clock: Clock = startClock()
+
+// An actor's own view of its life, for its own code alone: an `actor` declaration's body, arms,
+// methods and `stopping` block reach these as their own, and a behaviour's start makes one from the
+// reference it is given. Each traps where code other than the actor's own calls it.
+//
+//     Behaviour[Tick]("Ticker", me ->
+//         val ctx = ActorContext(me)
+//         ctx.every(time.seconds(1), Tick)
+//         t -> ...)
+open class ActorContext[M: Sendable](private val actorRef: ActorRef[M])
+    private val actorCell: Actor[M] = own(actorRef)
+
+    // Ends the actor once the message it is handling is handled; what is left in its mailbox is
+    // dropped, and its children end first.
+    stop()
+        check("stop")
+        actorCell.stopSelf()
+
+    // Ends `child`, one of this actor's own children, once the message it is handling is handled; for
+    // the actor itself, `stop()`. An actor that has ended stays ended; stopping any other actor traps,
+    // since an actor that should end on request is sent a message saying so.
+    stop(child: ActorRef[Nothing])
+        check("stop")
+        if child.number == actorRef.number then return actorCell.stopSelf()
+        for c in actorCell.children.load()
+            if c.id() == child.number then return c.requestStop()
+        if child.ended().isCompleted() then return ()
+        fail(s"$actorRef stops $child, which is not one of its children: an actor that should end on request is sent a message saying so")
+
+    // Asks for `message` in this actor's own mailbox when `actor` ends, for whatever reason, at once
+    // where it has ended already. Watching an actor again replaces the earlier watch, and an actor
+    // watching itself is told nothing, since its mailbox ends with it.
+    watch(actor: ActorRef[Nothing], message: M)
+        val a = actorCell
+        if watching(actor) is Some(g) then actor.ended().onComplete(_ -> a.post(message, Some(g)))
+
+    // Asks for `f` of how `actor` ended in this actor's own mailbox when it ends; `f` runs where the
+    // end is known, so it is `@sendable`.
+    watch(actor: ActorRef[Nothing], f: @sendable (Ending) -> M)
+        val a = actorCell
+        if watching(actor) is Some(g) then actor.ended().onComplete(e -> a.post(f(e), Some(g)))
+
+    // Stops asking to be told of `actor`'s end; a message about it not yet handled is dropped.
+    unwatch(actor: ActorRef[Nothing])
+        check("unwatch")
+        if actorCell.watches.get(actor.number) is Some(g)
+            g.cancel()
+            actorCell.watches.remove(actor.number)
+
+    // Sends the actor `message` once `delay` has passed.
+    after(delay: Duration, message: M) -> Timer
+        check("after")
+        timer(delay, time.zero(), message)
+
+    // Sends the actor `message` each time `interval` passes, until the timer is cancelled or the actor
+    // ends; the interval must be more than zero.
+    every(interval: Duration, message: M) -> Timer
+        check("every")
+        if interval <= time.zero() then fail(s"$actorRef sets a timer to repeat every $interval, which is not more than zero")
+        timer(interval, interval, message)
+
+    // This actor's children that have not ended, in the order they started.
+    children() -> Vector[ActorRef[Nothing]]
+        check("children")
+        actorCell.children.load().filter(c -> !c.isGone()).map(c -> c.ref())
+
+    // The actor whose code started this one, where one did.
+    parent() -> Option[ActorRef[Nothing]]
+        check("parent")
+        actorCell.parent.map(p -> p.ref())
+
+    // Runs `f` when the actor ends, after its children have ended; an `actor` declaration's
+    // `stopping` block is one. Several run in the order they were given.
+    onStopping(f: () -> unit)
+        check("onStopping")
+        actorCell.stoppings.append(f)
+
+    // The guard of a new watch of `actor`, replacing any earlier one; none where it is this actor.
+    private watching(actor: ActorRef[Nothing]) -> Option[Guard]
+        check("watch")
+        if actor.number == actorRef.number then return None
+        if actorCell.watches.get(actor.number) is Some(old) then old.cancel()
+        val g = Guard(actor.number, true)
+        actorCell.watches(actor.number) = g
+        Some(g)
+
+    private timer(delay: Duration, interval: Duration, message: M) -> Timer
+        val g = Guard(-1, interval == time.zero())
+        actorCell.timers(g.id) = g
+        val a = actorCell
+        clock.add(g, delay.micros, interval.micros, () -> a.post(message, Some(g)))
+        Timer(g)
+
+    private check(what: string)
+        if !actorCell.running() then fail(s"`$what` of $actorRef is called from code other than the actor's own")
+
+// The actor `ref` refers to, whose code is running.
+private own[M: Sendable](ref: ActorRef[M]) -> Actor[M] = registry.current() match
+    Some(a: Actor[M]) -> if a.number == ref.number then a else fail(s"an `ActorContext` of $ref is made by code other than the actor's own")
+    _ -> fail(s"an `ActorContext` of $ref is made by code other than the actor's own")
