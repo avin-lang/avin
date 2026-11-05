@@ -126,13 +126,22 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
                 if f.crossing.form is Handle(_)
                     held[handle_index(&w, f.crossing)] = true
                     holds = true
-    // A handle a callback answers goes into Sysl as a mirror's field does, checked the same way.
+    // A handle a callback answers goes into Sysl as a mirror's field does, checked the same way, and
+    // so does each handle of a collection a binding passes, whose shares are then made the slice the
+    // Sysl parameter asks for.
+    var listed: Buf[bool] = buf()
+    for _ in 0..<w.mirrors.len()
+        listed.push(false)
     for b in bindings
         for p in b.params
             if p.form is Callback(_, result, _, _, _)
                 if result.form is Handle(_)
                     held[handle_index(&w, result)] = true
                     holds = true
+            if handle_elements(p) is Some(e)
+                held[handle_index(&w, e)] = true
+                listed[handle_index(&w, e)] = true
+                holds = true
     put(&w, "module avin.shims\n\nimport avin.rt.{Context, stop_in_binding, text_bytes, text_length, text_of}\nimport sysl.raw.str_cast\n")
     if holds then put(&w, "import avin.rt.handle_claim\n")
     if converts then put(&w, "import avin.rt.{Frame, allocate, array_elements, array_length, descriptor_of, new_array}\nimport sysl.raw.ptr_cast\nimport sysl.slices.copy\n")
@@ -148,6 +157,8 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
     var collects = false
     for c in w.ins
         if c.form is Elements(_, _) then collects = true
+    for l in listed
+        if l then collects = true
     for c in w.outs
         if c.form is Elements(_, _) then collects = true
     if collects || owns_bytes then put(&w, "import sysl.buf.{Buf, buf}\n")
@@ -160,9 +171,14 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
         put(&w, s"import ${bindings[i].target} as bound_$i\n")
     for m in 0..<w.mirrors.len()
         w.mirror_lines.push(MirrorLines(m, w.line, w.line))
-        put(&w, s"import ${w.mirrors[m].target} as mirror_$m\n")
+        // An instance of a generic Sysl type imports the type, and is spelled with its arguments.
+        val (path, arguments) = instance_parts(w.mirrors[m].target)
+        if arguments.len() == 0 then put(&w, s"import ${w.mirrors[m].target} as mirror_$m\n")
+        else put(&w, s"import $path as instance_$m\n")
     put(&w, "\n// An Avin string's bytes, copied into a Sysl string.\nprivate text_in(p: *u8) -> string = str_cast(text_bytes(p)[0..<text_length(p)])\n")
     put(&w, IntegerHelper)
+    // A handle whose Sysl reference is a trait object keeps it in a cell of its own.
+    if handles.len() > 0 then put(&w, "\nextern \"calloc\" shim_calloc(n: usize, size: usize) -> *u8\nextern \"free\" shim_free(p: *u8)\n")
     if converts then put(&w, ConversionHelpers)
     // A handle passed to Sysl as a parameter, other than a method's receiver, is read by helpers of
     // its own.
@@ -175,7 +191,7 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
             if b.params[k].form is Callback(_, result, _, _, _)
                 if result.form is Handle(_) then passed[handle_index(&w, result)] = true
     for m in 0..<w.mirrors.len()
-        if w.mirrors[m].finalizer != "" then handle_lines(&w, m, passed[m] || held[m], held[m])
+        if w.mirrors[m].finalizer != "" then handle_lines(&w, m, passed[m] || held[m], held[m], listed[m])
     if calls_back then callback_declarations(&w, bindings)
     for i in 0..<bindings.len()
         val b = bindings[i]
@@ -183,6 +199,7 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
         first.push(w.line)
         put(&w, s"// ${b.name}\n@export(\"${b.shim}\")\nshim_$i(ctx: *Context")
         var args: Buf[string] = buf()
+        var lists: Buf[string] = buf()
         var handles: Buf[PassedHandle] = buf()
         // A handle's method takes the handle first, and reads the Sysl value it holds.
         val receiver = if b.reach is TopLevel then None else Some(handle_index(&w, b.params[0]))
@@ -193,9 +210,16 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
                 continue
             if *p.ty is Unit
                 args.push("()")
+                lists.push("")
                 continue
             put(&w, s", a$k: ${crossing_c_side(p)}")
-            if p.form is Callback(_, _, _, _, _) then args.push(callback_lambda(&w, b, i, k))
+            // A collection of handles is converted into the shares of their Sysl values, which are
+            // made the slice the Sysl parameter asks for at the call.
+            lists.push(handle_elements(p) match
+                Some(e) -> (if p.form is Elements(_, true) then "given_all_" else "given_reading_") + s"${handle_index(&w, e)}"
+                None -> "")
+            if handle_elements(p) is Some(_) then args.push(s"in_${function_of(&w, p, false).unwrap()}(ctx, a$k, ep$k)")
+            elif p.form is Callback(_, _, _, _, _) then args.push(callback_lambda(&w, b, i, k))
             elif p.form is Handle(_)
                 handles.push(PassedHandle(args.len(), handle_index(&w, p), s"a$k"))
                 args.push("")
@@ -219,7 +243,7 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
                 put(&w, s"e${k}_$j")
             put(&w, s"]\n    val ep$k: **u8 = ptr_cast(&es$k)")
         receiver match
-            Some(m) -> put(&w, s"\n    val s: *Slot_$m = ptr_cast(a0)")
+            Some(m) -> put(&w, s"\n    val s = cell_$m(a0)")
             None -> ()
         // Each function passed is rooted for as long as Sysl keeps the closure made of it.
         for k in 0..<b.params.len()
@@ -240,7 +264,7 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
             put(&w, s"\n    val s$k = $made\n    var root$k = Root(Frame(ctx.top, 1usize), a$k)\n    ctx.top = ptr_cast(&root$k)")
         // `close()` gives back the handle's share of its Sysl value, and the handle holds nothing.
         if b.reach is Release
-            put(&w, "\n    release(s.r)\n")
+            put(&w, s"\n    give_back_${receiver.unwrap()}(a0)\n")
             last.push(w.line - 1)
             continue
         var callee = b.reach match
@@ -269,7 +293,7 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
                         if t == m then seen = true
                     if !seen then types.push(m)
         put(&w, "\n")
-        call_arms(&w, b, callee, args, handles, types, 0, buf(), receiver is Some(_), fills, "    ")
+        call_arms(&w, b, callee, args, lists, handles, types, 0, buf(), receiver is Some(_), fills, "    ")
         for k in 0..<b.params.len()
             if b.params[k].form is Callback(_, _, _, _, _) then callback_functions(&w, b, i, k)
         last.push(w.line - 1)
@@ -301,7 +325,31 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
             m -= 1
             from = from.replace_all(s"mirror_$m", w.mirrors[m].target)
         unconverted.push(s"`${type_name(c.ty)}` is made from a Sysl $from, and the value is none of these")
-    ShimSource(w.out.finish(), imports, first, last, w.mirrors, w.mirror_lines, unconverted, w.passing)
+    // A handle on an instance of a generic Sysl type, whose name a trait's instance cannot be given,
+    // is spelled as the instance wherever the shim names its type.
+    var text = w.out.finish()
+    for m in 0..<w.mirrors.len()
+        val (_, arguments) = instance_parts(w.mirrors[m].target)
+        if arguments.len() == 0 then continue
+        var spelled: Buf[string] = buf()
+        for a in arguments
+            spelled.push(sysl_instance_argument(a.trim()))
+        text = replace_word(text, s"mirror_$m", s"instance_$m[${comma_list(spelled)}]")
+    ShimSource(text, imports, first, last, w.mirrors, w.mirror_lines, unconverted, w.passing)
+
+// `text` with each `word` that is a whole word, not the start of a longer one, replaced by `by`.
+private replace_word(text: string, word: string, by: string) -> string
+    var out = str_builder()
+    val pieces = text.split(word)
+    for i in 0..<pieces.len
+        if i == 0
+            out.push(pieces[i])
+            continue
+        val next = pieces[i]
+        val longer = next.bytes.len > 0 && is_word_byte(next.bytes[0])
+        out.push(if longer then word else by)
+        out.push(next)
+    out.finish()
 
 // The entries through which the shims call the functions they are given, which the program defines,
 // and the frames that keep a callback's function and the objects made of its arguments while it runs:
@@ -419,7 +467,7 @@ private callback_functions(w: *ShimWriter, b: &MirBinding, i: usize, k: usize)
     put(w, s"    val r = $call\n    ctx.top = held.frame.prev\n")
     if result.form is Handle(_)
         val m = handle_index(w, result)
-        put(w, s"    slot_$m(held_$m(ctx, r)).r\n")
+        put(w, s"    cell_$m(held_$m(ctx, r)).r\n")
     else put(w, "    " + into_expr(w, result, "r", "ep", base) + "\n")
 
 // Sysl's words for a callback's parameter whose type is not the one Sysl calls the closure with,
@@ -450,14 +498,15 @@ private struct PassedHandle
 // The call of binding `b`'s Sysl function `callee` with `args`, and the conversion of its result,
 // written once for each choice of the handles' types `types` from `depth` on having a destructor or
 // not: `dropped` holds the ones taken so far to have one. `method` says the callee is a handle's
-// method.
-private call_arms(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[string], handles: Buf[PassedHandle], types: Buf[usize], depth: usize, dropped: Buf[usize], method: bool, fills: Buf[usize], indent: string)
+// method. A non-empty `lists[k]` is the helper that makes the shares a collection of handles was
+// converted into the slice its Sysl parameter asks for.
+private call_arms(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[string], lists: Buf[string], handles: Buf[PassedHandle], types: Buf[usize], depth: usize, dropped: Buf[usize], method: bool, fills: Buf[usize], indent: string)
     if depth == types.len()
         var given: Buf[string] = buf()
         var wrappers: Buf[string] = buf()
         for k in 0..<args.len()
             var arg = args[k]
-            var wrapper = ""
+            var wrapper = lists[k]
             for h in handles
                 if h.arg != k then continue
                 var counted = false
@@ -465,9 +514,9 @@ private call_arms(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[stri
                     if m == h.mirror then counted = true
                 // A call that waits takes the handle's reference before it, into a local whose type
                 // is known, and the value the parameter asks for is made from that local at the call.
-                if counted then arg = s"slot_${h.mirror}(${h.name}).r"
+                if counted then arg = s"cell_${h.mirror}(${h.name}).r"
                 elif b.blocking
-                    arg = s"slot_${h.mirror}(${h.name}).r"
+                    arg = s"cell_${h.mirror}(${h.name}).r"
                     wrapper = s"given_${h.mirror}"
                 else arg = s"passed_${h.mirror}(${h.name})"
             // A callback answering a handle of a type with a destructor answers its counted reference.
@@ -482,10 +531,10 @@ private call_arms(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[stri
     for d in dropped
         with.push(d)
     with.push(m)
-    put(w, indent + s"if const mirror_$m: Drop\n")
-    call_arms(w, b, callee, args, handles, types, depth + 1, with, method, fills, indent + "    ")
+    put(w, indent + s"if const counted_$m()\n")
+    call_arms(w, b, callee, args, lists, handles, types, depth + 1, with, method, fills, indent + "    ")
     put(w, indent + "else\n")
-    call_arms(w, b, callee, args, handles, types, depth + 1, dropped, method, fills, indent + "    ")
+    call_arms(w, b, callee, args, lists, handles, types, depth + 1, dropped, method, fills, indent + "    ")
 
 // The call of binding `b`'s Sysl function `callee` with `args`, and the conversion of its result, at
 // `indent`. `method` says the callee is a handle's method; `fills` are the parameters whose arrays the
@@ -711,30 +760,43 @@ private mirror_of(w: *ShimWriter, c: &Crossing) -> Option[usize]
 // The position of the handle `c`'s type is.
 private handle_index(w: *ShimWriter, c: &Crossing) -> usize = mirror_of(w, c).unwrap()
 
-// What a handle's object is to Sysl: a word holding the counted reference to its Sysl value, which
-// is zero, naming nothing, from when the object is made until the reference is stored, and again
-// once `close()` has given it back. The collector does not trace the word; the finalizer the handle's
-// descriptor names gives the reference back when the object is freed still holding it. Giving back a
-// place that holds nothing does nothing. Where the handle is `passed` to Sysl as a parameter, it is
-// read by two helpers: one answering its slot, whose reference a parameter of a type with a
-// destructor shares, and one answering it as the parameter's type `P` asks, a pointer to the value
-// or the value itself, which `P` is when the parameter is the value or a counted reference to one.
-// Where a mirror's field holding the handle goes into Sysl, it is `held`: a third helper checks the
-// handle as compiled code checks one passed as a parameter, stopping the program at the call where it
-// belongs to another thread or holds nothing, and the field is then passed as a parameter is.
-private handle_lines(w: *ShimWriter, m: usize, passed: bool, held: bool)
+// What a handle's object is to Sysl: a word naming its Sysl value, which is zero, naming nothing, from
+// when the object is made until the value is stored, and again once `close()` has given it back, and
+// a word naming its owner. The first word is the counted reference to the value itself, except where
+// the reference is a trait object, which takes two words: it is then kept in a cell of its own, which
+// the first word points at, so that every handle's object has the same two words. The collector does
+// not trace the first word; the finalizer the handle's descriptor names gives the reference back when
+// the object is freed still holding it. Giving back a place that holds nothing does nothing. A type
+// with a destructor, and a trait, is always held by a counted reference, which is what `counted`
+// asks. Where the handle is `passed` to Sysl as a parameter, it is read by two helpers: one answering
+// it as the parameter's type `P` asks, a pointer to the value or the value itself, which `P` is when
+// the parameter is the value or a counted reference to one, and one answering the same of a
+// reference already taken. Where a mirror's field or a collection holding the handle goes into Sysl,
+// it is `held`: a third helper checks the handle as compiled code checks one passed as a parameter,
+// stopping the program at the call where it belongs to another thread or holds nothing. Where a
+// collection of the handles is a binding's parameter, they are `listed`: the shares the collection's
+// conversion takes are made the slice the Sysl parameter asks for.
+private handle_lines(w: *ShimWriter, m: usize, passed: bool, held: bool, listed: bool)
     val start = w.line + 1
-    put(w, s"\n// The handle `${w.mirrors[m].name}`'s object.\nprivate struct Slot_$m\n    r: &mirror_$m\n    owner: u64\n")
-    put(w, s"\n@export(\"${w.mirrors[m].finalizer}\")\nfinalize_$m(p: *u8, heap: *u8)\n    val s: *Slot_$m = ptr_cast(p)\n    release(s.r)\n")
+    val name = w.mirrors[m].name
+    put(w, s"\n// The handle `$name`'s object.\nprivate struct Slot_$m\n    word: *u8\n    owner: u64\n")
+    put(w, s"\n// Where the handle `$name`'s counted reference is kept.\nprivate struct Cell_$m\n    r: &mirror_$m\n")
+    put(w, s"\n// Whether a reference to the handle's Sysl type takes two words, a trait object's.\nprivate const wide_$m() -> bool = sizeof(&mirror_$m) > sizeof(*u8)\n")
+    put(w, s"\n// Whether the handle's Sysl type is always held by a counted reference.\nprivate const counted_$m() -> bool\n    if const wide_$m()\n        true\n    elif const mirror_$m: Drop\n        true\n    else\n        false\n")
+    put(w, s"\nprivate cell_$m(p: *u8) -> *Cell_$m\n    if const wide_$m()\n        val s: *Slot_$m = ptr_cast(p)\n        ptr_cast(s.word)\n    else\n        ptr_cast(p)\n")
+    put(w, s"\nprivate hold_$m[V](ctx: *Context, o: *u8, v: V)\n    val s: *Slot_$m = ptr_cast(o)\n    if const wide_$m()\n        s.word = shim_calloc(1usize, sizeof(Cell_$m))\n        if s.word == null then stop_in_binding(ctx, \"out of memory\")\n    cell_$m(o).r = v\n    s.owner = ctx.owner\n")
+    put(w, s"\nprivate give_back_$m(p: *u8)\n    if const wide_$m()\n        val s: *Slot_$m = ptr_cast(p)\n        if s.word == null then return\n        release(cell_$m(p).r)\n        shim_free(s.word)\n        s.word = null\n    else\n        release(cell_$m(p).r)\n")
+    put(w, s"\n@export(\"${w.mirrors[m].finalizer}\")\nfinalize_$m(p: *u8, heap: *u8) = give_back_$m(p)\n")
     w.mirror_lines.push(MirrorLines(m, start, w.line - 1))
     if !passed then return
     val helpers = w.line + 1
-    put(w, s"\nprivate slot_$m(p: *u8) -> *Slot_$m = ptr_cast(p)\n")
-    put(w, s"\nprivate passed_$m[P](p: *u8) -> P\n    val s: *Slot_$m = ptr_cast(p)\n    if const P::Kind == Kind.Ref\n        s.r\n    elif const P::Kind == Kind.Pointer\n        &*s.r\n    else\n        *s.r\n")
+    put(w, s"\nprivate passed_$m[P](p: *u8) -> P\n    val s = cell_$m(p)\n    if const P::Kind == Kind.Ref\n        s.r\n    elif const P::Kind == Kind.Pointer\n        &*s.r\n    else\n        *s.r\n")
     put(w, s"\nprivate given_$m[P](r: &mirror_$m) -> P\n    if const P::Kind == Kind.Ref\n        r\n    elif const P::Kind == Kind.Pointer\n        &*r\n    else\n        *r\n")
     if held
-        val name = w.mirrors[m].name
-        put(w, s"\nprivate held_$m(ctx: *Context, p: *u8) -> *u8\n    val s: *Slot_$m = ptr_cast(p)\n    if s.owner != ctx.owner && !handle_claim(ctx, p) then stop_in_binding(ctx, \"`$name` belongs to another thread\")\n    val word: *usize = ptr_cast(p)\n    if word[0] == 0 then stop_in_binding(ctx, \"`$name` is closed\")\n    p\n")
+        put(w, s"\nprivate held_$m(ctx: *Context, p: *u8) -> *u8\n    val s: *Slot_$m = ptr_cast(p)\n    if s.owner != ctx.owner && !handle_claim(ctx, p) then stop_in_binding(ctx, \"`$name` belongs to another thread\")\n    if s.word == null then stop_in_binding(ctx, \"`$name` is closed\")\n    p\n")
+    if listed
+        put(w, s"\nprivate given_all_$m[E](s: []&mirror_$m) -> []E\n    if const E::Kind == Kind.Ref\n        s\n    else\n        var b: Buf[E] = buf()\n        for r in s do b.push(given_$m(r))\n        b.view()\n")
+        put(w, s"\nprivate given_reading_$m[E](s: []&mirror_$m) -> []const E = given_all_$m[E](s)\n")
     w.passing.push(MirrorLines(m, helpers, w.line - 1))
 
 // The Sysl type a value of `c`'s type is converted to. A collection goes into Sysl as a slice, and an
@@ -821,6 +883,12 @@ private spellings(w: *ShimWriter, c: &Crossing, generic: bool, n: *usize) -> Buf
             out.push("&" + sysl_type(w, c))
         _ -> out.push(sysl_type(w, c))
     out
+
+// The handles' crossing where `c` is a collection of them, which goes into Sysl as the shares of
+// their Sysl values.
+private handle_elements(c: &Crossing) -> Option[&Crossing] = c.form match
+    Elements(element, _) -> if element.form is Handle(_) then Some(element) else None
+    _ -> None
 
 // Whether a value of `c`'s type holds a handle, so that its conversion out of Sysl takes whatever
 // Sysl type it is called with: a value or a counted reference, which a type with a destructor can
@@ -950,7 +1018,7 @@ private construction_arms(w: *ShimWriter, c: &Crossing, v: CrossVariant, args: B
             var arg = args[k]
             for h in handles
                 if h.arg != k then continue
-                arg = if has_mirror(dropped, h.mirror) then s"slot_${h.mirror}(${h.name}).r" else s"passed_${h.mirror}(${h.name})"
+                arg = if has_mirror(dropped, h.mirror) then s"cell_${h.mirror}(${h.name}).r" else s"passed_${h.mirror}(${h.name})"
             given.push(arg)
         put(w, indent + prefix + construction(w, c, v, given) + "\n")
         return
@@ -959,7 +1027,7 @@ private construction_arms(w: *ShimWriter, c: &Crossing, v: CrossVariant, args: B
     for d in dropped
         with.push(d)
     with.push(m)
-    put(w, indent + s"if const mirror_$m: Drop\n")
+    put(w, indent + s"if const counted_$m()\n")
     construction_arms(w, c, v, args, handles, types, depth + 1, with, prefix, indent + "    ")
     put(w, indent + "else\n")
     construction_arms(w, c, v, args, handles, types, depth + 1, dropped, prefix, indent + "    ")
@@ -980,7 +1048,7 @@ private out_function(w: *ShimWriter, k: usize)
     // counted reference both convert, and Sysl checks each where it is called.
     if c.form is Handle(_)
         val m = handle_index(w, c)
-        put(w, s"private out_$k[V](ctx: *Context, v: V, ds: **u8) -> *u8\n    val o = allocate(ctx, ptr_cast(ds[0]))\n    val s: *Slot_$m = ptr_cast(o)\n    s.r = v\n    s.owner = ctx.owner\n    o\n")
+        put(w, s"private out_$k[V](ctx: *Context, v: V, ds: **u8) -> *u8\n    val o = allocate(ctx, ptr_cast(ds[0]))\n    hold_$m(ctx, o, v)\n    o\n")
         w.mirror_lines.push(MirrorLines(m, start, w.line - 1))
         return
     // A mirror is its one Sysl type, whatever its fields hold.
@@ -1044,8 +1112,11 @@ private out_overload(w: *ShimWriter, k: usize, c: &Crossing, spelling: string, p
 // library's function among the layouts, which neither allocates nor collects.
 private in_elements(w: *ShimWriter, k: usize, c: &Crossing, element: &Crossing, vector: bool)
     val own = if vector then 4usize else 1usize
-    put(w, s"\n// ${type_name(c.ty)} into Sysl.\nprivate in_$k(ctx: *Context, p: *u8, ds: **u8) -> []${sysl_type(w, element)}\n")
-    put(w, s"    var b: Buf[${sysl_type(w, element)}] = buf()\n")
+    // A collection of handles becomes the shares of their Sysl values, each handle checked as one
+    // passed by itself is.
+    val shared = if element.form is Handle(_) then s"&mirror_${handle_index(w, element)}" else sysl_type(w, element)
+    put(w, s"\n// ${type_name(c.ty)} into Sysl.\nprivate in_$k(ctx: *Context, p: *u8, ds: **u8) -> []$shared\n")
+    put(w, s"    var b: Buf[$shared] = buf()\n")
     var indent = "    "
     if vector
         put(w, "    val length_of: *extern(*Context, *u8) -> i32 = ptr_cast(ds[2])\n")
@@ -1062,7 +1133,11 @@ private in_elements(w: *ShimWriter, k: usize, c: &Crossing, element: &Crossing, 
         put(w, indent + "for _ in 0..<array_length(a) do b.push(())\n")
     else
         put(w, indent + s"val e: *${crossing_c_side(element)} = ptr_cast(array_elements(a))\n")
-        put(w, indent + "for i in 0..<array_length(a) do b.push(" + into_expr(w, element, "e[i]", "ds", own) + ")\n")
+        val made = if element.form is Handle(_)
+            val m = handle_index(w, element)
+            s"cell_$m(held_$m(ctx, e[i])).r"
+        else into_expr(w, element, "e[i]", "ds", own)
+        put(w, indent + "for i in 0..<array_length(a) do b.push(" + made + ")\n")
     put(w, "    b.view()\n")
 
 // The conversion out of Sysl of the `k`th collection that crosses that way: a new array laid out by
@@ -1252,14 +1327,14 @@ shim_diagnostics(output: string, shim: ShimSource, bindings: Buf[MirBinding], un
         if passing is Some(j)
             val mirror = shim.mirrors[j]
             var r = report()
-            r.add(error(mirror.span, s"the Sysl handle `${mirror.name}` is passed to a Sysl parameter that does not take `${mirror.target}`: $message"))
-            rendered = rendered + r.render(units[mirror.unit].src)
+            r.add(error(mirror.span, s"the Sysl handle `${mirror.name}` is passed to a Sysl parameter that does not take `${mirror.target}`: ${listed_message(message)}"))
+            rendered = once(rendered, r.render(units[mirror.unit].src))
         elif m is Some(j)
             val mirror = shim.mirrors[j]
             var r = report()
             val what = if mirror.finalizer == "" then "mirror" else "handle"
             r.add(error(mirror.span, s"the Sysl $what `${mirror.name}` does not match `${mirror.target}`: $message"))
-            rendered = rendered + r.render(units[mirror.unit].src)
+            rendered = once(rendered, r.render(units[mirror.unit].src))
         else
             k match
                 Some(i) ->
@@ -1275,14 +1350,30 @@ shim_diagnostics(output: string, shim: ShimSource, bindings: Buf[MirBinding], un
                     // binding's parameter has to say.
                     if message.contains("shared between two domains") && message.contains("avin.rt.Callback")
                         message = "Sysl may call the function it is given from another thread, so the parameter that takes it is marked `@threaded`"
-                    message = callback_parameter_message(message)
+                    message = listed_message(callback_parameter_message(message))
                     var r = report()
                     r.add(error(b.span, s"the Sysl binding `${b.name}` does not match `${b.target}`: $message"))
-                    rendered = rendered + r.render(units[b.unit].src)
+                    rendered = once(rendered, r.render(units[b.unit].src))
                 None -> unplaced = true
         message = ""
     if unplaced || rendered == "" then return "avin: Sysl could not build the bindings' shims:\n" + output
     rendered
+
+// The diagnostics `rendered` with `more` after them, unless they already hold it: Sysl reports a
+// mirror's or a handle's type at each line of the shim that names it, which says one thing.
+private once(rendered: string, more: string) -> string = if rendered.contains(more) then rendered else rendered + more
+
+// Sysl's words for a collection of handles whose slice is not the one the Sysl parameter takes,
+// `function 'avin.shims.given_all_0' should return []&A, but its body yields []&B`, said of the
+// collection, or whose slice is not what the parameter takes at all; any other message as it is.
+private listed_message(message: string) -> string
+    if message.starts_with("cannot infer the type argument 'E' of 'avin.shims.given_") then return "a collection of handles goes into Sysl as a slice, which the Sysl parameter does not take"
+    if !message.starts_with("function 'avin.shims.given_") then return message
+    val halves = message.split("' should return ")
+    if halves.len != 2 then return message
+    val types = halves[1].split(", but its body yields ")
+    if types.len != 2 then return message
+    s"the collection's handles go in as a `${types[1]}`, and the parameter takes a `${types[0]}`"
 
 // Sysl's diagnostic `message`, or when it says that no overload of a conversion out of Sysl takes the
 // value it is called with, what that conversion makes and from what; when it says an integer's

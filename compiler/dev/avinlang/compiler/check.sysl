@@ -6285,8 +6285,8 @@ private check_crossings(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
         if threaded && !(*t is Function(_, _)) then c.note(unit, p.pattern.span, "`@threaded` marks a parameter that takes a function, which Sysl may call from any thread")
         if p.by_name then c.note(unit, p.pattern.span, "a by-name parameter cannot cross to Sysl")
         elif *t is Function(ps, r) then check_callback_crossing(c, unit, p, ps, r)
-        elif is_handle(c, t) then ()
-        elif holds_handle(c, t) then c.note(unit, p.ty.span, s"`${type_name(t)}` cannot cross to Sysl: a Sysl handle goes back into Sysl only by itself, as a parameter or the receiver of its own methods")
+        elif is_handle(c, t) || is_handle_collection(c, t) then ()
+        elif holds_handle(c, t) then c.note(unit, p.ty.span, s"`${type_name(t)}` cannot cross to Sysl: a Sysl handle goes back into Sysl by itself, as a parameter or the receiver of its own methods, or as the elements of an `Array` or a `Vector` that is a parameter")
         elif !crosses_to_sysl(c, t) then c.note(unit, p.ty.span, s"`${type_name(t)}` cannot cross to Sysl; ${BoundaryTypes}")
     if result is Some(r)
         if !crosses_out_of_sysl(c, r)
@@ -6362,6 +6362,12 @@ private tuple_holds_handle(c: *Checker, t: &Type) -> bool = *t match
         false
     _ -> false
 
+/** Whether `t` is an `Array` or a `Vector` of Sysl handles, which a binding's parameter passes into
+ * Sysl as a slice of the handles' Sysl values. */
+private is_handle_collection(c: *Checker, t: &Type) -> bool = *t match
+    Class(k, _, args) -> (is_array_class(c.classes[k]) || is_vector_class(c.classes[k])) && args.len() == 1 && is_handle(c, args[0])
+    _ -> false
+
 /** Whether `t` is a Sysl handle itself. */
 private is_handle(c: *Checker, t: &Type) -> bool = *t match
     Class(k, _, _) -> handle_target(c.classes[k].decl) is Some(_)
@@ -6408,7 +6414,12 @@ private check_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
             if a.args[0].value.kind is StringLit(p) then target = Some(p)
         target match
             Some(p) ->
-                if !is_sysl_path(p) then c.note(unit, a.span, s"`@sysl` on a class names the Sysl type it is a handle on, by its module and name, as in `sysl.checksum.Crc32`; `$p` is not one")
+                val (path, arguments) = instance_parts(p)
+                if !is_sysl_path(path) || (p.contains("[") && arguments.len() == 0)
+                    c.note(unit, a.span, s"`@sysl` on a class names the Sysl type it is a handle on, by its module and name, as in `sysl.checksum.Crc32`, or an instance of a generic one, as in `sysl.buf.Buf[int]`; `$p` is not one")
+                for t in arguments
+                    if !instance_argument(t)
+                        c.note(unit, a.span, s"`${t.trim()}` cannot be a type argument of the Sysl type a handle is on: each is one Sysl type, an integer of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, or an `Option`, a `Result` or a tuple of these")
             None -> c.note(unit, a.span, "`@sysl` on a class takes one string, the module and name of the Sysl type it is a handle on, as in `@sysl(\"sysl.checksum.Crc32\")`")
     if !annotated then return
     if d.type_params.len() > 0 then c.note(unit, d.type_params[0].span, "a Sysl handle has no type parameters: it holds one Sysl type")
@@ -6559,6 +6570,73 @@ private holds_mirror(c: *Checker, t: &Type, target: usize, seen: *Buf[usize]) ->
         for f in v.fields
             if holds_mirror(c, f, target, seen) then return true
     false
+
+/** The Sysl type a handle's `@sysl` names, split into its module path and name and, where it is an
+ * instance of a generic type, as in `sysl.buf.Buf[int]`, its type arguments' text, each as written.
+ * Text that opens a bracket and does not close it at its end has no arguments. */
+instance_parts(p: string) -> (string, Buf[string])
+    var open = 0usize
+    while open < p.bytes.len && p.bytes[open] != u8('[')
+        open += 1
+    if open == p.bytes.len then return (p, buf())
+    if !p.ends_with("]") || open + 2 > p.bytes.len then return (p[..<open], buf())
+    (p[..<open], top_level_parts(p[open + 1..<p.bytes.len - 1]))
+
+// `text` split at each comma outside brackets and parentheses; nothing where it is empty or a part
+// is, or its brackets do not pair.
+private top_level_parts(text: string) -> Buf[string]
+    var parts: Buf[string] = buf()
+    var depth = 0
+    var start = 0usize
+    for i in 0..<text.bytes.len
+        val b = text.bytes[i]
+        if b == u8('[') || b == u8('(') then depth += 1
+        elif b == u8(']') || b == u8(')')
+            depth -= 1
+            if depth < 0 then return buf()
+        elif b == u8(',') && depth == 0
+            parts.push(text[start..<i])
+            start = i + 1
+    if depth != 0 then return buf()
+    parts.push(text[start..])
+    for q in parts
+        if q.trim() == "" then return buf()
+    parts
+
+// Whether `text` is a type argument a handle's Sysl type may be instantiated with: a boundary type
+// that is one Sysl type, spelled as Avin spells it.
+private instance_argument(text: string) -> bool
+    val t = text.trim()
+    t match
+        "i8" | "i16" | "i32" | "i64" | "int" | "long" | "byte" | "real" | "char" | "bool" | "unit" | "string" -> return true
+        _ -> ()
+    if t.starts_with("(") && t.ends_with(")")
+        val parts = top_level_parts(t[1..<t.bytes.len - 1])
+        if parts.len() < 2 then return false
+        for q in parts
+            if !instance_argument(q) then return false
+        return true
+    val (name, arguments) = instance_parts(t)
+    if name == "Option" && arguments.len() == 1 then return instance_argument(arguments[0])
+    if name == "Result" && arguments.len() == 2 then return instance_argument(arguments[0]) && instance_argument(arguments[1])
+    false
+
+/** A handle's type argument as Sysl spells it: Avin's `byte` is Sysl's `u8`, and every other word is
+ * the same in both. */
+sysl_instance_argument(text: string) -> string
+    var out = ""
+    var start = 0usize
+    var i = 0usize
+    while i <= text.bytes.len
+        val letter = i < text.bytes.len && is_word_byte(text.bytes[i])
+        if !letter
+            if text[start..<i] == "byte" then out = out + "u8" else out = out + text[start..<i]
+            if i < text.bytes.len then out = out + text[i..<i + 1]
+            start = i + 1
+        i += 1
+    out
+
+is_word_byte(b: u8) -> bool = b >= u8('a') && b <= u8('z') || b >= u8('A') && b <= u8('Z') || b == u8('_') || b >= u8('0') && b <= u8('9')
 
 // A module path and a name: two or more identifiers joined by dots.
 private is_sysl_path(p: string) -> bool
