@@ -58,6 +58,10 @@ reads from the innermost view out: `text("hi").padding(8).panel()` is a padded l
 | --- | --- |
 | `padding(n)`, `pad(top, right, bottom, left)` (each defaulting to 0), `padded()` | Inset on every side, on the sides named, or by the theme's padding |
 | `panel()` | On a surface the theme draws |
+| `background(color, radius = 0)` | The rectangle behind it filled with a [colour](#colours), its corners rounded by `radius` |
+| `border(color, width = 1, radius = 0, dash = 0)` | Outlined `width` thick inside the rectangle it was given, so nothing moves; dashes `dash` long where `dash` is not 0 |
+| `foreground(color)` | The text inside drawn in `color`; the innermost one in force wins |
+| `tinted(color)` | The controls inside in `color` where they name no `Role`: the theme's primary colour |
 | `textStyle(style)`, `fontSize(pt)` | The text inside at one of the theme's sizes (`Display`, `Title`, `Body`, `Caption`), or at `pt` points |
 | `frame(w, h)` | Exactly `w` by `h` |
 | `flex(n = 1)` | `n` shares of a column's leftover height or a row's leftover width; the last link of a chain |
@@ -75,6 +79,27 @@ stops the program at the call:
 
 ```text
 avin: trap: `View` is closed at main.avin:11:13
+```
+
+### Colours
+
+A colour is an `int` holding `0xRRGGBB`, as syslui draws it, so a hex literal is one: there is no
+alpha, since nothing in syslui composites. syslui takes it as a `u32`, which an Avin `int` reaches as
+any [integer parameter](/spec/sysl-bindings/#integer-parameters) does, converted with a check: a
+negative colour stops the program where the modifier was called.
+
+```text
+avin: trap: value out of range for u32 at main.avin:11:12
+```
+
+| Function | Colour |
+| --- | --- |
+| `rgb(r, g, b)` | Of the channels `r`, `g` and `b`, each from 0 to 255; a channel outside that range stops the program |
+| `mix(a, b, pct)` | `a` moved toward `b` by `pct` percent, channel by channel; a percentage outside 0 to 100 is taken as the nearer end |
+| `lighten(c, pct)`, `darken(c, pct)` | `c` moved toward white, or black, by `pct` percent |
+
+```text
+text("Saved").foreground(0xFFFFFF).padding(8).background(darken(0x3E9B5F, 20), 6)
 ```
 
 ## Controls
@@ -145,9 +170,6 @@ Unknown: nothing on screen is called 'nothing'
 
 ## What is not bound
 
-- **Colours.** syslui takes a colour as a `u32` parameter (`background`, `foreground`, `border`,
-  `tinted`), which a binding's integer parameter does not reach; a control's colour is chosen by its
-  `Role`, and a surface by `panel()`.
 - **A control writing the program's signal.** Sysl 0.9.0 gives a `&T` parameter a copy of a handle's
   value where the type has no destructor, so a switch, checkbox, radio, slider, text field or tab
   given a signal writes a copy; reading and setting a signal from Avin is unaffected. The next Sysl

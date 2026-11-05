@@ -2471,7 +2471,52 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- Proposed 2026-11-05 (built on branch `ui-int-params`; the rule itself decided on the user's
+  delegation in the brief): **A binding's integer parameter goes into whatever integer the Sysl
+  parameter is, with a check** ([Sysl bindings](/spec/sysl-bindings/#integer-parameters)). An Avin
+  `int`, `long`, `i8` or `i16` parameter reaches a Sysl parameter of any concrete integer type, `u8`
+  to `u64`, `usize` and the signed widths, converted in the shim; a value the Sysl type cannot hold
+  stops the program where the binding was called (`value out of range for u32`). A handle's method
+  converts the same way, and a blocking call converts with its thread safe for the collector,
+  making it running again before stopping the program. Why: syslui's colour modifiers take a `u32`
+  parameter, Avin has no unsigned integers (settled 2026-11-02), and the rule is the mirror image of
+  the integer result and the callback answer, so all three directions of an integer follow one
+  rule. Consequence: a `long` now reaches an `i32` parameter where its value fits, which was
+  rejected before. Alternatives weighed: converting only into unsigned types (two rules for one
+  shape); an `int` reinterpreted as the `u32`'s bits (a colour past `0x7FFFFFFF` written negative).
+- Proposed 2026-11-05 (branch `ui-int-params`): **An integer parameter is passed as the Avin type
+  itself where Sysl cannot infer a type for its conversion**: a parameter whose Sysl type is a type
+  parameter of a generic function (`same[T](x: T)`), and every integer parameter of a binding whose
+  call left any type argument uninferred (syslui's `slider[T](value: &Signal[T], lo: T, hi: T)`,
+  where the integer bounds decide `T`). The compiler learns this from Sysl's refusal and builds the
+  shims once more, as it does for a callback's answer. Why: a conversion needs a target type, and a
+  generic parameter has none until its arguments say. Alternatives weighed: converting the
+  parameters a generic call can still infer and passing only the stalled ones as they are (needs a
+  build per round of refusals); refusing such bindings (`slider` would be unbindable). Review with
+  the user: a binding to a Sysl function overloaded only by integer width now reaches the overload
+  Sysl picks for an uninferred integer argument, rather than the one matching the Avin type
+  exactly; no binding does this today.
+- Proposed 2026-11-05 (branch `ui-int-params`): **An integer an `Option`, a `Result`, a tuple or a
+  collection parameter holds is not converted**, and the binding is rejected with a sentence saying
+  so. Why: the conversion functions for these shapes are shared between bindings and spelled with
+  the Avin type's Sysl spelling; making each generic in its integers would make every nested
+  parameter an inference problem, for no binding that needs it yet. Alternative: converting them as
+  results are converted (the shape is there, the need is not).
+- Proposed 2026-11-05 (branch `ui-int-params`): **A colour in `ui` is an `int` holding
+  `0xRRGGBB`**, as syslui draws it, with `rgb(r, g, b)`, `mix`, `lighten` and `darken`
+  ([User interfaces](/spec/ui/#colours)). Why: syslui has no alpha, so a `0xRRGGBBAA` would carry a
+  channel nobody reads; every colour fits an `int`, which is what a hex literal is by default; and a
+  binding's parameter cannot take an Avin data type, so a `Color` type would need a wrapper around
+  every modifier. Alternatives weighed: a `long` (what `app`'s `ground` answers, but wider than any
+  colour); a `Color` data type with `rgb`/`rgba` (a wrapper per modifier, and an alpha syslui
+  ignores). Review with the user: `app`'s `ground` still answers a `long`; it could become an `int`
+  to match.
+- Proposed 2026-11-05 (branch `ui-int-params`): **A value narrower than 32 bits crosses the
+  boundary widened as the C convention says**: Avin marks a shim's `i8` and `i16` parameters and a
+  callback's narrow signed answer `signext`, and a byte or bool `zeroext`, which Sysl relies on. This
+  fixes a bug: a negative `i8` or `i16` computed at run time reached Sysl as a large positive value
+  (`-5` as `65531`). Alternatives weighed: passing every narrow integer as an `i32` and narrowing in
+  the shim (changes the type a generic Sysl parameter infers).
 
 ## Open
 
