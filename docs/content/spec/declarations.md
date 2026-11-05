@@ -428,8 +428,43 @@ data Option[+T]
 ```
 
 The single-line form declares a one-variant type whose variant has the type's name. Variants are
-constructors, not types: `Some(1)` has type `Option[int]`. A variant is a name of its module, so two
-data types of one module, in one file or in two, private or not, cannot have variants of one name.
+constructors, not types: `Some(1)` has type `Option[int]`. A variant is a name of its module, and
+several data types of one module, in one file or in several, may each have a variant of one name:
+
+```text
+data Slant
+    Normal
+    Italic
+
+data Weight
+    Normal
+    Bold
+
+heavy(w: Weight) -> bool = w match
+    Normal -> false
+    Bold -> true
+
+val s: Slant = Normal
+println(heavy(Normal))
+```
+
+A bare use of a shared name is the variant of the type expected where it is written: a parameter's
+type, an annotated binding's, a function's result, a field's, a collection's element, the other
+operand of a comparison (`w == Normal`), and in a pattern the type of the value matched, so a nested
+pattern decides each name by its field's type. A `match` is checked for coverage over the matched
+type's own variants. Where nothing expected decides it, the use is an error that names the types and
+the qualified forms:
+
+```text
+val a = Normal
+error: `Normal` is a variant of `Slant` and `Weight`, and nothing here expects one of those types: write `Slant.Normal` or `Weight.Normal`
+```
+
+Within one type each variant has its own name. A shared name is still one name of the module, so no
+function, module-level value or object of the module may have it, and a type's companion object may
+not have a name another type's variant has. From another module a shared name is reached as any
+variant is, `fonts.Normal` or by `import fonts.Normal`, and decided the same way; a private type's
+variant is not seen there, so where only one of the types is public its variant needs no deciding.
 
 A variant is also reached through its type, `Type.Variant`: `Shape.Circle(1.0)`, `Option.None`,
 and in patterns `case Shape.Circle(r)`. The qualified name is the same constructor as the bare one,
