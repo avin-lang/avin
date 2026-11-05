@@ -3604,6 +3604,32 @@ spelling is better, as each entry says.
 
 ## Proposed
 
+- **An expected type reaches a core library variant that a nearer one hides** (branch
+  `none-shadowing`). A module's own variant `None` (a C mirror's `ImageFormat.None`) hid `Option`'s
+  throughout the module, so `return None` from a `-> Option[T]` function, `val x: Option[int] =
+  None` and a `None` pattern on an option were all refused. Now, where the type expected at a bare
+  variant name (every position of the shared-variant rule above: parameter, annotated binding,
+  result, field, collection element, comparison operand, pattern) is a data type that none of the
+  nearer variants of that name belongs to, but the core library's variant of the name does, that
+  variant is meant: `None`, `Some`, `Ok`, `Err`, `Left`, `Right` and any later prelude variant.
+  **Where nothing decides it the nearer declaration wins**, as the scoping order always said, so
+  `val f = None` in that module is still `ImageFormat.None`; an expected type that is neither (an
+  `int`, `Any`, a trait) also leaves the nearer one, reported against what was expected. Only the
+  core library's variants are reached this way: a file may not import a name its module declares,
+  so an imported variant is never the hidden one, and an imported `None` hides `Option`'s exactly as
+  a module's own does. **Review with the user**: it makes programs valid that were refused, and
+  changes no valid program's meaning (a use the rule now gives to `Option` was a type error before).
+  *Why*: the rule for shared names is the one a reader already knows, and a C mirror's
+  `None` is common enough that writing `Option.None` in every option-returning function of a
+  binding module would be a tax on exactly the code the bindings chapter shows. The undecided case
+  keeps the nearer one because every such use was valid before and meant the module's variant;
+  making it an ambiguity error would break `val f = None` and `f == None` in existing mirror
+  modules, and would make the module's own name second-class in its own module. *Alternatives*:
+  an ambiguity error naming `ImageFormat.None` and `Option.None` wherever nothing decides (no
+  silent pick, but breaks valid programs and asks for a qualified form on the module's own type);
+  leaving shadowing as it was and requiring `Option.None` (the status quo the bug report was
+  about); refusing a variant named like a core library variant (would rename C enumerators).
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

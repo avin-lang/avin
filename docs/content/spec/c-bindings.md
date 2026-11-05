@@ -607,6 +607,11 @@ The words are matched in the prefix's case, so an upper-case prefix matches uppe
 `@c(enum: "cairo_format_t", prefix: "CAIRO_FORMAT_")` mirrors `CAIRO_FORMAT_ARGB32` as `Argb32` and
 `CAIRO_FORMAT_A8` as `A8` ([proposed](/spec/decisions/#proposed)).
 
+A mirror's variant may have a core library variant's name, as `ImageFormat.None` does. In the
+binding's module it hides `Option`'s, yet wherever an `Option` is expected, a `-> Option[T]`
+result, an `Option` parameter or a pattern on an option, the bare `None` is still `Option`'s
+([data types](/spec/declarations/#data); [proposed](/spec/decisions/#proposed)).
+
 Each enumerator's value is measured by the C unit. A value C answers that no variant holds stops the
 program at the call. A mirror need not list every enumerator: one it leaves out is a value it cannot
 take. An enum whose values are **flags** combined with `|` (Cairo's `cairo_pdf_outline_flags_t`) is

@@ -466,6 +466,26 @@ not have a name another type's variant has. From another module a shared name is
 variant is, `fonts.Normal` or by `import fonts.Normal`, and decided the same way; a private type's
 variant is not seen there, so where only one of the types is public its variant needs no deciding.
 
+The same expected type also reaches past a nearer declaration to the core library's variants, which
+a module's own variant or an imported one of the same name hides (`None`, `Some`, `Ok`, `Err`,
+`Left`, `Right`). A mirror of a C enum with an enumerator `NONE` declares a variant `None`, and
+wherever an `Option` is expected the bare `None` is still `Option`'s; everywhere else it is the
+module's own, as the [scoping order](#visibility-and-modules) says:
+
+```avin
+data ImageFormat
+    None
+    Png
+
+find(n: int) -> Option[int] = if n > 0 then Some(n) else None   // Option's
+
+val f = None                           // ImageFormat's: nothing expects an Option
+val o: Option[ImageFormat] = Some(None)  // Option's Some, ImageFormat's None
+```
+
+Only the hidden variant's own type chooses it: an expected `int`, `Any` or a trait leaves the
+nearer variant, which is then reported against what was expected.
+
 A variant is also reached through its type, `Type.Variant`: `Shape.Circle(1.0)`, `Option.None`,
 and in patterns `case Shape.Circle(r)`. The qualified name is the same constructor as the bare one,
 so the two forms mix freely in one expression or one `match`, and a `match` over both is checked for
@@ -1192,7 +1212,9 @@ main() = println(s"${circleArea(Circle(2))}")
   [extensions](#extensions) add**, so `"hey".shout()` works in every file that imports `words`.
 - **What a name means** is decided in that order: the file's module, then its imports, then the
   public declarations of the standard library's module `avin`, which every file sees without an
-  import. The nearer hides the farther, whatever kind each declaration is. A program's own modules
+  import. The nearer hides the farther, whatever kind each declaration is, except that a core
+  library variant a nearer one hides is still chosen where its own type is expected
+  ([`data`](#data)). A program's own modules
   may not be `avin` or under it.
 - **Modules may import one another**, in a cycle if need be: the program is compiled whole. Its
   module-level values initialize before `main`, each after the values its initializer needs, across

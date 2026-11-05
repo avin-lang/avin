@@ -9692,6 +9692,22 @@ private variants_named(c: *Checker, name: string) -> Buf[VariantRef]
     if qualified_variant(c, name) is Some(v) then out.push(v)
     out
 
+/** The core library's variants of a bare name that a nearer declaration of it hides, the file's
+ * own module's or an import's: `Option`'s `None` behind a module's own `None`. An expected type of
+ * their own type still chooses them. A file never imports a name its module declares, so an
+ * import is never the one hidden. */
+private hidden_variants(c: *Checker, name: string) -> Buf[VariantRef]
+    var out: Buf[VariantRef] = buf()
+    if name.contains(".") || name.starts_with(CorePrefix) then return out
+    val scope = c.files[unit_of(c)]
+    val own = qualified(scope.module_name, name)
+    val core = qualified(CoreModule, name)
+    if core == own || !declared(c, own) && scope.imports.get(name) is None then return out
+    if c.variants.get(core) is None || !exported(c, core) then return out
+    for v in variants_at(c, core)
+        if exported(c, qualified(c.data[v.data].module_name, c.data[v.data].name)) then out.push(v)
+    out
+
 /** Every variant of the qualified name `key`: its one, or each of the types sharing it. */
 variants_at(c: *Checker, key: string) -> Buf[VariantRef]
     if c.shared_variants.get(key) is Some(vs) then return vs
@@ -9714,11 +9730,15 @@ variant_owners(c: *Checker, key: string) -> string
 private choose_variant(c: *Checker, at: Span, name: string, expected: Option[&Type]) -> (Option[VariantRef], bool)
     val vs = variants_named(c, name)
     if vs.len() == 0 then return (None, false)
-    if vs.len() == 1 then return (Some(vs[0]), true)
     if expected is Some(t)
         if *zonk(c, t) is Data(id, _, _)
             for v in vs
                 if v.data == id then return (Some(v), true)
+            // A variant the nearer one hides, `Option`'s `None` behind a module's own `None`, is
+            // still the one meant where its own type is expected.
+            for v in hidden_variants(c, name)
+                if v.data == id then return (Some(v), true)
+    if vs.len() == 1 then return (Some(vs[0]), true)
     // `m.Normal` is decided as `m.Slant.Normal`, through the module it was reached by.
     var through = ""
     for k in 0..<name.bytes.len
@@ -10886,8 +10906,8 @@ private has_operator_traits(t: &Type) -> bool = *t match
     Class(_, _, _) -> true
     _ -> false
 
-// Whether `e` is a bare variant name, or a call of one, that several data types share, so that the
-// type it makes is the one its context expects.
+// Whether `e` is a bare variant name, or a call of one, that several data types share, or that
+// hides a farther variant of its name, so that the type it makes is the one its context expects.
 private shared_variant_use(c: *Checker, e: &Expr) -> bool
     val name = e.kind match
         Name(n) -> n
@@ -10897,7 +10917,8 @@ private shared_variant_use(c: *Checker, e: &Expr) -> bool
         _ -> return false
     if lookup_local(c, name) is Some(_) || param_index(c, name) is Some(_) || class_member(c, name) is Some(_) then return false
     if local_function(c, name) is Some(_) || global_named(c, name) is Some(_) then return false
-    variants_named(c, name).len() > 1
+    val n = variants_named(c, name).len()
+    n > 1 || n == 1 && hidden_variants(c, name).len() > 0
 
 private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[CompareOp]) -> &TExpr
     var early: Buf[Option[&TExpr]] = buf()
