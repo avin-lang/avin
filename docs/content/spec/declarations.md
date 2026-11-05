@@ -609,11 +609,50 @@ value: `Add`'s `zero` and `Mul`'s `one` are the identities of their operators.
 - **Every implementation gives it, with a body**, marked `static` as the trait's member is: an impl,
   and a class's body with `override static`. An abstract class gives it too, since it belongs to the
   type and not to a subclass's objects. A static member is static exactly where the trait's member
-  is, and is only a trait's member or an implementation of one.
+  is, and is a trait's member, an implementation of one, or a
+  [built-in type's own](#static-members-of-built-in-types). A class or `data` type keeps what belongs
+  to the type in its companion object.
 - **A static member's body has no `self`**: neither `self` nor the members of a value by bare name.
   It may have parameters, defaults and type parameters as a method does.
 - **A trait with a static member is a bound and not a type**, as one mentioning `Self` is: a value of
   the trait's type would have no type to give the member.
+- **A static member named without a call is a function value** of its parameters, as a method of a
+  value is: `xs.map(string.fromUtf8Lossy)`, `val zero = Point.zero`. Where the member is overloaded,
+  the function type expected says which, and without one the value is an error.
+
+### Static members of built-in types
+
+```text
+impl string
+    static fromUtf8(bytes: Array[byte]) -> Result[string, Utf8Error] = …
+    static fromUtf8Lossy(bytes: Array[byte]) -> string = …
+
+impl int
+    static parity(n: int) -> string = if n % 2 == 0 then "even" else "odd"
+
+val text = string.fromUtf8Lossy(bytes)
+```
+
+A built-in type has no companion object, since it cannot be declared, so what belongs to the type
+itself is declared as a **`static` member in an impl of the type without a trait**: `string`,
+`char`, `bool`, `real`, `byte` and each integer type. The core library declares the built-in types'
+own (`string.fromUtf8`); a program adds one as it adds a method, in an [extension](#extensions), seen
+where its module is imported. Settled by the user 2026-11-04.
+
+- **It is called on the type's name**, `string.fromUtf8(bytes)`, and is a value without a call, as
+  any static member is; calling it on a value is an error, and so is calling a value's method on the
+  type. Its body has no `self`, and calls the type's other static members on the type,
+  `string.other()`.
+- **A name is a static member or a method of the type's values, not both**, so `string.name` and
+  `s.name` never mean two different functions. Static members of one name overload one another by
+  parameter types, as methods do.
+- **What the language gives a built-in type cannot be redeclared**: `wrap` on every built-in type,
+  which `i8.wrap(x)` reads, and the limits of the numeric types and `char` (`MaxValue`, `MinValue`,
+  and `real`'s `MinPositiveValue`, `PositiveInfinity`, `NegativeInfinity`, `NaN`).
+- An extension's static member with the parameter types of one the type has is an error where it is
+  declared, as an extension's method is; a `private` one is its module's.
+- A generic impl, an impl adding to a trait and an impl of a class or `data` type declare no static
+  member of their own.
 
 ## impl
 
