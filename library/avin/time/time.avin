@@ -1,11 +1,12 @@
 module avin.time
 
-// Measuring time and reading the clock. A `Duration` is a length of time, an `Instant` a reading of
-// the monotonic clock, which only moves forward and so is the one to measure with, and a `WallTime` a
-// reading of the wall clock, which anyone may set and which is the one to stamp something with. The
-// two clocks are different types, so a reading of one is never subtracted from a reading of the
-// other. Every quantity counts whole microseconds, and arithmetic that leaves the range of a `long`
-// of them, about 292,000 years, traps.
+// Clocks and lengths of time. An `Instant` is a point on the timeline, a count of microseconds since
+// 1970-01-01T00:00:00Z, and `now()` reads the wall clock as one; anyone may set that clock, so it is
+// the one to stamp things with. A `Duration` is an exact length of timeline, and `monotonic()` reads
+// the monotonic clock as one: the time since an origin that means nothing, which never decreases and
+// so is the one to measure with, `monotonic() - start`. A reading of the monotonic clock names no
+// point in time, so the two clocks never mix. Every quantity counts whole microseconds, and a maker or
+// arithmetic whose answer leaves the range of a `long` of them, about 292,000 years, traps.
 
 @sysl("avin.rt.monotonic_micros")
 private monotonicMicros() -> long
@@ -23,29 +24,67 @@ private val MicrosPerHour: long = 3600000000
 
 private val MicrosPerDay: long = 86400000000
 
-// A length of time, positive, zero or negative, in whole microseconds.
+private val MicrosPerWeek: long = 604800000000
+
+// An exact length of timeline, negative, zero or positive, in whole microseconds.
 data Duration(micros: long) derives Ord
 
-// The durations of `n` of each unit; a count too large for a duration traps.
-microseconds(n: long) -> Duration = Duration(n)
-milliseconds(n: long) -> Duration = Duration(n * MicrosPerMilli)
+object Duration
+    // The zero-length duration, and the least and greatest durations.
+    val Zero: Duration = Duration(0)
+    val Min: Duration = Duration(long.MinValue)
+    val Max: Duration = Duration(long.MaxValue)
+
+// The durations of `n` of each unit; a day is 24 hours and a week 7 days, and a count too large for a
+// duration traps.
+micros(n: long) -> Duration = Duration(n)
+millis(n: long) -> Duration = Duration(n * MicrosPerMilli)
 seconds(n: long) -> Duration = Duration(n * MicrosPerSecond)
 minutes(n: long) -> Duration = Duration(n * MicrosPerMinute)
 hours(n: long) -> Duration = Duration(n * MicrosPerHour)
+days(n: long) -> Duration = Duration(n * MicrosPerDay)
+weeks(n: long) -> Duration = Duration(n * MicrosPerWeek)
 
-// The zero-length duration.
-zero() -> Duration = Duration(0)
+// The makers as methods on a count: `2.hours() == hours(2)`.
+impl int
+    micros() -> Duration = Duration(long(self))
+    millis() -> Duration = Duration(long(self) * MicrosPerMilli)
+    seconds() -> Duration = Duration(long(self) * MicrosPerSecond)
+    minutes() -> Duration = Duration(long(self) * MicrosPerMinute)
+    hours() -> Duration = Duration(long(self) * MicrosPerHour)
+    days() -> Duration = Duration(long(self) * MicrosPerDay)
+    weeks() -> Duration = Duration(long(self) * MicrosPerWeek)
+
+impl long
+    micros() -> Duration = Duration(self)
+    millis() -> Duration = Duration(self * MicrosPerMilli)
+    seconds() -> Duration = Duration(self * MicrosPerSecond)
+    minutes() -> Duration = Duration(self * MicrosPerMinute)
+    hours() -> Duration = Duration(self * MicrosPerHour)
+    days() -> Duration = Duration(self * MicrosPerDay)
+    weeks() -> Duration = Duration(self * MicrosPerWeek)
 
 impl Duration
-    // The whole units in the duration, a fraction of a unit dropped toward zero.
-    inMilliseconds() -> long = micros / MicrosPerMilli
-    inSeconds() -> long = micros / MicrosPerSecond
-    inMinutes() -> long = micros / MicrosPerMinute
+    // How many whole units the duration holds, a fraction dropped toward zero.
+    toDays() -> long = micros / MicrosPerDay
+    toHours() -> long = micros / MicrosPerHour
+    toMinutes() -> long = micros / MicrosPerMinute
+    toSeconds() -> long = micros / MicrosPerSecond
+    toMillis() -> long = micros / MicrosPerMilli
+
+    // The part left in each unit below the next larger one, negative for a negative duration:
+    // `(hours(50) + minutes(7)).toHoursPart()` is `2`, and `toMicrosPart()` is what is left below
+    // the second.
+    toHoursPart() -> long = micros / MicrosPerHour % 24
+    toMinutesPart() -> long = micros / MicrosPerMinute % 60
+    toSecondsPart() -> long = micros / MicrosPerSecond % 60
+    toMicrosPart() -> long = micros % MicrosPerSecond
 
     // The duration in seconds, with the fraction.
-    inSecondsReal() -> real = real(micros) / 1000000.0
+    toSecondsReal() -> real = real(micros) / 1000000.0
 
     isNegative() -> bool = micros < 0
+    isZero() -> bool = micros == 0
 
     // The duration without its sign; the least duration has no absolute value and traps.
     abs() -> Duration = if micros < 0 then Duration(-micros) else self
@@ -54,6 +93,9 @@ impl Duration
     // remainder dropped toward zero; dividing by zero traps.
     *(n: long) -> Duration = Duration(micros * n)
     /(n: long) -> Duration = Duration(micros / n)
+
+    // How many whole `other` fit in the duration, `d / e`, a remainder dropped toward zero.
+    /(other: Duration) -> long = micros / other.micros
 
 impl Add for Duration
     add(other: Duration) -> Duration = Duration(micros + other.micros)
@@ -71,9 +113,17 @@ private padded(n: long, width: int) -> string
     while text.byteLength() < width do text = "0" + text
     text
 
-// A duration reads in the largest unit it fills, with its fraction and no trailing zeros: `3us`,
-// `1.5ms`, `2.25s`, `-0.5s`, and a minute or more as seconds, `90s`.
+// `digits`, a fraction's digits, without its trailing zeros.
+private trimmed(digits: string) -> string
+    var text = digits
+    while text.nonEmpty() && text.endsWith("0") do text = text.dropRight(1)
+    text
+
+// A duration reads in the largest of `s`, `ms` and `us` it has a whole part in, with its fraction and
+// no trailing zeros: `3us`, `1.5ms`, `2.25s`, `-0.5s`, a minute or more as seconds, `90s`, and no
+// time at all as `0s`.
 private durationText(micros: long) -> string
+    if micros == 0 then return "0s"
     var unit: long = MicrosPerSecond
     if -1000 < micros < 1000 then unit = 1
     elif -MicrosPerSecond < micros < MicrosPerSecond then unit = MicrosPerMilli
@@ -81,10 +131,7 @@ private durationText(micros: long) -> string
     val whole = micros / unit
     val part = (micros % unit).toString()
     var fraction = if micros % unit < 0 then part.drop(1) else part
-    if unit > 1
-        val digits = if unit == MicrosPerMilli then 3 else 6
-        fraction = fraction.padStart(digits, '0')
-        while fraction.nonEmpty() && fraction.endsWith("0") do fraction = fraction.dropRight(1)
+    if unit > 1 then fraction = trimmed(fraction.padStart(if unit == MicrosPerMilli then 3 else 6, '0'))
     val sign = if micros < 0 && whole == 0 then "-" else ""
     sign + whole.toString() + (if fraction == "" || unit == 1 then "" else "." + fraction) + suffix
 
@@ -94,62 +141,59 @@ impl Display for Duration
 impl Debug for Duration
     debug(out: Writer, spec: FormatSpec) = out.writeField("Duration(" + durationText(micros) + ")", spec)
 
-// A reading of the monotonic clock. One reading means nothing; the difference of two is the time
-// between them.
-data Instant(micros: long) derives Ord
+// The monotonic clock now: the time since an origin that means nothing, never decreasing within a run.
+monotonic() -> Duration = Duration(monotonicMicros())
 
-// The monotonic clock now.
-now() -> Instant = Instant(monotonicMicros())
+// A point on the timeline, with no calendar: a count of microseconds since 1970-01-01T00:00:00Z, leap
+// seconds not counted.
+data Instant(epochMicros: long) derives Ord
 
-impl Instant
-    // The time from this reading to the clock now.
-    elapsed() -> Duration = now().since(self)
+object Instant
+    // The instant `epochMicros(0)`, and the least and greatest instants.
+    val Epoch: Instant = Instant(0)
+    val Min: Instant = Instant(long.MinValue)
+    val Max: Instant = Instant(long.MaxValue)
 
-    // The time from `earlier` to this reading, negative where `earlier` is the later.
-    since(earlier: Instant) -> Duration = Duration(micros - earlier.micros)
+// The wall clock now, to the microsecond the host gives.
+now() -> Instant = Instant(wallMicros())
 
-    // The reading `d` after this one, `start + d`, or before it, `start - d`.
-    +(d: Duration) -> Instant = Instant(micros + d.micros)
-    -(d: Duration) -> Instant = Instant(micros - d.micros)
-
-    // The time from `earlier` to this reading, `later - earlier`, as `since` finds it.
-    -(earlier: Instant) -> Duration = since(earlier)
-
-impl Display for Instant
-    display(out: Writer, spec: FormatSpec) = out.writeField("Instant(" + durationText(micros) + ")", spec)
-
-impl Debug for Instant
-    debug(out: Writer, spec: FormatSpec) = display(out, spec)
-
-// A reading of the wall clock: a count of microseconds since 1970-01-01T00:00:00 UTC, leap seconds
-// not counted.
-data WallTime(sinceEpoch: Duration) derives Ord
-
-// The wall clock now.
-wallClock() -> WallTime = WallTime(Duration(wallMicros()))
-
-// The wall-clock time `d` after the start of 1970 (UTC), or before it where `d` is negative.
-fromEpoch(d: Duration) -> WallTime = WallTime(d)
-
-impl WallTime
-    // The time from `earlier` to this reading, negative where the wall clock was set back between.
-    since(earlier: WallTime) -> Duration = sinceEpoch - earlier.sinceEpoch
-
-    // The wall-clock time `d` after this one, `t + d`, or before it, `t - d`.
-    +(d: Duration) -> WallTime = WallTime(sinceEpoch + d)
-    -(d: Duration) -> WallTime = WallTime(sinceEpoch - d)
-
-    // The time from `earlier` to this reading, `later - earlier`, as `since` finds it.
-    -(earlier: WallTime) -> Duration = since(earlier)
+// The instant `n` units after 1970-01-01T00:00:00Z, or before it where `n` is negative; a count too
+// large for an instant traps.
+epochSeconds(n: long) -> Instant = Instant(n * MicrosPerSecond)
+epochMillis(n: long) -> Instant = Instant(n * MicrosPerMilli)
+epochMicros(n: long) -> Instant = Instant(n)
 
 // `n` divided by `d`, rounded toward negative infinity.
 private floorDiv(n: long, d: long) -> long = if n % d < 0 then n / d - 1 else n / d
 
-// The `YYYY-MM-DDThh:mm:ss.ffffffZ` form of a wall-clock reading, in UTC. The date is the proleptic
-// Gregorian calendar's, found from the day count by its 400-year cycles.
-private wallText(micros: long) -> string
-    val days = floorDiv(micros, MicrosPerDay)
-    val inDay = micros - days * MicrosPerDay
+impl Instant
+    // The whole units since 1970-01-01T00:00:00Z, rounded toward negative infinity, so the
+    // millisecond before the epoch is in its second `-1`.
+    epochSeconds() -> long = floorDiv(epochMicros, MicrosPerSecond)
+    epochMillis() -> long = floorDiv(epochMicros, MicrosPerMilli)
+
+    // The instant `d` later along the timeline, `t + d`, or earlier, `t - d`.
+    +(d: Duration) -> Instant = Instant(epochMicros + d.micros)
+    -(d: Duration) -> Instant = Instant(epochMicros - d.micros)
+
+    // The duration from `earlier` to this instant, `later - earlier`, negative where `earlier` is the
+    // later one.
+    -(earlier: Instant) -> Duration = Duration(epochMicros - earlier.epochMicros)
+
+// A year as ISO 8601 writes it: four digits from `0000` to `9999`, signed outside them.
+private yearText(year: long) -> string
+    if 0 <= year <= 9999 then padded(year, 4)
+    elif year > 9999 then "+" + year.toString()
+    else "-" + padded(-year, 4)
+
+// The `YYYY-MM-DDThh:mm:ss.fZ` form of an instant, in UTC, the fraction only where there is one and
+// without trailing zeros. The date is the proleptic Gregorian calendar's, found from the day count by
+// its 400-year cycles; the day and the time within it are split by a remainder first, so the least
+// instant's day count is never multiplied back out of range.
+private instantText(micros: long) -> string
+    val rest = micros % MicrosPerDay
+    val days = if rest < 0 then micros / MicrosPerDay - 1 else micros / MicrosPerDay
+    val inDay = if rest < 0 then rest + MicrosPerDay else rest
     val z = days + 719468
     val era = floorDiv(z, 146097)
     val dayOfEra = z - era * 146097
@@ -162,13 +206,13 @@ private wallText(micros: long) -> string
     val hour = inDay / MicrosPerHour
     val minute = inDay % MicrosPerHour / MicrosPerMinute
     val second = inDay % MicrosPerMinute / MicrosPerSecond
-    val fraction = inDay % MicrosPerSecond
-    val date = padded(year, 4) + "-" + padded(month, 2) + "-" + padded(day, 2)
+    val fraction = trimmed(padded(inDay % MicrosPerSecond, 6))
+    val date = yearText(year) + "-" + padded(month, 2) + "-" + padded(day, 2)
     val clock = padded(hour, 2) + ":" + padded(minute, 2) + ":" + padded(second, 2)
-    date + "T" + clock + "." + padded(fraction, 6) + "Z"
+    date + "T" + clock + (if fraction == "" then "" else "." + fraction) + "Z"
 
-impl Display for WallTime
-    display(out: Writer, spec: FormatSpec) = out.writeField(wallText(sinceEpoch.micros), spec)
+impl Display for Instant
+    display(out: Writer, spec: FormatSpec) = out.writeField(instantText(epochMicros), spec)
 
-impl Debug for WallTime
+impl Debug for Instant
     debug(out: Writer, spec: FormatSpec) = display(out, spec)

@@ -3597,6 +3597,61 @@ spelling is better, as each entry says.
   ignoring them (silently wrong where they differ). Revisit if a pattern on an `Any` scrutinee
   should match a variant at one instance, which would give written arguments a meaning.
 
+- Settled on the user's delegation 2026-11-05: **C enum mirrors, constants, statuses and out
+  parameters, as built** (branch `c-bindings-enums`,
+  [chapter](/spec/c-bindings/#enums-and-constants)). The chapter left these open:
+  - **An enumerator's words and case.** A word starts at each upper-case letter of the variant's
+    name, a digit and `_` staying with the word before them (`Yuv420p` one word, `ColorDodge` two,
+    `Rgb16_565` → `RGB16_565`); they are upper case where the prefix has an upper-case letter and no
+    lower-case one, and lower case otherwise, a prefix with no letter or none at all included.
+    *Why*: it is the case rule the chapter already states, made total. *Alternatives*: a `case:`
+    word on the mirror; matching the header's enumerators case-insensitively, which the C unit cannot
+    list. A name starting with a digit after the prefix (`CAIRO_PDF_VERSION_1_4`) is named with the
+    variant's own `@c`, and the C unit's refusal of the derived name says so.
+  - **A mirror crosses only where the prototype writes its C type** (or that type `const`), not at
+    a plain `int` that happens to carry it. *Why*: the binding then checks that the C function means
+    this enum. *Alternative*: any integer position, which loses that check.
+    **Review with the user**: some C APIs take an enum's values as `int`.
+  - **Duplicated values**: a variant crosses as its enumerator's value, and a value C answers is the
+    first variant in declaration order holding it. *Alternative*: refusing a mirror listing two
+    enumerators of one value, which refuses aliases a header keeps for compatibility.
+  - **A status mirror is `Ok` for zero whether or not it lists a zero variant.** *Why*: zero is
+    success by the binding's form, not by the mirror. *Alternative*: requiring the zero variant.
+  - **Constants**: an integer type takes any integer constant expression the headers define,
+    enumerators, characters and a `static const` clang folds among them; `real` takes a floating or
+    an integer constant; `string` only a string literal, its bytes checked as UTF-8. A value its Avin
+    type cannot hold is refused at the constant with its value. `bool`, `char` and `byte` constants are
+    refused. *Why*: the three kinds the chapter names, each checked where it is read. *Alternatives*:
+    narrowing silently; a `bool` constant from an integer (left for when a library needs one).
+  - **`out` and `inout` are written before the parameter's type** (`out int *x`), the parameter a
+    pointer to what is answered, never to `const`; a parameter may still be named `out`. A non-`void`
+    C result is left out where the binding's result is the out values alone (`int f(out int *a)`
+    bound as `-> int` answers the out value), and is the first part where the result is a tuple of
+    one more. *Why*: it is the chapter's "a C result bound as `unit` leaves the tuple without it"
+    without a `unit` part to write. *Alternative*: requiring a tuple whose first part is `unit`.
+  - **An out slot starts as zero or null**, so a C function that writes nothing answers zero,
+    `None`, or stops where the type has no null. **A handle is never `inout`**: whether C kept the
+    reference it was passed or replaced it cannot be said. *Alternative*: passing it in and treating
+    what comes back as a new owned handle, which double-frees where C answers the same pointer.
+  - **An `inout` string** is passed as a NUL-terminated copy through `const char **` and read back
+    where C pointed it, before the copy is freed, so C may move it into the copy; a string C answers
+    through an out pointer is left to C, as a borrowed result is.
+  - **What `keeps:` keeps with out handles**: the holder is the handle the C result is, else the
+    first handle answered through an out pointer, else the receiver; a status keeps only when it is
+    zero, and a `None` handle keeps nothing. `borrowed` applies to every handle the binding answers.
+- Settled on the user's delegation 2026-11-05 (branch `time-instant`): **A `Duration` given to a millisecond wait is
+  rounded up to whole milliseconds.** `Future.await(d)` and `Condition.waitFor(d)` pass the runtime's
+  millisecond wait `ceil(d / 1ms)`, so `await(micros(1))` waits a millisecond; a duration of zero or
+  less asks without waiting, as a count that is not positive does. *Why*: a timed wait should never
+  end before the time it was given, the rule `setTimeout` already follows for a socket.
+  *Alternatives*: rounding down, which turns every duration under a millisecond into no wait at all;
+  a microsecond wait in the runtime, which the condition variable beneath does not offer.
+- Settled on the user's delegation 2026-11-05 (branch `time-instant`): **`toMicrosPart()` is the part below the second**
+  (`micros % 1_000_000`), as the chapter's list goes from `toSecondsPart()` straight to it, with no
+  `toMillisPart()`. *Why*: the four parts then cover a duration with nothing left over (hours below
+  the day, minutes, seconds, microseconds). *Alternatives*: the part below the millisecond, which
+  would need a `toMillisPart()` beside it to be complete.
+
 **Deferred**
 
 - Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.

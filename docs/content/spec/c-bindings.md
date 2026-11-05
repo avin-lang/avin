@@ -605,15 +605,28 @@ data ImageFormat
 
 The words are matched in the prefix's case, so an upper-case prefix matches upper-case enumerators:
 `@c(enum: "cairo_format_t", prefix: "CAIRO_FORMAT_")` mirrors `CAIRO_FORMAT_ARGB32` as `Argb32` and
-`CAIRO_FORMAT_A8` as `A8` ([proposed](/spec/decisions/#proposed)).
+`CAIRO_FORMAT_A8` as `A8` ([proposed](/spec/decisions/#proposed)). A word starts at each upper-case
+letter of the variant's name, and a digit or `_` stays with the word before it: `ColorDodge` is
+`COLOR_DODGE` and `Rgb16_565` is `RGB16_565`. An enumerator whose name starts with a digit after the
+prefix, `CAIRO_PDF_VERSION_1_4`, is no variant's words, so its variant names it with `@c`. Two mirrors
+of one module may share a variant's name, as Cairo's slant and weight share `Normal`.
 
 A mirror's variant may have a core library variant's name, as `ImageFormat.None` does. In the
 binding's module it hides `Option`'s, yet wherever an `Option` is expected, a `-> Option[T]`
 result, an `Option` parameter or a pattern on an option, the bare `None` is still `Option`'s
 ([data types](/spec/declarations/#data); [proposed](/spec/decisions/#proposed)).
 
-Each enumerator's value is measured by the C unit. A value C answers that no variant holds stops the
-program at the call. A mirror need not list every enumerator: one it leaves out is a value it cannot
+Each enumerator's value is measured by the C unit, which checks the mirrored type is an enumeration or
+an integer type and that the headers declare every enumerator. A mirror crosses where the prototype
+writes the type it mirrors, as a parameter, a result, a status or an out value, at that type's width.
+A value C answers that no variant holds stops the program at the call:
+
+```text
+avin: trap: `cairo_status` answered a value no variant of `Status` holds at status.avin:7:1
+```
+
+Where two enumerators have one value, both variants cross as it, and the value comes back as the
+first. A mirror need not list every enumerator: one it leaves out is a value it cannot
 take. An enum whose values are **flags** combined with `|` (Cairo's `cairo_pdf_outline_flags_t`) is
 bound as an integer, its flags as constants, and the library gives it an Avin type of its own.
 
@@ -628,7 +641,10 @@ val mltVersion: int
 
 A constant is an integer, a `real` or a `string`: a string literal the header defines (Cairo's
 `CAIRO_TAG_DEST`, `"cairo.dest"`) is stored by the C unit as its bytes, read by the driver like any
-measurement, and checked as UTF-8 then ([proposed](/spec/decisions/#proposed)).
+measurement, and checked as UTF-8 then ([proposed](/spec/decisions/#proposed)). An integer constant
+may be any integer constant expression, an enumerator or a character among them, and one its Avin
+type cannot hold is refused at the constant, naming its value; a `real` may be given an integer
+constant, and holds NaN, the infinities and minus zero as C defines them.
 
 ## Arrays and out parameters
 
@@ -681,7 +697,12 @@ measurement, and checked as UTF-8 then ([proposed](/spec/decisions/#proposed)).
   `out` and `inout` value in order, as a tuple; a C result bound as `unit` leaves the tuple without
   it, one value alone is not a tuple, and a status bound as `Result[T, int]` holds the rest in its
   `Ok`. An out value is a scalar, a string, a handle (owned, unless the binding says `borrowed`) or a
-  mirror.
+  mirror. `out` and `inout` are written before the parameter's type, which is a pointer to what is
+  answered, never to `const`. A C result that is not `void` is left out where the binding answers the
+  out values alone. Each is a slot in the call's frame, zero or null until C writes it; an `inout` one
+  holds the converted argument first, a string as a copy C may move the pointer into, and a handle is
+  never passed `inout` ([proposed](/spec/decisions/#proposed)). A handle answered through an out
+  pointer keeps what the call `keeps:` where the C result is no handle.
 
   ```avin
   @c("int mlt_service_get_frame(mlt_service self, out mlt_frame *frame, int index)")

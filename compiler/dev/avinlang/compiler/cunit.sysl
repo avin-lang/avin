@@ -5,7 +5,7 @@ import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
 import sysl.fs.{exists, make_dir_all, make_temp_dir, pending_name, publish_file, read_bytes, remove_dir_all, remove_file, write_text}
 import sysl.process.capture
-import sysl.text.{StrBuilder, str_builder}
+import sysl.text.{StrBuilder, from_utf8, str_builder}
 
 // The C unit. Every program with C bindings is built with one generated C file, compiled by clang
 // with the include flags of the program's C libraries. For each binding it holds a `_Static_assert`
@@ -13,9 +13,12 @@ import sysl.text.{StrBuilder, str_builder}
 // of the function as the prototype says it, whose conflict with the header's names the header; for
 // each typedef a prototype names, a `_Static_assert` that it is the kind of type its Avin type needs;
 // and one table of constant bytes measuring each integer type a prototype names, its width and sign,
-// and each typedef in a `real` position, its width. The driver reads the table out of the object
-// file's bytes, so nothing is run and a build for another machine measures that machine. A clang
-// diagnostic is placed back at the binding by the line the unit gave it.
+// and each typedef in a `real` position, its width. A second table holds the value of every
+// enumerator an enum mirror holds and every constant a `@c(const:)` value is, after checks that each
+// mirror's type is an integer type and each value the kind its Avin type asks for. The driver reads
+// both tables out of the object file's bytes, so nothing is run and a build for another machine
+// measures that machine. A clang diagnostic is placed back at the binding, the mirror or the constant
+// by the line the unit gave it.
 //
 // The object is cached under `cunit/` in the user's cache, by a key over the unit's source, what
 // `pkg-config` answers for the libraries, and `clang --version`.
@@ -81,14 +84,79 @@ struct CUnitKept
     index: usize
     ty: string
 
+/** An enum mirror as the C unit checks it: its name, the C type it mirrors, the enumerator of each
+ * variant, in order, whether the variant names its own with `@c`, the variants' names and spans,
+ * and the unit, span and package that place the mirror. */
+struct CUnitEnum
+    name: string
+    ty: string
+    enumerators: Buf[string]
+    named: Buf[bool]
+    variants: Buf[string]
+    variant_spans: Buf[Span]
+    unit: usize
+    span: Span
+    package: string
+
+/** A module-level `@c(const:)` value as the C unit measures it: its name, the C constant, the kind of
+ * value it is, its Avin type, and the unit, span and package that place it. */
+struct CUnitConstant
+    name: string
+    constant: string
+    kind: CConstKind
+    avin: &Type
+    unit: usize
+    span: Span
+    package: string
+
 /** What building a program's C unit gave: the object, when the program has C bindings; whether this
- * build compiled it rather than finding it cached; what it measured, by `c_measure_key`; and the
- * flags that link the program's C libraries. */
+ * build compiled it rather than finding it cached; what it measured, by `c_measure_key`, and the
+ * values of its constants and enumerators, by `c_value_key`; and the flags that link the program's C
+ * libraries. */
 struct CUnit
     object: Option[string]
     built: bool
     measures: Map[string, CMeasure]
+    values: Map[string, CValue]
     link: Buf[string]
+
+/** The enum mirrors of a checked program, in the order of its data types. */
+c_unit_enums(program: TProgram, files: Buf[ProgramFile], library: usize) -> Buf[CUnitEnum]
+    var out: Buf[CUnitEnum] = buf()
+    for d in program.data
+        val e = c_enum_of(d.decl) match
+            Some(e) -> e
+            None -> continue
+        var enumerators: Buf[string] = buf()
+        var named: Buf[bool] = buf()
+        var variants: Buf[string] = buf()
+        var spans: Buf[Span] = buf()
+        for v in d.decl.variants
+            enumerators.push(c_enumerator(e, v))
+            named.push(c_variant_text(v) is Some(_))
+            variants.push(v.name)
+            spans.push(v.span)
+        out.push(CUnitEnum(d.name, e.ty, enumerators, named, variants, spans, d.unit, d.decl.span, package_of(d.unit, files, library)))
+    out
+
+/** The module-level `@c(const:)` values of a checked program, in the order they are declared. */
+c_unit_constants(program: TProgram, files: Buf[ProgramFile], library: usize) -> Buf[CUnitConstant]
+    var out: Buf[CUnitConstant] = buf()
+    for g in program.globals
+        val f = program.symbols[g.init]
+        val body = f.decl.body match
+            Some(b) -> b
+            None -> continue
+        val name = if body.kind is CConstant(n) then n else continue
+        if name == "" then continue
+        val t = f.result.unwrap_or(Unit)
+        val kind = *t match
+            Int(_) -> CConstInteger
+            Real -> CConstReal
+            Str -> CConstString
+            _ -> continue
+        out.push(CUnitConstant(g.name, name, kind, t, g.unit, g.span, package_of(g.unit, files, library)))
+    out
 
 /** The name the C unit is written under, which clang's diagnostics name. */
 const CUnitFile: string = "avin-c-unit.c"
@@ -109,18 +177,35 @@ c_unit_bindings(program: TProgram, files: Buf[ProgramFile], library: usize) -> B
         val p = c_prototype_of(s.decl) match
             Some(p) -> p
             None -> continue
-        val params = s.params
         val package = package_of(s.unit, files, library)
-        // A status is measured as the integer its code is.
-        var result = s.result.unwrap_or(Unit)
+        val parts = c_result_parts(p, s.result.unwrap_or(Unit), program.data) match
+            Ok(parts) -> parts
+            Err(_) -> continue
+        // Each of the prototype's positions has the Avin type crossing there: an `out` or `inout`
+        // parameter its out value's, and a status the integer or the mirror its code is. A mirror is
+        // measured as the integer it is.
+        var result = parts.result
         if c_status_error(result, program.data) is Some(e) then result = e
+        var params: Buf[&Type] = buf()
+        var out_at = 0usize
+        var in_at = 0usize
+        for i in 0..<p.params.len()
+            if p.params[i].mode is CIn
+                params.push(if in_at < s.params.len() then s.params[in_at] else Unit)
+            else
+                params.push(if out_at < parts.outs.len() then parts.outs[out_at] else Unit)
+                out_at += 1
+            if !(p.params[i].mode is COut) then in_at += 1
+        if c_mirror_of(result, program.data) is Some(_) then result = Int(64)
+        for i in 0..<params.len()
+            if c_mirror_of(params[i], program.data) is Some(_) then params[i] = Int(64)
         var forms: Buf[CTextForm] = buf()
         forms.push(c_text_form(result, program.data, program.classes))
         for t in params
             forms.push(c_text_form(t, program.data, program.classes))
         var uses: Buf[string] = buf()
         var positions: Buf[&Type] = buf()
-        positions.push(s.result.unwrap_or(Unit))
+        positions.push(result)
         for t in params
             positions.push(t)
         for t in positions
@@ -195,8 +280,23 @@ private c_unit_fields(program: TProgram, k: usize) -> Buf[CUnitField]
  * library's `pkg-config` module is asked for its flags; with no bindings there is no unit, and only
  * the link flags are answered. A binding the headers do not declare as its prototype says, or whose
  * package names no header, is reported at the binding, rendered with `sources`. */
-ensure_c_unit(tc: Toolchain, bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries: Buf[CLibrary], sources: Buf[Source]) -> Result[CUnit, string]
-    if bindings.len() == 0 && handles.len() == 0 && libraries.len() == 0 then return Ok(CUnit(None, false, map(), buf()))
+ensure_c_unit(tc: Toolchain, bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries: Buf[CLibrary], sources: Buf[Source]) -> Result[CUnit, string] = ensure_c_unit_of(tc, CUnitParts(bindings, handles, buf(), buf()), libraries, sources)
+
+/** What a program's C unit is made of: its bindings, its handles' glue, its enum mirrors and its
+ * constants. */
+struct CUnitParts
+    bindings: Buf[CUnitBinding]
+    handles: Buf[CUnitHandle]
+    enums: Buf[CUnitEnum]
+    constants: Buf[CUnitConstant]
+
+/** The C unit of a program made of `parts`, as `ensure_c_unit` builds one; each enumerator and
+ * constant is measured, and a constant its Avin type cannot hold, or a string constant that is not
+ * UTF-8, is reported at the constant. */
+ensure_c_unit_of(tc: Toolchain, parts: CUnitParts, libraries: Buf[CLibrary], sources: Buf[Source]) -> Result[CUnit, string]
+    val bindings = parts.bindings
+    val handles = parts.handles
+    if bindings.len() == 0 && handles.len() == 0 && parts.enums.len() == 0 && parts.constants.len() == 0 && libraries.len() == 0 then return Ok(CUnit(None, false, map(), map(), buf()))
     // A binding is checked against a header, always, and a handle's glue compiled against one.
     var refused = ""
     for b in bindings
@@ -217,6 +317,18 @@ ensure_c_unit(tc: Toolchain, bindings: Buf[CUnitBinding], handles: Buf[CUnitHand
         var r = report()
         r.add(error(h.span, why))
         refused = refused + r.render(sources[h.unit])
+    for e in parts.enums
+        if package_headers(libraries, e.package) > 0 then continue
+        val why = if e.package == "" then s"the C enum mirror `${e.name}` is measured against the headers a package's manifest names under `c-libraries`, and this program has no avin.hocon" else s"the C enum mirror `${e.name}` has no header to be measured against: name the one that declares `${e.ty}` in a `headers` list of the `c-libraries` of package `${e.package}`"
+        var r = report()
+        r.add(error(e.span, why))
+        refused = refused + r.render(sources[e.unit])
+    for k in parts.constants
+        if package_headers(libraries, k.package) > 0 then continue
+        val why = if k.package == "" then s"the C constant `${k.name}` is measured against the headers a package's manifest names under `c-libraries`, and this program has no avin.hocon" else s"the C constant `${k.name}` has no header to be measured against: name the one that defines `${k.constant}` in a `headers` list of the `c-libraries` of package `${k.package}`"
+        var r = report()
+        r.add(error(k.span, why))
+        refused = refused + r.render(sources[k.unit])
     if refused != "" then return Err(refused)
     var cflags: Buf[string] = buf()
     var link: Buf[string] = buf()
@@ -234,8 +346,8 @@ ensure_c_unit(tc: Toolchain, bindings: Buf[CUnitBinding], handles: Buf[CUnitHand
             None ->
                 for name in library.link
                     add_flag(&link, "-l" + name)
-    if bindings.len() == 0 && handles.len() == 0 then return Ok(CUnit(None, false, map(), link))
-    val unit = c_unit_source(bindings, handles, libraries)
+    if bindings.len() == 0 && handles.len() == 0 && parts.enums.len() == 0 && parts.constants.len() == 0 then return Ok(CUnit(None, false, map(), map(), link))
+    val unit = c_unit_source_of(parts, libraries)
     val version = capture(tc.clang, ["--version"], timeout = 60000) match
         Ok(r) -> r.text
         Err(e) -> return Err("avin: " + missing_tool(tc.clang, e.to_string()) + "\n")
@@ -245,13 +357,50 @@ ensure_c_unit(tc: Toolchain, bindings: Buf[CUnitBinding], handles: Buf[CUnitHand
     val object = tc.c_unit_cache() + "/" + content_key(unit.text + "\n" + flags_text + answered + version) + ".o"
     var built = false
     if !exists(object)
-        compile_c_unit(tc, unit, cflags, object, bindings, handles, libraries, sources)?
+        compile_c_unit(tc, unit, cflags, object, parts, libraries, sources)?
         built = true
     val bytes = read_bytes(object).map_err(e -> s"avin: $object: ${e.to_string()}\n")?
     val measures = read_measures(bytes, unit.measured) match
         Some(m) -> m
         None -> return Err(s"avin: the C unit $object holds no measurements\n")
-    Ok(CUnit(Some(object), built, measures, link))
+    val values = read_values(bytes, unit.values) match
+        Some(v) -> v
+        None -> return Err(s"avin: the C unit $object holds no values\n")
+    val troubles = c_constant_troubles(parts.constants, values, sources)
+    if troubles != "" then return Err(troubles)
+    Ok(CUnit(Some(object), built, measures, values, link))
+
+private package_headers(libraries: Buf[CLibrary], package: string) -> usize
+    var headers = 0usize
+    for library in libraries
+        if library.package == package then headers += library.headers.len()
+    headers
+
+// What is wrong with the measured constants: an integer its Avin type cannot hold, which names the
+// value and the type, and a string that is not UTF-8.
+private c_constant_troubles(constants: Buf[CUnitConstant], values: Map[string, CValue], sources: Buf[Source]) -> string
+    var out = ""
+    for k in constants
+        val v = values.get(c_value_key(k.kind, k.constant)) match
+            Some(v) -> v
+            None -> continue
+        var why = ""
+        k.kind match
+            CConstInteger ->
+                val bits = *k.avin match
+                    Int(b) -> b
+                    _ -> 64u32
+                if !v.negative && v.integer < 0i64 then why = s"the C constant `${k.constant}` is greater than any `long` holds, so `${k.name}` cannot be `${type_name(k.avin)}`"
+                elif bits < 64u32
+                    val greatest = (1i64 << i64(bits - 1u32)) - 1i64
+                    if v.integer > greatest || v.integer < -greatest - 1i64 then why = s"the C constant `${k.constant}` is ${v.integer}, which `${type_name(k.avin)}` cannot hold, so `${k.name}` is a wider integer type"
+            CConstString -> if v.text is None then why = s"the C constant `${k.constant}` is a string that is not UTF-8, so `${k.name}` cannot be a `string`"
+            CConstReal -> ()
+        if why == "" then continue
+        var r = report()
+        r.add(error(k.span, why))
+        out = out + r.render(sources[k.unit])
+    out
 
 private add_flag(flags: *Buf[string], flag: string)
     for f in *flags
@@ -292,6 +441,11 @@ enum CUnitLine
     GlueLine(handle: usize, part: string)
     /** A line of the glue of `handles[handle]`'s `as:` conversion `entry`. */
     AsLine(handle: usize, entry: usize)
+    /** The check of the C type the enum mirror `enums[mirror]` names, `type` declaring it and
+     * `kind` checking it is an integer type. */
+    EnumLine(mirror: usize, part: string)
+    /** A line of the measurement of `values[entry]`: `kind` checks its kind, `value` measures it. */
+    ValueLine(entry: usize, part: string)
     /** A line of the glue of the field accessor `handles[handle].fields[field]`: `field` reads its
      * field and names its type, `kind` checks that type, `bound` with the index's position compiles
      * its bound, and `write` writes the field. */
@@ -303,12 +457,31 @@ struct CUnitSource
     text: string
     lines: Buf[CUnitLine]
     measured: Buf[string]
+    /** The constants and enumerators of its table of values, in order. */
+    values: Buf[CValueEntry]
+
+/** One value the C unit measures: the key it is kept under, its kind, the C constant or enumerator,
+ * and what it is measured for, a constant by its index or the variant `variant` of an enum mirror. */
+struct CValueEntry
+    key: string
+    kind: CConstKind
+    expr: string
+    constant: Option[usize]
+    mirror: Option[usize]
+    variant: usize
 
 /** The C unit for `bindings` and the glue of `handles`, including every header of `libraries`, in
  * `header_order`, so a binding naming another package's handle is checked with that package's
  * headers before its own. Each package's headers keep their order, and a header that is a C
  * identifier is a macro an earlier header defines, included as `#include NAME`. */
-c_unit_source(bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries: Buf[CLibrary]) -> CUnitSource
+c_unit_source(bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries: Buf[CLibrary]) -> CUnitSource = c_unit_source_of(CUnitParts(bindings, handles, buf(), buf()), libraries)
+
+/** The C unit of `parts`, as `c_unit_source` writes one, with the check of each enum mirror's type
+ * and the values of its enumerators and of the constants: a table of their own, after the
+ * measurements. */
+c_unit_source_of(parts: CUnitParts, libraries: Buf[CLibrary]) -> CUnitSource
+    val bindings = parts.bindings
+    val handles = parts.handles
     var out = str_builder()
     var lines: Buf[CUnitLine] = buf()
     // Line 0 does not exist; lines count from 1.
@@ -367,9 +540,11 @@ c_unit_source(bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries:
             lines.push(FreeLine(i, f))
         // Each named type at each position: the result first, then the parameters.
         for k in 0..<p.params.len() + 1
-            val c = if k == 0 then p.result else p.params[k - 1].ty
+            // An `out` or `inout` parameter's value is the type its pointer points at, answered.
+            val written = k > 0 && !(p.params[k - 1].mode is CIn)
+            val c = if k == 0 then p.result elif written then p.params[k - 1].pointee else p.params[k - 1].ty
             val avin = if k == 0 then b.result else b.params[k - 1]
-            val kind = c_kind_needed(c, avin, b.forms[k], k == 0) match
+            val kind = c_kind_needed(c, avin, b.forms[k], k == 0 || written) match
                 Some(kind) -> kind
                 None -> continue
             val spelled = c_spelling(c)
@@ -401,7 +576,8 @@ c_unit_source(bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries:
         lines.push(Plain)
     out.push("};\n")
     lines.push(Plain)
-    CUnitSource(out.finish(), lines, measured)
+    val values = value_table(&out, &lines, parts)
+    CUnitSource(out.finish(), lines, measured, values)
 
 // The glue of the handle classes. A handle's object is four words: its C pointer, null once given
 // back; its owner; the C references it holds to what it keeps, a list off the heap; and the Avin
@@ -543,6 +719,116 @@ private glue(out: *StrBuilder, lines: *Buf[CUnitLine], text: string, line: CUnit
     out.push(text + "\n")
     lines.push(line)
 
+// The values: each enum mirror's C type checked to be an integer type, each constant and enumerator
+// checked to be the kind its Avin type asks for, an integer, a floating-point or integer value, or a
+// string literal, and then one packed struct holding the marker, the count and each value in order: an
+// integer as a `long long` and a byte saying whether it is negative, a `real` as a `double`, and a
+// string as its length, a `long long`, and its bytes with the NUL after them. The driver reads the
+// struct out of the object as the measurements are, in the target's byte order, which is little-endian
+// on every target Avin builds for.
+private value_table(out: *StrBuilder, lines: *Buf[CUnitLine], parts: CUnitParts) -> Buf[CValueEntry]
+    var entries: Buf[CValueEntry] = buf()
+    var keys: Buf[string] = buf()
+    for i in 0..<parts.enums.len()
+        val e = parts.enums[i]
+        glue(out, lines, s"typedef ${e.ty} avin_c_enum_type_$i;", EnumLine(i, "type"))
+        glue(out, lines, s"_Static_assert(__builtin_classify_type(*(avin_c_enum_type_$i *)0) == 1, \"avin: the C enum mirror ${e.name}\");", EnumLine(i, "kind"))
+        for v in 0..<e.enumerators.len()
+            val key = c_value_key(CConstInteger, e.enumerators[v])
+            if contains_text(keys, key) then continue
+            keys.push(key)
+            entries.push(CValueEntry(key, CConstInteger, e.enumerators[v], None, Some(i), v))
+    for i in 0..<parts.constants.len()
+        val k = parts.constants[i]
+        val key = c_value_key(k.kind, k.constant)
+        if contains_text(keys, key) then continue
+        keys.push(key)
+        entries.push(CValueEntry(key, k.kind, k.constant, Some(i), None, 0))
+    for j in 0..<entries.len()
+        val x = entries[j].expr
+        val class = s"__builtin_classify_type($x)"
+        val test = entries[j].kind match
+            CConstInteger -> s"$class == 1"
+            CConstReal -> s"$class == 8 || $class == 1"
+            CConstString -> s"__builtin_types_compatible_p(__typeof__($x), char[sizeof($x)])"
+        glue(out, lines, s"_Static_assert($test, \"avin: the C constant $x\");", ValueLine(j, "kind"))
+    glue(out, lines, "struct __attribute__((packed)) avin_c_unit_values {", Plain)
+    glue(out, lines, s"    unsigned char marker[${ValueMarker.bytes.len}];", Plain)
+    glue(out, lines, "    unsigned char count[2];", Plain)
+    for j in 0..<entries.len()
+        val x = entries[j].expr
+        val member = entries[j].kind match
+            CConstInteger -> s"    long long v$j; unsigned char n$j;"
+            CConstReal -> s"    double v$j;"
+            CConstString -> s"    long long v$j; char s$j[sizeof($x)];"
+        glue(out, lines, member, ValueLine(j, "value"))
+    glue(out, lines, "};", Plain)
+    glue(out, lines, "__attribute__((used)) const struct avin_c_unit_values avin_c_unit_values = {", Plain)
+    var marker = "    {"
+    for byte in ValueMarker.bytes
+        marker = marker + s" $byte,"
+    glue(out, lines, marker + " },", Plain)
+    glue(out, lines, s"    { ${entries.len() % 256}, ${entries.len() / 256} },", Plain)
+    for j in 0..<entries.len()
+        val x = entries[j].expr
+        val value = entries[j].kind match
+            CConstInteger -> s"    (long long)($x), ($x) < 0,"
+            CConstReal -> s"    (double)($x),"
+            CConstString -> s"    (long long)sizeof($x) - 1, $x,"
+        glue(out, lines, value, ValueLine(j, "value"))
+    glue(out, lines, "};", Plain)
+    entries
+
+/** What the table of values begins with, which finds it among the object's bytes. */
+const ValueMarker: string = "avin.c-unit.values:"
+
+/** The values in a C unit's object, by key, or `None` where the object holds no table of
+ * `entries.len()` values. */
+read_values(bytes: []const u8, entries: Buf[CValueEntry]) -> Option[Map[string, CValue]]
+    val marker = ValueMarker.bytes
+    var at: Option[usize] = None
+    var i = 0usize
+    while i + marker.len <= bytes.len
+        var same = true
+        for k in 0..<marker.len
+            if bytes[i + k] != marker[k]
+                same = false
+                break
+        if same
+            at = Some(i + marker.len)
+            break
+        i += 1
+    var p = at?
+    if p + 2 > bytes.len then return None
+    val count = usize(bytes[p]) + usize(bytes[p + 1]) * 256
+    if count != entries.len() then return None
+    p += 2
+    var out: Map[string, CValue] = map()
+    for e in entries
+        if p + 8 > bytes.len then return None
+        var word = 0u64
+        for k in 0..<8usize
+            word = word | (u64(bytes[p + k]) << u64(8 * k))
+        p += 8
+        e.kind match
+            CConstInteger ->
+                if p + 1 > bytes.len then return None
+                // The word's top bit is the sign of the `long long`.
+                val high = 9223372036854775808u64
+                val value = if word < high then i64(word) else i64(word - high) + (-9223372036854775807i64 - 1i64)
+                out.put(e.key, CValue(value, bytes[p] != 0u8, 0.0, None))
+                p += 1
+            CConstReal -> out.put(e.key, CValue(0i64, false, real.from_bits(word), None))
+            CConstString ->
+                val length = usize(word)
+                if p + length + 1 > bytes.len then return None
+                val text = from_utf8(bytes[p..<p + length]) match
+                    Ok(t) -> Some(t)
+                    Err(_) -> None
+                out.put(e.key, CValue(0i64, false, 0.0, text))
+                p += length + 1
+    Some(out)
+
 /** Whether a holder keeps a handle of `h`'s class by a C reference of its own: the class declares
  * `retain:`, and no `kept:`, whose names only its own object holds. */
 kept_by_reference(h: CUnitHandle) -> bool = h.retain is Some(_) && h.kept is None
@@ -584,7 +870,7 @@ private contains_text(xs: Buf[string], x: string) -> bool
     false
 
 // Compiles the C unit into `object`, published by rename, or renders why it did not compile.
-private compile_c_unit(tc: Toolchain, unit: CUnitSource, cflags: Buf[string], object: string, bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries: Buf[CLibrary], sources: Buf[Source]) -> Result[unit, string]
+private compile_c_unit(tc: Toolchain, unit: CUnitSource, cflags: Buf[string], object: string, parts: CUnitParts, libraries: Buf[CLibrary], sources: Buf[Source]) -> Result[unit, string]
     make_dir_all(tc.c_unit_cache()).map_err(e -> s"avin: ${tc.c_unit_cache()}: ${e.to_string()}\n")?
     val dir = make_temp_dir("avin-c-unit").map_err(e -> s"avin: ${e.to_string()}\n")?
     defer _ = remove_dir_all(dir)
@@ -598,7 +884,7 @@ private compile_c_unit(tc: Toolchain, unit: CUnitSource, cflags: Buf[string], ob
     for f in cflags
         args.push(f)
     val result = capture(tc.clang, args.view(), stderr = true, timeout = 120000).map_err(e -> "avin: " + missing_tool(tc.clang, e.to_string()) + "\n")?
-    if !result.status.ok() then return Err(c_unit_diagnostics(result.err.unwrap_or("") + result.text, unit, bindings, handles, libraries, sources))
+    if !result.status.ok() then return Err(c_unit_diagnostics_of(result.err.unwrap_or("") + result.text, unit, parts, libraries, sources))
     publish_file(pending, object).map_err(e -> s"avin: $object: ${e.to_string()}\n")?
     Ok(())
 
@@ -617,7 +903,21 @@ private struct BindingTrouble
 
 /** Clang's diagnostics of the C unit `unit`, placed back at the bindings and the libraries they came
  * from; anything clang said that no line of the unit accounts for is passed on as it was. */
-c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries: Buf[CLibrary], sources: Buf[Source]) -> string
+c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries: Buf[CLibrary], sources: Buf[Source]) -> string = c_unit_diagnostics_of(output, unit, CUnitParts(bindings, handles, buf(), buf()), libraries, sources)
+
+/** Clang's diagnostics of the C unit of `parts`, as `c_unit_diagnostics` places them, with those of
+ * the enum mirrors and the constants placed at each. */
+c_unit_diagnostics_of(output: string, unit: CUnitSource, parts: CUnitParts, libraries: Buf[CLibrary], sources: Buf[Source]) -> string
+    val bindings = parts.bindings
+    val handles = parts.handles
+    // What each enum mirror's check and each value's measurement said: one message each.
+    var enum_said: Buf[bool] = buf()
+    for _ in parts.enums
+        enum_said.push(false)
+    var value_said: Buf[bool] = buf()
+    for _ in unit.values
+        value_said.push(false)
+    var values_text = ""
     var troubles: Buf[BindingTrouble] = buf()
     for _ in bindings
         troubles.push(BindingTrouble("", "", false, "", "", buf(), buf(), buf()))
@@ -746,8 +1046,55 @@ c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding
                     troubles[i].frees.push(s"the C binding `${bindings[i].name}` frees its result with `$name`, which no header of its package declares")
                 elif d.message.starts_with("static assertion failed")
                     troubles[i].frees.push(s"the C binding `${bindings[i].name}` frees its result with `$name`, which the headers do not declare as a function taking the string and answering nothing, `void $name(void *)` or `void $name(char *)`")
+            EnumLine(i, part) ->
+                placed_any = true
+                if enum_said[i] then continue
+                enum_said[i] = true
+                val e = parts.enums[i]
+                val m = if part == "kind" then s"the C enum mirror `${e.name}` mirrors `${e.ty}`, which is not an enumeration or an integer type in its headers" else s"the C enum mirror `${e.name}` mirrors `${e.ty}`, which its headers do not declare as a type: clang says '${d.message}'"
+                var r = report()
+                r.add(error(e.span, m))
+                values_text = values_text + r.render(sources[e.unit])
+            ValueLine(j, part) ->
+                placed_any = true
+                if value_said[j] then continue
+                value_said[j] = true
+                val entry = unit.values[j]
+                val undeclared = d.message.starts_with("use of undeclared identifier")
+                var m = ""
+                var span = Span(0, 0)
+                var at_unit = 0usize
+                entry.constant match
+                    Some(k) ->
+                        val c = parts.constants[k]
+                        span = c.span
+                        at_unit = c.unit
+                        val what = c.kind match
+                            CConstInteger -> "an integer"
+                            CConstReal -> "a number"
+                            CConstString -> "a string literal"
+                        if undeclared then m = s"the C constant `${c.constant}` of `${c.name}` is not defined by any header of its package"
+                        elif part == "kind" && d.message.starts_with("static assertion failed") then m = s"the C constant `${c.constant}` is not $what in its headers, so `${c.name}` cannot be `${type_name(c.avin)}`"
+                        else m = s"the C constant `${c.constant}` of `${c.name}` is not a constant its headers define: clang says '${d.message}'"
+                    None ->
+                        // A mirror whose type the headers do not declare is reported once, at the
+                        // mirror, and not again at each of its variants.
+                        if enum_said[entry.mirror.unwrap()] then continue
+                        val e = parts.enums[entry.mirror.unwrap()]
+                        val v = entry.variant
+                        span = e.variant_spans[v]
+                        at_unit = e.unit
+                        val enumerator = e.enumerators[v]
+                        if undeclared
+                            m = s"the variant `${e.variants[v]}` of the C enum mirror `${e.name}` mirrors `$enumerator`, which no header of its package declares"
+                            if !e.named[v] then m = m + s"; a variant whose enumerator is not the prefix and its words names it with `@c(\"<enumerator>\")` before the variant"
+                        elif part == "kind" && d.message.starts_with("static assertion failed") then m = s"the variant `${e.variants[v]}` of the C enum mirror `${e.name}` mirrors `$enumerator`, which is not an integer constant in its headers"
+                        else m = s"the variant `${e.variants[v]}` of the C enum mirror `${e.name}` mirrors `$enumerator`, which does not compile against its headers: clang says '${d.message}'"
+                var r = report()
+                r.add(error(span, m))
+                values_text = values_text + r.render(sources[at_unit])
             Plain -> unplaced = unplaced + text + "\n"
-    var rendered = libraries_text
+    var rendered = libraries_text + values_text
     for i in 0..<handles.len()
         if glue_messages[i].len() == 0 then continue
         var r = report()

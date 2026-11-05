@@ -167,12 +167,12 @@ parameter's bound, has one taking one argument, at the built-in `+`'s own preced
 `a + b * k` is `a + (b * k)` whichever of them are methods:
 
 ```text
-data Instant(micros: long)
+data Instant(epochMicros: long)
 
 impl Instant
-    +(d: Duration) -> Instant = Instant(micros + d.micros)
-    -(d: Duration) -> Instant = Instant(micros - d.micros)
-    -(earlier: Instant) -> Duration = Duration(micros - earlier.micros)
+    +(d: Duration) -> Instant = Instant(epochMicros + d.micros)
+    -(d: Duration) -> Instant = Instant(epochMicros - d.micros)
+    -(earlier: Instant) -> Duration = Duration(epochMicros - earlier.epochMicros)
 
 class Vec(val x: real, val y: real)
     *(k: real) -> Vec = Vec(x * k, y * k)

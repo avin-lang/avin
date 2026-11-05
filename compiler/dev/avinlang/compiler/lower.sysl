@@ -798,6 +798,7 @@ private constant_of(l: *Lowering, e: &TExpr) -> Option[Constant] = e.kind match
     RealConst(value) -> Some(Constant(Some(ConstReal(value))))
     StrConst(value) -> Some(Constant(Some(string_constant(l, value))))
     UnitConst -> Some(Constant(None))
+    CConst(name) -> Some(Constant(Some(c_constant(l, e.ty, name))))
     Global(g) -> global_constant(l, g) match
         Some(k) -> Some(Constant(Some(k)))
         None -> None
@@ -2053,25 +2054,66 @@ private binding_body(l: *Lowering, symbol: FunctionSymbol, shim: string)
 // `shared`, and hold its C pointer, or the program stops at the call; C is passed the pointer, and
 // null for `None`. A pointer C answers as a handle is null-checked as a string is, then made the
 // handle's object, owned by the code running, after a reference of its own is taken through the
-// class's `retain` where the binding says `borrowed`. A status is `Ok(())` for zero and `Err` of the
+// class's `retain` where the binding says `borrowed`. A status is `Ok` for zero and `Err` of the
 // code otherwise. Once the call has succeeded, what it `keeps:` is kept by the handle it answered, or
 // by a method's receiver, and what it `consumes:` is closed without its `release`.
+//
+// An enum mirror crosses as the value its variant's enumerator has, at the width of the C type; a
+// value C answers is the first variant holding it, and one no variant holds stops the program.
+//
+// Each `out` and `inout` parameter is a slot in the binding's frame, at the width of the C type it
+// points at, which C is passed the address of: an `inout` one holds the argument, converted as any
+// argument is, and an `out` one zero or null. Once C has returned, each is read as a result of that
+// type is, a handle made, a string copied and a mirror's variant found; for a status, only when it is
+// zero. The binding answers the C result, unless it is left out, followed by the out values, as a
+// tuple of them where there is more than one, or in the status's `Ok`.
 private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
     val outer = l.library
     l.library = true
     val at = symbol.decl.name_span
+    // What each Avin parameter passed, for `keeps:` and `consumes:`: its operand, its handle object
+    // where it is a handle, perhaps null for `None`, its class and whether it is in an `Option`.
     var args: Buf[Operand] = buf()
-    // What C is passed: the arguments, each handle as the C type its parameter names, through its
-    // class's `as:` conversion where that is not the class's own.
-    var passed: Buf[Operand] = buf()
-    var scalars: Buf[CScalar] = buf()
-    var copies: Buf[Operand] = buf()
-    // Each parameter's handle object, where it is a handle, perhaps null for `None`, and its class.
     var objects: Buf[Option[Operand]] = buf()
     var classes: Buf[usize] = buf()
     var optionals: Buf[bool] = buf()
+    // What C is passed, by the prototype's parameters: each handle as the C type its parameter names,
+    // through its class's `as:` conversion where that is not the class's own, and each `out` and
+    // `inout` parameter as the address of its slot.
+    var passed: Buf[Operand] = buf()
+    var scalars: Buf[CScalar] = buf()
+    var copies: Buf[Operand] = buf()
+    var outs: Buf[COutSlot] = buf()
     val skipped = symbol.params.len() - symbol.decl.params.len()
-    for i in 0..<symbol.params.len()
+    val result_type = concrete(l, symbol.result.unwrap_or(Unit))
+    val parts = c_result_parts(p, result_type, l.program.data) match
+        Ok(parts) -> parts
+        Err(why) -> panic(why)
+    var in_at = 0usize
+    var out_at = 0usize
+    for k in 0..<p.params.len()
+        val q = p.params[k]
+        if !(q.mode is CIn)
+            val t = concrete(l, parts.outs[out_at])
+            out_at += 1
+            var given: Option[Operand] = None
+            var given_type: &Type = Unit
+            if q.mode is CInOut
+                val x = Value(l.param_values[in_at].unwrap())
+                given = Some(x)
+                given_type = concrete(l, symbol.params[in_at])
+                args.push(x)
+                objects.push(None)
+                classes.push(0)
+                optionals.push(false)
+                in_at += 1
+            val slot = c_out_slot(l, symbol, q, t, given, given_type, &copies, at)
+            outs.push(slot)
+            scalars.push(CAddress)
+            passed.push(SlotAddress(slot.slot))
+            continue
+        val i = in_at
+        in_at += 1
         val t = concrete(l, symbol.params[i])
         val x = Value(l.param_values[i].unwrap())
         objects.push(None)
@@ -2085,88 +2127,299 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
             scalars.push(CAddress)
             val pointer = c_handle_pointer(l, object, h.class_index, h.optional, at)
             args.push(pointer)
-            passed.push(c_converted(l, pointer, h.class_index, p.params[i].text))
+            passed.push(c_converted(l, pointer, h.class_index, q.text))
             continue
         val form = c_text_form(t, l.program.data, l.program.classes)
         if form is TextString(optional)
-            val text = if !optional then x elif pointer_option(l, t) then x else option_pointer(l, t, x)
-            val name = c_parameter_name(symbol.decl, i - skipped)
-            val site = trap_site(l, s"the string passed to `$name` of `${symbol.name}` holds a NUL", at)
-            val copy = runtime_call(l, "avin_rt_c_string_in", [MRef, MPtr], MPtr, [text, TrapSiteAddress(site)])
+            val copy = c_string_in(l, symbol, t, x, optional, i - skipped, at)
             copies.push(copy)
             scalars.push(CAddress)
             args.push(copy)
             passed.push(copy)
             continue
-        val s = c_scalar_of(p.params[i].ty, t, l.program.c_measures)
+        if c_mirror_of(t, l.program.data) is Some(d)
+            val s = c_scalar_of(q.ty, Int(64), l.program.c_measures)
+            scalars.push(s)
+            val value = c_mirror_argument(l, x, d, s)
+            args.push(value)
+            passed.push(value)
+            continue
+        val s = c_scalar_of(q.ty, t, l.program.c_measures)
         scalars.push(s)
-        val converted = c_argument(l, x, t, s, c_integer_name(p.params[i].ty, s), at)
+        val converted = c_argument(l, x, t, s, c_integer_name(q.ty, s), at)
         args.push(converted)
         passed.push(converted)
-    val calls = CCall(s"`${p.symbol}` answered", args, objects, classes, optionals, skipped)
-    val result_type = concrete(l, symbol.result.unwrap_or(Unit))
-    val free = c_free_text(symbol.decl)
-    val result_form = c_text_form(result_type, l.program.data, l.program.classes)
-    val text_result = !(result_form is NoText) || (*result_type is Unit && free is Some(_))
-    if *result_type is Unit && !text_result
-        l.insts.push(Call(None, CFunction(p.symbol, scalars, None), passed))
-        c_release_copies(l, copies)
-        c_after_call(l, symbol, calls, None, None)
-        l.library = outer
-        finish(l, Return(None))
-        return
-    if text_result
-        val answer = fresh(l, MPtr)
-        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(CAddress)), passed))
-        // C may answer a pointer into a string it was passed, so the copies outlive the answer's.
-        val value = c_text_answer(l, Value(answer), result_type, result_form, free, s"`${p.symbol}` answered", at)
-        c_release_copies(l, copies)
-        c_after_call(l, symbol, calls, None, None)
-        l.library = outer
-        finish(l, Return(value))
-        return
-    if c_handle_form(result_type, l.program.data, l.program.classes) is Some(h)
-        val answer = fresh(l, MPtr)
-        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(CAddress)), passed))
-        c_release_copies(l, copies)
-        val value = c_handle_answer(l, symbol, calls, Value(answer), result_type, h, at)
-        l.library = outer
-        finish(l, Return(Some(value)))
-        return
-    if c_status_error(result_type, l.program.data) is Some(e)
-        val s = c_scalar_of(p.result, e, l.program.c_measures)
+    var answers_handle = c_handle_form(parts.result, l.program.data, l.program.classes) is Some(_)
+    for o in outs
+        if c_handle_form(o.t, l.program.data, l.program.classes) is Some(_) then answers_handle = true
+    val calls = CCall(s"`${p.symbol}` answered", args, objects, classes, optionals, skipped, answers_handle)
+    val answered = concrete(l, parts.result)
+    // A status: `Ok` of the out values, read only when it is zero, and `Err` of the code otherwise.
+    if c_status_error(answered, l.program.data) is Some(e)
+        val mirror = c_mirror_of(e, l.program.data)
+        val s = c_scalar_of(p.result, if mirror is Some(_) then Int(64) else e, l.program.c_measures)
         val answer = fresh(l, c_machine(s))
         l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), passed))
-        c_release_copies(l, copies)
-        val zero = s match
-            CSigned(bits) -> ConstInt(bits, "0")
-            CUnsigned(bits) -> ConstInt(bits, "0")
-            _ -> ConstInt(32, "0")
-        val ok = compare(l, CmpEq, Value(answer), zero)
-        // What the call keeps and takes is kept and taken only when it succeeded.
-        c_after_call(l, symbol, calls, None, Some(ok))
+        val ok = compare(l, CmpEq, Value(answer), c_zero(s))
         val slot = machine_slot(l, MRef)
         val yes = new_block(l)
         val no = new_block(l)
         val join = new_block(l)
         finish_into(l, Branch(ok, yes, no), yes)
-        store(l, slot, Some(variant_object(l, result_type, "Ok", None)))
+        val read = c_read_outs(l, symbol, calls, outs, at)
+        c_keeps(l, symbol, calls, read.made, read.made_optional)
+        val ok_type = c_status_ok(answered)
+        store(l, slot, Some(variant_object(l, answered, "Ok", c_assemble(l, ok_type, read.values))))
         finish_into(l, Jump(join), no)
-        val code = c_answer(l, Value(answer), s, e, at)
-        store(l, slot, Some(variant_object(l, result_type, "Err", Some(code))))
+        val code = mirror match
+            Some(d) -> c_mirror_answer(l, Value(answer), d, s, s"`${p.symbol}` answered", at)
+            None -> c_answer(l, Value(answer), s, e, at)
+        store(l, slot, Some(variant_object(l, answered, "Err", Some(code))))
         finish_into(l, Jump(join), join)
+        c_release_copies(l, copies)
+        c_consumes(l, symbol, calls)
         val value = load(l, slot).unwrap()
         l.library = outer
         finish(l, Return(Some(value)))
         return
-    val s = c_scalar_of(p.result, result_type, l.program.c_measures)
-    val answer = fresh(l, c_machine(s))
-    l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), passed))
+    val free = c_free_text(symbol.decl)
+    val result_form = c_text_form(answered, l.program.data, l.program.classes)
+    val text_result = !(result_form is NoText) || (*answered is Unit && free is Some(_) && !(p.result is CVoidType))
+    var first: Option[Operand] = None
+    var made: Option[Operand] = None
+    var made_optional = false
+    if text_result
+        val answer = fresh(l, MPtr)
+        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(CAddress)), passed))
+        // C may answer a pointer into a string it was passed, so the copies outlive the answer's.
+        first = c_text_answer(l, Value(answer), answered, result_form, free, s"`${p.symbol}` answered", at)
+    elif c_handle_form(answered, l.program.data, l.program.classes) is Some(h)
+        val answer = fresh(l, MPtr)
+        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(CAddress)), passed))
+        val handle = c_handle_out(l, symbol, calls, Value(answer), answered, h, s"`${p.symbol}` answered", at)
+        first = Some(handle.value)
+        made = Some(handle.object)
+        made_optional = h.optional
+    elif *answered is Unit
+        l.insts.push(Call(None, CFunction(p.symbol, scalars, None), passed))
+    elif c_mirror_of(answered, l.program.data) is Some(d)
+        val s = c_scalar_of(p.result, Int(64), l.program.c_measures)
+        val answer = fresh(l, c_machine(s))
+        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), passed))
+        first = Some(c_mirror_answer(l, Value(answer), d, s, s"`${p.symbol}` answered", at))
+    else
+        val s = c_scalar_of(p.result, answered, l.program.c_measures)
+        val answer = fresh(l, c_machine(s))
+        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), passed))
+        first = Some(c_answer(l, Value(answer), s, answered, at))
+    val read = c_read_outs(l, symbol, calls, outs, at)
     c_release_copies(l, copies)
-    val value = c_answer(l, Value(answer), s, result_type, at)
-    c_after_call(l, symbol, calls, None, None)
+    if made is None
+        made = read.made
+        made_optional = read.made_optional
+    c_keeps(l, symbol, calls, made, made_optional)
+    c_consumes(l, symbol, calls)
+    var values: Buf[Option[Operand]] = buf()
+    if !(*answered is Unit) then values.push(first)
+    for v in read.values
+        values.push(v)
+    val value = if outs.len() == 0 then first else c_assemble(l, result_type, values)
     l.library = outer
-    finish(l, Return(Some(value)))
+    finish(l, Return(value))
+
+// The zero of the C integer crossing as `s`.
+private c_zero(s: CScalar) -> Operand = s match
+    CSigned(bits) -> ConstInt(bits, "0")
+    CUnsigned(bits) -> ConstInt(bits, "0")
+    _ -> ConstInt(32, "0")
+
+// The copy of the string `x` of type `t`, perhaps an `Option` of one, passed to parameter `i` of a
+// binding: NUL-terminated memory off the heap, null for `None`, which stops the program on a held NUL.
+private c_string_in(l: *Lowering, symbol: FunctionSymbol, t: &Type, x: Operand, optional: bool, i: usize, at: Span) -> Operand
+    val text = if !optional then x elif pointer_option(l, t) then x else option_pointer(l, t, x)
+    val name = c_parameter_name(symbol.decl, i)
+    val site = trap_site(l, s"the string passed to `$name` of `${symbol.name}` holds a NUL", at)
+    runtime_call(l, "avin_rt_c_string_in", [MRef, MPtr], MPtr, [text, TrapSiteAddress(site)])
+
+/** An `out` or `inout` parameter of a binding's call: its prototype parameter, the Avin type of its
+ * value, the slot C writes it in, and how that value crosses where it is a scalar or a mirror. */
+private struct COutSlot
+    q: CParam
+    t: &Type
+    slot: usize
+    scalar: CScalar
+
+// The slot of the `out` or `inout` parameter `q`, whose value is of Avin type `t`, holding the
+// argument `given`, of Avin type `given_type`, converted to the C type `q` points at, or zero or null.
+// A C `float` is kept as its bits, which C writes; a string given is copied, and the copy freed with
+// the others.
+private c_out_slot(l: *Lowering, symbol: FunctionSymbol, q: CParam, t: &Type, given: Option[Operand], given_type: &Type, copies: *Buf[Operand], at: Span) -> COutSlot
+    val pointer = c_handle_form(t, l.program.data, l.program.classes) is Some(_) || !(c_text_form(t, l.program.data, l.program.classes) is NoText)
+    if pointer
+        val place = machine_slot(l, MPtr)
+        var start: Operand = NullAddress
+        if given is Some(x)
+            val form = c_text_form(given_type, l.program.data, l.program.classes)
+            if form is TextString(optional)
+                val copy = c_string_in(l, symbol, given_type, x, optional, c_out_parameter_index(symbol, q), at)
+                copies.push(copy)
+                start = copy
+        store(l, place, Some(start))
+        return COutSlot(q, t, slot_of(place), CAddress)
+    val mirror = c_mirror_of(t, l.program.data)
+    val s = c_scalar_of(q.pointee, if mirror is Some(_) then Int(64) else t, l.program.c_measures)
+    val m = if s is CBinary32 then MInt(32) else c_machine(s)
+    val place = machine_slot(l, m)
+    var start: Operand = s match
+        CSigned(bits) -> ConstInt(bits, "0")
+        CUnsigned(bits) -> ConstInt(bits, "0")
+        CBoolean -> ConstBool(false)
+        CBinary32 -> ConstInt(32, "0")
+        _ -> ConstReal(0.0)
+    if given is Some(x)
+        if c_mirror_of(given_type, l.program.data) is Some(d) then start = c_mirror_argument(l, x, d, s)
+        else
+            start = c_argument(l, x, given_type, s, c_integer_name(q.pointee, s), at)
+            if s is CBinary32 then start = convert_op(l, RealToBinary32, MInt(32), start)
+    store(l, place, Some(start))
+    COutSlot(q, t, slot_of(place), s)
+
+// The position among a binding's declared parameters of the `inout` parameter `q`, for a trap's
+// name of it.
+private c_out_parameter_index(symbol: FunctionSymbol, q: CParam) -> usize
+    for i in 0..<symbol.decl.params.len()
+        if symbol.decl.params[i].pattern.kind is Name(n) && n == q.name then return i
+    0
+
+private slot_of(place: Option[Place]) -> usize = place.unwrap().address match
+    SlotAddress(id) -> id
+    _ -> panic("a slot's place is its address")
+
+/** The out values read after a call, each perhaps none for `unit`, and the first handle among them,
+ * which keeps what the call `keeps:` where the C result is no handle, perhaps null where it is in an
+ * `Option`. */
+private struct COutValues
+    values: Buf[Option[Operand]]
+    made: Option[Operand]
+    made_optional: bool
+
+// Reads each out value from its slot, as a result of the C type it points at is read.
+private c_read_outs(l: *Lowering, symbol: FunctionSymbol, call: CCall, outs: Buf[COutSlot], at: Span) -> COutValues
+    var values: Buf[Option[Operand]] = buf()
+    var made: Option[Operand] = None
+    var made_optional = false
+    for o in outs
+        val who = s"${call.symbol} through `${o.q.name}`"
+        val place = Some(Place(SlotAddress(o.slot), if o.scalar is CAddress then MPtr elif o.scalar is CBinary32 then MInt(32) else c_machine(o.scalar)))
+        val x = load(l, place).unwrap()
+        if c_handle_form(o.t, l.program.data, l.program.classes) is Some(h)
+            val handle = c_handle_out(l, symbol, call, x, o.t, h, who, at)
+            values.push(Some(handle.value))
+            if made is None
+                made = Some(handle.object)
+                made_optional = h.optional
+            continue
+        val form = c_text_form(o.t, l.program.data, l.program.classes)
+        if !(form is NoText)
+            values.push(c_text_answer(l, x, o.t, form, None, who, at))
+            continue
+        if c_mirror_of(o.t, l.program.data) is Some(d)
+            values.push(Some(c_mirror_answer(l, x, d, o.scalar, who, at)))
+            continue
+        val v = if o.scalar is CBinary32 then convert_op(l, Binary32ToReal, MReal, x) else x
+        values.push(Some(c_answer(l, v, o.scalar, o.t, at)))
+    COutValues(values, made, made_optional)
+
+// The binding's answer of Avin type `t` made of `values`: one value alone is itself, and more are a
+// tuple of them.
+private c_assemble(l: *Lowering, t: &Type, values: Buf[Option[Operand]]) -> Option[Operand]
+    if values.len() == 0 then return None
+    if values.len() == 1 then return values[0]
+    val shape = layout(l, concrete(l, t)).variants[0]
+    val object = fresh(l, MRef)
+    l.insts.push(Alloc(object, shape.descriptor))
+    for i in 0..<values.len()
+        if shape.fields[i] is Some(field)
+            if values[i] is Some(v) then l.insts.push(Store(field_address(l, Value(object), field), v))
+    l.insts.push(Publish)
+    Some(Value(object))
+
+/** A handle C answered: the Avin value, perhaps an `Option`, and the object, null for `None`. */
+private struct CHandleOut
+    value: Operand
+    object: Operand
+
+// The value `t` makes of the handle pointer C answered at `answer`: null is `None`, or stops the
+// program where `t` is no `Option`, `who` saying what answered; any other pointer is a new object of
+// the class, as `c_new_handle` makes it.
+private c_handle_out(l: *Lowering, symbol: FunctionSymbol, call: CCall, answer: Operand, t: &Type, h: CHandleForm, who: string, at: Span) -> CHandleOut
+    val absent = compare(l, CmpEq, answer, NullAddress)
+    if !h.optional
+        trap_if(l, absent, s"$who null", at)
+        val made = c_new_handle(l, symbol, call, answer, h.class_index)
+        return CHandleOut(made, made)
+    val slot = machine_slot(l, MRef)
+    val none = new_block(l)
+    val present = new_block(l)
+    val join = new_block(l)
+    finish_into(l, Branch(absent, none, present), none)
+    store(l, slot, Some(NullAddress))
+    finish_into(l, Jump(join), present)
+    store(l, slot, Some(c_new_handle(l, symbol, call, answer, h.class_index)))
+    finish_into(l, Jump(join), join)
+    val object = load(l, slot).unwrap()
+    CHandleOut(if pointer_option(l, t) then object else option_object(l, t, object), object)
+
+// The enumerator values of the variants of the enum mirror `d`, in order, as the C unit measured them.
+private c_mirror_values(l: *Lowering, d: usize) -> Buf[i64]
+    var out: Buf[i64] = buf()
+    val e = c_enum_of(l.program.data[d].decl).unwrap()
+    for v in l.program.data[d].decl.variants
+        out.push(c_value(l, c_value_key(CConstInteger, c_enumerator(e, v))).integer)
+    out
+
+// `value` as a constant of the C integer crossing as `s`: its low bits, written as the signed number
+// they make, so an unsigned type's greatest values are written as negative ones.
+private c_integer_constant(value: i64, s: CScalar) -> Operand
+    val bits = s match
+        CSigned(b) -> b
+        CUnsigned(b) -> b
+        _ -> 32u32
+    if bits >= 64u32 then return ConstInt(64, value.to_string())
+    val span = 1i64 << i64(bits)
+    var low = value % span
+    if low < 0i64 then low = low + span
+    if low >= span / 2i64 then low = low - span
+    ConstInt(bits, low.to_string())
+
+// The C value of the enum mirror `d`'s value `x`: its variant's enumerator, at the width of `s`.
+private c_mirror_argument(l: *Lowering, x: Operand, d: usize, s: CScalar) -> Operand
+    val values = c_mirror_values(l, d)
+    var result = c_integer_constant(values[0], s)
+    if values.len() == 1 then return result
+    val tag = variant_tag(l, x)
+    for v in 1..<values.len()
+        val dest = fresh(l, c_machine(s))
+        l.insts.push(Select(dest, compare(l, CmpEq, tag, ConstInt(64, v.to_string())), c_integer_constant(values[v], s), result))
+        result = Value(dest)
+    result
+
+// The variant of the enum mirror `d` holding the C value `x`, crossing as `s`: the first one whose
+// enumerator has that value. A value no variant holds stops the program, `who` saying what answered.
+private c_mirror_answer(l: *Lowering, x: Operand, d: usize, s: CScalar, who: string, at: Span) -> Operand
+    val values = c_mirror_values(l, d)
+    val t: &Type = Data(d, l.program.data[d].name, buf())
+    val slot = machine_slot(l, MRef)
+    val join = new_block(l)
+    for v in 0..<values.len()
+        val yes = new_block(l)
+        val next = new_block(l)
+        finish_into(l, Branch(compare(l, CmpEq, x, c_integer_constant(values[v], s)), yes, next), yes)
+        store(l, slot, Some(variant_object(l, t, l.program.data[d].decl.variants[v].name, None)))
+        finish_into(l, Jump(join), next)
+    val site = trap_site(l, s"$who a value no variant of `${l.program.data[d].name}` holds", at)
+    finish_into(l, trap_terminator(l, site), join)
+    load(l, slot).unwrap()
 
 // The size of a C handle's object, and the offsets of its owner, the C references it holds and the
 // Avin objects it keeps (see `layout`).
@@ -2185,6 +2438,8 @@ private struct CCall
     classes: Buf[usize]
     optionals: Buf[bool]
     skipped: usize
+    /** Whether the call answers a handle, as its result or an out value, which keeps what it keeps. */
+    answers: bool
 
 // The C handle class whose built-in `close()` `symbol` is.
 private c_close_class(l: *Lowering, symbol: FunctionSymbol) -> Option[usize]
@@ -2310,7 +2565,7 @@ private c_field_body(l: *Lowering, symbol: FunctionSymbol, n: usize, field: CFie
     if c_handle_form(result_type, l.program.data, l.program.classes) is Some(h)
         val answer = fresh(l, MPtr)
         l.insts.push(Call(Some(answer), CFunction(get, c_field_params(indices.len()), Some(CAddress)), c_field_args(pointer, indices)))
-        val call = CCall(who, buf(), buf(), buf(), buf(), symbol.params.len() - symbol.decl.params.len())
+        val call = CCall(who, buf(), buf(), buf(), buf(), symbol.params.len() - symbol.decl.params.len(), true)
         val value = c_handle_answer(l, symbol, call, Value(answer), result_type, h, at)
         l.library = outer
         finish(l, Return(Some(value)))
@@ -2403,28 +2658,41 @@ private c_named_parameter(symbol: FunctionSymbol, call: CCall, name: string) -> 
 // handle `consumes:` names is closed without its `release`, C having taken its reference. Where
 // `succeeded` is given, nothing is kept unless it is true.
 private c_after_call(l: *Lowering, symbol: FunctionSymbol, call: CCall, made: Option[Operand], succeeded: Option[Operand])
-    val keeps = c_binding_names(symbol.decl, "keeps")
-    val consumes = c_binding_names(symbol.decl, "consumes")
-    if keeps.len() == 0 && consumes.len() == 0 then return
-    var holder: Option[Operand] = made
-    if holder is None && call.skipped > 0 && c_handle_result(l, symbol) is None then holder = call.objects[0]
     var after: Option[usize] = None
     if succeeded is Some(flag)
         val yes = new_block(l)
         val join = new_block(l)
         finish_into(l, Branch(flag, yes, join), yes)
         after = Some(join)
-    if holder is Some(o)
-        for name in keeps
-            val i = c_named_parameter(symbol, call, name) match
-                Some(i) -> i
-                None -> continue
-            val kept = call.objects[i] match
-                Some(k) -> k
-                None -> continue
-            c_keep(l, o, kept, call.args[i], call.classes[i], call.optionals[i])
+    c_keeps(l, symbol, call, made, false)
     if after is Some(join) then finish_into(l, Jump(join), join)
-    for name in consumes
+    c_consumes(l, symbol, call)
+
+// Each handle `keeps:` names is kept by `made`, the handle the call answered, which is null for
+// `None` where it is `optional`, and keeps nothing then; where the call answers no handle, by the
+// receiver.
+private c_keeps(l: *Lowering, symbol: FunctionSymbol, call: CCall, made: Option[Operand], optional: bool)
+    val keeps = c_binding_names(symbol.decl, "keeps")
+    if keeps.len() == 0 then return
+    var holder: Option[Operand] = made
+    if holder is None && call.skipped > 0 && !call.answers then holder = call.objects[0]
+    val o = holder match
+        Some(o) -> o
+        None -> return
+    val join = c_if_present(l, o, optional && made is Some(_))
+    for name in keeps
+        val i = c_named_parameter(symbol, call, name) match
+            Some(i) -> i
+            None -> continue
+        val kept = call.objects[i] match
+            Some(k) -> k
+            None -> continue
+        c_keep(l, o, kept, call.args[i], call.classes[i], call.optionals[i])
+    c_end_present(l, join)
+
+// Each handle `consumes:` names is closed without its `release`, C having taken its reference.
+private c_consumes(l: *Lowering, symbol: FunctionSymbol, call: CCall)
+    for name in c_binding_names(symbol.decl, "consumes")
         val i = c_named_parameter(symbol, call, name) match
             Some(i) -> i
             None -> continue
@@ -2434,9 +2702,6 @@ private c_after_call(l: *Lowering, symbol: FunctionSymbol, call: CCall, made: Op
         val join = c_if_present(l, taken, call.optionals[i])
         l.insts.push(Store(field_address(l, taken, FieldSlot(0, MPtr)), NullAddress))
         c_end_present(l, join)
-
-// The handle class a binding answers, itself or in an `Option`.
-private c_handle_result(l: *Lowering, symbol: FunctionSymbol) -> Option[CHandleForm] = c_handle_form(concrete(l, symbol.result.unwrap_or(Unit)), l.program.data, l.program.classes)
 
 // Makes `holder` keep the handle `kept`, of class `k`, whose C pointer is `pointer`: by a C reference
 // of its own where the class declares `retain` and no `kept:`, given back after the holder's own, with
@@ -2565,6 +2830,17 @@ private c_text_copy(l: *Lowering, answer: Operand, t: &Type, form: CTextForm, fr
         copied = runtime_call(l, "avin_rt_c_string_out", [MPtr, MPtr], MRef, [answer, TrapSiteAddress(site)])
     if free is Some(f) then c_free_answer(l, f, answer)
     copied
+
+// The C constant `name` as a constant of its Avin type `t`, an integer type, `real` or `string`, as
+// the C unit measured it; the driver has checked that it fits.
+private c_constant(l: *Lowering, t: &Type, name: string) -> Operand = *t match
+    Int(bits) -> ConstInt(bits, c_value(l, c_value_key(CConstInteger, name)).integer.to_string())
+    Real -> ConstReal(c_value(l, c_value_key(CConstReal, name)).real)
+    _ -> string_constant(l, c_value(l, c_value_key(CConstString, name)).text.unwrap_or(""))
+
+private c_value(l: *Lowering, key: string) -> CValue = l.program.c_values.get(key) match
+    Some(v) -> v
+    None -> panic(s"the C unit measured no `$key`")
 
 // The machine type an operand crossing as `s` has: a `float` is carried as a `real`.
 private c_machine(s: CScalar) -> MirType = s match
@@ -3221,6 +3497,7 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
     RealConst(value) -> Some(ConstReal(value))
     StrConst(value) -> Some(string_constant(l, value))
     UnitConst -> None
+    CConst(name) -> Some(c_constant(l, e.ty, name))
     Param(index) -> param_operand(l, index)
     Local(index) -> load(l, local_place(l, index))
     TypeReceiver -> panic("a static member's receiver is a type, which has no value to lower")

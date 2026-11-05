@@ -37,6 +37,18 @@ struct CParam
     text: string
     /** The parameter's name, "" where the prototype gives none; `self` is a method's receiver. */
     name: string
+    /** How the value crosses: in, or written back by C through the pointer, `out` or `inout`. */
+    mode: CMode
+    /** For an `out` or `inout` parameter, the type the pointer points at, and its text. */
+    pointee: CType
+    pointee_text: string
+
+/** How a prototype's parameter crosses: passed in, or `out`, a pointer C writes a value through that
+ * is part of the binding's result, or `inout`, one C is also passed a value through. */
+enum CMode
+    CIn
+    COut
+    CInOut
 
 /** A prototype read: the C function's symbol, its result and its parameters. */
 struct CPrototype
@@ -50,6 +62,27 @@ struct CPrototype
 struct CMeasure
     bits: u32
     signed: bool
+
+/** What a C unit measured of a constant or an enumerator: an integer's value as a `long long` and
+ * whether it is negative, which tells a value past the greatest `long long` from a negative one; a
+ * `real`'s value; a string's bytes, as text where they are UTF-8. */
+struct CValue
+    integer: i64
+    negative: bool
+    real: real
+    text: Option[string]
+
+/** What kind of C constant a measurement is of. */
+enum CConstKind
+    CConstInteger
+    CConstReal
+    CConstString
+
+/** The name a C constant's measurement is kept under: its kind, then its name. */
+c_value_key(kind: CConstKind, name: string) -> string = (kind match
+    CConstInteger -> "integer "
+    CConstReal -> "real "
+    CConstString -> "string ") + name
 
 /** The prototype a function's `@c` gives, when it has one written as one string. */
 c_prototype_text(f: &Function) -> Option[string]
@@ -86,11 +119,25 @@ parse_prototype(text: string) -> Result[CPrototype, string]
         loop
             if at < tokens.len() && tokens[at] == "..."
                 return Err("a variadic function cannot be bound: the types of the arguments `...` takes cannot be checked")
+            var mode = CIn
+            if at < tokens.len() && (tokens[at] == "out" || tokens[at] == "inout")
+                mode = if tokens[at] == "out" then COut else CInOut
+                at += 1
             val p = c_declaration(tokens, &at)?
             if at < tokens.len() && tokens[at] == "("
                 return Err("a parameter taking a function cannot cross a C binding: callbacks are not implemented")
             if p.ty is CVoidType then return Err("a parameter cannot be `void`; a function taking nothing is written `(void)`")
-            params.push(CParam(p.ty, p.text, p.name.unwrap_or("")))
+            var pointee = CVoidType
+            var pointee_text = ""
+            if !(mode is CIn)
+                val word = if mode is COut then "out" else "inout"
+                if !p.text.ends_with(" *")
+                    return Err(s"an `$word` parameter is a pointer C writes the value through, as in `$word int *x`, and `${p.text}` is not one")
+                pointee_text = p.text[..<p.text.bytes.len - 2]
+                if pointee_text.starts_with("const ") && !pointee_text.ends_with("*") || pointee_text.ends_with("const")
+                    return Err(s"C cannot write through the `$word` parameter `${p.text}`: what it points at is `const`")
+                pointee = parse_c_type(pointee_text)?.ty
+            params.push(CParam(p.ty, p.text, p.name.unwrap_or(""), mode, pointee, pointee_text))
             if at < tokens.len() && tokens[at] == ","
                 at += 1
                 continue
@@ -126,7 +173,9 @@ private c_declaration(tokens: Buf[string], at: *usize) -> Result[CDeclared, stri
         if t == "extern"
             *at = *at + 1
             continue
-        if t == "out" || t == "inout" || t == "userdata" || t == "length"
+        if t == "out" || t == "inout"
+            return Err(s"`$t` is written first, before the parameter's type, as in `$t int *x`")
+        if t == "userdata" || t == "length"
             return Err(s"`$t` parameters are not implemented")
         if t == "static" || t == "inline" || t == "register" || t == "typedef"
             return Err(s"`$t` is not part of a function's prototype")
@@ -515,12 +564,154 @@ c_handle_form(t: &Type, data: Buf[DataSymbol], classes: Buf[ClassSymbol]) -> Opt
         Class(k, _, _) -> if c_handle_type(classes[k].decl) is Some(_) then Some(CHandleForm(k, optional)) else None
         _ -> None
 
-/** The error type of a status result, `Result[unit, E]` with `E` an integer type: `Ok(())` for zero
- * and `Err` of the code otherwise. */
+/** The error type of a status result, `Result[T, E]` with `E` an integer type or an enum mirror:
+ * `Ok` for zero, holding the out values (`unit` where there are none), and `Err` of the code or its
+ * variant otherwise. */
 c_status_error(t: &Type, data: Buf[DataSymbol]) -> Option[&Type] = *t match
     Data(d, _, args) ->
-        if data[d].module_name == "avin" && data[d].name == "Result" && args.len() == 2 && *args[0] is Unit && *args[1] is Int(_) then Some(args[1]) else None
+        val error = data[d].module_name == "avin" && data[d].name == "Result" && args.len() == 2 && (*args[1] is Int(_) || c_mirror_of(args[1], data) is Some(_))
+        if error then Some(args[1]) else None
     _ -> None
+
+/** How a binding's Avin result is made of what C answers: the Avin type of the C result (`unit`
+ * where it is no part of the result) and of each `out` and `inout` value, in order. A status's `Ok`
+ * holds the out values; otherwise the result is the C result followed by them, as a tuple, a `void`
+ * C result left out, and one value alone is no tuple. A C result that is not `void` is left out too
+ * where the binding's result has the out values alone. */
+struct CResultParts
+    result: &Type
+    outs: Buf[&Type]
+
+/** The prototype indices of the parameters an Avin binding takes, in order: all but the `out` ones. */
+c_avin_positions(p: CPrototype) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    for i in 0..<p.params.len()
+        if !(p.params[i].mode is COut) then out.push(i)
+    out
+
+/** The number of `out` and `inout` parameters of a prototype. */
+c_out_count(p: CPrototype) -> usize
+    var n = 0usize
+    for q in p.params
+        if !(q.mode is CIn) then n += 1
+    n
+
+/** How the result `r` of a binding with prototype `p` splits, or why it cannot. */
+c_result_parts(p: CPrototype, r: &Type, data: Buf[DataSymbol]) -> Result[CResultParts, string]
+    val n = c_out_count(p)
+    if n == 0 then return Ok(CResultParts(r, buf()))
+    if c_status_error(r, data) is Some(_)
+        val ok = c_status_ok(r)
+        val outs = c_spread(ok, n) match
+            Some(o) -> o
+            None -> return Err(s"the `Ok` of a status holds the ${count_words(n, "out value")} of the call" + (if n > 1 then s", a tuple of $n" else ""))
+        return Ok(CResultParts(r, outs))
+    if !(p.result is CVoidType)
+        if *r is Tuple(items)
+            if items.len() == n + 1
+                var outs: Buf[&Type] = buf()
+                for i in 1..<items.len()
+                    outs.push(items[i])
+                return Ok(CResultParts(items[0], outs))
+    if c_spread(r, n) is Some(outs) then return Ok(CResultParts(Unit, outs))
+    val values = count_words(n, "out value")
+    if p.result is CVoidType then return Err(s"the C function answers nothing, so the binding answers its $values" + (if n > 1 then s", a tuple of $n" else ""))
+    Err(s"the binding answers the C result followed by its $values, a tuple of ${n + 1}, or its $values alone" + (if n > 1 then s", a tuple of $n" else ""))
+
+// The `n` values `t` is made of: itself where `n` is one, and otherwise the parts of a tuple of `n`.
+private c_spread(t: &Type, n: usize) -> Option[Buf[&Type]]
+    var out: Buf[&Type] = buf()
+    // An out value is never a tuple, so a tuple is the values of more than one.
+    if n == 1
+        if *t is Tuple(_) then return None
+        out.push(t)
+        return Some(out)
+    if *t is Tuple(items)
+        if items.len() == n
+            for x in items
+                out.push(x)
+            return Some(out)
+    None
+
+private count_words(n: usize, word: string) -> string = if n == 1 then "one " + word else s"$n ${word}s"
+
+/** What a status result's `Ok` holds: the out values. */
+c_status_ok(t: &Type) -> &Type = *t match
+    Data(_, _, args) -> args[0]
+    _ -> t
+
+/** What a data type's `@c(enum: "<C type>", prefix: "<prefix>")` says: it mirrors the C enum, each
+ * variant one enumerator. */
+struct CEnum
+    ty: string
+    prefix: string
+
+/** The `@c` a data type is declared with, which makes it a mirror. */
+c_data_annotation(d: &DataDecl) -> Option[Annotation]
+    for a in d.annotations
+        if a.name == "c" then return Some(a)
+    None
+
+/** The C enum a data type mirrors, read; `None` where it mirrors none, or its `@c` is not well formed
+ * (which the checker reports). */
+c_enum_of(d: &DataDecl) -> Option[CEnum]
+    val a = c_data_annotation(d)?
+    var ty: Option[string] = None
+    var prefix = ""
+    for arg in a.args
+        val n = arg.name?
+        val text = if arg.value.kind is StringLit(t) then t else return None
+        if n == "enum" then ty = Some(text)
+        elif n == "prefix" then prefix = text
+        else return None
+    Some(CEnum(ty?, prefix))
+
+/** What is wrong with the enum mirror `d`, named `name`, crossing at a C position written `text`, or
+ * "": it crosses as the C type it mirrors, `const`-qualified or not. */
+c_mirror_problem(d: &DataDecl, name: string, text: string) -> string
+    val e = c_enum_of(d) match
+        Some(e) -> e
+        None -> return ""
+    val wanted = parse_c_type(e.ty) match
+        Ok(t) -> t.text
+        Err(_) -> return ""
+    if text == wanted || text == "const " + wanted then return ""
+    s"`$name` mirrors `${e.ty}`, so it crosses as that type"
+
+/** The index of the enum mirror `t` is, if it is one. */
+c_mirror_of(t: &Type, data: Buf[DataSymbol]) -> Option[usize] = *t match
+    Data(d, _, args) -> if args.len() == 0 && c_enum_of(data[d].decl) is Some(_) then Some(d) else None
+    _ -> None
+
+/** The name the variant `v` of an enum mirror gives its own enumerator with `@c("name")`. */
+c_variant_text(v: Variant) -> Option[string]
+    for a in v.annotations
+        if a.name == "c" && a.args.len() == 1 && a.args[0].name is None
+            if a.args[0].value.kind is StringLit(t) then return Some(t)
+    None
+
+/** The enumerator the variant `v` of the mirror `e` holds: the one its own `@c("name")` names, or
+ * the prefix followed by the variant's words, joined by `_`, in the prefix's case: upper case where
+ * the prefix has an upper-case letter and no lower-case one, and lower case otherwise. A word starts
+ * at each upper-case letter, and a digit belongs to the word before it: `Yuv420p` is one word,
+ * `ColorDodge` two. */
+c_enumerator(e: CEnum, v: Variant) -> string
+    if c_variant_text(v) is Some(t) then return t
+    var upper = false
+    var lower = false
+    for b in e.prefix.bytes
+        if u8('A') <= b <= u8('Z') then upper = true
+        if u8('a') <= b <= u8('z') then lower = true
+    val shout = upper && !lower
+    var out = e.prefix
+    val b = v.name.bytes
+    for i in 0..<b.len
+        val ch = b[i]
+        val capital = u8('A') <= ch <= u8('Z')
+        if capital && i > 0 then out = out + "_"
+        val c = if shout && u8('a') <= ch <= u8('z') then ch - 32u8 elif !shout && capital then ch + 32u8 else ch
+        out = out + char(c).to_string()
+    out
 
 /** Whether a prototype's position, written `text`, takes or answers the handle whose `type:` reads as
  * `handle`: the same type, or for a parameter that type `const`-qualified, which C passes the same
