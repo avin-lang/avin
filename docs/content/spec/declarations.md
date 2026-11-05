@@ -1,8 +1,48 @@
 ---
 title: Declarations
-summary: data, class, trait, object, impl, members, modules and initialization.
+summary: Names, data, class, trait, object, impl, members, modules and initialization.
 weight: 13
 ---
+
+## Names
+
+A name may be written in any script. It begins with a letter or `_` and continues with letters,
+digits, combining marks and connecting punctuation such as `_`; exactly, its first character has
+Unicode's `XID_Start` property or is `_`, and each later one has `XID_Continue` (the identifier
+rule of Unicode Standard Annex #31).
+
+```text
+data Ärger
+    Δelta(größe: int)
+    Ωmega
+
+fläche(breite: int, höhe: int) -> int = breite * höhe
+
+main()
+    val 名前 = "名"
+    val x٣ = 3
+    println(s"$名前 ${fläche(x٣, 2)}")
+```
+
+- A digit of any script continues a name and none begins one: `x٣` is a name and `٣x` is refused.
+  Number literals are written with ASCII digits only.
+- A combining mark continues a name and cannot begin one.
+- An emoji, a symbol, an operator character of another script and a space other than the ASCII
+  space are no part of any name; each is reported with its code point (`U+1F600`).
+- **A name is written in Unicode Normalization Form C.** A name spelled in another form (an `e`
+  followed by a combining acute, where `é` is one character in NFC) is reported, with the NFC
+  spelling to write instead. So two names that look the same are always the same name: nothing is
+  normalized behind the programmer's back, and nothing that looks alike can differ invisibly in
+  how it was composed. Names in different scripts that merely look alike (Latin `a`, Cyrillic `а`)
+  are different names.
+- A module's name is a path of names, so each directory of a program is named by the same rule.
+- **Capitalized** means the first character is an uppercase or titlecase letter (Unicode `Lu` or
+  `Lt`): `Ärger`, `Δelta` and `ǅemal` are capitalized. A letter with no case, as in Chinese,
+  Japanese or Arabic, is not, so such a name is written where a lowercase one is. Types and
+  variants are capitalized by convention, values and functions are lowerCamelCase, and where the
+  language reads a name's case (`T.V` naming a variant, `int.MaxValue`) this is the test. A bare
+  name in a pattern is a variant when a variant of that name is in scope, and otherwise binds,
+  whatever its case.
 
 ## Functions
 

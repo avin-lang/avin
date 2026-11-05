@@ -1,0 +1,126 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.{Span, scanner_of}
+
+// The identifier rule (UAX #31 `XID_Start` / `XID_Continue`, with `_`), the NFC test and the
+// capitalized-name test, character by character.
+
+@test("names: every script's letters start a name; `_` does too")
+names_start_letters()
+    for c in ['a', 'Z', '_', 'é', 'ß', 'Ä', 'Δ', 'ω', 'Ж', 'я', '名', 'あ', 'カ', '한', 'ע', 'ب', 'ก', 'ǅ', 'ª', 'ℵ']
+        assert(name_start(u32(c)), s"$c")
+    // The far end of the tables: a CJK extension B ideograph and the last range of XID_Start.
+    assert(name_start(0x20BB7))
+    assert(name_start(0x33479))
+    assert(!name_start(0x3347A))
+    assert(!name_cont(0x3347A))
+
+@test("names: digits, combining marks and connector punctuation of any script continue a name but do not start one")
+names_continue_only()
+    for c in ['0', '9', '\u{663}', '\u{966}', '\u{FF11}', '\u{301}', '\u{20D7}', '\u{93F}', '\u{203F}', '\u{B7}']
+        assert(!name_start(u32(c)), s"start $c")
+        assert(name_cont(u32(c)), s"continue $c")
+
+@test("names: symbols, emoji, punctuation and spaces of any kind are no part of a name")
+names_outside()
+    for c in ['\u{1F600}', '\u{2603}', '\u{20AC}', '\u{A0}', '\u{3000}', '\u{2028}', '\u{FEFF}', '\u{2E2F}', '-', '$', ' ', '\u{D7}', '\u{F7}', '\u{2192}']
+        assert(!name_start(u32(c)), s"start $c")
+        assert(!name_cont(u32(c)), s"continue $c")
+    // Unassigned, private use and the replacement character.
+    assert(!name_cont(0x0378))
+    assert(!name_cont(0xE000))
+    assert(!name_cont(0xFFFD))
+
+@test("names: the tables hold no ASCII, are sorted and do not overlap, and every start character continues")
+names_tables_well_formed()
+    sorted_ranges(xid_start_ranges)
+    sorted_ranges(xid_continue_ranges)
+    for i in 0..<xid_start_ranges.len
+        val (a, b) = xid_start_ranges[i]
+        assert(name_cont(a) && name_cont(b))
+    // Nothing is in both, since the second table is the first one's complement within XID_Continue.
+    for i in 0..<xid_continue_ranges.len
+        val (a, b) = xid_continue_ranges[i]
+        assert(!name_start(a) && !name_start(b), s"$a")
+
+private sorted_ranges(t: []const (u32, u32))
+    var previous = 0x7Fu32
+    for i in 0..<t.len
+        val (a, b) = t[i]
+        assert(a > previous && a <= b, s"$a..$b")
+        previous = b
+
+@test("names: a name is read to its last continue character, and a refused first character reads nothing")
+names_read()
+    assert_eq(read_of("größe = 1"), (Some(Span(0, 7)), 7))
+    assert_eq(read_of("名前)"), (Some(Span(0, 6)), 6))
+    assert_eq(read_of("x\u{663}\u{301}y z"), (Some(Span(0, 6)), 6))
+    assert_eq(read_of("a\u{1F600}"), (Some(Span(0, 1)), 1))
+    assert_eq(read_of("\u{663}x"), (None, 0))
+    assert_eq(read_of("\u{301}a"), (None, 0))
+    assert_eq(read_of("\u{1F600}"), (None, 0))
+    assert_eq(read_of(""), (None, 0))
+
+private read_of(text: string) -> (Option[Span], usize)
+    var s = scanner_of(text)
+    val r = read_name(&s)
+    (r, s.offset)
+
+@test("names: a whole text is spelled as a name, or is not")
+names_spelled()
+    for ok in ["x", "_", "_1", "größe", "Ärger", "Δelta", "名前", "x\u{663}", "v\u{20D7}", "ǅemal"]
+        assert(spelled_as_name(ok), ok)
+    for bad in ["", "1x", "\u{663}", "\u{301}a", "a\u{1F600}", "a b", "a.b", "a-b", "\u{1F600}"]
+        assert(!spelled_as_name(bad), bad)
+
+@test("names: NFC is told from the other forms, and an ASCII text is always NFC")
+names_nfc()
+    assert(is_nfc(""))
+    assert(is_nfc("plain_ascii_123"))
+    assert(is_nfc("café"))
+    assert(is_nfc("名前"))
+    assert(!is_nfc("cafe\u{301}"))
+    assert(!is_nfc("A\u{30A}"))
+    assert_eq(nfc_of("cafe\u{301}"), "café")
+    // A mark with no precomposed form stays a mark in NFC; two marks are put in canonical order.
+    assert(is_nfc("v\u{20D7}"))
+    assert(!is_nfc("a\u{301}\u{323}"))
+
+@test("names: capitalized is Lu or Lt first; a caseless letter, `_` and a lowercase letter are not")
+names_capitalized()
+    for yes in ["A", "Ärger", "Δelta", "Жук", "ǅemal", "Ω"]
+        assert(is_capitalized(yes), yes)
+    for no in ["", "a", "ärger", "δelta", "_Foo", "名前", "あ", "ª", "ß"]
+        assert(!is_capitalized(no), no)
+
+@test("names: a character's code point is written U+ and at least four hexadecimal digits")
+names_code_points()
+    assert_eq(code_point_of('\u{301}'), "U+0301")
+    assert_eq(code_point_of('\u{1F600}'), "U+1F600")
+    assert_eq(code_point_of('\u{0}'), "U+0000")
+    assert_eq(code_point_of('\u{10FFFF}'), "U+10FFFF")
+
+@test("names: a stray character is reported as unable to begin a name, or as no part of any token")
+names_stray_messages()
+    assert_eq(stray_character_message('\u{663}'), "`\u{663}` (U+0663) cannot begin a name: a name begins with a letter or `_`")
+    assert_eq(stray_character_message('\u{1F600}'), "`\u{1F600}` (U+1F600) is not a character a name or an operator is spelled with")
+
+@test("names: a shim's symbol for a name in any script is ASCII, and two names give two symbols")
+names_shim_symbols()
+    assert_eq(shim_symbol("groß"), "avin_shim_gro_c3_9f")
+    assert_eq(shim_symbol("名"), "avin_shim__e5_90_8d")
+    for name in ["größe", "Δelta", "名前", "v\u{20D7}", "x\u{663}"]
+        for b in shim_symbol(name).bytes
+            assert(b < 0x80, name)
+    assert(shim_symbol("a\u{430}") != shim_symbol("aa"))
+
+@test("names: a Sysl mirror's field maps case in any script, and keeps every other character whole")
+names_sysl_field_unicode()
+    assert_eq(sysl_field_of("größe"), "größe")
+    assert_eq(sysl_field_of("großeÄrger"), "große_ärger")
+    assert_eq(sysl_field_of("δΣ"), "δ_σ")
+    assert_eq(sysl_field_of("名前Value"), "名前_value")
+    assert_eq(camel_of_sysl("große_ärger"), "großeÄrger")
+    assert_eq(camel_of_sysl("名前_value"), "名前Value")
+    assert_eq(camel_of_sysl("a_名"), "a名")

@@ -127,7 +127,7 @@ read_interpolated_literal(s: *Scanner, prefix: string) -> Result[Interpolation, 
                     b = str_builder()
                 elif c == u8('$') && opens_name(s)
                     s.bump()
-                    s.read_ident(is_ident_start, is_ident_cont) match
+                    read_name(s) match
                         Some(at) -> holes.push(at)
                         None -> return Err(Unterminated(s.span_from(start)))
                     chunks.push(b.finish())
@@ -250,7 +250,7 @@ read_text_block(s: *Scanner, decode: bool, holes: bool) -> Result[BlockText, Dia
             part = str_builder()
         elif holes && c == u8('$') && opens_name(s)
             s.bump()
-            s.read_ident(is_ident_start, is_ident_cont) match
+            read_name(s) match
                 Some(at) -> spans.push(at)
                 None -> return Err(error(opening, "unterminated text block"))
             chunks.push(chunk.finish())
@@ -349,7 +349,7 @@ private skip_block_indent(s: *Scanner, strip: usize)
 
 private opens_name(s: *Scanner) -> bool =
     s.peek_at(1) match
-        Some(n) -> is_ident_start(n)
+        Some(_) -> name_start_at(s.rest(), 1)
         None -> false
 
 // Step over the expression of a `${…}` hole, leaving the cursor just past its `}`. A bracket inside
@@ -414,9 +414,11 @@ private lex_range(text: []const u8, range: Span, lines: bool, margin: usize) -> 
             continue
         val start = s.mark()
         val c = s.peek().unwrap()
-        if is_ident_start(c)
-            s.read_ident(is_ident_start, is_ident_cont)
+        if at_name_start(&s)
+            read_name(&s)
             val word = from_utf8_unchecked(text[start..<s.mark()])
+            if !is_nfc(word)
+                rep.add(error(s.span_from(start), s"this name is not in Unicode Normalization Form C: write it `${nfc_of(word)}`, which looks the same, so that every spelling of it is one name"))
             if opens_text_block(&s)
                 // A block in error is still a token, so the expression it stands in is not reported
                 // as missing as well.
@@ -453,6 +455,11 @@ private lex_range(text: []const u8, range: Span, lines: bool, margin: usize) -> 
             read_quoted(&s, c) match
                 Ok(_) -> out.push(Quoted, s.span_from(start))
                 Err(e) -> rep.add(error(where(e), e.to_string()))
+        elif c >= 0x80
+            // A character above ASCII that does not begin a name is no token at all: it is reported
+            // and stepped over whole, so the bytes of one character are not read as several.
+            val ch = s.next_char().unwrap()
+            rep.add(error(s.span_from(start), stray_character_message(ch)))
         else
             read_operator(&s)
             if c == u8('(') || c == u8('[') || c == u8('{')

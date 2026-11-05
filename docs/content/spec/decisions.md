@@ -2382,15 +2382,7 @@ their words are reserved.
 
 - Settled on the user's delegation 2026-11-05 (built on branch `iterable-size`): **every `Iterable` has `size()`, `knownSize()` and `sizeCompare(n)`** ([collections](/spec/collections/)), following the reference library: `size()` counts by iterating unless a collection overrides it with its own count, `knownSize()` is the count where it is known without iterating and -1 otherwise (a `List` other than `Nil`, an iterator, a view), and `sizeCompare(n)` answers -1, 0 or 1, reading at most `n` elements when the count is unknown. Sequences have `size()` and `length()`, equal. They are overridable trait members rather than `impl` methods, so a call through `Iterable[T]` reaches the collection's own count. Consequence: a class implementing `Iterable` that declares its own `size`, `knownSize` or `sizeCompare` must mark it `override`. Alternatives weighed: an arbitrary-sign `sizeCompare` (the reference library's contract, but -1/0/1 is what every caller tests); `length()` on every `Iterable` (left to sequences, whose length is their defining measure); `sizeIs` (needs special syntax). Review with the user: the `override` requirement on existing user classes.
 
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- **A callback's integer answer goes into whatever integer the closure Sysl takes answers, with a
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-binding`): **A callback's integer answer goes into whatever integer the closure Sysl takes answers, with a
   check** ([Sysl bindings](/spec/sysl-bindings/#callbacks)). An Avin function answering a `long` or
   an `int` reaches a Sysl closure answering any integer, `u32`, `u64` and `usize` among them, and
   an answer the Sysl type cannot hold stops the program where the binding Sysl is running in was
@@ -2404,7 +2396,7 @@ their words are reserved.
   reinterpreted as the `u32`'s bits (a colour past `0x7FFFFFFF` written negative, and a reader
   never sure which); refusing the binding (no window could be given a colour); converting only
   into unsigned types (two rules for one shape). Built on `ui-binding`.
-- **The user interface binding is the package `ui`, in `packages/ui` of this repository, rather
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-binding`): **The user interface binding is the package `ui`, in `packages/ui` of this repository, rather
   than a module of the standard library** ([User interfaces](/spec/ui/)). Why: no package may
   declare a module under `avin`, the standard library carries no Sysl dependencies, and a program
   that does not draw should neither build syslui nor link SDL3; a domain library is a package of
@@ -2413,7 +2405,7 @@ their words are reserved.
   a repository of its own (premature while the binding and the language move together). Built on
   `ui-binding`. Review with the user: the name `avin.ui` was the plan's, and only the standard
   library may hold it.
-- **The binding is thin and keeps syslui's shapes** ([User interfaces](/spec/ui/)). Each syslui
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-binding`): **The binding is thin and keeps syslui's shapes** ([User interfaces](/spec/ui/)). Each syslui
   function is bound under its Avin name with syslui's defaults restated; a view is one handle class
   on the trait; one signal class for each instance a control takes (`IntSignal`, `RealSignal`,
   `BoolSignal`, `StringSignal`); `slider` is one overload for `int` and one for `real`; `Role`,
@@ -2423,11 +2415,63 @@ their words are reserved.
   application writes; this layer only has to reach syslui. Alternatives weighed: a generic signal
   class (Avin binds a handle at one instance); wrapping every binding in a private one (no name to
   change yet). Built on `ui-binding`.
-- **`run` is `blocking`, and no ui callback is `@threaded`** ([User interfaces](/spec/ui/#the-application)).
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-binding`): **`run` is `blocking`, and no ui callback is `@threaded`** ([User interfaces](/spec/ui/#the-application)).
   The frame loop waits for events for most of its life, so the thread is safe for the collector
   meanwhile, and syslui-sdl calls the tree, the ground and every control's callback on the thread
   that called `run`. Alternatives weighed: an unmarked `run`, which would hold up every other
   thread's collections for the life of the window. Built on `ui-binding`.
+- Settled on the user's delegation 2026-11-05 (built on branch `unicode-identifiers`): **Names in any script** (branch `unicode-identifiers`, 2026-11-05; [names](/spec/declarations/#names)).
+  A name starts with a character of Unicode's `XID_Start` or `_` and continues with `XID_Continue`
+  (UAX #31, the Unicode identifier rule), at the Unicode version the compiler's tables were cut
+  from (17.0.0). Why: domain vocabulary is written in the programmer's own language, and the XID
+  properties are the ones designed to be stable under normalization and across Unicode versions.
+  Alternatives weighed: ASCII only (what the lexer had; refuses `größe` for no reason a reader
+  could guess); any non-ASCII character that is not a space (admits emoji, arrows and operators
+  of other scripts, so `a→b` would be one name); General_Category letters, marks and digits
+  (Sysl's rule; close to XID but not stable under normalization, and admits pattern characters
+  such as U+2E2F).
+- Settled on the user's delegation 2026-11-05 (built on branch `unicode-identifiers`): **A name in a normal form other than NFC is an error, with its NFC spelling** (branch
+  `unicode-identifiers`). Why: every name stays byte for byte the text written, so spans, rename,
+  lookup and emitted symbols need no second spelling, and two spellings that look identical can
+  never be two names, which is what normalizing would also guarantee. Alternatives weighed:
+  normalizing to NFC silently (friendlier to an input method that writes decomposed text, but
+  every name then has a spelling the source does not contain); no normalization (Sysl's choice:
+  `café` and `cafe` with U+0301 are two names that look the same); NFKC (folds `ﬁ` into `fi` and
+  full-width letters into ASCII, which changes what a name visibly is). A module's directory name
+  is held to the same rule. Review with the user: whether silent normalization is preferred.
+- Settled on the user's delegation 2026-11-05 (built on branch `unicode-identifiers`): **Capitalized means an uppercase or titlecase first letter (`Lu`, `Lt`); a caseless letter is
+  not capitalized** (branch `unicode-identifiers`). Every place the compiler asks whether a name
+  is capitalized (a missing variant written `T.V`, a scalar type's `MaxValue`-style constants, a
+  missing type in an import of a library module, a handle's `named:`, the highlighting of types)
+  uses this test, so `Ärger`, `Δelta` and `ǅemal` read as type-like names and `名前` as a value's.
+  A bare name in a pattern is a variant when one of that name is in scope and a binding otherwise,
+  whatever its case, so a caseless name is a binding unless it names a variant. Why: a caseless
+  script has no way to write a capital, and treating its names as lowercase keeps them usable for
+  the commonest names (values, functions); its types are still declared and used by name.
+  Alternatives weighed: caseless counting as capitalized (every CJK local would read as a
+  constructor-like name); refusing caseless names where a capital is expected (a CJK program could
+  not name a type). Review with the user: this is the choice most likely to matter to a program
+  written wholly in a caseless script.
+- Settled on the user's delegation 2026-11-05 (built on branch `unicode-identifiers`): **Look-alike names in different scripts are different names, with no warning** (branch
+  `unicode-identifiers`): Latin `a` and Cyrillic `а` are two names. Why: confusable detection
+  (UTS #39) needs data the compiler does not carry and warns on legitimate mixed-script code.
+  Alternative: a mixed-script warning per name. Review with the user if spoofed names in shared
+  packages become a concern.
+- Settled on the user's delegation 2026-11-05 (built on branch `unicode-identifiers`): **A character above ASCII that begins no token is reported with its code point and stepped over
+  whole** (branch `unicode-identifiers`): an emoji is "not a character a name or an operator is
+  spelled with", and a digit or mark of another script where a name begins "cannot begin a name",
+  each naming the character and its `U+` code point. Why: the bytes of one character used to be read as separate
+  symbols, which the parser then reported one at a time.
+
+**Deferred**
+
+- Public C interoperability. Until then, C is reached through Sysl.
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
