@@ -95,6 +95,27 @@ c-libraries {
   needs nothing at the link (the C library itself, whose headers are named only to check against).
 - `headers` are included by the C unit, in order, for every binding of the package. **A binding is
   checked against a header, always**: a package with a `@c` binding and no `headers` is refused.
+- **A header may be named by a macro** ([proposed](/spec/decisions/#proposed)). An entry that is a C
+  identifier rather than a path is included as `#include NAME`, which C expands to the header the
+  macro names, so it must be defined by an entry before it. FreeType names its headers this way,
+  each through a macro `<ft2build.h>` defines:
+
+  ```hocon
+  c-libraries {
+    freetype {
+      pkg-config = "freetype2"
+      headers    = ["<ft2build.h>", "FT_FREETYPE_H", "FT_MODULE_H", "FT_MULTIPLE_MASTERS_H",
+                    "FT_TRUETYPE_TABLES_H"]
+      install    = "FreeType 2: `brew install freetype`; Debian's libfreetype-dev"
+    }
+  }
+  ```
+
+  A macro no earlier header defines is reported at the entry, with clang's own words:
+
+  ```text
+  error: the header `FT_FREETYPE_H` of the C library `freetype` of package `freetype` is not a macro any earlier header defines: clang says '#include expects "FILENAME" or <FILENAME>'
+  ```
 - `install` is what a build that cannot find the module says to do:
 
   ```text
@@ -103,7 +124,8 @@ c-libraries {
 
 **A program builds with the C libraries of every package in it**, as it does with their
 [Sysl dependencies](/spec/packages/#sysl-dependencies), so a library that binds MLT works in a
-program that never names MLT itself.
+program that never names MLT itself. A package whose bindings name a [handle of another
+package](#handles-of-another-package) is checked with that package's headers too.
 
 ## Prototypes
 
@@ -259,8 +281,11 @@ A handle is the [Sysl handle](/spec/sysl-bindings/#handles) over a C pointer, an
 - **A handle passed to C is lent for the call.** C's own convention is that a pointer it is handed is
   borrowed, and most functions keep to it. One that **keeps** what it is handed past the call — MLT's
   producers keep a pointer to their profile and take no reference to it — is bound with `keeps:`
-  naming the parameter: the handle the binding makes (or, for a method, the receiver) then holds the
-  Avin object passed, so it is not collected while the holder lives. One that **takes** the reference
+  naming the parameter, or a list of them (`keeps: ["library", "base"]`): the handle the binding
+  makes (or, for a method, the receiver) then holds the
+  Avin object passed, so it is not collected while the holder lives; a kept handle whose class
+  declares `retain` is held by [a C reference](#kept-handles-and-the-order-they-are-given-back)
+  instead. One that **takes** the reference
   it is handed is bound with `consumes:`, and the handle passed is closed by the call without
   `release`.
 - **A handle belongs to one owner at a time**, checked at every use as a Sysl handle's is: C
@@ -294,6 +319,84 @@ record, made a root of the collector, and attaches it; C's call of `destroy`, wh
 thread the last reference goes, unpins it, and runs no Avin code. An `attach:` expression that answers
 non-zero stops the program at the call, since what it would keep could not be kept. Without `attach:`,
 `keeps:` holds only as long as the handle ([proposed](/spec/decisions/#proposed)).
+
+### Kept handles, and the order they are given back
+
+The collector frees what is unreachable in no order of its own: a holder and the handle it keeps,
+found dead in one collection, are finalized in either order. That is harmless where the holder's
+`release` never touches what it keeps, and a use after free where it does. A FreeType face belongs to
+its library, `FT_Done_FreeType` frees every face still in the library, and `FT_Done_Face` on one of
+them afterwards frees it twice.
+
+So **a kept handle whose class declares `retain` is held by a C reference**
+([proposed](/spec/decisions/#proposed)): when the call succeeds the holder takes a reference of its
+own through the kept class's `retain`, records the C pointer, and gives it back through that class's
+`release` **after its own `release`**. Whichever finalizer the collector runs first, C sees the holder
+released before what it keeps. FreeType counts both its libraries (`FT_Reference_Library`) and its
+faces (`FT_Reference_Face`), so a face keeps its library this way, and `FT_Done_FreeType` from the
+library's own handle only drops a count while a face still holds one:
+
+```avin
+@c(type: "FT_Library", release: "FT_Done_FreeType", retain: "FT_Reference_Library")
+class Library
+
+@c("FT_Error FT_New_Face(FT_Library library, const char *path, FT_Long index, out FT_Face *face)",
+   keeps: "library")
+private newFace(library: Library, path: string, index: long) -> Result[Face, int]
+```
+
+A kept handle with no `retain`, a `ByteBlock` and a callback's closure are held as the Avin object, as
+before, and the holder's `release` must not use them: that is taken on [trust](#soundness).
+
+**A holder's `release` may name what it keeps.** A class declaring `kept: "face: Face"` is made only
+by bindings that keep exactly one `Face`, and its `release:` and `retain:` may use `face` as that
+handle's C pointer, valid until after `release` since the reference to it is given back last. A
+FreeType variation descriptor is freed through the library its face belongs to, and FreeType
+publishes that library in the face's glyph slot:
+
+```avin
+@c(type: "FT_MM_Var *", kept: "face: Face", release: "FT_Done_MM_Var(face->glyph->library, self)")
+class MMVar
+
+@c("FT_Error FT_Get_MM_Var(FT_Face face, out FT_MM_Var **master)", keeps: "face")
+private mmVar(face: Face) -> Result[MMVar, int]
+```
+
+A class with `kept:` made by a binding that does not keep one handle of that class is refused at the
+binding, as is a `kept:` name that `release:` and `retain:` never use.
+
+### Handles of another package
+
+**A binding may take or answer a handle class another package declares**
+([proposed](/spec/decisions/#proposed)), when its package depends on that one and the class is
+public. Cairo's FreeType font faces are made from FreeType's `FT_Face`, so `avin-lang/cairo` depends
+on `avin-lang/freetype` and names its `Face`:
+
+```avin
+module cairo
+
+import freetype.Face
+
+@c("cairo_font_face_t *cairo_ft_font_face_create_for_ft_face(FT_Face face, int load_flags)",
+   keeps: "face")
+private ftFontFace(face: Face, loadFlags: int) -> FontFace
+```
+
+- **The prototype names the class's own C type**, or one of its `as:` types, by the rule for any
+  handle; the class's `type:`, `retain`, `release` and `as:` glue are the declaring package's, compiled
+  once in the C unit, and called by the other package's bindings.
+- **The C unit checks the binding with the declaring package's headers and flags first**: a
+  package's bindings are compiled after the `headers` of every package whose handle classes they
+  name, in dependency order, and with those packages' `pkg-config` flags beside its own, so `FT_Face`
+  is declared whether or not Cairo's header includes FreeType's. A header included twice is guarded by
+  the header itself, as C's always are.
+- **Ownership crosses unchanged.** A handle passed is lent for the call, and `keeps:`, `consumes:` and
+  `attach:` hold, take or tie it exactly as they would a handle of the binding's own package; a
+  pointer answered makes the declaring class's handle, owned, or `borrowed` through its `retain`. The
+  owner check is the handle's own, whichever package's binding uses it.
+
+A binding naming a handle class of a package its own does not depend on cannot name it at all, since
+the class is not in scope; one naming a private class is refused as any use of it is.
 
 ### Handles and C's inheritance
 
@@ -463,6 +566,18 @@ measurement, and checked as UTF-8 then ([proposed](/spec/decisions/#proposed)).
   private readInto(fd: int, into: Array[byte]) -> long
   ```
 
+  `length(data)` may also mark an `inout` pointer to an integer, for C that is told the length and
+  answers how much it used ([proposed](/spec/decisions/#proposed)): the array's length is written in
+  before the call, and the value C writes back is part of the result, stopping the program if it
+  exceeds the array's length. An `Option` of the array passes null and a length of zero for `None`,
+  which is how a C function is asked the size it needs. FreeType's `FT_Load_Sfnt_Table` is asked
+  twice, once with no buffer for the table's size and once to fill one:
+
+  ```avin
+  @c("FT_Error FT_Load_Sfnt_Table(FT_Face self, FT_ULong tag, FT_Long offset, FT_Byte *buffer, length(buffer) inout FT_ULong *length)")
+  private loadSfntTableRaw(tag: long, offset: long, buffer: Option[Array[byte]]) -> Result[long, int]
+  ```
+
 - **An array of a mirror goes to a `const` pointer to its struct** ([proposed](/spec/decisions/#proposed)).
   A mirror's Avin layout is not C's, so the elements are converted into C memory that lives for the
   call, laid out as the header lays the struct out, and nothing is written back; a pointer that is not
@@ -531,6 +646,22 @@ is a C expression over the parameters:
    length: "cairo_image_surface_get_stride(self) * cairo_image_surface_get_height(self)")
 private dataRaw() -> Option[MutByteView]
 ```
+
+A [field accessor](#field-accessors) whose field is a byte pointer says `view` the same way, its
+`length:` a C expression in `self` ([proposed](/spec/decisions/#proposed)). A FreeType glyph's bitmap
+is a field of the face's glyph slot, `|pitch| * rows` bytes that the face's next load replaces — the
+view's own rule, since that load is a use of the face. `pitch` is negative for a bitmap stored bottom
+row first, and the buffer then begins with the bottom row, so the length takes its magnitude:
+
+```avin
+@c(field: "glyph->bitmap.buffer", view,
+   length: "(self->glyph->bitmap.pitch < 0 ? -self->glyph->bitmap.pitch : self->glyph->bitmap.pitch) * self->glyph->bitmap.rows")
+private bitmapRaw() -> Option[ByteView]
+```
+
+The buffer is null for a glyph with no pixels (a space), answered as `None`. Reading a row as `row *
+pitch` with a negative pitch is caught by the view's bounds check rather than read from before the
+buffer.
 
 ### Writing into C's memory
 
@@ -663,6 +794,8 @@ on(event: string, @threaded listener: (Properties, EventData) -> unit)
 | Writing through a `ByteView`, or a `writable` binding of a `const` pointer | A `MutByteView` from a `writable` binding, an array C fills, or a `ByteBlock` |
 | An array of mirrors to a pointer that is not `const` | An `out` array C allocates (`array:`), or a binding per element |
 | An indexed field accessor with no `bound:` | Name the C expression that bounds the index |
+| `keeps:` naming an array parameter, whose C copy lives for the call ([proposed](/spec/decisions/#proposed)) | A `ByteBlock`, which is never copied |
+| `kept:` on a class some binding makes without keeping one handle of the named class | Keep it in every binding that makes the class |
 
 ## Soundness
 
@@ -678,7 +811,9 @@ every mirror's layout on the target built for. What it takes on trust is what no
 result is owned or `borrowed`, that a function `keeps` or `consumes` a pointer, that a buffer's
 `length` or `bound:` is right, that C calls a function only from the thread a missing `@threaded`
 implies, that `forget` stops the callbacks, that `attach:`'s `destroy` is called only once C has
-finished with what it keeps, and that C reads no more of a `ByteBlock` than the library checked. A wrong `borrowed` or `length` is a binding bug of the kind a wrong
+finished with what it keeps, that a holder's `release` does not use a kept object held as the Avin
+object (a handle with no `retain`, a `ByteBlock`), which the collector may free first, and that C
+reads no more of a `ByteBlock` than the library checked. A wrong `borrowed` or `length` is a binding bug of the kind a wrong
 `extern` is in C.
 
 ## An example: two clips rendered with MLT
@@ -823,6 +958,160 @@ leaving the playlist; the listener is `@threaded`, captures only a `val` holding
 called on MLT's render thread, attached for each call; the consumer keeps it until it is released,
 and `forget` disconnects it first; `run` waits by polling, each `sleep` safe for the collector, and
 `stop`, which joins the render thread, is `blocking`.
+
+## An example: a glyph from FreeType, and the same face drawn by Cairo
+
+The `freetype` package binds FreeType 2, with the manifest [above](#c-libraries); abridged to what the
+program uses:
+
+```avin
+module freetype
+
+data FreeTypeError
+    Failed(call: string, code: int)
+
+@c(enum: "FT_Render_Mode", prefix: "FT_RENDER_MODE_")
+data RenderMode
+    Normal
+    Light
+    Mono
+    Lcd
+    LcdV
+
+@c(const: "FT_LOAD_DEFAULT")
+val loadDefault: int
+
+@c(type: "FT_Library", release: "FT_Done_FreeType", retain: "FT_Reference_Library")
+class Library
+
+@c("FT_Error FT_Init_FreeType(out FT_Library *library)")
+private initRaw() -> Result[Library, int]
+
+init() -> Result[Library, FreeTypeError] = initRaw().mapErr(code -> Failed("FT_Init_FreeType", code))
+
+@c("FT_Error FT_New_Face(FT_Library library, const char *path, FT_Long index, out FT_Face *face)",
+   keeps: "library")
+private newFaceRaw(library: Library, path: string, index: long) -> Result[Face, int]
+
+@c("FT_Error FT_New_Memory_Face(FT_Library library, const FT_Byte *base, length(base) FT_Long size, FT_Long index, out FT_Face *face)",
+   keeps: ["library", "base"])
+private memoryFaceRaw(library: Library, base: ByteBlock, index: long) -> Result[Face, int]
+
+openFace(library: Library, path: string) -> Result[Face, FreeTypeError] =
+    newFaceRaw(library, path, 0).mapErr(code -> Failed("FT_New_Face", code))
+
+data Glyph
+    Glyph(width: int, rows: int, left: int, top: int, advance: real, pixels: Array[byte])
+
+@c(type: "FT_Face", release: "FT_Done_Face", retain: "FT_Reference_Face",
+   as: ["FT_GlyphSlot = self->glyph"])
+class Face
+    @c(field: "family_name")
+    familyName() -> Option[string]
+
+    @c(field: "num_glyphs")
+    glyphCount() -> long
+
+    @c("FT_Error FT_Set_Pixel_Sizes(FT_Face self, FT_UInt width, FT_UInt height)")
+    private setPixelSizesRaw(width: int, height: int) -> Result[unit, int]
+
+    @c("FT_Error FT_Load_Char(FT_Face self, FT_ULong code, FT_Int32 flags)")
+    private loadCharRaw(code: long, flags: int) -> Result[unit, int]
+
+    @c("FT_Error FT_Render_Glyph(FT_GlyphSlot self, FT_Render_Mode mode)")
+    private renderRaw(mode: RenderMode) -> Result[unit, int]
+
+    @c(field: "glyph->bitmap.width")
+    private bitmapWidth() -> int
+    @c(field: "glyph->bitmap.rows")
+    private bitmapRows() -> int
+    @c(field: "glyph->bitmap.pitch")
+    private bitmapPitch() -> int
+    @c(field: "glyph->bitmap_left")
+    private bitmapLeft() -> int
+    @c(field: "glyph->bitmap_top")
+    private bitmapTop() -> int
+    @c(field: "glyph->advance.x")
+    private advanceX() -> long
+
+    @c(field: "glyph->bitmap.buffer", view,
+       length: "(self->glyph->bitmap.pitch < 0 ? -self->glyph->bitmap.pitch : self->glyph->bitmap.pitch) * self->glyph->bitmap.rows")
+    private bitmapRaw() -> Option[ByteView]
+
+    setPixelSizes(width: int, height: int) -> Result[unit, FreeTypeError] =
+        setPixelSizesRaw(width, height).mapErr(code -> Failed("FT_Set_Pixel_Sizes", code))
+
+    render(c: char, mode: RenderMode = RenderMode.Normal) -> Result[Glyph, FreeTypeError] =
+        loadCharRaw(long(int(c)), loadDefault).mapErr(code -> Failed("FT_Load_Char", code))?
+        renderRaw(mode).mapErr(code -> Failed("FT_Render_Glyph", code))?
+        val (width, rows, pitch) = (bitmapWidth(), bitmapRows(), bitmapPitch())
+        val (left, top, advance) = (bitmapLeft(), bitmapTop(), real(advanceX()) / 64.0)
+        val stride = if pitch < 0 then -pitch else pitch
+        val pixels = Buffer[byte]()
+        bitmapRaw() match
+            Some(bits) ->
+                for r in 0..<rows
+                    val row = if pitch > 0 then r else rows - 1 - r
+                    pixels.appendAll(bits.slice(row * stride, row * stride + width))
+            None -> ()
+        Ok(Glyph(width, rows, left, top, advance, pixels.toArray()))
+```
+
+What each piece does here: a `Face` holds a C reference to its `Library`, so the two are given back
+in FreeType's order whichever the collector finalizes first; a face made over memory keeps the
+`ByteBlock` FreeType reads lazily for the face's whole life, which an array, copied for the call,
+could not be (`FT_Done_Face` reads none of it, so the block may be freed first). The glyph slot is
+the face's own, reached through field expressions and passed to `FT_Render_Glyph` through `as:`,
+since it has no reference count of its own to be a handle by. Its scalar fields are read before the
+bitmap is lent, because each read is a use of the face and would close the view; the bitmap is copied
+row by row into immutable data, top row first whatever the sign of `pitch`, and the advance, in 26.6
+fixed point, is divided by 64. A load or render that fails answers the library's error; the glyph's
+pixels are never read from a failed load.
+
+The `cairo` package depends on `freetype` and makes a Cairo font face from a FreeType one. **Cairo
+keeps the `FT_Face` without referencing it, and the face must outlive every Cairo font face made from
+it** — Cairo's own documentation asks for the face to be given back from the font face's user-data
+destructor. Contexts and scaled fonts reference the font face, so it can outlive the Avin `FontFace`,
+and `keeps:` on the handle alone would let the `Face` be collected while Cairo still draws with it.
+The `FontFace` class ties what it keeps to the C object instead, with
+[`attach:`](#when-c-holds-the-object-longer-than-avin-does):
+
+```avin
+module cairo
+
+import freetype.Face
+
+@c(type: "cairo_font_face_t *", release: "cairo_font_face_destroy", retain: "cairo_font_face_reference",
+   attach: "cairo_font_face_set_user_data(self, key, data, destroy)", key: "cairo_user_data_key_t")
+class FontFace
+    @c("cairo_status_t cairo_font_face_status(cairo_font_face_t *self)")
+    status() -> Result[unit, Status]
+
+@c("cairo_font_face_t *cairo_ft_font_face_create_for_ft_face(FT_Face face, int load_flags)",
+   keeps: "face")
+private ftFontFace(face: Face, loadFlags: int) -> FontFace
+
+fontFace(face: Face) -> Result[FontFace, CairoError] =
+    val made = ftFontFace(face, 0)
+    made.status().mapErr(CairoError.from)?
+    Ok(made)
+```
+
+The manifest adds the `cairo-ft` module (`pkg-config = "cairo-ft"`, `headers = ["<cairo-ft.h>"]`),
+and the binding is checked with `freetype`'s headers included first. The `Face` goes into the font
+face's attached record, a root of the collector, and Cairo's call of `destroy` when the last
+reference to the font face goes — from a context, a scaled font or the Avin handle, in any order —
+unpins it; the `Face` is then collected like any other, and its finalizer gives back the face, and
+after it the face's reference to its library. Cairo answers the font face it already has for an
+`FT_Face` and flags it was given before, and attaching again replaces the record, calling `destroy`
+for the old one, while the new record keeps the `Face`. A failure is latched on the font face, as
+Cairo's [errors kept on the object](#errors-kept-on-the-object) are, and `fontFace` asks it at once.
+
+**Cairo uses the `FT_Face` itself**: drawing text with the font face sets its size and loads glyphs
+into its slot, so a glyph rendered through the `Face` after Cairo has drawn must be loaded again,
+which `render` always does, and the two are used on one thread, the `Face`'s owner check holding for
+the Avin calls. `cairo_ft_font_options_substitute` takes a fontconfig pattern, and is left to a
+fontconfig binding.
 
 ## Relationship to Sysl bindings
 
