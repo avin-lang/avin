@@ -243,7 +243,7 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
             if handle_elements(p) is Some(_) then args.push(s"in_${function_of(&w, p, false).unwrap()}(ctx, a$k, ep$k)")
             elif p.form is Callback(_, _, _, _, _) then args.push(callback_lambda(&w, b, i, k))
             elif p.form is Handle(_)
-                handles.push(PassedHandle(args.len(), handle_index(&w, p), s"a$k"))
+                handles.push(PassedHandle(args.len(), handle_index(&w, p), s"a$k", s"${i}_$k"))
                 args.push("")
             // An array the Sysl function may fill is passed as a slice of its own, read back after.
             elif filled(p) then args.push(s"s$k")
@@ -323,6 +323,8 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
                 val n = if receiver is Some(_) then k else k + 1
                 val check = if b.blocking then "integer_in_waiting" else "integer_in"
                 put(&w, s"\n// `${b.name}`'s parameter $n, converted into the integer the Sysl parameter is.\nprivate param_${i}_$k[T: Integer](ctx: *Context, x: ${sysl_side(b.params[k].ty)}) -> T = $check(ctx, x)\n")
+        for h in handles
+            site_helpers(&w, h)
         last.push(w.line - 1)
     var k = 0usize
     while k < w.ins.len()
@@ -525,11 +527,33 @@ private callback_parameter_message(message: string) -> string
     s"the function's parameter ${j + 1} is ${types[0]}, but Sysl calls it with $given"
 
 // A handle a binding passes as a parameter: the place of its argument in the call, the mirror its type
-// is, and the shim's parameter that holds it.
+// is, the shim's parameter that holds it, and the helper of its own that gives it as the Sysl
+// parameter's type asks.
 private struct PassedHandle
     arg: usize
     mirror: usize
     name: string
+    site: string
+
+// The helpers that give the handle `h` to the one place in Sysl it goes: `pass_` reads it from its
+// object and `give_` from a reference already taken, each as the type `P` the place asks for, the
+// counted reference itself, a pointer to the value or the value. Sysl settles `P` from that place
+// and checks the helper's body against it, so the helpers are written beside the binding or the
+// mirror they serve, and a handle the place does not take is reported there.
+private site_helpers(w: *ShimWriter, h: &PassedHandle)
+    val m = h.mirror
+    put(w, s"\nprivate pass_${h.site}[P](p: *u8) -> P\n    val s = cell_$m(p)\n    if const P::Kind == Kind.Ref\n        s.r\n    elif const P::Kind == Kind.Pointer\n        &*s.r\n    else\n        *s.r\n")
+    put(w, s"\nprivate give_${h.site}[P](r: &mirror_$m) -> P\n    if const P::Kind == Kind.Ref\n        r\n    elif const P::Kind == Kind.Pointer\n        &*r\n    else\n        *r\n")
+
+// Sysl's words for a handle a place in Sysl does not take, `function 'avin.shims.pass_3_1' should
+// return &A, but its body yields &B`, said of the handle; any other message as it is.
+private site_message(message: string) -> string
+    if !message.starts_with("function 'avin.shims.pass_") && !message.starts_with("function 'avin.shims.give_") then return message
+    val halves = message.split("' should return ")
+    if halves.len != 2 then return message
+    val types = halves[1].split(", but its body yields ")
+    if types.len != 2 then return message
+    s"the handle goes in as a `${types[1]}`, and Sysl takes a `${types[0]}` there"
 
 // The call of binding `b`'s Sysl function `callee` with `args`, and the conversion of its result,
 // written once for each choice of the handles' types `types` from `depth` on being a trait or not:
@@ -550,8 +574,8 @@ private call_arms(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[stri
                 if has_mirror(traits, h.mirror) then arg = s"cell_${h.mirror}(${h.name}).r"
                 elif b.blocking
                     arg = s"cell_${h.mirror}(${h.name}).r"
-                    wrapper = s"given_${h.mirror}"
-                else arg = s"passed_${h.mirror}(${h.name})"
+                    wrapper = s"give_${h.site}"
+                else arg = s"pass_${h.site}(${h.name})"
             // A callback answering a handle on a trait answers its counted reference.
             for m in traits
                 arg = arg.replace_all(s"-> given_$m(call_", "-> (call_")
@@ -833,10 +857,11 @@ private handle_index(w: *ShimWriter, c: &Crossing) -> usize = mirror_of(w, c).un
 // the first word points at, so that every handle's object has the same two words. The collector does
 // not trace the first word; the finalizer the handle's descriptor names gives the reference back when
 // the object is freed still holding it. Giving back a place that holds nothing does nothing. A trait
-// is always held by a counted reference, which is what `wide` asks. Where the handle is `passed` to
-// Sysl as a parameter, it is read by two helpers: one answering it as the parameter's type `P` asks,
-// the counted reference itself, a pointer to the value or the value itself, and one answering the
-// same of a reference already taken. Where a mirror's field or a collection holding the handle goes into Sysl,
+// is always held by a counted reference, which is what `wide` asks. A handle passed to Sysl as a
+// binding's parameter or a mirror's field is read by helpers of that place's own (`site_helpers`);
+// where it is `passed` otherwise, as a callback's answer or an element of a collection, a helper
+// answers a reference already taken as the type `P` the place asks, the counted reference itself, a
+// pointer to the value or the value itself. Where a mirror's field or a collection holding the handle goes into Sysl,
 // it is `held`: a third helper checks the handle as compiled code checks one passed as a parameter,
 // stopping the program at the call where it belongs to another thread or holds nothing. Where a
 // collection of the handles is a binding's parameter, they are `listed`: the shares the collection's
@@ -854,7 +879,6 @@ private handle_lines(w: *ShimWriter, m: usize, passed: bool, held: bool, listed:
     w.mirror_lines.push(MirrorLines(m, start, w.line - 1))
     if !passed then return
     val helpers = w.line + 1
-    put(w, s"\nprivate passed_$m[P](p: *u8) -> P\n    val s = cell_$m(p)\n    if const P::Kind == Kind.Ref\n        s.r\n    elif const P::Kind == Kind.Pointer\n        &*s.r\n    else\n        *s.r\n")
     put(w, s"\nprivate given_$m[P](r: &mirror_$m) -> P\n    if const P::Kind == Kind.Ref\n        r\n    elif const P::Kind == Kind.Pointer\n        &*r\n    else\n        *r\n")
     if held
         put(w, s"\nprivate held_$m(ctx: *Context, p: *u8) -> *u8\n    val s: *Slot_$m = ptr_cast(p)\n    if s.owner != ctx.owner && !handle_claim(ctx, p) then stop_in_binding(ctx, \"`$name` belongs to another thread\")\n    if s.word == null then stop_in_binding(ctx, \"`$name` is closed\")\n    p\n")
@@ -1040,6 +1064,7 @@ private in_function(w: *ShimWriter, k: usize)
         mirror_lines(w, c, start)
         return
     if c.variants.len() > 1 then put(w, "    val tag = descriptor_of(p).tag\n")
+    var sites: Buf[PassedHandle] = buf()
     for t in 0..<c.variants.len()
         val v = c.variants[t]
         val lastly = t + 1 == c.variants.len()
@@ -1056,13 +1081,18 @@ private in_function(w: *ShimWriter, k: usize)
                     if f.crossing.form is Handle(_)
                         val m = handle_index(w, f.crossing)
                         put(w, indent + s"val h$i = held_$m(ctx, q$i[0])\n")
-                        handles.push(PassedHandle(args.len(), m, s"h$i"))
+                        val h = PassedHandle(args.len(), m, s"h$i", s"in_${k}_${t}_$i")
+                        handles.push(h)
+                        sites.push(h)
                         if !has_mirror(types, m) then types.push(m)
                         args.push("")
                     elif mirrored && *f.crossing.ty is Int(_) then args.push(s"integer_to(ctx, q$i[0], \"the Sysl field `${f.name}`\")")
                     else args.push(into_expr(w, f.crossing, s"q$i[0]", "ds", f.base))
                 None -> args.push("()")
         construction_arms(w, c, v, args, handles, types, 0, buf(), if lastly then "" else "return ", indent)
+    // Each handle field's helpers are the mirror's lines, where a field Sysl does not take is reported.
+    for h in sites
+        site_helpers(w, h)
     mirror_lines(w, c, start)
 
 // Whether `items` holds `m`.
@@ -1082,7 +1112,7 @@ private construction_arms(w: *ShimWriter, c: &Crossing, v: CrossVariant, args: B
             var arg = args[k]
             for h in handles
                 if h.arg != k then continue
-                arg = if has_mirror(traits, h.mirror) then s"cell_${h.mirror}(${h.name}).r" else s"passed_${h.mirror}(${h.name})"
+                arg = if has_mirror(traits, h.mirror) then s"cell_${h.mirror}(${h.name}).r" else s"pass_${h.site}(${h.name})"
             given.push(arg)
         put(w, indent + prefix + construction(w, c, v, given) + "\n")
         return
@@ -1449,7 +1479,7 @@ shim_diagnostics(output: string, shim: ShimSource, bindings: Buf[MirBinding], un
             val mirror = shim.mirrors[j]
             var r = report()
             val what = if mirror.finalizer == "" then "mirror" else "handle"
-            r.add(error(mirror.span, s"the Sysl $what `${mirror.name}` does not match `${mirror.target}`: $message"))
+            r.add(error(mirror.span, s"the Sysl $what `${mirror.name}` does not match `${mirror.target}`: ${site_message(message)}"))
             rendered = once(rendered, r.render(units[mirror.unit].src))
         else
             k match
@@ -1466,7 +1496,7 @@ shim_diagnostics(output: string, shim: ShimSource, bindings: Buf[MirBinding], un
                     // binding's parameter has to say.
                     if message.contains("shared between two domains") && message.contains("avin.rt.Callback")
                         message = "Sysl may call the function it is given from another thread, so the parameter that takes it is marked `@threaded`"
-                    message = nested_integer_message(listed_message(callback_parameter_message(message)))
+                    message = site_message(nested_integer_message(listed_message(callback_parameter_message(message))))
                     var r = report()
                     r.add(error(b.span, s"the Sysl binding `${b.name}` does not match `${b.target}`: $message"))
                     rendered = once(rendered, r.render(units[b.unit].src))

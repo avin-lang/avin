@@ -1550,6 +1550,13 @@ Settled by the user on 2026-11-04:
   on the user's delegation 2026-11-05 (branch `sysl-091`): from Sysl 0.9.1 the helper settles at
   the `&T`, so a type with a destructor needs no arm of its own and the shim tells only a trait
   apart; under 0.9.0 a `&T` parameter of a type without a destructor received a reference to a copy.
+  Since Sysl now checks the helper's body against the parameter's type, each handle parameter of a
+  binding and each handle field of a mirror has helpers of its own, written among that binding's or
+  mirror's lines of the shim, so a handle Sysl does not take there is reported as the binding or the
+  mirror not matching, in the handle's and the place's Sysl types, and no diagnostic names the
+  shim's functions (the reject corpus checks that none does). Alternatives weighed: one helper per
+  handle type, reported at the handle class (which names neither the binding nor the parameter at
+  fault); explicit type arguments at each call (the shim cannot see the Sysl parameter's type).
   Settled by the user 2026-11-04: **a handle is never used by two threads at once**, since its
   counted reference's count is not atomic. Each handle records an owner, and every use (a bound
   method, the handle passed as a parameter, `close()`) compares it with the running code's and traps
