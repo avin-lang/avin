@@ -31,28 +31,29 @@ build_cache(program: string) -> string
  * `testing` the executable that runs its tests, at `optimization` (`-O0` or `-O2`). It is taken from
  * the cache when one there was built from the same inputs, and otherwise built and kept there. An
  * error is the program's diagnostics, rendered, or a message saying why it could not be built. */
-cached_build(tc: Toolchain, program: string, files: Buf[ProgramFile], testing: bool, optimization: string, sysl: Buf[SyslPackage]) -> Result[Built, string]
+cached_build(tc: Toolchain, program: string, files: Buf[ProgramFile], testing: bool, optimization: string, sysl: Buf[SyslPackage], c: Buf[CLibrary]) -> Result[Built, string]
     val cache = build_cache(program)
     val kind = if testing then "-tests" else ""
     // A program named `.` is named by the directory it is.
     val name = stem(canonicalize(program).unwrap_or(program)).unwrap_or("program")
     val binary = cache + "/" + name + kind + optimization
     val record = binary + ".key"
-    val key = build_key(tc, files, testing, optimization, sysl)
+    val key = build_key(tc, files, testing, optimization, sysl, c)
     if exists(binary)
         if read_text(record) is Ok(text)
             if read_record(text, key) is Some(tests) then return Ok(Built(binary, tests, false))
-    val compiled = compile_program(tc, files, testing, sysl)
+    val compiled = compile_program(tc, files, testing, sysl, c)
     if compiled.diagnostics != "" then return Err(compiled.diagnostics)
     make_dir_all(cache).map_err(e -> s"avin: $cache: ${e.to_string()}")?
-    link(tc, compiled.llvm.unwrap_or(""), compiled.archive, binary, optimization).map_err(message -> "avin: " + message)?
+    link(tc, compiled.llvm.unwrap_or(""), compiled.archive, binary, optimization, compiled.c_link).map_err(message -> "avin: " + message)?
     write_text_atomic(record, write_record(key, compiled.tests)).map_err(e -> s"avin: $record: ${e.to_string()}")?
     Ok(Built(binary, compiled.tests, true))
 
 // Everything an executable is built from: the compiler, which a version names and the compiler's own
 // executable stamps, the kind of executable and its optimization, the runtime's sources, the
-// standard library's, the Sysl packages its bindings reach, and the program's.
-private build_key(tc: Toolchain, files: Buf[ProgramFile], testing: bool, optimization: string, sysl: Buf[SyslPackage]) -> string
+// standard library's, the Sysl packages its bindings reach, the C libraries its C bindings call, and
+// the program's.
+private build_key(tc: Toolchain, files: Buf[ProgramFile], testing: bool, optimization: string, sysl: Buf[SyslPackage], c: Buf[CLibrary]) -> string
     var text = str_builder()
     text.push("avin " + Version + "\n")
     if current_exe() is Some(exe)
@@ -61,6 +62,12 @@ private build_key(tc: Toolchain, files: Buf[ProgramFile], testing: bool, optimiz
     text.push((if testing then "tests " else "program ") + optimization + "\n")
     text.push(runtime_fingerprint(tc))
     text.push(shim_manifest(tc.runtime_dir(), sysl) + sysl_fingerprint(sysl))
+    for library in c
+        text.push(s"c ${library.package} ${library.label} ${library.pkg_config.unwrap_or("")} ${library.install}\n")
+        for name in library.link
+            text.push("link " + name + "\n")
+        for h in library.headers
+            text.push("header " + h + "\n")
     library_files(tc.library_dir()) match
         Ok(library) -> push_files(&text, library)
         Err(message) -> text.push(message + "\n")

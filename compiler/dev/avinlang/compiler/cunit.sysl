@@ -1,0 +1,467 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.{Source, Span, error, report}
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.fs.{exists, make_dir_all, make_temp_dir, pending_name, publish_file, read_bytes, remove_dir_all, remove_file, write_text}
+import sysl.process.capture
+import sysl.text.str_builder
+
+// The C unit. Every program with C bindings is built with one generated C file, compiled by clang
+// with the include flags of the program's C libraries. For each binding it holds a `_Static_assert`
+// that the function the headers declare has exactly the type the prototype says, and a declaration
+// of the function as the prototype says it, whose conflict with the header's names the header; for
+// each typedef a prototype names, a `_Static_assert` that it is the kind of type its Avin type needs;
+// and one table of constant bytes measuring each integer type a prototype names, its width and sign,
+// and each typedef in a `real` position, its width. The driver reads the table out of the object
+// file's bytes, so nothing is run and a build for another machine measures that machine. A clang
+// diagnostic is placed back at the binding by the line the unit gave it.
+//
+// The object is cached under `cunit/` in the user's cache, by a key over the unit's source, what
+// `pkg-config` answers for the libraries, and `clang --version`.
+
+/** A C binding as the C unit checks it: its name, its prototype, the Avin types of its parameters and
+ * result, the unit and span that place it, and the package it belongs to, "" for a program with no
+ * manifest. */
+struct CUnitBinding
+    name: string
+    prototype: CPrototype
+    params: Buf[&Type]
+    result: &Type
+    unit: usize
+    span: Span
+    package: string
+
+/** What building a program's C unit gave: the object, when the program has C bindings; whether this
+ * build compiled it rather than finding it cached; what it measured, by `c_measure_key`; and the
+ * flags that link the program's C libraries. */
+struct CUnit
+    object: Option[string]
+    built: bool
+    measures: Map[string, CMeasure]
+    link: Buf[string]
+
+/** The name the C unit is written under, which clang's diagnostics name. */
+const CUnitFile: string = "avin-c-unit.c"
+
+/** What the measurement table begins with, which finds it among the object's bytes. */
+const MeasureMarker: string = "avin.c-unit.measurements:"
+
+/** The C bindings of a checked program, in the order of their symbols. `files` are the program's own
+ * files, the units from `library` on. */
+c_unit_bindings(program: TProgram, files: Buf[ProgramFile], library: usize) -> Buf[CUnitBinding]
+    var out: Buf[CUnitBinding] = buf()
+    for s in program.symbols
+        if s.root is Some(_) || s.owner_class is Some(_) || s.receiver is Some(_) then continue
+        val p = c_prototype_of(s.decl) match
+            Some(p) -> p
+            None -> continue
+        val package = if s.unit >= library && s.unit - library < files.len() then files[s.unit - library].package else ""
+        out.push(CUnitBinding(s.name, p, s.params, s.result.unwrap_or(Unit), s.unit, s.decl.name_span, package))
+    out
+
+/** The C unit of a program whose C bindings are `bindings` and whose packages name `libraries`. Each
+ * library's `pkg-config` module is asked for its flags; with no bindings there is no unit, and only
+ * the link flags are answered. A binding the headers do not declare as its prototype says, or whose
+ * package names no header, is reported at the binding, rendered with `sources`. */
+ensure_c_unit(tc: Toolchain, bindings: Buf[CUnitBinding], libraries: Buf[CLibrary], sources: Buf[Source]) -> Result[CUnit, string]
+    if bindings.len() == 0 && libraries.len() == 0 then return Ok(CUnit(None, false, map(), buf()))
+    // A binding is checked against a header, always.
+    var refused = ""
+    for b in bindings
+        var headers = 0usize
+        for library in libraries
+            if library.package == b.package then headers += library.headers.len()
+        if headers > 0 then continue
+        val why = if b.package == "" then s"the C binding `${b.name}` is checked against the headers a package's manifest names under `c-libraries`, and this program has no avin.hocon" else s"the C binding `${b.name}` has no header to be checked against: name the one that declares `${b.prototype.symbol}` in a `headers` list of the `c-libraries` of package `${b.package}`"
+        var r = report()
+        r.add(error(b.span, why))
+        refused = refused + r.render(sources[b.unit])
+    if refused != "" then return Err(refused)
+    var cflags: Buf[string] = buf()
+    var link: Buf[string] = buf()
+    var answered = ""
+    for library in libraries
+        library.pkg_config match
+            Some(m) ->
+                val c = ask_pkg_config(tc, library, m, "--cflags")?
+                val l = ask_pkg_config(tc, library, m, "--libs")?
+                answered = answered + m + "\n" + c + "\n" + l + "\n"
+                for flag in c.fields()
+                    add_flag(&cflags, flag)
+                for flag in l.fields()
+                    add_flag(&link, flag)
+            None ->
+                for name in library.link
+                    add_flag(&link, "-l" + name)
+    if bindings.len() == 0 then return Ok(CUnit(None, false, map(), link))
+    val unit = c_unit_source(bindings, libraries)
+    val version = capture(tc.clang, ["--version"], timeout = 60000) match
+        Ok(r) -> r.text
+        Err(e) -> return Err("avin: " + missing_tool(tc.clang, e.to_string()) + "\n")
+    var flags_text = ""
+    for f in cflags
+        flags_text = flags_text + f + "\n"
+    val object = tc.c_unit_cache() + "/" + content_key(unit.text + "\n" + flags_text + answered + version) + ".o"
+    var built = false
+    if !exists(object)
+        compile_c_unit(tc, unit, cflags, object, bindings, libraries, sources)?
+        built = true
+    val bytes = read_bytes(object).map_err(e -> s"avin: $object: ${e.to_string()}\n")?
+    val measures = read_measures(bytes, unit.measured) match
+        Some(m) -> m
+        None -> return Err(s"avin: the C unit $object holds no measurements\n")
+    Ok(CUnit(Some(object), built, measures, link))
+
+private add_flag(flags: *Buf[string], flag: string)
+    for f in *flags
+        if f == flag then return
+    flags.push(flag)
+
+// What `pkg-config <question> <module>` prints, or the error a build that cannot find the library
+// gives, with what the manifest says to do.
+private ask_pkg_config(tc: Toolchain, library: CLibrary, module_name: string, question: string) -> Result[string, string]
+    val tail = if library.install == "" then "" else " " + library.install
+    val asked = s"`pkg-config $question $module_name`"
+    val result = capture(tc.pkg_config, [question, module_name], stderr = true, timeout = 60000) match
+        Ok(r) -> r
+        Err(e) -> return Err(s"error: the C library `${library.label}` of package `${library.package}` was not found: $asked could not run (${e.to_string()}).$tail\n")
+    if !result.status.ok() then return Err(s"error: the C library `${library.label}` of package `${library.package}` was not found: $asked failed.$tail\n")
+    Ok(result.text.trim())
+
+/** What one line of the C unit is for, which places a diagnostic clang gives at it. */
+enum CUnitLine
+    /** Nothing a diagnostic is placed by. */
+    Plain
+    /** The `#include` of a header of `libraries[library]`. */
+    IncludeLine(library: usize, header: string)
+    /** The header check of `bindings[binding]`. */
+    AssertLine(binding: usize)
+    /** A pointer of the prototype's type set to the header's function, whose diagnostic writes both
+     * types with their typedefs' names. */
+    PointerLine(binding: usize)
+    /** The declaration of `bindings[binding]`'s function as its prototype says it. */
+    DeclareLine(binding: usize)
+    /** The check that the typedef `name`, parameter `position` of `bindings[binding]` (0 for the
+     * result), is the kind `kind` needs. */
+    KindLine(binding: usize, position: usize, name: string, kind: CKind)
+
+/** A C unit's text, what each of its lines is for, counting from 1, and the measurement keys of its
+ * table, in order. */
+struct CUnitSource
+    text: string
+    lines: Buf[CUnitLine]
+    measured: Buf[string]
+
+/** The C unit for `bindings`, including every header of `libraries`. */
+c_unit_source(bindings: Buf[CUnitBinding], libraries: Buf[CLibrary]) -> CUnitSource
+    var out = str_builder()
+    var lines: Buf[CUnitLine] = buf()
+    // Line 0 does not exist; lines count from 1.
+    lines.push(Plain)
+    out.push("/* The C unit of an Avin program: written by the compiler. */\n")
+    lines.push(Plain)
+    out.push("#include <stdbool.h>\n")
+    lines.push(Plain)
+    var included: Buf[string] = buf()
+    for i in 0..<libraries.len()
+        for h in libraries[i].headers
+            if contains_text(included, h) then continue
+            included.push(h)
+            out.push("#include " + (if h.starts_with("<") || h.starts_with("\"") then h else "<" + h + ">") + "\n")
+            lines.push(IncludeLine(i, h))
+    var kinds: Buf[string] = buf()
+    var measured: Buf[string] = buf()
+    var measured_types: Buf[string] = buf()
+    for i in 0..<bindings.len()
+        val b = bindings[i]
+        val p = b.prototype
+        var params = ""
+        for k in 0..<p.params.len()
+            params = params + (if k > 0 then ", " else "") + p.params[k].text
+        if params == "" then params = "void"
+        out.push(s"_Static_assert(__builtin_types_compatible_p(__typeof__(&${p.symbol}), ${p.result_text} (*)($params)), \"avin: the C binding ${b.name}\");\n")
+        lines.push(AssertLine(i))
+        out.push(s"static ${p.result_text} (*const avin_c_binding_$i)($params) = &${p.symbol};\n")
+        lines.push(PointerLine(i))
+        out.push(s"${p.result_text} ${p.symbol}($params);\n")
+        lines.push(DeclareLine(i))
+        // Each named type at each position: the result first, then the parameters.
+        for k in 0..<p.params.len() + 1
+            val c = if k == 0 then p.result else p.params[k - 1].ty
+            val avin = if k == 0 then b.result else b.params[k - 1]
+            val kind = c_kind_needed(c, avin) match
+                Some(kind) -> kind
+                None -> continue
+            val spelled = c_spelling(c)
+            if c is CTypedef(name)
+                val tag = kind_tag(kind) + " " + name
+                if !contains_text(kinds, tag)
+                    kinds.push(tag)
+                    out.push(s"_Static_assert(${kind_test(kind, name)}, \"avin: the C type $name\");\n")
+                    lines.push(KindLine(i, k, name, kind))
+            val key = c_measure_key(c, kind)
+            if !contains_text(measured, key)
+                measured.push(key)
+                measured_types.push(spelled)
+    // The measurements: the marker, the count, then two bytes for each measured type.
+    out.push("__attribute__((used)) const unsigned char avin_c_unit_measurements[] = {\n")
+    lines.push(Plain)
+    var marker = "   "
+    for byte in MeasureMarker.bytes
+        marker = marker + s" $byte,"
+    out.push(marker + "\n")
+    lines.push(Plain)
+    out.push(s"    ${measured.len() % 256}, ${measured.len() / 256},\n")
+    lines.push(Plain)
+    for j in 0..<measured.len()
+        val t = measured_types[j]
+        if measured[j].starts_with("real ") then out.push(s"    (unsigned char)sizeof($t), 0,\n")
+        else out.push(s"    (unsigned char)sizeof($t), (unsigned char)(($t)-1 < ($t)0),\n")
+        lines.push(Plain)
+    out.push("};\n")
+    lines.push(Plain)
+    CUnitSource(out.finish(), lines, measured)
+
+private c_spelling(c: CType) -> string = c match
+    CKeyword(n) -> n
+    CTypedef(n) -> n
+    _ -> ""
+
+private kind_tag(kind: CKind) -> string = kind match
+    KindInteger -> "integer"
+    KindByte -> "byte"
+    KindBool -> "bool"
+    KindReal -> "real"
+
+// The constant expression that holds where the typedef `name` is the kind `kind` asks for, by the
+// class of type clang gives it: 1 an integer or enumeration, 4 a bool, 8 a floating-point type.
+private kind_test(kind: CKind, name: string) -> string
+    val class = s"__builtin_classify_type(*($name *)0)"
+    kind match
+        KindInteger -> s"$class == 1"
+        KindByte -> s"$class == 1 && sizeof($name) == 1"
+        KindBool -> s"$class == 4"
+        KindReal -> s"$class == 8"
+
+private contains_text(xs: Buf[string], x: string) -> bool
+    for y in xs
+        if y == x then return true
+    false
+
+// Compiles the C unit into `object`, published by rename, or renders why it did not compile.
+private compile_c_unit(tc: Toolchain, unit: CUnitSource, cflags: Buf[string], object: string, bindings: Buf[CUnitBinding], libraries: Buf[CLibrary], sources: Buf[Source]) -> Result[unit, string]
+    make_dir_all(tc.c_unit_cache()).map_err(e -> s"avin: ${tc.c_unit_cache()}: ${e.to_string()}\n")?
+    val dir = make_temp_dir("avin-c-unit").map_err(e -> s"avin: ${e.to_string()}\n")?
+    defer _ = remove_dir_all(dir)
+    val file = dir + "/" + CUnitFile
+    write_text(file, unit.text).map_err(e -> s"avin: $file: ${e.to_string()}\n")?
+    val pending = pending_name(object)
+    defer _ = remove_file(pending)
+    var args: Buf[string] = buf()
+    for a in ["-c", "-x", "c", "-w", "-fno-color-diagnostics", file, "-o", pending]
+        args.push(a)
+    for f in cflags
+        args.push(f)
+    val result = capture(tc.clang, args.view(), stderr = true, timeout = 120000).map_err(e -> "avin: " + missing_tool(tc.clang, e.to_string()) + "\n")?
+    if !result.status.ok() then return Err(c_unit_diagnostics(result.err.unwrap_or("") + result.text, unit, bindings, libraries, sources))
+    publish_file(pending, object).map_err(e -> s"avin: $object: ${e.to_string()}\n")?
+    Ok(())
+
+/** What one binding's diagnostics from the C unit said. */
+private struct BindingTrouble
+    declared: string
+    written: string
+    undeclared: bool
+    header: string
+    other: string
+    /** The typedefs found the wrong kind, and what each diagnostic says of one. */
+    kind_names: Buf[string]
+    kinds: Buf[string]
+
+/** Clang's diagnostics of the C unit `unit`, placed back at the bindings and the libraries they came
+ * from; anything clang said that no line of the unit accounts for is passed on as it was. */
+c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding], libraries: Buf[CLibrary], sources: Buf[Source]) -> string
+    var troubles: Buf[BindingTrouble] = buf()
+    for _ in bindings
+        troubles.push(BindingTrouble("", "", false, "", "", buf(), buf()))
+    var unplaced = ""
+    var libraries_text = ""
+    var placed_any = false
+    // The binding whose declaration conflicted with the header's last, whose note names the header.
+    var conflicting: Option[usize] = None
+    for text in output.split("\n")
+        val d = c_diagnostic(text) match
+            Some(d) -> d
+            None -> continue
+        if d.severity == "note"
+            if conflicting is Some(i) && d.message.starts_with("previous declaration is here") && troubles[i].header == ""
+                troubles[i].header = header_named(d.file, libraries)
+            continue
+        conflicting = None
+        if !d.file.ends_with("/" + CUnitFile) || d.line >= unit.lines.len()
+            unplaced = unplaced + text + "\n"
+            continue
+        unit.lines[d.line] match
+            IncludeLine(k, header) ->
+                val library = libraries[k]
+                val tail = if library.install == "" then "" else " " + library.install
+                libraries_text = libraries_text + s"error: the header `$header` of the C library `${library.label}` of package `${library.package}` was not found: ${d.message}.$tail\n"
+                placed_any = true
+            AssertLine(i) ->
+                placed_any = true
+                val requirement = "static assertion failed due to requirement '__builtin_types_compatible_p("
+                if d.message.starts_with(requirement)
+                    val inner = d.message[requirement.bytes.len..]
+                    val end = inner.index_of(")':") match
+                        Some(e) -> e
+                        None -> inner.bytes.len
+                    val pair = split_top_level(inner[..<end])
+                    // The pointer's diagnostic, where clang gives one, names the typedefs.
+                    if pair.len() == 2 && troubles[i].declared == ""
+                        troubles[i].declared = function_type_text(pair[0])
+                        troubles[i].written = function_type_text(pair[1])
+                elif d.message.starts_with("use of undeclared identifier") then troubles[i].undeclared = true
+                elif troubles[i].other == "" then troubles[i].other = d.message
+            PointerLine(i) ->
+                placed_any = true
+                val initializing = "incompatible function pointer types initializing '"
+                val expression = " with an expression of type '"
+                if d.message.starts_with(initializing) && d.message.contains(expression)
+                    val rest = d.message[initializing.bytes.len..]
+                    val parts = rest.split(expression)
+                    troubles[i].written = function_type_text(before_quote(parts[0]))
+                    troubles[i].declared = function_type_text(before_quote(parts[1]))
+            DeclareLine(i) ->
+                placed_any = true
+                if d.message.starts_with("conflicting types for") then conflicting = Some(i)
+                elif troubles[i].other == "" then troubles[i].other = d.message
+            KindLine(i, position, name, kind) ->
+                placed_any = true
+                val where = if position == 0 then "the result" else s"parameter $position"
+                val avin = if position == 0 then bindings[i].result else bindings[i].params[position - 1]
+                val what = kind match
+                    KindInteger -> "an integer type"
+                    KindByte -> "an integer type one byte wide"
+                    KindBool -> "a bool"
+                    KindReal -> "a floating-point type"
+                // A type the headers do not declare at all is reported by the header check.
+                if d.message.starts_with("static assertion failed") && !contains_text(troubles[i].kind_names, name)
+                    troubles[i].kind_names.push(name)
+                    troubles[i].kinds.push(s"the C type `$name` of $where is not $what in the headers, so it cannot cross as `${type_name(avin)}`")
+            Plain -> unplaced = unplaced + text + "\n"
+    var rendered = libraries_text
+    for i in 0..<bindings.len()
+        val b = bindings[i]
+        val t = troubles[i]
+        val symbol = b.prototype.symbol
+        var messages: Buf[string] = buf()
+        if t.undeclared
+            var names = ""
+            for library in libraries
+                if library.package != b.package then continue
+                for h in library.headers
+                    names = names + (if names == "" then "" else ", ") + h
+            messages.push(s"the C binding `${b.name}` names `$symbol`, which no header of its package declares: $names")
+        elif t.declared != ""
+            val place = if t.header == "" then "" else " in " + t.header
+            messages.push(s"the C binding `${b.name}` does not match `$symbol`$place: the header declares '${t.declared}', but the binding says '${t.written}'")
+        elif t.other != "" then messages.push(s"the C binding `${b.name}` does not compile against its headers: ${t.other}")
+        for k in t.kinds
+            messages.push(s"the C binding `${b.name}` does not fit its headers: $k")
+        if messages.len() == 0 then continue
+        var r = report()
+        for m in messages
+            r.add(error(b.span, m))
+        rendered = rendered + r.render(sources[b.unit])
+    if !placed_any || (rendered == "" && unplaced != "") then return "avin: the C unit did not compile:\n" + output
+    rendered
+
+/** One diagnostic line of clang's: the file, line and severity, and the message. */
+private struct CDiagnostic
+    file: string
+    line: usize
+    severity: string
+    message: string
+
+private c_diagnostic(text: string) -> Option[CDiagnostic]
+    for severity in ["fatal error", "error", "note", "warning"]
+        val marker = ": " + severity + ": "
+        val at = text.index_of(marker) match
+            Some(a) -> a
+            None -> continue
+        // `file:line:col` before the marker.
+        val place = text[..<at].split(":")
+        if place.len < 3 then return None
+        var line = 0usize
+        for b in place[place.len - 2].bytes
+            if b < u8('0') || b > u8('9') then return None
+            line = line * 10 + usize(b - u8('0'))
+        var file = ""
+        for i in 0..<place.len - 2
+            file = if i == 0 then place[i] else file + ":" + place[i]
+        return Some(CDiagnostic(file, line, if severity == "fatal error" then "error" else severity, text[at + marker.bytes.len..]))
+    None
+
+// The two types of `a, b`, split at the comma outside every parenthesis.
+private split_top_level(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var depth = 0
+    var from = 0usize
+    for i in 0..<text.bytes.len
+        val b = text.bytes[i]
+        if b == u8('(') then depth += 1
+        elif b == u8(')') then depth -= 1
+        elif b == u8(',') && depth == 0
+            out.push(text[from..<i].trim())
+            from = i + 1
+    out.push(text[from..].trim())
+    out
+
+// A pointer to a function type as clang writes it, `int (*)(long)`, as the function type,
+// `int (long)`.
+private function_type_text(pointer: string) -> string = pointer.replace_all("(*const)", "").replace_all("(*)", "").replace_all("  ", " ")
+
+// What a diagnostic quotes, up to the quote that ends it.
+private before_quote(text: string) -> string = text.index_of("'") match
+    Some(end) -> text[..<end]
+    None -> text
+
+// The header a diagnostic's file is, as the manifest wrote it when it is one of `libraries`', and
+// otherwise as the file's path from its include directory.
+private header_named(file: string, libraries: Buf[CLibrary]) -> string
+    for library in libraries
+        for h in library.headers
+            val bare = if h.starts_with("<") || h.starts_with("\"") then h[1..<h.bytes.len - 1] else h
+            if file == bare || file.ends_with("/" + bare) then return h
+    val parts = file.split("/include/")
+    if parts.len > 1 then return parts[parts.len - 1]
+    val names = file.split("/")
+    names[names.len - 1]
+
+/** The measurements in a C unit's object, by key, or `None` where the object holds no table of
+ * `keys.len()` entries. */
+read_measures(bytes: []const u8, keys: Buf[string]) -> Option[Map[string, CMeasure]]
+    val marker = MeasureMarker.bytes
+    var at: Option[usize] = None
+    var i = 0usize
+    while i + marker.len <= bytes.len
+        var same = true
+        for k in 0..<marker.len
+            if bytes[i + k] != marker[k]
+                same = false
+                break
+        if same
+            at = Some(i + marker.len)
+            break
+        i += 1
+    val start = at?
+    if start + 2 > bytes.len then return None
+    val count = usize(bytes[start]) + usize(bytes[start + 1]) * 256
+    if count != keys.len() || start + 2 + 2 * count > bytes.len then return None
+    var out: Map[string, CMeasure] = map()
+    for j in 0..<count
+        val size = u32(bytes[start + 2 + 2 * j])
+        val signed = bytes[start + 3 + 2 * j] != 0u8
+        out.put(keys[j], CMeasure(size * 8, signed))
+    Some(out)

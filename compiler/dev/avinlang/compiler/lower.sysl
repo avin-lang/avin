@@ -1805,6 +1805,7 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
             finish(l, returning(l, result))
         None ->
             if binding_target(symbol.decl) is Some(_) || handle_of(l, symbol) is Some(_) then binding_body(l, symbol, shim_symbol(function_symbol(l.program, f.symbol, inst.type_args)))
+            elif c_prototype_of(symbol.decl) is Some(p) then c_binding_body(l, symbol, p)
             else intrinsic_body(l, symbol)
     MirFunction(function_symbol(l.program, f.symbol, inst.type_args), signature, l.values, l.slots, l.blocks)
 
@@ -2024,6 +2025,71 @@ private binding_body(l: *Lowering, symbol: FunctionSymbol, shim: string)
         Some(d) -> Some(Value(d))
         None -> None))
 
+// A C binding's body converts each argument to its C type at the width the C unit measured, calls
+// the C function directly, and converts what it answers. An integer the other side cannot hold stops
+// the program at the call, as a check in the core library does: an argument's reason names the C
+// type by its sign and width, a result's the Avin type.
+private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
+    val outer = l.library
+    l.library = true
+    val at = symbol.decl.name_span
+    var args: Buf[Operand] = buf()
+    var scalars: Buf[CScalar] = buf()
+    for i in 0..<symbol.params.len()
+        val t = concrete(l, symbol.params[i])
+        val s = c_scalar_of(p.params[i].ty, t, l.program.c_measures)
+        scalars.push(s)
+        args.push(c_argument(l, Value(l.param_values[i].unwrap()), t, s, c_integer_name(p.params[i].ty, s), at))
+    val result_type = concrete(l, symbol.result.unwrap_or(Unit))
+    if *result_type is Unit
+        l.insts.push(Call(None, CFunction(p.symbol, scalars, None), args))
+        l.library = outer
+        finish(l, Return(None))
+        return
+    val s = c_scalar_of(p.result, result_type, l.program.c_measures)
+    val answer = fresh(l, c_machine(s))
+    l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), args))
+    val value = c_answer(l, Value(answer), s, result_type, at)
+    l.library = outer
+    finish(l, Return(Some(value)))
+
+// The machine type an operand crossing as `s` has: a `float` is carried as a `real`.
+private c_machine(s: CScalar) -> MirType = s match
+    CSigned(bits) -> MInt(bits)
+    CUnsigned(bits) -> MInt(bits)
+    CBoolean -> MBool
+    CBinary64 -> MReal
+    CBinary32 -> MReal
+
+// An argument of Avin type `t` as the C type crossing as `s`, which `name` names. A signed C type
+// narrower than the integer traps where the value does not survive the trip back; an unsigned one
+// traps on a negative value, and on one past its greatest where it is narrower.
+private c_argument(l: *Lowering, x: Operand, t: &Type, s: CScalar, name: string, at: Span) -> Operand = *t match
+    Int(width) -> s match
+        CSigned(bits) ->
+            if bits >= width then return resize(l, x, width, bits, true)
+            val narrow = resize(l, x, width, bits, true)
+            val back = resize(l, narrow, bits, width, true)
+            trap_if(l, compare(l, CmpNe, back, x), s"value out of range for $name", at)
+            narrow
+        CUnsigned(bits) ->
+            if bits >= width
+                trap_if(l, compare(l, CmpLt, x, ConstInt(width, "0")), s"value out of range for $name", at)
+                return resize(l, x, width, bits, false)
+            // A negative value compares as huge, so one unsigned test covers both ends.
+            trap_if(l, compare(l, CmpUgt, x, ConstInt(width, ((1u64 << u64(bits)) - 1u64).to_string())), s"value out of range for $name", at)
+            resize(l, x, width, bits, false)
+        _ -> x
+    _ -> x
+
+// What C answered, crossing as `s`, as the Avin type `t`: an integer traps where `t` cannot hold it.
+private c_answer(l: *Lowering, x: Operand, s: CScalar, t: &Type, at: Span) -> Operand = *t match
+    Int(width) -> s match
+        CSigned(bits) -> narrow_signed(l, x, bits, width, t, at)
+        CUnsigned(bits) -> narrow_unsigned(l, x, bits, width, t, at)
+        _ -> x
+    _ -> x
+
 // The name the traps of the handle class `k` give it.
 private trap_name(l: *Lowering, k: usize) -> string = handle_trap_name(l.program.classes[k].decl, l.program.classes[k].name)
 
@@ -2050,7 +2116,7 @@ private bound_instance(l: *Lowering, index: usize) -> bool
     val inst = l.instances[index]
     if inst.generated != Written then return false
     val symbol = l.program.symbols[inst.function]
-    binding_target(symbol.decl) is Some(_) || handle_of(l, symbol) is Some(_)
+    binding_target(symbol.decl) is Some(_) || handle_of(l, symbol) is Some(_) || c_prototype_text(symbol.decl) is Some(_)
 
 /** The Sysl handle class whose method `symbol` is, where it is one without a body: a method bound to
  * the handle's Sysl value, or its `close()`. */

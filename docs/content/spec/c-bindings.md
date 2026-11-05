@@ -142,6 +142,15 @@ avin: trap: value out of range for u64 (size_t) at main.avin:12:5
 The width of `long`, `size_t` and each typedef is the target's, measured by the C unit; the check is
 emitted for the widths measured. `long double`, `_Complex` types and vector types are refused.
 
+A typedef crosses as the Avin type of its kind, which the C unit checks: an integer typedef as an
+integer type, one an integer one byte wide as `byte`, a `bool` as `bool`, and a `float` or a `double`
+as `real`. `signed char` crosses only as an integer type, and `char` only as `byte`. A result one past
+what the binding's Avin type holds stops the program naming that type, as a Sysl binding's does:
+
+```text
+avin: trap: value out of range for long at main.avin:13:13
+```
+
 ## Strings
 
 - **A `const char *` parameter takes a `string`**, copied into NUL-terminated memory that lives for
