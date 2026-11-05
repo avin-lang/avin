@@ -10,7 +10,20 @@ lines indented four columns are the program. The program blocks are highlighted 
 blocks as illustrations (as Avin when the fence is marked `avin`), headings, lists and the inline
 Markdown of the prose as Markdown, and the language server answers in them as it does in `.avin`
 files, at the document's own positions. `syntaxes/lavin.tmLanguage.json` is the grammar; its tests
-are `samples/literate.lavin` in the grammar tests.
+are the `.lavin` samples in the grammar tests.
+
+The prose sits under the scope `meta.prose.lavin` and the program does not, so the prose can be
+coloured on its own without touching the program. The theme's Markdown colours apply by default; a
+rule in `settings.json` overrides them for literate files alone:
+
+```json
+"editor.tokenColorCustomizations": {
+  "textMateRules": [
+    { "scope": "meta.prose.lavin markup.heading", "settings": { "foreground": "#2f6f9f", "fontStyle": "bold" } },
+    { "scope": "meta.prose.lavin markup.inline.raw", "settings": { "foreground": "#8a5a00" } }
+  ]
+}
+```
 
 *An independent Avin extension for Visual Studio Code. It is not affiliated with or endorsed by
 Microsoft or the Visual Studio Code project.*
