@@ -440,7 +440,7 @@ source checkout. Its version is the compiler's. It is never a dependency: no man
   error at the import, listing the modules under the deepest prefix that exists:
 
 ```text
-error: the standard library has no module `avin.jsn`; the modules under `avin` are `avin.collections`, `avin.fs`, `avin.io`, `avin.math`, `avin.process`, `avin.regex`, `avin.threads`, `avin.time`
+error: the standard library has no module `avin.jsn`; the modules under `avin` are `avin.collections`, `avin.fs`, `avin.io`, `avin.math`, `avin.process`, `avin.random`, `avin.regex`, `avin.threads`, `avin.time`
  --> app/main.avin:1:8
 ```
 

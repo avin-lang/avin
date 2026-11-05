@@ -421,11 +421,11 @@ and in every release; `Random()` is seeded by the platform, differently each tim
 | --- | --- |
 | `nextInt() -> int`, `nextLong() -> long` | Any value of the type, each equally likely. |
 | `nextInt(bound: int) -> int`, `nextLong(bound: long) -> long` | From `0` up to `bound`, not including it; a bound that is not positive traps. |
-| `between(min, max)` | From `min` up to `max`, not including it, for `int`, `long` and `real`; `min >= max` traps. |
+| `between(min, max)` | From `min` up to `max`, not including it, for `int`, `long` and `real`; `min >= max` traps, and for `real` so do a NaN bound and an infinite `max - min`. |
 | `nextReal() -> real` | From `0.0` up to `1.0`, not including it, every multiple of 2^-53 equally likely. |
 | `nextBoolean() -> bool` | `true` or `false`, equally likely. |
 | `nextGaussian() -> real` | Normally distributed, mean `0.0` and standard deviation `1.0`. |
-| `nextBytes(n: int) -> Array[byte]` | A new array of `n` bytes. |
+| `nextBytes(n: int) -> Array[byte]` | A new array of `n` bytes; a negative `n` traps. |
 | `alphanumeric() -> Iterator[char]` | An endless run of characters from `A`–`Z`, `a`–`z` and `0`–`9`, equally likely. |
 | `shuffle[T](xs: Iterable[T]) -> Vector[T]` | The elements in a new order, every order equally likely. |
 | `setSeed(seed: long)` | Starts the generator again as `Random(seed)` would. |
@@ -435,8 +435,10 @@ and in every release; `Random()` is seeded by the platform, differently each tim
 call from any thread. A `Random` a program makes is its own: it takes no lock, so threads that share
 one share it through a `Mutex`.
 
-**The generator is named.** It is PCG32 (PCG-XSH-RR, 64 bits of state, 32 of output), so a seeded run
-can be checked against the published algorithm. A bound is reached without bias, by rejection rather
+**The generator is named.** It is PCG32 (PCG-XSH-RR, 64 bits of state, 32 of output) on the
+reference implementation's stream 54, seeded as the reference seeds it, so a seeded run can be checked
+against the published algorithm: `Random(42).nextInt()` is its first published output, `0xa15c02b7`,
+which as an `int` is `-1587805513`. A `long` is two draws, the first the high half. A bound is reached without bias, by rejection rather
 than a remainder. **None of this is fit for secrets**: anyone who sees a few outputs can compute the
 rest, so a key, a token or a password is never taken from it.
 
