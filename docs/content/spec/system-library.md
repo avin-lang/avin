@@ -264,7 +264,10 @@ main() -> int
 **A source is read once.** Each of the three takes up where the last stopped, as standard input's
 functions do; a second `lines()` over a source already read to its end has nothing. A source holds
 nothing open, so there is nothing to close: a file's is its text, and standard input stays the
-program's.
+program's. **Standard input's characters come from the same buffer as its lines**, so `chars()`,
+`lines()` and `io.readLine()` can be mixed, and bytes that are not UTF-8 are one U+FFFD for each
+ill-formed run, character by character as in a line. Asking an exhausted iterator for more traps, as
+with any iterator.
 
 ## `avin.fs`
 

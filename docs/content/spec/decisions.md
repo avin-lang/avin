@@ -1438,7 +1438,8 @@ Settled by the user on 2026-11-04:
   - **[`Source`](/spec/system-library/#source)** in `avin.io`: `fromFile` (read whole, every failure
     up front), `fromString`, `stdin()`, and `lines()`, `chars()` and `readAll()`, each consuming. The
     reference's `getLines` and `mkString` are `lines` and `readAll`, the names `avin.io` already uses.
-    No new binding: it is written over `fs.readText` and standard input's buffer. Not blocked.
+    No new binding: it is written over `fs.readText` and standard input's buffer, with one runtime
+    entry taking a character from that buffer for `chars()`. Not blocked.
   - **[`avin.random`](/spec/system-library/#avin-random)**: a `Random` class (`Random(seed)`
     reproducible, `Random()` seeded by the platform) with `nextInt`, `nextLong`, bounded forms,
     `between`, `nextReal`, `nextBoolean`, `nextGaussian`, `nextBytes`, `alphanumeric`, `shuffle` and
@@ -1589,7 +1590,10 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
-None at present.
+- **`Source` is a trait**, its three readers abstract, so a program can write a source of its own
+  (text made as it is read, a socket later) and hand it to any function that takes one; the kinds
+  `avin.io` makes are private classes reached only through `Source.fromFile`, `fromString` and
+  `stdin`. The alternative is a final class whose kinds are fixed by the library.
 
 ## Open
 
