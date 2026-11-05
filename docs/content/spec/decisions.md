@@ -2269,7 +2269,22 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- **Qualified variant access, `Type.Variant`** (branch `qualified-variants`, 2026-11-05). Proposed:
+  `T.V` and `m.T.V` name data type `T`'s variant `V`, beside the bare `V`, in expressions and
+  patterns; the variant comes before any other member of that name, and a companion object
+  declaring a method or a field named after one of its type's variants is refused where it is
+  declared. A capitalized `T.Name` that is no variant, companion member or static member is reported
+  with the type's variants. Why: the qualified form is meant to be unambiguous, and refusing the
+  companion member keeps it so, at the cost of a rule that only bites on a member spelled like a
+  variant (members are lowerCamelCase, variants PascalCase). Alternatives weighed: the companion's
+  member winning (`Shape.Circle` would then not always be the variant, defeating the point);
+  choosing between them by call shape (a value and a call of one name meaning different things);
+  allowing both silently with the variant winning (the companion member unreachable by name). A
+  static trait member spelled like a variant is not refused, since the trait and the type are
+  declared apart: the variant wins in `T.V`, and the member stays reachable through a type
+  parameter. Type arguments are written once, on the type or on the variant, not both. Review with
+  the user: whether the "capitalized name" test for reporting a missing variant should instead be
+  any name that resolves to nothing on a data type.
 
 ## Open
 
