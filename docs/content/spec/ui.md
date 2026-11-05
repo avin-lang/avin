@@ -160,7 +160,7 @@ a line by default, and writes down every operation instead of drawing it:
 | `c.dump()` | What was drawn, one operation a line |
 | `c.point(x, y, down)`, `c.release(x, y)` | Moves the pointer, held or not, and lets it go; a press and a release in one control is a tap |
 | `snapshot(v, c, at)` | A `Snapshot` of what `v` puts on screen: `len()`, `dump()`, `toJson()`, and `clickPoint(key)`, where to tap a control's name or its reference `@n`, or a `Missed` saying why there is nowhere (`Unknown`, `Duplicate`, `Covered`) |
-| `tap(v, key, at)` | Draws `v` in `at` on a new canvas and taps the control `key` names, at the centre of what of it is shown |
+| `tap(v, key, at)` | Draws `v` in `at` on a new canvas and taps the control `key` names, at the centre of what of it is shown, drawing a frame while the pointer is held so a slider moves to it |
 
 A key no control on screen answers to, and a name two controls share, are `Err(Missed(…))`:
 
