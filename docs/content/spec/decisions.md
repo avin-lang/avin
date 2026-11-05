@@ -2073,6 +2073,50 @@ their words are reserved.
   data type with an `Option` field and lets options sort and have `max`/`min`. Alternative: no order
   on options, leaving a field of one underivable — rejected as the cost falls on every record with
   an optional field. Tuples, `Either` and `Result` have no `Ord` here.
+- Settled on the user's delegation 2026-11-05 (built on branch `sysl-handles`): **a handle may name a
+  Sysl trait, and its trait object is kept in a cell** ([Sysl bindings](/spec/sysl-bindings/#handles-on-traits)).
+  Every handle's object stays two words, the first naming the Sysl value and the second its owner;
+  where the reference is a trait object, two words itself, the first word points at a cell the shim
+  allocates holding it, freed when the reference is given back. The shim tells the cases apart while
+  Sysl compiles it, by whether a reference to the type is wider than a pointer, and treats a trait
+  as always held by a counted reference. Rationale: a struct handle is unchanged and reached as
+  directly as before, the compiled code's owner and closed checks read the same two words for every
+  handle, and the compiler need not know which Sysl types are traits, which only Sysl does.
+  Alternatives weighed: a handle object of three words for a trait, which needs the compiler to know
+  the Sysl type's kind before Sysl checks the shim, and moves the owner word of one kind of handle;
+  every handle boxed, which costs a struct handle an allocation and a load for nothing.
+- Settled on the user's delegation 2026-11-05 (built on branch `sysl-handles`): **an `Array` or a
+  `Vector` of handles that is a parameter goes into Sysl** ([Sysl bindings](/spec/sysl-bindings/#collections-of-handles)),
+  replacing "a handle inside a collection does not go into Sysl": as a slice of shares of the
+  handles' Sysl values, each element checked (closed, another owner) as a handle passed by itself is,
+  then made the elements the Sysl parameter takes; a vector as a `[]T`, an array as a `[]const T`,
+  as for every collection, and a `Buf` parameter not reached. Only the collection itself is the
+  parameter: not nested, not in an `Option`, not a `List`, not a callback's answer, not a mirror's
+  field. Rationale: a user interface library's containers take `[]&View`; taking shares first means
+  a call that waits reads no Avin object, and what Sysl keeps it keeps by its own count. A slice or
+  `Buf` of handles out of Sysl already became a vector of handles, so nothing changed there.
+  Alternatives weighed: rooting the Avin collection for the call instead of taking shares, which
+  leaves a pointer element reading a value the collector may free once the call returns and Sysl
+  keeps it; allowing `List` and nested collections, which nothing yet needs.
+  **Review with the user:** whether an `Array` of handles should reach a writable `[]&T`, since a
+  handle collection's elements written by Sysl could never reach the array anyway; today it is
+  refused as for every other array, so such a parameter is bound with a `Vector`.
+- Settled on the user's delegation 2026-11-05 (built on branch `sysl-handles`): **a handle may name an
+  instance of a generic Sysl type**, `@sysl("module.Signal[string]")`, struct or trait
+  ([Sysl bindings](/spec/sysl-bindings/#handles-on-generic-instances)), its methods bound at that
+  instance. Each type argument is written as Avin writes it and is a boundary type that is one Sysl
+  type: an integer of 8, 16, 32 or 64 bits, `byte` (spelled `u8` for Sysl), `real`, `char`, `bool`,
+  `unit`, `string`, or an `Option`, a `Result` or a tuple of these; the compiler checks the
+  arguments' shape, Sysl that the type takes them. The shim imports the generic type and spells the
+  instance wherever it names the handle's type, since Sysl gives no alias to a trait's instance.
+  Rationale: `syslui` hands out `&Signal[T]`, and one class per instance needs no generic classes in
+  bindings. Alternatives weighed: mirrors and handles as type arguments, which have Sysl spellings of
+  their own but would make an annotation's text name Avin types; fully generic bindings, one class
+  for every `T`, which stay specified and unbuilt.
+  **Review with the user:** a `&Signal[T]` parameter of a type without a destructor receives a
+  reference to a copy under Sysl 0.9.0, as for every such handle, so a Sysl function setting a signal
+  is not seen by the handle; the next Sysl release settles the shim's helper at the `&T`, and
+  `tests/programs/run/sysl_generic_handle_sharing` waits on it.
 
 - Settled on the user's delegation 2026-11-05 (built on branch `sysl-callbacks`): [passing Avin functions to
   Sysl](/spec/sysl-bindings/#callbacks), the choices the request left open:

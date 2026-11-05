@@ -97,7 +97,7 @@ Data crosses the boundary in a fixed set of shapes:
 | `Option[T]`, `Result[T, E]` of boundary types | Converted variant by variant by the generated shim |
 | `data` declared with `@sysl("…")` mirroring a Sysl struct or enum of boundary types | Converted field by field |
 | `(T1, T2, …)`, a tuple of boundary types | A Sysl tuple of the same arity, converted part by part in each direction |
-| `class` declared with `@sysl("…")` | An **opaque handle**: an Avin object owning one counted Sysl reference, released by `close()` or, as a safety net, a finalizer. Its methods are bindings too. |
+| `class` declared with `@sysl("…")` | An **opaque handle** on a Sysl struct, trait or instance of a generic type: an Avin object owning one counted Sysl reference, released by `close()` or, as a safety net, a finalizer. Its methods are bindings too. |
 
 These shapes nest: a `Result[Option[string], IoError]` crosses, and so do a
 `Result[Vector[string], IoError]`, a `Vector[Vector[string]]`, a `Vector[Array[byte]]`, a
@@ -341,11 +341,12 @@ parseBigInt(s: string) -> Option[BigInt]
   handles comes from a Sysl slice or `Buf` of values or of counted references, and each element is
   a handle of its own, closed and collected on its own.
 - **A handle goes back into Sysl by itself**: as the receiver of its own methods, or as a parameter
-  of a binding or of another handle's method. A Sysl type with a destructor is always held by a
-  counted reference, and its parameter shares the handle's; a type without one is passed as the
-  Sysl parameter takes it — by value, a copy, or as a pointer to the handle's own value. A
-  [mirror's field](#mirrors) that is a handle is passed the same way. A handle inside an `Option`, a
-  collection or a tuple does not go into Sysl, nor is it a mirror's field; a
+  of a binding or of another handle's method. A Sysl type with a destructor, and a trait, is always
+  held by a counted reference, and its parameter shares the handle's; a type without one is passed
+  as the Sysl parameter takes it — by value, a copy, or as a pointer to the handle's own value. A
+  [mirror's field](#mirrors) that is a handle is passed the same way, and so is each element of a
+  [collection of handles](#collections-of-handles) that is a parameter. A handle inside an
+  `Option`, a tuple or any other collection does not go into Sysl, nor is it a mirror's field; a
   tuple holding a handle crosses out of Sysl as a result, the value of its `Option` or `Result`, or
   a part of a tuple that is one of these, as `accept` answers `Result[(Socket, Address), IoError]`,
   and never sits in a collection. Its Sysl value's fields are not the handle's members.
@@ -409,6 +410,93 @@ parseBigInt(s: string) -> Option[BigInt]
 The bytes a handle's method answers may be a view of the handle's own value; they are copied out
 before anything else runs, so the Avin array never reads the Sysl value's memory.
 
+### Handles on traits
+
+A handle may name a Sysl **trait**, and then holds a trait object: whatever value the binding that
+made it answered, reached through the trait's method table. Its methods are the trait's, a default
+one among them, and a method answering the trait is a handle of its own:
+
+```text
+@sysl("syslui.View")
+class View
+    padding(n: int) -> View
+
+@sysl("syslui.text")
+text(s: string) -> View
+```
+
+A trait handle is everything a struct handle is: made by a binding's result, alone or in an
+`Option`, a `Result`, a tuple or a collection; passed back by itself, as a mirror's field, as a
+callback's answer and in a collection; closed; given back by its finalizer; and owned by the code
+that made it, its owner checked at every use. Its Sysl parameter takes it as a counted reference,
+which the parameter shares, since a trait object is only ever reached through one.
+
+A trait object is two words, its value and its method table, and a handle's object keeps its
+reference in one: so a trait handle's reference is kept in a cell of its own, which that word points
+at. Every handle's object is the same two words, the reference or the cell and the owner, and a
+struct handle is reached as directly as it was; a trait handle's method reads one word more.
+
+### Collections of handles
+
+An `Array` or a `Vector` of handles that is a binding's parameter, or a handle's method's, goes into
+Sysl as a slice of the handles' Sysl values, for the call, as `syslui`'s containers take their
+children:
+
+```text
+@sysl("syslui.column")
+column(children: Vector[View], spacing: int) -> View
+```
+
+- **Each element is checked as a handle passed by itself is**: one closed, or owned by other code,
+  stops the program at the call, naming the handle's class, though the others are the caller's own.
+- **Each element is shared for the call**: the slice holds a share of each handle's Sysl value,
+  taken before the call, made the elements the Sysl parameter takes — the counted references, or,
+  for a type without a destructor, the values or pointers to them. What Sysl keeps of the slice it
+  keeps by its own shares, so a column outlives the vector it was made from, and a child closed
+  afterwards. A call that [waits](#calls-that-wait) takes the shares before the thread is safe for the
+  collector, and makes its slice from them, so it reads no Avin object.
+- **A vector is a `[]T`, an array a `[]const T`**, as for every [collection](#collections-are-copies):
+  an array of handles reaches only a Sysl parameter that may not write its elements. A Sysl parameter
+  that takes a `Buf` is not reached, as for any collection.
+- Only the collection itself is a parameter: a collection of collections or of options of handles, a
+  `List` of them, an `Option` holding one and a callback answering one do not go into Sysl, and a
+  mirror's field holds a handle only by itself.
+
+A slice or a `Buf` of handles, of trait objects as of struct values, comes back out of Sysl as a
+vector or an array of handles, each its own, as every collection does, so a tree built on either
+side crosses both ways.
+
+### Handles on generic instances
+
+A handle may name an **instance** of a generic Sysl type, struct or trait, with its type arguments in
+brackets after the type's name, each written as Avin writes it:
+
+```text
+@sysl("syslui.Signal[string]")
+class StringSignal
+    get() -> string
+    set(v: string)
+
+@sysl("syslui.signal")
+stringSignal(v: string) -> StringSignal
+
+@sysl("syslui.text_field")
+textField(text: StringSignal, id: int) -> View
+```
+
+Its methods are bound at that instance, and it is a handle on that one Sysl type: a generic Sysl
+function that answers the instance makes one, and a parameter that takes another instance is
+refused when Sysl checks the shim. Each type argument is a boundary type that is one Sysl type —
+an integer of 8, 16, 32 or 64 bits, `byte` (Sysl's `u8`), `real`, `char`, `bool`, `unit`, `string`,
+or an `Option`, a `Result` or a tuple of these — so the instance is fixed by its name alone:
+
+```text
+error: `Vector[int]` cannot be a type argument of the Sysl type a handle is on: each is one Sysl type, an integer of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, or an `Option`, a `Result` or a tuple of these
+```
+
+Each instance a program binds is its own class, and two classes may name the same instance; one Avin
+class for every instance of a generic type is a [generic binding](#generics).
+
 ## Calls that wait
 
 A Sysl function that may wait — for a connection, for data on a socket or a pipe, for a process to
@@ -461,7 +549,8 @@ error: `blocking` is written alone, after the Sysl function's name: `@sysl("sysl
 ## Generics
 
 A binding may be generic when its type parameters are instantiated with boundary types. The compiler
-generates one shim per instantiation the program uses.
+generates one shim per instantiation the program uses. A handle on one instance of a generic Sysl
+type is a class of its own, [above](#handles-on-generic-instances).
 
 ## Callbacks
 

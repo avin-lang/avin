@@ -151,13 +151,13 @@ shim_handle_crossings()
     var choices = 0
     var calls = 0
     for line in lines(shim.text)
-        if line.trim().starts_with("if const mirror_") && line.ends_with(": Drop") then choices += 1
+        if line.trim().starts_with("if const counted_") then choices += 1
         if line.contains("integer_to(ctx, s.r.combine(") then calls += 1
     // Two handle types among the method's parameters: each combination of with and without a
     // destructor is one call, of which Sysl keeps one.
     assert_eq(choices, 3)
     assert_eq(calls, 4)
-    assert(shim.text.contains("s.r.combine(slot_0(a1).r, slot_1(a2).r)"))
+    assert(shim.text.contains("s.r.combine(cell_0(a1).r, cell_1(a2).r)"))
     assert(shim.text.contains("s.r.combine(passed_0(a1), passed_1(a2))"))
     // Each handle passed has its helpers, whose lines are its own; the receiver needs none.
     assert(shim.text.contains("private passed_0[P](p: *u8) -> P\n"))
@@ -185,9 +185,9 @@ shim_mirror_handle_fields()
     // construction, of which Sysl keeps one.
     var choices = 0
     for line in lines(shim.text)
-        if line.trim().starts_with("if const mirror_") && line.ends_with(": Drop") then choices += 1
+        if line.trim().starts_with("if const counted_") then choices += 1
     assert_eq(choices, 3)
-    assert(shim.text.contains(".Both(slot_0(h0).r, slot_1(h1).r)"))
+    assert(shim.text.contains(".Both(cell_0(h0).r, cell_1(h1).r)"))
     assert(shim.text.contains(".Both(passed_0(h0), passed_1(h1))"))
     // Out of Sysl, the mirror is its own Sysl type, and each field becomes a handle by the handle's
     // conversion, generic in what Sysl holds.
@@ -368,3 +368,81 @@ shim_bulk_copy()
     // The runtime's copy into a new string is one slice copy.
     val runtime = read_text("runtime/avin/rt/text.sysl").unwrap()
     assert(runtime.contains("copy(to[0..<s.bytes.len], s.bytes)"))
+
+private const CellProgram: string = "@sysl(\"sysl.checksum.Crc32\")\nclass Crc32\n    finish() -> long\n\n@sysl(\"sysl.checksum.new_crc32\")\nnewCrc32() -> Crc32\n\nmain()\n    val c = newCrc32()\n    c.finish()\n    c.close()\n"
+
+@test("every handle's object is two words, the reference to its Sysl value or, for a trait object, a cell holding it, and its owner")
+shim_handle_cells()
+    val program = lower_source(repository_toolchain(), source_of("/probe/cells.avin", CellProgram)).unwrap()
+    val text = shim_source(program.bindings, program.handles).text
+    assert(text.contains("private struct Slot_0\n    word: *u8\n    owner: u64\n"))
+    assert(text.contains("private struct Cell_0\n    r: &mirror_0\n"))
+    assert(text.contains("private const wide_0() -> bool = sizeof(&mirror_0) > sizeof(*u8)\n"))
+    // A reference of one word is the object's first word itself; a wider one is kept in a cell.
+    assert(text.contains("private cell_0(p: *u8) -> *Cell_0\n    if const wide_0()\n        val s: *Slot_0 = ptr_cast(p)\n        ptr_cast(s.word)\n    else\n        ptr_cast(p)\n"))
+    assert(text.contains("        s.word = shim_calloc(1usize, sizeof(Cell_0))\n"))
+    assert(text.contains("extern \"calloc\" shim_calloc(n: usize, size: usize) -> *u8\n"))
+    assert(text.contains("extern \"free\" shim_free(p: *u8)\n"))
+    // A trait, which has no destructor of its own to ask about, is always held by a counted reference.
+    assert(text.contains("private const counted_0() -> bool\n    if const wide_0()\n        true\n    elif const mirror_0: Drop\n        true\n    else\n        false\n"))
+    // The finalizer and `close()` give the reference back the same way, and the cell with it.
+    assert(text.contains("finalize_0(p: *u8, heap: *u8) = give_back_0(p)\n"))
+    assert(text.contains("    give_back_0(a0)\n"))
+    assert(text.contains("        shim_free(s.word)\n        s.word = null\n"))
+    assert(text.contains("    val s = cell_0(a0)\n"))
+    assert(text.contains("    hold_0(ctx, o, v)\n"))
+    assert(!text.contains("Slot_0 = ptr_cast(a0)"))
+
+private const ListedProgram: string = "@sysl(\"sysl.checksum.Crc32\")\nclass Crc32\n    finish() -> long\n    absorb(others: Vector[Crc32])\n\n@sysl(\"sysl.hint.black_box\")\nall(v: Vector[Crc32]) -> long\n\n@sysl(\"sysl.hint.black_box\")\nreading(a: Array[Crc32]) -> long\n\n@sysl(\"sysl.hint.black_box\", blocking)\nwaiting(v: Vector[Crc32]) -> long\n\n@sysl(\"sysl.checksum.new_crc32\")\nnewCrc32() -> Crc32\n\nmain() = newCrc32().absorb([])\n"
+
+@test("a collection of handles a binding passes becomes the shares of their Sysl values, each checked, made the slice its parameter asks for")
+shim_handle_collections()
+    val program = lower_source(repository_toolchain(), source_of("/probe/listed.avin", ListedProgram)).unwrap()
+    val text = shim_source(program.bindings, program.handles).text
+    // Each handle of the collection is checked as a handle passed by itself is, and shared.
+    assert(text.contains("b.push(cell_0(held_0(ctx, e[i])).r)"))
+    assert(text.contains("stop_in_binding(ctx, \"`Crc32` belongs to another thread\")"))
+    assert(text.contains("stop_in_binding(ctx, \"`Crc32` is closed\")"))
+    assert(text.contains("ds: **u8) -> []&mirror_0\n"))
+    // The shares are made a slice of what the parameter takes, as is where it takes the references.
+    assert(text.contains("private given_all_0[E](s: []&mirror_0) -> []E\n    if const E::Kind == Kind.Ref\n        s\n"))
+    assert(text.contains("private given_reading_0[E](s: []&mirror_0) -> []const E = given_all_0[E](s)\n"))
+    assert(text.contains("given_all_0(in_"))
+    assert(text.contains("given_reading_0(in_"))
+    // A call that waits converts the collection before it, and makes the slice from the shares.
+    assert(text.contains("given_all_0(x0)"))
+    // A handle's method takes one too.
+    assert(text.contains("s.r.absorb(given_all_0(in_"))
+
+private const InstanceProgram: string = "@sysl(\"sysl.buf.Buf[(int, byte)]\")\nclass Pairs\n    len() -> long\n\n@sysl(\"sysl.buf.Buf[Option[byte]]\")\nclass Maybes\n    len() -> long\n\n@sysl(\"sysl.buf.buf\")\npairs() -> Pairs\n\n@sysl(\"sysl.hint.black_box\")\nsame(p: Pairs, m: Maybes) -> Pairs\n\nmain() = ()\n"
+
+@test("a handle on an instance of a generic Sysl type imports the type and spells the instance, as Sysl writes its arguments, wherever it names the handle's type")
+shim_generic_instances()
+    val program = lower_source(repository_toolchain(), source_of("/probe/instances.avin", InstanceProgram)).unwrap()
+    val text = shim_source(program.bindings, program.handles).text
+    assert(text.contains("import sysl.buf.Buf as instance_0\n"))
+    assert(text.contains("import sysl.buf.Buf as instance_1\n"))
+    assert(text.contains("    r: &instance_0[(int, u8)]\n"))
+    assert(text.contains("    r: &instance_1[Option[u8]]\n"))
+    assert(text.contains("sizeof(&instance_0[(int, u8)])"))
+    assert(text.contains("elif const instance_1[Option[u8]]: Drop\n"))
+    assert(!text.contains("mirror_0"))
+    assert(!text.contains("mirror_1"))
+
+@test("the type a handle's `@sysl` names splits into its path and its arguments, which Sysl spells as Avin does but for `byte`")
+generic_instance_parts()
+    val (path, arguments) = instance_parts("pkg.mod.Pair[int, (string, Option[byte])]")
+    assert_eq(path, "pkg.mod.Pair")
+    assert_eq(arguments.len(), 2usize)
+    assert_eq(arguments[0], "int")
+    assert_eq(arguments[1].trim(), "(string, Option[byte])")
+    assert_eq(sysl_instance_argument("(string, Option[byte])"), "(string, Option[u8])")
+    assert_eq(sysl_instance_argument("Result[bytes, byte]"), "Result[bytes, u8]")
+    assert_eq(sysl_instance_argument("byte"), "u8")
+    val (plain, none) = instance_parts("sysl.checksum.Crc32")
+    assert_eq(plain, "sysl.checksum.Crc32")
+    assert_eq(none.len(), 0usize)
+    // Brackets that do not close at the end, or hold nothing, give no arguments.
+    for unclosed in ["a.B[int", "a.B[]", "a.B[int, ]", "a.B[(int]", "a.B[int]]"]
+        val (_, nothing) = instance_parts(unclosed)
+        assert_eq(nothing.len(), 0usize)
