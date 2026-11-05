@@ -98,7 +98,9 @@ There is no `%%`.
 - **The width** is the least number of characters the field takes; a value wider is written whole.
 - **The precision** is, for an integer, the least number of digits, so a precision of 0 writes zero as
   no digits; for `f`, `e` and `E` the number of decimals, and for `g` and `G` of significant digits;
-  for `s` and `?` the most characters of the value's text that are written. `%c` takes none.
+  for `s` and `?` the most characters of the value's text that are written, whatever its type:
+  the value is rendered whole and its first N characters, counted as code points, fill the field,
+  so `${[1, 2, 3]}%.3s` is `[1,`, `${"abcdef"}%.2?` is `"a` and `${42}%.1?` is `4`. `%c` takes none.
 - **A width or precision may be a hole of its own**, counted when the program runs, written where the
   digits would go: `${x}%.${n}f`, `${s}%-${w}s`, `${k}%0${n + 3}d`. The count is an integer of any
   width. A negative width pads on the right at its magnitude, a negative precision is as though none
@@ -228,11 +230,18 @@ trait Display
 
 trait Debug
     debug(out: Writer, spec: FormatSpec)
+
+writeDisplayed[T: Display](out: Writer, value: T, spec: FormatSpec)
+writeDebugged[T: Debug](out: Writer, value: T, spec: FormatSpec)
 ```
 
 - `FormatSpec` is the field a value fills: `width` characters, padded with spaces on the left, or on
   the right when `left`; 0 asks for no padding, and wider text is written whole. `precision`, -1 for
-  none, is read by a renderer that takes one, in its own terms. `zeroPad`, `plus`, `space` and
+  none, is read by a renderer that takes one, in its own terms, under every conversion but `s` and
+  `?`. Under those two the precision is the formatter's: `writeDisplayed(out, value, spec)` and
+  `writeDebugged(out, value, spec)`, which a formatted hole is written through, render the value
+  with no width and no precision, keep its first `precision` characters and write them in the
+  field, so a renderer never cuts its own text. `zeroPad`, `plus`, `space` and
   `alternate` are the flags `0`, `+`, space and `#`, and `conversion` the letter of the specifier,
   `s` when none was written; a renderer reads the conversions its type takes and renders its own
   form under any other. `withWidth` and `withPrecision` set a count as a specifier's hole does.
@@ -267,6 +276,7 @@ trait Debug
 For `s` and `f`, the compiler does not call the method. It parses the specifiers while compiling and
 writes the literal out to calls on one `StringWriter` made for it, with the same result: each decoded
 piece of text is written to it, each hole is rendered into it by `display`, or by `debug` under
-`%?`, with the `FormatSpec` its specifier describes, and the writer's text is the value. A string hole
+`%?`, with the `FormatSpec` its specifier describes, a hole under `%s` or `%?` with a precision
+through `writeDisplayed` or `writeDebugged`, and the writer's text is the value. A string hole
 with no specifier is written as it is. No value is boxed to format it. Every other interpolator is
 compiled as the method call it denotes.
