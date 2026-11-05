@@ -1750,6 +1750,14 @@ their words are reserved.
   (text made as it is read, a socket later) and hand it to any function that takes one; the kinds
   `avin.io` makes are private classes reached only through `Source.fromFile`, `fromString` and
   `stdin`. The alternative is a final class whose kinds are fixed by the library.
+**Deferred**
+
+- Public C interoperability. Until then, C is reached through Sysl.
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
 - [Tail calls](/spec/declarations/#tail-calls) (2026-11-05). Choices the request left open:
   - **Every self-call in tail position is a loop, with or without `@tailrec`**, at `-O0` as at
     `-O2`, so a program's stack use does not depend on its optimization level; the annotation only
@@ -1774,16 +1782,6 @@ their words are reserved.
     convention, and Avin's calls pass a context and keep a shadow-stack frame.
   - The language has no `try`, `defer` or `finally`, so there is no pending cleanup to take a call
     out of tail position; when such a construct is added, a call inside it is not in tail position.
-
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-None at present.
 
 ## Open
 
