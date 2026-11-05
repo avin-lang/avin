@@ -385,7 +385,7 @@ parseBigInt(s: string) -> Option[BigInt]
   they differ:
 
   ```text
-  avin: trap: `Socket` belongs to another thread at main.avin:31:5
+  avin: trap: `File` belongs to another thread at main.avin:31:5
   ```
 
   The owner is not an operating system thread but whatever the runtime is running: a thread's body,

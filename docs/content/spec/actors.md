@@ -166,7 +166,7 @@ connection, and a large buffer filled by one actor goes to the next.
 - **A Sysl handle in a message is handed over.** A handle has an owner, the execution that may use
   it ([Sysl bindings](/spec/sysl-bindings/#handles)), and an actor is an owner. Sending a message
   puts every handle it holds in transit, and the first code to use one takes it: the receiving
-  actor. The sender's later use of it traps (`` `Socket` belongs to another thread ``). The compiler
+  actor. The sender's later use of it traps (`` `TcpStream` belongs to another thread ``). The compiler
   knows which types can hold a handle, so a send walks the message only for those.
 - **A mutable object graph moves inside an `Isolated[T]`.** `isolate(body)` runs its body, a by-name
   argument written in place or as a trailing block, and wraps what it returns:

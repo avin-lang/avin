@@ -2316,9 +2316,11 @@ their words are reserved.
   `Child`, which misleads a reader of the library); the trap text computed by the runtime from a
   name the token holds (the check is inline, one compare in compiled code, and its text is fixed
   when the program is compiled); naming the trap after the class whose method made the call (a
-  rule no reader would guess). `Socket` still names itself, for a `TcpStream` and a `TcpListener`
-  both; naming those for the user's type would need one handle class per type. Review with the
-  user whether they should.
+  rule no reader would guess). `TcpStream` and `TcpListener` each keep a handle class of their
+  own over the one runtime type `avin.rt.Connection`, `named:` for the type, so their traps name
+  the type the user holds (branch `socket-trap-names`); two handle classes may share one Sysl
+  type. The other library handles (`File`, `FdReader`, `Spawned`, `Address`) are held only inside
+  private library values whose own checks come first, so none is named further.
 - Settled on the user's delegation 2026-11-05 (built on branch `module-var-threads`): **a thread's body reaches no
   module-level mutable state** ([what is shared](/spec/threads/#what-is-shared)). What is passed
   for a `@sendable` parameter, directly or through every function it reaches, reads and writes no
@@ -2377,6 +2379,8 @@ their words are reserved.
   but the common case pays for a pattern); allowing a pattern in any lambda parameter position,
   `((a, b), c) -> …` (more general, but a second pattern syntax beside the `match` function, which
   already covers nested and refutable shapes).
+
+- Settled on the user's delegation 2026-11-05 (built on branch `iterable-size`): **every `Iterable` has `size()`, `knownSize()` and `sizeCompare(n)`** ([collections](/spec/collections/)), following the reference library: `size()` counts by iterating unless a collection overrides it with its own count, `knownSize()` is the count where it is known without iterating and -1 otherwise (a `List` other than `Nil`, an iterator, a view), and `sizeCompare(n)` answers -1, 0 or 1, reading at most `n` elements when the count is unknown. Sequences have `size()` and `length()`, equal. They are overridable trait members rather than `impl` methods, so a call through `Iterable[T]` reaches the collection's own count. Consequence: a class implementing `Iterable` that declares its own `size`, `knownSize` or `sizeCompare` must mark it `override`. Alternatives weighed: an arbitrary-sign `sizeCompare` (the reference library's contract, but -1/0/1 is what every caller tests); `length()` on every `Iterable` (left to sequences, whose length is their defining measure); `sizeIs` (needs special syntax). Review with the user: the `override` requirement on existing user classes.
 
 **Deferred**
 
