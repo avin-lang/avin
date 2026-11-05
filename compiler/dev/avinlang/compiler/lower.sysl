@@ -188,6 +188,10 @@ private struct Lowering
     /** Whether the program shows a value of unknown type, which reads the `display` or `debug`
      * entry of its type's record: every record then gets them. */
     runtime_rendering: bool
+    /** Where a call of the instance being lowered in tail position jumps, when its body has one:
+     * the block after the parameters have been stored, which `param_slots` then hold. */
+    tail_head: Option[usize]
+    param_slots: Buf[Option[Place]]
 
 /** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
  * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
@@ -242,7 +246,7 @@ lower_program(program: TProgram) -> MirProgram
         if d.table.len() > generic_base then generic_base = d.table.len()
     for b in program.builtins
         if b.table.len() > generic_base then generic_base = b.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false)
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf())
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
     l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None))
@@ -1357,7 +1361,7 @@ private function_value(l: *Lowering, function: usize, type_args: Buf[&Type]) -> 
             val place = if l.boxed[x] then l.local_slots[x] else local_place(l, x)
             values.push(load(l, place).unwrap())
     for x in symbol.captured_params
-        if l.param_values[x] is Some(v) then values.push(Value(v))
+        if param_operand(l, x) is Some(v) then values.push(v)
     val object = fresh(l, MRef)
     l.insts.push(Alloc(object, shape.descriptor))
     for i in 0..<values.len()
@@ -1546,7 +1550,7 @@ private call_resolved(l: *Lowering, e: &TExpr, function: usize, callee: Function
     for x in callee.captured_locals
         if l.local_slots[x] is Some(p) then operands.push(p.address)
     for x in callee.captured_params
-        if l.param_values[x] is Some(v) then operands.push(Value(v))
+        if param_operand(l, x) is Some(v) then operands.push(v)
     val index = instance(l, function, instance_args(l, callee, type_args))
     val dest = machine(l, e.ty) match
         Some(t) -> Some(fresh(l, t))
@@ -1731,6 +1735,8 @@ function_symbol(program: TProgram, id: usize, type_args: Buf[&Type]) -> string
 private lower_function(l: *Lowering, k: usize) -> MirFunction
     val inst = l.instances[k]
     l.function_index = k
+    l.tail_head = None
+    l.param_slots = buf()
     if inst.generated != Written then return lower_generated(l, inst)
     val f = l.program.functions[inst.function]
     val symbol = l.program.symbols[f.symbol]
@@ -1776,7 +1782,8 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
                 if machine(l, l.program.symbols[root].params[x]) is Some(t) then l.param_values.set(x, Some(fresh(l, t)))
     f.body match
         Some(body) ->
-            val result = lower_expr(l, body)
+            if loops_on_itself(l, symbol, body) then start_loop(l, symbol)
+            val result = lower_at(l, body, true)
             // A class's object is made by its constructor and complete when the constructor is.
             if is_class_constructor(l.program, f.symbol) then l.insts.push(Publish)
             finish(l, returning(l, result))
@@ -1784,6 +1791,67 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
             if binding_target(symbol.decl) is Some(_) || handle_of(l, symbol) is Some(_) then binding_body(l, symbol, shim_symbol(function_symbol(l.program, f.symbol, inst.type_args)))
             else intrinsic_body(l, symbol)
     MirFunction(function_symbol(l.program, f.symbol, inst.type_args), signature, l.values, l.slots, l.blocks)
+
+// A function that calls itself in tail position, at its own type arguments, is compiled as a loop:
+// its parameters are kept in slots, and such a call stores its arguments there and jumps back to the
+// start (see `tailrec.sysl`). A constructor finishes its object after its body, and a trait's method
+// is compiled for each conforming type, so neither loops.
+private loops_on_itself(l: *Lowering, symbol: FunctionSymbol, body: &TExpr) -> bool
+    if symbol.constructor || is_trait_method(l, symbol) then return false
+    val function = l.instances[l.function_index].function
+    for site in tail_sites(function, body)
+        if site.tail && site.direct && same_instance(l, function, site.type_args) then return true
+    false
+
+/** Whether a call of `function`, the function being lowered, at `type_args` calls the instance being
+ * lowered. */
+private same_instance(l: *Lowering, function: usize, type_args: Buf[&Type]) -> bool
+    val inst = l.instances[l.function_index]
+    if inst.entry || inst.function != function then return false
+    instance_key(function, instance_args(l, l.program.symbols[function], type_args), false) == instance_key(function, inst.type_args, false)
+
+// Stores a top-level function's parameters in slots, which a tail call stores the next ones into, and
+// starts the block it jumps back to. A local function's parameters are locals already, given new
+// values by each tail call as by the caller.
+private start_loop(l: *Lowering, symbol: FunctionSymbol)
+    if symbol.root is None
+        for i in 0..<l.param_values.len()
+            var slot: Option[Place] = None
+            if l.param_values[i] is Some(v)
+                slot = machine_slot(l, l.values[v])
+                store(l, slot, Some(Value(v)))
+            l.param_slots.push(slot)
+    val head = new_block(l)
+    finish_into(l, Jump(head), head)
+    l.tail_head = Some(head)
+
+/** The value of parameter `x` of the top-level function, where the code being lowered can reach it. */
+private param_operand(l: *Lowering, x: usize) -> Option[Operand]
+    if x < l.param_slots.len() && l.param_slots[x] is Some(p) then return load(l, Some(p))
+    l.param_values[x] match
+        Some(v) -> Some(Value(v))
+        None -> None
+
+// A call in tail position of the instance being lowered: its arguments are evaluated, every one
+// before any parameter changes, then become the parameters, and control goes back to the start. The
+// call has no value, since control never comes back to it.
+private tail_call(l: *Lowering, function: usize, args: Buf[&TExpr]) -> Option[Operand]
+    val symbol = l.program.symbols[function]
+    var operands: Buf[Option[Operand]] = buf()
+    for i in 0..<args.len()
+        val a = args[i]
+        if a.kind is TypeReceiver
+            operands.push(None)
+            continue
+        val op = lower_expr(l, a)
+        if *a.ty is Nothing then return None
+        if machine(l, a.ty) is Some(_) && op is None then return None
+        operands.push(op)
+    for i in 0..<operands.len()
+        if symbol.root is Some(_) then bind_local(l, symbol.param_locals[i], operands[i])
+        elif i < l.param_slots.len() then store(l, l.param_slots[i], operands[i])
+    leave(l, Jump(l.tail_head.unwrap()))
+    None
 
 // A closure entry takes the closure and the function's parameters. It keeps each captured local
 // the closure holds in a slot of its own and calls the function with the slot's address, as a
@@ -2468,26 +2536,29 @@ private checked(l: *Lowering, bits: u32, op: MirChecked, a: Operand, b: Operand,
 
 /** Lowers an expression for its value; `None` for an expression with no runtime value, or one in
  * code no path reaches. A call made for the expression is placed at its start. */
-private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand]
+private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = lower_at(l, e, false)
+
+/** Lowers `e`, which with `tail` is in tail position: its value is the function's result. */
+private lower_at(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand]
     val outer = l.here
     l.here = e.span
-    val value = lower_kind(l, e)
+    val value = lower_kind(l, e, tail)
     l.here = outer
     value
 
-private lower_kind(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
+private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.kind match
     IntConst(digits) -> Some(ConstInt(int_bits(e.ty), digits))
     BoolConst(value) -> Some(ConstBool(value))
     CharConst(code) -> Some(ConstInt(32, code.to_string()))
     RealConst(value) -> Some(ConstReal(value))
     StrConst(value) -> Some(string_constant(l, value))
     UnitConst -> None
-    Param(index) -> l.param_values[index] match
-        Some(id) -> Some(Value(id))
-        None -> None
+    Param(index) -> param_operand(l, index)
     Local(index) -> load(l, local_place(l, index))
     TypeReceiver -> panic("a static member's receiver is a type, which has no value to lower")
-    Call(function, args, type_args) -> direct_call(l, e, function, args, type_args)
+    Call(function, args, type_args) ->
+        if tail && l.tail_head is Some(_) && same_instance(l, function, type_args) then return tail_call(l, function, args)
+        direct_call(l, e, function, args, type_args)
     Dispatch(function, slot, args, type_args) -> dispatch(l, function, slot, args, type_args)
     BoundCall(function, slot, args, type_args) -> bound_call(l, e, function, slot, args, type_args)
     Construct(variant, args) -> construct(l, e, variant, args)
@@ -2530,8 +2601,8 @@ private lower_kind(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         if yields then v else None
     Block(items) ->
         var last: Option[Operand] = None
-        for item in items
-            last = lower_expr(l, item)
+        for i in 0..<items.len()
+            last = lower_at(l, items[i], tail && i + 1 == items.len())
         if machine(l, e.ty) is Some(_) then last else None
     Let(local, value) ->
         bind_local(l, local, lower_expr(l, value))
@@ -2587,9 +2658,9 @@ private lower_kind(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
         // The value is always `None`; kept as a pointer, the other option's `None` is null.
         val v = lower_expr(l, value)
         if pointer_option(l, e.ty) && !pointer_option(l, value.ty) then Some(NullAddress) else v
-    Logic(and, left, right) -> logic(l, and, left, right)
+    Logic(and, left, right) -> logic(l, and, left, right, tail)
     Compare(operands, ops) -> compare_chain(l, operands, ops)
-    If(condition, yes, no) -> lower_if(l, e, condition, yes, no)
+    If(condition, yes, no) -> lower_if(l, e, condition, yes, no, tail)
     While(label, condition, body, otherwise) -> lower_while(l, e, label, condition, body, otherwise)
     Break(label, value) ->
         val target = loop_target(l, label)
@@ -2601,14 +2672,14 @@ private lower_kind(l: *Lowering, e: &TExpr) -> Option[Operand] = e.kind match
     Continue(label) ->
         leave(l, Jump(loop_target(l, label).head))
         None
-    Match(subject, arms) -> lower_match(l, e, subject, arms)
+    Match(subject, arms) -> lower_match(l, e, subject, arms, tail)
     Is(value, pattern, negated) -> lower_is(l, value, pattern, negated)
-    Clauses(subjects, clauses) -> lower_clauses(l, e, subjects, clauses)
+    Clauses(subjects, clauses) -> lower_clauses(l, e, subjects, clauses, tail)
     Return(value) ->
         var v: Option[Operand] = None
         var dead = false
         if value is Some(x)
-            v = lower_expr(l, x)
+            v = lower_at(l, x, true)
             dead = *x.ty is Nothing
         leave(l, if dead then Unreachable else returning(l, v))
         None
@@ -2798,14 +2869,14 @@ max_digits(bits: u32) -> string
     val last = least.bytes[least.len - 1] - 1
     head + char(last).to_string()
 
-private logic(l: *Lowering, and: bool, left: &TExpr, right: &TExpr) -> Option[Operand]
+private logic(l: *Lowering, and: bool, left: &TExpr, right: &TExpr, tail: bool) -> Option[Operand]
     val a = lower_expr(l, left)?
     val slot = new_slot(l, Bool)
     store(l, slot, Some(a))
     val rest = new_block(l)
     val done = new_block(l)
     finish_into(l, if and then Branch(a, rest, done) else Branch(a, done, rest), rest)
-    store(l, slot, lower_expr(l, right))
+    store(l, slot, lower_at(l, right, tail))
     finish_into(l, Jump(done), done)
     load(l, slot)
 
@@ -2915,18 +2986,18 @@ private compare_chain(l: *Lowering, operands: Buf[&TExpr], ops: Buf[CompareOp]) 
     finish_into(l, Jump(done), done)
     load(l, slot)
 
-private lower_if(l: *Lowering, e: &TExpr, condition: &TExpr, yes: &TExpr, no: Option[&TExpr]) -> Option[Operand]
+private lower_if(l: *Lowering, e: &TExpr, condition: &TExpr, yes: &TExpr, no: Option[&TExpr], tail: bool) -> Option[Operand]
     val c = lower_expr(l, condition)?
     val slot = new_slot(l, e.ty)
     val then_block = new_block(l)
     val join = new_block(l)
     val else_block = if no is Some(_) then new_block(l) else join
     finish_into(l, Branch(c, then_block, else_block), then_block)
-    store(l, slot, lower_expr(l, yes))
+    store(l, slot, lower_at(l, yes, tail))
     finish(l, Jump(join))
     if no is Some(n)
         l.current = else_block
-        store(l, slot, lower_expr(l, n))
+        store(l, slot, lower_at(l, n, tail))
         finish(l, Jump(join))
     l.current = join
     load(l, slot)
@@ -2959,7 +3030,7 @@ private continue_if(l: *Lowering, condition: Operand, fail: usize)
 // Each arm tests its pattern and then its guard, going on to the next arm when either fails. The
 // checker has proved the arms cover every value, so falling past the last arm traps rather than
 // continuing.
-private lower_match(l: *Lowering, e: &TExpr, subject: &TExpr, arms: Buf[TArm]) -> Option[Operand]
+private lower_match(l: *Lowering, e: &TExpr, subject: &TExpr, arms: Buf[TArm], tail: bool) -> Option[Operand]
     val s = lower_expr(l, subject)
     if s is None && machine(l, subject.ty) is Some(_) then return None
     val slot = new_slot(l, e.ty)
@@ -2969,7 +3040,7 @@ private lower_match(l: *Lowering, e: &TExpr, subject: &TExpr, arms: Buf[TArm]) -
         test_pattern(l, arm.pattern, s, fail)
         if arm.guard is Some(g)
             if lower_expr(l, g) is Some(ok) then continue_if(l, ok, fail)
-        store(l, slot, lower_expr(l, arm.body))
+        store(l, slot, lower_at(l, arm.body, tail))
         finish_into(l, Jump(join), fail)
     finish_into(l, trap_at(l, "no arm of the match took the value", e.span), join)
     load(l, slot)
@@ -2977,7 +3048,7 @@ private lower_match(l: *Lowering, e: &TExpr, subject: &TExpr, arms: Buf[TArm]) -
 // Each clause tests its patterns against the arguments, then tries its bodies' guards in order; when
 // the patterns fail, or every guard does, the next clause is tried. The checker has proved the
 // clauses cover every argument, so falling past the last one traps.
-private lower_clauses(l: *Lowering, e: &TExpr, subjects: Buf[&TExpr], clauses: Buf[TClause]) -> Option[Operand]
+private lower_clauses(l: *Lowering, e: &TExpr, subjects: Buf[&TExpr], clauses: Buf[TClause], tail: bool) -> Option[Operand]
     var values: Buf[Option[Operand]] = buf()
     for s in subjects
         values.push(lower_expr(l, s))
@@ -2991,7 +3062,7 @@ private lower_clauses(l: *Lowering, e: &TExpr, subjects: Buf[&TExpr], clauses: B
             val next = new_block(l)
             if b.guard is Some(g)
                 if lower_expr(l, g) is Some(ok) then continue_if(l, ok, next)
-            store(l, slot, lower_expr(l, b.body))
+            store(l, slot, lower_at(l, b.body, tail))
             finish_into(l, Jump(join), next)
         finish_into(l, Jump(fail), fail)
     finish_into(l, trap_at(l, "no clause took the arguments", e.span), join)

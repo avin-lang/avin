@@ -1772,6 +1772,30 @@ their words are reserved.
   passes each handle field wherever it is called, though a bare handle in an `Option` or a collection
   still does not go into Sysl. The alternative is a mirror holding a handle only by itself, as a
   handle is.
+- [Tail calls](/spec/declarations/#tail-calls) (2026-11-05). Choices the request left open:
+  - **Every self-call in tail position is a loop, with or without `@tailrec`**, at `-O0` as at
+    `-O2`, so a program's stack use does not depend on its optimization level; the annotation only
+    adds the proof. Alternative: loop only where `@tailrec` asks, leaving the rest to LLVM at `-O2`
+    — rejected, since the same program would overflow at `-O0` and not at `-O2`.
+  - **The right operand of `&&` and `||` is in tail position**, as in the reference language:
+    `n == 0 || (ok(n) && f(n - 1))` is a loop. Alternative: only `if`/`match` branches — simpler to
+    explain, but it refuses a common shape of predicate.
+  - **A call on another receiver of the method's own type is a loop**, the receiver becoming
+    `self` for the next pass, as the reference language does for a method that cannot be
+    overridden; a call on a receiver of the class at other type arguments is another instance and
+    `@tailrec` refuses it. Alternative: only calls on `self` — it would refuse list-walking methods
+    such as `next.length(acc + 1)`.
+  - **A private method of an open or abstract class may be `@tailrec`**, since nothing overrides
+    it; a public one may not. There is no `final` modifier for a single method, so making a public
+    method of an open class a loop means making it private or the class final.
+  - **`@tailrec` is accepted on top-level functions, methods and local functions**, and is the one
+    annotation a local function takes; a lambda cannot be annotated. It refuses a function with no
+    recursive call, as the reference language does, rather than accepting it silently.
+  - **Mutual recursion is not made a loop**, only a function calling itself. Alternative: general
+    tail calls (LLVM `musttail`) — they need every caller and callee to agree on a calling
+    convention, and Avin's calls pass a context and keep a shadow-stack frame.
+  - The language has no `try`, `defer` or `finally`, so there is no pending cleanup to take a call
+    out of tail position; when such a construct is added, a call inside it is not in tail position.
 
 ## Open
 

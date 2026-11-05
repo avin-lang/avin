@@ -1,0 +1,217 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// Tail calls: where a function calls itself as the last thing it does.
+//
+// A call is in tail position when its result is the function's result with nothing left to do: it
+// is the body, the last item of a block in tail position, a branch of an `if`, an arm of a `match`
+// or a clause body in tail position, the right operand of `&&` or `||` in tail position, or the
+// value of a `return`. Anything that uses the result — an operator, a conversion, an argument, a
+// store, a loop, a pattern — takes the call out of tail position. Lowering compiles a direct call of
+// the function being compiled, at its own type arguments, in tail position as a jump back to the
+// start of the function with the arguments as the new parameters, so the recursion is a loop and the
+// stack does not grow. `@tailrec` asks the checker to prove that every recursive call becomes one.
+
+/** A call of a function inside that function's own body. */
+struct TailSite
+    span: Span
+    /** Whether the call names the function directly; a call through a method table or a bound may
+     * run another body, and is never a loop. */
+    direct: bool
+    type_args: Buf[&Type]
+    tail: bool
+    /** Why the call is not in tail position, when it is not. */
+    reason: string
+
+/** Every call of `function` in `body`, which is `function`'s, with whether each is in tail position. */
+tail_sites(function: usize, body: &TExpr) -> Buf[TailSite]
+    var out: Buf[TailSite] = buf()
+    tail_walk(function, body, true, "", &out)
+    out
+
+private tail_walk_all(function: usize, items: Buf[&TExpr], why: string, out: *Buf[TailSite])
+    for e in items
+        tail_walk(function, e, false, why, out)
+
+private tail_walk_option(function: usize, e: Option[&TExpr], tail: bool, why: string, out: *Buf[TailSite])
+    if e is Some(x) then tail_walk(function, x, tail, why, out)
+
+// `tail` says whether `e` is in tail position; where it is not, `why` says why, as the innermost
+// expression using its value does; inside a loop, the loop is the reason for a whole block.
+private tail_walk(function: usize, e: &TExpr, tail: bool, why: string, out: *Buf[TailSite])
+    val argument = "its result is an argument of another call"
+    val stored = "its result is stored"
+    val looped = "it is inside a loop"
+    e.kind match
+        Call(id, args, type_args) ->
+            if id == function then out.push(TailSite(e.span, true, type_args, tail, why))
+            tail_walk_all(function, args, argument, out)
+        Dispatch(id, _, args, type_args) ->
+            if id == function then out.push(TailSite(e.span, false, type_args, tail, why))
+            tail_walk_all(function, args, argument, out)
+        BoundCall(id, _, args, type_args) ->
+            if id == function then out.push(TailSite(e.span, false, type_args, tail, why))
+            tail_walk_all(function, args, argument, out)
+        Construct(_, args) -> tail_walk_all(function, args, "its result is a part of a new value", out)
+        Collection(elements, built) ->
+            tail_walk_all(function, elements, "its result is an element of a collection", out)
+            tail_walk(function, built, false, "its result is an element of a collection", out)
+        CallValue(callee, args) ->
+            tail_walk(function, callee, false, "its result is called", out)
+            tail_walk_all(function, args, argument, out)
+        Field(value, _) -> tail_walk(function, value, false, "a field of its result is read", out)
+        StoreField(object, _, value, _) ->
+            tail_walk(function, object, false, "a field of its result is stored into", out)
+            tail_walk(function, value, false, stored, out)
+        LazyGlobal(_, initialize, _) -> tail_walk(function, initialize, false, "it computes a `lazy val`", out)
+        LazyField(object, _, initialize, _) ->
+            tail_walk(function, object, false, "a field of its result is read", out)
+            tail_walk(function, initialize, false, "it computes a `lazy val`", out)
+        StoreGlobal(_, value, _) -> tail_walk(function, value, false, stored, out)
+        Block(items) ->
+            for i in 0..<items.len()
+                if i + 1 == items.len() then tail_walk(function, items[i], tail, why, out)
+                else tail_walk(function, items[i], false, if !tail && why == looped then why else "more of its block follows it", out)
+        Let(_, value) -> tail_walk(function, value, false, stored, out)
+        LetPattern(pattern, value) ->
+            tail_pattern(function, pattern, out)
+            tail_walk(function, value, false, "its result is taken apart by a pattern", out)
+        Store(_, value, _) -> tail_walk(function, value, false, stored, out)
+        MultiStore(_, value) -> tail_walk(function, value, false, stored, out)
+        Negate(x) -> tail_walk(function, x, false, "its result is negated", out)
+        Not(x) -> tail_walk(function, x, false, "its result is used by `!`", out)
+        Complement(x) -> tail_walk(function, x, false, "its result is used by `~`", out)
+        Convert(x, _) -> tail_walk(function, x, false, s"its result is converted to ${type_name(e.ty)}", out)
+        Box(x) -> tail_walk(function, x, false, "its result is boxed as `Any`", out)
+        NoneAs(x) -> tail_walk(function, x, false, s"its result is converted to ${type_name(e.ty)}", out)
+        Arith(op, a, b, _) ->
+            val used = s"its result is used by `${binary_spelling(op)}`"
+            tail_walk(function, a, false, used, out)
+            tail_walk(function, b, false, used, out)
+        Logic(and, a, b) ->
+            val name = if and then "&&" else "||"
+            tail_walk(function, a, false, s"its result decides whether `$name` goes on", out)
+            tail_walk(function, b, tail, why, out)
+        Compare(operands, _) -> tail_walk_all(function, operands, "its result is compared", out)
+        If(condition, yes, no) ->
+            tail_walk(function, condition, false, "its result is the condition of an `if`", out)
+            tail_walk(function, yes, tail, why, out)
+            tail_walk_option(function, no, tail, why, out)
+        While(_, condition, body, otherwise) ->
+            tail_walk(function, condition, false, looped, out)
+            tail_walk(function, body, false, looped, out)
+            tail_walk_option(function, otherwise, false, looped, out)
+        Break(_, value) -> tail_walk_option(function, value, false, "its result is the value of a `break`", out)
+        // A `return` leaves the function with its value, wherever it is written.
+        Return(value) -> tail_walk_option(function, value, true, "", out)
+        Match(subject, arms) ->
+            tail_walk(function, subject, false, "its result is matched", out)
+            for arm in arms
+                tail_pattern(function, arm.pattern, out)
+                tail_walk_option(function, arm.guard, false, "it is in a guard", out)
+                tail_walk(function, arm.body, tail, why, out)
+        Is(value, pattern, _) ->
+            tail_walk(function, value, false, "its result is tested against a pattern", out)
+            tail_pattern(function, pattern, out)
+        Clauses(subjects, clauses) ->
+            tail_walk_all(function, subjects, "its result is matched", out)
+            for clause in clauses
+                for p in clause.patterns
+                    tail_pattern(function, p, out)
+                for b in clause.bodies
+                    tail_walk_option(function, b.guard, false, "it is in a guard", out)
+                    tail_walk(function, b.body, tail, why, out)
+        _ -> ()
+
+private tail_pattern(function: usize, p: &TPattern, out: *Buf[TailSite])
+    val inside = "it is inside a pattern"
+    p.kind match
+        PLiteral(value) -> tail_walk(function, value, false, inside, out)
+        PBounds(_, lower, upper) ->
+            if lower is Some(b) then tail_walk(function, b.value, false, inside, out)
+            if upper is Some(b) then tail_walk(function, b.value, false, inside, out)
+        PSuccessor(_, amount) -> tail_walk(function, amount, false, inside, out)
+        PAlternatives(options) ->
+            for x in options
+                tail_pattern(function, x, out)
+        PNamed(_, inner) -> tail_pattern(function, inner, out)
+        PVariant(_, fields) ->
+            for x in fields
+                tail_pattern(function, x, out)
+        PSequence(_, test, elements, items, _) ->
+            tail_walk(function, test, false, inside, out)
+            tail_walk_all(function, elements, inside, out)
+            for x in items
+                tail_pattern(function, x, out)
+        PView(_, view, inner) ->
+            tail_walk(function, view, false, inside, out)
+            tail_pattern(function, inner, out)
+        _ -> ()
+
+// `@tailrec` on a function says every call of it in its own body is a loop. The checker proves it:
+// the function cannot be overridden, it calls itself at least once, and each call is direct, in tail
+// position and at the function's own type arguments. A call inside a lambda, a by-name argument or a
+// local function the body declares runs later or elsewhere, so it is never in tail position.
+check_tailrec(c: *Checker)
+    for id in 0..<c.symbols.len()
+        val s = c.symbols[id]
+        if s.lambda || s.default_param is Some(_) then continue
+        var marked: Option[Span] = None
+        for a in s.decl.annotations
+            if a.name != "tailrec" then continue
+            if a.args.len() > 0 then c.note(s.unit, a.span, "`@tailrec` takes no arguments")
+            marked = Some(a.span)
+        if marked is None then continue
+        val kind = if s.owner_class is Some(_) || s.receiver is Some(_) then "method" else "function"
+        if s.constructor
+            c.note(s.unit, s.decl.name_span, "`@tailrec` marks a function or a method, not a constructor")
+            continue
+        if can_be_overridden(c, s)
+            c.note(s.unit, s.decl.name_span, s"`@tailrec` method `${s.decl.name}` can be overridden, so a call of it may run another body; make it private, or its class final")
+            continue
+        val body = c.bodies[id] match
+            Some(b) -> b
+            None ->
+                c.note(s.unit, s.decl.name_span, s"`@tailrec` $kind `${s.decl.name}` has no body")
+                continue
+        var sites = tail_sites(id, body)
+        for g in 0..<c.symbols.len()
+            if g == id || !nested_in(c, g, id) then continue
+            val inner = c.symbols[g]
+            val within = if inner.delayed then "it is inside a by-name argument" elif inner.lambda then "it is inside a lambda" else s"it is inside local function `${inner.name}`"
+            if c.bodies[g] is Some(b)
+                for site in tail_sites(id, b)
+                    sites.push(TailSite(site.span, site.direct, site.type_args, false, within))
+        if sites.len() == 0
+            c.note(s.unit, s.decl.name_span, s"`@tailrec` $kind `${s.decl.name}` has no recursive call")
+            continue
+        for site in sites
+            if !site.tail then c.note(s.unit, site.span, s"this recursive call of `${s.decl.name}` is not in tail position: ${site.reason}")
+            elif !site.direct then c.note(s.unit, site.span, s"this recursive call of `${s.decl.name}` goes through a method table, so it may run an override")
+            elif !own_type_args(c, s, site.type_args) then c.note(s.unit, site.span, s"this recursive call of `${s.decl.name}` gives it other type arguments, so it is a call of another instance rather than a loop")
+
+/** Whether a method may be replaced by another body: a trait's, or a public method of an `open` or
+ * `abstract` class. */
+private can_be_overridden(c: *Checker, s: FunctionSymbol) -> bool = s.owner_class match
+    Some(k) -> is_trait(c, k) || (c.classes[k].decl.modifier != "" && s.public)
+    None -> false
+
+/** Whether function `g` is declared inside the body of `f`: a lambda or a local function written in
+ * it, at any depth. */
+private nested_in(c: *Checker, g: usize, f: usize) -> bool
+    val inner = c.symbols[g]
+    val outer = c.symbols[f]
+    val root = outer.root.unwrap_or(f)
+    if inner.root != Some(root) || inner.unit != outer.unit then return false
+    inner.decl.span.start >= outer.decl.span.start && inner.decl.span.end <= outer.decl.span.end
+
+/** Whether a call's type arguments are the function's own type parameters, each in its place, so the
+ * call is of the instance being run. */
+private own_type_args(c: *Checker, s: FunctionSymbol, type_args: Buf[&Type]) -> bool
+    for i in 0..<type_args.len()
+        *zonk(c, type_args[i]) match
+            TypeVar(owner, index, _) -> if owner != s.type_owner || index != i then return false
+            _ -> return false
+    true
