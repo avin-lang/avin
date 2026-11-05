@@ -81,6 +81,10 @@ quoted and escaped. Both render into a `Writer` with a `FormatSpec`, so formatti
 intermediate string. `data` types and tuples derive both; classes declare them. Nothing has a default
 that prints an address.
 
+A tuple is also an `Ord` where each of its parts is, at every arity: part by part, the first part
+that differs deciding, so later parts break ties. `(1, "b") < (2, "a")`, and `(1, 2) < (1, 3)`.
+`bool` and `unit` have no order, so a tuple holding one has none.
+
 A `data` type has both without asking, wherever its fields have them: `println(Some(3))` writes
 `Some(3)`, and `assertEq(Some(3), Some(3))` needs nothing written. `derives Display, Debug` on a data
 type is allowed and means the same. An impl of the type's own replaces the automatic one: `impl
