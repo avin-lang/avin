@@ -12397,6 +12397,18 @@ private call_checked(c: *Checker, at: Span, callee_span: Span, f: &TExpr, args: 
                 check_statement(c, a.value)
             TExpr(at, if *ty is Nothing then Nothing else ErrorType, UnitConst)
 
+// Whether a lambda's parameter declared `declared` may stand where `wanted` is expected though the two
+// differ: a function of an `Animal` is a function of a `Dog`, on the terms a function type's
+// parameters vary by, which a wider value type does not meet.
+private lambda_parameter_wider(c: *Checker, declared: &Type, wanted: &Type) -> bool
+    val w = zonk(c, wanted)
+    if has_unknowns(w) then return false
+    var mine: Buf[&Type] = buf()
+    mine.push(declared)
+    var theirs: Buf[&Type] = buf()
+    theirs.push(w)
+    fits(c, Function(mine, Unit), Function(theirs, Unit))
+
 // A lambda is an anonymous local function, checked where it is written. Its parameter types are
 // written or come from the function type expected there, and its result type comes from that type
 // or from its body.
@@ -12416,15 +12428,24 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
                 mismatched = true
     var types: Buf[&Type] = buf()
     var names: Buf[string] = buf()
+    var local_types: Buf[&Type] = buf()
     for i in 0..<params.len()
         val p = params[i]
         names.push(p.name)
         var ty: &Type = ErrorType
+        var local: Option[&Type] = None
         p.declared match
             Some(d) ->
                 ty = resolve_type(c, unit, d)
                 if i < wanted.len()
-                    if !unify(c, wanted[i], ty)
+                    // A declared parameter may be wider than the one expected, since a function of
+                    // an `Animal` is a function of a `Dog`, on the terms a function type's
+                    // parameters vary by. The lambda then takes what is expected, and its body sees
+                    // the parameter as declared.
+                    if lambda_parameter_wider(c, ty, wanted[i])
+                        local = Some(ty)
+                        ty = zonk(c, wanted[i])
+                    elif !unify(c, wanted[i], ty)
                         c.note(unit, p.span, s"`${p.name}` is declared ${type_name(ty)}, but this lambda is expected to take ${type_name(zonk(c, wanted[i]))}")
                         ty = ErrorType
             None ->
@@ -12432,6 +12453,7 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
                 if i < wanted.len() && !has_unknowns(known) then ty = known
                 elif !mismatched then c.note(unit, p.span, s"cannot infer the type of `${p.name}`; write it, as in `(${p.name}: int) -> …`")
         types.push(ty)
+        local_types.push(local.unwrap_or(ty))
     var result: Option[&Type] = None
     // A result still partly unknown is inferred from the body, which is checked against its known
     // shape; one wholly unknown says nothing.
@@ -12458,7 +12480,7 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     c.body.block_start = mark
     var param_locals: Buf[usize] = buf()
     for i in 0..<params.len()
-        param_locals.push(declare_local(c, params[i].span, names[i], types[i], false))
+        param_locals.push(declare_local(c, params[i].span, names[i], local_types[i], false))
     c.symbols[id].param_locals = param_locals
     check_body(c, id, body, hint)
     c.body.visible.truncate(mark)

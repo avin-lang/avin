@@ -239,7 +239,9 @@ contravariant, plain `T` invariant. A function's or an `impl`'s type parameters 
   `List[Nothing]` is a `List[int]` too.
 - Tuple parts are covariant and function types take contravariant parameters and covariant
   results, on the same terms: `(Animal) -> int` is a `(Dog) -> int`, and `() -> string` is a
-  `() -> Any`, but `() -> int` is not.
+  `() -> Any`, but `() -> int` is not. A lambda may declare its parameter that wide where the
+  narrower function is expected, `dogs.map((a: Animal) -> a.name)`, and its body sees an `Animal`;
+  `(x: Any) -> …` where an `(int) -> …` is expected is still an error.
 - Where two branches yield instances of one generic type, they agree on the instance whose
   covariant arguments are their arguments' agreement: `if c then Some(dog) else Some(cat)` is an
   `Option[Animal]`.
