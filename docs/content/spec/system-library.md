@@ -137,7 +137,7 @@ that handed it over traps at any use of it while the body runs, though the comma
 body returns, the next code to use it takes it back:
 
 ```text
-avin: trap: `Process` belongs to another thread at main.avin:12:3
+avin: trap: `Child` belongs to another thread at main.avin:12:3
 ```
 
 The iterator `lines()` answers is not sendable: the thread that reads a command's output starts it.

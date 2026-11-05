@@ -2233,7 +2233,7 @@ their words are reserved.
   (branch `thread-ownership`). It holds a runtime token, a handle holding nothing but its owner,
   and `waitFor`, `isAlive` and `kill` use it first, so handing a child to a thread's or a future's
   body makes it the body's, the code that handed it over traps at any use while the body runs
-  (`` `Process` belongs to another thread ``), and it comes back to the next user when the body
+  (`` `Child` belongs to another thread ``), and it comes back to the next user when the body
   returns. The body may wait for it, stop it and start a sequence's later part. Why a token: a
   child's own handles come and go (a program that has ended gives its handle back, a part not yet
   started has none, nor has one whose time ran out before it began), so none of them can carry the
@@ -2241,8 +2241,20 @@ their words are reserved.
   whole, as a connection is, not an object graph being built); keeping it not sendable, so that a
   thread starts and waits for its own commands (what it was; a server that starts a command and
   hands it to a waiter could not). A lines iterator stays not sendable: it is consumed where it is
-  made, and the thread reading a command's output can start the command itself. Review with the
-  user: whether the trap should name `Child` rather than the token's `Process`.
+  made, and the thread reading a command's output can start the command itself.
+- **A handle class's `@sysl` may name it for its traps: `@sysl("avin.rt.Token", named: "Child")`**
+  (branch `thread-ownership`; the director decided that the old owner's trap names the type the user
+  holds). Every trap a handle raises, belonging to another thread and being closed, in compiled code
+  and in the shim, uses that name rather than the class's; the name must be a type's (a capital
+  first, letters, digits and `_`), and nothing else about the handle changes. Why: the trap is read
+  by the code that misused the value, which knows the `Child`, not the private token class inside
+  it. Alternatives weighed: a token class of the same name in a module of its own (two types named
+  `Child`, which misleads a reader of the library); the trap text computed by the runtime from a
+  name the token holds (the check is inline, one compare in compiled code, and its text is fixed
+  when the program is compiled); naming the trap after the class whose method made the call (a
+  rule no reader would guess). `Socket` still names itself, for a `TcpStream` and a `TcpListener`
+  both; naming those for the user's type would need one handle class per type. Review with the
+  user whether they should.
 
 ## Open
 

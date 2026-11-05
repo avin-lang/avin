@@ -392,6 +392,11 @@ parseBigInt(s: string) -> Option[BigInt]
   keeps its handles from one message to the next whichever thread runs it. The check is one compare
   of two words, the handle's owner and the running code's, which the runtime sets when it starts
   running something else.
+- **A trap names the handle by its class**, unless the class's `@sysl` gives it another name after
+  the Sysl type, `named: "Name"`, a type's name ([proposed](/spec/decisions/#proposed)). A library
+  value that keeps a handle only to carry its owner names the handle for itself, so the trap names
+  the type its user holds: a started `Child` keeps one declared `@sysl("avin.rt.Token", named:
+  "Child")`, and traps with "`Child` belongs to another thread". The name changes nothing else.
 
   **Ownership moves with what is handed to code that runs elsewhere.** The handles a thread's body or
   a future's body reaches — captured directly, or through any object or collection — that the
