@@ -2605,15 +2605,7 @@ their words are reserved.
   (`-5` as `65531`). Alternatives weighed: passing every narrow integer as an `i32` and narrowing in
   the shim (changes the type a generic Sysl parameter infers).
 
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- Proposed 2026-11-05 (built on branch `sendable-params`): **a `@sendable` parameter is sendable
+- Settled on the user's delegation 2026-11-05 (built on branch `sendable-params`): **a `@sendable` parameter is sendable
   inside its function, whatever its type** ([threads](/spec/threads/#what-is-shared)). Found by the
   parsing library, whose combinators take a `@sendable f: PartialFunction[char, U]` and could neither
   capture it in a `@sendable` lambda nor pass it on.
@@ -2643,6 +2635,16 @@ their words are reserved.
     `^^^[@sendable (int, int) -> int](…)`, which is noisy for every operator parser. A `match`
     function where a `PartialFunction` is expected is not changed by the bound: it is a
     `PartialFunction`, which does not promise `Sendable`.
+
+**Deferred**
+
+- Public C interoperability. Until then, C is reached through Sysl.
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
