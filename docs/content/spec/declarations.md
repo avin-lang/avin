@@ -1367,8 +1367,11 @@ test the core library or a dependency declares.
   field only where it could call a method, after its last field and not at all in an `open` or
   `abstract` class. A trap inside an initializer stops the program as any trap does.
 
-  The first read is safe between threads: when several threads read the value first at once, one
-  runs the initializer and the others wait for it, [safe for the collector](threads.md), then see
-  the whole value. A read after the value is stored is one atomic load and a branch.
+  The first read is safe between threads: when several threads read the value first at once,
+  exactly one runs the initializer and the others wait for it, [safe for the collector](threads.md),
+  then all see the same, whole value. A read after the value is stored is one atomic load and a
+  branch. A trap in the initializer stops the program while the others still wait, so none of them
+  goes on without the value. The read that traps as needing its own value is one made by the thread
+  running the initializer, whichever thread that is; a read by any other thread waits.
 - Local helper functions may call one another in any order, but a call that would read a captured
   local before its initialization is rejected.
