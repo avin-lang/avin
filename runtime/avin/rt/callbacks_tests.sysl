@@ -1,0 +1,68 @@
+module avin.rt
+@tests
+
+import sh.sysl.gc
+
+// An object whose finalizer counts the times the collector frees one.
+private var freed: usize = 0
+private count_freed(p: *u8, h: *gc.Heap) = freed += 1
+private var counted: Descriptor = Descriptor(gc.Kind(&trace, &count_freed, null, null), 0, 16, 0, null)
+private var calling: Context = new_context()
+
+private begin()
+    attach(&calling)
+    leave_safe(&calling)
+    current_context = &calling
+
+private end()
+    calling.top = null
+    detach(&calling)
+
+@test("a pinned function value survives every collection until its callback is dropped, and its slot is reused")
+pinned_until_dropped()
+    begin()
+    freed = 0
+    val before = callbacks_held()
+    var first: Option[&Callback] = Some(callback_pin(&calling, allocate(&calling, &counted), null, 0, "keep"))
+    val second = callback_pin(&calling, allocate(&calling, &counted), null, 0, "keep")
+    assert(callbacks_held() == before + 2)
+    collect(&calling)
+    assert(freed == 0)
+    val slot = first.unwrap().slot
+    first = None
+    assert(callbacks_held() == before + 1)
+    collect(&calling)
+    assert(freed == 1)
+    val third = callback_pin(&calling, allocate(&calling, &counted), null, 0, "keep")
+    assert(third.slot == slot)
+    assert(second.slot != slot)
+    end()
+
+@test("a call of a callback on its giver's thread runs with that thread's context, and one made while the thread is safe makes it running for the call")
+enter_on_the_giving_thread()
+    begin()
+    val cb = callback_pin(&calling, null, null, 0, "keep")
+    val site = calling.caller
+    val e = callback_enter(&*cb)
+    assert(e.ctx == &calling && !e.was_safe && !e.attached)
+    callback_leave(e)
+    assert(calling.state.load() == Running)
+    enter_safe(&calling)
+    val waiting = callback_enter(&*cb)
+    assert(waiting.was_safe && calling.state.load() == Running)
+    callback_leave(waiting)
+    assert(calling.state.load() == Safe && calling.caller == site)
+    leave_safe(&calling)
+    end()
+
+@test("a callback keeps the layouts it was given")
+layouts_kept()
+    var ds: [2]*u8 = [null, null]
+    var a = 1u8
+    var b = 2u8
+    ds[0] = &a
+    ds[1] = &b
+    val cb = callback_pin(&calling, null, &ds[0], 2, "keep")
+    ds[0] = null
+    val kept = callback_layouts(&*cb)
+    assert(kept[0] == &a && kept[1] == &b)

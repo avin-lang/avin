@@ -2048,6 +2048,55 @@ their words are reserved.
 
 ## Proposed
 
+- Proposed on branch `sysl-callbacks` 2026-11-05: [passing Avin functions to
+  Sysl](/spec/sysl-bindings/#callbacks), the choices the request left open:
+  - **The closure's lifetime is Sysl's**: the shim's closure captures a counted Sysl value with a
+    destructor that holds a root of the collector, so the root is given back when Sysl drops its
+    last reference to the closure. Why: Sysl closures already carry captured state and drop it, so
+    nothing has to be released by hand and nothing leaks while Sysl's own ownership is right.
+    Alternatives: an explicit `release` the library calls (leaks whenever it forgets, and frees a
+    function Sysl may still call when it releases early); a root for the program's whole run
+    (leaks every callback ever given).
+  - **A callback belongs to the code that gave it by default; `@threaded` on a binding's parameter
+    lets any thread call it.** The default compares owners, as a handle's use does, and traps on any
+    other caller. Why: a callback's captures are ordinary Avin objects, shared without
+    synchronization, so a call from another thread is a data race unless the function is checked;
+    most UI and event callbacks run on the thread that registered them. Alternatives: a flag on the
+    whole binding, `@sysl("name", threaded)` (coarser: one binding may take two callbacks); reading
+    `&sync Fn` from the Sysl signature (Avin does not parse Sysl types; Sysl's check already refuses
+    the unmarked case, and the refusal is reworded to name the mark). **Review with the user**: the
+    spelling `@threaded`, and whether the default should be the owner (as built) or the OS thread.
+  - **What a `@threaded` parameter is given is checked by its captures**, since a function value is
+    never `Sendable`: a top-level function, or a lambda, local function or method value whose every
+    capture is a `val` or a parameter of a sendable type. A function value held in a variable or a
+    parameter is refused (its type does not say what it captures), and a binding with a `@threaded`
+    parameter cannot be used as a value, which would hide the call from the check. Alternatives:
+    making function types carry a sendability mark (`Sendable` function types; a larger language
+    change); no check (unsound).
+  - **A thread Sysl started itself is attached for a `@threaded` callback's call** (its own context,
+    a fresh owner, the stack guard installed) and detached after; a callback without the mark called
+    there traps without a place, since the thread never entered from Avin. Why: an audio or I/O
+    thread of a C library is the common case, and attaching is cheap and safe since the thread holds
+    no Avin references between calls. Alternative: always trap (makes such libraries unusable).
+  - **A callback made while its thread is in a blocking call makes the thread running for the call
+    and safe again after**; the place a trap in the library reports (the context's caller site) is
+    restored when the call ends.
+  - Settled on the user's delegation 2026-11-05 (the director): **a binding with a `@threaded`
+    parameter is `blocking` whether or not it says so**, since a Sysl call that may wait for another
+    thread to call back would otherwise hold up that thread's first collection for ever. Why: the
+    deadlock cannot be detected, and the cost is two stores and two loads per call. Alternative:
+    documenting that such a binding is declared `blocking` (built first; a forgotten word hangs the
+    program). A same-thread callback's binding still blocks only where it says so.
+  - **A trap inside a callback stops the program at the callback's own place.** Avin traps report a
+    place rather than a backtrace, so "with the Avin backtrace" is the trap's place; there is no
+    unwinding through Sysl frames, which would need Sysl to be unwind-safe.
+  - **The program defines one C-convention entry per callback parameter** (a bool as a byte), which
+    the shim declares `extern` and calls with the closure; the shim itself is generic in the Sysl
+    types of the closure's arguments, so a callback's integer parameter takes any Sysl integer with
+    the check a result has. Alternative: the shim calling the closure's code directly through a
+    function pointer (ties the shim to Avin's internal convention for `bool`).
+  - The runtime offers `avin.rt.callbacks_held`, the number of functions Sysl holds, for tests and
+    for libraries that want to check they release what they register.
 - **A member call on the name of a data type whose variant of its own name has no fields**
   (`Lone.m(…)` with `data Lone()`; branch `fix-lone-value`). The name is both the type and a value
   of it. Proposed: where the type has a static member named `m`, the call is the type's and chooses

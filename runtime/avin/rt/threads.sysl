@@ -20,6 +20,9 @@ private struct Started
     joint: *u8
     /** The program's closure runner, which calls `run` with the program's own convention. */
     runner: *u8
+    /** The context's address, which the thread makes its current one: the storage outlives every
+     * call the thread makes. */
+    own: *Context
     me: Option[&Started]
 
 @assert(offsetof(Started, context) == 0, "a started thread's context is the start of its storage")
@@ -42,9 +45,10 @@ var joint_descriptor: Descriptor = descriptor(0, sizeof(Joint), 0)
  * closure, which runs the closure. */
 @export("avin_rt_thread_start")
 thread_start(ctx: *Context, run: *u8, stack: long, runner: *u8) -> *u8
-    val s: &Started = Started(new_context(), Frame(null, 2), run, null, runner, None)
+    val s: &Started = Started(new_context(), Frame(null, 2), run, null, runner, null, None)
     s.me = Some(s)
     val p: *Started = ptr_cast(&*s)
+    p.own = &p.context
     // The new thread's frame is the caller's top frame until the thread's context is attached, so the
     // closure and the joint are roots while the joint is allocated and the heap lock is awaited.
     p.root.prev = ctx.top
@@ -82,6 +86,7 @@ private run_started(arg: *u8) -> unit
     val c = &p.context
     install_stack_guard()
     leave_safe(c)
+    current_context = p.own
     val entry: *extern(*Context, *u8) -> unit = ptr_cast(p.runner)
     entry(c, p.run)
     remove_stack_guard()
@@ -114,5 +119,12 @@ private var stopping: SleepLock = SleepLock.new()
 begin_stop(ctx: *Context)
     if stopping.try_lock() then return
     enter_safe(ctx)
+    loop
+        stopping.lock()
+
+/** Begins stopping the program from a thread with no context, as `begin_stop` does: the first
+ * thread to stop it returns, and any other waits until the process ends. */
+begin_stop_foreign()
+    if stopping.try_lock() then return
     loop
         stopping.lock()

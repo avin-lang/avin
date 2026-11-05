@@ -1,0 +1,244 @@
+module avintest.callbacks
+
+import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
+import sysl.threads.spawn
+import sysl.time.{millis, sleep}
+
+/** `f` applied to `x`. */
+apply(f: &Fn(int) -> int, x: int) -> int = f(x)
+
+/** `f` applied to `x`, the closure's type a type argument rather than a counted reference. */
+apply_direct(f: int -> int, x: int) -> int = f(x)
+
+/** The sum of `f(i)` for each `i` from zero below `n`. */
+sum_over(f: &Fn(int) -> int, n: int) -> int
+    var total = 0
+    for i in 0..<n
+        total += f(i)
+    total
+
+/** Runs `f` `n` times. */
+repeat(f: &Fn() -> unit, n: int)
+    for _ in 0..<n
+        f()
+
+/** Takes `f` and lets it go without calling it. */
+ignore(f: &Fn(int) -> int) = ()
+
+/** The callbacks kept for later. */
+var kept: Buf[&Fn(int) -> int] = buf()
+
+/** Keeps `f`, to be called later. */
+keep(f: &Fn(int) -> int) = kept.push(f)
+
+/** How many callbacks are kept. */
+kept_count() -> int = int(kept.len())
+
+/** The kept callback `i` applied to `x`. */
+call_kept(i: int, x: int) -> int = kept[usize(i)](x)
+
+/** The sum of every kept callback applied to `x`. */
+call_all_kept(x: int) -> int
+    var total = 0
+    for f in kept
+        total += f(x)
+    total
+
+/** Lets every kept callback go. */
+forget_kept()
+    kept = buf()
+
+/** Lets the last kept callback go. */
+forget_last()
+    _ = kept.pop()
+
+/** A callback that calls the kept callback `i` on `x` when it is called, kept itself. */
+keep_relay(i: int)
+    val k = usize(i)
+    kept.push(x -> kept[k](x))
+
+// Each scalar boundary type, as a callback's parameter and result.
+
+twice_long(f: &Fn(i64) -> i64, x: i64) -> i64 = f(f(x))
+small(f: &Fn(i8, i16) -> i16, a: i8, b: i16) -> i16 = f(a, b)
+byte_op(f: &Fn(u8) -> u8, b: u8) -> u8 = f(b)
+real_op(f: &Fn(f64) -> f64, x: f64) -> f64 = f(x)
+char_op(f: &Fn(char) -> char, c: char) -> char = f(c)
+bool_op(f: &Fn(bool) -> bool, b: bool) -> bool = f(b)
+text_op(f: &Fn(string) -> string, s: string) -> string = f(s)
+
+/** `f` called with a unit and `n`. */
+unit_op(f: &Fn(unit, int) -> unit, n: int) = f((), n)
+
+/** `f` given `n` as a `usize`, which a callback taking an `int` holds only when it fits. */
+size_op(f: &Fn(usize) -> int, n: i64) -> int = f(usize(n))
+
+/** The sum of the bytes `f` answers for the bytes 1, 2 and 3. */
+bytes_op(f: &Fn([]const u8) -> []const u8) -> i64
+    var given: []u8 = [0; 3]
+    given[0] = 1
+    given[1] = 2
+    given[2] = 3
+    var total = 0i64
+    for b in f(given)
+        total += i64(b)
+    total
+
+/** What `f` answers for `Some("ab")` and for `None`, written out. */
+option_op(f: &Fn(Option[string]) -> Option[int]) -> string = show_option(f(Some("ab"))) + " " + show_option(f(None))
+
+private show_option(o: Option[int]) -> string = o match
+    Some(n) -> "Some(" + n.to_string() + ")"
+    None -> "None"
+
+/** What `f` answers for `Ok(7)` and for `Err("no")`, written out. */
+result_op(f: &Fn(Result[int, string]) -> Result[string, int]) -> string = show_result(f(Ok(7))) + " " + show_result(f(Err("no")))
+
+private show_result(r: Result[string, int]) -> string = r match
+    Ok(s) -> "Ok(" + s + ")"
+    Err(n) -> "Err(" + n.to_string() + ")"
+
+/** The sum of what `f` answers for the elements 1, 2, 3 in a `Buf`. */
+vector_op(f: &Fn(Buf[int]) -> []int) -> int
+    var given: Buf[int] = buf()
+    given.push(1)
+    given.push(2)
+    given.push(3)
+    var total = 0
+    for x in f(given)
+        total += x
+    total
+
+/** The sum of what `f` answers for a slice of `n` ones. */
+array_op(f: &Fn([]int) -> []const int, n: int) -> int
+    var given: []int = [1; usize(n)]
+    var total = 0
+    for x in f(given)
+        total += x
+    total
+
+/** What `f` answers for `(3, "x")`, written out. */
+tuple_op(f: &Fn((int, string)) -> (string, int)) -> string
+    val (s, n) = f((3, "x"))
+    s + "/" + n.to_string()
+
+/** A point on a plane. */
+struct Point
+    x: i32
+    y: i32
+
+/** A shape. */
+enum Shape
+    Dot
+    Circle(radius: i32)
+    Label(text: string, at: Point)
+
+/** The sum of the coordinates of what `f` answers for the point (1, 2). */
+point_op(f: &Fn(Point) -> Point) -> i32
+    val p = f(Point(1, 2))
+    p.x + p.y
+
+/** What `f` answers for each of three shapes, written out. */
+shape_op(f: &Fn(Shape) -> Shape) -> string = show_shape(f(Shape.Dot)) + " " + show_shape(f(Shape.Circle(4))) + " " + show_shape(f(Shape.Label("p", Point(5, 6))))
+
+private show_shape(s: Shape) -> string = s match
+    Dot -> "Dot"
+    Circle(r) -> "Circle(" + r.to_string() + ")"
+    Label(t, p) -> "Label(" + t + ", " + p.x.to_string() + ", " + p.y.to_string() + ")"
+
+/** How many boxes have been given back. */
+var boxes_given_back = 0i64
+
+/** A number with a destructor, which counts the boxes given back. */
+struct Box
+    n: i64
+
+    /** The number. */
+    get(self) -> i64 = self.n
+
+    /** `f` applied to the number. */
+    apply_to(self, f: &Fn(i64) -> i64) -> i64 = f(self.n)
+
+    /** `f` applied to the number after a wait of `ms` milliseconds. */
+    apply_later(self, f: &Fn(i64) -> i64, ms: i64) -> i64
+        sleep(millis(ms))
+        f(self.n)
+
+impl Drop for Box
+    drop(self) = boxes_given_back += 1
+
+/** A box holding `n`. */
+new_box(n: i64) -> &Box = Box(n)
+
+/** How many boxes have been given back. */
+given_back() -> i64 = boxes_given_back
+
+/** What `f` answers for a box holding 40. */
+with_box(f: &Fn(&Box) -> i64) -> i64 = f(Box(40))
+
+/** The number held by the box `f` answers for `n`. */
+make_box(f: &Fn(i64) -> &Box, n: i64) -> i64 = f(n).n
+
+/** `g` applied to what `f` answers for `s`: two callbacks, each converting values with layouts. */
+combine(f: &Fn(string) -> Option[string], g: &Fn(Option[string]) -> Result[i64, string], s: string) -> string = g(f(s)) match
+    Ok(n) -> "Ok(" + n.to_string() + ")"
+    Err(e) -> "Err(" + e + ")"
+
+/** A place on a line, a value with no destructor. */
+struct Spot
+    at: i64
+
+    /** The place. */
+    place(self) -> i64 = self.at
+
+/** The spot at `n`. */
+spot_at(n: i64) -> Spot = Spot(n)
+
+/** The place of the spot `f` answers for the spot at 10. */
+with_spot(f: &Fn(Spot) -> Spot) -> i64 = f(Spot(10)).at
+
+/** `f` applied to `x` after a wait of `ms` milliseconds, which a binding declares blocking. */
+apply_after(f: &Fn(int) -> int, x: int, ms: i64) -> int
+    sleep(millis(ms))
+    f(x)
+
+/** The callbacks any thread may call, kept for later. */
+var shared: Buf[&sync Fn(int) -> int] = buf()
+
+/** Keeps `f`, which any thread may call. */
+share(f: &sync Fn(int) -> int) = shared.push(f)
+
+/** The last shared callback applied to `x`. */
+call_shared(x: int) -> int = shared[shared.len() - 1](x)
+
+/** Lets every shared callback go. */
+forget_shared()
+    shared = buf()
+
+/** `f` applied to `x` on a thread of Sysl's own, waited for. */
+apply_on_thread(f: &sync Fn(int) -> int, x: int) -> int
+    share(f)
+    val r = call_shared_on_thread(x)
+    _ = shared.pop()
+    r
+
+private var foreign_x: int = 0
+private var foreign_result: int = 0
+private var foreign_kept: bool = false
+
+private run_foreign(arg: *u8) -> unit
+    foreign_result = if foreign_kept then kept[kept.len() - 1](foreign_x) else shared[shared.len() - 1](foreign_x)
+
+private on_thread(x: int, use_kept: bool) -> int
+    foreign_x = x
+    foreign_kept = use_kept
+    val t = spawn(&run_foreign, null, 1048576usize).unwrap()
+    _ = t.join()
+    foreign_result
+
+/** The last shared callback applied to `x` on a thread of Sysl's own, waited for. */
+call_shared_on_thread(x: int) -> int = on_thread(x, false)
+
+/** The last kept callback applied to `x` on a thread of Sysl's own, waited for. */
+call_kept_on_thread(x: int) -> int = on_thread(x, true)

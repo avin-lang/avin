@@ -110,7 +110,11 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
         for p in b.params
             gather(&w, p, false)
         gather(&w, b.result, true)
-    val converts = w.ins.len() + w.outs.len() > 0 || uses_bytes(bindings)
+    var calls_back = false
+    for b in bindings
+        for p in b.params
+            if p.form is Callback(_, _, _, _, _) then calls_back = true
+    val converts = w.ins.len() + w.outs.len() > 0 || uses_bytes(bindings) || calls_back
     // A handle a mirror's field holds into Sysl is checked by a helper of its own.
     var held: Buf[bool] = buf()
     for _ in 0..<w.mirrors.len()
@@ -121,6 +125,13 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
             for f in v.fields
                 if f.crossing.form is Handle(_)
                     held[handle_index(&w, f.crossing)] = true
+                    holds = true
+    // A handle a callback answers goes into Sysl as a mirror's field does, checked the same way.
+    for b in bindings
+        for p in b.params
+            if p.form is Callback(_, result, _, _, _)
+                if result.form is Handle(_)
+                    held[handle_index(&w, result)] = true
                     holds = true
     put(&w, "module avin.shims\n\nimport avin.rt.{Context, stop_in_binding, text_bytes, text_length, text_of}\nimport sysl.raw.str_cast\n")
     if holds then put(&w, "import avin.rt.handle_claim\n")
@@ -133,6 +144,7 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
         if b.blocking then blocks = true
         if b.blocking && !(b.reach is TopLevel) && b.result.form is Bytes then owns_bytes = true
     if blocks then put(&w, "import avin.rt.{enter_safe, leave_safe}\n")
+    if calls_back then put(&w, "import avin.rt.{Callback, callback_enter, callback_layouts, callback_leave, callback_pin, callback_pin_threaded}\n")
     var collects = false
     for c in w.ins
         if c.form is Elements(_, _) then collects = true
@@ -160,8 +172,11 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
     for b in bindings
         for k in 0..<b.params.len()
             if b.params[k].form is Handle(_) && (k > 0 || b.reach is TopLevel) then passed[handle_index(&w, b.params[k])] = true
+            if b.params[k].form is Callback(_, result, _, _, _)
+                if result.form is Handle(_) then passed[handle_index(&w, result)] = true
     for m in 0..<w.mirrors.len()
         if w.mirrors[m].finalizer != "" then handle_lines(&w, m, passed[m] || held[m], held[m])
+    if calls_back then callback_declarations(&w, bindings)
     for i in 0..<bindings.len()
         val b = bindings[i]
         put(&w, "\n")
@@ -180,7 +195,8 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
                 args.push("()")
                 continue
             put(&w, s", a$k: ${crossing_c_side(p)}")
-            if p.form is Handle(_)
+            if p.form is Callback(_, _, _, _, _) then args.push(callback_lambda(&w, b, i, k))
+            elif p.form is Handle(_)
                 handles.push(PassedHandle(args.len(), handle_index(&w, p), s"a$k"))
                 args.push("")
             // An array the Sysl function may fill is passed as a slice of its own, read back after.
@@ -205,6 +221,13 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
         receiver match
             Some(m) -> put(&w, s"\n    val s: *Slot_$m = ptr_cast(a0)")
             None -> ()
+        // Each function passed is rooted for as long as Sysl keeps the closure made of it.
+        for k in 0..<b.params.len()
+            if b.params[k].form is Callback(_, _, _, _, threaded)
+                val n = b.params[k].layouts
+                val pin = if threaded then "callback_pin_threaded" else "callback_pin"
+                val at = if n == 0 then "null" else s"ep$k"
+                put(&w, s"\n    val cb$k = $pin(ctx, a$k, $at, ${n}usize, \"${b.name}\")")
         // Each array the Sysl function may fill is copied into a slice it may write, and kept as a
         // frame of the thread's stack until its elements are copied back: the collector, which never
         // moves an object, may run while the call waits or while the result is converted.
@@ -237,8 +260,18 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
             for m in types
                 if m == h.mirror then seen = true
             if !seen then types.push(h.mirror)
+        for p in b.params
+            if p.form is Callback(_, result, _, _, _)
+                if result.form is Handle(_)
+                    val m = handle_index(&w, result)
+                    var seen = false
+                    for t in types
+                        if t == m then seen = true
+                    if !seen then types.push(m)
         put(&w, "\n")
         call_arms(&w, b, callee, args, handles, types, 0, buf(), receiver is Some(_), fills, "    ")
+        for k in 0..<b.params.len()
+            if b.params[k].form is Callback(_, _, _, _, _) then callback_functions(&w, b, i, k)
         last.push(w.line - 1)
     var k = 0usize
     while k < w.ins.len()
@@ -270,6 +303,143 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
         unconverted.push(s"`${type_name(c.ty)}` is made from a Sysl $from, and the value is none of these")
     ShimSource(w.out.finish(), imports, first, last, w.mirrors, w.mirror_lines, unconverted, w.passing)
 
+// The entries through which the shims call the functions they are given, which the program defines,
+// and the frames that keep a callback's function and the objects made of its arguments while it runs:
+// one of each size used.
+private callback_declarations(w: *ShimWriter, bindings: Buf[MirBinding])
+    var sizes: Buf[usize] = buf()
+    for i in 0..<bindings.len()
+        val b = bindings[i]
+        for k in 0..<b.params.len()
+            if b.params[k].form is Callback(params, result, _, _, _)
+                var line = s"\nextern \"${callback_invoker(b.shim, k)}\" invoke_${i}_$k(ctx: *Context, f: *u8"
+                for j in 0..<params.len()
+                    if *params[j].ty is Unit then continue
+                    line = line + s", a$j: ${crossing_c_side(params[j])}"
+                line = line + ") -> " + (if *result.ty is Unit then "unit" else crossing_c_side(result)) + "\n"
+                put(w, line)
+                val n = held_slots(params)
+                var seen = false
+                for m in sizes
+                    if m == n then seen = true
+                if !seen then sizes.push(n)
+    for n in sizes
+        put(w, s"\n// A callback's function and the objects made of its arguments, kept as a frame of the thread's\n// stack while it runs.\nprivate struct Held_$n\n    frame: Frame\n    slots: [$n]*u8\n")
+
+// How many references a callback's frame holds: its function, and each argument that is an object.
+private held_slots(params: Buf[&Crossing]) -> usize
+    var n = 1usize
+    for p in params
+        if !(*p.ty is Unit) && crossing_c_side(p) == "*u8" then n += 1
+    n
+
+// The parameters and result of the function binding `b` passes as its parameter `k`.
+private callback_parts(b: &MirBinding, k: usize) -> (Buf[&Crossing], &Crossing)
+    val c = b.params[k]
+    if c.form is Callback(ps, r, _, _, _) then return (ps, r)
+    panic("a callback's crossing that is not one")
+
+// The Sysl closure binding `b`, the `i`th, hands Sysl for its parameter `k`: it passes what Sysl
+// calls it with to the function that runs the callback `cb<k>`. A handle it answers is made the
+// value the closure's type asks for, a pointer to the handle's value, the value or a counted
+// reference.
+private callback_lambda(w: *ShimWriter, b: &MirBinding, i: usize, k: usize) -> string
+    val (params, result) = callback_parts(b, k)
+    var names = ""
+    var call = s"call_${i}_$k(&*cb$k"
+    for j in 0..<params.len()
+        if j > 0 then names = names + ", "
+        names = names + s"q$j"
+        call = call + s", q$j"
+    call = call + ")"
+    // A handle is answered as the closure's type asks: a pointer to the value, the value or a counted
+    // reference, and a type with a destructor only by the counted reference, which the call written
+    // for that choice takes as it is.
+    if result.form is Handle(_) then call = s"given_${handle_index(w, result)}($call)"
+    s"($names) -> $call"
+
+// The Sysl type the answer of a callback with result `r` is converted to.
+private callback_answer(w: *ShimWriter, r: &Crossing) -> string
+    if r.form is Plain then return sysl_side(r.ty)
+    if r.form is Handle(_) then return s"&mirror_${handle_index(w, r)}"
+    sysl_type(w, r)
+
+// The functions that run the callback binding `b`, the `i`th, is given for its parameter `k`, generic
+// in the Sysl types of its arguments: `call` begins the call on the calling thread and ends it,
+// and `run`, with the thread's context, converts each argument out of Sysl, keeping each object it
+// makes and the function itself as a frame of the thread's stack, runs the function through the
+// program's entry for it, and converts what it answers into Sysl. A handle answered gives its share
+// of its Sysl value, taken while the thread is still running.
+private callback_functions(w: *ShimWriter, b: &MirBinding, i: usize, k: usize)
+    val (params, result) = callback_parts(b, k)
+    var types = ""
+    var declared = ""
+    var passed = ""
+    // An integer is any Sysl integer, and a collection, an option, a result, a tuple or a value a
+    // handle is made of is spelled as Sysl spells it; any other scalar has its one Sysl type.
+    for j in 0..<params.len()
+        val p = params[j]
+        passed = passed + s", q$j"
+        if p.form is Plain && !(*p.ty is Int(_))
+            declared = declared + s", q$j: ${sysl_side(p.ty)}"
+            continue
+        if types != "" then types = types + ", "
+        types = types + (if p.form is Plain then s"S$j: Integer" else s"S$j")
+        declared = declared + s", q$j: S$j"
+    val generic = if types == "" then "" else s"[$types]"
+    val unit = *result.ty is Unit
+    val answer = if unit then "" else " -> " + callback_answer(w, result)
+    put(w, s"\n// What Sysl calls the function given for `${b.name}`'s parameter ${k + 1} with, run on the calling thread.\nprivate call_${i}_$k$generic(cb: *Callback$declared)$answer\n    val e = callback_enter(cb)\n")
+    if unit then put(w, s"    run_${i}_$k(e.ctx, cb$passed)\n    callback_leave(e)\n")
+    else put(w, s"    val r = run_${i}_$k(e.ctx, cb$passed)\n    callback_leave(e)\n    r\n")
+    put(w, s"\nprivate run_${i}_$k$generic(ctx: *Context, cb: *Callback$declared)$answer\n")
+    if b.params[k].layouts > 0 then put(w, "    val ep: **u8 = callback_layouts(cb)\n")
+    val n = held_slots(params)
+    put(w, s"    var held = Held_$n(Frame(ctx.top, ${n}usize), [null; $n])\n    ctx.top = ptr_cast(&held)\n    held.slots[0] = cb.object\n")
+    var call = s"invoke_${i}_$k(ctx, held.slots[0]"
+    var slot = 1usize
+    var base = 0usize
+    for j in 0..<params.len()
+        val p = params[j]
+        if !(*p.ty is Unit)
+            val made = out_expr(w, p, s"q$j", "ep", base)
+            val side = crossing_c_side(p)
+            if side == "*u8"
+                put(w, s"    held.slots[$slot] = $made\n")
+                call = call + s", held.slots[$slot]"
+                slot += 1
+            else
+                put(w, s"    val v$j: $side = $made\n")
+                call = call + s", v$j"
+        base += p.layouts
+    call = call + ")"
+    if unit
+        put(w, s"    $call\n    ctx.top = held.frame.prev\n")
+        return
+    put(w, s"    val r = $call\n    ctx.top = held.frame.prev\n")
+    if result.form is Handle(_)
+        val m = handle_index(w, result)
+        put(w, s"    slot_$m(held_$m(ctx, r)).r\n")
+    else put(w, "    " + into_expr(w, result, "r", "ep", base) + "\n")
+
+// Sysl's words for a callback's parameter whose type is not the one Sysl calls the closure with,
+// `'q0' of 'avin.shims.call_2_0' is string, but int was given`, said of the callback's own parameter;
+// any other message as it is.
+private callback_parameter_message(message: string) -> string
+    if !message.starts_with("'q") || !message.ends_with(" was given") then return message
+    val halves = message.split("' of 'avin.shims.call_")
+    if halves.len != 2 then return message
+    val named = halves[1].split("' is ")
+    if named.len != 2 then return message
+    val types = named[1].split(", but ")
+    if types.len != 2 then return message
+    var j = 0usize
+    for b in halves[0].bytes[2..]
+        if b < u8('0') || b > u8('9') then return message
+        j = j * 10 + usize(b - u8('0'))
+    val given = types[1].replace_all(" was given", "")
+    s"the function's parameter ${j + 1} is ${types[0]}, but Sysl calls it with $given"
+
 // A handle a binding passes as a parameter: the place of its argument in the call, the mirror its type
 // is, and the shim's parameter that holds it.
 private struct PassedHandle
@@ -300,6 +470,9 @@ private call_arms(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[stri
                     arg = s"slot_${h.mirror}(${h.name}).r"
                     wrapper = s"given_${h.mirror}"
                 else arg = s"passed_${h.mirror}(${h.name})"
+            // A callback answering a handle of a type with a destructor answers its counted reference.
+            for m in dropped
+                arg = arg.replace_all(s"-> given_$m(call_", "-> (call_")
             given.push(arg)
             wrappers.push(wrapper)
         call_lines(w, b, callee, given, wrappers, method, fills, indent)
@@ -334,6 +507,11 @@ private call_lines(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[str
         for k in 0..<args.len()
             if args[k] == "()"
                 given.push("()")
+                continue
+            // A closure is made at the call, where its parameters' types are known; making it
+            // reads only Sysl values.
+            if b.params[k + (if method then 1 else 0)].form is Callback(_, _, _, _, _)
+                given.push(args[k])
                 continue
             put(w, indent + s"val x$k = ${args[k]}\n")
             given.push(if wrappers[k] != "" then s"${wrappers[k]}(x$k)" else s"x$k")
@@ -451,6 +629,10 @@ private uses_bytes(bindings: Buf[MirBinding]) -> bool
         if b.result.form is Bytes then return true
         for p in b.params
             if p.form is Bytes then return true
+            if p.form is Callback(params, result, _, _, _)
+                if result.form is Bytes then return true
+                for q in params
+                    if q.form is Bytes then return true
     false
 
 // Whether a parameter is an array the Sysl function may fill: an array of bytes, integers, reals,
@@ -485,6 +667,12 @@ private copy_back(w: *ShimWriter, p: &Crossing, k: usize, indent: string)
 // Records the conversions a value of `c`'s type needs, in the direction `out` says, and the mirrors
 // they include, each once.
 private gather(w: *ShimWriter, c: &Crossing, out: bool)
+    // A function Sysl is given takes values out of Sysl and answers one into it.
+    if c.form is Callback(params, result, _, _, _)
+        for p in params
+            gather(w, p, true)
+        gather(w, result, false)
+        return
     if c.form is Plain || c.form is Bytes then return
     // A handle goes into Sysl by itself, a parameter, a receiver or a mirror's field, which the shim
     // reads through the handle's own helpers rather than a conversion.
@@ -560,6 +748,8 @@ private sysl_type(w: *ShimWriter, c: &Crossing) -> string = c.form match
     Mirror(_, _, _, _, _) -> s"mirror_${mirror_of(w, c).unwrap()}"
     Elements(element, vector) -> (if vector then "[]" else "[]const ") + sysl_type(w, element)
     Handle(_) -> s"mirror_${handle_index(w, c)}"
+    // A function goes into Sysl as a closure made where it is passed, whose type Sysl infers.
+    Callback(_, _, _, _, _) -> "unit"
     TupleForm ->
         var parts: Buf[string] = buf()
         for f in c.variants[0].fields
@@ -1081,6 +1271,11 @@ shim_diagnostics(output: string, shim: ShimSource, bindings: Buf[MirBinding], un
                         continue
                     if message.starts_with("no module is called ")
                         message = message + ": a binding reaches Sysl's standard library and the Sysl packages the manifest names in `sysl-dependencies`"
+                    // A closure Sysl takes as a `&sync Fn` may be called from any thread, which the
+                    // binding's parameter has to say.
+                    if message.contains("shared between two domains") && message.contains("avin.rt.Callback")
+                        message = "Sysl may call the function it is given from another thread, so the parameter that takes it is marked `@threaded`"
+                    message = callback_parameter_message(message)
                     var r = report()
                     r.add(error(b.span, s"the Sysl binding `${b.name}` does not match `${b.target}`: $message"))
                     rendered = rendered + r.render(units[b.unit].src)
