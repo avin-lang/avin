@@ -310,16 +310,16 @@ the order it sorts as time:
 | `Time` | `09:30:00`, `09:30:07.25` |
 | `DateTime` | `2026-03-08T09:30:00` |
 | `Zoned` | `2026-03-08T09:00:00-04:00[America/Toronto]`; a fixed zone does not name itself again: `…T14:30:00Z`, `…T20:00:00+05:30` |
-| `Duration` | `1h 30m`, `-45s`, `0s`, `2h 1m 30s`, `250ms`, `1500us`, `50h` |
+| `Duration` | `5400s`, `-45s`, `0s`, `90.5s`, `250ms`, `1.5ms`, `7us` |
 | `Period` | `1y 2mo 3d`, `14d`, `0d` |
 | `Zone` | `America/Toronto` |
 | `Weekday` | `Wednesday` |
 
 The seconds are always written and the fraction only when there is one, without trailing zeros, so
 a column of readings has one shape until something below the second appears. A duration is written
-for a person, in hours, minutes and seconds with the part below a second in whole milliseconds or
-otherwise microseconds; a period keeps months and days apart. `Debug` writes a duration as
-`Duration(1h 30m)`, a period as `Period(1y 2mo)` and a zone as `Zone(America/Toronto)`, and every
+in the largest of `s`, `ms` and `us` that gives it a whole part, with the rest as a decimal fraction
+without trailing zeros, as it is today; a period keeps months and days apart. `Debug` writes a
+duration as `Duration(90.5s)`, a period as `Period(1y 2mo)` and a zone as `Zone(America/Toronto)`, and every
 other type as its display.
 
 ### Parsing

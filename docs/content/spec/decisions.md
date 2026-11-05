@@ -3419,15 +3419,8 @@ their words are reserved.
 
   **Review with the user**: writers of scalars only.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-**[Dates and times](/spec/time/)** (branch `datetime-design`, 2026-11-05), the choices the design
-makes beyond the user's settled entry. Where the slate design leaves a name open, the names follow the
+- Settled on the user's delegation 2026-11-05: **[Dates and times](/spec/time/)** (branch
+`datetime-design`), the choices the design makes beyond the user's settled entry. Where the slate design leaves a name open, the names follow the
 widely used date/time library family of Avin's reference standard library ecosystem (`atZone`,
 `plusDays`, `withYear`, `toInstant`, `isBefore`, `toMinutes`), except where a slate or a simpler
 spelling is better, as each entry says.
@@ -3478,11 +3471,12 @@ spelling is better, as each entry says.
   between two zones' readings of one instant is decided by the zone names.
 - **Text.** ISO 8601 with `T`, the seconds always written, the fraction only when there is one and
   without trailing zeros (slate's), years outside `0`–`9999` signed; a fixed zone's `Zoned` writes no
-  bracketed name. A duration writes as slate's `1h 30m`, `250ms`, `1500us`, `0s`; a period as
-  `1y 2mo 3d`. *Why*: one shape per column, and a duration written for a person. *Alternatives*:
-  Sysl's renderers (a space for `T`, seconds dropped when zero), today's `WallTime` form with six
-  fraction digits always, today's `1.5ms`/`90.5s` duration form. **Review with the user**: changes
-  the text of every duration the library prints today.
+  bracketed name. A duration keeps the form the user settled on 2026-11-04, its largest unit of `s`,
+  `ms` and `us` (`90.5s`, `1.5ms`); a period writes as `1y 2mo 3d`. *Why*: one shape per column; the
+  duration form is the user's own decision, which a delegated choice does not overturn.
+  *Alternatives*: Sysl's renderers (a space for `T`, seconds dropped when zero), today's `WallTime`
+  form with six fraction digits always, slate's `1h 30m` duration form (the design agent's
+  proposal). **Review with the user**: whether durations should move to slate's `1h 30m` form.
 - **Parsing.** `parseDate`, `parseTime`, `parseDateTime`, `parseTimestamp` and `parseZoned`, each a
   `Result` with `TimeParseError` (`BadShape(text, at)`, `OutOfRange(text, field)`,
   `Trailing(text, at)`, `UnknownZone(text, name)`, `at` a byte offset), every display read back,
@@ -3511,6 +3505,13 @@ spelling is better, as each entry says.
   overloads taking one beside their milliseconds; a command's deadline is a `monotonic()` reading;
   actor timers keep the runtime's monotonic microseconds and their `Duration` parameters.
   *Alternatives*: leaving the millisecond forms alone.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
 
 ## Open
 

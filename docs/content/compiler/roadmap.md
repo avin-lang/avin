@@ -88,7 +88,7 @@ gap to report, not to route around.
 - *Durations*: `2.hours() == hours(2)` on an `int` and a `long` receiver; `(hours(1) + minutes(30))
   .toMinutes() == 90`; `seconds(-90).toMinutes() == -1`; the parts of a negative duration;
   `Duration.Min.abs()`, `hours(long.MaxValue)`, `Duration.Max + micros(1)`, `d / 0` trap; `3 * d`
-  rejected; the displays `1h 30m`, `-45s`, `0s`, `2h 1m 30s`, `250ms`, `1500us`, `50h`, and the
+  rejected; the displays `5400s`, `-45s`, `0s`, `90.5s`, `250ms`, `1.5ms`, `7us`, and the
   `Debug` forms; `Ord` and `Hash` as `TreeMap` and `Map` keys.
 - *Instants*: `epochSeconds(0)` displays `1970-01-01T00:00:00Z`; `epochMillis(1000).epochSeconds()
   == 1`; `epochMillis(-1).epochSeconds() == -1`; `epochMicros(1_000_000_001)` keeps its last digit;
