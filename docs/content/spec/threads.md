@@ -340,7 +340,7 @@ blocking binding, a sleep. On a worker of a pool, the pool counts it as waiting 
 exactly as it counts one in `await`, so a full pool whose workers all wait on a channel still runs
 the task that fills it. A `blocking` inside another, or an `await` inside one, is counted once; on a
 thread of no pool, `body` simply runs. **`sleep(d: Duration)`** pauses the calling thread for at
-least `d` (from [`avin.time`](/spec/system-library/#avin-time)), safe for the collector while it
+least `d` (from [`avin.time`](/spec/time/)), safe for the collector while it
 sleeps; a duration of zero or less returns at once. A worker that sleeps keeps its place, and
 `blocking(sleep(d))` gives it up.
 

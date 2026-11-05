@@ -345,44 +345,19 @@ for name in fs.listDir(dir)?
 
 ## `avin.time`
 
-Measuring time and reading the clock. Every quantity is a count of whole microseconds, held in a
-`long`; arithmetic that leaves its range, about 292,000 years, traps like any integer overflow.
-
-**Three types, two clocks.** A `Duration` is a length of time, negative, zero or positive. An
-`Instant` is a reading of the **monotonic** clock, which only moves forward and starts from an origin
-that means nothing: one reading answers nothing, and the difference of two is the time between them.
-A `WallTime` is a reading of the **wall** clock, as a `Duration` since 1970-01-01T00:00:00 UTC, which
-anyone may set, so two readings may differ by a negative amount. The clocks are different types, so a
-reading of one is never taken from a reading of the other: measure with `Instant`, stamp with
-`WallTime`.
+Clocks, lengths of time, the calendar and time zones, in eight types: `Instant` (a point on the
+timeline), `Duration` (an exact length), `Date`, `Time` and `DateTime` (calendar readings with no
+zone), `Zone`, `Zoned` (a reading in a zone) and `Period` (months and days). `now()` reads the wall
+clock as an `Instant`; `monotonic()` reads the monotonic clock as a `Duration`, so an elapsed time is
+`monotonic() - start`. The module has a chapter of its own: [dates and times](/spec/time/).
 
 ```text
 import avin.time
 
-val start = time.now()
+val start = time.monotonic()
 work()
-println(s"took ${start.elapsed()}")
+println(s"took ${time.monotonic() - start}")
 ```
-
-**Making durations.** `microseconds`, `milliseconds`, `seconds`, `minutes` and `hours` each take a
-`long` count; `zero()` is the empty duration. `inMilliseconds`, `inSeconds` and `inMinutes` answer
-whole units, a fraction dropped toward zero, and `inSecondsReal` the seconds with their fraction.
-Durations add, subtract and negate with `+`, `-` and unary `-` (they implement `Add`, `Sub` and
-`Neg`), and `d * n` and `d / n` scale one by a `long`, a remainder dropped toward zero; `abs()`
-drops the sign and `isNegative()` asks it.
-
-**Readings.** `now()` reads the monotonic clock and `wallClock()` the wall clock; `fromEpoch(d)`
-makes the wall-clock time `d` after the start of 1970. On an `Instant`, `elapsed()` is the time from
-it to now, `later - earlier` (or `later.since(earlier)`) the time from another reading, and
-`start + d` and `start - d` move it by a duration; a `WallTime` has the same `+`, `-` and `since`, and
-the `sinceEpoch` duration. These are [operator methods](/spec/operators-and-control-flow/#methods-named-by-symbols)
-of the reading types, so a reading of one clock less a reading of the other does not compile.
-
-**Order, equality and text.** All three types compare by value and are ordered, so `<`, `==` and
-`max` work on them. A duration displays in the largest of `us`, `ms` and `s` it fills, with its fraction
-and no trailing zeros: `3us`, `1.5ms`, `90.5s`, `-500ms`, and an hour as `3600s`; its `Debug` form wraps that as `Duration(1.5ms)`.
-A `WallTime` displays as an ISO 8601 UTC timestamp with microseconds, `2026-11-04T12:34:56.000045Z`,
-in the proleptic Gregorian calendar.
 
 ## `avin.math`
 

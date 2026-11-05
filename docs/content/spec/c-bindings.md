@@ -988,7 +988,7 @@ class Consumer
 
     run() -> Result[unit, MltError] =
         startRaw().mapErr(code -> Failed("mlt_consumer_start", code))?
-        while isStoppedRaw() == 0 do threads.sleep(time.milliseconds(10))
+        while isStoppedRaw() == 0 do threads.sleep(time.millis(10))
         stopRaw().mapErr(code -> Failed("mlt_consumer_stop", code))
 
 @c("mlt_consumer mlt_factory_consumer(mlt_profile profile, const char *service, const char *input)",

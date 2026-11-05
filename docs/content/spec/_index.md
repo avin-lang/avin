@@ -49,7 +49,8 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
 | [Operators and control flow](/spec/operators-and-control-flow/) | Operators, blocks, `if`, `while`, `match` |
 | [Call-by-name](/spec/by-name/) | `value: -> T` parameters |
 | [Strings and formatting](/spec/strings-and-formatting/) | Interpolation and format specifiers |
-| [System library](/spec/system-library/) | `avin.process` — arguments, environment, exit; `avin.io` — `IoError`, standard input; `avin.fs` — files and directories; `avin.time`; `avin.math` — the elementary functions on `real`; `avin.random` — seeded and platform-seeded pseudo-random numbers; the environment, commands and pipelines, `Source`, `avin.net` (TCP, URLs, HTTP) and futures' additions |
+| [System library](/spec/system-library/) | `avin.process` — arguments, environment, exit; `avin.io` — `IoError`, standard input; `avin.fs` — files and directories; `avin.time` (its own chapter below); `avin.math` — the elementary functions on `real`; `avin.random` — seeded and platform-seeded pseudo-random numbers; the environment, commands and pipelines, `Source`, `avin.net` (TCP, URLs, HTTP) and futures' additions |
+| [Dates and times](/spec/time/) | `avin.time`: `Instant`, `Duration`, `Date`, `Time`, `DateTime`, `Zone`, `Zoned` and `Period`; the wall and monotonic clocks, calendar and zone arithmetic, ISO 8601 text and patterns |
 | [Regular expressions](/spec/regex/) | `avin.regex`: the pattern language, leftmost-first backtracking, `Regex`, `Match` and `MatchIterator`, replacing and splitting |
 | [Packages](/spec/packages/) | `avin.hocon`, dependencies, version selection, `avin.sum`, workspaces, `avin new` and `avin tidy`, features, members of a repository, vendoring and the standard library's modules |
 | [Derivation](/spec/derivation/) | Library-defined `derives`: shapes of data types and classes, `derive` templates, annotations, a JSON library written with them |
