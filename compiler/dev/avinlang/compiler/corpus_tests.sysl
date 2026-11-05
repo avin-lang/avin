@@ -21,6 +21,11 @@ import sysl.text.from_utf8_unchecked
 // `// args: ARG ...` line gives the program arguments, separated by spaces, an argument in double
 // quotes holding spaces or nothing at all.
 //
+// A test for a known bug keeps its correct expectations and carries a `// ignore: REASON` line, which
+// is required: the program is then neither compiled nor run, and the summary counts it apart and
+// prints it with its reason. In a program of many files the line goes in the main module (the other
+// expectation lines may be in any file, and so may this one).
+//
 // `examples/*.avin` are held to the same standard as `tests/run`, so every example shown to a
 // reader builds and does what its header says.
 //
@@ -49,11 +54,16 @@ private struct Expectation
     errors: Buf[string]
     env: Buf[Var]
     args: Buf[string]
+    ignored: bool
+    reason: string
 
 private expectation(text: string) -> Expectation
-    var e = Expectation(0, false, buf(), buf(), buf())
+    var e = Expectation(0, false, buf(), buf(), buf(), false, "")
     for line in text.split("\n")
-        if line.starts_with("// expect: exit ") then e.exit = parse_int(line["// expect: exit ".bytes.len..])
+        if line == "// ignore" || line.starts_with("// ignore:")
+            e.ignored = true
+            e.reason = if line.bytes.len > "// ignore:".bytes.len then line["// ignore:".bytes.len..].trim() else ""
+        elif line.starts_with("// expect: exit ") then e.exit = parse_int(line["// expect: exit ".bytes.len..])
         elif line == "// expect: trap" then e.trap = true
         elif line.starts_with("// error: ") then e.errors.push(line["// error: ".bytes.len..])
         elif line.starts_with("// env: ")
@@ -162,20 +172,55 @@ private expectation_text(src: Source) -> string =
 // A program's sidecars: `NAME.out` beside `NAME.avin`, or beside the directory `NAME`.
 private sidecar_base(path: string) -> string = if is_dir(path) then path else without_extension(path)
 
-// Runs every program in a directory; the failures, or "" when all passed.
-private run_all(tc: Toolchain, all: Buf[string]) -> string
+/** What a pass over a directory of programs found: the failure descriptions, how many programs
+ * passed and failed, and the ignored ones with their reasons. */
+private struct Tally
+    failures: string
+    passed: int
+    failed: int
+    ignored: Buf[string]
+
+private tally() -> Tally = Tally("", 0, 0, buf())
+
+// Counts one program's outcome: a failure description, or "" when it passed.
+private record(t: Tally, failure: string) -> Tally =
+    if failure == "" then Tally(t.failures, t.passed + 1, t.failed, t.ignored)
+    else Tally(t.failures + failure, t.passed, t.failed + 1, t.ignored)
+
+// Counts an ignored program, or fails one whose `// ignore:` line gives no reason.
+private record_ignored(t: Tally, path: string, want: Expectation) -> Tally =
+    if want.reason == "" then record(t, path + ": `// ignore:` needs a reason\n")
+    else
+        var list = t.ignored
+        list.push(path + ": " + want.reason)
+        Tally(t.failures, t.passed, t.failed, list)
+
+/** The summary line of a pass, which names the ignored programs beneath it. */
+private summary(label: string, t: Tally) -> string
+    var out = s"$label: ${t.passed} passed, ${t.failed} failed, ${t.ignored.len()} ignored\n"
+    for line in t.ignored
+        out = out + "  ignored " + line + "\n"
+    out
+
+// Prints the summary and fails the test when anything failed.
+private finish(label: string, t: Tally)
+    print(summary(label, t))
+    if t.failures != "" then panic(t.failures)
+
+// Runs every program in a directory.
+private run_all(tc: Toolchain, all: Buf[string]) -> Tally
     val scratch = make_temp_dir("avin-corpus").unwrap()
     defer _ = remove_dir_all(scratch)
-    var failures = ""
+    var t = tally()
     assert(all.len() > 0)
     for path in all
-        failures = failures + run_case(tc, path, scratch)
-    failures
+        val program = case_at(path)
+        val want = expectation(program.text)
+        t = if want.ignored then record_ignored(t, path, want) else record(t, run_case(tc, path, program, want, scratch))
+    t
 
 /** Runs one program at both optimization levels; a failure description, or "" when it passed. */
-private run_case(tc: Toolchain, path: string, scratch: string) -> string
-    val program = case_at(path)
-    val want = expectation(program.text)
+private run_case(tc: Toolchain, path: string, program: Case, want: Expectation, scratch: string) -> string
     val compiled = compile_case(tc, program)
     if compiled.diagnostics != "" then return path + ": did not compile:\n" + compiled.diagnostics
     val llvm = compiled.llvm.unwrap_or("")
@@ -214,32 +259,27 @@ private run_case(tc: Toolchain, path: string, scratch: string) -> string
 @test("every program in tests/run builds, exits and prints as expected at -O0 and -O2")
 corpus_runs()
     val tc = repository_toolchain()
-    val failures = run_all(tc, cases(tc, "tests/run"))
-    if failures != "" then panic(failures)
+    finish("tests/run", run_all(tc, cases(tc, "tests/run")))
 
 @test("every program of many modules in tests/programs/run builds, exits and prints as expected at -O0 and -O2")
 programs_run()
     val tc = repository_toolchain()
-    val failures = run_all(tc, program_cases(tc, "tests/programs/run"))
-    if failures != "" then panic(failures)
+    finish("tests/programs/run", run_all(tc, program_cases(tc, "tests/programs/run")))
 
 @test("every example builds, exits and prints as its header says at -O0 and -O2")
 examples_run()
     val tc = repository_toolchain()
-    val failures = run_all(tc, cases(tc, "examples"))
-    if failures != "" then panic(failures)
+    finish("examples", run_all(tc, cases(tc, "examples")))
 
 @test("every program in tests/reject fails to compile with the expected diagnostics")
 corpus_rejects()
     val tc = repository_toolchain()
-    val failures = reject_all(tc, cases(tc, "tests/reject"))
-    if failures != "" then panic(failures)
+    finish("tests/reject", reject_all(tc, cases(tc, "tests/reject")))
 
 @test("every program of many modules in tests/programs/reject fails to compile with the expected diagnostics")
 programs_reject()
     val tc = repository_toolchain()
-    val failures = reject_all(tc, program_cases(tc, "tests/programs/reject"))
-    if failures != "" then panic(failures)
+    finish("tests/programs/reject", reject_all(tc, program_cases(tc, "tests/programs/reject")))
 
 // The core library's own tests are a program of `@test` functions in `library/tests`, which `avin test`
 // runs as it runs any program's.
@@ -334,16 +374,101 @@ standard_error_keeps_order()
     assert(ended.ok())
     assert(read_text(dir + "/both.txt").unwrap() == "one\ntwo\nthree\nfour\nfive\n")
 
-private reject_all(tc: Toolchain, all: Buf[string]) -> string
-    var failures = ""
+private reject_all(tc: Toolchain, all: Buf[string]) -> Tally
+    var t = tally()
     assert(all.len() > 0)
     for path in all
         val program = case_at(path)
         val want = expectation(program.text)
+        if want.ignored
+            t = record_ignored(t, path, want)
+            continue
+        var failures = ""
         if want.errors.len() == 0 then failures = failures + s"$path: names no expected error\n"
         val compiled = compile_case(tc, program)
         if compiled.diagnostics == "" then failures = failures + s"$path: compiled\n"
         for message in want.errors
             if !compiled.diagnostics.contains(message)
                 failures = failures + s"$path: no `$message` in:\n${compiled.diagnostics}\n"
-    failures
+        t = record(t, failures)
+    t
+
+@test("an ignore line carries its reason, and combines with the other expectation lines")
+corpus_ignore_lines()
+    val want = expectation("// expect: exit 3\n// ignore:   known bug in tuples \n// env: A=b\n// error: x\nmain() = 0\n")
+    assert(want.ignored)
+    assert(want.reason == "known bug in tuples")
+    assert(want.exit == 3)
+    assert(want.env.len() == 1)
+    assert(want.errors.len() == 1)
+    assert(!expectation("main() = 0\n").ignored)
+    assert(expectation("// ignore:\n").ignored)
+    assert(expectation("// ignore:\n").reason == "")
+    assert(expectation("// ignore\n").reason == "")
+    assert(expectation("// ignore:   \n").reason == "")
+    assert(!expectation("// ignored: x\n").ignored)
+
+@test("an ignored program in a run directory is neither compiled nor run, and is counted and listed with its reason")
+corpus_ignored_run()
+    val tc = repository_toolchain()
+    val dir = make_temp_dir("avin-corpus-ign-run").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/broken.avin", "// expect: exit 0\n// ignore: tuples are wrong\nthis does not compile\n").unwrap()
+    write_text(dir + "/fine.avin", "main() = 0\n").unwrap()
+    val t = run_all(tc, cases_in(dir))
+    assert(t.failures == "")
+    assert(t.passed == 1)
+    assert(t.failed == 0)
+    assert(t.ignored.len() == 1)
+    assert(t.ignored[0] == dir + "/broken.avin: tuples are wrong")
+    val line = summary("tests/run", t)
+    assert(line.starts_with("tests/run: 1 passed, 0 failed, 1 ignored\n"))
+    assert(line.contains("ignored " + dir + "/broken.avin: tuples are wrong"))
+    write_text(dir + "/broken.avin", "// expect: exit 0\nthis does not compile\n").unwrap()
+    val again = run_all(tc, cases_in(dir))
+    assert(again.failed == 1)
+    assert(again.ignored.len() == 0)
+
+@test("an ignored program in a reject directory is not compiled, and one that would pass is ignored all the same")
+corpus_ignored_reject()
+    val tc = repository_toolchain()
+    val dir = make_temp_dir("avin-corpus-ign-rej").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/wrongly_ok.avin", "// error: some message\n// ignore: the checker accepts this\nmain() = 0\n").unwrap()
+    val t = reject_all(tc, cases_in(dir))
+    assert(t.failures == "")
+    assert(t.passed == 0)
+    assert(t.ignored.len() == 1)
+    write_text(dir + "/wrongly_ok.avin", "// error: some message\nmain() = 0\n").unwrap()
+    val again = reject_all(tc, cases_in(dir))
+    assert(again.failed == 1)
+
+@test("an ignore line anywhere in a program of many files ignores the whole program")
+corpus_ignored_program()
+    val tc = repository_toolchain()
+    val dir = make_temp_dir("avin-corpus-ign-prog").unwrap()
+    defer _ = remove_dir_all(dir)
+    make_dir_all(dir + "/one").unwrap()
+    write_text(dir + "/one/main.avin", "// expect: exit 0\n// ignore: imports across files are wrong\nthis does not compile\n").unwrap()
+    write_text(dir + "/one/other.avin", "also not a program\n").unwrap()
+    val ran = run_all(tc, program_cases_in(dir))
+    assert(ran.failures == "")
+    assert(ran.ignored.len() == 1)
+    assert(ran.ignored[0] == dir + "/one: imports across files are wrong")
+    val rejected = reject_all(tc, program_cases_in(dir))
+    assert(rejected.failures == "")
+    assert(rejected.ignored.len() == 1)
+
+@test("an ignore line with no reason is an error in both kinds of directory")
+corpus_ignore_needs_reason()
+    val tc = repository_toolchain()
+    val dir = make_temp_dir("avin-corpus-ign-none").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/bare.avin", "// error: x\n// ignore:\nmain() = 0\n").unwrap()
+    val ran = run_all(tc, cases_in(dir))
+    assert(ran.failed == 1)
+    assert(ran.ignored.len() == 0)
+    assert(ran.failures.contains("needs a reason"))
+    val rejected = reject_all(tc, cases_in(dir))
+    assert(rejected.failed == 1)
+    assert(rejected.failures.contains("needs a reason"))
