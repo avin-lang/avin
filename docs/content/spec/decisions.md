@@ -1508,7 +1508,15 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
-None at present.
+- **Text blocks under an interpolator that reads no escapes** ([text
+  blocks](/spec/strings-and-formatting/#text-blocks)). The parts `raw"""…"""` and a program's own
+  interpolators are given have the block's indentation and trailing blanks dropped but no escape
+  read, and since joining a line with `\` is an escape, no line joined: the `\` and the line break
+  after it reach the interpolator as written. `s` and `f` join lines in the lexer. A backslash
+  directly before a quote or a backslash is taken with it under every prefix, so `\"""` does not end
+  a `raw"""` block and `\\"""` does, as `raw"…"` does not end at `\"` and does at `\\"`.
+- **A block's first `"""` closes it** ([text blocks](/spec/strings-and-formatting/#text-blocks)),
+  so `""""` is the end of the block and a stray quote; a block ending in a quote writes it `\"`.
 
 ## Open
 

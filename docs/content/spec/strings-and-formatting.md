@@ -4,18 +4,59 @@ summary: String literals, interpolation as a method call on StringContext, user-
 weight: 22
 ---
 
-String literals and text blocks are written as Sysl's string reference describes them
-(`docs/content/reference/strings.md`). Interpolation, format specifiers and rendering are specified
-here.
+String literals are written as Sysl's string reference describes them
+(`docs/content/reference/strings.md`). Text blocks, interpolation, format specifiers and rendering
+are specified here.
 
 | Form | Meaning |
 | --- | --- |
 | `"…"` | Ordinary string with escapes |
 | `raw"…"` | Raw string, with no escape processing: a backslash is an ordinary character (`raw"C:\dir"`), though `\"` does not end the literal |
-| Text blocks | Multi-line literals with Sysl's indentation and line-joining rules |
+| `"""…"""` | Text block: a literal over several lines, its incidental indentation dropped ([below](#text-blocks)); every prefix composes with it, `s"""…"""` and `raw"""…"""` included |
 | `s"…"` | Interpolation: `$name`, `${expression}`, `$$` for a dollar sign, `$"` for a double quote |
 | `f"…"` | Formatted interpolation: a specifier after a hole (`${x}%08.3f`) |
 | `name"…"` | Any interpolator: a call of the method `name` on a `StringContext` |
+
+## Text blocks
+
+A literal that spans lines is written `"""` … `"""`. Its content begins on the line **after** the
+opening delimiter, which ends its line, so the column the block opens at plays no part in its value
+and a block reads the same at any depth. A block written on one line is an error.
+
+```text
+render() -> string
+    """
+    one
+      two
+    three
+    """
+// "one\n  two\nthree\n"
+```
+
+Three things happen to each line of a block that do not happen inside `"…"`:
+
+- **Its incidental indentation is dropped.** The strip is the least indentation of the lines that
+  carry content, together with that of the closing delimiter's line when the delimiter stands alone
+  on it, so the closing delimiter is the control: further left, the value keeps more indentation.
+  Lines holding only blanks say nothing about the strip and keep their line breaks. A tab and a space
+  are each one column.
+- **Its trailing blanks are dropped**, carriage returns among them, so whitespace nobody can see
+  never enters the value, and a file means the same with either line ending. Escapes are read after
+  the trimming, so a blank that is meant is written `\u{20}`.
+- **A `\` at the end of a line joins it to the next**, the blanks before it going with the line's
+  end, for data that must have no line breaks in its value.
+
+Whether the value ends with a line break needs no rule of its own: a closing delimiter alone on its
+line comes after the last line's break, and one written after content comes before any. A `"`, and
+`""`, are text inside a block; the first `"""` closes it, so a block cannot end with a quote except as
+the escape `\"`. An unterminated block is reported at its opening delimiter.
+
+**Every prefix composes with the quote form**: `s"""`, `f"""`, `raw"""` and any `name"""`. A prefix
+says how a literal is read, the quote form how it was written. Holes, `$$` and `$"` are as in
+`name"…"`, and a hole may span lines, which are then code rather than text. The parts an interpolator
+is given have the block's indentation and trailing blanks already dropped, and their escapes as
+written; since joining a line is an escape, `raw"""…"""` and every interpolator but `s` and `f`
+receive a `\` at a line's end and the line break after it as written.
 
 ## Format specifiers
 
