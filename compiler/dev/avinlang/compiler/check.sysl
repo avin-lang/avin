@@ -5774,19 +5774,49 @@ private names_self(t: &TypeExpr) -> bool
 /** The Sysl function a binding names: the string of its `@sysl` annotation, when it has one. */
 binding_target(f: &Function) -> Option[string]
     for a in f.annotations
-        if a.name == "sysl" && a.args.len() == 1
+        if a.name == "sysl" && a.args.len() >= 1 && a.args[0].name is None
             if a.args[0].value.kind is StringLit(path) then return Some(path)
     None
 
+/** Whether a binding's `@sysl` says its Sysl function may block, with the word `blocking` after the
+ * function's name: its shim marks the thread safe for the collector around the call. */
+is_blocking_binding(f: &Function) -> bool
+    for a in f.annotations
+        if a.name != "sysl" then continue
+        for arg in a.args
+            if is_blocking_word(arg) then return true
+    false
+
+private is_blocking_word(arg: AnnotationArg) -> bool
+    if arg.name is Some(_) then return false
+    arg.value.kind match
+        Name(word) -> word == "blocking"
+        _ -> false
+
+// The arguments of a function's `@sysl` after the Sysl function's name, or after none on a handle's
+// method bound by its own name: `blocking`, once and alone, and nothing else.
+private check_binding_flags(c: *Checker, unit: usize, a: Annotation, first: usize)
+    var blocking = false
+    for i in first..<a.args.len()
+        val arg = a.args[i]
+        if is_blocking_word(arg)
+            if blocking then c.note(unit, arg.value.span, "`@sysl` takes `blocking` once")
+            blocking = true
+        elif arg.name is Some(k) && k == "blocking"
+            c.note(unit, arg.value.span, "`blocking` is written alone, after the Sysl function's name: `@sysl(\"sysl.net.accept\", blocking)`")
+        else c.note(unit, arg.value.span, "`@sysl` takes the Sysl function's module and name, and after it only `blocking`, for a call that may wait: `@sysl(\"sysl.net.accept\", blocking)`")
+
 // A binding is a top-level function without a body whose `@sysl("module.path.name")` names a Sysl
-// function. Its parameters and result are boundary types, which the generated shim converts; a
-// binding with a wrong type is caught when Sysl checks the shim.
+// function, followed by `blocking` where the call may wait. Its parameters and result are boundary
+// types, which the generated shim converts; a binding with a wrong type is caught when Sysl checks
+// the shim.
 private check_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Type], result: Option[&Type], intrinsic: bool)
     for a in f.annotations
         if a.name != "sysl" then continue
         var path: Option[string] = None
-        if a.args.len() == 1 && a.args[0].name is None
+        if a.args.len() >= 1 && a.args[0].name is None
             if a.args[0].value.kind is StringLit(p) then path = Some(p)
+        if path is Some(_) then check_binding_flags(c, unit, a, 1)
         path match
             Some(p) ->
                 if !is_sysl_path(p) then c.note(unit, a.span, s"`@sysl` names a Sysl function by its module and name, as in `sysl.text.to_upper`; `$p` is not one")
@@ -5902,18 +5932,24 @@ private check_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
                         continue
                     if !bodyless then c.note(unit, a.span, "a method with a body is not bound to Sysl, so it takes no `@sysl`")
                     var name: Option[string] = None
-                    if a.args.len() == 1 && a.args[0].name is None
+                    if a.args.len() >= 1 && a.args[0].name is None
                         if a.args[0].value.kind is StringLit(p) then name = Some(p)
+                    // `@sysl(blocking)` binds a method that may wait to the Sysl method of its own
+                    // name's words.
+                    val own_name = name is None && a.args.len() >= 1 && (is_blocking_word(a.args[0]) || a.args[0].name is Some(_))
+                    if name is Some(_) then check_binding_flags(c, unit, a, 1)
+                    elif own_name then check_binding_flags(c, unit, a, 0)
                     name match
                         Some(p) ->
                             if !is_sysl_path("x." + p) || p.contains(".") then c.note(unit, a.span, s"`@sysl` on a handle's method names the Sysl method it is bound to, as in `@sysl(\"close\")`; `$p` is not one")
-                        None -> c.note(unit, a.span, "`@sysl` on a handle's method takes one string, the name of the Sysl method it is bound to, as in `@sysl(\"close\")`")
+                        None ->
+                            if !own_name then c.note(unit, a.span, "`@sysl` on a handle's method takes one string, the name of the Sysl method it is bound to, as in `@sysl(\"close\")`, or `blocking` alone where the method may wait")
 
 /** The Sysl method a bound method of a handle calls: the one its `@sysl("name")` names, or the one of
  * its own name's words in snake_case. */
 handle_method_name(f: &Function) -> string
     for a in f.annotations
-        if a.name == "sysl" && a.args.len() == 1
+        if a.name == "sysl" && a.args.len() >= 1 && a.args[0].name is None
             if a.args[0].value.kind is StringLit(name) then return name
     sysl_field_of(f.name)
 

@@ -111,12 +111,19 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
     put(&w, "module avin.shims\n\nimport avin.rt.{Context, stop_in_binding, text_bytes, text_length, text_of}\nimport sysl.raw.str_cast\n")
     if converts then put(&w, "import avin.rt.{Frame, allocate, array_elements, array_length, descriptor_of, new_array}\nimport sysl.raw.ptr_cast\nimport sysl.slices.copy\n")
     elif handles.len() > 0 then put(&w, "import sysl.raw.ptr_cast\n")
+    var blocks = false
+    // A handle's method that blocks and answers bytes copies them into a buffer of the shim's own.
+    var owns_bytes = false
+    for b in bindings
+        if b.blocking then blocks = true
+        if b.blocking && !(b.reach is TopLevel) && b.result.form is Bytes then owns_bytes = true
+    if blocks then put(&w, "import avin.rt.{enter_safe, leave_safe}\n")
     var collects = false
     for c in w.ins
         if c.form is Elements(_, _) then collects = true
     for c in w.outs
         if c.form is Elements(_, _) then collects = true
-    if collects then put(&w, "import sysl.buf.{Buf, buf}\n")
+    if collects || owns_bytes then put(&w, "import sysl.buf.{Buf, buf}\n")
     for i in 0..<bindings.len()
         // A handle's method is reached through the handle's import.
         if !(bindings[i].reach is TopLevel)
@@ -174,7 +181,7 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
             put(&w, "\n    release(s.r)\n")
             last.push(w.line - 1)
             continue
-        val callee = b.reach match
+        var callee = b.reach match
             Method(name) -> s"s.r.$name"
             _ -> s"bound_$i"
         // A result that holds a collection may be spelled with a slice or a `Buf`, and one that holds
@@ -182,6 +189,30 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
         // overloads of its conversion choose by it.
         var n = 0usize
         val spelled = spellings(&w, b.result, true, &n)
+        // A call that may wait is made with the thread safe for the collector, which may run, and
+        // free the handle's object, meanwhile: every argument is converted, and the handle's share
+        // of its Sysl value taken, before it, so the call reads no Avin object; and what it answers
+        // is converted once the thread is running again.
+        if b.blocking
+            put(&w, "\n")
+            var held: Buf[string] = buf()
+            for k in 0..<args.len()
+                if args[k] == "()"
+                    held.push("()")
+                    continue
+                put(&w, s"    val x$k = ${args[k]}\n")
+                held.push(s"x$k")
+            args = held
+            b.reach match
+                Method(name) ->
+                    // Bytes the method answers may be a view of the handle's value, which no local
+                    // may hold past the end of the safe region: they are copied, while the thread
+                    // is still safe, into a buffer bound before the value's share.
+                    if b.result.form is Bytes then put(&w, "    var owned: Buf[u8] = buf()\n")
+                    put(&w, "    val h = s.r\n")
+                    callee = s"h.$name"
+                _ -> ()
+            put(&w, "    enter_safe(ctx)\n")
         var call = callee + "("
         for k in 0..<args.len()
             if k > 0 then call = call + ", "
@@ -190,10 +221,20 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
         // A handle's method may answer a view of the handle's Sysl value, which Sysl lets no local
         // hold across a call that may free the value, as the conversion's allocation may: the
         // conversion takes the answer where the call gives it.
-        val direct = receiver is Some(_) && !(b.result.form is Plain)
+        val direct = receiver is Some(_) && !(b.result.form is Plain) && !b.blocking
         // An integer result takes any Sysl integer, converted with a check as a mirror's field is.
         val integral = *b.result.ty is Int(_)
-        if integral
+        if b.blocking
+            if integral
+                val side = sysl_side(b.result.ty)
+                put(&w, s"    val raw = $call\n    leave_safe(ctx)\n    val r: $side = integer_to(ctx, raw, \"$side\")\n")
+            // The bytes are copied before the thread leaves the safe region, touching only Sysl
+            // memory.
+            elif receiver is Some(_) && b.result.form is Bytes
+                put(&w, s"    owned.extend($call)\n    leave_safe(ctx)\n    val r = owned.view()\n")
+            elif spelled.len() == 1 && n == 0 then put(&w, s"    val r: ${spelled[0]} = $call\n    leave_safe(ctx)\n")
+            else put(&w, s"    val r = $call\n    leave_safe(ctx)\n")
+        elif integral
             val side = sysl_side(b.result.ty)
             put(&w, s"\n    val r: $side = integer_to(ctx, $call, \"$side\")\n")
         elif !direct
