@@ -128,15 +128,17 @@ so the check is made once, where the type is named, and never at a send:
 | a class with no `var` field, whose fields are all sendable, and which is not `open` or `abstract`; an `object` likewise | deeply immutable: no code can change it, and a subclass cannot add a `var` |
 | a trait declared `: Sendable` | every type implementing it is checked to be sendable, at its `impl` or declaration |
 | `ActorRef[M]`, `Behaviour[M]`, `Future[T]` and `Promise[T]` of a sendable `T` | made to be handed between threads |
-| `Channel[T]` and `Atomic[T]` of a sendable `T`, `Mutex[T]` of any `T`, `Once` | synchronization: every access is synchronized, and a mutex's value is reached only under its lock, so a mutex is the one deliberate door to shared mutable state |
+| `Channel[T]` and `Atomic[T]` of a sendable `T`, `Mutex[T]` of any `T`, a mutex's `Condition`, `Once` | synchronization: every access is synchronized, and a mutex's value is reached only under its lock, so a mutex is the one deliberate door to shared mutable state |
+| `Thread[T]` of a sendable `T`, an `Executor` | joining a thread and giving an executor work are synchronized |
 | a [Sysl handle](/spec/sysl-bindings/#handles) | sent by handing over its ownership, checked when it is used (below) |
 | `Isolated[T]` | an object graph nothing else reaches (below) |
 
 **Not sendable**: `Array`, `Buffer`, `Deque`, the mutable maps and sets, a class with a `var` field
 or a field that is not sendable, an `open` or `abstract` class, a [machine](#state-machines), a
-function value, and `Any`. A function value is not sendable because its type does not say what it
-captures, and a captured `var` is shared with the scope that made it. The error names the part that
-is not sendable:
+thread `Scope`, a function value, and `Any`. A function value is not sendable because its type does
+not say what it captures, and a captured `var` is shared with the scope that made it; a closure
+given to another thread is checked instead by what it captures, where it is written ([what is
+shared](/spec/threads/#what-is-shared)). The error names the part that is not sendable:
 
 ```text
 error: `JobMsg` cannot be sent between actors: its variant `Fill` holds a `Buffer[byte]`, which is mutable; send an immutable copy (`toVector`), or the buffer as an `Isolated[Buffer[byte]]`

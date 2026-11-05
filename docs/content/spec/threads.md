@@ -20,10 +20,13 @@ main() -> int
     worker.join() + mine
 ```
 
-- `spawn[T](body: () -> T, stack: long = 8388608) -> Thread[T]` starts `body` on a new operating
-  system thread with a stack of its own (8 MiB unless asked otherwise). `join() -> T` waits for it
+- `spawn[T: Sendable](@sendable body: () -> T, stack: long = 8388608) -> Thread[T]` starts `body`
+  on a new operating system thread with a stack of its own (8 MiB unless asked otherwise). The body
+  captures only sendable values, and its result is sendable ([what is shared](#what-is-shared)).
+  `join() -> T` waits for it
   and gives back the result; joining a second time gives the same result again. Any thread may
-  join, several at once: one waits for the thread and the others wait for that one. A `Thread` is
+  join, several at once: one waits for the thread and the others wait for that one, and a `Thread`
+  is itself sendable. A `Thread` is
   collected like any other object once nothing reaches it; a thread that is never joined keeps its
   stack until the program ends. A thread that overflows its own stack traps with `stack overflow`
   like any other thread's trap.
@@ -36,27 +39,66 @@ main() -> int
 - A library scope makes the joins structural: `scope(s -> …)` returns its body's result only once
   every thread started through `s.spawn` has finished. `s.spawn` takes the same arguments as
   `spawn` and is called by the thread that runs the scope's body, while the scope is open; a call
-  from another thread, or after the scope has returned, traps. A thread the scope started that
-  starts more uses a scope of its own.
+  from another thread, or after the scope has returned, traps. A `Scope` is not sendable, so a
+  thread the scope started cannot reach it; one that starts more uses a scope of its own.
 
 ```avin
-import avin.threads.scope
+import avin.threads.{Atomic, scope}
 
 main() -> int
-    val parts = Array.fill(4, 0)
+    val parts = (0..<4).map(_ -> Atomic(0)).toVector()
     scope(s ->
         for i in 0..<4
-            s.spawn(() -> parts(i) = (i + 1) * 10))
-    parts(0) + parts(1) + parts(2) + parts(3)
+            s.spawn(() -> parts(i).store((i + 1) * 10)))
+    parts.map(p -> p.load()).sum()
 ```
 
 ## What is shared
 
 The heap is shared: every object is reachable from every thread that is handed a reference to it.
-Module-level `val`s, `var`s and `object`s are shared by all threads. A closure's captured `var`
-lives in a box on the heap, so a closure run on another thread shares it with the scope that made
-it. Nothing is copied when a thread starts; the closure and what it captures are simply reachable
-from the new thread too.
+Nothing is copied when a thread starts; the closure and what it captures are simply reachable from
+the new thread too. **So what a thread is given is checked**: a closure that runs on another thread
+captures only [sendable](/spec/actors/#what-may-be-sent) values and no `var`, and the value it gives
+back is sendable. The threads then share nothing mutable but through the synchronized types, a
+`Mutex`, an `Atomic`, a `Channel`, a `Once` and a `Condition`, and the module-level state below. The
+error names what is captured and why it cannot be:
+
+```text
+error: what is passed for `body` of `spawn` may use only sendable values from around it, but it uses `parts`, an `Array[int]`, which is mutable; an immutable copy (`toVector`) is sendable
+```
+
+A captured `var` lives in a box on the heap that the closure would share with the code that made
+it, so it is never captured for another thread, whatever its type: the closure copies it into a
+`val` first, or the two share an `Atomic`. A closure is checked by what it captures, the closures
+it makes and the local functions it calls included; a method value captures its object, so
+`spawn(counter.tick)` needs a sendable `counter`; and a by-name body, as `Future(body)` takes, is a
+closure too. A function value held in a `val` is not sendable, since its type does not say what it
+captures: the closure is written where it is passed.
+
+**The checks are two marks on a parameter, which any function may use.** What is passed for an
+**`@isolated`** parameter may use only sendable values from around it: a closure captures only
+sendable values (a `var` among them, where its type is sendable), and any other expression reads
+only sendable locals and parameters; what it makes itself is its own. Nothing outside therefore
+reaches a mutable value it makes or is given. A **`@sendable`** parameter asks that, and that a
+closure captures no `var`, since it may run on another thread while the code that made it goes on.
+Inside the function, a parameter so marked that holds a function may be passed on for a parameter
+with the same mark or a weaker one; an unmarked one may not, and the error says to mark it. A
+method that overrides or implements another marks no parameter more strongly than the method it
+overrides does, since a call through that method would not check what is passed.
+
+```avin
+import avin.threads.spawn
+
+background[T: Sendable](@sendable body: () -> T) -> T = spawn(body).join()
+```
+
+`spawn` and `s.spawn` take their body `@sendable`, as do `Future(body)`, `ex.future(body)`, a
+future's `map`, `flatMap` and `onComplete` and the `orElse` of a future of a `Result`, whose
+functions run on a pool thread. A mutex's value and the body of its `with` are `@isolated`
+([synchronization](#synchronization)).
+
+Module-level `val`s, `var`s and `object`s are shared by all threads, and a body may reach them
+through the functions it calls.
 
 A [Sysl handle](/spec/sysl-bindings/#handles) is the exception: it belongs to one owner at a time,
 and a use by any other code traps. The handles a thread's body or a future's body reaches move to
@@ -67,13 +109,19 @@ will own its handles across every message, whichever thread runs it.
 
 `avin.threads` offers, all written in Avin over Sysl's atomics and futex-based locks:
 
-- **`Mutex[T](value)`**, which owns the value it guards. `m.with(v -> …)` takes the lock, runs the
+- **`Mutex[T](value)`**, which owns the value it guards, and is sendable whatever `T` is.
+  `m.with(v -> …)` takes the lock, runs the
   body with the value and lets the lock go when the body returns, giving back what it returned; it
-  is the way to a mutable value, such as a `Buffer`, which the body changes in place. For an
-  immutable value, `get()` reads it, `set(v)` replaces it and `update(f)` replaces it with `f` of it
+  is the way to a mutable value, such as a `Buffer`, which the body changes in place. So that
+  nothing reaches the value but under the lock, `value` is `@isolated`, made in the argument
+  (`Mutex(Buffer[int]())`, not a buffer the caller keeps), and so is the body, whose result is
+  sendable: `with[R: Sendable](@isolated body: (T) -> R) -> R`. A body may read and assign the
+  caller's `var`s of sendable types, since it runs at once on the calling thread. For a sendable
+  value, `get()` reads it, `set(v)` replaces it and `update(f)` replaces it with `f` of it
   under the lock, giving back the new value. A mutex is not reentrant: a thread that takes one it
   already holds, from inside a body, would wait for ever, so it traps instead.
-- **`Condition`**, made by a mutex's `condition()` and waited for inside that mutex's `with`.
+- **`Condition`**, made by a mutex's `condition()` and waited for inside that mutex's `with`; like
+  its mutex, it is sendable.
   `wait()` lets the mutex go while it sleeps and holds it again before it returns; `notify()` wakes
   one waiting thread and `notifyAll()` every one. A wait may end with nothing having changed, so the
   state is checked again in a loop. `waitFor(timeoutMillis: long) -> bool` waits at most that many
@@ -84,7 +132,8 @@ will own its handles across every message, whichever thread runs it.
   trapping on overflow, as `+` and `-` do, before anything is stored. Every operation is
   sequentially consistent; there are no weaker orderings in the library. `int`, `long`, `bool` and
   references are the types it is for, and it holds any type: a value of one word is accessed
-  lock-free, an integer wider than 64 bits under a lock the runtime keeps for them. A
+  lock-free, an integer wider than 64 bits under a lock the runtime keeps for them; an atomic
+  reaches another thread only where its value is sendable, as a `Channel` does. A
   compare-and-set of a reference to an object of a class compares identity, as `===` does (even for
   a class that derives `Eq`), and of a function value likewise, so a reference held in an `Atomic`
   is also kept alive by it. A compare-and-set of a scalar compares the value (a `real`, its bits).
@@ -136,7 +185,9 @@ taking a lock it already holds: threads that each wait for another sleep for eve
 
 A `Future[T]` is a value some thread is computing. `Future(body)` runs `body` on a shared pool of
 worker threads and gives back the future of its result at once; the body is a by-name argument, so
-it is written in place or as a trailing block:
+it is written in place or as a trailing block. Its value is sendable, as a thread's result is, and
+the body, like the functions of `map`, `flatMap` and `onComplete`, is `@sendable`:
+`apply[T: Sendable](@sendable body: -> T) -> Future[T]`.
 
 ```avin
 import avin.threads.Future
@@ -171,7 +222,7 @@ main() -> int
   goes on to the future `other` gives only where this one ended in `Err`: `other` is by-name, so it
   is not even evaluated after an `Ok`, and its value may widen to a supertype as `Result.orElse`'s
   does. A trap inside a body stops the program, as it does in any thread.
-- **A `Promise[T]()`** is completed by another thread: its `future` field is the future it completes,
+- **A `Promise[T]()`**, of a sendable `T`, is completed by another thread: its `future` field is the future it completes,
   `complete(x)` completes it and traps where it is already complete, and `tryComplete(x) -> bool`
   completes it only where nothing has yet, answering whether it did, for threads that race to give
   the value. Every thread waiting on the future wakes with the value.
@@ -215,6 +266,7 @@ executor it was made on**, so a chain begun on an executor stays there. `Executo
 pool `Future(body)` uses; `Future.successful`, `Future.all`, `Future.first`, `Future.traverse` and a
 promise's future belong to it.
 
+An executor is sendable, so a body on one thread may give work to an executor another made.
 `ex.shutdown()` lets the workers end once the queued work is done, and `isShutdown()` asks. A new
 body given to an executor after its shutdown traps, but the functions of futures already made on it
 still run there, on a worker started for them where none is left, so no future made before is

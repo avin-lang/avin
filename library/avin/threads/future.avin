@@ -22,7 +22,7 @@ private processors() -> long
 // therefore never leaves the pool without a thread to run that future, however deep the waits nest.
 // The workers are never joined: the program ends when `main` returns, whatever they are doing. Once
 // shut down, a worker that finds no task left ends.
-private class Pool(private val target: int)
+private class Pool(private val target: int): Sendable
     private val lock = Lock()
     private val work = Condition(lock)
     private val tasks = Deque[() -> unit]()
@@ -166,7 +166,7 @@ blocking[T](body: -> T) -> T
     v
 
 // Runs `body` on `p` and gives back the future of what it returns.
-private startOn[T](p: Pool, body: () -> T) -> Future[T]
+private startOn[T: Sendable](p: Pool, @sendable body: () -> T) -> Future[T]
     val cell = Cell[T]()
     p.submit(() ->
         cell.complete(body())
@@ -271,11 +271,11 @@ class Future[T](private val cell: Cell[T], private val home: Pool)
     value() -> Option[T] = cell.peek()
 
     // Runs `f` with the value on a thread of this future's executor once it is there.
-    onComplete(f: (T) -> unit) = cell.whenDone(v -> home.submit(() -> f(v)))
+    onComplete(@sendable f: (T) -> unit) = cell.whenDone(v -> home.submit(() -> f(v)))
 
     // The future of `f` of the value, which runs on a thread of this future's executor once the value
     // is there.
-    map[U](f: (T) -> U) -> Future[U]
+    map[U: Sendable](@sendable f: (T) -> U) -> Future[U]
         val next = Cell[U]()
         cell.whenDone(v -> home.submit(() ->
             next.complete(f(v))
@@ -284,7 +284,7 @@ class Future[T](private val cell: Cell[T], private val home: Pool)
 
     // The future of the value of the future `f` gives for the value; `f` runs on a thread of this
     // future's executor once the value is there.
-    flatMap[U](f: (T) -> Future[U]) -> Future[U]
+    flatMap[U](@sendable f: (T) -> Future[U]) -> Future[U]
         val next = Cell[U]()
         cell.whenDone(v -> home.submit(() ->
             f(v).cell.whenDone(u ->
@@ -302,33 +302,33 @@ class Future[T](private val cell: Cell[T], private val home: Pool)
 
 // A future of a computation that can fail is composed through its `Ok` values: an `Err` passes
 // through every step unchanged.
-impl[T, E] Future[Result[T, E]]
+impl[T: Sendable, E: Sendable] Future[Result[T, E]]
     // The future of `f` of the `Ok` value, or of the `Err` as it was.
-    mapOk[U](f: (T) -> U) -> Future[Result[U, E]] = map(r -> r.map(f))
+    mapOk[U: Sendable](@sendable f: (T) -> U) -> Future[Result[U, E]] = map(r -> r.map(f))
 
     // The future `f` gives for the `Ok` value, or the `Err` as it was.
-    flatMapOk[U](f: (T) -> Future[Result[U, E]]) -> Future[Result[U, E]] = flatMap(r -> r match
+    flatMapOk[U: Sendable](@sendable f: (T) -> Future[Result[U, E]]) -> Future[Result[U, E]] = flatMap(r -> r match
         Ok(v) -> f(v)
         Err(e) -> Future.successful(Err(e)))
 
     // The future of the `Ok` value as it was, or of `f` of the `Err`: a failure turned into another.
-    mapErr[F](f: (E) -> F) -> Future[Result[T, F]] = map(r -> r.mapErr(f))
+    mapErr[F: Sendable](@sendable f: (E) -> F) -> Future[Result[T, F]] = map(r -> r.mapErr(f))
 
     // The future of the `Ok` value as it was, or, where this one ended in `Err`, the future `other`
     // gives; `other` is evaluated only then, on a thread of this future's executor.
     //
     //     val page = fetch(primary).orElse(fetch(mirror))
-    orElse[U >: T, F](other: -> Future[Result[U, F]]) -> Future[Result[U, F]]
+    orElse[U >: T: Sendable, F: Sendable](@sendable other: -> Future[Result[U, F]]) -> Future[Result[U, F]]
         flatMap[Result[U, F]](r -> r match
             Ok(v) -> Future.successful[Result[U, F]](Ok(v))
             Err(_) -> other)
 
 object Future
     // Runs `body` on the shared pool and gives back the future of what it returns.
-    apply[T](body: -> T) -> Future[T] = startOn(pool, () -> body)
+    apply[T: Sendable](@sendable body: -> T) -> Future[T] = startOn(pool, () -> body)
 
     // A future already complete with `x`.
-    successful[T](x: T) -> Future[T]
+    successful[T: Sendable](x: T) -> Future[T]
         val cell = Cell[T]()
         cell.complete(x)
         Future(cell, pool)
@@ -386,10 +386,12 @@ object Future
 //     val io = Executor.fixed(4)
 //     val pages = urls.map(u -> io.future(fetch(u)))
 //     io.shutdown()
-class Executor(private val p: Pool, private val isShared: bool)
+//
+// An executor may be shared between threads: giving it work and shutting it down are synchronized.
+class Executor(private val p: Pool, private val isShared: bool): Sendable
     // Runs `body` on this executor and gives back the future of what it returns; traps after
     // `shutdown`.
-    future[T](body: -> T) -> Future[T]
+    future[T: Sendable](@sendable body: -> T) -> Future[T]
         if p.isShutdown() then fail("an executor is given work after its shutdown")
         startOn(p, () -> body)
 
@@ -421,7 +423,7 @@ impl[T: Sendable] Sendable for Promise[T]
 //     val reply = Promise[string]()
 //     spawn(() -> reply.complete(answer()))
 //     println(reply.future.await())
-class Promise[T]()
+class Promise[T: Sendable]()
     private val cell = Cell[T]()
 
     // The future this promise completes.

@@ -1866,7 +1866,52 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- Proposed 2026-11-05 (built on branch `sendable-spawn`): **`Sendable` where values cross threads
+  today** ([what is shared](/spec/threads/#what-is-shared)). The actors chapter's build order has no
+  step for it; it applies the rule of `isolate`'s body, less the whole-program half, to threads and
+  futures. Review with the user: it adds two annotations users can write.
+  - The check is two marks on a parameter, `@sendable` and `@isolated`, which any function may
+    write. What is passed for `@isolated` may use only sendable values from around it: a lambda, a
+    by-name argument, a local function or a method value by what it captures (its nested closures
+    and the local functions it calls included), any other expression by the locals and parameters it
+    reads; what it makes itself is its own. `@sendable` adds that a closure captures no `var`, whose
+    box it would share with the code that made it. A marked parameter holding a function may be
+    passed on for one with the same mark or a weaker one; an override may not add a mark or
+    strengthen one. *Why*: the library's thread entries are ordinary Avin functions, so a user's
+    wrapper of `spawn` needs the same spelling the library uses, and a mark on the parameter checks
+    every call where the closure is written and its captures are known. *Alternatives*: a list of
+    library functions known to the compiler (no user wrapper could pass a body on); a function type
+    that says it is sendable (`() -> T` that is `Sendable`), which would also let a sendable function
+    be stored and sent, but makes function types carry a flag through unification and subtyping
+    (the open question on function values below stays open); no check, leaving the data race the
+    memory model already makes harmless (the user's direction is that threads share nothing mutable
+    by default).
+  - The bodies of `spawn`, `s.spawn`, `Future(body)` and `ex.future(body)`, the functions of a
+    future's `map`, `flatMap` and `onComplete`, and `orElse`'s by-name argument are `@sendable`.
+    Their results are bounded by `Sendable`, as are `Future.successful`'s value, a `Promise`'s and
+    the results of `mapOk` and `mapErr`, so every future's value is sendable however it was made.
+    *Alternative*: bounding `Future[T]` itself, which would make every generic function naming a
+    future repeat the bound.
+  - A `Mutex` is sendable of any value, so its value is `@isolated` where it is made (a buffer the
+    caller keeps cannot be guarded), `with` is `with[R: Sendable](@isolated body: (T) -> R) -> R`
+    (the value cannot be returned or stored outside), and `get`, `set` and `update` exist only for a
+    sendable value. A `with` body may assign the caller's `var`s of sendable types, since it runs at
+    once on the calling thread. *Why*: without it, `Mutex(b)` or `m.with(v -> v)` hands the guarded
+    buffer to code that changes it without the lock, which is the shared mutable state the mutex is
+    the one door to. *Alternatives*: `Mutex` of any value unchecked, as written before; checking only
+    `with`'s result. The cost: a body cannot give back a fresh mutable value (`nextBytes` on the
+    shared random generator copies through a vector), and a generic body over an unbounded `T`
+    cannot take its argument in (the shared generator's `shuffle`, `choose` and `chooseWeighted`
+    now draw under the lock and pick outside it, with the same draws). Review with the user.
+  - The standard library promises `Sendable` for `Thread[T]` of a sendable `T`, `Executor`, a
+    mutex's `Condition`, and `TcpStream` and `TcpListener`, which hold a Sysl handle and are handed
+    over with it. A `Scope` is not sendable, so the trap on starting a scope's thread from another
+    thread is reached only through module-level state.
+  - Tests that shared mutable data across threads were changed to share it safely: a scope's
+    threads write `Atomic` slots rather than an array; a flag and a once-initialized value became
+    `Atomic`s; a vector built in a `var` is copied into a `val`; a test's own byte array is made by
+    each thread; a trait sent through futures promises `Sendable`; the run test of the scope trap
+    became a rejection test.
 
 ## Open
 
@@ -1888,4 +1933,11 @@ None at present.
 
 - Resource cleanup: a `defer` construct or a library `use`.
 - Whether a function value can ever be sent between actors, with a type that says what it captures.
+- Module-level mutable state reached by a thread's body: a `var`, or a value or `object` that is not
+  sendable, is shared by every thread, and nothing yet checks a body against it. `isolate`'s
+  whole-program check would; applied to threads it would reject every body that prints, unless
+  standard output is a synchronized object the library promises sendable.
+- A `TcpStream` handed to another thread keeps the bytes it read ahead in Avin fields; the code that
+  handed it over traps when it next uses the socket, but a read served from those bytes alone does
+  not reach the socket's owner check.
 - Whether mailboxes may be bounded, and what a `tell` to a full one does, since `tell` never waits.

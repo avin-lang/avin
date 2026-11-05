@@ -841,6 +841,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     check_sendable_declarations(&c)
     check_late_sendables(&c)
     check_initialization(&c)
+    check_sendable_arguments(&c)
     for id in 0..<c.data.len()
         check_data_implementations(&c, id)
         check_data_variance(&c, id)
@@ -4802,6 +4803,7 @@ private signature_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize)
 /** How method `m`'s result differs from that of `base`, which it overrides or implements for
  * `self_type`: it yields that result or, where that is a class or a trait, a type conforming to it. */
 private result_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) -> Option[string]
+    if sendable_mark_added(c, m, base) is Some(text) then return Some(text)
     val want = seen_from(c, self_type, base, c.symbols[base].result.unwrap_or(ErrorType))
     val own = seen_from(c, self_type, m, c.symbols[m].result.unwrap_or(ErrorType))
     var fits = alike_or_error(own, want) || *own is Nothing
@@ -5817,6 +5819,258 @@ private check_late_sendables(c: *Checker)
             c.note(late.unit, late.at, s"${type_name_quoted(zonk(c, late.ty))} does not conform to `Sendable`, ${late.context}: $why")
         c.generic = outer_generic
     c.late_sendables = buf()
+
+// Two marks on a parameter check what is passed for it. `@isolated`: it may use only sendable values
+// from around it, so nothing outside reaches a mutable value it makes or is given, as a mutex's value
+// and the body that works on it. `@sendable`: that, and it captures no `var`, since it may run on
+// another thread while the code that made it goes on, as a thread's body. A lambda, a by-name
+// argument, a local function or a method value is checked by what it captures, and any other
+// expression by the locals and parameters it uses; the values it makes itself are its own. A
+// parameter so marked that holds a function may be passed on for a parameter with the same mark or a
+// weaker one, since what it captures was checked where it was given. Every body is checked first, so
+// the closures' captures are known.
+
+/** How parameter `i` of function `f`, counted as a call passes its arguments, a method's receiver
+ * first, is marked: `NotMarked`, `IsolatedMark` or `SendableMark`, the stronger. */
+private param_mark(c: *Checker, f: usize, i: usize) -> int
+    val symbol = c.symbols[f]
+    val written = symbol.decl.params
+    if symbol.params.len() < written.len() then return NotMarked
+    val offset = symbol.params.len() - written.len()
+    if i < offset || i - offset >= written.len() then return NotMarked
+    var mark = NotMarked
+    for a in written[i - offset].annotations
+        if a.name == "sendable" then mark = SendableMark
+        elif a.name == "isolated" && mark == NotMarked then mark = IsolatedMark
+    mark
+
+const NotMarked: int = 0
+const IsolatedMark: int = 1
+const SendableMark: int = 2
+
+private mark_name(mark: int) -> string = if mark == SendableMark then "@sendable" else "@isolated"
+
+/** Where method `m` marks a parameter more strongly than `base`, which it overrides or implements: a
+ * call through `base` would pass what the mark never checked. */
+private sendable_mark_added(c: *Checker, m: usize, base: usize) -> Option[string]
+    for i in 0..<c.symbols[m].params.len()
+        val mark = param_mark(c, m, i)
+        if mark > param_mark(c, base, i)
+            return Some(s"which marks its parameter `${c.symbols[m].param_names[i]}` `${mark_name(mark)}` where the method it overrides does not; a call through that method would not check what is passed for it")
+    None
+
+/** A local with no name that holds an argument, evaluated before the call as its parameters' defaults
+ * need, and the expression it holds. */
+struct HeldArgument
+    local: usize
+    value: &TExpr
+
+/** A use, by what is passed for a marked parameter, of a local (`param` false) or a parameter of the
+ * code around it; `captured` says that a closure captures it. */
+struct SendUse
+    index: usize
+    param: bool
+    captured: bool
+
+private check_sendable_arguments(c: *Checker)
+    val k = c.core.trait_named("Sendable") match
+        Some(k) -> k
+        None -> return
+    for id in 0..<c.symbols.len()
+        val body = c.bodies[id] match
+            Some(b) -> b
+            None -> continue
+        val root = c.symbols[id].root.unwrap_or(id)
+        val r = c.symbols[root]
+        val outer_generic = c.generic
+        c.generic = if r.type_params.len() > 0 then Some(GenericScope(r.type_owner, r.type_params)) else None
+        var held: Buf[HeldArgument] = buf()
+        scan_sendable(c, id, root, body, k, &held)
+        c.generic = outer_generic
+
+private scan_sendable(c: *Checker, id: usize, root: usize, e: &TExpr, k: usize, held: *Buf[HeldArgument])
+    e.kind match
+        Call(f, args, _) -> sendable_arguments(c, id, root, f, args, k, held)
+        Dispatch(f, _, args, _) -> sendable_arguments(c, id, root, f, args, k, held)
+        BoundCall(f, _, args, _) -> sendable_arguments(c, id, root, f, args, k, held)
+        Let(x, value) ->
+            if x < c.locals[root].len() && c.locals[root][x].name == "" then held.push(HeldArgument(x, value))
+        _ -> ()
+    for x in texpr_children(e)
+        scan_sendable(c, id, root, x, k, held)
+
+// Reports, for each argument `f` takes for a marked parameter, the first use from around it that the
+// mark does not allow.
+private sendable_arguments(c: *Checker, id: usize, root: usize, f: usize, args: Buf[&TExpr], k: usize, held: *Buf[HeldArgument])
+    for i in 0..<args.len()
+        val mark = param_mark(c, f, i)
+        if mark == NotMarked then continue
+        var uses: Buf[SendUse] = buf()
+        var bound: Buf[usize] = buf()
+        collect_send_uses(c, args[i], &uses, &bound, held)
+        for u in uses
+            if !u.param && contains_index(bound, u.index) then continue
+            if send_use_problem(c, root, u, mark, k) is Some(why)
+                c.note(c.symbols[id].unit, args[i].span, s"what is passed for `${c.symbols[f].param_names[i]}` of `${c.symbols[f].name}` may use only sendable values from around it, but $why")
+                break
+
+// Why a use is not allowed: a `var` captured for a `@sendable` parameter, or a value whose type is not
+// sendable.
+private send_use_problem(c: *Checker, root: usize, u: SendUse, mark: int, k: usize) -> Option[string]
+    var name = ""
+    var t: &Type = ErrorType
+    if u.param
+        val r = c.symbols[root]
+        if u.index >= r.params.len() then return None
+        name = r.param_names[u.index]
+        t = r.params[u.index]
+        if param_mark(c, root, u.index) >= mark && holds_function(t) then return None
+    else
+        val locals = c.locals[root]
+        if u.index >= locals.len() then return None
+        val l = locals[u.index]
+        name = l.name
+        t = l.ty
+        if mark == SendableMark && u.captured && l.mutable then return Some(s"it captures `$name`, a `var`, which the closure would share with the code that made it; copy it into a `val`, or share it through an `Atomic` or a `Mutex`")
+    val ty = zonk(c, t)
+    sendability(conformances(c), ty, k) match
+        CannotSend(why) ->
+            if holds_function(ty) && u.param then return Some(s"it uses `$name`, ${quoted_type(ty)}, ${nested_reason(why)}; mark the parameter `${mark_name(mark)}`, and what is passed for it is checked in turn")
+            Some(s"it uses `$name`, ${quoted_type(ty)}, ${nested_reason(why)}")
+        _ -> None
+
+private holds_function(t: &Type) -> bool = *t is Function(_, _) || *t is ByName(_)
+
+// The locals and parameters `e` uses, a closure's captures among them, and the locals it binds itself.
+// A local holding an argument evaluated before the call stands for the expression it holds.
+private collect_send_uses(c: *Checker, e: &TExpr, uses: *Buf[SendUse], bound: *Buf[usize], held: *Buf[HeldArgument])
+    e.kind match
+        Local(x) ->
+            for h in *held
+                if h.local == x
+                    collect_send_uses(c, h.value, uses, bound, held)
+                    return
+            uses.push(SendUse(x, false, false))
+        Param(i) -> uses.push(SendUse(i, true, false))
+        Store(x, _, _) -> uses.push(SendUse(x, false, false))
+        Step(x, _, _, _) -> uses.push(SendUse(x, false, false))
+        MultiStore(locals, _) ->
+            for l in locals
+                if l is Some(x) then uses.push(SendUse(x, false, false))
+        FunctionValue(f, _) ->
+            if c.symbols[f].root is Some(_)
+                for x in c.symbols[f].captured_locals
+                    uses.push(SendUse(x, false, true))
+                for i in c.symbols[f].captured_params
+                    uses.push(SendUse(i, true, true))
+        Let(x, _) -> bound.push(x)
+        LetPattern(p, _) -> pattern_binds(p, bound)
+        Match(_, arms) ->
+            for arm in arms
+                pattern_binds(arm.pattern, bound)
+        Is(_, p, _) -> pattern_binds(p, bound)
+        Clauses(_, clauses) ->
+            for clause in clauses
+                for p in clause.patterns
+                    pattern_binds(p, bound)
+        _ -> ()
+    for x in texpr_children(e)
+        collect_send_uses(c, x, uses, bound, held)
+
+private pattern_binds(p: &TPattern, bound: *Buf[usize])
+    p.kind match
+        PBind(l) -> bound.push(l)
+        PBounds(l, _, _) ->
+            if l is Some(x) then bound.push(x)
+        PSuccessor(l, _) ->
+            if l is Some(x) then bound.push(x)
+        PAlternatives(options) ->
+            for o in options
+                pattern_binds(o, bound)
+        PNamed(l, inner) ->
+            bound.push(l)
+            pattern_binds(inner, bound)
+        PVariant(_, fields) ->
+            for f in fields
+                pattern_binds(f, bound)
+        PType(_, l, _) ->
+            if l is Some(x) then bound.push(x)
+        PSequence(l, _, _, items, _) ->
+            bound.push(l)
+            for item in items
+                pattern_binds(item, bound)
+        PView(l, _, inner) ->
+            bound.push(l)
+            pattern_binds(inner, bound)
+        _ -> ()
+
+/** The expressions directly inside `e` that are evaluated where `e` is, in order: not the bodies of
+ * the closures it makes, nor a lazy value's initializer. */
+private texpr_children(e: &TExpr) -> Buf[&TExpr]
+    var out: Buf[&TExpr] = buf()
+    e.kind match
+        Call(_, args, _) -> push_all(&out, args)
+        Dispatch(_, _, args, _) -> push_all(&out, args)
+        BoundCall(_, _, args, _) -> push_all(&out, args)
+        Construct(_, args) -> push_all(&out, args)
+        Collection(_, built) -> out.push(built)
+        CallValue(callee, args) ->
+            out.push(callee)
+            push_all(&out, args)
+        Field(value, _) -> out.push(value)
+        LazyField(object, _, _, _) -> out.push(object)
+        StoreField(object, _, value, _) ->
+            out.push(object)
+            out.push(value)
+        StoreGlobal(_, value, _) -> out.push(value)
+        Block(items) -> push_all(&out, items)
+        Let(_, value) -> out.push(value)
+        LetPattern(_, value) -> out.push(value)
+        Store(_, value, _) -> out.push(value)
+        MultiStore(_, value) -> out.push(value)
+        Negate(x) -> out.push(x)
+        Not(x) -> out.push(x)
+        Complement(x) -> out.push(x)
+        Convert(x, _) -> out.push(x)
+        Box(x) -> out.push(x)
+        NoneAs(x) -> out.push(x)
+        Arith(_, a, b, _) ->
+            out.push(a)
+            out.push(b)
+        Logic(_, a, b) ->
+            out.push(a)
+            out.push(b)
+        Compare(operands, _) -> push_all(&out, operands)
+        If(condition, yes, no) ->
+            out.push(condition)
+            out.push(yes)
+            if no is Some(x) then out.push(x)
+        While(_, condition, body, otherwise) ->
+            out.push(condition)
+            out.push(body)
+            if otherwise is Some(x) then out.push(x)
+        Break(_, value) ->
+            if value is Some(x) then out.push(x)
+        Return(value) ->
+            if value is Some(x) then out.push(x)
+        Match(subject, arms) ->
+            out.push(subject)
+            for arm in arms
+                if arm.guard is Some(g) then out.push(g)
+                out.push(arm.body)
+        Is(value, _, _) -> out.push(value)
+        Clauses(subjects, clauses) ->
+            push_all(&out, subjects)
+            for clause in clauses
+                for b in clause.bodies
+                    if b.guard is Some(g) then out.push(g)
+                    out.push(b.body)
+        _ -> ()
+    out
+
+private push_all(out: *Buf[&TExpr], items: Buf[&TExpr])
+    for x in items
+        out.push(x)
 
 // Holds each type that promises `Sendable`, outside the standard library, to the promise: a class
 // whose header, superclass or impl makes it, and a data type an impl makes it for. The standard
