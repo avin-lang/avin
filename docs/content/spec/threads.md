@@ -224,7 +224,9 @@ will own its handles across every message, whichever thread runs it.
   one waiting thread and `notifyAll()` every one. A wait may end with nothing having changed, so the
   state is checked again in a loop. `waitFor(timeoutMillis: long) -> bool` waits at most that many
   milliseconds and answers `false` where the time ran out first; a time that is not positive
-  answers `false` at once. Waiting from a thread that does not hold the mutex traps.
+  answers `false` at once. `waitFor(timeout: Duration) -> bool` is the same wait for a
+  [`Duration`](/spec/time/), a part of a millisecond waited for as a whole one. Waiting from a thread
+  that does not hold the mutex traps.
 - **`Atomic[T](value)`**, with `load`, `store`, `swap`, `compareAndSet(expected, desired) -> bool`
   and `update(f)`, and for the integers `add(n)` and `sub(n)`, each giving back the new value and
   trapping on overflow, as `+` and `-` do, before anything is stored. Every operation is
@@ -305,8 +307,10 @@ main() -> int
 - **`await() -> T`** waits for the value and gives it back, the same value at every call, safe for
   the collector while it waits. **`await(timeoutMillis: long) -> Option[T]`** waits at most that many
   milliseconds and gives `None` where the time ran out first; a time that is not positive asks
-  without waiting. `isCompleted()` asks and `value()` gives `Some` of a value already there; neither
-  waits. Times are milliseconds as a `long`, the unit every timed wait in the library takes.
+  without waiting; **`await(timeout: Duration) -> Option[T]`** is the same wait for a
+  [`Duration`](/spec/time/), a part of a millisecond waited for as a whole one. `isCompleted()` asks
+  and `value()` gives `Some` of a value already there; neither waits. Every timed wait takes a count
+  of milliseconds as a `long` or a `Duration`.
 - **The combinators never wait.** `map(f)` and `flatMap(f)` give the future of `f` of the value,
   `f` running on a pool thread once the value is there, so a `for … yield` over futures is a future
   too; `zip(other)` pairs two values, and `onComplete(f)` runs `f` with the value on a pool thread,

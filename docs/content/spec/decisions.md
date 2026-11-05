@@ -3558,6 +3558,19 @@ spelling is better, as each entry says.
 
 ## Proposed
 
+- Proposed 2026-11-05 (branch `time-instant`): **A `Duration` given to a millisecond wait is
+  rounded up to whole milliseconds.** `Future.await(d)` and `Condition.waitFor(d)` pass the runtime's
+  millisecond wait `ceil(d / 1ms)`, so `await(micros(1))` waits a millisecond; a duration of zero or
+  less asks without waiting, as a count that is not positive does. *Why*: a timed wait should never
+  end before the time it was given, the rule `setTimeout` already follows for a socket.
+  *Alternatives*: rounding down, which turns every duration under a millisecond into no wait at all;
+  a microsecond wait in the runtime, which the condition variable beneath does not offer.
+- Proposed 2026-11-05 (branch `time-instant`): **`toMicrosPart()` is the part below the second**
+  (`micros % 1_000_000`), as the chapter's list goes from `toSecondsPart()` straight to it, with no
+  `toMillisPart()`. *Why*: the four parts then cover a duration with nothing left over (hours below
+  the day, minutes, seconds, microseconds). *Alternatives*: the part below the millisecond, which
+  would need a `toMillisPart()` beside it to be complete.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
