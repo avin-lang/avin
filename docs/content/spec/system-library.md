@@ -117,12 +117,18 @@ main() -> int
 **`a | b` is a pipeline**: `a`'s standard output is `b`'s standard input, the two running at once,
 and its status is `b`'s.
 
+**A setting on a command made of parts is every part's** ([proposed](/spec/decisions/#proposed)):
+a part runs in the command's directory and with its variables unless it sets its own, a time limit
+bounds the whole and a part not started in time is not started, output redirected on a pipeline is
+its last stage's and input its first's, and a sequence's redirected file is opened once, its parts
+writing, or reading, one after the other.
+
 | Running | Meaning |
 | --- | --- |
 | `c.run() -> Result[ExitStatus, IoError]` | Runs the command with the program's own streams, waits, and answers how it ended. A status other than success is a value, not a failure. |
-| `c.output() -> Result[string, CommandError]` | Runs it with its standard output captured as text and standard error the program's own; any status but success is `Failed(status)`. |
+| `c.output() -> Result[string, CommandError]` | Runs it with its standard output captured as text, each ill-formed UTF-8 run replaced with U+FFFD, and standard error the program's own; any status but success is `Failed(status)`. |
 | `c.lines() -> Result[Iterator[string], IoError]` | Starts it and answers its standard output's lines as they arrive, by the rule [standard input](#standard-input) reads lines by. Its status is not checked. |
-| `c.start() -> Result[Child, IoError]` | Starts it and answers at once. A `Child` has `waitFor() -> Result[ExitStatus, IoError]`, `isAlive()` and `kill()`. |
+| `c.start() -> Result[Child, IoError]` | Starts it and answers at once. A `Child` has `waitFor() -> Result[ExitStatus, IoError]`, `isAlive()` and `kill()`, which sends signal 15 to every program still running and starts no part not yet started. |
 
 ```text
 data ExitStatus

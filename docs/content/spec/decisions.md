@@ -1433,9 +1433,10 @@ Settled by the user on 2026-11-04:
     define**: postfix `!` and `!!` (no method is called postfix, and `!` is the language's), and
     anything spelled with `#` (not an operator character), so `#|` is `|`, and `#&&`, `#||`, `###`,
     `#>`, `#>>` and `#<` are words; `run()` is the status, where the reference's `run()` starts the
-    process, which here is `start()`. Bindings: `sysl.process.run`, `capture`, `start`, `spawn` and
-    `pipe`, with mirrors of `Status`, `Output` and `Var`. **Blocked on stage-7 opaque handles**:
-    `Stdio` carries a `sysl.fs.File`, and `Child` and `Spawned` are live processes.
+    process, which here is `start()`. Bindings: `sysl.process.spawn` and `pipe`, with a mirror of
+    `Stdio` holding a `sysl.fs.File` handle, `Spawned` a handle waited for `blocking`, `Status`
+    mirrored as `ExitStatus` itself, `Var`, `sysl.fs.create`, `append` and `open` for the
+    redirections, and `sysl.io.FdReader` for `lines()`, which answers bytes as they arrive.
   - **[`Source`](/spec/system-library/#source)** in `avin.io`: `fromFile` (read whole, every failure
     up front), `fromString`, `stdin()`, and `lines()`, `chars()` and `readAll()`, each consuming. The
     reference's `getLines` and `mkString` are `lines` and `readAll`, the names `avin.io` already uses.
@@ -1857,6 +1858,42 @@ their words are reserved.
     shadow-stack frame before the call, and are built on branch `tailcalls` with their own entry.
   - The language has no `try`, `defer` or `finally`, so there is no pending cleanup to take a call
     out of tail position; when such a construct is added, a call inside it is not in tail position.
+
+- Settled on the user's delegation 2026-11-05 (built on branch `process-commands`): **How the parts of a command share its settings** ([commands](/spec/system-library/#commands)).
+  Proposed: a directory and variables set on a pipeline or a sequence are every part's, a part's own
+  directory replacing it and its own variables added after (a name set twice has the last value).
+  A time limit on a command made of parts bounds the whole, from when it starts: each program is
+  given what is left, a part not yet started when it runs out is `TimedOut` without being started,
+  and of two nested limits the earlier ends it. Output redirected on a pipeline is its last stage's
+  and input its first's; on a sequence the file is opened once and shared, so the parts write one
+  after the other and the second reads on where the first stopped. A part's own redirection replaces
+  the enclosing one, whose file is still opened (and so emptied by `toFile`), as a shell's is.
+  Why: each reads as a shell's `( … )` with the setting outside it, which is what a reader expects.
+  Alternatives: a limit given to each program afresh (a sequence of slow parts would never end), and
+  a file opened per part (each part of a sequence would empty what the one before wrote).
+- Settled on the user's delegation 2026-11-05 (built on branch `process-commands`): **Input given as text, and output captured, go through files** ([commands](/spec/system-library/#commands)).
+  Proposed: `withInput(text)` writes the text to a temporary file, opened and unlinked before the
+  program starts, and `output()` has the output written to a temporary file read once the command
+  has ended. Why: a pipe the program feeds or drains while it waits is a deadlock once either side
+  outgrows the pipe's buffer, and a file never fills. The alternative is pipes served by a thread.
+  `output()` decodes the bytes as `lines()` does, each ill-formed run replaced with U+FFFD, rather than
+  failing with `Io(InvalidUtf8)`; the alternative is the failure, which would lose the whole output
+  over one byte. **Review with the user**: the decoding.
+- Settled on the user's delegation 2026-11-05 (built on branch `process-commands`), with one change: **`kill()` and a started sequence** ([commands](/spec/system-library/#commands)).
+  Proposed: `Child.kill()` sends signal 15 to every program of the command still running and starts
+  no part not yet started; `waitFor()` then answers `Signalled(15)` for a program it stopped. A
+  started sequence starts its next part when `waitFor()` or `isAlive()` finds the part before it has
+  ended, on the code that started it, which owns the processes; `lines()` over a command holding a
+  sequence moves it on with a thread of its own, since its reader is waiting on the output. A
+  pipeline holding a sequence is polled, its processes asked without waiting at growing intervals up
+  to 16 ms, while a pipeline of programs alone is waited for without polling. Alternatives: signal 9,
+  which a program cannot clean up after, or `kill(signal: int = 15)`; every started command on a
+  thread of its own, whose processes the starting code could then not stop, since a handle belongs
+  to one thread. Settled: signal 15 as proposed. Changed: a started sequence must move on by itself, since a sequence that
+  stalls until its starter asks is a surprise; a thread of its own will own the processes and drive
+  the sequence, and the `Child` will ask it to wait or to kill through a channel, which keeps each
+  handle on one thread. Until that is built the sequence moves on only when asked, as described.
+  **Review with the user**: the signal.
 
 **Deferred**
 
