@@ -1859,17 +1859,7 @@ their words are reserved.
   - The language has no `try`, `defer` or `finally`, so there is no pending cleanup to take a call
     out of tail position; when such a construct is added, a call inside it is not in tail position.
 
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-None at present.
-
-- **How the parts of a command share its settings** ([commands](/spec/system-library/#commands)).
+- Settled on the user's delegation 2026-11-05 (built on branch `process-commands`): **How the parts of a command share its settings** ([commands](/spec/system-library/#commands)).
   Proposed: a directory and variables set on a pipeline or a sequence are every part's, a part's own
   directory replacing it and its own variables added after (a name set twice has the last value).
   A time limit on a command made of parts bounds the whole, from when it starts: each program is
@@ -1881,7 +1871,7 @@ None at present.
   Why: each reads as a shell's `( … )` with the setting outside it, which is what a reader expects.
   Alternatives: a limit given to each program afresh (a sequence of slow parts would never end), and
   a file opened per part (each part of a sequence would empty what the one before wrote).
-- **Input given as text, and output captured, go through files** ([commands](/spec/system-library/#commands)).
+- Settled on the user's delegation 2026-11-05 (built on branch `process-commands`): **Input given as text, and output captured, go through files** ([commands](/spec/system-library/#commands)).
   Proposed: `withInput(text)` writes the text to a temporary file, opened and unlinked before the
   program starts, and `output()` has the output written to a temporary file read once the command
   has ended. Why: a pipe the program feeds or drains while it waits is a deadlock once either side
@@ -1889,7 +1879,7 @@ None at present.
   `output()` decodes the bytes as `lines()` does, each ill-formed run replaced with U+FFFD, rather than
   failing with `Io(InvalidUtf8)`; the alternative is the failure, which would lose the whole output
   over one byte. **Review with the user**: the decoding.
-- **`kill()` and a started sequence** ([commands](/spec/system-library/#commands)).
+- Settled on the user's delegation 2026-11-05 (built on branch `process-commands`), with one change: **`kill()` and a started sequence** ([commands](/spec/system-library/#commands)).
   Proposed: `Child.kill()` sends signal 15 to every program of the command still running and starts
   no part not yet started; `waitFor()` then answers `Signalled(15)` for a program it stopped. A
   started sequence starts its next part when `waitFor()` or `isAlive()` finds the part before it has
@@ -1899,7 +1889,21 @@ None at present.
   to 16 ms, while a pipeline of programs alone is waited for without polling. Alternatives: signal 9,
   which a program cannot clean up after, or `kill(signal: int = 15)`; every started command on a
   thread of its own, whose processes the starting code could then not stop, since a handle belongs
-  to one thread. **Review with the user**: the signal, and a sequence that moves on only when asked.
+  to one thread. Settled: signal 15 as proposed. Changed: a started sequence must move on by itself, since a sequence that
+  stalls until its starter asks is a surprise; a thread of its own will own the processes and drive
+  the sequence, and the `Child` will ask it to wait or to kill through a channel, which keeps each
+  handle on one thread. Until that is built the sequence moves on only when asked, as described.
+  **Review with the user**: the signal.
+
+**Deferred**
+
+- Public C interoperability. Until then, C is reached through Sysl.
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
