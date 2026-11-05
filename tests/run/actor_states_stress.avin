@@ -1,0 +1,100 @@
+// expect: exit 0
+// Actors with states at a size the collector's stress can run, collecting at every allocation, on
+// the runtime's worker threads: a ring of 150 actors whose token moves each one between states
+// carrying fresh strings, three laps round, and 40 accumulators told 30 messages each from two
+// threads and the main one, each message moving it to a new state that holds a fresh vector, every
+// `enter` and `leave` making garbage of its own. Every state's data survives the collections between
+// messages, every message is handled once and in each sender's order, and every transition runs its
+// `leave` and `enter` once.
+import avin.actors.{ActorRef, spawn}
+import avin.threads.{Future, Promise}
+
+data RingMsg
+    Link(next: ActorRef[RingMsg])
+    Token(laps: int, trail: string, done: Promise[string])
+
+actor Ringer(id: int) receives RingMsg
+    state Unlinked
+        Link(n) -> Linked(n, Vector())
+        Token(_, _, _) -> stay
+
+    state Linked(next: ActorRef[RingMsg], marks: Vector[string])
+        Link(n) -> Linked(n, marks)
+        Token(laps, trail, done) ->
+            val mark = s"$id:$laps"
+            if id == 0 && laps == 0
+                done.complete(s"${marks.length()} ${trail.chars().size()}")
+                stay
+            else
+                next.tell(Token(if id == 0 then laps - 1 else laps, if id == 0 then "" else trail + "é", done))
+                Linked(next, marks :+ mark)
+
+data Item
+    Add(from: string, n: int, words: Vector[string])
+    Report(reply: Promise[string])
+
+actor Accumulator(name: string) receives Item
+    var entered = 0
+    var left = 0
+    state Fresh
+        enter
+            entered += 1
+        leave
+            left += 1
+    state Holding(seen: Map[string, Vector[int]], chars: int)
+        enter
+            entered += 1
+            val garbage = Vector.tabulate(3, i -> s"$name$i")
+            if garbage.length() != 3 then entered = -1
+        leave
+            left += 1
+            val more = s"$name left".chars().size()
+            if more == 0 then left = -1
+
+    receive
+        Add(from, n, words) ->
+            val (seen, chars) = state() match
+                Holding(s, c) -> (s, c)
+                Fresh -> (Map[string, Vector[int]](), 0)
+            var added = 0
+            for w in words do added += w.chars().size()
+            Holding(seen.updated(from, seen.get(from).getOrElse(Vector()) :+ n), chars + added)
+        Report(reply) ->
+            val text = state() match
+                Holding(seen, chars) ->
+                    var ordered = true
+                    var count = 0
+                    for (_, ns) in seen
+                        count += ns.length()
+                        for i in 1..<ns.length() do if ns(i - 1) >= ns(i) then ordered = false
+                    s"$name $count $ordered $chars $entered $left"
+                Fresh -> s"$name empty"
+            reply.complete(text)
+            stay
+
+feed(c: ActorRef[Item], from: string)
+    for i in 0..<10 do c.tell(Add(from, i, Vector(s"$from$i", "é")))
+
+main()
+    val ring: Vector[ActorRef[RingMsg]] = Vector.tabulate(150, i -> spawn(Ringer(i)))
+    for i in 0..<150 do ring(i).tell(Link(ring((i + 1) % 150)))
+    val done = Promise[string]()
+    ring(0).tell(Token(3, "", done))
+    println(done.future.await())
+    val accs: Vector[ActorRef[Item]] = Vector.tabulate(40, i -> spawn(Accumulator(s"c$i")))
+    val first = Promise[string]()
+    accs(0).tell(Report(first))
+    println(first.future.await())
+    val a = Future(for c in accs do feed(c, "a"))
+    val b = Future(for c in accs do feed(c, "b"))
+    for c in accs do feed(c, "m")
+    a.await()
+    b.await()
+    var lines: Vector[string] = Vector()
+    for c in accs
+        val p = Promise[string]()
+        c.tell(Report(p))
+        lines = lines :+ p.future.await()
+    println(lines(0))
+    println(lines(39))
+    println(lines.forall(l -> l.contains(" 30 true 90 31 30")))

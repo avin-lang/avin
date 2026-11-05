@@ -1,0 +1,133 @@
+// expect: exit 0
+// Messages an actor sends itself, its timers and `pipeToSelf` are handled by the state current when
+// each arrives, not the one that sent it. A message told to itself in one arm, and a timer due at
+// once, are handled after the transition that arm yields; a message arriving in a state with no arm
+// of its own for it is handled by the shared arms. A repeating timer started in one state's `enter`
+// keeps firing across transitions and is cancelled in another's, after which no tick arrives. The
+// spec's connection shape: a reply piped to itself moves it on, sends queued while connecting are
+// flushed on arrival, and its `leave` closes the connection.
+import avin.actors.{ActorRef, Timer, spawn}
+import avin.threads.{Channel, Future, Promise}
+import avin.time
+
+data Msg
+    Start
+    Ping
+    Late
+    Tick
+    Finish
+    Get(reply: ActorRef[string])
+
+actor Clock(log: Channel[string]) receives Msg
+    var ticks = 0
+    var timer: Option[Timer] = None
+
+    state Resting
+        Start ->
+            self.tell(Ping)
+            after(time.zero(), Late)
+            Armed
+
+    state Armed
+        enter
+            log.send("armed")
+        Ping ->
+            log.send(s"ping in ${state()}")
+            stay
+        Late ->
+            timer = Some(every(time.milliseconds(1), Tick))
+            Ticking(0)
+
+    state Ticking(k: int)
+        Tick ->
+            ticks += 1
+            if k == 2 then Done else Ticking(k + 1)
+
+    state Done
+        enter
+            if timer is Some(t) then t.cancel()
+            log.send(s"done after $ticks")
+            // Long enough for many more ticks, had the timer gone on.
+            after(time.milliseconds(25), Finish)
+        Finish ->
+            log.send(s"finished after $ticks")
+            stay
+
+    receive
+        Get(r) ->
+            r.tell(s"${state()} $ticks")
+            stay
+        other ->
+            log.send(s"$other ignored in ${state()}")
+            stay
+
+class Socket(val host: string, log: Channel[string])
+    write(n: int) = log.send(s"$host gets $n")
+    close() = log.send(s"$host closed")
+
+data ConnMsg
+    Connect(host: string)
+    Connected(socket: Socket)
+    Send(n: int)
+    Closed
+
+actor Connection(log: Channel[string], gate: Future[unit]) receives ConnMsg
+    var pending = Vector[int]()
+
+    state Idle
+        Connect(host) ->
+            val out = log
+            pipeToSelf(gate, _ -> Connected(Socket(host, out)))
+            Connecting
+
+    state Connecting
+        Connected(socket) ->
+            for n in pending do socket.write(n)
+            pending = Vector()
+            Ready(socket)
+        Send(n) ->
+            pending = pending :+ n
+            stay
+
+    state Ready(socket: Socket)
+        leave
+            socket.close()
+        Send(n) ->
+            socket.write(n)
+            stay
+        Closed -> Idle
+
+    receive
+        Send(n) ->
+            log.send(s"dropped $n")
+            stay
+        _ -> stay
+
+main()
+    val log = Channel[string]()
+    val c = spawn(Clock(log))
+    c.tell(Ping)
+    c.tell(Start)
+    println(log.receive().get())
+    println(log.receive().get())
+    println(log.receive().get())
+    println(log.receive().get())
+    println(log.receive().get())
+    println(c.ask(r -> Get(r), timeout = time.seconds(60)).await())
+    val gate = Promise[unit]()
+    val conn = spawn(Connection(log, gate.future))
+    conn.tell(Send(0))
+    conn.tell(Connect("here"))
+    conn.tell(Send(1))
+    conn.tell(Send(2))
+    println(log.receive().get())
+    gate.complete(())
+    println(log.receive().get())
+    println(log.receive().get())
+    conn.tell(Send(3))
+    println(log.receive().get())
+    conn.tell(Closed)
+    println(log.receive().get())
+    conn.tell(Send(4))
+    println(log.receive().get())
+    println(log.tryReceive())

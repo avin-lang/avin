@@ -1,0 +1,115 @@
+// expect: exit 0
+// The shapes an actor's states take. An arm's value is the next state wherever it ends: the last
+// item of a block, each branch of an `if` and of a `match`, so `stay` may be one branch and a state
+// another. An `else` arm catches what a state's other arms leave, and the shared `receive` arms what
+// its own arms leave. A state without arms of its own is handled by the shared ones alone; an actor
+// with a single state whose arms all `stay` behaves as one without states. Inside an actor with states, `state`, `enter`,
+// `leave`, `receive` and `stay` are ordinary names everywhere but where a state, its blocks or an
+// arm's value use them: a field called `enter`, a local called `state`, a parameter called `leave`
+// and a pattern binding `stay`. A message an actor tells itself from an `enter` is handled in the
+// state that `enter` belongs to, after the transition.
+import avin.actors.{ActorRef, spawn}
+import avin.threads.Channel
+
+data Cmd
+    Num(n: int)
+    Word(w: string)
+    Flag(b: bool)
+    Echo(reply: Channel[string])
+
+actor Shapes(log: Channel[string]) receives Cmd
+    var enter = "e"
+    var receive = 0
+
+    state Even
+        Num(n) ->
+            if n % 2 == 0 then stay
+            elif n < 0 then Negative(n)
+            else Odd(n)
+        Word(w) -> w match
+            "" -> stay
+            "neg" -> Negative(-1)
+            _ ->
+                enter = w
+                stay
+        Flag(_) -> stay
+
+    state Odd(last: int)
+        Num(n) ->
+            val state = n + last
+            if state % 2 == 0 then Even else Odd(state)
+        Flag(stay) -> if stay then Even else Silent
+
+    state Negative(n: int)
+        enter
+            self.tell(Num(n))
+        Num(m) if m == n ->
+            log.send(s"told itself $m in ${state()}")
+            Even
+
+    state Silent
+
+    receive
+        Echo(out) ->
+            out.send(described(receive))
+            receive += 1
+            stay
+        _ -> stay
+
+    described(leave: int) -> string = s"${state()} $enter $leave"
+
+actor Single(log: Channel[string]) receives Cmd
+    var total = 0
+    state Only
+        Num(n) ->
+            total += n
+            stay
+        Echo(out) ->
+            out.send(s"${state()} $total")
+            stay
+        else stay
+
+main()
+    val log = Channel[string]()
+    val out = Channel[string]()
+    val s = spawn(Shapes(log))
+    s.tell(Echo(out))
+    println(out.receive().get())
+    s.tell(Num(4))
+    s.tell(Word("wörd"))
+    s.tell(Flag(true))
+    s.tell(Echo(out))
+    println(out.receive().get())
+    s.tell(Num(3))
+    s.tell(Echo(out))
+    println(out.receive().get())
+    s.tell(Num(4))
+    s.tell(Echo(out))
+    println(out.receive().get())
+    s.tell(Word("x"))
+    s.tell(Num(5))
+    s.tell(Echo(out))
+    println(out.receive().get())
+    s.tell(Flag(true))
+    s.tell(Echo(out))
+    println(out.receive().get())
+    s.tell(Num(1))
+    s.tell(Flag(false))
+    s.tell(Num(2))
+    s.tell(Flag(true))
+    s.tell(Echo(out))
+    println(out.receive().get())
+    val t = spawn(Shapes(log))
+    t.tell(Num(-7))
+    println(log.receive().get())
+    t.tell(Echo(out))
+    println(out.receive().get())
+    t.tell(Word("neg"))
+    println(log.receive().get())
+    val one = spawn(Single(log))
+    one.tell(Num(2147483647))
+    one.tell(Num(-2147483647))
+    one.tell(Word(""))
+    one.tell(Echo(out))
+    println(out.receive().get())
+    println(log.tryReceive())

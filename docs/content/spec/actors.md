@@ -478,8 +478,15 @@ actor Connection receives ConnMsg
         _ -> stay
 ```
 
-A restarted actor starts again in its first state. An actor without `state` blocks is one whose
-arms all `stay`, which is why its arms yield nothing.
+An actor with states needs no `receive` block; its shared arms, where it has them, yield states as
+a machine's do. Its first state's `enter` runs after the body, when the actor starts. A message that
+arrives, a timer that falls due or a reply piped to itself is handled by the state current when it
+is handled, not the one that asked for it. Only a transition runs `leave`: an actor that stops or
+fails runs its `stopping` block, where `state()` answers the state it ended in. A trap in an
+`enter` or `leave` fails the actor as one in an arm does. A restarted actor starts again in its
+first state. The actor's `State` type, its states and `state()` are its own, private to its module
+as the actor's state is. An actor without `state` blocks is one whose arms all `stay`, which is why
+its arms yield nothing.
 
 ## Keywords
 

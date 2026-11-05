@@ -3409,7 +3409,37 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- Proposed (built on branch `actor-state`): **`state` blocks in actors** (stage 12 step 8), the
+  choices building it made where the [chapter](/spec/actors/#an-actors-states) is silent.
+  - **Only a transition runs `leave`**: an actor that stops, fails or restarts runs its `stopping`
+    block, which reads `state()`, and not the current state's `leave`. *Why*: the chapter defines
+    `leave` as running when the actor moves out of a state into another, and `stopping` is already
+    the one block an ending runs; running both would run two cleanups for one ending, in an order
+    the program cannot see. *Alternative*: running the current state's `leave` before `stopping`,
+    which suits a state holding a resource (the chapter's `Ready(socket)`) but runs code written
+    for a transition when none happens.
+  - **A trap in `enter` or `leave` fails the actor** as a trap in an arm does, and a trap in a
+    `leave` leaves the actor in the state it was leaving; one in an `enter` leaves it in the state
+    entered. The first state's `enter` runs as the last statement of the body, so a restart runs it
+    again, and a trap there fails the actor as it starts. *Why*: the transition's steps run in the
+    order the chapter gives, inside the turn, and supervision already decides what a trap in a turn
+    means. *Alternative*: rolling the state back on a trap, which needs a copy of the state before
+    every transition.
+  - **An actor's `State` type and its states are private to its module**, as the class holding its
+    state is, and `state()` is one of the actor's own methods, not its reference's. The states are
+    still names of the module, so they share no name with another variant there, a machine's states
+    included. *Why*: nothing outside an actor reaches its state. *Alternative*: a public `State` type
+    another module could match on, which nothing could hand it.
+  - **An actor with states needs no `receive` block**, as a machine needs none; without states it
+    still needs one. A shared arm of an actor with states yields a state, as a machine's does.
+  - **No reentrancy trap**: only the runtime hands an actor a message, one turn at a time, so the
+    actor needs no busy flag of the kind a machine's `handle` keeps.
+  - **A sendable function reading a stateful actor's fields is refused with the advice to copy into
+    a `val`**, not to make a field a `val`, which cannot make an actor that moves between states
+    sendable.
+
+  **Review with the user**: the first choice; whether an ending should run the current state's
+  `leave` is the one a program holding a resource in a state notices.
 
 ## Open
 
