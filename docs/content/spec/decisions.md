@@ -1806,22 +1806,34 @@ their words are reserved.
     trap; `Host`, `Content-Length` and `Connection: close` are written unless the request gives
     them; an interim `1xx` is skipped; redirects are 301, 302, 303, 307 and 308, the sixth answered
     as it is.
-
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- **Where a mirror holding a handle goes into Sysl** ([Sysl bindings](/spec/sysl-bindings/#mirrors)).
-  Proposed: wherever any mirror does — a parameter by itself, or inside an `Option`, a `Result`, a
-  collection, a tuple or another mirror — since the shim's conversion of the mirror checks and
-  passes each handle field wherever it is called, though a bare handle in an `Option` or a collection
-  still does not go into Sysl. The alternative is a mirror holding a handle only by itself, as a
-  handle is.
-- [Tail calls](/spec/declarations/#tail-calls) (2026-11-05). Choices the request left open:
+- Settled on the user's delegation 2026-11-05 (built on branch `sendable`): [`Sendable`'s
+  promises](/spec/actors/#what-may-be-sent), where the design left them open:
+  - A declaration promises `Sendable` as it conforms to any trait: after `:` in a class's or a
+    trait's header, or in an impl for a data type. The promise is checked against the structure,
+    outside the standard library, and an `open` or `abstract` class that promises it is sendable,
+    each subclass being checked. The standard library's promises are taken as made, since they are
+    for types whose structure cannot show it: `Future`, `Promise`, `Channel` and `Atomic` of a
+    sendable type (impls bounded by `Sendable`), `Mutex` of any type and `Once` (in their headers),
+    and `Vector` of sendable elements. `ArraySeq`, `List`, `Range`, the hash and tree maps and sets,
+    `Option`, `Result` and `Either` are sendable by their structure.
+  - A generic trait that promises `Sendable` is sendable at sendable type arguments; a type
+    implementing it has the parameters it passes to the trait, other than contravariantly, taken as
+    sendable where it is checked, and is sendable at sendable arguments for them. The immutable `Map`
+    and `Set` traits promise it, so `HashMap[K, V]` is sendable where `K` and `V` are, and a type
+    implementing either is held to it.
+  - `Sendable` is only a bound and a promise; it is not the type of a value.
+  - A `lazy val` field is sendable where its type is, since it is initialized by exactly one thread.
+    (That rests on the runtime initializing a `lazy val` once under contention; a test of two
+    threads forcing one `lazy val` at once pins it.)
+- Settled on the user's delegation 2026-11-05 (built on branch `mirror-handle-fields`): **a mirror
+  holding a handle goes into Sysl wherever any mirror does** ([Sysl
+  bindings](/spec/sysl-bindings/#mirrors)) — a parameter by itself, or inside an `Option`, a
+  `Result`, a collection, a tuple or another mirror — since the shim's conversion of the mirror
+  checks and passes each handle field wherever it is called, though a bare handle in an `Option` or
+  a collection still does not go into Sysl. The alternative is a mirror holding a handle only by
+  itself, as a handle is.
+- Settled on the user's delegation 2026-11-05 (built on branch `tailrec`): [tail
+  calls](/spec/declarations/#tail-calls), the choices the request left open:
   - **Every self-call in tail position is a loop, with or without `@tailrec`**, at `-O0` as at
     `-O2`, so a program's stack use does not depend on its optimization level; the annotation only
     adds the proof. Alternative: loop only where `@tailrec` asks, leaving the rest to LLVM at `-O2`
@@ -1840,11 +1852,21 @@ their words are reserved.
   - **`@tailrec` is accepted on top-level functions, methods and local functions**, and is the one
     annotation a local function takes; a lambda cannot be annotated. It refuses a function with no
     recursive call, as the reference language does, rather than accepting it silently.
-  - **Mutual recursion is not made a loop**, only a function calling itself. Alternative: general
-    tail calls (LLVM `musttail`) — they need every caller and callee to agree on a calling
-    convention, and Avin's calls pass a context and keep a shadow-stack frame.
+  - **A function calling itself is made a loop; mutual recursion is left to general tail calls**,
+    which need every caller and callee to agree on a calling convention and to unlink the
+    shadow-stack frame before the call, and are built on branch `tailcalls` with their own entry.
   - The language has no `try`, `defer` or `finally`, so there is no pending cleanup to take a call
     out of tail position; when such a construct is added, a call inside it is not in tail position.
+
+**Deferred**
+
+- Public C interoperability. Until then, C is reached through Sysl.
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
