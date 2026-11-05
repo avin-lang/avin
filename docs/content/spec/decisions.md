@@ -1857,6 +1857,34 @@ their words are reserved.
     shadow-stack frame before the call, and are built on branch `tailcalls` with their own entry.
   - The language has no `try`, `defer` or `finally`, so there is no pending cleanup to take a call
     out of tail position; when such a construct is added, a call inside it is not in tail position.
+- Settled on the user's delegation 2026-11-05 (built on branch `regex-hardening`): [`avin.regex`'s
+  limits on matching](/spec/regex/#matching), backtracking with leftmost-first results kept:
+  - **The matcher keeps its own backtrack stack**, an array of frames, so a repeated group over a
+    long input takes no deeper a call stack however many repetitions it makes; only a part matched
+    on its own (a repetition's item matched one way, an atomic group, a lookaround's body) takes a
+    call, so the call depth follows the pattern's nesting, never the input. Alternative: a
+    linear-time engine — rejected by the request, as back references, lookarounds and
+    leftmost-first captures need backtracking.
+  - **Each attempt at a start has a step budget, and spending it traps**, the message naming the
+    pattern and the input's length and saying to make a repetition possessive or atomic. A step is
+    an operation run or a backtrack frame popped; the budget is 1000 for each character of the
+    input (plus one) times each operation of the program, never fewer than 10,000,000, about a
+    tenth of a second of steps and far beyond what a pattern that backtracks only as far as its
+    input asks takes. The budget is per attempt, not per search, so a search is never stopped for
+    the number of starts it tries. Alternatives: answering a `Result` from every search — rejected,
+    as it would make every `findFirstIn` and `matches` a fallible call for what is a defect of the
+    pattern, which the trap's message says how to fix; no limit (the earlier behaviour) — rejected,
+    as one bad pattern hangs its program.
+  - **`withStepLimit(n)` sets an attempt's budget** (`n` above 0, or it traps), for a program that
+    wants a tighter bound on untrusted text or a looser one for a pattern known to be slow; the
+    trap's message then gives the limit. Alternative: a global setting — rejected, as the budget
+    belongs to the pattern.
+  - Review with the user: whether a search should also have a non-trapping form for untrusted
+    patterns (a `Result`-answering `tryFindFirstIn`, say), and whether the default budget's
+    constants are the right ones. A greedy, unbounded repetition of a group in a pattern without a
+    back reference already remembers where a further repetition failed, so the textbook
+    `(a+)+$`, `(a|a)*b` and `(a|aa)+$` finish in polynomial time and do not trap; their reluctant,
+    bounded and back-referencing forms are the ones that do.
 
 **Deferred**
 
