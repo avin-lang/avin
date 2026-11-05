@@ -616,9 +616,10 @@ Settled by the user on 2026-11-03:
   field of the same words in snake_case.
 - `fail(message)` is public in the prelude: it traps with the message at the caller's place and has
   type `Nothing`.
-- The methods an `impl` adds to a class whose fields are all immutable are not variance positions,
-  as a `data` type's are not: such an instance holds nothing a method could store a value into. A
-  class with a `var` field keeps every method a position.
+- The methods an `impl` adds to a final class whose fields are all immutable are not variance
+  positions, as a `data` type's are not: such an instance holds nothing a method could store a value
+  into. A class with a `var` field keeps every method a position, and so does an `open` or
+  `abstract` class (settled 2026-11-05, below).
 - A one-variant `data` type may have a companion `object`, as a class may: the name in call position
   is the constructor and `Name.member` the companion (`Map.empty`, `Map.newBuilder`, `List.newBuilder`).
 - An `impl` may add methods for some type arguments only: `impl[T: Display] List[T]` gives
@@ -1767,6 +1768,19 @@ their words are reserved.
   alternatives were requiring the bounds to be exactly the same, which forbids a weakening that is
   harmless; and checking the bound at each call through the base,
   which a call cannot do, since it does not know which override it reaches.
+- Settled on the user's delegation 2026-11-05: **the methods an `impl` adds to an `open` or
+  `abstract` class are [variance](/spec/generics/#variance) positions**, whatever its fields; the
+  exemption stays for final classes whose fields are all immutable, `data` types and traits. Why:
+  such a method is in the class's method table, so a call through a wider view runs the copy for
+  the object's own type arguments, and `(b: Box[Animal]).with(cat)` on a `Box[Dog]` answered a
+  `Box[Dog]` holding a cat, whose dog's fields read past the object; the core library's `Vector` had
+  the hole. So `Vector` takes an element through a lower bound, as maps do:
+  `:+[W >: T](element: W) -> Vector[W]`, `+:`, `++`, `updated`, and `toArray[W >: T]()`, and
+  `Seq`'s added `:+`, `+:`, `++` and `updated` widen alike, so a vector's own hides them. A vector's
+  `iterator()` and `reverseIterator()` are `Iterator[T]`s, and its guard view is the one every
+  sequence has. The alternative, not taken: making an exempt impl method non-virtual, compiled for
+  the receiver's static type as a trait's added methods are, which keeps `:+(element: T)` but would
+  make an added method on an open class behave unlike a method written in its body.
 
 **Deferred**
 

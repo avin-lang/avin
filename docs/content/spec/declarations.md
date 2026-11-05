@@ -793,7 +793,9 @@ built-in type implements every method of the trait, defaults included.
   them: a class or `data` type implementing it, the trait's own type, a type parameter it bounds.
   Inside them `self` is the value and `Self` its type; the trait's methods, and those other impls add
   to it, are in scope by bare name. They reach the value only through the trait's methods, so they
-  are not variance positions: `contains(element: T)` is written on `Seq[+T]`.
+  are not variance positions: `contains(element: T)` is written on `Seq[+T]`. The methods an impl
+  adds to an `open` or `abstract` class are, by contrast, in the class's method table, and so are
+  variance positions like the class's own ([generics](generics.md)).
 - **A call of an added method is compiled for the receiver's static type.** Where that is a class or
   a `data` type, the trait's methods the added one calls are that type's, called directly; where it
   is the trait, they go through the object's method table. An added method is in no method table and
