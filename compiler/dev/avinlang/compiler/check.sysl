@@ -536,6 +536,9 @@ struct Checker
     sendable_match: bool
     /** The actors' message types already held to `Sendable`, by unit and place. */
     actor_messages_held: Map[string, bool]
+    /** Every variant of a qualified name that data types of one module share, in declaration order;
+     * `variants` holds the first of them. A name no two types share is not here. */
+    shared_variants: Map[string, Buf[VariantRef]]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -621,6 +624,11 @@ declared(c: *Checker, key: string) -> bool =
 /** Whether the declaration named `key` may be seen from another module: it is not `private`. A
  * function's name is while any of its overloads is public. */
 exported(c: *Checker, key: string) -> bool
+    // A variant name several types share is seen where any of their types is.
+    if c.shared_variants.get(key) is Some(vs)
+        for v in vs
+            if exported(c, qualified(c.data[v.data].module_name, c.data[v.data].name)) then return true
+        return false
     if c.private_names.get(key) is Some(_) then return false
     if c.scope.get(key) is Some(ids)
         for id in ids
@@ -787,7 +795,7 @@ private check_imports(c: *Checker, unit: usize)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -1202,8 +1210,8 @@ private declare_unit(c: *Checker, unit: usize)
                 if same_as_overload(c, symbol, set)
                     c.note(unit, f.name_span, s"`${f.name}` is declared more than once with the same parameter types; overloads differ in their parameter types, and a function that chooses by its arguments' values is written with clauses")
                     continue
-                if set.len() == 0 && c.variants.get(key) is Some(v)
-                    c.note(unit, f.name_span, s"`${f.name}` is already a variant of `${c.data[v.data].name}`")
+                if set.len() == 0 && c.variants.get(key) is Some(_)
+                    c.note(unit, f.name_span, s"`${f.name}` is already a variant of ${variant_owners(c, key)}")
                 if set.len() == 0 && c.class_types.get(key) is Some(k)
                     if c.classes[k].decl.object then c.note(unit, f.name_span, s"`${f.name}` is already an object")
                     else c.note(unit, f.name_span, s"`${f.name}` is already a class, which is called to make one")
@@ -2217,11 +2225,11 @@ private language_static(t: &Type, name: string) -> bool
     if name == "MaxValue" || name == "MinValue" then return true
     *t is Real && (name == "MinPositiveValue" || name == "PositiveInfinity" || name == "NegativeInfinity" || name == "NaN")
 
-// A variant's fields are resolved with its type's parameters in scope. Variant names share one
-// space within a module, across its files, since a variant is named on its own (`Some(1)`, `None`)
-// wherever it is used and is a name of its module.
+// A variant's fields are resolved with its type's parameters in scope. A variant is a name of its
+// module, named on its own (`Some(1)`, `None`) wherever it is used, and several data types of one
+// module may each have a variant of one name: a bare use of it is then decided by the type expected
+// there. Within one type a variant's name is its own.
 private declare_variants(c: *Checker, unit: usize)
-    var seen: Map[string, Span] = map()
     for id in 0..<c.data.len()
         val d = c.data[id]
         if d.unit != unit then continue
@@ -2229,11 +2237,11 @@ private declare_variants(c: *Checker, unit: usize)
         c.generic = Some(GenericScope(data_owner(id), d.decl.type_params))
         declare_bounds(c, unit, data_owner(id), d.decl.type_params, 0, d.decl.type_params.len())
         var variants: Buf[VariantSymbol] = buf()
+        var seen: Map[string, Span] = map()
         for v in d.decl.variants
-            if seen.get(v.name) is Some(_) || c.variants.get(qualified(d.module_name, v.name)) is Some(_)
-                machine_site(c, unit, v.span) match
-                    Some(site) -> c.note(unit, v.span, s"the state `${v.name}` of `${site.machine}` has the name of another variant of its module; a state is a variant of `${d.name}`, named on its own as every variant is, so it needs a name of its own")
-                    None -> c.note(unit, v.span, s"the variant `${v.name}` is declared more than once")
+            // A machine's state declared twice is reported where the machine is read.
+            if seen.get(v.name) is Some(_)
+                c.note(unit, v.span, s"the variant `${v.name}` is declared more than once")
                 continue
             seen.put(v.name, v.span)
             var names: Buf[string] = buf()
@@ -2247,10 +2255,19 @@ private declare_variants(c: *Checker, unit: usize)
                         c.note(unit, f.pattern.span, "a field is a name and a type")
                         names.push("_")
                 fields.push(resolve_type(c, unit, f.ty))
-            // A variant is a name of its type's module, private where its type is.
+            // A variant is a name of its type's module, private where its type is. A name several
+            // types share is seen from another module where one of them is public: see `exported`.
             val key = qualified(c.data[id].module_name, v.name)
-            c.variants.put(key, VariantRef(id, variants.len()))
-            if c.private_names.get(qualified(c.data[id].module_name, c.data[id].name)) is Some(_) then c.private_names.put(key, true)
+            val made = VariantRef(id, variants.len())
+            if c.variants.get(key) is Some(first)
+                var all: Buf[VariantRef] = buf()
+                if c.shared_variants.get(key) is Some(earlier) then all = earlier
+                else all.push(first)
+                all.push(made)
+                c.shared_variants.put(key, all)
+            else
+                c.variants.put(key, made)
+                if c.private_names.get(qualified(c.data[id].module_name, c.data[id].name)) is Some(_) then c.private_names.put(key, true)
             variants.push(VariantSymbol(v.name, v.span, names, fields, field_defaults(c, unit, id, v, names, fields)))
         c.data[id].variants = variants
         c.generic = outer_generic
@@ -2891,9 +2908,14 @@ private declare_methods(c: *Checker, unit: usize)
         // position, as a class's does; a variant with no fields is a value by its bare name, which
         // the companion would take.
         val key = qualified(module_name, d.name)
-        if c.variants.get(key) is Some(v)
-            if k.companion_data != Some(v.data) then c.note(unit, d.name_span, s"`${d.name}` is already a variant of `${c.data[v.data].name}`")
-            elif c.data[v.data].variants[v.index].fields.len() == 0 then c.note(unit, d.name_span, s"`${d.name}` is a variant of `${d.name}` with no fields, a value by its bare name; a companion object cannot share it")
+        var own_variant: Option[VariantRef] = None
+        var others: Buf[string] = buf()
+        for each in variants_at(c, key)
+            if k.companion_data == Some(each.data) then own_variant = Some(each)
+            else others.push(s"`${c.data[each.data].name}`")
+        if others.len() > 0 then c.note(unit, d.name_span, s"`${d.name}` is already a variant of ${spoken_list(others)}")
+        elif own_variant is Some(v)
+            if c.data[v.data].variants[v.index].fields.len() == 0 then c.note(unit, d.name_span, s"`${d.name}` is a variant of `${d.name}` with no fields, a value by its bare name; a companion object cannot share it")
         // `T.V` is the variant, so the companion cannot declare a member the variant would hide.
         if k.companion_data is Some(data_id)
             for m in d.members
@@ -3661,10 +3683,13 @@ private made_by(c: *Checker, o: usize) -> Option[MadeBy]
     val d = k.companion_data match
         Some(d) -> d
         None -> return None
-    val v = c.variants.get(qualified(k.module_name, k.name)) match
+    var found: Option[VariantRef] = None
+    for each in variants_at(c, qualified(k.module_name, k.name))
+        if each.data == d then found = Some(each)
+    val v = found match
         Some(v) -> v
         None -> return None
-    if v.data != d || c.data[d].variants[v.index].fields.len() == 0 then return None
+    if c.data[d].variants[v.index].fields.len() == 0 then return None
     Some(MadeBy(c.data[d].variants[v.index].fields, data_owner(d), c.data[d].decl.type_params.len(), s"the variant `${k.name}`"))
 
 /** Whether `apply` method `m` takes the same parameter types as the constructor `made`, so that no
@@ -3717,8 +3742,8 @@ private global_name_taken(c: *Checker, unit: usize, name: string, at: Span, obje
             if !c.symbols[f].constructor
                 c.note(unit, at, s"`$name` is already a function")
                 return true
-    if c.variants.get(key) is Some(v)
-        c.note(unit, at, s"`$name` is already a variant of `${c.data[v.data].name}`")
+    if c.variants.get(key) is Some(_)
+        c.note(unit, at, s"`$name` is already a variant of ${variant_owners(c, key)}")
         return true
     false
 
@@ -7893,7 +7918,7 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
             None ->
                 if path == "Nothing" && args.len() == 0 then return Nothing
                 c.variants.get(key) match
-                    Some(v) -> c.note(unit, t.span, s"`$path` is a variant of `${c.data[v.data].name}`, not a type")
+                    Some(_) -> c.note(unit, t.span, s"`$path` is a variant of ${variant_owners(c, key)}, not a type")
                     None -> c.note(unit, t.span, unknown_type_message(c, unit, path))
                 ErrorType
     Tuple(items) ->
@@ -8877,9 +8902,11 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
     if lookup_function(c, name) is Some(id)
         if abstract_constructor(c, id, at) then return TExpr(at, ErrorType, UnitConst)
         return named_function_value(c, at, name, None, expected)
-    if variant_named(c, name) is Some(v)
+    val (chosen, is_variant) = choose_variant(c, at, name, expected)
+    if chosen is Some(v)
         if c.data[v.data].variants[v.index].fields.len() == 0 then return construct(c, at, at, v, buf(), None, expected)
         c.note(symbol.unit, at, s"`$name` has fields; call it, as in `$name(…)`")
+    elif is_variant then ()
     elif tested_named(c, name) then c.note(symbol.unit, at, s"`$name` is bound by an `is` test, and is in scope only where that test is known to hold")
     else c.note(symbol.unit, at, s"`$name` is not defined")
     TExpr(at, ErrorType, UnitConst)
@@ -9189,9 +9216,11 @@ private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], 
             if abstract_constructor(c, id, target.span) then return TExpr(e.span, ErrorType, UnitConst)
             return named_function_value(c, e.span, name, Some(types), expected)
         if lookup_local(c, name) is None && param_index(c, name) is None
-            if variant_named(c, name) is Some(v)
+            val (chosen, is_variant) = choose_variant(c, target.span, name, expected)
+            if chosen is Some(v)
                 if c.data[v.data].variants[v.index].fields.len() == 0
                     return construct(c, e.span, target.span, v, buf(), Some(types), expected)
+            elif is_variant then return TExpr(e.span, ErrorType, UnitConst)
     // A method named without a call, with its own type arguments, as in `box.convert[int]`.
     if target.kind is Member(inner, name)
         val object = check_expr(c, inner, None)
@@ -9635,14 +9664,65 @@ global_named(c: *Checker, name: string) -> Option[usize]
     if local_function(c, name) is Some(_) then return None
     c.global_names.get(resolve_name(c, unit_of(c), name))
 
-/** The variant a name refers to in the code being checked, if it refers to one: a bare name, a
- * module's `m.V`, or the type's own `T.V` and `m.T.V`. */
-private variant_named(c: *Checker, name: string) -> Option[VariantRef]
+/** Every variant a name refers to in the code being checked, a bare name, a module's `m.V`, or the
+ * type's own `T.V` and `m.T.V`: none, one, or, where data types of one module share the name, each
+ * of them that is visible here, in declaration order. */
+private variants_named(c: *Checker, name: string) -> Buf[VariantRef]
     val key = resolve_name(c, unit_of(c), name)
+    var out: Buf[VariantRef] = buf()
     // A name another module's declaration is reached by is that module's public one.
-    if c.variants.get(key) is Some(v)
-        if !name.contains(".") || exported(c, key) then return Some(v)
-    qualified_variant(c, name)
+    if c.variants.get(key) is Some(_)
+        if !name.contains(".") || exported(c, key)
+            val here = c.files[unit_of(c)].module_name
+            for v in variants_at(c, key)
+                val d = c.data[v.data]
+                if d.module_name == here || exported(c, qualified(d.module_name, d.name)) then out.push(v)
+            if out.len() > 0 then return out
+    if qualified_variant(c, name) is Some(v) then out.push(v)
+    out
+
+/** Every variant of the qualified name `key`: its one, or each of the types sharing it. */
+variants_at(c: *Checker, key: string) -> Buf[VariantRef]
+    if c.shared_variants.get(key) is Some(vs) then return vs
+    var out: Buf[VariantRef] = buf()
+    if c.variants.get(key) is Some(v) then out.push(v)
+    out
+
+/** The data types with a variant of the qualified name `key`, for a diagnostic: "`Slant`", or
+ * "`Slant` and `Weight`". */
+variant_owners(c: *Checker, key: string) -> string
+    var names: Buf[string] = buf()
+    for v in variants_at(c, key)
+        names.push(s"`${c.data[v.data].name}`")
+    spoken_list(names)
+
+/** The variant a name means where a value of type `expected` is wanted: its one, or among several
+ * types sharing the name, the expected type's. Where the expected type does not decide between
+ * several, the use is reported, naming the types and the qualified forms that would decide it, and
+ * the answer is `(None, true)`; a name that is no variant answers `(None, false)`. */
+private choose_variant(c: *Checker, at: Span, name: string, expected: Option[&Type]) -> (Option[VariantRef], bool)
+    val vs = variants_named(c, name)
+    if vs.len() == 0 then return (None, false)
+    if vs.len() == 1 then return (Some(vs[0]), true)
+    if expected is Some(t)
+        if *zonk(c, t) is Data(id, _, _)
+            for v in vs
+                if v.data == id then return (Some(v), true)
+    // `m.Normal` is decided as `m.Slant.Normal`, through the module it was reached by.
+    var through = ""
+    for k in 0..<name.bytes.len
+        if name.bytes[k] == u8('.') then through = name[0..<k + 1]
+    var owners: Buf[string] = buf()
+    var forms: Buf[string] = buf()
+    for v in vs
+        owners.push(s"`${c.data[v.data].name}`")
+        forms.push(s"`$through${c.data[v.data].name}.${c.data[v.data].variants[v.index].name}`")
+    var choices = ""
+    for i in 0..<forms.len()
+        if i > 0 then choices = choices + (if i + 1 == forms.len() then " or " else ", ")
+        choices = choices + forms[i]
+    c.note(unit_of(c), at, s"`$name` is a variant of ${spoken_list(owners)}, and nothing here expects one of those types: write $choices")
+    (None, true)
 
 /** Where `path` is `T.V` or `m.T.V`, `T` naming a data type: the type and the last part, `V`. `None`
  * where the part before the last dot names no data type, or a local, a parameter, a member of the
@@ -10789,6 +10869,19 @@ private has_operator_traits(t: &Type) -> bool = *t match
     Class(_, _, _) -> true
     _ -> false
 
+// Whether `e` is a bare variant name, or a call of one, that several data types share, so that the
+// type it makes is the one its context expects.
+private shared_variant_use(c: *Checker, e: &Expr) -> bool
+    val name = e.kind match
+        Name(n) -> n
+        Call(callee, _) -> callee.kind match
+            Name(n) -> n
+            _ -> return false
+        _ -> return false
+    if lookup_local(c, name) is Some(_) || param_index(c, name) is Some(_) || class_member(c, name) is Some(_) then return false
+    if local_function(c, name) is Some(_) || global_named(c, name) is Some(_) then return false
+    variants_named(c, name).len() > 1
+
 private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[CompareOp]) -> &TExpr
     var early: Buf[Option[&TExpr]] = buf()
     var anchor: Option[&Type] = None
@@ -10799,9 +10892,9 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
         if ordering_method(c, ops[0], l.ty) then return operator_method_call(c, e.span, e.span, operands[0], l, compare_spelling(ops[0]), operands[1], None)
         first = Some(l)
     // A number or collection literal takes its type from another operand: `xs == [1, 2]` builds the
-    // collection `xs` is.
+    // collection `xs` is. So does a variant's name several types share: `w == Normal`.
     for o in operands
-        if is_literal(o) || is_collection_literal(o) then early.push(None)
+        if is_literal(o) || is_collection_literal(o) || shared_variant_use(c, o) then early.push(None)
         else
             val t = if early.len() == 0 && first is Some(_) then first.unwrap() else check_expr(c, o, None)
             if anchor is None && settled(t.ty) then anchor = Some(t.ty)
@@ -12329,7 +12422,7 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
     var global = if explicit is None && ids.len() == 0 then global_named(c, name) else None
     if global is Some(g)
         if c.globals[g].object is Some(k)
-            if variant_named(c, name) is Some(v)
+            for v in variants_named(c, name)
                 if c.classes[k].companion_data == Some(v.data) then global = None
     if global is Some(g)
         if c.globals[g].object is Some(_)
@@ -12339,13 +12432,18 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
             return TExpr(at, ErrorType, UnitConst)
         return value_call(c, at, callee, args)
     if ids.len() == 0
-        if variant_named(c, name) is Some(v)
+        val (chosen, is_variant) = choose_variant(c, named.span, name, expected)
+        if chosen is Some(v)
             if c.data[v.data].variants[v.index].fields.len() == 0
                 c.note(unit, at, s"`$name` has no fields; write it without parentheses")
                 for a in args
                     check_statement(c, a.value)
                 return TExpr(at, ErrorType, UnitConst)
             return construct(c, at, named.span, v, args, explicit, expected)
+        if is_variant
+            for a in args
+                check_statement(c, a.value)
+            return TExpr(at, ErrorType, UnitConst)
         if explicit is None
             if builtin_type(name) is Some(target) then return conversion(c, at, target, args, false)
             if integer_param_named(c, name) is Some(target) then return conversion(c, at, target, args, false)
@@ -12422,11 +12520,9 @@ private companion_variant(c: *Checker, o: usize, name: string) -> Option[Variant
     val d = c.classes[o].companion_data match
         Some(d) -> d
         None -> return None
-    val v = variant_named(c, name) match
-        Some(v) -> v
-        None -> return None
-    if v.data != d || c.data[d].variants[v.index].fields.len() == 0 then return None
-    Some(v)
+    for v in variants_named(c, name)
+        if v.data == d && c.data[d].variants[v.index].fields.len() > 0 then return Some(v)
+    None
 
 /** The `apply` method `m` of object `o`, for a diagnostic: "`Point.apply(x: int)`". */
 private apply_text(c: *Checker, o: usize, m: usize) -> string
@@ -13066,9 +13162,9 @@ private names_fieldless_value(c: *Checker, target: &Expr) -> Option[usize]
         _ -> return None
     if lookup_local(c, name) is Some(_) || param_index(c, name) is Some(_) then return None
     if class_member(c, name) is Some(_) || global_named(c, name) is Some(_) then return None
-    val v = variant_named(c, name)?
-    if c.data[v.data].name != name || c.data[v.data].variants[v.index].fields.len() > 0 then return None
-    Some(v.data)
+    for v in variants_named(c, name)
+        if c.data[v.data].name == name && c.data[v.data].variants[v.index].fields.len() == 0 then return Some(v.data)
+    None
 
 // Whether data type `id` has a static member `name`, which a call on the type's name means even
 // where the name is also a value.
@@ -15263,11 +15359,13 @@ private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string)
         InvalidPattern -> TPattern(p.span, ErrorType, PWildcard)
         Name(name) ->
             // A bare name is a variant with no fields when one is in scope, and otherwise binds.
-            if variant_named(c, name) is Some(v)
+            val (chosen, is_variant) = choose_variant(c, p.span, name, Some(ty))
+            if chosen is Some(v)
                 if c.data[v.data].variants[v.index].fields.len() > 0
                     c.note(unit, p.span, s"`$name` has fields; match them, as in `$name(…)`")
                     return TPattern(p.span, ErrorType, PWildcard)
                 return variant_pattern(c, p, v, buf(), ty, no_bind)
+            if is_variant then return TPattern(p.span, ErrorType, PWildcard)
             if no_bind != ""
                 c.note(unit, p.span, no_bind)
                 return TPattern(p.span, ErrorType, PWildcard)
@@ -15325,15 +15423,15 @@ private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string)
             for o in options
                 typed.push(check_pattern(c, o, ty, if no_bind == "" then "alternatives bind no names; write `_` for a value that is not used" else no_bind))
             TPattern(p.span, ty, PAlternatives(typed))
-        Constructor(path, args, parens) -> variant_named(c, path) match
-            Some(v) ->
+        Constructor(path, args, parens) ->
+            val (chosen, is_variant) = choose_variant(c, p.span, path, Some(ty))
+            if chosen is Some(v)
                 if !parens && c.data[v.data].variants[v.index].fields.len() > 0
                     c.note(unit, p.span, s"`$path` has fields; match them, as in `$path(…)`")
                     return TPattern(p.span, ErrorType, PWildcard)
-                variant_pattern(c, p, v, args, ty, no_bind)
-            None ->
-                if no_such_variant(c, p.span, path) then return failed_extractor(c, p, args, no_bind)
-                extractor_pattern(c, p, path, args, ty, no_bind)
+                return variant_pattern(c, p, v, args, ty, no_bind)
+            if is_variant || no_such_variant(c, p.span, path) then return failed_extractor(c, p, args, no_bind)
+            extractor_pattern(c, p, path, args, ty, no_bind)
         Rest(binder) ->
             c.note(unit, p.span, "`rest*` stands for the rest of a sequence, last in a sequence pattern or in an `unapplySeq` extractor's patterns")
             check_pattern(c, binder, ErrorType, no_bind)
@@ -15453,7 +15551,7 @@ private variant_instances(c: *Checker, x: &Type, y: &Type) -> bool
 // binder there.
 private binder_local(c: *Checker, binder: &Pattern, ty: &Type, no_bind: string) -> Option[usize] = binder.kind match
     Name(name) ->
-        if variant_named(c, name) is Some(_)
+        if variants_named(c, name).len() > 0
             c.note(unit_of(c), binder.span, s"`$name` is a variant; a comparison binds a name or `_`")
             return None
         if no_bind != ""

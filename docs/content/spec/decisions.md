@@ -2543,13 +2543,13 @@ their words are reserved.
     would then read data no longer current); running `leave` before the arm (an arm yielding `stay`
     would have left).
   - **A state is a variant of its module**, as every data type's variant is: `Locked(code)` and
-    `door.state() is Locked(_)` name it bare, so two machines of one module cannot share a state's
-    name, nor a state an event's variant; the error says so, naming the state and the machine.
-    Why: it follows from `Door.State` being an ordinary data type matched by bare names, as the
-    chapter writes. Alternatives: scoping state names to their machine, written bare only inside
-    it and `Door.State.Locked` outside (the chapter's own `door.state() is Locked(_)` would no
-    longer read). **Review with the user**: common names such as `Idle` or `Done` collide between
-    machines of one module.
+    `door.state() is Locked(_)` name it bare. Why: it follows from `Door.State` being an ordinary
+    data type matched by bare names, as the chapter writes. Alternatives: scoping state names to
+    their machine, written bare only inside it and `Door.State.Locked` outside (the chapter's own
+    `door.state() is Locked(_)` would no longer read). Amended (Proposed, branch `shared-variants`,
+    below): two machines of one module may now share a state's name, and a state an event's
+    variant, each bare use decided by the type expected there, as for every shared variant name;
+    until then a state's name had to be one no other variant of the module had.
   - **`Door.State` takes all of the machine's type parameters, with their bounds**, so a state of a
     generic machine may hold values of them: `Cell.State[string]`. Why: the smallest rule that lets
     any state hold any of them. Alternative: only the parameters the states use (the type's
@@ -3505,6 +3505,51 @@ spelling is better, as each entry says.
   overloads taking one beside their milliseconds; a command's deadline is a `monotonic()` reading;
   actor timers keep the runtime's monotonic microseconds and their `Duration` parameters.
   *Alternatives*: leaving the millisecond forms alone.
+
+- Settled on the user's delegation 2026-11-05: **Data types of one module may share a variant's
+  name** (branch `shared-variants`).
+  Replaces the rule that a variant's name is unique across a module's files, which kept a C or Sysl
+  binding from mirroring two enums with one variant name (`Slant.Normal`, `Weight.Normal`;
+  `sysl.process`'s `Stdio.Inherit` and `Group.Inherit`) and two machines from sharing `Idle`.
+  **Review with the user.** The parts:
+  - **The expected type decides a bare use.** A shared name is the variant of the type expected
+    where it is written: a parameter's, an annotated binding's, a result's, a field's, a
+    collection's element, and in a pattern the matched value's, so nested patterns decide each name
+    by its field's type. Why: it is how the qualified form's work is already done everywhere a type
+    is known, and it keeps bare names, Avin's usual form, working in all the places a shared name is
+    actually used. Alternatives: refusing every bare use of a shared name (mirrors would read
+    `Weight.Normal` everywhere); picking the first declared type (silent, order-dependent);
+    deciding also by shape, a call meaning the variant with fields (a second rule for a reader to
+    know; not built).
+  - **Where nothing decides it, an error names the types and the qualified forms**: "`Normal` is a
+    variant of `Slant` and `Weight`, and nothing here expects one of those types: write
+    `Slant.Normal` or `Weight.Normal`". An expected type that is none of them is not a decision, and
+    `Any` or a trait expected is not either. Reached through a module, the forms keep the module:
+    `fonts.Slant.Normal`. Why: the qualified form always works, so the fix is the message.
+  - **A comparison's other operand decides**, as it does a number literal's type: `w == Normal`,
+    `Normal != w`. A shared name, bare or called, is checked after the other operands, with their
+    type expected. Why: comparing with a variant is the commonest use outside a `match`.
+    Alternative: requiring `is Normal` or `Weight.Normal` there.
+  - **Coverage, derived impls and shapes are per type** and unchanged: a `match` over `Weight` is
+    covered by `Weight`'s own variants; `Display`/`Debug` write the name; `Eq`/`Hash`/`Ord`, `walk`
+    and `build` use the type's own declaration order; layouts and mirrors are keyed by type, and a
+    mirrored variant crosses into Sysl as its own enum's.
+  - **A shared name is still one name of the module**: a function, module-level value or object of
+    that name is refused ("`Normal` is already a variant of `Slant` and `Weight`"), a companion object
+    may not have a name another type's variant has, and the name is not a type. Within one type a
+    variant's name stays its own. Why: functions and values are not chosen by expected type, so the
+    clash would stay unresolvable. Alternative: letting a function or value hide the variants.
+  - **Imports: `import m.Normal` is allowed** where `m`'s types share `Normal`; the imported name is
+    shared in the importing file as in `m`, and decided the same way. Why: it costs no new rule and a
+    file importing one of the names for its own type's use reads naturally. Alternative weighed:
+    refusing the import and asking for the type (`import m.Weight`, then `Weight.Normal`), which the
+    brief leaned to; refused because the bare form then could not be written at all in that file.
+  - **Visibility**: a shared name is seen from another module where any of its types is public, and
+    a private type's variant is left out there, so where only one type is public its variant needs
+    no deciding (`signals.Stop`). Where all are private the name is private to its module.
+  - Machines: two machines' states, and a state and an event's variant, may share a name, by the same
+    rule (amending the settled machine entry above). An arm's result is its own `State`, `handle`'s
+    argument the event type, so machine code needs nothing written.
 
 **Deferred**
 

@@ -433,7 +433,10 @@ machine Door receives DoorEvent
   `Door.State` is a `data` type the declaration makes, with a variant for each state and the state's
   parameters as its fields, so a program matches on it:
   `door.state() is Locked(_)`. Its variants are names of the machine's module, as every variant
-  is, so a state's name is one no other variant of the module has. A machine is a mutable object, so it is not sendable; handling an
+  is, and may share a name with another machine's state or an event's variant, as [variants of
+  different types may](/spec/declarations/#data): an arm's result is its own machine's state,
+  an event passed to `handle` is the event type's, and `door.state() is Idle` matches against
+  `Door.State`. A machine is a mutable object, so it is not sendable; handling an
   event from inside one of its own arms, `enter` or `leave` blocks traps, as taking a held mutex does.
 
 ### An actor's states
