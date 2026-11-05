@@ -58,6 +58,11 @@ lives in a box on the heap, so a closure run on another thread shares it with th
 it. Nothing is copied when a thread starts; the closure and what it captures are simply reachable
 from the new thread too.
 
+A [Sysl handle](/spec/sysl-bindings/#handles) is the exception: it belongs to one owner at a time,
+and a use by any other code traps. The handles a thread's body or a future's body reaches move to
+it when it starts, and are in transit, for the next code to use them, once it returns; an actor
+will own its handles across every message, whichever thread runs it.
+
 ## Synchronization
 
 `avin.threads` offers, all written in Avin over Sysl's atomics and futex-based locks:

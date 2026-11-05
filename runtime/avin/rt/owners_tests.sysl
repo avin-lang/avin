@@ -1,0 +1,120 @@
+module avin.rt
+@tests
+
+import sh.sysl.gc
+import sysl.raw.ptr_cast
+import sysl.sync.*
+
+// A descriptor followed by the offsets of its two reference fields, as the compiler emits one.
+private struct TwoRefs
+    d: Descriptor
+    offsets: [2]usize
+
+@assert(offsetof(TwoRefs, offsets) == sizeof(Descriptor), "a descriptor's offsets follow it")
+
+// A finalizer that does nothing, which marks a descriptor as a handle's.
+private let_go(p: *u8, h: *gc.Heap) = ()
+
+private var node: TwoRefs = TwoRefs(descriptor(0, 16, 2), [0, 8])
+private var handle: Descriptor = Descriptor(gc.Kind(&trace, &let_go, null, null), 0, 16, 0, null)
+private var refs_array: Descriptor = Descriptor(gc.Kind(&trace_array, null, null, null), 0, 8, 0, null)
+private var owning: Context = new_context()
+
+private struct Roots
+    frame: Frame
+    slots: [6]*u8
+
+private var roots: Roots = Roots(Frame(null, 6), [null, null, null, null, null, null])
+
+private owner_word(h: *u8) -> *u64 = ptr_cast(usize(h) + HandleOwnerOffset)
+
+private made_handle(owner: u64, slot: usize) -> *u8
+    val h = allocate(&owning, &handle)
+    roots.slots[slot] = h
+    *owner_word(h) = owner
+    h
+
+private made_node(first: *u8, second: *u8, slot: usize) -> *u8
+    val p = allocate(&owning, &node.d)
+    roots.slots[slot] = p
+    val fields: **u8 = ptr_cast(p)
+    fields[0] = first
+    fields[1] = second
+    p
+
+private begin()
+    attach(&owning)
+    leave_safe(&owning)
+    roots.frame.prev = null
+    owning.top = &roots.frame
+
+private end()
+    for i in 0..<6 do roots.slots[i] = null
+    owning.top = null
+    detach(&owning)
+
+@test("every context and every new owner is a different owner, and none is in transit")
+owners_are_distinct()
+    val a = new_context()
+    val b = new_context()
+    assert(a.owner != b.owner)
+    assert(a.owner != InTransit)
+    val n = fresh_owner()
+    assert(n != a.owner && n != b.owner && n != InTransit)
+
+@test("handing over moves the handles a value reaches that one owner owns, through a cycle, and leaves the rest")
+hand_over_moves_one_owners_handles()
+    begin()
+    val h1 = made_handle(5, 0)
+    val h2 = made_handle(6, 1)
+    val h3 = made_handle(5, 2)
+    val inner = made_node(h2, h3, 3)
+    val outer = made_node(h1, inner, 4)
+    // A cycle back to the start is visited once.
+    val fields: **u8 = ptr_cast(inner)
+    fields[1] = outer
+    val again = made_node(h3, null, 5)
+    hand_over(&owning, outer, 5, 9)
+    assert_eq(*owner_word(h1), 9u64)
+    assert_eq(*owner_word(h2), 6u64)
+    // `h3` is reachable only from `again`, which `outer` no longer reaches.
+    assert_eq(*owner_word(h3), 5u64)
+    hand_over(&owning, again, 5, long(InTransit))
+    assert_eq(*owner_word(h3), InTransit)
+    hand_over(&owning, null, 5, 9)
+    end()
+
+@test("handing over walks the elements of an array of references, null ones included")
+hand_over_walks_arrays()
+    begin()
+    val h1 = made_handle(3, 0)
+    val h2 = made_handle(3, 1)
+    val a = new_array(&owning, &refs_array, 3)
+    roots.slots[2] = a
+    val elements: **u8 = ptr_cast(array_elements(a))
+    elements[0] = h1
+    elements[2] = made_node(h2, null, 3)
+    hand_over(&owning, a, 3, 4)
+    assert_eq(*owner_word(h1), 4u64)
+    assert_eq(*owner_word(h2), 4u64)
+    end()
+
+@test("a handle in transit is taken by its first user; one another owns is not")
+claiming_takes_only_what_is_in_transit()
+    begin()
+    val free = made_handle(InTransit, 0)
+    val theirs = made_handle(owning.owner + 1000, 1)
+    val mine = made_handle(owning.owner, 2)
+    assert(handle_claim(&owning, free))
+    assert_eq(*owner_word(free), owning.owner)
+    assert(!handle_claim(&owning, theirs))
+    assert_eq(*owner_word(theirs), owning.owner + 1000)
+    assert(handle_claim(&owning, mine))
+    end()
+
+@test("the running code's owner is what the library sets it to")
+owner_is_set()
+    val was = owner_current(&owning)
+    owner_set(&owning, 77)
+    assert_eq(owner_current(&owning), 77i64)
+    owner_set(&owning, was)

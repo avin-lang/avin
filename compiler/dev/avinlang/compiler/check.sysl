@@ -5227,6 +5227,22 @@ intrinsic_entry(name: string) -> Option[(string, Buf[&Type], &Type)]
     elif name == "thread_current"
         entry = "avin_rt_thread_current"
         result = Int(64)
+    // The owners of Sysl handles: a new one, the running code's, setting the running code's, and
+    // handing what a value reaches from one owner to another.
+    elif name == "owner_new"
+        entry = "avin_rt_owner_new"
+        result = Int(64)
+    elif name == "owner_current"
+        entry = "avin_rt_owner_current"
+        result = Int(64)
+    elif name == "owner_set"
+        entry = "avin_rt_owner_set"
+        params.push(Int(64))
+    elif name == "hand_over"
+        entry = "avin_rt_hand_over"
+        params.push(AnyType)
+        params.push(Int(64))
+        params.push(Int(64))
     // A sleeping lock and a condition variable, each an opaque object on the collected heap.
     elif name == "lock_new"
         entry = "avin_rt_lock_new"
@@ -5881,19 +5897,21 @@ private check_crossings(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
         val p = f.params[i]
         val t = params[first + i]
         if p.by_name then c.note(unit, p.pattern.span, "a by-name parameter cannot cross to Sysl")
-        elif holds_handle(c, t) then c.note(unit, p.ty.span, s"`${type_name(t)}` cannot cross to Sysl: a Sysl handle goes back into Sysl only as the receiver of its own methods")
+        elif is_handle(c, t) then ()
+        elif holds_handle(c, t) then c.note(unit, p.ty.span, s"`${type_name(t)}` cannot cross to Sysl: a Sysl handle goes back into Sysl only by itself, as a parameter or the receiver of its own methods")
         elif !crosses_to_sysl(c, t) then c.note(unit, p.ty.span, s"`${type_name(t)}` cannot cross to Sysl; ${BoundaryTypes}")
     if result is Some(r)
         if !crosses_out_of_sysl(c, r)
             val at = if f.result is Some(t) then t.span else f.name_span
-            if holds_handle(c, r) then c.note(unit, at, s"`${type_name(r)}` cannot cross out of Sysl: a Sysl handle is a binding's result, the value of its `Option` or `Result`, or a part of a tuple that is one of these")
+            if holds_handle(c, r) then c.note(unit, at, s"`${type_name(r)}` cannot cross out of Sysl: a Sysl handle is a binding's result, held in its `Array`, `Vector`, `Option` or `Result`, or a part of a tuple that is one of these")
             else c.note(unit, at, s"`${type_name(r)}` cannot cross to Sysl; ${BoundaryTypes}")
 
 const BoundaryTypes: string = "a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, data types declared with `@sysl` to mirror a Sysl enum or struct, and `Array`, `Vector`, `Option`, `Result` and tuples of these"
 
 /** Whether a value of type `t` crosses between Avin and Sysl, converted by a binding's shim. A Sysl
- * handle crosses only out of Sysl, as a binding's result or the payload of its `Option` or
- * `Result`, which is what `crosses_out_of_sysl` asks. */
+ * handle held in another type crosses only out of Sysl, as a binding's result or held in its
+ * `Array`, `Vector`, `Option` or `Result`, which is what `crosses_out_of_sysl` asks; a handle by
+ * itself also crosses into Sysl as a parameter. */
 crosses_to_sysl(c: *Checker, t: &Type) -> bool = crosses(c, t, false)
 
 /** Whether a value of type `t` crosses out of Sysl as a binding's result. */
@@ -5916,11 +5934,30 @@ private crosses(c: *Checker, t: &Type, handles: bool) -> bool = *t match
         d.name == "Result" && args.len() == 2 && crosses(c, args[0], handles) && crosses(c, args[1], handles)
     Class(k, _, args) ->
         if handle_target(c.classes[k].decl) is Some(_) then return handles
-        (is_array_class(c.classes[k]) || is_vector_class(c.classes[k])) && args.len() == 1 && crosses_to_sysl(c, args[0])
+        // A collection's elements may be handles, but not tuples holding one.
+        (is_array_class(c.classes[k]) || is_vector_class(c.classes[k])) && args.len() == 1 && crosses(c, args[0], handles) && !tuple_holds_handle(c, args[0])
     Tuple(items) ->
         for item in items
             if !crosses(c, item, handles) then return false
         true
+    _ -> false
+
+/** Whether `t` is a tuple holding a Sysl handle, or holds one. */
+private tuple_holds_handle(c: *Checker, t: &Type) -> bool = *t match
+    Tuple(_) -> holds_handle(c, t)
+    Data(_, _, args) ->
+        for a in args
+            if tuple_holds_handle(c, a) then return true
+        false
+    Class(_, _, args) ->
+        for a in args
+            if tuple_holds_handle(c, a) then return true
+        false
+    _ -> false
+
+/** Whether `t` is a Sysl handle itself. */
+private is_handle(c: *Checker, t: &Type) -> bool = *t match
+    Class(k, _, _) -> handle_target(c.classes[k].decl) is Some(_)
     _ -> false
 
 /** Whether `t` is a Sysl handle, or a collection, `Option`, `Result` or tuple that holds one. */

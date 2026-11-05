@@ -315,17 +315,39 @@ parseBigInt(s: string) -> Option[BigInt]
 ```
 
 - **Only a binding makes a handle.** A handle has no parameters and no constructor; a binding that
-  returns one — directly, in an `Option` or a `Result`, as a part of a tuple, or from a handle's own
-  method — makes the
-  object, holding one counted reference to the Sysl value it was given (a value is moved into a
-  reference of its own; a counted reference is shared).
-- **A handle goes back into Sysl only as the receiver of its own methods.** A binding taking a handle
-  as a parameter, even inside an `Option`, is an error, and so is a collection of handles or a
-  mirror holding one: a handle crosses out of Sysl only as a result, the value of its `Option` or
-  `Result`, or a part of a tuple that is one of these, as `accept` answers
-  `Result[(Socket, Address), IoError]`. Its Sysl value's fields are not the handle's members.
+  returns one — directly, in an `Array`, a `Vector`, an `Option` or a `Result`, as a part of a
+  tuple, or from a handle's own method — makes the object, holding one counted reference to the Sysl value it was given (a
+  value is moved into a reference of its own; a counted reference is shared). A collection of
+  handles comes from a Sysl slice or `Buf` of values or of counted references, and each element is
+  a handle of its own, closed and collected on its own.
+- **A handle goes back into Sysl by itself**: as the receiver of its own methods, or as a parameter
+  of a binding or of another handle's method. A Sysl type with a destructor is always held by a
+  counted reference, and its parameter shares the handle's; a type without one is passed as the
+  Sysl parameter takes it — by value, a copy, or as a pointer to the handle's own value. A handle
+  inside an `Option`, a collection or a tuple does not go into Sysl, and no mirror holds one; a
+  tuple holding a handle crosses out of Sysl as a result, the value of its `Option` or `Result`, or
+  a part of a tuple that is one of these, as `accept` answers `Result[(Socket, Address), IoError]`,
+  and never sits in a collection. Its Sysl value's fields are not the handle's members.
+
+  ```avin
+  @sysl("sysl.net.Address")
+  class Address
+      port() -> int
+
+  @sysl("sysl.net.Socket")
+  class Socket
+      connect(to: Address) -> Result[unit, IoError]
+
+  @sysl("sysl.net.resolve")
+  resolve(host: string, port: int) -> Result[Vector[Address], IoError]
+
+  @sysl("sysl.net.socket")
+  socket(forAddress: Address) -> Result[Socket, IoError]
+  ```
+
 - **`close()` gives the value back.** Every handle has it. Closing again does nothing; a bound method
-  called on a closed handle stops the program at the call:
+  called on a closed handle, or a closed handle passed to Sysl as a parameter, stops the program at
+  the call:
 
   ```text
   avin: trap: `Crc32` is closed at main.avin:18:13
@@ -334,6 +356,33 @@ parseBigInt(s: string) -> Option[BigInt]
 - **A handle never closed is given back by the collector**, when it frees the object, through a
   finalizer the shim generates for the class. When that happens is not specified: a value that holds
   something scarce, such as a file, is closed.
+- **A handle belongs to one owner at a time.** Its Sysl value is held by a counted reference whose
+  count is not atomic, so a handle is never used by two threads at once. Each handle records its
+  owner, the code that made it, and every use — a bound method, the handle passed as a parameter,
+  `close()` — compares it with the owner of the code running and stops the program at the call where
+  they differ:
+
+  ```text
+  avin: trap: `Socket` belongs to another thread at main.avin:31:5
+  ```
+
+  The owner is not an operating system thread but whatever the runtime is running: a thread's body,
+  a task on the futures' pool (whichever worker runs it), and, once there are actors, an actor, which
+  keeps its handles from one message to the next whichever thread runs it. The check is one compare
+  of two words, the handle's owner and the running code's, which the runtime sets when it starts
+  running something else.
+
+  **Ownership moves with what is handed to code that runs elsewhere.** The handles a thread's body or
+  a future's body reaches — captured directly, or through any object or collection — that the
+  calling code owns become the body's when it is started, and the caller's next use of one traps.
+  When the body returns, what it was given and what it returns are **in transit**, as is a value a
+  future or promise is completed with and what a callback given to `onComplete` or `map` reaches: a
+  handle in transit is taken by the first code to use it. A value sent on a channel keeps its owner.
+  How a program hands a handle over explicitly is [proposed](/spec/decisions/#proposed).
+
+  The finalizer never checks the owner: a handle is finalized only once nothing can reach it, so no
+  other code can be using it, and the collector, which runs finalizers on whichever thread collects
+  while every other is stopped, gives its reference back.
 - **A handle is compared by identity**, and has no `Display` of its own.
 
 The bytes a handle's method answers may be a view of the handle's own value; they are copied out

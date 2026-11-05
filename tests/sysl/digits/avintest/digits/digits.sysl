@@ -158,6 +158,99 @@ count_or_zero(n: Option[i64]) -> i32 = n match
     Some(m) -> digit_count(m)
     None -> 0
 
+/** How many tallies have been given back. */
+var tallies_given_back = 0i64
+
+/** A running total with a destructor, which counts the tallies given back. */
+struct Tally
+    total: i64
+
+    /** Adds `n` to the total. */
+    add(*self, n: i64)
+        self.total += n
+
+    /** The total. */
+    get(self) -> i64 = self.total
+
+    /** The total so far. */
+    value(*self) -> i64 = self.total
+
+    /** Adds the total of `other` to this one's. */
+    absorb(*self, other: &Tally)
+        self.total += other.total
+
+impl Drop for Tally
+    drop(self) = tallies_given_back += 1
+
+/** A tally starting at `n`. */
+new_tally(n: i64) -> &Tally = Tally(n)
+
+/** How many tallies have been given back. */
+given_back() -> i64 = tallies_given_back
+
+/** The sum of the totals of `a` and `b`. */
+sum_of(a: &Tally, b: &Tally) -> i64 = a.total + b.total
+
+/** Adds one to `t`'s total, which every holder of `t` sees. */
+bump(t: &Tally)
+    t.total += 1
+
+/** Tallies starting at each number from zero below `n`. */
+tallies(n: i64) -> Buf[&Tally]
+    var out: Buf[&Tally] = buf()
+    for i in 0..<n
+        out.push(Tally(i))
+    out
+
+/** Tallies starting at each number from zero below `n`, or an error when `n` is negative. */
+maybe_tallies(n: i64) -> Result[Buf[&Tally], string] = if n < 0 then Err("negative") else Ok(tallies(n))
+
+/** A place on a line, a value with no destructor. */
+struct Mark
+    at: i64
+
+    /** The place. */
+    place(self) -> i64 = self.at
+
+/** The mark at `n`. */
+mark_at(n: i64) -> Mark = Mark(n)
+
+/** The distance from `a` to `b`. */
+distance(a: Mark, b: Mark) -> i64 = b.at - a.at
+
+/** Moves `m` one place on, through a pointer to it. */
+nudge(m: *Mark)
+    m.at += 1
+
+/** Marks at each number from zero below `n`, or none when `n` is zero. */
+marks(n: i64) -> Option[[]Mark]
+    if n == 0 then return None
+    var out: []Mark = [Mark(0); usize(n)]
+    for i in 0..<usize(n)
+        out[i] = Mark(i64(i))
+    Some(out)
+
+/** A book of tallies and marks: a second type whose methods take the others. */
+struct Ledger
+    sum: i64
+    entries: i64
+
+    /** Records `t`'s total. */
+    record(*self, t: &Tally)
+        self.sum += t.total
+        self.entries += 1
+
+    /** Records `m`'s place. */
+    mark(*self, m: Mark)
+        self.sum += m.at
+        self.entries += 1
+
+    /** The sum recorded, and how many entries made it, as `sum * 1000 + entries`. */
+    summary(self) -> i64 = self.sum * 1000 + self.entries
+
+/** An empty ledger. */
+new_ledger() -> Ledger = Ledger(0, 0)
+
 /** The count of `n`'s decimal digits and the digits as text. */
 count_and_text(n: i64) -> (i64, string) = (i64(digit_count(n)), digits_text(n))
 
@@ -194,19 +287,17 @@ labelled(pairs: [](string, i64)) -> string
         b.push(s"${pairs[i].1}")
     b.finish()
 
-/** A running total, which Avin holds as a handle. */
-struct Tally
-    total: i64
-
-    /** The total so far. */
-    value(*self) -> i64 = self.total
-
 /** A tally of `n`'s digits beside the digits as text. */
-tally_of(n: i64) -> (Tally, string) = (Tally(i64(digit_sum(i32(n)))), digits_text(n))
+tally_of(n: i64) -> (&Tally, string)
+    val t: &Tally = Tally(i64(digit_sum(i32(n))))
+    (t, digits_text(n))
 
 /** Two tallies, of `a`'s digit sum and of `b`'s, or an error when either is negative. */
-two_tallies(a: i64, b: i64) -> Result[(Tally, Tally), string] =
-    if a < 0 || b < 0 then Err("negative") else Ok((Tally(i64(digit_sum(i32(a)))), Tally(i64(digit_sum(i32(b))))))
+two_tallies(a: i64, b: i64) -> Result[(&Tally, &Tally), string]
+    if a < 0 || b < 0 then return Err("negative")
+    val x: &Tally = Tally(i64(digit_sum(i32(a))))
+    val y: &Tally = Tally(i64(digit_sum(i32(b))))
+    Ok((x, y))
 
 /** `n` beside its digits as text and its digit count, a tuple inside a tuple. */
 nested_pair(n: i64) -> (i64, (string, u8)) = (n, (digits_text(n), u8(digit_count(n))))
@@ -361,11 +452,11 @@ struct Latch
     opened: Atomic[i32]
     label: Buf[u8]
 
-    /** Waits until the latch is opened, sleeping a millisecond at a time, and answers its label: a
-     * view of the latch. */
+    /** Waits until the latch or the gate is opened, sleeping a millisecond at a time, and answers
+     * its label: a view of the latch. */
     @views(self)
     wait(*self) -> []const u8
-        while self.opened.load() == 0
+        while self.opened.load() == 0 && gate_open.load() == 0
             sleep(millis(1))
         self.label.view()
 
