@@ -1679,21 +1679,15 @@ their words are reserved.
   bodies at the start of a line (`stay` as an arm's value), so `state` stays an ordinary name
   elsewhere.
 
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- **Handing a handle over explicitly** ([Sysl bindings](/spec/sysl-bindings/#handles)). The
+- Settled on the user's delegation 2026-11-05: **Handing a handle over explicitly** ([Sysl bindings](/spec/sysl-bindings/#handles)). The
   spec has no spelling for it. Proposed: `handOff(value: Any)` in `avin.threads`, putting every
   handle `value` reaches that the running code owns in transit, for the next code to use it; and
   `Channel.send` doing the same with what it sends, which it does not do now because handing a value
   over walks it, and a channel of plain values should not pay for that (the compiler would skip
   the walk for a type that cannot reach a handle).
-- [Executors](/spec/threads/#executors) (2026-11-04): `Executor.fixed(n)` keeps at most `n` tasks
+  **Review with the user:** `Channel.send` walking each message to move handle ownership costs every
+  channel; the compiler skipping the walk for types that cannot reach a handle is the mitigation.
+- Settled on the user's delegation 2026-11-05: [Executors](/spec/threads/#executors) (2026-11-04): `Executor.fixed(n)` keeps at most `n` tasks
   working at once and starts its workers as work comes, as the shared pool does, a worker waiting in
   `await` or `blocking` leaving its place to another; `n` below one traps. After `shutdown()`,
   `ex.future(body)` traps, while the `map`, `flatMap` and `onComplete` of futures already made on
@@ -1701,14 +1695,37 @@ their words are reserved.
   before is stranded. `Executor.shared().shutdown()` traps, since every `Future(body)` runs there.
   `ex.isShutdown()` answers whether it was shut down. `Future.successful`, `Future.all`,
   `Future.first`, `Future.traverse` and a promise's future belong to the shared executor.
-- [`sleep`](/spec/threads/#futures) (2026-11-04): a worker that sleeps keeps its place in its pool;
+- Settled on the user's delegation 2026-11-05: [`sleep`](/spec/threads/#futures) (2026-11-04): a worker that sleeps keeps its place in its pool;
   a body that should leave it while it sleeps writes `blocking(sleep(d))`. Sleeping is a runtime
   function bound `blocking` over Sysl's `sleep`, which waits out the whole duration.
-- [`orElse` on a future of a `Result`](/spec/threads/#futures) (2026-11-04):
+- Settled on the user's delegation 2026-11-05: [`orElse` on a future of a `Result`](/spec/threads/#futures) (2026-11-04):
   `orElse[U >: T, F](other: -> Future[Result[U, F]])`, widening the value as `Result.orElse` does.
   `Future` stays invariant, since its cell is a mutable field, so a fallback written in place as
   `Future.successful(Ok(0))` needs its type stated where nothing else decides its error type.
-- `Url`'s details ([system library](/spec/system-library/#url)), where the design left them open:
+  `Future` stays invariant: exempting object-private fields from the variance check (as the user had
+  accepted) proved unsound here, because each set of type arguments has its own code and a method
+  run through a wider view could store a value of the wider type in a field the narrower view reads
+  (probe on branch private-variance, not landed). Sound alternatives, not taken now: dispatching a
+  class with object-private members by the type arguments in its header, or reading type
+  arguments from the object at run time. **Review with the user:** this reverses an accepted
+  recommendation.
+- Settled on the user's delegation 2026-11-05: Weighted choice in [`avin.random`](/spec/system-library/#avin-random), approved in kind by the user
+  2026-11-04, the names and details proposed:
+  - `choose[T](items: Seq[T]) -> T` is uniform (one `nextInt(items.length())`) and traps on an empty
+    sequence. `chooseWeighted(weights: Seq[real]) -> int` answers an index and
+    `chooseWeighted[T](pairs: Seq[(T, real)]) -> T` an item, the two overloaded by parameter type.
+    Both are on `Random` and on the companion's shared generator.
+  - A draw is `nextReal()` times the total of the weights, redrawn while it rounds up to the total,
+    and the answer is the first index whose running total is above it, so a zero weight is never
+    chosen and a seed replays. The traps: no weights, a weight that is negative or NaN, an infinite
+    weight, a total that overflows, a total of zero.
+  - `Weighted[T](pairs)` holds the running totals and the items, built once; `sample(rng: Random) -> T`
+    draws by binary search, O(log n), and `size()` is the number of items. It draws exactly as
+    `chooseWeighted` would from the same generator state. The alias method (O(1) a draw, a
+    different mapping of draws to items) was not taken: the cumulative table keeps one draw per
+    sample and a mapping a reader can follow.
+
+- Settled on the user's delegation 2026-11-05: `Url`'s details ([system library](/spec/system-library/#url)), where the design left them open:
   - `Url` is a `data` type whose `host` is an `Option[string]`, `None` where there is no authority
     (`mailto:a@b`) and `Some("")` where it is empty (`file:///etc`); an IPv6 host keeps its brackets;
     `userInfo`, `query` and `fragment` are `Option`s like `port`.
@@ -1729,7 +1746,7 @@ their words are reserved.
   - `resolve(ref: string)` answers a `Result`, the reference being text; `resolve(ref: Url)` takes
     one already read. The `with` methods take components as written and trap on one the URL cannot
     hold; each optional component's method takes a value or an `Option`.
-- **`Source` is a trait**, its three readers abstract, so a program can write a source of its own
+- Settled on the user's delegation 2026-11-05: **`Source` is a trait**, its three readers abstract, so a program can write a source of its own
   (text made as it is read, a socket later) and hand it to any function that takes one; the kinds
   `avin.io` makes are private classes reached only through `Source.fromFile`, `fromString` and
   `stdin`. The alternative is a final class whose kinds are fixed by the library.
@@ -1757,6 +1774,16 @@ their words are reserved.
     convention, and Avin's calls pass a context and keep a shadow-stack frame.
   - The language has no `try`, `defer` or `finally`, so there is no pending cleanup to take a call
     out of tail position; when such a construct is added, a call inside it is not in tail position.
+
+**Deferred**
+
+- Public C interoperability. Until then, C is reached through Sysl.
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
