@@ -2316,9 +2316,11 @@ their words are reserved.
   `Child`, which misleads a reader of the library); the trap text computed by the runtime from a
   name the token holds (the check is inline, one compare in compiled code, and its text is fixed
   when the program is compiled); naming the trap after the class whose method made the call (a
-  rule no reader would guess). `Socket` still names itself, for a `TcpStream` and a `TcpListener`
-  both; naming those for the user's type would need one handle class per type. Review with the
-  user whether they should.
+  rule no reader would guess). `TcpStream` and `TcpListener` each keep a handle class of their
+  own over the one runtime type `avin.rt.Connection`, `named:` for the type, so their traps name
+  the type the user holds (branch `socket-trap-names`); two handle classes may share one Sysl
+  type. The other library handles (`File`, `FdReader`, `Spawned`, `Address`) are held only inside
+  private library values whose own checks come first, so none is named further.
 - Settled on the user's delegation 2026-11-05 (built on branch `module-var-threads`): **a thread's body reaches no
   module-level mutable state** ([what is shared](/spec/threads/#what-is-shared)). What is passed
   for a `@sendable` parameter, directly or through every function it reaches, reads and writes no
