@@ -1855,9 +1855,48 @@ their words are reserved.
     recursive call, as the reference language does, rather than accepting it silently.
   - **A function calling itself is made a loop; mutual recursion is left to general tail calls**,
     which need every caller and callee to agree on a calling convention and to unlink the
-    shadow-stack frame before the call, and are built on branch `tailcalls` with their own entry.
+    shadow-stack frame before the call, and have their own entry (below).
   - The language has no `try`, `defer` or `finally`, so there is no pending cleanup to take a call
     out of tail position; when such a construct is added, a call inside it is not in tail position.
+- Settled on the user's delegation 2026-11-05: **[Guaranteed tail calls](/spec/declarations/#tail-calls)**
+  (branch `tailcalls`). Every call in tail position of a function of the program, by name, through
+  a method table or of a function value, replaces the caller's stack frame, at `-O0` as at `-O2`,
+  so mutual recursion, state machines of functions and continuation passing run in constant stack.
+  A self-call is still a jump within the function, which is cheaper. `@tailrec` stays about
+  self-recursion.
+  - Every compiled function has LLVM's `tailcc` convention, and a tail call is `musttail call
+    tailcc` followed at once by its `ret`. The C convention is kept only where code outside the
+    program calls in: `main`, a C-convention wrapper for each function whose address a Sysl
+    binding's shim is given, and the closure runner the runtime calls to start a thread.
+  - Calls through method tables and of function values are tail calls too, since every address a
+    table, a type record or a closure holds is a function of the program with its convention. A call
+    the whole-program pass guards by the receiver's descriptor returns from each of its branches.
+  - The caller gives its shadow-stack frame back just before the call, as a return does. The
+    arguments are then roots of no frame until the callee links its own, its first act, and nothing
+    between the two allocates, polls or stores, so no collection can see the gap.
+  - A call stays an ordinary one where an argument may point into the caller's own stack (a local
+    function given the address of a local it captures), where the core library calls the program's
+    code (it restores the caller site after), where the result is converted, and in a class's
+    constructor, which publishes its object after its body. A lambda or local function value that
+    captures a local of its enclosing function is entered through an entry that keeps the local on
+    its own stack, so that entry's call adds one frame per call; capturing only parameters and values
+    adds none.
+  - **Only a function whose arguments all travel in registers has `tailcc`**: the context and at
+    most five integers, bools or references, at most eight reals, and no integer wider than `long`
+    as a parameter or the result. The rest keep the C convention and make and receive ordinary
+    calls. Under `tailcc` the callee pops the arguments passed on the stack, and LLVM's unoptimized
+    code generation reloads spilled values from the wrong place after such a call (seen as crashes
+    and wrong results at `-O0`); with every argument in a register there is nothing to pop. The
+    limits are those of the smallest target (x86-64: six integer registers, eight vector ones), so a
+    program's stack use is the same everywhere. **Review with the user**: a function with six or more
+    such parameters gets no tail call; lifting the limit means passing the extra arguments in a
+    block the caller's caller owns, or a fixed LLVM.
+  - Alternatives weighed: merging each group of mutually recursive functions into one function that
+    switches on which one is running (no convention change, but only for calls by name, and code
+    size grows with the group); a trampoline in the library (no compiler work, but every tail call
+    pays an allocation and an indirect return, and the program must be written for it).
+  - **Review with the user.** Error backtraces lose the frames a tail call replaced; the user may
+    prefer this only at -O2.
 
 - Settled on the user's delegation 2026-11-05 (built on branch `process-commands`): **How the parts of a command share its settings** ([commands](/spec/system-library/#commands)).
   Proposed: a directory and variables set on a pipeline or a sequence are every part's, a part's own
