@@ -465,3 +465,61 @@ private spell_case(t: &Type, case: Case, parts: Buf[string], data: Buf[DataSymbo
     for i in k..<parts.len()
         out.push(parts[i])
     out
+
+/** A value a match leaves out, written as a pattern, and whether a guarded arm could have taken it. */
+struct MissingCase
+    text: string
+    guarded: bool
+
+/** Every case of `ty` the unguarded arms leave out, one for each variant (or `true` and `false`) they
+ * do not cover entirely, in declaration order; for a type without cases, the one value
+ * `missing_case` finds. A case is `guarded` when an arm with a guard could have taken it. */
+missing_cases(arms: Buf[TArm], ty: &Type, data: Buf[DataSymbol]) -> Buf[MissingCase]
+    var out: Buf[MissingCase] = buf()
+    var rows: Buf[Row] = buf()
+    var guarded: Buf[Row] = buf()
+    for arm in arms
+        var items: Buf[&TPattern] = buf()
+        items.push(arm.pattern)
+        if arm.guard is Some(_) then guarded.push(Row(items)) else rows.push(Row(items))
+    rows = expand_heads(rows)
+    guarded = expand_heads(guarded)
+    val cases = cases_of(ty, data)
+    if cases.len() == 0 || *ty is Tuple(_)
+        missing_case(arms, ty, data, true) match
+            Some(case) -> out.push(MissingCase(case, guarded.len() > 0))
+            None ->
+                if missing_case(arms, ty, data, false) is Some(_) then out.push(MissingCase("_", guarded.len() > 0))
+        return out
+    for case in cases
+        var specialized: Buf[Row] = buf()
+        for row in rows
+            val head = row.items[0]
+            if unconstrained(head, false) || matches_case(head, case) then specialized.push(specialize(row, case))
+        var columns: Buf[&Type] = buf()
+        if case is VariantCase(_, fields)
+            for t in fields
+                columns.push(t)
+        if witness(specialized, columns, data, false) is Some(parts)
+            var taken = false
+            for row in guarded
+                if unconstrained(row.items[0], false) || matches_case(row.items[0], case) then taken = true
+            out.push(MissingCase(spell_case(ty, case, parts, data)[0], taken))
+    out
+
+// Rows whose first pattern is named or a set of alternatives, as rows of the patterns it holds.
+private expand_heads(rows: Buf[Row]) -> Buf[Row]
+    var expanded: Buf[Row] = buf()
+    var changed = false
+    for row in rows
+        val head = row.items[0]
+        head.kind match
+            PNamed(_, inner) ->
+                changed = true
+                expanded.push(with_head(row, inner))
+            PAlternatives(options) ->
+                changed = true
+                for o in options
+                    expanded.push(with_head(row, o))
+            _ -> expanded.push(row)
+    if changed then expand_heads(expanded) else expanded
