@@ -1872,7 +1872,21 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- Proposed (branch option-ord-fix): the [polymorphic recursion](/spec/generics/#polymorphic-recursion)
+  check counts a cycle through a method an impl with bounds of its own adds only along the paths
+  whose type argument's outermost type may meet the bounds, that type's own arguments taken as any
+  type; a type argument whose outermost type the check does not know (a tuple, a function, a part
+  taken apart from a larger type) counts as one that may. Why: the check must never miss a real
+  cycle, and the outermost type is what the flow already tracks per path; `impl[T: Ord] Ord for
+  Option[T]` otherwise made every program loading the threads library fail. Alternatives weighed:
+  connecting the impl's methods from the parameter as a whole (what it did: false cycles through
+  types that never meet the bounds); tracking type arguments deeper than the outermost type (exact
+  for nested shapes such as a `Box[Box[Plain[T]]]`, which is still counted, at the cost of a much
+  larger flow graph). Review with the user if a nested shape turns up in real code.
+- Proposed (branch option-ord-fix): an ordering, `<`, `<=`, `>`, `>=`, settles an unknown in one
+  operand's type from the other's, so `Some(1) < None` compares two `Option[int]`s, as `==` already
+  did. Why: the two operands of an ordering are one type, so the other operand is the only evidence
+  and the obvious one. Alternative: requiring `None[int]`, which `==` does not.
 
 ## Open
 
