@@ -465,21 +465,50 @@ main() -> int
 
 | Function | Meaning |
 | --- | --- |
-| `TcpStream.connect(host: string, port: int) -> Result[TcpStream, IoError]` | A connection to the first of the host's addresses that answers. |
-| `s.read(max: int) -> Result[Array[byte], IoError]` | Up to `max` bytes, waiting for at least one; empty when the other end has finished sending. |
+| `TcpStream.connect(host: string, port: int) -> Result[TcpStream, IoError]` | A connection to the first of the host's addresses that answers; where none does, the last one's error. |
+| `s.read(max: int) -> Result[Array[byte], IoError]` | Up to `max` bytes, at least one, waiting for at least one; empty when the other end has finished sending. |
 | `s.readLine() -> Result[Option[string], IoError]` | The next line, as standard input reads one, `None` at the end. |
-| `s.write(bytes: Array[byte])`, `s.writeText(text: string)` | Sends all of it. |
-| `s.setTimeout(d: Duration)` | A read or write that waits longer fails with `TimedOut`. |
-| `s.shutdownOutput()` | Tells the other end nothing more will be sent. |
+| `s.readAll() -> Result[Array[byte], IoError]` | Everything until the other end has finished sending. |
+| `s.write(bytes: Array[byte])`, `s.writeText(text: string)` `-> Result[unit, IoError]` | Sends all of it. |
+| `s.setTimeout(d: Duration) -> Result[unit, IoError]` | A read or write that waits longer fails with `TimedOut`; zero or less takes the limit away. |
+| `s.shutdownOutput() -> Result[unit, IoError]` | Tells the other end nothing more will be sent; reading goes on. |
 | `s.close()` | Ends the connection; closing again does nothing. |
-| `TcpListener.bind(host: string, port: int) -> Result[TcpListener, IoError]` | Listens for connections; port `0` lets the platform choose. |
+| `TcpListener.bind(host: string, port: int) -> Result[TcpListener, IoError]` | Listens on the host's first address (`127.0.0.1` for this machine alone, `0.0.0.0` for all of its addresses); port `0` lets the platform choose. |
 | `l.port() -> int` | The port it listens on. |
 | `l.accept() -> Result[TcpStream, IoError]` | Waits for the next connection. |
+| `l.close()` | Stops listening; closing again does nothing. |
+
+```text
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.spawn
+
+main()
+    TcpListener.bind("127.0.0.1", 0) match
+        Ok(l) ->
+            val server = spawn(() -> l.accept().flatMap(s -> s.readLine()))
+            TcpStream.connect("127.0.0.1", l.port()).flatMap(c -> c.writeText("hello\n"))
+            server.join() match
+                Ok(Some(line)) -> println(line)
+                _ -> eprintln("no line")
+        Err(e) -> eprintln(e.message())
+```
 
 A connection and a listener are closed by `close()`; one the program forgets is closed when the
 collector finds it unreachable, so a lost one leaks nothing for long, but only `close()` says when.
-`IoError` gains the variants a connection meets: `ConnectionRefused`, `ConnectionReset` and
-`TimedOut`.
+A read, write or `accept` after `close()` answers `Other`, saying it is closed. `IoError` gains the
+variants a connection meets: `ConnectionRefused`, `ConnectionReset` (a reset, or a write to a
+connection the other end has closed) and `TimedOut`. A host that resolves to no address is `Other`,
+and a port outside 0 to 65535 or a read of fewer than one byte traps at the call. Bytes a `readLine`
+reads beyond its line are kept, and the next read of any kind takes them first. A timeout is kept in
+whole milliseconds, a part of one counting as one.
+
+**A connection belongs to one thread at a time**, as every [handle](/spec/sysl-bindings/#handles)
+does: a server accepts a connection and hands it to the thread or future that serves it, and the
+code that handed it over traps where it uses it again while the body runs:
+
+```text
+avin: trap: `Socket` belongs to another thread at main.avin:16:25
+```
 
 ### `Url`
 
@@ -527,12 +556,18 @@ URL**, so `parse` refuses `http://h/%FF` with `InvalidUtf8(9)` and `queryParams`
 | `http.post(url: string, body: string, contentType: string) -> Result[Response, HttpError]` | Sends `body` and answers the response. |
 | `http.send(request: Request) -> Result[Response, HttpError]` | Any method, headers, body and timeout, built from `Request(method, url)` with `withHeader`, `withBody` and `withTimeout`. |
 
-A `Response` has its `status`, its `headers` as a vector of name and value pairs, `header(name)`
-looking a name up without regard to case, its `body` as an `Array[byte]` and `text()` reading that as
-UTF-8. **A status is an answer, not a failure**: `404` is an `Ok`. `HttpError` is `Io(IoError)`,
+A `Response` has its `status` and `reason`, its `headers` as a vector of name and value pairs,
+`header(name)` looking a name up without regard to case, its `body` as an `Array[byte]` and `text()`
+reading that as UTF-8, a sequence that is not read as U+FFFD. **A status is an answer, not a failure**: `404` is an `Ok`. `HttpError` is `Io(IoError)`,
 `BadUrl(UrlError)`, `Malformed(text)` for a reply that is not HTTP, and `Unsupported(text)`. The
 client speaks HTTP/1.1, one request to a connection, reads bodies by `Content-Length`, chunked or to
-the connection's end, and follows up to five redirects of a `GET` or `HEAD`. A request for `https`
+the connection's end, and follows up to five redirects of a `GET` or `HEAD` (statuses 301, 302,
+303, 307 and 308), each `Location` resolved against the URL that answered by `Url.resolve`; the sixth
+is the answer. It writes `Host`, `Content-Length` (for a body, a `POST` and a `PUT`) and `Connection:
+close` unless the request gives them, then the request's own headers in order. `HEAD`, an interim
+`1xx` (which is skipped for the answer after it), `204` and `304` have no body. A method is a token
+and a header's name one too, and a header's value holds no line break; `Request` and `withHeader`
+trap where one does not. A request's timeout bounds each read and write on its connection. A request for `https`
 is `Unsupported` where the library has no TLS; TLS lives in a Sysl package of its own, which the
 library reaches through a binding to a package named in its `sysl-dependencies`, as any program
 reaches one.

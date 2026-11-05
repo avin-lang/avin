@@ -1733,6 +1733,30 @@ their words are reserved.
   (text made as it is read, a socket later) and hand it to any function that takes one; the kinds
   `avin.io` makes are private classes reached only through `Source.fromFile`, `fromString` and
   `stdin`. The alternative is a final class whose kinds are fixed by the library.
+- `avin.net`'s TCP and HTTP details ([system library](/spec/system-library/#avin-net)) (2026-11-04),
+  where the chapter left them open:
+  - `write`, `writeText`, `setTimeout` and `shutdownOutput` answer `Result[unit, IoError]`, since
+    each can fail; `readAll()` is added beside `read` and `readLine`, and `TcpListener` has `close()`.
+  - A read, write or `accept` after `close()` answers `Other("the connection is closed")` (or "the
+    listener is closed") rather than trapping, as a closed handle's method does.
+  - A host that resolves to no address is `Other(s"no address found for $host")`, not `NotFound`,
+    whose message speaks of files. A port outside 0 to 65535, and `read(max)` with `max` below one,
+    trap at the call, as a `Url`'s `withPort` does with a port it cannot hold.
+  - `ConnectionReset` also covers a write to a connection the other end has closed (`EPIPE`).
+  - `setTimeout` sets the read and the write limit together, in whole milliseconds rounded up; zero
+    or less takes the limit away.
+  - `bind` takes the host's first address and lets a port a recently stopped listener used be taken
+    again; the backlog is the platform's usual 128.
+  - The socket is a handle on a runtime type, `avin.rt.Connection`, holding `sysl.net`'s `Socket`
+    with a destructor that closes it, since `sysl.net` closes a socket only when asked; so closing
+    the handle, or the collector freeing a forgotten one, closes the socket. The runtime also turns
+    `sysl.net`'s errors into the four a connection tells apart.
+  - The HTTP client: a `Response` also has its `reason`; `text()` reads ill-formed UTF-8 as U+FFFD;
+    `Request` is a class with `method`, `url`, `headers`, `body` and `timeout`, the last three
+    defaulted; a method or header name that is not a token, and a header value with a line break,
+    trap; `Host`, `Content-Length` and `Connection: close` are written unless the request gives
+    them; an interim `1xx` is skipped; redirects are 301, 302, 303, 307 and 308, the sixth answered
+    as it is.
 
 ## Open
 
