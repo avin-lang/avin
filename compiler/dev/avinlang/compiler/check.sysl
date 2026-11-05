@@ -6806,7 +6806,7 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
     val want = expected match
         Some(w) -> w
         None -> return check_form(c, e, None, used)
-    if !(*zonk(c, want) is AnyType) then return to_trait(c, check_form(c, e, expected, used), zonk(c, want))
+    if !(*zonk(c, want) is AnyType) then return to_trait(c, none_as(c, check_form(c, e, expected, used), want), zonk(c, want))
     val passes = e.kind is Block(_, _) || e.kind is If(_, _, _) || e.kind is Match(_, _) || e.kind is While(_, _, _) || e.kind is Loop(_) || e.kind is DoWhile(_, _, _)
     to_any(c, check_form(c, e, if passes then expected else None, used))
 
@@ -6819,6 +6819,32 @@ private to_any(c: *Checker, typed: &TExpr) -> &TExpr
         return typed
     if *t is AnyType || *t is Nothing || *t is ErrorType || *t is ByName(_) then return typed
     TExpr(typed.span, AnyType, Box(typed))
+
+// An `Option[Nothing]` used where another option is expected converts to it where it is written, as
+// `None` would have been written at that type: an option kept as a pointer is null for `None`, and
+// one of `Nothing` is not (see `representation.sysl`). Only where the expected argument is settled,
+// so that what the value would have told inference it still tells.
+private none_as(c: *Checker, typed: &TExpr, want: &Type) -> &TExpr =
+    if converts_none(c, typed.ty, want) then TExpr(typed.span, zonk(c, want), NoneAs(typed)) else typed
+
+/** Whether a value of type `t` converts to `want` as `none_as` converts it. */
+private converts_none(c: *Checker, t: &Type, want: &Type) -> bool
+    if !nothing_option(c, t) then return false
+    *zonk(c, want) match
+        Data(d, _, args) ->
+            if !is_option_data(c, d) || args.len() != 1 then return false
+            val arg = zonk(c, args[0])
+            !(*arg is Nothing || *arg is ErrorType || has_unknowns(arg))
+        _ -> false
+
+/** Whether `t` is `Option[Nothing]`, whose every value is `None`. */
+private nothing_option(c: *Checker, t: &Type) -> bool = *zonk(c, t) match
+    Data(d, _, args) -> is_option_data(c, d) && args.len() == 1 && *zonk(c, args[0]) is Nothing
+    _ -> false
+
+private is_option_data(c: *Checker, d: usize) -> bool = core_data(c, "Option") match
+    Some(id) -> id == d
+    None -> false
 
 // A built-in value or a tuple expected as a trait it conforms to converts to it where it is written:
 // it is put in a box, as for `Any`, whose method table holds the type's implementations. A data value
@@ -8262,7 +8288,15 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
         var typed: Buf[&TExpr] = buf()
         var agreed: Option[&Type] = None
         for item in items
-            val t = check_expr(c, item, None)
+            var t = check_expr(c, item, None)
+            // An element that is an `Option[Nothing]` converts to the other elements' option, and the
+            // elements before one of another option, to that, as the arms of a `match` do.
+            if agreed is Some(so_far)
+                t = none_as(c, t, so_far)
+                if converts_none(c, so_far, t.ty)
+                    for i in 0..<typed.len()
+                        typed.set(i, none_as(c, typed[i], t.ty))
+                    agreed = Some(t.ty)
             typed.push(t)
             agreed = agreed match
                 None -> Some(t.ty)
@@ -8676,6 +8710,9 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
         // and between a trait's value and a built-in value or a tuple implementing it, as the trait's.
         elif settled(y) then typed.set(1, to_trait(c, typed[1], x))
         if settled(x) then typed.set(0, to_trait(c, typed[0], zonk(c, typed[1].ty)))
+        // and between an `Option[Nothing]` and another option, as the other.
+        typed.set(0, none_as(c, typed[0], typed[1].ty))
+        typed.set(1, none_as(c, typed[1], typed[0].ty))
     for i in 0..<ops.len()
         compare_link(c, ops[i], typed[i], typed[i + 1])
     var ty: &Type = Bool
@@ -9220,6 +9257,13 @@ private join_args(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
             args.push(zonk(c, xs[i]))
             continue
         if params[i].variance is Covariant
+            // No value has type `Nothing`, so `Option[Nothing]` and `Option[Dog]` agree on the latter.
+            if *zonk(c, xs[i]) is Nothing
+                args.push(ys[i])
+                continue
+            if *zonk(c, ys[i]) is Nothing
+                args.push(xs[i])
+                continue
             if lower_join(c, zonk(c, xs[i]), zonk(c, ys[i])) is Some(t)
                 args.push(t)
                 continue
@@ -9315,8 +9359,12 @@ private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[
             val y = tested_branch(c, yes, tested.yes, None, false)
             if *y.ty is Nothing then bring_into_scope(c, condition.span, tested.no)
             return TExpr(e.span, Unit, If(cond, y, None))
-    val y = tested_branch(c, yes, tested.yes, expected, used)
-    val n = tested_branch(c, other, tested.no, expected, used)
+    var y = tested_branch(c, yes, tested.yes, expected, used)
+    var n = tested_branch(c, other, tested.no, expected, used)
+    if used
+        // A branch that is an `Option[Nothing]` converts to the other's option.
+        y = none_as(c, y, n.ty)
+        n = none_as(c, n, y.ty)
     if *y.ty is Nothing && !(*n.ty is Nothing) then bring_into_scope(c, condition.span, tested.no)
     elif *n.ty is Nothing && !(*y.ty is Nothing) then bring_into_scope(c, condition.span, tested.yes)
     var ty: &Type = Unit
@@ -10480,7 +10528,7 @@ private fits_call(c: *Checker, s: Signature, binding: Binding, args: Buf[Argumen
             val spliced = args[j].value.kind is Splice(_)
             if ok && !(*t.ty is Nothing)
                 // An argument of a subtype, or of a covariant instance, fits as it would the call.
-                val agrees = if mentions_open(p, &open) || spliced then constrain(c, p, strict(t.ty), &open, true) else fits(c, strict(t.ty), p) || boxes_to(c, strict(t.ty), p)
+                val agrees = if converts_none(c, t.ty, p) then true elif mentions_open(p, &open) || spliced then constrain(c, p, strict(t.ty), &open, true) else fits(c, strict(t.ty), p) || boxes_to(c, strict(t.ty), p)
                 if !agrees then ok = false
     for j in 0..<args.len()
         if ok && typed[j] is None
@@ -11647,7 +11695,8 @@ private check_arguments(c: *Checker, args: Buf[Argument], wanted: Buf[Option[&Ty
                         if param is Some(p)
                             if *given.ty is ByName(_) && !(*zonk(c, p) is ByName(_)) then t = evaluated(given)
                             t = to_trait(c, t, zonk(c, p))
-                            val agrees = *t.ty is Nothing || constrain(c, p, t.ty, open, true)
+                            if converts_none(c, t.ty, p) then t = TExpr(t.span, p, NoneAs(t))
+                            val agrees = *t.ty is Nothing || same_type(t.ty, p) || constrain(c, p, t.ty, open, true)
                             if !agrees
                                 c.note(unit_of(c), value.span, mismatch(c, zonk(c, p), t.ty))
                         early.set(i, Some(t))
@@ -11969,11 +12018,30 @@ private call_argument(c: *Checker, arg: Argument, param: Option[&Type], open: *B
             if same_type(zonk(c, loose), inner) then return delayed_argument(c, arg, p, inner)
             val delayed = delayed_argument(c, arg, ByName(loose), loose)
             if *delayed.ty is ByName(yields)
+                // One that yields an `Option[Nothing]` converts as the value of the lambda it is
+                // checked as, as `call_argument` converts one passed strictly.
+                if converts_none(c, yields, raw) && delayed.kind is FunctionValue(id, _)
+                    if c.bodies[id] is Some(body)
+                        c.bodies.set(id, Some(TExpr(body.span, raw, NoneAs(body))))
+                        c.symbols[id].result = Some(raw)
+                        return TExpr(delayed.span, ByName(raw), delayed.kind)
                 if !(*yields is Nothing) && !constrain(c, raw, yields, open, true)
                     c.note(unit, arg.value.span, mismatch(c, zonk(c, raw), yields))
             return delayed
     val value = check_expr(c, arg.value, wanted)
     if param is Some(p)
+        // An `Option[Nothing]` passed as an option whose argument is decided, as a lower bound
+        // decides `B` in `orElse[B >: T]`, constrains nothing and converts as `none_as` does. It takes
+        // the parameter's own type, which follows the argument wherever a later one widens it.
+        if converts_none(c, value.ty, p) then return TExpr(value.span, p, NoneAs(value))
+        // Passed as an open type argument, as in `List(none, Some(dog))`, it is taken as a `None` written
+        // there would be, an option of an argument the others settle, or `Nothing` if none does.
+        if nothing_option(c, value.ty) && *zonk(c, p) is Var(_)
+            val element = fresh_var(c)
+            if *element is Var(v) then c.unknowns.push(Unknown(v, unit, arg.value.span, "", true))
+            val taken = TExpr(value.span, option_of(c, element), NoneAs(value))
+            if !constrain(c, p, taken.ty, open, true) then c.note(unit, arg.value.span, mismatch(c, zonk(c, p), value.ty))
+            return taken
         if !(*value.ty is Nothing) && !constrain(c, p, value.ty, open, true)
             c.note(unit, arg.value.span, mismatch(c, zonk(c, p), value.ty))
     value
@@ -12337,11 +12405,19 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
             val t = check_expr(c, g, Some(Bool))
             expect_bool(c, t)
             guard = Some(t)
-        val body = check_value(c, arm.body, expected, used)
+        var body = check_value(c, arm.body, expected, used)
         c.body.visible.truncate(mark)
         c.body.block_start = outer_start
         if !(*body.ty is Nothing) then never = false
         if used && agreed
+            // An arm that is an `Option[Nothing]` converts to the other arms' option, and the arms
+            // before an arm of another option, to that.
+            body = none_as(c, body, ty)
+            if converts_none(c, ty, body.ty)
+                for i in 0..<typed.len()
+                    val before = typed[i]
+                    typed.set(i, TArm(before.pattern, before.guard, none_as(c, before.body, body.ty)))
+                ty = body.ty
             join_expected(c, ty, body.ty, expected) match
                 Some(t) -> ty = t
                 None ->
@@ -13147,6 +13223,7 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
         Complement(x) -> scan_init(c, s, x, unsafe)
         Convert(x, _) -> scan_init(c, s, x, unsafe)
         Box(x) -> scan_init(c, s, x, unsafe)
+        NoneAs(x) -> scan_init(c, s, x, unsafe)
         Arith(_, a, b, _) ->
             val ok = scan_init(c, s, a, unsafe)
             scan_init(c, s, b, unsafe) && ok
