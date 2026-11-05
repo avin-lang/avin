@@ -1,6 +1,6 @@
 ---
 title: Regular expressions
-summary: "Proposed: `avin.regex` — the pattern language, backtracking matching with leftmost-first results, `Regex`, `Match` and `MatchIterator`, replacing and splitting."
+summary: "`avin.regex`: the pattern language, backtracking matching with leftmost-first results, `Regex`, `Match` and `MatchIterator`, replacing and splitting, and a regex as an extractor pattern."
 weight: 26
 ---
 
@@ -120,10 +120,29 @@ is repeated or tried more than once:
 | `replaceFirstIn(s, replacement)` | `s` with its first match replaced |
 | `replaceSomeIn(s, f)` | `s` with each match `m` replaced where `f(m)`, an `Option[string]`, is `Some`, and kept where it is `None` |
 | `split(s)` | `pattern().split(s)`: the pieces of `s` between the matches, as an `Array[string]` |
-| `unanchored()`, `anchored()` | The same regex with `matches` asking about any part, or the whole |
+| `unapplySeq(s)` | The groups' texts, an `Option[List[string]]`, where `s` matches as `matches` asks; it makes the regex an [extractor](/spec/operators-and-control-flow/#extractor-patterns) |
+| `unanchored()`, `anchored()` | The same regex with `matches` and the extractor asking about any part, or the whole |
 | `regex()`, `toString()`, `pattern()` | The pattern as written; `pattern()` is a `Pattern`, with `pattern()`, `groupCount()` and `split` |
 | `Regex.quote(text)` | A pattern matching `text` literally: `\Q`, the text, `\E`, each `\E` in the text written so it does not end the quotation |
 | `Regex.quoteReplacement(text)` | A replacement writing `text` literally: each `\` and `$` with a backslash before it |
+
+**Extractors.** A regex is an [extractor](/spec/operators-and-control-flow/#extractor-patterns)
+whose patterns match its groups' texts in order: `case date(y, m, d)` matches a text the whole of
+which the regex matches (any part of it, for a regex made by `unanchored()`), and needs one pattern
+for each group, or `rest*` for those left. A group that took no part gives the empty string. A
+regex with no groups is a test, written `word()`. `Groups`, imported from `avin.regex`, takes apart
+a `Match` found by any regex the same way, and does not match a match of a pattern with no groups.
+
+```text
+val date = Regex("(\\d{4})-(\\d\\d)-(\\d\\d)")
+
+describe(s: string) -> string = s match
+    date(year, month, day) -> s"day $day of month $month in $year"
+    _ -> "not a date"
+
+for m in "(\\d+)x(\\d+)".r().findAllMatchIn("3x4 and 10x20")
+    if m is Groups(w, h) then println(s"$w by $h")
+```
 
 **Replacements.** In a replacement, `$` followed by digits is what a group matched: the first digit
 always counts, and each digit after it is taken while the number still names a group the pattern

@@ -509,6 +509,8 @@ expression, checked for exhaustiveness. Patterns include:
 - `n + k`, where `k` is a positive integer literal: it matches an integer of at least `k` and binds
   `n` to the value minus `k`, which never overflows;
 - constructors with nested patterns, tuples and `()`;
+- [extractor patterns](#extractor-patterns), `Name(p1, p2)` where `Name` is a value with
+  `unapply` or `unapplySeq`;
 - list patterns: `head :: tail` matches a non-empty `List`, grouping to the right
   (`first :: second :: rest`);
 - [sequence patterns](/spec/collections/#sequence-patterns): `[]` matches an empty sequence and
@@ -560,6 +562,47 @@ function type in a type pattern is written in parentheses, because an arm's `->`
 
 A `match` that does not cover every value names one it leaves out, written as a pattern:
 `` this `match` does not cover every Shape value, such as `Rect(_, _)` ``.
+
+### Extractor patterns
+
+A pattern `Name(p1, p2)` whose `Name` is not a variant is an **extractor**: a value, such as an
+object, a class's companion or a local, whose type has an `unapply` or `unapplySeq` method. The
+matched value is passed to the method, and its answer decides the match:
+
+- `unapply(x) -> bool` matches where it answers `true`, and is written with no patterns, `Even()`;
+- `unapply(x) -> Option[U]` matches its `Some`: one pattern matches the value whole, and several
+  match the parts of a tuple of as many, `Split(key, value)` for an `Option[(string, string)]`;
+- `unapplySeq(x) -> Option[S]`, `S` a sequence, matches its `Some` as a
+  [sequence pattern](/spec/collections/#sequence-patterns) does, so `Words(first, second)` needs
+  exactly two elements and `Words(first, rest*)` one or more.
+
+```text
+object Twice
+    unapply(n: int) -> Option[int] = if n % 2 == 0 then Some(n / 2) else None
+
+object Even
+    unapply(n: int) -> bool = n % 2 == 0
+
+describe(n: int) -> string = n match
+    Twice(Twice(q)) -> s"four times $q"
+    Twice(h) if h > 100 -> "a large double"
+    Even() -> "even"
+    _ -> "odd"
+
+val date = Regex("(\\d{4})-(\\d\\d)-(\\d\\d)")
+"2024-06-30" match
+    date(year, month, day) -> …
+```
+
+A variant of the name is always the variant, so a data type's companion declares an `unapply` to be
+called by name, not to change what its variant's pattern means. Where the type has both methods,
+`unapply` is the one called. The method's parameter accepts the matched value's type, as any call's
+argument would, and a generic method infers its type arguments from it. The method is called once
+each time the pattern is tested, the patterns inside it are matched against its answer, and its
+names are bound like any pattern's; extractors nest, take guards, and appear in `is`, alternatives,
+clauses and match functions. An extractor may answer that it does not match, so it never counts
+toward exhaustiveness: a `match` relying on one needs a catch-all, and a binding's or a `for`'s
+pattern, which must cover every value, cannot hold one.
 
 ### Match functions
 

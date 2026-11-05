@@ -505,8 +505,23 @@ describe(xs: Vector[string]) -> string = xs match
     _ -> s"${xs(0)} and ${xs.length() - 1} others"
 ```
 
-For exhaustiveness, `[]` together with `head :: tail` covers every `List`; fixed-length patterns
-cover only their lengths, so a match that uses only them needs a catch-all.
+The last part may be `rest*`, or `_*` where the rest is not used: the pattern then matches a
+sequence of at least the elements before it, and `rest` is bound to the elements after them. On a
+`List` that is the tail, so `[first, rest*]` is `first :: rest`; on any other sequence it is what
+`drop(n)` answers, a `Vector`. `[rest*]` alone matches every sequence and binds the whole of it.
+
+```text
+total(xs: List[int]) -> int = xs match
+    [] -> 0
+    [head, tail*] -> head + total(tail)
+
+firstTwo(xs: Vector[string]) -> string = xs match
+    [a, b, _*] -> s"$a and $b"
+    _ -> "fewer than two"
+```
+
+For exhaustiveness, `[]` together with `head :: tail`, or `[head, tail*]`, covers every `List`;
+fixed-length patterns cover only their lengths, so a match that uses only them needs a catch-all.
 
 ## Literals
 

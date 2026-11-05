@@ -1399,32 +1399,24 @@ Settled by the user on 2026-11-04:
     carries no failure. Bindings: none beyond a runtime timed wait for `sleep`. Not blocked.
   - **JSON** is a package of its own, not part of the system library.
 
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- Lower bounds and the expected type ([generics](/spec/generics/#lower-bounds)): the expected type
+- Settled by the user 2026-11-04: Lower bounds and the expected type ([generics](/spec/generics/#lower-bounds)): the expected type
   decides a lower-bounded type argument only where it admits the bound; otherwise the argument is
   inferred from the bound and the arguments, and the result is passed as any value is. So
   `println(m.getOrElse(k, "none"), n)` on a `Map[string, string]`, where each argument expects a
   `Display`, takes `W` as `string` rather than reporting `Display` as no supertype of `string`. A
   delayed (by-name) argument widens an open lower-bounded type argument as any other argument does:
   `cats.getOrElse(k, dog)` is an `Animal`. Both keep programs working that called the methods before
-  they took `[W >: V]`. Awaiting the user.
-- Trait fields ([declarations](/spec/declarations/#trait)): a trait's field declares its type, since
+  they took `[W >: V]`.
+- Settled by the user 2026-11-04: Trait fields ([declarations](/spec/declarations/#trait)): a trait's field declares its type, since
   each conforming class's layout and the trait's `val` are known before any body is checked; it is
   public, as every member of a trait is, and is never `lazy`. A class never overrides a trait's
   field, `val` or `var`: declaring a field of its name is an error rather than an override. A trait
   never redeclares, with a value, a `val` of a trait it requires.
-- The wrapping conversion is spelled `i8.wrap(x)`, as the wrapping operators are spelled `+%`: the
+- Settled by the user 2026-11-04: The wrapping conversion is spelled `i8.wrap(x)`, as the wrapping operators are spelled `+%`: the
   integer type's name, `.wrap`, one operand, any integer target (a bounded type parameter included,
   `T.wrap(n)`). The core library needs it to test whether a value fits a narrower width (the formatter
-  converts a generic integer to `long` and back). Awaiting the user.
-- [`avin.regex`](/spec/regex/): the pattern language and its matching follow the established
+  converts a generic integer to `long` and back).
+- Settled by the user 2026-11-04: [`avin.regex`](/spec/regex/): the pattern language and its matching follow the established
   backtracking dialect exactly: leftmost-first alternation, greedy, reluctant and possessive
   repetition, atomic groups, bounded lookbehind (a repetition without an upper bound in one is an
   error), and the same rules for what a repeated group captures; `\d`, `\s`, `\w`, `\b` and the
@@ -1443,7 +1435,27 @@ Settled by the user on 2026-11-04:
   empty pieces at the end dropped, `Pattern.split(s, limit = 0)`, `Regex.quote` and
   `Regex.quoteReplacement`; `$n` takes digits while they name a group, `${name}` is the pattern's
   own name only, and a reference that cannot be resolved traps with the dialect's message.
-- Sysl handles ([Sysl bindings](/spec/sysl-bindings/#handles)): a `class` declared with `@sysl`
+- Settled by the user 2026-11-04: Extractor patterns ([control flow](/spec/operators-and-control-flow/#extractor-patterns)):
+  `Name(p…)` names a variant wherever one of that name is in scope, and only otherwise a value (an
+  object, a companion, a local) whose type has `unapply` or `unapplySeq`; where it has both,
+  `unapply` is used. `unapply` answers a `bool`, matched with no patterns (`Even()`), or an
+  `Option`, one pattern matching its value whole and several a tuple's parts. `unapplySeq` answers
+  an `Option` of a sequence, matched as a sequence pattern; the prefix-and-sequence form is not
+  taken. The matched value is passed to the method as it is, with no type test first, so the
+  method's parameter accepts the matched value's type. An extractor pattern never counts toward
+  exhaustiveness, and since a binding's or a `for`'s pattern must cover every value, extractors
+  appear in `match`, `is`, clauses and match functions only.
+- Settled by the user 2026-11-04: Rest patterns ([collections](/spec/collections/#sequence-patterns)): `rest*` or `_*`, last in a
+  sequence pattern or an `unapplySeq` extractor's patterns, binds what the patterns before it leave:
+  on a list the tail, so `[]` and `[head, tail*]` cover every list; on another sequence what
+  `drop(n)` answers, a `Vector`. `[rest*]` alone is the whole sequence, of its own type.
+- Settled by the user 2026-11-04: A regex as an extractor ([regular expressions](/spec/regex/#regex)): `Regex.unapplySeq(s)`
+  answers the groups' texts as a `List[string]` where `s` matches as `matches` asks, the whole of it
+  or, unanchored, any part. A group that took no part gives the empty string, since a `string` has
+  no null. `Groups`, a top-level object of `avin.regex`, takes apart any `Match`'s groups, `None`
+  for a pattern with none. There is no `unapplySeq` taking a `Match` on `Regex` itself, which
+  would need a match to know the regex that found it.
+- Settled by the user 2026-11-04: Sysl handles ([Sysl bindings](/spec/sysl-bindings/#handles)): a `class` declared with `@sysl`
   naming a Sysl type has no parameters, fields or constructor and is made only by a binding that
   returns it, directly or as the value of an `Option` or `Result`; a collection of handles does not
   cross. A method without a body is bound to the Sysl method of its name's words in snake_case, or
@@ -1452,6 +1464,16 @@ Settled by the user on 2026-11-04:
   call with "`Name` is closed"; a handle never closed is given back by a finalizer when the
   collector frees it. A handle crosses back into Sysl only as the receiver of its own methods,
   compares by identity, and has no `Display`.
+
+**Deferred**
+
+- Public C interoperability. Until then, C is reached through Sysl.
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
