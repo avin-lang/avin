@@ -1,0 +1,67 @@
+module avin.rt
+
+import sysl.text.{from_utf8, from_utf8_unchecked}
+
+// Strings crossing a C binding. A string passed to C is copied into NUL-terminated memory off the
+// collected heap, which the binding frees once the call returns, so nothing C holds during the call
+// is the collector's. A string C answers is copied onto the heap up to its NUL: as a string, whose
+// bytes must be UTF-8, or as an array of bytes, as they are.
+
+private extern "malloc" c_malloc(size: usize) -> *u8
+private extern "free" c_free(p: *u8) -> unit
+private extern "strlen" c_strlen(p: *u8) -> usize
+
+/** The string at `s` as NUL-terminated bytes off the heap, for one call of a C binding; null for
+ * null, which is how `None` is passed. A string holding U+0000 stops the program at the call,
+ * since C would read that NUL as its end: the reason is `site`'s, then the byte the NUL is at. */
+@export("avin_rt_c_string_in")
+c_string_in(ctx: *Context, s: *u8, site: *TrapSite) -> *u8
+    if s == null then return null
+    val n = text_length(s)
+    val from = text_bytes(s)
+    for i in 0..<n
+        if from[i] == 0u8 then stop_at_caller_with(ctx, site, text_of(ctx, site_reason(site) + " at byte " + i.to_string()))
+    val p = c_malloc(n + 1)
+    if p == null
+        flush()
+        eprints("avin: out of memory: no room for a string of " + n.to_string() + " bytes passed to C\n")
+        trap()
+    for i in 0..<n do p[i] = from[i]
+    p[n] = 0u8
+    p
+
+/** Frees a copy `c_string_in` made, once the call it was made for has returned. */
+@export("avin_rt_c_string_free")
+c_string_free(ctx: *Context, p: *u8)
+    if p != null then c_free(p)
+
+/** A new string holding the bytes C answered at `p`, up to its NUL, which is not null. Bytes that are
+ * not UTF-8 stop the program at the call: the reason is `site`'s, then the byte the first ill-formed
+ * sequence starts at. */
+@export("avin_rt_c_string_out")
+c_string_out(ctx: *Context, p: *u8, site: *TrapSite) -> *u8
+    val n = c_strlen(p)
+    from_utf8(p[0..<n]) match
+        Ok(_) -> ()
+        Err(e) -> stop_at_caller_with(ctx, site, text_of(ctx, site_reason(site) + " at byte " + e.offset.to_string()))
+    val t = new_text(ctx, n)
+    val to = text_bytes(t)
+    for i in 0..<n do to[i] = p[i]
+    published(t)
+
+/** A new array of bytes, laid out by `d`, holding the bytes C answered at `p`, up to its NUL, which is
+ * not null. An array holds at most as many bytes as a string does. */
+@export("avin_rt_c_bytes_out")
+c_bytes_out(ctx: *Context, d: *Descriptor, p: *u8) -> *u8
+    val n = c_strlen(p)
+    if n > max_text_length
+        flush()
+        eprints("avin: out of memory: an array of " + n.to_string() + " bytes is longer than the most an array holds, " + max_text_length.to_string() + "\n")
+        trap()
+    val a = new_array(ctx, d, n)
+    val to = array_elements(a)
+    for i in 0..<n do to[i] = p[i]
+    a
+
+// The reason a trap site gives, as a Sysl string.
+private site_reason(site: *TrapSite) -> string = from_utf8_unchecked(text_bytes(site.reason)[0..<text_length(site.reason)])

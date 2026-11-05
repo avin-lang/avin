@@ -3042,7 +3042,51 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- Proposed (built on branch `c-bindings-strings`): **C bindings of strings and truth values**
+  (stage 13 step 2), the choices building it made where the [chapter](/spec/c-bindings/#strings) is
+  silent.
+  - **A C string is exactly one pointer to a plain `char`**, `const` when the qualifier comes before
+    the star (`const char *`, `char const *`); a qualifier after it (`char *const`) is the pointer's
+    own and changes nothing. `signed char *`, `unsigned char *`, `void *` and `char **` are other
+    pointers. *Why*: those are the types C's string functions use, and the header check catches any
+    other spelling. *Alternative*: taking `unsigned char *` as a string too, which libraries use for
+    bytes, not text.
+  - **A typedef crossing as a string is checked by the C unit** to be `char *` or `const char *`
+    as a result, and `const char *` as a parameter (`__builtin_types_compatible_p`), and is not
+    measured. *Why*: the same rule the chapter gives a spelled `char *` parameter, which C may write.
+  - **A typedef crossing as `bool` may be a C `bool` or an integer type** (checked with
+    `__builtin_classify_type`), and is passed as the integer it measures; a C `bool` typedef is then
+    one byte holding 0 or 1, the same registers as an `i1`. An integer keyword crossing as `bool`
+    may be any but a plain `char`, which crosses only as `byte`. *Why*: the checker cannot tell a
+    `bool` typedef from `cairo_bool_t`, and one measured path serves both. *Alternative*: a marker
+    word for a truth value, which the Cairo survey weighed and set aside.
+  - **The traps' words**: ``the string passed to `s` of `length` holds a NUL at byte 3`` (the
+    chapter's), `` `fixture_invalid` answered a string that is not UTF-8 at byte 2`` (the offset is
+    where the first ill-formed sequence starts, as `from_utf8` reports it; overlong forms,
+    surrogates, values past U+10FFFF and a cut-off sequence are all ill-formed), and
+    `` `fixture_maybe` answered null`` (the chapter's). A parameter declared with a pattern rather
+    than a name is named `parameter N`. *Alternative*: naming the binding rather than the C function
+    in the result traps; the C function is what answered.
+  - **A string argument's copy is freed after the result is converted**, not when the call
+    returns, since C may answer a pointer into a string it was passed (`strchr`, `strstr`); the
+    copies are made with `malloc` by the runtime (`avin_rt_c_string_in`) and freed by
+    `avin_rt_c_string_free`. A non-`blocking` call cannot collect, and the collector never moves an
+    object, but the copy is still needed for the NUL. *Alternative*: one buffer per thread reused
+    across calls, which a callback calling the same binding again would overwrite.
+  - **`free:` accepts a function the headers declare as `void (void *)`, `void (char *)`,
+    `void (const char *)` or `void (<the result's type>)`**; anything else, including one answering
+    a value, is refused at the binding, as is a name no header declares. It is called only for a
+    non-null answer, after the copy is made, and **a binding whose result is `unit` with `free:`
+    frees what C answered and discards it**. `free:` on a binding that answers no string is refused
+    at check. *Why*: a free function that answers a status is not one a binding can ignore, and a
+    library's own free functions are seldom safe on null. *Alternative*: refusing `free:` on a
+    `unit` result, which would leave no way to call such a function without leaking.
+  - **An `Array[byte]` result may be an `Option` too**, null being `None`, and a null bound as a
+    bare `Array[byte]` traps as a bare `string` does. **An `Array[byte]` parameter is refused** until
+    [arrays](/spec/c-bindings/#arrays-and-out-parameters) are built. *Alternative*: an empty array
+    for null, which hides the difference C makes.
+
+  **Review with the user**: whether `free:` on a `unit` result should stay legal.
 
 ## Open
 

@@ -1,0 +1,99 @@
+// expect: exit 0
+// Strings crossing a C binding. A `const char *` parameter takes a `string`, copied into
+// NUL-terminated memory that lives for the call, or an `Option[string]`, whose `None` is null. A
+// `char *` or `const char *` result is copied into a new `string`, checked as UTF-8, or into an
+// `Array[byte]` as it is; a string C keeps is borrowed and left as it was, and one bound with
+// `free:` is freed by the function named once it is copied. A null result is an `Option`'s `None`.
+// A typedef of either pointer crosses as the header's type is. Every program of the corpus runs
+// with the collector at each allocation, so the copies made here are made under that stress too.
+
+@c("long fixture_length(const char *s)")
+length(s: string) -> long
+@c("long fixture_length(const char *s)")
+maybeLength(s: Option[string]) -> long
+@c("int fixture_byte_at(const char *s, int i)")
+byteAt(s: string, i: int) -> int
+@c("const char *fixture_static(void)")
+staticText() -> string
+@c("const char *fixture_static(void)")
+staticBytes() -> Array[byte]
+@c("const char *fixture_echo_text(const char *s)")
+echo(s: string) -> string
+@c("const char *fixture_echo_text(const char *s)")
+echoBytes(s: string) -> Array[byte]
+@c("char *fixture_copy(const char *s)", free: "fixture_free")
+copy(s: string) -> string
+@c("char *fixture_copy(const char *s)", free: "fixture_free")
+copyBytes(s: string) -> Array[byte]
+@c("char *fixture_copy(const char *s)", free: "fixture_free")
+copyDiscarded(s: string)
+@c("char *fixture_repeat(const char *s, int n)", free: "fixture_free")
+repeat(s: string, n: int) -> string
+@c("long fixture_allocated(void)")
+allocated() -> long
+@c("long fixture_freed(void)")
+freed() -> long
+@c("const char *fixture_invalid(int which)")
+invalidBytes(which: int) -> Array[byte]
+@c("const char *fixture_invalid(int which)")
+invalid(which: int) -> string
+@c("const char *fixture_maybe(int present)")
+maybe(present: int) -> Option[string]
+@c("const char *fixture_maybe(int present)")
+maybeBytes(present: int) -> Option[Array[byte]]
+@c("char *fixture_maybe_copy(const char *s)", free: "fixture_free")
+maybeCopy(s: Option[string]) -> Option[string]
+@c("fixture_text fixture_typedef_text(void)")
+typedefText() -> string
+@c("long fixture_typedef_length(fixture_const_text s)")
+typedefLength(s: string) -> long
+@c("const char *fixture_join(const char *a, const char *b)")
+join(a: Option[string], b: Option[string]) -> string
+
+private bytesText(b: Array[byte]) -> string
+    var out = ""
+    for i in 0..<b.length()
+        out = out + (if i == 0 then "" else " ") + int(b(i)).toString()
+    "[" + out + "]"
+
+private show(o: Option[string]) -> string = o match
+    Some(s) -> "Some(" + s + ")"
+    None -> "None"
+
+main()
+    // In: empty, ASCII, every UTF-8 width, and a string longer than any small buffer.
+    println(s"length ${length("")} ${length("fixture")} ${length("é")} ${length("€")} ${length("😀")} ${length("aé€😀")}")
+    println(s"bytes ${byteAt("é", 0)} ${byteAt("é", 1)} ${byteAt("é", 2)} ${byteAt("😀", 3)} ${byteAt("", 0)}")
+    val long = "abcdefghij".repeat(100000)
+    println(s"long ${length(long)}")
+    println(s"maybe ${maybeLength(Some("four"))} ${maybeLength(Some(""))} ${maybeLength(None)}")
+    println(s"join ${join(Some("a"), None)} ${join(None, Some("b"))} ${join(None, None)} ${join(Some("ü"), Some(""))}")
+    // Out, borrowed: a static string, and a pointer into the string the call was passed.
+    println(s"static ${staticText()} ${staticText().byteLength()} ${bytesText(staticBytes())}")
+    println(s"echo [${echo("")}] [${echo("x")}] [${echo("aé€😀")}] ${bytesText(echoBytes("é"))} ${bytesText(echoBytes(""))}")
+    println(s"echo long ${echo(long) == long}")
+    // Out, owned: copied, then freed with the function `free:` names.
+    println(s"copy [${copy("")}] [${copy("ünïcödé 😀")}] ${bytesText(copyBytes("€"))}")
+    copyDiscarded("dropped")
+    val big = repeat("😀", 50000)
+    println(s"repeat ${big.byteLength()} ${big.charCount()} ${repeat("", 3).byteLength()} ${repeat("ab", 0)}")
+    println(s"freed ${allocated() == freed()}")
+    // Bytes that are not UTF-8 arrive as they are in an array; the valid ones as a string.
+    for which in 0..<6
+        println(s"invalid $which ${bytesText(invalidBytes(which))}")
+    println(s"valid ${invalid(6)} ${invalid(6).charCount()}")
+    // Null as `None`, both ways.
+    println(s"option ${show(maybe(1))} ${show(maybe(0))} ${maybeBytes(0) is None} ${maybeBytes(1).map(b -> bytesText(b)).getOrElse("")}")
+    println(s"option copy ${show(maybeCopy(Some("kept")))} ${show(maybeCopy(None))} ${show(maybeCopy(Some("")))}")
+    // A typedef of `char *` out and of `const char *` in.
+    println(s"typedef ${typedefText()} ${typedefLength("twelve chars")}")
+    // Many calls, each allocating under the collector's stress: every owned answer is freed, and
+    // every copy passed in is released.
+    val before = allocated()
+    var total = 0
+    for i in 0..<2000
+        val s = copy("item " + i.toString())
+        total += s.byteLength()
+        total += int(length(s))
+        if echo(s) != s then println("echo differs")
+    println(s"loop $total ${allocated() - before} ${freed() == allocated()}")

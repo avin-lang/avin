@@ -164,7 +164,9 @@ binding is **not** a shim: it is a direct call from the program's own code.
   as a Sysl binding's is recorded.
 - **The C unit.** The driver writes one C file for the program, `#include`s the headers every
   package's `c-libraries` names, and emits per binding a `_Static_assert` that
-  `__builtin_types_compatible_p(__typeof__(&symbol), <the prototype's function pointer type>)`; per
+  `__builtin_types_compatible_p(__typeof__(&symbol), <the prototype's function pointer type>)`, and
+  one that the function its `free:` names takes a pointer and answers nothing; per typedef crossing
+  as a string, that it is `char *` or `const char *` (only the latter as a parameter); per
   typedef in an integer position, its size and sign; per mirror, size, alignment and offsets; per
   enumerator and constant, its value. Measurements are stored in one `const` table of bytes after a
   marker, which the driver finds in the object file's data, so nothing is run, no object format is
@@ -176,10 +178,14 @@ binding is **not** a shim: it is a direct call from the program's own code.
   for it. The object is cached under `cunit/` in the user's cache by a SHA-256 of the C source, the
   `pkg-config --cflags` and `--libs` answers and `clang --version`.
 - **Lower** gives each binding a body in MIR: convert each argument (a string into a NUL-terminated
-  copy in memory off the heap, a checked integer narrowing to the measured width, `None` to null, a
+  copy in memory off the heap, `avin_rt_c_string_in`'s, freed by `avin_rt_c_string_free` once the
+  result is converted, a `bool` into `0` or `1` for an integer used as a truth value, a checked
+  integer narrowing to the measured width, `None` to null, a
   handle to its C pointer after the closed and owner checks, through its `as` glue where needed),
-  call the C symbol or its glue, then convert the result (a string copied in through
-  `avin_rt_new_text` and checked as UTF-8, null to `None` or a trap, a status to `Result`, a pointer
+  call the C symbol or its glue, then convert the result (a string copied in and checked as UTF-8
+  by `avin_rt_c_string_out`, an `Array[byte]` by `avin_rt_c_bytes_out`, then the `free:` function
+  called on it; an integer used as a truth value compared with zero; null to `None` or a trap, a
+  status to `Result`, a pointer
   to a new handle object, through `retain` when `borrowed`). A `blocking` call is bracketed by
   `avin_rt_enter_safe` and `avin_rt_leave_safe` after every argument is converted (an array argument
   copied off the heap) and before the result is. A handle object holds its C pointer, its owner word,

@@ -22,6 +22,10 @@ enum CType
     CDoubleType
     CFloatType
     CVoidType
+    /** A C string: one pointer to `char`, `const char *` when `constant`. A pointer qualified after
+     * its star, `char *const`, is one too. */
+    CText(constant: bool)
+    /** Any other pointer. */
     CPointerType
     /** A struct or union by value, `struct name`. */
     CRecordType(name: string)
@@ -196,8 +200,17 @@ private c_declaration(tokens: Buf[string], at: *usize) -> Result[CDeclared, stri
         *at = *at + 1
     if *at < tokens.len() && tokens[*at] == "["
         return Err("an array parameter cannot cross a C binding: arrays are not implemented")
-    if pointers > 0 then ty = CPointerType
+    val plain_char = ty match
+        CKeyword(n) -> n == "char"
+        _ -> false
+    if pointers == 1 && plain_char then ty = CText(contains_word(words, "const"))
+    elif pointers > 0 then ty = CPointerType
     Ok(CDeclared(ty, text, name))
+
+private contains_word(words: Buf[string], w: string) -> bool
+    for x in words
+        if x == w then return true
+    false
 
 // The one spelling of an integer type its keywords make, `long unsigned int` being `unsigned long`.
 private integer_spelling(signed: bool, unsigned: bool, short: bool, longs: usize, char_word: bool) -> Result[string, string]
@@ -249,54 +262,118 @@ private is_c_word_byte(b: u8) -> bool = b >= u8('a') && b <= u8('z') || b >= u8(
 
 private is_c_word(t: string) -> bool = t.bytes.len > 0 && is_c_word_byte(t.bytes[0]) && !(t.bytes[0] >= u8('0') && t.bytes[0] <= u8('9'))
 
+/** Whether `t` is a C identifier that is no C keyword, as a function's name is. */
+is_c_identifier(t: string) -> bool
+    if !is_c_word(t) || is_c_keyword(t) then return false
+    for b in t.bytes
+        if !is_c_word_byte(b) then return false
+    true
+
 private is_c_keyword(t: string) -> bool =
     t == "const" || t == "volatile" || t == "restrict" || t == "void" || t == "char" || t == "short" || t == "int" || t == "long" || t == "signed" || t == "unsigned" || t == "float" || t == "double" || t == "_Bool" || t == "bool" || t == "struct" || t == "union" || t == "enum"
 
+/** The function a C binding's `@c(…, free: "name")` names to free the string C answers, when it
+ * names one as a string. */
+c_free_text(f: &Function) -> Option[string]
+    for a in f.annotations
+        if a.name != "c" then continue
+        for arg in a.args
+            if arg.name is Some(n) && n == "free"
+                if arg.value.kind is StringLit(text) then return Some(text)
+    None
+
+/** How an Avin type carries a C string, for the types that do: a `string`, copied and checked as
+ * UTF-8, or an `Array[byte]`, copied as it is, each perhaps in an `Option`, which is null's `None`. */
+enum CTextForm
+    NoText
+    TextString(optional: bool)
+    TextBytes(optional: bool)
+
+/** The form in which the Avin type `t` carries a C string, given the program's data types and
+ * classes, which say what `Option` and `Array` are. */
+c_text_form(t: &Type, data: Buf[DataSymbol], classes: Buf[ClassSymbol]) -> CTextForm
+    var inner = t
+    var optional = false
+    *t match
+        Data(d, _, args) ->
+            if data[d].module_name == "avin" && data[d].name == "Option" && args.len() == 1
+                inner = args[0]
+                optional = true
+        _ -> ()
+    *inner match
+        Str -> TextString(optional)
+        Class(k, _, args) ->
+            val array = classes[k].module_name == "avin" && classes[k].name == "Array" && !classes[k].decl.object
+            if array && args.len() == 1 && *args[0] is Byte then TextBytes(optional) else NoText
+        _ -> NoText
+
 /** What the Avin type at a C position must be, as a diagnostic says it, or "" where `avin` may cross
- * as `c`. A result whose Avin type is `unit` discards whatever C answers, except a struct, which is
- * passed by value. */
-c_crossing_problem(c: CType, avin: &Type, result: bool) -> string
+ * as `c`; `form` is how `avin` carries a string, if it does. A result whose Avin type is `unit`
+ * discards whatever C answers, except a struct, which is passed by value. */
+c_crossing_problem(c: CType, avin: &Type, form: CTextForm, result: bool) -> string
     if result && *avin is Unit
         return if c is CRecordType(_) then "a struct passed by value is not implemented" else ""
+    if !(form is NoText) then return c_text_problem(c, form, result)
     c match
         CKeyword(name) ->
             if name == "char" then return if *avin is Byte then "" else "a C `char` crosses as `byte`"
-            if name == "unsigned char" then return if *avin is Byte || *avin is Int(_) then "" else "it crosses as `byte` or an integer type"
-            if *avin is Int(_) then "" else "a C integer crosses as an integer type"
+            if name == "unsigned char" then return if *avin is Byte || *avin is Int(_) || *avin is Bool then "" else "it crosses as `byte`, an integer type, or `bool` as a truth value"
+            if *avin is Int(_) || *avin is Bool then "" else "a C integer crosses as an integer type, or `bool` as a truth value"
         CTypedef(_) -> *avin match
             Int(_) -> ""
             Byte -> ""
             Bool -> ""
             Real -> ""
-            _ -> "a typedef crosses as an integer type, `byte`, `bool` or `real`, as the header's type is"
+            _ -> "a typedef crosses as an integer type, `byte`, `bool`, `real` or a string, as the header's type is"
         CBoolType -> if *avin is Bool then "" else "a C `bool` crosses as `bool`"
         CDoubleType -> if *avin is Real then "" else "a C `double` crosses as `real`"
         CFloatType -> if *avin is Real then "" else "a C `float` crosses as `real`"
         CVoidType -> "the C function answers nothing, so the binding's result is `unit`"
+        CText(_) -> if result then "a C string crosses as `string`, `Array[byte]`, or either in an `Option`" else "a C string crosses as `string` or `Option[string]`"
         CPointerType -> "pointers are not implemented"
         CRecordType(_) -> "a struct passed by value is not implemented"
 
-/** How a typedef at a C position must be, by the Avin type it crosses as: the kind the C unit checks. */
+// What a string's Avin type `form` must be at the C position `c`, or "".
+private c_text_problem(c: CType, form: CTextForm, result: bool) -> string
+    val bytes = form is TextBytes(_)
+    if !result && bytes then return "an `Array[byte]` parameter is an array, and arrays are not implemented"
+    c match
+        CText(constant) -> if result || constant then "" else "C may write through a `char *`, so it takes an array rather than a `string`, and arrays are not implemented"
+        CTypedef(_) -> ""
+        CVoidType -> "the C function answers nothing, so the binding's result is `unit`"
+        _ -> "a string crosses as a C `const char *`" + (if result then " or `char *`" else "")
+
+/** How a typedef at a C position must be, by the Avin type it crosses as: the kind the C unit checks.
+ * A typedef crossing as `bool` is a C `bool` or an integer type used as a truth value; one crossing
+ * as a string is `char *` or `const char *` as a result, and `const char *` as a parameter. */
 enum CKind
     KindInteger
     KindByte
     KindBool
     KindReal
+    KindText
+    KindConstText
 
-/** The kind of type the C type `c` must be to cross as `avin`, where the C unit checks or measures
- * it: every integer type, which is measured, and every typedef, whose kind is checked. */
-c_kind_needed(c: CType, avin: &Type) -> Option[CKind]
+/** The kind of type the C type `c` must be to cross as `avin`, carried in `form`, where the C unit
+ * checks or measures it: every integer type, which is measured, and every typedef, whose kind is
+ * checked. */
+c_kind_needed(c: CType, avin: &Type, form: CTextForm, result: bool) -> Option[CKind]
     val named = c match
         CKeyword(_) -> true
         CTypedef(_) -> true
         _ -> false
     if !named then return None
+    if !(form is NoText) then return if c is CTypedef(_) then Some(if result then KindText else KindConstText) else None
     *avin match
         Int(_) -> Some(KindInteger)
         Byte -> Some(if c is CKeyword(_) then KindInteger else KindByte)
-        Bool -> if c is CTypedef(_) then Some(KindBool) else None
+        Bool -> Some(if c is CKeyword(_) then KindInteger else KindBool)
         Real -> if c is CTypedef(_) then Some(KindReal) else None
         _ -> None
+
+/** Whether the C unit measures a type checked as `kind`: integers, truth values and reals are, and
+ * strings are pointers, which need no measure. */
+c_kind_measured(kind: CKind) -> bool = !(kind is KindText || kind is KindConstText)
 
 /** The name a measurement of a C type is kept under: the type's spelling, and for a typedef in a
  * `real` position `real` before it. */
@@ -308,13 +385,13 @@ c_measure_key(c: CType, kind: CKind) -> string
     if kind is KindReal then "real " + name else name
 
 /** How a value of the C type `c` crosses as `avin` at the call: the machine form the emitter passes
- * it in, at the width measured. */
+ * it in, at the width measured. A typedef crossing as `bool` is passed as the integer it measures,
+ * which a C `bool` is too, one byte holding 0 or 1. */
 c_scalar_of(c: CType, avin: &Type, measures: Map[string, CMeasure]) -> CScalar = c match
     CBoolType -> CBoolean
     CDoubleType -> CBinary64
     CFloatType -> CBinary32
     CTypedef(name) -> *avin match
-        Bool -> CBoolean
         Real -> if measured(measures, "real " + name).bits == 32 then CBinary32 else CBinary64
         _ -> integer_scalar(measured(measures, name))
     CKeyword(name) -> integer_scalar(measured(measures, name))

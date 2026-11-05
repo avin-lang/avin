@@ -155,19 +155,31 @@ avin: trap: value out of range for long at main.avin:13:13
 ## Strings
 
 - **A `const char *` parameter takes a `string`**, copied into NUL-terminated memory that lives for
-  the call. A string holding U+0000 stops the program at the call, since C would read the NUL as its
-  end:
+  the call, and until its result is converted, since C may answer a pointer into it (`strchr`). A
+  string holding U+0000 stops the program at the call, since C would read the NUL as its end:
 
   ```text
   avin: trap: the string passed to `name` of `set` holds a NUL at byte 3 at main.avin:9:5
   ```
 
 - **A `char *` result, or a `const char *` one, is copied into a new `string`**, up to its NUL. The
-  bytes must be UTF-8; text that is not stops the program at the call. A binding that wants the
-  bytes as they are answers `Array[byte]` instead, copied up to the NUL, and nothing is checked.
+  bytes must be UTF-8; text that is not stops the program at the call, naming the byte the first
+  ill-formed sequence starts at:
+
+  ```text
+  avin: trap: `mlt_properties_get` answered a string that is not UTF-8 at byte 2 at main.avin:7:9
+  ```
+
+  A binding that wants the bytes as they are answers `Array[byte]` instead, copied up to the NUL,
+  and nothing is checked.
 - **C keeps its own string.** A string C answers is borrowed: it is copied and left as it was. One the
   caller must free is bound with `free:` naming the function that frees it, called once the copy is
-  made: `@c("char *mlt_properties_serialise_yaml(mlt_properties self)", free: "free")`.
+  made: `@c("char *mlt_properties_serialise_yaml(mlt_properties self)", free: "free")`. The C unit
+  checks that the headers declare it taking the string or any pointer and answering nothing; it is
+  not called for null. A binding with `free:` whose result is `unit` frees what C answered and
+  discards it ([proposed](/spec/decisions/#proposed)).
+- **A typedef of either pointer crosses as the header's type is**: as a result a `char *` or a
+  `const char *` typedef, as a parameter only a `const char *` one, which the C unit checks.
 - A `char *` parameter, which C may write, does not take a `string`: it takes an
   [array](#arrays-and-out-parameters).
 

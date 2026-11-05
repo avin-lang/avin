@@ -21,8 +21,9 @@ import sysl.text.str_builder
 // `pkg-config` answers for the libraries, and `clang --version`.
 
 /** A C binding as the C unit checks it: its name, its prototype, the Avin types of its parameters and
- * result, the unit and span that place it, and the package it belongs to, "" for a program with no
- * manifest. */
+ * result, the unit and span that place it, the package it belongs to, "" for a program with no
+ * manifest, how each position carries a string (the result first, then the parameters), and the
+ * function its `free:` names. */
 struct CUnitBinding
     name: string
     prototype: CPrototype
@@ -31,6 +32,8 @@ struct CUnitBinding
     unit: usize
     span: Span
     package: string
+    forms: Buf[CTextForm]
+    free: Option[string]
 
 /** What building a program's C unit gave: the object, when the program has C bindings; whether this
  * build compiled it rather than finding it cached; what it measured, by `c_measure_key`; and the
@@ -57,7 +60,12 @@ c_unit_bindings(program: TProgram, files: Buf[ProgramFile], library: usize) -> B
             Some(p) -> p
             None -> continue
         val package = if s.unit >= library && s.unit - library < files.len() then files[s.unit - library].package else ""
-        out.push(CUnitBinding(s.name, p, s.params, s.result.unwrap_or(Unit), s.unit, s.decl.name_span, package))
+        val result = s.result.unwrap_or(Unit)
+        var forms: Buf[CTextForm] = buf()
+        forms.push(c_text_form(result, program.data, program.classes))
+        for t in s.params
+            forms.push(c_text_form(t, program.data, program.classes))
+        out.push(CUnitBinding(s.name, p, s.params, result, s.unit, s.decl.name_span, package, forms, c_free_text(s.decl)))
     out
 
 /** The C unit of a program whose C bindings are `bindings` and whose packages name `libraries`. Each
@@ -145,6 +153,8 @@ enum CUnitLine
     /** The check that the typedef `name`, parameter `position` of `bindings[binding]` (0 for the
      * result), is the kind `kind` needs. */
     KindLine(binding: usize, position: usize, name: string, kind: CKind)
+    /** The check that `free`, which `bindings[binding]`'s `free:` names, frees a string. */
+    FreeLine(binding: usize, free: string)
 
 /** A C unit's text, what each of its lines is for, counting from 1, and the measurement keys of its
  * table, in order. */
@@ -186,11 +196,19 @@ c_unit_source(bindings: Buf[CUnitBinding], libraries: Buf[CLibrary]) -> CUnitSou
         lines.push(PointerLine(i))
         out.push(s"${p.result_text} ${p.symbol}($params);\n")
         lines.push(DeclareLine(i))
+        // The function `free:` names takes the string C answered, or any pointer, and answers nothing.
+        if b.free is Some(f)
+            val fp = s"__typeof__(&$f)"
+            var takes = ""
+            for arg in ["void *", "char *", "const char *", p.result_text]
+                takes = takes + (if takes == "" then "" else " || ") + s"__builtin_types_compatible_p($fp, void (*)($arg))"
+            out.push(s"_Static_assert($takes, \"avin: the free function $f\");\n")
+            lines.push(FreeLine(i, f))
         // Each named type at each position: the result first, then the parameters.
         for k in 0..<p.params.len() + 1
             val c = if k == 0 then p.result else p.params[k - 1].ty
             val avin = if k == 0 then b.result else b.params[k - 1]
-            val kind = c_kind_needed(c, avin) match
+            val kind = c_kind_needed(c, avin, b.forms[k], k == 0) match
                 Some(kind) -> kind
                 None -> continue
             val spelled = c_spelling(c)
@@ -200,6 +218,7 @@ c_unit_source(bindings: Buf[CUnitBinding], libraries: Buf[CLibrary]) -> CUnitSou
                     kinds.push(tag)
                     out.push(s"_Static_assert(${kind_test(kind, name)}, \"avin: the C type $name\");\n")
                     lines.push(KindLine(i, k, name, kind))
+            if !c_kind_measured(kind) then continue
             val key = c_measure_key(c, kind)
             if !contains_text(measured, key)
                 measured.push(key)
@@ -233,16 +252,22 @@ private kind_tag(kind: CKind) -> string = kind match
     KindByte -> "byte"
     KindBool -> "bool"
     KindReal -> "real"
+    KindText -> "text"
+    KindConstText -> "const text"
 
 // The constant expression that holds where the typedef `name` is the kind `kind` asks for, by the
-// class of type clang gives it: 1 an integer or enumeration, 4 a bool, 8 a floating-point type.
+// class of type clang gives it: 1 an integer or enumeration, 4 a bool, 8 a floating-point type; a
+// string is one of the two pointers to `char`.
 private kind_test(kind: CKind, name: string) -> string
     val class = s"__builtin_classify_type(*($name *)0)"
+    val constant = s"__builtin_types_compatible_p($name, const char *)"
     kind match
         KindInteger -> s"$class == 1"
         KindByte -> s"$class == 1 && sizeof($name) == 1"
-        KindBool -> s"$class == 4"
+        KindBool -> s"$class == 4 || $class == 1"
         KindReal -> s"$class == 8"
+        KindText -> s"__builtin_types_compatible_p($name, char *) || $constant"
+        KindConstText -> constant
 
 private contains_text(xs: Buf[string], x: string) -> bool
     for y in xs
@@ -278,13 +303,15 @@ private struct BindingTrouble
     /** The typedefs found the wrong kind, and what each diagnostic says of one. */
     kind_names: Buf[string]
     kinds: Buf[string]
+    /** What is wrong with the function its `free:` names. */
+    frees: Buf[string]
 
 /** Clang's diagnostics of the C unit `unit`, placed back at the bindings and the libraries they came
  * from; anything clang said that no line of the unit accounts for is passed on as it was. */
 c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding], libraries: Buf[CLibrary], sources: Buf[Source]) -> string
     var troubles: Buf[BindingTrouble] = buf()
     for _ in bindings
-        troubles.push(BindingTrouble("", "", false, "", "", buf(), buf()))
+        troubles.push(BindingTrouble("", "", false, "", "", buf(), buf(), buf()))
     var unplaced = ""
     var libraries_text = ""
     var placed_any = false
@@ -343,12 +370,21 @@ c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding
                 val what = kind match
                     KindInteger -> "an integer type"
                     KindByte -> "an integer type one byte wide"
-                    KindBool -> "a bool"
+                    KindBool -> "a bool or an integer type"
                     KindReal -> "a floating-point type"
+                    KindText -> "`char *` or `const char *`"
+                    KindConstText -> "`const char *`"
                 // A type the headers do not declare at all is reported by the header check.
                 if d.message.starts_with("static assertion failed") && !contains_text(troubles[i].kind_names, name)
                     troubles[i].kind_names.push(name)
                     troubles[i].kinds.push(s"the C type `$name` of $where is not $what in the headers, so it cannot cross as `${type_name(avin)}`")
+            FreeLine(i, name) ->
+                placed_any = true
+                if troubles[i].frees.len() > 0 then continue
+                if d.message.starts_with("use of undeclared identifier")
+                    troubles[i].frees.push(s"the C binding `${bindings[i].name}` frees its result with `$name`, which no header of its package declares")
+                elif d.message.starts_with("static assertion failed")
+                    troubles[i].frees.push(s"the C binding `${bindings[i].name}` frees its result with `$name`, which the headers do not declare as a function taking the string and answering nothing, `void $name(void *)` or `void $name(char *)`")
             Plain -> unplaced = unplaced + text + "\n"
     var rendered = libraries_text
     for i in 0..<bindings.len()
@@ -369,6 +405,8 @@ c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding
         elif t.other != "" then messages.push(s"the C binding `${b.name}` does not compile against its headers: ${t.other}")
         for k in t.kinds
             messages.push(s"the C binding `${b.name}` does not fit its headers: $k")
+        for m in t.frees
+            messages.push(m)
         if messages.len() == 0 then continue
         var r = report()
         for m in messages

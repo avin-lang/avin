@@ -2,6 +2,9 @@
 #include "avin_fixture.h"
 
 #include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define FIXTURE_DEFINE(name, T, MIN, MAX) \
     T fixture_echo_##name(T x) { return x; } \
@@ -68,6 +71,66 @@ fixture_pointer fixture_nowhere(void) { return 0; }
 int fixture_point_x(fixture_point p) { return p.x; }
 int fixture_count_up(fixture_pointer p) { return p ? *p : 0; }
 fixture_wide_octet fixture_wide(fixture_wide_octet x) { return x; }
+
+static long allocated;
+static long freed;
+static char joined[256];
+
+long fixture_length(const char *s) { return s ? (long)strlen(s) : -1; }
+int fixture_byte_at(const char *s, int i) { return (unsigned char)s[i]; }
+const char *fixture_static(void) { return "static text"; }
+const char *fixture_echo_text(const char *s) { return s; }
+
+char *fixture_copy(const char *s) {
+    size_t n = strlen(s);
+    char *p = malloc(n + 1);
+    memcpy(p, s, n + 1);
+    allocated++;
+    return p;
+}
+
+char *fixture_repeat(const char *s, int n) {
+    size_t m = strlen(s);
+    char *p = malloc(m * (size_t)n + 1);
+    for (int i = 0; i < n; i++) memcpy(p + m * (size_t)i, s, m);
+    p[m * (size_t)n] = 0;
+    allocated++;
+    return p;
+}
+
+void fixture_free(char *s) { freed++; free(s); }
+long fixture_allocated(void) { return allocated; }
+long fixture_freed(void) { return freed; }
+
+/* Byte strings that are not UTF-8, each ill-formed at the byte its comment says. */
+const char *fixture_invalid(int which) {
+    switch (which) {
+    case 0: return "ab\xff";             /* a byte no sequence begins with, at 2 */
+    case 1: return "a\xc3";              /* a sequence cut short, at 1 */
+    case 2: return "\xc0\xaf";           /* an overlong `/`, at 0 */
+    case 3: return "xy\xed\xa0\x80";     /* a surrogate, U+D800, at 2 */
+    case 4: return "\xf4\x90\x80\x80";   /* past U+10FFFF, at 0 */
+    case 5: return "ok \x80";            /* a continuation byte alone, at 3 */
+    default: return "\xe2\x82\xac\xf0\x9f\x98\x80"; /* valid: U+20AC then U+1F600 */
+    }
+}
+
+const char *fixture_maybe(int present) { return present ? "present" : 0; }
+char *fixture_maybe_copy(const char *s) { return s ? fixture_copy(s) : 0; }
+fixture_text fixture_typedef_text(void) { return (fixture_text)"typedef text"; }
+long fixture_typedef_length(fixture_const_text s) { return (long)strlen(s); }
+
+const char *fixture_join(const char *a, const char *b) {
+    snprintf(joined, sizeof joined, "%s+%s", a ? a : "(null)", b ? b : "(null)");
+    return joined;
+}
+
+fixture_truth fixture_truth_of(int x) { return x; }
+int fixture_truth_value(fixture_truth t) { return t; }
+void fixture_wrong_free(int x) { (void)x; }
+int fixture_free_answer(char *s) { free(s); return 0; }
+int fixture_count_args(const char **argv) { int n = 0; while (argv[n]) n++; return n; }
+long fixture_writable_length(fixture_text s) { return (long)strlen(s); }
 
 /* In the library, and declared by no header. */
 int fixture_undeclared(int x) { return x; }

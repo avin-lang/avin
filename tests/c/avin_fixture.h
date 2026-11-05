@@ -88,4 +88,33 @@ int fixture_point_x(fixture_point p);
 int fixture_count_up(fixture_pointer p);
 fixture_wide_octet fixture_wide(fixture_wide_octet x);
 
+/* Strings. A length of null is -1. `fixture_copy` and `fixture_repeat` answer memory `fixture_free`
+ * frees, and the library counts both, so a test sees that every string it was answered was freed. */
+typedef char *fixture_text;
+typedef const char *fixture_const_text;
+/* An integer used as a truth value, as Cairo's `cairo_bool_t` is. */
+typedef int fixture_truth;
+
+long fixture_length(const char *s);
+int fixture_byte_at(const char *s, int i);
+const char *fixture_static(void);
+const char *fixture_echo_text(const char *s);
+char *fixture_copy(const char *s);
+char *fixture_repeat(const char *s, int n);
+void fixture_free(char *s);
+long fixture_allocated(void);
+long fixture_freed(void);
+const char *fixture_invalid(int which);
+const char *fixture_maybe(int present);
+char *fixture_maybe_copy(const char *s);
+fixture_text fixture_typedef_text(void);
+long fixture_typedef_length(fixture_const_text s);
+const char *fixture_join(const char *a, const char *b);
+fixture_truth fixture_truth_of(int x);
+int fixture_truth_value(fixture_truth t);
+void fixture_wrong_free(int x);
+int fixture_free_answer(char *s);
+int fixture_count_args(const char **argv);
+long fixture_writable_length(fixture_text s);
+
 #endif

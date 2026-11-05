@@ -2029,29 +2029,131 @@ private binding_body(l: *Lowering, symbol: FunctionSymbol, shim: string)
 // the C function directly, and converts what it answers. An integer the other side cannot hold stops
 // the program at the call, as a check in the core library does: an argument's reason names the C
 // type by its sign and width, a result's the Avin type.
+//
+// A string argument is copied into NUL-terminated memory off the collected heap, which lives for the
+// call and is freed once what C answered has been converted; one holding a NUL stops the program at
+// the call. A string C answers is
+// copied onto the heap, checked as UTF-8 unless it is answered as an `Array[byte]`, and then freed
+// by the binding's `free:` function where it names one; a null answer is `None`, or stops the
+// program where the result is no `Option`.
 private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
     val outer = l.library
     l.library = true
     val at = symbol.decl.name_span
     var args: Buf[Operand] = buf()
     var scalars: Buf[CScalar] = buf()
+    var copies: Buf[Operand] = buf()
     for i in 0..<symbol.params.len()
         val t = concrete(l, symbol.params[i])
+        val x = Value(l.param_values[i].unwrap())
+        val form = c_text_form(t, l.program.data, l.program.classes)
+        if form is TextString(optional)
+            val text = if !optional then x elif pointer_option(l, t) then x else option_pointer(l, t, x)
+            val name = c_parameter_name(symbol.decl, i)
+            val site = trap_site(l, s"the string passed to `$name` of `${symbol.name}` holds a NUL", at)
+            val copy = runtime_call(l, "avin_rt_c_string_in", [MRef, MPtr], MPtr, [text, TrapSiteAddress(site)])
+            copies.push(copy)
+            scalars.push(CAddress)
+            args.push(copy)
+            continue
         val s = c_scalar_of(p.params[i].ty, t, l.program.c_measures)
         scalars.push(s)
-        args.push(c_argument(l, Value(l.param_values[i].unwrap()), t, s, c_integer_name(p.params[i].ty, s), at))
+        args.push(c_argument(l, x, t, s, c_integer_name(p.params[i].ty, s), at))
     val result_type = concrete(l, symbol.result.unwrap_or(Unit))
-    if *result_type is Unit
+    val free = c_free_text(symbol.decl)
+    val result_form = c_text_form(result_type, l.program.data, l.program.classes)
+    val text_result = !(result_form is NoText) || (*result_type is Unit && free is Some(_))
+    if *result_type is Unit && !text_result
         l.insts.push(Call(None, CFunction(p.symbol, scalars, None), args))
+        c_release_copies(l, copies)
         l.library = outer
         finish(l, Return(None))
+        return
+    if text_result
+        val answer = fresh(l, MPtr)
+        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(CAddress)), args))
+        // C may answer a pointer into a string it was passed, so the copies outlive the answer's.
+        val value = c_text_answer(l, Value(answer), result_type, result_form, free, p.symbol, at)
+        c_release_copies(l, copies)
+        l.library = outer
+        finish(l, Return(value))
         return
     val s = c_scalar_of(p.result, result_type, l.program.c_measures)
     val answer = fresh(l, c_machine(s))
     l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), args))
+    c_release_copies(l, copies)
     val value = c_answer(l, Value(answer), s, result_type, at)
     l.library = outer
     finish(l, Return(Some(value)))
+
+// The name of a binding's parameter `i` as a trap names it: the name it was declared with, or its
+// position where it was declared with a pattern.
+private c_parameter_name(f: &Function, i: usize) -> string = f.params[i].pattern.kind match
+    Name(n) -> n
+    _ -> s"parameter ${i + 1}"
+
+// Frees the copies a call's string arguments were made into, once the call has returned.
+private c_release_copies(l: *Lowering, copies: Buf[Operand])
+    for c in copies
+        var types: Buf[MirType] = buf()
+        types.push(MPtr)
+        var args: Buf[Operand] = buf()
+        args.push(c)
+        l.insts.push(Call(None, Runtime("avin_rt_c_string_free", MirSignature(types, None)), args))
+
+// Calls the C function `free` on the string C answered at `answer`.
+private c_free_answer(l: *Lowering, free: string, answer: Operand)
+    var params: Buf[CScalar] = buf()
+    params.push(CAddress)
+    var args: Buf[Operand] = buf()
+    args.push(answer)
+    l.insts.push(Call(None, CFunction(free, params, None), args))
+
+// What C answered as a string, at `answer`, as the Avin type `t` carrying it in `form`: copied
+// into a new string checked as UTF-8, or into a new `Array[byte]`, and then freed by `free` where
+// the binding names one. Null is `None` for an `Option`, and stops the program otherwise. A binding
+// whose result is `unit` frees what C answered and answers nothing.
+private c_text_answer(l: *Lowering, answer: Operand, t: &Type, form: CTextForm, free: Option[string], symbol: string, at: Span) -> Option[Operand]
+    val optional = form match
+        TextString(o) -> o
+        TextBytes(o) -> o
+        NoText -> false
+    val absent = compare(l, CmpEq, answer, NullAddress)
+    if *t is Unit
+        val present = new_block(l)
+        val join = new_block(l)
+        finish_into(l, Branch(absent, join, present), present)
+        c_free_answer(l, free.unwrap(), answer)
+        finish_into(l, Jump(join), join)
+        return None
+    if !optional then trap_if(l, absent, s"`$symbol` answered null", at)
+    if !optional then return Some(c_text_copy(l, answer, t, form, free, symbol, at))
+    val slot = machine_slot(l, MRef)
+    val none = new_block(l)
+    val present = new_block(l)
+    val join = new_block(l)
+    finish_into(l, Branch(absent, none, present), none)
+    store(l, slot, Some(NullAddress))
+    finish_into(l, Jump(join), present)
+    val inner = option_argument(l.options, t).unwrap()
+    store(l, slot, Some(c_text_copy(l, answer, inner, form, free, symbol, at)))
+    finish_into(l, Jump(join), join)
+    val value = load(l, slot).unwrap()
+    if pointer_option(l, t) then return Some(value)
+    Some(option_object(l, t, value))
+
+// The copy of the string C answered at `answer`, which is not null, as `t`, a `string` or an
+// `Array[byte]`, after which `free` frees it where the binding names one.
+private c_text_copy(l: *Lowering, answer: Operand, t: &Type, form: CTextForm, free: Option[string], symbol: string, at: Span) -> Operand
+    var copied: Operand = NullAddress
+    if form is TextBytes(_)
+        val descriptor = layout(l, t).variants[0].descriptor
+        copied = runtime_call(l, "avin_rt_c_bytes_out", [MPtr, MPtr], MRef, [DescriptorAddress(descriptor), answer])
+    else
+        val site = trap_site(l, s"`$symbol` answered a string that is not UTF-8", at)
+        copied = runtime_call(l, "avin_rt_c_string_out", [MPtr, MPtr], MRef, [answer, TrapSiteAddress(site)])
+    if free is Some(f) then c_free_answer(l, f, answer)
+    copied
 
 // The machine type an operand crossing as `s` has: a `float` is carried as a `real`.
 private c_machine(s: CScalar) -> MirType = s match
@@ -2060,6 +2162,7 @@ private c_machine(s: CScalar) -> MirType = s match
     CBoolean -> MBool
     CBinary64 -> MReal
     CBinary32 -> MReal
+    CAddress -> MPtr
 
 // An argument of Avin type `t` as the C type crossing as `s`, which `name` names. A signed C type
 // narrower than the integer traps where the value does not survive the trip back; an unsigned one
@@ -2080,13 +2183,28 @@ private c_argument(l: *Lowering, x: Operand, t: &Type, s: CScalar, name: string,
             trap_if(l, compare(l, CmpUgt, x, ConstInt(width, ((1u64 << u64(bits)) - 1u64).to_string())), s"value out of range for $name", at)
             resize(l, x, width, bits, false)
         _ -> x
+    // A `bool` passed to an integer used as a truth value is 0 or 1.
+    Bool -> s match
+        CSigned(bits) -> c_truth(l, x, bits)
+        CUnsigned(bits) -> c_truth(l, x, bits)
+        _ -> x
     _ -> x
 
-// What C answered, crossing as `s`, as the Avin type `t`: an integer traps where `t` cannot hold it.
+private c_truth(l: *Lowering, x: Operand, bits: u32) -> Operand
+    val dest = fresh(l, MInt(bits))
+    l.insts.push(Select(dest, x, ConstInt(bits, "1"), ConstInt(bits, "0")))
+    Value(dest)
+
+// What C answered, crossing as `s`, as the Avin type `t`: an integer traps where `t` cannot hold it,
+// and an integer answered as a `bool` is false for zero and true for every other value.
 private c_answer(l: *Lowering, x: Operand, s: CScalar, t: &Type, at: Span) -> Operand = *t match
     Int(width) -> s match
         CSigned(bits) -> narrow_signed(l, x, bits, width, t, at)
         CUnsigned(bits) -> narrow_unsigned(l, x, bits, width, t, at)
+        _ -> x
+    Bool -> s match
+        CSigned(bits) -> compare(l, CmpNe, x, ConstInt(bits, "0"))
+        CUnsigned(bits) -> compare(l, CmpNe, x, ConstInt(bits, "0"))
         _ -> x
     _ -> x
 
