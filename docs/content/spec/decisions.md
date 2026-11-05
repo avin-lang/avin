@@ -1396,7 +1396,8 @@ Settled by the user on 2026-11-04:
 - Settled by the user 2026-11-04: A collection added to itself ([collections](/spec/collections/#buffer)): `b.addAll(b)` and
   `b ++= b` on a `Buffer` or a `Deque` append the elements it held when the call began, once, and
   `s --= s` on a mutable `Set` empties it.
-- Settled by the user 2026-11-04: [`avin.time`](/spec/system-library/#avin-time): `Duration`, `Instant` (monotonic) and `WallTime`
+- **Superseded 2026-11-05** by the [dates and times](/spec/time/) entry that follows; kept as it
+  was. Settled by the user 2026-11-04: [`avin.time`](/spec/system-library/#avin-time): `Duration`, `Instant` (monotonic) and `WallTime`
   (wall clock, a `Duration` since the 1970 epoch) are data types counting whole microseconds in a
   `long`, overflow trapping; the two clocks are distinct types so their readings never mix. A
   duration implements `Add`, `Sub`, `Neg`, and scales by a `long` with its methods `*` and `/`; a
@@ -1404,6 +1405,22 @@ Settled by the user on 2026-11-04:
   through `-` (or `since`), which yields their `Duration`. The
   text forms are a duration's largest-unit form (`1.5ms`) and an ISO 8601 UTC timestamp. Sleeping
   and calendar fields beyond the timestamp text are not part of it yet.
+- Settled by the user 2026-11-05: [dates and times](/spec/time/) (`avin.time`) follow slate's
+  date/time design with Avin's spellings (types PascalCase, functions lowerCamelCase). Eight types:
+  `Instant` (a point on the timeline, microseconds since 1970 UTC, displayed as ISO 8601 with `Z`;
+  it replaces `WallTime`), `Duration`, `Date` (a calendar date with no zone; no `Local` prefix
+  anywhere), `Time` (a time of day), `DateTime` (a date and a time, no zone), `Zone`, `Zoned` (a
+  date-time in a zone, the only zoned type) and `Period` (months and years). There is no monotonic
+  `Instant`: `monotonic()` answers a `Duration`, a monotonic reading naming no point in time, and an
+  elapsed time is `monotonic() - start`. Makers: `now()`, `monotonic()`, `date(y, m, d)`,
+  `time(h, m, s)`, `dateTime(…)`, `zone("America/Toronto")`, `localZone()`, and `utc`, a value
+  rather than a call; `epochSeconds`, `epochMillis` and `epochMicros` to and from counts; the
+  durations `micros millis seconds minutes hours days weeks`, also as methods (`2.hours()`); the
+  periods `months` and `years`. The implementation binds with `@sysl` over Sysl 0.10.0's `sysl.time`
+  (`Date`, `Time`, `DateTime`, `YearMonthDay`, `Offset`, `Weekday`, `Resolution`, `Zone` over
+  `sysl.time.tzif` with `offset_at` and `resolve`, `Zoned`, `Period`), with the system clock and the
+  local zone from `sysl.posix.time`, and no new C. The choices the design makes beyond these are
+  under [Proposed](#proposed).
 - Settled by the user 2026-11-04: Bindings to Sysl packages ([packages](/spec/packages/#sysl-dependencies),
   [bindings](/spec/sysl-bindings/#sysl-packages)): a manifest names the Sysl packages its bindings
   reach in a block of its own, `sysl-dependencies`, beside `dependencies`, each entry written as an
@@ -3401,6 +3418,93 @@ their words are reserved.
     *Alternative*: requiring `borrowed`, a word that could only ever be written one way.
 
   **Review with the user**: writers of scalars only.
+
+- Settled on the user's delegation 2026-11-05: **[Dates and times](/spec/time/)** (branch
+`datetime-design`), the choices the design makes beyond the user's settled entry. Where the slate design leaves a name open, the names follow the
+widely used date/time library family of Avin's reference standard library ecosystem (`atZone`,
+`plusDays`, `withYear`, `toInstant`, `isBefore`, `toMinutes`), except where a slate or a simpler
+spelling is better, as each entry says.
+
+- **Representation and ranges.** Every type but `Zone` is a `data` type whose fields are its
+  representation (`Duration(micros)`, `Instant(epochMicros)`, `Date(epochDay: int)`,
+  `Time(microsOfDay)`, `DateTime(date, time)`, `Zoned(dateTime, offset, zone)`,
+  `Period(months, days)`); the makers check and the constructors take fields as given. A `Duration`
+  and an `Instant` span a whole `long`, a `Date` a whole `int` of days, and what leaves a range traps.
+  *Why*: data types are unboxed values, and every field value of `Duration`, `Instant`, `Date` and
+  `Period` is meaningful, so those constructors are total. *Alternatives*: one common range for every
+  type (±290,000 years), cleaner to state, but enforceable only with constructors the module keeps
+  to itself, which Avin does not have; classes with private state, boxed and with identity. A
+  `Time` or `Zoned` built through its constructor with fields no maker would give is the cost.
+  **Review with the user**: a module-private constructor would close it.
+- **Days and weeks are exact durations; a calendar day is `plusDays(n)` or `Period(0, n)`.** The
+  settled list makes `days` and `weeks` durations, as Sysl 0.10.0's are, so `Period` holds months
+  and days (Sysl's `Period(months, days)`), `months` and `years` make it, and `Date + Duration` does
+  not compile (`date.plusDays(1)`). On a `Zoned`, `z + days(1)` is 24 hours and `z.plusDays(1)` the
+  same wall clock a day later. *Why*: the user's list and Sysl agree, and the exact/calendar line
+  stays in the types. *Alternatives*: slate's implementation, where `days` and `weeks` make periods
+  so `zoned + days(1)` keeps the wall clock, which contradicts the settled list. **Review with the
+  user**: the two spellings answer differently across a daylight-saving change.
+- **Names where slate leaves them open, and where slate's are kept.** `t.atZone(z)`, `d.atTime(t)`,
+  `t.atDate(d)`, `d.atStartOfDay()`, `zt.toInstant()`, `plusYears`/`plusMonths`/`plusWeeks`/
+  `plusDays` (no `minus` forms: a negative count), `withYear`/`withMonth`/`withDay`/`withHour`…,
+  `isBefore`/`isAfter`/`isSameInstant`, a duration's `toHours()` (whole) and `toHoursPart()`, a
+  date's `daysUntil`/`monthsUntil`/`until`. Kept from slate as better: `weekday()` (shorter, and the
+  name of its type) over `dayOfWeek`, `day()` and so `withDay` over `dayOfMonth`, `onOrAfter(w)` and
+  `onOrBefore(w)` over adjuster objects, `parseTimestamp`, the `epoch*` makers. Slate's single `at`
+  is spelt `atZone`/`atTime`/`atDate`, since one overloaded word hides which conversion is meant and
+  `atZone` names what can fail. `startOf("month")` becomes `startOfMonth()` and its siblings, so a
+  date's `startOfHour` is a compile error rather than a run-time one. *Alternatives*: slate's
+  `d.minutes()` for whole minutes (the same word makes and measures), `dayOfMonth`.
+- **Choosing an instant for a skipped or repeated reading.** `dt.atZone(z)` answers
+  `Result[Zoned, ZoneTimeError]` (`Skipped`, `Repeated`), and `atZoneEarlier(z)`/`atZoneLater(z)`,
+  Sysl's `at_earlier`/`at_later`, always answer: the earlier or later instant of a repeated hour, and
+  in a skipped hour both push the reading past the gap by its length. A period on a `Zoned`, a
+  `with…` and `startOfDay` push past a gap and, in a repeated hour, keep the offset the reading had
+  where it is one of the two and otherwise take the earlier. *Why*: what the binding gives, and the
+  established rule. *Alternatives*: slate's string choice (`"earlier" | "later" | "after"`), a
+  `Pick` enum argument.
+- **A `Zoned`'s equality and order.** `==` needs the same instant in the same zone; `Ord` orders by
+  instant, then wall reading, then zone name, so it agrees with `==` and a `TreeMap` keeps two
+  readings of one instant; `isBefore`, `isAfter` and `isSameInstant` compare instants alone.
+  *Alternatives*: slate's, where `<` compares only the instant and so is false both ways for two
+  zones' readings of one instant, an `Ord` that disagrees with `==`. **Review with the user**: `<`
+  between two zones' readings of one instant is decided by the zone names.
+- **Text.** ISO 8601 with `T`, the seconds always written, the fraction only when there is one and
+  without trailing zeros (slate's), years outside `0`–`9999` signed; a fixed zone's `Zoned` writes no
+  bracketed name. A duration keeps the form the user settled on 2026-11-04, its largest unit of `s`,
+  `ms` and `us` (`90.5s`, `1.5ms`); a period writes as `1y 2mo 3d`. *Why*: one shape per column; the
+  duration form is the user's own decision, which a delegated choice does not overturn.
+  *Alternatives*: Sysl's renderers (a space for `T`, seconds dropped when zero), today's `WallTime`
+  form with six fraction digits always, slate's `1h 30m` duration form (the design agent's
+  proposal). **Review with the user**: whether durations should move to slate's `1h 30m` form.
+- **Parsing.** `parseDate`, `parseTime`, `parseDateTime`, `parseTimestamp` and `parseZoned`, each a
+  `Result` with `TimeParseError` (`BadShape(text, at)`, `OutOfRange(text, field)`,
+  `Trailing(text, at)`, `UnknownZone(text, name)`, `at` a byte offset), every display read back,
+  ASCII digits only, a timestamp's offset required. *Why*: Sysl's error kinds, with the text a
+  message must quote. *Alternatives*: a message string only (slate); reading by pattern, left out
+  until wanted.
+- **Patterns.** `format(pattern)` with slate's pattern language (`YYYY`, `MMMM`, `WWWW`, `h12`, `a`,
+  `f`…, `z`…, `|literal|`, `||` a bar), English names and no locales; an element the value lacks, a
+  malformed run and an unclosed bar trap, the pattern being program text. `Instant` has no `format`.
+  *Alternatives*: a compiled pattern answering a `Result`, as `Regex.compile` does, for patterns read
+  from outside.
+- **Zones.** `zone(name)` answers `Result[Zone, ZoneError]` (`UnknownZone`, `NotAZoneName` decided
+  before any file is read, `Malformed`); `localZone()` always answers, `utc` where the host names no
+  zone it can read; `fixedZone(offset: Duration)` takes whole minutes within ±23:59 and traps
+  otherwise. An offset is a `Duration` and Sysl's `Offset` stays behind the binding.
+  `isDaylightSavingAt` and `abbreviationAt` read the zone's table through `sysl.time.tzif`.
+  *Alternatives*: an `Offset` type of its own (a ninth public type), `localZone()` as a `Result`.
+- **The wall clock reads microseconds** as the host gives them. *Alternatives*: whole milliseconds,
+  slate's choice for agreement with a back end Avin does not have.
+- **Smaller additions**: `isoWeek()` and `isoWeekYear()`; `endOfMonth()`; `Date - Date` a `Period` of
+  days; `d / e` between durations a `long`; a `Period` and a `Zone` `Eq` and `Hash` but not `Ord`; a
+  `Time` with no arithmetic; `Weekday` ordered Monday to Sunday with `isoNumber()` and `plus(n)`;
+  `months` and `years` as methods on `int` as the durations are on `int` and `long`; `3 * d` does not
+  compile, the built-in types' operators gaining no methods.
+- **Delays.** Every delay in the library is a `Duration`: `Future.await` and `Condition.waitFor` gain
+  overloads taking one beside their milliseconds; a command's deadline is a `monotonic()` reading;
+  actor timers keep the runtime's monotonic microseconds and their `Duration` parameters.
+  *Alternatives*: leaving the millisecond forms alone.
 
 **Deferred**
 
