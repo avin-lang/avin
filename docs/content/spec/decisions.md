@@ -3125,14 +3125,7 @@ their words are reserved.
     `FT_Error_String`, which the survey placed in step 2, ride step 3, since step 2 was already being
     built.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- Proposed (built on branch `c-bindings-strings`): **C bindings of strings and truth values**
+- Settled on the user's delegation 2026-11-05 (built on branch `c-bindings-strings`): **C bindings of strings and truth values**
   (stage 13 step 2), the choices building it made where the [chapter](/spec/c-bindings/#strings) is
   silent.
   - **A C string is exactly one pointer to a plain `char`**, `const` when the qualifier comes before
@@ -3177,6 +3170,15 @@ their words are reserved.
     for null, which hides the difference C makes.
 
   **Review with the user**: whether `free:` on a `unit` result should stay legal.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
