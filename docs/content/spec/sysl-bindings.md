@@ -90,7 +90,7 @@ Data crosses the boundary in a fixed set of shapes:
 
 | Avin type | Crossing |
 | --- | --- |
-| `i8`, `i16`, `int`, `long`, `byte`, `real`, `char`, `bool`, `unit` | By value; Sysl's `u8` is `byte`. An integer result, and an integer a result holds, takes [any Sysl integer](#integer-results), and a callback's integer answer goes into [any](#callbacks) |
+| `i8`, `i16`, `int`, `long`, `byte`, `real`, `char`, `bool`, `unit` | By value; Sysl's `u8` is `byte`. An integer result, and an integer a result holds, takes [any Sysl integer](#integer-results); an integer parameter goes into [any](#integer-parameters), and so does a callback's integer answer [too](#callbacks) |
 | `string` | Copied into a Sysl `string` in each direction |
 | `Array[byte]` | Copied into a Sysl `[]u8` and, as a binding's own parameter, [copied back](#filled-arrays) after the call; out of a Sysl `[]u8` or `[]const u8` |
 | `Array[T]`, `Vector[T]` of any other boundary type | **Copied**, element by element: into a Sysl slice, and out of a Sysl `[]T` or `Buf[T]` into a new array or vector. An array of numbers, booleans or characters as a binding's own parameter is [copied back](#filled-arrays); any other array goes in as a `[]const T` |
@@ -139,10 +139,48 @@ A value of any other type is not converted to an integer, and the binding is rej
 error: the Sysl binding `upperCount` does not match `sysl.text.to_upper`: an integer is made from a Sysl integer, but the value is string
 ```
 
-An integer parameter, and an integer a parameter holds, is passed as the type it is declared, which
-Sysl accepts where its own parameter's type holds every value of it: an `i16` reaches an `i32`
-parameter, and a `long` does not. An integer in an `Option`, a `Result` or a collection is not
-widened: an `Option[int]` reaches an `Option[i32]` parameter only.
+### Integer parameters
+
+A binding's integer parameter goes into whatever integer the Sysl parameter is, of any width and
+either sign, converted with a check, as a [callback's answer](#callbacks) is. Avin has no unsigned
+integers, so a Sysl `u32`, `u64` or `usize` parameter takes an Avin `int` or `long`, and a `long`
+reaches an `i32` or an `i8` too where its value fits. syslui takes a colour this way:
+
+```text
+@sysl("sh.sysl.ui.View")
+class View
+    background(color: int, radius: int = 0) -> View
+```
+
+A value the Sysl type cannot hold — a negative one for a `u32` or a `u64`, one past its largest
+value — stops the program where the binding was called, naming the Sysl type by its sign and width.
+A handle's method converts its parameters the same way, and a [call that waits](#calls-that-wait)
+converts them while its thread is safe for the collector:
+
+```text
+avin: trap: value out of range for u32 at main.avin:11:13
+```
+
+A `byte` is not converted: it is passed as a Sysl `u8`. A Sysl parameter whose type is a type
+parameter of a generic function, `same[T](x: T) -> T`, says no integer to convert into, and is
+given the Avin type itself: `T` is then the binding's `int` or `long`. So is every integer parameter
+of a binding to a generic function that infers a type parameter from one of them, as syslui's
+`slider[T](value: &Signal[T], lo: T, hi: T, …)` does. An integer goes into an integer only:
+
+```text
+error: the Sysl binding `joinNumber` does not match `sysl.path.join`: parameter 2 is an integer, which goes into Sysl only as an integer, but the Sysl parameter is string
+```
+
+An integer a parameter holds — in an `Option`, a `Result`, a tuple or a collection — is passed as
+the type it is declared and is not converted: an `Option[int]` reaches an `Option[i32]` parameter
+only, and the diagnostic for any other says why:
+
+```text
+error: the Sysl binding `countOrZero` does not match `avintest.digits.count_or_zero`: 'n' of 'digits.avintest.digits.count_or_zero' is Option[i64], but Option[int] was given: an integer inside an `Option`, a `Result`, a tuple or a collection is passed as the type it is declared, and only a binding's own integer parameter is converted into the Sysl parameter's integer
+```
+
+A value narrower than 32 bits crosses widened as the C convention widens it, a signed integer
+sign-extended and a byte or a bool zero-extended: as a parameter, and as a callback's answer.
 
 ### Collections are copies
 

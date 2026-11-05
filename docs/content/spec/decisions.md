@@ -2508,6 +2508,96 @@ their words are reserved.
     only one), against a keyword or a `Sendable`-bounded spelling; and whether two overloads
     differing only in the mark should be refused or resolved to the plain one for a lambda.
 
+- Settled on the user's delegation 2026-11-05 (built on branch `state-machines`): **State machines, the choices [the chapter](/spec/actors/#state-machines) leaves open** (branch
+  `state-machines`, 2026-11-05). A machine is read into its `Door.State` data type and a final class
+  holding the current state, so it needs no runtime. Decided:
+  - **Order inside a transition.** The arm runs first; then the current state's `leave`, in which
+    `state()` still answers the state being left; then the new state is current and its `enter`
+    runs, in which `state()` answers it; `handle` answers the state after `enter`. Why: an arm
+    computes where to go, `leave` cleans up the old state's data, which it can still read, and
+    `enter` sees the machine as it will be. Alternatives: switching the state before `leave` (it
+    would then read data no longer current); running `leave` before the arm (an arm yielding `stay`
+    would have left).
+  - **A state is a variant of its module**, as every data type's variant is: `Locked(code)` and
+    `door.state() is Locked(_)` name it bare, so two machines of one module cannot share a state's
+    name, nor a state an event's variant; the error says so, naming the state and the machine.
+    Why: it follows from `Door.State` being an ordinary data type matched by bare names, as the
+    chapter writes. Alternatives: scoping state names to their machine, written bare only inside
+    it and `Door.State.Locked` outside (the chapter's own `door.state() is Locked(_)` would no
+    longer read). **Review with the user**: common names such as `Idle` or `Done` collide between
+    machines of one module.
+  - **`Door.State` takes all of the machine's type parameters, with their bounds**, so a state of a
+    generic machine may hold values of them: `Cell.State[string]`. Why: the smallest rule that lets
+    any state hold any of them. Alternative: only the parameters the states use (the type's
+    arguments would then depend on which states mention which parameter).
+  - **`stay` is the value of an arm where it is the arm's value**: the arm's whole body, the last
+    line of a block, and each branch of an `if` or a `match` that is itself in such a place.
+    Elsewhere `stay` is an ordinary name. Why: the chapter makes `stay` a keyword only as an arm's
+    value. Alternative: anywhere in an arm's body (it would then be a value that could be stored,
+    with a meaning only at the end).
+  - **The trap on handling from inside a handler names the machine and is reported at its
+    declaration**: ``avin: trap: `Relay` handles an event from inside one of its own arms, `enter`
+    or `leave` blocks at file:line:col``. The first state's `enter`, run as the machine is made, is
+    such a block too. Why: the check is in the code the declaration makes. Alternative: reporting
+    the `handle` call that re-entered, as a library trap reports the program's call (it needs the
+    machine's code to count as the library's for its traps, which its arms are not).
+  - **The coverage error lists every case left out**: each variant of the event type not covered in
+    full, written as its first uncovered value (`Lock(_)`, `Both(true, None)`), followed by "where
+    the guard is false" when a guarded arm could have taken it; for an event type without variants,
+    one value (`-1`). Why: it is the chapter's own message, extended to the shapes it does not show.
+  - **A machine takes no parents and no `derives`** in its header in this step, and a state and the
+    `receive` block take `else` arms as a `match` does. Alternative: parents after the parameters, as
+    a class's; nothing in the chapter needs them yet.
+  - **Handling an event from the machine's own body**, before the first state's `enter` has run, is
+    allowed: the machine is in its first state then. Alternative: trapping as from inside a handler.
+  - **Not sendable, said as such**: a machine passed where a sendable value is needed is reported as
+    "a machine, a mutable object that moves between its states", not by its hidden state field.
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-int-params`): **A binding's integer parameter goes into whatever integer the Sysl
+  parameter is, with a check** ([Sysl bindings](/spec/sysl-bindings/#integer-parameters)). An Avin
+  `int`, `long`, `i8` or `i16` parameter reaches a Sysl parameter of any concrete integer type, `u8`
+  to `u64`, `usize` and the signed widths, converted in the shim; a value the Sysl type cannot hold
+  stops the program where the binding was called (`value out of range for u32`). A handle's method
+  converts the same way, and a blocking call converts with its thread safe for the collector,
+  making it running again before stopping the program. Why: syslui's colour modifiers take a `u32`
+  parameter, Avin has no unsigned integers (settled 2026-11-02), and the rule is the mirror image of
+  the integer result and the callback answer, so all three directions of an integer follow one
+  rule. Consequence: a `long` now reaches an `i32` parameter where its value fits, which was
+  rejected before. Alternatives weighed: converting only into unsigned types (two rules for one
+  shape); an `int` reinterpreted as the `u32`'s bits (a colour past `0x7FFFFFFF` written negative).
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-int-params`): **An integer parameter is passed as the Avin type
+  itself where Sysl cannot infer a type for its conversion**: a parameter whose Sysl type is a type
+  parameter of a generic function (`same[T](x: T)`), and every integer parameter of a binding whose
+  call left any type argument uninferred (syslui's `slider[T](value: &Signal[T], lo: T, hi: T)`,
+  where the integer bounds decide `T`). The compiler learns this from Sysl's refusal and builds the
+  shims once more, as it does for a callback's answer. Why: a conversion needs a target type, and a
+  generic parameter has none until its arguments say. Alternatives weighed: converting the
+  parameters a generic call can still infer and passing only the stalled ones as they are (needs a
+  build per round of refusals); refusing such bindings (`slider` would be unbindable). Review with
+  the user: a binding to a Sysl function overloaded only by integer width now reaches the overload
+  Sysl picks for an uninferred integer argument, rather than the one matching the Avin type
+  exactly; no binding does this today.
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-int-params`): **An integer an `Option`, a `Result`, a tuple or a
+  collection parameter holds is not converted**, and the binding is rejected with a sentence saying
+  so. Why: the conversion functions for these shapes are shared between bindings and spelled with
+  the Avin type's Sysl spelling; making each generic in its integers would make every nested
+  parameter an inference problem, for no binding that needs it yet. Alternative: converting them as
+  results are converted (the shape is there, the need is not).
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-int-params`): **A colour in `ui` is an `int` holding
+  `0xRRGGBB`**, as syslui draws it, with `rgb(r, g, b)`, `mix`, `lighten` and `darken`
+  ([User interfaces](/spec/ui/#colours)). Why: syslui has no alpha, so a `0xRRGGBBAA` would carry a
+  channel nobody reads; every colour fits an `int`, which is what a hex literal is by default; and a
+  binding's parameter cannot take an Avin data type, so a `Color` type would need a wrapper around
+  every modifier. Alternatives weighed: a `long` (what `app`'s `ground` answers, but wider than any
+  colour); a `Color` data type with `rgb`/`rgba` (a wrapper per modifier, and an alpha syslui
+  ignores). Review with the user: `app`'s `ground` still answers a `long`; it could become an `int`
+  to match.
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-int-params`): **A value narrower than 32 bits crosses the
+  boundary widened as the C convention says**: Avin marks a shim's `i8` and `i16` parameters and a
+  callback's narrow signed answer `signext`, and a byte or bool `zeroext`, which Sysl relies on. This
+  fixes a bug: a negative `i8` or `i16` computed at run time reached Sysl as a large positive value
+  (`-5` as `65531`). Alternatives weighed: passing every narrow integer as an `i32` and narrowing in
+  the shim (changes the type a generic Sysl parameter infers).
+
 **Deferred**
 
 - Public C interoperability. Until then, C is reached through Sysl.

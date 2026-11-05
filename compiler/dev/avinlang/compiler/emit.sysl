@@ -87,7 +87,7 @@ emit_llvm(program: MirProgram) -> string
                     Call(_, Runtime(symbol, signature), _) ->
                         if !contains(declared, symbol)
                             declared.push(symbol)
-                            out.push("declare " + c_result(signature) + " @" + symbol + "(" + c_params(signature) + ")\n")
+                            out.push("declare " + c_result(signature) + " @" + symbol + "(" + c_params(signature, shim_extensions(program, symbol)) + ")\n")
                     _ -> ()
     out.push("\n")
     var intrinsics: Buf[string] = buf()
@@ -103,7 +103,8 @@ emit_llvm(program: MirProgram) -> string
         out.push(declaration + "\n")
     for b in program.bindings
         for k in 0..<b.params.len()
-            if b.params[k].form is Callback(_, _, machine, answer, _) then emit_invoker(&out, callback_invoker(b.shim, k), machine, answer)
+            if b.params[k].form is Callback(_, result, machine, answer, _)
+                emit_invoker(&out, callback_invoker(b.shim, k), machine, answer, if result.form is Plain then extension(result.ty) else "")
     out.push("\n")
     out.push("declare ptr @avin_rt_start(i32, ptr)\n")
     out.push("declare void @avin_rt_string_descriptor(ptr)\n")
@@ -250,11 +251,34 @@ private c_result(s: MirSignature) -> string = s.result match
     Some(t) -> c_type(t)
     None -> "void"
 
-// The context comes first, then the declared parameters.
-private c_params(s: MirSignature) -> string
+// The context comes first, then the declared parameters, each with its extension from `extensions`
+// where there is one.
+private c_params(s: MirSignature, extensions: Buf[string]) -> string
     var out = "ptr"
-    for t in s.params
-        out = out + ", " + c_type(t)
+    for i in 0..<s.params.len()
+        out = out + ", " + c_type(s.params[i]) + (if i < extensions.len() then extensions[i] else "")
+    out
+
+// How a value of a boundary type narrower than 32 bits is widened in a register with the C
+// convention, which Sysl relies on at both ends of a call: a signed integer sign-extended, a byte
+// and a bool zero-extended.
+private extension(t: &Type) -> string = *t match
+    Int(bits) -> if bits < 32 then " signext" else ""
+    Byte -> " zeroext"
+    Bool -> " zeroext"
+    _ -> ""
+
+// The extension of each parameter, after the context, of the binding whose shim is `symbol`, in the
+// order the shim takes them; nothing for any other runtime function, none of whose parameters is
+// narrow.
+private shim_extensions(program: MirProgram, symbol: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    for b in program.bindings
+        if b.shim != symbol then continue
+        for p in b.params
+            if *p.ty is Unit then continue
+            out.push(if p.form is Plain then extension(p.ty) else "")
+        return out
     out
 
 private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgram, graph: CallGraph, plan: RootPlan, index: usize)
@@ -814,15 +838,15 @@ callback_invoker(shim: string, k: usize) -> string = s"${shim}_cb$k"
 // The entry through which a binding's shim calls a function value Sysl was given, with the C
 // convention the shim calls with: the context, the closure, then its arguments, a bool as a byte. It
 // runs the closure's code, the word before its descriptor, with the program's own convention for
-// the closure's signature, and gives back what it answers.
-private emit_invoker(out: *StrBuilder, name: string, machine: Buf[MirType], answer: Option[MirType])
+// the closure's signature, and gives back what it answers, a narrow one widened as `ext` says.
+private emit_invoker(out: *StrBuilder, name: string, machine: Buf[MirType], answer: Option[MirType], ext: string)
     var params: Buf[MirType] = buf()
     params.push(MRef)
     for t in machine
         params.push(t)
     val cc = convention(MirSignature(params, answer))
     val result = answer match
-        Some(t) -> c_type(t)
+        Some(t) -> ext.trim() + " " + c_type(t)
         None -> "void"
     out.push(s"\ndefine $result @$name(ptr %ctx, ptr %f")
     for i in 0..<machine.len()
@@ -1193,13 +1217,16 @@ private emit_inst(out: *StrBuilder,intrinsics: *Buf[string], program: MirProgram
         Call(dest, Runtime(symbol, signature), args) ->
             var parts: Buf[string] = buf()
             parts.push("ptr %ctx")
-            for a in args
+            val extensions = shim_extensions(program, symbol)
+            for i in 0..<args.len()
+                val a = args[i]
+                val ext = if i < extensions.len() then extensions[i] else ""
                 operand_type(program, f, a) match
                     MBool ->
                         out.push(s"  %t$next = zext i1 " + operand(program, f, a) + " to i8\n")
-                        parts.push(s"i8 %t$next")
+                        parts.push(s"i8$ext %t$next")
                         next += 1
-                    MInt(bits) -> parts.push(s"i$bits " + operand(program, f, a))
+                    MInt(bits) -> parts.push(s"i$bits$ext " + operand(program, f, a))
                     MReal -> parts.push("double " + operand(program, f, a))
                     MPtr -> parts.push("ptr " + operand(program, f, a))
                     MRef -> parts.push("ptr " + operand(program, f, a))
