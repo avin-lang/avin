@@ -2819,6 +2819,106 @@ their words are reserved.
   never wrote). **Review with the user**: the hidden class is spelled `actor Counter`, with a
   space, so it reads well where a diagnostic names it.
 
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-lifecycle`): **An actor's lifecycle is the class `ActorContext[M]`
+  its state extends** ([lifecycle](/spec/actors/#lifecycle)). `stop`, `watch`, `unwatch`, `after`,
+  `every`, `children`, `parent` and `onStopping` are methods of `avin.actors.ActorContext[M]`, made
+  from the actor's reference; the hidden class of an `actor` declaration extends it, so the body,
+  arms and methods call them as their own, and a behaviour written as a library value makes one in
+  its start, `ActorContext(me)`. Each finds its actor through the runtime's table of running actors
+  by the owner of the code running, and traps where that is not the actor (made by `main`, or
+  called from a future). A field or method of an actor with the name and parameters of one of these
+  is refused (`` `stop` is one of every actor's own methods ``), and the body may call them before
+  its own fields are initialized, since they reach only the context's. The same table gives `spawn`
+  the actor whose code is running, its new child's parent. *Why*: the chapter writes `stop()` and
+  `after(…)` bare inside an actor, typed by the actor's message type, and inheritance gives exactly
+  that with no new lookup rule, while the library form keeps working with no declaration.
+  *Alternatives weighed*: changing a behaviour's start to take the context instead of the reference
+  (every library-form behaviour changes, and `me` is no longer a reference); free functions finding
+  the running actor (`after` could not be typed by the actor's messages); names the checker
+  resolves specially inside actors (a lookup rule of its own, and nothing for the library form).
+  **Review with the user**: the public name `ActorContext` and `onStopping`, and that an actor's
+  own names now include `children` and `parent` (a test's field `children` was renamed).
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-lifecycle`): **Stopping, the cases the chapter leaves open.**
+  `stop(self)` is `stop()`; stopping an actor that has ended does nothing, whoever started it (there
+  is no actor left to protect, and the end may have raced the call); an actor asked to stop before
+  its first turn still runs its body first, so its `stopping` block always has state to run on; an
+  actor started while its parent is ending is stopped at once and its parent does not wait for it; a
+  `stopping` block is given to the context after the body's statements, and several `onStopping`
+  functions run in the order given; `children()` omits a child once it has ended, before its end is
+  told to watchers. *Why*: each is the reading that never traps on a race and never leaves a parent
+  waiting for ever. *Alternatives weighed*: `stop(self)` trapping as "not a child"; stopping an
+  ended non-child trapping (needs a record of every child that ever ended); a child started from
+  `stopping` made a top-level actor instead.
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-lifecycle`): **Watching, the cases the chapter leaves open.**
+  Watching an actor again replaces the earlier watch, so its end is told once; an actor watching
+  itself is told nothing; `watch(ref, f)` takes a `@sendable` `f`, run on the pool where the end is
+  known, its result queued; `unwatch` and the replacing watch drop a message already queued and not
+  yet handled. *Why*: one message per watched end is what a program counting ends needs, and the
+  dropped message is what makes `unwatch` mean something under a race. *Alternatives weighed*: a
+  message per `watch` call; running `f` in the watcher's turn (the mailbox would hold functions
+  rather than messages); watching itself trapping.
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-lifecycle`): **Timers.** One thread, started with the first
+  timer, keeps every actor's timers and sleeps until the earliest is due; timers fire in the order
+  they fall due, those due together in the order they were set; a delay of zero or less is due at
+  once; a repeating timer is set again an interval after it fires (it does not catch up after a
+  stall), and an interval of zero or less traps; `cancel()` works from any thread, since a `Timer`
+  is sendable, and drops a message of it queued and not yet handled. `Timer` has only `cancel()`.
+  *Why*: a thread per timer would hold a worker per pending timer, and dropping queued messages
+  makes a cancelled timer's count exact without timing. *Alternatives weighed*: a fixed rate that
+  catches up; `every(zero)` sending as fast as it is handled; an `isActive()` query (left out until a
+  program needs it).
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-lifecycle`): **An actor's state is never captured by a `@sendable`
+  function**, whatever its fields: `Future(stop())` in an arm, or a body reading a `val` field, is
+  refused with `` it uses the state of the actor `Escaper`, which only the actor's own code reaches;
+  copy what it needs into a `val` first ``. Before, only a state with a `var` was refused. *Why*: the
+  context's methods act for the actor that is running, so a state carried to another thread is never
+  right to use there, and the static refusal says so where the runtime would trap. *Alternatives
+  weighed*: keeping the structural rule and relying on the trap. **Review with the user**: it
+  tightens a settled rule.
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-lifecycle`): **The expected type bounds a contravariant type
+  argument of a call's result only from below** ([generics](/spec/generics/#inference)). A call
+  whose result is `Sink[T]` for a contravariant `T` takes `T` from its arguments, and from the
+  expected type only where they leave it open, so `watch(spawn(Worker()), …)` and `val r:
+  ActorRef[Nothing] = spawn(Quiet())` check. Before, the expected `ActorRef[Nothing]` made `M`
+  `Nothing` and the argument was refused. *Why*: `Sink[A]` is a `Sink[B]` for every `B` below `A`,
+  so the expected argument says nothing about `T` beyond a lower bound. *Alternatives weighed*:
+  recording a lower bound on the variable (the checker's unknowns hold one type, not bounds).
+
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-ask`): **`Ended` means "not delivered", decided at the send.** An ask completes with `Err(Ended)` exactly
+  where the asked actor was ending or had ended when the question was sent, so the message was
+  dropped. A question that was queued and then dropped because the actor ended before handling it
+  times out. Why: the chapter defines `Ended` as "the message could not be delivered", and an actor
+  may legitimately forward the reply reference and end, the reply still to come from another actor;
+  watching the asked actor's end for every ask would also hold a callback per ask on long-lived
+  actors. Alternative: complete with `Ended` as soon as the asked actor ends before a reply (quicker
+  failure for a question dropped from a mailbox, wrong for forwarded replies).
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-ask`): **An ask's reply reference** is an ordinary `ActorRef[R]` shown as `Reply#n`, numbered from one
+  apart from the actors (so asks never disturb the actors' numbering), unequal to every other
+  reference; its `ended()` completes (`Stopped`) once the ask has its answer or has timed out, and
+  an ask *of* a used reply reference answers `Ended`. Why: it is a one-shot address, so it ends
+  when it can accept nothing more. Alternatives: no identity of its own (sharing the asker's, which
+  `main` and threads do not have), or numbering it among the actors.
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-ask`): **The timeout is set once the question is delivered**; a timeout of zero or less times out at
+  once unless the reply was already there. Alternative: trap on a timeout not more than zero as
+  `every` does on its interval (a zero timeout is a legitimate "only if it is already answered").
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-ask`): **`adapter(f)`'s `f` runs where the message is sent**, so it is `@sendable`, and the adapter
+  refers to the adapting actor: equal to its `self`, the same hash and display, the same `ended()`;
+  a message sent to it once the actor has ended is dropped, and an ask of it answers `Ended`. Why:
+  the mailbox holds the actor's own message type, so translating at the send keeps it so, and the
+  chapter says a reference compares by the actor it refers to. Alternative: translate in the
+  actor's own turn, which would let `f` read the actor's state but needs a mailbox of translations.
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-ask`): **`pipeToSelf` of a future complete already sends at once**, so its message precedes any the actor
+  sends itself after the call, and two such pipes arrive in the order they were made; an
+  incomplete one sends from wherever the future completes, so `f` is `@sendable`. `T` carries no
+  `Sendable` bound, the value never leaving the future's own handing-over. Alternative: always go
+  through `onComplete`, leaving the order of an already-complete pipe and a later `tell` open.
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-ask`): **A lambda's parameter of a known shape with an open type argument** (`Promise[T]`,
+  `ActorRef[R]`) takes that shape, and the body decides the argument, as `p -> ReadLine(p)` decides
+  `T` from `ReadLine`'s parameter; a body that leaves it open is reported at the parameter, once.
+  A wholly unknown parameter type is still an error. Why: inference fails otherwise exactly where
+  the explicit form succeeds, and `ask(r -> Get(r), …)` is the chapter's idiom. Alternative:
+  require the type argument at every request-style call.
+
 **C bindings**
 
 - Settled by the user 2026-11-05: **public C interoperability is no longer deferred.** The user's

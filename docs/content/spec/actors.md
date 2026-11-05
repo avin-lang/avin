@@ -119,7 +119,10 @@ main() -> int
   reference `ask` makes, or its own `self` where its message type is `R`, or an **adapter**:
   `adapter[R: Sendable](f: R -> M) -> ActorRef[R]`, called in an actor, makes a reference whose
   messages arrive in this actor's mailbox as `f` of them, so an actor talks to one with another
-  protocol without widening its own message type.
+  protocol without widening its own message type. `f` runs where the message is sent, so it is
+  `@sendable`; the adapter refers to this actor, equal to its `self` and ending with it. The
+  reference an ask makes is shown as `Reply#1`, the replies numbered apart from the actors, and
+  ends once its ask is answered or has timed out.
 - **`ActorRef[-M]`** is contravariant: a reference that accepts every `Shape` is also one that
   accepts `Circle`s. It compares by the actor it refers to (`==` and `hash`), is `Sendable` and is shown
   as the declaration's name and a number, `Counter#3`, the actors of a program being numbered from
@@ -129,7 +132,8 @@ main() -> int
 Any thread may `tell` and `ask`. Inside an actor, waiting for an ask's future with `await` holds the
 actor: it handles no other message until the reply comes, which is sometimes what is wanted. The
 usual way is **`pipeToSelf[T](future: Future[T], f: T -> M)`**, which sends the actor `f` of the
-value once the future completes, so the actor goes on handling messages meanwhile. An actor that
+value once the future completes, so the actor goes on handling messages meanwhile; a future complete
+already sends at once, before anything the actor sends itself after the call. An actor that
 awaits an ask of itself waits until the timeout.
 
 ### Mailboxes and order
@@ -278,12 +282,37 @@ An actor also has **`children() -> Vector[ActorRef[Nothing]]`**, its own referen
 parent's in **`parent() -> Option[ActorRef[Nothing]]`**, an `ActorRef[Nothing]` being one that may be
 watched and compared but not sent to.
 
+These are the actor's own methods, those of **`ActorContext[M]`** in `avin.actors`, which the object
+holding an actor's state extends; a field or method of the actor's own with the same name and
+parameters is an error. A behaviour written as a library value makes one in its start from the
+reference it is given, `ActorContext(me)`, and `ctx.onStopping(f)` gives it what a `stopping` block
+is. Made, or called, by any code other than the actor's own, an `ActorContext` traps. The details:
+
+- `children()` lists the children that have not ended, in the order they started; `parent()` is
+  `None` for a top-level actor, and for one a future's body started, which is not an actor's code.
+- `stop(self)` is `stop()`. Stopping an actor that has ended does nothing, whoever started it.
+- An actor started while its parent is ending, from its `stopping` block, is stopped at once, and the
+  parent does not wait for it.
+- Watching an actor again replaces the earlier watch, so its end is told once. An actor that watches
+  itself is told nothing, since its mailbox ends with it. The `f` of `watch(ref, f)` is
+  `@sendable`, since it runs where the end is known. `unwatch`, and cancelling a timer, also drop
+  the message already queued and not yet handled.
+- A `stopping` block runs once the body has run: the body gives it to the context last. An actor has
+  one.
+- The state of an actor is never captured by a `@sendable` function, whatever its fields, since its
+  methods act for the actor that is running; a body that needs a field copies it into a `val`.
+
 ### Timers
 
 `after(delay: Duration, message: M) -> Timer` sends the actor `message` once `delay` has passed, and
 `every(interval: Duration, message: M) -> Timer` each time `interval` passes. `cancel()` on the
 `Timer` stops it; an actor's timers are all cancelled when it ends or restarts. A timer's message is
 queued like any other, so it never interrupts an arm.
+
+Timers fire in the order they fall due, those due at the same time in the order they were set; a
+delay of zero or less is due at once. A repeating timer is set again an interval after it fires, and
+an interval of zero or less traps. A `Timer` is sendable, and `cancel()` works from any thread. One
+thread the runtime starts with the first timer keeps every actor's timers.
 
 ## Scheduling
 

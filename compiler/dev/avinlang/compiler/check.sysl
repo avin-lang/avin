@@ -4074,7 +4074,9 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
                 slots.push(m)
             for i in k.inherited..<k.fields.len()
                 if inherited_method(c, s, k.fields[i].name) is Some(m)
-                    c.note(unit, k.fields[i].span, s"`${k.fields[i].name}` is already a method of `${c.classes[c.symbols[m].owner_class.unwrap()].name}`")
+                    val owner = c.classes[c.symbols[m].owner_class.unwrap()].name
+                    if actor_own_method(k.name, owner) then c.note(unit, k.fields[i].span, s"`${k.fields[i].name}` is one of every actor's own methods, `${c.symbols[m].name}`; name the field something else")
+                    else c.note(unit, k.fields[i].span, s"`${k.fields[i].name}` is already a method of `$owner`")
     var conformed: Buf[&Type] = buf()
     collect_traits(c, own_class_type(k, id), &conformed)
     // A trait's overrides take their defaults when it is linked, before a class's methods take them.
@@ -4140,7 +4142,8 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
             for tm in implemented
                 if overrides_matches(c, id, m, tm) then inherit_defaults(c, m, tm)
         elif inherited is Some(t)
-            c.note(unit, symbol.decl.name_span, s"`$name` overrides `${c.symbols[t].name}`; mark it `override`")
+            if actor_own_method(k.name, c.classes[c.symbols[t].owner_class.unwrap()].name) then c.note(unit, symbol.decl.name_span, s"`$name` is one of every actor's own methods, `${c.symbols[t].name}`; name this one something else")
+            else c.note(unit, symbol.decl.name_span, s"`$name` overrides `${c.symbols[t].name}`; mark it `override`")
         elif implemented.len() > 0
             c.note(unit, symbol.decl.name_span, s"`$name` implements `${c.symbols[implemented[0]].name}`; mark it `override`")
         elif is_open(c, id) && symbol.public then slots.push(m)
@@ -6157,6 +6160,12 @@ private send_use_problem(c: *Checker, root: usize, u: SendUse, mark: int, k: usi
         t = l.ty
         if mark == SendableMark && u.captured && l.mutable then return Some(s"it captures `$name`, a `var`, which the closure would share with the code that made it; copy it into a `val`, or share it through an `Atomic` or a `Mutex`")
     val ty = zonk(c, t)
+    // An actor's state, whatever its fields, is reached only by the actor's own turns: its context's
+    // methods (`stop`, `after`, `watch`, ...) act for the actor that is running.
+    if name == "self" && *ty is Class(id, _, _)
+        val held = c.classes[id].decl.name
+        if held.starts_with(ActorClassPrefix) && !(sendability(conformances(c), ty, k) is CannotSend(_))
+            return Some(s"it uses the state of the actor `${held[ActorClassPrefix.bytes.len..]}`, which only the actor's own code reaches; copy what it needs into a `val` first")
     sendability(conformances(c), ty, k) match
         CannotSend(why) ->
             if holds_function(ty) && u.param then return Some(s"it uses `$name`, ${quoted_type(ty)}, ${nested_reason(why)}; mark the parameter `${mark_name(mark)}`, and what is passed for it is checked in turn")
@@ -8258,6 +8267,15 @@ enclosing_class(c: *Checker) -> Option[usize] = c.symbols[c.body.root].owner_cla
 /** Whether the code being checked is an actor's: the class an actor declaration keeps its state in. */
 private in_actor(c: *Checker) -> bool = enclosing_class(c) match
     Some(k) -> c.classes[k].decl.name.starts_with(ActorClassPrefix)
+    None -> false
+
+/** Whether a member of the class `owner` that the class `class_name` inherits is one of an actor's
+ * own methods, which the class keeping an actor's state inherits from `avin.actors.ActorContext`. */
+private actor_own_method(class_name: string, owner: string) -> bool = class_name.starts_with(ActorClassPrefix) && owner == "ActorContext"
+
+/** Whether `f` is a method of `avin.actors.ActorContext`, the class an actor's state extends. */
+private actor_context_method(c: *Checker, f: usize) -> bool = c.symbols[f].owner_class match
+    Some(k) -> c.classes[k].name == "ActorContext" && c.symbols[f].module_name == ActorsModule
     None -> false
 
 /** The class whose fields a bare name reaches: the enclosing class, or the class of the receiver of
@@ -13538,10 +13556,17 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     for j in 0..<binding.targets.len()
         targets.push(argument_type(c, s, wanted, binding, args, j))
     val sendable_args = sendable_lambda_args(c, owner, type_params, known.len(), type_args, args, targets)
+    // The expected type's arguments at a contravariant parameter bound the call's from below only, so
+    // they are unified after the arguments, and only where those leave the call's unknown.
+    var later_declared: Buf[&Type] = buf()
+    var later_wanted: Buf[&Type] = buf()
     if expected is Some(want)
         val saved = save_vars(c)
-        unify(c, declared, want)
-        if !admits_lowers(c, owner, type_params, known.len(), type_args) then restore_vars(c, saved)
+        unify_expected(c, declared, want, &later_declared, &later_wanted)
+        if !admits_lowers(c, owner, type_params, known.len(), type_args)
+            restore_vars(c, saved)
+            later_declared.clear()
+            later_wanted.clear()
         // A lambda passed for a type argument bounded by `Sendable` makes a `@sendable` function, so
         // the expected type's plain function type decides that argument as the `@sendable` one.
         var made: Buf[&Type] = buf()
@@ -13553,10 +13578,15 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
             if *t is Function(_, _, true) then changed = true
         if changed
             restore_vars(c, saved)
+            later_declared.clear()
+            later_wanted.clear()
             for i in 0..<made.len()
                 if *made[i] is Function(_, _, true) then unify(c, Var(sendable_args[i]), made[i])
             val decided = save_vars(c)
-            if !unify(c, declared, want) || !admits_lowers(c, owner, type_params, known.len(), type_args) then restore_vars(c, decided)
+            if !unify_expected(c, declared, want, &later_declared, &later_wanted) || !admits_lowers(c, owner, type_params, known.len(), type_args)
+                restore_vars(c, decided)
+                later_declared.clear()
+                later_wanted.clear()
     var open = open_type_args(c, type_args, known.len())
     constrain_lowers(c, owner, type_params, known.len(), type_args, &open)
     // Binding has placed, or reported, each spliced sequence, which is checked as the sequence it is.
@@ -13565,7 +13595,7 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
         passed_args.push(Argument(a.span, a.name, argument_value(a), a.block))
     val outer_sendable = c.sendable_args
     c.sendable_args = sendable_args
-    var typed = check_arguments(c, passed_args, targets, checked, &open)
+    var typed = check_arguments_after(c, passed_args, targets, checked, &open, &later_declared, &later_wanted)
     c.sendable_args = outer_sendable
     val sent_matches = sendable_match_args(c, type_params, known.len(), type_args, sendable_args, targets, typed)
     // A type argument the arguments settled settles those its bounds name: `[S: Source[A], A]`
@@ -13910,6 +13940,13 @@ private open_type_args(c: *Checker, type_args: Buf[&Type], from: usize) -> Buf[u
 // `wanted` has an entry per argument, `None` for one that fits no parameter.
 // An argument with an entry in `checked` was checked already, and only its type is matched here.
 private check_arguments(c: *Checker, args: Buf[Argument], wanted: Buf[Option[&Type]], checked: Buf[Option[&TExpr]], open: *Buf[usize]) -> Buf[&TExpr]
+    var none_declared: Buf[&Type] = buf()
+    var none_wanted: Buf[&Type] = buf()
+    check_arguments_after(c, args, wanted, checked, open, &none_declared, &none_wanted)
+
+// `check_arguments`, unifying each of `later_declared` with its `later_wanted` where the arguments
+// other than lambdas leave it unknown, before the lambdas, which may need it for their parameters.
+private check_arguments_after(c: *Checker, args: Buf[Argument], wanted: Buf[Option[&Type]], checked: Buf[Option[&TExpr]], open: *Buf[usize], later_declared: *Buf[&Type], later_wanted: *Buf[&Type]) -> Buf[&TExpr]
     var early: Buf[Option[&TExpr]] = buf()
     for _ in args
         early.push(None)
@@ -13935,6 +13972,8 @@ private check_arguments(c: *Checker, args: Buf[Argument], wanted: Buf[Option[&Ty
             val rank = if takes_parameter_type(value) then 2 elif is_literal(value) then 1 else 0
             if rank != pass then continue
             early[i] = Some(call_argument(c, args[i], param, open))
+    for i in 0..<later_declared.len()
+        if *zonk(c, (*later_declared)[i]) is Var(_) then unify(c, (*later_declared)[i], (*later_wanted)[i])
     // The lambdas go in turn, each the first in the call whose parameter types are known by then, from
     // its own declarations or from what the arguments checked before it decided; when none is, the
     // first left is checked, and reports what it cannot infer.
@@ -14130,6 +14169,7 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     var types: Buf[&Type] = buf()
     var names: Buf[string] = buf()
     var local_types: Buf[&Type] = buf()
+    var open_params: Buf[usize] = buf()
     for i in 0..<params.len()
         val p = params[i]
         names.push(p.name)
@@ -14152,6 +14192,12 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
             None ->
                 val known: &Type = if i < wanted.len() then zonk(c, wanted[i]) else Var(0)
                 if i < wanted.len() && !has_unknowns(known) then ty = known
+                // A parameter whose type is known in shape but not in every argument, a `Promise[T]`
+                // of an open `T`, takes that shape, and the body's use of it decides the rest:
+                // `p -> ReadLine(p)` passes it where a `Promise[Option[string]]` is expected.
+                elif i < wanted.len() && !(*known is Var(_)) && !mismatched
+                    ty = known
+                    open_params.push(i)
                 elif !mismatched then c.note(unit, p.span, s"cannot infer the type of `${p.name}`; write it, as in `(${p.name}: int) -> …`")
         types.push(ty)
         local_types.push(local.unwrap_or(ty))
@@ -14184,6 +14230,13 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
         param_locals.push(declare_local(c, params[i].span, names[i], local_types[i], false))
     c.symbols[id].param_locals = param_locals
     check_body(c, id, body, hint)
+    // One the body left open is reported here, and its unknowns are made errors, so the call does
+    // not report the same gap a second time.
+    for i in open_params
+        val left = zonk(c, types[i])
+        if has_unknowns(left)
+            c.note(unit, params[i].span, s"cannot infer the type of `${params[i].name}`; write it, as in `(${params[i].name}: int) -> …`")
+            give_up_unknowns(c, left)
     c.body.visible.truncate(mark)
     c.body.block_start = outer_start
     c.body.loops = loops
@@ -14198,6 +14251,19 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     // which holds what it captures and what it reaches to the rules for one (`check_sendable_arguments`).
     val ty: &Type = if mismatched then ErrorType else Function(types, yields, sendable_wanted(c, expected))
     TExpr(e.span, ty, FunctionValue(id, buf()))
+
+/** Solves every unknown left in `t` as an error, which says nothing more about it. */
+private give_up_unknowns(c: *Checker, t: &Type)
+    *t match
+        Var(_) -> unify(c, t, ErrorType)
+        Tuple(items) -> for item in items do give_up_unknowns(c, item)
+        Function(params, result, _) ->
+            for p in params do give_up_unknowns(c, p)
+            give_up_unknowns(c, result)
+        ByName(inner) -> give_up_unknowns(c, inner)
+        Data(_, _, args) -> for a in args do give_up_unknowns(c, a)
+        Class(_, _, args) -> for a in args do give_up_unknowns(c, a)
+        _ -> ()
 
 /** The elements of `t` where it is a tuple, and none otherwise. */
 private tuple_elements(t: &Type) -> Buf[&Type] = *t match
@@ -15438,6 +15504,39 @@ private unify(c: *Checker, a: &Type, b: &Type) -> bool
             _ -> false
         _ -> same_type(x, y)
 
+/** Unifies a call's declared result with the type expected of it, except at a contravariant argument
+ * of a class or data type, where the expected argument bounds the call's only from below (a
+ * `Sink[T]` is a `Sink[Nothing]` whatever `T` is): each such pair goes to `later_declared` and
+ * `later_wanted` instead, for the arguments to decide first. A covariant argument is followed in
+ * the same way, an invariant one unified whole. */
+private unify_expected(c: *Checker, declared: &Type, want: &Type, later_declared: *Buf[&Type], later_wanted: *Buf[&Type]) -> bool
+    val x = zonk(c, declared)
+    val y = zonk(c, want)
+    *x match
+        Class(i, _, xs) -> *y match
+            Class(j, _, ys) ->
+                if i != j || xs.len() != ys.len() then return unify(c, x, y)
+                unify_expected_args(c, c.classes[i].decl.type_params, xs, ys, later_declared, later_wanted)
+            _ -> unify(c, x, y)
+        Data(i, _, xs) -> *y match
+            Data(j, _, ys) ->
+                if i != j || xs.len() != ys.len() then return unify(c, x, y)
+                unify_expected_args(c, c.data[i].decl.type_params, xs, ys, later_declared, later_wanted)
+            _ -> unify(c, x, y)
+        _ -> unify(c, x, y)
+
+private unify_expected_args(c: *Checker, params: Buf[TypeParam], xs: Buf[&Type], ys: Buf[&Type], later_declared: *Buf[&Type], later_wanted: *Buf[&Type]) -> bool
+    var ok = true
+    for k in 0..<xs.len()
+        val variance = if k < params.len() then params[k].variance else Invariant
+        if variance is Contravariant
+            later_declared.push(xs[k])
+            later_wanted.push(ys[k])
+        elif variance is Covariant
+            if !unify_expected(c, xs[k], ys[k], later_declared, later_wanted) then ok = false
+        elif !unify(c, xs[k], ys[k]) then ok = false
+    ok
+
 /** Settles each unknown left open since `mark` that no use has settled: as `Nothing` where the call's
  * result names it only where a value is read out, and otherwise by reporting it at the call that
  * made it and settling it as the error type, so nothing reports it again. */
@@ -15533,6 +15632,10 @@ struct InitScan
     /** Whether the body scanned computes a trait's field, so its receiver is the object even where
      * its type is the trait's `Self`. */
     trait_init: bool
+    /** Whether the body scanned is an actor's, whose context's methods it may call before its own
+     * fields are initialized: they reach only the context's fields, which its superclass constructor
+     * has set, and an actor cannot override them, its methods being private. */
+    actor: bool
 
 /** Checks every class body's uses of `self`. */
 private check_initialization(c: *Checker)
@@ -15557,7 +15660,7 @@ private check_mixed_initialization(c: *Checker, k: usize, kind: string, unsafe: 
         var ready: Buf[string] = buf()
         for i in 0..<first + j
             if cls.fields[i].public then ready.push(cls.fields[i].name)
-        if !scan_init(c, InitScan(c.symbols[init].unit, None, cls.fields[first + j].name, kind, true, ready, true), body, unsafe) then reported.push(init)
+        if !scan_init(c, InitScan(c.symbols[init].unit, None, cls.fields[first + j].name, kind, true, ready, true, false), body, unsafe) then reported.push(init)
 
 private check_class_initialization(c: *Checker, k: usize, unsafe: *Buf[bool], reported: *Buf[usize])
     val cls = c.classes[k]
@@ -15598,7 +15701,7 @@ private check_class_initialization(c: *Checker, k: usize, unsafe: *Buf[bool], re
         val early = i < last
         if !early && kind == "" then return
         if deferred[i] then continue
-        val scan = InitScan(cls.unit, Some(self_local), if early then last_name else "", kind, true, buf(), false)
+        val scan = InitScan(cls.unit, Some(self_local), if early then last_name else "", kind, true, buf(), false, cls.decl.name.starts_with(ActorClassPrefix))
         val item = items[start + i]
         // A field's initializer is checked as it is stored.
         val e = item.kind match
@@ -15620,7 +15723,7 @@ private unsafe_methods(c: *Checker) -> Buf[bool]
         for m in 0..<c.symbols.len()
             if !unsafe[m] && is_class_method(c, m)
                 val safe = c.bodies[m] match
-                    Some(b) -> scan_init(c, InitScan(c.symbols[m].unit, None, "", "", false, buf(), false), b, &unsafe)
+                    Some(b) -> scan_init(c, InitScan(c.symbols[m].unit, None, "", "", false, buf(), false, false), b, &unsafe)
                     None -> false
                 if !safe
                     unsafe[m] = true
@@ -15662,7 +15765,8 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
             val name = c.symbols[f].decl.name
             if args.len() > 0 && is_class_method(c, f) && is_init_self(s, args[0])
                 from = 1
-                if s.last != "" then ok = init_violation(c, s, e.span, s"`$name` is called", "")
+                if s.actor && actor_context_method(c, f) then ()
+                elif s.last != "" then ok = init_violation(c, s, e.span, s"`$name` is called", "")
                 elif (*unsafe)[f] then ok = init_violation(c, s, e.span, "", s"`$name` uses `self` for more than its fields, so it cannot be called")
             elif c.symbols[f].root is Some(_) && captures_init_self(c, s, f)
                 ok = init_violation(c, s, e.span, s"`$name`, which uses `self`, is called", s"`$name` uses `self`, so it cannot be called")
@@ -15765,7 +15869,7 @@ private scan_dispatch(c: *Checker, s: InitScan, e: &TExpr, f: usize, args: Buf[&
         if is_trait_field(c, f)
             if !contains_name(s.ready, name) then ok = init_violation(c, s, e.span, s"`$name` is read", s"`$name` is a trait's `val`, which a subclass may supply, so it cannot be read")
         elif setter_field(c, f) is Some(field) then ok = init_violation(c, s, e.span, s"`$field` is assigned", s"`$field` cannot be assigned")
-        else ok = init_violation(c, s, e.span, s"`$name` is called", s"`$name` may be overridden, so it cannot be called")
+        elif !(s.actor && actor_context_method(c, f)) then ok = init_violation(c, s, e.span, s"`$name` is called", s"`$name` may be overridden, so it cannot be called")
     for i in from..<args.len()
         if !scan_init(c, s, args[i], unsafe) then ok = false
     ok

@@ -1,0 +1,63 @@
+// expect: exit 0
+// A behaviour written as a library value reaches its lifecycle through an `ActorContext` made in its
+// start from the reference it is given: `stop`, timers, `watch`, `children` and `parent`, and
+// `onStopping`, whose functions run in the order they were given, after the children have ended.
+// An `actor` declaration's `stopping` block is one such function, run after any the body gave
+// first through `onStopping` itself.
+import avin.actors.{ActorContext, ActorRef, Behaviour, Ending, spawn}
+import avin.threads.{Channel, Promise}
+import avin.time as time
+
+data Msg
+    Tick
+    Quit
+    ChildEnded
+    Count(reply: Promise[int])
+
+child(log: Channel[string]) -> Behaviour[Msg] = Behaviour("Child", me ->
+    val ctx = ActorContext(me)
+    ctx.onStopping(() -> log.send(s"child stopping, parent is set: ${ctx.parent().isDefined()}"))
+    m -> m match
+        Quit -> ctx.stop()
+        _ -> ())
+
+parent(log: Channel[string]) -> Behaviour[Msg] = Behaviour("Parent", me ->
+    val ctx = ActorContext(me)
+    var ticks = 0
+    val kid = spawn(child(log))
+    ctx.watch(kid, ChildEnded)
+    ctx.onStopping(() -> log.send(s"first, after $ticks ticks"))
+    ctx.onStopping(() -> log.send(s"second, ${ctx.children().length()} children"))
+    val timer = ctx.every(time.milliseconds(1), Tick)
+    m -> m match
+        Tick ->
+            ticks += 1
+            if ticks == 3
+                timer.cancel()
+                kid.tell(Quit)
+        ChildEnded ->
+            log.send(s"told the child ended, ${ctx.children().length()} children left")
+            ctx.stop()
+        Count(reply) -> reply.complete(ticks)
+        Quit -> ctx.stop())
+
+actor Declared(log: Channel[string]) receives Msg
+    onStopping(() -> log.send("given in the body"))
+    receive
+        Quit -> stop()
+        _ -> ()
+    stopping
+        log.send("the stopping block")
+
+main()
+    val log = Channel[string]()
+    val p = spawn(parent(log))
+    p.ended().await()
+    log.close()
+    for line in log do println(line)
+    val log2 = Channel[string]()
+    val d = spawn(Declared(log2))
+    d.tell(Quit)
+    d.ended().await()
+    log2.close()
+    for line in log2 do println(line)
