@@ -1558,6 +1558,13 @@ Settled by the user on 2026-11-04:
   callback registered on one reaches, and the first code to use a handle in transit takes it. The
   finalizer never checks: it runs only on an unreachable handle, on the collecting thread while the
   others are stopped.
+  Settled by the user 2026-11-04, replacing "no mirror holds a handle": **a Sysl mirror's field may
+  be a handle**, by itself (not in an `Option`, a collection or a tuple), so that Sysl's
+  `sysl.process.Stdio` reaches Avin with its `ToFile(file: File)` and `FromFile(file: File)`. Into
+  Sysl the field is passed exactly as a handle parameter is, its reference shared for a type with a
+  destructor and otherwise a copy or a pointer as the Sysl field asks, with the same traps at the
+  call: "`Name` is closed" and "`Name` belongs to another thread". Out of Sysl, which needed nothing
+  more, each such field becomes a handle of its own, as a handle result does.
 - Settled by the user 2026-11-04: **Tuples cross the Sysl boundary** ([Sysl bindings](/spec/sysl-bindings/#boundary-types)).
   A tuple of boundary types is a Sysl tuple of the same arity, in each direction, each part converted
   as it would be alone: an integer part out of Sysl takes any Sysl integer with the range check, and
@@ -1687,6 +1694,12 @@ their words are reserved.
 
 ## Proposed
 
+- **Where a mirror holding a handle goes into Sysl** ([Sysl bindings](/spec/sysl-bindings/#mirrors)).
+  Proposed: wherever any mirror does — a parameter by itself, or inside an `Option`, a `Result`, a
+  collection, a tuple or another mirror — since the shim's conversion of the mirror checks and
+  passes each handle field wherever it is called, though a bare handle in an `Option` or a collection
+  still does not go into Sysl. The alternative is a mirror holding a handle only by itself, as a
+  handle is.
 - **Handing a handle over explicitly** ([Sysl bindings](/spec/sysl-bindings/#handles)). The
   spec has no spelling for it. Proposed: `handOff(value: Any)` in `avin.threads`, putting every
   handle `value` reaches that the running code owns in transit, for the next code to use it; and
