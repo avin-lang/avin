@@ -129,6 +129,7 @@ converted.
 | `signed char`, `short`, `int`, `long`, `long long`, `intN_t`, `ssize_t`, `ptrdiff_t`, `intptr_t` and their `unsigned` forms, `size_t`, `uintN_t`, an integer typedef, an enum | any integer type | Converted with a check, in each direction, as a [Sysl integer](/spec/sysl-bindings/#integer-results) is: a value the other side cannot hold stops the program at the call, naming the C type by its sign and width |
 | `unsigned char`, `uint8_t`, `char` | `byte` | By value. A C `char` as a value is a byte, whatever its sign on the machine |
 | `bool`, `_Bool` | `bool` | By value |
+| an integer type or typedef used as a truth value (Cairo's `cairo_bool_t` is an `int`) | `bool` | A result is `false` for zero and `true` otherwise; a parameter passes `0` or `1` ([proposed](/spec/decisions/#proposed)) |
 | `double` | `real` | By value |
 | `float` | `real` | A parameter is rounded to the nearest `float`, as C converts one; a result is widened exactly |
 
@@ -180,7 +181,8 @@ avin: trap: `mlt_profile_init` answered null at main.avin:4:15
 ```
 
 A pointer parameter bound as an `Option` passes null for `None`. Strings, handles and arrays may each
-be wrapped this way, and nothing else is.
+be wrapped this way, and so may a [mirror passed by `const` pointer](#structs-by-pointer); nothing
+else is.
 
 ## Status results
 
@@ -190,6 +192,27 @@ bound as `Result[T, int]` holds the out values in its `Ok`, and they are read on
 zero. Other conventions — a negative error number, `-1` beside `errno` — are written in Avin over the
 integer, and a public function maps the code to the library's own error type. Whether `errno` is read
 by the binding is [proposed](/spec/decisions/#proposed).
+
+A status that is a C enum may be bound as `Result[unit, E]` with `E` its [mirror](#enums-and-constants):
+`Ok(())` for the enumerator whose value is zero, `Err` of the variant otherwise. The mirror keeps its
+zero variant, since the same type is what a [callback](#callbacks) answers C with
+([proposed](/spec/decisions/#proposed)):
+
+```avin
+@c("cairo_status_t cairo_surface_write_to_png(cairo_surface_t *self, const char *filename)")
+private writePngRaw(filename: string) -> Result[unit, Status]
+```
+
+### Errors kept on the object
+
+Some libraries do not answer a failure at all: they **latch** it on the object, which turns inert, and
+answer it when asked. Every Cairo call on a context or surface in error does nothing, and a
+constructor that fails answers a static object in an error state rather than null. A binding needs
+nothing new for this: the query is bound like any other (`@c("cairo_status_t
+cairo_status(cairo_t *self)") status() -> Result[unit, Status]`), and the library's public functions
+ask it where the user can act on the answer — after a constructor, before output is produced, and on
+request — while the drawing calls answer `unit`. A latched error is never lost, since every later
+query answers it, so checking at those points sees every failure the calls before them made.
 
 ## Handles
 
@@ -235,6 +258,31 @@ A handle is the [Sysl handle](/spec/sysl-bindings/#handles) over a C pointer, an
   ownership on follows the [Sysl handle's rule](/spec/sysl-bindings/#handles).
 - **A handle is compared by identity**, and has no `Display` of its own.
 
+### When C holds the object longer than Avin does
+
+`keeps:` holds the kept object on the Avin handle, and that is enough while the handle's reference is
+the C object's last. It is not enough where C takes references of its own: a Cairo context and a
+surface pattern each reference their surface, so the Avin `Surface` may be collected, and its
+reference given back, while C still draws into the surface — and into the pixel memory or font file
+the surface was made over. A library that tells its objects' owner when C frees one (Cairo's
+`cairo_surface_set_user_data`, MLT's `mlt_properties_set_data` with a destructor) lets the binding
+tie a kept object to **the C object's** lifetime instead, with `attach:`:
+
+```avin
+@c(type: "cairo_surface_t *", release: "cairo_surface_destroy", retain: "cairo_surface_reference",
+   attach: "cairo_surface_set_user_data(self, key, data, destroy)", key: "cairo_user_data_key_t")
+class Surface
+```
+
+`attach:` is a C expression, compiled in the glue, over four names: `self`; `key`, the address of a
+static object of the type `key:` names, one per class, defined by the C unit; `data`, the address of
+the runtime's record of what the handle keeps; and `destroy`, the runtime's function that releases the
+record. On a class with `attach:`, the first `keeps:` of a C object puts its kept objects in that
+record, made a root of the collector, and attaches it; C's call of `destroy`, whenever and on whichever
+thread the last reference goes, unpins it, and runs no Avin code. An `attach:` expression that answers
+non-zero stops the program at the call, since what it would keep could not be kept. Without `attach:`,
+`keeps:` holds only as long as the handle ([proposed](/spec/decisions/#proposed)).
+
 ### Handles and C's inheritance
 
 C libraries model inheritance by a struct whose first member is its parent: an MLT producer is a
@@ -274,6 +322,32 @@ class Profile
 The field's C type is the header's, so its conversion is the [scalar](#scalars) one for that type; a
 field that is a pointer is read as a string or a borrowed handle by the same rules as a result.
 
+**A field may be an expression**: a C lvalue in `self` and the accessor's parameters, reaching through
+the struct to an array it points at, and a union's members. An integer parameter used as an index is
+given a `bound:`, a C expression in `self`; the accessor stops the program unless `0 <= i < bound`
+before C reads anything ([proposed](/spec/decisions/#proposed)). That is how a C-owned array of a
+union is read — Cairo's `cairo_path_t`, whose `data` is `num_data` elements of a union of a header
+(`type`, `length`) and a point (`x`, `y`), freed whole by `cairo_path_destroy`:
+
+```avin
+@c(type: "cairo_path_t *", release: "cairo_path_destroy")
+class CPath
+    @c(field: "num_data")
+    count() -> int
+    @c(field: "data[i].header.type", bound: "self->num_data")
+    kind(i: int) -> PathDataType
+    @c(field: "data[i].header.length", bound: "self->num_data")
+    span(i: int) -> int
+    @c(field: "data[i].point.x", bound: "self->num_data")
+    x(i: int) -> real
+    @c(field: "data[i].point.y", bound: "self->num_data")
+    y(i: int) -> real
+```
+
+The library walks the handle once, by each header's `length`, into immutable Avin data (a
+`Vector[PathElement]` of `MoveTo`, `LineTo`, `CurveTo` and `ClosePath`) and closes it; the union never
+reaches Avin code. An accessor with an index and no `bound:` is refused.
+
 ## Structs
 
 ### Structs by pointer
@@ -281,7 +355,12 @@ field that is a pointer is read as a string or a borrowed handle by the same rul
 A struct C allocates and Avin reaches through a pointer is a [handle](#handles), its fields read
 through [accessors](#field-accessors). A struct Avin makes and passes by pointer, for C to read or
 fill, is a [mirror](#structs-by-value) passed as `const T *` (read) or `out T *` (filled, part of the
-result); the pointer is to a copy that lives for the call.
+result); the pointer is to a copy that lives for the call. A `const T *` C may be given null for —
+Cairo's `cairo_recording_surface_create` takes null extents for an unbounded surface — takes an
+`Option` of the mirror ([proposed](/spec/decisions/#proposed)). Cairo's `cairo_matrix_t`,
+`cairo_text_extents_t`, `cairo_font_extents_t` and `cairo_rectangle_t` are mirrors: C fills them
+through `out` (`cairo_text_extents`), reads them through `const` (`cairo_set_matrix`) and updates them
+through `inout` (`cairo_matrix_translate`).
 
 ### Structs by value
 
@@ -335,9 +414,14 @@ data ImageFormat
     Yuv420p
 ```
 
+The words are matched in the prefix's case, so an upper-case prefix matches upper-case enumerators:
+`@c(enum: "cairo_format_t", prefix: "CAIRO_FORMAT_")` mirrors `CAIRO_FORMAT_ARGB32` as `Argb32` and
+`CAIRO_FORMAT_A8` as `A8` ([proposed](/spec/decisions/#proposed)).
+
 Each enumerator's value is measured by the C unit. A value C answers that no variant holds stops the
 program at the call. A mirror need not list every enumerator: one it leaves out is a value it cannot
-take.
+take. An enum whose values are **flags** combined with `|` (Cairo's `cairo_pdf_outline_flags_t`) is
+bound as an integer, its flags as constants, and the library gives it an Avin type of its own.
 
 A constant the header defines — an enumerator, a `#define`, a `static const` — is bound as a
 top-level `val` without an initializer, measured by the C unit and folded into the program as a
@@ -347,6 +431,10 @@ constant:
 @c(const: "LIBMLT_VERSION_INT")
 val mltVersion: int
 ```
+
+A constant is an integer, a `real` or a `string`: a string literal the header defines (Cairo's
+`CAIRO_TAG_DEST`, `"cairo.dest"`) is stored by the C unit as its bytes, read by the driver like any
+measurement, and checked as UTF-8 then ([proposed](/spec/decisions/#proposed)).
 
 ## Arrays and out parameters
 
@@ -362,6 +450,26 @@ val mltVersion: int
   @c("ssize_t read(int fd, uint8_t *into, length(into) size_t count)")
   private readInto(fd: int, into: Array[byte]) -> long
   ```
+
+- **An array of a mirror goes to a `const` pointer to its struct** ([proposed](/spec/decisions/#proposed)).
+  A mirror's Avin layout is not C's, so the elements are converted into C memory that lives for the
+  call, laid out as the header lays the struct out, and nothing is written back; a pointer that is not
+  `const` does not take one. Cairo's glyphs are drawn this way, with no `cairo_glyph_allocate`:
+
+  ```avin
+  @c(struct: "cairo_glyph_t")
+  data Glyph
+      Glyph(index: long, x: real, y: real)
+
+  @c("void cairo_show_glyphs(cairo_t *self, const cairo_glyph_t *glyphs, length(glyphs) int num_glyphs)")
+  showGlyphs(glyphs: Array[Glyph])
+  ```
+
+- **An array C allocates and answers is copied**, as an `Array` of a scalar or a mirror: an `out`
+  pointer named with `array:`, given a `length:` (a C expression, as for [buffers](#buffers)) and a
+  `free:` naming the C expression that frees it once the copy is made — Cairo's
+  `cairo_scaled_font_text_to_glyphs`, freed by `cairo_glyph_free(glyphs)`. `bytes:` is the same for an
+  `Array[byte]`.
 
 - **An out parameter is part of the result.** The Avin result is the C result followed by each
   `out` and `inout` value in order, as a tuple; a C result bound as `unit` leaves the tuple without
@@ -403,7 +511,55 @@ class Frame
     private imageRaw(format: ImageFormat, writable: int) -> Result[(ByteView, ImageFormat, int, int), int]
 ```
 
-A view is read-only. Writing into C's memory is not offered.
+A binding whose C *result* is the pointer to the memory says `view` with no name, and its `length:`
+is a C expression over the parameters:
+
+```avin
+@c("unsigned char *cairo_image_surface_get_data(cairo_surface_t *self)", view, writable,
+   length: "cairo_image_surface_get_stride(self) * cairo_image_surface_get_height(self)")
+private dataRaw() -> Option[MutByteView]
+```
+
+### Writing into C's memory
+
+**A `ByteView` is read-only. A binding marked `writable` answers an `avin.c.MutByteView`**, which is
+a `ByteView` with `update(i, b)`, `fill(from, until, b)` and `write(at, bytes)` added, every one
+bounds-checked, and is closed by the same rule: the owner's next use closes it
+([proposed](/spec/decisions/#proposed)). A `writable` binding needs a pointer that is not `const`. Whether
+C sees the bytes is the library's own protocol, written in Avin over the owner: Cairo's surface is
+flushed before its data is lent and told with `cairo_surface_mark_dirty` once it was written, and since
+`markDirty()` is a use of the owner it closes the view, so a write after it is caught:
+
+```avin
+val px = surface.pixels()?
+px.fill(0, 4, byte(255))
+surface.markDirty()
+px.update(4, byte(0))
+```
+
+```text
+avin: trap: the `MutByteView` of `Surface` was closed when `Surface` was used again at main.avin:4:5
+```
+
+### Memory Avin gives C
+
+**Memory C keeps, and writes into, is an `avin.c.ByteBlock`** ([proposed](/spec/decisions/#proposed)):
+a fixed number of bytes outside the collected heap, zeroed when made by `ByteBlock(length)`, read and
+written in place by the methods of a `MutByteView` and freed when it is collected. It is passed where a
+prototype names a byte pointer, as an array is, with its length filled into `length(p)`, but **never
+copied**: its address does not move, so it may be passed to a `blocking` call, and kept by C past the
+call. A binding that hands it to C for keeps says `keeps:`, and on a class with
+[`attach:`](#when-c-holds-the-object-longer-than-avin-does) the block lives as long as C's object:
+
+```avin
+@c("cairo_surface_t *cairo_image_surface_create_for_data(unsigned char *data, cairo_format_t format, int width, int height, int stride)",
+   keeps: "data")
+private surfaceForData(data: ByteBlock, format: Format, width: int, height: int, stride: int) -> Surface
+```
+
+Cairo reads `height * stride` bytes from `data` and no prototype says so; the library checks
+`data.length() >= height * stride` before the call, a precondition the binding takes on trust like any
+`length`.
 
 ## Calls that wait
 
@@ -435,6 +591,28 @@ on(event: string, @threaded listener: (Properties, EventData) -> unit)
   `retain`; and the function's answer crosses into C as a parameter does. A binding takes one
   function per `userdata`, and a function pointer with no `userdata` beside it is refused: there is
   nowhere to find the closure.
+- **Memory C lends a callback is a view** ([proposed](/spec/decisions/#proposed)). In a function
+  pointer's prototype, a byte pointer with a `length(p)` parameter beside it crosses as a `ByteView`
+  when it is `const` and a `MutByteView` when it is not, the length filled from C's and not an Avin
+  parameter, and the view is closed when the callback returns. That is Cairo's PNG stream, written
+  (`cairo_write_func_t`) and read (`cairo_read_func_t`) through a closure. A function-pointer typedef
+  is written out in the binding's prototype, where the marker words go; clang finds the two the same
+  type:
+
+  ```avin
+  @c("cairo_status_t cairo_surface_write_to_png_stream(cairo_surface_t *self, cairo_status_t (*write)(userdata void *closure, const unsigned char *data, length(data) unsigned int length), userdata void *closure)")
+  private writePngStream(write: (ByteView) -> Status) -> Result[unit, Status]
+
+  toPng(surface: Surface) -> Result[Array[byte], CairoError] =
+      val out = Buffer[byte]()
+
+      collect(chunk: ByteView) -> Status =
+          out.appendAll(chunk.copy())
+          Status.Success
+
+      surface.writePngStream(collect).mapErr(CairoError.from)?
+      Ok(out.toArray())
+  ```
 - **The compiler makes one trampoline per C function type**, a function with C's convention whose
   address is passed for the pointer. It finds the closure through the `userdata`, which points at the
   runtime's record of it (the record Sysl callbacks use, `callback_pin`), enters the runtime as a
@@ -470,12 +648,14 @@ on(event: string, @threaded listener: (Properties, EventData) -> unit)
 | A function pointer C answers | Bind the C functions it would point at |
 | `long double`, `_Complex`, vector types, `va_list` | — |
 | A binding with no header to check it against | Name the header in `c-libraries` |
-| Writing into C's memory through a view | An array C fills |
+| Writing through a `ByteView`, or a `writable` binding of a `const` pointer | A `MutByteView` from a `writable` binding, an array C fills, or a `ByteBlock` |
+| An array of mirrors to a pointer that is not `const` | An `out` array C allocates (`array:`), or a binding per element |
+| An indexed field accessor with no `bound:` | Name the C expression that bounds the index |
 
 ## Soundness
 
 **Avin has no pointer type and no `unsafe` block.** Every pointer lives inside a binding's
-conversions, and safe Avin code sees only strings, arrays, handles, views and mirrors, each of which
+conversions, and safe Avin code sees only strings, arrays, handles, views, byte blocks and mirrors, each of which
 is bounds-checked, owner-checked and closed-checked. **The binding declarations are the trusted
 surface**, and the whole of it: what a reviewer reads to trust a library is the lines that begin
 `@c(`, and the C glue they generate ([proposed](/spec/decisions/#proposed)).
@@ -484,8 +664,9 @@ What the compiler checks of that surface is what it can: the prototype against t
 the Avin types against the prototype; every integer at run time; every typedef's kind and width and
 every mirror's layout on the target built for. What it takes on trust is what no header says: that a
 result is owned or `borrowed`, that a function `keeps` or `consumes` a pointer, that a buffer's
-`length` is right, that C calls a function only from the thread a missing `@threaded` implies, and
-that `forget` stops the callbacks. A wrong `borrowed` or `length` is a binding bug of the kind a wrong
+`length` or `bound:` is right, that C calls a function only from the thread a missing `@threaded`
+implies, that `forget` stops the callbacks, that `attach:`'s `destroy` is called only once C has
+finished with what it keeps, and that C reads no more of a `ByteBlock` than the library checked. A wrong `borrowed` or `length` is a binding bug of the kind a wrong
 `extern` is in C.
 
 ## An example: two clips rendered with MLT

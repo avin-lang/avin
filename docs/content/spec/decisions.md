@@ -2891,7 +2891,7 @@ their words are reserved.
     replace a frame's image on the next call, so validity is "until the owner changes", and the owner
     check catches every use after that. *Alternatives*: views valid only inside a block
     (`frame.withImage { … }`), which forbids keeping one at all; copy only, which costs a copy per
-    frame. **Review with the user**: whether writable views are wanted for producing frames.
+    frame. Writable views are proposed below, from the Cairo survey.
   - **Callbacks**: one C-convention trampoline per function type, the closure found through the
     `userdata`, the runtime's Sysl-callback record and `callback_enter` reused; `keeps:` holds a
     registered callback on its handle, whose `forget:` unregisters each before `release`; a
@@ -2914,14 +2914,7 @@ their words are reserved.
     arguments); and a missing `@threaded` on a callback C calls from its own thread being caught
     only by a trap at run time.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- **C bindings of scalars** (stage 13 step 1, branch `c-bindings-scalars`, 2026-11-05): the choices
+- Settled on the user's delegation 2026-11-05 (built on branch `c-bindings-scalars`): **C bindings of scalars** (stage 13 step 1), the choices
   building it made where the chapter is silent.
   - **A typedef's kind is decided by the Avin type and checked by the C unit** with
     `__builtin_classify_type`: an integer type for an integer, an integer one byte wide (of either
@@ -2958,6 +2951,98 @@ their words are reserved.
     unit's redeclaration inherit the internal linkage, so the binding fails at the link, where the
     linker names the missing symbol. *Alternative*: reading the C unit's symbol table for a local
     definition, a reader per object format.
+
+- Settled on the user's delegation 2026-11-05 (built on branch `cairo-survey`): **C bindings, from the Cairo survey** ([chapter](/spec/c-bindings/)). The user asked for `avin-lang/cairo`, Cairo 1.18 bound over the C bindings beside
+  `avin-lang/mlt`, ported from the reference binding's surface. Mapping it onto the chapter found these
+  lacks; each is the smallest addition that covers it:
+  - **An integer bound as `bool`** is `false` for zero, `true` otherwise; a `bool` passes `0`/`1`.
+    *Why*: `cairo_bool_t` is an `int`, and so is every pre-C99 library's truth value. *Alternatives*:
+    binding it as `int` and comparing in Avin at every call site; a `truth` marker word in the
+    prototype, which says what the Avin type already does.
+  - **A status that is a C enum binds as `Result[unit, E]`** with `E` its mirror: `Ok` for the zero
+    enumerator, `Err(variant)` otherwise; the mirror keeps its zero variant, which a callback answers.
+    *Why*: Cairo's `cairo_status_t` is the error type itself, and mapping an `int` back to it by hand
+    repeats the enum. *Alternatives*: `Result[unit, int]` and a mapping function; requiring the mirror
+    to omit its zero variant, which a callback answering `Success` could not then name.
+  - **Latched errors need nothing new**: the status query is an ordinary binding, and the library
+    asks it after constructors, before output (`writePng`, `finish`, the PNG stream) and on request,
+    answering `Result[_, CairoError]` there and `unit` from the drawing calls. *Why*: Cairo latches
+    errors on the object and makes every later call a no-op, so the next query sees every failure.
+    *Alternatives*: a per-class `status:` expression the compiler checks after every call, trapping
+    or answering `Result` from all ~150 drawing calls, which costs a call each and makes every line of
+    drawing code carry a `?`; trapping on any latched error, which turns a bad PNG file into a crash.
+    **Review with the user**: whether drawing calls should trap on a latched error in a debug build.
+  - **`attach:` ties what a handle keeps to the C object's lifetime**, through the library's
+    destroy notification (`cairo_surface_set_user_data`, `mlt_properties_set_data`): the kept
+    objects move to a pinned runtime record that C's `destroy` releases; `key:` names the static key
+    type the C unit defines per class. *Why*: Cairo contexts and surface patterns reference their
+    surface, so the Avin `Surface` can be collected while C still draws into the `ByteBlock` (or font
+    file) it was made over — a use after free that `keeps:` on the handle does not prevent. The same
+    gap reaches MLT wherever a C object that keeps a pointer (a producer keeping its profile) is held
+    by another C object (a playlist) after its Avin handle is collected. *Alternatives*: keeping the
+    kept objects for the rest of the program, a leak per surface; refusing `keeps:` on handles C can
+    reference, which refuses `create_for_data`; making the library hold every surface in an Avin
+    table. **Review with the user**: whether the MLT `keeps:` bindings should move to `attach:` too.
+  - **Field accessors take expressions and bounded indices**: `field:` a C lvalue in `self` and the
+    accessor's parameters, `bound:` the C expression an index is checked below; an index with no bound
+    is refused. *Why*: `cairo_path_t` is a C-owned array of a union, which no mirror may hold, and
+    reading it element by element through glue keeps the union out of Avin. *Alternatives*: an
+    opaque value per element, which needs by-value glue for every read; a package-carried C file
+    flattening the path into doubles, the trusted escape hatch proposed above, wider than one line.
+  - **`Option` of a mirror for a nullable `const T *`.** *Why*: `cairo_recording_surface_create`
+    takes null for unbounded extents. *Alternative*: two bindings, one passing a sentinel struct.
+  - **Upper-case enumerators match an upper-case prefix** (`CAIRO_FORMAT_` → `Argb32`). *Why*:
+    most C libraries write enumerators in upper case. *Alternative*: `@c("name")` on every variant.
+  - **String and `real` constants**: `@c(const:)` reads a string literal's bytes as a measurement,
+    checked as UTF-8. *Why*: Cairo's tag names (`CAIRO_TAG_DEST`) are string macros. *Alternative*:
+    copying the literals into Avin, which drifts if the header changes them.
+  - **Arrays of mirrors** go to `const T *` converted into C memory for the call; **arrays C
+    allocates** are copied out with `array:`, `length:` and `free:` (generalizing `bytes:`). *Why*:
+    Cairo's glyph arrays, in (`cairo_show_glyphs`) and out (`cairo_scaled_font_text_to_glyphs`).
+    *Alternatives*: a handle on `cairo_glyph_allocate`'s array with indexed writers, a C-shaped API
+    in Avin code; writing a converted array back for non-`const` pointers, which no Cairo call needs.
+  - **`view` on the result, and writable views**: a bare `view` names the C result as the memory;
+    `writable` answers an `avin.c.MutByteView` (a `ByteView` with `update`, `fill`, `write`),
+    closed by the owner's next use like any view. *Why*: Cairo's pixel access is
+    `cairo_image_surface_get_data`'s result, and the reference program writes pixels and calls
+    `mark_dirty`, which, being a use, closes the view so a write after it traps. *Alternatives*:
+    copy out, edit, copy back with `create_for_data` (a full copy per edit); a block-scoped
+    `withPixels { … }`, which the chapter already weighed against for reading; one `ByteView` type
+    with a run-time writable flag, which moves a type error to run time. A `stable` marker for
+    owner methods that do not close views (Cairo's `get_width` after `get_data`) was weighed and left
+    out: the library reads those first.
+  - **`avin.c.ByteBlock`, memory Avin gives C**: fixed-length, zeroed, outside the collected heap,
+    never copied at a call, read and written like a `MutByteView`, freed when collected, kept by C
+    through `keeps:` (and `attach:`). *Why*: `cairo_image_surface_create_for_data` keeps the pointer
+    and writes into it for the surface's life, which neither a copied array nor a heap array (moved
+    out of the heap for `blocking` calls) can be. *Alternatives*: pinning an `Array[byte]` in the
+    collector, which pins the collector's design to non-moving arrays; leaving `create_for_data`
+    unbound (the reference program uses it).
+  - **Memory lent to a callback is a view** closed when it returns, `const` a `ByteView`, otherwise a
+    `MutByteView`, its length from a `length(p)` beside it; a function-pointer typedef is written out
+    in the prototype. *Why*: Cairo's PNG write and read streams pass `(closure, data, length)`.
+    *Alternatives*: a copied `Array[byte]` per chunk (fine for writing, impossible for reading, where
+    the callback must fill C's buffer).
+  - **Steps 8 and 9 of stage 13 swap**: buffers before callbacks, so callbacks can take views.
+    *Why*: the PNG stream needs both, and neither MLT step needs the other. *Alternative*: callbacks
+    first with copied arrays, the read stream deferred.
+  - The survey's three questions, settled with it. **`attach:` for MLT**: only where C keeps
+    something Avin owns that C's own reference count does not cover (memory Avin gives C, a callback's
+    closure); MLT's playlists, tractors and services take their own reference to what they are given,
+    so a counted handle needs nothing more, and the MLT steps are audited for the other cases.
+    **Review with the user.** **No trap on a latched error in debug builds**: a program behaves the
+    same at every optimization level; the binding checks the status after constructors and before
+    output, as the chapter says. **A FreeType binding** (`avin-lang/freetype`) waits until Cairo's
+    font-face step needs it; the toy font API and the platform's own font backend come first.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
