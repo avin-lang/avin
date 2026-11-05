@@ -1553,6 +1553,15 @@ Settled by the user on 2026-11-04:
   `PropertyValueAliases.txt`, ignoring case, and only the scripts `Scripts.txt` lists, with
   `Unknown`, exist; a block by its name in `Blocks.txt`, that name without spaces, or any of its
   names in `PropertyValueAliases.txt`, short ones included, ignoring case.
+- Settled by the user 2026-11-04: [blocking bindings](/spec/sysl-bindings/#calls-that-wait): a
+  binding whose Sysl call may wait is written `@sysl("module.name", blocking)`, and a handle's
+  method bound by its own name `@sysl(blocking)`; `blocking` is a bare word, written once, and
+  nothing else follows the name. The shim converts every argument and takes a handle method's own
+  share of the Sysl value, then marks the thread safe for the collector, makes the call, marks it
+  running again (waiting out a collection in progress) and only then converts the result; bytes a
+  handle's method answers are copied into Sysl memory before the thread leaves the safe region. A
+  blocking call therefore never reads or writes the Avin heap, and an argument that is a pointer
+  into it, such as a buffer Sysl fills, would need its object held by a frame for the whole call.
 
 **Deferred**
 

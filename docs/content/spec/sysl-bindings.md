@@ -339,6 +339,49 @@ parseBigInt(s: string) -> Option[BigInt]
 The bytes a handle's method answers may be a view of the handle's own value; they are copied out
 before anything else runs, so the Avin array never reads the Sysl value's memory.
 
+## Calls that wait
+
+A Sysl function that may wait — for a connection, for data on a socket or a pipe, for a process to
+end, for time to pass — is bound with **`blocking`** after its name. A handle's method bound by its
+own name takes `@sysl(blocking)`:
+
+```text
+@sysl("sysl.net.accept", blocking)
+private acceptRaw(listener: long) -> Result[long, SyslIoError]
+
+@sysl("sysl.net.Socket")
+class Socket
+    @sysl(blocking)
+    recv(max: long) -> Result[Array[byte], SyslIoError]
+    @sysl("send_all", blocking)
+    write(bytes: Array[byte]) -> Result[unit, SyslIoError]
+```
+
+While a blocking call waits, its thread is **safe for the collector**, as a thread waiting on a
+lock, a channel or a join is ([threads](/spec/threads/)): every other thread goes on allocating, and
+a collection runs without waiting for this one. A call that is not declared blocking holds up every
+collection for as long as it runs, so a binding that can wait for something outside the program is
+declared blocking. On a program's only thread, `blocking` costs two stores and two loads.
+
+The shim keeps the Sysl call away from the Avin heap while the thread is safe, because the collector
+may then free any object no frame still holds:
+
+- **Every argument is converted before the call**, so the call reads Sysl copies, never an Avin
+  object. Since a collection [crosses as a copy](#collections-are-copies), no argument is a
+  pointer into the Avin heap.
+- **A handle's method takes its own share** of the handle's Sysl value before it waits, so the value
+  outlives the call even if the handle is collected, and its finalizer run, meanwhile.
+- **The result is converted after the call**, once the thread is running again, since converting
+  makes Avin objects. Bytes a handle's method answers, which may be a view of the handle's value,
+  are copied into Sysl memory first.
+
+`blocking` is written alone and once, and only on a function or a handle's method: a type does not
+wait.
+
+```text
+error: `blocking` is written alone, after the Sysl function's name: `@sysl("sysl.net.accept", blocking)`
+```
+
 ## Generics
 
 A binding may be generic when its type parameters are instantiated with boundary types. The compiler
