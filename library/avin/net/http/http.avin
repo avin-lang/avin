@@ -1,0 +1,243 @@
+module avin.net.http
+
+// An HTTP/1.1 client over a TCP connection: `get`, `post`, and `send` for any request. One request
+// goes on each connection, and a status is an answer rather than a failure, so a `404` is an `Ok`.
+// A `GET` or `HEAD` follows up to five redirects, each resolved against the URL that answered it.
+// `https` is refused as `Unsupported`, since the library has no TLS.
+
+import avin.io.IoError
+import avin.net.{TcpStream, Url, UrlError}
+import avin.time.Duration
+
+// Why a request has no response.
+data HttpError
+    // The connection failed: it could not be made, or broke, or timed out.
+    Io(error: IoError)
+    // The request's URL is not one.
+    BadUrl(error: UrlError)
+    // The reply is not HTTP, or breaks off in the middle.
+    Malformed(text: string)
+    // The request asks for something the client does not do, such as `https`.
+    Unsupported(text: string)
+
+impl HttpError
+    // A sentence saying what went wrong, for a message to a person.
+    message() -> string = self match
+        Io(e) -> e.message()
+        BadUrl(e) -> s"bad URL: ${e.message()}"
+        Malformed(t) -> s"malformed reply: $t"
+        Unsupported(t) -> s"unsupported: $t"
+
+impl Display for HttpError
+    display(out: Writer, spec: FormatSpec) = out.writeField(message(), spec)
+
+// A request: its method, its URL as text, the headers sent besides the ones the client writes, its
+// body, and how long a read or write on its connection may wait. A method is a token, such as `GET`,
+// and a header's name and value hold no line break; either traps where it does not hold.
+class Request(val method: string, val url: string, val headers: Vector[(string, string)] = Vector.empty[(string, string)](),
+        val body: Array[byte] = Array.empty[byte](), val timeout: Option[Duration] = None)
+    if method.isEmpty() || method.indexWhere(c -> !isTokenChar(c)) >= 0 then fail(s"`$method` is not an HTTP method")
+
+    // The request with a header added after the ones it has. `Host`, `Content-Length` and
+    // `Connection`, given here, replace the ones the client would write.
+    withHeader(name: string, value: string) -> Request
+        if name.isEmpty() || name.indexWhere(c -> !isTokenChar(c)) >= 0 then fail(s"`$name` is not a header name")
+        if value.indexWhere(c -> c == '\r' || c == '\n') >= 0 then fail(s"the value of the header `$name` holds a line break")
+        Request(method, url, headers :+ (name, value), body, timeout)
+
+    // The request with `text`, as UTF-8, for its body.
+    withBody(text: string) -> Request = Request(method, url, headers, utf8(text), timeout)
+
+    // The request with `bytes` for its body.
+    withBody(bytes: Array[byte]) -> Request = Request(method, url, headers, bytes, timeout)
+
+    // The request with a read or write on its connection failing with `TimedOut` after waiting `d`.
+    withTimeout(d: Duration) -> Request = Request(method, url, headers, body, Some(d))
+
+// A response: its status and reason, its headers as they came, name and value, and its body.
+class Response(val status: int, val reason: string, val headers: Vector[(string, string)], val body: Array[byte])
+    // The value of the first header of `name`, compared without regard to case.
+    header(name: string) -> Option[string] = headerIn(headers, name)
+
+    // The body read as UTF-8, a sequence that is not UTF-8 read as U+FFFD.
+    text() -> string = string.fromUtf8Lossy(body)
+
+// Fetches `url`.
+get(url: string) -> Result[Response, HttpError] = send(Request("GET", url))
+
+// Sends `body` to `url` with the content type `contentType`, and answers the response.
+post(url: string, body: string, contentType: string) -> Result[Response, HttpError] =
+    send(Request("POST", url).withHeader("Content-Type", contentType).withBody(body))
+
+// Sends `request` and answers its response, following up to five redirects of a `GET` or `HEAD`.
+send(request: Request) -> Result[Response, HttpError]
+    var at = Url.parse(request.url).mapErr(e -> BadUrl(e))?
+    var followed = 0
+    while true
+        val response = exchange(request, at)?
+        val follows = request.method == "GET" || request.method == "HEAD"
+        if !follows || followed == MaxRedirects || !isRedirect(response.status) then return Ok(response)
+        response.header("Location") match
+            Some(location) ->
+                at = at.resolve(location.trim()).mapErr(e -> BadUrl(e))?
+                followed += 1
+            None -> return Ok(response)
+    fail("unreachable")
+
+// How many redirects a request follows before it answers the redirect itself.
+private val MaxRedirects = 5
+
+private isRedirect(status: int) -> bool =
+    status == 301 || status == 302 || status == 303 || status == 307 || status == 308
+
+// One request on a connection of its own, and the response read from it.
+private exchange(request: Request, url: Url) -> Result[Response, HttpError]
+    if url.scheme == "https" then return Err(Unsupported("https needs TLS, which the library does not have"))
+    if url.scheme != "http" then return Err(Unsupported(s"the scheme `${url.scheme}`"))
+    val host = url.host.getOrElse("")
+    if host.isEmpty() then return Err(Unsupported(s"a URL without a host: $url"))
+    val port = url.portOrDefault().getOrElse(80)
+    val stream = TcpStream.connect(addressOf(host), port).mapErr(e -> Io(e))?
+    val answer = over(stream, request, url, host)
+    stream.close()
+    answer
+
+// The request written on `stream` and its response read, the connection left for the caller to close.
+private over(stream: TcpStream, request: Request, url: Url, host: string) -> Result[Response, HttpError]
+    request.timeout match
+        Some(d) -> stream.setTimeout(d).mapErr(e -> Io(e))?
+        None -> ()
+    stream.write(utf8(head(request, url, host))).mapErr(e -> Io(e))?
+    if request.body.length() > 0 then stream.write(request.body).mapErr(e -> Io(e))?
+    while true
+        val response = readResponse(stream, request.method == "HEAD")?
+        // An interim answer, such as `100 Continue`, is followed by the real one.
+        if response.status < 100 || response.status >= 200 || response.status == 101 then return Ok(response)
+    fail("unreachable")
+
+// The request line and headers, ending in the empty line.
+private head(request: Request, url: Url, host: string) -> string
+    val out = StringWriter()
+    val target = (if url.path.isEmpty() then "/" else url.path) + url.query.map(q -> "?" + q).getOrElse("")
+    out.write(s"${request.method} $target HTTP/1.1\r\n")
+    if headerIn(request.headers, "Host").isEmpty()
+        out.write(s"Host: $host${url.port.map(p -> s":$p").getOrElse("")}\r\n")
+    val sendsLength = request.body.length() > 0 || request.method == "POST" || request.method == "PUT"
+    if sendsLength && headerIn(request.headers, "Content-Length").isEmpty()
+        out.write(s"Content-Length: ${request.body.length()}\r\n")
+    if headerIn(request.headers, "Connection").isEmpty() then out.write("Connection: close\r\n")
+    for (name, value) in request.headers
+        out.write(s"$name: $value\r\n")
+    out.write("\r\n")
+    out.text()
+
+// The status line, headers and body of one response.
+private readResponse(stream: TcpStream, headOnly: bool) -> Result[Response, HttpError]
+    val statusLine = stream.readLine().mapErr(e -> Io(e))? match
+        Some(line) -> line
+        None -> return Err(Malformed("the connection closed before a response"))
+    val (status, reason) = parseStatus(statusLine)?
+    val headers = Buffer[(string, string)]()
+    while true
+        val line = stream.readLine().mapErr(e -> Io(e))? match
+            Some(l) -> l
+            None -> return Err(Malformed("the connection closed in the headers"))
+        if line.isEmpty() then break
+        val colon = line.indexOf(':')
+        if colon <= 0 then return Err(Malformed(s"not a header: `$line`"))
+        headers.addOne((line.slice(0, colon).trim(), line.slice(colon + 1, line.byteLength()).trim()))
+    val all = headers.toVector()
+    val noBody = headOnly || (status >= 100 && status < 200) || status == 204 || status == 304
+    val body = if noBody then Array.empty[byte]() else readBody(stream, all)?
+    Ok(Response(status, reason, all, body))
+
+// `HTTP/1.1 200 OK` as its status and reason.
+private parseStatus(line: string) -> Result[(int, string), HttpError]
+    val bad = Malformed(s"not a status line: `$line`")
+    if !line.startsWith("HTTP/") then return Err(bad)
+    val space = line.indexOf(' ')
+    if space < 0 || line.byteLength() < space + 4 then return Err(bad)
+    val code = line.slice(space + 1, space + 4)
+    if code.indexWhere(c -> c < '0' || c > '9') >= 0 then return Err(bad)
+    if line.byteLength() > space + 4 && line.byteAt(space + 4) != byte(32) then return Err(bad)
+    val reason = if line.byteLength() > space + 5 then line.slice(space + 5, line.byteLength()) else ""
+    Ok((code.toInt(), reason))
+
+// The body a response's headers announce: chunked, of a `Content-Length`, or to the connection's end.
+private readBody(stream: TcpStream, headers: Vector[(string, string)]) -> Result[Array[byte], HttpError]
+    val encoding = headerIn(headers, "Transfer-Encoding").getOrElse("")
+    if encoding.toLowerCase().contains("chunked") then return readChunked(stream)
+    headerIn(headers, "Content-Length") match
+        Some(text) -> text.toIntOption() match
+            Some(n) if n >= 0 -> readExactly(stream, n)
+            _ -> Err(Malformed(s"a Content-Length of `$text`"))
+        None -> stream.readAll().mapErr(e -> Io(e))
+
+// Exactly `n` bytes, or `Malformed` where the connection ends before them.
+private readExactly(stream: TcpStream, n: int) -> Result[Array[byte], HttpError]
+    val out = Buffer[byte]()
+    while out.length() < n
+        val left = n - out.length()
+        val part = stream.read(if left > 65536 then 65536 else left).mapErr(e -> Io(e))?
+        if part.length() == 0 then return Err(Malformed(s"the body ended after ${out.length()} of $n bytes"))
+        out.addAll(part)
+    Ok(out.toArray())
+
+// A chunked body: chunks, each its size in hexadecimal on a line and then its bytes, until one of
+// size zero, then trailer lines until an empty one.
+private readChunked(stream: TcpStream) -> Result[Array[byte], HttpError]
+    val out = Buffer[byte]()
+    while true
+        val line = stream.readLine().mapErr(e -> Io(e))? match
+            Some(l) -> l
+            None -> return Err(Malformed("the connection closed in a chunked body"))
+        val semicolon = line.indexOf(';')
+        val sizeText = (if semicolon >= 0 then line.slice(0, semicolon) else line).trim()
+        val size = hexValue(sizeText) match
+            Some(n) -> n
+            None -> return Err(Malformed(s"not a chunk size: `$line`"))
+        if size == 0
+            while true
+                stream.readLine().mapErr(e -> Io(e))? match
+                    Some(trailer) -> if trailer.isEmpty() then return Ok(out.toArray())
+                    None -> return Ok(out.toArray())
+        out.addAll(readExactly(stream, size)?)
+        stream.readLine().mapErr(e -> Io(e))? match
+            Some(end) -> if !end.isEmpty() then return Err(Malformed("a chunk longer than its size"))
+            None -> return Err(Malformed("the connection closed in a chunked body"))
+    Ok(out.toArray())
+
+// The value of hexadecimal digits, `None` for none or for a value above `int.MaxValue`.
+private hexValue(text: string) -> Option[int]
+    if text.isEmpty() then return None
+    var n: long = 0
+    for c in text.chars()
+        val d = hexDigit(c)
+        if d < 0 then return None
+        n = n * 16 + long(d)
+        if n > long(int.MaxValue) then return None
+    Some(int(n))
+
+// The value of an ASCII hexadecimal digit, -1 for any other character.
+private hexDigit(c: char) -> int =
+    if c >= '0' && c <= '9' then int(c) - int('0')
+    else if c >= 'a' && c <= 'f' then int(c) - int('a') + 10
+    else if c >= 'A' && c <= 'F' then int(c) - int('A') + 10
+    else -1
+
+// The value of the first header of `name` in `headers`, compared without regard to case.
+private headerIn(headers: Vector[(string, string)], name: string) -> Option[string]
+    for (n, v) in headers
+        if n.equalsIgnoreCase(name) then return Some(v)
+    None
+
+// The host as a connection names it: an IPv6 address without its brackets, its zone's `%25` as `%`.
+private addressOf(host: string) -> string =
+    if host.startsWith("[") then host.slice(1, host.byteLength() - 1).replace("%25", "%") else host
+
+// A character a method or a header's name may hold: a letter, a digit, or one of RFC 9110's marks.
+private isTokenChar(c: char) -> bool =
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || "!#$%&'*+-.^_`|~".indexOf(c) >= 0
+
+// The UTF-8 bytes of `text`.
+private utf8(text: string) -> Array[byte] = Array.tabulate(text.byteLength(), i -> text.byteAt(i))

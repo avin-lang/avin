@@ -194,6 +194,12 @@ n is the length of the receiver, m of the other operand, and k the count or size
 on a vector is O(log₃₂ n) where it says so; elsewhere a vector, an `ArraySeq`, an array, a buffer, a
 deque and a range answer in the same time as a list, which walks from its front.
 
+**Adding an element widens.** Through `Seq[T]` and on a vector, `++`, `:+`, `+:` and `updated` take
+the element as a type parameter bounded below by `T`, so a `Vector[Dog]` given a cat answers a
+`Vector[Animal]`, and a `Vector[Animal]` that is a vector of dogs given a cat does the same rather
+than make a vector of dogs holding a cat. A vector's `toArray()` is a `toArray[W >: T]()` alike, an
+array of the type the call asks for.
+
 | Method | Result through `Seq[T]` | Own result | Cost |
 |---|---|---|---|
 | `map(f)`, `flatMap(f)`, `collect(pf)` | `Vector[U]` | each type's own kind; a range's is a vector | O(n) |
@@ -207,9 +213,9 @@ deque and a range answer in the same time as a list, which walks from its front.
 | `span(p)` | `(Vector[T], Vector[T])` | List, ArraySeq; a vector's are vectors | O(n) |
 | `tail()`, `init()` | `Vector[T]`; trap when empty | List, Vector, ArraySeq | list `tail` O(1); vector O(log n); others O(n) |
 | `reverse()` | `Vector[T]` | List, ArraySeq; a vector's is a vector | O(n) |
-| `xs ++ ys` | `Vector[T]`, `ys` any `Iterable[T]` | List (shares a list `ys`), Vector, ArraySeq | vector O(min(n, m)) for another vector; others O(n + m) |
-| `xs :+ x`, `x +: xs` | `Vector[T]` | List, Vector, ArraySeq | list `+:` O(1), `:+` O(n); vector amortized O(1); others O(n) |
-| `updated(i, x)` | `Vector[T]`; traps outside | List, Vector, ArraySeq | list O(i); vector O(log n); others O(n) |
+| `xs ++ ys` | `Vector[W]`, `ys` any `Iterable[W]`, `W >: T` | List (shares a list `ys`), Vector, ArraySeq | vector O(min(n, m)) for another vector; others O(n + m) |
+| `xs :+ x`, `x +: xs` | `Vector[W]`, `x` a `W >: T` | List, Vector, ArraySeq | list `+:` O(1), `:+` O(n); vector amortized O(1); others O(n) |
+| `updated(i, x)` | `Vector[W]`, `x` a `W >: T`; traps outside | List, Vector, ArraySeq | list O(i); vector O(log n); others O(n) |
 | `padTo(total, x)` | `Vector[T]` | List, ArraySeq; a vector's is a vector | O(max(n, total)) |
 | `distinct()`, `distinctBy(key)` | `Vector[T]`, the first of each | List, ArraySeq; a vector's is a vector | O(n) expected, a hash set |
 | `intersect(other)`, `diff(other)` | `Vector[T]`, as multisets | List, ArraySeq; a vector's is a vector | O(n + m) expected, a hash map |

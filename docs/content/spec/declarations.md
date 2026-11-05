@@ -287,6 +287,46 @@ pairs[T: Display](first: T) -> string
 pairs("p")               // "(p, 1) (p, a) (p, 2.5)"
 ```
 
+### Tail calls
+
+A call is in **tail position** when its result is the function's result and nothing is left to do
+after it: the body itself, the last item of a block in tail position, a branch of an `if`, an arm of
+a `match` or a clause body in tail position, the right operand of `&&` or `||` in tail position, and
+the value of a `return`, wherever it is written. A call whose result is used is not: by an operator,
+a conversion, another call, a store, a pattern, a guard or a condition; nor is one inside a loop, a
+lambda, a by-name argument or a local function, which runs later or from somewhere else.
+
+**A function that calls itself in tail position runs as a loop.** The arguments are evaluated, every
+one before any parameter changes, then become the parameters, and the body starts again, so the
+stack does not grow however deep the recursion goes. This holds at every optimization level, of a
+call that names the function itself at its own type arguments, for every function no other body can
+replace: a top-level or local function, a method of a final class, of an object or of a data type,
+and a private method of any class. A call of a method on another receiver of the same type is a loop
+too, with that receiver as `self`. Each pass has parameters of its own: a lambda made in one pass
+keeps that pass's values, and a `var` its body declares is a new one each pass.
+
+```text
+sum(n: long, acc: long) -> long = if n == 0 then acc else sum(n - 1, acc + n)
+
+sum(10000000, 0)         // 50000005000000, in constant stack
+```
+
+**`@tailrec` makes it a guarantee.** Written before a function, a method or a local function, it
+asks the compiler to prove that every call of the function in its own body is such a loop, and each
+failure is an error at the call, saying why:
+
+```text
+@tailrec
+factorial(n: long) -> long = if n == 0 then 1 else n * factorial(n - 1)
+// error: this recursive call of `factorial` is not in tail position: its result is used by `*`
+```
+
+It is an error for the function to have no recursive call; for it to be a method that can be
+overridden, a trait's or a public method of an `open` or `abstract` class, since a call of it may run
+an override; and for a recursive call to give a generic function other type arguments, which calls
+another instance rather than looping. A function defined by clauses may be `@tailrec`, written before
+its signature.
+
 ## data
 
 `data` declares an algebraic data type: an immutable value with one or more variants.
@@ -304,7 +344,9 @@ data Option[+T]
 ```
 
 The single-line form declares a one-variant type whose variant has the type's name. Variants are
-constructors, not types: `Some(1)` has type `Option[int]`. `data` values have no identity, derive
+constructors, not types: `Some(1)` has type `Option[int]`. A variant is a name of its module, so two
+data types of one module, in one file or in two, private or not, cannot have variants of one name.
+`data` values have no identity, derive
 `Eq`, `Hash`, `Display` and `Debug` when their fields do, without `derives`, and are matched
 exhaustively. Methods are added in an `impl` block; an impl of `Display` or `Debug` replaces the
 derived one ([Display and Debug](/spec/equality-and-memory/#display-and-debug)).
@@ -398,7 +440,15 @@ class Square(label: string, side: int): Rect(label, side, side)
   override is marked `override`, takes the same parameter types (with the superclass's type
   arguments substituted) and yields the same result type or, for a class, a subclass of it. A method
   with type parameters of its own is overridden by one declaring as many, matched by position:
-  `override tag[V](item: V)` overrides `tag[U](item: U)`. A method sharing an inherited method's name and parameter types without
+  `override tag[V](item: V)` overrides `tag[U](item: U)`. An override assumes no more of its type
+  arguments than the method it overrides, since a call through the base type passes any type the
+  base's bounds admit: each bound it writes is implied by the overridden method's bounds on the same
+  parameter, being one of them, a trait or class one of them conforms to (`[U: Shape]` over
+  `[U: Named]` where `trait Named: Shape`), or `Eq` or `Hash`, which every type has. It may keep the
+  bounds, weaken them or drop them; `override tag[V: Ord](item: V)` over `tag[U](item: U)` is an
+  error naming the bound and the method. The same holds of a class's or an impl's method
+  implementing a trait's, for a data type or a built-in type, of a static member, and of a trait's
+  override. A method sharing an inherited method's name and parameter types without
   `override`, and `override` on a method that overrides nothing, are errors. An override cannot be
   private.
 - **Methods overload as functions do.** A class, object, trait or impl may declare several methods
@@ -745,7 +795,9 @@ built-in type implements every method of the trait, defaults included.
   them: a class or `data` type implementing it, the trait's own type, a type parameter it bounds.
   Inside them `self` is the value and `Self` its type; the trait's methods, and those other impls add
   to it, are in scope by bare name. They reach the value only through the trait's methods, so they
-  are not variance positions: `contains(element: T)` is written on `Seq[+T]`.
+  are not variance positions: `contains(element: T)` is written on `Seq[+T]`. The methods an impl
+  adds to an `open` or `abstract` class are, by contrast, in the class's method table, and so are
+  variance positions like the class's own ([generics](generics.md)).
 - **A call of an added method is compiled for the receiver's static type.** Where that is a class or
   a `data` type, the trait's methods the added one calls are that type's, called directly; where it
   is the trait, they go through the object's method table. An added method is in no method table and
