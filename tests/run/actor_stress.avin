@@ -1,0 +1,67 @@
+// expect: exit 0
+// Declared actors at a size the collector's stress can run, collecting at every allocation: a ring
+// of 200 actors of one declaration passing a token round three times, each holding the next's
+// reference in a body `var` set by a message, and 50 collectors each told 40 messages carrying
+// fresh strings and vectors from two threads and the main one, which each keeps in its body's
+// state across messages and answers with at the end, every message handled once and in each
+// sender's order.
+import avin.actors.{ActorRef, spawn}
+import avin.threads.{Future, Promise}
+
+data RingMsg
+    Link(next: ActorRef[RingMsg])
+    Token(laps: int, done: Promise[int])
+
+actor Ringer(id: int) receives RingMsg
+    var next: Option[ActorRef[RingMsg]] = None
+    var passed = 0
+    receive
+        Link(n) -> next = Some(n)
+        Token(laps, done) ->
+            passed += 1
+            if id == 0 && laps == 0 then done.complete(passed)
+            else next.get().tell(Token(if id == 0 then laps - 1 else laps, done))
+
+data Item
+    Add(from: string, n: int, words: Vector[string])
+    Report(reply: Promise[string])
+
+actor Collector(name: string) receives Item
+    var seen: Map[string, Vector[int]] = Map()
+    var chars = 0
+    receive
+        Add(from, n, words) ->
+            seen = seen.updated(from, seen.get(from).getOrElse(Vector()) :+ n)
+            for w in words do chars += w.chars().size()
+        Report(reply) ->
+            var ordered = true
+            var count = 0
+            for (_, ns) in seen
+                count += ns.length()
+                for i in 1..<ns.length() do if ns(i - 1) >= ns(i) then ordered = false
+            reply.complete(s"$name $count $ordered $chars")
+
+feed(c: ActorRef[Item], from: string)
+    for i in 0..<13 do c.tell(Add(from, i, Vector(s"$from$i", "é")))
+
+main()
+    val ring: Vector[ActorRef[RingMsg]] = Vector.tabulate(200, i -> spawn(Ringer(i)))
+    for i in 0..<200 do ring(i).tell(Link(ring((i + 1) % 200)))
+    val done = Promise[int]()
+    ring(0).tell(Token(2, done))
+    println(done.future.await())
+    val collectors: Vector[ActorRef[Item]] = Vector.tabulate(50, i -> spawn(Collector(s"c$i")))
+    val a = Future(for c in collectors do feed(c, "a"))
+    val b = Future(for c in collectors do feed(c, "b"))
+    for c in collectors do feed(c, "m")
+    for c in collectors do c.tell(Add("m", 13, Vector()))
+    a.await()
+    b.await()
+    var lines: Vector[string] = Vector()
+    for c in collectors
+        val p = Promise[string]()
+        c.tell(Report(p))
+        lines = lines :+ p.future.await()
+    println(lines(0))
+    println(lines(49))
+    println(lines.forall(l -> l.contains(" 40 true ")))

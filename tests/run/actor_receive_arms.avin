@@ -1,0 +1,70 @@
+// expect: exit 0
+// `receive` holds exactly a match's arms over the message type: nested patterns, guards, a comparison
+// pattern, alternatives, a binding of the whole message, block bodies, an `else` arm, and `_ -> ()`
+// ignoring the rest. Each arm's value is discarded, so arms yielding an int, a string and `unit`
+// sit side by side. A `return` in an arm ends the handling of that message only, and the actor goes
+// on to the next. A message type need not be a data type: an int, a string, a tuple and an `Option`
+// are received and matched by value.
+import avin.actors.{ActorRef, spawn}
+import avin.threads.{Channel, Promise}
+
+data Inner
+    Small(n: int)
+    Big(n: int)
+
+data Msg
+    Wrap(inner: Inner)
+    Pair(a: int, b: int)
+    Word(text: string)
+    Stop(done: Promise[unit])
+    Ignored(n: int)
+
+actor Matcher(log: Channel[string]) receives Msg
+    var count = 0
+    receive
+        Wrap(Small(n < 0)) -> log.send(s"negative small $n")
+        Wrap(Small(n)) -> log.send(s"small $n")
+        Wrap(whole @ Big(_)) -> log.send(s"big $whole")
+        Pair(a, b) if a == b -> 42
+        Pair(0 | 1, b) -> s"low pair $b"
+        Pair(a, b) ->
+            if a > 100 then return
+            count += 1
+            log.send(s"pair $a $b, $count so far")
+        Word("") -> log.send("empty word")
+        Word(text) -> log.send(s"word ${text.chars().size()} ${text}")
+        Stop(done) -> done.complete(())
+        _ -> ()
+
+actor Ints(log: Channel[string]) receives int
+    receive
+        0 -> log.send("zero")
+        n < 0 -> log.send(s"negative $n")
+        _ < 10 -> log.send("digit")
+        else log.send("large")
+
+actor Strings(log: Channel[string]) receives (string, Option[int])
+    receive
+        ("", _) -> log.send("no name")
+        (name, Some(n)) -> log.send(s"$name=$n")
+        (name, None) -> log.send(s"$name unset")
+
+main()
+    val log = Channel[string](64)
+    val m = spawn(Matcher(log))
+    for msg in [Wrap(Small(-2)), Wrap(Small(3)), Wrap(Big(9)), Pair(5, 5), Pair(1, 7), Pair(500, 1), Pair(8, 9),
+            Word(""), Word("héllo"), Ignored(1), Pair(2, 3)]
+        m.tell(msg)
+    val done = Promise[unit]()
+    m.tell(Stop(done))
+    done.future.await()
+    val ints = spawn(Ints(log))
+    for n in [0, -5, 7, 10, 2147483647, -2147483648] do ints.tell(n)
+    val strings = spawn(Strings(log))
+    strings.tell(("", Some(1)))
+    strings.tell(("a", Some(2)))
+    strings.tell(("ü", None))
+    for _ in 0..<7 do println(log.receive().get())
+    var rest: Vector[string] = Vector()
+    for _ in 0..<9 do rest = rest :+ log.receive().get()
+    println(rest.sorted())

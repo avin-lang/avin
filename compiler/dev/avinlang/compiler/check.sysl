@@ -534,6 +534,8 @@ struct Checker
     /** Whether the `match` function being checked is passed for such a type argument where a
      * `PartialFunction` is expected: its two lambdas are made as `@sendable` functions. */
     sendable_match: bool
+    /** The actors' message types already held to `Sendable`, by unit and place. */
+    actor_messages_held: Map[string, bool]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -785,7 +787,7 @@ private check_imports(c: *Checker, unit: usize)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false)
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -840,6 +842,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
         hold_to_bounds(&c, p.unit, p.at, p.what, p.owner, p.params, p.args, 0)
         c.generic = outer_generic
     c.pending = buf()
+    check_actor_params(&c)
     for dv in c.derivations
         if !dv.automatic then check_derivation(&c, dv)
     settle_automatic_derivations(&c)
@@ -5987,7 +5990,7 @@ private scan_sendable(c: *Checker, id: usize, root: usize, e: &TExpr, k: usize, 
         return
     if made_sendable(c, root, e)
         if first_send_problem(c, root, e, SendableMark, k, held) is Some(why)
-            c.note(c.symbols[id].unit, e.span, s"${quoted_type(zonk(c, e.ty))} may use only sendable values from around it, but $why")
+            c.note(c.symbols[id].unit, e.span, s"${sendable_made(c, c.symbols[id].unit, e)} may use only sendable values from around it, but $why")
         // A method value's receiver is evaluated where the value is made.
         if e.kind is Block(items)
             if items.len() == 2 then scan_sendable(c, id, root, items[0], k, held)
@@ -6010,6 +6013,12 @@ private sendable_match_attempt(c: *Checker, e: &TExpr) -> Option[&TExpr]
     e.kind match
         Call(_, args, _) -> Some(args[1])
         _ -> None
+
+/** What a `@sendable` function value `e` is called where it breaks the rules for one: an actor's,
+ * where it is the start an actor declaration's behaviour is made with, and otherwise its type. */
+private sendable_made(c: *Checker, unit: usize, e: &TExpr) -> string = actor_started(c, unit, e.span) match
+    Some(site) -> s"the actor `${site.name}`"
+    None -> quoted_type(zonk(c, e.ty))
 
 /** Whether `e` makes a function value of a `@sendable` function type: a lambda, a function
  * reference or a method value written where one is expected, which is held to the rules for one. */
@@ -6128,6 +6137,9 @@ private send_use_problem(c: *Checker, root: usize, u: SendUse, mark: int, k: usi
         // whatever the parameter's type.
         if param_mark(c, root, u.index) == SendableMark then return None
         if param_mark(c, root, u.index) >= mark && holds_function(t) then return None
+        // An actor's parameters are held to `Sendable` where the actor is declared.
+        if actor_started(c, r.unit, r.decl.name_span) is Some(site)
+            if site.name == r.name && r.owner_class is None then return None
     else
         val locals = c.locals[root]
         if u.index >= locals.len() then return None
@@ -6140,6 +6152,11 @@ private send_use_problem(c: *Checker, root: usize, u: SendUse, mark: int, k: usi
         CannotSend(why) ->
             if holds_function(ty) && u.param then return Some(s"it uses `$name`, ${quoted_type(ty)}, ${nested_reason(why)}; mark the parameter `${mark_name(mark)}`, and what is passed for it is checked in turn")
             if u.param && why.starts_with("it is a trait") then return Some(s"it uses `$name`, ${quoted_type(ty)}, ${nested_reason(why)}; or mark the parameter `@sendable`, and what is passed for it is checked in turn")
+            // An actor's methods and fields are read on the object holding its state.
+            if *ty is Class(id, _, _)
+                val held = c.classes[id].decl.name
+                if name == "self" && held.starts_with(ActorClassPrefix)
+                    return Some(s"it uses the state of the actor `${held[ActorClassPrefix.bytes.len..]}`, ${nested_reason(why)}")
             Some(s"it uses `$name`, ${quoted_type(ty)}, ${nested_reason(why)}")
         _ -> None
 
@@ -6303,7 +6320,7 @@ private scan_thread_bodies(c: *Checker, id: usize, root: usize, e: &TExpr, k: us
         return
     if made_sendable(c, root, e)
         if module_state_path(c, e, k, direct) is Some(why)
-            c.note(c.symbols[id].unit, e.span, s"${quoted_type(zonk(c, e.ty))} may run on another thread, which shares the program's module-level state, but $why")
+            c.note(c.symbols[id].unit, e.span, s"${sendable_made(c, c.symbols[id].unit, e)} may run on another thread, which shares the program's module-level state, but $why")
         if e.kind is Block(items)
             if items.len() == 2 then scan_thread_bodies(c, id, root, items[0], k, direct, held)
         return
@@ -6340,8 +6357,18 @@ private module_state_path(c: *Checker, arg: &TExpr, k: usize, direct: Buf[Option
     var through = ""
     for step in r.via
         val s = c.symbols[step]
-        if s.lambda || s.name == "" || s.name.starts_with("<") then continue
-        through = through + (if through == "" then "" else " → ") + s"`${s.name}`"
+        // The functions an actor declaration is read into, which no program writes, are not named,
+        // and an actor's own method is named as the actor's code calls it.
+        if s.lambda || s.name == "" || s.name.starts_with("<") || s.name.contains("$") then continue
+        var shown = s.name
+        if shown.starts_with(ActorClassPrefix)
+            var dot: Option[usize] = None
+            for k in 0..<shown.bytes.len
+                if shown.bytes[k] == u8('.') then dot = Some(k)
+            dot match
+                Some(d) -> shown = shown[d + 1..]
+                None -> continue
+        through = through + (if through == "" then "" else " → ") + s"`$shown`"
     val via = if through == "" then "" else s"through $through "
     val what = module_state_problem(c, r.global, k).unwrap_or("")
     Some(s"${via}it reaches $what")
@@ -6727,7 +6754,16 @@ private hold_to_bounds_except(c: *Checker, unit: usize, at: Span, what: string, 
         for b in bounds_at(c, owner, params, i)
             val bound = substitute(b, owner, args)
             if sendable_trait_of(c, bound) is Some(k)
-                if !contains_index(sent, i) then hold_to_sendable(c, unit, at, s"the bound of `${params[i].name}` in $what", args[i], k)
+                if contains_index(sent, i) then continue
+                // An actor's message type, named by its behaviour and its reference and inferred
+                // where the behaviour is made, is reported once, as what the actor receives.
+                if actor_message_held(c, unit, at) is Some(site)
+                    val key = s"$unit:${site.message.start}"
+                    if c.actor_messages_held.get(key) is None
+                        c.actor_messages_held.put(key, true)
+                        hold_to_sendable(c, unit, at, s"so the actor `${site.name}` cannot receive it", args[i], k)
+                    continue
+                hold_to_sendable(c, unit, at, s"the bound of `${params[i].name}` in $what", args[i], k)
                 continue
             if !conforms_to_bound(c, args[i], bound)
                 val arg = zonk(c, args[i])
@@ -7896,6 +7932,11 @@ local_function(c: *Checker, name: string) -> Option[usize]
 /** The class whose constructor or method the code being checked belongs to. */
 enclosing_class(c: *Checker) -> Option[usize] = c.symbols[c.body.root].owner_class
 
+/** Whether the code being checked is an actor's: the class an actor declaration keeps its state in. */
+private in_actor(c: *Checker) -> bool = enclosing_class(c) match
+    Some(k) -> c.classes[k].decl.name.starts_with(ActorClassPrefix)
+    None -> false
+
 /** The class whose fields a bare name reaches: the enclosing class, or the class of the receiver of
  * a method an impl adds to a type built from a class's parameters or to another module's class. */
 private fields_class(c: *Checker) -> Option[usize]
@@ -8274,6 +8315,8 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
     if c.super_args && name == "self"
         c.note(unit_of(c), at, "`self` cannot be used in a superclass's arguments, which run before the object is initialized")
         return TExpr(at, ErrorType, UnitConst)
+    // In an actor, `self` is the actor's reference; the object holding its state is never a value.
+    if name == "self" && in_actor(c) then return name_expr(c, at, ActorSelf, expected)
     if name == "self" && refuse_static_self(c, at, "") then return TExpr(at, ErrorType, UnitConst)
     if binding_ref(c, at, name) is Some(t) then return evaluated(t)
     val symbol = c.symbols[c.current]
@@ -8825,7 +8868,9 @@ private binding_expr(c: *Checker, e: &Expr, name: string, declared: Option[&Type
 
 /** Brings a new local into scope; a name may be declared once per block. */
 private declare_local(c: *Checker, at: Span, name: string, ty: &Type, mutable: bool) -> usize
-    if name == "self" then c.note(unit_of(c), at, "`self` names the instance a method works on; it cannot be declared")
+    if name == "self"
+        if in_actor(c) then c.note(unit_of(c), at, "`self` names the actor's reference; it cannot be declared")
+        else c.note(unit_of(c), at, "`self` names the instance a method works on; it cannot be declared")
     for i in c.body.block_start..<c.body.visible.len()
         if name != "_" && c.body.locals[c.body.visible[i]].name == name
             c.note(unit_of(c), at, s"`$name` is already defined in this block")
@@ -14477,6 +14522,10 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
             val missing = missing_cases(typed, s.ty, c.data)
             if missing.len() > 0
                 c.note(unit, e.span, s"state `${site.state}` of `${site.machine}` does not handle ${case_list(missing)}")
+        elif actor_receiving(c, unit, e.span) is Some(site)
+            val missing = missing_cases(typed, s.ty, c.data)
+            if missing.len() > 0
+                c.note(unit, e.span, s"actor `${site.name}` does not handle ${case_list(missing)}; a message it ignores is handled by an arm that does nothing, as `_ -> ()`")
         elif missing_case(typed, s.ty, c.data, false) is Some(_)
             val subject = s"this `match` does not cover every ${type_name(s.ty)} value"
             // A value is named only when no arm can match it whatever the extractors answer, and
@@ -14491,6 +14540,48 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
 // The state of a machine whose arms a match at `at` holds, if it is one.
 private machine_site(c: *Checker, unit: usize, at: Span) -> Option[MachineSite]
     for site in c.units[unit].file.machine_states
+        if site.span.start == at.start && site.span.end == at.end then return Some(site)
+    None
+
+// Holds each actor's parameters to `Sendable` where the actor is declared: its behaviour carries them
+// to the actor, which may start on any thread. One the program marks `@sendable` itself is sendable
+// whatever its type, as a marked parameter of a function is.
+private check_actor_params(c: *Checker)
+    val k = c.core.trait_named("Sendable") match
+        Some(k) -> k
+        None -> return
+    for id in 0..<c.symbols.len()
+        val symbol = c.symbols[id]
+        if symbol.owner_class is Some(_) || symbol.lambda then continue
+        val site = actor_started(c, symbol.unit, symbol.decl.name_span) match
+            Some(s) -> s
+            None -> continue
+        if symbol.name != site.name then continue
+        val outer_generic = c.generic
+        c.generic = if symbol.type_params.len() > 0 then Some(GenericScope(symbol.type_owner, symbol.type_params)) else None
+        for i in 0..<symbol.params.len()
+            if i >= site.sendable_params.len() || !site.sendable_params[i] then continue
+            hold_to_sendable(c, symbol.unit, symbol.decl.params[i].span, s"so the actor `${site.name}` cannot take it as its parameter `${symbol.param_names[i]}`", symbol.params[i], k)
+        c.generic = outer_generic
+
+// The actor whose `receive` arms a match at `at` holds, if it is one.
+private actor_receiving(c: *Checker, unit: usize, at: Span) -> Option[ActorSite]
+    for site in c.units[unit].file.actors
+        if site.receive.start == at.start && site.receive.end == at.end then return Some(site)
+    None
+
+// The actor whose behaviour's start is written at `at`, if it is one.
+private actor_started(c: *Checker, unit: usize, at: Span) -> Option[ActorSite]
+    for site in c.units[unit].file.actors
+        if site.span.start == at.start && site.span.end == at.end then return Some(site)
+    None
+
+// The actor whose message type is held to `Sendable` at `at`, if it is one: where the message type is
+// written, which its behaviour's and its reference's types are written at too, or where the actor's
+// behaviour is made.
+private actor_message_held(c: *Checker, unit: usize, at: Span) -> Option[ActorSite]
+    for site in c.units[unit].file.actors
+        if site.message.start == at.start && site.message.end == at.end then return Some(site)
         if site.span.start == at.start && site.span.end == at.end then return Some(site)
     None
 

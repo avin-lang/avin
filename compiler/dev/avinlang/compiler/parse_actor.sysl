@@ -1,0 +1,193 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// An actor declaration, `actor Counter(params) receives CounterMsg` and a body of fields, methods,
+// statements and one `receive` block of arms. It is read into the two declarations it means:
+//
+// - a private class `actor Counter`, holding the actor's reference first, then the parameters, as
+//   its fields, the body's fields, statements and methods, and a method `actor$receive(message)`
+//   that matches the message against the `receive` arms, each arm's value discarded. No name a
+//   program writes holds a space or a `$`, so the object of this class, the actor's state, is never
+//   a value the program sees; inside it `self` names the actor's reference (see the checker).
+// - a function `Counter(params) -> Behaviour[CounterMsg]`, taking the actor's parameters with their
+//   defaults, which makes the behaviour named "Counter" whose start, run on the actor's first turn,
+//   makes the state object from the parameters and the actor's reference and gives back the
+//   handler, the call of `actor$receive`.
+//
+// The start is a `@sendable` function and captures the parameters; the checker holds each one's type
+// to `Sendable` where the actor is declared, rather than at the capture, and the message type where
+// it is named after `receives`.
+
+/** The two declarations an actor is read into, and what the checker needs to report on it. */
+struct ActorDeclarations
+    decl: &ClassDecl
+    function: &Function
+    site: ActorSite
+
+/** Whether an actor declaration starts here: `actor` before the name it declares. Elsewhere `actor`
+ * is an ordinary name. */
+actor_ahead(p: *Parser) -> bool
+    if !p.at("actor") then return false
+    val next = p.toks.peek_at(1) match
+        Some(t) -> t
+        None -> return false
+    next.value == Word && p.ahead(1) != "("
+
+/** The name of the class an actor's state is kept in. */
+actor_class_name(name: string) -> string = ActorClassPrefix + name
+
+/** What the name of the class holding an actor's state begins with: `actor Counter`, which reads
+ * well where a diagnostic names it and which no program can write, since a name holds no space. */
+const ActorClassPrefix: string = "actor "
+
+// The hidden members and locals an actor's declarations hold.
+const ActorSelf: string = "actor$self"
+const ActorReceive: string = "actor$receive"
+const ActorMessage: string = "actor$message"
+const ActorState: string = "actor$state"
+
+parse_actor(p: *Parser, start: Span, annotations: Buf[Annotation]) -> ActorDeclarations
+    p.expect("actor")
+    val name_start = p.toks.here()
+    val name = declared_name(p, "an actor")
+    val name_span = name_start.to(p.ended())
+    val type_params = parse_type_params(p)
+    var params: Buf[ClassParam] = buf()
+    if p.at("(") then params = parse_field_params(p, "an actor's parameter is a value its behaviour carries to it, so it cannot be by-name")
+    var message: &TypeExpr = TypeExpr(p.toks.here(), InvalidType)
+    if p.accept("receives") then message = parse_type(p)
+    else p.report.add(error(p.toks.here(), s"an actor names the type of the messages it receives: `actor $name receives Message`"))
+    var members: Buf[ClassMember] = buf()
+    var arms: Buf[Arm] = buf()
+    var receive_at: Option[Span] = None
+    if p.accept_kind(Indent)
+        loop
+            if p.toks.at_end() || p.accept_kind(Dedent) then break
+            if p.accept_kind(Newline) then continue
+            val before = p.toks.position
+            if p.at("receive") && next_is(p, Indent)
+                val at = p.toks.here()
+                p.toks.advance()
+                if receive_at is Some(_) then p.report.add(error(at, s"`$name` has one `receive` block, holding the arms that handle its messages"))
+                else receive_at = Some(at)
+                p.expect_kind(Indent, "expected indented arms after `receive`")
+                for arm in machine_arms(p)
+                    arms.push(arm)
+            else members.push(private_member(parse_class_member(p)))
+            if p.toks.position == before then p.toks.advance()
+            if !p.toks.at_end() && !p.at_kind(Newline) && !p.at_kind(Dedent) && !after_block(p)
+                p.report.add(error(p.toks.here(), "expected a new line between an actor's members"))
+                skip_line(p)
+        optional_end(p, name, true)
+    val span = start.to(p.ended())
+    val receive = receive_at match
+        Some(at) -> at
+        None ->
+            p.report.add(error(name_span, s"an actor handles its messages in a `receive` block: `$name` has none"))
+            name_span
+    var sendable: Buf[bool] = buf()
+    for cp in params
+        sendable.push(!marked_sendable(cp.param))
+    val site = ActorSite(name_span, name, message.span, receive, sendable)
+    val decl = actor_class(span, name_span, name, type_params, params, message, members, arms, receive_at)
+    val function = behaviour_function(annotations, span, name_span, name, type_params, params, message)
+    ActorDeclarations(decl, function, site)
+
+// An actor's methods are its own helpers: nothing outside it reaches its state.
+private private_member(m: ClassMember) -> ClassMember = m match
+    MethodMember(f, _, overrides, static_member) -> MethodMember(f, false, overrides, static_member)
+    _ -> m
+
+private marked_sendable(param: Param) -> bool
+    for a in param.annotations
+        if a.name == "sendable" then return true
+    false
+
+private actor_name(at: Span, name: string) -> &Expr = Expr(at, Name(name))
+
+private actor_type(at: Span, name: string, args: Buf[&TypeExpr]) -> &TypeExpr = TypeExpr(at, Named(name, args))
+
+private param_name(param: Param) -> string = param.pattern.kind match
+    Name(n) -> n
+    _ -> ""
+
+// The actor's type parameters, as type arguments.
+private type_args(type_params: Buf[TypeParam]) -> Buf[&TypeExpr]
+    var args: Buf[&TypeExpr] = buf()
+    for tp in type_params
+        args.push(actor_type(tp.span, tp.name, buf()))
+    args
+
+// `avin.actors.Behaviour[M]` or `avin.actors.ActorRef[M]`, written at the message type, where a
+// message type that is not sendable is reported.
+private actors_type(message: &TypeExpr, name: string) -> &TypeExpr
+    var args: Buf[&TypeExpr] = buf()
+    args.push(message)
+    actor_type(message.span, core_path("actors." + name), args)
+
+private actor_class(span: Span, name_span: Span, name: string, type_params: Buf[TypeParam], params: Buf[ClassParam], message: &TypeExpr, written: Buf[ClassMember], arms: Buf[Arm], receive_at: Option[Span]) -> &ClassDecl
+    val at = name_span
+    var fields: Buf[ClassParam] = buf()
+    fields.push(ClassParam(Param(at, Pattern(at, Name(ActorSelf)), actors_type(message, "ActorRef"), None, false, false, buf()), false, false))
+    for cp in params
+        val q = cp.param
+        fields.push(ClassParam(Param(q.span, q.pattern, q.ty, None, false, q.variadic, q.annotations), cp.mutable, false))
+    var members: Buf[ClassMember] = buf()
+    for m in written
+        members.push(m)
+    // `actor$receive(message: M)`: the arms, each one's value discarded.
+    var discarded: Buf[Arm] = buf()
+    for arm in arms
+        var items: Buf[&Expr] = buf()
+        items.push(arm.body)
+        discarded.push(Arm(arm.pattern, arm.guard, Expr(arm.body.span, Block(items, true))))
+    // Without a `receive` block, already reported, the message is not matched at all.
+    val receive = receive_at.unwrap_or(at)
+    val body: &Expr = if receive_at is Some(_) then Expr(receive, Match(actor_name(receive, ActorMessage), discarded)) else Expr(at, UnitLit)
+    var receive_params: Buf[Param] = buf()
+    receive_params.push(Param(receive, Pattern(receive, Name(ActorMessage)), message, None, false, false, buf()))
+    members.push(MethodMember(Function(buf(), receive, receive, ActorReceive, buf(), receive_params, Some(TypeExpr(receive, Named("unit", buf()))), Some(body), buf()), true, false, false))
+    ClassDecl(buf(), span, name_span, actor_class_name(name), "", at, type_params, fields, buf(), buf(), members, false)
+
+// `Counter(params) -> Behaviour[M]`, making the behaviour whose start makes the state and gives back
+// the handler:
+//
+//     Behaviour("Counter", actor$self ->
+//         val actor$state = Counter$actor[T](actor$self, params)
+//         actor$message -> actor$state.actor$receive(actor$message))
+private behaviour_function(annotations: Buf[Annotation], span: Span, name_span: Span, name: string, type_params: Buf[TypeParam], params: Buf[ClassParam], message: &TypeExpr) -> &Function
+    val at = name_span
+    var own_params: Buf[TypeParam] = buf()
+    for tp in type_params
+        own_params.push(TypeParam(tp.span, tp.name, Invariant, tp.bounds, tp.site + ".behaviour", tp.lower))
+    var fn_params: Buf[Param] = buf()
+    var args: Buf[Argument] = buf()
+    args.push(Argument(at, None, actor_name(at, ActorSelf), false))
+    for cp in params
+        val q = cp.param
+        // A parameter the program marks `@sendable` is one in the function too; the checker takes
+        // every other one as sendable inside it, since its type is held to `Sendable` already.
+        var marks: Buf[Annotation] = buf()
+        if marked_sendable(q) then marks.push(Annotation(q.span, "sendable", buf()))
+        fn_params.push(Param(q.span, q.pattern, q.ty, q.default, false, q.variadic, marks))
+        val read = actor_name(q.span, param_name(q))
+        args.push(Argument(q.span, None, if q.variadic then Expr(q.span, Splice(read)) else read, false))
+    var class_ref = actor_name(at, actor_class_name(name))
+    if type_params.len() > 0 then class_ref = Expr(at, TypeApply(class_ref, type_args(type_params)))
+    var start: Buf[&Expr] = buf()
+    start.push(Expr(at, Binding(ActorState, None, Expr(at, Call(class_ref, args)), false)))
+    var receive_args: Buf[Argument] = buf()
+    receive_args.push(Argument(at, None, actor_name(at, ActorMessage), false))
+    var handler_params: Buf[LambdaParam] = buf()
+    handler_params.push(LambdaParam(at, ActorMessage, None))
+    start.push(Expr(at, Lambda(handler_params, Expr(at, Call(Expr(at, Member(actor_name(at, ActorState), ActorReceive)), receive_args)))))
+    var start_params: Buf[LambdaParam] = buf()
+    start_params.push(LambdaParam(at, ActorSelf, None))
+    var behaviour_args: Buf[Argument] = buf()
+    behaviour_args.push(Argument(at, None, Expr(at, StringLit(name)), false))
+    behaviour_args.push(Argument(at, None, Expr(at, Lambda(start_params, Expr(at, Block(start, false)))), false))
+    val result = actors_type(message, "Behaviour")
+    val body = Expr(at, Call(actor_name(at, core_path("actors.Behaviour")), behaviour_args))
+    Function(annotations, span, name_span, name, own_params, fn_params, Some(result), Some(body), buf())
