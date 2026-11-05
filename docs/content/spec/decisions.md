@@ -547,6 +547,18 @@ a decision changes, this page and the chapter change together.
   boundary type is copied into a Sysl slice. Collections nest, inside one another, `Option`,
   `Result` and mirrors' fields. `Array[byte]` stays a bulk copy to and from `[]u8`. No other Avin
   collection crosses.
+- Settled by the user 2026-11-04: **A Sysl function may fill an Avin array** ([Sysl
+  bindings](/spec/sysl-bindings/#filled-arrays)). An `Array` of `byte`, an integer type, `real`,
+  `bool` or `char` that is a binding's own parameter (a handle method's too) is copied into a `[]T`
+  the Sysl function may write, and copied back into the array element by element when it returns;
+  the shim keeps the array as a root of the thread's stack from before the call until the copy
+  back, which runs after the result is made. The representation is a copy, not a view of the
+  array's own elements: the collector never moves an object, but a Sysl slice of memory it does
+  not own has no owner, so a Sysl function that kept it would read freed memory once the call
+  returned; a copy keeps Avin memory out of Sysl. Every other array crossing into Sysl (of other
+  elements, or inside an `Option`, a `Result`, a collection or a mirror's field) goes in as a
+  `[]const T`, so a Sysl type that could write into it is refused at the binding instead of
+  silently losing the writes. A `Vector` stays a `[]T` copy: it never changes, so nothing is lost.
 - `Option[+T]` and `Result[+T, +E]` are `data` types of the core library, written in Avin, with
   their methods in an `impl`. See [errors](/spec/errors/#option-and-result).
 - Settled by the user 2026-11-04 ("follow the reference library"): `Option`, `Either` and `Result`
