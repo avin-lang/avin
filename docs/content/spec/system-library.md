@@ -428,7 +428,22 @@ and in every release; `Random()` is seeded by the platform, differently each tim
 | `nextBytes(n: int) -> Array[byte]` | A new array of `n` bytes; a negative `n` traps. |
 | `alphanumeric() -> Iterator[char]` | An endless run of characters from `A`–`Z`, `a`–`z` and `0`–`9`, equally likely. |
 | `shuffle[T](xs: Iterable[T]) -> Vector[T]` | The elements in a new order, every order equally likely. |
+| `choose[T](items: Seq[T]) -> T` | One of the items, each equally likely; an empty sequence traps. |
+| `chooseWeighted(weights: Seq[real]) -> int` | An index, with probability proportional to its weight; a zero weight is never chosen. An empty sequence, a negative, NaN or infinite weight, and weights whose sum is zero or overflows trap. |
+| `chooseWeighted[T](pairs: Seq[(T, real)]) -> T` | The first of a pair, chosen by the second as above. |
 | `setSeed(seed: long)` | Starts the generator again as `Random(seed)` would. |
+
+**Repeated draws from one distribution use `Weighted`.** `Weighted(pairs)` keeps the running totals
+of the weights, built once with the same checks, and `sample(rng)` draws an item by binary search, in
+O(log n); it draws exactly as `rng.chooseWeighted(pairs)` would. `size()` is the number of items.
+
+```text
+val weather = Weighted([("sun", 6.0), ("rain", 3.0), ("snow", 1.0)])
+val rng = Random(7)
+println(weather.sample(rng))
+```
+
+A chain is a weights row per state: `state = rng.chooseWeighted(rows(state))`.
 
 **The companion is a generator too.** `Random.nextInt(100)` and every other method called on
 `Random` itself use one generator the program shares, seeded by the platform on first use and safe to

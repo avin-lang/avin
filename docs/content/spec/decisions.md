@@ -1660,6 +1660,22 @@ their words are reserved.
 
 ## Proposed
 
+- Weighted choice in [`avin.random`](/spec/system-library/#avin-random), approved in kind by the user
+  2026-11-04, the names and details proposed:
+  - `choose[T](items: Seq[T]) -> T` is uniform (one `nextInt(items.length())`) and traps on an empty
+    sequence. `chooseWeighted(weights: Seq[real]) -> int` answers an index and
+    `chooseWeighted[T](pairs: Seq[(T, real)]) -> T` an item, the two overloaded by parameter type.
+    Both are on `Random` and on the companion's shared generator.
+  - A draw is `nextReal()` times the total of the weights, redrawn while it rounds up to the total,
+    and the answer is the first index whose running total is above it, so a zero weight is never
+    chosen and a seed replays. The traps: no weights, a weight that is negative or NaN, an infinite
+    weight, a total that overflows, a total of zero.
+  - `Weighted[T](pairs)` holds the running totals and the items, built once; `sample(rng: Random) -> T`
+    draws by binary search, O(log n), and `size()` is the number of items. It draws exactly as
+    `chooseWeighted` would from the same generator state. The alias method (O(1) a draw, a
+    different mapping of draws to items) was not taken: the cumulative table keeps one draw per
+    sample and a mapping a reader can follow.
+
 - `Url`'s details ([system library](/spec/system-library/#url)), where the design left them open:
   - `Url` is a `data` type whose `host` is an `Option[string]`, `None` where there is no authority
     (`mailto:a@b`) and `Some("")` where it is empty (`file:///etc`); an IPv6 host keeps its brackets;
