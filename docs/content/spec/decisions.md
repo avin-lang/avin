@@ -3042,7 +3042,87 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- **C bindings, from the FreeType survey** (branch `freetype-design`; [chapter](/spec/c-bindings/)).
+  The user (2026-11-05): *"Yes we'll need a freetype binding to work with cairo."* A third stressor,
+  `avin-lang/freetype`, binds FreeType 2 (`pkg-config freetype2`) to the reference binding's surface,
+  and `avin-lang/cairo` depends on it for Cairo's FreeType font faces (`cairo-ft.h`). This replaces
+  the Cairo survey's "a FreeType binding waits until Cairo's font-face step needs it". Mapping the
+  reference surface onto the chapter found these lacks; each is the smallest addition that covers it:
+  - **A binding may name a handle class of another package** its package depends on: the prototype
+    names the class's own C type or an `as:` type; the class's glue is the declaring package's,
+    compiled once; the package's bindings are checked after the `headers`, and with the `pkg-config`
+    flags, of every package whose handle classes they name, in dependency order; ownership (lent,
+    `keeps:`, `consumes:`, `attach:`, owned and `borrowed` results) crosses unchanged. *Why*:
+    `cairo_ft_font_face_create_for_ft_face` takes FreeType's `FT_Face`, and a header of one library
+    need not include the other's (Cairo's happens to; most do not). *Alternatives*: a third package
+    holding only the shared handle class, which the reference binding needs only to break a
+    dependency cycle Avin does not have; Cairo declaring its own `FT_Face` handle, two handles with
+    two owners and two `release`s on one C object, a double free; trusting each library's header to
+    include the other's.
+  - **A header may be named by a macro**: an entry of `headers` that is a C identifier is emitted
+    as `#include NAME`, defined by an earlier entry, and a macro no earlier header defines is
+    reported at the entry. *Why*: FreeType documents its headers by macro (`#include <ft2build.h>`
+    then `#include FT_FREETYPE_H`), and Cairo's own `cairo-ft.h` includes it so. *Alternatives*:
+    naming the path the macro expands to (`<freetype/freetype.h>`), which the installed FreeType's
+    own `ft2build.h` shows and which needs nothing new, but writes into the manifest a layout that
+    FreeType's macros exist to keep its users out of; a `prelude` string of raw C lines in the manifest, wider than
+    one rule and the start of a C file in HOCON.
+  - **A kept handle whose class declares `retain` is held by a C reference**, taken through that
+    `retain` when the call succeeds and given back through its `release` after the holder's own
+    `release`. *Why*: the collector finalizes the unreachable in address order, so a `Face` and the
+    `Library` it keeps, dead in one collection, may be finalized library first; `FT_Done_FreeType`
+    frees every face still in it, and the face's `FT_Done_Face` then frees one twice. With the
+    reference, `FT_Done_FreeType` only drops a count. MLT's `Consumer` keeping its `Playlist`
+    (`keeps: "source"`) gains the same order. *Alternatives*: ordered finalization in the collector
+    (kept before keeper), which Avin cannot change and which the collector's address-order sweep
+    does not offer; holding the Avin object and taking the order on trust, a use after free whenever
+    a `release` touches what it keeps; making the library's `release` a no-op while faces exist, a
+    count in Avin of what C already counts.
+  - **`kept: "name: Class"` lets a holder's `release:`/`retain:` name what it keeps**, as that
+    handle's C pointer; the class is made only by bindings keeping exactly one handle of that class,
+    and an unused name is refused. *Why*: `FT_Done_MM_Var(library, master)` frees the variation
+    descriptor through a library the descriptor does not record; the face it came from publishes it
+    (`face->glyph->library`), and the C reference above keeps that face valid until after the
+    `release`. *Alternatives*: walking the descriptor into Avin data and freeing it inside one
+    binding, which needs a binding that copies a C struct holding arrays of structs (a larger
+    addition); a `release` taking a second argument from a per-handle C field the runtime stores,
+    the same thing with a less readable spelling; leaving the variation API unbound.
+  - **`keeps:` takes a list** (`keeps: ["library", "base"]`). *Why*: `FT_New_Memory_Face` keeps its
+    library and its memory. *Alternative*: repeating the key, which HOCON merges rather than lists.
+  - **`keeps:` naming an array parameter is refused**, since its C copy lives for the call; memory C
+    keeps is a `ByteBlock`. *Why*: `FT_New_Memory_Face` reads its buffer lazily for the face's
+    life. *Alternative*: pinning the array, which the `ByteBlock` decision already weighed against.
+  - **`length(p)` may mark an `inout` pointer to an integer**: the array's length is written in, C's
+    answer is part of the result, checked to be no more than the length; `None` for an `Option` of
+    the array passes null and zero. *Why*: `FT_Load_Sfnt_Table` takes `FT_ULong *length`, and is
+    called once with no buffer to learn a table's size, then again to fill one. *Alternatives*: an
+    `inout` length the caller passes, which lets the length and the array disagree (a read past the
+    end); a `ByteBlock` sized by a first call, the same disagreement.
+  - **A field accessor may answer a `view`** of a byte-pointer field, `length:` a C expression in
+    `self`. *Why*: the glyph bitmap is `face->glyph->bitmap.buffer`, `|pitch| * rows` bytes the next
+    load replaces; the view's closing on the face's next use is exactly FreeType's rule.
+    *Alternatives*: `bytes:` on a field, a copy of every glyph before the library walks it, which the
+    library could still choose; a glue function per field answering the pointer, the same with more
+    C. The view's bounds check catches the reference binding's `row * pitch` indexing, which reads
+    before the buffer when `pitch` is negative.
+  - **Cairo's FreeType font face is an `attach:` class keeping the `Face`.** Cairo keeps the
+    `FT_Face` without a reference, documents that it must outlive every font face made from it, and
+    asks for it to be given back from `cairo_font_face_set_user_data`'s destructor; contexts and
+    scaled fonts reference the font face, so `keeps:` on the Avin handle is not enough. The destroy
+    unpins the record and the `Face` is then finalized as usual. *Alternative*: a destroy that calls
+    `FT_Done_Face` itself, from whatever thread drops the last reference, while an Avin `Face` may
+    still be in use: FreeType's face count is not atomic.
+  - **`FT_Error_String` binds as `Option[string]`**, and the library carries its own names for the
+    codes, as `@c(const:)` values of `fterrors.h`'s `FT_Err_*`. *Why*: Homebrew's FreeType is built
+    without `FT_CONFIG_OPTION_ERROR_STRINGS`, so the function answers null there.
+  - **The test font is Kaisei Decol Regular**, from the reference repository, under the SIL Open
+    Font License 1.1 (Copyright 2020 The Kaisei Project Authors, no Reserved Font Name), bundled
+    with its `OFL.txt` in the package's tests. *Alternative*: a smaller OFL Latin font (4.4 MB is
+    large for a test fixture), at the cost of a font the reference program's output was not made
+    with. **Review with the user**: the fixture's size.
+  - Left out: `cairo_ft_font_options_substitute`, which takes a fontconfig `FcPattern *` and waits on
+    a fontconfig binding; `FT_Outline_Decompose` and the other callback APIs, which the reference
+    binding does not reach.
 
 ## Open
 
