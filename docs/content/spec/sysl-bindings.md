@@ -276,6 +276,26 @@ readText(file: string) -> Result[string, IoError]
   each direction as an [integer result](#integer-results) is: Avin has no unsigned integers, so
   Sysl's `usize` offset above is a `long`, and a value the other side's type cannot hold stops the
   program where the binding was called. A collection field is copied as a binding's collection is.
+- **A field may be a [handle](#handles)**, by itself — not in an `Option`, a collection or a tuple.
+  Into Sysl it is passed as a handle parameter is, with the same checks: a closed handle, or one
+  another thread owns, stops the program where the binding was called. Out of Sysl each such field
+  becomes a handle of its own, as a binding's handle result does. Sysl's `sysl.process.Stdio` holds a
+  `File` in `ToFile` and `FromFile`, so the ends of a pipe reach a child's streams:
+
+  ```text
+  @sysl("sysl.fs.File")
+  class File
+      closed() -> bool
+
+  @sysl("sysl.process.Stdio")
+  data Stdio
+      Inherit
+      ToFile(file: File)
+      ToPath(path: string)
+      FromFile(file: File)
+      FromPath(path: string)
+  ```
+
 - A mirror has no type parameters, and none of its fields holds the mirror itself, directly or
   through an `Option`, a `Result`, a collection or another mirror.
 
@@ -323,8 +343,9 @@ parseBigInt(s: string) -> Option[BigInt]
 - **A handle goes back into Sysl by itself**: as the receiver of its own methods, or as a parameter
   of a binding or of another handle's method. A Sysl type with a destructor is always held by a
   counted reference, and its parameter shares the handle's; a type without one is passed as the
-  Sysl parameter takes it — by value, a copy, or as a pointer to the handle's own value. A handle
-  inside an `Option`, a collection or a tuple does not go into Sysl, and no mirror holds one; a
+  Sysl parameter takes it — by value, a copy, or as a pointer to the handle's own value. A
+  [mirror's field](#mirrors) that is a handle is passed the same way. A handle inside an `Option`, a
+  collection or a tuple does not go into Sysl, nor is it a mirror's field; a
   tuple holding a handle crosses out of Sysl as a result, the value of its `Option` or `Result`, or
   a part of a tuple that is one of these, as `accept` answers `Result[(Socket, Address), IoError]`,
   and never sits in a collection. Its Sysl value's fields are not the handle's members.
@@ -346,8 +367,8 @@ parseBigInt(s: string) -> Option[BigInt]
   ```
 
 - **`close()` gives the value back.** Every handle has it. Closing again does nothing; a bound method
-  called on a closed handle, or a closed handle passed to Sysl as a parameter, stops the program at
-  the call:
+  called on a closed handle, or a closed handle passed to Sysl as a parameter or a mirror's field,
+  stops the program at the call:
 
   ```text
   avin: trap: `Crc32` is closed at main.avin:18:13
@@ -358,8 +379,8 @@ parseBigInt(s: string) -> Option[BigInt]
   something scarce, such as a file, is closed.
 - **A handle belongs to one owner at a time.** Its Sysl value is held by a counted reference whose
   count is not atomic, so a handle is never used by two threads at once. Each handle records its
-  owner, the code that made it, and every use — a bound method, the handle passed as a parameter,
-  `close()` — compares it with the owner of the code running and stops the program at the call where
+  owner, the code that made it, and every use — a bound method, the handle passed as a parameter or
+  a mirror's field, `close()` — compares it with the owner of the code running and stops the program at the call where
   they differ:
 
   ```text

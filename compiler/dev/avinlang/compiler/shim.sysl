@@ -111,7 +111,19 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
             gather(&w, p, false)
         gather(&w, b.result, true)
     val converts = w.ins.len() + w.outs.len() > 0 || uses_bytes(bindings)
+    // A handle a mirror's field holds into Sysl is checked by a helper of its own.
+    var held: Buf[bool] = buf()
+    for _ in 0..<w.mirrors.len()
+        held.push(false)
+    var holds = false
+    for c in w.ins
+        for v in c.variants
+            for f in v.fields
+                if f.crossing.form is Handle(_)
+                    held[handle_index(&w, f.crossing)] = true
+                    holds = true
     put(&w, "module avin.shims\n\nimport avin.rt.{Context, stop_in_binding, text_bytes, text_length, text_of}\nimport sysl.raw.str_cast\n")
+    if holds then put(&w, "import avin.rt.handle_claim\n")
     if converts then put(&w, "import avin.rt.{Frame, allocate, array_elements, array_length, descriptor_of, new_array}\nimport sysl.raw.ptr_cast\nimport sysl.slices.copy\n")
     elif handles.len() > 0 then put(&w, "import sysl.raw.ptr_cast\n")
     var blocks = false
@@ -149,7 +161,7 @@ shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
         for k in 0..<b.params.len()
             if b.params[k].form is Handle(_) && (k > 0 || b.reach is TopLevel) then passed[handle_index(&w, b.params[k])] = true
     for m in 0..<w.mirrors.len()
-        if w.mirrors[m].finalizer != "" then handle_lines(&w, m, passed[m])
+        if w.mirrors[m].finalizer != "" then handle_lines(&w, m, passed[m] || held[m], held[m])
     for i in 0..<bindings.len()
         val b = bindings[i]
         put(&w, "\n")
@@ -474,7 +486,8 @@ private copy_back(w: *ShimWriter, p: &Crossing, k: usize, indent: string)
 // they include, each once.
 private gather(w: *ShimWriter, c: &Crossing, out: bool)
     if c.form is Plain || c.form is Bytes then return
-    // A handle goes into Sysl only as its method's receiver, which the method's shim reads itself.
+    // A handle goes into Sysl by itself, a parameter, a receiver or a mirror's field, which the shim
+    // reads through the handle's own helpers rather than a conversion.
     if c.form is Handle(_) && !out then return
     if function_of(w, c, out) is Some(_) then return
     if out then w.outs.push(c) else w.ins.push(c)
@@ -518,7 +531,10 @@ private handle_index(w: *ShimWriter, c: &Crossing) -> usize = mirror_of(w, c).un
 // read by two helpers: one answering its slot, whose reference a parameter of a type with a
 // destructor shares, and one answering it as the parameter's type `P` asks, a pointer to the value
 // or the value itself, which `P` is when the parameter is the value or a counted reference to one.
-private handle_lines(w: *ShimWriter, m: usize, passed: bool)
+// Where a mirror's field holding the handle goes into Sysl, it is `held`: a third helper checks the
+// handle as compiled code checks one passed as a parameter, stopping the program at the call where it
+// belongs to another thread or holds nothing, and the field is then passed as a parameter is.
+private handle_lines(w: *ShimWriter, m: usize, passed: bool, held: bool)
     val start = w.line + 1
     put(w, s"\n// The handle `${w.mirrors[m].name}`'s object.\nprivate struct Slot_$m\n    r: &mirror_$m\n    owner: u64\n")
     put(w, s"\n@export(\"${w.mirrors[m].finalizer}\")\nfinalize_$m(p: *u8, heap: *u8)\n    val s: *Slot_$m = ptr_cast(p)\n    release(s.r)\n")
@@ -528,6 +544,9 @@ private handle_lines(w: *ShimWriter, m: usize, passed: bool)
     put(w, s"\nprivate slot_$m(p: *u8) -> *Slot_$m = ptr_cast(p)\n")
     put(w, s"\nprivate passed_$m[P](p: *u8) -> P\n    val s: *Slot_$m = ptr_cast(p)\n    if const P::Kind == Kind.Ref\n        s.r\n    elif const P::Kind == Kind.Pointer\n        &*s.r\n    else\n        *s.r\n")
     put(w, s"\nprivate given_$m[P](r: &mirror_$m) -> P\n    if const P::Kind == Kind.Ref\n        r\n    elif const P::Kind == Kind.Pointer\n        &*r\n    else\n        *r\n")
+    if held
+        val name = w.mirrors[m].name
+        put(w, s"\nprivate held_$m(ctx: *Context, p: *u8) -> *u8\n    val s: *Slot_$m = ptr_cast(p)\n    if s.owner != ctx.owner && !handle_claim(ctx, p) then stop_in_binding(ctx, \"`$name` belongs to another thread\")\n    val word: *usize = ptr_cast(p)\n    if word[0] == 0 then stop_in_binding(ctx, \"`$name` is closed\")\n    p\n")
     w.passing.push(MirrorLines(m, helpers, w.line - 1))
 
 // The Sysl type a value of `c`'s type is converted to. A collection goes into Sysl as a slice, and an
@@ -705,16 +724,55 @@ private in_function(w: *ShimWriter, k: usize)
         val indent = if lastly then "    " else "        "
         if !lastly then put(w, s"    if tag == ${t}usize\n")
         var args: Buf[string] = buf()
+        var handles: Buf[PassedHandle] = buf()
+        var types: Buf[usize] = buf()
         for i in 0..<v.fields.len()
             val f = v.fields[i]
             f.offset match
                 Some(offset) ->
                     put(w, indent + s"val q$i: *${crossing_c_side(f.crossing)} = ptr_cast(usize(p) + ${offset}usize)\n")
-                    if mirrored && *f.crossing.ty is Int(_) then args.push(s"integer_to(ctx, q$i[0], \"the Sysl field `${f.name}`\")")
+                    if f.crossing.form is Handle(_)
+                        val m = handle_index(w, f.crossing)
+                        put(w, indent + s"val h$i = held_$m(ctx, q$i[0])\n")
+                        handles.push(PassedHandle(args.len(), m, s"h$i"))
+                        if !has_mirror(types, m) then types.push(m)
+                        args.push("")
+                    elif mirrored && *f.crossing.ty is Int(_) then args.push(s"integer_to(ctx, q$i[0], \"the Sysl field `${f.name}`\")")
                     else args.push(into_expr(w, f.crossing, s"q$i[0]", "ds", f.base))
                 None -> args.push("()")
-        put(w, indent + (if lastly then "" else "return ") + construction(w, c, v, args) + "\n")
+        construction_arms(w, c, v, args, handles, types, 0, buf(), if lastly then "" else "return ", indent)
     mirror_lines(w, c, start)
+
+// Whether `items` holds `m`.
+private has_mirror(items: Buf[usize], m: usize) -> bool
+    for i in items
+        if i == m then return true
+    false
+
+// The construction of `c`'s variant `v` from `args`, after `prefix`, written once for each choice of
+// the handles' types `types` from `depth` on having a destructor or not, as `call_arms` writes a call:
+// a handle field is passed as a parameter is, its reference shared where its type has a destructor
+// and otherwise given as the field's type asks.
+private construction_arms(w: *ShimWriter, c: &Crossing, v: CrossVariant, args: Buf[string], handles: Buf[PassedHandle], types: Buf[usize], depth: usize, dropped: Buf[usize], prefix: string, indent: string)
+    if depth == types.len()
+        var given: Buf[string] = buf()
+        for k in 0..<args.len()
+            var arg = args[k]
+            for h in handles
+                if h.arg != k then continue
+                arg = if has_mirror(dropped, h.mirror) then s"slot_${h.mirror}(${h.name}).r" else s"passed_${h.mirror}(${h.name})"
+            given.push(arg)
+        put(w, indent + prefix + construction(w, c, v, given) + "\n")
+        return
+    val m = types[depth]
+    var with: Buf[usize] = buf()
+    for d in dropped
+        with.push(d)
+    with.push(m)
+    put(w, indent + s"if const mirror_$m: Drop\n")
+    construction_arms(w, c, v, args, handles, types, depth + 1, with, prefix, indent + "    ")
+    put(w, indent + "else\n")
+    construction_arms(w, c, v, args, handles, types, depth + 1, dropped, prefix, indent + "    ")
 
 // The conversion out of Sysl of a value of the `k`th data type that crosses that way: each variant
 // is made by its layout, among the ones `ds` points at, and each field converted and stored at its
@@ -735,7 +793,8 @@ private out_function(w: *ShimWriter, k: usize)
         put(w, s"private out_$k[V](ctx: *Context, v: V, ds: **u8) -> *u8\n    val o = allocate(ctx, ptr_cast(ds[0]))\n    val s: *Slot_$m = ptr_cast(o)\n    s.r = v\n    s.owner = ctx.owner\n    o\n")
         w.mirror_lines.push(MirrorLines(m, start, w.line - 1))
         return
-    if holds_handle(c) then out_overload(w, k, c, "", "")
+    // A mirror is its one Sysl type, whatever its fields hold.
+    if holds_handle(c) && !(c.form is Mirror(_, _, _, _, _)) then out_overload(w, k, c, "", "")
     else
         // A conversion that holds an integer is generic in the Sysl integer type of each.
         var n = 0usize
