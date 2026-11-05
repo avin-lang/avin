@@ -946,11 +946,11 @@ a buffer's vacated capacity keeps nothing alive.
 
 **Sequence literals** (`sequence_literal` in `check.sysl`) are checked against the expected type. A
 `List` is built as `::` chains (`list_literal`). Otherwise the collection is the expected class
-whose companion object has a `builder` method, or else the core library's `Vector`, looked up by
+whose companion object has a `newBuilder` method, or else the core library's `Vector`, looked up by
 qualified name so a program's own `Vector` never takes its place. The literal becomes a block: a
-hidden local holding `Companion.builder()`, one `add` call per element, and `result()`. The result
-type is unified with the expected type, or with the instance of the expected trait the collection
-is (`ancestor_type`), which settles the element type, and the elements are then checked as `add`'s
+hidden local holding `Companion.newBuilder()`, one `addOne` call per element, and `result()`. The
+result type is unified with the expected type, or with the instance of the expected trait the
+collection is (`ancestor_type`), which settles the element type, and the elements are then checked as `addOne`'s
 arguments. With no element type expected, each element is checked alone and their types are joined
 as `if` branches are, the narrower references passed as the joined type. The builder's open type
 argument is recorded with a message about empty literals, so a later use may settle it.

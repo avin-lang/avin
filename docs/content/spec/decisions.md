@@ -203,17 +203,23 @@ a decision changes, this page and the chapter change together.
   methods from the library through `impl string`, conforms to traits through `impl`, and is matched
   by the type pattern `s: string` like any other type.
 - Settled 2026-11-03: the library's [string methods](/spec/types/#string) are `byteLength`,
-  `charCount`, `isEmpty`, `nonEmpty`, `startsWith`, `endsWith`, `contains`, `slice`, `toUpper`,
-  `toLower`, `trim`, `trimStart`, `trimEnd`, `repeat` and `replace`. A slice traps at its call
-  when its offsets are out of order or outside the string, or either falls inside a character;
-  `repeat` traps on a negative count. Casing is the simple mapping, one character for one; trimming
-  removes Unicode `White_Space`; `replace` replaces every occurrence, left to right and not
+  `charCount`, `isEmpty`, `nonEmpty`, `startsWith`, `endsWith`, `contains`, `slice`,
+  `toUpperCase`, `toLowerCase`, `trim`, `strip`, `stripLeading`, `stripTrailing`, `repeat`,
+  `replace` and `padTo` beside `padStart` and `padEnd`, with the reference library's names (user,
+  2026-11-04). A slice traps at its call when its offsets are out of order or outside the string, or
+  either falls inside a character; `repeat` traps on a negative count. Casing is the simple mapping,
+  one character for one; stripping removes Unicode `White_Space`, and `trim`, as the reference's,
+  the characters up to U+0020; `replace` replaces every occurrence, left to right and not
   overlapping, and an empty pattern occurs nowhere. Methods yielding a collection or iterator
   (`split`, `chars`, `bytes`) wait for the collections.
 - Settled 2026-11-03: a built-in type's impl in the core library may declare a method as an
   `@intrinsic`, whose type takes the receiver first.
-- Settled 2026-11-03: the string methods answering with `Option` are `indexOf` (with an optional
-  starting offset), `lastIndexOf`, `toInt`, `toLong` and `toReal`. Offsets are bytes. A number is read
+- Settled 2026-11-03, the searches revised 2026-11-04 by the user: `indexOf` (with an optional
+  starting offset), `lastIndexOf` (with an optional last offset), `indexWhere` (with an optional
+  starting offset) and `lastIndexWhere` answer a byte offset, -1 when there is none, as the reference
+  library's do, and so do a sequence's `indexOf`, `indexWhere`, `lastIndexOf` and `lastIndexWhere`,
+  each with the same optional bound. The string methods answering with `Option` are `toInt`, `toLong`
+  and `toReal`. Offsets are bytes. A number is read
   whole: `toInt` and `toLong` take an optional `+` or `-` and ASCII digits, so `"+3"` is 3 and
   `"-0"` is 0, and refuse white space, separators and overflow (`"-9223372036854775808"` is a
   `long`); `toReal` is correctly rounded, takes decimal only, and refuses white space, `nan`, `inf`,
@@ -222,10 +228,10 @@ a decision changes, this page and the chapter change together.
   behaviour unless it genuinely improves on it. `Option` has `isDefined`, `isEmpty` and `nonEmpty`
   (not `isSome`/`isNone`), `get` (trapping on `None`) and `filterNot`; there is no `orNull`, since
   there is no null. `char` has `isDigit`, `isLetter`, `isLetterOrDigit`, `isWhitespace`,
-  `isSpaceChar`, `isUpper`, `isLower`, `isControl`, `toUpper`, `toLower` and `asDigit`, classifying
-  by the Unicode Character Database. `isWhitespace` is true for the space separators except the
-  non-breaking ones (U+00A0, U+2007, U+202F) and for U+0009 to U+000D and U+001C to U+001F, so it
-  differs from `trim`'s `White_Space`; `isSpaceChar` is the categories `Zs`, `Zl` and `Zp`.
+  `isSpaceChar`, `isUpper`, `isLower`, `isControl`, `toUpperCase`, `toLowerCase` and `asDigit`,
+  classifying by the Unicode Character Database. `isWhitespace` is true for the space separators
+  except the non-breaking ones (U+00A0, U+2007, U+202F) and for U+0009 to U+000D and U+001C to
+  U+001F, so it differs from `strip`'s `White_Space`; `isSpaceChar` is the categories `Zs`, `Zl` and `Zp`.
   `asDigit` is the digit's value in radix 36 (Unicode decimal digits give their value, ASCII and
   fullwidth letters give 10 to 35) and is -1 for any other character, never a trap.
 - Settled by the user 2026-11-04 ([collections](/spec/collections/#maps-and-sets)): `Map[K, +V]` and
@@ -572,8 +578,8 @@ a decision changes, this page and the chapter change together.
 - `?` returns from the function or lambda it is written in, so that one's result type must be
   declared or, for a lambda, known where it is written. It cannot leave a delayed argument or a class
   body.
-- Builders are the trait `Builder[-A, +C]` (`add`, `addAll`, `result`); a collection's companion
-  object makes one with `builder[T]()`, and a sequence literal is built through the expected
+- Builders are the trait `Builder[-A, +C]` (`addOne`, `addAll`, `result`); a collection's companion
+  object makes one with `newBuilder[T]()` (the reference library's names, user 2026-11-04), and a sequence literal is built through the expected
   collection's, so a program's own class with such a companion is written as a literal too. A `List`
   literal is built from the back with `::`, since `List` is a data type.
 - A collection literal compared with `==`, `!=` or an ordering takes the other operand's type.
@@ -593,7 +599,7 @@ Settled by the user on 2026-11-03:
   as a `data` type's are not: such an instance holds nothing a method could store a value into. A
   class with a `var` field keeps every method a position.
 - A one-variant `data` type may have a companion `object`, as a class may: the name in call position
-  is the constructor and `Name.member` the companion (`Map.empty`, `Map.builder`, `List.builder`).
+  is the constructor and `Name.member` the companion (`Map.empty`, `Map.newBuilder`, `List.newBuilder`).
 - An `impl` may add methods for some type arguments only: `impl[T: Display] List[T]` gives
   `mkString` to lists of displayable elements, and calling it on any other list is an error.
 - The integers are one family: a closed core trait `Integer`, whose members the compiler decides (every
@@ -641,9 +647,9 @@ Settled by the user on 2026-11-03:
   type of its module is its companion. A variant of the type's own name stays the constructor in call
   position; a type with no such variant (`List`) has nothing of its name to call. An object cannot
   share its name with a variant of another type, nor with a fieldless variant of its own type's name.
-  A `builder` returning a `Builder` of its collection takes its type arguments from the type a
+  A `newBuilder` returning a `Builder` of its collection takes its type arguments from the type a
   literal expects, so their bounds are checked at the call.
-- A collection literal builds whatever collection is expected through its companion's `builder`: a
+- A collection literal builds whatever collection is expected through its companion's `newBuilder`: a
   sequence literal a sequence, a set literal `{a, b}` a set and a map literal `{k: v}` a map, giving
   the builder each entry as a `(key, value)` pair; with no expected collection they are a `Vector`, a
   `Set` and a `Map`.
@@ -651,9 +657,12 @@ Settled by the user on 2026-11-03:
   `product` of an empty collection are those values rather than an `Option`. They are written once,
   by impls on `Iterable` (`impl[T: Add] Iterable[T]`, `impl[T: Mul] Iterable[T]`).
 - `Seq[+T]` is a core trait over `Iterable[T]` with two abstract methods, `length()` and
-  `apply(index)`; its other methods (`get`, `isEmpty`, `head`, `headOption`, `last`, `lastOption`,
+  `apply(index)`; its other methods (`lift`, `isEmpty`, `head`, `headOption`, `last`, `lastOption`,
   the folds, `foreach`, `exists`, `forall`, `find`, `indexWhere`, `count`, `toVector`, `toList`, an
-  iterator and `reverseIterator`) are default bodies written once over those two. `List` is a `Seq`
+  iterator and `reverseIterator`) are default bodies written once over those two. `head`,
+  `headOption`, `last` and `lastOption` are `Iterable`'s own, written over `iterator()` for every
+  collection (user, 2026-11-04, as the reference library has them), and a sequence and a sorted
+  collection override them to reach the end at once. `lift(i)` is the element as an `Option`. `List` is a `Seq`
   and overrides every one that would index into it, so none takes more than linear time on a list.
   `contains` and `indexOf`, which take an element, and `mkString`, `max` and `min`, which need
   something of the elements, are added to `Seq` by impls (`impl[T] Seq[T]`, `impl[T: Display]
@@ -1076,7 +1085,7 @@ Settled by the user on 2026-11-04:
   empty map, whichever is expected. A program's own collection with a builder is built by any
   literal whose elements its builder takes, a map literal only by a builder of pairs. A map literal's
   keys agree on one type and its values on another, each as `if` branches do. The mutable `Set` and
-  `Map` gain companions with `empty` and `builder`.
+  `Map` gain companions with `empty` and `newBuilder`.
 - Settled by the user 2026-11-04: Packages ([packages](/spec/packages/)), modelled on Sysl's package system:
   - **The manifest**: `package { name, version, description }`, `dependencies { … }` and `workspace
     = [ … ]`, and no other key; an unknown key is an error, not a warning. A name is a lowercase

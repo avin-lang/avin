@@ -89,11 +89,11 @@ A `char` has these methods, classifying by the Unicode Character Database:
 | `isDigit()` | A decimal digit of any script (category `Nd`) |
 | `isLetter()` | A letter of any script (categories `Lu`, `Ll`, `Lt`, `Lm`, `Lo`) |
 | `isLetterOrDigit()` | `isLetter()` or `isDigit()` |
-| `isWhitespace()` | A space separator other than the non-breaking ones (U+00A0, U+2007, U+202F), or U+0009 to U+000D, or U+001C to U+001F; this is not `trim`'s test, which is the `White_Space` property and so counts U+00A0 |
+| `isWhitespace()` | A space separator other than the non-breaking ones (U+00A0, U+2007, U+202F), or U+0009 to U+000D, or U+001C to U+001F; this is not `strip`'s test, which is the `White_Space` property and so counts U+00A0 |
 | `isSpaceChar()` | A character of category `Zs`, `Zl` or `Zp` |
 | `isUpper()`, `isLower()` | Cased and upper, cased and lower |
 | `isControl()` | U+0000 to U+001F and U+007F to U+009F |
-| `toUpper()`, `toLower()` | The simple case mapping, one character for one: `'ß'.toUpper()` is `'ß'` |
+| `toUpperCase()`, `toLowerCase()` | The simple case mapping, one character for one: `'ß'.toUpperCase()` is `'ß'` |
 | `asDigit()` | The digit's value in radix 36: a decimal digit of any script gives its value, an ASCII or fullwidth letter, either case, gives 10 to 35; any other character gives -1 |
 
 ## string
@@ -125,13 +125,14 @@ most the largest `int` bytes.
 | `startsWith(p, at)` | Whether `p` occurs at byte offset `at`; false when it would reach outside the string |
 | `byteAt(at)`, `charAt(at)` | The byte at offset `at`, and the character whose encoding begins there; each traps when `at` is outside the string |
 | `slice(from, until)` | The bytes from `from` up to `until`; traps unless `0 <= from <= until <= byteLength()` and both offsets are character boundaries |
-| `toUpper()`, `toLower()` | Each character's simple case mapping, one character for one: `"straße".toUpper()` is `STRAßE` |
-| `trim()`, `trimStart()`, `trimEnd()` | Without the Unicode `White_Space` characters at both ends, the start, the end |
+| `toUpperCase()`, `toLowerCase()` | Each character's simple case mapping, one character for one: `"straße".toUpperCase()` is `STRAßE` |
+| `strip()`, `stripLeading()`, `stripTrailing()` | Without the Unicode `White_Space` characters at both ends, the start, the end |
+| `trim()` | Without the characters up to U+0020, the ASCII controls and the space, at both ends |
 | `repeat(n)` | `n` copies joined; empty for zero; traps when `n` is negative |
 | `replace(old, new)` | Every occurrence of `old`, left to right and not overlapping, replaced by `new`; an empty `old` occurs nowhere |
-| `indexOf(p)`, `indexOf(p, from)` | `Some` of the byte offset of the first `p`, at or after `from` (default 0; below 0 counts as 0); `None` when there is none or `from` is past the end. The empty string is found at `from` |
-| `lastIndexOf(p)` | `Some` of the byte offset of the last `p`; `None` when there is none. The empty string is found at `byteLength()` |
-| `chars()` | The characters, in order, as a `Vector[char]` |
+| `indexOf(p)`, `indexOf(p, from)` | The byte offset of the first `p`, at or after `from` (default 0; below 0 counts as 0); -1 when there is none or `from` is past the end. The empty string is found at `from` |
+| `lastIndexOf(p)`, `lastIndexOf(p, end)` | The byte offset of the last `p` beginning at or before `end` (default `byteLength()`); -1 when there is none. The empty string is found at `end`, or at `byteLength()` when `end` is past it |
+| `indexWhere(f)`, `indexWhere(f, from)`, `lastIndexWhere(f)` | The byte offset of the first character satisfying `f`, at or after `from`, or of the last; -1 when none does || `chars()` | The characters, in order, as a `Vector[char]` |
 | `bytes()` | The bytes of the encoding, in order, as a `Vector[byte]` |
 | `count(p)` | The number of characters satisfying `p` |
 | `split(sep)` | The pieces between the occurrences of `sep`, as a `Vector[string]`; empty pieces are kept (`",a,,b,".split(",")` has five pieces), and a string without `sep` is one piece. An empty `sep` traps |
@@ -139,6 +140,7 @@ most the largest `int` bytes.
 | `isBlank()` | Whether it has only `White_Space` characters, so the empty string is blank |
 | `reverse()` | The characters in the opposite order |
 | `padStart(w, c)`, `padEnd(w, c)` | At least `w` characters, `c` (default `' '`) repeated before, after; `w` counts characters, not bytes, and a string already that long is unchanged |
+| `padTo(n, c)` | As `padEnd(n, c)`, the name a sequence's padding has |
 | `equalsIgnoreCase(o)` | Whether the two are equal after each character's simple lower-case mapping |
 | `take(n)`, `drop(n)` | The first `n` characters, all but the first `n`; `n` counts characters, not bytes, and is clamped to the string, so 0 or less takes none |
 | `takeRight(n)`, `dropRight(n)` | The last `n` characters, all but the last `n` |

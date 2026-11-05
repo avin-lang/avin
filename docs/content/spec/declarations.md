@@ -845,7 +845,7 @@ object Point
     origin() -> Point = Point(0, 0)
 
 object List
-    builder[T]() -> ListBuilder[T] = ListBuilder()
+    newBuilder[T]() -> ListBuilder[T] = ListBuilder()
 ```
 
 ### A companion's `apply`

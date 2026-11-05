@@ -88,7 +88,9 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
 
 ## Methods every Iterable has
 
-Impls add these to `Iterable`, each written once over `iterator()`, so every collection has them:
+`Iterable` itself gives `head()`, `last()` and their `Option` forms, which a sequence and a sorted
+collection override to reach the end at once. Impls add the rest to `Iterable`, each written once
+over `iterator()`, so every collection has them:
 lists, vectors, arrays, buffers, deques, ranges, sets, maps (whose elements are their entries, as
 `(key, value)` pairs), the mutable sets and maps, iterators, and a class of the program's own that
 conforms to `Iterable`. They visit the elements in iteration order. On an iterator they consume it.
@@ -100,6 +102,8 @@ Collections they make are vectors, maps and sets; n is the number of elements.
 | Method | Result | Cost |
 |---|---|---|
 | `isEmpty()`, `nonEmpty()` | `bool` | O(1) |
+| `head()`, `last()` | `T`, the first and the last in iteration order; trap when empty | `head` O(1); `last` O(n), O(1) on a sequence or a sorted collection |
+| `headOption()`, `lastOption()` | `Option[T]`, `None` when empty | as `head` and `last` |
 | `foldLeft(initial, f)` | `B` | O(n) |
 | `reduce(f)` | `T`; traps when empty | O(n) |
 | `reduceOption(f)` | `Option[T]`, `None` when empty | O(n) |
@@ -215,12 +219,13 @@ deque and a range answer in the same time as a list, which walks from its front.
 | `scanLeft(initial, f)` | `Vector[B]`: `initial` and each partial fold, n + 1 | | O(n) |
 | `grouped(size)` | `Iterator[Vector[T]]`; the last may be shorter; size < 1 traps | | O(n) |
 | `sliding(size, step = 1)` | `Iterator[Vector[T]]`; ends with the first window to reach the last element, which may be shorter; size or step < 1 traps | | O(n) to copy the elements, then O(log n) a window |
-| `lastIndexOf(x)`, `lastIndexWhere(p)` | `Option[int]` | | O(n), by `reverseIterator()` |
+| `indexOf(x)`, `indexWhere(p)`, each also `(…, from)` | `int`, the first index at or after `from`; -1 when none | | O(n) |
+| `lastIndexOf(x)`, `lastIndexWhere(p)`, each also `(…, end)` | `int`, the last index at or before `end`; -1 when none | | O(n), by `reverseIterator()` |
 | `startsWith(prefix)`, `endsWith(suffix)` | `bool` | | O(m), plus `length()` for `endsWith` |
 | `sameElements(other)` | `bool`: as many, each equal in order | | O(min(n, m)) |
 
-Each also has `length()`, `apply(i)`, `get(i)`, `head()`, `last()` and their `Option` forms,
-`indexWhere`, `indexOf`, `contains`, `foldRight`, `reverseIterator()`, the sorts
+Each also has `length()`, `apply(i)`, `lift(i)` (the element as an `Option`), `head()`, `last()` and
+their `Option` forms read by index, `contains`, `foldRight`, `reverseIterator()`, the sorts
 ([sorting](#sorting)), `mkString`, `min` and `max`, besides everything an `Iterable` has.
 
 ```text
@@ -236,12 +241,12 @@ s.takeWhile(x -> x < 3)                      // a Vector: [1, 2]
 
 ## Builders
 
-Every collection type has a **builder**, through one library trait: `List.builder[int]()`,
-`Vector.builder[string]()`, `Set.builder[A]()`. A builder takes elements with `add(x)` and
+Every collection type has a **builder**, through one library trait: `List.newBuilder[int]()`,
+`Vector.newBuilder[string]()`, `Set.newBuilder[A]()`. A builder takes elements with `addOne(x)` and
 `addAll(xs)`, and `result()` hands over the finished collection; the builder is then spent, and using
 it again traps. Transformations, conversions such as `toList()` and collection literals all build
 through builders, and code that assembles a collection element by element uses one too. The trait
-is `Builder[-A, +C]`: `add(element: A)`, `addAll(elements: Iterable[A])`, which adds each in turn
+is `Builder[-A, +C]`: `addOne(element: A)`, `addAll(elements: Iterable[A])`, which adds each in turn
 unless a builder does better, and `result() -> C`.
 
 A builder is how an immutable collection is built efficiently without being mutable itself. `List`'s
@@ -250,8 +255,8 @@ order needs neither a second mutable list type nor a `reverse()` at the end:
 
 ```text
 squares(n: int) -> List[int]
-    val b = List.builder[int]()
-    for i in 1..n do b.add(i * i)
+    val b = List.newBuilder[int]()
+    for i in 1..n do b.addOne(i * i)
     b.result()
 ```
 
@@ -259,8 +264,8 @@ squares(n: int) -> List[int]
 
 `Map[K, +V]` and `Set[A]` are traits, the immutable maps and sets: a function over `Map[string, int]`
 takes a `HashMap` or a `TreeMap`. A map literal `{"a": 1}`, `Map((k, v), …)`, `Map.empty` and
-`Map.builder` make a `HashMap`, typed as a `Map`, and `{1, 2}`, `Set(…)`, `Set.empty` and
-`Set.builder` a `HashSet`, typed as a `Set`; `HashMap` and `HashSet` have companions of their own
+`Map.newBuilder` make a `HashMap`, typed as a `Map`, and `{1, 2}`, `Set(…)`, `Set.empty` and
+`Set.newBuilder` a `HashSet`, typed as a `Set`; `HashMap` and `HashSet` have companions of their own
 for a value typed as the hash-based kind.
 
 `HashMap` and `HashSet` find keys by their hash and compare them with `==`. Every type has both, so
@@ -388,7 +393,7 @@ println(small.rangeUntil(4))        // {1, 3}
 println(small.rangeTo(3))           // {1, 3}
 ```
 
-`TreeMap.empty`, `TreeMap.builder` and `TreeMap((k, v), …)`, and the same for `TreeSet`, make them as
+`TreeMap.empty`, `TreeMap.newBuilder` and `TreeMap((k, v), …)`, and the same for `TreeSet`, make them as
 their hash-based counterparts' companions do, and a set or map literal builds one where one is expected.
 `SortedMap` and `SortedSet` have the same companions, making tree collections typed as the sorted
 traits, and a literal where a `SortedMap` or `SortedSet` is expected builds a tree collection.
@@ -396,7 +401,7 @@ traits, and a literal where a `SortedMap` or `SortedSet` is expected builds a tr
 ## Indexing and callable sequences
 
 A `Seq[A]` is a function from index to element: `xs(i)` reads an element. Mutable sequences assign
-with `xs(i) = v`. An index out of bounds traps; `xs.get(i)` returns an `Option`. Square brackets
+with `xs(i) = v`. An index out of bounds traps; `xs.lift(i)` returns an `Option`. Square brackets
 never index; they are for types and literals.
 
 ## Collections as functions
@@ -446,7 +451,7 @@ val none = Array.empty[string]()
 ```
 
 `Array[int]()` is an error. `xs.length()` is the length, which never changes; `xs.slice(from, until)`
-and `xs.copy()` make new arrays; `xs.get(i)` is an `Option`. `xs(i) += 1`, `xs(i) := v` and `xs(i)++`
+and `xs.copy()` make new arrays; `xs.lift(i)` is an `Option`. `xs(i) += 1`, `xs(i) := v` and `xs(i)++`
 work as they do on a variable, evaluating `xs` and `i` once. Because a call with untyped arguments
 before `=` assigns an element, a local function's declaration always types its parameters or has
 none: `f(x) = 1` is the assignment `f.update(x, 1)`.
@@ -480,7 +485,7 @@ front of a `List[Dog]` where a `List[Animal]` is expected.
 Every operation on a list loops over it rather than recursing, so a list of any length is traversed,
 transformed, compared and hashed without deepening the stack; a method that yields a list in order,
 such as `map` or `filter`, builds it reversed and turns it around. `head()`, `tail()` and `last()`
-trap on the empty list, and `headOption()` and `get(i)` return an `Option`. Lists compare and hash by
+trap on the empty list, and `headOption()` and `lift(i)` return an `Option`. Lists compare and hash by
 their contents, and order element by element when their elements are ordered, a list ordering
 before every longer list it begins.
 
@@ -547,7 +552,7 @@ map literals, the mutable `Set` and `Map` of `avin.collections.mutable` and `Tre
 included. Each is built only by the literal of its own shape: `[1, 2]` where a `Set` is expected is
 an error, as `{1, 2}` is where a `Vector` is; `{}` is the empty set or the empty map, whichever is
 expected. A library or user collection with a builder can be written as a literal the same way:
-a class or `data` type whose companion object has a `builder()` method, returning a `Builder` of the
+a class or `data` type whose companion object has a `newBuilder()` method, returning a `Builder` of the
 elements and the type, is built by a sequence or set literal wherever that class is expected, and by
 a map literal when its builder takes `(key, value)` pairs, each entry given to it as one. The
 elements take their types from the expected element type when there is one (`Array[byte]` makes
@@ -601,7 +606,7 @@ vector made by one thread is whole to any other thread that reads it.
 | `xs ++ ys` | O(min(length of xs, length of ys)) |
 | `length()`, `isEmpty()` | O(1) |
 | `iterator()`, `reverseIterator()`, `for`, `foldLeft`, `map`, `filter` | O(n), a leaf at a time |
-| `Vector.builder()`, `toVector()` | O(n), each array made once |
+| `Vector.newBuilder()`, `toVector()` | O(n), each array made once |
 
 A vector's iterators read one leaf after another, finding the next leaf only when one is used up.
 A builder fills leaves of 32 as elements come and makes the tree above them once, at `result()`.
@@ -612,7 +617,7 @@ A builder fills leaves of 32 as elements come and makes the tree above them once
 after it is made. There is no level between an index and its element, so `xs(i)` reads one array
 however long the sequence is, but every operation that makes a changed sequence (`xs :+ x`,
 `x +: xs`, `xs ++ ys`, `updated`) copies all of them: it is for elements built once and then read.
-`slice` copies the elements it keeps. `ArraySeq.empty[T]()` and `ArraySeq.builder[T]()` make one, as
+`slice` copies the elements it keeps. `ArraySeq.empty[T]()` and `ArraySeq.newBuilder[T]()` make one, as
 does `toArraySeq()` on any collection, or a literal whose expected type is an `ArraySeq`:
 
 ```avin
@@ -635,8 +640,9 @@ does, `[1, 2, 3]`, where their elements display.
 
 `Seq[+T]` is what every indexed sequence shares, so a function over `Seq[T]` takes a list, a vector,
 an `ArraySeq`, a range, an array, a buffer or a deque. A sequence supplies `length()` and `apply(index)`, and has the rest
-from them: `get`, `isEmpty`, `nonEmpty`, `head` and `last` (trapping when empty) with `headOption` and
-`lastOption`, `foldRight`, `indexWhere`, `toVector`, an iterator, and `reverseIterator`, which walks
+from them: `lift`, `isEmpty`, `nonEmpty`, `head` and `last` (trapping when empty) with `headOption` and
+`lastOption`, read by index, `foldRight`, `indexWhere` (-1 when no element satisfies it), `toVector`,
+an iterator, and `reverseIterator`, which walks
 from the last element to the first. The [methods every Iterable has](#methods-every-iterable-has),
 `foldLeft`, `exists`, `count` and the rest, it has as every collection does. A sequence that reaches
 its elements another way overrides the ones that would be slow: a list walks from its front, so on a
@@ -683,7 +689,7 @@ is a queue, `addLast` with `removeFirst`, and a stack, `addLast` with `removeLas
 held when the call began, once. Its elements live in an array as a ring that wraps
 around from the array's end to its start, doubling as a buffer's does when full. A deque compares and
 hashes by its elements in order, displays as `[1, 2, 3]`, has `mkString` where its elements display,
-and is built by `Deque.builder` and by a sequence literal where one is expected.
+and is built by `Deque.newBuilder` and by a sequence literal where one is expected.
 
 ```text
 val pending: Deque[string] = ["build", "test"]
@@ -750,7 +756,7 @@ A `Range` of `int`s is a `Seq[int]`, and answers its own sequence questions from
 constant time: `length()` (trapping for a range of more values than the largest `int`, such as
 `int.MinValue .. int.MaxValue`), `r(i)`, which is `start + i * step` and traps outside `0 ..< length()`, and
 `contains(x)`, which is whether `x` lies between the first and last values a whole number of steps
-from the first, so `(1 ..< 10 by 3).contains(7)` is true and `.contains(8)` false. `get(i)`, `head()`,
+from the first, so `(1 ..< 10 by 3).contains(7)` is true and `.contains(8)` false. `lift(i)`, `head()`,
 `last()` and their `Option` forms are answered from the bounds too, so they work on a range too long
 for `length()`. Everything else
 it has as [every sequence](#methods-every-seq-has) does, and what those make of it, `map` and
@@ -762,12 +768,12 @@ it has as [every sequence](#methods-every-seq-has) does, and what those make of 
 Where the endpoints are integers of a type other than `int`, `a..b` and `a..<b` make a
 `NumericRange[T]` of that type, a `Seq[T]` that behaves as `Range` does: an integer literal endpoint
 takes its type from the other, `by` takes a step of type `T`, a zero step traps, and iteration never
-passes the largest or smallest value of `T`. `get`, `r(i)`, `head()`, `contains(x)` and `isEmpty()`
+passes the largest or smallest value of `T`. `lift`, `r(i)`, `head()`, `contains(x)` and `isEmpty()`
 are answered from the bounds without wrapping, so a range from the smallest `long` to the largest contains 0, and an
 `i8` range from 100 to 127 by 20 has the values 100 and 120. `length()` traps for more values than an `int`
 holds, as it does for `Range`; a range of `long`s past that still answers `head()`, `last()` and
-`get(i)`. A range whose ends lie more than the largest `long` apart cannot be counted, so
-`last()` and `length()` on it trap, while iterating it, `get` and `contains` work.
+`lift(i)`. A range whose ends lie more than the largest `long` apart cannot be counted, so
+`last()` and `length()` on it trap, while iterating it, `lift` and `contains` work.
 
 ```text
 val big: long = 5000000000
