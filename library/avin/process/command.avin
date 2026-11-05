@@ -1,0 +1,615 @@
+module avin.process
+
+// Commands: other programs to run, described first and run when asked. A command is one program and
+// its arguments, or two commands joined as a pipeline or a sequence, each with the directory,
+// variables, time limit and streams it runs with.
+
+import avin.fs
+import avin.io
+import avin.io.IoError
+import avin.threads
+import avin.time
+import avin.time.{Duration, Instant}
+
+// How a program ended: exited with a code, ended by a signal, or stopped for running past its time.
+@sysl("sysl.process.Status")
+data ExitStatus
+  Exited(code: int)
+  Signalled(signal: int)
+  TimedOut
+
+impl ExitStatus
+  // Whether the program exited with code 0, the one status that is success.
+  isSuccess() -> bool = self match
+    Exited(code) -> code == 0
+    _ -> false
+
+// Why `output()` has no text to give: the command could not be run, or it ran and did not succeed.
+data CommandError
+  Io(error: IoError)
+  Failed(status: ExitStatus)
+
+// A program to run: one program and its arguments, or two commands joined. Each method that changes
+// something answers a new command and leaves this one as it was, so a command can be run any number
+// of times.
+class Command(
+    private val shape: Shape,
+    private val dir: Option[string],
+    private val env: Vector[(string, string)],
+    private val limit: Option[Duration],
+    private val sink: Sink,
+    private val feed: Feed
+)
+  // The same command, run in `dir`. A part that names a directory of its own runs in that one.
+  inDir(dir: string) -> Command = Command(shape, Some(dir), env, limit, sink, feed)
+
+  // The same command, with the variable `name` set to `value` for it; the rest of the program's
+  // environment is passed on, and a part setting the same variable sets it for itself.
+  withEnv(name: string, value: string) -> Command = Command(shape, dir, env :+ (name, value), limit, sink, feed)
+
+  // The same command, stopped when it has run for `d`: a program still running then is ended, its
+  // status `TimedOut`, and a part not yet started is not started.
+  withTimeout(d: Duration) -> Command = Command(shape, dir, env, Some(d), sink, feed)
+
+  // The same command, its standard output written to `file`, which is made empty first, or made.
+  toFile(file: string) -> Command = Command(shape, dir, env, limit, OutputTo(file, false), feed)
+
+  // The same command, its standard output added to the end of `file`, which is made if it is not
+  // there.
+  appendTo(file: string) -> Command = Command(shape, dir, env, limit, OutputTo(file, true), feed)
+
+  // The same command, reading `file` as its standard input.
+  fromFile(file: string) -> Command = Command(shape, dir, env, limit, sink, InputFrom(file))
+
+  // The same command, reading `text` as its standard input.
+  withInput(text: string) -> Command = Command(shape, dir, env, limit, sink, InputText(text))
+
+  // A pipeline: this command's standard output is `next`'s standard input, the two running at once.
+  // Its status is `next`'s.
+  |(next: Command) -> Command = joined(Piped(self, next))
+
+  // This command, then `next` where this one succeeded. The status is the last one run.
+  andThen(next: Command) -> Command = joined(Joined(self, WhenSucceeded, next))
+
+  // This command, then `next` where this one did not succeed. The status is the last one run.
+  orElse(next: Command) -> Command = joined(Joined(self, WhenFailed, next))
+
+  // This command, then `next` whatever this one's status. The status is `next`'s.
+  followedBy(next: Command) -> Command = joined(Joined(self, Always, next))
+
+  // Runs the command with the program's own streams, waits for it, and answers how it ended. A
+  // status other than success is a value; the `Err` is a command that could not be started.
+  run() -> Result[ExitStatus, IoError]
+    val job = launch(Context(None, [], None), Streams(Inherit, None, Inherit, None))?
+    job.finish()
+    job.outcome()
+
+  // Runs the command with its standard output captured and its standard error the program's own,
+  // and answers the output as text, bytes that are not UTF-8 each replaced with U+FFFD. Any status
+  // but success is `Failed(status)`, and the output is then dropped.
+  output() -> Result[string, CommandError]
+    val dir = fs.createTempDir("avin-output").mapErr(e -> Io(e))?
+    val file = dir + "/output"
+    val opened = createFile(file)
+    if opened.isErr()
+      fs.removeDirAll(dir)
+      return Err(Io(ioError(opened.err().get())))
+    val into = opened.ok().get()
+    val started = launch(Context(None, [], None), Streams(Inherit, None, ToFile(into), Some(into)))
+    val outcome = started.map(job -> finished(job))
+    val bytes = fs.readBytes(file)
+    fs.removeDirAll(dir)
+    outcome.flatten() match
+      Err(e) -> Err(Io(e))
+      Ok(status) if !status.isSuccess() -> Err(Failed(status))
+      Ok(_) -> bytes match
+        Ok(b) -> Ok(string.fromUtf8Lossy(b))
+        Err(e) -> Err(Io(e))
+
+  // Starts the command and answers its standard output's lines as they arrive, each without its
+  // `\n` or `\r\n`, bytes that are not UTF-8 replaced with U+FFFD. Its status is not checked; once the
+  // output has ended the command is waited for.
+  lines() -> Result[Iterator[string], IoError]
+    val (from, into) = makePipe().mapErr(ioError)?
+    val started = launch(Context(None, [], None), Streams(Inherit, None, ToFile(into), Some(into)))
+    if started.isErr()
+      closeFile(Some(from))
+      return Err(started.err().get())
+    val job = started.ok().get()
+    val descriptor = from.fd()
+    if descriptor.isErr()
+      closeFile(Some(from))
+      job.finish()
+      return Err(ioError(descriptor.err().get()))
+    val reader = fdReader(descriptor.ok().get())
+    // A sequence starts its later parts as its earlier ones end, which has to happen while the
+    // output is read, so a command holding one is driven on a thread of its own.
+    if job.sequenced()
+      val driver = threads.spawn(() -> job.finish())
+      Ok(OutputLines(from, reader, () -> driver.join()))
+    else
+      Ok(OutputLines(from, reader, () -> job.finish()))
+
+  // Starts the command and answers at once, with the `Child` it is waited for and stopped by.
+  start() -> Result[Child, IoError] = launch(
+    Context(None, [], None),
+    Streams(Inherit, None, Inherit, None)
+  ).map(job -> Child(job))
+
+  private joined(shape: Shape) -> Command = Command(shape, None, [], None, OwnOutput, OwnInput)
+
+  // Starts the command within `outer`'s settings, its streams `given`. Whatever it fails at, the
+  // files `given` holds are closed.
+  private launch(outer: Context, given: Streams) -> Result[Job, IoError]
+    val context = outer.within(dir, env, limit)
+    val streams = redirected(given)?
+    shape match
+      Program(program, args) -> startProgram(program, args, context, streams)
+      Joined(first, joint, second) -> first.launch(context, streams.lent()) match
+        Ok(job) -> Ok(Sequence(job, joint, () -> second.launch(context, streams.lent()), streams))
+        Err(e) ->
+          streams.release()
+          Err(e)
+      Piped(from, into) ->
+        val ends = makePipe()
+        if ends.isErr()
+          streams.release()
+          return Err(ioError(ends.err().get()))
+        val (reading, writing) = ends.ok().get()
+        val left = from.launch(context, Streams(streams.input, streams.inputFile, ToFile(writing), Some(writing)))
+        if left.isErr()
+          closeFile(Some(reading))
+          closeFile(streams.outputFile)
+          return left
+        val right = into.launch(context, Streams(FromFile(reading), Some(reading), streams.output, streams.outputFile))
+        right match
+          Ok(job) -> Ok(Pipeline(left.ok().get(), job))
+          Err(e) ->
+            left.ok().get().finish()
+            Err(e)
+
+  // `given` with this command's own redirections in place of its streams, each replaced stream's
+  // file closed. A file that cannot be opened closes every file held so far.
+  private redirected(given: Streams) -> Result[Streams, IoError]
+    var streams = given
+    sink match
+      OwnOutput -> ()
+      OutputTo(file, append) -> (if append then appendFile(file) else createFile(file)) match
+        Ok(f) ->
+          closeFile(streams.outputFile)
+          streams = Streams(streams.input, streams.inputFile, ToFile(f), Some(f))
+        Err(e) ->
+          streams.release()
+          return Err(ioError(e))
+    val input = feed match
+      OwnInput -> return Ok(streams)
+      InputFrom(file) -> openFile(file).mapErr(ioError)
+      InputText(text) -> textFile(text)
+    input match
+      Ok(f) ->
+        closeFile(streams.inputFile)
+        Ok(Streams(FromFile(f), Some(f), streams.output, streams.outputFile))
+      Err(e) ->
+        streams.release()
+        Err(e)
+
+object Command
+  // One program and its arguments, each passed as it is: no shell reads them. A program without a
+  // `/` is looked for on `PATH`.
+  apply(program: string, args: string*) -> Command = Command(
+    Program(program, args),
+    None,
+    [],
+    None,
+    OwnOutput,
+    OwnInput
+  )
+
+  // The line split at runs of white space, the first word the program and the rest its arguments;
+  // no quoting and no shell. A line with no word traps.
+  parse(line: string) -> Command
+    val words = Vector.newBuilder[string]()
+    var word = ""
+    for c in line.chars()
+      if c.isWhitespace()
+        if !word.isEmpty() then words.addOne(word)
+        word = ""
+      else
+        word = word + c.toString()
+    if !word.isEmpty() then words.addOne(word)
+    val all = words.result()
+    if all.isEmpty() then fail("a command line with no word in it")
+    Command(Program(all(0), all.drop(1)), None, [], None, OwnOutput, OwnInput)
+
+impl string
+  // The string as a command line, `Command.parse(self).run()`.
+  run() -> Result[ExitStatus, IoError] = Command.parse(self).run()
+
+  // The string as a command line, `Command.parse(self).output()`.
+  output() -> Result[string, CommandError] = Command.parse(self).output()
+
+// A command that has been started: it is waited for, asked whether it is still running, and stopped,
+// by the code that started it.
+class Child(private val job: Job)
+  // Waits for the command to end and answers how it ended, the same answer every time.
+  waitFor() -> Result[ExitStatus, IoError] = finished(job)
+
+  // Whether the command is still running, without waiting for it.
+  isAlive() -> bool = !job.poll()
+
+  // Asks every program of the command still running to stop, with the signal 15, and starts no
+  // part not yet started.
+  kill() = job.stop()
+
+// What the command is: one program, a pipeline, or two commands one after the other.
+private data Shape
+  Program(program: string, args: Vector[string])
+  Piped(from: Command, into: Command)
+  Joined(first: Command, joint: Joint, second: Command)
+
+// When the second command of a sequence runs.
+private data Joint
+  WhenSucceeded
+  WhenFailed
+  Always
+
+// Where a command's standard output goes when the command says.
+private data Sink
+  OwnOutput
+  OutputTo(file: string, append: bool)
+
+// Where a command's standard input comes from when the command says.
+private data Feed
+  OwnInput
+  InputFrom(file: string)
+  InputText(text: string)
+
+// The settings a command's parts run with: the directory, the variables set for them, and when they
+// are stopped.
+private class Context(val dir: Option[string], val env: Vector[(string, string)], val deadline: Option[Instant])
+  // These settings with a part's own on top: its directory where it names one, its variables after
+  // these (a name it sets replacing the one here), and the earlier of the two deadlines.
+  within(ownDir: Option[string], ownEnv: Vector[(string, string)], limit: Option[Duration]) -> Context
+    val vars = Vector.newBuilder[(string, string)]()
+    for (name, value) in env
+      if !ownEnv.exists(p -> p.0 == name) then vars.addOne((name, value))
+    for (name, value) in ownEnv do vars.addOne((name, value))
+    val own = limit.map(d -> time.now() + d)
+    val until = (deadline, own) match
+      (Some(a), Some(b)) -> Some(if b < a then b else a)
+      (Some(a), None) -> Some(a)
+      _ -> own
+    Context(ownDir.orElse(dir), vars.result(), until)
+
+// A part's three streams as Sysl takes them, with the files among them this part closes once it no
+// longer needs them: a pipe's end, or a file a redirection opened.
+private class Streams(val input: Stdio, val inputFile: Option[File], val output: Stdio, val outputFile: Option[File])
+  // The same streams, for a part that does not close them: a sequence's, which closes them itself.
+  lent() -> Streams = Streams(input, None, output, None)
+
+  release()
+    closeFile(inputFile)
+    closeFile(outputFile)
+
+// Closes the descriptor the file holds and gives its Sysl value back.
+private closeFile(file: Option[File]) = file match
+  Some(f) ->
+    f.shut()
+    f.close()
+  None -> ()
+
+// A started command's status, once it has been waited for.
+private finished(job: Job) -> Result[ExitStatus, IoError]
+  job.finish()
+  job.outcome()
+
+// The text in a file that is then removed, opened for reading: a command's input given as text. The
+// open file outlives its name.
+private textFile(text: string) -> Result[File, IoError]
+  val dir = fs.createTempDir("avin-input")?
+  val file = dir + "/input"
+  val written = fs.writeText(file, text)
+  val opened = if written.isOk() then openFile(file).mapErr(ioError) else Err(written.err().get())
+  fs.removeDirAll(dir)
+  opened
+
+// Starts one program. Its streams' files are closed once it has its own copies of them.
+private startProgram(program: string, args: Vector[string], context: Context, streams: Streams) -> Result[Job, IoError]
+  var millis = 0
+  context.deadline match
+    Some(d) ->
+      val left = d.since(time.now()).micros
+      if left <= 0
+        streams.release()
+        return Ok(Ended(Ok(TimedOut)))
+      millis = if left >= 2147483647000 then 2147483647 else int((left + 999) / 1000)
+    None -> ()
+  val vars = context.env.map(p -> Var(p.0, p.1))
+  val started = spawnProgram(
+    program,
+    args,
+    context.dir.getOrElse(""),
+    vars,
+    millis,
+    true,
+    streams.input,
+    streams.output,
+    Inherit
+  )
+  streams.release()
+  started match
+    Ok(child) -> Ok(Process(child, context.deadline))
+    Err(e) -> Err(ioError(e))
+
+// A started command: one program, a pipeline or a sequence. `poll` moves it on without waiting and
+// says whether it has ended; `finish` waits for it to end; `outcome` is its status once it has.
+private abstract class Job
+  // Whether a sequence inside it still has parts to start, which only `poll` or `finish` start.
+  sequenced() -> bool
+  poll() -> bool
+  finish() -> unit
+  outcome() -> Result[ExitStatus, IoError]
+  stop() -> unit
+
+// A part that ended before it began: its time ran out first.
+private class Ended(private val result: Result[ExitStatus, IoError]): Job
+  override sequenced() -> bool = false
+  override poll() -> bool = true
+  override finish() = ()
+  override outcome() -> Result[ExitStatus, IoError] = result
+  override stop() = ()
+
+// One running program.
+private class Process(private val child: Spawned, private val deadline: Option[Instant]): Job
+  private var result: Option[Result[ExitStatus, IoError]] = None
+
+  override sequenced() -> bool = false
+
+  override poll() -> bool
+    if result.isDefined() then return true
+    // A program past its deadline is waited for, which stops it.
+    val late = deadline match
+      Some(d) -> time.now() >= d
+      None -> false
+    if late
+      finish()
+      return true
+    child.tryWait() match
+      Ok(Some(status)) -> ended(Ok(status))
+      Ok(None) -> return false
+      Err(e) -> ended(Err(ioError(e)))
+    true
+
+  override finish()
+    if result.isEmpty() then ended(child.wait().mapErr(ioError))
+
+  override outcome() -> Result[ExitStatus, IoError] = result.get()
+
+  override stop()
+    if result.isEmpty() then child.kill(15)
+
+  private ended(r: Result[ExitStatus, IoError])
+    result = Some(r)
+    child.close()
+
+// Two parts run at once, the first's standard output the second's input.
+private class Pipeline(private val from: Job, private val into: Job): Job
+  override sequenced() -> bool = from.sequenced() || into.sequenced()
+
+  override poll() -> bool
+    val a = from.poll()
+    val b = into.poll()
+    a && b
+
+  // Parts that are programs have all started and end by themselves; a sequence among them is moved
+  // on as its parts end, both sides polled until both have ended.
+  override finish()
+    if sequenced()
+      var pause: long = 1
+      while !poll()
+        threads.sleep(time.milliseconds(pause))
+        if pause < 16 then pause = pause * 2
+    else
+      from.finish()
+      into.finish()
+
+  override outcome() -> Result[ExitStatus, IoError] = from.outcome() match
+    Err(e) -> Err(e)
+    Ok(_) -> into.outcome()
+
+  override stop()
+    from.stop()
+    into.stop()
+
+// Two parts one after the other, the second started by `second` when the first ends, if `joint` says
+// so. The streams are both parts', closed when the sequence ends.
+private class Sequence(
+    private var current: Job,
+    private val joint: Joint,
+    private val second: () -> Result[Job, IoError],
+    private val streams: Streams
+): Job
+  private var started = false
+  private var stopped = false
+  private var result: Option[Result[ExitStatus, IoError]] = None
+
+  override sequenced() -> bool = result.isEmpty()
+
+  override poll() -> bool
+    while result.isEmpty()
+      if !current.poll() then return false
+      advance()
+    true
+
+  override finish()
+    while result.isEmpty()
+      current.finish()
+      advance()
+
+  override outcome() -> Result[ExitStatus, IoError] = result.get()
+
+  override stop()
+    stopped = true
+    current.stop()
+
+  // The current part has ended: the second is started where the joint says so, and otherwise the
+  // sequence has ended with the current part's outcome.
+  private advance()
+    val o = current.outcome()
+    if started || stopped || !goesOn(o) then return ended(o)
+    started = true
+    second() match
+      Ok(job) -> current = job
+      Err(e) -> ended(Err(e))
+
+  private goesOn(o: Result[ExitStatus, IoError]) -> bool = o match
+    Ok(status) -> joint match
+      WhenSucceeded -> status.isSuccess()
+      WhenFailed -> !status.isSuccess()
+      Always -> true
+    Err(_) -> false
+
+  private ended(o: Result[ExitStatus, IoError])
+    result = Some(o)
+    streams.release()
+
+// A command's standard output read a line at a time from the pipe it writes into. When the output
+// ends, `ending` waits for the command, and the pipe is closed.
+private class OutputLines(
+    private val file: File,
+    private val reader: FdReader,
+    private val ending: () -> unit
+): Iterator[string]
+  private val room = Array.fill(4096, byte(0))
+  private var chunk = Array.empty[byte]()
+  private var at = 0
+  private var ended = false
+  private var waiting: Option[string] = None
+
+  override hasNext() -> bool
+    if waiting.isEmpty() then waiting = takeLine()
+    waiting.isDefined()
+
+  override next() -> string
+    if !hasNext() then fail("next on an exhausted iterator")
+    val line = waiting.get()
+    waiting = None
+    line
+
+  // The next line, without its terminator, or `None` once the output has ended.
+  private takeLine() -> Option[string]
+    val line = Buffer[byte]()
+    loop
+      if at == chunk.length()
+        if ended then return if line.isEmpty() then None else Some(text(line))
+        chunk = reader.read(room)
+        at = 0
+        if chunk.length() == 0 then end()
+      else
+        val b = chunk(at)
+        at += 1
+        if b == byte(10)
+          if line.nonEmpty() && line(line.length() - 1) == byte(13) then line.remove(line.length() - 1)
+          return Some(text(line))
+        line.addOne(b)
+
+  private text(line: Buffer[byte]) -> string = string.fromUtf8Lossy(line.toArray())
+
+  private end()
+    ended = true
+    ending()
+    reader.close()
+    closeFile(Some(file))
+
+// The Sysl side: its error, its open files, its processes and how their streams are given.
+
+@sysl("sysl.fs.IoError")
+private data SyslError
+  NotFound
+  PermissionDenied
+  AlreadyExists
+  NotADirectory
+  IsADirectory
+  DirectoryNotEmpty
+  TooManyOpenFiles
+  NoSpaceLeft
+  Interrupted
+  NotOpen
+  NotPermitted
+  InvalidUtf8(offset: long)
+  Other(code: int)
+
+private ioError(e: SyslError) -> IoError = e match
+  NotFound -> io.NotFound
+  PermissionDenied -> io.PermissionDenied
+  AlreadyExists -> io.AlreadyExists
+  NotADirectory -> io.NotADirectory
+  IsADirectory -> io.IsADirectory
+  DirectoryNotEmpty -> io.DirectoryNotEmpty
+  InvalidUtf8(at) -> io.InvalidUtf8(at)
+  _ -> io.Other(syslMessage(e))
+
+// The platform's own sentence for a Sysl error, as Sysl words it.
+@sysl("avin.rt.io_error_message")
+private syslMessage(e: SyslError) -> string
+
+// An open file: a pipe's end, or a file a redirection opened.
+@sysl("sysl.fs.File")
+private class File
+  // Closes the descriptor; closing again does nothing.
+  @sysl("close")
+  shut() -> Result[unit, SyslError]
+  fd() -> Result[int, SyslError]
+
+@sysl("sysl.fs.create")
+private createFile(file: string) -> Result[File, SyslError]
+
+@sysl("sysl.fs.append")
+private appendFile(file: string) -> Result[File, SyslError]
+
+@sysl("sysl.fs.open")
+private openFile(file: string) -> Result[File, SyslError]
+
+@sysl("sysl.process.pipe")
+private makePipe() -> Result[(File, File), SyslError]
+
+// A descriptor read as bytes arrive, each read answering what is there rather than waiting to fill.
+@sysl("sysl.io.FdReader")
+private class FdReader
+  @sysl(blocking)
+  read(into: Array[byte]) -> Array[byte]
+
+@sysl("sysl.io.fd_reader")
+private fdReader(fd: int) -> FdReader
+
+@sysl("sysl.process.Stdio")
+private data Stdio
+  Inherit
+  ToFile(file: File)
+  ToPath(path: string)
+  FromFile(file: File)
+  FromPath(path: string)
+
+@sysl("sysl.process.Var")
+private data Var(name: string, value: string)
+
+// A started program, which ends it if it is collected before it has been waited for.
+@sysl("sysl.process.Spawned")
+private class Spawned
+  @sysl(blocking)
+  wait() -> Result[ExitStatus, SyslError]
+  tryWait() -> Result[Option[ExitStatus], SyslError]
+  kill(signal: int) -> Result[unit, SyslError]
+
+@sysl("sysl.process.spawn")
+private spawnProgram(
+    program: string,
+    args: Vector[string],
+    dir: string,
+    env: Vector[Var],
+    timeout: int,
+    inheritEnv: bool,
+    stdin: Stdio,
+    stdout: Stdio,
+    stderr: Stdio
+) -> Result[Spawned, SyslError]
