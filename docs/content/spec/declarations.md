@@ -287,6 +287,46 @@ pairs[T: Display](first: T) -> string
 pairs("p")               // "(p, 1) (p, a) (p, 2.5)"
 ```
 
+### Tail calls
+
+A call is in **tail position** when its result is the function's result and nothing is left to do
+after it: the body itself, the last item of a block in tail position, a branch of an `if`, an arm of
+a `match` or a clause body in tail position, the right operand of `&&` or `||` in tail position, and
+the value of a `return`, wherever it is written. A call whose result is used is not: by an operator,
+a conversion, another call, a store, a pattern, a guard or a condition; nor is one inside a loop, a
+lambda, a by-name argument or a local function, which runs later or from somewhere else.
+
+**A function that calls itself in tail position runs as a loop.** The arguments are evaluated, every
+one before any parameter changes, then become the parameters, and the body starts again, so the
+stack does not grow however deep the recursion goes. This holds at every optimization level, of a
+call that names the function itself at its own type arguments, for every function no other body can
+replace: a top-level or local function, a method of a final class, of an object or of a data type,
+and a private method of any class. A call of a method on another receiver of the same type is a loop
+too, with that receiver as `self`. Each pass has parameters of its own: a lambda made in one pass
+keeps that pass's values, and a `var` its body declares is a new one each pass.
+
+```text
+sum(n: long, acc: long) -> long = if n == 0 then acc else sum(n - 1, acc + n)
+
+sum(10000000, 0)         // 50000005000000, in constant stack
+```
+
+**`@tailrec` makes it a guarantee.** Written before a function, a method or a local function, it
+asks the compiler to prove that every call of the function in its own body is such a loop, and each
+failure is an error at the call, saying why:
+
+```text
+@tailrec
+factorial(n: long) -> long = if n == 0 then 1 else n * factorial(n - 1)
+// error: this recursive call of `factorial` is not in tail position: its result is used by `*`
+```
+
+It is an error for the function to have no recursive call; for it to be a method that can be
+overridden, a trait's or a public method of an `open` or `abstract` class, since a call of it may run
+an override; and for a recursive call to give a generic function other type arguments, which calls
+another instance rather than looping. A function defined by clauses may be `@tailrec`, written before
+its signature.
+
 ## data
 
 `data` declares an algebraic data type: an immutable value with one or more variants.
