@@ -1,0 +1,88 @@
+// expect: exit 0
+// `stop()` ends an actor once the message it is handling is handled, and what is left in its
+// mailbox is dropped: the messages one sender told after the one that stopped it are never handled,
+// and neither is anything told once it has ended, which is no error. `stop()` in the body ends the
+// actor before it handles a message, though the rest of the body runs; `stop()` twice, and
+// `stop(self)`, are one stop. The `stopping` block runs once, at the end, after the arm that
+// stopped, and sees the actor's fields. `ended()` completes with `Stopped`, the same from every
+// wait: `main`, a second wait, and another actor that awaits it. A method called `stopping`, which
+// is no block, is an ordinary method.
+import avin.actors.{ActorRef, Ending, Failed, Stopped, spawn}
+import avin.threads.{Channel, Promise}
+
+data Msg
+    Add(n: int)
+    Quit
+    QuitTwice
+    QuitSelf
+
+actor Summer(label: string, log: Channel[string]) receives Msg
+    var sum = 0
+    var stops = 0
+    receive
+        Add(n) -> sum += n
+        Quit -> stop()
+        QuitTwice ->
+            stop()
+            stop()
+            sum += 1000
+        QuitSelf -> stop(self)
+    stopping
+        stops += 1
+        log.send(s"$label stopping with sum $sum, ${stopping()}")
+    stopping() -> string = s"stopped $stops time"
+
+actor Brief(log: Channel[string]) receives Msg
+    log.send("body starts")
+    stop()
+    log.send("body goes on after stop()")
+    receive
+        Add(n) -> log.send(s"handled $n")
+        _ -> log.send("handled another")
+    stopping
+        log.send("brief stopping")
+
+// Waits, inside an arm, for another actor's end.
+data Wait(target: ActorRef[Msg], reply: Promise[string])
+
+actor Waiter receives Wait
+    receive
+        Wait(target, reply) -> reply.complete(describe(target.ended().await()))
+
+describe(e: Ending) -> string = e match
+    Stopped -> "Stopped"
+    Failed(reason) -> s"Failed($reason)"
+
+drain(log: Channel[string])
+    log.close()
+    for line in log do println(line)
+
+main()
+    val log = Channel[string]()
+    val s = spawn(Summer("one", log))
+    for i in 1..4 do s.tell(Add(i))
+    s.tell(Quit)
+    for i in 1..4 do s.tell(Add(100 * i))
+    println(describe(s.ended().await()))
+    println(describe(s.ended().await()))
+    s.tell(Add(7))
+    s.tell(Quit)
+    println(s.ended().isCompleted())
+    val twice = spawn(Summer("two", log))
+    twice.tell(Add(5))
+    twice.tell(QuitTwice)
+    twice.tell(Add(5))
+    twice.ended().await()
+    val own = spawn(Summer("three", log))
+    own.tell(Add(9))
+    own.tell(QuitSelf)
+    own.tell(Add(9))
+    val waiter = spawn(Waiter())
+    val seen = Promise[string]()
+    waiter.tell(Wait(own, seen))
+    println(s"waiter saw ${seen.future.await()}")
+    val b = spawn(Brief(log))
+    b.tell(Add(1))
+    b.tell(Add(2))
+    println(describe(b.ended().await()))
+    drain(log)

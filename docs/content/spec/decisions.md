@@ -2921,7 +2921,70 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- Proposed (built on branch `actor-lifecycle`): **An actor's lifecycle is the class `ActorContext[M]`
+  its state extends** ([lifecycle](/spec/actors/#lifecycle)). `stop`, `watch`, `unwatch`, `after`,
+  `every`, `children`, `parent` and `onStopping` are methods of `avin.actors.ActorContext[M]`, made
+  from the actor's reference; the hidden class of an `actor` declaration extends it, so the body,
+  arms and methods call them as their own, and a behaviour written as a library value makes one in
+  its start, `ActorContext(me)`. Each finds its actor through the runtime's table of running actors
+  by the owner of the code running, and traps where that is not the actor (made by `main`, or
+  called from a future). A field or method of an actor with the name and parameters of one of these
+  is refused (`` `stop` is one of every actor's own methods ``), and the body may call them before
+  its own fields are initialized, since they reach only the context's. The same table gives `spawn`
+  the actor whose code is running, its new child's parent. *Why*: the chapter writes `stop()` and
+  `after(…)` bare inside an actor, typed by the actor's message type, and inheritance gives exactly
+  that with no new lookup rule, while the library form keeps working with no declaration.
+  *Alternatives weighed*: changing a behaviour's start to take the context instead of the reference
+  (every library-form behaviour changes, and `me` is no longer a reference); free functions finding
+  the running actor (`after` could not be typed by the actor's messages); names the checker
+  resolves specially inside actors (a lookup rule of its own, and nothing for the library form).
+  **Review with the user**: the public name `ActorContext` and `onStopping`, and that an actor's
+  own names now include `children` and `parent` (a test's field `children` was renamed).
+- Proposed (built on branch `actor-lifecycle`): **Stopping, the cases the chapter leaves open.**
+  `stop(self)` is `stop()`; stopping an actor that has ended does nothing, whoever started it (there
+  is no actor left to protect, and the end may have raced the call); an actor asked to stop before
+  its first turn still runs its body first, so its `stopping` block always has state to run on; an
+  actor started while its parent is ending is stopped at once and its parent does not wait for it; a
+  `stopping` block is given to the context after the body's statements, and several `onStopping`
+  functions run in the order given; `children()` omits a child once it has ended, before its end is
+  told to watchers. *Why*: each is the reading that never traps on a race and never leaves a parent
+  waiting for ever. *Alternatives weighed*: `stop(self)` trapping as "not a child"; stopping an
+  ended non-child trapping (needs a record of every child that ever ended); a child started from
+  `stopping` made a top-level actor instead.
+- Proposed (built on branch `actor-lifecycle`): **Watching, the cases the chapter leaves open.**
+  Watching an actor again replaces the earlier watch, so its end is told once; an actor watching
+  itself is told nothing; `watch(ref, f)` takes a `@sendable` `f`, run on the pool where the end is
+  known, its result queued; `unwatch` and the replacing watch drop a message already queued and not
+  yet handled. *Why*: one message per watched end is what a program counting ends needs, and the
+  dropped message is what makes `unwatch` mean something under a race. *Alternatives weighed*: a
+  message per `watch` call; running `f` in the watcher's turn (the mailbox would hold functions
+  rather than messages); watching itself trapping.
+- Proposed (built on branch `actor-lifecycle`): **Timers.** One thread, started with the first
+  timer, keeps every actor's timers and sleeps until the earliest is due; timers fire in the order
+  they fall due, those due together in the order they were set; a delay of zero or less is due at
+  once; a repeating timer is set again an interval after it fires (it does not catch up after a
+  stall), and an interval of zero or less traps; `cancel()` works from any thread, since a `Timer`
+  is sendable, and drops a message of it queued and not yet handled. `Timer` has only `cancel()`.
+  *Why*: a thread per timer would hold a worker per pending timer, and dropping queued messages
+  makes a cancelled timer's count exact without timing. *Alternatives weighed*: a fixed rate that
+  catches up; `every(zero)` sending as fast as it is handled; an `isActive()` query (left out until a
+  program needs it).
+- Proposed (built on branch `actor-lifecycle`): **An actor's state is never captured by a `@sendable`
+  function**, whatever its fields: `Future(stop())` in an arm, or a body reading a `val` field, is
+  refused with `` it uses the state of the actor `Escaper`, which only the actor's own code reaches;
+  copy what it needs into a `val` first ``. Before, only a state with a `var` was refused. *Why*: the
+  context's methods act for the actor that is running, so a state carried to another thread is never
+  right to use there, and the static refusal says so where the runtime would trap. *Alternatives
+  weighed*: keeping the structural rule and relying on the trap. **Review with the user**: it
+  tightens a settled rule.
+- Proposed (built on branch `actor-lifecycle`): **The expected type bounds a contravariant type
+  argument of a call's result only from below** ([generics](/spec/generics/#inference)). A call
+  whose result is `Sink[T]` for a contravariant `T` takes `T` from its arguments, and from the
+  expected type only where they leave it open, so `watch(spawn(Worker()), …)` and `val r:
+  ActorRef[Nothing] = spawn(Quiet())` check. Before, the expected `ActorRef[Nothing]` made `M`
+  `Nothing` and the argument was refused. *Why*: `Sink[A]` is a `Sink[B]` for every `B` below `A`,
+  so the expected argument says nothing about `T` beyond a lower bound. *Alternatives weighed*:
+  recording a lower bound on the variable (the checker's unknowns hold one type, not bounds).
 
 ## Open
 

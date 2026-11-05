@@ -1,0 +1,55 @@
+// expect: exit 0
+// The lifecycle under the collector's stress and on every worker: rounds of a supervisor that
+// starts workers, each with children of its own and a timer that ends it, watches each worker and
+// counts their ends, then stops itself once all have ended, its own `stopping` block reporting what
+// its workers' blocks reported. The workers allocate as they go, so collections run while actors
+// start, end and are watched, and timers fire into mailboxes being torn down.
+import avin.actors.{ActorRef, Ending, spawn}
+import avin.threads.{Atomic, Channel}
+import avin.time as time
+
+data Msg
+    Ended(e: Ending)
+    Grow(n: int)
+    Expire
+
+actor Leaf(total: Atomic[int]) receives Msg
+    every(time.milliseconds(1), Grow(1))
+    var words: Vector[string] = Vector()
+    receive
+        Grow(n) -> words = words :+ s"word $n ${words.length()}"
+        _ -> ()
+    stopping
+        total.add(1)
+
+actor Worker(id: int, total: Atomic[int]) receives Msg
+    spawn(Leaf(total))
+    spawn(Leaf(total))
+    after(time.milliseconds(long(id % 5)), Expire)
+    var grown = 0
+    self.tell(Grow(id))
+    receive
+        Grow(n) -> grown += n
+        Expire -> stop()
+        _ -> ()
+    stopping
+        total.add(1)
+
+actor Supervisor(workers: int, out: Channel[string]) receives Msg
+    val total = Atomic[int](0)
+    var ended = 0
+    for i in 0..<workers do watch(spawn(Worker(i, total)), e -> Ended(e))
+    receive
+        Ended(_) ->
+            ended += 1
+            if ended == workers then stop()
+        _ -> ()
+    stopping
+        out.send(s"$ended workers ended, ${total.load()} stopping blocks ran, ${children().length()} children left")
+
+main()
+    val out = Channel[string]()
+    for round in 1..3
+        val s = spawn(Supervisor(20, out))
+        s.ended().await()
+        println(s"round $round: ${out.receive().get()}")
