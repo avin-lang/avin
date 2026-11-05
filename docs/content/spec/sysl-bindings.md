@@ -374,6 +374,10 @@ may then free any object no frame still holds:
 - **The result is converted after the call**, once the thread is running again, since converting
   makes Avin objects. Bytes a handle's method answers, which may be a view of the handle's value,
   are copied into Sysl memory first.
+- **A [filled array](#filled-arrays) is copied in before the call and back after it.** The Sysl
+  function writes its own slice while it waits, the array stays held by the calling thread's stack
+  throughout, and what the function left is copied into the array once the thread is running
+  again, after the result is converted. A blocking `read(into: Array[byte])` is bound this way.
 
 `blocking` is written alone and once, and only on a function or a handle's method: a type does not
 wait.
