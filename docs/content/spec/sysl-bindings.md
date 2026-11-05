@@ -671,9 +671,12 @@ runEvery(ms: long, @threaded tick: () -> bool)
   which the program never knew, is attached to the runtime for the call and detached after. The
   function is checked where the binding is called: a top-level function, which captures nothing,
   or a lambda, local function or method value whose every capture is a `val` or a parameter of a
-  [sendable](/spec/actors/#what-may-be-sent) type. A function value whose type does not say what it
-  captures is refused, as is a captured `var`, which the other thread would share; a binding with
-  a `@threaded` parameter is called by name, never used as a value, so no call escapes the check.
+  [sendable](/spec/actors/#what-may-be-sent) type or marked `@sendable`. A value of a
+  [`@sendable` function type](/spec/types/#function-types), and a parameter marked
+  `@sendable`, are taken as they are, since each was checked where it was made or passed to be what
+  any thread may run. Any other function value, whose type does not say what it captures, is
+  refused, as is a captured `var`, which the other thread would share; a binding with a `@threaded`
+  parameter is called by name, never used as a value, so no call escapes the check.
   **A binding with a `@threaded` parameter is `blocking`** whether or not it says so: the Sysl
   call may wait for another thread to call back, and that thread's collections go on without the
   waiting one. A Sysl parameter of type `&sync Fn` needs the mark, and Sysl's refusal says so:
