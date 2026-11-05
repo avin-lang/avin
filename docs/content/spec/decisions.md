@@ -2644,7 +2644,21 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- Proposed (branch `mixed-lambda-inference`): **the lambdas and `match` functions of a call are
+  checked in turn, each the first in the call whose parameter types are known**
+  ([generics](/spec/generics/#inference)): declared by it, or decided by the arguments checked so
+  far; where none is, the first one left is checked and reports what it cannot infer. Found as a
+  bug: they were checked strictly left to right after the other arguments, so
+  `both(match n -> n + 1, (x: int) -> x * 10)` for `both[A, B](g: (A) -> B, f: (A) -> B)` failed
+  with "cannot infer the type of the value this `match` matches", as did an untyped lambda written
+  before the typed one, while the same arguments swapped were accepted. *Why*: the smallest rule
+  under which argument order does not matter for what can be inferred, and every call accepted
+  before is checked in the same order as before (each lambda it checked was already the first
+  ready one). *Alternatives*: keep left to right (order-sensitive, as the bug shows); check the
+  lambdas with declared parameters first, then the rest left to right (misses chains, where a
+  `match` function's type comes from an untyped lambda's result); or solve all of them together
+  as constraints, checking each body against partly unknown parameters (a larger change, with
+  diagnostics harder to place).
 
 ## Open
 

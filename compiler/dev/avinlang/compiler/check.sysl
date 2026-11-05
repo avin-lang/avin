@@ -12139,6 +12139,36 @@ private open_argument_fits(value: &Expr, p: &Type) -> bool
             _ -> false
         _ -> true
 
+/** Whether the lambda or `match` function `value`, given for a parameter of type `param`, has the
+ * types of all it takes known: declared by it, or decided already in the expected type. One that
+ * would be reported whatever the order, for a parameter of another shape, counts as known. */
+private lambda_ready(c: *Checker, value: &Expr, param: Option[&Type]) -> bool
+    val p = param match
+        Some(t) -> zonk(c, strict(zonk(c, t)))
+        None -> return true
+    value.kind match
+        Lambda(params, _) ->
+            var all_declared = true
+            for q in params
+                if q.declared is None then all_declared = false
+            if all_declared then return true
+            *p match
+                Function(ps, _, _) ->
+                    if ps.len() == params.len()
+                        for i in 0..<params.len()
+                            if params[i].declared is None && has_unknowns(zonk(c, ps[i])) then return false
+                        true
+                    elif ps.len() == 1 && params.len() >= 2 then !has_unknowns(zonk(c, ps[0]))
+                    else true
+                Var(_) -> false
+                _ -> true
+        MatchFunction(_) -> *p match
+            Function(ps, _, _) -> ps.len() != 1 || !has_unknowns(zonk(c, ps[0]))
+            Class(_, name, args) -> name != "PartialFunction" || args.len() != 2 || !has_unknowns(zonk(c, args[0]))
+            Var(_) -> false
+            _ -> true
+        _ -> true
+
 /** Whether an argument takes its type from its parameter, and so is checked after the others: a
  * lambda, or a `match` with nothing before it. */
 private takes_parameter_type(value: &Expr) -> bool = value.kind is Lambda(_, _) || value.kind is MatchFunction(_)
@@ -13374,14 +13404,15 @@ private open_type_args(c: *Checker, type_args: Buf[&Type], from: usize) -> Buf[u
 
 // Checks a call's arguments against their parameters' types, in an order that lets each argument use
 // what the others decide: first the arguments that are neither bare literals nor lambdas, then the
-// literals, which take the types the others settle, and last the lambdas, whose parameter types
-// come from all of them. `wanted` has an entry per argument, `None` for one that fits no parameter.
+// literals, which take the types the others settle, and last the lambdas and `match` functions,
+// whose parameter types come from all of them and from the lambdas checked before them.
+// `wanted` has an entry per argument, `None` for one that fits no parameter.
 // An argument with an entry in `checked` was checked already, and only its type is matched here.
 private check_arguments(c: *Checker, args: Buf[Argument], wanted: Buf[Option[&Type]], checked: Buf[Option[&TExpr]], open: *Buf[usize]) -> Buf[&TExpr]
     var early: Buf[Option[&TExpr]] = buf()
     for _ in args
         early.push(None)
-    for pass in 0..<3
+    for pass in 0..<2
         for i in 0..<args.len()
             val value = args[i].value
             val param = if i < wanted.len() then wanted[i] else None
@@ -13403,6 +13434,25 @@ private check_arguments(c: *Checker, args: Buf[Argument], wanted: Buf[Option[&Ty
             val rank = if takes_parameter_type(value) then 2 elif is_literal(value) then 1 else 0
             if rank != pass then continue
             early[i] = Some(call_argument(c, args[i], param, open))
+    // The lambdas go in turn, each the first in the call whose parameter types are known by then, from
+    // its own declarations or from what the arguments checked before it decided; when none is, the
+    // first left is checked, and reports what it cannot infer.
+    var waiting: Buf[usize] = buf()
+    for i in 0..<args.len()
+        if early[i] is None then waiting.push(i)
+    while waiting.len() > 0
+        var pick = 0
+        for k in 0..<waiting.len()
+            val i = waiting[k]
+            if lambda_ready(c, args[i].value, if i < wanted.len() then wanted[i] else None)
+                pick = k
+                break
+        val i = waiting[pick]
+        var rest: Buf[usize] = buf()
+        for k in 0..<waiting.len()
+            if k != pick then rest.push(waiting[k])
+        waiting = rest
+        early[i] = Some(call_argument(c, args[i], if i < wanted.len() then wanted[i] else None, open))
     var typed: Buf[&TExpr] = buf()
     for t in early
         typed.push(t.unwrap())
