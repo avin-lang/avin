@@ -2636,15 +2636,7 @@ their words are reserved.
     function where a `PartialFunction` is expected is not changed by the bound: it is a
     `PartialFunction`, which does not promise `Sendable`.
 
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- Proposed (branch `mixed-lambda-inference`): **the lambdas and `match` functions of a call are
+- Settled on the user's delegation 2026-11-05 (built on branch `mixed-lambda-inference`): **the lambdas and `match` functions of a call are
   checked in turn, each the first in the call whose parameter types are known**
   ([generics](/spec/generics/#inference)): declared by it, or decided by the arguments checked so
   far; where none is, the first one left is checked and reports what it cannot infer. Found as a
@@ -2658,7 +2650,58 @@ their words are reserved.
   lambdas with declared parameters first, then the rest left to right (misses chains, where a
   `match` function's type comes from an untyped lambda's result); or solve all of them together
   as constraints, checking each body against partly unknown parameters (a larger change, with
-  diagnostics harder to place).
+  diagnostics harder to place). **Review with the user**: the order rule is visible in which calls infer, so a later
+  constraint solver would be a language change.
+- Settled on the user's delegation 2026-11-05 (built on branch `sendable-followups`): **three follow-ups to `@sendable` parameters**
+  ([threads](/spec/threads/#what-is-shared), [callbacks](/spec/sysl-bindings/#callbacks)). They
+  amend the `sendable-params` entry above where it says a combination, and a `match` function where
+  a `PartialFunction` is expected, are not sendable.
+  - A binding's `@threaded` parameter takes a value of a `@sendable` function type and a parameter
+    marked `@sendable` as they are, and a lambda passed there may capture a marked parameter. A
+    plain function value, an unmarked or `@isolated` parameter, and an unmarked parameter captured
+    stay refused. *Why*: each was checked where it was made or passed to be what any thread may
+    run, which is all the `@threaded` check asks. *Alternative*: none sound is narrower; requiring
+    a lambda around it (`x -> f(x)`) is the contortion this removes.
+  - **`f.orElse(g)` is sendable where `f` and `g` are**, by a promise the standard library writes on
+    the method, `@sendable_result`: a call of a function so marked is sendable where its receiver
+    and every argument are a `match` function written in place, a value of a sendable type, a
+    marked parameter or class field, or another such call; chains of `orElse` follow. The promise
+    is refused outside the standard library, since nothing checks it against the body, and a call
+    that names the method statically reaches no override. A combination held in a local is a
+    `PartialFunction` again, as a marked parameter copied into one is. Only `orElse` makes the
+    promise: `lift` answers a function whose captures a program's own `PartialFunction`
+    implementation decides, and `applyOrElse` answers a value, not a partial function.
+    *Alternatives weighed*: a general rule that any call whose parts are sendable is sendable
+    (unsound: the call may answer a fresh object with a `var`, or reach module-level state); a
+    conditional `Sendable` impl for `OrElsePartialFunction` (the result's static type is the trait,
+    which no impl of the class reaches); hard-coding `PartialFunction.orElse` in the checker (the
+    annotation says the same and names its users); a `@sendable` mark on trait types, under review
+    in the entry above, which would subsume this. **Review with the user**: whether a program's own
+    combinators should be able to make the promise, checked against the body (a body that only
+    builds an object of a final class from its parameters).
+  - **A `match` function where a `PartialFunction` is expected, passed for a type argument bounded
+    by `Sendable`, meets the bound**, as a lambda there does: its two lambdas are made as
+    `@sendable` functions and checked where they are made, the one running its arms holding every
+    pattern, guard and body, so a fault is reported once. `PartialFunction` itself does not promise
+    `Sendable`, so the bound is waived at that call only where every value the call gives the
+    callee of the type argument is such a function: each parameter whose type could give one (any
+    position but what a function passed takes, a data type's or a class's argument counted whatever
+    its variance) is of exactly that type and given such a function. A written type argument is
+    held to the bound as written, as `take[(int) -> int](…)` is. *Why*: the callee obtains values
+    of its type argument only from its arguments, each of which was checked. *Alternatives
+    weighed*: a sendable form of the `PartialFunction` type (the trait-type mark under review
+    above); making `MatchPartialFunction` promise `Sendable` (it holds two plain function fields,
+    which are not sendable, and a `match` function's static type is the trait anyway).
+
+**Deferred**
+
+- Public C interoperability. Until then, C is reached through Sysl.
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
