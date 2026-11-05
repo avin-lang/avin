@@ -12189,7 +12189,16 @@ private call_argument(c: *Checker, arg: Argument, param: Option[&Type], open: *B
             // on a map of cats takes `W >: Cat` as `Animal`.
             val raw = if *p is ByName(r) then r else inner
             val loose = loosen(c, raw, open, true)
-            if same_type(zonk(c, loose), inner) then return delayed_argument(c, arg, p, inner)
+            if same_type(zonk(c, loose), inner)
+                // What the delayed expression yields decides the unknowns `inner` still has, as a strict
+                // argument's type does: `byName(Box(x))` for `byName[U >: T, F](o: -> Box[Result[U, F]])`
+                // takes `U` and `F` from `x`.
+                val before = c.units[unit].report.len()
+                val given = delayed_argument(c, arg, p, inner)
+                if c.units[unit].report.len() == before && *given.ty is ByName(yields)
+                    if !(*yields is Nothing) && !same_type(zonk(c, yields), zonk(c, inner)) && !constrain(c, raw, yields, open, true)
+                        c.note(unit, arg.value.span, mismatch(c, zonk(c, raw), yields))
+                return given
             val delayed = delayed_argument(c, arg, ByName(loose), loose)
             if *delayed.ty is ByName(yields)
                 // One that yields an `Option[Nothing]` converts as the value of the lambda it is
@@ -12287,6 +12296,11 @@ private any_open(types: Buf[&Type], open: *Buf[usize]) -> bool
 // `Animal`. Named anywhere else (an invariant or contravariant argument, a function's parameter) it
 // is decided for good and leaves `open`, and every later argument must be an instance of it.
 private constrain(c: *Checker, p: &Type, actual: &Type, open: *Buf[usize], covariant: bool) -> bool
+    // A delayed argument is a function of no parameters the callee calls at each read, so it is held
+    // to a by-name parameter as such a function is to a function type: what it yields may be a
+    // subtype of what the parameter yields, `-> Option[Dog]` given for `-> Option[Animal]`.
+    if *zonk(c, p) is ByName(pi)
+        if *zonk(c, actual) is ByName(ai) then return constrain(c, Function(buf(), pi), Function(buf(), ai), open, covariant)
     if !mentions_open(p, open) then return unify(c, p, upcast(c, actual, p))
     val v = zonk(c, actual)
     *p match

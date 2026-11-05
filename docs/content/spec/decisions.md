@@ -1693,6 +1693,21 @@ their words are reserved.
   `Channel.send` doing the same with what it sends, which it does not do now because handing a value
   over walks it, and a channel of plain values should not pay for that (the compiler would skip
   the walk for a type that cannot reach a handle).
+- [Executors](/spec/threads/#executors) (2026-11-04): `Executor.fixed(n)` keeps at most `n` tasks
+  working at once and starts its workers as work comes, as the shared pool does, a worker waiting in
+  `await` or `blocking` leaving its place to another; `n` below one traps. After `shutdown()`,
+  `ex.future(body)` traps, while the `map`, `flatMap` and `onComplete` of futures already made on
+  the executor still run there, on a worker started for them where none is left, so no future made
+  before is stranded. `Executor.shared().shutdown()` traps, since every `Future(body)` runs there.
+  `ex.isShutdown()` answers whether it was shut down. `Future.successful`, `Future.all`,
+  `Future.first`, `Future.traverse` and a promise's future belong to the shared executor.
+- [`sleep`](/spec/threads/#futures) (2026-11-04): a worker that sleeps keeps its place in its pool;
+  a body that should leave it while it sleeps writes `blocking(sleep(d))`. Sleeping is a runtime
+  function bound `blocking` over Sysl's `sleep`, which waits out the whole duration.
+- [`orElse` on a future of a `Result`](/spec/threads/#futures) (2026-11-04):
+  `orElse[U >: T, F](other: -> Future[Result[U, F]])`, widening the value as `Result.orElse` does.
+  `Future` stays invariant, since its cell is a mutable field, so a fallback written in place as
+  `Future.successful(Ok(0))` needs its type stated where nothing else decides its error type.
 - `Url`'s details ([system library](/spec/system-library/#url)), where the design left them open:
   - `Url` is a `data` type whose `host` is an `Option[string]`, `None` where there is no authority
     (`mailto:a@b`) and `Some("")` where it is empty (`file:///etc`); an IPv6 host keeps its brackets;

@@ -1,0 +1,55 @@
+// expect: exit 0
+// An executor of `n` workers runs more tasks than it has threads, never more than `n` at once, and
+// gives every value. A future made on it runs its `map`, `flatMap` and `onComplete` there: with its
+// one worker busy, a `map` waits for it, where on the shared pool it would not. After `shutdown`, the
+// functions of futures already made on it still run, and `Executor.shared()` is the pool `Future`
+// uses.
+import avin.threads.{sleep, Atomic, Executor, Future, Promise}
+import avin.time.milliseconds
+
+// Counts itself in `active` while it runs, keeping in `most` the largest count seen.
+task(i: int, active: Atomic[int], most: Atomic[int]) -> int
+    val now = active.add(1)
+    most.update(m -> if now > m then now else m)
+    sleep(milliseconds(2))
+    active.sub(1)
+    i * 2
+
+main() -> int
+    val four = Executor.fixed(4)
+    val active = Atomic(0)
+    val most = Atomic(0)
+    val tasks = (0..<40).map(i -> four.future(task(i, active, most))).toVector()
+    val values = Future.all(tasks).await()
+    println(s"forty tasks on four workers: sum ${values.sum()}, at most four at once ${most.load() <= 4}, first ${values(0)}, last ${values(39)}")
+
+    val one = Executor.fixed(1)
+    val ten = one.future(10)
+    println(s"made on one ${ten.await()}")
+    val release = Atomic(false)
+    val busy = one.future
+        while !release.load() do ()
+        "busy done"
+    val mapped = ten.map(x -> x + 1)
+    val chained = ten.flatMap(x -> Future.successful(x + 2))
+    val heard = Promise[int]()
+    ten.onComplete(x -> heard.complete(x + 3))
+    println(s"waiting behind the busy worker ${mapped.await(50)} ${chained.await(1)} ${heard.future.await(1)}")
+    val elsewhere = Future.successful(10).map(x -> x + 4)
+    println(s"the shared pool is free ${elsewhere.await()}")
+    release.store(true)
+    println(s"${busy.await()}, then ${mapped.await()} ${chained.await()} ${heard.future.await()}")
+
+    one.shutdown()
+    println(s"shut down ${one.isShutdown()} ${four.isShutdown()}")
+    println(s"a function of a future made before still runs ${ten.map(x -> x * 10).await()}")
+    four.shutdown()
+    println(s"the queued work is done ${tasks(39).map(x -> x + 1).await()}")
+
+    val shared = Executor.shared()
+    val viaShared = shared.future(6 * 7)
+    println(s"shared ${viaShared.await()} ${shared.isShutdown()}")
+    val nested = Executor.fixed(2)
+    val deep = (0..<6).map(i -> nested.future(nested.future(nested.future(i).await() + 1).await() + 1)).toVector()
+    println(s"nested awaits on two workers ${Future.all(deep).await()}")
+    0
