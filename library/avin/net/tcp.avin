@@ -45,6 +45,8 @@ private class Socket
     recv(into: Array[byte]) -> Result[long, NetFailure]
     shutdownOutput() -> Result[unit, NetFailure]
     setTimeout(ms: int) -> Result[unit, NetFailure]
+    // Does nothing: calling it checks the socket belongs to the code running.
+    held() -> unit
 
 @sysl("avin.rt.resolve_host")
 private resolveRaw(host: string, port: int) -> Result[Vector[Address], NetFailure]
@@ -67,13 +69,15 @@ private val ChunkSize = 8192
 
 // A TCP connection, made by `TcpStream.connect` or a listener's `accept`. Bytes `readLine` reads
 // beyond its line are kept for the next read. A connection may be handed to another thread or actor,
-// which takes it over: its socket is a Sysl handle, so the code that handed it over traps where it
-// uses it again.
+// which takes it over, the bytes read ahead with it: its socket is a Sysl handle, and every
+// operation, one served from those bytes and one on a closed connection included, first checks the
+// socket's owner, so the code that handed it over traps where it uses it again.
 class TcpStream(private val conn: Socket, private var ahead: Array[byte], private var at: int,
         private var closed: bool): Sendable
     // Up to `max` bytes, waiting for at least one; an empty array once the other end has finished
     // sending. `max` is at least one.
     read(max: int) -> Result[Array[byte], IoError]
+        mine()
         if max < 1 then fail(s"a read of $max bytes: a read takes at least one")
         if closed then return Err(closedError())
         if at < ahead.length()
@@ -87,6 +91,7 @@ class TcpStream(private val conn: Socket, private var ahead: Array[byte], privat
     // every line has been read. A line ends at `\n`, a `\r` just before it being part of the
     // terminator, and the last line needs none; bytes that are not UTF-8 become U+FFFD.
     readLine() -> Result[Option[string], IoError]
+        mine()
         if closed then return Err(closedError())
         val line = Buffer[byte]()
         var any = false
@@ -110,6 +115,7 @@ class TcpStream(private val conn: Socket, private var ahead: Array[byte], privat
 
     // Everything the other end sends until it finishes, after what earlier reads left.
     readAll() -> Result[Array[byte], IoError]
+        mine()
         if closed then return Err(closedError())
         val all = Buffer[byte]()
         for k in at..<ahead.length()
@@ -123,6 +129,7 @@ class TcpStream(private val conn: Socket, private var ahead: Array[byte], privat
 
     // Sends all of `bytes`.
     write(bytes: Array[byte]) -> Result[unit, IoError]
+        mine()
         if closed then return Err(closedError())
         conn.sendAll(bytes).mapErr(ioError)
 
@@ -133,19 +140,27 @@ class TcpStream(private val conn: Socket, private var ahead: Array[byte], privat
     // zero or less takes the limit away. The limit is kept in whole milliseconds, a part of one
     // counting as one.
     setTimeout(d: Duration) -> Result[unit, IoError]
+        mine()
         if closed then return Err(closedError())
         conn.setTimeout(millisOf(d)).mapErr(ioError)
 
     // Tells the other end nothing more will be sent; reading goes on.
     shutdownOutput() -> Result[unit, IoError]
+        mine()
         if closed then return Err(closedError())
         conn.shutdownOutput().mapErr(ioError)
 
     // Ends the connection; closing again does nothing. A read or write afterwards answers an error.
     close()
+        mine()
         if !closed
             closed = true
             conn.close()
+
+    // Stops the program where the connection belongs to another thread. `held()` checks an open
+    // socket's owner, and `close()` of a closed one checks it and does nothing else.
+    private mine()
+        if closed then conn.close() else conn.held()
 
     // Up to `max` bytes from the connection itself.
     private received(max: int) -> Result[Array[byte], IoError]
@@ -183,13 +198,16 @@ object TcpStream
         Err(last)
 
 // A socket listening for connections, made by `TcpListener.bind`. Like a connection, it may be handed
-// to another thread, which takes it over.
+// to another thread, which takes it over, and every operation first checks its socket's owner.
 class TcpListener(private val conn: Socket, private val boundPort: int, private var closed: bool): Sendable
     // The port it listens on, the one the platform chose where `bind` was given port 0.
-    port() -> int = boundPort
+    port() -> int
+        mine()
+        boundPort
 
     // Waits for the next connection.
     accept() -> Result[TcpStream, IoError]
+        mine()
         if closed then return Err(io.Other("the listener is closed"))
         conn.accept() match
             Ok(c) -> Ok(TcpStream(c, Array.empty[byte](), 0, false))
@@ -197,9 +215,14 @@ class TcpListener(private val conn: Socket, private val boundPort: int, private 
 
     // Stops listening; closing again does nothing. An `accept` afterwards answers an error.
     close()
+        mine()
         if !closed
             closed = true
             conn.close()
+
+    // Stops the program where the listener belongs to another thread, as a connection's does.
+    private mine()
+        if closed then conn.close() else conn.held()
 
 object TcpListener
     // Listens on the first of the host's addresses, `127.0.0.1` for this machine alone and `0.0.0.0`

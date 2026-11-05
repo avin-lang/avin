@@ -2230,7 +2230,8 @@ their words are reserved.
     the mutable job belongs to that thread alone, and learns through a promise whether it started;
     before, the job was made on the calling thread and handed to the driver. A started `Child` and
     a lines iterator are mutable and not sendable; a thread starts and reads its own commands.
-    Moving one would need `Isolated` or a promise like `TcpStream`'s.
+    Moving one would need `Isolated` or a promise like `TcpStream`'s; a started `Child` has since
+    been given the promise ([proposed](#proposed)), and a lines iterator has not.
 - Settled on the user's delegation 2026-11-05 (built on branch `fix-lone-value`): **A member call on the name of a data type whose variant of its own name has no fields**
   (`Lone.m(…)` with `data Lone()`; branch `fix-lone-value`). The name is both the type and a value
   of it. Proposed: where the type has a static member named `m`, the call is the type's and chooses
@@ -2285,6 +2286,47 @@ their words are reserved.
   parameter. Type arguments are written once, on the type or on the variant, not both. Review with
   the user: whether the "capitalized name" test for reporting a missing variant should instead be
   any name that resolves to nothing on a data type.
+- **Every operation on a connection or a listener checks its socket's owner first** (branch
+  `thread-ownership`). A `TcpStream` keeps the bytes it read ahead in Avin fields, so a read served
+  from them alone never reached the socket, and the code that had handed the connection over read
+  on from them without trapping; a closed connection or listener answered an error, and a
+  listener's `port()` its field, from any thread. Now `read`, `readLine`, `readAll`, `write`,
+  `writeText`, `setTimeout`, `shutdownOutput` and `close` on a connection, and `port`, `accept` and
+  `close` on a listener, first call a runtime method that does nothing on the open socket, or the
+  socket's `close()`, which does nothing on a closed one: both check the owner, so the previous
+  owner traps at every use, open or closed, and the new owner reads the bytes read ahead, which
+  move with the connection. The owner check comes before a read's size check. Why: the promise is
+  that a connection belongs to one thread at a time, and a race on the read-ahead fields is exactly
+  what it rules out. Alternatives weighed: dropping the read-ahead on hand-over (loses bytes the
+  other end sent); a check in the compiler for every field of a class holding a handle (a language
+  rule for what one library type needs); an Avin owner field compared by hand (it would not move
+  when the runtime hands over, which moves only handles).
+- **A started `Child` promises `Sendable`, and moves between threads as a connection does**
+  (branch `thread-ownership`). It holds a runtime token, a handle holding nothing but its owner,
+  and `waitFor`, `isAlive` and `kill` use it first, so handing a child to a thread's or a future's
+  body makes it the body's, the code that handed it over traps at any use while the body runs
+  (`` `Child` belongs to another thread ``), and it comes back to the next user when the body
+  returns. The body may wait for it, stop it and start a sequence's later part. Why a token: a
+  child's own handles come and go (a program that has ended gives its handle back, a part not yet
+  started has none, nor has one whose time ran out before it began), so none of them can carry the
+  promise. Alternatives weighed: `Isolated` (not built yet, and a child is a resource handed over
+  whole, as a connection is, not an object graph being built); keeping it not sendable, so that a
+  thread starts and waits for its own commands (what it was; a server that starts a command and
+  hands it to a waiter could not). A lines iterator stays not sendable: it is consumed where it is
+  made, and the thread reading a command's output can start the command itself.
+- **A handle class's `@sysl` may name it for its traps: `@sysl("avin.rt.Token", named: "Child")`**
+  (branch `thread-ownership`; the director decided that the old owner's trap names the type the user
+  holds). Every trap a handle raises, belonging to another thread and being closed, in compiled code
+  and in the shim, uses that name rather than the class's; the name must be a type's (a capital
+  first, letters, digits and `_`), and nothing else about the handle changes. Why: the trap is read
+  by the code that misused the value, which knows the `Child`, not the private token class inside
+  it. Alternatives weighed: a token class of the same name in a module of its own (two types named
+  `Child`, which misleads a reader of the library); the trap text computed by the runtime from a
+  name the token holds (the check is inline, one compare in compiled code, and its text is fixed
+  when the program is compiled); naming the trap after the class whose method made the call (a
+  rule no reader would guess). `Socket` still names itself, for a `TcpStream` and a `TcpListener`
+  both; naming those for the user's type would need one handle class per type. Review with the
+  user whether they should.
 
 ## Open
 
@@ -2310,7 +2352,4 @@ their words are reserved.
   sendable, is shared by every thread, and nothing yet checks a body against it. `isolate`'s
   whole-program check would; applied to threads it would reject every body that prints, unless
   standard output is a synchronized object the library promises sendable.
-- A `TcpStream` handed to another thread keeps the bytes it read ahead in Avin fields; the code that
-  handed it over traps when it next uses the socket, but a read served from those bytes alone does
-  not reach the socket's owner check.
 - Whether mailboxes may be bounded, and what a `tell` to a full one does, since `tell` never waits.
