@@ -2074,15 +2074,7 @@ their words are reserved.
   on options, leaving a field of one underivable — rejected as the cost falls on every record with
   an optional field. Tuples, `Either` and `Result` have no `Ord` here.
 
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- Proposed on branch `sysl-callbacks` 2026-11-05: [passing Avin functions to
+- Settled on the user's delegation 2026-11-05 (built on branch `sysl-callbacks`): [passing Avin functions to
   Sysl](/spec/sysl-bindings/#callbacks), the choices the request left open:
   - **The closure's lifetime is Sysl's**: the shim's closure captures a counted Sysl value with a
     destructor that holds a root of the collector, so the root is given back when Sysl drops its
@@ -2131,7 +2123,7 @@ their words are reserved.
     function pointer (ties the shim to Avin's internal convention for `bool`).
   - The runtime offers `avin.rt.callbacks_held`, the number of functions Sysl holds, for tests and
     for libraries that want to check they release what they register.
-- Proposed 2026-11-05 (built on branch `sendable-spawn`): **`Sendable` where values cross threads
+- Settled on the user's delegation 2026-11-05 (built on branch `sendable-spawn`): **`Sendable` where values cross threads
   today** ([what is shared](/spec/threads/#what-is-shared)). The actors chapter's build order has no
   step for it; it applies the rule of `isolate`'s body, less the whole-program half, to threads and
   futures. Review with the user: it adds two annotations users can write.
@@ -2183,7 +2175,7 @@ their words are reserved.
     before, the job was made on the calling thread and handed to the driver. A started `Child` and
     a lines iterator are mutable and not sendable; a thread starts and reads its own commands.
     Moving one would need `Isolated` or a promise like `TcpStream`'s.
-- **A member call on the name of a data type whose variant of its own name has no fields**
+- Settled on the user's delegation 2026-11-05 (built on branch `fix-lone-value`): **A member call on the name of a data type whose variant of its own name has no fields**
   (`Lone.m(…)` with `data Lone()`; branch `fix-lone-value`). The name is both the type and a value
   of it. Proposed: where the type has a static member named `m`, the call is the type's and chooses
   among its static members alone; otherwise it is the value's method, its trait methods and
@@ -2197,7 +2189,7 @@ their words are reserved.
   static member and a value method of one name on such a type (an extra rule for a rare case). The
   companion object needs no rule: it cannot share the name of a fieldless variant
   ([declarations](/spec/declarations/#object)).
-- Proposed (branch option-ord-fix): the [polymorphic recursion](/spec/generics/#polymorphic-recursion)
+- Settled on the user's delegation 2026-11-05 (built on branch `option-ord-fix`): the [polymorphic recursion](/spec/generics/#polymorphic-recursion)
   check counts a cycle through a method an impl with bounds of its own adds only along the paths
   whose type argument's outermost type may meet the bounds, that type's own arguments taken as any
   type; a type argument whose outermost type the check does not know (a tuple, a function, a part
@@ -2208,10 +2200,20 @@ their words are reserved.
   types that never meet the bounds); tracking type arguments deeper than the outermost type (exact
   for nested shapes such as a `Box[Box[Plain[T]]]`, which is still counted, at the cost of a much
   larger flow graph). Review with the user if a nested shape turns up in real code.
-- Proposed (branch option-ord-fix): an ordering, `<`, `<=`, `>`, `>=`, settles an unknown in one
+- Settled on the user's delegation 2026-11-05 (built on branch `option-ord-fix`): an ordering, `<`, `<=`, `>`, `>=`, settles an unknown in one
   operand's type from the other's, so `Some(1) < None` compares two `Option[int]`s, as `==` already
   did. Why: the two operands of an ordering are one type, so the other operand is the only evidence
   and the obvious one. Alternative: requiring `None[int]`, which `==` does not.
+
+**Deferred**
+
+- Public C interoperability. Until then, C is reached through Sysl.
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
