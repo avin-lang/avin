@@ -1580,6 +1580,77 @@ Settled by the user on 2026-11-04:
   handle's method answers are copied into Sysl memory before the thread leaves the safe region. A
   blocking call therefore never reads or writes the Avin heap, and an argument that is a pointer
   into it, such as a buffer Sysl fills, would need its object held by a frame for the whole call.
+- Settled by the user 2026-11-04: [`Url`](/spec/system-library/#url) follows RFC 3986 as the
+  established library's URI does, beyond the first design: user information; IPv6 hosts in
+  brackets, with a zone; `base.resolve(ref)` by section 5.2, dot-segment removal included;
+  `withScheme`, `withUserInfo`, `withHost`, `withPort`, `withPath`, `withQuery` and `withFragment`;
+  and a trapping `Url(text)` beside `Url.parse(text)`, as `Regex(p)` beside `Regex.compile(p)`.
+
+Actors and state machines ([actors and state machines](/spec/actors/)), settled by the user
+2026-11-04 as written. They answer the open questions on how actors and machines work and whether
+their words are reserved.
+
+- Settled by the user 2026-11-04: **Messages are checked by `Sendable`**, a trait the compiler decides for each type from its
+  structure and that is written as a bound; `ActorRef[-M: Sendable]` makes the check once, where a
+  message type is named, never at a send. An actor's parameters and every type `ask` and `adapter`
+  carry are sendable too.
+- Settled by the user 2026-11-04: **What is sendable**: the scalars, `unit` and `string`; tuples and `data` of sendable fields; the
+  immutable collections of sendable elements; a final class or an `object` with no `var` field and
+  only sendable fields; a trait declared `: Sendable`, each implementor checked; `ActorRef`,
+  `Behaviour`, and `Future`, `Promise`, `Channel` and `Atomic` of a sendable type; `Mutex` of any
+  type (the one deliberate door to shared mutable state); `Once`; Sysl handles; `Isolated[T]`. Not:
+  arrays, buffers, deques, mutable maps and sets, classes with a `var` or an `open` or `abstract`
+  class, machines, function values (their captures are not in their type) and `Any`.
+- Settled by the user 2026-11-04: **Ownership transfer.** A Sysl handle in a message is put in transit by the send and taken by its
+  first user, the receiver; the sender's later use traps, through the handle's owner check. A mutable
+  object graph moves as an `Isolated[T]`, made by `isolate(body)`: the compiler checks the body reads
+  only sendable values from around it and that nothing it calls, transitively, reaches module-level
+  mutable state; `take()` gets it out once (a second take traps) and `with(f)` works on it in place
+  under the same check.
+- Settled by the user 2026-11-04: **Declaring an actor**: `actor Name[T](params) receives M`; the body runs once at the actor's start
+  and holds its fields; `receive` holds `match` arms over `M`, checked for exhaustiveness; methods
+  are private helpers; `self` is the actor's `ActorRef[M]`, and the object holding its state is
+  never a value.
+- Settled by the user 2026-11-04: **Behaviours and `spawn`**: `Counter(0)` is an immutable `Behaviour[M]`, and
+  `spawn(behaviour, onFailure = Escalate, executor = Executor.shared())` starts it and answers an
+  `ActorRef[M]`, in `avin.actors`. Code an actor runs starts a child; code elsewhere a top-level actor.
+- Settled by the user 2026-11-04: **`tell` and the mailbox**: `tell(message)` never waits and never fails (no `!`, which is
+  reserved); the mailbox is unbounded; one sender's messages to one actor arrive in order; a message
+  to an ended actor is dropped.
+- Settled by the user 2026-11-04: **`ask`** is `ask(make: ActorRef[R] -> M, timeout: Duration) -> Future[Result[R, AskError]]`, the
+  timeout required, `AskError` being `TimedOut` or `Ended`; reply addresses are ordinary
+  `ActorRef[R]`s; `adapter(f)` makes a reference translating another protocol into the actor's own;
+  `pipeToSelf(future, f)` delivers a future's value as a message.
+- Settled by the user 2026-11-04: **Supervision**: a trap in an actor fails only that actor, its frames unwound and the trap reported
+  with the actor's name, except while it holds a `Mutex`, runs a `Once`, initializes a `lazy val` or
+  is inside a Sysl call, where the program stops. `Supervision` is `Escalate` (the default: the
+  parent fails, and a top-level actor stops the program, so an unsupervised program behaves as one
+  with threads), `Stop`, or `Restart(limit, within)`, re-running the body from the same behaviour
+  with the mailbox kept. There is no resuming with the old state.
+- Settled by the user 2026-11-04: **Lifecycle**: `stop()` ends the actor after the current message, dropping its mailbox; `stop(child)`
+  only for its own children; children end first; a `stopping` block runs at every end and restart;
+  `watch(ref, message)` and `watch(ref, f: Ending -> M)` deliver the end into the watcher's own
+  mailbox, `Ending` being `Stopped` or `Failed(reason)`; `ref.ended()` is a `Future[Ending]` for code
+  outside actors; an actor is not collected while it runs; the program ends when `main` returns.
+- Settled by the user 2026-11-04: **Timers**: `after(delay, message)` and `every(interval, message)` answer a cancellable `Timer`,
+  queued like any message and cancelled when the actor ends or restarts.
+- Settled by the user 2026-11-04: **Scheduling**: actors are tasks on an `Executor` (the shared pool by default); an actor runs on
+  one thread at a time, each message's handling happening before the next's; a worker handles at most
+  16 messages of one actor before re-queuing it; the worker repoints its context's owner word to the
+  actor so the actor's handles never trap; a waiting actor is replaced in the pool as a waiting
+  future is; `tell` happens before the handling of its message.
+- Settled by the user 2026-11-04: **Machines**: `machine Name receives E` with `state S(params)` blocks; an arm's value is the next
+  state, or `stay`; the first state, without parameters, is the start; `enter` and `leave` run on
+  every transition (a state yielded again included) and not on `stay`; `receive` holds arms shared by
+  every state, tried after the state's own; the compiler checks every state handles every event;
+  `handle(event)` answers the new state and `state()` the current one, of the generated `Name.State`
+  data type; a machine is not sendable, and handling an event from inside its own handler traps.
+- Settled by the user 2026-11-04: **An actor's behaviour is a machine**: an actor's body takes the same `state` blocks, its messages
+  being the events, with the same checks; a restart starts it again in its first state.
+- Settled by the user 2026-11-04: **Keywords are contextual**: `actor` and `machine` only where a declaration starts, `receives` only
+  in their headers, and `state`, `receive`, `enter`, `leave`, `stopping` and `stay` only inside their
+  bodies at the start of a line (`stay` as an arm's value), so `state` stays an ordinary name
+  elsewhere.
 
 **Deferred**
 
@@ -1604,6 +1675,27 @@ Settled by the user on 2026-11-04:
   `orElse[U >: T, F](other: -> Future[Result[U, F]])`, widening the value as `Result.orElse` does.
   `Future` stays invariant, since its cell is a mutable field, so a fallback written in place as
   `Future.successful(Ok(0))` needs its type stated where nothing else decides its error type.
+- `Url`'s details ([system library](/spec/system-library/#url)), where the design left them open:
+  - `Url` is a `data` type whose `host` is an `Option[string]`, `None` where there is no authority
+    (`mailto:a@b`) and `Some("")` where it is empty (`file:///etc`); an IPv6 host keeps its brackets;
+    `userInfo`, `query` and `fragment` are `Option`s like `port`.
+  - Components are kept as written, escapes and all; `Url.decode` is the way to their text.
+  - `parse` holds the scheme and host in lower case and a default port as `None`, so `==` compares
+    the normalized URL and display needs no work of its own. Defaults are 80 for `http` and `ws`,
+    443 for `https` and `wss`, and `portOrDefault()` answers an `Option[int]`, `None` for a scheme
+    with no default.
+  - Escapes that do not decode to UTF-8 make text no URL (`InvalidUtf8`), at `parse` and in each
+    `with` method, so `queryParams` keeps the plain `Vector` the design gives it; `Url.decode`
+    answers a `Result`.
+  - `queryParams` reads `+` as a space and skips empty pieces; `decode` keeps `+`.
+  - `UrlError` is `MissingScheme`, `BadScheme`, `BadCharacter`, `BadPercent`, `BadHost`, `BadPort`
+    and `InvalidUtf8`, each but the first with the byte offset `at`.
+  - A zone is accepted only as RFC 6874 writes it, after `%25`; hosts of a later form (`[v7.x]`)
+    are accepted; characters beyond ASCII other than controls and spaces are accepted in any
+    component and kept.
+  - `resolve(ref: string)` answers a `Result`, the reference being text; `resolve(ref: Url)` takes
+    one already read. The `with` methods take components as written and trap on one the URL cannot
+    hold; each optional component's method takes a value or an `Option`.
 
 ## Open
 
@@ -1624,11 +1716,5 @@ Settled by the user on 2026-11-04:
     for more than one target.
 
 - Resource cleanup: a `defer` construct or a library `use`.
-- How actors work: how messages are declared and sent, mailboxes and replies, how actors are
-  scheduled onto threads, what an actor may share with others on the heap, and failure and
-  supervision.
-- How state machines work: events and transitions, data held by the machine and by each state,
-  entry and exit actions, checking that every event is handled, and whether an actor's behaviour
-  can be a machine.
-- Whether `actor`, `machine` and `state` are reserved everywhere or only where a declaration
-  starts; `state` is a common name for a variable or field.
+- Whether a function value can ever be sent between actors, with a type that says what it captures.
+- Whether mailboxes may be bounded, and what a `tell` to a full one does, since `tell` never waits.
