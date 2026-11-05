@@ -2676,6 +2676,40 @@ their words are reserved.
   keeps a handle usable by whoever runs the actor. Alternatives weighed: numbers per declaration
   (`Counter#1`, `Logger#1`; needs a registry of names); dropping messages to an actor whose executor
   is shut down (a silent loss the spec does not ask for).
+- Proposed 2026-11-05 (built on branch `actor-declarations`): **An `actor` declaration is read into
+  a function and a hidden class** ([declaring an actor](/spec/actors/#declaring-an-actor)).
+  `actor Counter(start: int) receives M` is the function `Counter(start: int) -> Behaviour[M]`,
+  with the parameters' defaults, and a private class holding the actor's reference, the parameters
+  and the body's fields and methods, whose name (`actor Counter`) no program can write. The start
+  of the behaviour makes one object of that class, which runs the body, and gives back the call of
+  its `receive` match; inside the body `self` reads the reference. Why: it lowers onto the library's
+  `Behaviour` with no runtime support, as the chapter says a declaration is, and the class gives the
+  body's methods the implicit receiver and its fields their life across messages for free, while
+  the object never becomes a value the program sees. Alternatives weighed: the body's fields as the
+  start lambda's locals and its methods as local functions (no implicit receiver, and forward
+  references between methods break); a runtime-known actor class (machinery the runtime does not
+  need).
+- Proposed 2026-11-05 (built on branch `actor-declarations`): **What an actor's parameters may be.**
+  Each parameter's type is held to `Sendable` where the actor is declared, not where the start
+  captures it, so the error names the actor and the parameter; one the program marks `@sendable`
+  is exempt, as a marked parameter of a function is sendable inside it whatever its type. A `var`
+  parameter is a field the actor may change, each start beginning again from the argument; a
+  repeated parameter is allowed; a by-name one is refused. An argument is checked only by its type,
+  so `Worker(s"$label$made")` computed from an actor's own `var` is accepted. Why: the chapter says
+  the parameters follow a class's rules and must be sendable; this is the reading that adds no rule
+  of its own. Alternatives weighed: marking every parameter `@sendable` (then an argument computed
+  from a `var` is refused, since what is passed for a marked parameter is checked by what it reads);
+  refusing `val` and `var` parameters (no gain: nothing outside the actor reaches its fields).
+- Proposed 2026-11-05 (built on branch `actor-declarations`): **An actor's diagnostics name the
+  actor.** A message type that is not sendable is reported once where it is written after
+  `receives` (`` `Buffer[int]` does not conform to `Sendable`, so the actor `Buffers` cannot receive
+  it ``), not once for the behaviour and once for the reference; a `receive` that does not cover the
+  message type says `` actor `Partial` does not handle `C` `` and how a message is ignored; module-level
+  state reached from the body, an arm or a method is `` the actor `Arm` may run on another thread ``,
+  the path naming the actor's methods by their own names; a method value carrying the state is `the
+  state of the actor`. Why: the program wrote an actor, not a behaviour and a lambda. Alternatives
+  weighed: the generic messages of the `@sendable` start (they name a function type the program
+  never wrote).
 
 ## Open
 

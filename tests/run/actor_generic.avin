@@ -1,0 +1,77 @@
+// expect: exit 0
+// A generic actor: the chapter's `Cache[K: Hash + Sendable, V: Sendable](limit: int) receives
+// CacheMsg[K, V]`, at two instances, with its type arguments written and inferred from what is
+// expected; one whose type parameter is the message type itself; one whose parameter holds a value
+// of its type parameter; and one generic actor spawning another at its own type argument.
+import avin.actors.{ActorRef, Behaviour, spawn}
+import avin.threads.Promise
+
+data CacheMsg[K: Sendable, V: Sendable]
+    Put(key: K, value: V)
+    Lookup(key: K, reply: Promise[Option[V]])
+    Size(reply: Promise[int])
+
+actor Cache[K: Hash + Sendable, V: Sendable](limit: int) receives CacheMsg[K, V]
+    var entries: Map[K, V] = Map()
+    var order: Vector[K] = Vector()
+
+    receive
+        Put(key, value) ->
+            if entries.get(key) is None then order = order :+ key
+            entries = entries.updated(key, value)
+            if order.length() > limit
+                entries = entries.removed(order.head())
+                order = order.tail()
+        Lookup(key, reply) -> reply.complete(entries.get(key))
+        Size(reply) -> reply.complete(order.length())
+
+actor Echo[T: Sendable] receives (T, Promise[T])
+    receive
+        (value, reply) -> reply.complete(value)
+
+data Hold[T: Sendable]
+    Read(reply: Promise[T])
+    Write(value: T)
+
+actor Holder[T: Sendable](initial: T) receives Hold[T]
+    var value = initial
+    receive
+        Read(reply) -> reply.complete(value)
+        Write(v) -> value = v
+
+actor Relay[T: Sendable](initial: T) receives Promise[T]
+    val inner = spawn(Holder[T](initial))
+    receive
+        reply -> inner.tell(Read(reply))
+
+lookup[K: Sendable, V: Sendable](c: ActorRef[CacheMsg[K, V]], key: K) -> Option[V]
+    val p = Promise[Option[V]]()
+    c.tell(Lookup(key, p))
+    p.future.await()
+
+main()
+    val words = spawn(Cache[string, int](2))
+    words.tell(Put("one", 1))
+    words.tell(Put("two", 2))
+    words.tell(Put("three", 3))
+    println(s"${lookup(words, "one")} ${lookup(words, "two")} ${lookup(words, "three")}")
+    val inferred: Behaviour[CacheMsg[int, string]] = Cache(5)
+    val numbers = spawn(inferred)
+    for i in 1..7 do numbers.tell(Put(i % 3, s"v$i"))
+    val size = Promise[int]()
+    numbers.tell(Size(size))
+    println(s"${size.future.await()} ${lookup(numbers, 0)} ${lookup(numbers, 1)} ${lookup(numbers, 9)}")
+    val echo = spawn(Echo[string]())
+    val e = Promise[string]()
+    echo.tell(("echoed", e))
+    println(e.future.await())
+    val h = spawn(Holder(Some(3)))
+    h.tell(Write(None))
+    val r = Promise[Option[int]]()
+    h.tell(Read(r))
+    println(r.future.await())
+    val relay = spawn(Relay[Vector[string]](Vector("a", "b")))
+    val v = Promise[Vector[string]]()
+    relay.tell(v)
+    println(v.future.await())
+    println(s"$words $numbers $echo $h $relay")

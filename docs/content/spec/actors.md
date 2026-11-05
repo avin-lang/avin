@@ -41,7 +41,10 @@ actor Counter(start: int) receives CounterMsg
   for a class's, with defaults and named arguments.
 - **The body is the actor's start.** Its fields and statements run once, on the actor's own
   execution, before it handles any message: that is where its state is made. The parameters are its
-  immutable fields, as a class's plain parameters are.
+  immutable fields, as a class's plain parameters are, and each one's type must be `Sendable`, which
+  is checked where the actor is declared. Since an actor runs on any of an executor's workers,
+  nothing its body, its arms or its methods reach may be a module-level `var` or a module-level
+  value that is not sendable.
 - **`receive` holds the arms** that handle a message: exactly a `match`'s arms over `M`, with
   patterns, guards and block bodies, and checked for exhaustiveness in the same way. A message the
   actor wants to ignore is handled by an arm that does nothing, `_ -> ()`, so ignoring one is always
