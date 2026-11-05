@@ -300,7 +300,7 @@ copyNotes(from: string, to: string) -> Result[unit, IoError]
 | `exists(file) -> bool` | Whether anything, file or directory, is at the path. |
 | `isDir(file) -> bool` | Whether the path names a directory. |
 | `isFile(file) -> bool` | Whether the path names something that is not a directory. |
-| `remove(file) -> Result[unit, IoError]` | Removes a file; never a directory. |
+| `remove(file) -> Result[unit, IoError]` | Removes a file; never a directory, which is `IsADirectory`. A link is removed, not what it names. |
 | `removeDir(dir) -> Result[unit, IoError]` | Removes an empty directory; `DirectoryNotEmpty` otherwise. |
 | `removeDirAll(dir) -> Result[unit, IoError]` | Removes a directory and everything in it; a path already gone is success. |
 | `createDir(dir) -> Result[unit, IoError]` | Makes one directory, whose parent must exist; `AlreadyExists` if something is there. |
@@ -367,8 +367,8 @@ the `sinceEpoch` duration. These are [operator methods](/spec/operators-and-cont
 of the reading types, so a reading of one clock less a reading of the other does not compile.
 
 **Order, equality and text.** All three types compare by value and are ordered, so `<`, `==` and
-`max` work on them. A duration displays in the largest unit it fills, with its fraction and no
-trailing zeros: `3us`, `1.5ms`, `90.5s`, `-500ms`; its `Debug` form wraps that as `Duration(1.5ms)`.
+`max` work on them. A duration displays in the largest of `us`, `ms` and `s` it fills, with its fraction
+and no trailing zeros: `3us`, `1.5ms`, `90.5s`, `-500ms`, and an hour as `3600s`; its `Debug` form wraps that as `Duration(1.5ms)`.
 A `WallTime` displays as an ISO 8601 UTC timestamp with microseconds, `2026-11-04T12:34:56.000045Z`,
 in the proleptic Gregorian calendar.
 
