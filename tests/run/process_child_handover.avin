@@ -1,0 +1,80 @@
+// expect: exit 0
+// A started command is sendable: handed to a thread or a future, it is the body's, which waits for
+// it, asks whether it is alive and stops it; when the body returns, it goes back to whoever uses it
+// next, so it is handed back and forth, and the same status comes back wherever it is asked for. A
+// sequence's later part is started by whichever thread moves it on, a pipeline's stages are waited
+// for there, and many children go to one thread in a vector.
+import avin.io.IoError
+import avin.process.{Child, Command, ExitStatus}
+import avin.threads.{Future, spawn}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message())
+
+// Holds it to the bound, at compile time: a `Child` is sendable.
+carry[T: Sendable](value: T) -> T = value
+
+main()
+  // A thread waits for it; this thread then gets the same status.
+  val quick = ok(Command("/bin/sh", "-c", "exit 4").start())
+  println(spawn(() -> quick.waitFor()).join())
+  println(quick.waitFor())
+  println(quick.isAlive())
+
+  // A future waits for it.
+  val other = ok(Command("/bin/sh", "-c", "exit 5").start())
+  println(Future(other.waitFor()).await())
+  println(other.waitFor())
+
+  // The body asks whether it is alive and stops it; this thread sees how it ended.
+  val sleeper = ok(Command("/bin/sleep", "30").start())
+  println(spawn(() ->
+    val alive = sleeper.isAlive()
+    sleeper.kill()
+    (alive, sleeper.waitFor(), sleeper.isAlive())).join())
+  println(sleeper.waitFor())
+  sleeper.kill()
+
+  // Back and forth, through threads and futures, and nested.
+  val long = ok(Command("/bin/sleep", "30").start())
+  for round in 0..<4
+    val alive = if round % 2 == 0 then spawn(() -> long.isAlive()).join() else Future(long.isAlive()).await()
+    println(s"round $round: $alive ${long.isAlive()}")
+  println(spawn(() ->
+    spawn(() -> long.kill()).join()
+    Future(long.waitFor()).await()).join())
+  println(long.waitFor())
+
+  // A sequence handed over before its first part ends: its second part is started by the thread.
+  val steps = ok((Command("/bin/sleep", "0.2") andThen Command("/bin/sh", "-c", "exit 3")).start())
+  println(spawn(() -> steps.waitFor()).join())
+  println(steps.waitFor())
+  // One the thread stops before its second part starts.
+  val stopped = ok((Command("/bin/sleep", "30") followedBy Command("/bin/sh", "-c", "exit 7")).start())
+  println(spawn(() ->
+    stopped.kill()
+    stopped.waitFor()).join())
+  println(stopped.isAlive())
+
+  // A pipeline's stages waited for by a future.
+  val piped = ok((Command("/bin/sh", "-c", "exit 1") | Command("/bin/sh", "-c", "exit 6")).start())
+  println(Future(piped.waitFor()).await())
+
+  // Many at once, in a vector a thread waits on, then this thread again.
+  val many = (0..<5).map(i -> ok(Command("/bin/sh", "-c", s"exit $i").start())).toVector()
+  println(spawn(() -> many.map(c -> c.waitFor())).join())
+  println(many.reverse().map(c -> c.isAlive()))
+
+  // Each one waited for by a thread of its own.
+  val each = (0..<4).map(i -> ok(Command("/bin/sh", "-c", s"exit ${10 + i}").start())).toVector()
+  val waiters = each.map(c -> spawn(() -> c.waitFor())).toVector()
+  println(waiters.map(t -> t.join()))
+
+  // Returned from a thread that started it: the child is started on one thread, used on another.
+  val made = spawn(() -> ok(Command("/bin/sh", "-c", "exit 8").start())).join()
+  println(made.waitFor())
+  println(Future(ok(Command("/bin/sh", "-c", "exit 9").start())).await().waitFor())
+
+  // A child in a generic sendable position.
+  println(carry(ok(Command("/usr/bin/true").start())).waitFor())

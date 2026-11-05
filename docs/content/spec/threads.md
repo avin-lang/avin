@@ -59,9 +59,9 @@ The heap is shared: every object is reachable from every thread that is handed a
 Nothing is copied when a thread starts; the closure and what it captures are simply reachable from
 the new thread too. **So what a thread is given is checked**: a closure that runs on another thread
 captures only [sendable](/spec/actors/#what-may-be-sent) values and no `var`, and the value it gives
-back is sendable. The threads then share nothing mutable but through the synchronized types, a
-`Mutex`, an `Atomic`, a `Channel`, a `Once` and a `Condition`, and the module-level state below. The
-error names what is captured and why it cannot be:
+back is sendable, and the code it runs reaches no module-level mutable state (below). The threads
+then share nothing mutable but through the synchronized types, a `Mutex`, an `Atomic`, a
+`Channel`, a `Once` and a `Condition`. The error names what is captured and why it cannot be:
 
 ```text
 error: what is passed for `body` of `spawn` may use only sendable values from around it, but it uses `parts`, an `Array[int]`, which is mutable; an immutable copy (`toVector`) is sendable
@@ -97,8 +97,33 @@ future's `map`, `flatMap` and `onComplete` and the `orElse` of a future of a `Re
 functions run on a pool thread. A mutex's value and the body of its `with` are `@isolated`
 ([synchronization](#synchronization)).
 
-Module-level `val`s, `var`s and `object`s are shared by all threads, and a body may reach them
-through the functions it calls.
+**Module-level state is shared by every thread**, and a body reaches it by name, not by capture.
+So what is passed for a `@sendable` parameter, directly or through every function it calls, may
+read and write no module-level `var`, and may read no module-level `val`, `lazy val` or `object`
+whose type is not sendable. Avin compiles the whole program, so every function a body can reach is
+known: the one a call names, every implementation a call through a trait method or an operator may
+reach, every closure made on the way, and an extractor a pattern calls. A module-level `val` of an
+`Atomic`, a `Mutex`, a `Channel` or immutable data is the way to share state between threads; a
+`lazy val` of a sendable type is initialized once whichever threads read it. The error names the
+module-level item and the functions it is reached through:
+
+```text
+var hits = 0
+
+record() = hits += 1
+
+main()
+    spawn(() -> record()).join()
+```
+
+```text
+error: what is passed for `body` of `spawn` may run on another thread, which shares the program's module-level state, but through `record` it reaches `hits`, a module-level `var`, which every thread would share; share it through an `Atomic` or a `Mutex` held in a `val`
+```
+
+With `val hits = Atomic(0)` and `record() = hits.add(1)` the program is legal. Printing is legal from any
+thread: `print`, `println` and `eprintln` reach the runtime's streams, which keep no state of the
+program's. What is passed for an `@isolated` parameter runs at once on the calling thread and is not
+held to this.
 
 A [Sysl handle](/spec/sysl-bindings/#handles) is the exception: it belongs to one owner at a time,
 and a use by any other code traps. The handles a thread's body or a future's body reaches move to

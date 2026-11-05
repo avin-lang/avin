@@ -150,7 +150,7 @@ class Command(
   start() -> Result[Child, IoError] = launch(
     Context(None, [], None),
     Streams(Inherit, None, Inherit, None)
-  ).map(job -> Child(job))
+  ).map(job -> Child(job, newOwner()))
 
   // Whether the command holds a sequence, whose later parts start as its earlier ones end.
   private sequenced() -> bool = shape match
@@ -250,18 +250,27 @@ impl string
   // The string as a command line, `Command.parse(self).output()`.
   output() -> Result[string, CommandError] = Command.parse(self).output()
 
-// A command that has been started: it is waited for, asked whether it is still running, and stopped,
-// by the code that started it.
-class Child(private val job: Job)
+// A command that has been started: it is waited for, asked whether it is still running, and stopped.
+// It belongs to one thread at a time, as a connection does: handed to another thread's or a future's
+// body, it is the body's, which may wait for it, stop it and start its later parts, and every
+// operation first checks the child's owner, so the code that handed it over traps where it uses it
+// again while the body runs.
+class Child(private val job: Job, private val owner: Owner): Sendable
   // Waits for the command to end and answers how it ended, the same answer every time.
-  waitFor() -> Result[ExitStatus, IoError] = finished(job)
+  waitFor() -> Result[ExitStatus, IoError]
+    owner.held()
+    finished(job)
 
   // Whether the command is still running, without waiting for it.
-  isAlive() -> bool = !job.poll()
+  isAlive() -> bool
+    owner.held()
+    !job.poll()
 
   // Asks every program of the command still running to stop, with the signal 15, and starts no
   // part not yet started.
-  kill() = job.stop()
+  kill()
+    owner.held()
+    job.stop()
 
 // What the command is: one program, a pipeline, or two commands one after the other.
 private data Shape
@@ -614,6 +623,17 @@ private data Stdio
 
 @sysl("sysl.process.Var")
 private data Var(name: string, value: string)
+
+// Who a started command belongs to: a Sysl handle holding nothing else, which moves between threads
+// with the `Child` that holds it whatever the command's own handles are, a program that has ended
+// and a part not yet started having none. Its traps name the `Child`.
+@sysl("avin.rt.Token", named: "Child")
+private class Owner
+  // Does nothing: calling it checks the child belongs to the code running.
+  held() -> unit
+
+@sysl("avin.rt.token")
+private newOwner() -> Owner
 
 // A started program, which ends it if it is collected before it has been waited for.
 @sysl("sysl.process.Spawned")

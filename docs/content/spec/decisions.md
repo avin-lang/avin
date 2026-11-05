@@ -2072,7 +2072,7 @@ their words are reserved.
   values, following the reference library's ordering of options. It makes `derives Ord` work on a
   data type with an `Option` field and lets options sort and have `max`/`min`. Alternative: no order
   on options, leaving a field of one underivable — rejected as the cost falls on every record with
-  an optional field. Tuples, `Either` and `Result` have no `Ord` here.
+  an optional field. (Tuples already had `Ord`; `Either` and `Result` follow in the next entry.)
 - Settled on the user's delegation 2026-11-05 (built on branch `sysl-handles`): **a handle may name a
   Sysl trait, and its trait object is kept in a cell** ([Sysl bindings](/spec/sysl-bindings/#handles-on-traits)).
   Every handle's object stays two words, the first naming the Sysl value and the second its owner;
@@ -2117,6 +2117,18 @@ their words are reserved.
   reference to a copy under Sysl 0.9.0, as for every such handle, so a Sysl function setting a signal
   is not seen by the handle; the next Sysl release settles the shim's helper at the `&T`, and
   `tests/programs/run/sysl_generic_handle_sharing` waits on it.
+- Settled on the user's delegation 2026-11-05 (built on branch `tuple-ord`): [`Either[L, R]` and `Result[T, E]` are `Ord`](/spec/errors/#either)
+  when both sides are. `Left` orders before every `Right`, following the reference library's
+  ordering of eithers; `Result` is ordered as `Either` with `Err` in the place of `Left`, so every
+  `Err` before every `Ok`. Rationale: both types put the failure on the same side (`Left` and
+  `Err` are the reason, `Right` and `Ok` the value), so the one rule "failure before success" holds
+  for both, and `Err` agrees with `Left` under `toRight`/`toLeft` conversions. Alternatives weighed:
+  `Ok` before `Err`, matching the declaration order of `Result`'s variants (which is what
+  `derives Ord` would give a data type, and what a reader of `data Result` might expect) but
+  disagreeing with `Either`; and no order on `Result`, leaving a record with a result field
+  underivable. Review with the user: the `Err`-first choice is the one a reader of the declaration
+  could find surprising. Tuples needed no change: their `Ord`, lexicographic by part at every
+  arity, was already written by the compiler for each arity and is now covered by tests.
 
 - Settled on the user's delegation 2026-11-05 (built on branch `sysl-callbacks`): [passing Avin functions to
   Sysl](/spec/sysl-bindings/#callbacks), the choices the request left open:
@@ -2218,7 +2230,8 @@ their words are reserved.
     the mutable job belongs to that thread alone, and learns through a promise whether it started;
     before, the job was made on the calling thread and handed to the driver. A started `Child` and
     a lines iterator are mutable and not sendable; a thread starts and reads its own commands.
-    Moving one would need `Isolated` or a promise like `TcpStream`'s.
+    Moving one would need `Isolated` or a promise like `TcpStream`'s; a started `Child` has since
+    been given the promise ([proposed](#proposed)), and a lines iterator has not.
 - Settled on the user's delegation 2026-11-05 (built on branch `fix-lone-value`): **A member call on the name of a data type whose variant of its own name has no fields**
   (`Lone.m(…)` with `data Lone()`; branch `fix-lone-value`). The name is both the type and a value
   of it. Proposed: where the type has a static member named `m`, the call is the type's and chooses
@@ -2248,6 +2261,106 @@ their words are reserved.
   operand's type from the other's, so `Some(1) < None` compares two `Option[int]`s, as `==` already
   did. Why: the two operands of an ordering are one type, so the other operand is the only evidence
   and the obvious one. Alternative: requiring `None[int]`, which `==` does not.
+
+- Settled on the user's delegation 2026-11-05 (built on branch `qualified-variants`): **Qualified variant access, `Type.Variant`** (branch `qualified-variants`, 2026-11-05). Decided:
+  `T.V` and `m.T.V` name data type `T`'s variant `V`, beside the bare `V`, in expressions and
+  patterns; the variant comes before any other member of that name, and a companion object
+  declaring a method or a field named after one of its type's variants is refused where it is
+  declared. A capitalized `T.Name` that is no variant, companion member or static member is reported
+  with the type's variants. Why: the qualified form is meant to be unambiguous, and refusing the
+  companion member keeps it so, at the cost of a rule that only bites on a member spelled like a
+  variant (members are lowerCamelCase, variants PascalCase). Alternatives weighed: the companion's
+  member winning (`Shape.Circle` would then not always be the variant, defeating the point);
+  choosing between them by call shape (a value and a call of one name meaning different things);
+  allowing both silently with the variant winning (the companion member unreachable by name). A
+  static trait member spelled like a variant is not refused, since the trait and the type are
+  declared apart: the variant wins in `T.V`, and the member stays reachable through a type
+  parameter. Type arguments are written once, on the type or on the variant, not both. Review with
+  the user: whether the "capitalized name" test for reporting a missing variant should instead be
+  any name that resolves to nothing on a data type.
+- Settled on the user's delegation 2026-11-05 (built on branch `thread-ownership`): **Every operation on a connection or a listener checks its socket's owner first** (branch
+  `thread-ownership`). A `TcpStream` keeps the bytes it read ahead in Avin fields, so a read served
+  from them alone never reached the socket, and the code that had handed the connection over read
+  on from them without trapping; a closed connection or listener answered an error, and a
+  listener's `port()` its field, from any thread. Now `read`, `readLine`, `readAll`, `write`,
+  `writeText`, `setTimeout`, `shutdownOutput` and `close` on a connection, and `port`, `accept` and
+  `close` on a listener, first call a runtime method that does nothing on the open socket, or the
+  socket's `close()`, which does nothing on a closed one: both check the owner, so the previous
+  owner traps at every use, open or closed, and the new owner reads the bytes read ahead, which
+  move with the connection. The owner check comes before a read's size check. Why: the promise is
+  that a connection belongs to one thread at a time, and a race on the read-ahead fields is exactly
+  what it rules out. Alternatives weighed: dropping the read-ahead on hand-over (loses bytes the
+  other end sent); a check in the compiler for every field of a class holding a handle (a language
+  rule for what one library type needs); an Avin owner field compared by hand (it would not move
+  when the runtime hands over, which moves only handles).
+- Settled on the user's delegation 2026-11-05 (built on branch `thread-ownership`): **A started `Child` promises `Sendable`, and moves between threads as a connection does**
+  (branch `thread-ownership`). It holds a runtime token, a handle holding nothing but its owner,
+  and `waitFor`, `isAlive` and `kill` use it first, so handing a child to a thread's or a future's
+  body makes it the body's, the code that handed it over traps at any use while the body runs
+  (`` `Child` belongs to another thread ``), and it comes back to the next user when the body
+  returns. The body may wait for it, stop it and start a sequence's later part. Why a token: a
+  child's own handles come and go (a program that has ended gives its handle back, a part not yet
+  started has none, nor has one whose time ran out before it began), so none of them can carry the
+  promise. Alternatives weighed: `Isolated` (not built yet, and a child is a resource handed over
+  whole, as a connection is, not an object graph being built); keeping it not sendable, so that a
+  thread starts and waits for its own commands (what it was; a server that starts a command and
+  hands it to a waiter could not). A lines iterator stays not sendable: it is consumed where it is
+  made, and the thread reading a command's output can start the command itself.
+- Settled on the user's delegation 2026-11-05 (built on branch `thread-ownership`): **A handle class's `@sysl` may name it for its traps: `@sysl("avin.rt.Token", named: "Child")`**
+  (branch `thread-ownership`; the director decided that the old owner's trap names the type the user
+  holds). Every trap a handle raises, belonging to another thread and being closed, in compiled code
+  and in the shim, uses that name rather than the class's; the name must be a type's (a capital
+  first, letters, digits and `_`), and nothing else about the handle changes. Why: the trap is read
+  by the code that misused the value, which knows the `Child`, not the private token class inside
+  it. Alternatives weighed: a token class of the same name in a module of its own (two types named
+  `Child`, which misleads a reader of the library); the trap text computed by the runtime from a
+  name the token holds (the check is inline, one compare in compiled code, and its text is fixed
+  when the program is compiled); naming the trap after the class whose method made the call (a
+  rule no reader would guess). `Socket` still names itself, for a `TcpStream` and a `TcpListener`
+  both; naming those for the user's type would need one handle class per type. Review with the
+  user whether they should.
+- Settled on the user's delegation 2026-11-05 (built on branch `module-var-threads`): **a thread's body reaches no
+  module-level mutable state** ([what is shared](/spec/threads/#what-is-shared)). What is passed
+  for a `@sendable` parameter, directly or through every function it reaches, reads and writes no
+  module-level `var` and reads no module-level value, `lazy val` or `object` whose type is not
+  sendable. Reached means: the function a call names; for a call through a method table or a bound,
+  every method of that name in that slot of any type's table; for an operator on a value that is not
+  a scalar, every implementation of the trait method it calls; every closure and function value
+  made along the way; and the code a pattern runs (an extractor's method, a sequence's length). The
+  error names the module-level item and the functions it is reached through, shortest path first.
+  *Why*: a module-level value is reached by name, not captured, so the capture rule of `@sendable`
+  never sees it, and a body that bumps a module-level counter races with `main`. Avin compiles the
+  whole program, so what a call can reach is known, as `isolate`'s check of its body already
+  assumes. *Alternatives*: no check (the memory model makes the race harmless to the collector, but
+  the threads chapter promises that threads share nothing mutable but the synchronized types);
+  rejecting only what the body names itself (misses every call, so it closes nothing); per-thread
+  copies of module-level `var`s (a different meaning for one declaration depending on which thread
+  reads it); and treating each module-level `var` as an implicit `Atomic` (hides a lock in every
+  read and does not make a read-modify-write atomic).
+  - The whole argument counts, not only the closure: `spawn(makeBody())` is checked through
+    `makeBody` and every closure it makes, since what runs on the thread is whatever it gives back.
+    The cost is a rejection where a call evaluated at once on the calling thread reads a `var` to
+    choose the body. *Alternative*: following only closures and function values, which misses a
+    body returned by a call.
+  - A call through a trait method or an operator counts every implementation in the program, since
+    which one a value has is not known where the body is checked. The cost is a rejection where one
+    implementation reads a module-level `var` and the body never meets a value of that type.
+    *Alternative*: following the receiver's static type only where the class is final, which is
+    finer but has to agree with devirtualization.
+  - What is passed for an `@isolated` parameter (a `Mutex`'s value and `with` body) is not held to
+    this, since it runs at once on the calling thread.
+  - Printing stays legal with no promise: `print`, `println`, `eprintln` and the `StandardOutput`
+    and `StandardError` objects reach the runtime's streams, which keep no state in Avin, and the
+    objects hold no field. The standard library's own module-level state is held to the rule like
+    a program's: the futures' worker registry, guarded by its lock, promises `Sendable`, as do the
+    regex library's Unicode run tables (arrays filled before the table is made and never written
+    after), and so does
+    the `Annotation` trait, since a type's shape is one module-level value every thread may read
+    (an annotation type holding a mutable field is now rejected where it implements the trait). A
+    collection's companion object (`Array`, `Buffer`, `Deque`, the mutable `Map` and `Set`) is
+    sendable like any object with no field; only the collections themselves are mutable.
+    Review with the user: whether the `Annotation` promise is wanted, and whether the trait and
+    operator over-approximation rejects too much in practice.
 
 **Deferred**
 
@@ -2316,11 +2429,4 @@ their words are reserved.
 
 - Resource cleanup: a `defer` construct or a library `use`.
 - Whether a function value can ever be sent between actors, with a type that says what it captures.
-- Module-level mutable state reached by a thread's body: a `var`, or a value or `object` that is not
-  sendable, is shared by every thread, and nothing yet checks a body against it. `isolate`'s
-  whole-program check would; applied to threads it would reject every body that prints, unless
-  standard output is a synchronized object the library promises sendable.
-- A `TcpStream` handed to another thread keeps the bytes it read ahead in Avin fields; the code that
-  handed it over traps when it next uses the socket, but a read served from those bytes alone does
-  not reach the socket's owner check.
 - Whether mailboxes may be bounded, and what a `tell` to a full one does, since `tell` never waits.

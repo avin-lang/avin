@@ -864,7 +864,9 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     check_tests_files(&c)
     check_expansion(&c)
     check_tailrec(&c)
-    val init = initializer(&c, initialization_order(&c), testing)
+    val direct = direct_uses(&c)
+    check_module_state_in_threads(&c, direct)
+    val init = initializer(&c, initialization_order(&c, direct), testing)
     // A program without `main` is told so in its last file.
     var main_unit = given - 1
     var entry: Option[usize] = None
@@ -2866,6 +2868,16 @@ private declare_methods(c: *Checker, unit: usize)
         if c.variants.get(key) is Some(v)
             if k.companion_data != Some(v.data) then c.note(unit, d.name_span, s"`${d.name}` is already a variant of `${c.data[v.data].name}`")
             elif c.data[v.data].variants[v.index].fields.len() == 0 then c.note(unit, d.name_span, s"`${d.name}` is a variant of `${d.name}` with no fields, a value by its bare name; a companion object cannot share it")
+        // `T.V` is the variant, so the companion cannot declare a member the variant would hide.
+        if k.companion_data is Some(data_id)
+            for m in d.members
+                val member = m match
+                    MethodMember(f, _, _, _) -> Some((f.name, f.name_span))
+                    FieldMember(f) -> Some((f.name, f.span))
+                    _ -> None
+                if member is Some((name, span))
+                    for v in c.data[data_id].variants
+                        if v.name == name then c.note(unit, span, s"`$name` is a variant of `${d.name}`, which `${d.name}.$name` names; its companion object cannot declare a member of that name")
         if k.companion_data is Some(_) && c.variants.get(key) is None
             if c.scope.get(key) is Some(ids)
                 for f in ids
@@ -5773,7 +5785,8 @@ private structural_sendability(f: Conformances, x: &Type, k: usize, a: SendAssum
                         CannotSend(why) -> CannotSend(s"its elements are ${quoted_type(args[0])}, ${nested_reason(why)}")
                         other -> other
                 val copy = if cls.name == "Buffer" || cls.name == "Array" || cls.name == "Deque" then "; an immutable copy (`toVector`) is sendable" elif cls.name == "Map" then "; an immutable copy (`toMap`) is sendable" elif cls.name == "Set" then "; an immutable copy (`toSet`) is sendable" else ""
-                if copy != "" then return CannotSend(s"it is mutable$copy")
+                // A collection's companion object, which makes collections, holds none itself.
+                if copy != "" && !cls.decl.object then return CannotSend(s"it is mutable$copy")
             if cls.decl.modifier == "trait"
                 return CannotSend(s"it is a trait that does not promise to be sendable; declare it `trait ${cls.name}: Sendable`, and every type implementing it is checked to be")
             if !top && (cls.decl.modifier == "open" || cls.decl.modifier == "abstract")
@@ -6103,6 +6116,125 @@ private texpr_children(e: &TExpr) -> Buf[&TExpr]
 private push_all(out: *Buf[&TExpr], items: Buf[&TExpr])
     for x in items
         out.push(x)
+
+// What is passed for a `@sendable` parameter may run on another thread, and every thread shares the
+// program's module-level state. So the code it runs, directly or through every function it reaches,
+// reads and writes no module-level `var` and reads no module-level value or object (a `lazy val`
+// among them) whose type is not sendable. The whole program is known, so what a call reaches is:
+// the function it names, every implementation a call through a method table or an operator may
+// reach, and every closure made along the way. What is passed for an `@isolated` parameter runs at
+// once on the calling thread, and is not held to this.
+private check_module_state_in_threads(c: *Checker, direct: Buf[Option[Uses]])
+    val k = c.core.trait_named("Sendable") match
+        Some(k) -> k
+        None -> return
+    for id in 0..<c.symbols.len()
+        if id >= c.bodies.len() then break
+        val body = c.bodies[id] match
+            Some(b) -> b
+            None -> continue
+        val root = c.symbols[id].root.unwrap_or(id)
+        var held: Buf[HeldArgument] = buf()
+        scan_thread_bodies(c, id, root, body, k, direct, &held)
+
+private scan_thread_bodies(c: *Checker, id: usize, root: usize, e: &TExpr, k: usize, direct: Buf[Option[Uses]], held: *Buf[HeldArgument])
+    e.kind match
+        Call(f, args, _) -> thread_body_arguments(c, id, f, args, k, direct, held)
+        Dispatch(f, _, args, _) -> thread_body_arguments(c, id, f, args, k, direct, held)
+        BoundCall(f, _, args, _) -> thread_body_arguments(c, id, f, args, k, direct, held)
+        Let(x, value) ->
+            if x < c.locals[root].len() && c.locals[root][x].name == "" then held.push(HeldArgument(x, value))
+        _ -> ()
+    for x in texpr_children(e)
+        scan_thread_bodies(c, id, root, x, k, direct, held)
+
+/** A module-level value a thread's body reaches that it may not, and the functions it is reached
+ * through, from the body outwards. */
+private struct StateReached
+    global: usize
+    via: Buf[usize]
+
+private thread_body_arguments(c: *Checker, id: usize, f: usize, args: Buf[&TExpr], k: usize, direct: Buf[Option[Uses]], held: *Buf[HeldArgument])
+    for i in 0..<args.len()
+        if param_mark(c, f, i) != SendableMark then continue
+        var arg = args[i]
+        if arg.kind is Local(x)
+            for h in *held
+                if h.local == x then arg = h.value
+        val start = with_implementations(c, uses_of(arg))
+        if module_state_reached(c, direct, start, k) is Some(r)
+            val g = c.globals[r.global]
+            var through = ""
+            for step in r.via
+                val s = c.symbols[step]
+                if s.lambda || s.name == "" || s.name.starts_with("<") then continue
+                through = through + (if through == "" then "" else " → ") + s"`${s.name}`"
+            val via = if through == "" then "" else s"through $through "
+            val what = module_state_problem(c, r.global, k).unwrap_or("")
+            c.note(c.symbols[id].unit, args[i].span, s"what is passed for `${c.symbols[f].param_names[i]}` of `${c.symbols[f].name}` may run on another thread, which shares the program's module-level state, but ${via}it reaches $what")
+
+// The first module-level value the uses `start` reach that a thread's body may not, found breadth
+// first so that the path to it is a shortest one.
+private module_state_reached(c: *Checker, direct: Buf[Option[Uses]], start: Uses, k: usize) -> Option[StateReached]
+    if forbidden_global(c, start, k) is Some(g) then return Some(StateReached(g, buf()))
+    val none = c.symbols.len()
+    var parent: Buf[usize] = buf()
+    var seen: Buf[bool] = buf()
+    for _ in 0..<direct.len()
+        parent.push(none)
+        seen.push(false)
+    var pending: Buf[usize] = buf()
+    for f in start.functions
+        if f < direct.len() && !seen[f]
+            seen[f] = true
+            pending.push(f)
+    var next = 0usize
+    while next < pending.len()
+        val f = pending[next]
+        next += 1
+        val u = direct[f] match
+            Some(u) -> u
+            None -> continue
+        if forbidden_global(c, u, k) is Some(g)
+            var chain: Buf[usize] = buf()
+            var at = f
+            while at != none
+                chain.push(at)
+                at = parent[at]
+            var via: Buf[usize] = buf()
+            var j = chain.len()
+            while j > 0
+                j -= 1
+                via.push(chain[j])
+            return Some(StateReached(g, via))
+        for callee in u.functions
+            if callee < direct.len() && !seen[callee]
+                seen[callee] = true
+                parent[callee] = f
+                pending.push(callee)
+    None
+
+private forbidden_global(c: *Checker, u: Uses, k: usize) -> Option[usize]
+    for g in u.globals
+        if module_state_problem(c, g, k) is Some(_) then return Some(g)
+    for g in u.lazies
+        if module_state_problem(c, g, k) is Some(_) then return Some(g)
+    None
+
+// Why a thread's body may not reach module-level value `g`: it is a `var`, or its type is not
+// sendable.
+private module_state_problem(c: *Checker, g: usize, k: usize) -> Option[string]
+    val global = c.globals[g]
+    if global.mutable then return Some(s"`${global.name}`, a module-level `var`, which every thread would share; share it through an `Atomic` or a `Mutex` held in a `val`")
+    val t = c.symbols[global.init].result match
+        Some(t) -> zonk(c, t)
+        None -> return None
+    if *t is ErrorType then return None
+    sendability(conformances(c), t, k) match
+        CannotSend(why) ->
+            if global.object is Some(_) then return Some(s"the object `${global.name}`, ${nested_reason(why)}")
+            Some(s"`${global.name}`, a module-level value holding ${quoted_type(t)}, ${nested_reason(why)}")
+        _ -> None
 
 // Holds each type that promises `Sendable`, outside the standard library, to the promise: a class
 // whose header, superclass or impl makes it, and a data type an impl makes it for. The standard
@@ -6668,22 +6800,40 @@ private holds_handle(c: *Checker, t: &Type) -> bool = *t match
 handle_target(d: &ClassDecl) -> Option[string]
     if d.object then return None
     for a in d.annotations
-        if a.name == "sysl" && a.args.len() == 1
+        if a.name == "sysl" && a.args.len() >= 1 && a.args[0].name is None && (a.args.len() == 1 || a.args.len() == 2 && names_handle(a.args[1]))
             if a.args[0].value.kind is StringLit(path) then return Some(path)
     None
+
+// Whether an argument of a handle's `@sysl` is `named: …`, after the Sysl type.
+private names_handle(arg: AnnotationArg) -> bool = arg.name == Some("named")
+
+/** The name a handle's traps give it, `own` unless its `@sysl` says another after the Sysl type with
+ * `named: "Name"`: a handle that a library value of another type keeps, for that value, is named
+ * for the type its user holds. */
+handle_trap_name(d: &ClassDecl, own: string) -> string
+    for a in d.annotations
+        if a.name == "sysl" && a.args.len() == 2 && names_handle(a.args[1])
+            if a.args[1].value.kind is StringLit(n) then return n
+    own
 
 // A class declared with `@sysl("module.Name")` is a handle on that Sysl type: its objects are made by
 // the bindings that return one and hold the Sysl value and nothing else, so the class has no
 // parameters, fields or statements, no type parameters and no parents, and is final. Its methods
-// without a body are bound to the Sysl type's methods.
+// without a body are bound to the Sysl type's methods. `named: "Name"` after the type gives the name
+// its traps use.
 private check_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
     var annotated = false
     for a in d.annotations
         if a.name != "sysl" then continue
         annotated = true
         var target: Option[string] = None
-        if a.args.len() == 1 && a.args[0].name is None
+        if (a.args.len() == 1 || a.args.len() == 2 && names_handle(a.args[1])) && a.args[0].name is None
             if a.args[0].value.kind is StringLit(p) then target = Some(p)
+        if target is Some(_) && a.args.len() == 2
+            val given = a.args[1]
+            if given.value.kind is StringLit(n)
+                if !is_type_name(n) then c.note(unit, given.value.span, s"`named` gives the name a handle's traps use, a type's name, as in `named: \"Child\"`; `$n` is not one")
+            else c.note(unit, given.value.span, "`named` takes a string, the name a handle's traps use, as in `named: \"Child\"`")
         target match
             Some(p) ->
                 val (path, arguments) = instance_parts(p)
@@ -6925,6 +7075,18 @@ private is_sysl_path(p: string) -> bool
         if start then parts += 1
         start = false
     !start && parts >= 2
+
+// A name a type could have: an identifier beginning with a capital letter.
+private is_type_name(n: string) -> bool
+    if n.len == 0 then return false
+    var first = true
+    for b in n.bytes
+        val upper = b >= u8('A') && b <= u8('Z')
+        val other = b >= u8('a') && b <= u8('z') || b >= u8('0') && b <= u8('9') || b == u8('_')
+        if first && !upper then return false
+        if !upper && !other then return false
+        first = false
+    true
 
 /** The annotations on a method other than `@tailrec`, which any method with a body may have. */
 private method_annotations(f: &Function) -> usize
@@ -7821,6 +7983,7 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Checked(slot) -> c.checked_slots[slot]
     Member(target, name) ->
         if module_use(c, e) is Some(q) then check_form(c, q, expected, used)
+        elif variant_use(c, e.span, target, name) is Some((found, explicit)) then qualified_variant_value(c, e.span, found, explicit, expected)
         elif limit_constant(c, e.span, target, name) is Some(k) then k
         elif static_value(c, e.span, target, name, expected) is Some(v) then v
         else member_expr(c, e, target, name, expected)
@@ -8695,8 +8858,156 @@ global_named(c: *Checker, name: string) -> Option[usize]
     if local_function(c, name) is Some(_) then return None
     c.global_names.get(resolve_name(c, unit_of(c), name))
 
-/** The variant a bare name refers to in the code being checked, if it refers to one. */
-private variant_named(c: *Checker, name: string) -> Option[VariantRef] = c.variants.get(resolve_name(c, unit_of(c), name))
+/** The variant a name refers to in the code being checked, if it refers to one: a bare name, a
+ * module's `m.V`, or the type's own `T.V` and `m.T.V`. */
+private variant_named(c: *Checker, name: string) -> Option[VariantRef]
+    val key = resolve_name(c, unit_of(c), name)
+    // A name another module's declaration is reached by is that module's public one.
+    if c.variants.get(key) is Some(v)
+        if !name.contains(".") || exported(c, key) then return Some(v)
+    qualified_variant(c, name)
+
+/** Where `path` is `T.V` or `m.T.V`, `T` naming a data type: the type and the last part, `V`. `None`
+ * where the part before the last dot names no data type, or a local, a parameter, a member of the
+ * enclosing class or a local function of the first part's name hides it. */
+private variant_qualifier(c: *Checker, path: string) -> Option[(usize, string)]
+    var dot: Option[usize] = None
+    for k in 0..<path.bytes.len
+        if path.bytes[k] == u8('.') then dot = Some(k)
+    val last = dot?
+    val prefix = path[0..<last]
+    var first = prefix
+    for k in 0..<prefix.bytes.len
+        if prefix.bytes[k] == u8('.')
+            first = prefix[0..<k]
+            break
+    if lookup_local(c, first) is Some(_) || param_index(c, first) is Some(_) || class_member(c, first) is Some(_) || local_function(c, first) is Some(_) then return None
+    val key = resolve_name(c, unit_of(c), prefix)
+    if prefix.contains(".") && !exported(c, key) then return None
+    val d = c.types.get(key)?
+    Some((d, path[last + 1..]))
+
+/** The variant `T.V` or `m.T.V` names: data type `T`'s own variant `V`. A variant of the type comes
+ * before any member of its companion or static member of the type of that name. */
+private qualified_variant(c: *Checker, path: string) -> Option[VariantRef]
+    val (d, name) = variant_qualifier(c, path)?
+    for i in 0..<c.data[d].variants.len()
+        if c.data[d].variants[i].name == name then return Some(VariantRef(d, i))
+    None
+
+// `T.V` where `T` is a type and `V`, capitalized as a variant is, is neither a variant of it nor a
+// member its name reaches: reported, naming the type's variants or saying it has none. Whether it
+// reported.
+private no_such_variant(c: *Checker, at: Span, path: string) -> bool
+    var dot: Option[usize] = None
+    for k in 0..<path.bytes.len
+        if path.bytes[k] == u8('.') then dot = Some(k)
+    val last = dot match
+        Some(k) -> k
+        None -> return false
+    val prefix = path[0..<last]
+    val name = path[last + 1..]
+    if name.bytes.len == 0 || name.bytes[0] < u8('A') || name.bytes[0] > u8('Z') then return false
+    val unit = unit_of(c)
+    // `m.V` or `m.T.V` where module `m`'s `V` or `T` is private to it.
+    if c.variants.get(resolve_name(c, unit, path)) is Some(v)
+        if !exported(c, resolve_name(c, unit, path))
+            c.note(unit, at, s"`$name` is private to module `${c.data[v.data].module_name}`")
+            return true
+    val type_key = resolve_name(c, unit, prefix)
+    if prefix.contains(".") && !exported(c, type_key)
+        if c.types.get(type_key) is Some(d)
+            c.note(unit, at, s"`${c.data[d].name}` is private to module `${c.data[d].module_name}`")
+            return true
+    if variant_qualifier(c, path) is Some((d, _))
+        if has_static_member(c, d, name) then return false
+        if c.data[d].companion is Some(o)
+            if companion_member(c, o, name) then return false
+        var names: Buf[string] = buf()
+        for v in c.data[d].variants
+            names.push(s"`${v.name}`")
+        val type_name_written = c.data[d].name
+        if names.len() == 1 then c.note(unit, at, s"`$type_name_written` has no variant `$name`; its one variant is ${names[0]}")
+        else c.note(unit, at, s"`$type_name_written` has no variant `$name`; its variants are ${spoken_list(names)}")
+        return true
+    if prefix.contains(".") then return false
+    if lookup_local(c, prefix) is Some(_) || param_index(c, prefix) is Some(_) || class_member(c, prefix) is Some(_) || local_function(c, prefix) is Some(_) then return false
+    if global_named(c, prefix) is Some(_) then return false
+    val key = resolve_name(c, unit, prefix)
+    if c.class_types.get(key) is Some(k)
+        if is_trait(c, k) then return false
+        if members_of_type(c, own_class_type(c.classes[k], k), name).len() > 0 then return false
+        c.note(unit, at, s"`$prefix` is a class, not a data type, so it has no variant `$name`")
+        return true
+    false
+
+/** `a.b.c` for an expression of names and members, `None` for any other. */
+private written_path(e: &Expr) -> Option[string] = e.kind match
+    Name(n) -> Some(n)
+    Member(target, name) -> Some(written_path(target)? + "." + name)
+    _ -> None
+
+// `T.V`, `m.T.V` or `T[A].V` as an expression, `target.name`: the variant named and the type
+// arguments written on `T`, or the report that `V` is none, as `Some(None)`. `None` where `target`
+// names no type, so the expression is read as any other member.
+private variant_use(c: *Checker, at: Span, target: &Expr, name: string) -> Option[(Option[VariantRef], Option[Buf[&TypeExpr]])]
+    var written = target
+    var explicit: Option[Buf[&TypeExpr]] = None
+    if target.kind is TypeApply(inner, types)
+        written = inner
+        explicit = Some(types)
+    val prefix = written_path(written)?
+    val path = prefix + "." + name
+    if qualified_variant(c, path) is Some(v) then return Some((Some(v), explicit))
+    if no_such_variant(c, at, path) then return Some((None, None))
+    None
+
+// `T.V` not called: a variant without fields, made; one with fields is reported, as its bare name is.
+private qualified_variant_value(c: *Checker, at: Span, found: Option[VariantRef], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+    val v = found match
+        Some(v) -> v
+        None -> return TExpr(at, ErrorType, UnitConst)
+    if c.data[v.data].variants[v.index].fields.len() == 0 then return construct(c, at, at, v, buf(), explicit, expected)
+    val written = c.data[v.data].name + "." + c.data[v.data].variants[v.index].name
+    c.note(unit_of(c), at, s"`$written` has fields; call it, as in `$written(…)`")
+    TExpr(at, ErrorType, UnitConst)
+
+// `T.V(args)`: the variant made from the arguments. Type arguments are written once, on the type,
+// `T[A].V(…)`, or on the variant, `T.V[A](…)`.
+private qualified_variant_call(c: *Checker, at: Span, name_span: Span, found: Option[VariantRef], on_type: Option[Buf[&TypeExpr]], on_variant: Option[Buf[&TypeExpr]], args: Buf[Argument], expected: Option[&Type]) -> &TExpr
+    val unit = unit_of(c)
+    var explicit = on_variant
+    var chosen = found
+    if on_type is Some(_)
+        if on_variant is Some(_)
+            c.note(unit, name_span, "a variant's type arguments are written once, on its type or on the variant")
+            chosen = None
+        else explicit = on_type
+    val v = chosen match
+        Some(v) -> v
+        None ->
+            for a in args
+                check_statement(c, a.value)
+            return TExpr(at, ErrorType, UnitConst)
+    if c.data[v.data].variants[v.index].fields.len() == 0
+        val written = c.data[v.data].name + "." + c.data[v.data].variants[v.index].name
+        c.note(unit, at, s"`$written` has no fields; write it without parentheses")
+        for a in args
+            check_statement(c, a.value)
+        return TExpr(at, ErrorType, UnitConst)
+    construct(c, at, name_span, v, args, explicit, expected)
+
+// Whether object `o` declares a method or a field `name`.
+private companion_member(c: *Checker, o: usize, name: string) -> bool =
+    methods_named(c, o, name).len() > 0 || field_named(c.classes[o].fields, name) is Some(_)
+
+// `a`, `a and b`, `a, b and c`.
+private spoken_list(items: Buf[string]) -> string
+    var out = ""
+    for i in 0..<items.len()
+        if i > 0 then out = out + (if i + 1 == items.len() then " and " else ", ")
+        out = out + items[i]
+    out
 
 // A module-level value's type is its initializer's result: declared, or inferred by checking the
 // initializer first, which is not possible while that initializer is itself being checked.
@@ -8832,12 +9143,17 @@ private add_named(c: *Checker, u: *Uses, table: Buf[Option[usize]], name: string
         if entry is Some(m)
             if c.symbols[m].decl.name == name then add_function(u, m)
 
-private initialization_order(c: *Checker) -> Buf[usize]
+/** What each function's code uses directly, the implementations its calls through a method table and
+ * its operators may reach among its functions. */
+private direct_uses(c: *Checker) -> Buf[Option[Uses]]
     var direct: Buf[Option[Uses]] = buf()
     for b in c.bodies
         direct.push(b match
             Some(body) -> Some(with_implementations(c, uses_of(body)))
             None -> None)
+    direct
+
+private initialization_order(c: *Checker, direct: Buf[Option[Uses]]) -> Buf[usize]
     var o = InitOrder(buf(), buf(), buf(), buf())
     for g in c.globals
         o.needs.push(globals_reached(direct, g.init))
@@ -11200,7 +11516,9 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
     if module_use(c, named) is Some(q)
         if explicit is Some(types) then return call_expr(c, at, Expr(callee.span, TypeApply(q, types)), args, expected)
         return call_expr(c, at, q, args, expected)
-    if named.kind is Member(target, member) then return member_call(c, at, callee, named.span, target, member, args, explicit, expected, false)
+    if named.kind is Member(target, member)
+        if variant_use(c, named.span, target, member) is Some((found, on_type)) then return qualified_variant_call(c, at, named.span, found, on_type, explicit, args, expected)
+        return member_call(c, at, callee, named.span, target, member, args, explicit, expected, false)
     val name = named.kind match
         Name(n) -> n
         _ -> return value_call(c, at, callee, args)
@@ -13847,9 +14165,15 @@ private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string)
             for o in options
                 typed.push(check_pattern(c, o, ty, if no_bind == "" then "alternatives bind no names; write `_` for a value that is not used" else no_bind))
             TPattern(p.span, ty, PAlternatives(typed))
-        Constructor(path, args) -> variant_named(c, path) match
-            Some(v) -> variant_pattern(c, p, v, args, ty, no_bind)
-            None -> extractor_pattern(c, p, path, args, ty, no_bind)
+        Constructor(path, args, parens) -> variant_named(c, path) match
+            Some(v) ->
+                if !parens && c.data[v.data].variants[v.index].fields.len() > 0
+                    c.note(unit, p.span, s"`$path` has fields; match them, as in `$path(…)`")
+                    return TPattern(p.span, ErrorType, PWildcard)
+                variant_pattern(c, p, v, args, ty, no_bind)
+            None ->
+                if no_such_variant(c, p.span, path) then return failed_extractor(c, p, args, no_bind)
+                extractor_pattern(c, p, path, args, ty, no_bind)
         Rest(binder) ->
             c.note(unit, p.span, "`rest*` stands for the rest of a sequence, last in a sequence pattern or in an `unapplySeq` extractor's patterns")
             check_pattern(c, binder, ErrorType, no_bind)
@@ -14746,7 +15070,7 @@ private shape_pattern(at: Span, v: ShapeVariant, prefix: string) -> &Pattern
     var args: Buf[&Pattern] = buf()
     for i in 0..<v.fields.len()
         args.push(if prefix == "" then Pattern(at, Wildcard) else Pattern(at, Name(s"$prefix$i")))
-    Pattern(at, Constructor(v.name, args))
+    Pattern(at, Constructor(v.name, args, true))
 
 /** Field `i` of `value`: bound by the pattern for a data type, read from the object for a class. */
 private field_value(at: Span, data: bool, value: &Expr, prefix: string, f: ShapeField, i: usize) -> &Expr =
@@ -14940,14 +15264,14 @@ private variant_build(c: *Checker, at: Span, site: DeriveSite, v: ShapeVariant, 
         val store = Expr(at, Assign(slot, None, plain_call(at, "Some", one(read)), false, at))
         var some_args: Buf[&Pattern] = buf()
         some_args.push(Pattern(at, Wildcard))
-        val given = Expr(at, Is(slot, Pattern(at, Constructor("Some", some_args)), false))
+        val given = Expr(at, Is(slot, Pattern(at, Constructor("Some", some_args, true)), false))
         field_arms.push(Arm(Pattern(at, Literal(Expr(at, IntLit(s"$j")))), None, Expr(at, If(given, twice, Some(store)))))
     field_arms.push(Arm(Pattern(at, Wildcard), None, plain_call(at, "fail", one(Expr(at, StringLit(s"a builder named a field `${v.name}` does not have"))))))
     var index_args: Buf[&Pattern] = buf()
     index_args.push(Pattern(at, Name("__shape_index")))
     var next_arms: Buf[Arm] = buf()
     next_arms.push(Arm(Pattern(at, Name("None")), None, Expr(at, Break(None))))
-    next_arms.push(Arm(Pattern(at, Constructor("Some", index_args)), None, Expr(at, Match(local(at, "__shape_index"), field_arms))))
+    next_arms.push(Arm(Pattern(at, Constructor("Some", index_args, true)), None, Expr(at, Match(local(at, "__shape_index"), field_arms))))
     val next = Expr(at, Propagate(method_call(at, builder_local, "next", one(shape_name_expr(at, site.type_name, Some(i), None)), None)))
     items.push(Expr(at, Loop(Expr(at, Match(next, next_arms)))))
     // Each field under its own name, so a default sees the fields before it as the constructor's does.
@@ -14960,7 +15284,7 @@ private variant_build(c: *Checker, at: Span, site: DeriveSite, v: ShapeVariant, 
         var given_args: Buf[&Pattern] = buf()
         given_args.push(Pattern(at, Name("__shape_given")))
         var arms: Buf[Arm] = buf()
-        arms.push(Arm(Pattern(at, Constructor("Some", given_args)), None, local(at, "__shape_given")))
+        arms.push(Arm(Pattern(at, Constructor("Some", given_args, true)), None, local(at, "__shape_given")))
         arms.push(Arm(Pattern(at, Name("None")), None, absent))
         items.push(Expr(at, Binding(f.name, Some(resolved(c, at, f.ty)), Expr(at, Match(local(at, s"__shape_slot$j"), arms)), false)))
         var passed = local(at, f.name)

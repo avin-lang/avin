@@ -388,6 +388,30 @@ data Option[+T]
 The single-line form declares a one-variant type whose variant has the type's name. Variants are
 constructors, not types: `Some(1)` has type `Option[int]`. A variant is a name of its module, so two
 data types of one module, in one file or in two, private or not, cannot have variants of one name.
+
+A variant is also reached through its type, `Type.Variant`: `Shape.Circle(1.0)`, `Option.None`,
+and in patterns `case Shape.Circle(r)`. The qualified name is the same constructor as the bare one,
+so the two forms mix freely in one expression or one `match`, and a `match` over both is checked for
+coverage as one over either. A generic type's arguments are inferred as for the bare name, or written
+once, on the type (`Option[int].None`) or on the variant (`Option.Some[long](9)`). Another module's
+type is reached through the module, `palette.Color.Red`, or by its own name where it is imported,
+`Color.Red`, and only where the type is public. A local, a parameter or a member named like the type
+hides it, so `Color.Red` is then that value's member. `Type.Name`, with `Name` capitalized and
+neither a variant of the type nor a member of its companion or a static member of the type, is
+reported with the variants the type has; on a class it is reported as a class having none. A
+companion object cannot declare a method or field named after one of its type's variants, since
+`Type.Variant` names the variant.
+
+```text
+area(s: Shape) -> real = s match
+    Shape.Circle(r) -> 3.0 * r * r
+    Rect(w, h) -> w * h
+
+main()
+    println(area(Shape.Rect(2.0, 3.0)))   // 6
+    val none: Option[string] = Option.None
+```
+
 `data` values have no identity, derive
 `Eq`, `Hash`, `Display` and `Debug` when their fields do, without `derives`, and are matched
 exhaustively. Methods are added in an `impl` block; an impl of `Display` or `Debug` replaces the

@@ -197,6 +197,13 @@ A `match` covers an `Either` with a `Left` and a `Right` arm that each cover the
 equal, hash and show by side and value: `Right(4)`, `Left(no)`, and under `debug` `Left("no")`.
 There is no left projection: `swap()` turns the left side into the one the methods work on.
 
+An `Either[L, R]` is an `Ord` when `L` and `R` are: every `Left` orders before every `Right`, and two
+on the same side order as their values. A `Result[T, E]` is ordered the same way with `Err` in the
+place of `Left` and `Ok` in the place of `Right`: every `Err` before every `Ok`, so a failure sorts
+before a success exactly as a `Left` sorts before a `Right`. Both sort, have `max` and `min`, key a
+`TreeMap` or `TreeSet`, and may be a field of a type that `derives Ord`; they nest with `Option` and
+tuples, and one with a part of a type that has no `Ord` has none.
+
 ## Not in Avin
 
 `throw`, `try`/`catch`/`finally`, `Try`, checked or unchecked exceptions, and `null`. Releasing a

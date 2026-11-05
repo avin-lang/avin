@@ -130,6 +130,18 @@ writing, or reading, one after the other.
 | `c.lines() -> Result[Iterator[string], IoError]` | Starts it and answers its standard output's lines as they arrive, by the rule [standard input](#standard-input) reads lines by. Its status is not checked. |
 | `c.start() -> Result[Child, IoError]` | Starts it and answers at once. A `Child` has `waitFor() -> Result[ExitStatus, IoError]`, `isAlive()` and `kill()`, which sends signal 15 to every program still running and starts no part not yet started. |
 
+A started `Child` is [sendable](/spec/actors/#what-may-be-sent) ([proposed](/spec/decisions/#proposed)):
+it belongs to one thread at a time, as a [connection](#tcp) does. Handed to a thread's or a future's
+body it is the body's, which may wait for it, stop it and start a sequence's later part, and the code
+that handed it over traps at any use of it while the body runs, though the command has ended; when the
+body returns, the next code to use it takes it back:
+
+```text
+avin: trap: `Child` belongs to another thread at main.avin:12:3
+```
+
+The iterator `lines()` answers is not sendable: the thread that reads a command's output starts it.
+
 ```text
 data ExitStatus
     Exited(code: int)
@@ -528,8 +540,11 @@ reads beyond its line are kept, and the next read of any kind takes them first. 
 whole milliseconds, a part of one counting as one.
 
 **A connection belongs to one thread at a time**, as every [handle](/spec/sysl-bindings/#handles)
-does: a server accepts a connection and hands it to the thread or future that serves it, and the
-code that handed it over traps where it uses it again while the body runs:
+does: a server accepts a connection and hands it to the thread or future that serves it, the bytes
+read ahead going with it, and the code that handed it over traps at any operation on it while the
+body runs, a read served from those bytes alone and one on a connection the body has closed
+included ([proposed](/spec/decisions/#proposed)); a listener's `port`, `accept` and `close` are
+checked the same way:
 
 ```text
 avin: trap: `Socket` belongs to another thread at main.avin:16:25
