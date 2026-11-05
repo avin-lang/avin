@@ -3506,14 +3506,8 @@ spelling is better, as each entry says.
   actor timers keep the runtime's monotonic microseconds and their `Duration` parameters.
   *Alternatives*: leaving the millisecond forms alone.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- **Data types of one module may share a variant's name** (branch `shared-variants`, 2026-11-05).
+- Settled on the user's delegation 2026-11-05: **Data types of one module may share a variant's
+  name** (branch `shared-variants`).
   Replaces the rule that a variant's name is unique across a module's files, which kept a C or Sysl
   binding from mirroring two enums with one variant name (`Slant.Normal`, `Weight.Normal`;
   `sysl.process`'s `Stdio.Inherit` and `Group.Inherit`) and two machines from sharing `Idle`.
@@ -3556,6 +3550,13 @@ spelling is better, as each entry says.
   - Machines: two machines' states, and a state and an event's variant, may share a name, by the same
     rule (amending the settled machine entry above). An arm's result is its own `State`, `handle`'s
     argument the event type, so machine code needs nothing written.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
 
 ## Open
 
