@@ -1501,6 +1501,13 @@ Settled by the user on 2026-11-04:
   call with "`Name` is closed"; a handle never closed is given back by a finalizer when the
   collector frees it. A handle crosses back into Sysl only as the receiver of its own methods,
   compares by identity, and has no `Display`.
+- Settled by the user 2026-11-04: **Tuples cross the Sysl boundary** ([Sysl bindings](/spec/sysl-bindings/#boundary-types)).
+  A tuple of boundary types is a Sysl tuple of the same arity, in each direction, each part converted
+  as it would be alone: an integer part out of Sysl takes any Sysl integer with the range check, and
+  tuples nest in one another, in `Option`, `Result`, `Array` and `Vector`, and in a mirror's fields.
+  A handle may be a part of a tuple that is a binding's result or the value of its `Option` or
+  `Result`, so `accept` answers `Result[(Socket, Address), IoError]`; a tuple holding a handle does
+  not go into Sysl or sit in a collection. `avin.process` has `environment()` over `sysl.env.vars`.
 
 - Settled by the user 2026-11-04: **Text blocks under an interpolator that reads no escapes** ([text
   blocks](/spec/strings-and-formatting/#text-blocks)). The parts `raw"""…"""` and a program's own
