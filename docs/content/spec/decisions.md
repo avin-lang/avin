@@ -3597,14 +3597,8 @@ spelling is better, as each entry says.
   ignoring them (silently wrong where they differ). Revisit if a pattern on an `Any` scrutinee
   should match a variant at one instance, which would give written arguments a meaning.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- **C enum mirrors, constants, statuses and out parameters, as built** (branch `c-bindings-enums`,
+- Settled on the user's delegation 2026-11-05: **C enum mirrors, constants, statuses and out
+  parameters, as built** (branch `c-bindings-enums`,
   [chapter](/spec/c-bindings/#enums-and-constants)). The chapter left these open:
   - **An enumerator's words and case.** A word starts at each upper-case letter of the variant's
     name, a digit and `_` staying with the word before them (`Yuv420p` one word, `ColorDodge` two,
@@ -3645,6 +3639,25 @@ spelling is better, as each entry says.
   - **What `keeps:` keeps with out handles**: the holder is the handle the C result is, else the
     first handle answered through an out pointer, else the receiver; a status keeps only when it is
     zero, and a `None` handle keeps nothing. `borrowed` applies to every handle the binding answers.
+- Settled on the user's delegation 2026-11-05 (branch `time-instant`): **A `Duration` given to a millisecond wait is
+  rounded up to whole milliseconds.** `Future.await(d)` and `Condition.waitFor(d)` pass the runtime's
+  millisecond wait `ceil(d / 1ms)`, so `await(micros(1))` waits a millisecond; a duration of zero or
+  less asks without waiting, as a count that is not positive does. *Why*: a timed wait should never
+  end before the time it was given, the rule `setTimeout` already follows for a socket.
+  *Alternatives*: rounding down, which turns every duration under a millisecond into no wait at all;
+  a microsecond wait in the runtime, which the condition variable beneath does not offer.
+- Settled on the user's delegation 2026-11-05 (branch `time-instant`): **`toMicrosPart()` is the part below the second**
+  (`micros % 1_000_000`), as the chapter's list goes from `toSecondsPart()` straight to it, with no
+  `toMillisPart()`. *Why*: the four parts then cover a duration with nothing left over (hours below
+  the day, minutes, seconds, microseconds). *Alternatives*: the part below the millisecond, which
+  would need a `toMillisPart()` beside it to be complete.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
 
 ## Open
 
