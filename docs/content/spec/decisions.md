@@ -443,7 +443,8 @@ a decision changes, this page and the chapter change together.
   programmer's responsibility.
 - `==` between two values whose static types share no common type is a compile error. On `Any` and
   on trait-typed values `==` is decided at run time through the type's entries: values of different
-  run-time types are unequal. `===` stays defined only on reference types, and not on `Any`.
+  run-time types are unequal. `===` stays defined only on reference types; where it meets an `Any`,
+  a trait or a type parameter, see the identity entry settled on 2026-11-05.
 - Settled 2026-11-03: the operator traits are the core library's `Eq` (`equals(other: Self) ->
   bool`), `Hash` (`hash() -> long`), `Ord: Eq` (`compare(other: Self) -> int`, with `less`,
   `lessOrEqual`, `greater` and `greaterOrEqual` defaulting from it), and `Add`, `Sub`, `Mul`, `Div`,
@@ -1857,6 +1858,61 @@ their words are reserved.
     shadow-stack frame before the call, and are built on branch `tailcalls` with their own entry.
   - The language has no `try`, `defer` or `finally`, so there is no pending cleanup to take a call
     out of tail position; when such a construct is added, a call inside it is not in tail position.
+- Settled on the user's delegation 2026-11-05 (built on branch `core-followups`): **`==` and `!=` on
+  `Any` are decided at run time**, as [equality](/spec/equality-and-memory/#equality) says: values of
+  one type compare as that type does, by value or by identity, and values of different types, a
+  reference and a value among them, are unequal. The sentence in
+  [Any and Nothing](/spec/types/#any-and-nothing) saying an `Any` had no equality was stale and is
+  corrected. Rationale: every value has `==` and a hash, so any value can be a map key, a `Map[Any,
+  V]`'s among them, and the compiler already compared `Any`s through each value's own entries.
+  Alternative weighed: no `==` on `Any`, so that every comparison goes through a type pattern first,
+  which breaks "every value can be a key".
+- Settled on the user's delegation 2026-11-05 (built on branch `core-followups`): **`===` is defined
+  only where its answer is**: at least one side's static type is a reference type that cannot hold a
+  value type (a class, an `object`, an array, a buffer, a function type, or a type parameter bounded
+  by a class). The other side may be the same type, a sub- or superclass, a trait the class conforms
+  to, an `Any`, or a type parameter with no class bound; an `Any` or such a parameter is compared as
+  an `Any`, and a boxed value there is never the object, so the answer is `false`. Two sides that
+  may each hold a value type (traits, `Any`s, type parameters with no class bound) are an error,
+  "`===` is undefined on Shape and Shape, which may hold values with no identity; compare with `==`,
+  or give one side a class type"; so is a value type on either side. See
+  [identity](/spec/equality-and-memory/#identity). Rationale: a boxed or data value may be one
+  object or two at the compiler's choice, so trait-to-trait identity answered arbitrarily
+  (`f(Box(2), Box(2))` true and `f(3, 3)` false for `f(a: Shape, b: Shape) = a === b`), while a
+  class instance is never a boxed value, so mixed class and trait is well defined. Alternatives
+  weighed: rejecting any trait or `Any` operand, which needlessly breaks the library's
+  `elements === self` (a buffer, deque or set given itself as an `Iterable`); and keeping
+  trait-to-trait identity, which is unsound. A class with a trait it does not conform to is rejected
+  even when the class is open and a subclass might conform. **Review with the user**: whether an
+  open class and a trait it does not itself conform to should compare, since a subclass may be both.
+- Settled on the user's delegation 2026-11-05 (built on branch `core-followups`): **a tuple already
+  made converts to a wider tuple only where each part already is what the wider tuple holds**: a part
+  that is an object (a string, a `data` value, a tuple, an instance of a class) is its own `Any`, and
+  an instance of a subclass is one of its superclass, so `(string, int)` is a `(Any, int)`; a part
+  that would need a box (a number, a `bool`, a `char`) does not convert, so `(int, int)` is not a
+  `(Any, int)`. A tuple written out where the wider one is expected boxes its part there. See
+  [Any and Nothing](/spec/types/#any-and-nothing). Rationale: a conversion that changes no bits is
+  free, while a boxed part changes the tuple's layout and would mean copying the tuple behind a plain
+  assignment. Alternatives weighed: no conversion of a tuple once made (what the chapter said, and
+  needlessly strict for parts that already are objects); converting every part by copying, which
+  hides an allocation.
+- Settled on the user's delegation 2026-11-05 (built on branch `core-followups`): **two classes with
+  no common superclass that share several unrelated most specific traits do not join, and the error
+  names the traits**: "the branches of this `if` yield Duck and Goose, which share Swims and Flies but
+  no single most specific type; write the type you want", and the same ending for `match` arms,
+  clauses, collection and map literals and a loop's `break`s, as
+  [inference](/spec/generics/#inference) says. Rationale: the bare "yield Duck and Goose" did not
+  say why two classes that plainly share traits fail to agree. Alternative weighed: choosing the
+  first trait declared, which makes the type depend on declaration order.
+- Settled on the user's delegation 2026-11-05 (built on branch `core-followups`): **a tuple type
+  pattern tests the type the tuple was made with**, as [Any and Nothing](/spec/types/#any-and-nothing)
+  says, not the classes of its parts: `t: (Animal, int)` holding a `Dog` does not match
+  `_: (Dog, int)`, and a tuple made as a `(Dog, int)` does wherever it is held. Each part is tested
+  by a tuple pattern with a type pattern inside it, `(d: Dog, n)`, and
+  [type patterns](/spec/operators-and-control-flow/) no longer say a tuple is "taken down part by
+  part". Rationale: a tuple's run-time type is one type, fixed when it is made, so the test agrees
+  with the static type it was made at. Alternative weighed: testing part by part, which would make a
+  tuple's run-time type depend on what it holds rather than on how it was made.
 
 **Deferred**
 

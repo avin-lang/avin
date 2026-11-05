@@ -6758,7 +6758,7 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
                         join(c, ty, body.ty) match
                             Some(t) -> ty = t
                             None ->
-                                c.note(unit, b.body.span, s"this clause yields ${type_name(body.ty)}, but the clauses before it yield ${type_name(ty)}")
+                                c.note(unit, b.body.span, s"this clause yields ${type_name(body.ty)}, but the clauses before it yield ${type_name(ty)}${no_single_join(c, ty, body.ty)}")
                                 agreed = false
             bodies.push(TGuarded(guard, body))
         c.body.visible.truncate(mark)
@@ -8632,7 +8632,7 @@ private literal_parts(c: *Checker, exprs: Buf[&Expr], want: &Type, what: string)
             Some(so_far) -> join(c, so_far, t.ty) match
                 Some(j) -> Some(j)
                 None ->
-                    c.note(unit, x.span, s"the $what of a map literal need a common type; ${type_name(zonk(c, so_far))} and ${type_name(zonk(c, t.ty))} have none")
+                    c.note(unit, x.span, s"the $what of a map literal need a common type; ${type_name(zonk(c, so_far))} and ${type_name(zonk(c, t.ty))} have none${no_single_join(c, so_far, t.ty)}")
                     Some(ErrorType)
     if agreed is Some(t) then unify(c, want, t)
     // A part of a narrower reference type is the agreed type as it is.
@@ -8823,7 +8823,7 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
                 Some(so_far) -> join(c, so_far, t.ty) match
                     Some(j) -> Some(j)
                     None ->
-                        c.note(unit, item.span, s"the elements of a collection literal need a common type; ${type_name(zonk(c, so_far))} and ${type_name(zonk(c, t.ty))} have none")
+                        c.note(unit, item.span, s"the elements of a collection literal need a common type; ${type_name(zonk(c, so_far))} and ${type_name(zonk(c, t.ty))} have none${no_single_join(c, so_far, t.ty)}")
                         Some(ErrorType)
         if agreed is Some(t) then unify(c, element, t)
         for i in 0..<items.len()
@@ -9233,8 +9233,21 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
         // and between an `Option[Nothing]` and another option, as the other.
         typed.set(0, none_as(c, typed[0], typed[1].ty))
         typed.set(1, none_as(c, typed[1], typed[0].ty))
-    for i in 0..<ops.len()
-        compare_link(c, ops[i], typed[i], typed[i + 1])
+    // `===` between a reference and an `Any` or a type parameter's value compares both as `Any`s: a
+    // reference is its own `Any`, and a value of another type is boxed, never the same object.
+    var linked = false
+    if ops.len() == 1 && (ops[0] is Same || ops[0] is NotSame)
+        val x = zonk(c, typed[0].ty)
+        val y = zonk(c, typed[1].ty)
+        val loose = *x is AnyType || *y is AnyType || (*x is TypeVar(_, _, _) && !reference_only(c, x)) || (*y is TypeVar(_, _, _) && !reference_only(c, y))
+        if loose && !same_type(x, y) && (reference_only(c, x) || reference_only(c, y))
+            compare_link(c, ops[0], typed[0], typed[1])
+            typed.set(0, to_any(c, typed[0]))
+            typed.set(1, to_any(c, typed[1]))
+            linked = true
+    if !linked
+        for i in 0..<ops.len()
+            compare_link(c, ops[i], typed[i], typed[i + 1])
     var ty: &Type = Bool
     for t in typed
         if *t.ty is Nothing then ty = Nothing
@@ -9273,22 +9286,53 @@ private compare_link(c: *Checker, op: CompareOp, left: &TExpr, right: &TExpr)
     val identity = op is Same || op is NotSame
     if op is Equal || op is NotEqual then return equality_link(c, at, spelling, zonk(c, a.ty), zonk(c, b.ty))
     if !identity then return ordering_link(c, at, spelling, zonk(c, a.ty), zonk(c, b.ty))
-    // An `Any` may hold a value with no identity; a type pattern recovers its type.
-    if *a.ty is AnyType || *b.ty is AnyType
-        c.note(unit_of(c), at, s"`$spelling` on Any is not implemented; match the value by its type first, as in `s: string`")
+    val x = zonk(c, a.ty)
+    val y = zonk(c, b.ty)
+    val xr = reference_only(c, x)
+    val yr = reference_only(c, y)
+    // Identity is defined where at least one side is a reference that cannot be a value type: a
+    // boxed value is never the object of a class, so the answer is the same however the compiler
+    // represents the other side's values.
+    if xr || yr
+        if identity_comparable(c, x, y, xr, yr) then return
+        c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(x)} with ${type_name(y)}")
         return
-    // A function value is a closure and an object of a class is a heap object: both are
-    // references, which `===` compares by identity.
-    if (*a.ty is Function(_, _) || *a.ty is Class(_, _, _)) && same_type(a.ty, b.ty) then return
-    // An instance of a subclass may be the very object a superclass-typed value holds.
-    if *a.ty is Class(_, _, _) && *b.ty is Class(_, _, _)
-        if same_type(upcast(c, a.ty, b.ty), b.ty) || same_type(upcast(c, b.ty, a.ty), a.ty) then return
-        c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} with ${type_name(b.ty)}")
+    // Two sides that may each hold a value type: whether two equal values are one object is the
+    // compiler's choice, so the answer would be arbitrary.
+    if may_hold_value(c, x) || may_hold_value(c, y)
+        c.note(unit_of(c), at, s"`$spelling` is undefined on ${type_name(x)} and ${type_name(y)}, which may hold values with no identity; compare with `==`, or give one side a class type")
         return
-    if *a.ty is Function(_, _) || *a.ty is Class(_, _, _)
-        c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} with ${type_name(b.ty)}")
-        return
-    c.note(unit_of(c), at, s"`$spelling` compares identities, and ${type_name(a.ty)} values have none")
+    c.note(unit_of(c), at, s"`$spelling` compares identities, and ${type_name(x)} values have none")
+
+/** Whether every value of type `t` is a reference with identity: an object of a class (an `object`,
+ * an array and a buffer among them), a function value, or a value of a type parameter bounded by
+ * one. */
+private reference_only(c: *Checker, t: &Type) -> bool = *t match
+    Class(k, _, _) -> !is_trait(c, k)
+    Function(_, _) -> true
+    TypeVar(_, _, _) ->
+        for b in bounds_of(c, t)
+            if reference_only(c, zonk(c, b)) then return true
+        false
+    _ -> false
+
+/** Whether a value of type `t` may be a reference and may as well be a value type: an `Any`, a
+ * trait's value, or a type parameter's. */
+private may_hold_value(c: *Checker, t: &Type) -> bool = *t match
+    AnyType -> true
+    Class(k, _, _) -> is_trait(c, k)
+    TypeVar(_, _, _) -> !reference_only(c, t)
+    _ -> false
+
+/** Whether `x === y` compares two values that may be one object, given that at least one side is a
+ * reference only (`xr`, `yr`): one type; an object of a class with an `Any`, with a value of an
+ * unbounded type parameter, with one of its sub- or superclasses, or with a trait it conforms to. */
+private identity_comparable(c: *Checker, x: &Type, y: &Type, xr: bool, yr: bool) -> bool
+    if same_type(x, y) then return true
+    if *x is AnyType || *y is AnyType then return true
+    if (*x is TypeVar(_, _, _) && !xr) || (*y is TypeVar(_, _, _) && !yr) then return true
+    if !(*x is Class(_, _, _) || *x is TypeVar(_, _, _)) || !(*y is Class(_, _, _) || *y is TypeVar(_, _, _)) then return false
+    same_type(upcast(c, x, y), y) || same_type(upcast(c, y, x), x)
 
 // Every type has `==`, so two values compare when they have a common type: one type, or a class or
 // trait one is an instance of, or two sequences of one element type. On `Any` and on trait types the comparison is decided at run time by
@@ -9893,7 +9937,7 @@ private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[
         join_expected(c, y.ty, n.ty, expected) match
             Some(t) -> ty = t
             None ->
-                c.note(unit_of(c), e.span, s"the branches of this `if` yield ${type_name(y.ty)} and ${type_name(n.ty)}")
+                c.note(unit_of(c), e.span, s"the branches of this `if` yield ${type_name(y.ty)} and ${type_name(n.ty)}${no_single_join(c, y.ty, n.ty)}")
                 ty = ErrorType
     TExpr(e.span, ty, If(cond, y, Some(n)))
 
@@ -9928,7 +9972,7 @@ private while_expr(c: *Checker, e: &Expr, condition: &Expr, body: &Expr, otherwi
         elif used
             join_expected(c, ty, site.ty, expected) match
                 Some(t) -> ty = t
-                None -> c.note(unit, site.span, s"this `break` yields ${type_name(site.ty)}, but the loop yields ${type_name(ty)}")
+                None -> c.note(unit, site.span, s"this `break` yields ${type_name(site.ty)}, but the loop yields ${type_name(ty)}${no_single_join(c, ty, site.ty)}")
     if !used then ty = Unit
     if !broken && cond.kind is BoolConst(true) then ty = Nothing
     TExpr(e.span, ty, While(label, cond, b, other))
@@ -9952,7 +9996,7 @@ private loop_expr(c: *Checker, e: &Expr, body: &Expr, expected: Option[&Type], u
         else
             join(c, ty, site.ty) match
                 Some(t) -> ty = t
-                None -> c.note(unit_of(c), site.span, s"this `break` yields ${type_name(site.ty)}, but the loop yields ${type_name(ty)}")
+                None -> c.note(unit_of(c), site.span, s"this `break` yields ${type_name(site.ty)}, but the loop yields ${type_name(ty)}${no_single_join(c, ty, site.ty)}")
     TExpr(e.span, ty, While(label, TExpr(e.span, Bool, BoolConst(true)), b, None))
 
 // `do body while test else other` is a `while` whose first test passes without being evaluated, so
@@ -12622,6 +12666,18 @@ private mismatch(c: *Checker, wanted: &Type, found: &Type) -> string
         names = names + type_name(traits[i])
     s"$text; they have no common superclass and share the unrelated traits $names, so write the type wanted"
 
+/** Why two branches yielding `a` and `b` agree on no type, where the reason is that they share several
+ * unrelated traits and no single most specific one: ", which share Swims and Flies but …", or
+ * nothing. */
+private no_single_join(c: *Checker, a: &Type, b: &Type) -> string
+    val traits = shared_traits(c, zonk(c, a), zonk(c, b))
+    if traits.len() < 2 then return ""
+    var names = ""
+    for i in 0..<traits.len()
+        if i > 0 then names = names + (if i + 1 == traits.len() then " and " else ", ")
+        names = names + type_name(traits[i])
+    s", which share $names but no single most specific type; write the type you want"
+
 /** The expected type of an argument whose parameter has the type `t`: `t` solved, except that a type
  * argument still open in `open` is left unknown where a value is read out, when what decided it is a
  * reference type that a later argument may widen. A value type is kept, so a literal takes it. */
@@ -12991,7 +13047,7 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
             join_expected(c, ty, body.ty, expected) match
                 Some(t) -> ty = t
                 None ->
-                    c.note(unit, arm.body.span, s"this arm yields ${type_name(body.ty)}, but the arms before it yield ${type_name(ty)}")
+                    c.note(unit, arm.body.span, s"this arm yields ${type_name(body.ty)}, but the arms before it yield ${type_name(ty)}${no_single_join(c, ty, body.ty)}")
                     agreed = false
         typed.push(TArm(pattern, guard, body))
     if !agreed then ty = ErrorType
