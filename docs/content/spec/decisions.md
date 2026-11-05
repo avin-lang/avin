@@ -2117,7 +2117,7 @@ their words are reserved.
   reference to a copy under Sysl 0.9.0, as for every such handle, so a Sysl function setting a signal
   is not seen by the handle; the next Sysl release settles the shim's helper at the `&T`, and
   `tests/programs/run/sysl_generic_handle_sharing` waits on it.
-- Proposed (built on branch `tuple-ord`): [`Either[L, R]` and `Result[T, E]` are `Ord`](/spec/errors/#either)
+- Settled on the user's delegation 2026-11-05 (built on branch `tuple-ord`): [`Either[L, R]` and `Result[T, E]` are `Ord`](/spec/errors/#either)
   when both sides are. `Left` orders before every `Right`, following the reference library's
   ordering of eithers; `Result` is ordered as `Either` with `Err` in the place of `Left`, so every
   `Err` before every `Ok`. Rationale: both types put the failure on the same side (`Left` and
@@ -2262,15 +2262,7 @@ their words are reserved.
   did. Why: the two operands of an ordering are one type, so the other operand is the only evidence
   and the obvious one. Alternative: requiring `None[int]`, which `==` does not.
 
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- **Qualified variant access, `Type.Variant`** (branch `qualified-variants`, 2026-11-05). Proposed:
+- Settled on the user's delegation 2026-11-05 (built on branch `qualified-variants`): **Qualified variant access, `Type.Variant`** (branch `qualified-variants`, 2026-11-05). Decided:
   `T.V` and `m.T.V` name data type `T`'s variant `V`, beside the bare `V`, in expressions and
   patterns; the variant comes before any other member of that name, and a companion object
   declaring a method or a field named after one of its type's variants is refused where it is
@@ -2286,7 +2278,7 @@ their words are reserved.
   parameter. Type arguments are written once, on the type or on the variant, not both. Review with
   the user: whether the "capitalized name" test for reporting a missing variant should instead be
   any name that resolves to nothing on a data type.
-- **Every operation on a connection or a listener checks its socket's owner first** (branch
+- Settled on the user's delegation 2026-11-05 (built on branch `thread-ownership`): **Every operation on a connection or a listener checks its socket's owner first** (branch
   `thread-ownership`). A `TcpStream` keeps the bytes it read ahead in Avin fields, so a read served
   from them alone never reached the socket, and the code that had handed the connection over read
   on from them without trapping; a closed connection or listener answered an error, and a
@@ -2301,7 +2293,7 @@ their words are reserved.
   other end sent); a check in the compiler for every field of a class holding a handle (a language
   rule for what one library type needs); an Avin owner field compared by hand (it would not move
   when the runtime hands over, which moves only handles).
-- **A started `Child` promises `Sendable`, and moves between threads as a connection does**
+- Settled on the user's delegation 2026-11-05 (built on branch `thread-ownership`): **A started `Child` promises `Sendable`, and moves between threads as a connection does**
   (branch `thread-ownership`). It holds a runtime token, a handle holding nothing but its owner,
   and `waitFor`, `isAlive` and `kill` use it first, so handing a child to a thread's or a future's
   body makes it the body's, the code that handed it over traps at any use while the body runs
@@ -2314,7 +2306,7 @@ their words are reserved.
   thread starts and waits for its own commands (what it was; a server that starts a command and
   hands it to a waiter could not). A lines iterator stays not sendable: it is consumed where it is
   made, and the thread reading a command's output can start the command itself.
-- **A handle class's `@sysl` may name it for its traps: `@sysl("avin.rt.Token", named: "Child")`**
+- Settled on the user's delegation 2026-11-05 (built on branch `thread-ownership`): **A handle class's `@sysl` may name it for its traps: `@sysl("avin.rt.Token", named: "Child")`**
   (branch `thread-ownership`; the director decided that the old owner's trap names the type the user
   holds). Every trap a handle raises, belonging to another thread and being closed, in compiled code
   and in the shim, uses that name rather than the class's; the name must be a type's (a capital
@@ -2327,7 +2319,7 @@ their words are reserved.
   rule no reader would guess). `Socket` still names itself, for a `TcpStream` and a `TcpListener`
   both; naming those for the user's type would need one handle class per type. Review with the
   user whether they should.
-- Proposed 2026-11-05 (built on branch `module-var-threads`): **a thread's body reaches no
+- Settled on the user's delegation 2026-11-05 (built on branch `module-var-threads`): **a thread's body reaches no
   module-level mutable state** ([what is shared](/spec/threads/#what-is-shared)). What is passed
   for a `@sendable` parameter, directly or through every function it reaches, reads and writes no
   module-level `var` and reads no module-level value, `lazy val` or `object` whose type is not
@@ -2369,6 +2361,16 @@ their words are reserved.
     sendable like any object with no field; only the collections themselves are mutable.
     Review with the user: whether the `Annotation` promise is wanted, and whether the trait and
     operator over-approximation rejects too much in practice.
+
+**Deferred**
+
+- Public C interoperability. Until then, C is reached through Sysl.
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
