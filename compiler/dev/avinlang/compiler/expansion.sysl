@@ -30,7 +30,10 @@ import sysl.container.{Map, map}
 //   arguments, as a trait with fewer parameters than the class does not;
 // - each call through a bound on a value of a type parameter: from that parameter to the
 //   implementation at the call's position in the method table of each data type or class some
-//   generic code passes as that parameter, taking the type argument apart.
+//   generic code passes as that parameter, taking the type argument apart. The edge leaves the
+//   parameter as it holds that type, a node of its own which only the paths bringing the type
+//   reach: `Chain[T]` passing `Option[Chain[T]]` to `F` reaches `Option`'s implementation from it,
+//   and not `Chain`'s, whose `Chain[T]` arrives at `F` by another path, one level shallower.
 //
 // A local function or lambda with no type parameters of its own is copied with the code it is
 // declared in, so its types are that code's.
@@ -68,6 +71,11 @@ private struct Flow
     /** For each node, the data types and classes (by `data_base` or `class_base`) some code passes
      * to it as the outermost type of its type argument, directly or through other parameters. */
     heads: Map[usize, Buf[usize]]
+    /** For each node and outermost type passed to it, by `"key/head"`, the node that stands for the
+     * parameter holding that type: an instance of the type reaches it, and a call through a bound
+     * on the parameter reaches the type's implementation from it, not from the parameter as a whole,
+     * whose other outermost types arrive by other paths. Its key is the parameter's own. */
+    head_nodes: Map[string, usize]
     /** The methods of types, by `name/n`, with `n` type parameters of their own. */
     methods_by_name: Map[string, Buf[usize]]
     /** The generic local functions of each top-level function. */
@@ -91,7 +99,7 @@ private class_base(id: usize) -> usize = (1usize << 61) + id * 256
 
 /** Rejects every generic call cycle of the program whose type arguments grow. */
 check_expansion(c: *Checker)
-    var f = Flow(buf(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), map(), map())
+    var f = Flow(buf(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), map(), map(), map())
     index_symbols(c, &f)
     for id in 0..<c.symbols.len()
         c.bodies[id] match
@@ -155,9 +163,23 @@ private node(f: *Flow, key: usize) -> usize
     f.nodes.put(key, n)
     n
 
+/** The node for the parameter with node key `key` holding an instance of the type `head` (a
+ * `data_base` or `class_base`), which leads to the parameter's own node; the edge that first
+ * reaches it, at `unit` and `span` passing `arg`, names that one too. */
+private head_node(f: *Flow, key: usize, head: usize, unit: usize, span: Span, arg: &Type) -> usize
+    val name = s"$key/$head"
+    if f.head_nodes.get(name) is Some(n) then return n
+    val n = f.keys.len()
+    f.keys.push(key)
+    f.out.push(buf())
+    f.head_nodes.put(name, n)
+    connect_nodes(f, n, node(f, key), 0, unit, span, arg)
+    n
+
 private connect(f: *Flow, from_key: usize, to_key: usize, weight: i64, unit: usize, span: Span, arg: &Type)
-    val from = node(f, from_key)
-    val to = node(f, to_key)
+    connect_nodes(f, node(f, from_key), node(f, to_key), weight, unit, span, arg)
+
+private connect_nodes(f: *Flow, from: usize, to: usize, weight: i64, unit: usize, span: Span, arg: &Type)
     if from == to && weight <= 0 then return
     val key = (from << 32) + to
     if f.edge_index.get(key) is Some(index)
@@ -243,13 +265,16 @@ private flow_into(c: *Checker, f: *Flow, site: Site, span: Span, args: Buf[&Type
         if offset + j >= 256 then break
         var params: Buf[usize] = buf()
         params_in(c, args[j], site.owner, &params)
+        val head: usize = *resolved(c, args[j]) match
+            Data(id, _, _) -> data_base(id)
+            Class(id, _, _) -> class_base(id)
+            _ -> 0
         for i in params
-            if i < 256 then connect(f, site.base + i, target + offset + j, depth_of(c, args[j], site.owner, i), site.unit, span, args[j])
-        if params.len() > 0
-            *resolved(c, args[j]) match
-                Data(id, _, _) -> add_head(f, target + offset + j, data_base(id))
-                Class(id, _, _) -> add_head(f, target + offset + j, class_base(id))
-                _ -> ()
+            if i < 256
+                val weight = depth_of(c, args[j], site.owner, i)
+                connect(f, site.base + i, target + offset + j, weight, site.unit, span, args[j])
+                if head != 0 then connect_nodes(f, node(f, site.base + i), head_node(f, target + offset + j, head, site.unit, span, args[j]), weight, site.unit, span, args[j])
+        if params.len() > 0 && head != 0 then add_head(f, target + offset + j, head)
         mention(c, f, site, span, args[j])
 
 private add_head(f: *Flow, key: usize, head: usize) -> bool
@@ -560,15 +585,22 @@ private view_edges(c: *Checker, f: *Flow, self_type: &Type, site: Site, span: Sp
 // The calls through bounds: each type parameter's outermost types reach the parameters it is passed
 // on to unchanged, and each call on a value of it reaches each such type's implementation.
 private connect_bounds(c: *Checker, f: *Flow)
+    // A parameter passed on unchanged passes on each outermost type it holds, along the path that
+    // type takes.
     var changed = true
     while changed
         changed = false
-        for e in f.edges
+        val count = f.edges.len()
+        for x in 0..<count
+            val e = f.edges[x]
             if e.weight != 0 then continue
             if !(*resolved(c, e.arg) is TypeVar(_, _, _)) then continue
+            if !plain(f, e.from) || !plain(f, e.to) then continue
             if f.heads.get(f.keys[e.from]) is Some(heads)
                 for h in heads
                     if add_head(f, f.keys[e.to], h) then changed = true
+                    val from = head_node(f, f.keys[e.from], h, e.unit, e.span, e.arg)
+                    connect_nodes(f, from, head_node(f, f.keys[e.to], h, e.unit, e.span, e.arg), 0, e.unit, e.span, e.arg)
     for x in 0..<f.bound_keys.len()
         val key = f.bound_keys[x]
         val slot = f.bound_slots[x]
@@ -576,18 +608,24 @@ private connect_bounds(c: *Checker, f: *Flow)
             Some(h) -> h
             None -> continue
         for h in heads
+            // The parameter as it holds this type, so only the paths that bring the type reach
+            // its implementation.
+            val from = f.head_nodes.get(s"$key/$h").unwrap_or(node(f, key))
             if h >= (1usize << 62)
                 val d = (h - (1usize << 62)) / 256
-                bound_target(c, f, key, data_type_of(c, d), data_owner(d), c.data[d].table, slot)
+                bound_target(c, f, from, data_type_of(c, d), data_owner(d), c.data[d].table, slot)
             else
                 val k = (h - (1usize << 61)) / 256
-                bound_target(c, f, key, class_type_of(c, k), class_owner(k), c.classes[k].table, slot)
+                bound_target(c, f, from, class_type_of(c, k), class_owner(k), c.classes[k].table, slot)
+
+/** Whether node `n` is a parameter's own node rather than one for an outermost type it holds. */
+private plain(f: *Flow, n: usize) -> bool = f.nodes.get(f.keys[n]).unwrap_or(n + 1) == n
 
 private bound_target(c: *Checker, f: *Flow, from: usize, self_type: &Type, owner: usize, table: Buf[Option[usize]], slot: usize)
     if slot < table.len()
         if table[slot] is Some(m) then bound_target_edges(c, f, from, self_type, owner, m)
 
-// Edges from the type parameter with node key `from`, holding an instance of `self_type`, to method
+// Edges from node `from`, a type parameter holding an instance of `self_type`, to method
 // `m`, that type's implementation: each of `m`'s type parameters is a part of the type argument, or
 // holds parts of it as deep as the view of `self_type` it belongs to puts them, so the weight is that
 // depth less the one the type adds.
@@ -604,7 +642,7 @@ private bound_target_edges(c: *Checker, f: *Flow, from: usize, self_type: &Type,
             var params: Buf[usize] = buf()
             params_in(c, receiver_args[j], symbol.type_owner, &params)
             for i in params
-                if i < 256 then connect(f, from, function_base(m) + i, -1 - depth_of(c, receiver_args[j], symbol.type_owner, i), symbol.unit, symbol.decl.name_span, receiver_args[j])
+                if i < 256 then connect_nodes(f, from, node(f, function_base(m) + i), -1 - depth_of(c, receiver_args[j], symbol.type_owner, i), symbol.unit, symbol.decl.name_span, receiver_args[j])
         return
     val k = symbol.owner_class.unwrap()
     val view = ancestor_type(c.classes, c.data, self_type, k) match
@@ -616,7 +654,7 @@ private bound_target_edges(c: *Checker, f: *Flow, from: usize, self_type: &Type,
     for i in 0..<args.len()
         if i >= 256 then break
         val d = deepest_param(c, args[i], owner)
-        if d >= 0 then connect(f, from, function_base(m) + i, d - 1, symbol.unit, symbol.decl.name_span, args[i])
+        if d >= 0 then connect_nodes(f, from, node(f, function_base(m) + i), d - 1, symbol.unit, symbol.decl.name_span, args[i])
 
 /** Reports each strongly connected set of nodes that holds a cycle of positive weight, naming the
  * cycle. */
@@ -637,8 +675,15 @@ private report_cycles(c: *Checker, f: *Flow)
             more.push(x)
             inner.put(component[e.from], more)
     var cycles: Buf[Buf[usize]] = buf()
+    // A component holding a growing cycle among data types' fields alone is that nested data type,
+    // even where code written for the types closes other cycles through it.
     for k in order
-        val cycle = positive_cycle(f, inner.get(k).unwrap())
+        val all = inner.get(k).unwrap()
+        var fields: Buf[usize] = buf()
+        for x in all
+            if f.keys[f.edges[x].from] >= (1usize << 62) && f.keys[f.edges[x].to] >= (1usize << 62) then fields.push(x)
+        var cycle = positive_cycle(f, fields)
+        if cycle.len() == 0 then cycle = positive_cycle(f, all)
         if cycle.len() > 0 then cycles.push(cycle)
     // A nested data type is reported at the type, and not again through the code written for it,
     // its derived and structural methods.

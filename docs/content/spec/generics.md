@@ -205,7 +205,11 @@ data Tree[T]
 ```
 
 is rejected the same way, at the type: every data type compares, hashes and shows its values field
-by field, and each of those needs a copy for every depth.
+by field, and each of those needs a copy for every depth. The larger instance may sit inside another
+type, as `inner: Option[Tree[List[T]]]` does, or reach back through a second data type; the error
+names the cycle of types. A type naming itself at its own type arguments, however wrapped, as
+`rest: Option[Chain[T]]`, `kids: Vector[Rose[T]]` or a pair of types naming each other at `T`, is
+ordinary recursion: it compiles, and its derived and structural methods have one copy per instance.
 
 ## Subtyping
 
