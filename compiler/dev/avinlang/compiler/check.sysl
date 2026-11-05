@@ -307,6 +307,16 @@ struct GenericScope
     owner: usize
     params: Buf[TypeParam]
 
+/** A Sysl binding whose types name type parameters, in the generic scope it is declared in: whether
+ * each crosses depends on the parameter's bound, known once every conformance is. */
+struct LateBinding
+    unit: usize
+    f: &Function
+    params: Buf[&Type]
+    first: usize
+    result: Option[&Type]
+    scope: Option[GenericScope]
+
 /** Type arguments written before every conformance is known, for the parameters `params` of `owner`,
  * held to their bounds once they are, in the generic scope they were written in. */
 struct PendingBound
@@ -539,6 +549,8 @@ struct Checker
     /** Every variant of a qualified name that data types of one module share, in declaration order;
      * `variants` holds the first of them. A name no two types share is not here. */
     shared_variants: Map[string, Buf[VariantRef]]
+    /** Generic Sysl bindings, whose types are held to what crosses once `Boundary` is known. */
+    late_bindings: Buf[LateBinding]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -795,7 +807,7 @@ private check_imports(c: *Checker, unit: usize)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -850,6 +862,14 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
         hold_to_bounds(&c, p.unit, p.at, p.what, p.owner, p.params, p.args, 0)
         c.generic = outer_generic
     c.pending = buf()
+    for b in c.late_bindings
+        val outer_generic = c.generic
+        c.generic = b.scope
+        check_crossings(&c, b.unit, b.f, b.params, b.first, b.result)
+        c.generic = outer_generic
+    c.late_bindings = buf()
+    check_handle_type_params(&c)
+    check_boundary_declarations(&c)
     check_actor_params(&c)
     for dv in c.derivations
         if !dv.automatic then check_derivation(&c, dv)
@@ -3097,8 +3117,7 @@ private declare_methods(c: *Checker, unit: usize)
             symbol.decl = f
             c.self_trait = outer_trait
             if bound_method
-                if f.type_params.len() > 0 then c.note(file_unit, f.name_span, "generic Sysl bindings are not implemented")
-                else check_crossings(c, file_unit, f, symbol.params, 0, symbol.result)
+                check_crossings_once_bounded(c, file_unit, f, symbol.params, 0, symbol.result, if type_params.len() > 0 then Some(GenericScope(class_owner(id), type_params)) else None)
             // The receiver comes first, named `self`. In a trait that mentions `Self`, it is a `Self`,
             // so the trait's methods can pass it where their parameters take one.
             var receiver_types: Buf[&Type] = buf()
@@ -5655,6 +5674,8 @@ meets_bound(f: Conformances, x: &Type, bound: &Type) -> bool
     if names_core_trait(f.core, k, "Eq") || names_core_trait(f.core, k, "Hash") then return true
     // Whether a type is sendable is decided from its structure.
     if names_core_trait(f.core, k, "Sendable") then return !(sendability(f, x, k) is CannotSend(_))
+    // Whether a type crosses to Sysl as one Sysl type is decided from its structure too.
+    if names_core_trait(f.core, k, "Boundary") then return on_boundary(f, x, k)
     if rendered_at_run_time(f.classes, x) && names_rendering_trait(f.core, k) then return true
     *x match
         ErrorType -> true
@@ -5685,6 +5706,38 @@ meets_bound(f: Conformances, x: &Type, bound: &Type) -> bool
 private names_core_trait(core: CoreTraits, k: usize, name: string) -> bool = core.trait_named(name) match
     Some(t) -> t == k
     None -> false
+
+/** Whether a value of type `x` crosses to Sysl as one Sysl type, conforming to `Boundary`, the core
+ * trait `k`: an integer of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, a
+ * data type mirroring a Sysl one, an `Option`, a `Result` or a tuple of these, or a type parameter
+ * bounded by it. */
+on_boundary(f: Conformances, x: &Type, k: usize) -> bool = *x match
+    ErrorType -> true
+    Nothing -> true
+    Var(_) -> true
+    Unit -> true
+    Bool -> true
+    Char -> true
+    Real -> true
+    Str -> true
+    Byte -> true
+    Int(bits) -> bits == 8 || bits == 16 || bits == 32 || bits == 64
+    Data(id, _, args) ->
+        val d = f.data[id]
+        if mirror_target(d.decl) is Some(_) then return true
+        if d.module_name != CoreModule then return false
+        if d.name == "Option" && args.len() == 1 then return on_boundary(f, args[0], k)
+        d.name == "Result" && args.len() == 2 && on_boundary(f, args[0], k) && on_boundary(f, args[1], k)
+    Tuple(items) ->
+        for item in items
+            if !on_boundary(f, item, k) then return false
+        true
+    TypeVar(_, _, _) ->
+        for b in type_var_bounds(f, x)
+            if *b is Class(id, _, _)
+                if id == k then return true
+        false
+    _ -> false
 
 /** Whether `k` is the core library's `Display` or `Debug`. */
 names_rendering_trait(core: CoreTraits, k: usize) -> bool = names_core_trait(core, k, "Display") || names_core_trait(core, k, "Debug")
@@ -6529,7 +6582,24 @@ private check_sendable_declarations(c: *Checker)
         if ancestor_type(c.classes, c.data, own, k) is None then continue
         keep_send_promise(c, cls.unit, cls.decl.name_span, own, k, Some(GenericScope(class_owner(id), cls.decl.type_params)))
 
-private in_standard_library(module_name: string) -> bool = module_name == CoreModule || module_name.starts_with(CoreModule + ".")
+// `Boundary` is decided from a type's structure alone, so no impl and no trait or class declares it:
+// what a Sysl binding's shim converts does not change with what a type says of itself.
+private check_boundary_declarations(c: *Checker)
+    val k = c.core.trait_named("Boundary") match
+        Some(k) -> k
+        None -> return
+    val message = "`Boundary` is decided from a type's structure, so it is a bound, as in `[T: Boundary]`, and no declaration promises it"
+    for block in c.impls
+        val t = block.trait_type match
+            Some(t) -> t
+            None -> continue
+        if ancestor_type(c.classes, c.data, t, k) is Some(_) then c.note(block.unit, written_trait_span(block.decl), message)
+    for id in 0..<c.classes.len()
+        val cls = c.classes[id]
+        if id == k then continue
+        if ancestor_type(c.classes, c.data, own_class_type(cls, id), k) is Some(_) then c.note(cls.unit, cls.decl.name_span, message)
+
+private in_standard_library(module_name: string) -> bool =module_name == CoreModule || module_name.starts_with(CoreModule + ".")
 
 // Reports `t`, with its own type parameters as its arguments, where its structure does not keep its
 // promise to be `Sendable`: each parameter the promise holds only at sendable arguments for is taken
@@ -6632,7 +6702,7 @@ unmet_condition(f: Conformances, owner: usize, conditions: Buf[Buf[&Type]], args
 private find_core_traits(c: *Checker)
     var traits: Map[string, usize] = map()
     var methods: Map[string, usize] = map()
-    for name in ["Eq", "Hash", "Ord", "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Integer", "Display", "Debug", "Sendable"]
+    for name in ["Eq", "Hash", "Ord", "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Integer", "Display", "Debug", "Sendable", "Boundary"]
         if c.class_types.get(qualified(CoreModule, name)) is Some(k)
             if is_trait(c, k)
                 traits.put(name, k)
@@ -6799,6 +6869,18 @@ private underived_reason(c: *Checker, t: &Type, trait_name: string) -> string
             return s"; `${c.data[id].name}` has no `$trait_name` because its field `${u.field}` has type `${u.field_type}`, which does not implement `$trait_name`"
     ""
 
+// Why `t` is not `Boundary`, where `bound` is it.
+private boundary_reason(c: *Checker, t: &Type, bound: &Type) -> string
+    val k = c.core.trait_named("Boundary") match
+        Some(k) -> k
+        None -> return ""
+    val named = *bound match
+        Class(b, _, _) -> b == k
+        _ -> false
+    if !named then return ""
+    if *t is TypeVar(_, _, name) then return s"; a type parameter is `Boundary` where it is bounded by it, as in `[$name: Boundary]`"
+    "; a value crosses to Sysl as one Sysl type where it is an integer of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, a data type declared with `@sysl` to mirror a Sysl enum or struct, or an `Option`, a `Result` or a tuple of these"
+
 // Holds type arguments written on a type to the bounds of its parameters: at once when every
 // conformance is known, and otherwise once it is.
 private check_type_args(c: *Checker, unit: usize, at: Span, what: string, owner: usize, params: Buf[TypeParam], args: Buf[&Type])
@@ -6833,7 +6915,7 @@ private hold_to_bounds_except(c: *Checker, unit: usize, at: Span, what: string, 
                 continue
             if !conforms_to_bound(c, args[i], bound)
                 val arg = zonk(c, args[i])
-                c.note(unit, at, s"`${type_name(arg)}` does not conform to `${type_name(bound)}`, the bound of `${params[i].name}` in $what${underived_reason(c, arg, type_name(bound))}")
+                c.note(unit, at, s"`${type_name(arg)}` does not conform to `${type_name(bound)}`, the bound of `${params[i].name}` in $what${underived_reason(c, arg, type_name(bound))}${boundary_reason(c, arg, bound)}")
         if lower_at(c, owner, params, i) is Some(l)
             val lower = zonk(c, substitute(l, owner, args))
             val arg = zonk(c, args[i])
@@ -6955,10 +7037,49 @@ private check_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Type]
             None -> c.note(unit, a.span, "`@sysl` takes one string, the module and name of the Sysl function, as in `@sysl(\"sysl.text.to_upper\")`")
         if intrinsic then c.note(unit, a.span, "a function is an intrinsic or a Sysl binding, not both")
         if f.body is Some(_) || f.clauses.len() > 0 then c.note(unit, a.span, "a Sysl binding has no body: the Sysl function it names is its body")
-        if f.type_params.len() > 0
-            c.note(unit, f.name_span, "generic Sysl bindings are not implemented")
-            continue
-        check_crossings(c, unit, f, params, 0, result)
+        check_crossings_once_bounded(c, unit, f, params, 0, result, c.generic)
+
+// Each type parameter of a generic Sysl handle is a type argument of the Sysl type, so it is bounded
+// by `Boundary`, which holds every instance of the handle to Sysl types.
+private check_handle_type_params(c: *Checker)
+    val k = c.core.trait_named("Boundary") match
+        Some(k) -> k
+        None -> return
+    for id in 0..<c.classes.len()
+        val d = c.classes[id].decl
+        if handle_target(d) is None then continue
+        val outer_generic = c.generic
+        c.generic = Some(GenericScope(class_owner(id), d.type_params))
+        for i in 0..<d.type_params.len()
+            val tp = d.type_params[i]
+            if !on_boundary(conformances(c), TypeVar(class_owner(id), i, tp.name), k)
+                c.note(c.classes[id].unit, tp.span, s"a Sysl handle's type parameter is a type argument of the Sysl type, which is one Sysl type, so it is bounded by `Boundary`, as in `[${tp.name}: Boundary]`")
+        c.generic = outer_generic
+
+// Checks a binding's types against what crosses to Sysl: at once, or, where they name a type
+// parameter, whose bound decides it, once every conformance is known, in `scope`.
+private check_crossings_once_bounded(c: *Checker, unit: usize, f: &Function, params: Buf[&Type], first: usize, result: Option[&Type], scope: Option[GenericScope])
+    var generic = result match
+        Some(r) -> names_type_parameter(r)
+        None -> false
+    for t in params
+        if names_type_parameter(t) then generic = true
+    if generic && !c.conformances_known then c.late_bindings.push(LateBinding(unit, f, params, first, result, scope))
+    else check_crossings(c, unit, f, params, first, result)
+
+// Whether `t` names a type parameter anywhere in it.
+private names_type_parameter(t: &Type) -> bool = *t match
+    TypeVar(_, _, _) -> true
+    Data(_, _, args) -> any_names_type_parameter(args)
+    Class(_, _, args) -> any_names_type_parameter(args)
+    Tuple(items) -> any_names_type_parameter(items)
+    Function(ps, r, _) -> any_names_type_parameter(ps) || names_type_parameter(r)
+    _ -> false
+
+private any_names_type_parameter(ts: Buf[&Type]) -> bool
+    for t in ts
+        if names_type_parameter(t) then return true
+    false
 
 // A C binding is a top-level function without a body whose `@c("<prototype>")` copies the C
 // function's prototype from the library's header. Its parameters correspond to the prototype's by
@@ -7383,12 +7504,12 @@ private check_crossings(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
         elif *t is Function(ps, r, _) then check_callback_crossing(c, unit, p, ps, r)
         elif is_handle(c, t) || is_handle_collection(c, t) then ()
         elif holds_handle(c, t) then c.note(unit, p.ty.span, s"`${type_name(t)}` cannot cross to Sysl: a Sysl handle goes back into Sysl by itself, as a parameter or the receiver of its own methods, or as the elements of an `Array` or a `Vector` that is a parameter")
-        elif !crosses_to_sysl(c, t) then c.note(unit, p.ty.span, s"`${type_name(t)}` cannot cross to Sysl; ${BoundaryTypes}")
+        elif !crosses_to_sysl(c, t) then c.note(unit, p.ty.span, s"`${type_name(t)}` cannot cross to Sysl; ${boundary_types(c, t)}")
     if result is Some(r)
         if !crosses_out_of_sysl(c, r)
             val at = if f.result is Some(t) then t.span else f.name_span
             if holds_handle(c, r) then c.note(unit, at, s"`${type_name(r)}` cannot cross out of Sysl: a Sysl handle is a binding's result, held in its `Array`, `Vector`, `Option` or `Result`, or a part of a tuple that is one of these")
-            else c.note(unit, at, s"`${type_name(r)}` cannot cross to Sysl; ${BoundaryTypes}")
+            else c.note(unit, at, s"`${type_name(r)}` cannot cross to Sysl; ${boundary_types(c, r)}")
 
 // A binding's parameter taking a function, which the shim hands Sysl as a closure: Sysl calls it with
 // arguments that cross out of Sysl, as a binding's result does, and it answers a value that crosses
@@ -7396,11 +7517,11 @@ private check_crossings(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
 private check_callback_crossing(c: *Checker, unit: usize, p: Param, ps: Buf[&Type], r: &Type)
     for q in ps
         if *q is Function(_, _, _) then c.note(unit, p.ty.span, s"`${type_name(q)}` cannot be a callback's parameter: a function crosses to Sysl only as a binding's own parameter")
-        elif !crosses_out_of_sysl(c, q) then c.note(unit, p.ty.span, s"`${type_name(q)}` cannot be a callback's parameter, which Sysl gives it; ${BoundaryTypes}")
+        elif !crosses_out_of_sysl(c, q) then c.note(unit, p.ty.span, s"`${type_name(q)}` cannot be a callback's parameter, which Sysl gives it; ${boundary_types(c, q)}")
     if *r is Function(_, _, _) then c.note(unit, p.ty.span, s"`${type_name(r)}` cannot be a callback's result: a function crosses to Sysl only as a binding's own parameter")
     elif is_handle(c, r) then ()
     elif holds_handle(c, r) then c.note(unit, p.ty.span, s"`${type_name(r)}` cannot be a callback's result: a Sysl handle goes back into Sysl only by itself")
-    elif !crosses_to_sysl(c, r) then c.note(unit, p.ty.span, s"`${type_name(r)}` cannot be a callback's result, which goes into Sysl; ${BoundaryTypes}")
+    elif !crosses_to_sysl(c, r) then c.note(unit, p.ty.span, s"`${type_name(r)}` cannot be a callback's result, which goes into Sysl; ${boundary_types(c, r)}")
 
 /** Whether a binding's parameter is marked `@threaded`: Sysl may call the function it is given from
  * any thread. */
@@ -7409,7 +7530,32 @@ is_threaded_param(p: Param) -> bool
         if a.name == "threaded" then return true
     false
 
-const BoundaryTypes: string = "a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, data types declared with `@sysl` to mirror a Sysl enum or struct, and `Array`, `Vector`, `Option`, `Result` and tuples of these"
+// What crosses to Sysl, said of `t`, which does not: where it holds a type parameter that is not
+// bounded by `Boundary`, that is the reason.
+private boundary_types(c: *Checker, t: &Type) -> string = unbounded_parameter(c, t) match
+    Some(name) -> s"a type parameter crosses as the type it is given, which its bound holds to one Sysl type, as in `[$name: Boundary]`"
+    None -> BoundaryTypes
+
+// The name of a type parameter `t` holds that is not bounded by `Boundary`.
+private unbounded_parameter(c: *Checker, t: &Type) -> Option[string]
+    val k = c.core.trait_named("Boundary")?
+    *t match
+        TypeVar(_, _, name) -> if on_boundary(conformances(c), t, k) then None else Some(name)
+        Data(_, _, args) ->
+            for a in args
+                if unbounded_parameter(c, a) is Some(n) then return Some(n)
+            None
+        Class(_, _, args) ->
+            for a in args
+                if unbounded_parameter(c, a) is Some(n) then return Some(n)
+            None
+        Tuple(items) ->
+            for a in items
+                if unbounded_parameter(c, a) is Some(n) then return Some(n)
+            None
+        _ -> None
+
+const BoundaryTypes: string ="a binding's parameters and result are integers of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, data types declared with `@sysl` to mirror a Sysl enum or struct, and `Array`, `Vector`, `Option`, `Result` and tuples of these"
 
 /** Whether a value of type `t` crosses between Avin and Sysl, converted by a binding's shim. A Sysl
  * handle held in another type crosses only out of Sysl, as a binding's result or held in its
@@ -7443,6 +7589,10 @@ private crosses(c: *Checker, t: &Type, handles: bool) -> bool = *t match
         for item in items
             if !crosses(c, item, handles) then return false
         true
+    // A type parameter crosses as the type it is instantiated at, which its bound holds to one.
+    TypeVar(_, _, _) -> c.core.trait_named("Boundary") match
+        Some(k) -> on_boundary(conformances(c), t, k)
+        None -> false
     _ -> false
 
 /** Whether `t` is a tuple holding a Sysl handle, or holds one. */
@@ -7510,11 +7660,12 @@ handle_trap_name(d: &ClassDecl, own: string) -> string
 
 // A class declared with `@sysl("module.Name")` is a handle on that Sysl type: its objects are made by
 // the bindings that return one and hold the Sysl value and nothing else, so the class has no
-// parameters, fields or statements, no type parameters and no parents, and is final. Its methods
-// without a body are bound to the Sysl type's methods. `named: "Name"` after the type gives the name
-// its traps use.
+// parameters, fields or statements and no parents, and is final. Its type parameters, where it has
+// any, are the generic Sysl type's, invariant and bounded by `Boundary`. Its methods without a body
+// are bound to the Sysl type's methods. `named: "Name"` after the type gives the name its traps use.
 private check_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
     var annotated = false
+    var instanced = false
     for a in d.annotations
         if a.name != "sysl" then continue
         annotated = true
@@ -7529,6 +7680,7 @@ private check_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
         target match
             Some(p) ->
                 val (path, arguments) = instance_parts(p)
+                if p.contains("[") then instanced = true
                 if !is_sysl_path(path) || (p.contains("[") && arguments.len() == 0)
                     c.note(unit, a.span, s"`@sysl` on a class names the Sysl type it is a handle on, by its module and name, as in `sysl.checksum.Crc32`, or an instance of a generic one, as in `sysl.buf.Buf[int]`; `$p` is not one")
                 for t in arguments
@@ -7536,7 +7688,12 @@ private check_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
                         c.note(unit, a.span, s"`${t.trim()}` cannot be a type argument of the Sysl type a handle is on: each is one Sysl type, an integer of 8, 16, 32 or 64 bits, `byte`, `real`, `char`, `bool`, `unit`, `string`, or an `Option`, a `Result` or a tuple of these")
             None -> c.note(unit, a.span, "`@sysl` on a class takes one string, the module and name of the Sysl type it is a handle on, as in `@sysl(\"sysl.checksum.Crc32\")`")
     if !annotated then return
-    if d.type_params.len() > 0 then c.note(unit, d.type_params[0].span, "a Sysl handle has no type parameters: it holds one Sysl type")
+    // A generic handle's type parameters are the Sysl type's, in order, so each of its instances is a
+    // handle on that instance of the Sysl type.
+    if d.type_params.len() > 0
+        if instanced then c.note(unit, d.type_params[0].span, "a Sysl handle names an instance of a generic Sysl type or has type parameters, the Sysl type's own, but not both")
+        for tp in d.type_params
+            if !(tp.variance is Invariant) then c.note(unit, tp.span, "a Sysl handle's type parameters are invariant, as the Sysl type's are")
     if d.params.len() > 0 then c.note(unit, d.params[0].param.pattern.span, "a Sysl handle has no parameters: the bindings that return one make it")
     if d.modifier != "" then c.note(unit, d.modifier_span, s"a Sysl handle is final, so it cannot be `${d.modifier}`")
     if d.parents.len() > 0 then c.note(unit, d.parents[0].span, "a Sysl handle has no parents; an `impl` makes it conform to a trait")
@@ -7574,8 +7731,8 @@ private check_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
 // `release:` gives back. `retain:` takes another, `kept:` names the one handle of a class the holder
 // keeps, and `shared` says the C object may be used from any thread. `release:` and `retain:` are a C
 // function of the pointer or a C expression in `self`, which the C unit compiles. Like a Sysl
-// handle, the class has no parameters, fields or statements, no type parameters and no parents, and
-// its methods without a body are C bindings whose prototype takes the receiver first, as `self`.
+// handle, the class has no parameters, fields or statements and no parents, and, a C type having no
+// type arguments, no type parameters; its methods without a body are C bindings whose prototype takes the receiver first, as `self`.
 // A data type declared `@c(enum: "<C type>", prefix: "<prefix>")` mirrors a C enum: each of its
 // variants, which have no fields, is an enumerator, the prefix and its words or the one its own
 // `@c("name")` names. The C type is an enumeration or an integer type, which the C unit checks, as it
@@ -8042,6 +8199,9 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                 return ErrorType
             if !as_bound && is_class_named(c, id, qualified(CoreModule, "Sendable"))
                 c.note(unit, t.span, "`Sendable` is a bound, as in `[T: Sendable]`, or a promise a declaration makes, as in `trait Shape: Sendable`, and not a type")
+                return ErrorType
+            if !as_bound && is_class_named(c, id, qualified(CoreModule, "Boundary"))
+                c.note(unit, t.span, "`Boundary` is a bound, as in `[T: Boundary]`, and not a type")
                 return ErrorType
             if !as_bound && is_trait(c, id) && mentions_self(c, id, 0)
                 c.note(unit, t.span, s"`$path` mentions `Self`, so it is a bound, as in `[T: $path]`, and not a type")
