@@ -2463,15 +2463,7 @@ their words are reserved.
   each naming the character and its `U+` code point. Why: the bytes of one character used to be read as separate
   symbols, which the parser then reported one at a time.
 
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- Proposed 2026-11-05 on the user's delegation (built on branch `sendable-functions`): **`@sendable`
+- Settled on the user's delegation 2026-11-05 (built on branch `sendable-functions`): **`@sendable`
   function types**, answering the open question whether a function value can be sent, with a type
   that says what it captures ([function types](/spec/types/#function-types), [what is
   shared](/spec/threads/#what-is-shared)).
@@ -2513,6 +2505,16 @@ their words are reserved.
   - **Review with the user**: the spelling `@sendable (A) -> B` (an annotation in type position, the
     only one), against a keyword or a `Sendable`-bounded spelling; and whether two overloads
     differing only in the mark should be refused or resolved to the plain one for a lambda.
+
+**Deferred**
+
+- Public C interoperability. Until then, C is reached through Sysl.
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
