@@ -702,12 +702,30 @@ Settled by the user on 2026-11-03:
   and they are called on a type, `int.zero()`, or on a bounded type parameter, `T.zero()`. `sum()`
   and `product()` on the collections are written with them. The details of
   [static members](/spec/declarations/#static-members): `static` is a keyword, written after
-  `private` and before or after `override`; a static member is only a trait's or an implementation
-  of one, with no static members of a type's own; in a trait it has no default body, and no trait
+  `private` and before or after `override`; a static member is a trait's, an implementation of one,
+  or a built-in type's own (below), and a class or `data` type keeps what belongs to the type in its
+  companion object; in a trait it has no default body, and no trait
   overrides one; an implementation is `static` exactly where the trait's member is, an abstract class
   giving it too; its body has no `self`; a trait's default body cannot call one on `Self`; a trait
   with one is a bound and not a type; and a local, parameter, member or module value of a type's
   name hides the type as a receiver.
+- Settled by the user 2026-11-04: a built-in type declares
+  [static members of its own](/spec/declarations/#static-members-of-built-in-types), as `static`
+  members of an impl of the type without a trait (`impl string` with
+  `static fromUtf8(bytes: Array[byte]) -> Result[string, Utf8Error]`), for `string`, `char`,
+  `bool`, `real`, `byte` and each integer type, since a built-in type has no companion object. The
+  core library declares the built-in types' own; a program adds them in an extension, as it adds
+  methods, seen where the module is imported and private to it where marked so. They are called on
+  the type's name, never on a value, and their bodies have no `self`. A name is a static member or
+  a method of the type's values, never both; static members of one name overload by parameter
+  types; `wrap` and the numeric limits (`MaxValue`, `MinValue`, `real`'s `NaN` and the rest) are the
+  language's and cannot be redeclared. A generic impl, an impl adding to a trait and an impl of a
+  class or `data` type declare no static member of their own. Any static member named on a known
+  type without a call (`string.fromUtf8Lossy`, `int.zero`, `Point.zero`) is a function value of its
+  parameters; an overloaded one takes the expected function type's overload, and without one is an
+  error. The first use is `string.fromUtf8` and `string.fromUtf8Lossy`
+  ([strings from bytes](/spec/types/#strings-from-bytes)), bound to Sysl's UTF-8 decoders, with
+  `Utf8Error(offset: long, truncated: bool)` mirroring Sysl's error.
 - `i1` has no `1`: `i1.one()` is a compile error, and `one()` reached at `i1` through a generic
   traps with "i1 has no 1" at the place the program called, so a generic that passes its bounds
   compiles for every type meeting them.

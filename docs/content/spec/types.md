@@ -162,6 +162,31 @@ println(word.slice(3, 5))                               // é
 println(word.slice(0, 4))                               // traps: offset 4 is inside `é`
 ```
 
+### Strings from bytes
+
+Bytes become a string through two [static members](/spec/declarations/#static-members-of-built-in-types)
+of `string`, which check that the bytes are UTF-8, since a string's bytes always are:
+
+| Static member | Result |
+| --- | --- |
+| `string.fromUtf8(bytes: Array[byte])` | `Ok` of the text the bytes encode, or `Err` of a `Utf8Error` |
+| `string.fromUtf8Lossy(bytes: Array[byte])` | The text, with U+FFFD, the replacement character, in place of each maximal run of bytes that is not UTF-8: a sequence the bytes end inside is one replacement, a stray continuation byte another |
+
+`data Utf8Error(offset: long, truncated: bool)` says where and why: `offset` is the byte offset at
+which the first sequence that is not a character begins, and `truncated` is true where the bytes end
+inside a sequence that more bytes could complete, and false where they hold one no continuation
+could make a character. Refused are a continuation byte that begins nothing, an overlong encoding
+(`C0 AF` for `/`), a surrogate (`ED A0 80`), a value past U+10FFFF (`F4 90 80 80`), a byte no
+sequence begins with (`FF`), and a sequence cut short.
+
+```text
+val bytes = "naïve".bytes().toArray()
+println(string.fromUtf8(bytes))                          // Ok(naïve)
+val cut: Array[byte] = [0x61, 0xE2, 0x82]
+println(string.fromUtf8(cut))                            // Err(Utf8Error(1, true))
+println(string.fromUtf8Lossy(cut))                       // a�
+```
+
 ## unit
 
 `unit` has the single value `()`. It is an ordinary type: it can be a type argument, a field, a
