@@ -1,0 +1,120 @@
+// expect: exit 0
+// A connection handed to a thread or a future is the body's, the bytes read ahead with it: the body
+// reads the lines a read on the calling thread fetched, by line, by size and to the end; when the
+// body returns, the connection goes back to whoever uses it next, so it is handed back and forth,
+// through threads and futures, nested ones and many at once; a body may close it, after which a read
+// anywhere answers that it is closed; and a listener moves the same way.
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.{Channel, Future, spawn}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+    Ok(v) -> v
+    Err(e) -> fail(e.message())
+
+text(bytes: Array[byte]) -> string = string.fromUtf8Lossy(bytes)
+
+// A connected pair: what is written to the first is read from the second.
+pair(l: TcpListener) -> (TcpStream, TcpStream)
+    val c = ok(TcpStream.connect("127.0.0.1", l.port()))
+    (c, ok(l.accept()))
+
+main()
+    val l = ok(TcpListener.bind("127.0.0.1", 0))
+
+    // Lines read ahead on this thread are read by the thread it hands the connection to, by line,
+    // by size, and to the end, the rest still arriving from the socket.
+    val (c, s) = pair(l)
+    ok(c.writeText("one\ntwo\nthree four\nfive"))
+    println(ok(s.readLine()))
+    val first = spawn(() ->
+        val two = ok(s.readLine())
+        val three = text(ok(s.read(5)))
+        val rest = ok(s.readLine())
+        (two, three, rest))
+    println(first.join())
+    // Back on this thread, the connection reads on from where the thread left it.
+    ok(c.writeText("\nsix\nseven\n"))
+    println(ok(s.readLine()))
+    println(ok(s.readLine()))
+    println(text(ok(s.read(2))))
+    println(ok(s.readLine()))
+
+    // Handed back and forth: each body reads one line of what one read fetched.
+    ok(c.writeText("a\nb\nc\nd\ne\nf\n"))
+    println(ok(s.readLine()))
+    for round in 0..<5
+        val line = if round % 2 == 0
+            spawn(() -> ok(s.readLine())).join()
+        else
+            Future(ok(s.readLine())).await()
+        println(s"round $round: $line")
+
+    // A thread that hands it on to a thread of its own, and a future that hands it to a thread.
+    ok(c.writeText("g\nh\ni\n"))
+    println(ok(s.readLine()))
+    println(spawn(() ->
+        val inner = spawn(() -> ok(s.readLine())).join()
+        (inner, ok(s.readLine()))).join())
+    ok(c.writeText("j\nk\n"))
+    println(Future((spawn(() -> ok(s.readLine())).join(), ok(s.readLine()))).await())
+
+    // Bytes read ahead that are not ASCII, a line split across what two reads fetch.
+    ok(c.writeText("ünï\ncødé "))
+    println(ok(s.readLine()))
+    val split = spawn(() -> ok(s.readLine()))
+    ok(c.writeText("😀\n"))
+    println(split.join())
+
+    // `readAll` in the body takes the bytes read ahead first.
+    ok(c.writeText("x\ny\nz"))
+    println(ok(s.readLine()))
+    ok(c.shutdownOutput())
+    println(Future(text(ok(s.readAll()))).await())
+
+    // The body writes on it, and the other end sees it.
+    val (c2, s2) = pair(l)
+    spawn(() -> ok(s2.writeText("from the thread\n"))).join()
+    println(ok(c2.readLine()))
+
+    // A body closes it: afterwards a read on this thread answers that it is closed, and closing again
+    // does nothing.
+    ok(c2.writeText("left\nbehind\n"))
+    println(ok(s2.readLine()))
+    println(spawn(() ->
+        s2.close()
+        s2.readLine().isErr()).join())
+    println(s2.readLine())
+    println(s2.read(1).isErr())
+    s2.close()
+    c2.close()
+
+    // Many connections at once, each read ahead on this thread and finished by its own thread.
+    val many = (0..<8).map(i ->
+        val (w, r) = pair(l)
+        ok(w.writeText(s"head $i\ntail $i\n"))
+        ok(r.readLine())
+        (w, r)).toVector()
+    val readers = for (_, r) in many yield spawn(() -> ok(r.readLine()))
+    println(readers.map(t -> t.join()))
+    for (w, r) in many
+        w.close()
+        r.close()
+
+    // A listener handed to a thread accepts there, and comes back with its port.
+    val port = l.port()
+    val accepted = spawn(() ->
+        val r = ok(l.accept())
+        val line = ok(r.readLine())
+        r.close()
+        (line, l.port() == port))
+    val w = ok(TcpStream.connect("127.0.0.1", port))
+    ok(w.writeText("to the listener's thread\n"))
+    println(accepted.join())
+    println(l.port() == port)
+    w.close()
+    c.close()
+    s.close()
+    spawn(() -> l.close()).join()
+    println(l.accept().isErr())
+    l.close()
