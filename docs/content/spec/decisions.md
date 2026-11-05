@@ -2362,15 +2362,7 @@ their words are reserved.
     Review with the user: whether the `Annotation` promise is wanted, and whether the trait and
     operator over-approximation rejects too much in practice.
 
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- **A lambda takes a tuple apart by its parameters** ([tuples](/spec/types/#tuples); branch
+- Settled on the user's delegation 2026-11-05 (built on branch `lambda-untupling`): **A lambda takes a tuple apart by its parameters** ([tuples](/spec/types/#tuples); branch
   `lambda-untupling`). Where a function of one parameter whose type is an *n*-tuple (*n* ≥ 2) is
   expected, a lambda of exactly *n* parameters binds the tuple's elements in order, each typed from
   its element; a declared parameter type must fit its element (a wider one is accepted, as for any
@@ -2385,6 +2377,16 @@ their words are reserved.
   but the common case pays for a pattern); allowing a pattern in any lambda parameter position,
   `((a, b), c) -> …` (more general, but a second pattern syntax beside the `match` function, which
   already covers nested and refutable shapes).
+
+**Deferred**
+
+- Public C interoperability. Until then, C is reached through Sysl.
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
