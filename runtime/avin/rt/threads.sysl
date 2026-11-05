@@ -18,6 +18,8 @@ private struct Started
     root: Frame
     run: *u8
     joint: *u8
+    /** The program's closure runner, which calls `run` with the program's own convention. */
+    runner: *u8
     /** The context's address, which the thread makes its current one: the storage outlives every
      * call the thread makes. */
     own: *Context
@@ -38,10 +40,12 @@ private struct Joint
 var joint_descriptor: Descriptor = descriptor(0, sizeof(Joint), 0)
 
 /** Starts a thread running `run`, a closure that takes nothing and returns nothing, on a stack of
- * `stack` bytes, and gives back the object the thread is joined by. `ctx` is the calling thread's. */
+ * `stack` bytes, and gives back the object the thread is joined by. `ctx` is the calling thread's.
+ * `runner` is the program's closure runner: a function the C convention calls with a context and a
+ * closure, which runs the closure. */
 @export("avin_rt_thread_start")
-thread_start(ctx: *Context, run: *u8, stack: long) -> *u8
-    val s: &Started = Started(new_context(), Frame(null, 2), run, null, null, None)
+thread_start(ctx: *Context, run: *u8, stack: long, runner: *u8) -> *u8
+    val s: &Started = Started(new_context(), Frame(null, 2), run, null, runner, null, None)
     s.me = Some(s)
     val p: *Started = ptr_cast(&*s)
     p.own = &p.context
@@ -74,18 +78,16 @@ private cannot_start(ctx: *Context) -> never
     eprints("avin: cannot start a thread: the system refused one\n")
     trap()
 
-// The body of every started thread. It waits for any collection in progress, runs the closure, and
-// detaches, giving its storage back. A closure's code is the word before its descriptor, and takes the
-// context and the closure.
+// The body of every started thread. It waits for any collection in progress, runs the closure through
+// the program's runner, and detaches, giving its storage back. The closure's own code has the
+// program's calling convention, not the C one, so it is never called from here directly.
 private run_started(arg: *u8) -> unit
     val p: *Started = ptr_cast(arg)
     val c = &p.context
     install_stack_guard()
     leave_safe(c)
     current_context = p.own
-    val d: usize = usize(descriptor_of(p.run))
-    val code: **u8 = ptr_cast(d - 8)
-    val entry: *extern(*Context, *u8) -> unit = ptr_cast(code[0])
+    val entry: *extern(*Context, *u8) -> unit = ptr_cast(p.runner)
     entry(c, p.run)
     remove_stack_guard()
     detach(c)

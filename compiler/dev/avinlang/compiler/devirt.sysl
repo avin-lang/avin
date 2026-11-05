@@ -252,9 +252,7 @@ private rewrite(f: MirFunction, states: Buf[usize], sites: Buf[DispatchSite], de
                         Guarded(guards) ->
                             for k in i + 1..<j
                                 insts.push(block.insts[k])
-                            guard_call(&values, &slots, &blocks, b, insts, block, i, j, guards)
-                            // The fallback is the block before the last, which goes on after the call.
-                            fallbacks.push(blocks.len() - 2)
+                            fallbacks.push(guard_call(&values, &slots, &blocks, b, insts, block, i, j, guards))
                             split = true
                             break
                         Unchanged -> ()
@@ -277,8 +275,11 @@ private rewrite(f: MirFunction, states: Buf[usize], sites: Buf[DispatchSite], de
 // Replaces the call at `j` of block `b`, through the method table entry made at `i`, with a test of
 // the receiver's descriptor against each guard's, in turn: a match calls the guard's method directly;
 // no match takes the method from the table. The result is kept in a slot of its own, which the block
-// after the call reads, and that block goes on with the rest of the original one.
-private guard_call(values: *Buf[MirType], slots: *Buf[MirType], blocks: *Buf[MirBlock], b: usize, before: Buf[Inst], block: MirBlock, i: usize, j: usize, guards: Buf[DispatchGuard])
+// after the call reads, and that block goes on with the rest of the original one. A call whose value
+// the block returns at once, a call in tail position, returns from each of its calls instead, so each
+// stays a tail call (see `tail_call_at` in `emit.sysl`). Answers the block that calls through the
+// table.
+private guard_call(values: *Buf[MirType], slots: *Buf[MirType], blocks: *Buf[MirBlock], b: usize, before: Buf[Inst], block: MirBlock, i: usize, j: usize, guards: Buf[DispatchGuard]) -> usize
     val (code, object, position) = block.insts[i] match
         MethodSlot(c, o, p) -> (c, o, p)
         _ -> panic("a guarded call that is not through a method table")
@@ -322,12 +323,22 @@ private guard_call(values: *Buf[MirType], slots: *Buf[MirType], blocks: *Buf[Mir
     (*blocks)[b] = heads[0]
     for k in 1..<heads.len()
         blocks.push(heads[k])
+    val returns_value = block.term match
+        Return(Some(Value(v))) -> dest == Some(v)
+        Return(None) -> dest is None
+        _ -> false
+    val returned = returns_value && j + 1 == block.insts.len()
     for m in methods
         var insts: Buf[Inst] = buf()
-        result_call(values, &insts, dest, result, Direct(m), args)
-        blocks.push(MirBlock(insts, Jump(join)))
+        if returned then blocks.push(returning_call(values, insts, dest, Direct(m), args))
+        else
+            result_call(values, &insts, dest, result, Direct(m), args)
+            blocks.push(MirBlock(insts, Jump(join)))
     var insts: Buf[Inst] = buf()
     insts.push(MethodSlot(code, object, position))
+    if returned
+        blocks.push(returning_call(values, insts, dest, Indirect(Value(code), signature), args))
+        return fallback
     result_call(values, &insts, dest, result, Indirect(Value(code), signature), args)
     blocks.push(MirBlock(insts, Jump(join)))
     var rest: Buf[Inst] = buf()
@@ -335,6 +346,20 @@ private guard_call(values: *Buf[MirType], slots: *Buf[MirType], blocks: *Buf[Mir
     for k in j + 1..<block.insts.len()
         rest.push(block.insts[k])
     blocks.push(MirBlock(rest, block.term))
+    fallback
+
+/** A block of `insts` and then a call of `callee`, which returns what the call returns. */
+private returning_call(values: *Buf[MirType], insts: Buf[Inst], dest: Option[usize], callee: Callee, args: Buf[Operand]) -> MirBlock
+    var out = insts
+    dest match
+        Some(d) ->
+            val v = values.len()
+            values.push((*values)[d])
+            out.push(Call(Some(v), callee, args))
+            MirBlock(out, Return(Some(Value(v))))
+        None ->
+            out.push(Call(None, callee, args))
+            MirBlock(out, Return(None))
 
 /** A call of `callee` whose result, if it has one, is stored in slot `result`. */
 private result_call(values: *Buf[MirType], insts: *Buf[Inst], dest: Option[usize], result: Option[usize], callee: Callee, args: Buf[Operand])

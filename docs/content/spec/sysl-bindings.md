@@ -474,7 +474,7 @@ top-level function, a function value held in a variable.
 @sysl("ui.widgets.on_click")
 onClick(button: Button, handler: (Point) -> unit)
 
-@sysl("ui.app.run_every", blocking)
+@sysl("ui.app.run_every")
 runEvery(ms: long, @threaded tick: () -> bool)
 ```
 
@@ -498,9 +498,7 @@ runEvery(ms: long, @threaded tick: () -> bool)
   and results never move between threads. Calls nest to any depth, Avin calling Sysl calling Avin,
   and a callback may call bindings, blocking ones included. A callback Sysl calls while its thread
   waits in a [blocking call](#calls-that-wait) makes the thread running for the call, so it may
-  allocate and collect, and safe again after. A Sysl call that waits for another thread to call a
-  callback is declared `blocking`: otherwise that thread's first collection waits for the waiting
-  one, which never comes.
+  allocate and collect, and safe again after.
 - **A callback belongs to the code that gave it**, as a [handle](#handles) does: one called by any
   other — another thread, a task on the futures' pool, a thread Sysl started — stops the program,
   before any of the function runs:
@@ -517,7 +515,9 @@ runEvery(ms: long, @threaded tick: () -> bool)
   [sendable](/spec/actors/#what-may-be-sent) type. A function value whose type does not say what it
   captures is refused, as is a captured `var`, which the other thread would share; a binding with
   a `@threaded` parameter is called by name, never used as a value, so no call escapes the check.
-  A Sysl parameter of type `&sync Fn` needs the mark, and Sysl's refusal says so:
+  **A binding with a `@threaded` parameter is `blocking`** whether or not it says so: the Sysl
+  call may wait for another thread to call back, and that thread's collections go on without the
+  waiting one. A Sysl parameter of type `&sync Fn` needs the mark, and Sysl's refusal says so:
 
   ```text
   error: the function passed to `f` of `share`, which Sysl may call from any thread, captures `count`, a `var`, which that thread would share with the code here; capture a `val` holding its value

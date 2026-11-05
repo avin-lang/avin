@@ -58,7 +58,7 @@ impl Add for Point
 | Shifts | `<<` `>>` (shifts bind like multiplication) |
 | Logical | `!`, short-circuit `&&` `\|\|` |
 | Comparison | `==` `!=` `<` `<=` `>` `>=`, chained |
-| Identity | `===` `!==` (reference types only) |
+| Identity | `===` `!==` (one side a reference type; see [identity](/spec/equality-and-memory/#identity)) |
 | Range | `..` `..<` |
 | Cons | `::`, prepending to a `List` (right-associative) |
 | Pattern test | `is`, `is not` |
@@ -542,7 +542,7 @@ A **type pattern**, `x: T`, matches a value whose type at run time is `T` and bi
 `T`; `_: T` tests without binding. For a class or a trait it matches an instance of any subclass or
 conforming class, and for a generic type it compares the type arguments exactly (`Box[int]` is not a
 `Box[string]`). The value matched may be an `Any`, or of a trait's or an open class's type, to be
-taken down to a class; a tuple, part by part. A downcast is written this way, never as a cast:
+taken down to a class. A downcast is written this way, never as a cast:
 
 ```text
 legs(a: Animal) -> int = a match
@@ -550,6 +550,13 @@ legs(a: Animal) -> int = a match
     b: Bird -> b.legs
     _ -> 0
 ```
+
+A tuple's type at run time is the one it was [made with](/spec/types/#any-and-nothing), so a tuple
+type pattern compares that type, not the classes of the objects inside it: `t: (Animal, int)` holding
+a `Dog` does not match `_: (Dog, int)`, nor does `(a, 1)` with `a: Animal` as an `Any`, while a
+tuple made as a `(Dog, int)` matches it wherever it is held. Each part is tested on its own by a
+tuple pattern with a type pattern inside it, `(d: Dog, n) -> …`, on a value of a tuple type; an `Any`
+is first matched by its tuple type, `p: (Animal, int)`.
 
 A type pattern that can never match, such as `s: string` on an `int`, is an error. A type pattern
 covers every value only when its type is one the matched value already has, so a `match` on an `Any`

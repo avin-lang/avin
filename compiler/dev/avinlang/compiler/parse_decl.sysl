@@ -2,6 +2,7 @@ module dev.avinlang.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
 
 struct Parsed
     file: SourceFile
@@ -582,7 +583,11 @@ private parse_clause(p: *Parser) -> Clause
     if p.accept("|")
         val guard = expression(p, 3)
         p.expect("=")
-        bodies.push(GuardedBody(Some(guard), parse_line_body(p, false)))
+        var body = parse_line_body(p, false)
+        if line_start_guard(p, body) is Some(bar)
+            p.report.add(error(bar, s"a guard on a line of its own continues the line above, not a second guard; write the guards in an indented block below the clause: `${from_utf8_unchecked(p.src.text(start))}(…)` then `    | condition = body` for each, ending with `| _ = body`"))
+            body = Expr(body.span, Invalid)
+        bodies.push(GuardedBody(Some(guard), body))
     elif p.accept("=") then bodies.push(GuardedBody(None, parse_line_body(p, false)))
     elif p.accept_kind(Indent)
         loop
@@ -603,6 +608,22 @@ private parse_clause(p: *Parser) -> Clause
     else p.report.add(error(p.toks.here(), "expected `=`, a guard, or indented guards after a clause's arguments"))
     val end = if bodies.len() > 0 then bodies[bodies.len() - 1].body.span else start
     Clause(start.to(end), patterns, bodies)
+
+// A one-line guard's body followed by a line that starts with `|` reads as the body continued, so
+// `| n < 0 = 1` then `| _ = 2` is `1 | _ = 2`, an assignment. The span of that `|` where the body is
+// such an assignment, found down the left of the target's operators.
+private line_start_guard(p: *Parser, body: &Expr) -> Option[Span]
+    var target = body.kind match
+        Assign(t, None, _, _, _) -> t
+        _ -> return None
+    loop
+        target.kind match
+            Binary(op, left, _, op_span) ->
+                if op is BitOr && p.src.locate(op_span.start).line > p.src.locate(left.span.end - 1).line then return Some(op_span)
+                target = left
+            Compare(operands, _) -> target = operands[0]
+            _ -> return None
+    None
 
 private after_block(p: *Parser) -> bool = p.toks.position > 0 && p.toks.items[p.toks.position - 1].value == Dedent
 
