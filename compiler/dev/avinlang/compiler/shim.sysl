@@ -91,6 +91,9 @@ private struct ShimWriter
     mirrors: Buf[Mirrored]
     mirror_lines: Buf[MirrorLines]
     passing: Buf[MirrorLines]
+    // The callbacks, `call_<i>_<k>`, whose integer answer is the Avin type itself: a closure whose
+    // answer is a type parameter of a generic Sysl function, which says no integer to convert into.
+    fixed: Buf[string]
 
 private put(w: *ShimWriter, text: string)
     w.out.push(text)
@@ -98,8 +101,12 @@ private put(w: *ShimWriter, text: string)
         if b == u8('\n') then w.line += 1
 
 /** The shim module for a program's bindings and the Sysl handles whose objects it lays out. */
-shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource
-    var w = ShimWriter(str_builder(), 1, buf(), buf(), buf(), buf(), buf())
+shim_source(bindings: Buf[MirBinding], handles: Buf[MirHandle]) -> ShimSource = shim_source_fixing(bindings, handles, buf())
+
+/** The shim module, with the integer answers of the callbacks `fixed` names, `call_<i>_<k>`, made the
+ * Avin type itself rather than converted into the type the closure Sysl takes answers. */
+shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Buf[string]) -> ShimSource
+    var w = ShimWriter(str_builder(), 1, buf(), buf(), buf(), buf(), buf(), fixed)
     var imports: Buf[usize] = buf()
     var first: Buf[usize] = buf()
     var last: Buf[usize] = buf()
@@ -434,11 +441,21 @@ private callback_functions(w: *ShimWriter, b: &MirBinding, i: usize, k: usize)
         if types != "" then types = types + ", "
         types = types + (if p.form is Plain then s"S$j: Integer" else s"S$j")
         declared = declared + s", q$j: S$j"
+    // An integer answer is converted, with a check, into whatever integer the closure's type answers,
+    // which Sysl infers where the closure is passed: a Sysl `u32` takes an Avin `long`. A closure
+    // whose answer is a generic Sysl function's type parameter answers the Avin type itself.
+    var integral = result.form is Plain && *result.ty is Int(_)
+    for name in w.fixed
+        if name == s"call_${i}_$k" then integral = false
+    if integral
+        if types != "" then types = types + ", "
+        types = types + "R: Integer"
     val generic = if types == "" then "" else s"[$types]"
     val unit = *result.ty is Unit
-    val answer = if unit then "" else " -> " + callback_answer(w, result)
+    val answer = if unit then "" elif integral then " -> R" else " -> " + callback_answer(w, result)
     put(w, s"\n// What Sysl calls the function given for `${b.name}`'s parameter ${k + 1} with, run on the calling thread.\nprivate call_${i}_$k$generic(cb: *Callback$declared)$answer\n    val e = callback_enter(cb)\n")
     if unit then put(w, s"    run_${i}_$k(e.ctx, cb$passed)\n    callback_leave(e)\n")
+    elif integral then put(w, s"    val r: R = run_${i}_$k(e.ctx, cb$passed)\n    callback_leave(e)\n    r\n")
     else put(w, s"    val r = run_${i}_$k(e.ctx, cb$passed)\n    callback_leave(e)\n    r\n")
     put(w, s"\nprivate run_${i}_$k$generic(ctx: *Context, cb: *Callback$declared)$answer\n")
     if b.params[k].layouts > 0 then put(w, "    val ep: **u8 = callback_layouts(cb)\n")
@@ -468,6 +485,7 @@ private callback_functions(w: *ShimWriter, b: &MirBinding, i: usize, k: usize)
     if result.form is Handle(_)
         val m = handle_index(w, result)
         put(w, s"    cell_$m(held_$m(ctx, r)).r\n")
+    elif integral then put(w, "    integer_to(ctx, r, integer_name[R]())\n")
     else put(w, "    " + into_expr(w, result, "r", "ep", base) + "\n")
 
 // Sysl's words for a callback's parameter whose type is not the one Sysl calls the closure with,
@@ -660,7 +678,9 @@ private const IntegerHelper: string =
     "private integer_to[T: Integer, S: Integer](ctx: *Context, x: S, name: string) -> T\n" +
     "    val y = T.wrap(x)\n" +
     "    if S.wrap(y) != x || (y < T.wrap(0)) != (x < S.wrap(0)) then stop_in_binding(ctx, \"value out of range for \" + name)\n" +
-    "    y\n"
+    "    y\n" +
+    "\n// The integer type `T` as its width and sign spell it, `u32` or `i8`.\n" +
+    "private integer_name[T: Integer]() -> string = (if T.wrap(-1) < T.wrap(0) then \"i\" else \"u\") + s\"${sizeof(T) * 8usize}\"\n"
 
 // The type parameters of a conversion generic in the Sysl types of the `n` integers it holds, each
 // any Sysl integer, or nothing where it holds none.
@@ -1240,10 +1260,21 @@ ensure_shims(tc: Toolchain, bindings: Buf[MirBinding], handles: Buf[MirHandle], 
     val pending = pending_name(archive)
     defer _ = remove_file(pending)
     defer _ = remove_file(pending + ".h")
-    val result = capture(tc.sysl, ["build-c", dir, "-o", pending], stderr = true, timeout = 300000).map_err(e -> "avin: " + missing_tool(tc.sysl, e.to_string()))?
+    var built = shim
+    var result = capture(tc.sysl, ["build-c", dir, "-o", pending], stderr = true, timeout = 300000).map_err(e -> "avin: " + missing_tool(tc.sysl, e.to_string()))?
+    // A callback whose closure answers a type parameter of a generic Sysl function leaves the integer
+    // its answer is converted into unsaid, so that callback answers the Avin type itself, and the
+    // shims are built once more. The archive is kept under the first source's key, which decides the
+    // second.
+    if !result.status.ok()
+        val fixed = unsaid_answers(result.err.unwrap_or("") + result.text)
+        if fixed.len() > 0
+            built = shim_source_fixing(bindings, handles, fixed)
+            write_text(dir + "/avin/shims/shims.sysl", built.text).map_err(e -> e.to_string())?
+            result = capture(tc.sysl, ["build-c", dir, "-o", pending], stderr = true, timeout = 300000).map_err(e -> "avin: " + missing_tool(tc.sysl, e.to_string()))?
     if !result.status.ok()
         val output = result.err.unwrap_or("") + result.text
-        return Err(shim_diagnostics(output, shim, bindings, units))
+        return Err(shim_diagnostics(output, built, bindings, units))
     // The libraries are published first, so an archive is never seen without them.
     val needs = link_needs_file(archive)
     val pending_needs = pending_name(needs)
@@ -1252,6 +1283,21 @@ ensure_shims(tc: Toolchain, bindings: Buf[MirBinding], handles: Buf[MirHandle], 
     publish_file(pending_needs, needs).map_err(e -> e.to_string())?
     publish_file(pending, archive).map_err(e -> e.to_string())?
     Ok(archive)
+
+// The callbacks, `call_<i>_<k>`, whose integer answer Sysl could not infer a type for in `output`.
+private unsaid_answers(output: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val marker = "cannot infer the type argument 'R' of 'avin.shims."
+    for text in output.split("\n")
+        val parts = text.split(marker)
+        if parts.len != 2 then continue
+        val rest = parts[1].split("'")
+        if rest.len < 2 || !rest[0].starts_with("call_") then continue
+        var seen = false
+        for name in out
+            if name == rest[0] then seen = true
+        if !seen then out.push(rest[0])
+    out
 
 /** The file beside a shim archive that lists the C libraries the archive's Sysl packages need at
  * the link, one to a line: `lib <name>` for a library a package names with `@link`, and
@@ -1393,6 +1439,9 @@ private unconverted_message(shim: ShimSource, message: string) -> string
             parts.push(p)
         if parts.len() == 2
             val given = parts[1][0..<parts[1].bytes.len - refusal.bytes.len]
+            // A callback's integer answer goes the other way, into the integer the closure answers.
+            if trimmed.starts_with("'avin.shims.call_") || trimmed.starts_with("'avin.shims.run_")
+                return s"the function answers an integer, which goes into Sysl only as an integer, but the closure Sysl takes answers $given"
             return s"an integer is made from a Sysl integer, but the value is $given"
     val prefix = "no 'avin.shims.out_"
     if !message.starts_with(prefix) then return message

@@ -90,7 +90,7 @@ Data crosses the boundary in a fixed set of shapes:
 
 | Avin type | Crossing |
 | --- | --- |
-| `i8`, `i16`, `int`, `long`, `byte`, `real`, `char`, `bool`, `unit` | By value; Sysl's `u8` is `byte`. An integer result, and an integer a result holds, takes [any Sysl integer](#integer-results) |
+| `i8`, `i16`, `int`, `long`, `byte`, `real`, `char`, `bool`, `unit` | By value; Sysl's `u8` is `byte`. An integer result, and an integer a result holds, takes [any Sysl integer](#integer-results), and a callback's integer answer goes into [any](#callbacks) |
 | `string` | Copied into a Sysl `string` in each direction |
 | `Array[byte]` | Copied into a Sysl `[]u8` and, as a binding's own parameter, [copied back](#filled-arrays) after the call; out of a Sysl `[]u8` or `[]const u8` |
 | `Array[T]`, `Vector[T]` of any other boundary type | **Copied**, element by element: into a Sysl slice, and out of a Sysl `[]T` or `Buf[T]` into a new array or vector. An array of numbers, booleans or characters as a binding's own parameter is [copied back](#filled-arrays); any other array goes in as a `[]const T` |
@@ -575,6 +575,32 @@ runEvery(ms: long, @threaded tick: () -> bool)
 
   ```text
   error: the Sysl binding `wrongParameter` does not match `avintest.callbacks.apply`: the function's parameter 1 is string, but Sysl calls it with int
+  ```
+
+- **A callback's integer answer goes into whatever integer the closure answers**, converted with
+  the same check. Avin has no unsigned integers, so a Sysl closure answering a `u32`, a `u64` or a
+  `usize` takes an Avin function answering a `long` (or an `int`), and one answering an `i8` takes
+  a `long` too where its values fit. syslui asks its window's colour this way:
+
+  ```text
+  @sysl("sh.sysl.ui_sdl.app")
+  app(title: string, tree: () -> View, ground: () -> long) -> App
+  ```
+
+  An answer the Sysl type cannot hold — a negative one for a `u32`, one past its largest value —
+  stops the program where the binding Sysl is running in was called, naming the Sysl type by its
+  sign and width:
+
+  ```text
+  avin: trap: value out of range for u32 at main.avin:10:13
+  ```
+
+  A closure whose answer is a type parameter of a generic Sysl function, `answer_any[T](f: &Fn() ->
+  T) -> T`, says no integer to convert into, and answers the Avin type itself: `T` is then the
+  binding's `long` or `int`. An integer answer goes into an integer only:
+
+  ```text
+  error: the Sysl binding `integerForText` does not match `avintest.callbacks.text_op`: the function answers an integer, which goes into Sysl only as an integer, but the closure Sysl takes answers string
   ```
 
 - **Sysl keeps the function alive for as long as it holds the closure.** The closure holds a root of

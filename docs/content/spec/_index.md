@@ -52,6 +52,7 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
 | [Regular expressions](/spec/regex/) | `avin.regex`: the pattern language, leftmost-first backtracking, `Regex`, `Match` and `MatchIterator`, replacing and splitting |
 | [Packages](/spec/packages/) | `avin.hocon`, dependencies, version selection, `avin.sum`, workspaces, `avin new` and `avin tidy`, features, members of a repository, vendoring and the standard library's modules |
 | [Derivation](/spec/derivation/) | Library-defined `derives`: shapes of data types and classes, `derive` templates, annotations, a JSON library written with them |
+| [User interfaces](/spec/ui/) | The `ui` package: syslui's views, controls and signals and syslui-sdl's window and frame loop, bound for Avin; drawing and tapping a tree with no window |
 | [Settled decisions](/spec/decisions/) | Every decision made so far, in one list |
 
 The syntax is light and regular: blocks by indentation, functions as `name(params) -> T`, `match`
