@@ -1750,6 +1750,16 @@ their words are reserved.
   (text made as it is read, a socket later) and hand it to any function that takes one; the kinds
   `avin.io` makes are private classes reached only through `Source.fromFile`, `fromString` and
   `stdin`. The alternative is a final class whose kinds are fixed by the library.
+- Settled on the user's delegation 2026-11-05: **An override adds no bound to a type parameter of
+  its own** ([declarations](/spec/declarations/#inheritance)). Each bound an override, or a method
+  implementing a trait's, writes on its own type parameters is implied by the overridden method's
+  bounds on that parameter: one of them, a trait or class one of them conforms to, or `Eq` or
+  `Hash`, which every type meets; it may keep, weaken or drop bounds. Why: a call through the base
+  type passes any type argument the base's bounds admit, so an added bound let a program that
+  type-checked run the override at a type without the bound's methods, which trapped or crashed. The
+  alternatives were requiring the bounds to be exactly the same, which forbids a weakening that is
+  harmless; and checking the bound at each call through the base,
+  which a call cannot do, since it does not know which override it reaches.
 
 **Deferred**
 
