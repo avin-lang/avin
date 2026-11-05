@@ -192,6 +192,10 @@ private struct Lowering
      * the block after the parameters have been stored, which `param_slots` then hold. */
     tail_head: Option[usize]
     param_slots: Buf[Option[Place]]
+    /** Whether the instance being lowered returns its body's value with nothing after it, so a call
+     * in tail position returns at once (see `returned_call`); a class's constructor publishes its
+     * object after the body, and nothing generated has a body. */
+    tail_calls: bool
 
 /** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
  * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
@@ -246,7 +250,7 @@ lower_program(program: TProgram) -> MirProgram
         if d.table.len() > generic_base then generic_base = d.table.len()
     for b in program.builtins
         if b.table.len() > generic_base then generic_base = b.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf())
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false)
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
     l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None))
@@ -1740,6 +1744,7 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     val inst = l.instances[k]
     l.function_index = k
     l.tail_head = None
+    l.tail_calls = false
     l.param_slots = buf()
     if inst.generated != Written then return lower_generated(l, inst)
     val f = l.program.functions[inst.function]
@@ -1787,7 +1792,9 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     f.body match
         Some(body) ->
             if loops_on_itself(l, symbol, body) then start_loop(l, symbol)
+            l.tail_calls = !is_class_constructor(l.program, f.symbol)
             val result = lower_at(l, body, true)
+            l.tail_calls = false
             // A class's object is made by its constructor and complete when the constructor is.
             if is_class_constructor(l.program, f.symbol) then l.insts.push(Publish)
             finish(l, returning(l, result))
@@ -1835,6 +1842,23 @@ private param_operand(l: *Lowering, x: usize) -> Option[Operand]
     l.param_values[x] match
         Some(v) -> Some(Value(v))
         None -> None
+
+// A call in tail position of another function, a method through its table or a function value, where
+// the function being lowered yields its body's value: the block returns the call's value as soon as
+// the call has made it, which is the shape emitting makes a tail call of (see `tail_call_at` in
+// `emit.sysl`). A call followed by anything, such as a conversion of its result, keeps its place.
+private returned_call(l: *Lowering, tail: bool, value: Option[Operand]) -> Option[Operand]
+    if !tail || !l.tail_calls || l.insts.len() == 0 then return value
+    val made = l.insts[l.insts.len() - 1] match
+        Call(dest, _, _) -> dest match
+            Some(d) -> value match
+                Some(Value(v)) -> v == d
+                _ -> false
+            None -> value is None && !l.returns_value
+        _ -> false
+    if !made then return value
+    leave(l, returning(l, value))
+    None
 
 // A call in tail position of the instance being lowered: its arguments are evaluated, every one
 // before any parameter changes, then become the parameters, and control goes back to the start. The
@@ -2201,6 +2225,11 @@ private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
         if machine(l, found.1[i]) is Some(t)
             if l.param_values[i] is Some(v) then args.push(Value(v))
             params.push(t)
+    // The runtime runs a started thread's closure through the program's closure runner, since it
+    // calls with the C convention and the closure's entry has the program's own.
+    if name == "thread_start"
+        args.push(ClosureRunner)
+        params.push(MPtr)
     val result = machine(l, found.2)
     val dest = result match
         Some(t) -> Some(fresh(l, t))
@@ -2562,13 +2591,13 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
     TypeReceiver -> panic("a static member's receiver is a type, which has no value to lower")
     Call(function, args, type_args) ->
         if tail && l.tail_head is Some(_) && same_instance(l, function, type_args) then return tail_call(l, function, args)
-        direct_call(l, e, function, args, type_args)
-    Dispatch(function, slot, args, type_args) -> dispatch(l, function, slot, args, type_args)
-    BoundCall(function, slot, args, type_args) -> bound_call(l, e, function, slot, args, type_args)
+        returned_call(l, tail, direct_call(l, e, function, args, type_args))
+    Dispatch(function, slot, args, type_args) -> returned_call(l, tail, dispatch(l, function, slot, args, type_args))
+    BoundCall(function, slot, args, type_args) -> returned_call(l, tail, bound_call(l, e, function, slot, args, type_args))
     Construct(variant, args) -> construct(l, e, variant, args)
     Collection(_, built) -> lower_expr(l, built)
     FunctionValue(function, type_args) -> Some(function_value(l, function, type_args))
-    CallValue(callee, args) -> call_value(l, callee, args)
+    CallValue(callee, args) -> returned_call(l, tail, call_value(l, callee, args))
     Field(value, index) ->
         val object = lower_expr(l, value)?
         layout(l, concrete(l, value.ty)).variants[0].fields[index] match

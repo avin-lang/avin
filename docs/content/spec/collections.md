@@ -213,9 +213,9 @@ array of the type the call asks for.
 | `span(p)` | `(Vector[T], Vector[T])` | List, ArraySeq; a vector's are vectors | O(n) |
 | `tail()`, `init()` | `Vector[T]`; trap when empty | List, Vector, ArraySeq | list `tail` O(1); vector O(log n); others O(n) |
 | `reverse()` | `Vector[T]` | List, ArraySeq; a vector's is a vector | O(n) |
-| `xs ++ ys` | `Vector[W]`, `ys` any `Iterable[W]`, `W >: T` | List (shares a list `ys`), Vector, ArraySeq | vector O(min(n, m)) for another vector; others O(n + m) |
-| `xs :+ x`, `x +: xs` | `Vector[W]`, `x` a `W >: T` | List, Vector, ArraySeq | list `+:` O(1), `:+` O(n); vector amortized O(1); others O(n) |
-| `updated(i, x)` | `Vector[W]`, `x` a `W >: T`; traps outside | List, Vector, ArraySeq | list O(i); vector O(log n); others O(n) |
+| `xs ++ ys` | a collection of its own kind with element `W >: T` (a `Vector[W]` for any other sequence), `ys` any `Iterable[W]` | List (shares a list `ys`), Vector, ArraySeq | vector O(min(n, m)) for another vector; others O(n + m) |
+| `xs :+ x`, `x +: xs` | its own kind with element `W`, `x` a `W >: T`; so `(dogs: List[Dog]) :+ cat` is a `List[Animal]` | List, Vector, ArraySeq | list `+:` O(1), `:+` O(n); vector amortized O(1); others O(n) |
+| `updated(i, x)` | its own kind with element `W`, `x` a `W >: T`; traps outside | List, Vector, ArraySeq | list O(i); vector O(log n); others O(n) |
 | `padTo(total, x)` | `Vector[T]` | List, ArraySeq; a vector's is a vector | O(max(n, total)) |
 | `distinct()`, `distinctBy(key)` | `Vector[T]`, the first of each | List, ArraySeq; a vector's is a vector | O(n) expected, a hash set |
 | `intersect(other)`, `diff(other)` | `Vector[T]`, as multisets | List, ArraySeq; a vector's is a vector | O(n + m) expected, a hash map |
@@ -459,6 +459,12 @@ val zeros = Array.fill(8, 0)              // eight 0s; the value is evaluated on
 val squares = Array.tabulate(5, i -> i * i)
 val none = Array.empty[string]()
 ```
+
+`List`, `Vector` and `ArraySeq` have the same two companions, with the same shapes:
+`Vector.tabulate(n, f)` calls `f` with `0 ..< n` in order, and `Vector.fill(n, element)` takes
+`element` by name and evaluates it once for each position, so `List.fill(3, Counter(0))` holds three
+distinct objects (an `Array`'s `fill` shares one value). A length that is not positive gives an empty
+collection.
 
 `Array[int]()` is an error. `xs.length()` is the length, which never changes; `xs.slice(from, until)`
 and `xs.copy()` make new arrays; `xs.lift(i)` is an `Option`. `xs(i) += 1`, `xs(i) := v` and `xs(i)++`

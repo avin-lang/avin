@@ -2266,7 +2266,9 @@ private declare_fields(c: *Checker, unit: usize)
         val d = k.decl
         // `@sysl` on a class is checked where the class is declared.
         for a in d.annotations
-            if a.name != "sysl" || d.object then c.note(unit, a.span, s"unknown annotation `@${a.name}`")
+            if a.name != "sysl" || d.object
+                val what = if d.object then "an object" elif d.modifier == "trait" then "a trait" else "a class"
+                c.note(unit, a.span, misplaced_annotation(c, unit, a.name, what))
         val declares_trait = is_trait(c, id)
         if declares_trait
             for m in d.members
@@ -4972,7 +4974,7 @@ private check_conformance_members(c: *Checker, self_type: &Type, t: &Type, unit:
                 val want = c.symbols[tm].params
                 for i in 1..<want.len()
                     if i > 1 then shown = shown + ", "
-                    shown = shown + s"${c.symbols[tm].param_names[i]}: ${type_name(seen_from(c, self_type, tm, want[i]))}"
+                    shown = shown + s"${c.symbols[tm].param_names[i]}: ${param_type_text(seen_from(c, self_type, tm, want[i]), declares_variadic(c.symbols[tm].decl) && i + 1 == want.len())}"
                 c.note(unit, at, s"`${type_name(self_type)}` implements `${type_name(t)}` without `static $name($shown)`")
     c.seen_instance = None
 
@@ -5163,7 +5165,7 @@ private intrinsic_of(c: *Checker, unit: usize, f: &Function) -> Option[string]
             c.note(unit, a.span, s"`${a.name}` is said of a test, as an argument of `@test`: `@test($example)`")
             continue
         if a.name != "intrinsic"
-            c.note(unit, a.span, s"unknown annotation `@${a.name}`")
+            c.note(unit, a.span, misplaced_annotation(c, unit, a.name, "a function"))
             continue
         if a.args.len() != 1 || a.args[0].name is Some(_)
             c.note(unit, a.span, "`@intrinsic` takes one string, the intrinsic's name")
@@ -6695,6 +6697,9 @@ mirror_target(d: &DataDecl) -> Option[string]
 private check_mirror(c: *Checker, id: usize)
     val d = c.data[id]
     if mirror_target(d.decl) is None || d.decl.type_params.len() > 0 then return
+    // A variant declared twice in the module was reported and left out of the type, so its
+    // variants no longer line up with the declaration's, and there is nothing more to check.
+    if d.variants.len() != d.decl.variants.len() then return
     val structure = d.variants.len() == 1 && d.variants[0].name == d.name
     for v in 0..<d.variants.len()
         val variant = d.variants[v]
@@ -7012,7 +7017,7 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
                         join(c, ty, body.ty) match
                             Some(t) -> ty = t
                             None ->
-                                c.note(unit, b.body.span, s"this clause yields ${type_name(body.ty)}, but the clauses before it yield ${type_name(ty)}")
+                                c.note(unit, b.body.span, s"this clause yields ${type_name(body.ty)}, but the clauses before it yield ${type_name(ty)}${no_single_join(c, ty, body.ty)}")
                                 agreed = false
             bodies.push(TGuarded(guard, body))
         c.body.visible.truncate(mark)
@@ -8150,7 +8155,13 @@ private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: 
         Data(id, _, args) ->
             val d = c.data[id]
             if d.variants.len() > 1
-                c.note(unit, e.span, s"`${type_name(ty)}` has several variants, so its fields are reached by `match`")
+                // Only a name some variant has as a field is one that `match` would reach.
+                var a_field = false
+                for v in d.variants
+                    for field in v.field_names
+                        if field == name then a_field = true
+                if a_field then c.note(unit, e.span, s"`${type_name(ty)}` has several variants, so its fields are reached by `match`")
+                else c.note(unit, e.span, s"`${type_name(ty)}` has no member `$name`")
                 return TExpr(e.span, ErrorType, UnitConst)
             if d.variants.len() == 1
                 val names = d.variants[0].field_names
@@ -8885,7 +8896,7 @@ private literal_parts(c: *Checker, exprs: Buf[&Expr], want: &Type, what: string)
             Some(so_far) -> join(c, so_far, t.ty) match
                 Some(j) -> Some(j)
                 None ->
-                    c.note(unit, x.span, s"the $what of a map literal need a common type; ${type_name(zonk(c, so_far))} and ${type_name(zonk(c, t.ty))} have none")
+                    c.note(unit, x.span, s"the $what of a map literal need a common type; ${type_name(zonk(c, so_far))} and ${type_name(zonk(c, t.ty))} have none${no_single_join(c, so_far, t.ty)}")
                     Some(ErrorType)
     if agreed is Some(t) then unify(c, want, t)
     // A part of a narrower reference type is the agreed type as it is.
@@ -9076,7 +9087,7 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
                 Some(so_far) -> join(c, so_far, t.ty) match
                     Some(j) -> Some(j)
                     None ->
-                        c.note(unit, item.span, s"the elements of a collection literal need a common type; ${type_name(zonk(c, so_far))} and ${type_name(zonk(c, t.ty))} have none")
+                        c.note(unit, item.span, s"the elements of a collection literal need a common type; ${type_name(zonk(c, so_far))} and ${type_name(zonk(c, t.ty))} have none${no_single_join(c, so_far, t.ty)}")
                         Some(ErrorType)
         if agreed is Some(t) then unify(c, element, t)
         for i in 0..<items.len()
@@ -9486,8 +9497,21 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
         // and between an `Option[Nothing]` and another option, as the other.
         typed[0] = none_as(c, typed[0], typed[1].ty)
         typed[1] = none_as(c, typed[1], typed[0].ty)
-    for i in 0..<ops.len()
-        compare_link(c, ops[i], typed[i], typed[i + 1])
+    // `===` between a reference and an `Any` or a type parameter's value compares both as `Any`s: a
+    // reference is its own `Any`, and a value of another type is boxed, never the same object.
+    var linked = false
+    if ops.len() == 1 && (ops[0] is Same || ops[0] is NotSame)
+        val x = zonk(c, typed[0].ty)
+        val y = zonk(c, typed[1].ty)
+        val loose = *x is AnyType || *y is AnyType || (*x is TypeVar(_, _, _) && !reference_only(c, x)) || (*y is TypeVar(_, _, _) && !reference_only(c, y))
+        if loose && !same_type(x, y) && (reference_only(c, x) || reference_only(c, y))
+            compare_link(c, ops[0], typed[0], typed[1])
+            typed[0] = to_any(c, typed[0])
+            typed[1] = to_any(c, typed[1])
+            linked = true
+    if !linked
+        for i in 0..<ops.len()
+            compare_link(c, ops[i], typed[i], typed[i + 1])
     var ty: &Type = Bool
     for t in typed
         if *t.ty is Nothing then ty = Nothing
@@ -9526,22 +9550,53 @@ private compare_link(c: *Checker, op: CompareOp, left: &TExpr, right: &TExpr)
     val identity = op is Same || op is NotSame
     if op is Equal || op is NotEqual then return equality_link(c, at, spelling, zonk(c, a.ty), zonk(c, b.ty))
     if !identity then return ordering_link(c, at, spelling, zonk(c, a.ty), zonk(c, b.ty))
-    // An `Any` may hold a value with no identity; a type pattern recovers its type.
-    if *a.ty is AnyType || *b.ty is AnyType
-        c.note(unit_of(c), at, s"`$spelling` on Any is not implemented; match the value by its type first, as in `s: string`")
+    val x = zonk(c, a.ty)
+    val y = zonk(c, b.ty)
+    val xr = reference_only(c, x)
+    val yr = reference_only(c, y)
+    // Identity is defined where at least one side is a reference that cannot be a value type: a
+    // boxed value is never the object of a class, so the answer is the same however the compiler
+    // represents the other side's values.
+    if xr || yr
+        if identity_comparable(c, x, y, xr, yr) then return
+        c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(x)} with ${type_name(y)}")
         return
-    // A function value is a closure and an object of a class is a heap object: both are
-    // references, which `===` compares by identity.
-    if (*a.ty is Function(_, _) || *a.ty is Class(_, _, _)) && same_type(a.ty, b.ty) then return
-    // An instance of a subclass may be the very object a superclass-typed value holds.
-    if *a.ty is Class(_, _, _) && *b.ty is Class(_, _, _)
-        if same_type(upcast(c, a.ty, b.ty), b.ty) || same_type(upcast(c, b.ty, a.ty), a.ty) then return
-        c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} with ${type_name(b.ty)}")
+    // Two sides that may each hold a value type: whether two equal values are one object is the
+    // compiler's choice, so the answer would be arbitrary.
+    if may_hold_value(c, x) || may_hold_value(c, y)
+        c.note(unit_of(c), at, s"`$spelling` is undefined on ${type_name(x)} and ${type_name(y)}, which may hold values with no identity; compare with `==`, or give one side a class type")
         return
-    if *a.ty is Function(_, _) || *a.ty is Class(_, _, _)
-        c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(a.ty)} with ${type_name(b.ty)}")
-        return
-    c.note(unit_of(c), at, s"`$spelling` compares identities, and ${type_name(a.ty)} values have none")
+    c.note(unit_of(c), at, s"`$spelling` compares identities, and ${type_name(x)} values have none")
+
+/** Whether every value of type `t` is a reference with identity: an object of a class (an `object`,
+ * an array and a buffer among them), a function value, or a value of a type parameter bounded by
+ * one. */
+private reference_only(c: *Checker, t: &Type) -> bool = *t match
+    Class(k, _, _) -> !is_trait(c, k)
+    Function(_, _) -> true
+    TypeVar(_, _, _) ->
+        for b in bounds_of(c, t)
+            if reference_only(c, zonk(c, b)) then return true
+        false
+    _ -> false
+
+/** Whether a value of type `t` may be a reference and may as well be a value type: an `Any`, a
+ * trait's value, or a type parameter's. */
+private may_hold_value(c: *Checker, t: &Type) -> bool = *t match
+    AnyType -> true
+    Class(k, _, _) -> is_trait(c, k)
+    TypeVar(_, _, _) -> !reference_only(c, t)
+    _ -> false
+
+/** Whether `x === y` compares two values that may be one object, given that at least one side is a
+ * reference only (`xr`, `yr`): one type; an object of a class with an `Any`, with a value of an
+ * unbounded type parameter, with one of its sub- or superclasses, or with a trait it conforms to. */
+private identity_comparable(c: *Checker, x: &Type, y: &Type, xr: bool, yr: bool) -> bool
+    if same_type(x, y) then return true
+    if *x is AnyType || *y is AnyType then return true
+    if (*x is TypeVar(_, _, _) && !xr) || (*y is TypeVar(_, _, _) && !yr) then return true
+    if !(*x is Class(_, _, _) || *x is TypeVar(_, _, _)) || !(*y is Class(_, _, _) || *y is TypeVar(_, _, _)) then return false
+    same_type(upcast(c, x, y), y) || same_type(upcast(c, y, x), x)
 
 // Every type has `==`, so two values compare when they have a common type: one type, or a class or
 // trait one is an instance of, or two sequences of one element type. On `Any` and on trait types the comparison is decided at run time by
@@ -10146,7 +10201,7 @@ private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[
         join_expected(c, y.ty, n.ty, expected) match
             Some(t) -> ty = t
             None ->
-                c.note(unit_of(c), e.span, s"the branches of this `if` yield ${type_name(y.ty)} and ${type_name(n.ty)}")
+                c.note(unit_of(c), e.span, s"the branches of this `if` yield ${type_name(y.ty)} and ${type_name(n.ty)}${no_single_join(c, y.ty, n.ty)}")
                 ty = ErrorType
     TExpr(e.span, ty, If(cond, y, Some(n)))
 
@@ -10181,7 +10236,7 @@ private while_expr(c: *Checker, e: &Expr, condition: &Expr, body: &Expr, otherwi
         elif used
             join_expected(c, ty, site.ty, expected) match
                 Some(t) -> ty = t
-                None -> c.note(unit, site.span, s"this `break` yields ${type_name(site.ty)}, but the loop yields ${type_name(ty)}")
+                None -> c.note(unit, site.span, s"this `break` yields ${type_name(site.ty)}, but the loop yields ${type_name(ty)}${no_single_join(c, ty, site.ty)}")
     if !used then ty = Unit
     if !broken && cond.kind is BoolConst(true) then ty = Nothing
     TExpr(e.span, ty, While(label, cond, b, other))
@@ -10205,7 +10260,7 @@ private loop_expr(c: *Checker, e: &Expr, body: &Expr, expected: Option[&Type], u
         else
             join(c, ty, site.ty) match
                 Some(t) -> ty = t
-                None -> c.note(unit_of(c), site.span, s"this `break` yields ${type_name(site.ty)}, but the loop yields ${type_name(ty)}")
+                None -> c.note(unit_of(c), site.span, s"this `break` yields ${type_name(site.ty)}, but the loop yields ${type_name(ty)}${no_single_join(c, ty, site.ty)}")
     TExpr(e.span, ty, While(label, TExpr(e.span, Bool, BoolConst(true)), b, None))
 
 // `do body while test else other` is a `while` whose first test passes without being evaluated, so
@@ -11005,7 +11060,7 @@ private apply_text(c: *Checker, o: usize, m: usize) -> string
     for i in 1..<f.params.len()
         names.push(f.param_names[i])
         params.push(f.params[i])
-    candidate_text(c.classes[o].name + ".apply", f.type_params, names, params)
+    candidate_text(c.classes[o].name + ".apply", f.type_params, names, params, declares_variadic(f.decl))
 
 // A call by the name of object `o`, which declares `apply`: `Name(…)` chooses among the object's
 // `apply` methods and, for a companion, the constructor its name has in call position, the class's
@@ -11025,7 +11080,7 @@ private apply_call(c: *Checker, at: Span, name_span: Span, name: string, o: usiz
     if variant is Some(v)
         val s = variant_signature(c, v)
         signatures.push(s)
-        labels.push(candidate_text(s.name, s.type_params, s.names, s.params))
+        labels.push(candidate_text(s.name, s.type_params, s.names, s.params, s.variadic))
     val first_method = signatures.len()
     for m in ms
         signatures.push(method_signature(c, receiver, m, ErrorType))
@@ -11378,10 +11433,10 @@ private overload_text(c: *Checker, id: usize) -> string
         names.push(f.param_names[i])
         params.push(f.params[i])
     // A local function shows its own type parameters, not those it shares with the enclosing code.
-    candidate_text(f.name, if f.root is Some(_) then f.decl.type_params else f.type_params, names, params)
+    candidate_text(f.name, if f.root is Some(_) then f.decl.type_params else f.type_params, names, params, declares_variadic(f.decl))
 
 /** A candidate of a call as written, for a diagnostic: "`f[T](x: T)`". */
-private candidate_text(name: string, type_params: Buf[TypeParam], names: Buf[string], params: Buf[&Type]) -> string
+private candidate_text(name: string, type_params: Buf[TypeParam], names: Buf[string], params: Buf[&Type], variadic: bool) -> string
     var text = name
     if type_params.len() > 0
         text = text + "["
@@ -11392,8 +11447,14 @@ private candidate_text(name: string, type_params: Buf[TypeParam], names: Buf[str
     text = text + "("
     for i in 0..<params.len()
         if i > 0 then text = text + ", "
-        text = text + names[i] + ": " + type_name(params[i])
+        text = text + names[i] + ": " + param_type_text(params[i], variadic && i + 1 == params.len())
     "`" + text + ")`"
+
+/** A parameter's type as declared: a repeated parameter, held as `Vector[T]`, is written `T*`. */
+private param_type_text(t: &Type, repeated: bool) -> string
+    if !repeated then return type_name(t)
+    val element = repeated_element(t)
+    if *element is ErrorType then type_name(t) else type_name(element) + "*"
 
 // The type `target` names where it is the receiver of a call, as `int` in `int.zero()`, `T` in
 // `T.zero()` and `Box[int]` in `Box[int].zero()`; `None` where it is a value, a value of the name
@@ -11565,8 +11626,33 @@ private refuse_static_on_value(c: *Checker, at: Span, receiver: &TExpr, m: usize
     c.note(unit_of(c), at, s"`${target.decl.name}` is static: it belongs to the type, so it is called on the type, as in `$shown.${target.decl.name}()`, not on a value")
     true
 
+// The data type `target` names where it is the bare name of the type's variant of its own name with
+// no fields, as `Lone` of `data Lone()` or `Empty[int]` of `data Empty[T]()`: a name that is both
+// the type and a value of it.
+private names_fieldless_value(c: *Checker, target: &Expr) -> Option[usize]
+    val name = target.kind match
+        Name(n) -> n
+        TypeApply(inner, _) -> inner.kind match
+            Name(n) -> n
+            _ -> return None
+        _ -> return None
+    if lookup_local(c, name) is Some(_) || param_index(c, name) is Some(_) then return None
+    if class_member(c, name) is Some(_) || global_named(c, name) is Some(_) then return None
+    val v = variant_named(c, name)?
+    if c.data[v.data].name != name || c.data[v.data].variants[v.index].fields.len() > 0 then return None
+    Some(v.data)
+
+// Whether data type `id` has a static member `name`, which a call on the type's name means even
+// where the name is also a value.
+private has_static_member(c: *Checker, id: usize, name: string) -> bool
+    for m in members_of_type(c, own_type(c.data[id], id), name)
+        if c.symbols[m].static_member then return true
+    false
+
 // `object.name(args)`: a method of the object's class, or a field holding a function, which is
-// called as a value.
+// called as a value. On the name of a data type whose variant of its own name has no fields, a
+// static member of the type is called where it has one of the name, and otherwise the method of the
+// value the name also is.
 private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, target: &Expr, name: string, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], infix: bool) -> &TExpr
     val unit = unit_of(c)
     if target.kind is Name("super")
@@ -11578,9 +11664,15 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
         if lookup_local(c, type_name_written) is None && param_index(c, type_name_written) is None
             if builtin_type(type_name_written) is Some(to) then return conversion(c, at, to, args, true)
             if integer_param_named(c, type_name_written) is Some(to) then return conversion(c, at, to, args, true)
+    var named_value: Option[&TExpr] = None
     if !infix
-        if static_receiver(c, target, name) is Some(ty) then return static_call(c, at, name_span, target, ty, name, args, explicit, expected)
-    val object = check_expr(c, target, None)
+        if names_fieldless_value(c, target) is Some(id)
+            if !has_static_member(c, id, name) then named_value = Some(check_expr(c, target, None))
+        if named_value is None
+            if static_receiver(c, target, name) is Some(ty) then return static_call(c, at, name_span, target, ty, name, args, explicit, expected)
+    val object = named_value match
+        Some(v) -> v
+        None -> check_expr(c, target, None)
     if *zonk(c, object.ty) is Class(k, _, _)
         val ms = with_trait_methods(c, object.ty, name, methods_named(c, k, name))
         if ms.len() > 0
@@ -12646,6 +12738,18 @@ private call_checked(c: *Checker, at: Span, callee_span: Span, f: &TExpr, args: 
                 check_statement(c, a.value)
             TExpr(at, if *ty is Nothing then Nothing else ErrorType, UnitConst)
 
+// Whether a lambda's parameter declared `declared` may stand where `wanted` is expected though the two
+// differ: a function of an `Animal` is a function of a `Dog`, on the terms a function type's
+// parameters vary by, which a wider value type does not meet.
+private lambda_parameter_wider(c: *Checker, declared: &Type, wanted: &Type) -> bool
+    val w = zonk(c, wanted)
+    if has_unknowns(w) then return false
+    var mine: Buf[&Type] = buf()
+    mine.push(declared)
+    var theirs: Buf[&Type] = buf()
+    theirs.push(w)
+    fits(c, Function(mine, Unit), Function(theirs, Unit))
+
 // A lambda is an anonymous local function, checked where it is written. Its parameter types are
 // written or come from the function type expected there, and its result type comes from that type
 // or from its body.
@@ -12665,15 +12769,24 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
                 mismatched = true
     var types: Buf[&Type] = buf()
     var names: Buf[string] = buf()
+    var local_types: Buf[&Type] = buf()
     for i in 0..<params.len()
         val p = params[i]
         names.push(p.name)
         var ty: &Type = ErrorType
+        var local: Option[&Type] = None
         p.declared match
             Some(d) ->
                 ty = resolve_type(c, unit, d)
                 if i < wanted.len()
-                    if !unify(c, wanted[i], ty)
+                    // A declared parameter may be wider than the one expected, since a function of
+                    // an `Animal` is a function of a `Dog`, on the terms a function type's
+                    // parameters vary by. The lambda then takes what is expected, and its body sees
+                    // the parameter as declared.
+                    if lambda_parameter_wider(c, ty, wanted[i])
+                        local = Some(ty)
+                        ty = zonk(c, wanted[i])
+                    elif !unify(c, wanted[i], ty)
                         c.note(unit, p.span, s"`${p.name}` is declared ${type_name(ty)}, but this lambda is expected to take ${type_name(zonk(c, wanted[i]))}")
                         ty = ErrorType
             None ->
@@ -12681,6 +12794,7 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
                 if i < wanted.len() && !has_unknowns(known) then ty = known
                 elif !mismatched then c.note(unit, p.span, s"cannot infer the type of `${p.name}`; write it, as in `(${p.name}: int) -> …`")
         types.push(ty)
+        local_types.push(local.unwrap_or(ty))
     var result: Option[&Type] = None
     // A result still partly unknown is inferred from the body, which is checked against its known
     // shape; one wholly unknown says nothing.
@@ -12707,7 +12821,7 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     c.body.block_start = mark
     var param_locals: Buf[usize] = buf()
     for i in 0..<params.len()
-        param_locals.push(declare_local(c, params[i].span, names[i], types[i], false))
+        param_locals.push(declare_local(c, params[i].span, names[i], local_types[i], false))
     c.symbols[id].param_locals = param_locals
     check_body(c, id, body, hint)
     c.body.visible.truncate(mark)
@@ -12874,6 +12988,18 @@ private mismatch(c: *Checker, wanted: &Type, found: &Type) -> string
         if i > 0 then names = names + (if i + 1 == traits.len() then " and " else ", ")
         names = names + type_name(traits[i])
     s"$text; they have no common superclass and share the unrelated traits $names, so write the type wanted"
+
+/** Why two branches yielding `a` and `b` agree on no type, where the reason is that they share several
+ * unrelated traits and no single most specific one: ", which share Swims and Flies but …", or
+ * nothing. */
+private no_single_join(c: *Checker, a: &Type, b: &Type) -> string
+    val traits = shared_traits(c, zonk(c, a), zonk(c, b))
+    if traits.len() < 2 then return ""
+    var names = ""
+    for i in 0..<traits.len()
+        if i > 0 then names = names + (if i + 1 == traits.len() then " and " else ", ")
+        names = names + type_name(traits[i])
+    s", which share $names but no single most specific type; write the type you want"
 
 /** The expected type of an argument whose parameter has the type `t`: `t` solved, except that a type
  * argument still open in `open` is left unknown where a value is read out, when what decided it is a
@@ -13244,7 +13370,7 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
             join_expected(c, ty, body.ty, expected) match
                 Some(t) -> ty = t
                 None ->
-                    c.note(unit, arm.body.span, s"this arm yields ${type_name(body.ty)}, but the arms before it yield ${type_name(ty)}")
+                    c.note(unit, arm.body.span, s"this arm yields ${type_name(body.ty)}, but the arms before it yield ${type_name(ty)}${no_single_join(c, ty, body.ty)}")
                     agreed = false
         typed.push(TArm(pattern, guard, body))
     if !agreed then ty = ErrorType

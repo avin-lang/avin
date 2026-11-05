@@ -989,7 +989,12 @@ in them are reported as unable to leave the comprehension.
 - **Runtime tests** are the runtime package's own Sysl tests, which the compiler's tests run.
 - **Execution tests** are Avin programs in `tests/run/`, compiled and run at `-O0` and `-O2`. A
   program's leading `// expect: exit N` or `// expect: trap` says how it ends (exit 0 when it says
-  neither), and `NAME.out` and `NAME.err` beside it hold the output it must write.
+  neither), and `NAME.out` and `NAME.err` beside it hold the output it must write. A test for a
+  known bug keeps its correct expectations and gains a `// ignore: REASON` line (the reason is
+  required; an empty one is a failure): the program is then neither compiled nor run, and the
+  summary line (`tests/run: N passed, M failed, K ignored`) counts it apart and lists it with its
+  reason. The same line works in `tests/reject`, in `examples/`, and in a program of many files
+  under `tests/programs/`, where it goes in the main module. Removing the line un-ignores the test.
 - **Rejection tests** are Avin programs in `tests/reject/` that must fail to compile; each
   `// error: TEXT` line names text the diagnostics must contain.
 - **Tooling tests** (`runner_tests.sysl`) drive `avin run` and `avin test` through the command line,
