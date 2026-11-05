@@ -547,7 +547,7 @@ included ([proposed](/spec/decisions/#proposed)); a listener's `port`, `accept` 
 checked the same way:
 
 ```text
-avin: trap: `Socket` belongs to another thread at main.avin:16:25
+avin: trap: `TcpStream` belongs to another thread at main.avin:16:25
 ```
 
 ### `Url`
