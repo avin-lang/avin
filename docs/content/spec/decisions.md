@@ -3679,14 +3679,8 @@ spelling is better, as each entry says.
   leaving shadowing as it was and requiring `Option.None` (the status quo the bug report was
   about); refusing a variant named like a core library variant (would rename C enumerators).
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- **The language server's `workspace/symbol` and `textDocument/foldingRange`** (branch
+- Settled on the user's delegation 2026-11-05: **The language server's `workspace/symbol` and
+  `textDocument/foldingRange`** (branch
   `lsp-symbols-folding`). Workspace symbols are read off each file's parse, for every program an
   open document belongs to, its unopened files included and its dependencies' left out; a name
   matches a query holding its characters in order (a subsequence), ASCII letters in either case; at
@@ -3706,6 +3700,13 @@ spelling is better, as each entry says.
   only for the empty query; folding by indentation alone. Review with the user: whether ranking by
   match quality is wanted, and whether a machine's compiler-written `state()`/`handle()` should be
   listed (they are, at the machine's name).
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
 
 ## Open
 
