@@ -1408,7 +1408,7 @@ private check_template_implementations(c: *Checker)
                 found = true
                 val described = s"`${c.symbols[m].decl.name}` implements `${c.symbols[base].name}`"
                 val at = c.symbols[m].decl.name_span
-                if param_mismatch(c, block.target, m, base) is Some(text) then c.note(block.unit, at, s"$described, $text")
+                if signature_mismatch(c, block.target, m, base) is Some(text) then c.note(block.unit, at, s"$described, $text")
                 elif result_mismatch(c, block.target, m, base) is Some(text) then c.note(block.unit, at, s"$described, $text")
             if !found && is_abstract_method(c.symbols[base]) && !contains_id(c.field_getters, base)
                 c.note(block.unit, block.decl.span, s"the template for `${c.classes[k].name}` does not implement `${c.symbols[base].decl.name}`, which the trait leaves to each type")
@@ -4161,6 +4161,9 @@ private build_builtin_table(c: *Checker, b: usize, conformed: Buf[usize])
             if several && own is None then continue
             own match
                 Some(m) ->
+                    if !several
+                        if bound_mismatch(c, c.symbols[m].receiver.unwrap(), m, methods[j]) is Some(text)
+                            c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`${c.symbols[m].name}` implements `${c.symbols[methods[j]].name}`, $text")
                     inherit_defaults(c, m, methods[j])
                     table.set(c.classes[t].base + j, Some(m))
                 None ->
@@ -4251,7 +4254,7 @@ private build_data_table(c: *Checker, id: usize, conformed: Buf[usize])
                 for k in 0..<mine.len()
                     if c.data[id].implementing[k] && c.symbols[mine[k]].decl.name == name && meant is None then meant = Some(mine[k])
                 if overloads == 1 && meant is Some(own)
-                    if param_mismatch(c, self_type, own, m) is Some(text)
+                    if signature_mismatch(c, self_type, own, m) is Some(text)
                         c.note(c.symbols[own].unit, c.symbols[own].decl.name_span, s"`${c.symbols[own].name}` implements `${c.symbols[m].name}`, $text")
                         continue
                 report_conformance(c, id, t, s"`$name_of` does not implement `$name` from `${c.classes[t].name}`; implement it in an impl of `${c.classes[t].name}`")
@@ -4479,7 +4482,7 @@ private ensure_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
 // position, and yields its result or, for a class, a subclass of it.
 private overrides_matches(c: *Checker, id: usize, m: usize, target: usize) -> bool
     val symbol = c.symbols[m]
-    if param_mismatch(c, own_class_type(c.classes[id], id), m, target) is Some(text)
+    if signature_mismatch(c, own_class_type(c.classes[id], id), m, target) is Some(text)
         c.note(c.classes[id].unit, symbol.decl.name_span, s"`${symbol.decl.name}` overrides `${c.symbols[target].name}`, $text")
         return false
     index_tie(c, m, target)
@@ -4657,7 +4660,7 @@ private check_override_results(c: *Checker, id: usize)
             val own = c.symbols[m].owner_class == Some(id)
             val at = if own then c.symbols[m].decl.name_span else k.decl.name_span
             if !own
-                if param_mismatch(c, own_class_type(c.classes[id], id), m, base) is Some(text)
+                if signature_mismatch(c, own_class_type(c.classes[id], id), m, base) is Some(text)
                     c.note(k.unit, at, s"$described for `${k.name}`, $text")
                     continue
                 if defaults_conflict(c, m, base, s"override `${c.symbols[m].decl.name}`") is Some(text) then c.note(k.unit, at, s"$described for `${k.name}`, $text")
@@ -4742,6 +4745,49 @@ private method_lower(c: *Checker, m: usize, j: usize) -> Option[&Type]
     val outer = symbol.type_params.len() - symbol.decl.type_params.len()
     lower_at(c, symbol.type_owner, symbol.type_params, outer + j)
 
+/** The bounds method `m` writes on its own type parameter `j`. */
+private method_bounds(c: *Checker, m: usize, j: usize) -> Buf[&Type]
+    val symbol = c.symbols[m]
+    val outer = symbol.type_params.len() - symbol.decl.type_params.len()
+    c.bounds.get(bound_key(symbol.type_owner, outer + j, symbol.type_params[outer + j])).unwrap_or(buf())
+
+/** The bound method `m` writes on a type parameter of its own that `base`, which it overrides or
+ * implements for `self_type`, does not imply. A call through `base` passes any type argument `base`'s
+ * bounds admit, so an override assumes no more of it: each bound it writes is one of `base`'s, or a
+ * trait or class one of them conforms to, or a trait every type has. The two declare the same number
+ * of type parameters of their own. */
+private bound_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) -> Option[string]
+    val own = own_type_params(c, base)
+    if own_type_params(c, m) != own then return None
+    for j in 0..<own
+        var given: Buf[&Type] = buf()
+        for b in method_bounds(c, base, j)
+            given.push(seen_from(c, self_type, base, b))
+        for b in method_bounds(c, m, j)
+            val wanted = seen_from(c, self_type, m, b)
+            if !bound_implied(c, given, wanted)
+                val name = c.symbols[base].decl.type_params[j].name
+                return Some(s"whose type parameter `$name` is not bounded by ${type_name(wanted)}")
+    None
+
+/** Whether a type parameter with the bounds `given` conforms to `wanted`, a trait or a class. */
+private bound_implied(c: *Checker, given: Buf[&Type], wanted: &Type) -> bool
+    val k = *wanted match
+        Class(k, _, _) -> k
+        _ -> return true
+    // Every type compares and hashes.
+    if names_core_trait(c.core, k, "Eq") || names_core_trait(c.core, k, "Hash") then return true
+    for g in given
+        if ancestor_type(c.classes, c.data, g, k) is Some(up)
+            if conforms(up, wanted) then return true
+    false
+
+/** How method `m`'s signature differs from that of `base`, which it overrides or implements for
+ * `self_type`: in its parameters, or in a bound it adds to a type parameter of its own. */
+private signature_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) -> Option[string]
+    if param_mismatch(c, self_type, m, base) is Some(text) then return Some(text)
+    bound_mismatch(c, self_type, m, base)
+
 /** How method `m`'s result differs from that of `base`, which it overrides or implements for
  * `self_type`: it yields that result or, where that is a class or a trait, a type conforming to it. */
 private result_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) -> Option[string]
@@ -4824,9 +4870,9 @@ private check_data_implementations(c: *Checker, id: usize)
             c.derived_context = c.derived_symbols.get(s"$m")
             if c.symbols[m].receiver is Some(_)
                 val at = c.symbols[m].decl.name_span
-                if param_mismatch(c, self_type, m, base) is Some(text) then c.note(c.symbols[m].unit, at, s"$described, $text")
+                if signature_mismatch(c, self_type, m, base) is Some(text) then c.note(c.symbols[m].unit, at, s"$described, $text")
                 elif result_mismatch(c, self_type, m, base) is Some(text) then c.note(c.symbols[m].unit, at, s"$described, $text")
-            elif param_mismatch(c, self_type, m, base) is Some(text) then report_conformance(c, id, t, s"$described for `${c.data[id].name}`, $text")
+            elif signature_mismatch(c, self_type, m, base) is Some(text) then report_conformance(c, id, t, s"$described for `${c.data[id].name}`, $text")
             elif result_mismatch(c, self_type, m, base) is Some(text) then report_conformance(c, id, t, s"$described, $text")
             c.derived_context = None
 
@@ -4907,6 +4953,7 @@ private check_conformance_members(c: *Checker, self_type: &Type, t: &Type, unit:
         found match
             Some(m) ->
                 if result_mismatch(c, self_type, m, tm) is Some(text) then c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`$name` implements `$name` of ${type_name(t)}, $text")
+                elif bound_mismatch(c, self_type, m, tm) is Some(text) then c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`$name` implements `$name` of ${type_name(t)}, $text")
             None ->
                 var shown = ""
                 val want = c.symbols[tm].params

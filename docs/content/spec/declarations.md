@@ -438,7 +438,15 @@ class Square(label: string, side: int): Rect(label, side, side)
   override is marked `override`, takes the same parameter types (with the superclass's type
   arguments substituted) and yields the same result type or, for a class, a subclass of it. A method
   with type parameters of its own is overridden by one declaring as many, matched by position:
-  `override tag[V](item: V)` overrides `tag[U](item: U)`. A method sharing an inherited method's name and parameter types without
+  `override tag[V](item: V)` overrides `tag[U](item: U)`. An override assumes no more of its type
+  arguments than the method it overrides, since a call through the base type passes any type the
+  base's bounds admit: each bound it writes is implied by the overridden method's bounds on the same
+  parameter, being one of them, a trait or class one of them conforms to (`[U: Shape]` over
+  `[U: Named]` where `trait Named: Shape`), or `Eq` or `Hash`, which every type has. It may keep the
+  bounds, weaken them or drop them; `override tag[V: Ord](item: V)` over `tag[U](item: U)` is an
+  error naming the bound and the method. The same holds of a class's or an impl's method
+  implementing a trait's, for a data type or a built-in type, of a static member, and of a trait's
+  override. A method sharing an inherited method's name and parameter types without
   `override`, and `override` on a method that overrides nothing, are errors. An override cannot be
   private.
 - **Methods overload as functions do.** A class, object, trait or impl may declare several methods
