@@ -1414,9 +1414,9 @@ Settled by the user on 2026-11-04:
     `between`, `nextReal`, `nextBoolean`, `nextGaussian`, `nextBytes`, `alphanumeric`, `shuffle` and
     `setSeed`; the companion's methods use one shared, locked generator. PCG32, written in Avin with
     the wrapping operators, so a seed gives the same sequence everywhere. Binding: one runtime
-    function for the platform's seed over `sysl.posix.rand.seed_from_os`, since its `u64` does not
-    fit a `long` at the boundary. `nextGaussian` uses `avin.math`'s `sqrt` and `log`. Not blocked on
-    opaque handles.
+    function for the platform's seed over `sysl.posix.rand.seed_from_os`, since a `u64` above
+    `long.MaxValue` traps at a binding's result; it answers the entropy's top 63 bits.
+    `nextGaussian` uses `avin.math`'s `sqrt` and `log`.
   - **[`avin.net`](/spec/system-library/#avin-net)**: `TcpStream` and `TcpListener`; `Url`, parsed
     and percent-encoded, written in Avin; an HTTP/1.1 client (`get`, `post`, `send` with a `Request`)
     written in Avin over the TCP stream, a status never an error. `IoError` gains
@@ -1509,7 +1509,21 @@ Settled by the user on 2026-11-04:
 
 ## Proposed
 
-None at present.
+- **`avin.random`'s details** ([system library](/spec/system-library/#avin-random)), where the
+  chapter left them open, so that a seed's numbers are fixed:
+  - Every generator uses PCG32's stream 54 (increment 109), the reference implementation's
+    demonstration stream, so `Random(42).nextInt()` gives its published first output, `0xa15c02b7`
+    (as an `int`, `-1587805513`). Seeding is the reference's: one step from zero, the seed added,
+    one step more.
+  - `nextLong` is two draws, the first the high half; `nextBoolean` is a draw's top bit; `nextReal`
+    is a 64-bit draw's top 53 bits over 2^53; `nextInt(n)` rejects 32-bit draws below `2^32 % n`,
+    and `nextLong(n)` and `between` on `long` reject 64-bit draws below `2^64 % n`; `between` on `int`
+    is `nextInt` of the span where it fits an `int`, and `nextLong` of it otherwise.
+  - `between` on `real` draws `min + nextReal() * (max - min)` again while it rounds up to `max`,
+    and traps on a NaN bound and where `max - min` is infinite, besides `min >= max`.
+  - `nextGaussian` is the polar method, keeping the second value of each pair for the next call;
+    `setSeed` drops it. `nextBytes` takes four bytes from each draw, lowest first; a negative count
+    traps. `alphanumeric` draws `nextInt(62)` per character, digits, then upper, then lower case.
 
 ## Open
 
