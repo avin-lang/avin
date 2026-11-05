@@ -130,7 +130,20 @@ indicators of one flag, nor inside an emoji sequence joined by a zero width join
 Matching is **backtracking, leftmost-first**. The search tries each start from the left; at a start,
 alternatives are tried in order, a greedy repetition takes as many repetitions as it can and gives
 them back one at a time, a reluctant one takes as few as it can, and a possessive one and an atomic
-group never give back. The first way the whole pattern matches is the match. There is no step limit.
+group never give back. The first way the whole pattern matches is the match.
+
+The matcher keeps its own backtrack stack, so however many times a group repeats, a match takes no
+deeper a call stack: `(?:a|b)*` over a million characters matches as `[ab]*` does. A greedy,
+unbounded repetition of a group, in a pattern with no back reference, remembers the indices where a
+further repetition has already failed and does not try one there again, so `(a+)+$` and `(a|aa)+$`
+fail in polynomial time, not exponential.
+
+**Each attempt at a start has a step budget**: an operation of the pattern run, or a choice gone
+back to, is a step, and an attempt may take 1000 steps for each character of the input and each
+operation of the compiled pattern, and never fewer than 10,000,000. An attempt that spends its budget
+traps, naming the pattern: `` pattern `(a+)+?$` backtracked too far on a 40-character input; make a
+repetition possessive or atomic ``. The budget is per attempt, so a search over a long text may take
+far more steps in all. `withStepLimit(n)` gives each attempt `n` steps instead.
 
 What a group captured is what it matched on the path that succeeded, with these rules where a group
 is repeated or tried more than once:
@@ -165,6 +178,7 @@ is repeated or tried more than once:
 | `split(s)` | `pattern().split(s)`: the pieces of `s` between the matches, as an `Array[string]` |
 | `unapplySeq(s)` | The groups' texts, an `Option[List[string]]`, where `s` matches as `matches` asks; it makes the regex an [extractor](/spec/operators-and-control-flow/#extractor-patterns) |
 | `unanchored()`, `anchored()` | The same regex with `matches` and the extractor asking about any part, or the whole |
+| `withStepLimit(n)` | The same regex, each attempt at a start allowed `n` steps in place of the [default budget](#matching); `n` must be above 0 |
 | `regex()`, `toString()`, `pattern()` | The pattern as written; `pattern()` is a `Pattern`, with `pattern()`, `groupCount()` and `split` |
 | `Regex.quote(text)` | A pattern matching `text` literally: `\Q`, the text, `\E`, each `\E` in the text written so it does not end the quotation |
 | `Regex.quoteReplacement(text)` | A replacement writing `text` literally: each `\` and `$` with a backslash before it |
