@@ -1816,6 +1816,7 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
         None ->
             if binding_target(symbol.decl) is Some(_) || handle_of(l, symbol) is Some(_) then binding_body(l, symbol, shim_symbol(function_symbol(l.program, f.symbol, inst.type_args)))
             elif c_close_class(l, symbol) is Some(k) then c_close_body(l, symbol, k)
+            elif c_field_of(symbol.decl) is Some(field) then c_field_body(l, symbol, f.symbol, field)
             elif c_prototype_of(symbol.decl) is Some(p) then c_binding_body(l, symbol, p)
             else intrinsic_body(l, symbol)
     MirFunction(function_symbol(l.program, f.symbol, inst.type_args), signature, l.values, l.slots, l.blocks)
@@ -2060,6 +2061,9 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
     l.library = true
     val at = symbol.decl.name_span
     var args: Buf[Operand] = buf()
+    // What C is passed: the arguments, each handle as the C type its parameter names, through its
+    // class's `as:` conversion where that is not the class's own.
+    var passed: Buf[Operand] = buf()
     var scalars: Buf[CScalar] = buf()
     var copies: Buf[Operand] = buf()
     // Each parameter's handle object, where it is a handle, perhaps null for `None`, and its class.
@@ -2079,7 +2083,9 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
             classes[i] = h.class_index
             optionals[i] = h.optional
             scalars.push(CAddress)
-            args.push(c_handle_pointer(l, object, h.class_index, h.optional, at))
+            val pointer = c_handle_pointer(l, object, h.class_index, h.optional, at)
+            args.push(pointer)
+            passed.push(c_converted(l, pointer, h.class_index, p.params[i].text))
             continue
         val form = c_text_form(t, l.program.data, l.program.classes)
         if form is TextString(optional)
@@ -2090,17 +2096,20 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
             copies.push(copy)
             scalars.push(CAddress)
             args.push(copy)
+            passed.push(copy)
             continue
         val s = c_scalar_of(p.params[i].ty, t, l.program.c_measures)
         scalars.push(s)
-        args.push(c_argument(l, x, t, s, c_integer_name(p.params[i].ty, s), at))
-    val calls = CCall(p.symbol, args, objects, classes, optionals, skipped)
+        val converted = c_argument(l, x, t, s, c_integer_name(p.params[i].ty, s), at)
+        args.push(converted)
+        passed.push(converted)
+    val calls = CCall(s"`${p.symbol}` answered", args, objects, classes, optionals, skipped)
     val result_type = concrete(l, symbol.result.unwrap_or(Unit))
     val free = c_free_text(symbol.decl)
     val result_form = c_text_form(result_type, l.program.data, l.program.classes)
     val text_result = !(result_form is NoText) || (*result_type is Unit && free is Some(_))
     if *result_type is Unit && !text_result
-        l.insts.push(Call(None, CFunction(p.symbol, scalars, None), args))
+        l.insts.push(Call(None, CFunction(p.symbol, scalars, None), passed))
         c_release_copies(l, copies)
         c_after_call(l, symbol, calls, None, None)
         l.library = outer
@@ -2108,9 +2117,9 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
         return
     if text_result
         val answer = fresh(l, MPtr)
-        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(CAddress)), args))
+        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(CAddress)), passed))
         // C may answer a pointer into a string it was passed, so the copies outlive the answer's.
-        val value = c_text_answer(l, Value(answer), result_type, result_form, free, p.symbol, at)
+        val value = c_text_answer(l, Value(answer), result_type, result_form, free, s"`${p.symbol}` answered", at)
         c_release_copies(l, copies)
         c_after_call(l, symbol, calls, None, None)
         l.library = outer
@@ -2118,7 +2127,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
         return
     if c_handle_form(result_type, l.program.data, l.program.classes) is Some(h)
         val answer = fresh(l, MPtr)
-        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(CAddress)), args))
+        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(CAddress)), passed))
         c_release_copies(l, copies)
         val value = c_handle_answer(l, symbol, calls, Value(answer), result_type, h, at)
         l.library = outer
@@ -2127,7 +2136,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
     if c_status_error(result_type, l.program.data) is Some(e)
         val s = c_scalar_of(p.result, e, l.program.c_measures)
         val answer = fresh(l, c_machine(s))
-        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), args))
+        l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), passed))
         c_release_copies(l, copies)
         val zero = s match
             CSigned(bits) -> ConstInt(bits, "0")
@@ -2152,7 +2161,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, p: CPrototype)
         return
     val s = c_scalar_of(p.result, result_type, l.program.c_measures)
     val answer = fresh(l, c_machine(s))
-    l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), args))
+    l.insts.push(Call(Some(answer), CFunction(p.symbol, scalars, Some(s)), passed))
     c_release_copies(l, copies)
     val value = c_answer(l, Value(answer), s, result_type, at)
     c_after_call(l, symbol, calls, None, None)
@@ -2165,7 +2174,8 @@ private const CHandleSize: usize = 32
 private const CHandleOwner: usize = 8
 private const CHandleKept: usize = 24
 
-/** What a C binding's call was passed: the C symbol, the arguments, and for each parameter that is a
+/** What a C binding's call was passed: what answers, as a trap on a null answer says it ("`symbol`
+ * answered"), the arguments, a handle's as its own C pointer, and for each parameter that is a
  * handle its object, perhaps null for `None`, its class and whether it is in an `Option`. A method's
  * receiver is the first `skipped` parameters, which its declaration does not list. */
 private struct CCall
@@ -2226,6 +2236,108 @@ private c_checked_pointer(l: *Lowering, object: Operand, k: usize, at: Span) -> 
     trap_if(l, compare(l, CmpEq, word, NullAddress), s"`${trap_name(l, k)}` is closed", at)
     word
 
+// The C pointer of a handle of class `k` as the prototype's parameter written `text` takes it: its own
+// pointer where that names the class's own type, and otherwise the one its `as:` conversion to that
+// type makes, which the C unit's glue answers, null for null.
+private c_converted(l: *Lowering, pointer: Operand, k: usize, text: string) -> Operand
+    val d = l.program.classes[k].decl
+    val own = c_handle_type(d) match
+        Some(t) -> parse_c_type(t) match
+            Ok(t) -> t.text
+            Err(_) -> return pointer
+        None -> return pointer
+    if c_names_handle(text, own, false) then return pointer
+    val j = c_as_position(d, text) match
+        Some(j) -> j
+        None -> return pointer
+    var params: Buf[CScalar] = buf()
+    params.push(CAddress)
+    var args: Buf[Operand] = buf()
+    args.push(pointer)
+    val dest = fresh(l, MPtr)
+    l.insts.push(Call(Some(dest), CFunction(s"avin_c_as_${k}_$j", params, Some(CAddress)), args))
+    Value(dest)
+
+// A field accessor's body reads or writes its field through the C unit's glue, after the receiver's
+// owner and closed checks, as any method's. Each index is passed as a `long long` and checked against
+// its bound, which the glue answers, before C reads anything: the program stops unless
+// `0 <= index < bound`. A field read is converted as a result of its C type is, a string copied and
+// checked, a null one `None` or a stop, and a handle lent, taking a reference of its own; a value
+// written is converted as an argument, at the field's own width.
+private c_field_body(l: *Lowering, symbol: FunctionSymbol, n: usize, field: CField)
+    val outer = l.library
+    l.library = true
+    val at = symbol.decl.name_span
+    val k = symbol.owner_class.unwrap()
+    val object = Value(l.param_values[0].unwrap())
+    val pointer = c_checked_pointer(l, object, k, at)
+    val result_type = concrete(l, symbol.result.unwrap_or(Unit))
+    val writer = *result_type is Unit
+    val last = if writer then symbol.params.len() - 1 else symbol.params.len()
+    var indices: Buf[Operand] = buf()
+    for i in 1..<last
+        val t = concrete(l, symbol.params[i])
+        indices.push(c_argument(l, Value(l.param_values[i].unwrap()), t, CSigned(64), "i64 (long long)", at))
+    for b in 0..<field.bounds.len()
+        if b >= indices.len() then break
+        val bound = fresh(l, MInt(64))
+        l.insts.push(Call(Some(bound), CFunction(c_field_glue(n, "bound" + b.to_string()), c_field_params(indices.len()), Some(CSigned(64))), c_field_args(pointer, indices)))
+        val reason = s"index `${c_parameter_name(symbol.decl, b)}` of `${symbol.name}` out of range"
+        trap_if(l, compare(l, CmpLt, indices[b], ConstInt(64, "0")), reason, at)
+        trap_if(l, compare(l, CmpGe, indices[b], Value(bound)), reason, at)
+    val field_type = CTypedef(c_field_type_name(n))
+    if writer
+        val t = concrete(l, symbol.params[last])
+        val s = c_scalar_of(field_type, t, l.program.c_measures)
+        var params = c_field_params(indices.len())
+        params.push(s)
+        var args = c_field_args(pointer, indices)
+        args.push(c_argument(l, Value(l.param_values[last].unwrap()), t, s, c_integer_name(field_type, s).replace_all(c_field_type_name(n), s"the field `${field.expr}`"), at))
+        l.insts.push(Call(None, CFunction(c_field_glue(n, "set"), params, None), args))
+        l.library = outer
+        finish(l, Return(None))
+        return
+    val get = c_field_glue(n, "get")
+    val who = s"the field `${field.expr}` of `${trap_name(l, k)}` holds"
+    val form = c_text_form(result_type, l.program.data, l.program.classes)
+    if !(form is NoText)
+        val answer = fresh(l, MPtr)
+        l.insts.push(Call(Some(answer), CFunction(get, c_field_params(indices.len()), Some(CAddress)), c_field_args(pointer, indices)))
+        val value = c_text_answer(l, Value(answer), result_type, form, None, who, at)
+        l.library = outer
+        finish(l, Return(value))
+        return
+    if c_handle_form(result_type, l.program.data, l.program.classes) is Some(h)
+        val answer = fresh(l, MPtr)
+        l.insts.push(Call(Some(answer), CFunction(get, c_field_params(indices.len()), Some(CAddress)), c_field_args(pointer, indices)))
+        val call = CCall(who, buf(), buf(), buf(), buf(), symbol.params.len() - symbol.decl.params.len())
+        val value = c_handle_answer(l, symbol, call, Value(answer), result_type, h, at)
+        l.library = outer
+        finish(l, Return(Some(value)))
+        return
+    val s = c_scalar_of(field_type, result_type, l.program.c_measures)
+    val answer = fresh(l, c_machine(s))
+    l.insts.push(Call(Some(answer), CFunction(get, c_field_params(indices.len()), Some(s)), c_field_args(pointer, indices)))
+    val value = c_answer(l, Value(answer), s, result_type, at)
+    l.library = outer
+    finish(l, Return(Some(value)))
+
+// The parameters of a field accessor's glue with `count` indices: the handle's pointer, then each
+// index as a `long long`.
+private c_field_params(count: usize) -> Buf[CScalar]
+    var out: Buf[CScalar] = buf()
+    out.push(CAddress)
+    for _ in 0..<count
+        out.push(CSigned(64))
+    out
+
+private c_field_args(pointer: Operand, indices: Buf[Operand]) -> Buf[Operand]
+    var out: Buf[Operand] = buf()
+    out.push(pointer)
+    for x in indices
+        out.push(x)
+    out
+
 // The value `result_type` makes of the handle pointer C answered at `answer`: null is `None`, or
 // stops the program where the result is no `Option`; any other pointer is a new object of the
 // class, holding the pointer, owned by the code running, after a reference of its own is taken where
@@ -2233,7 +2345,7 @@ private c_checked_pointer(l: *Lowering, object: Operand, k: usize, at: Span) -> 
 private c_handle_answer(l: *Lowering, symbol: FunctionSymbol, call: CCall, answer: Operand, result_type: &Type, h: CHandleForm, at: Span) -> Operand
     val absent = compare(l, CmpEq, answer, NullAddress)
     if !h.optional
-        trap_if(l, absent, s"`${call.symbol}` answered null", at)
+        trap_if(l, absent, s"${call.symbol} null", at)
         val made = c_new_handle(l, symbol, call, answer, h.class_index)
         c_after_call(l, symbol, call, Some(made), None)
         return made
@@ -2257,7 +2369,8 @@ private c_handle_answer(l: *Lowering, symbol: FunctionSymbol, call: CCall, answe
 // pointer has a reference of its own taken first, through the class's `retain`, which is given the
 // pointer of the handle of the class's `kept:` the call keeps, for its name.
 private c_new_handle(l: *Lowering, symbol: FunctionSymbol, call: CCall, pointer: Operand, k: usize) -> Operand
-    if c_binding_flag(symbol.decl, "borrowed")
+    // A handle read from a field is always lent.
+    if c_binding_flag(symbol.decl, "borrowed") || c_field_of(symbol.decl) is Some(_)
         var kept: Operand = NullAddress
         if c_kept_class(l.program.classes, k) is Some(wanted)
             for name in c_binding_names(symbol.decl, "keeps")
@@ -2411,7 +2524,7 @@ private c_free_answer(l: *Lowering, free: string, answer: Operand)
 // into a new string checked as UTF-8, or into a new `Array[byte]`, and then freed by `free` where
 // the binding names one. Null is `None` for an `Option`, and stops the program otherwise. A binding
 // whose result is `unit` frees what C answered and answers nothing.
-private c_text_answer(l: *Lowering, answer: Operand, t: &Type, form: CTextForm, free: Option[string], symbol: string, at: Span) -> Option[Operand]
+private c_text_answer(l: *Lowering, answer: Operand, t: &Type, form: CTextForm, free: Option[string], who: string, at: Span) -> Option[Operand]
     val optional = form match
         TextString(o) -> o
         TextBytes(o) -> o
@@ -2424,8 +2537,8 @@ private c_text_answer(l: *Lowering, answer: Operand, t: &Type, form: CTextForm, 
         c_free_answer(l, free.unwrap(), answer)
         finish_into(l, Jump(join), join)
         return None
-    if !optional then trap_if(l, absent, s"`$symbol` answered null", at)
-    if !optional then return Some(c_text_copy(l, answer, t, form, free, symbol, at))
+    if !optional then trap_if(l, absent, s"$who null", at)
+    if !optional then return Some(c_text_copy(l, answer, t, form, free, who, at))
     val slot = machine_slot(l, MRef)
     val none = new_block(l)
     val present = new_block(l)
@@ -2434,7 +2547,7 @@ private c_text_answer(l: *Lowering, answer: Operand, t: &Type, form: CTextForm, 
     store(l, slot, Some(NullAddress))
     finish_into(l, Jump(join), present)
     val inner = option_argument(l.options, t).unwrap()
-    store(l, slot, Some(c_text_copy(l, answer, inner, form, free, symbol, at)))
+    store(l, slot, Some(c_text_copy(l, answer, inner, form, free, who, at)))
     finish_into(l, Jump(join), join)
     val value = load(l, slot).unwrap()
     if pointer_option(l, t) then return Some(value)
@@ -2442,13 +2555,13 @@ private c_text_answer(l: *Lowering, answer: Operand, t: &Type, form: CTextForm, 
 
 // The copy of the string C answered at `answer`, which is not null, as `t`, a `string` or an
 // `Array[byte]`, after which `free` frees it where the binding names one.
-private c_text_copy(l: *Lowering, answer: Operand, t: &Type, form: CTextForm, free: Option[string], symbol: string, at: Span) -> Operand
+private c_text_copy(l: *Lowering, answer: Operand, t: &Type, form: CTextForm, free: Option[string], who: string, at: Span) -> Operand
     var copied: Operand = NullAddress
     if form is TextBytes(_)
         val descriptor = layout(l, t).variants[0].descriptor
         copied = runtime_call(l, "avin_rt_c_bytes_out", [MPtr, MPtr], MRef, [DescriptorAddress(descriptor), answer])
     else
-        val site = trap_site(l, s"`$symbol` answered a string that is not UTF-8", at)
+        val site = trap_site(l, s"$who a string that is not UTF-8", at)
         copied = runtime_call(l, "avin_rt_c_string_out", [MPtr, MPtr], MRef, [answer, TrapSiteAddress(site)])
     if free is Some(f) then c_free_answer(l, f, answer)
     copied
@@ -2532,7 +2645,7 @@ private bound_instance(l: *Lowering, index: usize) -> bool
     val inst = l.instances[index]
     if inst.generated != Written then return false
     val symbol = l.program.symbols[inst.function]
-    binding_target(symbol.decl) is Some(_) || handle_of(l, symbol) is Some(_) || c_prototype_text(symbol.decl) is Some(_) || c_close_class(l, symbol) is Some(_)
+    binding_target(symbol.decl) is Some(_) || handle_of(l, symbol) is Some(_) || c_prototype_text(symbol.decl) is Some(_) || c_field_of(symbol.decl) is Some(_) || c_close_class(l, symbol) is Some(_)
 
 /** The Sysl handle class whose method `symbol` is, where it is one without a body: a method bound to
  * the handle's Sysl value, or its `close()`. */

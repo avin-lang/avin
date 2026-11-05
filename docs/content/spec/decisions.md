@@ -2918,7 +2918,7 @@ their words are reserved.
   A wholly unknown parameter type is still an error. Why: inference fails otherwise exactly where
   the explicit form succeeds, and `ask(r -> Get(r), …)` is the chapter's idiom. Alternative:
   require the type argument at every request-style call.
-- Proposed (built on branch `actor-failure`): **How a trap is contained.** The runtime runs an
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-failure`): **How a trap is contained.** The runtime runs an
   actor's start, messages and `stopping` blocks under a return point (`_setjmp`), and a trap there
   restores the shadow stack, caller site and owner it recorded and returns to the turn
   (`_longjmp`). A count of regions in doubt on each thread (a lock held, which covers `Mutex` and
@@ -2926,40 +2926,40 @@ their words are reserved.
   program instead. *Why*: no unwinding tables are needed and the common path costs one `_setjmp`
   per turn. *Alternatives*: unwinding through every frame (needs landing pads in every function),
   or running each actor on a thread of its own (defeats many actors on few threads).
-- Proposed (built on branch `actor-failure`): **`Failed`'s reason is the trap's reason without its
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-failure`): **`Failed`'s reason is the trap's reason without its
   place** (`Failed(integer overflow)`), the place being in the report. *Alternative*: the whole
   report line, which ties the value to the file layout.
-- Proposed (built on branch `actor-failure`): **Every trap in an actor's code is reported naming the
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-failure`): **Every trap in an actor's code is reported naming the
   actor, also where it stops the program** (a mutex held, a `Once`, a `lazy val`, a Sysl call), so
   the report says where the bug ran. *Alternative*: the plain `avin: trap:` line where the program
   stops, as a thread's.
-- Proposed (built on branch `actor-failure`): **A stack overflow in an actor stops the program**, as
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-failure`): **A stack overflow in an actor stops the program**, as
   in a thread, with `avin: trap: stack overflow`: the stack may run out inside the runtime or the C
   library holding a lock, so nothing can be said about shared state. *Alternative*: contain it with
   `siglongjmp` from the signal handler (unsafe where the fault came from inside a lock).
   **Review with the user**: the chapter lists no exception for it.
-- Proposed (built on branch `actor-failure`): **An actor that escalates handles nothing more and
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-failure`): **An actor that escalates handles nothing more and
   waits for its parent's failure to stop it** (it ends `Failed`), rather than ending at once; a
   failure escalated to a parent that is already ending or restarting is dropped, since the parent
   is stopping its children anyway. *Why*: a failure escalated to the top then stops the program
   with no `stopping` block run anywhere, deterministically, and the parent's supervision decides
   the whole branch's fate. *Alternative*: the child ends on its own and tells the parent, which
   races the program's stop against the branch's `stopping` blocks.
-- Proposed (built on branch `actor-failure`): **A restart also cancels the actor's watches** (its
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-failure`): **A restart also cancels the actor's watches** (its
   timers are cancelled as the chapter says), since the fresh state sets its own; its reference,
   number, parent and watchers stay, and a stop asked for before the restart is honoured after it.
   A restart is reported as `avin: restarting Counter#3`, after the trap's line. *Alternative*:
   keep the watches, whose messages the fresh state may not expect.
-- Proposed (built on branch `actor-failure`): **`Restart`'s window counts restarts made within the
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-failure`): **`Restart`'s window counts restarts made within the
   last `within`; a limit less than zero or a window not more than zero traps in `spawn`**, as an
   `every` interval not more than zero does. *Alternative*: treat them as zero (a zero window would
   silently mean "restart for ever").
-- Proposed (built on branch `actor-failure`): **A trap in a `stopping` block ends the actor `Failed`**
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-failure`): **A trap in a `stopping` block ends the actor `Failed`**
   with that reason, or keeps the first reason where a trap had failed it already, asks no
   supervision (so a block that traps during a restart ends the actor), and runs no later
   `onStopping` function. *Alternative*: end it `Stopped` where it was stopping (hides the bug from
   its watchers).
-- Proposed (built on branch `actor-failure`): **A `pipeToSelf` function and a watch's function run in
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-failure`): **A `pipeToSelf` function and a watch's function run in
   the receiving actor's own turn**, when it takes the message, rather than wherever the future or
   the end completed, so a trap in one fails the actor that asked for it and never an unrelated
   thread or the actor watched. The message of a pipe of a future complete already is still made
@@ -2968,7 +2968,7 @@ their words are reserved.
   settled. *Alternative*: leave them where the value is known, where a trap stops the program from
   a pool worker or fails the watched actor in the middle of ending. **Review with the user**: the
   adapter and the pipe now differ in where their function runs.
-- Proposed (built on branch `actor-failure`): **`spawn`'s parameters are `(behaviour, onFailure,
+- Settled on the user's delegation 2026-11-05 (built on branch `actor-failure`): **`spawn`'s parameters are `(behaviour, onFailure,
   executor)`**, as the chapter writes them, so an executor alone is given by name
   (`executor = ex`). *Alternative*: keep the executor second.
 
@@ -3369,6 +3369,38 @@ their words are reserved.
 
   **Review with the user**: `shared` as a word of `@c` rather than a modifier, and the chain of C
   references a kept handle brings with it.
+
+- Settled on the user's delegation 2026-11-05 (built on branch `c-bindings-fields`): **`as:` conversions and field accessors** (stage 13
+  step 4), the choices building them made where the [chapter](/spec/c-bindings/#handles-and-c-s-inheritance)
+  is silent.
+  - **An `as:` entry's right side is a C function's name or an expression in `self`**, as
+    `release:`'s is, and `as:` is one string or a list. The C unit checks with
+    `__builtin_types_compatible_p` that what it makes is the entry's type. *Why*: one rule for every
+    piece of glue, and C would otherwise convert a wrong pointer silently (the C unit compiles with
+    warnings off). *Alternative*: an expression only, which makes MLT's every entry repeat `(self)`.
+  - **A conversion is made after the closed and owner checks, from the handle's own pointer, and
+    passes null as null**; what a binding `keeps:` or `consumes:` is the handle itself, held by its
+    class's own `retain`, never the converted pointer. *Why*: the converted pointer is lent and may
+    point into the object, so a reference taken through another class's glue would be the wrong
+    count. *Alternative*: holding the converted pointer, which has no `release` of its own.
+  - **A field is a member path read as `self->` followed by it**; its type is named in the C unit by
+    `__typeof__` with the indices replaced by zero, so it is measured and checked without being
+    read. *Why*: every surveyed accessor (MLT's profile, FreeType's face and glyph slot, Cairo's
+    path) is a member path, and an unevaluated operand needs no index. *Alternative*: a full C
+    expression in `self`, which nothing surveyed needs and which makes `self->` noise in each.
+  - **Only scalars are written**; a string or handle field is read only. *Why*: a string or a
+    reference stored into a C struct needs an owner that frees or gives it back, which no surveyed
+    library asks Avin to be. *Alternative*: writing strings copied with `malloc` and never freed.
+  - **Indices are `int` or `long`, passed as `long long`, one `bound:` each, in order**, a list for
+    more than one; a bound may use `self` and the indices. The check is `0 <= index < bound`, made
+    in Avin before the glue reads, trapping with "index `i` of `Class.method` out of range". *Why*:
+    a two-dimensional field needs a bound per index, and the trap names the index that was out of
+    range. *Alternative*: one bound for all indices.
+  - **A handle read from a field is lent, without `borrowed` written**, and its class must declare
+    `retain` and no `kept:`. *Why*: a struct's pointer is never the reader's to give back.
+    *Alternative*: requiring `borrowed`, a word that could only ever be written one way.
+
+  **Review with the user**: writers of scalars only.
 
 **Deferred**
 

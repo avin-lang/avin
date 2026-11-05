@@ -367,6 +367,111 @@ c_uses_name(text: string, name: string) -> bool
         i += 1
     false
 
+/** The C expression `text` with every use of one of `names` as a variable, not as a member's name,
+ * written `with` instead. */
+c_replace_names(text: string, names: Buf[string], with: string) -> string
+    val b = text.bytes
+    var out = ""
+    var from = 0usize
+    var i = 0usize
+    while i < b.len
+        if is_c_word_byte(b[i])
+            val start = i
+            while i < b.len && is_c_word_byte(b[i])
+                i += 1
+            val member = start > 0 && (b[start - 1] == u8('.') || start > 1 && b[start - 1] == u8('>') && b[start - 2] == u8('-'))
+            if !member
+                for n in names
+                    if text[start..<i] == n
+                        out = out + text[from..<start] + with
+                        from = i
+                        break
+            continue
+        i += 1
+    out + text[from..]
+
+/** One of a handle class's `as:` conversions: the other C type the handle may be passed as, as
+ * `parse_c_type` reads it, and the C function or expression in `self` that makes one. */
+struct CAs
+    ty: string
+    expr: string
+
+/** Reads one `as:` entry, `"mlt_service = mlt_playlist_service(self)"`: a C pointer type, `=`, and a
+ * C function of the handle's pointer or a C expression in `self`. */
+c_as_entry(text: string) -> Result[CAs, string]
+    val at = text.index_of("=") match
+        Some(a) -> a
+        None -> return Err("it has no `=`")
+    val written = text[..<at].trim()
+    val expr = text[at + 1..].trim()
+    val ty = parse_c_type(written) match
+        Ok(t) -> t
+        Err(why) -> return Err(s"`$written` is not a C type: $why")
+    ty.ty match
+        CPointerType -> ()
+        CTypedef(_) -> ()
+        _ -> return Err(s"`$written` is not a pointer: a handle is passed as another pointer to its C object")
+    if expr == "" then return Err(s"it names no function or expression to make a `$written`")
+    if !is_c_identifier(expr) && !c_uses_name(expr, "self") then return Err(s"`$expr` is neither a C function of the handle's pointer nor a C expression in `self`")
+    Ok(CAs(ty.text, expr))
+
+/** The strings a handle class's `@c` gives under `key`: one string, or a list of them. */
+c_class_texts(d: &ClassDecl, key: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val a = c_class_annotation(d) match
+        Some(a) -> a
+        None -> return out
+    for arg in a.args
+        if arg.name != Some(key) then continue
+        arg.value.kind match
+            StringLit(text) -> out.push(text)
+            ListLit(items) ->
+                for item in items
+                    if item.kind is StringLit(text) then out.push(text)
+            _ -> ()
+    out
+
+/** A handle class's `as:` conversions that read, in the order written. */
+c_class_as(d: &ClassDecl) -> Buf[CAs]
+    var out: Buf[CAs] = buf()
+    for text in c_class_texts(d, "as")
+        if c_as_entry(text) is Ok(entry) then out.push(entry)
+    out
+
+/** The `as:` conversion of a handle class by which a prototype's parameter written `text` takes its
+ * handle: the entry whose type it is, or that type `const`-qualified. */
+c_as_position(d: &ClassDecl, text: string) -> Option[usize]
+    val entries = c_class_as(d)
+    for j in 0..<entries.len()
+        if c_names_handle(text, entries[j].ty, false) then return Some(j)
+    None
+
+/** What a field accessor's `@c(field: …)` says: the C lvalue it reads or writes, a member path of the
+ * struct `self` points at, and the `bound:` of each index, in order. */
+struct CField
+    expr: string
+    bounds: Buf[string]
+
+/** The field accessor a method's `@c` makes, when it says `field:`. */
+c_field_of(f: &Function) -> Option[CField]
+    for a in f.annotations
+        if a.name != "c" then continue
+        for arg in a.args
+            if arg.name is Some(n) && n == "field"
+                if arg.value.kind is StringLit(text)
+                    var bounds: Buf[string] = buf()
+                    for b in c_binding_names(f, "bound")
+                        bounds.push(b)
+                    return Some(CField(text, bounds))
+    None
+
+/** The name of a field accessor's glue in the C unit, by the index of its symbol: `get` reads the
+ * field, `set` writes it, and `bound` with the index's position answers its bound. */
+c_field_glue(symbol: usize, part: string) -> string = s"avin_c_field_${part}_$symbol"
+
+/** The name the C unit gives the type of a field accessor's field. */
+c_field_type_name(symbol: usize) -> string = s"avin_c_field_type_$symbol"
+
 /** Whether a C binding's `@c` says the bare word `word`, `borrowed`. */
 c_binding_flag(f: &Function, word: string) -> bool
     for a in f.annotations

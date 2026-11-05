@@ -198,7 +198,13 @@ binding is **not** a shim: it is a direct call from the program's own code.
   `avin_c_keep_i`, which takes a C reference for a holder and one to each C reference the kept
   handle holds, given back in order after the holder's own `release`, so the collector's sweep order
   never frees a kept object first. A `kept:` name is the pointer of the first held reference of its
-  class. Later, the finalizer will run `forget` for each kept callback before `release`.
+  class. Each `as:` entry `j` is `avin_c_as_i_j`, answering the other pointer (null for null) after a
+  `_Static_assert` that its expression has the entry's type. A field accessor, by its symbol `n`,
+  names its field's type `avin_c_field_type_n` (`__typeof__` of the field with its indices at zero,
+  checked to be the kind its Avin type needs, and measured as a result's type is), reads or writes
+  it through `avin_c_field_get_n` or `avin_c_field_set_n`, taking each index as a `long long`, and
+  answers each index's bound through `avin_c_field_bound<j>_n`, which lowering compares with the
+  index before the read, trapping unless `0 <= index < bound`. Later, the finalizer will run `forget` for each kept callback before `release`.
 - **Callbacks.** For each C function type a callback parameter has, lowering makes one trampoline
   with C's convention. It reads the `userdata` as the runtime's callback record (`callback_pin` when
   the binding is called, unpinned at return or when the keeping handle is released), calls

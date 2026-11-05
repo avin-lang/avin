@@ -6956,6 +6956,12 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
         if f.type_params.len() > 0
             c.note(unit, f.name_span, "a C binding is not generic: the C function has one signature")
             continue
+        var field = false
+        for arg in a.args
+            if arg.name is Some(n) && n == "field" then field = true
+        if field
+            check_c_field(c, unit, f, a, params, result, receiver_class)
+            continue
         var text: Option[string] = None
         if a.args.len() >= 1 && a.args[0].name is None
             if a.args[0].value.kind is StringLit(t) then text = Some(t)
@@ -7027,8 +7033,8 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
             val wanted = parse_c_type(own) match
                 Ok(t) -> t.text
                 Err(_) -> ""
-            if wanted != "" && !c_names_handle(p.params[0].text, wanted, false)
-                c.note(unit, a.args[0].value.span, s"the receiver `self` of `${f.name}` is a `${c.classes[k].name}`, whose C type is `$own`, and the prototype says `${p.params[0].text}`")
+            if wanted != "" && !c_names_handle(p.params[0].text, wanted, false) && c_as_position(c.classes[k].decl, p.params[0].text) is None
+                c.note(unit, a.args[0].value.span, s"the receiver `self` of `${f.name}` is a `${c.classes[k].name}`, whose C type is `$own`" + c_as_list(c.classes[k].decl, false) + s", and the prototype says `${p.params[0].text}`")
                 continue
         if p.params.len() != params.len() + first
             c.note(unit, f.name_span, s"the C binding `${f.name}` has ${count(params.len(), "parameter")} and its prototype ${count(p.params.len() - first, "parameter")}" + (if first == 1 then " after `self`" else "") + ": they correspond by position")
@@ -7078,6 +7084,114 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                 c.note(unit, at, s"`free:` names the C function that frees a string the binding answers, and `${f.name}` answers no string: its result is `${p.result_text}` in C")
         check_c_ownership(c, unit, f, a, params, receiver_class, made, borrowed, keeps, consumes)
 
+// A field accessor is a method of a C handle bound with `@c(field: "<lvalue>")`, a member path of the
+// struct `self` points at. One answering `unit` writes the field, and takes the value as its last
+// parameter, a scalar; any other reads it, as a scalar, a string or a lent handle of a class that
+// declares `retain`. Every other parameter is an index the field names, an integer, each with a
+// `bound:`, a C expression in `self`. The field's C type is the header's, checked by the C unit.
+private check_c_field(c: *Checker, unit: usize, f: &Function, a: Annotation, params: Buf[&Type], result: Option[&Type], receiver_class: Option[usize])
+    if receiver_class is None
+        c.note(unit, a.span, s"`field:` binds a field accessor, a method of a C handle reading or writing a field of the struct it points at, and `${f.name}` is not a method of one")
+        return
+    var expr = ""
+    var given: Buf[string] = buf()
+    var bound_count = 0usize
+    for arg in a.args
+        val n = arg.name match
+            Some(n) -> n
+            None ->
+                if arg.value.kind is StringLit(_) then c.note(unit, arg.value.span, "a field accessor names its field with `field:` and has no prototype: the field's type is the header's")
+                elif arg.value.kind is Name(word) then c.note(unit, arg.value.span, s"`$word` is not a word of a field accessor, which takes `field:` and `bound:`; a handle it reads is always lent, and takes a reference of its own")
+                else c.note(unit, arg.value.span, "a field accessor takes `field:` and `bound:`")
+                continue
+        if n != "field" && n != "bound"
+            c.note(unit, arg.value.span, s"`$n:` is not a word of a field accessor, which takes `field:` and `bound:`")
+            continue
+        if contains_name(given, n)
+            c.note(unit, arg.value.span, s"`$n:` is given once" + (if n == "bound" then "; it takes a list, one bound for each index, as in `bound: [\"self->rows\", \"self->columns\"]`" else ""))
+            continue
+        given.push(n)
+        if n == "field"
+            arg.value.kind match
+                StringLit(t) ->
+                    if t.trim() == "" then c.note(unit, arg.value.span, "`field:` names the field, a C lvalue in the struct `self` points at, as in `field: \"width\"`") else expr = t
+                _ -> c.note(unit, arg.value.span, "`field:` takes the field as a string, a C lvalue in the struct `self` points at, as in `field: \"width\"`")
+            continue
+        var well_formed = true
+        arg.value.kind match
+            StringLit(t) ->
+                bound_count = 1
+                if t.trim() == "" then well_formed = false
+            ListLit(items) ->
+                bound_count = items.len()
+                for item in items
+                    if item.kind is StringLit(t)
+                        if t.trim() == "" then well_formed = false
+                    else well_formed = false
+                if items.len() == 0 then well_formed = false
+            _ -> well_formed = false
+        if !well_formed then c.note(unit, arg.value.span, "`bound:` is a C expression in `self` bounding an index, or a list of them, one for each index, as strings")
+    if expr == "" then return
+    val r = result.unwrap_or(Unit)
+    val writer = *r is Unit
+    if writer && params.len() == 0
+        c.note(unit, f.name_span, s"the field accessor `${f.name}` answers `unit`, so it writes its field, and takes the value written as its last parameter")
+        return
+    val indices = if writer then params.len() - 1 else params.len()
+    for i in 0..<params.len()
+        val decl = f.params[i]
+        val t = params[i]
+        if decl.by_name
+            c.note(unit, decl.pattern.span, "a by-name parameter cannot cross a C binding")
+            continue
+        if decl.variadic
+            c.note(unit, decl.pattern.span, "a repeated parameter cannot cross a C binding")
+            continue
+        if *t is ErrorType then continue
+        val name = decl.pattern.kind match
+            Name(n) -> n
+            _ -> "_"
+        if i < indices
+            if !(*t is Int(_))
+                c.note(unit, decl.ty.span, s"`$name` is an index of the field accessor `${f.name}`, so it is an integer type, and it is `${type_name(t)}`")
+                continue
+            if !c_uses_name(expr, name)
+                c.note(unit, decl.pattern.span, s"`$name` is not used by the field `$expr` of `${f.name}`: every parameter of a field accessor but the value written is an index the field names")
+            continue
+        val scalar = *t match
+            Int(_) -> true
+            Byte -> true
+            Bool -> true
+            Real -> true
+            _ -> false
+        if !scalar then c.note(unit, decl.ty.span, s"the field accessor `${f.name}` writes `${type_name(t)}`, and a field is written as an integer type, `byte`, `bool` or `real`; a string or handle field is only read")
+    if indices > 0 && bound_count == 0
+        c.note(unit, a.span, s"the field accessor `${f.name}` takes ${index_count(indices)} and no `bound:`: name the C expression in `self` that bounds each, which the index is checked against before C reads anything")
+    elif bound_count > 0 && indices == 0
+        c.note(unit, a.span, s"`bound:` bounds an index, and the field accessor `${f.name}` takes none")
+    elif bound_count != indices
+        c.note(unit, a.span, s"the field accessor `${f.name}` takes ${index_count(indices)} and `bound:` gives ${count(bound_count, "bound")}: one for each, in order")
+    if writer || *r is ErrorType then return
+    val at = if f.result is Some(t) then t.span else f.name_span
+    if c_handle_form(r, c.data, c.classes) is Some(h)
+        val d = c.classes[h.class_index].decl
+        val name = c.classes[h.class_index].name
+        if c_class_text(d, "retain") is None
+            c.note(unit, at, s"the field accessor `${f.name}` reads a `$name`, and `$name` declares no `retain`: a handle read from a field is lent, and kept only by a reference of its own")
+        elif c_class_kept(d) is Some(_)
+            c.note(unit, at, s"`$name` names what it keeps with `kept:`, so only a binding keeping one makes it, and the field accessor `${f.name}` keeps nothing")
+        return
+    if !(c_text_form(r, c.data, c.classes) is NoText) then return
+    val scalar = *r match
+        Int(_) -> true
+        Byte -> true
+        Bool -> true
+        Real -> true
+        _ -> false
+    if !scalar then c.note(unit, at, s"the field accessor `${f.name}` answers `${type_name(r)}`, and a field is read as an integer type, `byte`, `bool`, `real`, a string or a handle")
+
+private index_count(n: usize) -> string = if n == 1 then "1 index" else s"$n indices"
+
 // What is wrong with a handle of class `k` at a C position written `text`, or "": the position names
 // the class's own C type.
 private c_handle_problem(c: *Checker, k: usize, text: string, result: bool) -> string
@@ -7085,7 +7199,21 @@ private c_handle_problem(c: *Checker, k: usize, text: string, result: bool) -> s
     val wanted = parse_c_type(own) match
         Ok(t) -> t.text
         Err(_) -> return ""
-    if c_names_handle(text, wanted, result) then "" else s"a `${c.classes[k].name}` crosses as its C type, `$own`"
+    if c_names_handle(text, wanted, result) then return ""
+    val d = c.classes[k].decl
+    if !result && c_as_position(d, text) is Some(_) then return ""
+    s"a `${c.classes[k].name}` crosses as its C type, `$own`" + c_as_list(d, result)
+
+// The `as:` types a handle may also be passed as, for a diagnostic: none for a result, which answers
+// exactly the class's own type.
+private c_as_list(d: &ClassDecl, result: bool) -> string
+    val entries = c_class_as(d)
+    if entries.len() == 0 then return ""
+    if result then return ", which is the only type a result answers it as; its `as:` types are only passed"
+    var names = ""
+    for j in 0..<entries.len()
+        names = names + (if j == 0 then "" elif j + 1 == entries.len() then " or " else ", ") + s"`${entries[j].ty}`"
+    s", or as one of its `as:` types, $names"
 
 // What a C binding says of the references it is passed and answers: `borrowed` needs a handle
 // answered whose class can take a reference of its own; `keeps:` and `consumes:` name handle
@@ -7377,16 +7505,19 @@ private check_c_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
                     elif arg.value.kind is StringLit(_) then c.note(unit, arg.value.span, "`@c` on a class names the C pointer type it is a handle on with `type:`, as in `@c(type: \"cairo_t *\", release: \"cairo_destroy\")`")
                     else c.note(unit, arg.value.span, "`shared` is the one word `@c` on a class takes without a key")
                     continue
-            if key == "as" || key == "attach" || key == "key" || key == "forget" || key == "value"
+            if key == "attach" || key == "key" || key == "forget" || key == "value"
                 c.note(unit, arg.value.span, s"`$key:` on a C handle is not implemented")
                 continue
-            if key != "type" && key != "release" && key != "retain" && key != "kept"
-                c.note(unit, arg.value.span, s"`$key:` is not a word of `@c` on a class, which takes `type:`, `release:`, `retain:`, `kept:` and `shared`")
+            if key != "type" && key != "release" && key != "retain" && key != "kept" && key != "as"
+                c.note(unit, arg.value.span, s"`$key:` is not a word of `@c` on a class, which takes `type:`, `release:`, `retain:`, `kept:`, `as:` and `shared`")
                 continue
             if contains_name(seen, key)
                 c.note(unit, arg.value.span, s"`$key:` is given once")
                 continue
             seen.push(key)
+            if key == "as"
+                check_c_as(c, unit, d, arg.value)
+                continue
             val text = arg.value.kind match
                 StringLit(t) -> t
                 _ ->
@@ -7431,6 +7562,44 @@ private check_c_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
                 elif bodyless && !has_annotation(f, "c") then c.note(unit, f.name_span, s"`${f.name}` has no body, so it is a C binding, and names its C function with `@c(\"<prototype>\")`")
                 for a in f.annotations
                     if a.name != "c" then c.note(unit, a.span, s"unknown annotation `@${a.name}` on a method of a C handle")
+
+// A handle's `as:` lists the other C types it may be passed as, each `"type = function"` or
+// `"type = expression in self"`, as one string or a list; each type once, and none the handle's own.
+private check_c_as(c: *Checker, unit: usize, d: &ClassDecl, value: &Expr)
+    var items: Buf[&Expr] = buf()
+    value.kind match
+        StringLit(_) -> items.push(value)
+        ListLit(xs) ->
+            for x in xs
+                items.push(x)
+            if xs.len() == 0 then c.note(unit, value.span, "`as:` names the other C types the handle is passed as, and this list is empty")
+        _ ->
+            c.note(unit, value.span, "`as:` takes a list of strings, each a C type, `=` and the function or expression that makes one, as in `as: [\"mlt_service = mlt_playlist_service(self)\"]`")
+            return
+    val own = c_handle_type(d) match
+        Some(t) -> parse_c_type(t) match
+            Ok(t) -> t.text
+            Err(_) -> ""
+        None -> ""
+    var types: Buf[string] = buf()
+    for x in items
+        val text = x.kind match
+            StringLit(t) -> t
+            _ ->
+                c.note(unit, x.span, "an `as:` entry is a string, a C type, `=` and the function or expression that makes one")
+                continue
+        val entry = c_as_entry(text) match
+            Ok(e) -> e
+            Err(why) ->
+                c.note(unit, x.span, s"an `as:` entry is a C type, `=` and a function of the handle's pointer or an expression in `self`, as in `\"mlt_service = mlt_playlist_service(self)\"`, and `$text` is not one: $why")
+                continue
+        if entry.ty == own
+            c.note(unit, x.span, s"`${entry.ty}` is the handle's own C type, which it is passed as without a conversion")
+            continue
+        if contains_name(types, entry.ty)
+            c.note(unit, x.span, s"`as:` converts to `${entry.ty}` twice: a handle is passed as each type one way")
+            continue
+        types.push(entry.ty)
 
 /** Whether a class is a handle: on a Sysl type, or on a C pointer. */
 is_handle_class(d: &ClassDecl) -> bool = handle_target(d) is Some(_) || c_handle_type(d) is Some(_)

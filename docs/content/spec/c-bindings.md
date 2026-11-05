@@ -444,6 +444,29 @@ A handle is passed where a prototype names one of its `as` types, receiver or pa
 that conversion; the conversion lends, and the handle stays the owner. A method whose receiver's C
 type is neither the handle's type nor an `as` type is refused at the method.
 
+- **An entry is a C pointer type, `=`, and a C function of the handle's pointer or an expression in
+  `self`**, as `release:` is: `"mlt_service = mlt_playlist_service"` calls the function with the
+  handle's pointer. `as:` is one string or a list; each type is named once, and never the class's
+  own. The C unit compiles each into glue and checks that what the expression makes **is** the
+  entry's type, so a conversion to the wrong type is refused at the class rather than passing C the
+  wrong pointer:
+
+  ```text
+  error: the `as:` conversion of the C handle `Derived` to `fxf_middle` makes another type: `&self->middle.base` is not a `fxf_middle` in its headers
+  ```
+
+- **The conversion is made at the call, after the closed and owner checks**, from the handle's own
+  pointer: a closed handle stops the program at the call whichever type it is passed as, and `None`
+  passes null with no conversion made. A parameter takes an `as` type `const`-qualified as it takes
+  the class's own.
+- **What a binding keeps or takes is the handle**, not the converted pointer: `keeps:` of a handle
+  passed as an `as` type holds it by its class's own `retain`, and `consumes:` closes it
+  ([proposed](/spec/decisions/#proposed)).
+- **A result answers only the class's own type**: a pointer C answers as another type is a handle of
+  the class on that type.
+- **The glue is the declaring package's**, so another package's bindings pass the handle through it
+  as they pass it as its own type.
+
 ### Field accessors
 
 A handle on a struct whose layout the header publishes reads and writes its fields through methods
@@ -461,6 +484,32 @@ class Profile
 
 The field's C type is the header's, so its conversion is the [scalar](#scalars) one for that type; a
 field that is a pointer is read as a string or a borrowed handle by the same rules as a result.
+
+- **The field is a member path of the struct `self` points at**, `"width"`, `"origin.x"`,
+  `"glyph->bitmap.rows"`, read as `self->` followed by it. The handle's type must point at a struct
+  the headers define; one they only declare is refused when the C unit compiles the accessor.
+- **A field is read as an integer type, `byte`, `bool`, `real`, a string or a handle.** The C unit
+  checks the field is the kind its Avin type needs (an integer or enumeration, one byte wide for
+  `byte`, a `bool` or an integer for `bool`, a floating-point type for `real`, `char *` or
+  `const char *` for a string, and the class's own C type for a handle) and measures its width and
+  sign, so an integer the Avin type cannot hold stops the program at the read, as a result does. A
+  null string is `None` for an `Option[string]` and stops the program otherwise; a string is copied
+  and checked as UTF-8, and never freed, since the struct owns it.
+- **A handle read from a field is lent**, as a `borrowed` result is: it takes a reference of its own
+  through its class's `retain`, so the class must declare one, and a class with `kept:` cannot be
+  read, since the accessor keeps nothing. `borrowed` is not written.
+- **A writer answers `unit`, and its last parameter is the value**, written as an argument of the
+  field's type is converted: a value the field cannot hold stops the program at the call. Only a
+  scalar is written: a string or a handle stored into a struct would leave C holding memory or a
+  reference no one gives back, so those fields are read only ([proposed](/spec/decisions/#proposed)).
+  A `const` field, an array, or anything else C cannot assign is refused at the accessor.
+- **Every other parameter is an index**, an `int` or a `long` the field names, passed to C as a
+  `long long`. `bound:` gives each one's bound in order, one string for one index or a list for more
+  (`bound: ["self->rows", "self->columns"]`), each a C expression in `self` and the indices.
+  An index the field does not name, a `bound:` on an accessor with no index, and a count of bounds
+  that is not the count of indices are refused.
+- **The accessor checks its receiver as any method does**: it stops the program on a closed handle,
+  or one another thread owns, before anything is read.
 
 **A field may be an expression**: a C lvalue in `self` and the accessor's parameters, reaching through
 the struct to an array it points at, and a union's members. An integer parameter used as an index is
