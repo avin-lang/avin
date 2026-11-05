@@ -9211,7 +9211,18 @@ private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], 
             if chosen is Some(v)
                 if c.data[v.data].variants[v.index].fields.len() == 0
                     return construct(c, e.span, target.span, v, buf(), Some(types), expected)
+                return variant_needs_call(c, e.span, name)
             elif is_variant then return TExpr(e.span, ErrorType, UnitConst)
+    if target.kind is Member(inner, name)
+        // A variant reached through its type with the type arguments on the variant, `T.V[A]`.
+        if variant_use(c, target.span, inner, name) is Some((found, on_type))
+            val v = found match
+                Some(v) -> v
+                None -> return TExpr(e.span, ErrorType, UnitConst)
+            if on_type is Some(_)
+                c.note(unit_of(c), target.span, "a variant's type arguments are written once, on its type or on the variant")
+                return TExpr(e.span, ErrorType, UnitConst)
+            return qualified_variant_value(c, e.span, Some(v), Some(types), expected)
     // A method named without a call, with its own type arguments, as in `box.convert[int]`.
     if target.kind is Member(inner, name)
         val object = check_expr(c, inner, None)
@@ -9818,6 +9829,12 @@ private qualified_variant_value(c: *Checker, at: Span, found: Option[VariantRef]
     if c.data[v.data].variants[v.index].fields.len() == 0 then return construct(c, at, at, v, buf(), explicit, expected)
     val written = c.data[v.data].name + "." + c.data[v.data].variants[v.index].name
     c.note(unit_of(c), at, s"`$written` has fields; call it, as in `$written(…)`")
+    TExpr(at, ErrorType, UnitConst)
+
+// A variant with fields named with type arguments and not called, as in `Some[int]`: reported, since
+// a variant with fields is not a value.
+private variant_needs_call(c: *Checker, at: Span, name: string) -> &TExpr
+    c.note(unit_of(c), at, s"`$name` has fields; call it, as in `$name(…)`")
     TExpr(at, ErrorType, UnitConst)
 
 // `T.V(args)`: the variant made from the arguments. Type arguments are written once, on the type,
@@ -13816,14 +13833,14 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     var type_args: Buf[&Type] = buf()
     for i in 0..<type_params.len()
         type_args.push(if i < known.len() then known[i] else fresh_var(c))
-    // Written type arguments may be a leading prefix, with the rest inferred.
+    // Written type arguments may be a leading prefix, with the rest inferred. Too many are reported,
+    // and the ones that fit are still taken, so the count is the only error the call reports.
     if explicit is Some(types)
         val unknown = type_params.len() - known.len()
-        if types.len() > unknown
-            c.note(unit, name_span, s"`$name` takes ${count(unknown, "type argument")}, not ${types.len()}")
-        else
-            for i in 0..<types.len()
-                unify(c, type_args[known.len() + i], resolve_type(c, unit, types[i]))
+        if types.len() > unknown then c.note(unit, name_span, s"`$name` takes ${count(unknown, "type argument")}, not ${types.len()}")
+        val fitting = if types.len() > unknown then unknown else types.len()
+        for i in 0..<fitting
+            unify(c, type_args[known.len() + i], resolve_type(c, unit, types[i]))
     val wanted = substitute_all(params, owner, type_args)
     val declared = substitute(result, owner, type_args)
     // The expected type decides a type argument only where it admits that argument's lower bound: a

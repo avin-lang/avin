@@ -3558,6 +3558,19 @@ spelling is better, as each entry says.
 
 ## Proposed
 
+- **A variant pattern writes no type arguments** (branch `qualified-variant-targs`). In an
+  expression a generic type's variant takes its type arguments on the type, `Heap[int].Leaf`, or on
+  the variant, `Heap.Leaf[int]` and `Heap.Node[int](…)` (settled by the declarations chapter's
+  `Option.Some[long](9)`; only the fieldless form had been missing, and is now built). In a pattern
+  neither form is written: `case Heap.Leaf[int]`, `case Heap[int].Node(…)` and `case Some[int](x)`
+  are reported, *"a pattern takes its type arguments from the value it matches; write `Heap.Leaf`"*.
+  Why: the scrutinee's type already decides them, so a written list could only repeat it or be an
+  error, and a test of the instance is a type pattern's job (`x: Box[int]`). Alternatives weighed:
+  accepting both spellings in patterns with the arguments required to equal the scrutinee's (more
+  symmetric with expressions, but adds a rule that only restates the type); accepting them and
+  ignoring them (silently wrong where they differ). Revisit if a pattern on an `Any` scrutinee
+  should match a variant at one instance, which would give written arguments a meaning.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

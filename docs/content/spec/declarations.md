@@ -470,7 +470,9 @@ A variant is also reached through its type, `Type.Variant`: `Shape.Circle(1.0)`,
 and in patterns `case Shape.Circle(r)`. The qualified name is the same constructor as the bare one,
 so the two forms mix freely in one expression or one `match`, and a `match` over both is checked for
 coverage as one over either. A generic type's arguments are inferred as for the bare name, or written
-once, on the type (`Option[int].None`) or on the variant (`Option.Some[long](9)`). Another module's
+once, on the type (`Option[int].None`) or on the variant (`Option.None[int]`,
+`Option.Some[long](9)`), all of them or a leading prefix with the rest inferred. A pattern writes
+none, `case Option.Some(x)`: the value matched decides them. Another module's
 type is reached through the module, `palette.Color.Red`, or by its own name where it is imported,
 `Color.Red`, and only where the type is public. A local, a parameter or a member named like the type
 hides it, so `Color.Red` is then that value's member. `Type.Name`, with `Name` capitalized and
