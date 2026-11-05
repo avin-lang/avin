@@ -528,6 +528,9 @@ struct Checker
     /** Types held to `Sendable` before the type of a field they hold was known, held to it again once
      * every body is checked. */
     late_sendables: Buf[LateSendable]
+    /** The inference variables of the call whose arguments are being checked that a lambda passed for
+     * them decides as a `@sendable` function: see `sendable_lambda_args`. */
+    sendable_args: Buf[usize]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -770,7 +773,7 @@ private check_imports(c: *Checker, unit: usize)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -5803,6 +5806,7 @@ private structural_sendability(f: Conformances, x: &Type, k: usize, a: SendAssum
                 if fld.mutable
                     if library && !top then return CannotSend("it is mutable, and not made to be shared between threads")
                     return CannotSend(s"its field `${fld.name}` is a `var`; make it a `val`")
+                if marked_sendable_field(f.classes, fld) then continue
                 val t = fld.ty match
                     Some(t) -> substitute(t, class_owner(id), args)
                     None ->
@@ -5816,6 +5820,20 @@ private structural_sendability(f: Conformances, x: &Type, k: usize, a: SendAssum
                     CanSend -> ()
         _ -> ()
     if undecided then NotYetKnown else CanSend
+
+/** Whether `fld` is a class's `val` parameter marked `@sendable`: what each constructor call passes
+ * for it is checked to be sendable, and nothing assigns it afterwards, so its value is sendable
+ * whatever its type. */
+private marked_sendable_field(classes: Buf[ClassSymbol], fld: FieldSymbol) -> bool
+    if !fld.param || fld.mutable || fld.owner >= classes.len() then return false
+    val o = classes[fld.owner]
+    for j in 0..<o.decl.params.len()
+        val at = o.inherited + j
+        if at < o.fields.len() && o.fields[at].name == fld.name
+            for a in o.decl.params[j].param.annotations
+                if a.name == "sendable" then return true
+            return false
+    false
 
 /** A type in a diagnostic, after an article: a `Buffer[byte]`, an `int`. */
 private quoted_type(t: &Type) -> string
@@ -5989,6 +6007,41 @@ private sendable_arguments(c: *Checker, id: usize, root: usize, f: usize, args: 
         if mark == SendableMark && made_sendable(c, root, held_value(args[i], held)) then continue
         if first_send_problem(c, root, args[i], mark, k, held) is Some(why)
             c.note(c.symbols[id].unit, args[i].span, s"what is passed for `${c.symbols[f].param_names[i]}` of `${c.symbols[f].name}` may use only sendable values from around it, but $why")
+            continue
+        if mark == SendableMark && i < c.symbols[f].params.len() && !holds_function(c.symbols[f].params[i])
+            if unsent_value(c, root, held_value(args[i], held), k) is Some(why)
+                c.note(c.symbols[id].unit, args[i].span, s"what is passed for `${c.symbols[f].param_names[i]}` of `${c.symbols[f].name}` is sendable inside it, so it is a `match` function written in place, a value of a sendable type or a parameter marked `@sendable`, but $why")
+
+// A `@sendable` parameter that does not take a function is sendable inside its function, so what is
+// passed for it is itself sendable: a value of a sendable type, a parameter so marked, or a `match`
+// function written in place, whose arms are checked as a lambda's body is. Why `arg` is none of them.
+private unsent_value(c: *Checker, root: usize, arg: &TExpr, k: usize) -> Option[string]
+    val ty = zonk(c, arg.ty)
+    val why = sendability(conformances(c), ty, k) match
+        CannotSend(w) -> w
+        _ -> return None
+    if arg.kind is Param(j)
+        if param_mark(c, root, j) == SendableMark then return None
+    if arg.kind is Field(object, index)
+        if *zonk(c, object.ty) is Class(id, _, _)
+            if index < c.classes[id].fields.len() && marked_sendable_field(c.classes, c.classes[id].fields[index]) then return None
+    if is_match_function_literal(c, arg) then return None
+    Some(s"it is ${quoted_type(ty)}, ${nested_reason(why)}")
+
+/** Whether `e` is a `match` function made where a `PartialFunction` is expected: the core library's
+ * `MatchPartialFunction` of two lambdas, whose captures and module-level reach are checked as any
+ * closure's are. */
+private is_match_function_literal(c: *Checker, e: &TExpr) -> bool
+    val ids = c.scope.get(qualified(CoreModule, "MatchPartialFunction")) match
+        Some(ids) -> ids
+        None -> return false
+    e.kind match
+        Call(f, args, _) ->
+            if !contains_index(ids, f) || args.len() != 2 then return false
+            for a in args
+                if !(a.kind is FunctionValue(_, _)) then return false
+            true
+        _ -> false
 
 // The first use from around `e` that `mark` does not allow.
 private first_send_problem(c: *Checker, root: usize, e: &TExpr, mark: int, k: usize, held: *Buf[HeldArgument]) -> Option[string]
@@ -6010,6 +6063,9 @@ private send_use_problem(c: *Checker, root: usize, u: SendUse, mark: int, k: usi
         if u.index >= r.params.len() then return None
         name = r.param_names[u.index]
         t = r.params[u.index]
+        // What is passed for a `@sendable` parameter was checked to be sendable where it was passed,
+        // whatever the parameter's type.
+        if param_mark(c, root, u.index) == SendableMark then return None
         if param_mark(c, root, u.index) >= mark && holds_function(t) then return None
     else
         val locals = c.locals[root]
@@ -6022,6 +6078,7 @@ private send_use_problem(c: *Checker, root: usize, u: SendUse, mark: int, k: usi
     sendability(conformances(c), ty, k) match
         CannotSend(why) ->
             if holds_function(ty) && u.param then return Some(s"it uses `$name`, ${quoted_type(ty)}, ${nested_reason(why)}; mark the parameter `${mark_name(mark)}`, and what is passed for it is checked in turn")
+            if u.param && why.starts_with("it is a trait") then return Some(s"it uses `$name`, ${quoted_type(ty)}, ${nested_reason(why)}; or mark the parameter `@sendable`, and what is passed for it is checked in turn")
             Some(s"it uses `$name`, ${quoted_type(ty)}, ${nested_reason(why)}")
         _ -> None
 
@@ -12991,20 +13048,39 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     // The expected type decides a type argument only where it admits that argument's lower bound: a
     // `getOrElse[W >: V]` of `string` values passed where a `Display` is expected takes `W` from its
     // bound, and its `string` result is then passed as a `Display` is.
+    var targets: Buf[Option[&Type]] = buf()
+    for j in 0..<binding.targets.len()
+        targets.push(argument_type(c, s, wanted, binding, args, j))
+    val sendable_args = sendable_lambda_args(c, owner, type_params, known.len(), type_args, args, targets)
     if expected is Some(want)
         val saved = save_vars(c)
         unify(c, declared, want)
         if !admits_lowers(c, owner, type_params, known.len(), type_args) then restore_vars(c, saved)
-    var targets: Buf[Option[&Type]] = buf()
-    for j in 0..<binding.targets.len()
-        targets.push(argument_type(c, s, wanted, binding, args, j))
+        // A lambda passed for a type argument bounded by `Sendable` makes a `@sendable` function, so
+        // the expected type's plain function type decides that argument as the `@sendable` one.
+        var made: Buf[&Type] = buf()
+        for v in sendable_args
+            val t = zonk(c, Var(v))
+            if *t is Function(_, _, false) then made.push(as_sendable(t)) else made.push(Var(v))
+        var changed = false
+        for t in made
+            if *t is Function(_, _, true) then changed = true
+        if changed
+            restore_vars(c, saved)
+            for i in 0..<made.len()
+                if *made[i] is Function(_, _, true) then unify(c, Var(sendable_args[i]), made[i])
+            val decided = save_vars(c)
+            if !unify(c, declared, want) || !admits_lowers(c, owner, type_params, known.len(), type_args) then restore_vars(c, decided)
     var open = open_type_args(c, type_args, known.len())
     constrain_lowers(c, owner, type_params, known.len(), type_args, &open)
     // Binding has placed, or reported, each spliced sequence, which is checked as the sequence it is.
     var passed_args: Buf[Argument] = buf()
     for a in args
         passed_args.push(Argument(a.span, a.name, argument_value(a), a.block))
+    val outer_sendable = c.sendable_args
+    c.sendable_args = sendable_args
     var typed = check_arguments(c, passed_args, targets, checked, &open)
+    c.sendable_args = outer_sendable
     // A type argument the arguments settled settles those its bounds name: `[S: Source[A], A]`
     // takes `A` from the source `S` is.
     for i in known.len()..<type_params.len()
@@ -13133,6 +13209,27 @@ private argument_type(c: *Checker, s: Signature, params: Buf[&Type], binding: Bi
     if !s.variadic || i + 1 != params.len() then return Some(params[i])
     val element = repeated_element(params[i])
     if args[j].value.kind is Splice(_) then Some(core_class_of(c, "Iterable", element)) else Some(element)
+
+/** The inference variables of a call's type arguments, from `from` on, that are bounded by `Sendable`
+ * and are the whole type of a parameter a lambda or a `match` function is passed for: such a one makes
+ * a `@sendable` function, checked as one where it is made. */
+private sendable_lambda_args(c: *Checker, owner: usize, type_params: Buf[TypeParam], from: usize, type_args: Buf[&Type], args: Buf[Argument], targets: Buf[Option[&Type]]) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    for i in from..<type_params.len()
+        val v = *type_args[i] match
+            Var(v) -> v
+            _ -> continue
+        if !(*zonk(c, type_args[i]) is Var(_)) then continue
+        var bounded = false
+        for b in bounds_at(c, owner, type_params, i)
+            if sendable_trait_of(c, b) is Some(_) then bounded = true
+        if !bounded then continue
+        for j in 0..<targets.len()
+            if j >= args.len() || !takes_parameter_type(argument_value(args[j])) then continue
+            if targets[j] is Some(t)
+                if *t is Var(w)
+                    if w == v && !contains_index(out, v) then out.push(v)
+    out
 
 /** The expression an argument passes: the sequence itself for one spliced with `xs*`. */
 private argument_value(a: Argument) -> &Expr = a.value.kind match
@@ -13669,6 +13766,15 @@ private call_argument(c: *Checker, arg: Argument, param: Option[&Type], open: *B
     if param is Some(p)
         val known = loosen(c, p, open, true)
         if !(*known is Var(_)) then wanted = Some(known)
+    // A lambda or a `match` function passed for a type argument bounded by `Sendable` is a `@sendable`
+    // function, checked as one where it is made.
+    var sendable = false
+    if param is Some(p)
+        if *p is Var(v)
+            sendable = contains_index(c.sendable_args, v) && takes_parameter_type(arg.value)
+    if sendable
+        if wanted is Some(w)
+            if *w is Function(_, _, false) then wanted = Some(as_sendable(w))
     if param is Some(p)
         if *zonk(c, p) is ByName(inner)
             // A delayed argument widens an open type argument as any other does: `getOrElse(k, dog)`
@@ -13697,7 +13803,10 @@ private call_argument(c: *Checker, arg: Argument, param: Option[&Type], open: *B
                 if !(*yields is Nothing) && !constrain(c, raw, yields, open, true)
                     c.note(unit, arg.value.span, mismatch(c, zonk(c, raw), yields))
             return delayed
-    val value = check_expr(c, arg.value, wanted)
+    var value = check_expr(c, arg.value, wanted)
+    if sendable && value.kind is FunctionValue(_, _)
+        val t = zonk(c, value.ty)
+        if *t is Function(_, _, false) then value = TExpr(value.span, as_sendable(t), value.kind)
     if param is Some(p)
         // An `Option[Nothing]` passed as an option whose argument is decided, as a lower bound
         // decides `B` in `orElse[B >: T]`, constrains nothing and converts as `none_as` does. It takes

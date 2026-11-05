@@ -2514,7 +2514,36 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- Proposed 2026-11-05 (built on branch `sendable-params`): **a `@sendable` parameter is sendable
+  inside its function, whatever its type** ([threads](/spec/threads/#what-is-shared)). Found by the
+  parsing library, whose combinators take a `@sendable f: PartialFunction[char, U]` and could neither
+  capture it in a `@sendable` lambda nor pass it on.
+  - Inside the function the parameter is sendable: a `@sendable` lambda captures it and it is passed
+    on for another `@sendable` parameter without a check. *Why*: what is passed for it was checked
+    where it was passed, as a function-typed parameter's already was.
+  - What is passed for one that does not take a function is itself sendable: a `match` function
+    written in place (the core library's `MatchPartialFunction` of two lambdas, checked by what the
+    arms capture and the module-level state they reach), a value of a sendable type, a parameter so
+    marked, or a class's marked `val` parameter. Any other value is refused, where before a fresh
+    object (`what it makes itself is its own`) passed. *Why*: the value is now shared by whatever the
+    function hands it to, so a fresh object with a `var` field would be shared between threads.
+  - The mark belongs to the parameter, not to its type (the sound minimum): a marked value copied
+    into a local, stored in a data field typed as the trait, combined (`f.orElse(g)`), or passed for
+    an unmarked parameter bounded by `Sendable`, is a value of the trait's type again, which is not
+    sendable. A class's `val` parameter marked `@sendable` is a field whose value is sendable, so it
+    leaves the class sendable by its structure; a `var` one does not. *Alternatives*: a
+    `@sendable` mark on trait types (`@sendable PartialFunction[A, B]`), which would carry the
+    property through locals and fields, or marked data fields; both are new type-system surface, and
+    can be added later without breaking what this allows. **Review with the user**: whether
+    `@sendable` should become a mark on trait types, as it is on function types.
+  - A lambda or a `match` function passed for a type argument bounded by `Sendable`
+    (`^^^[U: Sendable](value: U)`) is made as a `@sendable` function and checked as one where it is
+    made; where the expected type decides that argument as a plain function type, it is taken as its
+    `@sendable` form, which conforms to the plain one. *Why*: a plain function type is never
+    sendable, so the call could not succeed otherwise. *Alternative*: requiring the type written,
+    `^^^[@sendable (int, int) -> int](…)`, which is noisy for every operator parser. A `match`
+    function where a `PartialFunction` is expected is not changed by the bound: it is a
+    `PartialFunction`, which does not promise `Sendable`.
 
 ## Open
 

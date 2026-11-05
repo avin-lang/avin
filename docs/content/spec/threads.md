@@ -110,6 +110,31 @@ with the same mark or a weaker one; an unmarked one may not, and the error says 
 method that overrides or implements another marks no parameter more strongly than the method it
 overrides does, since a call through that method would not check what is passed.
 
+**A parameter marked `@sendable` is sendable inside its function, whatever its type**, since what
+is passed for it was checked where it was passed: a `@sendable` lambda captures it, and it is passed
+on for another `@sendable` parameter as it is. So what is passed for one that does not take a
+function is itself sendable: a [`match` function](/spec/operators-and-control-flow/#match-functions)
+written in place, whose arms are checked as a lambda's body is, by what they capture and the
+module-level state they reach; a value of a sendable type; or a parameter so marked. A class's `val`
+parameter so marked is a field whose value is sendable, so it leaves the class sendable by its
+structure; a `var` one does not, since it may be assigned anything later. The mark belongs to the
+parameter, not to its type: a marked value copied into a local, stored in a data field of the
+trait's type, or combined into another (`f.orElse(g)`) is a value of that type again.
+
+```avin
+data Rule[T](run: @sendable (char) -> Option[T])
+
+pick[U](@sendable f: PartialFunction[char, U]) -> Rule[U] = Rule(c -> if f.isDefinedAt(c) then Some(f(c)) else None)
+
+pickAgain[U](@sendable f: PartialFunction[char, U]) -> Rule[U] = pick(f)
+
+val digit: Rule[int] = pickAgain(match c if '0' <= c <= '9' -> int(c) - int('0'))
+```
+
+A lambda or a `match` function passed for a type argument bounded by `Sendable`, as
+`take[U: Sendable](value: U)` has, is made as a `@sendable` function and checked as one where it is
+made; a plain function type the expected type gives that argument is taken as its `@sendable` form.
+
 ```avin
 import avin.threads.spawn
 
