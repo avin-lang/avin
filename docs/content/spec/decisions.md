@@ -2380,6 +2380,8 @@ their words are reserved.
   `((a, b), c) -> …` (more general, but a second pattern syntax beside the `match` function, which
   already covers nested and refutable shapes).
 
+- Settled on the user's delegation 2026-11-05 (built on branch `iterable-size`): **every `Iterable` has `size()`, `knownSize()` and `sizeCompare(n)`** ([collections](/spec/collections/)), following the reference library: `size()` counts by iterating unless a collection overrides it with its own count, `knownSize()` is the count where it is known without iterating and -1 otherwise (a `List` other than `Nil`, an iterator, a view), and `sizeCompare(n)` answers -1, 0 or 1, reading at most `n` elements when the count is unknown. Sequences have `size()` and `length()`, equal. They are overridable trait members rather than `impl` methods, so a call through `Iterable[T]` reaches the collection's own count. Consequence: a class implementing `Iterable` that declares its own `size`, `knownSize` or `sizeCompare` must mark it `override`. Alternatives weighed: an arbitrary-sign `sizeCompare` (the reference library's contract, but -1/0/1 is what every caller tests); `length()` on every `Iterable` (left to sequences, whose length is their defining measure); `sizeIs` (needs special syntax). Review with the user: the `override` requirement on existing user classes.
+
 **Deferred**
 
 - Public C interoperability. Until then, C is reached through Sysl.
