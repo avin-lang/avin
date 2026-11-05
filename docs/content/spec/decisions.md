@@ -443,7 +443,8 @@ a decision changes, this page and the chapter change together.
   programmer's responsibility.
 - `==` between two values whose static types share no common type is a compile error. On `Any` and
   on trait-typed values `==` is decided at run time through the type's entries: values of different
-  run-time types are unequal. `===` stays defined only on reference types, and not on `Any`.
+  run-time types are unequal. `===` stays defined only on reference types; where it meets an `Any`,
+  a trait or a type parameter, see the identity entry settled on 2026-11-05.
 - Settled 2026-11-03: the operator traits are the core library's `Eq` (`equals(other: Self) ->
   bool`), `Hash` (`hash() -> long`), `Ord: Eq` (`compare(other: Self) -> int`, with `less`,
   `lessOrEqual`, `greater` and `greaterOrEqual` defaulting from it), and `Add`, `Sub`, `Mul`, `Div`,
@@ -1433,9 +1434,10 @@ Settled by the user on 2026-11-04:
     define**: postfix `!` and `!!` (no method is called postfix, and `!` is the language's), and
     anything spelled with `#` (not an operator character), so `#|` is `|`, and `#&&`, `#||`, `###`,
     `#>`, `#>>` and `#<` are words; `run()` is the status, where the reference's `run()` starts the
-    process, which here is `start()`. Bindings: `sysl.process.run`, `capture`, `start`, `spawn` and
-    `pipe`, with mirrors of `Status`, `Output` and `Var`. **Blocked on stage-7 opaque handles**:
-    `Stdio` carries a `sysl.fs.File`, and `Child` and `Spawned` are live processes.
+    process, which here is `start()`. Bindings: `sysl.process.spawn` and `pipe`, with a mirror of
+    `Stdio` holding a `sysl.fs.File` handle, `Spawned` a handle waited for `blocking`, `Status`
+    mirrored as `ExitStatus` itself, `Var`, `sysl.fs.create`, `append` and `open` for the
+    redirections, and `sysl.io.FdReader` for `lines()`, which answers bytes as they arrive.
   - **[`Source`](/spec/system-library/#source)** in `avin.io`: `fromFile` (read whole, every failure
     up front), `fromString`, `stdin()`, and `lines()`, `chars()` and `readAll()`, each consuming. The
     reference's `getLines` and `mkString` are `lines` and `readAll`, the names `avin.io` already uses.
@@ -1823,8 +1825,9 @@ their words are reserved.
     implementing either is held to it.
   - `Sendable` is only a bound and a promise; it is not the type of a value.
   - A `lazy val` field is sendable where its type is, since it is initialized by exactly one thread.
-    (That rests on the runtime initializing a `lazy val` once under contention; a test of two
-    threads forcing one `lazy val` at once pins it.)
+    (That rests on the runtime initializing a `lazy val` once under contention, which the tests
+    `lazy_threads`, `lazy_threads_many` and `sendable_lazy` pin: threads and futures reading one
+    first together, counting a single run of each initializer.)
 - Settled on the user's delegation 2026-11-05 (built on branch `mirror-handle-fields`): **a mirror
   holding a handle goes into Sysl wherever any mirror does** ([Sysl
   bindings](/spec/sysl-bindings/#mirrors)) — a parameter by itself, or inside an `Option`, a
@@ -1854,7 +1857,7 @@ their words are reserved.
     recursive call, as the reference language does, rather than accepting it silently.
   - **A function calling itself is made a loop; mutual recursion is left to general tail calls**,
     which need every caller and callee to agree on a calling convention and to unlink the
-    shadow-stack frame before the call, and are built on branch `tailcalls` with their own entry.
+    shadow-stack frame before the call, and have their own entry (below).
   - The language has no `try`, `defer` or `finally`, so there is no pending cleanup to take a call
     out of tail position; when such a construct is added, a call inside it is not in tail position.
 - Settled on the user's delegation 2026-11-05: **`Iterable`'s transformations**
@@ -1906,6 +1909,136 @@ their words are reserved.
   other conversions. Why: the chapter promised it for every value and only strings honoured it; cut
   once, no renderer can get it wrong. Alternative: every renderer reading the precision, which each
   collection and data type would have to implement.
+- Settled on the user's delegation 2026-11-05: **[Guaranteed tail calls](/spec/declarations/#tail-calls)**
+  (branch `tailcalls`). Every call in tail position of a function of the program, by name, through
+  a method table or of a function value, replaces the caller's stack frame, at `-O0` as at `-O2`,
+  so mutual recursion, state machines of functions and continuation passing run in constant stack.
+  A self-call is still a jump within the function, which is cheaper. `@tailrec` stays about
+  self-recursion.
+  - Every compiled function has LLVM's `tailcc` convention, and a tail call is `musttail call
+    tailcc` followed at once by its `ret`. The C convention is kept only where code outside the
+    program calls in: `main`, a C-convention wrapper for each function whose address a Sysl
+    binding's shim is given, and the closure runner the runtime calls to start a thread.
+  - Calls through method tables and of function values are tail calls too, since every address a
+    table, a type record or a closure holds is a function of the program with its convention. A call
+    the whole-program pass guards by the receiver's descriptor returns from each of its branches.
+  - The caller gives its shadow-stack frame back just before the call, as a return does. The
+    arguments are then roots of no frame until the callee links its own, its first act, and nothing
+    between the two allocates, polls or stores, so no collection can see the gap.
+  - A call stays an ordinary one where an argument may point into the caller's own stack (a local
+    function given the address of a local it captures), where the core library calls the program's
+    code (it restores the caller site after), where the result is converted, and in a class's
+    constructor, which publishes its object after its body. A lambda or local function value that
+    captures a local of its enclosing function is entered through an entry that keeps the local on
+    its own stack, so that entry's call adds one frame per call; capturing only parameters and values
+    adds none.
+  - **Only a function whose arguments all travel in registers has `tailcc`**: the context and at
+    most five integers, bools or references, at most eight reals, and no integer wider than `long`
+    as a parameter or the result. The rest keep the C convention and make and receive ordinary
+    calls. Under `tailcc` the callee pops the arguments passed on the stack, and LLVM's unoptimized
+    code generation reloads spilled values from the wrong place after such a call (seen as crashes
+    and wrong results at `-O0`); with every argument in a register there is nothing to pop. The
+    limits are those of the smallest target (x86-64: six integer registers, eight vector ones), so a
+    program's stack use is the same everywhere. **Review with the user**: a function with six or more
+    such parameters gets no tail call; lifting the limit means passing the extra arguments in a
+    block the caller's caller owns, or a fixed LLVM.
+  - Alternatives weighed: merging each group of mutually recursive functions into one function that
+    switches on which one is running (no convention change, but only for calls by name, and code
+    size grows with the group); a trampoline in the library (no compiler work, but every tail call
+    pays an allocation and an indirect return, and the program must be written for it).
+  - **Review with the user.** Error backtraces lose the frames a tail call replaced; the user may
+    prefer this only at -O2.
+
+- Settled on the user's delegation 2026-11-05 (built on branch `process-commands`): **How the parts of a command share its settings** ([commands](/spec/system-library/#commands)).
+  Proposed: a directory and variables set on a pipeline or a sequence are every part's, a part's own
+  directory replacing it and its own variables added after (a name set twice has the last value).
+  A time limit on a command made of parts bounds the whole, from when it starts: each program is
+  given what is left, a part not yet started when it runs out is `TimedOut` without being started,
+  and of two nested limits the earlier ends it. Output redirected on a pipeline is its last stage's
+  and input its first's; on a sequence the file is opened once and shared, so the parts write one
+  after the other and the second reads on where the first stopped. A part's own redirection replaces
+  the enclosing one, whose file is still opened (and so emptied by `toFile`), as a shell's is.
+  Why: each reads as a shell's `( … )` with the setting outside it, which is what a reader expects.
+  Alternatives: a limit given to each program afresh (a sequence of slow parts would never end), and
+  a file opened per part (each part of a sequence would empty what the one before wrote).
+- Settled on the user's delegation 2026-11-05 (built on branch `process-commands`): **Input given as text, and output captured, go through files** ([commands](/spec/system-library/#commands)).
+  Proposed: `withInput(text)` writes the text to a temporary file, opened and unlinked before the
+  program starts, and `output()` has the output written to a temporary file read once the command
+  has ended. Why: a pipe the program feeds or drains while it waits is a deadlock once either side
+  outgrows the pipe's buffer, and a file never fills. The alternative is pipes served by a thread.
+  `output()` decodes the bytes as `lines()` does, each ill-formed run replaced with U+FFFD, rather than
+  failing with `Io(InvalidUtf8)`; the alternative is the failure, which would lose the whole output
+  over one byte. **Review with the user**: the decoding.
+- Settled on the user's delegation 2026-11-05 (built on branch `process-commands`), with one change: **`kill()` and a started sequence** ([commands](/spec/system-library/#commands)).
+  Proposed: `Child.kill()` sends signal 15 to every program of the command still running and starts
+  no part not yet started; `waitFor()` then answers `Signalled(15)` for a program it stopped. A
+  started sequence starts its next part when `waitFor()` or `isAlive()` finds the part before it has
+  ended, on the code that started it, which owns the processes; `lines()` over a command holding a
+  sequence moves it on with a thread of its own, since its reader is waiting on the output. A
+  pipeline holding a sequence is polled, its processes asked without waiting at growing intervals up
+  to 16 ms, while a pipeline of programs alone is waited for without polling. Alternatives: signal 9,
+  which a program cannot clean up after, or `kill(signal: int = 15)`; every started command on a
+  thread of its own, whose processes the starting code could then not stop, since a handle belongs
+  to one thread. Settled: signal 15 as proposed. Changed: a started sequence must move on by itself, since a sequence that
+  stalls until its starter asks is a surprise; a thread of its own will own the processes and drive
+  the sequence, and the `Child` will ask it to wait or to kill through a channel, which keeps each
+  handle on one thread. Until that is built the sequence moves on only when asked, as described.
+  **Review with the user**: the signal.
+- Settled on the user's delegation 2026-11-05 (built on branch `core-followups`): **`==` and `!=` on
+  `Any` are decided at run time**, as [equality](/spec/equality-and-memory/#equality) says: values of
+  one type compare as that type does, by value or by identity, and values of different types, a
+  reference and a value among them, are unequal. The sentence in
+  [Any and Nothing](/spec/types/#any-and-nothing) saying an `Any` had no equality was stale and is
+  corrected. Rationale: every value has `==` and a hash, so any value can be a map key, a `Map[Any,
+  V]`'s among them, and the compiler already compared `Any`s through each value's own entries.
+  Alternative weighed: no `==` on `Any`, so that every comparison goes through a type pattern first,
+  which breaks "every value can be a key".
+- Settled on the user's delegation 2026-11-05 (built on branch `core-followups`): **`===` is defined
+  only where its answer is**: at least one side's static type is a reference type that cannot hold a
+  value type (a class, an `object`, an array, a buffer, a function type, or a type parameter bounded
+  by a class). The other side may be the same type, a sub- or superclass, a trait the class conforms
+  to, an `Any`, or a type parameter with no class bound; an `Any` or such a parameter is compared as
+  an `Any`, and a boxed value there is never the object, so the answer is `false`. Two sides that
+  may each hold a value type (traits, `Any`s, type parameters with no class bound) are an error,
+  "`===` is undefined on Shape and Shape, which may hold values with no identity; compare with `==`,
+  or give one side a class type"; so is a value type on either side. See
+  [identity](/spec/equality-and-memory/#identity). Rationale: a boxed or data value may be one
+  object or two at the compiler's choice, so trait-to-trait identity answered arbitrarily
+  (`f(Box(2), Box(2))` true and `f(3, 3)` false for `f(a: Shape, b: Shape) = a === b`), while a
+  class instance is never a boxed value, so mixed class and trait is well defined. Alternatives
+  weighed: rejecting any trait or `Any` operand, which needlessly breaks the library's
+  `elements === self` (a buffer, deque or set given itself as an `Iterable`); and keeping
+  trait-to-trait identity, which is unsound. A class with a trait it does not conform to is rejected
+  even when the class is open and a subclass might conform. **Review with the user**: whether an
+  open class and a trait it does not itself conform to should compare, since a subclass may be both.
+- Settled on the user's delegation 2026-11-05 (built on branch `core-followups`): **a tuple already
+  made converts to a wider tuple only where each part already is what the wider tuple holds**: a part
+  that is an object (a string, a `data` value, a tuple, an instance of a class) is its own `Any`, and
+  an instance of a subclass is one of its superclass, so `(string, int)` is a `(Any, int)`; a part
+  that would need a box (a number, a `bool`, a `char`) does not convert, so `(int, int)` is not a
+  `(Any, int)`. A tuple written out where the wider one is expected boxes its part there. See
+  [Any and Nothing](/spec/types/#any-and-nothing). Rationale: a conversion that changes no bits is
+  free, while a boxed part changes the tuple's layout and would mean copying the tuple behind a plain
+  assignment. Alternatives weighed: no conversion of a tuple once made (what the chapter said, and
+  needlessly strict for parts that already are objects); converting every part by copying, which
+  hides an allocation.
+- Settled on the user's delegation 2026-11-05 (built on branch `core-followups`): **two classes with
+  no common superclass that share several unrelated most specific traits do not join, and the error
+  names the traits**: "the branches of this `if` yield Duck and Goose, which share Swims and Flies but
+  no single most specific type; write the type you want", and the same ending for `match` arms,
+  clauses, collection and map literals and a loop's `break`s, as
+  [inference](/spec/generics/#inference) says. Rationale: the bare "yield Duck and Goose" did not
+  say why two classes that plainly share traits fail to agree. Alternative weighed: choosing the
+  first trait declared, which makes the type depend on declaration order.
+- Settled on the user's delegation 2026-11-05 (built on branch `core-followups`): **a tuple type
+  pattern tests the type the tuple was made with**, as [Any and Nothing](/spec/types/#any-and-nothing)
+  says, not the classes of its parts: `t: (Animal, int)` holding a `Dog` does not match
+  `_: (Dog, int)`, and a tuple made as a `(Dog, int)` does wherever it is held. Each part is tested
+  by a tuple pattern with a type pattern inside it, `(d: Dog, n)`, and
+  [type patterns](/spec/operators-and-control-flow/) no longer say a tuple is "taken down part by
+  part". Rationale: a tuple's run-time type is one type, fixed when it is made, so the test agrees
+  with the static type it was made at. Alternative weighed: testing part by part, which would make a
+  tuple's run-time type depend on what it holds rather than on how it was made.
 
 **Deferred**
 
@@ -1915,7 +2048,20 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- **A member call on the name of a data type whose variant of its own name has no fields**
+  (`Lone.m(…)` with `data Lone()`; branch `fix-lone-value`). The name is both the type and a value
+  of it. Proposed: where the type has a static member named `m`, the call is the type's and chooses
+  among its static members alone; otherwise it is the value's method, its trait methods and
+  impl-added methods included. A method value `Lone.m` follows the same order. Why: a static member
+  can only be reached through the type's name, while the value's method is always reachable through
+  a value, so giving the static the name loses nothing; and it keeps `Name.m(…)` with a static
+  member meaning what it means on every other type. Alternatives weighed: the value always wins
+  (makes a fieldless type's static members unreachable by name); choosing among the static members
+  and the value's methods together by parameter types (a call on a type name would then mix two
+  kinds of receiver in one overload set, which nothing else in the language does); refusing a
+  static member and a value method of one name on such a type (an extra rule for a rare case). The
+  companion object needs no rule: it cannot share the name of a fieldless variant
+  ([declarations](/spec/declarations/#object)).
 
 ## Open
 

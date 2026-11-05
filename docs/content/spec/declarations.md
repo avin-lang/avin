@@ -237,6 +237,9 @@ A clause may be guarded:
 - `f(patterns)` followed by an indented block of `| condition = body` lines tries each guard in
   order; `| _ = body` always holds and ends the block.
 - When the patterns match but every guard fails, the next clause is tried.
+- A `|` that starts a line continues the expression above it, so a second guard written on its own
+  line after a one-line guard is not a guard; it is reported, and the guards belong in the
+  indented block.
 
 A body after `=` is one expression on the same line or an indented block. Without a declared result
 type, the result is inferred from the clauses' bodies, which must agree; a recursive function
@@ -326,6 +329,45 @@ overridden, a trait's or a public method of an `open` or `abstract` class, since
 an override; and for a recursive call to give a generic function other type arguments, which calls
 another instance rather than looping. A function defined by clauses may be `@tailrec`, written before
 its signature.
+
+**Every other call in tail position replaces the caller's frame.** A call of another function, a
+method, a local function, a method through a trait or an open class, or a function value, made in tail
+position, does not keep the caller waiting on the stack: the callee runs in the caller's place and
+returns straight to the caller's caller. So functions that call each other, state machines written as
+functions, and continuation passing run in constant stack however deep they go, at every
+optimization level, with no annotation:
+
+```text
+isEven(n: long) -> bool = if n == 0 then true else isOdd(n - 1)
+isOdd(n: long) -> bool = n != 0 && isEven(n - 1)
+
+isEven(10000000)         // true, in constant stack
+
+sumTo(n: long, k: (long) -> long) -> long =
+    if n == 0 then k(0) else sumTo(n - 1, s -> k(s + n))
+
+sumTo(1000000, s -> s)   // 500000500000: a million continuations, each calling the next
+```
+
+A call in tail position keeps its frame in a few places, where something of the caller is still
+needed once the callee has started:
+
+- a call of a local function that is given the place of a local it captures, which lives in the
+  caller's frame;
+- a call into the program's code from the core library, which puts back the place a trap in the
+  library reports once the call returns;
+- a call in a class's body, which completes the object after the body;
+- a call of a function whose arguments do not all travel in registers: one with more than five
+  parameters that are integers, bools or references (a method's receiver and the values a local
+  function captures count), more than eight `real`s, or an integer wider than `long` among its
+  parameters or as its result; the call is made in its own frame, and so is a tail call such a
+  function makes;
+- a call of a lambda or local function value that captures a local of the function it is written in
+  (not only its parameters): the closure's entry holds the local where the code can reach it, so each
+  such call adds the entry's frame.
+
+A trap reports the place it happened as always, but the frames a tail call replaced are gone: a
+program stopped after a million tail calls was not a million calls deep.
 
 ## data
 
@@ -652,6 +694,11 @@ value: `Add`'s `zero` and `Mul`'s `one` are the identities of their operators.
   Through a bound each instance calls its type argument's own directly, an open class's included,
   since no object is involved. Calling one on a value is an error, and so is calling a value's method
   on a type. A local, a parameter, a member or a module value of the name hides the type.
+- **The name of a data type whose variant of its own name has no fields is also a value**, so
+  `Lone.hi()` of `data Lone()` calls the method `hi` of that value, as `val l = Lone; l.hi()` does,
+  and `Lone.hi` without a call is a function value bound to it. Where the type has a static member
+  of the name, `Lone.unit()`, the name is the type's and calls the static member; a value's method
+  of that name is then called on a value.
 - **In a trait a static member has no body**: a trait's default bodies are shared by every
   conforming type, and a static member is each type's own. `Self` in its signature is the
   implementing type, as in a method's. A trait never overrides a static member, and its default
@@ -1322,8 +1369,11 @@ test the core library or a dependency declares.
   field only where it could call a method, after its last field and not at all in an `open` or
   `abstract` class. A trap inside an initializer stops the program as any trap does.
 
-  The first read is safe between threads: when several threads read the value first at once, one
-  runs the initializer and the others wait for it, [safe for the collector](threads.md), then see
-  the whole value. A read after the value is stored is one atomic load and a branch.
+  The first read is safe between threads: when several threads read the value first at once,
+  exactly one runs the initializer and the others wait for it, [safe for the collector](threads.md),
+  then all see the same, whole value. A read after the value is stored is one atomic load and a
+  branch. A trap in the initializer stops the program while the others still wait, so none of them
+  goes on without the value. The read that traps as needing its own value is one made by the thread
+  running the initializer, whichever thread that is; a read by any other thread waits.
 - Local helper functions may call one another in any order, but a call that would read a captured
   local before its initialization is rejected.

@@ -205,7 +205,11 @@ data Tree[T]
 ```
 
 is rejected the same way, at the type: every data type compares, hashes and shows its values field
-by field, and each of those needs a copy for every depth.
+by field, and each of those needs a copy for every depth. The larger instance may sit inside another
+type, as `inner: Option[Tree[List[T]]]` does, or reach back through a second data type; the error
+names the cycle of types. A type naming itself at its own type arguments, however wrapped, as
+`rest: Option[Chain[T]]`, `kids: Vector[Rose[T]]` or a pair of types naming each other at `T`, is
+ordinary recursion: it compiles, and its derived and structural methods have one copy per instance.
 
 ## Subtyping
 
@@ -239,7 +243,9 @@ contravariant, plain `T` invariant. A function's or an `impl`'s type parameters 
   `List[Nothing]` is a `List[int]` too.
 - Tuple parts are covariant and function types take contravariant parameters and covariant
   results, on the same terms: `(Animal) -> int` is a `(Dog) -> int`, and `() -> string` is a
-  `() -> Any`, but `() -> int` is not.
+  `() -> Any`, but `() -> int` is not. A lambda may declare its parameter that wide where the
+  narrower function is expected, `dogs.map((a: Animal) -> a.name)`, and its body sees an `Animal`;
+  `(x: Any) -> …` where an `(int) -> …` is expected is still an error.
 - Where two branches yield instances of one generic type, they agree on the instance whose
   covariant arguments are their arguments' agreement: `if c then Some(dog) else Some(cat)` is an
   `Option[Animal]`.

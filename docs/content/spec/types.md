@@ -310,8 +310,12 @@ describe(42)        // the int is boxed where it becomes an Any
 
 A value converts to `Any` wherever one is expected of it, at a single site: an argument, a binding,
 an assignment, a field, a result, a part of a tuple written out, or each branch of an `if` or
-`match` expected to yield an `Any`. A tuple already made does not convert part by part:
-`(string, int)` is not a `(Any, int)`, since boxing never happens inside a container.
+`match` expected to yield an `Any`. A tuple already made converts only where each part already is
+what the wider tuple holds there: a part that is an object (a string, a `data` value, a tuple, an
+instance of a class) is its own `Any`, so a `(string, int)` is a `(Any, int)`, and so is a `(P, int)`
+for a data type `P`. A part that would need a box does not convert, since its layout differs and
+boxing never happens inside a value already made: an `(int, int)` is not an `(Any, int)`, nor is a
+`(bool, int)`. A tuple written out where the wider one is expected, `(n, 1)`, boxes its part there.
 
 How a value is boxed is the compiler's choice, and invisible except in cost. A string, a tuple and a
 `data` value are already objects whose header names their exact type, so they need no box; a
@@ -324,9 +328,12 @@ sites: `val shown: Vector[Display] = [1, "two", (3, 4)]`, `describe(d: Display)`
 recovers the value: `d match n: int -> …`. An overload taking the value's own type is more specific
 than one taking a trait it implements.
 
-An `Any` has no equality and no identity: `==`, `!=`, `===` and `!==` are not defined on it, since
-it may hold a value with neither. A type pattern recovers the value's type, and with it the
-comparisons that type has.
+`==` and `!=` on an `Any` are decided at run time by the values' own types: values of one type
+compare as that type does, by value or by identity, and values of different types are unequal (see
+[equality](/spec/equality-and-memory/#equality)). `===` and `!==` need a side whose type is a class,
+since an `Any` may hold a value with no identity: `x === obj` is defined, and `x === y` with both
+`Any`s is an error (see [identity](/spec/equality-and-memory/#identity)). A type pattern recovers the
+value's type, and with it the other comparisons that type has.
 
 `Nothing` is the bottom type: the type of `return`, `break`, `continue` and a call to a function that
 never returns. It is a subtype of every type, and an expression of type `Nothing` never produces a

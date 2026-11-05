@@ -52,9 +52,26 @@ when they apply.
 
 ## Identity
 
-`a === b` is reference identity. It is defined only on reference types: class instances, `object`s,
-arrays, buffers and closures. It is a compile error on a value type, because a value type has no
-identity to compare, and on `Any`, which may hold one.
+`a === b` is reference identity, and `!==` its negation. It is defined only where its answer is: at
+least one side's type must be a reference type that cannot hold a value type, that is a class (an
+`object`, an array and a buffer among them), a function type, or a type parameter bounded by a
+class. The other side may then be:
+
+- the same type, or a sub- or superclass of the class;
+- a trait the class conforms to: `elements === self`, with `elements: Iterable[T]`, asks whether a
+  buffer was given itself;
+- an `Any`, or a type parameter with no class bound.
+
+A value type on the other side, boxed as an `Any` or a trait's value, is never the object of a class,
+so the answer is `false` whatever the compiler did with the value: `x === obj` with `x: Any` holding
+`4` is `false`.
+
+`===` is a compile error on a value type (a built-in type, a string, a tuple, a `data` type, an
+`Option` among them), since a value type has no identity to compare. It is also an error when
+neither side is such a reference, with both sides traits, `Any`s or type parameters that may hold a
+value type: whether two equal values are one object is the compiler's choice, so `f(Tile(2),
+Tile(2))` and `f(3, 3)` with `f(a: Shape, b: Shape) = a === b` would answer differently for no
+reason the program can see. The message suggests `==`, or a class type for one side.
 
 ## Display and Debug
 

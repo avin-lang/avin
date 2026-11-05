@@ -1,0 +1,135 @@
+// expect: exit 0
+// Many threads, and futures on an executor and on the shared pool, read `lazy val`s for the first
+// time together: a module-level value, a field of one shared object, a field of a generic class, a
+// field of an object, a lazy value whose initializer reads another lazy value, one of a data type,
+// one of `long`, one of `unit` and an object handed through a channel before anything read its
+// field. Every initializer counts its runs, and each runs exactly once whichever thread wins; every
+// reader sees the same, whole value, built on the heap while the collector runs.
+import avin.threads.{sleep, Atomic, Channel, Executor, Future, scope}
+import avin.time.milliseconds
+
+val tableRuns = Atomic(0)
+val arrived = Atomic(0)
+
+// Waits until `n` readers have arrived at their read, so that the others find the initializer
+// running and wait for it, then builds a vector of strings.
+build(prefix: string, n: int, count: Atomic[int]) -> Vector[string]
+    count.add(1)
+    while arrived.load() < n do ()
+    sleep(milliseconds(5))
+    var out: Vector[string] = []
+    for i in 0..<300
+        out = out :+ s"$prefix$i"
+    out
+
+lazy val table: Vector[string] = build("m", 12, tableRuns)
+
+// A lazy value whose initializer reads another one: both run once.
+val chainRuns = Atomic(0)
+lazy val chained: int =
+    chainRuns.add(1)
+    table.length() + 1
+
+// A lazy value of a data type, of `long` and of `unit`.
+data Point(x: int, y: string)
+val pointRuns = Atomic(0)
+lazy val origin: Point =
+    pointRuns.add(1)
+    sleep(milliseconds(3))
+    Point(7, "seven")
+
+val bigRuns = Atomic(0)
+lazy val big: long =
+    bigRuns.add(1)
+    sleep(milliseconds(3))
+    9223372036854775807
+
+val unitRuns = Atomic(0)
+lazy val effect: unit =
+    unitRuns.add(1)
+    sleep(milliseconds(3))
+
+class Shared(prefix: string)
+    val runs = Atomic(0)
+    lazy val items: Vector[string] =
+        runs.add(1)
+        sleep(milliseconds(5))
+        var out: Vector[string] = []
+        for i in 0..<300
+            out = out :+ s"$prefix$i"
+        out
+
+class Cell[T](value: T)
+    val runs = Atomic(0)
+    lazy val copies: Vector[T] =
+        runs.add(1)
+        sleep(milliseconds(3))
+        var out: Vector[T] = []
+        for _ in 0..<100
+            out = out :+ value
+        out
+
+val settingsRuns = Atomic(0)
+
+object Settings
+    lazy val name: string =
+        settingsRuns.add(1)
+        sleep(milliseconds(3))
+        s"settings-${(0..<50).map(_ -> "x").mkString("")}"
+
+// What each future on the shared pool reads.
+poolRead() -> int
+    effect
+    val p = origin
+    Settings.name.byteLength() + p.x + p.y.byteLength() + (if big == 9223372036854775807 then 1 else 0)
+
+main() -> int
+    // Twelve threads: the module-level value, a field and the chained value.
+    val shared = Shared("f")
+    val total = Atomic(0)
+    scope(s ->
+        for _ in 0..<12
+            s.spawn(() ->
+                var junk: Vector[int] = []
+                for i in 0..<40
+                    junk = junk :+ i
+                arrived.add(1)
+                val t = table
+                total.add(t.length() + shared.items.length() + chained + junk.length() - 40)))
+    println(s"table runs ${tableRuns.load()}, items runs ${shared.runs.load()}, chain runs ${chainRuns.load()}, total ${total.load()}")
+
+    // Futures on an executor of four workers: a generic class's field, at two type arguments.
+    val four = Executor.fixed(4)
+    val strings = Cell("s")
+    val points = Cell(Point(1, "one"))
+    val reads = (0..<16).map(i -> four.future(strings.copies.length() + points.copies(99).x + strings.copies(i).byteLength())).toVector()
+    println(s"generic: ${Future.all(reads).await().sum()}, runs ${strings.runs.load()} and ${points.runs.load()}")
+    four.shutdown()
+
+    // Futures on the shared pool: an object's field, a data value, a `long` and a `unit`.
+    val tasks = (0..<16).map(_ -> Future(poolRead())).toVector()
+    println(s"pool: ${Future.all(tasks).await().sum()}")
+    println(s"object runs ${settingsRuns.load()}, point runs ${pointRuns.load()}, long runs ${bigRuns.load()}, unit runs ${unitRuns.load()}")
+
+    // An object handed through a channel before its field was read: the receivers read it first,
+    // together, and the sender reads it after them.
+    val ch = Channel[Shared](8)
+    val handed = Shared("c")
+    val lengths = Atomic(0)
+    scope(s ->
+        for _ in 0..<8
+            s.spawn(() ->
+                ch.receive() match
+                    Some(sh) -> lengths.add(sh.items.length())
+                    None -> 0)
+        for _ in 0..<8
+            ch.send(handed))
+    println(s"channel: ${lengths.load()}, runs ${handed.runs.load()}, last ${handed.items(299)}")
+
+    // Every value survives the collections after it was made.
+    var rest: Vector[int] = []
+    for i in 0..<300
+        rest = rest :+ i
+    println(s"${table(299)} ${shared.items(0)} ${strings.copies(50)} ${points.copies(0).y} ${Settings.name.byteLength()} ${origin.y} $big ${rest.length()}")
+    println(s"runs again: ${tableRuns.load()} ${shared.runs.load()} ${strings.runs.load()} ${settingsRuns.load()} ${pointRuns.load()} ${handed.runs.load()}")
+    0
