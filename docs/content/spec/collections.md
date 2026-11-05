@@ -152,6 +152,12 @@ the collection made of the one before is used up, `zip` ends with the shorter si
 source, which must not then be read on its own. `withFilter(p)` is its `filter(p)`, already lazy, so a
 comprehension over an iterator is an iterator, read element by element.
 
+**An iterator counts by being used up.** `size()` and `length()` on an `Iterator` answer the number of
+elements remaining as an `int`, found by reading them all: `hasNext()` is false afterwards and a second
+`size()` is 0. On an iterator made by `map`, `filter` and the rest, the source is read to its end, and
+`f` or `p` is called for each element as in any other traversal. An infinite iterator never returns.
+`Iterable` itself has no `size`: collections each have their own, which counts without consuming.
+
 **A view is an iterator.** `xs.view()`, on every collection, is `xs.iterator()` taken as the start of
 a lazy pipeline: nothing is computed until the view is read, each element is computed once as it is
 read, and no intermediate collection is made. `toVector()`, `toList()` and the other conversions, or
