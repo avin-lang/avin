@@ -43,11 +43,13 @@ offset the API answers with is a **byte offset** into the text, as every string 
 | `.` | Any character but a line terminator; with `s`, any character; with `d`, any but `\n` |
 | `[abc]` `[^abc]` `[a-z]` | A class, its negation, a range; `]` first and `-` first or last are literal |
 | `[a[bc]]` `[a-z&&[^aeiou]]` | The union of nested classes, and an intersection |
-| `\d` `\D` `\s` `\S` `\w` `\W` | ASCII digits `[0-9]`, white space `[ \t\n\x0B\f\r]`, word characters `[a-zA-Z_0-9]`, and their negations |
+| `\d` `\D` `\s` `\S` `\w` `\W` | ASCII digits `[0-9]`, white space `[ \t\n\x0B\f\r]`, word characters `[a-zA-Z_0-9]`, and their negations; under `U`, decimal digits (`Nd`), `White_Space` and Unicode word characters |
 | `\h` `\H` `\v` `\V` | Horizontal and vertical white space, and their negations |
 | `\p{Lu}` `\p{L}` `\pL` `\p{gc=Lu}` `\p{IsLu}` | A Unicode general category or a group of them (`L`, `M`, `N`, `P`, `S`, `Z`, `C`, `LC`, `LD`) |
-| `\p{IsLetter}` `\p{IsDigit}` `\p{IsWhite_Space}` … | A Unicode binary property the general category decides; the name after `Is` ignores case |
-| `\p{Alpha}` `\p{Digit}` `\p{Punct}` … | A POSIX class, over ASCII: `Lower`, `Upper`, `ASCII`, `Alpha`, `Digit`, `Alnum`, `Punct`, `Graph`, `Print`, `Blank`, `Cntrl`, `XDigit`, `Space`; also `L1` (Latin-1) and `all` |
+| `\p{IsAlphabetic}` `\p{IsWhite_Space}` `\p{IsEmoji}` … | A Unicode binary property, or a POSIX class over Unicode (`\p{IsAlpha}`); the name after `Is` ignores case |
+| `\p{IsGreek}` `\p{sc=Grek}` `\p{script=Greek}` | A script, by name or four-letter code, ignoring case |
+| `\p{InGreek}` `\p{blk=Greek and Coptic}` `\p{block=…}` | A block, ignoring case |
+| `\p{Alpha}` `\p{Digit}` `\p{Punct}` … | A POSIX class, over ASCII unless `U` is on: `Lower`, `Upper`, `ASCII`, `Alpha`, `Digit`, `Alnum`, `Punct`, `Graph`, `Print`, `Blank`, `Cntrl`, `XDigit`, `Space`; also `L1` (Latin-1) and `all` |
 | `\P{…}` | The negation of a property |
 | `X?` `X*` `X+` `X{n}` `X{n,}` `X{n,m}` | Repetition, greedy; followed by `?` reluctant, by `+` possessive |
 | `(X)` `(?<name>X)` | A capturing group, numbered from 1 by its opening parenthesis; a named one, whose name is a Latin letter then letters and digits |
@@ -56,22 +58,26 @@ offset the API answers with is a **byte offset** into the text, as every string 
 | `\1` … `\k<name>` | The text a group matched, again |
 | `^` `$` `\A` `\z` `\Z` `\G` | Start; end, or before a line terminator ending the input; start of input; end of input; end or before a final line terminator; where the previous match ended |
 | `\b` `\B` | A word boundary, and anywhere else |
+| `\b{g}` | A boundary between grapheme clusters |
+| `\X` | One extended grapheme cluster: a user-perceived character such as `e` and a combining accent, a flag, or an emoji sequence |
 | `\R` | A line break: `\r\n`, or one of `\n`, `\x0B`, `\f`, `\r`, `\u0085`, ` `, ` ` |
 | `X\|Y` | Alternatives, tried left to right |
-| `(?imsxdu-imsxdu)` `(?i:X)` | Flags turned on and off from here to the end of the enclosing group, or for `X` alone |
+| `(?imsxduU-imsxduU)` `(?i:X)` | Flags turned on and off from here to the end of the enclosing group, or for `X` alone |
 
 **Flags.** `i` ignores case, for ASCII letters only unless `u` is on too, when it is Unicode's
 simple case mapping; `m` makes `^` and `$` match at each line; `s` makes `.` match a line terminator;
 `d` makes `\n` the only line terminator for `.`, `^` and `$`; `x` ignores white space and `#`
-comments to the end of the line, outside `\Q…\E` and escapes, inside classes too. A flag set by
+comments to the end of the line, outside `\Q…\E` and escapes, inside classes too; `U` makes `\d`,
+`\s`, `\w`, `\b` and the POSIX classes Unicode's and turns `u` on with it, and `(?-U)` turns both
+off. A flag set by
 `(?i)` lasts to the end of the group it is written in, across later alternatives.
 
 **Line terminators** are `\n`, `\r`, `\r\n`, `\u0085`, ` ` and ` `. In multiline mode `^`
 matches at the start and after a line terminator but never at the very end of the input, and never
 between the `\r` and `\n` of a pair; `$` matches before a line terminator and at the end.
 
-**Word boundaries.** A word character for `\b` is one `\w` matches, or a non-spacing mark that
-follows letters or digits.
+**Word boundaries.** A word character for `\b` is one `\w` matches, under `U` too, or a
+non-spacing mark that follows letters or digits.
 
 **Back references.** `\n` with more digits takes them while the number names a group already opened;
 `\11` after one group is `\1` and then `1`. A reference to a group that does not exist, or that has
@@ -81,6 +87,43 @@ not matched, matches nothing. Under `i` a reference matches the text in any case
 upper bound, no group in it whose body has alternatives or a repetition of varying count is
 repeated by a greedy or reluctant `*`, `+` or `{…}`, and it holds no back reference. It tries its body from the nearest
 start first.
+
+## Unicode properties
+
+The properties beyond the general category answer from tables generated from the Unicode Character
+Database 17.0.0, the version the general categories come from, by `scripts/unicode_tables.avin`;
+a table is read the first time a pattern names it.
+
+**Scripts** are those `Scripts.txt` lists, and `Unknown` for every other code point. A script is
+named by its name or its four-letter code, as `PropertyValueAliases.txt` gives them, with `_` for
+a space and case ignored: `\p{IsOld_Italic}`, `\p{sc=ital}`. Where the name after `Is` is also a
+binary property or a general category, that is what it names.
+
+**Blocks** are those of `Blocks.txt`. A block is named by its name there, that name without its
+spaces, or one of its names in `PropertyValueAliases.txt`, case ignored: `\p{InGreek and Coptic}`,
+`\p{InGreekandCoptic}`, `\p{InGreek}`, `\p{blk=Latin_1_Sup}`. A code point in no block is in none
+of them.
+
+**Binary properties** after `Is`: `Alphabetic`, `Ideographic`, `Letter`, `Lowercase`, `Uppercase`,
+`Titlecase`, `Punctuation`, `Control`, `White_Space`, `Digit`, `Hex_Digit`, `Join_Control`,
+`Noncharacter_Code_Point`, `Assigned`, `Emoji`, `Emoji_Presentation`, `Emoji_Modifier`,
+`Emoji_Modifier_Base`, `Emoji_Component`, `Extended_Pictographic`, and `Word` (alphabetic
+characters, marks, decimal digits, connector punctuation and the two joiners); `Hex_Digit`,
+`Join_Control`, `White_Space` and `Noncharacter_Code_Point` are also written without their `_`. After them come the POSIX classes over Unicode, which `U` gives the
+names without `Is` too: `Alpha` is `Alphabetic`, `Lower` and `Upper` are `Lowercase` and
+`Uppercase`, `Space` is `White_Space`, `Punct` is `Punctuation`, `XDigit` is `Hex_Digit`, `Alnum` is
+`Alphabetic` or `Nd`, `Cntrl` is `Cc`, `Digit` is `Nd`, `Blank` is a tab or `Zs`, `Graph` is
+neither a separator, `Cc`, `Cs` nor `Cn`, and `Print` is `Graph` or `Blank` without `Cc`. Under `i`,
+`Lowercase`, `Uppercase`, `Titlecase`, `Lower` and `Upper` each take every cased character. Under
+`U` the names of the POSIX classes ignore case; any other name keeps it.
+
+**Grapheme clusters** follow the extended grapheme cluster rules of Unicode's text segmentation
+annex, with the `Grapheme_Cluster_Break`, `Extended_Pictographic` and `Indic_Conjunct_Break`
+properties. `\X` matches the cluster that starts where it stands, as long as the rules make it,
+and is never matched shorter, so `\X\x{301}` does not match `e` and a combining acute. It has no
+greatest length, so a lookbehind may not hold it. `\b{g}` matches at the start and end of the
+text and wherever the rules, applied to the text before it, break: never between the regional
+indicators of one flag, nor inside an emoji sequence joined by a zero width joiner.
 
 ## Matching
 
@@ -191,11 +234,8 @@ Latin letter`, `named capturing group is missing trailing '>'`, `\k is not follo
 capturing group`, `Unknown character property name {X}`, `Unclosed character family`, `Empty
 character family`.
 
-**Not supported**, each reported as a `PatternError` whose description begins `Unsupported`:
-properties that need Unicode data beyond the general category — scripts (`\p{IsGreek}`,
-`\p{sc=…}`), blocks (`\p{InGreek}`, `\p{blk=…}`), `Alphabetic`, `Ideographic`, `Uppercase`,
-`Lowercase`, `Word`, `Alnum` and the emoji properties; the flags `U` and `c`; `\X`, `\b{g}` and
-`\N{…}`.
+**Not supported**, each reported as a `PatternError` whose description begins `Unsupported`: the
+flag `c`, canonical equivalence, and `\N{…}`, a character by its name.
 
 ## `Match` and `MatchIterator`
 
