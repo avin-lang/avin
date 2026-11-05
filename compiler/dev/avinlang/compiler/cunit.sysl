@@ -52,6 +52,27 @@ struct CUnitHandle
     unit: usize
     span: Span
     package: string
+    /** The other C types it is passed as, and how each is made. */
+    conversions: Buf[CAs]
+    /** Its field accessors. */
+    fields: Buf[CUnitField]
+
+/** A field accessor as the C unit compiles its glue: the method's name, the index of its symbol, which
+ * names its glue, the field, the names of its indices and the bound of each, whether it writes the
+ * field, the kind of C type the field must be for the Avin type it reads or writes, or for a handle
+ * read the handle's class, that Avin type, and the unit and span that place the accessor. */
+struct CUnitField
+    name: string
+    symbol: usize
+    expr: string
+    indices: Buf[string]
+    bounds: Buf[string]
+    writer: bool
+    kind: Option[CKind]
+    handle: Option[usize]
+    avin: &Type
+    unit: usize
+    span: Span
 
 /** The handle a class's `kept:` names: the name `release:` gives its pointer, the kept class's index
  * and its C type. */
@@ -129,7 +150,45 @@ c_unit_handles(program: TProgram, files: Buf[ProgramFile], library: usize) -> Bu
                 val kd = program.classes[j].decl
                 if c_handle_type(kd) is Some(kt) && c_class_text(kd, "retain") is Some(_) && c_class_kept(kd) is None
                     kept = Some(CUnitKept(name.name, j, kt))
-        out.push(CUnitHandle(program.classes[k].name, k, ty.text, ty.ty is CTypedef(_), c_class_text(d, "release").unwrap_or(""), c_class_text(d, "retain"), kept, program.classes[k].unit, d.name_span, package_of(program.classes[k].unit, files, library)))
+        out.push(CUnitHandle(program.classes[k].name, k, ty.text, ty.ty is CTypedef(_), c_class_text(d, "release").unwrap_or(""), c_class_text(d, "retain"), kept, program.classes[k].unit, d.name_span, package_of(program.classes[k].unit, files, library), c_class_as(d), c_unit_fields(program, k)))
+    out
+
+// The kind of C type a field read or written as the scalar `avin` is.
+private c_field_kind(avin: &Type) -> Option[CKind] = *avin match
+    Int(_) -> Some(KindInteger)
+    Byte -> Some(KindByte)
+    Bool -> Some(KindBool)
+    Real -> Some(KindReal)
+    _ -> None
+
+// The field accessors of the handle class `k`, in the order of the program's symbols.
+private c_unit_fields(program: TProgram, k: usize) -> Buf[CUnitField]
+    var out: Buf[CUnitField] = buf()
+    for n in 0..<program.symbols.len()
+        val s = program.symbols[n]
+        if s.root is Some(_) || s.receiver is Some(_) || s.constructor || s.owner_class != Some(k) then continue
+        val field = c_field_of(s.decl) match
+            Some(f) -> f
+            None -> continue
+        // The receiver is the first parameter; the value written, for a writer, the last.
+        val result = s.result.unwrap_or(Unit)
+        val writer = *result is Unit
+        if s.params.len() < 1 || writer && s.params.len() < 2 then continue
+        val last = if writer then s.params.len() - 1 else s.params.len()
+        var indices: Buf[string] = buf()
+        for i in 1..<last
+            val name = s.decl.params[i - 1].pattern.kind match
+                Name(name) -> name
+                _ -> "_"
+            indices.push(name)
+        val avin = if writer then s.params[last] else result
+        var kind: Option[CKind] = None
+        var handle: Option[usize] = None
+        if c_handle_form(avin, program.data, program.classes) is Some(h) then handle = Some(h.class_index)
+        elif !(c_text_form(avin, program.data, program.classes) is NoText) then kind = Some(KindText)
+        else kind = c_field_kind(avin)
+        if kind is None && handle is None then continue
+        out.push(CUnitField(s.name, n, field.expr, indices, field.bounds, writer, kind, handle, avin, s.unit, s.decl.name_span))
     out
 
 /** The C unit of a program whose C bindings are `bindings` and whose packages name `libraries`. Each
@@ -231,6 +290,12 @@ enum CUnitLine
     /** A line of the glue of `handles[handle]` compiling what its `@c` says under `part`: `type`,
      * `release`, `retain` or `kept`. */
     GlueLine(handle: usize, part: string)
+    /** A line of the glue of `handles[handle]`'s `as:` conversion `entry`. */
+    AsLine(handle: usize, entry: usize)
+    /** A line of the glue of the field accessor `handles[handle].fields[field]`: `field` reads its
+     * field and names its type, `kind` checks that type, `bound` with the index's position compiles
+     * its bound, and `write` writes the field. */
+    FieldLine(handle: usize, field: usize, part: string)
 
 /** A C unit's text, what each of its lines is for, counting from 1, and the measurement keys of its
  * table, in order. */
@@ -269,6 +334,16 @@ c_unit_source(bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries:
     var kinds: Buf[string] = buf()
     var measured: Buf[string] = buf()
     var measured_types: Buf[string] = buf()
+    // The type of each field read or written as an integer, a truth value or a `real` is measured.
+    for h in handles
+        for f in h.fields
+            val kind = f.kind match
+                Some(kind) -> kind
+                None -> continue
+            if !c_kind_measured(kind) then continue
+            val name = c_field_type_name(f.symbol)
+            measured.push(c_measure_key(CTypedef(name), kind))
+            measured_types.push(name)
     for i in 0..<bindings.len()
         val b = bindings[i]
         val p = b.prototype
@@ -383,6 +458,59 @@ private handle_glue(out: *StrBuilder, lines: *Buf[CUnitLine], handles: Buf[CUnit
         glue(out, lines, "    avin_c_drain(o);", Plain)
         glue(out, lines, "}", Plain)
         glue(out, lines, s"void avin_c_finalize_$n(void *o, void *heap) { (void)heap; avin_c_give_back_$n((void **)o); }", Plain)
+    // Each `as:` conversion, `avin_c_as_<class>_<entry>`, makes the other pointer from the handle's,
+    // and passes null on as null; its type is checked to be the one the entry names.
+    for i in 0..<handles.len()
+        val h = handles[i]
+        val n = h.index
+        for j in 0..<h.conversions.len()
+            val entry = h.conversions[j]
+            val made = c_call_text(entry.expr)
+            glue(out, lines, s"typedef ${entry.ty} avin_c_as_type_${n}_$j;", AsLine(i, j))
+            glue(out, lines, s"void *avin_c_as_${n}_$j(void *avin_p) {", Plain)
+            glue(out, lines, "    if (!avin_p) return 0;", Plain)
+            glue(out, lines, s"    avin_c_type_$n self = (avin_c_type_$n)avin_p;", Plain)
+            glue(out, lines, s"    _Static_assert(__builtin_types_compatible_p(__typeof__($made), avin_c_as_type_${n}_$j), \"avin: the conversion of ${h.name} to ${entry.ty}\");", AsLine(i, j))
+            glue(out, lines, s"    return (void *)($made);", AsLine(i, j))
+            glue(out, lines, "}", Plain)
+    // Each field accessor names its field's type, `avin_c_field_type_<symbol>`, checks it is the kind
+    // its Avin type needs, and reads or writes the field through `avin_c_field_get_<symbol>` or
+    // `avin_c_field_set_<symbol>`, taking each index as a `long long`, whose bounds are answered by
+    // `avin_c_field_bound<position>_<symbol>`.
+    for i in 0..<handles.len()
+        val h = handles[i]
+        for j in 0..<h.fields.len()
+            val f = h.fields[j]
+            val t = s"avin_c_type_${h.index}"
+            val ft = c_field_type_name(f.symbol)
+            var indices = ""
+            for name in f.indices
+                indices = indices + s", long long $name"
+            // The type is the field's at any index: an unevaluated operand reads no memory.
+            glue(out, lines, s"typedef __typeof__((($t)0)->${c_replace_names(f.expr, f.indices, "0")}) $ft;", FieldLine(i, j, "field"))
+            val test = f.handle match
+                Some(k) -> s"__builtin_types_compatible_p($ft, avin_c_type_$k)"
+                None -> kind_test(f.kind.unwrap(), ft)
+            glue(out, lines, s"_Static_assert($test, \"avin: the field ${f.name}\");", FieldLine(i, j, "kind"))
+            for b in 0..<f.bounds.len()
+                val part = "bound" + b.to_string()
+                val bound = c_field_glue(f.symbol, part)
+                glue(out, lines, s"long long $bound(void *avin_p$indices) {", Plain)
+                glue(out, lines, s"    $t self = ($t)avin_p;", Plain)
+                glue(out, lines, s"    return (long long)(${f.bounds[b]});", FieldLine(i, j, part))
+                glue(out, lines, "}", Plain)
+            if f.writer
+                val set = c_field_glue(f.symbol, "set")
+                glue(out, lines, s"void $set(void *avin_p$indices, $ft avin_value) {", Plain)
+                glue(out, lines, s"    $t self = ($t)avin_p;", Plain)
+                glue(out, lines, s"    self->${f.expr} = avin_value;", FieldLine(i, j, "write"))
+                glue(out, lines, "}", Plain)
+            else
+                val get = c_field_glue(f.symbol, "get")
+                glue(out, lines, s"$ft $get(void *avin_p$indices) {", Plain)
+                glue(out, lines, s"    $t self = ($t)avin_p;", Plain)
+                glue(out, lines, s"    return self->${f.expr};", FieldLine(i, j, "field"))
+                glue(out, lines, "}", Plain)
 
 /** The packages of `libraries` in the order their headers are included: each after every package
  * whose handle classes its bindings name, and otherwise in the order the libraries are listed. A
@@ -501,6 +629,8 @@ c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding
         glue_messages.push(buf())
     var unplaced = ""
     var libraries_text = ""
+    // What the field accessors' glue said, placed at each accessor.
+    var fields_text = ""
     var placed_any = false
     // The binding whose declaration conflicted with the header's last, whose note names the header.
     var conflicting: Option[usize] = None
@@ -535,6 +665,43 @@ c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding
                 if part == "type" then m = s"the C handle `${h.name}` is on `${h.ty}`, which its headers do not declare as a type: clang says '${d.message}'"
                 elif part == "pointer" then m = s"the C handle `${h.name}` is on `${h.ty}`, which is not a pointer in its headers"
                 glue_messages[i].push(m)
+            AsLine(i, j) ->
+                placed_any = true
+                val key = "as " + j.to_string()
+                if contains_text(glue_parts[i], key) || contains_text(glue_parts[i], "type") || contains_text(glue_parts[i], "pointer") then continue
+                glue_parts[i].push(key)
+                val h = handles[i]
+                val entry = h.conversions[j]
+                if d.message.starts_with("static assertion failed")
+                    glue_messages[i].push(s"the `as:` conversion of the C handle `${h.name}` to `${entry.ty}` makes another type: `${c_call_text(entry.expr)}` is not a `${entry.ty}` in its headers")
+                else glue_messages[i].push(s"the `as:` conversion of the C handle `${h.name}` to `${entry.ty}` does not compile against its headers: clang says '${d.message}'")
+            FieldLine(i, j, part) ->
+                placed_any = true
+                val key = "field " + j.to_string()
+                if contains_text(glue_parts[i], key) || contains_text(glue_parts[i], "type") || contains_text(glue_parts[i], "pointer") then continue
+                glue_parts[i].push(key)
+                val h = handles[i]
+                val f = h.fields[j]
+                val verb = if f.writer then "write" else "read"
+                var m = s"the field `${f.expr}` of the C handle `${h.name}`, which `${f.name}` ${verb}s, does not compile against its headers: clang says '${d.message}'"
+                if part == "kind"
+                    var what = ""
+                    f.handle match
+                        Some(k) ->
+                            for other in handles
+                                if other.index == k then what = s"`${other.ty}`, the C type of `${other.name}`"
+                        None -> what = field_kind_text(f.kind.unwrap())
+                    m = s"the field `${f.expr}` of the C handle `${h.name}` is not $what in the headers, so `${f.name}` cannot $verb it as `${type_name(f.avin)}`"
+                elif part == "write" then m = s"the field `${f.expr}` of the C handle `${h.name}` cannot be written by `${f.name}`: clang says '${d.message}'"
+                elif part.starts_with("bound")
+                    var position = 0usize
+                    for x in part[5..].bytes
+                        position = position * 10 + usize(x - u8('0'))
+                    val b = f.bounds[position]
+                    m =s"the `bound:` `$b` of the field accessor `${f.name}` does not compile against the headers of the C handle `${h.name}`: clang says '${d.message}'"
+                var r = report()
+                r.add(error(f.span, m))
+                fields_text = fields_text + r.render(sources[f.unit])
             AssertLine(i) ->
                 placed_any = true
                 val requirement = "static assertion failed due to requirement '__builtin_types_compatible_p("
@@ -567,13 +734,7 @@ c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding
                 placed_any = true
                 val where = if position == 0 then "the result" else s"parameter $position"
                 val avin = if position == 0 then bindings[i].result else bindings[i].params[position - 1]
-                val what = kind match
-                    KindInteger -> "an integer type"
-                    KindByte -> "an integer type one byte wide"
-                    KindBool -> "a bool or an integer type"
-                    KindReal -> "a floating-point type"
-                    KindText -> "`char *` or `const char *`"
-                    KindConstText -> "`const char *`"
+                val what = field_kind_text(kind)
                 // A type the headers do not declare at all is reported by the header check.
                 if d.message.starts_with("static assertion failed") && !contains_text(troubles[i].kind_names, name)
                     troubles[i].kind_names.push(name)
@@ -593,6 +754,7 @@ c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding
         for m in glue_messages[i]
             r.add(error(handles[i].span, m))
         rendered = rendered + r.render(sources[handles[i].unit])
+    rendered = rendered + fields_text
     for i in 0..<bindings.len()
         val b = bindings[i]
         val t = troubles[i]
@@ -620,6 +782,15 @@ c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding
         rendered = rendered + r.render(sources[b.unit])
     if !placed_any || (rendered == "" && unplaced != "") then return "avin: the C unit did not compile:\n" + output
     rendered
+
+// What a C type checked as `kind` must be, as a diagnostic says it.
+private field_kind_text(kind: CKind) -> string = kind match
+    KindInteger -> "an integer type"
+    KindByte -> "an integer type one byte wide"
+    KindBool -> "a bool or an integer type"
+    KindReal -> "a floating-point type"
+    KindText -> "`char *` or `const char *`"
+    KindConstText -> "`const char *`"
 
 /** One diagnostic line of clang's: the file, line and severity, and the message. */
 private struct CDiagnostic

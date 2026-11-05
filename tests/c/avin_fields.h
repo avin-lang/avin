@@ -1,0 +1,137 @@
+/* The C objects the field and conversion tests bind. A chain of structs models C's inheritance, each
+ * with its parent as its first member, as MLT's producers, services and property bags do; a record
+ * publishes fields of every kind a field accessor reads or writes. Both are counted as the objects of
+ * avin_handles.h are, and stop the process on a use after free; their memory is never reused. The test
+ * harness compiles this into the `avin-c-fixture` library beside avin_handles.c. */
+#ifndef AVIN_FIELDS_H
+#define AVIN_FIELDS_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/* The kinds counted, and what is counted of each, for `fxf_count`. */
+enum fxf_kind { FXF_BASE = 0, FXF_RECORD = 1, FXF_HOLDER = 2 };
+enum fxf_what { FXF_CREATED = 0, FXF_RETAINED = 1, FXF_RELEASED = 2, FXF_FREED = 3 };
+long fxf_count(int kind, int what);
+
+/* The chain: a base holding the count, a middle whose first member is a base, a derived whose first
+ * member is a middle. Each is made with one reference, and freed with the last, whichever type it was
+ * made as. */
+struct fxf_base_s {
+    int magic;
+    int refs;
+    int value;
+};
+typedef struct fxf_base_s *fxf_base;
+struct fxf_middle_s {
+    struct fxf_base_s base;
+    int extra;
+};
+typedef struct fxf_middle_s *fxf_middle;
+struct fxf_derived_s {
+    struct fxf_middle_s middle;
+    int more;
+};
+typedef struct fxf_derived_s *fxf_derived;
+
+fxf_base fxf_base_new(int value);
+fxf_middle fxf_middle_new(int value, int extra);
+fxf_derived fxf_derived_new(int value, int extra, int more);
+/* The conversions up the chain, as MLT's `mlt_producer_service` is: the same object, lent. */
+fxf_middle fxf_derived_middle(fxf_derived d);
+fxf_base fxf_middle_base(fxf_middle m);
+int fxf_base_inc_ref(fxf_base b);
+void fxf_base_close(fxf_base b);
+int fxf_base_value(fxf_base b);
+void fxf_base_set(fxf_base b, int value);
+int fxf_base_refs(fxf_base b);
+/* The value, or `fallback` for null. */
+int fxf_base_value_or(fxf_base b, int fallback);
+int fxf_middle_extra(fxf_middle m);
+int fxf_derived_more(fxf_derived d);
+/* Whether two pointers are the same object. */
+bool fxf_same(fxf_base a, fxf_base b);
+
+/* A holder keeping a pointer to a base without a reference of its own, which it reads when asked
+ * and never when it is freed. */
+typedef struct fxf_holder fxf_holder;
+fxf_holder *fxf_holder_new(fxf_base b);
+void fxf_holder_free(fxf_holder *h);
+int fxf_holder_peek(const fxf_holder *h);
+/* A sink taking the reference it is passed, given back by `fxf_sink_drain`. */
+void fxf_sink_take(fxf_base b);
+int fxf_sink_drain(void);
+
+/* A record with a field of each kind. */
+enum fxf_shade { FXF_LIGHT = 1, FXF_DARK = -3 };
+struct fxf_point {
+    int x;
+    int y;
+};
+/* A union of a header and a point, as Cairo's `cairo_path_data_t` is. */
+union fxf_cell {
+    struct {
+        int kind;
+        int length;
+    } header;
+    struct {
+        double x;
+        double y;
+    } point;
+};
+typedef struct fxf_record fxf_record;
+struct fxf_record {
+    int magic;
+    int refs;
+    int8_t tiny;
+    uint8_t small;
+    int16_t i16;
+    uint16_t u16;
+    int32_t i32;
+    uint32_t u32;
+    int64_t i64;
+    uint64_t u64;
+    long along;
+    size_t size;
+    bool flag;
+    int truth;
+    char letter;
+    float single;
+    double precise;
+    enum fxf_shade shade;
+    const char *name;
+    char *label;
+    const int fixed;
+    char text[8];
+    struct fxf_point origin;
+    struct fxf_point *corner;
+    int count;
+    int *values;
+    int rows;
+    int columns;
+    int grid[3][4];
+    int num_cells;
+    union fxf_cell *cells;
+    int tag_count;
+    const char **tags;
+    fxf_record *next;
+    fxf_base base;
+    fxf_derived derived;
+};
+/* A record with every field set to a fixed sample: see avin_fields.c. */
+fxf_record *fxf_record_new(void);
+fxf_record *fxf_record_ref(fxf_record *r);
+void fxf_record_unref(fxf_record *r);
+/* Gives `r` a next record, and the bases its handle fields point at, each holding a reference the
+ * record gives back when it is freed. */
+void fxf_record_link(fxf_record *r, fxf_record *next, fxf_base base, fxf_derived derived);
+/* Sets the name and label to null, or to bytes that are not UTF-8. */
+void fxf_record_clear_text(fxf_record *r);
+void fxf_record_bad_text(fxf_record *r);
+/* Sets the unsigned 64-bit field to its greatest, past every signed integer's. */
+void fxf_record_u64_max(fxf_record *r);
+/* The values a writer stored, read back by C. */
+long long fxf_record_sum(const fxf_record *r);
+
+#endif

@@ -3324,7 +3324,37 @@ their words are reserved.
 
 ## Proposed
 
-None at present.
+- Proposed (built on branch `c-bindings-fields`): **`as:` conversions and field accessors** (stage 13
+  step 4), the choices building them made where the [chapter](/spec/c-bindings/#handles-and-c-s-inheritance)
+  is silent.
+  - **An `as:` entry's right side is a C function's name or an expression in `self`**, as
+    `release:`'s is, and `as:` is one string or a list. The C unit checks with
+    `__builtin_types_compatible_p` that what it makes is the entry's type. *Why*: one rule for every
+    piece of glue, and C would otherwise convert a wrong pointer silently (the C unit compiles with
+    warnings off). *Alternative*: an expression only, which makes MLT's every entry repeat `(self)`.
+  - **A conversion is made after the closed and owner checks, from the handle's own pointer, and
+    passes null as null**; what a binding `keeps:` or `consumes:` is the handle itself, held by its
+    class's own `retain`, never the converted pointer. *Why*: the converted pointer is lent and may
+    point into the object, so a reference taken through another class's glue would be the wrong
+    count. *Alternative*: holding the converted pointer, which has no `release` of its own.
+  - **A field is a member path read as `self->` followed by it**; its type is named in the C unit by
+    `__typeof__` with the indices replaced by zero, so it is measured and checked without being
+    read. *Why*: every surveyed accessor (MLT's profile, FreeType's face and glyph slot, Cairo's
+    path) is a member path, and an unevaluated operand needs no index. *Alternative*: a full C
+    expression in `self`, which nothing surveyed needs and which makes `self->` noise in each.
+  - **Only scalars are written**; a string or handle field is read only. *Why*: a string or a
+    reference stored into a C struct needs an owner that frees or gives it back, which no surveyed
+    library asks Avin to be. *Alternative*: writing strings copied with `malloc` and never freed.
+  - **Indices are `int` or `long`, passed as `long long`, one `bound:` each, in order**, a list for
+    more than one; a bound may use `self` and the indices. The check is `0 <= index < bound`, made
+    in Avin before the glue reads, trapping with "index `i` of `Class.method` out of range". *Why*:
+    a two-dimensional field needs a bound per index, and the trap names the index that was out of
+    range. *Alternative*: one bound for all indices.
+  - **A handle read from a field is lent, without `borrowed` written**, and its class must declare
+    `retain` and no `kept:`. *Why*: a struct's pointer is never the reader's to give back.
+    *Alternative*: requiring `borrowed`, a word that could only ever be written one way.
+
+  **Review with the user**: writers of scalars only.
 
 ## Open
 
