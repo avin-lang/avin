@@ -212,6 +212,8 @@ lsp_answer(server: *LspServer, body: string) -> Buf[string]
         "textDocument/completion" -> lsp_result(asked, lsp_completion(*server, params))
         "textDocument/formatting" -> lsp_result(asked, lsp_formatting(*server, params))
         "textDocument/rangeFormatting" -> lsp_result(asked, lsp_range_formatting(*server, params))
+        "textDocument/foldingRange" -> lsp_result(asked, lsp_folding_ranges(*server, params))
+        "workspace/symbol" -> lsp_result(asked, lsp_workspace_symbols(*server, params))
         _ -> lsp_error(asked, LspMethodNotFound, s"'$method' is not a method avin lsp answers"))
     out
 
@@ -241,7 +243,8 @@ private lsp_notified(server: *LspServer, method: string, msg: Json, out: *Buf[st
         out.push(lsp_publish(uri, buf()))
 
 // The capabilities the server announces: full-text synchronization, hover, definition, the outline,
-// references, highlights, semantic tokens and completion, with positions counted in UTF-16, the
+// the workspace's symbols, references, highlights, semantic tokens, formatting, folding and
+// completion, with positions counted in UTF-16, the
 // protocol's default.
 private lsp_capabilities() -> Json
     var sync: Buf[JsonMember] = buf()
@@ -254,6 +257,7 @@ private lsp_capabilities() -> Json
     lsp_put(&caps, "hoverProvider", Json.Bool(true))
     lsp_put(&caps, "definitionProvider", Json.Bool(true))
     lsp_put(&caps, "documentSymbolProvider", Json.Bool(true))
+    lsp_put(&caps, "workspaceSymbolProvider", Json.Bool(true))
     lsp_put(&caps, "referencesProvider", Json.Bool(true))
     lsp_put(&caps, "documentHighlightProvider", Json.Bool(true))
     var rename: Buf[JsonMember] = buf()
@@ -262,6 +266,7 @@ private lsp_capabilities() -> Json
     lsp_put(&caps, "semanticTokensProvider", lsp_token_legend())
     lsp_put(&caps, "documentFormattingProvider", Json.Bool(true))
     lsp_put(&caps, "documentRangeFormattingProvider", Json.Bool(true))
+    lsp_put(&caps, "foldingRangeProvider", Json.Bool(true))
     var completion: Buf[JsonMember] = buf()
     var triggers: Buf[Json] = buf()
     triggers.push(Json.Str("."))
@@ -544,7 +549,8 @@ private lsp_forget(server: *LspServer, uri: string)
         if d.uri != uri then kept.push(d)
     server.documents = kept
 
-private lsp_document(server: LspServer, uri: string) -> Option[LspDocument]
+/** The open document the editor knows by `uri`. */
+lsp_document(server: LspServer, uri: string) -> Option[LspDocument]
     for d in server.documents
         if d.uri == uri then return Some(d)
     None
@@ -1226,7 +1232,7 @@ lsp_document_symbols(server: LspServer, params: Json) -> Json
     var out: Buf[Json] = buf()
     for item in file.items
         item match
-            FunctionItem(f) -> out.push(lsp_symbol(src, f.name, SymbolFunction, f.span, name_in(src, f.name_span, f.name), buf()))
+            FunctionItem(f) -> out.push(lsp_function_symbol(src, f, SymbolFunction))
             DataItem(data) ->
                 var variants: Buf[Json] = buf()
                 for v in data.variants
@@ -1255,8 +1261,63 @@ private lsp_members(src: Source, members: Buf[ClassMember], out: *Buf[Json])
         m match
             FieldMember(f) -> out.push(lsp_symbol(src, f.name, SymbolField, f.span, name_in(src, f.span, f.name), buf()))
             AbstractFieldMember(f) -> out.push(lsp_symbol(src, f.name, SymbolField, f.span, name_in(src, f.name_span, f.name), buf()))
-            MethodMember(method, _, _, _) -> out.push(lsp_symbol(src, method.name, SymbolMethod, method.span,name_in(src, method.name_span, method.name), buf()))
+            MethodMember(method, _, _, _) -> out.push(lsp_function_symbol(src, method, SymbolMethod))
             StatementMember(_) -> ()
+
+// A function or a method, with the local functions declared in its body as its children, and a
+// test's description, or `@test`, as its detail.
+private lsp_function_symbol(src: Source, f: &Function, kind: long) -> Json
+    var children: Buf[Json] = buf()
+    if f.body is Some(body) then lsp_local_functions(src, body, &children)
+    for c in f.clauses
+        for g in c.bodies
+            lsp_local_functions(src, g.body, &children)
+    lsp_symbol(src, f.name, kind, f.span, name_in(src, f.name_span, f.name), children, lsp_test_detail(f))
+
+/** What the outline says beside a function `@test` marks: the test's description where the
+ * annotation gives one, as `avin test` reads it, and otherwise `@test`; "" for any other function. */
+lsp_test_detail(f: &Function) -> string
+    for a in f.annotations
+        if a.name != "test" then continue
+        if a.args.len() > 0 && a.args[0].name is None
+            if a.args[0].value.kind is StringLit(text)
+                if text != "" then return text
+        return "@test"
+    ""
+
+// The local functions an expression declares at any depth, each with its own as its children; a
+// local function inside another is the other's child, not the enclosing function's.
+private lsp_local_functions(src: Source, e: &Expr, out: *Buf[Json])
+    e.kind match
+        LocalFunction(f) -> out.push(lsp_function_symbol(src, f, SymbolFunction))
+        Block(items, _) ->
+            for item in items
+                lsp_local_functions(src, item, out)
+        Binding(_, _, value, _) -> lsp_local_functions(src, value, out)
+        Destructure(_, _, value, _) -> lsp_local_functions(src, value, out)
+        If(_, yes, no) ->
+            lsp_local_functions(src, yes, out)
+            if no is Some(n) then lsp_local_functions(src, n, out)
+        While(_, body, otherwise) ->
+            lsp_local_functions(src, body, out)
+            if otherwise is Some(o) then lsp_local_functions(src, o, out)
+        DoWhile(body, _, otherwise) ->
+            lsp_local_functions(src, body, out)
+            if otherwise is Some(o) then lsp_local_functions(src, o, out)
+        Loop(body) -> lsp_local_functions(src, body, out)
+        For(_, _, body) -> lsp_local_functions(src, body, out)
+        ForYield(_, body) -> lsp_local_functions(src, body, out)
+        Match(_, arms) ->
+            for arm in arms
+                lsp_local_functions(src, arm.body, out)
+        MatchFunction(arms) ->
+            for arm in arms
+                lsp_local_functions(src, arm.body, out)
+        Lambda(_, body) -> lsp_local_functions(src, body, out)
+        Call(_, args) ->
+            for arg in args
+                lsp_local_functions(src, arg.value, out)
+        _ -> ()
 
 private lsp_pattern_name(p: &Pattern) -> string = p.kind match
     Name(n) -> n
@@ -1264,15 +1325,20 @@ private lsp_pattern_name(p: &Pattern) -> string = p.kind match
 
 // One `DocumentSymbol`. The protocol asks that the name's range lie inside the declaration's, so a
 // name found outside it is taken as the declaration's start.
-private lsp_symbol(src: Source, name: string, kind: long, whole: Span, named: Span, children: Buf[Json]) -> Json
-    val at = if named.start >= whole.start && named.end <= whole.end && named.end >= named.start then named else Span(whole.start, whole.start)
+private lsp_symbol(src: Source, name: string, kind: long, whole: Span, named: Span, children: Buf[Json], detail: string = "") -> Json
+    val at = lsp_selection(whole, named)
     var out: Buf[JsonMember] = buf()
     lsp_put(&out, "name", Json.Str(name))
+    if detail != "" then lsp_put(&out, "detail", Json.Str(detail))
     lsp_put(&out, "kind", Json.Int(kind))
     lsp_put(&out, "range", lsp_range(src, whole))
     lsp_put(&out, "selectionRange", lsp_range(src, at))
     if children.len() > 0 then lsp_put(&out, "children", Json.Arr(children))
     Json.Obj(out)
+
+/** A declaration's name where it lies inside the declaration, and otherwise the declaration's start. */
+lsp_selection(whole: Span, named: Span) -> Span =
+    if named.start >= whole.start && named.end <= whole.end && named.end >= named.start then named else Span(whole.start, whole.start)
 
 // ---- files and URIs ----
 

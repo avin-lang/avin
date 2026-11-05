@@ -1,0 +1,298 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.encoding.json.{Json, Member as JsonMember}
+import sysl.fs.{is_dir, read_text}
+
+// `avin lsp`'s answers about the shape of the source rather than its meaning: the declarations of
+// the whole workspace by name (`workspace/symbol`), and the regions of a document an editor may fold
+// (`textDocument/foldingRange`). Both are read off the parse, so they are there while the program
+// has mistakes in it.
+
+// ---- the workspace's symbols ----
+
+/** The most symbols one `workspace/symbol` answer lists, the empty query's included: enough for any
+ * list a person reads, and few enough that an editor asking on every keystroke is answered at once. */
+const WorkspaceSymbolLimit: usize = 500
+
+/** `workspace/symbol`: the declarations of every program an open document belongs to whose names
+ * hold the query's characters in order, ignoring case, each with its module (or, for a method, a
+ * variant or a machine's state, its type) as the container. Every file of such a program counts,
+ * open or not; an open one is read as the editor holds it. A dependency's files are not the
+ * workspace's and are left out. At most `WorkspaceSymbolLimit` are listed, in file order. */
+lsp_workspace_symbols(server: LspServer, params: Json) -> Json
+    val query = lsp_text_at(params, ["query"]).unwrap_or("").trim()
+    var wanted: Buf[char] = buf()
+    for c in query.chars
+        wanted.push(lsp_fold_case(c))
+    var out: Buf[Json] = buf()
+    var seen: Buf[string] = buf()
+    for root in lsp_workspace_roots(server)
+        for f in lsp_workspace_files(root)
+            if f.dependency then continue
+            val name = lsp_normal(f.src.name)
+            var again = false
+            for s in seen
+                if s == name then again = true
+            if again then continue
+            seen.push(name)
+            var held: Option[string] = None
+            for d in server.documents
+                if d.file == name then held = Some(d.text)
+            val src = held match
+                Some(text) -> source_of(name, text)
+                None -> source(name, f.src.bytes)
+            val parsed = parse(src)
+            val home = if parsed.file.module_name != "" then parsed.file.module_name else f.module_name.unwrap_or("")
+            var into = LspSymbolSink(lsp_uri_of_file(server, name), parsed.source, wanted, out)
+            lsp_file_symbols(&into, parsed.file, home)
+            out = into.out
+            if out.len() >= WorkspaceSymbolLimit then return Json.Arr(out)
+    Json.Arr(out)
+
+/** Where one file's symbols are gathered: the file's URI and source, the query, and the list. */
+struct LspSymbolSink
+    uri: string
+    src: Source
+    wanted: Buf[char]
+    out: Buf[Json]
+
+// The programs the open documents belong to: each one the server has analyzed whole, and a
+// document not yet analyzed whole as the file it is.
+private lsp_workspace_roots(server: LspServer) -> Buf[string]
+    var roots: Buf[string] = buf()
+    for p in server.programs
+        lsp_push_new(&roots, p.root)
+    for d in server.documents
+        lsp_push_new(&roots, if d.root != "" then d.root else d.file)
+    roots
+
+private lsp_push_new(names: *Buf[string], name: string)
+    for n in *names
+        if n == name then return
+    names.push(name)
+
+// The files of the program at `root`: a directory's tree, or the file alone.
+private lsp_workspace_files(root: string) -> Buf[ProgramFile]
+    if is_dir(root)
+        return program_tree_files(root) match
+            Ok(files) -> files
+            Err(_) -> buf()
+    single_file(source_of(root, read_text(root).unwrap_or("")))
+
+private lsp_uri_of_file(server: LspServer, file: string) -> string
+    for d in server.documents
+        if d.file == file then return d.uri
+    lsp_file_uri(file)
+
+// One file's declarations onto the sink, in the order they are written. An actor is listed once, as
+// the class it is, and a machine's states as members of its `State` type; the members the compiler
+// writes for them, whose names hold a `$`, are not listed.
+private lsp_file_symbols(into: *LspSymbolSink, file: SourceFile, home: string)
+    val src = into.src
+    for item in file.items
+        item match
+            FunctionItem(f) ->
+                var actor = false
+                for a in file.actors
+                    if a.name == f.name then actor = true
+                if !actor then lsp_offer(into, f.name, SymbolFunction, f.span, name_in(src, f.name_span, f.name), home)
+            DataItem(data) ->
+                // A machine's or an actor's states are a type named `Machine.State`.
+                val dot = data.name.last_index_of(".")
+                val owner = dot match
+                    Some(at) -> lsp_qualified(home, data.name[0..<at])
+                    None -> home
+                val name = dot match
+                    Some(at) -> data.name[at + 1..]
+                    None -> data.name
+                // The states are written as no type, so their type is found at the machine's name.
+                val written = dot match
+                    Some(at) -> data.name[0..<at]
+                    None -> name
+                lsp_offer(into, name, SymbolEnum, data.span, name_in(src, data.span, written), owner)
+                val inside = lsp_qualified(owner, name)
+                for v in data.variants
+                    lsp_offer(into, v.name, SymbolEnumMember, v.span, name_in(src, v.span, v.name), inside)
+            ClassItem(decl) ->
+                val name = if decl.name.starts_with(ActorClassPrefix) then decl.name[ActorClassPrefix.bytes.len..] else decl.name
+                val kind = if decl.object then SymbolObject elif decl.modifier == "trait" then SymbolInterface else SymbolClass
+                lsp_offer(into, name, kind, decl.span, decl.name_span, home)
+                lsp_offer_methods(into, decl.members, lsp_qualified(home, name))
+            ImplItem(decl) ->
+                val shown = show_type(decl.target)
+                val target = shown.index_of("[") match
+                    Some(at) -> shown[0..<at]
+                    None -> shown
+                lsp_offer_methods(into, decl.members, lsp_qualified(home, target))
+            ValueItem(v) -> lsp_offer(into, v.name, if v.mutable then SymbolVariable else SymbolConstant, v.span, name_in(src, v.span, v.name), home)
+        if into.out.len() >= WorkspaceSymbolLimit then return
+
+private lsp_offer_methods(into: *LspSymbolSink, members: Buf[ClassMember], container: string)
+    for m in members
+        if m is MethodMember(method, _, _, _)
+            lsp_offer(into, method.name, SymbolMethod, method.span, name_in(into.src, method.name_span, method.name), container)
+
+// One `SymbolInformation`, where its name matches and the list has room; its location is the name.
+private lsp_offer(into: *LspSymbolSink, name: string, kind: long, whole: Span, named: Span, container: string)
+    if into.out.len() >= WorkspaceSymbolLimit || name.contains("$") || !lsp_matches(into.wanted, name) then return
+    var location: Buf[JsonMember] = buf()
+    lsp_put(&location, "uri", Json.Str(into.uri))
+    lsp_put(&location, "range", lsp_range(into.src, lsp_selection(whole, named)))
+    var out: Buf[JsonMember] = buf()
+    lsp_put(&out, "name", Json.Str(name))
+    lsp_put(&out, "kind", Json.Int(kind))
+    lsp_put(&out, "location", Json.Obj(location))
+    if container != "" then lsp_put(&out, "containerName", Json.Str(container))
+    into.out.push(Json.Obj(out))
+
+private lsp_qualified(outer: string, name: string) -> string = if outer == "" then name else outer + "." + name
+
+/** Whether `name` holds the characters of `wanted` in order, not necessarily together, a letter of
+ * either case matching both: `wanted` is already case-folded. Nothing wanted matches every name. */
+lsp_matches(wanted: Buf[char], name: string) -> bool
+    var k = 0usize
+    for c in name.chars
+        if k == wanted.len() then return true
+        if lsp_fold_case(c) == wanted[k] then k += 1
+    k == wanted.len()
+
+// A character with an ASCII capital taken to its small letter; every other character as it is.
+private lsp_fold_case(c: char) -> char = if c >= 'A' && c <= 'Z' then char(u32(c) + 32) else c
+
+// ---- folding ----
+
+/** One region an editor may fold: lines counted from zero, the first kept in view. */
+struct LspFold
+    start: usize
+    end: usize
+    /** `comment`, `imports`, `region`, or "" for a block. */
+    kind: string
+
+/** `textDocument/foldingRange`: every region of the document spanning more than one line -- each
+ * indented block, from the line that opens it to its last line of code (a declaration's body, the
+ * body of a class, an impl, an actor, a machine or a state, a match's arms and an arm's body); a text
+ * block; a run of two or more comment lines; the run of `import` lines; and in a literate file each
+ * run of program text, its blank lines included and its prose not. Regions nest, and none is listed
+ * twice. They are ordered by their first line, an enclosing one before what it encloses. */
+lsp_folding_ranges(server: LspServer, params: Json) -> Json
+    val uri = lsp_text_at(params, ["textDocument", "uri"]).unwrap_or("")
+    val d = lsp_document(server, uri) match
+        Some(d) -> d
+        None -> return Json.Null
+    val doc = source_of(d.file, d.text)
+    var folds: Buf[LspFold] = buf()
+    // A literate file whose program cannot be read has no regions but its prose.
+    val program = literate_program(doc) match
+        Ok(p) -> p
+        Err(_) -> return Json.Arr(buf())
+    val lines = program.line_count()
+    // For each line, counted from one: whether a token starts on it, and whether it lies inside a
+    // token begun on an earlier line, a text block's.
+    var code: Buf[bool] = buf()
+    var inside: Buf[bool] = buf()
+    for _ in 0..lines
+        code.push(false)
+        inside.push(false)
+    var opens: Buf[usize] = buf()
+    var last = 0usize
+    for t in lex(program).items.items
+        t.value match
+            Indent -> opens.push(last)
+            Dedent ->
+                if opens.len() > 0
+                    val start = opens[opens.len() - 1]
+                    opens.pop()
+                    lsp_fold(&folds, start, last, "")
+            Newline -> ()
+            _ ->
+                val first = program.locate(t.span.start).line
+                val end = program.locate(if t.span.end > t.span.start then t.span.end - 1 else t.span.start).line
+                code[first] = true
+                for l in first + 1..end
+                    inside[l] = true
+                lsp_fold(&folds, first, end, "")
+                last = end
+    while opens.len() > 0
+        lsp_fold(&folds, opens[opens.len() - 1], last, "")
+        opens.pop()
+    // Runs of comment lines.
+    var run = 0usize
+    for l in 1..lines + 1
+        val comment = l <= lines && !inside[l] && !code[l] && lsp_line_starts(program, l, "//")
+        if comment
+            if run == 0 then run = l
+        else
+            if run != 0 then lsp_fold(&folds, run, l - 1, "comment")
+            run = 0
+    // The imports, as long as nothing but blank and comment lines comes between two of them.
+    val imports = parse(doc).file.imports
+    var from = 0usize
+    var to = 0usize
+    for i in imports
+        val first = program.locate(i.span.start).line
+        val end = program.locate(if i.span.end > i.span.start then i.span.end - 1 else i.span.start).line
+        var apart = from == 0
+        for l in to + 1..<first
+            if code[l] then apart = true
+        if apart
+            lsp_fold(&folds, from, to, "imports")
+            from = first
+        to = end
+    lsp_fold(&folds, from, to, "imports")
+    // A literate file's runs of program text: a line of prose ends one.
+    if is_literate(d.file)
+        var start = 0usize
+        var end = 0usize
+        for l in 1..lines
+            if !lsp_line_blank(program, l)
+                if start == 0 then start = l
+                end = l
+            elif !lsp_line_blank(doc, l)
+                lsp_fold(&folds, start, end, "region")
+                start = 0
+        lsp_fold(&folds, start, end, "region")
+    // In order of the first line, the longer first; then as JSON.
+    for i in 1..<folds.len()
+        var j = i
+        while j > 0 && (folds[j - 1].start > folds[j].start || folds[j - 1].start == folds[j].start && folds[j - 1].end < folds[j].end)
+            val held = folds[j - 1]
+            folds[j - 1] = folds[j]
+            folds[j] = held
+            j -= 1
+    var out: Buf[Json] = buf()
+    for f in folds
+        var range: Buf[JsonMember] = buf()
+        lsp_put(&range, "startLine", Json.Int(long(f.start)))
+        lsp_put(&range, "endLine", Json.Int(long(f.end)))
+        if f.kind != "" then lsp_put(&range, "kind", Json.Str(f.kind))
+        out.push(Json.Obj(range))
+    Json.Arr(out)
+
+// A region from line `start` to line `end`, both counted from one, unless it is one line or none, or
+// one of those lines is already a region.
+private lsp_fold(folds: *Buf[LspFold], start: usize, end: usize, kind: string)
+    if start == 0 || end <= start then return
+    for f in *folds
+        if f.start == start - 1 && f.end == end - 1 then return
+    folds.push(LspFold(start - 1, end - 1, kind))
+
+// Whether line `line` holds nothing but blanks.
+private lsp_line_blank(src: Source, line: usize) -> bool
+    val span = src.line_span(line)
+    for i in span.start..<span.end
+        val b = src.bytes[i]
+        if b != u8(' ') && b != u8('\t') && b != u8('\r') && b != u8('\n') then return false
+    true
+
+// Whether line `line`, past its blanks, starts with `text`.
+private lsp_line_starts(src: Source, line: usize, text: string) -> bool
+    val span = src.line_span(line)
+    var i = span.start
+    while i < span.end && (src.bytes[i] == u8(' ') || src.bytes[i] == u8('\t'))
+        i += 1
+    if i + text.bytes.len > span.end then return false
+    for k in 0..<text.bytes.len
+        if src.bytes[i + k] != text.bytes[k] then return false
+    true

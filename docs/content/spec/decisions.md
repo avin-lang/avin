@@ -3686,6 +3686,27 @@ spelling is better, as each entry says.
 
 ## Proposed
 
+- **The language server's `workspace/symbol` and `textDocument/foldingRange`** (branch
+  `lsp-symbols-folding`). Workspace symbols are read off each file's parse, for every program an
+  open document belongs to, its unopened files included and its dependencies' left out; a name
+  matches a query holding its characters in order (a subsequence), ASCII letters in either case; at
+  most 500 symbols are listed, in file order, for any query. A symbol's location is its name, its
+  container its module, or its type for a method, a variant or a machine's state; an actor is listed
+  once, as its class, and compiler-written members (names with a `$`) are not listed. Folding is by
+  whole lines, from the lexer's blocks (the line before an indent to the last line of code before the
+  matching dedent), multi-line tokens, comment runs, the import run and, in a literate file, runs of
+  program text; two regions of the same lines are listed once, the block's kind winning. WHY: the
+  parse is there while the program has mistakes, as the outline's is; a subsequence is what editors'
+  symbol search does; 500 is more than a person reads and small enough to answer per keystroke; the
+  lexer's indent and dedent tokens already know comments, text blocks and bracketed continuations,
+  which a reading of indentation alone would not. ALTERNATIVES: symbols from the checker's index
+  (absent while the program has a syntax error, and it holds no declarations of its own); prefix or
+  fuzzy-scored matching ranked by score (fine to add later; the protocol leaves ranking to the
+  client); Unicode case folding (needs a case table the compiler does not have); no cap, or a cap
+  only for the empty query; folding by indentation alone. Review with the user: whether ranking by
+  match quality is wanted, and whether a machine's compiler-written `state()`/`handle()` should be
+  listed (they are, at the machine's name).
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

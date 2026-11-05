@@ -126,11 +126,11 @@ lsp_initialize()
     assert_eq(lsp_one(&server, lsp_request(1, "initialize", "{\"capabilities\":{}}")),
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-16\"," +
         "\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":true},\"hoverProvider\":true," +
-        "\"definitionProvider\":true,\"documentSymbolProvider\":true,\"referencesProvider\":true," +
+        "\"definitionProvider\":true,\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"referencesProvider\":true," +
         "\"documentHighlightProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\"," +
         "\"class\",\"struct\",\"enum\",\"interface\",\"typeParameter\",\"enumMember\",\"function\",\"method\"," +
         "\"property\",\"parameter\",\"variable\"],\"tokenModifiers\":[\"declaration\",\"readonly\",\"static\"," +
-        "\"defaultLibrary\"]},\"full\":true},\"documentFormattingProvider\":true,\"documentRangeFormattingProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]}}," +
+        "\"defaultLibrary\"]},\"full\":true},\"documentFormattingProvider\":true,\"documentRangeFormattingProvider\":true,\"foldingRangeProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]}}," +
         s"\"serverInfo\":{\"name\":\"avin\",\"version\":\"$Version\"}}}")
     assert_eq(lsp_answer(&server, lsp_notify("initialized", "{}")).len(), 0)
 
@@ -1271,3 +1271,207 @@ lsp_single_variant_import()
         if it.label == "Italic" then italics += 1
     assert_eq(italics, 1)
     remove_dir_all(dir).unwrap_or(())
+
+// ---- folding ----
+
+private lsp_fold_of(start: int, end: int, kind: string) -> string =
+    if kind == "" then s"{\"startLine\":$start,\"endLine\":$end}"
+    else s"{\"startLine\":$start,\"endLine\":$end,\"kind\":\"$kind\"}"
+
+// The folding ranges of `text`, opened as `name` in a fresh directory.
+private lsp_folds(name: string, text: string) -> string
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    val uri = lsp_file_uri(dir + "/" + name)
+    var server = lsp_ready()
+    lsp_answer(&server, lsp_open(uri, text))
+    val answer = lsp_one(&server, lsp_request(2, "textDocument/foldingRange", s"{\"textDocument\":{\"uri\":\"$uri\"}}"))
+    remove_dir_all(dir).unwrap_or(())
+    answer
+
+@test("lsp: folding finds nothing in an empty file, in one-line declarations, or in one line of comment or import")
+lsp_folding_nothing()
+    assert_eq(lsp_folds("t.avin", ""), lsp_reply(2, "[]"))
+    assert_eq(lsp_folds("t.avin", "import avin.time\n\ndouble(n: int) -> int = n * 2\nval x: int = 1\n// one comment\nmain() = ()\n"),
+        lsp_reply(2, "[]"))
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_request(2, "textDocument/foldingRange", "{\"textDocument\":{\"uri\":\"file:///not/open.avin\"}}")),
+        lsp_reply(2, "null"))
+
+@test("lsp: folding finds nested blocks, a match and its arm, comment runs and the imports, outer first")
+lsp_folding_nested()
+    val text = "import avin.time\nimport avin.threads.{Channel}\n\n// A box.\n// Over two lines.\nclass Box(val w: int)\n" +
+        "    size() -> int\n        val s = w * w\n        s\n\nmain()\n    val v = 3 match\n        3 ->\n" +
+        "            print(\"three\")\n            1\n        _ -> 0\n    print(v)\n"
+    assert_eq(lsp_folds("t.avin", text), lsp_reply(2, s"[${lsp_fold_of(0, 1, "imports")},${lsp_fold_of(3, 4, "comment")}," +
+        s"${lsp_fold_of(5, 8, "")},${lsp_fold_of(6, 8, "")},${lsp_fold_of(10, 16, "")},${lsp_fold_of(11, 15, "")},${lsp_fold_of(12, 14, "")}]"))
+    // Blank and comment lines between two imports keep them one run; a comment line alone is no run.
+    assert_eq(lsp_folds("t.avin", "import avin.time\n\n// about threads\nimport avin.threads.{Channel}\nimport avin.text\n\nmain() = ()\n"),
+        lsp_reply(2, s"[${lsp_fold_of(0, 4, "imports")}]"))
+    // Blank lines inside a block are folded with it, and a block's end is its last line of code,
+    // not a comment after it.
+    assert_eq(lsp_folds("t.avin", "main()\n    print(1)\n\n    print(2)\n    // trailing\nf() = 1\n"),
+        lsp_reply(2, s"[${lsp_fold_of(0, 3, "")}]"))
+
+@test("lsp: a text block folds, its lines are not comments, and Unicode names change no line")
+lsp_folding_text_blocks()
+    val text = "café(n: int) -> string\n    // first\n    // second\n    // third\n    val t = \"\"\"\n" +
+        "        // not a comment\n        // nor this\n        😀\n        \"\"\"\n    t\n\n// lone\nmain() = print(café(1))\n"
+    assert_eq(lsp_folds("t.avin", text), lsp_reply(2, s"[${lsp_fold_of(0, 9, "")},${lsp_fold_of(1, 3, "comment")},${lsp_fold_of(4, 8, "")}]"))
+    // Two comment runs a blank line apart are two runs.
+    assert_eq(lsp_folds("t.avin", "// a\n// b\n\n// c\n// d\nmain() = ()\n"),
+        lsp_reply(2, s"[${lsp_fold_of(0, 1, "comment")},${lsp_fold_of(3, 4, "comment")}]"))
+
+@test("lsp: a literate file folds each run of program text, its blocks inside, and none of its prose")
+lsp_folding_literate()
+    val text = "# Title\n\nProse here.\n\n    main()\n        print(1)\n\n        print(2)\n\nMore prose.\n\n" +
+        "    helper() = 3\n\n    other() = 4\n\n```\nnot() = code\n```\n\n    last() = 5\n"
+    assert_eq(lsp_folds("t.lavin", text), lsp_reply(2, s"[${lsp_fold_of(4, 7, "")},${lsp_fold_of(11, 13, "region")}]"))
+    // A literate file whose program cannot be read has nothing to fold.
+    assert_eq(lsp_folds("t.lavin", "Prose\n\n```\n    a() = 1\n    b() = 2\n"), lsp_reply(2, "[]"))
+    // The same text as an ordinary file is read as code, not as a document.
+    assert_eq(lsp_folds("t.avin", "main()\n    print(1)\n"), lsp_reply(2, s"[${lsp_fold_of(0, 1, "")}]"))
+
+// ---- tests and local functions in the outline ----
+
+@test("lsp: the outline marks tests by their description or @test, and nests local functions in their function")
+lsp_document_symbols_of_tests_and_locals()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    val uri = lsp_file_uri(dir + "/t.avin")
+    val text = "@test(\"adds two numbers\")\nadds()\n    helper(n: int) -> int\n        inner() -> int = n\n        inner()\n" +
+        "    assert(helper(1) == 1)\n\n@test\nplain() = ()\n\n@test(should_trap)\ntraps() = ()\n\nmain()\n" +
+        "    for i in 0..<2\n        step() = print(i)\n        step()\n    if true\n        twice(y: int) -> int = y * 2\n" +
+        "        print(twice(1))\n\nclass C\n    m() -> int\n        k() -> int = 1\n        k()\n"
+    var server = lsp_ready()
+    lsp_answer(&server, lsp_open(uri, text))
+    val answer = lsp_one(&server, lsp_request(2, "textDocument/documentSymbol", s"{\"textDocument\":{\"uri\":\"$uri\"}}"))
+    val inner = lsp_sym("inner", 12, lsp_test_range(3, 8, 3, 26), lsp_test_range(3, 8, 3, 13), "")
+    val helper = lsp_sym("helper", 12, lsp_test_range(2, 4, 4, 15), lsp_test_range(2, 4, 2, 10), inner)
+    // A function's range starts at its name, after its annotations, as every declaration's does.
+    val adds = lsp_detailed("adds", "adds two numbers", 12, lsp_test_range(1, 0, 5, 26), lsp_test_range(1, 0, 1, 4), helper)
+    val plain = lsp_detailed("plain", "@test", 12, lsp_test_range(8, 0, 8, 12), lsp_test_range(8, 0, 8, 5), "")
+    val traps = lsp_detailed("traps", "@test", 12, lsp_test_range(11, 0, 11, 12), lsp_test_range(11, 0, 11, 5), "")
+    val step = lsp_sym("step", 12, lsp_test_range(15, 8, 15, 25), lsp_test_range(15, 8, 15, 12), "")
+    val twice = lsp_sym("twice", 12, lsp_test_range(18, 8, 18, 36), lsp_test_range(18, 8, 18, 13), "")
+    val main = lsp_sym("main", 12, lsp_test_range(13, 0, 19, 23), lsp_test_range(13, 0, 13, 4), s"$step,$twice")
+    val k = lsp_sym("k", 12, lsp_test_range(23, 8, 23, 22), lsp_test_range(23, 8, 23, 9), "")
+    val m = lsp_sym("m", 6, lsp_test_range(22, 4, 24, 11), lsp_test_range(22, 4, 22, 5), k)
+    val c = lsp_sym("C", 5, lsp_test_range(21, 0, 24, 11), lsp_test_range(21, 6, 21, 7), m)
+    assert_eq(answer, lsp_reply(2, s"[$adds,$plain,$traps,$main,$c]"))
+    remove_dir_all(dir).unwrap_or(())
+
+private lsp_detailed(name: string, detail: string, kind: int, range: string, selection: string, children: string) -> string =
+    s"{\"name\":\"$name\",\"detail\":${json_quote(detail)},\"kind\":$kind,\"range\":$range,\"selectionRange\":$selection" +
+        (if children == "" then "}" else s",\"children\":[$children]}")
+
+@test("lsp: a test's detail is its description, or @test; any other function has none")
+lsp_test_details()
+    val parsed = parse(source_of("t.avin", "@test(\"a sentence\")\na() = ()\n@test\nb() = ()\n@test(\"\")\nc() = ()\n@test(timeout: 5)\nd() = ()\n@tailrec\ne() = ()\nf() = ()\n"))
+    var details: Buf[string] = buf()
+    for item in parsed.file.items
+        if item is FunctionItem(f) then details.push(lsp_test_detail(f))
+    assert_eq(details.len(), 6)
+    assert_eq(details[0], "a sentence")
+    assert_eq(details[1], "@test")
+    assert_eq(details[2], "@test")
+    assert_eq(details[3], "@test")
+    assert_eq(details[4], "")
+    assert_eq(details[5], "")
+
+// ---- the workspace's symbols ----
+
+private lsp_wsym(name: string, kind: int, uri: string, range: string, container: string) -> string =
+    s"{\"name\":${json_quote(name)},\"kind\":$kind,\"location\":{\"uri\":\"$uri\",\"range\":$range}" +
+        (if container == "" then "}" else s",\"containerName\":${json_quote(container)}}")
+
+private lsp_symbols_for(server: *LspServer, id: int, query: string) -> string =
+    lsp_one(server, lsp_request(id, "workspace/symbol", s"{\"query\":${json_quote(query)}}"))
+
+@test("lsp: the workspace's symbols span every module of the program, opened or not, matched by subsequence in any case")
+lsp_workspace_symbols_across_modules()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    make_dir_all(dir + "/geo").unwrap()
+    write_text(dir + "/geo/shapes.avin", "module geo\n\ndata Shape\n    Circle(r: int)\n\nclass Größe(val x: int)\n" +
+        "    norm() -> int = x * x\n\nimpl Shape\n    area() -> int = 1\n\nval origin: int = 0\nvar count: int = 0\n\n" +
+        "actor Echo receives int\n    receive\n        n -> print(n)\n\nmachine Door receives int\n    state Shut\n" +
+        "        _ -> Open\n    state Open\n        _ -> Shut\n").unwrap()
+    val text = "import geo.{Größe}\n\nmain()\n    print(Größe(1).norm())\n"
+    write_text(dir + "/main.avin", text).unwrap()
+    val uri = lsp_file_uri(dir + "/main.avin")
+    val geo = lsp_file_uri(dir + "/geo/shapes.avin")
+    var server = lsp_ready()
+    assert_eq(lsp_symbols_for(&server, 2, ""), lsp_reply(2, "[]"))
+    lsp_answer(&server, lsp_open(uri, text))
+    val shape = lsp_wsym("Shape", 10, geo, lsp_test_range(2, 5, 2, 10), "geo")
+    val circle = lsp_wsym("Circle", 22, geo, lsp_test_range(3, 4, 3, 10), "geo.Shape")
+    val größe = lsp_wsym("Größe", 5, geo, lsp_test_range(5, 6, 5, 11), "geo")
+    val norm = lsp_wsym("norm", 6, geo, lsp_test_range(6, 4, 6, 8), "geo.Größe")
+    val area = lsp_wsym("area", 6, geo, lsp_test_range(9, 4, 9, 8), "geo.Shape")
+    val origin = lsp_wsym("origin", 14, geo, lsp_test_range(11, 4, 11, 10), "geo")
+    val count = lsp_wsym("count", 13, geo, lsp_test_range(12, 4, 12, 9), "geo")
+    // An actor is its class, and the members the compiler writes for it are not listed; a machine's
+    // states are its `State` type's variants, that type found at the machine's name, and its
+    // `state()` and `handle(event)` are its methods.
+    val echo = lsp_wsym("Echo", 5, geo, lsp_test_range(14, 6, 14, 10), "geo")
+    val states = lsp_wsym("State", 10, geo, lsp_test_range(18, 8, 18, 12), "geo.Door")
+    val shut = lsp_wsym("Shut", 22, geo, lsp_test_range(19, 10, 19, 14), "geo.Door.State")
+    val open = lsp_wsym("Open", 22, geo, lsp_test_range(21, 10, 21, 14), "geo.Door.State")
+    val door = lsp_wsym("Door", 5, geo, lsp_test_range(18, 8, 18, 12), "geo")
+    val state = lsp_wsym("state", 6, geo, lsp_test_range(18, 8, 18, 8), "geo.Door")
+    val handle = lsp_wsym("handle", 6, geo, lsp_test_range(18, 8, 18, 8), "geo.Door")
+    // The root module's files come after the modules', and have no module to be in.
+    val main = lsp_wsym("main", 12, uri, lsp_test_range(2, 0, 2, 4), "")
+    val all = lsp_symbols_for(&server, 3, "")
+    assert_eq(all, lsp_reply(3, s"[$shape,$circle,$größe,$norm,$area,$origin,$count,$echo,$states,$shut,$open,$door,$state,$handle,$main]"))
+    assert_eq(lsp_symbols_for(&server, 10, "sh"), lsp_reply(10, s"[$shape,$shut]"))
+    assert_eq(lsp_symbols_for(&server, 11, "receive"), lsp_reply(11, "[]"))
+    assert_eq(lsp_symbols_for(&server, 4, "norm"), lsp_reply(4, s"[$norm]"))
+    assert_eq(lsp_symbols_for(&server, 5, "NoRM"), lsp_reply(5, s"[$norm]"))
+    assert_eq(lsp_symbols_for(&server, 6, "gße"), lsp_reply(6, s"[$größe]"))
+    assert_eq(lsp_symbols_for(&server, 7, "  main "), lsp_reply(7, s"[$main]"))
+    assert_eq(lsp_symbols_for(&server, 8, "zzz"), lsp_reply(8, "[]"))
+    assert_eq(lsp_symbols_for(&server, 9, "nrom"), lsp_reply(9, "[]"))
+    // A file the editor holds is read as it holds it, saved or not.
+    lsp_answer(&server, lsp_open(geo, "module geo\n\nfresh() = 1\n"))
+    assert_eq(lsp_symbols_for(&server, 12, "fresh"), lsp_reply(12, s"[${lsp_wsym("fresh", 12, geo, lsp_test_range(2, 0, 2, 5), "geo")}]"))
+    assert_eq(lsp_symbols_for(&server, 13, "norm"), lsp_reply(13, "[]"))
+    remove_dir_all(dir).unwrap_or(())
+
+@test("lsp: the workspace's symbols stop at the limit, the empty query's and a matching one's alike")
+lsp_workspace_symbols_limit()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    val uri = lsp_file_uri(dir + "/t.avin")
+    var text = "main() = ()\n"
+    for i in 0..<600
+        text = text + s"f$i() = ()\n"
+    var server = lsp_ready()
+    lsp_answer(&server, lsp_open(uri, text))
+    val all = parse_json(lsp_symbols_for(&server, 2, "")).unwrap()
+    assert_eq(all.get("result").unwrap().len(), WorkspaceSymbolLimit)
+    // Of f0 to f599, the 195 names with a 1 in them.
+    val ones = parse_json(lsp_symbols_for(&server, 3, "f1")).unwrap()
+    assert_eq(ones.get("result").unwrap().len(), 195)
+    val many = parse_json(lsp_symbols_for(&server, 4, "f")).unwrap()
+    assert_eq(many.get("result").unwrap().len(), WorkspaceSymbolLimit)
+    remove_dir_all(dir).unwrap_or(())
+
+@test("lsp: a query matches a name holding its characters in order, ignoring the case of ASCII letters")
+lsp_symbol_query_matching()
+    val none: Buf[char] = buf()
+    assert(lsp_matches(none, "anything"))
+    assert(lsp_matches(none, ""))
+    var w: Buf[char] = buf()
+    w.push('a')
+    w.push('c')
+    assert(lsp_matches(w, "abc"))
+    assert(lsp_matches(w, "ABC"))
+    assert(lsp_matches(w, "ac"))
+    assert(!lsp_matches(w, "ca"))
+    assert(!lsp_matches(w, "a"))
+    assert(!lsp_matches(w, ""))
+    var u: Buf[char] = buf()
+    u.push('é')
+    u.push('😀')
+    assert(lsp_matches(u, "xéy😀"))
+    assert(!lsp_matches(u, "😀é"))
+    // Only ASCII letters fold: `É` is not `é`.
+    assert(!lsp_matches(u, "É😀"))
