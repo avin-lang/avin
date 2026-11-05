@@ -2246,7 +2246,9 @@ their words are reserved.
   - Printing stays legal with no promise: `print`, `println`, `eprintln` and the `StandardOutput`
     and `StandardError` objects reach the runtime's streams, which keep no state in Avin, and the
     objects hold no field. The standard library's own module-level state is held to the rule like
-    a program's: the futures' worker registry, guarded by its lock, promises `Sendable`, and so does
+    a program's: the futures' worker registry, guarded by its lock, promises `Sendable`, as do the
+    regex library's Unicode run tables (arrays filled before the table is made and never written
+    after), and so does
     the `Annotation` trait, since a type's shape is one module-level value every thread may read
     (an annotation type holding a mutable field is now rejected where it implements the trait). A
     collection's companion object (`Array`, `Buffer`, `Deque`, the mutable `Map` and `Set`) is
