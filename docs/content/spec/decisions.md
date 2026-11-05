@@ -2693,15 +2693,7 @@ their words are reserved.
     above); making `MatchPartialFunction` promise `Sendable` (it holds two plain function fields,
     which are not sendable, and a `match` function's static type is the trait anyway).
 
-**Deferred**
-
-- Public C interoperability. Until then, C is reached through Sysl.
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- Proposed (built on branch `ui-components`): **Interface state is a generic Avin class
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-components`): **Interface state is a generic Avin class
   `State[T]`, with `get`, `set` and `update(f)`, and a set is one write: an `invalidate()` for a
   state held in Avin, or a write of its signal for one a control has linked**
   ([components](/spec/ui/#components-and-state)). Why: the state lives in Avin, so it holds any
@@ -2710,7 +2702,7 @@ their words are reserved.
   state (only four instances exist, so a list or a data value could not be state); a set that skips
   the write when the value is unchanged (needs `Eq` on every `T`, and a function or a class has
   none).
-- Proposed (built on branch `ui-components`): **A control over a state reads and writes the
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-components`): **A control over a state reads and writes the
   state's own signal, made once by `State.signal(s)`, which is from then on where the value lives**,
   rather than a second copy kept in step. Why: one place for the value means a control's write is
   the state's value at once, with no build in between, and no write can echo back into the other
@@ -2719,7 +2711,7 @@ their words are reserved.
   conflict to resolve when both change); a callback from syslui on each write (not in the binding).
   The controls taking a `State` are overloads of the binding's own (`switch`, `checkbox`, `radio`,
   `radioGroup`, both `slider`s, `textField`, `textArea`, `tabs`, `scroll`).
-- Proposed (built on branch `ui-components`): **Components are functions returning `View`, written
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-components`): **Components are functions returning `View`, written
   `component c -> …` or `keyed(key) c -> …`; what a component keeps across builds is asked of its
   `Scope` by order (`c.state(init)`, `c.remember(make)`, `c.derived(f)`), and a component is found
   again by its place among its parent's unkeyed components, or by its key.** A build is a call of
@@ -2733,20 +2725,20 @@ their words are reserved.
   state machine per component (fits a component with modes, not one holding a value); a scope
   passed from parent to child explicitly (every call of a component would carry it). Review with
   the user: the shape of the API, and whether keys should be any `Hash` value rather than a
-  `string` or an `int`.
-- Proposed (built on branch `ui-components`): **The mistakes the order and the keys can make stop
+  `string` or an `int`. **Review with the user**: the component API's shape, and whether keys should be any `Hash` rather than a string or an int.
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-components`): **The mistakes the order and the keys can make stop
   the program**: a component built with no root building, two components under one parent with one
   key, a slot asked for as another type than the last build's, a scope asked after its build, and a
   root built inside its own build. Why: each would otherwise give one component another's state
   silently. Alternatives weighed: starting the slot or the component afresh (hides the mistake), a
   warning (Avin has no runtime warning channel).
-- Proposed (built on branch `ui-components`): **`derived(f)` computes again only after something
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-components`): **`derived(f)` computes again only after something
   has been written since its last computation, by the counter `writes()` answers**, rather than by
   the states it read. Why: every state, signal and `invalidate()` moves the counter, so it is never
   stale where the frame loop would rebuild, and it needs no record of what `f` read. Alternatives
   weighed: tracking the states read during `f` (finer, but a hidden global and a cost on every
   `get`), computing on every call (no use as a value of its own).
-- Proposed (built on branch `ui-components`): **The interface's state belongs to the thread running
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-components`): **The interface's state belongs to the thread running
   it, and the type system keeps it there**: a `State`, a `Derived` and a `Scope` are mutable, so not
   sendable, and a closure for another thread cannot capture one. There is no `post` or `runOnUi` yet.
   Why: the frame loop's write counter and syslui's signals are not synchronized, so the only sound
@@ -2754,10 +2746,20 @@ their words are reserved.
   another thread. Alternatives weighed: a sendable `post(@sendable f)` queuing a change (its
   function could not capture the state it is meant to change, so it would need a sendable handle
   to a state, a design of its own). Review with the user: a worker reporting to the interface
-  needs that handle and a way to wake the frame loop.
-- Proposed (built on branch `ui-components`): **An example program is one package, so the to-do
+  needs that handle and a way to wake the frame loop. **Review with the user**: the path from another thread, which needs a sendable handle and a way to wake the frame loop.
+- Settled on the user's delegation 2026-11-05 (built on branch `ui-components`): **An example program is one package, so the to-do
   example is `examples/ui-todo` beside `examples/ui`**, since the corpus builds each directory of
   `examples` as one program with one `main`.
+
+**Deferred**
+
+- Public C interoperability. Until then, C is reached through Sysl.
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
+
+None at present.
 
 ## Open
 
