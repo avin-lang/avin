@@ -1857,6 +1857,12 @@ their words are reserved.
     shadow-stack frame before the call, and are built on branch `tailcalls` with their own entry.
   - The language has no `try`, `defer` or `finally`, so there is no pending cleanup to take a call
     out of tail position; when such a construct is added, a call inside it is not in tail position.
+- Settled on the user's delegation 2026-11-05 (built on branch `option-ord`): [`Option[T]` is an
+  `Ord` when `T` is](/spec/errors/#option-and-result), `None` before every `Some` and `Some`s as their
+  values, following the reference library's ordering of options. It makes `derives Ord` work on a
+  data type with an `Option` field and lets options sort and have `max`/`min`. Alternative: no order
+  on options, leaving a field of one underivable — rejected as the cost falls on every record with
+  an optional field. Tuples, `Either` and `Result` have no `Ord` here.
 
 **Deferred**
 
