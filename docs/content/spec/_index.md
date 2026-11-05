@@ -45,6 +45,7 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
 | [Errors](/spec/errors/) | `Result`, `Option`, `?`, traps |
 | [Collections](/spec/collections/) | The Iterable hierarchy, arrays, literals, ranges, `for` |
 | [Sysl bindings](/spec/sysl-bindings/) | Calling Sysl from Avin |
+| [C bindings](/spec/c-bindings/) | Calling C libraries directly: prototypes checked against headers, handles, buffers, callbacks |
 | [Operators and control flow](/spec/operators-and-control-flow/) | Operators, blocks, `if`, `while`, `match` |
 | [Call-by-name](/spec/by-name/) | `value: -> T` parameters |
 | [Strings and formatting](/spec/strings-and-formatting/) | Interpolation and format specifiers |

@@ -690,8 +690,10 @@ runEvery(ms: long, @threaded tick: () -> bool)
 
 ## Relationship to C
 
-Public C interoperability is deferred. In the meantime, a C library reaches Avin through Sysl: Sysl
-binds the C API with its own FFI, and Avin binds the Sysl API.
+A C library is bound directly, by [C bindings](/spec/c-bindings/), which are calls from Avin's own
+code rather than through a shim. Until they are built, and wherever Sysl already binds a library
+well, a C library reaches Avin through Sysl: Sysl binds the C API with its own FFI, and Avin binds
+the Sysl API.
 
 ## The runtime is different
 

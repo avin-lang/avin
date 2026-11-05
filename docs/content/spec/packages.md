@@ -134,6 +134,21 @@ The libraries are kept beside the shims' cached archive, so a cached build links
 `pkg_config` module the machine does not know stops the link with the command that failed. The C a
 package carries in its own tree is compiled into the shims' archive and needs nothing at the link.
 
+### C libraries
+
+A package whose [C bindings](/spec/c-bindings/) call a C library names it in `c-libraries`: the
+`pkg-config` module (or the `link` names) that finds and links it, the `headers` its bindings are
+checked against, and an `install` sentence for a build that cannot find it.
+
+```hocon
+c-libraries {
+  mlt { pkg-config = "mlt-framework-7", headers = ["framework/mlt.h"], install = "brew install mlt" }
+}
+```
+
+A program links the C libraries of every package in it, asking `pkg-config` at every build. They are
+the machine's, not fetched: they get no line in `avin.sum`.
+
 ### What a dependency brings in
 
 **A dependency's modules come in under their own names.** A package `geometry` whose directory holds
