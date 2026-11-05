@@ -20,9 +20,12 @@ struct Uses
      * decided when the program is lowered, so the caller adds the candidates to `functions`. */
     operators: Buf[string]
     operator_types: Buf[&Type]
+    /** The module-level `lazy val`s the code reads. A read runs the initializer, whose call is
+     * among `functions`; the value is not among `globals`, since it has no place in the order. */
+    lazies: Buf[usize]
 
 uses_of(body: &TExpr) -> Uses
-    var u = Uses(buf(), buf(), buf(), buf(), buf(), buf())
+    var u = Uses(buf(), buf(), buf(), buf(), buf(), buf(), buf())
     collect(&u, body)
     u
 
@@ -94,7 +97,9 @@ private collect(u: *Uses, e: &TExpr)
     e.kind match
         Global(g) -> add(&u.globals, g)
         // A lazy value's read may run its initializer, so it uses what the initializer uses.
-        LazyGlobal(_, initialize, _) -> collect(u, initialize)
+        LazyGlobal(g, initialize, _) ->
+            add(&u.lazies, g)
+            collect(u, initialize)
         LazyField(object, _, initialize, _) ->
             collect(u, object)
             collect(u, initialize)
@@ -128,7 +133,9 @@ private collect(u: *Uses, e: &TExpr)
             collect(u, value)
         Block(items) -> collect_all(u, items)
         Let(_, value) -> collect(u, value)
-        LetPattern(_, value) -> collect(u, value)
+        LetPattern(pattern, value) ->
+            collect_pattern(u, pattern)
+            collect(u, value)
         Store(_, value, _) -> collect(u, value)
         MultiStore(_, value) -> collect(u, value)
         Negate(x) ->
@@ -163,13 +170,44 @@ private collect(u: *Uses, e: &TExpr)
         Match(subject, arms) ->
             collect(u, subject)
             for arm in arms
+                collect_pattern(u, arm.pattern)
                 collect_option(u, arm.guard)
                 collect(u, arm.body)
-        Is(value, _, _) -> collect(u, value)
+        Is(value, pattern, _) ->
+            collect(u, value)
+            collect_pattern(u, pattern)
         Clauses(subjects, clauses) ->
             collect_all(u, subjects)
             for clause in clauses
+                for p in clause.patterns
+                    collect_pattern(u, p)
                 for b in clause.bodies
                     collect_option(u, b.guard)
                     collect(u, b.body)
+        _ -> ()
+
+// A pattern runs code as it matches: an extractor's method, a sequence's length and elements, the
+// comparison with a constant.
+private collect_pattern(u: *Uses, p: &TPattern)
+    p.kind match
+        PLiteral(value) -> collect(u, value)
+        PBounds(_, lower, upper) ->
+            if lower is Some(b) then collect(u, b.value)
+            if upper is Some(b) then collect(u, b.value)
+        PSuccessor(_, amount) -> collect(u, amount)
+        PAlternatives(options) ->
+            for o in options
+                collect_pattern(u, o)
+        PNamed(_, inner) -> collect_pattern(u, inner)
+        PVariant(_, fields) ->
+            for f in fields
+                collect_pattern(u, f)
+        PSequence(_, test, elements, items, _) ->
+            collect(u, test)
+            collect_all(u, elements)
+            for item in items
+                collect_pattern(u, item)
+        PView(_, view, inner) ->
+            collect(u, view)
+            collect_pattern(u, inner)
         _ -> ()
