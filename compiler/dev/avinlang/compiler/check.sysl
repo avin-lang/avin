@@ -292,6 +292,8 @@ struct ThreadedArgument
     value: &TExpr
     binding: string
     param: string
+    /** Who calls the function: `Sysl`, or `C` for a C binding. */
+    caller: string
 
 /** A class body checked part way: its initializer's body so far, the code checked so far, the next
  * member to check and the next field it declares. */
@@ -7284,6 +7286,17 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
             val ctext = if inout then cp.pointee_text else cp.text
             var problem = ""
             val array = c_array_form(t, c.data, c.classes)
+            if is_threaded_param(decl) && cp.callback.len() == 0
+                c.note(unit, decl.pattern.span, "`@threaded` marks a parameter that takes a function, which C may call from any thread")
+            if cp.callback.len() > 0
+                if decl.by_name then problem = "a by-name parameter cannot cross a C binding"
+                else
+                    val message = c_callback_problem(c, cp, t)
+                    if message != "" then c.note(unit, decl.ty.span, s"parameter ${i + 1} of the C binding `${f.name}` takes the function C calls through `${cp.name}`, and `${type_name(t)}` cannot be it: $message")
+                continue
+            if *t is Function(_, _, _)
+                c.note(unit, decl.ty.span, s"parameter ${i + 1} of the C binding `${f.name}` is a function in Avin and `${cp.text}` in C: a function crosses to C only for a parameter of function-pointer type, as in `void (*listener)(userdata void *data, int value)`")
+                continue
             if c_is_array_param(p, positions[i + first])
                 problem = array match
                     Some(form) -> c_array_problem(cp, form, c.data)
@@ -7607,6 +7620,19 @@ private check_c_ownership(c: *Checker, unit: usize, f: &Function, a: Annotation,
                     None ->
                         c.note(unit, a.span, s"`$word:` names `$name`, which is not a parameter of `${f.name}`")
                         continue
+                // A function C keeps is held by the handle that keeps it, which tells C to stop
+                // calling it before its object goes back.
+                if *params[i] is Function(_, _, _)
+                    if which == 1
+                        c.note(unit, a.span, s"`consumes:` names the function `$name`: C keeps a function, with `keeps:`, or calls it during the call alone")
+                        continue
+                    val holder = if made is Some(_) then made else receiver_class
+                    holder match
+                        Some(k) ->
+                            if c_class_text(c.classes[k].decl, "forget") is None
+                                c.note(unit, a.span, s"`${f.name}` keeps the function `$name`, so `${c.classes[k].name}`, which keeps it, declares `forget:`, the C call that stops C calling it before the object goes back")
+                        None -> c.note(unit, a.span, s"`keeps:` makes the handle a binding answers keep what it names, and `${f.name}` answers no handle and is no method of one")
+                    continue
                 c_handle_form(params[i], c.data, c.classes) match
                     Some(h) -> class_index = Some(h.class_index)
                     None ->
@@ -7632,6 +7658,49 @@ private check_c_ownership(c: *Checker, unit: usize, f: &Function, a: Annotation,
                             if x == wanted then n += 1
                         if n != 1 then c.note(unit, a.span, s"`${c.classes[k].name}` names the `${kept.class_name}` it keeps, `${kept.name}`, so every binding that makes one keeps exactly one `${kept.class_name}`; `${f.name}` keeps $n")
                 None -> c.note(unit, a.span, s"`${c.classes[k].name}`'s `kept:` names the class `${kept.class_name}`, which is not a class of its module")
+
+// Why the Avin type `t` cannot take the function C calls through the parameter `q`, or "" when it
+// can: a function taking what C calls it with, but for the `userdata`, each crossing out of C as a
+// result does, a handle lent, and answering what C's function answers, crossing into C as a parameter
+// does, `unit` where C's answers nothing.
+private c_callback_problem(c: *Checker, q: CParam, t: &Type) -> string
+    val f = q.callback[0]
+    val (ps, r) = *t match
+        Function(ps, r, _) -> (ps, r)
+        ErrorType -> return ""
+        _ -> return s"the parameter takes a function, an Avin function of a matching type, as in `(int, int) -> int`"
+    val positions = c_callback_positions(f)
+    if positions.len() != ps.len()
+        return s"C calls it with ${count(positions.len(), "parameter")} besides its `userdata`, and the function takes ${ps.len()}; they correspond by position"
+    for j in 0..<ps.len()
+        val cq = f.params[positions[j]]
+        val a = ps[j]
+        if *a is ErrorType then continue
+        var problem = ""
+        if *a is Function(_, _, _) then problem = "a function is not a callback's parameter: a function crosses to C only as a binding's own parameter"
+        elif !(c_text_form(a, c.data, c.classes) is NoText) then problem = c_crossing_problem(cq.ty, a, c_text_form(a, c.data, c.classes), true)
+        elif c_array_form(a, c.data, c.classes) is Some(_) then problem = "an array is not a callback's parameter: memory C lends a callback is a view"
+        elif c_status_error(a, c.data) is Some(_) then problem = "a status is a binding's result, not a callback's parameter"
+        elif c_handle_form(a, c.data, c.classes) is Some(h)
+            problem = c_handle_problem(c, h.class_index, cq.text, true)
+            if problem == "" && c_class_text(c.classes[h.class_index].decl, "retain") is None
+                problem = s"C lends the callback the object, and `${c.classes[h.class_index].name}` declares no `retain`: a lent object is kept only by a reference of its own"
+        elif c_mirror_of(a, c.data) is Some(d) then problem = c_mirror_problem(c.data[d].decl, c.data[d].name, cq.text)
+        else problem = c_crossing_problem(cq.ty, a, c_text_form(a, c.data, c.classes), true)
+        if problem != "" then return s"its parameter ${j + 1} is `${type_name(a)}` in Avin and `${cq.text}` in C: $problem"
+    if *r is ErrorType then return ""
+    if f.result is CVoidType
+        if !(*r is Unit) then return s"C's function answers nothing, so the Avin function answers `unit`, not `${type_name(r)}`"
+        return ""
+    if *r is Unit then return s"C's function answers `${f.result_text}`, so the Avin function answers a value of its own"
+    var problem = ""
+    if c_text_form(r, c.data, c.classes) is TextString(_) then problem = "a string a callback answered would have to outlive the call, which nothing frees, so a callback answers a scalar or an enum mirror"
+    elif c_handle_form(r, c.data, c.classes) is Some(_) then problem = "a callback answers a scalar or an enum mirror, and no handle"
+    elif c_status_error(r, c.data) is Some(_) then problem = "a callback answers a scalar or an enum mirror, and no status"
+    elif c_mirror_of(r, c.data) is Some(d) then problem = c_mirror_problem(c.data[d].decl, c.data[d].name, f.result_text)
+    else problem = c_crossing_problem(f.result, r, NoText, false)
+    if problem != "" then return s"it answers `${type_name(r)}` in Avin and `${f.result_text}` in C: $problem"
+    ""
 
 // A binding's parameters, from `first` on, cross into Sysl, and its result out of Sysl.
 private check_crossings(c: *Checker, unit: usize, f: &Function, params: Buf[&Type], first: usize, result: Option[&Type])
@@ -8087,11 +8156,11 @@ private check_c_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
                     elif arg.value.kind is StringLit(_) then c.note(unit, arg.value.span, "`@c` on a class names the C pointer type it is a handle on with `type:`, as in `@c(type: \"cairo_t *\", release: \"cairo_destroy\")`")
                     else c.note(unit, arg.value.span, "`shared` is the one word `@c` on a class takes without a key")
                     continue
-            if key == "attach" || key == "key" || key == "forget"
+            if key == "attach" || key == "key"
                 c.note(unit, arg.value.span, s"`$key:` on a C handle is not implemented")
                 continue
-            if key != "type" && key != "release" && key != "retain" && key != "kept" && key != "as"
-                c.note(unit, arg.value.span, s"`$key:` is not a word of `@c` on a class, which takes `type:`, `release:`, `retain:`, `kept:`, `as:` and `shared`")
+            if key != "type" && key != "release" && key != "retain" && key != "kept" && key != "as" && key != "forget"
+                c.note(unit, arg.value.span, s"`$key:` is not a word of `@c` on a class, which takes `type:`, `release:`, `retain:`, `kept:`, `as:`, `forget:` and `shared`")
                 continue
             if contains_name(seen, key)
                 c.note(unit, arg.value.span, s"`$key:` is given once")
@@ -8122,6 +8191,9 @@ private check_c_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
                         if !c_uses_name(release, k.name) && !c_uses_name(retain, k.name)
                             c.note(unit, arg.value.span, s"`kept:` names `${k.name}` for `release:` and `retain:` to use, and neither does")
                     None -> c.note(unit, arg.value.span, s"`kept:` names the handle the class keeps and its class, as in `kept: \"face: Face\"`; `$text` is not that")
+            elif key == "forget"
+                if !is_c_identifier(text.trim()) && !c_uses_name(text, "userdata")
+                    c.note(unit, arg.value.span, s"`forget:` names the C function that stops C calling a callback, taking the handle's pointer and the callback's `userdata`, or a C expression in `self` and `userdata`; `$text` is neither")
             elif !is_c_identifier(text) && !c_uses_name(text, "self")
                 c.note(unit, arg.value.span, s"`$key:` names a C function of the handle's pointer, or a C expression in `self`; `$text` is neither")
         if !contains_name(seen, "type") then c.note(unit, a.span, "`@c` on a class names the C pointer type it is a handle on, `type: \"cairo_t *\"`")
@@ -8977,7 +9049,7 @@ private check_threaded_arguments(c: *Checker)
         if is_sendable_function(zonk(c, t.value.ty)) then continue
         if t.value.kind is Param(j)
             if param_mark(c, c.body.root, j) == SendableMark then continue
-        val what = s"the function passed to `${t.param}` of `${t.binding}`, which Sysl may call from any thread"
+        val what = s"the function passed to `${t.param}` of `${t.binding}`, which ${t.caller} may call from any thread"
         // A method value is its receiver held in a local, then the closure capturing it.
         var value = t.value
         if value.kind is Block(items)
@@ -13220,7 +13292,7 @@ private note_threaded_arguments(c: *Checker, id: usize, applied: Applied)
         val name = decl.params[i].pattern.kind match
             Name(n) -> n
             _ -> "_"
-        c.body.threaded.push(ThreadedArgument(unit_of(c), arg, decl.name, name))
+        c.body.threaded.push(ThreadedArgument(unit_of(c), arg, decl.name, name, if has_annotation(decl, "c") then "C" else "Sysl"))
 
 // The object a call by `name` reaches through its `apply` methods: the object of that name, where it
 // declares `apply` and the name is not a function's, only, if anything, its companion class's

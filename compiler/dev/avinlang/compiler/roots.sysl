@@ -46,8 +46,8 @@ private runtime_collects(symbol: string) -> bool
     val quiet = ["avin_rt_conforms", "avin_rt_string_compare", "avin_rt_string_find",
         "avin_rt_string_parse_real", "avin_rt_string_hash", "avin_rt_identity_hash",
         "avin_rt_real_hash", "avin_rt_array_clear", "avin_rt_c_array_elements", "avin_rt_c_array_length",
-        "avin_rt_c_array_limit", "avin_rt_c_array_copy", "avin_rt_c_array_back", "avin_rt_c_struct_new",
-        "avin_rt_c_struct_free"]
+        "avin_rt_c_array_limit", "avin_rt_c_array_copy", "avin_rt_c_array_back", "avin_rt_c_callback_object",
+        "avin_rt_c_struct_new", "avin_rt_c_struct_free"]
     for q in quiet
         if q == symbol then return false
     true
@@ -71,6 +71,8 @@ collecting_functions(program: MirProgram, graph: CallGraph) -> Buf[bool]
                     Call(_, Indirect(_, _), _) -> found = true
                     Call(_, Runtime(symbol, _), _) ->
                         if runtime_collects(symbol) then found = true
+                    Call(_, CFunction(symbol, _, _), _) ->
+                        if c_calls_back(program, symbol) then found = true
                     _ -> ()
         collects.push(found)
     var changed = true
@@ -89,12 +91,18 @@ collecting_functions(program: MirProgram, graph: CallGraph) -> Buf[bool]
 // How an instruction lets the collector run: 0 not at all; 1 during it, with the values live after
 // it as the roots, as a call of a function or an allocation does; 2 during it, with the values live
 // before it too, as a runtime entry point that reads its arguments after collecting does.
-private collection_kind(collects: Buf[bool], inst: Inst) -> u8 = inst match
+private collection_kind(program: MirProgram, collects: Buf[bool], inst: Inst) -> u8 = inst match
     Alloc(_, _) -> 1
     Call(_, Direct(g), _) -> if collects[g] then 1 else 0
     Call(_, Indirect(_, _), _) -> 1
     Call(_, Runtime(symbol, _), _) -> if runtime_collects(symbol) then 2 else 0
+    Call(_, CFunction(symbol, _, _), _) -> if c_calls_back(program, symbol) then 2 else 0
     _ -> 0
+
+/** Whether a call of the C function `symbol` may run the program's own code, and so the collector:
+ * in a program that passes C a function, any C function of a library may call one C keeps. The C
+ * unit's glue never does. */
+private c_calls_back(program: MirProgram, symbol: string) -> bool = program.c_trampolines.len() > 0 && !symbol.starts_with("avin_c_")
 
 // Sets of the function's tracked variables, `words` 64-bit words each, stored one after another.
 private has(bits: Buf[u64], set: usize, words: usize, v: usize) -> bool =
@@ -282,7 +290,7 @@ plan_roots(program: MirProgram, graph: CallGraph, collects: Buf[bool], index: us
             val inst = block.insts[i]
             val at = block_start[b] + 1 + i
             val def = inst_def(inst, value_var, slot_var)
-            val kind = collection_kind(collects, inst)
+            val kind = collection_kind(program, collects, inst)
             if kind == 1
                 for x in 0..<count
                     if has(live, 0, words, x) && def != Some(x) then needed[x] = true
@@ -394,7 +402,7 @@ plan_roots(program: MirProgram, graph: CallGraph, collects: Buf[bool], index: us
             for c in 0..<cells do state.push(written_in[b * cells + c])
             for i in 0..<block.insts.len()
                 val inst = block.insts[i]
-                if collection_kind(collects, inst) != 0 || i == poll_at
+                if collection_kind(program, collects, inst) != 0 || i == poll_at
                     for c in 0..<cells
                         if !state[c] then zeroed[c] = true
                 if cell_written(inst, value_cells, slot_cells) is Some(c) then state[c] = true

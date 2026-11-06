@@ -198,6 +198,10 @@ private struct Lowering
     tail_calls: bool
     /** The C handles whose objects have been laid out, each once. */
     c_handles: Buf[MirHandle]
+    /** The trampolines C calls Avin functions through, and the callback each one's function
+     * converts for, by the instance index of that function. */
+    trampolines: Buf[MirTrampoline]
+    c_callbacks: Map[usize, CCallbackPlan]
 
 /** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
  * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
@@ -252,7 +256,7 @@ lower_program(program: TProgram) -> MirProgram
         if d.table.len() > generic_base then generic_base = d.table.len()
     for b in program.builtins
         if b.table.len() > generic_base then generic_base = b.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf())
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map())
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
     l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None, false))
@@ -345,7 +349,7 @@ lower_program(program: TProgram) -> MirProgram
     for h in l.handles do finalized[h.descriptor] = true
     for h in l.c_handles do finalized[h.descriptor] = true
     functions = scalar_replace(functions, l.descriptors, finalized)
-    MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, l.handles, tests, program.testing, entry_arguments, strings, l.c_handles)
+    MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, l.handles, tests, program.testing, entry_arguments, strings, l.c_handles, l.trampolines)
 
 /** Whether a function belongs to the core library's module, `avin`, or one under it. */
 private in_core_library(program: TProgram, id: usize) -> bool
@@ -2181,6 +2185,23 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
         Ok(parts) -> parts
         Err(why) -> panic(why)
     val blocking = c_is_blocking(symbol.decl)
+    // Each function C is passed has a record of its own, whose address is the `userdata` beside it,
+    // made before any argument is converted: by the prototype's index, the record, and by the Avin
+    // parameter's, the slot holding it until the binding frees it, null once a handle keeps it.
+    var records: Buf[Option[Operand]] = buf()
+    for _ in p.params do records.push(None)
+    var record_slots: Buf[Option[Place]] = buf()
+    val positions = c_avin_positions(p)
+    for i in 0..<positions.len()
+        record_slots.push(None)
+        val k = positions[i]
+        if p.params[k].callback.len() == 0 then continue
+        val threaded = i >= skipped && is_threaded_param(symbol.decl.params[i - skipped])
+        val record = runtime_call(l, "avin_rt_c_callback_new", [MRef, MBool, MRef], MPtr, [Value(l.param_values[i].unwrap()), ConstBool(threaded), string_constant(l, symbol.name)])
+        records[k] = Some(record)
+        val slot = machine_slot(l, MPtr)
+        store(l, slot, Some(record))
+        record_slots[i] = slot
     // Each array parameter's pointer and length, the length an `int`, by the prototype's index.
     val arrays = c_arrays_in(l, symbol, p, blocking)
     // The C memory each mirror passed in was converted into, freed after the call.
@@ -2245,6 +2266,22 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
                     passed.push(memory)
                 None -> passed.push(SlotAddress(slot.slot))
             continue
+        // A `userdata` is the address of the record of the function it carries, and a function
+        // pointer the trampoline C calls it through.
+        if q.userdata
+            scalars.push(CAddress)
+            passed.push(records[c_callback_of_userdata(p, k)].unwrap())
+            continue
+        if q.callback.len() > 0
+            val i = in_at
+            in_at += 1
+            args.push(Value(l.param_values[i].unwrap()))
+            objects.push(None)
+            classes.push(0)
+            optionals.push(false)
+            scalars.push(CAddress)
+            passed.push(TrampolineAddress(c_trampoline(l, symbol, q, concrete(l, symbol.params[i]))))
+            continue
         val i = in_at
         in_at += 1
         val t = concrete(l, symbol.params[i])
@@ -2299,7 +2336,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
     var answers_handle = c_handle_form(parts.result, l.program.data, l.program.classes) is Some(_)
     for o in outs
         if c_handle_form(o.t, l.program.data, l.program.classes) is Some(_) then answers_handle = true
-    val calls = CCall(s"`${p.symbol}` answered", args, objects, classes, optionals, skipped, answers_handle)
+    val calls = CCall(s"`${p.symbol}` answered", args, objects, classes, optionals, skipped, answers_handle, record_slots)
     val answered = concrete(l, parts.result)
     // The glue writes the length of the array C answers through the address passed last.
     var length_slot: Option[usize] = None
@@ -2336,6 +2373,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
         finish_into(l, Jump(join), join)
         c_release_copies(l, copies)
         c_release_structs(l, symbol, structs, arrays)
+        c_free_records(l, record_slots)
         c_consumes(l, symbol, calls)
         val value = load(l, slot).unwrap()
         l.library = outer
@@ -2391,6 +2429,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
         made = read.made
         made_optional = read.made_optional
     c_keeps(l, symbol, calls, made, made_optional)
+    c_free_records(l, record_slots)
     c_consumes(l, symbol, calls)
     var values: Buf[Option[Operand]] = buf()
     if !(*answered is Unit) then values.push(first)
@@ -3064,6 +3103,9 @@ private struct CCall
     skipped: usize
     /** Whether the call answers a handle, as its result or an out value, which keeps what it keeps. */
     answers: bool
+    /** By the Avin parameter's index, the slot holding the record of a function the call passes C,
+     * which a handle keeping it takes, leaving null. */
+    records: Buf[Option[Place]]
 
 // The C handle class whose built-in `close()` `symbol` is.
 private c_close_class(l: *Lowering, symbol: FunctionSymbol) -> Option[usize]
@@ -3189,7 +3231,7 @@ private c_field_body(l: *Lowering, symbol: FunctionSymbol, n: usize, field: CFie
     if c_handle_form(result_type, l.program.data, l.program.classes) is Some(h)
         val answer = fresh(l, MPtr)
         l.insts.push(Call(Some(answer), CFunction(get, c_field_params(indices.len()), Some(CAddress)), c_field_args(pointer, indices)))
-        val call = CCall(who, buf(), buf(), buf(), buf(), symbol.params.len() - symbol.decl.params.len(), true)
+        val call = CCall(who, buf(), buf(), buf(), buf(), symbol.params.len() - symbol.decl.params.len(), true, buf())
         val value = c_handle_answer(l, symbol, call, Value(answer), result_type, h, at)
         l.library = outer
         finish(l, Return(Some(value)))
@@ -3258,6 +3300,10 @@ private c_new_handle(l: *Lowering, symbol: FunctionSymbol, call: CCall, pointer:
                     None -> continue
                 if call.objects[i] is Some(_) && call.classes[i] == wanted then kept = call.args[i]
         c_glue_call(l, s"avin_c_retain_$k", [pointer, kept])
+    c_handle_object(l, pointer, k)
+
+// A new handle object of class `k` holding `pointer`, owned by the code running.
+private c_handle_object(l: *Lowering, pointer: Operand, k: usize) -> Operand
     val t: &Type = Class(k, l.program.classes[k].name, buf())
     val shape = layout(l, t).variants[0]
     val object = fresh(l, MRef)
@@ -3308,11 +3354,155 @@ private c_keeps(l: *Lowering, symbol: FunctionSymbol, call: CCall, made: Option[
         val i = c_named_parameter(symbol, call, name) match
             Some(i) -> i
             None -> continue
+        // A function C keeps is held by the handle, its record given back with the handle's object.
+        if i < call.records.len() && call.records[i] is Some(_)
+            c_glue_call(l, "avin_c_keep_callback", [o, load(l, call.records[i]).unwrap()])
+            store(l, call.records[i], Some(NullAddress))
+            continue
         val kept = call.objects[i] match
             Some(k) -> k
             None -> continue
         c_keep(l, o, kept, call.args[i], call.classes[i], call.optionals[i])
     c_end_present(l, join)
+
+// Frees the record of each function the call passed C that no handle keeps, once the call has
+// returned: C calls it no more.
+private c_free_records(l: *Lowering, slots: Buf[Option[Place]])
+    for slot in slots
+        if slot is None then continue
+        var args: Buf[Operand] = buf()
+        args.push(load(l, slot).unwrap())
+        l.insts.push(Call(None, Runtime("avin_rt_c_callback_free", MirSignature(single(MPtr), None)), args))
+
+/** What the function a trampoline runs converts for: the binding's name, the unit and span that
+ * place it, the prototype of the function C calls, the Avin function's type, and the trampoline's
+ * index. */
+private struct CCallbackPlan
+    name: string
+    unit: usize
+    at: Span
+    f: CPrototype
+    ty: &Type
+    trampoline: usize
+
+// The trampoline C calls the function the binding `symbol` passes for its parameter `q` through, of
+// Avin type `t`, and the function it runs, made to be lowered with the program's others. The
+// trampoline's parameters are filled in when that function is.
+private c_trampoline(l: *Lowering, symbol: FunctionSymbol, q: CParam, t: &Type) -> usize
+    val index = l.trampolines.len()
+    val k = l.instances.len()
+    l.instances.push(Instance(0, buf(), false, CCallbackBody))
+    l.trampolines.push(MirTrampoline(k, buf(), 0, None))
+    l.c_callbacks.put(k, CCallbackPlan(symbol.name, symbol.unit, symbol.decl.name_span, q.callback[0], t, index))
+    index
+
+// How a value of the Avin type `t` crosses a callback's C type `c`: a handle or a string as a
+// pointer, an enum mirror as the integer it is, and a scalar at the width the C unit measured.
+private c_callback_scalar(l: *Lowering, c: CType, t: &Type) -> CScalar
+    if c_handle_form(t, l.program.data, l.program.classes) is Some(_) then return CAddress
+    if !(c_text_form(t, l.program.data, l.program.classes) is NoText) then return CAddress
+    if c_mirror_of(t, l.program.data) is Some(_) then return c_scalar_of(c, Int(64), l.program.c_measures)
+    c_scalar_of(c, t, l.program.c_measures)
+
+// The function a trampoline runs, the `k`th instance: with the thread's context, it takes the
+// callback's record and what C called it with but for the `userdata`, each converted as a binding's
+// result is, a handle lent through its class's `retain`, a string copied; runs the Avin function the
+// record holds; and converts its answer as a binding's argument is. A value no Avin type can hold
+// stops the program where the binding C is running in was called.
+private c_callback_body(l: *Lowering, k: usize) -> MirFunction
+    val plan = l.c_callbacks.get(k).unwrap()
+    l.unit = plan.unit
+    l.here = plan.at
+    val at = plan.at
+    val (ps, r) = *plan.ty match
+        Function(ps, r, _) -> (ps, r)
+        _ -> panic("a callback whose type is no function")
+    val positions = c_callback_positions(plan.f)
+    var params: Buf[MirType] = buf()
+    params.push(MPtr)
+    val record = fresh(l, MPtr)
+    var scalars: Buf[CScalar] = buf()
+    var values: Buf[usize] = buf()
+    for j in 0..<positions.len()
+        val s = c_callback_scalar(l, plan.f.params[positions[j]].ty, ps[j])
+        scalars.push(s)
+        params.push(c_machine(s))
+        values.push(fresh(l, c_machine(s)))
+    val who = s"the function given to `${plan.name}` was called by C with"
+    val closure = runtime_call(l, "avin_rt_c_callback_object", [MPtr], MRef, [Value(record)])
+    var operands: Buf[Operand] = buf()
+    operands.push(closure)
+    var types: Buf[MirType] = buf()
+    types.push(MRef)
+    for j in 0..<positions.len()
+        val q = plan.f.params[positions[j]]
+        val t = ps[j]
+        val x = Value(values[j])
+        val s = scalars[j]
+        val form = c_text_form(t, l.program.data, l.program.classes)
+        var v: Option[Operand] = None
+        if c_handle_form(t, l.program.data, l.program.classes) is Some(h) then v = Some(c_lent_handle(l, x, t, h, who, at))
+        elif !(form is NoText) then v = c_text_answer(l, x, t, form, None, who, at)
+        elif c_mirror_of(t, l.program.data) is Some(d) then v = Some(c_mirror_answer(l, x, d, s, who, at))
+        else v = Some(c_answer(l, x, s, t, at))
+        if machine(l, t) is Some(m)
+            operands.push(v.unwrap())
+            types.push(m)
+    val answer = machine(l, r)
+    val code = fresh(l, MPtr)
+    l.insts.push(CallEntry(code, closure))
+    val dest = answer match
+        Some(m) -> Some(fresh(l, m))
+        None -> None
+    push_call(l, dest, Indirect(Value(code), MirSignature(types, answer)), operands)
+    var result: Option[CScalar] = None
+    var answered: Option[Operand] = None
+    if !(plan.f.result is CVoidType)
+        if c_mirror_of(r, l.program.data) is Some(d)
+            val s = c_scalar_of(plan.f.result, Int(64), l.program.c_measures)
+            result = Some(s)
+            answered = Some(c_mirror_argument(l, Value(dest.unwrap()), d, s))
+        else
+            val s = c_scalar_of(plan.f.result, r, l.program.c_measures)
+            result = Some(s)
+            answered = Some(c_argument(l, Value(dest.unwrap()), r, s, s"${c_integer_name(plan.f.result, s)}, what the function given to `${plan.name}` answered", at))
+    finish(l, Return(answered))
+    // The trampoline takes every parameter C passes, the `userdata` among them.
+    var all: Buf[CScalar] = buf()
+    var userdata = 0usize
+    var at_value = 0usize
+    for i in 0..<plan.f.params.len()
+        if plan.f.params[i].userdata
+            userdata = i
+            all.push(CAddress)
+        else
+            all.push(scalars[at_value])
+            at_value += 1
+    l.trampolines[plan.trampoline] = MirTrampoline(k, all, userdata, result)
+    MirFunction(s"avin.c.callback.${plan.trampoline}", MirSignature(params, result match
+        Some(s) -> Some(c_machine(s))
+        None -> None), l.values, l.slots, l.blocks)
+
+// A handle C lends a callback, the pointer `x`: null is `None`, or stops the program where `t` is no
+// `Option`; any other is a new handle object of its own reference, taken through its class's `retain`.
+private c_lent_handle(l: *Lowering, x: Operand, t: &Type, h: CHandleForm, who: string, at: Span) -> Operand
+    val absent = compare(l, CmpEq, x, NullAddress)
+    if !h.optional
+        trap_if(l, absent, s"$who null", at)
+        c_glue_call(l, s"avin_c_retain_${h.class_index}", [x, NullAddress])
+        return c_handle_object(l, x, h.class_index)
+    val slot = machine_slot(l, MRef)
+    val none = new_block(l)
+    val present = new_block(l)
+    val join = new_block(l)
+    finish_into(l, Branch(absent, none, present), none)
+    store(l, slot, Some(NullAddress))
+    finish_into(l, Jump(join), present)
+    c_glue_call(l, s"avin_c_retain_${h.class_index}", [x, NullAddress])
+    store(l, slot, Some(c_handle_object(l, x, h.class_index)))
+    finish_into(l, Jump(join), join)
+    val object = load(l, slot).unwrap()
+    if pointer_option(l, t) then object else option_object(l, t, object)
 
 // Each handle `consumes:` names is closed without its `release`, C having taken its reference.
 private c_consumes(l: *Lowering, symbol: FunctionSymbol, call: CCall)
@@ -4773,6 +4963,9 @@ private const AnyEquals: u8 = 5
 private const AnyHash: u8 = 6
 /** A method table's entry for an option kept as a pointer: see `table_entry`. */
 private const OptionAdapter: u8 = 7
+/** The function a C trampoline runs, converting what C calls an Avin function with: see
+ * `c_callback_body`. */
+private const CCallbackBody: u8 = 12
 /** A type record's `display` entry: an object of the type rendered by its `Display`, or by name. */
 private const RecordDisplay: u8 = 8
 /** A type record's `debug` entry: the same through `Debug`. */
@@ -5151,6 +5344,7 @@ private lower_generated(l: *Lowering, inst: Instance) -> MirFunction
     l.returns_value = true
     l.current = new_block(l)
     if inst.generated == OptionAdapter then return lower_adapter(l, inst)
+    if inst.generated == CCallbackBody then return c_callback_body(l, l.function_index)
     val t = inst.type_args[0]
     val key = type_key(t)
     val kind = inst.generated

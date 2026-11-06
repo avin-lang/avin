@@ -854,9 +854,15 @@ on(event: string, @threaded listener: (Properties, EventData) -> unit)
 
 - **The Avin function's parameters are the C function's, without the `userdata`**, in order, each
   crossing out of C as a result does: a pointer to a handle's type is a handle C lends, made through
-  `retain`; and the function's answer crosses into C as a parameter does. A binding takes one
-  function per `userdata`, and a function pointer with no `userdata` beside it is refused: there is
-  nowhere to find the closure.
+  `retain`, a string copied and checked, a value no Avin type holds stopping the program where the
+  binding was called; and the function's answer crosses into C as a parameter does: a scalar, a
+  truth value or an enum mirror, and `unit` exactly where C's function answers `void`
+  ([proposed](/spec/decisions/#proposed)). A string or a handle is never a callback's answer: it
+  would have to outlive the call, with nothing to free it. A binding takes one function per
+  `userdata`, which the function pointer's own `userdata` names (`listener`'s `data` above), and a
+  function pointer with no `userdata` beside it is refused: there is nowhere to find the closure.
+  libc's `qsort` and `bsearch` are such functions; a binding reaches them through a C function that
+  passes a `userdata` of its own, as `qsort_r` does.
 - **Memory C lends a callback is a view** ([proposed](/spec/decisions/#proposed)). In a function
   pointer's prototype, a byte pointer with a `length(p)` parameter beside it crosses as a `ByteView`
   when it is `const` and a `MutByteView` when it is not, the length filled from C's and not an Avin
@@ -879,8 +885,9 @@ on(event: string, @threaded listener: (Properties, EventData) -> unit)
       surface.writePngStream(collect).mapErr(CairoError.from)?
       Ok(out.toArray())
   ```
-- **The compiler makes one trampoline per C function type**, a function with C's convention whose
-  address is passed for the pointer. It finds the closure through the `userdata`, which points at the
+- **The compiler makes one trampoline per parameter taking a function**, a function with C's
+  convention whose address is passed for the pointer ([proposed](/spec/decisions/#proposed)): two
+  bindings of one C type may cross it as different Avin types. It finds the closure through the `userdata`, which points at the
   runtime's record of it (the record Sysl callbacks use, `callback_pin`), enters the runtime as a
   Sysl callback does (`callback_enter`), converts the arguments, calls the function, converts its
   answer and leaves. A callback with a struct by value among its parameters has a C trampoline in
@@ -890,8 +897,13 @@ on(event: string, @threaded listener: (Properties, EventData) -> unit)
   handle the binding makes), so the closure lives as long as that handle. When the handle is
   released, its class's `forget:` expression is run for each callback it holds, with `userdata` the
   record's address, before `release` — MLT's `mlt_events_disconnect` — so a C object something else
-  keeps alive cannot call into a freed record. A handle class that keeps callbacks and declares no
-  `forget` is refused.
+  keeps alive cannot call into a freed record; a `forget:` that is a C function's name alone is
+  called `name(self, userdata)`. A handle class that keeps callbacks and declares no `forget` is
+  refused, as is a binding whose `keeps:` names a function with no handle to keep it, and a
+  `consumes:` naming a function. The record roots the function until then, so a kept function that
+  captures its own holder keeps both until `close()` ([proposed](/spec/decisions/#proposed)).
+- **Any C call may run a callback C keeps**, so in a program that passes C a function every call of
+  a C library function is one during which the collector may run.
 - **A callback belongs to the code that gave it**, and a call from any other thread stops the program,
   as for a Sysl callback. **A parameter marked `@threaded` takes a function any thread may call**,
   checked by its captures as a [Sysl `@threaded`

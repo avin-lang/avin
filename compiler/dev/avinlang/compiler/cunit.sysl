@@ -112,6 +112,9 @@ struct CUnitHandle
     conversions: Buf[CAs]
     /** Its field accessors. */
     fields: Buf[CUnitField]
+    /** Its `forget:`, the C expression in `self` and `userdata` that stops C calling a callback it
+     * keeps. */
+    forget: Option[string]
 
 /** A field accessor as the C unit compiles its glue: the method's name, the index of its symbol, which
  * names its glue, the field, the names of its indices and the bound of each, whether it writes the
@@ -252,6 +255,12 @@ c_unit_bindings(program: TProgram, files: Buf[ProgramFile], library: usize) -> B
         for i in 0..<p.params.len()
             val q = p.params[i]
             if q.mode is CIn && q.length_of != "" then params.push(Int(32))
+            elif q.userdata then params.push(Unit)
+            elif q.callback.len() > 0
+                // A callback's function type, a mirror among its parameters and its answer measured
+                // as the integer it is.
+                val t: &Type = if in_at < s.params.len() then s.params[in_at] else Unit
+                params.push(c_callback_measured(t, program.data))
             elif q.mode is CIn
                 var t: &Type = if in_at < s.params.len() then s.params[in_at] else Unit
                 if c_is_array_param(p, i)
@@ -346,7 +355,7 @@ c_unit_handles(program: TProgram, files: Buf[ProgramFile], library: usize) -> Bu
                 val kd = program.classes[j].decl
                 if c_handle_type(kd) is Some(kt) && c_class_text(kd, "retain") is Some(_) && c_class_kept(kd) is None
                     kept = Some(CUnitKept(name.name, j, kt))
-        out.push(CUnitHandle(program.classes[k].name, k, ty.text, ty.ty is CTypedef(_), c_class_text(d, "release").unwrap_or(""), c_class_text(d, "retain"), kept, program.classes[k].unit, d.name_span, package_of(program.classes[k].unit, files, library), c_class_as(d), c_unit_fields(program, k)))
+        out.push(CUnitHandle(program.classes[k].name, k, ty.text, ty.ty is CTypedef(_), c_class_text(d, "release").unwrap_or(""), c_class_text(d, "retain"), kept, program.classes[k].unit, d.name_span, package_of(program.classes[k].unit, files, library), c_class_as(d), c_unit_fields(program, k), c_class_text(d, "forget")))
     out
 
 // The kind of C type a field read or written as the scalar `avin` is.
@@ -734,6 +743,34 @@ c_unit_source_of(parts: CUnitParts, libraries: Buf[CLibrary]) -> CUnitSource
             if !contains_text(measured, key)
                 measured.push(key)
                 measured_types.push(spelled)
+        // A callback's parameters are what C calls it with, crossing as results do, and its answer
+        // crosses as a parameter does: each named type is checked and measured as at a binding.
+        for k in 0..<p.params.len()
+            if p.params[k].callback.len() == 0 then continue
+            val f = p.params[k].callback[0]
+            val (ps, r) = *b.params[k] match
+                Function(ps, r, _) -> (ps, r)
+                _ -> continue
+            val positions = c_callback_positions(f)
+            for j in 0..<positions.len() + 1
+                val c = if j == 0 then f.result else f.params[positions[j - 1]].ty
+                if j > 0 && j - 1 >= ps.len() then continue
+                val avin = if j == 0 then r else ps[j - 1]
+                val form = if *avin is Str then TextString(false) else NoText
+                val kind = c_kind_needed(c, avin, form, j > 0) match
+                    Some(kind) -> kind
+                    None -> continue
+                if c is CTypedef(name)
+                    val tag = kind_tag(kind) + " " + name
+                    if !contains_text(kinds, tag)
+                        kinds.push(tag)
+                        out.push(s"_Static_assert(${kind_test(kind, name)}, \"avin: the C type $name\");\n")
+                        lines.push(KindLine(i, k + 1, name, kind))
+                if !c_kind_measured(kind) then continue
+                val key = c_measure_key(c, kind)
+                if !contains_text(measured, key)
+                    measured.push(key)
+                    measured_types.push(c_spelling(c))
     // The measurements: the marker, the count, then two bytes for each measured type.
     out.push("__attribute__((used)) const unsigned char avin_c_unit_measurements[] = {\n")
     lines.push(Plain)
@@ -770,7 +807,10 @@ c_unit_source_of(parts: CUnitParts, libraries: Buf[CLibrary]) -> CUnitSource
 private handle_glue(out: *StrBuilder, lines: *Buf[CUnitLine], handles: Buf[CUnitHandle])
     glue(out, lines, "struct avin_c_kept { void *pointer; void (*take)(void *); void (*drop)(void *); struct avin_c_kept *next; };", Plain)
     glue(out, lines, "static void avin_c_hold(void **o, void *p, void (*take)(void *), void (*drop)(void *)) { struct avin_c_kept *k = malloc(sizeof *k); struct avin_c_kept **at = (struct avin_c_kept **)&o[2]; if (!k) abort(); k->pointer = p; k->take = take; k->drop = drop; k->next = 0; while (*at) at = &(*at)->next; *at = k; }", Plain)
-    glue(out, lines, "static void avin_c_hold_all(void **o, void **kept) { for (struct avin_c_kept *k = kept[2]; k; k = k->next) { k->take(k->pointer); avin_c_hold(o, k->pointer, k->take, k->drop); } }", Plain)
+    glue(out, lines, "void avin_rt_c_callback_drop(void *record);", Plain)
+    glue(out, lines, "static void avin_c_hold_all(void **o, void **kept) { for (struct avin_c_kept *k = kept[2]; k; k = k->next) { if (k->drop == avin_rt_c_callback_drop) continue; k->take(k->pointer); avin_c_hold(o, k->pointer, k->take, k->drop); } }", Plain)
+    glue(out, lines, "static void avin_c_no_take(void *p) { (void)p; }", Plain)
+    glue(out, lines, "void avin_c_keep_callback(void **o, void *record) { avin_c_hold(o, record, avin_c_no_take, avin_rt_c_callback_drop); }", Plain)
     glue(out, lines, "static void *avin_c_held(void **o, void (*drop)(void *)) { for (struct avin_c_kept *k = o[2]; k; k = k->next) if (k->drop == drop) return k->pointer; return 0; }", Plain)
     glue(out, lines, "static void avin_c_drain(void **o) { struct avin_c_kept *k = o[2]; o[2] = 0; while (k) { struct avin_c_kept *next = k->next; k->drop(k->pointer); free(k); k = next; } }", Plain)
     for h in handles
@@ -804,6 +844,14 @@ private handle_glue(out: *StrBuilder, lines: *Buf[CUnitLine], handles: Buf[CUnit
         glue(out, lines, s"        $t self = ($t)o[0];", Plain)
         if h.kept is Some(k) then glue(out, lines, s"        ${k.ty} ${k.name} = (${k.ty})avin_c_held(o, avin_c_drop_${k.index});", GlueLine(i, "kept"))
         glue(out, lines, "        o[0] = 0;", Plain)
+        // C is told to stop calling each callback the handle keeps before the object goes back.
+        if h.forget is Some(f)
+            glue(out, lines, "        for (struct avin_c_kept *k = o[2]; k; k = k->next) {", Plain)
+            glue(out, lines, "            if (k->drop != avin_rt_c_callback_drop) continue;", Plain)
+            glue(out, lines, "            void *userdata = k->pointer;", Plain)
+            val forget = if is_c_identifier(f.trim()) then f.trim() + "(self, userdata)" else f
+            glue(out, lines, s"            (void)($forget);", GlueLine(i, "forget"))
+            glue(out, lines, "        }", Plain)
         glue(out, lines, s"        (void)($release);", GlueLine(i, "release"))
         glue(out, lines, "    }", Plain)
         glue(out, lines, "    avin_c_drain(o);", Plain)

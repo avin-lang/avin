@@ -3885,6 +3885,45 @@ spelling is better, as each entry says.
   constructor `@isolated` (keeps the same hole open through the value's maker). **Review with the
   user:** a `with` body that only reads a module-level `var` counter is now refused.
 
+- Settled on the user's delegation 2026-11-05 (built on branch `c-bindings-callbacks`, stage 13 step 9,
+  [chapter](/spec/c-bindings/#callbacks)): **C callbacks, as built.** The chapter left these open:
+  - **A function pointer finds its `userdata` by name**: the function pointer's own prototype marks
+    exactly one parameter `userdata`, and the binding marks one of the same name, which carries it
+    (`void (*listener)(userdata void *data, …)` beside `userdata void *data`); each of the binding's
+    carries exactly one function, and a parameter taking a function is named. *Why*: MLT and Cairo
+    already use one name for both, and a name says unambiguously which `void *` goes with which
+    function when a binding takes two. *Alternatives*: by position (the n-th `userdata` carries the
+    n-th function; silent when C's order differs), or one function per binding (MLT and Cairo need
+    no more, but GLib-style APIs pass a `destroy` beside the callback).
+  - **One trampoline per binding parameter, not per C function type.** *Why*: two bindings of one
+    C type may cross it as different Avin types (`int` and `long`, a mirror and an integer), so the
+    conversions differ; the trampoline is a few instructions and the function it runs is the
+    conversion. *Alternative*: one per C type with the conversions chosen at run time.
+  - **A callback answers a scalar, a truth value or an enum mirror, and `unit` exactly where C's
+    function answers `void`**; a string, a handle or a status as its answer is refused. *Why*: a
+    string or a handle answered to C would have to outlive the call with nothing to free it.
+    *Alternative*: answer a string copied into memory C must free, which no C API this stage binds
+    expects.
+  - **What C calls a function with crosses as a binding's result does**, a string copied and
+    checked (or an `Array[byte]`, or `None` for null), a handle lent through its class's `retain` —
+    a handle class without `retain` is refused there — and a value no Avin type holds stops the
+    program where the binding C is running was called, as the answer's does, naming the function.
+  - **`forget:` is a C function's name, called `name(self, userdata)`, or a C expression in `self`
+    and `userdata`**, run in the handle's glue for each callback it keeps, after its pointer is taken
+    and before `release`; a handle that keeps a handle never takes the other's callbacks.
+  - **A kept function's record roots it until the handle keeping it is given back.** *Why*: the
+    record must outlive any call C makes, even one racing the collector on a thread of C's own.
+    *Consequence*: a kept function that captures its own holder keeps both alive until `close()`.
+    *Alternative*: trace the function from the handle, which frees such a cycle but lets a C thread
+    call a function the collector has just freed. **Review with the user**: whether that cycle is
+    worth a weak record.
+  - **In a program that passes C a function, every call of a C library function may run the
+    collector**, and is planned as one that does: any C call may call back a function C keeps. The
+    C unit's glue never does. *Alternative*: a `calls-back` word on the bindings that may, which is
+    cheaper and trusted.
+  - **libc's `qsort` and `bsearch` take no `userdata`, so they cannot be bound**; the corpus binds a
+    C function of its own that calls `qsort_r` and `bsearch` through one.
+
 **Deferred**
 
 - Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
