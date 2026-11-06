@@ -4009,7 +4009,11 @@ spelling is better, as each entry says.
   at its next wait); **keeping user-interface work on the main thread** (a scheduler that runs a
   lightweight thread on the main operating system thread only, which also gives the `ui` package
   its change from another thread); **stack size and growth** (a fixed reservation first; parked
-  frames moved to the heap later); and **the collector's scan of parked stacks**, which needs the
-  gc library's support.
+  frames moved to the heap later); and **the allocation chunk's owner**, which today is the
+  thread's context and becomes the carrier's, retired at every stop, so that thousands of parked
+  lightweight threads hold no chunk each. The collector needs nothing new: its roots are what the
+  runtime's callback marks, so a parked lightweight thread's context keeps its exact shadow stack
+  and is walked as an attached thread's is, and switching stacks happens only at the runtime's own
+  safepoints, so no collection sees one half done.
 - Resource cleanup: a `defer` construct or a library `use`.
 - Whether mailboxes may be bounded, and what a `tell` to a full one does, since `tell` never waits.
