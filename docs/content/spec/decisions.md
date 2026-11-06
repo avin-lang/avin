@@ -4140,13 +4140,7 @@ spelling is better, as each entry says.
   slots before marking the joint done (the joint, then reachable from nothing for a thread nobody
   joins, could be collected while the ending thread still writes to it).
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- Proposed (branch `lwt-timers`): **`sleep` parks a lightweight thread on a timer, and the
+- Settled on the user's delegation 2026-11-06 (branch `lwt-timers`): **`sleep` parks a lightweight thread on a timer, and the
   monitor thread fires the timers.** `sleep` in a lightweight thread parks it with no guard and a
   timer at its deadline, as a timed wait parks, so its worker runs other threads; `main` and other
   threads that are not lightweight block, safe for the collector. The monitor, which already wakes
@@ -4160,7 +4154,7 @@ spelling is better, as each entry says.
   a blocking call that the monitor compensates for (a worker per sleeper, which is what the
   lightweight threads are for). Review with the user only if sleep precision under 1 ms matters.
 
-- Proposed (branch `lwt-timers`): **the timers are a binary heap of waiters keyed by deadline, ties
+- Settled on the user's delegation 2026-11-06 (branch `lwt-timers`): **the timers are a binary heap of waiters keyed by deadline, ties
   broken by the order they were set, each waiter keeping its place in the heap.** Adding, firing and
   cancelling a timer each cost O(log n) under the timer lock, and reading the soonest is O(1);
   threads whose time runs out together are made ready soonest first, and two due at the same
@@ -4173,6 +4167,12 @@ spelling is better, as each entry says.
   *Alternatives weighed*: a hierarchical timing wheel (O(1) add and cancel, but a tick-quantized
   deadline and more machinery than a heap that is already fast at this scale); a sorted list (O(n)
   insertion); a heap without places (cancel would search, O(n)).
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
