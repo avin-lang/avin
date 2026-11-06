@@ -76,6 +76,8 @@ knows is asked for by name, and a program's own settings are its own values.
 | `executable() -> Option[string]` | The absolute path of the running program's file, where the platform can tell. |
 | `processors() -> int` | How many processors the program may run on: the number the futures' pool grows to. |
 | `pid() -> long` | The process's identifier. |
+| `signal(pid: long, sig: int) -> Result[unit, IoError]` | Sends the signal to the process `pid`; a negative `pid` is the group `-pid`, zero the program's own group, and `sig` zero sends nothing and answers whether one could be sent. No such process is `Err(Other("No such process"))`. |
+| `newSession() -> Result[long, IoError]` | Makes the program the leader of a new session and group with no controlling terminal, as a daemon does, answering its number; refused for a program that already leads a group. |
 | `os() -> Os` | The operating system the program was compiled for: `MacOS`, `Linux`, `Windows`, `Android`, `Wasi` or `Freestanding`. |
 
 **Nothing sets a variable.** The environment is the program's to read; a program that runs another
@@ -110,6 +112,9 @@ main() -> int
 | `c.withTimeout(d: Duration)` | The same command, stopped when it has run for `d`; its status is then `TimedOut`. |
 | `c.toFile(file: string)`, `c.appendTo(file: string)` | The same command, its standard output written to the file, emptied first or added to. |
 | `c.fromFile(file: string)`, `c.withInput(text: string)` | The same command, reading the file, or the text, as its standard input. |
+| `c.errorsToFile(file: string)`, `c.errorsAppendTo(file: string)` | The same command, its standard error written to the file, emptied first or added to. |
+| `c.errorsToOutput()` | The same command, its standard error going where its standard output goes: into the same open file, so neither empties what the other wrote, and into what `output()` and `lines()` capture. |
+| `c.inNewGroup()` | The same command, started in a process group of its own, which every program it starts joins ([proposed](/spec/decisions/#proposed)). |
 | `a andThen b` | `a`, then `b` only where `a` succeeded; the status is the last one run. |
 | `a orElse b` | `a`, then `b` only where `a` did not succeed. |
 | `a followedBy b` | `a`, then `b` whatever `a`'s status. |
@@ -128,7 +133,17 @@ writing, or reading, one after the other.
 | `c.run() -> Result[ExitStatus, IoError]` | Runs the command with the program's own streams, waits, and answers how it ended. A status other than success is a value, not a failure. |
 | `c.output() -> Result[string, CommandError]` | Runs it with its standard output captured as text, each ill-formed UTF-8 run replaced with U+FFFD, and standard error the program's own; any status but success is `Failed(status)`. |
 | `c.lines() -> Result[Iterator[string], IoError]` | Starts it and answers its standard output's lines as they arrive, by the rule [standard input](#standard-input) reads lines by. Its status is not checked. |
-| `c.start() -> Result[Child, IoError]` | Starts it and answers at once. A `Child` has `waitFor() -> Result[ExitStatus, IoError]`, `isAlive()` and `kill()`, which sends signal 15 to every program still running and starts no part not yet started. |
+| `c.start() -> Result[Child, IoError]` | Starts it and answers at once, with the `Child` below. |
+
+| `Child` | Meaning |
+| --- | --- |
+| `waitFor() -> Result[ExitStatus, IoError]` | Waits for the command to end; the same answer every time. |
+| `isAlive() -> bool` | Whether it is still running, without waiting. |
+| `kill()` | Sends signal 15 to every program still running and starts no part not yet started. |
+| `pid() -> long` | The process id of the program started last: the one program, a pipeline's last stage, a sequence's latest part; `0` where none started, its time having run out first. |
+| `group() -> Option[long]` | The process group of a command started `inNewGroup`: the number its first program leads it by. |
+| `signal(sig: int) -> Result[unit, IoError]` | Sends `sig` to the program `pid()` names. A command seen to have ended, by `waitFor` or by `isAlive` answering `false`, is `Err(Other("No such process"))`, its id being the platform's to give again. |
+| `signalGroup(sig: int) -> Result[unit, IoError]` | Sends `sig` to every process in the command's group, the programs those programs started that stayed in it among them, however the command ended; an empty group is `Err(Other("No such process"))`, and a command not started `inNewGroup` `Err(Other("the command has no group of its own"))`. |
 
 A started `Child` is [sendable](/spec/actors/#what-may-be-sent) ([proposed](/spec/decisions/#proposed)):
 it belongs to one thread at a time, as a [connection](#tcp) does. Handed to a thread's or a future's
@@ -139,6 +154,36 @@ body returns, the next code to use it takes it back:
 ```text
 avin: trap: `Child` belongs to another thread at main.avin:12:3
 ```
+
+**What a `Child` knows of its processes any thread may ask** ([proposed](/spec/decisions/#proposed)):
+`pid()`, `group()`, `signal` and `signalGroup` read what was recorded as each program started and
+touch none of the command's handles, so one thread may signal a child while another waits for it,
+the waiter seeing the status the signal caused. `signal` and `kill` differ: `signal` reaches one
+program and stops nothing else, so a sequence goes on as its status says, and `kill` reaches every
+program and starts nothing more.
+
+**One group for a whole command.** A command started `inNewGroup` puts every program it starts in one
+group, the first program leading it, the outermost command's setting deciding for its parts. A
+sequence's later part started once every member of the group has ended, the group being gone, leads
+a new one, which `group()` then answers. A group outlives its leader while any member is left, so
+`signalGroup` after `waitFor` still reaches what the command left running:
+
+```text
+import avin.io.IoError
+import avin.process.{Command, ExitStatus}
+import avin.signal
+import avin.threads
+
+stopped() -> Result[ExitStatus, IoError]
+    val job = Command("sh", "-c", "worker & worker & wait").inNewGroup().toFile("job.log").errorsToOutput().start()?
+    val waiter = threads.spawn(() -> job.waitFor())
+    job.signalGroup(signal.Terminate)?
+    waiter.join()
+```
+
+**A started command does not outlive its `Child`.** A `Child` collected while its command runs stops
+it, so a program that should go on after its starter is gone is started by a program that leaves it
+behind, or detaches itself with `newSession()`.
 
 The iterator `lines()` answers is not sendable: the thread that reads a command's output starts it.
 
@@ -167,6 +212,49 @@ redirection `toFile`, `appendTo` and `fromFile`.
 
 **Waiting is safe for the collector.** A thread waiting in `run`, `output` or `waitFor` holds
 nothing the collector waits on, as `await` does not.
+
+## `avin.signal`
+
+Signals the program watches for: a number another process, or the platform, sends to ask it to
+stop, to say its terminal has gone, or for a reason of their own. A watched signal no longer does
+what it did, ending the program among them; the program asks, where it chooses, whether it has
+arrived, and no code of its own runs when it does. Signals are sent with `process.signal` and
+`Child.signal`.
+
+```text
+import avin.io.IoError
+import avin.signal
+
+serve() -> Result[unit, IoError]
+    val stop = signal.watch(signal.Terminate)?
+    while !stop.take()
+        serveOne()
+    cleanUp()
+    Ok(())
+```
+
+| Constant | Signal |
+| --- | --- |
+| `Hangup`, `Interrupt`, `Quit` | 1, 2, 3: the terminal gone, Ctrl-C, Ctrl-\. |
+| `Kill` | 9: ends a program at once; it cannot be watched. |
+| `BrokenPipe`, `Alarm` | 13, 14. |
+| `Terminate` | 15: asks a program to stop; what `Child.kill` sends. |
+| `WindowChange` | 28: the terminal was resized. |
+| `User1`, `User2` | The user-defined signals, numbered as the platform numbers them. |
+
+| Function | Meaning |
+| --- | --- |
+| `watch(sig: int) -> Result[Watch, IoError]` | Starts watching `sig`. A number the platform does not have, `Kill` and the stop signal are `Err(Other("Invalid argument"))`. |
+| `w.take() -> bool` | Whether it arrived since the last `take` or since the watch began, marking it seen. Arrivals between two takes are one `true`. |
+| `w.wait()` | Parks until it arrives, then takes it. |
+| `w.wait(limit: Duration) -> bool` | The same, giving up after `limit`, and answering whether it arrived. |
+| `w.signal() -> int` | The signal watched. |
+
+**Two watches of one signal each see every arrival**, so a library watching for its own reasons
+takes nothing from the program. When every watch of a signal has been collected, the signal does
+again what it did before the first. **A wait looks every 20 milliseconds** ([proposed](/spec/decisions/#proposed)),
+its lightweight thread parked between looks, so it answers at most that late. A `Watch` is sendable,
+belonging to one thread at a time as a connection does, so a thread of its own may wait on it.
 
 ## `avin.io`
 

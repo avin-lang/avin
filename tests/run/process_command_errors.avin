@@ -1,0 +1,91 @@
+// Standard error redirected: to a file emptied first or added to, or where the output goes, sharing
+// its open file so that neither stream empties or overwrites what the other wrote, and into what
+// `output()` and `lines()` capture. On a pipeline every stage's errors go to the pipeline's
+// redirection; a sequence's file is opened once for both parts. The output is redirected first,
+// whatever order the calls were made in.
+import avin.fs
+import avin.io.IoError
+import avin.process.Command
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message())
+
+text(file: string) -> string = ok(fs.readText(file))
+
+main()
+  val dir = ok(fs.createTempDir("avin-command-errors"))
+  val both = Command("/bin/sh", "-c", "echo out; echo err 1>&2")
+  // To a file, emptied first; the output stays the program's own.
+  val errs = dir + "/errs"
+  fs.writeText(errs, "old text\n")
+  println(both.errorsToFile(errs).run())
+  print(text(errs))
+  // Added to.
+  println(both.errorsAppendTo(errs).run())
+  print(text(errs))
+  // Made where it is not there.
+  println(both.errorsAppendTo(dir + "/made").run())
+  print(text(dir + "/made"))
+  // Output and errors to two files.
+  println(both.toFile(dir + "/o").errorsToFile(dir + "/e").run())
+  print(text(dir + "/o"))
+  print(text(dir + "/e"))
+  // Both to one file: a thousand lines of each, alternating, all kept and in order.
+  val many = Command("/bin/sh", "-c", "i=0; while [ $i -lt 1000 ]; do echo out $i; echo err $i 1>&2; i=$((i+1)); done")
+  println(many.toFile(dir + "/one").errorsToOutput().run())
+  val lines = text(dir + "/one").lines()
+  println(lines.length())
+  var inOrder = true
+  for i in 0..<1000
+    if lines(2 * i) != s"out $i" || lines(2 * i + 1) != s"err $i" then inOrder = false
+  println(inOrder)
+  // The order of the calls does not matter.
+  println(both.errorsToOutput().toFile(dir + "/order").run())
+  print(text(dir + "/order"))
+  // Added to the end of one file, which keeps what it held.
+  fs.writeText(dir + "/log", "first\n")
+  println(both.appendTo(dir + "/log").errorsToOutput().run())
+  println(both.appendTo(dir + "/log").errorsToOutput().run())
+  print(text(dir + "/log"))
+  // Captured: `output()` and `lines()` see both.
+  println(both.errorsToOutput().output())
+  println(ok(both.errorsToOutput().lines()).toVector())
+  // Without it, only the output is captured.
+  println(Command("/bin/sh", "-c", "echo out; echo err 1>&2").errorsToFile(dir + "/aside").output())
+  print(text(dir + "/aside"))
+  // A failed command's errors still reach the file.
+  println(Command("/bin/sh", "-c", "echo broken 1>&2; exit 2").errorsToFile(dir + "/failed").run())
+  print(text(dir + "/failed"))
+  // A pipeline: both stages' errors, and the output its last stage's.
+  val piped = Command("/bin/sh", "-c", "echo left 1>&2; echo data") | Command("/bin/sh", "-c", "/bin/sleep 0.1; cat; echo right 1>&2")
+  println(piped.errorsToFile(dir + "/piped").run())
+  print(text(dir + "/piped"))
+  println(piped.toFile(dir + "/pipedOne").errorsToOutput().run())
+  print(text(dir + "/pipedOne"))
+  // A stage sending its own errors into the pipe.
+  println((Command("/bin/sh", "-c", "echo into-pipe 1>&2").errorsToOutput() | Command("/usr/bin/tr", "a-z", "A-Z")).output())
+  // A stage redirecting its own output while the pipeline's errors go to the pipeline's output: its
+  // errors still go there.
+  val inner = Command("/bin/sh", "-c", "echo first 1>&2") | Command("/bin/sh", "-c", "/bin/sleep 0.1; echo own; echo second 1>&2").toFile(dir + "/own")
+  println(inner.toFile(dir + "/outer").errorsToOutput().run())
+  print(text(dir + "/outer"))
+  print(text(dir + "/own"))
+  // A part's own redirection inside a command's.
+  println((both.errorsToFile(dir + "/part") andThen both).errorsToFile(dir + "/whole").run())
+  print(text(dir + "/part"))
+  print(text(dir + "/whole"))
+  // A sequence: one file for both parts, opened once.
+  println((both andThen both).toFile(dir + "/seq").errorsToOutput().run())
+  print(text(dir + "/seq"))
+  // A file that cannot be made: the command does not start.
+  println(both.errorsToFile(dir + "/no-such-dir/e").run())
+  println(both.errorsToFile(dir + "/no-such-dir/e").start().map(c -> c.waitFor()))
+  println(both.errorsToFile(dir + "/no-such-dir/e").output())
+  // Unicode and an empty stream.
+  println(Command("/bin/sh", "-c", "printf 'ü→✓\\n' 1>&2").errorsToOutput().output())
+  println(Command("/usr/bin/true").errorsToFile(dir + "/empty").run())
+  println(text(dir + "/empty").isEmpty())
+  // To the program's own output, where its output is: the lines arrive on standard output.
+  println(Command("/bin/sh", "-c", "echo to-own-output 1>&2").errorsToOutput().run())
+  fs.removeDirAll(dir)

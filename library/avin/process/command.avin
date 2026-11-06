@@ -8,6 +8,7 @@ import avin.fs
 import avin.io
 import avin.io.IoError
 import avin.threads
+import avin.threads.Atomic
 import avin.time
 import avin.time.Duration
 
@@ -38,31 +39,50 @@ class Command(
     private val env: Vector[(string, string)],
     private val limit: Option[Duration],
     private val sink: Sink,
-    private val feed: Feed
+    private val feed: Feed,
+    private val errors: Drain,
+    private val grouped: bool
 )
   // The same command, run in `dir`. A part that names a directory of its own runs in that one.
-  inDir(dir: string) -> Command = Command(shape, Some(dir), env, limit, sink, feed)
+  inDir(dir: string) -> Command = Command(shape, Some(dir), env, limit, sink, feed, errors, grouped)
 
   // The same command, with the variable `name` set to `value` for it; the rest of the program's
   // environment is passed on, and a part setting the same variable sets it for itself.
-  withEnv(name: string, value: string) -> Command = Command(shape, dir, env :+ (name, value), limit, sink, feed)
+  withEnv(name: string, value: string) -> Command = Command(shape, dir, env :+ (name, value), limit, sink, feed, errors, grouped)
 
   // The same command, stopped when it has run for `d`: a program still running then is ended, its
   // status `TimedOut`, and a part not yet started is not started.
-  withTimeout(d: Duration) -> Command = Command(shape, dir, env, Some(d), sink, feed)
+  withTimeout(d: Duration) -> Command = Command(shape, dir, env, Some(d), sink, feed, errors, grouped)
 
   // The same command, its standard output written to `file`, which is made empty first, or made.
-  toFile(file: string) -> Command = Command(shape, dir, env, limit, OutputTo(file, false), feed)
+  toFile(file: string) -> Command = Command(shape, dir, env, limit, OutputTo(file, false), feed, errors, grouped)
 
   // The same command, its standard output added to the end of `file`, which is made if it is not
   // there.
-  appendTo(file: string) -> Command = Command(shape, dir, env, limit, OutputTo(file, true), feed)
+  appendTo(file: string) -> Command = Command(shape, dir, env, limit, OutputTo(file, true), feed, errors, grouped)
 
   // The same command, reading `file` as its standard input.
-  fromFile(file: string) -> Command = Command(shape, dir, env, limit, sink, InputFrom(file))
+  fromFile(file: string) -> Command = Command(shape, dir, env, limit, sink, InputFrom(file), errors, grouped)
 
   // The same command, reading `text` as its standard input.
-  withInput(text: string) -> Command = Command(shape, dir, env, limit, sink, InputText(text))
+  withInput(text: string) -> Command = Command(shape, dir, env, limit, sink, InputText(text), errors, grouped)
+
+  // The same command, its standard error written to `file`, which is made empty first, or made.
+  errorsToFile(file: string) -> Command = Command(shape, dir, env, limit, sink, feed, ErrorsTo(file, false), grouped)
+
+  // The same command, its standard error added to the end of `file`, which is made if it is not
+  // there.
+  errorsAppendTo(file: string) -> Command = Command(shape, dir, env, limit, sink, feed, ErrorsTo(file, true), grouped)
+
+  // The same command, its standard error going where its standard output goes: into the same open
+  // file, so neither stream empties what the other wrote, and into the text `output()` and `lines()`
+  // capture.
+  errorsToOutput() -> Command = Command(shape, dir, env, limit, sink, feed, ErrorsToOutput, grouped)
+
+  // The same command, started in a process group of its own, which every program it starts joins:
+  // the group `Child.signalGroup` signals, and with it every program those programs start that stays
+  // in it.
+  inNewGroup() -> Command = Command(shape, dir, env, limit, sink, feed, errors, true)
 
   // A pipeline: this command's standard output is `next`'s standard input, the two running at once.
   // Its status is `next`'s.
@@ -80,7 +100,7 @@ class Command(
   // Runs the command with the program's own streams, waits for it, and answers how it ended. A
   // status other than success is a value; the `Err` is a command that could not be started.
   run() -> Result[ExitStatus, IoError]
-    val job = launch(Context(None, [], None), Streams(Inherit, None, Inherit, None))?
+    val job = launch(Context.outermost(Track()), Streams.own())?
     job.finish()
     job.outcome()
 
@@ -95,7 +115,7 @@ class Command(
       fs.removeDirAll(dir)
       return Err(Io(ioError(opened.err().get())))
     val into = opened.ok().get()
-    val started = launch(Context(None, [], None), Streams(Inherit, None, ToFile(into), Some(into)))
+    val started = launch(Context.outermost(Track()), Streams.into(into))
     val outcome = started.map(job -> finished(job))
     val bytes = fs.readBytes(file)
     fs.removeDirAll(dir)
@@ -117,7 +137,7 @@ class Command(
     if sequenced()
       val launched = threads.Promise[Result[unit, IoError]]()
       val driver = threads.spawn(() ->
-        launch(Context(None, [], None), Streams(Inherit, None, ToFile(into), Some(into))) match
+        launch(Context.outermost(Track()), Streams.into(into)) match
           Ok(job) ->
             launched.complete(Ok(()))
             job.finish()
@@ -134,7 +154,7 @@ class Command(
         driver.join()
         return Err(ioError(descriptor.err().get()))
       return Ok(OutputLines(from, fdReader(descriptor.ok().get()), () -> driver.join()))
-    val started = launch(Context(None, [], None), Streams(Inherit, None, ToFile(into), Some(into)))
+    val started = launch(Context.outermost(Track()), Streams.into(into))
     if started.isErr()
       closeFile(Some(from))
       return Err(started.err().get())
@@ -147,10 +167,9 @@ class Command(
     Ok(OutputLines(from, fdReader(descriptor.ok().get()), () -> job.finish()))
 
   // Starts the command and answers at once, with the `Child` it is waited for and stopped by.
-  start() -> Result[Child, IoError] = launch(
-    Context(None, [], None),
-    Streams(Inherit, None, Inherit, None)
-  ).map(job -> Child(job, newOwner()))
+  start() -> Result[Child, IoError]
+    val track = Track()
+    launch(Context.outermost(track), Streams.own()).map(job -> Child(job, newOwner(), track))
 
   // Whether the command holds a sequence, whose later parts start as its earlier ones end.
   private sequenced() -> bool = shape match
@@ -158,12 +177,12 @@ class Command(
     Joined(_, _, _) -> true
     Piped(from, into) -> from.sequenced() || into.sequenced()
 
-  private joined(shape: Shape) -> Command = Command(shape, None, [], None, OwnOutput, OwnInput)
+  private joined(shape: Shape) -> Command = Command(shape, None, [], None, OwnOutput, OwnInput, OwnErrors, false)
 
   // Starts the command within `outer`'s settings, its streams `given`. Whatever it fails at, the
   // files `given` holds are closed.
   private launch(outer: Context, given: Streams) -> Result[Job, IoError]
-    val context = outer.within(dir, env, limit)
+    val context = outer.within(dir, env, limit, grouped)
     val streams = redirected(given)?
     shape match
       Program(program, args) -> startProgram(program, args, context, streams)
@@ -178,12 +197,14 @@ class Command(
           streams.release()
           return Err(ioError(ends.err().get()))
         val (reading, writing) = ends.ok().get()
-        val left = from.launch(context, Streams(streams.input, streams.inputFile, ToFile(writing), Some(writing)))
+        // Both stages write their errors to the pipeline's; the second, started last, closes its file.
+        val left = from.launch(context, Streams(streams.input, streams.inputFile, ToFile(writing), Some(writing), streams.errors, None, false))
         if left.isErr()
           closeFile(Some(reading))
           closeFile(streams.outputFile)
+          closeFile(streams.errorsFile)
           return left
-        val right = into.launch(context, Streams(FromFile(reading), Some(reading), streams.output, streams.outputFile))
+        val right = into.launch(context, Streams(FromFile(reading), Some(reading), streams.output, streams.outputFile, streams.errors, streams.errorsFile, streams.errorsShared))
         right match
           Ok(job) -> Ok(Pipeline(left.ok().get(), job))
           Err(e) ->
@@ -191,15 +212,30 @@ class Command(
             Err(e)
 
   // `given` with this command's own redirections in place of its streams, each replaced stream's
-  // file closed. A file that cannot be opened closes every file held so far.
+  // file closed. A file that cannot be opened closes every file held so far. Standard error sent to
+  // the output goes where the output goes once this command's own output is in place.
   private redirected(given: Streams) -> Result[Streams, IoError]
     var streams = given
     sink match
       OwnOutput -> ()
       OutputTo(file, append) -> (if append then appendFile(file) else createFile(file)) match
-        Ok(f) ->
-          closeFile(streams.outputFile)
-          streams = Streams(streams.input, streams.inputFile, ToFile(f), Some(f))
+        Ok(f) -> streams = streams.withOutput(f)
+        Err(e) ->
+          streams.release()
+          return Err(ioError(e))
+    errors match
+      OwnErrors -> ()
+      // The program's own output is reached through the name the platform gives it, opened to add to
+      // its end, so what was written there is kept.
+      ErrorsToOutput -> streams.output match
+        Inherit -> appendFile("/dev/stdout") match
+          Ok(f) -> streams = streams.withErrors(f)
+          Err(e) ->
+            streams.release()
+            return Err(ioError(e))
+        _ -> streams = streams.errorsToOutput()
+      ErrorsTo(file, append) -> (if append then appendFile(file) else createFile(file)) match
+        Ok(f) -> streams = streams.withErrors(f)
         Err(e) ->
           streams.release()
           return Err(ioError(e))
@@ -208,9 +244,7 @@ class Command(
       InputFrom(file) -> openFile(file).mapErr(ioError)
       InputText(text) -> textFile(text)
     input match
-      Ok(f) ->
-        closeFile(streams.inputFile)
-        Ok(Streams(FromFile(f), Some(f), streams.output, streams.outputFile))
+      Ok(f) -> Ok(streams.withInput(f))
       Err(e) ->
         streams.release()
         Err(e)
@@ -224,7 +258,9 @@ object Command
     [],
     None,
     OwnOutput,
-    OwnInput
+    OwnInput,
+    OwnErrors,
+    false
   )
 
   // The line split at runs of white space, the first word the program and the rest its arguments;
@@ -241,7 +277,7 @@ object Command
     if !word.isEmpty() then words.addOne(word)
     val all = words.result()
     if all.isEmpty() then fail("a command line with no word in it")
-    Command(Program(all(0), all.drop(1)), None, [], None, OwnOutput, OwnInput)
+    Command(Program(all(0), all.drop(1)), None, [], None, OwnOutput, OwnInput, OwnErrors, false)
 
 impl string
   // The string as a command line, `Command.parse(self).run()`.
@@ -255,22 +291,56 @@ impl string
 // body, it is the body's, which may wait for it, stop it and start its later parts, and every
 // operation first checks the child's owner, so the code that handed it over traps where it uses it
 // again while the body runs.
-class Child(private val job: Job, private val owner: Owner): Sendable
+class Child(private val job: Job, private val owner: Owner, private val track: Track): Sendable
   // Waits for the command to end and answers how it ended, the same answer every time.
   waitFor() -> Result[ExitStatus, IoError]
     owner.held()
-    finished(job)
+    val outcome = finished(job)
+    track.ended.store(true)
+    outcome
 
   // Whether the command is still running, without waiting for it.
   isAlive() -> bool
     owner.held()
-    !job.poll()
+    if !job.poll() then return true
+    track.ended.store(true)
+    false
 
   // Asks every program of the command still running to stop, with the signal 15, and starts no
   // part not yet started.
   kill()
     owner.held()
     job.stop()
+
+  // The process id of the program the command started last: its one program, a pipeline's last
+  // stage, or the part of a sequence started most recently. Zero where no program was started, its
+  // time having run out first. Any thread may ask, while another waits for the command.
+  pid() -> long = track.pid.load()
+
+  // The process group the command's programs run in, where it was started `inNewGroup`: the number
+  // of the group its first program leads. Any thread may ask.
+  group() -> Option[long] = track.group.load() match
+    0 -> None
+    g -> Some(g)
+
+  // Sends the signal `sig` to the program `pid()` names. A command seen to have ended, by `waitFor`
+  // or by `isAlive` answering `false`, is not signalled, its process id being free for the platform
+  // to give again: that is `Err(Other("No such process"))`, as for a program that has ended
+  // unseen. Any thread may signal it while another waits for it, and `kill` aside, a sequence goes on
+  // to its next part as its status says.
+  signal(sig: int) -> Result[unit, IoError]
+    val p = track.pid.load()
+    if p == 0 || track.ended.load() then return Err(ioError(Other(3)))
+    sendSignal(p, sig).mapErr(ioError)
+
+  // Sends the signal `sig` to every process in the command's group, its programs and every program
+  // they started that stays in it, however the command itself has ended; a group with no one left in
+  // it is `Err(Other("No such process"))`. A command not started `inNewGroup` has no group of its
+  // own and is refused, `Err(Other("the command has no group of its own"))`. Any thread may signal
+  // it.
+  signalGroup(sig: int) -> Result[unit, IoError] = track.group.load() match
+    0 -> Err(io.Other("the command has no group of its own"))
+    g -> sendSignal(-g, sig).mapErr(ioError)
 
 // What the command is: one program, a pipeline, or two commands one after the other.
 private data Shape
@@ -295,12 +365,26 @@ private data Feed
   InputFrom(file: string)
   InputText(text: string)
 
+// Where a command's standard error goes when the command says: to a file, or where its output goes.
+private data Drain
+  OwnErrors
+  ErrorsTo(file: string, append: bool)
+  ErrorsToOutput
+
 // The settings a command's parts run with: the directory, the variables set for them, and when they
-// are stopped, a deadline being a reading of the monotonic clock.
-private class Context(val dir: Option[string], val env: Vector[(string, string)], val deadline: Option[Duration])
+// are stopped, a deadline being a reading of the monotonic clock; what the command's `Child` is told
+// of the programs it starts, and whether they start in a group of their own.
+private class Context(
+    val dir: Option[string],
+    val env: Vector[(string, string)],
+    val deadline: Option[Duration],
+    val track: Track,
+    val grouped: bool
+)
   // These settings with a part's own on top: its directory where it names one, its variables after
-  // these (a name it sets replacing the one here), and the earlier of the two deadlines.
-  within(ownDir: Option[string], ownEnv: Vector[(string, string)], limit: Option[Duration]) -> Context
+  // these (a name it sets replacing the one here), the earlier of the two deadlines, and a group of
+  // its own where either asks for one, the outermost command's being the one every part joins.
+  within(ownDir: Option[string], ownEnv: Vector[(string, string)], limit: Option[Duration], ownGroup: bool) -> Context
     val vars = Vector.newBuilder[(string, string)]()
     for (name, value) in env
       if !ownEnv.exists(p -> p.0 == name) then vars.addOne((name, value))
@@ -310,17 +394,69 @@ private class Context(val dir: Option[string], val env: Vector[(string, string)]
       (Some(a), Some(b)) -> Some(if b < a then b else a)
       (Some(a), None) -> Some(a)
       _ -> own
-    Context(ownDir.orElse(dir), vars.result(), until)
+    Context(ownDir.orElse(dir), vars.result(), until, track, grouped || ownGroup)
+
+private object Context
+  // The settings a command run from the program starts with: its own, and none of a command's.
+  outermost(track: Track) -> Context = Context(None, [], None, track, false)
+
+// What a started command's `Child` knows of its programs without asking them, so that any thread
+// may read it while another waits: the process id of the program started last, the group its
+// programs were started in (zero for none), and whether the command has been seen to end. The code
+// that starts the programs writes it, whichever thread that is.
+private class Track(): Sendable
+  val pid: Atomic[long] = Atomic(long(0))
+  val group: Atomic[long] = Atomic(long(0))
+  val ended: Atomic[bool] = Atomic(false)
 
 // A part's three streams as Sysl takes them, with the files among them this part closes once it no
-// longer needs them: a pipe's end, or a file a redirection opened.
-private class Streams(val input: Stdio, val inputFile: Option[File], val output: Stdio, val outputFile: Option[File])
+// longer needs them: a pipe's end, or a file a redirection opened. Standard error sent where the
+// output goes shares the output's open file, which `errorsShared` says, and the output closes.
+private class Streams(
+    val input: Stdio,
+    val inputFile: Option[File],
+    val output: Stdio,
+    val outputFile: Option[File],
+    val errors: Stdio,
+    val errorsFile: Option[File],
+    val errorsShared: bool
+)
   // The same streams, for a part that does not close them: a sequence's, which closes them itself.
-  lent() -> Streams = Streams(input, None, output, None)
+  lent() -> Streams = Streams(input, None, output, None, errors, None, false)
+
+  // The same streams, reading `f`; the input replaced is closed.
+  withInput(f: File) -> Streams
+    closeFile(inputFile)
+    Streams(FromFile(f), Some(f), output, outputFile, errors, errorsFile, errorsShared)
+
+  // The same streams, writing the output to `f`. The output replaced is closed, unless standard error
+  // still goes to it, which then closes it.
+  withOutput(f: File) -> Streams
+    if errorsShared then return Streams(input, inputFile, ToFile(f), Some(f), errors, outputFile, false)
+    closeFile(outputFile)
+    Streams(input, inputFile, ToFile(f), Some(f), errors, errorsFile, false)
+
+  // The same streams, writing standard error to `f`; the one replaced is closed.
+  withErrors(f: File) -> Streams
+    if !errorsShared then closeFile(errorsFile)
+    Streams(input, inputFile, output, outputFile, ToFile(f), Some(f), false)
+
+  // The same streams, standard error going to the output's file, which the output keeps closing.
+  errorsToOutput() -> Streams
+    if !errorsShared then closeFile(errorsFile)
+    Streams(input, inputFile, output, outputFile, output, None, outputFile.isDefined())
 
   release()
     closeFile(inputFile)
     closeFile(outputFile)
+    closeFile(errorsFile)
+
+private object Streams
+  // The program's own three streams.
+  own() -> Streams = Streams(Inherit, None, Inherit, None, Inherit, None, false)
+
+  // The program's own input and standard error, the output going into `f`, which these streams close.
+  into(f: File) -> Streams = Streams(Inherit, None, ToFile(f), Some(f), Inherit, None, false)
 
 // Closes the descriptor the file holds and gives its Sysl value back.
 private closeFile(file: Option[File]) = file match
@@ -356,20 +492,28 @@ private startProgram(program: string, args: Vector[string], context: Context, st
       millis = if left >= 2147483647000 then 2147483647 else int((left + 999) / 1000)
     None -> ()
   val vars = context.env.map(p -> Var(p.0, p.1))
-  val started = spawnProgram(
-    program,
-    args,
-    context.dir.getOrElse(""),
-    vars,
-    millis,
-    true,
-    streams.input,
-    streams.output,
-    Inherit
-  )
+  val dir = context.dir.getOrElse("")
+  val spawning = (group: Group) -> spawnProgram(program, args, dir, vars, millis, true, streams.input, streams.output, streams.errors, group)
+  var leads = false
+  var started = if !context.grouped then spawning(Group.Inherit) else context.track.group.load() match
+    0 ->
+      leads = true
+      spawning(Group.New)
+    g -> spawning(Group.Join(int(g)))
+  // A group whose every member has ended is gone, and joining it is refused: a sequence's later part
+  // started then leads a new group, which the command's group becomes.
+  val refused = started match
+    Err(NotPermitted) -> context.grouped && !leads
+    _ -> false
+  if refused
+    leads = true
+    started = spawning(Group.New)
   streams.release()
   started match
-    Ok(child) -> Ok(Process(child, context.deadline))
+    Ok(child) ->
+      context.track.pid.store(long(child.pid()))
+      if leads then context.track.group.store(long(child.group()))
+      Ok(Process(child, context.deadline))
     Err(e) -> Err(ioError(e))
 
 // A started command: one program, a pipeline or a sequence. `poll` moves it on without waiting and
@@ -642,6 +786,8 @@ private class Spawned
   wait() -> Result[ExitStatus, SyslError]
   tryWait() -> Result[Option[ExitStatus], SyslError]
   kill(signal: int) -> Result[unit, SyslError]
+  pid() -> int
+  group() -> int
 
 @sysl("sysl.process.spawn")
 private spawnProgram(
@@ -653,5 +799,13 @@ private spawnProgram(
     inheritEnv: bool,
     stdin: Stdio,
     stdout: Stdio,
-    stderr: Stdio
+    stderr: Stdio,
+    group: Group
 ) -> Result[Spawned, SyslError]
+
+// The process group a program starts in: this program's, a new one it leads, or one already there.
+@sysl("sysl.process.Group")
+private data Group
+  Inherit
+  New
+  Join(pgid: int)

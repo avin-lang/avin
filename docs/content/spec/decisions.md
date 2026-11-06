@@ -4299,6 +4299,46 @@ spec did not settle; the user may want to revisit the first two.
   runs in it, and the repository's own packages must be gated like the core library is. A package
   whose behaviour needs a window (`ui`) has no such directory.
 
+- Proposed (built on branch `process-control`): **A `Child`'s process ids are recorded, and read by
+  any thread** ([commands](/spec/system-library/#commands)). `pid()`, `group()`, `signal` and
+  `signalGroup` read atomics the starting code writes as each program starts, never the command's
+  handles, which belong to one thread, so a job manager can signal a child another thread is waiting
+  for. `pid()` is the program started last (a pipeline's last stage, a sequence's latest part, as a
+  shell's `$!` is), and `signal` reaches that one program; `kill` remains the call that reaches
+  every program and stops a sequence. A command seen to have ended is refused with the platform's
+  "No such process" rather than signalled, since its id may have been given again; one that ended
+  unseen is a zombie the signal reaches harmlessly. Alternatives: `signal` through the owner, which
+  traps on a child another thread waits for (what the marshal survey met); a `signal` reaching every
+  program, which needs every program's id kept and the job's handles' state shared; `pid()` as an
+  `Option`, rather than `0` for a command whose time ran out before it started a program.
+- Proposed (built on branch `process-control`): **One group per command, and `signalGroup` without
+  one is an `Err`** ([commands](/spec/system-library/#commands)). `inNewGroup()` puts every program
+  of the command in one group its first program leads, the outermost setting deciding; a sequence's
+  later part whose group has emptied leads a new one (joining a gone group is refused by the
+  platform), and `group()` follows it. `signalGroup` on a command with no group of its own is
+  `Err(Other("the command has no group of its own"))`, never a signal to the program's own group,
+  and it still signals after the command ended, since a group outlives its leader while anything it
+  started is left: the case a job manager kills for. Alternatives: a trap for `signalGroup` without a
+  group (a daemon would die of a missed setting); a group per part; refusing the later part.
+  **Review with the user**: whether `signalGroup` should trap.
+- Proposed (built on branch `process-control`): **Standard error is redirected as output is**
+  ([commands](/spec/system-library/#commands)): `errorsToFile`, `errorsAppendTo` and
+  `errorsToOutput()`, the last sharing the output's open file (one offset, so neither stream
+  truncates or overwrites the other), going into what `output()` and `lines()` capture, and, where
+  the output is the program's own, opening `/dev/stdout` to append. On a pipeline every stage's
+  errors go to the pipeline's redirection. The redirections apply output first whatever the order
+  they were called in. Alternatives: one `bothToFile(file)` (a second name for a pair of calls);
+  `Stdio`-like values passed to one `withStreams`; `2>&1` read as the output at the point of the call.
+- Proposed (built on branch `process-control`): **Signals are watched in `avin.signal`, and a wait
+  looks every 20 ms** ([`avin.signal`](/spec/system-library/#avinsignal)). The platform's facility
+  is a counted flag, so `wait()` parks its lightweight thread and looks again every 20 milliseconds,
+  the latency bound; `take()` asks once. Constants are `val`s named for what they mean (`Terminate`,
+  `Interrupt`, `Hangup`, `User1`...), the user ones numbered by the runtime for the platform; sending
+  stays in `avin.process` beside the process ids it takes. Alternatives: the POSIX short names
+  (`TERM`), against Avin's naming; a `data Signal` (a closed set, while numbers are open, and
+  `ExitStatus.Signalled` speaks `int`); a wake from the handler through the scheduler, which needs a
+  runtime handler that is async-signal-safe, for a latency no program has needed yet.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
