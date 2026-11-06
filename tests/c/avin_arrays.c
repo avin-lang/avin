@@ -114,6 +114,16 @@ int aa_wait_object(const fx_object *o, int timeout_ms) {
     return fx_object_value(o);
 }
 
+int aa_wait_objects(const fx_object *a, const fx_object *b, const fx_object *c, int timeout_ms) {
+    if (!aa_wait_flag(timeout_ms)) return -1;
+    return fx_object_value(a) + fx_object_value(b) + fx_object_value(c);
+}
+
+int aa_wait_maybe(const fx_object *o, int timeout_ms) {
+    if (!aa_wait_flag(timeout_ms)) return -1;
+    return o == NULL ? -2 : fx_object_value(o);
+}
+
 size_t aa_sleep_strlen(const char *s, int ms) {
     sleep_ms(ms);
     return strlen(s);

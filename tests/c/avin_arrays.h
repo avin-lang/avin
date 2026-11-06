@@ -84,6 +84,12 @@ long long aa_wait_sum(const int32_t *p, size_t n, int timeout_ms);
 int aa_wait_fill(uint8_t *p, size_t n, int timeout_ms);
 /* Waits for the flag, then reads the object, which must still be alive: its value, or -1. */
 int aa_wait_object(const fx_object *o, int timeout_ms);
+/* Waits for the flag, then reads three objects, each of which must still be alive: the sum of
+ * their values, or -1. */
+int aa_wait_objects(const fx_object *a, const fx_object *b, const fx_object *c, int timeout_ms);
+/* Waits for the flag, then reads the object, which must still be alive where it is not null: its
+ * value, -2 for null, or -1. */
+int aa_wait_maybe(const fx_object *o, int timeout_ms);
 /* Sleeps, then answers the string's length. */
 size_t aa_sleep_strlen(const char *s, int ms);
 /* Sleeps, then answers how much of the table it copied, as `aa_take`. */
