@@ -1,0 +1,177 @@
+// expect: exit 0
+// A handle made and used up in one expression, never stored anywhere, is still an object the
+// collector frees, so its finalizer gives its C reference back exactly once. Each shape makes 100
+// handles in a function of its own and then lets the collector free them: a handle-making call
+// written as a binding's argument, shared and owned, blocking and not; as a method's receiver; in
+// an `Option`; lent by a `borrowed` call; kept by the handle a `keeps:` call answers; taken by a
+// `consumes:` call; behind a status that answers an error; and made and dropped unused, its value
+// discarded or bound and never read. Each line is the fixture's running counts of objects made,
+// references taken, references given back and objects freed, and whether every one made was freed.
+// The corpus runs this with the collector at every allocation, at -O0 and -O2.
+import fixture.{Counts, Object, SharedObject, checkOf, faceOver, faces, lend, libraries, newLibrary, newObject, newPlain, newShared, newShelf, objects, plains, shelves, valueOf}
+
+@c("void aa_set_flag(void)")
+setFlag()
+
+@c("int fx_object_value(const fx_object *o)")
+sharedValue(o: SharedObject) -> int
+
+@c("int aa_wait_object(const fx_object *o, int timeout_ms)", blocking)
+waitShared(o: SharedObject, timeout: int) -> int
+
+@c("int aa_wait_object(const fx_object *o, int timeout_ms)", blocking)
+waitOwned(o: Object, timeout: int) -> int
+
+// The fixture's counted object again, with a blocking method, so the handle passed is the receiver.
+@c(type: "fx_object *", release: "fx_object_unref", retain: "fx_object_ref", shared)
+class Waiter
+    @c("int aa_wait_object(const fx_object *self, int timeout_ms)", blocking)
+    waitValue(timeout: int) -> int
+
+@c("fx_object *fx_object_new(int value)")
+newWaiter(value: int) -> Waiter
+
+line(c: Counts) -> string = s"${c.created} ${c.retained} ${c.released} ${c.freed}"
+
+// Allocates until every object of `counts` has been freed, or gives up after a bound.
+settle(counts: () -> Counts) -> bool
+    var n = 0
+    while counts().freed < counts().created && n < 1000000
+        val v = [n, n + 1]
+        n += v(1) - v(0)
+    counts().freed == counts().created
+
+report(name: string, counts: () -> Counts)
+    val freed = settle(counts)
+    println(s"$name ${line(counts())} $freed")
+
+ownedArgument() -> int
+    var sum = 0
+    for i in 0..<100 do sum += valueOf(newObject(i))
+    sum
+
+sharedArgument() -> int
+    var sum = 0
+    for i in 0..<100 do sum += sharedValue(newShared(i))
+    sum
+
+ownedBlocking() -> int
+    var sum = 0
+    for i in 0..<100 do sum += waitOwned(newObject(i), 1000)
+    sum
+
+sharedBlocking() -> int
+    var sum = 0
+    for i in 0..<100 do sum += waitShared(newShared(i), 1000)
+    sum
+
+blockingReceiver() -> int
+    var sum = 0
+    for i in 0..<100 do sum += newWaiter(i).waitValue(1000)
+    sum
+
+ownedReceiver() -> int
+    var sum = 0
+    for i in 0..<100 do sum += newObject(i).value()
+    sum
+
+sharedReceiver() -> int
+    var sum = 0
+    for i in 0..<100 do sum += newShared(i).value()
+    sum
+
+borrowed() -> int
+    var sum = 0
+    for i in 0..<100 do sum += lend(newObject(i)).value()
+    sum
+
+failedStatus() -> int
+    var errors = 0
+    for i in 0..<100
+        if checkOf(newObject(i), -1) is Err(_) then errors += 1
+    errors
+
+ownedDiscarded()
+    for i in 0..<100 do newObject(i)
+
+sharedDiscarded()
+    for i in 0..<100 do newShared(i)
+
+sharedUnread()
+    for i in 0..<100
+        val _o = newShared(i)
+
+inClosure() -> int
+    var sum = 0
+    for i in 0..<100
+        val f = () -> sharedValue(newShared(i))
+        sum += f()
+    sum
+
+kept() -> int
+    var sum = 0
+    for i in 0..<100 do sum += newShelf(newPlain(i)).peek()
+    sum
+
+keptDiscarded()
+    for i in 0..<100 do newShelf(newPlain(i))
+
+optionKept() -> int
+    var sum = 0
+    for i in 0..<100
+        if faceOver(newLibrary(), Some(newObject(i)), i) is Some(face) then sum += face.memoryValue()
+    sum
+
+optionDiscarded()
+    for i in 0..<100 do faceOver(newLibrary(), Some(newObject(i)), i)
+
+consumed()
+    for i in 0..<100 do newLibrary().adopt(newObject(i))
+
+main()
+    setFlag()
+    var sum = 0
+    sum += ownedArgument()
+    report("owned argument", () -> objects())
+    sum += sharedArgument()
+    report("shared argument", () -> objects())
+    sum += ownedBlocking()
+    report("owned blocking argument", () -> objects())
+    sum += sharedBlocking()
+    report("shared blocking argument", () -> objects())
+    sum += blockingReceiver()
+    report("blocking receiver", () -> objects())
+    sum += ownedReceiver()
+    report("owned receiver", () -> objects())
+    sum += sharedReceiver()
+    report("shared receiver", () -> objects())
+    sum += borrowed()
+    report("borrowed", () -> objects())
+    sum += failedStatus()
+    report("failed status", () -> objects())
+    ownedDiscarded()
+    report("owned discarded", () -> objects())
+    sharedDiscarded()
+    report("shared discarded", () -> objects())
+    sharedUnread()
+    report("shared unread", () -> objects())
+    sum += inClosure()
+    report("in a closure", () -> objects())
+    sum += kept()
+    report("kept plain", () -> plains())
+    report("keeping shelf", () -> shelves())
+    keptDiscarded()
+    report("kept plain, discarded", () -> plains())
+    report("keeping shelf, discarded", () -> shelves())
+    sum += optionKept()
+    report("in an option", () -> objects())
+    report("its face", () -> faces())
+    report("its library", () -> libraries())
+    optionDiscarded()
+    report("in an option, discarded", () -> objects())
+    report("its face, discarded", () -> faces())
+    report("its library, discarded", () -> libraries())
+    consumed()
+    report("consumed", () -> objects())
+    report("consuming library", () -> libraries())
+    println(sum)

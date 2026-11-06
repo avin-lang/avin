@@ -25,7 +25,8 @@ import sysl.buf.{Buf, buf}
 //   made only by allocations, used only to reach fields, to read the descriptor and to compare with
 //   null, is replaced by its fields, provided that no two of its objects are ever in use at once: an
 //   allocation in a loop makes a new object each time round, and every reference read after it must be
-//   to that newest one.
+//   to that newest one. A handle, Sysl or C, is never replaced, however little it is used: its
+//   finalizer gives back the reference it holds, and runs only when the collector frees the object.
 // - Fences. A fence that ends the making of an object is needed only if a store another thread could
 //   see was made since the last fence. Where the object it ended is now fields, and nothing else was
 //   stored to shared memory since, the fence goes.
@@ -96,8 +97,10 @@ private struct Analysis
     field_offset: Buf[usize]
     accesses: Buf[Access]
 
-/** The program's functions with objects that never leave a function kept as their fields. */
-scalar_replace(functions: Buf[MirFunction], descriptors: Buf[Descriptor]) -> Buf[MirFunction]
+/** The program's functions with objects that never leave a function kept as their fields. An
+ * object made with a descriptor `finalized` marks is never replaced: the collector must see it die,
+ * since its finalizer gives back what it holds. */
+scalar_replace(functions: Buf[MirFunction], descriptors: Buf[Descriptor], finalized: Buf[bool]) -> Buf[MirFunction]
     val n = functions.len()
     val cyclic = cyclic_functions(functions)
     var inlinable: Buf[bool] = buf()
@@ -107,7 +110,7 @@ scalar_replace(functions: Buf[MirFunction], descriptors: Buf[Descriptor]) -> Buf
     var out: Buf[MirFunction] = buf()
     for i in 0..<n
         val inlined = inline_for_objects(functions[i], functions, summary)
-        out.push(replace_objects(inlined, descriptors, summary))
+        out.push(replace_objects(inlined, descriptors, finalized, summary))
     remove_fences(out)
 
 /** The number of instructions of `f`, a terminator counting as one. */
@@ -592,7 +595,7 @@ private zero_of(t: MirType) -> Operand = t match
 
 /** `f` with every group of objects that never leaves it, and of which no two are in use at once,
  * kept as local slots, one for each field. */
-private replace_objects(f: MirFunction, descriptors: Buf[Descriptor], s: Summary) -> MirFunction
+private replace_objects(f: MirFunction, descriptors: Buf[Descriptor], finalized: Buf[bool], s: Summary) -> MirFunction
     val a = analyze(f, s)
     val groups = a.flags.len()
     var valid: Buf[bool] = buf()
@@ -609,7 +612,7 @@ private replace_objects(f: MirFunction, descriptors: Buf[Descriptor], s: Summary
                 if a.value_group[d] is Some(g)
                     if valid[g]
                         val desc = descriptors[descriptor]
-                        if desc.constant || desc.elements then valid[g] = false
+                        if desc.constant || desc.elements || finalized[descriptor] then valid[g] = false
                         var seen = false
                         for x in made[g]
                             if x == descriptor then seen = true
