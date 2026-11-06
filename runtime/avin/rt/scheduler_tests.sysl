@@ -1,0 +1,481 @@
+module avin.rt
+@tests
+
+import sh.sysl.gc
+import sysl.raw.ptr_cast
+import sysl.sync.*
+import sysl.threads.yield_now as os_yield
+import sysl.time.{millis, sleep}
+
+// Lightweight threads started as compiled code starts them, through `thread_start` with a runner the
+// C convention calls: here a Sysl function, handed a pointer to the test's own state as its closure,
+// which the collector ignores since it is outside the heap.
+
+// A frame of up to 64 slots holding the joints of the threads a test starts, so a collection while
+// it starts more keeps them.
+private struct Joints
+    frame: Frame
+    slots: [64]*u8
+
+@assert(offsetof(Joints, slots) == sizeof(Frame), "a frame's slots follow its header")
+
+private var joints: Joints = Joints(Frame(null, 64), [null; 64])
+
+// Starts `n` lightweight threads running `body` with `state`, from `me`, their joints held in `joints`.
+private start_n(me: *Context, n: usize, body: *extern(*Context, *u8) -> unit, state: *u8)
+    for i in 0..<n
+        joints.slots[i] = thread_start(me, state, LeastStack, ptr_cast(body))
+
+private join_n(me: *Context, n: usize)
+    for i in 0..<n
+        thread_join(me, joints.slots[i])
+        joints.slots[i] = null
+
+private with_joints(me: *Context)
+    joints.frame.prev = me.top
+    me.top = &joints.frame
+
+private without_joints(me: *Context)
+    me.top = joints.frame.prev
+
+// How many lightweight threads to start so that every worker has one and some wait: four for each
+// processor, within the 64 slots.
+private crowd() -> usize
+    val n = usize(processors()) * 4
+    if n > 64 then 64 else n
+
+// Waits, polling, for `flag` to be raised, for at most `ms` milliseconds; answers whether it was.
+private raised_within(flag: *Atomic[u32], ms: int) -> bool
+    for _ in 0..<ms
+        if flag.load() != 0 then return true
+        sleep(millis(1))
+    flag.load() != 0
+
+private struct Counting
+    runs: Atomic[u32]
+    lightweight: Atomic[u32]
+
+private var counting: Counting = Counting(Atomic(0), Atomic(0))
+
+private count_run(c: *Context, run: *u8) -> unit
+    val s: *Counting = ptr_cast(run)
+    if runs_lightweight(c) then _ = s.lightweight.add(1)
+    _ = s.runs.add(1)
+
+@test("lightweight threads run on the scheduler's workers and are joined, twice over, from a thread that is not one")
+start_and_join()
+    counting.runs.store(0)
+    counting.lightweight.store(0)
+    val me = thread_attach()
+    assert(!runs_lightweight(me))
+    with_joints(me)
+    val n = crowd()
+    start_n(me, n, &count_run, ptr_cast(&counting))
+    join_n(me, n)
+    assert_eq(counting.runs.load(), u32(n))
+    assert_eq(counting.lightweight.load(), u32(n))
+    assert(workers_started.load() >= 1)
+    assert(workers_started.load() <= u64(processors()) + 64)
+    // A second join of an ended thread returns at once.
+    joints.slots[0] = thread_start(me, ptr_cast(&counting), LeastStack, ptr_cast(&count_run))
+    thread_join(me, joints.slots[0])
+    thread_join(me, joints.slots[0])
+    joints.slots[0] = null
+    without_joints(me)
+    thread_detach(me)
+    collect_now()
+    assert_eq(gc.live(&space), 0usize)
+
+private struct Hops
+    moved: Atomic[u32]
+    turns: Atomic[u32]
+
+private var hops: Hops = Hops(Atomic(0), Atomic(0))
+
+private hop(c: *Context, run: *u8) -> unit
+    val h: *Hops = ptr_cast(run)
+    val first = c.carrier
+    var moved = false
+    for _ in 0..<2000
+        yield_now(c)
+        if c.carrier != first then moved = true
+    if moved then _ = h.moved.add(1)
+    _ = h.turns.add(1)
+
+@test("a lightweight thread that yields resumes on whichever worker takes it, which may be another")
+resumes_elsewhere()
+    hops.moved.store(0)
+    hops.turns.store(0)
+    val me = thread_attach()
+    with_joints(me)
+    val n = crowd()
+    start_n(me, n, &hop, ptr_cast(&hops))
+    join_n(me, n)
+    without_joints(me)
+    thread_detach(me)
+    assert_eq(hops.turns.load(), u32(n))
+    if processors() > 1 then assert(hops.moved.load() > 0)
+
+// A lock the test's own thread holds while lightweight threads wait for it, and a thread that needs
+// none, which must still run while they wait.
+private struct Contended
+    lock: *u8
+    taken: Atomic[u32]
+    free_ran: Atomic[u32]
+
+private var contended: Contended = Contended(null, Atomic(0), Atomic(0))
+
+private take_contended(c: *Context, run: *u8) -> unit
+    val s: *Contended = ptr_cast(run)
+    lock_acquire(c, s.lock)
+    _ = s.taken.add(1)
+    lock_release(c, s.lock)
+
+private run_free(c: *Context, run: *u8) -> unit
+    val s: *Contended = ptr_cast(run)
+    s.free_ran.store(1)
+
+@test("lightweight threads waiting for a lock park, leaving their workers to run others, and each takes it in turn")
+lock_waiters_park()
+    val me = thread_attach()
+    with_joints(me)
+    joints.slots[63] = lock_new(me)
+    contended.lock = joints.slots[63]
+    contended.taken.store(0)
+    contended.free_ran.store(0)
+    lock_acquire(me, contended.lock)
+    val n = crowd() - 1
+    start_n(me, n, &take_contended, ptr_cast(&contended))
+    sleep(millis(20))
+    assert_eq(contended.taken.load(), 0u32)
+    joints.slots[n] = thread_start(me, ptr_cast(&contended), LeastStack, ptr_cast(&run_free))
+    assert(raised_within(&contended.free_ran, 5000))
+    lock_release(me, contended.lock)
+    join_n(me, n + 1)
+    assert_eq(contended.taken.load(), u32(n))
+    val l: *ParkLock = ptr_cast(contended.lock)
+    assert(!l.held)
+    assert(l.waiting.head == null)
+    joints.slots[63] = null
+    contended.lock = null
+    without_joints(me)
+    thread_detach(me)
+    collect_now()
+    assert_eq(gc.live(&space), 0usize)
+
+// A condition lightweight threads wait on with a time limit.
+private struct Timed
+    lock: *u8
+    condition: *u8
+    notified: Atomic[u32]
+    ran_out: Atomic[u32]
+    waiting: Atomic[u32]
+    millis: long
+
+private var timed: Timed = Timed(null, null, Atomic(0), Atomic(0), Atomic(0), 0)
+
+private wait_timed(c: *Context, run: *u8) -> unit
+    val s: *Timed = ptr_cast(run)
+    lock_acquire(c, s.lock)
+    _ = s.waiting.add(1)
+    val before = now_micros()
+    if condition_wait_for(c, s.condition, s.lock, s.millis)
+        _ = s.notified.add(1)
+    else
+        if now_micros() - before >= s.millis * 1000 then _ = s.ran_out.add(1)
+    lock_release(c, s.lock)
+
+private timed_round(me: *Context, n: usize, ms: long, notify: bool)
+    timed.notified.store(0)
+    timed.ran_out.store(0)
+    timed.waiting.store(0)
+    timed.millis = ms
+    start_n(me, n, &wait_timed, ptr_cast(&timed))
+    if notify
+        while timed.waiting.load() < u32(n)
+            sleep(millis(1))
+        lock_acquire(me, timed.lock)
+        condition_notify_all(me, timed.condition)
+        lock_release(me, timed.lock)
+    join_n(me, n)
+
+@test("a timed condition wait in a lightweight thread runs out after its time, or ends early when notified")
+timed_waits_park()
+    val me = thread_attach()
+    with_joints(me)
+    joints.slots[62] = lock_new(me)
+    joints.slots[63] = condition_new(me)
+    timed.lock = joints.slots[62]
+    timed.condition = joints.slots[63]
+    val n = crowd() - 2
+    timed_round(me, n, 30, false)
+    assert_eq(timed.ran_out.load(), u32(n))
+    assert_eq(timed.notified.load(), 0u32)
+    val before = now_micros()
+    timed_round(me, n, 60000, true)
+    assert_eq(timed.notified.load(), u32(n))
+    assert(now_micros() - before < 30000000)
+    val q: *ParkCondition = ptr_cast(timed.condition)
+    assert(q.waiting.head == null)
+    joints.slots[62] = null
+    joints.slots[63] = null
+    timed.lock = null
+    timed.condition = null
+    without_joints(me)
+    thread_detach(me)
+    collect_now()
+    assert_eq(gc.live(&space), 0usize)
+
+// Lightweight threads that block in the operating system, as a blocking binding does, on every
+// worker at once, and one more thread that has to run meanwhile.
+private struct Blocking
+    done: Atomic[u32]
+    other_ran: Atomic[u32]
+    other_first: Atomic[u32]
+
+private var blocking: Blocking = Blocking(Atomic(0), Atomic(0), Atomic(0))
+
+private block_a_while(c: *Context, run: *u8) -> unit
+    val s: *Blocking = ptr_cast(run)
+    enter_safe(c)
+    sleep(millis(400))
+    leave_safe(c)
+    _ = s.done.add(1)
+
+private run_meanwhile(c: *Context, run: *u8) -> unit
+    val s: *Blocking = ptr_cast(run)
+    if s.done.load() == 0 then s.other_first.store(1)
+    s.other_ran.store(1)
+
+@test("a worker held by a blocking call is replaced, so a ready thread runs while every worker blocks")
+blocked_workers_are_replaced()
+    blocking.done.store(0)
+    blocking.other_ran.store(0)
+    blocking.other_first.store(0)
+    val before = releases.load()
+    val me = thread_attach()
+    with_joints(me)
+    val n = crowd() - 1
+    start_n(me, n, &block_a_while, ptr_cast(&blocking))
+    sleep(millis(20))
+    joints.slots[n] = thread_start(me, ptr_cast(&blocking), LeastStack, ptr_cast(&run_meanwhile))
+    join_n(me, n + 1)
+    without_joints(me)
+    thread_detach(me)
+    assert_eq(blocking.done.load(), u32(n))
+    assert_eq(blocking.other_ran.load(), 1u32)
+    assert_eq(blocking.other_first.load(), 1u32)
+    assert(releases.load() > before)
+
+// Threads that spin, polling as compiled code does, until one more thread has run: with more spinners
+// than workers, it runs only if the spinners are made to yield.
+private struct Spinning
+    halt: Atomic[u32]
+    spun: Atomic[u32]
+
+private var spinning: Spinning = Spinning(Atomic(0), Atomic(0))
+
+private spin_polling(c: *Context, run: *u8) -> unit
+    val s: *Spinning = ptr_cast(run)
+    while s.halt.load(Relaxed) == 0
+        if requested.load(Relaxed) != 0 then safepoint(c)
+    _ = s.spun.add(1)
+
+private halt_spinners(c: *Context, run: *u8) -> unit
+    val s: *Spinning = ptr_cast(run)
+    s.halt.store(1)
+
+@test("a thread that overruns its slice while another is ready yields at its next poll")
+overrunning_threads_yield()
+    spinning.halt.store(0)
+    spinning.spun.store(0)
+    val before = yields.load()
+    val me = thread_attach()
+    with_joints(me)
+    val n = crowd() - 1
+    start_n(me, n, &spin_polling, ptr_cast(&spinning))
+    sleep(millis(30))
+    joints.slots[n] = thread_start(me, ptr_cast(&spinning), LeastStack, ptr_cast(&halt_spinners))
+    join_n(me, n + 1)
+    without_joints(me)
+    thread_detach(me)
+    assert_eq(spinning.spun.load(), u32(n))
+    assert(yields.load() > before)
+    // Once nothing overruns, the monitor lowers the bit by its next tick.
+    sleep(millis(20))
+    assert_eq(requested.load() & Yield, 0u32)
+
+// A thread that builds a list rooted in its own frame, parks on a condition while collections run,
+// and checks the list when it wakes.
+private struct ParkedList
+    root: Frame
+    head: *u8
+    lock: *u8
+    condition: *u8
+    built: Atomic[u32]
+    go: Atomic[u32]
+    ok: Atomic[u32]
+
+@assert(offsetof(ParkedList, head) == sizeof(Frame), "a frame's slots follow its header")
+
+private struct Cell
+    header: Descriptor
+    offset: usize
+
+private var cell_kind: Cell = Cell(descriptor(2, 16, 1), 0)
+
+private var parked_list: ParkedList = ParkedList(Frame(null, 1), null, null, null, Atomic(0), Atomic(0), Atomic(0))
+
+private build_and_park(c: *Context, run: *u8) -> unit
+    val s: *ParkedList = ptr_cast(run)
+    s.root.prev = c.top
+    c.top = &s.root
+    for i in 0..<500
+        val p = allocate(c, &cell_kind.header)
+        val words: *usize = ptr_cast(p)
+        val next: **u8 = ptr_cast(p)
+        next[0] = s.head
+        words[1] = i
+        s.head = p
+    lock_acquire(c, s.lock)
+    s.built.store(1)
+    while s.go.load() == 0
+        condition_wait(c, s.condition, s.lock)
+    lock_release(c, s.lock)
+    var p = s.head
+    var n = 500usize
+    var intact = true
+    while p != null
+        if n == 0 then intact = false
+        n -= 1
+        val words: *usize = ptr_cast(p)
+        if words[1] != n then intact = false
+        val next: **u8 = ptr_cast(p)
+        p = next[0]
+    if intact && n == 0 then s.ok.store(1)
+    c.top = s.root.prev
+    s.head = null
+
+@test("a parked lightweight thread's frames are roots of every collection while it waits")
+parked_frames_are_roots()
+    parked_list.built.store(0)
+    parked_list.go.store(0)
+    parked_list.ok.store(0)
+    val me = thread_attach()
+    with_joints(me)
+    joints.slots[62] = lock_new(me)
+    joints.slots[63] = condition_new(me)
+    parked_list.lock = joints.slots[62]
+    parked_list.condition = joints.slots[63]
+    joints.slots[0] = thread_start(me, ptr_cast(&parked_list), LeastStack, ptr_cast(&build_and_park))
+    assert(raised_within(&parked_list.built, 5000))
+    for _ in 0..<10
+        collect(me)
+    assert(gc.live(&space) >= 500usize)
+    lock_acquire(me, parked_list.lock)
+    parked_list.go.store(1)
+    condition_notify(me, parked_list.condition)
+    lock_release(me, parked_list.lock)
+    thread_join(me, joints.slots[0])
+    assert_eq(parked_list.ok.load(), 1u32)
+    joints.slots[0] = null
+    joints.slots[62] = null
+    joints.slots[63] = null
+    parked_list.lock = null
+    parked_list.condition = null
+    without_joints(me)
+    thread_detach(me)
+    collect_now()
+    assert_eq(gc.live(&space), 0usize)
+
+private var queue: WaitQueue = new_wait_queue()
+private var first_waiter: Waiter = new_waiter()
+private var second_waiter: Waiter = new_waiter()
+private var third_waiter: Waiter = new_waiter()
+
+@test("a waiter is put at the back of its queue and taken off from anywhere in it")
+wait_queues()
+    val q = &queue
+    val a = &first_waiter
+    val b = &second_waiter
+    val c = &third_waiter
+    enqueue(q, a)
+    enqueue(q, b)
+    enqueue(q, c)
+    assert(q.head == a && q.tail == c)
+    unlink_waiter(q, b)
+    assert(!b.linked)
+    assert(a.next == c && c.prev == a)
+    unlink_waiter(q, b)
+    unlink_waiter(q, a)
+    assert(q.head == c && q.tail == c && c.prev == null)
+    unlink_waiter(q, c)
+    assert(q.head == null && q.tail == null)
+
+@test("a deadline is the time asked from now, and one too far away is held to about thirty years")
+deadlines()
+    val now = now_micros()
+    val d = deadline_after(5)
+    assert(d >= now + 5000)
+    assert(d < now + 5000 + 1000000)
+    val far = deadline_after(9223372036854775807)
+    assert(far > now)
+    assert(far <= now_micros() + 1000000000000000)
+
+// Threads queued for a lock one after another, and the order they took it in.
+private struct Queued
+    lock: *u8
+    taken: [8]usize
+    count: usize
+
+private var queued: Queued = Queued(null, [0; 8], 0)
+
+private take_in_turn(c: *Context, run: *u8) -> unit
+    val s: *Queued = ptr_cast(run)
+    lock_acquire(c, s.lock)
+    s.taken[s.count] = usize(c)
+    s.count += 1
+    lock_release(c, s.lock)
+
+private queue_length(q: *WaitQueue) -> usize
+    q.guard.lock()
+    var n = 0usize
+    var w = q.head
+    while w != null
+        n += 1
+        w = w.next
+    q.guard.unlock()
+    n
+
+@test("a lock let go goes to the thread that has waited for it longest")
+locks_go_in_turn()
+    val me = thread_attach()
+    with_joints(me)
+    joints.slots[63] = lock_new(me)
+    queued.lock = joints.slots[63]
+    queued.count = 0
+    val l: *ParkLock = ptr_cast(queued.lock)
+    lock_acquire(me, queued.lock)
+    var expected: [8]usize = [0; 8]
+    for i in 0..<8
+        joints.slots[i] = thread_start(me, ptr_cast(&queued), LeastStack, ptr_cast(&take_in_turn))
+        var waited = 0
+        while queue_length(&l.waiting) < i + 1 && waited < 5000
+            sleep(millis(1))
+            waited += 1
+        assert_eq(queue_length(&l.waiting), i + 1)
+        l.waiting.guard.lock()
+        expected[i] = usize(&*l.waiting.tail.lwt)
+        l.waiting.guard.unlock()
+    lock_release(me, queued.lock)
+    join_n(me, 8)
+    assert_eq(queued.count, 8usize)
+    for i in 0..<8
+        assert_eq(queued.taken[i], expected[i])
+    assert(!l.held)
+    joints.slots[63] = null
+    queued.lock = null
+    without_joints(me)
+    thread_detach(me)
+    collect_now()
+    assert_eq(gc.live(&space), 0usize)

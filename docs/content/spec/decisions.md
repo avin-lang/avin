@@ -4018,6 +4018,73 @@ spelling is better, as each entry says.
 
 ## Proposed
 
+- Proposed (branch `lwt-scheduler`): **the scheduler is one ready queue under one lock, run by
+  workers started one at a time as threads become ready, up to one per processor.** A thread made
+  ready goes to the back of the queue; an idle worker sleeps on a condition and is woken for it, and
+  where none is idle and fewer workers than processors are counted, another is started. A worker is
+  an operating system thread with a carrier of its own that runs no compiled code itself: it switches
+  to a lightweight thread and back, and after the switch back does what the thread asked (let a
+  guard go, re-queue it, give its stack back). *Why*: the simplest correct queue, with every wake in
+  the order threads became ready, and the lock is held for a few instructions. *Alternatives*: a
+  queue per worker with stealing (less contention on many cores; more code, and no ordering
+  between workers), left for when a measurement asks for it; starting every worker at once (simpler
+  counting, but a program with one thread would start one per processor).
+- Proposed (branch `lwt-scheduler`): **a lightweight thread's stack keeps `spawn`'s 8 MiB default,
+  reserved through `sysl.fiber` and committed as touched, with 64 KiB at the least; the stacks of
+  ended threads are kept, 64 at most, for threads asking about the same size.** *Why*: the default
+  costs address space only, so every program that recursed deeply in a thread before still does,
+  and a reused stack saves a mapping and its guard per short thread. *Alternatives*: a smaller
+  default such as 1 MiB (less address space at a hundred thousand threads, but deep recursion that
+  fitted in a thread would overflow); no reuse (a map and an unmap per thread). Review with the
+  user: the default is the knob most likely to want a different value once servers hold many
+  thousands of threads.
+- Proposed (branch `lwt-scheduler`): **`main` stays on the program's first operating system thread
+  and is not a worker; its waits block that thread.** Every wait has two forms: a lightweight thread
+  parks, and any other thread (the main thread, a thread attached for a callback) sleeps on one
+  shared condition until its own waiter is woken. *Why*: the main thread stays free for the `ui`
+  package, which must run on it, and a program whose `main` never waits keeps its whole processor
+  count of workers. *Alternatives*: `main` as a lightweight thread run by a worker, with the first
+  operating system thread one of the workers (one kind of wait, but the `ui` package would then need
+  a way to pin a thread to it, which is the open main-thread question).
+- Proposed (branch `lwt-scheduler`): **time-slicing answers at the existing poll by a second bit of
+  its flag.** `requested` holds `Stop` (1), raised by a collection, and `Yield` (2), raised by the
+  monitor, a runtime thread that ticks every millisecond while a worker is busy, when a worker's
+  thread has run 10 ms while another is ready; it also sets that worker's own `yield_wanted`. A poll
+  still loads the word and branches on zero; `avin_rt_safepoint` waits out a `Stop` and then, on a
+  worker whose flag is set, yields to the back of the queue, and lowers `Yield` once no worker wants
+  it. Any lightweight thread yields at any poll, inside a lock or a callback too. *Why*: compiled
+  code is unchanged and pays nothing while nothing overruns; while one does, the others' polls take
+  the slow call for at most a tick. *Alternatives*: a flag per carrier read through the context (no
+  spurious slow calls, but two loads per poll and a compiler change); not yielding inside a lock
+  (the lock's waiters park anyway, so it buys nothing and lets one thread hold a worker).
+- Proposed (branch `lwt-scheduler`): **a blocking call is noticed, not announced: `enter_safe`
+  marks the carrier blocked and counts the call, and the monitor releases a worker that has stayed
+  blocked across a whole tick while threads are ready.** A released worker is not counted against
+  the target, and another is woken from the spares or started; when the call returns the thread
+  runs on, and its worker rejoins the count at its next switch, or rests as a spare where the count
+  is full. This generalizes the pools' `blocking` compensation to every blocking binding, `sleep`
+  and a wait for a `lazy val`. *Why*: a call that returns within a tick costs two stores and starts
+  nothing, and the generated shims and every binding stay as they are. *Alternatives*: compensating
+  at every blocking call (a thread start or wake per call, however short); a pool of threads for
+  blocking calls only (every such call a hand-off between threads).
+- Proposed (branch `lwt-scheduler`): **every lock and condition parks: `Mutex`, `Condition` and
+  `Once` as well as channels, futures, promises and joins.** The runtime's one lock and one
+  condition, which all of them are built on, keep a queue of waiters; a lock let go goes straight to
+  its oldest waiter. The brief planned `Mutex` and `Condition` for the next step, keeping them
+  blocking until then. *Why*: channels, futures' cells and the pools are built on the very lock and
+  condition `Mutex` uses, so keeping `Mutex` blocking meant a second, temporary implementation of
+  both; and a `Mutex` whose holder parks can then never hold every worker. *Alternatives*: a parking
+  lock and condition beside the blocking ones, used by channels and futures only, until the next
+  step (two implementations, one to remove). Review with the user: it moves part of the next step
+  into this one.
+- Proposed (branch `lwt-scheduler`): **a context waits as the one waiter it holds**, since a thread
+  waits on one thing at a time; a timed wait of a lightweight thread is a timer the monitor fires,
+  added by the worker after the thread has switched away and taken off by the thread when it runs
+  again. *Why*: no waiter is ever made per wait, and no waiter is reachable once its wait has
+  answered. *Alternatives*: a waiter in the waiting function's frame (the same, but its address is
+  a local's, which Sysl's escape check refuses to queue); a heap waiter per wait (an allocation per
+  wait).
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

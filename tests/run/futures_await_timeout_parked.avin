@@ -1,0 +1,59 @@
+// expect: exit 0
+// Timed waits from threads that are not the main thread, which park with a timer: an `await` that
+// runs out gives `None` having waited its time, one whose value comes in time gives `Some` long
+// before its limit, and many of each run at once on fewer workers than there are waits. A condition's
+// `waitFor` from a thread answers the same way.
+import avin.threads.{Atomic, Future, Mutex, Promise, scope, spawn, sleep}
+import avin.time.millis
+
+@sysl("avin.rt.monotonic_millis")
+now() -> long
+
+class Flag()
+    var set = false
+
+main() -> int
+    val never = Promise[int]()
+    val late = Promise[string]()
+    val expired = Atomic(0)
+    val waitedEnough = Atomic(0)
+    val inTime = Atomic(0)
+    val quickly = Atomic(0)
+    scope(s ->
+        for _ in 0..<100
+            s.spawn(() ->
+                val before = now()
+                if never.future.await(40).isEmpty() then expired.update(n -> n + 1)
+                if now() - before >= 39 then waitedEnough.update(n -> n + 1))
+        for _ in 0..<100
+            s.spawn(() ->
+                val before = now()
+                if late.future.await(60000) == Some("late") then inTime.update(n -> n + 1)
+                if now() - before < 30000 then quickly.update(n -> n + 1))
+        sleep(millis(100))
+        late.complete("late"))
+    println(s"expired ${expired.load()}, waited long enough ${waitedEnough.load()}")
+    println(s"in time ${inTime.load()}, before the limit ${quickly.load()}")
+    val fromFutures = (0..<20).map(i -> Future(never.future.await(10).getOrElse(i))).toVector()
+    println(s"futures ${Future.all(fromFutures).await().sum()}")
+    val zeroes = spawn(() -> s"${never.future.await(0)} ${never.future.await(-1)}")
+    println(zeroes.join())
+    val gate = Mutex(Flag())
+    val c = gate.condition()
+    val waited = spawn(() ->
+        val before = now()
+        val notified = gate.with(_ -> c.waitFor(25))
+        !notified && now() - before >= 24)
+    println(s"condition ran out ${waited.join()}")
+    val woken = spawn(() ->
+        val before = now()
+        gate.with(f ->
+            while !f.set do c.waitFor(60000)
+            ())
+        now() - before < 30000)
+    sleep(millis(50))
+    gate.with(f ->
+        f.set = true
+        c.notifyAll())
+    println(s"condition notified ${woken.join()}")
+    0

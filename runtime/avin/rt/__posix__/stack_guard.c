@@ -134,6 +134,19 @@ void avin_rt_stack_guard_install(void) {
     }
 }
 
+/* The lowest usable address of the stack the calling thread is running on, as the handler knows it. */
+char *avin_rt_stack_guard_low(void) {
+    return avin_stack_low;
+}
+
+/* Tells the handler that the calling thread now runs on a stack whose lowest usable address is
+ * `low`. A worker of the scheduler calls it as it switches to a lightweight thread, whose stack is a
+ * mapping of its own, and again as it switches back to its own stack, so an overflow on either is
+ * reported as one. */
+void avin_rt_stack_guard_use(char *low) {
+    avin_stack_low = low;
+}
+
 /* Gives back what `avin_rt_stack_guard_install` made for the calling thread, which calls it last. */
 void avin_rt_stack_guard_remove(void) {
     stack_t off;

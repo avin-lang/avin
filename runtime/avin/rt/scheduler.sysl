@@ -1,0 +1,605 @@
+module avin.rt
+
+import sysl.buf.{Buf, buf}
+import sysl.fiber
+import sysl.raw.ptr_cast
+import sysl.sync.*
+import sysl.threads.{Condvar, Mutex, SleepLock, spawn}
+import sysl.time.monotonic
+
+// Lightweight threads. Every thread a program starts is a lightweight thread: a context with a stack
+// of its own, reserved large and committed only as it is touched, which the scheduler runs on one of
+// its workers, operating system threads about one per processor that it starts as work arrives. A
+// lightweight thread that waits, for a lock, a condition, a join, parks: it is marked safe, switches
+// back to its worker's own stack, and the worker runs the next ready thread. Whatever wakes it puts it
+// at the back of one ready queue, which every worker takes from, so it may resume on another worker.
+//
+// A worker switches only at the runtime's own safepoints: a wait, a yield answered at a poll, the end
+// of a thread. The context switching away is safe before it switches, so a collection that starts
+// meanwhile walks its frames as they are, and a parked thread's frames stay roots as long as it is
+// attached. A worker runs no compiled code of its own and holds no context, so a collection never
+// waits for one; its carrier's chunk is retired by every collection as any other carrier's is.
+//
+// A parked thread's wake must not come before it has left its worker's stack, or two workers would
+// run it at once. So the guard of what it waits on is let go by the worker, after the switch: a
+// waker finds the waiter only under that guard, and by then it is parked.
+//
+// The monitor, one more operating system thread, ticks every millisecond while a worker is busy. It
+// does three things. It fires timed waits that have run out. It asks a lightweight thread that has run
+// for its slice while another is ready to yield, by a flag on its carrier and the `Yield` bit of
+// `requested`, which the next poll answers. And it notices a worker held by a blocking call, one that
+// has stayed blocked for a whole tick while threads are ready: it stops counting that worker against
+// the target and starts or wakes another, so a lightweight thread blocked in the operating system
+// never starves the rest. When the blocked worker is free again it returns to the count, or rests as a
+// spare where the target is met.
+//
+// The main thread is not a worker: its waits block it, as an operating system thread's do, and it
+// stays free for work that has to run on it.
+
+/** A lightweight thread: its context, then a frame of two slots holding the closure it runs and the
+ * object it is joined by, its fiber and stack, and its place in the ready queue. It keeps itself alive
+ * until it has ended and its worker has given its stack back. */
+struct Lwt
+    context: Context
+    root: Frame
+    run: *u8
+    joint: *u8
+    /** The program's closure runner, which calls `run` with the program's own convention. */
+    runner: *u8
+    fiber: fiber.Context
+    stack: Option[&fiber.Stack]
+    /** How many bytes of stack were asked for. */
+    size: usize
+    /** About the lowest usable address of the stack, for the overflow report. */
+    low: *u8
+    next: *Lwt
+    me: Option[&Lwt]
+
+@assert(offsetof(Lwt, context) == 0, "a lightweight thread's context is the start of its storage")
+@assert(offsetof(Lwt, run) == offsetof(Lwt, root) + sizeof(Frame), "a frame's slots follow its header")
+
+/** How long a lightweight thread runs before it is asked to yield to a ready one, in microseconds. */
+const Slice: long = 10000
+
+/** How often the monitor looks at the workers while any is busy, in microseconds. */
+const Tick: long = 1000
+
+/** The stack an operating system thread of the scheduler's own runs its loop on. */
+private const LoopStack: usize = 262144
+
+/** The least stack a lightweight thread is given, whatever it asks for. */
+const LeastStack: long = 65536
+
+// What a worker does once the lightweight thread it ran has switched back to it.
+/** Nothing. */
+const AfterNothing: u32 = 0
+/** The thread parked: register its timed wait, if it has one, then let its guard go. */
+const AfterPark: u32 = 1
+/** The thread yielded: put it at the back of the ready queue. */
+const AfterYield: u32 = 2
+/** The thread ended: give its stack and storage back. */
+const AfterEnd: u32 = 3
+
+// The scheduler's state, all under `sched`: the ready queue, the workers and how they are counted.
+// `active` counts the workers counted against `target`: each running a thread, idle, or about to
+// start; a worker the monitor has released while it blocks, and a spare, are not counted.
+private var sched: Mutex[unit] = Mutex.new(())
+private var work: Condvar = Condvar.new()
+private var spare_call: Condvar = Condvar.new()
+private var ready_head: *Lwt = null
+private var ready_tail: *Lwt = null
+private var target: usize = 0
+private var active: usize = 0
+private var idle: usize = 0
+private var spares: usize = 0
+private var spare_calls: usize = 0
+private var monitoring: bool = false
+/** Every worker, newest first, linked through `worker_next`. A worker is linked once, whole. */
+private var workers: *Carrier = null
+/** How many workers have been started, which only grows. */
+var workers_started: Atomic[u64] = Atomic(0)
+/** How many times the monitor has released a worker held by a blocking call. */
+var releases: Atomic[u64] = Atomic(0)
+/** How many times a lightweight thread has yielded at a poll. */
+var yields: Atomic[u64] = Atomic(0)
+
+/** Microseconds on the monotonic clock. */
+now_micros() -> long = monotonic().us
+
+/** Whether `ctx` is a lightweight thread's, running on a worker. */
+runs_lightweight(ctx: *Context) -> bool = ctx.carrier != null && ctx.carrier.worker
+
+/** Starts a lightweight thread, `p`, which is attached and safe: puts it at the back of the ready
+ * queue. */
+start_lightweight(p: *Lwt)
+    make_ready(p)
+
+/** Puts `p`, a parked or new lightweight thread, at the back of the ready queue, and has a worker
+ * take it: an idle one, or a new one while fewer than the target are counted. */
+make_ready(p: *Lwt)
+    sched.lock_raw()
+    p.next = null
+    if ready_tail == null then ready_head = p else ready_tail.next = p
+    ready_tail = p
+    val start = more_hands()
+    sched.unlock_raw()
+    if start then start_worker()
+
+// Under `sched`, with a thread ready: wakes an idle worker, or counts one more toward the target,
+// waking a spare or answering `true` for the caller to start a new worker once it has let `sched` go.
+private more_hands() -> bool
+    if idle > 0
+        work.notify_one()
+        return false
+    if target == 0 then target = usize(processors())
+    if active >= target then return false
+    active += 1
+    if spares > 0
+        spare_calls += 1
+        spare_call.notify_one()
+        return false
+    true
+
+// Starts a worker thread, and the monitor with the first.
+private start_worker()
+    spawn(&work_loop, &workers_started, LoopStack) match
+        Some(_) -> ()
+        None -> cannot_schedule()
+    sched.lock_raw()
+    val first = !monitoring
+    monitoring = true
+    sched.unlock_raw()
+    if first
+        spawn(&monitor_loop, &workers_started, LoopStack) match
+            Some(_) -> ()
+            None -> cannot_schedule()
+
+private cannot_schedule() -> never
+    begin_stop_foreign()
+    flush()
+    eprints("avin: cannot start a thread: the system refused one\n")
+    trap()
+
+// A worker's life: it links its carrier where every collection retires its chunk, then runs ready
+// threads for as long as the program lasts.
+private work_loop(started: *Atomic[u64]) -> unit
+    val k = new_carrier(true)
+    install_stack_guard()
+    k.own_low = stack_guard_low()
+    heap_lock.lock()
+    link_carrier(k)
+    heap_lock.unlock()
+    sched.lock_raw()
+    k.worker_next = workers
+    workers = k
+    sched.unlock_raw()
+    _ = started.add(1)
+    loop
+        val p = next_ready(k)
+        run_on(k, p)
+
+// The next thread for `k` to run, waiting while there is none. A worker the monitor released rejoins
+// the count here, or rests as a spare until it is called where the count is full.
+private next_ready(k: *Carrier) -> *Lwt
+    sched.lock_raw()
+    loop
+        if k.released
+            k.released = false
+            if active < target
+                active += 1
+            else
+                spares += 1
+                while spare_calls == 0
+                    spare_call.wait(&sched)
+                spare_calls -= 1
+                spares -= 1
+        if ready_head != null
+            val p = ready_head
+            ready_head = p.next
+            if ready_head == null then ready_tail = null
+            p.next = null
+            val start = if ready_head != null then more_hands() else false
+            sched.unlock_raw()
+            if start then start_worker()
+            return p
+        idle += 1
+        work.wait(&sched)
+        idle -= 1
+
+// Runs `p` on `k` until it switches back, then does what it asked for. The worker's own code never
+// moves between threads, so it is where the thread-local context is set.
+private run_on(k: *Carrier, p: *Lwt)
+    p.context.carrier = k
+    k.slice_start.store(now_micros())
+    k.yield_wanted.store(0)
+    k.busy.store(1)
+    if monitor_resting.load() != 0 then wake_monitor()
+    set_current(&p.context)
+    if p.low != null then use_stack_guard(p.low)
+    fiber.switch(&k.home, &p.fiber)
+    use_stack_guard(k.own_low)
+    set_current(null)
+    k.busy.store(0)
+    val after = k.after
+    k.after = AfterNothing
+    if after == AfterPark
+        if k.after_waiter != null then add_timer(k.after_waiter, k.after_deadline)
+        k.after_guard.unlock()
+        k.after_guard = null
+        k.after_waiter = null
+    elif after == AfterYield
+        make_ready(p)
+    elif after == AfterEnd
+        p.stack match
+            Some(s) -> give_stack(s)
+            None -> ()
+        p.stack = None
+        p.me = None
+
+@noinline
+private set_current(c: *Context)
+    current_context = c
+
+/** The body of every lightweight thread, on its own stack: it notes where the stack ends, waits for
+ * any collection in progress, runs the closure through the program's runner, and ends. */
+lwt_entry(p: *Lwt) -> unit
+    var mark: u8 = 0
+    p.low = ptr_cast(usize(&mark) - p.size)
+    use_stack_guard(p.low)
+    val c = &p.context
+    mark_running(c)
+    val entry: *extern(*Context, *u8) -> unit = ptr_cast(p.runner)
+    entry(c, p.run)
+    lwt_finish(p)
+
+// Ends `p`: wakes its joiners, detaches its context, and switches away for the last time; its worker
+// gives its stack back.
+private lwt_finish(p: *Lwt)
+    val c = &p.context
+    joint_finished(p.joint)
+    mark_safe(c)
+    heap_lock.lock()
+    unlink(c)
+    heap_lock.unlock()
+    val k = c.carrier
+    k.after = AfterEnd
+    fiber.switch(&p.fiber, &k.home)
+
+/** Parks the lightweight thread `ctx` belongs to until something makes it ready again. Its worker lets
+ * `guard` go once it has switched away; where `w` is not null, a timer wakes it at `deadline`, in
+ * microseconds of the monotonic clock, unless something else has first. Every reference the thread
+ * still needs is in its frames. */
+park(ctx: *Context, guard: *SleepLock, w: *Waiter, deadline: long)
+    mark_safe(ctx)
+    val p: *Lwt = ptr_cast(ctx)
+    val k = ctx.carrier
+    k.after = AfterPark
+    k.after_guard = guard
+    k.after_waiter = w
+    k.after_deadline = deadline
+    fiber.switch(&p.fiber, &k.home)
+    mark_running(ctx)
+
+/** Answers the scheduler's request, if any, that the lightweight thread `c` belongs to yield its
+ * carrier: at a poll, with its frames consistent. Any other thread returns at once. */
+answer_yield(c: *Context)
+    val k = c.carrier
+    if k == null || !k.worker || k.yield_wanted.load() == 0 then return
+    k.yield_wanted.store(0)
+    settle_yield()
+    yield_now(c)
+
+/** Puts the lightweight thread `ctx` belongs to at the back of the ready queue and runs the next. */
+yield_now(ctx: *Context)
+    _ = yields.add(1)
+    mark_safe(ctx)
+    val p: *Lwt = ptr_cast(ctx)
+    val k = ctx.carrier
+    k.after = AfterYield
+    fiber.switch(&p.fiber, &k.home)
+    mark_running(ctx)
+
+// Lowers the `Yield` bit once no worker is asked to yield, so the other threads' polls stop calling
+// in. The monitor raises it again at its next tick where a thread still overruns.
+private settle_yield()
+    sched.lock_raw()
+    var k = workers
+    var wanted = false
+    while k != null
+        if k.yield_wanted.load() != 0 then wanted = true
+        k = k.worker_next
+    sched.unlock_raw()
+    if !wanted then _ = requested.and(Stop)
+
+// One thread waiting: on a lock, a condition or a join. It lives in the waiting thread's frame, and is
+// linked into the queue of what it waits on under that queue's guard. `state` says how the wait ended;
+// whoever changes it from `WaitPending` makes the thread ready.
+struct Waiter
+    next: *Waiter
+    prev: *Waiter
+    /** The lightweight thread waiting, or null for an operating system thread. */
+    lwt: *Lwt
+    state: Atomic[u32]
+    linked: bool
+
+/** A waiter still waiting. */
+const WaitPending: u32 = 0
+/** A waiter something woke. */
+const WaitWoken: u32 = 1
+/** A waiter whose time ran out. */
+const WaitTimedOut: u32 = 2
+
+private waiter_at(at: usize) -> *Waiter = ptr_cast(at)
+
+new_waiter() -> Waiter = Waiter(null, null, null, Atomic(WaitPending), false)
+
+/** The waiter of `ctx`'s thread, made ready for a new wait. A thread waits on one thing at a time, so
+ * its context holds the one waiter it needs. The context outlives every wait of its thread, and a
+ * waiter is off every queue and timer before its wait answers, so its address is handed on as a
+ * number: the queues keep it, and the compiler cannot see that the context outlives them. */
+waiter_of(ctx: *Context) -> *Waiter
+    val w = waiter_at(usize(&ctx.waiter))
+    w.next = null
+    w.prev = null
+    w.lwt = null
+    w.state.store(WaitPending)
+    w.linked = false
+    w
+
+/** The threads waiting on one thing, oldest first, and the guard over them and over the thing's own
+ * state. The guard is held only briefly: never across a wait for anything but another guard or the
+ * scheduler's lock. */
+struct WaitQueue
+    guard: SleepLock
+    head: *Waiter
+    tail: *Waiter
+
+new_wait_queue() -> WaitQueue = WaitQueue(SleepLock.new(), null, null)
+
+/** Under `q`'s guard: puts `w` at the back of `q`. */
+enqueue(q: *WaitQueue, w: *Waiter)
+    w.prev = q.tail
+    w.next = null
+    if q.tail == null then q.head = w else q.tail.next = w
+    q.tail = w
+    w.linked = true
+
+/** Under `q`'s guard: takes `w` off `q`, where it is still on it. */
+unlink_waiter(q: *WaitQueue, w: *Waiter)
+    if !w.linked then return
+    if w.prev == null then q.head = w.next else w.prev.next = w.next
+    if w.next == null then q.tail = w.prev else w.next.prev = w.prev
+    w.next = null
+    w.prev = null
+    w.linked = false
+
+/** Under `q`'s guard: wakes the oldest thread still waiting on `q`, and answers whether there was
+ * one. */
+wake_one(q: *WaitQueue) -> bool
+    loop
+        val w = q.head
+        if w == null then return false
+        unlink_waiter(q, w)
+        if wake_waiter(w) then return true
+
+/** Under `q`'s guard: wakes every thread waiting on `q`. */
+wake_all(q: *WaitQueue)
+    loop
+        val w = q.head
+        if w == null then return
+        unlink_waiter(q, w)
+        _ = wake_waiter(w)
+
+// Wakes `w`, which is off its queue, where it is still waiting. Its thread is parked, since the guard
+// the caller holds was let go only after it had switched away; once its state changes it may run, so
+// nothing of `w` is read after.
+private wake_waiter(w: *Waiter) -> bool
+    val l = w.lwt
+    if w.state.cas(WaitPending, WaitWoken) != WaitPending then return false
+    if l != null then make_ready(l) else wake_blocked()
+    true
+
+/** Waits as `w`, which the caller has put on `q` holding `q`'s guard, until it is woken or, where
+ * `deadline` is positive, until that time on the monotonic clock in microseconds: answers whether it
+ * was woken. The guard is let go during the wait and is not held when it answers. A lightweight thread
+ * parks; any other thread blocks, safe for the collector. */
+wait_on(ctx: *Context, q: *WaitQueue, w: *Waiter, deadline: long) -> bool
+    if runs_lightweight(ctx)
+        w.lwt = ptr_cast(ctx)
+        park(ctx, &q.guard, if deadline > 0 then w else null, deadline)
+        if deadline > 0 then cancel_timer(w)
+    else
+        q.guard.unlock()
+        enter_safe(ctx)
+        block_until_woken(w, deadline)
+        leave_safe(ctx)
+    if w.state.load() == WaitWoken then return true
+    q.guard.lock()
+    unlink_waiter(q, w)
+    q.guard.unlock()
+    false
+
+/** The time `millis` milliseconds from now on the monotonic clock, in microseconds, for a wait that
+ * is bounded: at most about thirty years away. */
+deadline_after(millis: long) -> long
+    val span = if millis > 1000000000000 then 1000000000000 else millis
+    now_micros() + span * 1000
+
+// The operating system threads waiting, which are few: the main thread and threads attached for a
+// callback. They sleep on one condition and each checks its own waiter when it wakes.
+private var blocked_lock: Mutex[unit] = Mutex.new(())
+private var blocked_woken: Condvar = Condvar.new()
+
+private block_until_woken(w: *Waiter, deadline: long)
+    blocked_lock.lock_raw()
+    while w.state.load() == WaitPending
+        if deadline <= 0
+            blocked_woken.wait(&blocked_lock)
+        else
+            val left = deadline - now_micros()
+            if left <= 0
+                _ = w.state.cas(WaitPending, WaitTimedOut)
+            else
+                _ = blocked_woken.wait_for(&blocked_lock, left * 1000)
+    blocked_lock.unlock_raw()
+
+private wake_blocked()
+    blocked_lock.lock_raw()
+    blocked_woken.notify_all()
+    blocked_lock.unlock_raw()
+
+// The timed waits of parked lightweight threads, which the monitor fires. A worker adds one after its
+// thread has switched away, before it lets the thread's guard go; the thread takes its own off when it
+// runs again, so the monitor never reaches a waiter whose frame is gone.
+private struct Timer
+    at: long
+    w: *Waiter
+
+private var timer_lock: Mutex[unit] = Mutex.new(())
+private var timer_wake: Condvar = Condvar.new()
+private var timers: Buf[Timer] = buf()
+/** 1 while the monitor sleeps with no worker busy and no timer due, until something wakes it. */
+private var monitor_resting: Atomic[u32] = Atomic(0)
+
+private add_timer(w: *Waiter, at: long)
+    timer_lock.lock_raw()
+    timers.push(Timer(at, w))
+    timer_wake.notify_one()
+    timer_lock.unlock_raw()
+
+private cancel_timer(w: *Waiter)
+    timer_lock.lock_raw()
+    var i = 0usize
+    while i < timers.len()
+        if timers[i].w == w
+            drop_timer(i)
+            break
+        i += 1
+    timer_lock.unlock_raw()
+
+private drop_timer(i: usize)
+    timers[i] = timers[timers.len() - 1]
+    _ = timers.pop()
+
+private wake_monitor()
+    timer_lock.lock_raw()
+    timer_wake.notify_one()
+    timer_lock.unlock_raw()
+
+// The monitor's life: it sleeps a tick while any worker is busy, until the next timer is due while
+// none is, or until woken while there is nothing to watch, and then fires the timers that are due and
+// looks over the workers.
+private monitor_loop(started: *Atomic[u64]) -> unit
+    loop
+        timer_lock.lock_raw()
+        if any_busy()
+            _ = timer_wake.wait_for(&timer_lock, Tick * 1000)
+        else
+            val soonest = earliest()
+            if soonest > 0
+                val left = soonest - now_micros()
+                if left > 0 then _ = timer_wake.wait_for(&timer_lock, left * 1000)
+            else
+                // A worker that becomes busy after this store sees it and wakes the monitor, and one
+                // that became busy before it is seen by the check after it.
+                monitor_resting.store(1)
+                if !any_busy() then timer_wake.wait(&timer_lock)
+                monitor_resting.store(0)
+        fire_timers(now_micros())
+        timer_lock.unlock_raw()
+        oversee(now_micros())
+
+private any_busy() -> bool
+    sched.lock_raw()
+    var k = workers
+    sched.unlock_raw()
+    while k != null
+        if k.busy.load() != 0 then return true
+        k = k.worker_next
+    false
+
+// Under `timer_lock`: the time the next timer is due, or 0 where there is none.
+private earliest() -> long
+    var soonest: long = 0
+    for t in timers
+        if soonest == 0 || t.at < soonest then soonest = t.at
+    soonest
+
+// Under `timer_lock`: makes ready every thread whose timed wait has run out by `now`, unless something
+// woke it first.
+private fire_timers(now: long)
+    var i = 0usize
+    while i < timers.len()
+        val t = timers[i]
+        if t.at <= now
+            drop_timer(i)
+            val l = t.w.lwt
+            if t.w.state.cas(WaitPending, WaitTimedOut) == WaitPending then make_ready(l)
+        else
+            i += 1
+
+// Asks each worker whose thread has overrun its slice while another is ready to yield, and releases
+// each worker that has stayed blocked for a whole tick while threads are ready.
+private oversee(now: long)
+    sched.lock_raw()
+    val first = workers
+    val waiting = ready_head != null
+    sched.unlock_raw()
+    val stopping = stop_requested()
+    var wanted = false
+    var k = first
+    while k != null
+        val busy = k.busy.load() != 0
+        val blocked = k.blocked.load() != 0
+        if busy && !blocked && waiting && !stopping && now - k.slice_start.load() >= Slice
+            k.yield_wanted.store(1)
+            wanted = true
+        else
+            k.yield_wanted.store(0)
+        val b = k.blocks.load()
+        if busy && blocked && b == k.seen_blocks && waiting && !stopping then release_worker(k)
+        k.seen_blocks = b
+        k = k.worker_next
+    if wanted then _ = requested.or(Yield) else _ = requested.and(Stop)
+
+// Stops counting `k`, held by a blocking call, against the target, and has another worker take the
+// ready threads.
+private release_worker(k: *Carrier)
+    sched.lock_raw()
+    var start = false
+    if !k.released
+        k.released = true
+        active -= 1
+        _ = releases.add(1)
+        if ready_head != null then start = more_hands()
+    sched.unlock_raw()
+    if start then start_worker()
+
+// The default stacks of threads that have ended, kept for the next threads to start, so a program
+// that starts many short threads maps a stack only now and then.
+private var stack_lock: SleepLock = SleepLock.new()
+private var spare_stacks: Buf[&fiber.Stack] = buf()
+private const SpareStacks: usize = 64
+
+/** A stack of at least `size` bytes, or `None` where the system refuses one. */
+take_stack(size: usize) -> Option[&fiber.Stack]
+    stack_lock.lock()
+    var i = spare_stacks.len()
+    while i > 0
+        i -= 1
+        if spare_stacks[i].len() >= size && spare_stacks[i].len() < size * 2
+            val s = spare_stacks[i]
+            spare_stacks[i] = spare_stacks[spare_stacks.len() - 1]
+            _ = spare_stacks.pop()
+            stack_lock.unlock()
+            return Some(s)
+    stack_lock.unlock()
+    fiber.Stack.reserve(size) match
+        Ok(s) -> Some(s)
+        Err(_) -> None
+
+// Keeps the stack of a thread that has ended for another, while there are few kept.
+private give_stack(s: &fiber.Stack)
+    stack_lock.lock()
+    if spare_stacks.len() < SpareStacks then spare_stacks.push(s)
+    stack_lock.unlock()

@@ -4,7 +4,8 @@ module avin.rt
 import sh.sysl.gc
 import sysl.raw.ptr_cast
 import sysl.sync.*
-import sysl.threads.{Mutex, Thread, spawn, yield_now}
+import sysl.threads.{Mutex, Thread, spawn}
+import sysl.threads.yield_now as os_yield
 
 // Real threads sharing the heap, each running as compiled code does: a context attached for the
 // thread, a frame of roots linked onto it, allocation through the runtime and polls of `requested`.
@@ -157,7 +158,7 @@ parked_frames_are_scanned()
     spinner.parks = 0
     val t = spawn(&spin, &spinner).unwrap()
     while spinner.ready.load() == 0
-        _ = yield_now()
+        _ = os_yield()
     val me = thread_attach()
     for _ in 0..<20
         collect(me)
@@ -187,7 +188,7 @@ private sleep_safely(s: *Sleeper) -> unit
     enter_safe(ctx)
     s.safe.store(1)
     while s.go.load() == 0
-        _ = yield_now()
+        _ = os_yield()
     leave_safe(ctx)
     s.running.store(1)
     unlink_root(ctx, &s.root)
@@ -200,7 +201,7 @@ safe_regions()
     sleeper.running.store(0)
     val t = spawn(&sleep_safely, &sleeper).unwrap()
     while sleeper.safe.load() == 0
-        _ = yield_now()
+        _ = os_yield()
     val me = thread_attach()
     // The sleeper never polls, so this finishes only because its context is safe.
     collect(me)
@@ -210,7 +211,7 @@ safe_regions()
     assert(stop_others(me))
     sleeper.go.store(1)
     for _ in 0..<20000
-        _ = yield_now()
+        _ = os_yield()
     assert_eq(sleeper.running.load(), 0u32)
     resume_others()
     heap_lock.unlock()
@@ -265,14 +266,13 @@ timed_wait_runs_out()
     val condition = w.second
     lock_acquire(me, lock)
     assert(!condition_wait_for(me, condition, lock, 20))
-    val l: *Mutex[unit] = ptr_cast(lock)
-    assert(l.try_lock_raw().is_none())
+    val l: *ParkLock = ptr_cast(lock)
+    assert(l.held)
     assert(!condition_wait_for(me, condition, lock, 0))
     assert(!condition_wait_for(me, condition, lock, -5))
-    assert(l.try_lock_raw().is_none())
+    assert(l.held)
     lock_release(me, lock)
-    assert(l.try_lock_raw().is_some())
-    l.unlock_raw()
+    assert(!l.held)
     me.top = w.frame.prev
     thread_detach(me)
     collect_now()
@@ -329,7 +329,7 @@ stress_retires_every_thread_chunk()
         holders[i] = Holder(Root(Frame(null, 1), null), Atomic(0))
         threads[i] = spawn(&hold_a_chunk, &holders[i])
     while holding.load() < u32(Workers)
-        _ = yield_now()
+        _ = os_yield()
     val me = thread_attach()
     assert(me.carrier != null)
     assert_eq(gc.chunks_out(&space), usize(Workers))

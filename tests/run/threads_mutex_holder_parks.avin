@@ -1,0 +1,59 @@
+// expect: exit 0
+// A thread that holds a mutex and then waits for a channel, while two hundred threads, far more than
+// there are processors, wait to take the same mutex: the waiters park, so the threads that let the
+// holder go on still run. A holder that sleeps instead, blocking its operating system thread, does not
+// stop the others either. And threads that sleep on every worker at once leave the rest running: the
+// runtime runs another worker in place of each one a blocking call holds.
+import avin.threads.{Atomic, Channel, Mutex, scope, sleep, spawn}
+import avin.time.millis
+
+class Count()
+    var n = 0
+
+main() -> int
+    val counter = Mutex(Count())
+    val go = Channel[int]()
+    val holding = Atomic(false)
+    scope(s ->
+        s.spawn(() ->
+            counter.with(c ->
+                holding.store(true)
+                c.n += go.receive().getOrElse(0)))
+        while !holding.load() do sleep(millis(1))
+        for _ in 0..<200
+            s.spawn(() -> counter.with(c -> c.n += 1))
+        val helper = spawn(() -> go.send(1000))
+        helper.join())
+    println(counter.with(c -> c.n))
+
+    val sleeper = Atomic(false)
+    scope(s ->
+        s.spawn(() ->
+            counter.with(c ->
+                sleeper.store(true)
+                sleep(millis(100))
+                c.n += 1))
+        while !sleeper.load() do sleep(millis(1))
+        for _ in 0..<200
+            s.spawn(() -> counter.with(c -> c.n += 1)))
+    println(counter.with(c -> c.n))
+
+    val slept = Atomic(0)
+    val sleepers = (0..<128).map(_ -> spawn(() ->
+        sleep(millis(1500))
+        slept.update(n -> n + 1))).toVector()
+    sleep(millis(20))
+    val ping = Channel[int]()
+    val pong = Channel[int]()
+    val player = spawn(() ->
+        for n in ping do pong.send(n + 1)
+        slept.load())
+    var last = 0
+    for _ in 0..<50
+        ping.send(last)
+        last = pong.receive().getOrElse(-1)
+    ping.close()
+    println(s"rounds $last, before any sleeper woke ${player.join() == 0}")
+    for t in sleepers do t.join()
+    println(slept.load())
+    0

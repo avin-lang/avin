@@ -1,0 +1,39 @@
+// expect: exit 0
+// Threads that park holding the only references to what they have built: each builds a list and a
+// map of its own, waits on a channel while the main thread allocates and collects many times over,
+// and checks every element once it wakes. A thread parked in a join, a lock and a timed await holds
+// its objects the same way.
+import avin.threads.{Channel, Mutex, Promise, spawn}
+
+build(seed: int) -> (List[string], Map[int, string])
+    val xs = (0..<200).map(i -> s"${seed}-$i").toList()
+    val m = Map((0..<50).map(i -> (i, s"v${seed * i}")).toVector()*)
+    (xs, m)
+
+intact(seed: int, xs: List[string], m: Map[int, string]) -> bool =
+    xs.length() == 200 && xs(199) == s"${seed}-199" && m.size() == 50 && m(49) == s"v${seed * 49}"
+
+main() -> int
+    val go = Channel[int]()
+    val parked = (0..<8).map(seed -> spawn(() ->
+        val (xs, m) = build(seed)
+        go.receive()
+        intact(seed, xs, m))).toVector()
+    var garbage: List[string] = []
+    for i in 0..<2000
+        garbage = s"g$i" :: (if i % 100 == 0 then [] else garbage)
+    for _ in 0..<8 do go.send(1)
+    println(parked.map(t -> t.join()).forall(ok -> ok))
+    val lock = Mutex(0)
+    val never = Promise[int]()
+    val inner = spawn(() -> build(99))
+    val joiner = spawn(() ->
+        val (xs, m) = build(7)
+        val (ys, n) = inner.join()
+        lock.with(_ -> ())
+        never.future.await(30)
+        intact(7, xs, m) && intact(99, ys, n))
+    for i in 0..<2000
+        garbage = s"h$i" :: (if i % 100 == 0 then [] else garbage)
+    println(joiner.join())
+    0

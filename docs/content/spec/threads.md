@@ -21,15 +21,16 @@ main() -> int
 ```
 
 - `spawn[T: Sendable](@sendable body: () -> T, stack: long = 8388608) -> Thread[T]` starts `body`
-  on a new operating system thread with a stack of its own (8 MiB unless asked otherwise). The body
+  on a new [lightweight thread](#lightweight-threads) with a stack of its own (8 MiB unless asked
+  otherwise, 64 KiB at the least). The body
   captures only sendable values, and its result is sendable ([what is shared](#what-is-shared)).
   `join() -> T` waits for it
   and gives back the result; joining a second time gives the same result again. Any thread may
   join, several at once: one waits for the thread and the others wait for that one, and a `Thread`
   is itself sendable. A `Thread` is
-  collected like any other object once nothing reaches it; a thread that is never joined keeps its
-  stack until the program ends. A thread that overflows its own stack traps with `stack overflow`
-  like any other thread's trap.
+  collected like any other object once nothing reaches it; a thread that is never joined still gives
+  its stack back when its body returns. A thread that overflows its own stack traps with
+  `stack overflow` like any other thread's trap.
 - **A trap in any thread stops the program**, as it does in a program with one thread: traps report
   bugs, and a bug in one thread leaves the state the others share in doubt. Only the first thread to
   stop the program reports: what was written is flushed once and one reason is printed, and a
@@ -52,6 +53,36 @@ main() -> int
             s.spawn(() -> parts(i).store((i + 1) * 10)))
     parts.map(p -> p.load()).sum()
 ```
+
+## Lightweight threads
+
+Every thread a program starts is a lightweight thread: the runtime runs it on one of a few operating
+system threads of its own, its **workers**, about one for each processor, started as threads become
+ready. What a program can rely on:
+
+- **Threads are cheap.** A thread's stack is reserved at its full size and the system commits its
+  pages only as the thread first touches them, so a thread that has not recursed deeply costs a page
+  or so of memory and a small record. A program may start a hundred thousand threads and join them
+  all, and a deep recursion still fits in a thread as it does in `main`.
+- **A wait parks only its thread.** A thread that waits for a lock, a condition, a channel, a join, a
+  future or a promise is set aside, and its worker runs another ready thread meanwhile; the thread
+  that ends the wait makes it ready again. Ready threads run in the order they became ready, and a
+  thread may resume on a different worker from the one it waited on. A timed wait parks the same way
+  and is made ready when its time runs out. So waiting code is written as plain straight-line code:
+  a server may hold one thread per connection, and a chain of futures each awaiting the one before
+  it resolves however long it is.
+- **Threads are time-sliced.** A thread that has run for 10 ms while another thread is ready yields
+  its worker at its next safepoint poll, which compiled code makes on every back edge of a loop and
+  before every call that may recur, and goes to the back of the ready queue. A thread that computes
+  without ever waiting therefore shares its processor rather than holding it, even in a tight loop
+  that calls nothing, and a thread that does not overrun its slice pays nothing for it.
+- **A call that blocks its operating system thread does not starve the others.** A `sleep`, a Sysl
+  binding [declared `blocking`](/spec/sysl-bindings/#calls-that-wait) or a wait for a `lazy val`
+  being initialized elsewhere holds the worker it runs on, but once such a call has held its worker
+  for a millisecond or two while other threads are ready, the runtime runs another worker in its
+  place. A worker freed again rejoins the others, or rests until it is needed.
+- **The main thread is not a worker.** `main` runs on the program's first operating system thread,
+  and its own waits block that thread while the workers run the rest.
 
 ## What is shared
 
@@ -289,8 +320,9 @@ main() -> int
 ```
 
 Every operation that can wait marks its thread safe for the collector while it waits, so a thread
-blocked on a lock, a condition, a channel, a join or input never holds up a collection. A Sysl
-binding [declared `blocking`](/spec/sysl-bindings/#calls-that-wait) does the same. **A deadlock is not detected**, apart from a thread
+parked on a lock, a condition, a channel or a join, or blocked on input, never holds up a collection.
+A Sysl binding [declared `blocking`](/spec/sysl-bindings/#calls-that-wait) does the same. A thread
+waiting for a mutex takes it in turn: the mutex goes to the thread that has waited longest. **A deadlock is not detected**, apart from a thread
 taking a lock it already holds: threads that each wait for another sleep for ever.
 
 ## Futures
@@ -436,7 +468,8 @@ on arm64, paid once per object made.
 
 A collection stops the world. The collecting thread raises a flag, waits until every other thread is
 parked at a safepoint or is in a safe region (waiting, or blocked in a call), collects alone, and
-lets them go. Compiled code polls the flag on every back edge of its loops and once per level of
+lets them go. A lightweight thread that is not running is always safe, and its frames stay roots of
+every collection however long it waits. Compiled code polls the flag on every back edge of its loops and once per level of
 every recursion, one load and a branch that is not taken; allocation is itself a
 safepoint. A program with one thread never stops anything.
 

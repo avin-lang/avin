@@ -2,6 +2,7 @@ module avin.rt
 
 import sh.sysl.gc
 import sysl.env
+import sysl.fiber
 import sysl.raw.ptr_cast
 import sysl.sync.*
 import sysl.threads.{Condvar, Mutex, SleepLock}
@@ -24,17 +25,21 @@ import sysl.threads.{Condvar, Mutex, SleepLock}
 //
 // A context's `carrier` changes only while the context is safe, at one of the runtime's own
 // safepoints, and by a single store: no allocation of that context is then in progress, and its
-// chunk stays with the carrier it leaves, so moving a context between carriers moves no chunk. Today
-// a carrier and an attached context are one to one; the store is what lets many contexts share one
-// carrier in turn.
+// chunk stays with the carrier it leaves, so moving a context between carriers moves no chunk. The
+// main thread and a thread the runtime attaches for a callback each have a carrier of their own; the
+// lightweight threads share the carriers of the scheduler's worker threads (`scheduler.sysl`), and a
+// worker stores its carrier in a lightweight thread's context just before it switches to it.
 //
 // That one lock, `heap_lock`, serializes claims, large allocations, collection and changes to the
-// lists of contexts and carriers. A collection stops the world: the collecting thread raises `requested`,
-// waits until every other attached context is safe, collects, lowers the flag and wakes the others.
-// A context is safe when its thread is parked at a safepoint or inside a region that touches no
-// reference, such as a wait for the heap lock or a blocking call. Compiled code polls `requested` on
-// every back edge of its control flow and before every call that may recur, and calls
-// `avin_rt_safepoint` only when it is raised; it is never raised while one context is attached.
+// lists of contexts and carriers. A collection stops the world: the collecting thread raises the
+// `Stop` bit of `requested`, waits until every other attached context is safe, collects, lowers the
+// bit and wakes the others. A context is safe when its thread is parked at a safepoint, inside a
+// region that touches no reference, such as a wait for the heap lock or a blocking call, or when it is
+// a lightweight thread that is not running. Compiled code polls `requested` on every back edge of its
+// control flow and before every call that may recur, and calls `avin_rt_safepoint` only when it is not
+// zero; the `Stop` bit is never raised while one context is attached. The scheduler raises the other
+// bit, `Yield`, when a lightweight thread has run past its time slice while another is ready, and the
+// same call answers it (`scheduler.sysl`), so the poll stays one load and one branch.
 //
 // The heap is one block reserved at startup, `AVIN_HEAP_LIMIT` bytes or 8 GiB. The operating system
 // commits its pages only as they are first touched, so the reservation costs nothing until it is
@@ -73,6 +78,11 @@ struct Context
      * is part of: a lock held, a `lazy val` being initialized, an Avin function Sysl called. A trap
      * inside one stops the program even in an actor. */
     doubt: u32
+    /** The previous attached context, so a context leaves the list in one step however many there
+     * are. */
+    prev: *Context
+    /** What the thread waits as, while it waits on a lock, a condition or a join (`scheduler.sysl`). */
+    waiter: Waiter
 
 @assert(offsetof(Context, caller) == 24, "the compiler writes a context's caller site at 24")
 @assert(offsetof(Context, owner) == OwnerOffset, "the compiler reads a context's owner at 32")
@@ -84,17 +94,54 @@ const Running: u32 = 0
 const Safe: u32 = 1
 
 /** A context no thread is running yet: safe, with an empty stack, and an owner of its own. */
-new_context() -> Context = Context(null, null, Atomic(Safe), null, fresh_owner(), null, null, 0)
+new_context() -> Context = Context(null, null, Atomic(Safe), null, fresh_owner(), null, null, 0, null, new_waiter())
 
-/** One operating system thread's allocation state: the chunk of the heap that the contexts running
- * on the thread allocate from with no lock. Only the context running on it touches the chunk, except
- * under the heap lock: by that context's thread, or by a collector while the context is safe. A
- * carrier keeps itself alive until its thread detaches. */
+/** One operating system thread's state: the chunk of the heap that the contexts running on the thread
+ * allocate from with no lock, and, on a worker of the scheduler, what the scheduler keeps about the
+ * lightweight thread it runs. Only the context running on it touches the chunk, except under the heap
+ * lock: by that context's thread, or by a collector while the context is safe. A carrier keeps itself
+ * alive until its thread detaches; a worker's lives as long as the program. */
 struct Carrier
     chunk: gc.Chunk
     /** The next carrier of an attached thread. */
     next: *Carrier
     me: Option[&Carrier]
+    /** Whether the thread is one of the scheduler's workers, which run lightweight threads only. */
+    worker: bool
+    /** Where a lightweight thread switches back to: the worker's own stack, in its scheduling loop. */
+    home: fiber.Context
+    /** What the worker does once the lightweight thread it ran has switched back (`scheduler.sysl`),
+     * with the guard to let go, and the waiter and time of a timed wait to register. */
+    after: u32
+    after_guard: *SleepLock
+    after_waiter: *Waiter
+    after_deadline: long
+    /** 1 while the worker runs a lightweight thread. */
+    busy: Atomic[u32]
+    /** 1 while the context running on the carrier is in a blocking call, and how many blocking calls
+     * it has begun, which the monitor compares from one tick to the next. */
+    blocked: Atomic[u32]
+    blocks: Atomic[u32]
+    /** `blocks` as the monitor saw it at its last tick. */
+    seen_blocks: u32
+    /** Whether the monitor has stopped counting the worker against the target, since its thread is
+     * held by a blocking call; under the scheduler's lock. */
+    released: bool
+    /** When the running lightweight thread was switched to, in microseconds of the monotonic clock. */
+    slice_start: Atomic[long]
+    /** 1 when the monitor asks the running lightweight thread to yield at its next poll. */
+    yield_wanted: Atomic[u32]
+    /** The next of the scheduler's workers. */
+    worker_next: *Carrier
+    /** The low end of the worker's own stack, for the overflow report. */
+    own_low: *u8
+
+/** A carrier holding no chunk, for an attached thread or, with `worker`, for a worker of the
+ * scheduler. It keeps itself alive until `me` is cleared. */
+new_carrier(worker: bool) -> *Carrier
+    val k: &Carrier = Carrier(gc.chunk(), null, None, worker, fiber.Context.new(), AfterNothing, null, null, 0, Atomic(0), Atomic(0), Atomic(0), 0, false, Atomic(0), Atomic(0), null, null)
+    k.me = Some(k)
+    ptr_cast(&*k)
 
 /** Every attached thread's carrier, whose chunks a collection retires. */
 var carriers: *Carrier = null
@@ -197,10 +244,20 @@ register_globals(f: *Frame)
     f.prev = globals
     globals = f
 
-/** Raised while a collection waits for the other threads to stop. Compiled code reads it at every
- * safepoint poll and calls `avin_rt_safepoint` when it is not zero. */
+/** Not zero while some thread is asked to call `avin_rt_safepoint`: the `Stop` bit while a collection
+ * waits for the other threads to stop, the `Yield` bit while a lightweight thread has overrun its time
+ * slice. Compiled code reads it at every safepoint poll and calls `avin_rt_safepoint` when it is not
+ * zero. */
 @export("avin_rt_requested")
 var requested: Atomic[u32] = Atomic(0)
+
+/** The bit of `requested` a collection raises. */
+const Stop: u32 = 1
+/** The bit of `requested` the scheduler raises for a lightweight thread to yield its carrier. */
+const Yield: u32 = 2
+
+/** Whether a collection has asked the other threads to stop. */
+stop_requested() -> bool = (requested.load() & Stop) != 0
 
 /** Held by the thread that allocates, collects, attaches or detaches: the collector's heap, the list
  * of contexts and the collection budget are touched only under it. A collecting thread holds it for
@@ -208,7 +265,7 @@ var requested: Atomic[u32] = Atomic(0)
 var heap_lock: SleepLock = SleepLock.new()
 
 // The handshake of a stop. The collector sleeps on `parked` until every other context is safe;
-// stopped threads sleep on `resumed` until `requested` is lowered. Both are notified under `world`,
+// stopped threads sleep on `resumed` until the `Stop` bit is lowered. Both are notified under `world`,
 // so no wake is lost between a check and a wait.
 private var world: Mutex[u32] = Mutex.new(0)
 private var parked: Condvar = Condvar.new()
@@ -218,48 +275,68 @@ private var resumed: Condvar = Condvar.new()
  * never does. */
 var stops: usize = 0
 
-/** Marks `c` safe: its frames hold every reference its thread still needs, and the thread touches no
- * reference until it calls `leave_safe`. A blocking call is made between the two, so a thread that
- * waits does not hold up a collection. */
+/** Marks `c` safe for a call that may wait: its frames hold every reference its thread still needs,
+ * and the thread touches no reference until it calls `leave_safe`. A blocking call is made between
+ * the two, so a thread that waits does not hold up a collection; on a worker of the scheduler the
+ * carrier counts as blocked meanwhile, and the monitor runs another worker in its place when the wait
+ * outlasts a tick. */
 @export("avin_rt_enter_safe")
 enter_safe(c: *Context)
+    val k = c.carrier
+    if k != null
+        k.blocks.store(k.blocks.load(Relaxed) + 1, Relaxed)
+        k.blocked.store(1)
+    mark_safe(c)
+
+/** Marks `c` running again after a call `enter_safe` began, first waiting until any collection in
+ * progress has finished. */
+@export("avin_rt_leave_safe")
+leave_safe(c: *Context)
+    mark_running(c)
+    val k = c.carrier
+    if k != null then k.blocked.store(0, Relaxed)
+
+/** Marks `c` safe, for a wait of the runtime's own that holds no carrier for long. */
+mark_safe(c: *Context)
     c.state.store(Safe)
     // The store and the load are both sequentially consistent, as the collector's raising of the
     // flag and its reading of the states are: either this thread sees the flag and wakes the
     // collector, or the collector sees this context safe.
-    if requested.load() != 0
+    if stop_requested()
         world.lock_raw()
         parked.notify_all()
         world.unlock_raw()
 
 /** Marks `c` running again, first waiting until any collection in progress has finished. */
-@export("avin_rt_leave_safe")
-leave_safe(c: *Context)
+mark_running(c: *Context)
     loop
         c.state.store(Running)
-        if requested.load() == 0 then return
+        if !stop_requested() then return
         // A collection started while this thread was safe: step back, and wait for it.
         c.state.store(Safe)
         world.lock_raw()
         parked.notify_all()
-        while requested.load() != 0
+        while stop_requested()
             resumed.wait(&world)
         world.unlock_raw()
 
-/** Parks the calling thread until the collection that raised `requested` has finished. Compiled code
- * calls it from a poll, with its frames consistent. */
+/** Answers a raised `requested` from a poll, with the calling thread's frames consistent: parks the
+ * thread until the collection that raised `Stop` has finished, and yields the carrier where the
+ * scheduler has asked the lightweight thread running on it to (`scheduler.sysl`). */
 @export("avin_rt_safepoint")
 safepoint(c: *Context)
-    enter_safe(c)
-    leave_safe(c)
+    if stop_requested()
+        mark_safe(c)
+        mark_running(c)
+    answer_yield(c)
 
 /** Takes the heap lock for `c`'s thread, safe while it waits, since the holder may be collecting.
- * Once it holds the lock no collection is in progress, so `leave_safe` returns at once. */
+ * Once it holds the lock no collection is in progress, so `mark_running` returns at once. */
 lock_heap(c: *Context)
     if heap_lock.try_lock() then return
-    enter_safe(c)
+    mark_safe(c)
     heap_lock.lock()
-    leave_safe(c)
+    mark_running(c)
 
 private others_safe(c: *Context) -> bool
     var o = contexts
@@ -272,7 +349,7 @@ private others_safe(c: *Context) -> bool
  * `resume_others` lets them run again. */
 stop_others(c: *Context) -> bool
     if contexts == null || contexts == c && c.next == null then return false
-    requested.store(1)
+    _ = requested.or(Stop)
     world.lock_raw()
     while !others_safe(c)
         parked.wait(&world)
@@ -282,7 +359,7 @@ stop_others(c: *Context) -> bool
 
 resume_others()
     world.lock_raw()
-    requested.store(0)
+    _ = requested.and(Yield)
     resumed.notify_all()
     world.unlock_raw()
 
@@ -297,12 +374,22 @@ attach(c: *Context)
 /** Under the heap lock: links `c` into the list of contexts, and a fresh carrier for it into the list
  * of carriers. */
 link_attached(c: *Context)
-    val k: &Carrier = Carrier(gc.chunk(), carriers, None)
-    k.me = Some(k)
-    val carrier: *Carrier = ptr_cast(&*k)
-    carriers = carrier
+    val carrier = new_carrier(false)
+    link_carrier(carrier)
     c.carrier = carrier
+    link_context(c)
+
+/** Under the heap lock: links the carrier `k` into the list of carriers, whose chunks every
+ * collection retires. */
+link_carrier(k: *Carrier)
+    k.next = carriers
+    carriers = k
+
+/** Under the heap lock: links `c` into the list of contexts, whose frames are the roots. */
+link_context(c: *Context)
+    c.prev = null
     c.next = contexts
+    if contexts != null then contexts.prev = c
     contexts = c
 
 /** Stops treating `c`'s frames as roots, retires its carrier's chunk and gives the carrier back. A
@@ -310,7 +397,7 @@ link_attached(c: *Context)
  * the context is safe from then on. Detaching a context that is not attached changes nothing. */
 detach(c: *Context)
     if current_context == c then current_context = null
-    enter_safe(c)
+    mark_safe(c)
     heap_lock.lock()
     unlink(c)
     val carrier = c.carrier
@@ -332,16 +419,17 @@ private unlink_carrier(k: *Carrier)
             return
         p = p.next
 
-private unlink(c: *Context)
-    if contexts == c
+/** Under the heap lock: takes `c` out of the list of contexts; one that is not in it is left alone. */
+unlink(c: *Context)
+    if c.prev != null
+        c.prev.next = c.next
+    elif contexts == c
         contexts = c.next
+    else
         return
-    var p = contexts
-    while p != null
-        if p.next == c
-            p.next = c.next
-            return
-        p = p.next
+    if c.next != null then c.next.prev = c.prev
+    c.next = null
+    c.prev = null
 
 /** A context for the calling thread, attached and running, which it passes to the compiled code it
  * runs. The thread gives it back with `avin_rt_thread_detach` before it finishes. */

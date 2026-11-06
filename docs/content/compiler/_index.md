@@ -823,8 +823,11 @@ allocate therefore scale with their number rather than queueing on the lock. **A
 the world.** Each context
 is either *running*, when its thread may touch references, or *safe*, when its frames hold every
 reference it still needs and it touches none until it is running again. The collecting thread,
-holding the lock, raises the flag `avin_rt_requested`, waits until every other attached context is
-safe, collects, lowers the flag and wakes the others. A thread becomes safe in three ways:
+holding the lock, raises the `Stop` bit of the flag `avin_rt_requested`, waits until every other
+attached context is safe, collects, lowers the bit and wakes the others; the scheduler raises the
+flag's other bit, `Yield`, to time-slice lightweight threads (see *Scheduling* below), and the same
+poll answers both. A lightweight thread that is not running is always safe. A thread becomes safe in
+three ways:
 
 - **At a poll.** The emitter places a poll before every terminator with a back edge, found by a
   depth-first walk of the function's blocks, so every loop polls once per iteration, and before
@@ -838,7 +841,7 @@ safe, collects, lowers the flag and wakes the others. A thread becomes safe in t
   its callees' and its own loops' polls, and never polls at all for its calls. A poll is a relaxed
   atomic load of the flag and a branch, weighted as almost never taken, to a call of
   `avin_rt_safepoint`, which is declared cold and laid out of line; the thread parks there until the
-  collection is over. Every reference live across a poll is already in a frame where the poll is
+  collection is over, and a lightweight thread asked to yield yields there. Every reference live across a poll is already in a frame where the poll is
   placed.
 - **Waiting for the lock.** Claiming a chunk takes the lock with one compare-and-swap when it is
   free; a thread that has to wait for it waits safe, since the holder may be collecting. An
@@ -902,31 +905,47 @@ anything is stored.
 **Locks and conditions.** The synchronization library reaches eight intrinsics, each a runtime
 entry: `lock_new`, `lock_acquire`, `lock_release`, `condition_new`, `condition_wait`,
 `condition_wait_for`, `condition_notify` and `condition_notify_all`. A lock is an object on the
-collected heap holding a Sysl `Mutex[unit]`, the three-state futex lock guarding nothing, and a
-condition one holding a `Condvar`; neither holds a reference, and the collector never moves either,
-so a thread sleeps on a word inside it. `condition_wait_for` takes a time in milliseconds and answers
-whether a notification came before it ran out, through `Condvar.wait_for`, which needs the lock to
-be a `Mutex`. Taking a
-free lock is one compare-and-swap; a thread that has to wait, and every condition wait, links a frame
-holding the objects it waits on onto its stack, waits safe, and unlinks the frame once it is running
-again, so what it sleeps on stays alive whatever the program still holds. A condition wait lets the
-lock go and takes it again inside the safe region.
+collected heap holding whether a thread holds it and a queue of the threads waiting for it, and a
+condition one holding a queue alone; neither holds a reference, and the collector never moves
+either, so a waiter may be linked from one. Each queue has a guard, a futex lock held for a few
+instructions. A thread waits as the waiter its context holds: a lightweight thread parks, and any
+other thread sleeps on one condition shared by all such threads until its own waiter is woken
+(`runtime/avin/rt/scheduler.sysl`). A lock let go goes to its oldest waiter, which then holds it.
+`condition_wait_for` takes a time in milliseconds and answers whether a notification came before it
+ran out; a lightweight thread's timed wait is a timer the scheduler's monitor fires. A thread that
+waits links a frame holding the objects it waits on onto its stack, waits safe, and unlinks the
+frame once it is running again, so what it waits on stays alive whatever the program still holds.
+A condition wait joins the condition's queue before it lets the lock go, and takes the lock again
+once it has been woken or its time has run out.
 
 **Starting a thread.** `avin.threads` reaches three intrinsics. `thread_start` calls
 `avin_rt_thread_start` with a closure taking nothing and returning nothing, which stores the body's
-result where the `Thread` reads it, and the stack size. The entry makes the new thread's context
-before the thread exists, with a frame of two slots at the bottom of its stack: the closure, and the
-thread's *joint*, the object it is joined by, allocated on the collected heap. That frame is linked
-onto the calling thread's own stack while the joint is allocated and the lock is awaited, then moved
-to the new context, which is attached, safe, before the operating system thread is started with the
-requested stack. So the closure is a root at every moment from the call to the thread's end. The
-new thread marks its context running, calls the closure's entry (the word before its descriptor)
-with its context and the closure, and detaches and frees its context when the closure returns.
-`thread_join` calls `avin_rt_thread_join`, which waits safe for the operating system thread under the
-joint's own lock, so of several joins one waits for the thread and the rest for it, and a later join
-returns at once; the joint, and with it the thread's handle, is collected once nothing reaches the
-`Thread`. `thread_current` answers the calling context's address, which the scope compares with
-its owner's.
+result where the `Thread` reads it, and the stack size. The entry makes the new lightweight thread's
+record: its context, with a frame of two slots at the bottom of its stack, the closure and the
+thread's *joint*, the object it is joined by, allocated on the collected heap; and its fiber, on a
+stack of the requested size (64 KiB at the least) reserved through `sysl.fiber`. That frame is linked
+onto the calling thread's own stack while the joint is allocated and the heap lock is awaited, then
+moved to the new context, which is attached, safe, before the thread is put on the scheduler's ready
+queue. So the closure is a root at every moment from the call to the thread's end. A worker that
+takes the thread stores its carrier in the context and switches to it; the thread marks its context
+running, calls the closure's entry (the word before its descriptor) with its context and the
+closure, and when the closure returns wakes its joiners, detaches its context and switches away for
+the last time, its worker giving the stack back. `thread_join` calls `avin_rt_thread_join`, which
+waits on the joint's queue until the thread has ended, and returns at once once it has; the joint
+is collected once nothing reaches the `Thread`. `thread_current` answers the calling context's
+address, which the scope compares with its owner's.
+
+**Scheduling.** The scheduler (`runtime/avin/rt/scheduler.sysl`) keeps one ready queue under one
+lock, and workers, operating system threads started one at a time as threads become ready, up to the
+processor count, each with a carrier of its own. A worker runs no compiled code: it switches to a
+lightweight thread, and once the thread switches back it does what the thread asked, letting go of
+the guard a parked thread waits under, putting a yielding one at the back of the queue, or giving an
+ended one's stack back. Since a waker finds a waiter only under that guard, no thread is woken before
+it has left its worker's stack. The monitor, one more thread, ticks every millisecond while a worker
+is busy: it fires timed waits that have run out, raises the `Yield` bit of `avin_rt_requested` and
+the worker's own flag when its thread has run 10 ms while another is ready, which the next poll's
+call of `avin_rt_safepoint` answers by yielding, and releases a worker that `avin_rt_enter_safe` has
+marked blocked for a whole tick while threads are ready, so another worker runs in its place.
 
 **Ending the program.** A trap, a failed allocation and `exit` begin by taking a lock that is never
 given back: the first thread to take it flushes standard output, reports and stops the process, and
