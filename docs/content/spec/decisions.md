@@ -4357,13 +4357,13 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   trying each candidate's parameter on a nested literal by its structure (collection, tuple and
   constructor shapes). Review with the user: whether either limit is worth lifting.
 
+- Settled on the user's delegation 2026-11-06 (branch `stdout-flush-isnan`): **standard output gets an explicit `flush()`; reading flushes it; `real` gets `isNaN`, `isInfinite` and `isFinite`.** `flush()` is a prelude function and a method on `StandardOutput` and `StandardError` (a no-op beyond flushing output, as error keeps no buffer); a read of standard input that must wait flushes output first. The classifiers are methods on `real` in `avin`, written in Avin (`self != self`; comparison with the infinities; `self - self == 0.0`); `real.NaN`, `real.PositiveInfinity` and `real.NegativeInfinity` already existed, and `real` is the only floating type. WHY: a drawing program must push a frame without a newline, and a prompt must be seen before the wait; the methods read as `char`'s do, where the `avin.math` functions are not methods. ALTERNATIVES: a `Writer.flush` on the trait (every writer would need a meaning); flushing only on `print` (defeats buffering); `math.isNaN(x)` functions (the spec keeps `avin.math` for elementary functions). Review with the user if a `Writer`-level `flush` is wanted.
+
 **Deferred**
 
 - Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
 
 ## Proposed
-
-- **Proposed (branch `stdout-flush-isnan`): standard output gets an explicit `flush()`; reading flushes it; `real` gets `isNaN`, `isInfinite` and `isFinite`.** `flush()` is a prelude function and a method on `StandardOutput` and `StandardError` (a no-op beyond flushing output, as error keeps no buffer); a read of standard input that must wait flushes output first. The classifiers are methods on `real` in `avin`, written in Avin (`self != self`; comparison with the infinities; `self - self == 0.0`); `real.NaN`, `real.PositiveInfinity` and `real.NegativeInfinity` already existed, and `real` is the only floating type. WHY: a drawing program must push a frame without a newline, and a prompt must be seen before the wait; the methods read as `char`'s do, where the `avin.math` functions are not methods. ALTERNATIVES: a `Writer.flush` on the trait (every writer would need a meaning); flushing only on `print` (defeats buffering); `math.isNaN(x)` functions (the spec keeps `avin.math` for elementary functions). Review with the user if a `Writer`-level `flush` is wanted.
 
 ## Open
 
