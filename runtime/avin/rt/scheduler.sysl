@@ -10,9 +10,10 @@ import sysl.time.monotonic
 // Lightweight threads. Every thread a program starts is a lightweight thread: a context with a stack
 // of its own, reserved large and committed only as it is touched, which the scheduler runs on one of
 // its workers, operating system threads about one per processor that it starts as work arrives. A
-// lightweight thread that waits, for a lock, a condition, a join, parks: it is marked safe, switches
-// back to its worker's own stack, and the worker runs the next ready thread. Whatever wakes it puts it
-// at the back of one ready queue, which every worker takes from, so it may resume on another worker.
+// lightweight thread that waits, for a lock, a condition, a join, a time, parks: it is marked safe,
+// switches back to its worker's own stack, and the worker runs the next ready thread. Whatever wakes it
+// puts it at the back of one ready queue, which every worker takes from, so it may resume on another
+// worker.
 //
 // A worker switches only at the runtime's own safepoints: a wait, a yield answered at a poll, the end
 // of a thread. The context switching away is safe before it switches, so a collection that starts
@@ -25,8 +26,9 @@ import sysl.time.monotonic
 // waker finds the waiter only under that guard, and by then it is parked.
 //
 // The monitor, one more operating system thread, ticks every millisecond while a worker is busy. It
-// does three things. It fires timed waits that have run out. It asks a lightweight thread that has run
-// for its slice while another is ready to yield, by a flag on its carrier and the `Yield` bit of
+// does three things. It fires the timed waits and sleeps that have run out. It asks a lightweight
+// thread that has run for its slice while another is ready to yield, by a flag on its carrier and the
+// `Yield` bit of
 // `requested`, which the next poll answers. And it notices a worker held by a blocking call, one that
 // has stayed blocked for a whole tick while threads are ready: it stops counting that worker against
 // the target and starts or wakes another, so a lightweight thread blocked in the operating system
@@ -102,6 +104,12 @@ var workers_started: Atomic[u64] = Atomic(0)
 var releases: Atomic[u64] = Atomic(0)
 /** How many times a lightweight thread has yielded at a poll. */
 var yields: Atomic[u64] = Atomic(0)
+
+/** How many workers have been started, for a program that looks at how its threads are carried. */
+scheduler_workers() -> long = long(workers_started.load())
+
+/** How many times the monitor has released a worker held by a blocking call. */
+scheduler_releases() -> long = long(releases.load())
 
 /** Microseconds on the monotonic clock. */
 now_micros() -> long = monotonic().us
@@ -224,7 +232,7 @@ private run_on(k: *Carrier, p: *Lwt)
     k.after = AfterNothing
     if after == AfterPark
         if k.after_waiter != null then add_timer(k.after_waiter, k.after_deadline)
-        k.after_guard.unlock()
+        if k.after_guard != null then k.after_guard.unlock()
         k.after_guard = null
         k.after_waiter = null
     elif after == AfterYield
@@ -266,9 +274,9 @@ private lwt_finish(p: *Lwt)
     fiber.switch(&p.fiber, &k.home)
 
 /** Parks the lightweight thread `ctx` belongs to until something makes it ready again. Its worker lets
- * `guard` go once it has switched away; where `w` is not null, a timer wakes it at `deadline`, in
- * microseconds of the monotonic clock, unless something else has first. Every reference the thread
- * still needs is in its frames. */
+ * `guard` go, where there is one, once it has switched away; where `w` is not null, a timer wakes it
+ * at `deadline`, in microseconds of the monotonic clock, unless something else has first. Every
+ * reference the thread still needs is in its frames. */
 park(ctx: *Context, guard: *SleepLock, w: *Waiter, deadline: long)
     mark_safe(ctx)
     val p: *Lwt = ptr_cast(ctx)
@@ -311,9 +319,10 @@ private settle_yield()
     sched.unlock_raw()
     if !wanted then _ = requested.and(Stop)
 
-// One thread waiting: on a lock, a condition or a join. It lives in the waiting thread's frame, and is
-// linked into the queue of what it waits on under that queue's guard. `state` says how the wait ended;
-// whoever changes it from `WaitPending` makes the thread ready.
+// One thread waiting: on a lock, a condition, a join or a time. It lives in the waiting thread's
+// context, and is linked into the queue of what it waits on under that queue's guard, and into the
+// timers under `timer_lock` while its wait is timed. `state` says how the wait ended; whoever changes
+// it from `WaitPending` makes the thread ready.
 struct Waiter
     next: *Waiter
     prev: *Waiter
@@ -321,6 +330,12 @@ struct Waiter
     lwt: *Lwt
     state: Atomic[u32]
     linked: bool
+    /** When its timer is due, in microseconds of the monotonic clock, and the order it was set in,
+     * which breaks a tie between two due at once; under `timer_lock`. */
+    at: long
+    order: u64
+    /** One more than its place among the timers, or 0 while it has no timer; under `timer_lock`. */
+    slot: usize
 
 /** A waiter still waiting. */
 const WaitPending: u32 = 0
@@ -331,7 +346,7 @@ const WaitTimedOut: u32 = 2
 
 private waiter_at(at: usize) -> *Waiter = ptr_cast(at)
 
-new_waiter() -> Waiter = Waiter(null, null, null, Atomic(WaitPending), false)
+new_waiter() -> Waiter = Waiter(null, null, null, Atomic(WaitPending), false, 0, 0, 0)
 
 /** The waiter of `ctx`'s thread, made ready for a new wait. A thread waits on one thing at a time, so
  * its context holds the one waiter it needs. The context outlives every wait of its thread, and a
@@ -344,6 +359,9 @@ waiter_of(ctx: *Context) -> *Waiter
     w.lwt = null
     w.state.store(WaitPending)
     w.linked = false
+    w.at = 0
+    w.order = 0
+    w.slot = 0
     w
 
 /** The threads waiting on one thing, oldest first, and the guard over them and over the thing's own
@@ -419,11 +437,37 @@ wait_on(ctx: *Context, q: *WaitQueue, w: *Waiter, deadline: long) -> bool
     q.guard.unlock()
     false
 
+/** The longest a bounded wait waits, in microseconds: about thirty years, so a deadline never
+ * overflows. */
+const LongestWait: long = 1000000000000000
+
 /** The time `millis` milliseconds from now on the monotonic clock, in microseconds, for a wait that
  * is bounded: at most about thirty years away. */
-deadline_after(millis: long) -> long
-    val span = if millis > 1000000000000 then 1000000000000 else millis
-    now_micros() + span * 1000
+deadline_after(millis: long) -> long =
+    deadline_in(if millis > LongestWait / 1000 then LongestWait else millis * 1000)
+
+/** The time `us` microseconds from now on the monotonic clock, at most about thirty years away. */
+deadline_in(us: long) -> long = now_micros() + (if us > LongestWait then LongestWait else us)
+
+/** Waits until `us` microseconds have passed; a time of zero or less returns at once. A lightweight
+ * thread parks on a timer, leaving its worker to run others, and any other thread blocks, safe for
+ * the collector, until the time has passed. */
+sleep_for(ctx: *Context, us: long)
+    if us <= 0 then return
+    if runs_lightweight(ctx)
+        park_until(ctx, deadline_in(us))
+    else
+        enter_safe(ctx)
+        val w = waiter_of(ctx)
+        block_until_woken(w, deadline_in(us))
+        leave_safe(ctx)
+
+// Parks the lightweight thread `ctx` belongs to until `deadline`. Its timer is its only waker, and
+// takes itself off the timers as it fires, so nothing is left to cancel when the thread runs again.
+private park_until(ctx: *Context, deadline: long)
+    val w = waiter_of(ctx)
+    w.lwt = ptr_cast(ctx)
+    park(ctx, null, w, deadline)
 
 // The operating system threads waiting, which are few: the main thread and threads attached for a
 // callback. They sleep on one condition and each checks its own waiter when it wakes.
@@ -448,38 +492,102 @@ private wake_blocked()
     blocked_woken.notify_all()
     blocked_lock.unlock_raw()
 
-// The timed waits of parked lightweight threads, which the monitor fires. A worker adds one after its
-// thread has switched away, before it lets the thread's guard go; the thread takes its own off when it
-// runs again, so the monitor never reaches a waiter whose frame is gone.
-private struct Timer
-    at: long
-    w: *Waiter
-
+// The timed waits and sleeps of parked lightweight threads, which the monitor fires: a binary heap of
+// their waiters, the soonest due at the root, two due at once in the order they were set. Each waiter
+// knows its place in the heap, so taking one off, as a wait ended early by its event does, costs as
+// little as adding one. A worker adds a waiter after its thread has switched away, before it lets the
+// thread's guard go; a timer that fires takes itself off, and a thread woken otherwise takes its own
+// off when it runs again, so the monitor never reaches a waiter whose wait has answered.
 private var timer_lock: Mutex[unit] = Mutex.new(())
 private var timer_wake: Condvar = Condvar.new()
-private var timers: Buf[Timer] = buf()
+private var timers: Buf[*Waiter] = buf()
+/** How many timers have been set, which orders two due at once. */
+private var timers_set: u64 = 0
 /** 1 while the monitor sleeps with no worker busy and no timer due, until something wakes it. */
 private var monitor_resting: Atomic[u32] = Atomic(0)
 
-private add_timer(w: *Waiter, at: long)
+/** Sets `w`'s timer for `at`, waking the monitor where it is now the soonest. */
+add_timer(w: *Waiter, at: long)
     timer_lock.lock_raw()
-    timers.push(Timer(at, w))
-    timer_wake.notify_one()
+    w.at = at
+    w.order = timers_set
+    timers_set += 1
+    timers.push(w)
+    rise(timers.len() - 1)
+    if w.slot == 1 then timer_wake.notify_one()
     timer_lock.unlock_raw()
 
-private cancel_timer(w: *Waiter)
+/** Takes `w`'s timer off, where it has one still: a timer that has fired has already gone. */
+cancel_timer(w: *Waiter)
     timer_lock.lock_raw()
-    var i = 0usize
-    while i < timers.len()
-        if timers[i].w == w
-            drop_timer(i)
-            break
-        i += 1
+    if w.slot != 0 then take_timer(w)
     timer_lock.unlock_raw()
 
-private drop_timer(i: usize)
-    timers[i] = timers[timers.len() - 1]
-    _ = timers.pop()
+/** How many timers are set. */
+timers_pending() -> usize
+    timer_lock.lock_raw()
+    val n = timers.len()
+    timer_lock.unlock_raw()
+    n
+
+/** The waiter whose timer is due soonest, or null where none is set. */
+soonest_timer() -> *Waiter
+    timer_lock.lock_raw()
+    val w = if timers.len() == 0 then null else timers[0]
+    timer_lock.unlock_raw()
+    w
+
+/** Whether the timers are in order: each waiter knows its place, and none is due before its parent. */
+timers_ordered() -> bool
+    timer_lock.lock_raw()
+    var ok = true
+    for i in 0..<timers.len()
+        if timers[i].slot != i + 1 then ok = false
+        if i > 0 && sooner(timers[i], timers[(i - 1) / 2]) then ok = false
+    timer_lock.unlock_raw()
+    ok
+
+// Under `timer_lock`: whether `a` is due before `b`.
+private sooner(a: *Waiter, b: *Waiter) -> bool = a.at < b.at || (a.at == b.at && a.order < b.order)
+
+// Under `timer_lock`: puts `w` at `i` in the heap.
+private place(i: usize, w: *Waiter)
+    timers[i] = w
+    w.slot = i + 1
+
+// Under `timer_lock`: moves the waiter at `i` toward the root past every one due after it.
+private rise(from: usize)
+    var i = from
+    val w = timers[i]
+    while i > 0
+        val up = (i - 1) / 2
+        if !sooner(w, timers[up]) then break
+        place(i, timers[up])
+        i = up
+    place(i, w)
+
+// Under `timer_lock`: moves the waiter at `i` away from the root past every one due before it.
+private sink(from: usize)
+    var i = from
+    val w = timers[i]
+    val n = timers.len()
+    loop
+        val left = 2 * i + 1
+        if left >= n then break
+        val child = if left + 1 < n && sooner(timers[left + 1], timers[left]) then left + 1 else left
+        if !sooner(timers[child], w) then break
+        place(i, timers[child])
+        i = child
+    place(i, w)
+
+// Under `timer_lock`: takes `w`, which is in the heap, out of it.
+private take_timer(w: *Waiter)
+    val i = w.slot - 1
+    w.slot = 0
+    val last = timers.pop().unwrap()
+    if i == timers.len() then return
+    place(i, last)
+    if i > 0 && sooner(last, timers[(i - 1) / 2]) then rise(i) else sink(i)
 
 private wake_monitor()
     timer_lock.lock_raw()
@@ -519,24 +627,16 @@ private any_busy() -> bool
     false
 
 // Under `timer_lock`: the time the next timer is due, or 0 where there is none.
-private earliest() -> long
-    var soonest: long = 0
-    for t in timers
-        if soonest == 0 || t.at < soonest then soonest = t.at
-    soonest
+private earliest() -> long = if timers.len() == 0 then 0 else timers[0].at
 
-// Under `timer_lock`: makes ready every thread whose timed wait has run out by `now`, unless something
-// woke it first.
+// Under `timer_lock`: makes ready every thread whose timed wait has run out by `now`, soonest first,
+// unless something woke it first.
 private fire_timers(now: long)
-    var i = 0usize
-    while i < timers.len()
-        val t = timers[i]
-        if t.at <= now
-            drop_timer(i)
-            val l = t.w.lwt
-            if t.w.state.cas(WaitPending, WaitTimedOut) == WaitPending then make_ready(l)
-        else
-            i += 1
+    while timers.len() > 0 && timers[0].at <= now
+        val w = timers[0]
+        take_timer(w)
+        val l = w.lwt
+        if w.state.cas(WaitPending, WaitTimedOut) == WaitPending then make_ready(l)
 
 // Asks each worker whose thread has overrun its slice while another is ready to yield, and releases
 // each worker that has stayed blocked for a whole tick while threads are ready.

@@ -1,0 +1,291 @@
+module avin.rt
+@tests
+
+import sh.sysl.gc
+import sysl.raw.ptr_cast
+import sysl.sync.*
+import sysl.time.{millis, sleep}
+
+// The timers that wake parked lightweight threads, and the sleeps and timed waits that park on them.
+
+// Waiters set on the timers directly, due so far ahead that the monitor never fires them.
+private var spread: [64]Waiter = [new_waiter(); 64]
+
+/** About three years from now: no timer of a test is ever due. */
+private const Far: long = 100000000000000
+
+// A deterministic scramble of `i`, for deadlines in no particular order with some ties.
+private scramble(i: usize) -> long = long((i * 37 + 11) % 23)
+
+@test("timers come off soonest first, two due at once in the order they were set, wherever one is cancelled from")
+timers_are_a_heap()
+    val base = now_micros() + Far
+    val before = timers_pending()
+    for i in 0..<64
+        spread[i] = new_waiter()
+        add_timer(&spread[i], base + scramble(i))
+        assert(spread[i].slot != 0)
+    assert_eq(timers_pending(), before + 64)
+    assert(timers_ordered())
+    // Cancelling from the middle, the end and twice over keeps the heap whole.
+    val gone: [6]usize = [5, 63, 0, 31, 5, 17]
+    for i in gone
+        cancel_timer(&spread[i])
+        assert_eq(spread[i].slot, 0usize)
+        assert(timers_ordered())
+    assert_eq(timers_pending(), before + 59)
+    // The rest come off as the monitor fires them: by deadline, then by the order they were set.
+    var last_at: long = 0
+    var last_order: u64 = 0
+    var taken = 0
+    loop
+        val w = soonest_timer()
+        if w == null || w.at < base then break
+        assert(w.at > last_at || (w.at == last_at && w.order > last_order))
+        last_at = w.at
+        last_order = w.order
+        cancel_timer(w)
+        assert(timers_ordered())
+        taken += 1
+    assert_eq(taken, 59)
+    assert_eq(timers_pending(), before)
+
+@test("a timer set while none is sooner becomes the root, and one set later than the root does not")
+timers_root()
+    val base = now_micros() + Far
+    spread[0] = new_waiter()
+    spread[1] = new_waiter()
+    spread[2] = new_waiter()
+    add_timer(&spread[0], base + 10)
+    assert(soonest_timer() == &spread[0])
+    add_timer(&spread[1], base + 20)
+    assert(soonest_timer() == &spread[0])
+    add_timer(&spread[2], base + 5)
+    assert(soonest_timer() == &spread[2])
+    cancel_timer(&spread[2])
+    assert(soonest_timer() == &spread[0])
+    cancel_timer(&spread[0])
+    cancel_timer(&spread[1])
+    assert(soonest_timer() == null || soonest_timer().at < base)
+
+@test("a deadline in microseconds is the time asked from now, and one too far away is held to about thirty years")
+deadlines_in_micros()
+    val now = now_micros()
+    val d = deadline_in(5000)
+    assert(d >= now + 5000)
+    assert(d < now + 5000 + 1000000)
+    val far = deadline_in(9223372036854775807)
+    assert(far > now)
+    assert(far <= now_micros() + LongestWait)
+    assert(deadline_in(0) >= now)
+    assert(deadline_after(9223372036854775807 / 1000 + 1) <= now_micros() + LongestWait)
+
+// Lightweight threads that sleep, and how many have finished.
+private struct Sleeping
+    us: long
+    done: Atomic[u32]
+    on_time: Atomic[u32]
+
+private var sleeping: Sleeping = Sleeping(0, Atomic(0), Atomic(0))
+
+private sleep_once(c: *Context, run: *u8) -> unit
+    val s: *Sleeping = ptr_cast(run)
+    val before = now_micros()
+    sleep_for(c, s.us)
+    if now_micros() - before >= s.us then _ = s.on_time.add(1)
+    _ = s.done.add(1)
+
+// Starts `n` sleepers of `us` microseconds that nobody joins, and waits, polling, until all have
+// finished or `limit` microseconds have passed; answers how long they took.
+private sleepers(me: *Context, n: u32, us: long, limit: long) -> long
+    sleeping.us = us
+    sleeping.done.store(0)
+    sleeping.on_time.store(0)
+    val start = now_micros()
+    for _ in 0..<n
+        _ = thread_start(me, ptr_cast(&sleeping), LeastStack, ptr_cast(&sleep_once))
+    while sleeping.done.load() < n && now_micros() - start < limit
+        sleep(millis(5))
+    now_micros() - start
+
+// Collects until the threads that have finished have also ended and let everything go, for at most
+// five seconds; answers whether nothing is left.
+private drained(me: *Context) -> bool
+    collect(me)
+    var rounds = 0
+    while gc.live(&space) != 0 && rounds < 5000
+        sleep(millis(1))
+        collect(me)
+        rounds += 1
+    gc.live(&space) == 0
+
+@test("ten thousand lightweight threads sleeping at once finish in about one sleep, on the same workers")
+sleepers_free_their_workers()
+    val me = thread_attach()
+    val released = releases.load()
+    val started = workers_started.load()
+    val took = sleepers(me, 10000, 200000, 60000000)
+    assert_eq(sleeping.done.load(), 10000u32)
+    assert_eq(sleeping.on_time.load(), 10000u32)
+    // Ten thousand sleeps of 200 ms one after another on each worker would take minutes.
+    assert(took < 20000000)
+    assert_eq(releases.load(), released)
+    assert(workers_started.load() - started <= u64(processors()))
+    assert_eq(timers_pending(), 0usize)
+    assert(drained(me))
+    thread_detach(me)
+
+@test("a sleep of no time or less returns at once and sets no timer, in a lightweight thread or not")
+empty_sleeps()
+    val me = thread_attach()
+    val times: [3]long = [0, -1, -9223372036854775807 - 1]
+    for us in times
+        val took = sleepers(me, 50, us, 30000000)
+        assert_eq(sleeping.done.load(), 50u32)
+        assert(took < 20000000)
+        assert_eq(timers_pending(), 0usize)
+        val before = now_micros()
+        sleep_for(me, us)
+        assert(now_micros() - before < 1000000)
+    thread_detach(me)
+
+@test("a thread that is not lightweight sleeps its time blocked, safe for the collector, setting no timer")
+blocked_sleep()
+    val me = thread_attach()
+    val before = now_micros()
+    sleep_for(me, 20000)
+    assert(now_micros() - before >= 20000)
+    assert_eq(timers_pending(), 0usize)
+    assert_eq(me.state.load(), Running)
+    thread_detach(me)
+
+// A condition lightweight threads wait on with a time limit, notified just as the limit runs out, so
+// the timer and the notification race.
+private struct Racing
+    lock: *u8
+    condition: *u8
+    waiting: Atomic[u32]
+    notified: Atomic[u32]
+    ran_out: Atomic[u32]
+
+private var racing: Racing = Racing(null, null, Atomic(0), Atomic(0), Atomic(0))
+
+private race_wait(c: *Context, run: *u8) -> unit
+    val s: *Racing = ptr_cast(run)
+    lock_acquire(c, s.lock)
+    _ = s.waiting.add(1)
+    if condition_wait_for(c, s.condition, s.lock, 2) then _ = s.notified.add(1) else _ = s.ran_out.add(1)
+    lock_release(c, s.lock)
+
+// A frame of the lock and the condition, so collections keep them.
+private struct RaceRoots
+    frame: Frame
+    lock: *u8
+    condition: *u8
+
+@assert(offsetof(RaceRoots, lock) == sizeof(Frame), "a frame's slots follow its header")
+
+private var race_roots: RaceRoots = RaceRoots(Frame(null, 2), null, null)
+
+@test("a timed wait the timer and a notification race to end is made ready once, and leaves no timer behind")
+timer_and_notify_race()
+    val me = thread_attach()
+    race_roots.frame.prev = me.top
+    me.top = &race_roots.frame
+    race_roots.lock = lock_new(me)
+    race_roots.condition = condition_new(me)
+    racing.lock = race_roots.lock
+    racing.condition = race_roots.condition
+    val n = 16u32
+    for round in 0..<60
+        racing.waiting.store(0)
+        racing.notified.store(0)
+        racing.ran_out.store(0)
+        for _ in 0..<n
+            _ = thread_start(me, ptr_cast(&racing), LeastStack, ptr_cast(&race_wait))
+        while racing.waiting.load() < n
+            sleep(millis(1))
+        // Notify at about the moment the timers are due, earlier or later from round to round.
+        val pause = (round % 4) * 700
+        if pause > 0 then sleep_for(me, long(pause))
+        lock_acquire(me, racing.lock)
+        condition_notify_all(me, racing.condition)
+        lock_release(me, racing.lock)
+        while racing.notified.load() + racing.ran_out.load() < n
+            sleep(millis(1))
+        assert_eq(racing.notified.load() + racing.ran_out.load(), n)
+        // Every waiter answered exactly once, so none is on the timers or the condition still.
+        while timers_pending() != 0
+            sleep(millis(1))
+        val q: *ParkCondition = ptr_cast(racing.condition)
+        assert(q.waiting.head == null)
+    racing.lock = null
+    racing.condition = null
+    me.top = race_roots.frame.prev
+    race_roots.lock = null
+    race_roots.condition = null
+    assert(drained(me))
+    thread_detach(me)
+
+// A lightweight thread that builds a list on the heap, sleeps, and checks the list afterwards, while
+// collections run meanwhile.
+private struct SleptList
+    root: Frame
+    head: *u8
+    built: Atomic[u32]
+    ok: Atomic[u32]
+
+@assert(offsetof(SleptList, head) == sizeof(Frame), "a frame's slots follow its header")
+
+private struct Node
+    header: Descriptor
+    offset: usize
+
+private var node_kind: Node = Node(descriptor(2, 16, 1), 0)
+
+private var slept_list: SleptList = SleptList(Frame(null, 1), null, Atomic(0), Atomic(0))
+
+private build_and_sleep(c: *Context, run: *u8) -> unit
+    val s: *SleptList = ptr_cast(run)
+    s.root.prev = c.top
+    c.top = &s.root
+    for i in 0..<500
+        val p = allocate(c, &node_kind.header)
+        val words: *usize = ptr_cast(p)
+        val next: **u8 = ptr_cast(p)
+        next[0] = s.head
+        words[1] = i
+        s.head = p
+    s.built.store(1)
+    sleep_for(c, 300000)
+    var p = s.head
+    var n = 500usize
+    var intact = true
+    while p != null
+        if n == 0 then intact = false
+        n -= 1
+        val words: *usize = ptr_cast(p)
+        if words[1] != n then intact = false
+        val next: **u8 = ptr_cast(p)
+        p = next[0]
+    if intact && n == 0 then s.ok.store(1)
+    c.top = s.root.prev
+    s.head = null
+    s.built.store(2)
+
+@test("a sleeping lightweight thread's frames are roots of every collection while it sleeps")
+sleeping_frames_are_roots()
+    slept_list.built.store(0)
+    slept_list.ok.store(0)
+    val me = thread_attach()
+    _ = thread_start(me, ptr_cast(&slept_list), LeastStack, ptr_cast(&build_and_sleep))
+    while slept_list.built.load() == 0
+        sleep(millis(1))
+    for _ in 0..<10
+        collect(me)
+    assert(gc.live(&space) >= 500usize)
+    while slept_list.built.load() != 2
+        sleep(millis(1))
+    assert_eq(slept_list.ok.load(), 1u32)
+    assert(drained(me))
+    thread_detach(me)

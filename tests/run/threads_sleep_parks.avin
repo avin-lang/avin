@@ -1,0 +1,107 @@
+// expect: exit 0
+// `sleep` in a thread parks it on a timer and frees its worker: a thousand threads sleeping at once,
+// under collections at every allocation, all wake having slept their time, with no worker added and
+// none replaced as if it were blocked (`threads_sleep_many` times ten thousand without the stress).
+// Sleepers keep what their frames hold through collections, sleep inside scopes, futures and actors,
+// wake soonest first, and a sleep of no time, less than none or the longest duration there is never
+// overflows. Upper bounds are generous, so a loaded machine cannot make the test fail.
+import avin.actors.{Behaviour, spawn as spawnActor}
+import avin.threads.{Atomic, Channel, Future, Mutex, Promise, scope, sleep, spawn}
+import avin.time.{Duration, millis, monotonic}
+
+@sysl("avin.rt.scheduler_workers")
+workers() -> long
+
+@sysl("avin.rt.scheduler_releases")
+releases() -> long
+
+@sysl("avin.rt.processors")
+processors() -> long
+
+// Sleeps `n` threads for `d` each, all at once, and answers how many woke having slept their time.
+sleepers(n: int, d: Duration) -> int
+    val woke = Atomic(0)
+    val all = (0..<n).map(_ -> spawn(() ->
+        val before = monotonic()
+        sleep(d)
+        if monotonic() - before >= d then woke.update(k -> k + 1))).toVector()
+    for t in all do t.join()
+    woke.load()
+
+napThen(i: int) -> int
+    sleep(millis(30))
+    i
+
+data Nap(ms: long, done: Promise[long])
+
+main() -> int
+    // Start the workers first, so the count compared below is the one the sleepers find.
+    sleepers(int(processors()) * 2, millis(1))
+    val started = workers()
+    val released = releases()
+    val woke = sleepers(1000, millis(100))
+    println(s"a thousand sleepers woke on time: ${woke == 1000}")
+    println(s"no worker added: ${workers() - started <= processors()}, none replaced: ${releases() == released}")
+
+    // A sleeper's own values survive the collections other threads make while it sleeps.
+    val kept = (0..<8).map(i -> spawn(() ->
+        val mine = (0..<200).map(k -> s"item $k of $i").toVector()
+        sleep(millis(50))
+        mine.map(s -> s.charCount()).sum())).toVector()
+    var garbage = 0
+    for round in 0..<200 do garbage += (0..<50).map(k -> s"garbage $k $round").toVector().length()
+    var kept_total = 0
+    for t in kept do kept_total += t.join()
+    println(s"kept across collections: $kept_total, garbage $garbage")
+
+    // Sleepers wake soonest first, whatever order they began in.
+    val order = Channel[int]()
+    val spaced = (0..<4).map(i -> spawn(() ->
+        sleep(millis(long(3 - i) * 150 + 20))
+        order.send(3 - i))).toVector()
+    var seen = ""
+    for _ in 0..<4 do seen += s"${order.receive().getOrElse(-1)}"
+    for t in spaced do t.join()
+    println(s"woke soonest first: $seen")
+
+    // No time, less than none and the longest duration: the first two return at once from any thread,
+    // and the longest parks without overflowing its deadline (the program ends with it still asleep).
+    val quick = spawn(() ->
+        val before = monotonic()
+        sleep(Duration.Zero)
+        sleep(millis(-1))
+        sleep(Duration.Min)
+        monotonic() - before < millis(1000))
+    println(s"no time in a thread returns at once: ${quick.join()}")
+    val forever = Promise[unit]()
+    spawn(() ->
+        forever.complete(())
+        sleep(Duration.Max))
+    forever.future.await()
+    spawn(() -> sleep(Duration(long.MaxValue - 1)))
+
+    // Inside a scope, in futures and in an actor's turn.
+    val scoped = scope(s ->
+        val count = Atomic(0)
+        for _ in 0..<100
+            s.spawn(() ->
+                sleep(millis(30))
+                count.update(k -> k + 1))
+        count)
+    println(s"scope waited for its sleepers: ${scoped.load()}")
+    val futures = (0..<100).map(i -> Future(napThen(i))).toVector()
+    println(s"futures that slept: ${Future.all(futures).await().sum()}")
+    val napper = spawnActor(Behaviour[Nap]("Napper", me -> m ->
+        sleep(millis(m.ms))
+        m.done.complete(m.ms)))
+    val naps = (1..5).map(n ->
+        val p = Promise[long]()
+        napper.tell(Nap(long(n) * 5, p))
+        p.future).toVector()
+    println(s"an actor that slept: ${Future.all(naps).await().sum()}")
+    // A sleeper holding a mutex makes the others wait their turn, each parked.
+    val held = Mutex(0)
+    val holders = (0..<20).map(_ -> spawn(() -> held.with(_ -> sleep(millis(2))))).toVector()
+    for t in holders do t.join()
+    println("a sleeper holding a mutex: done")
+    0

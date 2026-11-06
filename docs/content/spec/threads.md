@@ -70,7 +70,11 @@ ready. What a program can rely on:
   future or a promise is set aside, and its worker runs another ready thread meanwhile; the thread
   that ends the wait makes it ready again. Ready threads run in the order they became ready, and a
   thread may resume on a different worker from the one it waited on. A timed wait parks the same way
-  and is made ready when its time runs out. So waiting code is written as plain straight-line code:
+  and is made ready when its time runs out, and so does a `sleep`: ten thousand threads sleeping at
+  once hold no worker between them and all wake in about one sleep. Threads whose times run out
+  together are made ready soonest first, two due at the same moment in the order they began to wait.
+  A timed wait that its event ends first answers once, as woken, and its timer goes with it. So
+  waiting code is written as plain straight-line code:
   a server may hold one thread per connection, and a chain of futures each awaiting the one before
   it resolves however long it is.
 - **Threads are time-sliced.** A thread that has run for 10 ms while another thread is ready yields
@@ -78,9 +82,9 @@ ready. What a program can rely on:
   before every call that may recur, and goes to the back of the ready queue. A thread that computes
   without ever waiting therefore shares its processor rather than holding it, even in a tight loop
   that calls nothing, and a thread that does not overrun its slice pays nothing for it.
-- **A call that blocks its operating system thread does not starve the others.** A `sleep`, a Sysl
-  binding [declared `blocking`](/spec/sysl-bindings/#calls-that-wait) or a wait for a `lazy val`
-  being initialized elsewhere holds the worker it runs on, but once such a call has held its worker
+- **A call that blocks its operating system thread does not starve the others.** A Sysl binding
+  [declared `blocking`](/spec/sysl-bindings/#calls-that-wait) or a wait for a `lazy val` being
+  initialized elsewhere holds the worker it runs on, but once such a call has held its worker
   for a millisecond or two while other threads are ready, the runtime runs another worker in its
   place. A worker freed again rejoins the others, or rests until it is needed.
 - **The main thread is not a worker.** `main` runs on the program's first operating system thread,
@@ -389,7 +393,9 @@ exactly as it counts one in `await`, so a full pool whose workers all wait on a 
 the task that fills it. A `blocking` inside another, or an `await` inside one, is counted once; on a
 thread of no pool, `body` simply runs. **`sleep(d: Duration)`** pauses the calling thread for at
 least `d` (from [`avin.time`](/spec/time/)), safe for the collector while it
-sleeps; a duration of zero or less returns at once. A worker that sleeps keeps its place, and
+sleeps; a duration of zero or less returns at once, and one longer than about thirty years sleeps
+about thirty years. A thread that sleeps parks, freeing the operating system thread it ran on, and
+`main` blocks its own. A worker of a pool that sleeps keeps its place in the pool, and
 `blocking(sleep(d))` gives it up.
 
 ```avin

@@ -4146,6 +4146,34 @@ spelling is better, as each entry says.
 
 ## Proposed
 
+- Proposed (branch `lwt-timers`): **`sleep` parks a lightweight thread on a timer, and the
+  monitor thread fires the timers.** `sleep` in a lightweight thread parks it with no guard and a
+  timer at its deadline, as a timed wait parks, so its worker runs other threads; `main` and other
+  threads that are not lightweight block, safe for the collector. The monitor, which already wakes
+  once a tick while any worker is busy and sleeps until the soonest timer while none is, fires the
+  timers that are due. *Why*: the monitor exists, already fires timed waits and already sleeps until
+  the soonest one, so sleeps need no thread of their own and no new wake-up path; a sleep is never
+  more than a tick late while workers are busy. *Alternatives weighed*: the poller's timeout (the
+  poller of sockets, step 4, is not built yet; once it is, its wait could take the soonest timer as
+  its timeout and the monitor could hand timers over, which this choice does not preclude); a timer
+  thread of its own (one more operating system thread doing what the monitor does); keeping `sleep`
+  a blocking call that the monitor compensates for (a worker per sleeper, which is what the
+  lightweight threads are for). Review with the user only if sleep precision under 1 ms matters.
+
+- Proposed (branch `lwt-timers`): **the timers are a binary heap of waiters keyed by deadline, ties
+  broken by the order they were set, each waiter keeping its place in the heap.** Adding, firing and
+  cancelling a timer each cost O(log n) under the timer lock, and reading the soonest is O(1);
+  threads whose time runs out together are made ready soonest first, and two due at the same
+  microsecond in the order they began waiting. A timed wait that its event ends first takes its own
+  timer off when it runs again (its place makes that one step, not a search); the timer and the
+  event race on the waiter's state, and only the one that changes it from pending makes the thread
+  ready, so a wait answers exactly once and leaves no timer behind. *Why*: the linear list cost a
+  scan per cancel and per tick, which ten thousand sleepers turn into a hundred million steps a
+  second; a heap of the waiters themselves needs no allocation per timer beyond the heap's array.
+  *Alternatives weighed*: a hierarchical timing wheel (O(1) add and cancel, but a tick-quantized
+  deadline and more machinery than a heap that is already fast at this scale); a sorted list (O(n)
+  insertion); a heap without places (cancel would search, O(n)).
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

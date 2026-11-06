@@ -1,0 +1,51 @@
+// expect: exit 0
+// A timed wait whose time runs out just as its event comes answers once, either way: its timer and the
+// event race to end it, the loser does nothing, and the thread goes on. Round after round, threads
+// await a promise for 2 ms that is completed at about that moment, and wait 2 ms on a condition that
+// is notified at about that moment; every wait answers exactly once and every thread ends.
+import avin.threads.{Atomic, Mutex, Promise, sleep, spawn}
+import avin.time.micros
+
+class Flag()
+    var set = false
+
+main() -> int
+    var answered = 0
+    var waits = 0
+    for round in 0..<40
+        val p = Promise[int]()
+        val got = Atomic(0)
+        val ready = Atomic(0)
+        val answers = Atomic(0)
+        val waiters = (0..<32).map(_ -> spawn(() ->
+            ready.update(k -> k + 1)
+            if p.future.await(2) is Some(v) then got.update(k -> k + v)
+            answers.update(k -> k + 1))).toVector()
+        while ready.load() < 32 do sleep(micros(100))
+        sleep(micros(long(round % 5) * 500))
+        p.complete(1)
+        for t in waiters do t.join()
+        // Whoever was woken by the value saw it once; the rest ran out; every one answered once.
+        answered += answers.load()
+        if got.load() <= 32 then waits += 32
+    println(s"awaits answered once each: ${answered == waits}")
+    val gate = Mutex(Flag())
+    val c = gate.condition()
+    var notified = 0
+    var ranOut = 0
+    for round in 0..<40
+        val inWait = Atomic(0)
+        val woke = Atomic(0)
+        val timedOut = Atomic(0)
+        val waiters = (0..<16).map(_ -> spawn(() ->
+            gate.with(_ ->
+                inWait.update(k -> k + 1)
+                if c.waitFor(2) then woke.update(k -> k + 1) else timedOut.update(k -> k + 1)))).toVector()
+        while inWait.load() < 16 do sleep(micros(100))
+        sleep(micros(long(round % 5) * 500))
+        gate.with(_ -> c.notifyAll())
+        for t in waiters do t.join()
+        notified += woke.load()
+        ranOut += timedOut.load()
+    println(s"condition waits answered once each: ${notified + ranOut == 640}")
+    0
