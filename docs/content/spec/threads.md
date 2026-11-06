@@ -32,7 +32,9 @@ main() -> int
   its stack back when its body returns. Once `join` answers, the ended thread keeps nothing alive: its
   body and what the body captured are collected at the next collection unless something else still
   reaches them. A thread that overflows its own stack traps with
-  `stack overflow` like any other thread's trap.
+  `stack overflow` like any other thread's trap, whatever its stack's size: one under the least a
+  thread is given, the default, and a stack kept from an ended thread that is larger than the new
+  one asked for, which overflows at its own end.
 - **A trap in any thread stops the program**, as it does in a program with one thread: traps report
   bugs, and a bug in one thread leaves the state the others share in doubt. Only the first thread to
   stop the program reports: what was written is flushed once and one reason is printed, and a

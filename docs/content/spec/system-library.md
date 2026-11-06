@@ -125,6 +125,8 @@ knows is asked for by name, and a program's own settings are its own values.
 | `executable() -> Option[string]` | The absolute path of the running program's file, where the platform can tell. |
 | `processors() -> int` | How many processors the program may run on: the number the futures' pool grows to. |
 | `pid() -> long` | The process's identifier. |
+| `totalMemory() -> Result[long, IoError]` | The physical memory the machine has, in bytes: what is installed, not what is free. |
+| `residentBytes(pid: long) -> Result[long, IoError]` | The memory the process `pid` holds in RAM now, in bytes; `residentBytes(pid())` is the program's own. A process that is not there, a reaped child among them, and a `pid` of zero or less are `Err(NotFound)`; one the program may not look at is `Err(PermissionDenied)`. |
 | `signal(pid: long, sig: int) -> Result[unit, IoError]` | Sends the signal to the process `pid`; a negative `pid` is the group `-pid`, zero the program's own group, and `sig` zero sends nothing and answers whether one could be sent. No such process is `Err(Other("No such process"))`. |
 | `newSession() -> Result[long, IoError]` | Makes the program the leader of a new session and group with no controlling terminal, as a daemon does, answering its number; refused for a program that already leads a group. |
 | `os() -> Os` | The operating system the program was compiled for: `MacOS`, `Linux`, `Windows`, `Android`, `Wasi` or `Freestanding`. |
@@ -180,7 +182,9 @@ and its status is `b`'s.
 a part runs in the command's directory and with its variables unless it sets its own, a time limit
 bounds the whole and a part not started in time is not started, output redirected on a pipeline is
 its last stage's and input its first's, and a sequence's redirected file is opened once, its parts
-writing, or reading, one after the other.
+writing, or reading, one after the other. A started program is handed its three standard streams and
+nothing else: the files, sockets and pipes the program has open, and the runtime's own, are closed in
+it.
 
 | Running | Meaning |
 | --- | --- |
@@ -198,6 +202,8 @@ writing, or reading, one after the other.
 | `group() -> Option[long]` | The process group of a command started `inNewGroup`: the number its first program leads it by. |
 | `signal(sig: int) -> Result[unit, IoError]` | Sends `sig` to the program `pid()` names. A command seen to have ended, by `waitFor` or by `isAlive` answering `false`, is `Err(Other("No such process"))`, its id being the platform's to give again. |
 | `signalGroup(sig: int) -> Result[unit, IoError]` | Sends `sig` to every process in the command's group, the programs those programs started that stayed in it among them, however the command ended; an empty group is `Err(Other("No such process"))`, and a command not started `inNewGroup` `Err(Other("the command has no group of its own"))`. |
+| `detach() -> long` | Lets go of the command without stopping it, so it outlives its `Child` and the program, and answers `pid()`. |
+| `residentBytes() -> Result[long, IoError]` | The memory the program `pid()` names holds in RAM now, as `process.residentBytes(pid())` answers it; a command seen to have ended, or with no program started, is `Err(NotFound)`. |
 
 A started `Child` is [sendable](/spec/actors/#what-may-be-sent) ([proposed](/spec/decisions/#proposed)):
 it belongs to one thread at a time, as a [connection](#tcp) does. Handed to a thread's or a future's
@@ -235,9 +241,26 @@ stopped() -> Result[ExitStatus, IoError]
     waiter.join()
 ```
 
-**A started command does not outlive its `Child`.** A `Child` collected while its command runs stops
-it, so a program that should go on after its starter is gone is started by a program that leaves it
-behind, or detaches itself with `newSession()`.
+**A started command does not outlive its `Child` unless it is detached.** A `Child` collected while
+its command runs stops it. `detach()` lets go of every program of the command still running without
+stopping it ([proposed](/spec/decisions/#proposed)): neither collecting the `Child` nor the program's
+end stops them, so a server a command line program starts and leaves running is started and
+detached. It answers `pid()`, which `process.signal` can still reach, and so can the `Child`'s own
+`pid()`, `group()`, `signal` and `signalGroup`, which read only what was recorded as the programs
+started. A sequence's later part not yet started is never started. A detached command is no longer
+the `Child`'s to wait for: `waitFor`, `isAlive` and `kill` trap, and a second `detach` answers the
+`pid()` again.
+
+```text
+avin: trap: a detached `Child` is not waited for, asked after or stopped at main.avin:9:5
+```
+
+**Nothing reaps a detached program.** A detached program that ends while the program that started it
+still runs stays a zombie, holding its process id, until that program ends, when the system adopts
+and reaps it; since the `Child` no longer sees it end, `signal` may then reach whatever was given its
+id after, and `signal(0)` answers `Ok` of a zombie. Detaching a command already waited for lets go of
+nothing. A program that leaves its terminal's group as well starts the command `inNewGroup`, or
+detaches itself with `newSession()`.
 
 The iterator `lines()` answers is not sendable: the thread that reads a command's output starts it.
 

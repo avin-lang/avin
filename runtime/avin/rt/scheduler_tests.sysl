@@ -587,3 +587,56 @@ unjoined_threads_keep_nothing()
     assert_eq(gc.live(&space), 0usize)
     without_joints(me)
     thread_detach(me)
+
+// What a lightweight thread saw of its stack: whether the overflow report's low end was its stack's
+// own lowest usable address, before and after it yielded, and whether a local of its frame lay
+// between that address and the stack's top.
+private struct Bounds
+    exact: Atomic[u32]
+    inside: Atomic[u32]
+    runs: Atomic[u32]
+
+private var bounds: Bounds = Bounds(Atomic(0), Atomic(0), Atomic(0))
+
+private look_at_bounds(c: *Context, run: *u8) -> unit
+    val b: *Bounds = ptr_cast(run)
+    val p: *Lwt = ptr_cast(c)
+    var mark: u8 = 0
+    p.stack match
+        Some(st) ->
+            val before = stack_guard_low() == st.low()
+            yield_now(c)
+            val after = stack_guard_low() == st.low()
+            if before && after then _ = b.exact.add(1)
+            val at = usize(&mark)
+            if usize(st.low()) < at && at < usize(st.high()) then _ = b.inside.add(1)
+        None -> ()
+    _ = b.runs.add(1)
+
+// Starts `n` threads looking at their bounds on stacks of `size` bytes, and joins them.
+private bounds_at(me: *Context, n: usize, size: long)
+    for i in 0..<n
+        joints.slots[i] = thread_start(me, ptr_cast(&bounds), size, ptr_cast(&look_at_bounds))
+    join_n(me, n)
+
+@test("a lightweight thread's overflow report knows its stack's real low end, at every size and on a stack kept from an ended thread")
+stack_bounds_are_the_stacks_own()
+    bounds.exact.store(0)
+    bounds.inside.store(0)
+    bounds.runs.store(0)
+    val me = thread_attach()
+    with_joints(me)
+    val n = crowd()
+    // Below the least, at the least, a size that is not whole pages, and the library's default.
+    bounds_at(me, n, 1)
+    bounds_at(me, n, LeastStack)
+    bounds_at(me, n, 100001)
+    bounds_at(me, n, 8388608)
+    // A megabyte's stacks, kept as their threads end, are handed to threads asking for less.
+    bounds_at(me, n, 1048576)
+    bounds_at(me, n, 600000)
+    without_joints(me)
+    thread_detach(me)
+    assert_eq(bounds.runs.load(), u32(n * 6))
+    assert_eq(bounds.exact.load(), u32(n * 6))
+    assert_eq(bounds.inside.load(), u32(n * 6))

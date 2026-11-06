@@ -1,0 +1,85 @@
+// `detach()` lets go of a started command without stopping it and answers its pid. The program runs
+// on after its `Child` is collected and after the program that started it has ended; `pid`,
+// `signal` and `signalGroup` still reach it; a part of a sequence not yet started never starts; a
+// pipeline's stages all run on. A command that has ended unwaited stays a zombie, which a signal of 0
+// still finds; one already waited for has nothing to let go of. A second `detach` answers the pid
+// again.
+import avin.fs
+import avin.io.IoError
+import avin.process
+import avin.process.{Child, Command}
+import avin.threads
+import avin.time
+
+started(c: Command) -> Child = c.start() match
+  Ok(child) -> child
+  Err(e) -> fail(s"not started: $e")
+
+// The text of `file` once it is there and ends a line, within five seconds; `None` if it never is.
+awaited(file: string) -> Option[string]
+  for _ in 0..<500
+    fs.readText(file) match
+      Ok(text) -> if text.endsWith("\n") then return Some(text.trim())
+      Err(_) -> ()
+    threads.sleep(time.millis(10))
+  None
+
+// Starts a command writing `word` to `file` a little later, detaches it and lets its `Child` go.
+leaveWriting(file: string, word: string) -> long
+  val child = started(Command("/bin/sh", "-c", s"sleep 0.3; echo $word > '$file'"))
+  child.detach()
+
+// Run as its own program: starts the writer, detaches it and ends at once.
+parent(file: string)
+  leaveWriting(file, "outlived its program")
+
+main(args: Vector[string])
+  if args.length() == 2 && args(0) == "parent"
+    parent(args(1))
+    return
+  val dir = fs.createTempDir("avin-detach").ok().get()
+  // A running command, detached: the pid is its own, and a signal still reaches it.
+  val sleeper = started(Command("/bin/sleep", "30"))
+  val pid = sleeper.pid()
+  println(sleeper.detach() == pid)
+  println(sleeper.detach() == pid)
+  println(sleeper.pid() == pid)
+  println(process.signal(pid, 0))
+  println(sleeper.signal(0))
+  println(sleeper.signal(15))
+  // Collected while it runs, a detached command goes on.
+  val written = s"$dir/collected"
+  println(leaveWriting(written, "outlived its child") > 0)
+  for i in 0..<1000 do Array.fill(64, i)
+  println(awaited(written))
+  // The program that started it ends first, and it goes on.
+  val orphan = s"$dir/orphan"
+  println(Command(process.executable().get(), "parent", orphan).run())
+  println(awaited(orphan))
+  // A command that ended before it was detached is a zombie until this program ends.
+  val quick = started(Command("/bin/sh", "-c", "exit 3"))
+  threads.sleep(time.millis(200))
+  val zombie = quick.detach()
+  println(zombie == quick.pid())
+  println(process.signal(zombie, 0))
+  // A command already waited for has nothing to let go of, and keeps its pid.
+  val done = started(Command("/bin/sh", "-c", "exit 4"))
+  println(done.waitFor())
+  println(done.detach() == done.pid())
+  println(done.signal(0))
+  // A sequence's later part never starts once it is detached.
+  val never = s"$dir/never"
+  val sequence = started(Command("/bin/sleep", "0.2") followedBy Command("/bin/sh", "-c", s"echo started > '$never'"))
+  println(sequence.detach() > 0)
+  threads.sleep(time.millis(600))
+  println(fs.exists(never))
+  // Every stage of a detached pipeline runs on.
+  val piped = s"$dir/piped"
+  val pipeline = started(Command("/bin/sh", "-c", "sleep 0.2; echo through the pipe") | Command("/bin/sh", "-c", s"cat > '$piped'"))
+  println(pipeline.detach() == pipeline.pid())
+  println(awaited(piped))
+  // A detached command started in a group of its own is still reached through its group.
+  val grouped = started(Command("/bin/sleep", "30").inNewGroup())
+  println(grouped.detach() == grouped.group().get())
+  println(grouped.signalGroup(15))
+  fs.removeDirAll(dir)

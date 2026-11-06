@@ -312,14 +312,14 @@ impl string
 class Child(private val job: Job, private val owner: Owner, private val track: Track): Sendable
   // Waits for the command to end and answers how it ended, the same answer every time.
   waitFor() -> Result[ExitStatus, IoError]
-    owner.held()
+    held()
     val outcome = finished(job)
     track.ended.store(true)
     outcome
 
   // Whether the command is still running, without waiting for it.
   isAlive() -> bool
-    owner.held()
+    held()
     if !job.poll() then return true
     track.ended.store(true)
     false
@@ -327,8 +327,32 @@ class Child(private val job: Job, private val owner: Owner, private val track: T
   // Asks every program of the command still running to stop, with the signal 15, and starts no
   // part not yet started.
   kill()
-    owner.held()
+    held()
     job.stop()
+
+  // Lets go of the command without stopping it, and answers `pid()`. Its programs still running
+  // outlive the `Child` and the program; a part of a sequence not yet started never starts. Nothing
+  // waits for a detached program: one that ends while this program runs stays a zombie until this
+  // program ends. Afterwards `waitFor`, `isAlive` and `kill` trap, while `pid`, `group`, `signal`
+  // and `signalGroup` still answer from what was recorded; a second `detach` answers `pid()` again.
+  detach() -> long
+    owner.held()
+    if !track.detached.load()
+      track.detached.store(true)
+      if !track.ended.load() then job.release()
+    track.pid.load()
+
+  // The memory the program `pid()` names holds in RAM now, in bytes. A command seen to have ended,
+  // or one with no program started, is `Err(NotFound)`; a detached one is asked by its process id.
+  residentBytes() -> Result[long, IoError]
+    val p = track.pid.load()
+    if p == 0 || track.ended.load() then return Err(io.NotFound)
+    residentBytesOf(p)
+
+  // Checks the child belongs to the code running and is still its to wait for.
+  private held()
+    owner.held()
+    if track.detached.load() then fail("a detached `Child` is not waited for, asked after or stopped")
 
   // The process id of the program the command started last: its one program, a pipeline's last
   // stage, or the part of a sequence started most recently. Zero where no program was started, its
@@ -417,11 +441,13 @@ private object Context
 // What a started command's `Child` knows of its programs without asking them, so that any thread
 // may read it while another waits: the process id of the program started last, the group its
 // programs were started in (zero for none), and whether the command has been seen to end. The code
-// that starts the programs writes it, whichever thread that is.
+// that starts the programs writes it, whichever thread that is; and whether the command was detached,
+// after which the `Child` neither waits for it nor sees it end.
 private class Track(): Sendable
   val pid: Atomic[long] = Atomic(long(0))
   val group: Atomic[long] = Atomic(long(0))
   val ended: Atomic[bool] = Atomic(false)
+  val detached: Atomic[bool] = Atomic(false)
 
 // A part's three streams as Sysl takes them, with the files among them this part closes once it no
 // longer needs them: a pipe's end, or a file a redirection opened. Standard error sent where the
@@ -580,6 +606,8 @@ private abstract class Job
   finish() -> unit
   outcome() -> Result[ExitStatus, IoError]
   stop() -> unit
+  // Lets go of every program still running without stopping it, and starts no part not yet started.
+  release() -> unit
 
 // A part that ended before it began: its time ran out first.
 private class Ended(private val result: Result[ExitStatus, IoError]): Job
@@ -588,6 +616,7 @@ private class Ended(private val result: Result[ExitStatus, IoError]): Job
   override finish() = ()
   override outcome() -> Result[ExitStatus, IoError] = result
   override stop() = ()
+  override release() = ()
 
 // One running program.
 private class Process(private val child: Spawned, private val deadline: Option[Duration]): Job
@@ -617,6 +646,10 @@ private class Process(private val child: Spawned, private val deadline: Option[D
 
   override stop()
     if result.isEmpty() then child.kill(15)
+
+  // A program already waited for has nothing left to let go of.
+  override release()
+    if result.isEmpty() then child.detach()
 
   private ended(r: Result[ExitStatus, IoError])
     result = Some(r)
@@ -651,6 +684,10 @@ private class Pipeline(private val from: Job, private val into: Job): Job
     from.stop()
     into.stop()
 
+  override release()
+    from.release()
+    into.release()
+
 // Two parts one after the other, the second started by `second` when the first ends, if `joint` says
 // so. The streams are both parts', closed when the sequence ends.
 private class Sequence(
@@ -681,6 +718,14 @@ private class Sequence(
   override stop()
     stopped = true
     current.stop()
+
+  // The running part keeps its own copies of the streams, so the sequence's are closed here, as its
+  // end would have closed them.
+  override release()
+    if result.isEmpty()
+      stopped = true
+      current.release()
+      streams.release()
 
   // The current part has ended: the second is started where the joint says so, and otherwise the
   // sequence has ended with the current part's outcome.
@@ -843,6 +888,8 @@ private class Spawned
   kill(signal: int) -> Result[unit, SyslError]
   pid() -> int
   group() -> int
+  // Lets go of the program without stopping it, answering its process id.
+  detach() -> int
 
 @sysl("sysl.process.spawn")
 private spawnProgram(

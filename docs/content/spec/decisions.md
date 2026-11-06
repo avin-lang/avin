@@ -4411,6 +4411,39 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- Proposed (branch `sysl-098`): **`Child.detach()`** ([commands](/spec/system-library/#commands)).
+  `detach() -> long` lets go of every program of the command still running without stopping it
+  (Sysl's `Spawned.detach`) and answers `pid()`, the same `long` the `Child` already answers it as;
+  a sequence's later part not yet started is never started, and the sequence's own redirected files
+  are closed, the running part holding its copies. Afterwards `waitFor`, `isAlive` and `kill` trap
+  (`a detached `Child` is not waited for, asked after or stopped`), while `pid`, `group`, `signal`,
+  `signalGroup` and `residentBytes` answer from the ids recorded at each start; a second `detach`
+  answers the pid again, and detaching a command already waited for lets go of nothing. Nothing reaps
+  a detached program: one that ends while the program runs is a zombie until the program ends.
+  WHY: once detached the `Child` can no longer see the command end, so an answer from `waitFor` or
+  `isAlive` would be a guess, and a trap is how the library treats a handle used against its state
+  (a `Child` used from the wrong thread); keeping the id-based operations lets a program still stop
+  what it started. ALTERNATIVES: `waitFor` still waiting by pid (reaping, which makes a detached
+  command a waited one again and races a reaper the program may run itself); `Err` from `waitFor`
+  and `false` from `isAlive` (an `isAlive` of `false` would be a lie about a running program);
+  answering `int` as Sysl does (the `Child` answers every id as a `long`); refusing to detach a
+  pipeline or a sequence. **Review with the user**: whether a detached command should be reaped
+  by the runtime so it leaves no zombie.
+- Proposed (branch `sysl-098`): **`totalMemory` and `residentBytes`** ([the environment and the
+  platform](/spec/system-library/#the-environment-and-the-platform)). `process.totalMemory() ->
+  Result[long, IoError]` and `process.residentBytes(pid: long) -> Result[long, IoError]` over Sysl's
+  `total_memory` and `resident_bytes`, the `u64` bound as a `long` (machine memory and a process's
+  resident pages are far below 2^63), and `Child.residentBytes()` for the program `pid()` names. A
+  process that is not there (Sysl's `NotFound`, and its "no such process", which it answers for a
+  reaped child or an unused pid), a pid of zero or less and one past the largest `int` are
+  `Err(NotFound)`; Sysl's `NotPermitted` is `Err(PermissionDenied)`, which macOS answers for pid 1
+  and Linux does not (it reads any process's size). A `Child` seen to have ended, or with no program
+  started, is `Err(NotFound)` without asking. WHY: the pid is a `long` everywhere else in
+  `avin.process` (`pid()`, `signal`); `NotFound` and `PermissionDenied` are the `IoError` cases a
+  program tells apart, where Sysl's `NotPermitted` would otherwise read as `Other(text)`.
+  ALTERNATIVES: `pid: int` as Sysl takes it; `Option[long]` (loses why); passing Sysl's
+  "no such process" through as `Other(...)` as `signal` does.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
