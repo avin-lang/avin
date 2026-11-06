@@ -3924,15 +3924,8 @@ spelling is better, as each entry says.
   - **libc's `qsort` and `bsearch` take no `userdata`, so they cannot be bound**; the corpus binds a
     C function of its own that calls `qsort_r` and `bsearch` through one.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- Proposed on branch `c-bindings-structs` (roadmap stage 13 step 7): **C struct mirrors, opaque
-  values and arrays C answers.**
+- Settled on the user's delegation 2026-11-05: on branch `c-bindings-structs` (roadmap stage 13
+  step 7), **C struct mirrors, opaque values and arrays C answers.**
   - **A mirror's layout is measured, and checked against the header's order.** The C unit measures
     each field's offset, width and sign and the struct's size, and asserts the fields come in the
     header's order, each where C's alignment puts it after the one before, none after the last;
@@ -3964,6 +3957,13 @@ spelling is better, as each entry says.
     a pointer, `inout` or in an `Option`; each object is its own, compared by identity, and
     sendable, since it is an immutable copy. *Alternative*: also `out` and `const T *`, which no
     surveyed binding needs.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
 
 ## Open
 
