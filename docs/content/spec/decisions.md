@@ -4359,13 +4359,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 - Settled on the user's delegation 2026-11-06 (branch `stdout-flush-isnan`): **standard output gets an explicit `flush()`; reading flushes it; `real` gets `isNaN`, `isInfinite` and `isFinite`.** `flush()` is a prelude function and a method on `StandardOutput` and `StandardError` (a no-op beyond flushing output, as error keeps no buffer); a read of standard input that must wait flushes output first. The classifiers are methods on `real` in `avin`, written in Avin (`self != self`; comparison with the infinities; `self - self == 0.0`); `real.NaN`, `real.PositiveInfinity` and `real.NegativeInfinity` already existed, and `real` is the only floating type. WHY: a drawing program must push a frame without a newline, and a prompt must be seen before the wait; the methods read as `char`'s do, where the `avin.math` functions are not methods. ALTERNATIVES: a `Writer.flush` on the trait (every writer would need a meaning); flushing only on `print` (defeats buffering); `math.isNaN(x)` functions (the spec keeps `avin.math` for elementary functions). Review with the user if a `Writer`-level `flush` is wanted.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- Proposed (branch `exit-hooks`): **Exit hooks are `process.onExit(@sendable body: () -> unit) ->
+- Settled on the user's delegation 2026-11-06 (branch `exit-hooks`): **Exit hooks are `process.onExit(@sendable body: () -> unit) ->
   ExitHook`, with `cancel() -> bool`, run newest first and once each** ([exit
   hooks](/spec/system-library/#exit-hooks)). Why: a library that changes the world outside the
   program (tui's raw mode and alternate screen) must put it back on every ending, and the language
@@ -4374,7 +4368,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   Alternatives: one global handler to set (libraries would overwrite each other); a `defer`
   construct (scoped to a frame, so it cannot run on a trap or an `exit` from another thread);
   oldest first.
-- Proposed (branch `exit-hooks`): **The thread that ends the program runs the hooks**: the main
+- Settled on the user's delegation 2026-11-06 (branch `exit-hooks`): **The thread that ends the program runs the hooks**: the main
   thread when `main` returns, the thread calling `exit`, the trapping thread after its report
   (an escalated actor failure and running out of memory included), a test's process as a program.
   The other threads go on running meanwhile; one that traps or calls `exit` waits for the end
@@ -4385,7 +4379,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   one waiting or trapping); stopping the other threads first; hooks free to capture anything
   (a data race with the threads still running). **Review with the user**: whether a hook should
   rather be allowed to capture non-sendable state from the main thread for the common case.
-- Proposed (branch `exit-hooks`): **A hook that traps or calls `exit` never goes on, and the hooks
+- Settled on the user's delegation 2026-11-06 (branch `exit-hooks`): **A hook that traps or calls `exit` never goes on, and the hooks
   after it still run**, on top of its stack rather than after unwinding it (the runtime's frames
   hold counted values a jump past them would leak). The trap is reported as `avin: trap in an exit
   hook:` and the program then ends as a trap ends it, even where `main` returned or `exit` was
@@ -4395,11 +4389,11 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   cleanup must not end with a status that says success. Alternatives: a trap in a hook ends the
   program at once; an `exit` in a hook replaces the status (the last word wins, which a cleanup
   should not have).
-- Proposed (branch `exit-hooks`): **A hook registered while the hooks run runs too**, at once after
+- Settled on the user's delegation 2026-11-06 (branch `exit-hooks`): **A hook registered while the hooks run runs too**, at once after
   the one that registered it; `cancel()` answers `false` for a hook that has run or begun. Why: the
   registry is a stack the runner pops, so a hook a cleanup registers is the newest. Alternative:
   ignore registrations once the program is ending (silently drops cleanup a hook asked for).
-- Proposed (branch `exit-hooks`): **No hook runs on a stack overflow or on an unwatched signal.**
+- Settled on the user's delegation 2026-11-06 (branch `exit-hooks`): **No hook runs on a stack overflow or on an unwatched signal.**
   A stack overflow is reported by a handler on its own small stack where no Avin code can run. A
   signal the program does not watch keeps its platform action; a program that wants its hooks on
   `Terminate`, `Interrupt` or `Hangup` watches it and calls `exit`, as tui already watches them.
@@ -4410,6 +4404,12 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   watches them, ending with `exit(128 + sig)` after the hooks; running hooks from the overflow
   handler on a fresh stack (the thread may have overflowed inside a lock). **Review with the
   user**: the signals, if a program wants cleanup on Ctrl-C without watching for it.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
