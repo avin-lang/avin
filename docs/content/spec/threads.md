@@ -105,8 +105,9 @@ sendable values (a `var` among them, where its type is sendable), and any other 
 only sendable locals and parameters; what it makes itself is its own. Nothing outside therefore
 reaches a mutable value it makes or is given. An **`@isolating`** parameter asks that, and that
 nothing it runs, however indirectly, reaches module-level mutable state (below), so no mutable
-object it makes can be stored where code outside reaches it: it is the mark of
-[`isolate`'s body and `with`'s function](/spec/actors/#handing-over-ownership). A **`@sendable`**
+object it makes or is given can be stored where code outside reaches it: it is the mark of
+[`isolate`'s body and `with`'s function](/spec/actors/#handing-over-ownership), and of a
+[mutex's value and its body](#synchronization). A **`@sendable`**
 parameter asks both, and that a closure captures no `var`, since it may run on another thread while
 the code that made it goes on.
 Inside the function, a parameter so marked that holds a function may be passed on for a parameter
@@ -171,7 +172,7 @@ background[T: Sendable](@sendable body: () -> T) -> T = spawn(body).join()
 
 `spawn` and `s.spawn` take their body `@sendable`, as do `Future(body)`, `ex.future(body)`, a
 future's `map`, `flatMap` and `onComplete` and the `orElse` of a future of a `Result`, whose
-functions run on a pool thread. A mutex's value and the body of its `with` are `@isolated`
+functions run on a pool thread. A mutex's value and the body of its `with` are `@isolating`
 ([synchronization](#synchronization)).
 
 **Module-level state is shared by every thread**, and a body reaches it by name, not by capture.
@@ -199,8 +200,9 @@ error: what is passed for `body` of `spawn` may run on another thread, which sha
 
 With `val hits = Atomic(0)` and `record() = hits.add(1)` the program is legal. Printing is legal from any
 thread: `print`, `println` and `eprintln` reach the runtime's streams, which keep no state of the
-program's. What is passed for an `@isolating` parameter is held to it too, and what is passed for an
-`@isolated` one, which runs at once on the calling thread, is not.
+program's. What is passed for an `@isolating` parameter is held to it too, though it runs at once on
+the calling thread: a module-level value is where it could leave what it isolates for code that
+does not take the lock. What is passed for an `@isolated` one is not.
 
 A [Sysl handle](/spec/sysl-bindings/#handles) is the exception: it belongs to one owner at a time,
 and a use by any other code traps. The handles a thread's body or a future's body reaches move to
@@ -215,10 +217,14 @@ will own its handles across every message, whichever thread runs it.
   `m.with(v -> …)` takes the lock, runs the
   body with the value and lets the lock go when the body returns, giving back what it returned; it
   is the way to a mutable value, such as a `Buffer`, which the body changes in place. So that
-  nothing reaches the value but under the lock, `value` is `@isolated`, made in the argument
+  nothing reaches the value but under the lock, `value` is `@isolating`, made in the argument
   (`Mutex(Buffer[int]())`, not a buffer the caller keeps), and so is the body, whose result is
-  sendable: `with[R: Sendable](@isolated body: (T) -> R) -> R`. A body may read and assign the
-  caller's `var`s of sendable types, since it runs at once on the calling thread. For a sendable
+  sendable: `with[R: Sendable](@isolating body: (T) -> R) -> R`. A body may read and assign the
+  caller's `var`s of sendable types, since it runs at once on the calling thread, and may read
+  module-level `val`s of sendable types (another mutex among them), but nothing it runs may reach a
+  module-level `var` or a module-level value of a type that is not sendable: storing the value
+  there, in a module-level collection or in an object's field would let the program change it later
+  without the lock. A body reads such a `var` through a local read before it. For a sendable
   value, `get()` reads it, `set(v)` replaces it and `update(f)` replaces it with `f` of it
   under the lock, giving back the new value. A mutex is not reentrant: a thread that takes one it
   already holds, from inside a body, would wait for ever, so it traps instead.

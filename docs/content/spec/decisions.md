@@ -2231,8 +2231,8 @@ their words are reserved.
     the results of `mapOk` and `mapErr`, so every future's value is sendable however it was made.
     *Alternative*: bounding `Future[T]` itself, which would make every generic function naming a
     future repeat the bound.
-  - A `Mutex` is sendable of any value, so its value is `@isolated` where it is made (a buffer the
-    caller keeps cannot be guarded), `with` is `with[R: Sendable](@isolated body: (T) -> R) -> R`
+  - A `Mutex` is sendable of any value, so its value is `@isolating` where it is made (a buffer the
+    caller keeps cannot be guarded), `with` is `with[R: Sendable](@isolating body: (T) -> R) -> R`
     (the value cannot be returned or stored outside), and `get`, `set` and `update` exist only for a
     sendable value. A `with` body may assign the caller's `var`s of sendable types, since it runs at
     once on the calling thread. *Why*: without it, `Mutex(b)` or `m.with(v -> v)` hands the guarded
@@ -2375,8 +2375,9 @@ their words are reserved.
     implementation reads a module-level `var` and the body never meets a value of that type.
     *Alternative*: following the receiver's static type only where the class is final, which is
     finer but has to agree with devirtualization.
-  - What is passed for an `@isolated` parameter (a `Mutex`'s value and `with` body) is not held to
-    this, since it runs at once on the calling thread.
+  - What is passed for an `@isolated` parameter is not held to this, since it runs at once on the
+    calling thread. A `Mutex`'s value and `with` body were `@isolated`; they are now `@isolating`,
+    which is held to it (see the `mutex-isolating` entry below).
   - Printing stays legal with no promise: `print`, `println`, `eprintln` and the `StandardOutput`
     and `StandardError` objects reach the runtime's streams, which keep no state in Avin, and the
     objects hold no field. The standard library's own module-level state is held to the rule like
@@ -3847,10 +3848,11 @@ spelling is better, as each entry says.
   function that isolates what its caller passes writes it too: a parameter so marked is passed on
   for `@isolating` or `@isolated`, and a `@sendable` one for `@isolating`, but not the other way. It
   allows capturing a `var` of the code around it, since the body runs at once. Alternatives weighed:
-  holding every `@isolated` argument to the module-level check (a mutex's body has no need of it);
+  holding every `@isolated` argument to the module-level check (a mutex's body was thought to have
+  no need of it, which the `mutex-isolating` entry below corrects);
   an annotation only the standard library may write (a program could then not wrap `isolate`).
   **Review with the user:** it adds a third annotation users can write, beside `@sendable` and
-  `@isolated` (also see Findings below about a mutex's body).
+  `@isolated` (a mutex's value and body take it too, below).
 - Settled on the user's delegation 2026-11-05 (branch `actor-isolation`): **`with` holds an `Isolated`'s objects while its function
   runs.** Two `with`s of one `Isolated` on two threads would change one graph at once, and a `take`
   from inside `f` would hand the objects out while `f` still works on them. So `with` moves the
@@ -3862,14 +3864,26 @@ spelling is better, as each entry says.
 - Settled on the user's delegation 2026-11-05 (branch `actor-isolation`): **Where `Isolated` lives.** `Isolated`, `isolate` are in
   `avin.actors` (the chapter that defines them), imported as `import avin.actors.{Isolated,
   isolate}`; a thread passes one through a channel the same way. `Isolated(objects)` may be called
-  directly, its parameter marked `@isolating`, as `Mutex(value)`'s is `@isolated`. Alternatives
+  directly, its parameter marked `@isolating`, as `Mutex(value)`'s is. Alternatives
   weighed: the core module (imported everywhere, though only concurrent code wants it);
   `avin.threads` (the actors chapter names it).
-- Finding (branch `actor-isolation`), not changed: **a mutex's body may store its value in a
-  module-level `var`.** `@isolated` does not hold a `with` body to the module-level check, so
-  `m.with(b -> cache = b)` on the main thread lets the main thread change the buffer later without
-  the lock while a worker changes it under the lock. Marking `Mutex.with`'s body `@isolating` closes
-  it, at the cost of refusing a body that reads a module-level `var` it does not store into.
+- Settled on the user's delegation 2026-11-05 (branch `mutex-isolating`; found on
+  `actor-isolation`): **a mutex's value and its `with` body are `@isolating`**
+  ([synchronization](/spec/threads/#synchronization)). Under `@isolated`, `m.with(b -> cache = b)`
+  on the main thread stored the buffer in a module-level `var`, so the main thread could change it
+  later without the lock while a worker changed it under the lock; `Mutex(make())`, where `make`
+  keeps the buffer it returns in a module-level `var`, did the same at construction. Both
+  parameters now take the whole-program check that nothing they run reaches module-level mutable
+  state. The cost: a body may not read a module-level `var` (or a module-level value of a type that
+  is not sendable) even where it stores nothing; it reads a local copied before the `with` instead.
+  Module-level `val`s of sendable types, another mutex among them, stay readable, so nested `with`s
+  on two module-level mutexes are legal. Alternatives weighed: a narrower rule refusing only a flow
+  of the guarded value into module state while still allowing reads of module `var`s (an escape
+  analysis through every call, field, collection and closure; the store can go through a module
+  `val` of a mutable collection or an object's method, so the rule is the same whole-program reach
+  with flow tracking on top, harder to make sound and to explain in one diagnostic); leaving the
+  constructor `@isolated` (keeps the same hole open through the value's maker). **Review with the
+  user:** a `with` body that only reads a module-level `var` counter is now refused.
 
 **Deferred**
 
