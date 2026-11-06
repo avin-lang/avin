@@ -1,0 +1,97 @@
+// expect: exit 0
+// A blocking call keeps every handle it was passed alive until it returns, though nothing else
+// holds the handle while it waits: each handle here is made by a function value, so it is a real
+// object on the heap, and is passed as a temporary or used for the last time by the call. Another
+// thread allocates while the call waits, with the collector running at every allocation, and only
+// then sets the flag the call waits for; C reads each object after the wait, and the fixture stops
+// the process if the handle's finalizer had given it back. A shared handle is the sharp case: no
+// owner check runs before the call, so nothing but the call's own keeping holds it in the frame.
+// Shared handles, owned ones, several at once, one in an `Option` and one as a method's receiver;
+// afterwards every object is given back exactly once. The corpus runs this with the collector at
+// every allocation, at -O0 and -O2.
+import avin.threads.spawn
+import fixture.{Object, SharedObject, newObject, newShared, objects}
+
+@c("void aa_set_flag(void)")
+setFlag()
+
+@c("void aa_clear_flag(void)")
+clearFlag()
+
+@c("int aa_wait_object(const fx_object *o, int timeout_ms)", blocking)
+waitShared(o: SharedObject, timeout: int) -> int
+
+@c("int aa_wait_object(const fx_object *o, int timeout_ms)", blocking)
+waitOwned(o: Object, timeout: int) -> int
+
+@c("int aa_wait_objects(const fx_object *a, const fx_object *b, const fx_object *c, int timeout_ms)", blocking)
+waitThree(a: SharedObject, b: SharedObject, c: SharedObject, timeout: int) -> int
+
+@c("int aa_wait_objects(const fx_object *a, const fx_object *b, const fx_object *c, int timeout_ms)", blocking)
+waitMixed(a: Object, b: SharedObject, c: Object, timeout: int) -> int
+
+@c("int aa_wait_maybe(const fx_object *o, int timeout_ms)", blocking)
+waitMaybe(o: Option[SharedObject], timeout: int) -> int
+
+// The fixture's counted object again, with a blocking method, so the handle kept is the receiver.
+@c(type: "fx_object *", release: "fx_object_unref", retain: "fx_object_ref", shared)
+class Waiter
+    @c("int aa_wait_object(const fx_object *self, int timeout_ms)", blocking)
+    waitValue(timeout: int) -> int
+
+@c("fx_object *fx_object_new(int value)")
+newWaiter(value: int) -> Waiter
+
+// Allocates `n` small vectors, then sets the flag.
+churn(n: int) -> int
+    var total = 0
+    for i in 0..<n
+        val v = [i, i + 1]
+        total += v(1) - v(0)
+    setFlag()
+    total
+
+// Runs `call`, which waits for the flag, while another thread collects and then sets it.
+whileCollecting(call: () -> int) -> int
+    clearFlag()
+    val noise = spawn(() -> churn(500))
+    val answer = call()
+    noise.join()
+    answer
+
+// Allocates until every object has been freed, or gives up after a bound.
+settle() -> bool
+    var n = 0
+    while objects().freed < objects().created && n < 1000000
+        val v = [n, n + 1]
+        n += v(1) - v(0)
+    objects().freed == objects().created
+
+main()
+    val shared: int -> SharedObject = newShared
+    val owned: int -> Object = newObject
+    val waiter: int -> Waiter = newWaiter
+    // One handle, a temporary.
+    println(whileCollecting(() -> waitShared(shared(31), 60000)))
+    println(whileCollecting(() -> waitOwned(owned(32), 60000)))
+    // One handle whose last use is the call.
+    println(whileCollecting(() ->
+        val h = shared(33)
+        println(h.value())
+        waitShared(h, 60000)))
+    // Several handles, all temporaries, shared and owned.
+    println(whileCollecting(() -> waitThree(shared(1), shared(2), shared(4), 60000)))
+    println(whileCollecting(() -> waitMixed(owned(8), shared(16), owned(32), 60000)))
+    // A handle inside an `Option`, and none.
+    println(whileCollecting(() -> waitMaybe(Some(shared(34)), 60000)))
+    println(whileCollecting(() -> waitMaybe(None, 60000)))
+    // The receiver of a blocking method.
+    println(whileCollecting(() -> waiter(35).waitValue(60000)))
+    // Many rounds, a fresh handle each.
+    var good = 0
+    for round in 0..<20
+        if whileCollecting(() -> waitShared(shared(round), 60000)) == round then good += 1
+    println(good)
+    println(settle())
+    val c = objects()
+    println(s"${c.created} ${c.freed} ${c.released}")
