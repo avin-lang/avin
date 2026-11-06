@@ -3979,6 +3979,20 @@ spelling is better, as each entry says.
   least a page, 16 KB on arm64, per lightweight thread), with moving parked frames to the heap a
   later reduction; the collector scans parked stacks; a C call that blocks holds its operating
   system thread, as `blocking` already accounts for.
+- Settled on the user's delegation 2026-11-06: **lightweight threads are time-sliced at
+  safepoints.** A lightweight thread that has run for its slice, 10 ms to begin with and tunable,
+  yields at its next safepoint poll and goes to the back of the ready queue, so threads that never
+  wait share a core instead of starving the others. A timer in the runtime raises the yield request
+  on the carrier running it; compiled code already polls a flag on every back edge of its control
+  flow and before every call that may recur, for the collector, and the same poll answers it, so a
+  thread that does not overrun pays nothing more. A wait still switches at once, and an actor's
+  turn still ends after 16 messages. A long C call cannot be interrupted; `blocking` lets another
+  carrier run in its place. Built with the scheduler core.
+  *Why*: fairness for computation-heavy threads at no cost to the rest, from a poll that exists
+  already, with every interruption at a point where the roots are exact.
+  *Alternatives*: switching only at waits (a long computation holds its carrier until it ends);
+  interrupting at any instruction by a signal (needs exact roots at every instruction, which the
+  shadow stacks give only at safepoints).
 
 **Deferred**
 
