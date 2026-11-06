@@ -418,8 +418,8 @@ a decision changes, this page and the chapter change together.
 - A tuple needs no parentheses where it fills the rest of a line: `= a, b`, `return a, b`, a
   block's line. Bindings take tuples apart (`val q, r = divmod(n, d)`), and `a, b = b, a` is a
   multiple assignment: a statement that makes the whole right side before storing anything, with
-  compound forms that read every place first. Its places are `var` locals and `var` fields, each
-  field's object evaluated before anything else.
+  compound forms that read every place first. Its places are `var` locals, `var` fields and module-level
+  `var`s, each field's object evaluated before anything else.
 - Inside brackets whose commas separate items (call arguments, tuple and collection literals), a
   `return` or `break` value stops at the comma, so `f(a = return 1, b = 2)` has two arguments; a
   parenthesised `return 1, 2` is two tuple items, and `return (1, 2)` returns a tuple. An indented

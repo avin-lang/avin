@@ -405,7 +405,8 @@ so this swaps `a` and `b` with no temporary. The right side is a tuple, written 
 parenthesized: `(a, b) = (b, a)`.
 
 A place is a `var` local or a `var` field, written `obj.field`, `self.field`, or by its bare name
-inside its class: `self.lo, self.hi = hi, lo`. The object a field belongs to is evaluated first, left
+inside its class: `self.lo, self.hi = hi, lo`, or a module-level `var`, by its bare name or another
+module's through that module's name: `low, store.high = high, low`. The object a field belongs to is evaluated first, left
 to right across the places, before anything else; then the right side is made, then every place is
 stored.
 

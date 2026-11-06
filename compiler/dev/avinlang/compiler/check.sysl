@@ -9838,7 +9838,8 @@ private assignable(c: *Checker, target: &Expr) -> Option[usize]
         None ->
             if param_index(c, name) is Some(_) then c.note(unit, target.span, s"`$name` is a parameter, which cannot be assigned")
             elif global_named(c, name) is Some(g)
-                if writable_global(c, target.span, g) then c.note(unit, target.span, "assigning a module-level value in a multiple assignment is not implemented")
+                // Reached only where a member of the enclosing class hides the module's value.
+                if writable_global(c, target.span, g) then c.note(unit, target.span, s"`$name` names a member of this class, which hides the module-level value; only a `var` can be assigned")
             elif is_type_name(c, resolve_name(c, unit, name)) then c.note(unit, target.span, s"`$name` is a type, which cannot be assigned")
             elif lookup_function(c, name) is Some(_) then c.note(unit, target.span, s"`$name` is a function, which cannot be assigned")
             elif declared(c, resolve_name(c, unit, name)) then c.note(unit, target.span, s"`$name` is not a variable; only a `var` can be assigned")
@@ -11019,6 +11020,8 @@ private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option
     // A field is stored through a hidden local the multiple store writes, then copied into the field;
     // the object it belongs to is held first, before anything is read.
     var fields: Buf[Option[FieldPlace]] = buf()
+    // A module-level `var` is stored the same way: through a hidden local, then into the global.
+    var globals: Buf[Option[usize]] = buf()
     var block: Buf[&TExpr] = buf()
     var ok = true
     for written in targets
@@ -11030,8 +11033,10 @@ private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option
             locals.push(None)
             types.push(None)
             fields.push(None)
+            globals.push(None)
             continue
         if targets_field(c, t)
+            globals.push(None)
             field_place(c, t) match
                 Some(place) ->
                     if place.setup is Some(s) then block.push(s)
@@ -11045,6 +11050,20 @@ private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option
                     fields.push(None)
             continue
         fields.push(None)
+        if targets_global(c, t) is Some(g)
+            if writable_global(c, t.span, g)
+                val ty = global_type(c, g, t.span)
+                if c.index is Some(_) then index_expr(c, t, TExpr(t.span, ty, Global(g)))
+                locals.push(Some(hidden_local(c, ty)))
+                types.push(Some(ty))
+                globals.push(Some(g))
+            else
+                ok = false
+                locals.push(None)
+                types.push(None)
+                globals.push(None)
+            continue
+        globals.push(None)
         assignable(c, t) match
             Some(i) ->
                 locals.push(Some(i))
@@ -11063,7 +11082,9 @@ private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option
                     val old = hidden_local(c, ty)
                     val current: &TExpr = fields[i] match
                         Some(place) -> place_read(c, place, targets[i].span)
-                        None -> TExpr(targets[i].span, ty, Local(local))
+                        None -> globals[i] match
+                            Some(g) -> TExpr(targets[i].span, ty, Global(g))
+                            None -> TExpr(targets[i].span, ty, Local(local))
                     block.push(TExpr(e.span, Unit, Let(old, current)))
                     olds.push(Some(old))
                 None -> olds.push(None)
@@ -11126,6 +11147,9 @@ private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option
         if fields[i] is Some(place)
             val held = TExpr(targets[i].span, place.ty, Local(locals[i].unwrap()))
             block.push(place_store(c, place, targets[i].span, held, false))
+        elif globals[i] is Some(g)
+            val held = TExpr(targets[i].span, c.body.locals[locals[i].unwrap()].ty, Local(locals[i].unwrap()))
+            block.push(TExpr(targets[i].span, Unit, StoreGlobal(g, held, false)))
     TExpr(e.span, Unit, Block(block))
 
 /** A local the compiler introduces to hold a value for a moment; no name reaches it. */

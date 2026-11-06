@@ -1167,7 +1167,8 @@ public one as it reaches any declaration, by the name an import brings in or thr
 name, and assigns a `var` the same way: `store.latest = b`, `s.latest += 1` after `import app.store
 as s`, or `latest = b` after `import app.store.latest`. A private one is reached by neither, and only
 a `var` is assigned; a field of a module's object is assigned as any field is, `store.Tally.count =
-1`. Writing module state from a thread's body is refused as reading it is
+1`. Each of these is also a place of a multiple assignment: `store.latest, n = n, store.latest`.
+Writing module state from a thread's body is refused as reading it is
 ([threads](/spec/threads/)).
 
 ## Visibility and modules
