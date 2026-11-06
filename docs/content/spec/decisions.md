@@ -4077,14 +4077,7 @@ spelling is better, as each entry says.
   answered. *Alternatives*: a waiter in the waiting function's frame (the same, but its address is
   a local's, which Sysl's escape check refuses to queue); a heap waiter per wait (an allocation per
   wait).
-
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- Proposed (branch `c-bindings-buffers`): **views and blocks are one object layout, the runtime's
+- Settled on the user's delegation 2026-11-06 (branch `c-bindings-buffers`): **views and blocks are one object layout, the runtime's
   `CMemory`, with their operations as intrinsics of `avin.c`.** `ByteView`, `MutByteView` (a
   subclass) and `ByteBlock` (a subclass of `MutByteView`) are library classes the compiler lays out as
   the address, owner, length, closed flag, the two reasons they trap with and the lender; each
@@ -4094,27 +4087,27 @@ spelling is better, as each entry says.
   compiler and the runtime fill keeps every address one C lent or Avin allocated. *Alternatives*: a
   Sysl handle per view (the view could not keep its lender, an Avin object, alive); inline MIR for
   every operation (more compiler, and a closed view's reason is a string the runtime reports anyway).
-- Proposed (branch `c-bindings-buffers`): **a view's lengths and indices are `int`s**, and a C length
+- Settled on the user's delegation 2026-11-06 (branch `c-bindings-buffers`): **a view's lengths and indices are `int`s**, and a C length
   past the greatest `int`, or negative, stops the program at the call. *Why*: arrays' are `int`s, so a
   copy, a slice and an index mix with them without conversions; 2 GiB is more than a frame or a glyph.
   *Alternatives*: `long` lengths (every index written `long(i)`); `long` lengths with `int` indices
   (a view longer than any index reaches). Review with the user: a library lending more than 2 GiB at
   once would need `long`.
-- Proposed (branch `c-bindings-buffers`): **null lends `None` in an `Option` whatever the length, and
+- Settled on the user's delegation 2026-11-06 (branch `c-bindings-buffers`): **null lends `None` in an `Option` whatever the length, and
   otherwise an empty view where the length is zero and a stop where it is not**, as arrays C answers
   are. *Why*: FreeType's empty glyph is null with no rows, and a frame with no image may answer null
   with a size of zero. *Alternative*: null always a stop outside an `Option`.
-- Proposed (branch `c-bindings-buffers`): **a view belongs to the code owning its lender, and is lent
+- Settled on the user's delegation 2026-11-06 (branch `c-bindings-buffers`): **a view belongs to the code owning its lender, and is lent
   only by a method of a handle that is not `shared`.** A view checks its lender's owner at each use, so
   handing the lender over (a thread's body capturing the view or its frame) takes the view with it and
   any other thread traps. *Why*: closing a view is a write the lender's next use makes, and reading
   memory the lender's next call may free; both must happen on one owner at a time, which a `shared`
   handle does not have. *Alternatives*: an owner of the view's own (a view handed over without its
   lender would race the lender's next use); `shared` views closed under a lock (a lock per byte read).
-- Proposed (branch `c-bindings-buffers`): **a failed status lends nothing and copies nothing, but is a
+- Settled on the user's delegation 2026-11-06 (branch `c-bindings-buffers`): **a failed status lends nothing and copies nothing, but is a
   use of its receiver**, which closes the view lent before it. *Why*: the call ran, and may have freed
   the memory. *Alternative*: closing only on success (a stale view after a failed conversion).
-- Proposed (branch `c-bindings-buffers`): **the record `attach:` gives C belongs to one handle object**:
+- Settled on the user's delegation 2026-11-06 (branch `c-bindings-buffers`): **the record `attach:` gives C belongs to one handle object**:
   later keeps through the same handle add to it, the handle lets go of it when its reference goes back,
   and C holds it until `destroy`; on an `attach:` class every kept object, handles too, is held as its
   Avin object, so a kept handle's own C reference lives as long as the record. `key:` may be left out
@@ -4126,14 +4119,20 @@ spelling is better, as each entry says.
   back with the holder's handle, while C still uses them). Review with the user: two Avin handles on
   one C object each attach under the same key, so the second replaces the first's record, and C's
   destroy of the first lets go of what the first kept while the first handle still keeps it.
-- Proposed (branch `c-bindings-buffers`): **a `ByteBlock`'s own constructor makes a block of no bytes,
+- Settled on the user's delegation 2026-11-06 (branch `c-bindings-buffers`): **a `ByteBlock`'s own constructor makes a block of no bytes,
   passed to C as null**, and `ByteBlock(length)` is the companion's `apply`. *Why*: a class has a
   constructor, and the empty block is harmless where every index is out of range. *Alternative*: an
   abstract class with a factory (a block could not be named as the type `ByteBlock(n)` makes).
-- Proposed (branch `c-bindings-buffers`): **`bytes:` is `array:` for an `Array[byte]`**, with `free:`
+- Settled on the user's delegation 2026-11-06 (branch `c-bindings-buffers`): **`bytes:` is `array:` for an `Array[byte]`**, with `free:`
   where C allocated the bytes. *Why*: the spec's copy was the one-element case of the generalized
   `array:`; one path copies both. *Alternative*: `bytes:` with no `free:` (a leak per call for a library
   that allocates).
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
