@@ -11107,22 +11107,22 @@ private literal_parts(c: *Checker, exprs: Buf[&Expr], want: &Type, what: string)
                 typed.push(TExpr(t.span, ErrorType, t.kind))
             else typed.push(t)
         return typed
-    // An empty collection literal among them is checked after the rest, against the type they agree
-    // on.
+    // A number literal or an empty collection literal among them is checked after the rest, against
+    // the type they agree on.
     var checked: Buf[Option[&TExpr]] = buf()
     for x in exprs
         checked.push(None)
     var agreed: Option[&Type] = None
-    for k in empties_last(exprs)
+    for k in agreement_order(exprs)
         val x = exprs[k]
-        val t = check_expr(c, x, empty_hint(c, x, agreed))
+        val t = check_expr(c, x, agreement_hint(c, x, agreed))
         checked[k] = Some(t)
         agreed = agreed match
             None -> Some(t.ty)
             Some(so_far) -> join(c, so_far, t.ty) match
                 Some(j) -> Some(j)
                 None ->
-                    c.note(unit, x.span, s"the $what of a map literal need a common type; ${type_name(zonk(c, so_far))} and ${type_name(zonk(c, t.ty))} have none${no_single_join(c, so_far, t.ty)}")
+                    no_common_type(c, exprs, checked, k, so_far, t.ty, s"the $what of a map literal need a common type")
                     Some(ErrorType)
     for t in checked
         typed.push(t.unwrap())
@@ -11134,6 +11134,22 @@ private literal_parts(c: *Checker, exprs: Buf[&Expr], want: &Type, what: string)
         val same = same_type(zonk(c, t.ty), agreed_type) || *t.ty is Nothing || *t.ty is ErrorType
         out.push(if same then t else TExpr(t.span, agreed_type, t.kind))
     out
+
+// Reports that the part `k` of `exprs`, of type `found`, has no common type with `so_far`, what the
+// parts checked before it agree on. The report reads in the order the parts are written: where `k`
+// was checked after a part written later (a literal is checked after the rest), it names `found`
+// first and points at that later part, as it would had the parts been checked in order.
+private no_common_type(c: *Checker, exprs: Buf[&Expr], checked: Buf[Option[&TExpr]], k: usize, so_far: &Type, found: &Type, lead: string)
+    var at = k
+    var first = so_far
+    var second = found
+    for i in k + 1..<exprs.len()
+        if checked[i] is Some(_)
+            at = i
+            first = found
+            second = so_far
+            break
+    c.note(unit_of(c), exprs[at].span, s"$lead; ${type_name(zonk(c, first))} and ${type_name(zonk(c, second))} have none${no_single_join(c, first, second)}")
 
 // Whether `e` is a collection literal whose element types a type expected of it has to settle: one
 // with nothing in it, `[]` or `{}`, or one holding such a literal anywhere among its parts, as
@@ -11157,21 +11173,31 @@ private expected_of_branches(c: *Checker, expected: Option[&Type], used: bool, a
     val t = expected?
     if *zonk(c, t) is AnyType then None else expected
 
-// The positions of `exprs` in the order they are checked when they have to agree on one type: each
-// empty collection literal after the rest, so that what the rest agree on settles its element types.
-private empties_last(exprs: Buf[&Expr]) -> Buf[usize]
+// The positions of `exprs` in the order they are checked when they have to agree on one type: first
+// those that give a type of their own, then the values built around number literals (`Some(1)`,
+// `[1, 2]`), then the expressions of literals alone (`2`, `-(4 * 5)`), and each empty collection
+// literal last, so that what those before agree on settles the numbers and element types of those
+// after. Within a rank they keep the order they are written in.
+private agreement_order(exprs: Buf[&Expr]) -> Buf[usize]
     var order: Buf[usize] = buf()
-    for i in 0..<exprs.len()
-        if !empty_literal(exprs[i]) then order.push(i)
-    for i in 0..<exprs.len()
-        if empty_literal(exprs[i]) then order.push(i)
+    for rank in 0..<4
+        for i in 0..<exprs.len()
+            if agreement_rank(exprs[i]) == rank then order.push(i)
     order
 
-// The type `e` is checked against among siblings that agree on `agreed`: that type, where `e` is an
-// empty collection literal and `agreed` says something of a type; otherwise nothing is expected.
-private empty_hint(c: *Checker, e: &Expr, agreed: Option[&Type]) -> Option[&Type]
-    if !empty_literal(e) then return None
-    shaped_hint(c, e, useful_hint(c, agreed))
+private agreement_rank(e: &Expr) -> i32 =
+    if empty_literal(e) then 3 elif literal_expression(e) then 2 elif holds_literal(e) then 1 else 0
+
+// The type `e` is checked against among siblings that agree on `agreed`, where `agreed` says something
+// of a type: that type, where `e` is an empty collection literal; its shape with its numbers and other
+// value types kept and its classes left open, where `e` is or holds a number literal, so the literal
+// takes the numbers the others decide while a class in it may still widen the join; otherwise nothing
+// is expected.
+private agreement_hint(c: *Checker, e: &Expr, agreed: Option[&Type]) -> Option[&Type]
+    if empty_literal(e) then return shaped_hint(c, e, useful_hint(c, agreed))
+    if !holds_literal(e) && !literal_expression(e) then return None
+    val so_far = useful_hint(c, agreed)?
+    shaped_hint(c, e, Some(literal_hint(c, so_far)))
 
 // `hint`, where it is a collection of the kind literal `e` is written as, or one any literal builds;
 // a set literal's kind admits a map, since `{}` is both.
@@ -11354,15 +11380,15 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
             else given.push(Some(TExpr(span, if failed then ErrorType else pair, Construct(0, typed_parts))))
             steps.push(method_call(c, span, span, receiver, adds[0], args, None, None, false, given))
     elif *element is Var(_)
-        // No element type is expected, so the elements decide it. An empty collection literal among
-        // them is checked after the rest, against the type they agree on.
+        // No element type is expected, so the elements decide it. A number literal or an empty
+        // collection literal among them is checked after the rest, against the type they agree on.
         var checked: Buf[Option[&TExpr]] = buf()
         for item in items
             checked.push(None)
         var agreed: Option[&Type] = None
-        for k in empties_last(items)
+        for k in agreement_order(items)
             val item = items[k]
-            var t = check_expr(c, item, empty_hint(c, item, agreed))
+            var t = check_expr(c, item, agreement_hint(c, item, agreed))
             // An element that is an `Option[Nothing]` converts to the other elements' option, and the
             // elements before one of another option, to that, as the arms of a `match` do.
             if agreed is Some(so_far)
@@ -11377,7 +11403,7 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
                 Some(so_far) -> join(c, so_far, t.ty) match
                     Some(j) -> Some(j)
                     None ->
-                        c.note(unit, item.span, s"the elements of a collection literal need a common type; ${type_name(zonk(c, so_far))} and ${type_name(zonk(c, t.ty))} have none${no_single_join(c, so_far, t.ty)}")
+                        no_common_type(c, items, checked, k, so_far, t.ty, "the elements of a collection literal need a common type")
                         Some(ErrorType)
         var typed: Buf[&TExpr] = buf()
         for t in checked
@@ -12370,6 +12396,7 @@ private joined(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
     if forgets_sendable(current, zonk(c, b)) then return Some(zonk(c, b))
     if forgets_sendable(zonk(c, b), current) then return Some(current)
     if *current is Data(_, _, _) then return join_args(c, current, zonk(c, b))
+    if *current is Tuple(xs) then return join_parts(c, xs, zonk(c, b))
     val start = current
     var climbing = true
     while climbing
@@ -12451,6 +12478,19 @@ private join_args(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
         Data(d, name, _) -> Some(Data(d, name, args))
         Class(k, name, _) -> Some(Class(k, name, args))
         _ -> None
+
+// The tuple two tuples of as many parts agree on: each part where they agree on it, as a tuple's parts
+// are read out, so `(Dog, long)` and `(Cat, long)` agree on `(Animal, long)`. Parts of value types
+// agree only where they are the same type.
+private join_parts(c: *Checker, xs: Buf[&Type], b: &Type) -> Option[&Type]
+    val ys = *b match
+        Tuple(ys) -> ys
+        _ -> return None
+    if xs.len() != ys.len() then return None
+    var parts: Buf[&Type] = buf()
+    for i in 0..<xs.len()
+        parts.push(join(c, xs[i], ys[i])?)
+    Some(Tuple(parts))
 
 // The type parameter of `a` and `b` that the other is a value of through its lower bound, if either
 // is: `W` for `W >: T` and `T`.
@@ -12537,18 +12577,20 @@ private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[
             val y = tested_branch(c, yes, tested.yes, None, false)
             if *y.ty is Nothing then bring_into_scope(c, condition.span, tested.no)
             return TExpr(e.span, Unit, If(cond, y, None))
-    // A branch that is an empty collection literal, `[]` or `{}`, where nothing useful is expected
-    // of the `if`, is checked after the other and against its type, which settles its element types.
+    // A branch that is an empty collection literal, `[]` or `{}`, or is or holds a number literal,
+    // where nothing useful is expected of the `if`, is checked after the other and against its type,
+    // which settles its element types and its numbers: `if c then long(1) else 2` is a `long`.
     val wanted = expected_of_branches(c, expected, used, empty_literal(yes) || empty_literal(other))
     val settled_outside = useful_hint(c, wanted) is Some(_)
+    val agreeing = used && !settled_outside
     var y: &TExpr = TExpr(e.span, ErrorType, UnitConst)
     var n: &TExpr = TExpr(e.span, ErrorType, UnitConst)
-    if used && !settled_outside && empty_literal(yes) && !empty_literal(other)
+    if agreeing && agreement_rank(yes) > agreement_rank(other)
         n = tested_branch(c, other, tested.no, wanted, used)
-        y = tested_branch(c, yes, tested.yes, hint_or(shaped_hint(c, yes, useful_hint(c, Some(n.ty))), wanted), used)
+        y = tested_branch(c, yes, tested.yes, hint_or(agreement_hint(c, yes, Some(n.ty)), wanted), used)
     else
         y = tested_branch(c, yes, tested.yes, wanted, used)
-        val hint = if used && !settled_outside && empty_literal(other) then shaped_hint(c, other, useful_hint(c, Some(y.ty))) else None
+        val hint = if agreeing then agreement_hint(c, other, Some(y.ty)) else None
         n = tested_branch(c, other, tested.no, hint_or(hint, wanted), used)
     if used
         // A branch that is an `Option[Nothing]` converts to the other's option.
@@ -16120,6 +16162,11 @@ private compare_decimal(a: string, b: string) -> int
         if a.bytes[i] != b.bytes[i] then return if a.bytes[i] < b.bytes[i] then -1 else 1
     0
 
+// Whether a `match` arm's value is checked after the other arms, against what they agree on: an empty
+// collection literal, or an expression of number literals alone. Neither names a pattern's bindings,
+// so it is checked once they are out of scope.
+private waits_for_arms(e: &Expr) -> bool = empty_literal(e) || literal_expression(e)
+
 // Each arm's pattern names are scoped to that arm, and may shadow names outside it. The arms'
 // values must agree when the match's value is used, and together the unguarded arms must cover
 // every value of the subject's type.
@@ -16130,14 +16177,16 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
     var ty: &Type = Nothing
     var agreed = true
     var never = true
-    // An arm whose value is an empty collection literal, `[]` or `{}`, where nothing useful is
-    // expected of the `match`, is checked after the others and against the type they agree on,
-    // which settles its element types.
+    // An arm whose value is an empty collection literal, `[]` or `{}`, or an expression of number
+    // literals alone, where nothing useful is expected of the `match`, is checked after the others
+    // and against the type they agree on, which settles its element types or its numbers.
     var waiting = false
     var others = false
+    var any_empty = false
     for arm in arms
-        if empty_literal(arm.body) then waiting = true else others = true
-    val wanted = expected_of_branches(c, expected, used, waiting)
+        if waits_for_arms(arm.body) then waiting = true else others = true
+        if empty_literal(arm.body) then any_empty = true
+    val wanted = expected_of_branches(c, expected, used, any_empty)
     val settled_outside = useful_hint(c, wanted) is Some(_)
     val deferring = used && !settled_outside && waiting && others
     // A pattern that failed to check is not judged for reachability, nor are the ones after it.
@@ -16155,7 +16204,7 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
             val t = check_expr(c, g, Some(Bool))
             expect_bool(c, t)
             guard = Some(t)
-        if deferring && empty_literal(arm.body)
+        if deferring && waits_for_arms(arm.body)
             c.body.visible.truncate(mark)
             c.body.block_start = outer_start
             deferred.push(typed.len())
@@ -16182,14 +16231,23 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
         typed.push(TArm(pattern, guard, body))
     for k in deferred
         val arm = arms[k]
-        val body = check_value(c, arm.body, hint_or(shaped_hint(c, arm.body, useful_hint(c, Some(ty))), wanted), used)
+        val body = check_value(c, arm.body, hint_or(agreement_hint(c, arm.body, Some(ty)), wanted), used)
         never = false
         typed[k] = TArm(typed[k].pattern, typed[k].guard, body)
         if agreed
             join_expected(c, ty, body.ty, wanted) match
                 Some(t) -> ty = t
                 None ->
-                    c.note(unit, arm.body.span, s"this arm yields ${type_name(body.ty)}, but the other arms yield ${type_name(ty)}")
+                    // The report reads in the order the arms are written: a literal arm before an
+                    // arm it disagrees with is named as an arm before that one.
+                    var later: Option[usize] = None
+                    for j in k + 1..<arms.len()
+                        if !contains_index(deferred, j)
+                            later = Some(j)
+                            break
+                    if later is Some(j)
+                        c.note(unit, arms[j].body.span, s"this arm yields ${type_name(ty)}, but the arms before it yield ${type_name(body.ty)}")
+                    else c.note(unit, arm.body.span, s"this arm yields ${type_name(body.ty)}, but the other arms yield ${type_name(ty)}")
                     agreed = false
     if !agreed then ty = ErrorType
     elif !used then ty = if never then Nothing else Unit
