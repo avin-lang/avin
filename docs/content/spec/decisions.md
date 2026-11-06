@@ -4405,13 +4405,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   handler on a fresh stack (the thread may have overflowed inside a lock). **Review with the
   user**: the signals, if a program wants cleanup on Ctrl-C without watching for it.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- Proposed (branch `generic-joins`): **Two tuples join part by part** ([generics](/spec/generics/#inference)).
+- Settled on the user's delegation 2026-11-06 (branch `generic-joins`): **Two tuples join part by part** ([generics](/spec/generics/#inference)).
   `(Dog, long)` and `(Cat, long)` agree on `(Animal, long)` wherever two types are joined: the
   arguments of one type parameter, the branches of an `if`, the arms of a `match`, the elements of a
   literal, and a tuple inside a covariant argument (`Option`, `Vector`, `List`). Each part joins as two
@@ -4422,7 +4416,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   types but not tuples. Alternatives: requiring the tuple type to be written (a contortion the class
   case does not need). Nothing here deserves a conversation.
 
-- Proposed (branch `generic-joins`): **A number literal among values that agree on one type takes the
+- Settled on the user's delegation 2026-11-06 (branch `generic-joins`): **A number literal among values that agree on one type takes the
   type the others decide** ([generics](/spec/generics/#inference), [collections](/spec/collections/#literals)).
   Among the elements of a collection literal, the keys or values of a map literal and the branches of
   an `if`, the values are checked in tiers, as a call's arguments are: those holding no literal first,
@@ -4441,6 +4435,26 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   same reason); deferring every `match` arm that holds a literal by re-entering its pattern's scope
   (more machinery for a rare shape). Review with the user: whether `match` arms such as `Some(2)`
   beside `Some(big)` should also agree.
+
+- Settled on the user's delegation 2026-11-06 (branch `okor-command-message`): **`Option.okOr` / `okOrElse` and `CommandError.message()`**.
+  `Option[T]` gains `okOr[E](error: E) -> Result[T, E]` and `okOrElse[E](f: () -> E)`, the `Result`
+  counterparts of `toRight`; `Result.ok()` and `err()` already existed. `okOr` takes its argument
+  by value and `okOrElse` a function called only for `None`. WHY: the two names say which form
+  evaluates; the by-name form already exists as a lambda call, and a by-name `okOr` would leave
+  `okOrElse` redundant. Alternatives: a by-name `okOr` only (as `toRight` is; one method, but an
+  argument with effects reads as eager and is not), or `toRight`-style names (`toOk`). Review
+  with the user if `okOr`'s eagerness should instead match `toRight`'s.
+  `CommandError.message() -> string` reads `exited with status N`, `killed by signal N (Name)`
+  (`unknown` for a signal `avin.signal` has no name for), `timed out`, and an `Io` error's own
+  `IoError.message()`. WHY: one sentence per variant in `IoError.message`'s lower-case style, the
+  signal's name beside its number as `avin.signal` names them. Alternatives: the number alone;
+  `ExitStatus.message()` as well (not added: nothing needs it yet).
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
