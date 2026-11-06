@@ -1,0 +1,107 @@
+module avin.rt
+
+import sysl.raw.ptr_cast
+
+// The program's exit hooks: Avin code that runs as the program ends, whichever way it ends but a
+// stack overflow, an unwatched signal or a thread the runtime does not know. The library keeps the
+// hooks themselves, in a module-level value, and hands the runtime one closure that runs every hook
+// still registered, newest first, each taken out of the registry before it runs. The thread that ends
+// the program runs that closure once it has begun stopping it: the main thread when `main` returns,
+// the thread that calls `exit`, the thread that traps, after its report.
+//
+// A hook that traps, or calls `exit`, never goes on: the closure is run again on top of it, for the
+// hooks after it, and the program then ends. A trap is reported as one in an exit hook and makes the
+// program end as a trap ends it; an `exit` keeps the status of the ending that ran the hooks.
+
+/** The closure that runs the hooks still registered, and the program's closure runner, which calls
+ * it with the C convention; null until a hook is first registered. The closure is a module-level
+ * value of the library, so it is always a root. */
+private var hooks_closure: *u8 = null
+private var hooks_runner: *u8 = null
+
+/** The context of the thread running the hooks, once it has begun; it is the one thread stopping
+ * the program, so this is never given back. */
+private var hooks_thread: *Context = null
+
+/** How many regions in doubt the thread was inside when the hooks began. */
+private var hooks_doubt: u32 = 0
+
+/** How the program ends once the hooks have run: as a trap, or with `end_status`. */
+private var end_by_trap: bool = false
+private var end_status: int = 0
+
+/** Gives the runtime `run`, the closure that runs the hooks still registered, through `runner`.
+ * Every registration hands over the same closure. */
+@export("avin_rt_exit_hooks")
+exit_hooks(ctx: *Context, run: *u8, runner: *u8)
+    hooks_runner = runner
+    hooks_closure = run
+
+/** Whether the thread of `ctx` is running the exit hooks. */
+in_exit_hook(ctx: *Context) -> bool = hooks_thread == ctx
+
+/** Runs the hooks still registered on the thread of `ctx`. An actor's turn the thread was in no
+ * longer catches a trap, which from now on is the hooks'. */
+private run_hooks(ctx: *Context)
+    if hooks_closure == null then return
+    ctx.recovery = null
+    ctx.caller = null
+    val entry: *extern(*Context, *u8) -> unit = ptr_cast(hooks_runner)
+    entry(ctx, hooks_closure)
+
+/** Runs the exit hooks on the thread of `ctx`, which has begun stopping the program and will end it
+ * as `trapped` and `status` say. They begin once: the thread is recorded first, so an ending reached
+ * from a hook is that hook's. */
+private begin_hooks(ctx: *Context, trapped: bool, status: int)
+    end_by_trap = trapped
+    end_status = status
+    if hooks_closure == null then return
+    hooks_thread = ctx
+    hooks_doubt = ctx.doubt
+    run_hooks(ctx)
+
+/** Ends the process as the ending that ran the hooks said, or as a trap where a hook trapped. */
+private end_now() -> never
+    flush()
+    if end_by_trap then trap()
+    exit(end_status)
+
+/** Ends the program from inside the hook the thread of `ctx` is running, which trapped (reported
+ * already) or called `exit`: the hooks after it run, and the program ends. A trap in a region in
+ * doubt, a lock held, ends the program at once, since a hook may need what the lock guards. */
+private leave_hook(ctx: *Context, trapped: bool) -> never
+    if trapped then end_by_trap = true
+    flush()
+    if trapped && ctx.doubt > hooks_doubt then trap()
+    run_hooks(ctx)
+    end_now()
+
+/** Ends the program for a trap the thread of `ctx` has begun stopping it for and has reported: the
+ * hooks run, then the program stops as a trap stops it. */
+end_trapped(ctx: *Context) -> never
+    if in_exit_hook(ctx) then leave_hook(ctx, true)
+    flush()
+    begin_hooks(ctx, true, 0)
+    end_now()
+
+/** Ends the program with `status` from the thread of `ctx`, which calls `exit`. From inside a hook,
+ * the status is not taken: the hooks after it run and the program ends as it was already ending. */
+exit_after_hooks(ctx: *Context, status: int) -> never
+    if in_exit_hook(ctx) then leave_hook(ctx, false)
+    begin_stop(ctx)
+    flush()
+    begin_hooks(ctx, false, status)
+    end_now()
+
+/** Ends the program from the thread of `ctx` once `main` has returned `status`: the thread begins
+ * stopping it and runs the hooks, and this answers the status for the process to exit with, unless
+ * a hook trapped, when the program ends as a trap ends it. A thread already stopping the program
+ * keeps this one waiting until it has. */
+@export("avin_rt_finish")
+finish(ctx: *Context, status: int) -> int
+    begin_stop(ctx)
+    flush()
+    begin_hooks(ctx, false, status)
+    flush()
+    if end_by_trap then trap()
+    status

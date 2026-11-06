@@ -1,0 +1,57 @@
+module avin.process
+
+// Exit hooks: code the program registers to run as it ends, to put back what it changed outside
+// itself, such as a terminal's mode. The hooks run once each, newest first, on the thread that ends
+// the program: when `main` returns, when any thread calls `exit`, and when a trap stops the program,
+// after the trap's report. A stack overflow runs none, and a signal the program does not watch ends
+// it with none run.
+
+import avin.threads.Atomic
+import avin.threads.Mutex
+
+// A hook as the registry holds it: the number its `ExitHook` cancels it by, and its body.
+private class Entry(val number: long, val body: @sendable () -> unit): Sendable
+
+// The hooks registered and neither run nor cancelled, oldest first.
+private val registered: Mutex[Buffer[Entry]] = Mutex(Buffer[Entry]())
+
+// The number the next hook is given.
+private val numbers = Atomic[long](0)
+
+// Runs every hook still registered, newest first, each taken out before it runs, so one that is left
+// where it stopped is not run again when the runtime calls this once more for the rest. A hook
+// registered while the hooks run is run too, before those registered earlier.
+private runHooks()
+    loop
+        val next = registered.with(b -> if b.isEmpty() then None else Some(b.remove(b.size() - 1)))
+        next match
+            Some(e) -> e.body()
+            None -> return
+
+// What the runtime runs as the program ends, kept here so it stays alive.
+private val running: @sendable () -> unit = runHooks
+
+@intrinsic("exit_hooks")
+private giveHooks(run: () -> unit)
+
+// Registers `body` to run as the program ends, and answers the hook, which may cancel it. Hooks run
+// in the reverse of the order they were registered, each at most once, on the thread that ends the
+// program, while the program's other threads may still be running: a hook uses only what it
+// captured, which is sendable, and should not wait for another thread, which may have stopped.
+onExit(@sendable body: () -> unit) -> ExitHook
+    val n = numbers.add(1)
+    registered.with(b -> b.addOne(Entry(n, body)))
+    giveHooks(running)
+    ExitHook(n)
+
+// A hook registered by `onExit`.
+class ExitHook(private val number: long): Sendable
+    // Takes the hook out, so it does not run, and answers whether it was still registered: `false`
+    // once it has run, or begun to, or was cancelled before.
+    cancel() -> bool
+        val n = number
+        registered.with(b -> b.indexWhere(e -> e.number == n) match
+            -1 -> false
+            i ->
+                b.remove(i)
+                true)
