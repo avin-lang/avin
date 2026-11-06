@@ -338,6 +338,13 @@ standard error first flushes what the program has written to standard output, so
 terminal or one file they arrive in the order the program wrote them. `eprintln(x)` renders `x` (or all its arguments) and its
 new line first and writes them in one write, so a line is never split.
 
+**`flush()` sends a partial line on its way.** `flush()` in the prelude (and `StandardOutput.flush()`,
+and `StandardError.flush()`, which has nothing to send) sends everything written to standard output so
+far out of the buffer whether or not a line is complete, so a program that draws a frame without a
+new line can show it. Nothing buffered is not an error. Reading standard input flushes standard
+output first when it must wait for more, so a prompt written with `print` is on the terminal before
+the program blocks for the answer.
+
 **Tests see no input.** `avin test` gives each test an empty standard input, so a test never waits on
 the terminal it was started from. `avin run` hands the program its own standard input.
 
