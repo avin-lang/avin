@@ -1,0 +1,195 @@
+// Files held open through `avin.fs`: the five ways to open one, reading and writing from a
+// position, seeking, lines, following a growing file, two handles appending, and each misuse an
+// `Err`.
+import avin.fs
+import avin.fs.File
+import avin.io.{IoError, NotFound, Other, InvalidUtf8}
+
+impl[T] Result[T, IoError]
+    get() -> T = self match
+        Ok(v) -> v
+        Err(e) -> fail(s"unexpected $e")
+
+show(r: Result[Array[byte], IoError]) -> string = r match
+    Ok(b) -> b.mkString(" ")
+    Err(e) -> s"Err($e)"
+
+failure(r: Result[File, IoError]) -> string = r match
+    Ok(_) -> "opened"
+    Err(e) -> s"Err($e)"
+
+text(bytes: Array[byte]) -> string = string.fromUtf8Lossy(bytes)
+
+main()
+    val dir = fs.createTempDir("avin-file").get()
+    // An empty file: size 0, position 0, every read empty, no line.
+    fs.writeText(dir + "/empty", "")
+    val e = fs.open(dir + "/empty").get()
+    println(s"${e.size()} ${e.position()} ${show(e.read(10))} ${show(e.readAll())} ${e.readLine()} ${e.readText()}")
+    println(e.close())
+    // One byte.
+    fs.writeBytes(dir + "/one", Array.fill(1, byte(7)))
+    val o = fs.open(dir + "/one").get()
+    println(s"${o.size()} ${show(o.read(10))} ${show(o.read(10))} ${o.position()}")
+    o.close()
+    // A read of zero bytes, and at the end.
+    val lines = dir + "/lines"
+    fs.writeText(lines, "alpha\nbeta\r\n\ngamma")
+    val l = fs.open(lines).get()
+    println(show(l.read(0)))
+    println(show(l.read(3)))
+    println(s"${l.readLine()} ${l.readLine()} ${l.readLine()} ${l.readLine()} ${l.readLine()} ${l.readLine()}")
+    println(s"${l.position()} ${show(l.read(4))}")
+    // Seeking: to the start again, to the middle, past the end, and a negative offset.
+    println(l.seek(6))
+    println(s"${l.position()} ${l.readLine()}")
+    println(l.seek(1000))
+    println(s"${l.position()} ${show(l.read(4))} ${l.readLine()} ${l.readText()}")
+    println(l.seek(-1))
+    println(l.seekToEnd())
+    println(s"${l.position()} ${show(l.read(1))}")
+    println(l.seek(0))
+    println(l.readText())
+    l.close()
+    // Text through a buffer: Unicode and a long line across the 8192-byte chunk.
+    val uni = dir + "/uni"
+    val wide = "é".repeat(5000) + "\n" + "✓".repeat(3000) + "\n😀x"
+    fs.writeText(uni, wide)
+    val u = fs.open(uni).get()
+    val a = u.readLine().get().get()
+    val b = u.readLine().get().get()
+    val c = u.readLine().get().get()
+    println(s"${a == "é".repeat(5000)} ${b == "✓".repeat(3000)} $c ${u.readLine()}")
+    u.close()
+    // A character split across the buffer boundary: 8191 ASCII bytes, then a 3-byte character.
+    fs.writeText(uni, "a".repeat(8191) + "✓" + "\n")
+    val s = fs.open(uni).get()
+    println(s.readLine().get().get() == "a".repeat(8191) + "✓")
+    s.close()
+    fs.writeText(uni, "a".repeat(8191) + "😀")
+    val s2 = fs.open(uni).get()
+    println(s2.readText().get() == "a".repeat(8191) + "😀")
+    s2.close()
+    // Not UTF-8: text is an error with the offset, a line has U+FFFD.
+    fs.writeBytes(dir + "/bad", Array.tabulate(3, i -> if i == 2 then byte(0xff) else byte(65)))
+    val bad = fs.open(dir + "/bad").get()
+    println(bad.readText())
+    bad.seek(0)
+    println(bad.readLine())
+    bad.close()
+    // read(n) takes from what a line read ahead.
+    val r = fs.open(lines).get()
+    println(s"${r.readLine()} ${text(r.read(4).get())} ${r.position()} ${r.readLine()}")
+    r.close()
+    // Writing: create empties, and the handle is write-only.
+    val w = fs.create(dir + "/w").get()
+    println(s"${w.writeText("hello ")} ${w.writeText("wörld")} ${w.write(Array.fill(1, byte(33)))}")
+    println(s"${w.size()} ${w.position()} ${w.read(1)} ${w.readLine()} ${w.readText()}")
+    println(w.close())
+    println(fs.readText(dir + "/w"))
+    val w2 = fs.create(dir + "/w").get()
+    println(w2.close())
+    println(fs.readText(dir + "/w"))
+    // Write at a position: seek and overwrite, then a gap past the end.
+    val up = fs.createUpdate(dir + "/up").get()
+    up.writeText("0123456789")
+    up.seek(2)
+    up.writeText("ab")
+    println(s"${up.position()} ${up.size()}")
+    up.seek(0)
+    println(up.readText())
+    up.seek(14)
+    up.writeText("Z")
+    up.seek(0)
+    println(show(up.read(100)))
+    // Read ahead then write: the write lands at the logical position.
+    up.seek(0)
+    println(up.readLine())
+    up.seek(3)
+    up.read(2)
+    up.writeText("__")
+    up.seek(0)
+    println(text(up.readAll().get()))
+    up.close()
+    val ou = fs.openUpdate(dir + "/up").get()
+    println(s"${ou.position()} ${ou.read(3).get().length()}")
+    ou.close()
+    // Reading a write-only file and writing a read-only one are errors, not empty answers.
+    val ro = fs.open(dir + "/up").get()
+    println(ro.writeText("x"))
+    println(ro.flush())
+    ro.close()
+    val wo = fs.create(dir + "/wo").get()
+    println(wo.readLine())
+    println(wo.readAll())
+    println(show(wo.read(1)))
+    wo.close()
+    // Append: two handles interleave, each write whole, at the end.
+    val ap = dir + "/log"
+    val a1 = fs.append(ap).get()
+    val a2 = fs.append(ap).get()
+    a1.writeText("one\n")
+    a1.flush()
+    a2.writeText("two\n")
+    a2.flush()
+    a1.writeText("three\n")
+    a1.close()
+    a2.writeText("four\n")
+    a2.close()
+    println(fs.readText(ap))
+    fs.appendText(ap, "five\n")
+    val a3 = fs.append(ap).get()
+    a3.writeText("six\n")
+    a3.close()
+    println(fs.readText(ap).get().split("\n").length())
+    // A file followed while it grows: complete lines only, the half line waits.
+    val follow = dir + "/follow"
+    val writer = fs.create(follow).get()
+    val reader = fs.open(follow).get()
+    println(reader.readCompleteLine())
+    writer.writeText("first\nsec")
+    writer.flush()
+    println(s"${reader.readCompleteLine()} ${reader.readCompleteLine()} ${reader.position()}")
+    writer.writeText("ond\nthird\n")
+    writer.flush()
+    println(s"${reader.readCompleteLine()} ${reader.readCompleteLine()} ${reader.readCompleteLine()}")
+    writer.writeText("tail")
+    writer.flush()
+    println(s"${reader.readCompleteLine()} ${reader.readLine()} ${reader.readLine()}")
+    writer.writeText("s\n")
+    writer.flush()
+    println(show(reader.read(10)))
+    println(s"${reader.size()} ${reader.position()}")
+    // Starting a follow at the end of what is there.
+    val late = fs.open(follow).get()
+    late.seekToEnd()
+    writer.writeText("new\n")
+    writer.flush()
+    println(late.readCompleteLine())
+    late.close()
+    reader.close()
+    writer.close()
+    // Closed handles: every call an Err, closing again fine.
+    val k = fs.open(lines).get()
+    println(s"${k.isClosed()} ${k.close()} ${k.isClosed()} ${k.close()}")
+    println(s"${k.size()} ${k.position()} ${k.seek(0)} ${k.seekToEnd()}")
+    println(s"${show(k.read(1))} ${show(k.readAll())} ${k.readText()} ${k.readLine()} ${k.readCompleteLine()}")
+    println(s"${k.writeText("x")} ${k.write(Array.fill(1, byte(1)))} ${k.flush()}")
+    val kw = fs.create(dir + "/kw").get()
+    kw.close()
+    println(kw.writeText("x"))
+    // Missing files and directories, in each way of opening.
+    println(failure(fs.open(dir + "/missing")))
+    println(failure(fs.openUpdate(dir + "/missing")))
+    println(failure(fs.create(dir + "/no/such/dir/f")))
+    println(failure(fs.append(dir + "/no/such/dir/f")))
+    println(failure(fs.createUpdate(dir + "/no/such/dir/f")))
+    println(fs.readBytesFrom(dir + "/missing", 0))
+    println(fs.readTail(dir + "/missing", 5))
+    println(fs.readTailLines(dir + "/missing", 5))
+    // A directory is no file to open for reading data from.
+    println(failure(fs.open(dir)))
+    println(failure(fs.openUpdate(dir)))
+    println(failure(fs.create(dir)))
+    println(failure(fs.append(dir)))
+    fs.removeDirAll(dir)

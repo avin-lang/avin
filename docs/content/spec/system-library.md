@@ -343,6 +343,59 @@ for name in fs.listDir(dir)?
     if name.endsWith(".txt") then println(name)
 ```
 
+### Open files
+
+A file held open is a `File`, for a program that reads or writes a file piece by piece, follows one
+another program is writing, or adds to a log.
+
+```text
+import avin.fs
+import avin.threads.sleep
+
+follow(log: string) -> Result[unit, IoError]
+    val f = fs.open(log)?
+    f.seekToEnd()?
+    while true
+        f.readCompleteLine()? match
+            Some(line) -> println(line)
+            None -> sleep(250.millis())
+```
+
+| Function | Meaning |
+| --- | --- |
+| `open(file) -> Result[File, IoError]` | The existing file, for reading, at its start; `IsADirectory` for a directory. |
+| `create(file)` | For writing, made if it is not there and emptied if it is. |
+| `append(file)` | For writing, made if it is not there; every write goes to the end, whatever other handles append to the same file. |
+| `openUpdate(file)` | The existing file, for reading and writing, keeping what it holds. |
+| `createUpdate(file)` | For reading and writing, made if it is not there and emptied if it is. |
+| `readBytesFrom(file, offset) -> Result[Array[byte], IoError]` | Every byte from `offset` on, empty at or past the end: what was appended since a program last read to `offset`. A negative offset traps. |
+| `readTail(file, maxBytes) -> Result[string, IoError]` | The last `maxBytes` bytes as text, reading only those. |
+| `readTailLines(file, count) -> Result[Vector[string], IoError]` | The last `count` lines, without terminators, fewer where there are fewer. |
+
+| Method on `File` | Meaning |
+| --- | --- |
+| `size()` | The bytes the file holds now, other handles' writes included. |
+| `position()`, `seek(offset)`, `seekToEnd()` | The position counted from the start; `seek` past the end is allowed (a read there is empty, a write leaves zero bytes between), a negative offset is an `Err`; `seekToEnd` goes to the end as it is now. |
+| `read(max)` | Up to `max` bytes, fewer only at the end of the file; empty at the end. Negative `max` traps. |
+| `readAll()`, `readText()` | The rest of the file as bytes, or as text (`InvalidUtf8`, the offset counted from the position the read began at). |
+| `readLine()`, `readCompleteLine()` | The next line, `None` at the end. `readLine` also answers a last line with no `\n`; `readCompleteLine` answers only a line ended by `\n`, and leaves later bytes unread, so a line another program is still writing arrives whole. |
+| `write(bytes)`, `writeText(text)` | Writes at the position, buffered. |
+| `flush()`, `close()` | `flush` hands what is written to the platform, so other handles and programs see it. `close` flushes and releases; closing twice is fine. |
+
+**One position serves reading and writing**, and lines, `read` and `position` agree on it: bytes the
+file has buffered ahead are never lost to a `seek`, a `write` or a `read`. **A read at the end does
+not end the file's life**: a file that grew meanwhile gives the new bytes to the next read, so no
+reopening is needed to follow it. **A file closed by `close` answers every call with an `Err`**, as does
+reading a file opened only to write and writing one opened only to read; none of them is an empty
+answer that looks like the end of the file. A forgotten file is closed when the collector frees it. A
+file belongs to the thread that opened it and is not handed to another. Calls that read and write wait
+as the calls of `avin.fs` above do, which is to say they do not park a lightweight thread.
+
+**A tail starts at a whole character.** When `readTail` begins in the middle of a UTF-8 sequence it
+skips the rest of that sequence, so the text never starts with a stray byte; bytes that are not UTF-8
+elsewhere become U+FFFD, since a log's last lines are read to be looked at and not to be refused.
+Lines are decoded the same way, a `\r` before the `\n` going with it.
+
 ## `avin.time`
 
 Clocks, lengths of time, the calendar and time zones, in eight types: `Instant` (a point on the

@@ -141,6 +141,291 @@ createDirAll(dir: string) -> Result[unit, IoError] = syslMakeDirAll(dir).mapErr(
 // when it is done.
 createTempDir(prefix: string) -> Result[string, IoError] = syslMakeTempDir(prefix).mapErr(ioError)
 
+// A file Sysl holds open. It closes when it is closed or, for one the program forgot, when the
+// collector frees it.
+@sysl("sysl.fs.File")
+private class SyslFile
+    size() -> Result[long, SyslError]
+    tell() -> Result[long, SyslError]
+    seek(to: long) -> Result[unit, SyslError]
+    read(into: Array[byte]) -> Array[byte]
+    write(bytes: Array[byte])
+    failed() -> bool
+    flush() -> Result[unit, SyslError]
+    @sysl("close")
+    release() -> Result[unit, SyslError]
+
+@sysl("sysl.fs.open")
+private syslOpen(file: string) -> Result[SyslFile, SyslError]
+
+@sysl("sysl.fs.create")
+private syslCreate(file: string) -> Result[SyslFile, SyslError]
+
+@sysl("sysl.fs.append")
+private syslAppend(file: string) -> Result[SyslFile, SyslError]
+
+@sysl("sysl.fs.open_update")
+private syslOpenUpdate(file: string) -> Result[SyslFile, SyslError]
+
+@sysl("sysl.fs.create_update")
+private syslCreateUpdate(file: string) -> Result[SyslFile, SyslError]
+
+// How much a line or a read-everything call takes from the file at once.
+private val ChunkSize = 8192
+
+private closedError() -> IoError = io.Other("the file is closed")
+
+private notReadable() -> IoError = io.Other("the file is not open for reading")
+
+private notWritable() -> IoError = io.Other("the file is not open for writing")
+
+// The text of the bytes `from` up to `until`, a `\r` at the end dropped, bytes that are not UTF-8
+// becoming U+FFFD.
+private lineText(bytes: Array[byte], from: int, until: int) -> string
+    val stop = if until > from && bytes(until - 1) == byte(13) then until - 1 else until
+    string.fromUtf8Lossy(bytes.slice(from, stop))
+
+// A file held open, made by `open`, `create`, `append`, `openUpdate` or `createUpdate`. Reading and
+// writing go on from one position, which `seek` moves and `position` tells; a file opened to append
+// writes at its end whatever the position. Reading takes up where the last read stopped, and a file
+// that has grown since a read reached its end gives the new bytes to the next read, so a program can
+// follow a file another writes. A file belongs to the thread that opened it. It is closed by `close`
+// or, if the program forgot, when the collector frees it; every call on a closed file is an `Err`.
+class File(private val handle: SyslFile, private val readable: bool, private val writable: bool,
+        private var ahead: Array[byte], private var at: int, private var closed: bool)
+    // How many bytes the file holds now, what other handles have written included.
+    size() -> Result[long, IoError]
+        if closed then return Err(closedError())
+        handle.size().mapErr(ioError)
+
+    // Where the next read or write happens, in bytes from the start of the file.
+    position() -> Result[long, IoError]
+        if closed then return Err(closedError())
+        val sysl = handle.tell().mapErr(ioError)?
+        Ok(sysl - long(ahead.length() - at))
+
+    // Moves to `offset` bytes from the start. Past the end is allowed: a read there finds the end
+    // and a write leaves a gap of zero bytes. A negative offset is an `Err`.
+    seek(offset: long) -> Result[unit, IoError]
+        if closed then return Err(closedError())
+        if offset < 0 then return Err(io.Other(s"a negative offset: $offset"))
+        ahead = Array.empty[byte]()
+        at = 0
+        handle.seek(offset).mapErr(ioError)
+
+    // Moves to the end of the file as it is now, so the next read waits for what is written after.
+    seekToEnd() -> Result[unit, IoError]
+        seek(size()?)
+
+    // Up to `max` bytes from the position, fewer only where the file ends first; empty at the end.
+    // A `max` below zero traps.
+    read(max: int) -> Result[Array[byte], IoError]
+        if closed then return Err(closedError())
+        if !readable then return Err(notReadable())
+        if max < 0 then fail(s"a read of $max bytes: a read takes none or more")
+        if max == 0 then return Ok(Array.empty[byte]())
+        if at < ahead.length()
+            val end = if ahead.length() - at > max then at + max else ahead.length()
+            val taken = ahead.slice(at, end)
+            at = end
+            return Ok(taken)
+        pull(max)
+
+    // Everything from the position to the end of the file as it is while the read runs.
+    readAll() -> Result[Array[byte], IoError]
+        if closed then return Err(closedError())
+        if !readable then return Err(notReadable())
+        val all = Buffer[byte]()
+        for k in at..<ahead.length()
+            all.addOne(ahead(k))
+        ahead = Array.empty[byte]()
+        at = 0
+        while true
+            val more = pull(65536)?
+            if more.length() == 0 then return Ok(all.toArray())
+            all.addAll(more)
+        Ok(all.toArray())
+
+    // Everything from the position to the end as text; `InvalidUtf8` where it is not UTF-8, the
+    // offset counted from the position the read started at.
+    readText() -> Result[string, IoError]
+        val bytes = readAll()?
+        string.fromUtf8(bytes) match
+            Ok(text) -> Ok(text)
+            Err(e) -> Err(io.InvalidUtf8(e.offset))
+
+    // The next line without its terminator, or `None` at the end of the file. A line ends at `\n`,
+    // a `\r` before it going too; the last line needs no terminator, and a file another program is
+    // still writing may give half of it. Bytes that are not UTF-8 become U+FFFD.
+    readLine() -> Result[Option[string], IoError] = nextLine(false)
+
+    // As `readLine`, but only a line that ends at `\n`: the bytes after the last one are left
+    // unread, and a later call finds the line whole once its end is written. This is the call to
+    // follow a log with.
+    readCompleteLine() -> Result[Option[string], IoError] = nextLine(true)
+
+    // Writes all of `bytes` at the position.
+    write(bytes: Array[byte]) -> Result[unit, IoError]
+        if closed then return Err(closedError())
+        if !writable then return Err(notWritable())
+        unread()?
+        handle.write(bytes)
+        if handle.failed() then Err(io.Other("the write failed")) else Ok(())
+
+    // Writes `text` as UTF-8.
+    writeText(text: string) -> Result[unit, IoError]
+        write(Array.tabulate(text.byteLength(), i -> text.byteAt(i)))
+
+    // Hands what has been written to the platform, so another handle or program reading the file
+    // sees it. A failure that only now shows, a full disk, is the `Err`.
+    flush() -> Result[unit, IoError]
+        if closed then return Err(closedError())
+        handle.flush().mapErr(ioError)
+
+    // Flushes and releases the file; closing a closed file is not an error. Every later call
+    // answers an `Err`.
+    close() -> Result[unit, IoError]
+        if closed then return Ok(())
+        closed = true
+        ahead = Array.empty[byte]()
+        at = 0
+        handle.release().mapErr(ioError)
+
+    // Whether `close` has been called.
+    isClosed() -> bool = closed
+
+    // Up to `max` bytes from the file itself.
+    private pull(max: int) -> Result[Array[byte], IoError]
+        val got = handle.read(Array.fill(max, byte(0)))
+        if got.length() == 0 && handle.failed() then Err(io.Other("the read failed")) else Ok(got)
+
+    // Gives back what was read ahead and not handed out, so the file's own position is the
+    // logical one, which a write needs.
+    private unread() -> Result[unit, IoError]
+        val left = ahead.length() - at
+        if left > 0
+            val sysl = handle.tell().mapErr(ioError)?
+            handle.seek(sysl - long(left)).mapErr(ioError)?
+        ahead = Array.empty[byte]()
+        at = 0
+        Ok(())
+
+    // Reads one more chunk after what is unread; false at the end of the file.
+    private fill() -> Result[bool, IoError]
+        val more = pull(ChunkSize)?
+        if more.length() == 0 then return Ok(false)
+        val all = Buffer[byte]()
+        for k in at..<ahead.length()
+            all.addOne(ahead(k))
+        all.addAll(more)
+        ahead = all.toArray()
+        at = 0
+        Ok(true)
+
+    private nextLine(terminated: bool) -> Result[Option[string], IoError]
+        if closed then return Err(closedError())
+        if !readable then return Err(notReadable())
+        var scanned = 0
+        while true
+            var i = at + scanned
+            while i < ahead.length() && ahead(i) != byte(10)
+                i += 1
+            if i < ahead.length()
+                val text = lineText(ahead, at, i)
+                at = i + 1
+                return Ok(Some(text))
+            scanned = ahead.length() - at
+            val more = fill()?
+            if !more
+                if terminated || scanned == 0 then return Ok(None)
+                val text = lineText(ahead, at, ahead.length())
+                at = ahead.length()
+                return Ok(Some(text))
+        Ok(None)
+
+// Opens the existing file `file` for reading, at its start. A directory is `IsADirectory`.
+open(file: string) -> Result[File, IoError]
+    if isDir(file) then return Err(io.IsADirectory)
+    syslOpen(file).mapErr(ioError).map(h -> File(h, true, false, Array.empty[byte](), 0, false))
+
+// Opens `file` for writing, making it if it is not there and emptying it if it is.
+create(file: string) -> Result[File, IoError]
+    syslCreate(file).mapErr(ioError).map(h -> File(h, false, true, Array.empty[byte](), 0, false))
+
+// Opens `file` for writing at its end, making it if it is not there. Every write goes to the end,
+// however many handles append to the file at once.
+append(file: string) -> Result[File, IoError]
+    syslAppend(file).mapErr(ioError).map(h -> File(h, false, true, Array.empty[byte](), 0, false))
+
+// Opens the existing file `file` for reading and writing, at its start, keeping what it holds.
+openUpdate(file: string) -> Result[File, IoError]
+    if isDir(file) then return Err(io.IsADirectory)
+    syslOpenUpdate(file).mapErr(ioError).map(h -> File(h, true, true, Array.empty[byte](), 0, false))
+
+// Opens `file` for reading and writing, making it if it is not there and emptying it if it is.
+createUpdate(file: string) -> Result[File, IoError]
+    syslCreateUpdate(file).mapErr(ioError).map(h -> File(h, true, true, Array.empty[byte](), 0, false))
+
+// Every byte of `file` from `offset` on, empty where the file is no longer than `offset`: what has
+// been appended since a program last read to `offset`. A negative `offset` traps.
+readBytesFrom(file: string, offset: long) -> Result[Array[byte], IoError]
+    if offset < 0 then fail(s"a read from offset $offset: an offset is not negative")
+    val f = open(file)?
+    f.seek(offset)?
+    val bytes = f.readAll()
+    f.close()
+    bytes
+
+// The last `maxBytes` bytes of `file` as text, read without reading the rest. A start in the middle
+// of a character skips the rest of that character, so the text begins at a whole one; bytes that are
+// not UTF-8 elsewhere become U+FFFD. A `maxBytes` below zero traps.
+readTail(file: string, maxBytes: long) -> Result[string, IoError]
+    if maxBytes < 0 then fail(s"a tail of $maxBytes bytes: a tail takes none or more")
+    val f = open(file)?
+    val size = f.size()?
+    val from = if size > maxBytes then size - maxBytes else long(0)
+    f.seek(from)?
+    val bytes = f.readAll()?
+    f.close()
+    var k = 0
+    if from > 0
+        while k < bytes.length() && (int(bytes(k)) & 0xc0) == 0x80
+            k += 1
+    Ok(string.fromUtf8Lossy(bytes.slice(k, bytes.length())))
+
+// The last `count` lines of `file`, fewer where it has fewer, without their terminators, read from
+// the end without reading the rest. A file's final `\n` ends its last line rather than starting an
+// empty one. A `count` below zero traps.
+readTailLines(file: string, count: int) -> Result[Vector[string], IoError]
+    if count < 0 then fail(s"a tail of $count lines: a tail takes none or more")
+    if count == 0 then return Ok(Vector.empty[string]())
+    val f = open(file)?
+    val size = f.size()?
+    // Walk back a block at a time until the region holds `count` newlines, not counting one that
+    // ends the file: dropping the first, partial line then leaves `count` whole ones.
+    var from = size
+    var newlines = 0
+    while from > 0 && newlines < count
+        val block = if from > long(ChunkSize) then ChunkSize else int(from)
+        from -= long(block)
+        f.seek(from)?
+        val got = f.read(block)?
+        for k in 0..<got.length()
+            if got(k) == byte(10) && from + long(k) < size - 1 then newlines += 1
+    f.seek(from)?
+    val bytes = f.readAll()?
+    f.close()
+    val lines = Buffer[string]()
+    var start = 0
+    var first = from > 0
+    for k in 0..<bytes.length()
+        if bytes(k) == byte(10)
+            if first then first = false else lines.addOne(lineText(bytes, start, k))
+            start = k + 1
+    if start < bytes.length() && !first then lines.addOne(lineText(bytes, start, bytes.length()))
+    val all = lines.toVector()
+    Ok(if all.length() > count then all.slice(all.length() - count, all.length()) else all)
+
 // The names of the entries of the directory `dir`, without `dir` before them and without `.` and
 // `..`, sorted by code point, so two listings of an unchanged directory agree. A name that is not
 // UTF-8 makes the whole listing `InvalidUtf8`.

@@ -4174,6 +4174,57 @@ spelling is better, as each entry says.
 
 ## Proposed
 
+**Open files in `avin.fs`** (branch `fs-file`, for the job manager's log following and event log; the
+[system library](/spec/system-library/#open-files) chapter has the surface). Each choice below the
+spec did not settle; the user may want to revisit the first two.
+
+- **Proposed: the type is `File`, opened by `fs.open`, `create`, `append`, `openUpdate` and
+  `createUpdate`.** WHY: the five modes cover every combination a program asks for, named for what
+  happens to what is already there, as Sysl names them, and the whole-file functions keep their names.
+  ALTERNATIVES: an `OpenMode` argument (one function, but a mode a program can get wrong at runtime
+  and a longer call for the common case); only read, create and append (no way to overwrite part of a
+  file).
+- **Proposed: a `File` is not `Sendable`.** WHY: its Sysl handle belongs to the thread that opened it,
+  and a program that wants another thread to use a file opens it there; `TcpStream`'s hand-over
+  machinery buys nothing for a file a program can reopen. ALTERNATIVES: make it `Sendable` with the
+  owner check a `TcpStream` has. Review with the user if a file must move between actors.
+- **Proposed: seeking is from the start only, plus `seekToEnd()`; a negative offset is an `Err`, a
+  seek past the end is allowed.** WHY: following a log needs "start at the end", and a tail needs
+  absolute offsets, which `size()` gives; offsets back from the end are `size() - n`, with no second
+  vocabulary. ALTERNATIVES: a `Whence` argument; a signed offset meaning from the end.
+- **Proposed: `readLine` answers an unterminated last line; `readCompleteLine` does not, and leaves
+  the partial line unread.** WHY: a file followed while another program writes it shows half a line
+  at some moment, and a follower must not act on it; a file read to its end wants the last line even
+  with no `\n`. ALTERNATIVES: one `readLine` with the first meaning (torn lines when following), or
+  the second (the last line of a file with no final newline lost).
+- **Proposed: `read(max)` and the line calls share one buffer of the `File`'s own, and `position()`
+  is the logical position (the file's, minus what is buffered and unread).** WHY: lines need a
+  buffer, and `read`, `seek` and `write` have to agree with it. A `write` or `seek` gives the
+  buffered bytes back first. ALTERNATIVES: separate byte and line modes (a program mixing them gets
+  surprises).
+- **Proposed: a read at the end is not sticky.** WHY: following a growing file is the point; the next
+  read asks the file again. ALTERNATIVES: a latched end that `seek` clears (Sysl's own flag is not
+  used).
+- **Proposed: misuse is an `Err`, not a trap: a call on a closed file, a read of a write-only file,
+  a write to a read-only one, a negative seek offset; a negative `max` or `count` or tail size traps**
+  like `TcpStream.read`'s, being a program mistake at the call. WHY: the first group depends on the
+  state the program's files are in at runtime. The `Err` for those is `Other` with a plain sentence,
+  as `TcpStream`'s closed connection is. ALTERNATIVES: a dedicated `IoError` variant for a closed file
+  (more to match on for a rare case).
+- **Proposed: `readTail(file, maxBytes)` answers text, begins at a whole character, and replaces
+  invalid bytes with U+FFFD; `readTailLines(file, count)` answers lines.** WHY: the caller wants to
+  print or search the end of a log, where a cut character is garbage and an invalid byte elsewhere
+  should not refuse the whole tail. A start inside a UTF-8 sequence skips the rest of that sequence
+  (continuation bytes), never reading earlier bytes to complete it, so exactly the bytes asked for
+  or fewer come back. ALTERNATIVES: back up to include the whole character (more than `maxBytes`);
+  answer bytes and leave decoding to the caller; `InvalidUtf8` for a cut start.
+- **Proposed: opening a directory for reading or updating is `IsADirectory`.** WHY: the platform
+  opens a directory for reading and fails only at the first read, which would show up as an
+  unexplained failed read. ALTERNATIVES: leave it to the read.
+- **Proposed: the calls do not park a lightweight thread.** WHY: the whole-file `avin.fs` calls do
+  not either, and a regular file's read does not wait for a peer. ALTERNATIVES: bind them
+  `blocking` (needed only for files on a stalled network mount).
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
