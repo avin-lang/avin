@@ -124,7 +124,9 @@ Their methods:
 
 An `Option` also has `toRight[L](left: -> L) -> Either[L, T]` and `toLeft[R](right: -> R) ->
 Either[T, R]`, which put its value on one side of an [`Either`](#either) and the argument, evaluated
-only for `None`, on the other. It also has `iterator()` (one element or none) and `knownSize()` (1 or 0), an
+only for `None`, on the other. It also has `okOr[E](error: E) -> Result[T, E]` and
+`okOrElse[E](f: () -> E) -> Result[T, E]`, giving `Ok` of the value or `Err` of the error, which
+`okOrElse` calls only for `None` (`Result`'s `ok()` and `err()` go the other way). It also has `iterator()` (one element or none) and `knownSize()` (1 or 0), an
 `Option[(A, B)]` has `unzip()` giving the two options, an `Option[Option[T]]` also has `flatten()`, and an `Option` has `nonEmpty()` beside `isDefined()` and
 `isEmpty()`. There is no `orNull`, since Avin has no null.
 

@@ -4365,6 +4365,20 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- **`Option.okOr` / `okOrElse` and `CommandError.message()`** (branch `okor-command-message`).
+  `Option[T]` gains `okOr[E](error: E) -> Result[T, E]` and `okOrElse[E](f: () -> E)`, the `Result`
+  counterparts of `toRight`; `Result.ok()` and `err()` already existed. `okOr` takes its argument
+  by value and `okOrElse` a function called only for `None`. WHY: the two names say which form
+  evaluates; the by-name form already exists as a lambda call, and a by-name `okOr` would leave
+  `okOrElse` redundant. Alternatives: a by-name `okOr` only (as `toRight` is; one method, but an
+  argument with effects reads as eager and is not), or `toRight`-style names (`toOk`). Review
+  with the user if `okOr`'s eagerness should instead match `toRight`'s.
+  `CommandError.message() -> string` reads `exited with status N`, `killed by signal N (Name)`
+  (`unknown` for a signal `avin.signal` has no name for), `timed out`, and an `Io` error's own
+  `IoError.message()`. WHY: one sentence per variant in `IoError.message`'s lower-case style, the
+  signal's name beside its number as `avin.signal` names them. Alternatives: the number alone;
+  `ExitStatus.message()` as well (not added: nothing needs it yet).
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

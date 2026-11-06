@@ -203,6 +203,10 @@ data CommandError
     Failed(status: ExitStatus)
 ```
 
+`CommandError` has `message() -> string`, as `IoError` does: an `Io` error's own message,
+`exited with status 1`, `killed by signal 15 (Terminate)` (the name of a signal of `avin.signal`,
+`unknown` for any other number) or `timed out`.
+
 `isSuccess()` is `true` of `Exited(0)` alone. A program that is not there fails to start: `run`
 answers `Err(NotFound)` and `output` `Err(Io(NotFound))`.
 
