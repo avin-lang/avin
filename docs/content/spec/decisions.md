@@ -3957,11 +3957,32 @@ spelling is better, as each entry says.
     a pointer, `inout` or in an `Option`; each object is its own, compared by identity, and
     sendable, since it is an immutable copy. *Alternative*: also `out` and `const T *`, which no
     surveyed binding needs.
+- Settled by the user 2026-11-06: **concurrency that waits is written as straight-line blocking
+  code, run on lightweight threads; Avin has no `async` or `await` keywords.** A lightweight thread
+  is a runtime-scheduled thread with a stack of its own; a few operating system threads, about one
+  per core, run whichever are ready. A call that would wait (a socket read, `Future.await`, a
+  channel, `sleep`, a lock) parks only its lightweight thread: the runtime records what it waits
+  on (a socket through the runtime's poller over kqueue or epoll, a future, a timer), and runs another on the
+  same operating system thread. `spawn`, the futures' pool and actors' turns come to run on
+  lightweight threads, so the APIs that exist today keep their meaning and become cheap; a server
+  holds one lightweight thread or one actor per connection, and a connection that waits holds no
+  operating system thread. Concurrency stays explicit: `Future(body)` to start work and `await()`
+  on it, `Future.all` and `Future.first`, channels and `scope`.
+  *Why*: no division of functions into those that may wait and those that may not, so one library
+  serves every caller and any function at any depth may wait; an ordinary call allocates nothing;
+  existing code needs no change. *Alternatives*: stackless `async` functions compiled to state
+  machines (smaller per waiting task, in the hundreds of bytes, but every function on the path to
+  a wait marked `async`, libraries split in two, and an actor's state open to change at each
+  `await`); `async`/`await` as sugar over lightweight threads (`async def` a `Future`, `await e`
+  `e.await()`), declined as a second spelling of what `Future` already says.
+  *Consequences*: a stack per lightweight thread, reserved large and committed as touched (at
+  least a page, 16 KB on arm64, per lightweight thread), with moving parked frames to the heap a
+  later reduction; the collector scans parked stacks; a C call that blocks holds its operating
+  system thread, as `blocking` already accounts for.
 
 **Deferred**
 
 - Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
 
 ## Proposed
 
@@ -3983,5 +4004,12 @@ spelling is better, as each entry says.
   - Whether manifests gain machine conditions (Sysl's `if`, `choices`, `targets`) once Avin builds
     for more than one target.
 
+- Lightweight threads, the open parts of the settled design above: **cancellation** (proposed
+  direction: a `scope` ending cancels its lightweight threads, each answering an `Err` or trapping
+  at its next wait); **keeping user-interface work on the main thread** (a scheduler that runs a
+  lightweight thread on the main operating system thread only, which also gives the `ui` package
+  its change from another thread); **stack size and growth** (a fixed reservation first; parked
+  frames moved to the heap later); and **the collector's scan of parked stacks**, which needs the
+  gc library's support.
 - Resource cleanup: a `defer` construct or a library `use`.
 - Whether mailboxes may be bounded, and what a `tell` to a full one does, since `tell` never waits.
