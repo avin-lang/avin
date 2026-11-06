@@ -47,6 +47,12 @@ struct CParam
     /** The name of the array parameter whose length this parameter carries, `length(data)`, or "".
      * Such a parameter is no Avin parameter: it is filled in from the array. */
     length_of: string
+    /** Whether the parameter is the `void *` marked `userdata`, which carries a callback's closure and
+     * is no Avin parameter. */
+    userdata: bool
+    /** For a parameter taking a function, the function pointer's own prototype, named by the
+     * parameter, one entry; empty for any other parameter. */
+    callback: Buf[CPrototype]
 
 /** How a prototype's parameter crosses: passed in, or `out`, a pointer C writes a value through that
  * is part of the binding's result, or `inout`, one C is also passed a value through. */
@@ -117,29 +123,62 @@ parse_prototype(text: string) -> Result[CPrototype, string]
     if at >= tokens.len() || tokens[at] != "("
         return Err(s"`$symbol` is not followed by its parameters in parentheses")
     at += 1
+    val params = c_param_list(tokens, &at, false)?
+    if at < tokens.len() && tokens[at] == ";" then at += 1
+    if at < tokens.len() then return Err(s"`${tokens[at]}` follows the parameter list")
+    c_check_lengths(params)?
+    c_check_callbacks(params)?
+    Ok(CPrototype(symbol, declared.ty, declared.text, params))
+
+// The parameters of a parameter list from `tokens[*at]`, just after its `(`, through its `)`. A
+// callback's own list, `inner`, takes no `out`, `inout` or `length` parameter and no function.
+private c_param_list(tokens: Buf[string], at: *usize, inner: bool) -> Result[Buf[CParam], string]
     var params: Buf[CParam] = buf()
-    if at + 1 < tokens.len() && tokens[at] == "void" && tokens[at + 1] == ")"
-        at += 1
-    elif at < tokens.len() && tokens[at] != ")"
+    if *at + 1 < tokens.len() && tokens[*at] == "void" && tokens[*at + 1] == ")"
+        *at = *at + 1
+    elif *at < tokens.len() && tokens[*at] != ")"
         loop
-            if at < tokens.len() && tokens[at] == "..."
+            if *at < tokens.len() && tokens[*at] == "..."
                 return Err("a variadic function cannot be bound: the types of the arguments `...` takes cannot be checked")
             var length_of = ""
-            if at < tokens.len() && tokens[at] == "length"
-                if at + 3 >= tokens.len() || tokens[at + 1] != "(" || !is_c_word(tokens[at + 2]) || tokens[at + 3] != ")"
+            if *at < tokens.len() && tokens[*at] == "length"
+                if inner then return Err("a callback's parameter marked `length(...)` carries the length of memory C lends the callback, which crosses as a `ByteView`, and views lent to a callback are not implemented")
+                if *at + 3 >= tokens.len() || tokens[*at + 1] != "(" || !is_c_word(tokens[*at + 2]) || tokens[*at + 3] != ")"
                     return Err("`length` names the array parameter whose length the parameter carries, in parentheses, as in `length(data) size_t n`")
-                length_of = tokens[at + 2]
-                at += 4
-                if at < tokens.len() && tokens[at] == "out"
+                length_of = tokens[*at + 2]
+                *at = *at + 4
+                if *at < tokens.len() && tokens[*at] == "out"
                     return Err(s"a length is filled in from the array `$length_of`, so `length($length_of)` marks a parameter passed in, or an `inout` pointer C writes the length it used through, not an `out` one")
             var mode = CIn
-            if at < tokens.len() && (tokens[at] == "out" || tokens[at] == "inout")
-                mode = if tokens[at] == "out" then COut else CInOut
-                at += 1
-            val p = c_declaration(tokens, &at)?
-            if at < tokens.len() && tokens[at] == "("
-                return Err("a parameter taking a function cannot cross a C binding: callbacks are not implemented")
+            if *at < tokens.len() && (tokens[*at] == "out" || tokens[*at] == "inout")
+                if inner then return Err(s"a callback's parameter is what C calls it with, so it is never `${tokens[*at]}`")
+                mode = if tokens[*at] == "out" then COut else CInOut
+                *at = *at + 1
+            var userdata = false
+            if *at < tokens.len() && tokens[*at] == "userdata"
+                if length_of != "" || !(mode is CIn) then return Err("`userdata` marks the `void *` that carries a callback, which is passed in and carries no length")
+                userdata = true
+                *at = *at + 1
+            val p = c_declaration(tokens, at)?
+            if *at < tokens.len() && tokens[*at] == "("
+                if inner then return Err("a callback's parameter taking a function cannot cross a C binding: a function crosses only as a binding's own parameter")
+                if userdata || length_of != "" || !(mode is CIn) then return Err("a parameter taking a function is passed in, with no `userdata`, `out`, `inout` or `length` of its own")
+                if p.name is Some(n) then return Err(s"a parameter taking a function is written `${p.text} (*$n)(...)`, its name in parentheses after a `*`")
+                val f = c_function_pointer(tokens, at, p)?
+                var shown = ""
+                for q in f.params
+                    shown = shown + (if shown == "" then "" else ", ") + q.text
+                if shown == "" then shown = "void"
+                var own: Buf[CPrototype] = buf()
+                own.push(f)
+                params.push(CParam(CPointerType, s"${p.text} (*)($shown)", f.symbol, CIn, CVoidType, "", "", false, own))
+                if *at < tokens.len() && tokens[*at] == ","
+                    *at = *at + 1
+                    continue
+                break
             if p.ty is CVoidType then return Err("a parameter cannot be `void`; a function taking nothing is written `(void)`")
+            if userdata && p.text != "void *"
+                return Err(s"`userdata` marks the `void *` that carries a callback's closure, and `${p.text}` is not `void *`")
             var pointee = CVoidType
             var pointee_text = ""
             if !(mode is CIn)
@@ -152,22 +191,73 @@ parse_prototype(text: string) -> Result[CPrototype, string]
                 pointee = parse_c_type(pointee_text)?.ty
             elif p.text.ends_with(" *")
                 // What a pointer passed in points at, which an array's elements are.
-                val inner = p.text[..<p.text.bytes.len - 2]
-                if parse_c_type(inner) is Ok(t)
+                val inner_text = p.text[..<p.text.bytes.len - 2]
+                if parse_c_type(inner_text) is Ok(t)
                     pointee = t.ty
-                    pointee_text = inner
-            params.push(CParam(p.ty, p.text, p.name.unwrap_or(""), mode, pointee, pointee_text, length_of))
-            if at < tokens.len() && tokens[at] == ","
-                at += 1
+                    pointee_text = inner_text
+            params.push(CParam(p.ty, p.text, p.name.unwrap_or(""), mode, pointee, pointee_text, length_of, userdata, buf()))
+            if *at < tokens.len() && tokens[*at] == ","
+                *at = *at + 1
                 continue
             break
-    if at >= tokens.len() || tokens[at] != ")"
-        return Err(if at < tokens.len() then s"`${tokens[at]}` is not part of a parameter list" else "the parameter list has no closing `)`")
-    at += 1
-    if at < tokens.len() && tokens[at] == ";" then at += 1
-    if at < tokens.len() then return Err(s"`${tokens[at]}` follows the parameter list")
-    c_check_lengths(params)?
-    Ok(CPrototype(symbol, declared.ty, declared.text, params))
+    if *at >= tokens.len() || tokens[*at] != ")"
+        return Err(if *at < tokens.len() then s"`${tokens[*at]}` is not part of a parameter list" else "the parameter list has no closing `)`")
+    *at = *at + 1
+    Ok(params)
+
+// A function pointer's declarator from `tokens[*at]`, after its result type `result`: `(*name)` and
+// its parameter list, read as the prototype of the function C calls, named by the parameter.
+private c_function_pointer(tokens: Buf[string], at: *usize, result: CDeclared) -> Result[CPrototype, string]
+    val shape = "a parameter taking a function is written as C declares a function pointer, as in `void (*listener)(userdata void *data, int value)`"
+    *at = *at + 1
+    if *at >= tokens.len() || tokens[*at] != "*" then return Err(shape)
+    *at = *at + 1
+    var name = ""
+    if *at < tokens.len() && is_c_word(tokens[*at]) && !is_c_keyword(tokens[*at])
+        name = tokens[*at]
+        *at = *at + 1
+    if *at >= tokens.len() || tokens[*at] != ")" then return Err(shape)
+    *at = *at + 1
+    if *at >= tokens.len() || tokens[*at] != "(" then return Err(shape)
+    *at = *at + 1
+    val params = c_param_list(tokens, at, true)?
+    if result.ty is CText(_) then return Err("a callback answers C a scalar or an enum mirror; a string it answered would have to outlive the call, which nothing frees")
+    Ok(CPrototype(name, result.ty, result.text, params))
+
+// Each parameter taking a function has a name and a `userdata` of its own, the only one its prototype
+// has, which a `userdata` of the binding's carries by the same name; each of the binding's carries
+// one callback, and no two carry the same.
+private c_check_callbacks(params: Buf[CParam]) -> Result[unit, string]
+    var carried: Buf[string] = buf()
+    for q in params
+        if q.callback.len() == 0 then continue
+        val f = q.callback[0]
+        if q.name == "" then return Err(s"a parameter taking a function is named, as in `${q.text.replace_all("(*)", "(*listener)")}`")
+        var own: Option[CParam] = None
+        var count = 0usize
+        for r in f.params
+            if r.userdata
+                own = Some(r)
+                count += 1
+        if count == 0 then return Err(s"`${q.name}` takes a function with no `userdata`: C passes the function its closure through the `void *` marked `userdata`, and with none there is nowhere to find it")
+        if count > 1 then return Err(s"`${q.name}` takes a function with ${count} parameters marked `userdata`, and one carries its closure")
+        val word = own.unwrap().name
+        if word == "" then return Err(s"the `userdata` of `${q.name}` is named, as the binding's `userdata` that carries it is")
+        var found = false
+        for r in params
+            if r.userdata && r.name == word then found = true
+        if !found then return Err(s"`${q.name}` finds its closure through `$word`, and no parameter of the binding is `userdata void *$word`")
+        for c in carried
+            if c == word then return Err(s"`$word` carries the closure of two functions; a binding takes one function per `userdata`")
+        carried.push(word)
+    for q in params
+        if !q.userdata then continue
+        if q.name == "" then return Err("a `userdata` parameter is named, as the `userdata` of the function it carries is")
+        var used = false
+        for c in carried
+            if c == q.name then used = true
+        if !used then return Err(s"`${q.name}` is marked `userdata`, and no parameter takes a function whose `userdata` it carries")
+    Ok(())
 
 // Each `length(data)` names a pointer parameter passed in, `data`, which no other parameter's length
 // names, and marks an integer, or an `inout` pointer to one.
@@ -236,7 +326,7 @@ private c_declaration(tokens: Buf[string], at: *usize) -> Result[CDeclared, stri
         if t == "out" || t == "inout"
             return Err(s"`$t` is written first, before the parameter's type, as in `$t int *x`")
         if t == "userdata"
-            return Err(s"`$t` parameters are not implemented")
+            return Err("`userdata` is written first, before the parameter's type, as in `userdata void *data`")
         if t == "length" && *at + 1 < tokens.len() && tokens[*at + 1] == "("
             return Err("`length(data)` is written first, before the parameter's type and before `inout`, as in `length(data) size_t n`")
         if t == "static" || t == "inline" || t == "register" || t == "typedef"
@@ -652,8 +742,9 @@ c_avin_positions(p: CPrototype) -> Buf[usize]
         if c_is_avin_param(p.params[i]) then out.push(i)
     out
 
-/** Whether a prototype's parameter is one an Avin binding takes: not `out`, and carrying no length. */
-c_is_avin_param(q: CParam) -> bool = !(q.mode is COut) && q.length_of == ""
+/** Whether a prototype's parameter is one an Avin binding takes: not `out`, carrying no length, and
+ * not a `userdata`. */
+c_is_avin_param(q: CParam) -> bool = !(q.mode is COut) && q.length_of == "" && !q.userdata
 
 /** The number of `out` and `inout` parameters of a prototype. */
 c_out_count(p: CPrototype) -> usize
@@ -661,6 +752,34 @@ c_out_count(p: CPrototype) -> usize
     for q in p.params
         if !(q.mode is CIn) then n += 1
     n
+
+/** The indices of the parameters of a callback's prototype `f` the Avin function takes, in order:
+ * all but its `userdata`. */
+c_callback_positions(f: CPrototype) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    for i in 0..<f.params.len()
+        if !f.params[i].userdata then out.push(i)
+    out
+
+/** The index of the parameter of `p` taking the function whose closure the `userdata` parameter `k`
+ * carries. */
+c_callback_of_userdata(p: CPrototype, k: usize) -> usize
+    for j in 0..<p.params.len()
+        val q = p.params[j]
+        if q.callback.len() == 0 then continue
+        for r in q.callback[0].params
+            if r.userdata && r.name == p.params[k].name then return j
+    panic("a `userdata` that carries no callback")
+
+/** A callback's function type as the C unit measures it: each enum mirror among its parameters, and
+ * one it answers, as the integer it is. */
+c_callback_measured(t: &Type, data: Buf[DataSymbol]) -> &Type = *t match
+    Function(ps, r, sendable) ->
+        var own: Buf[&Type] = buf()
+        for q in ps
+            own.push(if c_mirror_of(q, data) is Some(_) then Int(64) else q)
+        Function(own, if c_mirror_of(r, data) is Some(_) then Int(64) else r, sendable)
+    _ -> t
 
 /** How the result `r` of a binding with prototype `p` splits, or why it cannot. */
 c_result_parts(p: CPrototype, r: &Type, data: Buf[DataSymbol]) -> Result[CResultParts, string]
@@ -796,8 +915,11 @@ c_free_text(f: &Function) -> Option[string]
                 if arg.value.kind is StringLit(text) then return Some(text)
     None
 
-/** Whether a C binding's `@c` says the call may wait, with the word `blocking`. */
+/** Whether a C binding's call may wait: its `@c` says `blocking`, or it takes a function marked
+ * `@threaded`, which C may call from another thread while this one waits for it. */
 c_is_blocking(f: &Function) -> bool
+    for p in f.params
+        if is_threaded_param(p) then return true
     for a in f.annotations
         if a.name != "c" then continue
         for arg in a.args

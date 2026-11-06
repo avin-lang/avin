@@ -116,6 +116,10 @@ emit_llvm(program: MirProgram) -> string
         for k in 0..<b.params.len()
             if b.params[k].form is Callback(_, result, machine, answer, _)
                 emit_invoker(&out, callback_invoker(b.shim, k), machine, answer, if result.form is Plain then extension(result.ty) else "")
+    for i in 0..<program.c_trampolines.len()
+        emit_trampoline(&out, program, i)
+    if program.c_trampolines.len() > 0
+        out.push("declare ptr @avin_rt_c_callback_enter(ptr, ptr)\ndeclare void @avin_rt_c_callback_leave(ptr)\n")
     out.push("\n")
     out.push("declare ptr @avin_rt_start(i32, ptr)\n")
     out.push("declare void @avin_rt_string_descriptor(ptr)\n")
@@ -878,6 +882,40 @@ private emit_invoker(out: *StrBuilder, name: string, machine: Buf[MirType], answ
             else out.push(s"  ret ${llvm_type(t)} %r\n}\n")
         None -> out.push(s"  call ${cc}void %code($args)\n  ret void\n}\n")
 
+// The trampoline `program.c_trampolines[i]`, which C calls with its own convention through a function
+// pointer: it begins the call on the calling thread with the `userdata`, the callback's record, as
+// `avin_rt_c_callback_enter`, which answers the context and writes what ending the call needs in room
+// of the trampoline's frame; runs the function that converts and calls, with the program's
+// convention; ends the call; and answers what that function answered, a `float` rounded from the
+// `real` carrying it, as every `float` C is passed is widened.
+private emit_trampoline(out: *StrBuilder, program: MirProgram, i: usize)
+    val t = program.c_trampolines[i]
+    val f = program.functions[t.function]
+    out.push(s"\ndefine internal ${foreign_result(t.result)} @avin.c.trampoline.$i(")
+    for j in 0..<t.params.len()
+        if j > 0 then out.push(", ")
+        out.push(foreign_type(t.params[j]) + foreign_extension(t.params[j]) + s" %a$j")
+    out.push(") {\nentry:\n  %entered = alloca [8 x i64], align 8\n")
+    out.push(s"  %ctx = call ptr @avin_rt_c_callback_enter(ptr %a${t.userdata}, ptr %entered)\n")
+    var args = s"ptr %ctx, ptr %a${t.userdata}"
+    for j in 0..<t.params.len()
+        if j == t.userdata then continue
+        if t.params[j] is CBinary32
+            out.push(s"  %w$j = fpext float %a$j to double\n")
+            args = args + s", double %w$j"
+        else args = args + ", " + foreign_type(t.params[j]) + s" %a$j"
+    val call = "call " + convention(f.signature) + result_type(f.signature) + " @\"" + f.symbol + "\"(" + args + ")\n"
+    t.result match
+        Some(s) ->
+            out.push("  %r = " + call)
+            out.push("  call void @avin_rt_c_callback_leave(ptr %entered)\n")
+            if s is CBinary32
+                out.push("  %n = fptrunc double %r to float\n  ret float %n\n}\n")
+            else out.push("  ret " + foreign_type(s) + " %r\n}\n")
+        None ->
+            out.push("  " + call)
+            out.push("  call void @avin_rt_c_callback_leave(ptr %entered)\n  ret void\n}\n")
+
 /** The collector's `Kind` as a descriptor begins with it: the runtime's tracer, and no finalizer,
  * weak hook or ephemeron hook. A Sysl handle's kind has its finalizer. */
 private const KindType: string = "{ ptr, ptr, ptr, ptr }"
@@ -1331,6 +1369,7 @@ private operand_type(program: MirProgram, f: MirFunction, a: Operand) -> MirType
     CallerSite -> MPtr
     OwnerWord -> MPtr
     ClosureRunner -> MPtr
+    TrampolineAddress(_) -> MPtr
 
 private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a match
     Value(id) -> s"%v$id"
@@ -1351,6 +1390,7 @@ private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a m
     CallerSite -> "%caller.site"
     OwnerWord -> "%owner.word"
     ClosureRunner -> "@avin.run_closure"
+    TrampolineAddress(i) -> s"@avin.c.trampoline.$i"
 
 // A module-level value that holds a reference is a slot of the roots frame; any other is a global
 // of its own.

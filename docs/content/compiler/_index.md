@@ -204,13 +204,24 @@ binding is **not** a shim: it is a direct call from the program's own code.
   checked to be the kind its Avin type needs, and measured as a result's type is), reads or writes
   it through `avin_c_field_get_n` or `avin_c_field_set_n`, taking each index as a `long long`, and
   answers each index's bound through `avin_c_field_bound<j>_n`, which lowering compares with the
-  index before the read, trapping unless `0 <= index < bound`. Later, the finalizer will run `forget` for each kept callback before `release`.
-- **Callbacks.** For each C function type a callback parameter has, lowering makes one trampoline
-  with C's convention. It reads the `userdata` as the runtime's callback record (`callback_pin` when
-  the binding is called, unpinned at return or when the keeping handle is released), calls
-  `callback_enter`, which attaches a thread the runtime has never seen and checks the owner unless
-  the parameter is `@threaded`, converts the arguments, calls the closure, converts the answer, and
-  calls `callback_leave`, which detaches a thread attached for the call.
+  index before the read, trapping unless `0 <= index < bound`. With `forget:`, `avin_c_give_back_i`
+  runs it for each callback the handle keeps before `release`.
+- **Callbacks.** Check reads a parameter of function-pointer type into the function pointer's own
+  prototype, paired with the binding's `userdata` of the name its own `userdata` has. Lowering makes
+  the binding's body call `avin_rt_c_callback_new` for each function it passes, a record off the heap
+  holding the function value rooted as a Sysl callback's is (`Callback`), whose address is the
+  `userdata`; the record is freed by `avin_rt_c_callback_free` once the call returns, or, for a
+  function `keeps:` names, handed to the holder's kept list by the glue's `avin_c_keep_callback` and
+  freed by `avin_rt_c_callback_drop` when the holder is given back, after `forget:`. For each such
+  parameter, lowering also makes a MIR function taking the record and C's other arguments, which
+  converts them as results are, calls the function value and converts its answer as an argument
+  is; emit wraps it in the trampoline, `@avin.c.trampoline.<n>`, with C's convention, whose address
+  is passed for the pointer: it calls `avin_rt_c_callback_enter`, which runs `callback_enter`
+  (attaching a thread the runtime has never seen where the parameter is `@threaded`, stopping the
+  program otherwise, and checking the owner), then the MIR function with the context it answered,
+  then `avin_rt_c_callback_leave`. In a program with a trampoline, every call of a C library
+  function is planned as one during which the collector may run, its live values rooted, since C
+  may call back.
 - **Emit** declares each C symbol and glue function with the target's parameter attributes
   (`signext`/`zeroext` below 32 bits) and calls it; nothing in the emitter knows about C beyond that.
 - **Link** adds the C unit's object and, for each package's C libraries, `-l<name>` or the words

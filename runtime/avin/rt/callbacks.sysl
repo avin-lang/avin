@@ -35,16 +35,18 @@ struct Callback
     threaded: bool
     layouts: &sync Frozen[*u8]
     binding: &sync Frozen[u8]
+    /** Whether C holds it, through a C binding's trampoline, rather than a Sysl closure. */
+    from_c: bool
 
 impl Drop for Callback
     drop(self) = unpin(self.slot)
 
 /** Makes `object` a root of every collection and answers the callback holding it, for code owned by
  * `ctx`'s owner: the `count` layouts at `layouts` are copied. */
-callback_pin(ctx: *Context, object: *u8, layouts: **u8, count: usize, binding: string) -> &Callback = Callback(object, pin(object), ctx.owner, false, copied(layouts, count), name_of(binding))
+callback_pin(ctx: *Context, object: *u8, layouts: **u8, count: usize, binding: string) -> &Callback = Callback(object, pin(object), ctx.owner, false, copied(layouts, count), name_of(binding), false)
 
 /** A callback any thread may call, as `callback_pin` makes one for the code that gave it. */
-callback_pin_threaded(ctx: *Context, object: *u8, layouts: **u8, count: usize, binding: string) -> &sync Callback = Callback(object, pin(object), ctx.owner, true, copied(layouts, count), name_of(binding))
+callback_pin_threaded(ctx: *Context, object: *u8, layouts: **u8, count: usize, binding: string) -> &sync Callback = Callback(object, pin(object), ctx.owner, true, copied(layouts, count), name_of(binding), false)
 
 private copied(layouts: **u8, count: usize) -> &sync Frozen[*u8]
     var own: Buf[*u8] = buf()
@@ -114,7 +116,7 @@ callback_enter(cb: *Callback) -> Entered
     var c = current_context
     var attached = false
     if c == null
-        if !cb.threaded then stop_foreign("the callback given to `" + binding_name(cb) + "` was called by a thread the program did not start; mark the parameter `@threaded` where Sysl may call it from any thread")
+        if !cb.threaded then stop_foreign("the callback given to `" + binding_name(cb) + "` was called by a thread the program did not start; mark the parameter `@threaded` where " + (if cb.from_c then "C" else "Sysl") + " may call it from any thread")
         c = thread_attach()
         install_stack_guard()
         attached = true
@@ -139,3 +141,80 @@ private stop_foreign(reason: string) -> never
     flush()
     eprints("avin: trap: " + reason + "\n")
     trap()
+
+// Avin functions handed to C. A C binding passes C its trampoline for the function pointer and, for
+// the `userdata` beside it, the address of a record of its own holding the callback: the function
+// value rooted as for Sysl, the code that gave it, and whether any thread may call it. The record
+// lives until the binding returns, or, for a function C keeps, until the handle keeping it is given
+// back, after its class's `forget`. A trampoline begins each call with `avin_rt_c_callback_enter`,
+// which finds the thread's context as a Sysl callback's call does, runs the function and ends with
+// `avin_rt_c_callback_leave`.
+
+/** A callback C holds, and its place among the records. */
+struct CRecord
+    callback: &sync Callback
+    slot: usize
+
+/** The records C holds now, each kept alive here until it is freed; freed places are reused. Both are
+ * touched only under `records_lock`. */
+private var records: Buf[Option[&sync CRecord]] = buf()
+private var free_records: Buf[usize] = buf()
+private var records_lock: SleepLock = SleepLock.new()
+
+/** A new record of the function value `object`, for code owned by `ctx`'s owner, given to the C
+ * binding named by the string `binding`; any thread may call it where `threaded`. Its address is the
+ * `userdata` C is passed. */
+@export("avin_rt_c_callback_new")
+c_callback_new(ctx: *Context, object: *u8, threaded: bool, binding: *u8) -> *u8
+    val no_layouts: Buf[*u8] = buf()
+    val cb: &sync Callback = Callback(object, pin(object), ctx.owner, threaded, no_layouts.freeze(), name_of(text_string(binding)), true)
+    records_lock.lock()
+    val slot = free_records.pop() match
+        Some(s) -> s
+        None ->
+            records.push(None)
+            records.len() - 1
+    val r: &sync CRecord = CRecord(cb, slot)
+    records[slot] = Some(r)
+    records_lock.unlock()
+    ptr_cast(&*r)
+
+/** Frees the record at `record`, which C no longer calls, so the function value is no longer rooted;
+ * null, for a record a handle has kept, frees nothing. */
+@export("avin_rt_c_callback_free")
+c_callback_free(ctx: *Context, record: *u8)
+    if record != null then c_callback_drop(record)
+
+/** Frees the record at `record`, as the glue of a handle that kept it does once its object is given
+ * back; it runs with no context, from a finalizer too. */
+@export("avin_rt_c_callback_drop")
+c_callback_drop(record: *u8)
+    val r: *CRecord = ptr_cast(record)
+    records_lock.lock()
+    val slot = r.slot
+    records[slot] = None
+    free_records.push(slot)
+    records_lock.unlock()
+
+/** The function value the record at `record` holds. */
+@export("avin_rt_c_callback_object")
+c_callback_object(ctx: *Context, record: *u8) -> *u8
+    val r: *CRecord = ptr_cast(record)
+    r.callback.object
+
+/** Begins a call of the callback whose record is at `record` on the calling thread, as a Sysl
+ * callback's call begins, and answers the context it runs with; what `avin_rt_c_callback_leave` needs
+ * is written at `entered`, room the trampoline keeps for it. */
+@export("avin_rt_c_callback_enter")
+c_callback_enter(record: *u8, entered: *u8) -> *Context
+    val r: *CRecord = ptr_cast(record)
+    val e = callback_enter(&*r.callback)
+    val at: *Entered = ptr_cast(entered)
+    *at = e
+    e.ctx
+
+/** Ends the call of a callback that `avin_rt_c_callback_enter` began, writing at `entered`. */
+@export("avin_rt_c_callback_leave")
+c_callback_leave(entered: *u8)
+    val at: *Entered = ptr_cast(entered)
+    callback_leave(*at)
