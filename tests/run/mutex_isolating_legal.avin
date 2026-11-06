@@ -1,0 +1,59 @@
+// expect: exit 0
+// What a mutex's value and body may still do under the `@isolating` mark, from eight threads at once
+// with garbage made on every turn: work on locals made inside the body, give back an immutable copy
+// of the guarded buffer, read module-level `val`s of immutable data (a scalar, a vector, an object of
+// `val`s, a map), take a nested `with` on a second mutex held in a module-level `val` (always in the
+// same order, so no thread waits for ever), read and assign the calling code's `var` of a sendable
+// type, pass a body on through a program's own generic function marked `@isolating`, and guard a
+// value made by a function that keeps nothing.
+import avin.threads.{Mutex, scope}
+
+val step = 3
+val weights = Vector(1, 2, 3, 4)
+val names: Map[string, int] = Map(("a", 1), ("b", 2))
+
+object Limits
+    val most = 1000
+
+val outer = Mutex(Buffer[int]())
+val inner = Mutex(Buffer[string]())
+
+fresh(n: int) -> Buffer[int]
+    val b = Buffer[int]()
+    for i in 0..<n
+        b.addOne(i)
+    b
+
+guarded[T, R: Sendable](m: Mutex[T], @isolating f: (T) -> R) -> R = m.with(f)
+
+main() -> int
+    val counts = Mutex(fresh(8))
+    scope(s ->
+        for t in 0..<8
+            s.spawn(() ->
+                for i in 0..<2000
+                    counts.with(b ->
+                        val scratch = Buffer[string]()
+                        scratch.addOne(s"$t-$i")
+                        b(t) += scratch.length() * weights(t % weights.length()) / weights(t % weights.length()))
+                    val copy = counts.with(b -> b.toVector())
+                    if copy.length() != 8 then println("lost a slot")
+                    outer.with(o ->
+                        inner.with(n ->
+                            if i % 100 == 0 then n.addOne(s"$t"))
+                        if i % 100 == 0 && o.length() < Limits.most then o.addOne(step + names("a")))
+                    guarded(counts, b -> b(t) += 0)))
+    var seen = 0
+    val total = counts.with(b ->
+        seen = b.length()
+        var sum = 0
+        for x in b
+            sum += x
+        sum)
+    println(total)
+    println(seen)
+    println(counts.with(b -> b.toVector()))
+    println(outer.with(o -> o.length()))
+    println(inner.with(n -> n.length()))
+    println(outer.with(o -> o.toVector().distinct()))
+    if total == 16028 then 0 else 1
