@@ -601,7 +601,10 @@ elements and the type, is built by a sequence or set literal wherever that class
 a map literal when its builder takes `(key, value)` pairs, each entry given to it as one. The
 elements take their types from the expected element type when there is one (`Array[byte]` makes
 each literal a `byte`), and otherwise from the elements themselves, which agree on a type as the
-branches of an `if` do: `[dog, cat]` is a `Vector[Animal]`, and `[1, "two"]` is an error. A map
+branches of an `if` do: `[dog, cat]` is a `Vector[Animal]`, and `[1, "two"]` is an error. A number
+literal among them takes the type the others decide, wherever it is written
+([generics](/spec/generics/#inference)): `[long(1), 2]` and `[2, long(1)]` are `Vector[long]`, and
+`[1.5, 2]` is a `Vector[real]`. A map
 literal's keys agree on one type and its values on another, so `{a: dog, b: cat}` is a
 `Map[string, Animal]`. A literal in braces is all elements or all entries; `{1, b: 2}` is an
 error. Set and map literals nest inside one another and inside sequence literals, and like them may

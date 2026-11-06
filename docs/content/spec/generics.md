@@ -370,6 +370,22 @@ infer is.
   `Goldfish` that are both `Pet: Named` join to `Pet`. Where they share several unrelated traits,
   no one of them is chosen: the join is an error that names them, and the type is written, or
   given by the expected type.
+- Two tuples of as many parts join part by part, since a tuple's parts are read out: with `x: long`,
+  `same((dog, x), (cat, x))` takes `(Animal, long)`, as do `if c then (dog, x) else (cat, x)` and
+  `[(dog, x), (cat, x)]`, and so does a tuple inside a covariant argument (`Some((dog, x))` and
+  `Some((cat, x))` join to `Option[(Animal, long)]`). A part joins only where its types do: an
+  invariant `(Array[Dog], long)` and `(Array[Cat], long)` have no join, nor have `(Dog, long)` and
+  `(Cat, int)`, nor tuples of different sizes.
+- A number literal among values that agree on one type (the branches of an `if`, the arms of a
+  `match`, the elements of a collection literal, the keys or the values of a map literal) takes the
+  type the others decide, wherever it is written, as an argument's literal does: `[long(1), 2]` and
+  `[2, long(1)]` are `Vector[long]`, `[1.5, 2]` is a `Vector[real]`, `if c then 2 else big` a `long`
+  for `big: long`, and `[Some(long(1)), Some(2)]` a `Vector[Option[long]]`. A value built around a
+  literal (`Some(2)`, `(2, "b")`, `[2]`) and an expression of literals alone (`2 * 3`, `-5`) do the
+  same; a `match` arm does so where it is an expression of literals alone. A literal that does not
+  fit the type decided is an error (`[i8(1), 128]`), and literals with no other value beside them
+  take the first one's type, so `[1, 5000000000]` is an error, as the `int` decided by `1` cannot
+  hold the second. Values that agree on no type are reported in the order they are written.
 - An argument of type `Nothing` (a `break`, a `return`, `fail(…)`) decides no type argument, since
   the call is never made: the other arguments and the expected type decide them as they would
   alone, and one that only such an argument names is `Nothing`. So `identity(break 42)` and

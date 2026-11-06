@@ -4365,6 +4365,37 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- Proposed (branch `generic-joins`): **Two tuples join part by part** ([generics](/spec/generics/#inference)).
+  `(Dog, long)` and `(Cat, long)` agree on `(Animal, long)` wherever two types are joined: the
+  arguments of one type parameter, the branches of an `if`, the arms of a `match`, the elements of a
+  literal, and a tuple inside a covariant argument (`Option`, `Vector`, `List`). Each part joins as two
+  types alone do, so a part of an invariant type (`Array[Dog]` beside `Array[Cat]`) or two different
+  value types (`long` beside `int`) still have no join, nor have tuples of different sizes. Why: the
+  chapter already lists a tuple part among the places a value is read out, and two classes alone join;
+  a tuple of them failing to was an omission in the checker's join, which handled classes and generic
+  types but not tuples. Alternatives: requiring the tuple type to be written (a contortion the class
+  case does not need). Nothing here deserves a conversation.
+
+- Proposed (branch `generic-joins`): **A number literal among values that agree on one type takes the
+  type the others decide** ([generics](/spec/generics/#inference), [collections](/spec/collections/#literals)).
+  Among the elements of a collection literal, the keys or values of a map literal and the branches of
+  an `if`, the values are checked in tiers, as a call's arguments are: those holding no literal first,
+  then values built around a literal (`Some(2)`, `(2, "b")`, `[2]`), then expressions of literals alone
+  (`2`, `2 * 3`, `-5`), then empty literals, each later tier given the shape of what the earlier agree
+  on with its value types kept and its classes left open. So `[long(1), 2]`, `[2, long(1)]` and
+  `if c then 2 else big` are `long`, and `[1.5, 2]` is `Vector[real]`. A `match` arm takes part only
+  where it is an expression of literals alone, since an arm checked after the others would be checked
+  outside its pattern's scope, and a value built around a literal may name a pattern's binding.
+  Diagnostics for values with no common type still read in written order, at the later value. Why:
+  `types.md` already says a literal takes its width from the other operand, and the literal chapter
+  says elements agree as an `if`'s branches do; `[long(1), 2]` being an error while `long(1) + 2` is
+  not read as a gap to programs. Alternatives: only the collection literal (leaves `if` and `match`
+  stricter than the literal that is said to agree as they do); leaving each literal an inference
+  variable settled at its use (the alternative weighed for nested literals too, deferred for the
+  same reason); deferring every `match` arm that holds a literal by re-entering its pattern's scope
+  (more machinery for a rare shape). Review with the user: whether `match` arms such as `Some(2)`
+  beside `Some(big)` should also agree.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
