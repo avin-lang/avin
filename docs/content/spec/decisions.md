@@ -3986,6 +3986,25 @@ spelling is better, as each entry says.
 
 ## Proposed
 
+- **The allocation chunk belongs to the carrier, a runtime record per operating system thread, and
+  a context reaches it through a pointer** (branch `lwt-carrier-chunk`). `Context.carrier` points at
+  the `Carrier` the context runs on, which holds the `gc.Chunk`; allocation reads
+  `ctx.carrier.chunk`, one load more than before, and compiled code never touches the chunk, so
+  lowering is unchanged. Attaching a thread makes its carrier (a record that keeps itself alive)
+  and links it into a list of carriers beside the list of contexts, both under the heap lock;
+  detaching retires the chunk, unlinks the carrier and frees it, and detaching twice changes
+  nothing. A collection retires the chunk of every carrier rather than of every context. A
+  context's `carrier` is stored only while the context is safe, by one store, so a later
+  scheduler moves a lightweight thread between carriers without moving a chunk.
+  *Why*: thousands of parked lightweight threads must hold no chunk each, and the chunk is a
+  property of the thread that is running, not of the code it runs. *Alternatives*: the chunk kept
+  in the context and handed over at each switch (a copy of the chunk's six words per switch, and
+  every parked context still sized for one); a thread-local carrier found through the platform's
+  thread-local storage (no pointer in the context, but a thread-local access on every allocation,
+  dearer than one load); the carrier embedded in the thread's own storage beside its context (no
+  separate record, but a carrier would then die with the context it was made beside, which is
+  wrong once contexts outnumber carriers).
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
@@ -4009,9 +4028,8 @@ spelling is better, as each entry says.
   at its next wait); **keeping user-interface work on the main thread** (a scheduler that runs a
   lightweight thread on the main operating system thread only, which also gives the `ui` package
   its change from another thread); **stack size and growth** (a fixed reservation first; parked
-  frames moved to the heap later); and **the allocation chunk's owner**, which today is the
-  thread's context and becomes the carrier's, retired at every stop, so that thousands of parked
-  lightweight threads hold no chunk each. The collector needs nothing new: its roots are what the
+  frames moved to the heap later). The allocation chunk belongs to the carrier (proposed above), so
+  thousands of parked lightweight threads hold no chunk each. The collector needs nothing new: its roots are what the
   runtime's callback marks, so a parked lightweight thread's context keeps its exact shadow stack
   and is walked as an attached thread's is, and switching stacks happens only at the runtime's own
   safepoints, so no collection sees one half done.

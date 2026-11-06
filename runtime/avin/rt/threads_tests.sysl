@@ -301,3 +301,127 @@ monotonic_clock()
     thread_detach(me)
     collect_now()
     assert_eq(gc.live(&space), 0usize)
+
+// A thread that roots one object, which leaves a chunk out on its carrier, and then spins on polls
+// until `halt` is raised.
+private struct Holder
+    root: Root
+    halt: Atomic[u32]
+
+private var holders: [4]Holder = [Holder(Root(Frame(null, 1), null), Atomic(0)); 4]
+private var holding: Atomic[u32] = Atomic(0)
+
+private hold_a_chunk(h: *Holder) -> unit
+    val ctx = thread_attach()
+    link(ctx, &h.root)
+    h.root.slot = allocate(ctx, &cell.header)
+    _ = holding.add(1)
+    while h.halt.load() == 0
+        if requested.load(Relaxed) != 0 then safepoint(ctx)
+    unlink_root(ctx, &h.root)
+    thread_detach(ctx)
+
+@test("a collection under stress retires the chunk out on every attached thread's carrier")
+stress_retires_every_thread_chunk()
+    var threads: [4]Option[Thread] = [None; 4]
+    holding.store(0)
+    for i in 0..<Workers
+        holders[i] = Holder(Root(Frame(null, 1), null), Atomic(0))
+        threads[i] = spawn(&hold_a_chunk, &holders[i])
+    while holding.load() < u32(Workers)
+        _ = yield_now()
+    val me = thread_attach()
+    assert(me.carrier != null)
+    assert_eq(gc.chunks_out(&space), usize(Workers))
+    // Every allocation collects first under stress: each holder's chunk is retired, and the
+    // allocation claims one for this thread's carrier alone.
+    val before = stops
+    stress = true
+    _ = allocate(me, &cell.header)
+    stress = false
+    assert(stops > before)
+    assert_eq(gc.chunks_out(&space), 1usize)
+    collect(me)
+    assert_eq(gc.chunks_out(&space), 0usize)
+    assert_eq(gc.live(&space), usize(Workers))
+    for i in 0..<Workers
+        holders[i].halt.store(1)
+    for i in 0..<Workers
+        threads[i] match
+            Some(t) -> assert(t.join())
+            None -> assert(false, "a thread did not start")
+    thread_detach(me)
+    assert(carriers == null)
+    assert(contexts == null)
+    collect_now()
+    assert_eq(gc.live(&space), 0usize)
+
+// A thread that attaches, allocates a few cells rooted in its frame, and detaches, over and over.
+private struct Churner
+    root: Root
+    rounds: usize
+    ok: bool
+
+private var churners: [2]Churner = [Churner(Root(Frame(null, 1), null), 0, false); 2]
+
+private churn(k: *Churner) -> unit
+    k.ok = true
+    for _ in 0..<k.rounds
+        val ctx = thread_attach()
+        if ctx.carrier == null then k.ok = false
+        link(ctx, &k.root)
+        for i in 0..<20usize
+            val p = allocate(ctx, &cell.header)
+            val next: **u8 = ptr_cast(p)
+            next[0] = k.root.slot
+            val words: *usize = ptr_cast(p)
+            words[1] = i
+            k.root.slot = p
+            if requested.load(Relaxed) != 0 then safepoint(ctx)
+        if !intact(k.root.slot, 20) then k.ok = false
+        unlink_root(ctx, &k.root)
+        thread_detach(ctx)
+
+@test("threads attaching and detaching while others allocate and collect keep every cell, and leave no carrier")
+attach_and_detach_beside_allocation()
+    collector.halt.store(0)
+    collector.rounds = 0
+    var churning: [2]Option[Thread] = [None; 2]
+    for i in 0..<2
+        churners[i] = Churner(Root(Frame(null, 1), null), 300, false)
+        churning[i] = spawn(&churn, &churners[i])
+    val k = spawn(&collect_repeatedly, &collector).unwrap()
+    run_workers(3000)
+    for i in 0..<2
+        churning[i] match
+            Some(t) -> assert(t.join())
+            None -> assert(false, "a thread did not start")
+        assert(churners[i].ok, "a churning thread lost cells or ran with no carrier")
+    collector.halt.store(1)
+    assert(k.join())
+    assert(collector.rounds > 0)
+    assert(carriers == null)
+    assert(contexts == null)
+    assert_eq(gc.chunks_out(&space), 0usize)
+    collect_now()
+    assert_eq(gc.live(&space), 0usize)
+
+@test("threads attaching and detaching under stress keep every cell")
+attach_and_detach_under_stress()
+    stress = true
+    for i in 0..<2
+        churners[i] = Churner(Root(Frame(null, 1), null), 50, false)
+    var churning: [2]Option[Thread] = [None; 2]
+    for i in 0..<2
+        churning[i] = spawn(&churn, &churners[i])
+    run_workers(500)
+    for i in 0..<2
+        churning[i] match
+            Some(t) -> assert(t.join())
+            None -> assert(false, "a thread did not start")
+        assert(churners[i].ok, "a churning thread lost cells or ran with no carrier")
+    stress = false
+    assert(carriers == null)
+    assert_eq(gc.chunks_out(&space), 0usize)
+    collect_now()
+    assert_eq(gc.live(&space), 0usize)

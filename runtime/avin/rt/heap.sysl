@@ -13,10 +13,23 @@ import sysl.threads.{Condvar, Mutex, SleepLock}
 // collection walks the frames of every attached context, and the frames of module-level values,
 // which belong to no thread.
 //
-// Threads share the heap. Each allocates small objects from a chunk of it that its context holds,
-// with no lock; a thread takes the heap lock only to claim a fresh chunk, to allocate an object too
-// large for one, or to collect. That one lock, `heap_lock`, serializes claims, large allocations,
-// collection and changes to the list of contexts. A collection stops the world: the collecting thread raises `requested`,
+// Threads share the heap. Each operating system thread running compiled code has a carrier, and
+// allocates small objects from the chunk of the heap its carrier holds, with no lock; a thread takes
+// the heap lock only to claim a fresh chunk, to allocate an object too large for one, or to collect.
+// A context reaches the chunk through `carrier`, the carrier it is running on, so an allocation costs
+// one load more than a chunk in the context itself would, and a context that is not running holds no
+// chunk. Attaching a thread makes its carrier and detaching it retires the carrier's chunk; every
+// collection retires the chunk of every carrier first, so the collector sees whole objects and free
+// blocks only.
+//
+// A context's `carrier` changes only while the context is safe, at one of the runtime's own
+// safepoints, and by a single store: no allocation of that context is then in progress, and its
+// chunk stays with the carrier it leaves, so moving a context between carriers moves no chunk. Today
+// a carrier and an attached context are one to one; the store is what lets many contexts share one
+// carrier in turn.
+//
+// That one lock, `heap_lock`, serializes claims, large allocations, collection and changes to the
+// lists of contexts and carriers. A collection stops the world: the collecting thread raises `requested`,
 // waits until every other attached context is safe, collects, lowers the flag and wakes the others.
 // A context is safe when its thread is parked at a safepoint or inside a region that touches no
 // reference, such as a wait for the heap lock or a blocking call. Compiled code polls `requested` on
@@ -50,9 +63,9 @@ struct Context
     /** The owner of the code the thread is running, which every use of a Sysl handle compares with
      * the handle's own (see `owners.sysl`). Compiled code reads it directly, at offset 32. */
     owner: u64
-    /** The run of the heap the thread allocates from with no lock. Only its own thread touches it,
-     * except under the heap lock: by the thread itself, or by a collector while the thread is safe. */
-    chunk: gc.Chunk
+    /** The carrier the context is running on, whose chunk it allocates from, or null while the
+     * context is not attached. Stored only while the context is safe. */
+    carrier: *Carrier
     /** Where a trap in the actor the thread is running returns to, or null where the thread runs no
      * actor's turn (see `recovery.sysl`). */
     recovery: *Recovery
@@ -71,7 +84,20 @@ const Running: u32 = 0
 const Safe: u32 = 1
 
 /** A context no thread is running yet: safe, with an empty stack, and an owner of its own. */
-new_context() -> Context = Context(null, null, Atomic(Safe), null, fresh_owner(), gc.chunk(), null, 0)
+new_context() -> Context = Context(null, null, Atomic(Safe), null, fresh_owner(), null, null, 0)
+
+/** One operating system thread's allocation state: the chunk of the heap that the contexts running
+ * on the thread allocate from with no lock. Only the context running on it touches the chunk, except
+ * under the heap lock: by that context's thread, or by a collector while the context is safe. A
+ * carrier keeps itself alive until its thread detaches. */
+struct Carrier
+    chunk: gc.Chunk
+    /** The next carrier of an attached thread. */
+    next: *Carrier
+    me: Option[&Carrier]
+
+/** Every attached thread's carrier, whose chunks a collection retires. */
+var carriers: *Carrier = null
 
 // The storage of a context the runtime made for a thread, which keeps itself alive until the thread
 // detaches.
@@ -129,7 +155,7 @@ var space: gc.Heap = gc.heap(&block[0], block.len, null)
  * first allocation it matters to. */
 var stress: bool = env.get("AVIN_GC_STRESS") == Some("1")
 var budget: usize = Floor
-/** What the heap held when the last collection finished. A thread's chunk is charged whole when it
+/** What the heap held when the last collection finished. A carrier's chunk is charged whole when it
  * is claimed, so what has been allocated since is at most what the heap holds now beyond this. */
 var settled: usize = 0
 
@@ -260,23 +286,51 @@ resume_others()
     resumed.notify_all()
     world.unlock_raw()
 
-/** Makes `c`'s frames roots of every collection from now on. A context is attached in the state it
- * has; a thread's own is marked running after it is attached. */
+/** Makes `c`'s frames roots of every collection from now on, and gives `c` a carrier of its own for
+ * the calling thread, holding no chunk until it first allocates. A context is attached in the state
+ * it has; a thread's own is marked running after it is attached. */
 attach(c: *Context)
     heap_lock.lock()
-    c.next = contexts
-    contexts = c
+    link_attached(c)
     heap_lock.unlock()
 
-/** Stops treating `c`'s frames as roots. A thread detaches its context when it has finished running
- * compiled code, with no frame left on it; the context is safe from then on. */
+/** Under the heap lock: links `c` into the list of contexts, and a fresh carrier for it into the list
+ * of carriers. */
+link_attached(c: *Context)
+    val k: &Carrier = Carrier(gc.chunk(), carriers, None)
+    k.me = Some(k)
+    val carrier: *Carrier = ptr_cast(&*k)
+    carriers = carrier
+    c.carrier = carrier
+    c.next = contexts
+    contexts = c
+
+/** Stops treating `c`'s frames as roots, retires its carrier's chunk and gives the carrier back. A
+ * thread detaches its context when it has finished running compiled code, with no frame left on it;
+ * the context is safe from then on. Detaching a context that is not attached changes nothing. */
 detach(c: *Context)
     if current_context == c then current_context = null
     enter_safe(c)
     heap_lock.lock()
     unlink(c)
-    gc.retire(&space, &c.chunk)
+    val carrier = c.carrier
+    c.carrier = null
+    if carrier != null
+        gc.retire(&space, &carrier.chunk)
+        unlink_carrier(carrier)
     heap_lock.unlock()
+    if carrier != null then carrier.me = None
+
+private unlink_carrier(k: *Carrier)
+    if carriers == k
+        carriers = k.next
+        return
+    var p = carriers
+    while p != null
+        if p.next == k
+            p.next = k.next
+            return
+        p = p.next
 
 private unlink(c: *Context)
     if contexts == c
@@ -312,14 +366,14 @@ thread_detach(c: *Context)
 
 // After a collection the next one waits until as much has been allocated as survived, so the heap
 // stays within about twice what is live and collecting costs in proportion to what is allocated.
-// The caller holds the heap lock and every other thread is stopped. The chunk of every attached
-// context is given back first, so the collector sees the heap as a run of whole objects and free
-// blocks; a detached context gave its own back when it detached.
+// The caller holds the heap lock and every other thread is stopped. The chunk of every carrier is
+// given back first, so the collector sees the heap as a run of whole objects and free blocks; a
+// detached thread's carrier gave its own back when it detached.
 collect_now()
-    var c = contexts
-    while c != null
-        gc.retire(&space, &c.chunk)
-        c = c.next
+    var k = carriers
+    while k != null
+        gc.retire(&space, &k.chunk)
+        k = k.next
     gc.collect(&space, &roots)
     val live = gc.live_size(&space)
     settled = live
@@ -362,16 +416,16 @@ allocate(ctx: *Context, d: *Descriptor) -> *u8 = allocate_sized(ctx, d, d.size)
 
 /** A new object of `size` bytes, all zero, whose header holds `d`, for an object whose size is not
  * its descriptor's, such as a string, whose bytes follow its length. Allocating may collect, so
- * every reference the caller still needs must be a root. An allocation the thread's chunk serves
+ * every reference the caller still needs must be a root. An allocation the carrier's chunk serves
  * takes no lock; one that takes the heap lock is also a safepoint, since a thread waiting for it is
  * safe. `ctx` is the allocating thread's. */
 allocate_sized(ctx: *Context, d: *Descriptor, size: usize) -> *u8
     if !stress
-        val p = gc.chunk_alloc(&ctx.chunk, size, &d.kind)
+        val p = gc.chunk_alloc(&ctx.carrier.chunk, size, &d.kind)
         if p != null then return p
     allocate_locked(ctx, d, size)
 
-// The allocation a thread's chunk cannot serve: the chunk is spent, or the object is too large for
+// The allocation a carrier's chunk cannot serve: the chunk is spent, or the object is too large for
 // any chunk. Under stress every allocation comes here, collects first, and is then taken from a
 // freshly claimed chunk like any other.
 private allocate_locked(ctx: *Context, d: *Descriptor, size: usize) -> *u8
@@ -390,9 +444,10 @@ private allocate_locked(ctx: *Context, d: *Descriptor, size: usize) -> *u8
     heap_lock.unlock()
     p
 
-// Under the heap lock: an object too large for a chunk from the heap itself; any other from a fresh chunk for `ctx`'s thread. Null when the heap holds no block large
-// enough.
+// Under the heap lock: an object too large for a chunk from the heap itself; any other from a fresh
+// chunk for the carrier `ctx` is running on. Null when the heap holds no block large enough.
 private take(ctx: *Context, d: *Descriptor, size: usize) -> *u8
     if size > gc.CHUNK_OBJECT_MAX then return gc.alloc(&space, size, &d.kind)
-    if !gc.claim(&space, &ctx.chunk, size) then return null
-    gc.chunk_alloc(&ctx.chunk, size, &d.kind)
+    val k = ctx.carrier
+    if !gc.claim(&space, &k.chunk, size) then return null
+    gc.chunk_alloc(&k.chunk, size, &d.kind)
