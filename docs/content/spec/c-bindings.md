@@ -554,12 +554,19 @@ through `inout` (`cairo_matrix_translate`).
 
 ### Structs by value
 
-A struct passed by value is **mirrored** by a `data` type with one variant, as a [Sysl
-struct](/spec/sysl-bindings/#mirrors) is. Its fields are matched by name, the Avin lowerCamelCase to
-C's snake_case, or by a field's own `@c("name")`; every C field is mirrored, and each field is a
-scalar, a `string` (`const char *`) or another mirror. The C unit asserts the size, alignment and
-offsets the mirror implies against the header's struct, so a struct laid out otherwise on some target
-stops that target's build at the mirror.
+A struct passed by value is **mirrored** by a `data` type with one variant named as the type, as a
+[Sysl struct](/spec/sysl-bindings/#mirrors) is ([proposed](/spec/decisions/#proposed)). `struct:`
+names the struct by its typedef or its tag, `struct as_tagged`; a union, a pointer or a scalar is
+refused. Its fields are matched by name, the Avin lowerCamelCase to C's snake_case (`maxXAdvance`
+is `max_x_advance`), or by a field's own `@c("name")`; every C field is mirrored, in the header's
+order, and each field is an integer type, `byte`, `bool`, `real`, a `string` or `Option[string]` (a
+`const char *`, null `None`), an [enum mirror](#enums-and-constants), or another struct mirror that
+does not hold it. The C unit measures each field's offset and C type and the struct's size, and
+asserts that the fields come in the header's order, each where C's alignment places it after the one
+before, nothing after the last, and none left out between them; a field crosses at its C type's
+width, converted as a scalar argument or result is, with the same traps. A mirror's value is a copy
+in C memory that lives for the call: strings in it are copies freed after the call, and strings C
+writes into one it fills are copied out and left to C.
 
 ```avin
 @c(struct: "mlt_color")
@@ -570,7 +577,9 @@ data Color
 A struct passed by value whose layout Avin does not mirror — a union, a struct with a bit-field or a
 flexible array, one a library documents as opaque but passes by value — is an **opaque value**: a
 class declared with `@c(value: "mlt_event_data")`, whose object holds a copy of the C value's bytes
-and is passed and answered by value. Its methods are bindings taking the value as their receiver:
+and is passed and answered by value, never through a pointer, `inout` or in an `Option`; each object
+is its own, compared by identity, and made only by a binding that answers one. Its methods are
+bindings taking the value as their receiver:
 
 ```avin
 @c(value: "mlt_event_data")
@@ -695,9 +704,13 @@ constant, and holds NaN, the infinities and minus zero as C defines them.
 
 - **An array C allocates and answers is copied**, as an `Array` of a scalar or a mirror: an `out`
   pointer named with `array:`, given a `length:` (a C expression, as for [buffers](#buffers)) and a
-  `free:` naming the C expression that frees it once the copy is made — Cairo's
-  `cairo_scaled_font_text_to_glyphs`, freed by `cairo_glyph_free(glyphs)`. `bytes:` is the same for an
-  `Array[byte]`.
+  `free:` naming the C function or the C expression in the array's name that frees it once the copy
+  is made — Cairo's `cairo_scaled_font_text_to_glyphs`, freed by `cairo_glyph_free(glyphs)`. The
+  length is computed in the C unit's glue after the call, over the parameters and the out values by
+  their names; the length's own out value stays in the result. Null is `None` for an `Option` of the
+  array, an empty array where the length is zero, and stops the program otherwise, as a negative
+  length does; where a status fails, the array is freed unread ([proposed](/spec/decisions/#proposed)).
+  `bytes:` is the same for an `Array[byte]`.
 
 - **An out parameter is part of the result.** The Avin result is the C result followed by each
   `out` and `inout` value in order, as a tuple; a C result bound as `unit` leaves the tuple without

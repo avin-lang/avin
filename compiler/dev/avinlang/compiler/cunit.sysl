@@ -39,6 +39,59 @@ struct CUnitBinding
     free: Option[string]
     /** The packages of the handle classes it takes or answers, whose headers come before its own. */
     uses: Buf[string]
+    /** The index of its symbol, which names its glue. */
+    symbol: usize
+    /** Whether it is called through glue, which passes and answers its structs by value through
+     * pointers and computes the length of the array C answers; and for each position, the result
+     * first, whether a struct crosses there by value. */
+    glued: bool
+    by_value: Buf[bool]
+    /** The array C answers through an `out` pointer, copied after the call, when it answers one. */
+    array_out: Option[CUnitArrayOut]
+
+/** An array a binding's `array:` names: the prototype's index of the `out` parameter it is answered
+ * through, the C type of its elements, the Avin type of an element, the C expression its length is,
+ * and how it is freed. */
+struct CUnitArrayOut
+    param: usize
+    element_text: string
+    element: &Type
+    length: string
+    free: Option[string]
+
+/** A struct mirror as the C unit checks and measures it: its name and data type's index, which names
+ * its typedefs, the C struct it mirrors, its fields, and the unit, span and package that place it. */
+struct CUnitStruct
+    name: string
+    index: usize
+    ty: string
+    fields: Buf[CUnitStructField]
+    unit: usize
+    span: Span
+    package: string
+
+/** A field of a struct mirror: its Avin name, the C field it mirrors and whether its `@c` names it,
+ * its Avin type, the kind of C type it must be, or for another mirror that mirror's data type and C
+ * struct, and its span. */
+struct CUnitStructField
+    name: string
+    c_name: string
+    named: bool
+    avin: &Type
+    kind: Option[CKind]
+    nested: Option[usize]
+    nested_ty: string
+    span: Span
+
+/** An opaque value class as the C unit checks and measures it: its name and class index, the C type
+ * it holds a copy of, and the unit, span and package that place it. */
+struct CUnitValue
+    name: string
+    index: usize
+    ty: string
+    unit: usize
+    span: Span
+    package: string
 
 /** A handle class as the C unit compiles its glue: its name and index, which name its glue
  * functions, the C type it is on as `parse_c_type` reads it and whether that is a typedef, whose
@@ -168,12 +221,13 @@ const MeasureMarker: string = "avin.c-unit.measurements:"
  * files, the units from `library` on. */
 c_unit_bindings(program: TProgram, files: Buf[ProgramFile], library: usize) -> Buf[CUnitBinding]
     var out: Buf[CUnitBinding] = buf()
-    for s in program.symbols
+    for n in 0..<program.symbols.len()
+        val s = program.symbols[n]
         if s.root is Some(_) || s.receiver is Some(_) then continue
-        // A method is a binding only on a C handle, and its receiver, the first of its parameters,
-        // is the prototype's first.
+        // A method is a binding only on a C handle or an opaque value, and its receiver, the first
+        // of its parameters, is the prototype's first.
         if s.owner_class is Some(k)
-            if c_handle_type(program.classes[k].decl) is None || s.constructor then continue
+            if c_handle_type(program.classes[k].decl) is None && c_value_type(program.classes[k].decl) is None || s.constructor then continue
         val p = c_prototype_of(s.decl) match
             Some(p) -> p
             None -> continue
@@ -186,6 +240,10 @@ c_unit_bindings(program: TProgram, files: Buf[ProgramFile], library: usize) -> B
         // measured as the integer it is.
         var result = parts.result
         if c_status_error(result, program.data) is Some(e) then result = e
+        // Each position a struct crosses by value at, which the glue passes through a pointer.
+        var by_value: Buf[bool] = buf()
+        by_value.push(c_by_value(p.result, result, program.data, program.classes))
+        var glue_params: Buf[&Type] = buf()
         var params: Buf[&Type] = buf()
         var out_at = 0usize
         var in_at = 0usize
@@ -203,6 +261,16 @@ c_unit_bindings(program: TProgram, files: Buf[ProgramFile], library: usize) -> B
                 params.push(if out_at < parts.outs.len() then parts.outs[out_at] else Unit)
                 out_at += 1
             if c_is_avin_param(q) then in_at += 1
+        for i in 0..<p.params.len()
+            val q = p.params[i]
+            by_value.push(q.mode is CIn && c_by_value(q.ty, params[i], program.data, program.classes))
+            if c_is_avin_param(q) then glue_params.push(params[i])
+        var array_out: Option[CUnitArrayOut] = None
+        if c_array_out_of(s.decl) is Some(a)
+            if c_array_out_index(p, a) is Some(k)
+                if c_array_form(params[k], program.data, program.classes) is Some(form)
+                    array_out = Some(CUnitArrayOut(k, c_array_out_element(p.params[k]), form.element, a.length, a.free))
+        val glued = c_binding_glued(s.decl, p, glue_params, result, program.data, program.classes)
         if c_mirror_of(result, program.data) is Some(_) then result = Int(64)
         for i in 0..<params.len()
             if c_mirror_of(params[i], program.data) is Some(_) then params[i] = Int(64)
@@ -219,7 +287,43 @@ c_unit_bindings(program: TProgram, files: Buf[ProgramFile], library: usize) -> B
             if c_handle_form(t, program.data, program.classes) is Some(h)
                 val used = package_of(program.classes[h.class_index].unit, files, library)
                 if used != package && !contains_text(uses, used) then uses.push(used)
-        out.push(CUnitBinding(s.name, p, params, result, s.unit, s.decl.name_span, package, forms, c_free_text(s.decl), uses))
+        out.push(CUnitBinding(s.name, p, params, result, s.unit, s.decl.name_span, package, forms, c_free_text(s.decl), uses, n, glued, by_value, array_out))
+    out
+
+/** The struct mirrors of a checked program, in the order of its data types. */
+c_unit_structs(program: TProgram, files: Buf[ProgramFile], library: usize) -> Buf[CUnitStruct]
+    var out: Buf[CUnitStruct] = buf()
+    for id in 0..<program.data.len()
+        val d = program.data[id]
+        if c_struct_type(d.decl) is None || d.variants.len() != 1 || d.decl.variants.len() != 1 then continue
+        val ty = c_struct_text(d.decl)
+        if ty == "" then continue
+        var fields: Buf[CUnitStructField] = buf()
+        val v = d.variants[0]
+        for j in 0..<v.fields.len()
+            val decl = d.decl.variants[0].fields[j]
+            val t = v.fields[j]
+            var nested: Option[usize] = None
+            var nested_ty = ""
+            if c_struct_of(t, program.data) is Some(e)
+                nested = Some(e)
+                nested_ty = c_struct_text(program.data[e].decl)
+            var named = false
+            for a in decl.annotations
+                if a.name == "c" then named = true
+            fields.push(CUnitStructField(v.field_names[j], c_struct_field_name(decl), named, t, c_struct_field_kind(t, program.data, program.classes), nested, nested_ty, decl.span))
+        out.push(CUnitStruct(d.name, id, ty, fields, d.unit, d.decl.span, package_of(d.unit, files, library)))
+    out
+
+/** The opaque value classes of a checked program, in the order of its classes. */
+c_unit_values(program: TProgram, files: Buf[ProgramFile], library: usize) -> Buf[CUnitValue]
+    var out: Buf[CUnitValue] = buf()
+    for k in 0..<program.classes.len()
+        val d = program.classes[k].decl
+        if c_value_type(d) is None then continue
+        val ty = c_value_text(d)
+        if ty == "" then continue
+        out.push(CUnitValue(program.classes[k].name, k, ty, program.classes[k].unit, d.name_span, package_of(program.classes[k].unit, files, library)))
     out
 
 private package_of(unit: usize, files: Buf[ProgramFile], library: usize) -> string = if unit >= library && unit - library < files.len() then files[unit - library].package else ""
@@ -287,7 +391,7 @@ private c_unit_fields(program: TProgram, k: usize) -> Buf[CUnitField]
  * library's `pkg-config` module is asked for its flags; with no bindings there is no unit, and only
  * the link flags are answered. A binding the headers do not declare as its prototype says, or whose
  * package names no header, is reported at the binding, rendered with `sources`. */
-ensure_c_unit(tc: Toolchain, bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries: Buf[CLibrary], sources: Buf[Source]) -> Result[CUnit, string] = ensure_c_unit_of(tc, CUnitParts(bindings, handles, buf(), buf()), libraries, sources)
+ensure_c_unit(tc: Toolchain, bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries: Buf[CLibrary], sources: Buf[Source]) -> Result[CUnit, string] = ensure_c_unit_of(tc, CUnitParts(bindings, handles, buf(), buf(), buf(), buf()), libraries, sources)
 
 /** What a program's C unit is made of: its bindings, its handles' glue, its enum mirrors and its
  * constants. */
@@ -296,6 +400,8 @@ struct CUnitParts
     handles: Buf[CUnitHandle]
     enums: Buf[CUnitEnum]
     constants: Buf[CUnitConstant]
+    structs: Buf[CUnitStruct]
+    values: Buf[CUnitValue]
 
 /** The C unit of a program made of `parts`, as `ensure_c_unit` builds one; each enumerator and
  * constant is measured, and a constant its Avin type cannot hold, or a string constant that is not
@@ -303,7 +409,7 @@ struct CUnitParts
 ensure_c_unit_of(tc: Toolchain, parts: CUnitParts, libraries: Buf[CLibrary], sources: Buf[Source]) -> Result[CUnit, string]
     val bindings = parts.bindings
     val handles = parts.handles
-    if bindings.len() == 0 && handles.len() == 0 && parts.enums.len() == 0 && parts.constants.len() == 0 && libraries.len() == 0 then return Ok(CUnit(None, false, map(), map(), buf()))
+    if bindings.len() == 0 && handles.len() == 0 && parts.enums.len() == 0 && parts.constants.len() == 0 && parts.structs.len() == 0 && parts.values.len() == 0 && libraries.len() == 0 then return Ok(CUnit(None, false, map(), map(), buf()))
     // A binding is checked against a header, always, and a handle's glue compiled against one.
     var refused = ""
     for b in bindings
@@ -330,6 +436,18 @@ ensure_c_unit_of(tc: Toolchain, parts: CUnitParts, libraries: Buf[CLibrary], sou
         var r = report()
         r.add(error(e.span, why))
         refused = refused + r.render(sources[e.unit])
+    for m in parts.structs
+        if package_headers(libraries, m.package) > 0 then continue
+        val why = if m.package == "" then s"the C struct mirror `${m.name}` is checked against the headers a package's manifest names under `c-libraries`, and this program has no avin.hocon" else s"the C struct mirror `${m.name}` has no header to be checked against: name the one that declares `${m.ty}` in a `headers` list of the `c-libraries` of package `${m.package}`"
+        var r = report()
+        r.add(error(m.span, why))
+        refused = refused + r.render(sources[m.unit])
+    for v in parts.values
+        if package_headers(libraries, v.package) > 0 then continue
+        val why = if v.package == "" then s"the opaque value `${v.name}` is measured against the headers a package's manifest names under `c-libraries`, and this program has no avin.hocon" else s"the opaque value `${v.name}` has no header to be measured against: name the one that declares `${v.ty}` in a `headers` list of the `c-libraries` of package `${v.package}`"
+        var r = report()
+        r.add(error(v.span, why))
+        refused = refused + r.render(sources[v.unit])
     for k in parts.constants
         if package_headers(libraries, k.package) > 0 then continue
         val why = if k.package == "" then s"the C constant `${k.name}` is measured against the headers a package's manifest names under `c-libraries`, and this program has no avin.hocon" else s"the C constant `${k.name}` has no header to be measured against: name the one that defines `${k.constant}` in a `headers` list of the `c-libraries` of package `${k.package}`"
@@ -353,7 +471,7 @@ ensure_c_unit_of(tc: Toolchain, parts: CUnitParts, libraries: Buf[CLibrary], sou
             None ->
                 for name in library.link
                     add_flag(&link, "-l" + name)
-    if bindings.len() == 0 && handles.len() == 0 && parts.enums.len() == 0 && parts.constants.len() == 0 then return Ok(CUnit(None, false, map(), map(), link))
+    if bindings.len() == 0 && handles.len() == 0 && parts.enums.len() == 0 && parts.constants.len() == 0 && parts.structs.len() == 0 && parts.values.len() == 0 then return Ok(CUnit(None, false, map(), map(), link))
     val unit = c_unit_source_of(parts, libraries)
     val version = capture(tc.clang, ["--version"], timeout = 60000) match
         Ok(r) -> r.text
@@ -460,6 +578,18 @@ enum CUnitLine
      * field and names its type, `kind` checks that type, `bound` with the index's position compiles
      * its bound, and `write` writes the field. */
     FieldLine(handle: usize, field: usize, part: string)
+    /** A line of the glue `bindings[binding]` is called through: `call` makes the call, `length`
+     * computes the length of the array it answers, `element` checks that array's elements and `free`
+     * frees it. */
+    BindingGlueLine(binding: usize, part: string)
+    /** A line of the check of the struct mirror `structs[mirror]`: `type` declaring its struct and
+     * `kind` checking it is one, and for its field `field` `field` naming the field's type, `kind`
+     * checking it, `nested` checking it is the struct another mirror mirrors, and `order` its offset;
+     * `size` checks no field follows the last, and `full` that the mirror names every field. */
+    StructLine(mirror: usize, field: usize, part: string)
+    /** A line of the check of the opaque value `values[value]`'s C type: `type` declaring it and
+     * `kind` checking it is a struct or a union. */
+    ValueTypeLine(value: usize, part: string)
 
 /** A C unit's text, what each of its lines is for, counting from 1, and the measurement keys of its
  * table, in order. */
@@ -479,12 +609,15 @@ struct CValueEntry
     constant: Option[usize]
     mirror: Option[usize]
     variant: usize
+    /** Whether it is a struct's size or a field's offset, which the checks of the struct mirrors and
+     * opaque values before it place a diagnostic of at the mirror or the value. */
+    layout: bool
 
 /** The C unit for `bindings` and the glue of `handles`, including every header of `libraries`, in
  * `header_order`, so a binding naming another package's handle is checked with that package's
  * headers before its own. Each package's headers keep their order, and a header that is a C
  * identifier is a macro an earlier header defines, included as `#include NAME`. */
-c_unit_source(bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries: Buf[CLibrary]) -> CUnitSource = c_unit_source_of(CUnitParts(bindings, handles, buf(), buf()), libraries)
+c_unit_source(bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries: Buf[CLibrary]) -> CUnitSource = c_unit_source_of(CUnitParts(bindings, handles, buf(), buf(), buf(), buf()), libraries)
 
 /** The C unit of `parts`, as `c_unit_source` writes one, with the check of each enum mirror's type
  * and the values of its enumerators and of the constants: a table of their own, after the
@@ -497,6 +630,10 @@ c_unit_source_of(parts: CUnitParts, libraries: Buf[CLibrary]) -> CUnitSource
     // Line 0 does not exist; lines count from 1.
     lines.push(Plain)
     out.push("/* The C unit of an Avin program: written by the compiler. */\n")
+    lines.push(Plain)
+    // No warning of the headers' or the unit's is reported, and the one the struct mirrors' checks
+    // need is made an error where they need it.
+    out.push("#pragma clang diagnostic ignored \"-Weverything\"\n")
     lines.push(Plain)
     out.push("#include <stdbool.h>\n")
     lines.push(Plain)
@@ -517,6 +654,18 @@ c_unit_source_of(parts: CUnitParts, libraries: Buf[CLibrary]) -> CUnitSource
     var kinds: Buf[string] = buf()
     var measured: Buf[string] = buf()
     var measured_types: Buf[string] = buf()
+    struct_checks(&out, &lines, parts)
+    // The type of each struct mirror's field that is an integer, a truth value or a `real` is
+    // measured.
+    for m in parts.structs
+        for j in 0..<m.fields.len()
+            val kind = m.fields[j].kind match
+                Some(kind) -> kind
+                None -> continue
+            if !c_kind_measured(kind) then continue
+            val name = c_struct_field_type(m.index, j)
+            measured.push(c_measure_key(CTypedef(name), kind))
+            measured_types.push(name)
     // The type of each field read or written as an integer, a truth value or a `real` is measured.
     for h in handles
         for f in h.fields
@@ -540,6 +689,7 @@ c_unit_source_of(parts: CUnitParts, libraries: Buf[CLibrary]) -> CUnitSource
         lines.push(PointerLine(i))
         out.push(s"${p.result_text} ${p.symbol}($params);\n")
         lines.push(DeclareLine(i))
+        if b.glued then binding_glue(&out, &lines, b, i)
         // The function `free:` names takes the string C answered, or any pointer, and answers nothing.
         if b.free is Some(f)
             val fp = s"__typeof__(&$f)"
@@ -550,7 +700,8 @@ c_unit_source_of(parts: CUnitParts, libraries: Buf[CLibrary]) -> CUnitSource
             lines.push(FreeLine(i, f))
         // What each array parameter points at is its elements' type, as it is.
         for k in 0..<p.params.len()
-            if !c_is_array_param(p, k) then continue
+            // An array of a struct mirror is converted into the struct the pointer names.
+            if !c_is_array_param(p, k) || c_array_element_size(b.params[k]) == 0 then continue
             out.push(s"_Static_assert(${element_test(b.params[k], p.params[k].pointee_text)}, \"avin: the elements of parameter ${k + 1} of ${b.name}\");\n")
             lines.push(ElementLine(i, k + 1))
         // Each named type at each position: the result first, then the parameters.
@@ -703,6 +854,116 @@ private handle_glue(out: *StrBuilder, lines: *Buf[CUnitLine], handles: Buf[CUnit
                 glue(out, lines, s"    return self->${f.expr};", FieldLine(i, j, "field"))
                 glue(out, lines, "}", Plain)
 
+// The glue a binding is called through, `avin_c_call_<symbol>`. A struct passed by value is passed to
+// it as a pointer to the struct, and one answered by value is written through a pointer passed first;
+// everything else is passed as the prototype says, so clang classifies each struct for the target.
+// For an array C answers through an `out` pointer, the glue also writes the array's length, its
+// `length:` evaluated after the call over the parameters and the out values by their names, through
+// a pointer passed last; and `avin_c_array_free_<symbol>` frees the array, once copied, by its
+// `free:`, where it is not null.
+private binding_glue(out: *StrBuilder, lines: *Buf[CUnitLine], b: CUnitBinding, i: usize)
+    val p = b.prototype
+    val answered_by_value = b.by_value[0]
+    var params = ""
+    var args = ""
+    var locals = ""
+    if answered_by_value then params = s"${p.result_text} *avin_r"
+    for k in 0..<p.params.len()
+        val q = p.params[k]
+        var param = ""
+        var arg = ""
+        if b.by_value[k + 1]
+            param = s"${q.text} *avin_s$k"
+            arg = s"*avin_s$k"
+        elif !(q.mode is CIn)
+            param = s"${q.text} avin_o$k"
+            arg = s"avin_o$k"
+            if q.name != "" then locals = locals + s" __typeof__(*avin_o$k) ${q.name} = *avin_o$k;"
+        else
+            val name = if q.name == "" then s"avin_a$k" else q.name
+            param = s"${q.text} $name"
+            arg = name
+        params = params + (if params == "" then "" else ", ") + param
+        args = args + (if args == "" then "" else ", ") + arg
+    if b.array_out is Some(_) then params = params + (if params == "" then "" else ", ") + "long long *avin_length"
+    if params == "" then params = "void"
+    val returns = !answered_by_value && !(p.result is CVoidType)
+    val result = if returns then p.result_text else "void"
+    glue(out, lines, s"$result ${c_call_glue(b.symbol)}($params) {", BindingGlueLine(i, "call"))
+    val call = s"${p.symbol}($args)"
+    if answered_by_value then glue(out, lines, s"    *avin_r = $call;", BindingGlueLine(i, "call"))
+    elif returns then glue(out, lines, s"    ${p.result_text} avin_v = $call;", BindingGlueLine(i, "call"))
+    else glue(out, lines, s"    $call;", BindingGlueLine(i, "call"))
+    if b.array_out is Some(a)
+        glue(out, lines, s"   $locals", BindingGlueLine(i, "call"))
+        glue(out, lines, s"    *avin_length = (long long)(${a.length});", BindingGlueLine(i, "length"))
+    if returns then glue(out, lines, "    return avin_v;", BindingGlueLine(i, "call"))
+    glue(out, lines, "}", BindingGlueLine(i, "call"))
+    if b.array_out is Some(a)
+        val name = p.params[a.param].name
+        if c_array_element_size(a.element) > 0
+            glue(out, lines, s"_Static_assert(${element_test(a.element, a.element_text)}, \"avin: the elements of the array ${b.name} answers\");", BindingGlueLine(i, "element"))
+        glue(out, lines, s"void ${c_array_free_glue(b.symbol)}(${a.element_text} *$name) {", BindingGlueLine(i, "free"))
+        a.free match
+            Some(f) ->
+                val freed = if is_c_identifier(f.trim()) then s"${f.trim()}((void *)$name)" else f
+                glue(out, lines, s"    if ($name) { $freed; }", BindingGlueLine(i, "free"))
+            None -> ()
+        glue(out, lines, "}", BindingGlueLine(i, "free"))
+
+// The checks of each struct mirror against its struct and of each opaque value's C type. A mirror's
+// struct is a struct, and each field's C type the kind its Avin type asks for, or the struct another
+// mirror mirrors; the fields come in the header's order, each at the offset C's alignment gives it
+// after the one before, the first at zero and nothing after the last; and the mirror names every
+// field, which an initializer of the struct by position, one value for each field, checks: one too
+// few is an error here, so a field hidden in the padding between two others is found too. Each
+// field's offset and the struct's size are measured in the table of values, as is each opaque value's
+// size.
+private struct_checks(out: *StrBuilder, lines: *Buf[CUnitLine], parts: CUnitParts)
+    for i in 0..<parts.structs.len()
+        val m = parts.structs[i]
+        val own = c_struct_own(m.index)
+        glue(out, lines, s"typedef ${m.ty} $own;", StructLine(i, 0, "type"))
+        glue(out, lines, s"_Static_assert(__builtin_classify_type(*($own *)0) == 12, \"avin: the C struct mirror ${m.name}\");", StructLine(i, 0, "struct"))
+        for j in 0..<m.fields.len()
+            val f = m.fields[j]
+            val name = c_struct_field_type(m.index, j)
+            glue(out, lines, s"typedef __typeof__((($own *)0)->${f.c_name}) $name;", StructLine(i, j, "field"))
+            f.kind match
+                Some(kind) -> glue(out, lines, s"_Static_assert(${kind_test(kind, name)}, \"avin: the field ${f.name} of ${m.name}\");", StructLine(i, j, "kind"))
+                None -> glue(out, lines, s"_Static_assert(__builtin_types_compatible_p($name, ${f.nested_ty}), \"avin: the field ${f.name} of ${m.name}\");", StructLine(i, j, "nested"))
+            val offset = c_offset_expr(own, f.c_name)
+            var wanted = "0"
+            if j > 0
+                val align = s"_Alignof($name)"
+                wanted = s"(${c_offset_expr(own, m.fields[j - 1].c_name)} + sizeof(${c_struct_field_type(m.index, j - 1)}) + $align - 1) / $align * $align"
+            glue(out, lines, s"_Static_assert($offset == $wanted, \"avin: the order of ${m.name}\");", StructLine(i, j, "order"))
+        val n = m.fields.len()
+        var end = "0"
+        if n > 0 then end = s"(${c_offset_expr(own, m.fields[n - 1].c_name)} + sizeof(${c_struct_field_type(m.index, n - 1)}) + _Alignof($own) - 1) / _Alignof($own) * _Alignof($own)"
+        glue(out, lines, s"_Static_assert(sizeof($own) == $end, \"avin: the fields of ${m.name}\");", StructLine(i, n, "size"))
+        glue(out, lines, "#pragma clang diagnostic push", Plain)
+        glue(out, lines, "#pragma clang diagnostic error \"-Wmissing-field-initializers\"", Plain)
+        glue(out, lines, s"static const $own avin_c_struct_full_${m.index} = ${zero_initializer(parts.structs, i)};", StructLine(i, n, "full"))
+        glue(out, lines, "#pragma clang diagnostic pop", Plain)
+    for i in 0..<parts.values.len()
+        val v = parts.values[i]
+        val own = c_value_own(v.index)
+        glue(out, lines, s"typedef ${v.ty} $own;", ValueTypeLine(i, "type"))
+        glue(out, lines, s"_Static_assert(__builtin_classify_type(*($own *)0) == 12 || __builtin_classify_type(*($own *)0) == 13, \"avin: the opaque value ${v.name}\");", ValueTypeLine(i, "kind"))
+
+// An initializer of the struct mirror `structs[i]`'s struct by position, a zero for each field and
+// an initializer of its own for each field another mirror mirrors.
+private zero_initializer(structs: Buf[CUnitStruct], i: usize) -> string
+    var items = ""
+    for f in structs[i].fields
+        var item = "0"
+        if f.nested is Some(e)
+            for k in 0..<structs.len()
+                if structs[k].index == e then item = zero_initializer(structs, k)
+        items = items + (if items == "" then "" else ", ") + item
+    if items == "" then "{ }" else "{ " + items + " }"
+
 /** The packages of `libraries` in the order their headers are included: each after every package
  * whose handle classes its bindings name, and otherwise in the order the libraries are listed. A
  * cycle, which dependencies cannot make, leaves the rest in that order. */
@@ -752,13 +1013,26 @@ private value_table(out: *StrBuilder, lines: *Buf[CUnitLine], parts: CUnitParts)
             val key = c_value_key(CConstInteger, e.enumerators[v])
             if contains_text(keys, key) then continue
             keys.push(key)
-            entries.push(CValueEntry(key, CConstInteger, e.enumerators[v], None, Some(i), v))
+            entries.push(CValueEntry(key, CConstInteger, e.enumerators[v], None, Some(i), v, false))
     for i in 0..<parts.constants.len()
         val k = parts.constants[i]
         val key = c_value_key(k.kind, k.constant)
         if contains_text(keys, key) then continue
         keys.push(key)
-        entries.push(CValueEntry(key, k.kind, k.constant, Some(i), None, 0))
+        entries.push(CValueEntry(key, k.kind, k.constant, Some(i), None, 0, false))
+    // Each struct mirror's size and its fields' offsets, and each opaque value's size.
+    var layouts: Buf[string] = buf()
+    for m in parts.structs
+        layouts.push(c_size_expr(c_struct_own(m.index)))
+        for f in m.fields
+            layouts.push(c_offset_expr(c_struct_own(m.index), f.c_name))
+    for v in parts.values
+        layouts.push(c_size_expr(c_value_own(v.index)))
+    for x in layouts
+        val key = c_value_key(CConstInteger, x)
+        if contains_text(keys, key) then continue
+        keys.push(key)
+        entries.push(CValueEntry(key, CConstInteger, x, None, None, 0, true))
     for j in 0..<entries.len()
         val x = entries[j].expr
         val class = s"__builtin_classify_type($x)"
@@ -910,7 +1184,7 @@ private compile_c_unit(tc: Toolchain, unit: CUnitSource, cflags: Buf[string], ob
     val pending = pending_name(object)
     defer _ = remove_file(pending)
     var args: Buf[string] = buf()
-    for a in ["-c", "-x", "c", "-w", "-fno-color-diagnostics", file, "-o", pending]
+    for a in ["-c", "-x", "c", "-fno-color-diagnostics", file, "-o", pending]
         args.push(a)
     for f in cflags
         args.push(f)
@@ -931,10 +1205,13 @@ private struct BindingTrouble
     kinds: Buf[string]
     /** What is wrong with the function its `free:` names. */
     frees: Buf[string]
+    /** What its glue said, one message for each part of it. */
+    glue_parts: Buf[string]
+    glue: Buf[string]
 
 /** Clang's diagnostics of the C unit `unit`, placed back at the bindings and the libraries they came
  * from; anything clang said that no line of the unit accounts for is passed on as it was. */
-c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries: Buf[CLibrary], sources: Buf[Source]) -> string = c_unit_diagnostics_of(output, unit, CUnitParts(bindings, handles, buf(), buf()), libraries, sources)
+c_unit_diagnostics(output: string, unit: CUnitSource, bindings: Buf[CUnitBinding], handles: Buf[CUnitHandle], libraries: Buf[CLibrary], sources: Buf[Source]) -> string = c_unit_diagnostics_of(output, unit, CUnitParts(bindings, handles, buf(), buf(), buf(), buf()), libraries, sources)
 
 /** Clang's diagnostics of the C unit of `parts`, as `c_unit_diagnostics` places them, with those of
  * the enum mirrors and the constants placed at each. */
@@ -949,9 +1226,17 @@ c_unit_diagnostics_of(output: string, unit: CUnitSource, parts: CUnitParts, libr
     for _ in unit.values
         value_said.push(false)
     var values_text = ""
+    // What each struct mirror's checks said, by field or by the whole, and each opaque value's.
+    var struct_said: Buf[Buf[string]] = buf()
+    for _ in parts.structs
+        struct_said.push(buf())
+    var value_type_said: Buf[bool] = buf()
+    for _ in parts.values
+        value_type_said.push(false)
+    var structs_text = ""
     var troubles: Buf[BindingTrouble] = buf()
     for _ in bindings
-        troubles.push(BindingTrouble("", "", false, "", "", buf(), buf(), buf()))
+        troubles.push(BindingTrouble("", "", false, "", "", buf(), buf(), buf(), buf(), buf()))
     // What each handle's glue said, one message for each part of its `@c`.
     var glue_parts: Buf[Buf[string]] = buf()
     var glue_messages: Buf[Buf[string]] = buf()
@@ -1098,6 +1383,8 @@ c_unit_diagnostics_of(output: string, unit: CUnitSource, parts: CUnitParts, libr
                 if value_said[j] then continue
                 value_said[j] = true
                 val entry = unit.values[j]
+                // A struct's size or a field's offset fails where its check before it does.
+                if entry.layout then continue
                 val undeclared = d.message.starts_with("use of undeclared identifier")
                 var m = ""
                 var span = Span(0, 0)
@@ -1131,8 +1418,60 @@ c_unit_diagnostics_of(output: string, unit: CUnitSource, parts: CUnitParts, libr
                 var r = report()
                 r.add(error(span, m))
                 values_text = values_text + r.render(sources[at_unit])
+            BindingGlueLine(i, part) ->
+                placed_any = true
+                if contains_text(troubles[i].glue_parts, part) then continue
+                troubles[i].glue_parts.push(part)
+                val b = bindings[i]
+                val a = b.array_out
+                val array = a match
+                    Some(x) -> b.prototype.params[x.param].name
+                    None -> ""
+                if part == "length" then troubles[i].glue.push(s"the C binding `${b.name}` gives the length of the array `$array` as `${a.unwrap().length}`, which does not compile against its headers: clang says '${d.message}'")
+                elif part == "free" then troubles[i].glue.push(s"the C binding `${b.name}` frees the array `$array` with `${a.unwrap().free.unwrap_or("")}`, which does not compile against its headers: clang says '${d.message}'")
+                elif part == "element" then troubles[i].kinds.push(s"the C type `${a.unwrap().element_text}` the array `$array` points at is not ${element_text(a.unwrap().element)} in the headers, so it cannot hold the elements of an `Array[${type_name(a.unwrap().element)}]` as they are")
+                else troubles[i].glue.push(s"the C binding `${b.name}` cannot be called through its glue: clang says '${d.message}'")
+            StructLine(i, j, part) ->
+                placed_any = true
+                val m = parts.structs[i]
+                val whole = part == "size" || part == "full" || part == "type" || part == "struct"
+                val key = if whole then part else s"field $j"
+                if contains_text(struct_said[i], "type") || contains_text(struct_said[i], "struct") || contains_text(struct_said[i], key) then continue
+                // A field that does not compile makes the order of the next one fail too, and a
+                // misplaced field the size.
+                if part == "order" && j > 0 && contains_text(struct_said[i], s"field ${j - 1}") then continue
+                if (part == "size" || part == "full") && struct_said[i].len() > 0 then continue
+                struct_said[i].push(key)
+                var msg = ""
+                if part == "type" then msg = s"the C struct mirror `${m.name}` mirrors `${m.ty}`, which its headers do not declare as a type: clang says '${d.message}'"
+                elif part == "struct" then msg = s"the C struct mirror `${m.name}` mirrors `${m.ty}`, which is not a struct in its headers"
+                elif part == "size"
+                    msg = if m.fields.len() == 0 then s"`${m.ty}` has fields in its headers, and the C struct mirror `${m.name}` mirrors none: a struct mirror mirrors every field of its struct" else s"`${m.ty}` has fields after `${m.fields[m.fields.len() - 1].c_name}` in its headers that the C struct mirror `${m.name}` does not mirror: a struct mirror mirrors every field of its struct"
+                elif part == "full" then msg = s"`${m.ty}` has a field in its headers that the C struct mirror `${m.name}` does not mirror, in the padding between two it does: a struct mirror mirrors every field of its struct"
+                else
+                    val f = m.fields[j]
+                    if d.message.contains("bit-field") then msg = s"the field `${f.c_name}` of `${m.ty}` is a bit-field, which no mirror holds: a struct with one crosses as an opaque value, a class declared `@c(value: \"${m.ty}\")`"
+                    elif part == "field"
+                        msg = s"the field `${f.name}` of the C struct mirror `${m.name}` mirrors `${f.c_name}`, which is not a field of `${m.ty}` in its headers"
+                        if !f.named then msg = msg + s"; a field whose C name is not its words in snake_case names it with `@c(\"<name>\")` before the field"
+                    elif part == "kind" then msg = s"the field `${f.c_name}` of `${m.ty}` is not ${field_kind_text(f.kind.unwrap())} in the headers, so the field `${f.name}` of the C struct mirror `${m.name}` cannot be `${type_name(f.avin)}`"
+                    elif part == "nested" then msg = s"the field `${f.c_name}` of `${m.ty}` is not `${f.nested_ty}` in the headers, so the field `${f.name}` of the C struct mirror `${m.name}` cannot be `${type_name(f.avin)}`, which mirrors it"
+                    elif j == 0 then msg = s"the field `${f.c_name}` is not the first field of `${m.ty}` in its headers: a struct mirror lists its struct's fields in the header's order"
+                    else msg = s"the field `${f.c_name}` of `${m.ty}` does not follow `${m.fields[j - 1].c_name}` in its headers: a struct mirror lists its struct's fields in the header's order"
+                var r = report()
+                r.add(error(if whole then m.span else m.fields[j].span, msg))
+                structs_text = structs_text + r.render(sources[m.unit])
+            ValueTypeLine(i, part) ->
+                placed_any = true
+                if value_type_said[i] then continue
+                value_type_said[i] = true
+                val v = parts.values[i]
+                val msg = if part == "kind" then s"the opaque value `${v.name}` holds a copy of `${v.ty}`, which is not a struct or a union in its headers: a scalar crosses as itself" else s"the opaque value `${v.name}` holds a copy of `${v.ty}`, which its headers do not declare as a type: clang says '${d.message}'"
+                var r = report()
+                r.add(error(v.span, msg))
+                structs_text = structs_text + r.render(sources[v.unit])
             Plain -> unplaced = unplaced + text + "\n"
-    var rendered = libraries_text + values_text
+    var rendered = libraries_text + values_text + structs_text
     for i in 0..<handles.len()
         if glue_messages[i].len() == 0 then continue
         var r = report()
@@ -1160,6 +1499,9 @@ c_unit_diagnostics_of(output: string, unit: CUnitSource, parts: CUnitParts, libr
             messages.push(s"the C binding `${b.name}` does not fit its headers: $k")
         for m in t.frees
             messages.push(m)
+        // A call the header check already refuses does not compile in its glue either.
+        for m in t.glue
+            if messages.len() == 0 || !m.contains("cannot be called through its glue") then messages.push(m)
         if messages.len() == 0 then continue
         var r = report()
         for m in messages

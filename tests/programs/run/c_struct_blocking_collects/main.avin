@@ -1,0 +1,117 @@
+// expect: exit 0
+// Structs crossing calls while the collector runs: a blocking call passing and answering a mirror
+// by value through its glue, one reading a mirror with a string through a `const` pointer, one
+// taking an opaque value by value and one reading an array of mirrors, each waiting on a flag
+// another thread sets after allocating, so collections run during the wait; what the call was passed
+// is C memory, or an object the call keeps alive, so C reads it whole after the wait. Then mirrors,
+// strings in them, arrays of them C answers and opaque values made fresh in a loop while another
+// thread collects, every value read back as it was written. The corpus runs this with the collector
+// at every allocation, at -O0 and -O2.
+import avin.threads.spawn
+
+@c("void aa_set_flag(void)")
+setFlag()
+
+@c("void aa_clear_flag(void)")
+clearFlag()
+
+@c(enum: "as_kind", prefix: "AS_KIND_")
+data Kind
+    Plain
+    Bold
+    Faint
+
+@c(struct: "as_point")
+data Point(x: real, y: real)
+
+@c(struct: "as_rect")
+data Rect(origin: Point, size: Point)
+
+@c(struct: "as_named")
+data Named(name: Option[string], id: int, kind: Kind, on: bool, truth: bool)
+
+@c(struct: "as_glyph")
+data Glyph(index: long, x: real, y: real)
+
+@c(value: "as_event")
+class Event
+    @c("int32_t as_event_to_int(as_event self)")
+    toInt() -> int
+
+@c("as_event as_event_int(int32_t i)")
+eventOf(i: int) -> Event
+
+@c("as_rect as_wait_grow(as_rect r, double by, int timeout_ms)", blocking)
+waitGrow(r: Rect, by: real, timeout: int) -> Rect
+
+@c("long long as_wait_named(const as_named *n, int timeout_ms)", blocking)
+waitNamed(n: Named, timeout: int) -> long
+
+@c("int32_t as_wait_event(as_event e, int timeout_ms)", blocking)
+waitEvent(e: Event, timeout: int) -> int
+
+@c("double as_wait_glyphs(const as_glyph *glyphs, length(glyphs) int count, int timeout_ms)", blocking)
+waitGlyphs(glyphs: Array[Glyph], timeout: int) -> real
+
+@c("as_rect as_rect_grow(as_rect r, double by)")
+grow(r: Rect, by: real) -> Rect
+
+@c("as_named as_named_make(int which)")
+namedMake(which: int) -> Named
+
+@c("long long as_named_length(const as_named *n)")
+namedLength(n: Named) -> long
+
+@c("void as_names_make(int n, out as_named **names, out int *count)", array: "names", length: "count", free: "free")
+namesMake(n: int) -> (Array[Named], int)
+
+@c("int as_glyphs_allocated(void)")
+allocated() -> int
+
+@c("int as_glyphs_freed(void)")
+freed() -> int
+
+@c("void as_glyphs_answer(int n, out as_glyph **glyphs, out long *count)", array: "glyphs", length: "count", free: "as_glyphs_free")
+glyphsAnswer(n: int) -> (Array[Glyph], long)
+
+// Allocates `n` small vectors, then sets the flag.
+churn(n: int) -> int
+    var total = 0
+    for i in 0..<n
+        val v = [i, i + 1]
+        total += v(1) - v(0)
+    setFlag()
+    total
+
+main()
+    clearFlag()
+    val first = spawn(() -> churn(500))
+    println(waitGrow(Rect(Point(1.0, 1.0), Point(2.0, 3.0)), 0.5, 60000))
+    println(first.join())
+    clearFlag()
+    val second = spawn(() -> churn(500))
+    println(waitNamed(Named(Some("wait é"), 4, Bold, true, false), 60000))
+    second.join()
+    clearFlag()
+    val third = spawn(() -> churn(500))
+    println(waitEvent(eventOf(77), 60000))
+    third.join()
+    clearFlag()
+    val fourth = spawn(() -> churn(500))
+    println(waitGlyphs(Array.tabulate(10, i -> Glyph(long(i), 1.0, 1.0)), 60000))
+    fourth.join()
+    // Fresh structs in a loop while another thread collects.
+    val noise = spawn(() -> churn(5000))
+    var good = 0
+    for round in 0..<200
+        val r = grow(Rect(Point(real(round), 0.0), Point(1.0, 1.0)), 1.0)
+        val n = namedMake(round % 3)
+        val (names, count) = namesMake(round % 4)
+        val (glyphs, length) = glyphsAnswer(round % 5)
+        val e = eventOf(round)
+        val text = s"#${round}"
+        val ok = r == Rect(Point(real(round) - 1.0, -1.0), Point(3.0, 3.0)) && namedLength(n) == namedLength(namedMake(round % 3)) && names.length() == count && glyphs.length() == int(length) && e.toInt() == round && namedLength(Named(Some(text), 0, Plain, false, false)) == long(text.byteLength()) * 1000
+        if ok then good += 1
+    noise.join()
+    println(good)
+    println(allocated() == freed())

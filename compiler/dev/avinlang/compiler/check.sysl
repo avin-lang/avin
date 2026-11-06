@@ -832,6 +832,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
         declare_fields(&c, u)
     for id in 0..<c.data.len()
         check_mirror(&c, id)
+        check_c_struct_mirror(&c, id)
     // A subclass's fields and methods follow its superclass's, wherever either is declared.
     for id in 0..<c.classes.len()
         inherit_fields(&c, id)
@@ -3024,6 +3025,8 @@ private declare_methods(c: *Checker, unit: usize)
         // Every handle has `close()`, which gives back its Sysl value or its C object.
         val handle = handle_target(d) is Some(_)
         val c_handle = c_handle_type(d) is Some(_)
+        // An opaque value's methods without a body are C bindings too; it has no `close()`.
+        val c_value = c_value_type(d) is Some(_)
         if handle || c_handle
             var named = false
             for m in d.members
@@ -3087,8 +3090,8 @@ private declare_methods(c: *Checker, unit: usize)
             // declaration of the handle has checked their annotations.
             val bound_method = handle && !entry.from_impl && !entry.static_member && f.body is None && f.clauses.len() == 0
             // A C handle's own methods without a body are C bindings, checked with their signatures.
-            val c_method = c_handle && !entry.from_impl && !entry.static_member && f.body is None && f.clauses.len() == 0
-            if method_annotations(f) > 0 && !intrinsic_method && !((handle || c_handle) && !entry.from_impl) then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
+            val c_method = (c_handle || c_value) && !entry.from_impl && !entry.static_member && f.body is None && f.clauses.len() == 0
+            if method_annotations(f) > 0 && !intrinsic_method && !((handle || c_handle || c_value) && !entry.from_impl) then c.note(file_unit, f.name_span, "annotations on methods are not implemented")
             if overrides then refuse_override_defaults(c, file_unit, f)
             if entry.static_member && !static_member_allowed(c, file_unit, f, c.classes[id].name, is_trait(c, id), overrides) then continue
             if is_trait(c, id)
@@ -7127,14 +7130,17 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
         if sysl then c.note(unit, a.span, "a function is a Sysl binding or a C binding, not both")
         if f.body is Some(_) || f.clauses.len() > 0 then c.note(unit, a.span, "a C binding has no body: the C function its prototype names is its body")
         var receiver_class: Option[usize] = None
+        // An opaque value's method takes the value as `self`, by value.
+        var value_receiver: Option[usize] = None
         if method
             val k = holder match
                 Some(k) -> k
                 None -> c.classes.len()
-            if k >= c.classes.len() || c_handle_type(c.classes[k].decl) is None
-                c.note(unit, a.span, "`@c` on a method binds a method of a C handle, a class declared with `@c(type: …)`; a C binding is otherwise a top-level function")
+            if k < c.classes.len() && c_value_type(c.classes[k].decl) is Some(_) then value_receiver = Some(k)
+            elif k >= c.classes.len() || c_handle_type(c.classes[k].decl) is None
+                c.note(unit, a.span, "`@c` on a method binds a method of a C handle, a class declared with `@c(type: …)`, or of an opaque value, one declared with `@c(value: …)`; a C binding is otherwise a top-level function")
                 continue
-            receiver_class = Some(k)
+            else receiver_class = Some(k)
         if f.type_params.len() > 0
             c.note(unit, f.name_span, "a C binding is not generic: the C function has one signature")
             continue
@@ -7148,6 +7154,10 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
         if a.args.len() >= 1 && a.args[0].name is None
             if a.args[0].value.kind is StringLit(t) then text = Some(t)
         var free: Option[string] = None
+        var free_text: Option[string] = None
+        var free_span = a.span
+        var array_name: Option[string] = None
+        var length_text: Option[string] = None
         var named_ok = true
         var borrowed = false
         var blocking = false
@@ -7188,16 +7198,37 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                 for name in names
                     if n == "keeps" then keeps.push(name) else consumes.push(name)
                 continue
-            if n != "free"
-                c.note(unit, arg.value.span, s"`$n:` is not a word of `@c` on a function, which takes `free:`, `keeps:`, `consumes:`, `borrowed` and `blocking`")
+            if n == "array" || n == "length"
+                if contains_name(given, n)
+                    c.note(unit, arg.value.span, s"`$n:` is given once")
+                    continue
+                given.push(n)
+                if arg.value.kind is StringLit(t)
+                    if t == "" then c.note(unit, arg.value.span, s"`$n:` " + (if n == "array" then "names the `out` parameter C answers an array through" else "is the C expression the array's length is") + ", and is empty")
+                    else
+                        if n == "array" then array_name = Some(t) else length_text = Some(t)
+                else c.note(unit, arg.value.span, s"`$n:` takes a string, as in " + (if n == "array" then "`array: \"glyphs\"`" else "`length: \"num_glyphs\"`"))
                 continue
-            if free is Some(_)
+            if n != "free"
+                c.note(unit, arg.value.span, s"`$n:` is not a word of `@c` on a function, which takes `free:`, `keeps:`, `consumes:`, `array:`, `length:`, `borrowed` and `blocking`")
+                continue
+            if free is Some(_) || free_text is Some(_)
                 c.note(unit, arg.value.span, "`free:` is given once")
                 continue
             if arg.value.kind is StringLit(name)
-                if is_c_identifier(name) then free = Some(name)
-                else c.note(unit, arg.value.span, s"`free:` names a C function, and `$name` is not a C identifier")
+                free_text = Some(name)
+                free_span = arg.value.span
             else c.note(unit, arg.value.span, "`free:` names the C function that frees the string as a string, as in `free: \"free\"`")
+        // `free:` frees the array `array:` names where there is one, with a C function or a C
+        // expression in the array's name, and otherwise the string the binding answers, with a C
+        // function.
+        if free_text is Some(name)
+            if array_name is Some(arr)
+                if !is_c_identifier(name) && !c_uses_name(name, arr) then c.note(unit, free_span, s"`free:` names the C function that frees the array `$arr`, or is a C expression in `$arr`, and `$name` is neither")
+            elif is_c_identifier(name) then free = Some(name)
+            else c.note(unit, free_span, s"`free:` names a C function, and `$name` is not a C identifier")
+        if length_text is Some(_) && array_name is None then c.note(unit, a.span, "`length:` is the length of the array C answers through the `out` parameter `array:` names, and the binding names none")
+        if array_name is Some(arr) && length_text is None then c.note(unit, a.span, s"C answers the array `$arr` with no length of its own, so the binding says it with `length:`, a C expression over the call's parameters and out values, as in `length: \"num_glyphs\"`")
         if !named_ok then text = None
         val written = text match
             Some(t) -> t
@@ -7210,7 +7241,15 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                 c.note(unit, a.args[0].value.span, s"`@c` takes the C function's prototype as the header writes it, as in `@c(\"int abs(int)\")`, and this one is not: $why")
                 continue
         // A method's receiver is the prototype's first parameter, `self`.
-        val first = if receiver_class is Some(_) then 1usize else 0usize
+        val first = if receiver_class is Some(_) || value_receiver is Some(_) then 1usize else 0usize
+        if value_receiver is Some(k)
+            if p.params.len() == 0 || p.params[0].name != "self" || !(p.params[0].mode is CIn)
+                c.note(unit, a.args[0].value.span, "the prototype of an opaque value's method takes the value first, named `self`, as in `int mlt_event_data_to_int(mlt_event_data self)`")
+                continue
+            val wanted = c_value_text(c.classes[k].decl)
+            if wanted != "" && !c_names_struct(p.params[0].text, wanted)
+                c.note(unit, a.args[0].value.span, s"the receiver `self` of `${f.name}` is a `${c.classes[k].name}`, a copy of `$wanted` passed by value, and the prototype says `${p.params[0].text}`")
+                continue
         if receiver_class is Some(k)
             if p.params.len() == 0 || p.params[0].name != "self" || !(p.params[0].mode is CIn)
                 c.note(unit, a.args[0].value.span, s"the prototype of a C handle's method takes the receiver first, named `self`, as in `int cairo_status(cairo_t *self)`")
@@ -7247,13 +7286,19 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
             val array = c_array_form(t, c.data, c.classes)
             if c_is_array_param(p, positions[i + first])
                 problem = array match
-                    Some(form) -> c_array_problem(cp, form)
+                    Some(form) -> c_array_problem(cp, form, c.data)
                     None -> s"`${cp.name}` is an array, its length carried by the parameter marked `length(${cp.name})`, so it crosses as an `Array` or an `Option` of one"
             elif array is Some(_) && inout then problem = "an array is passed in, a pointer to its elements, and never `inout`"
             elif array is Some(_) && cp.name == "" then problem = "C could read past the end of an array whose length nothing carries: name the pointer, and mark the integer parameter that carries its length `length(name)`"
             elif array is Some(_) then problem = s"C could read past the end of an array whose length nothing carries: mark the integer parameter that carries it `length(${cp.name})`"
             elif c_handle_form(t, c.data, c.classes) is Some(h)
                 problem = if inout then "a handle is not passed `inout`: whether C keeps the reference it is passed or replaces it, the binding cannot say" else c_handle_problem(c, h.class_index, cp.text, false)
+            elif c_struct_form(t, c.data) is Some(m) then problem = c_struct_problem(c, m, cp)
+            elif c_value_class_of(t, c.classes) is Some(k)
+                val wanted = c_value_text(c.classes[k].decl)
+                if inout then problem = "an opaque value is passed by value, and never `inout`"
+                elif !c_names_struct(cp.text, wanted) then problem = s"`${c.classes[k].name}` is a copy of `$wanted`, so it is passed by value, as `$wanted`"
+            elif c_value_option(t, c.data, c.classes) then problem = "an opaque value is passed by value, which is never null, so it is not in an `Option`"
             elif c_mirror_of(t, c.data) is Some(d) then problem = c_mirror_problem(c.data[d].decl, c.data[d].name, ctext)
             else problem = c_crossing_problem(ctype, t, c_text_form(t, c.data, c.classes), false)
             if problem != "" then c.note(unit, decl.ty.span, s"parameter ${i + 1} of the C binding `${f.name}` is `${type_name(t)}` in Avin and `${cp.text}` in C" + (if inout then ", `inout`" else "") + s": $problem")
@@ -7273,6 +7318,8 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                 elif c_handle_form(answered, c.data, c.classes) is Some(h)
                     made = Some(h.class_index)
                     val problem = c_handle_problem(c, h.class_index, p.result_text, true)
+                    if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(answered)}` in Avin and `${p.result_text}` in C: $problem")
+                elif c_struct_result_problem(c, answered, p.result_text) is Some(problem)
                     if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(answered)}` in Avin and `${p.result_text}` in C: $problem")
                 elif c_status_error(answered, c.data) is Some(e)
                     // A status is an integer, of C's keywords, an enumeration or a typedef of one, or
@@ -7295,6 +7342,7 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                     val problem = c_crossing_problem(p.result, answered, form, true)
                     if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(answered)}` in Avin and `${p.result_text}` in C: $problem")
                 // Each out value crosses as a result does, from the type its pointer points at.
+                var array_found = false
                 var j = 0usize
                 for q in p.params
                     if q.mode is CIn then continue
@@ -7302,19 +7350,31 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                     j += 1
                     if *t is ErrorType then continue
                     var problem = ""
-                    if q.length_of != ""
+                    val outs_word = "an out value is a scalar, a string, a handle, an enum mirror or a struct mirror"
+                    if array_name is Some(arr) && q.name == arr
+                        problem = c_array_out_problem(c, q, t)
+                        array_found = true
+                    elif q.length_of != ""
                         if !(*t is Int(_)) then problem = s"the length C writes back through `${q.name}`, how much of `${q.length_of}` it used, is an integer"
                         else problem = c_crossing_problem(q.pointee, t, NoText, true)
-                    elif *t is Unit then problem = "an out value is a scalar, a string, a handle or an enum mirror"
+                    elif *t is Unit then problem = outs_word
+                    elif c_struct_form(t, c.data) is Some(m)
+                        val d = c.data[m.class_index]
+                        val wanted = c_struct_text(d.decl)
+                        if m.optional then problem = s"C fills an out value, so it is never `None`"
+                        elif wanted != "" && q.pointee_text != wanted then problem = s"`${d.name}` mirrors `$wanted`, so C fills it through `${if q.mode is CInOut then "inout" else "out"} $wanted *`"
+                    elif c_value_class_of(t, c.classes) is Some(_) || c_value_option(t, c.data, c.classes) then problem = "an opaque value is passed and answered by value, and never through a pointer"
+                    elif c_array_form(t, c.data, c.classes) is Some(_) && c_text_form(t, c.data, c.classes) is NoText then problem = s"an array C answers through `${q.name}` is named with `array:`, its length given with `length:`, as in `array: \"${q.name}\", length: \"count\"`"
                     elif c_handle_form(t, c.data, c.classes) is Some(h)
                         if q.mode is CInOut then problem = "a handle is not passed `inout`: whether C keeps the reference it is passed or replaces it, the binding cannot say"
                         else
                             problem = c_handle_problem(c, h.class_index, q.pointee_text, true)
                             if made is None then made = Some(h.class_index)
                     elif c_mirror_of(t, c.data) is Some(d) then problem = c_mirror_problem(c.data[d].decl, c.data[d].name, q.pointee_text)
-                    elif c_status_error(t, c.data) is Some(_) then problem = "an out value is a scalar, a string, a handle or an enum mirror"
+                    elif c_status_error(t, c.data) is Some(_) then problem = outs_word
                     else problem = c_crossing_problem(q.pointee, t, c_text_form(t, c.data, c.classes), true)
                     if problem != "" then c.note(unit, at, s"out value $j of the C binding `${f.name}`, `${q.name}`, is `${type_name(t)}` in Avin and `${q.pointee_text}` in C: $problem")
+                if array_name is Some(arr) && !array_found then c.note(unit, a.span, s"`array:` names the `out` parameter C answers an array through, and `$arr` is no `out` parameter of the prototype")
                 // Only a string C answers is freed, and one bound as `unit` is freed and discarded.
                 val text = p.result is CText(_) || (p.result is CTypedef(_) && !(form is NoText))
                 if free is Some(_) && !text
@@ -7429,7 +7489,62 @@ private check_c_field(c: *Checker, unit: usize, f: &Function, a: Annotation, par
 
 private index_count(n: usize) -> string = if n == 1 then "1 index" else s"$n indices"
 
-// What is wrong with a handle of class `k` at a C position written `text`, or "": the position names
+// What is wrong with the struct mirror `m.class_index`, perhaps in an `Option`, passed to the
+// prototype's parameter `q`, or "": by value as its struct, by a `const` pointer to it, which an
+// `Option`'s `None` passes null to, or `inout` through a pointer to it, which C reads and writes.
+private c_struct_problem(c: *Checker, m: CHandleForm, q: CParam) -> string
+    val d = c.data[m.class_index]
+    val wanted = c_struct_text(d.decl)
+    if wanted == "" then return ""
+    if q.mode is CInOut
+        if m.optional then return "an `inout` value is read and written by C, so it is never `None`"
+        return if q.pointee_text == wanted then "" else s"`${d.name}` mirrors `$wanted`, so it is passed `inout` as `inout $wanted *`"
+    if q.ty is CPointerType
+        if c_points_at_const_struct(q.pointee_text, wanted) then return ""
+        if q.pointee_text == wanted then return s"C may write through `${q.text}`, so a mirror passed in goes to `const $wanted *`, and one C fills or updates is `out` or `inout`"
+    elif c_names_struct(q.text, wanted)
+        return if m.optional then s"`None` is null, so an `Option` of a mirror is passed as `const $wanted *`" else ""
+    s"`${d.name}` mirrors `$wanted`, so it crosses as `$wanted` by value or `const $wanted *`"
+
+// What is wrong with the out value of type `t` that `array:` names, C answering it through `q`, or
+// "": an `Array` of a struct mirror or of an element type an array crosses as, perhaps in an
+// `Option` for null, through an `out` pointer to a pointer to its elements.
+private c_array_out_problem(c: *Checker, q: CParam, t: &Type) -> string
+    if q.mode is CInOut then return s"C answers the array `${q.name}`, so it is `out`, not `inout`"
+    val element_text = c_array_out_element(q)
+    if element_text == "" then return s"C answers an array through a pointer to a pointer to its elements, as in `out cairo_glyph_t **${q.name}`"
+    val form = c_array_form(t, c.data, c.classes) match
+        Some(f) -> f
+        None -> return "the array C answers is copied into an `Array`, or an `Option` of one for null"
+    if c_struct_of(form.element, c.data) is Some(d)
+        val wanted = c_struct_text(c.data[d].decl)
+        if wanted != "" && !c_names_struct(element_text, wanted) then return s"`${c.data[d].name}` mirrors `$wanted`, so an array of it is answered as `out $wanted **${q.name}`"
+        return ""
+    if c_array_element_size(form.element) == 0 then return "an array C answers is copied into an `Array[byte]`, `Array[int]`, `Array[long]`, `Array[real]` or an `Array` of a struct mirror"
+    ""
+
+// Whether `t` is an `Option` of an opaque value, which no C position takes.
+private c_value_option(t: &Type, data: Buf[DataSymbol], classes: Buf[ClassSymbol]) -> bool = *t match
+    Data(o, _, args) -> data[o].module_name == "avin" && data[o].name == "Option" && args.len() == 1 && c_value_class_of(args[0], classes) is Some(_)
+    _ -> false
+
+// What is wrong with the result of type `t`, a struct mirror or an opaque value, at a C result
+// written `text`, or "": the struct, by value, never null.
+private c_struct_result_problem(c: *Checker, t: &Type, text: string) -> Option[string]
+    if c_struct_form(t, c.data) is Some(m)
+        val d = c.data[m.class_index]
+        val wanted = c_struct_text(d.decl)
+        if m.optional then return Some(s"a struct C answers by value is never null, so its mirror is not in an `Option`")
+        if wanted == "" || c_names_struct(text, wanted) then return Some("")
+        return Some(s"`${d.name}` mirrors `$wanted`, so it is answered by value, as `$wanted`")
+    if c_value_class_of(t, c.classes) is Some(k)
+        val wanted = c_value_text(c.classes[k].decl)
+        if wanted == "" || c_names_struct(text, wanted) then return Some("")
+        return Some(s"`${c.classes[k].name}` is a copy of `$wanted`, so it is answered by value, as `$wanted`")
+    if c_value_option(t, c.data, c.classes) then return Some("a value C answers by value is never null, so an opaque value is not in an `Option`")
+    None
+
+// What is wrong with the handle of class `k` at a C position written `text`, or "": the position names
 // the class's own C type.
 private c_handle_problem(c: *Checker, k: usize, text: string, result: bool) -> string
     val own = c_handle_type(c.classes[k].decl).unwrap()
@@ -7763,6 +7878,9 @@ private check_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
 // `@c("name")` names. The C type is an enumeration or an integer type, which the C unit checks, as it
 // measures each enumerator. A variant's `@c` is only a mirror's.
 private check_c_enum_declaration(c: *Checker, unit: usize, d: &DataDecl)
+    if c_says_struct(d)
+        check_c_struct_declaration(c, unit, d)
+        return
     var mirror = false
     var seen = false
     for a in d.annotations
@@ -7809,6 +7927,9 @@ private check_c_enum_declaration(c: *Checker, unit: usize, d: &DataDecl)
     var enumerators: Buf[string] = buf()
     val e = c_enum_of(d)
     for v in d.variants
+        for field in v.fields
+            for fa in field.annotations
+                if fa.name == "c" then c.note(unit, fa.span, s"`@c` on a field names the C field a field of a C struct mirror mirrors, and `${d.name}` mirrors no C struct")
         for va in v.annotations
             if va.name != "c" then continue
             if !mirror
@@ -7828,6 +7949,108 @@ private check_c_enum_declaration(c: *Checker, unit: usize, d: &DataDecl)
             if contains_name(enumerators, name) then c.note(unit, v.span, s"the variant `${v.name}` of the C enum mirror `${d.name}` mirrors `$name`, as a variant before it does")
             enumerators.push(name)
 
+// Whether a data type's `@c` names a struct with `struct:`, which makes it a struct mirror rather
+// than an enum mirror.
+private c_says_struct(d: &DataDecl) -> bool
+    for a in d.annotations
+        if a.name != "c" then continue
+        for arg in a.args
+            if arg.name is Some(n) && n == "struct" then return true
+    false
+
+// A data type declared `@c(struct: "<C type>")` mirrors a C struct passed by value or through a
+// pointer: one variant named as the type, whose fields are the struct's, each matched to the C field
+// of its words in snake_case or to the one its own `@c("name")` names. The struct is a typedef or
+// `struct tag`, never a union or a pointer; which C fields it has, in which order and at which
+// offsets, the C unit checks. What the fields may be is checked once their types are known, by
+// `check_c_struct_mirror`.
+private check_c_struct_declaration(c: *Checker, unit: usize, d: &DataDecl)
+    var seen = false
+    for a in d.annotations
+        if a.name == "sysl" then c.note(unit, a.span, "a data type mirrors a Sysl type or a C struct, not both")
+        if a.name != "c" then continue
+        if seen
+            c.note(unit, a.span, "a C struct mirror has one `@c`")
+            continue
+        seen = true
+        for arg in a.args
+            val n = arg.name match
+                Some(n) -> n
+                None ->
+                    c.note(unit, arg.value.span, "`@c` on a data type mirrors a C struct with `struct:`, as in `@c(struct: \"cairo_matrix_t\")`")
+                    continue
+            if n != "struct"
+                c.note(unit, arg.value.span, s"`$n:` is not a word of `@c` on a C struct mirror, which takes `struct:` alone")
+                continue
+            val text = arg.value.kind match
+                StringLit(t) -> t
+                _ ->
+                    c.note(unit, arg.value.span, "`struct:` takes a string, as in `struct: \"cairo_matrix_t\"`")
+                    continue
+            val problem = parse_c_type(text) match
+                Ok(t) -> t.ty match
+                    CTypedef(_) -> ""
+                    CRecordType(name) -> if name.starts_with("union ") then s"`$text` is a union, whose fields share their memory, so it crosses as an opaque value, a class declared `@c(value: \"$text\")`" else ""
+                    CPointerType -> s"`$text` is a pointer: a struct C allocates is a handle, and a mirror names the struct itself"
+                    _ -> s"`$text` is not a struct"
+                Err(why) -> s"`$text` is not a C type: $why"
+            if problem != "" then c.note(unit, arg.value.span, s"`struct:` names the C struct the type mirrors, and $problem")
+    if d.type_params.len() > 0 then c.note(unit, d.type_params[0].span, "a C struct mirror has no type parameters: it mirrors one C struct")
+    if d.variants.len() != 1 || d.variants[0].name != d.name
+        val at = if d.variants.len() > 0 then d.variants[if d.variants.len() > 1 then 1 else 0].span else d.span
+        c.note(unit, at, s"a C struct mirror has one variant, named as the type, whose fields are the struct's: `${d.name}(…)`")
+    for v in d.variants
+        for va in v.annotations
+            if va.name == "c" then c.note(unit, va.span, "`@c` on a variant names an enumerator of a C enum mirror; a struct mirror's fields name their C fields with `@c(\"name\")`")
+        var names: Buf[string] = buf()
+        for field in v.fields
+            var annotated = false
+            for fa in field.annotations
+                if fa.name != "c" then continue
+                if annotated
+                    c.note(unit, fa.span, "a field of a C struct mirror has one `@c`")
+                    continue
+                annotated = true
+                var named = ""
+                if fa.args.len() == 1 && fa.args[0].name is None
+                    if fa.args[0].value.kind is StringLit(t) then named = t
+                if named == "" then c.note(unit, fa.span, "`@c` on a field names the C field it mirrors as one string, as in `@c(\"x0\")`")
+                elif !is_c_identifier(named) then c.note(unit, fa.span, s"`@c` on a field names the C field it mirrors, and `$named` is not a C identifier")
+            val name = c_struct_field_name(field)
+            if name == "" then continue
+            if contains_name(names, name) then c.note(unit, field.span, s"two fields of the C struct mirror `${d.name}` mirror the C field `$name`")
+            names.push(name)
+
+// What each field of the C struct mirror `id` may be, once the fields' types are known: an integer
+// type, `byte`, `bool`, `real`, a `string` or `Option[string]` (a C `const char *`), an enum mirror,
+// or another struct mirror, which holds no mirror holding this one.
+private check_c_struct_mirror(c: *Checker, id: usize)
+    val d = c.data[id]
+    if c_struct_type(d.decl) is None || d.variants.len() != 1 || d.decl.variants.len() != 1 then return
+    val variant = d.variants[0]
+    for k in 0..<variant.fields.len()
+        val t = variant.fields[k]
+        if *t is ErrorType then continue
+        val at = d.decl.variants[0].fields[k].ty.span
+        if c_struct_of(t, c.data) is Some(inner)
+            var seen: Buf[usize] = buf()
+            if c_struct_holds(c, inner, id, &seen) then c.note(d.unit, at, s"a C struct mirror cannot hold itself: `${type_name(t)}` holds `${d.name}`")
+            continue
+        if c_struct_field_kind(t, c.data, c.classes) is None
+            c.note(d.unit, at, s"`${type_name(t)}` cannot be a field of the C struct mirror `${d.name}`: a field is an integer type, `byte`, `bool`, `real`, a `string` or `Option[string]`, an enum mirror or another struct mirror")
+
+// Whether the struct mirror `d` is `target` or holds it, through the mirrors its fields are.
+private c_struct_holds(c: *Checker, d: usize, target: usize, seen: *Buf[usize]) -> bool
+    if d == target then return true
+    for s in *seen
+        if s == d then return false
+    seen.push(d)
+    if c.data[d].variants.len() != 1 then return false
+    for t in c.data[d].variants[0].fields
+        if c_struct_of(t, c.data) is Some(inner)
+            if c_struct_holds(c, inner, target, seen) then return true
+    false
+
 private c_first_annotation(v: Variant) -> Span
     for a in v.annotations
         if a.name == "c" then return a.span
@@ -7842,6 +8065,9 @@ private c_variant_annotations(v: Variant) -> usize
 private check_c_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
     // An object's annotations are refused where its fields are declared.
     if d.object then return
+    if c_says_value(d)
+        check_c_value_declaration(c, unit, d)
+        return
     var annotated = false
     for a in d.annotations
         if a.name != "c" then continue
@@ -7861,7 +8087,7 @@ private check_c_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
                     elif arg.value.kind is StringLit(_) then c.note(unit, arg.value.span, "`@c` on a class names the C pointer type it is a handle on with `type:`, as in `@c(type: \"cairo_t *\", release: \"cairo_destroy\")`")
                     else c.note(unit, arg.value.span, "`shared` is the one word `@c` on a class takes without a key")
                     continue
-            if key == "attach" || key == "key" || key == "forget" || key == "value"
+            if key == "attach" || key == "key" || key == "forget"
                 c.note(unit, arg.value.span, s"`$key:` on a C handle is not implemented")
                 continue
             if key != "type" && key != "release" && key != "retain" && key != "kept" && key != "as"
@@ -7919,6 +8145,66 @@ private check_c_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
                 for a in f.annotations
                     if a.name != "c" then c.note(unit, a.span, s"unknown annotation `@${a.name}` on a method of a C handle")
 
+// Whether a class's `@c` says `value:`, which makes it an opaque value rather than a handle.
+private c_says_value(d: &ClassDecl) -> bool
+    for a in d.annotations
+        if a.name != "c" then continue
+        for arg in a.args
+            if arg.name is Some(n) && n == "value" then return true
+    false
+
+// A class declared `@c(value: "<C type>")` is an opaque value: its object holds a copy of a C struct
+// or union passed and answered by value whose layout Avin does not mirror. It has no parameters,
+// fields or parents, and its methods without a body are C bindings taking the value as `self`.
+private check_c_value_declaration(c: *Checker, unit: usize, d: &ClassDecl)
+    var annotated = false
+    for a in d.annotations
+        if a.name != "c" then continue
+        if annotated
+            c.note(unit, a.span, "an opaque value has one `@c`")
+            continue
+        annotated = true
+        if handle_target(d) is Some(_) then c.note(unit, a.span, "a class is a handle on a Sysl type or an opaque C value, not both")
+        for arg in a.args
+            val key = arg.name match
+                Some(n) -> n
+                None ->
+                    c.note(unit, arg.value.span, "`@c` on an opaque value names its C type with `value:` alone, as in `@c(value: \"mlt_event_data\")`")
+                    continue
+            if key != "value"
+                c.note(unit, arg.value.span, s"`$key:` is not a word of `@c` on an opaque value, which takes `value:` alone: it holds a copy of the C value, which nothing gives back")
+                continue
+            val text = arg.value.kind match
+                StringLit(t) -> t
+                _ ->
+                    c.note(unit, arg.value.span, "`value:` takes a string, as in `value: \"mlt_event_data\"`")
+                    continue
+            val problem = parse_c_type(text) match
+                Ok(t) -> t.ty match
+                    CTypedef(_) -> ""
+                    CRecordType(_) -> ""
+                    CPointerType -> s"`$text` is a pointer, which is a handle, a class declared `@c(type: …)`"
+                    CText(_) -> s"`$text` is a C string, which crosses as `string`"
+                    _ -> s"`$text` is not a struct or a union: a scalar crosses as itself"
+                Err(why) -> s"`$text` is not a C type: $why"
+            if problem != "" then c.note(unit, arg.value.span, s"`value:` names the C struct or union the class holds a copy of, and $problem")
+    if d.type_params.len() > 0 then c.note(unit, d.type_params[0].span, "an opaque value has no type parameters: it holds one C value")
+    if d.params.len() > 0 then c.note(unit, d.params[0].param.pattern.span, "an opaque value has no parameters: the C bindings that answer one make it")
+    if d.modifier != "" then c.note(unit, d.modifier_span, s"an opaque value is final, so it cannot be `${d.modifier}`")
+    if d.parents.len() > 0 then c.note(unit, d.parents[0].span, "an opaque value has no parents; an `impl` makes it conform to a trait")
+    if d.derives.len() > 0 then c.note(unit, d.derives[0].span, "an opaque value derives nothing: it compares by identity, and an `impl` gives it `Display`")
+    for m in d.members
+        m match
+            FieldMember(f) -> c.note(unit, f.span, "an opaque value holds its C value and nothing else, so its body declares only methods")
+            AbstractFieldMember(f) -> c.note(unit, f.span, "an opaque value holds its C value and nothing else, so its body declares only methods")
+            StatementMember(s) -> c.note(unit, s.span, "an opaque value holds its C value and nothing else, so its body declares only methods")
+            MethodMember(f, _, _, static_member) ->
+                val bodyless = f.body is None && f.clauses.len() == 0
+                if bodyless && static_member then c.note(unit, f.name_span, s"`${f.name}` is static, so it needs a body: an opaque value's methods without one are C bindings")
+                elif bodyless && !has_annotation(f, "c") then c.note(unit, f.name_span, s"`${f.name}` has no body, so it is a C binding, and names its C function with `@c(\"<prototype>\")`")
+                for a in f.annotations
+                    if a.name != "c" then c.note(unit, a.span, s"unknown annotation `@${a.name}` on a method of an opaque value")
+
 // A handle's `as:` lists the other C types it may be passed as, each `"type = function"` or
 // `"type = expression in self"`, as one string or a list; each type once, and none the handle's own.
 private check_c_as(c: *Checker, unit: usize, d: &ClassDecl, value: &Expr)
@@ -7958,7 +8244,7 @@ private check_c_as(c: *Checker, unit: usize, d: &ClassDecl, value: &Expr)
         types.push(entry.ty)
 
 /** Whether a class is a handle: on a Sysl type, or on a C pointer. */
-is_handle_class(d: &ClassDecl) -> bool = handle_target(d) is Some(_) || c_handle_type(d) is Some(_)
+is_handle_class(d: &ClassDecl) -> bool = handle_target(d) is Some(_) || c_handle_type(d) is Some(_) || c_value_type(d) is Some(_)
 
 /** The Sysl method a bound method of a handle calls: the one its `@sysl("name")` names, or the one of
  * its own name's words in snake_case. */
@@ -9540,6 +9826,9 @@ private abstract_constructor(c: *Checker, id: usize, at: Span) -> bool
         return true
     if c_handle_type(c.classes[k].decl) is Some(target)
         c.note(unit_of(c), at, s"`${c.classes[k].name}` is a handle on the C type `$target`, so only a C binding that answers one makes it")
+        return true
+    if c_value_type(c.classes[k].decl) is Some(target)
+        c.note(unit_of(c), at, s"`${c.classes[k].name}` is a copy of the C value `$target`, so only a C binding that answers one makes it")
         return true
     if !is_abstract_class(c, k) then return false
     if is_trait(c, k) then c.note(unit_of(c), at, s"`${c.classes[k].name}` is a trait, so it cannot be instantiated; instantiate a class that conforms to it")

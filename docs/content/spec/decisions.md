@@ -3892,6 +3892,40 @@ spelling is better, as each entry says.
 
 ## Proposed
 
+- Proposed on branch `c-bindings-structs` (roadmap stage 13 step 7): **C struct mirrors, opaque
+  values and arrays C answers.**
+  - **A mirror's layout is measured, and checked against the header's order.** The C unit measures
+    each field's offset, width and sign and the struct's size, and asserts the fields come in the
+    header's order, each where C's alignment puts it after the one before, none after the last;
+    lowering reads and writes each field at its measured offset and width, with the traps of an
+    argument and a result. *Why*: a field narrower or wider than its Avin type (`uint8_t` as `int`,
+    `float` as `real`, `unsigned long` as `long`) crosses as a scalar parameter does, and the layout is
+    the target's. *Alternatives*: a layout implied by the Avin types alone and asserted (cannot spell
+    a `float` or a `short` field); matching fields by name in any order (hides a reordered header).
+  - **Every field is named, which a positional initializer checks.** The unit initializes the struct
+    by position with one zero per mirrored field under `-Wmissing-field-initializers` made an error,
+    so a field hidden in the padding between two others is found. For that the unit no longer passes
+    `-w`; it ignores every warning with `#pragma clang diagnostic ignored "-Weverything"` instead.
+    *Alternative*: the layout checks alone, which miss a small field in padding.
+  - **A mirror has one variant named as the type**, as a Sysl struct mirror does, and its fields are
+    integer types, `byte`, `bool`, `real`, `string`, **`Option[string]`** (null as `None`), enum
+    mirrors and other struct mirrors. *Why*: FreeType's and Cairo's structs carry nullable names.
+    *Alternative*: `string` only, a stop on null.
+  - **Strings in a mirror passed in are copies freed after the call; strings C writes into a mirror
+    are copied out and left to C**, as a borrowed string result is. *Alternative*: a `free:` per
+    field, which no surveyed struct needs.
+  - **Every out value stays in the result, the array's length too**, where `array:` names the array.
+    *Why*: one rule for out values. *Alternative*: dropping the out value `length:` names.
+  - **An array C answers that is null** is `None` for an `Option`, an empty array where its length is
+    zero, and a stop otherwise; a negative length, or one past an `int`, stops the program; the
+    array is freed by `free:` (a function or an expression in the array's name, optional for memory
+    C keeps) after it is copied, and unread where a status fails. **Review with the user**: whether
+    `free:` should be required with `array:`.
+  - **Opaque values cross by value only**: a parameter, a result and a method's `self`, never through
+    a pointer, `inout` or in an `Option`; each object is its own, compared by identity, and
+    sendable, since it is an immutable copy. *Alternative*: also `out` and `const T *`, which no
+    surveyed binding needs.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

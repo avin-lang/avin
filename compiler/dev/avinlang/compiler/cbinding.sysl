@@ -749,6 +749,171 @@ c_mirror_of(t: &Type, data: Buf[DataSymbol]) -> Option[usize] = *t match
     Data(d, _, args) -> if args.len() == 0 && c_enum_of(data[d].decl) is Some(_) then Some(d) else None
     _ -> None
 
+/** The C struct a data type's `@c(struct: "<C type>")` says it mirrors, as written; `None` where it
+ * mirrors none. */
+c_struct_type(d: &DataDecl) -> Option[string]
+    val a = c_data_annotation(d)?
+    for arg in a.args
+        if arg.name is Some(n) && n == "struct"
+            if arg.value.kind is StringLit(t) then return Some(t)
+    None
+
+/** The C struct a struct mirror mirrors, as `parse_c_type` spells it, which a prototype's position
+ * writes to take it by value; "" where it does not read. */
+c_struct_text(d: &DataDecl) -> string = c_struct_type(d) match
+    Some(t) -> parse_c_type(t) match
+        Ok(r) -> r.text
+        Err(_) -> ""
+    None -> ""
+
+/** The index of the struct mirror `t` is, if it is one. */
+c_struct_of(t: &Type, data: Buf[DataSymbol]) -> Option[usize] = *t match
+    Data(d, _, args) -> if args.len() == 0 && c_struct_type(data[d].decl) is Some(_) then Some(d) else None
+    _ -> None
+
+/** The index of the struct mirror `t` holds as an `Option`'s value, or is: the mirror, and whether it
+ * is in an `Option`, whose `None` is null. */
+c_struct_form(t: &Type, data: Buf[DataSymbol]) -> Option[CHandleForm]
+    if c_struct_of(t, data) is Some(d) then return Some(CHandleForm(d, false))
+    *t match
+        Data(o, _, args) ->
+            if data[o].module_name == "avin" && data[o].name == "Option" && args.len() == 1
+                if c_struct_of(args[0], data) is Some(d) then return Some(CHandleForm(d, true))
+        _ -> ()
+    None
+
+/** The C name of a struct mirror's field: the one its own `@c("name")` names, or its Avin name in
+ * snake_case, each upper-case letter starting a word, `maxXAdvance` being `max_x_advance`. */
+c_struct_field_name(field: Param) -> string
+    for a in field.annotations
+        if a.name == "c" && a.args.len() == 1 && a.args[0].name is None
+            if a.args[0].value.kind is StringLit(t) then return t
+    val name = field.pattern.kind match
+        Name(n) -> n
+        _ -> return ""
+    var out = ""
+    for b in name.bytes
+        if u8('A') <= b <= u8('Z') then out = out + "_" + char(b + 32u8).to_string()
+        else out = out + char(b).to_string()
+    out
+
+/** The name the C unit gives the type of field `j` of the struct mirror `d`, which it checks and
+ * measures. */
+c_struct_field_type(d: usize, j: usize) -> string = s"avin_c_struct_field_${d}_$j"
+
+/** The kind of C type a struct mirror's field of Avin type `t` is, which the C unit checks, or `None`
+ * for a field that is another struct mirror, checked to be its struct. An enum mirror's field is the
+ * integer its enumerators are. */
+c_struct_field_kind(t: &Type, data: Buf[DataSymbol], classes: Buf[ClassSymbol]) -> Option[CKind]
+    if c_mirror_of(t, data) is Some(_) then return Some(KindInteger)
+    if c_text_form(t, data, classes) is TextString(_) then return Some(KindText)
+    *t match
+        Int(_) -> Some(KindInteger)
+        Byte -> Some(KindByte)
+        Bool -> Some(KindBool)
+        Real -> Some(KindReal)
+        _ -> None
+
+/** The name the C unit gives the struct the struct mirror `d` mirrors. */
+c_struct_own(d: usize) -> string = s"avin_c_struct_type_$d"
+
+/** The name the C unit gives the C type the opaque value class `k` holds a copy of. */
+c_value_own(k: usize) -> string = s"avin_c_value_type_$k"
+
+/** The C expression the C unit measures the size of the C type `ty` by. */
+c_size_expr(ty: string) -> string = s"sizeof($ty)"
+
+/** The C expression the C unit measures the offset of the field `field` of the struct `ty` by. */
+c_offset_expr(ty: string, field: string) -> string = s"__builtin_offsetof($ty, $field)"
+
+/** The C value type an opaque value class's `@c(value: "<C type>")` names, as written. */
+c_value_type(d: &ClassDecl) -> Option[string] = c_class_text(d, "value")
+
+/** The C type an opaque value class holds a copy of, as `parse_c_type` spells it; "" where it does
+ * not read. */
+c_value_text(d: &ClassDecl) -> string = c_value_type(d) match
+    Some(t) -> parse_c_type(t) match
+        Ok(r) -> r.text
+        Err(_) -> ""
+    None -> ""
+
+/** The index of the opaque value class `t` is, if it is one. */
+c_value_class_of(t: &Type, classes: Buf[ClassSymbol]) -> Option[usize] = *t match
+    Class(k, _, _) -> if c_value_type(classes[k].decl) is Some(_) then Some(k) else None
+    _ -> None
+
+/** Whether a prototype's position written `text` is the struct `wanted`, by value: that type, or that
+ * type `const`-qualified. */
+c_names_struct(text: string, wanted: string) -> bool = wanted != "" && (text == wanted || text == "const " + wanted)
+
+/** Whether a pointer passed in, pointing at `pointee`, points at the struct `wanted`, `const`. */
+c_points_at_const_struct(pointee: string, wanted: string) -> bool = wanted != "" && (pointee == "const " + wanted || pointee == wanted + " const")
+
+/** Whether the value of Avin type `t` at a C position of type `c` is a struct passed by value: a
+ * struct mirror or an opaque value where the prototype writes no pointer. Such a call goes through the
+ * C unit's glue. */
+c_by_value(c: CType, t: &Type, data: Buf[DataSymbol], classes: Buf[ClassSymbol]) -> bool
+    val named = c match
+        CTypedef(_) -> true
+        CRecordType(_) -> true
+        _ -> false
+    named && (c_struct_of(t, data) is Some(_) || c_value_class_of(t, classes) is Some(_))
+
+/** The name of the C unit's glue that makes the call of the binding whose symbol is `symbol`, for a
+ * binding passing or answering a struct by value or copying an array C answers. */
+c_call_glue(symbol: usize) -> string = s"avin_c_call_$symbol"
+
+/** The name of the C unit's glue that frees the array C answered to the binding whose symbol is
+ * `symbol`, through its `free:`. */
+c_array_free_glue(symbol: usize) -> string = s"avin_c_array_free_$symbol"
+
+/** What a binding's `array:`, `length:` and `free:` say of an array C allocates and answers through
+ * an `out` pointer: the parameter's name, the C expression its length is, and how it is freed, a C
+ * function or an expression in the parameter's name, if it is. */
+struct CArrayOut
+    name: string
+    length: string
+    free: Option[string]
+
+/** The array a binding's `@c(…, array: "name", length: "…")` says C answers, when it says one. */
+c_array_out_of(f: &Function) -> Option[CArrayOut]
+    var name: Option[string] = None
+    var length = ""
+    var free: Option[string] = None
+    for a in f.annotations
+        if a.name != "c" then continue
+        for arg in a.args
+            val n = arg.name match
+                Some(n) -> n
+                None -> continue
+            val text = if arg.value.kind is StringLit(t) then t else continue
+            if n == "array" then name = Some(text)
+            elif n == "length" then length = text
+            elif n == "free" then free = Some(text)
+    Some(CArrayOut(name?, length, free))
+
+/** The index among the prototype's parameters of the `out` pointer `array:` names, if it names one. */
+c_array_out_index(p: CPrototype, out: CArrayOut) -> Option[usize]
+    for k in 0..<p.params.len()
+        if p.params[k].name == out.name && p.params[k].mode is COut then return Some(k)
+    None
+
+/** What a pointer to an element of an array C answers through `q`, `out T **`, points at: `T`, or "". */
+c_array_out_element(q: CParam) -> string = if q.pointee_text.ends_with(" *") then q.pointee_text[..<q.pointee_text.bytes.len - 2] else ""
+
+/** Whether the binding `f` with prototype `p`, whose Avin parameter and result types are `params`
+ * and `result`, calls through the C unit's glue: it passes or answers a struct by value, or copies
+ * an array C answers, whose length the glue computes. */
+c_binding_glued(f: &Function, p: CPrototype, params: Buf[&Type], result: &Type, data: Buf[DataSymbol], classes: Buf[ClassSymbol]) -> bool
+    if c_array_out_of(f) is Some(_) then return true
+    if c_by_value(p.result, result, data, classes) then return true
+    val positions = c_avin_positions(p)
+    for i in 0..<positions.len()
+        if i < params.len()
+            val q = p.params[positions[i]]
+            if q.mode is CIn && c_by_value(q.ty, params[i], data, classes) then return true
+    false
+
 /** The name the variant `v` of an enum mirror gives its own enumerator with `@c("name")`. */
 c_variant_text(v: Variant) -> Option[string]
     for a in v.annotations
@@ -789,6 +954,8 @@ c_names_handle(text: string, handle: string, result: bool) -> bool
 /** The function a C binding's `@c(…, free: "name")` names to free the string C answers, when it
  * names one as a string. */
 c_free_text(f: &Function) -> Option[string]
+    // With `array:`, `free:` frees the array.
+    if c_array_out_of(f) is Some(_) then return None
     for a in f.annotations
         if a.name != "c" then continue
         for arg in a.args
@@ -861,9 +1028,16 @@ c_array_element_size(element: &Type) -> usize = *element match
 
 /** Why the Avin array type `t`, carried in `form`, cannot be passed to the array parameter `q`, or
  * "". The C unit checks the element type C's pointer points at. */
-c_array_problem(q: CParam, form: CArrayForm) -> string
+c_array_problem(q: CParam, form: CArrayForm, data: Buf[DataSymbol]) -> string
+    // An array of a struct mirror is converted into C's layout for the call, and read only.
+    if c_struct_of(form.element, data) is Some(d)
+        val wanted = c_struct_text(data[d].decl)
+        if !(q.ty is CPointerType) || q.pointee_text == "" then return s"an array is passed as a pointer to its elements, as in `const $wanted *${q.name}`"
+        if c_points_at_const_struct(q.pointee_text, wanted) then return ""
+        if q.pointee_text == wanted then return s"an array of `${data[d].name}` is converted into C memory that lives for the call and is never read back, so it goes to a `const` pointer, `const $wanted *`"
+        return s"`${data[d].name}` mirrors `$wanted`, so an array of it goes to `const $wanted *`"
     if c_array_element_size(form.element) == 0
-        return "an array crosses to C as `Array[byte]`, `Array[int]`, `Array[long]` or `Array[real]`, whose elements C reads as they are"
+        return "an array crosses to C as `Array[byte]`, `Array[int]`, `Array[long]`, `Array[real]` or an `Array` of a struct mirror, whose elements C reads"
     if !(q.ty is CPointerType || q.ty is CText(_)) || q.pointee_text == ""
         return s"an array is passed as a pointer to its elements, as in `uint8_t *${q.name}`"
     if q.ty is CText(_) && !(*form.element is Byte) then return "a pointer to `char` takes an `Array[byte]`"
@@ -874,7 +1048,7 @@ c_array_problem(q: CParam, form: CArrayForm) -> string
  * discards whatever C answers, except a struct, which is passed by value. */
 c_crossing_problem(c: CType, avin: &Type, form: CTextForm, result: bool) -> string
     if result && *avin is Unit
-        return if c is CRecordType(_) then "a struct passed by value is not implemented" else ""
+        return if c is CRecordType(_) then "a struct C answers by value is answered as its mirror, a data type declared `@c(struct: …)`, or as an opaque value, a class declared `@c(value: …)`" else ""
     if !(form is NoText) then return c_text_problem(c, form, result)
     c match
         CKeyword(name) ->
@@ -893,7 +1067,7 @@ c_crossing_problem(c: CType, avin: &Type, form: CTextForm, result: bool) -> stri
         CVoidType -> "the C function answers nothing, so the binding's result is `unit`"
         CText(_) -> if result then "a C string crosses as `string`, `Array[byte]`, or either in an `Option`" else "a C string crosses as `string` or `Option[string]`"
         CPointerType -> "a C pointer crosses as a handle, a class declared with `@c(type: …)` naming the pointer's type"
-        CRecordType(_) -> "a struct passed by value is not implemented"
+        CRecordType(_) -> "a struct by value crosses as its mirror, a data type declared `@c(struct: …)`, or as an opaque value, a class declared `@c(value: …)`"
 
 // What a string's Avin type `form` must be at the C position `c`, or "".
 private c_text_problem(c: CType, form: CTextForm, result: bool) -> string
