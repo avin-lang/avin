@@ -82,9 +82,9 @@ start_and_join()
     thread_join(me, joints.slots[0])
     joints.slots[0] = null
     without_joints(me)
-    thread_detach(me)
-    collect_now()
+    collect(me)
     assert_eq(gc.live(&space), 0usize)
+    thread_detach(me)
 
 private struct Hops
     moved: Atomic[u32]
@@ -159,9 +159,9 @@ lock_waiters_park()
     joints.slots[63] = null
     contended.lock = null
     without_joints(me)
-    thread_detach(me)
-    collect_now()
+    collect(me)
     assert_eq(gc.live(&space), 0usize)
+    thread_detach(me)
 
 // A condition lightweight threads wait on with a time limit.
 private struct Timed
@@ -222,9 +222,9 @@ timed_waits_park()
     timed.lock = null
     timed.condition = null
     without_joints(me)
-    thread_detach(me)
-    collect_now()
+    collect(me)
     assert_eq(gc.live(&space), 0usize)
+    thread_detach(me)
 
 // Lightweight threads that block in the operating system, as a blocking binding does, on every
 // worker at once, and one more thread that has to run meanwhile.
@@ -384,9 +384,9 @@ parked_frames_are_roots()
     parked_list.lock = null
     parked_list.condition = null
     without_joints(me)
-    thread_detach(me)
-    collect_now()
+    collect(me)
     assert_eq(gc.live(&space), 0usize)
+    thread_detach(me)
 
 private var queue: WaitQueue = new_wait_queue()
 private var first_waiter: Waiter = new_waiter()
@@ -476,6 +476,114 @@ locks_go_in_turn()
     joints.slots[63] = null
     queued.lock = null
     without_joints(me)
-    thread_detach(me)
-    collect_now()
+    collect(me)
     assert_eq(gc.live(&space), 0usize)
+    thread_detach(me)
+
+// A thread that ends once `go` is raised, raising `ended` first, and a lightweight thread joining it,
+// which raises `joined` once its join has answered.
+private struct Ending
+    running: Atomic[u32]
+    joining: Atomic[u32]
+    go: Atomic[u32]
+    ended: Atomic[u32]
+    joined: Atomic[u32]
+    joint: *u8
+
+private var ending: Ending = Ending(Atomic(0), Atomic(0), Atomic(0), Atomic(0), Atomic(0), null)
+
+private end_on_go(c: *Context, run: *u8) -> unit
+    ending.running.store(1)
+    while ending.go.load() == 0
+        sleep(millis(1))
+    _ = ending.ended.add(1)
+
+private join_ending(c: *Context, run: *u8) -> unit
+    ending.joining.store(1)
+    thread_join(c, ending.joint)
+    ending.joined.store(1)
+
+private end_at_once(c: *Context, run: *u8) -> unit
+    ()
+
+@test("a join answers only once the ended thread is detached, so its frames are no longer roots")
+join_answers_after_detach()
+    ending.running.store(0)
+    ending.joining.store(0)
+    ending.go.store(0)
+    ending.ended.store(0)
+    ending.joined.store(0)
+    val me = thread_attach()
+    with_joints(me)
+    // The closure is an object on the heap, which only the thread's own frame holds once it starts.
+    joints.slots[2] = allocate(me, &cell_kind.header)
+    joints.slots[0] = thread_start(me, joints.slots[2], LeastStack, ptr_cast(&end_on_go))
+    joints.slots[2] = null
+    ending.joint = joints.slots[0]
+    joints.slots[1] = thread_start(me, null, LeastStack, ptr_cast(&join_ending))
+    // Both run on workers before the heap lock is taken, since a worker starting links its carrier
+    // under it; the joiner is given time to park in its join.
+    assert(raised_within(&ending.running, 5000))
+    assert(raised_within(&ending.joining, 5000))
+    sleep(millis(20))
+    // While the heap lock is held the ended thread cannot detach, so its join must not answer.
+    heap_lock.lock()
+    ending.go.store(1)
+    assert(raised_within(&ending.ended, 5000))
+    sleep(millis(50))
+    assert_eq(ending.joined.load(), 0u32)
+    heap_lock.unlock()
+    assert(raised_within(&ending.joined, 5000))
+    thread_join(me, joints.slots[0])
+    thread_join(me, joints.slots[1])
+    joints.slots[0] = null
+    joints.slots[1] = null
+    ending.joint = null
+    without_joints(me)
+    collect(me)
+    assert_eq(gc.live(&space), 0usize)
+    thread_detach(me)
+
+@test("a joined thread keeps neither its closure nor its joint alive at the first collection after the join")
+joined_threads_keep_nothing()
+    val me = thread_attach()
+    with_joints(me)
+    // Slot 63 holds each closure until its thread starts.
+    val n = if crowd() < 63 then crowd() else 63usize
+    for _ in 0..<20
+        for i in 0..<n
+            joints.slots[63] = allocate(me, &cell_kind.header)
+            joints.slots[i] = thread_start(me, joints.slots[63], LeastStack, ptr_cast(&end_at_once))
+            joints.slots[63] = null
+        join_n(me, n)
+        collect(me)
+        assert_eq(gc.live(&space), 0usize)
+    without_joints(me)
+    thread_detach(me)
+
+@test("a thread nobody joins lets its closure and its joint go once it has ended, while collections run")
+unjoined_threads_keep_nothing()
+    counting.runs.store(0)
+    counting.lightweight.store(0)
+    val me = thread_attach()
+    with_joints(me)
+    val n = crowd()
+    for _ in 0..<n
+        joints.slots[0] = thread_start(me, ptr_cast(&counting), LeastStack, ptr_cast(&count_run))
+        joints.slots[0] = null
+        collect(me)
+    var waited = 0
+    while counting.runs.load() < u32(n) && waited < 5000
+        sleep(millis(1))
+        waited += 1
+    assert_eq(counting.runs.load(), u32(n))
+    // The bodies have run; their ends follow, each letting its joint go.
+    collect(me)
+    var rounds = 0
+    while gc.live(&space) != 0 && rounds < 5000
+        sleep(millis(1))
+        collect(me)
+        rounds += 1
+    assert_eq(gc.live(&space), 0usize)
+    without_joints(me)
+    thread_detach(me)

@@ -4134,6 +4134,18 @@ spelling is better, as each entry says.
 
 ## Proposed
 
+- **A join answers only once the ended thread keeps nothing alive** ([threads](/spec/threads/)).
+  An ending lightweight thread detaches its context (its frames, which hold its closure and its
+  joint, stop being roots) and then marks its joint done and wakes its joiners, both under the heap
+  lock, so no collection runs between the two and the joint outlives its last use even when nothing
+  else reaches it. *Why*: before, the joint was marked done first, so a collection right after a join
+  could still find the closure and the joint through the ended thread's frame; a program saw its
+  memory freed one collection late, and a runtime test asserting an empty heap after a join failed
+  under load. *Alternatives*: keep the old order and promise only that an ended thread's objects are
+  collected eventually (weaker, and visible to any program measuring its heap); or clear the frame's
+  slots before marking the joint done (the joint, then reachable from nothing for a thread nobody
+  joins, could be collected while the ending thread still writes to it). Built on `lock-turn-leak`.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
