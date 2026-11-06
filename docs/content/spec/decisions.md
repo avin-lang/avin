@@ -4339,6 +4339,25 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- Proposed (branch `nested-literal-typing`): **A number literal nested in an argument takes the
+  numbers the other arguments decide** ([generics](/spec/generics/#inference)). An argument that is
+  or holds an integer literal (a collection literal, a tuple, or a call other than a conversion
+  such as `long(1)`, with such a part) is checked after the arguments that hold none, against the
+  type they decided so far; where that type would otherwise be left open so a later argument may
+  widen it, the argument is given its shape with the value types kept and every class or other
+  reference leaf left open. So `assertEq(f(), [1, 2])` with `f() -> Vector[long]` is a
+  `Vector[long]`, while `same(dogs, [Cat(2)])` still joins to a `Vector[Animal]`. Why: the chapter
+  already says a literal takes the type the other arguments decide, and a literal one level down is
+  the same literal to a reader. Two limits, chosen as the smallest rule: of two arguments that
+  both hold literals, the first written decides for the second (`same((1, x), (x, 2))` for
+  `x: long` is an error, where a part-by-part solution would type it); and choosing an overload
+  checks a nested literal once at its own type where the candidates' parameters differ (`kind(Some(1))`
+  beside `kind(o: Option[long])` and `kind(o: Option[string])` fits neither), as only a bare literal
+  is tried against each candidate. Alternatives: leaving each literal unknown until its use settles
+  it, as a type argument is (solves both limits, but makes every literal an inference variable);
+  trying each candidate's parameter on a nested literal by its structure (collection, tuple and
+  constructor shapes). Review with the user: whether either limit is worth lifting.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

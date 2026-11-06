@@ -347,7 +347,12 @@ infer is.
   `ActorRef[Nothing]`, takes `M` from the `Behaviour` passed to `spawn`. An invariant or contravariant
   use (an argument of `Box[T]` for an invariant `T`, a lambda's parameter) decides it for good, as
   the type the lower bounds so far fit, and a later argument must be an instance of that. A number
-  literal takes the type the other arguments decide. Two value types have no join, so
+  literal takes the type the other arguments decide, and so does one inside a value built around
+  it, a collection literal, a tuple or a call such as `Some(1)`, wherever it is written: with
+  `f() -> Vector[long]`, `assertEq(f(), [1, 2])` and `assertEq(Some(1), someLong())` are well typed.
+  Only the numbers are taken; the classes in the decided type are still widened by such an argument,
+  so `same(dogs, [Cat(2)])` is a `Vector[Animal]`. Of two arguments that both hold literals, the
+  first written decides for the second, so `same((1, x), (x, 2))` with `x: long` is an error. Two value types have no join, so
   `pair(1, "one")` is an error naming both, unless `Any` is expected.
 - The lambdas and `match` functions of a call take their parameter types from what the other
   arguments decide, so they are checked after them, and in turn among themselves: each time, the
