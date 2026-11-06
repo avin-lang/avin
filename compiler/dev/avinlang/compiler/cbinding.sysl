@@ -716,6 +716,46 @@ c_handle_form(t: &Type, data: Buf[DataSymbol], classes: Buf[ClassSymbol]) -> Opt
         Class(k, _, _) -> if c_handle_type(classes[k].decl) is Some(_) then Some(CHandleForm(k, optional)) else None
         _ -> None
 
+/** Which of `avin.c`'s classes of memory crossing in place a class is: a view C lends, read-only or
+ * writable, or a block Avin gives C. */
+enum CMemoryKind
+    MemView
+    MemMutView
+    MemBlock
+
+/** The memory class an Avin type is, or holds as an `Option`'s value: its kind, the class's index,
+ * and whether it is in an `Option`, which null's `None` is. */
+struct CMemoryForm
+    kind: CMemoryKind
+    class_index: usize
+    optional: bool
+
+/** The kind of memory the class `k` is, where it is one of `avin.c`'s `ByteView`, `MutByteView` and
+ * `ByteBlock`. */
+c_memory_class(classes: Buf[ClassSymbol], k: usize) -> Option[CMemoryKind]
+    val c = classes[k]
+    if c.module_name != "avin.c" || c.decl.object then return None
+    if c.name == "ByteView" then return Some(MemView)
+    if c.name == "MutByteView" then return Some(MemMutView)
+    if c.name == "ByteBlock" then return Some(MemBlock)
+    None
+
+/** The form in which `t` carries memory crossing in place, if it does. */
+c_memory_form(t: &Type, data: Buf[DataSymbol], classes: Buf[ClassSymbol]) -> Option[CMemoryForm]
+    var inner = t
+    var optional = false
+    *t match
+        Data(d, _, args) ->
+            if data[d].module_name == "avin" && data[d].name == "Option" && args.len() == 1
+                inner = args[0]
+                optional = true
+        _ -> ()
+    *inner match
+        Class(k, _, _) -> c_memory_class(classes, k) match
+            Some(kind) -> Some(CMemoryForm(kind, k, optional))
+            None -> None
+        _ -> None
+
 /** The error type of a status result, `Result[T, E]` with `E` an integer type or an enum mirror:
  * `Ok` for zero, holding the out values (`unit` where there are none), and `Err` of the code or its
  * variant otherwise. */
@@ -986,33 +1026,55 @@ c_call_glue(symbol: usize) -> string = s"avin_c_call_$symbol"
  * `symbol`, through its `free:`. */
 c_array_free_glue(symbol: usize) -> string = s"avin_c_array_free_$symbol"
 
-/** What a binding's `array:`, `length:` and `free:` say of an array C allocates and answers through
- * an `out` pointer: the parameter's name, the C expression its length is, and how it is freed, a C
- * function or an expression in the parameter's name, if it is. */
+/** What a binding's `array:` or `bytes:`, `length:` and `free:` say of an array C allocates and answers
+ * through an `out` pointer, or its `view:` or bare `view`, `writable` and `length:` of memory C lends:
+ * the parameter's name, empty for a view of the C result; the C expression its length is; how an
+ * array is freed, a C function or an expression in the parameter's name, if it is; whether the memory
+ * is lent as a view rather than copied, and a writable one; and whether `bytes:` named it. */
 struct CArrayOut
     name: string
     length: string
     free: Option[string]
+    view: bool
+    writable: bool
+    bytes: bool
 
-/** The array a binding's `@c(…, array: "name", length: "…")` says C answers, when it says one. */
+/** The array a binding's `@c(…, array: "name", length: "…")` or `bytes:` says C answers, or the memory
+ * its `view: "name"` or bare `view` says C lends, when it says one. */
 c_array_out_of(f: &Function) -> Option[CArrayOut]
     var name: Option[string] = None
     var length = ""
     var free: Option[string] = None
+    var view = false
+    var writable = false
+    var bytes = false
     for a in f.annotations
         if a.name != "c" then continue
         for arg in a.args
             val n = arg.name match
                 Some(n) -> n
-                None -> continue
+                None ->
+                    if arg.value.kind is Name(word)
+                        if word == "view"
+                            view = true
+                            if name is None then name = Some("")
+                        elif word == "writable" then writable = true
+                    continue
             val text = if arg.value.kind is StringLit(t) then t else continue
             if n == "array" then name = Some(text)
+            elif n == "bytes"
+                name = Some(text)
+                bytes = true
+            elif n == "view"
+                name = Some(text)
+                view = true
             elif n == "length" then length = text
             elif n == "free" then free = Some(text)
-    Some(CArrayOut(name?, length, free))
+    Some(CArrayOut(name?, length, free, view, writable, bytes))
 
 /** The index among the prototype's parameters of the `out` pointer `array:` names, if it names one. */
 c_array_out_index(p: CPrototype, out: CArrayOut) -> Option[usize]
+    if out.name == "" then return None
     for k in 0..<p.params.len()
         if p.params[k].name == out.name && p.params[k].mode is COut then return Some(k)
     None
