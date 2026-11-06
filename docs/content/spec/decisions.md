@@ -3804,6 +3804,72 @@ spelling is better, as each entry says.
   Rationale: the same retry the shim already made for integer answers and parameters, extended.
   Alternatives weighed: always typing the lambda (wrong where Sysl hands a collection as a `Buf`
   rather than a slice, which only inference gets right); refusing such bindings.
+- Settled on the user's delegation 2026-11-05 (branch `actor-isolation`): **A send hands a message's handles to the receiving actor,
+  not into transit** ([actors](/spec/actors/#handing-over-ownership)). The settled ownership
+  decision says a send puts a message's handles in transit for their first user, the receiver, and
+  that the sender's later use traps. `ActorRef.tell` knows the actor the message goes to, so the
+  handles the sender owns are handed straight to that actor's owner as the message enters its
+  mailbox. Why: in transit, a sender that uses a handle before the receiver does would take it
+  back, and the trap the decision promises would depend on a race; handed to the actor, the
+  sender's next use always traps. A message dropped because the actor has ended hands nothing over,
+  so its handles stay the sender's. A reply to an `ask` completes a future, which already puts its
+  handles in transit for the waiting code. Alternatives weighed: in transit as written (racy, as
+  above); handing over when the receiver takes the message off its mailbox (too late: the sender
+  could have used the handle meanwhile).
+  **Review with the user:** it refines the wording of a decision the user settled.
+- Settled on the user's delegation 2026-11-05 (branch `actor-isolation`): **Handing a value over stops at what is shared between
+  owners.** The runtime's walk follows every object a value reaches, so a message holding an
+  actor's reference walked into that actor's state and handed its handles away (an actor that
+  spawned a child capturing its own reference lost its connections to the child). The standard
+  library marks the types shared between owners `@keeps_owners` — `ActorRef`, `Timer`, `Future`,
+  `Promise`, `Executor`, `Channel`, `Mutex`, `Condition`, `Once`, `Atomic`, `Thread`, `Scope` — and
+  their type records carry the mark, at which every walk (a send, `spawn`, a thread's or a future's
+  body, completing a future) stops: their handles keep their owners, as a channel's values already
+  do. `Behaviour` is walked, since its start's captures are what the new actor owns. The mark is the
+  standard library's alone. Alternatives weighed: a walk the compiler writes for each type (exact,
+  but a collection's nodes are untyped to it); a marker trait instead of an annotation (visible to
+  every program, which could then hide its own handles from a send).
+- Settled on the user's delegation 2026-11-05 (branch `actor-isolation`): **Which messages a send walks.** A send walks its message
+  where its type may hold a handle: a handle; a tuple, data type or class with a field that may; a
+  generic type of the standard library, its collections and `Isolated` among them, at a type
+  argument that may, or that keeps a function (`Behaviour`); a function value; and `Any`, a trait,
+  or an open or abstract class, which may hold anything. A `@keeps_owners` type and the scalars and
+  strings never are. Decided per type where the program is compiled (the actors' intrinsic
+  `holds_handles`), so a message of numbers, strings, actors' references or `Vector[int]` costs no
+  walk. Alternatives weighed: walking every message (pays for every send); a standard library
+  generic type judged by its fields too (a `Vector[int]`'s nodes hold `Any`, so every vector would be
+  walked).
+- Settled on the user's delegation 2026-11-05 (branch `actor-isolation`): **`@isolating`, the mark of `isolate`'s body and `with`'s
+  function** ([what is shared](/spec/threads/#what-is-shared)). The rule of `isolate`'s body is
+  `@isolated`'s (only sendable values from around it) and the whole-program check that nothing it
+  runs reaches module-level mutable state; `@isolated` deliberately leaves out the second half for a
+  mutex's body. A third mark between `@isolated` and `@sendable` carries both, and a program's own
+  function that isolates what its caller passes writes it too: a parameter so marked is passed on
+  for `@isolating` or `@isolated`, and a `@sendable` one for `@isolating`, but not the other way. It
+  allows capturing a `var` of the code around it, since the body runs at once. Alternatives weighed:
+  holding every `@isolated` argument to the module-level check (a mutex's body has no need of it);
+  an annotation only the standard library may write (a program could then not wrap `isolate`).
+  **Review with the user:** it adds a third annotation users can write, beside `@sendable` and
+  `@isolated` (also see Findings below about a mutex's body).
+- Settled on the user's delegation 2026-11-05 (branch `actor-isolation`): **`with` holds an `Isolated`'s objects while its function
+  runs.** Two `with`s of one `Isolated` on two threads would change one graph at once, and a `take`
+  from inside `f` would hand the objects out while `f` still works on them. So `with` moves the
+  `Isolated` from held to in use by one atomic compare-and-set and back when `f` returns; a `take` or
+  `with` meanwhile traps with `` `Isolated` is in use by `with` ``, and a `with` after a `take` traps
+  as a second `take` does (`` `Isolated` was already taken ``). A trap inside `f` leaves it in use.
+  Alternatives weighed: a lock that makes a second `with` wait (an actor holding it would stall a
+  worker, and a `with` from inside `f` would deadlock); no check (a data race).
+- Settled on the user's delegation 2026-11-05 (branch `actor-isolation`): **Where `Isolated` lives.** `Isolated`, `isolate` are in
+  `avin.actors` (the chapter that defines them), imported as `import avin.actors.{Isolated,
+  isolate}`; a thread passes one through a channel the same way. `Isolated(objects)` may be called
+  directly, its parameter marked `@isolating`, as `Mutex(value)`'s is `@isolated`. Alternatives
+  weighed: the core module (imported everywhere, though only concurrent code wants it);
+  `avin.threads` (the actors chapter names it).
+- Finding (branch `actor-isolation`), not changed: **a mutex's body may store its value in a
+  module-level `var`.** `@isolated` does not hold a `with` body to the module-level check, so
+  `m.with(b -> cache = b)` on the main thread lets the main thread change the buffer later without
+  the lock while a worker changes it under the lock. Marking `Mutex.with`'s body `@isolating` closes
+  it, at the cost of refusing a body that reads a module-level `var` it does not store into.
 
 **Deferred**
 

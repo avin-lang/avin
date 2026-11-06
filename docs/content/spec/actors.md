@@ -201,31 +201,51 @@ connection, and a large buffer filled by one actor goes to the next.
 
 - **A Sysl handle in a message is handed over.** A handle has an owner, the execution that may use
   it ([Sysl bindings](/spec/sysl-bindings/#handles)), and an actor is an owner. Sending a message
-  puts every handle it holds in transit, and the first code to use one takes it: the receiving
-  actor. The sender's later use of it traps (`` `TcpStream` belongs to another thread ``). The compiler
-  knows which types can hold a handle, so a send walks the message only for those.
+  to an actor hands every handle it holds that the sender owns to that actor, as the message is put
+  in its mailbox, so the receiver uses it and the sender's later use of it traps (`` `TcpStream`
+  belongs to another thread ``), whether or not the receiver has used it yet. A handle the sender
+  does not own stays as it is, so one sent twice goes with the first message, and the second
+  receiver's use traps; a receiver that sends one on hands it over in turn. A message dropped
+  because its actor has ended leaves its handles the sender's. A reply to an `ask` completes a
+  future, which puts its handles in transit for the code that waits for it. The compiler knows
+  which types can hold a handle, so a send walks the message only for those: a message of numbers
+  and strings, of immutable collections of them or of actors' references is never walked. The walk
+  follows what the message holds — its fields, a collection's elements, what a function value
+  captures, an `Isolated`'s objects — and stops at what is shared between owners, an actor's
+  reference, a future, a promise, a channel, a mutex, an atomic, a thread or an executor, whose
+  handles keep their owners.
 - **A mutable object graph moves inside an `Isolated[T]`.** `isolate(body)` runs its body, a by-name
   argument written in place or as a trailing block, and wraps what it returns:
 
   ```text
   val chunk = isolate
       val b = Buffer[byte]()
-      for i in 0..<size do b.add(byte.wrap(i))
+      for i in 0..<size do b.append(byte.wrap(i))
       b
   worker tell Fill(chunk)
   ```
 
   The compiler checks that **the body reads nothing from around it that is not sendable**, and that
   **nothing it calls, however indirectly, reaches module-level mutable state** (a module-level
-  `var`, or a module-level value or `object` whose type is not sendable). Avin compiles the whole
-  program, so the second is known for every function, through every trait method a call may reach
-  and every function value made inside the body. Every mutable object the body leaves reachable from
-  its result was therefore made inside it, and nothing outside holds one. The receiver gets the
-  objects out with **`take() -> T`**, after which they are ordinary objects it owns; a second `take`,
-  by anyone, traps with `` `Isolated` was already taken ``, one atomic swap deciding which take
-  wins. **`with[R: Sendable](f: T -> R) -> R`** works on the objects while leaving them isolated, `f`
-  being checked by the body's rule, so a pipeline of actors can fill, pass, change and pass one
-  buffer without a copy.
+  `var`, or a module-level value or `object` whose type is not sendable, a `lazy val` among them).
+  Avin compiles the whole program, so the second is known for every function, in every module,
+  through every trait method a call may reach and every function value made inside the body. Every
+  mutable object the body leaves reachable from its result was therefore made inside it, and
+  nothing outside holds one. The body may read a `var` of the code around it whose type is
+  sendable, since it runs at once, and module-level values that are immutable and sendable; an
+  actor's own state, its parameters among them, is read through a `val` copied first. The receiver
+  gets the objects out with **`take() -> T`**, after which they are ordinary objects it owns; a
+  second `take`, by anyone, traps with `` `Isolated` was already taken ``, one atomic
+  compare-and-set deciding which take wins. **`with[R: Sendable](f: T -> R) -> R`** works on the
+  objects while leaving them isolated, `f` being checked by the body's rule, so a pipeline of actors
+  can fill, pass, change and pass one buffer without a copy. `with` holds the objects while `f`
+  runs, so a `take` or a `with` of the same `Isolated` meanwhile, from another thread or from inside
+  `f`, traps with `` `Isolated` is in use by `with` ``, and a `with` after the objects are taken
+  traps as a second `take` does.
+
+  The rule is a parameter's mark, **`@isolating`**, which a program's own functions may write too
+  ([what is shared](/spec/threads/#what-is-shared)): `isolate[T](@isolating body: -> T) ->
+  Isolated[T]`, and `with`'s `f`. `Isolated` and `isolate` are imported from `avin.actors`.
 
 The cheapest way across stays the plainest: build with a `Buffer` or a builder, turn the result into
 an immutable collection, and send that.

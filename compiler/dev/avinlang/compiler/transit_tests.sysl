@@ -1,0 +1,86 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// Which sends walk their message for Sysl handles. An actor's `offer` hands what its message holds
+// over to the actor only where the message's type can hold a handle, a branch on a constant the
+// compiler decides for each instance; and the walk stops at an object whose type record is marked
+// `apart`, a type shared between owners such as an actor's reference.
+
+private const Probe: string = "import avin.actors.{ActorRef, Behaviour, Isolated, spawn}\nimport avin.net.TcpStream\nimport avin.threads.Future\n\ndata Plain(n: int, s: string, v: Vector[int], m: Map[string, int])\ndata Refs(r: ActorRef[int], f: Future[TcpStream])\ndata Conn(c: TcpStream)\ndata MaybeConn(c: Option[TcpStream])\ndata Deep(items: Vector[(int, List[TcpStream])])\ndata Fn(f: @sendable (int) -> int)\ndata Tree\n    Leaf\n    Node(l: Tree, r: Tree, n: int)\ndata ConnTree\n    CLeaf(c: TcpStream)\n    CNode(l: ConnTree, r: ConnTree)\nclass Box(val c: TcpStream)\nclass Pair(val a: int, val b: string)\ntrait Shape: Sendable\n\nsink[M: Sendable]() -> ActorRef[M] = spawn(Behaviour[M](\"Sink\", me -> m -> ()))\n\nmain()\n    sink[int]()\n    sink[string]()\n    sink[Plain]()\n    sink[Refs]()\n    sink[Conn]()\n    sink[MaybeConn]()\n    sink[Deep]()\n    sink[Fn]()\n    sink[Tree]()\n    sink[ConnTree]()\n    sink[Box]()\n    sink[Pair]()\n    sink[Shape]()\n    sink[Isolated[Buffer[int]]]()\n    sink[Isolated[Buffer[TcpStream]]]()\n    sink[Behaviour[int]]()\n    sink[(int, string)]()\n    sink[(int, Box)]()\n    ()\n"
+
+private probe_lines() -> Buf[string]
+    val program = lower_source(repository_toolchain(), source_of("probe.avin", Probe)) match
+        Ok(p) -> p
+        Err(d) -> panic(d)
+    var out: Buf[string] = buf()
+    for line in emit_llvm(program).split("\n")
+        out.push(line)
+    out
+
+/** Whether the `offer` of the actor whose message type is shown starting with `message`, and
+ * holding `also`, walks its message: the first constant branch in its body, `holds_handles` of the
+ * message's type. */
+private walks_also(lines: Buf[string], message: string, also: string) -> Option[bool]
+    val head = "@\"avin.actors.Actor.offer[" + message
+    var inside = false
+    for line in lines
+        if line.starts_with("define ") then inside = line.contains(head) && line.contains(also)
+        elif inside
+            if line.contains("br i1 true, label") then return Some(true)
+            if line.contains("br i1 false, label") then return Some(false)
+            if line == "}" then return None
+    None
+
+private walks(lines: Buf[string], message: string) -> Option[bool] = walks_also(lines, message, "")
+
+/** Whether the type record of the type shown as `name` is marked `apart`. */
+private apart(lines: Buf[string], name: string) -> Option[bool]
+    for i in 0..<lines.len()
+        if lines[i] == "; type " + name && i + 1 < lines.len()
+            if lines[i + 1].contains(", i64 1, [") then return Some(true)
+            if lines[i + 1].contains(", i64 0, [") then return Some(false)
+    None
+
+@test("a message that cannot hold a handle is never walked: scalars, strings, actors' references, futures and collections of them")
+messages_without_handles_are_not_walked()
+    val lines = probe_lines()
+    assert_eq(walks(lines, "int]"), Some(false))
+    assert_eq(walks(lines, "string]"), Some(false))
+    assert_eq(walks(lines, "Plain#"), Some(false))
+    assert_eq(walks(lines, "Refs#"), Some(false))
+    assert_eq(walks(lines, "Tree#"), Some(false))
+    assert_eq(walks(lines, "class Pair#"), Some(false))
+    assert_eq(walks(lines, "(int, string)]"), Some(false))
+
+@test("a message that may hold a handle is walked: directly, in an option, a collection, a tuple, a class, a recursive type or an isolated value")
+messages_with_handles_are_walked()
+    val lines = probe_lines()
+    assert_eq(walks(lines, "Conn#"), Some(true))
+    assert_eq(walks(lines, "MaybeConn#"), Some(true))
+    assert_eq(walks(lines, "Deep#"), Some(true))
+    assert_eq(walks(lines, "ConnTree#"), Some(true))
+    assert_eq(walks(lines, "class Box#"), Some(true))
+    assert_eq(walks(lines, "(int, class Box#"), Some(true))
+    assert_eq(walks_also(lines, "class Isolated#", "TcpStream"), Some(true))
+    assert_eq(walks_also(lines, "class Isolated#", "[int]]]"), Some(false))
+
+@test("a message whose type does not show what it holds is walked: a function, a trait, a behaviour")
+opaque_messages_are_walked()
+    val lines = probe_lines()
+    assert_eq(walks(lines, "Fn#"), Some(true))
+    assert_eq(walks(lines, "class Shape#"), Some(true))
+    assert_eq(walks(lines, "class Behaviour#"), Some(true))
+
+@test("the records of types shared between owners are marked apart, and others are not")
+shared_types_are_apart()
+    val lines = probe_lines()
+    assert_eq(apart(lines, "ActorRef[int]"), Some(true))
+    assert_eq(apart(lines, "Promise[Ending]"), Some(true))
+    assert_eq(apart(lines, "Behaviour[int]"), Some(false))
+    var none_other = true
+    for i in 0..<lines.len()
+        if lines[i].starts_with("; type Conn") && i + 1 < lines.len() && lines[i + 1].contains(", i64 1, [") then none_other = false
+    assert(none_other)

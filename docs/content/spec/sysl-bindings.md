@@ -444,6 +444,10 @@ parseBigInt(s: string) -> Option[BigInt]
   When the body returns, what it was given and what it returns are **in transit**, as is a value a
   future or promise is completed with and what a callback given to `onComplete` or `map` reaches: a
   handle in transit is taken by the first code to use it. A value sent on a channel keeps its owner.
+  A message sent to an actor hands its handles to that actor ([actors](/spec/actors/#handing-over-ownership)).
+  Handing a value over follows what it holds and stops at what is shared between owners — an
+  actor's reference, a future, a promise, a channel, a mutex, an atomic, a thread, an executor —
+  whose handles keep their owners.
   How a program hands a handle over explicitly is [proposed](/spec/decisions/#proposed).
 
   The finalizer never checks the owner: a handle is finalized only once nothing can reach it, so no

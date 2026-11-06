@@ -1,0 +1,54 @@
+module avin.actors
+
+import avin.threads.Atomic
+
+@intrinsic("trap")
+private refuse(reason: string) -> Nothing
+
+// A mutable object graph that nothing else reaches, which may be sent between actors and threads
+// without a copy. `isolate` makes one: what its body leaves reachable from its result was made inside
+// it, since the body uses only sendable values from around it and nothing it runs reaches
+// module-level mutable state. The receiver gets the objects out with `take`, after which they are
+// ordinary objects it owns, or works on them in place with `with`, which leaves them isolated.
+//
+//     val chunk = isolate
+//         val b = Buffer[byte]()
+//         for i in 0..<size do b.append(byte.wrap(i))
+//         b
+//     worker tell Fill(chunk)
+//
+// The objects are taken once: a second `take`, by anyone, traps with "`Isolated` was already
+// taken", one atomic compare-and-set deciding which take wins. `with` holds the objects while its
+// function runs, so a `take` or a `with` meanwhile, from another thread or from inside the function,
+// traps with "`Isolated` is in use by `with`".
+class Isolated[T](@isolating objects: T): Sendable
+    private var held: Option[T] = Some(objects)
+    private val state = Atomic[int](Held)
+
+    // The objects, which are the caller's from now on.
+    take() -> T
+        if !state.compareAndSet(Held, Taken) then refused()
+        val out = held.get()
+        held = None
+        out
+
+    // `f` of the objects, which stay isolated: `f` uses only sendable values from around it, reaches
+    // no module-level mutable state and gives back a sendable value, so nothing it leaves behind
+    // reaches them.
+    with[R: Sendable](@isolating f: (T) -> R) -> R
+        if !state.compareAndSet(Held, InUse) then refused()
+        val result = f(held.get())
+        state.store(Held)
+        result
+
+    private refused() -> Nothing = if state.load() == InUse then refuse("`Isolated` is in use by `with`") else refuse("`Isolated` was already taken")
+
+// The states of an `Isolated`: its objects held, held by a `with` running, and taken.
+private val Held = 0
+private val InUse = 1
+private val Taken = 2
+
+// Runs `body` and isolates what it returns: `body` may use only sendable values from around it, and
+// nothing it runs, however indirectly, may reach module-level mutable state, so every mutable object
+// its result reaches was made inside it.
+isolate[T](@isolating body: -> T) -> Isolated[T] = Isolated(body)
