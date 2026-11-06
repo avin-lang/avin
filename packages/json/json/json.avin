@@ -1,0 +1,166 @@
+module json
+
+// A JSON value. A number is kept as a `Long` when the text writes a whole number that fits a `long`,
+// so an identifier or a count is exact however large, and as a `Real` otherwise: a number with a
+// fraction or an exponent, or a whole number beyond a `long`. An object keeps its members in the
+// order they were written, every one of them, so a document read and written again comes back in
+// its own order.
+data Json
+    Null
+    Bool(value: bool)
+    Long(value: long)
+    Real(value: real)
+    Str(value: string)
+    Arr(items: Vector[Json])
+    Obj(members: Vector[(string, Json)])
+
+// Making values: `Json.obj(("id", Json.num(7)), ("tags", Json.arr(Json.str("a"))))`.
+object Json
+    // An object of the members given, in that order: `Json.obj(("id", Json.Long(7)), ("ok", Json.Bool(true)))`.
+    obj(members: (string, Json)*) -> Json = Obj(members)
+
+    // An array of the values given, in that order.
+    arr(items: Json*) -> Json = Arr(items)
+
+    // A string value; `Json.str("x")` is `Json.Str("x")`.
+    str(value: string) -> Json = Str(value)
+
+    // A number value holding `value` exactly, as a `Long`; `Json.num(42)` is `Json.Long(42)`.
+    num(value: int) -> Json = Long(long(value))
+
+    // A number value holding `value` exactly.
+    num(value: long) -> Json = Long(value)
+
+    // A number value holding `value`.
+    num(value: real) -> Json = Real(value)
+
+impl Json
+    isNull() -> bool = self match
+        Null -> true
+        _ -> false
+
+    asBool() -> Option[bool] = self match
+        Bool(b) -> Some(b)
+        _ -> None
+
+    // The number as a `long`: a `Long`'s value, or a `Real` that is a whole number within a `long`'s
+    // range, such as `3.0` or `1e3`.
+    asLong() -> Option[long] = self match
+        Long(n) -> Some(n)
+        Real(x) -> wholeLong(x)
+        _ -> None
+
+    // The number as an `int`, where `asLong` has one that fits.
+    asInt() -> Option[int]
+        val n = asLong()?
+        if long(-2147483647) - 1 <= n <= 2147483647 then Some(int(n)) else None
+
+    // The number as a `real`: a `Real`'s value, or a `Long`'s rounded to the nearest `real`.
+    asReal() -> Option[real] = self match
+        Real(x) -> Some(x)
+        Long(n) -> Some(real(n))
+        _ -> None
+
+    asString() -> Option[string] = self match
+        Str(s) -> Some(s)
+        _ -> None
+
+    // An array's elements.
+    asVector() -> Option[Vector[Json]] = self match
+        Arr(items) -> Some(items)
+        _ -> None
+
+    // An object's members, in their order.
+    asMembers() -> Option[Vector[(string, Json)]] = self match
+        Obj(members) -> Some(members)
+        _ -> None
+
+    // The value of an object's member `key`, the last one where the key is written more than once;
+    // None where there is no such member or this is not an object.
+    get(key: string) -> Option[Json] = self match
+        Obj(members) ->
+            var k = members.length() - 1
+            while k >= 0
+                val (name, value) = members(k)
+                if name == key then return Some(value)
+                k -= 1
+            None
+        _ -> None
+
+    // An array's element at `index`; None where it is outside the array or this is not an array.
+    get(index: int) -> Option[Json] = self match
+        Arr(items) -> if 0 <= index < items.length() then Some(items(index)) else None
+        _ -> None
+
+    // As `get(key)`, and a trap naming the key where there is no such member.
+    apply(key: string) -> Json
+        if get(key) is Some(value) then return value
+        fail(s"no member \"$key\" in this JSON value")
+
+    // As `get(index)`, and a trap naming the index where there is no such element.
+    apply(index: int) -> Json
+        if get(index) is Some(value) then return value
+        fail(s"no element $index in this JSON value")
+
+    // Whether an object has a member `key`.
+    has(key: string) -> bool = get(key).isDefined()
+
+    // An object's keys, in their order; empty for any other value.
+    keys() -> Vector[string] = self match
+        Obj(members) -> members.map(m -> m.0)
+        _ -> Vector.empty[string]()
+
+    // The number of an array's elements or an object's members; 0 for any other value.
+    size() -> int = self match
+        Arr(items) -> items.length()
+        Obj(members) -> members.length()
+        _ -> 0
+
+    // An object with `key` set to `value`: the member replaced in place where the object has one
+    // (the last, where it has several), and added at the end where it has none. Any other value is
+    // returned as it is.
+    with(key: string, value: Json) -> Json = self match
+        Obj(members) ->
+            var k = members.length() - 1
+            while k >= 0
+                if members(k).0 == key then return Obj(members.updated(k, (key, value)))
+                k -= 1
+            Obj(members :+ (key, value))
+        _ -> self
+
+    // The value written as compact JSON, with no white space: `{"a":[1,2]}`.
+    render() -> string
+        val out = StringWriter()
+        writeJson(out, self, 0, 0, false)
+        out.text()
+
+    // The value written as indented JSON: each element and member on its own line, `indent` spaces
+    // deeper than its container, and a space after each member's colon. An empty array or object is
+    // `[]` or `{}`.
+    pretty(indent: int = 2) -> string
+        val out = StringWriter()
+        writeJson(out, self, indent, 0, false)
+        out.text()
+
+    // As `render`, with every character outside ASCII written as a `\u` escape, a character beyond
+    // U+FFFF as its surrogate pair, so the text is ASCII throughout.
+    renderAscii() -> string
+        val out = StringWriter()
+        writeJson(out, self, 0, 0, true)
+        out.text()
+
+    // As `render`, written to `out` without making a string of the whole first.
+    writeTo(out: Writer) = writeJson(out, self, 0, 0, false)
+
+// A JSON value displays as its compact text.
+impl Display for Json
+    display(out: Writer, spec: FormatSpec) = out.writeField(render(), spec)
+
+impl Debug for Json
+    debug(out: Writer, spec: FormatSpec) = out.writeField(render(), spec)
+
+// `x` as a `long` where it is a whole number inside a `long`'s range.
+private wholeLong(x: real) -> Option[long]
+    if !(-9223372036854775808.0 <= x < 9223372036854775808.0) then return None
+    val n = long(x)
+    if real(n) == x then Some(n) else None

@@ -4243,6 +4243,62 @@ spec did not settle; the user may want to revisit the first two.
   not either, and a regular file's read does not wait for a peer. ALTERNATIVES: bind them
   `blocking` (needed only for files on a stalled network mount).
 
+- Proposed (branch `json`): **JSON is the package `json`, in `packages/json` of this repository,
+  module `json`, rather than `avin.json` in the standard library** ([JSON](/spec/json/)). Why: the
+  system library chapter already says JSON is a package of its own; the package mechanism reads a
+  path dependency and a git dependency on a directory of a repository (`//packages/json`), as the
+  `ui` package is reached; and a domain library outside the standard library keeps the compiler's
+  library small. Alternatives weighed: `avin.json` in the standard library (contradicts the system
+  library chapter, and every compiler release would carry it); a repository `avin-lang/json` of its
+  own (premature while the derivation templates it is to carry are still being built in this one).
+  Review with the user: whether JSON should after all ship with the compiler, since marshal and most
+  services need it.
+- Proposed (branch `json`): **a JSON number is a `Long` when the text writes a whole number that
+  fits a `long`, and a `Real` otherwise; a `Real` is always written with a fraction or an
+  exponent.** Why: identifiers, counts and sizes stay exact past 2^53; writing `1.0` rather than `1`
+  makes `parse(render(j)) == j` for every finite value, kind included. `-0` is the `Long` 0 (a whole
+  number, and a `long` has no minus zero); `-0.0` is the `Real` minus zero. A whole number beyond a
+  `long` is a `Real`, rounded. The `Real` form follows the usual shortest-digits rule, written out
+  from 1e-6 up to 1e21 and with an exponent outside. Alternatives weighed: one `Num(real)` (loses
+  integers beyond 2^53); keeping a number's text (`Num(text)`, exact for any size but every reader
+  parses again); a third `Big(digits)` variant for integers beyond a `long` (exact, at the cost of a
+  case every match must handle). Review with the user: the variant names `Long`, `Real`, `Str`,
+  `Arr`, `Obj` (chosen because `Array` is a built-in type's name and `String`/`Object` read as
+  types), and the companion's `obj`/`arr`/`str`/`num`.
+- Proposed (branch `json`): **a number too large to be a finite `real` is an error, and a NaN or an
+  infinity is written `null`.** Why: a `Real` holding an infinity cannot be written back as JSON, so
+  accepting `1e400` would break the round trip; writing `null` keeps `render` total, as most writers
+  do. Alternatives weighed: reading `1e400` as an infinity; trapping when writing a non-finite value.
+- Proposed (branch `json`): **an object keeps every member, a key written twice included, and `get`
+  and `apply` answer the last.** Why: reading is lossless and the order is the document's, which a
+  log or a configuration file shown back to a person needs; the last-wins lookup is what most
+  readers do. Lookup is a scan from the end, which is fast for the objects a protocol carries.
+  Alternatives weighed: refusing a duplicate key (strict, but RFC 8259 allows it); the first one
+  winning; members in a `Map` (fast lookup, loses order or needs an ordered map).
+- Proposed (branch `json`): **arrays and objects nest at most 512 deep unless `parse` is given
+  another limit, a scalar being 0 deep.** Why: the reader is recursive, and a hostile document of a
+  million `[` would otherwise end in a stack overflow trap; 512 is far beyond any real document and
+  far inside a lightweight thread's 8 MiB stack. Alternatives weighed: no limit; an iterative reader
+  with no limit (more code, and the values built are still recursive to write); 1000 or 10000.
+- Proposed (branch `json`): **a lone surrogate escape is an error.** Why: a `string` holds only
+  characters, and U+D800 is not one. Alternatives weighed: replacing it with U+FFFD (silent loss);
+  carrying it as WTF-8 (a string that is not UTF-8).
+- Proposed (branch `json`): **an error's line ends at a line feed only and its column counts
+  characters; it also carries the byte offset.** Why: the line feed is the only line end JSON text
+  ordinarily has, a `\r\n` counts the same, and counting characters matches what an editor shows.
+  The place is counted out only when an error is made, so reading pays nothing for it.
+  Alternatives weighed: a lone carriage return also ending a line; columns in bytes.
+- Proposed (branch `json`): **the accessors answer `Option`s, `apply` traps, and `asLong` takes a
+  `Real` that is a whole number within a `long`.** Why: Options chain with `?` in a function
+  answering an `Option` (`j.get("a")?.get("b")?.asInt()`), and `apply` is for a member the program
+  knows is there, as a map's is; a producer writing `3.0` for a count is common. Alternatives
+  weighed: a missing member answering `Null` (confuses absent with null); a cursor type with its
+  own errors (a later layer, which the derivation's `JsonReader` covers).
+- Proposed (branch `json`): **the corpus runs every package under `packages/` that has a `tests`
+  directory, with `avin test` at `-O0` and `-O2`.** Why: a package's tests are what `avin test`
+  runs in it, and the repository's own packages must be gated like the core library is. A package
+  whose behaviour needs a window (`ui`) has no such directory.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

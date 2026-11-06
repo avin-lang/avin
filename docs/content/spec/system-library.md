@@ -685,4 +685,5 @@ with futures reaches for is there, under these names:
 ## JSON
 
 JSON is not part of the system library: reading and writing it is a package of its own, which a
-program adds as a dependency.
+program adds as a dependency. It is the [`json` package](/spec/json/), in `packages/json` of this
+repository.
