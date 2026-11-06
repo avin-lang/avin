@@ -3885,14 +3885,7 @@ spelling is better, as each entry says.
   constructor `@isolated` (keeps the same hole open through the value's maker). **Review with the
   user:** a `with` body that only reads a module-level `var` counter is now refused.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-- Async and await.
-
-## Proposed
-
-- Proposed (built on branch `c-bindings-callbacks`, stage 13 step 9,
+- Settled on the user's delegation 2026-11-05 (built on branch `c-bindings-callbacks`, stage 13 step 9,
   [chapter](/spec/c-bindings/#callbacks)): **C callbacks, as built.** The chapter left these open:
   - **A function pointer finds its `userdata` by name**: the function pointer's own prototype marks
     exactly one parameter `userdata`, and the binding marks one of the same name, which carries it
@@ -3930,6 +3923,13 @@ spelling is better, as each entry says.
     cheaper and trusted.
   - **libc's `qsort` and `bsearch` take no `userdata`, so they cannot be bound**; the corpus binds a
     C function of its own that calls `qsort_r` and `bsearch` through one.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Async and await.
+
+## Proposed
 
 ## Open
 
