@@ -149,8 +149,8 @@ each named by its path in the runtime, and the source files of each Sysl package
 a package's source files are its Sysl, manifest, sum and C files, outside its `.sysl` working
 directory. The executables `avin run` and `avin test` cache are keyed by the same Sysl packages. A build with
 the same bindings finds it there and runs no Sysl build; it is built under a temporary name and
-published by rename, so concurrent builds never see a partial archive. The `check` command builds
-the shims too, since only Sysl can say whether a binding is right.
+published by rename, so concurrent builds never see a partial archive. The `check` command stops after type checking and builds no shims, so it is fast; `check --bindings`
+builds them too, since only Sysl can say whether a binding is right.
 
 ## C bindings and the C unit
 

@@ -4441,3 +4441,19 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   safepoints, so no collection sees one half done.
 - Resource cleanup: a `defer` construct or a library `use`.
 - Whether mailboxes may be bounded, and what a `tell` to a full one does, since `tell` never waits.
+
+- **`avin check` stops after type checking** (Proposed, branch `check-stops-early`). Checking a
+  program no longer lowers it, builds the shims of its Sysl bindings or builds its C unit: the
+  previous `check` did all three and threw the result away, 4.9 s against 0.4 s of checking on a
+  terminal-interface example. Two diagnostics came only from those later steps. **A C declaration
+  that names no header** needs no C compiler to find, so `check` reports it. **A Sysl binding Sysl
+  rejects, and what clang rejects of the C unit** (a constant that does not fit, a prototype the
+  header contradicts) need the real tools, and stay behind `avin check --bindings`, which runs the
+  whole pipeline up to the emitted code as `check` used to. Why: a type error is the common failure
+  and should cost what checking costs; a binding changes rarely and `build`, `run` and `test` still
+  report it. Alternatives weighed: moving the shim's type-check into the checker (a second
+  implementation of Sysl's inference, certain to drift); keeping `check` as it was (the slowness
+  this fixes); dropping binding validation from `check` with no flag (leaves no command that
+  reports a bad binding without linking). The language server already stops at checking, so it
+  matches the new `check`. Review with the user: whether `--bindings` should instead be the
+  default for packages that have bindings.
