@@ -4339,9 +4339,12 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   numbers the other arguments decide** ([generics](/spec/generics/#inference)). An argument that is
   or holds an integer literal (a collection literal, a tuple, or a call other than a conversion
   such as `long(1)`, with such a part) is checked after the arguments that hold none, against the
-  type they decided so far; where that type would otherwise be left open so a later argument may
-  widen it, the argument is given its shape with the value types kept and every class or other
-  reference leaf left open. So `assertEq(f(), [1, 2])` with `f() -> Vector[long]` is a
+  type they decided so far, and an expression of literals alone (a literal, or an operation or `if`
+  on such expressions) after both, so `assertEq(count(Box(1)), 1_000_000_000_000 + 1)` with a `long`
+  result is a `long` whichever is written first. Where the decided type would otherwise be left open
+  so a later argument may widen it, the argument is given its shape with the value types and every
+  invariant type argument kept, and every class or other reference leaf at a covariant place left
+  open. So `assertEq(f(), [1, 2])` with `f() -> Vector[long]` is a
   `Vector[long]`, while `same(dogs, [Cat(2)])` still joins to a `Vector[Animal]`. Why: the chapter
   already says a literal takes the type the other arguments decide, and a literal one level down is
   the same literal to a reader. Two limits, chosen as the smallest rule: of two arguments that

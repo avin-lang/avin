@@ -351,7 +351,10 @@ infer is.
   it, a collection literal, a tuple or a call such as `Some(1)`, wherever it is written: with
   `f() -> Vector[long]`, `assertEq(f(), [1, 2])` and `assertEq(Some(1), someLong())` are well typed.
   Only the numbers are taken; the classes in the decided type are still widened by such an argument,
-  so `same(dogs, [Cat(2)])` is a `Vector[Animal]`. Of two arguments that both hold literals, the
+  so `same(dogs, [Cat(2)])` is a `Vector[Animal]`; an invariant part of it, such as an `Array`'s
+  element, is taken whole. An expression of literals alone (`1_000_000_000_000 + 2001`, `-(4 * 5)`,
+  `if c then 0 else 6`) takes the type the other arguments decide, the values built around literals
+  among them. Of two arguments that both hold literals, the
   first written decides for the second, so `same((1, x), (x, 2))` with `x: long` is an error. Two value types have no join, so
   `pair(1, "one")` is an error naming both, unless `Any` is expected.
 - The lambdas and `match` functions of a call take their parameter types from what the other
