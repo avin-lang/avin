@@ -392,7 +392,10 @@ three steps:
   operands of a `select`. A group is kept as its fields when every reference in it comes from an
   `Alloc` in the function and every use reaches a field (an `Offset` used only as the address of a
   load or store, or the object's own address for its first field), reads the descriptor, or
-  compares with null. Anything else lets the object escape: a store into an object, an array or a
+  compares with null, and its `Alloc` is not of a handle, Sysl or C: a handle's finalizer gives
+  back the reference it holds, and runs only when the collector frees the object, so a handle made
+  and used up in one expression (`consume(newShared(1))`, `newObject(2)` discarded) stays an
+  object. Anything else lets the object escape: a store into an object, an array or a
   module-level value, a call (inlining has already taken the calls that could be followed), a
   return, a capture (a store into a closure), boxing as `Any`, a call through a table or a function
   value, a comparison by identity, and so any hand-over to another thread. A group's objects must
