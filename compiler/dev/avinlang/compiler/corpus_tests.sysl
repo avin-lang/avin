@@ -19,7 +19,9 @@ import sysl.text.from_utf8_unchecked
 // reference the compiler failed to root is found at once. A `// env: NAME=VALUE` line sets a variable
 // for the program's run, and may turn stress off for a program that allocates heavily. An
 // `// args: ARG ...` line gives the program arguments, separated by spaces, an argument in double
-// quotes holding spaces or nothing at all.
+// quotes holding spaces or nothing at all. A `// stderr: actor numbers vary` line compares standard
+// error with every number after a `#` shown as `n` (`Racer#n`), for a program whose actors race and
+// whose reports therefore name whichever actor lost.
 //
 // A test for a known bug keeps its correct expectations and carries a `// ignore: REASON` line, which
 // is required: the program is then neither compiled nor run, and the summary counts it apart and
@@ -56,15 +58,17 @@ private struct Expectation
     args: Buf[string]
     ignored: bool
     reason: string
+    numbers_vary: bool
 
 private expectation(text: string) -> Expectation
-    var e = Expectation(0, false, buf(), buf(), buf(), false, "")
+    var e = Expectation(0, false, buf(), buf(), buf(), false, "", false)
     for line in text.split("\n")
         if line == "// ignore" || line.starts_with("// ignore:")
             e.ignored = true
             e.reason = if line.bytes.len > "// ignore:".bytes.len then line["// ignore:".bytes.len..].trim() else ""
         elif line.starts_with("// expect: exit ") then e.exit = parse_int(line["// expect: exit ".bytes.len..])
         elif line == "// expect: trap" then e.trap = true
+        elif line == "// stderr: actor numbers vary" then e.numbers_vary = true
         elif line.starts_with("// error: ") then e.errors.push(line["// error: ".bytes.len..])
         elif line.starts_with("// env: ")
             val setting = line["// env: ".bytes.len..]
@@ -254,8 +258,23 @@ private run_case(tc: Toolchain, path: string, program: Case, want: Expectation, 
             _ -> false
         if !ended then failures = failures + s"$path $level: ended ${run.status.to_string()}\n"
         if run.text != stdout then failures = failures + s"$path $level: standard output was:\n${run.text}\n"
-        if run.err.unwrap_or("") != stderr then failures = failures + s"$path $level: standard error was:\n${run.err.unwrap_or("")}\n"
+        val err = if want.numbers_vary then without_actor_numbers(run.err.unwrap_or("")) else run.err.unwrap_or("")
+        if err != stderr then failures = failures + s"$path $level: standard error was:\n$err\n"
     failures
+
+/** `text` with the number after every `#` shown as `n`, so `Racer#7` reads `Racer#n`: the standard
+ * error of a program whose actors race, where which actor's report it holds is decided at run time. */
+without_actor_numbers(text: string) -> string
+    var out: Buf[u8] = buf()
+    var i: usize = 0
+    while i < text.bytes.len
+        out.push(text.bytes[i])
+        if text.bytes[i] == u8('#') && i + 1 < text.bytes.len && u8('0') <= text.bytes[i + 1] <= u8('9')
+            out.push(u8('n'))
+            i += 1
+            while i < text.bytes.len && u8('0') <= text.bytes[i] <= u8('9') do i += 1
+        else i += 1
+    from_utf8_unchecked(out.view())
 
 // The corpus is run in four parts, each its own test, so the parts run side by side and no one
 // test holds every program.
@@ -433,6 +452,16 @@ corpus_args_lines()
     assert(expectation("main() = 0\n").args.len() == 0)
     assert(split_args("").len() == 0)
     assert(split_args("   ").len() == 0)
+
+@test("a stderr line lets a program's actor numbers vary, each shown as n and nothing else changed")
+corpus_actor_numbers_vary()
+    assert(expectation("// stderr: actor numbers vary\nmain() = 0\n").numbers_vary)
+    assert(!expectation("main() = 0\n").numbers_vary)
+    assert(without_actor_numbers("avin: trap in Racer#12: x at a.avin:3:4\n") == "avin: trap in Racer#n: x at a.avin:3:4\n")
+    assert(without_actor_numbers("A#1 B#2345 #7") == "A#n B#n #n")
+    assert(without_actor_numbers("# #x end#") == "# #x end#")
+    assert(without_actor_numbers("") == "")
+    assert(without_actor_numbers("é#9é") == "é#né")
 
 @test("a program's standard input is its .in sidecar, and empty when it has none")
 corpus_input_sidecars()
