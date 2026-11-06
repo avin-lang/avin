@@ -3993,14 +3993,7 @@ spelling is better, as each entry says.
   *Alternatives*: switching only at waits (a long computation holds its carrier until it ends);
   interrupting at any instruction by a signal (needs exact roots at every instruction, which the
   shadow stacks give only at safepoints).
-
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- **The allocation chunk belongs to the carrier, a runtime record per operating system thread, and
+- Settled on the user's delegation 2026-11-06: **The allocation chunk belongs to the carrier, a runtime record per operating system thread, and
   a context reaches it through a pointer** (branch `lwt-carrier-chunk`). `Context.carrier` points at
   the `Carrier` the context runs on, which holds the `gc.Chunk`; allocation reads
   `ctx.carrier.chunk`, one load more than before, and compiled code never touches the chunk, so
@@ -4018,6 +4011,12 @@ spelling is better, as each entry says.
   dearer than one load); the carrier embedded in the thread's own storage beside its context (no
   separate record, but a carrier would then die with the context it was made beside, which is
   wrong once contexts outnumber carriers).
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
