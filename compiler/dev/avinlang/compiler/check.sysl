@@ -9824,6 +9824,8 @@ private assignable(c: *Checker, target: &Expr) -> Option[usize]
     val unit = unit_of(c)
     val name = target.kind match
         Name(n) -> n
+        // A module's member the target names, which `module_target` has already reported.
+        Invalid -> return None
         _ ->
             c.note(unit, target.span, "only a local `var` can be assigned")
             return None
@@ -9835,10 +9837,21 @@ private assignable(c: *Checker, target: &Expr) -> Option[usize]
             c.note(unit, target.span, s"`$name` is a `val`; only a `var` can be assigned")
         None ->
             if param_index(c, name) is Some(_) then c.note(unit, target.span, s"`$name` is a parameter, which cannot be assigned")
-            elif global_named(c, name) is Some(_) then c.note(unit, target.span, "assigning a module-level value in a multiple assignment is not implemented")
+            elif global_named(c, name) is Some(g)
+                if writable_global(c, target.span, g) then c.note(unit, target.span, "assigning a module-level value in a multiple assignment is not implemented")
+            elif is_type_name(c, resolve_name(c, unit, name)) then c.note(unit, target.span, s"`$name` is a type, which cannot be assigned")
             elif lookup_function(c, name) is Some(_) then c.note(unit, target.span, s"`$name` is a function, which cannot be assigned")
+            elif declared(c, resolve_name(c, unit, name)) then c.note(unit, target.span, s"`$name` is not a variable; only a `var` can be assigned")
             else c.note(unit, target.span, s"`$name` is not defined")
     None
+
+/** Whether the qualified name `key` is a type's: a class's, a trait's or a data type's. */
+private is_type_name(c: *Checker, key: string) -> bool = c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_)
+
+// An assignment's target `m.x`, with `m` a module the file imports whole: the name `m.x` its
+// declaration is reached by, as a read reaches it. A member the module does not declare, or keeps
+// private, is reported here and the target is left `Invalid`.
+private module_target(c: *Checker, target: &Expr) -> &Expr = module_use(c, target).unwrap_or(target)
 
 /** A field an assignment writes: the object, read once, and the field's index and type. `setup`
  * holds the object in a hidden local when it is computed rather than named. A trait's `var` field
@@ -10527,7 +10540,8 @@ private compound_assign(c: *Checker, e: &Expr, target: &Expr, spelling: string, 
     typed.push(result)
     TExpr(e.span, result.ty, Block(typed))
 
-private assign_place(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp], value: &Expr, yields: bool, op_span: Span) -> &TExpr
+private assign_place(c: *Checker, e: &Expr, written: &Expr, op: Option[BinaryOp], value: &Expr, yields: bool, op_span: Span) -> &TExpr
+    val target = module_target(c, written)
     if target.kind is Call(callee, args) then return check_form(c, element_assignment(e, callee, args, op, value, yields, op_span), None, yields)
     if targets_field(c, target) then return assign_field(c, e, target, op, value, yields, op_span)
     if targets_global(c, target) is Some(g) then return assign_global(c, e, target, g, op, value, yields, op_span)
@@ -11007,7 +11021,8 @@ private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option
     var fields: Buf[Option[FieldPlace]] = buf()
     var block: Buf[&TExpr] = buf()
     var ok = true
-    for t in targets
+    for written in targets
+        val t = module_target(c, written)
         if t.kind is Name("_")
             if op is Some(o)
                 c.note(unit, t.span, s"`${binary_spelling(o)}=` reads every place before writing it, and `_` has nothing to read")
@@ -11119,7 +11134,8 @@ private hidden_local(c: *Checker, ty: &Type) -> usize
     c.body.locals.push(TLocal("", ty, false, c.current))
     index
 
-private update_expr(c: *Checker, e: &Expr, target: &Expr, increment: bool, postfix: bool, op_span: Span) -> &TExpr
+private update_expr(c: *Checker, e: &Expr, written: &Expr, increment: bool, postfix: bool, op_span: Span) -> &TExpr
+    val target = module_target(c, written)
     if target.kind is Call(callee, args) then return check_form(c, element_update(e, callee, args, increment, postfix, op_span), None, true)
     if targets_field(c, target) then return update_field(c, e, target, increment, postfix, op_span)
     if targets_global(c, target) is Some(g) then return update_global(c, e, target, g, increment, postfix, op_span)

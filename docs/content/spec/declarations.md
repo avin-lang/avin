@@ -1162,7 +1162,13 @@ the constructor's parameter type is the more specific.
 - `Name.apply(…)` is an ordinary member call, and chooses among the `apply` methods alone.
 
 A file may also declare `val`s and `var`s at module level, beside its functions. Each is a value of
-the program, read and (for a `var`) assigned from any function by its name.
+the program, read and (for a `var`) assigned from any function by its name. Another module reaches a
+public one as it reaches any declaration, by the name an import brings in or through the module's
+name, and assigns a `var` the same way: `store.latest = b`, `s.latest += 1` after `import app.store
+as s`, or `latest = b` after `import app.store.latest`. A private one is reached by neither, and only
+a `var` is assigned; a field of a module's object is assigned as any field is, `store.Tally.count =
+1`. Writing module state from a thread's body is refused as reading it is
+([threads](/spec/threads/)).
 
 ## Visibility and modules
 
