@@ -4168,13 +4168,7 @@ spelling is better, as each entry says.
   deadline and more machinery than a heap that is already fast at this scale); a sorted list (O(n)
   insertion); a heap without places (cancel would search, O(n)).
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- Unix domain sockets in `avin.net` (branch `unix-sockets`). Proposed: `UnixStream` and
+- Settled on the user's delegation 2026-11-06 (branch `unix-sockets`): Unix domain sockets in `avin.net`: `UnixStream` and
   `UnixListener` mirror `TcpStream` and `TcpListener`, sharing the read-ahead code (`read`,
   `readLine`, `readAll`) through one private class both hold; `UnixListener.bind(path)` fails with
   `AlreadyExists` where anything is at the path, and the separate `bindReplacing(path)` removes a
@@ -4189,61 +4183,61 @@ spelling is better, as each entry says.
   always removing a stale file (a surprise on a path that is a live socket or not a socket at all);
   `close()` removing the file (wrong for a listener handed between threads, and a second program may
   already have replaced it); one shared `Stream` trait over TCP and Unix (no use yet, and the
-  language's traits would add a dispatch to every read). Open for review: `bindReplacing`'s probe
+  language's traits would add a dispatch to every read). Review with the user: `bindReplacing`'s probe
   connection is seen by a live listener as an immediately closed connection.
 
 **Open files in `avin.fs`** (branch `fs-file`, for the job manager's log following and event log; the
 [system library](/spec/system-library/#open-files) chapter has the surface). Each choice below the
-spec did not settle; the user may want to revisit the first two.
+spec did not settle, each settled on the user's delegation 2026-11-06. Review with the user: the first two (a `File` kept to one thread, and no seek from the end).
 
-- **Proposed: the type is `File`, opened by `fs.open`, `create`, `append`, `openUpdate` and
+- Settled on the user's delegation 2026-11-06: **the type is `File`, opened by `fs.open`, `create`, `append`, `openUpdate` and
   `createUpdate`.** WHY: the five modes cover every combination a program asks for, named for what
   happens to what is already there, as Sysl names them, and the whole-file functions keep their names.
   ALTERNATIVES: an `OpenMode` argument (one function, but a mode a program can get wrong at runtime
   and a longer call for the common case); only read, create and append (no way to overwrite part of a
   file).
-- **Proposed: a `File` is not `Sendable`.** WHY: its Sysl handle belongs to the thread that opened it,
+- Settled on the user's delegation 2026-11-06: **a `File` is not `Sendable`.** WHY: its Sysl handle belongs to the thread that opened it,
   and a program that wants another thread to use a file opens it there; `TcpStream`'s hand-over
   machinery buys nothing for a file a program can reopen. ALTERNATIVES: make it `Sendable` with the
   owner check a `TcpStream` has. Review with the user if a file must move between actors.
-- **Proposed: seeking is from the start only, plus `seekToEnd()`; a negative offset is an `Err`, a
+- Settled on the user's delegation 2026-11-06: **seeking is from the start only, plus `seekToEnd()`; a negative offset is an `Err`, a
   seek past the end is allowed.** WHY: following a log needs "start at the end", and a tail needs
   absolute offsets, which `size()` gives; offsets back from the end are `size() - n`, with no second
   vocabulary. ALTERNATIVES: a `Whence` argument; a signed offset meaning from the end.
-- **Proposed: `readLine` answers an unterminated last line; `readCompleteLine` does not, and leaves
+- Settled on the user's delegation 2026-11-06: **`readLine` answers an unterminated last line; `readCompleteLine` does not, and leaves
   the partial line unread.** WHY: a file followed while another program writes it shows half a line
   at some moment, and a follower must not act on it; a file read to its end wants the last line even
   with no `\n`. ALTERNATIVES: one `readLine` with the first meaning (torn lines when following), or
   the second (the last line of a file with no final newline lost).
-- **Proposed: `read(max)` and the line calls share one buffer of the `File`'s own, and `position()`
+- Settled on the user's delegation 2026-11-06: **`read(max)` and the line calls share one buffer of the `File`'s own, and `position()`
   is the logical position (the file's, minus what is buffered and unread).** WHY: lines need a
   buffer, and `read`, `seek` and `write` have to agree with it. A `write` or `seek` gives the
   buffered bytes back first. ALTERNATIVES: separate byte and line modes (a program mixing them gets
   surprises).
-- **Proposed: a read at the end is not sticky.** WHY: following a growing file is the point; the next
+- Settled on the user's delegation 2026-11-06: **a read at the end is not sticky.** WHY: following a growing file is the point; the next
   read asks the file again. ALTERNATIVES: a latched end that `seek` clears (Sysl's own flag is not
   used).
-- **Proposed: misuse is an `Err`, not a trap: a call on a closed file, a read of a write-only file,
+- Settled on the user's delegation 2026-11-06: **misuse is an `Err`, not a trap: a call on a closed file, a read of a write-only file,
   a write to a read-only one, a negative seek offset; a negative `max` or `count` or tail size traps**
   like `TcpStream.read`'s, being a program mistake at the call. WHY: the first group depends on the
   state the program's files are in at runtime. The `Err` for those is `Other` with a plain sentence,
   as `TcpStream`'s closed connection is. ALTERNATIVES: a dedicated `IoError` variant for a closed file
   (more to match on for a rare case).
-- **Proposed: `readTail(file, maxBytes)` answers text, begins at a whole character, and replaces
+- Settled on the user's delegation 2026-11-06: **`readTail(file, maxBytes)` answers text, begins at a whole character, and replaces
   invalid bytes with U+FFFD; `readTailLines(file, count)` answers lines.** WHY: the caller wants to
   print or search the end of a log, where a cut character is garbage and an invalid byte elsewhere
   should not refuse the whole tail. A start inside a UTF-8 sequence skips the rest of that sequence
   (continuation bytes), never reading earlier bytes to complete it, so exactly the bytes asked for
   or fewer come back. ALTERNATIVES: back up to include the whole character (more than `maxBytes`);
   answer bytes and leave decoding to the caller; `InvalidUtf8` for a cut start.
-- **Proposed: opening a directory for reading or updating is `IsADirectory`.** WHY: the platform
+- Settled on the user's delegation 2026-11-06: **opening a directory for reading or updating is `IsADirectory`.** WHY: the platform
   opens a directory for reading and fails only at the first read, which would show up as an
   unexplained failed read. ALTERNATIVES: leave it to the read.
-- **Proposed: the calls do not park a lightweight thread.** WHY: the whole-file `avin.fs` calls do
+- Settled on the user's delegation 2026-11-06: **the calls do not park a lightweight thread.** WHY: the whole-file `avin.fs` calls do
   not either, and a regular file's read does not wait for a peer. ALTERNATIVES: bind them
   `blocking` (needed only for files on a stalled network mount).
 
-- Proposed (branch `json`): **JSON is the package `json`, in `packages/json` of this repository,
+- Settled on the user's delegation 2026-11-06 (branch `json`): **JSON is the package `json`, in `packages/json` of this repository,
   module `json`, rather than `avin.json` in the standard library** ([JSON](/spec/json/)). Why: the
   system library chapter already says JSON is a package of its own; the package mechanism reads a
   path dependency and a git dependency on a directory of a repository (`//packages/json`), as the
@@ -4253,7 +4247,7 @@ spec did not settle; the user may want to revisit the first two.
   own (premature while the derivation templates it is to carry are still being built in this one).
   Review with the user: whether JSON should after all ship with the compiler, since marshal and most
   services need it.
-- Proposed (branch `json`): **a JSON number is a `Long` when the text writes a whole number that
+- Settled on the user's delegation 2026-11-06 (branch `json`): **a JSON number is a `Long` when the text writes a whole number that
   fits a `long`, and a `Real` otherwise; a `Real` is always written with a fraction or an
   exponent.** Why: identifiers, counts and sizes stay exact past 2^53; writing `1.0` rather than `1`
   makes `parse(render(j)) == j` for every finite value, kind included. `-0` is the `Long` 0 (a whole
@@ -4265,41 +4259,41 @@ spec did not settle; the user may want to revisit the first two.
   case every match must handle). Review with the user: the variant names `Long`, `Real`, `Str`,
   `Arr`, `Obj` (chosen because `Array` is a built-in type's name and `String`/`Object` read as
   types), and the companion's `obj`/`arr`/`str`/`num`.
-- Proposed (branch `json`): **a number too large to be a finite `real` is an error, and a NaN or an
+- Settled on the user's delegation 2026-11-06 (branch `json`): **a number too large to be a finite `real` is an error, and a NaN or an
   infinity is written `null`.** Why: a `Real` holding an infinity cannot be written back as JSON, so
   accepting `1e400` would break the round trip; writing `null` keeps `render` total, as most writers
   do. Alternatives weighed: reading `1e400` as an infinity; trapping when writing a non-finite value.
-- Proposed (branch `json`): **an object keeps every member, a key written twice included, and `get`
+- Settled on the user's delegation 2026-11-06 (branch `json`): **an object keeps every member, a key written twice included, and `get`
   and `apply` answer the last.** Why: reading is lossless and the order is the document's, which a
   log or a configuration file shown back to a person needs; the last-wins lookup is what most
   readers do. Lookup is a scan from the end, which is fast for the objects a protocol carries.
   Alternatives weighed: refusing a duplicate key (strict, but RFC 8259 allows it); the first one
   winning; members in a `Map` (fast lookup, loses order or needs an ordered map).
-- Proposed (branch `json`): **arrays and objects nest at most 512 deep unless `parse` is given
+- Settled on the user's delegation 2026-11-06 (branch `json`): **arrays and objects nest at most 512 deep unless `parse` is given
   another limit, a scalar being 0 deep.** Why: the reader is recursive, and a hostile document of a
   million `[` would otherwise end in a stack overflow trap; 512 is far beyond any real document and
   far inside a lightweight thread's 8 MiB stack. Alternatives weighed: no limit; an iterative reader
   with no limit (more code, and the values built are still recursive to write); 1000 or 10000.
-- Proposed (branch `json`): **a lone surrogate escape is an error.** Why: a `string` holds only
+- Settled on the user's delegation 2026-11-06 (branch `json`): **a lone surrogate escape is an error.** Why: a `string` holds only
   characters, and U+D800 is not one. Alternatives weighed: replacing it with U+FFFD (silent loss);
   carrying it as WTF-8 (a string that is not UTF-8).
-- Proposed (branch `json`): **an error's line ends at a line feed only and its column counts
+- Settled on the user's delegation 2026-11-06 (branch `json`): **an error's line ends at a line feed only and its column counts
   characters; it also carries the byte offset.** Why: the line feed is the only line end JSON text
   ordinarily has, a `\r\n` counts the same, and counting characters matches what an editor shows.
   The place is counted out only when an error is made, so reading pays nothing for it.
   Alternatives weighed: a lone carriage return also ending a line; columns in bytes.
-- Proposed (branch `json`): **the accessors answer `Option`s, `apply` traps, and `asLong` takes a
+- Settled on the user's delegation 2026-11-06 (branch `json`): **the accessors answer `Option`s, `apply` traps, and `asLong` takes a
   `Real` that is a whole number within a `long`.** Why: Options chain with `?` in a function
   answering an `Option` (`j.get("a")?.get("b")?.asInt()`), and `apply` is for a member the program
   knows is there, as a map's is; a producer writing `3.0` for a count is common. Alternatives
   weighed: a missing member answering `Null` (confuses absent with null); a cursor type with its
   own errors (a later layer, which the derivation's `JsonReader` covers).
-- Proposed (branch `json`): **the corpus runs every package under `packages/` that has a `tests`
+- Settled on the user's delegation 2026-11-06 (branch `json`): **the corpus runs every package under `packages/` that has a `tests`
   directory, with `avin test` at `-O0` and `-O2`.** Why: a package's tests are what `avin test`
   runs in it, and the repository's own packages must be gated like the core library is. A package
   whose behaviour needs a window (`ui`) has no such directory.
 
-- Proposed (built on branch `process-control`): **A `Child`'s process ids are recorded, and read by
+- Settled on the user's delegation 2026-11-06 (branch `process-control`): **A `Child`'s process ids are recorded, and read by
   any thread** ([commands](/spec/system-library/#commands)). `pid()`, `group()`, `signal` and
   `signalGroup` read atomics the starting code writes as each program starts, never the command's
   handles, which belong to one thread, so a job manager can signal a child another thread is waiting
@@ -4311,7 +4305,7 @@ spec did not settle; the user may want to revisit the first two.
   traps on a child another thread waits for (what the marshal survey met); a `signal` reaching every
   program, which needs every program's id kept and the job's handles' state shared; `pid()` as an
   `Option`, rather than `0` for a command whose time ran out before it started a program.
-- Proposed (built on branch `process-control`): **One group per command, and `signalGroup` without
+- Settled on the user's delegation 2026-11-06 (branch `process-control`): **One group per command, and `signalGroup` without
   one is an `Err`** ([commands](/spec/system-library/#commands)). `inNewGroup()` puts every program
   of the command in one group its first program leads, the outermost setting deciding; a sequence's
   later part whose group has emptied leads a new one (joining a gone group is refused by the
@@ -4321,7 +4315,7 @@ spec did not settle; the user may want to revisit the first two.
   started is left: the case a job manager kills for. Alternatives: a trap for `signalGroup` without a
   group (a daemon would die of a missed setting); a group per part; refusing the later part.
   **Review with the user**: whether `signalGroup` should trap.
-- Proposed (built on branch `process-control`): **Standard error is redirected as output is**
+- Settled on the user's delegation 2026-11-06 (branch `process-control`): **Standard error is redirected as output is**
   ([commands](/spec/system-library/#commands)): `errorsToFile`, `errorsAppendTo` and
   `errorsToOutput()`, the last sharing the output's open file (one offset, so neither stream
   truncates or overwrites the other), going into what `output()` and `lines()` capture, and, where
@@ -4329,7 +4323,7 @@ spec did not settle; the user may want to revisit the first two.
   errors go to the pipeline's redirection. The redirections apply output first whatever the order
   they were called in. Alternatives: one `bothToFile(file)` (a second name for a pair of calls);
   `Stdio`-like values passed to one `withStreams`; `2>&1` read as the output at the point of the call.
-- Proposed (built on branch `process-control`): **Signals are watched in `avin.signal`, and a wait
+- Settled on the user's delegation 2026-11-06 (branch `process-control`): **Signals are watched in `avin.signal`, and a wait
   looks every 20 ms** ([`avin.signal`](/spec/system-library/#avinsignal)). The platform's facility
   is a counted flag, so `wait()` parks its lightweight thread and looks again every 20 milliseconds,
   the latency bound; `take()` asks once. Constants are `val`s named for what they mean (`Terminate`,
@@ -4338,6 +4332,12 @@ spec did not settle; the user may want to revisit the first two.
   (`TERM`), against Avin's naming; a `data Signal` (a closed set, while numbers are open, and
   `ExitStatus.Signalled` speaks `int`); a wake from the handler through the scheduler, which needs a
   runtime handler that is async-signal-safe, for a latency no program has needed yet.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
