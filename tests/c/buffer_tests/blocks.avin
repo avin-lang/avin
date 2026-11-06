@@ -1,0 +1,138 @@
+// Memory Avin gives C: a `ByteBlock` of zeroed bytes outside the collected heap, read and written in
+// place as a `MutByteView` is, passed to C as a pointer to its bytes with its length filled in or with
+// none, never copied, so C's writes are the block's, during a `blocking` call while collections run
+// too; it belongs to the code that made it, and is never closed, since nothing lent it.
+import avin.c.{ByteBlock, ByteView, MutByteView}
+import avin.threads.{Channel, spawn}
+
+// Allocates until the collector has run several times.
+churnBlocks()
+    var n = 0
+    for i in 0..<200000
+        val v = [i, i + 1]
+        n += v(1) - v(0)
+
+@test("a block is the length it was made, every byte zero")
+blockZeroed()
+    val b = ByteBlock(1000)
+    assertEq(b.length(), 1000)
+    var total = 0
+    for i in 0..<1000
+        total += int(b(i))
+    assertEq(total, 0)
+
+@test("an empty block and a one-byte block")
+blockEmptyAndOne()
+    val e = ByteBlock(0)
+    assertEq(e.length(), 0)
+    assertEq(e.copy().length(), 0)
+    assertEq(sumOf(e), long(0))
+    val one = ByteBlock(1)
+    one.update(0, byte(255))
+    assertEq(one(0), byte(255))
+    assertEq(sumOf(one), long(255))
+
+@test("a block's own constructor makes a block of no bytes, which C is passed as null")
+blockConstructed()
+    val b = ByteBlock()
+    assertEq(b.length(), 0)
+    assert(isNull(b))
+    assert(!isNull(ByteBlock(1)))
+
+@test(should_trap: "negative `ByteBlock` length")
+blockNegative()
+    ByteBlock(-1)
+
+@test("C reads the bytes Avin wrote, and Avin those C wrote, in the same memory")
+blockShared()
+    val b = ByteBlock(8)
+    b.write(0, [byte(1), byte(2), byte(3)])
+    b.fill(6, 8, byte(10))
+    assertEq(sumOf(b), long(26))
+    assertEq(peek(b, 7), 10)
+    fill(b, byte(4))
+    assertEq(b(0), byte(4))
+    assertEq(b(7), byte(4))
+    val want: Array[byte] = [byte(4), byte(4)]
+    assertEq(b.slice(2, 4), want)
+
+@test("a block is a `MutByteView` and a `ByteView`")
+blockIsAView()
+    val b = ByteBlock(2)
+    val m: MutByteView = b
+    m.update(1, byte(9))
+    val v: ByteView = b
+    assertEq(v(1), byte(9))
+
+@test("using the block with C never closes it")
+blockNeverClosed()
+    val b = ByteBlock(3)
+    fill(b, byte(1))
+    fill(b, byte(2))
+    assertEq(b(2), byte(2))
+    assertEq(sumOf(b), long(6))
+
+@test(should_trap: "index out of range")
+blockIndexAtLength()
+    ByteBlock(3)(3)
+
+@test(should_trap: "write out of range")
+blockWriteOverEnd()
+    ByteBlock(3).write(2, [byte(1), byte(1)])
+
+@test(should_trap: "slice out of range")
+blockFillPastEnd()
+    ByteBlock(3).fill(0, 4, byte(1))
+
+@test("a blocking call writes into the block where it is while another thread collects")
+blockBlockingCall()
+    val b = ByteBlock(4096)
+    val done = Channel[unit]()
+    spawn(() ->
+        churnBlocks()
+        done.send(()))
+    fillSlowly(b, byte(7), 50)
+    done.receive()
+    assertEq(sumOf(b), long(7 * 4096))
+    assertEq(b(4095), byte(7))
+
+@test("a block survives collections while only it holds its bytes")
+blockSurvives()
+    val b = ByteBlock(64)
+    b.fill(0, 64, byte(2))
+    churnBlocks()
+    assertEq(sumOf(b), long(128))
+
+@test("blocks the program lets go of are freed by the collector")
+blockFreed()
+    for i in 0..<2000
+        val b = ByteBlock(65536)
+        b.update(i % 65536, byte(1))
+    churnBlocks()
+
+@test("a block a thread's body captures is the body's, and back with its caller once the body is done")
+blockHandedToThread()
+    val b = ByteBlock(2)
+    val got = spawn(() ->
+        b.update(0, byte(5))
+        sumOf(b)).join()
+    assertEq(got, long(5))
+    assertEq(b(0), byte(5))
+
+@test(should_trap: "`ByteBlock` belongs to another thread")
+blockOtherThread()
+    val made = Channel[ByteBlock]()
+    val done = Channel[unit]()
+    spawn(() ->
+        made.send(ByteBlock(2))
+        done.receive())
+    made.receive().get()(0)
+
+@test(should_trap: "`ByteBlock` belongs to another thread")
+blockOtherThreadPassed()
+    val made = Channel[ByteBlock]()
+    val done = Channel[unit]()
+    spawn(() ->
+        made.send(ByteBlock(2))
+        done.receive())
+    sumOf(made.receive().get())

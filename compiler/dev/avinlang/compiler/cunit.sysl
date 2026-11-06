@@ -46,18 +46,23 @@ struct CUnitBinding
      * first, whether a struct crosses there by value. */
     glued: bool
     by_value: Buf[bool]
-    /** The array C answers through an `out` pointer, copied after the call, when it answers one. */
+    /** The array C answers through an `out` pointer, copied after the call, or the memory it lends as
+     * a view, when it answers one. */
     array_out: Option[CUnitArrayOut]
+    /** The prototype's indices of the parameters a `ByteBlock` is passed to. */
+    blocks: Buf[usize]
 
-/** An array a binding's `array:` names: the prototype's index of the `out` parameter it is answered
- * through, the C type of its elements, the Avin type of an element, the C expression its length is,
- * and how it is freed. */
+/** An array a binding's `array:` or `bytes:` names, or the memory its `view:` or bare `view` lends:
+ * the prototype's index of the `out` parameter it is answered through, or the number of parameters
+ * for the C result; the C type of its elements; the Avin type of an element; the C expression its
+ * length is; how an array is freed; and whether it is a view, which nothing frees. */
 struct CUnitArrayOut
     param: usize
     element_text: string
     element: &Type
     length: string
     free: Option[string]
+    view: bool
 
 /** A struct mirror as the C unit checks and measures it: its name and data type's index, which names
  * its typedefs, the C struct it mirrors, its fields, and the unit, span and package that place it. */
@@ -115,6 +120,10 @@ struct CUnitHandle
     /** Its `forget:`, the C expression in `self` and `userdata` that stops C calling a callback it
      * keeps. */
     forget: Option[string]
+    /** Its `attach:`, the C expression in `self`, `key`, `data` and `destroy` that ties the record of
+     * what it keeps to the C object, and `key:`, the type of the static object whose address keys it. */
+    attach: Option[string]
+    key: Option[string]
 
 /** A field accessor as the C unit compiles its glue: the method's name, the index of its symbol, which
  * names its glue, the field, the names of its indices and the bound of each, whether it writes the
@@ -276,9 +285,18 @@ c_unit_bindings(program: TProgram, files: Buf[ProgramFile], library: usize) -> B
             if c_is_avin_param(q) then glue_params.push(params[i])
         var array_out: Option[CUnitArrayOut] = None
         if c_array_out_of(s.decl) is Some(a)
-            if c_array_out_index(p, a) is Some(k)
-                if c_array_form(params[k], program.data, program.classes) is Some(form)
-                    array_out = Some(CUnitArrayOut(k, c_array_out_element(p.params[k]), form.element, a.length, a.free))
+            // A view's bytes are checked through the pointer C lends them by: the C result's type for
+            // a bare `view`, which the out parameters' indices do not reach.
+            if a.view && a.name == ""
+                array_out = Some(CUnitArrayOut(p.params.len(), s"__typeof__(*(${p.result_text})0)", Byte, a.length, None, true))
+            elif c_array_out_index(p, a) is Some(k)
+                if a.view then array_out = Some(CUnitArrayOut(k, s"__typeof__(**(${p.params[k].pointee_text} *)0)", Byte, a.length, None, true))
+                elif c_array_form(params[k], program.data, program.classes) is Some(form)
+                    array_out = Some(CUnitArrayOut(k, c_array_out_element(p.params[k]), form.element, a.length, a.free, false))
+        // The parameters a `ByteBlock` is passed to, a pointer to its bytes.
+        var blocks: Buf[usize] = buf()
+        for k in 0..<p.params.len()
+            if p.params[k].mode is CIn && c_memory_form(params[k], program.data, program.classes) is Some(_) then blocks.push(k)
         val glued = c_binding_glued(s.decl, p, glue_params, result, program.data, program.classes)
         if c_mirror_of(result, program.data) is Some(_) then result = Int(64)
         for i in 0..<params.len()
@@ -296,7 +314,7 @@ c_unit_bindings(program: TProgram, files: Buf[ProgramFile], library: usize) -> B
             if c_handle_form(t, program.data, program.classes) is Some(h)
                 val used = package_of(program.classes[h.class_index].unit, files, library)
                 if used != package && !contains_text(uses, used) then uses.push(used)
-        out.push(CUnitBinding(s.name, p, params, result, s.unit, s.decl.name_span, package, forms, c_free_text(s.decl), uses, n, glued, by_value, array_out))
+        out.push(CUnitBinding(s.name, p, params, result, s.unit, s.decl.name_span, package, forms, c_free_text(s.decl), uses, n, glued, by_value, array_out, blocks))
     out
 
 /** The struct mirrors of a checked program, in the order of its data types. */
@@ -355,7 +373,7 @@ c_unit_handles(program: TProgram, files: Buf[ProgramFile], library: usize) -> Bu
                 val kd = program.classes[j].decl
                 if c_handle_type(kd) is Some(kt) && c_class_text(kd, "retain") is Some(_) && c_class_kept(kd) is None
                     kept = Some(CUnitKept(name.name, j, kt))
-        out.push(CUnitHandle(program.classes[k].name, k, ty.text, ty.ty is CTypedef(_), c_class_text(d, "release").unwrap_or(""), c_class_text(d, "retain"), kept, program.classes[k].unit, d.name_span, package_of(program.classes[k].unit, files, library), c_class_as(d), c_unit_fields(program, k), c_class_text(d, "forget")))
+        out.push(CUnitHandle(program.classes[k].name, k, ty.text, ty.ty is CTypedef(_), c_class_text(d, "release").unwrap_or(""), c_class_text(d, "retain"), kept, program.classes[k].unit, d.name_span, package_of(program.classes[k].unit, files, library), c_class_as(d), c_unit_fields(program, k), c_class_text(d, "forget"), c_class_text(d, "attach"), c_class_text(d, "key")))
     out
 
 // The kind of C type a field read or written as the scalar `avin` is.
@@ -722,6 +740,11 @@ c_unit_source_of(parts: CUnitParts, libraries: Buf[CLibrary]) -> CUnitSource
             if !c_is_array_param(p, k) || c_array_element_size(b.params[k]) == 0 then continue
             out.push(s"_Static_assert(${element_test(b.params[k], p.params[k].pointee_text)}, \"avin: the elements of parameter ${k + 1} of ${b.name}\");\n")
             lines.push(ElementLine(i, k + 1))
+        // A `ByteBlock` is passed as a pointer to its bytes, which are one byte wide.
+        for k in b.blocks
+            val bytes = "__typeof__(*(" + p.params[k].text + ")0)"
+            out.push(s"_Static_assert(${element_test(Byte, bytes)}, \"avin: the bytes of parameter ${k + 1} of ${b.name}\");\n")
+            lines.push(ElementLine(i, k + 1))
         // Each named type at each position: the result first, then the parameters.
         for k in 0..<p.params.len() + 1
             // An `out` or `inout` parameter's value is the type its pointer points at, answered.
@@ -791,9 +814,10 @@ c_unit_source_of(parts: CUnitParts, libraries: Buf[CLibrary]) -> CUnitSource
     val values = value_table(&out, &lines, parts)
     CUnitSource(out.finish(), lines, measured, values)
 
-// The glue of the handle classes. A handle's object is four words: its C pointer, null once given
-// back; its owner; the C references it holds to what it keeps, a list off the heap; and the Avin
-// objects it keeps, which the collector traces. For each class `i` the unit defines
+// The glue of the handle classes. A handle's object is six words: its C pointer, null once given
+// back; its owner; the C references it holds to what it keeps, a list off the heap; the Avin objects
+// it keeps and the view it lent last, which the collector traces; and for a class with `attach:`, the
+// number of the runtime's record of what it keeps, which C holds too. For each class `i` the unit defines
 // `avin_c_give_back_i`, which gives the object's reference back through `release:` and then each C
 // reference it holds, in the order they were taken, and `avin_c_finalize_i`, the collector's
 // finalizer of its objects, which does the same; with `retain:`, `avin_c_retain_i`, which takes a
@@ -808,6 +832,8 @@ private handle_glue(out: *StrBuilder, lines: *Buf[CUnitLine], handles: Buf[CUnit
     glue(out, lines, "struct avin_c_kept { void *pointer; void (*take)(void *); void (*drop)(void *); struct avin_c_kept *next; };", Plain)
     glue(out, lines, "static void avin_c_hold(void **o, void *p, void (*take)(void *), void (*drop)(void *)) { struct avin_c_kept *k = malloc(sizeof *k); struct avin_c_kept **at = (struct avin_c_kept **)&o[2]; if (!k) abort(); k->pointer = p; k->take = take; k->drop = drop; k->next = 0; while (*at) at = &(*at)->next; *at = k; }", Plain)
     glue(out, lines, "void avin_rt_c_callback_drop(void *record);", Plain)
+    glue(out, lines, "void avin_rt_c_attach_destroy(void *data);", Plain)
+    glue(out, lines, "void avin_rt_c_attach_drop(void *id);", Plain)
     glue(out, lines, "static void avin_c_hold_all(void **o, void **kept) { for (struct avin_c_kept *k = kept[2]; k; k = k->next) { if (k->drop == avin_rt_c_callback_drop) continue; k->take(k->pointer); avin_c_hold(o, k->pointer, k->take, k->drop); } }", Plain)
     glue(out, lines, "static void avin_c_no_take(void *p) { (void)p; }", Plain)
     glue(out, lines, "void avin_c_keep_callback(void **o, void *record) { avin_c_hold(o, record, avin_c_no_take, avin_rt_c_callback_drop); }", Plain)
@@ -855,7 +881,22 @@ private handle_glue(out: *StrBuilder, lines: *Buf[CUnitLine], handles: Buf[CUnit
         glue(out, lines, s"        (void)($release);", GlueLine(i, "release"))
         glue(out, lines, "    }", Plain)
         glue(out, lines, "    avin_c_drain(o);", Plain)
+        // The handle lets go of the record `attach:` gave C, which C holds until its own destroy.
+        if h.attach is Some(_) then glue(out, lines, "    if (o[5]) { avin_rt_c_attach_drop(o[5]); o[5] = 0; }", Plain)
         glue(out, lines, "}", Plain)
+        // `avin_c_attach_i` gives C the record numbered `data` through the class's `attach:`, keyed by
+        // the address of a static object of the type `key:` names, and answers what it answers.
+        if h.attach is Some(a)
+            val key = h.key.unwrap_or("char")
+            glue(out, lines, s"static $key avin_c_key_$n;", GlueLine(i, "key"))
+            glue(out, lines, s"long long avin_c_attach_$n(void *p, long long avin_id) {", Plain)
+            glue(out, lines, s"    $t self = ($t)p;", Plain)
+            glue(out, lines, "    void *data = (void *)(__INTPTR_TYPE__)avin_id;", Plain)
+            glue(out, lines, s"    $key *key = &avin_c_key_$n;", GlueLine(i, "key"))
+            glue(out, lines, "    void (*destroy)(void *) = avin_rt_c_attach_destroy;", Plain)
+            glue(out, lines, "    (void)key; (void)destroy;", Plain)
+            glue(out, lines, s"    return (long long)($a);", GlueLine(i, "attach"))
+            glue(out, lines, "}", Plain)
         glue(out, lines, s"void avin_c_finalize_$n(void *o, void *heap) { (void)heap; avin_c_give_back_$n((void **)o); }", Plain)
     // Each `as:` conversion, `avin_c_as_<class>_<entry>`, makes the other pointer from the handle's,
     // and passes null on as null; its type is checked to be the one the entry names.
@@ -957,6 +998,9 @@ private binding_glue(out: *StrBuilder, lines: *Buf[CUnitLine], b: CUnitBinding, 
     if returns then glue(out, lines, "    return avin_v;", BindingGlueLine(i, "call"))
     glue(out, lines, "}", BindingGlueLine(i, "call"))
     if b.array_out is Some(a)
+        if a.view
+            glue(out, lines, s"_Static_assert(${element_test(a.element, a.element_text)}, \"avin: the bytes ${b.name} lends\");", BindingGlueLine(i, "bytes"))
+            return
         val name = p.params[a.param].name
         if c_array_element_size(a.element) > 0
             glue(out, lines, s"_Static_assert(${element_test(a.element, a.element_text)}, \"avin: the elements of the array ${b.name} answers\");", BindingGlueLine(i, "element"))
@@ -1416,8 +1460,13 @@ c_unit_diagnostics_of(output: string, unit: CUnitSource, parts: CUnitParts, libr
                 placed_any = true
                 val q = bindings[i].prototype.params[position - 1]
                 val element = bindings[i].params[position - 1]
+                var block = false
+                for k in bindings[i].blocks
+                    if k == position - 1 then block = true
                 // A type the headers do not declare at all is reported by the header check.
-                if d.message.starts_with("static assertion failed")
+                if !d.message.starts_with("static assertion failed") then ()
+                elif block then troubles[i].kinds.push(s"parameter $position of `${bindings[i].name}`, `${q.text}`, is not a pointer to an integer type one byte wide in the headers, so a `ByteBlock` cannot be passed to it")
+                else
                     troubles[i].kinds.push(s"the C type `${q.pointee_text}` parameter $position points at is not ${element_text(element)} in the headers, so it cannot hold the elements of an `Array[${type_name(element)}]` as they are")
             FreeLine(i, name) ->
                 placed_any = true
@@ -1482,9 +1531,12 @@ c_unit_diagnostics_of(output: string, unit: CUnitSource, parts: CUnitParts, libr
                 val b = bindings[i]
                 val a = b.array_out
                 val array = a match
-                    Some(x) -> b.prototype.params[x.param].name
+                    Some(x) -> if x.param < b.prototype.params.len() then b.prototype.params[x.param].name else ""
                     None -> ""
-                if part == "length" then troubles[i].glue.push(s"the C binding `${b.name}` gives the length of the array `$array` as `${a.unwrap().length}`, which does not compile against its headers: clang says '${d.message}'")
+                val lent = if array == "" then "the memory its result points at" else s"the memory `$array` points at"
+                if part == "bytes" then troubles[i].kinds.push(s"the C binding `${b.name}` lends $lent as a view, and its bytes are not of an integer type one byte wide in the headers")
+                elif part == "length" && a.unwrap().view then troubles[i].glue.push(s"the C binding `${b.name}` gives the length of $lent as `${a.unwrap().length}`, which does not compile against its headers: clang says '${d.message}'")
+                elif part == "length" then troubles[i].glue.push(s"the C binding `${b.name}` gives the length of the array `$array` as `${a.unwrap().length}`, which does not compile against its headers: clang says '${d.message}'")
                 elif part == "free" then troubles[i].glue.push(s"the C binding `${b.name}` frees the array `$array` with `${a.unwrap().free.unwrap_or("")}`, which does not compile against its headers: clang says '${d.message}'")
                 elif part == "element" then troubles[i].kinds.push(s"the C type `${a.unwrap().element_text}` the array `$array` points at is not ${element_text(a.unwrap().element)} in the headers, so it cannot hold the elements of an `Array[${type_name(a.unwrap().element)}]` as they are")
                 else troubles[i].glue.push(s"the C binding `${b.name}` cannot be called through its glue: clang says '${d.message}'")

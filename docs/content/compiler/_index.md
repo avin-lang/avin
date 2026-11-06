@@ -222,6 +222,20 @@ binding is **not** a shim: it is a direct call from the program's own code.
   then `avin_rt_c_callback_leave`. In a program with a trampoline, every call of a C library
   function is planned as one during which the collector may run, its live values rooted, since C
   may call back.
+- **Buffers.** `ByteView`, `MutByteView` and `ByteBlock` (`library/avin/c`) are laid out by lowering
+  as the runtime's `CMemory` (`runtime/avin/rt/cmemory.sysl`): address, owner, length, closed flag,
+  the closed and foreign reasons and the lender, the last three traced. Their methods are `c_view_*`
+  and `c_block_new` intrinsics, each a call of `avin_rt_<name>` with a trap site, which checks the
+  lender's owner (a block's own), the closed flag and the bounds. A binding marked `view` (or naming
+  `view:`) is glued like `array:`, the glue writing its `length:`; lowering allocates the view, fills it
+  and stores it in the lender's fifth word, which every bound method, field accessor and `close()` of
+  the lender clears after setting the view's closed flag. A block is passed as its address and length
+  after `avin_rt_c_memory_check`, never copied. With `attach:`, the C unit defines
+  `avin_c_attach_i(pointer, record)` over a static `key:` object and `avin_rt_c_attach_destroy`;
+  lowering makes the record at a handle's first keep (`avin_rt_c_attach_new`, kept in the sixth word),
+  gives it to C, and after each keep hands it the head of the handle's kept list
+  (`avin_rt_c_attach_set`), which the collector marks while C holds the record; the handle's
+  `avin_c_give_back_i` lets go of it with `avin_rt_c_attach_drop`.
 - **Emit** declares each C symbol and glue function with the target's parameter attributes
   (`signext`/`zeroext` below 32 bits) and calls it; nothing in the emitter knows about C beyond that.
 - **Link** adds the C unit's object and, for each package's C libraries, `-l<name>` or the words

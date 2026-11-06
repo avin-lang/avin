@@ -1,0 +1,127 @@
+// `attach:` ties what a surface keeps to the C surface rather than its Avin handle: a holder taking a
+// C reference of its own reads and writes the block the surface was made over after the surface's
+// handle was closed or collected, through any number of collections, and C's destroy, when the last
+// reference goes, lets the block go. Without `attach:` the handle alone keeps it.
+import avin.c.ByteBlock
+
+// Allocates until the collector has run several times.
+churnAttached()
+    var n = 0
+    for i in 0..<200000
+        val v = [i, i + 1]
+        n += v(1) - v(0)
+
+// A holder of a surface over a new block of `n` bytes each `value`, the surface's handle left to the
+// collector.
+holderOverBlock(n: int, value: byte) -> Holder
+    val b = ByteBlock(n)
+    b.fill(0, n, value)
+    holderOf(surfaceOver(b))
+
+@test("a surface reads and writes the block it was made over")
+attachReads()
+    val b = ByteBlock(16)
+    b.fill(0, 16, byte(2))
+    val s = surfaceOver(b)
+    assertEq(s.sum(), long(32))
+    s.paint(byte(3))
+    assertEq(b(15), byte(3))
+
+@test("the block outlives the surface's collected handle while C holds the surface")
+attachOutlivesCollectedHandle()
+    val destroyed = destroys()
+    val h = holderOverBlock(4096, byte(1))
+    for i in 0..<5
+        churnAttached()
+        assertEq(h.sum(), long(4096 * (if i == 0 then 1 else i - 1)))
+        h.paint(byte(i))
+    assertEq(destroys(), destroyed)
+    h.close()
+    assertEq(destroys(), destroyed + 1)
+    churnAttached()
+
+@test("the block outlives the surface's closed handle while C holds the surface")
+attachOutlivesClosedHandle()
+    val destroyed = destroys()
+    val b = ByteBlock(100)
+    val s = surfaceOver(b)
+    val h = holderOf(s)
+    s.close()
+    churnAttached()
+    h.paint(byte(5))
+    assertEq(h.sum(), long(500))
+    h.close()
+    assertEq(destroys(), destroyed + 1)
+
+@test("C's destroy runs once when the last reference goes, whichever goes last")
+attachDestroyOnce()
+    val destroyed = destroys()
+    val b = ByteBlock(8)
+    val s = surfaceOver(b)
+    s.close()
+    assertEq(destroys(), destroyed + 1)
+    s.close()
+    assertEq(destroys(), destroyed + 1)
+
+@test("surfaces collected with their holders are destroyed, each once, and every block let go")
+attachManyCollected()
+    val destroyed = destroys()
+    val alive = surfacesAlive()
+    for i in 0..<500
+        holderOverBlock(256, byte(i % 256)).close()
+    var tries = 0
+    while surfacesAlive() > alive && tries < 50
+        churnAttached()
+        tries += 1
+    assertEq(surfacesAlive(), alive)
+    assertEq(destroys(), destroyed + 500)
+
+@test("one block kept by two surfaces is held by both records, and outlives either")
+attachOneBlockTwoSurfaces()
+    val destroyed = destroys()
+    val b = ByteBlock(10)
+    val first = holderOf(surfaceOver(b))
+    val second = holderOf(surfaceOver(b))
+    churnAttached()
+    first.paint(byte(1))
+    first.close()
+    assertEq(destroys(), destroyed + 1)
+    churnAttached()
+    assertEq(second.sum(), long(10))
+    second.close()
+    assertEq(destroys(), destroyed + 2)
+
+@test("a second `keeps:` of one surface adds to its one record, which keeps both blocks")
+attachTwoKeepsOneRecord()
+    val destroyed = destroys()
+    val s = surfaceOver(ByteBlock(4))
+    val other = ByteBlock(3)
+    other.fill(0, 3, byte(9))
+    assertEq(s.also(other), long(27))
+    val h = holderOf(s)
+    s.close()
+    churnAttached()
+    assertEq(h.sum(), long(0))
+    h.close()
+    assertEq(destroys(), destroyed + 1)
+
+@test("`attach:` without `key:` keys the record by a `char` of the class's own")
+attachKeyless()
+    val destroyed = destroys()
+    val s = keylessOver(ByteBlock(2))
+    assertEq(s.sum(), long(0))
+    s.close()
+    assertEq(destroys(), destroyed + 1)
+
+@test(should_trap: "`attach:` of `Refusing` answered non-zero, so what `refusingOver` keeps cannot be kept")
+attachRefused()
+    refusingOver(ByteBlock(2))
+
+@test("without `attach:` the handle keeps the block for as long as it lives")
+attachLoose()
+    val b = ByteBlock(6)
+    b.fill(0, 6, byte(1))
+    val s = looseOver(b)
+    churnAttached()
+    assertEq(s.sum(), long(6))
+    s.close()

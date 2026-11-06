@@ -3085,9 +3085,10 @@ private declare_methods(c: *Checker, unit: usize)
             val public = entry.public
             val overrides = entry.overrides
             val file_unit = entry.unit
-            // The core library's array classes declare their element operations as intrinsics, and
-            // `avin.threads.Atomic` its operations on the value it holds.
-            val intrinsic_method = (is_array_storage(c.classes[id]) || is_atomic_storage(c.classes[id])) && method_annotations(f) > 0
+            // The core library's array classes declare their element operations as intrinsics,
+            // `avin.threads.Atomic` its operations on the value it holds, and `avin.c`'s views and
+            // blocks their operations on the memory they reach.
+            val intrinsic_method = (is_array_storage(c.classes[id]) || is_atomic_storage(c.classes[id]) || c_memory_class(c.classes, id) is Some(_)) && method_annotations(f) > 0
             // A Sysl handle's own methods without a body are bound to its Sysl value's; the
             // declaration of the handle has checked their annotations.
             val bound_method = handle && !entry.from_impl && !entry.static_member && f.body is None && f.clauses.len() == 0
@@ -5230,6 +5231,10 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
         elif name == "holds_handles"
             if module_name != "avin.actors" then c.note(unit, f.name_span, s"`$name` is an intrinsic of `avin.actors`")
             elif params.len() != 1 || !(*result.unwrap_or(Unit) is Bool) then c.note(unit, f.name_span, s"intrinsic `$name` takes one value and answers a `bool`")
+        // The operations of memory crossing a C binding in place, on objects laid out as the runtime's
+        // `CMemory`, which only `avin.c` declares.
+        elif is_c_memory_intrinsic(name)
+            if module_name != "avin.c" then c.note(unit, f.name_span, s"`$name` is an intrinsic of `avin.c`")
         else
             intrinsic_signature(name) match
                 Some(expected) ->
@@ -5322,6 +5327,9 @@ private intrinsic_of(c: *Checker, unit: usize, module_name: string, f: &Function
             _ -> c.note(unit, a.span, "`@intrinsic` takes one string, the intrinsic's name")
         if f.body is Some(_) then c.note(unit, a.span, "an intrinsic function has no body")
     out
+
+/** Whether `name` is one of the operations of `avin.c`'s views and blocks. */
+is_c_memory_intrinsic(name: string) -> bool = name.starts_with("c_view_") || name == "c_block_new"
 
 /** Whether `name` is one of the operations of `avin.threads.Atomic`. */
 is_atomic_intrinsic(name: string) -> bool =
@@ -7159,6 +7167,11 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
         var free_text: Option[string] = None
         var free_span = a.span
         var array_name: Option[string] = None
+        // Which of `array:`, `bytes:` and `view:` named the out parameter, and whether a bare `view`
+        // lends the C result, `writable` a writable view.
+        var array_word = "array"
+        var result_view = false
+        var writable = false
         var length_text: Option[string] = None
         var named_ok = true
         var borrowed = false
@@ -7177,7 +7190,13 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                     elif arg.value.kind is Name(word) && word == "blocking"
                         if blocking then c.note(unit, arg.value.span, "`blocking` is said once")
                         blocking = true
-                    elif arg.value.kind is Name(word) then c.note(unit, arg.value.span, s"`$word` is not a word of `@c` on a function; `borrowed` says C only lends the handle it answers, and `blocking` that the call may wait")
+                    elif arg.value.kind is Name(word) && word == "view"
+                        if result_view then c.note(unit, arg.value.span, "`view` is said once")
+                        result_view = true
+                    elif arg.value.kind is Name(word) && word == "writable"
+                        if writable then c.note(unit, arg.value.span, "`writable` is said once")
+                        writable = true
+                    elif arg.value.kind is Name(word) then c.note(unit, arg.value.span, s"`$word` is not a word of `@c` on a function; `borrowed` says C only lends the handle it answers, `blocking` that the call may wait, `view` that C lends the memory it answers and `writable` that Avin may write it")
                     else named_ok = false
                     continue
             if n == "keeps" || n == "consumes"
@@ -7200,19 +7219,25 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                 for name in names
                     if n == "keeps" then keeps.push(name) else consumes.push(name)
                 continue
-            if n == "array" || n == "length"
+            if n == "array" || n == "bytes" || n == "view" || n == "length"
                 if contains_name(given, n)
                     c.note(unit, arg.value.span, s"`$n:` is given once")
                     continue
                 given.push(n)
+                val names_out = n != "length"
+                if names_out && array_name is Some(_)
+                    c.note(unit, arg.value.span, s"`$n:` and `$array_word:` both name what C answers; a binding answers one array or view")
+                    continue
                 if arg.value.kind is StringLit(t)
-                    if t == "" then c.note(unit, arg.value.span, s"`$n:` " + (if n == "array" then "names the `out` parameter C answers an array through" else "is the C expression the array's length is") + ", and is empty")
-                    else
-                        if n == "array" then array_name = Some(t) else length_text = Some(t)
-                else c.note(unit, arg.value.span, s"`$n:` takes a string, as in " + (if n == "array" then "`array: \"glyphs\"`" else "`length: \"num_glyphs\"`"))
+                    if t == "" then c.note(unit, arg.value.span, s"`$n:` " + (if names_out then "names the `out` parameter C answers " + (if n == "view" then "the memory it lends" else "an array") + " through" else "is the C expression the length is") + ", and is empty")
+                    elif names_out
+                        array_name = Some(t)
+                        array_word = n
+                    else length_text = Some(t)
+                else c.note(unit, arg.value.span, s"`$n:` takes a string, as in " + (if n == "array" then "`array: \"glyphs\"`" elif n == "bytes" then "`bytes: \"data\"`" elif n == "view" then "`view: \"buffer\"`" else "`length: \"num_glyphs\"`"))
                 continue
             if n != "free"
-                c.note(unit, arg.value.span, s"`$n:` is not a word of `@c` on a function, which takes `free:`, `keeps:`, `consumes:`, `array:`, `length:`, `borrowed` and `blocking`")
+                c.note(unit, arg.value.span, s"`$n:` is not a word of `@c` on a function, which takes `free:`, `keeps:`, `consumes:`, `array:`, `bytes:`, `view:`, `length:`, `borrowed`, `blocking`, `view` and `writable`")
                 continue
             if free is Some(_) || free_text is Some(_)
                 c.note(unit, arg.value.span, "`free:` is given once")
@@ -7224,13 +7249,26 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
         // `free:` frees the array `array:` names where there is one, with a C function or a C
         // expression in the array's name, and otherwise the string the binding answers, with a C
         // function.
-        if free_text is Some(name)
+        // A view's `free:` is refused below, as nothing frees what C lends.
+        if result_view || array_word == "view" then ()
+        elif free_text is Some(name)
             if array_name is Some(arr)
                 if !is_c_identifier(name) && !c_uses_name(name, arr) then c.note(unit, free_span, s"`free:` names the C function that frees the array `$arr`, or is a C expression in `$arr`, and `$name` is neither")
             elif is_c_identifier(name) then free = Some(name)
             else c.note(unit, free_span, s"`free:` names a C function, and `$name` is not a C identifier")
-        if length_text is Some(_) && array_name is None then c.note(unit, a.span, "`length:` is the length of the array C answers through the `out` parameter `array:` names, and the binding names none")
-        if array_name is Some(arr) && length_text is None then c.note(unit, a.span, s"C answers the array `$arr` with no length of its own, so the binding says it with `length:`, a C expression over the call's parameters and out values, as in `length: \"num_glyphs\"`")
+        val lends = result_view || (array_name is Some(_) && array_word == "view")
+        if result_view && array_name is Some(_) then c.note(unit, a.span, s"`view` lends the memory C answers as its result, and `$array_word:` names an out parameter too; a binding answers one array or view")
+        if length_text is Some(_) && array_name is None && !result_view then c.note(unit, a.span, "`length:` is the length of the array C answers through the `out` parameter `array:` names, or of the memory a `view` lends, and the binding names none")
+        if array_name is Some(arr) && length_text is None then c.note(unit, a.span, s"C answers `$arr` with no length of its own, so the binding says it with `length:`, a C expression over the call's parameters and out values, as in `length: \"num_glyphs\"`")
+        if result_view && array_name is None && length_text is None then c.note(unit, a.span, "C answers the memory a `view` lends with no length of its own, so the binding says it with `length:`, a C expression over the call's parameters, as in `length: \"stride * height\"`")
+        if writable && !lends then c.note(unit, a.span, "`writable` marks a binding that lends a `MutByteView`, with `view` or `view:`")
+        if lends && free_text is Some(_) then c.note(unit, free_span, "a view lends memory C owns and frees itself; `free:` frees an array C answers and the binding copies")
+        if lends
+            // A view is valid until its lender is used again, so only a handle's method lends one.
+            receiver_class match
+                Some(k) ->
+                    if c_class_shared(c.classes[k].decl) then c.note(unit, a.span, s"`${c.classes[k].name}` is `shared`, so another thread may use it while a view it lent is read; a view is lent only by a handle that belongs to one thread at a time")
+                None -> c.note(unit, a.span, "a view is valid until the handle that lent it is used again, so it is lent by a method of a C handle, its lender")
         if !named_ok then text = None
         val written = text match
             Some(t) -> t
@@ -7297,7 +7335,8 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
             if *t is Function(_, _, _)
                 c.note(unit, decl.ty.span, s"parameter ${i + 1} of the C binding `${f.name}` is a function in Avin and `${cp.text}` in C: a function crosses to C only for a parameter of function-pointer type, as in `void (*listener)(userdata void *data, int value)`")
                 continue
-            if c_is_array_param(p, positions[i + first])
+            if c_memory_form(t, c.data, c.classes) is Some(m) then problem = c_block_problem(m, cp)
+            elif c_is_array_param(p, positions[i + first])
                 problem = array match
                     Some(form) -> c_array_problem(cp, form, c.data)
                     None -> s"`${cp.name}` is an array, its length carried by the parameter marked `length(${cp.name})`, so it crosses as an `Array` or an `Option` of one"
@@ -7328,6 +7367,17 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                 val answered = split.result
                 val form = c_text_form(answered, c.data, c.classes)
                 if *answered is ErrorType then ()
+                elif result_view
+                    val pointer = p.result match
+                        CPointerType -> true
+                        CText(_) -> true
+                        CTypedef(_) -> true
+                        _ -> false
+                    val problem = if pointer then c_view_problem(c, answered, p.result_text, writable) else "`view` lends the memory C answers a pointer to, and C answers no pointer"
+                    if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(answered)}` in Avin and `${p.result_text}` in C: $problem")
+                elif c_memory_form(answered, c.data, c.classes) is Some(m)
+                    val problem = if m.kind is MemBlock then "a `ByteBlock` is memory Avin gives C, made by `ByteBlock(length)`, never answered by C" else "a view is lent by a binding marked `view`, its length given with `length:`"
+                    c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(answered)}` in Avin and `${p.result_text}` in C: $problem")
                 elif c_handle_form(answered, c.data, c.classes) is Some(h)
                     made = Some(h.class_index)
                     val problem = c_handle_problem(c, h.class_index, p.result_text, true)
@@ -7365,8 +7415,20 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                     var problem = ""
                     val outs_word = "an out value is a scalar, a string, a handle, an enum mirror or a struct mirror"
                     if array_name is Some(arr) && q.name == arr
-                        problem = c_array_out_problem(c, q, t)
                         array_found = true
+                        if array_word == "view"
+                            if q.mode is CInOut then problem = s"C lends the memory `${q.name}` points at, so it is `out`, not `inout`"
+                            elif !q.pointee_text.ends_with("*") then problem = s"C lends memory through a pointer to a pointer to its bytes, as in `out uint8_t **${q.name}`"
+                            else problem = c_view_problem(c, t, q.pointee_text, writable)
+                        else
+                            problem = c_array_out_problem(c, q, t)
+                            if problem == "" && array_word == "bytes"
+                                val bytes = c_array_form(t, c.data, c.classes) match
+                                    Some(form) -> *form.element is Byte
+                                    None -> false
+                                if !bytes then problem = "`bytes:` copies the bytes C answers into an `Array[byte]`, or an `Option` of one for null; `array:` copies an array of any other element"
+                    elif c_memory_form(t, c.data, c.classes) is Some(m)
+                        problem = if m.kind is MemBlock then "a `ByteBlock` is memory Avin gives C, made by `ByteBlock(length)`, never answered by C" else s"a view C lends through `${q.name}` is named with `view:`, its length given with `length:`, as in `view: \"${q.name}\", length: \"size\"`"
                     elif q.length_of != ""
                         if !(*t is Int(_)) then problem = s"the length C writes back through `${q.name}`, how much of `${q.length_of}` it used, is an integer"
                         else problem = c_crossing_problem(q.pointee, t, NoText, true)
@@ -7387,7 +7449,7 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                     elif c_status_error(t, c.data) is Some(_) then problem = outs_word
                     else problem = c_crossing_problem(q.pointee, t, c_text_form(t, c.data, c.classes), true)
                     if problem != "" then c.note(unit, at, s"out value $j of the C binding `${f.name}`, `${q.name}`, is `${type_name(t)}` in Avin and `${q.pointee_text}` in C: $problem")
-                if array_name is Some(arr) && !array_found then c.note(unit, a.span, s"`array:` names the `out` parameter C answers an array through, and `$arr` is no `out` parameter of the prototype")
+                if array_name is Some(arr) && !array_found then c.note(unit, a.span, s"`$array_word:` names the `out` parameter C answers " + (if array_word == "view" then "the memory it lends" else "an array") + s" through, and `$arr` is no `out` parameter of the prototype")
                 // Only a string C answers is freed, and one bound as `unit` is freed and discarded.
                 val text = p.result is CText(_) || (p.result is CTypedef(_) && !(form is NoText))
                 if free is Some(_) && !text
@@ -7522,6 +7584,31 @@ private c_struct_problem(c: *Checker, m: CHandleForm, q: CParam) -> string
 // What is wrong with the out value of type `t` that `array:` names, C answering it through `q`, or
 // "": an `Array` of a struct mirror or of an element type an array crosses as, perhaps in an
 // `Option` for null, through an `out` pointer to a pointer to its elements.
+// What is wrong with passing memory of the form `m` to the prototype's parameter `q`, or "": only a
+// `ByteBlock` is passed, as it is, as a pointer to its bytes, whose type the C unit checks.
+private c_block_problem(m: CMemoryForm, q: CParam) -> string
+    if !(m.kind is MemBlock) then return "a view is memory C lends, never passed back to C; memory C reads, writes or keeps is a `ByteBlock`"
+    if m.optional then return "a `ByteBlock` is passed as it is, never in an `Option`"
+    if !(q.mode is CIn) then return "a `ByteBlock` is passed in, a pointer to its bytes, and never `inout`"
+    q.ty match
+        CPointerType -> ""
+        CText(_) -> ""
+        CTypedef(_) -> ""
+        _ -> "a `ByteBlock` is passed as a pointer to its bytes"
+
+// What is wrong with lending, as the Avin type `t`, the memory at the C pointer type written `text`,
+// or "": a `ByteView`, or with `writable` a `MutByteView` over a pointer that is not `const`, perhaps in
+// an `Option` for null.
+private c_view_problem(c: *Checker, t: &Type, text: string, writable: bool) -> string
+    val m = c_memory_form(t, c.data, c.classes) match
+        Some(m) -> m
+        None -> return "the memory a binding lends is a `ByteView`, or with `writable` a `MutByteView`, perhaps in an `Option` for null"
+    if m.kind is MemBlock then return "a `ByteBlock` is memory Avin gives C; the memory a binding lends is a `ByteView`, or with `writable` a `MutByteView`"
+    if writable && m.kind is MemView then return "a `writable` binding lends a `MutByteView`"
+    if !writable && m.kind is MemMutView then return "a `MutByteView` is lent by a binding marked `writable`"
+    if writable && (" " + text + " ").contains(" const ") then return "C lends this memory `const`, so it is not `writable`"
+    ""
+
 private c_array_out_problem(c: *Checker, q: CParam, t: &Type) -> string
     if q.mode is CInOut then return s"C answers the array `${q.name}`, so it is `out`, not `inout`"
     val element_text = c_array_out_element(q)
@@ -7632,6 +7719,13 @@ private check_c_ownership(c: *Checker, unit: usize, f: &Function, a: Annotation,
                             if c_class_text(c.classes[k].decl, "forget") is None
                                 c.note(unit, a.span, s"`${f.name}` keeps the function `$name`, so `${c.classes[k].name}`, which keeps it, declares `forget:`, the C call that stops C calling it before the object goes back")
                         None -> c.note(unit, a.span, s"`keeps:` makes the handle a binding answers keep what it names, and `${f.name}` answers no handle and is no method of one")
+                    continue
+                // A block C keeps is held by the handle that keeps it, or by the C object itself
+                // where the class says `attach:`.
+                if c_memory_form(params[i], c.data, c.classes) is Some(m)
+                    if !(m.kind is MemBlock) then c.note(unit, f.params[i].ty.span, s"`$word:` names the view `$name`, which C lent: what C keeps is a `ByteBlock`")
+                    elif which == 1 then c.note(unit, a.span, s"`consumes:` names the `ByteBlock` `$name`: C keeps a block, with `keeps:`, and Avin frees it once nothing holds it")
+                    elif made is None && receiver_class is None then c.note(unit, a.span, s"`keeps:` makes the handle a binding answers keep what it names, and `${f.name}` answers no handle and is no method of one")
                     continue
                 c_handle_form(params[i], c.data, c.classes) match
                     Some(h) -> class_index = Some(h.class_index)
@@ -8156,11 +8250,8 @@ private check_c_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
                     elif arg.value.kind is StringLit(_) then c.note(unit, arg.value.span, "`@c` on a class names the C pointer type it is a handle on with `type:`, as in `@c(type: \"cairo_t *\", release: \"cairo_destroy\")`")
                     else c.note(unit, arg.value.span, "`shared` is the one word `@c` on a class takes without a key")
                     continue
-            if key == "attach" || key == "key"
-                c.note(unit, arg.value.span, s"`$key:` on a C handle is not implemented")
-                continue
-            if key != "type" && key != "release" && key != "retain" && key != "kept" && key != "as" && key != "forget"
-                c.note(unit, arg.value.span, s"`$key:` is not a word of `@c` on a class, which takes `type:`, `release:`, `retain:`, `kept:`, `as:`, `forget:` and `shared`")
+            if key != "type" && key != "release" && key != "retain" && key != "kept" && key != "as" && key != "forget" && key != "attach" && key != "key"
+                c.note(unit, arg.value.span, s"`$key:` is not a word of `@c` on a class, which takes `type:`, `release:`, `retain:`, `kept:`, `as:`, `forget:`, `attach:`, `key:` and `shared`")
                 continue
             if contains_name(seen, key)
                 c.note(unit, arg.value.span, s"`$key:` is given once")
@@ -8194,8 +8285,19 @@ private check_c_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
             elif key == "forget"
                 if !is_c_identifier(text.trim()) && !c_uses_name(text, "userdata")
                     c.note(unit, arg.value.span, s"`forget:` names the C function that stops C calling a callback, taking the handle's pointer and the callback's `userdata`, or a C expression in `self` and `userdata`; `$text` is neither")
+            // `attach:` is a C expression handing C the record of what the handle keeps, with the
+            // function that releases it, and `key:` the type of the static object whose address keys it.
+            elif key == "attach"
+                for name in ["self", "data", "destroy"]
+                    if !c_uses_name(text, name) then c.note(unit, arg.value.span, s"`attach:` is a C expression that gives the C object `self` the record `data` and the function `destroy` that releases it, and `$text` does not use `$name`")
+            elif key == "key"
+                parse_c_type(text) match
+                    Ok(t) -> if t.ty is CVoidType then c.note(unit, arg.value.span, "`key:` names the type of the static object whose address is `attach:`'s `key`, and an object is not `void`")
+                    Err(why) -> c.note(unit, arg.value.span, s"`key:` names the C type of the static object whose address is `attach:`'s `key`, as in `key: \"cairo_user_data_key_t\"`, and `$text` is not one: $why")
             elif !is_c_identifier(text) && !c_uses_name(text, "self")
                 c.note(unit, arg.value.span, s"`$key:` names a C function of the handle's pointer, or a C expression in `self`; `$text` is neither")
+        if contains_name(seen, "key") && !contains_name(seen, "attach") then c.note(unit, a.span, "`key:` names the type of the key `attach:` uses, and the class says no `attach:`")
+        if contains_name(seen, "attach") && contains_name(seen, "shared") then c.note(unit, a.span, "a `shared` handle may be used by any thread, and what `attach:` keeps is updated by the handle's owner alone; a class with `attach:` is not `shared`")
         if !contains_name(seen, "type") then c.note(unit, a.span, "`@c` on a class names the C pointer type it is a handle on, `type: \"cairo_t *\"`")
         if !contains_name(seen, "release") then c.note(unit, a.span, "a C handle names the C function that gives its object back, `release: \"cairo_destroy\"`")
     if !annotated then return

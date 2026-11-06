@@ -335,6 +335,14 @@ thread the last reference goes, unpins it, and runs no Avin code. An `attach:` e
 non-zero stops the program at the call, since what it would keep could not be kept. Without `attach:`,
 `keeps:` holds only as long as the handle ([proposed](/spec/decisions/#proposed)).
 
+The record belongs to one handle object: a later `keeps:` through the same handle adds to it, and the
+handle lets go of it when its reference goes back, by `close()` or its finalizer, while C keeps it until
+`destroy`. On such a class every kept object, a handle or a `ByteBlock`, is held as the Avin object, so
+a kept handle's own reference lives as long as the record. `key:` may be left out, and `key` is then the
+address of a `char` of the class's own; `attach:` must name `self`, `data` and `destroy`, `key:` comes
+only with `attach:`, and a `shared` class has no `attach:`, since the handle's owner alone updates the
+record ([proposed](/spec/decisions/#proposed)).
+
 ### Kept handles, and the order they are given back
 
 The collector frees what is unreachable in no order of its own: a holder and the handle it keeps,
@@ -814,14 +822,40 @@ call. A binding that hands it to C for keeps says `keeps:`, and on a class with
 [`attach:`](#when-c-holds-the-object-longer-than-avin-does) the block lives as long as C's object:
 
 ```avin
-@c("cairo_surface_t *cairo_image_surface_create_for_data(unsigned char *data, cairo_format_t format, int width, int height, int stride)",
-   keeps: "data")
-private surfaceForData(data: ByteBlock, format: Format, width: int, height: int, stride: int) -> Surface
+@c("cairo_surface_t *cairo_image_surface_create_for_data(unsigned char *pixels, cairo_format_t format, int width, int height, int stride)",
+   keeps: "pixels")
+private surfaceForData(pixels: ByteBlock, format: Format, width: int, height: int, stride: int) -> Surface
 ```
 
-Cairo reads `height * stride` bytes from `data` and no prototype says so; the library checks
-`data.length() >= height * stride` before the call, a precondition the binding takes on trust like any
-`length`.
+Cairo reads `height * stride` bytes from `pixels` and no prototype says so; the library checks
+`pixels.length() >= height * stride` before the call, a precondition the binding takes on trust like
+any `length`.
+
+`ByteBlock(length)` with a negative length stops the program, and the class's own constructor,
+`ByteBlock()`, makes a block of no bytes, passed to C as null. A block is a `MutByteView` that nothing
+closes, since nothing lent it; it belongs to the code that made it and moves between threads as a handle
+does, so another thread's use stops the program (`` `ByteBlock` belongs to another thread``). Only a
+block is passed to C: a view is memory C lent, never passed back. It is never in an `Option` and never
+`inout`, and the C unit checks that the pointer it is passed to points at bytes one byte wide.
+
+### The rules of views and blocks
+
+A view's length and its indices are `int`s, as an array's are. Where the binding's `length:` is
+negative, or longer than the greatest `int`, the program stops at the call (`` `bf_frame_static`
+answered more bytes than a view holds``). C lending null is `None` where the binding answers an
+`Option`, whatever the length; otherwise null with a length of zero is an empty view, and null with any
+other length stops the program (`` `frame_data` answered null``). `bytes:` answers the same way, with an
+empty array for a null of length zero ([proposed](/spec/decisions/#proposed)).
+
+A view is lent only by a method of a C handle, its lender, and only by a handle that is not `shared`:
+the view belongs to the code that owns its lender, wherever that code runs, so a lightweight thread
+reads its view across its own switches, a thread's body that captures a view takes its lender with it,
+and any other thread's use stops the program (`` the `ByteView` of `Frame` belongs to another
+thread``). A field accessor is a use of its handle as a method is, and closes the view it lent. Each
+operation of a view or a block checks, in order, the code running, that a view is still open, and the
+indices: `index out of range` for `apply` and `update`, `slice out of range` for `slice` and `fill`,
+and `write out of range` for a `write` that does not fit, which writes nothing. A failed status lends
+nothing ([proposed](/spec/decisions/#proposed)).
 
 ## Calls that wait
 

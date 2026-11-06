@@ -1,0 +1,202 @@
+module avin.rt
+
+import sh.sysl.gc
+import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
+import sysl.threads.SleepLock
+
+// Memory a C binding lends Avin, and memory Avin gives C. A `ByteView` or `MutByteView` is a view of
+// bytes C owns, lent by a C handle; a `ByteBlock` is bytes Avin owns outside the collected heap, which
+// C may keep. All three are objects of one layout, `CMemory`, which the compiler lays their classes out
+// as and the binding that lends a view fills in. Every operation first checks that the code running
+// may use the memory, then that a view is still open, then its bounds, and stops the program at the
+// call otherwise.
+
+private extern "calloc" block_calloc(count: usize, size: usize) -> *u8
+private extern "free" block_free(p: *u8) -> unit
+
+/** The object of a view or a block: the address of its bytes; the owner of the code that may use a
+ * block, at the offset a handle's owner is, so a block moves between threads as a handle does; how
+ * many bytes there are; whether a view was closed, by its lender's next use; the reasons, as strings,
+ * a closed view and a use by another thread stop the program with; and the C handle that lent a view,
+ * which it keeps alive, or null for a block. The last three are references the collector traces. */
+struct CMemory
+    address: *u8
+    owner: u64
+    length: i64
+    closed: i64
+    closed_reason: *u8
+    foreign_reason: *u8
+    lender: *u8
+
+@assert(sizeof(CMemory) == 56, "the compiler lays a view out in 56 bytes")
+@assert(offsetof(CMemory, owner) == HandleOwnerOffset, "a block's owner is where a handle's is")
+@assert(offsetof(CMemory, closed_reason) == 32, "the compiler traces a view's references from 32")
+
+private memory_of(p: *u8) -> *CMemory = ptr_cast(p)
+
+// Stops the program at the call for `reason`.
+private refuse(ctx: *Context, site: *TrapSite, reason: string) -> never = stop_at_caller_with(ctx, site, text_of(ctx, reason))
+
+/** Stops the program unless the code running may use `p`, a view or a block: a view's lender must
+ * belong to it, and a block itself, and a view must not be closed. */
+@export("avin_rt_c_memory_check")
+c_memory_check(ctx: *Context, p: *u8, site: *TrapSite)
+    val m = memory_of(p)
+    if m.lender != null
+        val word: *u64 = ptr_cast(usize(m.lender) + HandleOwnerOffset)
+        if *word != ctx.owner && !handle_claim(ctx, m.lender) then stop_at_caller_with(ctx, site, m.foreign_reason)
+    elif m.owner != ctx.owner && !handle_claim(ctx, p)
+        if m.foreign_reason != null then stop_at_caller_with(ctx, site, m.foreign_reason)
+        refuse(ctx, site, "`ByteBlock` belongs to another thread")
+    if m.closed != 0 then stop_at_caller_with(ctx, site, m.closed_reason)
+
+/** How many bytes the view or block `p` has. */
+@export("avin_rt_c_view_length")
+c_view_length(ctx: *Context, p: *u8, site: *TrapSite) -> i32
+    c_memory_check(ctx, p, site)
+    i32(memory_of(p).length)
+
+/** The byte at `index`. */
+@export("avin_rt_c_view_apply")
+c_view_apply(ctx: *Context, p: *u8, index: i32, site: *TrapSite) -> u8
+    c_memory_check(ctx, p, site)
+    val m = memory_of(p)
+    if index < 0 || i64(index) >= m.length then refuse(ctx, site, "index out of range")
+    m.address[usize(index)]
+
+/** Replaces the byte at `index` with `value`. */
+@export("avin_rt_c_view_update")
+c_view_update(ctx: *Context, p: *u8, index: i32, value: u8, site: *TrapSite)
+    c_memory_check(ctx, p, site)
+    val m = memory_of(p)
+    if index < 0 || i64(index) >= m.length then refuse(ctx, site, "index out of range")
+    m.address[usize(index)] = value
+
+/** A new array, laid out by `d`, of the bytes from `from` up to `until`. */
+@export("avin_rt_c_view_slice")
+c_view_slice(ctx: *Context, p: *u8, from: i32, until: i32, d: *Descriptor, site: *TrapSite) -> *u8
+    c_memory_check(ctx, p, site)
+    if from < 0 || from > until || i64(until) > memory_of(p).length then refuse(ctx, site, "slice out of range")
+    val n = usize(until - from)
+    // The array is made before the bytes are read: a collection while it is made moves nothing, and
+    // the view, a parameter of the call, keeps its lender and so its bytes.
+    val a = new_array(ctx, d, n)
+    val to = array_elements(a)
+    val m = memory_of(p)
+    for i in 0..<n do to[i] = m.address[usize(from) + i]
+    a
+
+/** Sets every byte from `from` up to `until` to `value`. */
+@export("avin_rt_c_view_fill")
+c_view_fill(ctx: *Context, p: *u8, from: i32, until: i32, value: u8, site: *TrapSite)
+    c_memory_check(ctx, p, site)
+    val m = memory_of(p)
+    if from < 0 || from > until || i64(until) > m.length then refuse(ctx, site, "slice out of range")
+    for i in usize(from)..<usize(until) do m.address[i] = value
+
+/** Copies the bytes of the array `bytes` in, the first at `at`; every one must fall inside. */
+@export("avin_rt_c_view_write")
+c_view_write(ctx: *Context, p: *u8, at: i32, bytes: *u8, site: *TrapSite)
+    c_memory_check(ctx, p, site)
+    val m = memory_of(p)
+    val n = array_length(bytes)
+    if at < 0 || i64(at) + i64(n) > m.length then refuse(ctx, site, "write out of range")
+    val from = array_elements(bytes)
+    for i in 0..<n do m.address[usize(at) + i] = from[i]
+
+/** A new block, laid out by `d`, of `length` zeroed bytes outside the collected heap, owned by the
+ * code running. Its finalizer frees them. */
+@export("avin_rt_c_block_new")
+c_block_new(ctx: *Context, length: i32, d: *Descriptor, site: *TrapSite) -> *u8
+    if length < 0 then refuse(ctx, site, "negative `ByteBlock` length")
+    val p = allocate(ctx, d)
+    val bytes = block_calloc(if length == 0 then 1usize else usize(length), 1usize)
+    if bytes == null
+        flush()
+        eprints("avin: out of memory: no room for a `ByteBlock` of " + length.to_string() + " bytes\n")
+        trap()
+    val m = memory_of(p)
+    *m = CMemory(bytes, ctx.owner, i64(length), 0, null, null, null)
+    published(p)
+
+/** The collector's finalizer of a block: its bytes are freed, as nothing reaches them any more. */
+@export("avin_rt_c_block_finalize")
+c_block_finalize(p: *u8, heap: *u8)
+    val m = memory_of(p)
+    if m.address != null then block_free(m.address)
+    m.address = null
+
+// What a handle of a class with `attach:` keeps, tied to the C object's lifetime rather than the
+// handle's. Each record is a slot of `attached`, named to C by its number plus one, the `data` the
+// class's `attach:` expression passes on. A record's list of kept objects is a root of every
+// collection while C holds the record, until C calls `avin_rt_c_attach_destroy`; the slot is reused
+// only once the handle has let go of it too, so a handle never names another's record.
+
+/** A record: the list of Avin objects it keeps, whether C still holds it, and whether the handle
+ * that made it does. */
+private struct Attached
+    kept: *u8
+    by_c: bool
+    by_handle: bool
+
+private var attached: Buf[Attached] = buf()
+private var free_attached: Buf[usize] = buf()
+private var attached_lock: SleepLock = SleepLock.new()
+
+/** A new record, held by C and by the handle making it, keeping nothing yet: its number. */
+@export("avin_rt_c_attach_new")
+c_attach_new(ctx: *Context) -> i64
+    attached_lock.lock()
+    val made = Attached(null, true, true)
+    val slot = free_attached.pop() match
+        Some(s) ->
+            attached[s] = made
+            s
+        None ->
+            attached.push(made)
+            attached.len() - 1
+    attached_lock.unlock()
+    i64(slot + 1)
+
+/** Makes the record numbered `id` keep `kept`, the list of what its handle keeps, while C holds it. */
+@export("avin_rt_c_attach_set")
+c_attach_set(ctx: *Context, id: i64, kept: *u8)
+    attached_lock.lock()
+    val s = usize(id - 1)
+    val a = attached[s]
+    if a.by_c then attached[s] = Attached(kept, true, a.by_handle)
+    attached_lock.unlock()
+
+// Lets go of the record numbered `id` for C, or for its handle, freeing its slot once neither holds it.
+private let_go(id: usize, c: bool)
+    if id == 0 then return
+    attached_lock.lock()
+    val s = id - 1
+    val a = attached[s]
+    val now = if c then Attached(null, false, a.by_handle) else Attached(a.kept, a.by_c, false)
+    attached[s] = now
+    if !now.by_c && !now.by_handle then free_attached.push(s)
+    attached_lock.unlock()
+
+/** C's destroy of a record, called with the record's `data` when its object's last reference goes, on
+ * any thread and with no context: what it keeps is no longer a root. It runs no Avin code. */
+@export("avin_rt_c_attach_destroy")
+c_attach_destroy(data: *u8) = let_go(usize(data), true)
+
+/** The handle's letting go of its record, numbered `id`, when its reference is given back. */
+@export("avin_rt_c_attach_drop")
+c_attach_drop(id: *u8) = let_go(usize(id), false)
+
+/** Undoes a record whose `attach:` failed, which C never held. */
+@export("avin_rt_c_attach_failed")
+c_attach_failed(ctx: *Context, id: i64)
+    let_go(usize(id), true)
+    let_go(usize(id), false)
+
+/** Marks what every record C holds keeps. The collector calls it with every attached thread stopped. */
+mark_attached(h: *gc.Heap)
+    attached_lock.lock()
+    for a in attached
+        if a.by_c && a.kept != null then gc.mark(h, a.kept)
+    attached_lock.unlock()

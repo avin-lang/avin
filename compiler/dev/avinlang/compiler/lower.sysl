@@ -426,12 +426,24 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
                     l.handles.push(MirHandle(handle_trap_name(k.decl, k.name), target, handle_finalizer(id, args), shape.descriptor, k.unit, k.decl.name_span, arguments))
                 // A C handle's first word is its C pointer and its second its owner, as a Sysl
                 // handle's; its third is the C references it holds to the handles it keeps, which
-                // the C unit's glue keeps off the heap, and its fourth, which the collector traces,
-                // the Avin objects it keeps. Its finalizer is the C unit's.
+                // the C unit's glue keeps off the heap; its fourth and fifth, which the collector
+                // traces, the Avin objects it keeps and the view it lent last; and its sixth the
+                // number of the record `attach:` gave C. Its finalizer is the C unit's.
                 elif c_handle_type(k.decl) is Some(target)
                     l.descriptors[shape.descriptor].size = CHandleSize
                     l.descriptors[shape.descriptor].refs.push(CHandleKept)
+                    l.descriptors[shape.descriptor].refs.push(CHandleLent)
                     l.c_handles.push(MirHandle(k.name, target, s"avin_c_finalize_$id", shape.descriptor, k.unit, k.decl.name_span, buf()))
+                // A view or a block is laid out as the runtime's `CMemory`: its address, owner,
+                // length and closed flag, then the reasons it traps with and its lender, which the
+                // collector traces. A block's finalizer, the runtime's, frees its bytes.
+                elif c_memory_class(l.program.classes, id) is Some(kind)
+                    l.descriptors[shape.descriptor].size = CMemorySize
+                    l.descriptors[shape.descriptor].refs = buf()
+                    l.descriptors[shape.descriptor].refs.push(CMemoryClosedReason)
+                    l.descriptors[shape.descriptor].refs.push(CMemoryForeignReason)
+                    l.descriptors[shape.descriptor].refs.push(CMemoryLender)
+                    if kind is MemBlock then l.c_handles.push(MirHandle(k.name, "", "avin_rt_c_block_finalize", shape.descriptor, k.unit, k.decl.name_span, buf()))
                 // An opaque value's object is the bytes of its C value, as the C unit measured them,
                 // which the collector does not trace.
                 elif c_value_type(k.decl) is Some(_)
@@ -2233,10 +2245,14 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
             passed.push(SlotAddress(slot.slot))
             continue
         if arrays.of[k] is Some(a)
+            // A block is an object `keeps:` may name, and the frame keeps it across a blocking call.
+            var block_class = 0usize
+            if a.block
+                if *concrete(l, symbol.params[in_at]) is Class(bk, _, _) then block_class = bk
             in_at += 1
             args.push(a.pointer)
-            objects.push(None)
-            classes.push(0)
+            objects.push(if a.block then Some(a.array) else None)
+            classes.push(block_class)
             optionals.push(false)
             scalars.push(CAddress)
             passed.push(a.pointer)
@@ -2257,7 +2273,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
                 in_at += 1
             var slot = c_out_slot(l, symbol, q, t, given, given_type, &copies, at)
             if array_out is Some(a)
-                if a.name == q.name then slot.array = true
+                if a.name != "" && a.name == q.name then slot.array = true
             outs.push(slot)
             scalars.push(CAddress)
             slot.memory match
@@ -2333,6 +2349,10 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
         val converted = c_argument(l, x, t, s, c_integer_name(q.ty, s), at)
         args.push(converted)
         passed.push(converted)
+    // A method of a handle is a use of it, which closes the view it lent last before C is called.
+    if symbol.owner_class is Some(k) && skipped > 0
+        if c_handle_type(l.program.classes[k].decl) is Some(_)
+            if objects[0] is Some(o) then c_close_lent(l, o)
     var answers_handle = c_handle_form(parts.result, l.program.data, l.program.classes) is Some(_)
     for o in outs
         if c_handle_form(o.t, l.program.data, l.program.classes) is Some(_) then answers_handle = true
@@ -2385,7 +2405,14 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
     var first: Option[Operand] = None
     var made: Option[Operand] = None
     var made_optional = false
-    if text_result
+    // Memory C lends as its result is a view of it, its length the glue's.
+    val view_form = c_memory_form(answered, l.program.data, l.program.classes)
+    if view_form is Some(m) && length_slot is Some(ls)
+        val answer = fresh(l, MPtr)
+        c_call(l, Call(Some(answer), CFunction(callee, scalars, Some(CAddress)), passed), blocking, arrays, objects)
+        val length = load(l, Some(Place(SlotAddress(ls), MInt(64)))).unwrap()
+        first = Some(c_view_answer(l, calls, answered, m, Value(answer), length, s"`${p.symbol}` answered", at))
+    elif text_result
         val answer = fresh(l, MPtr)
         c_call(l, Call(Some(answer), CFunction(callee, scalars, Some(CAddress)), passed), blocking, arrays, objects)
         // C may answer a pointer into a string it was passed, so the copies outlive the answer's.
@@ -2453,6 +2480,8 @@ private struct CArrayIn
     /** For an array of a struct mirror, the mirror: its elements are converted into C memory, which
      * nothing copies back, freed with the strings its elements hold once the call has returned. */
     converted: Option[usize]
+    /** Whether it is a `ByteBlock`, whose bytes C is passed where they are, and never a copy. */
+    block: bool
 
 /** The arrays a binding passes, by the prototype's index of each. */
 private struct CArraysIn
@@ -2468,6 +2497,13 @@ private c_arrays_in(l: *Lowering, symbol: FunctionSymbol, p: CPrototype, blockin
         val q = p.params[k]
         val i = in_at
         if c_is_avin_param(q) then in_at += 1
+        // A block is passed as a pointer to its bytes where they are, which never move, so a
+        // `blocking` call is passed them too; its length is filled into a `length(p)` beside it.
+        if q.mode is CIn && c_is_avin_param(q) && i < symbol.params.len()
+            val b = concrete(l, symbol.params[i])
+            if c_memory_form(b, l.program.data, l.program.classes) is Some(_)
+                of.push(Some(c_block_in(l, Value(l.param_values[i].unwrap()), symbol.decl.name_span)))
+                continue
         if !c_is_array_param(p, k)
             of.push(None)
             continue
@@ -2489,7 +2525,7 @@ private c_arrays_in(l: *Lowering, symbol: FunctionSymbol, p: CPrototype, blockin
             limit = convert_op(l, SignExtend, MInt(64), length)
         if c_struct_of(form.element, l.program.data) is Some(d)
             val memory = c_struct_array_in(l, symbol, d, a, length, symbol.decl.name_span)
-            of.push(Some(CArrayIn(a, memory, length, limit, c_struct_size(l, d), false, Some(d))))
+            of.push(Some(CArrayIn(a, memory, length, limit, c_struct_size(l, d), false, Some(d), false)))
             continue
         var pointer = a
         if blocking then pointer = runtime_call(l, "avin_rt_c_array_copy", [MRef, MInt(64)], MPtr, [a, ConstInt(64, size.to_string())])
@@ -2498,8 +2534,23 @@ private c_arrays_in(l: *Lowering, symbol: FunctionSymbol, p: CPrototype, blockin
             val elements = fresh(l, MPtr)
             l.insts.push(Offset(elements, a, ArrayHeader))
             pointer = Value(elements)
-        of.push(Some(CArrayIn(a, pointer, length, limit, size, write, None)))
+        of.push(Some(CArrayIn(a, pointer, length, limit, size, write, None, false)))
     CArraysIn(of)
+
+// The block `x` passed to C: checked to belong to the code running, then its address and its length,
+// an `int` and a `long`, no `int` being too short for it.
+private c_block_in(l: *Lowering, x: Operand, at: Span) -> CArrayIn
+    var types: Buf[MirType] = buf()
+    types.push(MRef)
+    types.push(MPtr)
+    var args: Buf[Operand] = buf()
+    args.push(x)
+    args.push(TrapSiteAddress(trap_site(l, "", at)))
+    l.insts.push(Call(None, Runtime("avin_rt_c_memory_check", MirSignature(types, None)), args))
+    val pointer = load_field(l, x, FieldSlot(0, MPtr))
+    val limit = load_field(l, x, FieldSlot(CMemoryLength, MInt(64)))
+    val length = resize(l, limit, 64, 32, true)
+    CArrayIn(x, pointer, length, limit, 1, true, None, true)
 
 // The index of the prototype's parameter named `name`.
 private c_param_index(p: CPrototype, name: string) -> usize
@@ -2520,7 +2571,7 @@ private c_call(l: *Lowering, call: Inst, blocking: bool, arrays: CArraysIn, obje
     l.insts.push(Call(None, Runtime("avin_rt_leave_safe", MirSignature(buf(), None)), buf()))
     for x in arrays.of
         if x is Some(a)
-            if a.converted is Some(_) then continue
+            if a.converted is Some(_) || a.block then continue
             var types: Buf[MirType] = buf()
             types.push(MRef)
             types.push(MPtr)
@@ -2576,7 +2627,7 @@ private c_out_slot(l: *Lowering, symbol: FunctionSymbol, q: CParam, t: &Type, gi
         val memory = c_struct_memory(l, ConstInt(64, c_struct_size(l, d).to_string()))
         if given is Some(x) then c_struct_write(l, symbol, d, x, memory, 0, copies, at)
         return COutSlot(q, t, 0, CAddress, None, Some(memory), false)
-    val pointer = c_handle_form(t, l.program.data, l.program.classes) is Some(_) || !(c_text_form(t, l.program.data, l.program.classes) is NoText) || c_array_form(t, l.program.data, l.program.classes) is Some(_)
+    val pointer = c_handle_form(t, l.program.data, l.program.classes) is Some(_) || !(c_text_form(t, l.program.data, l.program.classes) is NoText) || c_array_form(t, l.program.data, l.program.classes) is Some(_) || c_memory_form(t, l.program.data, l.program.classes) is Some(_)
     if pointer
         val place = machine_slot(l, MPtr)
         var start: Operand = NullAddress
@@ -2638,7 +2689,9 @@ private c_read_outs(l: *Lowering, symbol: FunctionSymbol, call: CCall, outs: Buf
         if o.array
             val pointer = load(l, Some(Place(SlotAddress(o.slot), MPtr))).unwrap()
             val length = load(l, Some(Place(SlotAddress(reading.length_slot.unwrap()), MInt(64)))).unwrap()
-            values.push(Some(c_array_answer(l, reading.symbol, o.t, pointer, length, who, at)))
+            c_memory_form(o.t, l.program.data, l.program.classes) match
+                Some(m) -> values.push(Some(c_view_answer(l, call, o.t, m, pointer, length, who, at)))
+                None -> values.push(Some(c_array_answer(l, reading.symbol, o.t, pointer, length, who, at)))
             continue
         val place = Some(Place(SlotAddress(o.slot), if o.scalar is CAddress then MPtr elif o.scalar is CBinary32 then MInt(32) else c_machine(o.scalar)))
         val x = load(l, place).unwrap()
@@ -2932,7 +2985,8 @@ private c_free_struct_memory(l: *Lowering, memory: Operand)
 // leaves it.
 private c_free_array_outs(l: *Lowering, outs: Buf[COutSlot], symbol: usize)
     for o in outs
-        if !o.array then continue
+        // Memory C lends is C's, and nothing frees it.
+        if !o.array || c_memory_form(o.t, l.program.data, l.program.classes) is Some(_) then continue
         val pointer = load(l, Some(Place(SlotAddress(o.slot), MPtr))).unwrap()
         var params: Buf[CScalar] = buf()
         params.push(CAddress)
@@ -2992,6 +3046,67 @@ private c_array_copy_out(l: *Lowering, symbol: usize, array: &Type, element: &Ty
     args.push(pointer)
     l.insts.push(Call(None, CFunction(c_array_free_glue(symbol), params, None), args))
     made
+
+// The memory C lent at `pointer`, `length` bytes long, as the Avin type `t`, a view of the form `m`:
+// a new view of it, lent by the call's receiver. Null is `None` for an `Option`, and otherwise an
+// empty view where the length is zero and a stop where it is not; a negative length, or one longer
+// than an `int`, stops the program.
+private c_view_answer(l: *Lowering, call: CCall, t: &Type, m: CMemoryForm, pointer: Operand, length: Operand, who: string, at: Span) -> Operand
+    val absent = compare(l, CmpEq, pointer, NullAddress)
+    if !m.optional
+        val counted = compare(l, CmpNe, length, ConstInt(64, "0"))
+        val both = fresh(l, MBool)
+        l.insts.push(Select(both, absent, counted, ConstBool(false)))
+        trap_if(l, Value(both), s"$who null", at)
+        return c_view_made(l, call, m, pointer, length, who, at)
+    val slot = machine_slot(l, MRef)
+    val none = new_block(l)
+    val present = new_block(l)
+    val join = new_block(l)
+    finish_into(l, Branch(absent, none, present), none)
+    store(l, slot, Some(NullAddress))
+    finish_into(l, Jump(join), present)
+    store(l, slot, Some(c_view_made(l, call, m, pointer, length, who, at)))
+    finish_into(l, Jump(join), join)
+    val value = load(l, slot).unwrap()
+    if pointer_option(l, t) then value else option_object(l, t, value)
+
+// A new view of the memory at `pointer`, of class `m.class_index`, owned by the code running and lent
+// by the call's receiver, which keeps it as the view it lent last, to close it at its next use.
+private c_view_made(l: *Lowering, call: CCall, m: CMemoryForm, pointer: Operand, length: Operand, who: string, at: Span) -> Operand
+    trap_if(l, compare(l, CmpLt, length, ConstInt(64, "0")), s"$who a negative length", at)
+    trap_if(l, compare(l, CmpGt, length, ConstInt(64, "2147483647")), s"$who more bytes than a view holds", at)
+    val lender = call.objects[0].unwrap()
+    val owner = trap_name(l, call.classes[0])
+    val name = l.program.classes[m.class_index].name
+    val t: &Type = Class(m.class_index, name, buf())
+    val object = fresh(l, MRef)
+    l.insts.push(Alloc(object, layout(l, t).variants[0].descriptor))
+    val v = Value(object)
+    l.insts.push(Store(field_address(l, v, FieldSlot(0, MPtr)), pointer))
+    val mine = fresh(l, MInt(64))
+    l.insts.push(Load(mine, OwnerWord))
+    l.insts.push(Store(field_address(l, v, FieldSlot(CMemoryOwner, MInt(64))), Value(mine)))
+    l.insts.push(Store(field_address(l, v, FieldSlot(CMemoryLength, MInt(64))), length))
+    l.insts.push(Store(field_address(l, v, FieldSlot(CMemoryClosedReason, MRef)), string_constant(l, s"the `$name` of `$owner` was closed when `$owner` was used again")))
+    l.insts.push(Store(field_address(l, v, FieldSlot(CMemoryForeignReason, MRef)), string_constant(l, s"the `$name` of `$owner` belongs to another thread")))
+    l.insts.push(Store(field_address(l, v, FieldSlot(CMemoryLender, MRef)), lender))
+    l.insts.push(Publish)
+    l.insts.push(Store(field_address(l, lender, FieldSlot(CHandleLent, MRef)), v))
+    v
+
+// Closes the view the handle `object` lent last, if it is open: the handle is being used, and the
+// use may free or replace the memory the view reads.
+private c_close_lent(l: *Lowering, object: Operand)
+    val slot = field_address(l, object, FieldSlot(CHandleLent, MRef))
+    val lent = fresh(l, MRef)
+    l.insts.push(Load(lent, slot))
+    val open = new_block(l)
+    val join = new_block(l)
+    finish_into(l, Branch(compare(l, CmpEq, Value(lent), NullAddress), join, open), open)
+    l.insts.push(Store(field_address(l, Value(lent), FieldSlot(CMemoryClosed, MInt(64))), ConstInt(64, "1")))
+    l.insts.push(Store(field_address(l, object, FieldSlot(CHandleLent, MRef)), NullAddress))
+    finish_into(l, Jump(join), join)
 
 // The binding's answer of Avin type `t` made of `values`: one value alone is itself, and more are a
 // tuple of them.
@@ -3086,9 +3201,20 @@ private c_mirror_answer(l: *Lowering, x: Operand, d: usize, s: CScalar, who: str
 
 // The size of a C handle's object, and the offsets of its owner, the C references it holds and the
 // Avin objects it keeps (see `layout`).
-private const CHandleSize: usize = 32
+private const CHandleSize: usize = 48
 private const CHandleOwner: usize = 8
 private const CHandleKept: usize = 24
+private const CHandleLent: usize = 32
+private const CHandleAttach: usize = 40
+
+// The layout of a view or a block, the runtime's `CMemory`.
+private const CMemorySize: usize = 56
+private const CMemoryOwner: usize = 8
+private const CMemoryLength: usize = 16
+private const CMemoryClosed: usize = 24
+private const CMemoryClosedReason: usize = 32
+private const CMemoryForeignReason: usize = 40
+private const CMemoryLender: usize = 48
 
 /** What a C binding's call was passed: what answers, as a trap on a null answer says it ("`symbol`
  * answered"), the arguments, a handle's as its own C pointer, and for each parameter that is a
@@ -3121,6 +3247,7 @@ private c_close_body(l: *Lowering, symbol: FunctionSymbol, k: usize)
     l.library = true
     val object = Value(l.param_values[0].unwrap())
     if !c_class_shared(l.program.classes[k].decl) then check_owner(l, object, k, symbol.decl.name_span)
+    c_close_lent(l, object)
     c_glue_call(l, s"avin_c_give_back_$k", [object])
     l.insts.push(Store(field_address(l, object, FieldSlot(CHandleKept, MRef)), NullAddress))
     l.library = outer
@@ -3192,6 +3319,8 @@ private c_field_body(l: *Lowering, symbol: FunctionSymbol, n: usize, field: CFie
     val k = symbol.owner_class.unwrap()
     val object = Value(l.param_values[0].unwrap())
     val pointer = c_checked_pointer(l, object, k, at)
+    // Reading or writing a field is a use of the handle, which closes the view it lent last.
+    c_close_lent(l, object)
     val result_type = concrete(l, symbol.result.unwrap_or(Unit))
     val writer = *result_type is Unit
     val last = if writer then symbol.params.len() - 1 else symbol.params.len()
@@ -3349,7 +3478,14 @@ private c_keeps(l: *Lowering, symbol: FunctionSymbol, call: CCall, made: Option[
     val o = holder match
         Some(o) -> o
         None -> return
+    // The holder's class; where it says `attach:`, what it keeps is held as Avin objects, on the list
+    // its record in the runtime keeps for as long as C holds the C object.
+    val holder_class = if made is Some(_) then c_first_handle_class(l, concrete(l, symbol.result.unwrap_or(Unit))) else symbol.owner_class
+    var attached: Option[usize] = None
+    if holder_class is Some(hk)
+        if c_class_text(l.program.classes[hk].decl, "attach") is Some(_) then attached = Some(hk)
     val join = c_if_present(l, o, optional && made is Some(_))
+    var kept_objects = false
     for name in keeps
         val i = c_named_parameter(symbol, call, name) match
             Some(i) -> i
@@ -3362,8 +3498,76 @@ private c_keeps(l: *Lowering, symbol: FunctionSymbol, call: CCall, made: Option[
         val kept = call.objects[i] match
             Some(k) -> k
             None -> continue
-        c_keep(l, o, kept, call.args[i], call.classes[i], call.optionals[i])
+        if attached is Some(_)
+            val present = c_if_present(l, kept, call.optionals[i])
+            c_keep_object(l, o, kept)
+            c_end_present(l, present)
+            kept_objects = true
+        else c_keep(l, o, kept, call.args[i], call.classes[i], call.optionals[i])
+    if attached is Some(hk)
+        if kept_objects then c_attach(l, o, hk, symbol.name, symbol.decl.name_span)
     c_end_present(l, join)
+
+// The first C handle class the Avin type `t` answers, itself or inside an `Option`, a `Result`'s `Ok`
+// or a tuple.
+private c_first_handle_class(l: *Lowering, t: &Type) -> Option[usize]
+    if c_handle_form(t, l.program.data, l.program.classes) is Some(h) then return Some(h.class_index)
+    *t match
+        Data(_, _, args) ->
+            if args.len() > 0 then return c_first_handle_class(l, args[0])
+            None
+        Tuple(items) ->
+            for item in items
+                if c_first_handle_class(l, item) is Some(k) then return Some(k)
+            None
+        _ -> None
+
+// Ties what the handle `holder`, of class `k` with `attach:`, keeps to its C object: at its first
+// keep, a record is made in the runtime and given to C through the class's glue, which stops the
+// program at the call of `binding` where C answers non-zero; the record then keeps the holder's list
+// of the Avin objects it keeps, for as long as C holds it.
+private c_attach(l: *Lowering, holder: Operand, k: usize, binding: string, at: Span)
+    val word = field_address(l, holder, FieldSlot(CHandleAttach, MInt(64)))
+    val known = fresh(l, MInt(64))
+    l.insts.push(Load(known, word))
+    val record = machine_slot(l, MInt(64))
+    store(l, record, Some(Value(known)))
+    val make = new_block(l)
+    val join = new_block(l)
+    finish_into(l, Branch(compare(l, CmpEq, Value(known), ConstInt(64, "0")), make, join), make)
+    val fresh_record = fresh(l, MInt(64))
+    l.insts.push(Call(Some(fresh_record), Runtime("avin_rt_c_attach_new", MirSignature(buf(), Some(MInt(64)))), buf()))
+    val made = Value(fresh_record)
+    var params: Buf[CScalar] = buf()
+    params.push(CAddress)
+    params.push(CSigned(64))
+    var args: Buf[Operand] = buf()
+    args.push(load_field(l, holder, FieldSlot(0, MPtr)))
+    args.push(made)
+    val answer = fresh(l, MInt(64))
+    l.insts.push(Call(Some(answer), CFunction(s"avin_c_attach_$k", params, Some(CSigned(64))), args))
+    val failed = new_block(l)
+    val attached = new_block(l)
+    finish_into(l, Branch(compare(l, CmpNe, Value(answer), ConstInt(64, "0")), failed, attached), failed)
+    var undo: Buf[MirType] = buf()
+    undo.push(MInt(64))
+    var undone: Buf[Operand] = buf()
+    undone.push(made)
+    l.insts.push(Call(None, Runtime("avin_rt_c_attach_failed", MirSignature(undo, None)), undone))
+    val site = trap_site(l, s"`attach:` of `${trap_name(l, k)}` answered non-zero, so what `$binding` keeps cannot be kept", at)
+    finish_into(l, trap_terminator(l, site), attached)
+    l.insts.push(Store(field_address(l, holder, FieldSlot(CHandleAttach, MInt(64))), made))
+    store(l, record, Some(made))
+    finish_into(l, Jump(join), join)
+    val list = fresh(l, MRef)
+    l.insts.push(Load(list, field_address(l, holder, FieldSlot(CHandleKept, MRef))))
+    var types: Buf[MirType] = buf()
+    types.push(MInt(64))
+    types.push(MRef)
+    var values: Buf[Operand] = buf()
+    values.push(load(l, record).unwrap())
+    values.push(Value(list))
+    l.insts.push(Call(None, Runtime("avin_rt_c_attach_set", MirSignature(types, None)), values))
 
 // Frees the record of each function the call passed C that no handle keeps, once the call has
 // returned: C calls it no more.
@@ -3940,6 +4144,32 @@ private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
     if name == "holds_handles"
         var seen: Buf[string] = buf()
         finish(l, Return(Some(ConstBool(holds_handles(l, concrete(l, symbol.params[0]), &seen)))))
+        return
+    // An operation of a view or a block calls the runtime's entry point of its name with its receiver
+    // and arguments, the descriptor of an array or block it makes, and a site for its traps, which
+    // report where the program called it.
+    if is_c_memory_intrinsic(name)
+        var args: Buf[Operand] = buf()
+        var types: Buf[MirType] = buf()
+        for i in 0..<symbol.params.len()
+            if l.param_values[i] is Some(v)
+                if machine(l, concrete(l, symbol.params[i])) is Some(m)
+                    args.push(Value(v))
+                    types.push(m)
+        val made = concrete(l, symbol.result.unwrap_or(Unit))
+        if name == "c_view_slice" || name == "c_block_new"
+            args.push(DescriptorAddress(layout(l, made).variants[0].descriptor))
+            types.push(MPtr)
+        args.push(TrapSiteAddress(trap_site(l, "", symbol.decl.name_span)))
+        types.push(MPtr)
+        val result = machine(l, made)
+        val dest = result match
+            Some(t) -> Some(fresh(l, t))
+            None -> None
+        l.insts.push(Call(dest, Runtime("avin_rt_" + name, MirSignature(types, result)), args))
+        finish(l, Return(dest match
+            Some(id) -> Some(Value(id))
+            None -> None))
         return
     // Every other intrinsic calls one runtime entry point.
     val found = intrinsic_entry(name) match
