@@ -36,9 +36,12 @@ main() -> int
 - **A trap in any thread stops the program**, as it does in a program with one thread: traps report
   bugs, and a bug in one thread leaves the state the others share in doubt. Only the first thread to
   stop the program reports: what was written is flushed once and one reason is printed, and a
-  thread that traps after it, or calls `exit`, waits for the end.
+  thread that traps after it, or calls `exit`, waits for the end. The stopping thread runs the
+  program's [exit hooks](/spec/system-library/#exit-hooks) after its report, the others still
+  running.
 - **The program ends when `main` returns**, whatever other threads are still running: standard
-  output is flushed and the process exits with `main`'s status, taking the other threads with it.
+  output is flushed, the main thread runs the exit hooks, and the process exits with `main`'s
+  status, taking the other threads with it.
 - A library scope makes the joins structural: `scope(s -> …)` returns its body's result only once
   every thread started through `s.spawn` has finished. `s.spawn` takes the same arguments as
   `spawn` and is called by the thread that runs the scope's body, while the scope is open; a call

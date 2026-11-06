@@ -31,7 +31,9 @@ main()
 | `args() -> Vector[string]` | The arguments after the program's name, in order. Empty arguments are kept. |
 | `programName() -> string` | The name the program was started by, as the platform gave it: usually the path it was run as. Empty when the program was started with no arguments at all. |
 | `env(name: string) -> Option[string]` | The environment variable's value, `None` when it is not set; a variable set to nothing is `Some("")`. |
-| `exit(code: int) -> Nothing` | Ends the program now with `code` as its exit status, after flushing what it has written. |
+| `exit(code: int) -> Nothing` | Ends the program now with `code` as its exit status, after flushing what it has written and running its [exit hooks](#exit-hooks). |
+| `onExit(@sendable body: () -> unit) -> ExitHook` | Registers `body` to run as the program ends; see [exit hooks](#exit-hooks). |
+| `hook.cancel() -> bool` | Takes the hook out so it does not run, answering whether it was still registered. |
 
 **`main` may take the arguments itself.** `main(args: Vector[string])` receives the vector `args()`
 answers, and `main()` is the form for a program that does not read them. The parameter is exactly
@@ -53,8 +55,55 @@ program wants it, for a usage line.
 
 **`exit` never returns.** Its type is `Nothing`, so it stands in any branch, as a trap does. What the
 program has written to standard output is flushed first, so output that goes to a pipe or a file is
-not lost. The status the parent sees is the platform's: on POSIX systems, the code's low eight bits.
+not lost, and then its [exit hooks](#exit-hooks) run. The status the parent sees is the platform's: on POSIX systems, the code's low eight bits.
 Returning an `int` from `main` sets the status the same way without stopping early.
+
+### Exit hooks
+
+A program that changes something outside itself, a terminal put into raw mode on the alternate
+screen, a lock file, puts it back in an exit hook, which runs however the program ends:
+
+```text
+import avin.process
+
+main(args: Vector[string]) -> int
+    print("\u001b[?1049h")
+    process.onExit(() -> print("\u001b[?1049l"))
+    draw(args)
+    0
+```
+
+**They run when the program ends, once each, newest first.** The thread that ends the program runs
+them, after it has flushed what the program wrote: the main thread when `main` returns, the thread
+that calls `exit`, wherever it is, and the thread that traps, after the trap's report, so a hook
+writing to standard error writes after it. A trap is any of them: a failed check, `fail`, an
+actor's failure escalated past every actor (reported naming the actor), running out of memory. A
+trap an actor's failure contains does not end the program and runs none. A test's process runs
+them as a program does. The program then ends as it was ending: with `main`'s status, with
+`exit`'s, or as a trap.
+
+**What does not run them.** Running out of stack stops the program from a handler on a stack of its
+own, where no Avin code can run, so no hook runs. A signal the program does not
+[watch](#avinsignal) ends it as the signal always has, with none run; a program that wants its hooks
+to run on `Terminate` or `Interrupt` watches the signal and calls `exit`. A program killed (`Kill`)
+runs nothing.
+
+**A hook may run on another thread than the one that registered it**, while the program's other
+threads go on running, so its body is `@sendable`: it captures only sendable values, as a thread's
+body does. Hooks may be registered and cancelled from any thread, an actor or a future. A hook may
+start threads and wait for them; it should not wait for one of the program's own threads, which
+may be blocked or have stopped. A thread that traps or calls `exit` while the hooks run waits for
+the end, and its trap is not reported: the first ending is the program's.
+
+**`cancel()`** answers `true` once, for a hook still registered, which then does not run, and
+`false` after it has run, has begun to, or was cancelled. A hook registered while the hooks run is
+run too, at once after the one that registered it.
+
+**A hook that traps or calls `exit` never goes on.** A trap is reported as `avin: trap in an exit
+hook: …`, the hooks after it still run, and the program then ends as a trap ends it, even where
+`main` returned. An `exit` inside a hook ends only that hook: the program keeps the status of the
+ending that ran the hooks. A hook that traps while holding a mutex leaves what the mutex guards in
+doubt, so the program stops at once, running no more hooks.
 
 **Tests see no arguments.** `avin test` runs each test in a process of its own and chooses the test
 by an argument of its own, which the test does not see: in a test, `args()` is empty.

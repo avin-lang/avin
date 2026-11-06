@@ -4365,6 +4365,52 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- Proposed (branch `exit-hooks`): **Exit hooks are `process.onExit(@sendable body: () -> unit) ->
+  ExitHook`, with `cancel() -> bool`, run newest first and once each** ([exit
+  hooks](/spec/system-library/#exit-hooks)). Why: a library that changes the world outside the
+  program (tui's raw mode and alternate screen) must put it back on every ending, and the language
+  has no `finally` or `defer`; a hook per change, cancelled when the change is undone normally, is
+  the smallest shape, and newest first undoes changes in the reverse of the order they were made.
+  Alternatives: one global handler to set (libraries would overwrite each other); a `defer`
+  construct (scoped to a frame, so it cannot run on a trap or an `exit` from another thread);
+  oldest first.
+- Proposed (branch `exit-hooks`): **The thread that ends the program runs the hooks**: the main
+  thread when `main` returns, the thread calling `exit`, the trapping thread after its report
+  (an escalated actor failure and running out of memory included), a test's process as a program.
+  The other threads go on running meanwhile; one that traps or calls `exit` waits for the end
+  silently, the first ending being the program's. So the body is `@sendable`. Why: a trap on another
+  thread cannot hand work to the main thread, which may be blocked or be the one that trapped, and
+  stopping every other thread first would stop the threads a hook needs (a future's pool) or leave
+  them stopped holding locks. Alternatives: always on the main thread (impossible when it is the
+  one waiting or trapping); stopping the other threads first; hooks free to capture anything
+  (a data race with the threads still running). **Review with the user**: whether a hook should
+  rather be allowed to capture non-sendable state from the main thread for the common case.
+- Proposed (branch `exit-hooks`): **A hook that traps or calls `exit` never goes on, and the hooks
+  after it still run**, on top of its stack rather than after unwinding it (the runtime's frames
+  hold counted values a jump past them would leak). The trap is reported as `avin: trap in an exit
+  hook:` and the program then ends as a trap ends it, even where `main` returned or `exit` was
+  called; an `exit` in a hook keeps the status of the ending that ran the hooks. A trap in a hook
+  while a mutex is held stops the program at once, since a later hook may need what the lock
+  guards. Why: one bad hook must not keep the others from putting their state back, and a failed
+  cleanup must not end with a status that says success. Alternatives: a trap in a hook ends the
+  program at once; an `exit` in a hook replaces the status (the last word wins, which a cleanup
+  should not have).
+- Proposed (branch `exit-hooks`): **A hook registered while the hooks run runs too**, at once after
+  the one that registered it; `cancel()` answers `false` for a hook that has run or begun. Why: the
+  registry is a stack the runner pops, so a hook a cleanup registers is the newest. Alternative:
+  ignore registrations once the program is ending (silently drops cleanup a hook asked for).
+- Proposed (branch `exit-hooks`): **No hook runs on a stack overflow or on an unwatched signal.**
+  A stack overflow is reported by a handler on its own small stack where no Avin code can run. A
+  signal the program does not watch keeps its platform action; a program that wants its hooks on
+  `Terminate`, `Interrupt` or `Hangup` watches it and calls `exit`, as tui already watches them.
+  Why: running hooks on an unwatched signal needs a watcher thread in every program with a hook, and
+  a library watch of its own would change what the signal does for the program, which
+  [`avin.signal`](/spec/system-library/#avinsignal) promises it does not. Alternatives: the runtime
+  watches `Terminate`, `Interrupt` and `Hangup` whenever a hook is registered and nothing else
+  watches them, ending with `exit(128 + sig)` after the hooks; running hooks from the overflow
+  handler on a fresh stack (the thread may have overflowed inside a lock). **Review with the
+  user**: the signals, if a program wants cleanup on Ctrl-C without watching for it.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

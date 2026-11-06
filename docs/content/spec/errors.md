@@ -12,7 +12,9 @@ signature, and the caller must deal with it.
 
 **A bug is a trap.** An index out of bounds, division by zero, an invalid conversion, `next()` on an
 exhausted iterator or a failed assertion stops the program with a message and the source location.
-A trap is not a value and cannot be caught.
+A trap is not a value and cannot be caught. What the program needs put back however it ends, a
+terminal's mode, goes in an [exit hook](/spec/system-library/#exit-hooks), which runs after the
+trap's report.
 
 **`fail(message)` is how a program says "this cannot happen".** It is in the prelude, stops the
 program with `message` at the place it is called, and has type `Nothing`, so it stands where a value
@@ -38,7 +40,8 @@ program, as `Array.tabulate` calls the function it is given, a trap the program'
 the library again reports that inner call, the nearest one the program wrote.
 
 **Running out of stack is a trap.** Recursion that never reaches a base case stops the program with
-`avin: trap: stack overflow`, after the output it had already written. The message names no place.
+`avin: trap: stack overflow`, after the output it had already written. The message names no place, and no exit hook runs: the report comes from a handler on a stack of
+its own, where no Avin code can run.
 It holds on the main thread, whose stack is the operating system's to size, and on every thread
 `spawn` starts, whose stack is 8 MiB unless `spawn` is asked for another size.
 
