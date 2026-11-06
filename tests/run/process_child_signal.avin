@@ -1,0 +1,93 @@
+// A `Child`'s `pid()` and `signal`: the id of the program it started last, the same before and after
+// it ends; a signal reaching that one program, and refused once the command has been seen to end,
+// by `waitFor` or by `isAlive`. A command with no group of its own has none to signal, and a
+// command whose time ran out before it started a program has no id.
+import avin.fs
+import avin.io.IoError
+import avin.process.{Child, Command}
+import avin.signal
+import avin.threads
+import avin.time.millis
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message())
+
+// Waits until the file a child writes its process id into holds it, and answers it.
+written(file: string) -> long
+  loop
+    fs.readText(file) match
+      Ok(text) if text.endsWith("\n") -> return text.trim().toLong()
+      _ -> threads.sleep(millis(5))
+
+main()
+  val dir = ok(fs.createTempDir("avin-child-signal"))
+  // One program: its id is the one it reports, and it stays after the program ends.
+  val one = ok(Command("/bin/sh", "-c", "echo $$ > \"$0\"; exec /bin/sleep 30", dir + "/one").start())
+  println(one.pid() == written(dir + "/one"))
+  println(one.signal(0))
+  println(one.isAlive())
+  println(one.signal(signal.Terminate))
+  println(one.waitFor())
+  val kept = one.pid()
+  println(kept > 0)
+  println(one.pid() == kept)
+  // Seen to end by `waitFor`: refused, however often, with any signal.
+  println(one.signal(0))
+  println(one.signal(signal.Kill))
+  println(one.signal(-1))
+  // Seen to end by `isAlive`.
+  val quick = ok(Command("/usr/bin/true").start())
+  while quick.isAlive() do threads.sleep(millis(5))
+  println(quick.signal(signal.Terminate))
+  println(quick.waitFor())
+  // Ended but not yet seen to: the program is there to be signalled until it is waited for.
+  val unseen = ok(Command("/usr/bin/true").start())
+  threads.sleep(millis(100))
+  println(unseen.signal(0))
+  println(unseen.waitFor())
+  println(unseen.signal(0))
+  // A number the platform does not have, while the program runs.
+  val running = ok(Command("/bin/sleep", "30").start())
+  println(running.signal(65))
+  println(running.isAlive())
+  running.kill()
+  println(running.waitFor())
+  // A pipeline's id is its last stage's, which alone the signal reaches; the first stage then sees
+  // its output end.
+  val piped = ok((Command("/bin/sh", "-c", "while :; do echo y; /bin/sleep 0.01; done") | Command("/bin/sh", "-c", "echo $$ > \"$0\"; exec /bin/sleep 30", dir + "/last")).start())
+  println(piped.pid() == written(dir + "/last"))
+  println(piped.signal(signal.Kill))
+  println(piped.waitFor())
+  // A sequence's id is the part started last: the second, once it has started.
+  val steps = ok((Command("/bin/sh", "-c", "echo $$ > \"$0\"", dir + "/first") andThen Command("/bin/sh", "-c", "echo $$ > \"$0\"; exec /bin/sleep 30", dir + "/second")).start())
+  val first = steps.pid()
+  println(first == written(dir + "/first"))
+  while steps.pid() == first do
+    steps.isAlive()
+    threads.sleep(millis(5))
+  println(steps.pid() == written(dir + "/second"))
+  // Signalling a part does not stop the sequence: `followedBy` goes on to its next part after it.
+  println(steps.signal(signal.Terminate))
+  println(steps.waitFor())
+  val goesOn = ok((Command("/bin/sleep", "30") followedBy Command("/bin/sh", "-c", "exit 3")).start())
+  println(goesOn.signal(signal.Terminate))
+  println(goesOn.waitFor())
+  // `kill`, unlike `signal`, starts nothing more.
+  val stops = ok((Command("/bin/sleep", "30") followedBy Command("/bin/sh", "-c", "exit 3")).start())
+  stops.kill()
+  println(stops.waitFor())
+  // No group of its own: the group is `None`, and signalling it is refused, before and after.
+  val plain = ok(Command("/bin/sleep", "30").start())
+  println(plain.group())
+  println(plain.signalGroup(signal.Terminate))
+  println(plain.isAlive())
+  plain.kill()
+  println(plain.waitFor())
+  println(plain.signalGroup(0))
+  // A command whose time ran out before its program started: no id, and nothing to signal.
+  val late = ok(Command("/bin/sleep", "30").withTimeout(millis(0)).start())
+  println(late.pid())
+  println(late.signal(0))
+  println(late.waitFor())
+  fs.removeDirAll(dir)

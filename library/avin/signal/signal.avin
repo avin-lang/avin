@@ -1,0 +1,114 @@
+module avin.signal
+
+// Signals: a number one process sends another, or the platform sends a program, to ask it to stop,
+// to say its terminal has gone, or for a reason of its own. A program watches the signals it wants
+// to hear of and asks, where it chooses, whether one has arrived; no code of the program runs when
+// it does. Sending one is `avin.process.signal`, and a started command's `Child.signal`.
+
+import avin.io
+import avin.io.IoError
+import avin.threads
+import avin.time
+import avin.time.Duration
+
+// Hangup: the terminal the program was started from has gone; a daemon's conventional "read your
+// settings again".
+val Hangup: int = 1
+
+// Interrupt: Ctrl-C at the terminal.
+val Interrupt: int = 2
+
+// Quit: Ctrl-\ at the terminal.
+val Quit: int = 3
+
+// Kill: ends a program at once. It cannot be watched.
+val Kill: int = 9
+
+// A write into a pipe or socket nobody reads any more.
+val BrokenPipe: int = 13
+
+// Alarm: a timer the program set has run out.
+val Alarm: int = 14
+
+// Terminate: asks a program to stop, cleaning up first; what `Child.kill` sends.
+val Terminate: int = 15
+
+// Window change: the terminal was resized.
+val WindowChange: int = 28
+
+@sysl("avin.rt.user_signal")
+private userSignal(which: int) -> int
+
+// User-defined signal 1, with no meaning but the one programs give it. Its number is the platform's
+// own.
+val User1: int = userSignal(1)
+
+// User-defined signal 2.
+val User2: int = userSignal(2)
+
+// How long `wait` parks between two looks at a watch: 20 milliseconds, the most a wait answers late.
+private val Interval: Duration = time.millis(20)
+
+// Starts watching the signal `sig` for this program, answering the `Watch` to ask about it. From
+// then on the signal no longer does what it did, ending the program among them, until every watch of
+// it has been collected. A number the platform does not have, `Kill`, and the stop signal, which
+// nothing may catch, are refused with `Err(Other("Invalid argument"))`.
+watch(sig: int) -> Result[Watch, IoError] = startWatch(sig) match
+  Ok(w) -> Ok(Watch(w, sig))
+  Err(e) -> Err(ioError(e))
+
+// A signal being watched for this program. It belongs to one thread at a time, as a connection does:
+// a thread of its own may wait on it.
+class Watch(private val counted: SyslWatch, private val number: int): Sendable
+  // The signal this watch is for.
+  signal() -> int = number
+
+  // Whether the signal has arrived since the last `take`, or since the watch began, marking every
+  // arrival so far seen: several arrivals between two takes are one `true`, and one arriving during
+  // a take is left for the next. Two watches of one signal each see every arrival.
+  take() -> bool = counted.take()
+
+  // Waits until the signal has arrived, then takes it, as `take` does. The thread parks between two
+  // looks, every 20 milliseconds, its worker free meanwhile.
+  wait()
+    while !counted.take() do threads.sleep(Interval)
+
+  // Waits until the signal has arrived or `limit` has passed, and answers whether it arrived, taking
+  // it. A limit of zero or less looks once.
+  wait(limit: Duration) -> bool
+    val until = time.monotonic() + limit
+    loop
+      if counted.take() then return true
+      val left = until - time.monotonic()
+      if left.micros <= 0 then return false
+      threads.sleep(if left < Interval then left else Interval)
+
+// The Sysl side: its counted watch and its error.
+
+@sysl("sysl.signal.Watch", named: "Watch")
+private class SyslWatch
+  take() -> bool
+
+@sysl("sysl.signal.watch")
+private startWatch(sig: int) -> Result[SyslWatch, SyslError]
+
+@sysl("sysl.fs.IoError")
+private data SyslError
+  NotFound
+  PermissionDenied
+  AlreadyExists
+  NotADirectory
+  IsADirectory
+  DirectoryNotEmpty
+  TooManyOpenFiles
+  NoSpaceLeft
+  Interrupted
+  NotOpen
+  NotPermitted
+  InvalidUtf8(offset: long)
+  Other(code: int)
+
+private ioError(e: SyslError) -> IoError = io.Other(syslMessage(e))
+
+@sysl("avin.rt.io_error_message")
+private syslMessage(e: SyslError) -> string
