@@ -15149,6 +15149,18 @@ private holds_literal(e: &Expr) -> bool
             false
         _ -> false
 
+/** Whether `e` is made of number literals alone: a literal, or an operation or an `if` whose operands
+ * or branches are, as `1_000_000_000_000 + 2001` is. Its type comes wholly from context. */
+private literal_expression(e: &Expr) -> bool
+    if is_literal(e) then return true
+    e.kind match
+        Unary(_, operand) -> literal_expression(operand)
+        Binary(_, left, right, _) -> literal_expression(left) && literal_expression(right)
+        If(_, yes, no) -> no match
+            Some(n) -> literal_expression(yes) && literal_expression(n)
+            None -> false
+        _ -> false
+
 private any_holds_literal(items: Buf[&Expr]) -> bool
     for e in items
         if holds_literal(e) then return true
@@ -15156,7 +15168,8 @@ private any_holds_literal(items: Buf[&Expr]) -> bool
 
 // Checks a call's arguments against their parameters' types, in an order that lets each argument use
 // what the others decide: first the arguments that neither are nor hold literals and are not lambdas,
-// then those with literals (`1`, `Some(1)`, `[1, 2]`), which take the types the others settle, and
+// then the values built around literals (`Some(1)`, `[1, 2]`, `count(Box(1))`), then the expressions
+// of literals alone (`1`, `1_000_000_000_000 + 2001`), each taking the types those before settle, and
 // last the lambdas and `match` functions,
 // whose parameter types come from all of them and from the lambdas checked before them.
 // `wanted` has an entry per argument, `None` for one that fits no parameter.
@@ -15172,7 +15185,7 @@ private check_arguments_after(c: *Checker, args: Buf[Argument], wanted: Buf[Opti
     var early: Buf[Option[&TExpr]] = buf()
     for _ in args
         early.push(None)
-    for pass in 0..<2
+    for pass in 0..<3
         for i in 0..<args.len()
             val value = args[i].value
             val param = if i < wanted.len() then wanted[i] else None
@@ -15191,7 +15204,9 @@ private check_arguments_after(c: *Checker, args: Buf[Argument], wanted: Buf[Opti
                                 c.note(unit_of(c), value.span, mismatch(c, zonk(c, p), t.ty))
                         early[i] = Some(t)
                     continue
-            val rank = if takes_parameter_type(value) then 2 elif holds_literal(value) then 1 else 0
+            // Values built around literals take what the plain arguments decide; expressions of
+            // literals alone take that too, or what the built values decide.
+            val rank = if takes_parameter_type(value) then 3 elif literal_expression(value) then 2 elif holds_literal(value) then 1 else 0
             if rank != pass then continue
             early[i] = Some(call_argument(c, args[i], param, open))
     for i in 0..<later_declared.len()
@@ -15773,14 +15788,16 @@ private literal_hint(c: *Checker, t: &Type) -> &Type
             for item in items
                 parts.push(literal_hint(c, item))
             Tuple(parts)
-        Data(d, name, args) -> if args.len() == 0 then fresh_var(c) else Data(d, name, literal_hint_args(c, args))
-        Class(k, name, args) -> if args.len() == 0 then fresh_var(c) else Class(k, name, literal_hint_args(c, args))
+        Data(d, name, args) -> if args.len() == 0 then fresh_var(c) else Data(d, name, literal_hint_args(c, c.data[d].decl.type_params, args))
+        Class(k, name, args) -> if args.len() == 0 then fresh_var(c) else Class(k, name, literal_hint_args(c, c.classes[k].decl.type_params, args))
         _ -> if is_reference(now) then fresh_var(c) else now
 
-private literal_hint_args(c: *Checker, args: Buf[&Type]) -> Buf[&Type]
+// A type argument no later argument can widen, one that is not covariant, is kept whole.
+private literal_hint_args(c: *Checker, params: Buf[TypeParam], args: Buf[&Type]) -> Buf[&Type]
     var out: Buf[&Type] = buf()
-    for a in args
-        out.push(literal_hint(c, a))
+    for i in 0..<args.len()
+        val widens = i < params.len() && params[i].variance is Covariant
+        out.push(if widens then literal_hint(c, args[i]) else zonk(c, args[i]))
     out
 
 private loosen_args(c: *Checker, params: Buf[TypeParam], args: Buf[&Type], open: *Buf[usize], covariant: bool, literals: bool) -> Buf[&Type]
