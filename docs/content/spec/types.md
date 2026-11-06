@@ -77,7 +77,8 @@ literal in a `byte` context must be in 0–255: `val mask: byte = 0xf0`.
 ## real and char
 
 `real` arithmetic follows IEEE 754, including NaN and signed zero; comparisons with NaN are false
-except `!=`. There is no implicit fused multiply-add. The square root, logarithms, trigonometry and
+except `!=`. `x.isNaN()`, `x.isInfinite()` (either infinity) and `x.isFinite()` (neither) classify a
+value, and each value is exactly one of NaN, infinite or finite. There is no implicit fused multiply-add. The square root, logarithms, trigonometry and
 the other elementary functions are in the module [`avin.math`](/spec/system-library/#avin-math):
 `math.sqrt(x)`. `char` supports ordering and equality but no
 arithmetic; `int(c)` and `char(n)` convert.
