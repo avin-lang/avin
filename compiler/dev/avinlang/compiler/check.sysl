@@ -15124,9 +15124,40 @@ private open_type_args(c: *Checker, type_args: Buf[&Type], from: usize) -> Buf[u
             if *zonk(c, type_args[i]) is Var(_) then open.push(v)
     open
 
+/** Whether `e` is an integer literal or builds a value around one: a tuple, a collection literal or
+ * a call (`Some(1)`, `Box(1)`) with such a part. Its type is then decided by what is expected of it,
+ * so as a call's argument it is checked after the arguments that decide that. */
+private holds_literal(e: &Expr) -> bool
+    if is_literal(e) then return true
+    e.kind match
+        Tuple(items) -> any_holds_literal(items)
+        ListLit(items) -> any_holds_literal(items)
+        SetLit(items) -> any_holds_literal(items)
+        MapLit(keys, values) -> any_holds_literal(keys) || any_holds_literal(values)
+        Call(callee, args) ->
+            // A conversion, `long(1)` or `i8.wrap(300)`, has the type it names whatever is expected.
+            val named = callee.kind match
+                Name(name) -> Some(name)
+                Member(target, _) -> target.kind match
+                    Name(name) -> Some(name)
+                    _ -> None
+                _ -> return false
+            if named is Some(name)
+                if builtin_type(name) is Some(_) then return false
+            for a in args
+                if holds_literal(a.value) then return true
+            false
+        _ -> false
+
+private any_holds_literal(items: Buf[&Expr]) -> bool
+    for e in items
+        if holds_literal(e) then return true
+    false
+
 // Checks a call's arguments against their parameters' types, in an order that lets each argument use
-// what the others decide: first the arguments that are neither bare literals nor lambdas, then the
-// literals, which take the types the others settle, and last the lambdas and `match` functions,
+// what the others decide: first the arguments that neither are nor hold literals and are not lambdas,
+// then those with literals (`1`, `Some(1)`, `[1, 2]`), which take the types the others settle, and
+// last the lambdas and `match` functions,
 // whose parameter types come from all of them and from the lambdas checked before them.
 // `wanted` has an entry per argument, `None` for one that fits no parameter.
 // An argument with an entry in `checked` was checked already, and only its type is matched here.
@@ -15160,7 +15191,7 @@ private check_arguments_after(c: *Checker, args: Buf[Argument], wanted: Buf[Opti
                                 c.note(unit_of(c), value.span, mismatch(c, zonk(c, p), t.ty))
                         early[i] = Some(t)
                     continue
-            val rank = if takes_parameter_type(value) then 2 elif is_literal(value) then 1 else 0
+            val rank = if takes_parameter_type(value) then 2 elif holds_literal(value) then 1 else 0
             if rank != pass then continue
             early[i] = Some(call_argument(c, args[i], param, open))
     for i in 0..<later_declared.len()
@@ -15599,7 +15630,10 @@ private call_argument(c: *Checker, arg: Argument, param: Option[&Type], open: *B
     val unit = unit_of(c)
     var wanted: Option[&Type] = None
     if param is Some(p)
-        val known = loosen(c, p, open, true)
+        // A value built around a number literal takes the numbers the other arguments decided, even
+        // where they sit inside a reference type a later argument may still widen.
+        val literals = !is_literal(arg.value) && holds_literal(arg.value)
+        val known = loosen_for(c, p, open, true, literals)
         if !(*known is Var(_)) then wanted = Some(known)
     // A lambda or a `match` function passed for a type argument bounded by `Sendable` is a `@sendable`
     // function, checked as one where it is made.
@@ -15701,29 +15735,59 @@ private no_single_join(c: *Checker, a: &Type, b: &Type) -> string
 /** The expected type of an argument whose parameter has the type `t`: `t` solved, except that a type
  * argument still open in `open` is left unknown where a value is read out, when what decided it is a
  * reference type that a later argument may widen. A value type is kept, so a literal takes it. */
-private loosen(c: *Checker, t: &Type, open: *Buf[usize], covariant: bool) -> &Type = *t match
+private loosen(c: *Checker, t: &Type, open: *Buf[usize], covariant: bool) -> &Type = loosen_for(c, t, open, covariant, false)
+
+/** `loosen`, for an argument that holds a number literal when `literals` is set: a type argument
+ * left open there keeps its value types for the literals, as `literal_hint` gives them. */
+private loosen_for(c: *Checker, t: &Type, open: *Buf[usize], covariant: bool, literals: bool) -> &Type = *t match
     Var(i) ->
         val now = zonk(c, t)
-        if covariant && open_index(open, i) is Some(_) && is_reference(now) then fresh_var(c) else now
+        if covariant && open_index(open, i) is Some(_) && is_reference(now)
+            if literals then literal_hint(c, now) else fresh_var(c)
+        else now
     Tuple(items) ->
         var parts: Buf[&Type] = buf()
         for item in items
-            parts.push(loosen(c, item, open, covariant))
+            parts.push(loosen_for(c, item, open, covariant, literals))
         Tuple(parts)
     Function(params, result, sendable) ->
         var solved: Buf[&Type] = buf()
         for param in params
             solved.push(zonk(c, param))
-        Function(solved, loosen(c, result, open, covariant), sendable)
-    Data(d, name, args) -> Data(d, name, loosen_args(c, c.data[d].decl.type_params, args, open, covariant))
-    Class(k, name, args) -> Class(k, name, loosen_args(c, c.classes[k].decl.type_params, args, open, covariant))
+        Function(solved, loosen_for(c, result, open, covariant, literals), sendable)
+    Data(d, name, args) -> Data(d, name, loosen_args(c, c.data[d].decl.type_params, args, open, covariant, literals))
+    Class(k, name, args) -> Class(k, name, loosen_args(c, c.classes[k].decl.type_params, args, open, covariant, literals))
     _ -> zonk(c, t)
 
-private loosen_args(c: *Checker, params: Buf[TypeParam], args: Buf[&Type], open: *Buf[usize], covariant: bool) -> Buf[&Type]
+/** The expected type of an argument that holds a number literal (`Some(1)`, `[1, 2]`, `(1, 2)`), where
+ * its parameter's type is decided as `t` so far: `t`'s shape, with every number and other value type
+ * in it kept, so the literals take them, and every other leaf left unknown, so a later argument may
+ * still widen it. With `Vector[long]` decided, `[1, 2]` is a `Vector[long]`; with `Vector[Dog]`,
+ * `[Cat(1)]` still joins to a `Vector[Animal]`. */
+private literal_hint(c: *Checker, t: &Type) -> &Type
+    val now = zonk(c, t)
+    *now match
+        Var(_) -> now
+        Tuple(items) ->
+            var parts: Buf[&Type] = buf()
+            for item in items
+                parts.push(literal_hint(c, item))
+            Tuple(parts)
+        Data(d, name, args) -> if args.len() == 0 then fresh_var(c) else Data(d, name, literal_hint_args(c, args))
+        Class(k, name, args) -> if args.len() == 0 then fresh_var(c) else Class(k, name, literal_hint_args(c, args))
+        _ -> if is_reference(now) then fresh_var(c) else now
+
+private literal_hint_args(c: *Checker, args: Buf[&Type]) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    for a in args
+        out.push(literal_hint(c, a))
+    out
+
+private loosen_args(c: *Checker, params: Buf[TypeParam], args: Buf[&Type], open: *Buf[usize], covariant: bool, literals: bool) -> Buf[&Type]
     var out: Buf[&Type] = buf()
     for i in 0..<args.len()
         val reads = covariant && i < params.len() && params[i].variance is Covariant
-        out.push(loosen(c, args[i], open, reads))
+        out.push(loosen_for(c, args[i], open, reads, literals))
     out
 
 /** Where the inference variable `v` is in `open`. */
