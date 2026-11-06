@@ -36,7 +36,7 @@ data CommandError
 class Command(
     private val shape: Shape,
     private val dir: Option[string],
-    private val env: Vector[(string, string)],
+    private val env: Vector[EnvEdit],
     private val limit: Option[Duration],
     private val sink: Sink,
     private val feed: Feed,
@@ -48,7 +48,25 @@ class Command(
 
   // The same command, with the variable `name` set to `value` for it; the rest of the program's
   // environment is passed on, and a part setting the same variable sets it for itself.
-  withEnv(name: string, value: string) -> Command = Command(shape, dir, env :+ (name, value), limit, sink, feed, errors, grouped)
+  withEnv(name: string, value: string) -> Command = Command(shape, dir, env :+ SetVar(name, value), limit, sink, feed, errors, grouped)
+
+  // The same command, started from an empty environment: none of the program's variables is passed
+  // on, and none set by a `withEnv` before this call stays. Variables set after it are the whole of
+  // the environment, `PATH` included: a program named without a directory is looked for on the
+  // `PATH` the command was given, or, where it was given none, on the system's default search path,
+  // never on the running program's.
+  clearEnv() -> Command = Command(shape, dir, env :+ ClearVars, limit, sink, feed, errors, grouped)
+
+  // The same command, without the variable `name`: the program's value for it is not passed on, and
+  // a `withEnv` of it before this call is dropped. A name that is not set is no error.
+  withoutEnv(name: string) -> Command = Command(shape, dir, env :+ RemoveVar(name), limit, sink, feed, errors, grouped)
+
+  // The same command, with exactly the variables of `vars` for its environment, none of the
+  // program's passed on: `clearEnv()` and then a `withEnv` for each, in the map's order.
+  withEnvironment(vars: Map[string, string]) -> Command
+    var c = clearEnv()
+    for (name, value) in vars do c = c.withEnv(name, value)
+    c
 
   // The same command, stopped when it has run for `d`: a program still running then is ended, its
   // status `TimedOut`, and a part not yet started is not started.
@@ -376,7 +394,7 @@ private data Drain
 // of the programs it starts, and whether they start in a group of their own.
 private class Context(
     val dir: Option[string],
-    val env: Vector[(string, string)],
+    val env: Vector[EnvEdit],
     val deadline: Option[Duration],
     val track: Track,
     val grouped: bool
@@ -384,17 +402,13 @@ private class Context(
   // These settings with a part's own on top: its directory where it names one, its variables after
   // these (a name it sets replacing the one here), the earlier of the two deadlines, and a group of
   // its own where either asks for one, the outermost command's being the one every part joins.
-  within(ownDir: Option[string], ownEnv: Vector[(string, string)], limit: Option[Duration], ownGroup: bool) -> Context
-    val vars = Vector.newBuilder[(string, string)]()
-    for (name, value) in env
-      if !ownEnv.exists(p -> p.0 == name) then vars.addOne((name, value))
-    for (name, value) in ownEnv do vars.addOne((name, value))
+  within(ownDir: Option[string], ownEnv: Vector[EnvEdit], limit: Option[Duration], ownGroup: bool) -> Context
     val own = limit.map(d -> time.monotonic() + d)
     val until = (deadline, own) match
       (Some(a), Some(b)) -> Some(if b < a then b else a)
       (Some(a), None) -> Some(a)
       _ -> own
-    Context(ownDir.orElse(dir), vars.result(), until, track, grouped || ownGroup)
+    Context(ownDir.orElse(dir), env ++ ownEnv, until, track, grouped || ownGroup)
 
 private object Context
   // The settings a command run from the program starts with: its own, and none of a command's.
@@ -480,6 +494,47 @@ private textFile(text: string) -> Result[File, IoError]
   fs.removeDirAll(dir)
   opened
 
+// One change to a program's environment, made in the order the calls were.
+private data EnvEdit
+  SetVar(name: string, value: string)
+  RemoveVar(name: string)
+  ClearVars
+
+// The variables a program is started with and whether the running program's are passed on beneath
+// them. Setting and removing alone leave the running program's environment to Sysl; once the edits
+// clear or remove, the whole environment is built here, as the edits leave it.
+private resolveEnv(edits: Vector[EnvEdit]) -> (Vector[Var], bool)
+  val needsAll = edits.exists(e -> e match
+    SetVar(_, _) -> false
+    _ -> true
+  )
+  var names: Vector[string] = []
+  var values: Vector[string] = []
+  if needsAll
+    for (name, value) in environment()
+      names = names :+ name
+      values = values :+ value
+  for edit in edits
+    edit match
+      SetVar(name, value) ->
+        val at = names.indexOf(name)
+        if at >= 0
+          values = values.updated(at, value)
+        else
+          names = names :+ name
+          values = values :+ value
+      RemoveVar(name) ->
+        val at = names.indexOf(name)
+        if at >= 0
+          names = names.take(at) ++ names.drop(at + 1)
+          values = values.take(at) ++ values.drop(at + 1)
+      ClearVars ->
+        names = []
+        values = []
+  var vars: Vector[Var] = []
+  for i in 0 ..< names.length() do vars = vars :+ Var(names(i), values(i))
+  (vars, !needsAll)
+
 // Starts one program. Its streams' files are closed once it has its own copies of them.
 private startProgram(program: string, args: Vector[string], context: Context, streams: Streams) -> Result[Job, IoError]
   var millis = 0
@@ -491,9 +546,9 @@ private startProgram(program: string, args: Vector[string], context: Context, st
         return Ok(Ended(Ok(TimedOut)))
       millis = if left >= 2147483647000 then 2147483647 else int((left + 999) / 1000)
     None -> ()
-  val vars = context.env.map(p -> Var(p.0, p.1))
+  val (vars, inherits) = resolveEnv(context.env)
   val dir = context.dir.getOrElse("")
-  val spawning = (group: Group) -> spawnProgram(program, args, dir, vars, millis, true, streams.input, streams.output, streams.errors, group)
+  val spawning = (group: Group) -> spawnProgram(program, args, dir, vars, millis, inherits, streams.input, streams.output, streams.errors, group)
   var leads = false
   var started = if !context.grouped then spawning(Group.Inherit) else context.track.group.load() match
     0 ->

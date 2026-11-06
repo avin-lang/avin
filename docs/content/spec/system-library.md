@@ -109,6 +109,11 @@ main() -> int
 | `Command.parse(line: string)` | The line split at runs of white space, the first word the program; no quoting and no shell. A line with no word traps. |
 | `c.inDir(dir: string)` | The same command, run in `dir`. |
 | `c.withEnv(name: string, value: string)` | The same command, with the variable set for it; the rest of the program's environment is passed on. |
+| `c.clearEnv()` | The same command, started from an empty environment: none of the program's variables is passed on and none set by an earlier `withEnv` stays. A bare program name is then looked for on the `PATH` the command was given, or on the system's default search path where it has none, never the running program's. |
+| `c.withoutEnv(name: string)` | The same command without the variable: the program's value is not passed on and an earlier `withEnv` of it is dropped. A name that is not set is no error. |
+| `c.withEnvironment(vars: Map[string, string])` | The same command with exactly these variables: `clearEnv()`, then a `withEnv` for each. |
+
+Environment changes apply in the order called; on a pipeline or a sequence the command's come first and each part's own after them, so a part's `clearEnv()` discards what the command set.
 | `c.withTimeout(d: Duration)` | The same command, stopped when it has run for `d`; its status is then `TimedOut`. |
 | `c.toFile(file: string)`, `c.appendTo(file: string)` | The same command, its standard output written to the file, emptied first or added to. |
 | `c.fromFile(file: string)`, `c.withInput(text: string)` | The same command, reading the file, or the text, as its standard input. |
