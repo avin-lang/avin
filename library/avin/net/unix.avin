@@ -1,0 +1,187 @@
+module avin.net
+
+// Unix domain sockets: a connection between two programs on one machine, named by a path in the file
+// system rather than by a host and port. A `UnixStream` reads and writes exactly as a `TcpStream`
+// does, and a `UnixListener` accepts them as a `TcpListener` does; every operation that can fail
+// answers a `Result` with an `IoError`, and one that waits for the other end is safe for the collector
+// while it waits.
+//
+// A connection or listener belongs to one thread at a time, as a TCP one does.
+
+import avin.fs
+import avin.io
+import avin.io.IoError
+import avin.time.Duration
+
+// Where a Unix socket lives: a path the platform's socket address can carry.
+@sysl("sysl.net.UnixAddress")
+private class UnixAddress
+
+// The address of `path`; a path the platform cannot carry (too long, empty, or holding a zero byte)
+// is an error.
+@sysl("sysl.net.unix")
+private unixAddressRaw(path: string) -> Result[UnixAddress, SyslError]
+
+// The socket under a Unix connection, the same Sysl type a TCP connection's is. Its traps name the
+// `UnixStream`.
+@sysl("sysl.net.Socket", named: "UnixStream")
+private class UnixSocket
+    @sysl(blocking)
+    sendAll(bytes: Array[byte]) -> Result[unit, SyslError]
+    @sysl(blocking)
+    recv(into: Array[byte]) -> Result[long, SyslError]
+    shutdown(how: Shutdown) -> Result[unit, SyslError]
+    readTimeout(ms: int) -> Result[unit, SyslError]
+    writeTimeout(ms: int) -> Result[unit, SyslError]
+    // The descriptor, which is never used: calling it checks the socket belongs to the code running.
+    @sysl("fd")
+    held() -> Result[int, SyslError]
+
+// The socket under a Unix listener. Its traps name the `UnixListener`.
+@sysl("sysl.net.UnixListener", named: "UnixListener")
+private class UnixListenSocket
+    @sysl(blocking)
+    accept() -> Result[UnixSocket, SyslError]
+    // The descriptor, which is never used: calling it checks the socket belongs to the code running.
+    @sysl("fd")
+    held() -> Result[int, SyslError]
+
+@sysl("sysl.net.unix_listen")
+private unixListenRaw(at: UnixAddress, backlog: int) -> Result[UnixListenSocket, SyslError]
+
+@sysl("sysl.net.unix_connect")
+private unixConnectRaw(to: UnixAddress) -> Result[UnixSocket, SyslError]
+
+// The address of `path`, its failure as an `IoError`.
+private addressAt(path: string) -> Result[UnixAddress, IoError] = unixAddressRaw(path).mapErr(ioError)
+
+// A connection to a program listening at a path, made by `UnixStream.connect` or a listener's
+// `accept`. It reads and writes as a `TcpStream` does: bytes `readLine` reads beyond its line are
+// kept for the next read, and a connection handed to another thread or actor takes them with it.
+class UnixStream(private val conn: UnixSocket, private val buffered: ReadAhead, private var closed: bool): Sendable
+    // Up to `max` bytes, waiting for at least one; an empty array once the other end has finished
+    // sending. `max` is at least one.
+    read(max: int) -> Result[Array[byte], IoError]
+        mine()
+        if closed then return Err(closedError())
+        buffered.read(max, received)
+
+    // The next line, without its terminator, or `None` once the other end has finished sending and
+    // every line has been read. A line ends at `\n`, a `\r` just before it being part of the
+    // terminator, and the last line needs none; bytes that are not UTF-8 become U+FFFD.
+    readLine() -> Result[Option[string], IoError]
+        mine()
+        if closed then return Err(closedError())
+        buffered.readLine(received)
+
+    // Everything the other end sends until it finishes, after what earlier reads left.
+    readAll() -> Result[Array[byte], IoError]
+        mine()
+        if closed then return Err(closedError())
+        buffered.readAll(received)
+
+    // Sends all of `bytes`.
+    write(bytes: Array[byte]) -> Result[unit, IoError]
+        mine()
+        if closed then return Err(closedError())
+        conn.sendAll(bytes).mapErr(ioError)
+
+    // Sends `text` as UTF-8.
+    writeText(text: string) -> Result[unit, IoError] = write(utf8Of(text))
+
+    // A read or a write that waits longer than `d` fails with `TimedOut` from now on; a duration of
+    // zero or less takes the limit away, as a `TcpStream`'s does.
+    setTimeout(d: Duration) -> Result[unit, IoError]
+        mine()
+        if closed then return Err(closedError())
+        val ms = millisOf(d)
+        conn.readTimeout(ms).mapErr(ioError)?
+        conn.writeTimeout(ms).mapErr(ioError)
+
+    // Tells the other end nothing more will be sent; reading goes on.
+    shutdownOutput() -> Result[unit, IoError]
+        mine()
+        if closed then return Err(closedError())
+        conn.shutdown(Write).mapErr(ioError)
+
+    // Ends the connection; closing again does nothing. A read or write afterwards answers an error.
+    close()
+        mine()
+        if !closed
+            closed = true
+            conn.close()
+
+    // Stops the program where the connection belongs to another thread.
+    private mine()
+        if closed then conn.close() else conn.held()
+
+    // Up to `max` bytes from the connection itself.
+    private received(max: int) -> Result[Array[byte], IoError]
+        val into = Array.fill(max, byte(0))
+        val n = conn.recv(into).mapErr(ioError)?
+        Ok(if n == long(max) then into else into.slice(0, int(n)))
+
+object UnixStream
+    // A connection to the program listening at `path`. A path nothing exists at is `NotFound`, and a
+    // socket file nobody listens on any more is `ConnectionRefused`.
+    connect(path: string) -> Result[UnixStream, IoError]
+        val at = addressAt(path)?
+        unixConnectRaw(at) match
+            Ok(c) -> Ok(UnixStream(c, ReadAhead(Array.empty[byte](), 0), false))
+            Err(e) -> Err(if fs.exists(path) then ioError(e) else io.NotFound)
+
+// A socket listening for connections at a path, made by `UnixListener.bind`. Like a connection, it may
+// be handed to another thread, which takes it over. Closing it leaves its socket file in the file
+// system, where `bindReplacing` or `fs.remove` clears it.
+class UnixListener(private val conn: UnixListenSocket, private val at: string, private var closed: bool): Sendable
+    // The path it listens at.
+    path() -> string
+        mine()
+        at
+
+    // Waits for the next connection.
+    accept() -> Result[UnixStream, IoError]
+        mine()
+        if closed then return Err(io.Other("the listener is closed"))
+        conn.accept() match
+            Ok(c) -> Ok(UnixStream(c, ReadAhead(Array.empty[byte](), 0), false))
+            Err(e) -> Err(ioError(e))
+
+    // Stops listening; closing again does nothing. An `accept` afterwards answers an error.
+    close()
+        mine()
+        if !closed
+            closed = true
+            conn.close()
+
+    // Stops the program where the listener belongs to another thread, as a connection's does.
+    private mine()
+        if closed then conn.close() else conn.held()
+
+object UnixListener
+    // Listens at `path`, which must name nothing yet: a path that already holds a file, a live
+    // listener's or a left-over one, is `AlreadyExists`, because what is there may belong to another
+    // program. A path the platform cannot carry, too long above all (103 bytes on macOS, 107 on
+    // Linux), is an error saying so, and so is a missing directory on the way.
+    bind(path: string) -> Result[UnixListener, IoError]
+        val a = addressAt(path)?
+        unixListenRaw(a, 128) match
+            Ok(c) -> Ok(UnixListener(c, path, false))
+            Err(e) -> Err(if fs.exists(path) then io.AlreadyExists else ioError(e))
+
+    // Listens at `path`, first clearing a socket file left behind by a program that is gone: where
+    // the path holds a socket nobody listens on, it is removed and bound. A live listener's path is
+    // `AlreadyExists` and is left alone, and so is anything that is not a refused socket. Finding
+    // out connects once, so a live listener sees one connection that closes without a word.
+    bindReplacing(path: string) -> Result[UnixListener, IoError]
+        val a = addressAt(path)?
+        if fs.exists(path)
+            unixConnectRaw(a) match
+                Ok(c) ->
+                    c.close()
+                    return Err(io.AlreadyExists)
+                Err(e) -> netFailure(e) match
+                    Refused -> ()
+                    _ -> return Err(io.AlreadyExists)
+            fs.remove(path)?
+        bind(path)

@@ -104,32 +104,25 @@ private closedError() -> IoError = io.Other("the connection is closed")
 // How much a read takes from the connection at once when it reads ahead.
 private val ChunkSize = 8192
 
-// A TCP connection, made by `TcpStream.connect` or a listener's `accept`. Bytes `readLine` reads
-// beyond its line are kept for the next read. A connection may be handed to another thread or actor,
-// which takes it over, the bytes read ahead with it: its socket is a Sysl handle, and every
-// operation, one served from those bytes and one on a closed connection included, first checks the
-// socket's owner, so the code that handed it over traps where it uses it again.
-class TcpStream(private val conn: Socket, private var ahead: Array[byte], private var at: int,
-        private var closed: bool): Sendable
+// The bytes a connection has read beyond what its caller has asked for, and the reading that works
+// through them before asking the connection for more. A TCP connection and a Unix one share it; each
+// passes the way it receives bytes from its own socket.
+private class ReadAhead(private var ahead: Array[byte], private var at: int)
     // Up to `max` bytes, waiting for at least one; an empty array once the other end has finished
     // sending. `max` is at least one.
-    read(max: int) -> Result[Array[byte], IoError]
-        mine()
+    read(max: int, fill: (int) -> Result[Array[byte], IoError]) -> Result[Array[byte], IoError]
         if max < 1 then fail(s"a read of $max bytes: a read takes at least one")
-        if closed then return Err(closedError())
         if at < ahead.length()
             val end = if ahead.length() - at > max then at + max else ahead.length()
             val taken = ahead.slice(at, end)
             at = end
             return Ok(taken)
-        received(max)
+        fill(max)
 
     // The next line, without its terminator, or `None` once the other end has finished sending and
     // every line has been read. A line ends at `\n`, a `\r` just before it being part of the
     // terminator, and the last line needs none; bytes that are not UTF-8 become U+FFFD.
-    readLine() -> Result[Option[string], IoError]
-        mine()
-        if closed then return Err(closedError())
+    readLine(fill: (int) -> Result[Array[byte], IoError]) -> Result[Option[string], IoError]
         val line = Buffer[byte]()
         var any = false
         while true
@@ -143,7 +136,7 @@ class TcpStream(private val conn: Socket, private var ahead: Array[byte], privat
                 at = i + 1
                 return Ok(Some(lineText(line)))
             at = ahead.length()
-            val more = received(ChunkSize)?
+            val more = fill(ChunkSize)?
             if more.length() == 0
                 return Ok(if any then Some(lineText(line)) else None)
             ahead = more
@@ -151,18 +144,46 @@ class TcpStream(private val conn: Socket, private var ahead: Array[byte], privat
         Ok(None)
 
     // Everything the other end sends until it finishes, after what earlier reads left.
-    readAll() -> Result[Array[byte], IoError]
-        mine()
-        if closed then return Err(closedError())
+    readAll(fill: (int) -> Result[Array[byte], IoError]) -> Result[Array[byte], IoError]
         val all = Buffer[byte]()
         for k in at..<ahead.length()
             all.addOne(ahead(k))
         at = ahead.length()
         while true
-            val more = received(ChunkSize)?
+            val more = fill(ChunkSize)?
             if more.length() == 0 then return Ok(all.toArray())
             all.addAll(more)
         Ok(all.toArray())
+
+// `text` as UTF-8 bytes.
+private utf8Of(text: string) -> Array[byte] = Array.tabulate(text.byteLength(), i -> text.byteAt(i))
+
+// A TCP connection, made by `TcpStream.connect` or a listener's `accept`. Bytes `readLine` reads
+// beyond its line are kept for the next read. A connection may be handed to another thread or actor,
+// which takes it over, the bytes read ahead with it: its socket is a Sysl handle, and every
+// operation, one served from those bytes and one on a closed connection included, first checks the
+// socket's owner, so the code that handed it over traps where it uses it again.
+class TcpStream(private val conn: Socket, private val buffered: ReadAhead, private var closed: bool): Sendable
+    // Up to `max` bytes, waiting for at least one; an empty array once the other end has finished
+    // sending. `max` is at least one.
+    read(max: int) -> Result[Array[byte], IoError]
+        mine()
+        if closed then return Err(closedError())
+        buffered.read(max, received)
+
+    // The next line, without its terminator, or `None` once the other end has finished sending and
+    // every line has been read. A line ends at `\n`, a `\r` just before it being part of the
+    // terminator, and the last line needs none; bytes that are not UTF-8 become U+FFFD.
+    readLine() -> Result[Option[string], IoError]
+        mine()
+        if closed then return Err(closedError())
+        buffered.readLine(received)
+
+    // Everything the other end sends until it finishes, after what earlier reads left.
+    readAll() -> Result[Array[byte], IoError]
+        mine()
+        if closed then return Err(closedError())
+        buffered.readAll(received)
 
     // Sends all of `bytes`.
     write(bytes: Array[byte]) -> Result[unit, IoError]
@@ -171,7 +192,7 @@ class TcpStream(private val conn: Socket, private var ahead: Array[byte], privat
         conn.sendAll(bytes).mapErr(ioError)
 
     // Sends `text` as UTF-8.
-    writeText(text: string) -> Result[unit, IoError] = write(Array.tabulate(text.byteLength(), i -> text.byteAt(i)))
+    writeText(text: string) -> Result[unit, IoError] = write(utf8Of(text))
 
     // A read or a write that waits longer than `d` fails with `TimedOut` from now on; a duration of
     // zero or less takes the limit away. The limit is kept in whole milliseconds, a part of one
@@ -229,7 +250,7 @@ object TcpStream
             openConnection(a) match
                 Ok(c) ->
                     c.connect(a) match
-                        Ok(_) -> return Ok(TcpStream(c, Array.empty[byte](), 0, false))
+                        Ok(_) -> return Ok(TcpStream(c, ReadAhead(Array.empty[byte](), 0), false))
                         Err(e) ->
                             c.close()
                             last = ioError(e)
@@ -249,7 +270,7 @@ class TcpListener(private val conn: ListenSocket, private val boundPort: int, pr
         mine()
         if closed then return Err(io.Other("the listener is closed"))
         conn.accept() match
-            Ok((c, _)) -> Ok(TcpStream(c, Array.empty[byte](), 0, false))
+            Ok((c, _)) -> Ok(TcpStream(c, ReadAhead(Array.empty[byte](), 0), false))
             Err(e) -> Err(ioError(e))
 
     // Stops listening; closing again does nothing. An `accept` afterwards answers an error.

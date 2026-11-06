@@ -4174,6 +4174,24 @@ spelling is better, as each entry says.
 
 ## Proposed
 
+- Unix domain sockets in `avin.net` (branch `unix-sockets`). Proposed: `UnixStream` and
+  `UnixListener` mirror `TcpStream` and `TcpListener`, sharing the read-ahead code (`read`,
+  `readLine`, `readAll`) through one private class both hold; `UnixListener.bind(path)` fails with
+  `AlreadyExists` where anything is at the path, and the separate `bindReplacing(path)` removes a
+  socket file nobody listens on (a probing connection is refused) before binding, leaving a live
+  listener's path and any non-socket file alone; `close()` leaves the socket file; a path the
+  platform cannot carry (103 bytes on macOS, 107 on Linux) is an `Err` with the platform's
+  message, and a connect to a path with nothing at it is `NotFound`. Waits are the TCP ones: blocking
+  bindings that park the lightweight thread's carrier as TCP's do, with no poller integration.
+  WHY: a daemon and its command-line client need a local socket with the API they already know from
+  TCP; silently deleting an existing path could remove another program's live socket or an unrelated
+  file, so the safe `bind` refuses and the replacing form is explicit. Alternatives weighed: `bind`
+  always removing a stale file (a surprise on a path that is a live socket or not a socket at all);
+  `close()` removing the file (wrong for a listener handed between threads, and a second program may
+  already have replaced it); one shared `Stream` trait over TCP and Unix (no use yet, and the
+  language's traits would add a dispatch to every read). Open for review: `bindReplacing`'s probe
+  connection is seen by a live listener as an immediately closed connection.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

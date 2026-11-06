@@ -505,6 +505,29 @@ main()
         Err(e) -> eprintln(e.message())
 ```
 
+### Unix domain sockets
+
+A `UnixStream` and a `UnixListener` connect two programs on one machine by a path in the file system
+rather than a host and port. A `UnixStream` has every reading and writing operation of a `TcpStream`
+(`read`, `readLine`, `readAll`, `write`, `writeText`, `setTimeout`, `shutdownOutput`, `close`) with the
+same meanings, including the bytes `readLine` reads beyond its line, and a `UnixListener` accepts
+them as a `TcpListener` does. Both are sendable and owned by one thread at a time, and every wait is
+safe for the collector, as TCP's are.
+
+| Function | Meaning |
+| --- | --- |
+| `UnixStream.connect(path: string) -> Result[UnixStream, IoError]` | A connection to the program listening at `path`; a path with nothing at it is `NotFound`, and a socket file nobody listens on any more is `ConnectionRefused`. |
+| `UnixListener.bind(path: string) -> Result[UnixListener, IoError]` | Listens at `path`, which must name nothing yet: a path already holding anything is `AlreadyExists`. |
+| `UnixListener.bindReplacing(path: string) -> Result[UnixListener, IoError]` | As `bind`, but a socket file left behind by a program that is gone (a connection to it is refused) is removed first. A live listener's path and anything that is not a socket file is `AlreadyExists` and untouched. |
+| `l.path() -> string` | The path it listens at. |
+| `l.accept() -> Result[UnixStream, IoError]` | Waits for the next connection. |
+| `l.close()` | Stops listening; closing again does nothing. The socket file stays; `fs.remove` or `bindReplacing` clears it. |
+
+A path the platform's socket address cannot carry is an `Err`: one longer than 103 bytes on macOS (107
+on Linux), an empty one, or one holding a zero byte. A missing directory on the way to a bound path is
+an `Err` too. `bindReplacing` finds out whether a socket is live by connecting to it once, so a live
+listener sees a connection that closes without a word.
+
 A connection and a listener are closed by `close()`; one the program forgets is closed when the
 collector finds it unreachable, so a lost one leaks nothing for long, but only `close()` says when.
 A read, write or `accept` after `close()` answers `Other`, saying it is closed. `IoError` gains the
