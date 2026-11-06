@@ -2025,7 +2025,7 @@ their words are reserved.
   `output()` decodes the bytes as `lines()` does, each ill-formed run replaced with U+FFFD, rather than
   failing with `Io(InvalidUtf8)`; the alternative is the failure, which would lose the whole output
   over one byte. **Review with the user**: the decoding.
-- Proposed (built on branch `command-clear-env`): **A command's environment: `clearEnv`, `withoutEnv`, `withEnvironment`** ([commands](/spec/system-library/#commands)).
+- Settled on the user's delegation 2026-11-06 (branch `command-clear-env`): **A command's environment: `clearEnv`, `withoutEnv`, `withEnvironment`** ([commands](/spec/system-library/#commands)).
   A command keeps its environment changes as an ordered list (set, remove, clear), applied in the order called; on a joined command the command's list comes before each part's own. `clearEnv()` starts from an empty environment, `withoutEnv(name)` drops one inherited variable (an unset name is no error), `withEnvironment(map)` is `clearEnv()` then each entry. With only sets, the running program's environment is left to Sysl's `inherit_env`; once a list clears or removes, the whole environment is built from `environment()` and handed over with `inherit_env = false`. A bare program name after a clear is looked for on the `PATH` the command was given, or the system's default path where none, never the running program's: that is Sysl's `spawn` rule, kept so a command never finds a program through a variable it was told not to have. Variables whose name or value is not UTF-8 are not passed once a command removes or clears (`environment()` passes them over). WHY: a daemon must start jobs from the submitter's environment, not its own. ALTERNATIVES: a single `withEnvironment` only (cannot remove one variable cheaply); a settings pair of a base flag and a removed set (loses the order of calls, so `clearEnv().withEnv(x)` and `withEnv(x).clearEnv()` could not differ); looking the program up on the parent's `PATH` (a cleared command would still find programs by a variable it lacks). Review with the user: the `PATH` lookup rule.
 - Settled on the user's delegation 2026-11-05 (built on branch `process-commands`), with one change: **`kill()` and a started sequence** ([commands](/spec/system-library/#commands)).
   Proposed: `Child.kill()` sends signal 15 to every program of the command still running and starts
@@ -4335,13 +4335,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   `ExitStatus.Signalled` speaks `int`); a wake from the handler through the scheduler, which needs a
   runtime handler that is async-signal-safe, for a latency no program has needed yet.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- Proposed (branch `nested-literal-typing`): **A number literal nested in an argument takes the
+- Settled on the user's delegation 2026-11-06 (branch `nested-literal-typing`): **A number literal nested in an argument takes the
   numbers the other arguments decide** ([generics](/spec/generics/#inference)). An argument that is
   or holds an integer literal (a collection literal, a tuple, or a call other than a conversion
   such as `long(1)`, with such a part) is checked after the arguments that hold none, against the
@@ -4359,6 +4353,12 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   it, as a type argument is (solves both limits, but makes every literal an inference variable);
   trying each candidate's parameter on a nested literal by its structure (collection, tuple and
   constructor shapes). Review with the user: whether either limit is worth lifting.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
