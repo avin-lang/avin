@@ -4127,14 +4127,8 @@ spelling is better, as each entry says.
   where C allocated the bytes. *Why*: the spec's copy was the one-element case of the generalized
   `array:`; one path copies both. *Alternative*: `bytes:` with no `free:` (a leak per call for a library
   that allocates).
-
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- **A join answers only once the ended thread keeps nothing alive** ([threads](/spec/threads/)).
+- Settled on the user's delegation 2026-11-06 (branch `lock-turn-leak`): **a join answers only once
+  the ended thread keeps nothing alive** ([threads](/spec/threads/)).
   An ending lightweight thread detaches its context (its frames, which hold its closure and its
   joint, stop being roots) and then marks its joint done and wakes its joiners, both under the heap
   lock, so no collection runs between the two and the joint outlives its last use even when nothing
@@ -4144,7 +4138,13 @@ spelling is better, as each entry says.
   under load. *Alternatives*: keep the old order and promise only that an ended thread's objects are
   collected eventually (weaker, and visible to any program measuring its heap); or clear the frame's
   slots before marking the joint done (the joint, then reachable from nothing for a thread nobody
-  joins, could be collected while the ending thread still writes to it). Built on `lock-turn-leak`.
+  joins, could be collected while the ending thread still writes to it).
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
