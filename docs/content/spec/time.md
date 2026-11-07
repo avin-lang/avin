@@ -33,7 +33,7 @@ An instant has no year until a zone is named; a date has no hour; a time of day 
 | `Date` | a calendar date, with no time of day and no zone | `data Date(epochDay: int)`, days since 1970-01-01 | `date(y, m, d)` |
 | `Time` | a time of day, with no date and no zone | `data Time(microsOfDay: long)`, `0` to `86_399_999_999` | `time(h, m)`, `time(h, m, s)`, `time(h, m, s, us)` |
 | `DateTime` | a wall reading, a date and a time of day, with no zone | `data DateTime(date: Date, time: Time)` | `dateTime(…)`, `d.atTime(t)` |
-| `Zone` | a zone: a name and the offset its clocks show at any instant | a handle over Sysl's `Zone` | `zone(name)`, `localZone()`, `utc`, `fixedZone(offset)` |
+| `Zone` | a zone: a name and the offset its clocks show at any instant | a name and its rules: one fixed offset, or the bytes of the host database's file for it, which Sysl's `sysl.time.tzif` decodes | `zone(name)`, `localZone()`, `utc`, `fixedZone(offset)` |
 | `Zoned` | a wall reading in a zone; the only zoned type | `data Zoned(dateTime: DateTime, offset: Duration, zone: Zone)` | `t.atZone(z)`, `dt.atZone(z)` |
 | `Period` | a length of calendar: months and days | `data Period(months: int, days: int)` | `months(n)`, `years(n)`, `Period(months, days)` |
 
@@ -221,7 +221,7 @@ where that is one of the two, and otherwise takes the earlier.
 | --- | --- |
 | `zone(name: string) -> Result[Zone, ZoneError]` | A zone by its name in the tz database (`"America/Toronto"`, `"Asia/Kolkata"`), `"UTC"`, or a fixed offset `"+05:30"`, `"-08:00"`, `"+0530"`, `"Z"`. |
 | `utc: Zone` | UTC, a value rather than a call: the one zone that cannot fail to be found. `zone("UTC")? == utc`. |
-| `localZone() -> Zone` | The host's own zone. It always answers: where the host names no zone it can read, `utc`. |
+| `localZone() -> Zone` | The host's own zone: the one the `TZ` environment variable names (a leading `:` dropped; a path is read as the zone's file and named for what follows its `zoneinfo/`), and where `TZ` is unset, the one `/etc/localtime` is, named for what follows the `zoneinfo/` of the link's target (`localtime` where it is a copy rather than a link). It always answers: where the host names no zone it can read — `TZ` empty, naming no zone in the database, not a zone's name, or a file that does not decode — `utc`. |
 | `fixedZone(offset: Duration) -> Zone` | A zone whose clocks are always `offset` from UTC; the offset must be whole minutes within ±23:59, and anything else traps. `fixedZone(Duration.Zero) == utc`. |
 
 **A zone's name usually comes from outside the program**, so `zone` answers a `Result`. Its
@@ -348,20 +348,22 @@ byte 4`.
 
 `format(pattern)` on `Date`, `Time`, `DateTime` and `Zoned` writes a reading the way a person wants
 to read it. A run of one letter is an element, text between `|` bars is written as it stands (`||` is
-a bar), and every other character, letters that are no element included, stands for itself:
+a bar, between the bars too: `|a||b|` writes `a|b`), and every other character, letters that are no
+element included, stands for itself. A run of `h` followed by `12` is one element, the hour on the
+twelve-hour clock:
 
 | Element | Writes |
 | --- | --- |
-| `Y` `YY` `YYYY` | the year as written, its last two digits, four digits padded |
+| `Y` `YY` `YYYY` | the year as written (`-1`, `12345`), the last two digits of its magnitude (`26`, `01` for `-1`), four digits padded and signed outside `0` to `9999` as [the display](#text) writes it |
 | `M` `MM` `MMM` `MMMM` | the month: `8`, `08`, `Aug`, `August` |
-| `D` `DD` `DDD` | the day of the month, `5` or `05`; the day of the year |
+| `D` `DD` `DDD` | the day of the month, `5` or `05`; the day of the year, three digits padded (`005`, `240`) |
 | `WWW` `WWWW` | `Fri`, `Friday` |
 | `h` `hh` | the hour `0` to `23`, `9` or `09` |
 | `h12` `hh12` | the hour `1` to `12`: midnight and noon are `12` |
-| `a` `A` | `am`, `AM` |
+| `a` `A` | `am` or `pm`, `AM` or `PM`: `am` before noon |
 | `m` `mm` `s` `ss` | the minute and the second |
-| `f` … `ffffff` | the fraction of a second to that many digits |
-| `z` `zz` `zzz` `zzzz` | `-04:00`, `-0400`, `EDT`, `America/Toronto` |
+| `f` … `ffffff` | the fraction of a second to that many digits, cut rather than rounded |
+| `z` `zz` `zzz` `zzzz` | `-04:00`, `-0400`, `EDT`, `America/Toronto`; UTC's are `+00:00`, `+0000`, `UTC`, `UTC`, and a fixed zone's abbreviation and name are its offset |
 
 ```text
 val t = dateTime(2026, 8, 28, 17, 24, 15).atZone(toronto)?
@@ -373,7 +375,9 @@ t.format("YYYY-MM-DDThh:mm:ss.fffZ")       // 2026-08-28T17:24:15.000Z
 saying a date has no time of day, and `z` on a `DateTime` traps saying only a zoned reading knows its
 zone. An instant has no `format`; read it in a zone first. A pattern is the program's own text, so a
 malformed one traps naming the fault: a run of a letter no element has that length of (`YYY`: `a
-year is Y, YY or YYYY`), or a `|` that never closes. Names are English; there are no locales.
+year is Y, YY or YYYY`), or a `|` that never closes. The whole pattern is read before anything is
+written, so a malformed pattern traps as malformed whatever value it is given, before an element the
+value lacks: `date.format("hh YYY")` traps naming `YYY`. Names are English; there are no locales.
 
 ## Sleeping and timers
 

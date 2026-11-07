@@ -4554,6 +4554,41 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   atomic write would need a remove first, losing atomicity); two functions, `rename` and
   `renameReplacing`. Across file systems the call fails and moves nothing (`Other`), never copying.
   Review with the user if a refuse-by-default `rename` is preferred.
+- Settled on the user's delegation 2026-11-07: **A `Zone` holds its rules in Avin until Sysl's own zone can be held** (branch `local-time`).
+  A zone is a final class of a name and its rules: one fixed offset, or the bytes of the host
+  database's file for it as an immutable `Vector[byte]`. Each question (`offsetAt`,
+  `isDaylightSavingAt`, `abbreviationAt`) passes the bytes to the runtime, which decodes them with
+  Sysl 0.9.9's `sysl.time.tzif` and answers. Why: that release's decoded `tzif.Zone` is a view of the
+  bytes it was decoded from, so it cannot be held as a handle past the call that made it; the bytes
+  can, and a zone so held is an immutable value any thread may share, as the chapter says, where a
+  handle belongs to one thread. Decoding a table walks its header, short beside reading it.
+  Alternatives weighed: a handle over the borrowed view (a dangling reference once the shim's copy
+  is freed); a runtime table of decoded zones under a lock, handed out by number (global state and a
+  lock for what is a pure function of the bytes); waiting for Sysl 0.10.0's owning `Zone` (marshal
+  needs the local time now). When Avin moves to Sysl 0.10.0, `Zone` becomes a handle over its zone
+  with no change to Avin's API. Review with the user: the roadmap planned the handle from the start.
+- Settled on the user's delegation 2026-11-07: **The local zone is the one `TZ` names, else the one `/etc/localtime` is, read from the
+  database like any other** (branch `local-time`). `TZ` with a leading `:` dropped is a zone's name,
+  a `TZ` that is a path is that file, named for what follows its `zoneinfo/`; with `TZ` unset,
+  `/etc/localtime`'s bytes are the table and its link's target after `zoneinfo/` the name
+  (`localtime` where it is a copy). An empty `TZ`, one naming no zone, one that is not a zone's
+  name, and a file that does not decode give `utc`. Why: one source for the offset, the abbreviation
+  and daylight saving, and a local zone equal to `zone(name)` of its own name, so
+  `localZone() == zone("America/New_York")?` where that is the host's zone. Alternatives weighed:
+  the offset from `localtime_r` (Sysl's `local_offset`) with the abbreviation from the table (two
+  sources that could disagree, and a POSIX rule `TZ` such as `EST5EDT` with no file would have an
+  offset and no abbreviation); a zone named `local` (never equal to the named zone it is). A POSIX
+  rule string with no file of its name in the database is therefore `utc`.
+- Settled on the user's delegation 2026-11-07: **Pattern details the chapter left open** (branch `local-time`): `||` is a bar between the bars
+  too (`|a||b|` writes `a|b`), as it is outside them, so any text can be quoted; `DDD` pads the day of
+  the year to three digits, as `DD` pads the day of the month to two; `YY` is the last two digits of
+  the year's magnitude (`01` for year `-1`); `YYYY` outside `0` to `9999` writes the year as the
+  display does (`+12345`, `-0001`); `z` and `zz` of UTC are `+00:00` and `+0000`, never `Z`, so a
+  pattern writes one shape for every zone (a literal `Z` is written as itself); `f` … `ffffff` cut
+  the fraction rather than rounding, so a reading never rounds into the next second; and the whole
+  pattern is read before anything is written, so a malformed pattern traps as malformed whatever
+  value it is given. Alternatives weighed: `DDD` unpadded (a column of days of the year would not
+  line up); `Z` for UTC's `z` (a pattern's output would change shape with the zone).
 - **Settled on the user's delegation 2026-11-07 (branch `stop-signals`): `avin.signal` names `Stop`, `Continue`,
   `TerminalStop` and `Child`.** Each is an `int` numbered by the runtime for the platform
   (`avin.rt.job_signal`, over Sysl's `STOP`, `CONT`, `TSTP` and `CHLD`, as `User1` and `User2` are
