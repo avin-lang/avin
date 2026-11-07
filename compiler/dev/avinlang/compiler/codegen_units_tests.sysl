@@ -8,14 +8,15 @@ import sysl.process.{Exited, capture}
 
 // Codegen units: a module cut into units, each unit compiled on its own, and the objects linked.
 
-// A module of six functions, a string constant reached through an alias, a mutable global, and a
-// runtime declaration: everything local, as emission writes a program.
-private const Sample: string = "; a program\ndeclare i32 @puts(ptr)\n\n@text.const = private constant { i64, [6 x i8] } { i64 5, [6 x i8] c\"hello\\00\" }, align 16\n@text = private alias i8, ptr getelementptr inbounds (i8, ptr @text.const, i64 8)\n@count = private global i64 0, align 8\n@unused = private constant i64 7, align 8\n\ndefine internal tailcc i64 @\"<program>.one\"(i64 %v0) {\nb0:\n  %r = add i64 %v0, 1\n  ret i64 %r\n}\n\ndefine internal tailcc i64 @\"<program>.two\"(i64 %v0) {\nb0:\n  %r = call tailcc i64 @\"<program>.one\"(i64 %v0)\n  %s = mul i64 %r, 2\n  ret i64 %s\n}\n\ndefine internal tailcc i64 @\"<program>.three\"(i64 %v0) {\nb0:\n  %r = call tailcc i64 @\"<program>.two\"(i64 %v0)\n  %c = load i64, ptr @count\n  %d = add i64 %c, %r\n  store i64 %d, ptr @count\n  ret i64 %d\n}\n\ndefine internal void @\"<program>.say\"() {\nb0:\n  %r = call i32 @puts(ptr @text)\n  ret void\n}\n\ndefine internal void @\"<program>.sayTwice\"() {\nb0:\n  call void @\"<program>.say\"()\n  call void @\"<program>.say\"()\n  ret void\n}\n\ndefine i32 @main(i32 %argc, ptr %argv) {\nb0:\n  call void @\"<program>.sayTwice\"()\n  %a = call tailcc i64 @\"<program>.three\"(i64 4)\n  %b = call tailcc i64 @\"<program>.three\"(i64 1)\n  %c = trunc i64 %b to i32\n  ret i32 %c\n}\n"
+// A module of eight functions, a string constant reached through an alias, a mutable global, and a
+// runtime declaration: everything local, as emission writes a program. Every function but `lonely`
+// and `other` has two callers; `lonely` has one, `main`, and nothing calls `other`.
+private const Sample: string = "; a program\ndeclare i32 @puts(ptr)\n\n@text.const = private constant { i64, [6 x i8] } { i64 5, [6 x i8] c\"hello\\00\" }, align 16\n@text = private alias i8, ptr getelementptr inbounds (i8, ptr @text.const, i64 8)\n@count = private global i64 0, align 8\n@unused = private constant i64 7, align 8\n\ndefine internal tailcc i64 @\"<program>.one\"(i64 %v0) {\nb0:\n  %r = add i64 %v0, 1\n  ret i64 %r\n}\n\ndefine internal tailcc i64 @\"<program>.two\"(i64 %v0) {\nb0:\n  %r = call tailcc i64 @\"<program>.one\"(i64 %v0)\n  %s = mul i64 %r, 2\n  ret i64 %s\n}\n\ndefine internal tailcc i64 @\"<program>.three\"(i64 %v0) {\nb0:\n  %r = call tailcc i64 @\"<program>.two\"(i64 %v0)\n  %c = load i64, ptr @count\n  %d = add i64 %c, %r\n  store i64 %d, ptr @count\n  ret i64 %d\n}\n\ndefine internal void @\"<program>.say\"() {\nb0:\n  %r = call i32 @puts(ptr @text)\n  ret void\n}\n\ndefine internal void @\"<program>.sayTwice\"() {\nb0:\n  call void @\"<program>.say\"()\n  call void @\"<program>.say\"()\n  ret void\n}\n\ndefine internal tailcc i64 @\"<program>.other\"(i64 %v0) {\nb0:\n  call void @\"<program>.sayTwice\"()\n  call void @\"<program>.say\"()\n  %a = call tailcc i64 @\"<program>.one\"(i64 %v0)\n  %b = call tailcc i64 @\"<program>.two\"(i64 %a)\n  %c = call tailcc i64 @\"<program>.three\"(i64 %b)\n  ret i64 %c\n}\n\ndefine internal tailcc i64 @\"<program>.lonely\"(i64 %v0) {\nb0:\n  ret i64 %v0\n}\n\ndefine i32 @main(i32 %argc, ptr %argv) {\nb0:\n  call void @\"<program>.sayTwice\"()\n  %a = call tailcc i64 @\"<program>.three\"(i64 4)\n  %b = call tailcc i64 @\"<program>.three\"(i64 1)\n  %l = call tailcc i64 @\"<program>.lonely\"(i64 %b)\n  %c = trunc i64 %l to i32\n  ret i32 %c\n}\n"
 
 // The names `Sample` defines functions under.
 private sample_functions() -> Buf[string]
     var names: Buf[string] = buf()
-    for n in ["\"<program>.one\"", "\"<program>.two\"", "\"<program>.three\"", "\"<program>.say\"", "\"<program>.sayTwice\"", "main"]
+    for n in ["\"<program>.one\"", "\"<program>.two\"", "\"<program>.three\"", "\"<program>.say\"", "\"<program>.sayTwice\"", "\"<program>.other\"", "\"<program>.lonely\"", "main"]
         names.push(n)
     names
 
@@ -106,6 +107,30 @@ promotion_renames_only_what_crosses()
     assert(!all.contains("@\"<program>.one\""))
     assert(!all.contains("@\"<program>.say\""))
 
+@test("a function only one function calls is placed in its caller's unit and stays local; a chain of them follows its head")
+sole_caller_shares_its_unit()
+    for n in [2, 3, 8, 64]
+        val units = split_module(Sample, n, true).unwrap()
+        var together = 0
+        for u in units
+            if u.contains("define internal tailcc i64 @\"<program>.lonely\"(i64 %v0) {") && u.contains("define i32 @main(")
+                together += 1
+            assert(!u.contains("avin.cgu:<program>.lonely"))
+        assert_eq(together, 1)
+    // A chain: `a` is called only by `b`, `b` only by `c`; all three share `c`'s unit, for any count.
+    val chain = "define internal void @a() {\nb0:\n  ret void\n}\n\ndefine internal void @b() {\nb0:\n  call void @a()\n  ret void\n}\n\ndefine internal void @c() {\nb0:\n  call void @b()\n  ret void\n}\n\ndefine internal void @d() {\nb0:\n  ret void\n}\n\ndefine i32 @main() {\nb0:\n  call void @c()\n  call void @d()\n  call void @c()\n  call void @d()\n  ret i32 0\n}\n"
+    // Everything but nothing has one caller here, so the module is one unit's worth.
+    assert(split_module(chain, 64, false) is None)
+    // A cycle of only callers is placed by the hash and still defines each function once.
+    val cycle = "define internal void @p() {\nb0:\n  call void @q()\n  ret void\n}\n\ndefine internal void @q() {\nb0:\n  call void @p()\n  ret void\n}\n\ndefine i32 @main() {\nb0:\n  ret i32 0\n}\n"
+    split_module(cycle, 64, false) match
+        Some(units) ->
+            var homes = 0
+            for u in units
+                if u.contains("define internal void @p()") || u.contains("define hidden void @\"avin.cgu:p\"()") then homes += 1
+            assert_eq(homes, 1)
+        None -> ()
+
 @test("at -O2 a small function is copied into the units that call it as available_externally; at -O0 nothing is")
 small_functions_copied_only_when_optimizing()
     val plain = split_module(Sample, 64, false).unwrap()
@@ -169,7 +194,7 @@ cut_module_links_and_runs()
             val units = split_module(Sample, n, level != "-O0").unwrap()
             val (out, code, compiled) = run_units(units, dir, level, "")
             assert_eq(out, "hello\nhello\n")
-            // three(4) = 10, then three(1) = 10 + 4.
+            // three(4) = 10, then three(1) = 10 + 4, which `lonely` answers as it is.
             assert_eq(code, 14)
             assert_eq(compiled, int(units.len()))
 
@@ -220,7 +245,7 @@ program_with_private_symbols_across_units()
     defer _ = remove_dir_all(dir)
     for level in ["-O0", "-O2"]
         for n in [1, 8]
-            link(tc, llvm, compiled.archive, dir + "/units", level, compiled.c_link, units = n).unwrap()
+            link(tc, llvm, compiled.archive, dir + "/units", level, compiled.c_link, units = n, keep_units = false).unwrap()
             val ran = capture(dir + "/units", timeout = 10000).unwrap()
             assert(ran.status.ok())
             assert_eq(ran.text, expected)

@@ -72,7 +72,7 @@ const CopyInitLimit: usize = 2048
 const Promoted: string = "avin.cgu:"
 
 /** What the cache of unit objects is trimmed to after a build that compiled a unit. */
-const UnitCacheBytes: long = 2147483648
+const UnitCacheBytes: long = 1073741824
 
 /** What a build never evicts from the cache of unit objects, however full: anything used this
  * recently, in microseconds. */
@@ -370,9 +370,10 @@ split_module(text: string, n: int, copies: bool) -> Option[Buf[string]]
         promoted.push(false)
     // (unit, item) pairs still to be read for what they name.
     var work: Buf[(usize, usize)] = buf()
+    var sole = sole_callers(&m)
     for i in 0..<count
         if m.items[i].piece == PieceDefine
-            val p = usize(name_hash(m.items[i].name) % u64(units))
+            val p = function_unit(&m, &sole, i, units)
             home[i] = int(p)
             member[p * count + i] = true
             work.push((p, i))
@@ -424,6 +425,39 @@ split_module(text: string, n: int, copies: bool) -> Option[Buf[string]]
             if member[p * count + i] then defines = true
         if defines then out.push(render(&m, p, count, &member, &imported, &needed, &promoted))
     if out.len() < 2 then None else Some(out)
+
+/** For each item, the one function that names it where exactly one does and no global does, and
+ * `count` otherwise. */
+private sole_callers(m: *Module) -> Buf[usize]
+    val count = m.items.len()
+    var sole: Buf[usize] = buf()
+    var users: Buf[int] = buf()
+    for _ in 0..<count
+        sole.push(count)
+        users.push(0)
+    for i in 0..<count
+        val by_function = m.items[i].piece == PieceDefine
+        for k in m.ref_start[i]..<m.ref_start[i + 1]
+            val r = m.refs[k]
+            if users[r] > 0 && sole[r] == i then continue
+            users[r] += 1
+            sole[r] = if by_function then i else count
+    for r in 0..<count
+        if users[r] != 1 then sole[r] = count
+    sole
+
+/** **The unit function `i` is placed in**: its only caller's, where one function alone calls it,
+ * so the optimizer keeps the inlining of a function into its one caller, which costs nothing in size;
+ * and otherwise the one a hash of its name picks. A chain of only callers is followed to its head,
+ * and a cycle of them is placed by the hash. */
+private function_unit(m: *Module, sole: *Buf[usize], i: usize, units: usize) -> usize
+    val count = m.items.len()
+    var at = i
+    var steps: usize = 0
+    while sole[at] < count && sole[at] != i && steps < 64
+        at = sole[at]
+        steps += 1
+    usize(name_hash(m.items[at].name) % u64(units))
 
 /** The unit alias `a` lives in, which is its global's: the global is placed in `p` first where it
  * has no unit yet. An alias that names no global of the module stays in `p`. */
