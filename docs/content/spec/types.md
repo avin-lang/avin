@@ -28,7 +28,7 @@ All other types — user types, library types, collections — are PascalCase by
 
 Arithmetic keeps the operand width: `i8 + i8` is `i8`. Mixed widths need an explicit conversion
 (`long(x)`); there is no implicit widening. Diagnostics name `i32` and `i64` by their aliases. A literal takes its width from context (an annotation,
-a parameter, the other operand) and defaults to `int`; a literal that does not fit is a compile error.
+a parameter, the other operand, the other branches of an `if` or elements of a collection literal) and defaults to `int`; a literal that does not fit is a compile error.
 Where a `real` is expected, an integer literal is that real (`x * 2`), provided it is exact: its
 magnitude is at most 2^53.
 
