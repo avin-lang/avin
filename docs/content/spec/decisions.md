@@ -4542,6 +4542,18 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   `Child.waitFor` is, and both answer the same mirrored `ExitStatus`. Alternatives weighed:
   `Other` with a sentence (unmatchable by kind); a trap for a pid of zero or less (a pid read back
   from saved state is data, not a programming error).
+- Settled on the user's delegation 2026-11-07 (branch `fs-rename`): `fs.rename(from, to) -> Result[unit, IoError]` ([system
+  library](/spec/system-library/)) **replaces** what is at `to`, in one step, and does not refuse.
+  A file replaces a file; a directory replaces an empty directory; a directory that holds entries
+  is `DirectoryNotEmpty`; a file onto a directory is `IsADirectory`, a directory onto a file
+  `NotADirectory`. Renaming a path to itself succeeds and changes nothing. WHY: the call exists for
+  the atomic write (write `state.json.new`, rename it over `state.json`), which is only atomic if a
+  reader sees the old file or the new and the replacement never fails because the old one is there;
+  replacing is also what the platform's own rename does, so no extra check can race. ALTERNATIVES:
+  refuse with `AlreadyExists` when `to` exists (a separate check-then-rename is racy, and the
+  atomic write would need a remove first, losing atomicity); two functions, `rename` and
+  `renameReplacing`. Across file systems the call fails and moves nothing (`Other`), never copying.
+  Review with the user if a refuse-by-default `rename` is preferred.
 
 **Deferred**
 
