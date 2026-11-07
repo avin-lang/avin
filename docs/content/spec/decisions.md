@@ -4489,6 +4489,16 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   ALTERNATIVES: `pid: int` as Sysl takes it; `Option[long]` (loses why); passing Sysl's
   "no such process" through as `Other(...)` as `signal` does.
 
+- **A group of only ended, unreaped processes answers "No such process"** (branch
+  `group-signal-eperm`; [commands](/spec/system-library/#commands)). `signalGroup` maps the
+  platform's permission refusal to `Err(Other("No such process"))`: on macOS `kill(-pgid)` answers
+  EPERM while a group holds only zombies and ESRCH once they are reaped, so the same program saw
+  either answer by the timing of the reaping. Every process in a group a command made belongs to the
+  program's user, so a refusal can only mean that. WHY: one answer for an empty group, however the
+  reaping falls. Alternatives: leave the platform's answer and have callers wait for reaping (no way
+  to observe it, and the flake stays); report the permission error only for a group the program did
+  not start (not reachable, since `signalGroup` only names groups of its own commands).
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
