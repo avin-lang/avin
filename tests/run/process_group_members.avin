@@ -1,0 +1,71 @@
+// expect: exit 0
+// `groupMembers(pgid)` lists every live process of a group, grandchildren that stayed in it included,
+// and not the program asking; `children(pid)` lists the direct children only. A group or a parent
+// nobody is in, a pid past the largest process id and a pid of zero or less: an empty list for the
+// first two kinds, `Err(Other)` for the rest. Once the processes have ended and been waited for they
+// are gone from both lists.
+import avin.fs
+import avin.io.IoError
+import avin.process
+import avin.process.{Child, Command}
+import avin.signal
+import avin.threads
+import avin.time.millis
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message())
+
+// Waits until `file` holds a line, and answers it.
+written(file: string) -> string
+  loop
+    fs.readText(file) match
+      Ok(text) if text.endsWith("\n") -> return text.trim()
+      _ -> threads.sleep(millis(5))
+
+// Waits until the group has no member left.
+emptied(pgid: long)
+  loop
+    if ok(process.groupMembers(pgid)).isEmpty() then return
+    threads.sleep(millis(5))
+
+sorted(pids: Vector[long]) -> Vector[long] = pids.sorted()
+
+main()
+  val dir = ok(fs.createTempDir("avin-group-members"))
+  val file = s"$dir/grandchild"
+  // A leader of a new group that starts a grandchild and waits for it.
+  val leader = ok(Command("/bin/sh", "-c", s"sleep 30 & echo $$! > '$file.tmp'; mv '$file.tmp' '$file'; wait").inNewGroup().start())
+  val grandchild = written(file).toLongOption().get()
+  val group = leader.group().get()
+  println(group == leader.pid())
+  println(sorted(ok(process.groupMembers(group))) == sorted([leader.pid(), grandchild]))
+  println(ok(process.groupMembers(group)).contains(process.pid()))
+  // Children are direct only: the program's own are the leader, the leader's the grandchild.
+  println(ok(process.children(process.pid())).contains(leader.pid()))
+  println(ok(process.children(process.pid())).contains(grandchild))
+  println(ok(process.children(leader.pid())))
+  println(ok(process.children(leader.pid())) == [grandchild])
+  println(ok(process.children(grandchild)))
+  // A second group in the same program is listed apart.
+  val other = ok(Command("/bin/sleep", "30").inNewGroup().start())
+  println(ok(process.groupMembers(other.pid())) == [other.pid()])
+  println(ok(process.groupMembers(group)).contains(other.pid()))
+  // A group nobody is in, and a parent with no children.
+  println(ok(process.groupMembers(long(int.MaxValue))))
+  println(ok(process.children(long(int.MaxValue))))
+  // Refused pids.
+  val refused: Vector[long] = [0, -1, -2147483648, long(int.MaxValue) + 1, long.MaxValue, long.MinValue]
+  for pid in refused
+    println(s"${process.groupMembers(pid).isErr()} ${process.children(pid).isErr()}")
+  // Ended and waited for: gone.
+  println(other.signalGroup(signal.Terminate))
+  println(other.waitFor())
+  println(ok(process.groupMembers(other.pid())))
+  println(leader.signalGroup(signal.Terminate))
+  println(leader.waitFor())
+  emptied(group)
+  println(ok(process.groupMembers(group)))
+  println(ok(process.children(process.pid())).contains(leader.pid()))
+  println(ok(process.children(process.pid())).contains(other.pid()))
+  ok(fs.removeDirAll(dir))
