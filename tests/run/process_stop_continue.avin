@@ -1,0 +1,96 @@
+// expect: exit 0
+// `Stop` and `Continue` sent to a started command: it is observably stopped, makes no progress, and
+// after `Continue` runs on and exits normally. Sent to a process group, by a negative id or by
+// `signalGroup`, they stop a child and the grandchild it started together and let both go on.
+import avin.fs
+import avin.io.IoError
+import avin.process
+import avin.process.{Child, Command}
+import avin.signal
+import avin.threads
+import avin.time.millis
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message())
+
+// The state letters `ps` gives the program `pid`.
+stateOf(pid: long) -> string = ok(Command("/bin/ps", "-o", "state=", "-p", pid.toString()).output().mapErr(e -> IoError.Other("ps"))).trim()
+
+// Waits until the program `pid` is stopped.
+stopped(pid: long)
+  while !stateOf(pid).startsWith("T") do threads.sleep(millis(5))
+
+// Waits until the program `pid` is not stopped.
+running(pid: long)
+  while stateOf(pid).startsWith("T") do threads.sleep(millis(5))
+
+// Waits until `file` holds a line, and answers it.
+written(file: string) -> string
+  loop
+    fs.readText(file) match
+      Ok(text) if text.endsWith("\n") -> return text.trim()
+      _ -> threads.sleep(millis(5))
+
+main()
+  val dir = ok(fs.createTempDir("avin-stop-continue"))
+
+  // One program that appends a line every 20 milliseconds, ten times, then exits 0.
+  val script = "i=0; while [ $i -lt 10 ]; do echo x >> \"$0\"; /bin/sleep 0.02; i=$((i+1)); done"
+  val one = ok(Command("/bin/sh", "-c", script, dir + "/ticks").start())
+  written(dir + "/ticks")
+  println(one.signal(signal.Stop))
+  stopped(one.pid())
+  println(one.isAlive())
+  // Stopped, it makes no progress, however long it is left.
+  val frozen = ok(fs.readText(dir + "/ticks"))
+  threads.sleep(millis(300))
+  println(ok(fs.readText(dir + "/ticks")) == frozen)
+  println(stateOf(one.pid()).startsWith("T"))
+  // Stopping a stopped program changes nothing.
+  println(one.signal(signal.Stop))
+  println(one.isAlive())
+  println(one.signal(signal.Continue))
+  running(one.pid())
+  println(one.waitFor())
+  println(ok(fs.readText(dir + "/ticks")).bytes().length() > frozen.bytes().length())
+
+  // Continue to a program that was never stopped does nothing to it.
+  val plain = ok(Command("/bin/sh", "-c", "/bin/sleep 0.1; exit 4").start())
+  println(plain.signal(signal.Continue))
+  println(plain.waitFor())
+
+  // A command stopped before it has finished, continued from another thread, ends as it would have.
+  val sleeper = ok(Command("/bin/sh", "-c", "/bin/sleep 0.3; exit 5").start())
+  println(sleeper.signal(signal.Stop))
+  stopped(sleeper.pid())
+  val waiter = threads.spawn(() -> sleeper.waitFor())
+  threads.sleep(millis(100))
+  println(sleeper.signal(signal.Continue))
+  println(waiter.join())
+
+  // A group: a shell and the grandchild it started, stopped by a negative id.
+  val tree = ok(Command("/bin/sh", "-c", "/bin/sleep 300 & echo $! > \"$0\"; wait", dir + "/grandchild").inNewGroup().start())
+  val grandchild = written(dir + "/grandchild").toLong()
+  println(process.signal(-tree.pid(), signal.Stop))
+  stopped(tree.pid())
+  stopped(grandchild)
+  println(stateOf(tree.pid()).startsWith("T"))
+  println(stateOf(grandchild).startsWith("T"))
+  println(process.signal(-tree.pid(), signal.Continue))
+  running(tree.pid())
+  running(grandchild)
+  println(stateOf(grandchild).startsWith("T"))
+  // And by the command's own group, both ways round.
+  println(tree.signalGroup(signal.Stop))
+  stopped(tree.pid())
+  stopped(grandchild)
+  println(tree.signalGroup(signal.Continue))
+  running(tree.pid())
+  running(grandchild)
+  println(tree.signalGroup(signal.Terminate))
+  println(tree.waitFor())
+  loop
+    if tree.signalGroup(0).isErr() then break
+    threads.sleep(millis(5))
+  println(tree.signalGroup(0))
