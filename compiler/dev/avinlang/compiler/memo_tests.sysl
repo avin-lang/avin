@@ -1,0 +1,156 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.container.map
+
+// The conformance answers lowering remembers are the answers it would have had by asking afresh:
+// for every type of a program of awkward shapes, as every class and trait, and as every other type,
+// asked once to fill the memo and again to read it back.
+
+private checked(text: string) -> TProgram
+    val tc = repository_toolchain()
+    val loaded = load_units(tc.library_dir(), single_file(source_of("probe.avin", text)), false, src -> src) match
+        Ok(l) -> l
+        Err(m) -> panic(m)
+    val result = check_program(loaded.units, loaded.root_module, false)
+    if result.has_errors() then panic(result.render())
+    result.program.unwrap()
+
+private finished(p: TProgram) -> Conformances = Conformances(p.classes, p.data, p.builtins, p.conditional, p.core, p.bounds, None, map())
+
+private own_module(name: string) -> bool = name != CoreModule && !name.starts_with(CoreModule + ".")
+
+/** The probe's own classes and data types, each at every list of arguments drawn from `pool`, with
+ * the pool itself first. */
+private instances(p: TProgram, pool: Buf[&Type]) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    for t in pool
+        out.push(t)
+    for k in 0..<p.classes.len()
+        val c = p.classes[k]
+        if !own_module(c.module_name) then continue
+        for args in argument_lists(pool, c.decl.type_params.len())
+            out.push(Class(k, c.name, args))
+    for d in 0..<p.data.len()
+        val x = p.data[d]
+        if !own_module(x.module_name) then continue
+        for args in argument_lists(pool, x.decl.type_params.len())
+            out.push(Data(d, x.name, args))
+    out
+
+private argument_lists(pool: Buf[&Type], n: usize) -> Buf[Buf[&Type]]
+    var lists: Buf[Buf[&Type]] = buf()
+    lists.push(buf())
+    for _ in 0..<n
+        var longer: Buf[Buf[&Type]] = buf()
+        for l in lists
+            for t in pool
+                var next: Buf[&Type] = buf()
+                for x in l
+                    next.push(x)
+                next.push(t)
+                longer.push(next)
+        lists = longer
+    lists
+
+private same_answer(a: Option[&Type], b: Option[&Type]) -> bool = a match
+    Some(x) -> b match
+        Some(y) -> same_type(x, y)
+        None -> false
+    None -> b is None
+
+/** Checks every remembered answer against the fresh one for `types`, and returns how many of them
+ * were yes, so a probe can show it asked questions whose answers differ. */
+private agree(p: TProgram, types: Buf[&Type]) -> (usize, usize)
+    val f = finished(p)
+    var memo = conformance_memo()
+    var ancestors = 0usize
+    var always = 0usize
+    for _ in 0..<2
+        ancestors = 0
+        always = 0
+        for t in types
+            val known = memo.known(t)
+            for k in 0..<p.classes.len()
+                val fresh = holding_ancestor(f, t, k)
+                val kept = memo.ancestor(f, known, k)
+                if !same_answer(fresh, kept) then panic(s"holding_ancestor of ${type_name(t)} as ${p.classes[k].name} differs")
+                if fresh is Some(_) then ancestors = ancestors + 1
+            for u in types
+                val fresh = value_always_is(f, t, u)
+                val kept = memo.always_is(f, known, memo.known(u))
+                if fresh != kept then panic(s"always_is of ${type_name(t)} and ${type_name(u)} differs")
+                if fresh then always = always + 1
+    (ancestors, always)
+
+private const Shapes: string = "trait Base\n    tag() -> int = 0\n\ntrait Left: Base\n\ntrait Right: Base\n\nclass Diamond: Left, Right\n\ntrait Shape\n    area() -> int\n\nclass Square(side: int): Shape\n    override area() -> int = side * side\n\nopen class Animal\n\nclass Dog: Animal, Left\n\ntrait Holder[T]\n    get() -> T\n\nclass Box[T](val item: T): Holder[T]\n    override get() -> T = item\n\nclass Wrap[T](val item: T)\n\nimpl[T: Shape] Shape for Wrap[T]\n    area() -> int = item.area() * 2\n\nimpl[T: Display] Display for Wrap[T]\n    display(out: Writer, spec: FormatSpec)\n        item.display(out, spec)\n\ndata Pair[A, B](a: A, b: B)\n\nimpl[A: Shape, B: Shape] Shape for Pair[A, B]\n    area() -> int = a.area() + b.area()\n\ntrait Named\n    name() -> string\n\ntrait Labelled: Named\n    label() -> string = name()\n\ndata Tagged[T](tag: string, value: T)\n\nimpl[T: Display] Labelled for Tagged[T]\n    name() -> string = tag\n\nmain()\n    println(Square(2).area())\n"
+
+private pool_of(p: TProgram) -> Buf[&Type]
+    var pool: Buf[&Type] = buf()
+    pool.push(int_type())
+    pool.push(Str)
+    pool.push(Unit)
+    pool.push(Tuple(two(int_type(), Str)))
+    for k in 0..<p.classes.len()
+        val c = p.classes[k]
+        if own_module(c.module_name) && c.decl.type_params.len() == 0 && (c.name == "Square" || c.name == "Diamond" || c.name == "Dog") then pool.push(Class(k, c.name, buf()))
+    pool
+
+private two(a: &Type, b: &Type) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    out.push(a)
+    out.push(b)
+    out
+
+@test("remembered conformance answers equal fresh ones: generic instances, conditional impls, a diamond of traits, a type conforming through two paths")
+remembered_answers_are_fresh_ones()
+    val p = checked(Shapes)
+    val types = instances(p, pool_of(p))
+    val (ancestors, always) = agree(p, types)
+    // Both kinds of answer include yeses and noes, so the comparison is of real questions.
+    assert(ancestors > 0)
+    assert(always > types.len())
+    assert(always < types.len() * types.len())
+
+@test("a conditional conformance is remembered per instance: Wrap[Square] is a Shape, Wrap[string] is not")
+conditional_answers_are_per_instance()
+    val p = checked(Shapes)
+    val f = finished(p)
+    var memo = conformance_memo()
+    var shape = 0usize
+    var wrap = 0usize
+    var square = 0usize
+    for k in 0..<p.classes.len()
+        if !own_module(p.classes[k].module_name) then continue
+        if p.classes[k].name == "Shape" then shape = k
+        if p.classes[k].name == "Wrap" then wrap = k
+        if p.classes[k].name == "Square" then square = k
+    var one: Buf[&Type] = buf()
+    one.push(Class(square, "Square", buf()))
+    var other: Buf[&Type] = buf()
+    other.push(Str)
+    val held = memo.known(Class(wrap, "Wrap", one))
+    val missed = memo.known(Class(wrap, "Wrap", other))
+    for _ in 0..<2
+        assert(memo.ancestor(f, held, shape) is Some(_))
+        assert(memo.ancestor(f, missed, shape) is None)
+    val shape_type = memo.known(Class(shape, "Shape", buf()))
+    assert(memo.always_is(f, held, shape_type))
+    assert(!memo.always_is(f, missed, shape_type))
+
+@test("a type naming a type parameter has no number, and its questions are asked afresh")
+type_parameters_are_not_remembered()
+    var memo = conformance_memo()
+    assert(memo.known(TypeVar(0, 0, "T")).id is None)
+    var args: Buf[&Type] = buf()
+    args.push(TypeVar(0, 0, "T"))
+    assert(memo.known(Tuple(args)).id is None)
+    assert(memo.known(Var(3)).id is None)
+    // Equal types share a number; different ones do not.
+    val a = memo.known(Tuple(two(int_type(), Str)))
+    val b = memo.known(Tuple(two(int_type(), Str)))
+    val c = memo.known(Tuple(two(Str, int_type())))
+    assert(a.id.unwrap() == b.id.unwrap())
+    assert(a.id.unwrap() != c.id.unwrap())

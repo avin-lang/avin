@@ -202,6 +202,10 @@ private struct Lowering
      * converts for, by the instance index of that function. */
     trampolines: Buf[MirTrampoline]
     c_callbacks: Map[usize, CCallbackPlan]
+    /** The conformance questions already answered. */
+    memo: ConformanceMemo
+    /** The receivers of the calls `slot_calls` records, by position and method name. */
+    slot_receivers: Map[string, Buf[KnownType]]
 
 /** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
  * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
@@ -239,6 +243,61 @@ private struct GenericHolder
     descriptor: usize
     ty: &Type
 
+/** A type with the number a `ConformanceMemo` gives it, where it names no type parameter. */
+struct KnownType
+    ty: &Type
+    id: Option[usize]
+
+/** The answers to the conformance questions lowering asks again and again of the types of a
+ * finished program: which instance of a class or trait a type is, and whether a value of one type
+ * always has another. Each type that names no type parameter has a number, by its `type_key`, and an
+ * answer is kept by the numbers it was asked of. A type naming a type parameter or an unsolved type
+ * means something different where it is named, so a question of one is asked afresh each time. */
+struct ConformanceMemo
+    type_ids: Map[string, usize]
+    ancestors: Map[usize, Option[&Type]]
+    always: Map[usize, bool]
+
+    /** `t` with its number, given when first asked for. */
+    known(*self, t: &Type) -> KnownType
+        if names_type_parameter(t) then return KnownType(t, None)
+        val key = type_key(t)
+        if self.type_ids.get(key) is Some(id) then return KnownType(t, Some(id))
+        val id = self.type_ids.len()
+        self.type_ids.put(key, id)
+        KnownType(t, Some(id))
+
+    /** What `holding_ancestor` answers of `t` and `target`. */
+    ancestor(*self, f: Conformances, t: KnownType, target: usize) -> Option[&Type]
+        val a = t.id match
+            Some(a) -> a
+            None -> return holding_ancestor(f, t.ty, target)
+        val key = pair_key(a, target)
+        if self.ancestors.get(key) is Some(known) then return known
+        val answer = holding_ancestor(f, t.ty, target)
+        self.ancestors.put(key, answer)
+        answer
+
+    /** What `value_always_is` answers of `from` and `to`. */
+    always_is(*self, f: Conformances, from: KnownType, to: KnownType) -> bool
+        val a = from.id match
+            Some(a) -> a
+            None -> return value_always_is(f, from.ty, to.ty)
+        val b = to.id match
+            Some(b) -> b
+            None -> return value_always_is(f, from.ty, to.ty)
+        val key = pair_key(a, b)
+        if self.always.get(key) is Some(known) then return known
+        val answer = value_always_is(f, from.ty, to.ty)
+        self.always.put(key, answer)
+        answer
+
+/** A memo with no answers yet. */
+conformance_memo() -> ConformanceMemo = ConformanceMemo(map(), map(), map())
+
+/** One number for a pair of numbers each below 2^32. */
+private pair_key(a: usize, b: usize) -> usize = a * 4294967296 + b
+
 // Every function that is not generic is compiled once; each generic function is compiled for each
 // list of type arguments a compiled call gives it, as those calls are found. An abstract method has
 // no code, and an abstract class's constructor is never called: its subclasses run its initializer.
@@ -256,7 +315,7 @@ lower_program(program: TProgram) -> MirProgram
         if d.table.len() > generic_base then generic_base = d.table.len()
     for b in program.builtins
         if b.table.len() > generic_base then generic_base = b.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map())
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map())
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
     l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None, false))
@@ -502,7 +561,8 @@ private element_size(t: Option[MirType]) -> usize = t match
 private method_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
     var table: Buf[Option[usize]] = buf()
     val entries = checker_table(l, t)
-    val missing = unheld_positions(l, t)
+    val known = known_type(l, t)
+    val missing = unheld_positions(l, known)
     for p in 0..<entries.len()
         val m = entries[p] match
             Some(m) -> m
@@ -510,7 +570,7 @@ private method_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
                 table.push(None)
                 continue
         val symbol = l.program.symbols[m]
-        if is_abstract_method(symbol) || symbol.decl.type_params.len() > 0 || missing[p] || !slot_used(l, p, symbol.decl.name, t)
+        if is_abstract_method(symbol) || symbol.decl.type_params.len() > 0 || missing[p] || !slot_used(l, p, symbol.decl.name, known)
             table.push(None)
             continue
         table.push(Some(table_entry(l, t, m, implementation_args(l, t, m), p)))
@@ -585,10 +645,12 @@ private any_names_type_parameter(items: Buf[&Type]) -> bool
 /** Whether a call through `position` of a method table reaches the method `name` on an object of type
  * `t`: one of that method whose receiver's static type `t` has. Different traits' methods may share
  * a position in different types' tables, so the name tells them apart. */
-private slot_used(l: *Lowering, position: usize, name: string, t: &Type) -> bool
-    if position >= l.slot_calls.len() then return false
-    for call in l.slot_calls[position]
-        if call.name == name && always_is(l, t, call.receiver) then return true
+private slot_used(l: *Lowering, position: usize, name: string, t: KnownType) -> bool
+    val receivers = l.slot_receivers.get(s"$position $name") match
+        Some(rs) -> rs
+        None -> return false
+    for receiver in receivers
+        if always_is_known(l, t, receiver) then return true
     false
 
 /** Records a call through `position` of a method table, of the method `name`, on a receiver of static
@@ -602,6 +664,10 @@ private use_slot(l: *Lowering, position: usize, name: string, receiver: &Type)
         known.push(k)
     known.push(SlotCall(name, receiver))
     l.slot_calls[position] = known
+    val key = s"$position $name"
+    var receivers: Buf[KnownType] = l.slot_receivers.get(key).unwrap_or(buf())
+    receivers.push(known_type(l, receiver))
+    l.slot_receivers.put(key, receivers)
     l.new_slots = true
 
 // Fills the positions that came into use since the last time in the method tables already made, each
@@ -639,7 +705,8 @@ private lowering_conformances(l: *Lowering) -> Conformances =
 // table. No call reaches such a position, so it stays empty and its methods are not compiled for
 // this instance. A tuple's table holds every trait its arity's impls state, and a tuple conforms to
 // one only where its parts meet that impl's bounds: `(int, unit)` is no `Ord`, for `unit` is not.
-private unheld_positions(l: *Lowering, t: &Type) -> Buf[bool]
+private unheld_positions(l: *Lowering, known: KnownType) -> Buf[bool]
+    val t = known.ty
     val entries = checker_table(l, t)
     var out: Buf[bool] = buf()
     for _ in entries do out.push(false)
@@ -665,7 +732,7 @@ private unheld_positions(l: *Lowering, t: &Type) -> Buf[bool]
         val symbol = l.program.classes[k]
         if symbol.decl.modifier != "trait" then continue
         if ancestor_type(l.program.classes, l.program.data, t, k) is None then continue
-        if holding_ancestor(f, t, k) is Some(_) then continue
+        if held_ancestor(l, known, k) is Some(_) then continue
         for j in 0..<symbol.methods.len()
             if symbol.base + j < out.len() then out[symbol.base + j] = true
     out
@@ -1292,6 +1359,7 @@ private all_invariant(params: Buf[TypeParam]) -> bool
 private add_variant_ancestors(l: *Lowering)
     for r in 1..<l.records.len()
         val from = l.record_types[r]
+        val known = known_type(l, from)
         var ancestors = l.records[r].ancestors
         var grew = false
         for target in l.tested
@@ -1301,10 +1369,19 @@ private add_variant_ancestors(l: *Lowering)
                 if a == target then listed = true
             if listed then continue
             val to = l.record_types[target]
-            if always_is(l, from, to) || same_type(view_as(lowering_conformances(l), from, to), to)
+            if seen_as(l, known, to)
                 ancestors.push(target)
                 grew = true
         if grew then l.records[r] = TypeRecord(l.records[r].name, ancestors, l.records[r].equals, l.records[r].hash, l.records[r].display, l.records[r].debug, l.records[r].apart)
+
+/** Whether a value of type `from` is one of `to`, as `always_is` or a view through `view_as` shows.
+ * A class or data value is seen as another class or trait only through the instance of it that it
+ * holds, so where `held_ancestor` remembers none, the answer is no without asking the rest. */
+private seen_as(l: *Lowering, from: KnownType, to: &Type) -> bool
+    if *to is Class(k, _, _)
+        if (*from.ty is Class(_, _, _) || *from.ty is Data(_, _, _)) && !same_type(from.ty, to)
+            if held_ancestor(l, from, k) is None then return false
+    always_is(l, from.ty, to) || same_type(view_as(lowering_conformances(l), from.ty, to), to)
 
 /** The value of type `t` an object that has that type holds: a built-in value is in its box, and an
  * option kept as a pointer is the `Some`'s value or null. */
@@ -1368,12 +1445,29 @@ private option_pointer(l: *Lowering, t: &Type, object: Operand) -> Operand
 // Whether a value of static type `from` always has type `to`: `to` is `Any`, or `from` itself, or
 // a type a value of `from` is with no conversion: an ancestor, an instance of the same generic type
 // as variance allows, a tuple part by part.
-private always_is(l: *Lowering, from: &Type, to: &Type) -> bool
+private always_is(l: *Lowering, from: &Type, to: &Type) -> bool = value_always_is(lowering_conformances(l), from, to)
+
+/** `always_is` as the conformances `f` of a finished program decide it. */
+value_always_is(f: Conformances, from: &Type, to: &Type) -> bool
     if *to is AnyType || same_type(from, to) then return true
     // A built-in value or a tuple is a value of each trait it conforms to, once boxed as one.
-    if (is_builtin(from) || *from is Tuple(_)) && *to is Class(_, _, _) then return meets_bound(lowering_conformances(l), from, to)
+    if (is_builtin(from) || *from is Tuple(_)) && *to is Class(_, _, _) then return meets_bound(f, from, to)
     if !is_reference(from) then return false
-    same_type(view_as(lowering_conformances(l), from, to), to)
+    same_type(view_as(f, from, to), to)
+
+/** `always_is` of two types with their numbers, remembered. */
+private always_is_known(l: *Lowering, from: KnownType, to: KnownType) -> bool
+    val f = lowering_conformances(l)
+    l.memo.always_is(f, from, to)
+
+/** `t` as an instance of the class or trait `target`, through the conformances that hold at its type
+ * arguments, as `holding_ancestor` finds it, remembered. */
+private held_ancestor(l: *Lowering, t: KnownType, target: usize) -> Option[&Type]
+    val f = lowering_conformances(l)
+    l.memo.ancestor(f, t, target)
+
+/** `t` with the number the memo gives it. */
+private known_type(l: *Lowering, t: &Type) -> KnownType = l.memo.known(t)
 
 private machine_name(t: MirType) -> string = t match
     MInt(bits) -> s"i$bits"
@@ -1572,10 +1666,15 @@ private is_plain_value(t: &Type) -> bool = is_builtin(t) && !(*t is Str)
 private dispatch_sites(l: *Lowering) -> Buf[DispatchSite]
     val f = lowering_conformances(l)
     var out: Buf[DispatchSite] = buf()
+    var types: Buf[KnownType] = buf()
+    for descriptor in l.descriptors
+        val t = l.record_types[descriptor.record]
+        types.push(known_type(l, t))
     for call in l.dispatches
         val head = *call.receiver match
             Class(k, _, _) -> k
             _ -> continue
+        val receiver = known_type(l, call.receiver)
         var single: Option[usize] = None
         var many = false
         var guards: Buf[DispatchGuard] = buf()
@@ -1585,17 +1684,17 @@ private dispatch_sites(l: *Lowering) -> Buf[DispatchSite]
             val g = descriptor.methods[call.position] match
                 Some(g) -> g
                 None -> continue
-            val t = l.record_types[descriptor.record]
+            val t = types[d].ty
             val placed = *t is Class(_, _, _) || *t is Data(_, _, _)
             if placed
-                val up = holding_ancestor(f, t, head) match
+                val up = held_ancestor(l, types[d], head) match
                     Some(up) -> up
                     None -> continue
                 if never_reaches(f, head, up, call.receiver) then continue
             single match
                 Some(s) -> if s != g then many = true
                 None -> single = Some(g)
-            if placed && always_is(l, t, call.receiver) then guards.push(DispatchGuard(d, g))
+            if placed && always_is_known(l, types[d], receiver) then guards.push(DispatchGuard(d, g))
         out.push(DispatchSite(call.function, call.code, if many then None else single, guards))
     out
 
