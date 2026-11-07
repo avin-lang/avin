@@ -4549,6 +4549,24 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- Proposed (branch `lambda-after-literal`): **A lambda's result takes part in a call's literal tiers**
+  ([generics](/spec/generics/#inference)). A lambda whose parameter types are known is checked in
+  the tier of the value it yields (the last item of its block; the lowest tier among an `if`'s or a
+  `match`'s branches), after the other arguments of that tier, rather than after every argument. So
+  `pick(s -> s.toLongOption(), 0)` for `pick[T](read: (string) -> Option[T], absent: T)` takes
+  `T = long`, as passing a named function does, and `pick(s -> s.toRealOption(), 0)` takes `real`;
+  a lambda yielding `Some(1)` or `1` takes the numbers the other arguments decide. A lambda that
+  leaves its body by `return` or `?`, and a `match` function, are still checked last, since such a
+  body needs its result type known before it is checked. Why: the settled number-literal decision
+  says a literal gives way to a type from a neighbour, and a lambda's result is a neighbour; a
+  lambda checked last let the `0` fix `T = int` first, so the lambda and a named function of the
+  same type behaved differently (marshal met it). Alternatives: deferring the literal instead of
+  advancing the lambda (the same order in effect, but it reaches only literals, not the lambda's own
+  literal result); checking a lambda with `?` early against a result type known only in shape (a
+  larger change to how `?` finds the type it returns, left for when a program needs
+  `pick(s -> Some(s.toLongOption()? + 1), 0)` to be a `long`). Review with the user: whether a
+  lambda that uses `?` should also take part, which needs `?` to work from a result known in shape.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
