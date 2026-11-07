@@ -4554,14 +4554,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   atomic write would need a remove first, losing atomicity); two functions, `rename` and
   `renameReplacing`. Across file systems the call fails and moves nothing (`Other`), never copying.
   Review with the user if a refuse-by-default `rename` is preferred.
-
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- **A `Zone` holds its rules in Avin until Sysl's own zone can be held** (branch `local-time`).
+- Settled on the user's delegation 2026-11-07: **A `Zone` holds its rules in Avin until Sysl's own zone can be held** (branch `local-time`).
   A zone is a final class of a name and its rules: one fixed offset, or the bytes of the host
   database's file for it as an immutable `Vector[byte]`. Each question (`offsetAt`,
   `isDaylightSavingAt`, `abbreviationAt`) passes the bytes to the runtime, which decodes them with
@@ -4574,7 +4567,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   lock for what is a pure function of the bytes); waiting for Sysl 0.10.0's owning `Zone` (marshal
   needs the local time now). When Avin moves to Sysl 0.10.0, `Zone` becomes a handle over its zone
   with no change to Avin's API. Review with the user: the roadmap planned the handle from the start.
-- **The local zone is the one `TZ` names, else the one `/etc/localtime` is, read from the
+- Settled on the user's delegation 2026-11-07: **The local zone is the one `TZ` names, else the one `/etc/localtime` is, read from the
   database like any other** (branch `local-time`). `TZ` with a leading `:` dropped is a zone's name,
   a `TZ` that is a path is that file, named for what follows its `zoneinfo/`; with `TZ` unset,
   `/etc/localtime`'s bytes are the table and its link's target after `zoneinfo/` the name
@@ -4586,7 +4579,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   sources that could disagree, and a POSIX rule `TZ` such as `EST5EDT` with no file would have an
   offset and no abbreviation); a zone named `local` (never equal to the named zone it is). A POSIX
   rule string with no file of its name in the database is therefore `utc`.
-- **Pattern details the chapter left open** (branch `local-time`): `||` is a bar between the bars
+- Settled on the user's delegation 2026-11-07: **Pattern details the chapter left open** (branch `local-time`): `||` is a bar between the bars
   too (`|a||b|` writes `a|b`), as it is outside them, so any text can be quoted; `DDD` pads the day of
   the year to three digits, as `DD` pads the day of the month to two; `YY` is the last two digits of
   the year's magnitude (`01` for year `-1`); `YYYY` outside `0` to `9999` writes the year as the
@@ -4596,6 +4589,12 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   pattern is read before anything is written, so a malformed pattern traps as malformed whatever
   value it is given. Alternatives weighed: `DDD` unpadded (a column of days of the year would not
   line up); `Z` for UTC's `z` (a pattern's output would change shape with the zone).
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
