@@ -89,12 +89,57 @@ residentBytes(pid: long) -> Result[long, IoError] = residentBytesOf(pid)
 
 private residentBytesOf(pid: long) -> Result[long, IoError]
   if !(0 < pid <= long(int.MaxValue)) then return Err(io.NotFound)
-  // The platform's "no such process" (3 on every platform the library runs on) is the process not
-  // being there.
   residentOf(int(pid)).mapErr(e -> e match
     NotPermitted -> io.PermissionDenied
-    Other(3) -> io.NotFound
     other -> ioError(other))
+
+@sysl("sysl.process.exec")
+private replaceImage(program: string, args: Vector[string], env: Vector[Var], inheritEnv: bool) -> SyslError
+
+// Replaces the program with `program`, run with `args`, and answers only if that failed. On success
+// nothing comes back: the process goes on with the same id, the same parent and every descriptor not
+// closed on exec (the standard streams; everything the library opens closes), running `program` from
+// its beginning with this program's environment. What the program has written so far is flushed
+// first. Nothing else of the program is left: its other threads vanish, its exit hooks do not run
+// and its signal watches end. A bare name is looked for on the `PATH`. A program that is not there
+// is `Err(NotFound)` and one that may not be run `Err(PermissionDenied)`, and the program then
+// carries on exactly as it was.
+exec(program: string, args: Vector[string]) -> Result[Nothing, IoError] = Err(ioError(replaceImage(program, args, [], true)))
+
+// `exec` with `environment` as the whole of the new program's environment, nothing of this program's
+// inherited: `process.environment().updated("NAME", "value")` adds to this program's. A bare name is looked for on
+// the `PATH` that `environment` holds, or the system's default search path where it holds none.
+exec(program: string, args: Vector[string], environment: Map[string, string]) -> Result[Nothing, IoError]
+  var vars: Vector[Var] = []
+  for (name, value) in environment do vars = vars :+ Var(name, value)
+  Err(ioError(replaceImage(program, args, vars, false)))
+
+@sysl("sysl.process.wait_pid", blocking)
+private waitedPid(pid: int) -> Result[ExitStatus, SyslError]
+
+@sysl("sysl.process.try_wait_pid")
+private polledPid(pid: int) -> Result[Option[ExitStatus], SyslError]
+
+// Waits for this program's child `pid` to end and answers how it ended, as a `Child`'s `waitFor`
+// does: for a child no `Child` holds, one detached or one an earlier image of the process started
+// before it became this program through `exec`. The child is reaped, so a second wait for it is
+// `Err(NotFound)`, as is a `pid` that is not this program's child and a `pid` of zero or less. A
+// lightweight thread waiting leaves its worker to run others.
+waitPid(pid: long) -> Result[ExitStatus, IoError]
+  if !(0 < pid <= long(int.MaxValue)) then return Err(io.NotFound)
+  waitedPid(int(pid)).mapErr(waitError)
+
+// Whether this program's child `pid` has ended, without waiting: `None` while it runs, and how it
+// ended once it has, reaping it then. The errors are `waitPid`'s.
+tryWaitPid(pid: long) -> Result[Option[ExitStatus], IoError]
+  if !(0 < pid <= long(int.MaxValue)) then return Err(io.NotFound)
+  polledPid(int(pid)).mapErr(waitError)
+
+// The platform's "no child process" (10 on every platform the library runs on) is the child not
+// being there to wait for.
+private waitError(e: SyslError) -> IoError = e match
+  Other(10) -> io.NotFound
+  other -> ioError(other)
 
 // The operating system the program was compiled for.
 @sysl("sysl.Os")

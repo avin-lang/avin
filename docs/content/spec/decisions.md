@@ -4473,8 +4473,8 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   Result[long, IoError]` and `process.residentBytes(pid: long) -> Result[long, IoError]` over Sysl's
   `total_memory` and `resident_bytes`, the `u64` bound as a `long` (machine memory and a process's
   resident pages are far below 2^63), and `Child.residentBytes()` for the program `pid()` names. A
-  process that is not there (Sysl's `NotFound`, and its "no such process", which it answers for a
-  reaped child or an unused pid), a pid of zero or less and one past the largest `int` are
+  process that is not there (Sysl's `NotFound`, which from Sysl 0.9.9 it answers for a reaped child
+  and an unused pid alike), a pid of zero or less and one past the largest `int` are
   `Err(NotFound)`; Sysl's `NotPermitted` is `Err(PermissionDenied)`, which macOS answers for pid 1
   and Linux does not (it reads any process's size). A `Child` seen to have ended, or with no program
   started, is `Err(NotFound)` without asking. WHY: the pid is a `long` everywhere else in
@@ -4523,6 +4523,31 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 - Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
 
 ## Proposed
+
+- Proposed (branch `process-exec`): **`process.exec` and its environment**
+  ([becoming another program](/spec/system-library/#becoming-another-program)).
+  `exec(program, args) -> Result[Nothing, IoError]` over Sysl 0.9.9's `sysl.process.exec`,
+  inheriting the environment, and an overload `exec(program, args, environment: Map[string,
+  string])` giving exactly that environment, nothing inherited, a bare name looked for on its `PATH`.
+  Why: a `Result` with `Nothing` on its `Ok` side lets `?` pass the failure on and says in the type
+  that success never comes back; a whole `Map` matches what `process.environment()` answers, so
+  adding to the program's own is `environment().updated(...)`, and a self-upgrading daemon wants the
+  environment it was started with. Alternatives weighed: answering a bare `IoError` as Sysl does
+  (no `?`); a `Command.exec()` carrying `withEnv`/`clearEnv` edits (a command's directory, time
+  limit and redirections have no meaning for an `exec`, and would need refusing); a vector of
+  environment edits. Standard output is flushed by the Sysl call (`fflush` of every stream, which
+  is where Avin's output is buffered). A `match` over the answer still needs an `Ok(_)` arm, since
+  exhaustiveness does not yet treat a variant holding `Nothing` as impossible. **Review with the
+  user** whether such arms should be dropped from exhaustiveness.
+- Proposed (branch `process-exec`): **`waitPid` and `tryWaitPid` answer `Err(NotFound)` for
+  anything not there to wait for**: a pid that is not this program's child or was already reaped
+  (Sysl's `Other(10)`, `ECHILD`), and a pid of zero or less or past the largest process id (Sysl's
+  `Other(22)` for the first, refused before the call for the second). Why: it matches
+  `residentBytes`, where a process that is not there, a reaped child among them, and a pid of zero
+  or less are `NotFound`, and gives a caller one case to match. `waitPid` is bound `blocking`, as
+  `Child.waitFor` is, and both answer the same mirrored `ExitStatus`. Alternatives weighed:
+  `Other` with a sentence (unmatchable by kind); a trap for a pid of zero or less (a pid read back
+  from saved state is data, not a programming error).
 
 ## Open
 

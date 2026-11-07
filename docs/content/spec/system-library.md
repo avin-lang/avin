@@ -129,11 +129,61 @@ knows is asked for by name, and a program's own settings are its own values.
 | `residentBytes(pid: long) -> Result[long, IoError]` | The memory the process `pid` holds in RAM now, in bytes; `residentBytes(pid())` is the program's own. A process that is not there, a reaped child among them, and a `pid` of zero or less are `Err(NotFound)`; one the program may not look at is `Err(PermissionDenied)`. |
 | `signal(pid: long, sig: int) -> Result[unit, IoError]` | Sends the signal to the process `pid`; a negative `pid` is the group `-pid`, zero the program's own group, and `sig` zero sends nothing and answers whether one could be sent. No such process is `Err(Other("No such process"))`. |
 | `newSession() -> Result[long, IoError]` | Makes the program the leader of a new session and group with no controlling terminal, as a daemon does, answering its number; refused for a program that already leads a group. |
+| `exec(program: string, args: Vector[string]) -> Result[Nothing, IoError]` | Replaces the program with `program` run with `args`, in the same process; see [becoming another program](#becoming-another-program). Answers only if that failed. |
+| `exec(program: string, args: Vector[string], environment: Map[string, string]) -> Result[Nothing, IoError]` | The same, with `environment` as the whole of the new program's environment. |
+| `waitPid(pid: long) -> Result[ExitStatus, IoError]` | Waits for this program's child `pid` to end and answers how it ended, reaping it; see [becoming another program](#becoming-another-program). |
+| `tryWaitPid(pid: long) -> Result[Option[ExitStatus], IoError]` | Whether the child `pid` has ended, without waiting: `None` while it runs, its status (reaping it) once it has. |
 | `os() -> Os` | The operating system the program was compiled for: `MacOS`, `Linux`, `Windows`, `Android`, `Wasi` or `Freestanding`. |
 
 **Nothing sets a variable.** The environment is the program's to read; a program that runs another
 gives it the variables it needs through its [command](#commands), which changes nothing in its own.
 Text ends lines with `\n` on every platform, so there is no line separator to ask for.
+
+### Becoming another program
+
+A long-running program that upgrades itself in place saves its state, becomes the newly installed
+version of itself with `exec`, keeping its process id, and the new image takes up the children the
+old one started, waiting for them by pid:
+
+```text
+import avin.process
+
+upgrade(state: string, jobs: Vector[long]) -> Result[unit, IoError]
+    fs.writeText(state, saved())?
+    process.exec(installed, ["--resume", state] ++ jobs.map(j -> s"$j"))?
+    Ok(())
+
+resume(jobs: Vector[long])
+    for pid in jobs do report(pid, process.waitPid(pid))
+```
+
+**`exec` comes back only when it failed.** On success the process goes on, the same id, the same
+parent and the same working directory, running `program` from its beginning; there is nothing left
+to return to, so its `Ok` side is `Nothing`, and `?` passes the failure on. A program that is not
+there is `Err(NotFound)`, one that may not be run (a directory among them) `Err(PermissionDenied)`,
+and the program then carries on exactly as it was: everything that can fail is checked before
+anything is given up.
+
+**What goes and what stays.** What the program has written to standard output is flushed first.
+Then nothing of it is left: its other threads vanish wherever they were, its
+[exit hooks](#exit-hooks) do not run, and its [signal watches](#avinsignal) end, each signal doing
+again what it does by default. Its standard streams stay; every other descriptor the library opens
+closes across the `exec`, as across a [command's](#commands) start. Its children stay its children.
+
+**Where the program is looked for.** A name with a `/` is a path; a bare name is looked for on the
+`PATH`. `exec(program, args)` gives the new program this program's environment;
+`exec(program, args, environment)` gives it exactly `environment`, nothing inherited, and looks for
+a bare name on the `PATH` that holds, or the system's default search path where it holds none.
+`process.environment().updated("NAME", "value")` adds to this program's own.
+
+**`waitPid` and `tryWaitPid` wait for a child no `Child` holds**: one [detached](#commands), or one
+an earlier image of the process started before it became this program. They answer the
+`ExitStatus` a `Child`'s `waitFor` answers, `Signalled` for a child a signal ended, and the child is
+reaped by the answer. A pid that is not this program's child, a child already waited for, the
+program's own pid, and a pid of zero or less or past the largest process id are each
+`Err(NotFound)`. A thread waiting in `waitPid` leaves its worker to the program's other threads, as
+every [blocking](/spec/threads/#lightweight-threads) wait does. A child a `Child` still holds is
+its `Child`'s to wait for: one reaped by `waitPid` first is no longer there for `waitFor`.
 
 ### Commands
 

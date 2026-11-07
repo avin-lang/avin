@@ -25,9 +25,10 @@ class Avin < Formula
   # `&T` parameter is shared rather than copied, and a socket closes when its last copy goes, from
   # Sysl 0.9.1; the runtime's lightweight threads stand on `sysl.fiber` and `sysl.io.poll`, from Sysl
   # 0.9.6, with a stack's real bounds from 0.9.7; and a command's `detach`, the memory a process holds
-  # and descriptors closed across a program's start come from Sysl 0.9.8. A dependency cannot name a
-  # least version, so it is checked here.
-  MINIMUM_SYSL = "0.9.8".freeze
+  # and descriptors closed across a program's start come from Sysl 0.9.8; `exec` and
+  # waiting for a child by its pid, and a missing process told as not found, from Sysl 0.9.9. A
+  # dependency cannot name a least version, so it is checked here.
+  MINIMUM_SYSL = "0.9.9".freeze
 
   def install
     sysl = Formula["sysl-lang/tap/sysl"]

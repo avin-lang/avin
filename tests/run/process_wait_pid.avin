@@ -1,0 +1,72 @@
+// expect: exit 0
+// Waiting for a child by its pid. A pid that is not this program's child, the program's own, the
+// system's first process, zero, a negative one and one past the largest process id are each
+// `Err(NotFound)`, from `waitPid` and from `tryWaitPid` alike. `tryWaitPid` answers `None` while a
+// child runs (it waits for a file to appear) and its status once it has ended; a child ended by a
+// signal is `Signalled`, whether by 15 or by 9. A program that watches a signal and then `exec`s
+// a shell no longer watches it: the shell's signal to itself ends it. Many threads each blocked in
+// `waitPid` leave the program's other threads running, and every wait answers its own child's status.
+import avin.fs
+import avin.process
+import avin.process.Command
+import avin.signal
+import avin.threads
+import avin.threads.Atomic
+import avin.time
+
+detached(script: string) -> long = Command("/bin/sh", "-c", script).start().ok().get().detach()
+
+// Waits for `file` to appear, then exits with `code`.
+untilMade(file: string, code: int) -> long =
+  detached(s"while [ ! -e '$file' ]; do sleep 0.01; done; exit $code")
+
+// Run as its own program: watches `Terminate`, then becomes a shell that sends itself one.
+watchedThenExec()
+  val watch = signal.watch(signal.Terminate).ok().get()
+  process.exec("/bin/sh", ["-c", "kill -TERM $$; sleep 5; echo the signal was still watched"])
+
+main(args: Vector[string])
+  if args.length() == 1 && args(0) == "watched"
+    watchedThenExec()
+    return
+  val dir = fs.createTempDir("avin-wait-pid").ok().get()
+  // Nothing to wait for.
+  val strangers: Vector[long] = [process.pid(), 1, 0, -1, -2147483648, long(int.MaxValue) + 1, long.MaxValue, long.MinValue]
+  for pid in strangers
+    println(s"${process.waitPid(pid)} ${process.tryWaitPid(pid)}")
+  // A child running, then ended.
+  val gate = s"$dir/gate"
+  val running = untilMade(gate, 4)
+  println(process.tryWaitPid(running))
+  println(process.tryWaitPid(running))
+  fs.writeText(gate, "")
+  println(process.waitPid(running))
+  println(process.tryWaitPid(running))
+  // Ended by a signal.
+  val terminated = detached("sleep 30")
+  println(process.signal(terminated, 15))
+  println(process.waitPid(terminated))
+  val killed = detached("sleep 30")
+  println(process.signal(killed, 9))
+  println(process.waitPid(killed))
+  // A watch ends at `exec`.
+  val watcher = Command(process.executable().get(), "watched").start().ok().get().detach()
+  println(process.waitPid(watcher))
+  // Many threads waiting at once while another thread works.
+  val many = 2 * process.processors() + 2
+  val release = s"$dir/release"
+  val pids = (0..<many).map(i -> untilMade(release, i % 100)).toVector()
+  val waiters = pids.map(pid -> threads.spawn(() -> process.waitPid(pid))).toVector()
+  val counted = Atomic(0)
+  val counter = threads.spawn(() ->
+    for _ in 0..<50
+      threads.sleep(time.millis(1))
+      counted.add(1)
+    counted.load())
+  println(counter.join())
+  fs.writeText(release, "")
+  var right = 0
+  for i in 0..<many
+    if waiters(i).join() == Ok(process.Exited(i % 100)) then right += 1
+  println(right == many)
+  fs.removeDirAll(dir)
