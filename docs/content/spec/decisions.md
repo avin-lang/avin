@@ -4518,13 +4518,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   concurrent build's objects from being evicted under it. Alternatives: a count of objects; no
   trimming.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- Proposed (branch `process-exec`): **`process.exec` and its environment**
+- Settled on the user's delegation 2026-11-06 (branch `process-exec`): **`process.exec` and its environment**
   ([becoming another program](/spec/system-library/#becoming-another-program)).
   `exec(program, args) -> Result[Nothing, IoError]` over Sysl 0.9.9's `sysl.process.exec`,
   inheriting the environment, and an overload `exec(program, args, environment: Map[string,
@@ -4539,7 +4533,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   is where Avin's output is buffered). A `match` over the answer still needs an `Ok(_)` arm, since
   exhaustiveness does not yet treat a variant holding `Nothing` as impossible. **Review with the
   user** whether such arms should be dropped from exhaustiveness.
-- Proposed (branch `process-exec`): **`waitPid` and `tryWaitPid` answer `Err(NotFound)` for
+- Settled on the user's delegation 2026-11-06 (branch `process-exec`): **`waitPid` and `tryWaitPid` answer `Err(NotFound)` for
   anything not there to wait for**: a pid that is not this program's child or was already reaped
   (Sysl's `Other(10)`, `ECHILD`), and a pid of zero or less or past the largest process id (Sysl's
   `Other(22)` for the first, refused before the call for the second). Why: it matches
@@ -4548,6 +4542,12 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   `Child.waitFor` is, and both answer the same mirrored `ExitStatus`. Alternatives weighed:
   `Other` with a sentence (unmatchable by kind); a trap for a pid of zero or less (a pid read back
   from saved state is data, not a programming error).
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
