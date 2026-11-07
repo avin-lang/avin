@@ -4623,14 +4623,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   larger change to how `?` finds the type it returns, left for when a program needs
   `pick(s -> Some(s.toLongOption()? + 1), 0)` to be a `long`). Review with the user: whether a
   lambda that uses `?` should also take part, which needs `?` to work from a result known in shape.
-
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- **Proposed 2026-11-07 (branch `hash-digest`): `avin.crypto`, digests over `sysl.crypto`.**
+- **Settled on the user's delegation 2026-11-07 (branch `hash-digest`): `avin.crypto`, digests over `sysl.crypto`.**
   The module is `avin.crypto`; it has `sha256`, `sha512`, `sha1` and `md5` (each taking a
   `Vector[byte]` or a `string`, hashed as UTF-8, answering a `Vector[byte]`), `hmacSha256` and
   `hmacSha512`, `toHex`, and incremental `Sha256()`, `Sha512()`, `Sha1()` and `Md5()` with `update`
@@ -4651,6 +4644,12 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   `verify` (Sysl has one; add it when a program checks tags). Review with the user: whether `sha1`
   and `md5` belong in the standard library at all, and whether the other SHA-2 widths and `verify`
   should be added now.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
