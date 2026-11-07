@@ -4542,14 +4542,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   `Child.waitFor` is, and both answer the same mirrored `ExitStatus`. Alternatives weighed:
   `Other` with a sentence (unmatchable by kind); a trap for a pid of zero or less (a pid read back
   from saved state is data, not a programming error).
-
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- Proposed 2026-11-07 (branch `fs-rename`): `fs.rename(from, to) -> Result[unit, IoError]` ([system
+- Settled on the user's delegation 2026-11-07 (branch `fs-rename`): `fs.rename(from, to) -> Result[unit, IoError]` ([system
   library](/spec/system-library/)) **replaces** what is at `to`, in one step, and does not refuse.
   A file replaces a file; a directory replaces an empty directory; a directory that holds entries
   is `DirectoryNotEmpty`; a file onto a directory is `IsADirectory`, a directory onto a file
@@ -4561,6 +4554,12 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   atomic write would need a remove first, losing atomicity); two functions, `rename` and
   `renameReplacing`. Across file systems the call fails and moves nothing (`Other`), never copying.
   Review with the user if a refuse-by-default `rename` is preferred.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
