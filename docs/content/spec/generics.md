@@ -365,6 +365,17 @@ infer is.
   and `back(match s -> s.byteLength(), (x: int) -> s"<$x>")` for `back[A, B](g: (B) -> A, f: (A) -> B)`,
   whose `match` takes `B` from the lambda's result. Where none is known, the first one left is
   checked and reports what it cannot infer.
+- A lambda whose parameter types are known takes part in the tiers above by what it yields, as any
+  other argument does: one yielding a value with a type of its own is checked with the arguments
+  that hold no literal, after them, so a number literal beside it takes the type it decides. For
+  `pick[T](read: (string) -> Option[T], absent: T)`, `pick(s -> s.toLongOption(), 0)` takes
+  `T = long`, whichever argument is written first, and `pick(s -> s.toRealOption(), 0)` takes
+  `real`. A lambda yielding a value built around a literal (`s -> Some(1)`) or a literal alone
+  (`s -> 1`) is checked in that tier, after the other arguments of it, and takes their numbers:
+  `yielding(s -> 1, long(5))` is a `long`. The value a lambda yields is the last item of its block,
+  and an `if` or a `match` yields in the lowest tier of its branches. A lambda that leaves its body
+  by `return` or `?`, and a `match` function, are still checked after every other argument, since
+  such a body needs its result type known before it is checked.
 - Two classes join to their nearest common superclass. Where they have none, they join to the trait
   they both conform to that every other trait they share is a parent of: a `Parrot` and a
   `Goldfish` that are both `Pet: Named` join to `Pet`. Where they share several unrelated traits,

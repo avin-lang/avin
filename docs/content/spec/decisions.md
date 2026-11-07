@@ -4589,6 +4589,40 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   pattern is read before anything is written, so a malformed pattern traps as malformed whatever
   value it is given. Alternatives weighed: `DDD` unpadded (a column of days of the year would not
   line up); `Z` for UTC's `z` (a pattern's output would change shape with the zone).
+- **Settled on the user's delegation 2026-11-07 (branch `stop-signals`): `avin.signal` names `Stop`, `Continue`,
+  `TerminalStop` and `Child`.** Each is an `int` numbered by the runtime for the platform
+  (`avin.rt.job_signal`, over Sysl's `STOP`, `CONT`, `TSTP` and `CHLD`, as `User1` and `User2` are
+  over `USR1` and `USR2`), since all four differ between macOS and Linux. **`Stop` cannot be
+  watched**: `watch(Stop)` is `Err(Other("Invalid argument"))`, the refusal `Kill` already gets,
+  because the platform lets nothing catch it. `Continue`, `TerminalStop` and `Child` can be
+  watched like any other signal; a watched `TerminalStop` no longer stops the program, and a
+  watched `Child` is raised whenever a program the program started ends, is stopped or continues.
+  A status a signal ended also names them (`killed by signal 19 (Stop)`), and now names `User1` and
+  `User2`, which it called "unknown". Why: a supervisor pauses a job's process group with `Stop`
+  and `Continue`, and needs `Child` to see an end that races a restart; an `Err`, not a trap, is
+  the existing treatment of a signal that cannot be watched, and a refusal is a value the caller
+  can act on. Alternatives weighed: a trap on `watch(Stop)` (inconsistent with `Kill`, and a
+  platform-dependent number would make "this one traps" a hidden fact of the platform); leaving
+  `Stop` out of the library and sending a literal number (the number is not portable); spelling
+  `Continue` as `Cont` (the library spells every other name out). Review with the user: whether
+  `TerminalStop` should be left unwatchable, as a program that traps Ctrl-Z rarely means to.
+- Settled on the user's delegation 2026-11-07 (branch `lambda-after-literal`): **A lambda's result takes part in a call's literal tiers**
+  ([generics](/spec/generics/#inference)). A lambda whose parameter types are known is checked in
+  the tier of the value it yields (the last item of its block; the lowest tier among an `if`'s or a
+  `match`'s branches), after the other arguments of that tier, rather than after every argument. So
+  `pick(s -> s.toLongOption(), 0)` for `pick[T](read: (string) -> Option[T], absent: T)` takes
+  `T = long`, as passing a named function does, and `pick(s -> s.toRealOption(), 0)` takes `real`;
+  a lambda yielding `Some(1)` or `1` takes the numbers the other arguments decide. A lambda that
+  leaves its body by `return` or `?`, and a `match` function, are still checked last, since such a
+  body needs its result type known before it is checked. Why: the settled number-literal decision
+  says a literal gives way to a type from a neighbour, and a lambda's result is a neighbour; a
+  lambda checked last let the `0` fix `T = int` first, so the lambda and a named function of the
+  same type behaved differently (marshal met it). Alternatives: deferring the literal instead of
+  advancing the lambda (the same order in effect, but it reaches only literals, not the lambda's own
+  literal result); checking a lambda with `?` early against a result type known only in shape (a
+  larger change to how `?` finds the type it returns, left for when a program needs
+  `pick(s -> Some(s.toLongOption()? + 1), 0)` to be a `long`). Review with the user: whether a
+  lambda that uses `?` should also take part, which needs `?` to work from a result known in shape.
 
 **Deferred**
 
