@@ -4571,14 +4571,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   `Stop` out of the library and sending a literal number (the number is not portable); spelling
   `Continue` as `Cont` (the library spells every other name out). Review with the user: whether
   `TerminalStop` should be left unwatchable, as a program that traps Ctrl-Z rarely means to.
-
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- Proposed (branch `lambda-after-literal`): **A lambda's result takes part in a call's literal tiers**
+- Settled on the user's delegation 2026-11-07 (branch `lambda-after-literal`): **A lambda's result takes part in a call's literal tiers**
   ([generics](/spec/generics/#inference)). A lambda whose parameter types are known is checked in
   the tier of the value it yields (the last item of its block; the lowest tier among an `if`'s or a
   `match`'s branches), after the other arguments of that tier, rather than after every argument. So
@@ -4595,6 +4588,12 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   larger change to how `?` finds the type it returns, left for when a program needs
   `pick(s -> Some(s.toLongOption()? + 1), 0)` to be a `long`). Review with the user: whether a
   lambda that uses `?` should also take part, which needs `?` to work from a result known in shape.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
