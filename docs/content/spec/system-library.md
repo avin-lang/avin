@@ -372,10 +372,19 @@ serve() -> Result[unit, IoError]
 | `Terminate` | 15: asks a program to stop; what `Child.kill` sends. |
 | `WindowChange` | 28: the terminal was resized. |
 | `User1`, `User2` | The user-defined signals, numbered as the platform numbers them. |
+| `Stop` | Freezes a program until a `Continue` arrives; numbered as the platform numbers it. It cannot be watched, as `Kill` cannot ([proposed](/spec/decisions/#proposed)). |
+| `Continue` | Lets a stopped program run again; one that was not stopped is not disturbed. Numbered as the platform numbers it. |
+| `TerminalStop` | Ctrl-Z at the terminal; a program that watches it is not stopped. Numbered as the platform numbers it. |
+| `Child` | A program this one started has ended, stopped or continued. The platform ignores it unless it is watched; numbered as the platform numbers it. |
+
+Sending `Stop` and then `Continue` with `process.signal` or `Child.signal` pauses and resumes one
+program; a negative `pid`, or `signalGroup` on a command started `inNewGroup`, pauses a child and
+every program it started in the group together. A status a signal ended names each of these, as
+`killed by signal 19 (Stop)`.
 
 | Function | Meaning |
 | --- | --- |
-| `watch(sig: int) -> Result[Watch, IoError]` | Starts watching `sig`. A number the platform does not have, `Kill` and the stop signal are `Err(Other("Invalid argument"))`. |
+| `watch(sig: int) -> Result[Watch, IoError]` | Starts watching `sig`. A number the platform does not have, `Kill` and `Stop` are `Err(Other("Invalid argument"))`. |
 | `w.take() -> bool` | Whether it arrived since the last `take` or since the watch began, marking it seen. Arrivals between two takes are one `true`. |
 | `w.wait()` | Parks until it arrives, then takes it. |
 | `w.wait(limit: Duration) -> bool` | The same, giving up after `limit`, and answering whether it arrived. |
