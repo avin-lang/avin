@@ -21,7 +21,7 @@ the standard library — in one run.
 | Monomorphize | typed HIR → mono HIR | Instantiates functions, types and generic trait methods for every use, and computes the dispatch for trait-typed calls over the closed world. |
 | Lower | mono HIR → MIR | Explicit control flow, object layouts and headers, type descriptors, vtables, closures and environments, allocation, GC root slots, traps. |
 | Emit | MIR → LLVM IR | Spelling only: no typing, layout or semantic decisions. |
-| Link | `.ll` + runtime + shim → executable | clang; the runtime library; the cached shim library; the C unit's object and the C libraries' link flags. |
+| Link | `.ll` + runtime + shim → executable | The module cut into codegen units, each compiled by its own clang at once and its object cached by its text; then clang links the objects, the runtime library, the cached shim library, the C unit's object and the C libraries' link flags. |
 
 Each stage has its own data structures and its own tests. No stage reaches back into an earlier stage's
 input. **Types are an enum over symbols, never strings**: built-in types, nominal types, functions,
@@ -134,6 +134,26 @@ them in a file beside the archive, `<archive>.link`, one to a line (`lib sqlite3
 written before the archive is published; an archive found without it is built again. The link
 passes each `lib` as `-l<name>`, leaving out `c` and `m`, which every program is linked with, and
 then the words `pkg-config --libs` prints for the `pkg` modules, asked at every link.
+
+**Codegen units.** clang compiles one module on one thread, so the link cuts the program's LLVM
+text into codegen units and compiles them at once, one clang each (`codegen_units.sysl`):
+one unit per processor, at most eight, none smaller than 256 KiB of text, and one module as before
+for text under 512 KiB; `AVIN_CODEGEN_UNITS=<n>` sets the number, 1 restoring the single module.
+`emit-llvm` still writes the one module. A function only one other function names is placed in
+that function's unit, following a chain of them to its head, so it stays local and is still inlined
+into its one caller; every other function is placed by a hash of its name. A global
+lives in the first unit that names it, an alias with the global it points into, and a global nothing
+names in the first unit. A local named from another unit is promoted: renamed `avin.cgu:<name>`, which
+no Avin, Sysl or C symbol can spell, and given hidden linkage, visible to the link's other objects
+and to nothing after it. At `-O2` a function whose body costs at most 32 instructions, and a
+constant whose line is at most 2 KiB, is also copied as `available_externally` into each unit that
+names it, so a call or a read across units can still be inlined or folded while the program keeps
+one definition of each. A module holding `module asm`, a comdat or an `ifunc` (emission writes
+none) stays whole. Each unit's object is kept under `units/` in the toolchain's cache, keyed by the
+compiler's and clang's versions, the level and the unit's text, so an edit recompiles only the units
+whose text it changed; a build that compiled a unit trims the directory to 1 GiB, oldest first,
+sparing whatever was used in the last hour. The test corpus, which builds each program once,
+keeps none.
 
 A Sysl diagnostic is placed by its line in the shim: the driver records the line of each binding's
 import and the lines of its function, and reports the message at the binding's name as `the Sysl

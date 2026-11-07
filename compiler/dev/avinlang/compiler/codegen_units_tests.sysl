@@ -1,0 +1,251 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all}
+import sysl.process.{Exited, capture}
+
+// Codegen units: a module cut into units, each unit compiled on its own, and the objects linked.
+
+// A module of eight functions, a string constant reached through an alias, a mutable global, and a
+// runtime declaration: everything local, as emission writes a program. Every function but `lonely`
+// and `other` has two callers; `lonely` has one, `main`, and nothing calls `other`.
+private const Sample: string = "; a program\ndeclare i32 @puts(ptr)\n\n@text.const = private constant { i64, [6 x i8] } { i64 5, [6 x i8] c\"hello\\00\" }, align 16\n@text = private alias i8, ptr getelementptr inbounds (i8, ptr @text.const, i64 8)\n@count = private global i64 0, align 8\n@unused = private constant i64 7, align 8\n\ndefine internal tailcc i64 @\"<program>.one\"(i64 %v0) {\nb0:\n  %r = add i64 %v0, 1\n  ret i64 %r\n}\n\ndefine internal tailcc i64 @\"<program>.two\"(i64 %v0) {\nb0:\n  %r = call tailcc i64 @\"<program>.one\"(i64 %v0)\n  %s = mul i64 %r, 2\n  ret i64 %s\n}\n\ndefine internal tailcc i64 @\"<program>.three\"(i64 %v0) {\nb0:\n  %r = call tailcc i64 @\"<program>.two\"(i64 %v0)\n  %c = load i64, ptr @count\n  %d = add i64 %c, %r\n  store i64 %d, ptr @count\n  ret i64 %d\n}\n\ndefine internal void @\"<program>.say\"() {\nb0:\n  %r = call i32 @puts(ptr @text)\n  ret void\n}\n\ndefine internal void @\"<program>.sayTwice\"() {\nb0:\n  call void @\"<program>.say\"()\n  call void @\"<program>.say\"()\n  ret void\n}\n\ndefine internal tailcc i64 @\"<program>.other\"(i64 %v0) {\nb0:\n  call void @\"<program>.sayTwice\"()\n  call void @\"<program>.say\"()\n  %a = call tailcc i64 @\"<program>.one\"(i64 %v0)\n  %b = call tailcc i64 @\"<program>.two\"(i64 %a)\n  %c = call tailcc i64 @\"<program>.three\"(i64 %b)\n  ret i64 %c\n}\n\ndefine internal tailcc i64 @\"<program>.lonely\"(i64 %v0) {\nb0:\n  ret i64 %v0\n}\n\ndefine i32 @main(i32 %argc, ptr %argv) {\nb0:\n  call void @\"<program>.sayTwice\"()\n  %a = call tailcc i64 @\"<program>.three\"(i64 4)\n  %b = call tailcc i64 @\"<program>.three\"(i64 1)\n  %l = call tailcc i64 @\"<program>.lonely\"(i64 %b)\n  %c = trunc i64 %l to i32\n  ret i32 %c\n}\n"
+
+// The names `Sample` defines functions under.
+private sample_functions() -> Buf[string]
+    var names: Buf[string] = buf()
+    for n in ["\"<program>.one\"", "\"<program>.two\"", "\"<program>.three\"", "\"<program>.say\"", "\"<program>.sayTwice\"", "\"<program>.other\"", "\"<program>.lonely\"", "main"]
+        names.push(n)
+    names
+
+// How many times `needle` occurs in `text`.
+private occurrences(text: string, needle: string) -> int
+    var n = 0
+    var at: usize = 0
+    loop
+        text.index_of_from(needle, at) match
+            Some(k) ->
+                n += 1
+                at = k + needle.len
+            None -> return n
+
+// The name a unit defines a function under, promoted or not, as its definition line spells it.
+private defined_in(unit: string, name: string) -> bool
+    val promoted = if name.starts_with("\"") then "@\"avin.cgu:" + name[1..] else "@\"avin.cgu:" + name + "\""
+    for line in unit.split("\n")
+        if line.starts_with("define ") && !line.starts_with("define available_externally ") && (line.contains("@" + name + "(") || line.contains(promoted + "("))
+            return true
+    false
+
+@test("a module's units define each of its functions exactly once, and every unit defines something")
+units_define_each_function_once()
+    for n in [2, 3, 4, 8, 64]
+        for copies in [false, true]
+            val units = split_module(Sample, n, copies).unwrap()
+            assert(2 <= units.len() <= usize(n))
+            for name in sample_functions()
+                var homes = 0
+                for u in units
+                    if defined_in(u, name) then homes += 1
+                assert_eq(homes, 1)
+            for u in units
+                assert(u.contains("\ndefine ") || u.starts_with("define ") || u.contains(" = hidden ") || u.contains(" = private "))
+                // Every unit carries the declarations it needs, and comments stay behind.
+                assert(!u.contains("; a program"))
+
+@test("a module of one function, or one asked to make one unit, is not cut")
+one_function_is_not_cut()
+    val one = "declare i32 @puts(ptr)\n@s = private constant [3 x i8] c\"hi\\00\"\n\ndefine i32 @main(i32 %argc, ptr %argv) {\nb0:\n  %r = call i32 @puts(ptr @s)\n  ret i32 0\n}\n"
+    assert(split_module(one, 8, true) is None)
+    assert(split_module(Sample, 1, true) is None)
+    assert(split_module(Sample, 0, false) is None)
+    assert(split_module("", 8, false) is None)
+
+@test("a module holding module asm, a comdat or an ifunc is never cut")
+unsplittable_modules_stay_whole()
+    assert(split_module("module asm \"nop\"\n" + Sample, 8, false) is None)
+    assert(split_module("$c = comdat any\n" + Sample, 8, false) is None)
+    assert(split_module(Sample + "@f = ifunc void (), ptr @r\n", 8, false) is None)
+
+@test("an alias lives in the unit that defines its global, and a unit naming it from elsewhere declares it hidden")
+alias_stays_with_its_global()
+    for n in [2, 3, 4, 8]
+        val units = split_module(Sample, n, false).unwrap()
+        var homes = 0
+        for u in units
+            val has_alias = u.contains("@text = private alias") || u.contains("@\"avin.cgu:text\" = hidden alias")
+            val has_global = u.contains("@text.const = private constant") || u.contains("@\"avin.cgu:text.const\" = hidden constant")
+            assert_eq(has_alias, has_global)
+            if has_alias then homes += 1
+            if u.contains("@\"avin.cgu:text\" = external") then assert(u.contains("@\"avin.cgu:text\" = external hidden global i8\n"))
+        assert_eq(homes, 1)
+        // A global nothing names is kept, once.
+        var unused = 0
+        for u in units
+            unused += occurrences(u, "@unused = private constant")
+        assert_eq(unused, 1)
+
+@test("a local named across units is promoted to a hidden name no other symbol can spell; one named only at home stays local")
+promotion_renames_only_what_crosses()
+    val units = split_module(Sample, 64, false).unwrap()
+    var all = ""
+    for u in units
+        all = all + u
+    // With a unit per function, every call crosses a unit, so each callee is promoted.
+    assert(all.contains("define hidden tailcc i64 @\"avin.cgu:<program>.one\"(i64 %v0) {"))
+    assert(all.contains("declare hidden tailcc i64 @\"avin.cgu:<program>.one\"(i64 %v0)\n"))
+    assert(all.contains("declare hidden void @\"avin.cgu:<program>.say\"()\n"))
+    // `main` is external already, and nothing calls it.
+    assert(all.contains("define i32 @main(i32 %argc, ptr %argv) {"))
+    assert(!all.contains("avin.cgu:main"))
+    // The runtime's declaration is copied where it is needed, never renamed.
+    assert(all.contains("declare i32 @puts(ptr)\n"))
+    assert(!all.contains("avin.cgu:puts"))
+    // Nothing keeps an unrenamed reference to a promoted local.
+    assert(!all.contains("@\"<program>.one\""))
+    assert(!all.contains("@\"<program>.say\""))
+
+@test("a function only one function calls is placed in its caller's unit and stays local; a chain of them follows its head")
+sole_caller_shares_its_unit()
+    for n in [2, 3, 8, 64]
+        val units = split_module(Sample, n, true).unwrap()
+        var together = 0
+        for u in units
+            if u.contains("define internal tailcc i64 @\"<program>.lonely\"(i64 %v0) {") && u.contains("define i32 @main(")
+                together += 1
+            assert(!u.contains("avin.cgu:<program>.lonely"))
+        assert_eq(together, 1)
+    // A chain: `a` is called only by `b`, `b` only by `c`; all three share `c`'s unit, for any count.
+    val chain = "define internal void @a() {\nb0:\n  ret void\n}\n\ndefine internal void @b() {\nb0:\n  call void @a()\n  ret void\n}\n\ndefine internal void @c() {\nb0:\n  call void @b()\n  ret void\n}\n\ndefine internal void @d() {\nb0:\n  ret void\n}\n\ndefine i32 @main() {\nb0:\n  call void @c()\n  call void @d()\n  call void @c()\n  call void @d()\n  ret i32 0\n}\n"
+    // Everything but nothing has one caller here, so the module is one unit's worth.
+    assert(split_module(chain, 64, false) is None)
+    // A cycle of only callers is placed by the hash and still defines each function once.
+    val cycle = "define internal void @p() {\nb0:\n  call void @q()\n  ret void\n}\n\ndefine internal void @q() {\nb0:\n  call void @p()\n  ret void\n}\n\ndefine i32 @main() {\nb0:\n  ret i32 0\n}\n"
+    split_module(cycle, 64, false) match
+        Some(units) ->
+            var homes = 0
+            for u in units
+                if u.contains("define internal void @p()") || u.contains("define hidden void @\"avin.cgu:p\"()") then homes += 1
+            assert_eq(homes, 1)
+        None -> ()
+
+@test("at -O2 a small function is copied into the units that call it as available_externally; at -O0 nothing is")
+small_functions_copied_only_when_optimizing()
+    val plain = split_module(Sample, 64, false).unwrap()
+    for u in plain
+        assert(!u.contains("available_externally"))
+    val copied = split_module(Sample, 64, true).unwrap()
+    var all = ""
+    for u in copied
+        all = all + u
+    assert(all.contains("define available_externally hidden tailcc i64 @\"avin.cgu:<program>.one\"(i64 %v0) {"))
+    // A copy names what it calls, which its unit declares.
+    for u in copied
+        if u.contains("define available_externally hidden tailcc i64 @\"avin.cgu:<program>.two\"")
+            assert(u.contains("@\"avin.cgu:<program>.one\"(i64 %v0)"))
+
+@test("body_cost counts instructions, not labels, branches, slots or their loads and stores")
+body_cost_counts_instructions()
+    val body = "b0:\n  %s0 = alloca i64\n  store i64 1, ptr %s0\n  %a = load i64, ptr %s0\n  %b = add i64 %a, 1\n  br label %b1\nb1:\n  %c = load i64, ptr %p\n  ret i64 %b\n}\n"
+    assert_eq(body_cost(body, 0, body.len), 3usize)
+    assert_eq(body_cost("", 0, 0), 0usize)
+
+@test("the unit count is AVIN_CODEGEN_UNITS when it is set, else one per processor up to eight, and one for small text")
+unit_count_follows_size_processors_and_override()
+    assert_eq(units_for(100, 18, ""), 1)
+    assert_eq(units_for(524287, 18, ""), 1)
+    assert_eq(units_for(524288, 18, ""), 2)
+    assert_eq(units_for(34000000, 18, ""), 8)
+    assert_eq(units_for(34000000, 4, ""), 4)
+    assert_eq(units_for(34000000, 1, ""), 1)
+    assert_eq(units_for(100, 18, "3"), 3)
+    assert_eq(units_for(34000000, 18, "1"), 1)
+    assert_eq(units_for(34000000, 18, "1000"), 64)
+    // Anything but a count from 1 up is no override.
+    assert_eq(units_for(34000000, 18, "0"), 8)
+    assert_eq(units_for(34000000, 18, "x"), 8)
+    assert_eq(units_for(34000000, 18, "-4"), 8)
+
+// Compiles `units` with clang at `level`, links them, and answers what the program printed and its
+// exit status.
+private run_units(units: Buf[string], dir: string, level: string, cache: string) -> (string, int, int)
+    val compiled = compile_units("clang", units, dir, level, cache).unwrap()
+    var args: Buf[string] = buf()
+    for o in compiled.objects
+        args.push(o)
+    args.push("-o")
+    args.push(dir + "/program")
+    val linked = capture("clang", args.view(), stderr = true, timeout = 60000).unwrap()
+    if !linked.status.ok() then panic(linked.err.unwrap_or("") + linked.text)
+    val ran = capture(dir + "/program", timeout = 10000).unwrap()
+    val code = ran.status match
+        Exited(c) -> c
+        _ -> -1
+    (ran.text, code, compiled.compiled)
+
+@test("units that name each other's locals, an alias's string and a global link and run as the one module did, at -O0 and -O2")
+cut_module_links_and_runs()
+    val dir = make_temp_dir("avin-cgu-run").unwrap()
+    defer _ = remove_dir_all(dir)
+    for n in [2, 3, 8, 64]
+        for level in ["-O0", "-O2"]
+            val units = split_module(Sample, n, level != "-O0").unwrap()
+            val (out, code, compiled) = run_units(units, dir, level, "")
+            assert_eq(out, "hello\nhello\n")
+            // three(4) = 10, then three(1) = 10 + 4, which `lonely` answers as it is.
+            assert_eq(code, 14)
+            assert_eq(compiled, int(units.len()))
+
+@test("a unit whose text was compiled before is taken from the cache, and an edit recompiles only the unit it changed")
+unit_objects_are_cached_by_text()
+    val dir = make_temp_dir("avin-cgu-cache").unwrap()
+    defer _ = remove_dir_all(dir)
+    val cache = dir + "/units"
+    val units = split_module(Sample, 64, false).unwrap()
+    val (_, _, first) = run_units(units, dir, "-O0", cache)
+    assert_eq(first, int(units.len()))
+    val (out, code, again) = run_units(units, dir, "-O0", cache)
+    assert_eq(again, 0)
+    assert_eq(out, "hello\nhello\n")
+    assert_eq(code, 14)
+    // The same text at another level is another object.
+    val (_, _, other) = run_units(units, dir, "-O2", cache)
+    assert_eq(other, int(units.len()))
+    // One function's body edited: only its own unit's text changes.
+    val edited = split_module(Sample.replace_all("%s = mul i64 %r, 2", "%s = mul i64 %r, 3"), 64, false).unwrap()
+    val (_, code3, changed) = run_units(edited, dir, "-O0", cache)
+    assert_eq(changed, 1)
+    // three(4) = 15, then three(1) = 15 + 6.
+    assert_eq(code3, 21)
+
+@test("a program whose private function and top-level string are used across units links and runs at -O0 and -O2")
+program_with_private_symbols_across_units()
+    val tc = repository_toolchain()
+    var text = "val greeting = \"hello\"\n\nprivate helper(n: int) -> string = greeting + \" \" + n.toString()\n\n"
+    for i in 0..<12
+        text = text + s"f$i() -> string = helper($i)\n\n"
+    text = text + "main()\n"
+    for i in 0..<12
+        text = text + s"    println(f$i())\n"
+    val compiled = compile(tc, source_of("units.avin", text))
+    if compiled.diagnostics != "" then panic(compiled.diagnostics)
+    val llvm = compiled.llvm.unwrap_or("")
+    // The helper is defined in one unit and called from others, which declare it promoted.
+    val units = split_module(llvm, 8, false).unwrap()
+    var callers = 0
+    for u in units
+        if u.contains("declare hidden tailcc ptr @\"avin.cgu:<program>.helper\"") then callers += 1
+    assert(callers >= 1)
+    var expected = ""
+    for i in 0..<12
+        expected = expected + s"hello $i\n"
+    val dir = make_temp_dir("avin-cgu-program").unwrap()
+    defer _ = remove_dir_all(dir)
+    for level in ["-O0", "-O2"]
+        for n in [1, 8]
+            link(tc, llvm, compiled.archive, dir + "/units", level, compiled.c_link, units = n, keep_units = false).unwrap()
+            val ran = capture(dir + "/units", timeout = 10000).unwrap()
+            assert(ran.status.ok())
+            assert_eq(ran.text, expected)

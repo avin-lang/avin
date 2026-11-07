@@ -4499,6 +4499,31 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   to observe it, and the flake stays); report the permission error only for a group the program did
   not start (not reachable, since `signalGroup` only names groups of its own commands).
 
+- Proposed (branch `parallel-codegen`): **A build compiles the program's LLVM text as codegen units
+  at once, one clang each, at most eight, and keeps each unit's object in the toolchain's cache by
+  its text.** A function only one function calls goes with its caller (kept local, so still inlined
+  there: without this a hot single-caller function across a cut ran ~6% slower at `-O2`); other
+  functions are placed by a hash of their name, globals with their first user, aliases
+  with their global; a local crossing units is promoted to a hidden `avin.cgu:` name; at `-O2` small
+  functions (body cost at most 32) and short constants are copied `available_externally` into the
+  units that use them. Why: clang -O2 on one 34 MB module was ~10 s of a 15 s rebuild of tui's `top`
+  on one core of eighteen; the hash placement keeps an edit to one function inside one unit, so the
+  cache recompiles one unit. Eight: on a machine of six performance and twelve efficiency cores more
+  units land on the slow cores and repeat more declarations and copies (the same cap Sysl's builds
+  measured). Alternatives weighed: units balanced greedily by size (better balance, but every edit
+  that shifts a size reshuffles the units and defeats the cache); copying small local functions as
+  local copies (cheaper, but a function would have one address per unit); no copies at `-O2` (a
+  call across units could never be inlined); no object cache (a one-line edit recompiles every
+  unit); one unit per processor without a cap. `AVIN_CODEGEN_UNITS` overrides the count. **Review
+  with the user** only if `-O2` run-time performance across units ever shows up in a profile: the
+  copy limit is the knob.
+- Proposed (branch `parallel-codegen`): **The cache of unit objects is trimmed to 1 GiB**, oldest
+  first, after a build that compiled a unit, sparing anything used in the last hour; a reused
+  object's time is refreshed. The test corpus links without keeping objects. Why: a build of `top`
+  keeps ~8 objects of a few MB per level, so 1 GiB holds dozens of builds; the hour keeps a
+  concurrent build's objects from being evicted under it. Alternatives: a count of objects; no
+  trimming.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
