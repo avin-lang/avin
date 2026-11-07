@@ -1,0 +1,645 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.env.get
+import sysl.fs.{entries, make_dir_all, metadata, pending_name, publish_file, remove_file, set_modified, write_text}
+import sysl.cpu_count
+import sysl.process.{Child, capture, start}
+import sysl.slices.sort_by
+import sysl.text.{StrBuilder, from_utf8_unchecked, str_builder}
+import sysl.time.now
+
+// **A program's LLVM text compiled as several modules at once: codegen units.**
+//
+// Emission produces one module, and clang turns one module into one object on one thread, which on
+// a program of any size is most of the time a build takes. Here the module is cut into units after
+// emission, each unit is compiled by its own clang at the same time as the others, and the objects
+// are linked where the one text used to be. `emit-llvm` still prints the whole program as one
+// module: the cut is only a fact about how a build hands that text to clang.
+//
+// ==What goes where==
+//
+// Everything a program defines is local to its module (`internal`, `private`), so nothing places
+// itself the way an exported symbol would. **Every function is placed by a hash of its name**, which
+// keeps a unit's contents stable when one function is edited: the edited function's unit changes and
+// the others keep their text, so their objects are taken from the cache (below). A global follows
+// its users: it lives in the first unit found to name it, and an alias lives with the global it
+// points into, since an alias cannot point at a declaration. A global nothing names lives in the
+// first unit.
+//
+// **A local named from a unit other than its own is promoted**: renamed `avin.cgu:<name>`, a name no
+// Avin, Sysl or C symbol can spell, so it can meet nothing else at the link, and given hidden
+// linkage, which every object of the one link sees and nothing after it does. A unit is then its own
+// definitions, a declaration of everything else it names, and every module-level line of the text.
+//
+// **At `-O2` a small function is also copied into the units that call it**, as an
+// `available_externally` definition: one definition still exists at the link, so the function has
+// one address, and the caller's optimizer can still inline the body, which a call across units could
+// otherwise never be. A constant with a short initializer is copied the same way, so a unit that
+// reads it can still fold the read. At `-O0` nothing is inlined, so nothing is copied.
+//
+// ==The object cache==
+//
+// A unit's object is kept in the toolchain's cache under a key over the compiler's version, clang's
+// version, the optimization level and the unit's text, so a build after an edit compiles only the
+// units whose text changed. Reusing an object refreshes its age, and a build that compiled anything
+// trims the cache to `UnitCacheBytes`, oldest first, sparing what was used in the last hour.
+
+/** The most units a build makes of its own accord: one per processor up to this. Past it a machine's
+ * efficiency cores take units at a fraction of the speed of the performance ones, and each unit
+ * repeats the declarations and copies it needs. */
+const DefaultMaxUnits: int = 8
+
+/** The most units `AVIN_CODEGEN_UNITS` may ask for. */
+const MaxUnits: int = 64
+
+/** Text below this is compiled as one module: spawning clangs costs more than the cut saves. */
+const MinSplitBytes: usize = 524288
+
+/** Each unit gets at least this much text, so a program just past `MinSplitBytes` makes fewer units. */
+const MinUnitBytes: usize = 262144
+
+/** A function whose body costs at most this (`body_cost`) is copied into the units that call it at
+ * `-O2`. */
+const CopyCost: usize = 32
+
+/** A constant whose initializer is at most this long is copied into the units that read it at
+ * `-O2`. */
+const CopyInitLimit: usize = 2048
+
+/** What a promoted local's name is given in front. */
+const Promoted: string = "avin.cgu:"
+
+/** What the cache of unit objects is trimmed to after a build that compiled a unit. */
+const UnitCacheBytes: long = 2147483648
+
+/** What a build never evicts from the cache of unit objects, however full: anything used this
+ * recently, in microseconds. */
+const UnitCacheFresh: long = 3600000000
+
+/** The format of a kept unit object, in its key: changed when what a unit is changes. */
+const UnitFormat: string = "avin-cgu-1"
+
+/** How many units a module of `size` bytes is compiled as: `AVIN_CODEGEN_UNITS` where it is set to a
+ * number from 1 up, and otherwise one per processor, at most `DefaultMaxUnits`, and no more than the
+ * text divides into `MinUnitBytes` pieces. */
+codegen_units(size: usize) -> int = units_for(size, int(cpu_count()), get("AVIN_CODEGEN_UNITS").unwrap_or(""))
+
+/** `codegen_units` for a machine of `cpus` processors and an `AVIN_CODEGEN_UNITS` of `asked`. */
+units_for(size: usize, cpus: int, asked: string) -> int
+    if asked != ""
+        val n = parse_count(asked)
+        if n >= 1 then return if n > MaxUnits then MaxUnits else n
+    if size < MinSplitBytes then return 1
+    var n = if cpus < DefaultMaxUnits then cpus else DefaultMaxUnits
+    val by_size = int(size / MinUnitBytes)
+    if by_size < n then n = by_size
+    if n < 1 then 1 else n
+
+// A decimal count, or 0 where the text is not one.
+private parse_count(text: string) -> int
+    var n = 0
+    for b in text.bytes
+        if b < u8('0') || b > u8('9') then return 0
+        if n > 100000 then return 0
+        n = n * 10 + int(b - u8('0'))
+    n
+
+// --- reading the module ------------------------------------------------------------------------
+
+/** What a top-level piece of the module text is. */
+private enum Piece
+    /** A line every unit carries: metadata, a type, an attribute group. */
+    PieceLine
+    /** A function definition, from `define` to its closing brace. */
+    PieceDefine
+    /** A function declaration, or an `external` global: a line naming something no unit defines. */
+    PieceDeclare
+    /** A global variable or constant. */
+    PieceGlobal
+    /** An alias, which lives in the unit of the global it points into. */
+    PieceAlias
+
+private struct Entity
+    piece: Piece
+    start: usize
+    /** Past the entity's last newline. */
+    end: usize
+    /** The symbol as written after '@', quotes included. */
+    name: string
+    /** `private` or `internal`. */
+    local: bool
+    /** A definition's `body_cost`; nothing else has one. */
+    cost: usize
+
+/** The module cut into its top-level pieces, with what each one names. */
+private struct Module
+    text: string
+    items: Buf[Entity]
+    /** Item i names `refs[ref_start[i] ..< ref_start[i + 1]]`. */
+    ref_start: Buf[usize]
+    refs: Buf[usize]
+    named: Map[string, usize]
+
+/** The module's pieces, or nothing where it holds something whose meaning depends on being in one
+ * module: `module asm`, a comdat, an `ifunc` or an `appending` global. */
+private read_module(text: string) -> Option[Module]
+    val b = text.bytes
+    var items: Buf[Entity] = buf()
+    var at: usize = 0
+    while at < b.len
+        val eol = line_end(b, at)
+        val line = text[at..<eol]
+        val next = if eol < b.len then eol + 1 else eol
+        if line.starts_with("define ")
+            var close = next
+            loop
+                if close >= b.len then return None
+                val e = line_end(b, close)
+                val past = if e < b.len then e + 1 else e
+                if e - close == 1 && b[close] == u8('}')
+                    close = past
+                    break
+                close = past
+            items.push(Entity(PieceDefine, at, close, symbol_after(line), is_local_define(line), body_cost(text, next, close)))
+            at = close
+        elif line.starts_with("declare ")
+            items.push(Entity(PieceDeclare, at, next, symbol_after(line), false, 0))
+            at = next
+        elif line.starts_with("@")
+            val rest = global_rest(line)
+            val local = rest.starts_with("private ") || rest.starts_with("internal ")
+            val kind = global_kind(line)
+            if kind == "alias" && local
+                items.push(Entity(PieceAlias, at, next, symbol_after(line), true, 0))
+            elif kind == "global" || kind == "constant"
+                val piece = if rest.starts_with("external ") then PieceDeclare else PieceGlobal
+                items.push(Entity(piece, at, next, symbol_after(line), local, 0))
+            else
+                return None
+            at = next
+        elif line.starts_with("module asm") || line.starts_with("$")
+            return None
+        elif line.starts_with(";") || line == ""
+            // A comment or a blank line between definitions: no unit needs it.
+            at = next
+        else
+            items.push(Entity(PieceLine, at, next, "", false, 0))
+            at = next
+    var named: Map[string, usize] = map()
+    for i in 0..<items.len()
+        if items[i].piece != PieceLine then named.put(items[i].name, i)
+    var ref_start: Buf[usize] = buf()
+    var refs: Buf[usize] = buf()
+    for i in 0..<items.len()
+        ref_start.push(refs.len())
+        val e = items[i]
+        if e.piece == PieceDefine || e.piece == PieceGlobal || e.piece == PieceAlias
+            // A global's own name opens its line, and is not a use of itself.
+            val from = if e.piece == PieceDefine then e.start else e.start + 1 + e.name.len
+            scan_symbols(b, from, e.end, &named, i, &refs)
+    ref_start.push(refs.len())
+    Some(Module(text, items, ref_start, refs, named))
+
+private line_end(b: []const u8, from: usize) -> usize
+    var i = from
+    while i < b.len && b[i] != u8('\n')
+        i += 1
+    i
+
+/** The first symbol on a line, `@name` or `@"quoted name"`, as written after the '@'. */
+private symbol_after(line: string) -> string
+    val b = line.bytes
+    var i: usize = 0
+    while i < b.len && b[i] != u8('@')
+        i += 1
+    if i >= b.len then return ""
+    line[i + 1..<symbol_end(b, i + 1)]
+
+/** Where a symbol starting at `i`, just past its '@', ends. */
+private symbol_end(b: []const u8, i: usize) -> usize
+    var j = i
+    if j < b.len && b[j] == u8('"')
+        j += 1
+        while j < b.len && b[j] != u8('"')
+            j += 1
+        return if j < b.len then j + 1 else j
+    while j < b.len && ident_byte(b[j])
+        j += 1
+    j
+
+private ident_byte(c: u8) -> bool = u8('a') <= c <= u8('z') || u8('A') <= c <= u8('Z') || u8('0') <= c <= u8('9') || c == u8('.') || c == u8('_') || c == u8('$') || c == u8('-')
+
+private is_local_define(line: string) -> bool = line.starts_with("define private ") || line.starts_with("define internal ")
+
+/** What follows `@name = ` on a global's line. */
+private global_rest(line: string) -> string
+    val e = symbol_end(line.bytes, 1)
+    if e + 3 > line.bytes.len then "" else line[e + 3..]
+
+/** The word that says what a global's line defines: `global`, `constant`, `alias`, `ifunc`, or
+ * `appending`, read from the words in front of the type and never from the initializer. */
+private global_kind(line: string) -> string
+    val b = line.bytes
+    var at = symbol_end(b, 1) + 3
+    while at < b.len
+        val stop = word_stop(b, at)
+        val word = line[at..<stop]
+        if word == "global" || word == "constant" || word == "alias" || word == "ifunc" || word == "appending" then return word
+        at = stop + 1
+    ""
+
+/** **What a body costs the optimizer**, counted the way LLVM sees it once its stack slots are
+ * registers: one for each instruction, and nothing for a label, an unconditional branch, a slot's
+ * `alloca`, or a load or store of a slot (`%s<n>`). */
+body_cost(text: string, from: usize, to: usize) -> usize
+    val b = text.bytes
+    var at = from
+    var cost: usize = 0
+    while at < to
+        val eol = line_end(b, at)
+        val line = text[at..<eol]
+        at = eol + 1
+        // A label and the closing brace start in the first column; an instruction is indented.
+        if !line.starts_with("  ") then continue
+        val inst = line[2..]
+        if inst.starts_with("br label ") || inst.contains(" = alloca ") then continue
+        if (inst.contains(" = load ") || inst.starts_with("store ")) && slot_access(inst) then continue
+        cost += 1
+    cost
+
+/** Whether a load or a store's pointer, its last `ptr` operand, is one of a function's stack slots. */
+private slot_access(inst: string) -> bool
+    val at = inst.last_index_of("ptr %s") match
+        Some(k) -> k + 6
+        None -> return false
+    var stop = at
+    while stop < inst.bytes.len && u8('0') <= inst.bytes[stop] <= u8('9')
+        stop += 1
+    stop > at && (stop == inst.bytes.len || inst.bytes[stop] == u8(','))
+
+/** Every `@symbol` between `from` and `to` outside a string or a comment, recorded where it names one
+ * of the module's pieces other than `me`. */
+private scan_symbols(b: []const u8, from: usize, to: usize, named: *Map[string, usize], me: usize, out: *Buf[usize])
+    var i = from
+    while i < to
+        val c = b[i]
+        if c == u8('"')
+            i = skip_quoted(b, i, to)
+        elif c == u8('%') && i + 1 < to && b[i + 1] == u8('"')
+            i = skip_quoted(b, i + 1, to)
+        elif c == u8(';')
+            while i < to && b[i] != u8('\n')
+                i += 1
+        elif c == u8('@')
+            val e = symbol_end(b, i + 1)
+            if e > i + 1
+                named.get(from_utf8_unchecked(b[i + 1..<e])) match
+                    Some(k) -> if k != me then out.push(k)
+                    None -> ()
+            i = e
+        else
+            i += 1
+
+/** Past the string whose opening quote is at `i`. LLVM escapes a quote inside one as `\22`, so the
+ * next quote closes it. */
+private skip_quoted(b: []const u8, i: usize, to: usize) -> usize
+    var j = i + 1
+    while j < to && b[j] != u8('"')
+        j += 1
+    if j < to then j + 1 else j
+
+private word_stop(b: []const u8, from: usize) -> usize
+    var i = from
+    var depth = 0
+    while i < b.len
+        val c = b[i]
+        if c == u8('(') then depth += 1
+        if c == u8(')') then depth -= 1
+        if c == u8(' ') && depth == 0 then return i
+        i += 1
+    i
+
+/** Where the type starting at `from` ends: a bracketed aggregate or one word. */
+private type_end(b: []const u8, from: usize) -> usize
+    if from >= b.len then return from
+    val c = b[from]
+    if c == u8('{') || c == u8('[') || c == u8('<')
+        var depth = 0
+        var i = from
+        while i < b.len
+            val d = b[i]
+            if d == u8('{') || d == u8('[') || d == u8('<') || d == u8('(') then depth += 1
+            if d == u8('}') || d == u8(']') || d == u8('>') || d == u8(')')
+                depth -= 1
+                if depth == 0 then return i + 1
+            i += 1
+        return i
+    var i = from
+    while i < b.len && b[i] != u8(' ') && b[i] != u8(',')
+        i += 1
+    i
+
+// --- partitioning ------------------------------------------------------------------------------
+
+/** **`text` cut into at most `n` modules**, each of which clang compiles on its own and all of which
+ * link into what `text` would have, with `copies` of small functions and constants for the units'
+ * optimizers. Nothing where the text cannot be cut, and nothing where fewer than two units would hold
+ * anything: a unit with nothing of its own is never made. */
+split_module(text: string, n: int, copies: bool) -> Option[Buf[string]]
+    if n < 2 then return None
+    var m = read_module(text) match
+        Some(found) -> found
+        None -> return None
+    val count = m.items.len()
+    val units = usize(n)
+    // `member[p * count + e]`: unit p defines item e. `imported`: p carries an `available_externally`
+    // copy of e. `needed`: p names e and e is defined elsewhere, so p declares it.
+    var member: Buf[bool] = buf()
+    var imported: Buf[bool] = buf()
+    var needed: Buf[bool] = buf()
+    for _ in 0..<units * count
+        member.push(false)
+        imported.push(false)
+        needed.push(false)
+    var home: Buf[int] = buf()
+    var promoted: Buf[bool] = buf()
+    for _ in 0..<count
+        home.push(-1)
+        promoted.push(false)
+    // (unit, item) pairs still to be read for what they name.
+    var work: Buf[(usize, usize)] = buf()
+    for i in 0..<count
+        if m.items[i].piece == PieceDefine
+            val p = usize(name_hash(m.items[i].name) % u64(units))
+            home[i] = int(p)
+            member[p * count + i] = true
+            work.push((p, i))
+    var next: usize = 0
+    var swept = false
+    loop
+        while next < work.len()
+            val (p, e) = work[next]
+            next += 1
+            for k in m.ref_start[e]..<m.ref_start[e + 1]
+                val r = m.refs[k]
+                if member[p * count + r] || imported[p * count + r] || needed[p * count + r] then continue
+                val it = m.items[r]
+                if it.piece == PieceDeclare || it.piece == PieceLine
+                    needed[p * count + r] = true
+                elif it.piece == PieceAlias
+                    val q = alias_home(&m, r, p, count, &home, &member, &work)
+                    if q != p
+                        needed[p * count + r] = true
+                        promoted[r] = true
+                elif home[r] < 0
+                    home[r] = int(p)
+                    member[p * count + r] = true
+                    work.push((p, r))
+                elif copies && (if it.piece == PieceDefine then it.cost <= CopyCost else copyable_constant(&m, r))
+                    imported[p * count + r] = true
+                    promoted[r] = true
+                    work.push((p, r))
+                else
+                    needed[p * count + r] = true
+                    if it.local then promoted[r] = true
+        if swept then break
+        // What nothing named, a global no function reads, is kept all the same, with its alias's
+        // global for an alias, and in the first unit otherwise.
+        for i in 0..<count
+            val e = m.items[i]
+            if home[i] >= 0 then continue
+            if e.piece == PieceAlias
+                _ = alias_home(&m, i, 0, count, &home, &member, &work)
+            elif e.piece == PieceGlobal
+                home[i] = 0
+                member[i] = true
+                work.push((0, i))
+        swept = true
+    var out: Buf[string] = buf()
+    for p in 0..<units
+        var defines = false
+        for i in 0..<count
+            if member[p * count + i] then defines = true
+        if defines then out.push(render(&m, p, count, &member, &imported, &needed, &promoted))
+    if out.len() < 2 then None else Some(out)
+
+/** The unit alias `a` lives in, which is its global's: the global is placed in `p` first where it
+ * has no unit yet. An alias that names no global of the module stays in `p`. */
+private alias_home(m: *Module, a: usize, p: usize, count: usize, home: *Buf[int], member: *Buf[bool], work: *Buf[(usize, usize)]) -> usize
+    if home[a] >= 0 then return usize(home[a])
+    var target = a
+    for k in m.ref_start[a]..<m.ref_start[a + 1]
+        if target == a then target = m.refs[k]
+    if target != a && home[target] < 0
+        home[target] = int(p)
+        member[p * count + target] = true
+        work.push((p, target))
+    val q = if target == a then p else usize(home[target])
+    home[a] = int(q)
+    member[q * count + a] = true
+    work.push((q, a))
+    q
+
+/** Whether global `i` is a constant whose value a unit that reads it may be given a copy of. */
+private copyable_constant(m: *Module, i: usize) -> bool
+    val e = m.items[i]
+    if e.piece != PieceGlobal || e.end - e.start > CopyInitLimit then return false
+    val line = m.text[e.start..<e.end]
+    global_kind(line) == "constant" && !line.contains(" section ") && !line.contains(" comdat")
+
+/** A hash of a symbol's name, which places a function in its unit. */
+private name_hash(name: string) -> u64
+    var h: u64 = 0xcbf29ce484222325
+    for c in name.bytes
+        h = (h ^ u64(c)) *% 0x100000001b3
+    h ^ (h >> 29)
+
+/** One unit's text: every module-level line, its own definitions, its copies, and a declaration of
+ * everything it names from elsewhere, in the order the whole text had them. */
+private render(m: *Module, p: usize, count: usize, member: *Buf[bool], imported: *Buf[bool], needed: *Buf[bool], promoted: *Buf[bool]) -> string
+    var out = str_builder()
+    for i in 0..<count
+        val e = m.items[i]
+        if e.piece == PieceLine
+            out.push(m.text[e.start..<e.end])
+        elif member[p * count + i]
+            copy_renamed(m, i, promoted, false, &out)
+        elif imported[p * count + i]
+            copy_renamed(m, i, promoted, true, &out)
+        elif needed[p * count + i]
+            if e.piece == PieceDeclare
+                out.push(m.text[e.start..<e.end])
+            elif e.piece == PieceDefine
+                out.push(declaration_of(m.text[e.start..<line_end(m.text.bytes, e.start)], e, promoted[i]))
+            else
+                out.push(external_global(m.text[e.start..<e.end], e, promoted[i]))
+    out.finish()
+
+/** A promoted symbol's name as every unit spells it. */
+private spelled(name: string) -> string = if name.starts_with("\"") then s"\"$Promoted${name[1..]}" else s"\"$Promoted$name\""
+
+/** Item `i`'s text with every promoted symbol renamed and, where it is promoted itself, its own
+ * linkage made hidden; as an `available_externally` copy where `copy`. */
+private copy_renamed(m: *Module, i: usize, promoted: *Buf[bool], copy: bool, out: *StrBuilder)
+    val e = m.items[i]
+    var touches = promoted[i]
+    for k in m.ref_start[i]..<m.ref_start[i + 1]
+        if promoted[m.refs[k]] then touches = true
+    if !touches
+        out.push(m.text[e.start..<e.end])
+        return
+    val b = m.text.bytes
+    var from = e.start
+    if promoted[i]
+        val linkage = if copy then "available_externally hidden " else "hidden "
+        if e.piece == PieceDefine
+            out.push("define " + linkage)
+            from = e.start + (if m.text[e.start..].starts_with("define private ") then 15 else 16)
+        else
+            val name_end = symbol_end(b, e.start + 1)
+            val rest = m.text[name_end + 3..]
+            out.push(s"@${spelled(e.name)} = $linkage")
+            from = name_end + 3 + (if rest.starts_with("private ") then 8 else 9)
+    var at = from
+    while at < e.end
+        val c = b[at]
+        if c == u8('"')
+            at = skip_quoted(b, at, e.end)
+        elif c == u8('%') && at + 1 < e.end && b[at + 1] == u8('"')
+            at = skip_quoted(b, at + 1, e.end)
+        elif c == u8(';')
+            while at < e.end && b[at] != u8('\n')
+                at += 1
+        elif c == u8('@')
+            val stop = symbol_end(b, at + 1)
+            val renamed = m.named.get(m.text[at + 1..<stop]) match
+                Some(k) -> promoted[k]
+                None -> false
+            if renamed
+                out.push(m.text[from..<at])
+                out.push("@" + spelled(m.text[at + 1..<stop]))
+                from = stop
+            at = stop
+        else
+            at += 1
+    out.push(m.text[from..<e.end])
+
+/** A function defined in another unit, declared from its definition's first line: the linkage
+ * dropped, hidden and renamed where it was promoted, and the body's brace gone. */
+private declaration_of(head: string, e: Entity, hidden: bool) -> string
+    val b = head.bytes
+    var from: usize = 7
+    if head.starts_with("define private ") then from = 15
+    if head.starts_with("define internal ") then from = 16
+    var at = from
+    while at < b.len && b[at] != u8('@')
+        at += 1
+    var tail = head[symbol_end(b, at + 1)..].trim_end()
+    if tail.ends_with("{") then tail = tail[0..<tail.len - 1].trim_end()
+    val name = if hidden then "@" + spelled(e.name) else "@" + e.name
+    val vis = if hidden then "hidden " else ""
+    s"declare $vis${head[from..<at]}$name$tail\n"
+
+/** A global or an alias defined in another unit, as an external declaration of its type. */
+private external_global(line: string, e: Entity, hidden: bool) -> string
+    val b = line.bytes
+    var at = symbol_end(b, 1) + 3
+    var kind = ""
+    while at < b.len && kind == ""
+        val stop = word_stop(b, at)
+        val word = line[at..<stop]
+        if word == "global" || word == "constant" || word == "alias" then kind = word
+        at = stop + 1
+    val ty = line[at..<type_end(b, at)]
+    val name = if hidden then spelled(e.name) else e.name
+    val vis = if hidden then "hidden " else ""
+    val declared = if kind == "alias" then "global" else kind
+    s"@$name = external $vis$declared $ty\n"
+
+// --- compiling the units at once ---------------------------------------------------------------
+
+/** What compiling a module's units did: the objects, in order, and how many clang compiled rather
+ * than the cache supplied. */
+struct Compiled
+    objects: Buf[string]
+    compiled: int
+
+/** Compiles each of `parts` into an object at `optimization`, every clang at once, taking an object
+ * whose text was compiled before from `cache` (none where `cache` is ""). Every clang started is
+ * waited for, and where one failed, the first such unit in order is reported with what it said. */
+compile_units(clang: string, parts: Buf[string], dir: string, optimization: string, cache: string) -> Result[Compiled, string]
+    var version = ""
+    if cache != ""
+        capture(clang, ["--version"], timeout = 60000) match
+            Ok(r) -> version = r.text
+            Err(e) -> return Err(missing_tool(clang, e.to_string()))
+        if make_dir_all(cache).is_err() then version = ""
+    val keep = version != ""
+    var objects: Buf[string] = buf()
+    var todo: Buf[usize] = buf()
+    var children: Buf[&Child] = buf()
+    var targets: Buf[string] = buf()
+    var failure = ""
+    for i in 0..<parts.len()
+        val obj = if keep then cache + "/" + content_key(UnitFormat + "\n" + Version + "\n" + version + "\n" + optimization + "\n" + parts[i]) + ".o" else dir + s"/cgu$i.o"
+        objects.push(obj)
+        if keep && set_modified(obj, now()).is_ok() then continue
+        val ll = dir + s"/cgu$i.ll"
+        write_text(ll, parts[i]).map_err(e -> s"$ll: ${e.to_string()}")?
+        val target = if keep then pending_name(obj) else obj
+        start(clang, [optimization, "-c", "-x", "ir", "-Wno-override-module", ll, "-o", target], stderr = true, timeout = 600000) match
+            Ok(child) ->
+                todo.push(i)
+                targets.push(target)
+                children.push(child)
+            Err(e) ->
+                failure = missing_tool(clang, e.to_string())
+                break
+    for j in 0..<children.len()
+        val ran = children[j].wait()
+        if failure != "" then continue
+        ran match
+            Ok(r) -> if !r.status.ok() then failure = s"clang failed on codegen unit ${todo[j]}: " + r.status.to_string() + "\n" + r.err.unwrap_or("") + r.text
+            Err(e) -> failure = missing_tool(clang, e.to_string())
+    if keep
+        for j in 0..<todo.len()
+            if failure == "" then _ = publish_file(targets[j], objects[todo[j]]) else _ = remove_file(targets[j])
+    if failure != "" then return Err(failure)
+    if keep && todo.len() > 0 then trim_unit_cache(cache, objects)
+    Ok(Compiled(objects, int(todo.len())))
+
+/** The cache of unit objects trimmed to `UnitCacheBytes`, oldest first, sparing `in_use` and anything
+ * used within `UnitCacheFresh`. A failure is not the build's: the worst an untrimmed cache costs is
+ * disk. */
+trim_unit_cache(cache: string, in_use: Buf[string])
+    val names = entries(cache) match
+        Ok(n) -> n
+        Err(_) -> return
+    var files: Buf[CachedObject] = buf()
+    var total: long = 0
+    for name in names
+        if !name.ends_with(".o") then continue
+        val file = cache + "/" + name
+        metadata(file) match
+            Ok(meta) ->
+                files.push(CachedObject(file, meta.size, meta.modified.us))
+                total += meta.size
+            Err(_) -> ()
+    if total <= UnitCacheBytes then return
+    sort_by(files.view(), older)
+    val fresh = now().us - UnitCacheFresh
+    for f in files
+        if total <= UnitCacheBytes || f.modified >= fresh then break
+        var used = false
+        for u in in_use
+            if u == f.file then used = true
+        if !used && remove_file(f.file).is_ok() then total -= f.size
+
+private struct CachedObject
+    file: string
+    size: long
+    modified: long
+
+private older(a: CachedObject, b: CachedObject) -> bool = a.modified < b.modified

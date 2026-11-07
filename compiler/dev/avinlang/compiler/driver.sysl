@@ -37,6 +37,8 @@ struct Toolchain
     shim_cache(self) -> string = self.cache + "/shims"
     /** Where the objects of programs' C units are kept, by key. */
     c_unit_cache(self) -> string = self.cache + "/cunit"
+    /** Where the objects of programs' codegen units are kept, by key. */
+    unit_cache(self) -> string = self.cache + "/units"
 end Toolchain
 
 /** A toolchain rooted at `root`, if `root` holds the library and the runtime, building into the
@@ -555,9 +557,10 @@ runtime_key(tc: Toolchain) -> string = content_key("avin " + Version + "\n" + ru
 /** Links LLVM IR with the runtime into an executable at `output`: with `shims`, the runtime with a
  * program's binding shims, when there is one, together with the C libraries its Sysl packages need,
  * and otherwise the runtime's own archive; then `c_link`, the program's C unit and the flags of its
- * C libraries. The executable is written under a temporary name and published by rename, so a failed
- * link leaves any previous output in place. */
-link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimization: string, c_link: Buf[string]) -> Result[unit, string]
+ * C libraries. The IR is compiled as `units` codegen units at once (`codegen_units.sysl`), or as many
+ * as `codegen_units` answers where `units` is 0. The executable is written under a temporary name and
+ * published by rename, so a failed link leaves any previous output in place. */
+link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimization: string, c_link: Buf[string], units: int = 0) -> Result[unit, string]
     var libraries: Buf[string] = buf()
     val archive = shims match
         Some(a) ->
@@ -569,13 +572,22 @@ link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimiz
         None -> ensure_runtime(tc)?
     val dir = make_temp_dir("avin-link").map_err(e -> e.to_string())?
     defer _ = remove_dir_all(dir)
-    val ir = dir + "/program.ll"
-    write_text(ir, llvm).map_err(e -> e.to_string())?
     val pending = pending_name(output)
     defer _ = remove_file(pending)
     var args: Buf[string] = buf()
-    for a in ["-x", "ir", optimization, "-Wno-override-module", ir, "-x", "none", archive]
-        args.push(a)
+    val n = if units > 0 then units else codegen_units(llvm.len)
+    val parts = if n >= 2 then split_module(llvm, n, optimization != "-O0") else None
+    parts match
+        Some(texts) ->
+            val compiled = compile_units(tc.clang, texts, dir, optimization, tc.unit_cache())?
+            for o in compiled.objects
+                args.push(o)
+        None ->
+            val ir = dir + "/program.ll"
+            write_text(ir, llvm).map_err(e -> e.to_string())?
+            for a in ["-x", "ir", optimization, "-Wno-override-module", ir, "-x", "none"]
+                args.push(a)
+    args.push(archive)
     for flag in c_link
         args.push(flag)
     for flag in libraries
