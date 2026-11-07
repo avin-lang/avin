@@ -4595,6 +4595,28 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- **Proposed 2026-11-07 (branch `hash-digest`): `avin.crypto`, digests over `sysl.crypto`.**
+  The module is `avin.crypto`; it has `sha256`, `sha512`, `sha1` and `md5` (each taking a
+  `Vector[byte]` or a `string`, hashed as UTF-8, answering a `Vector[byte]`), `hmacSha256` and
+  `hmacSha512`, `toHex`, and incremental `Sha256()`, `Sha512()`, `Sha1()` and `Md5()` with `update`
+  and `finish`. WHY: marshal hand-wrote FNV-1a to key a build cache because the library had no
+  digest, and Sysl already has SHA-2, SHA-1, MD5 and HMAC; a binding cannot disagree with Sysl.
+  `avin.crypto` rather than `avin.hash` because the module holds keyed digests, and "hash" in Avin
+  already means the trait behind `HashMap`. A digest is a `Vector[byte]`, not a string, so it
+  compares, keys and stores as bytes and hex is one call away. Details: `finish()` caches its digest
+  and answers it again, and `update` after `finish` traps (a Sysl hasher cannot be finished twice);
+  the hashers are Avin classes over private handles because a handle has no constructor; the
+  one-shot digests and HMACs go through small `avin.rt` functions (`runtime/avin/rt/digest.sysl`)
+  because Sysl's one-shot functions answer a fixed array (`[32]u8`), which no binding result takes,
+  and Sysl keeps its streaming HMAC private. ALTERNATIVES: `avin.hash` (above); digests as hex
+  `string` (loses the bytes); one-shots through the Sysl hasher handle only (cannot reach HMAC);
+  making the boundary accept fixed `[N]u8` results (a compiler change for a handful of functions);
+  an HMAC written in Avin over the hashers (a second implementation to keep correct); also offering
+  SHA-224, SHA-384, HMAC-SHA-1 and HMAC-MD5 (Sysl has them, nothing asks) and a constant-time
+  `verify` (Sysl has one; add it when a program checks tags). Review with the user: whether `sha1`
+  and `md5` belong in the standard library at all, and whether the other SHA-2 widths and `verify`
+  should be added now.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

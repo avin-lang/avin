@@ -1,0 +1,198 @@
+module avin.crypto
+
+// Content digests and keyed digests: SHA-256, SHA-512, SHA-1 and MD5, HMAC over the first two, and
+// hexadecimal text for any of them. A digest is a `Vector[byte]`, the bytes the standard defines, so it
+// can be compared, stored or used as a key; `toHex` writes it as text.
+//
+//     println(toHex(sha256("abc")))
+//
+// Text is hashed as its UTF-8 bytes. A hasher takes its input in pieces, so a large file is hashed
+// without being held whole: `update` as often as needed, then `finish`.
+//
+// `sha1` and `md5` are broken for security: people can make two inputs with one digest. They are here
+// for formats that already use them (a checksum in a file listing, a cache key nobody attacks), never
+// to sign, to authenticate or to name untrusted content. Use `sha256` or `sha512` for those.
+
+// SHA-256 of `bytes`, 32 bytes.
+@sysl("avin.rt.digest_sha256")
+sha256(bytes: Vector[byte]) -> Vector[byte]
+
+// SHA-256 of the UTF-8 bytes of `text`.
+sha256(text: string) -> Vector[byte] = sha256(text.bytes())
+
+// SHA-512 of `bytes`, 64 bytes.
+@sysl("avin.rt.digest_sha512")
+sha512(bytes: Vector[byte]) -> Vector[byte]
+
+// SHA-512 of the UTF-8 bytes of `text`.
+sha512(text: string) -> Vector[byte] = sha512(text.bytes())
+
+// SHA-1 of `bytes`, 20 bytes. Broken for security; see the note at the top of the module.
+@sysl("avin.rt.digest_sha1")
+sha1(bytes: Vector[byte]) -> Vector[byte]
+
+// SHA-1 of the UTF-8 bytes of `text`. Broken for security.
+sha1(text: string) -> Vector[byte] = sha1(text.bytes())
+
+// MD5 of `bytes`, 16 bytes. Broken for security; see the note at the top of the module.
+@sysl("avin.rt.digest_md5")
+md5(bytes: Vector[byte]) -> Vector[byte]
+
+// MD5 of the UTF-8 bytes of `text`. Broken for security.
+md5(text: string) -> Vector[byte] = md5(text.bytes())
+
+// HMAC-SHA-256 of `message` under `key`, 32 bytes. A key of any length, empty included, is allowed.
+@sysl("avin.rt.digest_hmac_sha256")
+hmacSha256(key: Vector[byte], message: Vector[byte]) -> Vector[byte]
+
+// HMAC-SHA-256 of the UTF-8 bytes of `message` under the UTF-8 bytes of `key`.
+hmacSha256(key: string, message: string) -> Vector[byte] = hmacSha256(key.bytes(), message.bytes())
+
+// HMAC-SHA-512 of `message` under `key`, 64 bytes.
+@sysl("avin.rt.digest_hmac_sha512")
+hmacSha512(key: Vector[byte], message: Vector[byte]) -> Vector[byte]
+
+// HMAC-SHA-512 of the UTF-8 bytes of `message` under the UTF-8 bytes of `key`.
+hmacSha512(key: string, message: string) -> Vector[byte] = hmacSha512(key.bytes(), message.bytes())
+
+// The lower-case hexadecimal digit of `n`, from 0 to 15.
+private hexDigit(n: int) -> char
+hexDigit(n < 10) = char(int('0') + n)
+hexDigit(n) = char(int('a') + n - 10)
+
+// `bytes` as lower-case hexadecimal text, two digits for each byte.
+toHex(bytes: Vector[byte]) -> string
+    val out = Buffer[string]()
+    for b in bytes
+        val v = int(b)
+        out.addOne(s"${hexDigit(v >> 4)}${hexDigit(v & 15)}")
+    out.toVector().mkString("")
+
+@sysl("sysl.crypto.Fault")
+private data Fault
+    NotStarted
+    DigestTooSmall
+    NoIterations
+    TooMuchOutput
+
+@sysl("sysl.crypto.Sha256")
+private class RawSha256
+    update(bytes: Vector[byte])
+    finish(digest: Array[byte]) -> Result[unit, Fault]
+
+@sysl("sysl.crypto.new_sha256")
+private newRawSha256() -> RawSha256
+
+@sysl("sysl.crypto.Sha512")
+private class RawSha512
+    update(bytes: Vector[byte])
+    finish(digest: Array[byte]) -> Result[unit, Fault]
+
+@sysl("sysl.crypto.new_sha512")
+private newRawSha512() -> RawSha512
+
+@sysl("sysl.crypto.Sha1")
+private class RawSha1
+    update(bytes: Vector[byte])
+    finish(digest: Array[byte]) -> Result[unit, Fault]
+
+@sysl("sysl.crypto.new_sha1")
+private newRawSha1() -> RawSha1
+
+@sysl("sysl.crypto.Md5")
+private class RawMd5
+    update(bytes: Vector[byte])
+    finish(digest: Array[byte]) -> Result[unit, Fault]
+
+@sysl("sysl.crypto.new_md5")
+private newRawMd5() -> RawMd5
+
+// What a finished hasher's raw state wrote into `out`, as the digest.
+private published(result: Result[unit, Fault], out: Array[byte]) -> Vector[byte] = result match
+    Ok(_) -> out.toVector()
+    Err(_) -> fail("a hasher's digest buffer is sized from the hasher itself")
+
+// A SHA-256 hash in progress. `update` adds input in pieces, as many as needed; `finish` gives the
+// digest of everything added, and gives the same digest again if asked again. Adding input after
+// `finish` traps. A hasher belongs to the thread that made it.
+//
+//     val h = Sha256()
+//     h.update("ab")
+//     h.update("c")
+//     println(toHex(h.finish()))
+class Sha256()
+    private val raw = newRawSha256()
+    private var done: Option[Vector[byte]] = None
+
+    update(bytes: Vector[byte])
+        if done is Some(_) then fail("Sha256.update: the hasher is finished")
+        raw.update(bytes)
+
+    update(text: string) = update(text.bytes())
+
+    finish() -> Vector[byte] = done match
+        Some(d) -> d
+        None ->
+            val out = Array.fill(32, byte(0))
+            val d = published(raw.finish(out), out)
+            done = Some(d)
+            d
+
+// A SHA-512 hash in progress; it works as `Sha256` does, with a 64-byte digest.
+class Sha512()
+    private val raw = newRawSha512()
+    private var done: Option[Vector[byte]] = None
+
+    update(bytes: Vector[byte])
+        if done is Some(_) then fail("Sha512.update: the hasher is finished")
+        raw.update(bytes)
+
+    update(text: string) = update(text.bytes())
+
+    finish() -> Vector[byte] = done match
+        Some(d) -> d
+        None ->
+            val out = Array.fill(64, byte(0))
+            val d = published(raw.finish(out), out)
+            done = Some(d)
+            d
+
+// A SHA-1 hash in progress, with a 20-byte digest. Broken for security; see the note at the top of the
+// module.
+class Sha1()
+    private val raw = newRawSha1()
+    private var done: Option[Vector[byte]] = None
+
+    update(bytes: Vector[byte])
+        if done is Some(_) then fail("Sha1.update: the hasher is finished")
+        raw.update(bytes)
+
+    update(text: string) = update(text.bytes())
+
+    finish() -> Vector[byte] = done match
+        Some(d) -> d
+        None ->
+            val out = Array.fill(20, byte(0))
+            val d = published(raw.finish(out), out)
+            done = Some(d)
+            d
+
+// An MD5 hash in progress, with a 16-byte digest. Broken for security; see the note at the top of the
+// module.
+class Md5()
+    private val raw = newRawMd5()
+    private var done: Option[Vector[byte]] = None
+
+    update(bytes: Vector[byte])
+        if done is Some(_) then fail("Md5.update: the hasher is finished")
+        raw.update(bytes)
+
+    update(text: string) = update(text.bytes())
+
+    finish() -> Vector[byte] = done match
+        Some(d) -> d
+        None ->
+            val out = Array.fill(16, byte(0))
+            val d = published(raw.finish(out), out)
+            done = Some(d)
+            d

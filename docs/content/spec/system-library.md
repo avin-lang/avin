@@ -742,6 +742,47 @@ which as an `int` is `-1587805513`. A `long` is two draws, the first the high ha
 than a remainder. **None of this is fit for secrets**: anyone who sees a few outputs can compute the
 rest, so a key, a token or a password is never taken from it.
 
+## `avin.crypto`
+
+Content digests and keyed digests: SHA-256, SHA-512, SHA-1 and MD5, HMAC over the first two, and
+hexadecimal text for any digest.
+
+```text
+import avin.crypto.{sha256, hmacSha256, toHex, Sha256}
+
+main()
+    println(toHex(sha256("abc")))
+    println(toHex(hmacSha256("key", "message")))
+    val file = Sha256()
+    file.update("a piece")
+    file.update("and another")
+    println(toHex(file.finish()))
+```
+
+A digest is a `Vector[byte]`, the bytes the standard defines, so it compares by value, can key a map
+or a cache, and is written as text only on request. Text is hashed as its UTF-8 bytes.
+
+| Function | Meaning |
+| --- | --- |
+| `sha256(x)`, `sha512(x)` | The 32-byte and 64-byte digest of `x`, a `Vector[byte]` or a `string`. |
+| `sha1(x)`, `md5(x)` | The 20-byte and 16-byte digest of `x`. **Broken for security** (below). |
+| `hmacSha256(key, message)`, `hmacSha512(key, message)` | The 32-byte and 64-byte HMAC (RFC 2104) of `message` under `key`, both `Vector[byte]` or both `string`. Any key length is allowed, the empty key included; one longer than the algorithm's block is hashed first, as the RFC says. |
+| `toHex(bytes) -> string` | Lower-case hexadecimal, two digits for each byte. |
+
+**A hasher takes its input in pieces**, for data too large to hold whole, such as a file read in
+chunks. `Sha256()`, `Sha512()`, `Sha1()` and `Md5()` each have `update(bytes)` and `update(text)`,
+any number of times, and `finish()`, the digest of everything added. `finish()` answers the same
+digest each time it is called, and `update` after `finish` traps. Hashing in any pieces gives the
+one-shot digest. A hasher belongs to the thread that made it, as a handle does.
+
+**`sha1` and `md5` are for formats that already use them**: a checksum in a listing, a cache key
+nobody attacks. Two different inputs with the same digest can be made for both, so neither signs,
+authenticates or names untrusted content; use `sha256` or `sha512` for those. HMAC does not rest on
+collision resistance, but only the SHA-2 variants are offered. Comparing a received tag with a
+computed one is a comparison of two `Vector[byte]`, which is not constant-time.
+
+The digests are bound to Sysl's `sysl.crypto`, so they are the same code Sysl programs use.
+
 ## `avin.net`
 
 TCP connections, URLs, and a small HTTP client. Every operation that can fail answers a
