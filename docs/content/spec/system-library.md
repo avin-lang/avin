@@ -127,6 +127,8 @@ knows is asked for by name, and a program's own settings are its own values.
 | `pid() -> long` | The process's identifier. |
 | `totalMemory() -> Result[long, IoError]` | The physical memory the machine has, in bytes: what is installed, not what is free. |
 | `residentBytes(pid: long) -> Result[long, IoError]` | The memory the process `pid` holds in RAM now, in bytes; `residentBytes(pid())` is the program's own. A process that is not there, a reaped child among them, and a `pid` of zero or less are `Err(NotFound)`; one the program may not look at is `Err(PermissionDenied)`. |
+| `groupMembers(pgid: long) -> Result[Vector[long], IoError]` | The live processes whose process group is `pgid`, in no particular order: the leader, the programs it started and their children that stayed in the group. Ended programs not yet waited for are listed, waited-for ones are not. A group nobody is in is `Ok([])`; a `pgid` of zero or less, or past the largest process id, is `Err(Other)`. A snapshot. |
+| `children(pid: long) -> Result[Vector[long], IoError]` | The live processes whose parent is `pid`, in no particular order, direct children only: `children(pid())` is what this program started and has not waited for. No children, or no such process, is `Ok([])`; a `pid` of zero or less, or past the largest process id, is `Err(Other)`. |
 | `signal(pid: long, sig: int) -> Result[unit, IoError]` | Sends the signal to the process `pid`; a negative `pid` is the group `-pid`, zero the program's own group, and `sig` zero sends nothing and answers whether one could be sent. No such process is `Err(Other("No such process"))`. |
 | `newSession() -> Result[long, IoError]` | Makes the program the leader of a new session and group with no controlling terminal, as a daemon does, answering its number; refused for a program that already leads a group. |
 | `exec(program: string, args: Vector[string]) -> Result[Nothing, IoError]` | Replaces the program with `program` run with `args`, in the same process; see [becoming another program](#becoming-another-program). Answers only if that failed. |
@@ -134,6 +136,17 @@ knows is asked for by name, and a program's own settings are its own values.
 | `waitPid(pid: long) -> Result[ExitStatus, IoError]` | Waits for this program's child `pid` to end and answers how it ended, reaping it; see [becoming another program](#becoming-another-program). |
 | `tryWaitPid(pid: long) -> Result[Option[ExitStatus], IoError]` | Whether the child `pid` has ended, without waiting: `None` while it runs, its status (reaping it) once it has. |
 | `os() -> Os` | The operating system the program was compiled for: `MacOS`, `Linux`, `Windows`, `Android`, `Wasi` or `Freestanding`. |
+
+Listing a group replaces a `pgrep -g` subprocess, for instance to signal or count everything a
+command left running:
+
+```avin
+match Command("/bin/sh", "-c", "sleep 30 & wait").inNewGroup().start()
+  Ok(child) ->
+    val members = process.groupMembers(child.pid())   // the shell and its `sleep`
+    val direct = process.children(child.pid())        // just the `sleep`
+  Err(e) -> eprint(e.message())
+```
 
 **Nothing sets a variable.** The environment is the program's to read; a program that runs another
 gives it the variables it needs through its [command](#commands), which changes nothing in its own.
