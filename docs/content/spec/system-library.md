@@ -550,6 +550,7 @@ copyNotes(from: string, to: string) -> Result[unit, IoError]
 | `remove(file) -> Result[unit, IoError]` | Removes a file; never a directory, which is `IsADirectory`. A link is removed, not what it names. |
 | `removeDir(dir) -> Result[unit, IoError]` | Removes an empty directory; `DirectoryNotEmpty` otherwise. |
 | `removeDirAll(dir) -> Result[unit, IoError]` | Removes a directory and everything in it; a path already gone is success. |
+| `rename(from, to) -> Result[unit, IoError]` | Moves a file or directory in one step, replacing what is at `to`: a file replaces a file, a directory an empty directory (`DirectoryNotEmpty` if it holds entries); a file onto a directory is `IsADirectory`, a directory onto a file `NotADirectory`; a missing source or a missing directory above `to` is `NotFound`. The same path on both sides succeeds and changes nothing. Both names must be on one file system, or nothing moves. |
 | `createDir(dir) -> Result[unit, IoError]` | Makes one directory, whose parent must exist; `AlreadyExists` if something is there. |
 | `createDirAll(dir) -> Result[unit, IoError]` | Makes the directory and every missing one above it; a directory already there is success; a file where `dir` itself would go is `AlreadyExists`, and a file where one of the directories above it would go is `NotADirectory`. |
 | `createTempDir(prefix) -> Result[string, IoError]` | Makes a new, empty directory in the platform's place for temporary files, its name starting with `prefix`, and answers its path. |
