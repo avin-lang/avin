@@ -451,6 +451,43 @@ private modules_under(modules: Map[string, bool], prefix: string) -> string
 // it is the core library's, `avin` or under it; the program's own modules may not be. A program's
 // C unit is built between checking and lowering, which converts at the widths it measured.
 private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool, c: Buf[CLibrary]) -> Result[Lowered, string]
+    val front = check_units(tc, files, testing)?
+    var program = front.program
+    val loaded = front.loaded
+    var tests: Buf[TestEntry] = buf()
+    for t in program.tests
+        val f = program.symbols[t.symbol]
+        val src = program.sources[f.unit]
+        tests.push(TestEntry(t.name, src.name, src.locate(f.decl.name_span.start).line, t.module_name, t.should_trap, t.ignore, t.timeout, hook_name(program, t.setup), hook_name(program, t.teardown), hook_name(program, t.setup_all), hook_name(program, t.teardown_all)))
+    val c_unit = ensure_c_unit_of(tc, c_parts(program, files, loaded.library), c, program.sources)?
+    program.c_measures = c_unit.measures
+    program.c_values = c_unit.values
+    var c_link: Buf[string] = buf()
+    if c_unit.object is Some(o) then c_link.push(o)
+    for flag in c_unit.link
+        c_link.push(flag)
+    Ok(Lowered(lower_program(program), front.units, tests, c_link))
+
+/** A program through checking and no further: the diagnostics of a program that is wrong, which are
+ * everything `avin check` reports without building the shims of its Sysl bindings or its C unit, or ""
+ * for a program that checks. A C declaration that names no header is reported here too, since it needs
+ * no C compiler to find. */
+check_only(tc: Toolchain, files: Buf[ProgramFile], testing: bool, c: Buf[CLibrary]) -> string
+    val front = check_units(tc, files, testing) match
+        Ok(f) -> f
+        Err(diagnostics) -> return diagnostics
+    headerless(c_parts(front.program, files, front.loaded.library), c, front.program.sources)
+
+/** A program as checked: the units it was loaded from, the typed program, and the units that place
+ * its diagnostics. */
+private struct FrontEnd
+    loaded: LoadedUnits
+    units: Buf[SourceUnit]
+    program: TProgram
+
+// A program loaded, checked, and with the tests of its dependencies and of the core library taken
+// out, since they are theirs.
+private check_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool) -> Result[FrontEnd, string]
     val loaded = load_units(tc.library_dir(), files, false, src -> src).map_err(message -> s"avin: $message\n")?
     val units = loaded.units
     val root_module = loaded.root_module
@@ -466,29 +503,17 @@ private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool, c: Bu
     if checked.has_errors() then return Err(checked.render())
     checked.program match
         Some(checked_program) ->
-            // A package's dependencies and the core library are compiled into its program, and their
-            // tests are theirs.
             var program = checked_program
             var own: Buf[TestCase] = buf()
             for t in program.tests
                 val unit = program.symbols[t.symbol].unit
                 if unit >= loaded.library && !files[unit - loaded.library].dependency then own.push(t)
             program.tests = own
-            var tests: Buf[TestEntry] = buf()
-            for t in program.tests
-                val f = program.symbols[t.symbol]
-                val src = program.sources[f.unit]
-                tests.push(TestEntry(t.name, src.name, src.locate(f.decl.name_span.start).line, t.module_name, t.should_trap, t.ignore, t.timeout, hook_name(program, t.setup), hook_name(program, t.teardown), hook_name(program, t.setup_all), hook_name(program, t.teardown_all)))
-            val parts = CUnitParts(c_unit_bindings(program, files, loaded.library), c_unit_handles(program, files, loaded.library), c_unit_enums(program, files, loaded.library), c_unit_constants(program, files, loaded.library), c_unit_structs(program, files, loaded.library), c_unit_values(program, files, loaded.library))
-            val c_unit = ensure_c_unit_of(tc, parts, c, program.sources)?
-            program.c_measures = c_unit.measures
-            program.c_values = c_unit.values
-            var c_link: Buf[string] = buf()
-            if c_unit.object is Some(o) then c_link.push(o)
-            for flag in c_unit.link
-                c_link.push(flag)
-            Ok(Lowered(lower_program(program), checked.units, tests, c_link))
+            Ok(FrontEnd(loaded, checked.units, program))
         None -> Err("avin: checking produced no program\n")
+
+private c_parts(program: TProgram, files: Buf[ProgramFile], library: usize) -> CUnitParts
+    CUnitParts(c_unit_bindings(program, files, library), c_unit_handles(program, files, library), c_unit_enums(program, files, library), c_unit_constants(program, files, library), c_unit_structs(program, files, library), c_unit_values(program, files, library))
 
 // The name of a test hook, or "" for none.
 private hook_name(program: TProgram, hook: Option[usize]) -> string = hook match
