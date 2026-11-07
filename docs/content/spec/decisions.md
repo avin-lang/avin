@@ -4450,13 +4450,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   signal's name beside its number as `avin.signal` names them. Alternatives: the number alone;
   `ExitStatus.message()` as well (not added: nothing needs it yet).
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- Proposed (branch `sysl-098`): **`Child.detach()`** ([commands](/spec/system-library/#commands)).
+- Settled on the user's delegation 2026-11-06 (branch `sysl-098`): **`Child.detach()`** ([commands](/spec/system-library/#commands)).
   `detach() -> long` lets go of every program of the command still running without stopping it
   (Sysl's `Spawned.detach`) and answers `pid()`, the same `long` the `Child` already answers it as;
   a sequence's later part not yet started is never started, and the sequence's own redirected files
@@ -4474,7 +4468,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   answering `int` as Sysl does (the `Child` answers every id as a `long`); refusing to detach a
   pipeline or a sequence. **Review with the user**: whether a detached command should be reaped
   by the runtime so it leaves no zombie.
-- Proposed (branch `sysl-098`): **`totalMemory` and `residentBytes`** ([the environment and the
+- Settled on the user's delegation 2026-11-06 (branch `sysl-098`): **`totalMemory` and `residentBytes`** ([the environment and the
   platform](/spec/system-library/#the-environment-and-the-platform)). `process.totalMemory() ->
   Result[long, IoError]` and `process.residentBytes(pid: long) -> Result[long, IoError]` over Sysl's
   `total_memory` and `resident_bytes`, the `u64` bound as a `long` (machine memory and a process's
@@ -4489,7 +4483,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   ALTERNATIVES: `pid: int` as Sysl takes it; `Option[long]` (loses why); passing Sysl's
   "no such process" through as `Other(...)` as `signal` does.
 
-- **A group of only ended, unreaped processes answers "No such process"** (branch
+- Settled on the user's delegation 2026-11-06: **A group of only ended, unreaped processes answers "No such process"** (branch
   `group-signal-eperm`; [commands](/spec/system-library/#commands)). `signalGroup` maps the
   platform's permission refusal to `Err(Other("No such process"))`: on macOS `kill(-pgid)` answers
   EPERM while a group holds only zombies and ESRCH once they are reaped, so the same program saw
@@ -4499,7 +4493,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   to observe it, and the flake stays); report the permission error only for a group the program did
   not start (not reachable, since `signalGroup` only names groups of its own commands).
 
-- Proposed (branch `parallel-codegen`): **A build compiles the program's LLVM text as codegen units
+- Settled on the user's delegation 2026-11-06 (branch `parallel-codegen`): **A build compiles the program's LLVM text as codegen units
   at once, one clang each, at most eight, and keeps each unit's object in the toolchain's cache by
   its text.** A function only one function calls goes with its caller (kept local, so still inlined
   there: without this a hot single-caller function across a cut ran ~6% slower at `-O2`); other
@@ -4517,12 +4511,18 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   unit); one unit per processor without a cap. `AVIN_CODEGEN_UNITS` overrides the count. **Review
   with the user** only if `-O2` run-time performance across units ever shows up in a profile: the
   copy limit is the knob.
-- Proposed (branch `parallel-codegen`): **The cache of unit objects is trimmed to 1 GiB**, oldest
+- Settled on the user's delegation 2026-11-06 (branch `parallel-codegen`): **The cache of unit objects is trimmed to 1 GiB**, oldest
   first, after a build that compiled a unit, sparing anything used in the last hour; a reused
   object's time is refreshed. The test corpus links without keeping objects. Why: a build of `top`
   keeps ~8 objects of a few MB per level, so 1 GiB holds dozens of builds; the hour keeps a
   concurrent build's objects from being evicted under it. Alternatives: a count of objects; no
   trimming.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
@@ -4555,7 +4555,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 - Resource cleanup: a `defer` construct or a library `use`.
 - Whether mailboxes may be bounded, and what a `tell` to a full one does, since `tell` never waits.
 
-- **`avin check` stops after type checking** (Proposed, branch `check-stops-early`). Checking a
+- Settled on the user's delegation 2026-11-06 (branch `check-stops-early`): **`avin check` stops after type checking**. Checking a
   program no longer lowers it, builds the shims of its Sysl bindings or builds its C unit: the
   previous `check` did all three and threw the result away, 4.9 s against 0.4 s of checking on a
   terminal-interface example. Two diagnostics came only from those later steps. **A C declaration
