@@ -4674,13 +4674,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   `set_modified`, so it costs a line, and it lets "last used" be recorded without writing).
   Times are microseconds, the library's resolution.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- Proposed (branch `runner-streaming`): **`avin test` pushes its report out as it goes, and on SIGTERM or
+- Settled on the user's delegation 2026-11-08 (branch `runner-streaming`): **`avin test` pushes its report out as it goes, and on SIGTERM or
   SIGINT writes out what it holds and names the work in progress.** The report text of a run is
   unchanged. The report is pushed to its reader when a test finishes and at least half a second has
   passed since the last push (the first finish always pushes), and at the end of the run, so a log
@@ -4698,7 +4692,14 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   every line (cost: a write for every line of a many-test run), a prefix always on (changes every
   existing report), a prefix on only when output is not a terminal (the same program would write
   different text by where it was sent), and polling the signal flag between tests (a blocked test or
-  build would never reach the poll).
+  build would never reach the poll). Review with the user: the option's name `--prefix`, and the exit
+  codes 143 and 130 (the shell's 128 + signal convention).
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
