@@ -4657,13 +4657,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   suppressing (the cascade still fills the five shown). Review with the user: whether same-file
   clashes should suppress the cascade too.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- **File metadata in `avin.fs`** (branch `fs-metadata`). Proposed: `metadata(path)` answers
+- **File metadata in `avin.fs`** Settled on the user's delegation 2026-11-07: `metadata(path)` answers
   `Result[Metadata, IoError]` with `Metadata(size: long, modified: Instant, isDir: bool,
   isFile: bool)`, from one `stat`, so the fields describe one entry; `size(path)` and
   `modified(path)` are shorthands for the two fields a program usually wants, and `setModified(path,
@@ -4679,6 +4673,12 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   `avin.fs` offers no way to make a link to ask about); `setModified` omitted (Sysl has
   `set_modified`, so it costs a line, and it lets "last used" be recorded without writing).
   Times are microseconds, the library's resolution.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
