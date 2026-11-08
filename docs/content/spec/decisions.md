@@ -4645,6 +4645,18 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   and `md5` belong in the standard library at all, and whether the other SHA-2 widths and `verify`
   should be added now.
 
+- **A top-level name declared twice is reported with the first declaration's place, and a clash
+  between two files of a module suppresses every other diagnostic.** Settled on the user's
+  delegation 2026-11-07. Each duplicate message ends `; first declared at FILE:LINE:COL`. When the
+  clash spans files, the program's other errors are dropped before printing, because they are almost
+  always cascades of the clash (two `Filter` types in one module gave 48 conformance errors and no
+  word of the clash, and the CLI shows five). A clash inside one file keeps its other errors, since
+  existing reject cases mix a duplicate with unrelated errors and the duplicate is easy to see there.
+  WHY: the clash is the cause and must be the error read first. ALTERNATIVES: suppressing for
+  same-file clashes too (hides real unrelated errors in one file); ordering duplicates first without
+  suppressing (the cascade still fills the five shown). Review with the user: whether same-file
+  clashes should suppress the cascade too.
+
 **Deferred**
 
 - Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
