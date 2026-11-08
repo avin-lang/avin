@@ -38,7 +38,7 @@ A missing tool is reported by name, with what installs it.
 
 Working on the compiler, the library or the runtime needs:
 
-- Sysl 0.9.9, with a checkout of Sysl's `parsing` package at `../../sysl-lang/parsing` relative to
+- Sysl 0.9.10, with a checkout of Sysl's `parsing` package at `../../sysl-lang/parsing` relative to
   the repository: the repository is cloned into a directory named for its organization
   (`avin-lang/avin`), beside a `sysl-lang` directory holding `sysl-lang/parsing`
 - clang on `PATH`
