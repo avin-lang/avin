@@ -1,0 +1,138 @@
+module dev.avinlang.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{current_dir, make_dir_all, make_temp_dir, read_text, remove_dir_all, set_permissions, write_text}
+import sysl.env.get
+import sysl.process.{Exited, Stdio, Var, capture, spawn}
+import sysl.time.{millis, monotonic, sleep}
+
+// The live report of `avin test`: when the report is pushed out, and what the real executable writes
+// when it is asked to stop. The executable is built once per test and run as a process, since a
+// signal can only be sent to one.
+
+@test("the report is pushed out when half a second has passed since the last push, and not before")
+flush_rule()
+    assert(flush_due(500, 0))
+    assert(flush_due(501, 0))
+    assert(!flush_due(499, 0))
+    assert(!flush_due(0, 0))
+    assert(flush_due(10500, 10000))
+    assert(!flush_due(10499, 10000))
+    assert(flush_due(1000000, 0))
+    // A clock that has not moved, or has gone back, is never due.
+    assert(!flush_due(100, 200))
+
+@test("a note that a test finished flushes at most about twice a second")
+finishing_is_rate_limited()
+    flush_now()
+    val before = pushes_made()
+    val began = monotonic().us / 1000
+    for _ in 0..<1000
+        note_finished()
+    val spent = monotonic().us / 1000 - began
+    // A burst of finishes right after a push makes at most one more push per half second it lasted.
+    assert(pushes_made() - before <= spent / 500 + 1)
+
+@test("a slot records work in progress and frees it")
+slots_fill_and_free()
+    val first = live_begin("a.avin  one", PhaseRun)
+    val second = live_begin("b", PhaseCompile)
+    assert(first >= 0 && second >= 0 && first != second)
+    live_end(first)
+    val third = live_begin("c", PhaseRun)
+    assert_eq(third, first)
+    live_end(second)
+    live_end(third)
+    live_end(-1)
+    live_phase(-1, PhaseRun)
+    live_process(-1, 0)
+
+private struct Scene
+    dir: string
+    bin: string
+    source: string
+
+// Builds the executable and writes a test file with a fast test, a test that sleeps and a test that
+// would run after it.
+private scene() -> Scene
+    val dir = make_temp_dir("avin-live").unwrap()
+    val bin = dir + "/avin"
+    val built = capture(repository_toolchain().sysl, ["build", "compiler", "-o", bin], stderr = true, timeout = 900000).unwrap()
+    assert(built.status.ok(), built.err.unwrap_or(""))
+    val source = dir + "/slow.avin"
+    write_text(source, "import avin.threads.sleep\nimport avin.time\n\n@test(\"fast one\")\nfastOne()\n    assert(true)\n\n@test(\"slow one\")\nslowOne()\n    sleep(time.millis(60000))\n\n@test(\"never reached\")\nnever()\n    assert(true)\n").unwrap()
+    Scene(dir, bin, source)
+
+private root_env() -> Buf[Var]
+    var env: Buf[Var] = buf()
+    env.push(Var("AVIN_ROOT", current_dir().unwrap()))
+    env
+
+// Waits up to `limit` milliseconds for `log` to hold `text`.
+private appears(log: string, text: string, limit: int) -> bool
+    var waited = 0
+    while waited < limit
+        if read_text(log).unwrap_or("").contains(text) then return true
+        sleep(millis(50))
+        waited += 50
+    false
+
+// Starts `avin test` on the slow file, sends it `signal` once the fast test's line is in the log,
+// and answers the log, the status it exited with and the milliseconds the exit took.
+private interrupted_run(s: Scene, signal: int, env: Buf[Var], watched: string, marker: string) -> (string, int, int)
+    val log = s.dir + "/run.log"
+    val child = spawn(s.bin, ["test", s.source], env = env.view(), stdout = Stdio.ToPath(log), stderr = Stdio.ToPath(s.dir + "/run.err")).unwrap()
+    assert(appears(if watched == "" then log else watched, marker, 120000), "the run never reached its marker")
+    // The slow test has started by the time its predecessor's line is out; let it be running.
+    sleep(millis(1500))
+    val sent = monotonic().us / 1000
+    child.kill(signal).unwrap()
+    val ended = child.wait().unwrap()
+    val took = int(monotonic().us / 1000 - sent)
+    val code = ended match
+        Exited(c) -> c
+        _ -> -1
+    (read_text(log).unwrap_or(""), code, took)
+
+@test("a test's line is in the log while a later test of its file is still running, and SIGTERM names the test in progress and exits within five seconds")
+streams_and_stops_on_term()
+    val s = scene()
+    defer _ = remove_dir_all(s.dir)
+    val (log, code, took) = interrupted_run(s, 15, root_env(), "", "fast one")
+    assert(log.contains("  ok    fast one"), log)
+    assert(!log.contains("passed,"), log)
+    assert(log.contains("interrupted by SIGTERM; in progress:"), log)
+    assert(log.contains("run      slow.avin  slow one  "), log)
+    assert(!log.contains("never reached"), log)
+    assert_eq(code, 143)
+    assert(took < 5000, s"took ${took}ms to exit")
+
+@test("SIGINT stops the run the same way")
+stops_on_interrupt()
+    val s = scene()
+    defer _ = remove_dir_all(s.dir)
+    val (log, code, took) = interrupted_run(s, 2, root_env(), "", "fast one")
+    assert(log.contains("interrupted by SIGINT; in progress:"), log)
+    assert(log.contains("run      slow.avin  slow one  "), log)
+    assert_eq(code, 130)
+    assert(took < 5000, s"took ${took}ms to exit")
+
+@test("a signal during the build names the build as in progress, in the compile phase")
+stops_during_the_build()
+    val s = scene()
+    defer _ = remove_dir_all(s.dir)
+    // A `sysl` that never finishes stands in for a hung build, and a cache that is empty makes the
+    // runtime need building.
+    make_dir_all(s.dir + "/fake").unwrap()
+    write_text(s.dir + "/fake/sysl", "#!/bin/sh\necho started >> " + s.dir + "/fake.log\nsleep 60\n").unwrap()
+    set_permissions(s.dir + "/fake/sysl", 493u32).unwrap()
+    var env = root_env()
+    env.push(Var("PATH", s.dir + "/fake:" + get("PATH").unwrap_or("/usr/bin:/bin")))
+    env.push(Var("AVIN_CACHE", s.dir + "/cache"))
+    val (log, code, took) = interrupted_run(s, 15, env, s.dir + "/fake.log", "started")
+    assert(log.contains("interrupted by SIGTERM; in progress:"), log)
+    assert(log.contains("compile  "), log)
+    assert(!log.contains("run      "), log)
+    assert_eq(code, 143)
+    assert(took < 5000, s"took ${took}ms to exit")

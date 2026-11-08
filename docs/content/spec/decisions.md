@@ -4680,6 +4680,26 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- Proposed (branch `runner-streaming`): **`avin test` pushes its report out as it goes, and on SIGTERM or
+  SIGINT writes out what it holds and names the work in progress.** The report text of a run is
+  unchanged. The report is pushed to its reader when a test finishes and at least half a second has
+  passed since the last push (the first finish always pushes), and at the end of the run, so a log
+  read while the run is alive shows every test but the last half second's, and speed is unchanged.
+  On SIGTERM or SIGINT the runner pushes the report at once, then writes `avin test: interrupted by
+  SIGTERM; in progress:` (or `SIGINT`) and one line for each piece of work still running, in the form
+  `run      <file>  <test>  <seconds>s` for a test and `compile  <program>  <seconds>s` for the build of
+  the program, stops the test processes it started and exits with 143 (TERM) or 130 (INT), within
+  about 20 ms of the signal. A watcher thread reads the signals, so a build blocked in a tool, or a
+  compiler pass that is busy, cannot keep the lines from being written. The new option `avin test
+  --prefix` puts the file's path and a colon before every result line (`a.avin:   ok    passes  3ms`),
+  for runs whose output is interleaved with other runs' in one log; headings and the summary are not
+  prefixed. Why: a job stopped at its deadline left a zero-byte log because the report sat in a
+  buffer until the run ended, and a hung build named nothing. Alternatives weighed: flushing after
+  every line (cost: a write for every line of a many-test run), a prefix always on (changes every
+  existing report), a prefix on only when output is not a terminal (the same program would write
+  different text by where it was sent), and polling the signal flag between tests (a blocked test or
+  build would never reach the poll).
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

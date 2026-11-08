@@ -1,0 +1,162 @@
+module dev.avinlang.compiler
+
+import sysl.signal
+import sysl.threads.spawn
+import sysl.sync.SpinLock
+import sysl.time.{millis, monotonic, sleep}
+
+// What `avin test` shows while it works, and what it leaves behind when it is stopped: the report
+// reaches the log in steps rather than all at the end, and a signal that asks the runner to stop
+// first writes out everything held back and names every test, and the build, still in progress.
+
+/** How often, at most, the report is pushed out to its reader, in milliseconds. */
+const FlushEvery: long = 500
+
+/** Whether the report is due to be pushed out: at least `FlushEvery` milliseconds have passed since
+ * the last push, at `last_ms`, as of `now_ms`. */
+flush_due(now_ms: long, last_ms: long) -> bool = now_ms - last_ms >= FlushEvery
+
+private var last_flush: long = 0
+private var flushed_once: bool = false
+private var pushes: long = 0
+
+/** How many times the report has been pushed out by `note_finished` and `flush_now`. */
+pushes_made() -> long = pushes
+
+/** A test, or the build, has finished: pushes the report out when `flush_due` says so. Called after
+ * each test's lines are written, so the report is never more than one test behind except for the
+ * pause between pushes. The first call always pushes. */
+note_finished()
+    val now = monotonic().us / 1000
+    if !flushed_once || flush_due(now, last_flush)
+        flush()
+        pushes += 1
+        flushed_once = true
+        last_flush = now
+
+/** Pushes everything written so far out, whatever `flush_due` says: for the end of a run. */
+flush_now()
+    flush()
+    pushes += 1
+    flushed_once = true
+    last_flush = monotonic().us / 1000
+
+/** The phase of work in progress that is a build of the program. */
+const PhaseCompile: int = 0
+/** The phase of work in progress that is a test running. */
+const PhaseRun: int = 1
+
+const Slots: int = 8
+const SlotText: int = 240
+
+private var guard: SpinLock = SpinLock(0)
+private var used: [8]bool
+private var phases: [8]int
+private var began: [8]long
+private var lens: [8]int
+private var pids: [8]int
+private var texts: [1920]u8
+private var ready: i32
+
+private extern "kill" c_kill(pid: int, sig: int) -> int
+
+/** Records that `what` is in progress in `phase`, answering a slot to end or change it with. `what`
+ * is cut to fit; an eighth simultaneous item and beyond are not recorded, and answer -1. */
+live_begin(what: string, phase: int) -> int
+    guard.lock()
+    var slot = -1
+    for i in 0..<Slots
+        if !used[i]
+            slot = i
+            break
+    if slot >= 0
+        used[slot] = true
+        phases[slot] = phase
+        began[slot] = monotonic().us / 1000
+        pids[slot] = 0
+        var n = 0
+        val b = what.bytes
+        while n < int(b.len) && n < SlotText
+            texts[slot * SlotText + n] = b[n]
+            n += 1
+        lens[slot] = n
+    guard.unlock()
+    slot
+
+/** Notes that the item in `slot` has moved to `phase`, restarting its clock. */
+live_phase(slot: int, phase: int)
+    if slot < 0 then return
+    guard.lock()
+    phases[slot] = phase
+    began[slot] = monotonic().us / 1000
+    guard.unlock()
+
+/** Notes the process a slot's item runs in, so an interrupt can stop it. 0 for none. */
+live_process(slot: int, pid: int)
+    if slot < 0 then return
+    guard.lock()
+    pids[slot] = pid
+    guard.unlock()
+
+/** The item in `slot` is no longer in progress. */
+live_end(slot: int)
+    if slot < 0 then return
+    guard.lock()
+    used[slot] = false
+    pids[slot] = 0
+    guard.unlock()
+
+// The thread that waits for the signals. Nothing sysl runs inside a handler, so the signals are
+// flags, read here every 20 ms; it is a thread of its own so that a build or a test that is blocked,
+// or a compiler pass that is busy, cannot keep the report from being written.
+private watcher(flag: *i32) -> unit
+    val term = signal.watch(signal.TERM)
+    val interrupt = signal.watch(signal.INT)
+    if term is Err(_) || interrupt is Err(_)
+        *flag = 2
+        return
+    var t = term.unwrap()
+    var i = interrupt.unwrap()
+    *flag = 1
+    loop
+        if t.take()
+            interrupted("SIGTERM", 143)
+        if i.take()
+            interrupted("SIGINT", 130)
+        sleep(millis(20))
+
+/** Starts watching for SIGTERM and SIGINT, which stop the run as `interrupted` describes. Answers
+ * whether the watch is in place. */
+watch_for_interrupts() -> bool
+    ready = 0
+    if spawn(&watcher, &ready) is None then return false
+    var waited = 0
+    while ready == 0 && waited < 1000
+        sleep(millis(1))
+        waited += 1
+    ready == 1
+
+// Writes out what is held back, names everything in progress, stops those processes and exits.
+private interrupted(name: string, code: int)
+    flush()
+    val now = monotonic().us / 1000
+    guard.lock()
+    var any = false
+    for i in 0..<Slots
+        if !used[i] then continue
+        if !any
+            prints(s"\navin test: interrupted by $name; in progress:\n")
+            any = true
+        val tenths = (now - began[i]) / 100
+        val phase = if phases[i] == PhaseCompile then "compile" else "run    "
+        prints(s"  $phase  ")
+        val lo = i * SlotText
+        putbytes(texts[lo..<lo + lens[i]])
+        prints(s"  ${tenths / 10}.${tenths % 10}s\n")
+    if !any then prints(s"\navin test: interrupted by $name; nothing in progress\n")
+    flush()
+    for i in 0..<Slots
+        if used[i] && pids[i] > 0 then _ = c_kill(pids[i], 9)
+    guard.unlock()
+    exit(code)
+end interrupted

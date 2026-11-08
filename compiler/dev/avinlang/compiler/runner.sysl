@@ -5,7 +5,7 @@ import sysl.container.{Map, map}
 import sysl.env.current_exe
 import sysl.fs.{canonicalize, exists, is_dir, make_dir_all, metadata, read_text, write_text_atomic}
 import sysl.path.{file_name, parent, stem}
-import sysl.process.{Exited, Signalled, Status, Stdio, TimedOut, capture, run}
+import sysl.process.{Exited, Signalled, Status, Stdio, TimedOut, run, start}
 import sysl.text.{StrBuilder, from_utf8_unchecked, parse_int, str_builder}
 import sysl.time.monotonic
 
@@ -163,7 +163,7 @@ const TestTimeout: int = 60000
  * and everything it printed, each line after `> `; a hook that failed on a row of its own; then how
  * many passed, failed and were ignored. Files are named from `root`, the program's directory, when
  * it is one. Answers 0 when every test that ran passed and every hook succeeded, and 1 otherwise. */
-run_tests(built: Built, root: string, filter: string, say: string -> unit) -> int
+run_tests(built: Built, root: string, filter: string, prefix: bool, say: string -> unit) -> int
     var selected: Buf[usize] = buf()
     for i in 0..<built.tests.len()
         val t = built.tests[i]
@@ -186,6 +186,7 @@ run_tests(built: Built, root: string, filter: string, say: string -> unit) -> in
     var failed = 0usize
     var ignored = 0usize
     var file = ""
+    val out: &Fn(string) -> unit = line -> say(if prefix && line != "" then s"$file: $line" else line)
     val started = monotonic()
     for i in selected
         val t = built.tests[i]
@@ -197,26 +198,29 @@ run_tests(built: Built, root: string, filter: string, say: string -> unit) -> in
         val padded = t.name + " ".repeat(width - t.name.len)
         if t.ignore is Some(reason)
             ignored += 1
-            say(s"  skip  $padded  ignored: $reason")
+            out(s"  skip  $padded  ignored: $reason")
             continue
+        val slot = live_begin(s"$shown  ${t.name}", PhaseRun)
         if t.setup_all != "" && set_up.get(t.module_name) is None
-            val ran = run_part(built, i, "a", TestTimeout)
+            val ran = run_part(built, i, "a", TestTimeout, slot)
             set_up.put(t.module_name, if ran.status == Exited(0) then "" else ran.reason)
             if ran.status != Exited(0)
                 failed += 1
-                say(s"  FAIL  @setup_all ${t.setup_all}")
-                report(ran, say)
+                out(s"  FAIL  @setup_all ${t.setup_all}")
+                report(ran, out)
         if set_up.get(t.module_name) is Some(fault)
             if fault != ""
                 failed += 1
-                say(s"  FAIL  ${t.name}")
-                say(s"        not run: `@setup_all` `${t.setup_all}` failed")
+                out(s"  FAIL  ${t.name}")
+                out(s"        not run: `@setup_all` `${t.setup_all}` failed")
+                live_end(slot)
+                note_finished()
                 continue
         val limit = t.timeout match
             Some(seconds) -> seconds * 1000
             None -> TestTimeout
         val began = monotonic()
-        val ran = run_part(built, i, "", limit)
+        val ran = run_part(built, i, "", limit, slot)
         val ms = (monotonic() - began).us / 1000
         // Why the test failed, or "" when it passed; whether its process ended before the module's
         // `@teardown` could run in it; and whether that teardown, run in the test's process, failed.
@@ -242,29 +246,31 @@ run_tests(built: Built, root: string, filter: string, say: string -> unit) -> in
         else verdict = ran.reason
         if verdict == ""
             passed += 1
-            say(s"  ok    $padded  ${ms}ms")
+            out(s"  ok    $padded  ${ms}ms")
         else
             failed += 1
-            say(s"  FAIL  $padded  ${ms}ms")
-            say("        " + verdict)
-            if !teardown_failed then printed(ran, say)
+            out(s"  FAIL  $padded  ${ms}ms")
+            out("        " + verdict)
+            if !teardown_failed then printed(ran, out)
         if teardown_failed
             failed += 1
-            say(s"  FAIL  @teardown ${t.teardown}")
-            report(ran, say)
+            out(s"  FAIL  @teardown ${t.teardown}")
+            report(ran, out)
         if teardown_apart && t.teardown != ""
-            val apart = run_part(built, i, "t", TestTimeout)
+            val apart = run_part(built, i, "t", TestTimeout, slot)
             if apart.status != Exited(0)
                 failed += 1
-                say(s"  FAIL  @teardown ${t.teardown}")
-                report(apart, say)
+                out(s"  FAIL  @teardown ${t.teardown}")
+                report(apart, out)
         if t.teardown_all != "" && last.get(t.module_name) is Some(final)
             if final == i
-                val ran_last = run_part(built, i, "z", TestTimeout)
+                val ran_last = run_part(built, i, "z", TestTimeout, slot)
                 if ran_last.status != Exited(0)
                     failed += 1
-                    say(s"  FAIL  @teardown_all ${t.teardown_all}")
-                    report(ran_last, say)
+                    out(s"  FAIL  @teardown_all ${t.teardown_all}")
+                    report(ran_last, out)
+        live_end(slot)
+        note_finished()
     say("")
     val elapsed = (monotonic() - started).us / 1000
     say(if ignored > 0 then s"$passed passed, $failed failed, $ignored ignored — ${elapsed}ms" else s"$passed passed, $failed failed — ${elapsed}ms")
@@ -289,11 +295,17 @@ private const CouldNotRun: string = "could not be run"
 // teardown for `part` "", or one hook (`part` "t", "a" or "z"), stopping it after `limit` milliseconds
 // unless `limit` is 0. A test reads no input: it never waits on the terminal `avin test` was started
 // from.
-private run_part(built: Built, i: usize, part: string, limit: int) -> Ran
+private run_part(built: Built, i: usize, part: string, limit: int, slot: int) -> Ran
     var args: Buf[string] = buf()
     args.push(i.to_string())
     if part != "" then args.push(part)
-    val output = capture(built.path, args.view(), stderr = true, timeout = limit, stdin = Stdio.FromPath("/dev/null")) match
+    val child = start(built.path, args.view(), stderr = true, timeout = limit, stdin = Stdio.FromPath("/dev/null")) match
+        Ok(c) -> c
+        Err(e) -> return Ran(Exited(1), false, false, s"$CouldNotRun: ${e.to_string()}", buf(), "")
+    live_process(slot, child.pid())
+    val waited = child.wait()
+    live_process(slot, 0)
+    val output = waited match
         Ok(o) -> o
         Err(e) -> return Ran(Exited(1), false, false, s"$CouldNotRun: ${e.to_string()}", buf(), "")
     val err = output.err.unwrap_or("")

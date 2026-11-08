@@ -152,6 +152,11 @@ With no program named, `avin test` tests the current directory. Its first argume
 when it names an existing file or directory, and the filter otherwise: `avin test "low bound"` filters
 the current directory's tests, and `avin test . low` filters when a path called `low` also exists.
 
+The report is written as the tests finish, at most twice a second, so a log read while the run is
+alive is current. SIGTERM or SIGINT writes out the rest at once, lists every test and build still in
+progress with the time it has taken, and exits with 143 or 130. `--prefix` puts each file's path and
+a colon before every result line, for output that shares a log with other runs.
+
 ```text
 running 2 tests
 
