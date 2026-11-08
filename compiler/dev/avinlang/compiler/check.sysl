@@ -553,6 +553,9 @@ struct Checker
     shared_variants: Map[string, Buf[VariantRef]]
     /** Generic Sysl bindings, whose types are held to what crosses once `Boundary` is known. */
     late_bindings: Buf[LateBinding]
+    /** Whether a top-level name was declared twice: the program's other diagnostics then follow from
+     * the duplicate, and only the duplicates are reported. */
+    duplicates: bool
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -809,7 +812,7 @@ private check_imports(c: *Checker, unit: usize)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false)
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -954,6 +957,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     val completions = finish_completion(&c)
     val references = finish_index(&c)
     val overrides = finish_ties(&c)
+    keep_duplicates(&c)
     var failed = false
     for u in c.units
         if u.report.has_errors() then failed = true
@@ -1215,6 +1219,27 @@ private declared_in(c: *Checker, t: &Type, unit: usize) -> bool = *t match
     Class(k, _, _) -> c.classes[k].unit == unit
     _ -> false
 
+// The words every duplicate-declaration diagnostic carries before the place of the first.
+const FirstDeclared: string = "; first declared at "
+
+// Reports a top-level name declared twice, at the second declaration, naming where the first is.
+// Everything else the program reports follows from the clash, so once one is found only these are
+// kept (see `keep_duplicates`).
+private note_duplicate(c: *Checker, unit: usize, at: Span, what: string, first_unit: usize, first_at: Span)
+    val src = c.units[first_unit].src
+    c.duplicates = true
+    c.reported_count = c.reported_count + 1
+    c.units[unit].report.add(error(at, s"$what$FirstDeclared${src.name}:${src.locate(first_at.start)}"))
+
+// Drops every diagnostic that is not a duplicate declaration, where there is one.
+private keep_duplicates(c: *Checker)
+    if !c.duplicates then return
+    for u in 0..<c.units.len()
+        var kept: Buf[Diagnostic] = buf()
+        for d in c.units[u].report.items
+            if d.message.contains(FirstDeclared) then kept.push(d)
+        c.units[u].report.items = kept
+
 private declare_unit(c: *Checker, unit: usize)
     val file = c.units[unit].file
     for i in 0..<file.items.len()
@@ -1230,14 +1255,14 @@ private declare_unit(c: *Checker, unit: usize)
                 val id = c.symbols.len()
                 var symbol = signature(c, unit, file.module_name, f, id, f.type_params, false, None)
                 symbol.public = !file.private_items[i]
-                if same_as_overload(c, symbol, set)
-                    c.note(unit, f.name_span, s"`${f.name}` is declared more than once with the same parameter types; overloads differ in their parameter types, and a function that chooses by its arguments' values is written with clauses")
+                if matching_overload(c, symbol, set) is Some(first)
+                    note_duplicate(c, unit, f.name_span, s"`${f.name}` is declared more than once with the same parameter types; overloads differ in their parameter types, and a function that chooses by its arguments' values is written with clauses", c.symbols[first].unit, c.symbols[first].decl.name_span)
                     continue
-                if set.len() == 0 && c.variants.get(key) is Some(_)
-                    c.note(unit, f.name_span, s"`${f.name}` is already a variant of ${variant_owners(c, key)}")
+                if set.len() == 0 && c.variants.get(key) is Some(v)
+                    note_duplicate(c, unit, f.name_span, s"`${f.name}` is already a variant of ${variant_owners(c, key)}", c.data[v.data].unit, c.data[v.data].variants[v.index].span)
                 if set.len() == 0 && c.class_types.get(key) is Some(k)
-                    if c.classes[k].decl.object then c.note(unit, f.name_span, s"`${f.name}` is already an object")
-                    else c.note(unit, f.name_span, s"`${f.name}` is already a class, which is called to make one")
+                    if c.classes[k].decl.object then note_duplicate(c, unit, f.name_span, s"`${f.name}` is already an object", c.classes[k].unit, c.classes[k].decl.name_span)
+                    else note_duplicate(c, unit, f.name_span, s"`${f.name}` is already a class, which is called to make one", c.classes[k].unit, c.classes[k].decl.name_span)
                 c.symbols.push(symbol)
                 c.states.push(0)
                 c.bodies.push(None)
@@ -1255,16 +1280,19 @@ private declare_unit(c: *Checker, unit: usize)
 // no call could choose between them. Two overloads are the same when each accepts the other's
 // parameter types: so `f[T](x: T)` and `f[U](x: U)` are, and neither whether a parameter is by-name
 // nor whether a function parameter is `@sendable` tells two apart.
-private same_as_overload(c: *Checker, symbol: FunctionSymbol, others: Buf[usize]) -> bool
+private same_as_overload(c: *Checker, symbol: FunctionSymbol, others: Buf[usize]) -> bool = matching_overload(c, symbol, others) is Some(_)
+
+// The first of `others` that takes the same parameter types as `symbol`.
+private matching_overload(c: *Checker, symbol: FunctionSymbol, others: Buf[usize]) -> Option[usize]
     // A parameter type already reported as unknown tells nothing apart.
     for p in symbol.params
-        if *p is ErrorType then return false
+        if *p is ErrorType then return None
     for other in others
         val o = c.symbols[other]
         if o.params.len() != symbol.params.len() then continue
         if accepts(c, o.params, o.type_owner, o.type_params.len(), symbol.params) && accepts(c, symbol.params, symbol.type_owner, symbol.type_params.len(), o.params)
-            return true
-    false
+            return Some(other)
+    None
 
 // Gives every function of an overload set, and the functions computing their defaults, its parameter
 // types, which name it apart from the others in the object file.
@@ -1324,6 +1352,14 @@ private restore_vars(c: *Checker, saved: Buf[Option[&Type]])
     for i in 0..<saved.len()
         c.vars[i] = saved[i]
 
+// Reports a type of qualified name `key` declared again, naming the data type or class that has it.
+private note_type_duplicate(c: *Checker, unit: usize, at: Span, name: string, key: string)
+    val what = s"the type `$name` is declared more than once"
+    if c.types.get(key) is Some(t)
+        note_duplicate(c, unit, at, what, c.data[t].unit, c.data[t].decl.span)
+    elif c.class_types.get(key) is Some(k)
+        note_duplicate(c, unit, at, what, c.classes[k].unit, c.classes[k].decl.name_span)
+
 private declare_types(c: *Checker, unit: usize)
     val file = c.units[unit].file
     for i in 0..<file.items.len()
@@ -1333,7 +1369,7 @@ private declare_types(c: *Checker, unit: usize)
                 c.note(unit, d.span, s"`${d.name}` is a built-in type, so it cannot be declared")
                 continue
             if c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_)
-                c.note(unit, d.span, s"the type `${d.name}` is declared more than once")
+                note_type_duplicate(c, unit, d.span, d.name, key)
                 continue
             if file.private_items[i] then c.private_names.put(key, true)
             check_c_enum_declaration(c, unit, d)
@@ -1360,7 +1396,7 @@ private declare_types(c: *Checker, unit: usize)
                 c.note(unit, d.name_span, s"`${d.name}` is a built-in type, so it cannot be declared")
                 continue
             if c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_)
-                c.note(unit, d.name_span, s"the type `${d.name}` is declared more than once")
+                note_type_duplicate(c, unit, d.name_span, d.name, key)
                 continue
             if file.private_items[i] then c.private_names.put(key, true)
             check_handle_declaration(c, unit, d)
@@ -1386,13 +1422,14 @@ private declare_objects(c: *Checker, unit: usize)
             var companion_data: Option[usize] = None
             if c.class_types.get(key) is Some(k)
                 if c.classes[k].decl.object || c.classes[k].companion is Some(_)
-                    c.note(unit, d.name_span, s"the object `${d.name}` is declared more than once")
+                    val first = if c.classes[k].decl.object then k else c.classes[k].companion.unwrap()
+                    note_duplicate(c, unit, d.name_span, s"the object `${d.name}` is declared more than once", c.classes[first].unit, c.classes[first].decl.name_span)
                     continue
                 companion = Some(k)
                 c.classes[k].companion = Some(id)
             elif c.types.get(key) is Some(t)
-                if c.data[t].companion is Some(_)
-                    c.note(unit, d.name_span, s"the object `${d.name}` is declared more than once")
+                if c.data[t].companion is Some(first)
+                    note_duplicate(c, unit, d.name_span, s"the object `${d.name}` is declared more than once", c.classes[first].unit, c.classes[first].decl.name_span)
                     continue
                 companion_data = Some(t)
                 c.data[t].companion = Some(id)
@@ -3762,21 +3799,21 @@ item_name(item: Item) -> string = item match
 // clash with a module value is reported here.
 private global_name_taken(c: *Checker, unit: usize, name: string, at: Span, object: bool) -> bool
     val key = qualified(c.units[unit].file.module_name, name)
-    if c.global_names.get(key) is Some(_)
-        c.note(unit, at, s"`$name` is declared more than once")
+    if c.global_names.get(key) is Some(g)
+        note_duplicate(c, unit, at, s"`$name` is declared more than once", c.globals[g].unit, c.globals[g].span)
         return true
     if object then return false
     if c.class_types.get(key) is Some(k)
         if !c.classes[k].decl.object && c.classes[k].companion is None
-            c.note(unit, at, s"`$name` is already a class")
+            note_duplicate(c, unit, at, s"`$name` is already a class", c.classes[k].unit, c.classes[k].decl.name_span)
             return true
     if c.scope.get(key) is Some(ids)
         for f in ids
             if !c.symbols[f].constructor
-                c.note(unit, at, s"`$name` is already a function")
+                note_duplicate(c, unit, at, s"`$name` is already a function", c.symbols[f].unit, c.symbols[f].decl.name_span)
                 return true
-    if c.variants.get(key) is Some(_)
-        c.note(unit, at, s"`$name` is already a variant of ${variant_owners(c, key)}")
+    if c.variants.get(key) is Some(v)
+        note_duplicate(c, unit, at, s"`$name` is already a variant of ${variant_owners(c, key)}", c.data[v.data].unit, c.data[v.data].variants[v.index].span)
         return true
     false
 

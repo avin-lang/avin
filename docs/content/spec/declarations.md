@@ -182,7 +182,7 @@ Choosing an overload works as follows:
   the function the parameter is a vector, so `f(xs: int*)` and `f(xs: Vector[int])` have the same
   parameter types.
 - **Scopes.** Overloads are the functions of one name in one scope: the top-level functions of one
-  file, or the local functions of one block. A block's local functions of a name hide every outer
+  module, in whichever of its files each is declared, or the local functions of one block. A block's local functions of a name hide every outer
   function of that name, whatever their parameter types, and a program's own top-level functions of
   a name hide the prelude's.
 - **Function values.** An overloaded name used as a value with no expected function type is an
@@ -1206,7 +1206,11 @@ main() = println(s"${circleArea(Circle(2))}")
 - **A module's files are one namespace.** Each sees every declaration of every other file of its
   module by its bare name, private ones included, and they may not declare one name twice, except
   as overloads of a function. A class's companion object may be in another file of the class's
-  module, never in another module.
+  module, never in another module. A name declared twice, whether in one file or in two, is
+  reported once, at the second declaration, with the place of the first; types, functions of the
+  same parameter types, values, objects and variants clash with one another. The program's other
+  diagnostics follow from the clash, so while a duplicate is unresolved only duplicates are
+  reported. The same name in different modules is no clash.
 - **Another module's declarations are imported, per file.** `import a.b.X` brings `X` into the file;
   `import a.b.{X, y as z}` brings several, and `as` names one differently. There is no wildcard
   import. Importing a name the module does not declare, a private declaration, a name the file's own
