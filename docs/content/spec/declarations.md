@@ -1209,8 +1209,8 @@ main() = println(s"${circleArea(Circle(2))}")
   module, never in another module. A name declared twice, whether in one file or in two, is
   reported once, at the second declaration, with the place of the first; types, functions of the
   same parameter types, values, objects and variants clash with one another. The program's other
-  diagnostics follow from the clash, so while a duplicate is unresolved only duplicates are
-  reported. The same name in different modules is no clash.
+  diagnostics follow from a clash between two files, so while one is unresolved only duplicates
+  are reported. The same name in different modules is no clash.
 - **Another module's declarations are imported, per file.** `import a.b.X` brings `X` into the file;
   `import a.b.{X, y as z}` brings several, and `as` names one differently. There is no wildcard
   import. Importing a name the module does not declare, a private declaration, a name the file's own
