@@ -1,0 +1,99 @@
+// expect: exit 0
+// `fs.metadata`, `size`, `modified` and `setModified`: sizes of empty, small and multi-KB files and
+// after an append; modification times compared rather than printed; a directory; a missing path;
+// a symbolic link, which is followed; and Unicode names. The link is made through Sysl's
+// `sysl.fs.symlink`, which `avin.fs` does not offer.
+import avin.fs
+import avin.time
+
+@sysl("sysl.fs.IoError")
+private data SyslIoError
+    NotFound
+    PermissionDenied
+    AlreadyExists
+    NotADirectory
+    IsADirectory
+    DirectoryNotEmpty
+    TooManyOpenFiles
+    NoSpaceLeft
+    Interrupted
+    NotOpen
+    NotPermitted
+    InvalidUtf8(offset: long)
+    Other(code: int)
+
+@sysl("sysl.fs.symlink")
+private symlinkRaw(target: string, link: string) -> Result[unit, SyslIoError]
+
+sizeOf(file: string) -> long = fs.size(file).getOrElse(-1)
+
+main()
+    val dir = fs.createTempDir("avin-fs-meta").getOrElse("")
+    // Sizes: empty, small, multi-KB, and after an append.
+    fs.writeText(dir + "/empty", "")
+    println(sizeOf(dir + "/empty"))
+    fs.writeText(dir + "/small", "hello")
+    println(sizeOf(dir + "/small"))
+    fs.writeText(dir + "/big", "x".repeat(5000))
+    println(sizeOf(dir + "/big"))
+    fs.appendText(dir + "/small", ", world")
+    println(sizeOf(dir + "/small"))
+    fs.appendText(dir + "/empty", "")
+    println(sizeOf(dir + "/empty"))
+    // Size counts bytes, not characters.
+    fs.writeText(dir + "/utf", "héllo→")
+    println(sizeOf(dir + "/utf"))
+    fs.writeBytes(dir + "/bin", Array.tabulate(300, (i) -> byte(i % 256)))
+    println(sizeOf(dir + "/bin"))
+    // Metadata of a file.
+    fs.metadata(dir + "/small") match
+        Ok(m) -> println(s"${m.size} ${m.isDir} ${m.isFile}")
+        Err(e) -> println(s"error $e")
+    // A directory.
+    fs.metadata(dir) match
+        Ok(m) -> println(s"dir ${m.isDir} ${m.isFile}")
+        Err(e) -> println(s"error $e")
+    // Modified time is near now, and moves forward after a write.
+    val start = time.now()
+    fs.writeText(dir + "/t", "one")
+    val first = fs.modified(dir + "/t").getOrElse(time.epochMicros(0))
+    println(first >= time.epochMicros(start.epochMicros - 5000000))
+    println(first <= time.epochMicros(time.now().epochMicros + 5000000))
+    fs.setModified(dir + "/t", time.epochSeconds(1000000000))
+    val old = fs.modified(dir + "/t").getOrElse(time.epochMicros(0))
+    println(old == time.epochSeconds(1000000000))
+    fs.writeText(dir + "/t", "two")
+    val second = fs.modified(dir + "/t").getOrElse(time.epochMicros(0))
+    println(second > old)
+    // setModified on a directory, and an exact round trip at second resolution.
+    println(fs.setModified(dir, time.epochSeconds(1500000000)))
+    println(fs.modified(dir).getOrElse(time.epochMicros(0)) == time.epochSeconds(1500000000))
+    // Setting the time changes neither contents nor size.
+    println(s"${fs.readText(dir + "/t")} ${sizeOf(dir + "/t")}")
+    // Missing paths.
+    println(fs.size(dir + "/missing"))
+    println(fs.modified(dir + "/missing"))
+    println(fs.metadata(dir + "/missing/deeper"))
+    println(fs.setModified(dir + "/missing", time.now()))
+    // Symbolic links are followed: a link to a file reports the file, a dangling one NotFound.
+    println(symlinkRaw(dir + "/small", dir + "/link").isOk())
+    println(sizeOf(dir + "/link"))
+    println(symlinkRaw(dir, dir + "/dirlink").isOk())
+    fs.metadata(dir + "/dirlink") match
+        Ok(m) -> println(s"dirlink ${m.isDir}")
+        Err(e) -> println(s"error $e")
+    println(symlinkRaw(dir + "/nowhere", dir + "/dangling").isOk())
+    println(fs.size(dir + "/dangling"))
+    fs.setModified(dir + "/link", time.epochSeconds(1200000000))
+    println(fs.modified(dir + "/small").getOrElse(time.epochMicros(0)) == time.epochSeconds(1200000000))
+    // Unicode names.
+    fs.writeText(dir + "/日本語-é.txt", "abc")
+    println(sizeOf(dir + "/日本語-é.txt"))
+    println(fs.setModified(dir + "/日本語-é.txt", time.epochSeconds(1300000000)))
+    println(fs.modified(dir + "/日本語-é.txt").getOrElse(time.epochMicros(0)) == time.epochSeconds(1300000000))
+    // The sizes the retention use needs: the sum over a listing.
+    var total: long = 0
+    for name in fs.listDir(dir + "/").getOrElse([])
+        if fs.isFile(dir + "/" + name) then total += sizeOf(dir + "/" + name)
+    println(total > 0)
+    fs.removeDirAll(dir)

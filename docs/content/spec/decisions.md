@@ -4663,6 +4663,23 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- **File metadata in `avin.fs`** (branch `fs-metadata`). Proposed: `metadata(path)` answers
+  `Result[Metadata, IoError]` with `Metadata(size: long, modified: Instant, isDir: bool,
+  isFile: bool)`, from one `stat`, so the fields describe one entry; `size(path)` and
+  `modified(path)` are shorthands for the two fields a program usually wants, and `setModified(path,
+  instant)` sets the modification time (and the access time with it). Every call follows symbolic
+  links, as `exists`, `isDir` and `isFile` do; a dangling link is `NotFound`. `modified` is an
+  `avin.time.Instant`, the type `now()` answers, so a program compares a file's age with
+  `now() - modified`-style arithmetic and nothing else. Why: marshal's retention kept `.used`
+  sidecar files because a file's age and size could not be read; one `stat` is also one trip, and
+  a value is not three answers about three possibly different files. Alternatives weighed:
+  separate `size`/`modified` only (three trips for three facts, no directory answer); returning
+  Sysl's whole `Meta` (owner, inode and permission bits are not what Avin programs ask yet, and
+  they tie the type to POSIX); a `linkMetadata` that does not follow (nothing needs it yet, and
+  `avin.fs` offers no way to make a link to ask about); `setModified` omitted (Sysl has
+  `set_modified`, so it costs a line, and it lets "last used" be recorded without writing).
+  Times are microseconds, the library's resolution.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension

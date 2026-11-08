@@ -567,11 +567,37 @@ copyNotes(from: string, to: string) -> Result[unit, IoError]
 | `createDir(dir) -> Result[unit, IoError]` | Makes one directory, whose parent must exist; `AlreadyExists` if something is there. |
 | `createDirAll(dir) -> Result[unit, IoError]` | Makes the directory and every missing one above it; a directory already there is success; a file where `dir` itself would go is `AlreadyExists`, and a file where one of the directories above it would go is `NotADirectory`. |
 | `createTempDir(prefix) -> Result[string, IoError]` | Makes a new, empty directory in the platform's place for temporary files, its name starting with `prefix`, and answers its path. |
+| `metadata(file) -> Result[Metadata, IoError]` | One look at a path: a `Metadata` of `size` (bytes), `modified` (an `avin.time.Instant`), `isDir` and `isFile`. A symbolic link is followed; a missing path is `NotFound`. For a directory `size` is the file system's bookkeeping, not a count of entries. |
+| `size(file) -> Result[long, IoError]` | The size of the file in bytes. |
+| `modified(file) -> Result[Instant, IoError]` | When the contents of the file or directory last changed, to the file system's resolution. |
+| `setModified(file, when) -> Result[unit, IoError]` | Sets the modification time (the access time moves with it); reading it back may round to the file system's resolution. |
 | `listDir(dir) -> Result[Vector[string], IoError]` | The names of the directory's entries, files and directories alike, sorted by code point; `NotFound` or `NotADirectory` when there is no directory to list. |
 
 **Paths are strings**, and the questions follow symbolic links: `isDir` of a link to a directory is
 `true`. `removeDirAll` is the exception that matters: a link inside the tree is removed, never
 followed, so it deletes nothing outside the directory it was given.
+
+**Size and age** come from one `stat`. A cache that keeps what was used recently and reports what it
+freed:
+
+```text
+import avin.fs
+import avin.io.IoError
+import avin.time
+import avin.time.Duration
+
+evictOlderThan(dir: string, age: Duration) -> Result[long, IoError]
+    var freed: long = 0
+    for name in fs.listDir(dir)?
+        val file = dir + "/" + name
+        val m = fs.metadata(file)?
+        if m.isFile && time.now() - m.modified > age
+            fs.remove(file)?
+            freed += m.size
+    Ok(freed)
+```
+
+Recording that an entry was used is `fs.setModified(file, time.now())`, which writes nothing to the file.
 
 **A temporary directory is the program's to remove.** `createTempDir` makes the directory rather than
 inventing a name, so no other program can take it in between, and nothing removes it at the end:
