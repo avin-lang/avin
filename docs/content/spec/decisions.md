@@ -4737,21 +4737,14 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   right side of a `val` with a declared function type takes one too. Parameter types come from the
   expected type, as for any lambda. Why: the user's rule that Avin adopts the conveniences that add
   no complexity; the short form reads as what it does and is the usual one for a one-step function.
-
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- Proposed (branch `placeholder-lambdas`): **a `_` that is a whole argument belongs to the argument
+- Settled on the user's delegation 2026-11-09 (branch `placeholder-lambdas`): **a `_` that is a whole argument belongs to the argument
   around its call**, so `xs.map(f(_, 2))` is `xs.map(x -> f(x, 2))` and `f(_)` is never the identity
   lambda `f(x -> x)`. Where a call with such a `_` is itself no argument and no declared value's
   right side (`f(_, 2)` as a statement), it is an error asking for the lambda to be written out.
   Why: the identity is rarely what `f(_)` means, and `x -> x` is short; reading the whole call as the
   lambda is what makes partial application, `f(_, 2)`, work. Alternative weighed: the identity
   lambda, which makes `f(_, 2)` a call of `f` with a function.
-- Proposed (branch `placeholder-lambdas`): **`xs.map(f(_))` is an error saying to pass `f`**: a
+- Settled on the user's delegation 2026-11-09 (branch `placeholder-lambdas`): **`xs.map(f(_))` is an error saying to pass `f`**: a
   placeholder lambda that only calls a function named in lowercase with all its parameters in order
   (`f(_)`, `add(_, _)`) is that function, and functions are already values. A name starting in
   uppercase (`Some(_)`, `Point(_, 0)`) is taken for a constructor and makes the lambda. Why: one
@@ -4760,7 +4753,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   resolves to rather than its case, which needs the parser to know the checker's answer; the case
   test follows the settled naming rule. Review with the user: whether the redundant form should
   simply be allowed.
-- Proposed (branch `placeholder-lambdas`): **where a placeholder is searched for.** Through
+- Settled on the user's delegation 2026-11-09 (branch `placeholder-lambdas`): **where a placeholder is searched for.** Through
   operators of every precedence, member access and method calls, tuple parts, `is`, ranges, `?`,
   `with`'s base, a call's callee and a call's arguments that are `_` alone; never into a lambda, a
   block, `if`, `match`, a collection literal, an interpolation, an assignment or another call's other
@@ -4769,12 +4762,18 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   would make the reader search for which lambda it belongs to. Alternatives weighed: searching
   everything to the argument (makes `xs.map(n -> n + _)` a lambda returning a lambda) and searching
   operators only (rejects `(_, 0)` and `_ is Some(_)`).
-- Proposed (branch `placeholder-lambdas`): **a declared value takes a placeholder lambda only by its
+- Settled on the user's delegation 2026-11-09 (branch `placeholder-lambdas`): **a declared value takes a placeholder lambda only by its
   written type**: `val f: (int) -> int = _ + 1` and any declared type other than a tuple; an
   undeclared `val f = _ + 1` is an error, as are a function's body, `return` and an assignment's
   right side, whose expected type the parser does not see. Why: the brief's rule, kept syntactic so
   the lambda's extent never depends on type inference. Alternative weighed: any expression with an
   expected function type, which makes the extent of a lambda depend on checking.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
