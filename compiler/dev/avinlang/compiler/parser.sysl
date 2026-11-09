@@ -139,6 +139,8 @@ private after_dedent(p: Parser) -> bool = p.toks.position > 0 && p.toks.items[p.
 // them, `i++`.
 private as_infix(p: Parser, t: Spanned[Token], offset: usize) -> Spanned[Token]
     if p.toks.position == 0 then return t
+    // `with` right before a brace is the update tail of a data value, binding as a postfix operator.
+    if t.value == Word && p.spelling(t) == "with" && p.ahead(offset + 1) == "{" then return Spanned(Postfix, t.span)
     if t.value == Word && !is_keyword(p.spelling(t)) then return Spanned(InfixName, t.span)
     if t.value == SymbolOp then return Spanned(symbol_token(p.spelling(t)), t.span)
     if t.value == Symbol && p.spelling(t) == "~" then return Spanned(SymbolTight, t.span)
@@ -631,7 +633,73 @@ private postfix(left: &Expr, t: Spanned[Token], op: string, p: *Parser) -> &Expr
     if op == "?" then return Expr(left.span.to(t.span), Propagate(left))
     if op == "[" then return type_application(left, p)
     if op == "(" then return call(left, p)
+    if op == "with" then return with_update(left, p)
     member(left, t, p)
+
+// `base with { pos.x = 3, name = "a" }`: the changes, each a path of field names, `=` and a value,
+// separated by commas, the last of which may carry one. A brace suspends the off-side rule, so the
+// changes may stand one per line.
+private with_update(left: &Expr, p: *Parser) -> &Expr
+    val open = p.toks.advance().unwrap()
+    var changes: Buf[FieldChange] = buf()
+    val outer = p.in_list
+    p.in_list = true
+    var written = false
+    loop
+        if p.at("}") || p.toks.at_end() then break
+        written = true
+        if !p.at_kind(Word)
+            p.report.add(expected(p.toks.here(), "a field name", found_at(p.src, p.toks.here())))
+            skip_change(p)
+            if !p.accept(",") then break
+            continue
+        var path: Buf[string] = buf()
+        var spans: Buf[Span] = buf()
+        val first = p.toks.advance().unwrap()
+        path.push(p.spelling(first))
+        spans.push(first.span)
+        var broken = false
+        while p.accept(".")
+            if !p.at_kind(Word)
+                p.report.add(expected(p.toks.here(), "a field name after `.`", found_at(p.src, p.toks.here())))
+                broken = true
+                break
+            val name = p.toks.advance().unwrap()
+            path.push(p.spelling(name))
+            spans.push(name.span)
+        if !broken && (p.at("(") || p.at("["))
+            val written = from_utf8_unchecked(p.src.text(first.span.to(spans[spans.len() - 1])))
+            p.report.add(error(p.toks.here(), s"`with` changes fields, and an element is not a field: replace the whole field, `$written = …`"))
+            broken = true
+        if !broken && !p.at("=")
+            if p.at_kind(AssignOp)
+                p.report.add(error(p.toks.here(), s"a change in `with` is written `field = value`, and `${p.ahead(0)}` is not `=`"))
+            else p.report.add(expected(p.toks.here(), "`=` after the field's name", found_at(p.src, p.toks.here())))
+            broken = true
+        if broken
+            skip_change(p)
+            if !p.accept(",") then break
+            continue
+        p.toks.advance()
+        val value = expression(p, 0)
+        changes.push(FieldChange(first.span.to(value.span), path, spans, value))
+        if !p.accept(",") then break
+    p.in_list = outer
+    val end = p.toks.here()
+    if !written && p.at("}") then p.report.add(error(open.span.to(end), "`with` changes at least one field: name it, as in `with { x = 1 }`"))
+    p.expect("}")
+    Expr(left.span.to(end), With(left, changes))
+
+// Skips the rest of a change that could not be read, up to the comma or brace that ends it.
+private skip_change(p: *Parser)
+    var depth = 0
+    loop
+        if p.toks.at_end() then return
+        val word = p.ahead(0)
+        if depth == 0 && (word == "," || word == "}") then return
+        if word == "(" || word == "[" || word == "{" then depth += 1
+        if word == ")" || word == "]" || word == "}" then depth -= 1
+        p.toks.advance()
 
 private type_application(left: &Expr, p: *Parser) -> &Expr
     var args: Buf[&TypeExpr] = buf()

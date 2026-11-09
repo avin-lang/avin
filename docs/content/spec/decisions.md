@@ -495,6 +495,14 @@ a decision changes, this page and the chapter change together.
   `||`, with `!` swapping the two. After an `if` whose one branch never finishes, the rest of the
   block sees the other branch's names. `a is P(v) || b is P(v)` binds no `v` for the whole. A
   condition binds a name once, and its names may shadow the enclosing block's.
+- Settled by the user 2026-11-09: **data updates are written `with { … }` with field paths**
+  ([Changing fields](/spec/declarations/#changing-fields-with)): `p with { pos.x = 3, name = "a" }`
+  is a new value of `p`'s type, each named field replaced and every other one `p`'s; a path rebuilds
+  only the values along it, a shared prefix once. Paths go through data fields only; a method is
+  never named; a path named twice, or a field beside a path inside it, is an error; an index is a
+  syntax error suggesting the whole field; values are read against the leaf field's type; the base
+  is evaluated first, then the values left to right; an unknown field is reported with the nearest
+  one. `with` is a keyword only after an operand and before `{`, binding as a postfix tail.
 
 **Project and tooling**
 
@@ -4700,6 +4708,35 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 - Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
 
 ## Proposed
+
+- Proposed (branch `with-update`): **`with` is refused on a data type with several variants**, and a
+  path through a field of such a type (`Option` among them) is refused too. Why: variants are
+  constructors, not types, so no static type says which variant a value is and which fields it has;
+  the language already refuses `s.radius` on a `Shape` for the same reason, and a `match` arm makes
+  the new variant directly (`Circle(r) -> Circle(r + 1)`). Alternatives weighed: accepting it where
+  every variant has every named field, with the same type, and choosing the variant at run time (a
+  hidden `match`), which makes the form's cost and its errors depend on edits to other variants; and
+  trapping on a variant without the field, which turns a compile-time error into a run-time one.
+  Review with the user: whether the every-variant-has-it form is wanted for enums whose variants
+  share a common header.
+- Proposed (branch `with-update`): **a `with` keeps the base's type arguments**: `Box[int] with
+  { v = "s" }` is a type error, not a `Box[string]`. Why: the result is then always the base's type,
+  as the desugaring to a copy says, the value of each change is read against a known field type (so
+  literals and `None` take it), and a field the change does not name, which may hold a `T`, never
+  has to be re-checked at a new type. Alternative weighed: re-inferring the type arguments from the
+  changed fields and the kept ones, which is what a call of the variant would do; it is left for an
+  explicit construction, `Box("s", b.label)`.
+- Proposed (branch `with-update`): **`with` is read as the update only when the brace follows it on
+  the same line**, as a postfix tail binding tighter than every prefix and infix operator; before
+  anything else it is an ordinary name, so `a with b` stays the infix call of a method `with`. Why:
+  keywords are contextual, and `Isolated.with` and the library's `shared.with(f)` keep their names.
+  The cost: an infix call of a method `with` whose argument is a set or map literal must be written
+  `a.with({…})`. Alternative weighed: making `with` a reserved word, which would rename those
+  methods.
+- Proposed (branch `with-update`): **a misspelt field is reported with the nearest field** when it is
+  at most two single-byte edits away and fewer edits than the name's length (`nmae` suggests `name`;
+  a one-letter name suggests nothing). Alternative weighed: listing every field of the type, which is
+  long for wide types.
 
 ## Open
 

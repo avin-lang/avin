@@ -521,6 +521,59 @@ main()
 exhaustively. Methods are added in an `impl` block; an impl of `Display` or `Debug` replaces the
 derived one ([Display and Debug](/spec/equality-and-memory/#display-and-debug)).
 
+### Changing fields: `with`
+
+A data value never changes, so a changed one is a new value: `base with { f = v, … }` is a value of
+the base's type with each named field replaced and every other field the base's. The left of each
+`=` is a field's name or a **path** of field names, `pos.x`, reaching a field inside a field at any
+depth; the base is left as it was.
+
+```avin
+data Point(x: int, y: int)
+data Sprite(pos: Point, name: string)
+
+main()
+    val s = Sprite(Point(1, 2), "ship")
+    val t = s with { pos.x = 3, name = "ghost" }
+    println(s)   // Sprite(Point(1, 2), ship)
+    println(t)   // Sprite(Point(3, 2), ghost)
+```
+
+- **A path makes again only the values along it.** `s with { pos.x = 3 }` is a new `Sprite` holding
+  a new `Point`; every field no path reaches is the base's own value, shared, so a class object or an
+  array a field holds is the same object in both. Paths with a common prefix make that prefix's value
+  once: `s with { pos.x = 1, pos.y = 2 }` makes one `Point`.
+- **Each value is read against the type of the field its path ends at**, so a literal takes that
+  type, as an argument does: `{ ratio = 1 }` into a `real` field, `{ items = [4, 5] }` into a `List`,
+  `{ next = None }` into an `Option`, a lambda into a function field.
+- **The result has the base's type.** A generic data value keeps its type arguments, so
+  `Box(1, "a") with { v = 2 }` is a `Box[int]` and `with { v = "s" }` on it is a type error.
+- **Order.** The base is evaluated once, first, then the values in the order written, and the new
+  value is made after the last of them. A value that leaves the function (`return`, `?`) leaves
+  before anything is made.
+- **The base is a data type with one variant.** On a type with several the fields a value has are
+  decided at run time, so `with` is refused there, and a `match` makes the new variant. A class, a
+  type parameter or any other type is refused too: a class's object is changed through its `var`
+  fields.
+- **A path goes through data fields only**: each name before the last must hold a data type with one
+  variant. A field holding a class, a type with several variants (`Option` among them), a type
+  parameter or a built-in type is refused, with the suggestion to replace that field whole.
+- **Only fields are named.** A method of the type, even one taking no arguments, is refused; a name
+  the type does not have is reported with the type's name and its nearest field.
+- **No two changes overlap**: a path named twice is an error (`` `pos.x` is changed twice in one
+  `with` ``), and so is a field changed whole beside a path inside it, `pos = q, pos.x = 1`, in either
+  order.
+- **An element is not a field.** `with { xs(0) = 1 }` is a syntax error that suggests replacing the
+  whole field, `xs = …`. Compound assignments (`+=`) are not written there, and `with { }` names
+  nothing and is an error.
+
+`with` is a postfix tail like a call's parentheses: it binds to the operand before it (`-p with { … }`
+is `-(p with { … })`, `a + p with { … }` changes `p`), its base may be any expression, a call, a
+field or another `with`, and a member read may follow the brace (`s with { pos.x = 3 }.pos`). A brace
+suspends the off-side rule, so the changes may stand one per line, and the last may carry a comma.
+`with` is a keyword only after an operand and before `{`; everywhere else it is a name, so a field,
+a method or a local may be called `with`, and `a with b` stays an infix call of a method `with`.
+
 ## class
 
 ```text

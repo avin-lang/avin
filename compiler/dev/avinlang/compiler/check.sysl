@@ -9657,6 +9657,7 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     MultiAssign(targets, op, value, op_span) -> multi_assign_expr(c, e, targets, op, value, op_span)
     Tuple(items) -> tuple_expr(c, e, items, expected)
     TupleIndex(target, index) -> tuple_index(c, e, target, index)
+    With(base, changes) -> with_expr(c, e, base, changes)
     Update(target, increment, postfix, op_span) -> update_expr(c, e, target, increment, postfix, op_span)
     Binary(op, left, right, op_span) -> binary_expr(c, e, op, left, right, op_span, expected)
     Compare(operands, ops) -> compare_expr(c, e, operands, ops)
@@ -10241,6 +10242,199 @@ private one_variant_field(c: *Checker, t: &Type, name: string) -> bool
             for n in d.variants[0].field_names
                 if n == name then return true
     false
+
+// `base with { pos.x = 3, name = "a" }`: the base is evaluated once, then each value in the order
+// written, each read against the type of the field its path ends at; the result is a new value of the
+// base's own type, in which the data values along each path are made again and every field no path
+// reaches is the base's. Paths sharing a prefix make that prefix's value once.
+private with_expr(c: *Checker, e: &Expr, base: &Expr, changes: Buf[FieldChange]) -> &TExpr
+    val unit = unit_of(c)
+    val typed_base = check_expr(c, base, None)
+    val ty = zonk(c, typed_base.ty)
+    if !with_base(c, base.span, ty)
+        for change in changes do check_statement(c, change.value)
+        return TExpr(e.span, ErrorType, UnitConst)
+    var items: Buf[&TExpr] = buf()
+    val held = hidden_local(c, ty)
+    items.push(TExpr(base.span, Unit, Let(held, typed_base)))
+    var paths: Buf[Buf[usize]] = buf()
+    var written: Buf[string] = buf()
+    var locals: Buf[usize] = buf()
+    var failed = false
+    var finishes = !(*ty is Nothing)
+    for change in changes
+        val reached = with_path(c, ty, change)
+        val (indices, leaf) = reached match
+            Some(r) -> r
+            None ->
+                failed = true
+                check_statement(c, change.value)
+                continue
+        val spelled = joined_path(change.path, change.path.len())
+        var clash = false
+        for k in 0..<paths.len()
+            if clash then break
+            if same_indices(paths[k], indices)
+                c.note(unit, change.span, s"`$spelled` is changed twice in one `with`")
+                clash = true
+            elif starts_indices(indices, paths[k])
+                c.note(unit, change.span, s"`${written[k]}` is changed whole and `$spelled` inside it in one `with`: change one or the other")
+                clash = true
+            elif starts_indices(paths[k], indices)
+                c.note(unit, change.span, s"`$spelled` is changed whole and `${written[k]}` inside it in one `with`: change one or the other")
+                clash = true
+        val value = check_expr(c, change.value, Some(leaf))
+        if !fits(c, value.ty, leaf) then c.note(unit, change.value.span, s"expected ${type_name(leaf)}, found ${type_name(value.ty)}${sendable_hint(c, leaf, value.ty)}")
+        if *value.ty is Nothing then finishes = false
+        if clash
+            failed = true
+            continue
+        val local = hidden_local(c, leaf)
+        items.push(TExpr(change.value.span, if *value.ty is Nothing then Nothing else Unit, Let(local, value)))
+        paths.push(indices)
+        written.push(spelled)
+        locals.push(local)
+    if failed then return TExpr(e.span, ErrorType, UnitConst)
+    var prefix: Buf[usize] = buf()
+    items.push(rebuilt_value(c, e.span, ty, held, ty, prefix, paths, locals))
+    TExpr(e.span, if finishes then ty else Nothing, Block(items))
+
+// Whether `with` can make a changed copy of a value of type `ty`: a data type with one variant.
+// Anything else is reported.
+private with_base(c: *Checker, at: Span, ty: &Type) -> bool
+    val unit = unit_of(c)
+    *ty match
+        Data(id, _, _) ->
+            if c.data[id].variants.len() == 1 then return true
+            c.note(unit, at, s"`${type_name(ty)}` has several variants, so `with` cannot know which fields a value has: `match` on it and make the new variant there")
+        Class(_, _, _) -> c.note(unit, at, s"`with` makes a changed copy of a data value, and `${type_name(ty)}` is a class, whose object is changed through its `var` fields")
+        TypeVar(_, _, _) -> c.note(unit, at, s"`with` makes a changed copy of a data value, and `${type_name(ty)}` is a type parameter, whose fields are not known")
+        ErrorType -> ()
+        _ -> c.note(unit, at, s"`with` makes a changed copy of a data value, and this is `${type_name(ty)}`")
+    false
+
+// The field indices a change's path walks from a value of type `ty`, and the type of the field it
+// ends at; or `None`, with the reason reported, where a name is not a field or a path goes through
+// something other than a data value with one variant.
+private with_path(c: *Checker, ty: &Type, change: FieldChange) -> Option[(Buf[usize], &Type)]
+    val unit = unit_of(c)
+    var indices: Buf[usize] = buf()
+    var current = ty
+    for k in 0..<change.path.len()
+        val name = change.path[k]
+        val at = change.spans[k]
+        if k > 0
+            current = zonk(c, current)
+            val through = joined_path(change.path, k)
+            val one = *current match
+                Data(id, _, _) -> c.data[id].variants.len() == 1
+                _ -> false
+            if !one
+                val what = *current match
+                    Data(_, _, _) -> s"`${type_name(current)}`, whose several variants have no fields to name"
+                    Class(_, _, _) -> s"`${type_name(current)}`, a class whose object the new value would share"
+                    TypeVar(_, _, _) -> s"`${type_name(current)}`, a type parameter"
+                    _ -> s"`${type_name(current)}`"
+                c.note(unit, at, s"a path in `with` goes through data fields only, and `$through` holds $what: replace `$through` whole")
+                return None
+        val (id, args) = *current match
+            Data(id, _, args) -> (id, args)
+            _ -> return None
+        val d = c.data[id]
+        val names = d.variants[0].field_names
+        var found: Option[usize] = None
+        for i in 0..<names.len()
+            if names[i] == name then found = Some(i)
+        val index = found match
+            Some(i) -> i
+            None ->
+                if methods_of(c, current, name).len() > 0
+                    c.note(unit, at, s"`$name` is a method of `${type_name(current)}`, not a field: `with` changes only the fields its variant declares")
+                else
+                    val hint = nearest_name(names, name) match
+                        Some(n) -> s": did you mean `$n`?"
+                        None -> ""
+                    c.note(unit, at, s"`${type_name(current)}` has no field `$name`$hint")
+                return None
+        indices.push(index)
+        current = variant_fields(d, id, 0, args)[index]
+    Some((indices, current))
+
+// The value of type `ty` at the field path `prefix` of the base held in local `held`, made again: a
+// field a change ends at is its new value, one a longer change goes through is made again the same
+// way, and any other is read from the base.
+private rebuilt_value(c: *Checker, at: Span, ty: &Type, held: usize, base_ty: &Type, prefix: Buf[usize], paths: Buf[Buf[usize]], locals: Buf[usize]) -> &TExpr
+    val (id, args) = *zonk(c, ty) match
+        Data(id, _, args) -> (id, args)
+        _ -> return TExpr(at, ErrorType, UnitConst)
+    val fields = variant_fields(c.data[id], id, 0, args)
+    var made: Buf[&TExpr] = buf()
+    for j in 0..<fields.len()
+        var path: Buf[usize] = buf()
+        for i in prefix do path.push(i)
+        path.push(j)
+        var value: Option[&TExpr] = None
+        var inside = false
+        for k in 0..<paths.len()
+            if same_indices(paths[k], path) then value = Some(TExpr(at, fields[j], Local(locals[k])))
+            elif starts_indices(paths[k], path) then inside = true
+        if value is Some(v) then made.push(v)
+        elif inside then made.push(rebuilt_value(c, at, fields[j], held, base_ty, path, paths, locals))
+        else
+            var read: &TExpr = TExpr(at, base_ty, Local(held))
+            for i in path do read = data_field_read(c, at, read, i)
+            made.push(read)
+    TExpr(at, ty, Construct(0, made))
+
+/** Whether two field paths are the same. */
+private same_indices(a: Buf[usize], b: Buf[usize]) -> bool
+    if a.len() != b.len() then return false
+    for i in 0..<a.len()
+        if a[i] != b[i] then return false
+    true
+
+/** Whether field path `a` goes through `b`: `b` is a proper prefix of it. */
+private starts_indices(a: Buf[usize], b: Buf[usize]) -> bool
+    if a.len() <= b.len() then return false
+    for i in 0..<b.len()
+        if a[i] != b[i] then return false
+    true
+
+/** The first `count` names of a field path as written, `pos.x`. */
+private joined_path(names: Buf[string], count: usize) -> string
+    var out = ""
+    for i in 0..<count
+        out = if i == 0 then names[i] else out + "." + names[i]
+    out
+
+/** The name among `names` nearest to `name` in edit distance, where it is near enough to be a
+ * misspelling: at most two edits, and fewer than the name's length. */
+nearest_name(names: Buf[string], name: string) -> Option[string]
+    var best: Option[string] = None
+    var best_distance = 3usize
+    for candidate in names
+        val d = edit_distance(candidate, name)
+        if d < best_distance && d < name.bytes.len
+            best = Some(candidate)
+            best_distance = d
+    best
+
+/** The number of single-byte insertions, deletions and replacements that turn `a` into `b`. */
+edit_distance(a: string, b: string) -> usize
+    val n = b.bytes.len
+    var previous: Buf[usize] = buf()
+    for j in 0..n do previous.push(j)
+    for i in 0..<a.bytes.len
+        var row: Buf[usize] = buf()
+        row.push(i + 1)
+        for j in 0..<n
+            val replace = previous[j] + (if a.bytes[i] == b.bytes[j] then 0 else 1)
+            var best = replace
+            if previous[j + 1] + 1 < best then best = previous[j + 1] + 1
+            if row[j] + 1 < best then best = row[j] + 1
+            row.push(best)
+        previous = row
+    previous[n]
 
 /** Whether an expression is `self` in a constructor, the object it is still initializing. */
 private is_self(c: *Checker, t: &TExpr) -> bool = t.kind match
@@ -15332,6 +15526,11 @@ private exits_lambda(e: &Expr) -> bool = e.kind match
     Member(target, _) -> exits_lambda(target)
     InfixCall(target, _, _, arg) -> exits_lambda(target) || exits_lambda(arg)
     TupleIndex(target, _) -> exits_lambda(target)
+    With(base, changes) ->
+        if exits_lambda(base) then return true
+        for change in changes
+            if exits_lambda(change.value) then return true
+        false
     TypeApply(target, _) -> exits_lambda(target)
     _ -> true
 
