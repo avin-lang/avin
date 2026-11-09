@@ -4702,14 +4702,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   different text by where it was sent), and polling the signal flag between tests (a blocked test or
   build would never reach the poll). Review with the user: the option's name `--prefix`, and the exit
   codes 143 and 130 (the shell's 128 + signal convention).
-
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- Proposed (branch `with-update`): **`with` is refused on a data type with several variants**, and a
+- Settled on the user's delegation 2026-11-09 (branch `with-update`): **`with` is refused on a data type with several variants**, and a
   path through a field of such a type (`Option` among them) is refused too. Why: variants are
   constructors, not types, so no static type says which variant a value is and which fields it has;
   the language already refuses `s.radius` on a `Shape` for the same reason, and a `match` arm makes
@@ -4719,24 +4712,30 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   trapping on a variant without the field, which turns a compile-time error into a run-time one.
   Review with the user: whether the every-variant-has-it form is wanted for enums whose variants
   share a common header.
-- Proposed (branch `with-update`): **a `with` keeps the base's type arguments**: `Box[int] with
+- Settled on the user's delegation 2026-11-09 (branch `with-update`): **a `with` keeps the base's type arguments**: `Box[int] with
   { v = "s" }` is a type error, not a `Box[string]`. Why: the result is then always the base's type,
   as the desugaring to a copy says, the value of each change is read against a known field type (so
   literals and `None` take it), and a field the change does not name, which may hold a `T`, never
   has to be re-checked at a new type. Alternative weighed: re-inferring the type arguments from the
   changed fields and the kept ones, which is what a call of the variant would do; it is left for an
   explicit construction, `Box("s", b.label)`.
-- Proposed (branch `with-update`): **`with` is read as the update only when the brace follows it on
+- Settled on the user's delegation 2026-11-09 (branch `with-update`): **`with` is read as the update only when the brace follows it on
   the same line**, as a postfix tail binding tighter than every prefix and infix operator; before
   anything else it is an ordinary name, so `a with b` stays the infix call of a method `with`. Why:
   keywords are contextual, and `Isolated.with` and the library's `shared.with(f)` keep their names.
   The cost: an infix call of a method `with` whose argument is a set or map literal must be written
   `a.with({…})`. Alternative weighed: making `with` a reserved word, which would rename those
   methods.
-- Proposed (branch `with-update`): **a misspelt field is reported with the nearest field** when it is
+- Settled on the user's delegation 2026-11-09 (branch `with-update`): **a misspelt field is reported with the nearest field** when it is
   at most two single-byte edits away and fewer edits than the name's length (`nmae` suggests `name`;
   a one-letter name suggests nothing). Alternative weighed: listing every field of the type, which is
   long for wide types.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
