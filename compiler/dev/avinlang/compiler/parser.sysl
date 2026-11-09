@@ -726,7 +726,7 @@ private call(left: &Expr, p: *Parser) -> &Expr
                 reject_keyword(p, p.toks.here(), p.ahead(0), "an argument")
                 name = Some(p.spelling(p.toks.advance().unwrap()))
                 p.toks.advance()
-            val value = expression(p, 0)
+            val value = placeholder_scope(p, expression(p, 0))
             args.push(Argument(start.to(value.span), name, value, false))
             if !p.accept(",") || p.at(")") then break
     p.in_list = outer
@@ -738,6 +738,98 @@ private call(left: &Expr, p: *Parser) -> &Expr
             end = block.span
         None -> ()
     Expr(left.span.to(end), Call(left, args))
+
+/** A placeholder lambda: where `value` holds `_`, each `_` is a parameter of its own, in the order
+ * written, and `value` is the body of a lambda of them, so `_ + _` is `(a, b) -> a + b`. A `_` is
+ * found through operators, member access, tuple parts, `is`, `with`'s base and a call's callee, and
+ * through a call's argument that is `_` alone, which is left for the expression around that call:
+ * `f(_, 2) + 1` is `x -> f(x, 2) + 1`. Every other argument and every lambda, block, `if` and
+ * `match` keeps its own `_`. A value that is `_` alone is no lambda of its own. Where the lambda
+ * would only call a named function with its parameters in order, `f(_)`, it is that function, which
+ * is passed as `f`. */
+placeholder_scope(p: *Parser, value: &Expr) -> &Expr
+    if value.kind is Name("_") then return value
+    var params: Buf[LambdaParam] = buf()
+    val body = with_placeholders(value, &params)
+    if params.len() == 0 then return value
+    if forwarding_name(body, params.len()) is Some(name)
+        var blanks = "_"
+        for _ in 1..<params.len()
+            blanks = blanks + ", _"
+        p.report.add(error(value.span, s"`$name($blanks)` is the function `$name` itself; pass it as `$name`"))
+        return Expr(value.span, Invalid)
+    Expr(value.span, Lambda(params, body))
+
+// The name of the function a placeholder lambda's body only calls, with all of its `count`
+// parameters as the arguments in order and nothing else: a lowercase name, as functions are named.
+private forwarding_name(body: &Expr, count: usize) -> Option[string]
+    val (callee, args) = body.kind match
+        Call(f, a) -> (f, a)
+        _ -> return None
+    val name = callee.kind match
+        Name(n) -> n
+        _ -> return None
+    if name.starts_with("_$") || args.len() != count then return None
+    val first = name.bytes[0]
+    if !(u8('a') <= first <= u8('z')) then return None
+    for a in args
+        if a.block || a.name is Some(_) then return None
+    Some(name)
+
+// `e` with each `_` it holds, through the forms `placeholder_scope` names, made a reference to a
+// fresh parameter added to `params`.
+private with_placeholders(e: &Expr, params: *Buf[LambdaParam]) -> &Expr
+    e.kind match
+        Name(n) ->
+            if n != "_" then return e
+            val name = "_$" + (params.len() + 1).to_string()
+            params.push(LambdaParam(e.span, name, None))
+            Expr(e.span, Name(name))
+        Unary(op, operand) -> Expr(e.span, Unary(op, with_placeholders(operand, params)))
+        Binary(op, left, right, at) ->
+            val l = with_placeholders(left, params)
+            val r = with_placeholders(right, params)
+            Expr(e.span, Binary(op, l, r, at))
+        Compare(operands, ops) ->
+            var items: Buf[&Expr] = buf()
+            for x in operands
+                items.push(with_placeholders(x, params))
+            Expr(e.span, Compare(items, ops))
+        Range(lower, upper, inclusive) ->
+            val l = with_placeholders(lower, params)
+            val u = with_placeholders(upper, params)
+            Expr(e.span, Range(l, u, inclusive))
+        Cons(head, tail, at) ->
+            val h = with_placeholders(head, params)
+            val t = with_placeholders(tail, params)
+            Expr(e.span, Cons(h, t, at))
+        Is(value, pattern, negated) -> Expr(e.span, Is(with_placeholders(value, params), pattern, negated))
+        Propagate(value) -> Expr(e.span, Propagate(with_placeholders(value, params)))
+        Member(target, name) -> Expr(e.span, Member(with_placeholders(target, params), name))
+        TupleIndex(target, index) -> Expr(e.span, TupleIndex(with_placeholders(target, params), index))
+        TypeApply(target, args) -> Expr(e.span, TypeApply(with_placeholders(target, params), args))
+        With(base, changes) -> Expr(e.span, With(with_placeholders(base, params), changes))
+        Tuple(items) ->
+            var parts: Buf[&Expr] = buf()
+            for x in items
+                parts.push(with_placeholders(x, params))
+            Expr(e.span, Tuple(parts))
+        // A name ending in `:` is written after its argument, so that argument's `_` comes first.
+        InfixCall(target, name, at, arg) ->
+            if groups_right(name)
+                val a = with_placeholders(arg, params)
+                return Expr(e.span, InfixCall(with_placeholders(target, params), name, at, a))
+            val t = with_placeholders(target, params)
+            Expr(e.span, InfixCall(t, name, at, with_placeholders(arg, params)))
+        Call(callee, args) ->
+            val f = with_placeholders(callee, params)
+            var rewritten: Buf[Argument] = buf()
+            for a in args
+                if !a.block && a.value.kind is Name("_")
+                    rewritten.push(Argument(a.span, a.name, with_placeholders(a.value, params), false))
+                else rewritten.push(a)
+            Expr(e.span, Call(f, rewritten))
+        _ -> e
 
 // A name, a member or a type application with no parentheses after it is called with a trailing
 // block alone: `scope` and an indented block, or `scope s ->` and one.

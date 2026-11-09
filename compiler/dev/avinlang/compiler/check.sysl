@@ -9647,7 +9647,11 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
         elif limit_constant(c, e.span, target, name) is Some(k) then k
         elif static_value(c, e.span, target, name, expected) is Some(v) then v
         else member_expr(c, e, target, name, expected)
-    Call(callee, args) -> call_expr(c, e.span, callee, args, expected)
+    Call(callee, args) ->
+        if bare_placeholder(args) is Some(blank)
+            c.note(unit_of(c), blank, "`_` alone as an argument makes the call around it a lambda, which stands only as another call's argument or a declared `val`'s value; write the lambda out, as in `x -> …`")
+            TExpr(e.span, ErrorType, UnitConst)
+        else call_expr(c, e.span, callee, args, expected)
     InfixCall(target, name, name_span, arg) -> infix_call(c, e.span, target, name, name_span, arg, expected)
     Block(items, discard) -> block_expr(c, e, items, discard, expected, used)
     Binding(name, declared, value, mutable) -> binding_expr(c, e, name, declared, value, mutable)
@@ -9689,6 +9693,22 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
         check_local_function(c, decl)
         TExpr(e.span, Unit, UnitConst)
     Invalid -> TExpr(e.span, ErrorType, UnitConst)
+
+// The span of a call's argument that is `_` alone, which the parser leaves where no argument or
+// declared value around the call makes it a placeholder lambda.
+private bare_placeholder(args: Buf[Argument]) -> Option[Span]
+    for a in args
+        if !a.block && a.value.kind is Name("_") then return Some(a.value.span)
+    None
+
+// The diagnostic for a lambda's parameter whose type nothing gives; a placeholder lambda's
+// parameter is one of its `_`s, which has no place for a type, so the lambda is written out.
+private untyped_param(name: string, more: bool) -> string
+    val rest = if more then ", …" else ""
+    if name.starts_with("_$") then return s"cannot infer the type of this `_`; write the lambda out with the type, as in `(x: int$rest) -> …`"
+    s"cannot infer the type of `$name`; write it, as in `($name: int$rest) -> …`"
+
+private placeholder_lambda(params: Buf[LambdaParam]) -> bool = params.len() > 0 && params[0].name.starts_with("_$")
 
 private unsupported(c: *Checker, e: &Expr, what: string) -> &TExpr
     c.note(unit_of(c), e.span, s"$what is not implemented")
@@ -9736,7 +9756,7 @@ param_index(c: *Checker, name: string) -> Option[usize]
 
 private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) -> &TExpr
     if name == "_"
-        c.note(unit_of(c), at, "`_` is not a value; it stands for a binding that is never read")
+        c.note(unit_of(c), at, "`_` is not a value here: it stands for a lambda's parameter only within a call's argument, as in `xs.map(_ + 1)`, or a declared `val`'s value, and elsewhere for a binding that is never read")
         return TExpr(at, ErrorType, UnitConst)
     if c.super_args && name == "self"
         c.note(unit_of(c), at, "`self` cannot be used in a superclass's arguments, which run before the object is initialized")
@@ -15791,7 +15811,10 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
                 val elements = tuple_elements(zonk(c, if ps.len() == 1 then ps[0] else Unit))
                 if params.len() >= 2 && elements.len() == params.len()
                     return untupled_lambda(c, e, params, body, elements, expected, delayed)
-                if params.len() >= 2 && elements.len() >= 2
+                if placeholder_lambda(params)
+                    val advice = if params.len() > ps.len() then "to use one parameter more than once, write the lambda out" else "to leave a parameter unused, write the lambda out, as in `(a, _) -> a`"
+                    c.note(unit, e.span, s"expected a function of ${count(ps.len(), "parameter")}, but this lambda has ${count(params.len(), "placeholder")}, and each `_` is a parameter of its own; $advice")
+                elif params.len() >= 2 && elements.len() >= 2
                     c.note(unit, e.span, s"expected a function of 1 parameter, ${type_name(zonk(c, ps[0]))}, but this lambda takes ${params.len()}: a lambda takes that tuple as one parameter or as ${count(elements.len(), "parameter")}, one for each element")
                 else
                     c.note(unit, e.span, s"expected a function of ${count(ps.len(), "parameter")}, but this lambda takes ${params.len()}")
@@ -15828,7 +15851,7 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
                 elif i < wanted.len() && !(*known is Var(_)) && !mismatched
                     ty = known
                     open_params.push(i)
-                elif !mismatched then c.note(unit, p.span, s"cannot infer the type of `${p.name}`; write it, as in `(${p.name}: int) -> …`")
+                elif !mismatched then c.note(unit, p.span, untyped_param(p.name, false))
         types.push(ty)
         local_types.push(local.unwrap_or(ty))
     var result: Option[&Type] = None
@@ -15865,7 +15888,7 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     for i in open_params
         val left = zonk(c, types[i])
         if has_unknowns(left)
-            c.note(unit, params[i].span, s"cannot infer the type of `${params[i].name}`; write it, as in `(${params[i].name}: int) -> …`")
+            c.note(unit, params[i].span, untyped_param(params[i].name, false))
             give_up_unknowns(c, left)
     c.body.visible.truncate(mark)
     c.body.block_start = outer_start
@@ -15923,7 +15946,7 @@ private untupled_lambda(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &
                 keep = None
                 ok = false
         elif has_unknowns(element) && p.name != "_"
-            c.note(unit, p.span, s"cannot infer the type of `${p.name}`; write it, as in `(${p.name}: int, …) -> …`")
+            c.note(unit, p.span, untyped_param(p.name, true))
             ok = false
         declared.push(keep)
     if !ok || has_unknowns(zonk(c, Tuple(elements)))

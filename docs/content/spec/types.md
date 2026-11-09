@@ -323,6 +323,51 @@ either. An override takes the parameter types of the method it overrides, the ma
 may yield a `@sendable` function where that method yields the plain type. Messages print the mark
 as it is written, `@sendable (int) -> int`.
 
+### Placeholder lambdas
+
+A call's argument that holds `_` is a lambda: each `_` is a parameter of its own, in the order
+written, and the argument is the body. A `val` or `var` with a declared type takes one the same way.
+
+```text
+xs.map(_ + 1)                 // xs.map(x -> x + 1)
+people.map(_.name)            // people.map(p -> p.name)
+xs.filter(0 < _ < 10)         // xs.filter(x -> 0 < x < 10)
+xs.reduce(_ + _)              // xs.reduce((a, b) -> a + b)
+people.sortBy(_.age)
+xs.map(scale(_, 2))           // xs.map(x -> scale(x, 2))
+orders.map(_.items.map(_ * 2))  // orders.map(o -> o.items.map(x -> x * 2))
+val inc: (int) -> int = _ + 1
+```
+
+- **The lambda is the nearest argument holding the `_`.** A `_` is found through operators of every
+  precedence, member access and method calls on it, tuple parts (`(_, 0)`), `is`, a range's bounds,
+  `with`'s base and a call's callee, so `_.name.byteLength() + 1` is one lambda. Another call's
+  argument is a lambda of its own: in `orders.map(_.items.map(_ * 2))` the first `_` is an order and
+  the second an item. A name ending in `:` is written after its argument, so in `_ +: _` the first
+  `_` is the element.
+- **A `_` that is a whole argument belongs to the argument around its call**: `xs.map(scale(_, 2))`
+  is `xs.map(x -> scale(x, 2))`, and `apply2(scale(_, 2) + _)` is
+  `apply2((a, b) -> scale(a, 2) + b)`. A lambda that would only call a named function with its
+  parameters in order, `xs.map(double(_))`, is that function: it is an error saying to pass
+  `double`. A constructor's name is no function's, so `xs.map(Some(_))` is `x -> Some(x)`.
+- **A lambda, a block, an `if`, a `match`, a collection literal and an interpolation keep their
+  own `_`**: none of them is searched, so `xs.map(n -> n + _)` is an error, as is any `_` outside a
+  call's argument and a declared value, `val y = x + _`. A `_` alone as a whole argument of a call
+  that is itself no argument, `scale(_, 2)` as a statement, is an error too.
+- **The parameters take their types from the function expected**, as any lambda's do, and their
+  count must be its parameter count; a lambda of two `_`s where a function of one tuple is
+  expected [takes the tuple apart](#tuples), so `xs.zip(ys).map(_ + _)` adds the pairs. A count
+  that fits neither is an error naming both counts, and a `_` whose type nothing gives is an error
+  asking for the lambda to be written out with a type. Overloads see the lambda as they see one
+  written out: the number of `_`s picks among overloads of different counts.
+- Each `_` is used once, so a parameter read twice, or a parameter not read at all, is written as
+  an ordinary lambda.
+
+The other meanings of `_` are unchanged: a parameter `_ ->` or `(_, b) ->` binds nothing, a
+pattern's `_` matches anything, `val _ =`, a discarded part `q, _ = …`, `for _ in`, a clause's `_`
+argument, the last guard `| _ =`, the digit separator in `1_000`, and a name that begins with `_`,
+such as `_offset`, which is an ordinary name.
+
 ### Partial functions
 
 `PartialFunction[-A, +B]` is a core-library trait, and a subtype of `A -> B`: a function defined at
