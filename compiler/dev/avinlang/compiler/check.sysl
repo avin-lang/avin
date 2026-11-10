@@ -309,6 +309,16 @@ struct GenericScope
     owner: usize
     params: Buf[TypeParam]
 
+/** A type alias. `body` is its expansion, naming its type parameters as those of `alias_owner` of
+ * its index, once resolved; `state` is 0 before its body is resolved, 1 while it is, so naming the
+ * alias again then is a cycle, and 2 after. */
+struct AliasSymbol
+    unit: usize
+    module_name: string
+    decl: &AliasDecl
+    body: &Type
+    state: u8
+
 /** A Sysl binding whose types name type parameters, in the generic scope it is declared in: whether
  * each crosses depends on the parameter's bound, known once every conformance is. */
 struct LateBinding
@@ -556,6 +566,9 @@ struct Checker
     /** Whether a top-level name was declared twice: the program's other diagnostics then follow from
      * the duplicate, and only the duplicates are reported. */
     duplicates: bool
+    /** The type aliases, and the place of each among them by qualified name. */
+    aliases: Buf[AliasSymbol]
+    alias_names: Map[string, usize]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -636,7 +649,7 @@ qualified(module_name: string, name: string) -> string = if module_name == "" th
 /** Whether a declaration has the qualified name `key`, whatever kind it is. */
 declared(c: *Checker, key: string) -> bool =
     c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_) || c.variants.get(key) is Some(_) ||
-        c.global_names.get(key) is Some(_) || c.scope.get(key) is Some(_)
+        c.global_names.get(key) is Some(_) || c.scope.get(key) is Some(_) || c.alias_names.get(key) is Some(_)
 
 /** Whether the declaration named `key` may be seen from another module: it is not `private`. A
  * function's name is while any of its overloads is public. */
@@ -812,7 +825,7 @@ private check_imports(c: *Checker, unit: usize)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false)
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -830,6 +843,9 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
         declare_types(&c, u)
     for u in 0..<c.units.len()
         declare_objects(&c, u)
+    for u in 0..<c.units.len()
+        declare_aliases(&c, u)
+    resolve_aliases(&c)
     for u in 0..<c.units.len()
         declare_impls(&c, u)
     for u in 0..<c.units.len()
@@ -1275,6 +1291,7 @@ private declare_unit(c: *Checker, unit: usize)
             ClassItem(_) -> ()
             ImplItem(_) -> ()
             ValueItem(_) -> ()
+            AliasItem(_) -> ()
 
 // Whether a function declared with `symbol` has the same parameter types as one of `others`, so that
 // no call could choose between them. Two overloads are the same when each accepts the other's
@@ -1438,6 +1455,44 @@ private declare_objects(c: *Checker, unit: usize)
                 if file.private_items[i] then c.private_names.put(key, true)
             c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, companion, None, buf(), buf(), 0, companion_data, buf(), None, buf(), buf()))
 
+// Each type alias of a file, named once every data type, class and object is, so a clash with any of
+// them is reported at the alias. An alias is another name for a type, so its parameters take no
+// variance and no bounds: the types its body names hold its type arguments to their own bounds
+// wherever it is used.
+private declare_aliases(c: *Checker, unit: usize)
+    val file = c.units[unit].file
+    for i in 0..<file.items.len()
+        if file.items[i] is AliasItem(d)
+            val key = qualified(file.module_name, d.name)
+            if builtin_type(d.name) is Some(_) || d.name == "Nothing"
+                c.note(unit, d.name_span, s"`${d.name}` is a built-in type, so it cannot be declared")
+                continue
+            if d.name == "Self"
+                c.note(unit, d.name_span, "`Self` is the type implementing a trait, so it cannot be declared")
+                continue
+            if c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_)
+                note_type_duplicate(c, unit, d.name_span, d.name, key)
+                continue
+            if c.alias_names.get(key) is Some(other)
+                note_duplicate(c, unit, d.name_span, s"the type `${d.name}` is declared more than once", c.aliases[other].unit, c.aliases[other].decl.name_span)
+                continue
+            for j in 0..<d.type_params.len()
+                val tp = d.type_params[j]
+                if !(tp.variance is Invariant) then c.note(unit, tp.span, "variance is written on the parameters of a data type or a class, not of a type alias, which is its expansion")
+                if tp.bounds.len() > 0 then c.note(unit, tp.span, s"a type alias's parameter takes no bounds: the types its body names hold `${tp.name}` to theirs wherever the alias is used")
+                if tp.lower is Some(l) then c.note(unit, l.span, s"a lower bound is written on a function's or a method's own type parameter, not on `${tp.name}`")
+                for k in 0..<j
+                    if d.type_params[k].name == tp.name then c.note(unit, tp.span, s"the type parameter `${tp.name}` is declared more than once")
+            if file.private_items[i] then c.private_names.put(key, true)
+            c.alias_names.put(key, c.aliases.len())
+            c.aliases.push(AliasSymbol(unit, file.module_name, d, ErrorType, 0))
+
+// Every alias's expansion, resolved once every alias is named, so one alias may name another
+// declared after it; naming itself, directly or through others, is reported where it does.
+private resolve_aliases(c: *Checker)
+    for id in 0..<c.aliases.len()
+        alias_body(c, id)
+
 // Each impl's type and trait, resolved with the impl's type parameters in scope. They are the type's
 // own parameters under the names the impl gives them, so `impl[T] Box[T]` lists them in order. What
 // an impl may hold, and where it may be written, is reported here once: a conformance lives in the
@@ -1571,6 +1626,9 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
         owner = class_owner(id)
         home = c.classes[id].module_name
     elif builtin_type(path) is Some(_) then home = CoreModule
+    elif c.alias_names.get(key) is Some(a)
+        c.note(unit, d.target.span, s"`$path` is a type alias, for ${alias_shown(c, a)}; an impl names the type itself")
+        return invalid
     else
         c.note(unit, d.target.span, s"unknown type `$path`")
         return invalid
@@ -2550,6 +2608,7 @@ private superclass_of(c: *Checker, unit: usize, id: usize, parent: &Expr) -> Opt
         None ->
             if c.types.get(key) is Some(_) || builtin_type(name) is Some(_)
                 c.note(unit, named.span, s"`$name` is not a class, so it cannot be extended")
+            elif c.alias_names.get(key) is Some(a) then c.note(unit, named.span, s"`$name` is a type alias, for ${alias_shown(c, a)}; a class names its superclass and its traits themselves")
             else c.note(unit, named.span, s"`$name` is neither a class nor a trait")
             return None
     val s = c.classes[sid]
@@ -3793,6 +3852,7 @@ item_name(item: Item) -> string = item match
     ClassItem(d) -> d.name
     ImplItem(_) -> ""
     ValueItem(v) -> v.name
+    AliasItem(d) -> d.name
 
 // Whether a module-level value's name is already declared in its module, reporting it if so. An
 // object's clashes with a class, a function or a variant were reported with its class, so only its
@@ -6967,6 +7027,9 @@ private boundary_reason(c: *Checker, t: &Type, bound: &Type) -> string
 // Holds type arguments written on a type to the bounds of its parameters: at once when every
 // conformance is known, and otherwise once it is.
 private check_type_args(c: *Checker, unit: usize, at: Span, what: string, owner: usize, params: Buf[TypeParam], args: Buf[&Type])
+    // An argument naming a type alias's parameter is held where the alias is used, with the use's
+    // type argument in its place (`hold_alias_body`).
+    if any_alias_param(args) then return
     if !c.conformances_known
         c.pending.push(PendingBound(unit, at, what, owner, params, args, c.generic))
         return
@@ -8674,6 +8737,105 @@ private has_annotation(f: &Function, name: string) -> bool
         if a.name == name then return true
     false
 
+// A use of type alias `id`, written `path` with the type arguments `args`: the alias's expansion,
+// with each type argument in place of its parameter. An alias is transparent: the type it yields is
+// its expansion's, and nothing remembers the alias.
+private expand_alias(c: *Checker, unit: usize, at: Span, path: string, id: usize, args: Buf[&TypeExpr]) -> &Type
+    var resolved: Buf[&Type] = buf()
+    for a in args
+        resolved.push(resolve_type(c, unit, a))
+    val params = c.aliases[id].decl.type_params
+    if resolved.len() != params.len()
+        if params.len() == 0 then c.note(unit, at, s"`$path` takes no type arguments")
+        else c.note(unit, at, s"`$path` takes ${count(params.len(), "type argument")}, not ${resolved.len()}")
+        return ErrorType
+    if c.aliases[id].state == 1
+        c.note(unit, at, s"the type alias `$path` is defined in terms of itself; an alias is another name for a type, so its expansion cannot contain it, and a recursive type is declared with `data`")
+        return ErrorType
+    val body = alias_body(c, id)
+    if *body is ErrorType then return ErrorType
+    for r in resolved
+        if *r is ErrorType then return ErrorType
+    if params.len() == 0 then return body
+    hold_alias_body(c, unit, at, body, alias_owner(id), resolved)
+    substitute(body, alias_owner(id), resolved)
+
+// The expansion of alias `id`, resolved the first time it is asked for, in the alias's own file with
+// its type parameters in scope and no other: an alias is declared at the top level, so it sees no
+// function's type parameters and no trait's `Self`.
+private alias_body(c: *Checker, id: usize) -> &Type
+    if c.aliases[id].state == 2 then return c.aliases[id].body
+    if c.aliases[id].state == 1 then return ErrorType
+    c.aliases[id].state = 1
+    val a = c.aliases[id]
+    val outer_generic = c.generic
+    val outer_self = c.self_trait
+    val outer_bound = c.bound_context
+    c.generic = Some(GenericScope(alias_owner(id), a.decl.type_params))
+    c.self_trait = None
+    c.bound_context = false
+    val body = resolve_type(c, a.unit, a.decl.body)
+    c.generic = outer_generic
+    c.self_trait = outer_self
+    c.bound_context = outer_bound
+    c.aliases[id].body = body
+    c.aliases[id].state = 2
+    // A parameter the body never names would make `A[int]` and `A[string]` one type.
+    if !(*body is ErrorType)
+        for i in 0..<a.decl.type_params.len()
+            val tp = a.decl.type_params[i]
+            // A second parameter of one name was reported where it is declared.
+            var repeated = false
+            for k in 0..<i
+                if a.decl.type_params[k].name == tp.name then repeated = true
+            if !repeated && !names_type_var(body, alias_owner(id), i)
+                c.note(a.unit, tp.span, s"the type alias `${a.decl.name}` does not use its type parameter `${tp.name}`, so every type argument given for it would make the same type")
+    body
+
+/** Alias `id`'s expansion as a diagnostic shows it, its parameters by their names. */
+private alias_shown(c: *Checker, id: usize) -> string = "`" + type_name(c.aliases[id].body) + "`"
+
+// What a name written in `unit` as a value, a constructor or a pattern is told where it is a type
+// alias: an alias names only a type, so the type it stands for is named instead.
+private alias_not_value(c: *Checker, unit: usize, name: string) -> Option[string]
+    val id = c.alias_names.get(resolve_name(c, unit, name)) match
+        Some(id) -> id
+        None -> return None
+    val hint = *c.aliases[id].body match
+        Data(d, n, _) -> if has_variant_named(c.data[d].decl, n) then s"; `$n` makes and matches its values" else ""
+        Class(k, n, _) -> if c.classes[k].decl.object || is_trait(c, k) || is_abstract_class(c, k) || c.classes[k].module_name == CoreModule then "" else s"; `$n` makes its values"
+        _ -> ""
+    Some(s"`$name` is a type alias, for ${alias_shown(c, id)}, and names only a type, not a value, a constructor or a pattern$hint")
+
+private has_variant_named(d: &DataDecl, name: string) -> bool
+    for v in d.variants
+        if v.name == name then return true
+    false
+
+// Holds each type the body of a generic alias names, with the alias's type arguments `args` in place
+// of its parameters, to the bounds of that type's parameters: a use of the alias is held as its
+// expansion written out would be. A type in the body naming no parameter was held where the alias is
+// declared.
+private hold_alias_body(c: *Checker, unit: usize, at: Span, t: &Type, owner: usize, args: Buf[&Type])
+    *t match
+        Data(id, name, items) ->
+            if any_alias_param(items) then check_type_args(c, unit, at, s"`$name`", data_owner(id), c.data[id].decl.type_params, substitute_all(items, owner, args))
+            for item in items
+                hold_alias_body(c, unit, at, item, owner, args)
+        Class(id, name, items) ->
+            if any_alias_param(items) then check_type_args(c, unit, at, s"`$name`", class_owner(id), c.classes[id].decl.type_params, substitute_all(items, owner, args))
+            for item in items
+                hold_alias_body(c, unit, at, item, owner, args)
+        Tuple(items) ->
+            for item in items
+                hold_alias_body(c, unit, at, item, owner, args)
+        Function(params, result, _) ->
+            for p in params
+                hold_alias_body(c, unit, at, p, owner, args)
+            hold_alias_body(c, unit, at, result, owner, args)
+        ByName(inner) -> hold_alias_body(c, unit, at, inner, owner, args)
+        _ -> ()
+
 resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
     InvalidType -> ErrorType
     Named(path, args) ->
@@ -8703,11 +8865,13 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
             var home: Option[string] = None
             if c.types.get(key) is Some(id) then home = Some(c.data[id].module_name)
             elif c.class_types.get(key) is Some(id) then home = Some(c.classes[id].module_name)
+            elif c.alias_names.get(key) is Some(id) then home = Some(c.aliases[id].module_name)
             if home is Some(m)
                 if m != c.files[unit].module_name
                     val declared_as = if m == "" then key else key[m.bytes.len + 1..]
                     c.note(unit, t.span, s"`$declared_as` is private to module `$m`")
                     return ErrorType
+        if c.alias_names.get(key) is Some(id) then return expand_alias(c, unit, t.span, path, id, args)
         if c.types.get(key) is Some(id)
             val d = c.data[id]
             var resolved: Buf[&Type] = buf()
@@ -9798,6 +9962,7 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
         c.note(symbol.unit, at, s"`$name` has fields; call it, as in `$name(…)`")
     elif is_variant then ()
     elif tested_named(c, name) then c.note(symbol.unit, at, s"`$name` is bound by an `is` test, and is in scope only where that test is known to hold")
+    elif alias_not_value(c, unit_of(c), name) is Some(message) then c.note(symbol.unit, at, message)
     else c.note(symbol.unit, at, s"`$name` is not defined")
     TExpr(at, ErrorType, UnitConst)
 
@@ -10569,7 +10734,7 @@ private assignable(c: *Checker, target: &Expr) -> Option[usize]
     None
 
 /** Whether the qualified name `key` is a type's: a class's, a trait's or a data type's. */
-private is_type_name(c: *Checker, key: string) -> bool = c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_)
+private is_type_name(c: *Checker, key: string) -> bool = c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_) || c.alias_names.get(key) is Some(_)
 
 // An assignment's target `m.x`, with `m` a module the file imports whole: the name `m.x` its
 // declaration is reached by, as a read reaches it. A member the module does not declare, or keeps
@@ -13659,7 +13824,7 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
                     for a in args
                         check_statement(c, a.value)
                     return TExpr(at, ErrorType, UnitConst)
-        c.note(unit, named.span, s"`$name` is not defined")
+        c.note(unit, named.span, alias_not_value(c, unit, name).unwrap_or(s"`$name` is not defined"))
         return TExpr(at, ErrorType, UnitConst)
     if ids.len() == 1 then return call_function(c, at, named.span, ids[0], args, explicit, expected, buf())
     val choice = choose_overload(c, at, named.span, name, ids, args, explicit)
@@ -17140,7 +17305,7 @@ private extractor_pattern(c: *Checker, p: &Pattern, path: string, args: Buf[&Pat
         if methods_of(c, t, "unapply").len() > 0 then method = "unapply"
         elif methods_of(c, t, "unapplySeq").len() > 0 then method = "unapplySeq"
         else c.note(unit, at, s"`$path` is not a variant, and ${type_name(t)} has no `unapply` or `unapplySeq` to make it an extractor")
-    else c.note(unit, at, s"`$path` is not a variant or an extractor")
+    else c.note(unit, at, alias_not_value(c, unit, path).unwrap_or(s"`$path` is not a variant or an extractor"))
     if method == "" then return failed_extractor(c, p, args, no_bind)
     val name = s"extractor ${at.start}"
     val local = declare_local(c, at, name, ty, false)

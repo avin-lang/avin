@@ -1224,6 +1224,57 @@ a `var` is assigned; a field of a module's object is assigned as any field is, `
 Writing module state from a thread's body is refused as reading it is
 ([threads](/spec/threads/)).
 
+## type
+
+`type Name = T` declares a **type alias**: another name for the type `T`, declared at the top level
+of a file beside data types and classes. A generic alias takes type parameters, and each use gives
+it type arguments:
+
+```text
+type Point = (int, int)
+type Pairs[T] = Vector[(T, T)]
+type Handler = (string) -> unit
+type Route = Pairs[Point]
+
+lengthOf(r: Route) -> int = r.length()
+val h: Handler = s -> println(s)
+```
+
+An alias is **transparent**: a use of it is its expansion, the body with each type argument in place
+of its parameter, and nothing else. It makes no new type and needs no conversion: a `Point` is a
+`(int, int)` and the other way round, two overloads whose parameters differ only by an alias take
+the same parameter types, and a diagnostic names the expansion, the type compared. An alias may be
+written wherever a type is: a parameter, a result, a binding, a data or class field, a type
+argument, a tuple, a function type, a type pattern (`p: Point`), and another alias's body, which may
+name an alias declared after it.
+
+- A generic alias takes exactly as many type arguments as it has parameters, and one without
+  parameters takes none.
+- Its parameters are plain names: no variance, no bounds, no lower bound. The types its body names
+  hold each type argument to their own bounds wherever the alias is used, as the expansion written
+  out would be: with `type Sorted[T] = TreeSet[T]`, `Sorted[Opaque]` is refused where `Opaque` is not
+  `Ord`, and `f[T: Ord](s: Sorted[T])` is accepted. A body naming no parameter is held to its bounds
+  where the alias is declared.
+- Every parameter appears in the body: one that does not would make `A[int]` and `A[string]` one
+  type.
+- The body sees the alias's own parameters and the file's types, and no function's type parameters
+  and no `Self`.
+- An alias cannot name itself, directly (`type A = Vector[A]`) or through other aliases: its
+  expansion would never end. A recursive type is a `data` type.
+- An alias's name is a type's: it may not be the name of another type of its module (a data type,
+  a class, an object or an alias), of a built-in type, or `Self`. It names no value, so a function
+  or a module value of the same name is no clash.
+- An alias names only a type. It is not a value, a constructor or a pattern: `type P = Point` does not
+  make `P(1, 2)` or match `P(x, y)`, and the diagnostic names `Point`, which does. An `impl` names the
+  type itself rather than an alias of it, and so does a class's list of its superclass and traits.
+- An alias takes no annotations.
+- An alias is public unless marked `private`, imported by name (`import geometry.{Point}`) or reached
+  through its module (`geometry.Point`) as any type is; a private one is seen only in its module, its
+  expansion reaching others through the signatures that use it.
+
+`type` declares an alias only where a name follows it; anywhere else it is an ordinary name, so a
+function, a parameter, a field or a local may be called `type`.
+
 ## Visibility and modules
 
 Declarations are public unless marked `private` (visible in the module). A directory is a module;

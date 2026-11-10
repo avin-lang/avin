@@ -4775,6 +4775,48 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- Proposed 2026-11-09 (branch `type-aliases`): **type aliases are transparent**, `type Name[T] =
+  Body` ([type](/spec/declarations/#type)): each use is the body with the type arguments
+  substituted, and the checker keeps no trace of the alias, so diagnostics name the expansion. Why:
+  an alias is shorthand for a long type, and a type a reader can see through needs no conversion and
+  no new rules for equality, overloading or patterns. Alternatives weighed: a nominal alias (a new
+  type, as `data` makes), which would need conversions everywhere and duplicates what a one-variant
+  data type already does; remembering the alias for diagnostics, which needs an alias-carrying type in
+  every type the checker builds and is left as a later improvement.
+- Proposed 2026-11-09 (branch `type-aliases`): **`type` is a declaration word only before a name**,
+  and elsewhere an ordinary name, as `actor`, `machine`, `lazy` and `with` are. Why: no Avin code in
+  the library or the tests names anything `type`, but a field called `type` is common in data that
+  mirrors JSON or C, and keywords are contextual where they can be. Alternative weighed: a reserved
+  word, which would forbid those names for no gain in parsing.
+- Proposed 2026-11-09 (branch `type-aliases`): **an alias's type parameters take no variance, no
+  bounds and no lower bound; the types its body names hold its type arguments to their own bounds at
+  each use.** Why: the alias is its expansion, so its uses are held exactly as the expansion written
+  out would be, and a bound on the alias would only repeat the body's (or wrongly differ from it).
+  Alternatives weighed: bounds on alias parameters checked against the body, as a data type's are,
+  which adds a second statement of the same constraint; no check at all until the expansion is used
+  as a value, which would accept `Sorted[Opaque]` in a signature.
+- Proposed 2026-11-09 (branch `type-aliases`): **an alias whose body does not use one of its type
+  parameters is refused.** Why: `A[int]` and `A[string]` would be one type, which reads as a
+  distinction the program does not make. Alternative weighed: allowing it as a phantom parameter, which
+  a transparent alias cannot give any meaning. Review with the user: a phantom-type idiom would need
+  `data` instead.
+- Proposed 2026-11-09 (branch `type-aliases`): **an alias names only a type: it is not a value, a
+  constructor, a pattern, an impl's target or a parent in a class's list**, each refused with a
+  message naming the expansion, and the name that makes and matches its values where there is one.
+  Why: one meaning for an alias's name keeps a call and a pattern reading as what they make and
+  match, and the expansion may be a tuple or a function type that has no constructor at all. An
+  alias of a function type in a class's parent list is refused with the rest, though the function
+  type itself may be written there. Alternatives weighed: allowing an alias of a data type or a class
+  as its constructor and in patterns (`P(1, 2)`), which makes an alias's use depend on what it
+  expands to; allowing `impl Alias`, which would add methods to a type under a name that does not
+  say which. Review with the user: aliases of traits in a parent list may be wanted later.
+- Proposed 2026-11-09 (branch `type-aliases`): **an alias's name may be shared with a function or a
+  module value, but not with any other type of its module (data type, class, object, alias), a
+  built-in type or `Self`.** Why: an alias lives only where types are written, so a function of its
+  name is never ambiguous, while two types of one name would be. Alternative weighed: refusing every
+  clash, as a class's name clashes with a function's because the class's name is also its
+  constructor, which an alias is not.
+
 ## Open
 
 - Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
