@@ -519,7 +519,9 @@ main()
 `data` values have no identity, derive
 `Eq`, `Hash`, `Display` and `Debug` when their fields do, without `derives`, and are matched
 exhaustively. Methods are added in an `impl` block; an impl of `Display` or `Debug` replaces the
-derived one ([Display and Debug](/spec/equality-and-memory/#display-and-debug)).
+derived one ([Display and Debug](/spec/equality-and-memory/#display-and-debug)). A data type whose
+variants have no fields is an enumeration, and `derives Enumerable` gives it `values()`, `ordinal()`,
+`name()` and `valueOf(name)` ([Enumerations](/spec/derivation/#enumerations)).
 
 ### Changing fields: `with`
 

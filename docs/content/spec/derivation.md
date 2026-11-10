@@ -426,7 +426,8 @@ into a tree first and decodes from the tree, with nothing new from the language.
 
 ## The built-in derivations
 
-The five traits the core library derives are templates in the same mould, each a few lines in the
+The six traits the core library derives, `Eq`, `Hash`, `Ord`, `Display`, `Debug` and `Enumerable`
+(below), are templates in the same mould, each a few lines in the
 trait's own file of the core library, compiled for each deriving type as any library's are:
 
 ```text
@@ -501,6 +502,62 @@ missing the hook's bound leaves the type without the trait instead of being an e
 missing `Ord`, `Display` or `Debug` where the type derives it is reported before any body is
 checked: *`Ranked` cannot derive `Ord`: its field `plain` has type `Plain`, which does not implement
 `Ord`*.
+
+### Enumerations
+
+A data type whose variants have no fields is an **enumeration**, and `derives Enumerable` gives it
+its variants as values:
+
+```avin
+data Color derives Enumerable
+    Red
+    Green
+    Blue
+
+main()
+    for c in Color.values()
+        println(s"${c.ordinal()} ${c.name()}")   // 0 Red, 1 Green, 2 Blue
+    println(Color.valueOf("Green"))              // Some(Green)
+    println(Color.valueOf("green"))              // None
+```
+
+```text
+trait Enumerable
+    static values() -> Vector[Self]
+    ordinal() -> int
+    name() -> string
+    static valueOf(name: string) -> Option[Self]
+
+derive Enumerable for T
+    static values() -> Vector[T] = Vector.tabulate(T.shape().variantCount, i -> T.build(ChooseVariant(i)).ok().get())
+    ordinal() -> int = T.variantOf(self).index
+    name() -> string = T.variantOf(self).name
+    static valueOf(name: string) -> Option[T] =
+        for v in T.shape().variants
+            if v.name == name then return T.build(ChooseVariant(v.index)).ok()
+        None
+```
+
+- **`T.values()`** is every variant in declaration order, as a new `Vector` each call.
+- **`ordinal()`** is the variant's 0-based position in the declaration, an `int`; a derived `Ord`
+  orders variants the same way, so `a < b` exactly when `a.ordinal() < b.ordinal()`.
+- **`name()`** is the variant's name as declared. It is not its `Display`: an impl of `Display`
+  changes what the variant prints, never its name, so `T.valueOf(x.name())` is always `Some(x)`.
+- **`T.valueOf(name)`** is the variant of exactly that name, compared byte for byte, so another
+  case, surrounding white space and the empty string are `None`. It never traps.
+- `ChooseVariant` is the template's builder, which picks the variant at an index and supplies no
+  fields, so every build succeeds.
+
+What stays the compiler's is who may derive it: only a data type of no type parameters whose every
+variant has no fields, the single-line form included when it has none (`data Marker()`). A variant
+with fields, a type parameter and a class are each reported at the `derives` entry:
+*`Shape` cannot derive `Enumerable`: its variant `Circle` has fields, and an enumeration's values
+are variants without fields*; *`Tag` cannot derive `Enumerable`: it has type parameters, and an
+enumeration's values are one fixed set of variants*; *`Word` cannot derive `Enumerable`: it is a
+class, and an enumeration is a data type whose variants have no fields*. A trait named `Enumerable`
+that a program declares with a template of its own follows that template's rules instead. A method
+of the type's own named `ordinal`, `name`, `values` or `valueOf` is a second method of that name,
+reported as any such pair is.
 
 ## What this does not do
 

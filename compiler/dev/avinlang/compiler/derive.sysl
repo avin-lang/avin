@@ -5,7 +5,7 @@ import sysl.buf.{Buf, buf}
 
 // `derives` written out as ordinary declarations, before anything is declared. Every derivable trait
 // has a template, `derive Trait for T`, in its own module: the core library's `Eq`, `Hash`, `Ord`,
-// `Display` and `Debug` as much as a library's own. Each `derives` entry makes an impl of the
+// `Display`, `Debug` and `Enumerable` as much as a library's own. Each `derives` entry makes an impl of the
 // template's body for the type, and the type's shape, as module values of its module.
 //
 // What is the compiler's own is when the core library's templates apply:
@@ -18,6 +18,8 @@ import sysl.buf.{Buf, buf}
 //   impl of its own implements the trait or declares the trait's method. That derivation is the
 //   type's only where its fields allow it: a field without the trait leaves the type without it, and
 //   only a use that needs it is an error.
+// - Only an enumeration derives `Enumerable`: a data type of no type parameters whose every variant
+//   has no fields.
 //
 // Each field's type must implement the `Ord`, `Display` or `Debug` derived from it, which the checker
 // holds it to once every conformance is known (`Derivation`), before any body is checked.
@@ -393,7 +395,7 @@ private derived_traits(c: *Checker, unit: usize, type_name: string, derives: Buf
         val template = found match
             Some(f) -> f
             None ->
-                c.note(unit, t.span, s"`${type_text(t)}` cannot be derived; a type derives `Eq`, `Hash`, `Ord`, `Display`, `Debug`, and a trait whose module declares a template for it, `derive ${type_text(t)} for T`")
+                c.note(unit, t.span, s"`${type_text(t)}` cannot be derived; a type derives `Eq`, `Hash`, `Ord`, `Display`, `Debug`, `Enumerable`, and a trait whose module declares a template for it, `derive ${type_text(t)} for T`")
                 continue
         var seen = false
         for earlier in out
@@ -463,7 +465,12 @@ private derive_class(c: *Checker, unit: usize, d: &ClassDecl, library: *Buf[Libr
         if m is MethodMember(f, _, _, _)
             for trait_name in ["Eq", "Hash", "Ord", "Display", "Debug"]
                 if f.name == derived_method(trait_name) then implemented.push(trait_name)
-    val traits = derived_traits(c, unit, d.name, d.derives, implemented)
+    var traits: Buf[LibraryDerived] = buf()
+    val what = if d.object then "an object" else "a class"
+    for t in derived_traits(c, unit, d.name, d.derives, implemented)
+        if is_core_enumerable(c, t)
+            c.note(unit, t.at, s"`${d.name}` cannot derive `Enumerable`: it is $what, and an enumeration is a data type whose variants have no fields")
+        else traits.push(t)
     val equality_by_hand = contains_name(implemented, "Eq")
     for t in traits
         if !t.builtin then continue
@@ -488,7 +495,12 @@ private fields_held(name: string) -> bool = name == "Ord" || name == "Display" |
 // already, by its fields, and `Display` and `Debug` unless its own impls give them.
 private derive_data(c: *Checker, unit: usize, d: &DataDecl, library: *Buf[LibraryDerived])
     val implemented = impl_traits(c, unit, d.name)
-    val traits = if d.derives.len() == 0 then buf() else derived_traits(c, unit, d.name, d.derives, implemented)
+    var traits: Buf[LibraryDerived] = buf()
+    if d.derives.len() > 0
+        for t in derived_traits(c, unit, d.name, d.derives, implemented)
+            val refusal = if is_core_enumerable(c, t) then enumerable_refusal(d) else ""
+            if refusal == "" then traits.push(t)
+            else c.note(unit, t.at, s"`${d.name}` cannot derive `Enumerable`: $refusal")
     for t in traits
         if t.builtin && !fields_held(t.name) then continue
         if t.builtin then c.derivations.push(Derivation(unit, d.name, true, t.name, t.at, false))
@@ -501,6 +513,23 @@ private derive_data(c: *Checker, unit: usize, d: &DataDecl, library: *Buf[Librar
         if core_template(c, name) is Some(t)
             c.derivations.push(Derivation(unit, d.name, true, name, d.span, true))
             library.push(LibraryDerived(name, d.span, t.template_unit, t.template, true))
+
+/** Whether `t` is the core library's `Enumerable`, which only an enumeration derives: a data type of
+ * no type parameters whose every variant has no fields. A trait of that name a program declares is
+ * its own, under its own template's rules. */
+private is_core_enumerable(c: *Checker, t: LibraryDerived) -> bool =
+    t.name == "Enumerable" && c.units[t.template_unit].file.module_name == CoreModule
+
+// Why the data type `d` cannot derive `Enumerable`, or "" when it can. Its values are one fixed set
+// of variants, so a type parameter, which would make a set per instance, and a field, which would
+// make a variant many values, are refused.
+private enumerable_refusal(d: &DataDecl) -> string
+    if d.type_params.len() > 0 then return "it has type parameters, and an enumeration's values are one fixed set of variants"
+    for v in d.variants
+        if v.fields.len() > 0
+            if d.variants.len() == 1 && v.name == d.name then return "it has fields, and an enumeration's values are variants without fields"
+            return s"its variant `${v.name}` has fields, and an enumeration's values are variants without fields"
+    ""
 
 // Whether the bare name `name`, written in unit `unit`, denotes the core library's declaration of it:
 // no declaration of the unit's module and no import of its file takes the name first. The core
