@@ -140,10 +140,37 @@ fail in polynomial time, not exponential.
 
 **Each attempt at a start has a step budget**: an operation of the pattern run, or a choice gone
 back to, is a step, and an attempt may take 1000 steps for each character of the input and each
-operation of the compiled pattern, and never fewer than 10,000,000. An attempt that spends its budget
-traps, naming the pattern: `` pattern `(a+)+?$` backtracked too far on a 40-character input; make a
-repetition possessive or atomic ``. The budget is per attempt, so a search over a long text may take
-far more steps in all. `withStepLimit(n)` gives each attempt `n` steps instead.
+operation of the compiled pattern, and never fewer than 10,000,000. The budget is per attempt, so a
+search over a long text may take far more steps in all. `withStepLimit(n)` gives each attempt `n`
+steps instead.
+
+An attempt that spends its budget ends the search. A plain search (`matches`, `findFirstIn`,
+`findAllIn`, `replaceAllIn`, `split`, the extractor, …) then traps, naming the pattern, the input's
+length in characters and the budget: `` pattern `(a+)+?$` backtracked too far on a 40-character
+input, past its budget of 10000000 steps; make a repetition possessive or atomic, or search with a
+`try` method to handle it ``. Each search has a **checked** form, its name with `try` before it, that
+answers a `Result` instead: `Ok` with what the plain search gives, or `Err` with a `MatchError`. A
+program searching text or with patterns from outside it uses the checked forms, and goes on:
+
+```text
+grep(r: Regex, lines: Vector[string]) -> Result[int, MatchError]
+    var n = 0
+    for line in lines
+        if r.tryMatches(line)? then n += 1
+    Ok(n)
+```
+
+The error ends the whole search wherever in the text it is met: `tryFindAllIn` and the replacing and
+splitting forms give none of the matches found before it, and a replacer has been called for each of
+those matches by then. A search that stops before the start where the budget is spent, as
+`tryFindFirstIn` does at its first match, answers `Ok`. A budget spent inside a lookaround or an
+atomic group ends the search too; it is never read as the body's failing, so `(?!…)` does not turn it
+into a match. The regex is unchanged by an error, and its next search starts with a full budget.
+
+`MatchError(pattern, inputLength, budget)` is a `data` type of `avin.regex`: the pattern as written,
+the number of characters in the text searched, and the steps each attempt had. `message()` and its
+`Display` give `` pattern `p` backtracked too far on a N-character input, past its budget of B
+steps ``.
 
 What a group captured is what it matched on the path that succeeded, with these rules where a group
 is repeated or tried more than once:
@@ -179,6 +206,9 @@ is repeated or tried more than once:
 | `unapplySeq(s)` | The groups' texts, an `Option[List[string]]`, where `s` matches as `matches` asks; it makes the regex an [extractor](/spec/operators-and-control-flow/#extractor-patterns) |
 | `unanchored()`, `anchored()` | The same regex with `matches` and the extractor asking about any part, or the whole |
 | `withStepLimit(n)` | The same regex, each attempt at a start allowed `n` steps in place of the [default budget](#matching); `n` must be above 0 |
+| `tryMatches(s)`, `tryFindFirstIn(s)`, `tryFindFirstMatchIn(s)`, `tryFindPrefixOf(s)`, `tryFindPrefixMatchOf(s)` | The [checked](#matching) searches: `Result[T, MatchError]`, `T` what the plain search answers |
+| `tryFindAllIn(s)`, `tryFindAllMatchIn(s)` | Every match, gathered: `Result[Vector[string], MatchError]` and `Result[Vector[Match], MatchError]` |
+| `tryReplaceAllIn(s, …)`, `tryReplaceFirstIn(s, r)`, `tryReplaceSomeIn(s, f)`, `trySplit(s)` | The replacing and splitting searches, checked: `Result[string, MatchError]` and `Result[Array[string], MatchError]`; `Pattern` has `trySplit(s, limit = 0)` |
 | `regex()`, `toString()`, `pattern()` | The pattern as written; `pattern()` is a `Pattern`, with `pattern()`, `groupCount()` and `split` |
 | `Regex.quote(text)` | A pattern matching `text` literally: `\Q`, the text, `\E`, each `\E` in the text written so it does not end the quotation |
 | `Regex.quoteReplacement(text)` | A replacement writing `text` literally: each `\` and `$` with a backslash before it |

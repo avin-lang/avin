@@ -4926,6 +4926,40 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- Proposed (built on branch `regex-budget`, for `marshal grep`): [`avin.regex`'s checked
+  searches](/spec/regex/#matching). A spent step budget becomes a failure the caller can handle,
+  answering the review question left on the settled limits on matching:
+  - **A checked family beside the plain API**: `tryMatches`, `tryFindFirstIn`,
+    `tryFindFirstMatchIn`, `tryFindPrefixOf`, `tryFindPrefixMatchOf`, `tryFindAllIn`,
+    `tryFindAllMatchIn`, `tryReplaceAllIn` (both forms), `tryReplaceFirstIn`, `tryReplaceSomeIn`,
+    `trySplit` and `Pattern.trySplit`, each `Result[T, MatchError]` with `T` what the plain search
+    answers. *Why*: a pattern written in the program that backtracks too far is a defect the trap
+    explains, and every `findFirstIn` stays a plain `Option`; a program searching outside text or
+    patterns (a grep) needs to go on, and says so by its choice of method. It mirrors
+    `Regex(p)` beside `Regex.compile(p)` and `Url(text)` beside `Url.parse`. *Alternatives*: every
+    search answering a `Result` (breaking, and makes every search fallible for what is almost
+    always a defect); a regex-level mode (`checked()`) changing what the plain methods do on
+    overflow (the result type cannot change with it, so it would need a sentinel); an
+    `error()` query on the iterator after it stops (easy to forget, so a spent budget reads as "no
+    more matches").
+  - **The gathered forms of every-match searches**: `tryFindAllIn` answers a `Vector`, not an
+    iterator, and the error discards the matches found before it; a replacer has been called for
+    those by then. *Why*: an iterator of `Result`s, or one whose end might be an error, makes the
+    common loop longer and is easy to read wrongly. *Alternatives*: an `Iterator[Result[Match,
+    MatchError]]`; giving the matches found so far with the error.
+  - **`MatchError(pattern, inputLength, budget)`, a plain `data` type** with `message()` and
+    `Display`, as `PatternError` is; `inputLength` counts characters. *Alternatives*: a `RegexError`
+    with variants for both kinds of failure (`compile` would change type, breaking); a bare message
+    string.
+  - **The plain searches still trap**, the message now naming the budget and the checked
+    alternative: `… past its budget of N steps; make a repetition possessive or atomic, or search
+    with a `try` method to handle it`. The budget stays per regex (`withStepLimit`), its default
+    unchanged. *Alternatives*: a per-call limit argument on the `try` methods (doubles every
+    signature; `withStepLimit` is cheap to call per search).
+  - The matcher learns of a spent budget by a flag every step checks, so a spent budget ends the
+    whole search through every nested part; a lookaround's or atomic group's body answering no for
+    it is never taken as the body failing.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

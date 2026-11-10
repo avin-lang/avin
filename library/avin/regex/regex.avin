@@ -17,8 +17,16 @@ class Pattern(private val text: string, private val program: Program, private va
     // the very start makes no empty first piece; a text the pattern does not match is one piece.
     // With a `limit` above 0 there are at most `limit` pieces, the last holding the rest of the
     // text; with 0 the empty pieces at the end are dropped; below 0 every piece is kept.
-    split(input: string, limit: int = 0) -> Array[string]
-        val e = Searched(input, program, patternNames, Vector.empty[string]())
+    split(input: string, limit: int = 0) -> Array[string] = splitting(Searched(input, program, patternNames, Vector.empty[string](), true), limit)
+
+    // The pieces, as `split` gives them, or the error where an attempt spent its step budget.
+    trySplit(input: string, limit: int = 0) -> Result[Array[string], MatchError]
+        val e = Searched(input, program, patternNames, Vector.empty[string](), false)
+        val pieces = splitting(e, limit)
+        e.checked(pieces)
+
+    private splitting(e: Searched, limit: int) -> Array[string]
+        val input = e.source
         val pieces = Buffer[string]()
         var index = 0
         val limited = limit > 0
@@ -105,6 +113,54 @@ class Regex(private val text: string, private val program: Program, private val 
     // at the end are dropped.
     split(toSplit: string) -> Array[string] = pattern().split(toSplit)
 
+    // The checked searches: each answers what the search of its name does, or a `MatchError` where
+    // an attempt at a start spent its step budget, in place of trapping. A search over text from
+    // outside the program, or with a pattern from outside it, uses these to go on.
+    tryMatches(source: string) -> Result[bool, MatchError]
+        val e = checking(source)
+        val found = if unanchoredMatch then e.engine.search(0) else e.engine.matchAt(0, true)
+        e.checked(found)
+
+    tryFindFirstIn(source: string) -> Result[Option[string], MatchError]
+        val e = checking(source)
+        e.checked(if e.engine.search(0) then Some(e.matched()) else None)
+
+    tryFindFirstMatchIn(source: string) -> Result[Option[Match], MatchError]
+        val e = checking(source)
+        e.checked(if e.engine.search(0) then Some(e.snapshot()) else None)
+
+    tryFindPrefixOf(source: string) -> Result[Option[string], MatchError]
+        val e = checking(source)
+        e.checked(if e.engine.matchAt(0, false) then Some(e.matched()) else None)
+
+    tryFindPrefixMatchOf(source: string) -> Result[Option[Match], MatchError]
+        val e = checking(source)
+        e.checked(if e.engine.matchAt(0, false) then Some(e.snapshot()) else None)
+
+    // Every match, as `findAllIn` finds them, gathered: the error ends the search wherever it is met,
+    // and none of the matches found before it is given.
+    tryFindAllIn(source: string) -> Result[Vector[string], MatchError]
+        val e = checking(source)
+        val found = Vector.newBuilder[string]()
+        while e.findNext() do found.addOne(e.matched())
+        e.checked(found.result())
+
+    tryFindAllMatchIn(source: string) -> Result[Vector[Match], MatchError]
+        val e = checking(source)
+        val found = Vector.newBuilder[Match]()
+        while e.findNext() do found.addOne(e.snapshot())
+        e.checked(found.result())
+
+    tryReplaceAllIn(target: string, replacement: string) -> Result[string, MatchError] = tryReplacing(target, m -> Some(replacement), false)
+
+    tryReplaceAllIn(target: string, replacer: (Match) -> string) -> Result[string, MatchError] = tryReplacing(target, m -> Some(replacer(m)), false)
+
+    tryReplaceFirstIn(target: string, replacement: string) -> Result[string, MatchError] = tryReplacing(target, m -> Some(replacement), true)
+
+    tryReplaceSomeIn(target: string, replacer: (Match) -> Option[string]) -> Result[string, MatchError] = tryReplacing(target, replacer, false)
+
+    trySplit(toSplit: string) -> Result[Array[string], MatchError] = pattern().trySplit(toSplit)
+
     // The texts of the groups, in order, where `source` matches as `matches` asks: the whole of it,
     // or any part for a regex made by `unanchored()`. This makes a regex an extractor, so
     // `case date(y, m, d)` takes a date apart. A group that took no part gives the empty string.
@@ -120,18 +176,27 @@ class Regex(private val text: string, private val program: Program, private val 
     anchored() -> Regex = Regex(text, program, patternNames, names, false)
 
     // The same pattern, each attempt at a start allowed `limit` steps in place of the budget the
-    // text's length and the pattern's size give; an attempt that takes more traps. `limit` must be
-    // above 0.
+    // text's length and the pattern's size give; an attempt that takes more traps, or ends a checked
+    // search with a `MatchError`. `limit` must be above 0.
     withStepLimit(limit: long) -> Regex
         if limit <= 0 then fail(s"step limit $limit is not above 0")
         Regex(text, limitedTo(program, limit), patternNames, names, unanchoredMatch)
 
-    private searching(source: string) -> Searched = Searched(source, program, patternNames, names)
+    private searching(source: string) -> Searched = Searched(source, program, patternNames, names, true)
+
+    private checking(source: string) -> Searched = Searched(source, program, patternNames, names, false)
 
     // `target` with the matches `replacer` gives a replacement for replaced, the first only when
     // `once`.
-    private replacing(target: string, replacer: (Match) -> Option[string], once: bool) -> string
-        val e = searching(target)
+    private replacing(target: string, replacer: (Match) -> Option[string], once: bool) -> string = replacingIn(searching(target), replacer, once)
+
+    private tryReplacing(target: string, replacer: (Match) -> Option[string], once: bool) -> Result[string, MatchError]
+        val e = checking(target)
+        val replaced = replacingIn(e, replacer, once)
+        e.checked(replaced)
+
+    private replacingIn(e: Searched, replacer: (Match) -> Option[string], once: bool) -> string
+        val target = e.source
         val out = StringWriter()
         var copied = 0
         var going = e.findNext()
@@ -252,9 +317,14 @@ impl string
 
 // A text being searched: its characters as code points, the byte offset each starts at with the
 // text's length after the last, and the matcher running over them.
-private class Searched(val source: string, program: Program, private val patternNames: Vector[(string, int)], private val names: Vector[string])
+// A `trapping` search traps when an attempt spends its step budget; any other ends, and `checked`
+// answers its error.
+private class Searched(val source: string, program: Program, private val patternNames: Vector[(string, int)], private val names: Vector[string], trapping: bool)
     private val offsets = Buffer[int]()
-    val engine: Engine = Engine(program, decode(source, offsets))
+    val engine: Engine = Engine(program, decode(source, offsets), trapping)
+
+    // `value`, or the error where the search spent its budget.
+    checked[T](value: T) -> Result[T, MatchError] = if engine.exhausted then Err(engine.error()) else Ok(value)
 
     // The text of the current match.
     matched() -> string = source.slice(offsets(engine.groups(0)), offsets(engine.groups(1)))

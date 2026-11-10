@@ -14,8 +14,21 @@ module avin.regex
 // lookaround's body) runs in a call of its own, with its frames above the caller's; when it succeeds
 // its frames are dropped, so nothing it did is put back and none of its choices is tried again.
 //
-// Every attempt at a start has a step budget, each operation run and each frame popped one step; an
-// attempt that spends it traps, as catastrophic backtracking would otherwise run for ever.
+// Every attempt at a start has a step budget, each operation run and each frame popped one step, as
+// catastrophic backtracking would otherwise run for ever. An attempt that spends it either traps or,
+// for a checked search, ends the whole search: every call under it answers no at once, and the
+// search reports the `MatchError` instead of a match.
+
+// A search stopped because one attempt at a start spent its step budget: the pattern, the number of
+// characters in the text searched, and the budget each attempt had.
+data MatchError(pattern: string, inputLength: int, budget: long)
+
+impl MatchError
+    // The error as one text, naming the pattern, the input's length and the budget.
+    message() -> string = s"pattern `$pattern` backtracked too far on a $inputLength-character input, past its budget of $budget ${if budget == 1 then "step" else "steps"}"
+
+impl Display for MatchError
+    display(out: Writer, spec: FormatSpec) = out.writeField(message(), spec)
 
 // The frames, each its fields and then its kind, so a frame is read from the top down.
 // Where `local` held `value`: (local, value).
@@ -62,7 +75,9 @@ private stepBudget(length: int, size: int) -> long
     val b = long(length + 1) * long(size) * StepsPerCharacterAndOperation
     if b < LeastStepBudget then LeastStepBudget else b
 
-private class Engine(val program: Program, val text: Array[int])
+// The matcher over one text. A `trapping` engine traps when an attempt spends its budget; any other
+// is left `exhausted`, and answers no from then on.
+private class Engine(val program: Program, val text: Array[int], private val trapping: bool)
     private val ops: Array[Op] = program.ops
     private val to: int = text.length()
     // The start and end of each group, as character indices, -1 where the group has not matched.
@@ -87,6 +102,8 @@ private class Engine(val program: Program, val text: Array[int])
     // The steps the current attempt has taken, and how many it may.
     private var steps: long = 0
     private val budget: long = if program.stepLimit > 0 then program.stepLimit else stepBudget(text.length(), program.ops.length())
+    // Whether an attempt has spent its budget; once it has, every search answers no.
+    var exhausted = false
     // Where a step goes on: the operation and the index.
     private var nextPc = 0
     private var nextAt = 0
@@ -146,6 +163,7 @@ private class Engine(val program: Program, val text: Array[int])
                 _ -> true
             steps = 0
             if worth && run(program.entry, i) then return found(i)
+            if exhausted then return false
             i += 1
         false
 
@@ -155,12 +173,17 @@ private class Engine(val program: Program, val text: Array[int])
         groups(1) = last
         true
 
-    // One step more of the attempt, trapping once the budget is spent.
-    private step()
+    // The error a search that spent its budget reports.
+    error() -> MatchError = MatchError(program.text, to, budget)
+
+    // One step more of the attempt. Once the budget is spent a trapping engine traps, and any other
+    // is marked exhausted, which ends the search; answers whether it is.
+    private step() -> bool
         steps += 1
         if steps > budget
-            val limit = if program.stepLimit > 0 then s" (step limit ${program.stepLimit})" else ""
-            fail(s"pattern `${program.text}` backtracked too far on a ${to}-character input$limit; make a repetition possessive or atomic")
+            if trapping then fail(s"${error().message()}; make a repetition possessive or atomic, or search with a `try` method to handle it")
+            exhausted = true
+        exhausted
 
     // Room on the stack for `n` more elements.
     private reserve(n: int)
@@ -222,7 +245,9 @@ private class Engine(val program: Program, val text: Array[int])
         var i = from
         var failed = false
         loop
-            step()
+            if step()
+                top = base
+                return false
             if failed
                 if !backtrack(base) then return false
                 failed = false
@@ -408,7 +433,9 @@ private class Engine(val program: Program, val text: Array[int])
                     _ -> ()
             elif retry(kind)
                 return true
-            step()
+            if step()
+                top = base
+                return false
 
     // The frames that try a reluctant item once more, or a loop's first repetition: whether the way
     // `kind` names can still go on, with where in `nextPc` and `nextAt`. Each is popped first, as
