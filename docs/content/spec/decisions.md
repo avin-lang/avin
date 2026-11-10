@@ -5212,6 +5212,82 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- Proposed (branch `lwt-server`): **the server library is in the standard library, as `TcpServer` in
+  `avin.net` and `http.serve` in `avin.net.http`**, not a package and not a module of its own. *Why*:
+  the TCP connection and the HTTP client it builds on are there already, the server shares the
+  client's `Response` and token rules, and it is the first user of the runtime's poller and, later,
+  of `scope` cancellation, which tie it to the compiler's release. *Alternatives*: a package
+  `dev.avinlang.http` (versioned apart, but it would duplicate the client's types or depend on the
+  standard library's privates); a module `avin.net.server` (one more import for the one type).
+  Review with the user if a larger web framework is wanted later: that belongs in a package on top.
+- Proposed (branch `lwt-server`): **each connection is served in an actor's first turn, supervised
+  with `Stop`**, rather than on a plain lightweight thread. *Why*: a trap in a thread stops the
+  program, and an actor is the only place a trap is contained; a connection's handler is the place
+  a server most needs a bug to cost one connection. The actor's first turn runs the whole
+  connection and the actor stops after it; an `onStopping` given before the connection is served
+  runs `failed` (which writes the `500`) and closes it, since a `stopping` block is given only after
+  the body has run. *Alternatives*: a lightweight thread per connection (a handler's trap stops the
+  server); an actor per request (a mailbox and a turn per request, for no gain).
+- Proposed (branch `lwt-server`): **the connections' actors run on an executor of the server's own,
+  `Executor.fixed(maxConnections)`**. *Why*: a connection's turn parks on its socket for as long as
+  the connection lives, and on the shared pool, about one worker per processor, those parked turns
+  would keep every other connection waiting for a worker; the workers are lightweight threads, so a
+  worker per connection costs a parked stack each. Once actors' turns run on lightweight threads of
+  their own (stage 14, item 5), the executor may go. *Alternatives*: the shared pool with each wait
+  in `blocking` (a trap inside `blocking` leaves the worker counted as waiting for good).
+- Proposed (branch `lwt-server`): **at the connection limit, the next connection waits unaccepted**
+  in the listener's backlog until one ends, rather than being accepted and refused. *Why*: the
+  client is served late instead of not at all, and the server spends nothing on it meanwhile.
+  *Alternatives*: accept and close at once, or answer `503` (a burst turns into failures the client
+  must retry).
+- Proposed (branch `lwt-server`): **`stop()` wakes the acceptor parked in `accept` with a
+  connection of its own** to the listener (to `127.0.0.1` or `::1` where it listens on every
+  address), which the acceptor, seeing the server stopping, closes before closing the listener.
+  *Why*: a listener belongs to the thread parked on it, so no other thread may close it, and until
+  `scope` can cancel a wait (stage 14, item 6) a connection is the one thing that ends a parked
+  `accept`. **How cancellation hooks in**: the acceptor and the connections run inside a `scope` the
+  server holds; `stop()` cancels the acceptor's wait instead of connecting, and cancels the waits
+  of connections idle between requests, so a shutdown no longer waits for their idle limit; a
+  connection in a request is not cancelled, so it still finishes. The API does not change.
+  *Alternatives*: an `accept` with a timeout polled for the stop (a delay of up to the poll, and
+  wake-ups for nothing); a listener closable from another thread (against the ownership rule).
+- Proposed (branch `lwt-server`): **a connection idle between requests ends at its idle limit
+  during a shutdown, and a request that arrives on one meanwhile is answered `503`**. *Why*: the
+  idle wait cannot be ended from outside until cancellation; `idleTimeout` is short (5 seconds by
+  default), so `join` is bounded. *Alternatives*: serving requests on connections already open (a
+  chatty client keeps the server up for ever).
+- Proposed (branch `lwt-server`): **HTTP limits and refusals.** Timeouts bound each wait, as a
+  connection's do: `readTimeout` while a request is read (`408` once one runs out mid-request, and a
+  quiet close where a connection sent nothing), `writeTimeout` while a response is written, and
+  `idleTimeout` between requests; `maxHeaderBytes` (16 KiB) bounds the request line (`414`) and the
+  head and a chunked body's trailers (`431`); `maxBodyBytes` (1 MiB) bounds a body by its length
+  before it is read, or as chunks arrive (`413`). A request with both `Content-Length` and
+  `Transfer-Encoding`, two lengths that differ, a coding list not ending in `chunked` or a header
+  folded onto a second line is `400`, and a coding besides `chunked` `501`. Every refusal closes
+  the connection after shutting its side and reading what the client still sends for half a
+  second, so the answer is not lost to a reset. *Why*: RFC 9112's choices where it gives the server
+  one, and per-wait timeouts keep one meaning for "timeout" across the library. *Alternatives*: a
+  deadline for the whole request (stops a slow upload still making progress; review with the user
+  if wanted beside the per-wait limit); decoding `gzip` request bodies (a dependency for a rare
+  case).
+- Proposed (branch `lwt-server`): **a `Response` is the client's class, given makers**
+  (`Response.text`, `bytes`, `empty`, `withHeader`) and `http.reasonPhrase`; a handler is a plain
+  `@sendable (ServerRequest) -> Response`; routes are a vector given to `Router(routes)`, made by
+  `Route(method, pattern, handler)` or `Route.get` and its siblings, and `router.handle` is the
+  handler. *Why*: one response type for both sides; a vector literal spans lines, where a builder's
+  chain of `.get(…)` cannot, since a line starting with `.` does not continue the one above. The
+  server writes `Content-Length` and `Connection` itself and refuses (traps on) a status outside
+  200 to 599. Responses are whole bodies; a streamed (chunked) response is later work.
+  *Alternatives*: a builder `Router().get(…)` (a chain on one line, or a `var` reassigned); a
+  response writer handed to the handler (streaming, but a handler that forgets to finish it).
+  Review with the user whether a line that starts with `.` should continue the expression above.
+- Proposed (branch `lwt-server`): **routing**: segments matched one for one with the request's
+  decoded segments, `:name` binding a non-empty one, the first matching route winning; a `GET`
+  route answers `HEAD`; `404` for a path no route matches and `405` with `Allow` for one matched for
+  other methods. *Why*: the smallest router that covers a service's paths, with escaped and raw
+  Unicode routing alike and an escaped `/` staying inside its segment. *Alternatives*: wildcards
+  for the rest of a path and patterns in a segment (later, if programs need them).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
