@@ -1072,7 +1072,8 @@ main() = println("hey".shout())       // hey!
 
 - **An extension's methods are seen by its own module and by every file that imports the module**:
   whole (`import a.b`, `import a.b as c`), or any declaration of it (`import a.b.X`,
-  `import a.b.{X, y}`). Nothing else is needed, and a file that imports neither does not see them:
+  `import a.b.{X, y}`), directly or through a module that exports a declaration of it
+  ([modules](#visibility-and-modules)). Nothing else is needed, and a file that imports neither does not see them:
   a call there is an error naming the module that adds the method and saying the file does not
   import it. The core library's impls are seen everywhere. Importing is per file, as for names.
 - **An extension adds methods, never meaning.** Its methods are not the type's: they reach no private
@@ -1285,7 +1286,8 @@ function, a parameter, a field or a local may be called `type`.
 
 Declarations are public unless marked `private` (visible in the module). A directory is a module;
 `module a.b` heads each file. A **package** is a build unit with an `avin.hocon` manifest; a
-**project** lists packages ([packages](/spec/packages/)). `import a.b.{X, y as z}` brings names into a file. The root module `avin`
+**project** lists packages ([packages](/spec/packages/)). `import a.b.{X, y as z}` brings names into a file, and `export a.b.{X}` makes another module's
+declaration one of the module's own names. The root module `avin`
 is reserved for the standard library.
 
 ```text
@@ -1336,7 +1338,54 @@ main() = println(s"${circleArea(Circle(2))}")
   imported.
 - **Importing a module, or any declaration of it, also brings in the methods its
   [extensions](#extensions) add**, so `"hey".shout()` works in every file that imports `words`.
-- **What a name means** is decided in that order: the file's module, then its imports, then the
+- **A module may export declarations of other modules**, presenting one surface over modules it
+  keeps internal:
+
+  ```text
+  // shapes/shapes.avin
+  module shapes
+
+  export shapes.geometry.{Point, distance}
+  export shapes.color.{Color, Red, Blue as Navy}
+
+  // main.avin
+  import shapes.{Point, Color, Navy}
+  import shapes
+
+  main() = println(shapes.distance(Point(0, 0), Point(3, 4)))
+  ```
+
+  An export is written as an import is, at the top of any file of the module: one name, a `{…}`
+  group, `as` naming one differently; there is no wildcard. `export` means this only at the start
+  of a top-level line and before a name; everywhere else it is an ordinary name.
+- **An export is a name of its module, for the very declaration it names**: no copy and no wrapper.
+  Every file of the exporting module sees it by its bare name without an import, and other modules
+  reach it as any declaration of the module, imported by name (`import shapes.Point`) or through the
+  module imported whole (`shapes.Point`, in types and patterns too). A value made through it is of
+  the declaring module's type, so `shapes.Point` and `shapes.geometry.Point` are one type, and a
+  `with`, a `match`, an impl or a conformance sees no difference. Exporting a function's name exports
+  every public overload of it; a type's variants are exported by their own names, and are reached
+  through an exported type as `Color.Red` either way. Types, aliases, classes and their companion
+  objects, objects, traits, machines, functions, module-level values and variants may all be
+  exported; a `var` is assigned through any name of it.
+- **An export names another module's public declaration**, directly or through that module's own
+  export, so exports chain: a module exporting `mid.Token`, which `mid` exports from `base`, presents
+  `base.Token`. Exporting a private declaration, one the module does not have, a whole module, a
+  name of the exporting module itself, or anything from the root module, which nothing imports, is
+  an error; so is marking an export `private`. Two modules may export each other's declarations;
+  exports that lead round to one another without reaching a declaration are an error at each of
+  them.
+- **An exported name clashes as a declaration does**: with a declaration of its module, with an
+  import of a different declaration by a file of the module, with a module imported under its name,
+  and with another export of the name reaching a different declaration. Two paths to one declaration
+  are never a clash: a module may export a name and import the same declaration, export it from two
+  files, and a file may import it both directly and through an export.
+- **A module that exports a declaration of another presents that module's extensions too**: a file
+  importing the exporting module, whole or any name of it, and the exporting module's own files, see
+  the methods the other module's extensions add, as a file importing the other module would. Only
+  the modules whose declarations it exports are presented; one it merely imports is not.
+- **What a name means** is decided in that order: the file's module, its declarations and then its
+  exports, then the file's imports, then the
   public declarations of the standard library's module `avin`, which every file sees without an
   import. The nearer hides the farther, whatever kind each declaration is, except that a core
   library variant a nearer one hides is still chosen where its own type is expected

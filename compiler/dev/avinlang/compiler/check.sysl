@@ -569,6 +569,9 @@ struct Checker
     /** The type aliases, and the place of each among them by qualified name. */
     aliases: Buf[AliasSymbol]
     alias_names: Map[string, usize]
+    /** Each name a module exports, by its qualified name in the exporting module, holding the
+     * qualified name of the declaration it presents, through any chain of exports. */
+    exports: Map[string, string]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -679,20 +682,26 @@ resolve_name(c: *Checker, unit: usize, name: string) -> string
         if dot is None && name.bytes[k] == u8('.') then dot = Some(k)
     if dot is Some(k)
         if scope.modules.get(name[0..<k]) is Some(module_path)
-            val key = qualified(module_path, name[k + 1..])
+            val key = exported_path(c, module_path, name[k + 1..])
             if declared(c, key) && exported(c, key) then return key
             return name
         // `Door.State`, the state type of a machine: declared in the file's own module, or in the
-        // module the file imports `Door` from. Any other dotted name is a whole qualified name.
+        // module the file imports or exports `Door` from. Any other dotted name is a whole qualified
+        // name.
         if name[k + 1..].contains(".") then return name
         val own_member = qualified(scope.module_name, name)
         if declared(c, own_member) then return own_member
+        if c.exports.get(qualified(scope.module_name, name[0..<k])) is Some(owner)
+            val member = owner + name[k..]
+            if declared(c, member) && exported(c, member) then return member
         if scope.imports.get(name[0..<k]) is Some(owner)
             val member = owner + name[k..]
             if declared(c, member) && exported(c, member) then return member
         return name
     val own = qualified(scope.module_name, name)
     if declared(c, own) then return own
+    // A name the module exports is one of its own, seen by each of its files.
+    if c.exports.get(own) is Some(key) then return key
     if scope.imports.get(name) is Some(key) then return key
     val core = qualified(CoreModule, name)
     if declared(c, core) && exported(c, core) then return core
@@ -706,7 +715,7 @@ private file_scope(c: *Checker, unit: usize) -> FileScope
     // these bindings with the ones it keeps.
     var modules: Map[string, string] = map()
     for i in file.imports
-        if imports.get(i.binding) is None then imports.put(i.binding, i.path)
+        if imports.get(i.binding) is None then imports.put(i.binding, through_exports(c, i.path))
         if i.path != file.module_name && module_has_unit(c, i.path) && !names_declaration(c, i.path) && modules.get(i.binding) is None
             modules.put(i.binding, i.path)
     FileScope(file.module_name, imports, modules)
@@ -766,6 +775,8 @@ private check_imports(c: *Checker, unit: usize)
                 c.note(unit, i.name_span, s"`${i.path}` is this file's own module")
             elif declared(c, qualified(own, i.binding))
                 c.note(unit, i.binding_span, s"`${i.binding}` is a module and also declared in this module")
+            elif c.exports.get(qualified(own, i.binding)) is Some(_)
+                c.note(unit, i.binding_span, s"`${i.binding}` is a module and also exported by this module")
             elif imported_from(kept, mods, i.binding) != ""
                 c.note(unit, i.binding_span, s"`${i.binding}` is already imported, from `${imported_from(kept, mods, i.binding)}`")
             else
@@ -790,32 +801,159 @@ private check_imports(c: *Checker, unit: usize)
             if module_exists(c, i.path) then c.note(unit, i.module_span.to(i.name_span), s"`${i.path}` is a module; an import names its declarations, as in `import ${i.path}.{Name}`")
             else c.note(unit, i.module_span, s"unknown module `$module_name`")
             continue
-        if !declared(c, i.path)
+        // A name another module exports means the declaration the export presents.
+        val target = through_exports(c, i.path)
+        if !declared(c, target)
             c.note(unit, i.name_span, s"module `$module_name` declares no `$name`")
             continue
-        if !exported(c, i.path)
+        if !exported(c, target)
             c.note(unit, i.name_span, s"`$name` is private to module `$module_name`")
             continue
         val local = qualified(own, i.binding)
+        // An import of the very declaration the module exports under that name is two paths to one
+        // declaration, and no clash.
+        if c.exports.get(local) is Some(exported_as)
+            if exported_as != target
+                c.note(unit, i.binding_span, s"`${i.binding}` is imported and also exported by this module, as `$exported_as`")
+                continue
         if declared(c, local)
             var companion = false
             var data_companion = false
             if c.class_types.get(local) is Some(k)
                 if c.classes[k].decl.object
-                    if c.class_types.get(i.path) is Some(j)
+                    if c.class_types.get(target) is Some(j)
                         if !c.classes[j].decl.object then companion = true
-                    if c.types.get(i.path) is Some(_) then data_companion = true
+                    if c.types.get(target) is Some(_) then data_companion = true
             if companion then c.note(unit, i.binding_span, s"`${i.binding}` is a class of module `$module_name`; its companion object is declared in the class's own module")
             elif data_companion then c.note(unit, i.binding_span, s"`${i.binding}` is a data type of module `$module_name`; its companion object is declared in the type's own module")
             else c.note(unit, i.binding_span, s"`${i.binding}` is imported and also declared in this module")
             continue
         if imported_from(kept, mods, i.binding) != ""
+            // Two imports reaching one declaration, one of them through an export, bind one name.
+            if kept.get(i.binding) is Some(earlier)
+                if earlier == target then continue
             c.note(unit, i.binding_span, s"`${i.binding}` is already imported, from `${imported_from(kept, mods, i.binding)}`")
             continue
-        kept.put(i.binding, i.path)
-        index_import(c, unit, i, false)
+        kept.put(i.binding, target)
+        index_import(c, unit, Import(i.span, target, i.binding, i.module_span, i.name_span, i.binding_span), false)
     c.files[unit].imports = kept
     c.files[unit].modules = mods
+
+/** The declaration `key` means, a qualified name written `a.b.X`: the one an export of `a.b` named
+ * `X` presents, else `key` itself. */
+through_exports(c: *Checker, key: string) -> string
+    if c.exports.get(key) is Some(target) then return target
+    key
+
+/** The qualified name `rest`, written after module `module_path`, means: `X` or a member of it,
+ * `X.State`, where `X` is a declaration of the module or one it exports. */
+private exported_path(c: *Checker, module_path: string, rest: string) -> string
+    for j in 0..<rest.bytes.len
+        if rest.bytes[j] == u8('.') then return through_exports(c, qualified(module_path, rest[0..<j])) + rest[j..]
+    through_exports(c, qualified(module_path, rest))
+
+// The path an export of the program binds the qualified name `key` to, as written, read from the source.
+private written_export(c: *Checker, key: string) -> Option[string]
+    for u in c.units
+        for e in u.file.exports
+            if qualified(u.file.module_name, e.binding) == key then return Some(e.path)
+    None
+
+// The declaration a path an export writes reaches: the path itself where it names one, else what the
+// export of that name presents, followed until a declaration is reached. A path naming nothing, or
+// exports that lead round in a cycle, reach none.
+private export_target(c: *Checker, path: string) -> Option[string]
+    var at = path
+    var seen: Buf[string] = buf()
+    loop
+        if names_declaration(c, at) then return Some(at)
+        for s in seen
+            if s == at then return None
+        seen.push(at)
+        at = written_export(c, at) match
+            Some(next) -> next
+            None -> return None
+
+// Whether following the exports from `path` comes round to one already passed.
+private export_cycles(c: *Checker, path: string) -> bool
+    var at = path
+    var seen: Buf[string] = buf()
+    loop
+        if names_declaration(c, at) then return false
+        for s in seen
+            if s == at then return true
+        seen.push(at)
+        at = written_export(c, at) match
+            Some(next) -> next
+            None -> return false
+
+/** Binds every name the program's modules export to the declaration it presents, read from the source
+ * before anything is declared, so a signature naming a type through an export resolves as one naming
+ * it directly. The first export of a name in a module binds it; `check_exports` reports what is wrong
+ * with each export and drops the ones that are. */
+private gather_exports(c: *Checker)
+    for u in c.units
+        for e in u.file.exports
+            val key = qualified(u.file.module_name, e.binding)
+            if c.exports.get(key) is Some(_) then continue
+            if export_target(c, e.path) is Some(target) then c.exports.put(key, target)
+
+// Each export of a unit names a public declaration of another module, directly or through that
+// module's own exports, under a name its module does not already use for something else. Exporting
+// one declaration twice under one name is no clash. An export found wrong is reported and dropped.
+private check_exports(c: *Checker, unit: usize)
+    val file = c.units[unit].file
+    val own = file.module_name
+    for e in file.exports
+        val key = qualified(own, e.binding)
+        val (reason, at) = export_problem(c, own, e)
+        if reason == ""
+            if export_target(c, e.path) is Some(target)
+                if exported(c, target) then index_import(c, unit, Import(e.span, target, e.binding, e.module_span, e.name_span, e.binding_span), false)
+            continue
+        c.note(unit, at, reason)
+        // Only the export that bound the name unbinds it: a wrong second one leaves the first.
+        if binds(c, key, unit, e) then c.exports.remove(key)
+
+// Whether export `e` of unit `unit` is the program's first export of the qualified name `key`, the
+// one `gather_exports` bound it by.
+private binds(c: *Checker, key: string, unit: usize, e: Import) -> bool
+    for u in 0..<c.units.len()
+        for other in c.units[u].file.exports
+            if qualified(c.units[u].file.module_name, other.binding) == key
+                return u == unit && other.span.start == e.span.start && other.span.end == e.span.end
+    false
+
+// What is wrong with export `e` of module `own`, or "" when nothing is, and the place to report it at.
+// A path going through another module's export that is itself wrong is reported there, not again here.
+private export_problem(c: *Checker, own: string, e: Import) -> (string, Span)
+    val path_span = e.module_span.to(e.name_span)
+    if own == "" then return ("the root module is imported by no other module, so it exports nothing", path_span)
+    var dot: Option[usize] = None
+    for k in 0..<e.path.bytes.len
+        if e.path.bytes[k] == u8('.') then dot = Some(k)
+    if module_exists(c, e.path) && !names_declaration(c, e.path) && written_export(c, e.path) is None
+        return (s"`${e.path}` is a module; an export names its declarations, as in `export ${e.path}.{Name}`", path_span)
+    val at = dot match
+        Some(k) -> k
+        None -> return (s"`${e.path}` is not a declaration of a module; an export names one, as in `export a.b.{Name}`", path_span)
+    val module_name = e.path[0..<at]
+    val name = e.path[at + 1..]
+    if module_name == own then return (s"`$name` is named in this module itself, and an export names another module's declaration: a public one of this module's is exported already", e.name_span)
+    if !module_exists(c, module_name) then return (s"unknown module `$module_name`", e.module_span)
+    val target = export_target(c, e.path) match
+        Some(t) -> t
+        None ->
+            if export_cycles(c, e.path) then return (s"`$name` of module `$module_name` is exported in a cycle of exports that reaches no declaration", e.name_span)
+            if written_export(c, e.path) is Some(_) then return ("", e.name_span)
+            return (s"module `$module_name` declares no `$name`", e.name_span)
+    if !exported(c, target)
+        if target == e.path then return (s"`$name` is private to module `$module_name`", e.name_span)
+        return ("", e.name_span)
+    if declared(c, qualified(own, e.binding)) then return (s"`${e.binding}` is exported and also declared in this module", e.binding_span)
+    if c.exports.get(qualified(own, e.binding)) is Some(first)
+        if first != target then return (s"`${e.binding}` is already exported by this module, as `$first`", e.binding_span)
+    ("", e.name_span)
 
 /** Checks a program: the core library's units, then the program's own, each heading its module's
  * name in `file.module_name`. `root_module` is the module that must declare `main`, and the last
@@ -825,11 +963,12 @@ private check_imports(c: *Checker, unit: usize)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
     if tuple_impls_unit(c.units) is Some(u) then c.units.push(u)
+    gather_exports(&c)
     for u in 0..<c.units.len()
         c.files.push(file_scope(&c, u))
     // `derives` is written out as the methods and impls it stands for before anything is declared.
@@ -898,6 +1037,8 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     settle_automatic_derivations(&c)
     for u in 0..<c.units.len()
         declare_globals(&c, u)
+    for u in 0..<c.units.len()
+        check_exports(&c, u)
     for u in 0..<c.units.len()
         check_imports(&c, u)
     for _ in c.classes
@@ -3584,17 +3725,38 @@ private extension_seen(c: *Checker, tm: TraitMethod) -> bool
     sees_module(c, unit_of(c), home)
 
 /** Whether file `unit` is of module `module_name` or imports it: the module itself, `import a.b`,
- * or one of its declarations, `import a.b.X`. */
+ * or one of its declarations, `import a.b.X`, directly or through another module's export. A module
+ * that exports a declaration of `module_name` presents it whole: its own files, and a file importing
+ * it or any name of it, see `module_name`'s extensions too. */
 private sees_module(c: *Checker, unit: usize, module_name: string) -> bool
     val scope = c.files[unit]
     if scope.module_name == module_name then return true
+    if presents(c, scope.module_name, module_name) then return true
     for (_, imported) in scope.modules
-        if imported == module_name then return true
+        if imported == module_name || presents(c, imported, module_name) then return true
     for (_, key) in scope.imports
-        var dot = 0usize
-        for k in 0..<key.bytes.len
-            if key.bytes[k] == u8('.') then dot = k
-        if dot > 0 && key[0..<dot] == module_name then return true
+        if module_of_key(key) == module_name then return true
+    // A name imported through an export is a name of the exporting module too.
+    for i in c.units[unit].file.imports
+        if scope.modules.get(i.binding) is Some(whole)
+            if whole == i.path then continue
+        val written = module_of_key(i.path)
+        if written == module_name || presents(c, written, module_name) then return true
+    false
+
+// The module of the declaration with qualified name `key`, "" for the root module's.
+private module_of_key(key: string) -> string
+    var dot = 0usize
+    for k in 0..<key.bytes.len
+        if key.bytes[k] == u8('.') then dot = k
+    if dot > 0 then key[0..<dot] else ""
+
+/** Whether module `exporter` exports a declaration of module `module_name`, and so presents its
+ * extensions to a file importing `exporter` whole. */
+private presents(c: *Checker, exporter: string, module_name: string) -> bool
+    if exporter == "" then return false
+    for (alias, target) in c.exports
+        if module_of_key(alias) == exporter && module_of_key(target) == module_name then return true
     false
 
 /** The parameter types of method `m` past the receiver, as a call on a value of type `t` sees them,
@@ -8937,7 +9099,7 @@ private unknown_type_message(c: *Checker, unit: usize, path: string) -> string
     if dot is Some(k)
         if c.files[unit].modules.get(path[0..<k]) is Some(module_path)
             val name = path[k + 1..]
-            val key = qualified(module_path, name)
+            val key = through_exports(c, qualified(module_path, name))
             if !declared(c, key) then return s"module `$module_path` declares no type `$name`"
             if !exported(c, key) then return s"`$name` is private to module `$module_path`"
     s"unknown type `$path`"
@@ -9473,7 +9635,7 @@ private module_use(c: *Checker, e: &Expr) -> Option[&Expr]
         if target.kind is Name(m)
             if lookup_local(c, m) is Some(_) || param_index(c, m) is Some(_) || class_member(c, m) is Some(_) || local_function(c, m) is Some(_) then return None
             if c.files[unit].modules.get(m) is Some(module_path)
-                val key = qualified(module_path, name)
+                val key = through_exports(c, qualified(module_path, name))
                 if !declared(c, key)
                     c.note(unit, e.span, s"module `$module_path` declares no `$name`")
                     return Some(Expr(e.span, Invalid))
@@ -10967,7 +11129,7 @@ private hidden_variants(c: *Checker, name: string) -> Buf[VariantRef]
     val scope = c.files[unit_of(c)]
     val own = qualified(scope.module_name, name)
     val core = qualified(CoreModule, name)
-    if core == own || !declared(c, own) && scope.imports.get(name) is None then return out
+    if core == own || !declared(c, own) && c.exports.get(own) is None && scope.imports.get(name) is None then return out
     if c.variants.get(core) is None || !exported(c, core) then return out
     for v in variants_at(c, core)
         if exported(c, qualified(c.data[v.data].module_name, c.data[v.data].name)) then out.push(v)

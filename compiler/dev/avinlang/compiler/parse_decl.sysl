@@ -12,7 +12,7 @@ struct Parsed
     source: Source
 
 parse(src: Source) -> Parsed
-    var file = SourceFile("", Span(0, 0), false, buf(), buf(), buf(), 0, buf(), buf())
+    var file = SourceFile("", Span(0, 0), false, buf(), buf(), buf(), buf(), 0, buf(), buf())
     val program = literate_program(src) match
         Ok(p) -> p
         Err(d) ->
@@ -31,8 +31,13 @@ parse(src: Source) -> Parsed
         val before = p.toks.position
         val start = p.toks.here()
         if p.accept("import")
-            parse_import(&p, start, file.imports)
+            parse_import(&p, start, file.imports, "an import")
             if !p.toks.at_end() then p.expect_kind(Newline, "expected a new line after an import")
+            continue
+        if export_ahead(&p)
+            p.expect("export")
+            parse_import(&p, start, file.exports, "an export")
+            if !p.toks.at_end() then p.expect_kind(Newline, "expected a new line after an export")
             continue
         val reported = p.report.len()
         val annotations = parse_annotations(&p)
@@ -40,6 +45,12 @@ parse(src: Source) -> Parsed
             file.tests_only = true
             continue
         val hidden = p.accept("private")
+        if hidden && export_ahead(&p)
+            p.report.add(error(start.to(p.ended()), "an export is public: it presents a declaration as the module's own, which `private` would hide again"))
+            p.expect("export")
+            parse_import(&p, start, file.exports, "an export")
+            if !p.toks.at_end() then p.expect_kind(Newline, "expected a new line after an export")
+            continue
         if hidden && p.at("impl")
             p.report.add(error(start.to(p.ended()), "an impl has no name, so it cannot be private: mark its methods `private`"))
         if p.accept("data") then file.items.push(DataItem(parse_data(&p, start, annotations)))
@@ -1110,8 +1121,18 @@ private signature_ahead(p: *Parser) -> bool
         i += 1
     false
 
-// `import a.b.c`, `import a.b.c as d`, `import a.b.{c, d as e}`
-private parse_import(p: *Parser, at: Span, imports: Buf[Import])
+/** Whether `export` begins an export here: like `type`, `export` is a word that means something
+ * only at the start of a top-level line and before a name, and elsewhere is an ordinary name. */
+export_ahead(p: *Parser) -> bool
+    if !p.at("export") then return false
+    val next = p.toks.peek_at(1) match
+        Some(t) -> t
+        None -> return false
+    next.value == Word
+
+// `import a.b.c`, `import a.b.c as d`, `import a.b.{c, d as e}`, and `export` written the same ways;
+// `what` names which it is in diagnostics.
+private parse_import(p: *Parser, at: Span, imports: Buf[Import], what: string)
     val first = p.toks.here()
     var path = required_name(p)
     // The place of the last segment read, and of the path before it (the whole path while it has one).
@@ -1128,9 +1149,9 @@ private parse_import(p: *Parser, at: Span, imports: Buf[Import])
                 var binding_span = name_span
                 val aliased = p.accept("as")
                 if aliased then binding_span = p.toks.here()
-                val binding = if aliased then declared_name(p, "an import") else name
+                val binding = if aliased then declared_name(p, what) else name
                 if aliased then binding_span = binding_span.to(p.ended())
-                if !aliased then reject_keyword(p, at, name, "an import")
+                if !aliased then reject_keyword(p, at, name, what)
                 imports.push(Import(at.to(p.ended()), path + "." + name, binding, selected_from, name_span, binding_span))
                 if !p.accept(",") || p.at("}") then break
             p.expect("}")
@@ -1143,9 +1164,9 @@ private parse_import(p: *Parser, at: Span, imports: Buf[Import])
     var binding_span = segment
     val aliased = p.accept("as")
     if aliased then binding_span = p.toks.here()
-    val binding = if aliased then declared_name(p, "an import") else last_segment(path)
+    val binding = if aliased then declared_name(p, what) else last_segment(path)
     if aliased then binding_span = binding_span.to(p.ended())
-    if !aliased then reject_keyword(p, at, binding, "an import")
+    if !aliased then reject_keyword(p, at, binding, what)
     imports.push(Import(at.to(p.ended()), path, binding, module_span, name_span, binding_span))
 
 private last_segment(path: string) -> string
