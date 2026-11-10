@@ -4920,13 +4920,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   go-to-definition on an exported name (at the export line or any import of it) goes to the
   declaration itself. Completion after `m.` does not yet list a module's exports (see Open).
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- Proposed (built on branch `regex-budget`, for `marshal grep`): [`avin.regex`'s checked
+- Settled on the user's delegation 2026-11-09 (built on branch `regex-budget`, for `marshal grep`): [`avin.regex`'s checked
   searches](/spec/regex/#matching). A spent step budget becomes a failure the caller can handle,
   answering the review question left on the settled limits on matching:
   - **A checked family beside the plain API**: `tryMatches`, `tryFindFirstIn`,
@@ -4959,6 +4953,12 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   - The matcher learns of a spent budget by a flag every step checks, so a spent budget ends the
     whole search through every nested part; a lookaround's or atomic group's body answering no for
     it is never taken as the body failing.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
