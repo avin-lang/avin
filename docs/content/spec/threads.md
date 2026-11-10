@@ -73,7 +73,8 @@ goes on running after the call. What a program can rely on:
   keeps its result, and `join` answers it as before. A thread started in a cancelled scope runs
   nothing.
 - **Every wait is a cancellation point**: a `sleep`, a join, a channel's `receive` or a full channel's
-  `send`, a future's `await`, a promise's future, a condition's `wait` (plain or timed). A thread
+  `send`, a future's `await`, a promise's future, a condition's `wait` (plain or timed), a socket's
+  `accept`, `connect`, read or write that waits for its connection. A thread
   parked in one is woken at once, however long the wait. **So is every safepoint poll**, which
   compiled code makes on every back edge of a loop and before every call that may recur, so a thread
   that computes without waiting stops too, within a loop's turn.
@@ -138,10 +139,14 @@ ready. What a program can rely on:
   and is made ready when its time runs out, and so does a `sleep`: ten thousand threads sleeping at
   once hold no worker between them and all wake in about one sleep. Threads whose times run out
   together are made ready soonest first, two due at the same moment in the order they began to wait.
-  A timed wait that its event ends first answers once, as woken, and its timer goes with it. So
+  A timed wait that its event ends first answers once, as woken, and its timer goes with it.
+  A thread waiting on a [connection](/spec/system-library/#avin-net), to accept, connect, read or
+  write, parks the same way on the runtime's poller, one kernel readiness set for the whole program,
+  and is made ready when the socket is; a connection's timeout parks it on a timer as well, and
+  whichever comes first ends the wait. So
   waiting code is written as plain straight-line code:
-  a server may hold one thread per connection, and a chain of futures each awaiting the one before
-  it resolves however long it is.
+  a server may hold one thread per connection, thousands of them waiting at once on a few workers,
+  and a chain of futures each awaiting the one before it resolves however long it is.
 - **Threads are time-sliced.** A thread that has run for 10 ms while another thread is ready yields
   its worker at its next safepoint poll, which compiled code makes on every back edge of a loop and
   before every call that may recur, and goes to the back of the ready queue. A thread that computes
@@ -153,7 +158,11 @@ ready. What a program can rely on:
   for a millisecond or two while other threads are ready, the runtime runs another worker in its
   place. A worker freed again rejoins the others, or rests until it is needed.
 - **The main thread is not a worker.** `main` runs on the program's first operating system thread,
-  and its own waits block that thread while the workers run the rest.
+  and its own waits block that thread while the workers run the rest. It stays free for work that
+  has to run there, a window above all, which the `ui` package runs on it while other threads
+  [hand it work](/spec/ui/#threads). `isMainThread()` answers whether the calling code runs on it:
+  `true` in `main` and what it calls, `false` on every lightweight thread, a pool's workers among
+  them.
 
 ## What is shared
 

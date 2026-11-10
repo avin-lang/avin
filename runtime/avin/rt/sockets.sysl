@@ -1,0 +1,265 @@
+module avin.rt
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{AlreadyExists, IoError, from_errno}
+import sysl.io.poll.{Event, OneShot, Poller}
+import sysl.io.wait.{Interest, Readable, Writable, ready}
+import sysl.net.{Address, Socket, UnixListener, would_block}
+import sysl.raw.ptr_cast
+import sysl.sync.Atomic
+import sysl.threads.{SleepLock, spawn}
+import sysl.time.micros
+
+// Sockets that wait without holding a worker. Every socket `avin.net` makes is non-blocking, and an
+// operation on one that would have to wait waits for its descriptor instead. A lightweight thread
+// parks on the runtime's poller, a kernel readiness set shared by the whole program, so its worker
+// runs other threads meanwhile; the poller's own operating system thread makes it ready again once
+// the descriptor is, and the operation is tried again. Any other thread, `main` among them, waits on
+// the descriptor alone, safe for the collector. A wait with a limit gives up when the limit runs out,
+// a lightweight thread's by the same timer a timed wait or a sleep parks on.
+//
+// A descriptor is registered for one readiness report at a time, under a token naming the slot its
+// waiter holds. The slot is let go under `io_lock` by whichever ends the wait, the poller thread
+// waking it or the thread itself after its time ran out, so a report that arrives late finds its slot
+// gone, or taken again under a newer token, and wakes nobody.
+
+/** One waiting thread's place among the poller's tokens: its waiter, null while the slot is free, and
+ * how many times the slot has been taken, which a token carries in its high half. */
+struct IoSlot
+    waiter: *Waiter
+    round: u32
+
+/** The time-out code of the platform, which `sysl.net.timed_out` recognises. */
+#if bsd
+private const TimedOutCode: int = 60
+private const InProgressCode: int = 36
+private const SolSocket: int = 65535
+private const SoError: int = 4103
+private const CancelledCode: int = 89
+#else
+private const TimedOutCode: int = 110
+private const InProgressCode: int = 115
+private const SolSocket: int = 1
+private const SoError: int = 4
+private const CancelledCode: int = 125
+#endif
+
+private extern "getsockopt" c_getsockopt(fd: int, level: int, name: int, value: *i32, len: *u32) -> int
+
+/** The longest a thread that is not lightweight waits on a descriptor at once before looking again,
+ * for a wait without a limit. */
+private const OsWaitSlice: long = 3600000000
+
+/** Held while the poller's slots change, and let go by a parking thread's worker once it has
+ * switched away. */
+var io_lock: SleepLock = SleepLock.new()
+private var io_poller: Option[Poller] = None
+private var io_slots: Buf[IoSlot] = buf()
+private var io_free: Buf[usize] = buf()
+private var io_started: Atomic[u64] = Atomic(0)
+/** How many times a lightweight thread has parked on the poller. */
+var io_parks: Atomic[u64] = Atomic(0)
+
+/** How many times a lightweight thread has parked waiting on a socket, for a program that looks at
+ * how its connections wait. */
+socket_parks() -> long = long(io_parks.load())
+
+/** How many of the poller's slots are taken: the threads parked on it now. */
+socket_waiters() -> long
+    io_lock.lock()
+    var n: long = 0
+    for i in 0..<io_slots.len()
+        if io_slots[i].waiter != null then n += 1
+    io_lock.unlock()
+    n
+
+/** The error a wait whose limit ran out answers. */
+private timed_out_error() -> IoError = from_errno(TimedOutCode)
+
+/** The poller, opened with its thread on first use. Under `io_lock`. */
+private poller() -> Result[Poller, IoError]
+    io_poller match
+        Some(p) -> return Ok(p)
+        None -> ()
+    val p = Poller.open()?
+    io_poller = Some(p)
+    spawn(&poll_loop, &io_started, LoopStackBytes) match
+        Some(_) -> ()
+        None -> cannot_poll()
+    Ok(p)
+
+/** The stack the poller's thread runs its loop on. */
+private const LoopStackBytes: usize = 262144
+
+private cannot_poll() -> never
+    begin_stop_foreign()
+    flush()
+    eprints("avin: cannot start a thread: the system refused one\n")
+    trap()
+
+/** Under `io_lock`: a slot for `w`, and the token naming it. */
+take_slot(w: *Waiter) -> u64
+    if io_free.len() == 0
+        io_slots.push(IoSlot(null, 0))
+        io_free.push(io_slots.len() - 1)
+    val i = io_free.pop().unwrap()
+    io_slots[i].waiter = w
+    io_slots[i].round += 1
+    (u64(io_slots[i].round) << 32) | u64(i)
+
+/** Under `io_lock`: the waiter `token` names while its slot is still taken under it, the slot let
+ * go; null where the slot has been let go since, or taken again under a newer token. */
+give_slot(token: u64) -> *Waiter
+    val i = usize(token & 4294967295)
+    if i >= io_slots.len() then return null
+    val s = io_slots[i]
+    if s.waiter == null || u64(s.round) != token >> 32 then return null
+    io_slots[i].waiter = null
+    io_free.push(i)
+    s.waiter
+
+// The poller's thread: waits for the descriptors registered and wakes each one's waiter.
+private poll_loop(started: *Atomic[u64]) -> unit
+    _ = started.add(1)
+    io_lock.lock()
+    val p = io_poller.unwrap()
+    io_lock.unlock()
+    var got = [Event.none; 64]
+    loop
+        val n = p.wait(got[..], None) match
+            Ok(k) -> k
+            Err(_) -> 0
+        io_lock.lock()
+        for i in 0..<n
+            val w = give_slot(got[i].token)
+            if w != null then _ = wake_waiter(w)
+        io_lock.unlock()
+
+/** Waits until `fd` is ready for `interest`, or until `limit_ms` milliseconds have passed where it is
+ * positive: answers whether it became ready. A lightweight thread parks on the poller; any other
+ * thread waits on the descriptor, safe for the collector. A wait may end before the descriptor is
+ * ready, so the caller tries its operation again and waits again where it would still have to. */
+wait_for_fd(fd: int, interest: Interest, limit_ms: int) -> Result[bool, IoError]
+    val ctx = current_context
+    val deadline = if limit_ms > 0 then deadline_after(long(limit_ms)) else 0
+    if ctx != null && runs_lightweight(ctx) then return park_on_fd(ctx, fd, interest, deadline)
+    if ctx != null then enter_safe(ctx)
+    val answer = wait_os(fd, interest, deadline)
+    if ctx != null then leave_safe(ctx)
+    answer
+
+// Waits on `fd` alone, until it is ready or `deadline` passes where it is positive.
+private wait_os(fd: int, interest: Interest, deadline: long) -> Result[bool, IoError]
+    loop
+        val left = if deadline > 0 then deadline - now_micros() else OsWaitSlice
+        if left <= 0 then return Ok(false)
+        if ready(fd, interest, micros(if left > OsWaitSlice then OsWaitSlice else left))? then return Ok(true)
+
+// Parks the lightweight thread `ctx` belongs to until `fd` is ready for `interest` or `deadline`
+// passes. The registration is made under `io_lock`, which the worker lets go only after the thread
+// has switched away, so the poller thread cannot wake it before it is parked.
+private park_on_fd(ctx: *Context, fd: int, interest: Interest, deadline: long) -> Result[bool, IoError]
+    val w = waiter_of(ctx)
+    w.lwt = ptr_cast(ctx)
+    io_lock.lock()
+    val p = poller() match
+        Ok(q) -> q
+        Err(e) ->
+            io_lock.unlock()
+            return Err(e)
+    val token = take_slot(w)
+    val wanted = [interest]
+    val registered = p.register(fd, wanted[..], token, OneShot) match
+        Err(AlreadyExists) -> p.modify(fd, wanted[..], token, OneShot)
+        r -> r
+    registered match
+        Ok(_) -> ()
+        Err(e) ->
+            _ = give_slot(token)
+            io_lock.unlock()
+            return Err(e)
+    _ = io_parks.add(1)
+    park_as(ctx, &io_lock, if deadline > 0 then w else null, deadline, if may_cancel(ctx, 0) then w else null)
+    if deadline > 0 then cancel_timer(w)
+    io_lock.lock()
+    _ = give_slot(token)
+    io_lock.unlock()
+    // A cancellation that ended the wait fails the operation, and the library stops the thread as
+    // soon as the operation has returned to it (`cancel.sysl`), with nothing of Sysl's left on its
+    // stack.
+    if w.state.load() == WaitCancelled then return Err(from_errno(CancelledCode))
+    Ok(w.state.load() == WaitWoken)
+
+/** Makes `s` non-blocking, as every socket the runtime waits on is. */
+socket_non_blocking(c: *Socket) -> Result[unit, IoError] = c.non_blocking(true)
+
+/** Up to `into.len` bytes from `s`, waiting for at least one, or for the end of the input, which
+ * answers zero; a wait longer than `limit_ms` milliseconds, where it is positive, fails as timed out. */
+socket_recv(s: Socket, into: []u8, limit_ms: int) -> Result[usize, IoError]
+    var c = s
+    loop
+        c.recv(into) match
+            Err(e) if would_block(e) ->
+                if !wait_for_fd(c.fd()?, Readable, limit_ms)? then return Err(timed_out_error())
+            r -> return r
+
+/** Every byte of `bytes` to `s`, waiting for room as often as it takes; a wait longer than `limit_ms`
+ * milliseconds, where it is positive, fails as timed out. */
+socket_send_all(s: Socket, bytes: []const u8, limit_ms: int) -> Result[unit, IoError]
+    var c = s
+    var at: usize = 0
+    while at < bytes.len
+        c.send(bytes[at..<bytes.len]) match
+            Ok(n) -> at += n
+            Err(e) if would_block(e) ->
+                if !wait_for_fd(c.fd()?, Writable, limit_ms)? then return Err(timed_out_error())
+            Err(e) -> return Err(e)
+    Ok(())
+
+/** The next connection to the listening `s`, made non-blocking, and where it came from. */
+socket_accept(s: Socket) -> Result[(Socket, Address), IoError]
+    var c = s
+    loop
+        c.accept() match
+            Ok((got, from)) ->
+                var conn = got
+                conn.non_blocking(true)?
+                return Ok((conn, from))
+            Err(e) if would_block(e) -> _ = wait_for_fd(c.fd()?, Readable, 0)?
+            Err(e) -> return Err(e)
+
+/** The next connection to the Unix listener `l`, made non-blocking. */
+unix_accept(l: UnixListener) -> Result[Socket, IoError]
+    var c = l
+    loop
+        c.accept() match
+            Ok(got) ->
+                var conn = got
+                conn.non_blocking(true)?
+                return Ok(conn)
+            Err(e) if would_block(e) -> _ = wait_for_fd(c.fd()?, Readable, 0)?
+            Err(e) -> return Err(e)
+
+/** Makes the Unix listener `l` non-blocking. */
+unix_listener_non_blocking(l: UnixListener) -> Result[unit, IoError]
+    var c = l
+    c.non_blocking(true)
+
+/** Connects `s` to `to`, making it non-blocking first: a connection the system cannot make at once
+ * waits until it is made or refused. */
+socket_connect(s: Socket, to: Address) -> Result[unit, IoError]
+    var c = s
+    c.non_blocking(true)?
+    c.connect(to) match
+        Ok(_) -> return Ok(())
+        Err(e) if e.code() == InProgressCode -> ()
+        Err(e) -> return Err(e)
+    val fd = c.fd()?
+    loop
+        if wait_for_fd(fd, Writable, 0)? then break
+    // Whether the connection was made is the socket's pending error, which reading also clears. A
+    // socket whose error cannot be read is taken as connected: its first read or write says otherwise.
+    var code: i32 = 0
+    var len: u32 = 4
+    if c_getsockopt(fd, SolSocket, SoError, &code, &len) != 0 || code == 0 then return Ok(())
+    Err(from_errno(int(code)))

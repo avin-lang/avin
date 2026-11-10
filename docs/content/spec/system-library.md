@@ -851,7 +851,7 @@ uses it again.
 | `s.readLine() -> Result[Option[string], IoError]` | The next line, as standard input reads one, `None` at the end. |
 | `s.readAll() -> Result[Array[byte], IoError]` | Everything until the other end has finished sending. |
 | `s.write(bytes: Array[byte])`, `s.writeText(text: string)` `-> Result[unit, IoError]` | Sends all of it. |
-| `s.setTimeout(d: Duration) -> Result[unit, IoError]` | A read or write that waits longer fails with `TimedOut`; zero or less takes the limit away. |
+| `s.setTimeout(d: Duration) -> Result[unit, IoError]` | A read or write that waits longer for the other end fails with `TimedOut`; zero or less takes the limit away. Each wait has the whole limit, so a write that waits for room several times fails only where one wait runs out. |
 | `s.shutdownOutput() -> Result[unit, IoError]` | Tells the other end nothing more will be sent; reading goes on. |
 | `s.close()` | Ends the connection; closing again does nothing. |
 | `TcpListener.bind(host: string, port: int) -> Result[TcpListener, IoError]` | Listens on the host's first address (`127.0.0.1` for this machine alone, `0.0.0.0` for all of its addresses); port `0` lets the platform choose. |
@@ -904,7 +904,19 @@ variants a connection meets: `ConnectionRefused`, `ConnectionReset` (a reset, or
 connection the other end has closed) and `TimedOut`. A host that resolves to no address is `Other`,
 and a port outside 0 to 65535 or a read of fewer than one byte traps at the call. Bytes a `readLine`
 reads beyond its line are kept, and the next read of any kind takes them first. A timeout is kept in
-whole milliseconds, a part of one counting as one.
+whole milliseconds, a part of one counting as one, and the longest duration is a limit that never
+runs out.
+
+**Waiting on a connection holds no operating system thread.** An `accept`, a `connect`, a read or a
+write that has to wait for the other end parks a [lightweight thread](/spec/threads/#lightweight-threads)
+on the runtime's poller, and its worker runs other threads until the socket is ready: a server that
+gives each connection a thread of its own serves far more connections than it has workers. `main`,
+which is not a lightweight thread, waits on the socket alone. Either way the wait is safe for the
+collector and a timeout ends it. A wait ends when the other end acts: a read whose peer has closed
+answers the end of the input (an empty array, `None` from `readLine`), and a write to a peer that has
+closed fails with `ConnectionReset`, never ending the program. Nothing else can end a wait early,
+since a connection [belongs to one thread](#tcp): another thread that tries to close a connection or
+listener a thread is parked on traps, as any use of it from there does.
 
 **A connection belongs to one thread at a time**, as every [handle](/spec/sysl-bindings/#handles)
 does: a server accepts a connection and hands it to the thread or future that serves it, the bytes
