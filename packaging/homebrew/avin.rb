@@ -27,9 +27,10 @@ class Avin < Formula
   # 0.9.6, with a stack's real bounds from 0.9.7; and a command's `detach`, the memory a process holds
   # and descriptors closed across a program's start come from Sysl 0.9.8; `exec` and
   # waiting for a child by its pid, and a missing process told as not found, from Sysl 0.9.9; and the
-  # members of a process group and the children of a process from Sysl 0.9.10. A
-  # dependency cannot name a least version, so it is checked here.
-  MINIMUM_SYSL = "0.9.10".freeze
+  # members of a process group and the children of a process from Sysl 0.9.10. The runtime's
+  # package is built with Sysl 0.9.19 and names that release. A dependency cannot name a least
+  # version, so it is checked here.
+  MINIMUM_SYSL = "0.9.19".freeze
 
   def install
     sysl = Formula["sysl-lang/tap/sysl"]
