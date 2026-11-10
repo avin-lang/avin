@@ -5169,6 +5169,49 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   shared close that wakes the parked thread with an error (needs sockets shared between threads,
   which the ownership rule excludes; cancellation by `scope` is where an outside end of a wait
   belongs).
+- Proposed (branch `lwt-ui`): **Other threads reach the interface through inboxes and `post`, run
+  by the main thread from one queue** ([User interfaces](/spec/ui/#threads)). `inbox(handle)` is
+  made on the main thread; its handler, which may capture `State`, stays there; the `Inbox[T, R]` is
+  sendable, with `send(m) -> Future[R]` and `ask(m) -> R`. `post(@sendable work)` queues work with
+  no answer. Every message and post waits in one queue, so one thread's order holds across inboxes.
+  Why: the interface's state is not sendable and must not become so, so the code that touches it
+  has to be made on the main thread and only a sendable message may cross; a future for the answer
+  reuses what already parks a lightweight thread. Alternatives weighed: `post` alone (a sendable
+  closure cannot reach a `State`, so it could not change the interface); a sendable `State` behind a
+  lock (every build would lock, and a write from another thread would race the build); an actor for
+  the interface (the frame loop owns the thread, so a mailbox would still need this queue); a queue
+  for each inbox (loses one thread's order between two inboxes).
+- Proposed (branch `lwt-ui`): **The frame loop runs the waiting work where it asks for the frame's
+  colour**, through a wrapper of `ground`, and `run` runs what is left once more as it returns. Why:
+  syslui-sdl's `on_frame`, the natural place, follows `size: f32` in `app`'s parameters, and a
+  binding cannot pass an `f32` (no Avin type crosses as one), so `app` cannot be given an `on_frame`;
+  the colour is asked for once a frame on the main thread. The cost is one frame: work run there is
+  built on the next frame rather than the one it ran in. Alternatives weighed: `tree` (called only
+  when something was written, so it would never notice a post); `on_event` (called only when there
+  are events). **Review with the user:** a `real` parameter crossing into a Sysl `f32`, converted,
+  would let the package pass `on_frame` and remove the frame's delay.
+- Proposed (branch `lwt-ui`): **`handlePosted` runs only what was waiting when it was called.**
+  Work that sends or posts waits for the next call. Why: work that posts itself again, a common
+  animation shape, would otherwise hold a frame for ever. Alternatives weighed: draining until the
+  queue is empty (simpler, but unbounded).
+- Proposed (branch `lwt-ui`): **An ask on the main thread stops the program; a send or post there
+  is queued.** Why: the main thread handles the message, so its own wait would never end; a trap
+  names the mistake where a hang would not. Alternatives weighed: handling the queue up to the
+  message at once (re-enters a handler that asks, and runs work out of frame order).
+- Proposed (branch `lwt-ui`): **Making an inbox, `handlePosted` and `run` are the main thread's
+  alone**, refused at compile time from code for another thread because they reach the package's
+  module-level state, and checked again at run time with `isMainThread()` (a new function of
+  `avin.threads`, answered by the runtime from the calling context). `run` on another thread stops
+  the program before any window is opened. Why: a window on a thread other than the process's
+  first never shows on macOS, and a handler made on another thread would run on the main thread
+  with that thread's values. Alternatives weighed: answering `Err` from `run` (a mistake in the
+  program, not a condition it can handle); moving `run` to the main thread silently (the caller's
+  wait for its result would be the same hang).
+- Proposed (branch `lwt-ui`): **An inbox lasts as long as the program, and work still waiting when
+  `main` returns is dropped.** Why: inboxes are made once, as a window's state is, and the program
+  ends when `main` returns whatever its threads are doing. Alternatives weighed: closing inboxes
+  (needs a lifetime the interface does not have yet); running the queue at exit (runs interface code
+  after the interface is gone).
 
 ## Open
 
