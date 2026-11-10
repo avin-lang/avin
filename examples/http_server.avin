@@ -1,0 +1,55 @@
+// A small HTTP server: a greeting, a counter each request adds to, and an echo of what is posted.
+// Each connection is served on a lightweight thread of its own, so a client that is slow to send
+// holds no operating system thread. Ctrl-C shuts it down gracefully: it stops accepting, and the
+// requests in flight are answered before it ends.
+//
+//     avin build http_server.avin && ./http_server 8080
+//     curl localhost:8080/hello/you
+//
+// Given `--try`, it serves on a port the system chooses, asks itself a few questions with the HTTP
+// client, and stops.
+//
+// args: --try
+// expect: exit 0
+import avin.net.http
+import avin.net.http.{Response, Route, Router}
+import avin.signal
+import avin.threads.Atomic
+
+routes(hits: Atomic[int]) -> Router = Router([
+    Route.get("/", _ -> Response.text(200, "try /hello/you, /count, or POST to /echo\n")),
+    Route.get("/hello/:name", r -> Response.text(200, s"hello, ${r.param("name")}\n")),
+    Route.get("/count", _ -> Response.text(200, s"${hits.update(n -> n + 1)}\n")),
+    Route.post("/echo", r -> Response.bytes(200, r.body, r.header("Content-Type").getOrElse("application/octet-stream")))])
+
+// The port the first argument names, 8080 where none does, and 0 to try the server out.
+portOf(args: Vector[string]) -> int =
+    if args.contains("--try") then 0
+    else if args.length() > 0 then args(0).toIntOption().getOrElse(8080)
+    else 8080
+
+main(args: Vector[string]) -> int
+    val router = routes(Atomic(0))
+    val server = http.serve("127.0.0.1", portOf(args), router.handle) match
+        Ok(s) -> s
+        Err(e) ->
+            eprintln(s"cannot listen: ${e.message()}")
+            return 1
+    val base = s"http://127.0.0.1:${server.port()}"
+    if args.contains("--try")
+        for path in ["/hello/Avin", "/hello/caf%C3%A9", "/count", "/count", "/nowhere"]
+            http.get(base + path) match
+                Ok(r) -> print(s"GET $path: ${r.status} ${r.text()}")
+                Err(e) -> println(e.message())
+        http.post(base + "/echo", "posted ✓\n", "text/plain") match
+            Ok(r) -> print(s"POST /echo: ${r.status} ${r.header("Content-Type").getOrElse("")} ${r.text()}")
+            Err(e) -> println(e.message())
+        server.shutdown()
+        return 0
+    println(s"serving on $base; Ctrl-C stops")
+    signal.watch(signal.Interrupt) match
+        Ok(interrupt) -> interrupt.wait()
+        Err(e) -> eprintln(s"cannot watch for Ctrl-C: ${e.message()}")
+    server.shutdown()
+    println("stopped")
+    0

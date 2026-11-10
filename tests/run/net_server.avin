@@ -1,0 +1,178 @@
+// expect: exit 0
+// stderr: actor numbers vary
+// `TcpServer`: a hundred clients at once, each connection served in an actor of its own while every
+// one waits, with no carrier added; the connection limit, the next connection waiting unaccepted
+// until one ends; a graceful shutdown with a connection in flight, which finishes while new
+// connections are refused and `shutdown` waits for it; a handler that traps, which fails its
+// connection alone after `failed` has answered on it; the connection's timeout; a handler that stops
+// its own server; stopping twice; a server on every address woken by its own connection; and Unicode
+// lines echoed.
+import avin.io.{ConnectionRefused, IoError, TimedOut}
+import avin.net.{TcpServer, TcpStream}
+import avin.threads.{Atomic, Channel, Promise, sleep, spawn}
+import avin.time.{Duration, millis}
+
+@sysl("avin.rt.scheduler_workers")
+workers() -> long
+
+@sysl("avin.rt.processors")
+processors() -> long
+
+ok[T](r: Result[T, IoError]) -> T = r match
+    Ok(v) -> v
+    Err(e) -> fail(e.message())
+
+connect(server: TcpServer) -> TcpStream = ok(TcpStream.connect("127.0.0.1", server.port()))
+
+// Waits until `server` holds `n` connections.
+holding(server: TcpServer, n: int)
+    while server.connections() != n do sleep(millis(1))
+
+// A hundred clients, all connected and waiting at once before any is answered.
+many(n: int) -> int
+    val go = Promise[unit]()
+    val server = ok(TcpServer.start("127.0.0.1", 0, (s, _) ->
+        val line = ok(s.readLine()).getOrElse("")
+        go.future.await()
+        ok(s.writeText(line.toUpperCase() + "\n"))))
+    val clients = (0..<n).map(i -> spawn(() ->
+        val c = connect(server)
+        ok(c.writeText(s"client $i\n"))
+        val back = ok(c.readLine())
+        c.close()
+        back == Some(s"CLIENT $i"))).toVector()
+    holding(server, n)
+    go.complete(())
+    var echoed = 0
+    for c in clients
+        if c.join() then echoed += 1
+    server.shutdown()
+    echoed
+
+main()
+    // Start the workers first, so the count compared below is the one the connections find.
+    val warm = (0..<int(processors()) * 2).map(_ -> spawn(() -> sleep(millis(1)))).toVector()
+    for t in warm do t.join()
+    val started = workers()
+    println(s"echoed: ${many(100)}")
+    println(s"no carrier added: ${workers() - started <= processors()}")
+
+    // At most two connections: the third waits unaccepted, unanswered, until one of the two ends.
+    val untilClosed: @sendable (TcpStream, TcpServer) -> unit = (s, _) ->
+        ok(s.writeText(s"${ok(s.readLine()).getOrElse("")} served\n"))
+        ok(s.readAll())
+        ()
+    val limited = ok(TcpServer.start("127.0.0.1", 0, untilClosed, maxConnections = 2))
+    val a = connect(limited)
+    val b = connect(limited)
+    ok(a.writeText("a\n"))
+    ok(b.writeText("b\n"))
+    println(s"${ok(a.readLine())} ${ok(b.readLine())}")
+    val c = connect(limited)
+    ok(c.writeText("c\n"))
+    ok(c.setTimeout(millis(100)))
+    println(s"the third waits: ${c.readLine()}, held: ${limited.connections()}")
+    a.close()
+    ok(c.setTimeout(Duration.Zero))
+    println(s"then it is served: ${ok(c.readLine())}")
+    b.close()
+    c.close()
+    limited.shutdown()
+    println(s"held after shutdown: ${limited.connections()}")
+
+    // A shutdown with a connection in flight: it stops accepting at once, the connection finishes,
+    // and `shutdown` returns only after it has.
+    val entered = Channel[string](8)
+    val release = Promise[unit]()
+    val graceful = ok(TcpServer.start("127.0.0.1", 0, (s, server) ->
+        val line = ok(s.readLine()).getOrElse("")
+        entered.send(line)
+        release.future.await()
+        ok(s.writeText(s"$line finished, stopping: ${server.isStopping()}\n"))))
+    val port = graceful.port()
+    val inFlight = connect(graceful)
+    ok(inFlight.writeText("in flight\n"))
+    println(s"entered: ${entered.receive()}")
+    val done = Atomic(false)
+    val stopper = spawn(() ->
+        graceful.shutdown()
+        done.store(true))
+    while !graceful.isStopping() do sleep(millis(1))
+    var refused = false
+    for _ in 0..<500
+        TcpStream.connect("127.0.0.1", port) match
+            Err(ConnectionRefused) ->
+                refused = true
+                break
+            Err(e) -> fail(e.message())
+            Ok(late) ->
+                // Accepted by the kernel before the listener closed: closed unserved.
+                ok(late.setTimeout(millis(2000)))
+                late.readLine() match
+                    Ok(Some(l)) -> fail(s"a connection after the shutdown was served: $l")
+                    _ -> late.close()
+        sleep(millis(10))
+    println(s"new connections refused: $refused, shutdown still waiting: ${!done.load()}")
+    release.complete(())
+    println(ok(inFlight.readLine()))
+    stopper.join()
+    println(s"shutdown returned: ${done.load()}, held: ${graceful.connections()}")
+    inFlight.close()
+
+    // A handler that traps fails its own connection: `failed` answers on it, it is closed, and the
+    // server serves the next one.
+    val mayTrap: @sendable (TcpStream, TcpServer) -> unit = (s, _) ->
+        val line = ok(s.readLine()).getOrElse("")
+        if line == "boom" then fail("the handler gave up")
+        ok(s.writeText(s"fine: $line\n"))
+    val sorry: @sendable (TcpStream) -> unit = s ->
+        s.writeText("sorry\n")
+        ()
+    val sturdy = ok(TcpServer.start("127.0.0.1", 0, mayTrap, failed = sorry))
+    val boom = connect(sturdy)
+    ok(boom.writeText("boom\n"))
+    println(s"${ok(boom.readLine())} then ${ok(boom.readLine())}")
+    boom.close()
+    for word in ["after", "the", "trap"]
+        val next = connect(sturdy)
+        ok(next.writeText(word + "\n"))
+        println(ok(next.readLine()))
+        next.close()
+    sturdy.shutdown()
+
+    // The connection's timeout, as the server set it, ends a read that waits too long.
+    val waits: @sendable (TcpStream, TcpServer) -> unit = (s, _) ->
+        val answer = s.readLine() match
+            Err(TimedOut) -> "timed out"
+            Err(e) -> e.message()
+            Ok(l) -> s"read $l"
+        ok(s.writeText(answer + "\n"))
+    val timed = ok(TcpServer.start("127.0.0.1", 0, waits, timeout = millis(50)))
+    val silent = connect(timed)
+    println(ok(silent.readLine()))
+    silent.close()
+    timed.shutdown()
+
+    // A handler stops its own server with `stop`; `join` waits for it from outside.
+    val selfStopping = ok(TcpServer.start("127.0.0.1", 0, (s, server) ->
+        server.stop()
+        ok(s.writeText("stopped\n"))))
+    val asks = connect(selfStopping)
+    println(ok(asks.readLine()))
+    selfStopping.join()
+    println(s"stopped by its handler: ${selfStopping.isStopping()}, held: ${selfStopping.connections()}")
+    selfStopping.stop()
+    selfStopping.shutdown()
+    println("stopping again changes nothing")
+    asks.close()
+
+    // On every address, woken by a connection to this machine; Unicode lines pass through whole.
+    val everywhere = ok(TcpServer.start("0.0.0.0", 0, (s, _) ->
+        val line = ok(s.readLine()).getOrElse("")
+        ok(s.writeText(s"${line.charCount()} $line\n"))))
+    val u = connect(everywhere)
+    ok(u.writeText("héllo wörld ✓ 𝄞\n"))
+    println(ok(u.readLine()))
+    u.close()
+    everywhere.shutdown()
+    println(s"every address shut down: ${everywhere.connections()}")

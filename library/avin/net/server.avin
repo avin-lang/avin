@@ -1,0 +1,170 @@
+module avin.net
+
+// A server: a listener that accepts TCP connections and serves each one in an actor of its own, so a
+// connection that waits holds no operating system thread and a trap in the code serving one ends
+// that connection alone. It holds at most a given number of connections at once, the next waiting to
+// be accepted until one ends, and it shuts down gracefully: it stops accepting, and every connection
+// it holds finishes before `join` and `shutdown` return.
+
+import avin.actors.{Stop, spawn as startActor}
+import avin.io.IoError
+import avin.threads.{Executor, Mutex, sleep, spawn}
+import avin.time.{Duration, millis}
+
+// The counts a server's acceptor, its connections and its handle share.
+private class Counts()
+    // Connections admitted and not yet ended.
+    var live = 0
+    // Whether the server has been asked to stop.
+    var stopping = false
+    // Whether the acceptor is still running.
+    var accepting = true
+
+// The shared state of one server, changed under its mutex, each change told to the threads waiting.
+private class Gate(private val max: int): Sendable
+    private val counts = Mutex(Counts())
+    private val changed = counts.condition()
+
+    // Waits for room for one more connection; false once the server is stopping. Only the acceptor
+    // adds connections, so the room is still there when it has accepted one.
+    hasRoom() -> bool
+        val most = max
+        val signal = changed
+        counts.with(c ->
+            while c.live >= most && !c.stopping do signal.wait()
+            !c.stopping)
+
+    // Counts a connection accepted.
+    entered() = counts.with(c -> c.live += 1)
+
+    // Counts a connection as ended.
+    left()
+        val signal = changed
+        counts.with(c ->
+            c.live -= 1
+            signal.notifyAll())
+
+    // Asks the server to stop; true the first time.
+    stop() -> bool
+        val signal = changed
+        counts.with(c ->
+            val first = !c.stopping
+            c.stopping = true
+            signal.notifyAll()
+            first)
+
+    // The acceptor has closed the listener and ended.
+    acceptorEnded()
+        val signal = changed
+        counts.with(c ->
+            c.accepting = false
+            signal.notifyAll())
+
+    // Waits until the acceptor has ended and every connection with it.
+    awaitEnd()
+        val signal = changed
+        counts.with(c ->
+            while c.accepting || c.live > 0 do signal.wait()
+            ())
+
+    isStopping() -> bool = counts.with(c -> c.stopping)
+
+    live() -> int = counts.with(c -> c.live)
+
+// A running server, made by `TcpServer.start`. It may be shared between threads: any of them may ask
+// it to stop and wait for it.
+class TcpServer(private val gate: Gate, private val wakeHost: string, private val boundPort: int): Sendable
+    // The port it listens on, the one the platform chose where `start` was given port 0.
+    port() -> int = boundPort
+
+    // How many connections it holds now.
+    connections() -> int = gate.live()
+
+    // Whether it has been asked to stop: code serving a connection asks this to finish early.
+    isStopping() -> bool = gate.isStopping()
+
+    // Stops accepting connections and returns at once; the connections it holds go on until their
+    // code returns. Stopping again does nothing.
+    stop()
+        // The acceptor may be parked in `accept`: a connection of its own wakes it to see the request.
+        if gate.stop()
+            TcpStream.connect(wakeHost, boundPort) match
+                Ok(c) -> c.close()
+                Err(_) -> ()
+
+    // Waits until the server has stopped and every connection it held has ended.
+    join() = gate.awaitEnd()
+
+    // Stops the server and waits for every connection it holds to end: `stop()`, then `join()`.
+    // Code serving one of its own connections calls `stop()`, since this would wait for itself.
+    shutdown()
+        stop()
+        join()
+
+object TcpServer
+    // Listens on `host` and `port`, as `TcpListener.bind` does, and serves each connection it accepts
+    // by `serve`, run in an actor of its own with the connection and the server. The connection is
+    // closed once `serve` returns. At most `maxConnections` are held at once: the next one waits
+    // unaccepted until one ends. Each connection's timeout is `timeout` when `serve` begins (none
+    // for zero). Where `serve` traps, the trap is reported and fails that connection's actor alone:
+    // `failed` runs on the connection, then it is closed, and the server goes on. A
+    // `maxConnections` less than one traps.
+    start(host: string, port: int, serve: @sendable (TcpStream, TcpServer) -> unit, maxConnections: int = 1024,
+          timeout: Duration = Duration.Zero, failed: @sendable (TcpStream) -> unit = _ -> ()) -> Result[TcpServer, IoError]
+        if maxConnections < 1 then fail(s"a server of at most $maxConnections connections: it holds at least one")
+        val listener = TcpListener.bind(host, port)?
+        val gate = Gate(maxConnections)
+        val server = TcpServer(gate, wakeHostOf(host), listener.port())
+        // The connections' actors run on workers of the server's own, one for each connection held,
+        // so a connection parked on its socket never keeps another waiting for a worker.
+        val workers = Executor.fixed(maxConnections)
+        spawn(() -> acceptAll(listener, server, gate, serve, failed, timeout, workers))
+        Ok(server)
+
+// The acceptor's life: admit, accept and hand each connection to an actor of its own until the server
+// stops, then close the listener.
+private acceptAll(listener: TcpListener, server: TcpServer, gate: Gate, serve: @sendable (TcpStream, TcpServer) -> unit,
+                  failed: @sendable (TcpStream) -> unit, timeout: Duration, workers: Executor)
+    while gate.hasRoom()
+        listener.accept() match
+            Ok(s) ->
+                if gate.isStopping()
+                    s.close()
+                    break
+                s.setTimeout(timeout) match
+                    Ok(_) ->
+                        gate.entered()
+                        val ref = startActor(Connection(s, server, serve, failed), onFailure = Stop, executor = workers)
+                        ref.ended().onComplete(_ -> gate.left())
+                    Err(_) -> s.close()
+            Err(_) ->
+                if gate.isStopping() then break
+                // A failure to accept, such as running out of descriptors, passes; try again shortly.
+                sleep(millis(10))
+    listener.close()
+    workers.shutdown()
+    gate.acceptorEnded()
+
+// One connection, served by the server's code in the actor's first turn, after which the actor ends.
+// The connection is closed when the actor ends, and where the code serving it trapped, `failed` runs
+// on it first.
+private actor Connection(stream: TcpStream, server: TcpServer, serve: @sendable (TcpStream, TcpServer) -> unit,
+                         failed: @sendable (TcpStream) -> unit) receives unit
+    var served = false
+    // Given before the connection is served, since a `stopping` block is given only once the body
+    // has run, and the body is where a trap can come.
+    onStopping(() ->
+        if !served then failed(stream)
+        stream.close())
+    serve(stream, server)
+    served = true
+    stop()
+    receive
+        _ -> ()
+
+// The host a server connects to to wake its own acceptor: this machine where it listens on every
+// address.
+private wakeHostOf(host: string) -> string = host match
+    "0.0.0.0" -> "127.0.0.1"
+    "::" -> "::1"
+    _ -> host

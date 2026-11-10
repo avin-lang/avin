@@ -824,7 +824,7 @@ The digests are bound to Sysl's `sysl.crypto`, so they are the same code Sysl pr
 
 ## `avin.net`
 
-TCP connections, URLs, and a small HTTP client. Every operation that can fail answers a
+TCP connections, servers, URLs, and a small HTTP client and server. Every operation that can fail answers a
 `Result[T, IoError]`, and a connection that is reading or writing waits safe for the collector.
 
 ```text
@@ -928,6 +928,124 @@ checked the same way:
 ```text
 avin: trap: `TcpStream` belongs to another thread at main.avin:16:25
 ```
+
+### Servers
+
+`TcpServer` is a listener that serves each connection it accepts in an
+[actor](/spec/actors/) of its own, so a connection that waits holds no operating system thread and
+a bug in the code serving one ends that connection alone:
+
+```text
+import avin.net.TcpServer
+
+main()
+    val server = TcpServer.start("0.0.0.0", 7000, (s, _) ->
+        while s.readLine() is Ok(Some(line))
+            s.writeText(line + "\n")).ok().get()
+    server.join()
+```
+
+| Member | Meaning |
+| --- | --- |
+| `TcpServer.start(host, port, serve: @sendable (TcpStream, TcpServer) -> unit, maxConnections = 1024, timeout = Duration.Zero, failed: @sendable (TcpStream) -> unit = _ -> ()) -> Result[TcpServer, IoError]` | Listens as `TcpListener.bind` does and serves each connection by `serve`, given the connection and the server. |
+| `s.port() -> int` | The port it listens on, the one the platform chose for port 0. |
+| `s.connections() -> int` | How many connections it holds now. |
+| `s.isStopping() -> bool` | Whether it has been asked to stop, for code serving a connection to finish early. |
+| `s.stop()` | Stops accepting and returns at once; stopping again does nothing. |
+| `s.join()` | Waits until it has stopped and every connection it held has ended. |
+| `s.shutdown()` | `stop()`, then `join()`. |
+
+- **Each connection is served in an actor's first turn**, the connection handed to it, and closed
+  once `serve` returns. The actor runs on a pool of the server's own with a worker for each
+  connection it may hold, so a connection parked on its socket never keeps another waiting for a
+  worker; the workers are lightweight threads, idle ones parked.
+- **A trap in `serve` fails that connection's actor alone** (supervised with `Stop`): the trap is
+  reported naming the actor, `avin: trap in Connection#7: …`, then `failed` runs on the
+  connection, which is closed, and the server goes on. A trap that leaves shared state in doubt, as
+  [supervision](/spec/actors/#supervision) says, still stops the program.
+- **At most `maxConnections` are held at once.** The next connection waits unaccepted, in the
+  listener's backlog, until one ends; a limit less than one traps. Each connection's timeout is
+  `timeout` when `serve` begins, none for zero, and `serve` may change it.
+- **A graceful shutdown.** `stop()` stops accepting at once: the listener is closed, so a new
+  connection is refused, and the connections held go on until `serve` returns; `join()` waits for
+  them. Code serving a connection calls `stop()`, since `shutdown()` there would wait for itself.
+  The server may be shared between threads, and any of them may stop it and wait for it.
+
+### HTTP server
+
+`http.serve` is an HTTP/1.1 server on a `TcpServer`, each request answered by a handler from a
+`ServerRequest` to a `Response`; a `Router` is a handler that chooses another by method and path:
+
+```text
+import avin.net.http
+import avin.net.http.{Response, Route, Router}
+
+main()
+    val router = Router([
+        Route.get("/hello/:name", r -> Response.text(200, s"hello, ${r.param("name")}\n")),
+        Route.post("/echo", r -> Response.bytes(200, r.body, "application/octet-stream"))])
+    http.serve("0.0.0.0", 8080, router.handle).ok().get().join()
+```
+
+`http.serve(host, port, handler: @sendable (ServerRequest) -> Response, maxConnections = 1024,
+readTimeout = seconds(30), writeTimeout = seconds(30), idleTimeout = seconds(5), maxHeaderBytes =
+16384, maxBodyBytes = 1048576) -> Result[TcpServer, IoError]` listens as `TcpServer.start` does. Each
+wait while a request is read may last `readTimeout`, each wait while a response is written
+`writeTimeout`, and the wait for the next request on a connection kept alive `idleTimeout`; zero
+takes a limit away. A `maxHeaderBytes` less than one or a `maxBodyBytes` less than zero traps.
+
+A `ServerRequest` has its `method`, its `target` as the request line gave it, its `version`
+(`HTTP/1.1` or `HTTP/1.0`), its `headers` in order with `header(name)` looking one up without regard
+to case, its `body` with `text()` reading it as UTF-8, and the `params` its route bound, with
+`param(name)` trapping where the route has none of that name. From the target come `path`, its
+escapes decoded, `segments`, the path's segments each decoded (so `/a%2Fb` is the one segment
+`a/b`, and `/` one empty one), `query` as written, and `queryParams()` as `Url.queryParams` reads
+them. A target is a path beginning with `/` or an absolute `http` URL; `ServerRequest(method,
+target)` traps on any other, so a handler can be tried without a connection.
+
+A `Response` is the client's: `Response.text(status, text)` (`text/plain; charset=utf-8`),
+`Response.bytes(status, body, contentType)`, `Response.empty(status)` and `withHeader(name, value)`,
+which traps on a name that is not a token or a value holding a line break; `http.reasonPhrase(status)`
+is RFC 9110's phrase for a status, empty for one it does not name.
+
+`Route(method, pattern, handler)`, or `Route.get`, `post`, `put`, `delete` and `patch`, routes a
+method and a pattern; a method that is not a token or a pattern not beginning with `/` traps.
+`Router(routes)` tries its routes in order. A pattern's segments match a request's decoded segments
+one for one, a segment `:name` matching any one that is not empty and binding it, so Unicode paths
+route whether escaped or not. A `GET` route answers `HEAD` too where no `HEAD` route matches. A path
+no route matches is answered `404`, and one that routes match for other methods only `405`, with
+`Allow` naming those methods, `HEAD` beside `GET`.
+
+**The connection.** Requests are read one after another, so several are kept alive on one
+connection and pipelined ones are answered in order: in HTTP/1.1 unless either side says
+`Connection: close`, in HTTP/1.0 only on `Connection: keep-alive`, which the response then repeats.
+Empty lines before a request line are passed over, and a line may end in a bare `\n`. A body is read
+by `Content-Length` or chunked (extensions and trailers passed over); an `Expect: 100-continue` is
+answered `100 Continue` once the body is known to fit. The server writes `Content-Length` and
+`Connection` itself, in place of any the handler gave, every response as `HTTP/1.1`, and no body for
+`HEAD`, `204` and `304`. A handler's status outside 200 to 599, or a header the response cannot
+carry, traps.
+
+**A request the server cannot take is answered and the connection closed**, gently: its side is shut
+and what the client still sends read and dropped for a moment, so the answer is not lost to a reset.
+
+| Status | When |
+| --- | --- |
+| `400` | A request line that is not three words, a method that is not a token, a malformed version, a target that is not one (a fragment, an escape that is not UTF-8 among them), no `Host` in HTTP/1.1 or two, a header without a colon, with a name that is not a token or folded onto a second line, a `Content-Length` that is not digits or two that differ, one beside `Transfer-Encoding`, a coding list not ending in `chunked`, a malformed chunk |
+| `408` | A wait while a request is read outlasts `readTimeout` |
+| `413` | A body longer than `maxBodyBytes`, by its length before it is read, or as its chunks arrive |
+| `414` | A request line longer than `maxHeaderBytes` |
+| `417` | An `Expect` other than `100-continue` |
+| `431` | The request line and headers together, or a chunked body's trailers, longer than `maxHeaderBytes` |
+| `500` | The handler traps: it fails its connection alone, as a `TcpServer`'s `serve` does |
+| `501` | A transfer coding besides `chunked` |
+| `503` | A request read once the server is stopping |
+| `505` | A version other than 1.0 and 1.1 |
+
+A connection waiting for a first request waits `readTimeout`, and for a later one `idleTimeout`,
+then is closed without an answer. **Shutting down**, the server answers the request in flight with
+`Connection: close`, and one arriving on a kept-alive connection `503`; a connection waiting for its
+next request ends when its idle limit runs out, and `join()` waits for that.
 
 ### `Url`
 

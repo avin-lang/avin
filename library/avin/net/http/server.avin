@@ -1,0 +1,410 @@
+module avin.net.http
+
+// An HTTP/1.1 server on a `TcpServer`: each connection is served in an actor of its own, its requests
+// read one after another, so a connection is kept alive for several and pipelined ones are answered
+// in order. A handler takes a `ServerRequest` and answers a `Response`; a `Router` is a handler that
+// chooses another by the request's method and path. A request the server cannot take is answered
+// with its status and the connection closed: a malformed one `400`, a body over the limit `413`, a
+// request line or headers over theirs `414` and `431`, a client too slow `408`, and a request that
+// arrives once the server is stopping `503`. A handler that traps fails its connection alone, which
+// is answered `500` and closed.
+
+import avin.io.{IoError, TimedOut}
+import avin.net.{TcpServer, TcpStream, Url}
+import avin.time.{Duration, millis, seconds}
+
+// A request as a server read it: its method, its target as the request line gave it, its headers in
+// order, its body, its version (`HTTP/1.1` or `HTTP/1.0`) and the parameters its route bound. A
+// target is a path beginning with `/`, with an optional query, or an absolute `http` URL; any other
+// traps where a request is made with it.
+class ServerRequest(val method: string, val target: string, val headers: Vector[(string, string)] = Vector.empty[(string, string)](),
+        val body: Array[byte] = Array.empty[byte](), val version: string = "HTTP/1.1",
+        val params: Vector[(string, string)] = Vector.empty[(string, string)]())
+    private val parts: Target = targetOf(target) match
+        Some(t) -> t
+        None -> fail(s"`$target` is not a request target")
+
+    // The path with its escapes decoded: a target of `/caf%C3%A9?x=1` has the path `/café`.
+    val path: string = parts.path
+
+    // The path's segments, each decoded: `/a/b%2Fc` has `a` and `b/c`, and `/` one empty one.
+    val segments: Vector[string] = parts.segments
+
+    // The query as it was written, without its `?`; `None` where the target has none.
+    val query: Option[string] = parts.url.query
+
+    // The value of the first header of `name`, compared without regard to case.
+    header(name: string) -> Option[string] = headerIn(headers, name)
+
+    // The body read as UTF-8, a sequence that is not UTF-8 read as U+FFFD.
+    text() -> string = string.fromUtf8Lossy(body)
+
+    // The query's pairs, decoded, as `Url.queryParams` reads them.
+    queryParams() -> Vector[(string, string)] = parts.url.queryParams()
+
+    // The value the route bound to the parameter `name`, written `:name` in its pattern; traps where
+    // the route has no such parameter.
+    param(name: string) -> string
+        for (n, v) in params
+            if n == name then return v
+        fail(s"the route has no parameter `$name`")
+
+    // The request with the parameters a route bound.
+    withParams(bound: Vector[(string, string)]) -> ServerRequest = ServerRequest(method, target, headers, body, version, bound)
+
+// A target read: the URL it is part of, its path decoded, and the path's segments decoded.
+private data Target(url: Url, path: string, segments: Vector[string])
+
+// The parts of a request target, or `None` where it is not one: neither a path beginning with `/`
+// nor an absolute `http` or `https` URL, holding a fragment, or holding escapes that are not UTF-8.
+private targetOf(target: string) -> Option[Target]
+    val absolute = target.startsWith("http://") || target.startsWith("https://")
+    if !absolute && !target.startsWith("/") then return None
+    val url = Url.parse(if absolute then target else "http://h" + target) match
+        Ok(u) -> u
+        Err(_) -> return None
+    if url.fragment.isDefined() then return None
+    val raw = if url.path.isEmpty() then "/" else url.path
+    val path = Url.decode(raw) match
+        Ok(p) -> p
+        Err(_) -> return None
+    val segments = Buffer[string]()
+    for piece in raw.split("/").drop(1)
+        Url.decode(piece) match
+            Ok(p) -> segments.addOne(p)
+            Err(_) -> return None
+    Some(Target(url, path, segments.toVector()))
+
+// A route: `handler` for requests of `method` whose path matches `pattern`. The method is a token
+// and the pattern begins with `/`; either traps where it does not.
+class Route(val method: string, val pattern: string, val handler: @sendable (ServerRequest) -> Response): Sendable
+    if method.isEmpty() || method.indexWhere(c -> !isTokenChar(c)) >= 0 then fail(s"`$method` is not an HTTP method")
+    if !pattern.startsWith("/") then fail(s"the route pattern `$pattern` does not begin with `/`")
+
+    // The pattern's segments.
+    private val parts: Vector[string] = pattern.split("/").drop(1)
+
+    // The parameters the pattern binds where it matches `segments`, `None` where it does not.
+    matches(segments: Vector[string]) -> Option[Vector[(string, string)]] = bound(parts, segments)
+
+object Route
+    // A route for `GET`, which answers `HEAD` too.
+    get(pattern: string, handler: @sendable (ServerRequest) -> Response) -> Route = Route("GET", pattern, handler)
+
+    // A route for `POST`.
+    post(pattern: string, handler: @sendable (ServerRequest) -> Response) -> Route = Route("POST", pattern, handler)
+
+    // A route for `PUT`.
+    put(pattern: string, handler: @sendable (ServerRequest) -> Response) -> Route = Route("PUT", pattern, handler)
+
+    // A route for `DELETE`.
+    delete(pattern: string, handler: @sendable (ServerRequest) -> Response) -> Route = Route("DELETE", pattern, handler)
+
+    // A route for `PATCH`.
+    patch(pattern: string, handler: @sendable (ServerRequest) -> Response) -> Route = Route("PATCH", pattern, handler)
+
+// A handler that chooses another by a request's method and path, trying its routes in order. A
+// pattern is a path whose segments are matched one for one with the request's decoded segments, a
+// segment written `:name` matching any one that is not empty and binding it to `name`. A `GET` route
+// answers `HEAD` too, where no `HEAD` route matches. A path no route matches is answered `404`, and
+// one that routes match for other methods only `405`, with an `Allow` header naming them.
+class Router(private val routes: Vector[Route]): Sendable
+    // The response of the first route matching the request's method and path, its parameters bound.
+    handle(request: ServerRequest) -> Response
+        answer(request, request.method) match
+            Some(r) -> return r
+            None -> ()
+        if request.method == "HEAD"
+            answer(request, "GET") match
+                Some(r) -> return r
+                None -> ()
+        val allowed = Buffer[string]()
+        for r in routes
+            if r.matches(request.segments).isDefined() && !allowed.contains(r.method) then allowed.addOne(r.method)
+        if allowed.isEmpty() then return Response.text(404, "Not Found\n")
+        if allowed.contains("GET") && !allowed.contains("HEAD") then allowed.addOne("HEAD")
+        Response.text(405, "Method Not Allowed\n").withHeader("Allow", allowed.mkString(", "))
+
+    // The response of the first route for `method` whose pattern matches the request's path.
+    private answer(request: ServerRequest, method: string) -> Option[Response]
+        for r in routes
+            if r.method == method
+                r.matches(request.segments) match
+                    Some(params) -> return Some(r.handler(request.withParams(params)))
+                    None -> ()
+        None
+
+// The parameters `pattern` binds where it matches `segments`, `None` where it does not.
+private bound(pattern: Vector[string], segments: Vector[string]) -> Option[Vector[(string, string)]]
+    if pattern.length() != segments.length() then return None
+    val params = Buffer[(string, string)]()
+    for (p, s) in pattern.zip(segments)
+        if p.startsWith(":") && p.byteLength() > 1
+            if s.isEmpty() then return None
+            params.addOne((p.slice(1, p.byteLength()), s))
+        else if p != s then return None
+    Some(params.toVector())
+
+// Serves HTTP/1.1 on `host` and `port`, as `TcpServer.start` listens, answering each request by
+// `handler`. At most `maxConnections` are held at once, the next waiting unaccepted. Each wait while
+// a request is read may last `readTimeout`, each wait while a response is written `writeTimeout`,
+// and the wait for the next request on a connection kept alive `idleTimeout`, after which it is
+// closed; zero takes a limit away. A request line may be at most `maxHeaderBytes` long, and the
+// request line and headers together as long; a body may be at most `maxBodyBytes`. A
+// `maxHeaderBytes` less than one, or a `maxBodyBytes` or `maxConnections` less than zero or one,
+// traps.
+serve(host: string, port: int, handler: @sendable (ServerRequest) -> Response, maxConnections: int = 1024,
+      readTimeout: Duration = seconds(30), writeTimeout: Duration = seconds(30), idleTimeout: Duration = seconds(5),
+      maxHeaderBytes: int = 16384, maxBodyBytes: int = 1048576) -> Result[TcpServer, IoError]
+    if maxHeaderBytes < 1 then fail(s"a header limit of $maxHeaderBytes bytes: it is at least one")
+    if maxBodyBytes < 0 then fail(s"a body limit of $maxBodyBytes bytes: it is at least zero")
+    val s = Settings(readTimeout, writeTimeout, idleTimeout, maxHeaderBytes, maxBodyBytes)
+    TcpServer.start(host, port, (stream, server) -> converse(stream, server, handler, s), maxConnections,
+        failed = stream -> refuse(stream, 500, s))
+
+// The limits a server was started with.
+private data Settings(readTimeout: Duration, writeTimeout: Duration, idleTimeout: Duration, maxHeaderBytes: int, maxBodyBytes: int)
+
+// Why a request is not served: the connection is closed quietly, or answered with a status first.
+private data Refusal
+    Quietly
+    Answer(status: int)
+
+// One connection's requests, read and answered in turn until it is not kept alive, its peer ends it,
+// or it waits for a request longer than its limit.
+private converse(stream: TcpStream, server: TcpServer, handler: @sendable (ServerRequest) -> Response, s: Settings)
+    val input = Incoming(stream)
+    var limit = s.readTimeout
+    while input.awaits(limit)
+        limit = s.idleTimeout
+        val request = readRequest(input, stream, s) match
+            Ok(r) -> r
+            Err(Quietly) -> return
+            Err(Answer(status)) ->
+                refuse(stream, status, s)
+                return
+        if server.isStopping()
+            refuse(stream, 503, s)
+            return
+        val response = handler(request)
+        val keep = keepsAlive(request) && !server.isStopping() && !asksToClose(response.headers)
+        if !written(stream, request.method == "HEAD", response, keep, request.version, s.writeTimeout) then return
+        if !keep then return
+
+// Whether the client asks for its connection to stay open after this request: by default in
+// HTTP/1.1, unless `Connection: close`; in HTTP/1.0 only with `Connection: keep-alive`.
+private keepsAlive(request: ServerRequest) -> bool
+    val words = connectionWords(request.headers)
+    if request.version == "HTTP/1.0" then words.contains("keep-alive") else !words.contains("close")
+
+private asksToClose(headers: Vector[(string, string)]) -> bool = connectionWords(headers).contains("close")
+
+// The options of a `Connection` header, in lower case.
+private connectionWords(headers: Vector[(string, string)]) -> Vector[string] =
+    headerIn(headers, "Connection").getOrElse("").toLowerCase().split(",").map(w -> w.trim())
+
+// Answers `status` and closes the connection gently: the server's side is shut, then what the client
+// still sends is read and dropped for a moment, so the answer is not lost to a reset.
+private refuse(stream: TcpStream, status: int, s: Settings)
+    if written(stream, false, Response.text(status, s"${reasonPhrase(status)}\n"), false, "HTTP/1.1", s.writeTimeout)
+        if stream.shutdownOutput().isErr() then return
+        if stream.setTimeout(millis(500)).isErr() then return
+        var left = 1 << 20
+        while left > 0
+            stream.read(65536) match
+                Ok(got) ->
+                    if got.length() == 0 then return
+                    left -= got.length()
+                Err(_) -> return
+
+// Writes `response`, whether or not the connection stays open, and answers whether it was written.
+// The server writes `Content-Length` and `Connection` itself, in place of any the handler gave, and
+// no body for `HEAD` or for `204` and `304`. A status outside 200 to 599, or a header the response
+// cannot carry, traps.
+private written(stream: TcpStream, headOnly: bool, response: Response, keep: bool, version: string, limit: Duration) -> bool
+    if !(200 <= response.status <= 599) then fail(s"a response of status ${response.status}: a handler answers 200 to 599")
+    if response.reason.indexWhere(c -> c == '\r' || c == '\n') >= 0 then fail(s"the reason `${response.reason}` holds a line break")
+    val out = StringWriter()
+    out.write(s"HTTP/1.1 ${response.status} ${response.reason}\r\n")
+    for (name, value) in response.headers
+        if name.isEmpty() || name.indexWhere(c -> !isTokenChar(c)) >= 0 then fail(s"`$name` is not a header name")
+        if value.indexWhere(c -> c == '\r' || c == '\n') >= 0 then fail(s"the value of the header `$name` holds a line break")
+        val own = name.equalsIgnoreCase("Content-Length") || name.equalsIgnoreCase("Transfer-Encoding") || name.equalsIgnoreCase("Connection")
+        if !own then out.write(s"$name: $value\r\n")
+    val bodiless = response.status == 204 || response.status == 304
+    if !bodiless then out.write(s"Content-Length: ${response.body.length()}\r\n")
+    if !keep then out.write("Connection: close\r\n")
+    else if version == "HTTP/1.0" then out.write("Connection: keep-alive\r\n")
+    out.write("\r\n")
+    val all = Buffer[byte]()
+    all.addAll(utf8(out.text()))
+    if !headOnly && !bodiless then all.addAll(response.body)
+    stream.setTimeout(limit).isOk() && stream.write(all.toArray()).isOk()
+
+// The bytes of a connection, read ahead in pieces and handed out as lines and counted runs.
+private class Incoming(private val stream: TcpStream)
+    private var ahead: Array[byte] = Array.empty[byte]()
+    private var at = 0
+
+    // Whether a byte is waiting, or arrives within `limit`.
+    awaits(limit: Duration) -> bool = at < ahead.length() || fill(limit).isOk()
+
+    // The next line without its terminator, `\r\n` or a bare `\n`, holding at most `room` bytes:
+    // a longer one is answered `tooLong`.
+    line(limit: Duration, room: int, tooLong: int) -> Result[string, Refusal]
+        val out = Buffer[byte]()
+        loop
+            while at < ahead.length()
+                val b = ahead(at)
+                at += 1
+                if b == byte(int('\n'))
+                    val bytes = out.toArray()
+                    val n = bytes.length()
+                    return Ok(string.fromUtf8Lossy(if n > 0 && bytes(n - 1) == byte(int('\r')) then bytes.slice(0, n - 1) else bytes))
+                if out.length() >= room then return Err(Answer(tooLong))
+                out.addOne(b)
+            fill(limit)?
+        Err(Quietly)
+
+    // Exactly `n` bytes.
+    bytes(n: int, limit: Duration) -> Result[Array[byte], Refusal]
+        val out = Buffer[byte]()
+        while out.length() < n
+            if at == ahead.length() then fill(limit)?
+            val end = if ahead.length() - at > n - out.length() then at + n - out.length() else ahead.length()
+            out.addAll(ahead.slice(at, end))
+            at = end
+        Ok(out.toArray())
+
+    // Reads the next piece, waiting at most `limit`: a wait that runs out is answered `408`, and a
+    // peer that has finished or failed ends the connection quietly.
+    private fill(limit: Duration) -> Result[unit, Refusal]
+        if stream.setTimeout(limit).isErr() then return Err(Quietly)
+        stream.read(8192) match
+            Ok(got) ->
+                if got.length() == 0 then return Err(Quietly)
+                ahead = got
+                at = 0
+                Ok(())
+            Err(TimedOut) -> Err(Answer(408))
+            Err(_) -> Err(Quietly)
+
+// One request: its request line, its headers and its body.
+private readRequest(input: Incoming, stream: TcpStream, s: Settings) -> Result[ServerRequest, Refusal]
+    var room = s.maxHeaderBytes
+    var first = input.line(s.readTimeout, room, 414)?
+    // Empty lines before a request line are passed over, counted against the limit.
+    while first.isEmpty()
+        room -= 2
+        if room <= 0 then return Err(Answer(400))
+        first = input.line(s.readTimeout, room, 414)?
+    room -= first.byteLength() + 2
+    val words = first.split(" ")
+    if words.length() != 3 then return Err(Answer(400))
+    val method = words(0)
+    val target = words(1)
+    val version = words(2)
+    if method.isEmpty() || method.indexWhere(c -> !isTokenChar(c)) >= 0 then return Err(Answer(400))
+    if !isVersion(version) then return Err(Answer(400))
+    if version != "HTTP/1.1" && version != "HTTP/1.0" then return Err(Answer(505))
+    if targetOf(target).isEmpty() then return Err(Answer(400))
+    val headers = Buffer[(string, string)]()
+    loop
+        if room <= 0 then return Err(Answer(431))
+        val line = input.line(s.readTimeout, room, 431)?
+        room -= line.byteLength() + 2
+        if line.isEmpty() then break
+        // A header folded onto a second line is refused, as RFC 9112 allows.
+        if line.startsWith(" ") || line.startsWith("\t") then return Err(Answer(400))
+        val colon = line.indexOf(':')
+        if colon <= 0 then return Err(Answer(400))
+        val name = line.slice(0, colon)
+        if name.indexWhere(c -> !isTokenChar(c)) >= 0 then return Err(Answer(400))
+        headers.addOne((name, line.slice(colon + 1, line.byteLength()).trim()))
+    val all = headers.toVector()
+    val hosts = all.count(h -> h.0.equalsIgnoreCase("Host"))
+    if hosts > 1 || (version == "HTTP/1.1" && hosts == 0) then return Err(Answer(400))
+    val body = readBody(input, stream, all, version, s)?
+    Ok(ServerRequest(method, target, all, body, version))
+
+// `HTTP/` and a digit, a dot and a digit.
+private isVersion(text: string) -> bool =
+    text.byteLength() == 8 && text.startsWith("HTTP/") && isDigit(text.byteAt(5)) && text.byteAt(6) == byte(int('.')) && isDigit(text.byteAt(7))
+
+private isDigit(b: byte) -> bool = int('0') <= int(b) <= int('9')
+
+// The body the headers announce: chunked, of a `Content-Length`, or none. An `Expect: 100-continue`
+// is answered `100 Continue` once the body is known to fit, and any other expectation `417`.
+private readBody(input: Incoming, stream: TcpStream, headers: Vector[(string, string)], version: string, s: Settings) -> Result[Array[byte], Refusal]
+    val expect = headerIn(headers, "Expect")
+    if expect is Some(e) && !e.equalsIgnoreCase("100-continue") then return Err(Answer(417))
+    val continues = expect.isDefined() && version == "HTTP/1.1"
+    val lengths = headers.filter(h -> h.0.equalsIgnoreCase("Content-Length")).map(h -> h.1)
+    headerIn(headers, "Transfer-Encoding") match
+        Some(encoding) ->
+            // A length beside a coding could be read two ways, so the request is refused.
+            if !lengths.isEmpty() then return Err(Answer(400))
+            val codings = encoding.split(",").map(c -> c.trim().toLowerCase())
+            if codings(codings.length() - 1) != "chunked" then return Err(Answer(400))
+            if codings.length() > 1 then return Err(Answer(501))
+            if continues then sayContinue(stream, s)?
+            readChunked(input, s)
+        None ->
+            if lengths.isEmpty() then return Ok(Array.empty[byte]())
+            val n = lengthOf(lengths(0)) match
+                Some(k) -> k
+                None -> return Err(Answer(400))
+            for other in lengths
+                if lengthOf(other) != Some(n) then return Err(Answer(400))
+            if n > long(s.maxBodyBytes) then return Err(Answer(413))
+            if n == 0 then return Ok(Array.empty[byte]())
+            if continues then sayContinue(stream, s)?
+            input.bytes(int(n), s.readTimeout)
+
+// Tells the client to go on and send the body it waits to send.
+private sayContinue(stream: TcpStream, s: Settings) -> Result[unit, Refusal]
+    if stream.setTimeout(s.writeTimeout).isErr() then return Err(Quietly)
+    stream.write(utf8("HTTP/1.1 100 Continue\r\n\r\n")).mapErr(_ -> Quietly)
+
+// The value of a `Content-Length`, digits only, or `None`; a value past any limit is held at 10^15.
+private lengthOf(text: string) -> Option[long]
+    if text.isEmpty() then return None
+    var n: long = 0
+    for c in text.chars()
+        if !('0' <= c <= '9') then return None
+        if n < 100000000000000 then n = n * 10 + long(int(c) - int('0'))
+    Some(n)
+
+// A chunked body: chunks, each its size in hexadecimal on a line and then its bytes and a line end,
+// until one of size zero, then trailer lines, counted against the header limit, until an empty one.
+private readChunked(input: Incoming, s: Settings) -> Result[Array[byte], Refusal]
+    val out = Buffer[byte]()
+    loop
+        val line = input.line(s.readTimeout, 1024, 400)?
+        val semicolon = line.indexOf(';')
+        val size = chunkSize((if semicolon >= 0 then line.slice(0, semicolon) else line).trim()) match
+            Some(n) -> n
+            None -> return Err(Answer(400))
+        if size == 0
+            var room = s.maxHeaderBytes
+            loop
+                val trailer = input.line(s.readTimeout, room, 431)?
+                if trailer.isEmpty() then return Ok(out.toArray())
+                room -= trailer.byteLength() + 2
+                if room <= 0 then return Err(Answer(431))
+        if long(out.length()) + size > long(s.maxBodyBytes) then return Err(Answer(413))
+        out.addAll(input.bytes(int(size), s.readTimeout)?)
+        val end = input.line(s.readTimeout, 1, 400)?
+        if !end.isEmpty() then return Err(Answer(400))
+    Ok(out.toArray())
+
+// The value of hexadecimal digits, `None` for none or for any other character; a value past any
+// limit is held at 16^13.
+private chunkSize(text: string) -> Option[long]
+    if text.isEmpty() then return None
+    var n: long = 0
+    for c in text.chars()
+        val d = hexDigit(c)
+        if d < 0 then return None
+        if n < 4503599627370496 then n = n * 16 + long(d)
+    Some(n)

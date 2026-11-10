@@ -1,0 +1,167 @@
+// expect: exit 0
+// The HTTP/1.1 server's protocol, against requests written by hand: several requests kept alive on
+// one connection, pipelined ones answered in order, HTTP/1.0's closing by default and keeping alive
+// on request, `Connection: close` from either side, `HEAD` and `204` without bodies, bodies by
+// `Content-Length` and chunked, `Expect`, every malformed request the server refuses with `400`,
+// `505`, `501` or `417`, routing by method and path with `404` and `405`, Unicode and escaped paths,
+// query parameters, and an absolute target. Each response is shown with its line ends as `|`.
+import avin.io.IoError
+import avin.net.{TcpServer, TcpStream}
+import avin.net.http
+import avin.net.http.{Response, Route, Router, ServerRequest}
+import avin.time
+
+ok[T](r: Result[T, IoError]) -> T = r match
+    Ok(v) -> v
+    Err(e) -> fail(e.message())
+
+shown(bytes: Array[byte]) -> string = string.fromUtf8Lossy(bytes).replace("\r\n", "|")
+
+open(server: TcpServer) -> TcpStream
+    val c = ok(TcpStream.connect("127.0.0.1", server.port()))
+    ok(c.setTimeout(time.seconds(10)))
+    c
+
+// Everything the server sends for `text` until it closes the connection.
+whole(server: TcpServer, text: string) -> string
+    val c = open(server)
+    ok(c.writeText(text))
+    val got = shown(ok(c.readAll()))
+    c.close()
+    got
+
+// One response read from `c`: its head and the body its `Content-Length` gives, none for `HEAD`.
+response(c: TcpStream, headOnly: bool = false) -> string
+    val out = StringWriter()
+    var length = 0
+    while true
+        val line = ok(c.readLine()).getOrElse("")
+        out.write(line + "|")
+        if line.isEmpty() then break
+        if line.toLowerCase().startsWith("content-length:") then length = line.slice(15, line.byteLength()).trim().toInt()
+    val body = Buffer[byte]()
+    while !headOnly && body.length() < length
+        body.addAll(ok(c.read(length - body.length())))
+    out.write(string.fromUtf8Lossy(body.toArray()))
+    out.text()
+
+// The router every request below is served by.
+routes() -> Router = Router([
+    Route.get("/", _ -> Response.text(200, "root")),
+    Route.get("/hello", _ -> Response.text(200, "hello")),
+    Route.post("/echo", r -> Response.bytes(200, r.body, r.header("content-type").getOrElse("none"))),
+    Route.put("/echo", r -> Response.text(201, s"put ${r.body.length()}")),
+    Route.get("/users/:id", r -> Response.text(200, s"user ${r.param("id")}")),
+    Route.get("/users/:id/files/:name", r -> Response.text(200, s"${r.param("id")}:${r.param("name")}")),
+    Route.get("/café/:what", r -> Response.text(200, s"path ${r.path} what ${r.param("what")} segments ${r.segments}")),
+    Route.get("/query", r -> Response.text(200, s"${r.query} ${r.queryParams()}")),
+    Route.get("/target", r -> Response.text(200, s"${r.method} ${r.target} ${r.version} ${r.path}")),
+    Route.get("/nothing", _ -> Response.empty(204)),
+    Route.get("/close", _ -> Response.text(200, "bye").withHeader("Connection", "close")),
+    Route.get("/own-length", _ -> Response.text(200, "four").withHeader("Content-Length", "99")),
+    Route.delete("/users/:id", r -> Response.text(200, s"deleted ${r.param("id")}"))])
+
+main()
+    val router = routes()
+    val server = ok(http.serve("127.0.0.1", 0, router.handle))
+
+    // Several requests kept alive on one connection, one at a time.
+    val kept = open(server)
+    for path in ["/", "/hello", "/users/42"]
+        ok(kept.writeText(s"GET $path HTTP/1.1\r\nHost: test\r\n\r\n"))
+        println(response(kept))
+    println(s"one connection held: ${server.connections()}")
+    kept.close()
+
+    // Pipelined: three requests in one write, answered in order.
+    val piped = open(server)
+    ok(piped.writeText("GET /users/1 HTTP/1.1\r\nHost: t\r\n\r\nPOST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\nContent-Type: text/x\r\n\r\nabcdeGET /users/3 HTTP/1.1\r\nHost: t\r\n\r\n"))
+    for _ in 0..<3 do println(response(piped))
+    piped.close()
+
+    // HTTP/1.0 closes by default, and keeps alive on request, saying so.
+    println(whole(server, "GET /hello HTTP/1.0\r\n\r\n"))
+    val old = open(server)
+    ok(old.writeText("GET /hello HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"))
+    println(response(old))
+    ok(old.writeText("GET / HTTP/1.0\r\n\r\n"))
+    println(shown(ok(old.readAll())))
+    old.close()
+
+    // `Connection: close` from the client, and from the handler, closes after the response; the
+    // server writes its own `Content-Length`, in place of a handler's.
+    println(whole(server, "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: Keep-Alive, Close\r\n\r\n"))
+    println(whole(server, "GET /close HTTP/1.1\r\nHost: t\r\n\r\n"))
+    println(whole(server, "GET /own-length HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+
+    // `HEAD` answers a `GET` route's headers with no body; `204` has neither body nor length. The next
+    // request on the same connection is read whole after each.
+    val heads = open(server)
+    ok(heads.writeText("HEAD /users/9 HTTP/1.1\r\nHost: t\r\n\r\n"))
+    println(response(heads, headOnly = true))
+    ok(heads.writeText("GET /nothing HTTP/1.1\r\nHost: t\r\n\r\n"))
+    println(response(heads))
+    ok(heads.writeText("GET /hello HTTP/1.1\r\nHost: t\r\n\r\n"))
+    println(response(heads))
+    heads.close()
+
+    // Bodies: by length, empty, chunked with an extension and a trailer, and after `100 Continue`.
+    println(whole(server, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 7\r\nConnection: close\r\n\r\nhé llo"))
+    println(whole(server, "PUT /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+    println(whole(server, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: Chunked\r\nConnection: close\r\n\r\n3;ext=1\r\nabc\r\nA\r\n0123456789\r\n0\r\nX-Trailer: yes\r\n\r\n"))
+    val asks = open(server)
+    ok(asks.writeText("PUT /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 4\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"))
+    println(s"before the body: ${ok(asks.readLine())} ${ok(asks.readLine())}")
+    ok(asks.writeText("body"))
+    println(shown(ok(asks.readAll())))
+    asks.close()
+
+    // Malformed requests: each refused with its status and the connection closed.
+    val malformed = [
+        "GARBAGE\r\n\r\n",
+        "GET / HTTP/1.1 extra\r\nHost: t\r\n\r\n",
+        "GET  / HTTP/1.1\r\nHost: t\r\n\r\n",
+        "G(T / HTTP/1.1\r\nHost: t\r\n\r\n",
+        "GET / HTTX/1.1\r\nHost: t\r\n\r\n",
+        "GET / HTTP/2.0\r\nHost: t\r\n\r\n",
+        "GET / HTTP/1.1\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: t\r\nNoColon\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: t\r\nBad Name: x\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: t\r\nX-Folded: a\r\n b\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: t\r\n: empty\r\n\r\n",
+        "GET hello HTTP/1.1\r\nHost: t\r\n\r\n",
+        "GET /a#frag HTTP/1.1\r\nHost: t\r\n\r\n",
+        "GET /%ZZ HTTP/1.1\r\nHost: t\r\n\r\n",
+        "GET /%FF HTTP/1.1\r\nHost: t\r\n\r\n",
+        "GET /a b HTTP/1.1\r\nHost: t\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: abc\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: -1\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab",
+        "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: gzip\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nab\r\n0\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nabc\r\n0\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nExpect: something-else\r\n\r\nab"]
+    for request in malformed
+        println(whole(server, request).slice(0, 40))
+
+    // Passed over: empty lines before a request line, two equal lengths, and a bare `\n` ending lines.
+    println(whole(server, "\r\n\r\nGET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+    println(whole(server, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"))
+    println(whole(server, "GET /hello HTTP/1.1\nHost: t\nConnection: close\n\n"))
+
+    // Routing: parameters, `404`, `405` naming the methods with `HEAD` beside `GET`, a parameter
+    // that does not match an empty segment, and a trailing slash that is a segment of its own.
+    for request in ["GET /users/7/files/a.txt", "GET /nowhere", "POST /hello", "PATCH /users/7", "GET /users/", "GET /hello/", "OPTIONS /echo"]
+        println(whole(server, s"$request HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+
+    // Unicode: an escaped path, the same written raw, an escaped `/` that stays inside its segment,
+    // decoded query parameters, and an absolute target.
+    for target in ["/caf%C3%A9/%E2%9C%93", "/café/✓", "/caf%C3%A9/a%2Fb", "/query?q=%C3%A9t%C3%A9&x=a+b&flag", "/query", "http://example.com/target?x=1"]
+        println(whole(server, s"GET $target HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+
+    server.shutdown()
+    println(s"held after shutdown: ${server.connections()}")
