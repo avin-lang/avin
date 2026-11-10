@@ -97,7 +97,11 @@ ready. What a program can rely on:
   for a millisecond or two while other threads are ready, the runtime runs another worker in its
   place. A worker freed again rejoins the others, or rests until it is needed.
 - **The main thread is not a worker.** `main` runs on the program's first operating system thread,
-  and its own waits block that thread while the workers run the rest.
+  and its own waits block that thread while the workers run the rest. It stays free for work that
+  has to run there, a window above all, which the `ui` package runs on it while other threads
+  [hand it work](/spec/ui/#threads). `isMainThread()` answers whether the calling code runs on it:
+  `true` in `main` and what it calls, `false` on every lightweight thread, a pool's workers among
+  them.
 
 ## What is shared
 

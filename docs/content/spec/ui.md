@@ -142,7 +142,11 @@ so a program keeping its state in Avin variables changes them and calls `invalid
 | `saveFrame(file)` | Writes the next finished frame to a PNG file |
 
 `run` is `blocking`: while the loop waits for events the thread is safe for the collector, and it is
-running for each call of `tree` and `ground` and every control's callback. `ground` answers a
+running for each call of `tree` and `ground` and every control's callback. A window runs on the
+[main thread](/spec/threads/#lightweight-threads), the operating system thread `main` was called
+on, which is never a lightweight thread; at the start of every frame the loop runs the
+[work other threads have handed it](#threads), and when the loop ends `run` runs what is still
+waiting before it returns. `ground` answers a
 `long`, which Sysl takes as the `u32` syslui asks for, [checked](/spec/sysl-bindings/#callbacks): an
 answer below 0 or past `0xFFFFFFFF` stops the program.
 
@@ -268,11 +272,67 @@ and a closure for another thread cannot capture one:
 error: what is passed for `body` of `spawn` may use only sendable values from around it, but it uses `count`, a `State[int]`, whose field `held` is a `var`; make it a `val`
 ```
 
-There is no way yet to hand a change to the interface from another thread.
+Another thread changes the interface by handing the main thread something to do, and the main
+thread does it at the start of a frame. An **inbox** takes messages: `inbox(handle)`, made on the
+main thread, is an `Inbox[T, R]` whose handler `handle: (T) -> R` runs on the main thread with the
+interface's state in reach, and an inbox is sendable, so threads are handed it:
+
+| Function | |
+| --- | --- |
+| `inbox(handle)` | An `Inbox[T, R]` whose messages `handle` handles on the main thread; `T` and `R` are sendable |
+| `box.send(m)` | Queues `m` and answers at once a `Future[R]` of the handler's answer |
+| `box.ask(m)` | Queues `m` and waits for the handler's answer |
+| `post(work)` | Queues the `@sendable () -> unit` `work` to run on the main thread, and returns at once |
+| `handlePosted()` | Runs every message and piece of work waiting, on the main thread, and answers how many |
+
+```text
+import avin.threads.{sleep, spawn}
+import avin.time.millis
+import ui.{inbox, state}
+
+val ticks = state(0)
+val tick = inbox((n: int) -> ticks.set(n))
+spawn(() ->
+    for n in 1..10
+        sleep(millis(100))
+        tick.ask(n))
+```
+
+- **Everything runs on the main thread, in the order it was sent.** Messages to every inbox and
+  posted work wait in one queue, so what one thread sends and posts runs in the order it did them,
+  whichever inboxes they went to, and a send happens before its handling. Among many senders each
+  thread's order is kept.
+- **The frame loop runs what is waiting at the start of every frame**, where the frame asks for its
+  colour, so a state the work sets is built on the next frame. `run` runs what is still waiting
+  once more when the loop ends. A program with no window, a test among them, calls
+  `handlePosted()` itself.
+- **What the work sends or posts waits for the next frame.** `handlePosted` runs only what was
+  waiting when it was called, so work that posts itself again runs once a frame rather than holding
+  the frame for ever.
+- **An ask parks.** A lightweight thread waiting in `ask`, or in `await` on what `send` answered,
+  frees its worker until the main thread has handled the message. An ask on the main thread, which
+  would wait for itself, stops the program:
+
+  ```text
+  avin: trap: an inbox was asked from the main thread, which would wait for itself to handle the message
+  ```
+
+  A send or a post from the main thread, from a handler too, is queued like any other.
+- **Only the main thread makes an inbox, handles what is waiting and runs a window.** Each reaches
+  the main thread's own state, so code for another thread that does one of them is refused where it
+  is compiled, as reaching any module-level mutable state is:
+
+  ```text
+  error: what is passed for `body` of `spawn` may run on another thread, which shares the program's module-level state, but through `handlePosted` → `handleOne` it reaches `handlers`, a module-level value holding a `Map[int, () -> unit]`, which is mutable; an immutable copy (`toMap`) is sendable
+  ```
+
+- **A message, an answer and posted work cross threads, so each is sendable**; a handler is not,
+  since it stays on the main thread, and may capture a `State`. An inbox lasts as long as the
+  program. When `main` returns the program ends, as it always does: work still waiting is never
+  run, and a thread parked on an ask does not hold the program open.
 
 ## What is not bound
 
-- Changing the interface's state from another thread.
 - Overlays (`popover`, `modal`, `menu_bar`), tables, images, selection, the theme and its
   `restyle`, keyboard input to a recording canvas, `on_event`, `on_frame` and the control socket;
   each is bound when something needs it.
