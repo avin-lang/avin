@@ -5125,15 +5125,43 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
     the member that does not conform; a trait taking `Self` other than as the receiver); a result
     with a scalar error union names `mapErr(e -> e)`. *Why*: each names the fix. *Alternatives*: the
     general messages alone.
-
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (branch `lwt-ui`): **Other threads reach the interface through inboxes and `post`, run
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-sockets`): **a socket wait parks on one poller with a thread of its own, one
+  readiness report per wait.** Every socket `avin.net` makes is non-blocking; an operation that would
+  have to wait registers the descriptor with the runtime's single `sysl.io.poll` set as `OneShot`,
+  under a token naming a slot that holds the waiter, and parks; the poller's own operating system
+  thread waits on the set and makes each reported waiter ready, and the operation is tried again. A
+  slot is let go under one lock by whichever ends the wait, so a report arriving after a timeout
+  finds its slot gone or taken again under a newer token and wakes nobody. *Why*: the monitor sleeps
+  on a condition, which a kernel set cannot wake, and a thread blocked in the set's wait needs nothing
+  else; a one-shot registration per wait can never deliver a stale wake to a later wait on another
+  thing. *Alternatives*: the monitor waiting on the poller with the soonest timer as its timeout
+  (the timers then move under the poller, a larger change to settled code, which this choice does not
+  preclude); workers polling the set between threads (no extra thread, but a worker with nothing ready
+  then sleeps in the kernel instead of on its condition, and wakes need a second path); a level- or
+  edge-triggered registration kept for the socket's life (one system call less per wait, but a
+  report for a wait that has ended can reach the next one, so every wait in the runtime would have to
+  tolerate spurious wakes).
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-sockets`): **a connection's timeout bounds each wait, not the whole
+  operation.** A write that waits for room several times fails with `TimedOut` only where one wait
+  outlasts the limit, as the kernel's per-call socket timeouts did before; the limit is kept in the
+  connection rather than in the socket, since a non-blocking socket ignores the kernel's. *Why*: a
+  large transfer to a slow but steady peer keeps going, and the meaning of `setTimeout` does not
+  change. *Alternatives*: a deadline for the whole `write` or `readAll` (stops a slow transfer that is
+  still making progress). Review with the user if a whole-operation deadline is wanted as well.
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-sockets`): **`connect` parks; a Unix `connect` does not.** A TCP connection
+  that cannot be made at once waits for the socket to become writable, then reads the socket's
+  pending error (`SO_ERROR`) for the outcome, since a second `connect` answers "already connected"
+  even for a refused connection on macOS. A Unix connection is made at once by the kernel or refused,
+  so it stays a plain call and the socket is made non-blocking after. *Alternatives*: a blocking
+  `connect` that the monitor compensates for (holds a worker for a round trip to the peer).
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-sockets`): **a connection or listener cannot be closed under a thread parked
+  on it.** It belongs to the parked thread, so another thread's `close()` traps as any other use
+  from there does, and the wait ends only by the peer, a timeout or readiness. *Why*: the ownership
+  rule already decides it, and no wake path for a socket closed elsewhere is needed. *Alternatives*: a
+  shared close that wakes the parked thread with an error (needs sockets shared between threads,
+  which the ownership rule excludes; cancellation by `scope` is where an outside end of a wait
+  belongs).
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-ui`): **Other threads reach the interface through inboxes and `post`, run
   by the main thread from one queue** ([User interfaces](/spec/ui/#threads)). `inbox(handle)` is
   made on the main thread; its handler, which may capture `State`, stays there; the `Inbox[T, R]` is
   sendable, with `send(m) -> Future[R]` and `ask(m) -> R`. `post(@sendable work)` queues work with
@@ -5145,8 +5173,9 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   lock (every build would lock, and a write from another thread would race the build); an actor for
   the interface (the frame loop owns the thread, so a mailbox would still need this queue); a queue
   for each inbox (loses one thread's order between two inboxes).
-- Proposed (branches `lwt-ui`, `binding-f32`): **The frame loop runs the waiting work in
-  syslui-sdl's `on_frame`**, at the start of every frame and before the loop decides whether to build
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-ui`; moved to `on_frame` on
+  branch `binding-f32`, which rests on the Proposed `f32` entry): **The frame loop runs the waiting
+  work in syslui-sdl's `on_frame`**, at the start of every frame and before the loop decides whether to build
   the tree again, so work posted before a frame runs in that frame and what it writes is built in it;
   `run` runs what is left once more as it returns. The package passes `app` its `on_event` (answering
   `false` for every event, as syslui-sdl's default does, through a private handle on
@@ -5159,6 +5188,36 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   naming arguments at the Sysl call so the defaults in between need not be repeated (a larger change
   to every binding's shim, for one call). If syslui-sdl's defaults for `font` or `size` change, the
   package's copies must follow.
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-ui`): **`handlePosted` runs only what was waiting when it was called.**
+  Work that sends or posts waits for the next call. Why: work that posts itself again, a common
+  animation shape, would otherwise hold a frame for ever. Alternatives weighed: draining until the
+  queue is empty (simpler, but unbounded).
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-ui`): **An ask on the main thread stops the program; a send or post there
+  is queued.** Why: the main thread handles the message, so its own wait would never end; a trap
+  names the mistake where a hang would not. Alternatives weighed: handling the queue up to the
+  message at once (re-enters a handler that asks, and runs work out of frame order).
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-ui`): **Making an inbox, `handlePosted` and `run` are the main thread's
+  alone**, refused at compile time from code for another thread because they reach the package's
+  module-level state, and checked again at run time with `isMainThread()` (a new function of
+  `avin.threads`, answered by the runtime from the calling context). `run` on another thread stops
+  the program before any window is opened. Why: a window on a thread other than the process's
+  first never shows on macOS, and a handler made on another thread would run on the main thread
+  with that thread's values. Alternatives weighed: answering `Err` from `run` (a mistake in the
+  program, not a condition it can handle); moving `run` to the main thread silently (the caller's
+  wait for its result would be the same hang).
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-ui`): **An inbox lasts as long as the program, and work still waiting when
+  `main` returns is dropped.** Why: inboxes are made once, as a window's state is, and the program
+  ends when `main` returns whatever its threads are doing. Alternatives weighed: closing inboxes
+  (needs a lifetime the interface does not have yet); running the queue at exit (runs interface code
+  after the interface is gone).
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
+
 - Proposed (branch `binding-f32`): **A `real` crosses into and out of any Sysl floating-point type
   that rounds: `f32`, `f16`, `bf16` and `real`.** A binding's own `real` parameter, a mirror's `real`
   field going into Sysl, and a callback's `real` answer are rounded into the Sysl type to the nearest
@@ -5178,28 +5237,6 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   (integers are not converted there either, and the copy would be written element by element).
   **Review with the user** whether a `real` into an `f32` should trap on overflow to infinity
   rather than round to it.
-- Proposed (branch `lwt-ui`): **`handlePosted` runs only what was waiting when it was called.**
-  Work that sends or posts waits for the next call. Why: work that posts itself again, a common
-  animation shape, would otherwise hold a frame for ever. Alternatives weighed: draining until the
-  queue is empty (simpler, but unbounded).
-- Proposed (branch `lwt-ui`): **An ask on the main thread stops the program; a send or post there
-  is queued.** Why: the main thread handles the message, so its own wait would never end; a trap
-  names the mistake where a hang would not. Alternatives weighed: handling the queue up to the
-  message at once (re-enters a handler that asks, and runs work out of frame order).
-- Proposed (branch `lwt-ui`): **Making an inbox, `handlePosted` and `run` are the main thread's
-  alone**, refused at compile time from code for another thread because they reach the package's
-  module-level state, and checked again at run time with `isMainThread()` (a new function of
-  `avin.threads`, answered by the runtime from the calling context). `run` on another thread stops
-  the program before any window is opened. Why: a window on a thread other than the process's
-  first never shows on macOS, and a handler made on another thread would run on the main thread
-  with that thread's values. Alternatives weighed: answering `Err` from `run` (a mistake in the
-  program, not a condition it can handle); moving `run` to the main thread silently (the caller's
-  wait for its result would be the same hang).
-- Proposed (branch `lwt-ui`): **An inbox lasts as long as the program, and work still waiting when
-  `main` returns is dropped.** Why: inboxes are made once, as a window's state is, and the program
-  ends when `main` returns whatever its threads are doing. Alternatives weighed: closing inboxes
-  (needs a lifetime the interface does not have yet); running the queue at exit (runs interface code
-  after the interface is gone).
 
 ## Open
 

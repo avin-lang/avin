@@ -1,0 +1,271 @@
+// expect: exit 0
+// A lightweight thread that waits on a socket parks on the runtime's poller and frees its worker:
+// a hundred connections, more than there are workers, each served by a thread of its own while all
+// of them wait at once, with no worker added and none replaced as if it were blocked. Accepting,
+// connecting, reading and writing each park; a counter thread makes progress while they wait; a
+// round trip echoes; a peer that closes ends a parked read with the end of the input and a parked
+// write with `ConnectionReset`; a refused connection is `ConnectionRefused` from a thread and from
+// `main`; a timeout ends a parked read or write with `TimedOut` and a wait the other end ends first is
+// not timed out; a write larger than the socket's buffers waits for room many times; and Unix
+// connections park as TCP ones do. Bounds are generous, so a loaded machine cannot fail the test.
+import avin.fs
+import avin.io.{ConnectionRefused, ConnectionReset, IoError, TimedOut}
+import avin.net.{TcpListener, TcpStream, UnixListener, UnixStream}
+import avin.threads.{Atomic, Future, Promise, scope, sleep, spawn}
+import avin.time.{Duration, millis, monotonic}
+
+@sysl("avin.rt.scheduler_workers")
+workers() -> long
+
+@sysl("avin.rt.scheduler_releases")
+releases() -> long
+
+@sysl("avin.rt.processors")
+processors() -> long
+
+@sysl("avin.rt.socket_parks")
+socketParks() -> long
+
+@sysl("avin.rt.socket_waiters")
+socketWaiters() -> long
+
+ok[T](r: Result[T, IoError]) -> T = r match
+    Ok(v) -> v
+    Err(e) -> fail(e.message())
+
+// Waits until at least `n` threads are parked on sockets.
+parkedAtLeast(n: long)
+    while socketWaiters() < n
+        sleep(millis(1))
+
+// The two ends of one connection: the client's and the one a listener of its own accepted.
+pair() -> (TcpStream, TcpStream)
+    val l = ok(TcpListener.bind("127.0.0.1", 0))
+    val port = l.port()
+    val accepted = spawn(() -> ok(l.accept()))
+    val c = ok(TcpStream.connect("127.0.0.1", port))
+    (c, accepted.join())
+
+bytesOf(text: string) -> Array[byte] = Array.tabulate(text.byteLength(), i -> text.byteAt(i))
+
+// Upper-cases the line `s` sends back to it.
+serve(s: TcpStream) -> int
+    val line = ok(s.readLine()).getOrElse("")
+    ok(s.writeText(line.toUpperCase() + "\n"))
+    s.close()
+    line.charCount()
+
+// A hundred connections, each served by a thread of its own that the acceptor hands it to, every
+// server parked reading and every client parked on the promise that lets them all write at once.
+manyConnections(n: int) -> int
+    val l = ok(TcpListener.bind("127.0.0.1", 0))
+    val port = l.port()
+    val go = Promise[unit]()
+    val acceptor = spawn(() ->
+        val servers = (0..<n).map(_ ->
+            val s = ok(l.accept())
+            spawn(() -> serve(s))).toVector()
+        var chars = 0
+        for t in servers do chars += t.join()
+        chars)
+    val clients = (0..<n).map(i -> spawn(() ->
+        val c = ok(TcpStream.connect("127.0.0.1", port))
+        go.future.await()
+        ok(c.writeText(s"client $i\n"))
+        val back = ok(c.readLine()).getOrElse("")
+        c.close()
+        back == s"CLIENT $i")).toVector()
+    parkedAtLeast(long(n))
+    go.complete(())
+    var echoed = 0
+    for c in clients
+        if c.join() then echoed += 1
+    if acceptor.join() != n * 8 + 90 then println("the servers read other lines")
+    echoed
+
+main() -> int
+    // Start the workers first, so the count compared below is the one the connections find.
+    val warm = (0..<int(processors()) * 2).map(_ -> spawn(() -> sleep(millis(1)))).toVector()
+    for t in warm do t.join()
+    val started = workers()
+    val released = releases()
+    val parks = socketParks()
+    val n = 100
+    println(s"connections echoed: ${manyConnections(n)}")
+    println(s"no worker added: ${workers() - started <= processors()}, none replaced: ${releases() == released}")
+    println(s"each server parked: ${socketParks() - parks >= long(n)}")
+
+    // A round trip, in a thread and in `main`.
+    val (c1, s1) = pair()
+    val echo = spawn(() ->
+        val got = ok(s1.read(5))
+        ok(s1.write(got))
+        got.length())
+    ok(c1.write(bytesOf("hello")))
+    println(s"round trip: ${string.fromUtf8Lossy(ok(c1.read(5)))} ${echo.join()}")
+
+    // A thread parked in `accept` holds no worker: a counter keeps counting while it waits.
+    val l2 = ok(TcpListener.bind("127.0.0.1", 0))
+    val port2 = l2.port()
+    val acceptor = spawn(() -> ok(l2.accept()).readLine())
+    parkedAtLeast(1)
+    val counted = Atomic(0)
+    val counter = spawn(() ->
+        for _ in 0..<1000
+            counted.update(k -> k + 1)
+            sleep(Duration.Zero))
+    counter.join()
+    println(s"counted while accept waits: ${counted.load()}")
+    val late = ok(TcpStream.connect("127.0.0.1", port2))
+    ok(late.writeText("late\n"))
+    println(s"accept answered: ${ok(acceptor.join())}")
+
+    // A peer that closes ends a parked read with the end of the input, a line read with `None`.
+    val (c2, s2) = pair()
+    val reader = spawn(() -> (ok(s2.read(10)).length(), ok(s2.readLine())))
+    parkedAtLeast(1)
+    c2.close()
+    println(s"read after the peer closed: ${reader.join()}")
+
+    // A parked write to a peer that closes without reading fails with `ConnectionReset`, and does not
+    // end the program.
+    val (c3, s3) = pair()
+    val writer = spawn(() ->
+        val big = Array.fill(1 << 20, byte(7))
+        var outcome = "never failed"
+        for _ in 0..<64
+            s3.write(big) match
+                Err(ConnectionReset) ->
+                    outcome = "ConnectionReset"
+                    break
+                Err(e) ->
+                    outcome = s"$e"
+                    break
+                Ok(_) -> ()
+        outcome)
+    parkedAtLeast(1)
+    c3.close()
+    println(s"write to a closed peer: ${writer.join()}")
+
+    // A connection refused, from a thread, which parks while it connects, and from `main`.
+    val gone = ok(TcpListener.bind("127.0.0.1", 0))
+    val port = gone.port()
+    gone.close()
+    val refused = spawn(() -> TcpStream.connect("127.0.0.1", port).map(_ -> "connected"))
+    println(s"refused in a thread: ${refused.join()}")
+    println(s"refused in main: ${TcpStream.connect("127.0.0.1", port).map(_ -> "connected")}")
+
+    // A timeout ends a parked read, and a parked write, with `TimedOut` once it runs out; in `main`
+    // too. A read the other end answers first is not timed out, and zero takes the limit away.
+    val (c4, s4) = pair()
+    ok(s4.setTimeout(millis(50)))
+    val timed = spawn(() ->
+        val before = monotonic()
+        val r = s4.read(1).map(b -> b.length())
+        (r, monotonic() - before >= millis(50)))
+    println(s"read timed out in a thread: ${timed.join()}")
+    val before = monotonic()
+    println(s"read timed out in main: ${s4.read(1).map(b -> b.length())} ${monotonic() - before >= millis(50)}")
+    ok(s4.setTimeout(millis(10000)))
+    val answered = spawn(() -> s4.read(3).map(b -> string.fromUtf8Lossy(b)))
+    parkedAtLeast(1)
+    ok(c4.writeText("abc"))
+    println(s"read answered before its time: ${answered.join()}")
+    ok(s4.setTimeout(Duration.Zero))
+    val unlimited = spawn(() -> s4.read(3).map(b -> string.fromUtf8Lossy(b)))
+    sleep(millis(80))
+    ok(c4.writeText("def"))
+    println(s"no limit waits as long as it takes: ${unlimited.join()}")
+    ok(s4.setTimeout(millis(50)))
+    val stuck = spawn(() ->
+        val big = Array.fill(1 << 20, byte(7))
+        var outcome = "never failed"
+        for _ in 0..<64
+            s4.write(big) match
+                Err(TimedOut) ->
+                    outcome = "TimedOut"
+                    break
+                Err(e) ->
+                    outcome = s"$e"
+                    break
+                Ok(_) -> ()
+        outcome)
+    println(s"write timed out: ${stuck.join()}")
+
+    // The longest limit there is waits without its deadline overflowing, and a limit of a microsecond
+    // counts as a whole millisecond and runs out.
+    ok(s4.setTimeout(Duration.Max))
+    val longest = spawn(() -> s4.read(3).map(b -> string.fromUtf8Lossy(b)))
+    parkedAtLeast(1)
+    ok(c4.writeText("ghi"))
+    println(s"the longest limit: ${longest.join()}")
+    ok(s4.setTimeout(Duration(1)))
+    println(s"a microsecond's limit: ${spawn(() -> s4.read(1).map(b -> b.length())).join()}")
+
+    // What a parked thread's frames hold survives the collections other threads make while it waits.
+    val (c7, s7) = pair()
+    val keeper = spawn(() ->
+        val mine = (0..<200).map(k -> s"item $k").toVector()
+        val got = ok(s7.readLine()).getOrElse("")
+        mine.map(s -> s.charCount()).sum() + got.charCount())
+    parkedAtLeast(1)
+    var garbage = 0
+    for round in 0..<200 do garbage += (0..<50).map(k -> s"garbage $k $round").toVector().length()
+    ok(c7.writeText("done\n"))
+    println(s"kept while parked: ${keeper.join()}, garbage $garbage")
+
+    // A write far larger than the socket's buffers, read slowly at the other end in small pieces:
+    // the writer parks for room many times and every byte arrives in order.
+    val (c5, s5) = pair()
+    val size = 4 << 20
+    val parksBefore = socketParks()
+    val sender = spawn(() ->
+        ok(s5.write(Array.tabulate(size, i -> byte(i % 251))))
+        s5.close())
+    var total = 0
+    var inOrder = true
+    while true
+        val got = ok(c5.read(65536))
+        if got.length() == 0 then break
+        for k in 0..<got.length()
+            if got(k) != byte((total + k) % 251) then inOrder = false
+        total += got.length()
+    sender.join()
+    println(s"large write: $total bytes, in order: $inOrder, parked for room: ${socketParks() - parksBefore > 1}")
+
+    // In a future and inside a scope: each serves its connection parked like any thread.
+    val (c6, s6) = pair()
+    val served = Future(ok(s6.readLine()))
+    ok(c6.writeText("from a future\n"))
+    println(s"future: ${served.await()}")
+    val scoped = scope(sc ->
+        val got = Atomic(0)
+        for _ in 0..<10
+            sc.spawn(() ->
+                val (c, s) = pair()
+                val r = spawn(() -> ok(s.read(1)).length())
+                ok(c.write(bytesOf("x")))
+                got.update(k -> k + r.join()))
+        got)
+    println(s"scope: ${scoped.load()}")
+
+    // Unix connections park as TCP ones do.
+    val dir = ok(fs.createTempDir("avlwt"))
+    val path = dir + "/s"
+    val u = ok(UnixListener.bind(path))
+    val uParks = socketParks()
+    val userver = spawn(() ->
+        val s = ok(u.accept())
+        val line = ok(s.readLine())
+        ok(s.writeText("unix\n"))
+        line)
+    parkedAtLeast(1)
+    val uc = ok(UnixStream.connect(path))
+    sleep(millis(20))
+    ok(uc.writeText("over unix\n"))
+    println(s"unix: ${userver.join()} ${ok(uc.readLine())} parked: ${socketParks() - uParks >= 2}")
+    uc.close()
+    u.close()
+    ok(fs.remove(path))
+    ok(fs.removeDir(dir))
+    0

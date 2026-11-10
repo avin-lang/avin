@@ -10,6 +10,14 @@ import sysl.fs.{canonicalize, exists, make_dir_all, make_temp_dir, metadata, rea
 
 private compiled(text: string) -> Compilation = compile(repository_toolchain(), source_of("/probe/bindings.avin", text))
 
+private compiled_in(tc: Toolchain, text: string) -> Compilation = compile(tc, source_of("/probe/bindings.avin", text))
+
+// The repository's toolchain building into a cache of its own under `dir`, so the archives a test
+// builds are removed with `dir` and never left in the user's cache.
+private shim_toolchain(dir: string) -> Toolchain
+    val real = repository_toolchain()
+    Toolchain(real.root, dir + "/cache", real.clang, real.sysl, real.pkg_config)
+
 private lines(text: string) -> Buf[string]
     var out: Buf[string] = buf()
     for line in text.split("\n")
@@ -284,23 +292,29 @@ mirror_field_names()
 
 @test("a binding's shim is built once and found in the cache after that")
 shim_cache()
+    val dir = make_temp_dir("avin-shim-cache").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = shim_toolchain(dir)
     val text = "@sysl(\"sysl.text.to_lower\")\nlower(s: string) -> string\n\nmain() = 0\n"
-    val first = compiled(text)
+    val first = compiled_in(tc, text)
     assert_eq(first.diagnostics, "")
     val archive = first.archive.unwrap()
     val built = metadata(archive).unwrap().modified
     // The same bindings in another program are the same shims, which are not built again.
-    val second = compiled("// another program with the same binding\n" + text)
+    val second = compiled_in(tc, "// another program with the same binding\n" + text)
     assert_eq(second.archive.unwrap(), archive)
     assert(metadata(archive).unwrap().modified == built)
     // Another binding is another archive.
-    val other = compiled("@sysl(\"sysl.text.to_upper\")\nlower(s: string) -> string\n\nmain() = 0\n")
+    val other = compiled_in(tc, "@sysl(\"sysl.text.to_upper\")\nlower(s: string) -> string\n\nmain() = 0\n")
     assert(other.archive.unwrap() != archive)
 
 @test("a shim archive keeps the C libraries it needs beside it, and one cached without them is built again")
 shim_link_needs_kept()
+    val dir = make_temp_dir("avin-shim-needs").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = shim_toolchain(dir)
     val text = "@sysl(\"sysl.text.to_lower\")\nlowerKeepingLibraries(s: string) -> string\n\nmain() = 0\n"
-    val first = compiled(text)
+    val first = compiled_in(tc, text)
     assert_eq(first.diagnostics, "")
     val archive = first.archive.unwrap()
     val needs = link_needs_file(archive)
@@ -308,9 +322,24 @@ shim_link_needs_kept()
     // The standard library needs the C runtime's mathematics and nothing else.
     assert_eq(read_text(needs).unwrap(), "lib m\n")
     remove_file(needs).unwrap()
-    val second = compiled(text)
+    val second = compiled_in(tc, text)
     assert_eq(second.archive.unwrap(), archive)
     assert(exists(needs))
+
+@test("a test that builds a shim leaves nothing in the user's cache: the archive is under the test's own directory and is gone with it")
+shim_tests_leave_user_cache_alone()
+    val dir = make_temp_dir("avin-shim-leak").unwrap()
+    val tc = shim_toolchain(dir)
+    // A binding no other test uses, so its archive's name can only come from this build.
+    val built = compiled_in(tc, "@sysl(\"sysl.text.to_lower\")\nlowerLeavingNoTrace(s: string) -> string\n\nmain() = 0\n")
+    assert_eq(built.diagnostics, "")
+    val archive = built.archive.unwrap()
+    assert(archive.starts_with(dir + "/cache/"))
+    val name = archive[archive.bytes.len - 35..]
+    assert(name.starts_with("/") && name.ends_with(".a"))
+    assert(!exists(repository_toolchain().shim_cache() + name))
+    assert(remove_dir_all(dir).is_ok())
+    assert(!exists(archive))
 
 @test("the libraries `sysl build-c` reports an archive needs are kept, `@link` names and pkg-config modules apart")
 link_needs_report()

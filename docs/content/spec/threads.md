@@ -78,10 +78,14 @@ ready. What a program can rely on:
   and is made ready when its time runs out, and so does a `sleep`: ten thousand threads sleeping at
   once hold no worker between them and all wake in about one sleep. Threads whose times run out
   together are made ready soonest first, two due at the same moment in the order they began to wait.
-  A timed wait that its event ends first answers once, as woken, and its timer goes with it. So
+  A timed wait that its event ends first answers once, as woken, and its timer goes with it.
+  A thread waiting on a [connection](/spec/system-library/#avin-net), to accept, connect, read or
+  write, parks the same way on the runtime's poller, one kernel readiness set for the whole program,
+  and is made ready when the socket is; a connection's timeout parks it on a timer as well, and
+  whichever comes first ends the wait. So
   waiting code is written as plain straight-line code:
-  a server may hold one thread per connection, and a chain of futures each awaiting the one before
-  it resolves however long it is.
+  a server may hold one thread per connection, thousands of them waiting at once on a few workers,
+  and a chain of futures each awaiting the one before it resolves however long it is.
 - **Threads are time-sliced.** A thread that has run for 10 ms while another thread is ready yields
   its worker at its next safepoint poll, which compiled code makes on every back edge of a loop and
   before every call that may recur, and goes to the back of the ready queue. A thread that computes

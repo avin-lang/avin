@@ -1,0 +1,90 @@
+module avin.rt
+@tests
+
+import sysl.net.{Socket, resolve, socket, timed_out, would_block}
+import sysl.io.wait.{Readable, Writable}
+import sysl.time.monotonic
+
+// The poller's tokens, and the waits and operations of a thread that is not lightweight, which waits
+// on the descriptor alone. A lightweight thread's parking is exercised by the programs that serve
+// connections from threads (`tests/run/net_lwt_sockets.avin`).
+
+private var parked: [3]Waiter = [new_waiter(); 3]
+
+@test("a token names its slot only until the slot is let go, and a slot taken again names a new token")
+tokens_name_their_slots_once()
+    io_lock.lock()
+    val a = take_slot(&parked[0])
+    val b = take_slot(&parked[1])
+    assert(a != b)
+    assert(give_slot(a) == &parked[0])
+    // A report that arrives after its wait has ended wakes nobody.
+    assert(give_slot(a) == null)
+    // The slot is taken again under a token the old one does not match.
+    val c = take_slot(&parked[2])
+    assert(c != a)
+    assert(c & 4294967295 == a & 4294967295)
+    assert(give_slot(a) == null)
+    assert(give_slot(c) == &parked[2])
+    assert(give_slot(b) == &parked[1])
+    // A token for a slot that never existed names nobody.
+    assert(give_slot(u64(1) << 32 | 100000) == null)
+    io_lock.unlock()
+
+// A listener on this machine and a connection to it, both non-blocking, and the accepted end.
+private struct Ends
+    listener: Socket
+    client: Socket
+    served: Socket
+
+private ends() -> Ends
+    val at = resolve("127.0.0.1", 0).unwrap()[0]
+    var l = socket(at).unwrap()
+    l.bind(at).unwrap()
+    l.listen().unwrap()
+    socket_non_blocking(&l).unwrap()
+    val to = l.local().unwrap()
+    val c = socket(to).unwrap()
+    socket_connect(c, to).unwrap()
+    val (s, _) = socket_accept(l).unwrap()
+    Ends(l, c, s)
+
+@test("a wait with a limit on a socket nothing arrives on answers not ready once the limit has passed")
+fd_wait_times_out()
+    val e = ends()
+    val before = monotonic()
+    assert(!wait_for_fd(e.served.fd().unwrap(), Readable, 30).unwrap())
+    assert((monotonic() - before).us >= 30000)
+    assert(wait_for_fd(e.served.fd().unwrap(), Writable, 30).unwrap())
+
+@test("bytes sent arrive, a receive with a limit and nothing to read times out, and the end of the input is zero")
+send_and_receive()
+    val e = ends()
+    socket_send_all(e.client, "ping".bytes, 0).unwrap()
+    var into: [8]u8 = [0; 8]
+    assert_eq(socket_recv(e.served, into[..], 1000).unwrap(), 4usize)
+    socket_recv(e.served, into[..], 20) match
+        Ok(_) -> panic("nothing was sent")
+        Err(err) -> assert(timed_out(err))
+    var c = e.client
+    c.close().unwrap()
+    assert_eq(socket_recv(e.served, into[..], 1000).unwrap(), 0usize)
+
+@test("an accepted connection is non-blocking, so a receive with nothing to read answers would-block rather than waiting")
+accepted_is_non_blocking()
+    val e = ends()
+    var s = e.served
+    s.recv([0u8; 1][..]) match
+        Ok(_) -> panic("nothing was sent")
+        Err(err) -> assert(would_block(err))
+
+@test("a connection nobody listens for is refused")
+connect_refused()
+    val at = resolve("127.0.0.1", 0).unwrap()[0]
+    var l = socket(at).unwrap()
+    l.bind(at).unwrap()
+    val to = l.local().unwrap()
+    l.close().unwrap()
+    socket_connect(socket(to).unwrap(), to) match
+        Ok(_) -> panic("nobody listens")
+        Err(err) -> assert(net_failure(err) is Refused)
