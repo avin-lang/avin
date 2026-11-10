@@ -248,20 +248,40 @@ parse_type(p: *Parser) -> &TypeExpr
         for param in params
             if param.by_name then p.report.add(error(param.ty.span, "only a function type's parameter may be by-name"))
             items.push(param.ty)
-        if items.len() == 1 then return items[0]
+        if items.len() == 1 then return type_tail(p, start, items[0])
         saw_tuple(p, items.len())
-        return TypeExpr(start.to(p.ended()), Tuple(items))
+        return type_tail(p, start, TypeExpr(start.to(p.ended()), Tuple(items)))
     if !p.at("[") && !p.at_kind(Word)
         p.report.add(expected(start, "a type", found_at(p.src, start)))
         p.toks.advance()
         return TypeExpr(start, InvalidType)
-    val head = if p.at("[") then slice_type(p, start) else named_type(p, start)
-    if !p.accept("->") then return head
+    type_tail(p, start, if p.at("[") then slice_type(p, start) else named_type(p, start))
+end parse_type
+
+// What may follow a type's first operand: more members of a union, `A | B`, which binds more
+// tightly than `->`, and then `->` and a result, making a function taking the type so far.
+private type_tail(p: *Parser, start: Span, head: &TypeExpr) -> &TypeExpr
+    var t = head
+    if p.at("|") && !guard_ahead(p)
+        var members: Buf[&TypeExpr] = buf()
+        members.push(head)
+        while p.at("|") && !guard_ahead(p)
+            p.toks.advance()
+            members.push(parse_pattern_type(p))
+        t = TypeExpr(start.to(p.ended()), Union(members))
+    if !p.accept("->") then return t
     var params: Buf[FunctionTypeParam] = buf()
-    params.push(FunctionTypeParam(head, false))
+    params.push(FunctionTypeParam(t, false))
     val result = parse_type(p)
     TypeExpr(start.to(result.span), Function(params, result, false))
-end parse_type
+
+// Whether the `|` ahead begins a clause's guard rather than a union's next member: a name followed by
+// an operator no type is followed by, as in `-> int | n > 0 = n`.
+private guard_ahead(p: *Parser) -> bool
+    val after = p.ahead(2)
+    for op in ["<", ">", "<=", ">=", "==", "!=", "&&", "||", "+", "-", "*", "/", "%", "!", "is"]
+        if after == op then return true
+    false
 
 /** `[]T`, which is `Vector[T]`. The element is a name or a parenthesized type, so `[]int -> int` is
  * a function from a vector and `[](int -> int)` is a vector of functions. */

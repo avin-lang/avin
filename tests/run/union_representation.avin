@@ -1,0 +1,101 @@
+// expect: exit 0
+// Union values held everywhere a value is held, across many allocations (the corpus runs this with
+// the collector at every allocation): in locals, data fields, class fields, tuples, `Vector`, `List`,
+// `Array`, `Buffer` and `Map` values, closures' captures and an actor's messages; strings and objects
+// held by a union stay alive and intact. A union of scalars round-trips every member at its
+// boundaries, a union nests in a union field of a data type inside a vector, and a generic
+// `Vector[T | int]` works at `T = string` and at `T = int`.
+import avin.actors.{ActorRef, spawn}
+import avin.threads.Channel
+
+data Leaf(text: string)
+
+data Branch(label: Leaf | int, rest: Vector[Branch | string])
+
+class Cell(var held: string | Leaf | int)
+
+data Message
+    Put(v: int | string)
+    Report(reply: Channel[string])
+
+actor Keeper receives Message
+    var kept: Vector[int | string] = []
+    receive
+        Put(v) -> kept = kept :+ v
+        Report(reply) -> reply.send(kept.map(show).mkString(","))
+
+show(x: int | string) -> string = x match
+    n: int -> s"$n"
+    s: string -> s
+
+scalar(x: long | real | char | bool | unit) -> string = x match
+    l: long -> s"long $l"
+    r: real -> s"real $r"
+    c: char -> s"char ${int(c)}"
+    b: bool -> s"bool $b"
+    _: unit -> "unit"
+
+churn(n: int) -> int
+    var total = 0
+    for i in 0..<n
+        total += s"garbage $i".charCount()
+    total
+
+mixed[T](xs: Vector[T | int]) -> int = xs.size()
+
+main()
+    val local: int | string = "local " + "string"
+    val leafy: Leaf | int = Leaf("leaf " + "object")
+    val tuple: (int | string, Leaf | int) = ("tuple " + "part", Leaf("in tuple"))
+    val vector: Vector[int | string] = Vector.tabulate(50, i -> if i % 2 == 0 then i else s"s$i")
+    val list: List[int | string] = List("a" + "b", 2, "c" + "d")
+    val array: Array[int | string] = Array.fill(3, "fill")
+    array(1) = 11
+    val buffer = Buffer[int | string]()
+    for i in 0..<20
+        buffer.append(if i % 3 == 0 then s"b$i" else i)
+    val map: Map[string, Leaf | int] = {first: Leaf("map " + "leaf"), second: 2}
+    val cell = Cell(Leaf("cell"))
+    var captured: int | string = "captured " + "first"
+    val read = () -> show(captured)
+    churn(2000)
+    captured = 5
+    churn(2000)
+    cell.held = "cell " + "string"
+    churn(2000)
+    println(show(local))
+    println(leafy)
+    println(s"${show(tuple.0)} ${tuple.1}")
+    println(vector.map(show).mkString(" "))
+    println(list.map(show))
+    println(array.toVector().map(show))
+    println(buffer.toVector().map(show).mkString(" "))
+    println(map.get("first"))
+    println(cell.held)
+    println(read())
+    val tree = Branch(Leaf("root"), [Branch(1, ["x", Branch(Leaf("deep"), [])]), "y"])
+    churn(2000)
+    println(tree)
+    val trees: Vector[Branch] = [tree, Branch(2, [])]
+    churn(1000)
+    println(trees.size())
+    println(scalar(long.MinValue))
+    println(scalar(long.MaxValue))
+    println(scalar(0.0 / 0.0))
+    println(scalar(-0.0))
+    println(scalar(1.5))
+    println(scalar('\u{10FFFF}'))
+    println(scalar('\0'))
+    println(scalar(true))
+    println(scalar(false))
+    println(scalar(()))
+    val strings: Vector[string | int] = ["one", 2]
+    val ints: Vector[int] = [3, 4, 5]
+    println(mixed[string](strings))
+    println(mixed[int](ints))
+    val keeper = spawn(Keeper())
+    for i in 0..<10
+        keeper.tell(Put(if i % 2 == 0 then i else s"m$i"))
+    val reply = Channel[string](1)
+    keeper.tell(Report(reply))
+    println(reply.receive().get())

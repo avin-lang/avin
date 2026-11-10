@@ -42,7 +42,76 @@ enum Type
     TypeVar(owner: usize, index: usize, name: string)
     /** An unknown the checker is solving for, by its index in the checker's table. */
     Var(id: usize)
+    /** A union `A | B`: a value of any one of its members. The members are in the order they were
+     * written, flattened, each named once, never `Nothing` or `Any`, and at least two (`union_of`
+     * keeps that form); two unions with the same members are one type, whatever their order. */
+    Union(members: Buf[&Type])
 end Type
+
+/** The union of `members` in normal form, as far as it needs no knowledge of declarations: nested
+ * unions flattened, a member named twice kept once, `Nothing` dropped, a union with `Any` among its
+ * members `Any`, and one member that member. A member that converts to another by subtyping or into
+ * a trait is absorbed by the checker, which knows the declarations. */
+union_of(members: Buf[&Type]) -> &Type
+    var flat: Buf[&Type] = buf()
+    for m in members
+        add_member(&flat, m)
+    for m in flat
+        if *m is AnyType || *m is ErrorType then return m
+    if flat.len() == 0 then return Nothing
+    if flat.len() == 1 then return flat[0]
+    Union(flat)
+
+private add_member(flat: *Buf[&Type], m: &Type)
+    *m match
+        Union(inner) ->
+            for i in inner
+                add_member(flat, i)
+        Nothing -> ()
+        _ ->
+            for f in *flat
+                if same_type(f, m) then return
+            flat.push(m)
+
+/** The members of `t`: its own where it is a union, and otherwise `t` alone. */
+members_of(t: &Type) -> Buf[&Type] = *t match
+    Union(ms) -> ms
+    _ ->
+        var one: Buf[&Type] = buf()
+        one.push(t)
+        one
+
+/** `t` with every union in it, at any depth, replaced by `Any`: the layout a union value has at run
+ * time, one reference to an object, a scalar member in a box. */
+erase_unions(t: &Type) -> &Type = *t match
+    Union(_) -> AnyType
+    Tuple(items) -> Tuple(erase_all(items))
+    Function(params, result, sendable) -> Function(erase_all(params), erase_unions(result), sendable)
+    ByName(inner) -> ByName(erase_unions(inner))
+    Data(id, name, args) -> Data(id, name, erase_all(args))
+    Class(id, name, args) -> Class(id, name, erase_all(args))
+    _ -> t
+
+private erase_all(items: Buf[&Type]) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    for item in items
+        out.push(erase_unions(item))
+    out
+
+/** Whether `t` names a union anywhere in it. */
+has_union(t: &Type) -> bool = *t match
+    Union(_) -> true
+    Tuple(items) -> any_union(items)
+    Function(params, result, _) -> any_union(params) || has_union(result)
+    ByName(inner) -> has_union(inner)
+    Data(_, _, args) -> any_union(args)
+    Class(_, _, args) -> any_union(args)
+    _ -> false
+
+private any_union(items: Buf[&Type]) -> bool
+    for item in items
+        if has_union(item) then return true
+    false
 
 const IntBits: u32 = 32
 
@@ -90,6 +159,7 @@ names_alias_param(t: &Type) -> bool = *t match
     ByName(inner) -> names_alias_param(inner)
     Data(_, _, args) -> any_alias_param(args)
     Class(_, _, args) -> any_alias_param(args)
+    Union(members) -> any_alias_param(members)
     _ -> false
 
 /** Whether `t` names type parameter `index` of `owner`. */
@@ -100,6 +170,7 @@ names_type_var(t: &Type, owner: usize, index: usize) -> bool = *t match
     ByName(inner) -> names_type_var(inner, owner, index)
     Data(_, _, args) -> any_names_type_var(args, owner, index)
     Class(_, _, args) -> any_names_type_var(args, owner, index)
+    Union(members) -> any_names_type_var(members, owner, index)
     _ -> false
 
 private any_names_type_var(items: Buf[&Type], owner: usize, index: usize) -> bool
@@ -202,6 +273,19 @@ same_type(a: &Type, b: &Type) -> bool = *a match
     Var(id) -> *b match
         Var(other) -> id == other
         _ -> false
+    Union(xs) -> *b match
+        Union(ys) -> same_members(xs, ys)
+        _ -> false
+
+/** Whether two unions have the same members, in whatever order. */
+private same_members(xs: Buf[&Type], ys: Buf[&Type]) -> bool
+    if xs.len() != ys.len() then return false
+    for x in xs
+        var found = false
+        for y in ys
+            if same_type(x, y) then found = true
+        if !found then return false
+    true
 
 private same_types(xs: Buf[&Type], ys: Buf[&Type]) -> bool
     if xs.len() != ys.len() then return false
@@ -248,7 +332,19 @@ private alike(a: &Type, b: &Type) -> bool
         Class(x, _, xs) -> *b match
             Class(y, _, ys) -> x == y && all_alike(xs, ys)
             _ -> false
+        Union(xs) -> *b match
+            Union(ys) -> members_alike(xs, ys)
+            _ -> false
         _ -> same_type(a, b)
+
+private members_alike(xs: Buf[&Type], ys: Buf[&Type]) -> bool
+    if xs.len() != ys.len() then return false
+    for x in xs
+        var found = false
+        for y in ys
+            if alike(x, y) then found = true
+        if !found then return false
+    true
 
 private all_alike(xs: Buf[&Type], ys: Buf[&Type]) -> bool
     if xs.len() != ys.len() then return false
@@ -275,6 +371,16 @@ type_name(t: &Type) -> string = *t match
     Class(_, name, args) -> if args.len() == 0 then name else name + "[" + type_list(args) + "]"
     TypeVar(_, _, name) -> name
     Var(_) -> "_"
+    Union(members) -> union_name(members)
+
+// A union's members in the order written, a function type among them in parentheses.
+private union_name(members: Buf[&Type]) -> string
+    var out = ""
+    for i in 0..<members.len()
+        if i > 0 then out = out + " | "
+        val name = type_name(members[i])
+        out = out + (if *members[i] is Function(_, _, _) then s"($name)" else name)
+    out
 
 private type_list(items: Buf[&Type]) -> string
     var out = ""
@@ -292,6 +398,20 @@ type_key(t: &Type) -> string = *t match
     ByName(inner) -> "-> " + type_key(inner)
     Data(id, name, args) -> s"$name#$id[" + key_list(args) + "]"
     Class(id, name, args) -> s"class $name#$id[" + key_list(args) + "]"
+    // The members' keys in sorted order, so a union is one key whatever order it was written in.
+    Union(members) ->
+        var keys: Buf[string] = buf()
+        for m in members
+            val k = type_key(m)
+            var at = keys.len()
+            while at > 0 && k < keys[at - 1]
+                at -= 1
+            keys.insert(at, k)
+        var out = "union("
+        for i in 0..<keys.len()
+            if i > 0 then out = out + " | "
+            out = out + keys[i]
+        out + ")"
     _ -> type_name(t)
 
 private key_list(items: Buf[&Type]) -> string
@@ -342,6 +462,7 @@ has_unknowns(t: &Type) -> bool = *t match
     ByName(inner) -> has_unknowns(inner)
     Data(_, _, args) -> any_unknowns(args)
     Class(_, _, args) -> any_unknowns(args)
+    Union(members) -> any_unknowns(members)
     _ -> false
 
 private any_unknowns(items: Buf[&Type]) -> bool
@@ -357,6 +478,7 @@ substitute(t: &Type, owner: usize, args: Buf[&Type]) -> &Type = *t match
     ByName(inner) -> ByName(substitute(inner, owner, args))
     Data(id, name, items) -> Data(id, name, substitute_all(items, owner, args))
     Class(id, name, items) -> Class(id, name, substitute_all(items, owner, args))
+    Union(members) -> union_of(substitute_all(members, owner, args))
     _ -> t
 
 substitute_all(items: Buf[&Type], owner: usize, args: Buf[&Type]) -> Buf[&Type]
@@ -375,6 +497,7 @@ solve(vars: Buf[Option[&Type]], t: &Type) -> &Type = *t match
     ByName(inner) -> ByName(solve(vars, inner))
     Data(id, name, args) -> Data(id, name, solve_all(vars, args))
     Class(id, name, args) -> Class(id, name, solve_all(vars, args))
+    Union(members) -> union_of(solve_all(vars, members))
     _ -> t
 
 private solve_all(vars: Buf[Option[&Type]], items: Buf[&Type]) -> Buf[&Type]

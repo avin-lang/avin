@@ -28,6 +28,16 @@ clauses_cover(clauses: Buf[TClause], params: Buf[&Type], data: Buf[DataSymbol]) 
     if params.len() == 0 then return rows.len() > 0
     covers(rows, params, data)
 
+/** The arguments, each written as a pattern, that the clauses of a function leave out, where some are. */
+missing_arguments(clauses: Buf[TClause], params: Buf[&Type], data: Buf[DataSymbol]) -> Option[Buf[string]]
+    var rows: Buf[Row] = buf()
+    for clause in clauses
+        var always = false
+        for b in clause.bodies
+            if b.guard is None then always = true
+        if always then rows.push(Row(clause.patterns))
+    witness(rows, params, data, false)
+
 /** Whether the unguarded arms of a match on a value of type `ty` cover every value. */
 match_covers(arms: Buf[TArm], ty: &Type, data: Buf[DataSymbol]) -> bool
     var rows: Buf[Row] = buf()
@@ -45,10 +55,15 @@ private enum Case
     BoolCase(value: bool)
     /** A variant, with the types of its fields in the matched type. */
     VariantCase(index: usize, fields: Buf[&Type])
+    /** A member of a union: a union is covered when each of its members is. */
+    MemberCase(member: &Type)
 
 private cases_of(t: &Type, data: Buf[DataSymbol]) -> Buf[Case]
     var out: Buf[Case] = buf()
     *t match
+        Union(members) ->
+            for m in members
+                out.push(MemberCase(m))
         Bool ->
             out.push(BoolCase(true))
             out.push(BoolCase(false))
@@ -82,6 +97,15 @@ private matches_case(p: &TPattern, case: Case) -> bool = case match
     VariantCase(index, _) -> p.kind match
         PVariant(i, _) -> i == index
         _ -> false
+    MemberCase(member) -> member_part(p, member) is Some(_)
+
+// The part of a pattern on a union that applies to `member`.
+private member_part(p: &TPattern, member: &Type) -> Option[&TPattern] = p.kind match
+    PUnion(parts) ->
+        for part in parts
+            if same_type(part.ty, member) then return Some(part)
+        None
+    _ -> None
 
 // A row specialized to a case: its first pattern is replaced by the patterns of the case's fields,
 // which are wildcards when the first pattern matched anything.
@@ -89,6 +113,7 @@ private specialize(row: Row, case: Case) -> Row
     var items: Buf[&TPattern] = buf()
     val head = row.items[0]
     case match
+        MemberCase(member) -> items.push(member_part(head, member).unwrap_or(TPattern(Span(0, 0), member, PWildcard)))
         VariantCase(_, fields) -> head.kind match
             PVariant(_, inner) ->
                 for p in inner
@@ -368,9 +393,8 @@ private witness(rows: Buf[Row], types: Buf[&Type], data: Buf[DataSymbol], views:
             val head = row.items[0]
             if unconstrained(head, views) || matches_case(head, case) then specialized.push(specialize(row, case))
         var columns: Buf[&Type] = buf()
-        if case is VariantCase(_, fields)
-            for t in fields
-                columns.push(t)
+        for t in case_fields(case)
+            columns.push(t)
         for t in rest
             columns.push(t)
         if witness(specialized, columns, data, views) is Some(parts) then return Some(spell_case(types[0], case, parts, data))
@@ -449,12 +473,15 @@ private in_front(head: string, found: Option[Buf[string]]) -> Option[Buf[string]
 private spell_case(t: &Type, case: Case, parts: Buf[string], data: Buf[DataSymbol]) -> Buf[string]
     var k = 0usize
     if case is VariantCase(_, fields) then k = fields.len()
+    if case is MemberCase(_) then k = 1
     var inner = ""
     for i in 0..<k
         if i > 0 then inner = inner + ", "
         inner = inner + parts[i]
     val head = case match
         BoolCase(value) -> if value then "true" else "false"
+        // A member none of whose values is matched is named by a type pattern.
+        MemberCase(member) -> if parts[0] == "_" then s"_: ${spell_member(member)}" else parts[0]
         VariantCase(index, _) -> *t match
             Data(id, _, _) ->
                 val d = data[id]
@@ -471,6 +498,9 @@ private spell_case(t: &Type, case: Case, parts: Buf[string], data: Buf[DataSymbo
     for i in k..<parts.len()
         out.push(parts[i])
     out
+
+// A member's type as a type pattern writes it: a function type in parentheses.
+private spell_member(t: &Type) -> string = if *t is Function(_, _, _) then s"(${type_name(t)})" else type_name(t)
 
 /** A value a match leaves out, written as a pattern, and whether a guarded arm could have taken it. */
 struct MissingCase
@@ -503,9 +533,8 @@ missing_cases(arms: Buf[TArm], ty: &Type, data: Buf[DataSymbol]) -> Buf[MissingC
             val head = row.items[0]
             if unconstrained(head, false) || matches_case(head, case) then specialized.push(specialize(row, case))
         var columns: Buf[&Type] = buf()
-        if case is VariantCase(_, fields)
-            for t in fields
-                columns.push(t)
+        for t in case_fields(case)
+            columns.push(t)
         if witness(specialized, columns, data, false) is Some(parts)
             var taken = false
             for row in guarded
@@ -605,6 +634,9 @@ private erroneous(p: &TPattern) -> bool
             for item in items
                 if erroneous(item) then return true
         PView(_, _, inner) -> return erroneous(inner)
+        PUnion(parts) ->
+            for part in parts
+                if erroneous(part) then return true
         _ -> ()
     false
 
@@ -648,6 +680,12 @@ private useful(rows: Buf[Row], q: Row, types: Buf[&Type], data: Buf[DataSymbol])
         if ordered then return useful_ordered(expanded, q, domain, rest, data)
     val cases = cases_of(t, data)
     val anything = unconstrained(head, false) || head.kind is PType(_, _, _) || head.kind is PView(_, _, _)
+    // A pattern on a union is useful where it is for one of the members it applies to.
+    if head.kind is PUnion(_)
+        for case in cases
+            if matches_case(head, case)
+                if useful(specialize_rows(expanded, case), specialize(q, case), case_columns(case, rest), data) then return true
+        return false
     if !anything
         for case in cases
             if matches_case(head, case) then return useful(specialize_rows(expanded, case), specialize(q, case), case_columns(case, rest), data)
@@ -678,12 +716,20 @@ private specialize_rows(rows: Buf[Row], case: Case) -> Buf[Row]
 
 // The columns a case's fields become, in front of the remaining ones.
 private case_columns(case: Case, rest: Buf[&Type]) -> Buf[&Type]
-    var columns: Buf[&Type] = buf()
-    if case is VariantCase(_, fields)
-        for t in fields
-            columns.push(t)
+    var columns = case_fields(case)
     for t in rest
         columns.push(t)
+    columns
+
+// The columns a case's own values make: a variant's fields, or a union's member.
+private case_fields(case: Case) -> Buf[&Type]
+    var columns: Buf[&Type] = buf()
+    case match
+        VariantCase(_, fields) ->
+            for t in fields
+                columns.push(t)
+        MemberCase(member) -> columns.push(member)
+        BoolCase(_) -> ()
     columns
 
 // An ordered column: the values `q` matches are cut, with every row's, into pieces each row matches

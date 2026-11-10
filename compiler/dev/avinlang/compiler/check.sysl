@@ -3,7 +3,7 @@ module dev.avinlang.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
-import sysl.text.{chars_of, from_utf8_unchecked, str_builder}
+import sysl.text.{chars_of, from_utf8_unchecked, str_builder, to_lower}
 
 /** A source file in a program, with the report its diagnostics go to. */
 struct SourceUnit
@@ -1740,6 +1740,9 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
     if d.target.kind is Tuple(_) then return resolve_tuple_impl(c, unit, module_name, d)
     val path = d.target.kind match
         Named(p, _) -> p
+        Union(_) ->
+            c.note(unit, d.target.span, s"an `impl` names a declared type, and `${show_union(d.target)}` is a union; declare a data type to give it methods")
+            return invalid
         _ ->
             c.note(unit, d.target.span, "an impl adds to a data type, a class, an object or a built-in type")
             return invalid
@@ -2618,7 +2621,9 @@ private declare_fields(c: *Checker, unit: usize)
             if parent.kind is TypeParent(written)
                 val f = resolve_type(c, unit, written)
                 if *f is Function(_, _, _) then functions.push(f)
+                elif *f is Union(_) then c.note(unit, parent.span, union_parent_message(type_name(f)))
                 elif !(*f is ErrorType) then c.note(unit, parent.span, s"${type_name(f)} is neither a class nor a trait")
+            elif union_parent(parent) is Some(written) then c.note(unit, parent.span, union_parent_message(written))
             elif parent_trait(c, unit, parent) is Some(t)
                 if trait_type(c, unit, t, parent) is Some(ty)
                     if conforms_already(c, traits, ty) then c.note(unit, parent.span, s"`${c.classes[t].name}` is named more than once after `:`")
@@ -2994,7 +2999,40 @@ private add_function_type(out: *Buf[&Type], f: &Type)
 // `to`, the result is `x` itself or a type that differs from `to`. Both types are solved. A
 // conformance an impl with bounds of its own states is a view only where `x`'s arguments meet them.
 // A type parameter with a lower bound is a view of what the bound is.
-view_as(f: Conformances, x: &Type, to: &Type) -> &Type = *to match
+view_as(f: Conformances, x: &Type, to: &Type) -> &Type
+    // A union is seen as `to` where each of its members is, and a value as a union where it is seen
+    // as one of its members. Inside another type the layouts must also agree, which `view_part`
+    // asks first.
+    if *to is Union(ys)
+        for m in members_of(x)
+            if !into_union(f, m, ys) then return x
+        return to
+    if *x is Union(xs)
+        if *to is Var(_) || *to is ErrorType then return x
+        for m in xs
+            if !into_member(f, m, to) then return x
+        return to
+    view_as_type(f, x, to)
+
+// Whether a value of type `m` is seen as one of `members`.
+private into_union(f: Conformances, m: &Type, members: Buf[&Type]) -> bool
+    for y in members
+        if into_member(f, m, y) then return true
+    false
+
+// Whether a value of type `m` is seen as the member `y`, or boxed into it where `y` is a trait or
+// `Any`.
+private into_member(f: Conformances, m: &Type, y: &Type) -> bool
+    if *m is Var(_) || *y is Var(_) then return false
+    if same_type(m, y) || *y is AnyType || *m is Nothing then return true
+    if conforms(view_as(f, m, y), y) then return true
+    (is_builtin(m) || *m is Tuple(_)) && is_trait_class(f, y) && meets_bound(f, m, y)
+
+private is_trait_class(f: Conformances, t: &Type) -> bool = *t match
+    Class(k, _, _) -> f.classes[k].decl.modifier == "trait"
+    _ -> false
+
+private view_as_type(f: Conformances, x: &Type, to: &Type) -> &Type = *to match
     Class(k, name, ys) -> holding_ancestor(f, x, k) match
         Some(up) -> *up match
             Class(_, _, xs) -> Class(k, name, vary_args(f, f.classes[k].decl.type_params, xs, ys))
@@ -3061,6 +3099,8 @@ private view_part(f: Conformances, x: &Type, to: &Type) -> &Type
     // conversion, so a value of any type is one of it through the bound.
     if *to is TypeVar(_, _, _) && below_lower(f, x, to) then return to
     if !is_reference(x) then return x
+    // A union with a scalar member is laid out by its tag, so no other type is one inside another.
+    if *to is Union(_) && !is_reference(to) then return x
     if *to is AnyType then return AnyType
     view_as(f, x, to)
 
@@ -3078,6 +3118,11 @@ is_reference(t: &Type) -> bool = *t match
     Function(_, _, _) -> true
     Data(_, _, _) -> true
     Class(_, _, _) -> true
+    // A union of references is laid out as an `Any` holding its member.
+    Union(members) ->
+        for m in members
+            if !is_reference(m) then return false
+        true
     _ -> false
 
 /** Whether a field may be used from the code being checked: a public one, or a private one from
@@ -5968,6 +6013,12 @@ meets_bound(f: Conformances, x: &Type, bound: &Type) -> bool
     // Whether a type crosses to Sysl as one Sysl type is decided from its structure too.
     if names_core_trait(f.core, k, "Boundary") then return on_boundary(f, x, k)
     if rendered_at_run_time(f.classes, x) && names_rendering_trait(f.core, k) then return true
+    // A union is shown as its member is, so it has `Display` and `Debug` where every member does.
+    if *x is Union(members)
+        if !names_rendering_trait(f.core, k) then return false
+        for m in members
+            if !meets_bound(f, m, bound) then return false
+        return true
     *x match
         ErrorType -> true
         Nothing -> true
@@ -6075,6 +6126,15 @@ private type_sendability(f: Conformances, x: &Type, k: usize, a: SendAssumed, se
             for i in 0..<items.len()
                 type_sendability(f, items[i], k, a, seen, depth + 1) match
                     CannotSend(why) -> return CannotSend(s"its part ${i + 1} is ${quoted_type(items[i])}, ${nested_reason(why)}")
+                    NotYetKnown -> undecided = true
+                    CanSend -> ()
+            if undecided then NotYetKnown else CanSend
+        // A union is sendable where every member is.
+        Union(members) ->
+            var undecided = false
+            for m in members
+                type_sendability(f, m, k, a, seen, depth + 1) match
+                    CannotSend(why) -> return CannotSend(s"its member is ${quoted_type(m)}, ${nested_reason(why)}")
                     NotYetKnown -> undecided = true
                     CanSend -> ()
             if undecided then NotYetKnown else CanSend
@@ -6640,6 +6700,9 @@ private pattern_binds(p: &TPattern, bound: *Buf[usize])
         PView(l, _, inner) ->
             bound.push(l)
             pattern_binds(inner, bound)
+        PUnion(parts) ->
+            for part in parts
+                pattern_binds(part, bound)
         _ -> ()
 
 /** The expressions directly inside `e` that are evaluated where `e` is, in order: not the bodies of
@@ -7289,6 +7352,9 @@ private names_self(t: &TypeExpr) -> bool
             for p in params
                 if names_self(p.ty) then return true
             return names_self(result)
+        Union(members) ->
+            for m in members
+                if names_self(m) then return true
         InvalidType -> ()
         ResolvedType(_) -> ()
     false
@@ -7424,6 +7490,16 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
         if f.type_params.len() > 0
             c.note(unit, f.name_span, "a C binding is not generic: the C function has one signature")
             continue
+        var unions = false
+        for i in 0..<params.len()
+            if i < f.params.len() && has_union(params[i])
+                c.note(unit, f.params[i].ty.span, union_crossing_message(params[i]))
+                unions = true
+        if result is Some(r)
+            if has_union(r)
+                c.note(unit, if f.result is Some(t) then t.span else f.name_span, union_crossing_message(r))
+                unions = true
+        if unions then continue
         var field = false
         for arg in a.args
             if arg.name is Some(n) && n == "field" then field = true
@@ -8074,12 +8150,15 @@ private check_crossings(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
         val threaded = is_threaded_param(p)
         if threaded && !(*t is Function(_, _, _)) then c.note(unit, p.pattern.span, "`@threaded` marks a parameter that takes a function, which Sysl may call from any thread")
         if p.by_name then c.note(unit, p.pattern.span, "a by-name parameter cannot cross to Sysl")
+        elif has_union(t) then c.note(unit, p.ty.span, union_crossing_message(t))
         elif *t is Function(ps, r, _) then check_callback_crossing(c, unit, p, ps, r)
         elif is_handle(c, t) || is_handle_collection(c, t) then ()
         elif holds_handle(c, t) then c.note(unit, p.ty.span, s"`${type_name(t)}` cannot cross to Sysl: a Sysl handle goes back into Sysl by itself, as a parameter or the receiver of its own methods, or as the elements of an `Array` or a `Vector` that is a parameter")
         elif !crosses_to_sysl(c, t) then c.note(unit, p.ty.span, s"`${type_name(t)}` cannot cross to Sysl; ${boundary_types(c, t)}")
     if result is Some(r)
-        if !crosses_out_of_sysl(c, r)
+        if has_union(r)
+            c.note(unit, if f.result is Some(t) then t.span else f.name_span, union_crossing_message(r))
+        elif !crosses_out_of_sysl(c, r)
             val at = if f.result is Some(t) then t.span else f.name_span
             if holds_handle(c, r) then c.note(unit, at, s"`${type_name(r)}` cannot cross out of Sysl: a Sysl handle is a binding's result, held in its `Array`, `Vector`, `Option` or `Result`, or a part of a tuple that is one of these")
             else c.note(unit, at, s"`${type_name(r)}` cannot cross to Sysl; ${boundary_types(c, r)}")
@@ -8465,6 +8544,9 @@ private check_c_struct_mirror(c: *Checker, id: usize)
         val t = variant.fields[k]
         if *t is ErrorType then continue
         val at = d.decl.variants[0].fields[k].ty.span
+        if has_union(t)
+            c.note(d.unit, at, union_crossing_message(t))
+            continue
         if c_struct_of(t, c.data) is Some(inner)
             var seen: Buf[usize] = buf()
             if c_struct_holds(c, inner, id, &seen) then c.note(d.unit, at, s"a C struct mirror cannot hold itself: `${type_name(t)}` holds `${d.name}`")
@@ -8736,7 +8818,8 @@ private check_mirror(c: *Checker, id: usize)
                 c.note(d.unit, d.decl.variants[v].fields[k].span, s"a Sysl mirror's field is written in lowerCamelCase, and the compiler matches it to the Sysl field of the same words in snake_case: write `${camel_of_sysl(variant.field_names[k])}`, not `${variant.field_names[k]}`")
             // A handle is a field by itself, passed into Sysl as a binding's parameter is.
             if is_handle(c, t) then continue
-            if holds_handle(c, t)
+            if has_union(t) then c.note(d.unit, at, union_crossing_message(t))
+            elif holds_handle(c, t)
                 c.note(d.unit, at, s"`${type_name(t)}` cannot be a Sysl mirror's field: a Sysl handle is one only by itself")
             elif !crosses_to_sysl(c, t)
                 c.note(d.unit, at, s"`${type_name(t)}` cannot cross to Sysl, so a Sysl mirror's field cannot be one; ${BoundaryTypes}")
@@ -9088,7 +9171,143 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
             val ty = resolve_type(c, unit, p.ty)
             if p.by_name then types.push(ByName(ty)) else types.push(ty)
         Function(types, resolve_type(c, unit, result), sendable)
+    Union(members) -> resolve_union(c, unit, t, members)
     ResolvedType(slot) -> c.type_slots[slot]
+
+// A union written out, in normal form. A member written by hand that another absorbs (a duplicate,
+// one that converts to another member, `Any`, `Nothing`) is a mistake, reported with the type to
+// write; members that come together through an alias are absorbed silently, as they are through a
+// type argument.
+private resolve_union(c: *Checker, unit: usize, t: &TypeExpr, members: Buf[&TypeExpr]) -> &Type
+    if c.bound_context
+        c.bound_context = false
+        c.note(unit, t.span, s"a bound is a trait or a class, and `${show_union_written(members)}` is a union")
+        return ErrorType
+    var written: Buf[&Type] = buf()
+    var spans: Buf[Span] = buf()
+    var all: Buf[&Type] = buf()
+    collect_union(c, unit, members, &written, &spans, &all)
+    for m in all
+        if *m is ErrorType then return ErrorType
+    val normal = absorb_members(c, union_of(all))
+    val whole = type_name(union_of_written(all))
+    for i in 0..<written.len()
+        val w = written[i]
+        if *w is Nothing
+            c.note(unit, spans[i], s"`Nothing` adds no value to a union; write `${type_name(normal)}`")
+            return ErrorType
+        if *w is AnyType
+            c.note(unit, t.span, "every member converts to `Any`, so this union is `Any`; write `Any`")
+            return ErrorType
+        for j in 0..<i
+            if same_type(written[j], w)
+                c.note(unit, spans[i], s"`${type_name(w)}` is named twice in this union")
+                return ErrorType
+    for i in 0..<written.len()
+        for j in 0..<written.len()
+            if i != j && !same_type(written[i], written[j]) && member_converts(c, written[i], written[j])
+                c.note(unit, t.span, s"${type_article_quoted(written[i])} is already ${type_article_quoted(written[j])}, so `$whole` is `${type_name(normal)}`; write `${type_name(normal)}`")
+                return ErrorType
+    normal
+
+// The members as written, flattened, keeping duplicates, for naming the union in a message.
+private union_of_written(all: Buf[&Type]) -> &Type
+    if all.len() == 1 then return all[0]
+    Union(all)
+
+/** What is said of a union, or a type holding one, written where it would cross a binding. */
+union_crossing_message(t: &Type) -> string =
+    s"`${type_name(first_union(t))}` cannot cross a binding: a union has no Sysl or C type; bind one function per member, or pass a data type"
+
+// The first union written in `t`.
+private first_union(t: &Type) -> &Type
+    if *t is Union(_) then return t
+    val parts: Buf[&Type] = *t match
+        Tuple(items) -> items
+        Function(params, result, _) ->
+            for p in params
+                if has_union(p) then return first_union(p)
+            return first_union(result)
+        ByName(inner) -> return first_union(inner)
+        Data(_, _, args) -> args
+        Class(_, _, args) -> args
+        _ -> return t
+    for p in parts
+        if has_union(p) then return first_union(p)
+    t
+
+// A parent written `A | B`, which reads as an expression, as the union it names.
+private union_parent(parent: &Expr) -> Option[string] = parent.kind match
+    Binary(op, left, right, _) ->
+        if !(op is BitOr) then return None
+        val l = union_parent(left) match
+            Some(x) -> x
+            None -> parent_name(left)?
+        val r = parent_name(right)?
+        Some(s"$l | $r")
+    _ -> None
+
+private union_parent_message(written: string) -> string =
+    s"a union is no parent: a class or trait lists a class and traits after `:`, and `$written` is a union"
+
+/** A written union as a message names it: its members as written, with no outer parentheses. */
+show_union(t: &TypeExpr) -> string = t.kind match
+    Union(members) -> show_union_written(members)
+    _ -> show_type(t)
+
+private show_union_written(members: Buf[&TypeExpr]) -> string
+    var out = ""
+    for i in 0..<members.len()
+        if i > 0 then out = out + " | "
+        out = out + show_type(members[i])
+    out
+
+// Resolves the members of a written union: a parenthesized union written inside it is written by
+// hand too, while an alias brings its own members, which are not.
+private collect_union(c: *Checker, unit: usize, members: Buf[&TypeExpr], written: *Buf[&Type], spans: *Buf[Span], all: *Buf[&Type])
+    for m in members
+        if m.kind is Union(inner)
+            collect_union(c, unit, inner, written, spans, all)
+            continue
+        val ty = resolve_type(c, unit, m)
+        all.push(ty)
+        if !names_alias(c, unit, m)
+            written.push(ty)
+            spans.push(m.span)
+
+// Whether a written type is a name of a type alias.
+private names_alias(c: *Checker, unit: usize, t: &TypeExpr) -> bool = t.kind match
+    Named(path, _) -> c.alias_names.get(resolve_name(c, unit, path)) is Some(_)
+    _ -> false
+
+/** Whether a value of member `m` converts to member `other` of the same union, so that a union
+ * holding both is `other`: by subtyping, or by boxing into a trait `m` conforms to. */
+private member_converts(c: *Checker, m: &Type, other: &Type) -> bool
+    if *m is Var(_) || *other is Var(_) || *m is ErrorType || *other is ErrorType then return false
+    if *other is AnyType then return true
+    fits(c, m, other) || boxes_to(c, m, other)
+
+/** `t` with every member that converts to another member absorbed into it. */
+private absorb_members(c: *Checker, t: &Type) -> &Type
+    val members = *t match
+        Union(ms) -> ms
+        _ -> return t
+    var kept: Buf[&Type] = buf()
+    for i in 0..<members.len()
+        var absorbed = false
+        for j in 0..<members.len()
+            if i != j && member_converts(c, members[i], members[j])
+                // Of two members that convert to each other, the first written stays.
+                if !(member_converts(c, members[j], members[i]) && j > i) then absorbed = true
+        if !absorbed then kept.push(members[i])
+    union_of(kept)
+
+/** A type's name in backticks with its article: an `int`, a `Dog`. */
+private type_article_quoted(t: &Type) -> string
+    val name = type_name(t)
+    val first = name.bytes[0]
+    val vowel = first == u8('a') || first == u8('e') || first == u8('i') || first == u8('o') || first == u8('u') || first == u8('A') || first == u8('E') || first == u8('I') || first == u8('O') || first == u8('U')
+    (if vowel then "an `" else "a `") + name + "`"
 
 // What is said of a type name that names no type. Written through a module the file imports whole,
 // `m.X`, it names what the module lacks: a declaration `X`, or a public one.
@@ -9240,6 +9459,16 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
         var blanks = ""
         for i in 0..<params.len()
             blanks = blanks + (if i == 0 then "_" else ", _")
+        // A clause left out of a union parameter is named by the member it would take.
+        var unions = false
+        for t in params
+            if *zonk(c, t) is Union(_) then unions = true
+        if unions
+            if missing_arguments(typed, params, c.data) is Some(parts)
+                if parts.len() == params.len()
+                    blanks = ""
+                    for i in 0..<parts.len()
+                        blanks = blanks + (if i == 0 then parts[i] else ", " + parts[i])
         c.note(unit, decl.name_span, s"the clauses of `${decl.name}` do not cover every argument; add a clause for the rest, such as `${decl.name}($blanks)`")
     if settled_params && typed.len() == decl.clauses.len() && !pattern_errors
         for u in unreached_clauses(typed, params, c.data)
@@ -9856,8 +10085,9 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
     val want = expected match
         Some(w) -> w
         None -> return check_form(c, e, None, used)
+    if *zonk(c, want) is Union(_) then return union_value(c, e, zonk(c, want), used)
     if !(*zonk(c, want) is AnyType) then return to_trait(c, none_as(c, to_sendable(c, check_form(c, e, expected, used), want), want), zonk(c, want))
-    val passes = e.kind is Block(_, _) || e.kind is If(_, _, _) || e.kind is Match(_, _) || e.kind is While(_, _, _) || e.kind is Loop(_) || e.kind is DoWhile(_, _, _)
+    val passes =e.kind is Block(_, _) || e.kind is If(_, _, _) || e.kind is Match(_, _) || e.kind is While(_, _, _) || e.kind is Loop(_) || e.kind is DoWhile(_, _, _)
     to_any(c, check_form(c, e, if passes then expected else None, used))
 
 /** `typed` as the `@sendable` function type `want`, where it makes a function value: a lambda, a
@@ -9884,6 +10114,213 @@ private to_any(c: *Checker, typed: &TExpr) -> &TExpr
         return typed
     if *t is AnyType || *t is Nothing || *t is ErrorType || *t is ByName(_) then return typed
     TExpr(typed.span, AnyType, Box(typed))
+
+// A value expected as a union becomes one where it is written, injected into the member it belongs
+// to. The forms that yield one of their parts pass the union on, so each part injects its own; a
+// literal, a lambda, `None`, a variant's constructor and a collection literal are checked as the one
+// member they can be, which decides their types; anything else is checked on its own.
+private union_value(c: *Checker, e: &Expr, want: &Type, used: bool) -> &TExpr
+    val passes = e.kind is Block(_, _) || e.kind is If(_, _, _) || e.kind is Match(_, _) || e.kind is While(_, _, _) || e.kind is Loop(_) || e.kind is DoWhile(_, _, _)
+    if passes then return inject(c, check_form(c, e, Some(want), used), want)
+    val hint = union_hint(c, e, want) match
+        Some(h) -> h
+        None -> return TExpr(e.span, ErrorType, UnitConst)
+    inject(c, check_value(c, e, hint, used), want)
+
+// The member an expression is checked as, where its form decides it, or `None` inside the outer
+// option where the form's member could not be decided, which is reported.
+private union_hint(c: *Checker, e: &Expr, want: &Type) -> Option[Option[&Type]]
+    val members = members_of(want)
+    e.kind match
+        IntLit(spelling) -> literal_member(c, e.span, spelling, false, want)
+        Unary(op, operand) ->
+            if op is Negate
+                operand.kind match
+                    IntLit(spelling) -> return literal_member(c, e.span, spelling, true, want)
+                    RealLit(_) -> return Some(only_member(members, Real))
+                    _ -> ()
+            Some(None)
+        RealLit(_) -> Some(only_member(members, Real))
+        Lambda(_, _) -> one_of(c, e, "a lambda", want, function_members(c, members))
+        MatchFunction(_) -> one_of(c, e, "a `match` function", want, function_members(c, members))
+        // A variant among several members of its type is checked on its own, which decides it where
+        // its arguments do, as `Some(7)` does; `inject` refuses one they leave open.
+        Name(name) -> Some(first_if_one(variant_members(c, name, members)))
+        Call(callee, _) -> callee.kind match
+            Name(name) -> Some(first_if_one(variant_members(c, name, members)))
+            _ -> Some(None)
+        ListLit(_) -> one_of(c, e, "a collection literal", want, collection_members(c, members))
+        SetLit(_) -> one_of(c, e, "a collection literal", want, collection_members(c, members))
+        MapLit(_, _) -> one_of(c, e, "a collection literal", want, collection_members(c, members))
+        _ -> Some(None)
+
+// The member a form is checked as, where exactly one fits it; where several do, the program has to
+// say which, and none leaves the form to be checked on its own.
+private one_of(c: *Checker, e: &Expr, what: string, want: &Type, found: Buf[&Type]) -> Option[Option[&Type]]
+    if found.len() == 1 then return Some(Some(found[0]))
+    if found.len() == 0 then return Some(None)
+    var names: Buf[string] = buf()
+    for m in found
+        names.push(s"`${type_name(m)}`")
+    c.note(unit_of(c), e.span, s"$what could be ${spoken_list(names)}, more than one member of `${type_name(want)}`; give it the type you mean first, as in `val x: ${type_name(found[0])} = …`")
+    None
+
+private first_if_one(found: Buf[&Type]) -> Option[&Type] = if found.len() == 1 then Some(found[0]) else None
+
+private only_member(members: Buf[&Type], t: &Type) -> Option[&Type]
+    for m in members
+        if same_type(m, t) then return Some(m)
+    None
+
+// The members that are function types, which a lambda is checked as.
+private function_members(c: *Checker, members: Buf[&Type]) -> Buf[&Type]
+    var found: Buf[&Type] = buf()
+    for m in members
+        if *zonk(c, m) is Function(_, _, _) then found.push(m)
+    found
+
+// The members that are instances of the data type a variant named `name` belongs to: `None` and
+// `Ok(x)` take their type from the one there is.
+private variant_members(c: *Checker, name: string, members: Buf[&Type]) -> Buf[&Type]
+    var found: Buf[&Type] = buf()
+    val vs = variants_named(c, name)
+    for m in members
+        if *zonk(c, m) is Data(d, _, _)
+            for v in vs
+                if v.data == d
+                    found.push(m)
+                    break
+    found
+
+// The members a collection literal can build: a `List`, and a type whose companion has `newBuilder`.
+private collection_members(c: *Checker, members: Buf[&Type]) -> Buf[&Type]
+    var found: Buf[&Type] = buf()
+    for m in members
+        val t = zonk(c, m)
+        val companion = *t match
+            Class(k, _, _) -> c.classes[k].companion
+            Data(d, _, _) -> c.data[d].companion
+            _ -> None
+        var collection = is_list_type(c, t)
+        if companion is Some(o)
+            if methods_named(c, o, "newBuilder").len() > 0 then collection = true
+        if collection then found.push(m)
+    found
+
+// The member an integer literal is: its default type, `int` or `long` for one too large for `int`,
+// where that is a member; otherwise the one numeric member it fits. Fitting several is an error.
+private literal_member(c: *Checker, at: Span, spelling: string, negative: bool, want: &Type) -> Option[Option[&Type]]
+    val members = members_of(want)
+    val digits = literal_magnitude(spelling) match
+        Some(d) -> d
+        None -> return Some(None)
+    val default: &Type = if fits(digits, IntBits, negative) then int_type() else Int(64)
+    if only_member(members, default) is Some(m) then return Some(Some(m))
+    var fitting: Buf[&Type] = buf()
+    for m in members
+        val fit = *m match
+            Int(bits) -> fits(digits, bits, negative)
+            Byte -> !(negative && digits != "0") && compare_decimal(digits, "255") <= 0
+            Real -> compare_decimal(digits, "9007199254740992") <= 0
+            _ -> false
+        if fit then fitting.push(m)
+    if fitting.len() == 1 then return Some(Some(fitting[0]))
+    if fitting.len() == 0 then return Some(None)
+    var names: Buf[string] = buf()
+    for m in fitting
+        names.push(s"`${type_name(m)}`")
+    val written = if negative then s"-$spelling" else spelling
+    c.note(unit_of(c), at, s"the literal `$written` fits ${spoken_list(names)}, so it could be more than one member of `${type_name(want)}`; give it the type you mean, as in `${type_name(fitting[0])}($written)`")
+    None
+
+/** `typed` as a value of the union `want`: injected into the member its type is, or else the one
+ * member it converts to. A value of another union is one of `want` where each of its members is; a
+ * type parameter among `want`'s members takes what the value leaves over once the other members are
+ * taken out. Where the value fits no member, `typed` is left as it is, for the caller's report. */
+private inject(c: *Checker, typed: &TExpr, want: &Type) -> &TExpr
+    val t = zonk(c, typed.ty)
+    val w = zonk(c, want)
+    if *t is Nothing || *t is ErrorType || same_type(t, w) then return typed
+    val members = members_of(w)
+    if !(*w is Union(_)) then return typed
+    // A type parameter left among the members takes what is left over.
+    var open: Option[&Type] = None
+    for m in members
+        if *m is Var(_) then open = Some(m)
+    if open is Some(v)
+        var rest: Buf[&Type] = buf()
+        for x in members_of(t)
+            var taken = false
+            for m in members
+                if !(*m is Var(_)) && member_converts(c, x, m) then taken = true
+            if !taken then rest.push(x)
+        if rest.len() > 0
+            if !unify(c, v, union_of(rest)) then return typed
+            return inject(c, typed, w)
+        // Every member the value has is a member already, so the parameter is not decided here.
+        if *t is Union(_) && fits(c, t, w) then return TExpr(typed.span, w, Box(typed))
+    if *t is Union(_)
+        if fits(c, t, w) then return TExpr(typed.span, w, Box(typed))
+        return typed
+    for m in members
+        if same_type(t, m) then return TExpr(typed.span, w, Box(typed))
+    // An unknown still in the value's type settles as the one member of its shape.
+    if has_unknowns(t) || nothing_option(c, t)
+        var shaped: Buf[&Type] = buf()
+        for m in members
+            if same_shape(t, zonk(c, m)) then shaped.push(m)
+        if shaped.len() > 1
+            var names: Buf[string] = buf()
+            for m in shaped
+                names.push(s"`${type_name(m)}`")
+            c.note(unit_of(c), typed.span, s"this value could be ${spoken_list(names)}, more than one member of `${type_name(w)}`; give it the type you mean first, as in `val x: ${type_name(shaped[0])} = …`")
+            return TExpr(typed.span, ErrorType, typed.kind)
+        if shaped.len() == 0 then return typed
+        val m = shaped[0]
+        if converts_none(c, t, m) then return TExpr(typed.span, w, Box(none_as(c, typed, m)))
+        if !fits(c, t, m) then return typed
+        return TExpr(typed.span, w, Box(typed))
+    var candidates: Buf[&Type] = buf()
+    for m in members
+        if !has_unknowns(m) && member_converts(c, t, m) then candidates.push(m)
+    if candidates.len() == 0 then return typed
+    var chosen = candidates[0]
+    if candidates.len() > 1
+        // Members that came together through a type argument convert to the widest of them.
+        var widest: Option[&Type] = None
+        for m in candidates
+            var all = true
+            for o in candidates
+                if !same_type(m, o) && !member_converts(c, o, m) then all = false
+            if all then widest = Some(m)
+        if widest is Some(m) then chosen = m
+        else
+            var names: Buf[string] = buf()
+            for m in candidates
+                names.push(type_article_quoted(m))
+            val first = type_name(candidates[0])
+            val local = to_lower(first[0..<1])
+            c.note(unit_of(c), typed.span, s"${type_article_quoted(t)} is ${if candidates.len() == 2 then "both " else ""}${spoken_list(names)}, so it could be either member of `${type_name(w)}`; give it the type you mean first, as in `val $local: $first = …`")
+            return TExpr(typed.span, ErrorType, typed.kind)
+    fits(c, t, chosen)
+    TExpr(typed.span, w, Box(to_trait(c, typed, chosen)))
+
+// Whether `t`, which may still hold unknowns, is of the same kind of type as `m`: one data type or
+// class, a tuple of as many parts, or a function of as many parameters.
+private same_shape(t: &Type, m: &Type) -> bool = *t match
+    Data(d, _, _) -> *m match
+        Data(e, _, _) -> d == e
+        _ -> false
+    Class(k, _, _) -> *m match
+        Class(j, _, _) -> k == j
+        _ -> false
+    Tuple(xs) -> *m match
+        Tuple(ys) -> xs.len() == ys.len()
+        _ -> false
+    Function(xs, _, _) -> *m match
+        Function(ys, _, _) -> xs.len() == ys.len()
+        _ -> false
+    _ -> false
 
 // An `Option[Nothing]` used where another option is expected converts to it where it is written, as
 // `None` would have been written at that type: an option kept as a pointer is null for `None`, and
@@ -10080,6 +10517,32 @@ param_index(c: *Checker, name: string) -> Option[usize]
         if symbol.param_names[i] == name then return Some(i)
     None
 
+// A named function with a union parameter, written where a function type is expected whose parameter
+// there is one of the union's members (or a smaller union), is made at that site as a lambda calling
+// it, so each argument is injected as a call's would be: `val f: (int) -> string = describe` for
+// `describe(x: int | string)`.
+private adapted_function(c: *Checker, at: Span, name: string, id: usize, expected: Option[&Type]) -> Option[&TExpr]
+    val want = zonk(c, expected?)
+    val ps = *want match
+        Function(ps, _, _) -> ps
+        _ -> return None
+    if lookup_functions(c, name).len() != 1 then return None
+    val symbol = c.symbols[id]
+    if symbol.type_params.len() > 0 || symbol.params.len() != ps.len() then return None
+    var adapts = false
+    for i in 0..<ps.len()
+        val declared = zonk(c, symbol.params[i])
+        if *declared is Union(_) && !same_type(declared, zonk(c, ps[i])) then adapts = true
+    if !adapts then return None
+    var params: Buf[LambdaParam] = buf()
+    var args: Buf[Argument] = buf()
+    for i in 0..<ps.len()
+        val param = s"adapted $i"
+        params.push(LambdaParam(at, param, None))
+        args.push(Argument(at, None, name_at(at, param), false))
+    val body = Expr(at, Call(name_at(at, name), args))
+    Some(lambda_expr(c, Expr(at, Lambda(params, body)), params, body, expected, false))
+
 private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) -> &TExpr
     if name == "_"
         c.note(unit_of(c), at, "`_` is not a value here: it stands for a lambda's parameter only within a call's argument, as in `xs.map(_ + 1)`, or a declared `val`'s value, and elsewhere for a binding that is never read")
@@ -10117,6 +10580,7 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
         return global_read(c, at, g)
     if lookup_function(c, name) is Some(id)
         if abstract_constructor(c, id, at) then return TExpr(at, ErrorType, UnitConst)
+        if adapted_function(c, at, name, id, expected) is Some(lambda) then return lambda
         return named_function_value(c, at, name, None, expected)
     val (chosen, is_variant) = choose_variant(c, at, name, expected)
     if chosen is Some(v)
@@ -10191,9 +10655,19 @@ private method_of(c: *Checker, t: &Type, name: string) -> Option[usize]
     val rendering = rendering_methods(c, known, name)
     if rendering.len() > 0 then Some(rendering[0]) else None
 
+// The methods of `Display` and `Debug` a union has where every member has that trait, which run the
+// member's own.
+private union_rendering_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
+    for trait_name in ["Display", "Debug"]
+        if c.core.trait_named(trait_name) is Some(k)
+            val ms = methods_named(c, k, name)
+            if ms.len() > 0 && meets_bound(conformances(c), t, Class(k, trait_name, buf())) then return ms
+    buf()
+
 // The methods of `Display` and `Debug` named `name` that a value of `Any` or of a trait has without
-// declaring them: see `rendered_at_run_time`.
+// declaring them (see `rendered_at_run_time`), and a union where its members have them.
 private rendering_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
+    if *t is Union(_) then return union_rendering_methods(c, t, name)
     if !rendered_at_run_time(c.classes, t) then return buf()
     for trait_name in ["Display", "Debug"]
         if c.core.trait_named(trait_name) is Some(k)
@@ -10239,6 +10713,7 @@ private overloaded_method_value(c: *Checker, at: Span, receiver: &TExpr, name: s
 methods_of(c: *Checker, t: &Type, name: string) -> Buf[usize]
     val known = zonk(c, t)
     if *known is TypeVar(_, _, _) then return with_trait_methods(c, known, name, bound_methods(c, known, name))
+    if *known is Union(_) then return union_rendering_methods(c, known, name)
     val found = if *known is Class(k, _, _) then with_trait_methods(c, known, name, methods_named(c, k, name)) else in_scope_on_context(c, known, with_trait_methods(c, known, name, visible_methods(c, receiver_methods(c, known, name))))
     if found.len() > 0 then found else rendering_methods(c, known, name)
 
@@ -10530,8 +11005,13 @@ private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: 
         TypeVar(_, _, _) -> return bound_member_value(c, e.span, value, ty, name, expected)
         ErrorType -> ()
         Nothing -> return value
+        Union(_) -> c.note(unit, e.span, union_no_member(ty, name))
         _ -> c.note(unit, e.span, s"${type_name(ty)} has no field `$name`")
     TExpr(e.span, ErrorType, UnitConst)
+
+/** What is said of a member a union does not have. */
+union_no_member(t: &Type, name: string) -> string =
+    s"`${type_name(t)}` has no member `$name`: its members share no type that has one; take it apart with a `match` or `is` first"
 
 // `value.name` on a value of type parameter `ty`: a `val` of a trait bounding it, or a method of its
 // bounds named without a call.
@@ -10681,6 +11161,7 @@ private with_path(c: *Checker, ty: &Type, change: FieldChange) -> Option[(Buf[us
                     Data(_, _, _) -> s"`${type_name(current)}`, whose several variants have no fields to name"
                     Class(_, _, _) -> s"`${type_name(current)}`, a class whose object the new value would share"
                     TypeVar(_, _, _) -> s"`${type_name(current)}`, a type parameter"
+                    Union(_) -> s"`${type_name(current)}`, a union, to be taken apart with a `match` first"
                     _ -> s"`${type_name(current)}`"
                 c.note(unit, at, s"a path in `with` goes through data fields only, and `$through` holds $what: replace `$through` whole")
                 return None
@@ -12514,12 +12995,18 @@ private reference_only(c: *Checker, t: &Type) -> bool = *t match
         for b in bounds_of(c, t)
             if reference_only(c, zonk(c, b)) then return true
         false
+    // A union of classes and function types holds only objects with identity.
+    Union(members) ->
+        for m in members
+            if !reference_only(c, zonk(c, m)) then return false
+        true
     _ -> false
 
 /** Whether a value of type `t` may be a reference and may as well be a value type: an `Any`, a
- * trait's value, or a type parameter's. */
+ * trait's value, a type parameter's, or a union with a member that is no class or function type. */
 private may_hold_value(c: *Checker, t: &Type) -> bool = *t match
     AnyType -> true
+    Union(_) -> !reference_only(c, t)
     Class(k, _, _) -> is_trait(c, k)
     TypeVar(_, _, _) -> !reference_only(c, t)
     _ -> false
@@ -12531,6 +13018,12 @@ private identity_comparable(c: *Checker, x: &Type, y: &Type, xr: bool, yr: bool)
     if same_type(x, y) then return true
     if *x is AnyType || *y is AnyType then return true
     if (*x is TypeVar(_, _, _) && !xr) || (*y is TypeVar(_, _, _) && !yr) then return true
+    // A union of classes may be one object with a value of any type one of its members may be.
+    if *x is Union(_) || *y is Union(_)
+        for m in members_of(x)
+            for n in members_of(y)
+                if identity_comparable(c, zonk(c, m), zonk(c, n), reference_only(c, m), reference_only(c, n)) then return true
+        return false
     if !(*x is Class(_, _, _) || *x is TypeVar(_, _, _)) || !(*y is Class(_, _, _) || *y is TypeVar(_, _, _)) then return false
     same_type(upcast(c, x, y), y) || same_type(upcast(c, y, x), x)
 
@@ -13181,10 +13674,25 @@ private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[
     elif used
         join_expected(c, y.ty, n.ty, wanted) match
             Some(t) -> ty = t
-            None ->
-                c.note(unit_of(c), e.span, s"the branches of this `if` yield ${type_name(y.ty)} and ${type_name(n.ty)}${no_single_join(c, y.ty, n.ty)}")
-                ty = ErrorType
+            None -> union_join(c, y.ty, n.ty) match
+                Some(t) ->
+                    ty = t
+                    y = inject(c, y, t)
+                    n = inject(c, n, t)
+                None ->
+                    c.note(unit_of(c), e.span, s"the branches of this `if` agree on no type: `${type_name(y.ty)}` and `${type_name(n.ty)}`${no_single_join(c, y.ty, n.ty)}")
+                    ty = ErrorType
     TExpr(e.span, ty, If(cond, y, Some(n)))
+
+/** Where a union and a value of one of its members meet, as two branches, they agree on the union,
+ * as a class and its superclass agree on the superclass. */
+private union_join(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
+    val x = zonk(c, a)
+    val y = zonk(c, b)
+    if has_unknowns(x) || has_unknowns(y) then return None
+    if *x is Union(_) && fits(c, y, x) then return Some(x)
+    if *y is Union(_) && fits(c, x, y) then return Some(y)
+    None
 
 // A loop yields unit, or with an `else`, the value its `else` and every `break` agree on. A
 // `while true` that no `break` leaves never finishes.
@@ -14462,6 +14970,10 @@ private literal_fits(e: &Expr, t: &Type) -> bool
         Byte -> !(negative && digits != "0") && compare_decimal(digits, "255") <= 0
         Real -> compare_decimal(digits, "9007199254740992") <= 0
         AnyType -> true
+        Union(members) ->
+            for m in members
+                if literal_fits(e, m) then return true
+            false
         _ -> false
 
 /** The overloads `ids` as written, for a diagnostic: "`f(x: int)`, `f(s: string)`". */
@@ -15093,7 +15605,7 @@ private dispatch_slot(c: *Checker, receiver_type: &Type, m: usize) -> Option[usi
         if is_trait(c, r) then return Some(trait_slot(c, m))
         if is_open(c, r) then return table_position(c, r, m)
     // `Any` has the methods of `Display` and `Debug`, which its value's own type answers.
-    if *zonk(c, receiver_type) is AnyType
+    if *zonk(c, receiver_type) is AnyType || *zonk(c, receiver_type) is Union(_)
         if c.symbols[m].owner_class is Some(k)
             if is_trait(c, k) then return Some(trait_slot(c, m))
     None
@@ -16103,7 +16615,8 @@ private call_checked(c: *Checker, at: Span, callee_span: Span, f: &TExpr, args: 
             // A sequence is a function from index to element: calling one calls its `apply`.
             val applies = apply_methods(c, ty)
             if applies.len() > 0 then return call_method(c, at, callee_span, f, "apply", applies, args, None, None, false)
-            if settled(ty) then c.note(unit, callee_span, s"a value of type ${type_name(ty)} cannot be called; only a function can")
+            if *ty is Union(_) then c.note(unit, callee_span, s"a union is not called: `${type_name(ty)}` may hold a value that is no function; take it apart with a `match` first")
+            elif settled(ty) then c.note(unit, callee_span, s"a value of type ${type_name(ty)} cannot be called; only a function can")
             for a in args
                 check_statement(c, a.value)
             TExpr(at, if *ty is Nothing then Nothing else ErrorType, UnitConst)
@@ -16455,8 +16968,19 @@ private call_argument(c: *Checker, arg: Argument, param: Option[&Type], open: *B
             if !constrain(c, p, taken.ty, open, true) then c.note(unit, arg.value.span, mismatch(c, zonk(c, p), value.ty))
             return taken
         if !(*value.ty is Nothing) && !constrain(c, p, value.ty, open, true)
-            c.note(unit, arg.value.span, mismatch(c, zonk(c, p), value.ty))
+            c.note(unit, arg.value.span, mismatch(c, zonk(c, p), value.ty) + (if *p is Var(_) then type_argument_union_hint(c, zonk(c, p), value.ty) else ""))
     value
+
+// Where two arguments give one type argument types that agree on none, the union to write as the
+// type argument where both are wanted, since inference never forms one.
+private type_argument_union_hint(c: *Checker, a: &Type, b: &Type) -> string
+    val x = zonk(c, a)
+    val y = zonk(c, b)
+    if !union_member_type(x) || !union_member_type(y) || shared_traits(c, x, y).len() >= 2 then return ""
+    var both: Buf[&Type] = buf()
+    both.push(y)
+    both.push(x)
+    s"; a type argument is never inferred as a union: to take either, write it, as in `[${type_name(union_of(both))}]`"
 
 /** "expected T, found U", and why two classes that share several traits do not join to one. */
 private mismatch(c: *Checker, wanted: &Type, found: &Type) -> string
@@ -16485,12 +17009,26 @@ private sendable_hint(c: *Checker, wanted: &Type, found: &Type) -> string
  * nothing. */
 private no_single_join(c: *Checker, a: &Type, b: &Type) -> string
     val traits = shared_traits(c, zonk(c, a), zonk(c, b))
-    if traits.len() < 2 then return ""
+    if traits.len() < 2 then return union_hint_text(c, a, b)
     var names = ""
     for i in 0..<traits.len()
         if i > 0 then names = names + (if i + 1 == traits.len() then " and " else ", ")
         names = names + type_name(traits[i])
     s", which share $names but no single most specific type; write the type you want"
+
+/** Where two values agree on no type, the union to declare where both are wanted, since inference
+ * never forms one; nothing where they could not be one. */
+private union_hint_text(c: *Checker, a: &Type, b: &Type) -> string
+    val x = zonk(c, a)
+    val y = zonk(c, b)
+    if !union_member_type(x) || !union_member_type(y) then return ""
+    var both: Buf[&Type] = buf()
+    both.push(x)
+    both.push(y)
+    s"; to keep either, declare the type it yields, such as `${type_name(union_of(both))}`"
+
+private union_member_type(t: &Type) -> bool =
+    !(has_unknowns(t) || *t is Nothing || *t is ErrorType || *t is AnyType || *t is ByName(_) || *t is Unit)
 
 /** The expected type of an argument whose parameter has the type `t`: `t` solved, except that a type
  * argument still open in `open` is left unknown where a value is read out, when what decided it is a
@@ -16920,9 +17458,11 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
                 ty = body.ty
             join_expected(c, ty, body.ty, wanted) match
                 Some(t) -> ty = t
-                None ->
-                    c.note(unit, arm.body.span, s"this arm yields ${type_name(body.ty)}, but the arms before it yield ${type_name(ty)}${no_single_join(c, ty, body.ty)}")
-                    agreed = false
+                None -> union_join(c, ty, body.ty) match
+                    Some(t) -> ty = t
+                    None ->
+                        c.note(unit, arm.body.span, s"this arm yields ${type_name(body.ty)}, but the arms before it yield ${type_name(ty)}${no_single_join(c, ty, body.ty)}")
+                        agreed = false
         typed.push(TArm(pattern, guard, body))
     for k in deferred
         val arm = arms[k]
@@ -16941,11 +17481,15 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
                             later = Some(j)
                             break
                     if later is Some(j)
-                        c.note(unit, arms[j].body.span, s"this arm yields ${type_name(ty)}, but the arms before it yield ${type_name(body.ty)}")
-                    else c.note(unit, arm.body.span, s"this arm yields ${type_name(body.ty)}, but the other arms yield ${type_name(ty)}")
+                        c.note(unit, arms[j].body.span, s"this arm yields ${type_name(ty)}, but the arms before it yield ${type_name(body.ty)}${no_single_join(c, body.ty, ty)}")
+                    else c.note(unit, arm.body.span, s"this arm yields ${type_name(body.ty)}, but the other arms yield ${type_name(ty)}${no_single_join(c, ty, body.ty)}")
                     agreed = false
     if !agreed then ty = ErrorType
     elif !used then ty = if never then Nothing else Unit
+    // Arms that met a union they belong to yield it, each injected.
+    elif *zonk(c, ty) is Union(_)
+        for i in 0..<typed.len()
+            typed[i] = TArm(typed[i].pattern, typed[i].guard, inject(c, typed[i].body, zonk(c, ty)))
     if settled(s.ty)
         if machine_site(c, unit, e.span) is Some(site)
             val missing = missing_cases(typed, s.ty, c.data)
@@ -16961,7 +17505,8 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
             // when there is more to say of it than `_`.
             missing_case(typed, s.ty, c.data, true) match
                 Some(case) ->
-                    if case == "_" then c.note(unit, e.span, s"$subject; add an arm for the rest, such as `_`")
+                    if *zonk(c, s.ty) is Union(_) then c.note(unit, e.span, s"this `match` does not cover every `${type_name(s.ty)}` value, such as `$case`")
+                    elif case == "_" then c.note(unit, e.span, s"$subject; add an arm for the rest, such as `_`")
                     else c.note(unit, e.span, s"$subject, such as `$case`; add an arm for it, or `_` for the rest")
                 None -> c.note(unit, e.span, s"$subject, since an extractor may answer that it does not match; add an arm for the rest, such as `_`")
         if !pattern_errors then report_match_unreached(c, unit, e.span, typed, s.ty)
@@ -17182,6 +17727,8 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
 
 private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &TPattern
     val unit = unit_of(c)
+    if *zonk(c, ty) is Union(members)
+        if applies_to_members(c, p) then return union_pattern(c, p, zonk(c, ty), members, no_bind)
     p.kind match
         Wildcard -> TPattern(p.span, ty, PWildcard)
         InvalidPattern -> TPattern(p.span, ErrorType, PWildcard)
@@ -17247,6 +17794,9 @@ private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string)
                 return TPattern(p.span, ErrorType, PWildcard)
             TPattern(p.span, ty, PSuccessor(local, k))
         Alternatives(options) ->
+            if union_in_type_pattern(c, options) is Some(written)
+                c.note(unit, p.span, s"a union in a type pattern is written in parentheses, `$written`")
+                return TPattern(p.span, ErrorType, PWildcard)
             var typed: Buf[&TPattern] = buf()
             for o in options
                 typed.push(check_pattern(c, o, ty, if no_bind == "" then "alternatives bind no names; write `_` for a value that is not used" else no_bind))
@@ -17310,10 +17860,196 @@ private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string)
             val local = binder_local(c, binder, target, no_bind)
             if *target is ErrorType || !settled(zonk(c, ty)) then return TPattern(p.span, ErrorType, PWildcard)
             if !may_match(c, ty, target)
-                c.note(unit, p.span, s"a value of type ${type_name(zonk(c, ty))} is never ${type_article(target)}, so this type pattern never matches")
+                if *zonk(c, ty) is Union(_) then c.note(unit, p.span, s"`${type_name(target)}` is no member of `${type_name(zonk(c, ty))}`, so this pattern can never match")
+                else c.note(unit, p.span, s"a value of type ${type_name(zonk(c, ty))} is never ${type_article(target)}, so this type pattern never matches")
                 return TPattern(p.span, ErrorType, PWildcard)
             c.type_tests.push(TypeView(ty, target))
             TPattern(p.span, ty, PType(target, local, !fits(c, ty, target)))
+
+// A type pattern followed by `|` and bare names that are no variants, `x: int | string`, which reads as
+// a union meant for the type: the parenthesized form to write, where the alternatives are that.
+private union_in_type_pattern(c: *Checker, options: Buf[&Pattern]) -> Option[string]
+    val (binder, first) = options[0].kind match
+        Typed(b, t) -> (b, t)
+        _ -> return None
+    var names = show_type(first)
+    if first.kind is Function(_, _, _) then names = s"($names)"
+    for i in 1..<options.len()
+        options[i].kind match
+            Name(n) ->
+                if variants_named(c, n).len() > 0 then return None
+                names = names + " | " + n
+            _ -> return None
+    val bound = binder.kind match
+        Name(n) -> n
+        _ -> "_"
+    Some(s"$bound: ($names)")
+
+// Whether a pattern on a union applies to some of its members rather than to the union as a whole:
+// every pattern but `_`, a binding, a named pattern and alternatives, which hold patterns that do.
+private applies_to_members(c: *Checker, p: &Pattern) -> bool = p.kind match
+    Wildcard -> false
+    InvalidPattern -> false
+    Named(_, _) -> false
+    Alternatives(_) -> false
+    Name(name) -> variants_named(c, name).len() > 0
+    _ -> true
+
+// A pattern on a union, as the parts it is on the members it applies to. A type pattern applies to
+// every member it may match, and covers a member it is a supertype of; any other pattern applies to
+// the one member it can match.
+private union_pattern(c: *Checker, p: &Pattern, union: &Type, members: Buf[&Type], no_bind: string) -> &TPattern
+    val unit = unit_of(c)
+    val failed = TPattern(p.span, ErrorType, PWildcard)
+    if p.kind is Typed(binder, written)
+        val target = resolve_type(c, unit, written)
+        val local = binder_local(c, binder, target, no_bind)
+        if *target is ErrorType then return failed
+        var parts: Buf[&TPattern] = buf()
+        var whole = true
+        for m in members
+            if *target is AnyType || fits(c, m, target) || boxes_to(c, m, target)
+                parts.push(TPattern(p.span, m, PType(target, local, false)))
+            elif may_match(c, m, target)
+                c.type_tests.push(TypeView(m, target))
+                parts.push(TPattern(p.span, m, PType(target, local, true)))
+                whole = false
+            else whole = false
+        if parts.len() == 0
+            c.note(unit, p.span, s"`${type_name(target)}` is no member of `${type_name(union)}`, so this pattern can never match")
+            return failed
+        if whole then return TPattern(p.span, union, PType(target, local, false))
+        return TPattern(p.span, union, PUnion(parts))
+    var candidates = pattern_members(c, p, members)
+    if candidates.len() > 1 then candidates = by_typed_fields(c, p, candidates)
+    if candidates.len() == 0
+        c.note(unit, p.span, s"this pattern can match no member of `${type_name(union)}`")
+        return failed
+    if candidates.len() > 1
+        var names: Buf[string] = buf()
+        for m in candidates
+            names.push(s"`${type_name(m)}`")
+        c.note(unit, p.span, s"this pattern could match more than one member of `${type_name(union)}`, ${spoken_list(names)}; match the member first with a type pattern, as in `x: ${type_name(candidates[0])}`")
+        return failed
+    val part = check_pattern(c, p, candidates[0], no_bind)
+    if *part.ty is ErrorType then return failed
+    var parts: Buf[&TPattern] = buf()
+    parts.push(part)
+    TPattern(p.span, union, PUnion(parts))
+
+// The members a pattern other than a type pattern can match, by its form: a literal or a bound the
+// members of its constant's kind, a variant or a constructor the instances of its data type, an
+// extractor those its method takes, a sequence pattern the sequences, a tuple the tuples of its size.
+private pattern_members(c: *Checker, p: &Pattern, members: Buf[&Type]) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    for m in members
+        val z = zonk(c, m)
+        val fits = p.kind match
+            Literal(value) -> constant_member(value, z)
+            Range(lower, _, _) -> constant_member(lower, z)
+            Bounded(_, lower, upper) -> lower match
+                Some(b) -> constant_member(b.value, z)
+                None -> upper match
+                    Some(b) -> constant_member(b.value, z)
+                    None -> false
+            Successor(_, _) -> *z is Int(_)
+            Name(name) -> variant_of_member(c, name, z)
+            Constructor(path, _, _) ->
+                if variants_named(c, path).len() > 0 then variant_of_member(c, path, z) else extractor_takes(c, path, z)
+            Cons(_, _) -> is_list_type(c, z)
+            Sequence(_) -> is_list_type(c, z) || seq_element(c, z) is Some(_)
+            Tuple(items) -> *z match
+                Tuple(parts) -> parts.len() == items.len()
+                _ -> false
+            _ -> false
+        if fits then out.push(m)
+    out
+
+// The members a constructor pattern can match once the type patterns among its fields are taken into
+// account: `Some(n: int)` on `Option[int] | Option[string]` is the first. Where a written type fails
+// to resolve, or the fields decide nothing, the members are left as they are.
+private by_typed_fields(c: *Checker, p: &Pattern, members: Buf[&Type]) -> Buf[&Type]
+    val (path, args) = p.kind match
+        Constructor(path, args, _) -> (path, args)
+        _ -> return members
+    var written: Buf[Option[&Type]] = buf()
+    var any = false
+    for a in args
+        a.kind match
+            Typed(_, t) ->
+                val resolved = resolve_type(c, unit_of(c), t)
+                if *resolved is ErrorType then return members
+                written.push(Some(resolved))
+                any = true
+            _ -> written.push(None)
+    if !any then return members
+    var out: Buf[&Type] = buf()
+    for m in members
+        val (d, targs) = *zonk(c, m) match
+            Data(d, _, targs) -> (d, targs)
+            _ -> continue
+        var keep = true
+        for v in variants_named(c, path)
+            if v.data != d then continue
+            val fields = variant_fields(c.data[d], d, v.index, targs)
+            if fields.len() != written.len() then continue
+            for i in 0..<fields.len()
+                if written[i] is Some(t)
+                    if !may_match(c, fields[i], t) then keep = false
+        if keep then out.push(m)
+    out
+
+// Whether a pattern's constant, a literal, is of the kind of member `t`: an integer literal of an
+// integer or a byte, and each other literal of its own type.
+private constant_member(value: &Expr, t: &Type) -> bool = value.kind match
+    IntLit(_) -> *t is Int(_) || *t is Byte
+    Unary(_, operand) -> operand.kind match
+        IntLit(_) -> *t is Int(_)
+        RealLit(_) -> *t is Real
+        _ -> false
+    RealLit(_) -> *t is Real
+    CharLit(_) -> *t is Char
+    StringLit(_) -> *t is Str
+    Interpolate(_, _, _, _) -> *t is Str
+    BoolLit(_) -> *t is Bool
+    UnitLit -> *t is Unit
+    _ -> false
+
+private variant_of_member(c: *Checker, name: string, t: &Type) -> bool
+    val d = *t match
+        Data(d, _, _) -> d
+        _ -> return false
+    for v in variants_named(c, name)
+        if v.data == d then return true
+    false
+
+// Whether the extractor named `path` has an `unapply` or `unapplySeq` that takes a value of `t`.
+private extractor_takes(c: *Checker, path: string, t: &Type) -> bool
+    val owner = extractor_type(c, path_expr(Span(0, 0), path)) match
+        Some(o) -> o
+        None -> return false
+    var ms = methods_of(c, owner, "unapply")
+    if ms.len() == 0 then ms = methods_of(c, owner, "unapplySeq")
+    for m in ms
+        val params = c.symbols[m].params
+        if params.len() == 0 then continue
+        val taken = params[params.len() - 1]
+        if has_type_params(taken) || may_match(c, t, taken) then return true
+    false
+
+private has_type_params(t: &Type) -> bool = *t match
+    TypeVar(_, _, _) -> true
+    Tuple(items) -> any_type_params(items)
+    Function(params, result, _) -> any_type_params(params) || has_type_params(result)
+    Data(_, _, args) -> any_type_params(args)
+    Class(_, _, args) -> any_type_params(args)
+    Union(members) -> any_type_params(members)
+    _ -> false
+
+private any_type_params(items: Buf[&Type]) -> bool
+    for item in items
+        if has_type_params(item) then return true
+    false
 
 /** A type's name with an article, for a sentence: `an int`, `a Dog`. */
 private type_article(t: &Type) -> string
@@ -17330,6 +18066,16 @@ private type_article(t: &Type) -> string
 private may_match(c: *Checker, from: &Type, to: &Type) -> bool
     val x = zonk(c, from)
     val y = zonk(c, to)
+    // A union may hold a value of a type where one of its members may; a value may be a union's
+    // value where it may be one of its members.
+    if *x is Union(xs)
+        for m in xs
+            if may_match(c, m, y) then return true
+        return false
+    if *y is Union(ys)
+        for m in ys
+            if may_match(c, x, m) then return true
+        return false
     if fits(c, x, y) || *x is AnyType || *x is TypeVar(_, _, _) || *y is TypeVar(_, _, _) then return true
     // A value of a generic type may be an instance whose arguments are subtypes of the static ones,
     // or, for a contravariant parameter, supertypes.

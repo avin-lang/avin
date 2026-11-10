@@ -11,6 +11,8 @@ mir_type(t: &Type) -> Option[MirType] = *t match
     Unit -> None
     Nothing -> None
     AnyType -> Some(MRef)
+    // A union is laid out as an `Any` holding its member.
+    Union(_) -> Some(MRef)
     Bool -> Some(MBool)
     Str -> Some(MRef)
     Int(bits) -> Some(MInt(bits))
@@ -1197,6 +1199,7 @@ private holds_handles(l: *Lowering, t: &Type, seen: *Buf[string]) -> bool
         Function(_, _, _) -> true
         ByName(_) -> true
         AnyType -> true
+        Union(_) -> true
         TypeVar(_, _, _) -> true
         _ -> false
 
@@ -1512,8 +1515,8 @@ private closure_type(l: *Lowering, function: usize, type_args: Buf[&Type]) -> &T
     val owner = l.program.symbols[symbol.root.unwrap_or(function)].type_owner
     var params: Buf[&Type] = buf()
     for p in symbol.params
-        params.push(substitute(solve(l.program.vars, p), owner, type_args))
-    Function(params, substitute(solve(l.program.vars, symbol.result.unwrap_or(Unit)), owner, type_args), false)
+        params.push(erase_unions(substitute(solve(l.program.vars, p), owner, type_args)))
+    Function(params, erase_unions(substitute(solve(l.program.vars, symbol.result.unwrap_or(Unit)), owner, type_args)), false)
 
 // The type arguments of the copy of `symbol` a call or a function value in the instance being
 // lowered reaches. A local function without type parameters of its own shares those of the code it
@@ -1532,9 +1535,11 @@ private instance_args(l: *Lowering, symbol: FunctionSymbol, type_args: Buf[&Type
         for i in 0..<shared
             prefix.push(l.subst[i])
         return prefix
+    // A union type argument is kept, so a type pattern naming the parameter tests its members; the
+    // copy lays the union out as an `Any`, as every type made concrete in it is.
     var out: Buf[&Type] = buf()
     for t in type_args
-        out.push(concrete(l, t))
+        out.push(written_concrete(l, t))
     out
 
 // How many type parameters are in scope where local function `symbol` of `root` is declared: the
@@ -1906,8 +1911,12 @@ private bind_local(l: *Lowering, x: usize, value: Option[Operand])
     l.insts.push(Publish)
     store(l, l.local_slots[x], Some(Value(box)))
 
-/** A type of the code being lowered, with the instance's type arguments substituted. */
-private concrete(l: *Lowering, t: &Type) -> &Type = substitute(solve(l.program.vars, t), l.subst_owner, l.subst)
+/** A type of the code being lowered, with the instance's type arguments substituted. A union is laid
+ * out as an `Any` holding its member, so lowering sees every union as `Any`. */
+private concrete(l: *Lowering, t: &Type) -> &Type = erase_unions(substitute(solve(l.program.vars, t), l.subst_owner, l.subst))
+
+/** `t` in the instance being lowered, with its unions kept: what a type pattern naming a union tests. */
+private written_concrete(l: *Lowering, t: &Type) -> &Type = substitute(solve(l.program.vars, t), l.subst_owner, l.subst)
 
 private machine(l: *Lowering, t: &Type) -> Option[MirType] = mir_type(concrete(l, t))
 
@@ -4405,6 +4414,7 @@ private held_by_value(atomic: &Type) -> bool = *atomic match
             Tuple(_) -> true
             Data(_, _, _) -> true
             AnyType -> true
+            Union(_) -> true
             _ -> false
     _ -> false
 
@@ -5173,6 +5183,47 @@ private lower_is(l: *Lowering, value: &TExpr, pattern: &TPattern, negated: bool)
     finish_into(l, Jump(join), join)
     load(l, slot)
 
+// Continues where `value`, of static type `from`, has type `to` at run time; otherwise goes to `fail`.
+// A union `to`, with its unions kept, is had where one of its members is.
+private member_test(l: *Lowering, from: &Type, to: &Type, value: Option[Operand], fail: usize)
+    if *to is Union(members)
+        val matched = new_block(l)
+        for m in members
+            val next = new_block(l)
+            member_test(l, from, m, value, next)
+            finish(l, Jump(matched))
+            l.current = next
+        finish(l, Jump(fail))
+        l.current = matched
+        return
+    val target = erase_unions(to)
+    if always_is(l, from, target) then return
+    if *from is AnyType || *from is Class(_, _, _) || *from is Tuple(_) || *from is Data(_, _, _) || *from is Function(_, _, _)
+        if value is Some(v)
+            val object = if pointer_option(l, from) then option_object(l, from, v) else v
+            continue_if(l, type_test(l, object, target), fail)
+    else continue_if(l, ConstBool(false), fail)
+
+// A pattern on a union value: each part is tried in turn, on the member its type names, taken out
+// of the `Any` the union is laid out as. Where the instance being lowered made the union one of its
+// members, the value is that member already.
+private test_union(l: *Lowering, p: &TPattern, parts: Buf[&TPattern], value: Option[Operand], fail: usize)
+    val from = concrete(l, p.ty)
+    val matched = new_block(l)
+    for part in parts
+        val next = new_block(l)
+        val member = written_concrete(l, part.ty)
+        val to = concrete(l, part.ty)
+        var v = value
+        member_test(l, from, member, value, next)
+        if *from is AnyType && !(*to is AnyType)
+            if value is Some(x) then v = unbox(l, to, x)
+        test_pattern(l, part, v, next)
+        finish(l, Jump(matched))
+        l.current = next
+    finish(l, Jump(fail))
+    l.current = matched
+
 // Tests `value` against a pattern, binding its names, and continues where it matched; a failed
 // test goes to `fail`. A unit value has no runtime value, and every unit pattern matches it.
 private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: usize)
@@ -5207,8 +5258,14 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
                 finish(l, Jump(matched))
                 l.current = next
             l.current = matched
-        PType(target, local, _) ->
+        PType(target, local, tested) ->
             val from = concrete(l, p.ty)
+            // A union matches where one of its members does, and binds the value as the union, laid
+            // out as an `Any`.
+            if *written_concrete(l, target) is Union(_)
+                if tested then member_test(l, from, written_concrete(l, target), value, fail)
+                if local is Some(x) then bind_local(l, x, if *from is AnyType then value else box_value(l, from, value))
+                return
             val to = concrete(l, target)
             var bound = value
             // An option kept as a pointer is the same pointer as any option it is seen as; seen as
@@ -5237,6 +5294,7 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
         PView(local, view, inner) ->
             bind_local(l, local, value)
             test_pattern(l, inner, lower_expr(l, view), fail)
+        PUnion(parts) -> test_union(l, p, parts, value, fail)
         PVariant(variant, fields) ->
             if value is Some(v)
                 // An option kept as a pointer is `None` where it is null, and otherwise the `Some`
@@ -5326,6 +5384,7 @@ private is_machine_scalar(t: &Type) -> bool = *t match
  * in the trait's shared default bodies. */
 private decided_at_run_time(l: *Lowering, t: &Type) -> bool = *t match
     AnyType -> true
+    Union(_) -> true
     TypeVar(owner, _, _) -> is_self_owner(owner)
     Class(k, _, _) -> l.program.classes[k].decl.modifier != ""
     _ -> false

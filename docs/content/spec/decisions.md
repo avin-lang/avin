@@ -5057,6 +5057,49 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- Proposed 2026-11-09 (branch `unions-core`): **Union types: the choices the core's implementation
+  made** ([union types](/spec/unions/)).
+  - **Every union is laid out as an `Any` for now, a scalar member in a box.** The chapter's
+    tag-and-payload layout for a union with a scalar member needs values of more than one machine
+    word in the compiler's intermediate code (parameters, results, fields, array elements, closure
+    captures), which nothing else in the language has; the core ships without it. The type rules stay
+    the chapter's, so programs do not change when the layout lands: `List[int]` is still no
+    `List[int | string]`, and a union of references still nests in covariant containers. *Why*: one
+    layout makes every part of the core correct now (exact roots, `-O0` and `-O2` alike, equality,
+    hashing and rendering through the `Any` machinery), at the cost of a box per scalar injected.
+    *Alternatives*: building the multi-word value first (holds every other part of the item); a single
+    tagged word (cannot hold a `long` and a pointer apart, so roots would not be exact). Review with the
+    user: the allocation per scalar injection until the layout lands.
+  - **A copy of generic code at a union type argument is a copy of its own**, so a type pattern naming
+    the parameter tests the union's members, `t: T` at `T = int | bool` taking neither a string nor
+    anything else. Through a method called by its table, the type argument is still taken as `Any`.
+    *Why*: a function's copies are keyed by their type arguments, and the union is one; a method's
+    table slot is shared by every receiver. *Alternatives*: erasing every union type argument to `Any`
+    (a `T` arm would take every value).
+  - **Members that come together through a type argument are merged when they are the same type, and
+    a member a subtype of another is kept, injection choosing the widest.** `T | int` at `T = int` is
+    `int`; `T | Animal` at `T = Dog` keeps both members in the type, and a `Puppy` given to it is the
+    `Animal`. *Why*: substitution is done where the class table is not at hand; the two forms hold the
+    same values and match the same way, and only a message names the difference. *Alternatives*:
+    absorbing subtypes at every substitution (needs the declarations at each one).
+  - **`x: int | string` in a pattern is recognized as a type pattern followed by bare names that are
+    no variants**, and reported with the parenthesized form; any other alternatives are checked as
+    written. *Why*: a bare name is a binding, which alternatives refuse anyway, so nothing legal is
+    taken from the program. *Alternatives*: deciding it in the parser (cannot tell a variant from a
+    type there).
+  - **A `|` after a type is a guard, not a union member, where the name after it is followed by an
+    operator no type is followed by** (a comparison, arithmetic, `&&`, `||`, `!`, `is`), so
+    `f(n: int) -> int | n > 0 = n` is still reported as a guard on a signature. *Why*: keeps the
+    existing clause diagnostics. *Alternatives*: refusing `|` after a result type outside brackets.
+  - **Messages the chapter left open** are those of [what is refused](/spec/unions/#what-is-refused)
+    and these: a pattern several members could match names them and suggests a type pattern; `None`,
+    `Ok(…)`, a collection literal or a lambda with several members of its kind names them and asks for
+    the type meant; a literal several numeric members fit names them and suggests a conversion, as in
+    `byte(3)`; two arguments of one type parameter that agree on no type add that a type argument is
+    never inferred as a union, with the union to write; a missing clause names the member, as in
+    `size(_: string)`. *Why*: each says what to write. *Alternatives*: the generic messages, which
+    name no member.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

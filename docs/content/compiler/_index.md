@@ -25,7 +25,9 @@ the standard library — in one run.
 
 Each stage has its own data structures and its own tests. No stage reaches back into an earlier stage's
 input. **Types are an enum over symbols, never strings**: built-in types, nominal types, functions,
-tuples, type parameters, inference variables, `Any`, `Nothing` and an error type.
+tuples, type parameters, inference variables, `Any`, `Nothing`, unions and an error type. A union is
+kept in normal form (`union_of`) and checked by its members; lowering lays it out as an `Any`
+(`erase_unions`), and a pattern on one is a `PUnion`, a part for each member it applies to.
 
 **Loading a program.** `avin build <dir>` takes a directory as the program's root: every `.avin` and
 `.lavin` file under it is read in path order, passing over directories whose names begin with `.`, and each is

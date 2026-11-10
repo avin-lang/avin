@@ -449,17 +449,19 @@ same at `-O0` and `-O2`:
   `` impl Display for int | string `` is an error: `` an `impl` names a declared type, and
   `int | string` is a union; declare a data type to give it methods ``. An alias of a union is
   refused the same way, as any alias is.
-- **A union is no parent**: a class or trait cannot list `A | B` after `:`.
-- **A union is no bound**: `[T: A | B]` is an error, since a bound is a trait; `[T >: A | B]`, a
-  lower bound, is a type and is allowed.
+- **A union is no parent**: a class or trait cannot list `A | B` after `:`: `` a union is no parent:
+  a class or trait lists a class and traits after `:`, and `A | B` is a union ``.
+- **A union is no bound**: `[T: A | B]` is an error, since a bound is a trait: `` a bound is a trait
+  or a class, and `A | B` is a union ``; `[T >: A | B]`, a lower bound, is a type and is allowed.
 - **A union does not cross a binding.** A parameter, result or field of an `@sysl` or `@c`
   declaration, or of a mirror, may not be a union: `` `int | string` cannot cross a binding: a union
   has no Sysl or C type; bind one function per member, or pass a data type ``.
 - **A field path does not go through a union** in `with { … }`: with `v: A | B`, `p with { v.x = 1 }`
-  is an error saying `v` is a union, to be taken apart first. Replacing the whole field,
+  is an error saying `v` is a union, to be taken apart with a `match` first. Replacing the whole field,
   `p with { v = 1 }`, injects as any value does.
 - **No member is reached without a test**: there is no cast, and a union is not callable as a
-  function, constructed, or used as a companion.
+  function (`` a union is not called: `((int) -> int) | string` may hold a value that is no function;
+  take it apart with a `match` first ``), constructed, or used as a companion.
 - **`derives` and annotations** have nowhere to go on a union: it is not declared, and an alias takes
   none.
 - **Intersection types** (`A & B`) are not part of Avin.
