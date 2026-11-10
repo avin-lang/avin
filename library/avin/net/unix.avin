@@ -26,13 +26,7 @@ private unixAddressRaw(path: string) -> Result[UnixAddress, SyslError]
 // `UnixStream`.
 @sysl("sysl.net.Socket", named: "UnixStream")
 private class UnixSocket
-    @sysl(blocking)
-    sendAll(bytes: Array[byte]) -> Result[unit, SyslError]
-    @sysl(blocking)
-    recv(into: Array[byte]) -> Result[long, SyslError]
     shutdown(how: Shutdown) -> Result[unit, SyslError]
-    readTimeout(ms: int) -> Result[unit, SyslError]
-    writeTimeout(ms: int) -> Result[unit, SyslError]
     // The descriptor, which is never used: calling it checks the socket belongs to the code running.
     @sysl("fd")
     held() -> Result[int, SyslError]
@@ -40,11 +34,26 @@ private class UnixSocket
 // The socket under a Unix listener. Its traps name the `UnixListener`.
 @sysl("sysl.net.UnixListener", named: "UnixListener")
 private class UnixListenSocket
-    @sysl(blocking)
-    accept() -> Result[UnixSocket, SyslError]
     // The descriptor, which is never used: calling it checks the socket belongs to the code running.
     @sysl("fd")
     held() -> Result[int, SyslError]
+
+// A Unix socket waits as a TCP one does: it is non-blocking, and a wait parks a lightweight thread on
+// the runtime's poller.
+@sysl("avin.rt.socket_send_all")
+private unixSendAll(s: UnixSocket, bytes: Array[byte], limitMs: int) -> Result[unit, SyslError]
+
+@sysl("avin.rt.socket_recv")
+private unixRecv(s: UnixSocket, into: Array[byte], limitMs: int) -> Result[long, SyslError]
+
+@sysl("avin.rt.socket_non_blocking")
+private unixNonBlocking(s: UnixSocket) -> Result[unit, SyslError]
+
+@sysl("avin.rt.unix_accept")
+private unixAcceptOn(s: UnixListenSocket) -> Result[UnixSocket, SyslError]
+
+@sysl("avin.rt.unix_listener_non_blocking")
+private unixListenerNonBlocking(s: UnixListenSocket) -> Result[unit, SyslError]
 
 @sysl("sysl.net.unix_listen")
 private unixListenRaw(at: UnixAddress, backlog: int) -> Result[UnixListenSocket, SyslError]
@@ -58,7 +67,8 @@ private addressAt(path: string) -> Result[UnixAddress, IoError] = unixAddressRaw
 // A connection to a program listening at a path, made by `UnixStream.connect` or a listener's
 // `accept`. It reads and writes as a `TcpStream` does: bytes `readLine` reads beyond its line are
 // kept for the next read, and a connection handed to another thread or actor takes them with it.
-class UnixStream(private val conn: UnixSocket, private val buffered: ReadAhead, private var closed: bool): Sendable
+class UnixStream(private val conn: UnixSocket, private val buffered: ReadAhead, private var closed: bool,
+                 private var limitMs: int): Sendable
     // Up to `max` bytes, waiting for at least one; an empty array once the other end has finished
     // sending. `max` is at least one.
     read(max: int) -> Result[Array[byte], IoError]
@@ -84,7 +94,7 @@ class UnixStream(private val conn: UnixSocket, private val buffered: ReadAhead, 
     write(bytes: Array[byte]) -> Result[unit, IoError]
         mine()
         if closed then return Err(closedError())
-        conn.sendAll(bytes).mapErr(ioError)
+        unixSendAll(conn, bytes, limitMs).mapErr(ioError)
 
     // Sends `text` as UTF-8.
     writeText(text: string) -> Result[unit, IoError] = write(utf8Of(text))
@@ -94,9 +104,8 @@ class UnixStream(private val conn: UnixSocket, private val buffered: ReadAhead, 
     setTimeout(d: Duration) -> Result[unit, IoError]
         mine()
         if closed then return Err(closedError())
-        val ms = millisOf(d)
-        conn.readTimeout(ms).mapErr(ioError)?
-        conn.writeTimeout(ms).mapErr(ioError)
+        limitMs = millisOf(d)
+        Ok(())
 
     // Tells the other end nothing more will be sent; reading goes on.
     shutdownOutput() -> Result[unit, IoError]
@@ -118,7 +127,7 @@ class UnixStream(private val conn: UnixSocket, private val buffered: ReadAhead, 
     // Up to `max` bytes from the connection itself.
     private received(max: int) -> Result[Array[byte], IoError]
         val into = Array.fill(max, byte(0))
-        val n = conn.recv(into).mapErr(ioError)?
+        val n = unixRecv(conn, into, limitMs).mapErr(ioError)?
         Ok(if n == long(max) then into else into.slice(0, int(n)))
 
 object UnixStream
@@ -127,7 +136,12 @@ object UnixStream
     connect(path: string) -> Result[UnixStream, IoError]
         val at = addressAt(path)?
         unixConnectRaw(at) match
-            Ok(c) -> Ok(UnixStream(c, ReadAhead(Array.empty[byte](), 0), false))
+            Ok(c) ->
+                unixNonBlocking(c) match
+                    Ok(_) -> Ok(UnixStream(c, ReadAhead(Array.empty[byte](), 0), false, 0))
+                    Err(e) ->
+                        c.close()
+                        Err(ioError(e))
             Err(e) -> Err(if fs.exists(path) then ioError(e) else io.NotFound)
 
 // A socket listening for connections at a path, made by `UnixListener.bind`. Like a connection, it may
@@ -143,8 +157,8 @@ class UnixListener(private val conn: UnixListenSocket, private val at: string, p
     accept() -> Result[UnixStream, IoError]
         mine()
         if closed then return Err(io.Other("the listener is closed"))
-        conn.accept() match
-            Ok(c) -> Ok(UnixStream(c, ReadAhead(Array.empty[byte](), 0), false))
+        unixAcceptOn(conn) match
+            Ok(c) -> Ok(UnixStream(c, ReadAhead(Array.empty[byte](), 0), false, 0))
             Err(e) -> Err(ioError(e))
 
     // Stops listening; closing again does nothing. An `accept` afterwards answers an error.
@@ -166,7 +180,12 @@ object UnixListener
     bind(path: string) -> Result[UnixListener, IoError]
         val a = addressAt(path)?
         unixListenRaw(a, 128) match
-            Ok(c) -> Ok(UnixListener(c, path, false))
+            Ok(c) ->
+                unixListenerNonBlocking(c) match
+                    Ok(_) -> Ok(UnixListener(c, path, false))
+                    Err(e) ->
+                        c.close()
+                        Err(ioError(e))
             Err(e) -> Err(if fs.exists(path) then io.AlreadyExists else ioError(e))
 
     // Listens at `path`, first clearing a socket file left behind by a program that is gone: where
