@@ -443,6 +443,20 @@ never returns. It is a subtype of every type, and an expression of type `Nothing
 value. An empty collection literal or `None` does **not** have a `Nothing` type argument; its type
 comes from context (see [inference](/spec/generics/#inference)).
 
+## Union types
+
+`A | B` is a value of `A` or of `B`, written in annotations and never inferred, made at a single
+site as an `Any` is, and taken apart by a `match` that covers every member. `?` uses it to pass on
+errors of several types: a function yielding `Result[T, IoError | ParseError]` may `?` either kind.
+`|` binds more tightly than `->`, so `(A) -> B | C` returns a union. The rules are in their own
+chapter, [union types](/spec/unions/).
+
+```text
+describe(x: int | string) -> string = x match
+    n: int -> s"number $n"
+    s: string -> s"text $s"
+```
+
 ## Reference types and value types
 
 Class instances, `object`s, arrays, buffers, closures and boxes are **reference types**: they live on

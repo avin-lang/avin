@@ -39,6 +39,7 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
 | [Types](/spec/types/) | Built-in types, numbers, strings, tuples, functions, `Any`/`Nothing` |
 | [Declarations](/spec/declarations/) | Names in any script, `data`, `class`, `trait`, `object`, `impl`, members, modules, initialization |
 | [Generics and inference](/spec/generics/) | Reification, bounds, variance, type tests, local inference |
+| [Union types](/spec/unions/) | Unions written in annotations: syntax, normal form, injection at a single site, `match` by type, `?` combining errors, layout |
 | [Equality, identity and memory](/spec/equality-and-memory/) | `==`, `===`, hashing, display, values vs references, GC |
 | [Threads](/spec/threads/) | Starting and joining, sharing, synchronization, the memory model |
 | [Actors and state machines](/spec/actors/) | `actor` and `machine` declarations, typed messages and `Sendable`, `tell` and `ask`, supervision, lifecycle, scheduling, states and transitions |

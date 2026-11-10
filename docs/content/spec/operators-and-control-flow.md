@@ -516,7 +516,8 @@ expression, checked for exhaustiveness. Patterns include:
   (`first :: second :: rest`);
 - [sequence patterns](/spec/collections/#sequence-patterns): `[]` matches an empty sequence and
   `[a, b]` a sequence of exactly two elements;
-- type patterns (`d: Dog`, `_: Dog`);
+- type patterns (`d: Dog`, `_: Dog`), which also take a [union](/spec/unions/#match) apart, member
+  by member; a union in a type pattern is parenthesized, `x: (int | string)`;
 - alternatives (`1 | 2 | 3`), which bind no names and may continue across lines with a leading or
   trailing `|`;
 - named patterns (`whole @ Some(x)`);

@@ -227,7 +227,9 @@ ordinary recursion: it compiles, and its derived and structural methods have one
 - both are function types, with parameters contravariant and results covariant;
 - both are instances of one generic type and each argument follows its declared variance (below);
 - `T` is a type parameter with a [lower bound](#lower-bounds) that `S` is, or is a subtype of as a
-  covariant part is.
+  covariant part is;
+- `T` is a [union](/spec/unions/#subtyping) with a member `S` is a subtype of, or `S` is a union
+  each of whose members is a subtype of `T`.
 
 A value type is never a subtype of a trait or of `Any` without conversion. A value converts to a trait
 type or `Any` by **boxing at a single site**, such as an argument or an assignment. Boxing never
@@ -420,7 +422,8 @@ leading prefix with the rest inferred.
 ## Scope of the type system
 
 The type system stays small: generics with bounds, subtyping with declaration-site variance, and
-traits implemented through `impl`. It has no higher-kinded types, type members, union or
-intersection types, implicit parameters, implicit conversions or macros. The
+traits implemented through `impl`, and [union types](/spec/unions/) written in annotations. It has
+no higher-kinded types, type members, inferred unions, intersection types, implicit parameters,
+implicit conversions or macros. The
 [collections chapter](/spec/collections/) shows how the library gets precise result types with
 these tools alone.

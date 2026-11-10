@@ -503,6 +503,14 @@ a decision changes, this page and the chapter change together.
   syntax error suggesting the whole field; values are read against the leaf field's type; the base
   is evaluated first, then the values left to right; an unknown field is reported with the nearest
   one. `with` is a keyword only after an operand and before `{`, binding as a postfix tail.
+- Settled by the user 2026-11-09 ("union types are great"): **limited union types**
+  ([union types](/spec/unions/)). (1) A union `A | B` is written only in annotations: parameters,
+  results, `val`s, fields, type arguments and aliases (`type Num = int | long`). (2) It is never
+  inferred: the branches of an `if` or a `match` join as before. (3) It compiles to an anonymous
+  tagged sum. (4) `match` takes it apart by type pattern, exhaustively: a member left uncovered is an
+  error, and `_` is allowed. (5) `?` combines distinct error types into a union: a function returning
+  `Result[T, IoError | ParseError]` may `?` a `Result[_, IoError]` and a `Result[_, ParseError]`.
+  Intersection types stay deferred. The further rules are under [Proposed](#proposed).
 
 **Project and tooling**
 
@@ -4956,9 +4964,98 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 **Deferred**
 
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
 
 ## Proposed
+
+- **Union types: the rules beyond the user's five points** (branch `unions-design`;
+  [union types](/spec/unions/)).
+  - **Precedence: `|` binds tighter than `->` and looser than everything else in a type**, so
+    `(A) -> B | C` returns a union and a union of functions parenthesizes each. *Why*: a function
+    returning one of several results is far more common than a union with a function member, and
+    `->` is already the loosest type operator. *Alternatives*: `|` looser than `->` (makes the
+    common case need parentheses); refusing the unparenthesized form (noisy).
+  - **A union in a type pattern is parenthesized**, `x: (int | string) ->`; a `|` in a pattern is
+    always an alternative, and `x: int | string` is reported with the parenthesized form. *Why*: it
+    keeps one meaning for `|` in patterns, as function types already need parentheses there.
+    *Alternatives*: parsing a type after `:` greedily (makes `_: A | _: B` mean something else).
+  - **Normal form: flatten, order irrelevant, a member that converts to another member (by subtyping
+    or boxing into a trait or `Any`) absorbed, `Nothing` absorbed, one member is that member. Written
+    by hand, a duplicate, absorbed or `Nothing` member is an error naming the type to write; arising
+    through an alias or type argument it is absorbed silently.** *Why*: `T | int` at `T = int` and
+    `T | Animal` at `T = Dog` must compile, while `Dog | Animal` written out is almost certainly a
+    mistake. Absorbing by conversion rather than subtyping alone keeps every injection unambiguous
+    (`int | Display` would otherwise leave an `int` two homes). *Alternatives*: keep subsumed members
+    distinct (two homes for one value, an ambiguity on every injection); refuse at instantiation too
+    (breaks generic code); silently absorb written duplicates (hides mistakes). Review with the user:
+    whether written duplicates should be errors or warnings.
+  - **Inference carries a union it is given and never forms one**: `val u2 = u` is the union; a
+    union and its member join to the union; `T` in `x: T | string` takes the members the argument
+    leaves over (`orText(u)` with `u: int | bool | string` gives `T = int | bool`); a member argument
+    decides no `T`. *Why*: anything less makes unions unusable in generic code; forming one would be
+    the inference the user ruled out. *Alternatives*: refusing to solve `T` against a union (forces
+    explicit type arguments everywhere).
+  - **Injection at a single site, like boxing**: a member's own type first, else the one member it
+    converts to, several an error naming them; a literal takes its default type where that is a
+    member, else the one numeric member it fits; `None`/`Ok(x)`/an empty literal go to the one member
+    that is an instance of their type. *Why*: mirrors how a value becomes an `Any`, and never guesses.
+    *Alternatives*: choosing the first member written (order would then matter, contradicting the
+    normal form).
+  - **Overloads**: a member type is more specific than a union containing it; a union more specific
+    than a type every member converts to; a union argument never chooses among member overloads (an
+    error suggesting a `match`). *Why*: overloads are resolved statically (settled 2026-11-02).
+    *Alternatives*: generating a dispatch `match` over member overloads (dynamic overloading, which
+    the language does not have).
+  - **A named function is adapted where written** to a function type whose parameters inject into its
+    union parameters (`val f: (int) -> string = describe`); a function value already made is not.
+    *Why*: the same single-site rule as `@sendable` references. *Alternatives*: always requiring a
+    lambda (a contortion for the common case).
+  - **Representation: a union whose members are all types an `Any` holds without a box is laid out
+    as an `Any` (one pointer, the header as the tag); one with a scalar member is a tag, a bits slot
+    and, if any member is a reference, a separate pointer slot.** Consequently variance through
+    containers holds exactly where the layouts agree: `List[Dog] <: List[Dog | Cat]`,
+    `Result[T, IoError] <: Result[T, IoError | ParseError]`, but not `List[int] <: List[int | string]`.
+    Tag numbering follows the normal form, and the layout is decided before optimization, so -O0 and
+    -O2 agree. *Why*: reference unions cost nothing over `Any` and keep `?`'s common case free;
+    scalar unions avoid an allocation per value; the separate pointer slot keeps the collector's
+    roots exact. *Alternatives*: every union boxed as an `Any` (simplest, but `int | long` allocates);
+    every union a tag-and-payload value (no variance through containers, a conversion for every
+    `Result` of a wider error); one overlapping payload word (needs tag-aware root scanning).
+    Review with the user: the variance consequence is visible to programs.
+  - **`match`**: type patterns, supertypes and sub-unions cover members; any other pattern applies to
+    the one member it can match (`0` and `n < 0` on an `int | string` reach the int), and one more than
+    one member could match is an error; a type pattern naming no member is an error; in generic code
+    the `match` is checked as written and, at an instance where members come together, the first arm
+    in order wins. *Why*: lets literals and constructors reach their member without a nested
+    `match`, without guessing. *Alternatives*: type patterns only, as on an `Any` (verbose).
+  - **`is` binds, it does not narrow**: `v` keeps its union type after `if v is _: string`; the
+    pattern binds a name. *Why*: the settled `is` scoping (2026-11-03) has no flow-sensitive typing,
+    and unions should not introduce it. *Alternatives*: flow narrowing of the tested variable
+    (a new, language-wide mechanism). Review with the user.
+  - **What a union can do**: `==` and hashing as two `Any`s holding the values; `===` only where every
+    member is a class or function type; a union conforms to a trait every member conforms to whose
+    methods take `Self` only as receiver (`Display`, `Debug`, `Hash`, a library `JsonEncoder`), plus
+    `Eq` and `Sendable` member-wise, never `Ord`; a member call is looked up on the members' join and
+    on those traits, ambiguity an error. *Why*: printing, hashing and calling a shared superclass
+    method are what a union is used for; `Ord` would need an order between members that order-free
+    unions cannot give. *Alternatives*: refusing every member call (forces a `match` just to call a
+    method every member has); any method name every member has, structurally (breaks the nominal
+    principle, and its result would be an inferred union). Review with the user.
+  - **`?` with unions**: (1) `E` converting to `F` (a member, a member's subtype, a union of members)
+    passes on unchanged; (2) for a union `F`, the one member implementing `From[E]` converts; (3) for a
+    union `E` and a plain `F`, each member converts on its own; (4) otherwise `F.from(e)` as before.
+    `?` never adds a member. *Why*: unions replace hand-written wrapper error types without breaking
+    the `From` rule existing code relies on. *Alternatives*: a union `F` consulting no `From` (loses
+    the bridge from wrapper errors); inferring the error union from the `?`s in the body (the
+    inference the user ruled out).
+  - **Refused**: `impl` or extension on a union; a union as a parent or as an upper bound (a lower
+    bound is allowed); a union across `@sysl`/`@c` declarations and mirrors; a `with { … }` field path
+    through a union field; casts, calls and construction of a union. *Why*: each needs a declared
+    type or a C/Sysl layout a union does not have. *Alternatives*: shims that pass a tag and payload
+    across a binding (no Sysl or C library takes one).
+  - **Chapter**: a chapter of its own, `spec/unions.md`, linked from types, generics, errors and
+    `match`. *Alternatives*: a section of types.md (too long for one section).
 
 ## Open
 

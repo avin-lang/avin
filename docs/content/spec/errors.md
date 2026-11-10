@@ -79,6 +79,11 @@ function yielding errors of `F`:
   than every other: an error of a subclass converts through its superclass's.
 - **No conformance is an error** naming the one missing, `From[E]`; several equally specific are an
   error naming them.
+- **A union of errors needs no wrapper type.** "`E` is an `F`" includes `E` being a member of a
+  union `F`, or a union whose members are all members of `F`; where `F` is a union, the one member
+  implementing `From[E]` converts it; where `E` is a union and `F` is not, each member converts on
+  its own. So `load(path) -> Result[Config, IoError | ParseError]` may `?` a `Result[_, IoError]` and a
+  `Result[_, ParseError]`. The full rule is in [union types](/spec/unions/#errors-and).
 - **A type parameter converts through its bounds**: in
   `load[F: From[IoError] + From[ParseError]](path: string) -> Result[Doc, F]`, both errors convert,
   and each instance calls its type argument's `from`.
