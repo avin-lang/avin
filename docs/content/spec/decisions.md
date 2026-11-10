@@ -4811,13 +4811,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   clash, as a class's name clashes with a function's because the class's name is also its
   constructor, which an alias is not.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
-- Proposed (branch `derives-enumerable`): **`Enumerable` is a core library trait derived through an
+- Settled on the user's delegation 2026-11-09 (branch `derives-enumerable`): **`Enumerable` is a core library trait derived through an
   ordinary template** (`library/avin/enumerable.avin`), its members `static values() ->
   Vector[Self]`, `ordinal() -> int`, `name() -> string` and `static valueOf(name: string) ->
   Option[Self]`; the compiler's only part is who may derive it. Why: the template mechanism already
@@ -4826,34 +4820,40 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   weighed: members the compiler writes out per type (a constant vector made once, faster
   `values()`, but a second derivation path beside the templates); an `enum` keyword (new syntax for
   what a data type already is).
-- Proposed (branch `derives-enumerable`): **`values()` is a `Vector`, made anew at each call**.
+- Settled on the user's delegation 2026-11-09 (branch `derives-enumerable`): **`values()` is a `Vector`, made anew at each call**.
   Why: `Vector` is the library's default sequence, what a literal `[a, b]` makes; a template has
   no per-type storage to keep one in, and the vector is immutable, so a fresh one is
   indistinguishable from a kept one except in cost (O(variants) per call). Alternatives weighed:
   `Array` (mutable, so it would have to be copied anyway); `List`; an iterator (cannot be indexed
   by `ordinal()`). Review with the user if `values()` turns up in a hot loop: a compiler-kept
   constant would make it free.
-- Proposed (branch `derives-enumerable`): **`name()` is part of `Enumerable`, separate from
+- Settled on the user's delegation 2026-11-09 (branch `derives-enumerable`): **`name()` is part of `Enumerable`, separate from
   `Display`**. Why: `Display` can be replaced by an impl, so it cannot be the inverse of
   `valueOf`; `name()` always is, `T.valueOf(x.name()) == Some(x)`. Alternatives weighed: reusing
   `toString()`/`Display` (breaks the round trip once `Display` is customised); a `static
   names()` (redundant with `values().map(v -> v.name())`). A type's own method named `name`
   then clashes, reported as two methods of one name; review with the user if that proves common.
-- Proposed (branch `derives-enumerable`): **`valueOf` matches the declared name exactly, byte for
+- Settled on the user's delegation 2026-11-09 (branch `derives-enumerable`): **`valueOf` matches the declared name exactly, byte for
   byte, answering `Option`**. Why: exact is predictable and cheap, and a program wanting another
   rule (case-insensitive, trimmed) writes it over `values()` and `name()`. Alternatives weighed: a
   trapping `valueOf` (the library answers input that may be wrong with `Option`, as
   `toIntOption` does); case-insensitive matching (ambiguous where two variants differ only in case).
-- Proposed (branch `derives-enumerable`): **a generic data type cannot derive `Enumerable`, even
+- Settled on the user's delegation 2026-11-09 (branch `derives-enumerable`): **a generic data type cannot derive `Enumerable`, even
   when every variant has no fields** (`data Tag[A]` with `X | Y`). Why: a derived impl of a
   generic type bounds each parameter by the trait (`impl[A: Enumerable]`), which means nothing for
   a phantom parameter, and `Tag.values()` would need a type argument nobody can infer. A
   parameterless enumeration is what such code wants. Alternative weighed: allowing it with
   unbounded parameters, `Tag[int].values()`, a special case in how templates are applied.
-- Proposed (branch `derives-enumerable`): **only data types derive it; a class (an object cannot
+- Settled on the user's delegation 2026-11-09 (branch `derives-enumerable`): **only data types derive it; a class (an object cannot
   write `derives`) is refused even without constructor parameters**. Why: a class instance has
   identity, so `values()` would make a new instance per call, unequal to the last. Alternative
   weighed: allowing a class of no parameters as an enumeration of one.
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
