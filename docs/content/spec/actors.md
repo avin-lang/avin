@@ -361,27 +361,37 @@ thread the runtime starts with the first timer keeps every actor's timers.
 
 ## Scheduling
 
-**Actors are many; threads are few.** Every actor runs on an `Executor`'s workers, by default the
-shared pool `Future(body)` uses, with one worker per processor:
+**Actors are many; threads are few.** An actor's messages are handled in **turns**, and each turn
+is a [lightweight thread](/spec/threads/#lightweight-threads) of its own, run by the same workers,
+about one per processor, as every other thread. An actor given an executor,
+`spawn(b, executor = Executor.fixed(1))`, runs its turns as tasks on that executor's workers
+instead, which bounds how many of them work at once:
 
-- **An actor with messages is one task.** A send to an actor with an empty mailbox queues the actor
-  on its executor; a worker takes it and handles its messages one at a time. **An actor never runs
-  on two threads at once**, and the handling of each message happens before the handling of the
-  next, wherever each runs, so an actor's fields need no lock and no `Atomic`.
-- **Fairness.** A worker handles at most 16 messages of one actor before putting the actor at the
-  back of the queue, so a busy actor cannot hold a worker from the others. Within one message there
-  is no preemption: an arm that computes for a second holds its worker for that second.
+- **An actor with messages has one turn queued.** A send to an actor with an empty mailbox queues a
+  turn, which handles its messages one at a time. **An actor never runs two turns at once**, not
+  even while a turn is parked and new messages arrive meanwhile, and the handling of each message
+  happens before the handling of the next, wherever each runs, so an actor's fields need no lock
+  and no `Atomic`.
+- **Fairness.** A turn handles at most 16 messages before the actor's next turn goes to the back of
+  the queue, so a busy actor cannot hold a worker from the others. Within one message, a turn is
+  time-sliced as any thread is: one that computes for a second shares its worker with the other
+  ready threads at its safepoints, though the actor itself handles nothing else meanwhile. On an
+  executor of its own, a task is not set aside, so an arm that computes for a second holds that
+  executor's place for that second.
   The body runs in the actor's first turn and is not one of the 16; a turn ends early when the
   mailbox is empty. An actor's executor being shut down does not end it: its turns still run there,
   on a worker started for them where none is left, so `tell` never fails.
-- **An actor may move between threads between messages.** Before handling an actor's messages, the
-  worker sets its context's owner word to the actor, so the handles an actor owns are its own on any
-  worker and never trap. `spawn` gives the actor the handles its behaviour reaches that the
+- **An actor may move between workers**, between messages and, where a turn parks, within one. A
+  turn sets its context's owner word to the actor before handling its messages, so the handles an
+  actor owns are its own on any worker and never trap. `spawn` gives the actor the handles its behaviour reaches that the
   spawning code owns, as a thread's `spawn` does with its body.
-- **Waiting.** An actor that waits, in `await`, a [blocking binding](/spec/sysl-bindings/#calls-that-wait)
-  or `threads.blocking(body)`, holds its worker, and the pool starts another in its place while it
-  waits, as it does for any waiting future, so the other actors keep running. An actor that waits
-  most of the time is better given an executor of its own: `spawn(b, executor = Executor.fixed(1))`.
+- **Waiting.** A turn that waits, in `await`, an ask, a `sleep`, a channel or a lock, parks: its
+  worker runs other actors and threads meanwhile, and the actor handles no other message until the
+  turn goes on. A thousand actors each sleeping in a turn hold no worker between them. A
+  [blocking binding](/spec/sysl-bindings/#calls-that-wait) holds its worker, and the runtime runs
+  another worker in its place while it does. On an executor of its own, a task that waits in `await`
+  or `threads.blocking(body)` leaves its place to another worker of that executor, and one that
+  waits otherwise keeps it.
 - **Memory model.** A `tell` happens before the handling of the message it sent, and a reply's
   `tell` happens before the `await` or `pipeToSelf` that delivers it, joining the edges of
   [the memory model](/spec/threads/#the-memory-model).
@@ -390,8 +400,8 @@ shared pool `Future(body)` uses, with one worker per processor:
 
 Actors are built on `avin.threads` and live beside it. Any thread may start, tell and ask actors;
 an ask is a future, and a future's value reaches an actor by `pipeToSelf`. A `Channel` is the tool
-for a fixed pipeline of threads, and an actor that receives from a channel holds its worker while
-it waits, so between actors, messages are the channel. Locks remain for the state that genuinely
+for a fixed pipeline of threads, and an actor that receives from a channel parks its turn and
+handles nothing else while it waits, so between actors, messages are the channel. Locks remain for the state that genuinely
 must be shared; a `Mutex` is sendable for that reason.
 
 ## State machines

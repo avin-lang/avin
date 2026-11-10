@@ -1,0 +1,39 @@
+// expect: exit 0
+// Threads are time-sliced even while the only timer pending is far off: with a thread asleep for two
+// minutes, or parked in a timed wait of two minutes, and every worker idle for a moment, threads that
+// then start spinning, more of them than there are workers, still yield at their safepoints, so the
+// thread that stops them runs within moments rather than when the far timer falls due. The test's
+// time limit is under the two minutes, so a scheduler that waited for the timer fails it.
+import avin.threads.{Atomic, Channel, Mutex, Promise, sleep, spawn}
+import avin.time
+
+// Starts 64 threads that wait for `go`, then spin until a flag is set, then a thread that sets it,
+// and answers how many stopped.
+spinRound() -> int
+    val flag = Atomic[bool](false)
+    val go = Promise[unit]()
+    val spun = Channel[int]()
+    for _ in 0..<64 do spawn(() ->
+        go.future.await()
+        var spins: long = 0
+        while !flag.load() do spins += 1
+        spun.send(1))
+    // Every worker goes idle, so the scheduler rests until its next timer.
+    sleep(time.millis(30))
+    go.complete(())
+    spawn(() -> flag.store(true))
+    var stopped = 0
+    for _ in 0..<64 do stopped += spun.receive().get()
+    stopped
+
+main()
+    // A thread asleep for two minutes holds the only timer.
+    spawn(() -> sleep(time.seconds(120)))
+    println(spinRound())
+    // A timed wait of two minutes holds it too, beside the sleep.
+    val m = Mutex(0)
+    val c = m.condition()
+    spawn(() -> m.with(_ ->
+        c.waitFor(time.seconds(120))
+        ()))
+    println(spinRound())

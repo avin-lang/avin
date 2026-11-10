@@ -1,0 +1,94 @@
+// expect: exit 0
+// A turn that parks and then traps fails its actor as any trap in a turn does: with `Stop` the actor
+// ends, the message told while the turn was parked dropped and its `stopping` block run; with
+// `Restart` it starts again with fresh state and handles the message told while the turn was parked.
+// An actor stopped while its turn is parked finishes the message it is handling, then ends without
+// handling what was told meanwhile; it has not ended while the turn is still parked.
+import avin.actors.{ActorRef, Restart, Stop, spawn}
+import avin.threads.{Channel, Promise}
+import avin.time
+
+data Msg
+    Wait(release: Channel[int])
+    WaitThenTrap(release: Channel[int])
+    Add(n: int)
+    Get(reply: Promise[int])
+
+actor Holder(label: string, log: Channel[string]) receives Msg
+    var count = 0
+    log.send(s"$label starts")
+    receive
+        Wait(release) ->
+            log.send(s"$label waiting")
+            release.receive()
+            log.send(s"$label done waiting at $count")
+        WaitThenTrap(release) ->
+            log.send(s"$label waiting")
+            release.receive()
+            count = count / (count - count)
+        Add(n) -> count += n
+        Get(reply) -> reply.complete(count)
+    stopping
+        log.send(s"$label stopping at $count")
+
+data Order
+    Start(release: Channel[int], reply: Promise[ActorRef[Msg]])
+    StopKid
+    Ping(reply: Promise[unit])
+
+actor Parent(log: Channel[string]) receives Order
+    var kid: Option[ActorRef[Msg]] = None
+    receive
+        Start(release, reply) ->
+            val k = spawn(Holder("C", log))
+            k.tell(Add(3))
+            k.tell(Wait(release))
+            kid = Some(k)
+            reply.complete(k)
+        StopKid -> if kid is Some(k) then stop(k)
+        Ping(reply) -> reply.complete(())
+
+// Prints the next `n` entries of the log.
+show(log: Channel[string], n: int) = for _ in 0..<n do println(log.receive().get())
+
+main()
+    val log = Channel[string]()
+    // Stop: parked, then trapped; the message told meanwhile is dropped.
+    val a = spawn(Holder("A", log), onFailure = Stop)
+    val ra = Channel[int]()
+    a.tell(Add(1))
+    a.tell(WaitThenTrap(ra))
+    show(log, 2)
+    a.tell(Add(5))
+    ra.send(1)
+    println(a.ended().await())
+    show(log, 1)
+    // Restart: parked, then trapped; the message told meanwhile is handled by the fresh state.
+    val b = spawn(Holder("B", log), onFailure = Restart(3, time.seconds(60)))
+    val rb = Channel[int]()
+    b.tell(Add(2))
+    b.tell(WaitThenTrap(rb))
+    show(log, 2)
+    b.tell(Add(7))
+    rb.send(1)
+    val got = Promise[int]()
+    b.tell(Get(got))
+    println(got.future.await())
+    show(log, 2)
+    // Stopped by its parent while its turn is parked.
+    val p = spawn(Parent(log))
+    val rc = Channel[int]()
+    val made = Promise[ActorRef[Msg]]()
+    p.tell(Start(rc, made))
+    val c = made.future.await()
+    show(log, 2)
+    c.tell(Add(100))
+    p.tell(StopKid)
+    // The parent has taken the stop once it answers an order after it; the kid is still parked.
+    val pinged = Promise[unit]()
+    p.tell(Ping(pinged))
+    pinged.future.await()
+    println(c.ended().isCompleted())
+    rc.send(1)
+    println(c.ended().await())
+    show(log, 2)

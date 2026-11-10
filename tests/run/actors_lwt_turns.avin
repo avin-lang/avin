@@ -1,0 +1,132 @@
+// expect: exit 0
+// An actor runs one turn at a time even while its turn is parked: messages told to it meanwhile, by
+// threads and by other actors, wait for the parked one to finish, and no handler ever overlaps
+// another. Messages one sender tells arrive in the order told, whether the sender is a thread or an
+// actor and whatever parks between them. Asks chain through turns parked in `await`, an actor that
+// awaits an ask of itself waits until the timeout, and what it is told while it waits is handled
+// afterwards, in order. Turns that compute without waiting are time-sliced, so actors spinning on a
+// flag, more of them than there are workers, let the actor that sets it run.
+import avin.actors.{ActorRef, Behaviour, spawn}
+import avin.threads.{Atomic, Channel, Promise, sleep}
+import avin.threads as threads
+import avin.time
+
+data Msg
+    Park(release: Channel[int])
+    Note(sender: int, n: int)
+    Report(reply: Promise[string])
+
+// Counts the handlers running at once, which must never be more than one, and checks each sender's
+// notes come in order.
+actor Recorder(senders: int) receives Msg
+    val active = Atomic[int](0)
+    var overlaps = 0
+    var disorders = 0
+    var notes = 0
+    var log: Vector[string] = Vector()
+    val last = Array.fill(senders, -1)
+    receive
+        m ->
+            if active.add(1) != 1 then overlaps += 1
+            m match
+                Park(release) ->
+                    release.receive()
+                    log = log :+ "released"
+                Note(s, n) ->
+                    if n != last(s) + 1 then disorders += 1
+                    last(s) = n
+                    notes += 1
+                    if notes == 1 then log = log :+ "first note"
+                    // Park now and then inside the handling of a note too.
+                    if n % 25 == 0 then sleep(time.millis(1))
+                Report(reply) -> reply.complete(s"$log notes $notes overlaps $overlaps disorders $disorders")
+            active.add(-1)
+            ()
+
+// An actor that tells `count` notes as sender `id`, sleeping now and then between them.
+sender(target: ActorRef[Msg], id: int, count: int) -> Behaviour[unit] = Behaviour("Sender", me -> _ ->
+    for n in 0..<count
+        target.tell(Note(id, n))
+        if n % 40 == 0 then sleep(time.millis(1)))
+
+data Chain(depth: int, reply: Promise[int])
+
+// Each link asks the next and awaits it in its turn; the last sleeps before answering.
+actor Link(left: int) receives Chain
+    val next: Option[ActorRef[Chain]] = if left > 0 then Some(spawn(Link(left - 1))) else None
+    receive
+        Chain(depth, reply) -> next match
+            Some(r) ->
+                val p = Promise[int]()
+                r.tell(Chain(depth + 1, p))
+                reply.complete(p.future.await())
+            None ->
+                sleep(time.millis(5))
+                reply.complete(depth)
+
+data Q
+    Get(reply: ActorRef[int])
+    AskSelf(out: Channel[string])
+    AskOther(other: ActorRef[Q], out: Channel[string])
+    Say(text: string, out: Channel[string])
+
+actor Asker(value: int) receives Q
+    receive
+        Get(r) ->
+            sleep(time.millis(2))
+            r.tell(value)
+        AskSelf(out) -> out.send(s"self: ${self.ask(r -> Get(r), timeout = time.millis(50)).await()}")
+        AskOther(o, out) -> out.send(s"other: ${o.ask(r -> Get(r), timeout = time.seconds(30)).await()}")
+        Say(text, out) -> out.send(text)
+
+main()
+    // Four threads and four actors tell 200 notes each while the recorder's turn is parked.
+    val rec = spawn(Recorder(8))
+    val release = Channel[int]()
+    rec.tell(Park(release))
+    val threadsDone = (0..<4).map(id -> threads.spawn(() ->
+        for n in 0..<200
+            rec.tell(Note(id, n))
+            if n % 50 == 0 then sleep(time.millis(1)))).toVector()
+    for id in 4..<8 do spawn(sender(rec, id, 200)).tell(())
+    for t in threadsDone do t.join()
+    sleep(time.millis(20))
+    release.send(1)
+    // The senders that are actors may still be telling: wait until all 1600 notes are in.
+    var report = ""
+    loop
+        val p = Promise[string]()
+        rec.tell(Report(p))
+        report = p.future.await()
+        if report.contains("notes 1600 ") then break
+        sleep(time.millis(5))
+    println(report)
+    // A chain of asks, each awaited in a parked turn.
+    val chain = spawn(Link(30))
+    val answer = Promise[int]()
+    chain.tell(Chain(0, answer))
+    println(answer.future.await())
+    // An ask of itself times out; one of another is answered; what is told meanwhile waits.
+    val out = Channel[string]()
+    val a = spawn(Asker(1))
+    val b = spawn(Asker(2))
+    a.tell(AskSelf(out))
+    a.tell(Say("after the self ask", out))
+    a.tell(AskOther(b, out))
+    a.tell(Say("after the other ask", out))
+    for _ in 0..<4 do println(out.receive().get())
+    // Spinning turns, more than the workers, and the one that stops them.
+    // They wait for `go` first, so none spins while the others are being started.
+    val flag = Atomic[bool](false)
+    val go = Promise[unit]()
+    val spun = Channel[int]()
+    for _ in 0..<64 do spawn(Behaviour[unit]("Spinner", me -> _ ->
+        go.future.await()
+        var spins: long = 0
+        while !flag.load() do spins += 1
+        spun.send(1))).tell(())
+    go.complete(())
+    spawn(Behaviour[unit]("Setter", me -> _ -> flag.store(true))).tell(())
+    var stopped = 0
+    for _ in 0..<64 do stopped += spun.receive().get()
+    println(s"spinners stopped: $stopped")
