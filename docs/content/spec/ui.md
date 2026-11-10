@@ -302,8 +302,8 @@ spawn(() ->
   posted work wait in one queue, so what one thread sends and posts runs in the order it did them,
   whichever inboxes they went to, and a send happens before its handling. Among many senders each
   thread's order is kept.
-- **The frame loop runs what is waiting at the start of every frame**, where the frame asks for its
-  colour, so a state the work sets is built on the next frame. `run` runs what is still waiting
+- **The frame loop runs what is waiting at the start of every frame**, before it decides whether to
+  build the tree again, so a state the work sets is built in that same frame. `run` runs what is still waiting
   once more when the loop ends. A program with no window, a test among them, calls
   `handlePosted()` itself.
 - **What the work sends or posts waits for the next frame.** `handlePosted` runs only what was

@@ -5145,15 +5145,39 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   lock (every build would lock, and a write from another thread would race the build); an actor for
   the interface (the frame loop owns the thread, so a mailbox would still need this queue); a queue
   for each inbox (loses one thread's order between two inboxes).
-- Proposed (branch `lwt-ui`): **The frame loop runs the waiting work where it asks for the frame's
-  colour**, through a wrapper of `ground`, and `run` runs what is left once more as it returns. Why:
-  syslui-sdl's `on_frame`, the natural place, follows `size: f32` in `app`'s parameters, and a
-  binding cannot pass an `f32` (no Avin type crosses as one), so `app` cannot be given an `on_frame`;
-  the colour is asked for once a frame on the main thread. The cost is one frame: work run there is
-  built on the next frame rather than the one it ran in. Alternatives weighed: `tree` (called only
-  when something was written, so it would never notice a post); `on_event` (called only when there
-  are events). **Review with the user:** a `real` parameter crossing into a Sysl `f32`, converted,
-  would let the package pass `on_frame` and remove the frame's delay.
+- Proposed (branches `lwt-ui`, `binding-f32`): **The frame loop runs the waiting work in
+  syslui-sdl's `on_frame`**, at the start of every frame and before the loop decides whether to build
+  the tree again, so work posted before a frame runs in that frame and what it writes is built in it;
+  `run` runs what is left once more as it returns. The package passes `app` its `on_event` (answering
+  `false` for every event, as syslui-sdl's default does, through a private handle on
+  `sh.sysl.sdl3.Event`), an empty `font` and `size` 15, syslui-sdl's defaults, to reach `on_frame`
+  behind them, since a binding passes its arguments by place. Why: `on_frame` is the hook syslui-sdl
+  runs first in a frame for exactly this; a real crosses into its `size: f32` (see the `f32` entry).
+  Alternatives weighed: a wrapper of `ground`, which `lwt-ui` used while no real could cross into an
+  `f32` (run after the tree, so its work was built a frame late); `tree` (called only when something
+  was written, so it would never notice a post); `on_event` (called only when there are events);
+  naming arguments at the Sysl call so the defaults in between need not be repeated (a larger change
+  to every binding's shim, for one call). If syslui-sdl's defaults for `font` or `size` change, the
+  package's copies must follow.
+- Proposed (branch `binding-f32`): **A `real` crosses into and out of any Sysl floating-point type
+  that rounds: `f32`, `f16`, `bf16` and `real`.** A binding's own `real` parameter, a mirror's `real`
+  field going into Sysl, and a callback's `real` answer are rounded into the Sysl type to the nearest
+  value it holds, a tie to the even one, as an IEEE conversion rounds: a value past its largest
+  becomes an infinity of its sign, one below half its smallest subnormal a zero of its sign, a NaN
+  stays a NaN, and nothing stops the program. A `real` result, a mirror's field coming out, a
+  callback's parameter, and a real an `Option`, a `Result`, a tuple or a collection result holds are
+  widened exactly. A real inside a parameter's `Option`, tuple or collection is passed as `real`
+  only, as an integer there is passed as its declared type. `f128` is refused (its arithmetic is not
+  `sysl.math.Float`), and so is every non-floating type. Why: Avin has one floating type, and a
+  graphics or audio library's `f32` (syslui-sdl's `size`, a canvas's coordinates) is what a binding
+  meets; rounding is what every conversion between floating widths does and the only one that keeps
+  every `f32` value exact on the way back. It mirrors how an integer crosses into any Sysl integer.
+  Alternatives weighed: an `f32` type in Avin (a second floating type in every arithmetic rule, for
+  the boundary's sake); trapping where the value does not fit (a rounding is not an error, and an
+  infinity is a legal `f32`); converting a real held inside a parameter's option or collection too
+  (integers are not converted there either, and the copy would be written element by element).
+  **Review with the user** whether a `real` into an `f32` should trap on overflow to infinity
+  rather than round to it.
 - Proposed (branch `lwt-ui`): **`handlePosted` runs only what was waiting when it was called.**
   Work that sends or posts waits for the next call. Why: work that posts itself again, a common
   animation shape, would otherwise hold a frame for ever. Alternatives weighed: draining until the

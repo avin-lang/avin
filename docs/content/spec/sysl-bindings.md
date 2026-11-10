@@ -90,7 +90,7 @@ Data crosses the boundary in a fixed set of shapes:
 
 | Avin type | Crossing |
 | --- | --- |
-| `i8`, `i16`, `int`, `long`, `byte`, `real`, `char`, `bool`, `unit` | By value; Sysl's `u8` is `byte`. An integer result, and an integer a result holds, takes [any Sysl integer](#integer-results); an integer parameter goes into [any](#integer-parameters), and so does a callback's integer answer [too](#callbacks) |
+| `i8`, `i16`, `int`, `long`, `byte`, `real`, `char`, `bool`, `unit` | By value; Sysl's `u8` is `byte`. An integer result, and an integer a result holds, takes [any Sysl integer](#integer-results); an integer parameter goes into [any](#integer-parameters), and so does a callback's integer answer [too](#callbacks). A `real` goes into and comes out of [any Sysl floating-point type](#real-numbers), `f32` among them |
 | `string` | Copied into a Sysl `string` in each direction |
 | `Array[byte]` | Copied into a Sysl `[]u8` and, as a binding's own parameter, [copied back](#filled-arrays) after the call; out of a Sysl `[]u8` or `[]const u8` |
 | `Array[T]`, `Vector[T]` of any other boundary type | **Copied**, element by element: into a Sysl slice, and out of a Sysl `[]T` or `Buf[T]` into a new array or vector. An array of numbers, booleans or characters as a binding's own parameter is [copied back](#filled-arrays); any other array goes in as a `[]const T` |
@@ -181,6 +181,37 @@ error: the Sysl binding `countOrZero` does not match `avintest.digits.count_or_z
 
 A value narrower than 32 bits crosses widened as the C convention widens it, a signed integer
 sign-extended and a byte or a bool zero-extended: as a parameter, and as a callback's answer.
+
+### Real numbers
+
+A `real` goes into whatever floating-point type its Sysl place is — `f32`, the half-precision `f16`
+and `bf16`, or `real` itself — and comes out of any of them. syslui-sdl's `app` takes its text size
+as an `f32`, and a binding gives it a `real`:
+
+```text
+@sysl("sh.sysl.ui_sdl.app")
+appOf(title: string, tree: () -> View, ground: () -> long, width: int, height: int, onEvent: Event -> bool, font: string, size: real, onFrame: real -> unit) -> App
+```
+
+Going in — a binding's own parameter, a mirror's field, a callback's answer — the value is rounded to
+the nearest the Sysl type holds, a tie to the one whose last bit is zero. Nothing stops the program:
+a value past the type's largest becomes an infinity of its sign, one smaller than half its smallest
+subnormal a zero of its sign, and a NaN stays a NaN. `0.1` reaches an `f32` as
+`0.10000000149011612`, and `16777217.0` as `16777216`.
+
+Coming out — a result, a mirror's field, a callback's parameter, and a real an `Option`, a `Result`, a
+tuple or a collection holds — the value is widened exactly, so an `f32` that went out comes back
+as the same number. A Sysl `Option[f32]` is bound as an `Option[real]`, and a `Buf[f32]` as a
+`Vector[real]`.
+
+As with integers, a real a parameter holds — in an `Option`, a `Result`, a tuple or a collection — is
+passed as `real` and not rounded, and a Sysl parameter whose type is a type parameter of a generic
+function takes the `real` itself. A real goes into a floating-point type only, and Sysl's
+quadruple-precision `f128` is not one it converts into:
+
+```text
+error: the Sysl binding `countReal` does not match `avintest.digits.digit_count`: parameter 1 is a real, which goes into Sysl only as a floating-point number, but the Sysl parameter is long
+```
 
 ### Collections are copies
 
@@ -313,7 +344,9 @@ readText(file: string) -> Result[string, IoError]
 - **A field is a boundary type.** An integer field takes any Sysl integer, converted with a check in
   each direction as an [integer result](#integer-results) is: Avin has no unsigned integers, so
   Sysl's `usize` offset above is a `long`, and a value the other side's type cannot hold stops the
-  program where the binding was called. A collection field is copied as a binding's collection is.
+  program where the binding was called. A real field takes any Sysl floating-point type, rounded
+  going in and widened coming out as a [real](#real-numbers) is. A collection field is copied as a
+  binding's collection is.
 - **A field may be a [handle](#handles)**, by itself — not in an `Option`, a collection or a tuple.
   Into Sysl it is passed as a handle parameter is, with the same checks: a closed handle, or one
   another thread owns, stops the program where the binding was called. Out of Sysl each such field
@@ -736,6 +769,10 @@ runEvery(ms: long, @threaded tick: () -> bool)
   ```text
   error: the Sysl binding `integerForText` does not match `avintest.callbacks.text_op`: the function answers an integer, which goes into Sysl only as an integer, but the closure Sysl takes answers string
   ```
+
+- **A callback's real answer is rounded into whatever floating-point type the closure answers**,
+  and a real parameter Sysl calls it with is widened out of whatever floating-point type it is, as
+  a binding's [real](#real-numbers) is: a closure `&Fn(f32) -> f32` takes an Avin `real -> real`.
 
 - **Sysl keeps the function alive for as long as it holds the closure.** The closure holds a root of
   the collector, made when the binding is called, so a callback Sysl stores and calls later runs
