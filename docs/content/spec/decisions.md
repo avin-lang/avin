@@ -4962,14 +4962,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
     whole search through every nested part; a lookaround's or atomic group's body answering no for
     it is never taken as the body failing.
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- **Union types: the rules beyond the user's five points** (branch `unions-design`;
+- Settled on the user's delegation 2026-11-09: **Union types: the rules beyond the user's five points** (branch `unions-design`;
   [union types](/spec/unions/)).
   - **Precedence: `|` binds tighter than `->` and looser than everything else in a type**, so
     `(A) -> B | C` returns a union and a union of functions parenthesizes each. *Why*: a function
@@ -5056,6 +5049,13 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
     across a binding (no Sysl or C library takes one).
   - **Chapter**: a chapter of its own, `spec/unions.md`, linked from types, generics, errors and
     `match`. *Alternatives*: a section of types.md (too long for one section).
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
