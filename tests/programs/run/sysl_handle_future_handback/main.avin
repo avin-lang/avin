@@ -1,0 +1,148 @@
+// expect: exit 0
+// env: AVIN_GC_STRESS=0
+// The handles a future's body or function captures are in transit before its value is published, so
+// the code that awaits the value may use them at once. Each body here waits on a gate until the
+// future has many callbacks waiting, which run on the worker after the awaiter is woken and keep it
+// busy there: a hand-back made after the value was published would still be pending when the awaiter
+// uses the handle. The callbacks are many, so the collector runs at its own pace.
+import avin.threads.{Executor, Future, Promise}
+
+@sysl("avintest.digits.Tally")
+class Tally
+    add(n: long)
+    get() -> long
+    absorb(other: Tally)
+
+@sysl("avintest.digits.new_tally")
+newTally(n: long) -> Tally
+
+class Box(val tally: Tally)
+
+class Nest(val inner: Box, val more: Vector[Box])
+
+// Many callbacks waiting on `f`, each cheap, which the worker that completes `f` runs one by one.
+crowded[T](f: Future[T]) -> Future[Vector[Vector[T]]] =
+    Future.all(Vector.tabulate(400, i -> Future.all(Vector.fill(50, f))))
+
+// Waits for the callbacks `crowded` left, which all see the one value.
+settle[T](c: Future[Vector[Vector[T]]], what: string)
+    val groups = c.await()
+    if groups.length() != 400 || groups.exists(g -> g.length() != 50) then println(s"$what: crowd")
+
+bumped(b: Box, gate: Future[int]) -> long
+    b.tally.add(long(gate.await()))
+    b.tally.get()
+
+nested(n: Nest, gate: Future[int]) -> long
+    val step = long(gate.await())
+    n.inner.tally.add(step)
+    for b in n.more do b.tally.add(step)
+    n.inner.tally.get()
+
+checked(b: Box, gate: Future[int]) -> Result[long, string]
+    val step = gate.await()
+    b.tally.add(long(step))
+    if b.tally.get() < 100 then Err("small") else Ok(b.tally.get())
+
+// A single body on an executor and its awaiter.
+single(ex: Executor, r: long)
+    val gate = Promise[int]()
+    val b = Box(newTally(r))
+    val f = ex.future(bumped(b, gate.future))
+    val c = crowded(f)
+    gate.complete(10)
+    val got = f.await()
+    val seen = b.tally.get()
+    if got != seen || seen != r + 10 then println(s"single $r: $got $seen")
+    settle(c, "single")
+
+// The same on the shared pool.
+shared(r: long)
+    val gate = Promise[int]()
+    val b = Box(newTally(r))
+    val f = Future(bumped(b, gate.future))
+    val c = crowded(f)
+    gate.complete(20)
+    if f.await() != b.tally.get() then println(s"shared $r")
+    settle(c, "shared")
+
+// `Future.all` of several bodies, each with a box of its own.
+everyOne(ex: Executor, r: long)
+    val gate = Promise[int]()
+    val boxes = (0..<4).map(i -> Box(newTally(r + long(i)))).toVector()
+    val all = Future.all(boxes.map(x -> ex.future(bumped(x, gate.future))))
+    val c = crowded(all)
+    gate.complete(1)
+    if all.await().sum() != boxes.map(x -> x.tally.get()).sum() then println(s"all $r")
+    settle(c, "all")
+
+// A `map` chain: each function captures a tally of its own, used once the end is awaited.
+mapped(ex: Executor, r: long)
+    val gate = Promise[int]()
+    val m1 = newTally(1)
+    val m2 = newTally(r)
+    val chained = ex.future(gate.future.await()).map(v ->
+        m1.add(long(v))
+        m1.get()).map(v ->
+        m2.add(v)
+        m2.get())
+    val c = crowded(chained)
+    gate.complete(5)
+    if chained.await() != m2.get() || m1.get() != 6 then println(s"map $r")
+    settle(c, "map")
+
+// A `flatMap` whose function captures a tally.
+flatMapped(ex: Executor, r: long)
+    val gate = Promise[int]()
+    val fm = newTally(r)
+    val flat = ex.future(gate.future.await()).flatMap(v ->
+        fm.add(long(v))
+        Future.successful(v))
+    val c = crowded(flat)
+    gate.complete(4)
+    if flat.await() != 4 || fm.get() != r + 4 then println(s"flatMap $r")
+    settle(c, "flatMap")
+
+// A body that answers a failure, and one that answers a success through `mapOk`.
+answered(ex: Executor, r: long)
+    val gate = Promise[int]()
+    val small = Box(newTally(r))
+    val large = Box(newTally(100 + r))
+    val failed = ex.future(checked(small, gate.future))
+    val passed = ex.future(checked(large, gate.future)).mapOk(v -> v + 1)
+    val c = crowded(failed)
+    val d = crowded(passed)
+    gate.complete(2)
+    failed.await() match
+        Err(e) -> if small.tally.get() != r + 2 then println(s"failed $r $e")
+        Ok(v) -> println(s"failed answered $v")
+    passed.await() match
+        Ok(v) -> if v != large.tally.get() + 1 then println(s"passed $r")
+        Err(e) -> println(s"passed answered $e")
+    settle(c, "failed")
+    settle(d, "passed")
+
+// Boxes nested in an object and in a vector inside it.
+nestedBoxes(ex: Executor, r: long)
+    val gate = Promise[int]()
+    val nest = Nest(Box(newTally(r)), [Box(newTally(1)), Box(newTally(2))])
+    val f = ex.future(nested(nest, gate.future))
+    val c = crowded(f)
+    gate.complete(7)
+    if f.await() != nest.inner.tally.get() then println(s"nested $r")
+    if nest.more.map(x -> x.tally.get()).sum() != 17 then println(s"nested more $r")
+    settle(c, "nested")
+
+main()
+    val ex = Executor.fixed(2)
+    for round in 0..<10
+        val r = long(round)
+        single(ex, r)
+        shared(r)
+        everyOne(ex, r)
+        mapped(ex, r)
+        flatMapped(ex, r)
+        answered(ex, r)
+        nestedBoxes(ex, r)
+    println("done")
+    ex.shutdown()

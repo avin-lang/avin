@@ -36,18 +36,23 @@ private class Pool(private val target: int): Sendable
     private val waiting = MutableSet[long]()
     private var closed = false
 
-    // Runs `task` on a worker, soon; after a shutdown too, starting a worker where none is left. The
-    // Sysl handles `task` reaches that the calling code owns are the task's, an owner of its own
-    // whichever worker runs it, until it returns; then they are in transit, for the next code to use
-    // them.
-    submit(task: () -> unit)
+    // Runs `task` on a worker, soon, then `finish` with what it returned; after a shutdown too,
+    // starting a worker where none is left. The Sysl handles `task` and `finish` reach that the
+    // calling code owns are the task's, an owner of its own whichever worker runs it, until `task`
+    // returns; then they are in transit, for the next code to use them, before `finish` runs. So
+    // `finish` is where the task's result is published: code that sees the result, a future's awaiter
+    // among them, finds every handle the task used already given up.
+    submit[R](task: () -> R, finish: (R) -> unit)
         val owner = newOwner()
         handOver(task, currentOwner(), owner)
+        handOver(finish, currentOwner(), owner)
         val run: () -> unit = () ->
             val worker = currentOwner()
             runAs(owner)
-            task()
+            val r = task()
             handOver(task, owner, inTransit)
+            handOver(finish, owner, inTransit)
+            finish(r)
             runAs(worker)
         post(run)
 
@@ -175,8 +180,8 @@ blocking[T](body: -> T) -> T
 // Runs `body` on `p` and gives back the future of what it returns.
 private startOn[T: Sendable](p: Pool, @sendable body: () -> T) -> Future[T]
     val cell = Cell[T]()
-    p.submit(() ->
-        cell.complete(body())
+    p.submit(body, v ->
+        cell.complete(v)
         ())
     Future(cell, p)
 
@@ -283,14 +288,14 @@ class Future[T](private val cell: Cell[T], private val home: Pool)
     value() -> Option[T] = cell.peek()
 
     // Runs `f` with the value on a thread of this future's executor once it is there.
-    onComplete(@sendable f: (T) -> unit) = cell.whenDone(v -> home.submit(() -> f(v)))
+    onComplete(@sendable f: (T) -> unit) = cell.whenDone(v -> home.submit(() -> f(v), u -> u))
 
     // The future of `f` of the value, which runs on a thread of this future's executor once the value
     // is there.
     map[U: Sendable](@sendable f: (T) -> U) -> Future[U]
         val next = Cell[U]()
-        cell.whenDone(v -> home.submit(() ->
-            next.complete(f(v))
+        cell.whenDone(v -> home.submit(() -> f(v), u ->
+            next.complete(u)
             ()))
         Future(next, home)
 
@@ -298,8 +303,8 @@ class Future[T](private val cell: Cell[T], private val home: Pool)
     // future's executor once the value is there.
     flatMap[U](@sendable f: (T) -> Future[U]) -> Future[U]
         val next = Cell[U]()
-        cell.whenDone(v -> home.submit(() ->
-            f(v).cell.whenDone(u ->
+        cell.whenDone(v -> home.submit(() -> f(v), inner ->
+            inner.cell.whenDone(u ->
                 next.complete(u)
                 ())))
         Future(next, home)

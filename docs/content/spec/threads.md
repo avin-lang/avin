@@ -248,7 +248,8 @@ does not take the lock. What is passed for an `@isolated` one is not.
 
 A [Sysl handle](/spec/sysl-bindings/#handles) is the exception: it belongs to one owner at a time,
 and a use by any other code traps. The handles a thread's body or a future's body reaches move to
-it when it starts, and are in transit, for the next code to use them, once it returns; an actor
+it when it starts, and are in transit, for the next code to use them, once it returns, before a
+future's value is published, so its awaiter may use them at once; an actor
 will own its handles across every message, whichever thread runs it.
 
 ## Synchronization

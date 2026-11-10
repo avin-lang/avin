@@ -443,7 +443,10 @@ parseBigInt(s: string) -> Option[BigInt]
   calling code owns become the body's when it is started, and the caller's next use of one traps.
   When the body returns, what it was given and what it returns are **in transit**, as is a value a
   future or promise is completed with and what a callback given to `onComplete` or `map` reaches: a
-  handle in transit is taken by the first code to use it. A value sent on a channel keeps its owner.
+  handle in transit is taken by the first code to use it. A future's body, or the function of its
+  `map` or `flatMap`, gives up what it was given before its value is published, so the code that
+  awaits the value, or a future made from it, may use those handles at once. A value sent on a
+  channel keeps its owner.
   A message sent to an actor hands its handles to that actor ([actors](/spec/actors/#handing-over-ownership)).
   Handing a value over follows what it holds and stops at what is shared between owners — an
   actor's reference, a future, a promise, a channel, a mutex, an atomic, a thread, an executor —
