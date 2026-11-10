@@ -5050,14 +5050,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   - **Chapter**: a chapter of its own, `spec/unions.md`, linked from types, generics, errors and
     `match`. *Alternatives*: a section of types.md (too long for one section).
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed 2026-11-09 (branch `unions-core`): **Union types: the choices the core's implementation
+- Settled on the user's delegation 2026-11-09 (branch `unions-core`): **Union types: the choices the core's implementation
   made** ([union types](/spec/unions/)).
   - **Every union is laid out as an `Any` for now, a scalar member in a box.** The chapter's
     tag-and-payload layout for a union with a scalar member needs values of more than one machine
@@ -5099,6 +5092,13 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
     never inferred as a union, with the union to write; a missing clause names the member, as in
     `size(_: string)`. *Why*: each says what to write. *Alternatives*: the generic messages, which
     name no member.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
