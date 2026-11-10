@@ -58,6 +58,8 @@ enum NameKind
     RecordName
     EnumName
     TraitName
+    /** A type alias, `type Parsed[T] = Result[T, ParseError]`. */
+    AliasName
     TypeParamName
     VariantName
     FunctionName
@@ -81,6 +83,8 @@ enum Target
     FunctionTarget(symbol: usize)
     DataTarget(id: usize)
     ClassTarget(id: usize)
+    /** A type alias, by its place among the checker's aliases. */
+    AliasTarget(id: usize)
     VariantTarget(data: usize, index: usize)
     ModuleTarget(name: string)
     /** A type parameter, by its name. */
@@ -217,7 +221,7 @@ private local_key(c: *Checker, index: usize) -> string = s"${c.body.root}:$index
 private index_note(c: *Checker, unit: usize, at: Span, declared_unit: usize, declared: Span, starts: usize, target: Target)
     if c.index is Some(ix)
         if at.end <= at.start then return
-        if !ix.renaming && !(target is ModuleTarget(_)) && !spells(c.units[unit].src.bytes, at, c.units[declared_unit].src.bytes, declared) then return
+        if !ix.renaming && !(target is ModuleTarget(_)) && !spells(c.units[unit].src.bytes, at, c.units[declared_unit].src.bytes, declared) && !written_as_binding(c, unit, at) then return
         ix.note(Noted(unit, at, declared_unit, declared, starts, target))
 
 // Whether the text at `at` can be a name for the declaration whose name is at `declared`: the name
@@ -234,6 +238,28 @@ private spells(b: []const u8, at: Span, home: []const u8, declared: Span) -> boo
     if m < n then return false
     for i in 0..<n
         if b[at.end - n + i] != home[declared.start + i] then return false
+    m == n || b[at.end - n - 1] == u8('.')
+
+// Whether the text at `at` ends in a name an import of the file binds, or an export of the program
+// does (`import a.{f as g}`, `export a.{f as g}`): a use of a declaration under a name of its own,
+// which means the declaration whatever its spelling.
+private written_as_binding(c: *Checker, unit: usize, at: Span) -> bool
+    val b = c.units[unit].src.bytes
+    if at.end > b.len then return false
+    for i in c.units[unit].file.imports
+        if ends_in_name(b, at, i.binding) then return true
+    for u in 0..<c.units.len()
+        for e in c.units[u].file.exports
+            if ends_in_name(b, at, e.binding) then return true
+    false
+
+// Whether the text at `at` is `name`, or a path ending in it.
+private ends_in_name(b: []const u8, at: Span, name: string) -> bool
+    val n = name.bytes.len
+    val m = at.end - at.start
+    if n == 0 || m < n then return false
+    for i in 0..<n
+        if b[at.end - n + i] != name.bytes[i] then return false
     m == n || b[at.end - n - 1] == u8('.')
 
 /** A function, by its symbol: a constructor is its class, and a lambda or a function the compiler
@@ -258,6 +284,11 @@ private class_name(c: *Checker, k: usize) -> Span = name_in(c.units[c.classes[k]
 index_class(c: *Checker, unit: usize, at: Span, k: usize)
     if c.index is None then return
     index_note(c, unit, at, c.classes[k].unit, class_name(c, k), c.classes[k].decl.span.start, ClassTarget(k))
+
+index_alias(c: *Checker, unit: usize, at: Span, id: usize)
+    if c.index is None then return
+    val a = c.aliases[id]
+    index_note(c, unit, at, a.unit, name_in(c.units[a.unit].src, a.decl.name_span, a.decl.name), a.decl.span.start, AliasTarget(id))
 
 index_data(c: *Checker, unit: usize, at: Span, id: usize)
     if c.index is None then return
@@ -440,9 +471,16 @@ index_import(c: *Checker, unit: usize, i: Import, whole: bool)
 
 private index_imported(c: *Checker, unit: usize, i: Import, whole: bool)
     val at = last_name_in(c.units[unit].src, i.span, i.binding)
+    index_imported_at(c, unit, at, i, whole)
+    // `a.{f as g}` also writes the declaration's own name, which means the declaration too.
+    if !whole && i.name_span.end > i.name_span.start && (i.name_span.start != i.binding_span.start || i.name_span.end != i.binding_span.end)
+        index_imported_at(c, unit, i.name_span, i, whole)
+
+private index_imported_at(c: *Checker, unit: usize, at: Span, i: Import, whole: bool)
     if whole then return index_module(c, unit, at, i.path)
     if c.types.get(i.path) is Some(id) then return index_data(c, unit, at, id)
     if c.class_types.get(i.path) is Some(k) then return index_class(c, unit, at, k)
+    if c.alias_names.get(i.path) is Some(id) then return index_alias(c, unit, at, id)
     if c.variants.get(i.path) is Some(_)
         val vs = variants_at(c, i.path)
         // Where several types share the name, the import means each of them.
@@ -486,6 +524,7 @@ target_kind(c: *Checker, target: Target) -> (NameKind, bool, bool) = target matc
         (if method then MethodName else FunctionName, false, s.static_member)
     DataTarget(id) -> (if c.data[id].decl.variants.len() == 1 then RecordName else EnumName, false, false)
     ClassTarget(k) -> (if c.classes[k].decl.modifier == "trait" then TraitName else ClassName, false, false)
+    AliasTarget(_) -> (AliasName, false, false)
     VariantTarget(id, _) -> (if c.data[id].decl.variants.len() == 1 then RecordName else VariantName, false, false)
     ModuleTarget(_) -> (ModuleName, false, false)
     TypeParamTarget(_) -> (TypeParamName, false, false)
@@ -509,6 +548,9 @@ private index_declarations(c: *Checker)
             if f.owner != k || f.name.starts_with("<") then continue
             val home = c.classes[k].unit
             index_class_field(c, home, name_in(c.units[home].src, f.span, f.name), k, i)
+    for id in 0..<c.aliases.len()
+        val a = c.aliases[id]
+        index_alias(c, a.unit, name_in(c.units[a.unit].src, a.decl.name_span, a.decl.name), id)
     for id in 0..<c.data.len()
         val d = c.data[id]
         index_data(c, d.unit, name_in(c.units[d.unit].src, d.decl.span, d.name), id)
@@ -534,6 +576,7 @@ render_target(c: *Checker, target: Target) -> string = target match
     FunctionTarget(id) -> function_header(c, id)
     DataTarget(id) -> data_header(c, id)
     ClassTarget(k) -> class_header(c, k)
+    AliasTarget(id) -> alias_header(c.aliases[id].decl)
     VariantTarget(id, index) -> s"${c.data[id].name}.${variant_header(c.data[id].decl.variants[index])}"
     ModuleTarget(name) -> s"module $name"
     TypeParamTarget(name) -> s"type parameter $name"
@@ -606,6 +649,9 @@ private parent_text(e: &Expr) -> string = e.kind match
         out + "]"
     Call(callee, args) -> parent_text(callee) + (if args.len() == 0 then "()" else "(…)")
     _ -> show_expr(e)
+
+/** An alias as its declaration would be written: `type Parsed[T] = Result[T, ParseError]`. */
+private alias_header(d: &AliasDecl) -> string = "type " + d.name + type_params_text(d.type_params) + " = " + show_type(d.body)
 
 private data_header(c: *Checker, id: usize) -> string
     val d = c.data[id].decl

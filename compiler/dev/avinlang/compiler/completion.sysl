@@ -140,7 +140,7 @@ completing_type(c: *Checker, unit: usize, path: string) -> bool
     val scope = c.files[unit]
     declaration_candidates(c, scope.module_name, false, 2, true)
     for (binding, key) in scope.imports
-        if c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_) then imported_candidate(c, binding, key)
+        if c.types.get(key) is Some(_) || c.class_types.get(key) is Some(_) || c.alias_names.get(key) is Some(_) then imported_candidate(c, binding, key, 3)
     for (binding, module_path) in scope.modules
         add_candidate(c, Candidate(binding, 3, ModuleTarget(module_path), None, false, None, false))
     declaration_candidates(c, CoreModule, true, 4, true)
@@ -201,7 +201,7 @@ private completing_scope(c: *Checker)
     val scope = c.files[unit]
     declaration_candidates(c, scope.module_name, false, 2, false)
     for (binding, key) in scope.imports
-        imported_candidate(c, binding, key)
+        imported_candidate(c, binding, key, 3)
     for (binding, module_path) in scope.modules
         add_candidate(c, Candidate(binding, 3, ModuleTarget(module_path), None, false, None, false))
     declaration_candidates(c, CoreModule, true, 4, false)
@@ -350,6 +350,18 @@ private declaration_candidates(c: *Checker, module_name: string, public: bool, g
             val v = d.decl.variants[i]
             if v.name == d.name || !plain_name(v.name) then continue
             add_candidate(c, Candidate(v.name, group, VariantTarget(id, i), Some((d.unit, v.span.start)), false, None, false))
+    for id in 0..<c.aliases.len()
+        val a = c.aliases[id]
+        if a.module_name != module_name || !plain_name(a.decl.name) then continue
+        if public && !exported(c, qualified(module_name, a.decl.name)) then continue
+        add_candidate(c, Candidate(a.decl.name, group, AliasTarget(id), Some((a.unit, a.decl.span.start)), false, None, false))
+    // What the module exports is its own, under the name it exports it by.
+    for (exported_as, target) in c.exports
+        if module_name == "" || !exported_as.starts_with(module_name + ".") then continue
+        val binding = exported_as[module_name.bytes.len + 1..]
+        if binding.contains(".") || !plain_name(binding) then continue
+        if types && c.types.get(target) is None && c.class_types.get(target) is None && c.alias_names.get(target) is None then continue
+        imported_candidate(c, binding, target, group)
     if types then return
     for k in 0..<c.classes.len()
         val cls = c.classes[k]
@@ -376,27 +388,30 @@ private declaration_candidates(c: *Checker, module_name: string, public: bool, g
         add_candidate(c, Candidate(s.decl.name, group, FunctionTarget(id), Some((s.unit, s.decl.span.start)), false, None, false))
 
 // A declaration a file imports under `binding`, by its qualified name.
-private imported_candidate(c: *Checker, binding: string, key: string)
+private imported_candidate(c: *Checker, binding: string, key: string, group: usize)
     if c.types.get(key) is Some(id)
         val d = c.data[id]
-        return add_candidate(c, Candidate(binding, 3, DataTarget(id), Some((d.unit, d.decl.span.start)), false, None, false))
+        return add_candidate(c, Candidate(binding, group, DataTarget(id), Some((d.unit, d.decl.span.start)), false, None, false))
     if c.class_types.get(key) is Some(k)
         val cls = c.classes[k]
-        return add_candidate(c, Candidate(binding, 3, ClassTarget(k), Some((cls.unit, cls.decl.span.start)), false, None, false))
+        return add_candidate(c, Candidate(binding, group, ClassTarget(k), Some((cls.unit, cls.decl.span.start)), false, None, false))
+    if c.alias_names.get(key) is Some(id)
+        val a = c.aliases[id]
+        return add_candidate(c, Candidate(binding, group, AliasTarget(id), Some((a.unit, a.decl.span.start)), false, None, false))
     if c.variants.get(key) is Some(_)
         // A name several types share is offered once for each, its detail naming the type.
         for v in variants_at(c, key)
             val d = c.data[v.data]
-            add_candidate(c, Candidate(binding, 3, VariantTarget(v.data, v.index), Some((d.unit, d.decl.variants[v.index].span.start)), false, None, false))
+            add_candidate(c, Candidate(binding, group, VariantTarget(v.data, v.index), Some((d.unit, d.decl.variants[v.index].span.start)), false, None, false))
         return
     if c.global_names.get(key) is Some(g)
         val v = c.globals[g]
-        return add_candidate(c, Candidate(binding, 3, ValueTarget(if v.mutable then "var " else "val ", binding, ErrorType, GlobalRole), Some((v.unit, v.span.start)), false, Some(g), false))
+        return add_candidate(c, Candidate(binding, group, ValueTarget(if v.mutable then "var " else "val ", binding, ErrorType, GlobalRole), Some((v.unit, v.span.start)), false, Some(g), false))
     if c.scope.get(key) is Some(ids)
         for id in ids
             if c.symbols[id].public && !c.symbols[id].constructor
                 val s = c.symbols[id]
-                add_candidate(c, Candidate(binding, 3, FunctionTarget(id), Some((s.unit, s.decl.span.start)), false, None, false))
+                add_candidate(c, Candidate(binding, group, FunctionTarget(id), Some((s.unit, s.decl.span.start)), false, None, false))
 
 // ---- rendering ----
 

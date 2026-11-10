@@ -1504,3 +1504,195 @@ lsp_symbol_query_matching()
     assert(!lsp_matches(u, "😀é"))
     // Only ASCII letters fold: `É` is not `é`.
     assert(!lsp_matches(u, "É😀"))
+
+private lsp_modern_text() -> string =
+    "// A parsed value.\n" +
+    "type Parsed[T] = Result[T, string]\n" +
+    "\n" +
+    "data Color derives Enumerable\n" +
+    "    Red\n" +
+    "    Green\n" +
+    "\n" +
+    "data Point(x: int, y: int)\n" +
+    "\n" +
+    "type Num = int | string\n" +
+    "\n" +
+    "describe(v: int | string) -> string = \"x\"\n" +
+    "\n" +
+    "main()\n" +
+    "    val p: Parsed[int] = Ok(1)\n" +
+    "    val c = Color.Red\n" +
+    "    val n = c.ordinal()\n" +
+    "    val q = Point(1, 2) with { x = 3 }\n" +
+    "    val xs = [1, 2].map(_ * 2)\n" +
+    "    val u: Num = 3\n" +
+    "    print(Color.values())\n"
+
+@test("lsp: hover, definition, references and the outline reach a type alias, from a use and from its declaration")
+lsp_type_alias()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    val uri = lsp_file_uri(dir + "/t.avin")
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(uri, lsp_modern_text())), lsp_publish_of(uri, ""))
+    assert_eq(lsp_one(&server, lsp_request(2, "textDocument/hover", lsp_test_at(uri, 14, 13))),
+        lsp_hover_of(2, "type Parsed[T] = Result[T, string]", "A parsed value.", 14, 11, 14, 17))
+    assert_eq(lsp_one(&server, lsp_request(3, "textDocument/definition", lsp_test_at(uri, 14, 13))),
+        lsp_location_of(3, uri, 1, 5, 1, 11))
+    assert_eq(lsp_one(&server, lsp_request(4, "textDocument/hover", lsp_test_at(uri, 1, 6))),
+        lsp_hover_of(4, "type Parsed[T] = Result[T, string]", "A parsed value.", 1, 5, 1, 11))
+    // A non-generic alias, whose body is a union.
+    assert_eq(lsp_one(&server, lsp_request(5, "textDocument/hover", lsp_test_at(uri, 19, 12))),
+        lsp_hover_of(5, "type Num = int | string", "", 19, 11, 19, 14))
+    assert_eq(lsp_one(&server, lsp_request(6, "textDocument/definition", lsp_test_at(uri, 19, 12))),
+        lsp_location_of(6, uri, 9, 5, 9, 8))
+    // A value of an alias is shown at the type the alias stands for.
+    assert_eq(lsp_one(&server, lsp_request(7, "textDocument/hover", lsp_test_at(uri, 14, 8))),
+        lsp_hover_of(7, "val p: Result[int, string]", "", 14, 8, 14, 9))
+    val refs = lsp_one(&server, lsp_request(8, "textDocument/references", s"{\"textDocument\":{\"uri\":\"$uri\"},\"position\":{\"line\":1,\"character\":6},\"context\":{\"includeDeclaration\":true}}"))
+    assert_eq(refs, lsp_reply(8, s"[{\"uri\":\"$uri\",\"range\":${lsp_test_range(1, 5, 1, 11)}},{\"uri\":\"$uri\",\"range\":${lsp_test_range(14, 11, 14, 17)}}]"))
+    val symbols = lsp_one(&server, lsp_request(9, "textDocument/documentSymbol", s"{\"textDocument\":{\"uri\":\"$uri\"}}"))
+    assert(symbols.contains(s"{\"name\":\"Parsed\",\"kind\":5,\"range\":${lsp_test_range(1, 0, 1, 34)},\"selectionRange\":${lsp_test_range(1, 5, 1, 11)}}"))
+    assert(symbols.contains(s"{\"name\":\"Num\",\"kind\":5,\"range\":${lsp_test_range(9, 0, 9, 23)},\"selectionRange\":${lsp_test_range(9, 5, 9, 8)}}"))
+    remove_dir_all(dir).unwrap_or(())
+
+@test("lsp: a type alias of another module is reached through its import and use, and is offered where a type is written")
+lsp_type_alias_across_modules()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    make_dir_all(dir + "/geo").unwrap()
+    write_text(dir + "/geo/pairs.avin", "module geo\n\n// A pair of one type.\ntype Pair[T] = (T, T)\n").unwrap()
+    val text = "import geo.{Pair}\n\nmain()\n    val p: Pair[int] = (1, 2)\n    print(p)\n"
+    write_text(dir + "/main.avin", text).unwrap()
+    val uri = lsp_file_uri(dir + "/main.avin")
+    val geo_uri = lsp_file_uri(dir + "/geo/pairs.avin")
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(uri, text)), lsp_publish_of(uri, ""))
+    assert_eq(lsp_one(&server, lsp_request(2, "textDocument/hover", lsp_test_at(uri, 3, 12))),
+        lsp_hover_of(2, "type Pair[T] = (T, T)", "A pair of one type.", 3, 11, 3, 15))
+    assert_eq(lsp_one(&server, lsp_request(3, "textDocument/definition", lsp_test_at(uri, 3, 12))),
+        lsp_location_of(3, geo_uri, 3, 5, 3, 9))
+    assert_eq(lsp_one(&server, lsp_request(4, "textDocument/definition", lsp_test_at(uri, 0, 13))),
+        lsp_location_of(4, geo_uri, 3, 5, 3, 9))
+    remove_dir_all(dir).unwrap_or(())
+    val items = lsp_complete_in("t.avin", "type Parsed[T] = Result[T, string]\n\nsize(p: Pa) -> int = 0\n\nmain() = ()\n", 2, 10, false)
+    assert_eq(lsp_item(items, "Parsed").kind, 7)
+    assert(!lsp_offers(items, "size"))
+    assert(!lsp_offers(items, "print"))
+
+@test("lsp: a type alias is a class in the semantic tokens, its declaration marked as one")
+lsp_type_alias_tokens()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    val uri = lsp_file_uri(dir + "/t.avin")
+    var server = lsp_ready()
+    lsp_answer(&server, lsp_open(uri, "type Index = Map[string, int]\n\nmain()\n    val i: Index = Map()\n"))
+    val answer = lsp_one(&server, lsp_request(2, "textDocument/semanticTokens/full", s"{\"textDocument\":{\"uri\":\"$uri\"}}"))
+    // The declaration at line 0 column 5 carries the declaration bit; the use, three tokens on in the
+    // same line as `i` and eleven columns in, does not. Both are of token type 1 (class).
+    assert(answer.contains("[0,5,5,1,1,"))
+    assert(answer.contains(",0,3,5,1,0"))
+    remove_dir_all(dir).unwrap_or(())
+
+@test("lsp: hover and definition show a union, the types a union alias names, and the members a derived Enumerable gives")
+lsp_union_and_enumerable()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    val uri = lsp_file_uri(dir + "/t.avin")
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(uri, lsp_modern_text())), lsp_publish_of(uri, ""))
+    assert_eq(lsp_one(&server, lsp_request(2, "textDocument/hover", lsp_test_at(uri, 11, 9))),
+        lsp_hover_of(2, "v: int | string", "", 11, 9, 11, 10))
+    assert_eq(lsp_one(&server, lsp_request(3, "textDocument/hover", lsp_test_at(uri, 19, 8))),
+        lsp_hover_of(3, "val u: int | string", "", 19, 8, 19, 9))
+    assert_eq(lsp_one(&server, lsp_request(4, "textDocument/hover", lsp_test_at(uri, 16, 15))),
+        lsp_hover_of(4, "Color.ordinal() -> int", "", 16, 14, 16, 21))
+    assert_eq(lsp_one(&server, lsp_request(5, "textDocument/hover", lsp_test_at(uri, 20, 18))),
+        lsp_hover_of(5, "Color.values() -> Vector[Color]", "", 20, 16, 20, 22))
+    remove_dir_all(dir).unwrap_or(())
+
+@test("lsp: completion offers the members derives Enumerable gives: values and valueOf on the type, ordinal and name on a value")
+lsp_completion_enumerable()
+    val base = "data Color derives Enumerable\n    Red\n    Green\n\nmain()\n    val c = Color.Red\n"
+    val on_value = lsp_complete_in("t.avin", base + "    c.\n", 6, 6, false)
+    assert_eq(lsp_item(on_value, "ordinal").kind, 2)
+    assert_eq(lsp_item(on_value, "ordinal").detail, "Color.ordinal() -> int")
+    assert_eq(lsp_item(on_value, "name").kind, 2)
+    assert_eq(lsp_item(on_value, "name").detail, "Color.name() -> string")
+    assert(!lsp_offers(on_value, "values"))
+    val on_type = lsp_complete_in("t.avin", base + "    Color.\n", 6, 10, false)
+    assert_eq(lsp_item(on_type, "values").kind, 2)
+    assert_eq(lsp_item(on_type, "values").detail, "Color.values() -> Vector[Color]")
+    assert_eq(lsp_item(on_type, "valueOf").kind, 2)
+    assert(!lsp_offers(on_type, "ordinal"))
+    // A type that does not derive it has none of them.
+    val plain = lsp_complete_in("t.avin", "data Shade\n    Dark\n    Light\n\nmain()\n    val s = Shade.Dark\n    s.\n", 6, 6, false)
+    assert(!lsp_offers(plain, "ordinal"))
+
+@test("lsp: an export is reached from its use, the import and the export itself, a brace group and a renamed name included, and completes")
+lsp_export_group()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    make_dir_all(dir + "/geo/inner").unwrap()
+    write_text(dir + "/geo/inner/inner.avin", "module geo.inner\n\n// The area of a rectangle.\narea(w: int, h: int) -> int = w * h\n\n// A box.\ndata Box(w: int)\n").unwrap()
+    val facade = "module geo\n\nexport geo.inner.{Box, area as surface}\n"
+    write_text(dir + "/geo/geo.avin", facade).unwrap()
+    val text = "import geo.{Box, surface}\n\nmain()\n    val b = Box(1)\n    print(surface(2, 3))\n"
+    write_text(dir + "/main.avin", text).unwrap()
+    val uri = lsp_file_uri(dir + "/main.avin")
+    val facade_uri = lsp_file_uri(dir + "/geo/geo.avin")
+    val inner_uri = lsp_file_uri(dir + "/geo/inner/inner.avin")
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(uri, text)), lsp_publish_of(uri, ""))
+    assert_eq(lsp_one(&server, lsp_request(2, "textDocument/definition", lsp_test_at(uri, 4, 12))),
+        lsp_location_of(2, inner_uri, 3, 0, 3, 4))
+    assert_eq(lsp_one(&server, lsp_request(3, "textDocument/definition", lsp_test_at(uri, 3, 14))),
+        lsp_location_of(3, inner_uri, 6, 5, 6, 8))
+    assert_eq(lsp_one(&server, lsp_request(4, "textDocument/definition", lsp_test_at(uri, 0, 20))),
+        lsp_location_of(4, inner_uri, 3, 0, 3, 4))
+    assert_eq(lsp_one(&server, lsp_request(5, "textDocument/hover", lsp_test_at(uri, 4, 12))),
+        lsp_hover_of(5, "area(w: int, h: int) -> int", "The area of a rectangle.", 4, 10, 4, 17))
+    assert_eq(lsp_one(&server, lsp_open(facade_uri, facade)), lsp_publish_of(facade_uri, ""))
+    assert_eq(lsp_one(&server, lsp_request(6, "textDocument/definition", lsp_test_at(facade_uri, 2, 18))),
+        lsp_location_of(6, inner_uri, 6, 5, 6, 8))
+    assert_eq(lsp_one(&server, lsp_request(7, "textDocument/definition", lsp_test_at(facade_uri, 2, 24))),
+        lsp_location_of(7, inner_uri, 3, 0, 3, 4))
+    assert_eq(lsp_one(&server, lsp_request(8, "textDocument/definition", lsp_test_at(facade_uri, 2, 33))),
+        lsp_location_of(8, inner_uri, 3, 0, 3, 4))
+    remove_dir_all(dir).unwrap_or(())
+
+@test("lsp: a name an import renames is the declaration at its original spelling, at the new one and in its uses")
+lsp_import_renamed()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    make_dir_all(dir + "/geo").unwrap()
+    write_text(dir + "/geo/shapes.avin", "module geo\n\n// The area of a rectangle.\narea(w: int, h: int) -> int = w * h\n").unwrap()
+    val text = "import geo.{area as size}\n\nmain()\n    print(size(2, 3))\n"
+    write_text(dir + "/main.avin", text).unwrap()
+    val uri = lsp_file_uri(dir + "/main.avin")
+    val geo_uri = lsp_file_uri(dir + "/geo/shapes.avin")
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(uri, text)), lsp_publish_of(uri, ""))
+    assert_eq(lsp_one(&server, lsp_request(2, "textDocument/definition", lsp_test_at(uri, 3, 12))),
+        lsp_location_of(2, geo_uri, 3, 0, 3, 4))
+    assert_eq(lsp_one(&server, lsp_request(3, "textDocument/definition", lsp_test_at(uri, 0, 13))),
+        lsp_location_of(3, geo_uri, 3, 0, 3, 4))
+    assert_eq(lsp_one(&server, lsp_request(4, "textDocument/definition", lsp_test_at(uri, 0, 21))),
+        lsp_location_of(4, geo_uri, 3, 0, 3, 4))
+    assert_eq(lsp_one(&server, lsp_request(5, "textDocument/hover", lsp_test_at(uri, 3, 12))),
+        lsp_hover_of(5, "area(w: int, h: int) -> int", "The area of a rectangle.", 3, 10, 3, 14))
+    remove_dir_all(dir).unwrap_or(())
+
+@test("lsp: completion after a module's name and in an import offers what the module exports")
+lsp_completion_through_export()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    make_dir_all(dir + "/geo/inner").unwrap()
+    write_text(dir + "/geo/inner/inner.avin", "module geo.inner\n\narea(w: int, h: int) -> int = w * h\n").unwrap()
+    write_text(dir + "/geo/geo.avin", "module geo\n\nexport geo.inner.{area as surface}\n").unwrap()
+    var server = lsp_ready()
+    val dotted = "import geo\n\nmain()\n    geo.\n"
+    write_text(dir + "/main.avin", dotted).unwrap()
+    val uri = lsp_file_uri(dir + "/main.avin")
+    lsp_answer(&server, lsp_open(uri, dotted))
+    var items = lsp_offered(lsp_one(&server, lsp_request(2, "textDocument/completion", lsp_test_at(uri, 3, 8))))
+    assert_eq(lsp_item(items, "surface").kind, 3)
+    assert_eq(lsp_item(items, "surface").detail, "area(w: int, h: int) -> int")
+    val braces = "import geo.{su}\n\nmain()\n    print(1)\n"
+    lsp_answer(&server, lsp_change(uri, braces))
+    items = lsp_offered(lsp_one(&server, lsp_request(3, "textDocument/completion", lsp_test_at(uri, 0, 14))))
+    assert(lsp_offers(items, "surface"))
+    remove_dir_all(dir).unwrap_or(())
