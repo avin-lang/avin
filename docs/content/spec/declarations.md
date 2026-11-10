@@ -1228,24 +1228,28 @@ Writing module state from a thread's body is refused as reading it is
 
 `type Name = T` declares a **type alias**: another name for the type `T`, declared at the top level
 of a file beside data types and classes. A generic alias takes type parameters, and each use gives
-it type arguments:
+it type arguments. An alias earns its place where a type is long or repeated: a function type, a
+nested generic, a generic with some of its arguments fixed:
 
 ```text
-type Point = (int, int)
-type Pairs[T] = Vector[(T, T)]
-type Handler = (string) -> unit
-type Route = Pairs[Point]
+type Handler = (Request) -> Result[Response, HttpError]
+type Index = Map[string, Vector[(int, string)]]
+type Parsed[T] = Result[T, ParseError]
+type Lookup = (Index, string) -> Parsed[int]
 
-lengthOf(r: Route) -> int = r.length()
-val h: Handler = s -> println(s)
+serve(path: string, h: Handler) -> unit = …
+val log: (string) -> unit = println(_)
 ```
 
+A short type needs no alias, and a value with its own identity and named fields is a `data` type
+rather than an alias of a tuple: `data Point(x: int, y: int)`, not `type Point = (int, int)`.
+
 An alias is **transparent**: a use of it is its expansion, the body with each type argument in place
-of its parameter, and nothing else. It makes no new type and needs no conversion: a `Point` is a
-`(int, int)` and the other way round, two overloads whose parameters differ only by an alias take
+of its parameter, and nothing else. It makes no new type and needs no conversion: a `Parsed[int]` is a
+`Result[int, ParseError]` and the other way round, two overloads whose parameters differ only by an alias take
 the same parameter types, and a diagnostic names the expansion, the type compared. An alias may be
 written wherever a type is: a parameter, a result, a binding, a data or class field, a type
-argument, a tuple, a function type, a type pattern (`p: Point`), and another alias's body, which may
+argument, a tuple, a function type, a type pattern (`r: Parsed[int]`), and another alias's body, which may
 name an alias declared after it.
 
 - A generic alias takes exactly as many type arguments as it has parameters, and one without
