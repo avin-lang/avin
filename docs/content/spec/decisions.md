@@ -5093,14 +5093,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
     `size(_: string)`. *Why*: each says what to write. *Alternatives*: the generic messages, which
     name no member.
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed 2026-11-10: **Union types: the operations' choices the chapter left open** (branch
+- Settled on the user's delegation 2026-11-10: **Union types: the operations' choices the chapter left open** (branch
   `unions-ops`; [union types](/spec/unions/)).
   - **`?` converts an error union member by member whatever the function's error type is**, not
     only where it is no union: an `IoError | ParseError` passed on from a function yielding
@@ -5132,6 +5125,13 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
     the member that does not conform; a trait taking `Self` other than as the receiver); a result
     with a scalar error union names `mapErr(e -> e)`. *Why*: each names the fix. *Alternatives*: the
     general messages alone.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
