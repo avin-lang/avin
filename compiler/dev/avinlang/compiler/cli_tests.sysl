@@ -4,7 +4,6 @@ module dev.avinlang.compiler
 import sysl.fs.{entries, exists, is_link, make_dir_all, make_temp_dir, read_text, remove_dir_all, symlink, write_bytes, write_text}
 import sysl.buf.{Buf, buf}
 import sysl.process.{Exited, capture}
-import sysl.time.now
 
 private struct Run
     status: int
@@ -22,6 +21,9 @@ help_and_version()
     val help = avin(["avin", "--help"])
     assert_eq(help.status, 0)
     assert(help.said.starts_with("usage: avin "))
+    assert(help.said.contains("avin test [<program>] [<filter>] [--prefix] "))
+    assert(help.said.contains("`--prefix` puts each file's path and a colon before every result line"))
+    assert(help.said.contains("check [<program>] [--bindings]"))
     assert_eq(help.noted, "")
     val version = avin(["avin", "--version"])
     assert_eq(version.status, 0)
@@ -242,45 +244,66 @@ default_output_name()
     assert_eq(default_output("examples/hello.avin"), "hello")
     assert_eq(default_output("/tmp/a/hello.world.avin"), "hello.world")
 
-// The names in the toolchain's shim cache, or none where it does not exist yet.
-private shim_archives() -> Buf[string]
+// The names in a toolchain's shim cache, or none where it does not exist yet.
+private shim_archives(tc: Toolchain) -> Buf[string]
     var names: Buf[string] = buf()
-    if entries(repository_toolchain().shim_cache()) is Ok(found)
+    if entries(tc.shim_cache()) is Ok(found)
         for n in found do names.push(n)
     names
 
-@test("check builds no shim archive for a valid Sysl binding, and check --bindings builds it")
+// The repository's toolchain building into a cache of its own under `dir`, so what a test builds is
+// removed with `dir` and never left in the user's cache.
+private private_toolchain(dir: string) -> Toolchain
+    val real = repository_toolchain()
+    Toolchain(real.root, dir + "/cache", real.clang, real.sysl, real.pkg_config)
+
+private avin_with(tc: Toolchain, args: []const string) -> Run
+    var said = ""
+    var noted = ""
+    val status = run_cli(args, Some(tc), s -> said = said + s + "\n", s -> noted = noted + s + "\n")
+    Run(status, said, noted)
+
+@test("check builds no shim archive for a valid Sysl binding, and check --bindings builds it in the toolchain's own cache")
 check_builds_no_shims()
     val dir = make_temp_dir("avin-cli").unwrap()
     defer _ = remove_dir_all(dir)
+    val tc = private_toolchain(dir)
     val file = dir + "/bound.avin"
-    // Archives are keyed by their shim's text, so a name no earlier run used keeps the archive from existing already.
-    val name = s"checkStopsEarlyLower${now().us}"
-    write_text(file, "@sysl(\"sysl.text.to_lower\")\n" + name + "(s: string) -> string\n\nmain() = 0\n").unwrap()
-    val before = shim_archives().len()
-    val checked = avin(["avin", "check", file])
+    write_text(file, "@sysl(\"sysl.text.to_lower\")\ncheckStopsEarlyLower(s: string) -> string\n\nmain() = 0\n").unwrap()
+    val checked = avin_with(tc, ["avin", "check", file])
     assert_eq(checked.status, 0)
     assert_eq(checked.said, "checked " + file + "\n")
-    assert_eq(shim_archives().len(), before)
-    val deep = avin(["avin", "check", file, "--bindings"])
+    assert_eq(shim_archives(tc).len(), 0)
+    val deep = avin_with(tc, ["avin", "check", file, "--bindings"])
     assert_eq(deep.status, 0)
     assert_eq(deep.said, "checked " + file + "\n")
-    assert(shim_archives().len() > before)
+    // The archive is built into the cache the toolchain names, which is under `dir`, so nothing is
+    // left behind once `dir` is removed.
+    val built = shim_archives(tc)
+    assert(built.len() > 0)
+    var archives = 0
+    for n in built
+        if n.ends_with(".a") then archives += 1
+    assert_eq(archives, 1)
+    assert(tc.shim_cache().starts_with(dir + "/"))
+    // A second check --bindings of the same source finds the archive and builds no other.
+    assert_eq(avin_with(tc, ["avin", "check", file, "--bindings"]).status, 0)
+    assert_eq(shim_archives(tc).len(), built.len())
 
 @test("check accepts a Sysl binding Sysl would reject, and check --bindings reports it")
 check_bindings_flag_reports_sysl_rejection()
     val dir = make_temp_dir("avin-cli").unwrap()
     defer _ = remove_dir_all(dir)
+    val tc = private_toolchain(dir)
     val file = dir + "/mismatch.avin"
     write_text(file, "main() = 0\n\n@sysl(\"sysl.text.to_upper\")\ncheckStopsEarlyShout(s: char) -> string\n").unwrap()
-    val before = shim_archives().len()
-    assert_eq(avin(["avin", "check", file]).status, 0)
-    assert_eq(shim_archives().len(), before)
-    val deep = avin(["avin", "check", file, "--bindings"])
+    assert_eq(avin_with(tc, ["avin", "check", file]).status, 0)
+    assert_eq(shim_archives(tc).len(), 0)
+    val deep = avin_with(tc, ["avin", "check", file, "--bindings"])
     assert_eq(deep.status, 1)
     assert_eq(deep.said, "")
     assert(deep.noted.contains("the Sysl binding `checkStopsEarlyShout` does not match `sysl.text.to_upper`"))
-    assert_eq(shim_archives().len(), before)
+    assert_eq(shim_archives(tc).len(), 0)
 
 @test("check reports a C binding that names no header, with or without --bindings")
 check_reports_headerless_c_binding()

@@ -321,17 +321,49 @@ new_packages()
     assert_eq(avin(dir, ["avin", "new", "a", "b"]).status, 2)
     assert_eq(avin(dir, ["avin", "new", "a", "--bin"]).status, 2)
 
-// Runs git in `dir` as a fixed author that signs nothing, so a test's repositories are made alike on
-// every machine.
-private git(dir: string, args: []const string)
+// The arguments that run git in `dir` as a fixed author that signs nothing, so a test's repositories
+// are made alike on every machine, and that never start git's background maintenance: a commit would
+// otherwise leave a detached `git maintenance` holding `objects/maintenance.lock`, which a local
+// clone of the repository copies, and fails on, if the lock comes and goes while it reads.
+private git_args(dir: string, args: []const string) -> Buf[string]
     var all: Buf[string] = buf()
-    for a in ["-C", dir, "-c", "user.name=avin", "-c", "user.email=avin@example.com", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "-c", "init.defaultBranch=main"]
+    for a in ["-C", dir, "-c", "user.name=avin", "-c", "user.email=avin@example.com", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "-c", "init.defaultBranch=main", "-c", "maintenance.auto=false", "-c", "gc.auto=0"]
         all.push(a)
     for a in args
         all.push(a)
+    all
+
+// Runs git in `dir` with `git_args`, and fails the test if it fails.
+private git(dir: string, args: []const string)
+    val all = git_args(dir, args)
     val result = capture("git", all.view(), stderr = true, timeout = 60000).unwrap()
     if !result.status.ok() then eprints(result.err.unwrap_or("") + result.text)
     assert(result.status.ok())
+
+// What git answers for `key` in `dir` as the tests' helper runs it.
+private helper_config(dir: string, key: string) -> string
+    val all = git_args(dir, ["config", "--get", key])
+    val result = capture("git", all.view(), stderr = true, timeout = 60000).unwrap()
+    assert(result.status.ok(), key)
+    result.text.trim()
+
+@test("the repositories the package tests make never start git's background maintenance, and a local clone of a just-committed one succeeds")
+test_repositories_skip_maintenance()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    val work = dir + "/work/quiet"
+    put(work + "/avin.hocon", manifest("quiet", ""))
+    git(work, ["init", "-q"])
+    assert_eq(helper_config(work, "maintenance.auto"), "false")
+    assert_eq(helper_config(work, "gc.auto"), "0")
+    // Commits back to back, each cloned locally at once: the clone copies `objects/`, which no
+    // maintenance started by a commit is writing into.
+    make_dir_all(dir + "/remotes").unwrap()
+    for i in 0..<5
+        put(work + s"/file$i.avin", s"module quiet\n\nvalue$i() -> int = $i\n")
+        commit_and_tag(work, s"v0.$i.0")
+        git(dir, ["clone", "-q", "--bare", work, dir + s"/remotes/quiet$i.git"])
+        assert(!exists(work + "/.git/objects/maintenance.lock"))
 
 private commit_and_tag(work: string, tag: string)
     git(work, ["add", "-A"])
