@@ -1,0 +1,63 @@
+// expect: exit 0
+// Cancellation under load, with the collector running at every allocation: rounds of scopes whose
+// threads allocate lists, wait on channels, sleep and start scopes of their own, each round cancelled
+// at a different moment, some while a thread is still starting more. Every round's scope returns,
+// every thread that finished has the right result, and once the scopes have returned no thread of
+// theirs is left running: none of them does anything afterwards. The stacks and timers of the
+// cancelled threads are given back, so many rounds run in little memory.
+import avin.threads.{Atomic, Channel, scope, sleep}
+import avin.time.millis
+
+build(n: int) -> List[int] = if n == 0 then [] else n :: build(n - 1)
+
+work(i: int, ch: Channel[int], late: Atomic[int]) -> int
+    if i % 4 == 0
+        var total = 0
+        while true
+            total = build(50).sum()
+        total
+    elif i % 4 == 1
+        ch.receive().getOrElse(0)
+    elif i % 4 == 2
+        sleep(millis(40))
+        late.add(1)
+        build(10).length()
+    else
+        scope(inner ->
+            val ts = (0..<3).map(j -> inner.spawn(() ->
+                sleep(millis(40))
+                late.add(1)
+                j)).toVector()
+            ts.map(t -> t.join()).sum())
+
+main() -> int
+    val late = Atomic(0)
+    var wrong = 0
+    for round in 0..<30
+        val ch = Channel[int]()
+        val spawner = Atomic(0)
+        val ts = scope(s ->
+            val ts = (0..<8).map(i -> s.spawn(() -> work(i, ch, late))).toVector()
+            // A thread that starts a scope of many threads, cancelled while it is starting them.
+            val many = s.spawn(() -> scope(inner ->
+                for _ in 0..<40
+                    spawner.add(1)
+                    inner.spawn(() ->
+                        sleep(millis(40))
+                        late.add(1)
+                        0)
+                1))
+            sleep(millis(long(round % 5)))
+            s.cancel()
+            ts :+ many)
+        for (t, i) in ts.zipWithIndex()
+            t.result() match
+                Some(v) ->
+                    val expected = if i == 8 then 1 elif i % 4 == 2 then 10 elif i % 4 == 3 then 3 else -1
+                    if v != expected then wrong += 1
+                None -> ()
+    val settled = late.load()
+    sleep(millis(100))
+    println(wrong)
+    println(late.load() == settled)
+    0

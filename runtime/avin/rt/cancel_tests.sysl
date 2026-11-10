@@ -1,0 +1,76 @@
+module avin.rt
+@tests
+
+import sysl.raw.ptr_cast
+import sysl.sync.*
+import sysl.time.{millis, sleep}
+
+// Cancellation of lightweight threads started as compiled code starts them, through `thread_start`
+// with a Sysl function as the runner and the test's own state as the closure. A function handed over
+// by its address may not reach the stop itself, which drops every frame below it, so these threads
+// see their cancellation as compiled code's entry points do and end of their own accord where those
+// would stop; the stop itself is the execution corpus's to test.
+
+private struct CancelJoints
+    frame: Frame
+    slots: [16]*u8
+
+@assert(offsetof(CancelJoints, slots) == sizeof(Frame), "a frame's slots follow its header")
+
+private var cancel_joints: CancelJoints = CancelJoints(Frame(null, 16), [null; 16])
+
+private struct Stopping
+    began: Atomic[u32]
+    ended: Atomic[u32]
+    halt: Atomic[u32]
+
+private var stopping_state: Stopping = Stopping(Atomic(0), Atomic(0), Atomic(0))
+
+private spin_until_halted(c: *Context, run: *u8) -> unit
+    val s: *Stopping = ptr_cast(run)
+    _ = s.began.add(1)
+    while s.halt.load(Relaxed) == 0
+        if requested.load(Relaxed) != 0
+            safepoint(c)
+            if is_cancelled(c) && may_cancel(c, 0) then return
+    _ = s.ended.add(1)
+
+private sleep_long(c: *Context, run: *u8) -> unit
+    val s: *Stopping = ptr_cast(run)
+    _ = s.began.add(1)
+    if sleep_as(c, 3600000000, may_cancel(c, 0)) then return
+    _ = s.ended.add(1)
+
+@test("cancelled threads see it at a poll and are woken from a sleep, and the Cancel bit falls once they have ended")
+cancelled_threads_stop()
+    stopping_state.began.store(0)
+    stopping_state.ended.store(0)
+    stopping_state.halt.store(0)
+    val me = thread_attach()
+    cancel_joints.frame.prev = me.top
+    me.top = &cancel_joints.frame
+    for i in 0..<8
+        val body = if i % 2 == 0 then &spin_until_halted else &sleep_long
+        cancel_joints.slots[i] = thread_start(me, ptr_cast(&stopping_state), LeastStack, ptr_cast(body))
+    for _ in 0..<2000
+        if stopping_state.began.load() == 8 then break
+        sleep(millis(1))
+    assert_eq(cancels_outstanding(), 0u64)
+    for i in 0..<8 do thread_cancel(me, cancel_joints.slots[i])
+    for i in 0..<8
+        thread_join(me, cancel_joints.slots[i])
+        // Cancelling a thread that has ended does nothing.
+        thread_cancel(me, cancel_joints.slots[i])
+        cancel_joints.slots[i] = null
+    me.top = cancel_joints.frame.prev
+    thread_detach(me)
+    assert_eq(stopping_state.ended.load(), 0u32)
+    assert_eq(cancels_outstanding(), 0u64)
+    assert_eq(requested.load() & Cancel, 0u32)
+
+@test("a thread that is not lightweight has no cancellation and may not be stopped")
+os_threads_are_not_cancellable()
+    val me = thread_attach()
+    assert(!is_cancelled(me))
+    assert(!may_cancel(me, 0))
+    thread_detach(me)

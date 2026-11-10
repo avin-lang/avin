@@ -55,6 +55,12 @@ struct Lwt
     low: *u8
     next: *Lwt
     me: Option[&Lwt]
+    /** 1 once a scope has cancelled the thread (`cancel.sysl`). */
+    cancelled: Atomic[u32]
+    /** Held while the thread's cancellation is set or armed, and while a wait's arming is undone. */
+    cancel_guard: SleepLock
+    /** The waiter of the cancellable wait the thread is parked in, or null. */
+    cancel_waiter: *Waiter
 
 @assert(offsetof(Lwt, context) == 0, "a lightweight thread's context is the start of its storage")
 @assert(offsetof(Lwt, run) == offsetof(Lwt, root) + sizeof(Frame), "a frame's slots follow its header")
@@ -230,10 +236,15 @@ private run_on(k: *Carrier, p: *Lwt)
     val after = k.after
     k.after = AfterNothing
     if after == AfterPark
-        if k.after_waiter != null then add_timer(k.after_waiter, k.after_deadline)
+        // A thread already cancelled when it parks in a cancellable wait is made ready at once, its
+        // wait ended as cancelled, with no timer set.
+        val cancelled = k.after_cancel != null && arm_cancel(p, k.after_cancel)
+        if !cancelled && k.after_waiter != null then add_timer(k.after_waiter, k.after_deadline)
         if k.after_guard != null then k.after_guard.unlock()
         k.after_guard = null
         k.after_waiter = null
+        k.after_cancel = null
+        if cancelled then make_ready(p)
     elif after == AfterYield
         make_ready(p)
     elif after == AfterEnd
@@ -250,8 +261,7 @@ private set_current(c: *Context)
 lwt_entry(p: *Lwt) -> unit
     val c = &p.context
     mark_running(c)
-    val entry: *extern(*Context, *u8) -> unit = ptr_cast(p.runner)
-    entry(c, p.run)
+    _ = run_cancellable(c, p.run, p.runner)
     lwt_finish(p)
 
 // Ends `p`: detaches its context, wakes its joiners, and switches away for the last time; its worker
@@ -266,6 +276,7 @@ private lwt_finish(p: *Lwt)
     unlink(c)
     joint_finished(p.joint)
     heap_lock.unlock()
+    cancel_finished(p)
     val k = c.carrier
     k.after = AfterEnd
     fiber.switch(&p.fiber, &k.home)
@@ -275,6 +286,11 @@ private lwt_finish(p: *Lwt)
  * at `deadline`, in microseconds of the monotonic clock, unless something else has first. Every
  * reference the thread still needs is in its frames. */
 park(ctx: *Context, guard: *SleepLock, w: *Waiter, deadline: long)
+    park_as(ctx, guard, w, deadline, null)
+
+/** `park`, where `cancel` is the thread's waiter in a wait its cancellation ends (`cancel.sysl`), or
+ * null in one it does not. */
+park_as(ctx: *Context, guard: *SleepLock, w: *Waiter, deadline: long, cancel: *Waiter)
     mark_safe(ctx)
     val p: *Lwt = ptr_cast(ctx)
     val k = ctx.carrier
@@ -282,7 +298,9 @@ park(ctx: *Context, guard: *SleepLock, w: *Waiter, deadline: long)
     k.after_guard = guard
     k.after_waiter = w
     k.after_deadline = deadline
+    k.after_cancel = cancel
     fiber.switch(&p.fiber, &k.home)
+    if cancel != null then disarm_cancel(p)
     mark_running(ctx)
 
 /** Answers the scheduler's request, if any, that the lightweight thread `c` belongs to yield its
@@ -314,7 +332,7 @@ private settle_yield()
         if k.yield_wanted.load() != 0 then wanted = true
         k = k.worker_next
     sched.unlock_raw()
-    if !wanted then _ = requested.and(Stop)
+    if !wanted then _ = requested.and(Stop | Cancel)
 
 // One thread waiting: on a lock, a condition, a join or a time. It lives in the waiting thread's
 // context, and is linked into the queue of what it waits on under that queue's guard, and into the
@@ -340,6 +358,8 @@ const WaitPending: u32 = 0
 const WaitWoken: u32 = 1
 /** A waiter whose time ran out. */
 const WaitTimedOut: u32 = 2
+/** A waiter whose thread was cancelled. */
+const WaitCancelled: u32 = 3
 
 private waiter_at(at: usize) -> *Waiter = ptr_cast(at)
 
@@ -418,10 +438,15 @@ private wake_waiter(w: *Waiter) -> bool
  * `deadline` is positive, until that time on the monotonic clock in microseconds: answers whether it
  * was woken. The guard is let go during the wait and is not held when it answers. A lightweight thread
  * parks; any other thread blocks, safe for the collector. */
-wait_on(ctx: *Context, q: *WaitQueue, w: *Waiter, deadline: long) -> bool
+wait_on(ctx: *Context, q: *WaitQueue, w: *Waiter, deadline: long) -> bool = wait_on_as(ctx, q, w, deadline, false)
+
+/** `wait_on`, which the thread's cancellation also ends where `cancellable`: it answers `false`, with
+ * `w`'s state `WaitCancelled` and `w` off `q`, and the caller goes on with the cancellation
+ * (`cancel.sysl`). */
+wait_on_as(ctx: *Context, q: *WaitQueue, w: *Waiter, deadline: long, cancellable: bool) -> bool
     if runs_lightweight(ctx)
         w.lwt = ptr_cast(ctx)
-        park(ctx, &q.guard, if deadline > 0 then w else null, deadline)
+        park_as(ctx, &q.guard, if deadline > 0 then w else null, deadline, if cancellable then w else null)
         if deadline > 0 then cancel_timer(w)
     else
         q.guard.unlock()
@@ -450,21 +475,30 @@ deadline_in(us: long) -> long = now_micros() + (if us > LongestWait then Longest
  * thread parks on a timer, leaving its worker to run others, and any other thread blocks, safe for
  * the collector, until the time has passed. */
 sleep_for(ctx: *Context, us: long)
-    if us <= 0 then return
-    if runs_lightweight(ctx)
-        park_until(ctx, deadline_in(us))
-    else
-        enter_safe(ctx)
-        val w = waiter_of(ctx)
-        block_until_woken(w, deadline_in(us))
-        leave_safe(ctx)
+    _ = sleep_as(ctx, us, false)
 
-// Parks the lightweight thread `ctx` belongs to until `deadline`. Its timer is its only waker, and
-// takes itself off the timers as it fires, so nothing is left to cancel when the thread runs again.
-private park_until(ctx: *Context, deadline: long)
+/** `sleep_for`, which the thread's cancellation also ends where `cancellable`: answers whether it
+ * did, the caller to go on with the cancellation (`cancel.sysl`). */
+sleep_as(ctx: *Context, us: long, cancellable: bool) -> bool
+    if us <= 0 then return false
+    if runs_lightweight(ctx) then return park_until(ctx, deadline_in(us), cancellable)
+    enter_safe(ctx)
+    val w = waiter_of(ctx)
+    block_until_woken(w, deadline_in(us))
+    leave_safe(ctx)
+    false
+
+// Parks the lightweight thread `ctx` belongs to until `deadline`. Its timer takes itself off the
+// timers as it fires, so nothing is left to take off when the thread runs again, unless, where the
+// sleep is `cancellable`, the thread's cancellation woke it first: then its timer goes, and this
+// answers `true`.
+private park_until(ctx: *Context, deadline: long, cancellable: bool) -> bool
     val w = waiter_of(ctx)
     w.lwt = ptr_cast(ctx)
-    park(ctx, null, w, deadline)
+    park_as(ctx, null, w, deadline, if cancellable then w else null)
+    if w.state.load() != WaitCancelled then return false
+    cancel_timer(w)
+    true
 
 // The operating system threads waiting, which are few: the main thread and threads attached for a
 // callback. They sleep on one condition and each checks its own waiter when it wakes.
@@ -657,7 +691,7 @@ private oversee(now: long)
         if busy && blocked && b == k.seen_blocks && waiting && !stopping then release_worker(k)
         k.seen_blocks = b
         k = k.worker_next
-    if wanted then _ = requested.or(Yield) else _ = requested.and(Stop)
+    if wanted then _ = requested.or(Yield) else _ = requested.and(Stop | Cancel)
 
 // Stops counting `k`, held by a blocking call, against the target, and has another worker take the
 // ready threads.

@@ -1,0 +1,185 @@
+module avin.rt
+
+import sysl.raw.ptr_cast
+import sysl.sync.*
+import sysl.threads.SleepLock
+
+// Cancellation. A scope cancels the lightweight threads it started; a cancelled thread stops at its
+// next cancellation point, its frames are dropped, and it ends with no result. Every lightweight
+// thread runs its closure at a cancellation point of its own, and every scope a lightweight thread
+// runs sets one more around its body, so a cancellation stops first at the innermost scope the
+// thread is running: that scope cancels its own threads and waits for them, then goes on to the next,
+// until the thread ends.
+//
+// A thread is stopped only where nothing it shares is in doubt: a running thread at a safepoint poll,
+// a parked one in a cancellable wait (a sleep, a join, a condition, and so everything built on one:
+// a channel, a future, a `Mutex`'s condition). A thread that holds a lock, is initializing a
+// `lazy val` or runs an Avin function Sysl called is stopped only once it has left that region; in a
+// wait on a condition, the lock the condition goes with is let go while it waits, so that wait is
+// a cancellation point and the lock is not taken again. Waiting for a lock is not one: a lock is
+// held briefly, and a thread stopped while it waits would hold nothing either.
+//
+// A cancelled thread that is running is asked to call in by the `Cancel` bit of `requested`, which
+// stays raised while any cancelled thread has not yet ended. A parked thread is made ready with its
+// waiter's state `WaitCancelled`. A worker arms a thread's cancellation of its wait once the thread
+// has switched away and before what it waits on can wake it, under the thread's `cancel_guard`, and
+// the thread disarms it under the same guard as soon as it runs again, so the canceller only ever
+// finds a waiter whose thread is parked in that very wait.
+
+/** Where a cancelled thread returns to: the saved registers, and what its context held when the
+ * point was set, which the return puts back. */
+struct CancelPoint
+    env: [64]u64
+    top: *Frame
+    caller: *TrapSite
+    owner: u64
+    recovery: *Recovery
+    doubt: u32
+    previous: *CancelPoint
+
+/** The bit of `requested` raised while a cancelled thread has not yet ended. */
+const Cancel: u32 = 4
+
+// How many cancelled threads have not yet ended, under `cancel_count_lock`, with the `Cancel` bit
+// raised exactly while it is not zero.
+private var cancel_count_lock: SleepLock = SleepLock.new()
+private var cancels_pending: u64 = 0
+
+private cancel_raised()
+    cancel_count_lock.lock()
+    if cancels_pending == 0 then _ = requested.or(Cancel)
+    cancels_pending += 1
+    cancel_count_lock.unlock()
+
+private cancel_ended()
+    cancel_count_lock.lock()
+    cancels_pending -= 1
+    if cancels_pending == 0 then _ = requested.and(Stop | Yield)
+    cancel_count_lock.unlock()
+
+/** How many cancelled threads have not yet ended. */
+cancels_outstanding() -> u64
+    cancel_count_lock.lock()
+    val n = cancels_pending
+    cancel_count_lock.unlock()
+    n
+
+/** Runs `run`, a closure that takes nothing and returns nothing, so that a cancellation of the
+ * calling thread returns here, and answers whether it did. A thread that returns here is still
+ * cancelled and cannot be stopped again until it calls `cancel_resume`, so what it does next, joining
+ * the threads of its scope, runs to its end. A thread that cannot be cancelled here, being no
+ * lightweight thread or being inside a region nothing may stop it in, runs `run` with no point of its
+ * own. `runner` is the program's closure runner. */
+@export("avin_rt_cancel_guarded")
+cancel_guarded(ctx: *Context, run: *u8, runner: *u8) -> bool
+    val entry: *extern(*Context, *u8) -> unit = ptr_cast(runner)
+    if !may_cancel(ctx, 0)
+        entry(ctx, run)
+        return false
+    guarded_run(ctx, run, entry)
+
+/** The cancellation point a lightweight thread runs its closure at. */
+run_cancellable(ctx: *Context, run: *u8, runner: *u8) -> bool
+    val entry: *extern(*Context, *u8) -> unit = ptr_cast(runner)
+    guarded_run(ctx, run, entry)
+
+private guarded_run(ctx: *Context, run: *u8, entry: *extern(*Context, *u8) -> unit) -> bool
+    var pt = CancelPoint([0u64; 64], ctx.top, ctx.caller, ctx.owner, ctx.recovery, ctx.doubt, ctx.cancel_point)
+    ctx.cancel_point = &pt
+    if save_point(&pt.env[0]) == 0
+        entry(ctx, run)
+        ctx.cancel_point = ctx.cancel_point.previous
+        return false
+    // Back from a cancellation, with the context as it was when the point was set; the point is read
+    // through the context, since the locals of this frame may not have survived the return.
+    ctx.cancel_point = ctx.cancel_point.previous
+    true
+
+/** Goes on with the cancellation of the calling thread from the scope that a cancellation returned
+ * to, once that scope's threads have ended: to the next scope out, or to the end of the thread. */
+@export("avin_rt_cancel_resume")
+cancel_resume(ctx: *Context) -> never
+    leave_doubt(ctx)
+    unwind_cancelled(ctx)
+
+/** Cancels the thread `joint` was given back for, unless it has ended. */
+@export("avin_rt_thread_cancel")
+thread_cancel(ctx: *Context, joint: *u8)
+    val j: *Joint = ptr_cast(joint)
+    j.waiting.guard.lock()
+    if !j.done then request_cancel(j.lwt)
+    j.waiting.guard.unlock()
+
+// Cancels `p`, which has not ended: marks it, and makes it ready where it is parked in a cancellable
+// wait.
+private request_cancel(p: *Lwt)
+    p.cancel_guard.lock()
+    if p.cancelled.load() == 0
+        p.cancelled.store(1)
+        cancel_raised()
+        val w = p.cancel_waiter
+        if w != null && w.state.cas(WaitPending, WaitCancelled) == WaitPending then make_ready(p)
+    p.cancel_guard.unlock()
+
+/** Whether the thread of `ctx` has been cancelled. */
+is_cancelled(ctx: *Context) -> bool
+    if !runs_lightweight(ctx) then return false
+    val p: *Lwt = ptr_cast(ctx)
+    p.cancelled.load() != 0
+
+/** Whether a wait the thread of `ctx` begins now, holding `held` locks the wait lets go, may be
+ * ended by its cancellation: a lightweight thread's, inside no region nothing may stop it in. */
+may_cancel(ctx: *Context, held: u32) -> bool =
+    runs_lightweight(ctx) && ctx.cancel_point != null && ctx.doubt == ctx.cancel_point.doubt + held && ctx.uncancellable == 0
+
+/** Enters a region the calling thread's cancellation does not stop it in. */
+@export("avin_rt_uncancellable_enter")
+uncancellable_enter(ctx: *Context)
+    ctx.uncancellable += 1
+
+/** Leaves the region `uncancellable_enter` entered; a cancellation that came meanwhile stops the
+ * thread at its next cancellation point. */
+@export("avin_rt_uncancellable_leave")
+uncancellable_leave(ctx: *Context)
+    if ctx.uncancellable > 0 then ctx.uncancellable -= 1
+
+/** By the worker of `p`, which has just parked with `w` as its waiter in a cancellable wait, before
+ * anything can wake it: answers `true` where `p` is already cancelled, its wait ended as cancelled
+ * and its worker to make it ready, and otherwise arms the cancellation of the wait. */
+arm_cancel(p: *Lwt, w: *Waiter) -> bool
+    p.cancel_guard.lock()
+    var now = false
+    if p.cancelled.load() != 0
+        _ = w.state.cas(WaitPending, WaitCancelled)
+        now = true
+    else
+        p.cancel_waiter = w
+    p.cancel_guard.unlock()
+    now
+
+/** By `p` as soon as it runs again after a cancellable wait: a cancellation no longer reaches the
+ * wait. */
+disarm_cancel(p: *Lwt)
+    p.cancel_guard.lock()
+    p.cancel_waiter = null
+    p.cancel_guard.unlock()
+
+/** At a safepoint poll: stops the thread of `c` where it is cancelled and may be stopped here. */
+cancel_at_poll(c: *Context)
+    if is_cancelled(c) && may_cancel(c, 0) then unwind_cancelled(c)
+
+/** Stops the thread of `ctx`, which is cancelled and running: returns to its innermost cancellation
+ * point, with every frame since dropped, and nothing to stop it again until it resumes. */
+unwind_cancelled(ctx: *Context) -> never
+    val pt = ctx.cancel_point
+    ctx.top = pt.top
+    ctx.caller = pt.caller
+    ctx.owner = pt.owner
+    ctx.recovery = pt.recovery
+    ctx.doubt = pt.doubt + 1
+    return_to(&pt.env[0], 1)
+
+/** By an ending lightweight thread, once it can no longer be cancelled: counts its cancellation, if
+ * it had one, as ended. */
+cancel_finished(p: *Lwt)
+    if p.cancelled.load() != 0 then cancel_ended()

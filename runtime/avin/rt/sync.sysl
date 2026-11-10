@@ -95,23 +95,38 @@ condition_new(ctx: *Context) -> *u8
  * and takes the lock again. The thread is safe for the collector from before it lets the lock go until
  * it holds it again. A wait may also end with no notification, so the caller checks what it waits for
  * again. */
-@export("avin_rt_condition_wait")
 condition_wait(ctx: *Context, p: *u8, lock: *u8)
-    _ = wait_notified(ctx, p, lock, 0)
+    _ = wait_notified(ctx, p, lock, 0, false)
 
 /** `condition_wait` for at most `millis` milliseconds: answers `false` where the time ran out before a
  * notification came. Either way the lock is held again when it answers, and the caller checks what it
  * waits for again. A time that is not positive answers `false` at once, without letting the lock go. */
-@export("avin_rt_condition_wait_for")
 condition_wait_for(ctx: *Context, p: *u8, lock: *u8, millis: long) -> bool
     if millis <= 0 then return false
-    wait_notified(ctx, p, lock, deadline_after(millis))
+    wait_notified(ctx, p, lock, deadline_after(millis), false) == WaitWoken
+
+/** `condition_wait` as compiled code waits, which the thread's cancellation also ends where the lock
+ * is the only region the thread is in (`cancel.sysl`): the thread then stops, without the lock, which
+ * it let go to wait. */
+@export("avin_rt_condition_wait")
+condition_wait_cancellable(ctx: *Context, p: *u8, lock: *u8)
+    if wait_notified(ctx, p, lock, 0, may_cancel(ctx, 1)) == WaitCancelled then unwind_cancelled(ctx)
+
+/** `condition_wait_for` as compiled code waits, which the thread's cancellation also ends, as in
+ * `condition_wait_cancellable`. */
+@export("avin_rt_condition_wait_for")
+condition_wait_for_cancellable(ctx: *Context, p: *u8, lock: *u8, millis: long) -> bool
+    if millis <= 0 then return false
+    val ended = wait_notified(ctx, p, lock, deadline_after(millis), may_cancel(ctx, 1))
+    if ended == WaitCancelled then unwind_cancelled(ctx)
+    ended == WaitWoken
 
 // Waits on the condition `p` with the lock `lock` let go, until notified or, where `deadline` is
-// positive, until then; takes the lock again and answers whether it was notified. The waiter joins the
-// condition's queue before the lock is let go, so a notification made under the lock after that is
-// never missed.
-private wait_notified(ctx: *Context, p: *u8, lock: *u8, deadline: long) -> bool
+// positive, until then; takes the lock again and answers how the wait ended. Where `cancellable`, the
+// thread's cancellation ends the wait too, answering `WaitCancelled` without taking the lock again.
+// The waiter joins the condition's queue before the lock is let go, so a notification made under the
+// lock after that is never missed.
+private wait_notified(ctx: *Context, p: *u8, lock: *u8, deadline: long, cancellable: bool) -> u32
     val c: *ParkCondition = ptr_cast(p)
     val w = waiter_of(ctx)
     var r = Holding(Frame(ctx.top, 2), p, lock)
@@ -119,10 +134,11 @@ private wait_notified(ctx: *Context, p: *u8, lock: *u8, deadline: long) -> bool
     c.waiting.guard.lock()
     enqueue(&c.waiting, w)
     let_lock_go(lock)
-    val notified = wait_on(ctx, &c.waiting, w, deadline)
-    take_lock(ctx, lock)
+    _ = wait_on_as(ctx, &c.waiting, w, deadline, cancellable)
+    val ended = w.state.load()
+    if ended != WaitCancelled then take_lock(ctx, lock)
     ctx.top = r.frame.prev
-    notified
+    ended
 
 /** Milliseconds on a clock that only moves forward, from a starting point of no meaning: the
  * difference between two readings is the time between them, which a bounded wait counts down. */

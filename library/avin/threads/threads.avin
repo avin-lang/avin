@@ -76,19 +76,35 @@ impl[T: Sendable] Sendable for Thread[T]
 @keeps_owners
 class Thread[T](private val joint: Any, private val outcome: Outcome[T])
     // Waits for the thread to finish and gives back what its body returned. Joining again gives the
-    // same result again.
+    // same result again. Joining a thread its scope cancelled before its body returned traps, since it
+    // has no result; `result` answers `None` for one.
     join() -> T
         await(joint)
         outcome.value match
             Some(v) -> v
-            None -> fail("a joined thread left no result")
+            None -> fail("a joined thread was cancelled before it finished")
+
+    // Waits for the thread to end and answers what its body returned, or `None` where its scope
+    // cancelled it before its body returned.
+    result() -> Option[T]
+        await(joint)
+        outcome.value
 
 // Starts `body` on a new thread with a stack of `stack` bytes, 8 MiB unless asked otherwise, reserved
 // and committed only as the thread touches it, and 64 KiB at the least. The
 // Sysl handles `body` reaches that the calling code owns are the new thread's until its body
 // returns; then they, and those in what it returns, are in transit, for the next code to use them.
-spawn[T: Sendable](@sendable body: () -> T, stack: long = 8388608) -> Thread[T]
+spawn[T: Sendable](@sendable body: () -> T, stack: long = 8388608) -> Thread[T] = launch(body, stack).0
+
+// `spawn`, giving back too what a scope keeps of the thread: its joint, which the scope cancels it
+// by, and what hands back the Sysl handles its body reaches once it has ended, which a thread
+// cancelled before its body returned did not do itself. Where `runs` is false the thread is one a
+// cancelled scope starts: it runs nothing, and ends with no result.
+private launch[T: Sendable](@sendable body: () -> T, stack: long, runs: bool = true) -> (Thread[T], Any, () -> unit)
     val outcome = Outcome[T]()
+    if !runs
+        val joint = start(() -> (), stack)
+        return (Thread(joint, outcome), joint, () -> ())
     val owner = newOwner()
     handOver(body, currentOwner(), owner)
     val run = () ->
@@ -97,42 +113,103 @@ spawn[T: Sendable](@sendable body: () -> T, stack: long = 8388608) -> Thread[T]
         handOver(body, owner, inTransit)
         handOver(v, owner, inTransit)
         outcome.finish(v)
-    Thread(start(run, stack), outcome)
+    val joint = start(run, stack)
+    val handBack = () ->
+        if outcome.value.isEmpty() then handOver(body, owner, inTransit)
+    (Thread(joint, outcome), joint, handBack)
 
-// What a scope has started: a join of each of its threads, newest first, and whether it is still
-// open. It belongs to the thread that runs the scope's body.
+// Cancels the thread `joint` was given back for, unless it has ended.
+@intrinsic("thread_cancel")
+private cancelThread(joint: Any)
+
+// Runs `run` so that a cancellation of the calling thread returns here, and answers whether it did.
+// The thread is then still cancelled, but nothing stops it again until it calls `resumeCancel`.
+@intrinsic("cancel_guarded")
+private cancelGuarded(run: () -> unit) -> bool
+
+// Goes on with the calling thread's cancellation, which returned to `cancelGuarded`: to the scope
+// around this one, or to the end of the thread.
+@intrinsic("cancel_resume")
+private resumeCancel() -> Nothing
+
+// Enters, and leaves, a region the calling thread's cancellation does not stop it in, for work other
+// threads wait on that holds no lock, such as running what waits for a future the thread completed. A
+// cancellation that comes meanwhile stops the thread at its next cancellation point after.
+@intrinsic("uncancellable_enter")
+private enterUncancellable()
+
+@intrinsic("uncancellable_leave")
+private leaveUncancellable()
+
+// What a scope has started: the joint of each of its threads and what hands back the handles of one
+// that was cancelled, newest first, whether it is still open and whether it has been cancelled. It
+// belongs to the thread that runs the scope's body.
 private class Started()
     val owner = current()
     var open = true
-    var joins: List[() -> unit] = []
+    var cancelled = false
+    var joints: List[Any] = []
+    var handBacks: List[() -> unit] = []
 
-    // Joins every thread started so far, and closes the scope.
+    // Cancels every thread started so far; one started later runs nothing.
+    cancelAll()
+        cancelled = true
+        for j in joints do cancelThread(j)
+
+    // Waits for every thread started so far to end, hands back the handles the cancelled ones
+    // reached, and closes the scope.
     close()
-        for j in joins do j()
+        for j in joints do await(j)
+        for h in handBacks do h()
         open = false
 
-// The threads one call of `scope` starts, which it joins before it returns. They are started by the
-// thread that runs the scope's body, while the scope is open.
+    // Checks that the scope is open and used by the thread that runs its body.
+    use(what: string)
+        if !open then fail("a scope's threads are " + what + " while it is open")
+        if current() != owner then fail("a scope's threads are " + what + " by the thread that runs its body")
+
+// The threads one call of `scope` starts, which it waits for before it returns. They are started, and
+// cancelled, by the thread that runs the scope's body, while the scope is open.
 @keeps_owners
 class Scope(private val started: Started)
     // Starts `body` on a new thread with a stack of `stack` bytes, as `spawn` does, which the scope
-    // joins before it returns.
+    // waits for before it returns. In a cancelled scope the thread starts cancelled, and ends before
+    // its body runs.
     spawn[T: Sendable](@sendable body: () -> T, stack: long = 8388608) -> Thread[T]
-        if !started.open then fail("a scope's threads are started while it is open")
-        if current() != started.owner then fail("a scope's threads are started by the thread that runs its body")
-        val t = startThread(body, stack)
-        val joinIt: () -> unit = () ->
-            t.join()
-            ()
-        started.joins = joinIt :: started.joins
+        started.use("started")
+        // A cancellation of the calling thread does not come between starting the thread and
+        // recording it, so the scope always waits for it.
+        // A thread started in a cancelled scope runs nothing, and ends with no result.
+        enterUncancellable()
+        val (t, joint, handBack) = launch(body, stack, !started.cancelled)
+        started.joints = joint :: started.joints
+        started.handBacks = handBack :: started.handBacks
+        leaveUncancellable()
         t
 
-private startThread[T: Sendable](@sendable body: () -> T, stack: long) -> Thread[T] = spawn(body, stack)
+    // Cancels every thread the scope has started and every one it starts from now on: each stops at
+    // its next cancellation point, and its result is `None`. The scope still waits for them all before
+    // it returns, and the body goes on.
+    cancel()
+        started.use("cancelled")
+        started.cancelAll()
+
+    // Whether the scope has been cancelled, by `cancel` or by a cancellation of the thread running it.
+    isCancelled() -> bool = started.cancelled
 
 // Runs `body` with a new scope, and returns what it returns once every thread started through the
-// scope has finished.
+// scope has ended. Where the thread running it is itself cancelled, by a scope it was started in,
+// the scope cancels its own threads, waits for them to end, and the thread's cancellation goes on.
 scope[T](body: (Scope) -> T) -> T
     val started = Started()
-    val result = body(Scope(started))
-    started.close()
-    result
+    val out = Outcome[T]()
+    val run = () ->
+        out.finish(body(Scope(started)))
+        started.close()
+    if cancelGuarded(run)
+        started.cancelAll()
+        started.close()
+        resumeCancel()
+    out.value match
+        Some(v) -> v
+        None -> fail("a scope's body left no result")

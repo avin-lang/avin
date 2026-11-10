@@ -1,0 +1,57 @@
+// expect: exit 0
+// A cancelled thread is not stopped inside a region other threads may be waiting on, even at a
+// cancellation point: it goes on to the region's end and stops at its first cancellation point after.
+// A `lazy val` being initialized: the initializer, which sleeps, runs to its end, so every thread
+// reading the value gets it. A scope opened while holding a mutex: its threads are not cancelled with
+// the thread running it, they finish with their results, and the thread stops once it has let the
+// mutex go.
+import avin.threads.{Atomic, Channel, Mutex, Thread, scope, sleep}
+import avin.time.{hours, millis}
+
+val entered = Atomic(0)
+
+lazy val slow: int =
+    entered.store(1)
+    sleep(millis(40))
+    entered.store(2)
+    7
+
+main() -> int
+    val after = Atomic(0)
+    val lazyCase = scope(s ->
+        val t = s.spawn(() ->
+            val v = slow
+            sleep(hours(1))
+            after.add(1)
+            v)
+        while entered.load() == 0 do sleep(millis(1))
+        s.cancel()
+        t)
+    println(lazyCase.result())
+    println(entered.load())
+    println(slow)
+    val box = Mutex(0)
+    val handed = Channel[Thread[int]](1)
+    val started = Atomic(0)
+    val inLock = scope(s ->
+        val t = s.spawn(() ->
+            val r = box.with(_ -> scope(inner ->
+                val child = inner.spawn(() ->
+                    started.store(1)
+                    sleep(millis(40))
+                    5)
+                handed.send(child)
+                child.join()))
+            sleep(hours(1))
+            after.add(1)
+            r)
+        while started.load() == 0 do sleep(millis(1))
+        s.cancel()
+        t)
+    println(inLock.result())
+    handed.receive() match
+        Some(child) -> println(child.result())
+        None -> println("missing")
+    println(after.load())
+    println(box.update(v -> v + 1))
+    0

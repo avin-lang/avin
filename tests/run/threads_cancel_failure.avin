@@ -1,0 +1,64 @@
+// expect: exit 0
+// A trap in any thread stops the program, so a failure that should end a scope's other threads is a
+// value: here each thread sends its `Result` to the scope's body, which cancels the scope at the first
+// `Err` and returns that `Err` out of it. The slow threads are cancelled, the fast ones keep their
+// results, and the scope returns only once all have ended. The same scope with no failure returns
+// every value. The first thread to finish can also end the others, for a race.
+import avin.threads.{Atomic, Channel, scope, sleep}
+import avin.time.{hours, millis}
+
+// Items below 3 succeed at once, item 3 fails once they have, and the rest take an hour.
+fetch(i: int, done: Atomic[int]) -> Result[int, string]
+    if i == 3
+        while done.load() < 3 do sleep(millis(1))
+        Err(s"item $i failed")
+    elif i < 3
+        Ok(i * 10)
+    else
+        sleep(hours(1))
+        Ok(i)
+
+all(n: int, fail: bool) -> Result[Vector[int], string]
+    val results = Channel[Result[int, string]](n)
+    val done = Atomic(0)
+    scope(s ->
+        val ts = (0..<n).map(i -> s.spawn(() ->
+            val r = if fail then fetch(i, done) else Ok(i)
+            results.send(r)
+            done.add(1)
+            r)).toVector()
+        var got: Vector[int] = []
+        var outcome: Result[Vector[int], string] = Ok([])
+        var left = n
+        while left > 0
+            left -= 1
+            results.receive() match
+                Some(Ok(v)) -> got = got :+ v
+                Some(Err(e)) ->
+                    s.cancel()
+                    outcome = Err(e)
+                    left = 0
+                None -> left = 0
+        if outcome.isOk() then outcome = Ok(got.sorted())
+        val finished = ts.count(t -> t.result().isDefined())
+        println(s"cancelled: ${s.isCancelled()}, finished: $finished of $n")
+        outcome)
+
+main() -> int
+    println(all(6, true))
+    println(all(6, false))
+    // A race: the first answer wins and the rest are cancelled.
+    val losers = Atomic(0)
+    val winner = scope(s ->
+        val answers = Channel[int](4)
+        for i in 0..<4
+            s.spawn(() ->
+                if i != 2 then sleep(hours(1))
+                answers.send(i)
+                losers.add(1))
+        val w = answers.receive()
+        s.cancel()
+        w)
+    println(winner)
+    println(losers.load() <= 1)
+    0

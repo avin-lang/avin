@@ -1,0 +1,75 @@
+// expect: exit 0
+// A scope's `cancel` wakes a thread parked in every kind of wait: a sleep, a channel's receive and a
+// full channel's send, a join, a future's await (plain and timed), a promise's future, a condition's
+// wait inside its mutex (plain and timed). Each thread ends with no result, `result()` answers `None`,
+// and nothing after its wait runs. A wait of an hour would hold the test for an hour if the
+// cancellation did not end it. The threads say they are about to wait first, so most are parked when
+// the scope is cancelled; one not yet parked ends at its wait all the same.
+import avin.threads.{Atomic, Channel, Future, Mutex, Promise, scope, sleep, spawn}
+import avin.time.{hours, millis}
+
+main() -> int
+    val started = Atomic(0)
+    val after = Atomic(0)
+    val empty = Channel[int]()
+    val full = Channel[int](1)
+    full.send(0)
+    val never = Promise[int]()
+    val gate = Channel[int]()
+    val sleeper = spawn(() -> gate.receive())
+    val box = Mutex(0)
+    val changed = box.condition()
+    val results = scope(s ->
+        val ts = [
+            s.spawn(() ->
+                started.add(1)
+                sleep(hours(1))
+                after.add(1)),
+            s.spawn(() ->
+                started.add(1)
+                empty.receive()
+                after.add(1)),
+            s.spawn(() ->
+                started.add(1)
+                full.send(1)
+                after.add(1)),
+            s.spawn(() ->
+                started.add(1)
+                sleeper.join()
+                after.add(1)),
+            s.spawn(() ->
+                started.add(1)
+                never.future.await()
+                after.add(1)),
+            s.spawn(() ->
+                started.add(1)
+                never.future.await(hours(1))
+                after.add(1)),
+            s.spawn(() ->
+                started.add(1)
+                Future(sleep(hours(1))).await()
+                after.add(1)),
+            s.spawn(() ->
+                started.add(1)
+                box.with(_ ->
+                    changed.wait()
+                    0)
+                after.add(1)),
+            s.spawn(() ->
+                started.add(1)
+                box.with(_ ->
+                    changed.waitFor(hours(1))
+                    0)
+                after.add(1))]
+        while started.load() < ts.length() do sleep(millis(1))
+        sleep(millis(20))
+        s.cancel()
+        ts)
+    for t in results do println(t.result())
+    println(after.load())
+    // The mutex is free again, and the channels still work.
+    println(box.update(v -> v + 1))
+    println(full.receive())
+    gate.send(5)
+    println(sleeper.join())
+    0

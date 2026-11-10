@@ -12,10 +12,12 @@ import sysl.threads.SleepLock
 // closure go. What a thread is joined by is an object on the collected
 // heap, so it lives as long as the program can reach the thread and no longer.
 
-// The payload of a joint: whether the thread has ended, and the threads waiting for it to.
-private struct Joint
+/** The payload of a joint: whether the thread has ended, the threads waiting for it to, and the
+ * thread, which a cancellation reaches under the queue's guard while it has not ended. */
+struct Joint
     waiting: WaitQueue
     done: bool
+    lwt: *Lwt
 
 /** The descriptor of a joint. It holds no reference and names no type record: the library keeps it as
  * an opaque `Any` and never asks its type. */
@@ -40,7 +42,7 @@ thread_start(ctx: *Context, run: *u8, stack: long, runner: *u8) -> *u8
 // this makes is let go here, before it is published: from then on only its worker changes them.
 private prepare_thread(ctx: *Context, run: *u8, stack: long, runner: *u8) -> *Lwt
     val size: usize = if stack < LeastStack then usize(LeastStack) else usize(stack)
-    val s: &Lwt = Lwt(new_context(), Frame(null, 2), run, null, runner, fiber.Context.new(), None, null, null, None)
+    val s: &Lwt = Lwt(new_context(), Frame(null, 2), run, null, runner, fiber.Context.new(), None, null, null, None, Atomic(0), SleepLock.new(), null)
     s.me = Some(s)
     val p: *Lwt = ptr_cast(&*s)
     // The new thread's frame is the caller's top frame until the thread's context is attached, so the
@@ -49,7 +51,7 @@ private prepare_thread(ctx: *Context, run: *u8, stack: long, runner: *u8) -> *Lw
     ctx.top = &p.root
     p.joint = allocate(ctx, &joint_descriptor)
     val j: *Joint = ptr_cast(p.joint)
-    *j = Joint(new_wait_queue(), false)
+    *j = Joint(new_wait_queue(), false, p)
     val st = take_stack(size) match
         Some(st) -> st
         None -> cannot_start(ctx)
@@ -83,19 +85,30 @@ joint_finished(joint: *u8)
 
 /** Waits until the thread `joint` was given back for has ended. A lightweight thread parks; any other
  * blocks, safe for the collector. A second wait for the same thread returns at once. */
-@export("avin_rt_thread_join")
 thread_join(ctx: *Context, joint: *u8)
+    _ = join_as(ctx, joint, false)
+
+/** `thread_join` as compiled code waits, which the waiting thread's cancellation also ends: the thread
+ * then stops (`cancel.sysl`). */
+@export("avin_rt_thread_join")
+thread_join_cancellable(ctx: *Context, joint: *u8)
+    if join_as(ctx, joint, may_cancel(ctx, 0)) then unwind_cancelled(ctx)
+
+// Waits for the thread `joint` was given back for to end, or, where `cancellable`, for the waiting
+// thread's cancellation; answers whether the cancellation ended the wait.
+private join_as(ctx: *Context, joint: *u8, cancellable: bool) -> bool
     val j: *Joint = ptr_cast(joint)
     j.waiting.guard.lock()
     if j.done
         j.waiting.guard.unlock()
-        return
+        return false
     val w = waiter_of(ctx)
     var r = Holding(Frame(ctx.top, 1), joint, null)
     ctx.top = &r.frame
     enqueue(&j.waiting, w)
-    _ = wait_on(ctx, &j.waiting, w, 0)
+    _ = wait_on_as(ctx, &j.waiting, w, 0, cancellable)
     ctx.top = r.frame.prev
+    w.state.load() == WaitCancelled
 
 /** The calling thread's identity while it runs: its context's address. */
 @export("avin_rt_thread_current")

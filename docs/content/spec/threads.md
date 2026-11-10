@@ -61,6 +61,66 @@ main() -> int
     parts.map(p -> p.load()).sum()
 ```
 
+### Cancellation
+
+A scope can end its threads early. `s.cancel()` cancels every thread the scope has started, and every
+one it starts from then on; the scope still returns only once all of them have ended, and its body
+goes on running after the call. What a program can rely on:
+
+- **A cancelled thread stops at its next cancellation point** and ends with no result: nothing of its
+  body runs after that point. Its `result() -> Option[T]` answers `None`, and its `join()` traps,
+  since there is no value to give back; a thread that finished before its cancellation reached it
+  keeps its result, and `join` answers it as before. A thread started in a cancelled scope runs
+  nothing.
+- **Every wait is a cancellation point**: a `sleep`, a join, a channel's `receive` or a full channel's
+  `send`, a future's `await`, a promise's future, a condition's `wait` (plain or timed). A thread
+  parked in one is woken at once, however long the wait. **So is every safepoint poll**, which
+  compiled code makes on every back edge of a loop and before every call that may recur, so a thread
+  that computes without waiting stops too, within a loop's turn.
+- **A thread is never stopped where others may be waiting on what it is doing**: while it holds a
+  lock (inside a `Mutex`'s `with`, for one), while it initializes a `lazy val`, while it runs what
+  waits for a future it completed. It goes on to the end of that region and stops at its first
+  cancellation point after, so a cancelled thread never leaves a mutex held or a value half made. Waiting
+  for a lock is not a cancellation point; waiting on a condition is, and a thread stopped there does
+  not take its mutex again.
+- **Cancellation reaches down through scopes.** A cancelled thread that is running a scope of its own,
+  in that scope's body or waiting for its threads, stops first at that scope: the inner scope cancels
+  its threads and waits for them to end, and only then does the thread go on stopping. So every
+  thread below a cancelled scope has ended once that scope returns. Cancelling an inner scope cancels
+  only its own threads. A scope opened while its thread holds a lock is not cancelled with that
+  thread, since nothing stops the thread there: its threads finish, and the thread stops once it has
+  let the lock go.
+- `s.isCancelled()` answers whether the scope has been cancelled, by `cancel` or by a cancellation of
+  the thread running it. `cancel`, like `spawn`, is called by the thread that runs the scope's body
+  while the scope is open, and traps otherwise; cancelling twice is cancelling once.
+- **A failure is a value.** A trap still stops the whole program, so a scope's threads report a
+  failure by returning or sending a `Result`, and the body that sees it cancels the scope and returns
+  it. A cancelled thread runs no code of its own as it stops: what it must leave tidy is either under a
+  lock, which it finishes, or its own, which nothing else reaches. The Sysl handles its body reached,
+  a connection for one, are handed back once the scope has waited for it, as a body that returns
+  hands them back itself, so the code after the scope may use or close them.
+
+```avin
+import avin.threads.{Channel, scope}
+
+fetchAll(urls: Vector[string]) -> Result[Vector[string], string]
+    val pages = Channel[Result[string, string]](urls.length())
+    scope(s ->
+        for u in urls do s.spawn(() -> pages.send(fetch(u)))
+        var got: Vector[string] = []
+        var failure: Option[string] = None
+        while got.length() < urls.length() && failure.isEmpty()
+            pages.receive() match
+                Some(Ok(page)) -> got = got :+ page
+                Some(Err(e)) ->
+                    failure = Some(e)
+                    s.cancel()
+                None -> ()
+        failure match
+            Some(e) -> Err(e)
+            None -> Ok(got))
+```
+
 ## Lightweight threads
 
 Every thread a program starts is a lightweight thread: the runtime runs it on one of a few operating

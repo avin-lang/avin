@@ -5133,6 +5133,58 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- Proposed (branch `lwt-scope`): **Cancellation by a scope stops a thread and drops its frames**
+  ([cancellation](/spec/threads/#cancellation)). `s.cancel()` cancels the scope's threads, and those
+  it starts afterwards (which run nothing); a cancelled thread stops at its next cancellation point
+  with its frames dropped and ends with no result: `Thread.result() -> Option[T]` (new) answers
+  `None`, and `join` traps. The cancellation points are every wait but a lock's (sleep, join,
+  condition, so channels, futures and promises) and every safepoint poll. *Why*: Avin has no
+  exceptions and a trap stops the program, so a cancellation that made each wait answer an `Err`
+  would change the type of every wait in the library and leave a computing thread unreachable; the
+  runtime already drops an actor's frames on a trap, and a thread shares nothing mutable outside a
+  lock, so dropping its frames loses nothing anyone else can see. *Alternatives weighed*: every wait
+  answering an `Err` or `Option` (the direction first sketched; changes every signature, and a loop
+  that never waits is never cancelled); a cooperative flag the thread polls (a thread that forgets
+  to look is never cancelled, and parked threads still need waking); a trap at the next wait (stops
+  the program). Review with the user: `join` trapping on a cancelled thread rather than answering an
+  `Option`, which keeps every existing `join` unchanged.
+- Proposed (branch `lwt-scope`): **A thread is not stopped inside a region others may wait on**: a
+  lock held, a `lazy val` being initialized, an Avin function Sysl called (the regions a trap already
+  treats as in doubt), and the library's running of what waits for a future it completed. It
+  finishes the region and stops at its next cancellation point after. A wait on a condition is a
+  cancellation point when the lock it lets go is the only region the thread is in; the thread then
+  stops without taking the lock again. Waiting for a lock is not a cancellation point. *Why*: a
+  mutex is the only door to shared mutable state, so a thread stopped outside every lock leaves
+  nothing half changed, and never leaves a lock held; a lock is held briefly, so making its wait a
+  point would buy little and race the hand-over of the lock. *Alternatives weighed*: stopping
+  anywhere and releasing the locks a thread holds (leaves the state they guard half changed); making
+  the release of the last lock itself a cancellation point (cuts library code short after its
+  release, as a future's completion is).
+- Proposed (branch `lwt-scope`): **Cancellation reaches down through scopes, and only scopes.** A
+  cancelled thread stops first at the innermost scope it runs, which cancels its own threads and
+  waits for them, and the cancellation then goes on outward; a scope opened while its thread holds a
+  lock sets no such stop, so its threads are not cancelled with the thread. Threads started with the
+  plain `spawn`, and futures' work, are not reached by any scope's cancellation. *Why*: structured
+  joins hold only if a scope never returns before its threads, cancelled or not; unstructured threads
+  have no owner to be cancelled by. *Alternatives weighed*: cancelling the thread alone and leaving
+  its inner scope's threads running (breaks the scope's promise); a `Thread.cancel()` on any thread
+  (unstructured cancellation, which nothing here needs).
+- Proposed (branch `lwt-scope`): **A failure does not cancel a scope by itself.** A trap stops the
+  program as before, so there is no failing thread to propagate; a thread reports a failure as a
+  `Result`, and the scope's body cancels and returns it. `Scope` gains `cancel()` and
+  `isCancelled()` only, both used by the thread running the body while the scope is open. *Why*: the
+  body already sees every thread's result and decides what a failure means; a `scope` that inspected
+  results would need to know their type is a `Result`. *Alternatives weighed*: a `scopeTry` whose
+  threads return `Result[T, E]` and whose first `Err` cancels the rest (a second entry point for what
+  a channel and a `cancel` express); a sendable canceller a thread could call (the body can already
+  cancel on a message). Review with the user: whether a `Result`-aware scope is wanted for brevity.
+- Proposed (branch `lwt-scope`): **The scope hands back the Sysl handles a cancelled thread's body
+  reached**, once it has waited for the thread, as a body that returns hands them back itself; they
+  are then in transit, for the next code to use. *Why*: a connection given to a thread that was
+  cancelled is otherwise unusable by anyone, and closing it is the scope's thread's job. *Alternatives
+  weighed*: leaving them with the ended thread's owner (every later use traps); handing them back on
+  the cancelled thread as it stops (it runs no code of its own then).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
@@ -5159,9 +5211,8 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   - Whether manifests gain machine conditions (Sysl's `if`, `choices`, `targets`) once Avin builds
     for more than one target.
 
-- Lightweight threads, the open parts of the settled design above: **cancellation** (proposed
-  direction: a `scope` ending cancels its lightweight threads, each answering an `Err` or trapping
-  at its next wait); **keeping user-interface work on the main thread** (a scheduler that runs a
+- Lightweight threads, the open parts of the settled design above (cancellation is under
+  [Proposed](#proposed)): **keeping user-interface work on the main thread** (a scheduler that runs a
   lightweight thread on the main operating system thread only, which also gives the `ui` package
   its change from another thread); **stack size and growth** (a fixed reservation first; parked
   frames moved to the heap later). The allocation chunk belongs to the carrier (proposed above), so
