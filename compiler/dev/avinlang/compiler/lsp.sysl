@@ -348,9 +348,9 @@ struct LspProgram
 /** The program `file` belongs to, `header` being the module its first line names. A file of the
  * library is the library's, and a file in a package is the package's. A file whose header names a module is in a program rooted where the
  * directories above it spell that module (`a/b/x.avin` for `module a.b`), and a file with no header
- * is a root file of the program in its directory when that directory has modules below it; any
- * other file is a program by itself. */
-lsp_program(library: string, file: string, header: string) -> LspProgram
+ * is a root file of the program in its directory when it imports a module held in a directory below
+ * it; any other file is a program by itself. */
+lsp_program(library: string, file: string, header: string, imports: Buf[string] = buf()) -> LspProgram
     if file.starts_with(library + "/") && !file.starts_with(library + "/tests/") then return LspProgram(library, true, true, false)
     if enclosing_package(file) is Ok(Some(package)) then return LspProgram(package, true, false, true)
     val dir = parent(file).unwrap_or("")
@@ -360,32 +360,26 @@ lsp_program(library: string, file: string, header: string) -> LspProgram
             tail = tail + (if b == u8('.') then "/" else from_utf8_lossy([b]))
         if dir.ends_with(tail) && dir.bytes.len > tail.bytes.len then return LspProgram(dir[0..<dir.bytes.len - tail.bytes.len], true, false, false)
         return LspProgram(file, false, false, false)
-    if dir != "" && lsp_holds_modules(dir, 0) then LspProgram(dir, true, false, false) else LspProgram(file, false, false, false)
+    if dir != "" && lsp_imports_module_below(dir, imports) then LspProgram(dir, true, false, false) else LspProgram(file, false, false, false)
 
-// Whether a directory below `dir`, at most a few levels down, holds an `.avin` or `.lavin` file.
-private lsp_holds_modules(dir: string, depth: usize) -> bool
-    if depth > 3 then return false
-    val names = entries(dir) match
-        Ok(n) -> n
-        Err(_) -> return false
-    for name in names
-        if name.starts_with(".") then continue
-        val full = dir + "/" + name
-        if is_dir(full)
-            if lsp_dir_has_avin(full, depth + 1) then return true
+// Whether one of `imports` names a module held in a directory below `dir`: the file then needs its
+// siblings, and a file that imports none is checked alone, as `avin check <file>` does.
+private lsp_imports_module_below(dir: string, imports: Buf[string]) -> bool
+    for name in imports
+        var at = dir
+        for part in name.split(".")
+            at = at + "/" + part
+            if !is_dir(at) then break
+            if lsp_dir_holds_source(at) then return true
     false
 
-private lsp_dir_has_avin(dir: string, depth: usize) -> bool
-    if depth > 4 then return false
+// Whether `dir` itself holds an `.avin` or `.lavin` file.
+private lsp_dir_holds_source(dir: string) -> bool
     val names = entries(dir) match
         Ok(n) -> n
         Err(_) -> return false
     for name in names
-        if name.starts_with(".") then continue
-        if is_source_name(name) then return true
-        val full = dir + "/" + name
-        if is_dir(full)
-            if lsp_dir_has_avin(full, depth + 1) then return true
+        if !name.starts_with(".") && is_source_name(name) then return true
     false
 
 /** What one file is told: its diagnostics. */
@@ -412,7 +406,10 @@ struct LspAnalysis
 lsp_analyze(server: LspServer, file: string, text: string, completing: string = "") -> LspAnalysis
     val library_dir = lsp_normal(server.toolchain.library_dir())
     val first = parse(source_of(file, text))
-    val program = lsp_program(library_dir, file, first.file.module_name)
+    var imported: Buf[string] = buf()
+    for i in first.file.imports
+        imported.push(i.path)
+    val program = lsp_program(library_dir, file, first.file.module_name, imported)
     var found: Buf[LspFound] = buf()
     found.push(LspFound(file, buf()))
     var names: Buf[string] = buf()
