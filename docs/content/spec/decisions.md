@@ -5100,6 +5100,39 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- Proposed 2026-11-10: **Union types: the operations' choices the chapter left open** (branch
+  `unions-ops`; [union types](/spec/unions/)).
+  - **`?` converts an error union member by member whatever the function's error type is**, not
+    only where it is no union: an `IoError | ParseError` passed on from a function yielding
+    `ConfigError | Invalid`, where `ConfigError` implements `From` at each, converts each member by
+    rule 2. *Why*: rules 1 and 2 cannot reach this case (no member implements `From` at the union),
+    so rule 3 as written would leave it an error with no way to say what to do but `mapErr`, while
+    each member converts on its own; the extension only turns an error into the conversion a reader
+    expects. *Alternatives*: keep rule 3 for a plain `F` only (refuses an obvious program);
+    implement `From` at a union (a union has no `impl`).
+  - **A trait with type parameters counts for a union through the one instance every member
+    holds**: `Vector[int] | List[int]` has `Seq[int]`'s methods, so `u.size()` and `u.map(…)` work
+    although the two join on no type. *Why*: the chapter's rule ("the traits the union conforms to")
+    names no restriction to traits without parameters, and the instance is unambiguous when the
+    members agree on it. *Alternatives*: only traits without type parameters (refuses the common
+    sequence case); every instance any member holds (ambiguous).
+  - **A member of the union found through a trait or the join is called, named as a value or read
+    as a field with the union seen as that type**, with no conversion, as an `Any` holding its
+    member is seen: a field of the join class is read (`p.called` on `Puppy | Kitten`). *Why*: the
+    union is laid out as an `Any`, which already is a value of every trait and class its member is;
+    the field is the chapter's "looked up where it would be on the members' join". *Alternatives*:
+    methods only (a field of the shared superclass would need a `match`).
+  - **`===` between a union with a value member and an object of a class is accepted**, answering
+    `false` for a value member, as it is between an `Any` and an object; it is refused where neither
+    side holds only objects (`Dog | int` against an `Any`). *Why*: the identity chapter's rule for
+    `Any`, which the union chapter says the union follows. *Alternatives*: refuse every `===` on a
+    union with a value member (stricter than `Any`, with no added safety).
+  - **The diagnostics' wording**: a union argument to overloads of its members says the member is
+    known only while running and suggests a `match`; a bound a union misses says why (no order;
+    the member that does not conform; a trait taking `Self` other than as the receiver); a result
+    with a scalar error union names `mapErr(e -> e)`. *Why*: each names the fix. *Alternatives*: the
+    general messages alone.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

@@ -364,7 +364,10 @@ v.charCount()
 // apart with a `match` or `is` first
 ```
 
-A name found on more than one of those types is an error that names them.
+A name found on more than one of those types is an error that names them. A trait with type
+parameters counts through the one instance every member holds: `Vector[int] | List[int]` has
+`Seq[int]`'s `size` and `map`. What is found is called, named as a value, or, for a field of the join
+class, read, with the union seen as that type, as an `Any` holding its member is.
 
 **Derivations.** A data type or class with a union field derives `Eq`, `Hash`, `Display` and `Debug`
 as with any field. `derives Ord` is an error naming the field, as for any field type without `Ord`. A
@@ -392,10 +395,11 @@ On `Err(e)`, with `e` of type `E` and the enclosing function yielding errors of 
 2. **Otherwise, where `F` is a union, the one member of `F` that implements `From[E]`** makes the
    error passed on: with `F = ConfigError | NetError` and `impl From[IoError] for ConfigError`, an
    `IoError` becomes a `ConfigError`. Two members implementing it is an error naming both.
-3. **Otherwise, where `E` is a union and `F` is not, each member of `E` is converted on its own** by
-   rules 1 and 2 and the existing `From` rule, and the error names each member with no conversion:
+3. **Otherwise, where `E` is a union, each member of `E` is converted on its own** by rules 1 and 2
+   and the existing `From` rule, and the error names each member with no conversion:
    `Result[_, IoError | ParseError]` inside a function yielding `ConfigError`, which implements
-   `From[IoError]` and `From[ParseError]`, converts each kind through its own `from`.
+   `From[IoError]` and `From[ParseError]`, converts each kind through its own `from`; inside one
+   yielding `ConfigError | Invalid`, each kind becomes a `ConfigError` by rule 2.
 4. **Otherwise the existing rule applies**: `F.from(e)` through `F`'s `From[E]`.
 
 ```text
