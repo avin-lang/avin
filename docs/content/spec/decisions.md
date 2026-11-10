@@ -5133,6 +5133,43 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- Proposed (branch `lwt-sockets`): **a socket wait parks on one poller with a thread of its own, one
+  readiness report per wait.** Every socket `avin.net` makes is non-blocking; an operation that would
+  have to wait registers the descriptor with the runtime's single `sysl.io.poll` set as `OneShot`,
+  under a token naming a slot that holds the waiter, and parks; the poller's own operating system
+  thread waits on the set and makes each reported waiter ready, and the operation is tried again. A
+  slot is let go under one lock by whichever ends the wait, so a report arriving after a timeout
+  finds its slot gone or taken again under a newer token and wakes nobody. *Why*: the monitor sleeps
+  on a condition, which a kernel set cannot wake, and a thread blocked in the set's wait needs nothing
+  else; a one-shot registration per wait can never deliver a stale wake to a later wait on another
+  thing. *Alternatives*: the monitor waiting on the poller with the soonest timer as its timeout
+  (the timers then move under the poller, a larger change to settled code, which this choice does not
+  preclude); workers polling the set between threads (no extra thread, but a worker with nothing ready
+  then sleeps in the kernel instead of on its condition, and wakes need a second path); a level- or
+  edge-triggered registration kept for the socket's life (one system call less per wait, but a
+  report for a wait that has ended can reach the next one, so every wait in the runtime would have to
+  tolerate spurious wakes).
+- Proposed (branch `lwt-sockets`): **a connection's timeout bounds each wait, not the whole
+  operation.** A write that waits for room several times fails with `TimedOut` only where one wait
+  outlasts the limit, as the kernel's per-call socket timeouts did before; the limit is kept in the
+  connection rather than in the socket, since a non-blocking socket ignores the kernel's. *Why*: a
+  large transfer to a slow but steady peer keeps going, and the meaning of `setTimeout` does not
+  change. *Alternatives*: a deadline for the whole `write` or `readAll` (stops a slow transfer that is
+  still making progress). Review with the user if a whole-operation deadline is wanted as well.
+- Proposed (branch `lwt-sockets`): **`connect` parks; a Unix `connect` does not.** A TCP connection
+  that cannot be made at once waits for the socket to become writable, then reads the socket's
+  pending error (`SO_ERROR`) for the outcome, since a second `connect` answers "already connected"
+  even for a refused connection on macOS. A Unix connection is made at once by the kernel or refused,
+  so it stays a plain call and the socket is made non-blocking after. *Alternatives*: a blocking
+  `connect` that the monitor compensates for (holds a worker for a round trip to the peer).
+- Proposed (branch `lwt-sockets`): **a connection or listener cannot be closed under a thread parked
+  on it.** It belongs to the parked thread, so another thread's `close()` traps as any other use
+  from there does, and the wait ends only by the peer, a timeout or readiness. *Why*: the ownership
+  rule already decides it, and no wake path for a socket closed elsewhere is needed. *Alternatives*: a
+  shared close that wakes the parked thread with an error (needs sockets shared between threads,
+  which the ownership rule excludes; cancellation by `scope` is where an outside end of a wait
+  belongs).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

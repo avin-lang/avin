@@ -2,7 +2,8 @@ module avin.net
 
 // TCP: a connection to a host and port, and a listener that accepts them. Every operation that can
 // fail answers a `Result` with an `IoError`, and one that waits for the other end, to connect, accept,
-// read or write, is safe for the collector while it waits.
+// read or write, is safe for the collector while it waits: a lightweight thread parks, leaving its
+// worker to run other threads, until the socket is ready.
 //
 // A connection or listener belongs to one thread at a time. Handing one to a thread's or a future's
 // body hands it over, so a server accepts a connection and gives it to the code that serves it.
@@ -48,15 +49,7 @@ private data Shutdown
 // program forgot, when the collector frees it. Its traps name the `TcpStream`.
 @sysl("sysl.net.Socket", named: "TcpStream")
 private class Socket
-    @sysl(blocking)
-    connect(to: Address) -> Result[unit, SyslError]
-    @sysl(blocking)
-    sendAll(bytes: Array[byte]) -> Result[unit, SyslError]
-    @sysl(blocking)
-    recv(into: Array[byte]) -> Result[long, SyslError]
     shutdown(how: Shutdown) -> Result[unit, SyslError]
-    readTimeout(ms: int) -> Result[unit, SyslError]
-    writeTimeout(ms: int) -> Result[unit, SyslError]
     // The descriptor, which is never used: calling it checks the socket belongs to the code running.
     @sysl("fd")
     held() -> Result[int, SyslError]
@@ -69,11 +62,28 @@ private class ListenSocket
     bind(to: Address) -> Result[unit, SyslError]
     listen(backlog: int) -> Result[unit, SyslError]
     local() -> Result[Address, SyslError]
-    @sysl(blocking)
-    accept() -> Result[(Socket, Address), SyslError]
     // The descriptor, which is never used: calling it checks the socket belongs to the code running.
     @sysl("fd")
     held() -> Result[int, SyslError]
+
+// Every socket is non-blocking, and an operation that would have to wait waits in the runtime: a
+// lightweight thread parks on the runtime's poller, freeing its worker, and any other thread waits on
+// the socket alone. Each is safe for the collector while it waits. A limit of zero milliseconds is
+// none.
+@sysl("avin.rt.socket_connect")
+private connectSocket(s: Socket, to: Address) -> Result[unit, SyslError]
+
+@sysl("avin.rt.socket_send_all")
+private sendAll(s: Socket, bytes: Array[byte], limitMs: int) -> Result[unit, SyslError]
+
+@sysl("avin.rt.socket_recv")
+private recv(s: Socket, into: Array[byte], limitMs: int) -> Result[long, SyslError]
+
+@sysl("avin.rt.socket_accept")
+private acceptOn(s: ListenSocket) -> Result[(Socket, Address), SyslError]
+
+@sysl("avin.rt.socket_non_blocking")
+private nonBlocking(s: ListenSocket) -> Result[unit, SyslError]
 
 @sysl("sysl.net.resolve")
 private resolveRaw(host: string, port: int) -> Result[Vector[Address], SyslError]
@@ -85,11 +95,12 @@ private openConnection(to: Address) -> Result[Socket, SyslError]
 private openListenSocket(to: Address) -> Result[ListenSocket, SyslError]
 
 // Binds `s` to `to`, letting a port a recently stopped listener used be taken again, and listens
-// with the platform's usual backlog.
+// with the platform's usual backlog, without blocking.
 private listening(s: ListenSocket, to: Address) -> Result[unit, SyslError]
     s.reuseAddress(true)?
     s.bind(to)?
-    s.listen(128)
+    s.listen(128)?
+    nonBlocking(s)
 
 // Every address `host` and `port` resolve to, in the order the platform prefers them.
 private addressesOf(host: string, port: int) -> Result[Vector[Address], IoError]
@@ -163,7 +174,10 @@ private utf8Of(text: string) -> Array[byte] = Array.tabulate(text.byteLength(), 
 // which takes it over, the bytes read ahead with it: its socket is a Sysl handle, and every
 // operation, one served from those bytes and one on a closed connection included, first checks the
 // socket's owner, so the code that handed it over traps where it uses it again.
-class TcpStream(private val conn: Socket, private val buffered: ReadAhead, private var closed: bool): Sendable
+// A read or write waits at most `limitMs` milliseconds at a time for the connection, zero for no
+// limit.
+class TcpStream(private val conn: Socket, private val buffered: ReadAhead, private var closed: bool,
+                private var limitMs: int): Sendable
     // Up to `max` bytes, waiting for at least one; an empty array once the other end has finished
     // sending. `max` is at least one.
     read(max: int) -> Result[Array[byte], IoError]
@@ -189,20 +203,20 @@ class TcpStream(private val conn: Socket, private val buffered: ReadAhead, priva
     write(bytes: Array[byte]) -> Result[unit, IoError]
         mine()
         if closed then return Err(closedError())
-        conn.sendAll(bytes).mapErr(ioError)
+        sendAll(conn, bytes, limitMs).mapErr(ioError)
 
     // Sends `text` as UTF-8.
     writeText(text: string) -> Result[unit, IoError] = write(utf8Of(text))
 
-    // A read or a write that waits longer than `d` fails with `TimedOut` from now on; a duration of
-    // zero or less takes the limit away. The limit is kept in whole milliseconds, a part of one
-    // counting as one.
+    // A read or a write that waits longer than `d` for the other end fails with `TimedOut` from now
+    // on; a duration of zero or less takes the limit away. The limit is kept in whole milliseconds, a
+    // part of one counting as one, and each wait has the whole of it: a write that has to wait for
+    // room several times fails only where one of those waits runs out.
     setTimeout(d: Duration) -> Result[unit, IoError]
         mine()
         if closed then return Err(closedError())
-        val ms = millisOf(d)
-        conn.readTimeout(ms).mapErr(ioError)?
-        conn.writeTimeout(ms).mapErr(ioError)
+        limitMs = millisOf(d)
+        Ok(())
 
     // Tells the other end nothing more will be sent; reading goes on.
     shutdownOutput() -> Result[unit, IoError]
@@ -225,7 +239,7 @@ class TcpStream(private val conn: Socket, private val buffered: ReadAhead, priva
     // Up to `max` bytes from the connection itself.
     private received(max: int) -> Result[Array[byte], IoError]
         val into = Array.fill(max, byte(0))
-        val n = conn.recv(into).mapErr(ioError)?
+        val n = recv(conn, into, limitMs).mapErr(ioError)?
         Ok(if n == long(max) then into else into.slice(0, int(n)))
 
 // The text of a line's bytes, a `\r` at its end dropped.
@@ -237,7 +251,8 @@ private lineText(line: Buffer[byte]) -> string
 // A duration as a socket's timeout in milliseconds, rounded up, zero for none.
 private millisOf(d: Duration) -> int
     if d.micros <= 0 then return 0
-    val ms = (d.micros + 999) / 1000
+    // Divided first, so the longest duration does not overflow on the way.
+    val ms = if d.micros % 1000 > 0 then d.micros / 1000 + 1 else d.micros / 1000
     if ms > long(int.MaxValue) then int.MaxValue else int(ms)
 
 object TcpStream
@@ -249,8 +264,8 @@ object TcpStream
         for a in addresses
             openConnection(a) match
                 Ok(c) ->
-                    c.connect(a) match
-                        Ok(_) -> return Ok(TcpStream(c, ReadAhead(Array.empty[byte](), 0), false))
+                    connectSocket(c, a) match
+                        Ok(_) -> return Ok(TcpStream(c, ReadAhead(Array.empty[byte](), 0), false, 0))
                         Err(e) ->
                             c.close()
                             last = ioError(e)
@@ -269,8 +284,8 @@ class TcpListener(private val conn: ListenSocket, private val boundPort: int, pr
     accept() -> Result[TcpStream, IoError]
         mine()
         if closed then return Err(io.Other("the listener is closed"))
-        conn.accept() match
-            Ok((c, _)) -> Ok(TcpStream(c, ReadAhead(Array.empty[byte](), 0), false))
+        acceptOn(conn) match
+            Ok((c, _)) -> Ok(TcpStream(c, ReadAhead(Array.empty[byte](), 0), false, 0))
             Err(e) -> Err(ioError(e))
 
     // Stops listening; closing again does nothing. An `accept` afterwards answers an error.
