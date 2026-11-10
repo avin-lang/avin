@@ -4849,20 +4849,14 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   identity, so `values()` would make a new instance per call, unequal to the last. Alternative
   weighed: allowing a class of no parameters as an enumeration of one.
 
-**Deferred**
-
-- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
-
-## Proposed
-
 **Exports between modules** (branch `export-reexports`; [modules](/spec/declarations/#visibility-and-modules))
 
-- Proposed: **`export` is written exactly as `import` is**: `export a.b.X`, `export a.b.{X, y as
+- Settled on the user's delegation 2026-11-09: **`export` is written exactly as `import` is**: `export a.b.X`, `export a.b.{X, y as
   z}`, renaming with `as`, one top-level line each, at the top of any file of the module. Why: one
   syntax to learn, and every form an import has means the same thing in an export. Alternatives
   weighed: an `export` modifier on an `import` line (`export import a.b.X`), which ties presenting
   a name to bringing it into one file; a list in the package manifest, far from the code it shapes.
-- Proposed: **an exported name is a name of the module, seen by every file of the exporting module
+- Settled on the user's delegation 2026-11-09: **an exported name is a name of the module, seen by every file of the exporting module
   without an import**, and found after the module's own declarations and before the file's imports.
   Why: a module's files are one namespace, and an export adds to that namespace exactly as a
   declaration would; a module presenting `Point` and writing `centre(p: Point)` beside it should
@@ -4870,11 +4864,11 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   modules, so the exporting file also writes the matching import (two lines per name, and a file of
   the module that forgets the import sees a name its importers see but it does not); an export
   visible in its own file only, as an import is (breaks "a module's files are one namespace").
-- Proposed: **no wildcard export**, as there is no wildcard import. Why: a module's surface stays
+- Settled on the user's delegation 2026-11-09: **no wildcard export**, as there is no wildcard import. Why: a module's surface stays
   readable from its export lines, and a declaration added to an internal module never silently
   joins the public surface. Alternative weighed: `export a.b.*`, convenient for a facade over one
   module; revisit with wildcard imports if those are ever added.
-- Proposed: **an export names a public declaration of another module, directly or through that
+- Settled on the user's delegation 2026-11-09: **an export names a public declaration of another module, directly or through that
   module's export; private, unknown, whole-module, own-module and root-module exports and a
   `private export` are errors.** Why: an export presents a declaration, never widens one, and the
   root module has no name to be imported by. A whole module is not a declaration: `export a.b`
@@ -4882,13 +4876,13 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   a whole module as a nested name (`shapes.geometry` reachable as `facade.geometry`), which needs
   module members and is left for later; letting an export make a private declaration public, which
   would make `private` meaningless to the module that wrote it.
-- Proposed: **exports chain, and two modules may export each other's declarations; exports that
+- Settled on the user's delegation 2026-11-09: **exports chain, and two modules may export each other's declarations; exports that
   lead round without reaching a declaration are an error at each export of the cycle.** Exports are
   resolved from the source before anything is declared, following each chain with the names it has
   passed, so a cycle stops rather than loops. A link that is wrong (a private or unknown target) is
   reported where it is written, and the exports chained after it are not reported again; an import
   through such a chain reports the name as private to, or missing from, the module it names.
-- Proposed: **an exported name clashes as a declaration does, but two paths to one declaration
+- Settled on the user's delegation 2026-11-09: **an exported name clashes as a declaration does, but two paths to one declaration
   never clash.** An export clashes with a declaration of its module, with another export of the
   name reaching a different declaration, with an import of a different declaration in a file of the
   module, and with a module imported under that name. A module exporting a name and importing the
@@ -4897,7 +4891,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   mean one declaration nothing is ambiguous. Alternative weighed: refusing every duplicate, which
   makes a module that both uses and presents a declaration choose between an import and an export
   for no reason.
-- Proposed: **every kind of top-level declaration can be exported**: data types, aliases (generic
+- Settled on the user's delegation 2026-11-09: **every kind of top-level declaration can be exported**: data types, aliases (generic
   ones too), classes with their companion objects, objects, traits, machines (with `Door.State`),
   functions (all public overloads of the name, never a private one), module-level `val`, `var` and
   `lazy val`, and variants. A type's variants are not exported with it: each is exported by its own
@@ -4905,7 +4899,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   way. Why: an export is a name for a declaration, and every name an import can bring in is one an
   export can present; variants follow imports so the two never differ. Alternative weighed:
   exporting a data type's variants with it, which an import does not do either.
-- Proposed: **a module that exports a declaration of another presents that module's extensions**:
+- Settled on the user's delegation 2026-11-09: **a module that exports a declaration of another presents that module's extensions**:
   the exporting module's own files, and every file importing it whole or any name of it, see the
   methods the other module's extensions add; a file importing a declaration through an export sees
   its declaring module's extensions as a direct import would. Why: "importing a module or any of
@@ -4915,16 +4909,22 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   Alternatives weighed: extensions reached only by importing their module directly (a facade could
   not offer a package's extension methods at all); an explicit `export` of an extension (an impl
   has no name to export). Review with the user: this widens which extensions a file sees.
-- Proposed: **`export` is a contextual word**, meaning an export only at the start of a top-level
+- Settled on the user's delegation 2026-11-09: **`export` is a contextual word**, meaning an export only at the start of a top-level
   line before a name, and an ordinary name everywhere else (a function `export(…)`, a field, a
   parameter, a local). Why: as `type` is; nothing in the library or tests names anything `export`
   today, but the word is a natural method name (`report.export()`), and keeping it free costs one
   token of lookahead. Alternative weighed: a reserved keyword, simpler to lex but taking a useful
   name from every program.
-- Proposed: **a diagnostic and the language server name the declaration an export reaches**: an
+- Settled on the user's delegation 2026-11-09: **a diagnostic and the language server name the declaration an export reaches**: an
   import clash reports `already imported, from \`inner.Widget\``, the declaring module's path, and
   go-to-definition on an exported name (at the export line or any import of it) goes to the
   declaration itself. Completion after `m.` does not yet list a module's exports (see Open).
+
+**Deferred**
+
+- Higher-kinded, path-dependent, union and intersection types; implicit parameters; macros.
+
+## Proposed
 
 ## Open
 
