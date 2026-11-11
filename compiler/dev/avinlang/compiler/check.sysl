@@ -1737,6 +1737,12 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
             AbstractFieldMember(f) -> c.note(unit, f.span, s"an impl adds methods, not state, so it cannot declare the field `${f.name}`")
             StatementMember(s) -> c.note(unit, s.span, "an impl's body declares only methods")
             MethodMember(_, _, _, _) -> ()
+    // An impl without `for` adds methods to the tuples or the functions its type matches, as one adds
+    // to any other type built from its parameters: `impl[A, B] (A, B)`, `impl[A, B] (A) -> B`. The
+    // tuple and function types are the core library's, so written elsewhere it is an extension.
+    if d.trait_name is None && (d.target.kind is Tuple(_) || d.target.kind is Function(_, _, _))
+        c.trait_impls.push(TraitImpl(unit, module_name, d, 0, false, module_name != CoreModule))
+        return invalid
     if d.target.kind is Tuple(_) then return resolve_tuple_impl(c, unit, module_name, d)
     val path = d.target.kind match
         Named(p, _) -> p
@@ -1744,7 +1750,8 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
             c.note(unit, d.target.span, s"an `impl` names a declared type, and `${show_union(d.target)}` is a union; declare a data type to give it methods")
             return invalid
         _ ->
-            c.note(unit, d.target.span, "an impl adds to a data type, a class, an object or a built-in type")
+            if d.trait_name is Some(_) then c.note(unit, d.target.span, "an impl of a trait is for a data type, a class, an object or a built-in type")
+            else c.note(unit, d.target.span, "an impl adds to a data type, a class, an object, a built-in type, a tuple or a function type")
             return invalid
     val written = d.target.kind match
         Named(_, args) -> args
@@ -2091,6 +2098,14 @@ private added_applies(c: *Checker, t: &Type, tm: TraitMethod) -> bool
             Data(e, _, _) -> d == e
             _ -> false
         Class(k, _, _) -> trait_view(c, x, k) is Some(_)
+        // Every tuple is an instance of the tuples, whatever its arity, and every function of the
+        // functions, so a call on one of another shape says what the receiver would need to be.
+        Tuple(_) -> *x is Tuple(_)
+        Function(_, _, _) -> *x match
+            Function(_, _, _) -> true
+            Data(_, _, _) -> function_ancestor(c.classes, c.data, x) is Some(_)
+            Class(_, _, _) -> function_ancestor(c.classes, c.data, x) is Some(_)
+            _ -> false
         _ -> added_args(c, x, tm) is Some(_)
 
 /** The impl's type arguments a call of method `tm` takes on a value of type `t`: what the
@@ -2141,9 +2156,18 @@ private match_target(c: *Checker, pattern: &Type, t: &Type, owner: usize, binds:
         Tuple(ps) -> *x match
             Tuple(xs) -> ps.len() == xs.len() && match_parts(c, ps, xs, owner, binds, covariant)
             _ -> false
-        Function(ps, r, _) -> *x match
-            Function(xs, s, _) -> ps.len() == xs.len() && match_parts(c, ps, xs, owner, binds, false) && match_target(c, r, s, owner, binds, false)
-            _ -> false
+        Function(ps, r, sendable) ->
+            // A value of a type that is a subtype of a function type, a class or a data type naming
+            // one, is seen as that function where it would be passed as one. A `@sendable` pattern
+            // matches only a `@sendable` function, as only one is passed where it is expected.
+            val seen = *x match
+                Function(_, _, _) -> x
+                Data(_, _, _) -> if covariant then function_ancestor(c.classes, c.data, x).unwrap_or(x) else x
+                Class(_, _, _) -> if covariant then function_ancestor(c.classes, c.data, x).unwrap_or(x) else x
+                _ -> x
+            *seen match
+                Function(xs, s, marked) -> (marked || !sendable) && ps.len() == xs.len() && match_parts(c, ps, xs, owner, binds, false) && match_target(c, r, s, owner, binds, false)
+                _ -> false
         _ -> same_type(pattern, x)
 
 // The type arguments `ps` of a pattern matched against `xs`, each in a covariant position where the
@@ -2168,6 +2192,15 @@ private added_target_phrase(tm: TraitMethod) -> string = target_phrase(tm.target
 private target_phrase(t: &Type) -> string
     val inner = *t match
         Tuple(items) -> return if items.len() == 2 then "a pair" else s"a tuple of ${items.len()}"
+        Function(params, result, sendable) ->
+            // A function of any types is named by its number of parameters; one with a part of its
+            // own is written out.
+            var plain = *result is TypeVar(_, _, _)
+            for p in params
+                if !(*p is TypeVar(_, _, _)) then plain = false
+            if !plain then return s"`${type_name(t)}`"
+            val kind = if sendable then "a `@sendable` function" else "a function"
+            return if params.len() == 1 then s"$kind of 1 parameter" else s"$kind of ${params.len()} parameters"
         Data(_, _, args) -> args
         Class(_, _, args) -> args
         _ -> return s"`${type_name(t)}`"
@@ -3747,12 +3780,17 @@ private with_trait_methods(c: *Checker, t: &Type, name: string, own: Buf[usize])
         var hidden = false
         for o in own
             if same_params_seen(c, t, o, m) then hidden = true
-        if hidden && (tm.on_trait || tm.extension || !matches) then continue
+        if hidden && (tm.on_trait || tm.extension || adds_to_function(tm) || !matches) then continue
         if matches then matching.push(m) else unmatched.push(m)
     val offered = if matching.len() > 0 || own.len() > 0 then matching else unmatched
     for m in offered
         if !hidden_by_nearer_trait(c, t, m, offered) then out.push(m)
     out
+
+/** Whether method `tm` is added to a function type, `impl[A, B] (A) -> B`. A function type is a trait,
+ * so a type's own method of the same parameter types is found first, as for a method added to any
+ * trait. */
+private adds_to_function(tm: TraitMethod) -> bool = *tm.target is Function(_, _, _)
 
 // Whether method `m`, which an impl adds to a trait, is hidden among `offered` by one of the same
 // parameter types that an impl adds to a trait requiring that trait: the nearer trait's is the
@@ -3871,7 +3909,7 @@ private refuse_trait_clash(c: *Checker, at: Span, t: &Type, name: string, ms: Bu
         val a = trait_method_of(c, ms[i]) match
             Some(x) -> x
             None -> continue
-        if !a.on_trait && !a.extension && added_args(c, t, a) is Some(_)
+        if !a.on_trait && !a.extension && !adds_to_function(a) && added_args(c, t, a) is Some(_)
             for o in ms
                 if trait_method_of(c, o) is Some(_) then continue
                 if same_params_seen(c, t, o, ms[i])
