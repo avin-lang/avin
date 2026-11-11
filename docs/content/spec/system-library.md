@@ -733,6 +733,13 @@ main()
 | `abs(x)`, `signum(x)` | The magnitude, `abs(-0.0)` being `0.0`; `1.0`, `-1.0`, or `x` itself for a zero or NaN. |
 | `max(x, y)`, `min(x, y)` | NaN when either is; `-0.0` is less than `0.0`. |
 | `toRadians(x)`, `toDegrees(x)` | An angle converted. |
+| `round(x)` | The whole number nearest `x` as a `long`, a tie going away from zero: `round(2.5)` is `3`, `round(-2.5)` is `-3`. It converts as `long(x)` does: NaN is `0`, a value past the range, an infinity included, is the nearest bound. |
+| `trunc(x)` | `x` with its fraction dropped, towards zero, as a `real`; `trunc(-0.5)` is `-0.0`. |
+| `log2(x)` | The logarithm to base 2, exact at every power of two. |
+| `fma(x, y, z)` | `x * y + z` rounded once. The language never fuses `x * y + z` by itself, so `fma` is how a program asks for it. |
+| `copySign(x, s)` | The magnitude of `x` with the sign of `s`, a negative zero's sign included. |
+| `ulp(x)` | The gap from `abs(x)` to the next `real` above: `real.MinPositiveValue` at zero and through the subnormals, infinity at an infinity, NaN at NaN, and at the greatest finite value the gap below it. |
+| `nextUp(x)`, `nextDown(x)` | The next `real` above, or below: `nextUp(0.0)` is `real.MinPositiveValue`, the greatest finite value goes to infinity, and an infinity going outward and NaN stay as they are. |
 
 **Nothing traps.** Every function follows IEEE 754: an argument outside a function's domain gives
 NaN, a pole gives the infinity its limit approaches, and the infinities go where their limits do

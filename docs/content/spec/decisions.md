@@ -6151,6 +6151,50 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (branch `stdlib-math`): **the integer methods are an inherent impl over `Integer`, not
+  members of the trait.** `abs`, `sign`, `pow`, `gcd`, `lcm`, `floorDiv`, `floorMod`, `bitCount`,
+  `leadingZeros`, `trailingZeros`, `isPowerOfTwo` and `toRadix` are written once in
+  `library/avin/integer.avin` as `impl[T: Integer] T`, which the core library may declare. Why: it
+  gives every width the methods with no new trait and no change to the closed bound. The cost: a
+  type parameter bounded by `Integer` sees only the trait's members, so generic code cannot write
+  `x.abs()`. Alternatives weighed: putting the methods in `Integer` as required members (every
+  width implements them, but "no type implements it" then has an exception, and the arithmetic
+  traits would grow by a dozen); leaving them to free functions (`math.abs(x)`, unlike
+  `x.compare(y)`). Review with the user: whether generic code should reach these methods, which
+  means making them members of `Integer`.
+
+- Proposed (branch `stdlib-math`): **the bitwise and shift operators work on a type parameter
+  bounded by `Integer`.** `x & y`, `|`, `^`, `<<` and `>>` on a `T: Integer` are the machine's
+  operators at each instance's width, with both operands `T` (`x >> T(1)`); the checker had treated
+  every operator on a type parameter as a call of a method of that name, so `Integer` code had no
+  bit operations at all. Why: the bound is documented as having every integer operation, and the
+  integer methods need them. Alternatives weighed: methods `bitAnd`, `shiftLeft` on `Integer` (a
+  second spelling of what the operators already say); doing the bit work by division and remainder
+  (slower, and unreadable). A `T` with another bound still has them only as methods.
+
+- Proposed (branch `stdlib-math`): **choices inside the integer methods.** `pow(n: int)` takes an
+  `int` exponent at every width and traps on a negative one (a fraction is not an integer);
+  `x.pow(0)` is `1` for every `x`, `0.pow(0)` included. `gcd` is never negative and traps only when
+  its value is `MinValue`'s magnitude; `lcm` is `0` when either side is, otherwise positive. `sign`
+  is an `int`, as are `bitCount`, `leadingZeros` and `trailingZeros`, which count at the width
+  (`(-1).bitCount()` is `32`, zero has `width` leading and trailing zeros). `toRadix` writes lower
+  case, a `-` and the magnitude, as `f"%x"` does, with no prefix, and takes `int` from 2 to 36 and
+  traps outside it. Why: each is the usual meaning, the least surprising for a program moving
+  between widths. Alternatives weighed: a `long` exponent (never needed; an `int` is enough for
+  squaring by halves); a `gcd` that keeps a negative sign (an unsigned-looking result is what callers
+  want).
+
+- Proposed (branch `stdlib-math`): **`avin.math` additions.** `round(x)` returns a `long`, a tie
+  going away from zero, and converts as `long(x)` does for NaN and out-of-range values; `trunc(x)`
+  returns a `real`, as `floor` and `ceil` do, keeping a negative zero's sign; `ulp` at the greatest
+  finite value is the gap below it (a finite answer rather than infinity); `nextUp` and `nextDown`
+  leave NaN and the infinity they move towards alone. Why: `round` is the one the program usually
+  wants as an integer and `rint` is already the `real` form; the others follow the platform's
+  functions. Alternatives weighed: `round` returning `real` (no saturation story to tell, but the
+  common use then needs `long(round(x))`); `trunc` returning `long` (loses negative zero and the
+  large values). Review with the user: the `round` and `trunc` result types differ, which is
+  unusual to read.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
