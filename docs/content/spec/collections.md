@@ -487,8 +487,11 @@ counter reads `val counts = HashMap.empty[string, int]().withDefaultValue(0)` an
 
 A hash, tree or ordered map's `partition((k, v) -> bool)` answers two maps of its own kind, the
 entries that pass and those that do not, each keeping the order of the whole and `p` called once per
-entry; likewise `partition(p)` of a hash, tree, ordered or bit set answers two sets of its own kind.
-Held as a `Map` or `Set`, or given a function of one pair, `partition` is `Iterable`'s and answers
+entry; this holds through `Map`, `SortedMap` and `SeqMap` as well, whose `partition((k, v) -> bool)`
+answers maps of the receiver's kind (a class implementing `Map` inherits a default built on
+`removed`, and may override it). Likewise `partition(p)` of a hash, tree, ordered or bit set answers
+two sets of its own kind; held as a `Set`, `partition` is `Iterable`'s and answers vectors, since a
+set is not a vector. Given a function of one pair, a map's `partition` is `Iterable`'s and answers
 vectors. `s.subsets()` visits every subset of a set and `s.subsets(k)` those of `k` elements, as
 iterators that make each subset only when it is asked for: each is a set of the receiver's kind,
 visited by size, the empty set first and the set itself last, and those of one size in the
