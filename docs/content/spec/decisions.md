@@ -6566,6 +6566,43 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- **`BitSet` (immutable and mutable): representation and negatives** (branch `stdlib-bitset`).
+  Proposed: the immutable `BitSet` is a class over a `Vector[long]` of words, kept without empty words
+  at the end, so an update copies one path and `toBitMask()` is the words; the mutable one is over a
+  `Buffer[long]`. A negative element is not in any bit set: `contains` and `excl`/`remove` treat it as
+  absent (`false`, set unchanged), and everything that would add one traps (`incl`, `++`, `apply`,
+  the builder, `add`, `+=`, `++=`, `addAll`); the ordered queries and slices take any `int`. Why: a
+  query about a number that cannot be present has the honest answer "no", which keeps generic
+  code over `Set[int]` from trapping on `s(x)`, while storing a number the set cannot hold must not
+  silently succeed. Alternatives weighed: trapping in `contains`/`remove` too (strict, but breaks
+  `Set[int]` code that probes with arbitrary ints); ignoring negatives in `incl` (silently drops an
+  element, so `s.incl(x).contains(x)` can be false); offsetting by a minimum (a different set type).
+  Review with the user if bit sets of negatives (a signed range) are wanted.
+
+- **`BitSet` method names beyond the `Set` ones** (branch `stdlib-bitset`). Proposed: the immutable
+  set adds `symmetricDiff` and `toBitMask`, with `BitSet.fromBitMask`; the mutable one adds
+  `unionInPlace`, `intersectInPlace`, `diffInPlace`, `symmetricDiffInPlace` (taking a mutable bit
+  set), the non-mutating `union`, `intersect`, `diff` and `symmetricDiff` over mutable bit sets,
+  `copy()` and `toSet()` (the immutable one), beside the mutable `Set`'s `add`, `remove`, `addAll`,
+  `+=`, `-=`, `++=`, `--=` and `filterInPlace`. Why: the `…InPlace` suffix names the in-place form of a
+  method the set already has (as `filterInPlace` and `sortInPlace` do) and spells out what the symbol
+  forms `|=` and `&=` would, which are free method names but carry no word for a reader. Alternatives:
+  `|=`, `&=`, `-=` as the in-place algebra (`-=` is taken by removing an element); `unionWith` and so on
+  (suggests a combining function); `addAll(other)` for the union (already means adding elements of
+  any `Iterable`). `symmetricDiff` is `xor` in some libraries; the longer name reads without
+  knowing bit-twiddling. The mutable bit set's `union`/`intersect`/`diff` take a mutable bit set only
+  rather than any `Set[int]`, the mutable `Set` not being a `Set` trait member either.
+
+- **A mutable `BitSet` iterates over a snapshot, and its ordered queries copy it** (branch
+  `stdlib-bitset`). Proposed: `iterator()`, `headOption()`, `lastOption()`, `minAfter` and
+  `maxBefore` of a mutable bit set read an immutable copy of its words, so changing the set during a
+  `for` is safe and visits the elements it had when the loop began. Why: it makes the iterator the
+  same code as the immutable one, and a mutable hash set's iterator has no defined behaviour under
+  change at all, so a stable one is the safer promise. Cost: one pass over the words per call, so a
+  loop calling `minAfter` repeatedly on a large sparse set is quadratic in the words. Alternative: a
+  live iterator that reads the words as it goes (no copy, but sees its own changes); revisit if
+  `minAfter` is used as a scan.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
