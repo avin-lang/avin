@@ -5690,6 +5690,15 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   an Avin `bool` or `Option` parameter choosing at run time (the result's shape would depend on a
   value); a `skip:` list on the annotation (a second place saying what one parameter is).
   **Review with the user**: whether `null` should also let an Avin `Option` parameter decide.
+- **A field accessor reads and writes an enum mirror** (built on branch `c-binding-gaps`): the C
+  unit checks the field is of an integer type (any, not only the mirrored enum) and measures it; a read
+  value no variant holds stops the program as an enum result does (`` the field `f` of `H` held a
+  value no variant of `M` holds``), a write stores the enumerator's value, and an `Option` of a
+  mirror is refused. *Why*: a struct mirror's field already crosses this way, and Cairo's path header
+  is a union member; accepting any integer type lets an `int` field holding an enum's values be
+  mirrored. *Alternatives*: requiring the field to be exactly the mirrored enum (the field's type is
+  the header's, which the checker never sees, so the C unit would compare type names); reading it as
+  an `int` and converting in Avin (the workaround cairo used).
 
 ## Open
 

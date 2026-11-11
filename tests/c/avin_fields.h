@@ -69,6 +69,8 @@ struct fxf_point {
     int x;
     int y;
 };
+/* The kinds a cell's header holds, as Cairo's `cairo_path_data_type_t` does. */
+enum fxf_path_kind { FXF_MOVE_TO, FXF_LINE_TO, FXF_CURVE_TO, FXF_CLOSE_PATH };
 /* A union of a header and a point, as Cairo's `cairo_path_data_t` is. */
 union fxf_cell {
     struct {

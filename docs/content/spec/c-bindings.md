@@ -497,7 +497,7 @@ field that is a pointer is read as a string or a borrowed handle by the same rul
 - **The field is a member path of the struct `self` points at**, `"width"`, `"origin.x"`,
   `"glyph->bitmap.rows"`, read as `self->` followed by it. The handle's type must point at a struct
   the headers define; one they only declare is refused when the C unit compiles the accessor.
-- **A field is read as an integer type, `byte`, `bool`, `real`, a string or a handle**, or the memory
+- **A field is read as an integer type, `byte`, `bool`, `real`, an enum mirror, a string or a handle**, or the memory
   a byte pointer points at is lent as a [view](#buffers) with `view` and `length:`. The C unit
   checks the field is the kind its Avin type needs (an integer or enumeration, one byte wide for
   `byte`, a `bool` or an integer for `bool`, a floating-point type for `real`, `char *` or
@@ -505,6 +505,18 @@ field that is a pointer is read as a string or a borrowed handle by the same rul
   sign, so an integer the Avin type cannot hold stops the program at the read, as a result does. A
   null string is `None` for an `Option[string]` and stops the program otherwise; a string is copied
   and checked as UTF-8, and never freed, since the struct owns it.
+- **A field may be read and written as an [enum mirror](#enums-and-constants)**
+  ([proposed](/spec/decisions/#proposed)): the field is of an integer type, the enum the mirror
+  mirrors or another (a union member C declares `int`), measured as any integer field is. A value
+  read that no variant holds stops the program at the read
+  (`` the field `cells[i].header.kind` of `Path` held a value no variant of `PathDataType` holds``),
+  and a variant is written as its enumerator's value. A mirror in an `Option` is neither, since a field
+  is never null. Cairo's path data is a union whose header holds the element's kind:
+
+  ```avin
+  @c(field: "data[i].header.type", bound: "self->num_data")
+  kind(i: int) -> PathDataType
+  ```
 - **A handle read from a field is lent**, as a `borrowed` result is: it takes a reference of its own
   through its class's `retain`, so the class must declare one, and a class with `kept:` cannot be
   read, since the accessor keeps nothing. `borrowed` is not written.
