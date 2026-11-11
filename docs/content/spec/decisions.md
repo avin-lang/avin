@@ -6207,6 +6207,22 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- **Proposed: `clamp(x, lo, hi)` is a free function, and `Vector` has no `Ord` yet.** A method
+  `x.clamp(lo, hi)` on every `Ord` type needs `impl[T: Ord] T`, which the checker refuses (an impl
+  adds to a type parameter only where it is bounded by `Integer` alone), so `clamp` is a free
+  function beside `max` and `min`, which are free functions too; it traps where `hi < lo`. Why: it
+  reads like `max`/`min` and needs no language change. Alternatives weighed: widening the blanket
+  impl rule (a language change with a wide reach); a method on `Integer` only (leaves strings,
+  chars and reals without). `impl[T: Ord] Ord for Vector[T]` is refused because `Vector` is an
+  abstract covariant class, whose added methods are variance positions, and `compare(other:
+  Vector[T])` takes `T` in; `ArraySeq` is a final class and has its `Ord`. `Seq[T]` gets no
+  `compare` method. Review with the user: how `Vector` should be `Ord`.
+- **Proposed: `Reverse`, `compareBy`, `reverseOrder` and `thenBy` are in `avin` as plain names.**
+  `Reverse` is a `data` type with `Ord` reversed and equality as `T`'s; descending sorts are written
+  with it rather than a `sortedDescending()`. Why: it composes inside tuple keys, which a
+  descending method cannot. Alternatives weighed: `sortedDescending`/`sortByDescending` on `Seq`
+  (do not combine with a second key).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

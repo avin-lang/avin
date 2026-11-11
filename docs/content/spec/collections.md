@@ -794,6 +794,17 @@ val scores: Array[int] = [3, 1, 2]
 scores.sortInPlace()                                 // [1, 2, 3]
 ```
 
+**Ordering toolkit.** An `ArraySeq` is `Ord` where its elements are, as a `List` is: element by
+element, the first pair that differs deciding, and a sequence ordering before every longer one it
+begins. **Descending order is `Reverse`**, so there is no `sortedDescending()`:
+`data Reverse[T: Ord](value: T)` orders the opposite way to `value`, and as a sort key, alone or one
+part of a tuple, it sorts descending: `people.sortBy(p -> (Reverse(p.age), p.name))` is oldest first,
+ties by name. `Reverse(Reverse(x))` orders as `x`. `clamp(x, lo, hi)` is `x` limited to `lo ..= hi`
+and traps where `hi < lo`. For `sortWith`, `compareBy(key)` is the comparison of two values by their
+keys, `reverseOrder(cmp)` the same comparison the other way round, and `thenBy(first, second)` the
+first, with the second deciding where the first finds two values equal:
+`people.sortWith(thenBy(reverseOrder(compareBy(p -> p.age)), compareBy(p -> p.name)))`.
+
 Strings order by code point (their bytes, which in UTF-8 order the same), so every capital comes
 before every small letter; reals order as IEEE 754 does. Sorting elements without `Ord` by
 `sorted()` or `sortInPlace()` is a compile-time error naming the bound, and `sortWith` is the way to sort
