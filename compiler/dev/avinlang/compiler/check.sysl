@@ -3542,11 +3542,20 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
     // A built-in type's operations are intrinsics, so its impls may declare them; no other method
     // takes an annotation.
     val builtin = !(*target is Data(_, _, _)) && !family
-    for a in f.annotations
-        if a.name == "tailrec" || a.name == "sendable_result" then continue
-        if a.name != "intrinsic" || !builtin || trait_id is Some(_)
-            c.note(unit, f.name_span, "annotations on methods are not implemented")
-            break
+    // A Sysl mirror's methods without a body, in an impl of no trait, are bound to the Sysl methods
+    // of the value it mirrors, which each call converts the receiver into.
+    val bodyless = f.body is None && f.clauses.len() == 0
+    val mirror = *target match
+        Data(id, _, _) -> mirror_target(c.data[id].decl) is Some(_)
+        _ -> false
+    val bound = mirror && trait_id is None && !overrides && !static_member && bodyless
+    if bound || (mirror && has_annotation(f, "sysl")) then check_bound_method_annotations(c, unit, f, bound, "mirror")
+    else
+        for a in f.annotations
+            if a.name == "tailrec" || a.name == "sendable_result" then continue
+            if a.name != "intrinsic" || !builtin || trait_id is Some(_)
+                c.note(unit, f.name_span, "annotations on methods are not implemented")
+                break
     // A built-in type's arithmetic and orderings are the machine's, which no method replaces, in a
     // trait's implementation either.
     if arithmetic_method_name(f.name) && !(*target is Data(_, _, _))
@@ -3603,7 +3612,12 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
         type_params.push(tp)
     for tp in f.type_params
         type_params.push(tp)
-    var symbol = signature(c, unit, methods_module(c, block), f, owner, type_params, false, Some(target))
+    // A bound method's `@sysl` names a Sysl method, which has been checked above, rather than a
+    // function, so its signature is read without it; its parameters and result cross to Sysl.
+    val written: &Function = if bound || (mirror && has_annotation(f, "sysl")) then Function(buf(), f.span, f.name_span, f.name, f.type_params, f.params, f.result, f.body, f.clauses) else f
+    var symbol = signature(c, unit, methods_module(c, block), written, owner, type_params, bound, Some(target))
+    symbol.decl = f
+    if bound then check_crossings_once_bounded(c, unit, f, symbol.params, 0, symbol.result, if type_params.len() > 0 then Some(GenericScope(owner, type_params)) else None)
     // The receiver comes first, named `self`.
     var receiver_types: Buf[&Type] = buf()
     var receiver_names: Buf[string] = buf()
@@ -8581,24 +8595,29 @@ private check_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
                 if f.name == "close" then c.note(unit, f.name_span, "every Sysl handle has `close()`, which gives back its Sysl value; bind the Sysl type's own `close` under another name, with `@sysl(\"close\")`")
                 val bodyless = f.body is None && f.clauses.len() == 0
                 if bodyless && static_member then c.note(unit, f.name_span, s"`${f.name}` is static, so it needs a body: a handle's methods without one are bound to its Sysl value's")
-                for a in f.annotations
-                    if a.name != "sysl"
-                        c.note(unit, a.span, s"unknown annotation `@${a.name}` on a method of a Sysl handle")
-                        continue
-                    if !bodyless then c.note(unit, a.span, "a method with a body is not bound to Sysl, so it takes no `@sysl`")
-                    var name: Option[string] = None
-                    if a.args.len() >= 1 && a.args[0].name is None
-                        if a.args[0].value.kind is StringLit(p) then name = Some(p)
-                    // `@sysl(blocking)` binds a method that may wait to the Sysl method of its own
-                    // name's words.
-                    val own_name = name is None && a.args.len() >= 1 && (is_blocking_word(a.args[0]) || is_binding_word(a.args[0], "named") || a.args[0].name is Some(_))
-                    if name is Some(_) then check_binding_flags(c, unit, a, 1)
-                    elif own_name then check_binding_flags(c, unit, a, 0)
-                    name match
-                        Some(p) ->
-                            if !is_sysl_path("x." + p) || p.contains(".") then c.note(unit, a.span, s"`@sysl` on a handle's method names the Sysl method it is bound to, as in `@sysl(\"close\")`; `$p` is not one")
-                        None ->
-                            if !own_name then c.note(unit, a.span, "`@sysl` on a handle's method takes one string, the name of the Sysl method it is bound to, as in `@sysl(\"close\")`, or `blocking` alone where the method may wait")
+                check_bound_method_annotations(c, unit, f, bodyless, "handle")
+
+/** The annotations of a method of a Sysl handle or mirror (`kind` names which): only `@sysl`, on a
+ * method without a body, naming the Sysl method it is bound to, or `blocking` or `named` alone where
+ * it is bound to the Sysl method of its own name's words. */
+private check_bound_method_annotations(c: *Checker, unit: usize, f: &Function, bodyless: bool, kind: string)
+    for a in f.annotations
+        if a.name != "sysl"
+            c.note(unit, a.span, s"unknown annotation `@${a.name}` on a method of a Sysl $kind")
+            continue
+        if !bodyless then c.note(unit, a.span, "a method with a body is not bound to Sysl, so it takes no `@sysl`")
+        var name: Option[string] = None
+        if a.args.len() >= 1 && a.args[0].name is None
+            if a.args[0].value.kind is StringLit(p) then name = Some(p)
+        // `@sysl(blocking)` binds a method that may wait to the Sysl method of its own name's words.
+        val own_name = name is None && a.args.len() >= 1 && (is_blocking_word(a.args[0]) || is_binding_word(a.args[0], "named") || a.args[0].name is Some(_))
+        if name is Some(_) then check_binding_flags(c, unit, a, 1)
+        elif own_name then check_binding_flags(c, unit, a, 0)
+        name match
+            Some(p) ->
+                if !is_sysl_path("x." + p) || p.contains(".") then c.note(unit, a.span, s"`@sysl` on a $kind's method names the Sysl method it is bound to, as in `@sysl(\"close\")`; `$p` is not one")
+            None ->
+                if !own_name then c.note(unit, a.span, s"`@sysl` on a $kind's method takes one string, the name of the Sysl method it is bound to, as in `@sysl(\"close\")`, or `blocking` alone where the method may wait")
 
 // A class declared with `@c(type: "T", release: "f")` is a handle on a C pointer of type `T`: its
 // objects are made by the C bindings that answer one, and hold one reference to the C object, which

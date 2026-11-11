@@ -5943,12 +5943,12 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   gains a second field, `why: TlsRefusal`, and `TlsError.refusal() -> Option[TlsRefusal]` answers it
   (`None` for the other errors). `TlsRefusal` is `HostMismatch`, `Expired`, `NotYetValid`,
   `Untrusted` and `Other(code: long)`, and its `message()` and the error's say the reason in words.
-  The package `openssl` 0.2.3 supplies the X509 verdict (`Error.verify`); the mapping to the five
-  kinds is the function `refusalOf` in `library/avin/net/tls/tls.avin`, the table of `openssl`'s
-  own `refusal()` (62 host; 10; 9; 2, 18, 19, 20, 21 untrusted) with one addition: 64, a certificate
-  for another IP address, is `HostMismatch` too (OpenSSL gives it a code of its own, so
-  `openssl`'s `Error.refusal()` would answer `Other(64)` for `127.0.0.2`). The verdict is read in
-  Avin and not through `openssl`'s `Refusal`, so the addition lives in one place. *Why*: a program
+  Amended 2026-11-11 (branch `openssl-024`): the mapping to the five kinds comes from the package
+  `openssl` 0.2.4, whose `Error.refusal()` groups the X509 verdicts (62 and 64, a certificate for
+  another name or another IP address, host; 10 expired; 9 not yet valid; 2, 18, 19, 20, 21
+  untrusted; any other `Other(code)`). `TlsRefusal` mirrors `openssl`'s `Refusal` and the private
+  `TlsFailure` binds `refusal()` as a [mirror's bound method](/spec/sysl-bindings/#methods-of-a-mirror),
+  so Avin keeps no table of its own; a failure with no verdict is `Other(0)`. *Why*: a program
   can tell a wrong name from an untrusted issuer, which read identically before; the reason is a
   value, so it is matched, not parsed out of text. The field is not an `Option`, since a refused
   certificate always has a verdict and `Other` carries the unusual ones. The field is `why` because
@@ -5992,6 +5992,30 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   through freed memory. The chapter's prose and both examples say so. *Why*: a `release` must give
   back exactly one reference when the class declares `retain`. *Alternatives*: none that keeps
   `keeps:` sound; the manager's small record is not given back, as the freetype package notes.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `openssl-024`): **a mirror's methods may be bound to Sysl**
+  ([methods of a mirror](/spec/sysl-bindings/#methods-of-a-mirror)). A method without a body in an
+  `impl` of a `@sysl` data type that names no trait is bound to the Sysl method of its name's words
+  in snake_case, or the one its own `@sysl("name")` names, with `blocking` and `named` as on a
+  handle's method; it may be overloaded by parameter types; its parameters and result cross as a
+  binding's do. Each call converts the receiver into the Sysl value, puts it in a counted box of its
+  own and calls the method on that, so a Sysl method taking `self`, `&self` or `*self` is bound
+  alike, and what a `*self` method writes is lost with the box: the mirror is a value. A method
+  without a body on a plain data type, or in an `impl` of a trait, still needs one; a method with a
+  body takes no `@sysl`. *Why*: `openssl`'s `Error.refusal()` is a method of a struct Avin
+  mirrors, and a mirror had no way to reach it, so Avin copied its table. The `impl` form, because
+  a data type's body holds its variants, and a handle's body form would need a second kind of body
+  member for data. The box, because the shim cannot see which receiver the Sysl method takes and
+  `&self` needs a counted reference; the cost is one allocation per call. *Alternatives*: methods
+  in the data's own body after its variants (a new body grammar for data); a top-level binding
+  whose first parameter is the mirror, `@sysl("sh.sysl.openssl.Error.refusal")` (a path that names
+  a method rather than a function, read differently from every other binding's); passing the value on the stack and
+  refusing `&self` methods (most Sysl readers take `&self`); a `*self` method's write copied back
+  (a mirror is immutable in Avin). Also chosen here: `TlsRefusal` itself mirrors `openssl`'s
+  `Refusal` rather than a private mirror mapped to it, since a second data type with the same
+  variant names cannot share the module, and the two would be the same five cases. Review with
+  the user whether a public library type mirroring a package's enum is wanted: a variant `openssl`
+  adds must be added to `TlsRefusal`, which Sysl reports as not matching until it is.
 
 **Deferred**
 
