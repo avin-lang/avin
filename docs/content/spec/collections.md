@@ -26,16 +26,20 @@ Iterable[+A]                 iterator(), and the operation families below
 ├── PriorityQueue[T]         mutable binary heap, greatest first (avin.collections.mutable)
 ├── Set[A]                   immutable sets, (A) -> bool
 │   ├── HashSet[A]           by hash; what {a, b} and Set(...) build
+│   ├── SeqSet[A]            in insertion order
+│   │   └── OrderedSet[A]    by hash, with the order of first insertion
 │   └── SortedSet[A]         in order, with the ordered operations
 │       └── TreeSet[A]       sorted by Ord
 └── Map[K, +V]               immutable maps, (K) -> V
     ├── HashMap[K, +V]       by hash; what {k: v} and Map(...) build
+    ├── SeqMap[K, +V]        in insertion order
+    │   └── OrderedMap[K, +V]  by hash, with the order of first insertion
     └── SortedMap[K, +V]     in key order, with the ordered operations
         └── TreeMap[K, +V]   sorted by Ord
 ```
 
-`Set`, `SortedSet`, `Map` and `SortedMap` are traits; the hash-based and tree collections are the
-data types that conform to them.
+`Set`, `SeqSet`, `SortedSet`, `Map`, `SeqMap` and `SortedMap` are traits; the hash-based, insertion-ordered
+and tree collections are the data types that conform to them.
 
 `[]T` is shorthand for `Vector[T]` in any type position (`xs: []int`, `[][]int`); see
 [types](/spec/types/).
@@ -397,6 +401,20 @@ elements of another type, `map`, `collect` and `flatMap`, answer a hash-based co
 trait, and the tree collection's own versions answer a tree collection where its type is known. The
 hash-based kinds are hash tries, branching on one bit of the spread hash at a time, so an update
 copies a path proportional to the logarithm of the size.
+
+`OrderedMap` and `OrderedSet`, the `SeqMap` and `SeqSet` data types, find keys by hash as the hash-based
+kinds do and iterate in the order their keys were first added: `OrderedMap(("b", 1), ("a", 2))` visits
+`b` then `a`, whatever the hashes. Updating a key already present replaces its value and keeps its
+place; a key removed and added again goes to the end. `keys()`, `values()`, `keySet()`, the
+iterators, `display` and `toString` all follow that order, and `reverseIterator()` visits it backwards.
+They are persistent like the others: the entries sit in a vector in insertion order, a removed entry
+leaving a gap that is dropped, with the keys renumbered, once the gaps outnumber the entries, so a
+lookup, an update or a removal takes time in the logarithm of the size (a compaction costs the size,
+paid for by the removals that caused it) and the slots never exceed about twice the entries. Equality
+ignores the order: an `OrderedMap` equals a `HashMap` or `TreeMap` of the same entries, an
+`OrderedSet` equals a `HashSet` of the same elements, and equal ones hash alike. Updates through
+`SeqMap` and `SeqSet` answer a `SeqMap` or `SeqSet`; `map`, `collect` and `flatMap` answer hash-based
+collections. A literal `{k: v}` or `{a, b}` where one of them is expected builds it in the order written.
 
 A map's values are covariant, so a method that puts a value in takes any supertype of `V`, as
 [lower bounds](/spec/generics/#lower-bounds) allow: `updated[W >: V](key, value: W) -> Map[K, W]`,

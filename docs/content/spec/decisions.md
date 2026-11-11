@@ -6493,6 +6493,33 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 - **Equal elements come out in no promised order** (branch `stdlib-priority-queue`): a binary heap
   is not stable. Alternative: a sequence number breaking ties first-in-first-out, at the cost of a
   word per element and a wider comparison; a caller wanting it orders by `thenBy` on its own counter.
+- **Insertion-ordered maps and sets: names, update order, equality** (branch `stdlib-ordered-map`).
+  The concrete types are `OrderedMap[K, +V]` and `OrderedSet[A]`, conforming to the traits `SeqMap[K, +V]`
+  and `SeqSet[A]`. *Why:* the concrete names say what the collection does, as `HashMap` says how it
+  finds and `TreeMap` how it sorts, and no implementation (a vector of keys) leaks into them; the
+  trait names follow the sequence-like "in the order added" meaning of `Seq`. *Alternatives:*
+  `VectorMap`/`VectorSet` (names the layout, not the behaviour), `InsertionOrderedMap`,
+  `LinkedHashMap`-style names, and `OrderedMap` as the trait with the concrete type named for its
+  layout. *Update order:* updating a key already present keeps its place and replaces its value;
+  removing and re-adding moves it to the end. *Why:* an update is not a new arrival, so a map used as
+  a record keeps its field order. *Alternative:* an update moves the key to the end. *Equality:* two
+  maps are equal when they hold the same keys bound to equal values, and two sets when they hold the
+  same elements, whatever the order, and equal ones hash alike, so an `OrderedMap` equals a
+  `HashMap` of the same entries as every kind of `Map` does. *Why:* the existing rule makes map
+  equality independent of the kind, and an order-sensitive `==` on one kind would break transitivity
+  through the traits. *Alternative:* an order-sensitive `==` between two ordered maps (reached by
+  comparing `iterator()`s). *Layout:* a hash trie from key to slot and a vector of slots, removal
+  leaving a gap, compacted when gaps exceed both eight and the entries. `map`, `collect` and
+  `flatMap` through the trait answer hash-based collections, as for `TreeMap` through `Map`. A
+  `{k: v}` or `{a, b}` literal builds one where `SeqMap`, `OrderedMap`, `SeqSet` or `OrderedSet` is
+  expected. Review with the user: the names.
+- **A call through a method table or a bound reaches only methods of types that conform** (branch
+  `stdlib-ordered-map`; a fix, recorded because it changes what the polymorphic-recursion check
+  reports). The type arguments of a method's own type parameters flowed into every method of the same
+  name and arity of any type, so a generic method that called a sequence's `updated` with a type built
+  from its own parameter was reported as recursing into itself. They now flow only into methods of
+  types that have the called method's class or trait among their ancestors. *Alternative:* keep the
+  name-only approximation and rename the method (rejected: `updated` is the name every map has).
 
 ## Open
 
