@@ -335,6 +335,22 @@ thread the last reference goes, unpins it, and runs no Avin code. An `attach:` e
 non-zero stops the program at the call, since what it would keep could not be kept. Without `attach:`,
 `keeps:` holds only as long as the handle ([proposed](/spec/decisions/#proposed)).
 
+**A binding answering its handle in a `Result[H, E]` answers that failure instead**
+([proposed](/spec/decisions/#proposed)): `Ok` of the handle where C was told, and otherwise `Err` of
+what `attach:` answered — `E` an integer type, checked against its width, or an enum mirror, a value no
+variant holds stopping the program — the handle's reference given back and nothing kept. Cairo answers
+a surface it could not make as a surface in an error state, and `cairo_surface_set_user_data` on it
+answers that surface's status, so the status comes back as the error, with no check before the call:
+
+```avin
+@c("cairo_surface_t *cairo_image_surface_create_for_data(unsigned char *pixels, cairo_format_t format, int width, int height, int stride)",
+   keeps: "pixels")
+private surfaceForData(pixels: ByteBlock, format: Format, width: int, height: int, stride: int) -> Result[Surface, Status]
+```
+
+Such a binding answers no out values, its handle is never in an `Option`, its class has `attach:` and
+it keeps something; a C result that is null still stops the program.
+
 The record belongs to one handle object: a later `keeps:` through the same handle adds to it, and the
 handle lets go of it when its reference goes back, by `close()` or its finalizer, while C keeps it until
 `destroy`. On such a class every kept object, a handle or a `ByteBlock`, is held as the Avin object, so

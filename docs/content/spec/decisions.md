@@ -5699,6 +5699,17 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   mirrored. *Alternatives*: requiring the field to be exactly the mirrored enum (the field's type is
   the header's, which the checker never sees, so the C unit would compare type names); reading it as
   an `int` and converting in Avin (the workaround cairo used).
+- **`attach:` failing answers `Err` where the binding answers `Result[H, E]`** (built on branch
+  `c-binding-gaps`): a binding whose C result is a handle of a class with `attach:`, which keeps
+  something and answers no out values, may answer `Result[H, E]`, `E` an integer type or an enum
+  mirror; when `attach:` answers non-zero, the record is undone, the handle given back (its kept list
+  cleared) and `Err` of the answer returned, converted as a status code is. Without the `Result` the
+  trap stays. *Why*: Cairo's `cairo_surface_set_user_data` on a surface in error answers the surface's
+  own status, so the `attach:` answer is exactly the error the program wants, and no new word is
+  needed; the `Result` is the existing status shape. *Alternatives*: a class-level `status:` C
+  expression evaluated on every new handle (a new word, and a check on bindings that keep nothing);
+  answering `None` for a refused attach (loses the reason); keeping the trap and the library's
+  pre-checks (what cairo had to write).
 
 ## Open
 

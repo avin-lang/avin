@@ -2492,6 +2492,40 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
         passed.push(SlotAddress(slot_of(place)))
     val length_slot: Option[usize] = if length_slots.len() > 0 then Some(length_slots[0]) else None
     val outs_read = COutsRead(n, length_slots)
+    // A handle answered in a `Result`: `Ok` of the handle, or, where the `attach:` that ties what the
+    // call keeps to the C object answers non-zero, `Err` of that answer, the handle given back.
+    if c_attach_result(answered, outs.len(), l.program.data, l.program.classes) is Some(e)
+        val ok_type = c_status_ok(answered)
+        val h = c_handle_form(ok_type, l.program.data, l.program.classes).unwrap()
+        val answer = fresh(l, MPtr)
+        c_call(l, Call(Some(answer), CFunction(callee, scalars, Some(CAddress)), passed), blocking, arrays, objects)
+        val handle = c_handle_out(l, symbol, calls, Value(answer), ok_type, h, s"`${p.symbol}` answered", at)
+        val code = machine_slot(l, MInt(64))
+        store(l, code, Some(ConstInt(64, "0")))
+        val slot = machine_slot(l, MRef)
+        val failed = new_block(l)
+        val join = new_block(l)
+        c_keeps(l, symbol, calls, Some(handle.object), false, Some(CAttachFail(slot_of(code), failed)))
+        store(l, slot, Some(variant_object(l, answered, "Ok", Some(handle.value))))
+        finish_into(l, Jump(join), failed)
+        // What C could not be told of is not kept: the handle gives its reference back, and the
+        // objects it was to keep with it.
+        c_glue_call(l, s"avin_c_give_back_${h.class_index}", [handle.object])
+        l.insts.push(Store(field_address(l, handle.object, FieldSlot(CHandleKept, MRef)), NullAddress))
+        val x = load(l, code).unwrap()
+        val error = c_mirror_of(e, l.program.data) match
+            Some(d) -> c_mirror_answer(l, x, d, CSigned(64), s"`attach:` of `${trap_name(l, h.class_index)}` answered", at)
+            None -> c_answer(l, x, CSigned(64), e, at)
+        store(l, slot, Some(variant_object(l, answered, "Err", Some(error))))
+        finish_into(l, Jump(join), join)
+        c_release_copies(l, copies)
+        c_release_structs(l, symbol, structs, arrays)
+        c_free_records(l, record_slots)
+        c_consumes(l, symbol, calls)
+        val value = load(l, slot).unwrap()
+        l.library = outer
+        finish(l, Return(Some(value)))
+        return
     // A status: `Ok` of the out values, read only when it is zero, and `Err` of the code otherwise.
     if c_status_error(answered, l.program.data) is Some(e)
         val mirror = c_mirror_of(e, l.program.data)
@@ -2505,7 +2539,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
         val join = new_block(l)
         finish_into(l, Branch(ok, yes, no), yes)
         val read = c_read_outs(l, symbol, calls, outs, outs_read, at)
-        c_keeps(l, symbol, calls, read.made, read.made_optional)
+        c_keeps(l, symbol, calls, read.made, read.made_optional, None)
         val ok_type = c_status_ok(answered)
         store(l, slot, Some(variant_object(l, answered, "Ok", c_assemble(l, ok_type, read.values))))
         finish_into(l, Jump(join), no)
@@ -2580,7 +2614,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
     if made is None
         made = read.made
         made_optional = read.made_optional
-    c_keeps(l, symbol, calls, made, made_optional)
+    c_keeps(l, symbol, calls, made, made_optional, None)
     c_free_records(l, record_slots)
     c_consumes(l, symbol, calls)
     var values: Buf[Option[Operand]] = buf()
@@ -3648,14 +3682,14 @@ private c_after_call(l: *Lowering, symbol: FunctionSymbol, call: CCall, made: Op
         val join = new_block(l)
         finish_into(l, Branch(flag, yes, join), yes)
         after = Some(join)
-    c_keeps(l, symbol, call, made, false)
+    c_keeps(l, symbol, call, made, false, None)
     if after is Some(join) then finish_into(l, Jump(join), join)
     c_consumes(l, symbol, call)
 
 // Each handle `keeps:` names is kept by `made`, the handle the call answered, which is null for
 // `None` where it is `optional`, and keeps nothing then; where the call answers no handle, by the
 // receiver.
-private c_keeps(l: *Lowering, symbol: FunctionSymbol, call: CCall, made: Option[Operand], optional: bool)
+private c_keeps(l: *Lowering, symbol: FunctionSymbol, call: CCall, made: Option[Operand], optional: bool, fail: Option[CAttachFail])
     val keeps = c_binding_names(symbol.decl, "keeps")
     if keeps.len() == 0 then return
     var holder: Option[Operand] = made
@@ -3690,8 +3724,14 @@ private c_keeps(l: *Lowering, symbol: FunctionSymbol, call: CCall, made: Option[
             kept_objects = true
         else c_keep(l, o, kept, call.args[i], call.classes[i], call.optionals[i])
     if attached is Some(hk)
-        if kept_objects then c_attach(l, o, hk, symbol.name, symbol.decl.name_span)
+        if kept_objects then c_attach(l, o, hk, symbol.name, symbol.decl.name_span, fail)
     c_end_present(l, join)
+
+/** Where an `attach:` answering non-zero goes for a binding answering its handle in a `Result`: the
+ * slot its answer is written into, and the block that answers the error. */
+private struct CAttachFail
+    code: usize
+    block: usize
 
 // The first C handle class the Avin type `t` answers, itself or inside an `Option`, a `Result`'s `Ok`
 // or a tuple.
@@ -3709,9 +3749,10 @@ private c_first_handle_class(l: *Lowering, t: &Type) -> Option[usize]
 
 // Ties what the handle `holder`, of class `k` with `attach:`, keeps to its C object: at its first
 // keep, a record is made in the runtime and given to C through the class's glue, which stops the
-// program at the call of `binding` where C answers non-zero; the record then keeps the holder's list
-// of the Avin objects it keeps, for as long as C holds it.
-private c_attach(l: *Lowering, holder: Operand, k: usize, binding: string, at: Span)
+// program at the call of `binding` where C answers non-zero, or, given `fail`, writes the answer into
+// its slot and goes to its block; the record then keeps the holder's list of the Avin objects it
+// keeps, for as long as C holds it.
+private c_attach(l: *Lowering, holder: Operand, k: usize, binding: string, at: Span, fail: Option[CAttachFail])
     val word = field_address(l, holder, FieldSlot(CHandleAttach, MInt(64)))
     val known = fresh(l, MInt(64))
     l.insts.push(Load(known, word))
@@ -3739,8 +3780,13 @@ private c_attach(l: *Lowering, holder: Operand, k: usize, binding: string, at: S
     var undone: Buf[Operand] = buf()
     undone.push(made)
     l.insts.push(Call(None, Runtime("avin_rt_c_attach_failed", MirSignature(undo, None)), undone))
-    val site = trap_site(l, s"`attach:` of `${trap_name(l, k)}` answered non-zero, so what `$binding` keeps cannot be kept", at)
-    finish_into(l, trap_terminator(l, site), attached)
+    fail match
+        Some(f) ->
+            l.insts.push(Store(SlotAddress(f.code), Value(answer)))
+            finish_into(l, Jump(f.block), attached)
+        None ->
+            val site = trap_site(l, s"`attach:` of `${trap_name(l, k)}` answered non-zero, so what `$binding` keeps cannot be kept", at)
+            finish_into(l, trap_terminator(l, site), attached)
     l.insts.push(Store(field_address(l, holder, FieldSlot(CHandleAttach, MInt(64))), made))
     store(l, record, Some(made))
     finish_into(l, Jump(join), join)

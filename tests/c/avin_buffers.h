@@ -65,6 +65,12 @@ void bf_surface_unref(bf_surface *s);
 int bf_surface_set_user_data(bf_surface *s, const bf_user_data_key_t *key, void *data, void (*destroy)(void *));
 /* As `bf_surface_set_user_data`, but failing with 1, setting nothing. */
 int bf_surface_refuse_user_data(bf_surface *s, const bf_user_data_key_t *key, void *data, void (*destroy)(void *));
+/* A surface made in an error state, as Cairo's are: with a stride of zero its status is
+ * `BF_INVALID_STRIDE`, with a negative one its magnitude; setting its user data then answers the
+ * status and sets nothing, as `cairo_surface_set_user_data` does for a surface in error. */
+typedef enum { BF_SUCCESS = 0, BF_NO_MEMORY = 1, BF_INVALID_STRIDE = 3 } bf_status;
+bf_surface *bf_surface_new_checked(unsigned char *data, int n, int stride);
+bf_status bf_surface_set_user_data_checked(bf_surface *s, const bf_user_data_key_t *key, void *data, void (*destroy)(void *));
 /* Reads and writes the surface's bytes. */
 long bf_surface_sum(bf_surface *s);
 void bf_surface_paint(bf_surface *s, unsigned char value);

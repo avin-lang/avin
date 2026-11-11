@@ -1,0 +1,86 @@
+// A binding answering a handle of a class with `attach:` in a `Result`: `Ok` of the handle where C
+// was told of what the call keeps, and otherwise `Err` of what `attach:` answered, as an enum mirror
+// or an integer, the handle given back and nothing kept. A Cairo surface made in an error state
+// answers its status to `cairo_surface_set_user_data`, so its error comes back this way.
+import avin.c.ByteBlock
+import avin.threads.spawn
+
+@c(enum: "bf_status", prefix: "BF_")
+data BfStatus
+    Success
+    NoMemory
+    InvalidStride
+
+@c(type: "bf_surface *", release: "bf_surface_unref", retain: "bf_surface_ref",
+   attach: "bf_surface_set_user_data_checked(self, key, data, destroy)", key: "bf_user_data_key_t")
+class Checked
+    @c("long bf_surface_sum(bf_surface *self)")
+    sum() -> long
+
+@c("bf_surface *bf_surface_new_checked(unsigned char *pixels, length(pixels) int n, int stride)", keeps: "pixels")
+checkedOver(pixels: ByteBlock, stride: int) -> Result[Checked, BfStatus]
+
+@c("bf_surface *bf_surface_new_checked(unsigned char *pixels, length(pixels) int n, int stride)", keeps: "pixels")
+checkedCode(pixels: ByteBlock, stride: int) -> Result[Checked, int]
+
+@c("bf_surface *bf_surface_new_checked(unsigned char *pixels, length(pixels) int n, int stride)", keeps: "pixels")
+checkedNarrow(pixels: ByteBlock, stride: int) -> Result[Checked, i8]
+
+@c("bf_surface *bf_surface_new_checked(unsigned char *pixels, length(pixels) int n, int stride)", keeps: "pixels", blocking)
+checkedBlocking(pixels: ByteBlock, stride: int) -> Result[Checked, BfStatus]
+
+@c("bf_surface *bf_surface_new(unsigned char *pixels, length(pixels) int n)", keeps: "pixels")
+refusingResult(pixels: ByteBlock) -> Result[Refusing, int]
+
+@test("a surface C was told of is `Ok`, and keeps its block through C")
+attachOk()
+    val alive = surfacesAlive()
+    val b = ByteBlock(8)
+    b.fill(0, 8, byte(3))
+    checkedOver(b, 4) match
+        Ok(s) ->
+            assertEq(s.sum(), long(24))
+            assertEq(surfacesAlive(), alive + 1)
+            s.close()
+        Err(e) -> assert(false, s"error $e")
+    assertEq(surfacesAlive(), alive)
+
+@test("a surface in error is `Err` of its status, given back, and keeps nothing")
+attachErr()
+    val alive = surfacesAlive()
+    val destroyed = destroys()
+    assertEq(checkedOver(ByteBlock(8), 0).map(_ -> 0), Err(InvalidStride))
+    assertEq(checkedOver(ByteBlock(8), -1).map(_ -> 0), Err(NoMemory))
+    assertEq(surfacesAlive(), alive)
+    assertEq(destroys(), destroyed)
+
+@test("the error is an integer where the binding answers one, checked against its width")
+attachErrCode()
+    assertEq(checkedCode(ByteBlock(4), -7).map(_ -> 0), Err(7))
+    assertEq(checkedCode(ByteBlock(4), -2147483647).map(_ -> 0), Err(2147483647))
+    assertEq(checkedNarrow(ByteBlock(4), -127).map(_ -> 0), Err(i8(127)))
+    assertEq(refusingResult(ByteBlock(2)).map(_ -> 0), Err(1))
+    checkedCode(ByteBlock(4), 1) match
+        Ok(s) -> assertEq(s.sum(), long(0))
+        Err(_) -> assert(false)
+
+@test("errors and surfaces made many times over, collected, blocking and on another thread")
+attachMany()
+    val alive = surfacesAlive()
+    for i in 0..<3000
+        val r = if i % 10 == 0 then checkedBlocking(ByteBlock(4), i % 3 - 1) else checkedOver(ByteBlock(4), i % 3 - 1)
+        r match
+            Ok(s) -> assertEq(s.sum(), long(0))
+            Err(e) -> assert(e == InvalidStride || e == NoMemory)
+    val t = spawn(() -> checkedCode(ByteBlock(4), 0).map(_ -> 0))
+    assertEq(t.join(), Err(3))
+    churnAttached()
+    churnAttached()
+
+@test(should_trap: "`attach:` of `Checked` answered a value no variant of `BfStatus` holds")
+attachErrNoVariant()
+    checkedOver(ByteBlock(4), -7)
+
+@test(should_trap: "value out of range for i8")
+attachErrNarrow()
+    checkedNarrow(ByteBlock(4), -300)
