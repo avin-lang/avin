@@ -9,7 +9,8 @@
 import avin.fs
 import avin.io.IoError
 import avin.net.{TcpListener, TcpStream}
-import avin.net.tls.{Certificate, Credentials, Handshake, TlsClient, TlsError, TlsServer, TlsStream, Transport}
+import avin.io
+import avin.net.tls.{Certificate, Credentials, Expired, Handshake, HostMismatch, NotYetValid, Other, TlsClient, TlsError, TlsRefusal, TlsServer, TlsStream, Transport, Untrusted}
 import avin.threads.{Thread, spawn}
 import avin.time
 
@@ -30,7 +31,7 @@ trusting() -> TlsClient = TlsClient().trust(fixture("ca.pem"))
 
 kind(e: TlsError) -> string = e match
     Transport(_) -> "transport"
-    Certificate(_) -> "certificate"
+    Certificate(_, _) -> "certificate"
     Handshake(_) -> "handshake"
     Credentials(_) -> "credentials"
 
@@ -62,6 +63,17 @@ refused(certificate: string, host: string, client: TlsClient)
     tcp.close()
     served.join()
     println(s"$certificate for $host: ${kind(e)}, the message names it: ${e.message().contains("certificate")}")
+    // The reason, as a value and in the message.
+    val why = e.refusal().get()
+    println(s"  why: ${why}, in the message: ${e.message().contains(why.message())}")
+    println(s"  matched: ${reasonName(why)}")
+
+reasonName(r: TlsRefusal) -> string = r match
+    HostMismatch -> "host mismatch"
+    Expired -> "expired"
+    NotYetValid -> "not yet valid"
+    Untrusted -> "untrusted"
+    Other(c) -> s"other $c"
 
 main()
     refused("localhost.pem", "localhost", TlsClient())
@@ -70,6 +82,21 @@ main()
     refused("expired.pem", "localhost", trusting())
     refused("localhost.pem", "elsewhere.example", trusting())
     refused("localhost.pem", "127.0.0.2", trusting())
+    // A certificate whose first day is in the future, trusted as its own authority: the dates are
+    // refused whatever the chain.
+    refused("notyet.pem", "localhost", TlsClient().trust(fixture("notyet.pem")))
+    // Only a certificate refusal has a reason.
+    val plainPeer = ok(TcpListener.bind("127.0.0.1", 0))
+    val plainAt = plainPeer.port()
+    val plainThread = spawn(() ->
+        val s = ok(plainPeer.accept())
+        ok(s.writeText("HTTP/1.1 400 Bad Request\r\n\r\n"))
+        s.close()
+        plainPeer.close())
+    val notCertificate = TlsStream.connect("localhost", plainAt, trusting()).err().get()
+    println(s"a plain-text peer has a reason: ${notCertificate.refusal().isDefined()}")
+    plainThread.join()
+    println(s"a transport error has a reason: ${Transport(io.ConnectionReset).refusal().isDefined()}")
 
     // A self-signed certificate trusted as its own authority is accepted.
     val (port, served) = serving("selfsigned.pem", 2)
@@ -137,3 +164,10 @@ main()
     val clientSide = TlsStream.client(t6, "localhost", trusting())
     t6.close()
     println(s"a mismatched server: ${side.join()}, the client's handshake failed: ${clientSide.isErr()}")
+
+    // A verdict with no kind of its own keeps OpenSSL's number, and every reason has its words.
+    println(Other(7))
+    println(Certificate("x", Other(7)).message())
+    println(Certificate("x", Expired).refusal().get())
+    for r in [HostMismatch, Expired, NotYetValid, Untrusted]
+        println(r)

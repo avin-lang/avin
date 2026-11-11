@@ -19,8 +19,9 @@ data TlsError
     // The connection beneath failed: it could not be made, broke, or timed out.
     Transport(error: IoError)
     // The peer's certificate is not acceptable: no trusted authority issued it, it has expired, it
-    // is self-signed, or it names another host.
-    Certificate(text: string)
+    // is self-signed, or it names another host. `text` is OpenSSL's account; `why` is the reason
+    // as something to match on, also `TlsError.refusal()`.
+    Certificate(text: string, why: TlsRefusal)
     // The two ends did not agree on a TLS connection: the peer does not speak TLS, offered nothing
     // this end accepts, or ended the connection in the middle of the handshake.
     Handshake(text: string)
@@ -28,11 +29,51 @@ data TlsError
     // with the certificate.
     Credentials(text: string)
 
+// Why a certificate was refused.
+data TlsRefusal
+    // The chain is sound and the certificate names some other host.
+    HostMismatch
+    // The certificate's last day has passed.
+    Expired
+    // The certificate's first day has not come (often a clock that is wrong).
+    NotYetValid
+    // The chain does not end at an authority this client trusts: an unknown issuer or a
+    // self-signed certificate.
+    Untrusted
+    // Any other verdict, as OpenSSL's number for it.
+    Other(code: long)
+
+impl TlsRefusal
+    // The reason in words.
+    message() -> string = self match
+        HostMismatch -> "the certificate is for another host"
+        Expired -> "the certificate has expired"
+        NotYetValid -> "the certificate is not yet valid"
+        Untrusted -> "the certificate is not trusted"
+        Other(c) -> s"the certificate was refused (code $c)"
+
+impl Display for TlsRefusal
+    display(out: Writer, spec: FormatSpec) = out.writeField(message(), spec)
+
+// The refusal OpenSSL's certificate verdict `verify` (an X509 result) is. A certificate for another
+// IP address (64) is for another host as one for another name (62) is.
+private refusalOf(verify: long) -> TlsRefusal = verify match
+    62 | 64 -> HostMismatch
+    10 -> Expired
+    9 -> NotYetValid
+    2 | 18 | 19 | 20 | 21 -> Untrusted
+    c -> Other(c)
+
 impl TlsError
+    // Why the peer's certificate was refused, or `None` for any other failure.
+    refusal() -> Option[TlsRefusal] = self match
+        Certificate(_, r) -> Some(r)
+        _ -> None
+
     // A sentence saying what went wrong, for a message to a person.
     message() -> string = self match
         Transport(e) -> e.message()
-        Certificate(t) -> s"certificate refused: $t"
+        Certificate(_, r) -> s"certificate refused: ${r.message()}"
         Handshake(t) -> s"TLS handshake failed: $t"
         Credentials(t) -> s"unusable certificate or key: $t"
 
@@ -42,7 +83,7 @@ impl Display for TlsError
 // What OpenSSL says went wrong: its verdict on the call, the top of its error queue (or the
 // certificate check's result), and both in words.
 @sysl("sh.sysl.openssl.Error")
-private data TlsFailure(reason: int, code: long, message: string)
+private data TlsFailure(reason: int, code: long, message: string, verify: long)
 
 // How far a handshake got.
 @sysl("sh.sysl.openssl.Step")
@@ -102,7 +143,7 @@ private handshakeError(f: TlsFailure) -> TlsError
     if f.reason == 5 then return Transport(io.ConnectionReset)
     val verifyFailed = f.code % 8388608 == 134
     val checkedAfter = 0 < f.code < 4096
-    if verifyFailed || checkedAfter then Certificate(f.message) else Handshake(f.message)
+    if verifyFailed || checkedAfter then Certificate(f.message, refusalOf(f.verify)) else Handshake(f.message)
 
 // The `IoError` a TLS failure after the handshake is, for a connection's reads and writes.
 private streamError(f: TlsFailure) -> IoError = io.Other(s"TLS: ${f.message}")
