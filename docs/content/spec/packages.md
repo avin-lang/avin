@@ -15,6 +15,7 @@ package {
   name = "shapes"
   version = "0.3.1"
   description = "Plane shapes and their areas"
+  avin = "0.0.18"
 }
 
 dependencies {
@@ -39,13 +40,38 @@ was, and needs no ceremony.
 
 ## The manifest
 
-`package` names the package and gives its version; both are required, and `description` is optional.
-Beside it a manifest holds `dependencies`, [`features`](#features) and [`workspace`](#workspaces).
+`package` names the package and gives its version; both are required, and `description` and `avin`
+are optional. Beside it a manifest holds `dependencies`, [`features`](#features) and
+[`workspace`](#workspaces).
 
 - **A name** begins with a lowercase letter and holds lowercase letters, digits, `_` and `-`
   (`geom-tools`). It names the package, not a module: modules are named by their directories.
 - **A version** is three numbers, `major.minor.patch`, with no leading zeros (`0.3.1`, not `0.3` or
   `0.03.1`).
+- **`avin`** is the least Avin the package builds with, a version: `avin = "0.0.18"` is met by Avin
+  0.0.18 and by every later one. Versions are compared number by number, so 0.0.9 comes before
+  0.0.18. It is a minimum and nothing else: no range, no upper bound. With no `avin` the package
+  asks for no particular Avin. `avin new` writes the version of the Avin that made the package.
+
+### The Avin a package needs
+
+Every package a program is made of is held to its `avin`: the root package, and every dependency,
+directly or through another, fetched or by path. Building, running, testing or checking the program,
+`avin add`, `avin tidy` and `avin vendor` all refuse a package that needs a later Avin than the one
+running, at its `avin` value, naming the package, what it needs and what is running:
+
+```text
+error: `cairo` 0.2.0 needs Avin 0.0.19 or later, and this is Avin 0.0.18: upgrade Avin to 0.0.19 or later to build it
+ --> cairo/avin.hocon:4:10
+  |
+4 |   avin = "0.0.19"
+  |          ^^^^^^^^
+```
+
+That error comes before anything else wrong in the manifest: one written for a later Avin may hold a
+key this one does not know, and the upgrade is what it needs. An `avin` that is not a version is an
+error at its value, like any other. `avin lsp` reports both on the manifest: on `avin.hocon` itself
+when the editor opens it, and on the manifest of the package a file being edited belongs to.
 - **Every key is known.** A key the manifest does not hold (`author`, `build`, `tag`) is an error at
   the key, as are a value of the wrong kind and a block missing what it needs. Each error points at
   its line:
@@ -485,8 +511,8 @@ without one, as before.
   dependencies. `avin build` names the executable after the package. A package without `main` is a
   library: `avin check` checks it, its tests included, and `avin run` and `avin build`, having no
   `main` to start from, refuse it.
-- `avin new <dir>` writes a program package named by the directory's last segment: its manifest, a
-  module of that name (with `-` written `_`) holding one function, `main.avin` using it, a test of it in
+- `avin new <dir>` writes a program package named by the directory's last segment: its manifest,
+  whose `avin` is the version of the Avin that wrote it, a module of that name (with `-` written `_`) holding one function, `main.avin` using it, a test of it in
   `tests/`, and a `.gitignore` naming `.avin/`. `avin new <dir> --lib` writes a library, the same
   without `main.avin`. It refuses a directory that exists and a name that is not a package's.
 - `avin add <coordinate>[@<version>|@<rev>] [<package>]` adds a git dependency to the package's
@@ -495,12 +521,13 @@ without one, as before.
   it under the name its own manifest gives it, and adds its hash to `avin.sum`. Adding a dependency
   already listed changes its version, to a lower one as well as a higher. A coordinate followed by
   `//` and a directory adds that [member](#members-of-a-repository). The rest of the manifest,
-  comments and layout included, is left as written, and a dependency that cannot be fetched or is
-  not an Avin package changes nothing.
+  comments and layout included, is left as written, and a dependency that cannot be fetched, is
+  not an Avin package, or needs a later Avin than the one running, itself or through a package it
+  depends on, changes nothing.
 - `avin tidy [--check] [<package>]` rewrites `avin.sum`, given a package, a path in one, or a
   workspace's root, which it tidies whole.
 - `avin vendor [<package>]` copies what the project resolves to into its
   [`vendor/`](#vendoring). It and `build`, `run`, `check` and `test` take the
   [feature flags](#on-the-command-line).
 - `avin lsp` analyzes a file in a package as the package, with its dependencies as the cache holds
-  them.
+  them, and an `avin.hocon` as a manifest, telling it what is wrong with it at its place.

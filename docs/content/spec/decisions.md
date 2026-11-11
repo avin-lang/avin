@@ -6024,6 +6024,32 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (branch `manifest-avin-version`): **a package names the least Avin it builds with**
+  ([the manifest](/spec/packages/#the-manifest), [the Avin a package
+  needs](/spec/packages/#the-avin-a-package-needs)). `avin = "0.0.18"` in the `package` block, a
+  version, met by that Avin and every later one, compared number by number (0.0.9 before 0.0.18).
+  A minimum only: no ranges, no upper bound, no pre-release suffixes. Every package of the
+  resolved graph is held to it, the root and each dependency at any depth, fetched or by path, by
+  every command that reads manifests (build, run, test, check, `add`, `tidy`, `vendor`); a package
+  needing a later Avin is refused at its `avin` value, naming the package, its requirement and the
+  running version and saying to upgrade, before anything else wrong in that manifest. A malformed
+  value is an error at the value. `avin new` writes the running Avin's version. `avin lsp` reports
+  it on `avin.hocon` when the editor opens one, and on the manifest of the package a file being
+  edited belongs to. *Why*: `cairo` needed 0.0.18 and could only say so in its README, and a
+  package that needs a feature should fail with the upgrade named rather than with an unknown key
+  or a type error. The key's spelling follows `sysl.hocon`, which names the Sysl a package needs
+  as `sysl = "0.9.20"` in its `package` block. A minimum, because Avin's versions only add: a
+  later Avin that breaks a package is a bug or a deliberate break in a release, which a range
+  written in advance cannot foresee, and an upper bound would refuse every upgrade until each
+  package re-releases. Checked when each manifest is read, so every path that reads one is held to
+  it without a second walk of the graph; told first, because a manifest written for a later Avin
+  may hold a key this one does not know. *Alternatives*: a range (`>=0.0.18, <0.1`), refused for
+  the reasons above; a top-level `avin` key or a `requires { avin = … }` block (Sysl puts its own in
+  `package`); a warning rather than an error (the build would then fail later and less clearly);
+  checking only the root package (a dependency's need is the common case, as with `cairo`). Review
+  with the user whether `avin new` should write the running version (it ties a new package to the
+  Avin that made it, which may be later than the package needs).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

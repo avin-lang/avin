@@ -69,6 +69,10 @@ struct Manifest
     name: string
     version: string
     description: string
+    /** The least Avin the package builds with, as `avin` in its `package` block writes it, or empty
+     * where it names none; and where the value is written. */
+    avin: string
+    avin_span: Span
     dependencies: Buf[Dependency]
     /** The Sysl packages the package's bindings reach beyond Sysl's standard library. A `Member`
      * origin is never among them: a workspace's members are Avin packages. */
@@ -105,10 +109,45 @@ read_manifest_named(dir: string, name: string) -> Result[Manifest, string]
     val file = dir + "/" + name
     val text = read_text(file).map_err(e -> s"avin: $file: ${e.to_string()}")?
     val src = source_of(file, text)
-    val doc = parse_hocon(src).map_err(d -> d.render(src))?
-    var m = Manifest(dir, src, false, "", "", "", buf(), buf(), false, buf(), buf(), buf())
-    read_fields(&m, doc.root).map_err(d -> d.render(src))?
+    manifest_from(dir, src, Version).map_err(d -> d.render(src))
+
+/** The manifest `src` holds, for the package at `dir`, as the Avin whose version is `running` reads
+ * it, or the first thing wrong with it. A package needing a later Avin than `running` is refused at
+ * its `avin` key before anything else in it is read: a manifest written for a later Avin may hold
+ * what this one does not know, and the upgrade is what it needs. */
+manifest_from(dir: string, src: Source, running: string) -> Result[Manifest, Diagnostic]
+    val doc = parse_hocon(src)?
+    if later_avin_required(doc.root, running) is Some(d) then return Err(d)
+    var m = Manifest(dir, src, false, "", "", "", "", Span(0, 0), buf(), buf(), false, buf(), buf(), buf())
+    read_fields(&m, doc.root)?
     Ok(m)
+
+/** Whether the Avin whose version is `running` builds a package that needs at least `required`:
+ * versions are compared number by number, so `0.0.9` comes before `0.0.18`. */
+avin_satisfies(running: string, required: string) -> bool = !version_after(required, running)
+
+// The error for a manifest at `root` whose `package` block asks, in a well-formed `avin`, for a later
+// Avin than `running`: at the value, naming the package, what it needs and what is running.
+private later_avin_required(root: Value, running: string) -> Option[Diagnostic]
+    for f in root.fields()
+        if f.key != "package" || !f.value.is_obj() then continue
+        var name = ""
+        var version = ""
+        var required = ""
+        var at = Span(0, 0)
+        for g in f.value.fields()
+            val text = g.value.as_text().unwrap_or("")
+            if g.key == "name"
+                name = text
+            elif g.key == "version"
+                version = text
+            elif g.key == "avin"
+                required = text
+                at = g.value.span
+        if required == "" || !valid_version(required) || avin_satisfies(running, required) then continue
+        val who = if name == "" then "this package" elif version == "" then s"`$name`" else s"`$name` $version"
+        return Some(error(at, s"$who needs Avin $required or later, and this is Avin $running: upgrade Avin to $required or later to build it"))
+    None
 
 private read_fields(m: *Manifest, root: Value) -> Result[unit, Diagnostic]
     var dependencies = Span(0, 0)
@@ -165,8 +204,12 @@ private read_package(m: *Manifest, f: Field) -> Result[unit, Diagnostic]
             versioned = true
         elif g.key == "description"
             m.description = text_of(g)?
+        elif g.key == "avin"
+            m.avin = text_of(g)?
+            if !valid_version(m.avin) then return Err(error(g.value.span, s"`${m.avin}` is not a version of Avin: `avin` names the least Avin the package builds with, three numbers such as `$Version`"))
+            m.avin_span = g.value.span
         else
-            return Err(error(g.key_span, s"`${g.key}` is not a key of `package`, which holds `name`, `version` and `description`"))
+            return Err(error(g.key_span, s"`${g.key}` is not a key of `package`, which holds `name`, `version`, `description` and `avin`"))
     if !named then return Err(error(f.key_span, "the `package` block has no `name`: every package is named, `name = \"geom\"`"))
     if !versioned then return Err(error(f.key_span, "the `package` block has no `version`: every package has one, `version = \"0.1.0\"`"))
     Ok(())
@@ -1595,7 +1638,7 @@ new_package(dir: string, library: bool) -> Result[string, string]
     make_dir_all(dir + "/" + module_name).map_err(e -> s"avin: $dir: ${e.to_string()}")?
     make_dir_all(dir + "/tests").map_err(e -> s"avin: $dir: ${e.to_string()}")?
     val files = [
-        (ManifestName, s"package {\n  name = \"$package_name\"\n  version = \"0.1.0\"\n}\n\ndependencies {\n}\n"),
+        (ManifestName, s"package {\n  name = \"$package_name\"\n  version = \"0.1.0\"\n  avin = \"$Version\"\n}\n\ndependencies {\n}\n"),
         (".gitignore", ".avin/\n"),
         (s"$module_name/$module_name.avin", s"module $module_name\n\n// The greeting for `name`.\ngreeting(name: string) -> string = \"Hello, \" + name + \"!\"\n"),
         (s"tests/${module_name}_tests.avin", s"module tests\n\nimport $module_name.greeting\n\n@test(\"the greeting names whom it greets\")\ngreetsByName()\n    assertEq(greeting(\"Avin\"), \"Hello, Avin!\")\n"),

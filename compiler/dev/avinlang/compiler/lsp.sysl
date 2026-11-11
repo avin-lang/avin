@@ -3,7 +3,7 @@ module dev.avinlang.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.encoding.json.{Json, Member as JsonMember, parse as parse_json}
-import sysl.fs.{entries, is_dir, read_text}
+import sysl.fs.{entries, exists, is_dir, read_text}
 import sysl.io.{Reader, stdin}
 import sysl.path.parent
 import sysl.slices.sort_by
@@ -352,7 +352,12 @@ struct LspProgram
  * it; any other file is a program by itself. */
 lsp_program(library: string, file: string, header: string, imports: Buf[string] = buf()) -> LspProgram
     if file.starts_with(library + "/") && !file.starts_with(library + "/tests/") then return LspProgram(library, true, true, false)
-    if enclosing_package(file) is Ok(Some(package)) then return LspProgram(package, true, false, true)
+    enclosing_package(file) match
+        Ok(Some(package)) -> return LspProgram(package, true, false, true)
+        // A manifest that cannot be read still makes its directory a package, whose analysis tells
+        // the manifest what is wrong with it.
+        Err(_) -> if lsp_nearest_manifest(file) is Some(package) then return LspProgram(package, true, false, true)
+        Ok(None) -> ()
     val dir = parent(file).unwrap_or("")
     if header != ""
         var tail = "/"
@@ -361,6 +366,16 @@ lsp_program(library: string, file: string, header: string, imports: Buf[string] 
         if dir.ends_with(tail) && dir.bytes.len > tail.bytes.len then return LspProgram(dir[0..<dir.bytes.len - tail.bytes.len], true, false, false)
         return LspProgram(file, false, false, false)
     if dir != "" && lsp_imports_module_below(dir, imports) then LspProgram(dir, true, false, false) else LspProgram(file, false, false, false)
+
+// The nearest directory above `file` holding a manifest.
+private lsp_nearest_manifest(file: string) -> Option[string]
+    var at = parent(absolute_path(file)).unwrap_or("")
+    while at != ""
+        if exists(at + "/" + ManifestName) then return Some(at)
+        val up = parent(at).unwrap_or("")
+        if up == at then return None
+        at = up
+    None
 
 // Whether one of `imports` names a module held in a directory below `dir`: the file then needs its
 // siblings, and a file that imports none is checked alone, as `avin check <file>` does.
@@ -405,6 +420,7 @@ struct LspAnalysis
  * there. */
 lsp_analyze(server: LspServer, file: string, text: string, completing: string = "") -> LspAnalysis
     val library_dir = lsp_normal(server.toolchain.library_dir())
+    if file.ends_with("/" + ManifestName) then return lsp_analyze_manifest(file, text)
     val first = parse(source_of(file, text))
     var imported: Buf[string] = buf()
     for i in first.file.imports
@@ -419,6 +435,9 @@ lsp_analyze(server: LspServer, file: string, text: string, completing: string = 
             Ok(f) -> f
             Err(message) ->
                 found[0].diagnostics.push(lsp_diagnostic(source_of(file, text), Span(0, 0), Error, s"avin: $message"))
+                // What is wrong with the package's own manifest, a later Avin it needs most of all, is
+                // told to the manifest too, at its place.
+                if program.package then lsp_manifest_found(server, program.root, &found)
                 return LspAnalysis(program, found, buf(), buf(), names, false, no_completions())
     elif !program.library
         files = single_file(source_of(file, text))
@@ -444,6 +463,29 @@ lsp_analyze(server: LspServer, file: string, text: string, completing: string = 
     for u in checked.units
         if u.report.len() > 0 then lsp_found(&found, u, false)
     LspAnalysis(program, found, checked.references, checked.overrides, names, true, checked.completions)
+
+// The first thing wrong with the manifest of the package at `root`, as the editor holds it or else as
+// the disk does, onto what that manifest is told.
+private lsp_manifest_found(server: LspServer, root: string, found: *Buf[LspFound])
+    val manifest = root + "/" + ManifestName
+    var text = read_text(manifest).unwrap_or("")
+    for d in server.documents
+        if d.file == manifest then text = d.text
+    val src = source_of(manifest, text)
+    if manifest_from(root, src, Version) is Err(d)
+        var diagnostics: Buf[Json] = buf()
+        diagnostics.push(lsp_diagnostic(src, d.span, d.severity, d.message))
+        found.push(LspFound(manifest, diagnostics))
+
+// A manifest the editor holds, analyzed as reading it does: the first thing wrong with it, at its
+// place, a later Avin than this one it needs most of all.
+private lsp_analyze_manifest(file: string, text: string) -> LspAnalysis
+    val dir = parent(file).unwrap_or("")
+    val src = source_of(file, text)
+    var found: Buf[LspFound] = buf()
+    found.push(LspFound(file, buf()))
+    if manifest_from(dir, src, Version) is Err(d) then found[0].diagnostics.push(lsp_diagnostic(src, d.span, d.severity, d.message))
+    LspAnalysis(LspProgram(dir, true, false, true), found, buf(), buf(), buf(), false, no_completions())
 
 // A file's source as the editor holds it, where it holds it: `text` for the file being analyzed.
 private lsp_held(server: LspServer, src: Source, file: string, text: string) -> Source
