@@ -12337,7 +12337,7 @@ private literal_parts(c: *Checker, exprs: Buf[&Expr], want: &Type, what: string)
     for x in exprs
         checked.push(None)
     var agreed: Option[&Type] = None
-    for k in agreement_order(exprs)
+    for k in agreement_order(c, exprs)
         val x = exprs[k]
         val t = check_expr(c, x, agreement_hint(c, x, agreed))
         checked[k] = Some(t)
@@ -12401,16 +12401,22 @@ private expected_of_branches(c: *Checker, expected: Option[&Type], used: bool, a
 // those that give a type of their own, then the values built around number literals (`Some(1)`,
 // `[1, 2]`), then the expressions of literals alone (`2`, `-(4 * 5)`), and each empty collection
 // literal last, so that what those before agree on settles the numbers and element types of those
-// after. Within a rank they keep the order they are written in.
-private agreement_order(exprs: Buf[&Expr]) -> Buf[usize]
+// after. A variant name several data types share goes with the literals alone, so that the type the
+// others agree on decides it. Within a rank they keep the order they are written in.
+private agreement_order(c: *Checker, exprs: Buf[&Expr]) -> Buf[usize]
     var order: Buf[usize] = buf()
     for rank in 0..<4
         for i in 0..<exprs.len()
-            if agreement_rank(exprs[i]) == rank then order.push(i)
+            if shared_agreement_rank(c, exprs[i]) == rank then order.push(i)
     order
 
 private agreement_rank(e: &Expr) -> i32 =
     if empty_literal(e) then 3 elif literal_expression(e) then 2 elif holds_literal(e) then 1 else 0
+
+/** `agreement_rank`, with a variant name several data types share ranked with the literals alone. */
+private shared_agreement_rank(c: *Checker, e: &Expr) -> i32
+    val rank = agreement_rank(e)
+    if rank < 2 && shared_variant_owners(c, e).len() > 0 then 2 else rank
 
 // The type `e` is checked against among siblings that agree on `agreed`, where `agreed` says something
 // of a type: that type, where `e` is an empty collection literal; its shape with its numbers and other
@@ -12419,6 +12425,8 @@ private agreement_rank(e: &Expr) -> i32 =
 // is expected.
 private agreement_hint(c: *Checker, e: &Expr, agreed: Option[&Type]) -> Option[&Type]
     if empty_literal(e) then return shaped_hint(c, e, useful_hint(c, agreed))
+    if agreed is Some(t)
+        if shared_variant_expected(c, t, shared_variant_owners(c, e)) is Some(decided) then return Some(decided)
     if !holds_literal(e) && !literal_expression(e) then return None
     val so_far = useful_hint(c, agreed)?
     shaped_hint(c, e, Some(literal_hint(c, so_far)))
@@ -12610,7 +12618,7 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
         for item in items
             checked.push(None)
         var agreed: Option[&Type] = None
-        for k in agreement_order(items)
+        for k in agreement_order(c, items)
             val item = items[k]
             var t = check_expr(c, item, agreement_hint(c, item, agreed))
             // An element that is an `Option[Nothing]` converts to the other elements' option, and the
@@ -13830,7 +13838,7 @@ private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[
     val agreeing = used && !settled_outside
     var y: &TExpr = TExpr(e.span, ErrorType, UnitConst)
     var n: &TExpr = TExpr(e.span, ErrorType, UnitConst)
-    if agreeing && agreement_rank(yes) > agreement_rank(other)
+    if agreeing && shared_agreement_rank(c, yes) > shared_agreement_rank(c, other)
         n = tested_branch(c, other, tested.no, wanted, used)
         y = tested_branch(c, yes, tested.yes, hint_or(agreement_hint(c, yes, Some(n.ty)), wanted), used)
     else
@@ -15200,6 +15208,37 @@ private lambda_ready(c: *Checker, value: &Expr, param: Option[&Type]) -> bool
 /** Whether an argument takes its type from its parameter, and so is checked after the others: a
  * lambda, or a `match` with nothing before it. */
 private takes_parameter_type(value: &Expr) -> bool = value.kind is Lambda(_, _) || value.kind is MatchFunction(_)
+
+/** The data types an argument written as a bare variant name, `Close` or `MoveTo(1.0, 2.0)`, may be
+ * a value of, where data types share that name and so its type decides which variant it is; empty
+ * for any other argument. Such an argument is checked after the others, so that what they decide of
+ * a type argument decides the name. */
+private shared_variant_owners(c: *Checker, value: &Expr) -> Buf[usize]
+    var owners: Buf[usize] = buf()
+    var name = ""
+    if value.kind is Name(n) then name = n
+    if value.kind is Call(f, _)
+        if f.kind is Name(n) then name = n
+    if name.len == 0 || lookup_local(c, name) is Some(_) || param_index(c, name) is Some(_) then return owners
+    val vs = variants_named(c, name)
+    if vs.len() < 2 then return owners
+    for v in vs
+        owners.push(v.data)
+    owners
+
+/** The expected type that decides a shared variant name passed for a parameter of type `p`, where
+ * the arguments checked before it have decided `p` to be one of `owners`: that data type, with its
+ * type arguments left for the variant's own fields to decide, so a later argument may still widen
+ * them. */
+private shared_variant_expected(c: *Checker, p: &Type, owners: Buf[usize]) -> Option[&Type]
+    if owners.len() == 0 then return None
+    if *zonk(c, p) is Data(id, name, args)
+        if contains_index(owners, id)
+            var open: Buf[&Type] = buf()
+            for _ in args
+                open.push(fresh_var(c))
+            return Some(Data(id, name, open))
+    None
 
 // Whether an integer literal, possibly negated, can be a value of type `t`, as `integer_literal`
 // would make it.
@@ -16711,7 +16750,8 @@ private check_arguments_after(c: *Checker, args: Buf[Argument], wanted: Buf[Opti
                     continue
             // Values built around literals take what the plain arguments decide; expressions of
             // literals alone take that too, or what the built values decide.
-            val rank = if takes_parameter_type(value) then 3 elif literal_expression(value) then 2 elif holds_literal(value) then 1 else 0
+            // A shared variant name goes with the literals, after what decides its type.
+            val rank = if takes_parameter_type(value) then 3 elif literal_expression(value) || shared_variant_owners(c, value).len() > 0 then 2 elif holds_literal(value) then 1 else 0
             if rank != pass then continue
             early[i] = Some(call_argument(c, args[i], param, open))
         // Then the lambdas whose results belong to this tier, each once its parameter types are known.
@@ -17174,6 +17214,10 @@ private call_argument(c: *Checker, arg: Argument, param: Option[&Type], open: *B
         val literals = (!is_literal(arg.value) && holds_literal(arg.value)) || tier == 1 || tier == 2
         val known = loosen_for(c, p, open, true, literals)
         if !(*known is Var(_)) then wanted = Some(known)
+        // A shared variant name takes its type from what the other arguments decided of the type
+        // argument, even where a later one may still widen it: `same(segment, MoveTo(1.0, 2.0))`.
+        if wanted is None
+            if shared_variant_expected(c, p, shared_variant_owners(c, arg.value)) is Some(t) then wanted = Some(t)
     // A lambda or a `match` function passed for a type argument bounded by `Sendable` is a `@sendable`
     // function, checked as one where it is made.
     var sendable = false
