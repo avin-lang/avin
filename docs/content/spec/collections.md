@@ -23,6 +23,7 @@ Iterable[+A]                 iterator(), and the operation families below
 │   ├── Array[A]             mutable, fixed length, contiguous
 │   ├── Buffer[A]            mutable, growable at the end, contiguous
 │   └── Deque[A]             mutable, growable at both ends
+├── PriorityQueue[T]         mutable binary heap, greatest first (avin.collections.mutable)
 ├── Set[A]                   immutable sets, (A) -> bool
 │   ├── HashSet[A]           by hash; what {a, b} and Set(...) build
 │   └── SortedSet[A]         in order, with the ordered operations
@@ -860,6 +861,35 @@ val pending: Deque[string] = ["build", "test"]
 pending.prepend("fetch")
 while pending.nonEmpty() do run(pending.removeHead())
 ```
+
+## Priority queues
+
+`avin.collections.mutable.PriorityQueue[T]` is a mutable binary heap: elements go in in any order
+and `dequeue()` takes out the greatest. `PriorityQueue[int]()` orders by the element type's `Ord`;
+`PriorityQueue.withOrdering(compare)` takes a comparison, positive where its first argument is to
+come out before its second. A queue giving the least first is made with `Reverse` elements or with
+`reverseOrder`, and `compareBy` and `thenBy` build the comparison from keys.
+
+```text
+val q = PriorityQueue[int]()
+q.enqueue(3, 9, 1)
+q += 5
+q.head()           // 9, left in the queue
+q.dequeue()        // 9
+q.dequeueAll()     // [5, 3, 1], and q is empty
+
+val soonest = PriorityQueue.withOrdering(reverseOrder(compareBy((t: Task) -> t.due)))
+```
+
+`enqueue(xs*)`, `addOne(x)`, `addAll(xs)`, `+=` and `++=` add, each in O(log n) per element;
+`dequeue()` and `head()` trap on an empty queue, `dequeueOption()` and `headOption()` answer `None`;
+`size()`, `isEmpty()` and `nonEmpty()` take constant time, and `clear()` empties the queue.
+`copy()` makes an independent queue with the same comparison, and `PriorityQueue.newBuilder` a
+builder. A queue is `Iterable`: `iterator()` and `toVector()` give the elements in heap order, the
+greatest first and the rest in no promised order, and an iterator is a snapshot, unaffected by
+changes made while it runs. `toSortedVector()` gives the elements in the order `dequeue` would,
+leaving the queue as it is. Elements the comparison finds equal come out in no promised order; the
+queue is not stable.
 
 ## Sorting
 

@@ -6475,6 +6475,25 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- **`PriorityQueue` gives the greatest element first** (branch `stdlib-priority-queue`),
+  [collections](/spec/collections/#priority-queues). `PriorityQueue[T]()` orders by `T`'s `Ord`, and
+  `PriorityQueue.withOrdering(compare)` by a comparison; the element `compare` finds greatest comes
+  out first. Why: it matches `max`, which every `Ord` type already answers, and `dequeue` then takes
+  the same element `max()` would; a least-first queue is one `Reverse` or `reverseOrder` away either
+  way. Alternative: least first (the order of a sorted sequence read from the front, the usual choice
+  for shortest-path searches); it makes `PriorityQueue[int]()` the odd one out against `max`.
+  Review with the user: it is the default every caller will meet.
+- **A queue's `iterator()` and `toVector()` are in heap order, and `toSortedVector()` is the sorted
+  form** (branch `stdlib-priority-queue`). Heap order starts with the greatest element and is
+  otherwise unspecified; the iterator is a snapshot taken when it is made, so enqueuing or dequeuing
+  while iterating neither traps nor changes what it gives. Why: heap order costs nothing, a sorted
+  iteration costs O(n log n) and a copy, and `Iterable` conformance wants the cheap one; a snapshot
+  makes mutation during iteration defined. Alternatives: iterating in dequeue order; an iterator
+  over the live heap (cheaper, but what it gives after a change is arbitrary).
+- **Equal elements come out in no promised order** (branch `stdlib-priority-queue`): a binary heap
+  is not stable. Alternative: a sequence number breaking ties first-in-first-out, at the cost of a
+  word per element and a wider comparison; a caller wanting it orders by `thenBy` on its own counter.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
