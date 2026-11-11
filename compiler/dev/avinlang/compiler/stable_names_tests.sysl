@@ -1,0 +1,274 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.fs.{make_temp_dir, read_text, remove_dir_all}
+import sysl.text.parse_int
+
+// Stable names: every function, string, descriptor, record, constant object, closure, trap site and
+// module-level value of the emitted text is named by what it is, never by the order the checker or
+// lowering found it in. So adding a function or a string to a program changes no other function's
+// text, and a build after such an edit recompiles the unit holding it and the tables' unit alone.
+
+private const Base: string = "data Shape\n    Circle(r: int)\n    Square(side: int)\n\nclass Counter(var n: int)\n    bump() -> int\n        n = n + 1\n        n\n\nval greeting = \"hi\"\nval primes = [2, 3, 5]\nvar hits = 0\n\narea(s: Shape) -> int = s match\n    Circle(r) -> 3 * r * r\n    Square(a) -> a * a\n\ntwice[T](x: T) -> (T, T) = (x, x)\n\napply(f: (int) -> int, x: int) -> int = f(x)\n\nmain()\n    val c = Counter(0)\n    hits = c.bump()\n    println(area(Circle(2)) + area(Square(3)))\n    println(twice(1))\n    println(twice(\"a\"))\n    println(apply((x: int) -> x + 1, 4))\n    println(greeting + \"!\")\n    println(primes)\n    println(Some(hits))\n"
+
+/** `Base` with a function nothing calls declared first. */
+private const AddedFunction: string = "added(n: int) -> int = n * 3 + 1\n\n" + Base
+
+/** `Base` with a function returning a string no other function has declared first. */
+private const AddedString: string = "greet() -> string = \"a brand new string\"\n\n" + Base
+
+/** The module a one-file program compiles to. */
+private ir_of(text: string) -> string
+    val program = lower_source(repository_toolchain(), source_of("probe.avin", text)) match
+        Ok(p) -> p
+        Err(d) -> panic(d)
+    emit_llvm(program)
+
+/** The module the program of `files` compiles to. */
+private ir_of_files(files: Buf[ProgramFile]) -> string
+    val program = lower_files(repository_toolchain(), files) match
+        Ok(p) -> p
+        Err(d) -> panic(d)
+    emit_llvm(program)
+
+/** A file of the module `path`, "" for the program's root. */
+private file_of(name: string, path: string, text: string) -> ProgramFile =
+    ProgramFile(source_of(name, text), if path == "" then None else Some(path), false, buf(), "")
+
+/** Each function `ir` defines, its definition's whole text by its symbol as written. */
+private definitions(ir: string) -> Map[string, string]
+    var out: Map[string, string] = map()
+    var name = ""
+    var text = ""
+    for line in ir.split("\n")
+        if line.starts_with("define ")
+            val at = line.index_of(" @").unwrap() + 1
+            name = line[at..<line.index_of_from("(", line.index_of_from("\"", at + 2).unwrap_or(at)).unwrap()]
+            text = ""
+        if name != ""
+            text = text + line + "\n"
+            if line == "}"
+                out.put(name, text)
+                name = ""
+    out
+
+/** The symbols of `ir`'s definitions. */
+private symbols_of(ir: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    for line in ir.split("\n")
+        if line.starts_with("define ")
+            val at = line.index_of(" @").unwrap() + 1
+            out.push(line[at..<line.index_of_from("(", line.index_of_from("\"", at + 2).unwrap_or(at)).unwrap()])
+    out
+
+/** Asserts every function `before` defines is defined in `after` with the same text, but the one
+ * named `changed`, if any; answers how many were compared. */
+private same_functions(before: string, after: string, changed: string) -> usize
+    val old = definitions(before)
+    val new = definitions(after)
+    var compared = 0usize
+    for name in symbols_of(before)
+        if name == changed then continue
+        new.get(name) match
+            Some(text) -> assert_eq(text, old.get(name).unwrap())
+            None -> panic("no longer defined: " + name)
+        compared += 1
+    compared
+
+/** How many lines of `ir` start with `prefix`. */
+private lines_starting(ir: string, prefix: string) -> usize
+    var n = 0usize
+    for line in ir.split("\n")
+        if line.starts_with(prefix) then n += 1
+    n
+
+@test("a function added first in a program changes no other function's emitted text")
+added_function_changes_nothing_else()
+    val before = ir_of(Base)
+    val after = ir_of(AddedFunction)
+    assert(same_functions(before, after, "")> 100)
+    assert(definitions(after).get("@\"<program>.added\"") is Some(_))
+    assert_eq(symbols_of(after).len(), symbols_of(before).len() + 1)
+
+@test("a string added first in a program changes no other function's emitted text")
+added_string_changes_nothing_else()
+    val before = ir_of(Base)
+    val after = ir_of(AddedString)
+    assert(same_functions(before, after, "")> 100)
+    // One constant and its payload's alias.
+    assert_eq(lines_starting(after, "@\"avin.str:"), lines_starting(before, "@\"avin.str:") + 2)
+
+@test("a function added first and called from main changes main's text and no other's")
+added_called_function_changes_only_main()
+    val called = "added(n: int) -> int = n * 3 + 1\n\n" + Base + "    println(added(2))\n"
+    val before = ir_of(Base)
+    val after = ir_of(called)
+    assert(same_functions(before, after, "@\"<program>.main\"") > 100)
+
+@test("a class and a data type added first rename no descriptor, record or function")
+added_types_change_nothing_else()
+    val added = "class Extra(val k: int)\n\ndata Mode\n    On\n    Off\n\n" + Base
+    val before = ir_of(Base)
+    val after = ir_of(added)
+    assert(same_functions(before, after, "")> 100)
+    for kind in ["@\"avin.desc:", "@\"avin.type:", "@\"avin.methods:"]
+        for line in before.split("\n")
+            if line.starts_with(kind) then assert(after.contains(line + "\n"), line)
+
+@test("a module-level value added first renames no other value and moves no other function's text")
+added_global_changes_nothing_else()
+    val added = "val first = \"one\" + \"two\"\nvar counter = 0\n\n" + Base
+    val before = ir_of(Base)
+    val after = ir_of(added)
+    // The program's initializer computes the new values; nothing else changes.
+    assert(same_functions(before, after, "@\"avin.<init>\"") > 100)
+    assert(after.contains("@\"avin.global:<program>.hits\""))
+
+@test("lines added above a function move its trap sites' lines but not their names")
+trap_sites_named_by_place_in_function()
+    val before = ir_of(Base)
+    val after = ir_of("\n\n\n" + Base)
+    assert(same_functions(before, after, "")> 100)
+    var moved = 0
+    for line in before.split("\n")
+        if line.starts_with("@\"avin.trap:<program>.area+")
+            val name = line[0..<line.index_of(" = ").unwrap()]
+            assert(after.contains(name + " = "), name)
+            moved += 1
+    assert(moved > 0)
+
+@test("two functions holding the same string name one constant")
+same_string_one_name()
+    val ir = ir_of("first() -> string = \"shared text\"\n\nsecond() -> string = \"shared text\"\n\nmain()\n    println(first() + second())\n")
+    val defs = definitions(ir)
+    val a = defs.get("@\"<program>.first\"").unwrap()
+    val b = defs.get("@\"<program>.second\"").unwrap()
+    val at = a.index_of("@\"avin.str:").unwrap()
+    val name = a[at..<a.index_of_from(".const\"", at).unwrap()]
+    assert(b.contains(name + ".const\""), b)
+    assert_eq(lines_starting(ir, name + ".const\" = "), 1usize)
+    // The name is the same in any program holding the string.
+    assert(ir_of("main()\n    println(\"shared text\")\n").contains(name + ".const\" = "))
+
+@test("two strings name two constants, the empty string and Unicode included")
+strings_named_apart()
+    val ir = ir_of("main()\n    println(\"\")\n    println(\"ä\")\n    println(\"a\")\n    println(\"Ä\")\n")
+    var names: Buf[string] = buf()
+    for line in ir.split("\n")
+        if line.starts_with("@\"avin.str:") && line.contains(".const\" = ")
+            val name = line[0..<line.index_of(" = ").unwrap()]
+            for n in names
+                assert(n != name)
+            names.push(name)
+    assert(names.len() >= 4)
+
+@test("two lambdas of one function, and two local functions of one name in it, are told apart by place")
+closures_named_by_place()
+    val text = "pick(n: int) -> int\n    val f = (x: int) -> x + 1\n    val g = (x: int) -> x * 2\n    if n > 0\n        step(x: int) -> int = x + 3\n        f(step(n))\n    else\n        step(x: int) -> int = x - 3\n        g(step(n))\n\nmain()\n    println(pick(1))\n    println(pick(-1))\n"
+    val defs = definitions(ir_of(text))
+    for name in ["<program>.pick.lambda#1", "<program>.pick.lambda#2", "<program>.pick.step#1", "<program>.pick.step#2"]
+        assert(defs.get("@\"" + name + "\"") is Some(_), name)
+    assert(defs.get("@\"<program>.pick.lambda#1\"").unwrap().contains("add"))
+    assert(defs.get("@\"<program>.pick.lambda#2\"").unwrap().contains("mul"))
+    // A lambda added to another function renames none of these.
+    val more = definitions(ir_of("other() -> int\n    val h = (x: int) -> x\n    h(1)\n\n" + text))
+    for name in ["<program>.pick.lambda#1", "<program>.pick.lambda#2", "<program>.pick.step#1", "<program>.pick.step#2"]
+        assert_eq(more.get("@\"" + name + "\"").unwrap(), defs.get("@\"" + name + "\"").unwrap())
+
+@test("types of one name in two modules, and a generic at each, are named apart and run")
+same_short_names_in_two_modules()
+    var files: Buf[ProgramFile] = buf()
+    files.push(file_of("a/point.avin", "a", "module a\n\ndata Point(x: int)\n\nclass Box(val v: int)\n\nlabel(p: Point) -> string = s\"a$p\"\n"))
+    files.push(file_of("b/point.avin", "b", "module b\n\ndata Point(x: int, y: int)\n\nclass Box(val v: string)\n\nlabel(p: Point) -> string = s\"b$p\"\n"))
+    files.push(file_of("main.avin", "", "import a\nimport b\n\nwrap[T](x: T) -> Option[T] = Some(x)\n\nmain()\n    println(a.label(a.Point(1)))\n    println(b.label(b.Point(1, 2)))\n    println(wrap(a.Point(3)))\n    println(wrap(b.Point(4, 5)))\n    println(wrap(a.Box(6)).isDefined)\n    println(wrap(b.Box(\"7\")).isDefined)\n    println(wrap(1))\n    println(wrap(long(1)))\n"))
+    val ir = ir_of_files(files)
+    val defs = definitions(ir)
+    for name in ["<program>.wrap[a.Point[]]", "<program>.wrap[b.Point[]]", "<program>.wrap[class a.Box[]]", "<program>.wrap[class b.Box[]]", "<program>.wrap[int]", "<program>.wrap[long]", "a.label", "b.label"]
+        assert(defs.get("@\"" + name + "\"") is Some(_), name)
+    for kind in ["@\"avin.desc:a.Point[].Point\" = ", "@\"avin.desc:b.Point[].Point\" = ", "@\"avin.type:a.Point[]\" = ", "@\"avin.type:b.Point[]\" = ", "@\"avin.desc:class a.Box[]\" = ", "@\"avin.desc:class b.Box[]\" = "]
+        assert_eq(lines_starting(ir, kind), 1usize)
+
+@test("an object and the data type it is the companion of are named apart")
+object_and_companion_named_apart()
+    val ir = ir_of("data Temp(c: int)\n\nobject Temp\n    zero() -> Temp = Temp(0)\n\nmain()\n    println(Temp.zero())\n    println(Temp(3))\n")
+    assert_eq(lines_starting(ir, "@\"avin.desc:<program>.Temp[].Temp\" = "), 1usize)
+    assert_eq(lines_starting(ir, "@\"avin.desc:object <program>.Temp[]\" = "), 1usize)
+    assert_eq(lines_starting(ir, "@\"avin.global:object <program>.Temp\" = "), 1usize)
+    assert(ir.contains("define internal tailcc ptr @\"<program>.object Temp.zero\"("))
+
+@test("renaming a module's file changes no function's emitted text")
+renamed_file_changes_nothing()
+    val geo = "module geo\n\ndata Shape\n    Circle(r: int)\n\narea(s: Shape) -> int = s match\n    Circle(r) -> 3 * r * r\n"
+    val main = "import geo\n\nmain()\n    println(geo.area(geo.Circle(2)))\n    println(10 / (geo.area(geo.Circle(1)) - 2))\n"
+    var one: Buf[ProgramFile] = buf()
+    one.push(file_of("geo/shapes.avin", "geo", geo))
+    one.push(file_of("main.avin", "", main))
+    var two: Buf[ProgramFile] = buf()
+    two.push(file_of("geo/figures.avin", "geo", geo))
+    two.push(file_of("main.avin", "", main))
+    val before = ir_of_files(one)
+    val after = ir_of_files(two)
+    assert(same_functions(before, after, "")> 50)
+
+@test("a program's symbols are short enough: none of the probe's over 300 bytes")
+symbols_stay_short()
+    for line in ir_of(Base).split("\n")
+        if line.starts_with("@\"") || line.starts_with("define ")
+            if line.index_of("@\"") is Some(at)
+                val end = line.index_of_from("\"", at + 2).unwrap()
+                assert(end - at < 300, line)
+
+// --- the build log's unit counts ---------------------------------------------------------------
+
+// The repository's toolchain building into a cache of its own under `dir`.
+private cold_toolchain(dir: string) -> Toolchain
+    val real = repository_toolchain()
+    Toolchain(real.root, dir + "/cache", real.clang, real.sysl, real.pkg_config)
+
+// The `units` line of a build of `text` at `optimization` in `units` codegen units.
+private units_line(tc: Toolchain, dir: string, text: string, optimization: string, units: int) -> string
+    open_build_log(Some(dir + "/build.log")).unwrap()
+    defer close_build_log()
+    val compiled = compile_program(tc, single_file(source_of("probe.avin", text)), false, buf(), buf())
+    assert_eq(compiled.diagnostics, "")
+    link(tc, compiled.llvm.unwrap(), compiled.archive, dir + "/probe", optimization, compiled.c_link, units).unwrap()
+    for line in read_text(dir + "/build.log").unwrap().split("\n")
+        if line.starts_with("phase=units ") then return line
+    panic("no units line")
+
+// The number `key` has on `line`.
+private count(line: string, key: string) -> int
+    for word in line.split(" ")
+        if word.starts_with(key + "=") then return parse_int(word[key.bytes.len + 1..]).unwrap()
+    panic(s"no `$key` on `$line`")
+
+// Builds `Base`, then `edited`, at `optimization`: answers how many units the second compiled.
+private recompiled_after(edited: string, optimization: string) -> int
+    val dir = make_temp_dir("avin-stable").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = cold_toolchain(dir)
+    val first = units_line(tc, dir, Base, optimization, 4)
+    assert_eq(count(first, "units"), 4)
+    val second = units_line(tc, dir, edited, optimization, 4)
+    assert_eq(count(second, "units"), 4)
+    assert_eq(count(second, "compiled") + count(second, "reused"), 4)
+    count(second, "compiled")
+
+@test("a function added first recompiles its unit and the tables' unit alone, at -O0 and -O2")
+added_function_recompiles_two_units()
+    assert_eq(recompiled_after(AddedFunction, "-O0"), 2)
+    assert_eq(recompiled_after(AddedFunction, "-O2"), 2)
+
+@test("a string added first recompiles its function's unit and the tables' unit alone, at -O0 and -O2")
+added_string_recompiles_two_units()
+    assert_eq(recompiled_after(AddedString, "-O0"), 2)
+    assert_eq(recompiled_after(AddedString, "-O2"), 2)
+
+@test("a function added first and called from main recompiles main's unit and the tables', at -O0 and -O2")
+added_called_function_recompiles_two_units()
+    val called = "added(n: int) -> int = n * 3 + 1\n\n" + Base + "    println(added(2))\n"
+    assert_eq(recompiled_after(called, "-O0"), 2)
+    assert_eq(recompiled_after(called, "-O2"), 2)

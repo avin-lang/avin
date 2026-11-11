@@ -1,6 +1,7 @@
 module dev.avinlang.compiler
 
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
 import sysl.text.{StrBuilder, str_builder}
 
 // Spells a MIR program as LLVM IR. Every decision about types, layout and control flow has already
@@ -30,14 +31,15 @@ emit_llvm(program: MirProgram) -> string
     out.push("\n")
     // A string literal is a constant object laid out as the runtime lays out a string: a header
     // naming the program's descriptor for strings, the length in bytes, then the bytes.
+    check_names(program)
     val strings = program.string_descriptor
     for i in 0..<program.strings.len()
         val text = program.strings[i]
         val n = text.bytes.len
-        out.push(s"@avin.str.$i.const = private constant { ptr, i64, i64, [$n x i8] } { ptr @avin.desc.$strings, i64 0, i64 $n, [$n x i8] c\"")
+        out.push(s"${symbol(str_name(program, i) + ".const")} = private constant { ptr, i64, i64, [$n x i8] } { ptr ${desc_symbol(program, strings)}, i64 0, i64 $n, [$n x i8] c\"")
         push_bytes(&out, text)
         out.push("\" }, align 16\n")
-        constant_payload(&out, s"@avin.str.$i")
+        constant_payload(&out, str_name(program, i))
     out.push("\n")
     for i in 0..<program.descriptors.len()
         emit_descriptor(&out, program, i)
@@ -50,37 +52,41 @@ emit_llvm(program: MirProgram) -> string
         val n = r.ancestors.len()
         val m = r.parts.len()
         val apart = if r.apart then 1 else 0
-        out.push(s"; type ${r.name}\n@avin.type.$i = private constant { i64, ptr, ptr, ptr, ptr, i64, i64, i64, [$n x ptr], [$m x ptr] } { i64 $n, ")
+        out.push(s"${record_symbol(program, i)} = private constant { i64, ptr, ptr, ptr, ptr, i64, i64, i64, [$n x ptr], [$m x ptr] } { i64 $n, ")
         out.push(entry_address(program, r.equals) + ", " + entry_address(program, r.hash) + ", ")
         out.push(entry_address(program, r.display) + ", " + entry_address(program, r.debug) + s", i64 $apart, i64 $m, i64 ${r.part_view}, [$n x ptr] ")
-        record_addresses(&out, r.ancestors)
+        record_addresses(&out, program, r.ancestors)
         out.push(s", [$m x ptr] ")
-        record_addresses(&out, r.parts)
+        record_addresses(&out, program, r.parts)
         out.push(" }, align 8\n")
     // A closure that captures nothing is constant: only a header naming its descriptor, whose `call`
     // is its entry.
     for i in 0..<program.closures.len()
         val k = program.closures[i]
-        out.push(s"@avin.fn.$i.const = private constant { ptr, i64 } { ptr @avin.desc.${k.descriptor}, i64 0 }, align 16\n")
-        constant_payload(&out, s"@avin.fn.$i")
+        out.push(s"${symbol(closure_name(program, i) + ".const")} = private constant { ptr, i64 } { ptr ${desc_symbol(program, k.descriptor)}, i64 0 }, align 16\n")
+        constant_payload(&out, closure_name(program, i))
     for i in 0..<program.constants.len()
         emit_constant(&out, program, i)
     // A trap site is what the runtime reports when the program stops there: the reason and the file
     // as constant strings, then the line and column.
     for i in 0..<program.traps.len()
         val t = program.traps[i]
-        out.push(s"@avin.trap.$i = private constant { ptr, ptr, i64, i64 } { ptr @avin.str.${t.reason}, ptr @avin.str.${t.file}, i64 ${t.line}, i64 ${t.col} }, align 8\n")
+        out.push(s"${trap_symbol(program, i)} = private constant { ptr, ptr, i64, i64 } { ptr ${symbol(str_name(program, t.reason))}, ptr ${symbol(str_name(program, t.file))}, i64 ${t.line}, i64 ${t.col} }, align 8\n")
     // The module-level values that hold references are the slots of one frame, laid out as a
     // function's shadow-stack frame is, which `main` gives the runtime as a root of every
-    // collection. Each other value is a global of its own. All start zero, before `main` initializes
-    // them.
+    // collection; each such value's name is an alias of its slot, so code reading it names the value
+    // and not its position among the slots. Each other value is a global of its own. All start zero,
+    // before `main` initializes them.
     val roots = root_count(program)
     if roots > 0
         out.push(s"@avin.roots = private global { ptr, i64, [$roots x ptr] } { ptr null, i64 $roots, [$roots x ptr] zeroinitializer }, align 8\n")
+    var slot = 0usize
     for i in 0..<program.globals.len()
         program.globals[i] match
-            Some(MRef) -> ()
-            Some(t) -> out.push(s"@avin.global.$i = private global ${llvm_type(t)} zeroinitializer, align 8\n")
+            Some(MRef) ->
+                out.push(s"${global_symbol(program, i)} = private alias ptr, ptr getelementptr inbounds ({ ptr, i64, [$roots x ptr] }, ptr @avin.roots, i64 0, i32 2, i64 $slot)\n")
+                slot += 1
+            Some(t) -> out.push(s"${global_symbol(program, i)} = private global ${llvm_type(t)} zeroinitializer, align 8\n")
             None -> ()
     out.push("\n")
     var declared: Buf[string] = buf()
@@ -131,7 +137,7 @@ emit_llvm(program: MirProgram) -> string
     val entry = program.functions[program.entry.unwrap()]
     out.push("\ndefine i32 @main(i32 %argc, ptr %argv) {\nentry:\n")
     out.push("  %ctx = call ptr @avin_rt_start(i32 %argc, ptr %argv)\n")
-    out.push(s"  call void @avin_rt_string_descriptor(ptr @avin.desc.${program.string_descriptor})\n")
+    out.push(s"  call void @avin_rt_string_descriptor(ptr ${desc_symbol(program, program.string_descriptor)})\n")
     // The module-level values are roots before the first of them is stored, and are all
     // initialized before the entry runs.
     if roots > 0 then out.push("  call void @avin_rt_globals(ptr @avin.roots)\n")
@@ -182,7 +188,7 @@ private emit_test_main(out: *StrBuilder, program: MirProgram, roots: usize)
     out.push("  %mode_char = load i8, ptr %mode_arg\n  br label %start\n")
     out.push("start:\n  %how = phi i8 [ 0, %pick ], [ %mode_char, %mode ]\n")
     out.push("  %ctx = call ptr @avin_rt_start(i32 1, ptr %argv)\n")
-    out.push(s"  call void @avin_rt_string_descriptor(ptr @avin.desc.${program.string_descriptor})\n")
+    out.push(s"  call void @avin_rt_string_descriptor(ptr ${desc_symbol(program, program.string_descriptor)})\n")
     if roots > 0 then out.push("  call void @avin_rt_globals(ptr @avin.roots)\n")
     if program.init is Some(init) then out.push(s"  call ${convention(program.functions[init].signature)}void @\"${program.functions[init].symbol}\"(ptr %ctx)\n")
     out.push("  switch i32 %which, label %unknown [")
@@ -201,7 +207,7 @@ private emit_test_main(out: *StrBuilder, program: MirProgram, roots: usize)
                 val reader = program.functions[a]
                 out.push(s"  %answer$i = call ${convention(test.signature)}${result_type(test.signature)} @\"${test.symbol}\"(ptr %ctx)\n")
                 // The context's caller site, which the reader's trap reports.
-                out.push(s"  %site$i = getelementptr inbounds i8, ptr %ctx, i64 24\n  store ptr @avin.trap.${t.answer_site}, ptr %site$i\n")
+                out.push(s"  %site$i = getelementptr inbounds i8, ptr %ctx, i64 24\n  store ptr ${trap_symbol(program, t.answer_site)}, ptr %site$i\n")
                 out.push(s"  call ${convention(reader.signature)}${result_type(reader.signature)} @\"${reader.symbol}\"(ptr %ctx, ${llvm_type(reader.signature.params[0])} %answer$i)\n")
             None -> out.push(s"  call ${convention(test.signature)}${result_type(test.signature)} @\"${test.symbol}\"(ptr %ctx)\n")
         out.push(s"  call i64 @write(i32 2, ptr @avin.test.returned, i64 ${TestReturned.len + 1})\n")
@@ -234,15 +240,83 @@ const TestReady: string = "avin: test: ready"
 const TestReturned: string = "avin: test: returned"
 
 /** The addresses of the records `records`, as the elements of a constant array. */
-private record_addresses(out: *StrBuilder, records: Buf[usize])
+private record_addresses(out: *StrBuilder, program: MirProgram, records: Buf[usize])
     if records.len() == 0
         out.push("zeroinitializer")
         return
     out.push("[")
     for j in 0..<records.len()
         if j > 0 then out.push(", ")
-        out.push(s"ptr @avin.type.${records[j]}")
+        out.push("ptr " + record_symbol(program, records[j]))
     out.push("]")
+
+// ==Stable names==
+//
+// Every constant and table is named by what it is, never by the order lowering found it in, so one
+// function, string or type added to a program renames nothing else and every other function's text
+// stays as it was: a string by a hash of its bytes, a descriptor and its method table by the type it
+// lays out, a type record by its type, a constant closure by its function, a constant object by what
+// it holds or the module-level value it was made for, a trap site by its function and its place in
+// it, a module-level value by its qualified name. Each name is `avin.<kind>:` and that, quoted.
+
+/** `name` as an LLVM symbol, quoted, so any text is valid. */
+private symbol(name: string) -> string = "@\"" + name + "\""
+
+private str_name(program: MirProgram, i: usize) -> string = "avin.str:" + program.string_names[i]
+
+private desc_symbol(program: MirProgram, i: usize) -> string = symbol("avin.desc:" + program.descriptors[i].name)
+
+private methods_symbol(program: MirProgram, i: usize) -> string = symbol("avin.methods:" + program.descriptors[i].name)
+
+private object_name(program: MirProgram, i: usize) -> string = "avin.obj:" + program.descriptors[i].name
+
+private record_symbol(program: MirProgram, i: usize) -> string = symbol("avin.type:" + program.records[i].name)
+
+private closure_name(program: MirProgram, i: usize) -> string = "avin.fn:" + program.functions[program.closures[i].function].symbol
+
+private data_name(program: MirProgram, i: usize) -> string = "avin.data:" + program.constants[i].name
+
+private trap_symbol(program: MirProgram, i: usize) -> string = symbol("avin.trap:" + program.traps[i].name)
+
+private global_symbol(program: MirProgram, i: usize) -> string = symbol("avin.global:" + program.global_names[i])
+
+private trampoline_symbol(program: MirProgram, i: usize) -> string = symbol("avin.c.trampoline:" + program.c_trampolines[i].name)
+
+/** Stops with the name where two things of one kind would share it: lowering names each by what
+ * makes it different from every other, so a shared name is a defect of that naming, which the
+ * assembler would otherwise report as a redefinition. */
+private check_names(program: MirProgram)
+    var functions: Buf[string] = buf()
+    for f in program.functions
+        functions.push(f.symbol)
+    distinct(functions, "functions")
+    var descriptors: Buf[string] = buf()
+    for d in program.descriptors
+        descriptors.push(d.name)
+    distinct(descriptors, "descriptors")
+    var records: Buf[string] = buf()
+    for r in program.records
+        records.push(r.name)
+    distinct(records, "type records")
+    var constants: Buf[string] = buf()
+    for k in program.constants
+        constants.push(k.name)
+    distinct(constants, "constant objects")
+    var traps: Buf[string] = buf()
+    for t in program.traps
+        traps.push(t.name)
+    distinct(traps, "trap sites")
+    distinct(program.global_names, "module-level values")
+    var trampolines: Buf[string] = buf()
+    for t in program.c_trampolines
+        trampolines.push(t.name)
+    distinct(trampolines, "trampolines")
+
+private distinct(names: Buf[string], what: string)
+    var seen: Map[string, usize] = map()
+    for name in names
+        if seen.get(name) is Some(_) then panic(s"two $what named `$name`")
+        seen.put(name, 0)
 
 /** A type record's equality entry as an LLVM constant: the function's address, or null. */
 private entry_address(program: MirProgram, entry: Option[usize]) -> string = entry match
@@ -399,12 +473,12 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
             Trap(site) ->
                 // The runtime flushes the program's output, reports the site and stops.
                 need(intrinsics, "declare void @avin_rt_trap(ptr, ptr) noreturn cold")
-                out.push(s"  call void @avin_rt_trap(ptr %ctx, ptr @avin.trap.$site)\n  unreachable\n")
+                out.push(s"  call void @avin_rt_trap(ptr %ctx, ptr ${trap_symbol(program, site)})\n  unreachable\n")
             CallerTrap(site) ->
                 // The runtime reports the site's reason at the place the program entered the core
                 // library.
                 need(intrinsics, "declare void @avin_rt_caller_trap(ptr, ptr) noreturn cold")
-                out.push(s"  call void @avin_rt_caller_trap(ptr %ctx, ptr @avin.trap.$site)\n  unreachable\n")
+                out.push(s"  call void @avin_rt_caller_trap(ptr %ctx, ptr ${trap_symbol(program, site)})\n  unreachable\n")
             Unreachable -> out.push("  unreachable\n")
     out.push("}\n\n")
 
@@ -829,7 +903,7 @@ polled_before(graph: CallGraph, index: usize, f: MirFunction) -> Buf[bool]
 // header, `KindBack` bytes before the object. The word directly before the descriptor is its `call`,
 // what a call of the object as a function value runs, null for an object that is no function; a
 // class's method table sits before that, in the same constant, so slot `s` is the word 8(s + 2) bytes
-// before the descriptor; `@avin.desc.N` names the descriptor's address. An abstract method's slot is
+// before the descriptor; `@"avin.desc:<type>"` names the descriptor's address. An abstract method's slot is
 // null: no object of its class exists. A variant with no field data is one constant object, which is
 // only its header.
 private emit_descriptor(out: *StrBuilder, program: MirProgram, i: usize)
@@ -845,7 +919,7 @@ private emit_descriptor(out: *StrBuilder, program: MirProgram, i: usize)
         if h.descriptor == i then kind = s"$KindType { ptr @avin_rt_trace, ptr @${h.finalizer}, ptr null, ptr null }"
     for h in program.c_handles
         if h.descriptor == i then kind = s"$KindType { ptr @avin_rt_trace, ptr @${h.finalizer}, ptr null, ptr null }"
-    body.push(s"{ $kind, i64 ${d.tag}, i64 ${d.size}, i64 $n, ptr @avin.type.${d.record}, [$n x i64] ")
+    body.push(s"{ $kind, i64 ${d.tag}, i64 ${d.size}, i64 $n, ptr ${record_symbol(program, d.record)}, [$n x i64] ")
     if n == 0 then body.push("zeroinitializer")
     else
         body.push("[")
@@ -858,7 +932,7 @@ private emit_descriptor(out: *StrBuilder, program: MirProgram, i: usize)
     val m = d.methods.len()
     val words = m + 1
     val whole = s"{ [$words x ptr], $header }"
-    out.push(s"; ${d.name}\n@avin.methods.$i = private constant $whole { [$words x ptr] [")
+    out.push(s"${methods_symbol(program, i)} = private constant $whole { [$words x ptr] [")
     for j in 0..<m
         d.methods[m - 1 - j] match
             Some(f) -> out.push("ptr @\"" + program.functions[f].symbol + "\", ")
@@ -867,10 +941,10 @@ private emit_descriptor(out: *StrBuilder, program: MirProgram, i: usize)
         Some(f) -> out.push("ptr @\"" + program.functions[f].symbol + "\"")
         None -> out.push("ptr null")
     out.push(s"], $header $value }, align 8\n")
-    out.push(s"@avin.desc.$i = private alias $header, ptr getelementptr inbounds ($whole, ptr @avin.methods.$i, i32 0, i32 1)\n")
+    out.push(s"${desc_symbol(program, i)} = private alias $header, ptr getelementptr inbounds ($whole, ptr ${methods_symbol(program, i)}, i32 0, i32 1)\n")
     if d.constant
-        out.push(s"@avin.obj.$i.const = private constant { ptr, i64 } { ptr @avin.desc.$i, i64 0 }, align 16\n")
-        constant_payload(out, s"@avin.obj.$i")
+        out.push(s"${symbol(object_name(program, i) + ".const")} = private constant { ptr, i64 } { ptr ${desc_symbol(program, i)}, i64 0 }, align 16\n")
+        constant_payload(out, object_name(program, i))
 
 /** The symbol of the entry a binding's shim calls a function value passed as its parameter `k`
  * through. */
@@ -915,7 +989,7 @@ private emit_invoker(out: *StrBuilder, name: string, machine: Buf[MirType], answ
 private emit_trampoline(out: *StrBuilder, program: MirProgram, i: usize)
     val t = program.c_trampolines[i]
     val f = program.functions[t.function]
-    out.push(s"\ndefine internal ${foreign_result(t.result)} @avin.c.trampoline.$i(")
+    out.push(s"\ndefine internal ${foreign_result(t.result)} ${trampoline_symbol(program, i)}(")
     for j in 0..<t.params.len()
         if j > 0 then out.push(", ")
         out.push(foreign_type(t.params[j]) + foreign_extension(t.params[j]) + s" %a$j")
@@ -963,19 +1037,19 @@ private emit_constant(out: *StrBuilder, program: MirProgram, i: usize)
     var types = str_builder()
     var values = str_builder()
     types.push("ptr, i64")
-    values.push(s"ptr @avin.desc.${k.descriptor}, i64 0")
+    values.push(s"ptr ${desc_symbol(program, k.descriptor)}, i64 0")
     var at = 0usize
     for f in k.fields
         if f.offset > at then pad_bytes(&types, &values, f.offset - at)
-        val cell = constant_cell(f)
+        val cell = constant_cell(program, f)
         types.push(", " + cell.ty)
         values.push(", " + cell.ty + " " + cell.text)
         at = f.offset + cell.width
     val end = (if k.size > at then k.size else at) + 7
     val whole = end - end % 8
     if whole > at then pad_bytes(&types, &values, whole - at)
-    out.push(s"@avin.data.$i.const = private constant <{ ${types.finish()} }> <{ ${values.finish()} }>, align 16\n")
-    constant_payload(out, s"@avin.data.$i")
+    out.push(s"${symbol(data_name(program, i) + ".const")} = private constant <{ ${types.finish()} }> <{ ${values.finish()} }>, align 16\n")
+    constant_payload(out, data_name(program, i))
 
 private pad_bytes(types: *StrBuilder, values: *StrBuilder, n: usize)
     types.push(s", [$n x i8]")
@@ -987,15 +1061,15 @@ private struct Cell
     width: usize
     text: string
 
-private constant_cell(f: ConstantField) -> Cell
+private constant_cell(program: MirProgram, f: ConstantField) -> Cell
     val text = f.value match
         ConstInt(_, digits) -> digits
         ConstBool(value) -> if value then "1" else "0"
         ConstReal(value) -> real_constant(value)
-        ConstStr(index) -> payload_address(s"@avin.str.$index")
-        ConstObject(descriptor) -> payload_address(s"@avin.obj.$descriptor")
-        ConstData(index, _) -> payload_address(s"@avin.data.$index")
-        ConstClosure(index) -> payload_address(s"@avin.fn.$index")
+        ConstStr(index) -> payload_address(str_name(program, index))
+        ConstObject(descriptor) -> payload_address(object_name(program, descriptor))
+        ConstData(index, _) -> payload_address(data_name(program, index))
+        ConstClosure(index) -> payload_address(closure_name(program, index))
         _ -> "null"
     f.ty match
         MInt(_) ->
@@ -1008,12 +1082,12 @@ private constant_cell(f: ConstantField) -> Cell
 // Names the payload of the constant object `name.const`, which follows its two header words, as
 // `name`: every reference to the object is to its payload.
 private constant_payload(out: *StrBuilder, name: string)
-    out.push(s"$name = private alias i8, ptr getelementptr inbounds (i8, ptr $name.const, i64 $KindBack)\n")
+    out.push(s"${symbol(name)} = private alias i8, ptr getelementptr inbounds (i8, ptr ${symbol(name + ".const")}, i64 $KindBack)\n")
 
 // The address of the payload of the constant object `name.const`, written out rather than by its
 // alias: LLVM sees through the expression to the constant, so it knows the object can be read on
 // either side of a choice between two of them, and folds what is read.
-private payload_address(name: string) -> string = s"getelementptr inbounds (i8, ptr $name.const, i64 $KindBack)"
+private payload_address(name: string) -> string = s"getelementptr inbounds (i8, ptr ${symbol(name + ".const")}, i64 $KindBack)"
 
 /** The byte offset from a descriptor to the method in slot `slot` of the table before its `call`. */
 private method_slot_offset(slot: usize) -> string = "-" + ((slot + 2) * 8).to_string()
@@ -1266,7 +1340,7 @@ private emit_inst(out: *StrBuilder,intrinsics: *Buf[string], program: MirProgram
             next += 1
         Alloc(dest, descriptor) ->
             need(intrinsics, "declare ptr @avin_rt_alloc(ptr, ptr)")
-            out.push(s"  %v$dest = call ptr @avin_rt_alloc(ptr %ctx, ptr @avin.desc.$descriptor)\n")
+            out.push(s"  %v$dest = call ptr @avin_rt_alloc(ptr %ctx, ptr ${desc_symbol(program, descriptor)})\n")
         Offset(dest, base, bytes) ->
             out.push(s"  %v$dest = getelementptr inbounds i8, ptr " + operand(program, f, base) + s", i64 $bytes\n")
         Index(dest, base, index) ->
@@ -1404,30 +1478,22 @@ private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a m
     ConstBool(value) -> if value then "true" else "false"
     ConstReal(value) -> real_constant(value)
     SlotAddress(slot) -> s"%s$slot"
-    ConstObject(descriptor) -> payload_address(s"@avin.obj.$descriptor")
-    ConstData(index, _) -> payload_address(s"@avin.data.$index")
-    ConstStr(index) -> payload_address(s"@avin.str.$index")
-    ConstClosure(index) -> payload_address(s"@avin.fn.$index")
+    ConstObject(descriptor) -> payload_address(object_name(program, descriptor))
+    ConstData(index, _) -> payload_address(data_name(program, index))
+    ConstStr(index) -> payload_address(str_name(program, index))
+    ConstClosure(index) -> payload_address(closure_name(program, index))
     FunctionAddress(function) -> c_wrapper_name(program, function)
-    GlobalAddress(index) -> global_address(program, index)
-    RecordAddress(index) -> s"@avin.type.$index"
-    DescriptorAddress(descriptor) -> s"@avin.desc.$descriptor"
+    // A module-level value that holds a reference is a slot of the roots frame, which its name is
+    // an alias of; any other is a global of its own.
+    GlobalAddress(index) -> global_symbol(program, index)
+    RecordAddress(index) -> record_symbol(program, index)
+    DescriptorAddress(descriptor) -> desc_symbol(program, descriptor)
     NullAddress -> "null"
-    TrapSiteAddress(site) -> s"@avin.trap.$site"
+    TrapSiteAddress(site) -> trap_symbol(program, site)
     CallerSite -> "%caller.site"
     OwnerWord -> "%owner.word"
     ClosureRunner -> "@avin.run_closure"
-    TrampolineAddress(i) -> s"@avin.c.trampoline.$i"
-
-// A module-level value that holds a reference is a slot of the roots frame; any other is a global
-// of its own.
-private global_address(program: MirProgram, index: usize) -> string
-    if !(program.globals[index] is Some(MRef)) then return s"@avin.global.$index"
-    var slot = 0usize
-    for i in 0..<index
-        if program.globals[i] is Some(MRef) then slot += 1
-    val n = root_count(program)
-    s"getelementptr inbounds ({ ptr, i64, [$n x ptr] }, ptr @avin.roots, i64 0, i32 2, i64 $slot)"
+    TrampolineAddress(i) -> trampoline_symbol(program, i)
 
 private root_count(program: MirProgram) -> usize
     var n = 0usize

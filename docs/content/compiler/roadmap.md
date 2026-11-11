@@ -310,7 +310,18 @@ its samples), `conformance_holds`, `same_type` and `collect_ancestors`.
    content, descriptors and records by type, closures and trap sites by function and place; the
    module-level tables in a codegen unit of their own. Test: adding a function or a string early in a
    program changes no other function's emitted text, and the unit counts in the log say one unit
-   plus the tables' recompiled.
+   plus the tables' recompiled. **Done:** every table is `@"avin.<kind>:<name>"`, named as the
+   [pipeline](/compiler/#incremental-builds) lists, and the tables are the last unit. A function, a
+   string, a class, a data type, a module-level value or blank lines added first in a program change
+   no other function's text, and a function or string added recompiles 2 of 4 units at `-O0` and
+   `-O2`. marshal's longest
+   symbol is 319 bytes, with no hash suffix; its text grew from 126 MB to 140 MB. Its edit of one
+   string in a leaf function rebuilds in 19.1 s against 19.0 s before (load average about 7), 3 units
+   of 8 compiled against 2: lowering, checking and emission are still most of it, which items 5 to 7
+   address, and the edited function, small enough to be copied into its callers' units at `-O2`,
+   reaches a third. The C unit's glue is still named by the checker's indices
+   (`avin_c_call_<symbol>`, `avin_c_retain_<class>`, and the handles' finalizers), so a declaration
+   added before a C binding renames the binding's calls.
 5. **Instance keys.** The canonical typed-tree fingerprint, the interfaces read and the world facts,
    computed and logged but not yet used. Test: an edit matrix (a body, a signature, a field, a new
    implementing class, a new impl, a changed default argument, an inferred type changed by a callee's
