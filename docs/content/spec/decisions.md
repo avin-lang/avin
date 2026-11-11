@@ -5447,6 +5447,80 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   other methods. *Why*: the smallest router that covers a service's paths, with escaped and raw
   Unicode routing alike and an escaped `/` staying inside its segment. *Alternatives*: wildcards
   for the rest of a path and patterns in a segment (later, if programs need them).
+- Settled on the user's delegation 2026-11-11 (designed on branch `incremental-design`): **Lowering is made cheaper before anything is cached**:
+  the [build plan](/compiler/roadmap/#incremental-builds-build-plan) fixes tuple records (a
+  tuple's ancestors listed as the product of its parts' traits, each with its own entries: 33,858 of
+  marshal's 71,646 functions) and lowering's constant factors first. WHY: lowering is 75 to 80% of
+  an edit's rebuild and most of it is that defect; a cache built first would key and store tens of
+  thousands of instances no program needs, and its measured win would be the defect's. Alternatives:
+  cache first and fix after (stores the waste and measures the wrong thing); fix only (an edit still
+  lowers the whole program).
+- Settled on the user's delegation 2026-11-11 (designed on branch `incremental-design`): **The unit of reuse is the instance, grouped a file per
+  source module; the front end stays whole-program and uncached.** WHY: monomorphization makes the
+  instance, not the module, the thing whose code exists, and closed-world passes decide per call
+  site; checking marshal is about 4 s of a 65 s rebuild, and the checker numbers every symbol of the
+  program by index, so caching its output per module is a rewrite, deferred until a measurement says
+  the front end is the larger part. Alternatives: per-module object files with generic code emitted
+  where it is used (duplicates instances across modules and loses closed-world devirtualization); a
+  cache of the checked front end per module first (targets 6% of the time); whole-program LLVM text
+  cached by the program's hash (only helps an unchanged program, which the executable record already
+  does).
+- Settled on the user's delegation 2026-11-11 (designed on branch `incremental-design`): **An instance's key is its identity spelled by qualified
+  names, its typed body printed canonically, the layouts and records it reads, and the world facts
+  the whole-program passes used on it**, beside the compiler's stamp, level and kind. WHY: the
+  printed typed tree carries every resolution and inference the checker made, so a change elsewhere
+  that alters what the body means alters its key without a dependency graph of the source; world
+  facts per call site let a new implementing class rerun the passes on its callers without lowering
+  them again. Alternatives: the declaration's source text plus the hashes of the modules it imports
+  (misses inference changes through a callee's result, and invalidates on every unrelated change to
+  an imported module); one hash of the whole program's world for the passes (any new class reruns
+  every pass on every instance).
+- Settled on the user's delegation 2026-11-11 (designed on branch `incremental-design`): **Emitted names are stable**: a string by its content's
+  hash, a descriptor or record by its type, a closure or trap site by its function and place, the
+  module-level tables in a codegen unit of their own. WHY: today's numbering by discovery order lets
+  one new instance renumber the rest, which changes every unit's text and defeats both caches.
+  Alternatives: keep the numbering and patch indices at emission (every reused text rewritten
+  anyway); number per module (still moves when a module gains a string).
+- Settled on the user's delegation 2026-11-11 (designed on branch `incremental-design`): **The instance cache lives in the program's
+  `.avin/build/incremental/<kind><level>/`, content-addressed, published by rename, with no lock;
+  a missing, short or mismatched entry is a miss; a build trims what its manifest does not name and
+  was not used in the last hour.** WHY: the same scheme as the unit and shim caches, safe for two
+  builds at once because a key's bytes are the same whoever writes them. Alternatives: a lock per
+  program directory (serializes `run` and `test` and the language server); the toolchain's shared
+  cache for everything (instances of a program's own types are useless to any other program; sharing
+  library-only instances can come later, since the keys already allow it). Review with the user:
+  whether library-only instances should later go to the toolchain's cache, shared across programs.
+- Settled on the user's delegation 2026-11-11 (designed on branch `incremental-design`): **An incremental build is tested against a clean one**:
+  every edit in the compiler's tests checks that the incremental build's LLVM text equals a build
+  with no cache, and the counts in `AVIN_BUILD_LOG` that only the affected instances were lowered;
+  `AVIN_INCREMENTAL=verify` compares every reused instance with a fresh lowering. WHY: a key missing
+  a dependency is the one way this design fails, and it fails silently; the clean build is an oracle
+  that needs no list of what each edit should touch. Alternatives: count-only tests (prove reuse,
+  not correctness); trusting the key (no defence against a missed dependency).
+- Settled on the user's delegation 2026-11-11 (built on branch `option-nested`): **`Option[Nothing]` takes the form of the options it is seen
+  as inside other values.** Its one value, `None`, is null as a pointer and the constant `None`
+  object as an object, so the program-wide plan keeps it a pointer when every view of it inside
+  another value (a `Vector[Option[Nothing]]` as a `Vector[Option[Dog]]`, a `Result`, a function's
+  result, an option, a tuple, a data field, a map value) sees it as an option kept as a pointer, and
+  an object when every such view sees it as one kept as an object (`Option[int]`,
+  `Option[Option[Dog]]`); a bare `Option[Nothing]` written as an option of the other form is
+  converted where it is written, as before. *Why*: options of classes and strings stay pointers in
+  the common program that builds a collection of `None`s, at no cost in any other. *Left as full
+  objects (correct, slower)*: a program that sees it inside other values both ways, since one
+  vector of it could flow to both and no single form serves; and one that sees it as an option of a
+  type parameter (`Vector[Option[Nothing]]` as `Vector[Option[T]]` in generic code), since the view
+  is recorded once for every instance. *Alternatives*: (a) `None` null in every option, objects
+  included, removing the conflict but adding a null test to every match, method call and table
+  entry on an object option; (b) copying the containing value at the view, which a view by
+  definition does not do and which breaks identity of mutable containers; (c) keeping
+  `Option[Nothing]` always an object, the old rule, which stores every option of the program as an
+  object as soon as one nested view to a pointer option exists. With it, an `Option[Nothing]`
+  written as another option is always that option's own `None` (the null, or that option's constant
+  object, where an object option used to receive the `Option[Nothing]` object itself), so as an
+  `Any` it has the option's type and equals that type's other `None`s, as the equality chapter's
+  rule by run-time type says; one seen inside a vector as an `Option[Dog]` and then boxed is an
+  `Option[Dog]` too. A view inside an object-form value still leaves the `Option[Nothing]` object
+  there, as any view leaves a value as it was made.
 
 **Deferred**
 
