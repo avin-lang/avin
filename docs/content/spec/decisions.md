@@ -5455,6 +5455,45 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- Proposed (branch `json-stream`): **`avin.io.Reader`**, a trait of one method, `read(max) ->
+  Result[Array[byte], IoError]`, an empty array at the end, which `fs.File`, `net.TcpStream` and
+  `net.UnixStream` implement with the `read` each already had. *Why*: the streaming JSON reader
+  reads "a byte stream", and the three byte sources had the same method with no common type, so a
+  function could take only one of them. *Alternatives*: a read function `(int) -> Result[Array[byte],
+  IoError]` passed to the JSON reader (no library change, but every caller writes the lambda and
+  other byte readers gain nothing); a `ByteSource` trait private to the json package (each source
+  wrapped by hand). Standard input and a command's output are not readers yet; making them so is
+  later work when a program needs it.
+- Proposed (branch `json-stream`): **the streaming JSON reader's interface**, `JsonReader` with the
+  pull events of `JsonEvent` (`next`, `peek`, `depth`) beside the calls the derivation chapter's
+  decoder makes (`beginArray`, `nextElement`, `beginObject`, `nextKey`, `readString`, `takeNull`,
+  `skipValue`, `error`), completed with `readBool`, `readLong`, `readInt`, `readReal`, `readValue`,
+  `readDocument` and `finish`; made by `fromReader`, `fromString` and `fromBytes`. *Why*: one type
+  serves both a program walking a large document and a derived decoder, and the events are the
+  smallest set that names every token; a decoder's calls are each a step or two over them.
+  *Alternatives*: callbacks pushed per event (a decoder cannot pull a field's value at its type);
+  an iterator of events (no `Result` per step, so a fault would have to trap); a reader of several
+  values in a row (JSON lines), later if a program needs it, as `parse` takes one value too.
+  Review with the user: the variant names (`StartObject` … `EndOfText`), chosen to stay apart from
+  `Json`'s own variants in the same module.
+- Proposed (branch `json-stream`): **a stream gives `parse`'s faults at `parse`'s places**, and a
+  failure to read is a `JsonError` (`the text could not be read: <the IoError's message>`) at the
+  place reading stopped, rather than a separate error type. Bytes that are not UTF-8 are found as
+  they are read, so a grammar fault earlier in the text is reported first, where `parse` of bytes,
+  which checks the whole text first, reports the UTF-8 fault. *Why*: one error type for the decoder
+  to carry, and a stream cannot look ahead to the end. *Alternatives*: `Either[IoError, JsonError]`
+  per call (every decoder's signature grows); trapping on a read failure.
+- Proposed (branch `json-stream`): **`JsonError`'s `line`, `column` and `offset` are `long`s**
+  (they were `int`s). *Why*: a stream larger than memory runs past two gibibytes, and a minified one
+  is on a single line, so an `int` column or offset would trap on overflow. *Alternatives*: `int`s
+  that saturate (a wrong place, silently); a `long` offset only (a column of a long line still
+  overflows).
+- Proposed (branch `json-stream`): **a parent after `:` may be named through its module**,
+  `class Body: shapes.Base("b"), io.Reader`, resolved as a type written `m.T` is. *Why*: it was
+  refused with "expected a superclass" though the same name is a type everywhere else; found when
+  `fs.File` was made an `io.Reader`. *Alternatives*: none weighed; the bare name through an import
+  stays the common form.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

@@ -501,6 +501,22 @@ the program blocks for the answer.
 **Tests see no input.** `avin test` gives each test an empty standard input, so a test never waits on
 the terminal it was started from. `avin run` hands the program its own standard input.
 
+### `Reader`
+
+A `Reader` is bytes read from somewhere a piece at a time, so one function can read a file, a
+connection, or a source the program writes itself, holding no more of the input than it asks for:
+
+```text
+trait Reader
+    read(max: int) -> Result[Array[byte], IoError]
+```
+
+`read(max)` gives up to `max` bytes, `max` being at least one, waiting for at least one where the
+source is still going, and an empty array once it has ended. `fs.File`, `net.TcpStream` and
+`net.UnixStream` are readers, each by its own `read`; a class of the program's own is one by
+naming `io.Reader` (or `Reader`, imported) after `:` and overriding `read`. The
+[json package](/spec/json/#reading-a-stream)'s `JsonReader` reads JSON from any reader.
+
 ### `Source`
 
 A `Source` is text to be read from somewhere, so one function can read a file, a string
