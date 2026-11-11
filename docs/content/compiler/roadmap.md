@@ -285,7 +285,8 @@ its samples), `conformance_holds`, `same_type` and `collect_ancestors`.
    says. Its tests are the existing suite; the report gives marshal's before and after.
 3. **Build log.** `AVIN_BUILD_LOG=<file>`: each phase's time and the counts of instances, units
    compiled and units reused, with a test of its form on a small program. Every later item asserts
-   through it.
+   through it. Built: `AVIN_BUILD_LOG` is a file or `-`, one `phase=<name> ms=<n> key=<n>` line per
+   phase, documented in the [pipeline](/compiler/#incremental-builds).
 4. **Stable names.** Types in instance keys and symbols spelled by qualified names; strings named by
    content, descriptors and records by type, closures and trap sites by function and place; the
    module-level tables in a codegen unit of their own. Test: adding a function or a string early in a
