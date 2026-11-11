@@ -6468,14 +6468,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     inlining such functions (a call where there was none at `-O0`); no tail calls of several words
     (deep mutual recursion through `val (a, b) = f(x)` would overflow the stack).
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- **`PriorityQueue` gives the greatest element first** (branch `stdlib-priority-queue`),
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-priority-queue`): **`PriorityQueue` gives the greatest element first** (branch `stdlib-priority-queue`),
   [collections](/spec/collections/#priority-queues). `PriorityQueue[T]()` orders by `T`'s `Ord`, and
   `PriorityQueue.withOrdering(compare)` by a comparison; the element `compare` finds greatest comes
   out first. Why: it matches `max`, which every `Ord` type already answers, and `dequeue` then takes
@@ -6483,17 +6476,17 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   way. Alternative: least first (the order of a sorted sequence read from the front, the usual choice
   for shortest-path searches); it makes `PriorityQueue[int]()` the odd one out against `max`.
   Review with the user: it is the default every caller will meet.
-- **A queue's `iterator()` and `toVector()` are in heap order, and `toSortedVector()` is the sorted
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-priority-queue`): **A queue's `iterator()` and `toVector()` are in heap order, and `toSortedVector()` is the sorted
   form** (branch `stdlib-priority-queue`). Heap order starts with the greatest element and is
   otherwise unspecified; the iterator is a snapshot taken when it is made, so enqueuing or dequeuing
   while iterating neither traps nor changes what it gives. Why: heap order costs nothing, a sorted
   iteration costs O(n log n) and a copy, and `Iterable` conformance wants the cheap one; a snapshot
   makes mutation during iteration defined. Alternatives: iterating in dequeue order; an iterator
   over the live heap (cheaper, but what it gives after a change is arbitrary).
-- **Equal elements come out in no promised order** (branch `stdlib-priority-queue`): a binary heap
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-priority-queue`): **Equal elements come out in no promised order** (branch `stdlib-priority-queue`): a binary heap
   is not stable. Alternative: a sequence number breaking ties first-in-first-out, at the cost of a
   word per element and a wider comparison; a caller wanting it orders by `thenBy` on its own counter.
-- **Insertion-ordered maps and sets: names, update order, equality** (branch `stdlib-ordered-map`).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-ordered-map`): **Insertion-ordered maps and sets: names, update order, equality** (branch `stdlib-ordered-map`).
   The concrete types are `OrderedMap[K, +V]` and `OrderedSet[A]`, conforming to the traits `SeqMap[K, +V]`
   and `SeqSet[A]`. *Why:* the concrete names say what the collection does, as `HashMap` says how it
   finds and `TreeMap` how it sorts, and no implementation (a vector of keys) leaks into them; the
@@ -6513,14 +6506,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `flatMap` through the trait answer hash-based collections, as for `TreeMap` through `Map`. A
   `{k: v}` or `{a, b}` literal builds one where `SeqMap`, `OrderedMap`, `SeqSet` or `OrderedSet` is
   expected. Review with the user: the names.
-- **A call through a method table or a bound reaches only methods of types that conform** (branch
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-ordered-map`): **A call through a method table or a bound reaches only methods of types that conform** (branch
   `stdlib-ordered-map`; a fix, recorded because it changes what the polymorphic-recursion check
   reports). The type arguments of a method's own type parameters flowed into every method of the same
   name and arity of any type, so a generic method that called a sequence's `updated` with a type built
   from its own parameter was reported as recursing into itself. They now flow only into methods of
   types that have the called method's class or trait among their ancestors. *Alternative:* keep the
   name-only approximation and rename the method (rejected: `updated` is the name every map has).
-- Proposed 2026-11-11 (branch `stdlib-linked-map`): **`avin.collections.mutable.LinkedMap[K, V]` and
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-linked-map`): **`avin.collections.mutable.LinkedMap[K, V]` and
   `LinkedSet[A]`, the insertion-ordered mutable map and set.** The choices:
   1. *Re-binding a present key keeps its place*; `putLast(k, v)` and `moveToEnd(k)` (and a set's
      `addLast` and `moveToEnd`) make it the newest, and a key removed and bound again is new. Why:
@@ -6551,7 +6544,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
      positions; every operation is amortized constant time. Alternative: open addressing with
      order links threaded through the table, one structure instead of two but a second copy of the
      table's removal logic; it can replace this without changing the API.
-- **`Queue[+T]` (immutable, two lists), built by the stdlib-queue branch.**
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-queue`): **`Queue[+T]` (immutable, two lists), built by the stdlib-queue branch.**
   - *Choice:* `Queue` is an abstract covariant class with a private two-list implementation, so its
     constructor cannot be called with a state that breaks the invariant (the front is empty only
     when the back is). It has `Queue(xs*)`, `Queue.empty[T]()` and `Queue.newBuilder`, but no
@@ -6565,6 +6558,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     better for the usual single-threaded use); `dequeue` answering `Option` only (loses the trap
     that every other `removeHead` has); `head`/`tail` names only (they remain, from `Seq`, with `tail`
     answering a `Vector`).
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 

@@ -22,13 +22,9 @@ Iterable[+A]                 iterator(), and the operation families below
 │   ├── Range[A]             immutable arithmetic progression
 │   ├── Array[A]             mutable, fixed length, contiguous
 │   ├── Buffer[A]            mutable, growable at the end, contiguous
-<<<<<<< HEAD
-│   └── Deque[A]             mutable, growable at both ends
-├── PriorityQueue[T]         mutable binary heap, greatest first (avin.collections.mutable)
-=======
 │   ├── Deque[A]             mutable, growable at both ends
 │   └── Queue[+A]            immutable first-in, first-out, two lists
->>>>>>> origin/stdlib-queue
+├── PriorityQueue[T]         mutable binary heap, greatest first (avin.collections.mutable)
 ├── Set[A]                   immutable sets, (A) -> bool
 │   ├── HashSet[A]           by hash; what {a, b} and Set(...) build
 │   ├── SeqSet[A]            in insertion order
@@ -898,7 +894,6 @@ pending.prepend("fetch")
 while pending.nonEmpty() do run(pending.removeHead())
 ```
 
-<<<<<<< HEAD
 ## Priority queues
 
 `avin.collections.mutable.PriorityQueue[T]` is a mutable binary heap: elements go in in any order
@@ -928,7 +923,6 @@ changes made while it runs. `toSortedVector()` gives the elements in the order `
 leaving the queue as it is. Elements the comparison finds equal come out in no promised order; the
 queue is not stable.
 
-=======
 ## Queue
 
 `Queue[+T]` is an immutable first-in, first-out sequence. `Queue(1, 2, 3)` has 1 at its front and
@@ -951,7 +945,6 @@ val jobs = Queue("build", "test")
 val (next, rest) = jobs.enqueue("deploy").dequeue()
 ```
 
->>>>>>> origin/stdlib-queue
 ## Sorting
 
 Every sequence sorts into a new one, and the mutable sequences also sort in place. A comparison is
