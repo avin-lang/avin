@@ -118,6 +118,122 @@ trait Iterator[+A]: Iterable[A]
     // Each element paired with its position, counted from 0.
     zipWithIndex() -> Iterator[(A, int)] = IndexedIterator(self, 0)
 
+// More lazy transformations of an iterator. Each answers an iterator that reads its source only as far
+// as its own `hasNext()` and `next()` ask, as `map` and the rest above do, and shares the source.
+// Being added to `Iterator`, they are found before the forms every `Iterable` has, which make
+// vectors.
+impl[T] Iterator[T]
+    // The elements followed by those of `other`, whose iterator is asked for only once these are
+    // used up.
+    ++[W >: T](other: Iterable[W]) -> Iterator[W] = JoinedIterator[W](self, other, None)
+
+    // The same as `++`.
+    concat[W >: T](other: Iterable[W]) -> Iterator[W] = JoinedIterator[W](self, other, None)
+
+    // `initial`, then each partial result of folding the elements with `f` from `initial`: one more
+    // than there are elements. `f` is called on an element as the result after it is read.
+    scanLeft[B](initial: B, f: (B, T) -> B) -> Iterator[B] = ScannedIterator(self, initial, f, false)
+
+    // Vectors of `size` consecutive elements, in order, the last holding what remains when it is
+    // fewer. A size below 1 traps.
+    grouped(size: int) -> Iterator[Vector[T]]
+        if size < 1 then fail("group size is not positive")
+        WindowIterator(self, size, size, None, None)
+
+    // Vectors of `size` consecutive elements starting at every `step`th one, in order, up to the
+    // first that reaches the last element, which holds what remains when it is fewer; a source
+    // shorter than `size` gives one window of all of it, and an empty one none. A size or step below
+    // 1 traps. Each window is read when it is asked for, and no element is held beyond the window.
+    sliding(size: int, step: int = 1) -> Iterator[Vector[T]]
+        if size < 1 then fail("window size is not positive")
+        if step < 1 then fail("window step is not positive")
+        WindowIterator(self, size, step, None, None)
+
+    // The elements with each one equal to an earlier one left out.
+    distinct() -> Iterator[T] = DistinctIterator(self, x -> x, Set.empty[T](), None)
+
+    // The elements with each one whose `key` equals an earlier one's left out; `key` is called once
+    // for each element read.
+    distinctBy[K](key: (T) -> K) -> Iterator[T] = DistinctIterator(self, key, Set.empty[K](), None)
+
+    // Pairs as `zip` makes them, as many as the longer side has: where these elements have run out
+    // the pair holds `thisElement`, and where `other`'s have, `thatElement`.
+    zipAll[U](other: Iterable[U], thisElement: T, thatElement: U) -> Iterator[(T, U)] =
+        ZippedAllIterator(self, other.iterator(), thisElement, thatElement)
+
+    // The elements followed by as many copies of `element` as make `total` of them; just the
+    // elements when there are already `total` or more.
+    padTo(total: int, element: T) -> Iterator[T] = PaddedIterator(self, total, element, 0)
+
+    // The same elements, `f` being called with each as it is read.
+    tapEach(f: (T) -> unit) -> Iterator[T] = TappedIterator(self, f)
+
+    // The same elements, through an iterator that can look at the next one without moving past it.
+    buffered() -> BufferedIterator[T] = BufferedIterator(self, None)
+
+// An iterator of collections joins their elements lazily: `flatten()` reads the next collection only
+// once the one before it is used up.
+impl[T] Iterator[Iterable[T]]
+    flatten() -> Iterator[T] = FlatMappedIterator(self, x -> x, None)
+
+// An iterator that can look at its next element without moving past it. `peek()` answers the element
+// `next()` would, reading it from the source when it has not already, and traps when none is left;
+// `peekOption()` answers `Some` of it, or `None`.
+class BufferedIterator[A](private val source: Iterator[A], private var held: Option[A]): Iterator[A]
+    override hasNext() -> bool = held.isDefined() || source.hasNext()
+
+    override next() -> A = held match
+        Some(x) ->
+            held = None
+            x
+        None -> source.next()
+
+    peekOption() -> Option[A]
+        if held.isEmpty() && source.hasNext() then held = Some(source.next())
+        held
+
+    peek() -> A = peekOption() match
+        Some(x) -> x
+        None -> fail("peek on an exhausted iterator")
+
+// Iterators made from nothing but a value or a function. Each is lazy: an element is computed when it
+// is read, and an endless one is used through `take`, `takeWhile` and the other methods that stop.
+object Iterator
+    // An iterator with no elements.
+    empty[T]() -> Iterator[T] = EmptyIterator[T]()
+
+    // An iterator of the one element `element`.
+    single[T](element: T) -> Iterator[T] = SingleIterator(element, false)
+
+    // The endless iterator of `start`, `f(start)`, `f(f(start))` and so on, each call of `f` made when
+    // its result is read.
+    iterate[T](start: T, f: (T) -> T) -> Iterator[T] = IteratedIterator(start, f, false)
+
+    // The elements `f` gives from `state`: while `f` of the state is `Some((element, next))`, the
+    // element is given and `next` becomes the state; the first `None` ends it. `f` is called when
+    // the iterator is asked whether another element remains.
+    unfold[T, S](state: S, f: (S) -> Option[(T, S)]) -> Iterator[T] = UnfoldedIterator(state, f, None, false)
+
+    // The endless iterator of the values of `element`, which is evaluated once for each element read.
+    continually[T](element: -> T) -> Iterator[T] = ContinualIterator(() -> element)
+
+    // The endless iterator of `start`, `start + 1`, `start + 2` and so on, of any integer type. Each
+    // element is computed when it is read, so an addition that overflows traps only when the element
+    // past the greatest value is asked for.
+    from[T: Integer](start: T) -> Iterator[T] = CountingIterator(start, T(1), false)
+
+    // The endless iterator of `start`, `start + step`, `start + 2 * step` and so on; a negative
+    // `step` counts down. Overflow traps as `from(start)`'s does.
+    from[T: Integer](start: T, step: T) -> Iterator[T] = CountingIterator(start, step, false)
+
+    // An iterator of `count` elements, each the value of `element`, which is evaluated when the
+    // element is read; empty when `count` is not positive.
+    fill[T](count: int, element: -> T) -> Iterator[T] = ContinualIterator(() -> element).take(count)
+
+    // An iterator of `count` elements, the one at `i` being `f(i)`, computed when it is read; empty
+    // when `count` is not positive.
+    tabulate[T](count: int, f: (int) -> T) -> Iterator[T] = (0 ..< count).iterator().map(f)
+
 // Every collection and iterator has these, written once here over `iterator()`. Each traverses the
 // elements in iteration order and, on an iterator, consumes it. A type with a faster way to answer
 // one keeps its own method of the same name and parameter types, which is found first.
@@ -328,6 +444,50 @@ impl[T] Iterable[T]
         for x in iterator() do b.addOne(x)
         b.result()
 
+    // `initial`, then each partial result of `foldLeft(initial, f)`, in order: one more than there
+    // are elements.
+    scanLeft[B](initial: B, f: (B, T) -> B) -> Vector[B] = iterator().scanLeft(initial, f).toVector()
+
+    // The elements, `f` having been called with each in order.
+    tapEach(f: (T) -> unit) -> Vector[T]
+        val b = Vector.newBuilder[T]()
+        for x in iterator()
+            f(x)
+            b.addOne(x)
+        b.result()
+
+    // The values of the `Left`s `f` makes of the elements and those of the `Right`s, each in order.
+    partitionMap[A, B](f: (T) -> Either[A, B]) -> (Vector[A], Vector[B])
+        val lefts = Vector.newBuilder[A]()
+        val rights = Vector.newBuilder[B]()
+        for x in iterator()
+            f(x) match
+                Left(a) -> lefts.addOne(a)
+                Right(b) -> rights.addOne(b)
+        (lefts.result(), rights.result())
+
+    // The elements before the first that does not satisfy `p`, and the rest, in one traversal; `p`
+    // is not called after it first fails.
+    span(p: (T) -> bool) -> (Vector[T], Vector[T]) = spanInto(self, p, Vector.newBuilder[T](), Vector.newBuilder[T]())
+
+    // Vectors of `size` consecutive elements, as an iterator's `grouped` makes them. A size below 1
+    // traps.
+    grouped(size: int) -> Iterator[Vector[T]] = iterator().grouped(size)
+
+    // Windows of `size` elements every `step`, as an iterator's `sliding` makes them. A size or step
+    // below 1 traps.
+    sliding(size: int, step: int = 1) -> Iterator[Vector[T]] = iterator().sliding(size, step)
+
+    // The elements followed by those of `other`.
+    concat[W >: T](other: Iterable[W]) -> Vector[W] = joinedInto[W, Vector[W]](self, other, Vector.newBuilder[W]())
+
+// A collection of collections flattens into one vector of their elements, in order.
+impl[T] Iterable[Iterable[T]]
+    flatten() -> Vector[T]
+        val b = Vector.newBuilder[T]()
+        for xs in iterator() do b.addAll(xs)
+        b.result()
+
 // Ordered elements have a greatest and a least.
 impl[T: Ord] Iterable[T]
     // The greatest element, the first of equal ones, or `None` when there are none.
@@ -528,3 +688,174 @@ private class IndexedIterator[A](source: Iterator[A], private var index: int): I
         val i = index
         index += 1
         (x, i)
+
+// Reads `first`, then the iterator of `second`, which it asks for once `first` is used up.
+private class JoinedIterator[A](first: Iterator[A], second: Iterable[A], private var rest: Option[Iterator[A]]): Iterator[A]
+    private remaining() -> Iterator[A] = rest match
+        Some(it) -> it
+        None ->
+            if first.hasNext() then return first
+            val it = second.iterator()
+            rest = Some(it)
+            it
+
+    override hasNext() -> bool = remaining().hasNext()
+
+    override next() -> A = remaining().next()
+
+// Gives `acc` first, then `f` of it and each source element in turn.
+private class ScannedIterator[A, B](source: Iterator[A], private var acc: B, f: (B, A) -> B, private var started: bool): Iterator[B]
+    override hasNext() -> bool = !started || source.hasNext()
+
+    override next() -> B
+        if started then acc = f(acc, source.next()) else started = true
+        acc
+
+// The windows of `sliding` and `grouped`. `last` is the window given most recently and `pending` the
+// next one once `hasNext()` has read it; a window shorter than `size`, or a step that finds no new
+// element, ends them.
+private class WindowIterator[A](source: Iterator[A], size: int, step: int, private var last: Option[Vector[A]], private var pending: Option[Vector[A]]): Iterator[Vector[A]]
+    private var done = false
+
+    // Adds up to `n` elements of the source to `b`, answering how many there were.
+    private readInto(b: Builder[A, Vector[A]], n: int) -> int
+        var read = 0
+        while read < n && source.hasNext()
+            b.addOne(source.next())
+            read += 1
+        read
+
+    private following() -> Option[Vector[A]]
+        val b = Vector.newBuilder[A]()
+        last match
+            None ->
+                if readInto(b, size) == 0 then return None
+            Some(previous) ->
+                if previous.length() < size then return None
+                if step <= size
+                    b.addAll(previous.drop(step))
+                    if readInto(b, step) == 0 then return None
+                else
+                    var skipped = size
+                    while skipped < step
+                        if !source.hasNext() then return None
+                        source.next()
+                        skipped += 1
+                    if readInto(b, size) == 0 then return None
+        Some(b.result())
+
+    override hasNext() -> bool
+        if pending.isDefined() then return true
+        if done then return false
+        pending = following()
+        if pending.isEmpty() then done = true
+        pending.isDefined()
+
+    override next() -> Vector[A]
+        if !hasNext() then fail("next on an exhausted iterator")
+        val window = pending match
+            Some(w) -> w
+            None -> fail("next on an exhausted iterator")
+        pending = None
+        last = Some(window)
+        window
+
+// Holds the next element whose key is not in `seen` once `hasNext()` has found it.
+private class DistinctIterator[A, K](source: Iterator[A], key: (A) -> K, private var seen: Set[K], private var found: Option[A]): Iterator[A]
+    override hasNext() -> bool
+        while found.isEmpty() && source.hasNext()
+            val x = source.next()
+            val k = key(x)
+            if !seen.contains(k)
+                seen = seen.incl(k)
+                found = Some(x)
+        found.isDefined()
+
+    override next() -> A
+        hasNext()
+        found match
+            Some(x) ->
+                found = None
+                x
+            None -> fail("next on an exhausted iterator")
+
+private class ZippedAllIterator[A, B](left: Iterator[A], right: Iterator[B], thisElement: A, thatElement: B): Iterator[(A, B)]
+    override hasNext() -> bool = left.hasNext() || right.hasNext()
+
+    override next() -> (A, B)
+        if !hasNext() then fail("next on an exhausted iterator")
+        val x = if left.hasNext() then left.next() else thisElement
+        val y = if right.hasNext() then right.next() else thatElement
+        (x, y)
+
+// Counts the elements given, up to `total`, and gives `element` while the count is short of it once
+// the source is used up.
+private class PaddedIterator[A](source: Iterator[A], total: int, element: A, private var given: int): Iterator[A]
+    override hasNext() -> bool = given < total || source.hasNext()
+
+    override next() -> A
+        val x = if source.hasNext() then source.next() elif given < total then element else fail("next on an exhausted iterator")
+        if given < total then given += 1
+        x
+
+private class TappedIterator[A](source: Iterator[A], f: (A) -> unit): Iterator[A]
+    override hasNext() -> bool = source.hasNext()
+
+    override next() -> A
+        val x = source.next()
+        f(x)
+        x
+
+private class EmptyIterator[A](): Iterator[A]
+    override hasNext() -> bool = false
+
+    override next() -> A = fail("next on an exhausted iterator")
+
+private class SingleIterator[A](element: A, private var used: bool): Iterator[A]
+    override hasNext() -> bool = !used
+
+    override next() -> A
+        if used then fail("next on an exhausted iterator")
+        used = true
+        element
+
+// Gives `current`, then replaces it by `f` of it before each element after the first.
+private class IteratedIterator[A](private var current: A, f: (A) -> A, private var started: bool): Iterator[A]
+    override hasNext() -> bool = true
+
+    override next() -> A
+        if started then current = f(current) else started = true
+        current
+
+// Holds the element `f` gave once `hasNext()` has asked for it, and stops at the first `None`.
+private class UnfoldedIterator[A, S](private var state: S, f: (S) -> Option[(A, S)], private var found: Option[A], private var done: bool): Iterator[A]
+    override hasNext() -> bool
+        if found.isDefined() then return true
+        if done then return false
+        f(state) match
+            Some((x, next)) ->
+                found = Some(x)
+                state = next
+            None -> done = true
+        found.isDefined()
+
+    override next() -> A
+        hasNext()
+        found match
+            Some(x) ->
+                found = None
+                x
+            None -> fail("next on an exhausted iterator")
+
+private class ContinualIterator[A](element: () -> A): Iterator[A]
+    override hasNext() -> bool = true
+
+    override next() -> A = element()
+
+// Gives `current`, then adds `step` to it before each element after the first.
+private class CountingIterator[T: Integer](private var current: T, step: T, private var started: bool): Iterator[T]
+    override hasNext() -> bool = true
+
+    override next() -> T
+        if started then current = current + step else started = true
+        current
