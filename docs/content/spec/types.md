@@ -66,6 +66,27 @@ has every integer operation and conversion ([Bounds](generics.md#bounds)). A val
 `long` renders through it, at no cost for widths up to 64 bits; a wider one renders in chunks of
 eighteen digits.
 
+**Integer methods.** Every integer type has these methods, from one impl for the whole family, each
+working at the width it is called at (an `i8` stays an `i8`) and trapping, as arithmetic does, when
+a result does not fit:
+
+| Method | Result |
+| --- | --- |
+| `abs()` | The magnitude; traps for `MinValue`, whose magnitude does not fit |
+| `sign()` | `-1`, `0` or `1`, as an `int` at every width |
+| `pow(n)` | The number to the power `n`, an `int`; `x.pow(0)` is `1`, `0.pow(0)` included. Traps when the result does not fit and when `n` is negative |
+| `gcd(o)` | The greatest common divisor, never negative; `0.gcd(0)` is `0`. Traps only when it is `MinValue`'s magnitude, as in `MinValue.gcd(0)` |
+| `lcm(o)` | The least positive common multiple, `0` when either is `0`; traps when it does not fit |
+| `floorDiv(o)`, `floorMod(o)` | The quotient rounded towards negative infinity, and the remainder that takes the divisor's sign, so `a == a.floorDiv(d) * d + a.floorMod(d)`. They trap where `/` and `%` do: a zero divisor, and `MinValue.floorDiv(-1)` |
+| `bitCount()` | The number of one bits of the two's-complement form at the width: `(-1).bitCount()` is `32` for an `int` |
+| `leadingZeros()`, `trailingZeros()` | The zero bits above the highest one and below the lowest one, an `int`; the width for zero. `leadingZeros()` is `0` for a negative number |
+| `isPowerOfTwo()` | Whether the number is `1`, `2`, `4`, and so on; never for zero or a negative number |
+| `toRadix(r)` | The digits in radix `r` from 2 to 36, lower case, with a `-` for a negative number and no prefix, as `f"%x"` and `f"%b"` write them; any other radix traps |
+
+The bitwise operators `&`, `|`, `^` and the shifts also work on a type parameter bounded by
+`Integer`, as the machine's operators at each width, with both operands of one type: `x >> T(1)`.
+The methods above are not members of `Integer`, so generic code cannot call them on a `T`.
+
 ## byte
 
 `byte` is an octet with a value from 0 to 255. It is the element of binary data — file contents,
@@ -155,6 +176,22 @@ most the largest `int` bytes.
 | `toInt()`, `toLong()` | The number written in decimal: an optional `-` or `+`, then one or more ASCII digits and nothing else; a trap, `For input string: "…"`, otherwise or when it does not fit the type |
 | `toReal()` | The number written as a decimal fraction, correctly rounded: an optional sign, digits with an optional point, an optional exponent (`3.25`, `-.5`, `1e10`); a trap, as `toInt`'s, for anything else, including white space, `nan`, `inf`, hexadecimal, and a number too large to be finite |
 | `toIntOption()`, `toLongOption()`, `toRealOption()` | `Some` of the number `toInt`, `toLong` or `toReal` reads, and `None` where it would trap |
+| `toInt(radix)`, `toLong(radix)` | As `toInt()` and `toLong()` with digits of base `radix`, 2 to 36: `0`–`9`, then `a`–`z` in either case; the same trap for text that is not such a number or does not fit, and a trap for a `radix` outside 2 to 36 |
+| `toIntOption(radix)`, `toLongOption(radix)` | `Some` of the number the radix form reads, and `None` where its text would trap; a `radix` outside 2 to 36 still traps, being the caller's mistake and not the text's |
+| `toBool()`, `toBoolOption()` | `true` for the text `true`, `false` for `false`, exactly (no other case, no white space); `toBool` traps, as `toInt` does, on any other text and `toBoolOption` answers `None` |
+| `map(f)`, `flatMap(f)` | A string of `f` applied to each character: `f` answers a `char` for `map` and a `string` for `flatMap`, and the results are joined in order |
+| `filter(p)`, `filterNot(p)` | The characters that do, or do not, satisfy `p`, in order |
+| `foreach(f)` | Calls `f` on each character, in order |
+| `exists(p)`, `forall(p)` | Whether some, or every, character satisfies `p`; false and true for the empty string |
+| `find(p)` | `Some` of the first character satisfying `p`, or `None` |
+| `takeWhile(p)`, `dropWhile(p)` | The longest prefix whose characters all satisfy `p`, and the string without it |
+| `span(p)`, `partition(p)` | A pair of strings: the longest prefix satisfying `p` and the rest; the characters that satisfy `p` and those that do not |
+| `splitAt(n)` | The pair of the first `n` characters and the rest; `n` is clamped as `take`'s is |
+| `tail()`, `init()` | All but the first, and all but the last, character; each traps on the empty string |
+| `charIterator()` | The characters as an `Iterator[char]` that decodes one character for each `next()`, making no vector |
+| `split(c)`, `split(sep, limit)`, `split(c, limit)` | `split` with a `char` separator; and with at most `limit` pieces, the last holding the rest of the text with its separators. A `limit` of 0 or less sets none, 1 gives the whole string, and an empty string separator traps |
+| `stripLineEnd()` | Without one `\n` or `\r\n` at its end; a lone `\r`, or no terminator, leaves it unchanged |
+| `compareIgnoreCase(o)` | The sign of the comparison after each character's simple lower-case mapping: negative, zero or positive |
 
 ```text
 val word = "café"

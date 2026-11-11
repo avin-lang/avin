@@ -6200,6 +6200,129 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   act on. Alternatives: compare instance by instance before emission (needs the clean build's
   instances matched to the cached build's).
 
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-string`): **String
+  character-wise and parsing methods.** Choices the spec did not settle, in [`types.md`](/spec/types/#string):
+  - **`toBool` is exact.** Only `"true"` and `"false"`; `toBool` traps with the number-parse
+    message (`For input string: "…"`) on anything else, `toBoolOption` answers `None`. *Why:* a
+    parse that accepts `"True"`, `"1"` or `"yes"` hides data errors, and the exact form is the one
+    every program can state. *Alternatives:* case-insensitive; also `"1"`/`"0"`.
+  - **A `radix` outside 2 to 36 traps, in the `Option` forms too.** *Why:* a bad radix is the
+    caller's bug, not bad input, so `None` would hide it. *Alternative:* `None` from the `Option`
+    forms.
+  - **Radix digits are ASCII `0`–`9` and `a`–`z`, either case**, with the optional `+`/`-` sign of
+    the decimal forms, and no prefix (`"0x10".toInt(16)` is not a number). *Alternatives:* accept a
+    `0x`/`0b` prefix where it matches the radix.
+  - **`split(sep, limit)`: `limit` is the most pieces; the last holds the remaining text.** A
+    `limit` of 0 or less means no limit, 1 returns the whole string as one piece. *Why:* the
+    reading that needs no special negative case beyond "no limit". *Alternatives:* a limit of 0
+    dropping trailing empty pieces; a negative limit trapping.
+  - **`stripLineEnd` removes one terminator, `\n` or `\r\n`, never a lone `\r`**, agreeing with
+    `lines()`, which does not end a line at a `\r` either. *Alternative:* also a lone `\r`.
+  - **`compareIgnoreCase` compares the two after `toLowerCase`**, as `equalsIgnoreCase` equates
+    them, so its sign is `compare` of the lower-cased strings. *Alternative:* comparing character by
+    character after upper-casing.
+  - **`charIterator()` is a lazy `Iterator[char]` reading the string by offset**, with `next()` on
+    an exhausted one trapping like every iterator. `map`/`flatMap`/`filter` on a string answer a
+    `string`, not an iterator, and `tail`/`init` trap on the empty string as `Seq`'s do.
+  Review with the user: whether `toBool` should be this strict, and whether the `Option` forms
+  should answer `None` rather than trap for a radix outside 2 to 36.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-ordering`): **`clamp(x, lo,
+  hi)` is a free function, and `Vector` has no `Ord` yet.** A method
+  `x.clamp(lo, hi)` on every `Ord` type needs `impl[T: Ord] T`, which the checker refuses (an impl
+  adds to a type parameter only where it is bounded by `Integer` alone), so `clamp` is a free
+  function beside `max` and `min`, which are free functions too; it traps where `hi < lo`. Why: it
+  reads like `max`/`min` and needs no language change. Alternatives weighed: widening the blanket
+  impl rule (a language change with a wide reach); a method on `Integer` only (leaves strings,
+  chars and reals without). `impl[T: Ord] Ord for Vector[T]` is refused because `Vector` is an
+  abstract covariant class, whose added methods are variance positions, and `compare(other:
+  Vector[T])` takes `T` in; `ArraySeq` is a final class and has its `Ord`. `Seq[T]` gets no
+  `compare` method. Review with the user: how `Vector` should be `Ord`. The recommendation is that
+  a method a trait impl adds, and no subclass overrides, is called through the static type rather
+  than the method table, which would make `compare` on a covariant abstract class sound; that is a
+  language change, so it waits for the user.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-ordering`): **`Reverse`,
+  `compareBy`, `reverseOrder` and `thenBy` are in `avin` as plain names.**
+  `Reverse` is a `data` type with `Ord` reversed and equality as `T`'s; descending sorts are written
+  with it rather than a `sortedDescending()`. Why: it composes inside tuple keys, which a
+  descending method cannot. Alternatives weighed: `sortedDescending`/`sortByDescending` on `Seq`
+  (do not combine with a second key).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-seq`): **Seq search, slices
+  and combinatorics**, [collections](/spec/collections/):
+  - **`search` answers the first of equal elements.** `Found(i)` is the lowest index holding an
+    element equal to the one searched for, found by a lower-bound halving, so the answer is
+    deterministic. Why: a binary search that stops at the first hit returns whichever duplicate the
+    midpoints reach, which no caller can rely on and a test cannot pin; the lower bound costs the same
+    O(log n) comparisons and makes `Found(i)` and `InsertionPoint(i)` one index (`i` is where the
+    element is or would go, the insertion point of an equal element being its first). Alternatives:
+    any equal element, unspecified (cheaper by at most one comparison, not testable); the last one.
+  - **`search(x, from, until)` holds its window to the sequence** (`until` to `0 .. n`, then `from` to
+    `0 .. until`) rather than trapping, as counts are held (`take`, `drop`) and unlike `slice`, which
+    traps. Why: the window is a bound on where to look, not an index range to read, and an empty or
+    out-of-range one has the clear answer `InsertionPoint` of its edge. Alternative: trap as `slice`
+    does. `searchBy(key, wanted)` is included (the plan marked it optional); it takes the key
+    function first, as `sortBy`'s sibling `distinctBy` does, and `K: Ord`.
+  - **`combinations` and `permutations` are distinct by `equals` and ordered by first appearance.**
+    The classes of equal elements are found with a hash map on the elements (as `distinct` does), so
+    `equals` and `hash` must agree, and the vectors come in dictionary order of the classes' first
+    appearance. Why: the dictionary order is stepped with O(k) or O(n) work and no memory beyond the
+    class counts, and needs no `Ord`. Alternatives: the order of a recursive generation, which differs
+    for a multiset; positions rather than values (every permutation of equal elements, n! of them).
+    `k < 0` or `k > n` gives an empty iterator, `k == 0` and the empty sequence's permutations one
+    empty vector.
+  - **`indexOfSlice` and `lastIndexOfSlice` find the empty slice where the edges allow**: at
+    `max(from, 0)` while that is no further than the length, and at `min(end, n)` while `end >= 0`;
+    `lastIndexOfSlice(slice)` is the form with `end` the length, written as an overload as
+    `lastIndexOf` is. `patch` holds `from` to `0 .. n` and a `replaced` below 0 to 0 rather than
+    trapping, and takes `other` as an `Iterable[W]` with `W >: T`, widening as `++` does.
+    `reduceRightOption` accompanies `reduceRight` as `reduceOption` accompanies `reduce`.
+    Alternative for all: trap on an out-of-range count, as `slice` does for indices.
+  - **`inits()` and `tails()` copy the elements into a vector once and slice it per step**, so each
+    step is O(log n) and the n + 1 vectors share structure; they are lazy iterators, not a vector of
+    vectors. `transpose()` of rows of different lengths traps (the plan's decision), and answers an
+    empty vector, not a vector of empty ones, for no rows; for rows that are all empty it answers
+    empty too.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-math`): **the integer methods are an inherent impl over `Integer`, not
+  members of the trait.** `abs`, `sign`, `pow`, `gcd`, `lcm`, `floorDiv`, `floorMod`, `bitCount`,
+  `leadingZeros`, `trailingZeros`, `isPowerOfTwo` and `toRadix` are written once in
+  `library/avin/integer.avin` as `impl[T: Integer] T`, which the core library may declare. Why: it
+  gives every width the methods with no new trait and no change to the closed bound. The cost: a
+  type parameter bounded by `Integer` sees only the trait's members, so generic code cannot write
+  `x.abs()`. Alternatives weighed: putting the methods in `Integer` as required members (every
+  width implements them, but "no type implements it" then has an exception, and the arithmetic
+  traits would grow by a dozen); leaving them to free functions (`math.abs(x)`, unlike
+  `x.compare(y)`). Review with the user: whether generic code should reach these methods, which
+  means making them members of `Integer`.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-math`): **the bitwise and shift operators work on a type parameter
+  bounded by `Integer`.** `x & y`, `|`, `^`, `<<` and `>>` on a `T: Integer` are the machine's
+  operators at each instance's width, with both operands `T` (`x >> T(1)`); the checker had treated
+  every operator on a type parameter as a call of a method of that name, so `Integer` code had no
+  bit operations at all. Why: the bound is documented as having every integer operation, and the
+  integer methods need them. Alternatives weighed: methods `bitAnd`, `shiftLeft` on `Integer` (a
+  second spelling of what the operators already say); doing the bit work by division and remainder
+  (slower, and unreadable). A `T` with another bound still has them only as methods.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-math`): **choices inside the integer methods.** `pow(n: int)` takes an
+  `int` exponent at every width and traps on a negative one (a fraction is not an integer);
+  `x.pow(0)` is `1` for every `x`, `0.pow(0)` included. `gcd` is never negative and traps only when
+  its value is `MinValue`'s magnitude; `lcm` is `0` when either side is, otherwise positive. `sign`
+  is an `int`, as are `bitCount`, `leadingZeros` and `trailingZeros`, which count at the width
+  (`(-1).bitCount()` is `32`, zero has `width` leading and trailing zeros). `toRadix` writes lower
+  case, a `-` and the magnitude, as `f"%x"` does, with no prefix, and takes `int` from 2 to 36 and
+  traps outside it. Why: each is the usual meaning, the least surprising for a program moving
+  between widths. Alternatives weighed: a `long` exponent (never needed; an `int` is enough for
+  squaring by halves); a `gcd` that keeps a negative sign (an unsigned-looking result is what callers
+  want).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-math`): **`avin.math`
+  additions.** `round(x)` returns a `long`, a tie
+  going away from zero, and converts as `long(x)` does for NaN and out-of-range values; `trunc(x)`
+  returns a `real`, as `floor` and `ceil` do, keeping a negative zero's sign; `ulp` at the greatest
+  finite value is the gap below it (a finite answer rather than infinity); `nextUp` and `nextDown`
+  leave NaN and the infinity they move towards alone. Why: `round` is the one the program usually
+  wants as an integer and `rint` is already the `real` form; the others follow the platform's
+  functions. Alternatives weighed: `round` returning `real` (no saturation story to tell, but the
+  common use then needs `long(round(x))`); `trunc` returning `long` (loses negative zero and the
+  large values). Review with the user: the `round` and `trunc` result types differ, which is
+  unusual to read.
+
 **Deferred**
 
 - Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
