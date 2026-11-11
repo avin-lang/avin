@@ -58,7 +58,8 @@ a decision changes, this page and the chapter change together.
   call a method or use `self`; a parameter's name in them reads the argument.
 - A subclass's fields are its superclass's, in order, then its own. Fields are never overridden.
 - Only public methods can be overridden. An override takes the same parameter types and yields the
-  same result or, for a class result, a subclass of it (covariant results). An override cannot be
+  same result or a type seen as it with no conversion (covariant results; see the Proposed entry
+  on override results below). An override cannot be
   private. A method with type parameters of its own is overridden by one declaring as many, matched
   by position (bounds, once they exist, must match too).
 - An abstract method is a method without a body, allowed only in an `abstract` class; an abstract
@@ -6638,6 +6639,21 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   macros.
 
 ## Proposed
+
+- Proposed (branch `tuple-result-override`): **an override's or an implementation's result may be
+  any type seen as the declared result with no conversion**
+  ([declarations](/spec/declarations/)), the covariant position [generics](/spec/generics/#variance)
+  already names: `-> (Dog, Dog)` overrides `-> (Animal, Animal)`, `-> (HashMap[K, V], HashMap[K, V])`
+  implements `-> (Map[K, V], Map[K, V])`, `-> Option[Dog]` overrides `-> Option[Animal]`,
+  `-> () -> Dog` overrides `-> () -> Animal`, and `-> string` overrides `-> Any`. A result that
+  would need a box (`-> int` for `-> Any`, `-> (int, int)` for `-> (Any, int)`) or that differs at
+  an invariant argument (`Array[Dog]` for `Array[Animal]`) is still refused. Rationale: the chapter
+  said "for a class, a subclass", which refused exactly the shapes the variance rules call
+  subtypes with one representation, so a value returned through the base needs no conversion;
+  the checker now asks the same no-conversion question an element of a covariant collection does.
+  Alternatives weighed: keeping results to classes only (tuples and covariant instances then need
+  a differently named method, as own-kind `partition` met); also boxing a scalar result, which
+  would make an override's call site convert behind a virtual call.
 
 ## Open
 
