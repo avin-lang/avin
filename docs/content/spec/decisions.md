@@ -6200,15 +6200,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   act on. Alternatives: compare instance by instance before emission (needs the clean build's
   instances matched to the cached build's).
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- **String character-wise and parsing methods** (branch `stdlib-string`). Choices the spec did not
-  settle, in [`types.md`](/spec/types/#string):
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-string`): **String
+  character-wise and parsing methods.** Choices the spec did not settle, in [`types.md`](/spec/types/#string):
   - **`toBool` is exact.** Only `"true"` and `"false"`; `toBool` traps with the number-parse
     message (`For input string: "…"`) on anything else, `toBoolOption` answers `None`. *Why:* a
     parse that accepts `"True"`, `"1"` or `"yes"` hides data errors, and the exact form is the one
@@ -6231,7 +6224,10 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - **`charIterator()` is a lazy `Iterator[char]` reading the string by offset**, with `next()` on
     an exhausted one trapping like every iterator. `map`/`flatMap`/`filter` on a string answer a
     `string`, not an iterator, and `tail`/`init` trap on the empty string as `Seq`'s do.
-- **Proposed: `clamp(x, lo, hi)` is a free function, and `Vector` has no `Ord` yet.** A method
+  Review with the user: whether `toBool` should be this strict, and whether the `Option` forms
+  should answer `None` rather than trap for a radix outside 2 to 36.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-ordering`): **`clamp(x, lo,
+  hi)` is a free function, and `Vector` has no `Ord` yet.** A method
   `x.clamp(lo, hi)` on every `Ord` type needs `impl[T: Ord] T`, which the checker refuses (an impl
   adds to a type parameter only where it is bounded by `Integer` alone), so `clamp` is a free
   function beside `max` and `min`, which are free functions too; it traps where `hi < lo`. Why: it
@@ -6240,12 +6236,58 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   chars and reals without). `impl[T: Ord] Ord for Vector[T]` is refused because `Vector` is an
   abstract covariant class, whose added methods are variance positions, and `compare(other:
   Vector[T])` takes `T` in; `ArraySeq` is a final class and has its `Ord`. `Seq[T]` gets no
-  `compare` method. Review with the user: how `Vector` should be `Ord`.
-- **Proposed: `Reverse`, `compareBy`, `reverseOrder` and `thenBy` are in `avin` as plain names.**
+  `compare` method. Review with the user: how `Vector` should be `Ord`. The recommendation is that
+  a method a trait impl adds, and no subclass overrides, is called through the static type rather
+  than the method table, which would make `compare` on a covariant abstract class sound; that is a
+  language change, so it waits for the user.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-ordering`): **`Reverse`,
+  `compareBy`, `reverseOrder` and `thenBy` are in `avin` as plain names.**
   `Reverse` is a `data` type with `Ord` reversed and equality as `T`'s; descending sorts are written
   with it rather than a `sortedDescending()`. Why: it composes inside tuple keys, which a
   descending method cannot. Alternatives weighed: `sortedDescending`/`sortByDescending` on `Seq`
   (do not combine with a second key).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-seq`): **Seq search, slices
+  and combinatorics**, [collections](/spec/collections/):
+  - **`search` answers the first of equal elements.** `Found(i)` is the lowest index holding an
+    element equal to the one searched for, found by a lower-bound halving, so the answer is
+    deterministic. Why: a binary search that stops at the first hit returns whichever duplicate the
+    midpoints reach, which no caller can rely on and a test cannot pin; the lower bound costs the same
+    O(log n) comparisons and makes `Found(i)` and `InsertionPoint(i)` one index (`i` is where the
+    element is or would go, the insertion point of an equal element being its first). Alternatives:
+    any equal element, unspecified (cheaper by at most one comparison, not testable); the last one.
+  - **`search(x, from, until)` holds its window to the sequence** (`until` to `0 .. n`, then `from` to
+    `0 .. until`) rather than trapping, as counts are held (`take`, `drop`) and unlike `slice`, which
+    traps. Why: the window is a bound on where to look, not an index range to read, and an empty or
+    out-of-range one has the clear answer `InsertionPoint` of its edge. Alternative: trap as `slice`
+    does. `searchBy(key, wanted)` is included (the plan marked it optional); it takes the key
+    function first, as `sortBy`'s sibling `distinctBy` does, and `K: Ord`.
+  - **`combinations` and `permutations` are distinct by `equals` and ordered by first appearance.**
+    The classes of equal elements are found with a hash map on the elements (as `distinct` does), so
+    `equals` and `hash` must agree, and the vectors come in dictionary order of the classes' first
+    appearance. Why: the dictionary order is stepped with O(k) or O(n) work and no memory beyond the
+    class counts, and needs no `Ord`. Alternatives: the order of a recursive generation, which differs
+    for a multiset; positions rather than values (every permutation of equal elements, n! of them).
+    `k < 0` or `k > n` gives an empty iterator, `k == 0` and the empty sequence's permutations one
+    empty vector.
+  - **`indexOfSlice` and `lastIndexOfSlice` find the empty slice where the edges allow**: at
+    `max(from, 0)` while that is no further than the length, and at `min(end, n)` while `end >= 0`;
+    `lastIndexOfSlice(slice)` is the form with `end` the length, written as an overload as
+    `lastIndexOf` is. `patch` holds `from` to `0 .. n` and a `replaced` below 0 to 0 rather than
+    trapping, and takes `other` as an `Iterable[W]` with `W >: T`, widening as `++` does.
+    `reduceRightOption` accompanies `reduceRight` as `reduceOption` accompanies `reduce`.
+    Alternative for all: trap on an out-of-range count, as `slice` does for indices.
+  - **`inits()` and `tails()` copy the elements into a vector once and slice it per step**, so each
+    step is O(log n) and the n + 1 vectors share structure; they are lazy iterators, not a vector of
+    vectors. `transpose()` of rows of different lengths traps (the plan's decision), and answers an
+    empty vector, not a vector of empty ones, for no rows; for rows that are all empty it answers
+    empty too.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 

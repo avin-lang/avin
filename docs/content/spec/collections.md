@@ -251,6 +251,34 @@ array of the type the call asks for.
 | `lastIndexOf(x)`, `lastIndexWhere(p)`, each also `(…, end)` | `int`, the last index at or before `end`; -1 when none | | O(n), by `reverseIterator()` |
 | `startsWith(prefix)`, `endsWith(suffix)` | `bool` | | O(m), plus `length()` for `endsWith` |
 | `sameElements(other)` | `bool`: as many, each equal in order | | O(min(n, m)) |
+| `corresponds(other, p)` | `bool`: as many, and `p` holds of each pair | | O(min(n, m)) |
+| `indexOfSlice(slice, from = 0)` | `int`, the first index at or after `from` where `slice` occurs; -1 when none; an empty `slice` occurs at `from` while `from <= n` | | O(n · m) |
+| `lastIndexOfSlice(slice)`, `lastIndexOfSlice(slice, end)` | `int`, the last index at or before `end` where `slice` occurs; -1 when none | | O(n · m) |
+| `containsSlice(slice)` | `bool`; the empty slice is in every sequence | | O(n · m) |
+| `patch(from, other, replaced)` | `Vector[W]` (`W >: T`): `replaced` elements from `from` taken out and `other` put in; `from` held to `0 .. n`, `replaced` below 0 is 0 and past the end takes the rest | | O(n + m) |
+| `segmentLength(p, from = 0)` | `int`, the run of elements satisfying `p` from `from` (below 0 is 0) | | O(run) |
+| `findLast(p)` | `Option[T]`, by `reverseIterator()` | | O(n) |
+| `scanRight(initial, f)` | `Vector[B]`: `f(x0, f(x1, … initial))` first, `initial` last, n + 1 | | O(n) |
+| `reduceRight(f)`, `reduceRightOption(f)` | `f(x0, f(x1, … f(x(n-2), x(n-1))))`; `reduceRight` traps when empty, the `Option` form answers `None` | | O(n) |
+| `inits()`, `tails()` | `Iterator[Vector[T]]`: the n + 1 prefixes (longest first, the empty one last) or suffixes (likewise) | | O(n) to copy the elements, then O(log n) a vector |
+| `combinations(k)` | `Iterator[Vector[T]]`: each distinct selection of `k` elements once; `k` of 0 gives `[]` once, `k` below 0 or above n none | | O(k) a step after an O(n) set-up |
+| `permutations()` | `Iterator[Vector[T]]`: each distinct order of all the elements once; the empty sequence gives `[]` once | | O(n) a step after an O(n) set-up |
+| `search(x)`, `search(x, from, until)` (`T: Ord`) | `SearchResult`: `Found(i)` or `InsertionPoint(i)`, see [sorting](#sorting) | | O(log n) comparisons |
+| `searchBy(key, wanted)` | `SearchResult`, the sequence in ascending order of `key` | | O(log n) calls of `key` |
+
+On a `Seq[Seq[T]]`, `transpose()` answers the `Vector[Vector[T]]` of the columns: the first elements of
+the rows, then the seconds, and so on. There are no columns for no rows, and rows that are not all as
+long as the first trap. On a `Seq[(A, B, C)]`, `unzip3()` answers `(Vector[A], Vector[B], Vector[C])`
+as `unzip()` answers two.
+
+**`combinations` and `permutations` are distinct by `equals`, and lazy.** Two elements are one where
+`==` says so, so `[1, 1, 2].combinations(2)` is `[1, 1]` and `[1, 2]`, and `[1, 1, 2].permutations()`
+is `[1, 1, 2]`, `[1, 2, 1]` and `[2, 1, 1]`; the elements need no `Hash` or `Ord`. They come as a
+dictionary lists words, the elements ranked by their first appearance in the receiver, and each
+vector is made when the iterator is stepped, so the first few of `(1 .. 20).permutations()` cost
+nothing for the other twenty factorial. The iterator holds the classes of the elements as they were
+when it was made, so a buffer that changes afterwards does not change it. A count is the multiset
+formula: `[a, a, b, b, c].permutations()` has 5! / (2! · 2!) = 30.
 
 Each also has `length()`, `apply(i)`, `lift(i)` (the element as an `Option`), `head()`, `last()` and
 their `Option` forms read by index, `contains`, `foldRight`, `reverseIterator()`, the sorts
@@ -260,6 +288,11 @@ their `Option` forms read by index, `contains`, `foldRight`, `reverseIterator()`
 [1, 2, 3, 4, 5].sliding(3, 2).toVector()     // [[1, 2, 3], [3, 4, 5]]
 [1, 2, 3, 4, 5].grouped(2).toVector()        // [[1, 2], [3, 4], [5]]
 (1 .. 4).scanLeft(0, (s, x) -> s + x)        // [0, 1, 3, 6, 10]
+(1 .. 3).scanRight(0, (x, s) -> x + s)       // [6, 5, 3, 0]
+[1, 2, 3, 1, 2].indexOfSlice([2, 3])         // 1
+[1, 2, 3].patch(1, [9, 9, 9], 1)             // [1, 9, 9, 9, 3]
+[1, 2, 3].tails().toVector()                 // [[1, 2, 3], [2, 3], [3], []]
+[[1, 2, 3], [4, 5, 6]].transpose()           // [[1, 4], [2, 5], [3, 6]]
 val l: List[int] = [1, 2, 3]
 val s: Seq[int] = l
 l.takeWhile(x -> x < 3)                      // a List: [1, 2]
@@ -804,6 +837,24 @@ and traps where `hi < lo`. For `sortWith`, `compareBy(key)` is the comparison of
 keys, `reverseOrder(cmp)` the same comparison the other way round, and `thenBy(first, second)` the
 first, with the second deciding where the first finds two values equal:
 `people.sortWith(thenBy(reverseOrder(compareBy(p -> p.age)), compareBy(p -> p.name)))`.
+
+**A sequence in ascending order is searched by halving.** On a `Seq[T]` with `T: Ord`,
+`search(x)` answers a `SearchResult`: `Found(i)` where `i` is the index of the **first** element equal
+to `x`, or `InsertionPoint(i)` where `i` is the index `x` would have if put in, that of the first
+element ordering after it, or the length. It takes O(log n) comparisons, and an index read by
+position is O(log n) on a vector, an array or a range. `search(x, from, until)` looks only at that
+window, the two held to the sequence as a count is, and answers indices of the whole sequence.
+`searchBy(key, wanted)` is the same for a sequence in ascending order of `key`, comparing `key` of
+an element with `wanted` (a `K: Ord`). A sequence that is not in order gives some answer but not a
+meaningful one. `SearchResult` is a data type, so `==` and `match` work on it.
+
+```text
+val xs = [1, 3, 3, 5]
+xs.search(3)      // Found(1)
+xs.search(4)      // InsertionPoint(3)
+xs.search(9)      // InsertionPoint(4)
+xs.search(3, 2, 4) // Found(2)
+```
 
 Strings order by code point (their bytes, which in UTF-8 order the same), so every capital comes
 before every small letter; reals order as IEEE 754 does. Sorting elements without `Ord` by
