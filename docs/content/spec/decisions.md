@@ -6072,14 +6072,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   another unit moves it; and a small function copied into its callers' units at `-O2` makes an edit
   to it recompile those units too.
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (branch `manifest-avin-version`): **a package names the least Avin it builds with**
+- Settled on the user's delegation 2026-11-11 (built on branch `manifest-avin-version`): **a package names the least Avin it builds with**
   ([the manifest](/spec/packages/#the-manifest), [the Avin a package
   needs](/spec/packages/#the-avin-a-package-needs)). `avin = "0.0.18"` in the `package` block, a
   version, met by that Avin and every later one, compared number by number (0.0.9 before 0.0.18).
@@ -6104,6 +6097,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   checking only the root package (a dependency's need is the common case, as with `cairo`). Review
   with the user whether `avin new` should write the running version (it ties a new package to the
   Avin that made it, which may be later than the package needs).
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
