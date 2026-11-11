@@ -46,7 +46,8 @@ allowed and does nothing.
 and `byte.MinValue` (0). `char.MaxValue` is U+10FFFF and `char.MinValue` U+0000. `real` has `MaxValue`
 (the greatest finite value), `MinValue` (the least, its negation), `MinPositiveValue` (the least positive
 value, subnormal), `PositiveInfinity`, `NegativeInfinity` and `NaN`. They are written on the type, are
-folded at compile time, and have the type they are written on. Any other name written on one of these
+folded at compile time, and have the type they are written on; a type parameter bounded by `Integer`
+has `MinValue` and `MaxValue` too, folded at each instance's width ([generics](/spec/generics/)). Any other name written on one of these
 types is an error.
 
 **Arithmetic that overflows traps.** `+`, `-`, `*`, unary `-`, `++` and `--` trap when the

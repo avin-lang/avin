@@ -1125,7 +1125,8 @@ Settled by the user on 2026-11-04:
   `MaxValue`, `MinValue`, `MinPositiveValue`, `PositiveInfinity`, `NegativeInfinity` and `NaN`, all
   compile-time constants. Narrowing integer conversions (`i8(x)`, `int(l)`, `T(n)`, and a byte or char to
   a narrower integer) trap when the value does not fit; real-to-integer still saturates. The wrapping
-  form, `i8.wrap(x)` (spelling proposed below), keeps the low bits. Not yet: the limits of a type parameter bounded by `Integer` (`T.MaxValue`).
+  form, `i8.wrap(x)` (spelling proposed below), keeps the low bits. A type parameter bounded by `Integer` has the limits too, `T.MaxValue` and
+  `T.MinValue`, each instance's own ([generics](/spec/generics/)).
 - Settled by the user 2026-11-04: Nested data types ([generics](/spec/generics/#polymorphic-recursion)): a data type naming itself
   at a larger instance in its fields (`Deeper(inner: Tree[Nest[T]])` in `Tree[T]`) is rejected at
   the type as polymorphic recursion, even where no code compares, hashes or shows it, since every
