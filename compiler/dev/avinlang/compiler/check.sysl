@@ -16024,6 +16024,13 @@ private refuse_unmet_conformance(c: *Checker, at: Span, receiver_type: &Type, m:
     c.note(unit_of(c), at, s"`${symbol.decl.name}` is a method of `${c.classes[k].name}`, which ${type_name(t)} does not implement")
     true
 
+// A local or a parameter converted where it is the receiver, as a union with a scalar member is to
+// the trait its method is found on, is read where the call is made like the variable itself, so
+// lowering sees the union and can call its member's method by its tag.
+private boxed_variable(receiver: &TExpr) -> bool = receiver.kind match
+    Box(inner) -> inner.kind is Local(_) || inner.kind is Param(_)
+    _ -> false
+
 // A method call passes the receiver first. The class's type arguments come from the receiver's
 // type, and the method's own, which follow them, are written or inferred as for a function.
 private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m: usize, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], direct: bool, checked: Buf[Option[&TExpr]]) -> &TExpr
@@ -16036,7 +16043,14 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
     // The receiver is evaluated before the arguments, so one that is computed is held while they are.
     var setup: Option[&TExpr] = None
     var object = receiver
-    if !(receiver.kind is Local(_) || receiver.kind is Param(_) || receiver.kind is TypeReceiver)
+    if receiver.kind is Box(inner) && *zonk(c, inner.ty) is Union(_)
+        // A union converted to the type its method is found on is held as the union, and converted
+        // where the call is made.
+        if !boxed_variable(receiver)
+            val held = hidden_local(c, inner.ty)
+            setup = Some(TExpr(receiver.span, Unit, Let(held, inner)))
+            object = TExpr(receiver.span, receiver.ty, Box(TExpr(inner.span, inner.ty, Local(held))))
+    elif !(receiver.kind is Local(_) || receiver.kind is Param(_) || receiver.kind is TypeReceiver)
         val held = hidden_local(c, receiver.ty)
         setup = Some(TExpr(receiver.span, Unit, Let(held, receiver)))
         object = TExpr(receiver.span, receiver.ty, Local(held))

@@ -1439,6 +1439,11 @@ private record_made(l: *Lowering, t: &Type) -> usize
     l.object_records.push(false)
     l.record_index.put(key, index)
     var ancestors: Buf[usize] = buf()
+    // A value kept as a reference to an object is an `Any` as it is, so as a tuple's part it is seen
+    // as an `Any` part: `(string, int)` is an `(Any, int)`. A number or another scalar, and a union
+    // with a scalar member, is not, since an `Any` holds it only boxed.
+    val object = !(*t is AnyType) && mir_type(t) is Some(MRef) && !is_scalar_union(t)
+    if object then ancestors.push(record_of(l, AnyType))
     for up in supertypes(l, t)
         ancestors.push(record_of(l, up))
     var parts: Buf[usize] = buf()
@@ -1446,7 +1451,7 @@ private record_made(l: *Lowering, t: &Type) -> usize
         for item in items
             parts.push(record_of(l, item))
     // A class or data part is seen through what its declarations make it, as a reference both ways.
-    val part_view = if *t is Class(_, _, _) || *t is Data(_, _, _) then ancestors.len() else 0
+    val part_view = if *t is Class(_, _, _) || *t is Data(_, _, _) then ancestors.len() elif object then 1 else 0
     l.records[index] = TypeRecord(name, ancestors, None, None, None, None, keeps_owners(l, t), parts, part_view)
     index
 
@@ -1898,7 +1903,7 @@ private exact(l: *Lowering, t: &Type) -> bool = *t match
     Function(_, _, _) -> false
     Tuple(items) ->
         for item in items
-            if !exact(l, item) then return false
+            if *item is AnyType || !exact(l, item) then return false
         true
     _ -> true
 
@@ -2295,7 +2300,7 @@ private value_machine(t: MirType) -> MirType = if t is MCell(_) then MRef else t
 private union_rendering(l: *Lowering, function: usize, t: &Type, operands: Buf[Operand]) -> Option[Option[Operand]]
     val core = l.program.core
     if core.is(function, "toString")
-        return Some(Some(call_instance(l, library_instance(l, "displayString", AnyType), one(cell_as_any(l, t, operands[0])), machine(l, Str)).unwrap()))
+        return Some(Some(call_instance(l, library_instance(l, "displayString", t), one(operands[0]), machine(l, Str)).unwrap()))
     var name = "display"
     if core.is(function, "debug") then name = "debug"
     elif !core.is(function, "display") then return None
@@ -6391,6 +6396,26 @@ private member_test(l: *Lowering, from: &Type, to: &Type, value: Option[Operand]
             continue_if(l, type_test(l, object, target), fail)
     else continue_if(l, ConstBool(false), fail)
 
+// A tuple type pattern with a union of references among its parts, `(Dog | Cat, int)`, tests the
+// object that part holds too: such a union is laid out as an `Any`, so the tuple's record test takes
+// any object there, and the object must be one of the union's members. A part that is a tuple is
+// tested the same way, part by part.
+private union_part_tests(l: *Lowering, object: Operand, written: &Type, fail: usize)
+    val items = *written match
+        Tuple(items) -> items
+        _ -> return
+    val fields = layout(l, erase_reference_unions(written)).variants[0].fields
+    for i in 0..<items.len()
+        val item = items[i]
+        val union_part = *item is Union(_) && !is_scalar_union(erase_reference_unions(item))
+        if !union_part && !(*item is Tuple(_) && has_union(item)) then continue
+        val field = fields[i] match
+            Some(f) -> f
+            None -> continue
+        val part = load_field(l, object, field)
+        if union_part then member_test(l, AnyType, item, Some(part), fail)
+        else union_part_tests(l, part, item, fail)
+
 // A pattern on a union value: each part is tried in turn, on the member its type names, taken out
 // of the `Any` a union of references is laid out as, or out of the cell of one with a scalar member.
 // Where the instance being lowered made the union one of its members, the value is that member
@@ -6462,6 +6487,10 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
             val pointer = pointer_option(l, from)
             if always_is(l, from, to)
                 if (*to is AnyType && !(*from is AnyType)) || (pointer && !pointer_option(l, to)) then bound = box_value(l, from, value)
+                // A tuple whose type says it holds objects where the target names a union of them
+                // still has each such object tested.
+                if *from is Tuple(_)
+                    if value is Some(v) then union_part_tests(l, v, written_concrete(l, target), fail)
             elif is_scalar_union(from)
                 // A union with a scalar member: its tag says which member it holds.
                 if value is Some(v)
@@ -6472,6 +6501,7 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
                 if value is Some(v)
                     val object = if pointer then option_object(l, from, v) else v
                     continue_if(l, type_test(l, object, to), fail)
+                    union_part_tests(l, object, written_concrete(l, target), fail)
                     bound = unbox(l, to, object)
             else
                 // A value that is neither `Any` nor an object of a class has exactly its static
