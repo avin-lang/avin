@@ -6151,6 +6151,41 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- **Seq search, slices and combinatorics** (branch `stdlib-seq`, 2026-11-11), [collections](/spec/collections/):
+  - **`search` answers the first of equal elements.** `Found(i)` is the lowest index holding an
+    element equal to the one searched for, found by a lower-bound halving, so the answer is
+    deterministic. Why: a binary search that stops at the first hit returns whichever duplicate the
+    midpoints reach, which no caller can rely on and a test cannot pin; the lower bound costs the same
+    O(log n) comparisons and makes `Found(i)` and `InsertionPoint(i)` one index (`i` is where the
+    element is or would go, the insertion point of an equal element being its first). Alternatives:
+    any equal element, unspecified (cheaper by at most one comparison, not testable); the last one.
+  - **`search(x, from, until)` holds its window to the sequence** (`until` to `0 .. n`, then `from` to
+    `0 .. until`) rather than trapping, as counts are held (`take`, `drop`) and unlike `slice`, which
+    traps. Why: the window is a bound on where to look, not an index range to read, and an empty or
+    out-of-range one has the clear answer `InsertionPoint` of its edge. Alternative: trap as `slice`
+    does. `searchBy(key, wanted)` is included (the plan marked it optional); it takes the key
+    function first, as `sortBy`'s sibling `distinctBy` does, and `K: Ord`.
+  - **`combinations` and `permutations` are distinct by `equals` and ordered by first appearance.**
+    The classes of equal elements are found with a hash map on the elements (as `distinct` does), so
+    `equals` and `hash` must agree, and the vectors come in dictionary order of the classes' first
+    appearance. Why: the dictionary order is stepped with O(k) or O(n) work and no memory beyond the
+    class counts, and needs no `Ord`. Alternatives: the order of a recursive generation, which differs
+    for a multiset; positions rather than values (every permutation of equal elements, n! of them).
+    `k < 0` or `k > n` gives an empty iterator, `k == 0` and the empty sequence's permutations one
+    empty vector.
+  - **`indexOfSlice` and `lastIndexOfSlice` find the empty slice where the edges allow**: at
+    `max(from, 0)` while that is no further than the length, and at `min(end, n)` while `end >= 0`;
+    `lastIndexOfSlice(slice)` is the form with `end` the length, written as an overload as
+    `lastIndexOf` is. `patch` holds `from` to `0 .. n` and a `replaced` below 0 to 0 rather than
+    trapping, and takes `other` as an `Iterable[W]` with `W >: T`, widening as `++` does.
+    `reduceRightOption` accompanies `reduceRight` as `reduceOption` accompanies `reduce`.
+    Alternative for all: trap on an out-of-range count, as `slice` does for indices.
+  - **`inits()` and `tails()` copy the elements into a vector once and slice it per step**, so each
+    step is O(log n) and the n + 1 vectors share structure; they are lazy iterators, not a vector of
+    vectors. `transpose()` of rows of different lengths traps (the plan's decision), and answers an
+    empty vector, not a vector of empty ones, for no rows; for rows that are all empty it answers
+    empty too.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
