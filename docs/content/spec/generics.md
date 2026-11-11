@@ -94,7 +94,9 @@ class SortedPair[T: Ordered](first: T, second: T)
   scope, a default argument's value included, and a type parameter without the `Integer` bound has
   no limits. The bitwise operators `&`, `|`, `^`, `<<` and `>>` also work on such a `T`, both
   operands of type `T` (`x >> T(1)`), as the machine's operators at each instance's width; a `T`
-  with any other bound has them only as methods of those names.
+  with any other bound has them only as methods of those names. So do the wrapping operators `+%`,
+  `-%`, `*%` and the saturating `+|`, `-|`, `*|` (and their compound forms), which a `T` with any other
+  bound lacks.
 
 ```text
 digits[T: Integer](x: T) -> int
