@@ -6,8 +6,9 @@ import sysl.buf.{Buf, buf}
 
 // A union with a scalar member is a tag and a payload: in a function a cell whose fields scalar
 // replacement keeps in slots, across a call its words, a 32-bit tag, 64 bits and, where a member is a
-// reference, the reference. Nothing is allocated for one in a local, a parameter or a result; one
-// stored in an object stays a cell there, and one seen as an `Any` boxes a scalar member.
+// reference, the reference; in storage those words, the reference word alone traced. Nothing is
+// allocated for one in a local, a parameter, a result or storage; one seen as an `Any` boxes a
+// scalar member.
 
 private union_lowered(text: string) -> MirProgram = lower_source(repository_toolchain(), source_of("probe.avin", text)) match
     Ok(p) -> p
@@ -123,20 +124,30 @@ widening_to_any_boxes()
     assert_eq(allocs(f), 1)
     assert_eq(allocs_of(program, f, "box of int"), 1)
 
-@test("a union stored in an object's field stays a cell there, traced through its reference word")
-union_in_field_is_a_cell()
-    val text = "data Holder(v: int | string)\n\nmake(n: int) -> Holder = Holder(n)\n\nmain()\n    println(make(1).v)\n"
+@test("a union stored in a data value's field is its words there, the reference word traced and no other")
+union_in_field_is_words()
+    val text = "data Holder(label: string, v: int | string, n: long)\n\nmake(n: int) -> Holder = Holder(\"h\", n, 1)\n\nread(h: Holder) -> int | string = h.v\n\nmain()\n    println(read(make(1)))\n"
     val program = union_lowered(text)
-    val f = function_of(program, "make")
-    assert_eq(allocs_of(program, f, "union cell"), 1)
-    var found = false
+    assert_eq(allocs_of(program, function_of(program, "make"), "union cell"), 0)
+    assert_eq(allocs(function_of(program, "make")), 1)
+    assert_eq(allocs(function_of(program, "read")), 0)
+    // The label at 0, the union's tag at 8, its bits at 16 and its reference at 24, the long at 32.
+    val d = descriptor_named(program, "Holder")
+    assert_eq(d.size, 40usize)
+    assert_eq(d.refs.len(), 2usize)
+    assert_eq(d.refs[0], 0usize)
+    assert_eq(d.refs[1], 24usize)
+
+/** The descriptor whose name ends with `suffix`. */
+private descriptor_named(program: MirProgram, suffix: string) -> Descriptor
     for d in program.descriptors
-        if d.name == "union cell"
-            found = true
-            assert_eq(d.size, 24usize)
-            assert_eq(d.refs.len(), 1usize)
-            assert_eq(d.refs[0], 16usize)
-    assert(found)
+        if d.name.ends_with(suffix) then return d
+    panic("no descriptor " + suffix)
+
+private has_descriptor(program: MirProgram, suffix: string) -> bool
+    for d in program.descriptors
+        if d.name.ends_with(suffix) then return true
+    false
 
 @test("a call in tail position of a function answering with a union passes the callee's words straight on")
 tail_call_passes_union_words()
@@ -178,3 +189,155 @@ reference_word_rooted()
         if plan.slot_cells[s] is Some(_) then assert(f.slots[s] is MRef)
     assert(plan.value_cells[0] is None)
     assert(plan.value_cells[1] is None)
+
+/** How many allocations of a union's cell the whole program makes, in any function. */
+private cell_allocs(program: MirProgram) -> int
+    var n = 0
+    for f in program.functions
+        n = n + allocs_of(program, f, "union cell") + allocs_of(program, f, "union cell of scalars")
+    n
+
+@test("a union of scalars alone in a field is its tag and bits, with nothing traced")
+scalar_union_field_has_no_reference_word()
+    val program = union_lowered("data P(u: int | bool)\n\nmake(n: int) -> P = P(n > 0)\n\nmain()\n    println(make(1).u)\n")
+    val d = descriptor_named(program, ".P")
+    assert_eq(d.size, 16usize)
+    assert_eq(d.refs.len(), 0usize)
+    assert_eq(allocs(function_of(program, "make")), 1)
+
+@test("assigning a union to a class's var field and reading it back allocates nothing")
+class_field_store_and_load()
+    val text = "class Box(var c: real | string)\n\nput(b: Box, s: string) = b.c = s\n\nputReal(b: Box, x: real) = b.c = x\n\nget(b: Box) -> real | string = b.c\n\nmain()\n    val b = Box(0.5)\n    put(b, \"s\")\n    putReal(b, -0.0)\n    println(get(b))\n"
+    val program = union_lowered(text)
+    assert_eq(allocs(function_of(program, "put")), 0)
+    assert_eq(allocs(function_of(program, "putReal")), 0)
+    assert_eq(allocs(function_of(program, "get")), 0)
+    val d = descriptor_named(program, ".Box[]")
+    assert_eq(d.size, 24usize)
+    assert_eq(d.refs.len(), 1usize)
+    assert_eq(d.refs[0], 16usize)
+
+@test("a tuple with a union part keeps the union's words in the tuple, which is the one allocation")
+tuple_part_is_words()
+    val program = union_lowered("pair(n: int) -> (int | string, bool) = (n, true)\n\nmain()\n    println(pair(1))\n")
+    val f = function_of(program, "pair")
+    assert_eq(allocs(f), 1)
+    assert_eq(allocs_of(program, f, "union cell"), 0)
+    var found = false
+    for d in program.descriptors
+        if d.name == "(union(int | string), bool)"
+            found = true
+            assert_eq(d.size, 32usize)
+            assert_eq(d.refs.len(), 1usize)
+            assert_eq(d.refs[0], 16usize)
+    assert(found)
+
+@test("an array of a union holds each element's words, its map marking only the reference word")
+array_elements_are_words()
+    val text = "put(a: Array[int | string], i: int, s: string) = a(i) = s\n\nget(a: Array[int | string], i: int) -> int | string = a(i)\n\nflags(a: Array[int | bool], i: int) -> int | bool = a(i)\n\nmain()\n    val a: Array[int | string] = Array.fill(2, 0)\n    put(a, 1, \"x\")\n    println(get(a, 1))\n    val b: Array[int | bool] = Array.fill(2, true)\n    println(flags(b, 0))\n"
+    val program = union_lowered(text)
+    assert_eq(allocs(function_of(program, "put")), 0)
+    assert_eq(allocs(function_of(program, "get")), 0)
+    assert_eq(allocs(function_of(program, "flags")), 0)
+    var mapped = 0
+    var plain = 0
+    for d in program.descriptors
+        if d.name.contains("Array[union(int | string)]")
+            mapped = mapped + 1
+            assert_eq(d.size, 24usize)
+            assert(d.tracing is ElementMap)
+            assert_eq(d.refs.len(), 1usize)
+            assert_eq(d.refs[0], 16usize)
+        if d.name.contains("Array[union(bool | int)]")
+            plain = plain + 1
+            assert_eq(d.size, 16usize)
+            assert(d.tracing is Fields)
+            assert_eq(d.refs.len(), 0usize)
+    assert(mapped >= 1)
+    assert(plain >= 1)
+
+@test("a closure capturing a union keeps its words, the reference word traced")
+closure_capture_is_words()
+    val text = "later(u: int | string) -> () -> int | string = () -> u\n\nmain()\n    println(later(\"x\")())\n    println(later(3)())\n"
+    val program = union_lowered(text)
+    val f = function_of(program, "later")
+    assert_eq(allocs(f), 1)
+    assert_eq(cell_allocs(program), 0)
+    var found = false
+    for d in program.descriptors
+        if d.name.starts_with("closure of") && d.name.contains("later")
+            found = true
+            assert_eq(d.size, 24usize)
+            assert_eq(d.refs.len(), 1usize)
+            assert_eq(d.refs[0], 16usize)
+    assert(found)
+
+@test("a captured var holding a union is boxed as its words, the box tracing only the reference word")
+boxed_var_is_words()
+    val text = "count(n: int) -> int | string\n    var c: int | string = 0\n    val bump = () ->\n        c = c match\n            k: int -> if k > 2 then \"many\" else k + 1\n            s: string -> s\n    for _ in 0..<n do bump()\n    c\n\nmain()\n    println(count(5))\n"
+    val program = union_lowered(text)
+    assert_eq(cell_allocs(program), 0)
+    val d = descriptor_named(program, "cell of union")
+    assert_eq(d.size, 24usize)
+    assert_eq(d.refs.len(), 1usize)
+    assert_eq(d.refs[0], 16usize)
+
+@test("a module-level union keeps its tag and bits in its storage and its reference word among the roots")
+module_value_is_words()
+    val text = "var current: int | string = 0\n\nvar flag: int | bool = true\n\nput(s: string) = current = s\n\nget() -> int | string = current\n\nmain()\n    put(\"x\")\n    println(get())\n    flag = 2\n    println(flag)\n"
+    val program = union_lowered(text)
+    assert_eq(allocs(function_of(program, "put")), 0)
+    assert_eq(allocs(function_of(program, "get")), 0)
+    assert_eq(cell_allocs(program), 0)
+    var tag_words = 0
+    var references = 0
+    for i in 0..<program.global_names.len()
+        val name = program.global_names[i]
+        if name == "<program>.current" || name == "<program>.flag"
+            tag_words = tag_words + 1
+            assert(program.globals[i] is Some(MInt(128)))
+        if name.ends_with("#reference")
+            references = references + 1
+            assert_eq(name, "<program>.current#reference")
+            assert(program.globals[i] is Some(MRef))
+    assert_eq(tag_words, 2)
+    assert_eq(references, 1)
+
+@test("vectors, buffers, maps and options of a union, and generic classes at one, never allocate a union's cell")
+collections_never_allocate_cells()
+    val text = "class Holder[T](var item: T)\n\nmain()\n    var v: Vector[long | string] = []\n    val b: Buffer[char | string] = Buffer()\n    var m: Map[int, real | string] = {}\n    for i in 0..<10\n        v = v :+ (if i % 2 == 0 then long(i) else s\"s$i\")\n        b.append(if i % 3 == 0 then 'c' else s\"b$i\")\n        m = m.updated(i, if i > 4 then real(i) else \"m\")\n    val h = Holder[int | string](1)\n    h.item = \"one\"\n    var o: Option[int | string] = None\n    o = Some(\"o\")\n    println(s\"$v $b $m ${h.item} $o\")\n"
+    val program = union_lowered(text)
+    assert_eq(cell_allocs(program), 0)
+
+@test("an Atomic of a union holds a reference to its cell, one word its operations access indivisibly")
+atomic_keeps_a_cell()
+    val text = "import avin.threads.Atomic\n\nmain()\n    val a = Atomic[int | string](1)\n    a.store(\"x\")\n    println(a.load())\n"
+    val program = union_lowered(text)
+    var found = false
+    for d in program.descriptors
+        if d.name.contains("Atomic[union(int | string)]")
+            found = true
+            assert_eq(d.size, 8usize)
+            assert_eq(d.refs.len(), 1usize)
+            assert_eq(d.refs[0], 0usize)
+    assert(found)
+
+@test("an integer member wider than 64 bits is boxed in the reference word, so its union has one")
+wide_member_is_boxed()
+    val text = "keep(u: i128 | int) -> i128 | int = u\n\nwide(x: i128) -> i128 | int = x\n\nmain()\n    println(keep(wide(i128(1) << 100)))\n"
+    val program = union_lowered(text)
+    val k = function_of(program, "keep")
+    assert_eq(k.signature.params.len(), 3usize)
+    assert(k.signature.params[2] is MRef)
+    val w = function_of(program, "wide")
+    assert_eq(allocs_of(program, w, "box of i128"), 1)
+    assert_eq(allocs_of(program, w, "union cell"), 0)
+
+@test("a union read from storage takes its tag as a reference's only beside a reference, and a zero tag as a scalar's")
+storage_reads_check_the_tag()
+    val text = "data Holder(v: int | string)\n\ndata Flags(v: int | bool)\n\nread(h: Holder) -> int | string = h.v\n\nflags(f: Flags) -> int | bool = f.v\n\nmain()\n    println(read(Holder(1)))\n    println(flags(Flags(true)))\n"
+    val program = union_lowered(text)
+    // A reference member: the tag tested against 0 and the reference against null, each choosing.
+    assert(insts_where(function_of(program, "read"), inst -> inst is Select(_, _, _, _)) >= 2)
+    // Scalars alone: a zero tag, which no store writes, is the first scalar member's.
+    assert(insts_where(function_of(program, "flags"), inst -> inst is Select(_, _, _, _)) >= 1)
