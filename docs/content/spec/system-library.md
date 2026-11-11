@@ -512,8 +512,8 @@ trait Reader
 ```
 
 `read(max)` gives up to `max` bytes, `max` being at least one, waiting for at least one where the
-source is still going, and an empty array once it has ended. `fs.File`, `net.TcpStream` and
-`net.UnixStream` are readers, each by its own `read`; a class of the program's own is one by
+source is still going, and an empty array once it has ended. `fs.File` is a reader by its own
+`read`, and so is every `net.ByteStream`: `TcpStream`, `UnixStream` and `TlsStream`; a class of the program's own is one by
 naming `io.Reader` (or `Reader`, imported) after `:` and overriding `read`. The
 [json package](/spec/json/#reading-a-stream)'s `JsonReader` reads JSON from any reader.
 
@@ -840,14 +840,15 @@ The digests are bound to Sysl's `sysl.crypto`, so they are the same code Sysl pr
 
 ## `avin.net`
 
-TCP connections, servers, URLs, and a small HTTP client and server. Every operation that can fail answers a
-`Result[T, IoError]`, and a connection that is reading or writing waits safe for the collector.
+TCP connections, TLS over them, servers, URLs, and a small HTTP client and server that speak `https`
+too. Every operation that can fail answers a `Result[T, IoError]`, and a connection that is reading
+or writing waits safe for the collector.
 
 ```text
 import avin.net.http
 
 main() -> int
-    http.get("http://example.com/") match
+    http.get("https://example.com/") match
         Ok(r) if r.status == 200 -> println(r.text())
         Ok(r) -> eprintln(s"status ${r.status}")
         Err(e) -> eprintln(e.message())
@@ -945,6 +946,68 @@ checked the same way:
 avin: trap: `TcpStream` belongs to another thread at main.avin:16:25
 ```
 
+**`ByteStream` is what the three connections share**: a trait with `read`, `readLine`, `readAll`,
+`write`, `writeText`, `setTimeout`, `shutdownOutput` and `close`, which `TcpStream`, `UnixStream` and
+`TlsStream` implement, so code that speaks a protocol, as the HTTP client and server do, takes a
+`ByteStream` and runs over any of them. It is [sendable](/spec/actors/#what-may-be-sent), and it is
+an [`io.Reader`](#reader) by its `read`, so whatever reads a `Reader` reads any connection, a TLS one
+included. `ReadAhead`,
+the bytes a connection has read beyond what its caller asked for and the line reading over them, is
+public for a connection of one's own.
+
+### TLS
+
+`avin.net.tls` is TLS over a `TcpStream`, at either end, by OpenSSL, which the library reaches
+through the Sysl package `openssl` named in its own `sysl-dependencies`. OpenSSL never touches the
+socket: it works on two buffers in memory, the bytes it has to send are written on the TCP
+connection, and the bytes that arrive there are handed to it. So a `TlsStream` waits exactly as its
+`TcpStream` does, a lightweight thread parked on the poller, with the same per-wait limit and the
+same [cancellation](/spec/threads/#cancellation). A program that reaches none of this builds and
+links no OpenSSL.
+
+```text
+import avin.net.tls.{TlsClient, TlsStream}
+
+main()
+    TlsStream.connect("example.com", 443) match
+        Ok(s) ->
+            s.writeText("HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+            println(s.readLine())
+            s.close()
+        Err(e) -> eprintln(e.message())
+```
+
+| Member | Meaning |
+| --- | --- |
+| `TlsStream.connect(host, port, settings: TlsClient = TlsClient()) -> Result[TlsStream, TlsError]` | A TCP connection as `TcpStream.connect` makes one, then TLS as the client, the certificate checked for `host`. |
+| `TlsStream.client(tcp: TcpStream, host, settings = TlsClient()) -> Result[TlsStream, TlsError]` | TLS as the client over a connection the caller made, its handshake waiting with `tcp`'s limit. Where it fails, `tcp` is the caller's to close. |
+| `TlsStream.server(tcp: TcpStream, settings: TlsServer) -> Result[TlsStream, TlsError]` | TLS as the server over an accepted connection, presenting the settings' certificate. |
+| `s.read`, `readLine`, `readAll`, `write`, `writeText`, `setTimeout` | As a `TcpStream`'s, of plaintext; the limit is the TCP connection's, for each of its waits. |
+| `s.shutdownOutput()` | Closes TLS (a `close_notify`) and the TCP connection's sending side; reading goes on. |
+| `s.close()` | Closes TLS as far as the peer can be told without waiting, then the connection; again does nothing. |
+| `TlsClient(trusted = [])`, `c.trust(pem: string) -> TlsClient` | The machine's trusted authorities and those added: `trust` answers a client that also trusts the certificates in `pem`. |
+| `TlsServer(certificate, key)`, `TlsServer.of(certificate, key) -> Result[TlsServer, TlsError]` | A server's certificate (a chain, leaf first) and private key as PEM text; `of` checks they can be used and go together, and one made directly is checked at its first connection. |
+
+**What a client checks, and what cannot be turned off.** The server's certificate must chain to an
+authority the client trusts: the machine's store, read through OpenSSL's default paths (on macOS
+the `cert.pem` of Homebrew's OpenSSL, not the Keychain), and the authorities `trust` adds. Its name
+must cover the host connected to, a name or an address. The host's name is sent for the server to
+choose a certificate by, and the oldest protocol spoken is TLS 1.2. `trust` only adds: there is no
+way to accept a certificate these refuse, a private authority, a corporate one and a test's own
+being the same case. The choices are [proposed](/spec/decisions/#proposed).
+
+**After the handshake a connection is a `ByteStream`**: a failure of TLS itself while reading or
+writing is an `IoError.Other` whose text begins `TLS:`, and the connection's end, by the peer's
+`close_notify` or by the TCP connection closing, reads as the end of a TCP connection's does.
+
+`TlsError` says why a connection could not be made: `Transport(IoError)`, the connection beneath
+could not be made, broke or timed out; `Certificate(text)`, the peer's certificate was refused, as
+untrusted, self-signed, expired or for another host; `Handshake(text)`, the two ends did not agree,
+as with a peer that does not speak TLS or ends the connection in the handshake; and
+`Credentials(text)`, a certificate or key given to this end cannot be used. `message()` says it in
+words. Each `TlsStream`, `TlsClient` and `TlsServer` is sendable, a stream belonging to one thread
+at a time as a `TcpStream` does.
+
 ### Servers
 
 `TcpServer` is a listener that serves each connection it accepts in an
@@ -1022,7 +1085,7 @@ main()
 
 `http.serve(host, port, handler: @sendable (ServerRequest) -> Response, maxConnections = 1024,
 readTimeout = seconds(30), writeTimeout = seconds(30), idleTimeout = seconds(5), maxHeaderBytes =
-16384, maxBodyBytes = 1048576) -> Result[TcpServer, IoError]` listens as `TcpServer.start` does. Each
+16384, maxBodyBytes = 1048576, tls: Option[TlsServer] = None) -> Result[TcpServer, IoError]` listens as `TcpServer.start` does. Each
 wait while a request is read may last `readTimeout`, each wait while a response is written
 `writeTimeout`, and the wait for the next request on a connection kept alive `idleTimeout`; zero
 takes a limit away. A `maxHeaderBytes` less than one or a `maxBodyBytes` less than zero traps. The
@@ -1030,6 +1093,13 @@ wait for a connection's next request, its first among them, is made through `idl
 closes a connection waiting there at once, unanswered; a request already being read or answered
 finishes, its response saying `Connection: close`, and a request read once the server is stopping
 is answered `503`.
+
+**With `tls`, the server speaks HTTPS.** Each connection's actor begins with a TLS handshake
+presenting the `TlsServer`'s certificate, each of its waits lasting at most `readTimeout`, and
+serves its requests over the `TlsStream` exactly as over TCP, kept alive and pipelined alike. A
+connection whose handshake fails, a client speaking plain HTTP among them, is closed, and the server
+goes on. A handler that traps on a TLS connection has it closed without the `500`, since the answer
+would have to be written through TLS the handler's turn held.
 
 A `ServerRequest` has its `method`, its `target` as the request line gave it, its `version`
 (`HTTP/1.1` or `HTTP/1.0`), its `headers` in order with `header(name)` looking one up without regard
@@ -1074,7 +1144,7 @@ and what the client still sends read and dropped for a moment, so the answer is 
 | `414` | A request line longer than `maxHeaderBytes` |
 | `417` | An `Expect` other than `100-continue` |
 | `431` | The request line and headers together, or a chunked body's trailers, longer than `maxHeaderBytes` |
-| `500` | The handler traps: it fails its connection alone, as a `TcpServer`'s `serve` does |
+| `500` | The handler traps: it fails its connection alone, as a `TcpServer`'s `serve` does (over TLS the connection is closed unanswered) |
 | `501` | A transfer coding besides `chunked` |
 | `503` | A request read once the server is stopping |
 | `505` | A version other than 1.0 and 1.1 |
@@ -1128,12 +1198,14 @@ URL**, so `parse` refuses `http://h/%FF` with `InvalidUtf8(9)` and `queryParams`
 | --- | --- |
 | `http.get(url: string) -> Result[Response, HttpError]` | Fetches the URL. |
 | `http.post(url: string, body: string, contentType: string) -> Result[Response, HttpError]` | Sends `body` and answers the response. |
-| `http.send(request: Request) -> Result[Response, HttpError]` | Any method, headers, body and timeout, built from `Request(method, url)` with `withHeader`, `withBody` and `withTimeout`. |
+| `http.send(request: Request) -> Result[Response, HttpError]` | Any method, headers, body, timeout and TLS settings, built from `Request(method, url)` with `withHeader`, `withBody`, `withTimeout` and `withTls`. |
 
 A `Response` has its `status` and `reason`, its `headers` as a vector of name and value pairs,
 `header(name)` looking a name up without regard to case, its `body` as an `Array[byte]` and `text()`
 reading that as UTF-8, a sequence that is not read as U+FFFD. **A status is an answer, not a failure**: `404` is an `Ok`. `HttpError` is `Io(IoError)`,
-`BadUrl(UrlError)`, `Malformed(text)` for a reply that is not HTTP, and `Unsupported(text)`. The
+`BadUrl(UrlError)`, `Malformed(text)` for a reply that is not HTTP, `Unsupported(text)` for a scheme
+other than `http` and `https`, and `Tls(TlsError)` for TLS that could not be set up (a connection
+that could not be made, broke or timed out being `Io`, for `https` as for `http`). The
 client speaks HTTP/1.1, one request to a connection, reads bodies by `Content-Length`, chunked or to
 the connection's end, and follows up to five redirects of a `GET` or `HEAD` (statuses 301, 302,
 303, 307 and 308), each `Location` resolved against the URL that answered by `Url.resolve`; the sixth
@@ -1141,10 +1213,17 @@ is the answer. It writes `Host`, `Content-Length` (for a body, a `POST` and a `P
 close` unless the request gives them, then the request's own headers in order. `HEAD`, an interim
 `1xx` (which is skipped for the answer after it), `204` and `304` have no body. A method is a token
 and a header's name one too, and a header's value holds no line break; `Request` and `withHeader`
-trap where one does not. A request's timeout bounds each read and write on its connection. A request for `https`
-is `Unsupported` where the library has no TLS; TLS lives in a Sysl package of its own, which the
-library reaches through a binding to a package named in its `sysl-dependencies`, as any program
-reaches one.
+trap where one does not. A request's timeout bounds each read and write on its connection.
+
+**An `https` URL just works**: the client makes the TCP connection to the URL's port, 443 where it
+gives none, sets the request's timeout on it, so the handshake's waits are bounded too, and speaks
+the request over a [`TlsStream`](#tls), the certificate checked for the URL's host against the
+machine's trusted authorities and those of the request's `TlsClient`, which `withTls(client)` sets
+(`TlsClient()` unless it is set). A redirect between `http` and `https` is followed like any other,
+keeping the request's TLS settings. TLS lives in the Sysl package `openssl`, which the library
+names in `library/library.hocon`, its own `sysl-dependencies`; a program's shims depend on it only
+where a binding the program compiles reaches it, which `avin.net.http` and `avin.net.tls` do and
+`avin.net` alone does not ([proposed](/spec/decisions/#proposed)).
 
 ## Concurrency
 

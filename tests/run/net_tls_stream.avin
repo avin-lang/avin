@@ -1,0 +1,134 @@
+// expect: exit 0
+// TLS connections over TCP at both ends, in one program: a server presenting a certificate a test
+// authority issued for `localhost` and `127.0.0.1`, and clients trusting that authority through
+// `TlsClient.trust`. Bytes each way, lines with UTF-8, a body far larger than one TLS record, the
+// end once the peer closes TLS, a closed connection, many connections at once on lightweight
+// threads, a handshake over a connection the caller made with its timeout, and a parked TLS read
+// cancelled by its scope.
+import avin.fs
+import avin.io.{IoError, TimedOut}
+import avin.net.{TcpListener, TcpStream}
+import avin.net.tls.{TlsClient, TlsError, TlsServer, TlsStream, Transport}
+import avin.threads.{Thread, scope, sleep, spawn}
+import avin.time
+import avin.time.millis
+
+ok[T](r: Result[T, IoError]) -> T = r match
+    Ok(v) -> v
+    Err(e) -> fail(s"unexpected error: ${e.message()}")
+
+tls[T](r: Result[T, TlsError]) -> T = r match
+    Ok(v) -> v
+    Err(e) -> fail(s"unexpected error: ${e.message()}")
+
+// A test certificate or key, from the repository root or from `compiler/`.
+fixture(name: string) -> string
+    val here = "tests/fixtures/tls/" + name
+    ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+utf8(text: string) -> Array[byte] = Array.tabulate(text.byteLength(), i -> text.byteAt(i))
+
+trusting() -> TlsClient = TlsClient().trust(fixture("ca.pem"))
+
+// The port of a listener whose next `count` connections are each served TLS by `body` on a thread of
+// their own, presenting the test authority's certificate for `localhost`, and the thread that
+// accepts them, which ends once they all have.
+serving(count: int, body: @sendable (TlsStream) -> unit) -> (int, Thread[unit])
+    val listener = ok(TcpListener.bind("127.0.0.1", 0))
+    val server = tls(TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")))
+    val port = listener.port()
+    val accepting = spawn(() ->
+        val workers = Buffer[Thread[unit]]()
+        for _ in 0..<count
+            val tcp = ok(listener.accept())
+            workers.addOne(spawn(() ->
+                ok(tcp.setTimeout(time.seconds(20)))
+                TlsStream.server(tcp, server) match
+                    Ok(s) ->
+                        body(s)
+                        s.close()
+                    Err(e) ->
+                        println(s"server: ${e.message()}")
+                        tcp.close()))
+        for w in workers do w.join()
+        listener.close())
+    (port, accepting)
+
+echoLines(s: TlsStream)
+    while true
+        ok(s.readLine()) match
+            Some(line) -> ok(s.writeText(line.toUpperCase() + "\n"))
+            None -> return
+
+main()
+    // Bytes each way and lines, by host name and by address.
+    val (p1, d1) = serving(2, echoLines)
+    for host in ["localhost", "127.0.0.1"]
+        val c = tls(TlsStream.connect(host, p1, trusting()))
+        ok(c.writeText("héllo\nworld\n"))
+        println(ok(c.readLine()).getOrElse("?"))
+        println(ok(c.read(100)).length())
+        ok(c.shutdownOutput())
+        println(s"after the peer's close: ${ok(c.readLine()).isEmpty()} ${ok(c.read(10)).length()} ${ok(c.readAll()).length()}")
+        c.close()
+        c.close()
+        println(s"closed: ${c.read(1).isErr()} ${c.write(utf8("x")).isErr()} ${c.readLine().isErr()} ${c.setTimeout(millis(1)).isErr()}")
+    d1.join()
+
+    // A body far larger than one record: two mebibytes out and back, in one write and one read.
+    val big = Array.tabulate(2 * 1024 * 1024, i -> byte(i % 251))
+    val (p2, d2) = serving(1, s ->
+        val got = ok(s.readAll())
+        ok(s.write(got)))
+    val c2 = tls(TlsStream.connect("localhost", p2, trusting()))
+    ok(c2.write(big))
+    ok(c2.shutdownOutput())
+    val back = ok(c2.readAll())
+    var same = back.length() == big.length()
+    for i in 0..<back.length()
+        if back(i) != big(i) then same = false
+    println(s"${back.length()} bytes back, the same: $same")
+    c2.close()
+    d2.join()
+
+    // Many connections at once, each on a lightweight thread of its own.
+    val many = 64
+    val (p3, d3) = serving(many, echoLines)
+    val clients = (0..<many).map(i -> spawn(() ->
+        val c = tls(TlsStream.connect("localhost", p3, trusting()))
+        ok(c.writeText(s"client $i\n"))
+        val line = ok(c.readLine()).getOrElse("?")
+        c.close()
+        line == s"CLIENT $i")).toVector()
+    var answered = 0
+    for t in clients
+        if t.join() then answered += 1
+    println(s"$answered of $many answered")
+    d3.join()
+
+    // A handshake over a connection the caller made keeps its limit: a server that accepts and
+    // never answers times the handshake out.
+    val silent = ok(TcpListener.bind("127.0.0.1", 0))
+    val quiet = ok(TcpStream.connect("127.0.0.1", silent.port()))
+    ok(quiet.setTimeout(millis(200)))
+    val held = ok(silent.accept())
+    TlsStream.client(quiet, "localhost", trusting()) match
+        Err(Transport(TimedOut)) -> println("the handshake timed out")
+        other -> println(s"unexpected: ${other.isOk()}")
+    quiet.close()
+    held.close()
+    silent.close()
+
+    // A read parked on a TLS connection is cancelled by its scope.
+    val (p4, d4) = serving(1, s -> println(s"the server read: ${string.fromUtf8Lossy(ok(s.readAll())).trim()}"))
+    val waiting = tls(TlsStream.connect("localhost", p4, trusting()))
+    val outcome = scope(sc ->
+        val reader = sc.spawn(() -> waiting.read(10).isOk())
+        sleep(millis(100))
+        sc.cancel()
+        reader)
+    println(s"cancelled: ${outcome.result().isEmpty()}")
+    // The connection was handed back to the scope's caller, and still works.
+    ok(waiting.writeText("after\n"))
+    waiting.close()
+    d4.join()

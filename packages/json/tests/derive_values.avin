@@ -1,0 +1,167 @@
+module tests
+
+// Values at their edges through the derived codecs: text with escapes and beyond ASCII, the least and
+// greatest integers, reals at their extremes, and nesting up to the reader's limit and past it; and the
+// `JsonWriter` and `JsonReader` the derivations are written against, used directly.
+import json
+import json.Json
+import json.JsonEncoder
+import json.JsonDecoder
+import json.JsonKey
+import json.JsonReader
+import json.JsonWriter
+
+data Text(@JsonKey("ключ \"q\"") value: string) derives JsonEncoder, JsonDecoder
+
+data Ints(i: int, n: long) derives JsonEncoder, JsonDecoder
+
+data Reals(x: real) derives JsonEncoder, JsonDecoder
+
+data Node(next: Option[Node]) derives JsonEncoder, JsonDecoder
+
+data Branch(label: string, children: Vector[Branch]) derives JsonEncoder, JsonDecoder
+
+// A chain of `n` nodes.
+chain(n: int) -> Node
+    var node = Node(None)
+    for _ in 1..<n do node = Node(Some(node))
+    node
+
+depthOf(node: Node) -> int
+    var n = 1
+    var at = node
+    while at.next is Some(inner)
+        n += 1
+        at = inner
+    n
+
+same[A: JsonEncoder + JsonDecoder + Debug](a: A, text: string)
+    assertEq(json.encode(a), text)
+    assertEq(json.decode[A](text), Ok(a))
+
+@test("strings keep every character: escapes for the quote, the backslash and control characters, and text beyond ASCII as it is")
+strings()
+    same(Text("a\"b\\c"), "{\"ключ \\\"q\\\"\":\"a\\\"b\\\\c\"}")
+    same(Text("\n\r\t\u{8}\u{c}\u{0}\u{1f}"), "{\"ключ \\\"q\\\"\":\"\\n\\r\\t\\b\\f\\u0000\\u001f\"}")
+    same(Text("é日本😀"), "{\"ключ \\\"q\\\"\":\"é日本😀\"}")
+    same(Text(""), "{\"ключ \\\"q\\\"\":\"\"}")
+    same(Text("/"), "{\"ключ \\\"q\\\"\":\"/\"}")
+
+@test("escapes in the input read as their characters, surrogate pairs and an escaped key included")
+escapesRead()
+    assertEq(json.decode[Text]("{\"\\u043a\\u043b\\u044e\\u0447 \\\"q\\\"\":\"\\u00e9\\ud83d\\ude00\\/\"}"), Ok(Text("é😀/")))
+    assertEq(json.decode[string]("\"\\ud83d\""), Err(json.JsonError("a high surrogate \\uD83D with no low surrogate after it", 1, 2, 1)))
+
+@test("the least and greatest int and long read back exactly")
+integers()
+    same(Ints(2147483647, 9223372036854775807), "{\"i\":2147483647,\"n\":9223372036854775807}")
+    same(Ints(-2147483647 - 1, long(-9223372036854775807) - 1), "{\"i\":-2147483648,\"n\":-9223372036854775808}")
+    same(Ints(0, -1), "{\"i\":0,\"n\":-1}")
+
+@test("reals at their extremes read back as the same value")
+reals()
+    same(Reals(1.7976931348623157e308), "{\"x\":1.7976931348623157e+308}")
+    same(Reals(5e-324), "{\"x\":5e-324}")
+    same(Reals(-2.5e-7), "{\"x\":-2.5e-7}")
+    same(Reals(0.1), "{\"x\":0.1}")
+    same(Reals(1e21), "{\"x\":1e+21}")
+    assertEq(json.decode[Reals]("{\"x\":-0}"), Ok(Reals(0.0)))
+    assertEq(json.decode[Reals]("{\"x\":12}"), Ok(Reals(12.0)))
+    assertEq(json.encode(Reals(real.PositiveInfinity)), "{\"x\":null}")
+    assert(json.decode[Reals]("{\"x\":null}").isErr())
+
+@test("a recursive value nests as deep as the reader allows, and past it is an error, not an overflow")
+deep()
+    val nodes = chain(500)
+    val text = json.encode(nodes)
+    assertEq(json.decode[Node](text).map(n -> depthOf(n)), Ok(500))
+    assertEq(json.decode[Node](json.encode(chain(512))).map(n -> depthOf(n)), Ok(512))
+    val past = json.decode[Node](json.encode(chain(513))).err().get()
+    assertEq(past.message, "arrays and objects nested more than 512 deep")
+    assertEq(past.path.length(), 512)
+    assertEq(json.decode[Node](json.encode(chain(10)), 9).err().get().message, "arrays and objects nested more than 9 deep")
+    assertEq(json.decode[Node](json.encode(chain(10)), 10).map(n -> depthOf(n)), Ok(10))
+
+@test("a value the decoder skips counts towards the limit where it nests")
+deepSkipped()
+    val inner = "[".repeat(511) + "]".repeat(511)
+    assertEq(json.decode[Node]("{\"x\":" + inner + ",\"next\":null}"), Ok(Node(None)))
+    val past = "[".repeat(512) + "]".repeat(512)
+    assertEq(json.decode[Node]("{\"x\":" + past + "}").err().get().message, "arrays and objects nested more than 512 deep")
+
+@test("arrays and objects nest in turn, wide and deep")
+branches()
+    var tree = Branch("leaf", [])
+    for i in 0..<100 do tree = Branch(s"$i", [tree, Branch("x", [])])
+    assertEq(json.decode[Branch](json.encode(tree)), Ok(tree))
+    val wide = Branch("w", Vector.tabulate(1000, i -> Branch(s"$i", [])))
+    assertEq(json.decode[Branch](json.encode(wide)), Ok(wide))
+
+@test("the writer places commas and colons itself, nested containers included")
+writer()
+    val text = StringWriter()
+    val out = JsonWriter(text)
+    out.beginObject()
+    out.key("a")
+    out.beginArray()
+    out.long(1)
+    out.beginObject()
+    out.endObject()
+    out.beginArray()
+    out.endArray()
+    out.string("s")
+    out.endArray()
+    out.key("b")
+    out.bool(false)
+    out.key("c")
+    out.writeNull()
+    out.key("d")
+    out.real(2.0)
+    out.key("e")
+    out.json(Json.obj(("x", Json.arr())))
+    out.endObject()
+    assertEq(text.text(), "{\"a\":[1,{},[],\"s\"],\"b\":false,\"c\":null,\"d\":2.0,\"e\":{\"x\":[]}}")
+
+@test("the reader reads a token at a time, telling an object's end and an array's end")
+reader()
+    val r = JsonReader.fromString(" {\"a\": [1, true, \"s\", null, {\"k\": -2.5}], \"b\": {}} ")
+    assertEq(r.beginObject(), Ok(()))
+    assertEq(r.nextKey(), Ok(Some("a")))
+    assertEq(r.beginArray(), Ok(()))
+    assertEq(r.nextElement(), Ok(true))
+    assertEq(r.readInt(), Ok(1))
+    assertEq(r.nextElement(), Ok(true))
+    assertEq(r.readBool(), Ok(true))
+    assertEq(r.nextElement(), Ok(true))
+    assert(!r.takeNull())
+    assertEq(r.readString(), Ok("s"))
+    assertEq(r.nextElement(), Ok(true))
+    assert(r.takeNull())
+    assertEq(r.nextElement(), Ok(true))
+    assertEq(r.readValue(), Ok(Json.obj(("k", Json.num(-2.5)))))
+    assertEq(r.nextElement(), Ok(false))
+    assertEq(r.nextKey(), Ok(Some("b")))
+    assertEq(r.beginObject(), Ok(()))
+    assertEq(r.nextKey(), Ok(None))
+    assertEq(r.nextKey(), Ok(None))
+    assertEq(r.finish(), Ok(()))
+    assertEq(JsonReader.fromString("[]").beginArray().map(_ -> 0), Ok(0))
+    assertEq(JsonReader.fromString("1 x").readLong(), Ok(long(1)))
+
+@test("the reader skips a value of any kind, and an error it makes names the last token read")
+readerSkips()
+    val r = JsonReader.fromString("[{\"a\": [[], {\"b\": \"\\u00e9\"}]}, true]")
+    assertEq(r.beginArray(), Ok(()))
+    assertEq(r.nextElement(), Ok(true))
+    assertEq(r.skipValue(), Ok(()))
+    assertEq(r.nextElement(), Ok(true))
+    assert(!r.takeNull())
+    assertEq(r.readReal().map(_ -> 0).mapErr(e -> (e.message, e.column)), Err(("expected a number, found a boolean", long(32))))
+    assertEq(r.error("here").column, long(32))
+    // A word that is not one is a fault of the text, met as soon as the reader looks at it.
+    val bad = JsonReader.fromString("[{\"a\": [[], {\"b\": \"\\u00e9\"}]}, nullx]")
+    assertEq(bad.beginArray(), Ok(()))
+    assertEq(bad.nextElement(), Ok(true))
+    assertEq(bad.skipValue(), Ok(()))
+    assertEq(bad.nextElement().mapErr(e -> (e.message, e.column)), Err(("unexpected word 'nullx' where a value was expected", long(32))))
+    assert(!bad.takeNull())

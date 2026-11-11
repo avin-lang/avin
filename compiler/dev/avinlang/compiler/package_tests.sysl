@@ -1251,6 +1251,61 @@ vendor_command_line()
 
 // Sysl dependencies.
 
+@test("a Sysl package the standard library names joins a program's only where one of its bindings reaches it")
+library_sysl_dependencies_join_where_reached()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    put(dir + "/library.hocon", "package { name = \"avin-library\", version = \"0.1.0\" }\nsysl-dependencies {\n  openssl { git = \"github.com/sysl-lang/openssl\", version = \"0.2.2\" }\n  digits { path = \"digits\" }\n}\n")
+    make_dir_all(dir + "/digits").unwrap()
+    // No binding reaches either package: nothing joins, and the runtime's and Sysl's own names never do.
+    assert_eq(with_library_sysl(dir, buf(), ["sysl.net.Socket", "avin.rt.socket_recv", "openssl"]).unwrap().len(), 0)
+    // A function and a handle of the package, its name a segment before the last.
+    val reached = with_library_sysl(dir, buf(), ["sysl.net.Socket", "sh.sysl.openssl.client"]).unwrap()
+    assert_eq(reached.len(), 1)
+    assert_eq(reached[0].label, "openssl")
+    assert(reached[0].origin is Git(_, _))
+    assert_eq(with_library_sysl(dir, buf(), ["sh.sysl.openssl.Stream"]).unwrap().len(), 1)
+    // A name that only begins with the package's name is not inside it.
+    assert_eq(with_library_sysl(dir, buf(), ["sh.sysl.openssl_extra.client", "sh.openssl2.f"]).unwrap().len(), 0)
+    // Two packages reached, in the library's order; a path is made absolute against the library.
+    val both = with_library_sysl(dir, buf(), ["avintest.digits.count", "sh.sysl.openssl.accept"]).unwrap()
+    assert_eq(both.len(), 2)
+    assert_eq(both[0].label, "openssl")
+    assert(both[1].origin is Local(_))
+    if both[1].origin is Local(d)
+        assert(d.starts_with("/") && d.ends_with("/digits"))
+    // A program naming the package keeps its own unless the library's is a later release of it.
+    var older: Buf[SyslPackage] = buf()
+    older.push(SyslPackage("openssl", Git("github.com/sysl-lang/openssl", "0.2.1")))
+    val raised = with_library_sysl(dir, older, ["sh.sysl.openssl.client"]).unwrap()
+    assert_eq(raised.len(), 1)
+    assert_eq(origin_words(raised[0].origin), "github.com/sysl-lang/openssl 0.2.2")
+    var newer: Buf[SyslPackage] = buf()
+    newer.push(SyslPackage("openssl", Git("github.com/sysl-lang/openssl", "0.3.0")))
+    assert_eq(origin_words(with_library_sysl(dir, newer, ["sh.sysl.openssl.client"]).unwrap()[0].origin), "github.com/sysl-lang/openssl 0.3.0")
+    var local: Buf[SyslPackage] = buf()
+    local.push(SyslPackage("openssl", Local("/somewhere/openssl")))
+    assert(with_library_sysl(dir, local, ["sh.sysl.openssl.client"]).unwrap()[0].origin is Local(_))
+    // A library without the file names none; one whose file is not a manifest is an error.
+    assert_eq(with_library_sysl(dir + "/digits", buf(), ["sh.sysl.openssl.client"]).unwrap().len(), 0)
+    put(dir + "/library.hocon", "sysl-dependencies = 3\n")
+    assert(with_library_sysl(dir, buf(), ["sh.sysl.openssl.client"]).unwrap_err().contains("`sysl-dependencies` is a block"))
+
+@test("the standard library's own manifest names OpenSSL for TLS, and is read as a manifest")
+library_manifest_names_openssl()
+    val m = read_manifest_named(repository_toolchain().library_dir(), LibraryManifestName).unwrap()
+    assert_eq(m.name, "avin-library")
+    assert_eq(m.sysl_dependencies.len(), 1)
+    assert_eq(m.sysl_dependencies[0].label, "openssl")
+    assert(origin_words(m.sysl_dependencies[0].origin).starts_with("github.com/sysl-lang/openssl "))
+
+// A dependency's origin in words: a repository and its version or commit, or a directory.
+private origin_words(o: Origin) -> string = o match
+    Git(c, v) -> c + " " + v
+    Rev(c, r) -> c + " " + r
+    Local(d) -> d
+    Member -> "member"
+
 @test("a manifest's sysl-dependencies are written as dependencies are, at a release, a commit or a directory")
 sysl_dependencies_read()
     val dir = make_temp_dir("avin-pkg").unwrap()

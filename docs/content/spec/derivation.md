@@ -277,18 +277,19 @@ that never encodes a `Person` compiles none of the encoder.
 ## A JSON library
 
 The core of a `json` library written with templates. `JsonWriter` writes text and places the
-commas; `JsonReader` reads tokens from a byte stream, one at a time.
+commas; `JsonReader` is the json package's [streaming reader](/spec/json/#reading-a-stream), which
+reads events from text in hand or from any `Reader`, one at a time.
 
 ```text
 data PathStep
     Key(name: string)
     Index(at: int)
 
-data JsonError(path: List[PathStep], message: string, line: int, column: int)
+data JsonError(message: string, line: long, column: long, offset: long, path: List[PathStep] = [])
 
 impl JsonError
-    inField(name: string) -> JsonError = JsonError(Key(name) :: path, message, line, column)
-    atIndex(i: int) -> JsonError = JsonError(Index(i) :: path, message, line, column)
+    inField(name: string) -> JsonError = JsonError(message, line, column, offset, Key(name) :: path)
+    atIndex(i: int) -> JsonError = JsonError(message, line, column, offset, Index(i) :: path)
 
 trait JsonEncoder
     encode(out: JsonWriter)
@@ -375,20 +376,17 @@ impl ShapeBuilder[JsonError] for FieldReader
         r.beginObject()?
         if t.variantCount == 1 then return Ok(0)
         if r.nextKey()? != Some(tagOf(t))
-            return Err(r.error(s"expected \"${tagOf(t)}\" first"))
+            return Err(r.error(s"expected \"${tagOf(t)}\" first, naming the variant"))
         val name = r.readString().mapErr(e -> e.inField(tagOf(t)))?
         t.variants.find(v -> nameOf(v) == name) match
             Some(v) -> Ok(v.index)
             None -> Err(r.error(s"unknown variant \"$name\"").inField(tagOf(t)))
 
-    next(v: VariantShape) -> Result[Option[int], JsonError] =
-        r.nextKey()? match
-            None -> Ok(None)
-            Some(key) -> v.fields.find(f -> !f.has(JsonOmit) && keyOf(f) == key) match
-                Some(f) -> Ok(Some(f.index))
-                None ->
-                    r.skipValue()?
-                    next(v)
+    next(v: VariantShape) -> Result[Option[int], JsonError]
+        while r.nextKey()? is Some(key)
+            if v.fields.find(f -> !f.has(JsonOmit) && keyOf(f) == key) is Some(f) then return Ok(Some(f.index))
+            r.skipValue()?
+        Ok(None)
 
     duplicate(f: FieldShape) -> JsonError = r.error(s"duplicate field \"${keyOf(f)}\"")
 
