@@ -673,12 +673,20 @@ directly. Tables of boxes, tuples and strings are filled as calls through new po
 data types' are. A **type record** per type is constant data that every descriptor of the type names,
 at offset 56: the number of the type's ancestors and their records' addresses. A class's ancestors
 are its superclasses and every trait it and they conform to, with their type arguments as it sees
-them; a tuple's are the tuple types its parts' ancestors make, one combination at a time. A type
+them. A tuple's record lists no other tuple types: it holds its parts' records instead, so the
+tuple types a tuple may be seen as, the product of its parts' ancestors, cost nothing until a type
+pattern names one. A type
 pattern loads the object's descriptor and its record: for a type nothing else can be (a built-in, a
 final class, a `data` type, a tuple of such, each with only invariant parameters), one comparison
 with the target's record; for an open class, a trait, an instance of a type with a covariant or
 contravariant parameter, or a tuple with a part of one, a call of the runtime's `avin_rt_conforms`, which
-scans the record's ancestors, so the test costs the number of ancestors. A generic instance is its
+scans the record's ancestors, so the test costs the number of ancestors, and for a tuple target
+compares the parts' records one by one: a part is one of the target's when its type is the same,
+a tuple seen as it in turn, or a class or data type with it among the ancestors its declarations
+give it (the record's first `part_view`), which keep the part's representation. Only a record some
+object has as its own type, through a layout, a box or a closure, gets equality and rendering
+entries; a record that a type pattern names, or that is only another's ancestor or part, has
+none, as no object can reach them through it. A generic instance is its
 own type with its own record, so `Box[int]` and `Box[string]` differ by address. A closure's
 descriptor names the record of its function's own type in the copy it was made from, and a function
 type, whose parameters and result vary and which a class may extend, is always tested through
