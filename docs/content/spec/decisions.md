@@ -6151,6 +6151,31 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- **String character-wise and parsing methods** (branch `stdlib-string`). Choices the spec did not
+  settle, in [`types.md`](/spec/types/#string):
+  - **`toBool` is exact.** Only `"true"` and `"false"`; `toBool` traps with the number-parse
+    message (`For input string: "…"`) on anything else, `toBoolOption` answers `None`. *Why:* a
+    parse that accepts `"True"`, `"1"` or `"yes"` hides data errors, and the exact form is the one
+    every program can state. *Alternatives:* case-insensitive; also `"1"`/`"0"`.
+  - **A `radix` outside 2 to 36 traps, in the `Option` forms too.** *Why:* a bad radix is the
+    caller's bug, not bad input, so `None` would hide it. *Alternative:* `None` from the `Option`
+    forms.
+  - **Radix digits are ASCII `0`–`9` and `a`–`z`, either case**, with the optional `+`/`-` sign of
+    the decimal forms, and no prefix (`"0x10".toInt(16)` is not a number). *Alternatives:* accept a
+    `0x`/`0b` prefix where it matches the radix.
+  - **`split(sep, limit)`: `limit` is the most pieces; the last holds the remaining text.** A
+    `limit` of 0 or less means no limit, 1 returns the whole string as one piece. *Why:* the
+    reading that needs no special negative case beyond "no limit". *Alternatives:* a limit of 0
+    dropping trailing empty pieces; a negative limit trapping.
+  - **`stripLineEnd` removes one terminator, `\n` or `\r\n`, never a lone `\r`**, agreeing with
+    `lines()`, which does not end a line at a `\r` either. *Alternative:* also a lone `\r`.
+  - **`compareIgnoreCase` compares the two after `toLowerCase`**, as `equalsIgnoreCase` equates
+    them, so its sign is `compare` of the lower-cased strings. *Alternative:* comparing character by
+    character after upper-casing.
+  - **`charIterator()` is a lazy `Iterator[char]` reading the string by offset**, with `next()` on
+    an exhausted one trapping like every iterator. `map`/`flatMap`/`filter` on a string answer a
+    `string`, not an iterator, and `tail`/`init` trap on the empty string as `Seq`'s do.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

@@ -155,6 +155,22 @@ most the largest `int` bytes.
 | `toInt()`, `toLong()` | The number written in decimal: an optional `-` or `+`, then one or more ASCII digits and nothing else; a trap, `For input string: "…"`, otherwise or when it does not fit the type |
 | `toReal()` | The number written as a decimal fraction, correctly rounded: an optional sign, digits with an optional point, an optional exponent (`3.25`, `-.5`, `1e10`); a trap, as `toInt`'s, for anything else, including white space, `nan`, `inf`, hexadecimal, and a number too large to be finite |
 | `toIntOption()`, `toLongOption()`, `toRealOption()` | `Some` of the number `toInt`, `toLong` or `toReal` reads, and `None` where it would trap |
+| `toInt(radix)`, `toLong(radix)` | As `toInt()` and `toLong()` with digits of base `radix`, 2 to 36: `0`–`9`, then `a`–`z` in either case; the same trap for text that is not such a number or does not fit, and a trap for a `radix` outside 2 to 36 |
+| `toIntOption(radix)`, `toLongOption(radix)` | `Some` of the number the radix form reads, and `None` where its text would trap; a `radix` outside 2 to 36 still traps, being the caller's mistake and not the text's |
+| `toBool()`, `toBoolOption()` | `true` for the text `true`, `false` for `false`, exactly (no other case, no white space); `toBool` traps, as `toInt` does, on any other text and `toBoolOption` answers `None` |
+| `map(f)`, `flatMap(f)` | A string of `f` applied to each character: `f` answers a `char` for `map` and a `string` for `flatMap`, and the results are joined in order |
+| `filter(p)`, `filterNot(p)` | The characters that do, or do not, satisfy `p`, in order |
+| `foreach(f)` | Calls `f` on each character, in order |
+| `exists(p)`, `forall(p)` | Whether some, or every, character satisfies `p`; false and true for the empty string |
+| `find(p)` | `Some` of the first character satisfying `p`, or `None` |
+| `takeWhile(p)`, `dropWhile(p)` | The longest prefix whose characters all satisfy `p`, and the string without it |
+| `span(p)`, `partition(p)` | A pair of strings: the longest prefix satisfying `p` and the rest; the characters that satisfy `p` and those that do not |
+| `splitAt(n)` | The pair of the first `n` characters and the rest; `n` is clamped as `take`'s is |
+| `tail()`, `init()` | All but the first, and all but the last, character; each traps on the empty string |
+| `charIterator()` | The characters as an `Iterator[char]` that decodes one character for each `next()`, making no vector |
+| `split(c)`, `split(sep, limit)`, `split(c, limit)` | `split` with a `char` separator; and with at most `limit` pieces, the last holding the rest of the text with its separators. A `limit` of 0 or less sets none, 1 gives the whole string, and an empty string separator traps |
+| `stripLineEnd()` | Without one `\n` or `\r\n` at its end; a lone `\r`, or no terminator, leaves it unchanged |
+| `compareIgnoreCase(o)` | The sign of the comparison after each character's simple lower-case mapping: negative, zero or positive |
 
 ```text
 val word = "café"
