@@ -5939,6 +5939,27 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `P12M`, which means one exact period); ISO's weeks (`P2W`, fourteen days, which `toIsoString`
   never writes).
 
+- Settled on the user's delegation 2026-11-11 (built on branch `tls-refusal`): **why a certificate was refused**. `TlsError.Certificate`
+  gains a second field, `why: TlsRefusal`, and `TlsError.refusal() -> Option[TlsRefusal]` answers it
+  (`None` for the other errors). `TlsRefusal` is `HostMismatch`, `Expired`, `NotYetValid`,
+  `Untrusted` and `Other(code: long)`, and its `message()` and the error's say the reason in words.
+  The package `openssl` 0.2.3 supplies the X509 verdict (`Error.verify`); the mapping to the five
+  kinds is the function `refusalOf` in `library/avin/net/tls/tls.avin`, the table of `openssl`'s
+  own `refusal()` (62 host; 10; 9; 2, 18, 19, 20, 21 untrusted) with one addition: 64, a certificate
+  for another IP address, is `HostMismatch` too (OpenSSL gives it a code of its own, so
+  `openssl`'s `Error.refusal()` would answer `Other(64)` for `127.0.0.2`). The verdict is read in
+  Avin and not through `openssl`'s `Refusal`, so the addition lives in one place. *Why*: a program
+  can tell a wrong name from an untrusted issuer, which read identically before; the reason is a
+  value, so it is matched, not parsed out of text. The field is not an `Option`, since a refused
+  certificate always has a verdict and `Other` carries the unusual ones. The field is `why` because
+  a variant field named `refusal` would clash with the method. *Alternatives*: an `Option` field (a
+  `None` that cannot happen); one variant per kind, `HostMismatch` and the like as `TlsError`
+  variants (every existing `Certificate(_)` pattern would stop matching and a program that only
+  cares that a certificate was refused would need four arms); keeping `Certificate(text)` and
+  adding a separate query (the reason would have to be stored somewhere anyway). **Breaking**:
+  `Certificate(_)` patterns become `Certificate(_, _)`. Review with the user whether the
+  `Certificate` arity change is wanted over a variant per kind.
+
 **Deferred**
 
 - Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;

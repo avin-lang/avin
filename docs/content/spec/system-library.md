@@ -1001,8 +1001,13 @@ writing is an `IoError.Other` whose text begins `TLS:`, and the connection's end
 `close_notify` or by the TCP connection closing, reads as the end of a TCP connection's does.
 
 `TlsError` says why a connection could not be made: `Transport(IoError)`, the connection beneath
-could not be made, broke or timed out; `Certificate(text)`, the peer's certificate was refused, as
-untrusted, self-signed, expired or for another host; `Handshake(text)`, the two ends did not agree,
+could not be made, broke or timed out; `Certificate(text, why)`, the peer's certificate was refused,
+and `why` is a `TlsRefusal` saying how: `HostMismatch` (for another host or IP address), `Expired`,
+`NotYetValid`, `Untrusted` (an unknown issuer, or a self-signed certificate) or `Other(code)`, OpenSSL's
+number for a rarer verdict; `refusal()` answers it as an `Option[TlsRefusal]`, `None` for any other
+error, and the `message()` of the error and of the refusal names it ("the certificate is for another
+host", "the certificate has expired", "the certificate is not yet valid", "the certificate is not
+trusted", "the certificate was refused (code N)"); `Handshake(text)`, the two ends did not agree,
 as with a peer that does not speak TLS or ends the connection in the handshake; and
 `Credentials(text)`, a certificate or key given to this end cannot be used. `message()` says it in
 words. Each `TlsStream`, `TlsClient` and `TlsServer` is sendable, a stream belonging to one thread
