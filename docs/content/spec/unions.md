@@ -438,7 +438,9 @@ same at `-O0` and `-O2`:
   names its type. The scalar's bits and the reference are kept in slots of their own, so the
   collector's roots stay exact: the reference slot holds a pointer or nothing, never a number. A
   union of scalars alone has no reference slot. Injecting a scalar writes the tag and the bits, and
-  allocates nothing.
+  allocates nothing; neither does passing the union, returning it, matching it, comparing it with
+  `==`, hashing it or showing it, each of which reads the tag. Seen as an `Any` or as a trait, a
+  scalar member is boxed there, as any scalar is.
 - The tag numbering is fixed by the normal form, not by the order written, so `int | string` and
   `string | int` are one layout.
 - Generic code is compiled per instance, as all generic code is, so `Vector[T | int]` at `T = string`

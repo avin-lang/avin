@@ -6474,6 +6474,64 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (built on branch `union-tag-payload`): **The words of a union with a scalar member, and
+  where they live** (the second part of Settled → unions → Representation, built on the multi-word
+  values above).
+  - **Three words**: a 32-bit tag, 64 bits for a scalar member and, where a member is a reference, the
+    reference. Tag 0 says the union holds a reference, whose header names its type; tag `i + 1` says
+    it holds scalar member `i`, the scalar members ordered by their type keys, so the order written
+    never changes the layout. A scalar is kept in the bits as its value: an integer sign-extended, a
+    `byte` and a `char` zero-extended, a `bool` as 0 or 1, a `real`'s bits unchanged (so a NaN's
+    payload and a zero's sign survive), `unit` as nothing. A union of scalars alone has two words.
+    *Why*: the reference word is the only one the frame plan can root, and a separate 64-bit word
+    holds every scalar unchanged. *Alternatives*: one word for the tag and the bits together (a
+    `long` member needs all 64 bits); a word per scalar member (more words for nothing); numbering by
+    the order written (`int | string` and `string | int` would differ).
+  - **In lowering, the union is a reference to its cell**, an object of those words that is made once
+    and only read; a function takes and gives each union as its words (`MCell` in a signature,
+    replaced by the words before anything else reads the program), and makes a cell of the words it
+    receives. So scalar replacement keeps every cell of a local, a parameter or a result as its
+    fields in slots, and none of them allocates; a call in tail position passes its callee's words
+    straight on. *Why*: every operation on a union (injection, a `match`, `==`, the hash,
+    rendering) is written once, on the cell, and the existing scalar replacement makes it words
+    everywhere a value stays in its function. *Alternatives*: lowering carrying several operands for
+    one value through every expression form (a much larger change to every join, local and call
+    path, for the same code after scalar replacement).
+  - **Where a union is stored** (a field, an element, a capture, a module-level value, a generic
+    type's storage at a union argument), **its cell stays an object**, traced through its reference
+    word, until those places lay a union out as its words too: storing a union allocates its cell as
+    boxing a scalar did, a string member included. *Why*: one representation per type everywhere, so
+    generic code at a union type argument needs no conversion where it meets its storage.
+    *Alternatives*: converting to an `Any` at every such boundary (a box only for a scalar member, but
+    a conversion at every generic call and field access, each a place to get wrong).
+  - **Converting to an `Any` or a trait** boxes a scalar member there and passes a reference member
+    as it is; **a member call** through a trait every member has converts the union the same way,
+    except `display`, `debug` and `toString`, which call the member's own implementation by the tag
+    with no box. `===` with an object compares the union as an `Any`, so a scalar member, a new box,
+    is never identical to it. **`==` and the hash** are decided by the tag: two values of one member
+    compare and hash as that member, and a reference as an `Any`, so a union and the same value as an
+    `Any` are equal and hash alike. Review with the user: storing a union with a string member now
+    allocates its cell where an `Any` did not, until fields and collections take the words.
+- Proposed (built on branch `union-tag-payload`): **Tuple type patterns by their parts' layouts.**
+  A tuple type pattern matches a tuple whose type as made is seen as the target with no conversion,
+  part by part: a part that is an object (a string, a tuple, a data value, an object of a class, a
+  function, or a union of references) is seen as an `Any` part, so a `(string, string)` and a
+  `(Dog, string)` are `(Any, string)`s; a scalar part, or a union with a scalar member, is only that
+  very part, so an `(int, string)` is no `(Any, string)` and an `(int, bool)` no
+  `(int | string, bool)`; a part naming a **union of references** takes any object there and then
+  tests that object's own type against the members, so `(Dog | Cat, int)` matches a tuple made as
+  `(Dog, int)`, as `(Dog | Cat, int)` or as `(Any, int)` holding a `Cat`, and not one holding a `Bird`
+  or a boxed number. A pattern on a tuple of known type that could never match by this rule is the
+  error any such pattern is (`a value of type (int, bool) is never a (int | string, bool), so this
+  type pattern never matches`). *Why*: the chapter's rule that a tuple converts only where each part
+  keeps its layout decides which tuples a pattern can take as its type; a union of references is
+  laid out as an `Any`, so a tuple made with one records an `Any` there and only the object can say
+  which member it is. *Alternatives*: matching only a tuple made with exactly the pattern's type
+  (what was built: `("a", "b")` was no `(Any, string)`); testing every part by the value it holds
+  (rebuilding the tuple at the pattern's layout where a scalar part would need a box, an allocation
+  hidden in a `match`). Review with the user: a union-of-references part tests the object, while a
+  class part tests the type the tuple was made with.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
