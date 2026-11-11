@@ -1,0 +1,180 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// A union with a scalar member is a tag and a payload: in a function a cell whose fields scalar
+// replacement keeps in slots, across a call its words, a 32-bit tag, 64 bits and, where a member is a
+// reference, the reference. Nothing is allocated for one in a local, a parameter or a result; one
+// stored in an object stays a cell there, and one seen as an `Any` boxes a scalar member.
+
+private union_lowered(text: string) -> MirProgram = lower_source(repository_toolchain(), source_of("probe.avin", text)) match
+    Ok(p) -> p
+    Err(d) -> panic(d)
+
+private index_of(program: MirProgram, symbol: string) -> usize
+    for i in 0..<program.functions.len()
+        if program.functions[i].symbol == symbol then return i
+    panic("no function " + symbol)
+
+private function_of(program: MirProgram, name: string) -> MirFunction = program.functions[index_of(program, "<program>." + name)]
+
+private insts_where(f: MirFunction, keep: (Inst) -> bool) -> int
+    var n = 0
+    for block in f.blocks
+        for inst in block.insts
+            if keep(inst) then n = n + 1
+    n
+
+private allocs(f: MirFunction) -> int = insts_where(f, inst -> inst is Alloc(_, _))
+
+/** The allocations of `f` by the descriptor named `name`. */
+private allocs_of(program: MirProgram, f: MirFunction, name: string) -> int = insts_where(f, inst -> inst match
+    Alloc(_, d) -> program.descriptors[d].name == name
+    _ -> false)
+
+private has_cell(s: MirSignature) -> bool
+    for p in s.params
+        if p is MCell(_) then return true
+    s.result is Some(MCell(_))
+
+const Pick: string = "pick(n: int) -> int | string = if n > 0 then n * 2 else \"neg\"\n\ntwice(u: int | string) -> int | string = u match\n    n: int -> n + 1\n    s: string -> s + s\n\n"
+
+@test("a union parameter is three words and a union result answers with the tag, then the bits and the reference")
+union_parameter_and_result_are_words()
+    val program = union_lowered(Pick + "main()\n    println(twice(pick(3)))\n")
+    val f = function_of(program, "twice")
+    assert_eq(f.signature.params.len(), 3usize)
+    assert(f.signature.params[0] is MInt(32))
+    assert(f.signature.params[1] is MInt(64))
+    assert(f.signature.params[2] is MRef)
+    assert(f.signature.result is Some(MInt(32)))
+    assert_eq(f.signature.rest.len(), 2usize)
+    assert(f.signature.rest[0] is MInt(64))
+    assert(f.signature.rest[1] is MRef)
+
+@test("a union of scalars alone has no reference word")
+scalar_union_has_no_reference_word()
+    val program = union_lowered("flip(u: int | bool) -> int | bool = u match\n    n: int -> n > 0\n    b: bool -> if b then 1 else 0\n\nmain()\n    println(flip(3))\n")
+    val f = function_of(program, "flip")
+    assert_eq(f.signature.params.len(), 2usize)
+    assert(f.signature.params[1] is MInt(64))
+    assert(f.signature.result is Some(MInt(32)))
+    assert_eq(f.signature.rest.len(), 1usize)
+    assert(f.signature.rest[0] is MInt(64))
+
+@test("members written in another order make the same words")
+member_order_is_one_layout()
+    val program = union_lowered("a(u: int | string) -> string | int = u\n\nb(u: string | int) -> int | string = a(u)\n\nmain()\n    println(b(1))\n")
+    val x = function_of(program, "a")
+    val y = function_of(program, "b")
+    assert_eq(x.signature.params.len(), y.signature.params.len())
+    assert_eq(x.signature.rest.len(), y.signature.rest.len())
+    assert_eq(allocs(x), 0)
+    assert_eq(allocs(y), 0)
+
+@test("no union's cell is left in a signature of a function or a call")
+no_cell_left_in_signatures()
+    val text = Pick + "apply(f: (int | string) -> int | string, u: int | string) -> int | string = f(u)\n\nmain()\n    println(apply(twice, pick(-1)))\n    val g: (int) -> int | string = n -> n\n    println(g(1))\n"
+    val program = union_lowered(text)
+    for f in program.functions
+        assert(!has_cell(f.signature))
+        for block in f.blocks
+            for inst in block.insts
+                if inst is Call(_, Indirect(_, s), _) then assert(!has_cell(s))
+
+@test("a union in a local, a parameter and a result allocates nothing, a scalar member or a reference")
+union_values_allocate_nothing()
+    val text = Pick + "total(n: int) -> int | long\n    var acc: int | long = 0\n    for i in 0..<n\n        acc = acc match\n            k: int -> if k > 1000 then long(k) else k + i\n            l: long -> l + long(i)\n    acc\n\nmain()\n    println(twice(pick(4)))\n    println(total(10))\n"
+    val program = union_lowered(text)
+    assert_eq(allocs(function_of(program, "pick")), 0)
+    assert_eq(allocs(function_of(program, "twice")), 0)
+    assert_eq(allocs(function_of(program, "total")), 0)
+
+@test("a union widened to a wider union and narrowed back by a type pattern allocates nothing")
+widening_and_narrowing_allocate_nothing()
+    val text = "widen(u: int | bool) -> int | bool | string = u\n\nnarrow(u: int | bool | string) -> int = u match\n    ib: (int | bool) -> ib match\n        n: int -> n\n        _: bool -> 1\n    _: string -> 2\n\nmain()\n    println(narrow(widen(3)))\n"
+    val program = union_lowered(text)
+    assert_eq(allocs(function_of(program, "widen")), 0)
+    assert_eq(allocs(function_of(program, "narrow")), 0)
+
+@test("== and the hash of a union are decided by its tag, allocating nothing")
+equality_and_hash_allocate_nothing()
+    val text = "same(a: int | string, b: int | string) -> bool = a == b\n\nmix(a: real | char) -> long = a.hash()\n\nmain()\n    println(same(1, \"1\"))\n    println(mix('x'))\n"
+    val program = union_lowered(text)
+    assert_eq(allocs(function_of(program, "same")), 0)
+    assert_eq(allocs(function_of(program, "mix")), 0)
+
+@test("a union shown is rendered by its member's own implementation, allocating nothing for a scalar")
+display_allocates_nothing()
+    val text = "show(u: int | bool) -> string = s\"[$u]\"\n\nmain()\n    println(show(3))\n"
+    val program = union_lowered(text)
+    val f = function_of(program, "show")
+    assert_eq(allocs_of(program, f, "box of int"), 0)
+    assert_eq(allocs_of(program, f, "box of bool"), 0)
+    assert_eq(allocs_of(program, f, "union cell of scalars"), 0)
+
+@test("a union seen as an Any boxes a scalar member there, and only there")
+widening_to_any_boxes()
+    val text = "seen(u: int | string) -> Any = u\n\nmain()\n    println(seen(1))\n"
+    val program = union_lowered(text)
+    val f = function_of(program, "seen")
+    assert_eq(allocs(f), 1)
+    assert_eq(allocs_of(program, f, "box of int"), 1)
+
+@test("a union stored in an object's field stays a cell there, traced through its reference word")
+union_in_field_is_a_cell()
+    val text = "data Holder(v: int | string)\n\nmake(n: int) -> Holder = Holder(n)\n\nmain()\n    println(make(1).v)\n"
+    val program = union_lowered(text)
+    val f = function_of(program, "make")
+    assert_eq(allocs_of(program, f, "union cell"), 1)
+    var found = false
+    for d in program.descriptors
+        if d.name == "union cell"
+            found = true
+            assert_eq(d.size, 24usize)
+            assert_eq(d.refs.len(), 1usize)
+            assert_eq(d.refs[0], 16usize)
+    assert(found)
+
+@test("a call in tail position of a function answering with a union passes the callee's words straight on")
+tail_call_passes_union_words()
+    val text = "ping(n: int) -> int | string = if n == 0 then \"done\" else pong(n - 1)\n\npong(n: int) -> int | string = if n == 0 then 0 else ping(n - 1)\n\nmain()\n    println(ping(7))\n"
+    val program = union_lowered(text)
+    val f = function_of(program, "ping")
+    assert_eq(allocs(f), 0)
+    // The call's later words are returned as the call gives them.
+    var words: Buf[usize] = buf()
+    for block in f.blocks
+        for inst in block.insts
+            if inst is CallWord(d, _, _) then words.push(d)
+    assert(words.len() >= 2)
+    var passed = 0
+    for block in f.blocks
+        for inst in block.insts
+            if inst is ReturnWord(_, Value(v))
+                for w in words
+                    if w == v then passed = passed + 1
+    assert(passed >= 2)
+
+@test("the reference word of a union parameter is rooted across an allocation, the tag and the bits never")
+reference_word_rooted()
+    val text = "keep(u: int | string, a: string) -> int | string\n    val b = a + \"!\"\n    println(b)\n    u\n\nmain()\n    println(keep(\"x\", \"y\"))\n"
+    val program = union_lowered(text)
+    val index = index_of(program, "<program>.keep")
+    val f = program.functions[index]
+    val graph = call_graph(program)
+    val plan = plan_roots(program, graph, collecting_functions(program, graph), index)
+    assert(f.value_types[0] is MInt(32))
+    assert(f.value_types[1] is MInt(64))
+    assert(f.value_types[2] is MRef)
+    // The union is kept in slots of its own, one per word; whatever holds it across the allocation
+    // in the frame is of reference type.
+    assert(plan.cells >= 1usize)
+    for v in 0..<plan.value_cells.len()
+        if plan.value_cells[v] is Some(_) then assert(f.value_types[v] is MRef)
+    for s in 0..<plan.slot_cells.len()
+        if plan.slot_cells[s] is Some(_) then assert(f.slots[s] is MRef)
+    assert(plan.value_cells[0] is None)
+    assert(plan.value_cells[1] is None)

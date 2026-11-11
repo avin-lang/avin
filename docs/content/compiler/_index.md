@@ -676,6 +676,33 @@ of its returns reads the parts out of the tuple, which scalar replacement then k
 a call in its tail position of a function yielding a tuple of the same words calls that function's
 copy and hands its words on. A caller that keeps the tuple calls `f`, which still makes it.
 
+**Unions with a scalar member.** `concrete` erases a union of references to `Any`, as which it is
+laid out, and keeps a union with a scalar member, whose words are a 32-bit tag, 64 bits for a scalar
+member and, where a member is a reference, the reference (`union_scalars` numbers the scalar members
+from 1 by their type keys; tag 0 is a reference). Lowering keeps such a value as a reference to its
+cell, an object of those words made once and only read, so every operation is written once, on the
+cell: injection (`inject_cell`, from a member, a smaller union, or a value boxed into a reference
+member), a type test by the tag and then the reference's record (`cell_test`), taking a member out
+(`cell_member`), widening to a wider union (`recell`) and narrowing to a smaller one
+(`narrow_cell`), conversion to and from an `Any` (`cell_as_any`, `any_as_cell`), `==` and the hash
+by the tag, and `display`, `debug` and `toString` by the member's own implementation. A signature
+names such a parameter or result `MCell`; `union_words` (`union_words.sysl`) then gives each
+function one parameter per word, a cell made from them at its entry, returns of the words read out
+of the returned cell, and each call its arguments' words and a cell made of the words it gets back,
+except a call whose value the block only returns, which passes the words straight on. Every cell of
+a function is then made in it and only read, so scalar replacement keeps it as its fields, and a
+union in a local, a parameter or a result allocates nothing; a cell stored in an object, an array, a
+closure or a module-level value stays an object (descriptors `union cell` and `union cell of
+scalars`), traced through its reference word. The checker converts a union with a scalar member to
+an `Any` or a trait with `Box`, as it does a scalar; a member call through such a trait boxes the
+receiver too, keeping it a variable so `dispatch` sees the union and renders it by its tag.
+
+A tuple type pattern is tested by the tuple's record: each record of a type kept as a reference to
+an object lists `Any`'s record first among the ancestors a tuple's part is seen through, so a
+`(string, int)` is an `(Any, int)`, and a tuple type with an `Any` part is never tested by its record
+alone. A part naming a union of references, erased to `Any` in the record, is then tested on the
+object the tuple holds there (`union_part_tests`).
+
 A method with type parameters of its own, a trait's or an overridable class method, holds a
 position in the checker's tables like any other, but no one function fills it: each list of its own
 type arguments is a different function. Lowering leaves its position empty and gives the method a

@@ -1,0 +1,301 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+
+// A union with a scalar member crosses a call as its words: the tag, a 32-bit integer; the bits of a
+// scalar member, a 64-bit integer; and, where a member is a reference, the reference. Lowering keeps
+// such a value as a reference to its cell (see `make_cell` in `lower.sysl`) and writes `MCell` where
+// a signature takes or gives one. This pass, run once every function is lowered and before anything
+// else reads them, replaces each `MCell` with the words:
+//
+// - a parameter becomes one parameter per word, and the function begins by making the cell its body
+//   reads out of them;
+// - a return of a cell reads its words out of it, giving the tag as the return's value and the others
+//   by `ReturnWord`;
+// - a call passes each cell argument's words, read out of the cell, and makes a cell of the words it
+//   gets back, unless the block returns the call's value as it is, which then returns those words
+//   straight on, so a call in tail position stays one.
+//
+// Every cell a function makes is then made from words in it and only read, so scalar replacement
+// keeps it as its fields, and a union passed to a call or returned from one allocates nothing.
+
+/** Where a cell keeps its words: the tag at 0, the bits at 8, the reference at 16. */
+const CellTagOffset: usize = 0
+const CellBitsOffset: usize = 8
+const CellReferenceOffset: usize = 16
+
+/** The descriptor of a union's cell, with a reference word where `refs`: found among `descriptors`,
+ * or added to them. */
+union_cell_descriptor(descriptors: *Buf[Descriptor], refs: bool) -> usize
+    val name = if refs then "union cell" else "union cell of scalars"
+    var i = 0usize
+    for d in *descriptors
+        if d.name == name then return i
+        i += 1
+    var offsets: Buf[usize] = buf()
+    if refs then offsets.push(CellReferenceOffset)
+    descriptors.push(Descriptor(name, 0, if refs then 24 else 16, offsets, false, buf(), 0, Fields, None))
+    descriptors.len() - 1
+
+/** The machine types of a union's words. */
+private cell_word_types(refs: bool) -> Buf[MirType]
+    var out: Buf[MirType] = buf()
+    out.push(MInt(32))
+    out.push(MInt(64))
+    if refs then out.push(MRef)
+    out
+
+private cell_offsets(refs: bool) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    out.push(CellTagOffset)
+    out.push(CellBitsOffset)
+    if refs then out.push(CellReferenceOffset)
+    out
+
+private has_cell(s: MirSignature) -> bool
+    for p in s.params
+        if p is MCell(_) then return true
+    s.result is Some(MCell(_))
+
+/** `s` with each `MCell` replaced by its words: a parameter by one parameter each, a result by the tag
+ * and the rest. */
+private words_of_signature(s: MirSignature) -> MirSignature
+    var params: Buf[MirType] = buf()
+    for p in s.params
+        p match
+            MCell(refs) ->
+                for w in cell_word_types(refs) do params.push(w)
+            _ -> params.push(p)
+    s.result match
+        Some(MCell(refs)) ->
+            var rest: Buf[MirType] = buf()
+            val words = cell_word_types(refs)
+            for k in 1..<words.len() do rest.push(words[k])
+            MirSignature(params, Some(MInt(32)), rest)
+        _ -> MirSignature(params, s.result, s.rest)
+
+/** Replaces every union cell in the signatures of `functions` and of their calls with the union's
+ * words. */
+union_words(functions: Buf[MirFunction], descriptors: *Buf[Descriptor]) -> Buf[MirFunction]
+    var any = false
+    for f in functions
+        if has_cell(f.signature) then any = true
+        for block in f.blocks
+            for inst in block.insts
+                if inst is Call(_, Indirect(_, s), _)
+                    if has_cell(s) then any = true
+    if !any then return functions
+    var out: Buf[MirFunction] = buf()
+    for f in functions
+        out.push(function_words(f, functions, descriptors))
+    out
+
+/** The code a function is being rewritten into: its value types, which grow as words are read. */
+private struct WordsCode
+    values: Buf[MirType]
+
+    fresh(*self, t: MirType) -> usize
+        self.values.push(t)
+        self.values.len() - 1
+
+end WordsCode
+
+/** Makes the cell `cell` of a union with a reference word where `refs`, holding `words`. */
+private make_cell_from(code: *WordsCode, insts: *Buf[Inst], cell: usize, descriptor: usize, refs: bool, words: Buf[Operand])
+    insts.push(Alloc(cell, descriptor))
+    val offsets = cell_offsets(refs)
+    for k in 0..<words.len()
+        val address = code.fresh(MPtr)
+        insts.push(Offset(address, Value(cell), offsets[k]))
+        insts.push(Store(Value(address), words[k]))
+    insts.push(Publish)
+
+/** The words of the cell `cell`, read out of it. */
+private read_words(code: *WordsCode, insts: *Buf[Inst], cell: Operand, refs: bool) -> Buf[Operand]
+    var out: Buf[Operand] = buf()
+    val offsets = cell_offsets(refs)
+    val types = cell_word_types(refs)
+    for k in 0..<offsets.len()
+        val address = code.fresh(MPtr)
+        insts.push(Offset(address, cell, offsets[k]))
+        val word = code.fresh(types[k])
+        insts.push(Load(word, Value(address)))
+        out.push(Value(word))
+    out
+
+/** How many times each value is read in `f`. */
+private value_reads(f: MirFunction) -> Buf[usize]
+    var reads: Buf[usize] = buf()
+    for _ in f.value_types do reads.push(0)
+    for block in f.blocks
+        for inst in block.insts
+            for o in inst_operands(inst)
+                if o is Value(v) then reads[v] += 1
+        block.term match
+            Return(Some(Value(v))) -> reads[v] += 1
+            Branch(Value(v), _, _) -> reads[v] += 1
+            _ -> ()
+    reads
+
+/** The operands an instruction reads. */
+private inst_operands(inst: Inst) -> Buf[Operand]
+    var out: Buf[Operand] = buf()
+    inst match
+        Call(_, callee, args) ->
+            if callee is Indirect(t, _) then out.push(t)
+            for a in args do out.push(a)
+        Binary(_, _, a, b) ->
+            out.push(a)
+            out.push(b)
+        Checked(_, _, _, a, b) ->
+            out.push(a)
+            out.push(b)
+        Compare(_, _, a, b) ->
+            out.push(a)
+            out.push(b)
+        Select(_, c, a, b) ->
+            out.push(c)
+            out.push(a)
+            out.push(b)
+        Convert(_, _, a) -> out.push(a)
+        Load(_, a) -> out.push(a)
+        Store(a, b) ->
+            out.push(a)
+            out.push(b)
+        AtomicLoad(_, a) -> out.push(a)
+        AtomicStore(a, b) ->
+            out.push(a)
+            out.push(b)
+        AtomicSwap(_, a, b) ->
+            out.push(a)
+            out.push(b)
+        AtomicCompareSet(_, a, b, c) ->
+            out.push(a)
+            out.push(b)
+            out.push(c)
+        Offset(_, a, _) -> out.push(a)
+        Index(_, a, b) ->
+            out.push(a)
+            out.push(b)
+        DescriptorOf(_, a) -> out.push(a)
+        MethodSlot(_, a, _) -> out.push(a)
+        CallEntry(_, a) -> out.push(a)
+        CallWord(_, call, _) -> out.push(Value(call))
+        ReturnWord(_, a) -> out.push(a)
+        _ -> ()
+    out
+
+/** `f` with its own cell parameters and result, and those of its calls, as words. */
+private function_words(f: MirFunction, functions: Buf[MirFunction], descriptors: *Buf[Descriptor]) -> MirFunction
+    var cells = false
+    for p in f.signature.params
+        if p is MCell(_) then cells = true
+    var code = WordsCode(buf())
+    var blocks: Buf[MirBlock] = buf()
+    if cells
+        // The parameters' words come first, then the other values, moved up past them, then the
+        // cell of each union parameter.
+        val n = f.signature.params.len()
+        var first: Buf[usize] = buf()
+        var params: Buf[MirType] = buf()
+        for p in f.signature.params
+            first.push(params.len())
+            p match
+                MCell(refs) ->
+                    for w in cell_word_types(refs) do params.push(w)
+                _ -> params.push(p)
+        for t in params do code.values.push(t)
+        for i in n..<f.value_types.len() do code.values.push(f.value_types[i])
+        var args: Buf[Operand] = buf()
+        var entry: Buf[Inst] = buf()
+        for i in 0..<n
+            f.signature.params[i] match
+                MCell(refs) ->
+                    val cell = code.fresh(MRef)
+                    args.push(Value(cell))
+                    var words: Buf[Operand] = buf()
+                    for k in 0..<cell_word_types(refs).len()
+                        words.push(Value(first[i] + k))
+                    make_cell_from(&code, &entry, cell, union_cell_descriptor(descriptors, refs), refs, words)
+                _ -> args.push(Value(first[i]))
+        val r = Remap(params.len() - n, 0, 0, n, args, buf())
+        for b in 0..<f.blocks.len()
+            var insts: Buf[Inst] = buf()
+            if b == 0
+                for inst in entry do insts.push(inst)
+            for inst in f.blocks[b].insts
+                insts.push(map_inst(r, inst))
+            blocks.push(MirBlock(insts, map_term(r, f.blocks[b].term)))
+    else
+        for t in f.value_types do code.values.push(t)
+        for block in f.blocks do blocks.push(block)
+    val reads = value_reads(MirFunction(f.symbol, f.signature, code.values, f.slots, blocks))
+    var result_refs: Option[bool] = None
+    if f.signature.result is Some(MCell(refs)) then result_refs = Some(refs)
+    var out: Buf[MirBlock] = buf()
+    for block in blocks
+        var insts: Buf[Inst] = buf()
+        // The calls of this block whose cell result the block only returns: their words.
+        var passed: Buf[usize] = buf()
+        var passed_words: Buf[Buf[Operand]] = buf()
+        for inst in block.insts
+            if !(inst is Call(_, _, _))
+                insts.push(inst)
+                continue
+            val (dest, callee, args) = inst match
+                Call(d, c, a) -> (d, c, a)
+                _ -> panic("a call that is no call")
+            val signature: Option[MirSignature] = callee match
+                Direct(g) -> Some(functions[g].signature)
+                Indirect(_, s) -> Some(s)
+                _ -> None
+            if !(signature is Some(_))
+                insts.push(inst)
+                continue
+            val s = signature.unwrap()
+            if !has_cell(s)
+                insts.push(inst)
+                continue
+            var operands: Buf[Operand] = buf()
+            for i in 0..<args.len()
+                if i < s.params.len() && s.params[i] is MCell(refs)
+                    for w in read_words(&code, &insts, args[i], refs) do operands.push(w)
+                else operands.push(args[i])
+            val target = callee match
+                Indirect(t, _) -> Indirect(t, words_of_signature(s))
+                _ -> callee
+            s.result match
+                Some(MCell(refs)) ->
+                    val tag = code.fresh(MInt(32))
+                    insts.push(Call(Some(tag), target, operands))
+                    var words: Buf[Operand] = buf()
+                    words.push(Value(tag))
+                    val types = cell_word_types(refs)
+                    for k in 1..<types.len()
+                        val w = code.fresh(types[k])
+                        insts.push(CallWord(w, tag, k))
+                        words.push(Value(w))
+                    if dest is Some(d)
+                        var returned_only = false
+                        if reads[d] == 1 && block.term is Return(Some(Value(x))) && result_refs is Some(r)
+                            returned_only = x == d && r == refs
+                        if returned_only
+                            passed.push(d)
+                            passed_words.push(words)
+                        else make_cell_from(&code, &insts, d, union_cell_descriptor(descriptors, refs), refs, words)
+                _ -> insts.push(Call(dest, target, operands))
+        var term = block.term
+        if result_refs is Some(refs)
+            if block.term is Return(Some(v))
+                var words: Option[Buf[Operand]] = None
+                if v is Value(x)
+                    for k in 0..<passed.len()
+                        if passed[k] == x then words = Some(passed_words[k])
+                val given = words match
+                    Some(w) -> w
+                    None -> read_words(&code, &insts, v, refs)
+                for k in 1..<given.len()
+                    insts.push(ReturnWord(k, given[k]))
+                term = Return(Some(given[0]))
+        out.push(MirBlock(insts, term))
+    MirFunction(f.symbol, words_of_signature(f.signature), code.values, f.slots, out)
