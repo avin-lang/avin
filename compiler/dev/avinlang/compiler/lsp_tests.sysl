@@ -341,6 +341,63 @@ lsp_package_file_sees_siblings()
     val answer = lsp_every(&again, lsp_open(uri, text))
     assert(answer.contains("declared more than once"), answer)
 
+// A manifest asking for Avin `avin`.
+private lsp_manifest_needing(avin: string) -> string = s"package {\n  name = \"pkg\"\n  version = \"0.1.0\"\n  avin = \"$avin\"\n}\n"
+
+@test("lsp: a manifest needing a later Avin is told so at its `avin` value, and cleared once it asks for this one")
+lsp_manifest_later_avin()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    defer _ = remove_dir_all(dir)
+    make_dir_all(dir + "/pkg").unwrap()
+    val file = dir + "/pkg/avin.hocon"
+    write_text(file, lsp_manifest_needing(Version)).unwrap()
+    val uri = lsp_file_uri(file)
+    var server = lsp_ready()
+    // The manifest is read as a manifest, never as Avin source: one asking for this Avin is clean.
+    assert_eq(lsp_one(&server, lsp_open(uri, lsp_manifest_needing(Version))), lsp_publish_of(uri, ""))
+    val later = lsp_one(&server, lsp_change(uri, lsp_manifest_needing("999.0.0")))
+    assert_eq(later, lsp_publish_of(uri, lsp_error_of(3, 9, 3, 18, s"`pkg` 0.1.0 needs Avin 999.0.0 or later, and this is Avin $Version: upgrade Avin to 999.0.0 or later to build it")))
+    // An earlier Avin, numerically earlier though not as text, is satisfied.
+    assert_eq(lsp_one(&server, lsp_change(uri, lsp_manifest_needing("0.0.9"))), lsp_publish_of(uri, ""))
+    assert_eq(lsp_one(&server, lsp_change(uri, lsp_manifest_needing("0.0.1"))), lsp_publish_of(uri, ""))
+
+@test("lsp: a malformed `avin` and the manifest's other mistakes are told at their place")
+lsp_manifest_malformed()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    defer _ = remove_dir_all(dir)
+    make_dir_all(dir + "/pkg").unwrap()
+    val uri = lsp_file_uri(dir + "/pkg/avin.hocon")
+    var server = lsp_ready()
+    val bad = lsp_one(&server, lsp_open(uri, lsp_manifest_needing("0.18")))
+    assert_eq(bad, lsp_publish_of(uri, lsp_error_of(3, 9, 3, 15, s"`0.18` is not a version of Avin: `avin` names the least Avin the package builds with, three numbers such as `$Version`")))
+    val unknown = lsp_one(&server, lsp_change(uri, "package {\n  name = \"pkg\"\n  version = \"0.1.0\"\n  author = \"me\"\n}\n"))
+    assert(unknown.contains("`author` is not a key of `package`"), unknown)
+    assert(unknown.contains(lsp_test_range(3, 2, 3, 8)), unknown)
+    // A manifest written for a later Avin may hold keys this one does not know: the upgrade is told.
+    val newer = lsp_one(&server, lsp_change(uri, "package {\n  name = \"pkg\"\n  version = \"0.1.0\"\n  avin = \"999.0.0\"\n  licence = \"x\"\n}\n"))
+    assert(newer.contains("needs Avin 999.0.0 or later"), newer)
+    assert(!newer.contains("licence"), newer)
+
+@test("lsp: a file of a package needing a later Avin tells the manifest so, and the file that it cannot be read")
+lsp_package_file_later_avin()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    defer _ = remove_dir_all(dir)
+    make_dir_all(dir + "/pkg").unwrap()
+    write_text(dir + "/pkg/avin.hocon", lsp_manifest_needing("999.0.0")).unwrap()
+    val text = "main() = ()\n"
+    write_text(dir + "/pkg/main.avin", text).unwrap()
+    val uri = lsp_file_uri(dir + "/pkg/main.avin")
+    val manifest_uri = lsp_file_uri(dir + "/pkg/avin.hocon")
+    var server = lsp_ready()
+    val answer = lsp_every(&server, lsp_open(uri, text))
+    assert(answer.contains(lsp_publish_of(manifest_uri, lsp_error_of(3, 9, 3, 18, s"`pkg` 0.1.0 needs Avin 999.0.0 or later, and this is Avin $Version: upgrade Avin to 999.0.0 or later to build it"))), answer)
+    assert(answer.contains(s"{\"uri\":\"$uri\",\"diagnostics\":[{"), answer)
+    // Asking for this Avin, the package is analyzed and both are cleared.
+    write_text(dir + "/pkg/avin.hocon", lsp_manifest_needing(Version)).unwrap()
+    val fixed = lsp_every(&server, lsp_change(uri, text))
+    assert(fixed.contains(lsp_publish_of(uri, "")), fixed)
+    assert(fixed.contains(lsp_publish_of(manifest_uri, "")), fixed)
+
 // ---- hover, definition, outline ----
 
 // The program the hover and definition exchanges read. Line 9 holds a character outside the BMP
