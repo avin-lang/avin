@@ -1,6 +1,7 @@
 /* The chain and the record of the field and conversion tests: see avin_fields.h. */
 #include "avin_fields.h"
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -187,6 +188,14 @@ fxf_record *fxf_record_new(void) {
         .columns = 4,
         .num_cells = 3,
         .tag_count = 3,
+        .box = {-LONG_MAX - 1, -2, 300, LONG_MAX},
+        .labelled = {"\xc3\xa9tiquette \xf0\x9f\x98\x80", 42},
+        .corners = {{1, 2}, {3, 4}, {5, 6}},
+        .anchor = {-7, 8},
+        .family_name = "Kaisei Decol",
+        .style_name = (fxf_string2 *)"Regular",
+        .raw = (fxf_ubyte *)"raw",
+        .signed_raw = (const fxf_sbyte *)"signed",
     };
     fxf_record *r = made(sizeof *r);
     memcpy(r, &sample, sizeof *r);
@@ -206,6 +215,12 @@ fxf_record *fxf_record_new(void) {
     r->cells[2].header.kind = 3;
     r->cells[2].header.length = 1;
     r->tags = (const char **)tag_texts;
+    r->scaled = made(sizeof *r->scaled);
+    r->scaled->metrics.x_ppem = 65535;
+    r->scaled->metrics.ascender = -9000000000L;
+    r->scaled->metrics.origin.x = 11;
+    r->scaled->metrics.origin.y = -12;
+    r->scaled->metrics.shade = FXF_LIGHT;
     count(FXF_RECORD, FXF_CREATED);
     return r;
 }
@@ -265,4 +280,40 @@ long long fxf_record_sum(const fxf_record *r) {
     for (int i = 0; i < r->count; i++) sum += r->values[i];
     sum += (long long)(r->single * 100) + (long long)(r->precise * 100) + (r->flag ? 1000 : 0);
     return sum;
+}
+
+static _Thread_local char shapes_text[512];
+
+const char *fxf_record_shapes(fxf_record *r) {
+    check_record(r, "a freed record's shapes read");
+    const struct fxf_metrics *m = &r->scaled->metrics;
+    snprintf(shapes_text, sizeof shapes_text, "box %ld %ld %ld %ld; metrics %u %ld (%d, %d) %d; corners (%d, %d) (%d, %d) (%d, %d); labelled %d",
+             r->box.x_min, r->box.y_min, r->box.x_max, r->box.y_max, (unsigned)m->x_ppem, m->ascender, m->origin.x, m->origin.y,
+             (int)m->shade, r->corners[0].x, r->corners[0].y, r->corners[1].x, r->corners[1].y, r->corners[2].x, r->corners[2].y,
+             r->labelled.id);
+    return shapes_text;
+}
+
+void fxf_record_bad_metrics(fxf_record *r) { r->scaled->metrics.shade = (enum fxf_shade)99; }
+
+const fxf_string *fxf_family(const fxf_record *r) { return r->family_name; }
+
+fxf_string2 *fxf_style(const fxf_record *r) { return r->style_name; }
+
+long fxf_string_length(const fxf_string *s) { return (long)strlen(s); }
+
+long fxf_string2_length(fxf_string2 const *s) { return (long)strlen(s); }
+
+long fxf_cstring_length(fxf_cstring *s) { return (long)strlen(s); }
+
+long fxf_mutable_length(fxf_string *s) { return (long)strlen(s); }
+
+void fxf_family_out(const fxf_record *r, const fxf_string **name) { *name = r->family_name; }
+
+const fxf_ubyte *fxf_raw(const fxf_record *r) { return r->raw; }
+
+long fxf_sbyte_length(const fxf_sbyte *s) { return (long)strlen((const char *)s); }
+
+int fxf_with_family(const fxf_record *r, int (*f)(const fxf_string *name, void *userdata), void *userdata) {
+    return f(r->family_name, userdata);
 }

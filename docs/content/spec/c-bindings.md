@@ -203,6 +203,15 @@ avin: trap: value out of range for long at main.avin:13:13
   discards it ([proposed](/spec/decisions/#proposed)).
 - **A typedef of either pointer crosses as the header's type is**: as a result a `char *` or a
   `const char *` typedef, as a parameter only a `const char *` one, which the C unit checks.
+- **So does one pointer to a typedef of `char`** ([proposed](/spec/decisions/#proposed)), as
+  FreeType's `const FT_String *` is (`typedef char FT_String`): through a chain of typedefs, with
+  `const` before the typedef, after it or inside it (`typedef const char T`), at a parameter, a
+  result, an `out` value, a callback's parameter and a field, wherever `char *` and `const char *`
+  cross as a string. Only the headers say what the typedef is, so the C unit checks the whole
+  pointer is `char *` or `const char *` by the rule above; a typedef of `unsigned char` or
+  `signed char` holds bytes rather than text, and is refused saying so
+  (`` the C type `const FT_Byte *` of the result points at `unsigned char` or `signed char` in the
+  headers, which hold bytes rather than text ``), as a field pointing at either is.
 - A `char *` parameter, which C may write, does not take a `string`: it takes an
   [array](#arrays-and-out-parameters).
 
@@ -364,19 +373,23 @@ record ([proposed](/spec/decisions/#proposed)).
 The collector frees what is unreachable in no order of its own: a holder and the handle it keeps,
 found dead in one collection, are finalized in either order. That is harmless where the holder's
 `release` never touches what it keeps, and a use after free where it does. A FreeType face belongs to
-its library, `FT_Done_FreeType` frees every face still in the library, and `FT_Done_Face` on one of
-them afterwards frees it twice.
+its library, freeing the library frees every face still in it, and `FT_Done_Face` on one of them
+afterwards frees it twice.
 
 So **a kept handle whose class declares `retain` is held by a C reference**
 ([proposed](/spec/decisions/#proposed)): when the call succeeds the holder takes a reference of its
 own through the kept class's `retain`, records the C pointer, and gives it back through that class's
 `release` **after its own `release`**. Whichever finalizer the collector runs first, C sees the holder
 released before what it keeps. FreeType counts both its libraries (`FT_Reference_Library`) and its
-faces (`FT_Reference_Face`), so a face keeps its library this way, and `FT_Done_FreeType` from the
-library's own handle only drops a count while a face still holds one:
+faces (`FT_Reference_Face`), so a face keeps its library this way. **The `release` gives back one
+reference and no more**: `FT_Done_Library` drops the count and frees the library with its last, so
+the library's own handle, given back while a face still holds a reference, only drops a count.
+`FT_Done_FreeType`, the pair of `FT_Init_FreeType`, is not a `release`: after dropping the count it
+frees the library's memory manager whatever the count is, and a face kept past it allocates through
+freed memory at its next load:
 
 ```avin
-@c(type: "FT_Library", release: "FT_Done_FreeType", retain: "FT_Reference_Library")
+@c(type: "FT_Library", release: "FT_Done_Library", retain: "FT_Reference_Library")
 class Library
 
 @c("FT_Error FT_New_Face(FT_Library library, const char *path, FT_Long index, out FT_Face *face)",
@@ -513,7 +526,7 @@ field that is a pointer is read as a string or a borrowed handle by the same rul
 - **The field is a member path of the struct `self` points at**, `"width"`, `"origin.x"`,
   `"glyph->bitmap.rows"`, read as `self->` followed by it. The handle's type must point at a struct
   the headers define; one they only declare is refused when the C unit compiles the accessor.
-- **A field is read as an integer type, `byte`, `bool`, `real`, an enum mirror, a string or a handle**, or the memory
+- **A field is read as an integer type, `byte`, `bool`, `real`, an enum mirror, a struct mirror, a string or a handle**, or the memory
   a byte pointer points at is lent as a [view](#buffers) with `view` and `length:`. The C unit
   checks the field is the kind its Avin type needs (an integer or enumeration, one byte wide for
   `byte`, a `bool` or an integer for `bool`, a floating-point type for `real`, `char *` or
@@ -533,12 +546,27 @@ field that is a pointer is read as a string or a borrowed handle by the same rul
   @c(field: "data[i].header.type", bound: "self->num_data")
   kind(i: int) -> PathDataType
   ```
+- **A field may be read and written as a [struct mirror](#structs-by-value)**, whole
+  ([proposed](/spec/decisions/#proposed)): the field is the struct the mirror mirrors, which the C
+  unit checks, reached by any member path, through pointers and into arrays. The reader copies the
+  struct into memory of its own and reads a new value of the mirror out of it, each field converted
+  as a mirror C fills is, with the same traps, its strings copied and left to C, the mirrors and enum
+  mirrors it holds read in place; the writer lays the value out as C's struct and assigns it. A
+  mirror holding a string, in a field of its own or of a mirror it holds, is only read, as a string
+  field is, and a mirror in an `Option` is neither. FreeType's face box and size metrics:
+
+  ```avin
+  @c(field: "bbox")
+  boundingBox() -> BBox
+  @c(field: "size->metrics")
+  sizeMetrics() -> SizeMetrics
+  ```
 - **A handle read from a field is lent**, as a `borrowed` result is: it takes a reference of its own
   through its class's `retain`, so the class must declare one, and a class with `kept:` cannot be
   read, since the accessor keeps nothing. `borrowed` is not written.
 - **A writer answers `unit`, and its last parameter is the value**, written as an argument of the
   field's type is converted: a value the field cannot hold stops the program at the call. Only a
-  scalar is written: a string or a handle stored into a struct would leave C holding memory or a
+  scalar, an enum mirror or a struct mirror holding no string is written: a string or a handle stored into a struct would leave C holding memory or a
   reference no one gives back, so those fields are read only ([proposed](/spec/decisions/#proposed)).
   A `const` field, an array, or anything else C cannot assign is refused at the accessor.
 - **Every other parameter is an index**, an `int` or a `long` the field names, passed to C as a
@@ -1260,7 +1288,7 @@ data RenderMode
 @c(const: "FT_LOAD_DEFAULT")
 val loadDefault: int
 
-@c(type: "FT_Library", release: "FT_Done_FreeType", retain: "FT_Reference_Library")
+@c(type: "FT_Library", release: "FT_Done_Library", retain: "FT_Reference_Library")
 class Library
 
 @c("FT_Error FT_Init_FreeType(out FT_Library *library)")
@@ -1282,6 +1310,13 @@ openFace(library: Library, path: string) -> Result[Face, FreeTypeError] =
 data Glyph
     Glyph(width: int, rows: int, left: int, top: int, advance: real, pixels: Array[byte])
 
+@c(struct: "FT_BBox")
+data BBox(@c("xMin") xMin: long, @c("yMin") yMin: long, @c("xMax") xMax: long, @c("yMax") yMax: long)
+
+@c(struct: "FT_Size_Metrics")
+data SizeMetrics(xPpem: int, yPpem: int, xScale: long, yScale: long, ascender: long, descender: long,
+                 height: long, maxAdvance: long)
+
 @c(type: "FT_Face", release: "FT_Done_Face", retain: "FT_Reference_Face",
    as: ["FT_GlyphSlot = self->glyph"])
 class Face
@@ -1290,6 +1325,12 @@ class Face
 
     @c(field: "num_glyphs")
     glyphCount() -> long
+
+    @c(field: "bbox")
+    boundingBox() -> BBox
+
+    @c(field: "size->metrics")
+    sizeMetrics() -> SizeMetrics
 
     @c("FT_Error FT_Set_Pixel_Sizes(FT_Face self, FT_UInt width, FT_UInt height)")
     private setPixelSizesRaw(width: int, height: int) -> Result[unit, int]
@@ -1337,9 +1378,11 @@ class Face
 ```
 
 What each piece does here: a `Face` holds a C reference to its `Library`, so the two are given back
-in FreeType's order whichever the collector finalizes first; a face made over memory keeps the
-`ByteBlock` FreeType reads lazily for the face's whole life, which an array, copied for the call,
-could not be (`FT_Done_Face` reads none of it, so the block may be freed first). The glyph slot is
+in FreeType's order whichever the collector finalizes first, each reference by `FT_Done_Library`,
+which frees the library only with its last; a face's box and its size's metrics are read whole as
+struct mirrors, and the family name, an `FT_String *`, a typedef of `char`, is a string; a face made
+over memory keeps the `ByteBlock` FreeType reads lazily for the face's whole life, which an array,
+copied for the call, could not be (`FT_Done_Face` reads none of it, so the block may be freed first). The glyph slot is
 the face's own, reached through field expressions and passed to `FT_Render_Glyph` through `as:`,
 since it has no reference count of its own to be a handle by. Its scalar fields are read before the
 bitmap is lent, because each read is a use of the face and would close the view; the bitmap is copied

@@ -131,7 +131,8 @@ struct CUnitHandle
  * names its glue, the field, the names of its indices and the bound of each, whether it writes the
  * field, the kind of C type the field must be for the Avin type it reads or writes, or for a handle
  * read the handle's class, that Avin type, the unit and span that place the accessor, and for a field
- * lent as a view, whether it is lent `writable` and the C expression its length is ("" for no view). */
+ * lent as a view, whether it is lent `writable` and the C expression its length is ("" for no view);
+ * and for a field read or written as a struct mirror, the C struct it mirrors ("" for none). */
 struct CUnitField
     name: string
     symbol: usize
@@ -146,6 +147,7 @@ struct CUnitField
     span: Span
     writable: bool
     length: string
+    mirror: string
 
 /** The handle a class's `kept:` names: the name `release:` gives its pointer, the kept class's index
  * and its C type. */
@@ -419,15 +421,18 @@ private c_unit_fields(program: TProgram, k: usize) -> Buf[CUnitField]
         val avin = if writer then s.params[last] else result
         var kind: Option[CKind] = None
         var handle: Option[usize] = None
+        var mirror = ""
         val lent = field.view && !writer && field.length != ""
         if lent then ()
         elif c_handle_form(avin, program.data, program.classes) is Some(h) then handle = Some(h.class_index)
         elif !(c_text_form(avin, program.data, program.classes) is NoText) then kind = Some(KindText)
         // An enum mirror is read and written as the integer its enum is.
         elif c_mirror_of(avin, program.data) is Some(_) then kind = Some(KindInteger)
+        // A struct mirror is read and written whole, as the struct it mirrors.
+        elif c_struct_of(avin, program.data) is Some(d) then mirror = c_struct_text(program.data[d].decl)
         else kind = c_field_kind(avin)
-        if kind is None && handle is None && !lent then continue
-        out.push(CUnitField(s.name, n, field.expr, indices, field.bounds, writer, kind, handle, avin, s.unit, s.decl.name_span, field.writable, if lent then field.length else ""))
+        if kind is None && handle is None && !lent && mirror == "" then continue
+        out.push(CUnitField(s.name, n, field.expr, indices, field.bounds, writer, kind, handle, avin, s.unit, s.decl.name_span, field.writable, if lent then field.length else "", mirror))
     out
 
 /** The C unit of a program whose C bindings are `bindings` and whose packages name `libraries`. Each
@@ -611,6 +616,9 @@ enum CUnitLine
     /** The check that the typedef `name`, parameter `position` of `bindings[binding]` (0 for the
      * result), is the kind `kind` needs. */
     KindLine(binding: usize, position: usize, name: string, kind: CKind)
+    /** The check that the type `name`, parameter `position` of `bindings[binding]` (0 for the result),
+     * crossing as a string, is no pointer to `unsigned char` or `signed char`. */
+    BytesTextLine(binding: usize, position: usize, name: string)
     /** The check that the type parameter `position` of `bindings[binding]` points at is the element
      * type of the Avin array passed there, as it is, by kind, size and sign. */
     ElementLine(binding: usize, position: usize)
@@ -777,7 +785,10 @@ c_unit_source_of(parts: CUnitParts, libraries: Buf[CLibrary]) -> CUnitSource
         for k in 0..<p.params.len() + 1
             // An `out` or `inout` parameter's value is the type its pointer points at, answered.
             val written = k > 0 && !(p.params[k - 1].mode is CIn)
-            val c = if k == 0 then p.result elif written then p.params[k - 1].pointee else p.params[k - 1].ty
+            val written_c = if k == 0 then p.result elif written then p.params[k - 1].pointee else p.params[k - 1].ty
+            val text = if k == 0 then p.result_text elif written then p.params[k - 1].pointee_text else p.params[k - 1].text
+            // One pointer to a typedef crosses as a string where the headers make the typedef `char`.
+            val c = c_text_position(written_c, text, b.forms[k])
             val avin = if k == 0 then b.result else b.params[k - 1]
             val kind = c_kind_needed(c, avin, b.forms[k], k == 0 || written) match
                 Some(kind) -> kind
@@ -787,8 +798,7 @@ c_unit_source_of(parts: CUnitParts, libraries: Buf[CLibrary]) -> CUnitSource
                 val tag = kind_tag(kind) + " " + name
                 if !contains_text(kinds, tag)
                     kinds.push(tag)
-                    out.push(s"_Static_assert(${kind_test(kind, name)}, \"avin: the C type $name\");\n")
-                    lines.push(KindLine(i, k, name, kind))
+                    kind_asserts(&out, &lines, i, k, kind, name)
             if !c_kind_measured(kind) then continue
             val key = c_measure_key(c, kind)
             if !contains_text(measured, key)
@@ -804,10 +814,10 @@ c_unit_source_of(parts: CUnitParts, libraries: Buf[CLibrary]) -> CUnitSource
                 _ -> continue
             val positions = c_callback_positions(f)
             for j in 0..<positions.len() + 1
-                val c = if j == 0 then f.result else f.params[positions[j - 1]].ty
                 if j > 0 && j - 1 >= ps.len() then continue
                 val avin = if j == 0 then r else ps[j - 1]
                 val form = if *avin is Str then TextString(false) else NoText
+                val c = if j == 0 then f.result else c_text_position(f.params[positions[j - 1]].ty, f.params[positions[j - 1]].text, form)
                 val kind = c_kind_needed(c, avin, form, j > 0) match
                     Some(kind) -> kind
                     None -> continue
@@ -815,8 +825,7 @@ c_unit_source_of(parts: CUnitParts, libraries: Buf[CLibrary]) -> CUnitSource
                     val tag = kind_tag(kind) + " " + name
                     if !contains_text(kinds, tag)
                         kinds.push(tag)
-                        out.push(s"_Static_assert(${kind_test(kind, name)}, \"avin: the C type $name\");\n")
-                        lines.push(KindLine(i, k + 1, name, kind))
+                        kind_asserts(&out, &lines, i, k + 1, kind, name)
                 if !c_kind_measured(kind) then continue
                 val key = c_measure_key(c, kind)
                 if !contains_text(measured, key)
@@ -980,9 +989,13 @@ private handle_glue(out: *StrBuilder, lines: *Buf[CUnitLine], handles: Buf[CUnit
             // The type is the field's at any index: an unevaluated operand reads no memory.
             glue(out, lines, s"typedef __typeof__((($t)0)->${c_replace_names(f.expr, f.indices, "0")}) $ft;", FieldLine(i, j, "field"))
             // A field lent as a view points at bytes one byte wide.
-            val test = if f.length != "" then element_test(Byte, s"__typeof__(*($ft)0)") else f.handle match
+            // A struct mirror's field is the struct it mirrors.
+            val test = if f.length != "" then element_test(Byte, s"__typeof__(*($ft)0)") elif f.mirror != "" then s"__builtin_types_compatible_p($ft, ${f.mirror})" else f.handle match
                 Some(k) -> s"__builtin_types_compatible_p($ft, avin_c_type_$k)"
                 None -> kind_test(f.kind.unwrap(), ft)
+            // A string's field is first checked not to point at bytes, so its diagnostic says so.
+            if f.length == "" && f.handle is None && f.kind is Some(KindText)
+                glue(out, lines, s"_Static_assert(!(${byte_pointer_test(ft)}), \"avin: the field ${f.name}\");", FieldLine(i, j, "bytes"))
             glue(out, lines, s"_Static_assert($test, \"avin: the field ${f.name}\");", FieldLine(i, j, "kind"))
             if f.length != ""
                 // The view's length, a C expression in `self` and the indices.
@@ -1000,7 +1013,20 @@ private handle_glue(out: *StrBuilder, lines: *Buf[CUnitLine], handles: Buf[CUnit
                 glue(out, lines, s"    $t self = ($t)avin_p;", Plain)
                 glue(out, lines, s"    return (long long)(${f.bounds[b]});", FieldLine(i, j, part))
                 glue(out, lines, "}", Plain)
-            if f.writer
+            // A struct crosses through a pointer to a copy Avin made or reads.
+            if f.writer && f.mirror != ""
+                val set = c_field_glue(f.symbol, "set")
+                glue(out, lines, s"void $set(void *avin_p$indices, const ${f.mirror} *avin_value) {", Plain)
+                glue(out, lines, s"    $t self = ($t)avin_p;", Plain)
+                glue(out, lines, s"    self->${f.expr} = *avin_value;", FieldLine(i, j, "write"))
+                glue(out, lines, "}", Plain)
+            elif f.mirror != ""
+                val get = c_field_glue(f.symbol, "get")
+                glue(out, lines, s"void $get(void *avin_p$indices, ${f.mirror} *avin_out) {", Plain)
+                glue(out, lines, s"    $t self = ($t)avin_p;", Plain)
+                glue(out, lines, s"    *avin_out = self->${f.expr};", FieldLine(i, j, "field"))
+                glue(out, lines, "}", Plain)
+            elif f.writer
                 val set = c_field_glue(f.symbol, "set")
                 glue(out, lines, s"void $set(void *avin_p$indices, $ft avin_value) {", Plain)
                 glue(out, lines, s"    $t self = ($t)avin_p;", Plain)
@@ -1134,7 +1160,10 @@ private struct_checks(out: *StrBuilder, lines: *Buf[CUnitLine], parts: CUnitPart
             val name = c_struct_field_type(m.index, j)
             glue(out, lines, s"typedef __typeof__((($own *)0)->${f.c_name}) $name;", StructLine(i, j, "field"))
             f.kind match
-                Some(kind) -> glue(out, lines, s"_Static_assert(${kind_test(kind, name)}, \"avin: the field ${f.name} of ${m.name}\");", StructLine(i, j, "kind"))
+                Some(kind) ->
+                    // A string's field is first checked not to point at bytes, so its diagnostic says so.
+                    if kind is KindText then glue(out, lines, s"_Static_assert(!(${byte_pointer_test(name)}), \"avin: the field ${f.name} of ${m.name}\");", StructLine(i, j, "bytes"))
+                    glue(out, lines, s"_Static_assert(${kind_test(kind, name)}, \"avin: the field ${f.name} of ${m.name}\");", StructLine(i, j, "kind"))
                 None -> glue(out, lines, s"_Static_assert(__builtin_types_compatible_p($name, ${f.nested_ty}), \"avin: the field ${f.name} of ${m.name}\");", StructLine(i, j, "nested"))
             val offset = c_offset_expr(own, f.c_name)
             var wanted = "0"
@@ -1343,6 +1372,22 @@ private kind_tag(kind: CKind) -> string = kind match
     KindText -> "text"
     KindConstText -> "const text"
 
+// The checks that the typedef `name`, at position `position` of `bindings[binding]`, is the kind
+// `kind` asks for. A string's is first checked not to point at `unsigned char` or `signed char`,
+// which headers use for bytes rather than text, so that its diagnostic can say so.
+private kind_asserts(out: *StrBuilder, lines: *Buf[CUnitLine], binding: usize, position: usize, kind: CKind, name: string)
+    if kind is KindText || kind is KindConstText
+        glue(out, lines, s"_Static_assert(!(${byte_pointer_test(name)}), \"avin: the C type $name\");", BytesTextLine(binding, position, name))
+    glue(out, lines, s"_Static_assert(${kind_test(kind, name)}, \"avin: the C type $name\");", KindLine(binding, position, name, kind))
+
+// The constant expression that holds where the C type `name` is a pointer to `unsigned char` or
+// `signed char`, `const` or not, through any typedefs.
+private byte_pointer_test(name: string) -> string
+    var tests = ""
+    for t in ["unsigned char *", "const unsigned char *", "signed char *", "const signed char *"]
+        tests = tests + (if tests == "" then "" else " || ") + s"__builtin_types_compatible_p($name, $t)"
+    tests
+
 // The constant expression that holds where the typedef `name` is the kind `kind` asks for, by the
 // class of type clang gives it: 1 an integer or enumeration, 4 a bool, 8 a floating-point type; a
 // string is one of the two pointers to `char`.
@@ -1514,8 +1559,9 @@ c_unit_diagnostics_of(output: string, unit: CUnitSource, parts: CUnitParts, libr
                         Some(k) ->
                             for other in handles
                                 if other.index == k then what = s"`${other.ty}`, the C type of `${other.name}`"
-                        None -> what = field_kind_text(f.kind.unwrap())
+                        None -> what = if f.mirror != "" then s"`${f.mirror}`, which `${type_name(f.avin)}` mirrors," else field_kind_text(f.kind.unwrap())
                     m = s"the field `${f.expr}` of the C handle `${h.name}` is not $what in the headers, so `${f.name}` cannot $verb it as `${type_name(f.avin)}`"
+                elif part == "bytes" then m = s"the field `${f.expr}` of the C handle `${h.name}` points at `unsigned char` or `signed char` in the headers, which hold bytes rather than text, so `${f.name}` cannot read it as `${type_name(f.avin)}`: a string is a pointer to `char`, and bytes are lent as a view with `view` and `length:`"
                 elif part == "write" then m = s"the field `${f.expr}` of the C handle `${h.name}` cannot be written by `${f.name}`: clang says '${d.message}'"
                 elif part.starts_with("bound")
                     var position = 0usize
@@ -1563,6 +1609,13 @@ c_unit_diagnostics_of(output: string, unit: CUnitSource, parts: CUnitParts, libr
                 if d.message.starts_with("static assertion failed") && !contains_text(troubles[i].kind_names, name)
                     troubles[i].kind_names.push(name)
                     troubles[i].kinds.push(s"the C type `$name` of $where is not $what in the headers, so it cannot cross as `${type_name(avin)}`")
+            BytesTextLine(i, position, name) ->
+                placed_any = true
+                val where = if position == 0 then "the result" else s"parameter $position"
+                val avin = if position == 0 then bindings[i].result else bindings[i].params[position - 1]
+                if d.message.starts_with("static assertion failed") && !contains_text(troubles[i].kind_names, name)
+                    troubles[i].kind_names.push(name)
+                    troubles[i].kinds.push(s"the C type `$name` of $where points at `unsigned char` or `signed char` in the headers, which hold bytes rather than text, so it cannot cross as `${type_name(avin)}`: a string is a pointer to `char`, and bytes cross as `Array[byte]`")
             ElementLine(i, position) ->
                 placed_any = true
                 val q = bindings[i].prototype.params[position - 1]
@@ -1684,6 +1737,7 @@ c_unit_diagnostics_of(output: string, unit: CUnitSource, parts: CUnitParts, libr
                         msg = s"the field `${f.name}` of the C struct mirror `${m.name}` mirrors `${f.c_name}`, which is not a field of `${m.ty}` in its headers"
                         if !f.named then msg = msg + s"; a field whose C name is not its words in snake_case names it with `@c(\"<name>\")` before the field"
                     elif part == "kind" then msg = s"the field `${f.c_name}` of `${m.ty}` is not ${field_kind_text(f.kind.unwrap())} in the headers, so the field `${f.name}` of the C struct mirror `${m.name}` cannot be `${type_name(f.avin)}`"
+                    elif part == "bytes" then msg = s"the field `${f.c_name}` of `${m.ty}` points at `unsigned char` or `signed char` in the headers, which hold bytes rather than text, so the field `${f.name}` of the C struct mirror `${m.name}` cannot be `${type_name(f.avin)}`: a string is a pointer to `char`"
                     elif part == "nested" then msg = s"the field `${f.c_name}` of `${m.ty}` is not `${f.nested_ty}` in the headers, so the field `${f.name}` of the C struct mirror `${m.name}` cannot be `${type_name(f.avin)}`, which mirrors it"
                     elif j == 0 then msg = s"the field `${f.c_name}` is not the first field of `${m.ty}` in its headers: a struct mirror lists its struct's fields in the header's order"
                     else msg = s"the field `${f.c_name}` of `${m.ty}` does not follow `${m.fields[j - 1].c_name}` in its headers: a struct mirror lists its struct's fields in the header's order"
