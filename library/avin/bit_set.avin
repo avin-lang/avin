@@ -1,0 +1,321 @@
+module avin
+
+// A set of non-negative `int`s kept as bits: element `e` is bit `e % 64` of word `e / 64`. It is a
+// `SortedSet[int]`, and so a `Set[int]`: it iterates in ascending order, answers the ordered
+// operations, is the predicate of membership, and is equal to and hashes alike any other set of the
+// same elements, a `TreeSet` or a `HashSet` included. Membership takes constant time, and the set
+// algebra works a word, 64 elements, at a time. The set takes a word for each 64 of its greatest
+// element, so it suits a dense run of small numbers, not a few large ones.
+//
+// An update answers a new set, which copies the words it changes and shares the rest, and leaves the
+// old one as it was. An element that is negative cannot be in the set: `incl` traps on one, `contains`
+// answers `false` and `excl` leaves the set as it was. `toBitMask()` gives the words, the lowest
+// element in bit 0 of the first, with none trailing that is empty, and `BitSet.fromBitMask` is its
+// inverse.
+class BitSet(private val words: Vector[long]): SortedSet[int]
+    // The number of elements.
+    override size() -> int
+        var n = 0
+        for w in words do n += bitCount(w)
+        n
+
+    override isEmpty() -> bool = words.forall(w -> w == 0)
+
+    override nonEmpty() -> bool = !isEmpty()
+
+    override contains(element: int) -> bool =
+        element >= 0 && (0 <= (element >> 6) < words.length()) && (words(element >> 6) & bitOf(element)) != 0
+
+    // This set with `element` in it; traps when `element` is negative.
+    override incl(element: int) -> BitSet
+        if element < 0 then fail(s"BitSet element is negative: $element")
+        val i = element >> 6
+        val bit = bitOf(element)
+        if i < words.length()
+            val w = words(i)
+            if (w & bit) != 0 then self else BitSet(words.updated(i, w | bit))
+        else
+            val zero: long = 0
+            var v = words
+            while v.length() < i do v = v :+ zero
+            BitSet(v :+ bit)
+
+    // This set without `element`; the same set when `element` is absent or negative.
+    override excl(element: int) -> BitSet
+        if !contains(element) then return self
+        val i = element >> 6
+        BitSet(trimmed(words.updated(i, words(i) & ~bitOf(element))))
+
+    // This set with every element of `other` in it; traps on a negative element.
+    override ++(other: Iterable[int]) -> BitSet
+        val buffer = bufferOf(words)
+        for x in other do setBit(buffer, x)
+        BitSet(trimmed(buffer.toVector()))
+
+    // This set without any element of `other`; an element it lacks, or a negative one, is ignored.
+    override --(other: Iterable[int]) -> BitSet
+        val buffer = bufferOf(words)
+        for x in other do clearBit(buffer, x)
+        BitSet(trimmed(buffer.toVector()))
+
+    override union(other: Set[int]) -> BitSet = other match
+        o: BitSet -> combined(words, o.toBitMask(), (a, b) -> a | b)
+        _ -> self ++ other
+
+    override intersect(other: Set[int]) -> BitSet = other match
+        o: BitSet -> combined(words, o.toBitMask(), (a, b) -> a & b)
+        _ -> filter(x -> other.contains(x))
+
+    override diff(other: Set[int]) -> BitSet = other match
+        o: BitSet -> combined(words, o.toBitMask(), (a, b) -> a & ~b)
+        _ -> filter(x -> !other.contains(x))
+
+    // The elements in exactly one of this set and `other`.
+    symmetricDiff(other: BitSet) -> BitSet = combined(words, other.toBitMask(), (a, b) -> a ^ b)
+
+    override subsetOf(other: Set[int]) -> bool = other match
+        o: BitSet ->
+            val theirs = o.toBitMask()
+            for i in 0 ..< words.length()
+                if (words(i) & ~wordOf(theirs, i)) != 0 then return false
+            true
+        _ ->
+            if size() > other.size() then return false
+            for x in self
+                if !other.contains(x) then return false
+            true
+
+    override filter(p: (int) -> bool) -> BitSet
+        val buffer = bufferOf(words)
+        for x in self
+            if !p(x) then clearBit(buffer, x)
+        BitSet(trimmed(buffer.toVector()))
+
+    // The elements in ascending order.
+    override iterator() -> Iterator[int] = BitSetIterator(words, true)
+
+    override reverseIterator() -> Iterator[int] = BitSetIterator(words, false)
+
+    override headOption() -> Option[int] = minFrom(words, 0)
+
+    override lastOption() -> Option[int] = maxUpTo(words, words.length() * 64 - 1)
+
+    override minAfter(x: int) -> Option[int] = minFrom(words, if x < 0 then 0 else x)
+
+    override maxBefore(x: int) -> Option[int] = if x <= 0 then None else maxUpTo(words, x - 1)
+
+    override rangeFrom(low: int) -> BitSet = within(long(low), long.MaxValue)
+
+    override rangeTo(high: int) -> BitSet = within(0, long(high) + 1)
+
+    override rangeUntil(high: int) -> BitSet = within(0, long(high))
+
+    override range(low: int, high: int) -> BitSet = within(long(low), long(high))
+
+    // The words of the set, element `e` being bit `e % 64` of word `e / 64`; the last word is not zero.
+    toBitMask() -> Vector[long] = trimmed(words)
+
+    // The elements `e` with `low <= e < high`.
+    private within(low: long, high: long) -> BitSet
+        val lo = if low < 0 then 0 else low
+        val hi = if high > long(words.length()) * 64 then long(words.length()) * 64 else high
+        if hi <= lo then return BitSet.empty()
+        val firstBit = int(lo)
+        val lastBit = int(hi - 1)
+        val first = firstBit >> 6
+        val last = lastBit >> 6
+        val zero: long = 0
+        val b = Vector.newBuilder[long]()
+        for _ in 0 ..< first do b.addOne(zero)
+        for j in first ..< last + 1
+            var w = words(j)
+            if j == first then w = w & bitsFrom(firstBit & 63)
+            if j == last then w = w & bitsThrough(lastBit & 63)
+            b.addOne(w)
+        BitSet(trimmed(b.result()))
+
+// Two bit sets are equal when they hold the same elements.
+impl Eq for BitSet
+    equals(other: BitSet) -> bool
+        val a = toBitMask()
+        val b = other.toBitMask()
+        if a.length() != b.length() then return false
+        for i in 0 ..< a.length()
+            if a(i) != b(i) then return false
+        true
+
+// The sum a `HashSet` of the same elements hashes to, so that the hash does not depend on the kind of
+// set.
+impl Hash for BitSet
+    hash() -> long
+        var h: long = 0
+        for x in self do h = h +% spreadHash(x.hash())
+        h
+
+// A bit set displays as a set does, `{1, 2, 3}`, in ascending order. A field width pads the whole.
+impl Display for BitSet
+    display(out: Writer, spec: FormatSpec)
+        writeElement(w: Writer, x: int) = x.display(w, FormatSpec())
+        writeBraced(out, spec, iterator(), writeElement)
+
+// A bit set's diagnostic form is its elements in braces: `{1, 2, 3}`.
+impl Debug for BitSet
+    debug(out: Writer, spec: FormatSpec)
+        writeElement(w: Writer, x: int) = x.debug(w, FormatSpec())
+        writeBraced(out, spec, iterator(), writeElement)
+
+object BitSet
+    // A bit set with no elements.
+    empty() -> BitSet = BitSet(Vector.empty[long]())
+
+    // A bit set of the elements given, each equal one once: `BitSet(3, 1, 2)`; traps on a negative one.
+    apply(elements: int*) -> BitSet
+        val buffer = Buffer[long]()
+        for x in elements do setBit(buffer, x)
+        BitSet(trimmed(buffer.toVector()))
+
+    // The bit set whose words are `words`: element `e` is in the set when bit `e % 64` of word
+    // `e / 64` is set. The inverse of `toBitMask()`; a word beyond the last needed may be zero.
+    fromBitMask(words: Vector[long]) -> BitSet = BitSet(trimmed(words))
+
+    // A builder of a bit set: the elements it is given, each held once.
+    newBuilder() -> Builder[int, BitSet] = BitSetBuilder()
+
+// Builds a bit set from elements, an element added twice held once.
+class BitSetBuilder: Builder[int, BitSet]
+    private val buffer = Buffer[long]()
+    private var spent = false
+
+    override addOne(element: int)
+        if spent then fail("add to a builder whose result was taken")
+        setBit(buffer, element)
+
+    override result() -> BitSet
+        if spent then fail("result of a builder whose result was taken")
+        spent = true
+        BitSet(trimmed(buffer.toVector()))
+
+    override clear()
+        buffer.clear()
+        spent = false
+
+// The elements of a word vector in ascending order, or in descending order.
+private class BitSetIterator(private val words: Vector[long], private val ascending: bool): Iterator[int]
+    private var nextWord = if ascending then 0 else words.length() - 1
+    private var current: long = 0
+    private var offset = 0
+
+    override hasNext() -> bool
+        settle()
+        current != 0
+
+    override next() -> int
+        settle()
+        if current == 0 then fail("next on an exhausted iterator")
+        if ascending
+            val b = lowestBit(current)
+            current = current & (current -% 1)
+            offset + b
+        else
+            val b = highestBit(current)
+            current = current & ~bitOf(b)
+            offset + b
+
+    // Loads the next word that has an element, if the current one is spent.
+    private settle()
+        while current == 0 && 0 <= nextWord < words.length()
+            current = words(nextWord)
+            offset = nextWord * 64
+            nextWord = if ascending then nextWord + 1 else nextWord - 1
+
+// The bit of a word that element `e` is.
+private bitOf(e: int) -> long = long(1) << long(e & 63)
+
+// The bits of a word at position `b` and above.
+private bitsFrom(b: int) -> long = long(-1) << long(b)
+
+// The bits of a word at position `b` and below.
+private bitsThrough(b: int) -> long = (long(1) << long(b + 1)) -% 1
+
+// Whether bit `b` of a word is set.
+private bitSet(w: long, b: int) -> bool = (w >> long(b)) & 1 != 0
+
+// The number of bits set in a word.
+private bitCount(w: long) -> int
+    var x = w
+    var n = 0
+    while x != 0
+        x = x & (x -% 1)
+        n += 1
+    n
+
+// The position of the lowest bit set in a nonzero word.
+private lowestBit(w: long) -> int
+    var b = 0
+    while !bitSet(w, b) do b += 1
+    b
+
+// The position of the highest bit set in a nonzero word.
+private highestBit(w: long) -> int
+    var b = 63
+    while !bitSet(w, b) do b -= 1
+    b
+
+// Word `i` of `ws`, zero beyond the last.
+private wordOf(ws: Vector[long], i: int) -> long = if 0 <= i < ws.length() then ws(i) else 0
+
+// `ws` without the empty words at its end.
+private trimmed(ws: Vector[long]) -> Vector[long]
+    var n = ws.length()
+    while n > 0 && ws(n - 1) == 0 do n -= 1
+    if n == ws.length() then ws else ws.take(n)
+
+private bufferOf(ws: Vector[long]) -> Buffer[long]
+    val b = Buffer[long]()
+    for w in ws do b.addOne(w)
+    b
+
+// Puts element `e` in the words of `b`, growing them to hold it.
+private setBit(b: Buffer[long], e: int)
+    if e < 0 then fail(s"BitSet element is negative: $e")
+    val i = e >> 6
+    while b.length() <= i do b.addOne(0)
+    b(i) = b(i) | bitOf(e)
+
+// Takes element `e` out of the words of `b`; nothing when it is not there.
+private clearBit(b: Buffer[long], e: int)
+    if e >= 0 && (e >> 6) < b.length() then b(e >> 6) = b(e >> 6) & ~bitOf(e)
+
+// The words that `f` makes of each pair of words of `x` and `y`, the shorter padded with zero.
+private combined(x: Vector[long], y: Vector[long], f: (long, long) -> long) -> BitSet
+    val n = if x.length() > y.length() then x.length() else y.length()
+    val b = Vector.newBuilder[long]()
+    for i in 0 ..< n do b.addOne(f(wordOf(x, i), wordOf(y, i)))
+    BitSet(trimmed(b.result()))
+
+// The least element at least `start` (not negative) in `ws`.
+private minFrom(ws: Vector[long], start: int) -> Option[int]
+    var i = start >> 6
+    if i >= ws.length() then return None
+    var w = ws(i) & bitsFrom(start & 63)
+    while w == 0
+        i += 1
+        if i >= ws.length() then return None
+        w = ws(i)
+    Some(i * 64 + lowestBit(w))
+
+// The greatest element at most `end` in `ws`; `end` may be past the last word.
+private maxUpTo(ws: Vector[long], end: int) -> Option[int]
+    if ws.length() == 0 || end < 0 then return None
+    var i = end >> 6
+    var w: long = 0
+    if i >= ws.length()
+        i = ws.length() - 1
+        w = ws(i)
+    else
+        w = ws(i) & bitsThrough(end & 63)
+    while w == 0
+        i -= 1
+        if i < 0 then return None
+        w = ws(i)
+    Some(i * 64 + highestBit(w))
